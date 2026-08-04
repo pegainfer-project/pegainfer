@@ -234,8 +234,8 @@ Validation scope:
 ## References
 
 - `docs/models/qwen3/tp-design.md`
-- `pegainfer-qwen3-4b/src/config.rs`
-- `pegainfer-qwen3-4b/src/executor.rs`
+- `pegainfer-qwen3/src/config.rs`
+- `pegainfer-qwen3/src/executor.rs`
 - `pegainfer-qwen35/src/config.rs`
 - `pegainfer-qwen35/src/weights.rs`
 - `pegainfer-qwen35/src/recurrent_state.rs`
