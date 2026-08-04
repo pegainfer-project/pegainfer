@@ -139,6 +139,13 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn softcap_bf16_in_place_cuda(
+        buf: *mut Half,
+        cap: f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn embedding_batched_cuda(
         embed: *const Half,
         token_ids: *const u32,

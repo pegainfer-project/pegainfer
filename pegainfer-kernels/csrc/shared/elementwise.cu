@@ -303,6 +303,25 @@ __global__ void gelu_tanh_mul_kernel(
 }
 
 // ============================================================================
+// In-place final-logit softcap: buf[i] = bf16(cap * tanh(f32(buf[i]) / cap)).
+// Gemma 4 declares final_logit_softcapping (30.0 at every published size) and
+// applies it to the LM head output in the compute dtype; f32 internal with a
+// single rounding matches the reference's bf16 elementwise chain.
+// ============================================================================
+
+__global__ void softcap_bf16_kernel(
+    __nv_bfloat16 *__restrict__ buf,
+    float cap,
+    int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    float x = __bfloat162float(buf[idx]);
+    buf[idx] = __float2bfloat16(cap * tanhf(x / cap));
+  }
+}
+
+// ============================================================================
 // In-place multiply by a host scalar: buf[i] = bf16(f32(buf[i]) * scale).
 // Serves Gemma 4's per-layer layer_scalar, a [1] weight the model reads to
 // the host at load; f32 compute with a single rounding matches HF's bf16
@@ -711,6 +730,14 @@ CUresult scale_bf16_in_place_cuda(
   int block = 256;
   int grid = n / block + (n % block != 0);
   scale_bf16_kernel<<<grid, block, 0, stream>>>(buf, scale, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult softcap_bf16_in_place_cuda(
+    __nv_bfloat16 *buf, float cap, int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = n / block + (n % block != 0);
+  softcap_bf16_kernel<<<grid, block, 0, stream>>>(buf, cap, n);
   return (CUresult)cudaGetLastError();
 }
 

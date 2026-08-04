@@ -1729,7 +1729,12 @@ pub fn paged_attention_batch_decode_hd512_into(
     meta: &Hd512DecodeMetadata,
     output: &mut HiddenStates,
     num_qo_heads: usize,
+    sm_scale: f32,
 ) -> Result<()> {
+    anyhow::ensure!(
+        sm_scale.is_finite(),
+        "paged_attention_batch_decode_hd512 sm_scale {sm_scale} must be finite"
+    );
     let num_kv_heads = layout.num_kv_heads;
     let head_dim = layout.head_dim;
     anyhow::ensure!(
@@ -1821,7 +1826,6 @@ pub fn paged_attention_batch_decode_hd512_into(
         "batch hd512 decode",
     )?;
 
-    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
     let result = unsafe {
         ffi::paged_attention_decode_cuda_hd512(
             q_ptr as *const ffi::Half,
@@ -1868,7 +1872,12 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
     positions_d: &CudaSlice<i32>,
     output: &mut HiddenStates,
     num_qo_heads: usize,
+    sm_scale: f32,
 ) -> Result<()> {
+    anyhow::ensure!(
+        sm_scale.is_finite(),
+        "paged_attention_batch_decode_via_prefill_hd512 sm_scale {sm_scale} must be finite"
+    );
     let num_kv_heads = layout.num_kv_heads;
     let head_dim = layout.head_dim;
     anyhow::ensure!(
@@ -2002,7 +2011,6 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
     let k_offset = (layer * layout.layer_stride) as i64;
     let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
     let stride_page = layout.page_stride as i64;
-    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -2071,7 +2079,12 @@ pub fn batch_prefill_paged_hd512_into(
     plan: &PrefillPagedPlan,
     output: &mut HiddenStates,
     num_qo_heads: usize,
+    sm_scale: f32,
 ) -> Result<()> {
+    anyhow::ensure!(
+        sm_scale.is_finite(),
+        "batch_prefill_paged_hd512 sm_scale {sm_scale} must be finite"
+    );
     let num_kv_heads = layout.num_kv_heads;
     let head_dim = layout.head_dim;
     anyhow::ensure!(
@@ -2150,7 +2163,6 @@ pub fn batch_prefill_paged_hd512_into(
     let k_offset = (layer * layout.layer_stride) as i64;
     let v_offset = (layer * layout.layer_stride + layout.kv_block_len) as i64;
     let stride_page = layout.page_stride as i64;
-    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
 
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
@@ -2219,7 +2231,12 @@ pub fn single_prefill_hd512_into(
     num_q_heads: usize,
     num_kv_heads: usize,
     kv_len: usize,
+    sm_scale: f32,
 ) -> Result<()> {
+    anyhow::ensure!(
+        sm_scale.is_finite(),
+        "single_prefill_hd512 sm_scale {sm_scale} must be finite"
+    );
     assert_eq!(q.hidden_dim, num_q_heads * 512);
     assert_eq!(output.hidden_dim, q.hidden_dim);
     assert_eq!(output.seq_len, q.seq_len);
@@ -2252,7 +2269,7 @@ pub fn single_prefill_hd512_into(
             q_seq_len as i32,
             kv_len as i32,
             k_cache.seq_len as i32,
-            1.0f32 / (512.0f32).sqrt(),
+            sm_scale,
             crate::tensor::active_cu_stream(ctx),
         )
     };
