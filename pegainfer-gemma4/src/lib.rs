@@ -6,8 +6,15 @@ mod config;
 mod manifest;
 pub mod model_line;
 mod probe;
+// Dead until an executor calls in; test targets do use them, so an
+// `expect(dead_code)` cannot hold in every build.
 #[cfg(feature = "gemma4")]
-#[expect(dead_code, reason = "no consumer until the executor lands")]
+#[allow(dead_code)]
+mod layer;
+#[cfg(all(feature = "gemma4", test))]
+mod testkit;
+#[cfg(feature = "gemma4")]
+#[allow(dead_code)]
 mod weights;
 
 use std::path::Path;

@@ -30,6 +30,7 @@ pub use pegainfer_kernels::ops::eagle3_rope_into;
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use pegainfer_kernels::ops::embedding_batch;
 pub use pegainfer_kernels::ops::embedding_decode_into;
+pub use pegainfer_kernels::ops::extract_hidden_rows_raw_into;
 pub use pegainfer_kernels::ops::extract_vec;
 pub use pegainfer_kernels::ops::extract_vec_into;
 pub use pegainfer_kernels::ops::extract_vec_ref;
@@ -39,6 +40,7 @@ pub use pegainfer_kernels::ops::f32_to_bf16_hidden_into;
 pub use pegainfer_kernels::ops::fused_add_rms_norm_batch_into;
 pub use pegainfer_kernels::ops::fused_add_rms_norm_into;
 pub use pegainfer_kernels::ops::gather_hidden_tokens_into;
+pub use pegainfer_kernels::ops::gelu_tanh_mul_batch_into;
 pub use pegainfer_kernels::ops::gemm;
 pub use pegainfer_kernels::ops::gemm_graphsafe_into_checked;
 pub use pegainfer_kernels::ops::gemm_graphsafe_ref_into_checked;
@@ -62,6 +64,7 @@ pub use pegainfer_kernels::ops::pack_lora_b_rows_into;
 pub use pegainfer_kernels::ops::qk_norm_partial_rope_batched_decode_hd256_into;
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use pegainfer_kernels::ops::qk_norm_rope_batch_decode_into;
+pub use pegainfer_kernels::ops::qk_norm_rope_prefill_hd256_plain_into;
 pub use pegainfer_kernels::ops::rms_norm;
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use pegainfer_kernels::ops::rms_norm_batch_into;
@@ -69,6 +72,7 @@ pub use pegainfer_kernels::ops::rms_norm_batch_offset_into;
 pub use pegainfer_kernels::ops::rms_norm_gated_batch_into;
 pub use pegainfer_kernels::ops::rms_norm_into;
 pub use pegainfer_kernels::ops::rms_norm_offset_into;
+pub use pegainfer_kernels::ops::scale_bf16_in_place;
 pub use pegainfer_kernels::ops::scale_f32_in_place;
 pub use pegainfer_kernels::ops::scaled_add_batch_into;
 pub use pegainfer_kernels::ops::scaled_add_rows_indexed_into;
@@ -79,6 +83,7 @@ pub use pegainfer_kernels::ops::silu_mul_batch_into;
 #[cfg(not(feature = "kernel-call-trace"))]
 pub use pegainfer_kernels::ops::silu_mul_fused_batch_into;
 pub use pegainfer_kernels::ops::single_decode_nhd_into;
+pub use pegainfer_kernels::ops::single_prefill_hd256_into;
 pub use pegainfer_kernels::ops::single_prefill_nhd_causal_into;
 pub use pegainfer_kernels::ops::single_prefill_nhd_noncausal_into;
 pub use pegainfer_kernels::ops::write_vec_into;

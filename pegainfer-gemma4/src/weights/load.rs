@@ -29,7 +29,7 @@ use crate::manifest::validate::ObservedTensor;
 /// redemption, prefetch join and unmap fall between them, and the allocations
 /// submitted under `record_api_wall_ms` execute under
 /// `execute_and_drain_wall_ms`. Only `elapsed_ms` is a total.
-struct LoadStats {
+pub(crate) struct LoadStats {
     /// Every required tensor at its dtype.
     manifest_bytes: usize,
     /// Free-before minus free-after. Signed: this measures the device, not the
@@ -55,7 +55,7 @@ struct LayerSlots {
     post_attention_layernorm: VecSlotId,
     pre_feedforward_layernorm: VecSlotId,
     post_feedforward_layernorm: VecSlotId,
-    layer_scalar: VecSlotId,
+    layer_scalar: f32,
     q_proj: SlotId,
     k_proj: SlotId,
     v_proj: Option<SlotId>,
@@ -114,7 +114,30 @@ fn classify_checkpoint(manifest: &Manifest, shards: &[SafeTensors]) -> Result<us
     Ok(skipped)
 }
 
-fn record_plan(loader: &mut StagedWeightLoader, manifest: &Manifest) -> Result<RecordedPlan> {
+fn read_scalar_bf16(shards: &[SafeTensors], name: &str) -> Result<f32> {
+    for shard in shards {
+        if let Ok(view) = shard.tensor(name) {
+            anyhow::ensure!(
+                view.dtype() == Dtype::BF16 && view.data().len() == 2,
+                "Gemma 4: '{name}' must be a single bf16 scalar"
+            );
+            let bits = u16::from_le_bytes([view.data()[0], view.data()[1]]);
+            let value = half::bf16::from_bits(bits).to_f32();
+            anyhow::ensure!(
+                value.is_finite(),
+                "Gemma 4: '{name}' = {value} is not finite"
+            );
+            return Ok(value);
+        }
+    }
+    anyhow::bail!("Gemma 4: tensor '{name}' missing from every shard")
+}
+
+fn record_plan(
+    loader: &mut StagedWeightLoader,
+    shards: &[SafeTensors],
+    manifest: &Manifest,
+) -> Result<RecordedPlan> {
     let embed_tokens = record_matrix(loader, &manifest.embed_tokens)?;
     let norm = record_vector(loader, &manifest.norm)?;
     let mut layers = Vec::with_capacity(manifest.layers.len());
@@ -125,7 +148,7 @@ fn record_plan(loader: &mut StagedWeightLoader, manifest: &Manifest) -> Result<R
             post_attention_layernorm: record_vector(loader, &layer.post_attention_layernorm)?,
             pre_feedforward_layernorm: record_vector(loader, &layer.pre_feedforward_layernorm)?,
             post_feedforward_layernorm: record_vector(loader, &layer.post_feedforward_layernorm)?,
-            layer_scalar: record_vector(loader, &layer.layer_scalar)?,
+            layer_scalar: read_scalar_bf16(shards, &layer.layer_scalar.name)?,
             q_proj: record_matrix(loader, &attention.q_proj)?,
             k_proj: record_matrix(loader, &attention.k_proj)?,
             v_proj: attention
@@ -153,36 +176,38 @@ fn materialize(
     loader: &mut StagedWeightLoader,
     plan: RecordedPlan,
     config: Gemma4Config,
-) -> Gemma4Weights {
-    Gemma4Weights {
+) -> Result<Gemma4Weights> {
+    Ok(Gemma4Weights {
         embed_tokens: loader.take(plan.embed_tokens),
         norm: loader.take_vec(plan.norm),
         layers: plan
             .layers
             .into_iter()
-            .map(|slots| Gemma4Layer {
-                input_layernorm: loader.take_vec(slots.input_layernorm),
-                post_attention_layernorm: loader.take_vec(slots.post_attention_layernorm),
-                pre_feedforward_layernorm: loader.take_vec(slots.pre_feedforward_layernorm),
-                post_feedforward_layernorm: loader.take_vec(slots.post_feedforward_layernorm),
-                layer_scalar: loader.take_vec(slots.layer_scalar),
-                attention: Gemma4Attention {
-                    q_proj: loader.take(slots.q_proj),
-                    k_proj: loader.take(slots.k_proj),
-                    v_proj: slots.v_proj.map(|slot| loader.take(slot)),
-                    o_proj: loader.take(slots.o_proj),
-                    q_norm: loader.take_vec(slots.q_norm),
-                    k_norm: loader.take_vec(slots.k_norm),
-                },
-                mlp: Gemma4Mlp {
-                    gate: loader.take(slots.gate),
-                    up: loader.take(slots.up),
-                    down: loader.take(slots.down),
-                },
+            .map(|slots| -> Result<Gemma4Layer> {
+                Ok(Gemma4Layer {
+                    input_layernorm: loader.take_vec(slots.input_layernorm),
+                    post_attention_layernorm: loader.take_vec(slots.post_attention_layernorm),
+                    pre_feedforward_layernorm: loader.take_vec(slots.pre_feedforward_layernorm),
+                    post_feedforward_layernorm: loader.take_vec(slots.post_feedforward_layernorm),
+                    layer_scalar: slots.layer_scalar,
+                    attention: Gemma4Attention {
+                        q_proj: loader.take(slots.q_proj),
+                        k_proj: loader.take(slots.k_proj),
+                        v_proj: slots.v_proj.map(|slot| loader.take(slot)),
+                        o_proj: loader.take(slots.o_proj),
+                        q_norm: loader.take_vec(slots.q_norm),
+                        k_norm: loader.take_vec(slots.k_norm),
+                    },
+                    mlp: Gemma4Mlp {
+                        gate: loader.take(slots.gate),
+                        up: loader.take(slots.up),
+                        down: loader.take(slots.down),
+                    },
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
         config,
-    }
+    })
 }
 
 fn free_device_bytes() -> Result<usize> {
@@ -203,7 +228,10 @@ impl Gemma4Weights {
     /// Loads the text tower onto one device. Config, manifest and headers are
     /// all checked before a device context exists, so a checkpoint that does
     /// not match its config costs no GPU.
-    fn from_safetensors(model_path: &str, device_ordinal: usize) -> Result<(Self, LoadStats)> {
+    pub(crate) fn from_safetensors(
+        model_path: &str,
+        device_ordinal: usize,
+    ) -> Result<(Self, LoadStats)> {
         let started = Instant::now();
         let config = Gemma4Config::from_file(model_path)?;
         let manifest = Manifest::from_config(&config)?;
@@ -221,14 +249,14 @@ impl Gemma4Weights {
         let mut loader = StagedWeightLoader::new(&ctx, &shards, &weight_map)?;
 
         let recording = Instant::now();
-        let plan = record_plan(&mut loader, &manifest)?;
+        let plan = record_plan(&mut loader, &shards, &manifest)?;
         let record_api_wall_ms = elapsed_ms(recording);
 
         let uploading = Instant::now();
         loader.finish()?;
         let execute_and_drain_wall_ms = elapsed_ms(uploading);
 
-        let weights = materialize(&mut loader, plan, config);
+        let weights = materialize(&mut loader, plan, config)?;
         drop(loader);
         drop(prefetch);
         let device_free_bytes = free_device_bytes()?;
@@ -309,7 +337,6 @@ mod tests {
             }
             assert_eq!(attention.q_proj.cols, config.hidden_size);
             assert_eq!(attention.o_proj.rows, config.hidden_size);
-            assert_eq!(layer.layer_scalar.len, 1);
         }
         assert_eq!(weights.embed_tokens.rows, config.vocab_size);
         assert_eq!(weights.embed_tokens.cols, config.hidden_size);

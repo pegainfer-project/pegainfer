@@ -2,8 +2,8 @@
 
 **TL;DR:** `test_data/gemma4-12b-hf-golden.safetensors` is the Hugging Face reference for Gemma 4
 12B — layer-boundary activations at both ends of both layer types, plus top-64 logprobs, over a
-single-token, a nine-token and a 1024-token (exactly the sliding window) case. Nothing consumes it
-yet; it exists so the layer and forward comparisons have something to compare against.
+single-token, a nine-token and a 1024-token (exactly the sliding window) case. It is the reference
+the in-crate golden gates replay their probes against.
 
 Last touched: 2026-08.
 

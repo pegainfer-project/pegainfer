@@ -17,6 +17,19 @@ pub(crate) enum LayerKind {
     Global,
 }
 
+/// First and last sliding layers from the layer map; `None` when the map has
+/// no sliding entry.
+#[cfg(test)]
+pub(crate) fn first_last_sliding(layer_types: &[LayerKind]) -> Option<(usize, usize)> {
+    let mut sliding = layer_types
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| matches!(kind, LayerKind::Sliding))
+        .map(|(index, _)| index);
+    let first = sliding.next()?;
+    Some((first, sliding.next_back().unwrap_or(first)))
+}
+
 /// What the manifest is derived from. Only [`Gemma4Config::from_file`] is
 /// probe-backed; a value built directly is not, so consumers check what they
 /// depend on.
@@ -35,6 +48,15 @@ pub(crate) struct Gemma4Config {
     pub(crate) tie_word_embeddings: bool,
     /// The MoE size keeps its dense MLP and adds experts alongside it.
     pub(crate) moe_enabled: bool,
+    // Not manifest inputs: until a serving path lands, only the oracle reads
+    // these three.
+    #[allow(dead_code)]
+    pub(crate) rms_norm_eps: f32,
+    /// The sliding-attention rope theta; the global family reads its own.
+    #[allow(dead_code)]
+    pub(crate) sliding_rope_theta: f32,
+    #[allow(dead_code)]
+    pub(crate) sliding_window: usize,
 }
 
 #[cfg(feature = "gemma4")]
@@ -70,6 +92,17 @@ impl Gemma4Config {
             "Gemma 4: layer_types has {} entries but num_hidden_layers is {num_hidden_layers}",
             layer_types.len()
         );
+        let rope = tc
+            .get("rope_parameters")
+            .ok_or_else(|| anyhow::anyhow!("Gemma 4: missing text_config.rope_parameters"))?;
+        let sliding_rope = rope
+            .get("sliding_attention")
+            .ok_or_else(|| anyhow::anyhow!("Gemma 4: missing rope_parameters.sliding_attention"))?;
+        let sliding_window = usize_field(tc, "sliding_window")?;
+        anyhow::ensure!(
+            sliding_window > 0,
+            "Gemma 4: sliding_window must be positive"
+        );
         Ok(Self {
             hidden_size: usize_field(tc, "hidden_size")?,
             intermediate_size: usize_field(tc, "intermediate_size")?,
@@ -82,8 +115,28 @@ impl Gemma4Config {
             layer_types,
             tie_word_embeddings: bool_field(tc, "tie_word_embeddings")?,
             moe_enabled: bool_field(tc, "enable_moe_block")?,
+            rms_norm_eps: f32_field(tc, "text_config", "rms_norm_eps")?,
+            sliding_rope_theta: f32_field(sliding_rope, "sliding_attention", "rope_theta")?,
+            sliding_window,
         })
     }
+}
+
+/// Numeric config values land in f32 compute; the checked cast rejects
+/// anything the narrowing would turn infinite rather than rounding it in
+/// silently.
+#[cfg(feature = "gemma4")]
+fn f32_field(obj: &serde_json::Value, ctx: &str, field: &str) -> Result<f32> {
+    let value = obj
+        .get(field)
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: {ctx}.{field} missing or not a number"))?;
+    let narrowed = value as f32;
+    anyhow::ensure!(
+        narrowed.is_finite(),
+        "Gemma 4: {ctx}.{field} = {value} overflows f32"
+    );
+    Ok(narrowed)
 }
 
 #[cfg(feature = "gemma4")]
@@ -104,4 +157,26 @@ fn bool_field(text_config: &serde_json::Value, field: &str) -> Result<bool> {
         .get(field)
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| anyhow::anyhow!("Gemma 4: text_config.{field} missing or not a boolean"))
+}
+
+#[cfg(test)]
+mod layer_map_tests {
+    use super::*;
+
+    #[test]
+    fn first_last_sliding_handles_edges() {
+        // The real 12B map is reconciled against the fixture's own parse in
+        // the oracle; here only the iterator logic is under test.
+        assert_eq!(
+            first_last_sliding(&[LayerKind::Sliding, LayerKind::Global, LayerKind::Sliding]),
+            Some((0, 2))
+        );
+        assert_eq!(first_last_sliding(&[LayerKind::Sliding]), Some((0, 0)));
+        assert_eq!(
+            first_last_sliding(&[LayerKind::Global, LayerKind::Sliding]),
+            Some((1, 1))
+        );
+        assert_eq!(first_last_sliding(&[LayerKind::Global]), None);
+        assert_eq!(first_last_sliding(&[]), None);
+    }
 }

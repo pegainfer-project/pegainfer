@@ -271,6 +271,9 @@ pub(super) fn sample_config() -> Gemma4Config {
         layer_types: vec![LayerKind::Sliding, LayerKind::Sliding, LayerKind::Global],
         tie_word_embeddings: true,
         moe_enabled: false,
+        rms_norm_eps: 1e-6,
+        sliding_rope_theta: 10_000.0,
+        sliding_window: 1024,
     }
 }
 
