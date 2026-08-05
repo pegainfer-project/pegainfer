@@ -1,8 +1,8 @@
 # Qwen3.5 TP Implementation Record
 
-> **TL;DR:** Qwen3.5 TP Phase 1 is implemented as correctness-first eager dense TP: TP2 worker/scheduler execution, short/long HF logits gates, scheduler e2e, and real OpenAI-compatible HTTP serving smoke pass. The branch is rebased onto current `main` with the newer engine, sampling, config, and golden-fixture contracts; remaining TP work is tracked as follow-up, not a Phase 1 claim.
+> **TL;DR:** Qwen3.5 TP Phase 1 is complete as a correctness-first eager dense TP path. P2A is underway: step 1 adds test-only exact-rank worker-state snapshots plus full-capacity cleanup and numeric readmission gates; production cancellation, protocol, lifecycle, and unified-execution changes remain follow-up before P2B GDR sharding.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-08
 
 ## Scope
 
@@ -136,21 +136,50 @@ Stable test knobs:
 - `PEGAINFER_TEST_TP_DEVICES`: comma-separated TP2 CUDA ordinals. Defaults to `0,1`; examples: `1,2`, `2,3`. TP2 tests require exactly two distinct ordinals.
 - `PEGAINFER_TEST_FRONTEND_MODEL_PATH`: optional tokenizer/config metadata path for HTTP serving tests. Defaults to `PEGAINFER_TEST_MODEL_PATH` when unset.
 
-## Follow-Up Work
+## Phase 2 Follow-Up
 
-The exact Phase 2 split is not decided yet. The items below are retained as follow-up work that should be scoped in the design branch before implementation.
+Phase 2 is locked in `docs/models/qwen35/tp-design.md` as two separate implementation series: P2a is eager mixed unified execution on the replicated Phase 1 GDR path; P2b shards the head-indexed linear-attention/GDR weight and state surface. P2a protocol/lifecycle gates must complete before P2b changes loader, kernel, or state shapes.
 
-### TP mixed-step unified execution
+### P2a: TP mixed-step unified execution
 
-Implement `RunUnifiedStep` under TP while keeping Phase 1's replicated linear-attention/GDR state unless the design branch decides otherwise.
+Implement eager `RunUnifiedStep` under TP while retaining Phase 1's replicated linear-attention/GDR weights, kernels, conv state, recurrent state, and scratch shapes.
+
+#### Step 1: lifecycle cleanup gates
+
+Completed as test and fault-observation infrastructure before changing production lifecycle semantics.
+
+Why it exists:
+
+- A successful controller-side `DropRequest` return did not directly prove that every rank removed the same `RequestId` or released its KV/recurrent/conv ownership.
+- Later cancellation, partial-dispatch, drop-acknowledgement, and unified-step work needs direct evidence of rank-local state before and after each transition.
+- Cleanup must prove both capacity recovery and fresh numeric state; scheduler bookkeeping alone cannot detect a stale rank-local recurrent or KV allocation.
+
+Implemented in `tp_executor.rs` under `#[cfg(test)]` only:
+
+- `WorkerStateSnapshot { rank, request_count, requests }`, where each request entry carries its `RequestId` and `Prefilling`/`Decoding` phase.
+- A healthy snapshot API that requires an unpoisoned executor and an unchecked test-only API that bypasses only the controller poison guard. The latter is reserved for later synthetic failure tests while every worker channel remains connected.
+- Exact-rank collection that rejects duplicate or out-of-range ranks, payload/response rank disagreement, missing responses, wrong reply variants, and inconsistent request counts. Valid snapshots are returned in rank order.
+- An ignored TP2 capacity gate that fills configured `max_batch=2`, observes every ID in `Decoding` on both ranks, drops every ID, requires zero requests on every rank, refills the complete capacity, executes decode, and proves the second cleanup is also empty.
+- An ignored TP2 numeric gate that records a prompt's deterministic first token and five requested logprobs, drops the request, verifies every rank is empty, re-admits the same prompt under a new `RequestId`, and requires an exact artifact match.
+
+Verification:
+
+- Qwen3.5 release all-target check and clippy with `-D warnings` pass.
+- The regular library suite passes: `71 passed`, `0 failed`, `8 ignored`.
+- Both new TP2 GPU gates pass independently.
+- Formatting and `git diff --check` pass.
+
+This step deliberately adds no production command, scheduler state transition, drop semantics, or serving claim. It supplies the observability needed to prove the later P2A changes rather than trusting controller-visible acknowledgements alone.
 
 Goals:
 
 - Support mixed prefill+decode scheduler steps under TP.
 - Preserve deterministic collective ordering across ranks.
 - Return mixed prefill/decode artifacts from the primary rank.
+- Use the `RequestId`-keyed `UnifiedPlan` and artifact contract in `tp-design.md`; P2a does not introduce CUDA Graph padded-slot or compaction semantics.
 - Validate finish/drop/client-disconnect cleanup under mixed-step execution.
 - Keep TP CUDA Graph disabled unless a separate graph design is completed.
+- Keep the fixed 16-device Triton AOT handle table and add startup-time validation for unsupported logical CUDA ordinals.
 
 Why this should be separated from GDR sharding:
 
@@ -158,9 +187,9 @@ Why this should be separated from GDR sharding:
 - Sharded linear-attention/GDR is a model-state-shape problem.
 - Combining them would make failures hard to attribute.
 
-### Sharded linear-attention/GDR state
+### P2b: sharded linear-attention/GDR state
 
-Shard the Qwen3.5 linear-attention/GDR path after the mixed-step and state-lifecycle contract is clear.
+Shard the Qwen3.5 linear-attention/GDR path after P2a establishes the mixed-step and state-lifecycle contract.
 
 Expected work:
 
@@ -169,6 +198,7 @@ Expected work:
 - adapt or regenerate GDR kernels for local state shapes
 - keep recurrent/conv state rank-local and request-local
 - all-reduce only after local linear-attention `out_proj`
+- report matched Phase 1 TP2 versus P2b TP2 HBM/latency/throughput data before making a performance claim
 
 Non-negotiable invariant:
 
