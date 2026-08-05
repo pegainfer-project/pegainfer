@@ -1,6 +1,6 @@
 # Qwen3.5 TP Implementation Record
 
-> **TL;DR:** Qwen3.5 TP Phase 1 is complete as a correctness-first eager dense TP path. P2A is underway: step 1 adds test-only exact-rank worker-state snapshots plus full-capacity cleanup and numeric readmission gates; production cancellation, protocol, lifecycle, and unified-execution changes remain follow-up before P2B GDR sharding.
+> **TL;DR:** Qwen3.5 TP Phase 1 is complete as a correctness-first eager dense TP path. P2A steps 1-2 add exact-rank lifecycle baselines and production cancellation pruning before load publication/admission; TP protocol hardening, fail-closed lifecycle propagation, and unified execution remain before P2B GDR sharding.
 >
 > **Last touched:** 2026-08
 
@@ -170,6 +170,45 @@ Verification:
 - Formatting and `git diff --check` pass.
 
 This step deliberately adds no production command, scheduler state transition, drop semantics, or serving claim. It supplies the observability needed to prove the later P2A changes rather than trusting controller-visible acknowledgements alone.
+
+#### Step 2: cancellation pruning before admission
+
+Completed as the first production scheduler lifecycle change in P2A.
+
+The shared TP1/TP scheduler tick now follows the fixed order `drain -> prune -> publish load -> admission -> plan`. It merges deferred and newly submitted work, removes requests whose `TokenSink` is already closed, publishes the resulting state, and only then computes slot/KV budgets and admits work. The idle wakeup path repeats drain/prune/publication after `blocking_recv()` because the waking request can close before admission and other submissions can race with the receive.
+
+Change to the existing scheduler skeleton:
+
+- Previously, the loop published the state left by the prior tick before draining `submit_rx`; `num_waiting_reqs` therefore represented only `deferred.len()`. It then drained submissions and entered admission.
+- The loop now first takes `deferred`, drains every currently available submission into the same `pending` vector, and calls one backend-neutral `prune_closed_requests` helper across pending, active, and prefilling ownership.
+- `publish_load` remains the same internal watch publication surface and `LoadSnapshot` retains the same public fields and types. A small `logical_load_counts` helper makes the post-prune running/waiting calculation directly testable; waiting is now `pending.len()` at the admission boundary.
+- The empty-loop blocking skeleton is retained, but wakeup now has a second drain/prune/publish boundary before admission. If every received request is already closed, the loop returns to blocking without entering admission or planning.
+- The admission and plan implementations are otherwise unchanged. This commit changes which settled state they consume, not their policies or the public `EngineHandle::load_watch()` API.
+
+Effect on the pre-existing TP1 (`SchedulerBackend::Single`) path:
+
+- A closed pending request is removed before `alloc_prefill_state`, so TP1 no longer allocates its KV/recurrent state and then discovers the disconnected consumer during token delivery.
+- A closed prefilling request is removed before plan construction. Consuming its existing `PrefillBackendState::Single` drops the owned `KvState` and `RecurrentState` through their existing RAII path; no TP1 release routine or allocator rule was added.
+- A closed active request is retired before the next model step through the existing `compact_single_slot` path. The same `swap_remove` and graph-slot copy used by EOS, length, and token-send failure are reused; only the retirement timing moves earlier, so the cancelled row no longer executes and samples one unnecessary decode step.
+- TP1 page availability, slot budgets, and plan construction now observe that cleanup in the same tick. Consequently, the executed batch width and load samples can differ under cancellation, but KV accounting formulas, slot-compaction mechanics, admission policy, plan builders, kernels, and sampling implementation are unchanged.
+
+Cleanup deliberately reuses existing backend ownership paths:
+
+- pending cancellation uses stable `retain`, preserving FIFO order among live requests;
+- active cancellation uses normal request retirement, including TP drop and single-GPU slot compaction;
+- prefilling cancellation removes the entry and drops its backend state through the existing adapter.
+
+This ordering makes cancellation visible to admission in the same tick. A closed resident is absent from the post-prune running/KV state, a live replacement is present in waiting, and the capacity released by the resident can admit that replacement immediately.
+
+Verification:
+
+- Three focused CPU tests pass for pending FIFO pruning, post-prune logical load, and same-tick capacity reuse.
+- The ignored real TP1 `max_batch=1` cancellation/replacement gate passes on an RTX 3090. It observes the post-prune `running=0, waiting=1` boundary, completes the replacement, and returns running, waiting, and KV usage to zero.
+- The existing real TP1 scheduler integration E2E passes (`1 passed`, 29.06 seconds).
+- Release all-target clippy with `-D warnings` passes.
+- The regular library suite passes: `74 passed`, `0 failed`, `9 ignored`.
+
+This step does not strengthen the TP drop reply protocol or add scheduler-wide fail-closed propagation. It uses the Phase 1 cleanup calls as they exist; exact-rank `DropExpectation` acknowledgement belongs to step 3, and mandatory replica-fatal propagation belongs to step 4.
 
 Goals:
 

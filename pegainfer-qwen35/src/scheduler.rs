@@ -996,14 +996,32 @@ fn publish_load(
     num_waiting_reqs: usize,
 ) {
     let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+    let (num_running_reqs, num_waiting_reqs) = logical_load_counts(
+        active,
+        prefilling,
+        inflight_prefill_reqs,
+        num_waiting_reqs,
+    );
     load_tx.send_replace(SchedulerMetrics {
         kv_used_blocks: kv_total_blocks
             .saturating_sub(backend.available_pages(active, prefilling) as u64),
         kv_total_blocks,
-        num_running_reqs: (active.len() + prefilling.len() + inflight_prefill_reqs) as u64,
-        num_waiting_reqs: num_waiting_reqs as u64,
+        num_running_reqs,
+        num_waiting_reqs,
         spec_decode: None,
     });
+}
+
+fn logical_load_counts(
+    active: &[ActiveRequest35],
+    prefilling: &[PrefillingRequest35],
+    inflight_prefill_reqs: usize,
+    num_waiting_reqs: usize,
+) -> (u64, u64) {
+    (
+        (active.len() + prefilling.len() + inflight_prefill_reqs) as u64,
+        num_waiting_reqs as u64,
+    )
 }
 
 fn should_block_on_submit(
@@ -1013,6 +1031,38 @@ fn should_block_on_submit(
     inflight_prefill: bool,
 ) -> bool {
     active_empty && prefilling_empty && pending_empty && !inflight_prefill
+}
+
+fn prune_closed_requests<B>(
+    backend: &mut B,
+    active: &mut Vec<ActiveRequest35>,
+    prefilling: &mut Vec<PrefillingRequest35>,
+    pending: &mut Vec<SchedulerRequest>,
+) where
+    B: DecodeDispatchBackend + PrefillPromoteBackend,
+{
+    pending.retain(|req| !req.token_tx.is_closed());
+
+    for idx in (0..active.len()).rev() {
+        if active[idx].token_tx.is_closed() {
+            debug!(
+                "request pruned before scheduling: request_id={:?} phase=decode tokens_generated={}",
+                active[idx].request_id, active[idx].generated_count
+            );
+            backend.retire_request(active, idx);
+        }
+    }
+
+    for idx in (0..prefilling.len()).rev() {
+        if prefilling[idx].req.token_tx.is_closed() {
+            let removed = prefilling.remove(idx);
+            debug!(
+                "request pruned before scheduling: request_id={:?} phase=prefill cursor={}",
+                removed.req.request_id, removed.cursor
+            );
+            backend.drop_prefill_state(removed.backend_state);
+        }
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1034,20 +1084,6 @@ fn scheduler_loop(
     info!("scheduler ready (max_batch={})", max_batch);
 
     loop {
-        // Publish the settled state between scheduler steps. If the prior step
-        // retired its final requests, their KV pages have already returned via
-        // RAII, so this snapshot reaches idle before the channel blocks below.
-        publish_load(
-            &load_tx,
-            &backend,
-            &active,
-            &prefilling,
-            inflight_prefill
-                .as_ref()
-                .map_or(0, |prefill| prefill.chunk.reqs.len()),
-            deferred.len(),
-        );
-
         if inflight_prefill
             .as_mut()
             .is_some_and(|prefill| prefill.output.is_ready())
@@ -1078,14 +1114,35 @@ fn scheduler_loop(
             );
         }
 
-        // 1. Drain all pending requests (deferred from last iteration + channel)
+        // 1. Merge deferred work with every submission currently available.
         let mut pending = std::mem::take(&mut deferred);
         while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
             pending.push(req);
         }
 
-        // 2. Nothing in flight (no decode, no in-progress prefill) and nothing
-        //    pending → block until a request arrives.
+        // 2. Remove closed work before metrics, admission, or planning. Active
+        // and prefilling cleanup goes through the backend's normal retirement
+        // paths so graph slots and TP request state are released consistently.
+        prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending);
+
+        // 3. Publish the settled post-prune state. Requests accepted from the
+        // channel are waiting until admission below; closed requests never
+        // appear in this snapshot or consume its KV/slot accounting.
+        publish_load(
+            &load_tx,
+            &backend,
+            &active,
+            &prefilling,
+            inflight_prefill
+                .as_ref()
+                .map_or(0, |prefill| prefill.chunk.reqs.len()),
+            pending.len(),
+        );
+
+        // 4. Nothing in flight and nothing pending: the idle snapshot above is
+        // already visible, so block until work arrives. Drain and prune again
+        // after wakeup because the first request may already be closed and more
+        // submissions may have raced with the blocking receive.
         if should_block_on_submit(
             active.is_empty(),
             prefilling.is_empty(),
@@ -1100,6 +1157,18 @@ fn scheduler_loop(
             }
             while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
                 pending.push(req);
+            }
+            prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending);
+            publish_load(
+                &load_tx,
+                &backend,
+                &active,
+                &prefilling,
+                0,
+                pending.len(),
+            );
+            if pending.is_empty() {
+                continue;
             }
         }
 
@@ -1141,7 +1210,7 @@ fn scheduler_loop(
             continue;
         }
 
-        // 3. Admit new prompts. In-flight prefills reserve their promotion slot
+        // 5. Admit new prompts. In-flight prefills reserve their promotion slot
         //    and future KV growth, so shrink the slot/page budgets accordingly
         let active_budget: Vec<ActiveKvBudget> = active
             .iter()
@@ -1181,7 +1250,7 @@ fn scheduler_loop(
             send_rejection(rejected, *reason);
         }
 
-        // 4. Move freshly admitted prompts into the chunked-prefill queue.
+        // 6. Move freshly admitted prompts into the chunked-prefill queue.
         for req in admission.pending {
             debug!(
                 "request admitted: request_id={:?} prompt_len={} max_tokens={}",
@@ -1209,7 +1278,7 @@ fn scheduler_loop(
 
         deferred = admission.deferred;
 
-        // 5. Choose this tick's prefill budget, take that chunk off the front of
+        // 7. Choose this tick's prefill budget, take that chunk off the front of
         //    the queue, then dispatch by plan. Auto can return 0 for a short
         //    decode-priority tick; the next iteration reconsiders the same FIFO
         //    prefill without reordering it.
