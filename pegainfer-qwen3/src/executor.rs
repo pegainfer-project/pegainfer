@@ -37,6 +37,7 @@ use crate::Qwen3OffloadOptions;
 use crate::batch_decode::DecodeGraphUse;
 use crate::batch_decode_buffers::BATCH_BUCKETS;
 use crate::batch_decode_buffers::BatchDecodeBuffers;
+use crate::batch_decode_buffers::per_token_graph_bucket_allowed;
 use crate::config::Config;
 use crate::config::TensorParallelConfig;
 use crate::weights::KvBudget;
@@ -1491,7 +1492,16 @@ impl Qwen3Executor {
                 Ok(())
             };
             run_phase(PrecapturePhase::Warmup)?;
-            for bucket_idx in 0..BATCH_BUCKETS.len() {
+            let graph_policy = pegainfer_kernels::ops::numeric_policy();
+            let captured_buckets = BATCH_BUCKETS
+                .iter()
+                .filter(|&&bucket| per_token_graph_bucket_allowed(graph_policy, bucket))
+                .count();
+
+            for (bucket_idx, &bucket) in BATCH_BUCKETS.iter().enumerate() {
+                if !per_token_graph_bucket_allowed(graph_policy, bucket) {
+                    continue;
+                }
                 run_phase(PrecapturePhase::Capture { bucket_idx })?;
                 run_phase(PrecapturePhase::Launch { bucket_idx })?;
             }
@@ -1499,7 +1509,7 @@ impl Qwen3Executor {
             let _ = sweep_done_tx.send(());
             log::info!(
                 "TP decode graph pre-capture: {} buckets per rank captured in {:.2}s",
-                BATCH_BUCKETS.len(),
+                captured_buckets,
                 started.elapsed().as_secs_f64()
             );
         }
@@ -3213,6 +3223,10 @@ impl LocalQwen3Lane {
             }
             PrecapturePhase::Finalize => {
                 for (bucket_idx, &bucket) in BATCH_BUCKETS.iter().enumerate() {
+                    if !per_token_graph_bucket_allowed(self.bufs.policy_at_construction, bucket) {
+                        continue;
+                    }
+
                     let path = BatchDecodeBuffers::attention_path(
                         bucket,
                         self.bufs.policy_at_construction,
@@ -3231,6 +3245,10 @@ impl LocalQwen3Lane {
 
     fn precapture_decode(&mut self, bucket_idx: usize, graph_use: DecodeGraphUse) -> Result<()> {
         let bucket = BATCH_BUCKETS[bucket_idx];
+
+        if !per_token_graph_bucket_allowed(self.bufs.policy_at_construction, bucket) {
+            return Ok(());
+        }
         let token_ids = vec![0u32; bucket];
         let kv_views: Vec<KvView> = (0..bucket)
             .map(|_| KvView::new(vec![self.padding_block_id], 1, self.layout.page_size))

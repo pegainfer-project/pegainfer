@@ -13,6 +13,7 @@ use super::batch_decode_buffers::BATCH_BUCKETS;
 use super::batch_decode_buffers::BatchDecodeBuffers;
 use super::batch_decode_buffers::DecodeAttentionPath;
 use super::batch_decode_buffers::bucket_for;
+use super::batch_decode_buffers::per_token_graph_bucket_allowed;
 use super::batch_decode_dag::BatchDecodeDag;
 use super::weights::PackedLoraProjection;
 use super::weights::Qwen3Model;
@@ -94,13 +95,32 @@ impl Qwen3Model {
             graphs_available || matches!(graph_use, DecodeGraphUse::Serve | DecodeGraphUse::Eager),
             "batch_decode {graph_use:?} requires CUDA graphs enabled and no LoRA rows"
         );
-        let use_cuda_graph = graphs_available && graph_use != DecodeGraphUse::Eager;
+        // PerToken records one GEMM node per now; cap Large buckets to bound graph memory.
+        // Above the cap, keep the PetToken arithmetic but execute the kernels eagerly
+        let mut use_cuda_graph = graphs_available && graph_use != DecodeGraphUse::Eager;
+        let requested_bucket = use_cuda_graph.then(|| bucket_for(bs));
+
+        if graph_use == DecodeGraphUse::Serve {
+            if let Some(bucket) = requested_bucket {
+                if !per_token_graph_bucket_allowed(bufs.policy_at_construction, bucket) {
+                    log::debug!(
+                        "PerToken decode bucket {bucket} exceeds graph cap{}; using eager decode",
+                        super::batch_decode_buffers::PERTOKEN_GRAPH_MAX_BUCKET
+                    );
+                    use_cuda_graph = false;
+                }
+            }
+        }
 
         // Derive positions from views (seq_len - 1 = position of the new token)
         let mut positions: Vec<i32> = kv_views.iter().map(|v| (v.seq_len() - 1) as i32).collect();
 
         // Pad to bucket size for CUDA Graph stability
-        let padded_bs = if use_cuda_graph { bucket_for(bs) } else { bs };
+        let padded_bs = if use_cuda_graph {
+            requested_bucket.expect("graph requests always have a batch bucket")
+        } else {
+            bs
+        };
 
         // Set batch size on all buffers (padded — kernels run at bucket width)
         bufs.set_batch_size(padded_bs);
