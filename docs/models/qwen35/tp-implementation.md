@@ -1,6 +1,6 @@
 # Qwen3.5 TP Implementation Record
 
-> **TL;DR:** Qwen3.5 TP Phase 1 is complete as a correctness-first eager dense TP path. P2A steps 1-4 add lifecycle baselines, pre-admission cancellation, start-gated exact-rank worker protocol, lifecycle-aware drop proof, and fail-closed scheduler completion/error propagation; unified execution remains before P2B GDR sharding.
+> **TL;DR:** Qwen3.5 TP Phase 1 and P2A are complete: TP2 now supports start-gated eager unified prefill+decode with strict ID-aligned artifacts, fail-closed lifecycle recovery, and pre-load CUDA ordinal validation; P2B GDR state sharding is next.
 >
 > **Last touched:** 2026-08
 
@@ -136,13 +136,13 @@ Stable test knobs:
 - `PEGAINFER_TEST_TP_DEVICES`: comma-separated TP2 CUDA ordinals. Defaults to `0,1`; examples: `1,2`, `2,3`. TP2 tests require exactly two distinct ordinals.
 - `PEGAINFER_TEST_FRONTEND_MODEL_PATH`: optional tokenizer/config metadata path for HTTP serving tests. Defaults to `PEGAINFER_TEST_MODEL_PATH` when unset.
 
-## Phase 2 Follow-Up
+## Phase 2 Progress
 
-Phase 2 is locked in `docs/models/qwen35/tp-design.md` as two separate implementation series: P2a is eager mixed unified execution on the replicated Phase 1 GDR path; P2b shards the head-indexed linear-attention/GDR weight and state surface. P2a protocol/lifecycle gates must complete before P2b changes loader, kernel, or state shapes.
+Phase 2 is locked in `docs/models/qwen35/tp-design.md` as two separate implementation series: P2a is eager mixed unified execution on the replicated Phase 1 GDR path; P2b shards the head-indexed linear-attention/GDR weight and state surface. P2a protocol/lifecycle gates are complete, so P2b can now change loader, kernel, and state shapes while preserving those contracts.
 
 ### P2a: TP mixed-step unified execution
 
-Implement eager `RunUnifiedStep` under TP while retaining Phase 1's replicated linear-attention/GDR weights, kernels, conv state, recurrent state, and scratch shapes.
+P2A implements eager `RunUnifiedStep` under TP while retaining Phase 1's replicated linear-attention/GDR weights, kernels, conv state, recurrent state, and scratch shapes.
 
 #### Step 1: lifecycle cleanup gates
 
@@ -272,7 +272,41 @@ Verification:
 
 Step 4 does not add unified plans, change worker command payloads, alter TP1 sampling, or modify GDR weights/state/kernel shapes. Step 5 owns `RunUnifiedStep`, strict ID-aligned unified artifacts, ordinal validation, and the final TP1/TP2 regression ladder.
 
-Goals:
+#### Step 5: TP unified execution
+
+Completed as the final P2A execution-protocol milestone. When active decode and scheduled prefill coexist, TP now uses the same `plan::build_next_plan` decision as the single-GPU scheduler and emits one start-gated `RunUnifiedStep` to every rank. The canonical plan carries ordered prefill/decode items plus separate seeds. The scheduler selects the decode seed first and the prefill seed second to preserve its prior RNG order; workers execute prefill first and decode second on every rank. Rank 0 returns `TpUnifiedResult`, while every non-primary rank must return `Ack`.
+
+Internal protocol/API changes:
+
+- Added crate-private `TpUnifiedPlan`, `TpUnifiedResult`, the complete `RunUnifiedStep` payload, and `TpWorkerReply::Unified`. These are not re-exported through `runtime`; the public server `EngineHandle`, `TokenEvent`, and request contract are unchanged.
+- Refactored worker prefill/decode into typed inner row operations so standalone and unified commands share the same eager kernels and sampling behavior. Existing public low-level `execute_prefill`/`execute_decode` results retain their shapes.
+- Added controller structural validation before enqueue: both halves must be non-empty, row counts must fit scheduler capacity, prefill/decode IDs must be internally unique and mutually disjoint, and prefill chunks must be non-empty. Worker-local request existence, phase, and actual capacity are revalidated after gate release and remain replica-fatal rather than adding a two-phase validation protocol.
+- Extended exact-rank reply validation so unified accepts exactly one rank-0 `Unified` result plus non-primary acknowledgements. Returned worker or reply-set failure continues through the step-4 poison and terminal scheduler path.
+
+Change to the existing scheduler skeleton:
+
+- Removed the TP-only `build_eager_only_plan` branch. Both backends now use the normal planner, so active decode plus scheduled prefill becomes `ExecutionPlan::Unified` instead of two serialized scheduler ticks.
+- Added a TP-only execution adapter that builds the canonical plan, aligns returned artifacts by `RequestId`, processes decode results first, and only then promotes or requeues prefill. Decode completion can therefore release capacity through `DropRequest(MustExist)` before final-prefill promotion.
+- Replaced TP prefill token-`0` placeholders and positional decode matching with explicit artifacts. Prefill alignment is a chunk-length `Vec<Option<PrefillArtifact>>`: outer `None` means non-final, while `Some { logprob: None, .. }` is a valid final artifact. Decode requires one artifact for every active ID. Shuffled valid results are accepted; unknown, duplicate, non-final, or missing IDs poison the replica after execution.
+- The shared `promote_or_requeue` skeleton now accepts a backend-specific artifact wrapper. The single-GPU branch still consumes its original dense sampled tokens/logprobs, uses the same logits path and RNG calls, and retains its step-4 publish/retire semantics.
+
+Startup now validates TP CUDA ordinals against the generated Triton AOT handle-table contract before model/filesystem/CUDA access. Ordinals must be distinct and below the named table length `16`; the generated wrapper's runtime bounds check remains defense in depth.
+
+Verification:
+
+- Release all-target check and clippy with `-D warnings`, formatting, and `git diff --check` pass.
+- Complete non-ignored library suite passes on SM86: `96 passed`, `0 failed`, `14 ignored`.
+- Pure tests cover ordinal bounds/duplicates, unified structural rejection plus subsequent healthy dispatch, worker-local missing/phase/capacity failures, exact-rank unified replies, shuffled artifact alignment, unknown/duplicate/missing IDs, and final-without-logprobs versus non-final absence.
+- The real-weight TP2 executor mixed-step gate passes (`1 passed`, 7.27 seconds), confirms both ranks retain two decoding requests after the combined operation, and returns both ranks to empty after lifecycle cleanup.
+- The deterministic real-weight TP2 scheduler case with `max_batch=2` and `max_prefill_tokens=1` passes (`1 passed`, 7.15 seconds).
+- All `13` TP2/lifecycle ignored library gates pass together. The fourteenth ignored test is TP1-only and could not load under the unrelated training process: the loader reported `8101 MB` free versus `3248 MB` prefill scratch plus `6288 MB` recurrent state and minimal KV needs. No training process was stopped.
+- Complete TP2 scheduler E2E passes (`1 passed`, 35.89 seconds).
+- TP2 short/long HF golden gates pass (`2 passed`): short sequential mean `0.0260`, p99 `0.1081`; short batched mean `0.0267`, p99 `0.1167`; long sequential mean `0.0228`, p99 `0.0689`.
+- TP2 OpenAI-compatible HTTP serving smoke passes (`1 passed`, 10.41 seconds), including streaming, non-streaming, concurrent completions, logprobs, and TP+CUDA Graph rejection.
+
+P2A does not shard GDR weights/state/scratch, add a post-GDR all-reduce, enable TP CUDA Graph, or claim a performance improvement. TP1's earlier real-weight evidence remains applicable, but a same-session full TP1 model E2E rerun is still resource-blocked by external GPU occupancy.
+
+Delivered constraints:
 
 - Support mixed prefill+decode scheduler steps under TP.
 - Preserve deterministic collective ordering across ranks.
@@ -307,6 +341,7 @@ Non-negotiable invariant:
 
 ## Follow-Ups
 
+- Design and implement P2B sharded linear-attention/GDR state without weakening the completed P2A lifecycle and ID contracts.
 - Promote any stable contract changes discovered here back into `tp-design.md` through the design-doc branch.
 - Decide whether Qwen3.5 server CLI should accept arbitrary TP device ordinals instead of only `0..tp_size`.
 - Consider lifting the per-device Triton AOT handle lesson into a kernels or runtime subsystem doc if another model hits the same issue.

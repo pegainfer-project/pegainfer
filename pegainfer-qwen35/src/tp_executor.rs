@@ -1,7 +1,7 @@
 //! Tensor-parallel worker runtime for Qwen3.5.
 //!
-//! Phase 1 supports eager dense TP prefill and decode. Unified execution still
-//! fails closed until the scheduler path can drive ordered eager decode.
+//! Phase 2A adds one canonical eager unified command while retaining the
+//! replicated linear-attention state layout from Phase 1.
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
@@ -45,6 +45,7 @@ const TP_NCCL_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const TP_RUNTIME_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const TP_WORKER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const TP_RUNTIME_MEMORY_RESERVE_BYTES: usize = 512 * 1024 * 1024;
+const TRITON_AOT_DEVICE_TABLE_LEN: usize = 16;
 
 #[allow(dead_code)]
 enum TpWorkerCommand {
@@ -64,6 +65,7 @@ enum TpWorkerCommand {
         resp: mpsc::Sender<TpWorkerResponse>,
     },
     RunUnifiedStep {
+        plan: TpUnifiedPlan,
         start: Arc<TpCommandStartGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
@@ -96,6 +98,7 @@ enum TpWorkerReply {
     },
     Prefill(PrefillResult),
     Decode(DecodeResult),
+    Unified(TpUnifiedResult),
     #[cfg(test)]
     Snapshot(WorkerStateSnapshot),
 }
@@ -261,6 +264,20 @@ impl TpDecodeStepItem {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct TpUnifiedPlan {
+    pub(crate) prefill: Vec<TpPrefillChunkItem>,
+    pub(crate) decode: Vec<TpDecodeStepItem>,
+    pub(crate) prefill_sample_seed: u64,
+    pub(crate) decode_sample_seed: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct TpUnifiedResult {
+    pub(crate) prefill: PrefillResult,
+    pub(crate) decode: DecodeResult,
+}
+
 impl Qwen35TpExecutor {
     #[cfg(test)]
     fn from_runtime(
@@ -293,6 +310,7 @@ impl Qwen35TpExecutor {
         max_batch: usize,
         max_prefill_tokens: usize,
     ) -> Result<Self> {
+        validate_cuda_ordinals(device_ordinals)?;
         anyhow::ensure!(
             device_ordinals.len() > 1,
             "Qwen3.5 TP executor requires at least two CUDA devices, got {}",
@@ -421,7 +439,6 @@ impl Qwen35TpExecutor {
         Ok(Self {
             workers,
             poison,
-            #[cfg(test)]
             world_size,
             max_batch: min_rank_max_batch,
             page_size,
@@ -573,6 +590,36 @@ impl Qwen35TpExecutor {
         )
     }
 
+    pub(crate) fn execute_unified(&self, plan: &TpUnifiedPlan) -> Result<TpUnifiedResult> {
+        self.poison.ensure_healthy()?;
+        validate_unified_plan(plan, self.max_batch)?;
+        let resp_rx = self.dispatch_mutating("unified step", |start, resp| {
+            TpWorkerCommand::RunUnifiedStep {
+                plan: plan.clone(),
+                start,
+                resp,
+            }
+        })?;
+        let responses =
+            recv_runtime_responses(&resp_rx, self.world_size, "unified step", &self.poison)?;
+        validate_dispatched_responses(
+            validate_unified_responses(responses, self.world_size),
+            "unified step",
+            &self.poison,
+        )
+    }
+
+    pub(crate) fn poison_artifact_contract(
+        &self,
+        operation: &'static str,
+        err: &anyhow::Error,
+    ) -> anyhow::Error {
+        let reason = self.poison.poison(format!(
+            "invalid Qwen3.5 TP {operation} artifact set: {err:#}"
+        ));
+        anyhow::anyhow!(reason)
+    }
+
     pub fn drop_request(&self, request_id: RequestId, expectation: DropExpectation) -> Result<()> {
         self.poison.ensure_healthy()?;
         let resp_rx =
@@ -711,6 +758,7 @@ impl Qwen35TpExecutor {
         )
     }
 
+    #[cfg(test)]
     fn send_or_poison(&self, worker: &TpWorker, command: TpWorkerCommand) -> Result<()> {
         worker.send(command).map_err(|err| {
             let reason = self
@@ -1146,18 +1194,12 @@ impl TpWorkerState {
                         self.respond(resp, "decode", result)
                     }
                 }
-                TpWorkerCommand::RunUnifiedStep { start, resp } => {
+                TpWorkerCommand::RunUnifiedStep { plan, start, resp } => {
                     if start.wait() == TpCommandDecision::Cancel {
                         false
                     } else {
-                        let rank = self.rank;
-                        self.respond(
-                            resp,
-                            "unified step",
-                            Err(anyhow::anyhow!(
-                                "Qwen3.5 TP worker rank {rank} has no TP unified implementation yet"
-                            )),
-                        )
+                        let result = self.execute_unified(&plan);
+                        self.respond(resp, "unified step", result)
                     }
                 }
                 TpWorkerCommand::DropRequest {
@@ -1241,6 +1283,19 @@ impl TpWorkerState {
         chunks: &[TpPrefillChunkItem],
         sample_seed: u64,
     ) -> Result<TpWorkerReply> {
+        let requests = self.execute_prefill_rows(chunks, sample_seed)?;
+        if self.rank == 0 {
+            Ok(TpWorkerReply::Prefill(PrefillResult { requests }))
+        } else {
+            Ok(TpWorkerReply::Ack)
+        }
+    }
+
+    fn execute_prefill_rows(
+        &mut self,
+        chunks: &[TpPrefillChunkItem],
+        sample_seed: u64,
+    ) -> Result<Vec<PrefillRequestResult>> {
         anyhow::ensure!(
             !chunks.is_empty(),
             "Qwen3.5 TP prefill chunk command requires at least one chunk"
@@ -1289,13 +1344,7 @@ impl TpWorkerState {
             }
         }
 
-        if self.rank == 0 {
-            Ok(TpWorkerReply::Prefill(PrefillResult {
-                requests: primary_results,
-            }))
-        } else {
-            Ok(TpWorkerReply::Ack)
-        }
+        Ok(primary_results)
     }
 
     fn sample_final_prefill_chunk(
@@ -1331,6 +1380,19 @@ impl TpWorkerState {
         requests: &[TpDecodeStepItem],
         sample_seed: u64,
     ) -> Result<TpWorkerReply> {
+        let requests = self.execute_decode_rows(requests, sample_seed)?;
+        if self.rank == 0 {
+            Ok(TpWorkerReply::Decode(DecodeResult { requests }))
+        } else {
+            Ok(TpWorkerReply::Ack)
+        }
+    }
+
+    fn execute_decode_rows(
+        &mut self,
+        requests: &[TpDecodeStepItem],
+        sample_seed: u64,
+    ) -> Result<Vec<DecodeRequestResult>> {
         anyhow::ensure!(
             !requests.is_empty(),
             "Qwen3.5 TP decode command requires at least one request"
@@ -1398,9 +1460,27 @@ impl TpWorkerState {
             }
         }
 
+        Ok(primary_results)
+    }
+
+    fn execute_unified(&mut self, plan: &TpUnifiedPlan) -> Result<TpWorkerReply> {
+        validate_unified_worker_state(self, plan)?;
+
+        // The command order is canonical across ranks. Sampling seeds are
+        // selected by the scheduler in decode-then-prefill order, independent
+        // of this forward order.
+        let prefill_requests =
+            self.execute_prefill_rows(&plan.prefill, plan.prefill_sample_seed)?;
+        let decode_requests = self.execute_decode_rows(&plan.decode, plan.decode_sample_seed)?;
+
         if self.rank == 0 {
-            Ok(TpWorkerReply::Decode(DecodeResult {
-                requests: primary_results,
+            Ok(TpWorkerReply::Unified(TpUnifiedResult {
+                prefill: PrefillResult {
+                    requests: prefill_requests,
+                },
+                decode: DecodeResult {
+                    requests: decode_requests,
+                },
             }))
         } else {
             Ok(TpWorkerReply::Ack)
@@ -1473,6 +1553,101 @@ fn validate_decode_requests(requests: &[TpDecodeStepItem]) -> Result<()> {
             seen.insert(request.request_id),
             "duplicate Qwen3.5 TP request id {} in one decode command",
             request.request_id.get()
+        );
+    }
+    Ok(())
+}
+
+fn validate_cuda_ordinals(device_ordinals: &[usize]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(device_ordinals.len());
+    for &ordinal in device_ordinals {
+        anyhow::ensure!(
+            ordinal < TRITON_AOT_DEVICE_TABLE_LEN,
+            "Qwen3.5 TP CUDA ordinal {ordinal} exceeds the Triton AOT device table bound {TRITON_AOT_DEVICE_TABLE_LEN}"
+        );
+        anyhow::ensure!(
+            seen.insert(ordinal),
+            "Qwen3.5 TP CUDA ordinals must be distinct; ordinal {ordinal} appears more than once"
+        );
+    }
+    Ok(())
+}
+
+fn validate_unified_plan(plan: &TpUnifiedPlan, max_batch: usize) -> Result<()> {
+    anyhow::ensure!(
+        !plan.prefill.is_empty(),
+        "Qwen3.5 TP unified plan requires at least one prefill chunk"
+    );
+    anyhow::ensure!(
+        !plan.decode.is_empty(),
+        "Qwen3.5 TP unified plan requires at least one decode request"
+    );
+    validate_prefill_chunks(&plan.prefill)?;
+    validate_decode_requests(&plan.decode)?;
+    anyhow::ensure!(
+        plan.prefill.len().saturating_add(plan.decode.len()) <= max_batch,
+        "Qwen3.5 TP unified plan has {} rows, exceeding scheduler capacity {max_batch}",
+        plan.prefill.len().saturating_add(plan.decode.len())
+    );
+
+    let prefill_ids: HashSet<_> = plan.prefill.iter().map(|item| item.request_id).collect();
+    for decode in &plan.decode {
+        anyhow::ensure!(
+            !prefill_ids.contains(&decode.request_id),
+            "Qwen3.5 TP unified plan request id {} appears in both prefill and decode",
+            decode.request_id.get()
+        );
+    }
+    Ok(())
+}
+
+fn validate_unified_worker_state(state: &TpWorkerState, plan: &TpUnifiedPlan) -> Result<()> {
+    validate_unified_worker_layout(plan, state.max_batch, state.requests.len(), |request_id| {
+        state
+            .request_index(request_id)
+            .map(|idx| state.requests[idx].phase)
+    })
+}
+
+fn validate_unified_worker_layout(
+    plan: &TpUnifiedPlan,
+    max_batch: usize,
+    resident_count: usize,
+    mut phase_for: impl FnMut(RequestId) -> Option<TpRequestPhase>,
+) -> Result<()> {
+    validate_unified_plan(plan, max_batch)?;
+
+    let new_prefill_count = plan
+        .prefill
+        .iter()
+        .filter(|item| phase_for(item.request_id).is_none())
+        .count();
+    anyhow::ensure!(
+        resident_count.saturating_add(new_prefill_count) <= max_batch,
+        "Qwen3.5 TP unified plan would exceed worker capacity {}",
+        max_batch
+    );
+
+    for item in &plan.prefill {
+        if let Some(phase) = phase_for(item.request_id) {
+            anyhow::ensure!(
+                phase == TpRequestPhase::Prefilling,
+                "Qwen3.5 TP unified prefill request {} is already in decode state",
+                item.request_id.get()
+            );
+        }
+    }
+    for item in &plan.decode {
+        let phase = phase_for(item.request_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Qwen3.5 TP unified decode request {} has no worker state",
+                item.request_id.get()
+            )
+        })?;
+        anyhow::ensure!(
+            phase == TpRequestPhase::Decoding,
+            "Qwen3.5 TP unified request {} is not ready for decode",
+            item.request_id.get()
         );
     }
     Ok(())
@@ -1559,6 +1734,7 @@ fn validate_exact_rank_responses(
     Ok(replies)
 }
 
+#[cfg(test)]
 fn validate_ack_responses(
     responses: Vec<TpWorkerResponse>,
     world_size: usize,
@@ -1641,12 +1817,35 @@ fn validate_decode_responses(
     primary.ok_or_else(|| anyhow::anyhow!("decode returned no primary result"))
 }
 
+fn validate_unified_responses(
+    responses: Vec<TpWorkerResponse>,
+    world_size: usize,
+) -> Result<TpUnifiedResult> {
+    let mut primary = None;
+    for (rank, reply) in validate_exact_rank_responses(responses, world_size, "unified step")? {
+        match (rank, reply) {
+            (0, TpWorkerReply::Unified(result)) => primary = Some(result),
+            (0, reply) => anyhow::bail!(
+                "unified step rank 0 returned {} instead of primary unified result",
+                reply_name(&reply)
+            ),
+            (_, TpWorkerReply::Ack) => {}
+            (rank, reply) => anyhow::bail!(
+                "unified step non-primary rank {rank} returned {} instead of acknowledgement",
+                reply_name(&reply)
+            ),
+        }
+    }
+    primary.ok_or_else(|| anyhow::anyhow!("unified step returned no primary result"))
+}
+
 fn reply_name(reply: &TpWorkerReply) -> &'static str {
     match reply {
         TpWorkerReply::Ack => "acknowledgement",
         TpWorkerReply::DropAck { .. } => "drop acknowledgement",
         TpWorkerReply::Prefill(_) => "prefill result",
         TpWorkerReply::Decode(_) => "decode result",
+        TpWorkerReply::Unified(_) => "unified result",
         #[cfg(test)]
         TpWorkerReply::Snapshot(_) => "worker snapshot",
     }
@@ -1700,6 +1899,9 @@ fn wait_for_worker_snapshots(
             }
             TpWorkerReply::Decode(_) => {
                 anyhow::bail!("Qwen3.5 TP snapshot unexpectedly returned decode result")
+            }
+            TpWorkerReply::Unified(_) => {
+                anyhow::bail!("Qwen3.5 TP snapshot unexpectedly returned unified result")
             }
         }
     }
@@ -1859,6 +2061,17 @@ mod tests {
         })
     }
 
+    fn empty_unified_reply() -> TpWorkerReply {
+        TpWorkerReply::Unified(TpUnifiedResult {
+            prefill: PrefillResult {
+                requests: Vec::new(),
+            },
+            decode: DecodeResult {
+                requests: Vec::new(),
+            },
+        })
+    }
+
     fn executor_without_worker_threads(
         world_size: usize,
     ) -> (Qwen35TpExecutor, Vec<mpsc::Receiver<TpWorkerCommand>>) {
@@ -2008,13 +2221,82 @@ mod tests {
             .to_string();
         assert!(err.contains("duplicate"));
 
-        for receiver in receivers {
+        let overlapping_unified = TpUnifiedPlan {
+            prefill: vec![TpPrefillChunkItem::new(
+                RequestId::new(5),
+                vec![9707],
+                0,
+                true,
+            )],
+            decode: vec![TpDecodeStepItem::new(
+                RequestId::new(5),
+                560,
+                0,
+                SamplingParams::default(),
+            )],
+            prefill_sample_seed: 1,
+            decode_sample_seed: 2,
+        };
+        let err = executor
+            .execute_unified(&overlapping_unified)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both prefill and decode"));
+
+        for receiver in &receivers {
             assert!(matches!(
                 receiver.try_recv(),
                 Err(mpsc::TryRecvError::Empty)
             ));
         }
         executor.poison.ensure_healthy().unwrap();
+
+        let responders: Vec<_> = receivers
+            .into_iter()
+            .enumerate()
+            .map(|(rank, receiver)| {
+                thread::spawn(move || {
+                    let TpWorkerCommand::RunUnifiedStep { start, resp, .. } =
+                        receiver.recv().expect("receive valid unified command")
+                    else {
+                        panic!("expected valid unified command")
+                    };
+                    assert_eq!(start.wait(), TpCommandDecision::Execute);
+                    let reply = if rank == 0 {
+                        empty_unified_reply()
+                    } else {
+                        TpWorkerReply::Ack
+                    };
+                    resp.send(TpWorkerResponse {
+                        rank,
+                        result: Ok(reply),
+                    })
+                    .expect("return valid unified response");
+                })
+            })
+            .collect();
+        let valid = TpUnifiedPlan {
+            prefill: vec![TpPrefillChunkItem::new(
+                RequestId::new(6),
+                vec![9707],
+                0,
+                true,
+            )],
+            decode: vec![TpDecodeStepItem::new(
+                RequestId::new(7),
+                560,
+                0,
+                SamplingParams::default(),
+            )],
+            prefill_sample_seed: 3,
+            decode_sample_seed: 2,
+        };
+        executor
+            .execute_unified(&valid)
+            .expect("valid unified command should succeed after structural rejection");
+        for responder in responders {
+            responder.join().unwrap();
+        }
     }
 
     #[test]
@@ -2195,6 +2477,32 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("non-primary rank 1"));
+
+        validate_unified_responses(
+            vec![
+                reply(1, TpWorkerReply::Ack),
+                reply(0, empty_unified_reply()),
+            ],
+            2,
+        )
+        .unwrap();
+        let err = validate_unified_responses(
+            vec![reply(0, TpWorkerReply::Ack), reply(1, TpWorkerReply::Ack)],
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("rank 0"));
+        let err = validate_unified_responses(
+            vec![
+                reply(0, empty_unified_reply()),
+                reply(1, empty_unified_reply()),
+            ],
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("non-primary rank 1"));
     }
 
     fn snapshot_response(
@@ -2302,6 +2610,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_cuda_ordinals_before_model_load() {
+        let out_of_bounds = match Qwen35TpExecutor::from_runtime_with_capacity(
+            "path-that-must-not-be-read",
+            false,
+            &[0, TRITON_AOT_DEVICE_TABLE_LEN],
+            1,
+        ) {
+            Ok(_) => panic!("out-of-bounds CUDA ordinal should fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(out_of_bounds.contains("ordinal 16"));
+        assert!(out_of_bounds.contains("bound 16"));
+
+        let duplicate = match Qwen35TpExecutor::from_runtime_with_capacity(
+            "path-that-must-not-be-read",
+            false,
+            &[3, 3],
+            1,
+        ) {
+            Ok(_) => panic!("duplicate CUDA ordinal should fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(duplicate.contains("ordinal 3 appears more than once"));
+        validate_cuda_ordinals(&[0, TRITON_AOT_DEVICE_TABLE_LEN - 1]).unwrap();
+    }
+
+    #[test]
     fn rejects_single_device_topology() {
         let err = match Qwen35TpExecutor::from_runtime_with_capacity("unused", false, &[0], 1) {
             Ok(_) => panic!("single-device TP topology should fail"),
@@ -2351,6 +2686,139 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn validates_unified_plan_shape_before_dispatch() {
+        let prefill = TpPrefillChunkItem::new(RequestId::new(1), vec![9707], 0, true);
+        let decode = TpDecodeStepItem::new(RequestId::new(2), 560, 0, SamplingParams::default());
+        validate_unified_plan(
+            &TpUnifiedPlan {
+                prefill: vec![prefill.clone()],
+                decode: vec![decode.clone()],
+                prefill_sample_seed: 11,
+                decode_sample_seed: 10,
+            },
+            2,
+        )
+        .unwrap();
+
+        let empty = validate_unified_plan(
+            &TpUnifiedPlan {
+                prefill: Vec::new(),
+                decode: vec![decode.clone()],
+                prefill_sample_seed: 11,
+                decode_sample_seed: 10,
+            },
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(empty.contains("at least one prefill"));
+
+        let overlap = validate_unified_plan(
+            &TpUnifiedPlan {
+                prefill: vec![prefill],
+                decode: vec![TpDecodeStepItem::new(
+                    RequestId::new(1),
+                    560,
+                    0,
+                    SamplingParams::default(),
+                )],
+                prefill_sample_seed: 11,
+                decode_sample_seed: 10,
+            },
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(overlap.contains("both prefill and decode"));
+
+        let over_capacity = validate_unified_plan(
+            &TpUnifiedPlan {
+                prefill: vec![TpPrefillChunkItem::new(
+                    RequestId::new(3),
+                    vec![9707],
+                    0,
+                    true,
+                )],
+                decode: vec![decode],
+                prefill_sample_seed: 11,
+                decode_sample_seed: 10,
+            },
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(over_capacity.contains("exceeding scheduler capacity 1"));
+    }
+
+    #[test]
+    fn validates_worker_local_unified_state_before_mutation() {
+        let plan = TpUnifiedPlan {
+            prefill: vec![TpPrefillChunkItem::new(
+                RequestId::new(1),
+                vec![9707],
+                0,
+                false,
+            )],
+            decode: vec![TpDecodeStepItem::new(
+                RequestId::new(2),
+                560,
+                0,
+                SamplingParams::default(),
+            )],
+            prefill_sample_seed: 11,
+            decode_sample_seed: 10,
+        };
+        let validate = |states: &[(RequestId, TpRequestPhase)], resident_count| {
+            validate_unified_worker_layout(&plan, 2, resident_count, |request_id| {
+                states
+                    .iter()
+                    .find_map(|(id, phase)| (*id == request_id).then_some(*phase))
+            })
+        };
+
+        validate(
+            &[
+                (RequestId::new(1), TpRequestPhase::Prefilling),
+                (RequestId::new(2), TpRequestPhase::Decoding),
+            ],
+            2,
+        )
+        .unwrap();
+
+        let missing = validate(&[(RequestId::new(1), TpRequestPhase::Prefilling)], 1)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("decode request 2 has no worker state"));
+
+        let wrong_prefill = validate(
+            &[
+                (RequestId::new(1), TpRequestPhase::Decoding),
+                (RequestId::new(2), TpRequestPhase::Decoding),
+            ],
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_prefill.contains("prefill request 1 is already in decode state"));
+
+        let wrong_decode = validate(
+            &[
+                (RequestId::new(1), TpRequestPhase::Prefilling),
+                (RequestId::new(2), TpRequestPhase::Prefilling),
+            ],
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_decode.contains("request 2 is not ready for decode"));
+
+        let capacity = validate(&[(RequestId::new(2), TpRequestPhase::Decoding)], 2)
+            .unwrap_err()
+            .to_string();
+        assert!(capacity.contains("exceed worker capacity 2"));
     }
 
     fn assert_workers_empty(executor: &Qwen35TpExecutor) {
@@ -2571,6 +3039,63 @@ mod tests {
         executor
             .drop_request(request_id, DropExpectation::MustExist)
             .expect("drop decoded request");
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_unified_step_advances_prefill_and_decode_together() {
+        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
+            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 2)
+            .expect("start TP2 executor");
+        let decode_id = RequestId::new(30);
+        let decode_prefill = executor
+            .execute_prefill(PrefillPlan {
+                requests: &[PrefillStepItem::new(decode_id, vec![151_646, 9707], 1)],
+            })
+            .expect("materialize TP2 decode request");
+        let prefill_id = RequestId::new(31);
+        let unified = executor
+            .execute_unified(&TpUnifiedPlan {
+                prefill: vec![TpPrefillChunkItem::new(
+                    prefill_id,
+                    vec![151_646, 9707],
+                    1,
+                    true,
+                )],
+                decode: vec![TpDecodeStepItem::new(
+                    decode_id,
+                    decode_prefill.requests[0].first_token,
+                    1,
+                    SamplingParams::default(),
+                )],
+                prefill_sample_seed: 102,
+                decode_sample_seed: 101,
+            })
+            .expect("run TP2 unified step");
+
+        assert_eq!(unified.prefill.requests.len(), 1);
+        assert_eq!(unified.prefill.requests[0].request_id, prefill_id);
+        assert!(unified.prefill.requests[0].first_token_logprob.is_some());
+        assert_eq!(unified.decode.requests.len(), 1);
+        assert_eq!(unified.decode.requests[0].request_id, decode_id);
+        assert!(unified.decode.requests[0].logprob.is_some());
+        for snapshot in executor.snapshot_workers().expect("snapshot unified state") {
+            assert_eq!(snapshot.request_count, 2);
+            assert!(
+                snapshot
+                    .requests
+                    .iter()
+                    .all(|(_, phase)| *phase == TpRequestPhase::Decoding)
+            );
+        }
+
+        for request_id in [decode_id, prefill_id] {
+            executor
+                .drop_request(request_id, DropExpectation::MustExist)
+                .expect("drop unified request");
+        }
+        assert_workers_empty(&executor);
     }
 
     #[test]

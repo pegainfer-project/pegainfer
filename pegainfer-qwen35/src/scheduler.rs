@@ -6,6 +6,8 @@
 
 mod plan;
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -67,6 +69,7 @@ use crate::tp_executor::DropExpectation;
 use crate::tp_executor::Qwen35TpExecutor;
 use crate::tp_executor::TpDecodeStepItem;
 use crate::tp_executor::TpPrefillChunkItem;
+use crate::tp_executor::TpUnifiedPlan;
 use crate::weights::Qwen35Model;
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -206,6 +209,45 @@ impl<R: CompletionRequest> CompletionCandidate<R> {
 struct FatalSchedulerError {
     message: String,
     transient: Vec<TerminalRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PrefillArtifact {
+    token: u32,
+    logprob: Option<TokenLogprob>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DecodeArtifact {
+    token: u32,
+    logprob: Option<TokenLogprob>,
+}
+
+struct AlignedUnifiedArtifacts {
+    prefill: Vec<Option<PrefillArtifact>>,
+    decode: Vec<DecodeArtifact>,
+}
+
+enum PrefillStepArtifacts {
+    Single {
+        tokens: Vec<u32>,
+        logprobs: Vec<Option<TokenLogprob>>,
+    },
+    Tp(Vec<Option<PrefillArtifact>>),
+}
+
+impl PrefillStepArtifacts {
+    fn final_artifact(&self, idx: usize) -> PrefillArtifact {
+        match self {
+            Self::Single { tokens, logprobs } => PrefillArtifact {
+                token: tokens[idx],
+                logprob: logprobs[idx].clone(),
+            },
+            Self::Tp(artifacts) => artifacts[idx]
+                .clone()
+                .expect("validated TP final-prefill row must contain an artifact"),
+        }
+    }
 }
 
 impl FatalSchedulerError {
@@ -864,53 +906,49 @@ impl TpSchedulerBackend {
         &self,
         chunk: &ScheduledChunk,
         sample_seed: u64,
-    ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
-        let ScheduledChunkBackendState::Tp { request_ids } = &chunk.backend_state else {
-            anyhow::bail!("TP prefill received single-GPU chunk state");
-        };
-        let items: Vec<TpPrefillChunkItem> = chunk
-            .reqs
-            .iter()
-            .zip(request_ids)
-            .zip(&chunk.windows)
-            .zip(&chunk.ends)
-            .map(|(((req, request_id), window), end)| {
-                TpPrefillChunkItem::new_with_sampling(
-                    *request_id,
-                    window.clone(),
-                    req.logprobs,
-                    req.params,
-                    *end == req.prompt_tokens.len(),
-                )
-            })
-            .collect();
+    ) -> Result<Vec<Option<PrefillArtifact>>> {
+        let items = tp_prefill_items(chunk)?;
         let result = self
             .executor
             .execute_prefill_chunks_with_seed(&items, sample_seed)?;
         align_prefill_results(chunk, &result)
+            .map_err(|err| self.executor.poison_artifact_contract("prefill", &err))
     }
 
     fn execute_decode(
         &self,
         active: &[ActiveRequest35],
         sample_seed: u64,
-    ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
-        let items: Vec<TpDecodeStepItem> = active
-            .iter()
-            .map(|req| {
-                let ActiveBackendState::Tp { request_id } = &req.backend_state else {
-                    anyhow::bail!("TP decode received single-GPU active state");
-                };
-                Ok(TpDecodeStepItem::new(
-                    *request_id,
-                    req.last_token,
-                    req.logprobs,
-                    req.params,
-                ))
-            })
-            .collect::<Result<_>>()?;
+    ) -> Result<Vec<DecodeArtifact>> {
+        let items = tp_decode_items(active)?;
         let result = self.executor.execute_decode_items(&items, sample_seed)?;
         align_decode_results(active, &result)
+            .map_err(|err| self.executor.poison_artifact_contract("decode", &err))
+    }
+
+    fn execute_unified(
+        &self,
+        chunk: &ScheduledChunk,
+        active: &[ActiveRequest35],
+        decode_sample_seed: u64,
+        prefill_sample_seed: u64,
+    ) -> Result<AlignedUnifiedArtifacts> {
+        let plan = TpUnifiedPlan {
+            prefill: tp_prefill_items(chunk)?,
+            decode: tp_decode_items(active)?,
+            prefill_sample_seed,
+            decode_sample_seed,
+        };
+        let result = self.executor.execute_unified(&plan)?;
+        let prefill = align_prefill_results(chunk, &result.prefill).map_err(|err| {
+            self.executor
+                .poison_artifact_contract("unified prefill", &err)
+        })?;
+        let decode = align_decode_results(active, &result.decode).map_err(|err| {
+            self.executor
+                .poison_artifact_contract("unified decode", &err)
+        })?;
+        Ok(AlignedUnifiedArtifacts { prefill, decode })
     }
 
     fn drop_request(&self, request_id: RequestId, expectation: DropExpectation) -> Result<()> {
@@ -970,10 +1008,6 @@ impl SchedulerBackend {
         }
     }
 
-    fn is_tp(&self) -> bool {
-        matches!(self, Self::Tp(_))
-    }
-
     fn is_stop_token(&self, token: u32) -> bool {
         match self {
             Self::Single(backend) => backend.is_stop_token(token),
@@ -991,73 +1025,174 @@ fn pages_needed(token_count: usize, page_size: usize) -> usize {
     token_count.div_ceil(page_size)
 }
 
+fn tp_prefill_items(chunk: &ScheduledChunk) -> Result<Vec<TpPrefillChunkItem>> {
+    let ScheduledChunkBackendState::Tp { request_ids } = &chunk.backend_state else {
+        anyhow::bail!("TP prefill received single-GPU chunk state");
+    };
+    anyhow::ensure!(
+        chunk.reqs.len() == request_ids.len()
+            && chunk.reqs.len() == chunk.windows.len()
+            && chunk.reqs.len() == chunk.ends.len(),
+        "Qwen3.5 TP scheduled prefill vectors are misaligned"
+    );
+    Ok(chunk
+        .reqs
+        .iter()
+        .zip(request_ids)
+        .zip(&chunk.windows)
+        .zip(&chunk.ends)
+        .map(|(((req, request_id), window), end)| {
+            TpPrefillChunkItem::new_with_sampling(
+                *request_id,
+                window.clone(),
+                req.logprobs,
+                req.params,
+                *end == req.prompt_tokens.len(),
+            )
+        })
+        .collect())
+}
+
+fn tp_decode_items(active: &[ActiveRequest35]) -> Result<Vec<TpDecodeStepItem>> {
+    active
+        .iter()
+        .map(|req| {
+            let ActiveBackendState::Tp { request_id } = &req.backend_state else {
+                anyhow::bail!("TP decode received single-GPU active state");
+            };
+            Ok(TpDecodeStepItem::new(
+                *request_id,
+                req.last_token,
+                req.logprobs,
+                req.params,
+            ))
+        })
+        .collect()
+}
+
 fn align_prefill_results(
     chunk: &ScheduledChunk,
     result: &PrefillResult,
-) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
+) -> Result<Vec<Option<PrefillArtifact>>> {
     let ScheduledChunkBackendState::Tp { request_ids } = &chunk.backend_state else {
         anyhow::bail!("align_prefill_results requires TP chunk state");
     };
-    let mut tokens = vec![0u32; chunk.reqs.len()];
-    let mut logprobs = vec![None; chunk.reqs.len()];
+    anyhow::ensure!(
+        request_ids.len() == chunk.reqs.len() && chunk.ends.len() == chunk.reqs.len(),
+        "Qwen3.5 TP prefill alignment vectors are misaligned"
+    );
+    let expected: HashSet<RequestId> = request_ids
+        .iter()
+        .zip(&chunk.reqs)
+        .zip(&chunk.ends)
+        .filter_map(|((&request_id, req), &end)| {
+            (end == req.prompt_tokens.len()).then_some(request_id)
+        })
+        .collect();
+    let mut by_id = HashMap::with_capacity(result.requests.len());
     for PrefillRequestResult {
         request_id,
         first_token,
         first_token_logprob,
     } in &result.requests
     {
-        let idx = request_ids
-            .iter()
-            .position(|id| id == request_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Qwen3.5 TP prefill returned unknown request id {}",
-                    request_id.get()
-                )
-            })?;
-        tokens[idx] = *first_token;
-        logprobs[idx].clone_from(first_token_logprob);
+        anyhow::ensure!(
+            expected.contains(request_id),
+            "Qwen3.5 TP prefill returned unknown or non-final request id {}",
+            request_id.get()
+        );
+        let artifact = PrefillArtifact {
+            token: *first_token,
+            logprob: first_token_logprob.clone(),
+        };
+        anyhow::ensure!(
+            by_id.insert(*request_id, artifact).is_none(),
+            "Qwen3.5 TP prefill returned duplicate request id {}",
+            request_id.get()
+        );
     }
-    Ok((tokens, logprobs))
+    anyhow::ensure!(
+        by_id.len() == expected.len(),
+        "Qwen3.5 TP prefill result is missing final request IDs"
+    );
+
+    request_ids
+        .iter()
+        .zip(&chunk.reqs)
+        .zip(&chunk.ends)
+        .map(|((&request_id, req), &end)| {
+            if end == req.prompt_tokens.len() {
+                by_id.remove(&request_id).map(Some).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Qwen3.5 TP prefill result is missing final request id {}",
+                        request_id.get()
+                    )
+                })
+            } else {
+                Ok(None)
+            }
+        })
+        .collect()
 }
 
 fn align_decode_results(
     active: &[ActiveRequest35],
     result: &DecodeResult,
-) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
+) -> Result<Vec<DecodeArtifact>> {
+    let expected: Vec<RequestId> = active
+        .iter()
+        .map(|active_req| {
+            let ActiveBackendState::Tp { request_id } = active_req.backend_state else {
+                anyhow::bail!("align_decode_results requires TP active state");
+            };
+            Ok(request_id)
+        })
+        .collect::<Result<_>>()?;
+    let expected_set: HashSet<_> = expected.iter().copied().collect();
     anyhow::ensure!(
-        active.len() == result.requests.len(),
-        "Qwen3.5 TP decode result row count mismatch: active={}, result={}",
-        active.len(),
-        result.requests.len()
+        expected_set.len() == expected.len(),
+        "Qwen3.5 TP active decode IDs contain duplicates"
     );
-    let mut tokens = Vec::with_capacity(active.len());
-    let mut logprobs = Vec::with_capacity(active.len());
-    for (
-        active_req,
-        DecodeRequestResult {
-            request_id,
-            token,
-            logprob,
-        },
-    ) in active.iter().zip(&result.requests)
+    let mut by_id = HashMap::with_capacity(result.requests.len());
+    for DecodeRequestResult {
+        request_id,
+        token,
+        logprob,
+    } in &result.requests
     {
-        let ActiveBackendState::Tp {
-            request_id: expected,
-        } = &active_req.backend_state
-        else {
-            anyhow::bail!("align_decode_results requires TP active state");
-        };
         anyhow::ensure!(
-            *expected == *request_id,
-            "Qwen3.5 TP decode result request id mismatch: expected {}, got {}",
-            expected.get(),
+            expected_set.contains(request_id),
+            "Qwen3.5 TP decode returned unknown request id {}",
             request_id.get()
         );
-        tokens.push(*token);
-        logprobs.push(logprob.clone());
+        let artifact = DecodeArtifact {
+            token: *token,
+            logprob: logprob.clone(),
+        };
+        anyhow::ensure!(
+            by_id.insert(*request_id, artifact).is_none(),
+            "Qwen3.5 TP decode returned duplicate request id {}",
+            request_id.get()
+        );
     }
-    Ok((tokens, logprobs))
+    expected
+        .into_iter()
+        .map(|request_id| {
+            by_id.remove(&request_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Qwen3.5 TP decode result is missing request id {}",
+                    request_id.get()
+                )
+            })
+        })
+        .collect()
+}
+
+fn split_decode_artifacts(artifacts: &[DecodeArtifact]) -> (Vec<u32>, Vec<Option<TokenLogprob>>) {
+    artifacts
+        .iter()
+        .map(|artifact| (artifact.token, artifact.logprob.clone()))
+        .unzip()
 }
 
 fn servable_len(max_context: usize, max_pages: usize, page_size: usize) -> u32 {
@@ -1541,11 +1676,7 @@ fn scheduler_loop(
         let itl_prefill_tokens: usize = scheduled.iter().map(|p| p.step_chunk).sum();
         let itl_prefill_reqs = scheduled.len();
         let itl_decode_n = active.len();
-        let plan = if backend.is_tp() {
-            build_eager_only_plan(!active.is_empty(), scheduled)
-        } else {
-            plan::build_next_plan(!active.is_empty(), scheduled)
-        };
+        let plan = plan::build_next_plan(!active.is_empty(), scheduled);
         if let Some(plan) = plan {
             let itl_plan_kind = match &plan {
                 ExecutionPlan::Unified { .. } if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled()) => {
@@ -1612,16 +1743,6 @@ fn scheduler_loop(
     }
 }
 
-fn build_eager_only_plan<T>(have_active: bool, pending: Vec<T>) -> Option<ExecutionPlan<T>> {
-    if !pending.is_empty() {
-        Some(ExecutionPlan::Prefill { pending })
-    } else if have_active {
-        Some(ExecutionPlan::Decode)
-    } else {
-        None
-    }
-}
-
 fn send_rejection(req: &SchedulerRequest, reason: RejectReason) {
     let message = match reason {
         RejectReason::ContextLength { limit } => format!(
@@ -1656,7 +1777,7 @@ fn prefill_batch(
 ) -> std::result::Result<(), FatalSchedulerError> {
     let mut chunk = ScheduledChunk::from(scheduled);
     let sample_seed = rand::RngExt::random(rng);
-    let (tokens, logprobs_vec) = match backend {
+    let artifacts = match backend {
         SchedulerBackend::Single(single) => {
             // Scope the borrows of `chunk` to the executor call so the error path can
             // move `chunk` into `fail_chunk`.
@@ -1670,7 +1791,7 @@ fn prefill_batch(
             };
             let prefill_sample_seed = rand::RngExt::random(rng);
             match single.sample_prefill_logits(&chunk.reqs, &logits, prefill_sample_seed) {
-                Ok(v) => v,
+                Ok((tokens, logprobs)) => PrefillStepArtifacts::Single { tokens, logprobs },
                 Err(e) => {
                     warn!("prefill sampling failed: {e}");
                     fail_chunk(chunk, &e.to_string());
@@ -1679,7 +1800,7 @@ fn prefill_batch(
             }
         }
         SchedulerBackend::Tp(tp) => match tp.execute_prefill_chunk(&chunk, sample_seed) {
-            Ok(v) => v,
+            Ok(v) => PrefillStepArtifacts::Tp(v),
             Err(e) => {
                 warn!("TP prefill chunk failed: {e}");
                 return Err(FatalSchedulerError::new(e.to_string()).with_requests(chunk.reqs));
@@ -1687,7 +1808,7 @@ fn prefill_batch(
         },
     };
 
-    promote_or_requeue(backend, active, prefilling, chunk, &tokens, &logprobs_vec)
+    promote_or_requeue(backend, active, prefilling, chunk, &artifacts)
 }
 
 fn launch_overlap_step(
@@ -1744,7 +1865,8 @@ fn finish_async_prefill(
             return Ok(());
         }
     };
-    promote_or_requeue(single, active, prefilling, chunk, &tokens, &logprobs)
+    let artifacts = PrefillStepArtifacts::Single { tokens, logprobs };
+    promote_or_requeue(single, active, prefilling, chunk, &artifacts)
 }
 
 // ── Unified step (prefill chunk + decode in one forward pass) ──────────────
@@ -1756,13 +1878,41 @@ fn unified_step_sched(
     prefilling: &mut Vec<PrefillingRequest35>,
     rng: &mut StdRng,
 ) -> std::result::Result<(), FatalSchedulerError> {
-    let SchedulerBackend::Single(backend) = backend else {
-        let chunk = ScheduledChunk::from(scheduled);
-        let message = "Qwen3.5 TP Phase 1 does not support unified prefill+decode steps";
-        warn!("{message}");
-        return Err(FatalSchedulerError::new(message).with_requests(chunk.reqs));
-    };
     let mut chunk = ScheduledChunk::from(scheduled);
+    if matches!(backend, SchedulerBackend::Tp(_)) {
+        // Preserve the established scheduler RNG order: decode seed first,
+        // prefill seed second. Workers execute the forwards in the opposite
+        // (prefill-then-decode) order using these preselected seeds.
+        let decode_sample_seed = rand::RngExt::random(rng);
+        let prefill_sample_seed = rand::RngExt::random(rng);
+        let result = {
+            let SchedulerBackend::Tp(tp) = backend else {
+                unreachable!()
+            };
+            tp.execute_unified(&chunk, active, decode_sample_seed, prefill_sample_seed)
+        };
+        let artifacts = match result {
+            Ok(artifacts) => artifacts,
+            Err(err) => {
+                warn!("TP unified step failed: {err}");
+                return Err(FatalSchedulerError::new(err.to_string()).with_requests(chunk.reqs));
+            }
+        };
+
+        let (decode_tokens, decode_logprobs) = split_decode_artifacts(&artifacts.decode);
+        if let Err(failure) =
+            dispatch_decode_tokens(backend, active, &decode_tokens, &decode_logprobs)
+        {
+            return Err(failure.with_requests(chunk.reqs));
+        }
+
+        let prefill = PrefillStepArtifacts::Tp(artifacts.prefill);
+        return promote_or_requeue(backend, active, prefilling, chunk, &prefill);
+    }
+
+    let SchedulerBackend::Single(backend) = backend else {
+        unreachable!()
+    };
     // Scope the borrows of `chunk` / `active` to the executor call so the error
     // and decode-processing paths can use them afterwards.
     let result = backend.unified_step(&mut chunk, active);
@@ -1795,7 +1945,7 @@ fn unified_step_sched(
         .prefill_logits
         .as_ref()
         .expect("scheduled prefill chunk must return prefill logits");
-    let (tokens, logprobs_vec) =
+    let (tokens, logprobs) =
         match backend.sample_prefill_logits(&chunk.reqs, prefill_logits, prefill_seed) {
             Ok(v) => v,
             Err(e) => {
@@ -1804,8 +1954,8 @@ fn unified_step_sched(
                 return Ok(());
             }
         };
-
-    promote_or_requeue(backend, active, prefilling, chunk, &tokens, &logprobs_vec)
+    let prefill = PrefillStepArtifacts::Single { tokens, logprobs };
+    promote_or_requeue(backend, active, prefilling, chunk, &prefill)
 }
 
 // ── Decode step (pure decode, CUDA Graph enabled) ──────────────────────
@@ -1863,7 +2013,7 @@ fn decode_step_with_seed(
             }
         }
         SchedulerBackend::Tp(tp) => match tp.execute_decode(active, sample_seed) {
-            Ok(v) => v,
+            Ok(v) => split_decode_artifacts(&v),
             Err(e) => {
                 warn!("TP eager decode error: {e}");
                 return Err(FatalSchedulerError::new(e.to_string()));
@@ -2202,14 +2352,13 @@ fn fail_chunk(chunk: ScheduledChunk, message: &str) {
 /// For each request in the just-prefilled chunk: if its prompt is now exhausted,
 /// sample its first token, emit events, and move it into the decode batch;
 /// otherwise re-queue it (with an advanced cursor) at the FRONT of `prefilling`.
-/// `tokens` / `logprobs` are indexed by request order in `chunk`.
+/// `artifacts` are indexed by request order in `chunk`.
 fn promote_or_requeue(
     backend: &mut impl PrefillPromoteBackend,
     active: &mut Vec<ActiveRequest35>,
     prefilling: &mut Vec<PrefillingRequest35>,
     chunk: ScheduledChunk,
-    tokens: &[u32],
-    logprobs: &[Option<TokenLogprob>],
+    artifacts: &PrefillStepArtifacts,
 ) -> std::result::Result<(), FatalSchedulerError> {
     let ScheduledChunk {
         reqs,
@@ -2240,8 +2389,9 @@ fn promote_or_requeue(
         }
 
         let prompt_len = req.prompt_tokens.len();
-        let first_token = tokens[i];
-        let logprob = logprobs[i].clone();
+        let artifact = artifacts.final_artifact(i);
+        let first_token = artifact.token;
+        let logprob = artifact.logprob;
 
         if req.echo {
             let echo_logprobs = vec![None; req.prompt_tokens.len()];

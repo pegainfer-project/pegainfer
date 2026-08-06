@@ -131,11 +131,14 @@ struct LifecycleTestBackend {
     active_drops: Vec<RequestId>,
     active_events_before_drop: Vec<TokenEvent>,
     prefill_drops: Vec<(RequestId, DropExpectation)>,
-    observer: Option<openinfer_core::engine::TokenStreamReceiver>,
+    observer: Option<pegainfer_frontend::engine::TokenStreamReceiver>,
 }
 
 impl LifecycleTestBackend {
-    fn new(stop_token: Option<u32>, observer: openinfer_core::engine::TokenStreamReceiver) -> Self {
+    fn new(
+        stop_token: Option<u32>,
+        observer: pegainfer_frontend::engine::TokenStreamReceiver,
+    ) -> Self {
         Self {
             stop_token,
             active_completion_requires_drop_ack: true,
@@ -222,7 +225,7 @@ impl PrefillPromoteBackend for LifecycleTestBackend {
 }
 
 fn next_event(
-    rx: &mut openinfer_core::engine::TokenStreamReceiver,
+    rx: &mut pegainfer_frontend::engine::TokenStreamReceiver,
     description: &str,
 ) -> TokenEvent {
     rx.blocking_recv()
@@ -230,7 +233,7 @@ fn next_event(
         .1
 }
 
-fn assert_no_more_events(rx: &mut openinfer_core::engine::TokenStreamReceiver) {
+fn assert_no_more_events(rx: &mut pegainfer_frontend::engine::TokenStreamReceiver) {
     assert!(
         rx.try_recv().is_err(),
         "request received more than one terminal event"
@@ -558,8 +561,10 @@ fn immediate_prefill_completion_waits_for_drop() {
             &mut active,
             &mut prefilling,
             chunk,
-            &[11],
-            &[None],
+            &PrefillStepArtifacts::Single {
+                tokens: vec![11],
+                logprobs: vec![None],
+            },
         )
         .is_ok()
     );
@@ -608,8 +613,10 @@ fn immediate_prefill_drop_failure_publishes_only_terminal_error() {
         &mut active,
         &mut prefilling,
         chunk,
-        &[12, 13],
-        &[None, None],
+        &PrefillStepArtifacts::Single {
+            tokens: vec![12, 13],
+            logprobs: vec![None, None],
+        },
     ) {
         Ok(()) => panic!("injected prefill drop should fail"),
         Err(failure) => failure,
@@ -695,11 +702,13 @@ fn terminal_shutdown_closes_drains_and_errors_every_owner_once() {
         std::thread::spawn(move || {
             before_send.wait();
             submit_tx
-                .send(queued)
+                .send((queued, pegainfer_frontend::engine::KvPrefix::none()))
                 .expect("close-before request should be accepted");
             sent_before_close.wait();
             after_receiver_close.wait();
-            submit_tx.send(after_close).is_err()
+            submit_tx
+                .send((after_close, pegainfer_frontend::engine::KvPrefix::none()))
+                .is_err()
         })
     };
 
@@ -841,22 +850,165 @@ fn send_rejection_reports_kv_lifetime_request_tokens() {
 }
 
 #[test]
-fn tp_scheduler_uses_eager_only_plan() {
+fn tp_scheduler_uses_shared_unified_plan() {
     let pending = vec!["prefill"];
     assert!(
         matches!(
-            build_eager_only_plan(true, pending),
-            Some(ExecutionPlan::Prefill { pending }) if pending == vec!["prefill"]
+            plan::build_next_plan(true, pending),
+            Some(ExecutionPlan::Unified { pending }) if pending == vec!["prefill"]
         ),
-        "TP Phase 1 should prefill first instead of choosing unified"
+        "TP Phase 2A should use the shared mixed prefill/decode plan"
     );
     assert!(
         matches!(
-            build_eager_only_plan::<&str>(true, vec![]),
+            plan::build_next_plan::<&str>(true, vec![]),
             Some(ExecutionPlan::Decode)
         ),
-        "TP Phase 1 should decode only when no prefill chunk is scheduled"
+        "active-only work should remain a pure decode plan"
     );
+}
+
+fn mixed_tp_alignment_chunk() -> ScheduledChunk {
+    let (non_final_tx, _non_final_rx) = TokenSink::standalone();
+    let (final_tx, _final_rx) = TokenSink::standalone();
+    let mut non_final = prefilling_request(50, "non-final", non_final_tx);
+    non_final.req.prompt_tokens = vec![1, 2];
+    non_final.step_chunk = 1;
+    let mut final_req = prefilling_request(51, "final", final_tx);
+    final_req.step_chunk = 1;
+    ScheduledChunk::from(vec![non_final, final_req])
+}
+
+#[test]
+fn tp_prefill_alignment_distinguishes_absence_from_no_logprobs() {
+    let chunk = mixed_tp_alignment_chunk();
+    let aligned = align_prefill_results(
+        &chunk,
+        &PrefillResult {
+            requests: vec![PrefillRequestResult {
+                request_id: RequestId::new(51),
+                first_token: 0,
+                first_token_logprob: None,
+            }],
+        },
+    )
+    .unwrap();
+
+    assert_eq!(aligned.len(), 2);
+    assert!(aligned[0].is_none());
+    assert_eq!(
+        aligned[1],
+        Some(PrefillArtifact {
+            token: 0,
+            logprob: None,
+        })
+    );
+}
+
+#[test]
+fn tp_prefill_alignment_rejects_unknown_duplicate_and_missing_ids() {
+    let chunk = mixed_tp_alignment_chunk();
+    let artifact = |request_id| PrefillRequestResult {
+        request_id: RequestId::new(request_id),
+        first_token: 7,
+        first_token_logprob: None,
+    };
+
+    let unknown = align_prefill_results(
+        &chunk,
+        &PrefillResult {
+            requests: vec![artifact(99)],
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(unknown.contains("unknown or non-final request id 99"));
+
+    let duplicate = align_prefill_results(
+        &chunk,
+        &PrefillResult {
+            requests: vec![artifact(51), artifact(51)],
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(duplicate.contains("duplicate request id 51"));
+
+    let missing = align_prefill_results(
+        &chunk,
+        &PrefillResult {
+            requests: Vec::new(),
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(missing.contains("missing final request IDs"));
+}
+
+#[test]
+fn tp_decode_alignment_is_request_id_strict_and_order_independent() {
+    let (first_tx, _first_rx) = TokenSink::standalone();
+    let (second_tx, _second_rx) = TokenSink::standalone();
+    let active = vec![
+        active_request(60, "first", first_tx),
+        active_request(61, "second", second_tx),
+    ];
+    let result = DecodeResult {
+        requests: vec![
+            DecodeRequestResult {
+                request_id: RequestId::new(61),
+                token: 11,
+                logprob: None,
+            },
+            DecodeRequestResult {
+                request_id: RequestId::new(60),
+                token: 10,
+                logprob: None,
+            },
+        ],
+    };
+    let aligned = align_decode_results(&active, &result).unwrap();
+    assert_eq!(aligned[0].token, 10);
+    assert_eq!(aligned[1].token, 11);
+
+    for (requests, expected) in [
+        (
+            vec![DecodeRequestResult {
+                request_id: RequestId::new(99),
+                token: 1,
+                logprob: None,
+            }],
+            "unknown request id 99",
+        ),
+        (
+            vec![
+                DecodeRequestResult {
+                    request_id: RequestId::new(60),
+                    token: 1,
+                    logprob: None,
+                },
+                DecodeRequestResult {
+                    request_id: RequestId::new(60),
+                    token: 2,
+                    logprob: None,
+                },
+            ],
+            "duplicate request id 60",
+        ),
+        (
+            vec![DecodeRequestResult {
+                request_id: RequestId::new(60),
+                token: 1,
+                logprob: None,
+            }],
+            "missing request id 61",
+        ),
+    ] {
+        let err = align_decode_results(&active, &DecodeResult { requests })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "unexpected alignment error: {err}");
+    }
 }
 
 #[test]
@@ -1001,6 +1153,43 @@ fn tp2_scheduler_chunked_prefill_then_decode_smoke() {
             None => panic!("TP scheduler channel closed before Finished"),
         }
     }
+}
+
+#[test]
+#[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+fn tp2_scheduler_runs_forced_mixed_steps() {
+    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
+        .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+    let handle =
+        start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1).expect("start TP2 scheduler");
+    let (decode_tx, mut decode_rx) = TokenSink::standalone();
+    let (prefill_tx, mut prefill_rx) = TokenSink::standalone();
+
+    handle
+        .submit(test_request_with_shape(
+            "mixed-active",
+            decode_tx,
+            vec![151_646],
+            8,
+        ))
+        .expect("submit request that becomes active first");
+    handle
+        .submit(test_request_with_shape(
+            "mixed-prefill",
+            prefill_tx,
+            vec![151_646, 9707],
+            2,
+        ))
+        .expect("submit request that remains chunk-prefilling");
+
+    let (decode_tokens, decode_finish) =
+        collect_finished_with_timeout(&mut decode_rx, "mixed active request");
+    let (prefill_tokens, prefill_finish) =
+        collect_finished_with_timeout(&mut prefill_rx, "mixed prefill request");
+    assert_eq!(decode_tokens, 8);
+    assert_eq!(decode_finish, FinishReason::Length);
+    assert_eq!(prefill_tokens, 2);
+    assert_eq!(prefill_finish, FinishReason::Length);
 }
 
 #[test]
