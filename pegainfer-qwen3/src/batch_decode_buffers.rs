@@ -34,6 +34,23 @@ pub(crate) const fn per_token_graph_bucket_allowed(policy: NumericPolicy, bucket
     !matches!(policy, NumericPolicy::PerToken) || bucket <= PERTOKEN_GRAPH_MAX_BUCKET
 }
 
+/// Supplemental graph bucket for a decode profile whose normal bucket is disallowed.
+///
+/// When the normal profile bucket is allowed, its existing `Serve` call already
+/// captures it and no supplemental probe is needed. Otherwise, return the largest
+/// allowed bucket that fits within the profile's decode-row capacity.
+pub(crate) fn supplemental_profile_graph_bucket(
+    policy: NumericPolicy,
+    profile_decode_rows: usize,
+) -> Option<usize> {
+    if per_token_graph_bucket_allowed(policy, bucket_for(profile_decode_rows)) {
+        return None;
+    }
+    BATCH_BUCKETS.iter().rev().copied().find(|&bucket| {
+        bucket <= profile_decode_rows && per_token_graph_bucket_allowed(policy, bucket)
+    })
+}
+
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // Split-KV decode attention: the non-partitioned kernel issues one CTA per
 // (request x kv-head), starving SMs at small batch. The path is therefore
@@ -542,6 +559,7 @@ mod tests {
     use super::PERTOKEN_GRAPH_MAX_BUCKET;
     use super::build_split_kv_csr;
     use super::per_token_graph_bucket_allowed;
+    use super::supplemental_profile_graph_bucket;
 
     #[test]
     fn per_token_graph_cap_only_applies_to_pertoken() {
@@ -567,6 +585,34 @@ mod tests {
             NumericPolicy::Tuned,
             *super::BATCH_BUCKETS.last().unwrap()
         ));
+        assert_eq!(
+            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 255),
+            Some(PERTOKEN_GRAPH_MAX_BUCKET)
+        );
+        assert_eq!(
+            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 33),
+            Some(PERTOKEN_GRAPH_MAX_BUCKET)
+        );
+        assert_eq!(
+            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 32),
+            None
+        );
+        assert_eq!(
+            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 31),
+            None
+        );
+        assert_eq!(
+            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 7),
+            None
+        );
+        assert_eq!(
+            supplemental_profile_graph_bucket(NumericPolicy::Tuned, 255),
+            None
+        );
+        assert_eq!(
+            supplemental_profile_graph_bucket(NumericPolicy::Pin, 255),
+            None
+        );
     }
 
     #[test]

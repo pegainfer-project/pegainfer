@@ -18,6 +18,7 @@ use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvView;
 
 use super::batch_decode_buffers::BatchDecodeBuffers;
+use super::batch_decode_buffers::supplemental_profile_graph_bucket;
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::prefill::PrefillBuffers;
 use super::weights::Qwen3Model;
@@ -73,6 +74,28 @@ impl Qwen3Model {
             } else {
                 crate::batch_decode::DecodeGraphUse::Serve
             };
+            // PerToken buckets above 32 intentionally run eager, so the usual
+            // max-row probe would miss the largest graph that serving can still
+            // instantiate. Capture that allowed bucket first on the single-GPU
+            // path so its executable memory is included in the KV budget. TP
+            // keeps this profile eager because ranks are not coordinated here.
+            let policy = numeric_policy();
+            if self.enable_cuda_graph && self.tensor_parallel.world_size == 1 {
+                if let Some(graph_rows) =
+                    supplemental_profile_graph_bucket(policy, profile_decode_rows)
+                {
+                    self.batch_decode(
+                        &decode_tokens[..graph_rows],
+                        &decode_views[..graph_rows],
+                        &decode_adapters[..graph_rows],
+                        kv_buffer.buffer(),
+                        &layout,
+                        decode_bufs,
+                        crate::batch_decode::DecodeGraphUse::Serve,
+                    )?;
+                    mark_peak()?;
+                }
+            }
             self.batch_decode(
                 &decode_tokens,
                 &decode_views,
