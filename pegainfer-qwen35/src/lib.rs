@@ -61,6 +61,7 @@ pub mod runtime {
     pub use crate::executor::Qwen35Executor;
     pub use crate::executor::RequestId;
     pub use crate::scheduler::start_with_capacity;
+    pub use crate::tp_executor::DropExpectation;
     pub use crate::tp_executor::Qwen35TpExecutor;
     pub use crate::weights::Qwen35Model;
 }

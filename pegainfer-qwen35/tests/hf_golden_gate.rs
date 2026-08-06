@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_qwen35::runtime::DecodePlan;
 use pegainfer_qwen35::runtime::DecodeStepItem;
+use pegainfer_qwen35::runtime::DropExpectation;
 use pegainfer_qwen35::runtime::PrefillPlan;
 use pegainfer_qwen35::runtime::PrefillStepItem;
 use pegainfer_qwen35::runtime::Qwen35Executor;
@@ -575,7 +576,8 @@ fn run_tp(g: &Golden, ex: &Qwen35TpExecutor, seqs: &[usize], batched: bool) -> (
         }
 
         for &id in &ids {
-            ex.drop_request(id).expect("TP2 drop request");
+            ex.drop_request(id, DropExpectation::MustExist)
+                .expect("TP2 drop request");
         }
     } else {
         for &seq in seqs {
@@ -604,7 +606,8 @@ fn run_tp(g: &Golden, ex: &Qwen35TpExecutor, seqs: &[usize], batched: bool) -> (
                     &top_logprobs(dr.requests[0].logprob.as_ref()),
                 );
             }
-            ex.drop_request(id).expect("TP2 drop request");
+            ex.drop_request(id, DropExpectation::MustExist)
+                .expect("TP2 drop request");
         }
     }
     (stats, fingerprint)

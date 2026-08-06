@@ -62,6 +62,7 @@ use crate::executor::PrefillResult;
 use crate::executor::RequestId;
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
+use crate::tp_executor::DropExpectation;
 use crate::tp_executor::Qwen35TpExecutor;
 use crate::tp_executor::TpDecodeStepItem;
 use crate::tp_executor::TpPrefillChunkItem;
@@ -794,8 +795,8 @@ impl TpSchedulerBackend {
         align_decode_results(active, &result)
     }
 
-    fn drop_request(&self, request_id: RequestId) {
-        if let Err(err) = self.executor.drop_request(request_id) {
+    fn drop_request(&self, request_id: RequestId, expectation: DropExpectation) {
+        if let Err(err) = self.executor.drop_request(request_id, expectation) {
             warn!(
                 "failed to drop Qwen3.5 TP worker request {}: {err}",
                 request_id.get()
@@ -1060,7 +1061,12 @@ fn prune_closed_requests<B>(
                 "request pruned before scheduling: request_id={:?} phase=prefill cursor={}",
                 removed.req.request_id, removed.cursor
             );
-            backend.drop_prefill_state(removed.backend_state);
+            let expectation = if removed.cursor == 0 {
+                DropExpectation::MustBeAbsent
+            } else {
+                DropExpectation::MustExist
+            };
+            backend.drop_prefill_state(removed.backend_state, expectation);
         }
     }
 }
@@ -1437,7 +1443,6 @@ fn prefill_batch(
             Ok(v) => v,
             Err(e) => {
                 warn!("TP prefill chunk failed: {e}");
-                drop_tp_chunk_state(tp, &chunk);
                 fail_chunk(chunk, &e.to_string());
                 return;
             }
@@ -1633,10 +1638,6 @@ fn decode_step_with_seed(
                 warn!("TP eager decode error: {e}");
                 let message = e.to_string();
                 for req in active.drain(..) {
-                    let state = req.backend_state;
-                    if let ActiveBackendState::Tp { request_id } = state {
-                        tp.drop_request(request_id);
-                    }
                     let _ = req.token_tx.send(TokenEvent::Error {
                         message: message.clone(),
                         prompt_tokens: req.prompt_len,
@@ -1774,7 +1775,7 @@ impl DecodeDispatchBackend for SchedulerBackend {
             SchedulerBackend::Tp(backend) => {
                 let removed = active.swap_remove(idx);
                 if let ActiveBackendState::Tp { request_id } = removed.backend_state {
-                    backend.drop_request(request_id);
+                    backend.drop_request(request_id, DropExpectation::MustExist);
                 }
             }
         }
@@ -1905,15 +1906,6 @@ fn fail_chunk(chunk: ScheduledChunk, message: &str) {
     }
 }
 
-fn drop_tp_chunk_state(backend: &TpSchedulerBackend, chunk: &ScheduledChunk) {
-    let ScheduledChunkBackendState::Tp { request_ids } = &chunk.backend_state else {
-        return;
-    };
-    for &request_id in request_ids {
-        backend.drop_request(request_id);
-    }
-}
-
 /// For each request in the just-prefilled chunk: if its prompt is now exhausted,
 /// sample its first token, emit events, and move it into the decode batch;
 /// otherwise re-queue it (with an advanced cursor) at the FRONT of `prefilling`.
@@ -1974,7 +1966,7 @@ fn promote_or_requeue(
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
             });
-            backend.drop_prefill_state(backend_state);
+            backend.drop_prefill_state(backend_state, DropExpectation::MustExist);
             continue;
         }
 
@@ -1990,7 +1982,7 @@ fn promote_or_requeue(
                 "request dropped: client disconnected: request_id={:?} tokens_generated={}",
                 req.request_id, 0
             );
-            backend.drop_prefill_state(backend_state);
+            backend.drop_prefill_state(backend_state, DropExpectation::MustExist);
             continue;
         }
 
@@ -2007,7 +1999,7 @@ fn promote_or_requeue(
                 prompt_tokens: prompt_len,
                 completion_tokens: 1,
             });
-            backend.drop_prefill_state(backend_state);
+            backend.drop_prefill_state(backend_state, DropExpectation::MustExist);
             continue;
         }
 
@@ -2035,7 +2027,7 @@ trait PrefillPromoteBackend {
         active_len: usize,
         state: PrefillBackendState,
     ) -> ActiveBackendState;
-    fn drop_prefill_state(&mut self, state: PrefillBackendState);
+    fn drop_prefill_state(&mut self, state: PrefillBackendState, expectation: DropExpectation);
 }
 
 impl PrefillPromoteBackend for SingleGpuBackend {
@@ -2061,7 +2053,7 @@ impl PrefillPromoteBackend for SingleGpuBackend {
         }
     }
 
-    fn drop_prefill_state(&mut self, _state: PrefillBackendState) {}
+    fn drop_prefill_state(&mut self, _state: PrefillBackendState, _expectation: DropExpectation) {}
 }
 
 impl PrefillPromoteBackend for SchedulerBackend {
@@ -2093,11 +2085,11 @@ impl PrefillPromoteBackend for SchedulerBackend {
         }
     }
 
-    fn drop_prefill_state(&mut self, state: PrefillBackendState) {
+    fn drop_prefill_state(&mut self, state: PrefillBackendState, expectation: DropExpectation) {
         if let (SchedulerBackend::Tp(backend), PrefillBackendState::Tp { request_id }) =
             (self, state)
         {
-            backend.drop_request(request_id);
+            backend.drop_request(request_id, expectation);
         }
     }
 }

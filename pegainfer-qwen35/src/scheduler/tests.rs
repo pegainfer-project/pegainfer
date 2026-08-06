@@ -66,7 +66,7 @@ fn prefilling_request(request_id: u64, label: &str, token_tx: TokenSink) -> Pref
 #[derive(Default)]
 struct PruneTestBackend {
     retired_active: Vec<RequestId>,
-    dropped_prefilling: Vec<RequestId>,
+    dropped_prefilling: Vec<(RequestId, DropExpectation)>,
 }
 
 impl DecodeDispatchBackend for PruneTestBackend {
@@ -96,11 +96,11 @@ impl PrefillPromoteBackend for PruneTestBackend {
         panic!("prune test must not promote prefill state")
     }
 
-    fn drop_prefill_state(&mut self, state: PrefillBackendState) {
+    fn drop_prefill_state(&mut self, state: PrefillBackendState, expectation: DropExpectation) {
         let PrefillBackendState::Tp { request_id } = state else {
             panic!("prune test expected TP prefill state");
         };
-        self.dropped_prefilling.push(request_id);
+        self.dropped_prefilling.push((request_id, expectation));
     }
 }
 
@@ -167,7 +167,10 @@ fn closed_resident_work_is_absent_from_post_prune_load() {
         (1, 1)
     );
     assert_eq!(backend.retired_active, vec![RequestId::new(10)]);
-    assert_eq!(backend.dropped_prefilling, vec![RequestId::new(12)]);
+    assert_eq!(
+        backend.dropped_prefilling,
+        vec![(RequestId::new(12), DropExpectation::MustBeAbsent)]
+    );
 }
 
 #[test]
@@ -212,6 +215,27 @@ fn closed_resident_frees_capacity_for_same_tick_admission() {
     assert!(admission.deferred.is_empty());
 }
 
+#[test]
+fn closed_materialized_prefill_requires_existing_worker_state() {
+    let (closed_sink, closed_rx) = TokenSink::standalone();
+    drop(closed_rx);
+    let mut prefilling = vec![PrefillingRequest35 {
+        cursor: 1,
+        ..prefilling_request(21, "prefill-materialized", closed_sink)
+    }];
+    let mut active = Vec::new();
+    let mut pending = Vec::new();
+    let mut backend = PruneTestBackend::default();
+
+    prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending);
+
+    assert!(prefilling.is_empty());
+    assert_eq!(
+        backend.dropped_prefilling,
+        vec![(RequestId::new(21), DropExpectation::MustExist)]
+    );
+}
+
 fn wait_for_load(
     load_rx: &watch::Receiver<LoadSnapshot>,
     description: &str,
@@ -232,7 +256,7 @@ fn wait_for_load(
 }
 
 fn collect_finished_with_timeout(
-    token_rx: &mut openinfer_core::engine::TokenStreamReceiver,
+    token_rx: &mut pegainfer_frontend::engine::TokenStreamReceiver,
     description: &str,
 ) -> (usize, FinishReason) {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -351,7 +375,7 @@ fn tp_engine_rejects_cuda_graph_before_model_load() {
 #[test]
 #[ignore = "requires one CUDA device and Qwen3.5 weights"]
 fn tp1_cancelled_resident_frees_capacity_before_admission() {
-    let model_path = std::env::var("OPENINFER_TEST_MODEL_PATH")
+    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
         .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
     let model =
         Qwen35Model::from_safetensors_with_options(&model_path, true).expect("load Qwen3.5 model");

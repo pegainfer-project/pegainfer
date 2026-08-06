@@ -1,6 +1,6 @@
 # Qwen3.5 TP Implementation Record
 
-> **TL;DR:** Qwen3.5 TP Phase 1 is complete as a correctness-first eager dense TP path. P2A steps 1-2 add exact-rank lifecycle baselines and production cancellation pruning before load publication/admission; TP protocol hardening, fail-closed lifecycle propagation, and unified execution remain before P2B GDR sharding.
+> **TL;DR:** Qwen3.5 TP Phase 1 is complete as a correctness-first eager dense TP path. P2A steps 1-3 add lifecycle baselines, pre-admission cancellation, start-gated broadcasts, exact-rank replies, and lifecycle-aware drop proof; fail-closed scheduler propagation and unified execution remain before P2B GDR sharding.
 >
 > **Last touched:** 2026-08
 
@@ -209,6 +209,40 @@ Verification:
 - The regular library suite passes: `74 passed`, `0 failed`, `9 ignored`.
 
 This step does not strengthen the TP drop reply protocol or add scheduler-wide fail-closed propagation. It uses the Phase 1 cleanup calls as they exist; exact-rank `DropExpectation` acknowledgement belongs to step 3, and mandatory replica-fatal propagation belongs to step 4.
+
+#### Step 3: TP worker protocol hardening
+
+Completed as the distributed command/reply foundation for later scheduler fail-closed handling and unified execution.
+
+State-mutating prefill, decode, drop, and future unified envelopes now share one `Pending -> Execute | Cancel` start gate. The controller enqueues an envelope for every rank before resolving `Execute`; if any enqueue fails, it resolves `Cancel` for the delivered prefix and poisons the executor. Workers wait on the gate before request-state mutation, kernel launch, or NCCL entry. Ping and test-only snapshots remain ungated because they do not mutate request state or enter collectives.
+
+Response handling now separates timed transport collection from pure response-set validation. Ping, prefill, decode, and drop all require exactly one in-range response from every rank:
+
+- ping requires `Ack` from every rank;
+- prefill requires one `Prefill` result from rank 0 and `Ack` from every non-primary rank;
+- decode requires one `Decode` result from rank 0 and `Ack` from every non-primary rank;
+- drop requires `DropAck { existed }` from every rank and validates the complete existence vector against the scheduler's `DropExpectation`.
+
+Duplicate, missing, out-of-range, wrong-variant, non-primary typed, or missing-primary responses poison the executor after dispatch. Drop accepts only exact-rank all-false for `MustBeAbsent` and exact-rank all-true for `MustExist`; mixed values and uniformly unexpected values are lifecycle divergence even though every rank is absent after the command.
+
+The low-level `Qwen35TpExecutor::drop_request` API now requires `DropExpectation` and returns `Result<()>`; `DropExpectation` is re-exported through the model-local `runtime` module for tests and debugging. The server-facing `EngineHandle` API is unchanged. Scheduler callers derive expectations from owned lifecycle state:
+
+- active and successfully dispatched/final-prefill state use `MustExist`;
+- prefilling cancellation at `cursor == 0` uses `MustBeAbsent`;
+- prefilling cancellation after progress uses `MustExist`;
+- execution failure performs no healthy-path drop because the executor is already poisoned.
+
+This commit intentionally retains the temporary scheduler adapter that logs a returned healthy-drop failure. Executor poison prevents subsequent normal commands, but step 4 still owns mandatory propagation into one scheduler-wide terminal path, fail-closed completion publication, and exactly-once unresolved-request error fan-out.
+
+Verification:
+
+- Release all-target check and clippy with `-D warnings` pass.
+- Pure protocol/gate tests cover exact-rank reply matrices, lifecycle-expectation mismatch, controller structural rejection with zero dispatch, all-enqueued `Execute`, prefix-only `Cancel`, and poison preservation.
+- The complete regular library suite passes on SM86: `82 passed`, `0 failed`, `12 ignored`.
+- Three new real TP2 gates pass: prefix-only dispatch failure leaves every rank empty (214.38 seconds under unrelated four-GPU training contention), lifecycle expectations plus mixed-rank divergence pass (8.05 seconds), and a real receiver disconnect poisons without claiming an unavailable all-rank snapshot (6.96 seconds).
+- Existing healthy TP2 prefill/decode/drop and scheduler chunked-prefill/decode smoke tests pass (6.45 and 6.54 seconds).
+
+Implementation pitfall: the first release-only gate test hung because `start.execute()` was placed inside `debug_assert!`; release builds remove the complete assertion expression, including side effects. The state transition now executes unconditionally and only its boolean result is debug-asserted. Protocol state transitions must never live inside debug-only assertions.
 
 Goals:
 
