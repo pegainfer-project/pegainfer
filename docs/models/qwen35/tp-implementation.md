@@ -1,6 +1,6 @@
 # Qwen3.5 TP Implementation Record
 
-> **TL;DR:** Qwen3.5 TP Phase 1 is complete as a correctness-first eager dense TP path. P2A steps 1-3 add lifecycle baselines, pre-admission cancellation, start-gated broadcasts, exact-rank replies, and lifecycle-aware drop proof; fail-closed scheduler propagation and unified execution remain before P2B GDR sharding.
+> **TL;DR:** Qwen3.5 TP Phase 1 is complete as a correctness-first eager dense TP path. P2A steps 1-4 add lifecycle baselines, pre-admission cancellation, start-gated exact-rank worker protocol, lifecycle-aware drop proof, and fail-closed scheduler completion/error propagation; unified execution remains before P2B GDR sharding.
 >
 > **Last touched:** 2026-08
 
@@ -243,6 +243,34 @@ Verification:
 - Existing healthy TP2 prefill/decode/drop and scheduler chunked-prefill/decode smoke tests pass (6.45 and 6.54 seconds).
 
 Implementation pitfall: the first release-only gate test hung because `start.execute()` was placed inside `debug_assert!`; release builds remove the complete assertion expression, including side effects. The state transition now executes unconditionally and only its boolean result is debug-asserted. Protocol state transitions must never live inside debug-only assertions.
+
+#### Step 4: fail-closed TP scheduler lifecycle
+
+Completed as the scheduler recovery and user-visible completion boundary required before TP unified execution.
+
+The temporary step-3 logging adapter is gone. TP active retirement and prefill-state cleanup now return `Result`, and cancellation pruning, standalone prefill/decode execution, token dispatch, and final-prefill promotion propagate any returned TP lifecycle failure to the scheduler loop. A returned TP prefill/decode or post-execution artifact-alignment error follows the same fatal path. The scheduler does not retry per-request cleanup after poison.
+
+Successful TP completion is now prepared and committed explicitly:
+
+- decode EOS buffers only `Finished(Stop)`;
+- decode length buffers the final `Token` followed by `Finished(Length)`;
+- immediate final-prefill EOS/length uses the same buffering rule, so its first token is not exposed before cleanup;
+- the candidate keeps logical request ownership while `DropRequest(MustExist)` runs, and publishes the buffered events only after exact-rank all-true `DropAck` succeeds;
+- drop failure discards the buffered success events and transfers the unresolved candidate to terminal error fan-out.
+
+Fatal errors carry any tick-local request ownership back to the scheduler loop instead of consuming it in a step helper. The single terminal helper closes `submit_rx`, drains every request whose send completed before close, consumes transient candidates/scheduled work plus active, prefilling, current pending, and deferred owners exactly once, attempts one `TokenEvent::Error` per request, publishes a zero-running/zero-waiting/zero-KV load snapshot, and exits. It does not deduplicate by TP or external request ID; exclusivity comes from moving each request out of its prior owner.
+
+The existing single-GPU boundary remains explicit. TP completion requires cleanup acknowledgement before publication, while the non-TP decode path retains its original `Token`/`Finished` publication before slot retirement. Single-GPU prefill state still drops through its existing RAII ownership, and `EngineHandle` plus `TokenEvent` public types are unchanged.
+
+Verification:
+
+- Focused scheduler lifecycle coverage passes: `16 passed`, `0 failed`, `2 ignored`. It covers TP EOS/length and immediate-prefill event buffering, active/prefill drop failure with no leaked success event, remaining scheduled ownership preservation, prune failure propagation, non-TP publication order, and barrier-controlled submit close/drain fan-out across every owner class.
+- Release all-target check and clippy with `-D warnings` pass; formatting and `git diff --check` pass.
+- The complete regular library suite passes on SM86 outside the GPU-isolated sandbox: `90 passed`, `0 failed`, `12 ignored`.
+- The real-weight TP2 scheduler chunked-prefill/decode smoke and the complete TP2 scheduler E2E pass on physical GPUs 1/2. The complete E2E covers context rejection, greedy/logprobs, sequential/repeated/concurrent requests, consumer drop, and post-drop health.
+- A same-session TP1 scheduler E2E attempt could not pass model startup because an unrelated training process left insufficient memory for the loader's default 64-slot graph allocation. No training process was stopped. The non-TP ordering CPU gate and complete regular suite are green; the previously established real TP1 E2E evidence remains unchanged.
+
+Step 4 does not add unified plans, change worker command payloads, alter TP1 sampling, or modify GDR weights/state/kernel shapes. Step 5 owns `RunUnifiedStep`, strict ID-aligned unified artifacts, ordinal validation, and the final TP1/TP2 regression ladder.
 
 Goals:
 

@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Barrier;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -74,12 +76,24 @@ impl DecodeDispatchBackend for PruneTestBackend {
         false
     }
 
-    fn retire_request(&mut self, active: &mut Vec<ActiveRequest35>, idx: usize) {
-        let removed = active.swap_remove(idx);
-        let ActiveBackendState::Tp { request_id } = removed.backend_state else {
+    fn completion_requires_drop_ack(&self) -> bool {
+        true
+    }
+
+    fn take_active_request(
+        &mut self,
+        active: &mut Vec<ActiveRequest35>,
+        idx: usize,
+    ) -> ActiveRequest35 {
+        active.swap_remove(idx)
+    }
+
+    fn drop_active_state(&mut self, state: &ActiveBackendState) -> Result<()> {
+        let ActiveBackendState::Tp { request_id } = state else {
             panic!("prune test expected TP active state");
         };
-        self.retired_active.push(request_id);
+        self.retired_active.push(*request_id);
+        Ok(())
     }
 }
 
@@ -96,12 +110,131 @@ impl PrefillPromoteBackend for PruneTestBackend {
         panic!("prune test must not promote prefill state")
     }
 
-    fn drop_prefill_state(&mut self, state: PrefillBackendState, expectation: DropExpectation) {
+    fn drop_prefill_state(
+        &mut self,
+        state: &PrefillBackendState,
+        expectation: DropExpectation,
+    ) -> Result<()> {
         let PrefillBackendState::Tp { request_id } = state else {
             panic!("prune test expected TP prefill state");
         };
-        self.dropped_prefilling.push((request_id, expectation));
+        self.dropped_prefilling.push((*request_id, expectation));
+        Ok(())
     }
+}
+
+struct LifecycleTestBackend {
+    stop_token: Option<u32>,
+    active_completion_requires_drop_ack: bool,
+    fail_active_drop: bool,
+    fail_prefill_drop: bool,
+    active_drops: Vec<RequestId>,
+    active_events_before_drop: Vec<TokenEvent>,
+    prefill_drops: Vec<(RequestId, DropExpectation)>,
+    observer: Option<openinfer_core::engine::TokenStreamReceiver>,
+}
+
+impl LifecycleTestBackend {
+    fn new(stop_token: Option<u32>, observer: openinfer_core::engine::TokenStreamReceiver) -> Self {
+        Self {
+            stop_token,
+            active_completion_requires_drop_ack: true,
+            fail_active_drop: false,
+            fail_prefill_drop: false,
+            active_drops: Vec::new(),
+            active_events_before_drop: Vec::new(),
+            prefill_drops: Vec::new(),
+            observer: Some(observer),
+        }
+    }
+
+    fn assert_no_completion_published(&mut self) {
+        let Some(observer) = &mut self.observer else {
+            return;
+        };
+        assert!(matches!(
+            observer.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+impl DecodeDispatchBackend for LifecycleTestBackend {
+    fn is_stop_token(&self, token: u32) -> bool {
+        self.stop_token == Some(token)
+    }
+
+    fn completion_requires_drop_ack(&self) -> bool {
+        self.active_completion_requires_drop_ack
+    }
+
+    fn take_active_request(
+        &mut self,
+        active: &mut Vec<ActiveRequest35>,
+        idx: usize,
+    ) -> ActiveRequest35 {
+        active.swap_remove(idx)
+    }
+
+    fn drop_active_state(&mut self, state: &ActiveBackendState) -> Result<()> {
+        let ActiveBackendState::Tp { request_id } = state else {
+            panic!("lifecycle test expected TP active state");
+        };
+        if self.active_completion_requires_drop_ack {
+            self.assert_no_completion_published();
+        } else if let Some(observer) = &mut self.observer {
+            while let Ok((_, event)) = observer.try_recv() {
+                self.active_events_before_drop.push(event);
+            }
+        }
+        self.active_drops.push(*request_id);
+        anyhow::ensure!(!self.fail_active_drop, "injected active drop failure");
+        Ok(())
+    }
+}
+
+impl PrefillPromoteBackend for LifecycleTestBackend {
+    fn is_stop_token(&self, token: u32) -> bool {
+        self.stop_token == Some(token)
+    }
+
+    fn promote_prefill_state(
+        &mut self,
+        _active_len: usize,
+        _state: PrefillBackendState,
+    ) -> ActiveBackendState {
+        panic!("completion lifecycle test must not promote prefill state")
+    }
+
+    fn drop_prefill_state(
+        &mut self,
+        state: &PrefillBackendState,
+        expectation: DropExpectation,
+    ) -> Result<()> {
+        let PrefillBackendState::Tp { request_id } = state else {
+            panic!("lifecycle test expected TP prefill state");
+        };
+        self.assert_no_completion_published();
+        self.prefill_drops.push((*request_id, expectation));
+        anyhow::ensure!(!self.fail_prefill_drop, "injected prefill drop failure");
+        Ok(())
+    }
+}
+
+fn next_event(
+    rx: &mut openinfer_core::engine::TokenStreamReceiver,
+    description: &str,
+) -> TokenEvent {
+    rx.blocking_recv()
+        .unwrap_or_else(|| panic!("{description} channel closed before event"))
+        .1
+}
+
+fn assert_no_more_events(rx: &mut openinfer_core::engine::TokenStreamReceiver) {
+    assert!(
+        rx.try_recv().is_err(),
+        "request received more than one terminal event"
+    );
 }
 
 #[test]
@@ -117,7 +250,9 @@ fn closed_pending_work_is_pruned_before_admission() {
     let mut prefilling = Vec::new();
     let mut backend = PruneTestBackend::default();
 
-    prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending);
+    assert!(
+        prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending).is_ok()
+    );
 
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].request_id.as_deref(), Some("open"));
@@ -157,7 +292,9 @@ fn closed_resident_work_is_absent_from_post_prune_load() {
     let mut pending = vec![test_request("pending-open", pending_sink)];
     let mut backend = PruneTestBackend::default();
 
-    prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending);
+    assert!(
+        prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending).is_ok()
+    );
 
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].request_id.as_deref(), Some("active-open"));
@@ -183,7 +320,9 @@ fn closed_resident_frees_capacity_for_same_tick_admission() {
     let mut pending = vec![test_request("replacement", pending_sink)];
     let mut backend = PruneTestBackend::default();
 
-    prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending);
+    assert!(
+        prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending).is_ok()
+    );
 
     let active_budget: Vec<ActiveKvBudget> = active
         .iter()
@@ -227,13 +366,389 @@ fn closed_materialized_prefill_requires_existing_worker_state() {
     let mut pending = Vec::new();
     let mut backend = PruneTestBackend::default();
 
-    prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending);
+    assert!(
+        prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending).is_ok()
+    );
 
     assert!(prefilling.is_empty());
     assert_eq!(
         backend.dropped_prefilling,
         vec![(RequestId::new(21), DropExpectation::MustExist)]
     );
+}
+
+#[test]
+fn prune_drop_failure_preserves_pending_for_terminal_fanout() {
+    let (closed_tx, closed_rx) = TokenSink::standalone();
+    drop(closed_rx);
+    let (pending_tx, mut pending_rx) = TokenSink::standalone();
+    let (_observer_tx, observer_rx) = TokenSink::standalone();
+    let mut active = vec![active_request(22, "closed-active", closed_tx)];
+    let mut prefilling = Vec::new();
+    let mut pending = vec![test_request("live-pending", pending_tx)];
+    let mut backend = LifecycleTestBackend::new(None, observer_rx);
+    backend.observer = None;
+    backend.fail_active_drop = true;
+
+    let failure =
+        match prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending) {
+            Ok(()) => panic!("injected prune drop should fail"),
+            Err(failure) => failure,
+        };
+    assert!(active.is_empty());
+    assert_eq!(failure.transient.len(), 1);
+    assert_eq!(pending.len(), 1);
+
+    let (_submit_tx, mut submit_rx) = mpsc::unbounded_channel();
+    let (load_tx, _load_rx) = watch::channel(LoadSnapshot::default());
+    terminal_scheduler_shutdown(
+        &mut submit_rx,
+        &load_tx,
+        64,
+        active,
+        prefilling,
+        pending,
+        Vec::new(),
+        failure,
+    );
+
+    assert!(matches!(
+        next_event(&mut pending_rx, "pending after prune failure"),
+        TokenEvent::Error { .. }
+    ));
+    assert_no_more_events(&mut pending_rx);
+}
+
+#[test]
+fn decode_eos_waits_for_drop_before_finished() {
+    let (token_tx, token_rx) = TokenSink::standalone();
+    let mut request = active_request(30, "decode-eos", token_tx);
+    request.params.ignore_eos = false;
+    let mut active = vec![request];
+    let mut backend = LifecycleTestBackend::new(Some(9), token_rx);
+
+    assert!(dispatch_decode_tokens(&mut backend, &mut active, &[9], &[None]).is_ok());
+
+    assert!(active.is_empty());
+    assert_eq!(backend.active_drops, vec![RequestId::new(30)]);
+    let mut token_rx = backend.observer.take().unwrap();
+    assert!(matches!(
+        next_event(&mut token_rx, "decode EOS"),
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            ..
+        }
+    ));
+    assert_no_more_events(&mut token_rx);
+}
+
+#[test]
+fn decode_length_waits_for_drop_before_token_and_finished() {
+    let (token_tx, token_rx) = TokenSink::standalone();
+    let mut request = active_request(31, "decode-length", token_tx);
+    request.params.ignore_eos = true;
+    request.max_tokens = 2;
+    let mut active = vec![request];
+    let mut backend = LifecycleTestBackend::new(None, token_rx);
+
+    assert!(dispatch_decode_tokens(&mut backend, &mut active, &[7], &[None]).is_ok());
+
+    assert!(active.is_empty());
+    assert_eq!(backend.active_drops, vec![RequestId::new(31)]);
+    let mut token_rx = backend.observer.take().unwrap();
+    assert!(matches!(
+        next_event(&mut token_rx, "decode length token"),
+        TokenEvent::Token { id: 7, .. }
+    ));
+    assert!(matches!(
+        next_event(&mut token_rx, "decode length finish"),
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Length,
+            ..
+        }
+    ));
+    assert_no_more_events(&mut token_rx);
+}
+
+#[test]
+fn non_tp_decode_preserves_publish_before_retire_order() {
+    let (token_tx, token_rx) = TokenSink::standalone();
+    let mut request = active_request(36, "single-order", token_tx);
+    request.params.ignore_eos = true;
+    request.max_tokens = 2;
+    let mut active = vec![request];
+    let mut backend = LifecycleTestBackend::new(None, token_rx);
+    backend.active_completion_requires_drop_ack = false;
+
+    assert!(dispatch_decode_tokens(&mut backend, &mut active, &[8], &[None]).is_ok());
+
+    assert!(active.is_empty());
+    assert_eq!(backend.active_drops, vec![RequestId::new(36)]);
+    assert_eq!(backend.active_events_before_drop.len(), 2);
+    assert!(matches!(
+        &backend.active_events_before_drop[0],
+        TokenEvent::Token { id: 8, .. }
+    ));
+    assert!(matches!(
+        &backend.active_events_before_drop[1],
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Length,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn decode_completion_drop_failure_publishes_only_terminal_error() {
+    let (token_tx, token_rx) = TokenSink::standalone();
+    let mut request = active_request(32, "decode-drop-failure", token_tx);
+    request.params.ignore_eos = true;
+    request.max_tokens = 2;
+    let mut active = vec![request];
+    let mut backend = LifecycleTestBackend::new(None, token_rx);
+    backend.fail_active_drop = true;
+
+    let failure = match dispatch_decode_tokens(&mut backend, &mut active, &[7], &[None]) {
+        Ok(()) => panic!("injected active drop should fail"),
+        Err(failure) => failure,
+    };
+    assert!(active.is_empty());
+    assert_eq!(failure.transient.len(), 1);
+    let mut token_rx = backend.observer.take().unwrap();
+    assert!(matches!(
+        token_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    let (_submit_tx, mut submit_rx) = mpsc::unbounded_channel();
+    let (load_tx, _load_rx) = watch::channel(LoadSnapshot::default());
+    terminal_scheduler_shutdown(
+        &mut submit_rx,
+        &load_tx,
+        64,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        failure,
+    );
+
+    assert!(matches!(
+        next_event(&mut token_rx, "failed decode completion"),
+        TokenEvent::Error { .. }
+    ));
+    assert_no_more_events(&mut token_rx);
+}
+
+#[test]
+fn immediate_prefill_completion_waits_for_drop() {
+    let (token_tx, token_rx) = TokenSink::standalone();
+    let mut request = prefilling_request(33, "prefill-length", token_tx);
+    request.req.max_tokens = 1;
+    request.req.params.ignore_eos = true;
+    request.step_chunk = 1;
+    let chunk = ScheduledChunk::from(vec![request]);
+    let mut active = Vec::new();
+    let mut prefilling = Vec::new();
+    let mut backend = LifecycleTestBackend::new(None, token_rx);
+
+    assert!(
+        promote_or_requeue(
+            &mut backend,
+            &mut active,
+            &mut prefilling,
+            chunk,
+            &[11],
+            &[None],
+        )
+        .is_ok()
+    );
+
+    assert!(active.is_empty());
+    assert!(prefilling.is_empty());
+    assert_eq!(
+        backend.prefill_drops,
+        vec![(RequestId::new(33), DropExpectation::MustExist)]
+    );
+    let mut token_rx = backend.observer.take().unwrap();
+    assert!(matches!(
+        next_event(&mut token_rx, "prefill length token"),
+        TokenEvent::Token { id: 11, .. }
+    ));
+    assert!(matches!(
+        next_event(&mut token_rx, "prefill length finish"),
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Length,
+            ..
+        }
+    ));
+    assert_no_more_events(&mut token_rx);
+}
+
+#[test]
+fn immediate_prefill_drop_failure_publishes_only_terminal_error() {
+    let (token_tx, token_rx) = TokenSink::standalone();
+    let (remaining_tx, mut remaining_rx) = TokenSink::standalone();
+    let mut request = prefilling_request(34, "prefill-drop-failure", token_tx);
+    request.req.max_tokens = 1;
+    request.req.params.ignore_eos = true;
+    request.step_chunk = 1;
+    let mut remaining = prefilling_request(35, "remaining-scheduled", remaining_tx);
+    remaining.req.max_tokens = 1;
+    remaining.req.params.ignore_eos = true;
+    remaining.step_chunk = 1;
+    let chunk = ScheduledChunk::from(vec![request, remaining]);
+    let mut active = Vec::new();
+    let mut prefilling = Vec::new();
+    let mut backend = LifecycleTestBackend::new(None, token_rx);
+    backend.fail_prefill_drop = true;
+
+    let failure = match promote_or_requeue(
+        &mut backend,
+        &mut active,
+        &mut prefilling,
+        chunk,
+        &[12, 13],
+        &[None, None],
+    ) {
+        Ok(()) => panic!("injected prefill drop should fail"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.transient.len(), 2);
+    let mut token_rx = backend.observer.take().unwrap();
+    assert!(matches!(
+        token_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        remaining_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    let (_submit_tx, mut submit_rx) = mpsc::unbounded_channel();
+    let (load_tx, _load_rx) = watch::channel(LoadSnapshot::default());
+    terminal_scheduler_shutdown(
+        &mut submit_rx,
+        &load_tx,
+        64,
+        active,
+        prefilling,
+        Vec::new(),
+        Vec::new(),
+        failure,
+    );
+
+    assert!(matches!(
+        next_event(&mut token_rx, "failed prefill completion"),
+        TokenEvent::Error { .. }
+    ));
+    assert_no_more_events(&mut token_rx);
+    assert!(matches!(
+        next_event(&mut remaining_rx, "remaining scheduled prefill"),
+        TokenEvent::Error { .. }
+    ));
+    assert_no_more_events(&mut remaining_rx);
+}
+
+#[test]
+fn terminal_shutdown_closes_drains_and_errors_every_owner_once() {
+    let (active_tx, active_rx) = TokenSink::standalone();
+    let (prefill_tx, prefill_rx) = TokenSink::standalone();
+    let (pending_tx, pending_rx) = TokenSink::standalone();
+    let (deferred_tx, deferred_rx) = TokenSink::standalone();
+    let (candidate_tx, candidate_rx) = TokenSink::standalone();
+    let (scheduled_tx, scheduled_rx) = TokenSink::standalone();
+    let (queued_tx, queued_rx) = TokenSink::standalone();
+    let (after_close_tx, mut after_close_rx) = TokenSink::standalone();
+    let (closed_tx, closed_rx) = TokenSink::standalone();
+    drop(closed_rx);
+
+    let active = vec![active_request(40, "active", active_tx)];
+    let prefilling = vec![prefilling_request(41, "prefilling", prefill_tx)];
+    let pending = vec![
+        test_request("duplicate-external-id", pending_tx),
+        test_request("closed-sink", closed_tx),
+    ];
+    let deferred = vec![test_request("duplicate-external-id", deferred_tx)];
+    let candidate = CompletionCandidate {
+        request: active_request(42, "candidate", candidate_tx),
+        final_events: vec![TokenEvent::Finished {
+            finish_reason: FinishReason::Length,
+            prompt_tokens: 1,
+            completion_tokens: 2,
+        }],
+    };
+    let failure = FatalSchedulerError::new("injected TP replica failure")
+        .with_request(candidate.into_terminal())
+        .with_request(test_request("scheduled", scheduled_tx));
+
+    let queued = test_request("queued-before-close", queued_tx);
+    let after_close = test_request("queued-after-close", after_close_tx);
+    let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
+    let before_send = Arc::new(Barrier::new(2));
+    let sent_before_close = Arc::new(Barrier::new(2));
+    let after_receiver_close = Arc::new(Barrier::new(2));
+    let sender = {
+        let before_send = Arc::clone(&before_send);
+        let sent_before_close = Arc::clone(&sent_before_close);
+        let after_receiver_close = Arc::clone(&after_receiver_close);
+        std::thread::spawn(move || {
+            before_send.wait();
+            submit_tx
+                .send(queued)
+                .expect("close-before request should be accepted");
+            sent_before_close.wait();
+            after_receiver_close.wait();
+            submit_tx.send(after_close).is_err()
+        })
+    };
+
+    before_send.wait();
+    sent_before_close.wait();
+    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+        kv_used_blocks: 9,
+        kv_total_blocks: 64,
+        num_running_reqs: 9,
+        num_waiting_reqs: 9,
+    });
+    terminal_scheduler_shutdown(
+        &mut submit_rx,
+        &load_tx,
+        64,
+        active,
+        prefilling,
+        pending,
+        deferred,
+        failure,
+    );
+    after_receiver_close.wait();
+    assert!(sender.join().expect("submit race thread panicked"));
+
+    let mut receivers = vec![
+        ("active", active_rx),
+        ("prefilling", prefill_rx),
+        ("pending", pending_rx),
+        ("deferred", deferred_rx),
+        ("candidate", candidate_rx),
+        ("scheduled", scheduled_rx),
+        ("queued", queued_rx),
+    ];
+    for (owner, rx) in &mut receivers {
+        match next_event(rx, owner) {
+            TokenEvent::Error { message, .. } => {
+                assert_eq!(message, "injected TP replica failure");
+            }
+            other => panic!("{owner} received non-error terminal event: {other:?}"),
+        }
+        assert_no_more_events(rx);
+    }
+    assert!(after_close_rx.try_recv().is_err());
+
+    let snapshot = *load_rx.borrow();
+    assert_eq!(snapshot.kv_used_blocks, 0);
+    assert_eq!(snapshot.kv_total_blocks, 64);
+    assert_eq!(snapshot.num_running_reqs, 0);
+    assert_eq!(snapshot.num_waiting_reqs, 0);
 }
 
 fn wait_for_load(

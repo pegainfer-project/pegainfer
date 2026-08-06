@@ -6,6 +6,7 @@
 
 mod plan;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::mpsc as std_mpsc;
@@ -111,6 +112,123 @@ enum ActiveBackendState {
 enum PrefillBackendState {
     Single { kv: KvState, rec: RecurrentState },
     Tp { request_id: RequestId },
+}
+
+struct TerminalRequest {
+    token_tx: TokenSink,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+}
+
+impl TerminalRequest {
+    fn send_error(self, message: &str) {
+        let _ = self.token_tx.send(TokenEvent::Error {
+            message: message.to_string(),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+        });
+    }
+}
+
+impl From<SchedulerRequest> for TerminalRequest {
+    fn from(req: SchedulerRequest) -> Self {
+        Self {
+            prompt_tokens: req.prompt_tokens.len(),
+            completion_tokens: 0,
+            token_tx: req.token_tx,
+        }
+    }
+}
+
+impl From<ActiveRequest35> for TerminalRequest {
+    fn from(req: ActiveRequest35) -> Self {
+        Self {
+            token_tx: req.token_tx,
+            prompt_tokens: req.prompt_len,
+            completion_tokens: req.generated_count,
+        }
+    }
+}
+
+impl From<PrefillingRequest35> for TerminalRequest {
+    fn from(req: PrefillingRequest35) -> Self {
+        req.req.into()
+    }
+}
+
+struct PrefillCompletionRequest {
+    req: SchedulerRequest,
+    backend_state: PrefillBackendState,
+}
+
+trait CompletionRequest {
+    fn token_tx(&self) -> &TokenSink;
+    fn into_terminal(self) -> TerminalRequest;
+}
+
+impl CompletionRequest for ActiveRequest35 {
+    fn token_tx(&self) -> &TokenSink {
+        &self.token_tx
+    }
+
+    fn into_terminal(self) -> TerminalRequest {
+        self.into()
+    }
+}
+
+impl CompletionRequest for PrefillCompletionRequest {
+    fn token_tx(&self) -> &TokenSink {
+        &self.req.token_tx
+    }
+
+    fn into_terminal(self) -> TerminalRequest {
+        self.req.into()
+    }
+}
+
+struct CompletionCandidate<R> {
+    request: R,
+    final_events: Vec<TokenEvent>,
+}
+
+impl<R: CompletionRequest> CompletionCandidate<R> {
+    fn commit(self) {
+        for event in self.final_events {
+            let _ = self.request.token_tx().send(event);
+        }
+    }
+
+    fn into_terminal(self) -> TerminalRequest {
+        self.request.into_terminal()
+    }
+}
+
+struct FatalSchedulerError {
+    message: String,
+    transient: Vec<TerminalRequest>,
+}
+
+impl FatalSchedulerError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: Vec::new(),
+        }
+    }
+
+    fn with_request(mut self, request: impl Into<TerminalRequest>) -> Self {
+        self.transient.push(request.into());
+        self
+    }
+
+    fn with_requests<I, R>(mut self, requests: I) -> Self
+    where
+        I: IntoIterator<Item = R>,
+        R: Into<TerminalRequest>,
+    {
+        self.transient.extend(requests.into_iter().map(Into::into));
+        self
+    }
 }
 
 pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
@@ -795,13 +913,8 @@ impl TpSchedulerBackend {
         align_decode_results(active, &result)
     }
 
-    fn drop_request(&self, request_id: RequestId, expectation: DropExpectation) {
-        if let Err(err) = self.executor.drop_request(request_id, expectation) {
-            warn!(
-                "failed to drop Qwen3.5 TP worker request {}: {err}",
-                request_id.get()
-            );
-        }
+    fn drop_request(&self, request_id: RequestId, expectation: DropExpectation) -> Result<()> {
+        self.executor.drop_request(request_id, expectation)
     }
 }
 
@@ -1034,12 +1147,57 @@ fn should_block_on_submit(
     active_empty && prefilling_empty && pending_empty && !inflight_prefill
 }
 
+fn terminal_scheduler_shutdown(
+    submit_rx: &mut mpsc::UnboundedReceiver<SubmittedRequest>,
+    load_tx: &watch::Sender<SchedulerMetrics>,
+    kv_total_blocks: u64,
+    active: Vec<ActiveRequest35>,
+    prefilling: Vec<PrefillingRequest35>,
+    pending: Vec<SchedulerRequest>,
+    deferred: Vec<SchedulerRequest>,
+    inflight_prefill: Option<InflightPrefill>,
+    failure: FatalSchedulerError,
+) {
+    submit_rx.close();
+
+    let mut requests = failure.transient;
+    requests.extend(active.into_iter().map(Into::into));
+    requests.extend(prefilling.into_iter().map(Into::into));
+    requests.extend(pending.into_iter().map(Into::into));
+    requests.extend(deferred.into_iter().map(Into::into));
+    if let Some(InflightPrefill { output, chunk, .. }) = inflight_prefill {
+        // The stream must drain before the chunk's KV/recurrent/conv state is
+        // released or transferred into terminal request ownership.
+        drop(output);
+        requests.extend(chunk.reqs.into_iter().map(Into::into));
+    }
+    while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
+        requests.push(req.into());
+    }
+
+    warn!(
+        "Qwen3.5 TP scheduler terminating after replica failure: {}",
+        failure.message
+    );
+    for request in requests {
+        request.send_error(&failure.message);
+    }
+    load_tx.send_replace(SchedulerMetrics {
+        kv_used_blocks: 0,
+        kv_total_blocks,
+        num_running_reqs: 0,
+        num_waiting_reqs: 0,
+        spec_decode: None,
+    });
+}
+
 fn prune_closed_requests<B>(
     backend: &mut B,
     active: &mut Vec<ActiveRequest35>,
     prefilling: &mut Vec<PrefillingRequest35>,
     pending: &mut Vec<SchedulerRequest>,
-) where
+) -> std::result::Result<(), FatalSchedulerError>
+where
     B: DecodeDispatchBackend + PrefillPromoteBackend,
 {
     pending.retain(|req| !req.token_tx.is_closed());
@@ -1050,7 +1208,10 @@ fn prune_closed_requests<B>(
                 "request pruned before scheduling: request_id={:?} phase=decode tokens_generated={}",
                 active[idx].request_id, active[idx].generated_count
             );
-            backend.retire_request(active, idx);
+            let removed = backend.take_active_request(active, idx);
+            if let Err(err) = backend.drop_active_state(&removed.backend_state) {
+                return Err(FatalSchedulerError::new(err.to_string()).with_request(removed));
+            }
         }
     }
 
@@ -1066,9 +1227,12 @@ fn prune_closed_requests<B>(
             } else {
                 DropExpectation::MustExist
             };
-            backend.drop_prefill_state(removed.backend_state, expectation);
+            if let Err(err) = backend.drop_prefill_state(&removed.backend_state, expectation) {
+                return Err(FatalSchedulerError::new(err.to_string()).with_request(removed));
+            }
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1103,7 +1267,7 @@ fn scheduler_loop(
                 });
             let decode_n = active.len();
             let step_start = itl_debug_enabled().then(Instant::now);
-            finish_async_prefill(
+            let finish_result = finish_async_prefill(
                 &mut backend,
                 &mut active,
                 &mut prefilling,
@@ -1118,6 +1282,21 @@ fn scheduler_loop(
                 prefill_reqs,
                 decode_n,
             );
+            if let Err(failure) = finish_result {
+                let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+                terminal_scheduler_shutdown(
+                    &mut submit_rx,
+                    &load_tx,
+                    kv_total_blocks,
+                    active,
+                    prefilling,
+                    Vec::new(),
+                    deferred,
+                    inflight_prefill.take(),
+                    failure,
+                );
+                return;
+            }
         }
 
         // 1. Merge deferred work with every submission currently available.
@@ -1129,7 +1308,23 @@ fn scheduler_loop(
         // 2. Remove closed work before metrics, admission, or planning. Active
         // and prefilling cleanup goes through the backend's normal retirement
         // paths so graph slots and TP request state are released consistently.
-        prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending);
+        if let Err(failure) =
+            prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending)
+        {
+            let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+            terminal_scheduler_shutdown(
+                &mut submit_rx,
+                &load_tx,
+                kv_total_blocks,
+                active,
+                prefilling,
+                pending,
+                deferred,
+                inflight_prefill.take(),
+                failure,
+            );
+            return;
+        }
 
         // 3. Publish the settled post-prune state. Requests accepted from the
         // channel are waiting until admission below; closed requests never
@@ -1164,7 +1359,23 @@ fn scheduler_loop(
             while let Ok((req, _kv_prefix)) = submit_rx.try_recv() {
                 pending.push(req);
             }
-            prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending);
+            if let Err(failure) =
+                prune_closed_requests(&mut backend, &mut active, &mut prefilling, &mut pending)
+            {
+                let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+                terminal_scheduler_shutdown(
+                    &mut submit_rx,
+                    &load_tx,
+                    kv_total_blocks,
+                    active,
+                    prefilling,
+                    pending,
+                    deferred,
+                    inflight_prefill.take(),
+                    failure,
+                );
+                return;
+            }
             publish_load(
                 &load_tx,
                 &backend,
@@ -1192,8 +1403,8 @@ fn scheduler_loop(
                     )
                 });
             let itl_decode_n = active.len();
-            let itl_plan_kind = if active.is_empty() {
-                finish_async_prefill(
+            let (itl_plan_kind, step_result) = if active.is_empty() {
+                let result = finish_async_prefill(
                     &mut backend,
                     &mut active,
                     &mut prefilling,
@@ -1201,10 +1412,10 @@ fn scheduler_loop(
                         .take()
                         .expect("async prefill must be present before blocking wait"),
                 );
-                "overlap_wait"
+                ("overlap_wait", result)
             } else {
-                decode_step(&mut backend, &mut active, &mut rng);
-                "overlap_decode"
+                let result = decode_step(&mut backend, &mut active, &mut rng);
+                ("overlap_decode", result)
             };
             log_itl_step(
                 itl_step_start,
@@ -1213,6 +1424,21 @@ fn scheduler_loop(
                 itl_prefill_reqs,
                 itl_decode_n,
             );
+            if let Err(failure) = step_result {
+                let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+                terminal_scheduler_shutdown(
+                    &mut submit_rx,
+                    &load_tx,
+                    kv_total_blocks,
+                    active,
+                    prefilling,
+                    Vec::new(),
+                    deferred,
+                    inflight_prefill.take(),
+                    failure,
+                );
+                return;
+            }
             continue;
         }
 
@@ -1330,7 +1556,7 @@ fn scheduler_loop(
                 ExecutionPlan::Decode => "decode",
             };
             let itl_step_start = itl_debug.then(Instant::now);
-            match plan {
+            let step_result = match plan {
                 ExecutionPlan::Unified { pending } => {
                     if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled())
                     {
@@ -1340,7 +1566,7 @@ fn scheduler_loop(
                             pending,
                             &mut inflight_prefill,
                             &mut rng,
-                        );
+                        )
                     } else {
                         unified_step_sched(
                             &mut backend,
@@ -1348,7 +1574,7 @@ fn scheduler_loop(
                             pending,
                             &mut prefilling,
                             &mut rng,
-                        );
+                        )
                     }
                 }
                 ExecutionPlan::Prefill { pending } => prefill_batch(
@@ -1358,10 +1584,8 @@ fn scheduler_loop(
                     &mut prefilling,
                     &mut rng,
                 ),
-                ExecutionPlan::Decode => {
-                    decode_step(&mut backend, &mut active, &mut rng);
-                }
-            }
+                ExecutionPlan::Decode => decode_step(&mut backend, &mut active, &mut rng),
+            };
             log_itl_step(
                 itl_step_start,
                 itl_plan_kind,
@@ -1369,6 +1593,21 @@ fn scheduler_loop(
                 itl_prefill_reqs,
                 itl_decode_n,
             );
+            if let Err(failure) = step_result {
+                let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+                terminal_scheduler_shutdown(
+                    &mut submit_rx,
+                    &load_tx,
+                    kv_total_blocks,
+                    active,
+                    prefilling,
+                    Vec::new(),
+                    deferred,
+                    inflight_prefill.take(),
+                    failure,
+                );
+                return;
+            }
         }
     }
 }
@@ -1414,7 +1653,7 @@ fn prefill_batch(
     scheduled: Vec<PrefillingRequest35>,
     prefilling: &mut Vec<PrefillingRequest35>,
     rng: &mut StdRng,
-) {
+) -> std::result::Result<(), FatalSchedulerError> {
     let mut chunk = ScheduledChunk::from(scheduled);
     let sample_seed = rand::RngExt::random(rng);
     let (tokens, logprobs_vec) = match backend {
@@ -1426,7 +1665,7 @@ fn prefill_batch(
                 Err(e) => {
                     warn!("batch prefill failed: {e}");
                     fail_chunk(chunk, &e.to_string());
-                    return;
+                    return Ok(());
                 }
             };
             let prefill_sample_seed = rand::RngExt::random(rng);
@@ -1435,7 +1674,7 @@ fn prefill_batch(
                 Err(e) => {
                     warn!("prefill sampling failed: {e}");
                     fail_chunk(chunk, &e.to_string());
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -1443,13 +1682,12 @@ fn prefill_batch(
             Ok(v) => v,
             Err(e) => {
                 warn!("TP prefill chunk failed: {e}");
-                fail_chunk(chunk, &e.to_string());
-                return;
+                return Err(FatalSchedulerError::new(e.to_string()).with_requests(chunk.reqs));
             }
         },
     };
 
-    promote_or_requeue(backend, active, prefilling, chunk, &tokens, &logprobs_vec);
+    promote_or_requeue(backend, active, prefilling, chunk, &tokens, &logprobs_vec)
 }
 
 fn launch_overlap_step(
@@ -1458,7 +1696,7 @@ fn launch_overlap_step(
     scheduled: Vec<PrefillingRequest35>,
     inflight_prefill: &mut Option<InflightPrefill>,
     rng: &mut StdRng,
-) {
+) -> std::result::Result<(), FatalSchedulerError> {
     debug_assert!(inflight_prefill.is_none());
     let mut chunk = ScheduledChunk::from(scheduled);
     let decode_seed = rand::RngExt::random(rng);
@@ -1480,7 +1718,7 @@ fn launch_overlap_step(
             fail_chunk(chunk, &err.to_string());
         }
     }
-    decode_step_with_seed(backend, active, decode_seed);
+    decode_step_with_seed(backend, active, decode_seed)
 }
 
 fn finish_async_prefill(
@@ -1488,7 +1726,7 @@ fn finish_async_prefill(
     active: &mut Vec<ActiveRequest35>,
     prefilling: &mut Vec<PrefillingRequest35>,
     inflight: InflightPrefill,
-) {
+) -> std::result::Result<(), FatalSchedulerError> {
     let InflightPrefill {
         chunk,
         output,
@@ -1503,10 +1741,10 @@ fn finish_async_prefill(
         Err(err) => {
             warn!("async prefill sampling failed: {err}");
             fail_chunk(chunk, &err.to_string());
-            return;
+            return Ok(());
         }
     };
-    promote_or_requeue(single, active, prefilling, chunk, &tokens, &logprobs);
+    promote_or_requeue(single, active, prefilling, chunk, &tokens, &logprobs)
 }
 
 // ── Unified step (prefill chunk + decode in one forward pass) ──────────────
@@ -1517,20 +1755,12 @@ fn unified_step_sched(
     scheduled: Vec<PrefillingRequest35>,
     prefilling: &mut Vec<PrefillingRequest35>,
     rng: &mut StdRng,
-) {
+) -> std::result::Result<(), FatalSchedulerError> {
     let SchedulerBackend::Single(backend) = backend else {
         let chunk = ScheduledChunk::from(scheduled);
         let message = "Qwen3.5 TP Phase 1 does not support unified prefill+decode steps";
         warn!("{message}");
-        for req in active.drain(..) {
-            let _ = req.token_tx.send(TokenEvent::Error {
-                message: message.to_string(),
-                prompt_tokens: req.prompt_len,
-                completion_tokens: req.generated_count,
-            });
-        }
-        fail_chunk(chunk, message);
-        return;
+        return Err(FatalSchedulerError::new(message).with_requests(chunk.reqs));
     };
     let mut chunk = ScheduledChunk::from(scheduled);
     // Scope the borrows of `chunk` / `active` to the executor call so the error
@@ -1549,7 +1779,7 @@ fn unified_step_sched(
                 });
             }
             fail_chunk(chunk, &message);
-            return;
+            return Ok(());
         }
     };
     let decode_seed = rand::RngExt::random(rng);
@@ -1558,7 +1788,7 @@ fn unified_step_sched(
     // Process decode results FIRST (it may retire requests and free graph slots
     // that promotion then fills densely).
     if output.decoded {
-        process_decode_logits(backend, active, decode_seed);
+        process_decode_logits(backend, active, decode_seed)?;
     }
 
     let prefill_logits = output
@@ -1571,11 +1801,11 @@ fn unified_step_sched(
             Err(e) => {
                 warn!("unified prefill sampling failed: {e}");
                 fail_chunk(chunk, &e.to_string());
-                return;
+                return Ok(());
             }
         };
 
-    promote_or_requeue(backend, active, prefilling, chunk, &tokens, &logprobs_vec);
+    promote_or_requeue(backend, active, prefilling, chunk, &tokens, &logprobs_vec)
 }
 
 // ── Decode step (pure decode, CUDA Graph enabled) ──────────────────────
@@ -1584,7 +1814,7 @@ fn decode_step(
     backend: &mut SchedulerBackend,
     active: &mut Vec<ActiveRequest35>,
     rng: &mut StdRng,
-) {
+) -> std::result::Result<(), FatalSchedulerError> {
     // Preserve the historical scheduler RNG sequence: TP consumes the first
     // seed, while single-GPU decode consumed a second seed inside sampling.
     let first_seed = rand::RngExt::random(rng);
@@ -1593,14 +1823,14 @@ fn decode_step(
     } else {
         first_seed
     };
-    decode_step_with_seed(backend, active, sample_seed);
+    decode_step_with_seed(backend, active, sample_seed)
 }
 
 fn decode_step_with_seed(
     backend: &mut SchedulerBackend,
     active: &mut Vec<ActiveRequest35>,
     sample_seed: u64,
-) {
+) -> std::result::Result<(), FatalSchedulerError> {
     let (tokens, logprobs_vec) = match backend {
         SchedulerBackend::Single(single) => {
             if let Err(e) = single.decode_graph(active) {
@@ -1613,7 +1843,7 @@ fn decode_step_with_seed(
                         completion_tokens: req.generated_count,
                     });
                 }
-                return;
+                return Ok(());
             }
             // Snapshot logits to CPU BEFORE sampling (sampling may modify bufs.logits)
             match single.sample_decode_logits(active, sample_seed) {
@@ -1628,7 +1858,7 @@ fn decode_step_with_seed(
                             completion_tokens: req.generated_count,
                         });
                     }
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -1636,20 +1866,12 @@ fn decode_step_with_seed(
             Ok(v) => v,
             Err(e) => {
                 warn!("TP eager decode error: {e}");
-                let message = e.to_string();
-                for req in active.drain(..) {
-                    let _ = req.token_tx.send(TokenEvent::Error {
-                        message: message.clone(),
-                        prompt_tokens: req.prompt_len,
-                        completion_tokens: req.generated_count,
-                    });
-                }
-                return;
+                return Err(FatalSchedulerError::new(e.to_string()));
             }
         },
     };
 
-    dispatch_decode_tokens(backend, active, &tokens, &logprobs_vec);
+    dispatch_decode_tokens(backend, active, &tokens, &logprobs_vec)
 }
 
 /// Process decode logits from unified step: sample, extract logprobs, dispatch.
@@ -1657,7 +1879,7 @@ fn process_decode_logits(
     backend: &mut SingleGpuBackend,
     active: &mut Vec<ActiveRequest35>,
     sample_seed: u64,
-) {
+) -> std::result::Result<(), FatalSchedulerError> {
     let (tokens, logprobs_vec) = match backend.sample_decode_logits(active, sample_seed) {
         Ok(v) => v,
         Err(e) => {
@@ -1670,11 +1892,11 @@ fn process_decode_logits(
                     completion_tokens: req.generated_count,
                 });
             }
-            return;
+            return Ok(());
         }
     };
 
-    dispatch_decode_tokens(backend, active, &tokens, &logprobs_vec);
+    dispatch_decode_tokens(backend, active, &tokens, &logprobs_vec)
 }
 
 /// Dispatch sampled decode tokens: send events, check EOS/limits, retire finished.
@@ -1686,7 +1908,13 @@ fn dispatch_decode_tokens(
     active: &mut Vec<ActiveRequest35>,
     tokens: &[u32],
     logprobs: &[Option<TokenLogprob>],
-) {
+) -> std::result::Result<(), FatalSchedulerError> {
+    enum Retirement {
+        Completion(Vec<TokenEvent>),
+        CleanupOnly,
+        Disconnected,
+    }
+
     let n = active.len();
     let mut to_retire = Vec::new();
 
@@ -1707,12 +1935,17 @@ fn dispatch_decode_tokens(
                 req.generated_count,
                 FinishReason::Stop
             );
-            let _ = req.token_tx.send(TokenEvent::Finished {
+            let event = TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: req.prompt_len,
                 completion_tokens: req.generated_count,
-            });
-            to_retire.push(i);
+            };
+            if backend.completion_requires_drop_ack() {
+                to_retire.push((i, Retirement::Completion(vec![event])));
+            } else {
+                let _ = req.token_tx.send(event);
+                to_retire.push((i, Retirement::CleanupOnly));
+            }
         } else if at_limit {
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
@@ -1721,13 +1954,22 @@ fn dispatch_decode_tokens(
                 req.generated_count,
                 FinishReason::Length
             );
-            let _ = req.token_tx.send(TokenEvent::Token { id: token, logprob });
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: req.prompt_len,
-                completion_tokens: req.generated_count,
-            });
-            to_retire.push(i);
+            let events = vec![
+                TokenEvent::Token { id: token, logprob },
+                TokenEvent::Finished {
+                    finish_reason: FinishReason::Length,
+                    prompt_tokens: req.prompt_len,
+                    completion_tokens: req.generated_count,
+                },
+            ];
+            if backend.completion_requires_drop_ack() {
+                to_retire.push((i, Retirement::Completion(events)));
+            } else {
+                for event in events {
+                    let _ = req.token_tx.send(event);
+                }
+                to_retire.push((i, Retirement::CleanupOnly));
+            }
         } else if req
             .token_tx
             .send(TokenEvent::Token { id: token, logprob })
@@ -1737,21 +1979,46 @@ fn dispatch_decode_tokens(
                 "request dropped: client disconnected: request_id={:?} tokens_generated={}",
                 req.request_id, req.generated_count
             );
-            to_retire.push(i);
+            to_retire.push((i, Retirement::Disconnected));
         } else {
             req.last_token = token;
         }
     }
 
     // Remove in reverse order so compact_slot indices stay valid
-    for &i in to_retire.iter().rev() {
-        backend.retire_request(active, i);
+    for (i, retirement) in to_retire.into_iter().rev() {
+        let request = backend.take_active_request(active, i);
+        match retirement {
+            Retirement::Completion(final_events) => {
+                let candidate = CompletionCandidate {
+                    request,
+                    final_events,
+                };
+                if let Err(err) = backend.drop_active_state(&candidate.request.backend_state) {
+                    return Err(FatalSchedulerError::new(err.to_string())
+                        .with_request(candidate.into_terminal()));
+                }
+                candidate.commit();
+            }
+            Retirement::CleanupOnly | Retirement::Disconnected => {
+                if let Err(err) = backend.drop_active_state(&request.backend_state) {
+                    return Err(FatalSchedulerError::new(err.to_string()).with_request(request));
+                }
+            }
+        }
     }
+    Ok(())
 }
 
 trait DecodeDispatchBackend {
     fn is_stop_token(&self, token: u32) -> bool;
-    fn retire_request(&mut self, active: &mut Vec<ActiveRequest35>, idx: usize);
+    fn completion_requires_drop_ack(&self) -> bool;
+    fn take_active_request(
+        &mut self,
+        active: &mut Vec<ActiveRequest35>,
+        idx: usize,
+    ) -> ActiveRequest35;
+    fn drop_active_state(&mut self, state: &ActiveBackendState) -> Result<()>;
 }
 
 impl DecodeDispatchBackend for SingleGpuBackend {
@@ -1759,8 +2026,20 @@ impl DecodeDispatchBackend for SingleGpuBackend {
         self.is_stop_token(token)
     }
 
-    fn retire_request(&mut self, active: &mut Vec<ActiveRequest35>, idx: usize) {
-        compact_single_slot(self, active, idx);
+    fn completion_requires_drop_ack(&self) -> bool {
+        false
+    }
+
+    fn take_active_request(
+        &mut self,
+        active: &mut Vec<ActiveRequest35>,
+        idx: usize,
+    ) -> ActiveRequest35 {
+        compact_single_slot(self, active, idx)
+    }
+
+    fn drop_active_state(&mut self, _state: &ActiveBackendState) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -1769,15 +2048,28 @@ impl DecodeDispatchBackend for SchedulerBackend {
         self.is_stop_token(token)
     }
 
-    fn retire_request(&mut self, active: &mut Vec<ActiveRequest35>, idx: usize) {
+    fn completion_requires_drop_ack(&self) -> bool {
+        matches!(self, SchedulerBackend::Tp(_))
+    }
+
+    fn take_active_request(
+        &mut self,
+        active: &mut Vec<ActiveRequest35>,
+        idx: usize,
+    ) -> ActiveRequest35 {
         match self {
             SchedulerBackend::Single(backend) => compact_single_slot(backend, active, idx),
-            SchedulerBackend::Tp(backend) => {
-                let removed = active.swap_remove(idx);
-                if let ActiveBackendState::Tp { request_id } = removed.backend_state {
-                    backend.drop_request(request_id, DropExpectation::MustExist);
-                }
+            SchedulerBackend::Tp(_) => active.swap_remove(idx),
+        }
+    }
+
+    fn drop_active_state(&mut self, state: &ActiveBackendState) -> Result<()> {
+        match (self, state) {
+            (SchedulerBackend::Single(_), ActiveBackendState::Single { .. }) => Ok(()),
+            (SchedulerBackend::Tp(backend), ActiveBackendState::Tp { request_id }) => {
+                backend.drop_request(*request_id, DropExpectation::MustExist)
             }
+            _ => anyhow::bail!("mismatched Qwen3.5 scheduler backend state during retirement"),
         }
     }
 }
@@ -1791,13 +2083,14 @@ fn compact_single_slot(
     backend: &mut SingleGpuBackend,
     active: &mut Vec<ActiveRequest35>,
     idx: usize,
-) {
+) -> ActiveRequest35 {
     let compaction = compaction_after_retire(active.len(), idx);
-    active.swap_remove(idx);
+    let removed = active.swap_remove(idx);
 
     if let Some(compaction) = compaction {
         backend.compact_slot(active, compaction);
     }
+    removed
 }
 
 // ── Chunked-prefill helpers ────────────────────────────────────────────────
@@ -1917,7 +2210,7 @@ fn promote_or_requeue(
     chunk: ScheduledChunk,
     tokens: &[u32],
     logprobs: &[Option<TokenLogprob>],
-) {
+) -> std::result::Result<(), FatalSchedulerError> {
     let ScheduledChunk {
         reqs,
         backend_state,
@@ -1926,10 +2219,15 @@ fn promote_or_requeue(
     } = chunk;
     let mut still_prefilling: Vec<PrefillingRequest35> = Vec::new();
     let backend_states = split_scheduled_backend_state(backend_state);
+    let mut entries: VecDeque<_> = reqs
+        .into_iter()
+        .zip(backend_states)
+        .zip(ends)
+        .enumerate()
+        .map(|(i, ((req, backend_state), end))| (i, req, backend_state, end))
+        .collect();
 
-    for (i, ((req, backend_state), end)) in
-        reqs.into_iter().zip(backend_states).zip(ends).enumerate()
-    {
+    while let Some((i, req, backend_state, end)) = entries.pop_front() {
         // Not finished: re-queue with the advanced cursor
         if end < req.prompt_tokens.len() {
             still_prefilling.push(PrefillingRequest35 {
@@ -1961,12 +2259,61 @@ fn promote_or_requeue(
                 0,
                 FinishReason::Stop
             );
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: prompt_len,
-                completion_tokens: 0,
-            });
-            backend.drop_prefill_state(backend_state, DropExpectation::MustExist);
+            let candidate = CompletionCandidate {
+                request: PrefillCompletionRequest { req, backend_state },
+                final_events: vec![TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    prompt_tokens: prompt_len,
+                    completion_tokens: 0,
+                }],
+            };
+            if let Err(err) = backend
+                .drop_prefill_state(&candidate.request.backend_state, DropExpectation::MustExist)
+            {
+                return Err(prefill_lifecycle_failure(
+                    err.to_string(),
+                    candidate.into_terminal(),
+                    still_prefilling,
+                    entries,
+                ));
+            }
+            candidate.commit();
+            continue;
+        }
+
+        if req.max_tokens <= 1 {
+            debug!(
+                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
+                req.request_id,
+                prompt_len,
+                1,
+                FinishReason::Length
+            );
+            let candidate = CompletionCandidate {
+                request: PrefillCompletionRequest { req, backend_state },
+                final_events: vec![
+                    TokenEvent::Token {
+                        id: first_token,
+                        logprob,
+                    },
+                    TokenEvent::Finished {
+                        finish_reason: FinishReason::Length,
+                        prompt_tokens: prompt_len,
+                        completion_tokens: 1,
+                    },
+                ],
+            };
+            if let Err(err) = backend
+                .drop_prefill_state(&candidate.request.backend_state, DropExpectation::MustExist)
+            {
+                return Err(prefill_lifecycle_failure(
+                    err.to_string(),
+                    candidate.into_terminal(),
+                    still_prefilling,
+                    entries,
+                ));
+            }
+            candidate.commit();
             continue;
         }
 
@@ -1982,24 +2329,17 @@ fn promote_or_requeue(
                 "request dropped: client disconnected: request_id={:?} tokens_generated={}",
                 req.request_id, 0
             );
-            backend.drop_prefill_state(backend_state, DropExpectation::MustExist);
-            continue;
-        }
-
-        if req.max_tokens <= 1 {
-            debug!(
-                "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                req.request_id,
-                prompt_len,
-                1,
-                FinishReason::Length
-            );
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: prompt_len,
-                completion_tokens: 1,
-            });
-            backend.drop_prefill_state(backend_state, DropExpectation::MustExist);
+            let removed = PrefillCompletionRequest { req, backend_state };
+            if let Err(err) =
+                backend.drop_prefill_state(&removed.backend_state, DropExpectation::MustExist)
+            {
+                return Err(prefill_lifecycle_failure(
+                    err.to_string(),
+                    removed.into_terminal(),
+                    still_prefilling,
+                    entries,
+                ));
+            }
             continue;
         }
 
@@ -2018,6 +2358,19 @@ fn promote_or_requeue(
     }
 
     prefilling.splice(0..0, still_prefilling);
+    Ok(())
+}
+
+fn prefill_lifecycle_failure(
+    message: String,
+    current: TerminalRequest,
+    still_prefilling: Vec<PrefillingRequest35>,
+    remaining: VecDeque<(usize, SchedulerRequest, PrefillBackendState, usize)>,
+) -> FatalSchedulerError {
+    FatalSchedulerError::new(message)
+        .with_request(current)
+        .with_requests(still_prefilling)
+        .with_requests(remaining.into_iter().map(|(_, req, _, _)| req))
 }
 
 trait PrefillPromoteBackend {
@@ -2027,7 +2380,11 @@ trait PrefillPromoteBackend {
         active_len: usize,
         state: PrefillBackendState,
     ) -> ActiveBackendState;
-    fn drop_prefill_state(&mut self, state: PrefillBackendState, expectation: DropExpectation);
+    fn drop_prefill_state(
+        &mut self,
+        state: &PrefillBackendState,
+        expectation: DropExpectation,
+    ) -> Result<()>;
 }
 
 impl PrefillPromoteBackend for SingleGpuBackend {
@@ -2053,7 +2410,13 @@ impl PrefillPromoteBackend for SingleGpuBackend {
         }
     }
 
-    fn drop_prefill_state(&mut self, _state: PrefillBackendState, _expectation: DropExpectation) {}
+    fn drop_prefill_state(
+        &mut self,
+        _state: &PrefillBackendState,
+        _expectation: DropExpectation,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl PrefillPromoteBackend for SchedulerBackend {
@@ -2085,11 +2448,17 @@ impl PrefillPromoteBackend for SchedulerBackend {
         }
     }
 
-    fn drop_prefill_state(&mut self, state: PrefillBackendState, expectation: DropExpectation) {
-        if let (SchedulerBackend::Tp(backend), PrefillBackendState::Tp { request_id }) =
-            (self, state)
-        {
-            backend.drop_request(request_id, expectation);
+    fn drop_prefill_state(
+        &mut self,
+        state: &PrefillBackendState,
+        expectation: DropExpectation,
+    ) -> Result<()> {
+        match (self, state) {
+            (SchedulerBackend::Single(_), PrefillBackendState::Single { .. }) => Ok(()),
+            (SchedulerBackend::Tp(backend), PrefillBackendState::Tp { request_id }) => {
+                backend.drop_request(*request_id, expectation)
+            }
+            _ => anyhow::bail!("mismatched Qwen3.5 scheduler backend state during prefill drop"),
         }
     }
 }
