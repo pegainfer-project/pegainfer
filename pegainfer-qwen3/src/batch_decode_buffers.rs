@@ -26,30 +26,6 @@ pub(crate) const BATCH_BUCKETS: &[usize] = &[
     1, 2, 4, 8, 16, 20, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152,
     160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
-/// Largest batch bucket for which PerToken keeps a CUDA Graph
-pub(crate) const PERTOKEN_GRAPH_MAX_BUCKET: usize = 32;
-
-/// Whether a decode bucket may use a PerToken CUDA Graph
-pub(crate) const fn per_token_graph_bucket_allowed(policy: NumericPolicy, bucket: usize) -> bool {
-    !matches!(policy, NumericPolicy::PerToken) || bucket <= PERTOKEN_GRAPH_MAX_BUCKET
-}
-
-/// Supplemental graph bucket for a decode profile whose normal bucket is disallowed.
-///
-/// When the normal profile bucket is allowed, its existing `Serve` call already
-/// captures it and no supplemental probe is needed. Otherwise, return the largest
-/// allowed bucket that fits within the profile's decode-row capacity.
-pub(crate) fn supplemental_profile_graph_bucket(
-    policy: NumericPolicy,
-    profile_decode_rows: usize,
-) -> Option<usize> {
-    if per_token_graph_bucket_allowed(policy, bucket_for(profile_decode_rows)) {
-        return None;
-    }
-    BATCH_BUCKETS.iter().rev().copied().find(|&bucket| {
-        bucket <= profile_decode_rows && per_token_graph_bucket_allowed(policy, bucket)
-    })
-}
 
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // Split-KV decode attention: the non-partitioned kernel issues one CTA per
@@ -552,68 +528,10 @@ impl BatchDecodeBuffers {
 #[cfg(test)]
 mod tests {
     use pegainfer_core::tensor::DeviceContext;
-    use pegainfer_kernels::ops::NumericPolicy;
     use pegainfer_kv_cache::KvView;
 
     use super::BatchDecodeBuffers;
-    use super::PERTOKEN_GRAPH_MAX_BUCKET;
     use super::build_split_kv_csr;
-    use super::per_token_graph_bucket_allowed;
-    use super::supplemental_profile_graph_bucket;
-
-    #[test]
-    fn per_token_graph_cap_only_applies_to_pertoken() {
-        assert_eq!(
-            super::bucket_for(PERTOKEN_GRAPH_MAX_BUCKET),
-            PERTOKEN_GRAPH_MAX_BUCKET
-        );
-        assert_eq!(super::bucket_for(PERTOKEN_GRAPH_MAX_BUCKET + 1), 40);
-
-        assert!(per_token_graph_bucket_allowed(
-            NumericPolicy::PerToken,
-            PERTOKEN_GRAPH_MAX_BUCKET
-        ));
-        assert!(!per_token_graph_bucket_allowed(
-            NumericPolicy::PerToken,
-            PERTOKEN_GRAPH_MAX_BUCKET + 1
-        ));
-        assert!(per_token_graph_bucket_allowed(
-            NumericPolicy::Pin,
-            *super::BATCH_BUCKETS.last().unwrap()
-        ));
-        assert!(per_token_graph_bucket_allowed(
-            NumericPolicy::Tuned,
-            *super::BATCH_BUCKETS.last().unwrap()
-        ));
-        assert_eq!(
-            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 255),
-            Some(PERTOKEN_GRAPH_MAX_BUCKET)
-        );
-        assert_eq!(
-            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 33),
-            Some(PERTOKEN_GRAPH_MAX_BUCKET)
-        );
-        assert_eq!(
-            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 32),
-            None
-        );
-        assert_eq!(
-            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 31),
-            None
-        );
-        assert_eq!(
-            supplemental_profile_graph_bucket(NumericPolicy::PerToken, 7),
-            None
-        );
-        assert_eq!(
-            supplemental_profile_graph_bucket(NumericPolicy::Tuned, 255),
-            None
-        );
-        assert_eq!(
-            supplemental_profile_graph_bucket(NumericPolicy::Pin, 255),
-            None
-        );
-    }
 
     #[test]
     fn shared_prefix_views_are_counted_by_reference() {
