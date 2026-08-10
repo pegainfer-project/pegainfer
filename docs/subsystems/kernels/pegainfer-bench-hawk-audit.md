@@ -51,6 +51,7 @@
 - `cargo test --release --workspace --lib` — passed after providing the local NCCL runtime library to the dynamic loader.
 - Final all-features Hawk check after rebasing onto the latest `main`, using the corrected playbook command — passed. Result: 361 findings (26 dead / 321 public / 14 restricted), down 215. Of those, 332 are in the excluded `kvbm-logical` fork; `pegainfer-bench` remains at zero.
 - A full all-features workspace Clippy was also attempted. It reaches pre-existing pedantic failures in unchanged GLM5.2 kernel/test code and other never-CI-gated model code; the repository playbook explicitly keeps that baseline outside a visibility PR. The two actual CI Clippy gates above are green.
+- Opened draft PR [#858](https://github.com/pegainfer-project/pegainfer/pull/858) from `chore/hawk-pegainfer-bench-audit`.
 
 ## Debrief
 
