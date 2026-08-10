@@ -167,14 +167,14 @@ const _: () = assert!(
 /// the architecture — the ONE construction shared by `finish_kv`, the MTP
 /// attach, and the layout unit test, so the offset table cannot drift from
 /// the wire constants.
-pub(crate) struct Glm52PageLayout {
-    pub(crate) layers: Vec<Glm52LayerCaches>,
+struct Glm52PageLayout {
+    layers: Vec<Glm52LayerCaches>,
     /// Layer-78 committed mirrors (native MTP): radix hits reuse L78 KV by
     /// pool page id, so the mirrors ride the same page as the target layers.
-    pub(crate) mtp: Glm52LayerCaches,
+    mtp: Glm52LayerCaches,
 }
 
-pub(crate) fn glm52_page_layout() -> Glm52PageLayout {
+fn glm52_page_layout() -> Glm52PageLayout {
     let mut offset = 0usize;
     let mut layers = Vec::with_capacity(GLM52_LAYERS);
     for layer in 0..GLM52_LAYERS {
@@ -542,9 +542,6 @@ pub(crate) struct Glm52RankModelFixed {
     prefill: Option<Glm52TpPrefillExecutor>,
 }
 
-/// Attention layers occupy AR slots `0..GLM52_LAYERS`; the tail reuses the
-/// same fixed-order transport to gather vocabulary-shard top-1 candidates.
-const VOCAB_AR_SLOT: usize = GLM52_LAYERS;
 impl Glm52RankModel {
     /// Export one already pre-captured whole-step bucket graph. The scheduler
     /// selects the topology's serving shape; this method only enforces that
@@ -645,12 +642,7 @@ impl Glm52RankModel {
     /// Native P/D boundary restore: one whole-page D2D from the restored
     /// shared page into the request's own page — every layer's slices (MTP
     /// mirrors included) move together by construction.
-    pub(crate) fn copy_kv_page(
-        &mut self,
-        ctx: &DeviceContext,
-        src: usize,
-        dst: usize,
-    ) -> Result<()> {
+    fn copy_kv_page(&mut self, ctx: &DeviceContext, src: usize, dst: usize) -> Result<()> {
         ensure!(
             src < self.pool_blocks && dst < self.pool_blocks,
             "GLM5.2 boundary copy outside the pool: {src} -> {dst}, {} pool blocks",
@@ -1493,7 +1485,7 @@ impl Glm52RankModel {
         ctx: &DeviceContext,
         aux: &DeviceContext,
         ep8: Option<&mut Glm52MoeEpState>,
-        mut tp: Option<&mut Glm52MoeTpRank>,
+        tp: Option<&mut Glm52MoeTpRank>,
         inputs: &[(u32, usize); GLM52_MAX_STEP_ROWS],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
@@ -1748,7 +1740,7 @@ pub(crate) fn glm52_test_layer_slab(
 /// One whole-page D2D within a KV slab: the page CONTENT moves, the pad tail
 /// does not. `src` and `dst` never overlap — the destination is always a
 /// distinct page.
-pub(crate) fn glm52_copy_page_content(
+fn glm52_copy_page_content(
     stream: &Arc<CudaStream>,
     slab: &mut Glm52KvSlab,
     src: usize,
@@ -1767,7 +1759,7 @@ pub(crate) fn glm52_copy_page_content(
 
 /// One block-granular D2D within a strided arena region: block `b` occupies
 /// `copy_bytes` at `region_offset + b * block_stride`.
-pub(crate) fn copy_strided_block(
+fn copy_strided_block(
     stream: &Arc<CudaStream>,
     arena: &mut CudaSlice<u8>,
     region_offset: usize,

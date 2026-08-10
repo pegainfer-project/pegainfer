@@ -34,7 +34,6 @@ mod typed_scratch;
 mod weights;
 
 pub use config::KIMI_K2_LAYERS;
-pub use config::probe_config_json;
 
 #[cfg(feature = "kimi-k2")]
 #[allow(clippy::needless_pass_by_value)]
@@ -54,15 +53,15 @@ pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<E
 #[cfg(feature = "kimi-k2")]
 #[derive(Clone, Copy, Debug)]
 pub struct KimiLaunchOptions {
-    pub tp_size: usize,
-    pub dp_size: usize,
-    pub ep_backend: EpBackend,
-    pub cuda_graph: bool,
+    tp_size: usize,
+    dp_size: usize,
+    ep_backend: EpBackend,
+    cuda_graph: bool,
 }
 
 /// Start the Kimi-K2 engine from server-facing [`KimiLaunchOptions`].
 #[cfg(feature = "kimi-k2")]
-pub fn launch(model_path: &Path, options: KimiLaunchOptions) -> Result<EngineHandle> {
+fn launch(model_path: &Path, options: KimiLaunchOptions) -> Result<EngineHandle> {
     use log::info;
     use pegainfer_frontend::parallel::ParallelConfig;
 

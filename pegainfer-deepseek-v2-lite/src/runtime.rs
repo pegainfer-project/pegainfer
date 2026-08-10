@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 mod backend;
 mod generation;
 mod graph_probe;
@@ -23,7 +21,6 @@ use crate::model::DriverRankModel;
 use crate::model::ExpertRankModel;
 
 pub struct DeepSeekV2LiteEp2Generator {
-    model_path: PathBuf,
     device_ordinals: Vec<usize>,
     config: Config,
     rank0: DriverRankModel,

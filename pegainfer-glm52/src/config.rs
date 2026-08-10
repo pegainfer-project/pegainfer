@@ -67,7 +67,7 @@ pub(crate) fn glm52_layer_has_full_indexer(layer: usize) -> bool {
         .is_multiple_of(GLM52_INDEX_TOPK_FREQ)
 }
 
-pub fn probe_config_json(json: &Value) -> Result<()> {
+pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
     let model_type = string_field(json, "model_type")?;
     if model_type != "glm_moe_dsa" {
         bail!("not a GLM5.2 config: model_type={model_type}");

@@ -35,15 +35,15 @@ pub struct OffloadConfig {
     /// CUDA device ordinal whose KV buffer this engine offloads.
     pub(crate) device_id: i32,
     /// Host pinned-memory pool size in bytes (the CPU KV tier capacity).
-    pub(crate) pinned_pool_bytes: usize,
+    pinned_pool_bytes: usize,
     /// Back the pinned pool with hugepages (see [`HostConfig::use_hugepages`]).
     pub use_hugepages: bool,
     /// Worker threads for the embedded runtime that drives pegaflow's async
     /// save/query. Two is plenty: save is fire-and-forget, query is a brief
     /// memory-cache lookup.
-    pub(crate) runtime_threads: usize,
+    runtime_threads: usize,
     /// `Some` joins the cross-instance P2P mesh (see [`P2pConfig`]).
-    pub(crate) p2p: Option<P2pConfig>,
+    p2p: Option<P2pConfig>,
 }
 
 impl OffloadConfig {
@@ -84,15 +84,15 @@ impl OffloadConfig {
 }
 
 /// Host-tier knobs for a shared `OffloadHost`.
-pub struct HostConfig {
+pub(crate) struct HostConfig {
     /// Host pinned-memory pool size in bytes (the CPU KV tier capacity).
-    pub pinned_pool_bytes: usize,
+    pub(crate) pinned_pool_bytes: usize,
     /// Back the pinned pool with hugepages (pegaflow supports it natively).
     /// Verify the box actually holds a reservation (`HugePages_Total`) —
     /// some cluster platforms re-claim it across reboots.
-    pub use_hugepages: bool,
+    pub(crate) use_hugepages: bool,
     /// Worker threads for the runtime that drives pegaflow's async save/query.
-    pub runtime_threads: usize,
+    pub(crate) runtime_threads: usize,
     /// `Some` joins the cross-instance P2P mesh (see [`P2pConfig`]).
-    pub p2p: Option<P2pConfig>,
+    pub(crate) p2p: Option<P2pConfig>,
 }

@@ -548,7 +548,7 @@ pub(crate) fn tokenizer_effective_vocab(model_path: &str) -> Result<usize> {
 }
 
 /// Identity check that `json` is a Qwen3.5 config; size and shape validation belong to the config loader.
-pub fn probe_config_json(json: &Value) -> Result<()> {
+pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
     let model_type = json.get("model_type").and_then(Value::as_str).unwrap_or("");
     if model_type != "qwen3_5" {
         bail!("not a Qwen3.5 config: model_type={model_type}");

@@ -10,9 +10,9 @@ use crate::ffi;
 use crate::tensor::DeviceContext;
 
 const GLM52_FLASHMLA_SPARSE_BATCH_CAPACITY: usize = 128;
-pub const GLM52_FLASHMLA_SPARSE_HEADS: usize = 64;
-pub const GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM: usize = 576;
-pub const GLM52_FLASHMLA_SPARSE_V_HEAD_DIM: usize = 512;
+const GLM52_FLASHMLA_SPARSE_HEADS: usize = 64;
+const GLM52_FLASHMLA_SPARSE_QK_HEAD_DIM: usize = 576;
+const GLM52_FLASHMLA_SPARSE_V_HEAD_DIM: usize = 512;
 pub const GLM52_FLASHMLA_SPARSE_PAGE_SIZE: usize = 64;
 pub const GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN: usize = 656;
 pub const GLM52_FLASHMLA_SPARSE_TOPK: usize = 2048;

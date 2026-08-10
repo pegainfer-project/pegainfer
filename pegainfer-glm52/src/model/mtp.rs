@@ -55,6 +55,7 @@ use crate::layer::Glm52LayerCaches;
 use crate::layer::Glm52LayerMlp;
 use crate::layer::glm52_layer_attention_half;
 use crate::layer::glm52_layer_finish;
+#[cfg(test)]
 use crate::mla_decode::Glm52MlaBackend;
 use crate::mla_decode::Glm52MlaSchedMetadata;
 use crate::mla_decode::glm52_select_mla_backend;
@@ -191,14 +192,14 @@ pub(super) struct Glm52MtpDenseKv {
     /// buffer. The MLA region is addressed dense from the base
     /// (`mla_offset` 0, `page_stride` = one 64 x 576 page); the index-K
     /// region starts at `index_k_offset` with the tight 8,448-byte stride.
-    pub(super) proposal: Glm52KvSlab,
-    pub(super) proposal_caches: Glm52LayerCaches,
+    proposal: Glm52KvSlab,
+    proposal_caches: Glm52LayerCaches,
     /// The layer-78 mirror slices inside a KV slab page
     /// (`glm52_page_layout().mtp`). The prefill executor commits the P/D
     /// wire rows (fp8_ds_mla + index-K) straight into the rank slab at these
     /// offsets — the slab page is the ONLY registered arena, so KV that
     /// never reaches it never reaches the decode side (openinfer#850 review).
-    pub(super) slab_caches: Glm52LayerCaches,
+    slab_caches: Glm52LayerCaches,
 }
 
 pub(super) struct Glm52NativeMtp {

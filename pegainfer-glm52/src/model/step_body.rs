@@ -108,7 +108,7 @@ pub(super) fn run_step_body(
             tp_ar,
         )
         .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
-        let mut tp_padded_mlp = false;
+        let tp_padded_mlp = false;
         match &weights.mlp {
             Glm52LayerMlp::Dense(dense) => glm52_dense_mlp_forward_into(
                 ctx,

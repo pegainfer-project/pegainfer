@@ -27,12 +27,7 @@ use crate::weights::Glm52RankGpuWeights;
 use crate::weights::retype_owned;
 
 /// Take one fp8 projection (weight + scale) out of the resident tensor map.
-pub(super) fn take_proj(
-    w: &mut Glm52RankGpuWeights,
-    stem: &str,
-    n: usize,
-    k: usize,
-) -> Result<ProjWeight> {
+fn take_proj(w: &mut Glm52RankGpuWeights, stem: &str, n: usize, k: usize) -> Result<ProjWeight> {
     ProjWeight::from_device(
         w.take_tensor(&format!("{stem}.weight"))?,
         w.take_tensor(&format!("{stem}.weight_scale_inv"))?,

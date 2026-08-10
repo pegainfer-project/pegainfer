@@ -32,11 +32,11 @@ const INTERMEDIATE: usize = crate::config::GLM52_EXPERT_INTERMEDIATE;
 pub(crate) const QUANT_GROUP: usize = 128;
 
 pub(crate) const W13_N: usize = 2 * INTERMEDIATE; // 4096 (gate|up)
-pub(crate) const W13_K: usize = HIDDEN; // 6144
+const W13_K: usize = HIDDEN; // 6144
 pub(crate) const W2_N: usize = HIDDEN; // 6144
 pub(crate) const W2_K: usize = INTERMEDIATE; // 2048
 
-pub(crate) const HIDDEN_SCALE_COLS: usize = HIDDEN / QUANT_GROUP; // 48
+const HIDDEN_SCALE_COLS: usize = HIDDEN / QUANT_GROUP; // 48
 const W13_SCALE_ROWS: usize = W13_N / QUANT_GROUP; // 32
 pub(crate) const W2_SCALE_COLS: usize = W2_K / QUANT_GROUP; // 16
 pub(crate) const W2_SCALE_ROWS: usize = W2_N / QUANT_GROUP; // 48
@@ -311,17 +311,6 @@ impl Glm52RouterScratch {
             },
         })
     }
-}
-
-/// Router over the scratch's `tokens` rows into the persistent scratch
-/// (`s.route` holds the per-row top-k, `[T, 8]`).
-pub(crate) fn run_router_into(
-    ctx: &DeviceContext,
-    router: &Glm52MoeRouterWeights,
-    normed_hidden: &CudaSlice<bf16>,
-    s: &mut Glm52RouterScratch,
-) -> Result<()> {
-    run_router_into_with_config(ctx, router, normed_hidden, s, Glm52RouterConfig::glm52())
 }
 
 pub(crate) fn run_ep_router_into(

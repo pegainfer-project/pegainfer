@@ -46,7 +46,7 @@ pub(crate) const KIMI_K2_RMS_NORM_EPS: f32 = 1.0e-5;
 /// Validate that `json` is a Kimi-K2.6 text config and that every dimension
 /// matches the constants this crate is compiled against. This is a pure gate:
 /// callers only care whether it succeeds, so nothing is materialized.
-pub fn probe_config_json(json: &Value) -> Result<()> {
+pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
     let outer_model_type = string_field(json, "model_type")?;
     let text = if outer_model_type == "kimi_k25" {
         json.get("text_config")

@@ -37,7 +37,7 @@ pub struct OffloadHost {
 }
 
 impl OffloadHost {
-    pub fn new(config: HostConfig) -> Result<Arc<Self>, EngineError> {
+    pub(crate) fn new(config: HostConfig) -> Result<Arc<Self>, EngineError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.runtime_threads.max(1))
             .enable_all()

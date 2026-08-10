@@ -14,7 +14,6 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
 use dynamo_kv_hashing::compute_salt_hash;
-use kvbm_logical::KvbmSequenceHashProvider;
 use kvbm_logical::SequenceHash;
 use kvbm_logical::blocks::ImmutableBlock;
 use kvbm_logical::blocks::MutableBlock;
@@ -92,7 +91,7 @@ impl BlockPool {
         }
     }
 
-    pub fn block_size(&self) -> usize {
+    pub(crate) fn block_size(&self) -> usize {
         self.block_size
     }
 
@@ -114,11 +113,6 @@ impl BlockPool {
 
     pub fn padding_block_id(&self) -> i32 {
         self.padding_block_id as i32
-    }
-
-    /// Maximum blocks a single request can consume (total minus padding).
-    pub fn max_request_blocks(&self) -> usize {
-        self.block_manager.total_blocks().saturating_sub(1)
     }
 
     /// Evict every cached-but-unused block from the GPU prefix cache (drain the
@@ -172,29 +166,15 @@ impl BlockPool {
                 Arc::clone(&self.reserve_gate),
                 lifetime_blocks,
             ),
-            emitted_blocks: 0,
         }
     }
 
     // ── KV-offload prefetch (CPU-tier load before prefill) ─────────────
 
-    /// Resolve `prompt_tokens` against the GPU prefix cache *without* creating
-    /// a request, returning a [`PrefixProbe`] that holds the GPU-hit prefix
-    /// blocks alive so an async CPU-tier load can extend it. The connector
-    /// queries the probe's [`PrefixProbe::cpu_query_hashes`] against the host
-    /// tier, then [`reserve_loaded_blocks`](Self::reserve_loaded_blocks) +
-    /// load + [`commit_loaded_blocks`](Self::commit_loaded_blocks).
-    ///
-    /// `lora_name` must match the request's adapter — it salts the block
-    /// hashes, so probing under the wrong adapter would query unrelated keys.
-    pub fn probe_prefix(&self, prompt_tokens: Vec<u32>, lora_name: Option<&str>) -> PrefixProbe {
-        self.probe_prefix_with_cache_salt(prompt_tokens, None, lora_name)
-    }
-
     /// [`Self::probe_prefix`] with the same additional cache scope accepted by
     /// [`Self::new_request_with_cache_salt`]. The producer request and every
     /// restore probe must derive the identical salt.
-    pub fn probe_prefix_with_cache_salt(
+    pub(crate) fn probe_prefix_with_cache_salt(
         &self,
         prompt_tokens: Vec<u32>,
         cache_salt: Option<&str>,
@@ -243,7 +223,11 @@ impl BlockPool {
     ///
     /// The probe keeps holding every registered block until the request
     /// prefills, closing the eviction window between registration and re-match.
-    pub fn commit_loaded_blocks(&self, probe: &mut PrefixProbe, reservation: LoadReservation) {
+    pub(crate) fn commit_loaded_blocks(
+        &self,
+        probe: &mut PrefixProbe,
+        reservation: LoadReservation,
+    ) {
         let start = probe.gpu_hit;
         for (i, block) in reservation.blocks.into_iter().enumerate() {
             let hash = probe.seq_hashes[start + i];
@@ -271,7 +255,8 @@ pub struct PrefixProbe {
 
 impl PrefixProbe {
     /// Blocks already resident in GPU HBM (the existing prefix-cache hit).
-    pub fn gpu_hit_blocks(&self) -> usize {
+    #[cfg(test)]
+    fn gpu_hit_blocks(&self) -> usize {
         self.gpu_hit
     }
 
@@ -279,14 +264,14 @@ impl PrefixProbe {
     /// a CPU-tier load. They are already out of the free pool and become the
     /// request's cached prefix at prefill, so admission credits them against the
     /// request's block need (avoiding a double-count against `available_blocks`).
-    pub fn held_blocks(&self) -> usize {
+    pub(crate) fn held_blocks(&self) -> usize {
         self.held.len()
     }
 
     /// Content hashes to query the CPU tier with: the blocks past the GPU hit,
     /// capped at the reuse boundary. Empty when the GPU hit already covers
     /// every reusable block (nothing to load — prefill normally).
-    pub fn cpu_query_hashes(&self) -> Vec<Vec<u8>> {
+    pub(crate) fn cpu_query_hashes(&self) -> Vec<Vec<u8>> {
         if self.gpu_hit >= self.cacheable {
             return Vec::new();
         }
@@ -307,7 +292,7 @@ impl PrefixProbe {
     /// `blocks` (they fall to the inactive — evictable, still matchable —
     /// pool). `held` is in prefix order, so the surviving pins cover exactly
     /// the leading `blocks` blocks of the prefix.
-    pub fn truncate_held(&mut self, blocks: usize) {
+    pub(crate) fn truncate_held(&mut self, blocks: usize) {
         self.held.truncate(blocks);
     }
 
@@ -319,7 +304,7 @@ impl PrefixProbe {
     /// Physical page ids of the held blocks, in prefix order. The native
     /// admission reads the last one as its boundary copy-on-restore source;
     /// the probe's pins keep it resident until the hold drops.
-    pub fn held_page_ids(&self) -> Vec<i32> {
+    fn held_page_ids(&self) -> Vec<i32> {
         self.held.iter().map(|b| b.block_id() as i32).collect()
     }
 
@@ -350,7 +335,7 @@ pub struct LoadReservation {
 impl LoadReservation {
     /// Physical page ids the connector loads the leased CPU blocks into, in
     /// lease order (the i-th leased block lands in `page_ids()[i]`).
-    pub fn page_ids(&self) -> Vec<i32> {
+    pub(crate) fn page_ids(&self) -> Vec<i32> {
         self.blocks.iter().map(|b| b.block_id() as i32).collect()
     }
 
@@ -508,13 +493,6 @@ mod entitlement {
 /// store.
 pub struct RequestKv {
     inner: entitlement::EntitledSeq,
-    /// Cursor for [`Self::take_newly_registered_blocks`]: how many of this
-    /// request's sequence blocks have already been surfaced as KV-router store
-    /// events. Starts past the prefix-cache hit (those were stored by whoever
-    /// first sealed them — this assumes GPU-resident reuse, i.e. KV offload
-    /// off, which holds wherever a router feed consumes the diffs). Untouched
-    /// on the plain path, where nothing consumes them.
-    emitted_blocks: usize,
 }
 
 impl RequestKv {
@@ -559,10 +537,6 @@ impl RequestKv {
             .inner
             .with_draw(|seq| seq.match_and_add_prefix(&pool.block_manager))
             .map_err(|e| anyhow::anyhow!("match_and_add_prefix: {e}"))?;
-        // Prefix-hit blocks are already in the router's tree (whoever first
-        // sealed them stored them, and a GPU hit means they were never evicted),
-        // so the store-event cursor skips them.
-        self.emitted_blocks = self.inner.seq().assigned_blocks();
         Ok(blocks * self.inner.seq().block_size())
     }
 
@@ -627,7 +601,7 @@ impl RequestKv {
     /// decode/speculative scheduling. Does not advance `kv_position`.
     pub fn adopt_external_prefill_anchor(&mut self) -> anyhow::Result<()> {
         self.inner
-            .with_draw(|seq| seq.adopt_external_prefill_anchor())
+            .with_draw(kvbm_logical::SchedulableSequence::adopt_external_prefill_anchor)
             .map_err(|e| anyhow::anyhow!("adopt_external_prefill_anchor: {e}"))
     }
 
@@ -653,7 +627,7 @@ impl RequestKv {
     /// schedule whose forward or apply failed) and return its blocks to the pool.
     pub fn revert_schedule(&mut self) -> anyhow::Result<()> {
         self.inner
-            .with_draw(|seq| seq.revert_schedule())
+            .with_draw(kvbm_logical::SchedulableSequence::revert_schedule)
             .map_err(|e| anyhow::anyhow!("revert_schedule: {e}"))
     }
 
@@ -663,7 +637,7 @@ impl RequestKv {
         // availability.
         self.inner.retire();
         self.inner
-            .with_draw(|seq| seq.release())
+            .with_draw(kvbm_logical::SchedulableSequence::release)
             .map_err(|e| anyhow::anyhow!("release: {e}"))
     }
 
@@ -672,7 +646,8 @@ impl RequestKv {
     /// A duplicate resets itself but keeps its primary alive; marking the
     /// primary prevents that hidden block from entering the inactive cache on
     /// final drop.
-    pub fn mark_blocks_reset_on_release(&self) {
+    #[cfg(test)]
+    fn mark_blocks_reset_on_release(&self) {
         for (_, block) in self.inner.seq().inner().assignments().assigned_iter() {
             block.set_primary_reset_on_release(true);
         }
@@ -685,11 +660,13 @@ impl RequestKv {
         self.inner.seq().kv_position()
     }
 
-    pub fn is_complete(&self) -> bool {
+    #[cfg(test)]
+    fn is_complete(&self) -> bool {
         self.inner.seq().is_complete()
     }
 
-    pub fn generated_tokens(&self) -> usize {
+    #[cfg(test)]
+    fn generated_tokens(&self) -> usize {
         self.inner.seq().generated_tokens()
     }
 
@@ -791,7 +768,7 @@ impl RequestKv {
     /// the free/inactive pool until the copy lands, so a later request can't be
     /// allocated the same slot and overwrite it mid-copy. Drop the guard once
     /// the save reports done.
-    pub fn assigned_block_guards(&self) -> Vec<KvBlockGuard> {
+    pub(crate) fn assigned_block_guards(&self) -> Vec<KvBlockGuard> {
         self.inner
             .seq()
             .inner()
@@ -802,55 +779,9 @@ impl RequestKv {
     }
 
     /// Number of leading blocks reused from the GPU prefix cache.
-    pub fn prefix_matched_blocks(&self) -> usize {
+    pub(crate) fn prefix_matched_blocks(&self) -> usize {
         self.inner.seq().inner().prefix_matched_blocks()
     }
-
-    /// Blocks this request has registered (made cacheable) since the last call,
-    /// in the u64 hash space a KV-router consumes plus the kvbm lineage hash.
-    ///
-    /// A block becomes reusable by other requests once it is *registered*
-    /// (assigned an `ImmutableBlock`), which lags sealing the token block by a
-    /// step. Diffs the registered count against an internal cursor and returns
-    /// the new run in sequence order; prefix-cache hits are skipped (see
-    /// [`Self::emitted_blocks`]). Empty when nothing new registered this step.
-    pub fn take_newly_registered_blocks(&mut self) -> Vec<RegisteredBlock> {
-        let registered = self.inner.seq().assigned_blocks();
-        if registered <= self.emitted_blocks {
-            return Vec::new();
-        }
-        let blocks = self.inner.seq().inner().sequence().blocks();
-        debug_assert!(
-            registered <= blocks.len(),
-            "registered blocks ({registered}) exceed sealed token blocks ({})",
-            blocks.len()
-        );
-        let new = blocks[self.emitted_blocks..registered]
-            .iter()
-            .map(|b| RegisteredBlock {
-                plh: b.kvbm_sequence_hash().as_u128(),
-                sequence_hash: b.sequence_hash(),
-                tokens_hash: b.block_hash(),
-                parent_sequence_hash: b.parent_sequence_hash(),
-            })
-            .collect();
-        self.emitted_blocks = registered;
-        new
-    }
-}
-
-/// One full KV block a request just registered, ready to become a KV-router
-/// store event. `sequence_hash`/`tokens_hash`/`parent_sequence_hash` are the
-/// router's u64 hashes (`dynamo_tokens::TokenBlock` accessors, identical by
-/// construction to what the router recomputes); `plh` is the engine's 128-bit
-/// lineage hash, kept only to correlate an eviction event (which carries the
-/// lineage hash) back to `sequence_hash`.
-#[derive(Clone, Copy, Debug)]
-pub struct RegisteredBlock {
-    pub plh: u128,
-    pub sequence_hash: u64,
-    pub tokens_hash: u64,
-    pub parent_sequence_hash: Option<u64>,
 }
 
 /// Pack a kvbm [`SequenceHash`] (lineage hash) into the 16-byte content key the
@@ -1021,7 +952,6 @@ mod tests {
     fn issue_681_profiled_capacity_reuses_blocks_across_requests() {
         // BlockPool reserves one additional CUDA-graph padding page.
         let pool = BlockPool::new(16, 161);
-        assert_eq!(pool.max_request_blocks(), 160);
         let baseline = pool.available_blocks();
         let prompt = (0..1643).map(|i| 30_000 + i).collect::<Vec<_>>();
 
@@ -1138,7 +1068,7 @@ mod tests {
         kv.apply_prefill(1000, &pool).unwrap();
         assert_eq!(pool.entitled_blocks(), 0);
         kv.release().unwrap();
-        let probe = pool.probe_prefix(vec![1; 16], None);
+        let probe = pool.probe_prefix_with_cache_salt(vec![1; 16], None, None);
         assert_eq!(pool.entitled_blocks(), 0, "probe requests entitle nothing");
         drop(probe);
         assert_eq!(pool.entitled_blocks(), 0);
@@ -1248,12 +1178,12 @@ mod tests {
                 let pool = Arc::clone(&pool);
                 let stop = Arc::clone(&stop);
                 std::thread::spawn(move || {
-                    let mut rng = 0x9e3779b97f4a7c15u64.wrapping_add(seed);
+                    let mut rng = 0x9e37_79b9_7f4a_7c15_u64.wrapping_add(seed);
                     let mut held: Option<LoadReservation> = None;
                     while !stop.load(Ordering::Acquire) {
                         rng = rng
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(1442695040888963407);
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
                         let n = (rng >> 33) as usize % 4 + 1;
                         drop(held.take());
                         held = pool.reserve_loaded_blocks(n);
@@ -1265,11 +1195,11 @@ mod tests {
         // Scheduler thread (this one): full lifecycles; a deferred admit is
         // legal, a failed draw after admission never is.
         let mut admitted_rounds = 0u32;
-        let mut rng = 0xdeadbeefcafef00du64;
+        let mut rng = 0xdead_beef_cafe_f00d_u64;
         for round in 0..20_000u32 {
             rng = rng
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let max_output = 32 + ((rng >> 13) as usize % 4) * 16; // lifetime 3..=6
             let prompt: Vec<u32> = (0..16).map(|i| round.wrapping_mul(31) + i).collect();
             let mut kv = pool.new_request(prompt, max_output, None);
@@ -1282,8 +1212,8 @@ mod tests {
             kv.apply_prefill(70_000, &pool)
                 .expect("apply after a successful schedule");
             rng = rng
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let decode_steps = (rng >> 33) as usize % (max_output - 4);
             for step in 0..decode_steps {
                 kv.schedule_decode(&pool)

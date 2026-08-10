@@ -20,6 +20,7 @@ use anyhow::Result;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_frontend::sampler::SamplingParams;
 
+#[cfg(test)]
 use crate::batch_decode_graph::MAX_BATCH;
 use crate::config::TensorParallelConfig;
 use crate::decode_buffers::BatchDecodeBuffers35;
@@ -112,6 +113,7 @@ impl TpRuntimePoison {
 pub struct Qwen35TpExecutor {
     workers: Vec<TpWorker>,
     poison: Arc<TpRuntimePoison>,
+    #[cfg(test)]
     world_size: usize,
     max_batch: usize,
     page_size: usize,
@@ -187,7 +189,8 @@ impl TpDecodeStepItem {
 }
 
 impl Qwen35TpExecutor {
-    pub fn from_runtime(
+    #[cfg(test)]
+    fn from_runtime(
         model_path: &str,
         enable_cuda_graph: bool,
         device_ordinals: &[usize],
@@ -345,6 +348,7 @@ impl Qwen35TpExecutor {
         Ok(Self {
             workers,
             poison,
+            #[cfg(test)]
             world_size,
             max_batch: min_rank_max_batch,
             page_size,
@@ -354,7 +358,8 @@ impl Qwen35TpExecutor {
         })
     }
 
-    pub fn world_size(&self) -> usize {
+    #[cfg(test)]
+    fn world_size(&self) -> usize {
         self.world_size
     }
 
@@ -378,9 +383,20 @@ impl Qwen35TpExecutor {
         token_id == self.eos_token_id
     }
 
-    pub fn ping_all(&self) -> Result<()> {
+    #[cfg(test)]
+    fn ping_all(&self) -> Result<()> {
         self.poison.ensure_healthy()?;
-        self.broadcast_ack(TpWorkerCommandKind::Ping)
+        let (resp_tx, resp_rx) = mpsc::channel();
+        for worker in &self.workers {
+            self.send_or_poison(
+                worker,
+                TpWorkerCommand::Ping {
+                    resp: resp_tx.clone(),
+                },
+            )?;
+        }
+        drop(resp_tx);
+        wait_for_acks(resp_rx, self.workers.len(), "ping", &self.poison)
     }
 
     pub fn execute_prefill(&self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
@@ -489,33 +505,6 @@ impl Qwen35TpExecutor {
         wait_for_acks(resp_rx, self.workers.len(), "drop request", &self.poison)
     }
 
-    fn broadcast_ack(&self, kind: TpWorkerCommandKind) -> Result<()> {
-        let (resp_tx, resp_rx) = mpsc::channel();
-        for worker in &self.workers {
-            let command = match kind {
-                TpWorkerCommandKind::Ping => TpWorkerCommand::Ping {
-                    resp: resp_tx.clone(),
-                },
-                TpWorkerCommandKind::RunPrefillChunks => TpWorkerCommand::RunPrefillChunks {
-                    chunks: Vec::new(),
-                    sample_seed: 0,
-                    resp: resp_tx.clone(),
-                },
-                TpWorkerCommandKind::RunDecodeStep => TpWorkerCommand::RunDecodeStep {
-                    requests: Vec::new(),
-                    sample_seed: 0,
-                    resp: resp_tx.clone(),
-                },
-                TpWorkerCommandKind::RunUnifiedStep => TpWorkerCommand::RunUnifiedStep {
-                    resp: resp_tx.clone(),
-                },
-            };
-            self.send_or_poison(worker, command)?;
-        }
-        drop(resp_tx);
-        wait_for_acks(resp_rx, self.workers.len(), kind.name(), &self.poison)
-    }
-
     fn send_or_poison(&self, worker: &TpWorker, command: TpWorkerCommand) -> Result<()> {
         worker.send(command).map_err(|err| {
             let reason = self
@@ -533,26 +522,6 @@ impl Drop for Qwen35TpExecutor {
         }
         for worker in &mut self.workers {
             worker.join_bounded();
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-enum TpWorkerCommandKind {
-    Ping,
-    RunPrefillChunks,
-    RunDecodeStep,
-    RunUnifiedStep,
-}
-
-impl TpWorkerCommandKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Ping => "ping",
-            Self::RunPrefillChunks => "prefill chunks",
-            Self::RunDecodeStep => "decode step",
-            Self::RunUnifiedStep => "unified step",
         }
     }
 }

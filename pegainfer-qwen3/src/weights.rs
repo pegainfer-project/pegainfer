@@ -28,7 +28,7 @@ use crate::lora::apply_lora_projection_delta_range;
 mod load;
 pub(crate) use load::ModelRuntimeConfig;
 
-pub const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.90;
+pub(crate) const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.90;
 pub const DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES: usize = 150 * 1024 * 1024;
 /// Default KV cache page (block) size in tokens.
 pub const DEFAULT_KV_PAGE_SIZE: usize = 16;

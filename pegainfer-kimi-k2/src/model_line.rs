@@ -62,7 +62,7 @@ impl ModelLine for KimiK2Line {
                 config_model_type(config)
             ));
         }
-        crate::probe_config_json(config).map_err(|error| error.to_string())
+        crate::config::probe_config_json(config).map_err(|error| error.to_string())
     }
 
     fn augment_cli(&self, cmd: clap::Command) -> clap::Command {

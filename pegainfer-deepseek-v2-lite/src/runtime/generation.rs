@@ -137,7 +137,6 @@ impl DeepSeekV2LiteEp2Generator {
         );
 
         Ok(Self {
-            model_path: model_path.to_path_buf(),
             device_ordinals: options.device_ordinals,
             config,
             rank0,
@@ -178,7 +177,6 @@ impl DeepSeekV2LiteEp2Generator {
 
     pub(crate) fn new_generation_stats(&self, prompt_tokens: usize) -> GenerationStats {
         GenerationStats {
-            model_path: self.model_path.clone(),
             device_ordinals: self.device_ordinals.clone(),
             ep_backend: self.backend.kind().as_str().to_string(),
             ep_size: 2,

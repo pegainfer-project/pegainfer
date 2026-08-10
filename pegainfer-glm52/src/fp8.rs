@@ -505,16 +505,6 @@ impl Glm52MlpScratch {
                 .transpose()?,
         })
     }
-
-    #[cfg(test)]
-    pub(crate) fn gate_up(&self) -> &CudaSlice<bf16> {
-        &self.gate_up
-    }
-
-    #[cfg(test)]
-    pub(crate) fn silu_out(&self) -> &CudaSlice<bf16> {
-        &self.silu_out
-    }
 }
 
 /// A plain fp8 SwiGLU MLP over the scratch's `rows` tokens into a

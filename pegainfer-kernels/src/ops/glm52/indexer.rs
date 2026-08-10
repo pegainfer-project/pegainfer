@@ -237,7 +237,7 @@ pub const GLM52_MIN_GEMV_MAX_TOKENS: usize = 96;
 /// The token counts `glm52_min_gemv.cuh` instantiates: 1..=8 plus the
 /// verify-span decode bucket sizes (#812) — token counts always land on a
 /// bucket member.
-pub fn glm52_min_gemv_tokens_supported(tokens: usize) -> bool {
+fn glm52_min_gemv_tokens_supported(tokens: usize) -> bool {
     (1..=8).contains(&tokens) || matches!(tokens, 16 | 32 | 48 | 64 | 96)
 }
 

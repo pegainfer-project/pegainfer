@@ -25,7 +25,7 @@
 use xxhash_rust::xxh3::xxh3_128;
 
 /// Key width: xxh3_128 digest.
-pub const VLLM_HASH_BYTES: usize = 16;
+pub(crate) const VLLM_HASH_BYTES: usize = 16;
 
 /// Derives vLLM-compatible block-hash chains for one `(seed, block_size)`
 /// configuration.
@@ -50,7 +50,7 @@ impl VllmBlockHasher {
 
     /// Hash one block: `parent` is the previous block's hash (`None` for the
     /// first block, which chains off `NONE_HASH`).
-    pub fn hash_block(
+    fn hash_block(
         &self,
         parent: Option<&[u8; VLLM_HASH_BYTES]>,
         token_ids: &[u32],

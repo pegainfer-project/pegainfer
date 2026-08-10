@@ -19,7 +19,7 @@ use super::Glm52RankGpuContext;
 /// Bytes per pinned slot. Two slots cost 64 MiB/rank (256 MiB for EP4) and
 /// allow one host fill to overlap one H2D DMA. See the GLM5.2 GB300 bring-up
 /// document for the same-host EP4 parameter sweep behind this value.
-pub(super) const STAGE_BYTES: usize = 32 << 20;
+const STAGE_BYTES: usize = 32 << 20;
 /// Persistent host memcpy workers per rank. EP4 has 30,660 uploads/rank;
 /// retaining the workers avoids repeated thread creation and yields 16 active
 /// fill workers across four local ranks. See the GLM5.2 GB300 bring-up

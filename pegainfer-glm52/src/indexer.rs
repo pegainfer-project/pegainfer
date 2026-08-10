@@ -291,7 +291,7 @@ pub(crate) struct Glm52IndexerScratch {
     topk_offsets: CudaSlice<i32>,
     topk_values: CudaSlice<f32>,
     pub(crate) global_slots: CudaSlice<i32>,
-    pub(crate) topk_lens: CudaSlice<i32>,
+    topk_lens: CudaSlice<i32>,
     // Owned mma partial buffer (wq_b/wk). The indexer chain runs on the AUX
     // stream concurrently with the ctx-side MLA front — this buffer being
     // owned here (not shared per device) is what makes that overlap safe.
@@ -662,7 +662,7 @@ pub(crate) fn glm52_indexer_forward(
 
 /// Upper bound on requests sharing one prefill chunk (sizes the
 /// per-request gather tables; exceeding it fails the chunk explicitly).
-pub(crate) const GLM52_INDEXER_PREFILL_MAX_REQUESTS: usize = 128;
+const GLM52_INDEXER_PREFILL_MAX_REQUESTS: usize = 128;
 
 /// One request's segment inside the current prefill chunk.
 #[derive(Clone, Copy, Debug)]

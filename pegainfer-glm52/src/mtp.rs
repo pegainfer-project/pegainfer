@@ -155,22 +155,6 @@ impl Glm52MtpBookendWeights {
             shared_norm,
         })
     }
-
-    #[cfg(test)]
-    pub(crate) fn from_host(
-        ctx: &DeviceContext,
-        enorm: &[u8],
-        hnorm: &[u8],
-        eh_proj: &[u8],
-        shared_norm: &[u8],
-    ) -> Result<Self> {
-        Self::new(
-            DeviceVec::from_safetensors(ctx, enorm)?,
-            DeviceVec::from_safetensors(ctx, hnorm)?,
-            DeviceMatrix::from_safetensors(ctx, eh_proj, GLM52_HIDDEN, MTP_FUSED_INPUT)?,
-            DeviceVec::from_safetensors(ctx, shared_norm)?,
-        )
-    }
 }
 
 /// Persistent MTP-only intermediates for one row bucket.
@@ -207,16 +191,6 @@ impl Glm52MtpScratch {
             normed_previous: Rows::zeros(ctx, tokens)?,
             fused_input: HiddenStates::zeros(ctx, MTP_FUSED_INPUT, tokens)?,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn normed_embed(&self) -> &Rows<GLM52_HIDDEN> {
-        &self.normed_embed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn normed_previous(&self) -> &Rows<GLM52_HIDDEN> {
-        &self.normed_previous
     }
 }
 

@@ -43,7 +43,7 @@ const GLM52_WEIGHT_INDEX: &str = "model.safetensors.index.json";
 /// only needs SOME partition covering every checkpoint tensor) and the EP8
 /// chain's shim contract check.
 pub(crate) const GLM52_EP_RANKS: usize = 8;
-pub(crate) const GLM52_LOCAL_EXPERTS: usize = GLM52_ROUTED_EXPERTS / GLM52_EP_RANKS;
+const GLM52_LOCAL_EXPERTS: usize = GLM52_ROUTED_EXPERTS / GLM52_EP_RANKS;
 const FP8_BLOCK_SIZE: usize = 128;
 
 // ---------------------------------------------------------------------------

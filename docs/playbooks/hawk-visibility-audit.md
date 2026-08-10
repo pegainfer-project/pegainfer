@@ -22,16 +22,16 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 
 ```sh
 RUSTC_BOOTSTRAP=1 \
-PEGAINFER_NCCL_ROOT=/data/opt/nccl-2.30.4 \
-PEGAINFER_TRITON_PYTHON=.venv/bin/python \
+PEGAINFER_NCCL_ROOT="${NCCL_ROOT:?set NCCL_ROOT to the NCCL installation root}" \
+PEGAINFER_TRITON_PYTHON="$PWD/.venv/bin/python" \
 cargo +1.97.1 hawk check
 ```
 
 All three environment variables are required:
 
 - `RUSTC_BOOTSTRAP=1` — the repo pins nightly (`generic_const_exprs`); hawk only accepts the 1.97.1 stable compiler, so feature gates must be unlocked.
-- `PEGAINFER_NCCL_ROOT` — under all-features, `pegainfer-kernels/moe` builds the DeepEP shim, which needs NCCL >= 2.30.4.
-- `PEGAINFER_TRITON_PYTHON` — the `qwen35` build-time Triton AOT codegen (build.rs also falls back to `.venv/bin/python` on its own).
+- `PEGAINFER_NCCL_ROOT` — under all-features, `pegainfer-kernels/moe` builds the DeepEP shim, which needs NCCL >= 2.30.4. Set `NCCL_ROOT` to that installation before running the command.
+- `PEGAINFER_TRITON_PYTHON` — the `qwen35` build-time Triton AOT codegen. Keep this absolute: the build script runs with the kernel crate as its working directory, so a workspace-relative `.venv/bin/python` does not resolve there.
 
 Expected runtime: ~20 minutes cold (Triton AOT + Marlin nvcc dominate); artifacts are cached under `/tmp/cargo-hawk-target/<workspace>-<hash>`, so reruns take a few minutes.
 

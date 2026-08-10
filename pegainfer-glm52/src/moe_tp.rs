@@ -295,7 +295,7 @@ pub(crate) fn load_tp_slice_layer(
 /// Max rows per prefill MoE sub-block. Bounds routed gather/GEMM scratch
 /// buffers (`block * TOPK` rows) while keeping per-layer expert weight
 /// re-reads to `ceil(chunk / block)` passes.
-pub(crate) const GLM52_PREFILL_MOE_BLOCK_ROWS: usize = 8192;
+const GLM52_PREFILL_MOE_BLOCK_ROWS: usize = 8192;
 
 /// Chunk-scale TP prefill MoE scratch: the router runs over the whole
 /// chunk once; expert compute walks the chunk in blocks of this size.

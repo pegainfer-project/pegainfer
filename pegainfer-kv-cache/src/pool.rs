@@ -149,7 +149,7 @@ impl BlockPool {
     /// different KV bytes because of state outside that block. `lora_name`
     /// remains a separate weight identity; callers must not overload it with
     /// request-local cache semantics.
-    pub fn new_request_with_cache_salt(
+    fn new_request_with_cache_salt(
         &self,
         prompt_tokens: Vec<u32>,
         max_output_tokens: usize,
@@ -158,7 +158,6 @@ impl BlockPool {
     ) -> RequestKv {
         let salt_hash = compute_salt_hash(cache_salt, lora_name)
             .expect("compute_salt_hash is infallible for string cache/lora identities");
-        let lifetime_blocks = (prompt_tokens.len() + max_output_tokens).div_ceil(self.block_size);
         let seq = SchedulableSequence::new(
             prompt_tokens,
             max_output_tokens,
@@ -169,7 +168,6 @@ impl BlockPool {
         RequestKv {
             seq,
             emitted_blocks: 0,
-            lifetime_blocks,
         }
     }
 
@@ -191,7 +189,7 @@ impl BlockPool {
     /// [`Self::probe_prefix`] with the same additional cache scope accepted by
     /// [`Self::new_request_with_cache_salt`]. The producer request and every
     /// restore probe must derive the identical salt.
-    pub fn probe_prefix_with_cache_salt(
+    fn probe_prefix_with_cache_salt(
         &self,
         prompt_tokens: Vec<u32>,
         cache_salt: Option<&str>,
@@ -338,12 +336,6 @@ pub struct RequestKv {
     /// which holds wherever the event feed is enabled). Untouched on the plain
     /// path where the feed is off.
     emitted_blocks: usize,
-    /// Input-plus-output page capacity, frozen at construction. The sequence
-    /// may later reclassify an input token as generated (external-prefill
-    /// anchor adoption), which must not shrink the reservation: the promoted
-    /// token still occupies its sequence position and the dangling token at
-    /// the end of the sequence still provisions a page beyond it.
-    lifetime_blocks: usize,
 }
 
 impl RequestKv {
@@ -454,15 +446,6 @@ impl RequestKv {
             .map_err(|e| anyhow::anyhow!("apply_prefill_chunk: {e}"))
     }
 
-    /// Convert the one uncomputed final input token left by an external
-    /// prefill restore into the normal dangling-token state expected by
-    /// decode/speculative scheduling. Does not advance `kv_position`.
-    pub fn adopt_external_prefill_anchor(&mut self) -> anyhow::Result<()> {
-        self.seq
-            .adopt_external_prefill_anchor()
-            .map_err(|e| anyhow::anyhow!("adopt_external_prefill_anchor: {e}"))
-    }
-
     pub fn apply_decode(&mut self, token: u32, pool: &BlockPool) -> anyhow::Result<DecodeOutcome> {
         self.seq
             .apply_decode(token, &pool.block_manager)
@@ -519,13 +502,6 @@ impl RequestKv {
 
     pub fn generated_tokens(&self) -> usize {
         self.seq.generated_tokens()
-    }
-
-    /// Full input-plus-output page capacity fixed when this request was
-    /// created. Admission uses this value for already-active requests so any
-    /// internal tokens added by a protocol remain accounted for.
-    pub fn lifetime_blocks(&self) -> usize {
-        self.lifetime_blocks
     }
 
     /// Physical blocks currently held by this request, including registered,
@@ -757,35 +733,6 @@ mod tests {
                 .expect("repeated match"),
             32,
             "the same cache salt must preserve ordinary prefix reuse"
-        );
-    }
-
-    #[test]
-    fn request_reports_the_lifetime_capacity_it_was_created_with() {
-        let pool = BlockPool::new(16, 8).unwrap();
-        let req = pool.new_request(vec![1; 16], 17, None);
-
-        assert_eq!(req.lifetime_blocks(), 3);
-    }
-
-    #[test]
-    fn external_prefill_anchor_promotion_keeps_lifetime_capacity() {
-        let pool = BlockPool::new(16, 8).unwrap();
-        // 16 restored tokens + 1 anchor tail + 16 output positions. The
-        // anchor promotion reclassifies one input token as generated; the
-        // reservation must not shrink — the promoted token still occupies a
-        // sequence position and the dangling token at the end of the
-        // sequence still provisions a page beyond it.
-        let mut req = pool.new_request(vec![1; 17], 16, None);
-        assert_eq!(req.lifetime_blocks(), 3);
-        req.schedule_prefill(16, &pool).expect("restored chunk");
-        req.apply_prefill_chunk(&pool).expect("restored apply");
-        req.adopt_external_prefill_anchor()
-            .expect("anchor adoption");
-        assert_eq!(
-            req.lifetime_blocks(),
-            3,
-            "promoting the external anchor to generated must not shrink the reservation"
         );
     }
 

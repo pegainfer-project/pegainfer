@@ -243,7 +243,7 @@ impl OffloadEngine {
     /// the caller's blocks cannot be evicted and overwritten under the in-flight
     /// D2H (which would snapshot the wrong KV and persist it under the old hash).
     /// Pass `()` only when the blocks are owned elsewhere for the whole save.
-    pub fn submit_save<G: Send + 'static>(
+    fn submit_save<G: Send + 'static>(
         &self,
         block_ids: &[i32],
         block_hashes: &[Vec<u8>],
@@ -325,7 +325,7 @@ impl OffloadEngine {
     /// A handle dropped before it settles can strand a `Ready` outcome's
     /// lease until its TTL expires — poll every submitted query to settlement
     /// (the same discipline as an abandoned [`LoadHandle`]).
-    pub fn submit_query(
+    fn submit_query(
         &self,
         req_id: &str,
         block_hashes: &[Vec<u8>],

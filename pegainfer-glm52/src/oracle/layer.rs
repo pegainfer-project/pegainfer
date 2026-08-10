@@ -139,87 +139,13 @@ const DENSE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
 ];
 // ---- END GENERATED ----
 
-// ---- BEGIN GENERATED: glm52_oracle layer probes (moe, layer 6) ----
-// uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
-//     --ctx 200 --seed 0x5eed604d --layer 6 --precision fp8sim \
-//     --stage layer --input-scale 0.02
-// transformers=5.13.0.dev0 torch=2.12.1+cu130
+// Shared seeded-input metadata for the MoE layer oracle below.
 pub(crate) const MOE_ORACLE_SEED: u64 = 0x5eed604d;
 pub(crate) const MOE_ORACLE_CTX: usize = 200;
 pub(crate) const MOE_ORACLE_LAYER: usize = 6;
 pub(crate) const MOE_ORACLE_INPUT_SCALE: f64 = 0.02;
 // sha256[..16] of the seeded bf16 input — a mismatch means PRNG drift, not a kernel bug.
 pub(crate) const MOE_ORACLE_HIDDEN_DIGEST: &str = "d39daa8ba2c7f939";
-// tap `layer_out` [200, 6144] bf16 digest=9644721e4fe718db (provenance only)
-// tol = max(rel_tol 0.05 x delta_rms 1.945e-03, 3 x bf16-ulp 9.021e-05) — see emit_rust_layer.
-pub(crate) const MOE_ORACLE_LAYER_TOL: f32 = 2.706195228e-04;
-pub(crate) const MOE_ORACLE_LAYER_PROBES: &[(usize, f32)] = &[
-    (7504, 3.393554688e-02),
-    (10832, 1.940917969e-02),
-    (30355, 4.028320312e-02),
-    (33148, -2.624511719e-02),
-    (69206, 2.050781250e-02),
-    (146761, 3.112792969e-02),
-    (156574, 4.052734375e-02),
-    (161844, 2.587890625e-02),
-    (240978, -1.831054688e-02),
-    (307757, -2.380371094e-02),
-    (319510, -2.893066406e-02),
-    (333821, 2.734375000e-02),
-    (337363, -8.430480957e-04),
-    (345826, 1.129150391e-02),
-    (368340, -3.540039062e-02),
-    (377565, -2.258300781e-03),
-    (387659, 1.953125000e-02),
-    (432017, 3.387451172e-03),
-    (442664, 3.808593750e-02),
-    (446114, 2.526855469e-02),
-    (468571, 2.160644531e-02),
-    (471935, 1.257324219e-02),
-    (488799, 9.826660156e-03),
-    (520950, -3.784179688e-02),
-    (530739, -2.697753906e-02),
-    (534505, -3.540039062e-02),
-    (534971, 3.710937500e-02),
-    (577397, 2.471923828e-03),
-    (604084, -3.369140625e-02),
-    (636056, -2.429199219e-02),
-    (668274, 1.953125000e-02),
-    (672858, -3.417968750e-02),
-    (714313, -8.178710938e-03),
-    (743834, -2.648925781e-02),
-    (791113, 1.226806641e-02),
-    (802252, -1.397705078e-02),
-    (807243, 1.611328125e-02),
-    (818652, -1.818847656e-02),
-    (878485, 1.550292969e-02),
-    (879770, 3.320312500e-02),
-    (880514, -3.369140625e-02),
-    (903613, 3.759765625e-02),
-    (915339, -1.876831055e-03),
-    (931272, -2.758789062e-02),
-    (943182, 1.672363281e-02),
-    (949584, -3.311157227e-03),
-    (980538, 2.038574219e-02),
-    (980931, -3.799438477e-03),
-    (1022303, -1.855468750e-02),
-    (1023279, -8.544921875e-03),
-    (1091288, 3.063964844e-02),
-    (1092832, -3.829956055e-03),
-    (1094227, 1.989746094e-02),
-    (1094427, 1.428222656e-02),
-    (1102135, -2.807617188e-02),
-    (1104580, -2.648925781e-02),
-    (1120355, 1.965332031e-02),
-    (1158451, -1.599121094e-02),
-    (1167014, -3.735351562e-02),
-    (1176953, 3.271484375e-02),
-    (1181822, -5.607604980e-04),
-    (1209754, 3.082275391e-03),
-    (1216021, 4.052734375e-02),
-    (1218315, 3.149414062e-02),
-];
-// ---- END GENERATED ----
 
 // ---- BEGIN GENERATED: glm52_oracle layer probes (moe, layer 6, deepgemm precision) ----
 // Non-expert projections use the engine's bf16-activation GEMV precision.
@@ -321,7 +247,7 @@ pub(crate) fn seeded_hidden(seed: u64, count: usize, scale: f64) -> Vec<bf16> {
         .collect()
 }
 
-pub(crate) fn bf16_digest(data: &[bf16]) -> String {
+fn bf16_digest(data: &[bf16]) -> String {
     let mut hasher = Sha256::new();
     for v in data {
         hasher.update(v.to_bits().to_le_bytes());
@@ -365,7 +291,7 @@ impl LayerTensors {
         Ok(Self { by_name })
     }
 
-    pub(crate) fn bytes(&self, name: &str) -> Result<&[u8]> {
+    fn bytes(&self, name: &str) -> Result<&[u8]> {
         self.by_name
             .get(name)
             .map(Vec::as_slice)
@@ -414,7 +340,7 @@ pub(crate) fn load_rank_expert_bank(
     crate::moe_decode::Glm52MoeExpertBank::pack_from_host(ctx, &experts)
 }
 
-pub(crate) fn upload_u8(ctx: &DeviceContext, host: &[u8]) -> Result<cudarc::driver::CudaSlice<u8>> {
+fn upload_u8(ctx: &DeviceContext, host: &[u8]) -> Result<cudarc::driver::CudaSlice<u8>> {
     let mut dev = ctx.stream.alloc_zeros::<u8>(host.len())?;
     ctx.stream.memcpy_htod(host, &mut dev)?;
     Ok(dev)

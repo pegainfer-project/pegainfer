@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 /// Why a resolve returned less than the tier could theoretically serve.
 /// Observability-only: the caller sees just a smaller `hit_tokens`.
 #[derive(Clone, Copy, Debug)]
-pub enum DegradeReason {
+pub(crate) enum DegradeReason {
     /// The request was cancelled mid-resolve; remaining I/O was skipped.
     Cancelled,
     /// The tier stayed `Loading` past the resolve deadline.
@@ -26,9 +26,9 @@ pub enum DegradeReason {
 
 #[derive(Debug, Default)]
 pub struct KvStoreStats {
-    pub resolves: AtomicU64,
+    pub(crate) resolves: AtomicU64,
     /// Resolves that returned with a hold (any hit at all, GPU or host).
-    pub resolve_hits: AtomicU64,
+    pub(crate) resolve_hits: AtomicU64,
     /// Host-tier blocks actually loaded onto the GPU.
     pub resolve_loaded_blocks: AtomicU64,
     pub resolve_degraded: AtomicU64,

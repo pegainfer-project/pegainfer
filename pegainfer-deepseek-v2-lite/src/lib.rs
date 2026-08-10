@@ -49,7 +49,7 @@ pub use runtime::GenerationResult;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use runtime::GenerationStats;
 
-pub fn probe_config_json(json: &serde_json::Value) -> Result<bool> {
+fn probe_config_json(json: &serde_json::Value) -> Result<bool> {
     let Some(model_type) = json.get("model_type").and_then(serde_json::Value::as_str) else {
         return Ok(false);
     };
@@ -93,7 +93,7 @@ pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<E
 /// in the attribution gate. The EP=2 topology (devices `0..1`) is fixed by the
 /// model.
 #[cfg(feature = "deepseek-v2-lite")]
-pub fn launch(model_path: &Path, cuda_graph: bool) -> Result<EngineHandle> {
+fn launch(model_path: &Path, cuda_graph: bool) -> Result<EngineHandle> {
     if cuda_graph {
         log::warn!("DeepSeek V2 Lite does not support CUDA Graph; ignoring --cuda-graph=true");
     }

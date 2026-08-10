@@ -29,25 +29,25 @@ use crate::manifest::validate::ObservedTensor;
 /// redemption, prefetch join and unmap fall between them, and the allocations
 /// submitted under `record_api_wall_ms` execute under
 /// `execute_and_drain_wall_ms`. Only `elapsed_ms` is a total.
-pub(crate) struct LoadStats {
+struct LoadStats {
     /// Every required tensor at its dtype.
-    pub(crate) manifest_bytes: usize,
+    manifest_bytes: usize,
     /// Free-before minus free-after. Signed: this measures the device, not the
     /// process, so anything else running on it moves the number too.
-    pub(crate) device_bytes: i64,
-    pub(crate) device_free_bytes: usize,
+    device_bytes: i64,
+    device_free_bytes: usize,
     /// Config, headers, classification. No device. The advisory prefetch
     /// workers start inside this window and keep running past it.
-    pub(crate) validate_wall_ms: f64,
+    validate_wall_ms: f64,
     /// Submitting one allocation and one staging plan per tensor. Wider than
     /// the shared loader's `alloc_api_wall`, which times the allocs alone.
-    pub(crate) record_api_wall_ms: f64,
+    record_api_wall_ms: f64,
     /// The checkpoint is consumed here, so this carries the source read as
     /// well as the transfer.
-    pub(crate) execute_and_drain_wall_ms: f64,
+    execute_and_drain_wall_ms: f64,
     /// The whole call, unmap included.
-    pub(crate) elapsed_ms: f64,
-    pub(crate) skipped_modality_tensors: usize,
+    elapsed_ms: f64,
+    skipped_modality_tensors: usize,
 }
 
 struct LayerSlots {
@@ -203,10 +203,7 @@ impl Gemma4Weights {
     /// Loads the text tower onto one device. Config, manifest and headers are
     /// all checked before a device context exists, so a checkpoint that does
     /// not match its config costs no GPU.
-    pub(crate) fn from_safetensors(
-        model_path: &str,
-        device_ordinal: usize,
-    ) -> Result<(Self, LoadStats)> {
+    fn from_safetensors(model_path: &str, device_ordinal: usize) -> Result<(Self, LoadStats)> {
         let started = Instant::now();
         let config = Gemma4Config::from_file(model_path)?;
         let manifest = Manifest::from_config(&config)?;

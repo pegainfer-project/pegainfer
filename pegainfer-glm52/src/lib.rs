@@ -52,7 +52,7 @@ use anyhow::ensure;
 use bytesize::ByteSize;
 pub(crate) use config::GLM52_LAYERS;
 pub(crate) use config::GLM52_ROUTED_EXPERTS;
-pub use config::probe_config_json;
+pub(crate) use config::probe_config_json;
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::KvCapacity;
 use pegainfer_frontend::engine::LoadSnapshot;
@@ -80,8 +80,9 @@ use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::glm52_arena_bytes;
 use crate::model::glm52_pool_blocks;
 
-pub const GLM52_PREFILL_CHUNK_ALIGN: usize = GLM52_MODEL_LEN_ALIGN;
-pub const GLM52_DEFAULT_PREFILL_CHUNK_SIZE: usize = 16_384;
+const GLM52_PREFILL_CHUNK_ALIGN: usize = GLM52_MODEL_LEN_ALIGN;
+#[cfg(test)]
+const GLM52_DEFAULT_PREFILL_CHUNK_SIZE: usize = 16_384;
 
 /// Optional speculative decoder used by the GLM5.2 engine.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -116,7 +117,7 @@ impl Glm52Drafter {
 
 /// Parse a `--glm52-ranks` value (`start..end`, e.g. `4..8`) into the global
 /// DP rank range a process hosts.
-pub fn parse_rank_range(spec: &str) -> Result<Range<usize>> {
+fn parse_rank_range(spec: &str) -> Result<Range<usize>> {
     let (start, end) = spec
         .split_once("..")
         .with_context(|| format!("rank range `{spec}` must be start..end (e.g. 4..8)"))?;
@@ -133,63 +134,63 @@ pub fn parse_rank_range(spec: &str) -> Result<Range<usize>> {
 /// TP4 prefill-only configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52PrefillOnlyOptions {
-    pub chunk_size: usize,
+    chunk_size: usize,
 }
 
 /// GLM5.2 parallel shape. EP8 is the production layout today; TP4 is the
 /// GB300 bring-up target.
 #[derive(Clone, Debug)]
 pub struct Glm52LaunchOptions {
-    pub tp_size: usize,
-    pub dp_size: usize,
+    tp_size: usize,
+    dp_size: usize,
     /// Optional speculative decoder. DSpark enables lossless speculative
     /// sampling from an external checkpoint; native MTP uses the checkpoint's
     /// layer-78 decoder and supports EP decode (single- or multi-process —
     /// the MTP round rides the same fixed chain and DeepEP context as the
     /// target steps) and TP4 prefill-only.
-    pub drafter: Glm52Drafter,
+    drafter: Glm52Drafter,
     /// Per-request context cap (`prompt + max_tokens - 1 <= max_model_len`).
     /// `None` sizes it from the post-weight-load free VRAM (fleet minimum);
     /// an explicit value is still validated against that budget so an
     /// impossible cap fails at launch, not at the first long request.
-    pub max_model_len: Option<usize>,
+    max_model_len: Option<usize>,
     /// Enables TP4 prefill-only serving.
-    pub prefill_only: Option<Glm52PrefillOnlyOptions>,
+    prefill_only: Option<Glm52PrefillOnlyOptions>,
     /// vLLM-style kill switch: disable prefix matching outright (every
     /// prefill recomputes the full prompt). Prefix caching is also forced
     /// off while a speculative decoder is on: DSpark needs aux-hidden
     /// captures for every prefix row, while native MTP needs target hidden
     /// states and uninterrupted MTP KV continuity.
-    pub no_prefix_cache: bool,
+    no_prefix_cache: bool,
     /// `Some` adds the pegaflow host tier under the prefix cache: sealed KV
     /// blocks flow to one shared pinned pool on request release, and a
     /// prompt whose prefix fell out of HBM restores from it at admission.
     /// Requires the prefix cache (rejected at launch alongside any
     /// speculative decoder or `no_prefix_cache`).
-    pub kv_offload: Option<Glm52KvOffloadOptions>,
+    kv_offload: Option<Glm52KvOffloadOptions>,
     /// Launch-time MoE sharding topology. `Ep8` (default) is the
     /// high-throughput configuration: 32 whole experts per rank, DeepEP
     /// dispatch/combine, buckets 1-8. `Tp4` is GB300 **prefill-only**
     /// tensor parallel (NCCL all-reduce; requires `--glm52-prefill-only`).
-    pub moe_topo: Glm52MoeTopo,
+    moe_topo: Glm52MoeTopo,
     /// Stage checkpoint bytes through pinned double buffers. Intended for
     /// warm page-cache starts; cold network filesystems should leave it off.
-    pub weight_staging: bool,
+    weight_staging: bool,
     /// Export rank 0's already pre-captured whole-step decode graph during
     /// startup. EP and TP4 export bucket 1. The requested PNG gets a
     /// complete sibling `.dot` for machine inspection.
-    pub dump_graph_png: Option<PathBuf>,
+    dump_graph_png: Option<PathBuf>,
     /// The global DP ranks THIS process hosts (default: the whole topology
     /// — the single-node engine). A partial range is the multi-process
     /// cross-node shape: every node runs the same binary over its own ranks,
     /// and the collective DeepEP communicator is the only coupling
     /// (`docs/models/glm52/free-running-dp.md` §3).
-    pub ranks: Option<Range<usize>>,
+    ranks: Option<Range<usize>>,
     /// Bootstrap rendezvous address, required exactly when `ranks` is a
     /// partial range. The process hosting rank 0 binds it and serves the
     /// DeepEP unique id; every other process connects to fetch it. A
     /// one-time handshake — there is no runtime control plane.
-    pub rendezvous: Option<String>,
+    rendezvous: Option<String>,
 }
 
 /// Launch-time MoE sharding topology (the expert slab is repacked during
@@ -215,7 +216,7 @@ pub enum Glm52MoeTopo {
 
 impl Glm52MoeTopo {
     #[must_use]
-    pub fn default_dp_size(self) -> usize {
+    fn default_dp_size(self) -> usize {
         match self {
             Self::Tp4 => 1,
             _ => self.device_count(),
@@ -236,7 +237,7 @@ impl Glm52MoeTopo {
     /// Number of independently scheduled request partitions. Tensor-
     /// replicated workers execute one mirrored partition in lock-step.
     #[must_use]
-    pub fn logical_rank_count(self) -> usize {
+    fn logical_rank_count(self) -> usize {
         if self.uses_tensor_replicated_moe() {
             1
         } else {
@@ -247,7 +248,7 @@ impl Glm52MoeTopo {
     /// The `--tp-size` this topology requires (server validation mirrors the
     /// launch-time ensure).
     #[must_use]
-    pub fn expected_tp_size(self) -> usize {
+    fn expected_tp_size(self) -> usize {
         match self {
             Self::Tp4 => 4,
             _ => 1,
@@ -279,7 +280,7 @@ impl Glm52MoeTopo {
     /// (TP4) — the server needs it to size the frontend partition count
     /// for a hosted rank range.
     #[must_use]
-    pub fn uses_tensor_replicated_moe(self) -> bool {
+    fn uses_tensor_replicated_moe(self) -> bool {
         matches!(self, Self::Tp4)
     }
 }
@@ -376,26 +377,26 @@ mod topology_tests {
 #[derive(Clone, Debug)]
 pub struct Glm52KvOffloadOptions {
     /// Host pinned-memory pool size in bytes, shared by all ranks.
-    pub pinned_pool_bytes: usize,
+    pinned_pool_bytes: usize,
     /// Back the pool with hugepages (the box must hold a reservation —
     /// check `HugePages_Total`).
-    pub use_hugepages: bool,
+    use_hugepages: bool,
     /// `Some` joins the cross-instance P2P mesh: saved block hashes register
     /// with the MetaServer and missing prefixes are pulled from peer
     /// instances over RDMA — the P/D disaggregation data plane.
-    pub p2p: Option<Glm52P2pOptions>,
+    p2p: Option<Glm52P2pOptions>,
 }
 
 /// Cross-instance P2P KV sharing (see `pegainfer_kv_store::P2pConfig`).
 #[derive(Clone, Debug)]
 pub struct Glm52P2pOptions {
     /// MetaServer gRPC address, e.g. `http://10.0.0.100:50056`.
-    pub metaserver_addr: String,
+    metaserver_addr: String,
     /// This engine's routable `IP:port` (doubles as the embedded transfer
     /// service's bind address). Must be reachable by every peer.
-    pub advertise_addr: String,
+    advertise_addr: String,
     /// RDMA NIC device names to register the pinned pool on.
-    pub rdma_nics: Vec<String>,
+    rdma_nics: Vec<String>,
 }
 
 /// GLM5.2 kernels (FlashMLA SM100, DeepGEMM MQA and routed experts, …)
@@ -424,7 +425,7 @@ fn ensure_blackwell_devices(local_gpus: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
+fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle> {
     let Glm52LaunchOptions {
         tp_size,
         dp_size,

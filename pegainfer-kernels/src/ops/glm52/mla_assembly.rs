@@ -19,7 +19,7 @@ const GLM52_MLA_QUERY_DIM: usize = GLM52_MLA_QK_NOPE + GLM52_MLA_ROPE_DIM; // 57
 const GLM52_MLA_KV_LORA: usize = 512;
 const GLM52_MLA_SCALE_GROUPS: usize = GLM52_MLA_KV_LORA / 128; // 4
 /// fp8_ds_mla token: 512 e4m3 ckv + 4 f32 scales + 64 bf16 rope-key.
-pub const GLM52_MLA_CACHE_BYTES: usize = 656;
+const GLM52_MLA_CACHE_BYTES: usize = 656;
 /// Standard E4M3 MLA token used by FlashInfer: 512 ckv + 64 rope-key.
 const GLM52_MLA_FLASHINFER_CACHE_BYTES: usize = 576;
 

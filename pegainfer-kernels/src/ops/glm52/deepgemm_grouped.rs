@@ -24,7 +24,7 @@ pub enum Glm52DeepGemmGroupedFp8Kind {
 
 impl Glm52DeepGemmGroupedFp8Kind {
     /// The operand's `(n, k)`.
-    pub fn shape(self) -> (usize, usize) {
+    pub(crate) fn shape(self) -> (usize, usize) {
         match self {
             Self::W13 => (4096, 6144),
             Self::W2 => (6144, 2048),

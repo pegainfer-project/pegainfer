@@ -149,7 +149,7 @@ pub(super) fn lease_flags(
 }
 
 /// Whether `GLM52_EAGER_DECODE=1` forces the eager (graph-free) decode path.
-pub(super) fn eager_decode_forced() -> bool {
+fn eager_decode_forced() -> bool {
     static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EAGER.get_or_init(|| std::env::var("GLM52_EAGER_DECODE").as_deref() == Ok("1"))
 }

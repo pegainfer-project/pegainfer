@@ -521,7 +521,7 @@ pub fn gemm_graphsafe_ref_into_checked(
     gemm_ref_into_with_policy(ctx, weight, x, out, true)
 }
 
-pub(crate) fn gemm_per_token_into_checked(
+fn gemm_per_token_into_checked(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     x: &HiddenStates,

@@ -23,12 +23,12 @@ pub type LoadHandle = OffloadHandle<()>;
 
 /// GPU→CPU save; resolves when the host tier has captured the data (the
 /// source GPU blocks are reusable from that point).
-pub type SaveHandle = OffloadHandle<()>;
+pub(crate) type SaveHandle = OffloadHandle<()>;
 
 /// Prefix query; resolves to a [`QueryOutcome`] once pegaflow has counted the
 /// local hit and — for `Loading` outcomes — leaves the background fetch
 /// running (re-submit with the same `req_id` to poll it).
-pub type QueryHandle = OffloadHandle<QueryOutcome>;
+pub(crate) type QueryHandle = OffloadHandle<QueryOutcome>;
 
 impl<T> OffloadHandle<T> {
     pub(crate) fn from_rx(rx: oneshot::Receiver<Result<T, EngineError>>) -> Self {
@@ -63,7 +63,7 @@ impl<T> OffloadHandle<T> {
 
     /// A handle that is already settled with `result` — lets scheduler tests
     /// drive their admission poll path without a pegaflow worker.
-    pub fn settled(result: Result<T, EngineError>) -> Self {
+    pub(crate) fn settled(result: Result<T, EngineError>) -> Self {
         let (tx, rx) = oneshot::channel();
         let _ = tx.send(result);
         Self { rx }

@@ -175,6 +175,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `subsystems/kernels/pegainfer-kernels-boundary.md` | Architecture decision: reusable frontend/runtime/data-plane layers plus per-model engines; `pegainfer-kernels` keeps shared MoE/MLA substrate (`moe`: DeepEP/DeepGEMM/FlashMLA) separate from model-local surfaces such as the narrow GLM5.2 DeepGEMM/FlashMLA wrappers. |
+| `subsystems/kernels/pegainfer-bench-hawk-audit.md` | Hawk retained `pegainfer-bench` on two report consumers, reduced workspace findings 576 → 361, and exposed dead state that was deleted; 332 remaining findings are in the excluded kvbm fork. |
 | `subsystems/kernels/build-rs-submodule-init.md` | `pegainfer-kernels/build.rs` initializes missing git submodules automatically for first-time builds before checking vendored third-party kernel headers. |
 | `subsystems/kernels/kernel-op-reports.md` | Qwen3 kernel/report tooling is feature-gated: `qwen3_kernel_report` covers per-op kernel reports, and `qwen3_model_report` emits runtime-traced eager-DAG decode operator rollups with TensorSpec `KernelCall`s, latency stats, tables, and Graphviz DOT; measured FA2 `CTA_TILE_Q=64` prefill default in place. |
 | `subsystems/kernels/typed-forward-pipeline.md` | Reusable typed tensor pipeline macro in `pegainfer-kernels` so model crates can express common `typed_ops` chains without model-specific wrapper macros. |

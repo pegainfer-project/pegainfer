@@ -21,19 +21,14 @@ mod host;
 mod layout;
 mod vllm_hash;
 
-pub use config::HostConfig;
 pub use config::OffloadConfig;
 pub use config::P2pConfig;
 pub use engine::OffloadEngine;
 pub use handle::LoadHandle;
 pub use handle::OffloadHandle;
-pub use handle::QueryHandle;
 pub use handle::QueryHit;
 pub use handle::QueryOutcome;
-pub use handle::SaveHandle;
 pub use host::OffloadHost;
-pub use layout::KvArena;
 // Re-exported so callers name pegaflow's engine types through this bridge.
 pub use pegaflow_core::{EngineError, PegaEngine, QueryLeaseId};
-pub use vllm_hash::VLLM_HASH_BYTES;
 pub use vllm_hash::VllmBlockHasher;

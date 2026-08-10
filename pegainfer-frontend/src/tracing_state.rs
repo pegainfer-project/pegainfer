@@ -21,6 +21,6 @@ pub fn set_enabled(enabled: bool) {
 /// Whether request tracing is active. A relaxed load on the request hot path;
 /// callers use it to avoid building spans that would be discarded.
 #[inline]
-pub fn is_enabled() -> bool {
+pub(crate) fn is_enabled() -> bool {
     TRACING_ENABLED.load(Ordering::Relaxed)
 }

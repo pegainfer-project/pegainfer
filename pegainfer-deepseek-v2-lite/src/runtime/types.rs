@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use pegainfer_frontend::engine::FinishReason;
 use serde::Serialize;
 
@@ -9,7 +7,6 @@ use crate::nccl_backend::NcclGraphSmokeReport;
 
 #[derive(Clone, Debug, Default)]
 pub struct GenerationStats {
-    pub model_path: PathBuf,
     pub device_ordinals: Vec<usize>,
     pub ep_backend: String,
     pub ep_size: usize,

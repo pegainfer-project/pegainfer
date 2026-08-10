@@ -101,7 +101,7 @@ pub(super) fn native_kv_shape(req: &GenerateRequest, handoff: &NativeMtpHandoff)
 /// The naming chain P sealed: its natural sequence at handoff (committed
 /// prompt + dangling anchor) padded to the page boundary. A page-aligned
 /// commit has no partial page and no pads — the anchor stays unnamed.
-pub(super) fn padded_chain(committed_prompt: &[u32], anchor: u32) -> Vec<u32> {
+fn padded_chain(committed_prompt: &[u32], anchor: u32) -> Vec<u32> {
     let mut chain = committed_prompt.to_vec();
     if chain.len().is_multiple_of(PAGE) {
         return chain;

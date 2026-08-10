@@ -143,9 +143,6 @@ pub(crate) struct Glm52LayerScratch {
     pub(crate) normed2: Rows<GLM52_HIDDEN>,
     /// the MLP half's final contribution (dense out, or routed+shared sum).
     pub(crate) mlp_out: Rows<GLM52_HIDDEN>,
-    /// head-sharded o_proj partial, before the attention-TP all-reduce
-    /// (unused when the layer holds all 64 heads).
-    pub(crate) ar_partial: Rows<GLM52_HIDDEN>,
     /// MoE shared-expert contribution.
     pub(crate) shared_out: Rows<GLM52_HIDDEN>,
 }
@@ -157,7 +154,6 @@ impl Glm52LayerScratch {
             attn: [Rows::zeros(ctx, tokens)?, Rows::zeros(ctx, tokens)?],
             normed2: Rows::zeros(ctx, tokens)?,
             mlp_out: Rows::zeros(ctx, tokens)?,
-            ar_partial: Rows::zeros(ctx, tokens)?,
             shared_out: Rows::zeros(ctx, tokens)?,
         })
     }

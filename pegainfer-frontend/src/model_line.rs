@@ -64,7 +64,7 @@ impl CliError {
 }
 
 /// Flags accepted for every model line regardless of detected type.
-pub const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
+const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
 
 /// A source argument id and the argument ids it requires.
 pub type ArgRequirement = (&'static str, &'static [&'static str]);

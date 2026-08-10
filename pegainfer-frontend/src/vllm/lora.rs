@@ -64,8 +64,8 @@ struct UnloadLoraAdapterHttpRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoraModule {
-    pub name: String,
-    pub path: PathBuf,
+    name: String,
+    path: PathBuf,
 }
 
 /// CLI parser for `--lora-modules`: vLLM-style `name=path`, a JSON object,

@@ -377,7 +377,7 @@ impl Glm52Engine {
         })
     }
 
-    pub(crate) fn run(mut self) {
+    fn run(mut self) {
         if let Err(err) = self.bootstrap() {
             let _ = self.startup_tx.send(Err(err));
             self.shutdown_workers();

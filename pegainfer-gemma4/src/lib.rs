@@ -15,10 +15,10 @@ use std::path::Path;
 use anyhow::Result;
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
-pub use probe::probe_config_json;
+pub(crate) use probe::probe_config_json;
 
 #[cfg(feature = "gemma4")]
-pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<EngineHandle> {
+fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<EngineHandle> {
     anyhow::bail!("Gemma 4 engine is not implemented yet (registration only)")
 }
 

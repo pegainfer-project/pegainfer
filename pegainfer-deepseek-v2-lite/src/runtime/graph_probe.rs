@@ -156,7 +156,6 @@ impl DeepSeekV2LiteEp2Generator {
         }
         trace_graph_probe("start full decode graph probe");
         let mut stats = GenerationStats {
-            model_path: self.model_path.clone(),
             device_ordinals: self.device_ordinals.clone(),
             ep_backend: self.backend.kind().as_str().to_string(),
             ep_size: 2,

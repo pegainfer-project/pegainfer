@@ -11,7 +11,7 @@ const GEMMA4_MOE_NUM_EXPERTS: u64 = 128;
 const GEMMA4_MOE_TOP_K: u64 = 8;
 const GEMMA4_MOE_INTERMEDIATE: u64 = 704;
 
-pub fn probe_config_json(json: &serde_json::Value) -> Result<()> {
+pub(crate) fn probe_config_json(json: &serde_json::Value) -> Result<()> {
     let (family, text_config) = probe_identity(json)?;
     probe_common_text(family, text_config)?;
     probe_layer_types(family, text_config)?;

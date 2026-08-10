@@ -43,14 +43,6 @@ pub enum EpBackend {
     DeepEp,
 }
 
-#[derive(Clone, Debug)]
-pub struct ModelInfo {
-    pub id: &'static str,
-    pub display_name: String,
-    pub model_path: PathBuf,
-    pub max_model_len: Option<u32>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct TokenLogprob {
     pub logprob: f32,
@@ -234,7 +226,7 @@ impl KvPrefix {
     }
 
     /// The partition the resolution is bound to, if one ran.
-    pub fn rank(&self) -> Option<usize> {
+    fn rank(&self) -> Option<usize> {
         self.rank
     }
 
@@ -340,7 +332,7 @@ impl TokenSink {
     }
 
     /// Current per-request abort reason.
-    pub fn abort_reason(&self) -> RequestAbortReason {
+    fn abort_reason(&self) -> RequestAbortReason {
         RequestAbortReason::from_raw(self.abort_reason.load(Ordering::Acquire))
     }
 
@@ -373,7 +365,7 @@ pub enum RequestAbortReason {
 }
 
 impl RequestAbortReason {
-    pub fn from_raw(raw: u8) -> Self {
+    pub(crate) fn from_raw(raw: u8) -> Self {
         match raw {
             1 => Self::Cancelled,
             2 => Self::Disconnected,
@@ -381,7 +373,7 @@ impl RequestAbortReason {
         }
     }
 
-    pub fn store(self, abort_reason: &AtomicU8) {
+    pub(crate) fn store(self, abort_reason: &AtomicU8) {
         abort_reason.store(self as u8, Ordering::Release);
     }
 }
@@ -412,7 +404,7 @@ pub struct KvCapacity {
 impl KvCapacity {
     /// Total tokens the pool can hold (`total_blocks × block_size`).
     #[must_use]
-    pub fn total_tokens(self) -> usize {
+    pub(crate) fn total_tokens(self) -> usize {
         self.total_blocks.saturating_mul(self.block_size)
     }
 
@@ -505,7 +497,8 @@ impl EngineHandle {
         Self::from_parts(vec![submit_tx], None, Vec::new())
     }
 
-    pub fn new_with_command_channel(command_tx: mpsc::UnboundedSender<EngineCommand>) -> Self {
+    #[cfg(test)]
+    fn new_with_command_channel(command_tx: mpsc::UnboundedSender<EngineCommand>) -> Self {
         Self::from_parts(Vec::new(), Some(command_tx), Vec::new())
     }
 
@@ -584,7 +577,7 @@ impl EngineHandle {
     /// KV pool capacity, if the engine reported it. A batch whose per-request
     /// block footprint exceeds [`KvCapacity::total_blocks`] cannot be resident
     /// at once.
-    pub fn kv_capacity(&self) -> Option<KvCapacity> {
+    pub(crate) fn kv_capacity(&self) -> Option<KvCapacity> {
         self.kv_capacity
     }
 
@@ -610,7 +603,7 @@ impl EngineHandle {
     }
 
     /// Number of logical scheduler partitions exposed to the frontend.
-    pub fn scheduler_partition_count(&self) -> usize {
+    pub(crate) fn scheduler_partition_count(&self) -> usize {
         self.load_watches.len()
     }
 
@@ -619,7 +612,7 @@ impl EngineHandle {
     /// stays quiet when idle, so a consumer republishes on real change rather
     /// than polling. `None` if the partition does not report a load feed or the
     /// index is outside the engine topology.
-    pub fn load_watch_for(&self, partition: usize) -> Option<watch::Receiver<LoadSnapshot>> {
+    pub(crate) fn load_watch_for(&self, partition: usize) -> Option<watch::Receiver<LoadSnapshot>> {
         self.load_watches.get(partition)?.clone()
     }
 
@@ -665,7 +658,7 @@ impl EngineHandle {
     /// channel) the prefix is dropped: those engines never resolve prefixes,
     /// and dropping releases the (necessarily absent) hold.
     #[allow(clippy::result_large_err)]
-    pub fn submit_resolved(
+    fn submit_resolved(
         &self,
         req: GenerateRequest,
         kv_prefix: KvPrefix,

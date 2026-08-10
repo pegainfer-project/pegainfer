@@ -26,14 +26,14 @@ use std::path::Path;
 
 use anyhow::Result;
 use anyhow::anyhow;
-pub use config::probe_config_json;
+pub(crate) use config::probe_config_json;
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
 /// Maximum supported Qwen3.5 decode scheduler slots.
-pub const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
+const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
 
 /// Low-level Qwen3.5 execution interface.
 ///
@@ -90,13 +90,13 @@ pub fn start_engine(
 #[derive(Clone, Debug)]
 pub struct Qwen35LaunchOptions {
     /// CUDA device for single-GPU loads (ignored when `tp_size > 1`).
-    pub device_ordinal: usize,
+    device_ordinal: usize,
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
-    pub tp_size: usize,
+    tp_size: usize,
     /// TP Phase 1 supports eager-only multi-GPU execution.
-    pub cuda_graph: bool,
-    pub max_batch: usize,
-    pub max_prefill_tokens: usize,
+    cuda_graph: bool,
+    max_batch: usize,
+    max_prefill_tokens: usize,
 }
 
 impl Qwen35LaunchOptions {
@@ -111,7 +111,7 @@ impl Qwen35LaunchOptions {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-pub fn launch_with_options_and_policy(
+fn launch_with_options_and_policy(
     model_path: &Path,
     options: Qwen35LaunchOptions,
     scheduler_policy: Qwen35SchedulerPolicy,
@@ -147,7 +147,7 @@ pub fn start_engine_with_capacity(
     )
 }
 
-pub fn start_engine_with_capacity_and_policy(
+pub(crate) fn start_engine_with_capacity_and_policy(
     model_path: &Path,
     options: EngineLoadOptions,
     max_batch: usize,

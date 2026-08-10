@@ -19,11 +19,11 @@ const ELEM_SIZE: usize = std::mem::size_of::<half::bf16>();
 /// `name` keys the arena for the whole engine lifetime (save/load fan across
 /// every registered name); it must be unique within the engine.
 pub struct KvArena {
-    pub name: String,
-    pub base_ptr: u64,
-    pub num_blocks: usize,
-    pub bytes_per_block: usize,
-    pub block_stride_bytes: usize,
+    name: String,
+    base_ptr: u64,
+    num_blocks: usize,
+    bytes_per_block: usize,
+    block_stride_bytes: usize,
 }
 
 /// Per-layer registration geometry fed to pegaflow's one batched call.
