@@ -105,6 +105,9 @@ impl Default for ModelRuntimeConfig {
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
+    /// Model-local owner for the experimental SM120 GDN artifact. It remains
+    /// unset until an internal integration explicitly installs it.
+    pub(super) flashinfer_gdn: Option<super::flashinfer_gdn::FlashInferGdnBackend>,
     pub(super) config: Config35,
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) embed_tokens: DeviceMatrix,
@@ -535,6 +538,7 @@ impl Qwen35Model {
 
         Ok(Self {
             ctx,
+            flashinfer_gdn: None,
             config,
             tensor_parallel,
             embed_tokens,

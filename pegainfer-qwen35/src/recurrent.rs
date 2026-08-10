@@ -10,6 +10,7 @@ use crate::config::GDN_AOT_KEY_HEAD_DIM;
 use crate::config::GDN_AOT_VALUE_HEAD_DIM;
 use crate::config::LINEAR_CONV_MAX_KERNEL_DIM;
 use crate::ffi;
+use crate::prefill_buffers::GdnPrepareScratch35;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
 
 #[cfg(test)]
@@ -176,6 +177,126 @@ pub(crate) fn conv1d_prefill_batch_into(
             ctx.stream.cu_stream(),
         );
     }
+}
+
+/// Prepare native Q/K/V plus per-token alpha/beta for the FlashInfer GDN
+/// candidate.
+///
+/// The preparation kernel reports non-finite inputs through a sticky device
+/// status word owned by the chunk. The caller validates it once after the
+/// layer loop, avoiding one D2H synchronization per layer while still refusing
+/// to return a candidate result containing invalid inputs.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_rule_prefill_native_prepare_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    b_proj: &HiddenStates,
+    a_proj: &HiddenStates,
+    dt_bias: &DeviceVec,
+    a_log: &CudaSlice<f32>,
+    scratch: &mut GdnPrepareScratch35,
+    h_q: usize,
+    h_k: usize,
+    h_v: usize,
+    head_dim: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        matches!((h_q, h_k, h_v, head_dim), (16, 16, 32 | 48, 128)),
+        "native GDN prepare supports Hq/Hk/Hv/D=16/16/{{32,48}}/128, got {h_q}/{h_k}/{h_v}/{head_dim}"
+    );
+    anyhow::ensure!(qkv.seq_len > 0, "native GDN prepare requires T>=1");
+    let expected_qkv = (h_q + h_k + h_v) * head_dim;
+    anyhow::ensure!(
+        qkv.hidden_dim == expected_qkv,
+        "native GDN qkv hidden dim mismatch: expected {expected_qkv}, got {}",
+        qkv.hidden_dim
+    );
+    anyhow::ensure!(
+        b_proj.hidden_dim == h_v && b_proj.seq_len == qkv.seq_len,
+        "native GDN b projection must be [T,Hv]=[{},{}]",
+        qkv.seq_len,
+        h_v
+    );
+    anyhow::ensure!(
+        a_proj.hidden_dim == h_v && a_proj.seq_len == qkv.seq_len,
+        "native GDN a projection must be [T,Hv]=[{},{}]",
+        qkv.seq_len,
+        h_v
+    );
+    anyhow::ensure!(
+        dt_bias.len == h_v,
+        "native GDN dt_bias length must be {h_v}, got {}",
+        dt_bias.len
+    );
+    anyhow::ensure!(
+        a_log.len() == h_v,
+        "native GDN A_log length must be {h_v}, got {}",
+        a_log.len()
+    );
+    anyhow::ensure!(
+        scratch.q.hidden_dim == h_q * head_dim && scratch.q.seq_len == qkv.seq_len,
+        "native GDN Q output shape mismatch"
+    );
+    anyhow::ensure!(
+        scratch.k.hidden_dim == h_k * head_dim && scratch.k.seq_len == qkv.seq_len,
+        "native GDN K output shape mismatch"
+    );
+    anyhow::ensure!(
+        scratch.v.hidden_dim == h_v * head_dim && scratch.v.seq_len == qkv.seq_len,
+        "native GDN V output shape mismatch"
+    );
+    anyhow::ensure!(
+        scratch.alpha.len() == qkv.seq_len * h_v,
+        "native GDN alpha output length mismatch"
+    );
+    anyhow::ensure!(
+        scratch.beta.len() == qkv.seq_len * h_v,
+        "native GDN beta output length mismatch"
+    );
+    anyhow::ensure!(
+        scratch.non_finite_status.len() == 1,
+        "native GDN status output length mismatch"
+    );
+
+    {
+        let (qkv_ptr, _gqkv) = qkv.data.device_ptr(&ctx.stream);
+        let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
+        let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
+        let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
+        let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+        let (q_out, _gqo) = scratch.q.data.device_ptr_mut(&ctx.stream);
+        let (k_out, _gko) = scratch.k.data.device_ptr_mut(&ctx.stream);
+        let (v_out, _gvo) = scratch.v.data.device_ptr_mut(&ctx.stream);
+        let (alpha_out, _gaout) = scratch.alpha.device_ptr_mut(&ctx.stream);
+        let (beta_out, _gbout) = scratch.beta.device_ptr_mut(&ctx.stream);
+        let (status_out, _gsout) = scratch.non_finite_status.device_ptr_mut(&ctx.stream);
+
+        let result = unsafe {
+            ffi::gated_delta_rule_prefill_native_prepare_cuda(
+                qkv_ptr as *const ffi::Half,
+                b_ptr as *const ffi::Half,
+                a_ptr as *const ffi::Half,
+                dt_ptr as *const ffi::Half,
+                alog_ptr as *const f32,
+                q_out as *mut ffi::Half,
+                k_out as *mut ffi::Half,
+                v_out as *mut ffi::Half,
+                alpha_out as *mut f32,
+                beta_out as *mut f32,
+                status_out as *mut u32,
+                h_q as i32,
+                h_k as i32,
+                h_v as i32,
+                head_dim as i32,
+                qkv.hidden_dim as i32,
+                qkv.seq_len as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

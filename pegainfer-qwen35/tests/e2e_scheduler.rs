@@ -29,6 +29,7 @@ use vllm_text::tokenizer::DynTokenizer;
 mod common;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
+const FLASHINFER_GDN_MANIFEST_ENV: &str = "PEGAINFER_QWEN35_FLASHINFER_GDN_MANIFEST";
 
 const CASES: &[TestCase] = &[
     TestCase {
@@ -584,6 +585,62 @@ fn test_e2e_qwen35_scheduler() {
 
     let max_context_tokens = context_limit_for(&handle, &model_path);
     run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP1");
+}
+
+#[test]
+#[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
+fn test_e2e_qwen35_scheduler_flashinfer_gdn() {
+    let model_path = get_model_path();
+    let manifest = std::env::var(FLASHINFER_GDN_MANIFEST_ENV).unwrap_or_else(|_| {
+        panic!("{FLASHINFER_GDN_MANIFEST_ENV} must point to the validated Hv32 manifest")
+    });
+    let manifest = Path::new(&manifest);
+    assert!(
+        manifest.is_file(),
+        "missing manifest: {}",
+        manifest.display()
+    );
+
+    info!("Loading Qwen3.5 model for FlashInfer scheduler test...");
+    let start = Instant::now();
+    let tokenizer = common::load_tokenizer(&model_path);
+    let (handle, evidence) =
+        pegainfer_qwen35::runtime::start_engine_with_flashinfer_gdn_for_accuracy(
+            Path::new(&model_path),
+            0,
+            8,
+            pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+            manifest,
+        )
+        .expect("Failed to start FlashInfer Qwen3.5 scheduler");
+    let initial = evidence.snapshot();
+    assert_eq!(initial.variant, "qwen35_4b_candidate");
+    assert_eq!(initial.manifest_path, manifest);
+    assert_eq!(initial.successful_launches, 0);
+    info!(
+        "FlashInfer identity: manifest={} ptx={} sha256={}",
+        initial.manifest_path.display(),
+        initial.ptx_path.display(),
+        initial.artifact_sha256
+    );
+    info!("FlashInfer scheduler loaded in {:.2?}", start.elapsed());
+
+    let max_context_tokens = context_limit_for(&handle, &model_path);
+    run_full_scheduler_e2e(
+        &handle,
+        &tokenizer,
+        max_context_tokens,
+        "TP1 FlashInfer GDN",
+    );
+    let final_evidence = evidence.snapshot();
+    assert!(
+        final_evidence.successful_launches > 0,
+        "scheduler e2e completed without a successful FlashInfer GDN launch"
+    );
+    info!(
+        "FlashInfer scheduler successful launches: {}",
+        final_evidence.successful_launches
+    );
 }
 
 #[test]
