@@ -579,7 +579,7 @@ mod tests {
             .iter()
             .map(|flag| {
                 let (tx, mut rx) = mpsc::unbounded_channel::<SubmittedRequest>();
-                let flag = Arc::clone(&flag);
+                let flag = Arc::clone(flag);
                 let join = thread::spawn(move || {
                     while rx.blocking_recv().is_some() {}
                     flag.store(true, Ordering::SeqCst);
