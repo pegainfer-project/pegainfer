@@ -1,10 +1,6 @@
 use std::any::Any;
-use std::fmt;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 use std::thread::{self};
 
@@ -12,9 +8,25 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
+use super::control::EngineCommand;
+use super::control::EngineControlError;
+use super::control::EngineControlRequest;
+use super::control::EngineControlResult;
+use super::control::LoadLoraAdapterRequest;
+use super::control::UnloadLoraAdapterRequest;
+use super::event::TokenEvent;
+use super::event::unix_now_s;
+use super::kv::KvBlockEvent;
+use super::kv::KvCapacity;
+use super::kv::KvPrefix;
+use super::kv::SubmittedRequest;
+use super::request::GenerateRequest;
 use crate::parallel::ParallelConfig;
-use crate::sampler::SamplingParams;
 
+/// Launch-time options for building an engine: GPU placement, parallel
+/// topology, collective backend, graph capture toggle, seed. Consumed once by
+/// the model crate's `start_engine` / `launch`; [`EngineHandle`] is what the
+/// frontend holds afterwards.
 #[derive(Clone, Debug)]
 pub struct EngineLoadOptions {
     pub enable_cuda_graph: bool,
@@ -43,379 +55,6 @@ pub enum EpBackend {
     DeepEp,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct TokenLogprob {
-    pub logprob: f32,
-    pub top_logprobs: Vec<(u32, f32)>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FinishReason {
-    Length,
-    Stop,
-    Error,
-}
-
-pub struct GenerateRequest {
-    pub request_id: Option<String>,
-    pub queued_at_unix_s: Option<f64>,
-    /// Trace context of the caller's request span, when tracing is on. The
-    /// model scheduler opens its queue/prefill/decode spans as children of this
-    /// so the host-side phase breakdown attaches to the same trace the frontend
-    /// started. `None` when tracing is disabled — the scheduler then skips span
-    /// work entirely. `SpanContext` is `Copy`, so it rides through the
-    /// scheduler's `Clone` request state without holding a live (non-`Clone`)
-    /// `Span`.
-    pub trace_parent: Option<fastrace::collector::SpanContext>,
-    /// Logical data-parallel rank selected by the frontend. `None` lets the
-    /// handle place the request on its least-loaded partition (waiting
-    /// requests weigh 4x).
-    pub data_parallel_rank: Option<usize>,
-    pub prompt_tokens: Vec<u32>,
-    pub params: SamplingParams,
-    pub max_tokens: usize,
-    pub lora_adapter: Option<String>,
-    /// Opaque router/P-D metadata from the request's
-    /// `vllm_xargs.kv_transfer_params`.
-    pub kv_transfer_params: Option<serde_json::Value>,
-    /// Where the scheduler emits this request's `TokenEvent`s. All requests on
-    /// one engine share a single tagged output channel behind this sink (see
-    /// [`TokenSink`]); the frontend demuxes by tag.
-    pub token_tx: TokenSink,
-    pub logprobs: usize,
-    pub echo: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LoadLoraAdapterRequest {
-    pub lora_name: String,
-    pub lora_path: PathBuf,
-    pub load_inplace: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnloadLoraAdapterRequest {
-    pub lora_name: String,
-    pub lora_int_id: Option<i64>,
-}
-
-pub enum EngineControlRequest {
-    LoadLoraAdapter {
-        request: LoadLoraAdapterRequest,
-        response_tx: oneshot::Sender<std::result::Result<(), String>>,
-    },
-    UnloadLoraAdapter {
-        request: UnloadLoraAdapterRequest,
-        response_tx: oneshot::Sender<std::result::Result<(), String>>,
-    },
-    ListLoraAdapters {
-        response_tx: oneshot::Sender<std::result::Result<Vec<String>, String>>,
-    },
-}
-
-pub enum EngineCommand {
-    Generate(Box<GenerateRequest>),
-    Control(EngineControlRequest),
-}
-
-#[derive(Debug, Eq, PartialEq, thiserror::Error)]
-pub enum EngineControlError {
-    #[error("{0}")]
-    Unsupported(&'static str),
-    #[error("engine control channel closed")]
-    ChannelClosed,
-    #[error("engine control operation failed: {0}")]
-    OperationFailed(String),
-}
-
-pub type EngineControlResult<T> = std::result::Result<T, EngineControlError>;
-
-#[derive(Debug)]
-pub enum TokenEvent {
-    Scheduled {
-        queued_at_unix_s: f64,
-        scheduled_at_unix_s: f64,
-        prompt_tokens: usize,
-        /// Prompt tokens served from the prefix cache (0 when the engine has
-        /// no prefix cache or the value is not known at emit time).
-        cached_tokens: usize,
-    },
-    Token {
-        id: u32,
-        logprob: Option<TokenLogprob>,
-    },
-    PromptTokens {
-        ids: Vec<u32>,
-        logprobs: Vec<Option<TokenLogprob>>,
-    },
-    /// Opaque P/D handoff metadata forwarded through the vLLM-compatible
-    /// `kv_transfer_params` response field.
-    KvTransfer { params: serde_json::Value },
-    Finished {
-        finish_reason: FinishReason,
-        prompt_tokens: usize,
-        completion_tokens: usize,
-    },
-    Error {
-        message: String,
-        prompt_tokens: usize,
-        completion_tokens: usize,
-    },
-    Rejected {
-        message: String,
-        prompt_tokens: usize,
-        completion_tokens: usize,
-    },
-}
-
-/// The tag that routes a [`TokenEvent`] back to its request on the shared
-/// output channel — the external request id (vLLM's `request_id`). `Arc<str>`
-/// keeps per-event tagging to a refcount bump instead of a string copy.
-pub type RequestTag = Arc<str>;
-
-/// A request's KV-prefix resolution, produced by the KV store *before* the
-/// request reaches a scheduler: how many leading prompt tokens are already
-/// materialized in the target rank's GPU prefix cache, plus an opaque RAII
-/// hold keeping those blocks resident until the scheduler's prefix match
-/// consumes them.
-///
-/// The engine contract deliberately does not know KV internals (this crate is
-/// CUDA-free): the hold is minted by `pegainfer-kv-store`, carried opaquely,
-/// and only ever *dropped* — after the scheduler's `match_and_add_prefix`, or
-/// with the request if it dies first. Dropping releases the anti-eviction pin.
-///
-/// Degraded resolutions (timeout, pool pressure) are not a distinct state:
-/// they surface as a smaller `hit_tokens` — the number alone carries all
-/// downstream semantics (disaggregated-decode admission asserts it against
-/// the handoff's committed length; everyone else just prefills from
-/// `hit_tokens`).
-pub struct KvPrefix {
-    hit_tokens: usize,
-    hold: Option<Box<dyn Any + Send>>,
-    /// The scheduler partition the resolution ran against. The hold pins
-    /// blocks on THIS rank, so routing anywhere else silently loses the hit
-    /// and wastes the pin — [`EngineHandle::submit_resolved`] routes by it.
-    rank: Option<usize>,
-}
-
-impl KvPrefix {
-    /// No resolution ran (or it degraded to nothing): prefill from scratch.
-    /// The scheduler's own GPU prefix match still applies as usual.
-    #[must_use]
-    pub fn none() -> Self {
-        Self {
-            hit_tokens: 0,
-            hold: None,
-            rank: None,
-        }
-    }
-
-    /// A resolved prefix: `hit_tokens` are materialized on partition `rank`,
-    /// pinned by `hold` until this value is dropped.
-    #[must_use]
-    pub fn resolved(hit_tokens: usize, rank: usize, hold: Box<dyn Any + Send>) -> Self {
-        Self {
-            hit_tokens,
-            hold: Some(hold),
-            rank: Some(rank),
-        }
-    }
-
-    pub fn hit_tokens(&self) -> usize {
-        self.hit_tokens
-    }
-
-    /// The partition the resolution is bound to, if one ran.
-    fn rank(&self) -> Option<usize> {
-        self.rank
-    }
-
-    /// Whether a hold is still pinning resolved blocks.
-    pub fn has_hold(&self) -> bool {
-        self.hold.is_some()
-    }
-
-    /// The opaque hold, for the store that minted it to downcast. Every
-    /// other crate treats the hold as drop-only.
-    pub fn hold_any(&self) -> Option<&(dyn Any + Send)> {
-        self.hold.as_deref()
-    }
-}
-
-impl fmt::Debug for KvPrefix {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KvPrefix")
-            .field("hit_tokens", &self.hit_tokens)
-            .field("rank", &self.rank)
-            .field("hold", &self.hold.as_ref().map(|_| "<opaque>"))
-            .finish()
-    }
-}
-
-/// What a scheduler partition's submit channel carries: the request plus its
-/// KV-prefix resolution. Unresolved paths submit [`KvPrefix::none`]; the
-/// tuple (rather than a wrapper struct) states the fact plainly — the store's
-/// output is a prefix resolution, not a new kind of request.
-pub type SubmittedRequest = (GenerateRequest, KvPrefix);
-
-/// The single output channel an engine dispatches *all* requests' token events
-/// into, each tagged with its [`RequestTag`]. One receiver (the frontend demux
-/// loop) drains it, replacing the former per-request fan-out of N channels and
-/// N consumer tasks — N distinct sleeping consumers cost N wakeups per step,
-/// one shared consumer costs ~1.
-pub type TokenStreamSender = mpsc::UnboundedSender<(RequestTag, TokenEvent)>;
-pub type TokenStreamReceiver = mpsc::UnboundedReceiver<(RequestTag, TokenEvent)>;
-
-/// Per-request handle the scheduler holds to emit [`TokenEvent`]s.
-///
-/// Drop-in for the former `UnboundedSender<TokenEvent>`: it keeps the same
-/// `send` / `is_closed` / `Clone` surface, so scheduler call sites are
-/// unchanged. Internally each event is tagged with the request's
-/// [`RequestTag`] and pushed onto one shared [`TokenStreamSender`].
-///
-/// Cancellation moved from "drop the per-request receiver" to a shared abort
-/// reason: the frontend aborts a *single* request by setting its reason without
-/// closing the channel the other requests still use. `send` and `is_closed`
-/// then report that request as gone, so the scheduler retires it on its next
-/// emit — the same *reactive* retirement the old consumer-drop gave, reached
-/// through the reason rather than channel closure. `tx.is_closed()` is the
-/// engine-wide signal (the whole demux is gone); the per-request signal is the
-/// abort reason. The reason is set with `Release` and read with `Acquire` so
-/// the abort is ordered against the frontend dropping the request's stream
-/// state.
-#[derive(Clone)]
-pub struct TokenSink {
-    tag: RequestTag,
-    tx: TokenStreamSender,
-    abort_reason: Arc<AtomicU8>,
-}
-
-impl TokenSink {
-    pub fn new(tag: RequestTag, tx: TokenStreamSender, abort_reason: Arc<AtomicU8>) -> Self {
-        Self {
-            tag,
-            tx,
-            abort_reason,
-        }
-    }
-
-    /// Emit one event for this request. Returns `Err` (handing the event back)
-    /// when the request was aborted or the shared receiver is gone — both of
-    /// which the scheduler reads as "consumer dropped, retire the request",
-    /// the same contract as the old per-request channel.
-    #[allow(clippy::result_large_err)]
-    pub fn send(&self, event: TokenEvent) -> Result<(), mpsc::error::SendError<TokenEvent>> {
-        if self.abort_reason() != RequestAbortReason::None {
-            return Err(mpsc::error::SendError(event));
-        }
-        self.tx.send((self.tag.clone(), event)).map_err(|err| {
-            let (_, event) = err.0;
-            mpsc::error::SendError(event)
-        })
-    }
-
-    /// `true` once the request is aborted or the shared receiver is gone.
-    pub fn is_closed(&self) -> bool {
-        self.abort_reason() != RequestAbortReason::None || self.tx.is_closed()
-    }
-
-    /// `true` once the frontend explicitly cancelled this request after the
-    /// stream had already started.
-    pub fn is_cancelled(&self) -> bool {
-        self.abort_reason() == RequestAbortReason::Cancelled
-    }
-
-    /// `true` once the frontend observed a client disconnect before the first
-    /// response chunk for this request reached the client.
-    pub fn is_disconnected(&self) -> bool {
-        self.abort_reason() == RequestAbortReason::Disconnected
-    }
-
-    /// Current per-request abort reason.
-    fn abort_reason(&self) -> RequestAbortReason {
-        RequestAbortReason::from_raw(self.abort_reason.load(Ordering::Acquire))
-    }
-
-    /// The request id this sink tags its events with.
-    pub fn tag(&self) -> &RequestTag {
-        &self.tag
-    }
-
-    /// A sink backed by its own private channel, for direct drivers
-    /// (benchmarks, integration tests, the simulator) that consume one
-    /// request's events without the shared frontend demux. The returned
-    /// receiver yields the tagged events; the cancel flag is never tripped.
-    pub fn standalone() -> (Self, TokenStreamReceiver) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let sink = Self::new(
-            Arc::from("local"),
-            tx,
-            Arc::new(AtomicU8::new(RequestAbortReason::None as u8)),
-        );
-        (sink, rx)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum RequestAbortReason {
-    None = 0,
-    Cancelled = 1,
-    Disconnected = 2,
-}
-
-impl RequestAbortReason {
-    pub(crate) fn from_raw(raw: u8) -> Self {
-        match raw {
-            1 => Self::Cancelled,
-            2 => Self::Disconnected,
-            _ => Self::None,
-        }
-    }
-
-    pub(crate) fn store(self, abort_reason: &AtomicU8) {
-        abort_reason.store(self as u8, Ordering::Release);
-    }
-}
-
-/// Seconds since `UNIX_EPOCH` as `f64` — the clock base for `TokenEvent`
-/// timestamps.
-pub fn unix_now_s() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is before UNIX_EPOCH")
-        .as_secs_f64()
-}
-
-/// KV pool capacity as the scheduler actually allocates it: whole blocks of
-/// `block_size` tokens. A request of `L` tokens occupies `⌈L / block_size⌉`
-/// blocks no matter how `L` divides, so a fit check must round per request —
-/// summing raw token counts under-counts and can admit a batch that the
-/// scheduler then has to defer. Lets a caller (e.g. the prefill/decode bench)
-/// decide up front whether a batch fits without computing per-token KV by hand.
-#[derive(Clone, Copy, Debug)]
-pub struct KvCapacity {
-    /// Blocks available for requests when the pool is empty.
-    pub total_blocks: usize,
-    /// Tokens per block.
-    pub block_size: usize,
-}
-
-impl KvCapacity {
-    /// Total tokens the pool can hold (`total_blocks × block_size`).
-    #[must_use]
-    pub(crate) fn total_tokens(self) -> usize {
-        self.total_blocks.saturating_mul(self.block_size)
-    }
-
-    /// Blocks a single request of `tokens` tokens occupies — whole-block
-    /// allocation rounds up.
-    #[must_use]
-    pub fn blocks_for(self, tokens: usize) -> usize {
-        tokens.div_ceil(self.block_size.max(1))
-    }
-}
-
 /// Live KV-cache occupancy the scheduler republishes after every step.
 ///
 /// `kv_used_blocks` is the load signal an out-of-band consumer (e.g. a Dynamo
@@ -432,38 +71,6 @@ pub struct LoadSnapshot {
     pub num_running_reqs: u64,
     /// Requests admitted but not yet running (KV pressure, prefetch wait).
     pub num_waiting_reqs: u64,
-}
-
-/// One full KV block that just became reusable from this engine's prefix cache.
-///
-/// The hashes are the *u64* sequence-aware / per-block token hashes a Dynamo KV
-/// router indexes by (`dynamo_tokens::TokenBlock::{sequence_hash, block_hash}`),
-/// kept as plain integers so this contract type stays free of any kvbm/dynamo
-/// dependency. They are NOT the engine's internal 128-bit lineage hash.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvStoredBlock {
-    /// Chained, sequence-aware block id (dynamo `ExternalSequenceBlockHash`).
-    pub sequence_hash: u64,
-    /// Un-chained per-block token hash (dynamo `LocalBlockHash`); the field a
-    /// prefix-routing radix tree keys its children by.
-    pub tokens_hash: u64,
-}
-
-/// A KV-cache block lifecycle event for an out-of-band cache-aware router.
-///
-/// Emitted only when the engine was built with a KV-event feed wired (off by
-/// default); see [`EngineHandle::take_kv_events`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KvBlockEvent {
-    /// A contiguous run of newly-registered blocks became cacheable. `parent_hash`
-    /// is the sequence hash of the block preceding `blocks[0]` (`None` if the run
-    /// starts the sequence); each later block chains off the previous one.
-    Stored {
-        parent_hash: Option<u64>,
-        blocks: Vec<KvStoredBlock>,
-    },
-    /// A previously-stored block was evicted from this engine's cache.
-    Removed { sequence_hash: u64 },
 }
 
 #[derive(Clone)]
@@ -849,11 +456,16 @@ impl Drop for EngineInner {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+    use std::thread;
 
     use super::*;
+    use crate::engine::TokenSink;
+    use crate::engine::TokenStreamReceiver;
+    use crate::sampler::SamplingParams;
 
     #[test]
     fn joins_owned_thread_after_last_handle_drop() {
@@ -883,7 +495,7 @@ mod tests {
                 trace_parent: None,
                 data_parallel_rank: rank,
                 prompt_tokens: vec![1],
-                params: crate::sampler::SamplingParams::default(),
+                params: SamplingParams::default(),
                 max_tokens: 1,
                 lora_adapter: None,
                 kv_transfer_params: None,
@@ -967,7 +579,7 @@ mod tests {
             .iter()
             .map(|flag| {
                 let (tx, mut rx) = mpsc::unbounded_channel::<SubmittedRequest>();
-                let flag = Arc::clone(flag);
+                let flag = Arc::clone(&flag);
                 let join = thread::spawn(move || {
                     while rx.blocking_recv().is_some() {}
                     flag.store(true, Ordering::SeqCst);
@@ -1024,73 +636,6 @@ mod tests {
             2
         );
         assert!(handle.load_watch_for(2).is_none());
-    }
-
-    #[test]
-    fn token_sink_distinguishes_cancelled_from_closed_receiver() {
-        let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = TokenSink::new(Arc::from("request-a"), tx, Arc::clone(&abort_reason));
-
-        assert!(!sink.is_cancelled());
-        assert!(!sink.is_disconnected());
-        assert!(!sink.is_closed());
-        sink.send(TokenEvent::Token {
-            id: 7,
-            logprob: None,
-        })
-        .expect("uncancelled sink should send");
-        assert_eq!(rx.try_recv().expect("tagged event").0.as_ref(), "request-a");
-
-        RequestAbortReason::Cancelled.store(&abort_reason);
-        assert!(sink.is_cancelled());
-        assert!(!sink.is_disconnected());
-        assert!(sink.is_closed());
-        assert!(
-            sink.send(TokenEvent::Token {
-                id: 8,
-                logprob: None,
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn token_sink_closed_receiver_is_not_explicit_cancel() {
-        let (sink, rx) = TokenSink::standalone();
-
-        drop(rx);
-
-        assert!(!sink.is_cancelled());
-        assert!(!sink.is_disconnected());
-        assert!(sink.is_closed());
-        assert!(
-            sink.send(TokenEvent::Token {
-                id: 7,
-                logprob: None,
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn token_sink_distinguishes_disconnected_from_cancelled() {
-        let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = TokenSink::new(Arc::from("request-a"), tx, Arc::clone(&abort_reason));
-
-        RequestAbortReason::Disconnected.store(&abort_reason);
-
-        assert!(!sink.is_cancelled());
-        assert!(sink.is_disconnected());
-        assert!(sink.is_closed());
-        assert!(
-            sink.send(TokenEvent::Token {
-                id: 7,
-                logprob: None,
-            })
-            .is_err()
-        );
     }
 
     #[tokio::test]
@@ -1157,7 +702,7 @@ mod tests {
         }
 
         assert_eq!(
-            list.await.expect("join list task").expect("list succeeded"),
+            list.await.expect("join load task").expect("list succeeded"),
             vec!["adapter-a"]
         );
     }

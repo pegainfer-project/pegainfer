@@ -12,8 +12,15 @@ An engine is a function `launch(model_path, options) -> EngineHandle` whose sema
 
 ```
 pegainfer-frontend
-├── engine.rs          # the contract: EngineHandle, GenerateRequest, TokenEvent,
-│                      #   TokenSink, KvPrefix, KvCapacity, LoadSnapshot, KvBlockEvent
+├── engine/            # the contract, split by cohesion and re-exported flat
+│   │                  #   from `engine/mod.rs` (`engine::X` paths unchanged):
+│   ├── request.rs     #   GenerateRequest (one request in)
+│   ├── event.rs       #   TokenEvent, FinishReason, TokenLogprob, RequestTag, unix_now_s
+│   ├── sink.rs        #   TokenSink / RequestAbortReason over the shared tagged channel
+│   ├── kv.rs          #   KvPrefix, SubmittedRequest, KvCapacity, KvStoredBlock, KvBlockEvent
+│   ├── control.rs     #   LoRA control plane (EngineCommand & friends)
+│   └── handle.rs      #   EngineLoadOptions/EpBackend (launch), EngineHandle: routing,
+│                      #     LoadSnapshot feeds, join-on-drop
 ├── sampler.rs         # SamplingParams
 ├── parallel.rs        # ParallelConfig
 ├── tracing_state.rs   # global tracing on/off flag (frontend + schedulers both read it)
