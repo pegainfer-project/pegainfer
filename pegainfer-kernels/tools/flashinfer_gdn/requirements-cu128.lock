@@ -1,0 +1,5 @@
+# Generation-only environment for CUDA Toolkit 12.8. Runtime does not use these.
+nvidia-cutlass-dsl==4.5.0
+cuda-python==12.9.4
+nvidia-cuda-nvcc-cu12==12.9.86
+torch==2.7.1

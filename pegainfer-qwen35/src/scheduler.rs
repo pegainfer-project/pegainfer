@@ -55,7 +55,9 @@ use crate::executor::DecodeResult;
 use crate::executor::PrefillRequestResult;
 use crate::executor::PrefillResult;
 use crate::executor::RequestId;
+use crate::flashinfer_gdn::GdnPrefillBackendSeam;
 use crate::logprobs::snapshot_requested_logprobs;
+use crate::prefill::GdnPrefillRuntimeEvidenceHandle;
 use crate::recurrent_state::RecurrentState;
 use crate::tp_executor::Qwen35TpExecutor;
 use crate::tp_executor::TpDecodeStepItem;
@@ -146,12 +148,52 @@ pub fn start_with_capacity(
     )
 }
 
+/// Start the scheduler with an already installed FlashInfer GDN candidate and
+/// return launch evidence that remains readable after the model moves into the
+/// scheduler thread. This is a low-level accuracy/benchmark entry; production
+/// engine construction remains Triton-only.
+pub(crate) fn start_with_capacity_flashinfer_gdn(
+    model: Qwen35Model,
+    seed: u64,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+) -> Result<(SchedulerHandle, GdnPrefillRuntimeEvidenceHandle)> {
+    let evidence = model.flashinfer_gdn_runtime_evidence_handle()?;
+    let handle = start_with_capacity_and_policy_backend(
+        model,
+        seed,
+        max_batch,
+        max_prefill_tokens,
+        Qwen35SchedulerPolicy::Off,
+        GdnPrefillBackendSeam::FlashInfer,
+    )?;
+    Ok((handle, evidence))
+}
+
 pub(crate) fn start_with_capacity_and_policy(
     model: Qwen35Model,
     seed: u64,
     max_batch: usize,
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
+) -> Result<SchedulerHandle> {
+    start_with_capacity_and_policy_backend(
+        model,
+        seed,
+        max_batch,
+        max_prefill_tokens,
+        scheduler_policy,
+        GdnPrefillBackendSeam::Triton,
+    )
+}
+
+fn start_with_capacity_and_policy_backend(
+    model: Qwen35Model,
+    seed: u64,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    scheduler_policy: Qwen35SchedulerPolicy,
+    gdn_prefill_backend: GdnPrefillBackendSeam,
 ) -> Result<SchedulerHandle> {
     assert!(
         max_prefill_tokens > 0,
@@ -167,7 +209,7 @@ pub(crate) fn start_with_capacity_and_policy(
         total_blocks,
         block_size,
     );
-    let backend = SingleGpuBackend::new(model, max_batch)?;
+    let backend = SingleGpuBackend::new(model, max_batch, gdn_prefill_backend)?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (startup_tx, startup_rx) = std_mpsc::channel();
@@ -271,6 +313,7 @@ pub(crate) fn start_tp_with_capacity(
 struct SingleGpuBackend {
     model: Qwen35Model,
     graph_state: BatchDecodeGraphState,
+    gdn_prefill_backend: GdnPrefillBackendSeam,
 }
 
 // One instance per scheduler; the size asymmetry costs nothing here.
@@ -286,11 +329,19 @@ struct TpSchedulerBackend {
 }
 
 impl SingleGpuBackend {
-    fn new(model: Qwen35Model, max_batch: usize) -> Result<Self> {
+    fn new(
+        model: Qwen35Model,
+        max_batch: usize,
+        gdn_prefill_backend: GdnPrefillBackendSeam,
+    ) -> Result<Self> {
         anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
         let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
         let graph_state = model.create_batch_decode_graph_state_with_capacity(graph_capacity)?;
-        Ok(Self { model, graph_state })
+        Ok(Self {
+            model,
+            graph_state,
+            gdn_prefill_backend,
+        })
     }
 
     fn model(&self) -> &Qwen35Model {
@@ -336,8 +387,16 @@ impl SingleGpuBackend {
             anyhow::bail!("single-GPU prefill received TP chunk state");
         };
         let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
-        self.model
-            .batch_prefill_logits(&window_refs, kvs, &mut rec_refs)
+        match self.gdn_prefill_backend {
+            GdnPrefillBackendSeam::Triton => {
+                self.model
+                    .batch_prefill_logits(&window_refs, kvs, &mut rec_refs)
+            }
+            GdnPrefillBackendSeam::FlashInfer => {
+                self.model
+                    .batch_prefill_logits_flashinfer(&window_refs, kvs, &mut rec_refs)
+            }
+        }
     }
 
     fn unified_step(
@@ -360,14 +419,25 @@ impl SingleGpuBackend {
                 }
             })
             .collect();
-        self.model.unified_step(
-            &window_refs,
-            kvs,
-            &mut rec_refs,
-            &decode_tokens,
-            &mut decode_kv_refs,
-            &mut self.graph_state,
-        )
+        match self.gdn_prefill_backend {
+            GdnPrefillBackendSeam::Triton => self.model.unified_step(
+                &window_refs,
+                kvs,
+                &mut rec_refs,
+                &decode_tokens,
+                &mut decode_kv_refs,
+                &mut self.graph_state,
+            ),
+            GdnPrefillBackendSeam::FlashInfer => self.model.unified_step_with_gdn_backend(
+                &window_refs,
+                kvs,
+                &mut rec_refs,
+                &decode_tokens,
+                &mut decode_kv_refs,
+                &mut self.graph_state,
+                GdnPrefillBackendSeam::FlashInfer,
+            ),
+        }
     }
 
     fn decode_graph(&mut self, active: &mut [ActiveRequest35]) -> Result<()> {

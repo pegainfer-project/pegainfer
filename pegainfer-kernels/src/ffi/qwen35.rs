@@ -1,13 +1,71 @@
-#[cfg(feature = "qwen35")]
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
 
 use super::Half;
 
+/// Stable host-side ABI for the FlashInfer SM120 GDN prefill artifact.
+///
+/// All pointer fields are CUDA device addresses. The caller owns their
+/// allocation and lifetime through kernel completion; `workspace_bytes` and
+/// `cu_seqlens_len` make the two variable-sized buffers explicit. The launch
+/// implementation derives `scale = 1 / sqrt(head_dim)` only after validating
+/// the complete geometry against the artifact manifest.
+///
+/// This is deliberately a data-only C ABI. A loaded module/function is owned
+/// by the Qwen3.5 model's `DeviceContext`, never by a process-global handle.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FlashInferGdnPrefillArgs {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub output: u64,
+    pub alpha: u64,
+    pub beta: u64,
+    pub state: u64,
+    pub initial_state: u64,
+    pub workspace: u64,
+    pub workspace_bytes: u64,
+    pub cu_seqlens: u64,
+    pub cu_seqlens_len: u32,
+    pub tokens: u32,
+    pub h_q: u32,
+    pub h_k: u32,
+    pub h_v: u32,
+    pub head_dim: u32,
+    pub stream: CUstream,
+}
+
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
 // Sources: csrc/qwen35/*.cu. The paged HD256 attention entry points are shared
 // with Gemma 4 and are declared in `shared.rs`.
 unsafe extern "C" {
+    /// Native, non-expanded FlashInfer-GDN input preparation.
+    ///
+    /// `q_out`, `k_out`, and `v_out` are token-major `[T,H,D]`; alpha/beta are
+    /// FP32 `[T,Hv]`. `non_finite_status` is zeroed asynchronously and set to
+    /// one by the kernel if any consumed input is non-finite.
+    pub fn gated_delta_rule_prefill_native_prepare_cuda(
+        qkv: *const Half,
+        b_proj: *const Half,
+        a_proj: *const Half,
+        dt_bias: *const Half,
+        a_log: *const f32,
+        q_out: *mut Half,
+        k_out: *mut Half,
+        v_out: *mut Half,
+        alpha_out: *mut f32,
+        beta_out: *mut f32,
+        non_finite_status: *mut u32,
+        h_q: i32,
+        h_k: i32,
+        h_v: i32,
+        head_dim: i32,
+        qkv_dim: i32,
+        tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // Qwen3.5 full-attention prefill prep that writes K/V directly into paged KV.
     pub fn prefill_attention_hd256_prep_paged_cuda(
         q_full_batch: *const Half,

@@ -10,6 +10,11 @@ pub(crate) mod config;
 mod decode_buffers;
 mod executor;
 mod ffi;
+mod flashinfer_gdn;
+#[cfg(test)]
+mod gdn_prepare_test_contract;
+#[cfg(test)]
+mod gdn_stage7_test_support;
 mod logprobs;
 pub mod model_line;
 mod ops;
@@ -33,7 +38,7 @@ use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
 /// Maximum supported Qwen3.5 decode scheduler slots.
-const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
+pub const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
 
 /// Low-level Qwen3.5 execution interface.
 ///
@@ -50,7 +55,12 @@ pub mod runtime {
     pub use crate::executor::PrefillStepItem;
     pub use crate::executor::Qwen35Executor;
     pub use crate::executor::RequestId;
+    pub use crate::prefill::GdnPrefillBenchmarkState;
+    pub use crate::prefill::GdnPrefillComparison;
+    pub use crate::prefill::GdnPrefillRuntimeEvidence;
+    pub use crate::prefill::GdnPrefillRuntimeEvidenceHandle;
     pub use crate::scheduler::start_with_capacity;
+    pub use crate::start_engine_with_flashinfer_gdn_for_accuracy;
     pub use crate::tp_executor::Qwen35TpExecutor;
     pub use crate::weights::Qwen35Model;
 }
@@ -60,6 +70,7 @@ pub mod runtime_ops {
     pub use crate::ops::gated_delta_rule_prefill_chunkwise_into;
     pub use crate::ops::rms_norm_batch_offset_into;
     pub use crate::ops::rms_norm_offset_into;
+    pub use crate::prefill_buffers::GdrChunkwiseScratch35;
 }
 
 /// Scheduler policy for balancing Qwen3.5 prefill work against active decode.
@@ -85,6 +96,29 @@ pub fn start_engine(
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
     )
+}
+
+/// Start a single-GPU accuracy scheduler with the pinned FlashInfer GDN
+/// candidate selected explicitly. Production launch APIs remain Triton-only.
+/// The returned evidence handle proves artifact identity and successful
+/// launches across the scheduler thread boundary.
+pub fn start_engine_with_flashinfer_gdn_for_accuracy(
+    model_path: &Path,
+    device_ordinal: usize,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    manifest_path: &Path,
+) -> Result<(EngineHandle, prefill::GdnPrefillRuntimeEvidenceHandle)> {
+    anyhow::ensure!(
+        (1..=MAX_DECODE_BATCH).contains(&max_batch),
+        "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
+    );
+    let model_path = model_path
+        .to_str()
+        .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
+    let mut model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+    model.install_flashinfer_gdn_for_benchmark(manifest_path)?;
+    scheduler::start_with_capacity_flashinfer_gdn(model, 42, max_batch, max_prefill_tokens)
 }
 
 #[derive(Clone, Debug)]
