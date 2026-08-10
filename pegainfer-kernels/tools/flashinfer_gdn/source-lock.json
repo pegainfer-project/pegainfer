@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "flashinfer_commit": "19f1a41e6b21f0c422d775e377b6fdf9a1fc9d23",
+  "patches": [
+    {
+      "path": "patches/0001-openinfer-hkv-state-layout.patch",
+      "sha256": "c9ccea6881979c8bb21a29816cbe1e6782819c70567093ced76e475becca3d7a"
+    }
+  ],
+  "patched_kernel_sha256": "2ef4dcecf7c87ae1cc54bb1938d418af45dc47cd5eeaf1edd0cee2b977d0d5a0",
+  "hkv_state_index_patch": {
+    "applied": true,
+    "state_layout": "openinfer_hkv_v_contiguous",
+    "ordered_layout": [1, 0, 2, 3]
+  }
+}
