@@ -216,6 +216,76 @@ impl Qwen35GdnAot {
         output: &mut HiddenStates,
         launch_workspace: &mut Qwen35GdnWorkspace,
     ) -> Result<()> {
+        let state_elements = self.geometry.h_v * self.geometry.head_dim * self.geometry.head_dim;
+        ensure!(
+            state.len() == state_elements,
+            "Qwen3.5 GDN state length mismatch"
+        );
+        let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
+        self.launch_with_state_pointers(
+            ctx,
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            state_ptr,
+            state_ptr,
+            output,
+            launch_workspace,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn launch_separate_for_test(
+        &self,
+        ctx: &DeviceContext,
+        q: &HiddenStates,
+        k: &HiddenStates,
+        v: &HiddenStates,
+        alpha: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        initial_state: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>,
+        output: &mut HiddenStates,
+        launch_workspace: &mut Qwen35GdnWorkspace,
+    ) -> Result<()> {
+        let state_elements = self.geometry.h_v * self.geometry.head_dim * self.geometry.head_dim;
+        ensure!(
+            initial_state.len() == state_elements && state.len() == state_elements,
+            "Qwen3.5 GDN separate-state length mismatch"
+        );
+        let (initial_state_ptr, _initial_state) = initial_state.device_ptr(&ctx.stream);
+        let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
+        self.launch_with_state_pointers(
+            ctx,
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            state_ptr,
+            initial_state_ptr,
+            output,
+            launch_workspace,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_with_state_pointers(
+        &self,
+        ctx: &DeviceContext,
+        q: &HiddenStates,
+        k: &HiddenStates,
+        v: &HiddenStates,
+        alpha: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        state_ptr: u64,
+        initial_state_ptr: u64,
+        output: &mut HiddenStates,
+        launch_workspace: &mut Qwen35GdnWorkspace,
+    ) -> Result<()> {
         let t = q.seq_len;
         let g = self.geometry;
         ensure!(
@@ -233,11 +303,9 @@ impl Qwen35GdnAot {
                 && output.hidden_dim == g.h_v * g.head_dim,
             "Qwen3.5 GDN tensor geometry mismatch"
         );
-        let state_elements = g.h_v * g.head_dim * g.head_dim;
         ensure!(
             alpha.len() == t * g.h_v
                 && beta.len() == t * g.h_v
-                && state.len() == state_elements
                 && launch_workspace.workspace.len() >= self.workspace_bytes
                 && launch_workspace.cu_seqlens.len() == 2
                 && launch_workspace.tokens == t,
@@ -249,7 +317,6 @@ impl Qwen35GdnAot {
         let (v_ptr, _v) = v.data.device_ptr(&ctx.stream);
         let (alpha_ptr, _alpha) = alpha.device_ptr(&ctx.stream);
         let (beta_ptr, _beta) = beta.device_ptr(&ctx.stream);
-        let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
         let (output_ptr, _output) = output.data.device_ptr_mut(&ctx.stream);
         let workspace_bytes = launch_workspace.workspace.len() as u64;
         let (workspace_ptr, _workspace) = launch_workspace.workspace.device_ptr_mut(&ctx.stream);
@@ -264,7 +331,7 @@ impl Qwen35GdnAot {
             alpha: alpha_ptr,
             beta: beta_ptr,
             state: state_ptr,
-            initial_state: state_ptr,
+            initial_state: initial_state_ptr,
             workspace: workspace_ptr,
             workspace_bytes,
             cu_seqlens: cu_ptr,
@@ -295,6 +362,8 @@ impl Drop for Qwen35GdnAot {
 
 #[cfg(test)]
 mod tests {
+    use half::bf16;
+
     use super::*;
 
     #[test]
@@ -323,5 +392,120 @@ mod tests {
             qwen35_gdn_capability(120, Qwen35GdnGeometry::PRODUCTION),
             Qwen35GdnSupport::Supported
         );
+    }
+
+    #[test]
+    #[ignore = "requires an SM120 GPU and a build-linked validated FlashInfer GDN AOT bundle"]
+    fn sm120_stable_abi_alias_and_separate_state_are_bitwise_identical() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let geometry = Qwen35GdnGeometry::PRODUCTION;
+        let backend = Qwen35GdnAot::load_for_production(&ctx, geometry)?
+            .context("validated FlashInfer GDN AOT bundle is not available on SM120")?;
+        let launches_before = backend.successful_launch_counter().load(Ordering::Relaxed);
+
+        let bf16_values = |elements: usize, modulus: usize, scale: f32| {
+            (0..elements)
+                .map(|index| {
+                    let signed = (index % modulus) as i32 - (modulus / 2) as i32;
+                    bf16::from_f32(signed as f32 * scale)
+                })
+                .collect::<Vec<_>>()
+        };
+        let state_elements = geometry.h_v * geometry.head_dim * geometry.head_dim;
+        let initial_host = (0..state_elements)
+            .map(|index| ((index % 257) as f32 - 128.0) * 1.0e-4)
+            .collect::<Vec<_>>();
+
+        for tokens in [1_usize, 2, 63, 64, 65, 127, 128] {
+            let q = HiddenStates::from_host(
+                &ctx,
+                &bf16_values(tokens * geometry.h_q * geometry.head_dim, 127, 1.0 / 1024.0),
+                geometry.h_q * geometry.head_dim,
+                tokens,
+            )?;
+            let k = HiddenStates::from_host(
+                &ctx,
+                &bf16_values(tokens * geometry.h_k * geometry.head_dim, 113, 1.0 / 1024.0),
+                geometry.h_k * geometry.head_dim,
+                tokens,
+            )?;
+            let v = HiddenStates::from_host(
+                &ctx,
+                &bf16_values(tokens * geometry.h_v * geometry.head_dim, 97, 1.0 / 128.0),
+                geometry.h_v * geometry.head_dim,
+                tokens,
+            )?;
+            let alpha = ctx
+                .stream
+                .clone_htod(&vec![0.9921875_f32; tokens * geometry.h_v])?;
+            let beta = ctx
+                .stream
+                .clone_htod(&vec![0.5_f32; tokens * geometry.h_v])?;
+
+            let initial_state = ctx.stream.clone_htod(&initial_host)?;
+            let mut separate_state: CudaSlice<f32> = ctx.stream.alloc_zeros(state_elements)?;
+            let mut separate_output =
+                HiddenStates::zeros(&ctx, geometry.h_v * geometry.head_dim, tokens)?;
+            let mut separate_workspace = backend.allocate_workspace(&ctx, tokens)?;
+            backend.launch_separate_for_test(
+                &ctx,
+                &q,
+                &k,
+                &v,
+                &alpha,
+                &beta,
+                &initial_state,
+                &mut separate_state,
+                &mut separate_output,
+                &mut separate_workspace,
+            )?;
+
+            let mut alias_state = ctx.stream.clone_htod(&initial_host)?;
+            let mut alias_output =
+                HiddenStates::zeros(&ctx, geometry.h_v * geometry.head_dim, tokens)?;
+            let mut alias_workspace = backend.allocate_workspace(&ctx, tokens)?;
+            backend.launch_in_place(
+                &ctx,
+                &q,
+                &k,
+                &v,
+                &alpha,
+                &beta,
+                &mut alias_state,
+                &mut alias_output,
+                &mut alias_workspace,
+            )?;
+
+            let separate_output = separate_output.to_host(&ctx)?;
+            let alias_output = alias_output.to_host(&ctx)?;
+            let separate_state = ctx.stream.clone_dtoh(&separate_state)?;
+            let alias_state = ctx.stream.clone_dtoh(&alias_state)?;
+            ctx.sync()?;
+
+            ensure!(
+                separate_output == alias_output,
+                "stable C ABI alias/separate outputs differ at T={tokens}"
+            );
+            ensure!(
+                separate_state == alias_state,
+                "stable C ABI alias/separate final states differ at T={tokens}"
+            );
+            ensure!(
+                alias_output.iter().any(|&value| value != 0.0),
+                "stable C ABI output remained zero at T={tokens}"
+            );
+            ensure!(
+                alias_state != initial_host,
+                "stable C ABI recurrent state did not update at T={tokens}"
+            );
+        }
+
+        let launches = backend.successful_launch_counter().load(Ordering::Relaxed);
+        ensure!(
+            launches - launches_before == 14,
+            "stable C ABI launch counter expected fourteen alias/separate launches, observed {}",
+            launches - launches_before
+        );
+        Ok(())
     }
 }
