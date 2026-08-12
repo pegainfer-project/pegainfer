@@ -34,7 +34,6 @@ mod common;
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 const GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_GOLDEN";
 const LONG_GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_LONG_GOLDEN";
-const FLASHINFER_GDN_MANIFEST_ENV: &str = "PEGAINFER_QWEN35_FLASHINFER_GDN_MANIFEST";
 
 const LOGPROBS: usize = 64;
 const MAX_EXECUTOR_BATCH: usize = 8;
@@ -768,29 +767,15 @@ fn build_executor(model_path: &str) -> Qwen35Executor {
         .expect("build Qwen3.5 logits executor")
 }
 
-fn flashinfer_manifest() -> PathBuf {
-    let path = std::env::var(FLASHINFER_GDN_MANIFEST_ENV).unwrap_or_else(|_| {
-        panic!(
-            "{FLASHINFER_GDN_MANIFEST_ENV} must point to the validated Hv32 qwen35_4b_candidate manifest"
-        )
-    });
-    let path = PathBuf::from(path);
-    assert!(
-        path.is_file(),
-        "{FLASHINFER_GDN_MANIFEST_ENV} does not point to a file: {}",
-        path.display()
-    );
-    path
+fn build_triton_executor(model_path: &str) -> Qwen35Executor {
+    Qwen35Executor::from_runtime_with_triton_gdn(model_path, 0, MAX_EXECUTOR_BATCH)
+        .expect("build Qwen3.5 Triton-control logits executor")
 }
 
-fn build_flashinfer_executor(model_path: &str, manifest_path: &Path) -> Qwen35Executor {
-    let executor = Qwen35Executor::from_runtime_with_flashinfer_gdn(
-        model_path,
-        0,
-        MAX_EXECUTOR_BATCH,
-        manifest_path,
-    )
-    .expect("build Qwen3.5 FlashInfer logits executor");
+fn build_flashinfer_executor(model_path: &str) -> Qwen35Executor {
+    let executor =
+        Qwen35Executor::from_runtime_with_flashinfer_gdn(model_path, 0, MAX_EXECUTOR_BATCH)
+            .expect("build Qwen3.5 FlashInfer logits executor");
     let evidence = executor
         .flashinfer_gdn_runtime_evidence()
         .expect("read initial FlashInfer GDN evidence")
@@ -800,24 +785,13 @@ fn build_flashinfer_executor(model_path: &str, manifest_path: &Path) -> Qwen35Ex
         "FlashInfer launch evidence must start at zero before HF replay"
     );
     assert_eq!(
-        evidence.variant, "qwen35_4b_candidate",
-        "HF gate requires the Hv32 production-candidate artifact"
-    );
-    assert_eq!(
-        evidence.manifest_path, manifest_path,
-        "FlashInfer executor loaded a different manifest"
-    );
-    assert_eq!(
         evidence.artifact_sha256.len(),
         64,
         "FlashInfer artifact identity must include a SHA-256"
     );
     eprintln!(
-        "qwen35 hf_golden_gate [FlashInfer identity]: variant={} manifest={} ptx={} sha256={}",
-        evidence.variant,
-        evidence.manifest_path.display(),
-        evidence.ptx_path.display(),
-        evidence.artifact_sha256
+        "qwen35 hf_golden_gate [FlashInfer identity]: object_sha256={} object_bytes={}",
+        evidence.artifact_sha256, evidence.artifact_size_bytes
     );
     executor
 }
@@ -857,23 +831,23 @@ fn report_backend_deltas(labels: &[String], triton: &[GateMetrics], flashinfer: 
 }
 
 #[derive(Clone, Copy)]
-enum GateBackend<'a> {
+enum GateBackend {
     Triton,
-    FlashInfer(&'a Path),
+    FlashInfer,
 }
 
-impl GateBackend<'_> {
+impl GateBackend {
     fn label(self) -> &'static str {
         match self {
             Self::Triton => "Triton",
-            Self::FlashInfer(_) => "FlashInfer",
+            Self::FlashInfer => "FlashInfer",
         }
     }
 
     fn build(self, model_path: &str) -> Qwen35Executor {
         match self {
-            Self::Triton => build_executor(model_path),
-            Self::FlashInfer(manifest_path) => build_flashinfer_executor(model_path, manifest_path),
+            Self::Triton => build_triton_executor(model_path),
+            Self::FlashInfer => build_flashinfer_executor(model_path),
         }
     }
 
@@ -889,7 +863,7 @@ impl GateBackend<'_> {
                 );
                 0
             }
-            Self::FlashInfer(_) => require_flashinfer_launches(executor, previous_launches, label),
+            Self::FlashInfer => require_flashinfer_launches(executor, previous_launches, label),
         }
     }
 }
@@ -897,7 +871,7 @@ impl GateBackend<'_> {
 fn run_short_backend_gate(
     golden: &Golden,
     model_path: &str,
-    backend: GateBackend<'_>,
+    backend: GateBackend,
 ) -> (Vec<String>, Vec<GateMetrics>) {
     let all: Vec<usize> = (0..golden.num_seqs).collect();
     let mut labels = Vec::new();
@@ -986,7 +960,7 @@ fn run_short_backend_gate(
 fn run_long_backend_gate(
     golden: &Golden,
     model_path: &str,
-    backend: GateBackend<'_>,
+    backend: GateBackend,
 ) -> (Vec<String>, Vec<GateMetrics>) {
     let all: Vec<usize> = (0..golden.num_seqs).collect();
     let mut executor = backend.build(model_path);
@@ -1116,11 +1090,9 @@ fn flashinfer_gdn_and_triton_match_hf_short_golden() {
         return;
     }
     report_fixture_shape(&golden);
-    let manifest = flashinfer_manifest();
-
     let (labels, triton) = run_short_backend_gate(&golden, &model_path, GateBackend::Triton);
     let (flashinfer_labels, flashinfer) =
-        run_short_backend_gate(&golden, &model_path, GateBackend::FlashInfer(&manifest));
+        run_short_backend_gate(&golden, &model_path, GateBackend::FlashInfer);
     assert_eq!(labels, flashinfer_labels);
     report_backend_deltas(&labels, &triton, &flashinfer);
 }
@@ -1143,11 +1115,9 @@ fn flashinfer_gdn_and_triton_match_hf_long_golden() {
         return;
     }
     report_fixture_shape(&golden);
-    let manifest = flashinfer_manifest();
-
     let (labels, triton) = run_long_backend_gate(&golden, &model_path, GateBackend::Triton);
     let (flashinfer_labels, flashinfer) =
-        run_long_backend_gate(&golden, &model_path, GateBackend::FlashInfer(&manifest));
+        run_long_backend_gate(&golden, &model_path, GateBackend::FlashInfer);
     assert_eq!(labels, flashinfer_labels);
     report_backend_deltas(&labels, &triton, &flashinfer);
 }
