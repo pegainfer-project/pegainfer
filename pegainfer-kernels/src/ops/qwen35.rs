@@ -251,6 +251,7 @@ impl Qwen35GdnAot {
         let (beta_ptr, _beta) = beta.device_ptr(&ctx.stream);
         let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
         let (output_ptr, _output) = output.data.device_ptr_mut(&ctx.stream);
+        let workspace_bytes = launch_workspace.workspace.len() as u64;
         let (workspace_ptr, _workspace) = launch_workspace.workspace.device_ptr_mut(&ctx.stream);
         let (cu_ptr, _cu) = launch_workspace.cu_seqlens.device_ptr(&ctx.stream);
         let args = ffi::FlashInferGdnPrefillArgs {
@@ -265,7 +266,7 @@ impl Qwen35GdnAot {
             state: state_ptr,
             initial_state: state_ptr,
             workspace: workspace_ptr,
-            workspace_bytes: launch_workspace.workspace.len() as u64,
+            workspace_bytes,
             cu_seqlens: cu_ptr,
             cu_seqlens_len: 2,
             tokens: t.try_into().context("Qwen3.5 GDN T exceeds u32")?,
