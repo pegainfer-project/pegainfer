@@ -1091,34 +1091,39 @@ fn flashinfer_gdn_and_triton_match_hf_short_golden() {
     }
     report_fixture_shape(&golden);
     let all = (0..golden.num_seqs).collect::<Vec<_>>();
-    let mut production = build_executor(&model_path);
-    let production_before = production
-        .flashinfer_gdn_runtime_evidence()
-        .expect("read production Auto GDN evidence before HF replay")
-        .expect("SM120/Hv32 production Auto dispatch must select FlashInfer");
-    assert_eq!(production_before.selected_backend, "flashinfer");
-    assert_eq!(production_before.successful_launches, 0);
-    let (production_stats, _) = run(&golden, &mut production, &all, false);
-    report_and_assert("production Auto sequential bs=1 graph", &production_stats);
-    let production_after = production
-        .flashinfer_gdn_runtime_evidence()
-        .expect("read production Auto GDN evidence after HF replay")
-        .expect("production Auto dispatch lost FlashInfer identity");
-    assert_eq!(
-        production_after.artifact_sha256,
-        production_before.artifact_sha256
-    );
-    assert!(
-        production_after.successful_launches > production_before.successful_launches,
-        "production Auto HF replay completed without a FlashInfer launch"
-    );
-    eprintln!(
-        "qwen35 hf_golden_gate [production Auto]: selected_backend={} object_sha256={} successful_launches={} -> {}",
-        production_after.selected_backend,
-        production_after.artifact_sha256,
-        production_before.successful_launches,
-        production_after.successful_launches,
-    );
+    {
+        // Keep only one full model resident at a time on 32 GiB cards. The
+        // production-Auto proof must be dropped before the Triton/FlashInfer
+        // same-path controls construct their own executors below.
+        let mut production = build_executor(&model_path);
+        let production_before = production
+            .flashinfer_gdn_runtime_evidence()
+            .expect("read production Auto GDN evidence before HF replay")
+            .expect("SM120/Hv32 production Auto dispatch must select FlashInfer");
+        assert_eq!(production_before.selected_backend, "flashinfer");
+        assert_eq!(production_before.successful_launches, 0);
+        let (production_stats, _) = run(&golden, &mut production, &all, false);
+        report_and_assert("production Auto sequential bs=1 graph", &production_stats);
+        let production_after = production
+            .flashinfer_gdn_runtime_evidence()
+            .expect("read production Auto GDN evidence after HF replay")
+            .expect("production Auto dispatch lost FlashInfer identity");
+        assert_eq!(
+            production_after.artifact_sha256,
+            production_before.artifact_sha256
+        );
+        assert!(
+            production_after.successful_launches > production_before.successful_launches,
+            "production Auto HF replay completed without a FlashInfer launch"
+        );
+        eprintln!(
+            "qwen35 hf_golden_gate [production Auto]: selected_backend={} object_sha256={} successful_launches={} -> {}",
+            production_after.selected_backend,
+            production_after.artifact_sha256,
+            production_before.successful_launches,
+            production_after.successful_launches,
+        );
+    }
     let (labels, triton) = run_short_backend_gate(&golden, &model_path, GateBackend::Triton);
     let (flashinfer_labels, flashinfer) =
         run_short_backend_gate(&golden, &model_path, GateBackend::FlashInfer);
