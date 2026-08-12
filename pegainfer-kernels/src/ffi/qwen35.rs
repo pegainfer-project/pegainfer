@@ -1,21 +1,19 @@
+use std::ffi::c_char;
+use std::ffi::c_void;
+
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
 
 use super::Half;
 
-/// Stable host-side ABI for the FlashInfer SM120 GDN prefill artifact.
-///
-/// All pointer fields are CUDA device addresses. The caller owns their
-/// allocation and lifetime through kernel completion; `workspace_bytes` and
-/// `cu_seqlens_len` make the two variable-sized buffers explicit. The launch
-/// implementation derives `scale = 1 / sqrt(head_dim)` only after validating
-/// the complete geometry against the artifact manifest.
-///
-/// This is deliberately a data-only C ABI. A loaded module/function is owned
-/// by the Qwen3.5 model's `DeviceContext`, never by a process-global handle.
+/// Kernels-private Rust mirror of the stable C ABI. Model crates never import
+/// this struct: the safe `ops::Qwen35GdnAot` wrapper owns validation, workspace,
+/// handle lifetime, and conversion from semantic tensors to device addresses.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FlashInferGdnPrefillArgs {
+    pub abi_version: u32,
+    pub struct_size: u32,
     pub q: u64,
     pub k: u64,
     pub v: u64,
@@ -36,10 +34,41 @@ pub struct FlashInferGdnPrefillArgs {
     pub stream: CUstream,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FlashInferGdnSpec {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub sm: i32,
+    pub h_q: u32,
+    pub h_k: u32,
+    pub h_v: u32,
+    pub head_dim: u32,
+    pub qkv_dtype: u32,
+    pub state_dtype: u32,
+    pub state_layout: u32,
+}
+
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
 // Sources: csrc/qwen35/*.cu. The paged HD256 attention entry points are shared
 // with Gemma 4 and are declared in `shared.rs`.
 unsafe extern "C" {
+    pub fn pegainfer_qwen35_gdn_abi_version() -> u32;
+    pub fn pegainfer_qwen35_gdn_artifact_sha256() -> *const c_char;
+    pub fn pegainfer_qwen35_gdn_artifact_size_bytes() -> u64;
+    pub fn pegainfer_qwen35_gdn_aot_available() -> i32;
+    pub fn pegainfer_qwen35_gdn_supported(spec: *const FlashInferGdnSpec) -> i32;
+    pub fn pegainfer_qwen35_gdn_create(handle: *mut *mut c_void, device: i32) -> i32;
+    pub fn pegainfer_qwen35_gdn_workspace_bytes(
+        handle: *mut c_void,
+        workspace_bytes: *mut usize,
+    ) -> i32;
+    pub fn pegainfer_qwen35_gdn_launch(
+        handle: *mut c_void,
+        args: *const FlashInferGdnPrefillArgs,
+    ) -> i32;
+    pub fn pegainfer_qwen35_gdn_destroy(handle: *mut c_void);
+
     /// Native, non-expanded FlashInfer-GDN input preparation.
     ///
     /// `q_out`, `k_out`, and `v_out` are token-major `[T,H,D]`; alpha/beta are

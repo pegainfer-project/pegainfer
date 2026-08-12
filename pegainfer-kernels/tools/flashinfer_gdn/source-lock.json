@@ -1,16 +1,21 @@
 {
-  "schema_version": 1,
-  "flashinfer_commit": "19f1a41e6b21f0c422d775e377b6fdf9a1fc9d23",
+  "schema_version": 2,
+  "flashinfer_commit": "a0efa0adfe49bb836ab1a147d6572980b870f3d4",
   "patches": [
     {
       "path": "patches/0001-openinfer-hkv-state-layout.patch",
-      "sha256": "c9ccea6881979c8bb21a29816cbe1e6782819c70567093ced76e475becca3d7a"
+      "sha256": "75c55c32d2b673855d8cf5f1db8f70a31d4eff75f391ddd9542ae63f4a9c8cad"
     }
   ],
-  "patched_kernel_sha256": "2ef4dcecf7c87ae1cc54bb1938d418af45dc47cd5eeaf1edd0cee2b977d0d5a0",
+  "patched_kernel_sha256": "4e3c6f81edf39b5444f20353b1307c8028b2496d702b7bfb9ebfbcebf4f7b35b",
   "hkv_state_index_patch": {
     "applied": true,
     "state_layout": "openinfer_hkv_v_contiguous",
     "ordered_layout": [1, 0, 2, 3]
+  },
+  "aot_export_patch": {
+    "grid_x": "cutlass.Int32",
+    "stream": "cuda.CUstream",
+    "purpose": "host-only type annotations required by official export_to_c"
   }
 }

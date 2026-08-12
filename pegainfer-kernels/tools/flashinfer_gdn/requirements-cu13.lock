@@ -1,0 +1,8 @@
+# Generation-only CUDA 13 environment. Serving statically links the exported
+# object and libcuda_dialect_runtime_static.a; it never imports these packages.
+nvidia-cutlass-dsl[cu13]==4.5.0
+nvidia-cutlass-dsl-libs-base==4.5.0
+cuda-python==13.0.1
+cuda-bindings==13.0.3
+cuda-pathfinder==1.6.0
+torch==2.7.1

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package and validate FlashInfer CuTe GDN SM120 PTX artifacts.
+"""Package and validate FlashInfer CuTe GDN SM120 native AOT artifacts.
 
 This module intentionally uses only the Python standard library. CuTe and
 PyTorch are generation-time dependencies isolated in ``compile_sm120.py``.
@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TARGET_ARCH = "sm_120a"
-FROZEN_FLASHINFER_COMMIT = "19f1a41e6b21f0c422d775e377b6fdf9a1fc9d23"
+FROZEN_FLASHINFER_COMMIT = "a0efa0adfe49bb836ab1a147d6572980b870f3d4"
 SUPPORTED_GEOMETRIES = {
     "qwen35_4b_candidate": {"h_q": 16, "h_k": 16, "h_v": 32, "head_dim": 128},
     "operator_hv48": {"h_q": 16, "h_k": 16, "h_v": 48, "head_dim": 128},
@@ -40,17 +40,15 @@ DTYPES = {
 }
 PINNED_TOOLCHAIN = {
     "python": "3.12.3",
-    "host_cuda_toolkit": "12.8",
-    "ptxas": "12.9",
-    "ptx_compiler_release": "12.9",
-    "ptx_compiler_version": "12.9.83",
-    "ptx_isa": "8.8",
+    "ptx_compiler_release": "13.1",
+    "ptx_compiler_version": "13.1.66",
+    "ptx_isa": "9.1",
     "cutlass_dsl": "4.5.0",
     "cutlass_dsl_libs_base": "4.5.0",
-    "cuda_nvcc_package": "12.9.86",
     "torch": "2.7.1",
-    "cuda_python": "12.9.4",
-    "cuda_bindings": "12.9.7",
+    "cuda_python": "13.0.1",
+    "cuda_bindings": "13.0.3",
+    "cuda_pathfinder": "1.6.0",
 }
 WORKSPACE_SOURCE = (
     "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py"
@@ -103,7 +101,7 @@ def source_lock_path() -> Path:
 
 
 def requirements_lock_path() -> Path:
-    return Path(__file__).with_name("requirements-cu128.lock")
+    return Path(__file__).with_name("requirements-cu13.lock")
 
 
 def compiler_path() -> Path:
@@ -142,6 +140,13 @@ def load_source_lock(path: Path | None = None) -> tuple[dict[str, Any], str]:
     }
     if hkv != expected_hkv:
         raise ContractError("Stage 3 HKV state-index patch metadata mismatch")
+    expected_export = {
+        "grid_x": "cutlass.Int32",
+        "stream": "cuda.CUstream",
+        "purpose": "host-only type annotations required by official export_to_c",
+    }
+    if lock.get("aot_export_patch") != expected_export:
+        raise ContractError("Stage 12 AOT export annotation metadata mismatch")
     return lock, sha256_file(path)
 
 
@@ -277,22 +282,6 @@ def parse_entry_symbols(ptx: str) -> list[str]:
     return sorted(set(ENTRY_RE.findall(ptx)))
 
 
-def parse_ptx_toolchain(ptx: str) -> dict[str, str]:
-    compiler_match = re.search(
-        r"Cuda compilation tools, release\s+([0-9.]+),\s+V([0-9.]+)", ptx
-    )
-    isa_match = re.search(r"^\.version\s+([0-9.]+)$", ptx, re.MULTILINE)
-    target_match = re.search(r"^\.target\s+([^,\s]+)", ptx, re.MULTILINE)
-    if not compiler_match or not isa_match or not target_match:
-        raise ContractError("cannot derive compiler, PTX ISA, or target from PTX")
-    return {
-        "ptx_compiler_release": compiler_match.group(1),
-        "ptx_compiler_version": compiler_match.group(2),
-        "ptx_isa": isa_match.group(1),
-        "target_arch": target_match.group(1),
-    }
-
-
 def expected_spec(variant: str) -> dict[str, Any]:
     try:
         geometry = SUPPORTED_GEOMETRIES[variant]
@@ -339,6 +328,11 @@ def validate_compile_metadata(
         "compile metadata requirements lock hash",
     )
     _require_equal(metadata.get("workspace"), source["workspace"], "workspace metadata")
+    aot = metadata.get("aot")
+    if not isinstance(aot, dict):
+        raise ContractError("compile metadata is missing AOT export metadata")
+    expected_prefix = f"pegainfer_qwen35_gdn_{variant}"
+    _require_equal(aot.get("function_prefix"), expected_prefix, "AOT function prefix")
     toolchain = metadata.get("toolchain")
     if not isinstance(toolchain, dict):
         raise ContractError("compile metadata is missing toolchain")
@@ -348,30 +342,32 @@ def validate_compile_metadata(
 def build_manifest(
     *,
     variant: str,
-    ptx_name: str,
-    ptx_bytes: bytes,
-    symbols: list[str],
+    header_name: str,
+    header_bytes: bytes,
+    object_name: str,
+    object_bytes: bytes,
+    runtime_name: str,
+    runtime_bytes: bytes,
     compile_metadata: dict[str, Any],
     source: dict[str, Any],
     patch_set_sha256: str,
 ) -> dict[str, Any]:
-    if len(symbols) != 1:
-        raise ContractError(f"expected exactly one PTX entry symbol, got {symbols}")
     lock, _ = load_source_lock()
     patch_sha256 = lock["patches"][0]["sha256"]
     spec = expected_spec(variant)
     production_candidate = variant == "qwen35_4b_candidate"
     return {
         "schema_version": SCHEMA_VERSION,
-        "artifact_kind": "flashinfer_cute_gdn_prefill_ptx",
+        "artifact_kind": "flashinfer_cute_gdn_prefill_aot_object",
         "variant": variant,
-        "target": {"arch": TARGET_ARCH, "driver_jit_target": "compute_120a"},
+        "target": {"arch": TARGET_ARCH, "code_object": "embedded_cubin"},
         "geometry": spec["geometry"],
         "dtypes": spec["dtypes"],
         "tokens": spec["tokens"],
         "abi": {
-            "entry_symbol": symbols[0],
-            "geometry_binding": "manifest_guarded_runtime_head_parameters",
+            "version": 1,
+            "function_prefix": compile_metadata["aot"]["function_prefix"],
+            "geometry_binding": "stable_project_c_wrapper",
             "q_view": {"shape": ["T", 128, spec["geometry"]["h_q"]], "stride": [spec["geometry"]["h_q"] * 128, 1, 128]},
             "k_view": {"shape": [128, "T", spec["geometry"]["h_k"]], "stride": [1, spec["geometry"]["h_k"] * 128, 128]},
             "v_view": {"shape": [128, "T", spec["geometry"]["h_v"]], "stride": [1, spec["geometry"]["h_v"] * 128, 128]},
@@ -390,18 +386,29 @@ def build_manifest(
         },
         "toolchain": compile_metadata["toolchain"],
         "artifact": {
-            "file": ptx_name,
-            "format": "ptx",
-            "sha256": sha256_bytes(ptx_bytes),
-            "size_bytes": len(ptx_bytes),
-            "entry_symbols": symbols,
-            "absolute_path_scan": "passed",
+            "format": "elf_relocatable_with_embedded_cubin",
+            "header": {
+                "file": header_name,
+                "sha256": sha256_bytes(header_bytes),
+                "size_bytes": len(header_bytes),
+            },
+            "object": {
+                "file": object_name,
+                "sha256": sha256_bytes(object_bytes),
+                "size_bytes": len(object_bytes),
+            },
+            "native_runtime": {
+                "file": runtime_name,
+                "sha256": sha256_bytes(runtime_bytes),
+                "size_bytes": len(runtime_bytes),
+            },
         },
         "distribution": {
             "strategy": "release_bundle",
             "serving_requires_python": False,
             "serving_requires_cute_dsl": False,
-            "cuda_driver_jit_required": True,
+            "cuda_driver_jit_required": False,
+            "cute_runtime_linkage": "static",
             "production_candidate_geometry": production_candidate,
             "production_eligible": False,
             "production_blocker": "SM120 output/final-state GPU validation and model integration are not complete",
@@ -412,7 +419,7 @@ def build_manifest(
 def package_variant(
     *,
     variant: str,
-    raw_ptx_path: Path,
+    raw_aot_dir: Path,
     compile_metadata_path: Path,
     output_dir: Path,
     flashinfer_dir: Path,
@@ -424,23 +431,46 @@ def package_variant(
     metadata = read_json(compile_metadata_path)
     validate_compile_metadata(metadata, variant, source)
 
-    ptx = normalize_ptx(raw_ptx_path.read_text(encoding="utf-8"))
-    if FORBIDDEN_TMA_CLUSTER_LOAD in ptx:
-        raise ContractError("PTX still contains the forbidden SM120 cluster TMA load")
-    leaks = leaked_absolute_paths(ptx)
-    if leaks:
-        raise ContractError(f"PTX contains absolute path(s): {', '.join(leaks)}")
-    symbols = parse_entry_symbols(ptx)
-    ptx_bytes = ptx.encode("utf-8")
+    aot = metadata["aot"]
+    header_path = raw_aot_dir / aot["header"]
+    object_path = raw_aot_dir / aot["object"]
+    if not header_path.is_file() or not object_path.is_file():
+        raise ContractError("AOT export header/object is missing")
+    header_bytes = header_path.read_bytes()
+    object_bytes = object_path.read_bytes()
+    runtime_path = Path(aot["native_runtime"])
+    if not runtime_path.is_file():
+        raise ContractError("CuTe static runtime archive is missing")
+    runtime_bytes = runtime_path.read_bytes()
+    _require_equal(aot["header_sha256"], sha256_bytes(header_bytes), "AOT header hash")
+    _require_equal(aot["object_sha256"], sha256_bytes(object_bytes), "AOT object hash")
+    _require_equal(aot["object_size_bytes"], len(object_bytes), "AOT object size")
+    _require_equal(
+        aot["native_runtime_sha256"],
+        sha256_bytes(runtime_bytes),
+        "CuTe static runtime hash",
+    )
+    _require_equal(
+        aot["native_runtime_size_bytes"],
+        len(runtime_bytes),
+        "CuTe static runtime size",
+    )
 
     output_dir.mkdir(parents=True)
-    ptx_name = "kernel.ptx"
-    (output_dir / ptx_name).write_bytes(ptx_bytes)
+    header_name = "kernel.h"
+    object_name = "kernel.o"
+    runtime_name = "libcuda_dialect_runtime_static.a"
+    (output_dir / header_name).write_bytes(header_bytes)
+    (output_dir / object_name).write_bytes(object_bytes)
+    (output_dir / runtime_name).write_bytes(runtime_bytes)
     manifest = build_manifest(
         variant=variant,
-        ptx_name=ptx_name,
-        ptx_bytes=ptx_bytes,
-        symbols=symbols,
+        header_name=header_name,
+        header_bytes=header_bytes,
+        object_name=object_name,
+        object_bytes=object_bytes,
+        runtime_name=runtime_name,
+        runtime_bytes=runtime_bytes,
         compile_metadata=metadata,
         source=source,
         patch_set_sha256=patch_set_sha256,
@@ -464,7 +494,7 @@ def validate_manifest(
         raise ContractError("manifest variant is missing")
     spec = expected_spec(variant)
     _require_equal(manifest.get("variant"), variant, "variant")
-    _require_equal(manifest.get("target"), {"arch": TARGET_ARCH, "driver_jit_target": "compute_120a"}, "target")
+    _require_equal(manifest.get("target"), {"arch": TARGET_ARCH, "code_object": "embedded_cubin"}, "target")
     _require_equal(manifest.get("geometry"), spec["geometry"], "geometry")
     _require_equal(manifest.get("dtypes"), spec["dtypes"], "dtypes")
     _require_equal(manifest.get("tokens"), spec["tokens"], "dynamic token contract")
@@ -503,40 +533,32 @@ def validate_manifest(
     artifact = manifest.get("artifact")
     if not isinstance(artifact, dict):
         raise ContractError("artifact metadata is missing")
-    artifact_name = artifact.get("file")
-    if not isinstance(artifact_name, str) or Path(artifact_name).name != artifact_name:
-        raise ContractError("artifact file must be a relative basename")
-    artifact_path = manifest_path.parent / artifact_name
-    if not artifact_path.is_file():
-        raise ContractError(f"artifact file is missing: {artifact_path}")
-    data = artifact_path.read_bytes()
-    _require_equal(artifact.get("size_bytes"), len(data), "artifact size")
-    _require_equal(artifact.get("sha256"), sha256_bytes(data), "artifact hash")
-    ptx = data.decode("utf-8")
-    if FORBIDDEN_TMA_CLUSTER_LOAD in ptx:
-        raise ContractError("artifact contains forbidden SM120 cluster TMA load")
-    leaks = leaked_absolute_paths(ptx)
-    if leaks:
-        raise ContractError(f"artifact contains absolute path(s): {', '.join(leaks)}")
-    symbols = parse_entry_symbols(ptx)
-    ptx_toolchain = parse_ptx_toolchain(ptx)
-    _require_equal(ptx_toolchain["target_arch"], TARGET_ARCH, "PTX target")
+    _require_equal(artifact.get("format"), "elf_relocatable_with_embedded_cubin", "artifact format")
+    for component in ("header", "object", "native_runtime"):
+        entry = artifact.get(component)
+        if not isinstance(entry, dict):
+            raise ContractError(f"artifact {component} metadata is missing")
+        name = entry.get("file")
+        if not isinstance(name, str) or Path(name).name != name:
+            raise ContractError(f"artifact {component} file must be a relative basename")
+        path = manifest_path.parent / name
+        if not path.is_file():
+            raise ContractError(f"artifact {component} file is missing: {path}")
+        data = path.read_bytes()
+        _require_equal(entry.get("size_bytes"), len(data), f"artifact {component} size")
+        _require_equal(entry.get("sha256"), sha256_bytes(data), f"artifact {component} hash")
     manifest_toolchain = manifest.get("toolchain")
     if not isinstance(manifest_toolchain, dict):
         raise ContractError("manifest toolchain is missing")
     _require_equal(manifest_toolchain, PINNED_TOOLCHAIN, "manifest toolchain")
-    for key in ("ptx_compiler_release", "ptx_compiler_version", "ptx_isa"):
-        _require_equal(manifest_toolchain.get(key), ptx_toolchain[key], f"PTX {key}")
-    _require_equal(artifact.get("entry_symbols"), symbols, "artifact symbol table")
-    _require_equal(artifact.get("absolute_path_scan"), "passed", "absolute path scan status")
     abi = manifest.get("abi")
     if not isinstance(abi, dict):
         raise ContractError("ABI metadata is missing")
-    if len(symbols) != 1 or abi.get("entry_symbol") != symbols[0]:
-        raise ContractError("ABI symbol does not match PTX entry")
+    _require_equal(abi.get("version"), 1, "stable C ABI version")
+    _require_equal(abi.get("function_prefix"), f"pegainfer_qwen35_gdn_{variant}", "AOT function prefix")
     _require_equal(
         abi.get("geometry_binding"),
-        "manifest_guarded_runtime_head_parameters",
+        "stable_project_c_wrapper",
         "geometry binding",
     )
     _require_equal(
@@ -550,6 +572,8 @@ def validate_manifest(
         raise ContractError("distribution metadata is missing")
     for key in ("serving_requires_python", "serving_requires_cute_dsl", "production_eligible"):
         _require_equal(distribution.get(key), False, f"distribution {key}")
+    _require_equal(distribution.get("cuda_driver_jit_required"), False, "driver JIT policy")
+    _require_equal(distribution.get("cute_runtime_linkage"), "static", "CuTe runtime linkage")
     _require_equal(distribution.get("strategy"), "release_bundle", "distribution strategy")
     return manifest
 

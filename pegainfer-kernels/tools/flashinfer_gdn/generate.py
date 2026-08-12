@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and package both frozen FlashInfer GDN SM120 PTX variants."""
+"""Generate and package frozen FlashInfer GDN SM120 AOT variants."""
 
 from __future__ import annotations
 
@@ -27,8 +27,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--flashinfer-dir", type=Path, default=default_flashinfer_dir())
-    parser.add_argument("--cuda-root", type=Path, default=Path("/usr/local/cuda-12.8"))
-    parser.add_argument("--ptxas", required=True, type=Path)
     parser.add_argument("--output", type=Path, default=Path("target/flashinfer-gdn-sm120"))
     args = parser.parse_args()
 
@@ -45,7 +43,6 @@ def main() -> int:
             compiler = Path(__file__).with_name("compile_sm120.py")
             for variant in sorted(SUPPORTED_GEOMETRIES):
                 raw_dir = temp / "raw" / variant
-                ptx_path = raw_dir / "kernel.ptx"
                 metadata_path = raw_dir / "compile-metadata.json"
                 subprocess.run(
                     [
@@ -57,12 +54,8 @@ def main() -> int:
                         str(prepared),
                         "--base-flashinfer-dir",
                         str(args.flashinfer_dir),
-                        "--cuda-root",
-                        str(args.cuda_root),
-                        "--ptxas",
-                        str(args.ptxas),
-                        "--ptx-out",
-                        str(ptx_path),
+                        "--aot-out",
+                        str(raw_dir),
                         "--metadata-out",
                         str(metadata_path),
                     ],
@@ -70,14 +63,14 @@ def main() -> int:
                 )
                 package_variant(
                     variant=variant,
-                    raw_ptx_path=ptx_path,
+                    raw_aot_dir=raw_dir,
                     compile_metadata_path=metadata_path,
                     output_dir=staged / variant,
                     flashinfer_dir=args.flashinfer_dir,
                 )
 
             bundle = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "variants": {
                     variant: {
                         "manifest": f"{variant}/manifest.json",
