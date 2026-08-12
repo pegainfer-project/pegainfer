@@ -1,8 +1,7 @@
 //! Stage 9 single-variable Qwen3.5 GDN backend benchmark.
 //!
-//! This binary deliberately uses the model scheduler directly. The production
-//! server remains Triton-only until Stage 10, so routing an HTTP request to the
-//! FlashInfer candidate here would require changing the variable under test.
+//! This binary uses the same scheduler and production dispatch as serving. The
+//! backend seam is crate-internal and exists only to run matched A/B evidence.
 
 use std::env;
 use std::fs;
@@ -17,8 +16,6 @@ use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 use pegainfer_frontend::engine::EngineHandle;
-use pegainfer_frontend::engine::EngineLoadOptions;
-use pegainfer_frontend::engine::EpBackend;
 use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenSink;
@@ -54,7 +51,6 @@ impl Backend {
 struct Args {
     backend: Backend,
     model_path: PathBuf,
-    manifest: Option<PathBuf>,
     output: Option<PathBuf>,
     prompt_len: usize,
     concurrency: usize,
@@ -102,9 +98,7 @@ struct ScratchReport {
 
 #[derive(Debug, Serialize)]
 struct EvidenceReport {
-    manifest_path: String,
-    ptx_path: String,
-    variant: String,
+    selected_backend: String,
     artifact_sha256: String,
     artifact_size_bytes: u64,
     runtime_workspace_bytes: u64,
@@ -118,7 +112,7 @@ struct Report {
     run_label: String,
     backend: Backend,
     model_path: String,
-    manifest_path: Option<String>,
+    artifact_manifest_sha256: Option<String>,
     code_commit: Option<String>,
     gpu_label: Option<String>,
     cuda_label: Option<String>,
@@ -172,32 +166,21 @@ fn main() -> Result<()> {
     let startup_started = Instant::now();
     let (handle, evidence_handle) = match args.backend {
         Backend::Triton => (
-            pegainfer_qwen35::start_engine_with_capacity(
+            pegainfer_qwen35::start_engine_with_triton_gdn_for_accuracy(
                 &args.model_path,
-                EngineLoadOptions {
-                    enable_cuda_graph: true,
-                    device_ordinals: vec![args.device],
-                    parallel_config: None,
-                    ep_backend: EpBackend::Nccl,
-                    seed: 42,
-                },
+                args.device,
                 args.concurrency,
                 args.max_prefill_tokens,
             )?,
             None,
         ),
         Backend::FlashInfer => {
-            let manifest = args
-                .manifest
-                .as_deref()
-                .context("--manifest is required for --backend flashinfer")?;
             let (handle, evidence) =
                 pegainfer_qwen35::start_engine_with_flashinfer_gdn_for_accuracy(
                     &args.model_path,
                     args.device,
                     args.concurrency,
                     args.max_prefill_tokens,
-                    manifest,
                 )?;
             (handle, Some(evidence))
         }
@@ -252,15 +235,12 @@ fn main() -> Result<()> {
         .map_or(0, |evidence| evidence.artifact_size_bytes);
 
     let report = Report {
-        schema_version: 1,
+        schema_version: 2,
         surface: "qwen35_engine_handle_no_http_transport",
         run_label: args.run_label,
         backend: args.backend,
         model_path: args.model_path.display().to_string(),
-        manifest_path: args
-            .manifest
-            .as_ref()
-            .map(|path| path.display().to_string()),
+        artifact_manifest_sha256: env::var("PEGAINFER_STAGE9_MANIFEST_SHA256").ok(),
         code_commit: env::var("PEGAINFER_STAGE9_COMMIT").ok(),
         gpu_label: env::var("PEGAINFER_STAGE9_GPU").ok(),
         cuda_label: env::var("PEGAINFER_STAGE9_CUDA").ok(),
@@ -435,9 +415,7 @@ fn scratch_report(
 
 fn evidence_report(evidence: &GdnPrefillRuntimeEvidence) -> EvidenceReport {
     EvidenceReport {
-        manifest_path: evidence.manifest_path.display().to_string(),
-        ptx_path: evidence.ptx_path.display().to_string(),
-        variant: evidence.variant.clone(),
+        selected_backend: evidence.selected_backend.clone(),
         artifact_sha256: evidence.artifact_sha256.clone(),
         artifact_size_bytes: evidence.artifact_size_bytes,
         runtime_workspace_bytes: evidence.runtime_workspace_bytes,
@@ -493,7 +471,6 @@ fn duration_ms(duration: Duration) -> f64 {
 fn parse_args() -> Result<Args> {
     let mut backend = None;
     let mut model_path = None;
-    let mut manifest = None;
     let mut output = None;
     let mut prompt_len = 128usize;
     let mut concurrency = 1usize;
@@ -515,7 +492,6 @@ fn parse_args() -> Result<Args> {
         match flag.as_str() {
             "--backend" => backend = Some(Backend::parse(&value)?),
             "--model-path" => model_path = Some(PathBuf::from(value)),
-            "--manifest" => manifest = Some(PathBuf::from(value)),
             "--output" => output = Some(PathBuf::from(value)),
             "--prompt-len" => prompt_len = parse_usize(&flag, &value)?,
             "--concurrency" => concurrency = parse_usize(&flag, &value)?,
@@ -531,7 +507,6 @@ fn parse_args() -> Result<Args> {
     Ok(Args {
         backend: backend.context("--backend is required")?,
         model_path: model_path.context("--model-path is required")?,
-        manifest,
         output,
         prompt_len,
         concurrency,
@@ -553,7 +528,7 @@ fn parse_usize(flag: &str, value: &str) -> Result<usize> {
 fn print_help() {
     println!(
         "Usage: gdn_stage9_bench --backend triton|flashinfer --model-path PATH [options]\n\
-         \nRequired for FlashInfer:\n  --manifest PATH\n\
+         \nFlashInfer must be linked at build time with PEGAINFER_QWEN35_GDN_AOT_BUNDLE.\n\
          \nOptions:\n  --prompt-len N           default 128\n  --concurrency N          default 1\n  --warmup N              default 2\n  --iterations N          default 10\n  --max-new-tokens N      default 8\n  --max-prefill-tokens N  default 20000\n  --device N              default 0\n  --run-label TEXT        default stage9\n  --output PATH           also write JSON to PATH"
     );
 }

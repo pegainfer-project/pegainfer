@@ -24,7 +24,6 @@ const CHUNK_BUDGET: usize = 16;
 const BASELINE_PREFILL_BUDGET: usize = 1 << 20;
 const MAX_BATCH: usize = 2;
 const GENERATED_TOKENS: usize = 8;
-const FLASHINFER_GDN_MANIFEST_ENV: &str = "PEGAINFER_QWEN35_FLASHINFER_GDN_MANIFEST";
 
 fn model_path_or_skip() -> Option<String> {
     match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
@@ -56,18 +55,8 @@ fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
     .expect("failed to start Qwen3.5 engine")
 }
 
-fn flashinfer_manifest() -> std::path::PathBuf {
-    let path = std::env::var(FLASHINFER_GDN_MANIFEST_ENV).unwrap_or_else(|_| {
-        panic!("{FLASHINFER_GDN_MANIFEST_ENV} must point to the validated Hv32 manifest")
-    });
-    let path = std::path::PathBuf::from(path);
-    assert!(path.is_file(), "missing manifest: {}", path.display());
-    path
-}
-
 fn start_flashinfer_engine(
     model_path: &str,
-    manifest_path: &Path,
     max_prefill_tokens: usize,
 ) -> (EngineHandle, GdnPrefillRuntimeEvidenceHandle) {
     pegainfer_qwen35::runtime::start_engine_with_flashinfer_gdn_for_accuracy(
@@ -75,7 +64,6 @@ fn start_flashinfer_engine(
         0,
         MAX_BATCH,
         max_prefill_tokens,
-        manifest_path,
     )
     .expect("start FlashInfer Qwen3.5 scheduler")
 }
@@ -177,13 +165,11 @@ fn flashinfer_gdn_chunked_prefill_matches_unchunked_prefill() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
-    let manifest = flashinfer_manifest();
     let prompt_tokens = prompt_tokens(&model_path);
     assert!(prompt_tokens.len() > CHUNK_BUDGET * 2);
 
     let (baseline_tokens, baseline_finish) = {
-        let (handle, evidence) =
-            start_flashinfer_engine(&model_path, &manifest, BASELINE_PREFILL_BUDGET);
+        let (handle, evidence) = start_flashinfer_engine(&model_path, BASELINE_PREFILL_BUDGET);
         assert_eq!(evidence.snapshot().successful_launches, 0);
         let result = generate(&handle, prompt_tokens.clone());
         assert!(
@@ -195,7 +181,7 @@ fn flashinfer_gdn_chunked_prefill_matches_unchunked_prefill() {
     assert_eq!(baseline_finish, FinishReason::Length);
 
     let (chunked_tokens, chunked_finish) = {
-        let (handle, evidence) = start_flashinfer_engine(&model_path, &manifest, CHUNK_BUDGET);
+        let (handle, evidence) = start_flashinfer_engine(&model_path, CHUNK_BUDGET);
         assert_eq!(evidence.snapshot().successful_launches, 0);
         let result = generate(&handle, prompt_tokens);
         assert!(

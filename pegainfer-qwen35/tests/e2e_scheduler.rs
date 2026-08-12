@@ -29,7 +29,6 @@ use vllm_text::tokenizer::DynTokenizer;
 mod common;
 
 const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
-const FLASHINFER_GDN_MANIFEST_ENV: &str = "PEGAINFER_QWEN35_FLASHINFER_GDN_MANIFEST";
 
 const CASES: &[TestCase] = &[
     TestCase {
@@ -591,16 +590,6 @@ fn test_e2e_qwen35_scheduler() {
 #[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
 fn test_e2e_qwen35_scheduler_flashinfer_gdn() {
     let model_path = get_model_path();
-    let manifest = std::env::var(FLASHINFER_GDN_MANIFEST_ENV).unwrap_or_else(|_| {
-        panic!("{FLASHINFER_GDN_MANIFEST_ENV} must point to the validated Hv32 manifest")
-    });
-    let manifest = Path::new(&manifest);
-    assert!(
-        manifest.is_file(),
-        "missing manifest: {}",
-        manifest.display()
-    );
-
     info!("Loading Qwen3.5 model for FlashInfer scheduler test...");
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
@@ -610,18 +599,13 @@ fn test_e2e_qwen35_scheduler_flashinfer_gdn() {
             0,
             8,
             pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
-            manifest,
         )
         .expect("Failed to start FlashInfer Qwen3.5 scheduler");
     let initial = evidence.snapshot();
-    assert_eq!(initial.variant, "qwen35_4b_candidate");
-    assert_eq!(initial.manifest_path, manifest);
     assert_eq!(initial.successful_launches, 0);
     info!(
-        "FlashInfer identity: manifest={} ptx={} sha256={}",
-        initial.manifest_path.display(),
-        initial.ptx_path.display(),
-        initial.artifact_sha256
+        "FlashInfer identity: object_sha256={} object_bytes={}",
+        initial.artifact_sha256, initial.artifact_size_bytes
     );
     info!("FlashInfer scheduler loaded in {:.2?}", start.elapsed());
 

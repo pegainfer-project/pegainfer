@@ -2,16 +2,15 @@
 set -euo pipefail
 
 : "${PEGAINFER_STAGE9_MODEL_PATH:?set PEGAINFER_STAGE9_MODEL_PATH}"
-: "${PEGAINFER_STAGE9_MANIFEST:?set PEGAINFER_STAGE9_MANIFEST}"
+: "${PEGAINFER_STAGE9_AOT_BUNDLE:?set PEGAINFER_STAGE9_AOT_BUNDLE to qwen35_4b_candidate directory}"
 : "${PEGAINFER_STAGE9_OUTPUT_DIR:?set PEGAINFER_STAGE9_OUTPUT_DIR}"
 : "${PEGAINFER_STAGE9_COMMIT:?set PEGAINFER_STAGE9_COMMIT to the exact code/archive provenance}"
 : "${PEGAINFER_TRITON_PYTHON:?set PEGAINFER_TRITON_PYTHON to a Python that imports Triton}"
 
 readonly EXPECTED_CONFIG_SHA="ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670"
-readonly EXPECTED_MANIFEST_SHA="7070260c8e69095d9c8658b9243b7b3b92d5b518e816780e29842f880a587e9f"
-readonly EXPECTED_PTX_SHA="225646b26dab488cdfd64dcf3fe189ba4b7ccaf2ba735eb7b68a47d13db96b68"
 readonly STAGE9_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 readonly STAGE9_BIN="${STAGE9_TARGET_DIR}/release/gdn_stage9_bench"
+readonly stage9_manifest="${PEGAINFER_STAGE9_AOT_BUNDLE}/manifest.json"
 
 mkdir -p "${PEGAINFER_STAGE9_OUTPUT_DIR}"
 
@@ -27,9 +26,30 @@ if [[ ! -x "${PEGAINFER_TRITON_PYTHON}" ]] \
 fi
 
 test -f "${PEGAINFER_STAGE9_MODEL_PATH}/config.json"
-test -f "${PEGAINFER_STAGE9_MANIFEST}"
-readonly stage9_ptx_path="$(dirname "${PEGAINFER_STAGE9_MANIFEST}")/kernel.ptx"
-test -f "${stage9_ptx_path}"
+test -f "${stage9_manifest}"
+
+readonly actual_commit="$(git rev-parse HEAD)"
+if [[ "${PEGAINFER_STAGE9_COMMIT}" != "${actual_commit}" ]]; then
+    echo "PEGAINFER_STAGE9_COMMIT mismatch: expected ${actual_commit}, got ${PEGAINFER_STAGE9_COMMIT}" >&2
+    exit 1
+fi
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "Stage 9 refuses a dirty tracked or staged source tree" >&2
+    exit 1
+fi
+if [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+    echo "Stage 9 refuses an untracked source tree" >&2
+    exit 1
+fi
+if git submodule status --recursive | grep -Eq '^[+-U]'; then
+    echo "Stage 9 refuses missing or mismatched submodules" >&2
+    git submodule status --recursive >&2
+    exit 1
+fi
+
+python3 pegainfer-kernels/tools/flashinfer_gdn/artifact_contract.py \
+    validate-manifest "${stage9_manifest}" \
+    --flashinfer-dir pegainfer-kernels/third_party/flashinfer
 
 check_hash() {
     local expected="$1"
@@ -43,21 +63,33 @@ check_hash() {
 }
 
 check_hash "${EXPECTED_CONFIG_SHA}" "${PEGAINFER_STAGE9_MODEL_PATH}/config.json"
-check_hash "${EXPECTED_MANIFEST_SHA}" "${PEGAINFER_STAGE9_MANIFEST}"
-check_hash "${EXPECTED_PTX_SHA}" "${stage9_ptx_path}"
+export PEGAINFER_STAGE9_MANIFEST_SHA256
+PEGAINFER_STAGE9_MANIFEST_SHA256="$(sha256sum "${stage9_manifest}" | awk '{print $1}')"
+export PEGAINFER_QWEN35_GDN_AOT_BUNDLE="${PEGAINFER_STAGE9_AOT_BUNDLE}"
+readonly stage9_object_path="${PEGAINFER_STAGE9_AOT_BUNDLE}/kernel.o"
+test -f "${stage9_object_path}"
+readonly stage9_object_sha="$(python3 - "${stage9_manifest}" <<'PY'
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["artifact"]["object"]["sha256"])
+PY
+)"
+check_hash "${stage9_object_sha}" "${stage9_object_path}"
 
 {
     date -u
     git rev-parse HEAD
-    git status --short -- pegainfer-qwen35
+    git status --short
+    git submodule status --recursive
     nvidia-smi
     nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv
     nvcc --version
     sha256sum \
         "${PEGAINFER_STAGE9_MODEL_PATH}/config.json" \
-        "${PEGAINFER_STAGE9_MANIFEST}" \
-        "${stage9_ptx_path}"
-    stat -c '%n %s bytes' "${stage9_ptx_path}"
+        "${stage9_manifest}" \
+        "${stage9_object_path}"
+    stat -c '%n %s bytes' "${stage9_object_path}"
     printf 'PEGAINFER_STAGE9_COMMIT=%s\n' "${PEGAINFER_STAGE9_COMMIT}"
     printf 'PEGAINFER_STAGE9_ARCHIVE_SHA=%s\n' "${PEGAINFER_STAGE9_ARCHIVE_SHA:-not-set}"
 } | tee "${PEGAINFER_STAGE9_OUTPUT_DIR}/environment.log"
@@ -126,25 +158,27 @@ for stage9_case in "${stage9_case_array[@]}"; do
             --run-label "${stage9_stem}"
             --output "${PEGAINFER_STAGE9_OUTPUT_DIR}/${stage9_stem}.json"
         )
-        if [[ "${stage9_backend}" == "flashinfer" ]]; then
-            stage9_args+=(--manifest "${PEGAINFER_STAGE9_MANIFEST}")
-        fi
-
         "${STAGE9_BIN}" "${stage9_args[@]}" \
             2>&1 | tee "${PEGAINFER_STAGE9_OUTPUT_DIR}/${stage9_stem}.log"
     done
 done
 
-python3 - "${PEGAINFER_STAGE9_OUTPUT_DIR}" <<'PY'
+python3 - "${PEGAINFER_STAGE9_OUTPUT_DIR}" "${stage9_object_sha}" <<'PY'
 import json
 import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
+expected_object_sha = sys.argv[2]
 rows = []
 for path in sorted(root.glob("t*-c*-o*-*.json")):
     report = json.loads(path.read_text())
     evidence = report.get("flashinfer_evidence")
+    if evidence is not None and evidence["artifact_sha256"] != expected_object_sha:
+        raise SystemExit(
+            f"{path.name}: linked object hash {evidence['artifact_sha256']} "
+            f"does not match validated manifest {expected_object_sha}"
+        )
     rows.append(
         {
             "file": path.name,
