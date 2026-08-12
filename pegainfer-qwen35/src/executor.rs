@@ -5,7 +5,6 @@
 //! logits without widening the northbound engine API.
 
 use std::collections::HashSet;
-use std::path::Path;
 
 use anyhow::Result;
 use pegainfer_core::kv_pool::KvState;
@@ -109,6 +108,7 @@ struct ActiveRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExecutorGdnPrefillBackend {
+    Auto,
     Triton,
     FlashInfer,
 }
@@ -123,20 +123,28 @@ pub struct Qwen35Executor {
 impl Qwen35Executor {
     pub fn from_runtime(model_path: &str, device_ordinal: usize, max_batch: usize) -> Result<Self> {
         let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+        Self::from_model(model, ExecutorGdnPrefillBackend::Auto)
+    }
+
+    pub fn from_runtime_with_triton_gdn(
+        model_path: &str,
+        device_ordinal: usize,
+        max_batch: usize,
+    ) -> Result<Self> {
+        let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
         Self::from_model(model, ExecutorGdnPrefillBackend::Triton)
     }
 
     /// Build the low-level accuracy executor with the pinned FlashInfer GDN
     /// candidate selected explicitly for every prefill chunk. This is a
-    /// test/benchmark entry: production construction remains Triton-only.
+    /// test/benchmark seam over the same production dispatch boundary.
     pub fn from_runtime_with_flashinfer_gdn(
         model_path: &str,
         device_ordinal: usize,
         max_batch: usize,
-        manifest_path: &Path,
     ) -> Result<Self> {
-        let mut model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
-        model.install_flashinfer_gdn_for_benchmark(manifest_path)?;
+        let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+        model.require_flashinfer_gdn_for_test()?;
         Self::from_model(model, ExecutorGdnPrefillBackend::FlashInfer)
     }
 
@@ -158,6 +166,11 @@ impl Qwen35Executor {
     /// constructor. A standard Triton executor has no such evidence.
     pub fn flashinfer_gdn_runtime_evidence(&self) -> Result<Option<GdnPrefillRuntimeEvidence>> {
         match self.gdn_prefill_backend {
+            ExecutorGdnPrefillBackend::Auto => self
+                .model
+                .flashinfer_gdn_runtime_evidence()
+                .map(Some)
+                .or_else(|_| Ok(None)),
             ExecutorGdnPrefillBackend::Triton => Ok(None),
             ExecutorGdnPrefillBackend::FlashInfer => {
                 self.model.flashinfer_gdn_runtime_evidence().map(Some)
@@ -213,10 +226,15 @@ impl Qwen35Executor {
             .collect::<Result<_>>()?;
         let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
         let logits = match self.gdn_prefill_backend {
-            ExecutorGdnPrefillBackend::Triton => {
+            ExecutorGdnPrefillBackend::Auto => {
                 self.model
                     .batch_prefill_logits(&prompts, &mut kv_states, &mut recurrent_refs)?
             }
+            ExecutorGdnPrefillBackend::Triton => self.model.batch_prefill_logits_triton(
+                &prompts,
+                &mut kv_states,
+                &mut recurrent_refs,
+            )?,
             ExecutorGdnPrefillBackend::FlashInfer => self.model.batch_prefill_logits_flashinfer(
                 &prompts,
                 &mut kv_states,
