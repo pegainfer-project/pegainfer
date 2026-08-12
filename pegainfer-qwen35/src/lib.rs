@@ -98,16 +98,14 @@ pub fn start_engine(
     )
 }
 
-/// Start a single-GPU accuracy scheduler with the pinned FlashInfer GDN
-/// candidate selected explicitly. Production launch APIs remain Triton-only.
-/// The returned evidence handle proves artifact identity and successful
-/// launches across the scheduler thread boundary.
+/// Start a single-GPU accuracy scheduler with the build-linked FlashInfer GDN
+/// candidate selected explicitly. Both the forced test seam and serving use
+/// the same production dispatch; the returned handle only records evidence.
 pub fn start_engine_with_flashinfer_gdn_for_accuracy(
     model_path: &Path,
     device_ordinal: usize,
     max_batch: usize,
     max_prefill_tokens: usize,
-    manifest_path: &Path,
 ) -> Result<(EngineHandle, prefill::GdnPrefillRuntimeEvidenceHandle)> {
     anyhow::ensure!(
         (1..=MAX_DECODE_BATCH).contains(&max_batch),
@@ -116,9 +114,28 @@ pub fn start_engine_with_flashinfer_gdn_for_accuracy(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let mut model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
-    model.install_flashinfer_gdn_for_benchmark(manifest_path)?;
+    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+    model.require_flashinfer_gdn_for_test()?;
     scheduler::start_with_capacity_flashinfer_gdn(model, 42, max_batch, max_prefill_tokens)
+}
+
+/// Internal benchmarking control that forces Triton at the production
+/// dispatch boundary without changing any surrounding model/scheduler path.
+pub fn start_engine_with_triton_gdn_for_accuracy(
+    model_path: &Path,
+    device_ordinal: usize,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+) -> Result<EngineHandle> {
+    anyhow::ensure!(
+        (1..=MAX_DECODE_BATCH).contains(&max_batch),
+        "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
+    );
+    let model_path = model_path
+        .to_str()
+        .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
+    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+    scheduler::start_with_capacity_triton_gdn(model, 42, max_batch, max_prefill_tokens)
 }
 
 #[derive(Clone, Debug)]

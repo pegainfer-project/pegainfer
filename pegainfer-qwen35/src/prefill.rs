@@ -1,8 +1,3 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
-
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -31,6 +26,8 @@ use pegainfer_core::tensor::HiddenStates;
 
 use super::flashinfer_gdn::FlashInferGdnChunkResources;
 use super::flashinfer_gdn::GdnPrefillBackendSeam;
+pub use super::flashinfer_gdn::GdnPrefillRuntimeEvidence;
+pub use super::flashinfer_gdn::GdnPrefillRuntimeEvidenceHandle;
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
 use super::weights::FullAttentionLayer;
@@ -67,48 +64,6 @@ pub struct GdnPrefillComparison {
     pub conv_state_max_abs: f32,
 }
 
-/// Runtime proof that an explicitly selected FlashInfer GDN test path loaded
-/// the pinned artifact and actually launched it. Production dispatch does not
-/// expose or consume this diagnostic surface.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GdnPrefillRuntimeEvidence {
-    pub manifest_path: PathBuf,
-    pub ptx_path: PathBuf,
-    pub variant: String,
-    pub artifact_sha256: String,
-    pub artifact_size_bytes: u64,
-    pub runtime_workspace_bytes: u64,
-    pub successful_launches: u64,
-}
-
-/// Cloneable test/benchmark proof that remains readable after a model moves
-/// into the scheduler thread. It owns no CUDA resources and cannot select a
-/// backend; it only snapshots identity plus the shared successful-launch count.
-#[derive(Clone, Debug)]
-pub struct GdnPrefillRuntimeEvidenceHandle {
-    manifest_path: PathBuf,
-    ptx_path: PathBuf,
-    variant: String,
-    artifact_sha256: String,
-    artifact_size_bytes: u64,
-    runtime_workspace_bytes: u64,
-    successful_launches: Arc<AtomicU64>,
-}
-
-impl GdnPrefillRuntimeEvidenceHandle {
-    pub fn snapshot(&self) -> GdnPrefillRuntimeEvidence {
-        GdnPrefillRuntimeEvidence {
-            manifest_path: self.manifest_path.clone(),
-            ptx_path: self.ptx_path.clone(),
-            variant: self.variant.clone(),
-            artifact_sha256: self.artifact_sha256.clone(),
-            artifact_size_bytes: self.artifact_size_bytes,
-            runtime_workspace_bytes: self.runtime_workspace_bytes,
-            successful_launches: self.successful_launches.load(Ordering::Relaxed),
-        }
-    }
-}
-
 fn update_max_abs(max_abs: &mut f32, left: &[f32], right: &[f32]) -> Result<()> {
     anyhow::ensure!(
         left.len() == right.len(),
@@ -142,36 +97,15 @@ fn checked_prefill_end_pos(
 }
 
 impl Qwen35Model {
-    /// Load the pinned FlashInfer artifact for the explicit runtime
-    /// test/benchmark seam. This does not change production dispatch, which
-    /// remains hard-wired to Triton in `prefill_chunk_forward`.
-    pub fn install_flashinfer_gdn_for_benchmark(
-        &mut self,
-        manifest_path: &std::path::Path,
-    ) -> Result<()> {
-        self.install_flashinfer_gdn(manifest_path)
-    }
-
-    /// Snapshot the installed candidate's pinned identity and successful
-    /// launch count. Missing installation fails closed.
-    pub fn flashinfer_gdn_runtime_evidence(&self) -> Result<GdnPrefillRuntimeEvidence> {
-        Ok(self.flashinfer_gdn_runtime_evidence_handle()?.snapshot())
-    }
-
-    pub fn flashinfer_gdn_runtime_evidence_handle(
-        &self,
-    ) -> Result<GdnPrefillRuntimeEvidenceHandle> {
-        let backend = self.flashinfer_gdn()?;
-        let (manifest_path, ptx_path, variant, artifact_sha256) = backend.artifact_identity();
-        Ok(GdnPrefillRuntimeEvidenceHandle {
-            manifest_path: manifest_path.to_owned(),
-            ptx_path: ptx_path.to_owned(),
-            variant: variant.to_owned(),
-            artifact_sha256: artifact_sha256.to_owned(),
-            artifact_size_bytes: backend.artifact_size_bytes(),
-            runtime_workspace_bytes: backend.runtime_workspace_bytes()?,
-            successful_launches: backend.successful_launch_counter(),
-        })
+    /// Require the build-linked candidate for an explicit same-path A/B gate.
+    /// Artifact selection and validation happen in `pegainfer-kernels` at build
+    /// time; model code never consumes an artifact path at runtime.
+    pub(crate) fn require_flashinfer_gdn_for_test(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.flashinfer_gdn.is_some(),
+            "FlashInfer GDN is not available; set PEGAINFER_QWEN35_GDN_AOT_BUNDLE at build time"
+        );
+        Ok(())
     }
 
     /// Allocate an empty request state for one side of a GDN benchmark.
@@ -289,7 +223,7 @@ impl Qwen35Model {
             token_ids,
             kv_state,
             recurrent,
-            GdnPrefillBackendSeam::Triton,
+            GdnPrefillBackendSeam::Auto,
         )
     }
 
@@ -320,14 +254,19 @@ impl Qwen35Model {
         // per-pass GDR scratch (which grows with the pass length) at the budget
         // reserved at startup, so prompts longer than one chunk prefill without OOM.
         let mut hidden_batch: Option<HiddenStates> = None;
+        let gdn_backend = self.resolved_gdn_backend(gdn_backend)?;
         for chunk in token_ids.chunks(PREFILL_CHUNK_LEN) {
             // Free the previous chunk's hidden states before allocating the next
             // chunk's scratch so peak memory stays within one chunk's reservation.
             drop(hidden_batch.take());
             hidden_batch = Some(match gdn_backend {
-                GdnPrefillBackendSeam::Triton => {
-                    self.prefill_chunk_forward(chunk, kv_state, recurrent)?
-                }
+                GdnPrefillBackendSeam::Auto => unreachable!("GDN backend was resolved above"),
+                GdnPrefillBackendSeam::Triton => self.prefill_chunk_forward_with_gdn_backend(
+                    chunk,
+                    kv_state,
+                    recurrent,
+                    GdnPrefillBackendSeam::Triton,
+                )?,
                 GdnPrefillBackendSeam::FlashInfer => self.prefill_chunk_forward_with_gdn_backend(
                     chunk,
                     kv_state,
@@ -388,23 +327,9 @@ impl Qwen35Model {
     /// `token_ids.len()` must be in `1..=PREFILL_CHUNK_LEN` so the per-chunk GDR
     /// scratch stays within the startup reservation. Returns the chunk's hidden
     /// states for every token; only the final chunk's last token feeds the LM head.
-    fn prefill_chunk_forward(
-        &self,
-        token_ids: &[u32],
-        kv_state: &mut KvState,
-        recurrent: &mut RecurrentState,
-    ) -> Result<HiddenStates> {
-        self.prefill_chunk_forward_with_gdn_backend(
-            token_ids,
-            kv_state,
-            recurrent,
-            GdnPrefillBackendSeam::Triton,
-        )
-    }
-
-    /// Crate-private Stage 6 seam for model-internal tests/benchmarks. The
-    /// production entry above always selects Triton; requesting FlashInfer is
-    /// explicit and fails if no validated model-local artifact is installed.
+    /// Crate-private seam for model-internal same-production-path A/B gates.
+    /// `Auto` is the serving policy; forced variants never bypass scratch
+    /// allocation, the layer loop, or the kernels-owned stable ABI.
     pub(crate) fn prefill_chunk_forward_with_gdn_backend(
         &self,
         token_ids: &[u32],
@@ -441,7 +366,9 @@ impl Qwen35Model {
         // Allocate the chunk scratch before advancing the KV state. It is the
         // largest, most allocation-prone buffer here, so failing first leaves
         // `kv_state` untouched and the request can be rejected cleanly.
+        let gdn_backend = self.resolved_gdn_backend(gdn_backend)?;
         let mut gdn_scratch = match gdn_backend {
+            GdnPrefillBackendSeam::Auto => unreachable!("GDN backend was resolved above"),
             GdnPrefillBackendSeam::Triton => GdnPrefillChunkScratch::Triton(Box::new(
                 GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?,
             )),

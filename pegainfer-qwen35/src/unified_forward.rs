@@ -38,7 +38,7 @@ impl Qwen35Model {
             prompts,
             kv_states,
             recurrent_states,
-            GdnPrefillBackendSeam::Triton,
+            GdnPrefillBackendSeam::Auto,
         )
     }
 
@@ -53,6 +53,20 @@ impl Qwen35Model {
             kv_states,
             recurrent_states,
             GdnPrefillBackendSeam::FlashInfer,
+        )
+    }
+
+    pub(crate) fn batch_prefill_logits_triton(
+        &self,
+        prompts: &[&[u32]],
+        kv_states: &mut [KvState],
+        recurrent_states: &mut [&mut RecurrentState],
+    ) -> Result<HiddenStates> {
+        self.batch_prefill_logits_with_gdn_backend(
+            prompts,
+            kv_states,
+            recurrent_states,
+            GdnPrefillBackendSeam::Triton,
         )
     }
 
@@ -71,12 +85,17 @@ impl Qwen35Model {
             "prompts / recurrent_states len mismatch"
         );
 
+        let gdn_backend = self.resolved_gdn_backend(gdn_backend)?;
         let mut last_hiddens = Vec::with_capacity(n);
         for i in 0..n {
             let last_hidden = match gdn_backend {
-                GdnPrefillBackendSeam::Triton => {
-                    self.prefill_last_hidden(prompts[i], &mut kv_states[i], recurrent_states[i])?
-                }
+                GdnPrefillBackendSeam::Auto => unreachable!("GDN backend was resolved above"),
+                GdnPrefillBackendSeam::Triton => self.prefill_last_hidden_with_gdn_backend(
+                    prompts[i],
+                    &mut kv_states[i],
+                    recurrent_states[i],
+                    GdnPrefillBackendSeam::Triton,
+                )?,
                 GdnPrefillBackendSeam::FlashInfer => self.prefill_last_hidden_with_gdn_backend(
                     prompts[i],
                     &mut kv_states[i],
@@ -119,7 +138,7 @@ impl Qwen35Model {
             decode_tokens,
             decode_kv_states,
             graph_state,
-            GdnPrefillBackendSeam::Triton,
+            GdnPrefillBackendSeam::Auto,
         )
     }
 
@@ -143,7 +162,12 @@ impl Qwen35Model {
             None
         } else {
             Some(match gdn_backend {
-                GdnPrefillBackendSeam::Triton => self.batch_prefill_logits(
+                GdnPrefillBackendSeam::Auto => self.batch_prefill_logits(
+                    prefill_prompts,
+                    prefill_kv_states,
+                    prefill_recurrent_states,
+                )?,
+                GdnPrefillBackendSeam::Triton => self.batch_prefill_logits_triton(
                     prefill_prompts,
                     prefill_kv_states,
                     prefill_recurrent_states,

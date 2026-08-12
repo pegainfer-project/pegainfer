@@ -148,10 +148,8 @@ pub fn start_with_capacity(
     )
 }
 
-/// Start the scheduler with an already installed FlashInfer GDN candidate and
-/// return launch evidence that remains readable after the model moves into the
-/// scheduler thread. This is a low-level accuracy/benchmark entry; production
-/// engine construction remains Triton-only.
+/// Start the scheduler with the build-linked FlashInfer GDN candidate forced
+/// through the same dispatch used by serving, returning launch evidence.
 pub(crate) fn start_with_capacity_flashinfer_gdn(
     model: Qwen35Model,
     seed: u64,
@@ -170,6 +168,22 @@ pub(crate) fn start_with_capacity_flashinfer_gdn(
     Ok((handle, evidence))
 }
 
+pub(crate) fn start_with_capacity_triton_gdn(
+    model: Qwen35Model,
+    seed: u64,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+) -> Result<SchedulerHandle> {
+    start_with_capacity_and_policy_backend(
+        model,
+        seed,
+        max_batch,
+        max_prefill_tokens,
+        Qwen35SchedulerPolicy::Off,
+        GdnPrefillBackendSeam::Triton,
+    )
+}
+
 pub(crate) fn start_with_capacity_and_policy(
     model: Qwen35Model,
     seed: u64,
@@ -183,7 +197,7 @@ pub(crate) fn start_with_capacity_and_policy(
         max_batch,
         max_prefill_tokens,
         scheduler_policy,
-        GdnPrefillBackendSeam::Triton,
+        GdnPrefillBackendSeam::Auto,
     )
 }
 
@@ -388,9 +402,13 @@ impl SingleGpuBackend {
         };
         let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
         match self.gdn_prefill_backend {
-            GdnPrefillBackendSeam::Triton => {
+            GdnPrefillBackendSeam::Auto => {
                 self.model
                     .batch_prefill_logits(&window_refs, kvs, &mut rec_refs)
+            }
+            GdnPrefillBackendSeam::Triton => {
+                self.model
+                    .batch_prefill_logits_triton(&window_refs, kvs, &mut rec_refs)
             }
             GdnPrefillBackendSeam::FlashInfer => {
                 self.model
@@ -420,13 +438,22 @@ impl SingleGpuBackend {
             })
             .collect();
         match self.gdn_prefill_backend {
-            GdnPrefillBackendSeam::Triton => self.model.unified_step(
+            GdnPrefillBackendSeam::Auto => self.model.unified_step(
                 &window_refs,
                 kvs,
                 &mut rec_refs,
                 &decode_tokens,
                 &mut decode_kv_refs,
                 &mut self.graph_state,
+            ),
+            GdnPrefillBackendSeam::Triton => self.model.unified_step_with_gdn_backend(
+                &window_refs,
+                kvs,
+                &mut rec_refs,
+                &decode_tokens,
+                &mut decode_kv_refs,
+                &mut self.graph_state,
+                GdnPrefillBackendSeam::Triton,
             ),
             GdnPrefillBackendSeam::FlashInfer => self.model.unified_step_with_gdn_backend(
                 &window_refs,

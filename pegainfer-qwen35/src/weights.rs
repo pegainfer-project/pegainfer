@@ -105,9 +105,9 @@ impl Default for ModelRuntimeConfig {
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
-    /// Model-local owner for the experimental SM120 GDN artifact. It remains
-    /// unset until an internal integration explicitly installs it.
-    pub(super) flashinfer_gdn: Option<super::flashinfer_gdn::FlashInferGdnBackend>,
+    /// Opaque kernels-owned AOT operation. `None` is an explicit capability
+    /// fallback (non-SM120 or non-Hv32), never a corrupt-artifact fallback.
+    pub(super) flashinfer_gdn: Option<pegainfer_kernels::ops::Qwen35GdnAot>,
     pub(super) config: Config35,
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) embed_tokens: DeviceMatrix,
@@ -536,9 +536,39 @@ impl Qwen35Model {
             num_pages,
         )?;
 
+        // The first production specialization is deliberately single-GPU.
+        // TP remains an explicit capability fallback to the existing Triton path.
+        let flashinfer_gdn = if tensor_parallel.world_size == 1 {
+            pegainfer_kernels::ops::Qwen35GdnAot::load_for_production(
+                &ctx,
+                super::flashinfer_gdn::model_geometry(&config),
+            )?
+        } else {
+            None
+        };
+        if let Some(backend) = &flashinfer_gdn {
+            info!(
+                "Qwen3.5 GDN production backend: FlashInfer AOT object {} ({} bytes)",
+                backend.artifact_sha256(),
+                backend.artifact_size_bytes()
+            );
+        } else if tensor_parallel.world_size > 1 {
+            info!(
+                "Qwen3.5 GDN production backend: Triton (explicit capability fallback: TP world_size={})",
+                tensor_parallel.world_size
+            );
+        } else {
+            let (major, minor) = ctx.ctx.compute_capability()?;
+            info!(
+                "Qwen3.5 GDN production backend: Triton (explicit capability fallback: sm_{}{}, geometry={:?})",
+                major,
+                minor,
+                super::flashinfer_gdn::model_geometry(&config)
+            );
+        }
         Ok(Self {
             ctx,
-            flashinfer_gdn: None,
+            flashinfer_gdn,
             config,
             tensor_parallel,
             embed_tokens,
