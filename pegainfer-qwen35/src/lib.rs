@@ -14,6 +14,8 @@ mod flashinfer_gdn;
 #[cfg(test)]
 mod gdn_prepare_test_contract;
 #[cfg(test)]
+mod gdn_stage13_test;
+#[cfg(test)]
 mod gdn_stage7_test_support;
 mod logprobs;
 pub mod model_line;
