@@ -132,7 +132,7 @@ def main() -> int:
             "kernel_source_sha256": UPSTREAM_KERNEL_SHA256,
             "generator_sha256": sha256_file(Path(__file__)),
             "requirements_lock_sha256": sha256_file(
-                Path(__file__).with_name("requirements-cu128.lock")
+                Path(__file__).with_name("requirements-cu13.lock")
             ),
             "patch_set_sha256": ZERO_SHA256,
             "hkv_state_index_patch_sha256": ZERO_SHA256,
