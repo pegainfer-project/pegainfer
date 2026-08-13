@@ -29,6 +29,8 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
         &pegainfer_gemma4::model_line::MODEL_LINE,
         #[cfg(feature = "glm52")]
         &pegainfer_glm52::model_line::MODEL_LINE,
+        #[cfg(feature = "k3")]
+        &pegainfer_k3::model_line::MODEL_LINE,
         #[cfg(feature = "kimi-k2")]
         &pegainfer_kimi_k2::model_line::MODEL_LINE,
         #[cfg(feature = "qwen3")]
@@ -78,6 +80,12 @@ fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
             model_types: &["glm_moe_dsa"],
             text_model_types: &[],
             compiled: cfg!(feature = "glm52"),
+        },
+        Family {
+            feature: "k3",
+            model_types: &["kimi_k3"],
+            text_model_types: &["kimi_linear"],
+            compiled: cfg!(feature = "k3"),
         },
         Family {
             feature: "kimi-k2",

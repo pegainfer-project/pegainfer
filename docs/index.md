@@ -91,6 +91,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/glm52/fp8-blockwise-gemm-lab.md` | kernel_lab fp8 blockwise GEMM lab line (8 units: production CUTLASS `fp8_gemm.*` + CuTe DSL tcgen05 `fp8_gemm_dsl_tc.*`, `sm_tcgen05_only` fail-closed): GB300 sm_103 DSL passes 24/24 and beats the CUTLASS production baselines at rows=64 by 1.37–1.97x (tuning round over tile-N/split-K adds −21~−40% more), cold-L2 recheck holds; production profit estimate and SASS/PTX evidence inside. |
 | `models/glm52/kernel-lab-ops.md` | kernel_lab ops & maintenance manual: pipeline map (manifest -> registry -> adapter -> loader -> timing -> ledger), the add-a-CUTLASS-unit and add-a-python-native-DSL-unit lifecycles, capability-key semantics, warm vs `--cold-l2` protocol boundaries + the <11us event-timing floor, ledger discipline, and the GB300 tray remote-workflow record. |
 
+## models / k3
+
+| Doc | TL;DR |
+|---|---|
+| `models/k3/bring-up.md` | New model line (`--features k3`), bring-up stage: config probe + weight loader + step-contract scheduler skeleton landed; model execution not wired yet. Kernel surface: build-time TileLang generated router/attn-res kernels + DeepGEMM masked FP8xFP4 grouped-GEMM AOT shim. Dev vehicle: 224-expert checkpoint at EP4, shape-isomorphic to the full 896-expert model at EP16. |
+
 ## models / deepseek-v2-lite
 
 | Path | TL;DR |

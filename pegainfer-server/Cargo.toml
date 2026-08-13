@@ -19,6 +19,7 @@ pegainfer-deepseek-v2-lite = { workspace = true, optional = true }
 pegainfer-frontend = { workspace = true }
 pegainfer-gemma4 = { workspace = true, optional = true }
 pegainfer-glm52 = { workspace = true, optional = true }
+pegainfer-k3 = { workspace = true, optional = true }
 pegainfer-kimi-k2 = { workspace = true, optional = true }
 pegainfer-qwen3 = { workspace = true, optional = true }
 pegainfer-qwen35 = { workspace = true, optional = true }
@@ -40,6 +41,7 @@ deepseek-v2-lite = [
 ]
 gemma4 = ["dep:pegainfer-gemma4", "pegainfer-gemma4/gemma4"]
 glm52 = ["dep:pegainfer-glm52"]
+k3 = ["dep:pegainfer-k3"]
 kimi-k2 = ["dep:pegainfer-kimi-k2", "pegainfer-kimi-k2/kimi-k2"]
 qwen35 = ["dep:pegainfer-qwen35", "pegainfer-qwen35/qwen35"]
 

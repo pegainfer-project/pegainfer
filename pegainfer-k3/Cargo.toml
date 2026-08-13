@@ -1,0 +1,30 @@
+[package]
+autobenches = false
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-k3"
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+crossbeam-channel = { workspace = true }
+cudarc = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+memmap2 = { workspace = true }
+pegainfer-core = { workspace = true }
+pegainfer-frontend = { workspace = true }
+pegainfer-kernels = { workspace = true, features = ["k3"] }
+pegainfer-kv-store = { workspace = true }
+pegainfer-sample = { workspace = true }
+rayon = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
