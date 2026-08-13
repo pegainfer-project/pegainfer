@@ -681,10 +681,225 @@ mod tests {
     use super::gated_delta_rule_decode_batch_into;
     use super::gated_delta_rule_decode_vec_into;
     use super::gated_delta_rule_prefill_chunkwise_into;
+    use super::gated_delta_rule_prefill_native_prepare_into;
+    use crate::prefill_buffers::GdnPrepareScratch35;
     use crate::prefill_buffers::GdrChunkwiseScratch35;
 
     fn bf16_vec(data: &[f32]) -> Vec<bf16> {
         data.iter().map(|&x| bf16::from_f32(x)).collect()
+    }
+
+    fn softplus(value: f32) -> f32 {
+        if value > 20.0 {
+            value
+        } else if value < -20.0 {
+            value.exp()
+        } else {
+            value.exp().ln_1p()
+        }
+    }
+
+    fn sigmoid(value: f32) -> f32 {
+        let exp = if value < 0.0 {
+            value.exp()
+        } else {
+            (-value).exp()
+        };
+        if value >= 0.0 {
+            1.0 / (1.0 + exp)
+        } else {
+            exp / (1.0 + exp)
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let h_q = 16usize;
+        let h_k = 16usize;
+        let h_v = 32usize;
+        let d = 128usize;
+        let qkv_dim = (h_q + h_k + h_v) * d;
+        let dt_host = bf16_vec(
+            &(0..h_v)
+                .map(|head| (head as f32 - h_v as f32 / 2.0) / 64.0)
+                .collect::<Vec<_>>(),
+        );
+        let a_log_host = (0..h_v)
+            .map(|head| -2.5 + head as f32 / h_v as f32)
+            .collect::<Vec<_>>();
+        let dt_bias = DeviceVec::from_host(&ctx, &dt_host)?;
+        let a_log = ctx.stream.clone_htod(&a_log_host)?;
+
+        for tokens in [1usize, 2, 63, 64, 65, 127, 128, 2048] {
+            let qkv_host = bf16_vec(
+                &(0..tokens * qkv_dim)
+                    .map(|index| {
+                        let signed = ((index * 37 + 11) % 251) as i32 - 125;
+                        signed as f32 / 31.0
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let b_host = bf16_vec(
+                &(0..tokens * h_v)
+                    .map(|index| ((index * 13 % 41) as f32 - 20.0) / 7.0)
+                    .collect::<Vec<_>>(),
+            );
+            let a_host = bf16_vec(
+                &(0..tokens * h_v)
+                    .map(|index| ((index * 17 % 47) as f32 - 23.0) / 9.0)
+                    .collect::<Vec<_>>(),
+            );
+            let qkv = HiddenStates {
+                data: ctx.stream.clone_htod(&qkv_host)?,
+                hidden_dim: qkv_dim,
+                seq_len: tokens,
+            };
+            let b = HiddenStates {
+                data: ctx.stream.clone_htod(&b_host)?,
+                hidden_dim: h_v,
+                seq_len: tokens,
+            };
+            let a = HiddenStates {
+                data: ctx.stream.clone_htod(&a_host)?,
+                hidden_dim: h_v,
+                seq_len: tokens,
+            };
+            let mut prepared = GdnPrepareScratch35::from_dims(&ctx, h_q, h_k, h_v, d, tokens)?;
+            gated_delta_rule_prefill_native_prepare_into(
+                &ctx,
+                &qkv,
+                &b,
+                &a,
+                &dt_bias,
+                &a_log,
+                &mut prepared,
+                h_q,
+                h_k,
+                h_v,
+                d,
+            )?;
+
+            let status = ctx.stream.clone_dtoh(&prepared.non_finite_status)?;
+            let q_actual = ctx.stream.clone_dtoh(&prepared.q.data)?;
+            let k_actual = ctx.stream.clone_dtoh(&prepared.k.data)?;
+            let v_actual = ctx.stream.clone_dtoh(&prepared.v.data)?;
+            let alpha_actual = ctx.stream.clone_dtoh(&prepared.alpha)?;
+            let beta_actual = ctx.stream.clone_dtoh(&prepared.beta)?;
+            ctx.sync()?;
+            assert_eq!(status, [0], "finite Hv32 T={tokens} fixture was rejected");
+
+            for token in 0..tokens {
+                let token_qkv = token * qkv_dim;
+                for head in 0..h_q {
+                    let input = token_qkv + head * d;
+                    let output = (token * h_q + head) * d;
+                    let sum_sq = qkv_host[input..input + d]
+                        .iter()
+                        .map(|value| value.to_f32().powi(2))
+                        .sum::<f32>();
+                    let inv_norm = (sum_sq + 1.0e-12).sqrt().recip();
+                    for lane in 0..d {
+                        let expected = qkv_host[input + lane].to_f32() * inv_norm;
+                        assert!(
+                            (q_actual[output + lane].to_f32() - expected).abs() <= 1.0 / 256.0,
+                            "Q mismatch at T={tokens}, token={token}, head={head}, lane={lane}"
+                        );
+                    }
+                }
+                for head in 0..h_k {
+                    let input = token_qkv + h_q * d + head * d;
+                    let output = (token * h_k + head) * d;
+                    let sum_sq = qkv_host[input..input + d]
+                        .iter()
+                        .map(|value| value.to_f32().powi(2))
+                        .sum::<f32>();
+                    let inv_norm = (sum_sq + 1.0e-12).sqrt().recip();
+                    for lane in 0..d {
+                        let expected = qkv_host[input + lane].to_f32() * inv_norm;
+                        assert!(
+                            (k_actual[output + lane].to_f32() - expected).abs() <= 1.0 / 256.0,
+                            "K mismatch at T={tokens}, token={token}, head={head}, lane={lane}"
+                        );
+                    }
+                }
+                let v_input = token_qkv + (h_q + h_k) * d;
+                let v_output = token * h_v * d;
+                assert_eq!(
+                    &v_actual[v_output..v_output + h_v * d],
+                    &qkv_host[v_input..v_input + h_v * d],
+                    "V bits changed at Hv32 T={tokens}, token={token}"
+                );
+            }
+            for index in 0..tokens * h_v {
+                let head = index % h_v;
+                let a_value = a_host[index].to_f32();
+                let b_value = b_host[index].to_f32();
+                let expected_alpha =
+                    (-a_log_host[head].exp() * softplus(a_value + dt_host[head].to_f32())).exp();
+                let expected_beta = sigmoid(b_value);
+                assert!(
+                    (alpha_actual[index] - expected_alpha).abs()
+                        <= 2.0e-6 * expected_alpha.abs().max(1.0),
+                    "alpha mismatch at Hv32 T={tokens}, index={index}"
+                );
+                assert!(
+                    (beta_actual[index] - expected_beta).abs()
+                        <= 2.0e-6 * expected_beta.abs().max(1.0),
+                    "beta mismatch at Hv32 T={tokens}, index={index}"
+                );
+            }
+        }
+
+        for non_finite_source in ["q", "v", "gate"] {
+            let mut qkv_host = vec![bf16::from_f32(0.25); qkv_dim];
+            let b_host = vec![bf16::from_f32(-0.5); h_v];
+            let mut a_host = vec![bf16::from_f32(0.5); h_v];
+            match non_finite_source {
+                "q" => qkv_host[0] = bf16::from_bits(0x7fc0),
+                "v" => qkv_host[(h_q + h_k) * d + 7] = bf16::from_bits(0x7fc0),
+                "gate" => a_host[0] = bf16::from_bits(0x7fc0),
+                _ => unreachable!(),
+            }
+            let qkv = HiddenStates {
+                data: ctx.stream.clone_htod(&qkv_host)?,
+                hidden_dim: qkv_dim,
+                seq_len: 1,
+            };
+            let b = HiddenStates {
+                data: ctx.stream.clone_htod(&b_host)?,
+                hidden_dim: h_v,
+                seq_len: 1,
+            };
+            let a = HiddenStates {
+                data: ctx.stream.clone_htod(&a_host)?,
+                hidden_dim: h_v,
+                seq_len: 1,
+            };
+            let mut prepared = GdnPrepareScratch35::from_dims(&ctx, h_q, h_k, h_v, d, 1)?;
+            gated_delta_rule_prefill_native_prepare_into(
+                &ctx,
+                &qkv,
+                &b,
+                &a,
+                &dt_bias,
+                &a_log,
+                &mut prepared,
+                h_q,
+                h_k,
+                h_v,
+                d,
+            )?;
+            let status = ctx.stream.clone_dtoh(&prepared.non_finite_status)?;
+            ctx.sync()?;
+            assert_eq!(
+                status,
+                [1],
+                "non-finite {non_finite_source} input was not reported"
+            );
+        }
+        Ok(())
     }
 
     #[test]
