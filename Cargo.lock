@@ -3711,7 +3711,6 @@ dependencies = [
  "cudarc",
  "half",
  "log",
- "nvtx",
  "pegainfer-core",
  "pegainfer-frontend",
  "pegainfer-kernels",

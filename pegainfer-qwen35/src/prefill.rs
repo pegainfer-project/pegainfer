@@ -25,7 +25,7 @@ use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
 use super::flashinfer_gdn::FlashInferGdnChunkResources;
-use super::flashinfer_gdn::GdnPrefillBackendSeam;
+use super::flashinfer_gdn::GdnPrefillBackend;
 pub use super::flashinfer_gdn::GdnPrefillRuntimeEvidence;
 pub use super::flashinfer_gdn::GdnPrefillRuntimeEvidenceHandle;
 use super::prefill_buffers::GdrChunkwiseScratch35;
@@ -42,43 +42,6 @@ use crate::ops::PrefillPagedPlan;
 enum GdnPrefillChunkScratch {
     Triton(Box<GdrChunkwiseScratch35>),
     FlashInfer(Box<FlashInferGdnChunkResources>),
-}
-
-/// Opaque request state for the explicit GDN prefill test/benchmark seam.
-///
-/// Each backend being compared must own a different instance. That guarantees
-/// identical starting state without accidentally letting the first run mutate
-/// the second run's recurrent or paged-KV storage.
-pub struct GdnPrefillBenchmarkState {
-    kv: KvState,
-    recurrent: RecurrentState,
-}
-
-/// Host-observable result from executing the same fresh request through the
-/// Triton baseline and the explicitly selected FlashInfer candidate.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GdnPrefillComparison {
-    pub tokens: usize,
-    pub hidden_max_abs: f32,
-    pub recurrent_state_max_abs: f32,
-    pub conv_state_max_abs: f32,
-}
-
-fn update_max_abs(max_abs: &mut f32, left: &[f32], right: &[f32]) -> Result<()> {
-    anyhow::ensure!(
-        left.len() == right.len(),
-        "GDN comparison length mismatch: Triton={}, FlashInfer={}",
-        left.len(),
-        right.len()
-    );
-    for (index, (&baseline, &candidate)) in left.iter().zip(right).enumerate() {
-        anyhow::ensure!(
-            baseline.is_finite() && candidate.is_finite(),
-            "GDN comparison found non-finite value at index {index}: Triton={baseline}, FlashInfer={candidate}"
-        );
-        *max_abs = (*max_abs).max((baseline - candidate).abs());
-    }
-    Ok(())
 }
 
 fn checked_prefill_end_pos(
@@ -108,131 +71,11 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Allocate an empty request state for one side of a GDN benchmark.
-    pub fn new_gdn_prefill_benchmark_state(&self) -> Result<GdnPrefillBenchmarkState> {
-        Ok(GdnPrefillBenchmarkState {
-            kv: self.alloc_kv(),
-            recurrent: RecurrentState::new(&self.ctx, &self.config)?,
-        })
-    }
-
-    fn run_gdn_prefill_benchmark_chunk(
-        &self,
-        token_ids: &[u32],
-        state: &mut GdnPrefillBenchmarkState,
-        backend: GdnPrefillBackendSeam,
-    ) -> Result<HiddenStates> {
-        anyhow::ensure!(
-            !token_ids.is_empty() && token_ids.len() <= PREFILL_CHUNK_LEN,
-            "GDN benchmark chunk length {} is outside 1..={PREFILL_CHUNK_LEN}",
-            token_ids.len()
-        );
-        self.prefill_chunk_forward_with_gdn_backend(
-            token_ids,
-            &mut state.kv,
-            &mut state.recurrent,
-            backend,
-        )
-    }
-
-    /// Execute one benchmark chunk through the production Triton baseline.
-    /// This backend-named method avoids exposing a public backend enum.
-    pub fn run_triton_gdn_prefill_benchmark_chunk(
-        &self,
-        token_ids: &[u32],
-        state: &mut GdnPrefillBenchmarkState,
-    ) -> Result<HiddenStates> {
-        self.run_gdn_prefill_benchmark_chunk(token_ids, state, GdnPrefillBackendSeam::Triton)
-    }
-
-    /// Execute one benchmark chunk through the quarantined FlashInfer
-    /// candidate. Failure is returned directly and never falls back to Triton.
-    pub fn run_flashinfer_gdn_prefill_benchmark_chunk(
-        &self,
-        token_ids: &[u32],
-        state: &mut GdnPrefillBenchmarkState,
-    ) -> Result<HiddenStates> {
-        self.run_gdn_prefill_benchmark_chunk(token_ids, state, GdnPrefillBackendSeam::FlashInfer)
-    }
-
-    /// Run the same fresh request through Triton and FlashInfer and compare the
-    /// full chunk output plus every linear layer's recurrent and conv state.
-    /// The backend identities are explicit at both calls, so an unavailable
-    /// FlashInfer artifact is reported rather than falling back.
-    pub fn compare_gdn_prefill_backends(&self, token_ids: &[u32]) -> Result<GdnPrefillComparison> {
-        let mut triton_state = self.new_gdn_prefill_benchmark_state()?;
-        let mut flashinfer_state = self.new_gdn_prefill_benchmark_state()?;
-        let triton_output =
-            self.run_triton_gdn_prefill_benchmark_chunk(token_ids, &mut triton_state)?;
-        let flashinfer_output =
-            self.run_flashinfer_gdn_prefill_benchmark_chunk(token_ids, &mut flashinfer_state)?;
-
-        anyhow::ensure!(
-            triton_state.recurrent.seq_len == flashinfer_state.recurrent.seq_len,
-            "GDN comparison recurrent sequence lengths differ: Triton={}, FlashInfer={}",
-            triton_state.recurrent.seq_len,
-            flashinfer_state.recurrent.seq_len
-        );
-        anyhow::ensure!(
-            triton_state.recurrent.layers.len() == flashinfer_state.recurrent.layers.len(),
-            "GDN comparison recurrent layer counts differ"
-        );
-
-        let triton_hidden = triton_output.to_host(&self.ctx)?;
-        let flashinfer_hidden = flashinfer_output.to_host(&self.ctx)?;
-        let mut hidden_max_abs = 0.0;
-        update_max_abs(&mut hidden_max_abs, &triton_hidden, &flashinfer_hidden)?;
-
-        let mut recurrent_state_max_abs = 0.0;
-        let mut conv_state_max_abs = 0.0;
-        for (triton_layer, flashinfer_layer) in triton_state
-            .recurrent
-            .layers
-            .iter()
-            .zip(&flashinfer_state.recurrent.layers)
-        {
-            let triton_recurrent = self.ctx.stream.clone_dtoh(&triton_layer.state)?;
-            let flashinfer_recurrent = self.ctx.stream.clone_dtoh(&flashinfer_layer.state)?;
-            self.ctx.sync()?;
-            update_max_abs(
-                &mut recurrent_state_max_abs,
-                &triton_recurrent,
-                &flashinfer_recurrent,
-            )?;
-
-            let triton_conv = triton_layer.conv_state.to_host(&self.ctx)?;
-            let flashinfer_conv = flashinfer_layer.conv_state.to_host(&self.ctx)?;
-            update_max_abs(&mut conv_state_max_abs, &triton_conv, &flashinfer_conv)?;
-        }
-
-        Ok(GdnPrefillComparison {
-            tokens: token_ids.len(),
-            hidden_max_abs,
-            recurrent_state_max_abs,
-            conv_state_max_abs,
-        })
-    }
-
     pub(super) fn prefill_last_hidden(
         &self,
         token_ids: &[u32],
         kv_state: &mut KvState,
         recurrent: &mut RecurrentState,
-    ) -> Result<DeviceVec> {
-        self.prefill_last_hidden_with_gdn_backend(
-            token_ids,
-            kv_state,
-            recurrent,
-            GdnPrefillBackendSeam::Auto,
-        )
-    }
-
-    pub(crate) fn prefill_last_hidden_with_gdn_backend(
-        &self,
-        token_ids: &[u32],
-        kv_state: &mut KvState,
-        recurrent: &mut RecurrentState,
-        gdn_backend: GdnPrefillBackendSeam,
     ) -> Result<DeviceVec> {
         let seq_len = token_ids.len();
         anyhow::ensure!(
@@ -254,26 +97,13 @@ impl Qwen35Model {
         // per-pass GDR scratch (which grows with the pass length) at the budget
         // reserved at startup, so prompts longer than one chunk prefill without OOM.
         let mut hidden_batch: Option<HiddenStates> = None;
-        let gdn_backend = self.resolved_gdn_backend(gdn_backend)?;
+        let gdn_backend = self.resolved_gdn_backend();
         for chunk in token_ids.chunks(PREFILL_CHUNK_LEN) {
             // Free the previous chunk's hidden states before allocating the next
             // chunk's scratch so peak memory stays within one chunk's reservation.
             drop(hidden_batch.take());
-            hidden_batch = Some(match gdn_backend {
-                GdnPrefillBackendSeam::Auto => unreachable!("GDN backend was resolved above"),
-                GdnPrefillBackendSeam::Triton => self.prefill_chunk_forward_with_gdn_backend(
-                    chunk,
-                    kv_state,
-                    recurrent,
-                    GdnPrefillBackendSeam::Triton,
-                )?,
-                GdnPrefillBackendSeam::FlashInfer => self.prefill_chunk_forward_with_gdn_backend(
-                    chunk,
-                    kv_state,
-                    recurrent,
-                    GdnPrefillBackendSeam::FlashInfer,
-                )?,
-            });
+            hidden_batch =
+                Some(self.prefill_chunk_forward(chunk, kv_state, recurrent, gdn_backend)?);
         }
         // `seq_len > 0` guarantees at least one chunk produced hidden states.
         let hidden_batch = hidden_batch.expect("prefill produced no chunk despite seq_len > 0");
@@ -327,15 +157,12 @@ impl Qwen35Model {
     /// `token_ids.len()` must be in `1..=PREFILL_CHUNK_LEN` so the per-chunk GDR
     /// scratch stays within the startup reservation. Returns the chunk's hidden
     /// states for every token; only the final chunk's last token feeds the LM head.
-    /// Crate-private seam for model-internal same-production-path A/B gates.
-    /// `Auto` is the serving policy; forced variants never bypass scratch
-    /// allocation, the layer loop, or the kernels-owned stable ABI.
-    pub(crate) fn prefill_chunk_forward_with_gdn_backend(
+    fn prefill_chunk_forward(
         &self,
         token_ids: &[u32],
         kv_state: &mut KvState,
         recurrent: &mut RecurrentState,
-        gdn_backend: GdnPrefillBackendSeam,
+        gdn_backend: GdnPrefillBackend,
     ) -> Result<HiddenStates> {
         let seq_len = token_ids.len();
         anyhow::ensure!(
@@ -366,13 +193,11 @@ impl Qwen35Model {
         // Allocate the chunk scratch before advancing the KV state. It is the
         // largest, most allocation-prone buffer here, so failing first leaves
         // `kv_state` untouched and the request can be rejected cleanly.
-        let gdn_backend = self.resolved_gdn_backend(gdn_backend)?;
         let mut gdn_scratch = match gdn_backend {
-            GdnPrefillBackendSeam::Auto => unreachable!("GDN backend was resolved above"),
-            GdnPrefillBackendSeam::Triton => GdnPrefillChunkScratch::Triton(Box::new(
+            GdnPrefillBackend::Triton => GdnPrefillChunkScratch::Triton(Box::new(
                 GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?,
             )),
-            GdnPrefillBackendSeam::FlashInfer => {
+            GdnPrefillBackend::FlashInfer => {
                 let backend = self.flashinfer_gdn()?;
                 GdnPrefillChunkScratch::FlashInfer(Box::new(FlashInferGdnChunkResources::new(
                     &self.ctx,
