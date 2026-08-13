@@ -57,11 +57,17 @@ const auto kMetadataKernel = &deep_gemm::sched::sm100_paged_mqa_logits_metadata<
     kAotNextN, /*kIsContextLens2D=*/false, /*kIsVarlen=*/false,
     /*BLOCK_Q=*/1, kSplitKv, kAotNumSms>;
 
+// Upstream #377 re-parameterized the MQA-logits templates: the leading
+// `kIsFP4` flag became a trailing `qk_dtype_t` type argument plus a `kIsMXSF`
+// flag (MX scale-factor path, shared by MXFP4 and MXFP8). The GLM5.2 indexer
+// is plain FP8 e4m3 with per-KV f32 scales, so `kIsMXSF=false` and
+// `qk_dtype_t = cutlass::float_e4m3_t` reproduce the previous behaviour.
 const auto kLogitsKernel = &deep_gemm::sm100_paged_mqa_logits<
-    /*kIsFP4=*/false, kAotNextN, kAotNumHeads, kAotHeadDim, kAotBlockKv,
-    /*kIsContextLens2D=*/false, /*kIsVarlen=*/false,
+    kAotNextN, kAotNumHeads, kAotHeadDim, kAotBlockKv,
+    /*kIsMXSF=*/false, /*kIsContextLens2D=*/false, /*kIsVarlen=*/false,
     kNumQStages, kNumKVStages, kSplitKv, kSplitsPerChunk,
-    kNumSpecializedThreads, kNumMathThreads, cutlass::bfloat16_t, float>;
+    kNumSpecializedThreads, kNumMathThreads, cutlass::float_e4m3_t,
+    cutlass::bfloat16_t, float>;
 
 // Unpaged (contiguous-KV) prefill instantiation: DeepGEMM's `fp8_mqa_logits`
 // path (the kernel vLLM uses for the DeepSeek-V3.2 indexer prefill).
@@ -77,12 +83,13 @@ const auto kLogitsKernel = &deep_gemm::sm100_paged_mqa_logits<
 //  - No schedule-metadata kernel: the contiguous-KV scheduler derives its
 //    work list on the fly from `cu_seqlen_ks/ke` inside the kernel.
 const auto kUnpagedLogitsKernel = &deep_gemm::sm100_mqa_logits<
-    /*kIsFP4=*/false, kAotNumHeads, kAotHeadDim,
-    /*kIsCompressedLogits=*/false,
+    kAotNumHeads, kAotHeadDim,
+    /*kIsMXSF=*/false, /*kIsCompressedLogits=*/false,
     /*BLOCK_Q=*/kAotBlockQ, kSplitKv,
     kNumQStages, kNumKVStages,
     /*kNumSMs=*/kAotNumSms,
     kNumSpecializedThreads, kNumMathThreads,
+    /*qk_dtype_t=*/cutlass::float_e4m3_t,
     /*logits_dtype_t=*/float, /*reduce_dtype_t=*/float>;
 
 CUresult launch_aot(const void* func, dim3 grid_dim, dim3 block_dim, int smem_size,
@@ -275,8 +282,8 @@ CUresult glm52_deepgemm_paged_mqa_logits_cuda(
 
     constexpr int smem_size = static_cast<int>(sizeof(
         deep_gemm::layout::MQALogitsSharedStorage<
-            false, kAotNumHeads, kAotHeadDim, kAotBlockQ, kSplitKv,
-            kNumQStages, kNumKVStages, 3, float>));
+            kAotNumHeads, kAotHeadDim, /*kIsMXSF=*/false, kAotBlockQ, kSplitKv,
+            kNumQStages, kNumKVStages, 3, cutlass::float_e4m3_t, float>));
     static_assert(smem_size <= kSM100SmemCapacity);
 
     const uint32_t arg_num_q_tokens_total = static_cast<uint32_t>(batch_size * next_n);
@@ -404,8 +411,8 @@ CUresult glm52_deepgemm_mqa_logits_unpaged_cuda(
     // H/D/BLOCK_Q/SPLIT_KV/stage template arguments).
     constexpr int smem_size = static_cast<int>(sizeof(
         deep_gemm::layout::MQALogitsSharedStorage<
-            false, kAotNumHeads, kAotHeadDim, kAotBlockQ, kSplitKv,
-            kNumQStages, kNumKVStages, 3, float>));
+            kAotNumHeads, kAotHeadDim, /*kIsMXSF=*/false, kAotBlockQ, kSplitKv,
+            kNumQStages, kNumKVStages, 3, cutlass::float_e4m3_t, float>));
     static_assert(smem_size <= kSM100SmemCapacity);
 
     const uint32_t arg_num_q_tokens = static_cast<uint32_t>(seq_q);
