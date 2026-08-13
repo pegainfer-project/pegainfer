@@ -11,7 +11,6 @@ clap = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
-nvtx = { workspace = true }
 pegainfer-core = { workspace = true }
 pegainfer-frontend = { workspace = true }
 pegainfer-kernels = { workspace = true }
@@ -61,9 +60,4 @@ required-features = ["qwen35"]
 [[bench]]
 harness = false
 name = "qwen35_ops"
-required-features = ["qwen35"]
-
-[[bin]]
-name = "gdn_stage9_bench"
-path = "src/bin/gdn_stage9_bench.rs"
 required-features = ["qwen35"]

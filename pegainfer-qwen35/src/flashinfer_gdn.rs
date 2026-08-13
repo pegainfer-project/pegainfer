@@ -22,12 +22,9 @@ use crate::config::Config35;
 use crate::prefill_buffers::GdnPrepareScratch35;
 use crate::weights::Qwen35Model;
 
-/// Internal policy injected at the production dispatch boundary. `Auto` is
-/// used by serving; the forced variants exist only for same-path A/B gates.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum GdnPrefillBackendSeam {
-    #[default]
-    Auto,
+/// Backend selected once at the production prefill boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GdnPrefillBackend {
     Triton,
     FlashInfer,
 }
@@ -100,24 +97,11 @@ pub(crate) fn model_geometry(config: &Config35) -> Qwen35GdnGeometry {
 }
 
 impl Qwen35Model {
-    pub(crate) fn resolved_gdn_backend(
-        &self,
-        requested: GdnPrefillBackendSeam,
-    ) -> Result<GdnPrefillBackendSeam> {
-        match requested {
-            GdnPrefillBackendSeam::Auto => Ok(if self.flashinfer_gdn.is_some() {
-                GdnPrefillBackendSeam::FlashInfer
-            } else {
-                GdnPrefillBackendSeam::Triton
-            }),
-            GdnPrefillBackendSeam::Triton => Ok(GdnPrefillBackendSeam::Triton),
-            GdnPrefillBackendSeam::FlashInfer => {
-                ensure!(
-                    self.flashinfer_gdn.is_some(),
-                    "forced FlashInfer GDN is unsupported for this device/model capability"
-                );
-                Ok(GdnPrefillBackendSeam::FlashInfer)
-            }
+    pub(crate) fn resolved_gdn_backend(&self) -> GdnPrefillBackend {
+        if self.flashinfer_gdn.is_some() {
+            GdnPrefillBackend::FlashInfer
+        } else {
+            GdnPrefillBackend::Triton
         }
     }
 

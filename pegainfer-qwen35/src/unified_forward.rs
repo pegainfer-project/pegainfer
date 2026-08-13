@@ -14,7 +14,6 @@ use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::HiddenStates;
 
 use super::batch_decode_graph::BatchDecodeGraphState;
-use super::flashinfer_gdn::GdnPrefillBackendSeam;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
 
@@ -34,49 +33,6 @@ impl Qwen35Model {
         kv_states: &mut [KvState],
         recurrent_states: &mut [&mut RecurrentState],
     ) -> Result<HiddenStates> {
-        self.batch_prefill_logits_with_gdn_backend(
-            prompts,
-            kv_states,
-            recurrent_states,
-            GdnPrefillBackendSeam::Auto,
-        )
-    }
-
-    pub(crate) fn batch_prefill_logits_flashinfer(
-        &self,
-        prompts: &[&[u32]],
-        kv_states: &mut [KvState],
-        recurrent_states: &mut [&mut RecurrentState],
-    ) -> Result<HiddenStates> {
-        self.batch_prefill_logits_with_gdn_backend(
-            prompts,
-            kv_states,
-            recurrent_states,
-            GdnPrefillBackendSeam::FlashInfer,
-        )
-    }
-
-    pub(crate) fn batch_prefill_logits_triton(
-        &self,
-        prompts: &[&[u32]],
-        kv_states: &mut [KvState],
-        recurrent_states: &mut [&mut RecurrentState],
-    ) -> Result<HiddenStates> {
-        self.batch_prefill_logits_with_gdn_backend(
-            prompts,
-            kv_states,
-            recurrent_states,
-            GdnPrefillBackendSeam::Triton,
-        )
-    }
-
-    fn batch_prefill_logits_with_gdn_backend(
-        &self,
-        prompts: &[&[u32]],
-        kv_states: &mut [KvState],
-        recurrent_states: &mut [&mut RecurrentState],
-        gdn_backend: GdnPrefillBackendSeam,
-    ) -> Result<HiddenStates> {
         let n = prompts.len();
         anyhow::ensure!(n > 0, "batch_prefill requires at least one prompt");
         anyhow::ensure!(n == kv_states.len(), "prompts / kv_states len mismatch");
@@ -85,24 +41,10 @@ impl Qwen35Model {
             "prompts / recurrent_states len mismatch"
         );
 
-        let gdn_backend = self.resolved_gdn_backend(gdn_backend)?;
         let mut last_hiddens = Vec::with_capacity(n);
         for i in 0..n {
-            let last_hidden = match gdn_backend {
-                GdnPrefillBackendSeam::Auto => unreachable!("GDN backend was resolved above"),
-                GdnPrefillBackendSeam::Triton => self.prefill_last_hidden_with_gdn_backend(
-                    prompts[i],
-                    &mut kv_states[i],
-                    recurrent_states[i],
-                    GdnPrefillBackendSeam::Triton,
-                )?,
-                GdnPrefillBackendSeam::FlashInfer => self.prefill_last_hidden_with_gdn_backend(
-                    prompts[i],
-                    &mut kv_states[i],
-                    recurrent_states[i],
-                    GdnPrefillBackendSeam::FlashInfer,
-                )?,
-            };
+            let last_hidden =
+                self.prefill_last_hidden(prompts[i], &mut kv_states[i], recurrent_states[i])?;
             debug_assert_eq!(
                 last_hidden.len, self.config.hidden_size,
                 "Qwen3.5 prefill last hidden row must match request {i}"
@@ -131,27 +73,6 @@ impl Qwen35Model {
         decode_kv_states: &mut [&mut KvState],
         graph_state: &mut BatchDecodeGraphState,
     ) -> Result<UnifiedStepOutput> {
-        self.unified_step_with_gdn_backend(
-            prefill_prompts,
-            prefill_kv_states,
-            prefill_recurrent_states,
-            decode_tokens,
-            decode_kv_states,
-            graph_state,
-            GdnPrefillBackendSeam::Auto,
-        )
-    }
-
-    pub(crate) fn unified_step_with_gdn_backend(
-        &self,
-        prefill_prompts: &[&[u32]],
-        prefill_kv_states: &mut [KvState],
-        prefill_recurrent_states: &mut [&mut RecurrentState],
-        decode_tokens: &[u32],
-        decode_kv_states: &mut [&mut KvState],
-        graph_state: &mut BatchDecodeGraphState,
-        gdn_backend: GdnPrefillBackendSeam,
-    ) -> Result<UnifiedStepOutput> {
         anyhow::ensure!(
             !prefill_prompts.is_empty() || !decode_tokens.is_empty(),
             "unified_step: both prefill and decode are empty"
@@ -161,23 +82,11 @@ impl Qwen35Model {
         let prefill_logits = if prefill_prompts.is_empty() {
             None
         } else {
-            Some(match gdn_backend {
-                GdnPrefillBackendSeam::Auto => self.batch_prefill_logits(
-                    prefill_prompts,
-                    prefill_kv_states,
-                    prefill_recurrent_states,
-                )?,
-                GdnPrefillBackendSeam::Triton => self.batch_prefill_logits_triton(
-                    prefill_prompts,
-                    prefill_kv_states,
-                    prefill_recurrent_states,
-                )?,
-                GdnPrefillBackendSeam::FlashInfer => self.batch_prefill_logits_flashinfer(
-                    prefill_prompts,
-                    prefill_kv_states,
-                    prefill_recurrent_states,
-                )?,
-            })
+            Some(self.batch_prefill_logits(
+                prefill_prompts,
+                prefill_kv_states,
+                prefill_recurrent_states,
+            )?)
         };
 
         // ── Decode phase ──────────────────────────────────────────────────────

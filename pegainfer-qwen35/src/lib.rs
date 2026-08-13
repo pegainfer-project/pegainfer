@@ -11,12 +11,6 @@ mod decode_buffers;
 mod executor;
 mod ffi;
 mod flashinfer_gdn;
-#[cfg(test)]
-mod gdn_prepare_test_contract;
-#[cfg(test)]
-mod gdn_stage13_test;
-#[cfg(test)]
-mod gdn_stage7_test_support;
 mod logprobs;
 pub mod model_line;
 mod ops;
@@ -40,7 +34,7 @@ use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
 /// Maximum supported Qwen3.5 decode scheduler slots.
-pub const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
+const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
 
 /// Low-level Qwen3.5 execution interface.
 ///
@@ -57,8 +51,6 @@ pub mod runtime {
     pub use crate::executor::PrefillStepItem;
     pub use crate::executor::Qwen35Executor;
     pub use crate::executor::RequestId;
-    pub use crate::prefill::GdnPrefillBenchmarkState;
-    pub use crate::prefill::GdnPrefillComparison;
     pub use crate::prefill::GdnPrefillRuntimeEvidence;
     pub use crate::prefill::GdnPrefillRuntimeEvidenceHandle;
     pub use crate::scheduler::start_with_capacity;
@@ -72,7 +64,6 @@ pub mod runtime_ops {
     pub use crate::ops::gated_delta_rule_prefill_chunkwise_into;
     pub use crate::ops::rms_norm_batch_offset_into;
     pub use crate::ops::rms_norm_offset_into;
-    pub use crate::prefill_buffers::GdrChunkwiseScratch35;
 }
 
 /// Scheduler policy for balancing Qwen3.5 prefill work against active decode.
@@ -100,9 +91,8 @@ pub fn start_engine(
     )
 }
 
-/// Start a single-GPU accuracy scheduler with the build-linked FlashInfer GDN
-/// candidate selected explicitly. Both the forced test seam and serving use
-/// the same production dispatch; the returned handle only records evidence.
+/// Start the normal single-GPU production scheduler and expose build-linked
+/// FlashInfer launch evidence to end-to-end accuracy tests.
 pub fn start_engine_with_flashinfer_gdn_for_accuracy(
     model_path: &Path,
     device_ordinal: usize,
@@ -118,26 +108,9 @@ pub fn start_engine_with_flashinfer_gdn_for_accuracy(
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
     let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
     model.require_flashinfer_gdn_for_test()?;
-    scheduler::start_with_capacity_flashinfer_gdn(model, 42, max_batch, max_prefill_tokens)
-}
-
-/// Internal benchmarking control that forces Triton at the production
-/// dispatch boundary without changing any surrounding model/scheduler path.
-pub fn start_engine_with_triton_gdn_for_accuracy(
-    model_path: &Path,
-    device_ordinal: usize,
-    max_batch: usize,
-    max_prefill_tokens: usize,
-) -> Result<EngineHandle> {
-    anyhow::ensure!(
-        (1..=MAX_DECODE_BATCH).contains(&max_batch),
-        "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
-    );
-    let model_path = model_path
-        .to_str()
-        .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
-    scheduler::start_with_capacity_triton_gdn(model, 42, max_batch, max_prefill_tokens)
+    let evidence = model.flashinfer_gdn_runtime_evidence_handle()?;
+    let handle = scheduler::start_with_capacity(model, 42, max_batch, max_prefill_tokens)?;
+    Ok((handle, evidence))
 }
 
 #[derive(Clone, Debug)]
