@@ -363,8 +363,27 @@ impl K3WeightManifest {
         rank: usize,
         topo: K3MoeTopo,
     ) -> Result<K3RankLoadBundle> {
+        self.rank_load_bundle_for_layers(rank, topo, K3_LAYERS)
+    }
+
+    /// A rank load that covers only the model's first `num_layers` layers.
+    ///
+    /// A truncated build discards the layers it does not take, but only after
+    /// they are resident: at low expert parallelism a whole rank's weights do
+    /// not fit on one device, so bring-up has to plan the shallow model rather
+    /// than trim it afterwards. `num_layers == K3_LAYERS` is the whole rank.
+    pub(crate) fn rank_load_bundle_for_layers(
+        &self,
+        rank: usize,
+        topo: K3MoeTopo,
+        num_layers: usize,
+    ) -> Result<K3RankLoadBundle> {
+        ensure!(
+            (1..=K3_LAYERS).contains(&num_layers),
+            "K3 rank load must cover 1..={K3_LAYERS} layers, got {num_layers}"
+        );
         let expert_range = topo.rank_expert_range(rank)?;
-        let names = self.rank_tensor_names(rank, topo)?;
+        let names = Self::rank_tensor_names_for_layers(rank, topo, num_layers)?;
         let mut by_shard: BTreeMap<String, Vec<K3TensorLoadSpec>> = BTreeMap::new();
         for name in names {
             let shard = self
@@ -396,11 +415,21 @@ impl K3WeightManifest {
     /// Names are GENERATED from the architecture constants, never enumerated
     /// from the index — `validate_rank_coverage` proves the generator and the
     /// checkpoint agree.
-    fn rank_tensor_names(&self, rank: usize, topo: K3MoeTopo) -> Result<Vec<String>> {
+    fn rank_tensor_names(rank: usize, topo: K3MoeTopo) -> Result<Vec<String>> {
+        Self::rank_tensor_names_for_layers(rank, topo, K3_LAYERS)
+    }
+
+    /// The same list truncated to the first `num_layers`, for a bring-up build
+    /// that only makes part of the stack resident.
+    fn rank_tensor_names_for_layers(
+        rank: usize,
+        topo: K3MoeTopo,
+        num_layers: usize,
+    ) -> Result<Vec<String>> {
         let expert_range = topo.rank_expert_range(rank)?;
         let mut names = Vec::new();
         push_bookends(&mut names);
-        for layer in 0..K3_LAYERS {
+        for layer in 0..num_layers {
             push_layer_backbone(&mut names, layer);
             if k3_layer_is_moe(layer) {
                 push_moe_backbone(&mut names, layer);
@@ -416,7 +445,7 @@ impl K3WeightManifest {
         let topo = K3MoeTopo::new(self.routed_experts, K3_COVERAGE_EP_SIZE)?;
         let mut generated = BTreeSet::new();
         for rank in 0..topo.device_count() {
-            for name in self.rank_tensor_names(rank, topo)? {
+            for name in Self::rank_tensor_names(rank, topo)? {
                 generated.insert(name);
             }
         }
@@ -1029,12 +1058,8 @@ mod tests {
 
     #[test]
     fn rank_plans_shard_experts_and_replicate_the_backbone() {
-        let manifest = K3WeightManifest {
-            weight_map: BTreeMap::new(),
-            routed_experts: experts224(),
-        };
         let topo = K3MoeTopo::new(experts224(), 4).unwrap();
-        let rank1 = manifest.rank_tensor_names(1, topo).unwrap();
+        let rank1 = K3WeightManifest::rank_tensor_names(1, topo).unwrap();
 
         assert!(rank1.iter().any(|name| name
             == "language_model.model.layers.1.block_sparse_moe.experts.56.w1.weight_packed"));
@@ -1061,11 +1086,11 @@ mod tests {
                 .iter()
                 .any(|name| name == "language_model.lm_head.weight")
         );
-        assert!(manifest.rank_tensor_names(4, topo).is_err());
+        assert!(K3WeightManifest::rank_tensor_names(4, topo).is_err());
 
         // Single-GPU bring-up keeps every expert on rank 0.
         let ep1 = K3MoeTopo::new(experts224(), 1).unwrap();
-        let all = manifest.rank_tensor_names(0, ep1).unwrap();
+        let all = K3WeightManifest::rank_tensor_names(0, ep1).unwrap();
         assert!(all.iter().any(|name| name
             == "language_model.model.layers.1.block_sparse_moe.experts.223.w3.weight_scale"));
     }

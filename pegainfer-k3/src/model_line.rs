@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 
+use anyhow::Context as _;
 use clap::Args as ClapArgs;
 use clap::FromArgMatches;
 use log::info;
@@ -17,6 +18,9 @@ use serde_json::Value;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_LAYERS;
 use crate::config::K3_SUPPORTED_ROUTED_EXPERTS;
+use crate::executor::K3Executor;
+use crate::executor::K3ExecutorConfig;
+use crate::scheduler::K3SchedulerConfig;
 
 pub static MODEL_LINE: K3Line = K3Line;
 
@@ -186,14 +190,36 @@ impl ModelLine for K3Line {
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         let ep_size = ep_size(&cli(ctx))?;
         let eos_token_ids = eos_token_ids(ctx.config);
+        let config = K3ExecutorConfig::default().from_env();
         info!(
-            "K3 engine starting: ep_size={ep_size}, eos_token_ids={eos_token_ids:?} \
-             (model execution not wired up yet — requests are answered with an explicit failure)"
+            "K3 engine starting: ep_size={ep_size}, eos_token_ids={eos_token_ids:?}, \
+             slots={}, ctx={}, layers={}, cuda_graph={}",
+            config.max_batch, config.max_ctx, config.num_layers, config.cuda_graph
         );
-        Ok(LaunchedEngine::Stepped(crate::scheduler::launch_unwired(
-            ep_size,
-            eos_token_ids,
-        )))
+        // One executor per EP rank. A single-rank run honours --device-ordinal;
+        // wider runs take devices 0..ep_size, which `validate` already enforced.
+        let mut executors = Vec::with_capacity(ep_size);
+        for rank in 0..ep_size {
+            let device = if ep_size == 1 {
+                ctx.shared.device_ordinal
+            } else {
+                rank
+            };
+            executors.push(
+                K3Executor::load(ctx.model_path, device, rank, ep_size, config).with_context(
+                    || format!("loading K3 rank {rank} of {ep_size} onto device {device}"),
+                )?,
+            );
+        }
+        Ok(LaunchedEngine::Stepped(
+            crate::scheduler::start_with_executors(
+                executors,
+                &K3SchedulerConfig {
+                    eos_token_ids,
+                    kv_capacity: None,
+                },
+            ),
+        ))
     }
 }
 

@@ -91,11 +91,11 @@ where
     }
 }
 
-/// The phase-1 engine: `ep_size` scheduler partitions over placeholder
-/// executors. Every request is admitted and then failed with
-/// [`UNWIRED_MESSAGE`], so the serving path is real end to end and no client
-/// is answered with invented tokens. Swapping [`UnwiredExecutor`] for the GPU
-/// executor is the only change this function needs.
+/// `ep_size` scheduler partitions over placeholder executors: every request is
+/// admitted and then failed with [`UNWIRED_MESSAGE`], so the serving path is
+/// real end to end and no client is answered with invented tokens. Serving now
+/// goes through the GPU executor instead; what is left here is the vehicle for
+/// exercising the request protocol on a box with no GPU and no weights.
 #[must_use]
 pub fn launch_unwired(ep_size: usize, eos_token_ids: Vec<u32>) -> Engine {
     start_with_executors(

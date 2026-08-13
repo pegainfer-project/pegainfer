@@ -338,7 +338,7 @@ impl K3RankModel {
             layers.push(layer);
         }
 
-        let discarded = discard_layers_above(&mut weights, num_layers, routed_experts)?;
+        let discarded = discard_layers_above(&mut weights, num_layers, routed_experts);
         weights.ensure_consumed()?;
 
         info!(
@@ -470,23 +470,31 @@ fn expert_region_bytes(regions: &K3ExpertLayerRegions) -> usize {
 /// the map) keeps the loader's "everything resident was consumed" invariant
 /// exact: an unexpected leftover still fails `ensure_consumed`, and the device
 /// memory is released here instead of at the end of the load bundle's life.
+///
+/// A load bundle planned for the same truncation never made these resident in
+/// the first place, so an absent name is not an error here — anything else left
+/// over is still caught by `ensure_consumed`.
 fn discard_layers_above(
     weights: &mut K3RankGpuWeights,
     num_layers: usize,
     routed_experts: K3RoutedExperts,
-) -> Result<usize> {
+) -> usize {
     let mut bytes = 0usize;
     for layer in num_layers..K3_LAYERS {
         for plan in k3_layer_slots(layer, routed_experts) {
             for name in &plan.sources {
-                bytes += weights.take_tensor(name)?.len();
+                if let Ok(tensor) = weights.take_tensor(name) {
+                    bytes += tensor.len();
+                }
             }
         }
-        if k3_layer_is_moe(layer) {
-            bytes += expert_region_bytes(&weights.take_expert_layer(layer)?);
+        if k3_layer_is_moe(layer)
+            && let Ok(regions) = weights.take_expert_layer(layer)
+        {
+            bytes += expert_region_bytes(&regions);
         }
     }
-    Ok(bytes)
+    bytes
 }
 
 fn gib(bytes: usize) -> f64 {
