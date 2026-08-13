@@ -45,4 +45,81 @@ unsafe extern "C" {
         num_sms: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Local routing metadata for one rank's experts: per-expert row counts
+    /// (`masked_m[groups]`) and the expanded-entry -> masked-slot map
+    /// (`slot_map[tokens * topk]`, `-1` for inactive entries). Entry order
+    /// (`token * topk + slot`) fixes the row assignment deterministically.
+    pub fn k3_moe_local_route_metadata_cuda(
+        topk_idx: *const i32,
+        masked_m: *mut i32,
+        slot_map: *mut i32,
+        tokens: i32,
+        topk: i32,
+        groups: i32,
+        masked_cap: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Local gather fused with the W13 A-operand quant: token-major bf16
+    /// latents `[tokens, hidden]` -> fp8 e4m3 `[groups * masked_cap, hidden]`
+    /// plus MN-major UE8M0 f32 group scales `[groups, hidden / 128,
+    /// masked_cap]`.
+    pub fn k3_moe_gather_fp8_quant_masked_cuda(
+        latent: *const Half,
+        topk_idx: *const i32,
+        slot_map: *const i32,
+        output: *mut u8,
+        scales: *mut f32,
+        tokens: i32,
+        topk: i32,
+        hidden: i32,
+        groups: i32,
+        masked_cap: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// K3 situ activation over the masked gate|up rows
+    /// (`4 * tanh(g / 4) * sigmoid(g) * 25 * tanh(u / 25)`, f32 over the bf16
+    /// W13 output) followed by the W2 A-operand quant.
+    pub fn k3_situ_and_mul_fp8_quant_masked_cuda(
+        gate_up: *const Half,
+        topk_idx: *const i32,
+        slot_map: *const i32,
+        output: *mut u8,
+        scales: *mut f32,
+        tokens: i32,
+        topk: i32,
+        inter: i32,
+        groups: i32,
+        masked_cap: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// f32 MN-major group scales `[groups, scale_cols, cap]` -> the packed
+    /// UE8M0 i32 SFA tensor `[groups, scale_cols / 4, cap]`.
+    pub fn k3_fp8_scale_pack_ue8m0_cuda(
+        scales: *const f32,
+        packed: *mut i32,
+        groups: i32,
+        scale_cols: i32,
+        cap: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Weighted combine: masked W2 rows -> token-major bf16 hidden states,
+    /// f32 accumulation in topk-slot order (no atomics), one bf16 round.
+    pub fn k3_moe_weighted_combine_cuda(
+        expert_out: *const Half,
+        topk_idx: *const i32,
+        slot_map: *const i32,
+        topk_weight: *const f32,
+        out: *mut Half,
+        tokens: i32,
+        topk: i32,
+        hidden: i32,
+        groups: i32,
+        masked_cap: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
