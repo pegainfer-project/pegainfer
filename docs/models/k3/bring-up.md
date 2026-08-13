@@ -1,14 +1,17 @@
 # Kimi K3 bring-up
 
-**TL;DR**: New model line (`--features k3`). Single-rank decode is wired
-end-to-end: config probe + weight loader + step-contract scheduler + a batched
-decode executor (buckets up to `B = 128`, per-bucket CUDA graphs default-on)
-that token-matches a certified 4-layer greedy golden (38/40 exact, 2 steps
-inside a structural ≤2-ULP noise floor — see below). Kernel surface: thirteen
-batched TileLang decode families (every non-GEMM step, `B` a compile-time
-bucket) + DeepGEMM masked FP8xFP4 grouped-GEMM AOT shim, both compiled behind
-`pegainfer-kernels`'s `k3` feature; dense projections go to cuBLASLt. Next:
-EP4 MoE (allreduce oracle first, MegaMoE swap-in after).
+**TL;DR**: New model line (`--features k3`). Decode is end-to-end: full
+93-layer model serves at `--k3-ep-size 4` (free-running per-rank engines, a
+fixed 4-collectives-per-MoE-layer NCCL chain as the only coupling, 189 GiB
+per rank), producing coherent greedy text over `/v1/completions`, and the EP4
+sharding is **bitwise-equal to single-rank** (all 40 gate tokens and all
+163840 final logits, idle and busy peers alike). Single-rank executor:
+buckets up to `B = 128`, per-bucket CUDA graphs default-on, token-matching a
+certified 4-layer greedy golden (38/40 exact, 2 steps inside a structural
+≤2-ULP noise floor — see below). Kernel surface: thirteen batched TileLang
+decode families + DeepGEMM masked FP8xFP4 grouped-GEMM AOT shim behind
+`pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt. Next:
+MegaMoE(situ) swap-in.
 
 Last touched: 2026-08
 
@@ -104,13 +107,64 @@ cross-bucket gate holds to the fixture with the same noise-floor rule.
 dominates — known to lose to a GEMV below ~8 rows/expert); B=128 ≈ 12.3k
 tok/s. Graphs buy ~4.5% (the step is not launch-bound).
 
+## EP4: free-running fixed-chain oracle (wired, bitwise)
+
+The full model does not fit one GPU (routed experts alone are ~354 GB of
+MXFP4), so multi-GPU EP is the only serving shape. The architecture is the
+free-running design glm52 migrated to (`docs/models/glm52/free-running-dp.md`)
+— K3 adopts it from day one rather than building a coordinator and deleting
+it later:
+
+- **Each rank is an autonomous engine.** `start_with_executors` already gives
+  one scheduler partition per rank; the frontend routes requests across
+  partitions. There is no cross-rank host protocol of any kind.
+- **The only coupling is the step's fixed collective chain.** The scheduler
+  calls `decode()` unconditionally — an idle EP rank pads the step rather
+  than skipping it, so collective pairing (which is by entry order) is a code
+  structure guarantee. K3 gets the fixed-chain discipline for free: prefill
+  is sequential decode-shaped steps, so every step of every rank runs the
+  identical 4-collectives-per-MoE-layer sequence, and a rank's prefill step
+  pairs against a peer's decode step with no negotiation. A per-step ledger
+  `ensure!`s the collective count is the compile-time constant.
+- **Numerics are bitwise by construction** (`executor/ep.rs`, gated by
+  `tests/ep_oracle.rs`): protocol-max allgather of latents + router topk
+  (padding rows constructively zero/`-1`), expert-windowed route metadata
+  (entries outside the rank's window go inactive; the intra-expert compaction
+  order is unchanged, so every computed row is byte-identical to the
+  single-rank run), local masked chain over the global batch, dense scatter
+  to entry-major staging (each entry owned by exactly one rank), bf16
+  allreduce — disjoint support means every reduction is `0 + x`, exact in
+  any order — and an entry combine whose accumulation loop is copied verbatim
+  from the masked combine. Gate: EP4 rank 0 vs single-rank, all 40 greedy
+  tokens and all 163840 final logits bit-identical, with idle peers and with
+  peers running their own traffic.
+- **Lessons imported from glm52/qwen3 instead of re-learned**: EP forces
+  eager (collectives under graph capture need warmup-per-size, two-phase
+  cross-rank pre-capture and an abort watchdog — deferred to the MegaMoE
+  phase); NCCL comms are minted on each rank's own thread after a
+  condvar-timeout id rendezvous; all ranks finish loading weights before any
+  comm init; an EP step error is group-fatal (log + exit — plain NCCL has no
+  device timeout, survivors would pair against the wrong step forever);
+  `ep_size × max_batch ≤ masked_cap` is enforced at construction (worst case
+  one expert claims every global token). GPU gates run one per process
+  (comm/context lifetime is the process).
+
+This chain is the correctness oracle and the fallback; the fused
+MegaMoE(situ) kernel is the planned production swap-in, A/B'd against it.
+
+Full-depth serve (93 layers, 4×GB300, `--k3-ep-size 4`,
+`PEGAINFER_K3_MAX_BATCH=16`): each rank loads in ~68 s (backbone 100.5 GiB +
+56 experts 84.2 GiB + 4.4 GiB other = 189.1 GiB), all four ranks join the
+NCCL group at 368 collectives/step, and greedy completions come back as
+coherent English. Four concurrent requests across the four partitions each
+finish in ~2.9 s (40 tokens, ~72 ms/step — eager oracle chain, perf is not
+its job); a 60 s idle hold of free-running padding steps followed by a fresh
+request serves normally with zero error lines. The checkpoint must be
+readable by the serving user — its ACLs may effectively be owner-only, which
+surfaces as `Permission denied` on the first shard.
+
 ## Next
 
-EP4 MoE: first the replicated-batch expert-partial allreduce oracle (bitwise
-scheme verified in the reference harness, zero new kernels, correctness only),
-then the fused MegaMoE(situ) swap-in (AOT instantiation + symm-buffer
-plumbing) with the stepwise chain kept as the A/B baseline. Launch-ahead
-(overlap next step's feed with current compute) needs the scheduler to hand
-the next batch over before reading this step's tokens — the executor side is
-ready. Paged KV for MLA (current MLA cache is fixed `max_ctx = 128` per seat)
-and real prefill come after.
+MegaMoE(situ) swap-in (AOT instantiation + symm-buffer plumbing), then
+graphs-with-collectives (qwen3 recipe), launch-ahead, paged KV for MLA
+(current MLA cache is fixed `max_ctx = 128` per seat) and real prefill.
