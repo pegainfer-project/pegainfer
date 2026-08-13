@@ -76,94 +76,21 @@ pub(crate) struct LocalEngineBridge {
 
 impl LocalEngineBridge {
     pub(crate) async fn run(self, shutdown: CancellationToken) -> Result<()> {
-        wait_for_ipc_endpoint(&self.input_address, &shutdown).await?;
-        wait_for_ipc_endpoint(&self.output_address, &shutdown).await?;
-
-        let engine_id = EngineId::from_engine_index(self.engine_index);
-        let mut socket_options = SocketOptions::default();
-        socket_options.peer_identity(PeerIdentity::try_from(engine_id)?);
-
-        let mut input = DealerSocket::with_options(socket_options);
-        input.connect(&self.input_address).await.with_context(|| {
-            format!(
-                "failed to connect local engine input {}",
-                self.input_address
-            )
-        })?;
-
-        let kv_capacity = self.handle.kv_capacity();
-        let (num_gpu_blocks, block_size, kv_cache_size_tokens, kv_cache_max_concurrency) =
-            match kv_capacity {
-                Some(c) => {
-                    // vLLM single-group concurrency: blocks / ceil(max_len / block_size).
-                    let blocks_per_req =
-                        u64::from(self.max_model_len).div_ceil(c.block_size as u64);
-                    (
-                        c.total_blocks as u64,
-                        c.block_size as u64,
-                        Some(c.total_tokens() as u64),
-                        Some(c.total_blocks as f64 / blocks_per_req as f64),
-                    )
-                }
-                None => (0, 16, None, None),
-            };
-        let ready = EngineCoreReadyResponse {
-            max_model_len: u64::from(self.max_model_len),
-            num_gpu_blocks,
-            block_size,
-            dp_stats_address: None,
-            dtype: ModelDtype::BFloat16,
-            vllm_version: "pegainfer-local-bridge".to_string(),
-            world_size: 1,
-            data_parallel_size: u64::from(self.data_parallel_size),
-            kv_cache_size_tokens,
-            kv_cache_max_concurrency,
-        };
-        info!(
-            "local engine {} KV capacity: {kv_capacity:?} -> \
-             kv_cache_size_tokens={kv_cache_size_tokens:?} \
-             kv_cache_max_concurrency={kv_cache_max_concurrency:?}",
-            self.engine_index
-        );
-        input
-            .send(ZmqMessage::from(encode_msgpack(&ready)?))
-            .await
-            .context("failed to send local engine ready response")?;
-
-        let mut output = PushSocket::new();
-        output
-            .connect(&self.output_address)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to connect local engine output {}",
-                    self.output_address
-                )
-            })?;
-
-        let (output_tx, output_rx) = mpsc::unbounded_channel();
-        let mut child_tasks = tokio::task::JoinSet::new();
-        child_tasks.spawn(async move { ("output sender", output_loop(output, output_rx).await) });
-
-        // Republish the scheduler's load snapshots as stats-only output
-        // batches so the frontend's Prometheus gauges (scheduler_running,
-        // scheduler_waiting, kv_cache_usage) track the engine. The watch
-        // channel coalesces to at most one message per scheduler step, and the
-        // scheduler publishes a final drained snapshot before parking idle, so
-        // the gauges settle to zero instead of freezing at the last busy
-        // value. Engines without a load watch simply publish no stats.
-        if let Some(load_rx) = self.load_watch.clone() {
-            let engine_index = self.engine_index;
-            let stats_output_tx = output_tx.clone();
-            let stats_shutdown = shutdown.clone();
-            child_tasks.spawn(async move {
-                (
-                    "scheduler stats publisher",
-                    publish_scheduler_stats(engine_index, load_rx, stats_output_tx, stats_shutdown)
-                        .await,
-                )
-            });
-        }
+        let BridgeLink {
+            mut input,
+            output_tx,
+            mut child_tasks,
+        } = connect_link(
+            &self.input_address,
+            &self.output_address,
+            self.engine_index,
+            self.data_parallel_size,
+            self.max_model_len,
+            self.handle.kv_capacity(),
+            self.load_watch.clone(),
+            &shutdown,
+        )
+        .await?;
 
         // One shared channel carries every request's token events, tagged by
         // request id; this loop is the sole consumer. Per-request state lives
@@ -659,6 +586,22 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
     eos_token_id.or_else(|| stop_token_ids.first().copied())
 }
 
+/// vLLM `SchedulerStats` view of a load snapshot — what the frontend's
+/// Prometheus gauges (`scheduler_running`, `scheduler_waiting`,
+/// `kv_cache_usage`) and DP load balancer consume.
+pub(crate) fn scheduler_stats_from(snapshot: LoadSnapshot) -> SchedulerStats {
+    SchedulerStats {
+        num_running_reqs: snapshot.num_running_reqs,
+        num_waiting_reqs: snapshot.num_waiting_reqs,
+        kv_cache_usage: if snapshot.kv_total_blocks == 0 {
+            0.0
+        } else {
+            snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
+        },
+        ..SchedulerStats::default()
+    }
+}
+
 /// Forward every scheduler load snapshot as a stats-only output batch; the
 /// frontend records it into the shared Prometheus registry. Sends the current
 /// snapshot up front so the gauges initialize before the first step, then one
@@ -672,17 +615,7 @@ async fn publish_scheduler_stats(
     shutdown: CancellationToken,
 ) -> Result<()> {
     loop {
-        let snapshot = *load_rx.borrow_and_update();
-        let stats = SchedulerStats {
-            num_running_reqs: snapshot.num_running_reqs,
-            num_waiting_reqs: snapshot.num_waiting_reqs,
-            kv_cache_usage: if snapshot.kv_total_blocks == 0 {
-                0.0
-            } else {
-                snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
-            },
-            ..SchedulerStats::default()
-        };
+        let stats = scheduler_stats_from(*load_rx.borrow_and_update());
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),
@@ -699,6 +632,110 @@ async fn publish_scheduler_stats(
             }
         }
     }
+}
+
+/// The connected transport of one engine bridge: the vLLM EngineCore
+/// handshake done, the output pump running, the stats publisher attached.
+/// Shared by the legacy per-token bridge and the stepped bridge — everything
+/// north of the engine data plane is identical between them.
+struct BridgeLink {
+    input: DealerSocket,
+    output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
+    child_tasks: tokio::task::JoinSet<(&'static str, Result<()>)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_link(
+    input_address: &str,
+    output_address: &str,
+    engine_index: u32,
+    data_parallel_size: u32,
+    max_model_len: u32,
+    kv_capacity: Option<crate::engine::KvCapacity>,
+    load_watch: Option<watch::Receiver<LoadSnapshot>>,
+    shutdown: &CancellationToken,
+) -> Result<BridgeLink> {
+    wait_for_ipc_endpoint(input_address, shutdown).await?;
+    wait_for_ipc_endpoint(output_address, shutdown).await?;
+
+    let engine_id = EngineId::from_engine_index(engine_index);
+    let mut socket_options = SocketOptions::default();
+    socket_options.peer_identity(PeerIdentity::try_from(engine_id)?);
+
+    let mut input = DealerSocket::with_options(socket_options);
+    input
+        .connect(input_address)
+        .await
+        .with_context(|| format!("failed to connect local engine input {input_address}"))?;
+
+    let (num_gpu_blocks, block_size, kv_cache_size_tokens, kv_cache_max_concurrency) =
+        match kv_capacity {
+            Some(c) => {
+                // vLLM single-group concurrency: blocks / ceil(max_len / block_size).
+                let blocks_per_req = u64::from(max_model_len).div_ceil(c.block_size as u64);
+                (
+                    c.total_blocks as u64,
+                    c.block_size as u64,
+                    Some(c.total_tokens() as u64),
+                    Some(c.total_blocks as f64 / blocks_per_req as f64),
+                )
+            }
+            None => (0, 16, None, None),
+        };
+    let ready = EngineCoreReadyResponse {
+        max_model_len: u64::from(max_model_len),
+        num_gpu_blocks,
+        block_size,
+        dp_stats_address: None,
+        dtype: ModelDtype::BFloat16,
+        vllm_version: "pegainfer-local-bridge".to_string(),
+        world_size: 1,
+        data_parallel_size: u64::from(data_parallel_size),
+        kv_cache_size_tokens,
+        kv_cache_max_concurrency,
+    };
+    info!(
+        "local engine {engine_index} KV capacity: {kv_capacity:?} -> \
+         kv_cache_size_tokens={kv_cache_size_tokens:?} \
+         kv_cache_max_concurrency={kv_cache_max_concurrency:?}"
+    );
+    input
+        .send(ZmqMessage::from(encode_msgpack(&ready)?))
+        .await
+        .context("failed to send local engine ready response")?;
+
+    let mut output = PushSocket::new();
+    output
+        .connect(output_address)
+        .await
+        .with_context(|| format!("failed to connect local engine output {output_address}"))?;
+
+    let (output_tx, output_rx) = mpsc::unbounded_channel();
+    let mut child_tasks = tokio::task::JoinSet::new();
+    child_tasks.spawn(async move { ("output sender", output_loop(output, output_rx).await) });
+
+    // Legacy handle engines republish load snapshots as stats-only output
+    // batches: their scheduler loops park when idle, so the watch cadence is
+    // bounded. The stepped bridge passes no watch here — its driver busy-polls
+    // (every spin would become a message), so it reads the watch at send time
+    // and stamps stats onto the batches it already emits instead.
+    if let Some(load_rx) = load_watch {
+        let stats_output_tx = output_tx.clone();
+        let stats_shutdown = shutdown.clone();
+        child_tasks.spawn(async move {
+            (
+                "scheduler stats publisher",
+                publish_scheduler_stats(engine_index, load_rx, stats_output_tx, stats_shutdown)
+                    .await,
+            )
+        });
+    }
+
+    Ok(BridgeLink {
+        input,
+        output_tx,
+        child_tasks,
+    })
 }
 
 async fn output_loop(
@@ -844,6 +881,10 @@ async fn wait_for_ipc_endpoint(address: &str, shutdown: &CancellationToken) -> R
         }
     }
 }
+
+mod stepped;
+
+pub(crate) use stepped::SteppedEngineBridge;
 
 #[cfg(test)]
 mod tests;

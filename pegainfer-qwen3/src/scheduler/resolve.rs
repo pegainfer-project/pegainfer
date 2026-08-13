@@ -2,10 +2,10 @@ use pegainfer_frontend::engine::FinishReason;
 
 use super::ActiveRequestState;
 use super::PendingRequest;
+use super::effects::CachedTokensEffect;
 use super::effects::DecodeEffect;
 use super::effects::PendingEffect;
 use super::effects::PromptEchoEffect;
-use super::effects::ScheduledEffect;
 use super::effects::StepEffects;
 use super::plan::ExecutionArtifacts;
 use crate::executor::DecodeRequestResult;
@@ -13,40 +13,29 @@ use crate::executor::ModelExecutor;
 use crate::executor::PrefillRequestResult;
 use crate::speculative::VerifyRequestResult;
 
-pub(super) fn resolve_step(
+pub(crate) fn resolve_step(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
     artifacts: ExecutionArtifacts,
 ) -> StepEffects {
     match artifacts {
-        ExecutionArtifacts::Prefill {
-            pending,
-            result,
-            scheduled_at_unix_s,
-        } => resolve_prefill_outputs(executor, pending, result.requests, scheduled_at_unix_s),
+        ExecutionArtifacts::Prefill { pending, result } => {
+            resolve_prefill_outputs(executor, pending, result.requests)
+        }
         ExecutionArtifacts::Decode { result } => StepEffects {
-            scheduled: Vec::new(),
+            cached: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
         },
         ExecutionArtifacts::SpeculativeDecode { verify } => StepEffects {
-            scheduled: Vec::new(),
+            cached: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_speculative_outputs(executor, active, &verify.requests),
         },
-        ExecutionArtifacts::Unified {
-            pending,
-            result,
-            scheduled_at_unix_s,
-        } => {
-            let mut effects = resolve_prefill_outputs(
-                executor,
-                pending,
-                result.prefill_requests,
-                scheduled_at_unix_s,
-            );
+        ExecutionArtifacts::Unified { pending, result } => {
+            let mut effects = resolve_prefill_outputs(executor, pending, result.prefill_requests);
             effects.decode = resolve_decode_outputs(executor, active, &result.decode_requests);
             effects
         }
@@ -57,7 +46,7 @@ pub(super) fn resolve_step(
 /// commits 1..=K+1 tokens at once; we walk it in order so a stop token or the
 /// max-output budget truncates exactly where it lands (the executor already
 /// suppressed nothing — stop handling lives here, mirroring single-token decode).
-pub(super) fn resolve_speculative_outputs(
+pub(crate) fn resolve_speculative_outputs(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
     request_results: &[VerifyRequestResult],
@@ -79,7 +68,6 @@ pub(super) fn resolve_speculative_outputs(
                         request_id: result.request_id,
                         tokens: emitted,
                         finish_reason: FinishReason::Stop,
-                        completion_tokens,
                     };
                 }
                 emitted.push(token);
@@ -88,7 +76,6 @@ pub(super) fn resolve_speculative_outputs(
                         request_id: result.request_id,
                         tokens: emitted,
                         finish_reason: FinishReason::Length,
-                        completion_tokens,
                     };
                 }
             }
@@ -105,7 +92,6 @@ fn resolve_prefill_outputs(
     executor: &impl ModelExecutor,
     pending: Vec<PendingRequest>,
     request_results: Vec<PrefillRequestResult>,
-    scheduled_at_unix_s: f64,
 ) -> StepEffects {
     let mut effects = StepEffects::empty();
     for (mut req, result) in pending.into_iter().zip(request_results) {
@@ -113,17 +99,12 @@ fn resolve_prefill_outputs(
         // would deliver request A's tokens to request B, so fail loudly in
         // release builds too.
         assert_eq!(req.request_id, result.request_id);
-        let prompt_len = req.prompt_tokens.len();
 
-        // Fire Scheduled on the request's first chunk only: queue time ends
-        // when prompt work first reaches the GPU, and the prefix-cache hit
-        // count is determined there. Later chunks must not re-send the event.
+        // Report the prefix-cache hit count on the request's first chunk only
+        // — that is where it is determined. Later chunks must not re-report.
         if req.prefill_pos == 0 {
-            effects.scheduled.push(ScheduledEffect {
-                token_tx: req.token_tx.clone(),
-                queued_at_unix_s: req.queued_at_unix_s,
-                scheduled_at_unix_s,
-                prompt_tokens: prompt_len,
+            effects.cached.push(CachedTokensEffect {
+                request_id: req.request_id,
                 cached_tokens: result.cached_tokens,
             });
         }
@@ -137,7 +118,7 @@ fn resolve_prefill_outputs(
 
         if req.echo {
             effects.prompt_echoes.push(PromptEchoEffect {
-                token_tx: req.token_tx.clone(),
+                request_id: req.request_id,
                 ids: req.prompt_tokens.clone(),
                 logprobs: result
                     .prompt_logprobs
@@ -148,10 +129,7 @@ fn resolve_prefill_outputs(
         if !req.params.ignore_eos && executor.is_stop_token(result.first_token) {
             effects.pending.push(PendingEffect::Finish {
                 request_id: req.request_id,
-                token_tx: req.token_tx,
                 finish_reason: FinishReason::Stop,
-                prompt_tokens: prompt_len,
-                completion_tokens: 0,
             });
             continue;
         }
@@ -159,21 +137,18 @@ fn resolve_prefill_outputs(
         if req.max_tokens <= 1 {
             effects.pending.push(PendingEffect::EmitAndFinish {
                 request_id: req.request_id,
-                token_tx: req.token_tx,
                 token: result.first_token,
                 logprob: result.first_token_logprob,
                 finish_reason: FinishReason::Length,
-                prompt_tokens: prompt_len,
-                completion_tokens: 1,
             });
             continue;
         }
 
+        let prompt_len = req.prompt_tokens.len();
         effects.pending.push(PendingEffect::Promote {
             state: ActiveRequestState {
                 request_id: req.request_id,
                 lora_adapter: req.lora_adapter,
-                token_tx: req.token_tx,
                 last_token: result.first_token,
                 generated_count: 1,
                 max_tokens: req.max_tokens,
@@ -208,7 +183,6 @@ fn resolve_decode_outputs(
                 DecodeEffect::Finish {
                     request_id: result.request_id,
                     finish_reason: FinishReason::Stop,
-                    completion_tokens,
                 }
             } else if at_limit {
                 DecodeEffect::EmitAndFinish {
@@ -216,7 +190,6 @@ fn resolve_decode_outputs(
                     token: result.token,
                     logprob: result.logprob.clone(),
                     finish_reason: FinishReason::Length,
-                    completion_tokens,
                 }
             } else {
                 DecodeEffect::EmitAndContinue {

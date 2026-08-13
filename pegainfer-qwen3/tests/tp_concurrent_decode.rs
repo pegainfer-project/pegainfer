@@ -1,7 +1,8 @@
 //! TP=2 launch with CUDA Graph on — when rendering tools are available, startup
 //! dumps rank 0's pre-captured bs1 graph, then decode replays captured graphs
 //! under concurrent serving.
-//! The drain loop polls with a deadline so a deadlock fails instead of wedging the run.
+//! Worker threads fold each request stream; the main thread collects results
+//! against a deadline so a deadlock fails instead of wedging the run.
 
 use std::mem::ManuallyDrop;
 use std::path::Path;
@@ -10,9 +11,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
 use pegainfer_qwen3::DEFAULT_KV_PAGE_SIZE;
@@ -21,9 +20,10 @@ use pegainfer_qwen3::DecodeOverlap;
 use pegainfer_qwen3::Qwen3LaunchOptions;
 use pegainfer_qwen3::Qwen3MemoryOptions;
 use pegainfer_qwen3::Qwen3OffloadOptions;
-use tokio::sync::mpsc::error::TryRecvError;
 
 mod common;
+
+use common::harness::EngineHarness;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const REQUESTS: usize = 16;
@@ -100,13 +100,13 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: None,
-        enable_kv_events: false,
     };
-    // Dropping the handle joins the scheduler thread; on a panic the engine may be
-    // wedged and the join would hang, so panics leak it — only the happy path drops.
-    let handle = ManuallyDrop::new(
+    // Dropping the harness joins the scheduler thread; on a panic the engine may
+    // be wedged and the join would hang, so panics leak it — only the happy path
+    // drops.
+    let engine = ManuallyDrop::new(EngineHarness::new(
         pegainfer_qwen3::launch(Path::new(&model_path), options).expect("launch tp2 engine"),
-    );
+    ));
     if dump_enabled {
         let dump_dot = dump_png.with_extension("dot");
         assert!(dump_png.is_file(), "TP graph PNG was not exported");
@@ -118,63 +118,51 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
 
     let tokenizer = common::load_tokenizer(&model_path);
     // Submit all up front so they coexist in the engine and form real decode batches.
-    let receivers: Vec<_> = (0..REQUESTS)
+    let streams: Vec<_> = (0..REQUESTS)
         .map(|i| {
             let prompt = format!("Write a few sentences about topic {i}:");
             let prompt_tokens = tokenizer.encode(&prompt, false).expect("encode failed");
-            let (token_tx, rx) = TokenSink::standalone();
-            handle
-                .submit(GenerateRequest {
-                    trace_parent: None,
-                    request_id: None,
-                    queued_at_unix_s: None,
-                    data_parallel_rank: None,
-                    prompt_tokens,
-                    params: SamplingParams::default(),
-                    max_tokens: 24 + (i % 4) * 24,
-                    lora_adapter: None,
-                    kv_transfer_params: None,
-                    token_tx,
-                    logprobs: 0,
-                    echo: false,
-                })
-                .expect("submit failed");
-            rx
+            engine.submit(common::harness::request(
+                prompt_tokens,
+                SamplingParams::default(),
+                24 + (i % 4) * 24,
+            ))
         })
         .collect();
 
+    // Fold every stream on its own thread; the main thread enforces the
+    // deadline so a wedged engine surfaces as a timeout, not a hang.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let workers: Vec<_> = streams
+        .into_iter()
+        .enumerate()
+        .map(|(i, stream)| {
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                let _ = done_tx.send((i, stream.outcome()));
+            })
+        })
+        .collect();
+    drop(done_tx);
+
     let deadline = Instant::now() + Duration::from_secs(DEADLINE_SECS);
-    for (i, mut rx) in receivers.into_iter().enumerate() {
-        let mut tokens = 0usize;
-        loop {
-            match rx.try_recv() {
-                Ok((_, TokenEvent::Token { .. })) => tokens += 1,
-                Ok((
-                    _,
-                    TokenEvent::Scheduled { .. }
-                    | TokenEvent::PromptTokens { .. }
-                    | TokenEvent::KvTransfer { .. },
-                )) => {}
-                Ok((_, TokenEvent::Finished { .. })) => break,
-                Ok((_, TokenEvent::Error { message, .. })) => {
-                    panic!("request {i} failed: {message}")
-                }
-                Ok((_, TokenEvent::Rejected { message, .. })) => {
-                    panic!("request {i} rejected: {message}")
-                }
-                Err(TryRecvError::Empty) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "request {i}: no progress within {DEADLINE_SECS}s, engine deadlocked"
-                    );
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(TryRecvError::Disconnected) => {
-                    panic!("request {i}: channel closed without Finished")
-                }
-            }
+    for _ in 0..REQUESTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok((i, outcome)) = done_rx.recv_timeout(remaining) else {
+            panic!("no request completed within {DEADLINE_SECS}s, engine deadlocked");
+        };
+        match outcome.terminal {
+            Terminal::Finished { .. } => {}
+            Terminal::Rejected { reason, .. } => panic!("request {i} rejected: {reason}"),
+            Terminal::Failed { message, .. } => panic!("request {i} failed: {message}"),
         }
-        assert!(tokens > 0, "request {i} finished with zero decoded tokens");
+        assert!(
+            !outcome.tokens.is_empty(),
+            "request {i} finished with zero decoded tokens"
+        );
     }
-    drop(ManuallyDrop::into_inner(handle));
+    for worker in workers {
+        worker.join().expect("stream worker panicked");
+    }
+    drop(ManuallyDrop::into_inner(engine));
 }

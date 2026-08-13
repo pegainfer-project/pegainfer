@@ -22,7 +22,7 @@ use vllm_server::HttpListenerMode;
 use vllm_server::ParserSelection;
 use vllm_server::RendererSelection;
 
-use crate::engine::EngineHandle;
+use crate::engine::LaunchedEngine;
 
 mod bridge;
 mod lora;
@@ -60,7 +60,7 @@ impl ModelLenConfig {
 /// `model_path/config.json`; pass `Some(n)` when the path has no config
 /// (e.g. a HuggingFace model id for the sim frontend).
 pub async fn serve(
-    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
+    engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
     served_model_name: Vec<String>,
     port: u16,
@@ -84,7 +84,7 @@ pub async fn serve(
 /// partition; ordinary model lines call [`serve`] and get the single-engine
 /// case.
 pub async fn serve_with_engine_count(
-    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
+    engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
     served_model_name: Vec<String>,
     port: u16,
@@ -108,7 +108,7 @@ pub async fn serve_with_engine_count(
 /// Serve an endpoint that requires `max_tokens=1`.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_prefill_only_with_engine_count(
-    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
+    engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
     served_model_name: Vec<String>,
     port: u16,
@@ -131,7 +131,7 @@ pub async fn serve_prefill_only_with_engine_count(
 }
 
 pub async fn serve_model_with_lora_routes(
-    handle: EngineHandle,
+    engine: crate::engine::Engine,
     model_id: impl Into<String>,
     served_model_name: Vec<String>,
     lora_modules: Vec<LoraModule>,
@@ -141,13 +141,19 @@ pub async fn serve_model_with_lora_routes(
 ) -> Result<()> {
     let model_id = model_id.into();
     let adapter_names = Arc::new(RwLock::new(HashSet::new()));
-    load_startup_lora_modules(&handle, &adapter_names, &lora_modules).await?;
+    // The Option is the capability: only engines that minted a LoRA channel
+    // can serve these routes.
+    let control = engine
+        .lora
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("engine does not expose LoRA adapter control"))?;
+    load_startup_lora_modules(&control, &adapter_names, &lora_modules).await?;
     let base_model_name = served_model_name
         .first()
         .cloned()
         .unwrap_or_else(|| model_id.clone());
     serve_model_on_host_with_router_extension(
-        std::future::ready(Ok(handle.clone())),
+        std::future::ready(Ok(LaunchedEngine::Stepped(engine))),
         model_id,
         served_model_name.clone(),
         "0.0.0.0".to_string(),
@@ -156,7 +162,7 @@ pub async fn serve_model_with_lora_routes(
         1,
         shutdown,
         move |router| {
-            let lora_router = lora_routes(handle.clone(), Arc::clone(&adapter_names));
+            let lora_router = lora_routes(control, Arc::clone(&adapter_names));
             let openai_router = lora_openai_routes(
                 router.clone(),
                 base_model_name,
@@ -170,7 +176,7 @@ pub async fn serve_model_with_lora_routes(
 }
 
 async fn serve_model_on_host(
-    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
+    engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_id: String,
     served_model_name: Vec<String>,
     host: String,
@@ -194,7 +200,7 @@ async fn serve_model_on_host(
 }
 
 async fn serve_model_on_host_with_router_extension<F>(
-    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
+    engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_id: String,
     served_model_name: Vec<String>,
     host: String,
@@ -228,38 +234,72 @@ where
         let input_address = input_address.clone();
         let output_address = output_address.clone();
         async move {
-            let handle = match engine.await {
-                Ok(handle) => handle,
+            let launched = match engine.await {
+                Ok(launched) => launched,
                 Err(error) => {
                     server_shutdown.cancel();
                     return Err(error);
                 }
             };
-            let actual_partitions = handle.scheduler_partition_count();
-            if actual_partitions != engine_count {
-                server_shutdown.cancel();
-                anyhow::bail!(
-                    "frontend declared {engine_count} engines but the resolved handle exposes \
-                     {actual_partitions} scheduler partitions"
-                );
-            }
-            let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
-            let max_model_len = servable_limit.unwrap_or(max_model_len);
             let mut bridges = tokio::task::JoinSet::new();
-            for engine_index in 0..engine_count {
-                let bridge = LocalEngineBridge {
-                    input_address: input_address.clone(),
-                    output_address: output_address.clone(),
-                    handle: handle.clone(),
-                    max_model_len,
-                    engine_index: engine_index as u32,
-                    data_parallel_size,
-                    load_watch: handle.load_watch_for(engine_index),
-                };
-                let shutdown = bridge_shutdown.clone();
-                bridges.spawn(async move { (engine_index, bridge.run(shutdown).await) });
+            // Stepped engines own their scheduler threads; reaped below after
+            // the bridges (and with them the scheduler handles) are gone.
+            let mut scheduler_joins: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            match launched {
+                LaunchedEngine::Handle(handle) => {
+                    let actual_partitions = handle.scheduler_partition_count();
+                    if actual_partitions != engine_count {
+                        server_shutdown.cancel();
+                        anyhow::bail!(
+                            "frontend declared {engine_count} engines but the resolved handle \
+                             exposes {actual_partitions} scheduler partitions"
+                        );
+                    }
+                    let servable_limit = handle.servable_len().map(|cap| max_model_len.min(cap));
+                    let max_model_len = servable_limit.unwrap_or(max_model_len);
+                    for engine_index in 0..engine_count {
+                        let bridge = LocalEngineBridge {
+                            input_address: input_address.clone(),
+                            output_address: output_address.clone(),
+                            handle: handle.clone(),
+                            max_model_len,
+                            engine_index: engine_index as u32,
+                            data_parallel_size,
+                            load_watch: handle.load_watch_for(engine_index),
+                        };
+                        let shutdown = bridge_shutdown.clone();
+                        bridges.spawn(async move { (engine_index, bridge.run(shutdown).await) });
+                    }
+                    drop(handle);
+                }
+                LaunchedEngine::Stepped(engine) => {
+                    let actual_schedulers = engine.schedulers.len();
+                    if actual_schedulers != engine_count {
+                        server_shutdown.cancel();
+                        anyhow::bail!(
+                            "frontend declared {engine_count} engines but the launched engine \
+                             exposes {actual_schedulers} schedulers"
+                        );
+                    }
+                    let info = engine.info;
+                    let servable_limit = info.servable_len.map(|cap| max_model_len.min(cap));
+                    let max_model_len = servable_limit.unwrap_or(max_model_len);
+                    for (engine_index, scheduler) in engine.schedulers.into_iter().enumerate() {
+                        scheduler_joins.push(scheduler.join);
+                        let bridge = bridge::SteppedEngineBridge {
+                            input_address: input_address.clone(),
+                            output_address: output_address.clone(),
+                            scheduler: scheduler.handle,
+                            kv_capacity: info.kv_capacity,
+                            max_model_len,
+                            engine_index: engine_index as u32,
+                            data_parallel_size,
+                        };
+                        let shutdown = bridge_shutdown.clone();
+                        bridges.spawn(async move { (engine_index, bridge.run(shutdown).await) });
+                    }
+                }
             }
-            drop(handle);
 
             let mut bridge_error = None;
             while let Some(joined) = bridges.join_next().await {
@@ -286,14 +326,29 @@ where
                     }
                 }
             }
-            if let Some(error) = bridge_error {
+            if bridge_error.is_some() {
                 server_shutdown.cancel();
                 bridge_shutdown.cancel();
                 bridges.abort_all();
                 while bridges.join_next().await.is_some() {}
-                return Err(error);
             }
-            Ok(())
+            // The bridges are gone, and with them the partition handles:
+            // intake channels are disconnected, so the drivers drain and
+            // exit. Reap their threads to surface scheduler panics.
+            if !scheduler_joins.is_empty() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    for join in scheduler_joins {
+                        if join.join().is_err() {
+                            warn!("scheduler thread panicked during shutdown");
+                        }
+                    }
+                })
+                .await;
+            }
+            match bridge_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
     });
 

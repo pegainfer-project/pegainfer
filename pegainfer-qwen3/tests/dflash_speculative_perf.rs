@@ -20,10 +20,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
-use pegainfer_frontend::engine::EngineHandle;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
 use pegainfer_qwen3::DEFAULT_KV_PAGE_SIZE;
@@ -34,6 +31,9 @@ use pegainfer_qwen3::Qwen3MemoryOptions;
 use pegainfer_qwen3::Qwen3OffloadOptions;
 
 mod common;
+
+use common::harness::EngineHarness;
+use common::harness::request;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B-DFlash-b16");
@@ -79,59 +79,46 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: draft,
-        enable_kv_events: false,
     }
 }
 
 /// Generate `GENERATED_TOKENS` greedily and return (token_count, elapsed).
-fn timed_generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (usize, Duration) {
-    let (token_tx, mut rx) = TokenSink::standalone();
+/// Counts tokens per stream update — speculative decoding commits multi-token
+/// spans, so one update may carry several.
+fn timed_generate(engine: &EngineHarness, prompt_tokens: Vec<u32>) -> (usize, Duration) {
     let start = Instant::now();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params: SamplingParams {
-                ignore_eos: true,
-                ..SamplingParams::default()
-            },
-            max_tokens: GENERATED_TOKENS,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
+    let mut stream = engine.submit(request(
+        prompt_tokens,
+        SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        },
+        GENERATED_TOKENS,
+    ));
 
     let mut count = 0usize;
     loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { .. }) => count += 1,
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { .. }) => return (count, start.elapsed()),
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
+        let update = stream
+            .recv()
+            .expect("engine closed the stream without a terminal");
+        count += update.tokens.len();
+        match update.terminal {
+            Some(Terminal::Finished { .. }) => return (count, start.elapsed()),
+            Some(Terminal::Failed { message, .. }) => panic!("generation failed: {message}"),
+            Some(Terminal::Rejected { reason, .. }) => panic!("generation rejected: {reason}"),
+            None => {}
         }
     }
 }
 
 /// Decode tok/s averaged over the prompts (one warm-up run discarded).
-fn measure(handle: &EngineHandle, prompts: &[Vec<u32>]) -> f64 {
+fn measure(engine: &EngineHarness, prompts: &[Vec<u32>]) -> f64 {
     // Warm up CUDA-graph capture / allocator on the first prompt.
-    let _ = timed_generate(handle, prompts[0].clone());
+    let _ = timed_generate(engine, prompts[0].clone());
     let mut tokens = 0usize;
     let mut elapsed = Duration::ZERO;
     for p in prompts {
-        let (n, dt) = timed_generate(handle, p.clone());
+        let (n, dt) = timed_generate(engine, p.clone());
         tokens += n;
         elapsed += dt;
     }
@@ -158,21 +145,25 @@ fn dflash_speculative_single_stream_speedup() {
     .collect();
 
     let baseline_tps = {
-        let handle = pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
-            .expect("baseline engine");
-        let tps = measure(&handle, &prompts);
-        drop(handle);
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("baseline engine"),
+        );
+        let tps = measure(&engine, &prompts);
+        drop(engine);
         std::thread::sleep(Duration::from_secs(2));
         tps
     };
 
     let spec_tps = {
-        let handle = pegainfer_qwen3::launch(
-            Path::new(&model_path),
-            launch_options(Some(PathBuf::from(&draft_path))),
-        )
-        .expect("speculative engine");
-        measure(&handle, &prompts)
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(
+                Path::new(&model_path),
+                launch_options(Some(PathBuf::from(&draft_path))),
+            )
+            .expect("speculative engine"),
+        );
+        measure(&engine, &prompts)
     };
 
     let speedup = spec_tps / baseline_tps;

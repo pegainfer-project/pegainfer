@@ -40,10 +40,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pegainfer_frontend::engine::EngineHandle;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
 use pegainfer_qwen3::DEFAULT_KV_PAGE_SIZE;
@@ -57,6 +53,9 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 mod common;
+
+use common::harness::EngineHarness;
+use common::harness::request;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B-DFlash-b16");
@@ -158,7 +157,6 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: draft,
-        enable_kv_events: false,
     }
 }
 
@@ -180,56 +178,22 @@ fn sampling(cfg: (f32, i32, f32, f32)) -> SamplingParams {
 /// arms are supposed to be equivalent under — and the two arms see the same
 /// wave sizes so batch-composition numerics cancel out of the comparison.
 fn sample_wave(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     prompt_tokens: &[u32],
     params: &SamplingParams,
     n: usize,
 ) -> Vec<Vec<u32>> {
-    let receivers: Vec<_> = (0..n)
-        .map(|_| {
-            let (token_tx, rx) = TokenSink::standalone();
-            handle
-                .submit(GenerateRequest {
-                    trace_parent: None,
-                    request_id: None,
-                    queued_at_unix_s: None,
-                    data_parallel_rank: None,
-                    prompt_tokens: prompt_tokens.to_vec(),
-                    params: *params,
-                    max_tokens: POSITIONS,
-                    lora_adapter: None,
-                    kv_transfer_params: None,
-                    token_tx,
-                    logprobs: 0,
-                    echo: false,
-                })
-                .expect("submit failed");
-            rx
-        })
+    // Submit all up front so they coexist in the engine and form real batches.
+    let streams: Vec<_> = (0..n)
+        .map(|_| engine.submit(request(prompt_tokens.to_vec(), *params, POSITIONS)))
         .collect();
 
-    receivers
+    // Fold each stream to its terminal (updates are buffered per request, so
+    // the fold order doesn't matter — they all ran concurrently).
+    streams
         .into_iter()
-        .map(|mut rx| {
-            let mut tokens = Vec::with_capacity(POSITIONS);
-            loop {
-                match rx.blocking_recv().map(|(_, event)| event) {
-                    Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-                    Some(
-                        TokenEvent::Scheduled { .. }
-                        | TokenEvent::PromptTokens { .. }
-                        | TokenEvent::KvTransfer { .. },
-                    ) => {}
-                    Some(TokenEvent::Finished { .. }) => break,
-                    Some(TokenEvent::Error { message, .. }) => {
-                        panic!("generation failed: {message}")
-                    }
-                    Some(TokenEvent::Rejected { message, .. }) => {
-                        panic!("generation rejected: {message}")
-                    }
-                    None => panic!("scheduler channel closed without Finished"),
-                }
-            }
+        .map(|stream| {
+            let tokens = stream.expect_finished().tokens;
             assert_eq!(
                 tokens.len(),
                 POSITIONS,
@@ -243,7 +207,7 @@ fn sample_wave(
 /// `runs` independent generations for every (config, prompt), in waves of
 /// `batch`. Indexed `[config][prompt][run][position]`.
 fn collect_arm(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     encoded: &[Vec<u32>],
     runs: usize,
     batch: usize,
@@ -258,7 +222,7 @@ fn collect_arm(
                     let mut rows = Vec::with_capacity(runs);
                     while rows.len() < runs {
                         let n = batch.min(runs - rows.len());
-                        rows.extend(sample_wave(handle, prompt_tokens, &params, n));
+                        rows.extend(sample_wave(engine, prompt_tokens, &params, n));
                     }
                     rows
                 })
@@ -475,23 +439,27 @@ fn dflash_sampled_equivalence_gate() {
 
     // Arm A: plain decode (no draft model loaded — the spec path cannot run).
     let spec_off = {
-        let handle = pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
-            .expect("failed to start spec-off engine");
-        let arm = collect_arm(&handle, &encoded, runs, batch);
-        drop(handle);
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start spec-off engine"),
+        );
+        let arm = collect_arm(&engine, &encoded, runs, batch);
+        drop(engine);
         std::thread::sleep(Duration::from_secs(2));
         arm
     };
 
     // Arm B: DFlash speculative engine; sampled requests ride chain rejection.
     let spec_on = {
-        let handle = pegainfer_qwen3::launch(
-            Path::new(&model_path),
-            launch_options(Some(PathBuf::from(&draft_path))),
-        )
-        .expect("failed to start speculative engine");
-        let arm = collect_arm(&handle, &encoded, runs, batch);
-        drop(handle);
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(
+                Path::new(&model_path),
+                launch_options(Some(PathBuf::from(&draft_path))),
+            )
+            .expect("failed to start speculative engine"),
+        );
+        let arm = collect_arm(&engine, &encoded, runs, batch);
+        drop(engine);
         arm
     };
 
@@ -521,14 +489,16 @@ fn dflash_sampled_equivalence_null_check() {
         .map(|p| tokenizer.encode(p, false).expect("encode failed"))
         .collect();
 
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
-    )
-    .expect("failed to start speculative engine");
-    let first = collect_arm(&handle, &encoded, runs, batch);
-    let second = collect_arm(&handle, &encoded, runs, batch);
-    drop(handle);
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
+    let first = collect_arm(&engine, &encoded, runs, batch);
+    let second = collect_arm(&engine, &encoded, runs, batch);
+    drop(engine);
 
     let cells = compare_arms(&first, &second);
     assert_equivalent(&cells, "null check spec-on vs spec-on");
@@ -547,11 +517,13 @@ fn dflash_sampled_seeded_determinism() {
         return;
     };
     let tokenizer = common::load_tokenizer(&model_path);
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
-    )
-    .expect("failed to start speculative engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
 
     for (i, prompt) in PROMPTS.iter().enumerate() {
         let tokens = tokenizer.encode(prompt, false).expect("encode failed");
@@ -559,14 +531,14 @@ fn dflash_sampled_seeded_determinism() {
             seed: Some(0x00C0_FFEE + i as u64),
             ..sampling(CONFIGS[0])
         };
-        let first = sample_wave(&handle, &tokens, &params, 1);
-        let second = sample_wave(&handle, &tokens, &params, 1);
+        let first = sample_wave(&engine, &tokens, &params, 1);
+        let second = sample_wave(&engine, &tokens, &params, 1);
         assert_eq!(
             first, second,
             "prompt {i}: a seeded spec-on request must replay byte-identically"
         );
     }
-    drop(handle);
+    drop(engine);
 }
 
 /// The statistical machinery must *detect* a real shift: a synthetic sampler

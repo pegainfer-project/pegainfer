@@ -3,19 +3,18 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::LoadLoraAdapterRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::lora_fixtures as fixtures;
 use serde::Deserialize;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
+
+use common::harness::EngineHarness;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
@@ -73,11 +72,12 @@ fn write_zero_lora_adapter(path: &Path, config: &ModelConfig, rank: usize) {
     fixtures::write_adapter_tensors(path, tensors);
 }
 
-fn load_adapter(handle: &EngineHandle, adapter_name: &str, adapter_path: PathBuf) {
+fn load_adapter(engine: &EngineHarness, adapter_name: &str, adapter_path: PathBuf) {
+    let control = engine.lora_client();
     tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build runtime")
-        .block_on(handle.load_lora_adapter(LoadLoraAdapterRequest {
+        .block_on(control.load(LoadLoraAdapterRequest {
             lora_name: adapter_name.to_string(),
             lora_path: adapter_path,
             load_inplace: false,
@@ -86,47 +86,22 @@ fn load_adapter(handle: &EngineHandle, adapter_name: &str, adapter_path: PathBuf
 }
 
 fn generate_tokens(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
     lora_adapter: Option<String>,
 ) -> (Vec<u32>, FinishReason) {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-    let (token_tx, mut token_rx) = TokenSink::standalone();
+    let mut request =
+        common::harness::request(prompt_tokens, SamplingParams::default(), max_tokens);
+    request.lora_adapter = lora_adapter;
 
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params: SamplingParams::default(),
-            max_tokens,
-            lora_adapter,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    let mut tokens = Vec::new();
-    loop {
-        match token_rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(
-                TokenEvent::PromptTokens { .. }
-                | TokenEvent::Scheduled { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { finish_reason, .. }) => return (tokens, finish_reason),
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
-        }
-    }
+    let outcome = engine.submit(request).expect_finished();
+    let Terminal::Finished { reason, .. } = outcome.terminal else {
+        unreachable!("expect_finished returned a non-Finished terminal");
+    };
+    (outcome.tokens, reason)
 }
 
 #[test]
@@ -152,30 +127,31 @@ fn qwen3_lora_loads_rank_and_generates(rank: usize, adapter_name: &str) {
     let adapter_dir = tempfile::tempdir().expect("create temp adapter dir");
     write_zero_lora_adapter(adapter_dir.path(), &config, rank);
 
-    let handle = pegainfer_qwen3::start_engine_with_lora_control(
-        Path::new(&model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: false,
-            device_ordinals: vec![get_device_ordinal()],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        pegainfer_qwen3::Qwen3LoraOptions::default(),
-        pegainfer_qwen3::Qwen3OffloadOptions::disabled(),
-        false,
-        pegainfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS,
-        pegainfer_qwen3::Qwen3MemoryOptions::default(),
-        pegainfer_qwen3::DecodeOverlap::Off,
-        false,
-    )
-    .expect("start LoRA-capable Qwen3 engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::start_engine_with_lora_control(
+            Path::new(&model_path),
+            EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![get_device_ordinal()],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+            pegainfer_qwen3::Qwen3LoraOptions::default(),
+            pegainfer_qwen3::Qwen3OffloadOptions::disabled(),
+            false,
+            pegainfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS,
+            pegainfer_qwen3::Qwen3MemoryOptions::default(),
+            pegainfer_qwen3::DecodeOverlap::Off,
+            false,
+        )
+        .expect("start LoRA-capable Qwen3 engine"),
+    );
 
-    assert!(handle.supports_lora_control());
-    load_adapter(&handle, adapter_name, adapter_dir.path().to_path_buf());
+    load_adapter(&engine, adapter_name, adapter_dir.path().to_path_buf());
 
     let tokenizer = common::load_tokenizer(&model_path);
     let (tokens, finish_reason) = generate_tokens(
-        &handle,
+        &engine,
         &tokenizer,
         "Hello",
         4,

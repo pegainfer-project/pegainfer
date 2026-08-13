@@ -9,7 +9,7 @@ use anyhow::Context;
 use clap::FromArgMatches;
 use log::info;
 use pegainfer_core::logging;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::DetectError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
@@ -165,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     // Engine load (weights → GPU) runs on a blocking thread so the HTTP
     // frontend (tokenizer, chat templates) loads concurrently. The frontend
     // binds only after the engine registers, so readiness is unchanged.
-    let engine_load = tokio::task::spawn_blocking(move || -> anyhow::Result<EngineHandle> {
+    let engine_load = tokio::task::spawn_blocking(move || -> anyhow::Result<LaunchedEngine> {
         let ctx = LaunchContext {
             model_path: &shared.model_path,
             config: &config,
@@ -177,16 +177,19 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let serve_result = if let Some(lora_modules) = plan.lora_modules {
-        // LoRA routes need the engine handle when the router is built, so this
-        // path stays sequential.
-        let handle = engine_load
+        // LoRA routes need the engine's control plane when the router is
+        // built, so this path stays sequential.
+        let launched = engine_load
             .await
             .context("engine loader thread panicked")??;
+        let LaunchedEngine::Stepped(engine) = launched else {
+            anyhow::bail!("LoRA serving requires a step-driven engine");
+        };
         info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
         let max_model_len =
             pegainfer_frontend::vllm::load_max_model_len(&model_path).unwrap_or(4096);
         pegainfer_frontend::vllm::serve_model_with_lora_routes(
-            handle,
+            engine,
             model_path.to_string_lossy().into_owned(),
             served_model_name.into_iter().collect(),
             lora_modules,

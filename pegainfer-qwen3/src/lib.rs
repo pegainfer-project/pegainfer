@@ -7,6 +7,7 @@ mod dflash;
 mod dspark;
 mod eagle3;
 mod executor;
+mod frontend_adapter;
 pub(crate) mod green_ctx;
 pub mod kernel_bench;
 mod lora;
@@ -28,7 +29,7 @@ use anyhow::Result;
 pub(crate) use config::probe_config_json;
 use log::info;
 use log::warn;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
@@ -246,10 +247,6 @@ pub struct Qwen3LaunchOptions {
     /// `Some` enables DFlash speculative decoding with this drafter model.
     /// Single-GPU only and mutually exclusive with LoRA and KV offload.
     pub dflash_draft_model_path: Option<PathBuf>,
-    /// Publish KV block store/remove events for an out-of-band cache-aware
-    /// router (e.g. a Dynamo KV router). Off for plain single-machine serving;
-    /// single-GPU + base-model only (rejected with LoRA or tensor parallel).
-    pub enable_kv_events: bool,
 }
 
 /// Start the Qwen3 engine from server-facing [`Qwen3LaunchOptions`].
@@ -257,7 +254,7 @@ pub struct Qwen3LaunchOptions {
     clippy::needless_pass_by_value,
     reason = "launch is a one-shot ownership boundary used by external worker threads"
 )]
-pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHandle> {
+pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<Engine> {
     let device_ordinals = if options.tp_size == 1 {
         vec![options.device_ordinal]
     } else {
@@ -315,9 +312,6 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
          (--decode-overlap): the speculative path never takes the unified overlap \
          route, so the overlap streams would only waste VRAM the drafter needs"
     );
-    if options.enable_kv_events && options.lora.is_some() {
-        anyhow::bail!("KV block events are not supported with LoRA serving");
-    }
     match options.lora {
         Some(lora) => {
             info!(
@@ -346,13 +340,12 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.decode_overlap,
             options.batch_invariant,
             options.dflash_draft_model_path.as_deref(),
-            options.enable_kv_events,
             options.dump_graph_png.as_deref(),
         ),
     }
 }
 
-pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
+pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Engine> {
     start_engine_with_offload(
         model_path,
         options,
@@ -363,7 +356,6 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         DecodeOverlap::Off,
         false,
         None,
-        false,
     )
 }
 
@@ -390,8 +382,7 @@ pub fn start_engine_with_offload(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
     dflash_draft_model_path: Option<&Path>,
-    enable_kv_events: bool,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     start_engine_with_offload_inner(
         model_path,
         options,
@@ -402,7 +393,6 @@ pub fn start_engine_with_offload(
         decode_overlap,
         batch_invariant,
         dflash_draft_model_path,
-        enable_kv_events,
         None,
     )
 }
@@ -418,9 +408,8 @@ fn start_engine_with_offload_inner(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
     dflash_draft_model_path: Option<&Path>,
-    enable_kv_events: bool,
     dump_graph_png: Option<&Path>,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
@@ -446,7 +435,7 @@ fn start_engine_with_offload_inner(
                 .ok_or_else(|| anyhow::anyhow!("DFlash draft model path must be valid UTF-8"))
         })
         .transpose()?;
-    scheduler::start_qwen3(
+    frontend_adapter::start_qwen3(
         model_path,
         enable_cuda_graph,
         &device_ordinals,
@@ -457,7 +446,6 @@ fn start_engine_with_offload_inner(
         memory_options,
         decode_overlap,
         dflash_draft_model_path,
-        enable_kv_events,
         dump_graph_png,
     )
 }
@@ -472,7 +460,7 @@ pub fn start_engine_with_lora_control(
     memory_options: Qwen3MemoryOptions,
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
@@ -494,7 +482,7 @@ pub fn start_engine_with_lora_control(
         "LoRA serving does not support --decode-overlap"
     );
     apply_batch_invariant_policy(batch_invariant);
-    scheduler::start_qwen3_with_lora_control(
+    frontend_adapter::start_qwen3_with_lora_control(
         model_path,
         enable_cuda_graph,
         &device_ordinals,

@@ -2,8 +2,8 @@
 
 use clap::Args as ClapArgs;
 use clap::FromArgMatches;
-use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EpBackend;
+use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
 
@@ -73,7 +73,7 @@ impl ModelLine for KimiK2Line {
         &["tp_size", "dp_size", "cuda_graph"]
     }
 
-    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle> {
+    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         let cli =
             KimiCli::from_arg_matches(ctx.matches).expect("KimiCli parses from the merged command");
         crate::launch(
@@ -85,6 +85,7 @@ impl ModelLine for KimiK2Line {
                 cuda_graph: ctx.shared.cuda_graph,
             },
         )
+        .map(LaunchedEngine::Handle)
     }
 }
 
