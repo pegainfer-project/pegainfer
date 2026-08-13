@@ -1,8 +1,7 @@
 //! Kimi-K3 batched-decode MoE expert chain: the step-time kernels around the
 //! FP8xFP4 masked grouped GEMM (see [`super::deepgemm`]).
 //!
-//! Single-rank shape (all routed experts local; the EP all-to-all is a later
-//! stage). Per MoE layer:
+//! Per MoE layer, single-rank shape (all routed experts local):
 //!
 //! 1. [`k3_moe_local_route_metadata_launch`] — per-expert row counts plus the
 //!    expanded-entry -> masked-slot map.
@@ -19,13 +18,26 @@
 //! `token * topk + slot`, and that order is the deterministic order the whole
 //! chain uses: it fixes which masked row an entry lands in, and it fixes the
 //! combine's accumulation order (f32, no atomics, one bf16 round), so replays
-//! are bit-reproducible. Entries whose `topk_idx` falls outside `[0, groups)`
-//! are inactive — that is how padded batch rows, and later an EP shard's
-//! non-local experts, are excluded. Every consumer re-reads `topk_idx` and
-//! skips inactive entries, so a stale slot map is never silently consumed.
+//! are bit-reproducible. `topk_idx` carries GLOBAL expert ids; an entry is
+//! active for a rank exactly when `topk_idx - local_expert_base` falls in
+//! `[0, groups)` — that is how padded batch rows and an EP shard's non-local
+//! experts are excluded, and a single-rank chain is the `local_expert_base = 0`
+//! case of it. Every consumer re-reads `topk_idx` and skips inactive entries,
+//! so a stale slot map is never silently consumed.
+//!
+//! Under expert parallelism the same seven steps run over the GLOBAL batch,
+//! with three extra kernels around them:
+//! [`k3_moe_ep_pack_dispatch_launch`] (this rank's allgather contribution, with
+//! padding rows constructively determined), then in place of step 6's combine
+//! [`k3_moe_entry_scatter_launch`] (masked rows -> entry-major staging, dense
+//! full cover), a sum all-reduce over that staging buffer, and
+//! [`k3_moe_entry_combine_launch`]. Every global entry is owned by exactly one
+//! rank, so the reduction only ever adds a value to zeros and is exact.
 //!
 //! Nothing here allocates, reads back to the host, or varies its launch
-//! geometry with device state, so the chain is CUDA-graph capturable.
+//! geometry with device state, so the chain is CUDA-graph capturable. (The EP
+//! chain is not captured, because the collectives between these kernels are
+//! not.)
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -93,6 +105,24 @@ pub fn k3_moe_local_route_metadata_launch(
     masked_m: &mut CudaSlice<i32>,
     slot_map: &mut CudaSlice<i32>,
 ) -> Result<()> {
+    k3_moe_windowed_route_metadata_launch(ctx, shape, 0, topk_idx, masked_m, slot_map)
+}
+
+/// [`k3_moe_local_route_metadata_launch`] over one EP rank's expert window:
+/// `topk_idx` carries global expert ids and an entry is active exactly when
+/// `topk_idx - local_expert_base` lands in `[0, shape.groups)`.
+///
+/// Windowing changes which entries an expert claims, never the order it claims
+/// them in — the compaction still walks entry order over the same per-expert
+/// entry set — so an entry lands in the same masked row either way.
+pub fn k3_moe_windowed_route_metadata_launch(
+    ctx: &DeviceContext,
+    shape: K3MoeRouteShape,
+    local_expert_base: usize,
+    topk_idx: &CudaSlice<i32>,
+    masked_m: &mut CudaSlice<i32>,
+    slot_map: &mut CudaSlice<i32>,
+) -> Result<()> {
     shape.validate()?;
     ensure!(
         topk_idx.len() >= shape.entries()
@@ -115,6 +145,7 @@ pub fn k3_moe_local_route_metadata_launch(
             shape.topk as i32,
             shape.groups as i32,
             shape.masked_cap as i32,
+            i32::try_from(local_expert_base)?,
             ctx.stream.cu_stream(),
         )
     };
@@ -133,6 +164,25 @@ pub fn k3_moe_gather_fp8_quant_masked_launch(
     ctx: &DeviceContext,
     shape: K3MoeRouteShape,
     hidden: usize,
+    latent: &CudaSlice<bf16>,
+    topk_idx: &CudaSlice<i32>,
+    slot_map: &CudaSlice<i32>,
+    output: &mut CudaSlice<u8>,
+    scales: &mut CudaSlice<f32>,
+) -> Result<()> {
+    k3_moe_windowed_gather_fp8_quant_masked_launch(
+        ctx, shape, hidden, 0, latent, topk_idx, slot_map, output, scales,
+    )
+}
+
+/// [`k3_moe_gather_fp8_quant_masked_launch`] over one EP rank's expert window
+/// (see [`k3_moe_windowed_route_metadata_launch`]).
+#[allow(clippy::too_many_arguments)]
+pub fn k3_moe_windowed_gather_fp8_quant_masked_launch(
+    ctx: &DeviceContext,
+    shape: K3MoeRouteShape,
+    hidden: usize,
+    local_expert_base: usize,
     latent: &CudaSlice<bf16>,
     topk_idx: &CudaSlice<i32>,
     slot_map: &CudaSlice<i32>,
@@ -174,6 +224,7 @@ pub fn k3_moe_gather_fp8_quant_masked_launch(
             hidden as i32,
             shape.groups as i32,
             shape.masked_cap as i32,
+            i32::try_from(local_expert_base)?,
             ctx.stream.cu_stream(),
         )
     };
@@ -196,6 +247,25 @@ pub fn k3_situ_and_mul_fp8_quant_masked_launch(
     ctx: &DeviceContext,
     shape: K3MoeRouteShape,
     inter: usize,
+    gate_up: &CudaSlice<bf16>,
+    topk_idx: &CudaSlice<i32>,
+    slot_map: &CudaSlice<i32>,
+    output: &mut CudaSlice<u8>,
+    scales: &mut CudaSlice<f32>,
+) -> Result<()> {
+    k3_situ_and_mul_fp8_quant_windowed_launch(
+        ctx, shape, inter, 0, gate_up, topk_idx, slot_map, output, scales,
+    )
+}
+
+/// [`k3_situ_and_mul_fp8_quant_masked_launch`] over one EP rank's expert window
+/// (see [`k3_moe_windowed_route_metadata_launch`]).
+#[allow(clippy::too_many_arguments)]
+pub fn k3_situ_and_mul_fp8_quant_windowed_launch(
+    ctx: &DeviceContext,
+    shape: K3MoeRouteShape,
+    inter: usize,
+    local_expert_base: usize,
     gate_up: &CudaSlice<bf16>,
     topk_idx: &CudaSlice<i32>,
     slot_map: &CudaSlice<i32>,
@@ -237,6 +307,7 @@ pub fn k3_situ_and_mul_fp8_quant_masked_launch(
             inter as i32,
             shape.groups as i32,
             shape.masked_cap as i32,
+            i32::try_from(local_expert_base)?,
             ctx.stream.cu_stream(),
         )
     };
@@ -346,4 +417,188 @@ pub fn k3_moe_weighted_combine_launch(
     result
         .result()
         .map_err(|err| anyhow!("K3 MoE weighted combine launch failed: {err}"))
+}
+
+// ── Expert parallelism ──────────────────────────────────────────────────
+
+/// This rank's fixed-shape contribution to the per-layer EP allgather.
+///
+/// Copies `rows` latent rows plus the two router arrays into the send slabs,
+/// writing every row whose `row_active` entry is negative as padding — zero
+/// latent, `-1` expert id, zero router weight. `rows` is the protocol-max row
+/// count, never the live bucket, so the wire bytes are constant and the rows a
+/// narrower bucket never computed are constructively determined rather than
+/// read out of the previous step's residue.
+#[allow(clippy::too_many_arguments)]
+pub fn k3_moe_ep_pack_dispatch_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    topk: usize,
+    hidden: usize,
+    latent: &CudaSlice<bf16>,
+    topk_idx: &CudaSlice<i32>,
+    topk_weight: &CudaSlice<f32>,
+    row_active: &CudaSlice<i32>,
+    latent_out: &mut CudaSlice<bf16>,
+    idx_out: &mut CudaSlice<i32>,
+    weight_out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    ensure!(
+        rows > 0 && topk > 0 && hidden > 0,
+        "K3 MoE EP pack needs rows/topk/hidden > 0, got rows={rows}, topk={topk}, hidden={hidden}"
+    );
+    let entries = rows * topk;
+    ensure!(
+        latent.len() >= rows * hidden
+            && topk_idx.len() >= entries
+            && topk_weight.len() >= entries
+            && row_active.len() >= rows
+            && latent_out.len() >= rows * hidden
+            && idx_out.len() >= entries
+            && weight_out.len() >= entries,
+        "K3 MoE EP pack buffers too small for rows={rows}, topk={topk}, hidden={hidden}: \
+         latent {}, topk_idx {}, topk_weight {}, row_active {}, latent_out {}, idx_out {}, \
+         weight_out {}",
+        latent.len(),
+        topk_idx.len(),
+        topk_weight.len(),
+        row_active.len(),
+        latent_out.len(),
+        idx_out.len(),
+        weight_out.len()
+    );
+    let (latent_ptr, _latent_guard) = latent.device_ptr(&ctx.stream);
+    let (idx_ptr, _idx_guard) = topk_idx.device_ptr(&ctx.stream);
+    let (weight_ptr, _weight_guard) = topk_weight.device_ptr(&ctx.stream);
+    let (active_ptr, _active_guard) = row_active.device_ptr(&ctx.stream);
+    let (latent_out_ptr, _latent_out_guard) = latent_out.device_ptr_mut(&ctx.stream);
+    let (idx_out_ptr, _idx_out_guard) = idx_out.device_ptr_mut(&ctx.stream);
+    let (weight_out_ptr, _weight_out_guard) = weight_out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::k3_moe_ep_pack_dispatch_cuda(
+            latent_ptr as *const ffi::Half,
+            idx_ptr as *const i32,
+            weight_ptr as *const f32,
+            active_ptr as *const i32,
+            latent_out_ptr as *mut ffi::Half,
+            idx_out_ptr as *mut i32,
+            weight_out_ptr as *mut f32,
+            rows as i32,
+            topk as i32,
+            hidden as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("K3 MoE EP dispatch pack launch failed: {err}"))
+}
+
+/// Masked W2 rows `[groups * masked_cap, hidden]` -> entry-major staging
+/// `[entries, hidden]` bf16, ready for the sum all-reduce.
+///
+/// Dense full-cover pass: an entry this rank owns takes its expert's masked
+/// row, every other entry is written as an exact zero. That is what makes the
+/// all-reduce exact — each global entry is owned by exactly one rank, so every
+/// reduction adds one value to zeros, in any order and any float format — and
+/// it is why the chain carries no separate zero-fill of the staging buffer.
+pub fn k3_moe_entry_scatter_launch(
+    ctx: &DeviceContext,
+    entries: usize,
+    hidden: usize,
+    expert_out: &CudaSlice<bf16>,
+    slot_map: &CudaSlice<i32>,
+    staging: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        entries > 0 && hidden > 0,
+        "K3 MoE entry scatter needs entries/hidden > 0, got entries={entries}, hidden={hidden}"
+    );
+    ensure!(
+        slot_map.len() >= entries && staging.len() >= entries * hidden,
+        "K3 MoE entry scatter buffers too small for entries={entries}, hidden={hidden}: \
+         slot_map {}, staging {}",
+        slot_map.len(),
+        staging.len()
+    );
+    let (expert_ptr, _expert_guard) = expert_out.device_ptr(&ctx.stream);
+    let (slot_ptr, _slot_guard) = slot_map.device_ptr(&ctx.stream);
+    let (staging_ptr, _staging_guard) = staging.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::k3_moe_entry_scatter_cuda(
+            expert_ptr as *const ffi::Half,
+            slot_ptr as *const i32,
+            staging_ptr as *mut ffi::Half,
+            entries as i32,
+            hidden as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("K3 MoE entry scatter launch failed: {err}"))
+}
+
+/// Weighted combine over the reduced entry-major staging buffer, for the
+/// `tokens_out` global token rows starting at `token_base`.
+///
+/// Same f32 accumulation in topk-slot order and same single bf16 round as
+/// [`k3_moe_weighted_combine_launch`], so given bit-identical per-entry rows it
+/// produces bit-identical output. `experts` is the GLOBAL routed-expert count:
+/// entries outside `[0, experts)` are padding entries and are skipped exactly
+/// as the masked combine skips inactive ones, so a padding token lands an exact
+/// zero.
+#[allow(clippy::too_many_arguments)]
+pub fn k3_moe_entry_combine_launch(
+    ctx: &DeviceContext,
+    token_base: usize,
+    tokens_out: usize,
+    topk: usize,
+    hidden: usize,
+    experts: usize,
+    staging: &CudaSlice<bf16>,
+    topk_idx: &CudaSlice<i32>,
+    topk_weight: &CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    ensure!(
+        tokens_out > 0 && topk > 0 && hidden > 0 && experts > 0,
+        "K3 MoE entry combine needs tokens_out/topk/hidden/experts > 0, got \
+         tokens_out={tokens_out}, topk={topk}, hidden={hidden}, experts={experts}"
+    );
+    let entries = (token_base + tokens_out) * topk;
+    ensure!(
+        staging.len() >= entries * hidden
+            && topk_idx.len() >= entries
+            && topk_weight.len() >= entries
+            && out.len() >= tokens_out * hidden,
+        "K3 MoE entry combine buffers too small for token_base={token_base}, \
+         tokens_out={tokens_out}, topk={topk}, hidden={hidden}: staging {}, topk_idx {}, \
+         topk_weight {}, out {}",
+        staging.len(),
+        topk_idx.len(),
+        topk_weight.len(),
+        out.len()
+    );
+    let (staging_ptr, _staging_guard) = staging.device_ptr(&ctx.stream);
+    let (idx_ptr, _idx_guard) = topk_idx.device_ptr(&ctx.stream);
+    let (weight_ptr, _weight_guard) = topk_weight.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::k3_moe_entry_combine_cuda(
+            staging_ptr as *const ffi::Half,
+            idx_ptr as *const i32,
+            weight_ptr as *const f32,
+            out_ptr as *mut ffi::Half,
+            i32::try_from(token_base)?,
+            tokens_out as i32,
+            topk as i32,
+            hidden as i32,
+            experts as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("K3 MoE entry combine launch failed: {err}"))
 }

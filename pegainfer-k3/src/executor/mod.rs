@@ -34,12 +34,32 @@
 //! Decode is captured per (bucket, parity) and replayed; the H2D feed of the
 //! step's inputs and the D2H of the sampled ids stay outside the capture, as in
 //! the reference engine. `PEGAINFER_K3_CUDA_GRAPH=0` forces the eager path.
+//!
+//! **Expert parallelism forces eager.** A plain-NCCL collective inside a
+//! per-bucket graph needs warmup per size, a two-phase cross-rank pre-capture
+//! handshake and an `ncclCommAbort` watchdog before it is safe; that is
+//! MegaMoE-phase work, so `ep_size > 1` turns capture off and says so.
+//!
+//! ## Expert parallelism
+//!
+//! Ranks are free-running: each has its own scheduler thread and its own
+//! requests, and the only runtime coupling is the fixed collective chain inside
+//! the step ([`ep`]). Two consequences show up here:
+//!
+//! * an **empty batch is a real step**, not an early return — the rank owes its
+//!   peers a chain either way, so it takes one with every row padding;
+//! * **any error is fatal**. A rank that skips a step leaves every peer's next
+//!   collective paired against the wrong one, which plain NCCL reports as
+//!   neither an error nor a timeout, so the rank exits the process instead of
+//!   returning into the scheduler's keep-serving path.
 
 mod buffers;
+pub mod ep;
 mod gemm;
 mod step;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -57,8 +77,12 @@ use pegainfer_kernels::tensor::DeviceContext;
 
 use self::buffers::K3Scratch;
 use self::buffers::K3StatePool;
+use self::ep::K3EpRendezvous;
+use self::ep::K3EpRuntime;
+use self::ep::ep_fatal;
 use self::step::K3StepShape;
 use self::step::k3_decode_step;
+use crate::config::K3_DENSE_LAYERS;
 use crate::config::K3_LAYERS;
 use crate::config::K3MoeTopo;
 use crate::config::probe_config_json;
@@ -83,6 +107,12 @@ const K3_CUDA_GRAPH_ENV: &str = "PEGAINFER_K3_CUDA_GRAPH";
 /// Concurrent slots per rank; rounded up to a compiled bucket, capped at the
 /// widest one.
 const K3_MAX_BATCH_ENV: &str = "PEGAINFER_K3_MAX_BATCH";
+
+/// Slots per rank an expert-parallel launch takes when nothing says otherwise.
+/// The ceiling is arithmetic — the worst case is one expert claiming every
+/// global token, so `ep_size * max_batch` must fit `K3_MASKED_CAP` — and 16
+/// leaves headroom at every supported EP width.
+const K3_EP_DEFAULT_MAX_BATCH: usize = 16;
 
 /// What a launch decides about an executor before its weights are read.
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +160,20 @@ impl K3ExecutorConfig {
         }
         self
     }
+
+    /// Apply what an EP width decides on its own: a narrower default slot count
+    /// (an explicit `PEGAINFER_K3_MAX_BATCH` still wins) and no graph capture,
+    /// because the step contains collectives.
+    #[must_use]
+    pub fn for_ep(mut self, ep_size: usize) -> Self {
+        if ep_size > 1 {
+            if std::env::var(K3_MAX_BATCH_ENV).is_err() {
+                self.max_batch = K3_EP_DEFAULT_MAX_BATCH;
+            }
+            self.cuda_graph = false;
+        }
+        self
+    }
 }
 
 pub struct K3Executor {
@@ -157,6 +201,9 @@ pub struct K3Executor {
     cache_row_host: Vec<i32>,
     sampled_host: Vec<i32>,
     thread_bound: bool,
+    /// Present exactly when `ep_size > 1`. Holds this rank's collective
+    /// buffers and, once the first step has run, its communicator.
+    ep: Option<K3EpRuntime>,
 }
 
 // SAFETY: the executor owns one rank's context, stream and device buffers, and
@@ -166,12 +213,59 @@ unsafe impl Send for K3Executor {}
 
 impl K3Executor {
     /// Load one rank of a K3 checkpoint and build its decode executor.
+    ///
+    /// Single-rank only: an expert-parallel group's ranks have to share one
+    /// rendezvous, so they go through [`Self::load_ep`].
     pub fn load(
         model_path: &Path,
         device_ordinal: usize,
         rank: usize,
         ep_size: usize,
         config: K3ExecutorConfig,
+    ) -> Result<Self> {
+        ensure!(
+            ep_size == 1,
+            "K3Executor::load builds a single-rank executor; an ep_size of {ep_size} needs \
+             K3Executor::load_ep with the group's shared rendezvous"
+        );
+        Self::load_inner(model_path, device_ordinal, rank, ep_size, config, None)
+    }
+
+    /// Load one rank of an expert-parallel group.
+    ///
+    /// `rendezvous` is shared by every rank of the group and carries its width;
+    /// the communicator itself is minted lazily, on the worker thread that
+    /// steps this executor, so a rank that fails to load cannot leave its peers
+    /// blocked inside `ncclCommInitRank`.
+    pub fn load_ep(
+        model_path: &Path,
+        device_ordinal: usize,
+        rank: usize,
+        config: K3ExecutorConfig,
+        rendezvous: Arc<K3EpRendezvous>,
+    ) -> Result<Self> {
+        let ep_size = rendezvous.ranks();
+        ensure!(
+            ep_size > 1,
+            "K3Executor::load_ep needs an EP group wider than one rank; use K3Executor::load"
+        );
+        Self::load_inner(
+            model_path,
+            device_ordinal,
+            rank,
+            ep_size,
+            config,
+            Some(rendezvous),
+        )
+    }
+
+    fn load_inner(
+        model_path: &Path,
+        device_ordinal: usize,
+        rank: usize,
+        ep_size: usize,
+        config: K3ExecutorConfig,
+        rendezvous: Option<Arc<K3EpRendezvous>>,
     ) -> Result<Self> {
         probe_config_json(&read_config(model_path)?)
             .with_context(|| format!("validate the K3 config at {}", model_path.display()))?;
@@ -191,7 +285,7 @@ impl K3Executor {
         let ctx = gpu.device_context()?;
         let loaded = load_rank_weights_to_gpu(&gpu, model_path, &bundle, false)?;
         let model = K3RankModel::build(&ctx, loaded.weights, topo, rank, config.num_layers)?;
-        Self::new(gpu, ctx, model, config)
+        Self::new(gpu, ctx, model, config, rendezvous)
     }
 
     /// Wrap an already-built rank model.
@@ -200,6 +294,7 @@ impl K3Executor {
         ctx: DeviceContext,
         model: K3RankModel,
         config: K3ExecutorConfig,
+        rendezvous: Option<Arc<K3EpRendezvous>>,
     ) -> Result<Self> {
         let max_batch = k3_batch_bucket(config.max_batch)?;
         ensure!(
@@ -220,17 +315,67 @@ impl K3Executor {
         let routed_experts = model.topo.routed_experts().count();
         let num_layers = model.layers.len();
         let blocks = model.blocks;
+        let ep_size = rendezvous.as_ref().map_or(1, |r| r.ranks());
+        let mut cuda_graph = config.cuda_graph;
+        if ep_size > 1 && cuda_graph {
+            // A plain-NCCL collective inside a captured graph needs machinery
+            // this bring-up does not have; capture stays off rather than
+            // silently capturing a chain that will not replay.
+            info!(
+                "K3 rank {} runs eagerly: CUDA-graph capture is off under expert parallelism \
+                 (ep_size={ep_size})",
+                model.rank
+            );
+            cuda_graph = false;
+        }
+        // Worst case one expert claims every token of the global batch, so the
+        // fleet's whole batch has to fit the masked layout's per-expert rows.
+        // The route metadata's device trap is the backstop; this is the check
+        // that turns it into a launch-time message.
+        ensure!(
+            ep_size * max_batch <= K3_MASKED_CAP,
+            "K3 ep_size {ep_size} x {max_batch} slots per rank exceeds the {K3_MASKED_CAP} rows \
+             the masked layout reserves per expert — lower {K3_MAX_BATCH_ENV}"
+        );
+        // The routed-expert chain runs over the whole fleet's batch under EP.
+        let chain_tokens = ep_size * max_batch;
 
         let decode_state = K3StatePool::new(&ctx, max_batch, config.max_ctx, num_layers, blocks)?;
         let prefill_state = K3StatePool::new(&ctx, 1, config.max_ctx, num_layers, blocks)?;
-        let scratch = K3Scratch::new(&ctx, max_batch, routed_experts, groups, K3_MASKED_CAP)?;
+        let scratch = K3Scratch::new(
+            &ctx,
+            max_batch,
+            chain_tokens,
+            routed_experts,
+            groups,
+            K3_MASKED_CAP,
+        )?;
+        let ep = rendezvous
+            .map(|rendezvous| {
+                K3EpRuntime::new(
+                    &ctx,
+                    rendezvous,
+                    model.rank,
+                    max_batch,
+                    model.topo.rank_expert_range(model.rank)?.start,
+                    routed_experts,
+                    num_layers.saturating_sub(K3_DENSE_LAYERS),
+                )
+            })
+            .transpose()?;
         gpu.sync()?;
 
         let bucket_count = K3_BATCH_BUCKETS.iter().filter(|b| **b <= max_batch).count();
         info!(
             "K3 rank {} executor ready: slots={max_batch}, max_ctx={}, layers={num_layers}, \
-             blocks={blocks}, local_experts={groups}, sms={num_sms}, cuda_graph={}",
-            model.rank, config.max_ctx, config.cuda_graph
+             blocks={blocks}, local_experts={groups}, sms={num_sms}, cuda_graph={cuda_graph}, \
+             ep_size={ep_size}{}",
+            model.rank,
+            config.max_ctx,
+            ep.as_ref().map_or(String::new(), |ep| format!(
+                ", collectives/step={}",
+                ep.collectives_per_step()
+            ))
         );
         Ok(Self {
             gpu,
@@ -244,7 +389,7 @@ impl K3Executor {
             groups,
             num_sms,
             parity: 0,
-            cuda_graph: config.cuda_graph,
+            cuda_graph,
             decode_graphs: (0..2 * bucket_count)
                 .map(|_| CudaGraphState::new())
                 .collect(),
@@ -254,6 +399,7 @@ impl K3Executor {
             cache_row_host: vec![-1; max_batch],
             sampled_host: vec![0; max_batch],
             thread_bound: false,
+            ep,
         })
     }
 
@@ -267,6 +413,38 @@ impl K3Executor {
             self.thread_bound = true;
         }
         Ok(())
+    }
+
+    /// Bind the thread and, the first time through, mint this rank's
+    /// communicator on it.
+    ///
+    /// Every path that can reach a step goes through here, and nothing else
+    /// does: comm init is collective, so a rank must not enter it from a
+    /// housekeeping call its peers are not making. Comms also belong to the
+    /// thread that uses them — creating one on a controller thread and handing
+    /// it to a worker is a recorded route to invalid-handle symptoms and hangs
+    /// — which is why it happens here rather than at construction.
+    fn enter_step(&mut self) -> Result<()> {
+        self.bind_thread()?;
+        if let Some(ep) = self.ep.as_mut() {
+            ep.ensure_comm(&self.ctx)?;
+        }
+        Ok(())
+    }
+
+    /// Is this executor one rank of an expert-parallel group?
+    #[must_use]
+    pub fn is_expert_parallel(&self) -> bool {
+        self.ep.is_some()
+    }
+
+    /// Collectives one step of this executor issues, or `0` single-rank. The
+    /// number a peer rank has to match, entry for entry.
+    #[must_use]
+    pub fn collectives_per_step(&self) -> usize {
+        self.ep
+            .as_ref()
+            .map_or(0, K3EpRuntime::collectives_per_step)
     }
 
     fn shape(&self, bucket: usize, parity: usize) -> K3StepShape {
@@ -310,7 +488,13 @@ impl K3Executor {
         let model = &self.model;
         let scratch = &mut self.scratch;
         if !self.cuda_graph {
-            return k3_decode_step(ctx, model, shape, pool, scratch);
+            let ep = self.ep.as_mut();
+            if let Some(ep) = ep {
+                ep.begin_step();
+                k3_decode_step(ctx, model, shape, pool, scratch, Some(ep))?;
+                return ep.end_step();
+            }
+            return k3_decode_step(ctx, model, shape, pool, scratch, None);
         }
         let graphs = if prefill {
             &mut self.prefill_graphs
@@ -318,7 +502,11 @@ impl K3Executor {
             &mut self.decode_graphs
         };
         let mut graph = std::mem::take(&mut graphs[graph_index]);
-        let result = graph.run_or_capture(ctx, || k3_decode_step(ctx, model, shape, pool, scratch));
+        // Capture is off whenever there are collectives to capture, so the
+        // captured body never carries an EP chain.
+        let result = graph.run_or_capture(ctx, || {
+            k3_decode_step(ctx, model, shape, pool, scratch, None)
+        });
         let graphs = if prefill {
             &mut self.prefill_graphs
         } else {
@@ -435,7 +623,38 @@ impl StepExecutor for K3Executor {
         self.max_ctx
     }
 
-    fn prefill(&mut self, slot: SlotId, prompt: &[u32], _params: &SamplingParams) -> Result<u32> {
+    fn prefill(&mut self, slot: SlotId, prompt: &[u32], params: &SamplingParams) -> Result<u32> {
+        let rank = self.model.rank;
+        match self.prefill_inner(slot, prompt, params) {
+            Err(error) if self.ep.is_some() => ep_fatal(rank, "prefill", &error),
+            other => other,
+        }
+    }
+
+    fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
+        let rank = self.model.rank;
+        match self.decode_inner(batch) {
+            Err(error) if self.ep.is_some() => ep_fatal(rank, "decode", &error),
+            other => other,
+        }
+    }
+
+    fn release(&mut self, slot: SlotId) {
+        if self.bind_thread().is_ok()
+            && let Err(error) = self.decode_state.reset_row(&self.ctx, slot)
+        {
+            log::warn!("K3 slot {slot} release did not clear its state: {error:#}");
+        }
+    }
+}
+
+impl K3Executor {
+    fn prefill_inner(
+        &mut self,
+        slot: SlotId,
+        prompt: &[u32],
+        _params: &SamplingParams,
+    ) -> Result<u32> {
         ensure!(slot < self.max_batch, "K3 slot {slot} is out of range");
         ensure!(!prompt.is_empty(), "K3 prefill needs at least one token");
         ensure!(
@@ -444,7 +663,7 @@ impl StepExecutor for K3Executor {
             prompt.len(),
             self.max_ctx
         );
-        self.bind_thread()?;
+        self.enter_step()?;
         self.prefill_state.reset_row(&self.ctx, 0)?;
 
         let mut parity = 0usize;
@@ -470,23 +689,27 @@ impl StepExecutor for K3Executor {
         Ok(sampled)
     }
 
-    fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
-        if batch.is_empty() {
+    /// One decode step.
+    ///
+    /// An empty batch is an early return single-rank — there is nothing to
+    /// compute and nobody to answer to. Under expert parallelism it is a
+    /// *padding step*: this rank owes its peers the same collective chain
+    /// whether or not it has work, so it runs the narrowest bucket with every
+    /// row padding and returns no tokens. That is the whole free-running story
+    /// — a rank never negotiates, it just keeps walking the chain.
+    fn decode_inner(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
+        if batch.is_empty() && self.ep.is_none() {
             return Ok(Vec::new());
         }
-        self.bind_thread()?;
-        let rows = batch
-            .iter()
-            .map(|entry| entry.slot + 1)
-            .max()
-            .expect("the batch is not empty");
+        self.enter_step()?;
+        let rows = batch.iter().map(|entry| entry.slot + 1).max().unwrap_or(0);
         ensure!(
             rows <= self.max_batch,
             "K3 decode reached slot {} above the {} configured slots",
-            rows - 1,
+            rows.saturating_sub(1),
             self.max_batch
         );
-        let bucket = k3_batch_bucket(rows)?;
+        let bucket = k3_batch_bucket(rows.max(1))?;
 
         for row in 0..self.max_batch {
             self.token_host[row] = 0;
@@ -519,13 +742,5 @@ impl StepExecutor for K3Executor {
             .iter()
             .map(|entry| sampled[entry.slot] as u32)
             .collect())
-    }
-
-    fn release(&mut self, slot: SlotId) {
-        if self.bind_thread().is_ok()
-            && let Err(error) = self.decode_state.reset_row(&self.ctx, slot)
-        {
-            log::warn!("K3 slot {slot} release did not clear its state: {error:#}");
-        }
     }
 }

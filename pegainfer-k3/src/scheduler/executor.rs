@@ -52,6 +52,13 @@ pub trait StepExecutor: Send {
 
     /// Advance every slot in `batch` by one token. The returned tokens are
     /// parallel to `batch`.
+    ///
+    /// The scheduler calls this every step, **including with an empty
+    /// batch**: an EP rank with nothing to serve must still walk the step's
+    /// fixed collective chain (padding rows in place of live ones) so its
+    /// peers' collectives pair against the right step. Executors with no
+    /// collective obligations answer an empty batch with an empty vec and no
+    /// device work.
     fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>>;
 
     /// Drop the slot's state. Called on every terminal path, including the
@@ -92,7 +99,10 @@ impl StepExecutor for UnwiredExecutor {
         anyhow::bail!(UNWIRED_MESSAGE)
     }
 
-    fn decode(&mut self, _batch: &[DecodeSlot]) -> Result<Vec<u32>> {
+    fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
         anyhow::bail!(UNWIRED_MESSAGE)
     }
 

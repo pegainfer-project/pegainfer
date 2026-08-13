@@ -345,7 +345,10 @@ pub(crate) struct K3MoeScratch {
 }
 
 impl K3MoeScratch {
-    fn new(ctx: &DeviceContext, rows: usize, groups: usize, masked_cap: usize) -> Result<Self> {
+    /// `tokens` is the row count the *chain* runs at: this rank's bucket
+    /// capacity single-rank, the whole fleet's global batch under expert
+    /// parallelism.
+    fn new(ctx: &DeviceContext, tokens: usize, groups: usize, masked_cap: usize) -> Result<Self> {
         let stream = &ctx.stream;
         let masked_rows = groups * masked_cap;
         let latent = K3_ROUTED_EXPERT_HIDDEN;
@@ -353,7 +356,7 @@ impl K3MoeScratch {
         let quant = K3_MOE_QUANT_GROUP;
         Ok(Self {
             masked_m: stream.alloc_zeros(groups)?,
-            slot_map: stream.alloc_zeros(rows * K3_ROUTER_TOPK)?,
+            slot_map: stream.alloc_zeros(tokens * K3_ROUTER_TOPK)?,
             w13_activation: stream
                 .alloc_zeros(masked_rows * latent)
                 .context("alloc K3 W13 activation")?,
@@ -457,9 +460,13 @@ pub(crate) struct K3Scratch {
 }
 
 impl K3Scratch {
+    /// `rows` is this rank's row capacity; `chain_tokens` is the row count the
+    /// routed-expert chain runs at, which under expert parallelism is the whole
+    /// fleet's global batch rather than this rank's.
     pub(crate) fn new(
         ctx: &DeviceContext,
         rows: usize,
+        chain_tokens: usize,
         routed_experts: usize,
         groups: usize,
         masked_cap: usize,
@@ -548,7 +555,7 @@ impl K3Scratch {
             dense_gate: wide(K3_DENSE_INTERMEDIATE)?,
             dense_up: wide(K3_DENSE_INTERMEDIATE)?,
             dense_act: wide(K3_DENSE_INTERMEDIATE)?,
-            moe: K3MoeScratch::new(ctx, rows, groups, masked_cap)?,
+            moe: K3MoeScratch::new(ctx, chain_tokens, groups, masked_cap)?,
             logit_partial: partial(K3_VOCAB).context("alloc K3 logit partial")?,
             logits: wide(K3_VOCAB).context("alloc K3 logits")?,
             argmax_partial_values: stream.alloc_zeros(argmax_partials)?,

@@ -113,6 +113,12 @@ impl StepExecutor for FakeExecutor {
     }
 
     fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
+        // Idle steps reach the executor by contract (free-running EP ranks
+        // pad them); a fake with nothing to do steps in silence, without
+        // consuming the injected failure.
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
         std::thread::sleep(self.decode_delay);
         if std::mem::take(&mut self.fail_next_decode) {
             anyhow::bail!("fake decode failure");

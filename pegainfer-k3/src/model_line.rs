@@ -20,6 +20,7 @@ use crate::config::K3_LAYERS;
 use crate::config::K3_SUPPORTED_ROUTED_EXPERTS;
 use crate::executor::K3Executor;
 use crate::executor::K3ExecutorConfig;
+use crate::executor::ep::K3EpRendezvous;
 use crate::scheduler::K3SchedulerConfig;
 
 pub static MODEL_LINE: K3Line = K3Line;
@@ -190,7 +191,7 @@ impl ModelLine for K3Line {
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         let ep_size = ep_size(&cli(ctx))?;
         let eos_token_ids = eos_token_ids(ctx.config);
-        let config = K3ExecutorConfig::default().from_env();
+        let config = K3ExecutorConfig::default().from_env().for_ep(ep_size);
         info!(
             "K3 engine starting: ep_size={ep_size}, eos_token_ids={eos_token_ids:?}, \
              slots={}, ctx={}, layers={}, cuda_graph={}",
@@ -198,6 +199,14 @@ impl ModelLine for K3Line {
         );
         // One executor per EP rank. A single-rank run honours --device-ordinal;
         // wider runs take devices 0..ep_size, which `validate` already enforced.
+        //
+        // Every rank's weights are resident before any rank is stepped, and a
+        // rank's communicator is minted on its own scheduler thread at its
+        // first step — which is after `start_with_executors` below, and so
+        // after every load. That ordering is the point: `ncclCommInitRank` has
+        // no timeout, so one rank running out of memory mid-load must not be
+        // able to strand its peers inside it.
+        let rendezvous = (ep_size > 1).then(|| K3EpRendezvous::new(ep_size));
         let mut executors = Vec::with_capacity(ep_size);
         for rank in 0..ep_size {
             let device = if ep_size == 1 {
@@ -205,11 +214,15 @@ impl ModelLine for K3Line {
             } else {
                 rank
             };
-            executors.push(
-                K3Executor::load(ctx.model_path, device, rank, ep_size, config).with_context(
-                    || format!("loading K3 rank {rank} of {ep_size} onto device {device}"),
-                )?,
-            );
+            let executor = match rendezvous.clone() {
+                Some(rendezvous) => {
+                    K3Executor::load_ep(ctx.model_path, device, rank, config, rendezvous)
+                }
+                None => K3Executor::load(ctx.model_path, device, rank, ep_size, config),
+            };
+            executors.push(executor.with_context(|| {
+                format!("loading K3 rank {rank} of {ep_size} onto device {device}")
+            })?);
         }
         Ok(LaunchedEngine::Stepped(
             crate::scheduler::start_with_executors(

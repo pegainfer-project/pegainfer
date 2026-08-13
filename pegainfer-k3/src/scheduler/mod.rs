@@ -293,9 +293,12 @@ impl<E: StepExecutor> K3Scheduler<E> {
                 last_token: state.last_token,
             })
             .collect();
-        if batch.is_empty() {
-            return;
-        }
+        // The step is unconditional: an empty batch still reaches the
+        // executor, which is what keeps EP ranks free-running — a rank with
+        // nothing to serve must still walk the step's fixed collective chain
+        // (padding rows in place of live ones), or its peers' collectives
+        // would pair against the wrong step. Single-rank executors simply
+        // return an empty token list without touching the device.
         let tokens = match self.executor.decode(&batch) {
             Ok(tokens) => tokens,
             Err(error) => {

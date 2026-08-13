@@ -28,6 +28,7 @@ pub mod scheduler;
 
 pub use executor::K3Executor;
 pub use executor::K3ExecutorConfig;
+pub use executor::ep::K3EpRendezvous;
 pub use model_line::MODEL_LINE;
 
 mod model;

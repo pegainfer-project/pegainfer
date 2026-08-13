@@ -20,7 +20,9 @@
 //! batched kernel, called with the reference's operands.
 //!
 //! No call here reads device memory back to the host or varies its launch
-//! geometry with device state, so the whole sequence is capturable.
+//! geometry with device state, so the whole sequence is capturable — except
+//! under expert parallelism, where [`routed_experts_ep`] puts NCCL collectives
+//! inside the layer and the whole step runs eagerly (see [`super::ep`]).
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -48,13 +50,19 @@ use pegainfer_kernels::ops::k3_kda_core_batched_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_land_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_mla_attn_batched_launch;
+use pegainfer_kernels::ops::k3_moe_entry_combine_launch;
+use pegainfer_kernels::ops::k3_moe_entry_scatter_launch;
+use pegainfer_kernels::ops::k3_moe_ep_pack_dispatch_launch;
 use pegainfer_kernels::ops::k3_moe_gather_fp8_quant_masked_launch;
 use pegainfer_kernels::ops::k3_moe_local_route_metadata_launch;
 use pegainfer_kernels::ops::k3_moe_weighted_combine_launch;
+use pegainfer_kernels::ops::k3_moe_windowed_gather_fp8_quant_masked_launch;
+use pegainfer_kernels::ops::k3_moe_windowed_route_metadata_launch;
 use pegainfer_kernels::ops::k3_mul_sigmoid_batched_launch;
 use pegainfer_kernels::ops::k3_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_router_topk_batched_launch;
 use pegainfer_kernels::ops::k3_situ_and_mul_fp8_quant_masked_launch;
+use pegainfer_kernels::ops::k3_situ_and_mul_fp8_quant_windowed_launch;
 use pegainfer_kernels::ops::k3_situ_batched_launch;
 use pegainfer_kernels::ops::scaled_add_rows_indexed_into;
 use pegainfer_kernels::tensor::DeviceContext;
@@ -67,6 +75,7 @@ use super::buffers::K3LayerState;
 use super::buffers::K3Scratch;
 use super::buffers::K3StatePool;
 use super::buffers::parity_pair;
+use super::ep::K3EpRuntime;
 use super::gemm::K3PartialSpan;
 use super::gemm::k3_gemm_full;
 use super::gemm::k3_gemm_partial;
@@ -127,12 +136,17 @@ impl K3StepShape {
 ///
 /// Reads `scratch.token_ids`, `scratch.context_len` and `scratch.cache_row`;
 /// the caller fills those before the step (or before the graph replay).
+///
+/// With `ep` present every MoE layer runs the collective chain instead of the
+/// local one, in layer order, so a step's collective sequence is the same
+/// compile-time constant on every rank — including a step whose batch is empty.
 pub(crate) fn k3_decode_step(
     ctx: &DeviceContext,
     model: &K3RankModel,
     shape: K3StepShape,
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
+    mut ep: Option<&mut K3EpRuntime>,
 ) -> Result<()> {
     let b = shape.bucket;
     let K3StatePool {
@@ -229,7 +243,7 @@ pub(crate) fn k3_decode_step(
         )?;
 
         match &layer.mlp {
-            K3LayerMlp::Moe(moe) => moe_mlp(ctx, b, shape, layer, moe, scratch)?,
+            K3LayerMlp::Moe(moe) => moe_mlp(ctx, b, shape, layer, moe, scratch, ep.as_deref_mut())?,
             K3LayerMlp::Dense(dense) => {
                 k3_rms_norm_rbs_batched_launch(
                     ctx,
@@ -755,6 +769,7 @@ fn mla_attention(
 
 // ── Latent MoE ──────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn moe_mlp(
     ctx: &DeviceContext,
     b: usize,
@@ -762,6 +777,7 @@ fn moe_mlp(
     layer: &K3LayerWeights,
     w: &K3MoeWeights,
     s: &mut K3Scratch,
+    ep: Option<&mut K3EpRuntime>,
 ) -> Result<()> {
     let experts = w.w_router.rows;
     k3_rms_norm_rbs_batched_launch(
@@ -797,7 +813,10 @@ fn moe_mlp(
         &mut s.latent,
     )?;
 
-    routed_experts(ctx, shape, w, s)?;
+    match ep {
+        None => routed_experts(ctx, shape, w, s)?,
+        Some(ep) => routed_experts_ep(ctx, shape, w, s, ep)?,
+    }
 
     k3_rms_norm_rbs_batched_launch(
         ctx,
@@ -960,6 +979,162 @@ fn routed_experts(
         &s.topk_idx,
         &moe.slot_map,
         &s.topk_weight,
+        &mut s.routed_latent,
+    )
+}
+
+/// The same masked chain, run over the whole fleet's batch through this rank's
+/// expert window, with the four collectives that make it one forward pass.
+///
+/// Bit-for-bit the single-rank chain, by construction:
+///
+/// * **the gathered latent row is this rank's own bf16 row**, so the quant
+///   sees the same values and emits the same fp8 bytes;
+/// * **a token's entry lands in the same masked row** — the compaction walks
+///   entry order over the expert's entry set either way, and the widest global
+///   batch still fits inside one `masked_cap`-row tile, so the masked GEMM's
+///   per-row K accumulation is untouched by how many neighbours share the tile;
+/// * **the merge is a sum over disjoint support** — each entry's row comes
+///   from its expert's home rank and every other rank staged an exact zero
+///   there, so adding them is exact in any order;
+/// * **the combine's arithmetic is the masked combine's**, slot by slot, f32
+///   `fmaf`, one bf16 round.
+///
+/// Which is why the acceptance gate is bitwise equality with `ep_size = 1` and
+/// not a tolerance: nothing here is allowed to move a single bit.
+fn routed_experts_ep(
+    ctx: &DeviceContext,
+    shape: K3StepShape,
+    w: &K3MoeWeights,
+    s: &mut K3Scratch,
+    ep: &mut K3EpRuntime,
+) -> Result<()> {
+    let latent = K3_ROUTED_EXPERT_HIDDEN;
+    let inter = K3_EXPERT_INTERMEDIATE;
+    let quant = K3_MOE_QUANT_GROUP;
+    let topk = K3_ROUTER_TOPK;
+    let base = ep.local_expert_base();
+
+    // This rank's fixed-shape contribution. Padding rows are written every
+    // layer of every step rather than trusted to hold what the last one left:
+    // under a fixed chain a residue read happens every step, not eventually.
+    k3_moe_ep_pack_dispatch_launch(
+        ctx,
+        ep.max_batch(),
+        topk,
+        latent,
+        &s.latent,
+        &s.topk_idx,
+        &s.topk_weight,
+        &s.cache_row,
+        &mut ep.buffers.latent_send,
+        &mut ep.buffers.idx_send,
+        &mut ep.buffers.weight_send,
+    )?;
+    ep.all_gather_dispatch()?;
+
+    let route = K3MoeRouteShape {
+        tokens: ep.chain_tokens(),
+        topk,
+        groups: shape.groups,
+        masked_cap: shape.masked_cap,
+    };
+    let moe = &mut s.moe;
+    k3_moe_windowed_route_metadata_launch(
+        ctx,
+        route,
+        base,
+        &ep.buffers.idx_recv,
+        &mut moe.masked_m,
+        &mut moe.slot_map,
+    )?;
+    k3_moe_windowed_gather_fp8_quant_masked_launch(
+        ctx,
+        route,
+        latent,
+        base,
+        &ep.buffers.latent_recv,
+        &ep.buffers.idx_recv,
+        &moe.slot_map,
+        &mut moe.w13_activation,
+        &mut moe.w13_scale,
+    )?;
+    k3_fp8_scale_pack_ue8m0_launch(
+        ctx,
+        route.groups,
+        latent / quant,
+        route.masked_cap,
+        &moe.w13_scale,
+        &mut moe.w13_scale_packed,
+    )?;
+    k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch(
+        ctx,
+        K3DeepGemmFp8Fp4Kind::W13,
+        route.groups,
+        route.masked_cap,
+        shape.num_sms,
+        &moe.w13_activation,
+        &moe.w13_scale_packed,
+        &w.experts.w13_weight,
+        &w.experts.w13_scale,
+        &moe.masked_m,
+        &mut moe.w13_out,
+    )?;
+    k3_situ_and_mul_fp8_quant_windowed_launch(
+        ctx,
+        route,
+        inter,
+        base,
+        &moe.w13_out,
+        &ep.buffers.idx_recv,
+        &moe.slot_map,
+        &mut moe.w2_activation,
+        &mut moe.w2_scale,
+    )?;
+    k3_fp8_scale_pack_ue8m0_launch(
+        ctx,
+        route.groups,
+        inter / quant,
+        route.masked_cap,
+        &moe.w2_scale,
+        &mut moe.w2_scale_packed,
+    )?;
+    k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch(
+        ctx,
+        K3DeepGemmFp8Fp4Kind::W2,
+        route.groups,
+        route.masked_cap,
+        shape.num_sms,
+        &moe.w2_activation,
+        &moe.w2_scale_packed,
+        &w.experts.w2_weight,
+        &w.experts.w2_scale,
+        &moe.masked_m,
+        &mut moe.w2_out,
+    )?;
+
+    // Entry-major staging is a dense full-cover write: this rank's entries take
+    // their expert's row, every other entry becomes an exact zero. That is what
+    // makes the sum below exact, and why the buffer needs no separate clear.
+    k3_moe_entry_scatter_launch(
+        ctx,
+        route.entries(),
+        latent,
+        &moe.w2_out,
+        &moe.slot_map,
+        &mut ep.buffers.stage,
+    )?;
+    ep.all_reduce_stage()?;
+    k3_moe_entry_combine_launch(
+        ctx,
+        ep.token_base(),
+        ep.max_batch(),
+        topk,
+        latent,
+        ep.routed_experts(),
+        &ep.buffers.stage,
+        &ep.buffers.idx_recv,
+        &ep.buffers.weight_recv,
         &mut s.routed_latent,
     )
 }
