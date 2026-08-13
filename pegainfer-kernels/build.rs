@@ -1485,12 +1485,18 @@ const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
         "k3_land_rms_norm_rbs_batched",
         "const float*, const void*, void*, int, int, int, int, int",
     ),
-    ("k3_add2_batched", "const void*, const void*, void*, int, int"),
+    (
+        "k3_add2_batched",
+        "const void*, const void*, void*, int, int",
+    ),
     (
         "k3_mul_sigmoid_batched",
         "const void*, const void*, void*, int, int",
     ),
-    ("k3_situ_batched", "const void*, const void*, void*, int, int"),
+    (
+        "k3_situ_batched",
+        "const void*, const void*, void*, int, int",
+    ),
     (
         "k3_combine_land_batched",
         "const void*, const float*, void*, int, int, int",

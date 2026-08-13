@@ -409,7 +409,10 @@ pub fn k3_conv_silu_batched_launch(
     sn: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     check_bucket(b)?;
-    ensure!(width >= 2, "K3 conv_silu needs a window of at least two slots");
+    ensure!(
+        width >= 2,
+        "K3 conv_silu needs a window of at least two slots"
+    );
     let state = b * (width - 1) * kp;
     ensure!(
         p.len() >= b * split_k * kp
@@ -701,7 +704,10 @@ pub fn k3_attnres_scores_batched_launch(
         "K3 attnres blocks={blocks} outside the instantiated 1..={K3_ATTNRES_MAX_BLOCKS}"
     );
     ensure!(
-        ps.len() >= b * h && bl.len() >= b * blocks * h && sw.len() >= h && sc.len() >= b * (blocks + 1),
+        ps.len() >= b * h
+            && bl.len() >= b * blocks * h
+            && sw.len() >= h
+            && sc.len() >= b * (blocks + 1),
         "K3 attnres_scores buffers too small for b={b}, blocks={blocks}, h={h}: \
          ps {}, bl {}, sw {}, sc {}",
         ps.len(),
@@ -750,7 +756,10 @@ pub fn k3_attnres_mix_batched_launch(
         "K3 attnres blocks={blocks} outside the instantiated 1..={K3_ATTNRES_MAX_BLOCKS}"
     );
     ensure!(
-        ps.len() >= b * h && bl.len() >= b * blocks * h && sc.len() >= b * (blocks + 1) && o.len() >= b * h,
+        ps.len() >= b * h
+            && bl.len() >= b * blocks * h
+            && sc.len() >= b * (blocks + 1)
+            && o.len() >= b * h,
         "K3 attnres_mix buffers too small for b={b}, blocks={blocks}, h={h}: \
          ps {}, bl {}, sc {}, o {}",
         ps.len(),
