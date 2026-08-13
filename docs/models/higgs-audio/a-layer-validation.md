@@ -44,6 +44,10 @@ current one-step semantic gate. To keep this foundation PR focused, the shared
 `pegainfer-kernels` rounding change is left out of scope and can be discussed
 separately as a Qwen3 numeric-parity change if needed.
 
+Evidence source: old-4090 semantic comparison logs from the Higgs-Audio
+trace-driven bring-up run; the auto path and retained-session path reported the
+same semantic metrics.
+
 - `audio_argmax.ids`: exact.
 - `hidden_cosine`: `0.999994874`.
 - `logits_cosine`: `0.999998987`.
