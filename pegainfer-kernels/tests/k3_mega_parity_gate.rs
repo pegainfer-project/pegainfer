@@ -24,6 +24,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
 use half::bf16;
 use pegainfer_kernels::ops::K3MegaActivation;
 use pegainfer_kernels::ops::K3MegaShape;
@@ -289,6 +290,14 @@ fn mega_moe_matches_the_python_kernel_bit_for_bit() {
         hidden: HIDDEN,
         intermediate_hidden: INTER,
         num_sms,
+        num_ranks: 1,
+        rank_idx: 0,
+    };
+    // Single-rank pointer table: `SymBuffer<1>::map` is the identity, so this
+    // is just the slab's own base.
+    let symm_ptrs = {
+        let (base, _guard) = symm.device_ptr(&ctx.stream);
+        [base as i64]
     };
 
     // The K3 activation is `situ`; `swiglu` is upstream's default and rides
@@ -317,6 +326,7 @@ fn mega_moe_matches_the_python_kernel_bit_for_bit() {
             &ctx,
             &layout,
             &mut symm,
+            &symm_ptrs,
             shape,
             activation,
             &l1_weights,

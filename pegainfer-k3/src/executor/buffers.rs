@@ -15,7 +15,9 @@
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
 use half::bf16;
 use pegainfer_kernels::ops::K3_CONV_WIDTH;
 use pegainfer_kernels::ops::K3_KDA_HEAD_DIM;
@@ -27,6 +29,7 @@ use pegainfer_kernels::ops::K3_ROUTER_TOPK;
 use pegainfer_kernels::ops::K3_V_DIM;
 use pegainfer_kernels::ops::K3MegaSymmLayout;
 use pegainfer_kernels::ops::argmax_batch_bf16_split_partials_len;
+use pegainfer_kernels::ops::k3_mega_open_peer_access;
 use pegainfer_kernels::ops::k3_mega_symm_buffer_layout;
 use pegainfer_kernels::ops::k3_mega_token_alignment;
 use pegainfer_kernels::tensor::DeviceContext;
@@ -387,14 +390,64 @@ impl K3MoeScratch {
 ///
 /// It doubles as the kernel's "symmetric" buffer. At `ep_size == 1` that is a
 /// plain device allocation: the kernel's cross-rank barriers compile down to
-/// grid-local synchronisation, so no IPC or NVSHMEM handle is involved. It is
-/// zeroed once here — the workspace counters that share the slab are
-/// self-restoring across launches but start from zero.
+/// grid-local synchronisation, so no IPC or NVSHMEM handle is involved. Above
+/// one rank every rank holds one of these on its own device and the whole world
+/// exchanges base pointers once, at startup; the addressing is plain peer
+/// access over NVLink, so there is still no IPC or NVSHMEM handle. It is zeroed
+/// once here — the workspace counters that share the slab are self-restoring
+/// across launches but start from zero.
 pub(crate) struct K3MegaScratch {
     pub(crate) layout: K3MegaSymmLayout,
     pub(crate) symm: CudaSlice<u8>,
-    /// Row capacity the slab and the AOT kernel were built for.
+    /// Row capacity the slab and the AOT kernel were built for. This is the
+    /// protocol maximum, not the executor's live batch: it is a template
+    /// parameter of the AOT kernel and every rank must agree on it.
     pub(crate) max_tokens: usize,
+    /// GLOBAL routed-expert count. The kernel derives a token's destination
+    /// rank from `expert_id / (num_experts / num_ranks)`, so it wants the whole
+    /// count even though this rank only holds its own block of experts.
+    pub(crate) routed_experts: usize,
+    pub(crate) num_ranks: usize,
+    pub(crate) rank_idx: usize,
+    /// One base pointer per rank, as addressed from this rank's context. Known
+    /// at construction at `ep_size == 1`; above it, filled once from the group's
+    /// rendezvous before the first step.
+    ptrs: Vec<i64>,
+    base: i64,
+}
+
+/// Open `self_ordinal` against every other device this process can see, so a
+/// later rendezvous can hand any of them this rank's slab pointer. Devices the
+/// pair cannot reach are skipped rather than fatal — they are simply not
+/// candidates for the group, and a rank that ends up with an unreachable peer
+/// finds out at rendezvous time with its ordinal in the message.
+fn open_local_peer_access(self_ordinal: usize) -> Result<()> {
+    let devices = cudarc::driver::result::device::get_count()
+        .map_err(|error| anyhow::anyhow!("count the CUDA devices: {error}"))?;
+    for peer in 0..usize::try_from(devices.max(0))? {
+        if peer == self_ordinal {
+            continue;
+        }
+        if let Err(error) = k3_mega_open_peer_access(self_ordinal, peer) {
+            log::debug!(
+                "K3 MegaMoE device {self_ordinal} cannot reach device {peer}, so it is not a \
+                 candidate peer: {error:#}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What an executor decides about its MegaMoE slab before it exists.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct K3MegaGeometry {
+    /// Device SM count; the kernel's grid sync spans it, so it is baked into
+    /// the instantiation.
+    pub(crate) num_sms: usize,
+    /// Expert-parallel world size the kernel pairs across.
+    pub(crate) num_ranks: usize,
+    /// This rank's index in that world.
+    pub(crate) rank_idx: usize,
 }
 
 impl K3MegaScratch {
@@ -403,11 +456,22 @@ impl K3MegaScratch {
         routed_experts: usize,
         num_sms: usize,
         min_tokens: usize,
+        num_ranks: usize,
+        rank_idx: usize,
     ) -> Result<Self> {
+        // Every device that will ever address this slab has to be opened
+        // BEFORE the slab exists: the memory-pool access grant only reliably
+        // covers allocations made after it. An in-process EP group's ranks are
+        // all local devices, and the group's own membership is not known until
+        // the rendezvous, so open every reachable one now and let
+        // `K3MegaEpRuntime` re-check the ranks that turn out to be in the group.
+        if num_ranks > 1 {
+            open_local_peer_access(ctx.device_ordinal)?;
+        }
         let alignment = k3_mega_token_alignment();
         let max_tokens = min_tokens.div_ceil(alignment) * alignment;
         let layout = k3_mega_symm_buffer_layout(
-            1,
+            num_ranks,
             routed_experts,
             max_tokens,
             K3_ROUTER_TOPK,
@@ -419,11 +483,54 @@ impl K3MegaScratch {
             .stream
             .alloc_zeros::<u8>(layout.num_bytes)
             .context("alloc K3 MegaMoE symmetric buffer")?;
+        let base = {
+            let (ptr, _guard) = symm.device_ptr(&ctx.stream);
+            i64::try_from(ptr)?
+        };
+        let mut ptrs = vec![0i64; num_ranks];
+        ptrs[rank_idx] = base;
         Ok(Self {
             layout,
             symm,
             max_tokens,
+            routed_experts,
+            num_ranks,
+            rank_idx,
+            ptrs,
+            base,
         })
+    }
+
+    /// This rank's slab base, the value it publishes to its peers.
+    pub(crate) fn base(&self) -> i64 {
+        self.base
+    }
+
+    /// The world's base-pointer table, or `None` until the rendezvous has
+    /// filled it (which cannot happen at `ep_size == 1`, where it is complete
+    /// from construction).
+    pub(crate) fn peers(&self) -> Option<&[i64]> {
+        self.ptrs.iter().all(|ptr| *ptr != 0).then_some(&self.ptrs)
+    }
+
+    /// Adopt the table the group's rendezvous produced.
+    pub(crate) fn set_peers(&mut self, ptrs: Vec<i64>) -> Result<()> {
+        ensure!(
+            ptrs.len() == self.num_ranks,
+            "K3 MegaMoE rank {} expected {} peer pointers, the rendezvous produced {}",
+            self.rank_idx,
+            self.num_ranks,
+            ptrs.len()
+        );
+        ensure!(
+            ptrs[self.rank_idx] == self.base,
+            "K3 MegaMoE rank {} published base {:#x} but its slab is at {:#x}",
+            self.rank_idx,
+            ptrs[self.rank_idx],
+            self.base
+        );
+        self.ptrs = ptrs;
+        Ok(())
     }
 }
 
@@ -515,6 +622,7 @@ impl K3Scratch {
     /// `rows` is this rank's row capacity; `chain_tokens` is the row count the
     /// routed-expert chain runs at, which under expert parallelism is the whole
     /// fleet's global batch rather than this rank's.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &DeviceContext,
         rows: usize,
@@ -522,7 +630,7 @@ impl K3Scratch {
         routed_experts: usize,
         groups: usize,
         masked_cap: usize,
-        mega: Option<usize>,
+        mega: Option<K3MegaGeometry>,
     ) -> Result<Self> {
         let stream = &ctx.stream;
         let heads = K3_MLA_HEADS;
@@ -610,7 +718,21 @@ impl K3Scratch {
             dense_act: wide(K3_DENSE_INTERMEDIATE)?,
             moe: K3MoeScratch::new(ctx, chain_tokens, groups, masked_cap)?,
             mega: mega
-                .map(|num_sms| K3MegaScratch::new(ctx, routed_experts, num_sms, chain_tokens))
+                .map(|geometry| {
+                    K3MegaScratch::new(
+                        ctx,
+                        routed_experts,
+                        geometry.num_sms,
+                        // The mega slab is a PROTOCOL-max buffer, not a
+                        // batch-sized one: the token alignment lifts whatever
+                        // this rank's live capacity is to the same 384 rows
+                        // every peer allocated, which is what the AOT kernel is
+                        // instantiated for.
+                        rows,
+                        geometry.num_ranks,
+                        geometry.rank_idx,
+                    )
+                })
                 .transpose()?,
             logit_partial: partial(K3_VOCAB).context("alloc K3 logit partial")?,
             logits: wide(K3_VOCAB).context("alloc K3 logits")?,

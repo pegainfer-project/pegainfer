@@ -11,9 +11,11 @@ certified 4-layer greedy golden (38/40 exact, 2 steps inside a structural
 ≤2-ULP noise floor — see below). Kernel surface: thirteen batched TileLang
 decode families + DeepGEMM masked FP8xFP4 grouped-GEMM AOT shim behind
 `pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt. The fused
-MegaMoE(situ) kernel is wired at `ep_size 1` behind `PEGAINFER_K3_MEGA=1`,
+MegaMoE(situ) kernel is wired at `ep_size 1` and `4` behind `PEGAINFER_K3_MEGA=1`,
 bit-identical to the Python-validated kernel and 5-8% faster per layer, with
-graphs still on. Next: MegaMoE at EP > 1.
+graphs still on, and at `ep_size 4` it replaces the NCCL chain outright — zero
+host collectives, bitwise-equal to the single-rank fused path, invariant to
+peer traffic, and 21% faster per step. Next: graphs with the EP4 fused path.
 
 Last touched: 2026-08
 
@@ -165,7 +167,7 @@ request serves normally with zero error lines. The checkpoint must be
 readable by the serving user — its ACLs may effectively be owner-only, which
 surfaces as `Permission denied` on the first shard.
 
-## MegaMoE(situ): fused routed experts (wired, ep_size 1)
+## MegaMoE(situ): fused routed experts (wired, ep_size 1 and 4)
 
 `PEGAINFER_K3_MEGA=1` replaces the eight-launch masked chain with one
 DeepGEMM MegaMoE launch that fuses dispatch, both FP8xFP4 GEMMs, the situ
@@ -184,17 +186,18 @@ torch (`csrc/k3/k3_mega_moe_sm100.cu`).
   arithmetic over the shapes, the candidate `BLOCK_M` set and the SM count —
   and they are kernel *template parameters*, so a rounded-up allocation is
   wrong, not merely wasteful. At `ep_size 1` the slab is a plain device
-  allocation: the kernel's cross-rank barriers compile down to grid-local
-  synchronisation, so no IPC or NVSHMEM handle is involved. `ep_size > 1` is
-  rejected at construction.
+  allocation (260 MiB): the kernel's cross-rank barriers compile down to
+  grid-local synchronisation, so no IPC or NVSHMEM handle is involved. At
+  `ep_size 4` each rank owns one (209.8 MiB, ring 17280 tokens / SF ring
+  276480) on its own device and the world exchanges bare base pointers.
 - **The expert bank carries one layout or the other, never both** — a rank
   holds 84-189 GiB of experts. `K3ExpertBankForm` picks the layout at build
   time: the mega form interleaves the fused gate|up rows at granularity 8 and
   adds the UTCCP transpose to both scale-factor tensors.
-- **CUDA graphs stay on.** The fused kernel's grid sync is atomics over the
-  slab, not a cooperative launch, and its TMA descriptors are built from
-  persistent pointers — capture and replay work unchanged, verified over every
-  bucket.
+- **CUDA graphs stay on at `ep_size 1`.** The fused kernel's grid sync is
+  atomics over the slab, not a cooperative launch, and its TMA descriptors are
+  built from persistent pointers — capture and replay work unchanged, verified
+  over every bucket. EP4 stays eager for now, like the chain.
 - **Bit-level parity gate.** `pegainfer-kernels/tests/k3_mega_parity_gate.rs`
   replays a fixture dumped from DeepGEMM's own Python path (inputs in
   checkpoint form plus the kernel's output *bits*) through the whole Rust
@@ -213,10 +216,82 @@ GB300, ms per layer):
 | 16     | 0.997       | 0.919      | 0.970        | 0.895       |
 | 128    | 2.635       | 2.507      | 2.607        | 2.482       |
 
+### MegaMoE at ep_size 4
+
+At four ranks the fused kernel replaces the *entire* collective chain for a
+MoE layer: no pack, no allgather, no scatter, no allreduce, no entry combine.
+A rank quantizes its own live rows into its own slab and launches; the kernel
+dispatches across the world over NVLink, computes every expert it owns for
+whoever sent it work, and combines each token back to the rank that owns it.
+`collectives/step=0` — a mega EP group builds no communicator at all, and the
+write-then-launch ordering the inputs need is plain stream order on the rank's
+own stream.
+
+- **The rank count is a template parameter**, not a runtime dimension: it sets
+  the ring capacities and the experts-per-rank divisor. `1` and `4` are
+  instantiated (`K3_MEGA_EP_SIZES`); anything else is refused at construction.
+- **One fixed block config for every rank and every step at EP4**, derived from
+  the protocol maximum (`num_max_tokens_per_rank = 384`) rather than the live
+  token count: BLOCK_M 192 / BLOCK_K 128. Two reasons. Nothing in the kernel
+  forces the world to agree on a config, and heterogeneous tiling across a
+  collective launch is unverified territory. And a fixed config makes a row's
+  tile shape independent of how much traffic its peers are sending — which is
+  what turns traffic invariance into a bitwise claim instead of a tolerance.
+  The small-batch cost is accepted. `ep_size 1` keeps the live-config
+  selection, because that is what keeps it bit-identical to upstream's Python
+  path.
+- **Cross-rank addressing is layout-only.** Every access a rank makes into a
+  peer's slab targets a region whose offset and stride come from
+  `MegaMoEBuffer(hidden, intermediate, ranks, experts, max_tokens, topk,
+  ring_tokens, sf_ring_tokens)` — no BLOCK_M/BLOCK_N/stage terms anywhere. The
+  block-config-dependent quantities (pool block indices, the L1/L2 ring
+  counters, SF paging) are only ever used against the rank's OWN workspace and
+  rings. A sender never needs the receiver's block config; that is what makes
+  the paragraph above a choice rather than a requirement.
+- **`num_tokens = 0` is a first-class case.** An idle rank's launch still
+  serves its local experts for its peers' tokens (the pull loop iterates the
+  sum over all ranks) and still meets both NVLink barriers; only the topk read
+  and the final combine, both bounded by `num_tokens`, do nothing. The
+  free-running contract is therefore unchanged: an empty batch still launches
+  all 92 mega layers.
+- **Peer access needs two grants, not one.** `cudaDeviceEnablePeerAccess` lets
+  a context address a peer's memory; it explicitly does **not** cover
+  stream-ordered memory-pool allocations, and every buffer here comes from
+  `cudaMallocAsync`. The owner must also `cudaMemPoolSetAccess` its pool for
+  each peer, *before* allocating the slab — the grant does not reliably reach
+  allocations that predate it. Getting only the first grant reads as
+  `CUDA_ERROR_ILLEGAL_ADDRESS` inside the kernel, not as an error at setup.
+- **Startup is the rendezvous itself.** Each rank publishes its slab base only
+  after the allocation is zeroed and synchronised; the first step blocks until
+  the whole table is in. No launch can precede the last allocation.
+- **Gates** (`pegainfer-k3/tests/ep_mega_oracle.rs`, one per process, four
+  GPUs, `PEGAINFER_K3_MEGA=1`): EP4 rank 0 against a single-rank mega run is
+  **bit-identical** — all 40 forced-replay tokens and all 163840 final logits —
+  with three idle peers; and rank 0 with busy peers against rank 0 with idle
+  peers is **bit-identical** too. The first was only required to clear the
+  fixture's noise floor (the two world sizes pick different block configs);
+  bitwise is what it measured, which says the MMA's K-accumulation order does
+  not depend on BLOCK_K for these shapes.
+
+Full-depth serve (93 layers, 4xGB300, `--k3-ep-size 4`, `PEGAINFER_K3_MEGA=1`,
+`PEGAINFER_K3_MAX_BATCH=16`): all four ranks load 189.1 GiB and pair over peer
+access, greedy completions come back as coherent English, four concurrent
+requests across the four partitions finish together, and a 60 s idle hold of
+free-running padding steps followed by a fresh request serves normally with
+zero error lines. Single stream, 76 decode-shaped steps (12-token prompt + 64
+generated), median of three:
+
+| EP4 MoE transport | ms/step | 4 concurrent, 69 steps |
+|-------------------|---------|------------------------|
+| NCCL chain (368 collectives/step) | 54.6 | 3.90 s |
+| MegaMoE (0 collectives/step) | 43.3 | 3.03 s |
+
+Both transports emit the same greedy text. The ~72 ms/step recorded for the
+chain earlier in this doc was taken on a differently loaded box; the pair above
+is a same-session A/B and is the one to compare.
+
 ## Next
 
-MegaMoE at `ep_size > 1` (per-device slabs + peer-pointer exchange; the shim
-is instantiated for one rank today, so the second rank count is a host-side
-change plus one more AOT instantiation), then graphs-with-collectives (qwen3
-recipe), launch-ahead, paged KV for MLA (current MLA cache is fixed
-`max_ctx = 128` per seat) and real prefill.
+Graphs over the EP4 fused path (the ranks=1 path already captures; the EP4
+path is eager only because the chain was), then launch-ahead, paged KV for MLA
+(current MLA cache is fixed `max_ctx = 128` per seat) and real prefill.

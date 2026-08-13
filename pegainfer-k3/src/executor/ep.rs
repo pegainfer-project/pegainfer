@@ -55,18 +55,38 @@
 //! * **Protocol-max shapes.** Every collective buffer is allocated once at the
 //!   worst case and is pointer-stable; a rank's live batch never reaches the
 //!   wire.
+//!
+//! ## The MegaMoE transport
+//!
+//! [`K3MegaEpRuntime`] is the other way a group's MoE can be wired, and it
+//! replaces the whole four-collective chain: the fused kernel dispatches,
+//! computes and combines across the world by itself, addressing its peers'
+//! symmetric slabs over NVLink and pairing them with its own device-side
+//! barriers. In steady state the host issues **no** collective, so there is no
+//! entry order to keep and no ledger to keep it with — a step is one kernel
+//! launch per MoE layer on the rank's own stream, and the write-then-launch
+//! ordering that the inputs need is stream order on that same stream.
+//!
+//! What survives from the chain's rules is the important part: ranks still run
+//! free, an idle rank still launches every layer (the kernel serves its local
+//! experts for its peers' tokens and joins every barrier even at zero local
+//! tokens), and a failed step is still fatal to the process, because a rank
+//! that skips a launch leaves its peers spinning on a barrier that will never
+//! be met.
 
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_kernels::ops::K3_ROUTER_TOPK;
+use pegainfer_kernels::ops::k3_mega_open_peer_access;
 use pegainfer_kernels::tensor::DeviceContext;
 
 use crate::config::K3_ROUTED_EXPERT_HIDDEN;
@@ -80,18 +100,36 @@ const ID_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(300);
 /// router weights) and one all-reduce over the entry staging buffer.
 const COLLECTIVES_PER_MOE_LAYER: usize = 4;
 
-/// The in-process handshake that gives every rank of one EP group the same
-/// NCCL unique id. Rank 0 mints it on its first step; peers wait, with a
-/// timeout that errors rather than hanging forever.
+/// One rank's contribution to the MegaMoE startup exchange: where its
+/// symmetric slab lives and which device that is, so its peers can open access
+/// to it.
+#[derive(Clone, Copy, Debug)]
+struct K3MegaSlab {
+    base: i64,
+    device_ordinal: usize,
+}
+
+/// The in-process handshake an EP group's ranks pair through.
+///
+/// It carries whatever the group's MoE transport needs. The NCCL chain wants
+/// one unique id: rank 0 mints it on its first step and peers wait for it.
+/// MegaMoE wants the world's symmetric-slab base pointers instead: every rank
+/// publishes its own at construction — after the allocation has been zeroed and
+/// synchronised — and reads the full table back on its first step. Waiting for
+/// that table IS the startup barrier, so a rank cannot launch before every peer
+/// slab exists and is zeroed.
 ///
 /// Deliberately in-process: an EP group is one process with one thread per
-/// rank. A multi-node group would replace this with a real out-of-band
-/// exchange and nothing else about the chain would move.
+/// rank. A multi-node group would replace this with a real out-of-band exchange
+/// (and, for MegaMoE, with exported IPC handles rather than bare pointers) and
+/// nothing else about either path would move.
 #[derive(Debug)]
 pub struct K3EpRendezvous {
     ranks: usize,
     id: Mutex<Option<[::core::ffi::c_char; 128]>>,
     ready: Condvar,
+    slabs: Mutex<Vec<Option<K3MegaSlab>>>,
+    slabs_ready: Condvar,
 }
 
 impl K3EpRendezvous {
@@ -102,11 +140,56 @@ impl K3EpRendezvous {
             ranks,
             id: Mutex::new(None),
             ready: Condvar::new(),
+            slabs: Mutex::new(vec![None; ranks]),
+            slabs_ready: Condvar::new(),
         })
     }
 
     pub(crate) fn ranks(&self) -> usize {
         self.ranks
+    }
+
+    /// Publish this rank's zeroed MegaMoE slab. Never blocks: the ranks are
+    /// constructed one after another on one thread, so a publish that waited
+    /// for its peers would deadlock before they exist.
+    fn publish_slab(&self, rank: usize, slab: K3MegaSlab) -> Result<()> {
+        let mut slabs = self.slabs.lock().expect("K3 EP rendezvous poisoned");
+        ensure!(rank < self.ranks, "K3 EP rank {rank} is outside the group");
+        ensure!(
+            slabs[rank].is_none(),
+            "K3 MegaMoE rank {rank} published its symmetric slab twice"
+        );
+        slabs[rank] = Some(slab);
+        self.slabs_ready.notify_all();
+        Ok(())
+    }
+
+    /// Block until every rank has published, then return the world's base
+    /// pointers in rank order together with their device ordinals.
+    fn slabs(&self, rank: usize) -> Result<Vec<K3MegaSlab>> {
+        let mut slabs = self.slabs.lock().expect("K3 EP rendezvous poisoned");
+        while slabs.iter().any(Option::is_none) {
+            let (guard, timeout) = self
+                .slabs_ready
+                .wait_timeout(slabs, ID_RENDEZVOUS_TIMEOUT)
+                .expect("K3 EP rendezvous poisoned");
+            slabs = guard;
+            if timeout.timed_out() && slabs.iter().any(Option::is_none) {
+                let missing: Vec<usize> = slabs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(peer, slab)| slab.is_none().then_some(peer))
+                    .collect();
+                bail!(
+                    "K3 MegaMoE rank {rank} waited {}s for its peers' symmetric slabs; ranks                      {missing:?} never published",
+                    ID_RENDEZVOUS_TIMEOUT.as_secs()
+                );
+            }
+        }
+        Ok(slabs
+            .iter()
+            .map(|slab| slab.expect("checked above"))
+            .collect())
     }
 
     fn nccl_id(&self, rank: usize) -> Result<cudarc::nccl::Id> {
@@ -369,6 +452,89 @@ impl K3EpRuntime {
     }
 }
 
+/// One rank of an expert-parallel group whose routed experts run through the
+/// fused MegaMoE kernel.
+///
+/// It owns no buffers and issues nothing per step. Its whole job is the startup
+/// handshake: publish this rank's symmetric slab, and — once, on the stepping
+/// thread — collect the world's table and open peer access to every other
+/// device so the kernel's cross-rank stores land.
+pub(crate) struct K3MegaEpRuntime {
+    rendezvous: Arc<K3EpRendezvous>,
+    rank: usize,
+    device_ordinal: usize,
+    ready: bool,
+}
+
+impl K3MegaEpRuntime {
+    /// Publish this rank's slab. The caller must already have synchronised the
+    /// allocation's zeroing: a peer that sees this entry is entitled to assume
+    /// the memory behind it is live and zeroed.
+    pub(crate) fn new(
+        rendezvous: Arc<K3EpRendezvous>,
+        rank: usize,
+        base: i64,
+        device_ordinal: usize,
+    ) -> Result<Self> {
+        let ranks = rendezvous.ranks();
+        ensure!(
+            ranks > 1 && rank < ranks,
+            "K3 MegaMoE rank {rank} is not part of a {ranks}-rank group"
+        );
+        rendezvous.publish_slab(
+            rank,
+            K3MegaSlab {
+                base,
+                device_ordinal,
+            },
+        )?;
+        Ok(Self {
+            rendezvous,
+            rank,
+            device_ordinal,
+            ready: false,
+        })
+    }
+
+    /// Resolve the world's base-pointer table, exactly once. Returns the table
+    /// the first time through and `None` afterwards.
+    ///
+    /// This blocks until every peer has published, which is the group's startup
+    /// barrier: a rank publishes only after its slab is allocated, zeroed and
+    /// synchronised, so no launch can precede the last allocation.
+    ///
+    /// The device pairs were opened before the slabs were allocated (the
+    /// memory-pool grant has to precede the allocation it covers), so all that
+    /// is left here is confirming that the ranks the group actually contains
+    /// are among the ones this rank opened — the call is idempotent, and it
+    /// fails with the peer's ordinal in the message if that device turned out
+    /// to be unreachable.
+    pub(crate) fn ensure_ready(&mut self) -> Result<Option<Vec<i64>>> {
+        if self.ready {
+            return Ok(None);
+        }
+        let slabs = self.rendezvous.slabs(self.rank)?;
+        for peer in &slabs {
+            k3_mega_open_peer_access(self.device_ordinal, peer.device_ordinal).with_context(
+                || {
+                    format!(
+                        "K3 MegaMoE rank {} cannot address rank {}'s slab",
+                        self.rank, peer.device_ordinal
+                    )
+                },
+            )?;
+        }
+        self.ready = true;
+        log::info!(
+            "K3 MegaMoE rank {} paired with {} ranks over peer access (devices {:?})",
+            self.rank,
+            slabs.len(),
+            slabs.iter().map(|s| s.device_ordinal).collect::<Vec<_>>()
+        );
+        Ok(Some(slabs.iter().map(|slab| slab.base).collect()))
+    }
+}
+
 /// A step that fails under expert parallelism has already left the group out
 /// of phase: the survivors' pending collectives pair against the wrong step,
 /// which is deterministic garbage rather than an error, and plain NCCL never
@@ -379,10 +545,14 @@ impl K3EpRuntime {
 // which this group can serve a correct next token.
 #[allow(clippy::exit)]
 pub(crate) fn ep_fatal(rank: usize, phase: &str, error: &anyhow::Error) -> ! {
-    log::error!(
+    let reason = format!(
         "K3 EP rank {rank} failed during {phase}: {error:#}. The EP group cannot recover from a \
-         missed step — every peer's next collective would pair against the wrong one — so this \
-         process is exiting."
+         missed step — every peer's next step would pair against the wrong one — so this process \
+         is exiting."
     );
+    log::error!("{reason}");
+    // The log goes nowhere when nobody installed a logger, and this call takes
+    // the process down: a fatal that leaves no trace is worse than noisy.
+    eprintln!("{reason}");
     std::process::exit(1);
 }

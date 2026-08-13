@@ -182,6 +182,13 @@ unsafe extern "C" {
     /// `num_max_tokens_per_rank` (`layout::kLCMCandidateBlockM`).
     pub fn k3_mega_token_alignment() -> i32;
 
+    /// Open the device pair `(self_ordinal, peer_ordinal)` for the kernel's
+    /// cross-rank addressing: peer access from this device's context, plus a
+    /// memory-pool access grant so this device's stream-ordered allocations are
+    /// visible from the peer. Must precede the allocations it protects.
+    /// Idempotent, and a no-op for the self pair.
+    pub fn k3_mega_open_peer_access(self_ordinal: i32, peer_ordinal: i32) -> CUresult;
+
     /// Symmetric-buffer sizing: total bytes plus the 12 sub-buffer byte offsets
     /// in the order `x, x_sf, topk_idx, topk_weights, shared_l1_acts,
     /// shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf, l1_acts,

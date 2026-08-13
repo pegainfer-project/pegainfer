@@ -115,6 +115,10 @@ use crate::model::K3RankModel;
 pub(crate) struct K3StepShape {
     /// Compiled batch bucket every kernel runs at.
     pub(crate) bucket: usize,
+    /// Leading rows of the bucket this rank actually owns this step; the rest
+    /// are padding. Only the expert-parallel MegaMoE path reads it — see
+    /// [`routed_experts_mega`].
+    pub(crate) live_rows: usize,
     /// Which half of each ping-pong state slab this step reads.
     pub(crate) parity: usize,
     /// Slots per sequence in the MLA cache.
@@ -823,6 +827,9 @@ fn moe_mlp(
         &mut s.latent,
     )?;
 
+    // MegaMoE covers both world sizes: at ep_size > 1 the executor builds no
+    // `K3EpRuntime` at all, because the fused kernel replaces the chain rather
+    // than riding alongside it.
     match ep {
         None if shape.mega => routed_experts_mega(ctx, shape, w, s)?,
         None => routed_experts(ctx, shape, w, s)?,
@@ -923,11 +930,27 @@ fn routed_experts_mega(
         .mega
         .as_mut()
         .context("K3 MegaMoE step ran without its symmetric buffer")?;
+    // Single-rank steps run the whole bucket: the count has to be a function of
+    // the bucket alone, because the step is captured into a CUDA graph. Above
+    // one rank the rows leave this device — a padding row would put junk
+    // routing on the wire and make a peer serve experts for a token nobody
+    // wants — so only the live prefix is sent, and an idle rank sends nothing
+    // at all while still launching (and so still serving its own experts for
+    // its peers, and still meeting every barrier).
+    let num_tokens = if mega.num_ranks > 1 {
+        shape.live_rows
+    } else {
+        shape.bucket
+    };
+    let symm_ptrs = mega
+        .peers()
+        .context("K3 MegaMoE EP step ran before its peers published their symmetric slabs")?
+        .to_vec();
     k3_mega_write_inputs_launch(
         ctx,
         &mega.layout,
         &mut mega.symm,
-        shape.bucket,
+        num_tokens,
         K3_ROUTED_EXPERT_HIDDEN,
         K3_ROUTER_TOPK,
         &s.latent,
@@ -938,14 +961,20 @@ fn routed_experts_mega(
         ctx,
         &mega.layout,
         &mut mega.symm,
+        &symm_ptrs,
         K3MegaShape {
-            num_tokens: shape.bucket,
+            num_tokens,
             num_max_tokens_per_rank: mega.max_tokens,
-            num_experts: shape.groups,
+            // GLOBAL: the kernel turns an expert id into a destination rank by
+            // dividing by the per-rank block, and the router already emits
+            // global ids, so nothing is rebased on either side.
+            num_experts: mega.routed_experts,
             num_topk: K3_ROUTER_TOPK,
             hidden: K3_ROUTED_EXPERT_HIDDEN,
             intermediate_hidden: K3_EXPERT_INTERMEDIATE,
             num_sms: shape.num_sms,
+            num_ranks: mega.num_ranks,
+            rank_idx: mega.rank_idx,
         },
         K3MegaActivation::Situ,
         &w.experts.w13_weight,

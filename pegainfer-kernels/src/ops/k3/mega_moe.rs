@@ -7,7 +7,10 @@
 //! mid-quantization and the combine. Everything it needs beyond the weights
 //! lives in one flat "symmetric" byte slab: at `ep_size == 1` that is a plain
 //! device allocation and the kernel's cross-rank barriers degrade to
-//! grid-local synchronisation.
+//! grid-local synchronisation. Above one rank every rank allocates its own slab
+//! on its own device and the whole table of base pointers is handed to every
+//! launch; the kernel does its own NVLink pairing over those pointers, so the
+//! host issues no collective of any kind.
 //!
 //! Two semantic differences from the masked chain are inherent to the fused
 //! kernel and expected to move logits slightly:
@@ -109,6 +112,29 @@ impl K3MegaSymmLayout {
 pub fn k3_mega_token_alignment() -> usize {
     // SAFETY: a pure constant getter with no arguments.
     (unsafe { ffi::k3_mega_token_alignment() }) as usize
+}
+
+/// Open the device pair `(self_ordinal, peer_ordinal)` for the fused kernel's
+/// cross-rank addressing.
+///
+/// Two grants, not one: peer access so `self_ordinal`'s context can address
+/// `peer_ordinal`'s memory, and a memory-pool access grant so `self_ordinal`'s
+/// own stream-ordered allocations are addressable from `peer_ordinal`. Peer
+/// access alone does not cover pool allocations, and everything here comes from
+/// the stream-ordered allocator — that omission reads as an illegal address
+/// inside the kernel, not as an error at setup.
+///
+/// The pool grant only reliably covers allocations made after it, so call this
+/// for every device that will ever address this rank's slab BEFORE allocating
+/// it. Idempotent, and a no-op for the self pair.
+pub fn k3_mega_open_peer_access(self_ordinal: usize, peer_ordinal: usize) -> Result<()> {
+    // SAFETY: an ordinal-only call into the CUDA runtime.
+    let result = unsafe {
+        ffi::k3_mega_open_peer_access(i32::try_from(self_ordinal)?, i32::try_from(peer_ordinal)?)
+    };
+    result.result().map_err(|err| {
+        anyhow!("K3 MegaMoE peer access {self_ordinal} -> {peer_ordinal} failed: {err}")
+    })
 }
 
 /// Symmetric-buffer sizing for one rank.
@@ -337,13 +363,15 @@ pub fn k3_mega_write_inputs_launch(
 /// allocation time — the kernel's workspace counters live in the same slab and
 /// are self-restoring across launches, but start from zero.
 ///
-/// Only `ep_size == 1` is wired: the AOT kernel is instantiated for one rank,
-/// so `symm_ptrs` is this rank's own base pointer.
+/// `symm_ptrs` is the world's base-pointer table: entry `r` is rank `r`'s slab
+/// as addressed from this context, so every peer entry needs CUDA peer access
+/// already enabled. Entry `shape.rank_idx` must be this rank's own `symm`.
 #[allow(clippy::too_many_arguments)]
 pub fn k3_mega_moe_launch(
     ctx: &DeviceContext,
     layout: &K3MegaSymmLayout,
     symm: &mut CudaSlice<u8>,
+    symm_ptrs: &[i64],
     shape: K3MegaShape,
     activation: K3MegaActivation,
     l1_weights: &CudaSlice<u8>,
@@ -359,19 +387,23 @@ pub fn k3_mega_moe_launch(
         symm.len(),
         layout.num_bytes
     );
+    // Weights are sharded: a rank holds only the experts it owns.
+    let local_experts = shape.local_experts();
     ensure!(
-        l1_weights.len()
-            >= shape.num_experts * (2 * shape.intermediate_hidden) * (shape.hidden / 2)
+        symm_ptrs.len() == shape.num_ranks,
+        "K3 MegaMoE needs one base pointer per rank ({} ranks), got {}",
+        shape.num_ranks,
+        symm_ptrs.len()
+    );
+    ensure!(
+        l1_weights.len() >= local_experts * (2 * shape.intermediate_hidden) * (shape.hidden / 2)
             && l1_weights_sf.len()
-                >= shape.num_experts
+                >= local_experts
                     * (shape.hidden / K3_MEGA_SF_WORD_K)
                     * (2 * shape.intermediate_hidden)
-            && l2_weights.len()
-                >= shape.num_experts * shape.hidden * (shape.intermediate_hidden / 2)
+            && l2_weights.len() >= local_experts * shape.hidden * (shape.intermediate_hidden / 2)
             && l2_weights_sf.len()
-                >= shape.num_experts
-                    * (shape.intermediate_hidden / K3_MEGA_SF_WORD_K)
-                    * shape.hidden,
+                >= local_experts * (shape.intermediate_hidden / K3_MEGA_SF_WORD_K) * shape.hidden,
         "K3 MegaMoE weight buffers too small for {shape:?}: l1 {}, l1_sf {}, l2 {}, l2_sf {}",
         l1_weights.len(),
         l1_weights_sf.len(),
@@ -391,9 +423,13 @@ pub fn k3_mega_moe_launch(
     let (l2_sf_ptr, _l2_sf_guard) = l2_weights_sf.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = output.device_ptr_mut(&ctx.stream);
 
-    // Single-rank pointer table: the kernel's `SymBuffer` maps every rank onto
-    // this one base, and its `map` is the identity at `kNumRanks == 1`.
-    let symm_ptrs: [i64; 1] = [symm_ptr as i64];
+    ensure!(
+        symm_ptrs[shape.rank_idx] == symm_ptr as i64,
+        "K3 MegaMoE rank {} published base {:#x} but is launching on {:#x}",
+        shape.rank_idx,
+        symm_ptrs[shape.rank_idx],
+        symm_ptr
+    );
     let offsets = *layout.offsets();
 
     let result = unsafe {
@@ -405,8 +441,8 @@ pub fn k3_mega_moe_launch(
             l2_sf_ptr as *const i32,
             symm_ptrs.as_ptr(),
             offsets.as_ptr(),
-            1,
-            0,
+            i32::try_from(shape.num_ranks)?,
+            i32::try_from(shape.rank_idx)?,
             i32::try_from(shape.num_max_tokens_per_rank)?,
             i32::try_from(shape.num_tokens)?,
             i32::try_from(shape.num_experts)?,
@@ -431,8 +467,15 @@ pub struct K3MegaShape {
     pub num_tokens: usize,
     /// Row capacity the symmetric buffer and the kernel were built for.
     pub num_max_tokens_per_rank: usize,
-    /// Routed experts on this rank (all of them at `ep_size == 1`).
+    /// GLOBAL routed-expert count. Rank `r` owns the contiguous block
+    /// `[r * num_experts / num_ranks, (r + 1) * ...)`, which is exactly how the
+    /// kernel derives a token's destination rank from its expert id, so the
+    /// routing ids fed to the slab must be global too.
     pub num_experts: usize,
+    /// Expert-parallel world size (1, or 4 — the instantiated widths).
+    pub num_ranks: usize,
+    /// This rank's index in that world.
+    pub rank_idx: usize,
     /// Router fan-out.
     pub num_topk: usize,
     /// Latent width the experts consume.
@@ -445,7 +488,22 @@ pub struct K3MegaShape {
 }
 
 impl K3MegaShape {
+    /// Experts this rank holds weights for.
+    #[must_use]
+    pub const fn local_experts(&self) -> usize {
+        self.num_experts / self.num_ranks
+    }
+
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.num_ranks > 0
+                && self.rank_idx < self.num_ranks
+                && self.num_experts.is_multiple_of(self.num_ranks),
+            "K3 MegaMoE rank {} of {} does not partition {} experts",
+            self.rank_idx,
+            self.num_ranks,
+            self.num_experts
+        );
         ensure!(
             self.num_tokens <= self.num_max_tokens_per_rank,
             "K3 MegaMoE fed {} tokens but the buffer holds {}",

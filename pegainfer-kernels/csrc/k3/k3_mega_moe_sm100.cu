@@ -6,7 +6,19 @@
 // the weights lives in one flat "symmetric" byte slab whose sub-buffer offsets
 // are pure host arithmetic over the shapes; at ep_size == 1 the slab is a plain
 // device allocation and the kernel's cross-rank barriers degrade to grid-local
-// synchronisation (`layout::SymBuffer<1>::map` is the identity).
+// synchronisation (`layout::SymBuffer<1>::map` is the identity). Above one rank
+// each rank owns one such slab on its own device and the launch is handed the
+// whole base-pointer table; the kernel's NVLink barriers pair the ranks, so the
+// host issues no collective at all.
+//
+// Cross-rank addressing is layout-only: every access a rank makes into a peer's
+// slab (`sym_buffer.map(...)`) targets a region whose offset and stride come
+// from `MegaMoEBuffer(hidden, intermediate, ranks, experts, max_tokens, topk,
+// ring_tokens, sf_ring_tokens)`. None of those terms involve BLOCK_M, BLOCK_N,
+// the stage count or the epilogue width. The block-config-dependent quantities
+// (pool block indices, the L1/L2 ring counters, SF paging) are only ever used
+// against the rank's OWN workspace and rings. A sender therefore never needs to
+// know the receiver's block config.
 //
 // ---------------------------------------------------------------------------
 // What this TU replicates from the upstream host side
@@ -51,11 +63,22 @@
 // ---------------------------------------------------------------------------
 // Instantiation matrix
 // ---------------------------------------------------------------------------
-// hidden 3584 (K3 latent), intermediate 3072, 224 experts, topk 16, ranks 1,
-// num_max_tokens_per_rank 384 (`kLCMCandidateBlockM`, the token alignment the
-// upstream API enforces), 152 SMs (GB300). Three block configs are reachable
-// for num_tokens <= 384 under `get_block_config_for_mega_moe`, times the two
-// activations (situ for K3, swiglu as a regression handle) = 6 kernels.
+// hidden 3584 (K3 latent), intermediate 3072, 224 experts (GLOBAL — a rank
+// holds `224 / ranks` of them), topk 16, num_max_tokens_per_rank 384
+// (`kLCMCandidateBlockM`, the token alignment the upstream API enforces), 152
+// SMs (GB300), two world sizes: 1 rank and 4 ranks (56 experts each).
+//
+// At ranks 1 the launch picks among the three block configs reachable for
+// num_tokens <= 384 under `get_block_config_for_mega_moe`, so a single-rank
+// launch stays bit-identical to what upstream's Python wrapper would run.
+// At ranks 4 there is exactly ONE config, taken at the protocol maximum
+// (num_tokens == 384) rather than from the live token count — see the note on
+// `kRanks4Config`. Times the two activations (situ for K3, swiglu as a
+// regression handle): 3 * 2 + 1 * 2 = 8 kernels.
+//
+// The ring capacities (`kNumRingTokens`, `kNumSFRingTokens`) are template
+// parameters that depend on the rank count, so each world size carries its own
+// pair; see `MegaRing`.
 //
 // build.rs compiles this TU for sm_100f ONLY when a sm_100-family target
 // exists; otherwise every entry point compiles as a NOT_SUPPORTED stub.
@@ -363,8 +386,8 @@ constexpr int kNumBlockConfigs = (int)(sizeof(kBlockLadder) / sizeof(kBlockLadde
 // `num_expected_tokens_per_expert = num_tokens * num_ranks * num_topk / num_experts`
 // compared against the ladder's thresholds. Done in integers: the comparison
 // `expected <= bucket` becomes `2 * num_tokens * ranks * topk <= bucket_x2 * experts`.
-inline int mega_block_config_index(int num_tokens, int num_ranks, int num_experts,
-                                   int num_topk) {
+constexpr int mega_block_config_index(int num_tokens, int num_ranks, int num_experts,
+                                      int num_topk) {
   const long long lhs = 2LL * num_tokens * num_ranks * num_topk;
   for (int i = 0; i < kNumBlockConfigs - 1; ++i) {
     if (lhs <= (long long)kBlockLadder[i].bucket_x2 * num_experts) return i;
@@ -405,17 +428,26 @@ constexpr PipelineConfig mega_pipeline(int num_experts, int block_m, int block_n
 // AOT instantiations
 // ---------------------------------------------------------------------------
 
-constexpr int kNumRanks = 1;
 constexpr int kMaxTokensPerRank = 384;  // layout::kLCMCandidateBlockM
 constexpr int kGb300Sms = 152;
-
-constexpr int kRingTokens = mega_ring_tokens(kNumRanks, kNumExperts, kMaxTokensPerRank, kNumTopk,
-                                             kHidden, kIntermediate, kGb300Sms);
-constexpr int kSfRingTokens = mega_sf_ring_tokens(kRingTokens);
 constexpr int kBytesPerPull = mega_bytes_per_pull(kHidden);
 
-// One AOT kernel: a ladder entry crossed with an activation.
-template <int kCfgIdx, bool kSitu>
+/// Expert-parallel widths the kernel is instantiated for.
+constexpr int kEpRanks1 = 1;
+constexpr int kEpRanks4 = 4;
+
+// The ring capacities are template parameters, and they depend on the rank
+// count (through the experts-per-rank and the worst-case routed-token count),
+// so every supported world size is its own set of constants.
+template <int kRanks>
+struct MegaRing {
+  static constexpr int kTokens = mega_ring_tokens(kRanks, kNumExperts, kMaxTokensPerRank, kNumTopk,
+                                                  kHidden, kIntermediate, kGb300Sms);
+  static constexpr int kSfTokens = mega_sf_ring_tokens(kTokens);
+};
+
+// One AOT kernel: a world size crossed with a ladder entry and an activation.
+template <int kRanks, int kCfgIdx, bool kSitu>
 struct MegaKernel {
   static constexpr BlockConfig kCfg = kBlockLadder[kCfgIdx];
   static constexpr int kBlockM = kCfg.block_m;
@@ -425,6 +457,7 @@ struct MegaKernel {
   // SM100ArchSpec::get_sf_uttcp_aligned_block_sizes for MXFP8FP4.
   static constexpr int kSfBlockM = alignup(kBlockM, 128);
   static constexpr int kSfBlockN = alignup(kMegaBlockN, 128);
+  // The dispatch smem holds one counter per GLOBAL expert, not per local one.
   static constexpr PipelineConfig kPipe =
       mega_pipeline(kNumExperts, kBlockM, kMegaBlockN, kBlockK, kStoreBlockM, kSfBlockM,
                     kSfBlockN, kNumDispatchThreads / 32, kEpilogueThreads / 32, kBytesPerPull);
@@ -437,15 +470,45 @@ struct MegaKernel {
 
   static constexpr auto kFn = &sm100_fp8_fp4_mega_moe_impl<
       kMaxTokensPerRank, kHidden, kIntermediate, kNumExperts, /*shared=*/0, kNumTopk, kBlockM,
-      kMegaBlockN, kBlockK, kStoreBlockM, kSfBlockM, kSfBlockN, kRingTokens, kSfRingTokens,
-      kPipe.num_stages, kBytesPerPull, kNumDispatchThreads, kNumNonEpilogueThreads,
-      kEpilogueThreads, kGb300Sms, kNumRanks, /*clamp=*/inf, kSitu, /*fast_math=*/false>;
+      kMegaBlockN, kBlockK, kStoreBlockM, kSfBlockM, kSfBlockN, MegaRing<kRanks>::kTokens,
+      MegaRing<kRanks>::kSfTokens, kPipe.num_stages, kBytesPerPull, kNumDispatchThreads,
+      kNumNonEpilogueThreads, kEpilogueThreads, kGb300Sms, kRanks, /*clamp=*/inf, kSitu,
+      /*fast_math=*/false>;
 };
 
-// Only the first three ladder entries are reachable at
-// num_max_tokens_per_rank == 384 with 224 experts and topk 16 (the 96/128/192
-// entries need > 455 tokens), so those are the only ones instantiated.
+// Single rank: the first three ladder entries are the reachable ones at
+// num_max_tokens_per_rank == 384 with 224 local experts and topk 16 (the
+// 96/128/192 entries need > 455 tokens), and the launch picks among them by
+// the upstream heuristic so a single-rank launch stays bit-identical to what
+// DeepGEMM's own Python wrapper would have run.
 constexpr int kNumReachableConfigs = 3;
+static_assert(mega_block_config_index(kMaxTokensPerRank, kEpRanks1, kNumExperts, kNumTopk) <
+                  kNumReachableConfigs,
+              "the single-rank protocol max must land inside the instantiated ladder prefix");
+
+// Four ranks: ONE config for every launch, chosen at the protocol maximum
+// (`num_tokens == num_max_tokens_per_rank`) rather than from the live token
+// count.
+//
+// Two reasons. First, a per-step config would let peers disagree about BLOCK_M
+// within one collective launch; nothing in the kernel forces the world to
+// agree, and cross-rank behaviour under heterogeneous tiling is unverified
+// territory. (The addressing itself is safe — see the layout note at the top of
+// this file — but "safe to address" is not "known to be correct".) Second, a
+// fixed config makes a row's tile shape independent of how much traffic its
+// peers happen to be sending, which is what makes traffic invariance testable
+// as bitwise equality rather than as a tolerance.
+//
+// The cost is small-batch efficiency: a 16-token step still runs BLOCK_M 192
+// tiles. That is accepted — the fused path is still ahead of the masked chain,
+// which additionally pays four NCCL collectives per MoE layer at EP4.
+constexpr int kRanks4Config =
+    mega_block_config_index(kMaxTokensPerRank, kEpRanks4, kNumExperts, kNumTopk);
+static_assert(kBlockLadder[kRanks4Config].block_m == 192,
+              "EP4 protocol-max config is expected to be the BLOCK_M 192 ladder entry");
+static_assert(kBlockLadder[kRanks4Config].block_k == kBlockLadder[2].block_k,
+              "EP4 and the widest single-rank config must share BLOCK_K, or a row's MMA "
+              "K-accumulation order differs between world sizes");
 
 // ---------------------------------------------------------------------------
 // Launch
@@ -487,11 +550,15 @@ struct MegaBuffers {
   void* l2_acts_sf;
 };
 
-template <typename Kernel>
+template <int kRanks, typename Kernel>
 CUresult launch_mega(unsigned short* y, const unsigned char* l1_weights, const int* l1_weights_sf,
                      const unsigned char* l2_weights, const int* l2_weights_sf,
-                     const MegaBuffers& buffers, const long long* symm_ptrs, int num_ranks,
-                     int rank_idx, int num_tokens, int* cumulative_stats, cudaStream_t stream) {
+                     const MegaBuffers& buffers, const long long* symm_ptrs, int rank_idx,
+                     int num_tokens, int* cumulative_stats, cudaStream_t stream) {
+  constexpr int kRingTokens = MegaRing<kRanks>::kTokens;
+  constexpr int kSfRingTokens = MegaRing<kRanks>::kSfTokens;
+  // Weight tensors are sharded: a rank holds only its own experts.
+  constexpr int kExpertsPerRank = kNumExperts / kRanks;
   const auto func = reinterpret_cast<const void*>(Kernel::kFn);
   const cudaError_t attr_err = cudaFuncSetAttribute(
       func, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel::kSmemSize);
@@ -511,11 +578,11 @@ CUresult launch_mega(unsigned short* y, const unsigned char* l1_weights, const i
   {
     const CUresult err = make_fp4_k_major_tma_desc(
         &tm_l1_weights, l1_weights, kHidden,
-        (long long)kNumExperts * (long long)(kIntermediate * 2), kLoadBlockN);
+        (long long)kExpertsPerRank * (long long)(kIntermediate * 2), kLoadBlockN);
     if (err != CUDA_SUCCESS) return err;
   }
   CUtensorMap tm_l1_weights_sf = make_sf_desc(const_cast<int*>(l1_weights_sf), kIntermediate * 2,
-                                              kHidden, kMegaBlockN, kNumExperts, kSfSmemOuter);
+                                              kHidden, kMegaBlockN, kExpertsPerRank, kSfSmemOuter);
   // L1 output and L2 activations are the same tensor; the post-activation
   // output is BLOCK_N / 2 wide, so its swizzle halves too.
   CUtensorMap tm_l1_output = deep_gemm::make_tma_2d_desc_raw(
@@ -529,12 +596,13 @@ CUresult launch_mega(unsigned short* y, const unsigned char* l1_weights, const i
   CUtensorMap tm_l2_weights;
   {
     const CUresult err = make_fp4_k_major_tma_desc(&tm_l2_weights, l2_weights, kIntermediate,
-                                                   (long long)kNumExperts * (long long)kHidden,
+                                                   (long long)kExpertsPerRank * (long long)kHidden,
                                                    kLoadBlockN);
     if (err != CUDA_SUCCESS) return err;
   }
   CUtensorMap tm_l2_weights_sf = make_sf_desc(const_cast<int*>(l2_weights_sf), kHidden,
-                                              kIntermediate, kMegaBlockN, kNumExperts, kSfSmemOuter);
+                                              kIntermediate, kMegaBlockN, kExpertsPerRank,
+                                              kSfSmemOuter);
 
   // No shared experts: upstream passes the routed descriptors through.
   CUtensorMap tm_sl1_acts = tm_l1_acts;
@@ -547,11 +615,14 @@ CUresult launch_mega(unsigned short* y, const unsigned char* l1_weights, const i
   CUtensorMap tm_sl2_weights = tm_l2_weights;
   CUtensorMap tm_sl2_weights_sf = tm_l2_weights_sf;
 
-  deep_gemm::layout::SymBuffer<kNumRanks> sym_buffer;
+  // The kernel maps a local pointer onto rank r by adding `offsets[r]`, so the
+  // table is peer-base minus own-base. At `kRanks == 1` `map` is the identity
+  // and the offsets are never read.
+  deep_gemm::layout::SymBuffer<kRanks> sym_buffer;
   sym_buffer.rank_idx = (uint32_t)rank_idx;
   sym_buffer.base = symm_ptrs[rank_idx];
   for (uint32_t i = 0; i < deep_gemm::layout::kNumMaxRanks; ++i) {
-    sym_buffer.offsets[i] = i < (uint32_t)num_ranks ? symm_ptrs[i] - sym_buffer.base : 0;
+    sym_buffer.offsets[i] = i < (uint32_t)kRanks ? symm_ptrs[i] - sym_buffer.base : 0;
   }
 
   cudaLaunchAttribute attrs[2];
@@ -595,28 +666,62 @@ CUresult launch_mega(unsigned short* y, const unsigned char* l1_weights, const i
   return map_cuda_error(cudaLaunchKernelExC(&config, func, args));
 }
 
+// Single rank: pick the ladder entry the upstream heuristic would have picked
+// for this token count, so a launch stays bit-identical to DeepGEMM's Python
+// path.
 template <bool kSitu>
-CUresult launch_mega_by_config(int cfg_idx, unsigned short* y, const unsigned char* l1_weights,
-                               const int* l1_weights_sf, const unsigned char* l2_weights,
-                               const int* l2_weights_sf, const MegaBuffers& buffers,
-                               const long long* symm_ptrs, int num_ranks, int rank_idx,
-                               int num_tokens, int* cumulative_stats, cudaStream_t stream) {
+CUresult launch_mega_ranks1(int cfg_idx, unsigned short* y, const unsigned char* l1_weights,
+                            const int* l1_weights_sf, const unsigned char* l2_weights,
+                            const int* l2_weights_sf, const MegaBuffers& buffers,
+                            const long long* symm_ptrs, int rank_idx, int num_tokens,
+                            int* cumulative_stats, cudaStream_t stream) {
   switch (cfg_idx) {
     case 0:
-      return launch_mega<MegaKernel<0, kSitu>>(y, l1_weights, l1_weights_sf, l2_weights,
-                                               l2_weights_sf, buffers, symm_ptrs, num_ranks,
-                                               rank_idx, num_tokens, cumulative_stats, stream);
+      return launch_mega<kEpRanks1, MegaKernel<kEpRanks1, 0, kSitu>>(
+          y, l1_weights, l1_weights_sf, l2_weights, l2_weights_sf, buffers, symm_ptrs, rank_idx,
+          num_tokens, cumulative_stats, stream);
     case 1:
-      return launch_mega<MegaKernel<1, kSitu>>(y, l1_weights, l1_weights_sf, l2_weights,
-                                               l2_weights_sf, buffers, symm_ptrs, num_ranks,
-                                               rank_idx, num_tokens, cumulative_stats, stream);
+      return launch_mega<kEpRanks1, MegaKernel<kEpRanks1, 1, kSitu>>(
+          y, l1_weights, l1_weights_sf, l2_weights, l2_weights_sf, buffers, symm_ptrs, rank_idx,
+          num_tokens, cumulative_stats, stream);
     case 2:
-      return launch_mega<MegaKernel<2, kSitu>>(y, l1_weights, l1_weights_sf, l2_weights,
-                                               l2_weights_sf, buffers, symm_ptrs, num_ranks,
-                                               rank_idx, num_tokens, cumulative_stats, stream);
+      return launch_mega<kEpRanks1, MegaKernel<kEpRanks1, 2, kSitu>>(
+          y, l1_weights, l1_weights_sf, l2_weights, l2_weights_sf, buffers, symm_ptrs, rank_idx,
+          num_tokens, cumulative_stats, stream);
     default:
       return CUDA_ERROR_NOT_SUPPORTED;
   }
+}
+
+// Four ranks: always `kRanks4Config`, whatever the live token count is.
+template <bool kSitu>
+CUresult launch_mega_ranks4(unsigned short* y, const unsigned char* l1_weights,
+                            const int* l1_weights_sf, const unsigned char* l2_weights,
+                            const int* l2_weights_sf, const MegaBuffers& buffers,
+                            const long long* symm_ptrs, int rank_idx, int num_tokens,
+                            int* cumulative_stats, cudaStream_t stream) {
+  return launch_mega<kEpRanks4, MegaKernel<kEpRanks4, kRanks4Config, kSitu>>(
+      y, l1_weights, l1_weights_sf, l2_weights, l2_weights_sf, buffers, symm_ptrs, rank_idx,
+      num_tokens, cumulative_stats, stream);
+}
+
+template <bool kSitu>
+CUresult launch_mega_by_world(int num_ranks, int cfg_idx, unsigned short* y,
+                              const unsigned char* l1_weights, const int* l1_weights_sf,
+                              const unsigned char* l2_weights, const int* l2_weights_sf,
+                              const MegaBuffers& buffers, const long long* symm_ptrs, int rank_idx,
+                              int num_tokens, int* cumulative_stats, cudaStream_t stream) {
+  if (num_ranks == kEpRanks1) {
+    return launch_mega_ranks1<kSitu>(cfg_idx, y, l1_weights, l1_weights_sf, l2_weights,
+                                     l2_weights_sf, buffers, symm_ptrs, rank_idx, num_tokens,
+                                     cumulative_stats, stream);
+  }
+  if (num_ranks == kEpRanks4) {
+    return launch_mega_ranks4<kSitu>(y, l1_weights, l1_weights_sf, l2_weights, l2_weights_sf,
+                                     buffers, symm_ptrs, rank_idx, num_tokens, cumulative_stats,
+                                     stream);
+  }
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 #endif  // K3_MEGA_MOE_SM100F
@@ -627,6 +732,53 @@ extern "C" {
 
 // Token-count alignment the mega API enforces (`layout::kLCMCandidateBlockM`).
 int k3_mega_token_alignment(void) { return 384; }
+
+// Let this rank's device read and write `peer_ordinal`'s memory, and let
+// `peer_ordinal` read and write ours.
+//
+// Two separate things have to be opened, and getting only the first is the
+// classic way to earn an illegal address here:
+//
+//  * `cudaDeviceEnablePeerAccess` makes the CALLING device's context able to
+//    address `peer_ordinal`'s allocations. That is what the kernel's
+//    `SymBuffer::map` arithmetic relies on.
+//  * `cudaMemPoolSetAccess` makes THIS device's stream-ordered pool allocations
+//    visible from `peer_ordinal`. Peer-access enablement explicitly does not
+//    cover memory-pool allocations, and every buffer here comes from the
+//    stream-ordered allocator, so without this the peers hold a pointer they
+//    may not dereference.
+//
+// The pool grant only reliably covers allocations made AFTER it, so the caller
+// has to open every device it will ever expose memory to before it allocates
+// the slab. Idempotent, and a no-op for the self pair.
+CUresult k3_mega_open_peer_access(int self_ordinal, int peer_ordinal) {
+  PEGAINFER_FFI_GUARD_BEGIN
+  if (self_ordinal < 0 || peer_ordinal < 0) return CUDA_ERROR_INVALID_VALUE;
+  if (self_ordinal == peer_ordinal) return CUDA_SUCCESS;
+  int reachable = 0;
+  const cudaError_t query = cudaDeviceCanAccessPeer(&reachable, self_ordinal, peer_ordinal);
+  if (query != cudaSuccess) return map_cuda_error(query);
+  if (reachable == 0) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
+
+  const cudaError_t bind = cudaSetDevice(self_ordinal);
+  if (bind != cudaSuccess) return map_cuda_error(bind);
+  const cudaError_t enable = cudaDeviceEnablePeerAccess(peer_ordinal, 0);
+  if (enable == cudaErrorPeerAccessAlreadyEnabled) {
+    (void)cudaGetLastError();
+  } else if (enable != cudaSuccess) {
+    return map_cuda_error(enable);
+  }
+
+  cudaMemPool_t pool = nullptr;
+  const cudaError_t pool_err = cudaDeviceGetDefaultMemPool(&pool, self_ordinal);
+  if (pool_err != cudaSuccess) return map_cuda_error(pool_err);
+  cudaMemAccessDesc desc{};
+  desc.location.type = cudaMemLocationTypeDevice;
+  desc.location.id = peer_ordinal;
+  desc.flags = cudaMemAccessFlagsProtReadWrite;
+  return map_cuda_error(cudaMemPoolSetAccess(pool, &desc, 1));
+  PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
+}
 
 #ifdef K3_MEGA_MOE_SM100F
 
@@ -757,8 +909,9 @@ CUresult k3_mega_write_routing_cuda(const int* topk_idx, const float* topk_weigh
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }
 
-// `symm_ptrs` is the per-rank base pointer table (`buffer_ptrs` upstream); at
-// ep_size == 1 it is a single entry holding this rank's own slab.
+// `symm_ptrs` is the per-rank base pointer table (`buffer_ptrs` upstream): entry
+// `i` is rank `i`'s slab base, mapped into this context (peer access enabled).
+// At ep_size == 1 it is a single entry holding this rank's own slab.
 CUresult k3_mega_moe_launch_cuda(unsigned short* y, const unsigned char* l1_weights,
                                  const int* l1_weights_sf, const unsigned char* l2_weights,
                                  const int* l2_weights_sf, const long long* symm_ptrs,
@@ -773,10 +926,13 @@ CUresult k3_mega_moe_launch_cuda(unsigned short* y, const unsigned char* l1_weig
       symm_offsets == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  if (num_ranks != kNumRanks || rank_idx != 0 || num_experts != kNumExperts ||
+  if ((num_ranks != kEpRanks1 && num_ranks != kEpRanks4) || num_experts != kNumExperts ||
       num_topk != kNumTopk || hidden != kHidden || intermediate_hidden != kIntermediate ||
       num_max_tokens_per_rank != kMaxTokensPerRank || num_sms != kGb300Sms) {
     return CUDA_ERROR_NOT_SUPPORTED;
+  }
+  if (rank_idx < 0 || rank_idx >= num_ranks || num_experts % num_ranks != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
   }
   if (num_tokens < 0 || num_tokens > num_max_tokens_per_rank) return CUDA_ERROR_INVALID_VALUE;
 
@@ -788,18 +944,23 @@ CUresult k3_mega_moe_launch_cuda(unsigned short* y, const unsigned char* l1_weig
   buffers.l2_acts = base + symm_offsets[10];
   buffers.l2_acts_sf = base + symm_offsets[11];
 
-  const int cfg_idx = mega_block_config_index(num_tokens, num_ranks, num_experts, num_topk);
-  if (cfg_idx >= kNumReachableConfigs) return CUDA_ERROR_NOT_SUPPORTED;
-
+  // Single rank follows the upstream heuristic (live token count), which is what
+  // the Python parity fixture exercises. Multi-rank pins one block config for
+  // every rank and every step: cross-rank writes must not depend on the
+  // receiver's tiling, and a traffic-independent tile shape is what makes a
+  // rank's own rows bitwise-stable as its peers' batches move.
+  const int cfg_idx = num_ranks == kEpRanks1
+                          ? mega_block_config_index(num_tokens, num_ranks, num_experts, num_topk)
+                          : kRanks4Config;
   if (activation == kActSitu) {
-    return launch_mega_by_config<true>(cfg_idx, y, l1_weights, l1_weights_sf, l2_weights,
-                                       l2_weights_sf, buffers, symm_ptrs, num_ranks, rank_idx,
-                                       num_tokens, cumulative_stats, stream);
+    return launch_mega_by_world<true>(num_ranks, cfg_idx, y, l1_weights, l1_weights_sf, l2_weights,
+                                      l2_weights_sf, buffers, symm_ptrs, rank_idx, num_tokens,
+                                      cumulative_stats, stream);
   }
   if (activation == kActSwiglu) {
-    return launch_mega_by_config<false>(cfg_idx, y, l1_weights, l1_weights_sf, l2_weights,
-                                        l2_weights_sf, buffers, symm_ptrs, num_ranks, rank_idx,
-                                        num_tokens, cumulative_stats, stream);
+    return launch_mega_by_world<false>(num_ranks, cfg_idx, y, l1_weights, l1_weights_sf,
+                                       l2_weights, l2_weights_sf, buffers, symm_ptrs, rank_idx,
+                                       num_tokens, cumulative_stats, stream);
   }
   return CUDA_ERROR_INVALID_VALUE;
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)

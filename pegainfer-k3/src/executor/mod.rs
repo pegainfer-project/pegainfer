@@ -75,10 +75,12 @@ use pegainfer_kernels::ops::K3_MAX_CTX;
 use pegainfer_kernels::ops::k3_batch_bucket;
 use pegainfer_kernels::tensor::DeviceContext;
 
+use self::buffers::K3MegaGeometry;
 use self::buffers::K3Scratch;
 use self::buffers::K3StatePool;
 use self::ep::K3EpRendezvous;
 use self::ep::K3EpRuntime;
+use self::ep::K3MegaEpRuntime;
 use self::ep::ep_fatal;
 use self::step::K3StepShape;
 use self::step::k3_decode_step;
@@ -109,11 +111,15 @@ const K3_CUDA_GRAPH_ENV: &str = "PEGAINFER_K3_CUDA_GRAPH";
 /// widest one.
 const K3_MAX_BATCH_ENV: &str = "PEGAINFER_K3_MAX_BATCH";
 /// Set to `1` to run the routed experts through DeepGEMM's fused MegaMoE
-/// kernel instead of the masked chain. Single-rank only for now.
+/// kernel instead of the masked chain.
 const K3_MEGA_ENV: &str = "PEGAINFER_K3_MEGA";
 /// The only SM count the fused MegaMoE kernel is AOT-instantiated for. Its
 /// grid sync spans the whole grid, so the launch geometry is baked in.
 const K3_MEGA_SMS: usize = 152;
+/// Expert-parallel widths the fused MegaMoE kernel is AOT-instantiated for.
+/// The rank count is a template parameter (it sets the ring capacities and the
+/// experts-per-rank divisor), so this is not a runtime dimension.
+const K3_MEGA_EP_SIZES: [usize; 2] = [1, 4];
 
 /// Slots per rank an expert-parallel launch takes when nothing says otherwise.
 /// The ceiling is arithmetic — the worst case is one expert claiming every
@@ -219,9 +225,13 @@ pub struct K3Executor {
     cache_row_host: Vec<i32>,
     sampled_host: Vec<i32>,
     thread_bound: bool,
-    /// Present exactly when `ep_size > 1`. Holds this rank's collective
-    /// buffers and, once the first step has run, its communicator.
+    /// Present exactly when `ep_size > 1` and the MoE runs the NCCL chain.
+    /// Holds this rank's collective buffers and, once the first step has run,
+    /// its communicator.
     ep: Option<K3EpRuntime>,
+    /// Present exactly when `ep_size > 1` and the MoE runs through MegaMoE.
+    /// The two are mutually exclusive: MegaMoE replaces the chain outright.
+    mega_ep: Option<K3MegaEpRuntime>,
 }
 
 // SAFETY: the executor owns one rank's context, stream and device buffers, and
@@ -354,9 +364,10 @@ impl K3Executor {
         // Worst case one expert claims every token of the global batch, so the
         // fleet's whole batch has to fit the masked layout's per-expert rows.
         // The route metadata's device trap is the backstop; this is the check
-        // that turns it into a launch-time message.
+        // that turns it into a launch-time message. MegaMoE does not use the
+        // masked layout at all, so the ceiling is not its ceiling.
         ensure!(
-            ep_size * max_batch <= K3_MASKED_CAP,
+            config.mega || ep_size * max_batch <= K3_MASKED_CAP,
             "K3 ep_size {ep_size} x {max_batch} slots per rank exceeds the {K3_MASKED_CAP} rows \
              the masked layout reserves per expert — lower {K3_MAX_BATCH_ENV}"
         );
@@ -367,9 +378,9 @@ impl K3Executor {
         let prefill_state = K3StatePool::new(&ctx, 1, config.max_ctx, num_layers, blocks)?;
         if config.mega {
             ensure!(
-                ep_size == 1,
-                "K3 MegaMoE is wired for ep_size 1 only (this rank is one of {ep_size}); \
-                 unset {K3_MEGA_ENV} or drop --k3-ep-size"
+                K3_MEGA_EP_SIZES.contains(&ep_size),
+                "K3 MegaMoE is AOT-instantiated for ep_size {K3_MEGA_EP_SIZES:?} only, not \
+                 {ep_size}; unset {K3_MEGA_ENV} or pick one of those widths"
             );
             // The fused kernel's grid sync spans exactly its instantiation's SM
             // count, so a mismatched launch grid would hang rather than
@@ -381,16 +392,24 @@ impl K3Executor {
                  this device has {num_sms} SMs — unset {K3_MEGA_ENV} to run the masked chain"
             );
         }
-        let scratch = K3Scratch::new(
+        let mut scratch = K3Scratch::new(
             &ctx,
             max_batch,
             chain_tokens,
             routed_experts,
             groups,
             K3_MASKED_CAP,
-            config.mega.then_some(num_sms),
+            config.mega.then_some(K3MegaGeometry {
+                num_sms,
+                num_ranks: ep_size,
+                rank_idx: model.rank,
+            }),
         )?;
+        // MegaMoE replaces the collective chain outright, so a mega group has
+        // no communicator and no collective buffers at all.
         let ep = rendezvous
+            .clone()
+            .filter(|_| !config.mega)
             .map(|rendezvous| {
                 K3EpRuntime::new(
                     &ctx,
@@ -403,7 +422,19 @@ impl K3Executor {
                 )
             })
             .transpose()?;
+        // Every allocation this rank will ever hand a peer has to be live and
+        // zeroed before its base pointer is published, hence the sync first.
         gpu.sync()?;
+        let mega_ep = rendezvous
+            .filter(|_| config.mega)
+            .map(|rendezvous| {
+                let mega = scratch
+                    .mega
+                    .as_mut()
+                    .context("K3 MegaMoE EP rank built without its symmetric buffer")?;
+                K3MegaEpRuntime::new(rendezvous, model.rank, mega.base(), gpu.device_ordinal())
+            })
+            .transpose()?;
 
         let bucket_count = K3_BATCH_BUCKETS.iter().filter(|b| **b <= max_batch).count();
         info!(
@@ -413,10 +444,16 @@ impl K3Executor {
             model.rank,
             config.max_ctx,
             if config.mega { "mega" } else { "masked-chain" },
-            ep.as_ref().map_or(String::new(), |ep| format!(
-                ", collectives/step={}",
-                ep.collectives_per_step()
-            ))
+            ep.as_ref().map_or_else(
+                || {
+                    if mega_ep.is_some() {
+                        ", collectives/step=0 (the fused kernel pairs the ranks itself)".to_string()
+                    } else {
+                        String::new()
+                    }
+                },
+                |ep| format!(", collectives/step={}", ep.collectives_per_step())
+            )
         );
         Ok(Self {
             gpu,
@@ -442,6 +479,7 @@ impl K3Executor {
             sampled_host: vec![0; max_batch],
             thread_bound: false,
             ep,
+            mega_ep,
         })
     }
 
@@ -471,13 +509,22 @@ impl K3Executor {
         if let Some(ep) = self.ep.as_mut() {
             ep.ensure_comm(&self.ctx)?;
         }
+        if let Some(mega_ep) = self.mega_ep.as_mut()
+            && let Some(ptrs) = mega_ep.ensure_ready()?
+        {
+            self.scratch
+                .mega
+                .as_mut()
+                .context("K3 MegaMoE EP step ran without its symmetric buffer")?
+                .set_peers(ptrs)?;
+        }
         Ok(())
     }
 
     /// Is this executor one rank of an expert-parallel group?
     #[must_use]
     pub fn is_expert_parallel(&self) -> bool {
-        self.ep.is_some()
+        self.ep.is_some() || self.mega_ep.is_some()
     }
 
     /// Collectives one step of this executor issues, or `0` single-rank. The
@@ -489,9 +536,15 @@ impl K3Executor {
             .map_or(0, K3EpRuntime::collectives_per_step)
     }
 
-    fn shape(&self, bucket: usize, parity: usize) -> K3StepShape {
+    /// `live_rows` is how many leading rows of the bucket this step actually
+    /// owns — zero on an expert-parallel padding step. Only the MegaMoE path at
+    /// `ep_size > 1` reads it: everything else runs the whole bucket and throws
+    /// the padding rows away, but a mega rank's rows travel to its peers, so it
+    /// sends only the rows it has.
+    fn shape(&self, bucket: usize, parity: usize, live_rows: usize) -> K3StepShape {
         K3StepShape {
             bucket,
+            live_rows,
             parity,
             max_ctx: self.max_ctx,
             groups: self.groups,
@@ -516,8 +569,14 @@ impl K3Executor {
     }
 
     /// Run one step against `pool`, through its graph when graphs are on.
-    fn run_step(&mut self, prefill: bool, bucket: usize, parity: usize) -> Result<()> {
-        let shape = self.shape(bucket, parity);
+    fn run_step(
+        &mut self,
+        prefill: bool,
+        bucket: usize,
+        parity: usize,
+        live_rows: usize,
+    ) -> Result<()> {
+        let shape = self.shape(bucket, parity, live_rows);
         let (pool, graph_index) = if prefill {
             (&mut self.prefill_state, parity)
         } else {
@@ -645,7 +704,7 @@ impl K3Executor {
             self.cache_row_host[row] = -1;
         }
         self.feed()?;
-        self.run_step(true, 1, parity)?;
+        self.run_step(true, 1, parity, 1)?;
         self.prefill_state.positions[0] = position + 1;
         Ok(self.sampled(1)?[0] as u32)
     }
@@ -669,7 +728,7 @@ impl StepExecutor for K3Executor {
     fn prefill(&mut self, slot: SlotId, prompt: &[u32], params: &SamplingParams) -> Result<u32> {
         let rank = self.model.rank;
         match self.prefill_inner(slot, prompt, params) {
-            Err(error) if self.ep.is_some() => ep_fatal(rank, "prefill", &error),
+            Err(error) if self.is_expert_parallel() => ep_fatal(rank, "prefill", &error),
             other => other,
         }
     }
@@ -677,7 +736,7 @@ impl StepExecutor for K3Executor {
     fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
         let rank = self.model.rank;
         match self.decode_inner(batch) {
-            Err(error) if self.ep.is_some() => ep_fatal(rank, "decode", &error),
+            Err(error) if self.is_expert_parallel() => ep_fatal(rank, "decode", &error),
             other => other,
         }
     }
@@ -736,12 +795,17 @@ impl K3Executor {
     ///
     /// An empty batch is an early return single-rank — there is nothing to
     /// compute and nobody to answer to. Under expert parallelism it is a
-    /// *padding step*: this rank owes its peers the same collective chain
+    /// *padding step*: this rank owes its peers the same per-layer sequence
     /// whether or not it has work, so it runs the narrowest bucket with every
     /// row padding and returns no tokens. That is the whole free-running story
     /// — a rank never negotiates, it just keeps walking the chain.
+    ///
+    /// Under MegaMoE the same step still launches every MoE layer, at zero
+    /// local tokens: the kernel serves this rank's experts for its peers'
+    /// tokens and joins every device barrier regardless of what it holds
+    /// itself.
     fn decode_inner(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
-        if batch.is_empty() && self.ep.is_none() {
+        if batch.is_empty() && !self.is_expert_parallel() {
             return Ok(Vec::new());
         }
         self.enter_step()?;
@@ -774,7 +838,7 @@ impl K3Executor {
 
         self.feed()?;
         let parity = self.parity;
-        self.run_step(false, bucket, parity)?;
+        self.run_step(false, bucket, parity, rows)?;
         self.parity ^= 1;
         for entry in batch {
             self.decode_state.positions[entry.slot] += 1;
