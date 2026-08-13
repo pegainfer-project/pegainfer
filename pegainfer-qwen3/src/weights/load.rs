@@ -10,6 +10,7 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::weight_loader::FusedPart;
 use pegainfer_core::weight_loader::SlotId;
 use pegainfer_core::weight_loader::StagedWeightLoader;
+use pegainfer_core::weight_loader::TensorNameAliases;
 use pegainfer_core::weight_loader::VecSlotId;
 use pegainfer_core::weight_loader::WeightPrefetch;
 use pegainfer_core::weight_loader::deserialize_shards;
@@ -25,13 +26,15 @@ use super::TransformerBlock;
 use crate::config::Config;
 use crate::config::TensorParallelConfig;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ModelRuntimeConfig {
     pub(crate) enable_cuda_graph: bool,
     pub(crate) tensor_parallel: Option<TensorParallelConfig>,
     pub(crate) device_ordinal: usize,
     pub(crate) max_loras: usize,
     pub(crate) max_lora_rank: usize,
+    pub(crate) weight_path: Option<String>,
+    pub(crate) tensor_name_aliases: TensorNameAliases,
 }
 
 impl Default for ModelRuntimeConfig {
@@ -42,6 +45,8 @@ impl Default for ModelRuntimeConfig {
             device_ordinal: 0,
             max_loras: crate::Qwen3LoraOptions::DEFAULT_MAX_LORAS,
             max_lora_rank: crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+            weight_path: None,
+            tensor_name_aliases: TensorNameAliases::default(),
         }
     }
 }
@@ -70,7 +75,8 @@ impl Qwen3Model {
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         tensor_parallel.validate_for(&config)?;
 
-        let (shard_paths, weight_map) = load_shard_info(model_path)?;
+        let weight_path = runtime.weight_path.as_deref().unwrap_or(model_path);
+        let (shard_paths, weight_map) = load_shard_info(weight_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
         let prefetch =
             (tensor_parallel.world_size == 1).then(|| WeightPrefetch::spawn(&shard_paths));
@@ -78,7 +84,8 @@ impl Qwen3Model {
         let shards = deserialize_shards(&mmaps)?;
 
         let t_gpu = Instant::now();
-        let mut loader = StagedWeightLoader::new(&ctx, &shards, &weight_map)?;
+        let mut loader = StagedWeightLoader::new(&ctx, &shards, &weight_map)?
+            .with_aliases(runtime.tensor_name_aliases);
         let hidden = config.hidden_size;
         debug!("Loading embeddings to GPU");
         let embed_slot = loader.matrix("model.embed_tokens.weight", config.vocab_size, hidden)?;

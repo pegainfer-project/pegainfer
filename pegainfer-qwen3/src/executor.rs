@@ -13,6 +13,7 @@ use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_core::weight_loader::TensorNameAliases;
 use pegainfer_core::weight_loader::WeightPrefetch;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_frontend::engine::DeferredFinish;
@@ -438,6 +439,36 @@ fn execute_step_on_lane(
                 Ok(WorkerStepOutcome::Ack)
             }
         }
+        StepCommand::PrefillLastHidden { prompt, kv_view } => {
+            let hidden = lane.execute_prefill_last_hidden(prompt, kv_view)?;
+            if collect_result {
+                Ok(WorkerStepOutcome::PrefillHidden(PrefillHiddenResult {
+                    hidden_bf16: hidden,
+                }))
+            } else {
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
+        StepCommand::PrefillLayerHidden { prompt, kv_view } => {
+            let hidden = lane.execute_prefill_layer_hidden(prompt, kv_view)?;
+            if collect_result {
+                Ok(WorkerStepOutcome::PrefillLayerHidden(hidden))
+            } else {
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
+        StepCommand::PrefillLayerStages {
+            layer_idx,
+            prompt,
+            kv_view,
+        } => {
+            let stages = lane.execute_prefill_layer_stages(*layer_idx, prompt, kv_view)?;
+            if collect_result {
+                Ok(WorkerStepOutcome::PrefillStages(stages))
+            } else {
+                Ok(WorkerStepOutcome::Ack)
+            }
+        }
         StepCommand::Unified {
             prefill_requests,
             prefill_kv_views,
@@ -829,6 +860,29 @@ pub struct DecodeResult {
 pub struct UnifiedResult {
     pub prefill_requests: Vec<PrefillRequestResult>,
     pub decode_requests: Vec<DecodeRequestResult>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrefillHiddenResult {
+    pub hidden_bf16: Vec<half::bf16>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RetainedPrefillHiddenResult {
+    pub request_id: RequestId,
+    pub hidden_bf16: Vec<half::bf16>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrefillLayerHiddenResult {
+    pub embedding_hidden_bf16: Vec<half::bf16>,
+    pub layer_hidden_bf16: Vec<Vec<half::bf16>>,
+    pub final_normed_bf16: Vec<half::bf16>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrefillStageResult {
+    pub stages: Vec<(String, Vec<half::bf16>)>,
 }
 
 pub(crate) trait ModelExecutor: Send {
@@ -1230,12 +1284,63 @@ impl Qwen3Executor {
         )
     }
 
+    pub fn from_runtime_with_weight_source(
+        model_path: &str,
+        weight_path: Option<&str>,
+        tensor_name_aliases: TensorNameAliases,
+        enable_cuda_graph: bool,
+        device_ordinals: &[usize],
+    ) -> Result<Self> {
+        Self::from_runtime_with_weight_source_and_lora_options(
+            model_path,
+            weight_path,
+            tensor_name_aliases,
+            enable_cuda_graph,
+            device_ordinals,
+            Qwen3LoraOptions::default(),
+            Qwen3OffloadOptions::disabled(),
+            crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
+            None,
+            Qwen3MemoryOptions::default(),
+        )
+    }
+
     #[allow(
         clippy::needless_pass_by_value,
         reason = "executor construction is a one-shot ownership boundary"
     )]
     pub fn from_runtime_with_lora_options(
         model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinals: &[usize],
+        lora_options: Qwen3LoraOptions,
+        offload_options: Qwen3OffloadOptions,
+        max_prefill_tokens: usize,
+        dflash_draft_path: Option<&str>,
+        memory_options: Qwen3MemoryOptions,
+    ) -> Result<Self> {
+        Self::from_runtime_with_weight_source_and_lora_options(
+            model_path,
+            None,
+            TensorNameAliases::default(),
+            enable_cuda_graph,
+            device_ordinals,
+            lora_options,
+            offload_options,
+            max_prefill_tokens,
+            dflash_draft_path,
+            memory_options,
+        )
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "executor construction is a one-shot ownership boundary"
+    )]
+    fn from_runtime_with_weight_source_and_lora_options(
+        model_path: &str,
+        weight_path: Option<&str>,
+        tensor_name_aliases: TensorNameAliases,
         enable_cuda_graph: bool,
         device_ordinals: &[usize],
         lora_options: Qwen3LoraOptions,
@@ -1265,6 +1370,8 @@ impl Qwen3Executor {
                     device_ordinal: device_ordinals[0],
                     max_loras: lora_options.max_loras,
                     max_lora_rank: lora_options.max_lora_rank,
+                    weight_path: weight_path.map(str::to_string),
+                    tensor_name_aliases,
                 },
             )?;
             // The DFlash draft model loads after profiling but lives outside the
@@ -1302,7 +1409,8 @@ impl Qwen3Executor {
         let mut models = Vec::with_capacity(world_size);
         // TP ranks load sequentially and suppress per-rank prefetch, so keep one
         // whole-checkpoint prefetch alive across the loop.
-        let (shard_paths, _) = load_shard_info(model_path)?;
+        let weight_source = weight_path.unwrap_or(model_path);
+        let (shard_paths, _) = load_shard_info(weight_source)?;
         let prefetch = WeightPrefetch::spawn(&shard_paths);
         for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
             models.push(Qwen3Model::from_safetensors_with_runtime(
@@ -1313,6 +1421,8 @@ impl Qwen3Executor {
                     device_ordinal,
                     max_loras: lora_options.max_loras,
                     max_lora_rank: lora_options.max_lora_rank,
+                    weight_path: weight_path.map(str::to_string),
+                    tensor_name_aliases: tensor_name_aliases.clone(),
                 },
             )?);
         }
@@ -1532,6 +1642,98 @@ impl Qwen3Executor {
         <Self as ModelExecutor>::execute_unified(self, plan)
     }
 
+    pub fn prefill_last_hidden_bf16(&mut self, prompt: Vec<u32>) -> Result<PrefillHiddenResult> {
+        self.ensure_single_rank_diagnostic("prefill_last_hidden_bf16")?;
+        let mut rkv = self.kv_mgr.pool().new_request(prompt.clone(), 1, None);
+        rkv.schedule_prefill(prompt.len(), self.kv_mgr.pool())
+            .map_err(|e| anyhow::anyhow!("diagnostic prefill schedule failed: {e}"))?;
+        let kv_view = rkv.prefill_view(prompt.len());
+        let outcome = self.run_step(&StepCommand::PrefillLastHidden { prompt, kv_view })?;
+        match outcome {
+            WorkerStepOutcome::PrefillHidden(result) => Ok(result),
+            other => Err(anyhow::anyhow!(
+                "prefill hidden returned unexpected: {}",
+                other.kind()
+            )),
+        }
+    }
+
+    pub fn prefill_last_hidden_bf16_retained_prompt(
+        &mut self,
+        request_id: RequestId,
+        prompt: Vec<u32>,
+    ) -> Result<RetainedPrefillHiddenResult> {
+        self.ensure_single_rank_diagnostic("prefill_last_hidden_bf16_retained_prompt")?;
+        anyhow::ensure!(
+            !self.request_kvs.contains_key(&request_id),
+            "request {:?} already exists",
+            request_id
+        );
+        let mut rkv = self.kv_mgr.pool().new_request(prompt.clone(), 1, None);
+        rkv.schedule_prefill(prompt.len(), self.kv_mgr.pool())
+            .map_err(|e| anyhow::anyhow!("diagnostic retained prefill schedule failed: {e}"))?;
+        let kv_view = rkv.prefill_view(prompt.len());
+        let outcome = self.run_step(&StepCommand::PrefillLastHidden { prompt, kv_view })?;
+        let result = match outcome {
+            WorkerStepOutcome::PrefillHidden(result) => result,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "retained prefill hidden returned unexpected: {}",
+                    other.kind()
+                ));
+            }
+        };
+        rkv.apply_prefill_chunk(self.kv_mgr.pool())?;
+        self.request_kvs.insert(request_id, rkv);
+        Ok(RetainedPrefillHiddenResult {
+            request_id,
+            hidden_bf16: result.hidden_bf16,
+        })
+    }
+
+    pub fn prefill_layer_hidden_bf16(
+        &mut self,
+        prompt: Vec<u32>,
+    ) -> Result<PrefillLayerHiddenResult> {
+        self.ensure_single_rank_diagnostic("prefill_layer_hidden_bf16")?;
+        let mut rkv = self.kv_mgr.pool().new_request(prompt.clone(), 1, None);
+        rkv.schedule_prefill(prompt.len(), self.kv_mgr.pool())
+            .map_err(|e| anyhow::anyhow!("diagnostic layer prefill schedule failed: {e}"))?;
+        let kv_view = rkv.prefill_view(prompt.len());
+        let outcome = self.run_step(&StepCommand::PrefillLayerHidden { prompt, kv_view })?;
+        match outcome {
+            WorkerStepOutcome::PrefillLayerHidden(result) => Ok(result),
+            other => Err(anyhow::anyhow!(
+                "prefill layer hidden returned unexpected: {}",
+                other.kind()
+            )),
+        }
+    }
+
+    pub fn prefill_layer_stages_bf16(
+        &mut self,
+        layer_idx: usize,
+        prompt: Vec<u32>,
+    ) -> Result<PrefillStageResult> {
+        self.ensure_single_rank_diagnostic("prefill_layer_stages_bf16")?;
+        let mut rkv = self.kv_mgr.pool().new_request(prompt.clone(), 1, None);
+        rkv.schedule_prefill(prompt.len(), self.kv_mgr.pool())
+            .map_err(|e| anyhow::anyhow!("diagnostic stage prefill schedule failed: {e}"))?;
+        let kv_view = rkv.prefill_view(prompt.len());
+        let outcome = self.run_step(&StepCommand::PrefillLayerStages {
+            layer_idx,
+            prompt,
+            kv_view,
+        })?;
+        match outcome {
+            WorkerStepOutcome::PrefillStages(result) => Ok(result),
+            other => Err(anyhow::anyhow!(
+                "prefill stages returned unexpected: {}",
+                other.kind()
+            )),
+        }
+    }
+
     pub fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
         <Self as ModelExecutor>::load_lora_adapter(self, request)
     }
@@ -1664,6 +1866,14 @@ impl Qwen3Executor {
     /// request (rather than served from HBM).
     pub fn evict_cached_blocks(&self) {
         self.kv_mgr.pool().evict_inactive();
+    }
+
+    fn ensure_single_rank_diagnostic(&self, op: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.workers.is_empty(),
+            "{op} is only supported on the single-GPU diagnostic path"
+        );
+        Ok(())
     }
 
     /// Begin an async CPU-tier KV prefetch for `request_id`; see the
@@ -3359,6 +3569,98 @@ impl LocalQwen3Lane {
         )
     }
 
+    fn execute_prefill_last_hidden(
+        &mut self,
+        prompt: &[u32],
+        kv_view: &KvView,
+    ) -> Result<Vec<half::bf16>> {
+        let hidden = self.model.prefill_last_normed_hidden(
+            prompt,
+            kv_view,
+            self.kv_buffer.buffer(),
+            &self.layout,
+        )?;
+        let host = self
+            .model
+            .device_ctx()
+            .stream
+            .clone_dtoh(&hidden.data)
+            .map_err(|e| anyhow::anyhow!("D2H hidden copy failed: {e}"))?;
+        self.model.device_ctx().sync()?;
+        Ok(host)
+    }
+
+    fn execute_prefill_layer_hidden(
+        &mut self,
+        prompt: &[u32],
+        kv_view: &KvView,
+    ) -> Result<PrefillLayerHiddenResult> {
+        let (embedding_hidden, layer_hidden, final_normed) =
+            self.model.prefill_last_hidden_layer_snapshots(
+                prompt,
+                kv_view,
+                self.kv_buffer.buffer(),
+                &self.layout,
+            )?;
+        let embedding_hidden_bf16 = self
+            .model
+            .device_ctx()
+            .stream
+            .clone_dtoh(&embedding_hidden.data)
+            .map_err(|e| anyhow::anyhow!("D2H embedding hidden copy failed: {e}"))?;
+        let mut layer_hidden_bf16 = Vec::with_capacity(layer_hidden.len());
+        for hidden in layer_hidden {
+            layer_hidden_bf16.push(
+                self.model
+                    .device_ctx()
+                    .stream
+                    .clone_dtoh(&hidden.data)
+                    .map_err(|e| anyhow::anyhow!("D2H layer hidden copy failed: {e}"))?,
+            );
+        }
+        let final_normed_bf16 = self
+            .model
+            .device_ctx()
+            .stream
+            .clone_dtoh(&final_normed.data)
+            .map_err(|e| anyhow::anyhow!("D2H final normed hidden copy failed: {e}"))?;
+        self.model.device_ctx().sync()?;
+        Ok(PrefillLayerHiddenResult {
+            embedding_hidden_bf16,
+            layer_hidden_bf16,
+            final_normed_bf16,
+        })
+    }
+
+    fn execute_prefill_layer_stages(
+        &mut self,
+        layer_idx: usize,
+        prompt: &[u32],
+        kv_view: &KvView,
+    ) -> Result<PrefillStageResult> {
+        let stages = self.model.prefill_layer_stage_snapshots(
+            layer_idx,
+            prompt,
+            kv_view,
+            self.kv_buffer.buffer(),
+            &self.layout,
+        )?;
+        let mut host_stages = Vec::with_capacity(stages.len());
+        for stage in stages {
+            let values = self
+                .model
+                .device_ctx()
+                .stream
+                .clone_dtoh(&stage.values.data)
+                .map_err(|e| anyhow::anyhow!("D2H {} copy failed: {e}", stage.name))?;
+            host_stages.push((stage.name, values));
+        }
+        self.model.device_ctx().sync()?;
+        Ok(PrefillStageResult {
+            stages: host_stages,
+        })
+    }
+
     /// DFlash verify forward over each request's `block_size`-token span, using
     /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation).
     /// Numerically equivalent to the `batch_prefill(echo=true)` verify path it
@@ -3506,6 +3808,19 @@ enum StepCommand {
         kv_views: Vec<KvView>,
         sample_seed: u64,
     },
+    PrefillLastHidden {
+        prompt: Vec<u32>,
+        kv_view: KvView,
+    },
+    PrefillLayerHidden {
+        prompt: Vec<u32>,
+        kv_view: KvView,
+    },
+    PrefillLayerStages {
+        layer_idx: usize,
+        prompt: Vec<u32>,
+        kv_view: KvView,
+    },
     Unified {
         prefill_requests: Vec<PrefillStepItem>,
         prefill_kv_views: Vec<KvView>,
@@ -3536,7 +3851,9 @@ enum StepCommand {
     },
     /// Speculative draft: roll the DFlash draft model forward one block per
     /// request. Uses the draft's own KV — no target KV views.
-    SpeculativeDraft { requests: Vec<DraftStepItem> },
+    SpeculativeDraft {
+        requests: Vec<DraftStepItem>,
+    },
 }
 
 impl StepCommand {
@@ -3544,6 +3861,9 @@ impl StepCommand {
         match self {
             Self::Prefill { .. } => "prefill",
             Self::Decode { .. } => "decode",
+            Self::PrefillLastHidden { .. } => "prefill_hidden",
+            Self::PrefillLayerHidden { .. } => "prefill_layer_hidden",
+            Self::PrefillLayerStages { .. } => "prefill_layer_stages",
             Self::Unified { .. } => "unified",
             Self::SplitConcurrent { .. } => "split_concurrent",
             Self::SpeculativeVerify { .. } => "speculative_verify",
@@ -3627,6 +3947,9 @@ enum WorkerStepOutcome {
     Prefill(PrefillResult),
     Decode(DecodeResult),
     Unified(UnifiedResult),
+    PrefillHidden(PrefillHiddenResult),
+    PrefillLayerHidden(PrefillLayerHiddenResult),
+    PrefillStages(PrefillStageResult),
     /// Split-concurrent: decode result is ready; prefill is still in-flight
     /// on the prefill stream. The executor must call a follow-up to sync+sample
     /// prefill before using prefill scratch buffers again.
@@ -3647,6 +3970,9 @@ impl WorkerStepOutcome {
             Self::Prefill(_) => "prefill",
             Self::Decode(_) => "decode",
             Self::Unified(_) => "unified",
+            Self::PrefillHidden(_) => "prefill_hidden",
+            Self::PrefillLayerHidden(_) => "prefill_layer_hidden",
+            Self::PrefillStages(_) => "prefill_layer_stages",
             Self::SplitDecodeReady { .. } => "split_decode_ready",
             Self::SpeculativeVerify(_) => "speculative_verify",
             Self::SpeculativeDraft(_) => "speculative_draft",

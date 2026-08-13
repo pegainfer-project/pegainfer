@@ -6,6 +6,7 @@ use half::bf16;
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
+use pegainfer_core::tensor::DeviceVec;
 
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::weights::Qwen3Model;
@@ -99,6 +100,12 @@ pub(super) struct PrefillBuffers {
     pub(super) attn_output: HiddenStates, // q_dim × seq_len
 }
 
+/// One named last-token snapshot from a selected prefill layer.
+pub(crate) struct PrefillStageSnapshot {
+    pub(crate) name: String,
+    pub(crate) values: DeviceVec,
+}
+
 impl PrefillBuffers {
     pub(super) fn new(
         ctx: &DeviceContext,
@@ -141,6 +148,26 @@ impl PrefillBuffers {
 }
 
 impl Qwen3Model {
+    fn prefill_plan_for_single_prompt(
+        &self,
+        prompt: &[u32],
+        kv_view: &KvView,
+    ) -> Result<PrefillPagedPlan> {
+        anyhow::ensure!(!prompt.is_empty(), "prompt must not be empty");
+        let start_position = kv_view.seq_len() - prompt.len();
+        PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+            &self.ctx,
+            &[kv_view.page_indices().to_vec()],
+            &[kv_view.last_page_len()],
+            &[start_position],
+            &[prompt.len()],
+            self.local_num_attention_heads(),
+            self.local_num_key_value_heads(),
+            self.config.head_dim,
+            PREFILL_ATTENTION_CTA_TILE_Q,
+        )
+    }
+
     pub(super) fn get_embeddings_batch(&self, token_ids: &[u32]) -> Result<HiddenStates> {
         let seq_len = token_ids.len();
         let hidden_dim = self.config.hidden_size;
@@ -575,6 +602,370 @@ impl Qwen3Model {
         result
     }
 
+    /// Run one prompt prefill and return the final RMSNorm'ed hidden state for
+    /// the last prompt token. This narrow diagnostic hook lets model adapters
+    /// compare the exact hidden-state contract consumed by downstream heads.
+    pub(crate) fn prefill_last_normed_hidden(
+        &self,
+        prompt: &[u32],
+        kv_view: &KvView,
+        kv_buffer: &CudaSlice<bf16>,
+        layout: &KvLayout,
+    ) -> Result<DeviceVec> {
+        let plan = self.prefill_plan_for_single_prompt(prompt, kv_view)?;
+        let mut hidden = self.get_embeddings_batch(prompt)?;
+        let lora_groups: Vec<DeviceLoraTokenGroup<'_>> = Vec::new();
+        self.process_all_layers_batch_multi(
+            &mut hidden,
+            layout,
+            kv_buffer,
+            &plan,
+            &lora_groups,
+            None,
+        )?;
+        let last_hidden = ops::extract_vec(&self.ctx, &hidden, prompt.len() - 1)?;
+        let normed = ops::rms_norm(
+            &self.ctx,
+            &last_hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+        )?;
+        park(hidden);
+        park(plan);
+        Ok(normed)
+    }
+
+    /// Run one prompt prefill and return HuggingFace-style last-token hidden
+    /// snapshots: embedding output, each transformer block output before final
+    /// model norm, and the final normed hidden.
+    pub(crate) fn prefill_last_hidden_layer_snapshots(
+        &self,
+        prompt: &[u32],
+        kv_view: &KvView,
+        kv_buffer: &CudaSlice<bf16>,
+        layout: &KvLayout,
+    ) -> Result<(DeviceVec, Vec<DeviceVec>, DeviceVec)> {
+        let plan = self.prefill_plan_for_single_prompt(prompt, kv_view)?;
+        let mut hidden = self.get_embeddings_batch(prompt)?;
+        let embedding_snapshot = ops::extract_vec(&self.ctx, &hidden, prompt.len() - 1)?;
+        let total_tokens = hidden.seq_len;
+        let inter_dim = self.local_intermediate_size();
+        let q_dim = self.local_q_dim();
+        let kv_dim = self.local_kv_dim();
+        let last_token_idx = prompt.len() - 1;
+        let lora_groups: Vec<DeviceLoraTokenGroup<'_>> = Vec::new();
+        let mut bufs = PrefillBuffers::new(
+            &self.ctx,
+            self.config.hidden_size,
+            q_dim,
+            kv_dim,
+            inter_dim,
+            total_tokens,
+        )?;
+        let mut layer_snapshots = Vec::with_capacity(self.layers.len());
+
+        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
+        let run = (|| -> Result<()> {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                self.forward_layer_batch_paged(
+                    layer_idx,
+                    layer,
+                    &mut hidden,
+                    kv_buffer,
+                    layout,
+                    &plan,
+                    &lora_groups,
+                    &mut bufs,
+                )?;
+                layer_snapshots.push(ops::extract_vec(&self.ctx, &hidden, last_token_idx)?);
+            }
+            Ok(())
+        })();
+        park(bufs);
+        run?;
+
+        let last_hidden = ops::extract_vec(&self.ctx, &hidden, last_token_idx)?;
+        let final_normed = ops::rms_norm(
+            &self.ctx,
+            &last_hidden,
+            &self.norm,
+            self.config.rms_norm_eps,
+        )?;
+        park(hidden);
+        park(plan);
+        Ok((embedding_snapshot, layer_snapshots, final_normed))
+    }
+
+    /// Run layers before `layer_idx` normally, then expose named last-token
+    /// snapshots across the selected layer's pre-attention, attention, and MLP
+    /// stages without changing the production layer forward path.
+    pub(crate) fn prefill_layer_stage_snapshots(
+        &self,
+        layer_idx: usize,
+        prompt: &[u32],
+        kv_view: &KvView,
+        kv_buffer: &CudaSlice<bf16>,
+        layout: &KvLayout,
+    ) -> Result<Vec<PrefillStageSnapshot>> {
+        anyhow::ensure!(
+            layer_idx < self.layers.len(),
+            "layer_idx {} out of range for {} layers",
+            layer_idx,
+            self.layers.len()
+        );
+
+        let plan = self.prefill_plan_for_single_prompt(prompt, kv_view)?;
+        let mut hidden = self.get_embeddings_batch(prompt)?;
+        let total_tokens = hidden.seq_len;
+        let inter_dim = self.local_intermediate_size();
+        let q_dim = self.local_q_dim();
+        let kv_dim = self.local_kv_dim();
+        let last_token_idx = prompt.len() - 1;
+        let lora_groups: Vec<DeviceLoraTokenGroup<'_>> = Vec::new();
+        let mut stages = Vec::new();
+        let mut bufs = PrefillBuffers::new(
+            &self.ctx,
+            self.config.hidden_size,
+            q_dim,
+            kv_dim,
+            inter_dim,
+            total_tokens,
+        )?;
+
+        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
+        let run = (|| -> Result<()> {
+            for (previous_idx, previous_layer) in self.layers.iter().take(layer_idx).enumerate() {
+                self.forward_layer_batch_paged(
+                    previous_idx,
+                    previous_layer,
+                    &mut hidden,
+                    kv_buffer,
+                    layout,
+                    &plan,
+                    &lora_groups,
+                    &mut bufs,
+                )?;
+            }
+
+            let layer = &self.layers[layer_idx];
+            let stage_prefix = format!("layer{layer_idx}");
+            stages.push(PrefillStageSnapshot {
+                name: format!("{stage_prefix}.input_hidden.bf16"),
+                values: ops::extract_vec(&self.ctx, &hidden, last_token_idx)?,
+            });
+
+            self.forward_layer_pre_attn(layer_idx, layer, &hidden, &lora_groups, &mut bufs)?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.input_norm.bf16"),
+                &self.ctx,
+                &bufs.normed,
+                last_token_idx,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.q_proj.bf16"),
+                &self.ctx,
+                &bufs.q_batch,
+                last_token_idx,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.k_proj.bf16"),
+                &self.ctx,
+                &bufs.k_batch,
+                last_token_idx,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.v_proj.bf16"),
+                &self.ctx,
+                &bufs.v_batch,
+                last_token_idx,
+            )?;
+
+            let mut q_norm_debug = HiddenStates {
+                data: bufs
+                    .q_batch
+                    .data
+                    .try_clone()
+                    .map_err(|e| anyhow::anyhow!("D2D q norm debug clone failed: {e}"))?,
+                hidden_dim: bufs.q_batch.hidden_dim,
+                seq_len: bufs.q_batch.seq_len,
+            };
+            let mut k_norm_debug = HiddenStates {
+                data: bufs
+                    .k_batch
+                    .data
+                    .try_clone()
+                    .map_err(|e| anyhow::anyhow!("D2D k norm debug clone failed: {e}"))?,
+                hidden_dim: bufs.k_batch.hidden_dim,
+                seq_len: bufs.k_batch.seq_len,
+            };
+            let zero_positions = vec![0i32; total_tokens];
+            let zero_positions_d = self
+                .ctx
+                .stream
+                .clone_htod(&zero_positions)
+                .map_err(|e| anyhow::anyhow!("H2D q/k norm debug positions failed: {e}"))?;
+            ops::qk_norm_rope_batch_decode_into(
+                &self.ctx,
+                &mut q_norm_debug,
+                &mut k_norm_debug,
+                0,
+                total_tokens,
+                &layer.attention.q_norm,
+                &layer.attention.k_norm,
+                &self.cos_cache,
+                &self.sin_cache,
+                &zero_positions_d,
+                self.local_num_attention_heads(),
+                self.local_num_key_value_heads(),
+                self.config.head_dim,
+                self.config.rms_norm_eps,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.q_norm.bf16"),
+                &self.ctx,
+                &q_norm_debug,
+                last_token_idx,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.k_norm.bf16"),
+                &self.ctx,
+                &k_norm_debug,
+                last_token_idx,
+            )?;
+            park(zero_positions_d);
+            park(q_norm_debug);
+            park(k_norm_debug);
+
+            self.forward_layer_attn(layer_idx, layer, kv_buffer, layout, &plan, &mut bufs)?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.q_norm_rope.bf16"),
+                &self.ctx,
+                &bufs.q_batch,
+                last_token_idx,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.k_norm_rope.bf16"),
+                &self.ctx,
+                &bufs.k_batch,
+                last_token_idx,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.attn_output.bf16"),
+                &self.ctx,
+                &bufs.attn_output,
+                last_token_idx,
+            )?;
+
+            ops::gemm_into_checked(
+                &self.ctx,
+                &layer.attention.o_proj,
+                &bufs.attn_output,
+                &mut bufs.o_buf,
+            )?;
+            self.all_reduce_hidden(&mut bufs.o_buf)?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.o_proj.bf16"),
+                &self.ctx,
+                &bufs.o_buf,
+                last_token_idx,
+            )?;
+
+            pegainfer_kernels::ops::fused_add_rms_norm_round_batch_into(
+                &self.ctx,
+                &mut hidden,
+                &bufs.o_buf,
+                &layer.post_attention_layernorm,
+                self.config.rms_norm_eps,
+                &mut bufs.normed,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.post_attn_norm.bf16"),
+                &self.ctx,
+                &bufs.normed,
+                last_token_idx,
+            )?;
+
+            ops::gemm_rows_into_checked(
+                &self.ctx,
+                &layer.mlp.gate_up_proj,
+                0,
+                inter_dim,
+                &bufs.normed,
+                &mut bufs.gate_out,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.gate_proj.bf16"),
+                &self.ctx,
+                &bufs.gate_out,
+                last_token_idx,
+            )?;
+            ops::gemm_rows_into_checked(
+                &self.ctx,
+                &layer.mlp.gate_up_proj,
+                inter_dim,
+                inter_dim,
+                &bufs.normed,
+                &mut bufs.up_out,
+            )?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.up_proj.bf16"),
+                &self.ctx,
+                &bufs.up_out,
+                last_token_idx,
+            )?;
+            ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.silu_mul.bf16"),
+                &self.ctx,
+                &bufs.act_out,
+                last_token_idx,
+            )?;
+            ops::gemm_into_checked(
+                &self.ctx,
+                &layer.mlp.down_proj,
+                &bufs.act_out,
+                &mut bufs.o_buf,
+            )?;
+            self.all_reduce_hidden(&mut bufs.o_buf)?;
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.down_proj.bf16"),
+                &self.ctx,
+                &bufs.o_buf,
+                last_token_idx,
+            )?;
+            ops::add_batch_into(&self.ctx, &hidden, &bufs.o_buf, &mut bufs.hidden_out)?;
+            std::mem::swap(&mut hidden, &mut bufs.hidden_out);
+            push_stage(
+                &mut stages,
+                format!("{stage_prefix}.output_hidden.bf16"),
+                &self.ctx,
+                &hidden,
+                last_token_idx,
+            )?;
+            Ok(())
+        })();
+        park(bufs);
+        run?;
+        park(hidden);
+        park(plan);
+        Ok(stages)
+    }
+
     fn process_all_layers_batch_multi(
         &self,
         hidden: &mut HiddenStates,
@@ -654,4 +1045,18 @@ impl Qwen3Model {
 
         Ok(captured_hidden)
     }
+}
+
+fn push_stage(
+    stages: &mut Vec<PrefillStageSnapshot>,
+    name: String,
+    ctx: &DeviceContext,
+    batch: &HiddenStates,
+    token_idx: usize,
+) -> Result<()> {
+    stages.push(PrefillStageSnapshot {
+        name,
+        values: ops::extract_vec(ctx, batch, token_idx)?,
+    });
+    Ok(())
 }

@@ -203,12 +203,16 @@ pub mod runtime {
     pub use crate::executor::DecodeRequestResult;
     pub use crate::executor::DecodeResult;
     pub use crate::executor::DecodeStepItem;
+    pub use crate::executor::PrefillHiddenResult;
+    pub use crate::executor::PrefillLayerHiddenResult;
     pub use crate::executor::PrefillPlan;
     pub use crate::executor::PrefillRequestResult;
     pub use crate::executor::PrefillResult;
+    pub use crate::executor::PrefillStageResult;
     pub use crate::executor::PrefillStepItem;
     pub use crate::executor::Qwen3Executor;
     pub use crate::executor::RequestId;
+    pub use crate::executor::RetainedPrefillHiddenResult;
     pub use crate::executor::UnifiedPlan;
     pub use crate::executor::UnifiedResult;
 }

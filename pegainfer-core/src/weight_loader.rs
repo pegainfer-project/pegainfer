@@ -24,6 +24,35 @@ use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
 
+/// Optional mapping from the runtime's requested tensor name to the tensor name
+/// stored in the safetensors shard.
+///
+/// Normal model loading keeps the identity mapping. Model adapters can pass an
+/// alias table to reuse a checkpoint layout without materializing a renamed
+/// weight copy.
+#[derive(Clone, Debug, Default)]
+pub struct TensorNameAliases {
+    storage_by_requested: HashMap<String, String>,
+}
+
+impl TensorNameAliases {
+    pub fn new(storage_by_requested: HashMap<String, String>) -> Self {
+        Self {
+            storage_by_requested,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.storage_by_requested.is_empty()
+    }
+
+    fn storage_name<'a>(&'a self, requested_name: &'a str) -> &'a str {
+        self.storage_by_requested
+            .get(requested_name)
+            .map_or(requested_name, String::as_str)
+    }
+}
+
 mod staging;
 use staging::ColShardPlan;
 use staging::WeightStager;
@@ -253,18 +282,30 @@ fn find_tensor<'a>(
     weight_map: &HashMap<String, usize>,
     name: &str,
 ) -> Result<safetensors::tensor::TensorView<'a>> {
-    if let Some(&idx) = weight_map.get(name) {
-        shards[idx]
-            .tensor(name)
-            .map_err(|e| anyhow::anyhow!("Failed to load tensor '{}': {}", name, e))
+    find_tensor_with_aliases(shards, weight_map, &TensorNameAliases::default(), name)
+}
+
+fn find_tensor_with_aliases<'a>(
+    shards: &'a [SafeTensors<'a>],
+    weight_map: &HashMap<String, usize>,
+    aliases: &TensorNameAliases,
+    name: &str,
+) -> Result<safetensors::tensor::TensorView<'a>> {
+    let storage_name = aliases.storage_name(name);
+    if let Some(&idx) = weight_map.get(storage_name) {
+        shards[idx].tensor(storage_name).map_err(|e| {
+            anyhow::anyhow!("Failed to load tensor '{name}' stored as '{storage_name}': {e}")
+        })
     } else {
         // Fallback: try all shards (single-file case)
         for shard in shards {
-            if let Ok(t) = shard.tensor(name) {
+            if let Ok(t) = shard.tensor(storage_name) {
                 return Ok(t);
             }
         }
-        Err(anyhow::anyhow!("Tensor '{}' not found in any shard", name))
+        Err(anyhow::anyhow!(
+            "Tensor '{name}' stored as '{storage_name}' not found in any shard"
+        ))
     }
 }
 
@@ -361,6 +402,7 @@ pub struct StagedWeightLoader<'a> {
     stager: WeightStager,
     shards: &'a [SafeTensors<'a>],
     weight_map: &'a HashMap<String, usize>,
+    aliases: TensorNameAliases,
     slots: Vec<Slot>,
     vec_slots: Vec<VecSlot>,
     pending: Vec<PendingUpload<'a>>,
@@ -381,6 +423,7 @@ impl<'a> StagedWeightLoader<'a> {
             stager: WeightStager::new(ctx)?,
             shards,
             weight_map,
+            aliases: TensorNameAliases::default(),
             slots: Vec::new(),
             vec_slots: Vec::new(),
             pending: Vec::new(),
@@ -389,6 +432,12 @@ impl<'a> StagedWeightLoader<'a> {
             failed: false,
             alloc_ms: 0.0,
         })
+    }
+
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: TensorNameAliases) -> Self {
+        self.aliases = aliases;
+        self
     }
 
     fn ensure_recording(&self) -> Result<()> {
@@ -482,7 +531,7 @@ impl<'a> StagedWeightLoader<'a> {
     }
 
     fn tensor_2d(&self, name: &str, rows: usize, cols: usize) -> Result<&'a [u8]> {
-        let tensor = find_tensor(self.shards, self.weight_map, name)?;
+        let tensor = find_tensor_with_aliases(self.shards, self.weight_map, &self.aliases, name)?;
         let shape = tensor.shape();
         anyhow::ensure!(
             shape.len() == 2,
@@ -584,7 +633,7 @@ impl<'a> StagedWeightLoader<'a> {
     /// Small tensors; uploaded as plain pageable copies.
     pub fn vector(&mut self, name: &str, len: usize) -> Result<VecSlotId> {
         self.ensure_recording()?;
-        let tensor = find_tensor(self.shards, self.weight_map, name)?;
+        let tensor = find_tensor_with_aliases(self.shards, self.weight_map, &self.aliases, name)?;
         let shape = tensor.shape();
         anyhow::ensure!(
             shape.len() == 1 && shape[0] == len,
