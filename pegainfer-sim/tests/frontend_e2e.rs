@@ -37,20 +37,9 @@ impl SimServer {
         Self::spawn_with_model_dir(model_dir_with_minimal_metadata()?).await
     }
 
-    async fn spawn_with_lora_routes() -> Result<Self> {
-        Self::spawn_with_model_dir_and_lora_routes(
-            model_dir_with_minimal_metadata()?,
-            true,
-            1,
-            MODEL_NAME,
-        )
-        .await
-    }
-
     async fn spawn_partitioned() -> Result<Self> {
-        Self::spawn_with_model_dir_and_lora_routes(
+        Self::spawn_with_model_dir_and_engine_count(
             model_dir_with_minimal_metadata()?,
-            false,
             2,
             METRICS_MODEL_NAME,
         )
@@ -58,9 +47,8 @@ impl SimServer {
     }
 
     async fn spawn_with_closed_load_feed() -> Result<Self> {
-        Self::spawn_with_model_dir_and_lora_routes(
+        Self::spawn_with_model_dir_and_engine_count(
             model_dir_with_minimal_metadata()?,
-            false,
             2,
             CLOSED_FEED_MODEL_NAME,
         )
@@ -68,18 +56,17 @@ impl SimServer {
     }
 
     async fn spawn_with_model_dir(model_dir: TempDir) -> Result<Self> {
-        Self::spawn_with_model_dir_and_lora_routes(model_dir, false, 1, MODEL_NAME).await
+        Self::spawn_with_model_dir_and_engine_count(model_dir, 1, MODEL_NAME).await
     }
 
-    async fn spawn_with_model_dir_and_lora_routes(
+    async fn spawn_with_model_dir_and_engine_count(
         model_dir: TempDir,
-        enable_lora_routes: bool,
         engine_count: usize,
         model_name: &str,
     ) -> Result<Self> {
         let mut last_error = None;
         for attempt in 1..=SERVER_START_ATTEMPTS {
-            match Self::spawn_once(&model_dir, enable_lora_routes, engine_count, model_name).await {
+            match Self::spawn_once(&model_dir, engine_count, model_name).await {
                 Ok(started) => {
                     return Ok(Self {
                         base_url: started.base_url,
@@ -107,7 +94,6 @@ impl SimServer {
 
     async fn spawn_once(
         model_dir: &TempDir,
-        enable_lora_routes: bool,
         engine_count: usize,
         model_name: &str,
     ) -> Result<StartedSimServer> {
@@ -127,32 +113,18 @@ impl SimServer {
         let server_shutdown = shutdown.clone();
         let served_model_name = model_name.to_string();
         let started_model_name = served_model_name.clone();
-        let model_path = model_dir.path().to_string_lossy().into_owned();
         let model_path_buf = model_dir.path().to_path_buf();
         let mut task = tokio::spawn(async move {
-            if enable_lora_routes {
-                pegainfer_frontend::vllm::serve_model_with_lora_routes(
-                    engine,
-                    model_path,
-                    vec![served_model_name],
-                    Vec::new(),
-                    port,
-                    128,
-                    server_shutdown,
-                )
-                .await
-            } else {
-                pegainfer_frontend::vllm::serve_with_engine_count(
-                    std::future::ready(Ok(engine)),
-                    &model_path_buf,
-                    vec![served_model_name],
-                    port,
-                    Some(128),
-                    engine_count,
-                    server_shutdown,
-                )
-                .await
-            }
+            pegainfer_frontend::vllm::serve_with_engine_count(
+                std::future::ready(Ok(engine.into())),
+                &model_path_buf,
+                vec![served_model_name],
+                port,
+                Some(128),
+                engine_count,
+                server_shutdown,
+            )
+            .await
         });
 
         let client = test_client()?;
@@ -415,7 +387,7 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         pegainfer_frontend::vllm::serve_with_engine_count(
-            std::future::ready(Ok(engine)),
+            std::future::ready(Ok(engine.into())),
             model_dir.path(),
             vec![MODEL_NAME.to_string()],
             port,
@@ -436,34 +408,11 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn simulated_lora_routes_are_mounted_on_openai_frontend() -> Result<()> {
-    let server = SimServer::spawn_with_lora_routes().await?;
-    let client = test_client()?;
-
-    let response = client
-        .post(format!("{}/v1/load_lora_adapter", server.base_url))
-        .json(&json!({
-            "lora_name": "adapter-a",
-            "lora_path": "/tmp/adapter-a"
-        }))
-        .send()
-        .await?;
-
-    let status = response.status();
-    let body: Value = response.json().await?;
-    if status != reqwest::StatusCode::NOT_FOUND {
-        bail!("expected mounted LoRA route to report unsupported engine, got {status}: {body}");
-    }
-    let error = body["error"]
-        .as_str()
-        .ok_or_else(|| anyhow!("LoRA route response has no error string: {body}"))?;
-    if !error.contains("dynamic LoRA adapter loading") {
-        bail!("LoRA route returned unexpected error: {body}");
-    }
-
-    server.shutdown().await
-}
+// The old "mounted LoRA routes report unsupported" sim test is gone by
+// construction: `serve_model_with_lora_routes` now requires an `Engine` whose
+// `lora` capability is `Some(LoraClient)` — the `Option` is the capability —
+// and the simulated handle engine cannot provide one. The gone-engine HTTP
+// mapping is pinned by the `vllm::lora` route tests.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_streaming_completion_returns_nonempty_output_for_positive_max_tokens() -> Result<()> {

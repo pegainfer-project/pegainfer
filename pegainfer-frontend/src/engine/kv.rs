@@ -117,35 +117,3 @@ impl KvCapacity {
         tokens.div_ceil(self.block_size.max(1))
     }
 }
-
-/// One full KV block that just became reusable from this engine's prefix cache.
-///
-/// The hashes are the *u64* sequence-aware / per-block token hashes a Dynamo KV
-/// router indexes by (`dynamo_tokens::TokenBlock::{sequence_hash, block_hash}`),
-/// kept as plain integers so this contract type stays free of any kvbm/dynamo
-/// dependency. They are NOT the engine's internal 128-bit lineage hash.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvStoredBlock {
-    /// Chained, sequence-aware block id (dynamo `ExternalSequenceBlockHash`).
-    pub sequence_hash: u64,
-    /// Un-chained per-block token hash (dynamo `LocalBlockHash`); the field a
-    /// prefix-routing radix tree keys its children by.
-    pub tokens_hash: u64,
-}
-
-/// A KV-cache block lifecycle event for an out-of-band cache-aware router.
-///
-/// Emitted only when the engine was built with a KV-event feed wired (off by
-/// default); see [`crate::engine::EngineHandle::take_kv_events`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KvBlockEvent {
-    /// A contiguous run of newly-registered blocks became cacheable. `parent_hash`
-    /// is the sequence hash of the block preceding `blocks[0]` (`None` if the run
-    /// starts the sequence); each later block chains off the previous one.
-    Stored {
-        parent_hash: Option<u64>,
-        blocks: Vec<KvStoredBlock>,
-    },
-    /// A previously-stored block was evicted from this engine's cache.
-    Removed { sequence_hash: u64 },
-}

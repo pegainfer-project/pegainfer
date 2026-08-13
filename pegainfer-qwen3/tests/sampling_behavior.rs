@@ -15,14 +15,12 @@
 
 use std::path::Path;
 
-use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::sampler::SamplingParams;
 
 mod common;
+
+use common::harness::EngineHarness;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const GENERATED_TOKENS: usize = 32;
@@ -42,41 +40,9 @@ fn model_path_or_skip() -> Option<String> {
     }
 }
 
-/// Submit one request and collect the generated token ids until `Finished`.
-fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, params: SamplingParams) -> Vec<u32> {
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params,
-            max_tokens: GENERATED_TOKENS,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    let mut tokens = Vec::new();
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { .. }) => return tokens,
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
-        }
-    }
+/// Submit one request and collect the generated token ids until it finishes.
+fn generate(engine: &EngineHarness, prompt_tokens: Vec<u32>, params: SamplingParams) -> Vec<u32> {
+    engine.generate(prompt_tokens, params, GENERATED_TOKENS)
 }
 
 #[test]
@@ -85,16 +51,18 @@ fn sampling_params_steer_the_sampler() {
         return;
     };
 
-    let handle = pegainfer_qwen3::start_engine(
-        Path::new(&model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-    )
-    .expect("failed to start engine");
+    let handle = EngineHarness::new(
+        pegainfer_qwen3::start_engine(
+            Path::new(&model_path),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+        )
+        .expect("failed to start engine"),
+    );
     let tokenizer = common::load_tokenizer(&model_path);
 
     // Branchy continuation so unrestricted sampling has real entropy to show.

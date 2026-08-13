@@ -1,22 +1,13 @@
 use std::any::Any;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::thread::{self};
 
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::sync::watch;
 
-use super::control::EngineCommand;
-use super::control::EngineControlError;
-use super::control::EngineControlRequest;
-use super::control::EngineControlResult;
-use super::control::LoadLoraAdapterRequest;
-use super::control::UnloadLoraAdapterRequest;
 use super::event::TokenEvent;
 use super::event::unix_now_s;
-use super::kv::KvBlockEvent;
 use super::kv::KvCapacity;
 use super::kv::KvPrefix;
 use super::kv::SubmittedRequest;
@@ -84,36 +75,18 @@ pub struct EngineHandle {
     /// has one partition; a data-parallel engine exposes one per logical DP
     /// rank. Each handle clone owns cloned receivers and `watch` fans out.
     load_watches: Vec<Option<watch::Receiver<LoadSnapshot>>>,
-    /// Block store/remove feed for a cache-aware router, or `None` if not wired.
-    /// `mpsc` (every event matters — unlike the coalescing load feed), so the
-    /// single receiver is handed out exactly once via [`Self::take_kv_events`];
-    /// the shared cell lets all handle clones agree on who took it.
-    kv_events: Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<KvBlockEvent>>>>>,
 }
 
 struct EngineInner {
     /// One submit channel per scheduler partition (logical DP rank). A
     /// single-partition engine holds exactly one sender.
     submit_txs: Vec<mpsc::UnboundedSender<SubmittedRequest>>,
-    command_tx: Option<mpsc::UnboundedSender<EngineCommand>>,
     join_handles: Vec<JoinHandle<()>>,
 }
 
 impl EngineHandle {
     pub fn new(submit_tx: mpsc::UnboundedSender<SubmittedRequest>) -> Self {
-        Self::from_parts(vec![submit_tx], None, Vec::new())
-    }
-
-    #[cfg(test)]
-    fn new_with_command_channel(command_tx: mpsc::UnboundedSender<EngineCommand>) -> Self {
-        Self::from_parts(Vec::new(), Some(command_tx), Vec::new())
-    }
-
-    pub fn new_with_command_channel_and_join_handle(
-        command_tx: mpsc::UnboundedSender<EngineCommand>,
-        join_handle: JoinHandle<()>,
-    ) -> Self {
-        Self::from_parts(Vec::new(), Some(command_tx), vec![join_handle])
+        Self::from_parts(vec![submit_tx], Vec::new())
     }
 
     /// Construct a handle that owns the engine thread shutdown.
@@ -125,7 +98,7 @@ impl EngineHandle {
         submit_tx: mpsc::UnboundedSender<SubmittedRequest>,
         join_handle: JoinHandle<()>,
     ) -> Self {
-        Self::from_parts(vec![submit_tx], None, vec![join_handle])
+        Self::from_parts(vec![submit_tx], vec![join_handle])
     }
 
     /// Construct a multi-partition handle: one submit channel and one owned
@@ -144,24 +117,21 @@ impl EngineHandle {
             !submit_txs.is_empty(),
             "an engine must expose at least one scheduler partition"
         );
-        Self::from_parts(submit_txs, None, join_handles)
+        Self::from_parts(submit_txs, join_handles)
     }
 
     fn from_parts(
         submit_txs: Vec<mpsc::UnboundedSender<SubmittedRequest>>,
-        command_tx: Option<mpsc::UnboundedSender<EngineCommand>>,
         join_handles: Vec<JoinHandle<()>>,
     ) -> Self {
         Self {
             inner: Arc::new(EngineInner {
                 submit_txs,
-                command_tx,
                 join_handles,
             }),
             servable_len: None,
             kv_capacity: None,
             load_watches: vec![None],
-            kv_events: None,
         }
     }
 
@@ -228,23 +198,6 @@ impl EngineHandle {
         self.load_watch_for(0)
     }
 
-    #[must_use]
-    pub fn with_kv_events(mut self, rx: mpsc::UnboundedReceiver<KvBlockEvent>) -> Self {
-        self.kv_events = Some(Arc::new(Mutex::new(Some(rx))));
-        self
-    }
-
-    /// Take the engine's KV block-event receiver. Returns the receiver on the
-    /// first call and `None` thereafter (there is one stream and one consumer —
-    /// the cache-aware router pump). `None` also if the engine wired no feed.
-    pub fn take_kv_events(&self) -> Option<mpsc::UnboundedReceiver<KvBlockEvent>> {
-        self.kv_events
-            .as_ref()?
-            .lock()
-            .expect("kv-events cell poisoned")
-            .take()
-    }
-
     /// Submit an unresolved request: no KV-prefix resolution ran for it, so
     /// the scheduler receives [`KvPrefix::none`] and prefills from its own
     /// GPU prefix match alone. See [`Self::submit_resolved`].
@@ -260,51 +213,36 @@ impl EngineHandle {
     /// the request's `data_parallel_rank` (unbound requests go to the
     /// least-loaded partition), so the caller that resolved the prefix must
     /// have bound the request to the rank it resolved against.
-    ///
-    /// On the legacy command path (an engine wired with only a command
-    /// channel) the prefix is dropped: those engines never resolve prefixes,
-    /// and dropping releases the (necessarily absent) hold.
     #[allow(clippy::result_large_err)]
     fn submit_resolved(
         &self,
         req: GenerateRequest,
         kv_prefix: KvPrefix,
     ) -> std::result::Result<(), mpsc::error::SendError<GenerateRequest>> {
-        if !self.inner.submit_txs.is_empty() {
-            // A resolved prefix binds the request: its hold pins blocks on
-            // the rank it resolved against, so that rank wins the routing.
-            // A caller-bound rank that disagrees is a caller bug.
-            let partition = match (kv_prefix.rank(), req.data_parallel_rank) {
-                (Some(resolved), bound) => {
-                    debug_assert!(
-                        bound.is_none_or(|b| b == resolved),
-                        "request bound to rank {bound:?} but its prefix resolved on rank {resolved}"
-                    );
-                    resolved
-                }
-                (None, Some(bound)) => bound,
-                (None, None) => self.least_loaded_partition(),
-            };
-            if let Some(submit_tx) = self.inner.submit_txs.get(partition) {
-                return submit_tx
-                    .send((req, kv_prefix))
-                    .map_err(|err| mpsc::error::SendError(err.0.0));
+        // A resolved prefix binds the request: its hold pins blocks on
+        // the rank it resolved against, so that rank wins the routing.
+        // A caller-bound rank that disagrees is a caller bug.
+        let partition = match (kv_prefix.rank(), req.data_parallel_rank) {
+            (Some(resolved), bound) => {
+                debug_assert!(
+                    bound.is_none_or(|b| b == resolved),
+                    "request bound to rank {bound:?} but its prefix resolved on rank {resolved}"
+                );
+                resolved
             }
-            // An out-of-range rank is a caller error, not an engine
-            // failure: answer the request with the standard
-            // Scheduled → Rejected pair instead of failing the submit.
-            reject_unroutable(&req, partition, self.inner.submit_txs.len());
-            return Ok(());
+            (None, Some(bound)) => bound,
+            (None, None) => self.least_loaded_partition(),
+        };
+        if let Some(submit_tx) = self.inner.submit_txs.get(partition) {
+            return submit_tx
+                .send((req, kv_prefix))
+                .map_err(|err| mpsc::error::SendError(err.0.0));
         }
-        match self.inner.command_tx.as_ref() {
-            Some(command_tx) => command_tx
-                .send(EngineCommand::Generate(Box::new(req)))
-                .map_err(|err| match err.0 {
-                    EngineCommand::Generate(req) => mpsc::error::SendError(*req),
-                    EngineCommand::Control(_) => unreachable!("submitted generate command"),
-                }),
-            None => Err(mpsc::error::SendError(req)),
-        }
+        // An out-of-range rank is a caller error, not an engine
+        // failure: answer the request with the standard
+        // Scheduled → Rejected pair instead of failing the submit.
+        reject_unroutable(&req, partition, self.inner.submit_txs.len());
+        Ok(())
     }
 
     /// Placement for an unbound request: the partition with the lowest
@@ -329,85 +267,6 @@ impl EngineHandle {
                 (score, *partition)
             })
             .map_or(0, |(partition, _)| partition)
-    }
-
-    pub fn supports_lora_control(&self) -> bool {
-        self.inner.command_tx.is_some()
-    }
-
-    pub async fn load_lora_adapter(
-        &self,
-        request: LoadLoraAdapterRequest,
-    ) -> EngineControlResult<()> {
-        match self.inner.command_tx.as_ref() {
-            Some(command_tx) => {
-                let (response_tx, response_rx) = oneshot::channel();
-                command_tx
-                    .send(EngineCommand::Control(
-                        EngineControlRequest::LoadLoraAdapter {
-                            request,
-                            response_tx,
-                        },
-                    ))
-                    .map_err(|_| EngineControlError::ChannelClosed)?;
-
-                response_rx
-                    .await
-                    .map_err(|_| EngineControlError::ChannelClosed)?
-                    .map_err(EngineControlError::OperationFailed)
-            }
-            None => Err(EngineControlError::Unsupported(
-                "engine does not support dynamic LoRA adapter loading",
-            )),
-        }
-    }
-
-    pub async fn list_lora_adapters(&self) -> EngineControlResult<Vec<String>> {
-        match self.inner.command_tx.as_ref() {
-            Some(command_tx) => {
-                let (response_tx, response_rx) = oneshot::channel();
-                command_tx
-                    .send(EngineCommand::Control(
-                        EngineControlRequest::ListLoraAdapters { response_tx },
-                    ))
-                    .map_err(|_| EngineControlError::ChannelClosed)?;
-
-                response_rx
-                    .await
-                    .map_err(|_| EngineControlError::ChannelClosed)?
-                    .map_err(EngineControlError::OperationFailed)
-            }
-            None => Err(EngineControlError::Unsupported(
-                "engine does not support dynamic LoRA adapter loading",
-            )),
-        }
-    }
-
-    pub async fn unload_lora_adapter(
-        &self,
-        request: UnloadLoraAdapterRequest,
-    ) -> EngineControlResult<()> {
-        match self.inner.command_tx.as_ref() {
-            Some(command_tx) => {
-                let (response_tx, response_rx) = oneshot::channel();
-                command_tx
-                    .send(EngineCommand::Control(
-                        EngineControlRequest::UnloadLoraAdapter {
-                            request,
-                            response_tx,
-                        },
-                    ))
-                    .map_err(|_| EngineControlError::ChannelClosed)?;
-
-                response_rx
-                    .await
-                    .map_err(|_| EngineControlError::ChannelClosed)?
-                    .map_err(EngineControlError::OperationFailed)
-            }
-            None => Err(EngineControlError::Unsupported(
-                "engine does not support dynamic LoRA adapter loading",
-            )),
-        }
     }
 }
 
@@ -440,7 +299,6 @@ fn reject_unroutable(req: &GenerateRequest, partition: usize, partitions: usize)
 impl Drop for EngineInner {
     fn drop(&mut self) {
         self.submit_txs.clear();
-        let _ = self.command_tx.take();
         for join_handle in self.join_handles.drain(..) {
             if join_handle.thread().id() != thread::current().id() {
                 if let Err(panic) = join_handle.join() {
@@ -456,7 +314,6 @@ impl Drop for EngineInner {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -595,17 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn lora_control_support_is_opt_in() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
-        let handle = EngineHandle::new(submit_tx);
-        assert!(!handle.supports_lora_control());
-
-        let (command_tx, _command_rx) = mpsc::unbounded_channel::<EngineCommand>();
-        let handle = EngineHandle::new_with_command_channel(command_tx);
-        assert!(handle.supports_lora_control());
-    }
-
-    #[test]
     fn load_watches_define_scheduler_partitions() {
         let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
         let (_load_tx0, load_rx0) = watch::channel(LoadSnapshot {
@@ -636,131 +482,5 @@ mod tests {
             2
         );
         assert!(handle.load_watch_for(2).is_none());
-    }
-
-    #[tokio::test]
-    async fn load_lora_adapter_sends_control_command() {
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<EngineCommand>();
-        let handle = EngineHandle::new_with_command_channel(command_tx);
-
-        let request = LoadLoraAdapterRequest {
-            lora_name: "adapter-a".to_string(),
-            lora_path: PathBuf::from("/tmp/adapter-a"),
-            load_inplace: false,
-        };
-        let load = tokio::spawn({
-            let handle = handle.clone();
-            let request = request.clone();
-            async move { handle.load_lora_adapter(request).await }
-        });
-
-        let command = command_rx.recv().await.expect("control command");
-        match command {
-            EngineCommand::Control(EngineControlRequest::LoadLoraAdapter {
-                request: actual,
-                response_tx,
-            }) => {
-                assert_eq!(actual, request);
-                response_tx.send(Ok(())).expect("send load result");
-            }
-            EngineCommand::Control(
-                EngineControlRequest::UnloadLoraAdapter { .. }
-                | EngineControlRequest::ListLoraAdapters { .. },
-            ) => {
-                panic!("expected LoRA load command")
-            }
-            EngineCommand::Generate(_) => panic!("expected LoRA control command"),
-        }
-
-        load.await.expect("join load task").expect("load succeeded");
-    }
-
-    #[tokio::test]
-    async fn list_lora_adapters_sends_control_command() {
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<EngineCommand>();
-        let handle = EngineHandle::new_with_command_channel(command_tx);
-
-        let list = tokio::spawn({
-            let handle = handle.clone();
-            async move { handle.list_lora_adapters().await }
-        });
-
-        let command = command_rx.recv().await.expect("control command");
-        match command {
-            EngineCommand::Control(EngineControlRequest::ListLoraAdapters { response_tx }) => {
-                response_tx
-                    .send(Ok(vec!["adapter-a".to_string()]))
-                    .expect("send list result");
-            }
-            EngineCommand::Control(
-                EngineControlRequest::LoadLoraAdapter { .. }
-                | EngineControlRequest::UnloadLoraAdapter { .. },
-            ) => {
-                panic!("expected LoRA list command")
-            }
-            EngineCommand::Generate(_) => panic!("expected LoRA control command"),
-        }
-
-        assert_eq!(
-            list.await.expect("join load task").expect("list succeeded"),
-            vec!["adapter-a"]
-        );
-    }
-
-    #[tokio::test]
-    async fn load_lora_adapter_reports_unsupported_without_control() {
-        let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
-        let handle = EngineHandle::new(submit_tx);
-        let error = handle
-            .load_lora_adapter(LoadLoraAdapterRequest {
-                lora_name: "adapter-a".to_string(),
-                lora_path: PathBuf::from("/tmp/adapter-a"),
-                load_inplace: false,
-            })
-            .await
-            .expect_err("control should be unsupported");
-        assert_eq!(
-            error,
-            EngineControlError::Unsupported("engine does not support dynamic LoRA adapter loading")
-        );
-    }
-
-    #[tokio::test]
-    async fn unload_lora_adapter_sends_control_command() {
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<EngineCommand>();
-        let handle = EngineHandle::new_with_command_channel(command_tx);
-
-        let request = UnloadLoraAdapterRequest {
-            lora_name: "adapter-a".to_string(),
-            lora_int_id: None,
-        };
-        let unload = tokio::spawn({
-            let handle = handle.clone();
-            let request = request.clone();
-            async move { handle.unload_lora_adapter(request).await }
-        });
-
-        let command = command_rx.recv().await.expect("control command");
-        match command {
-            EngineCommand::Control(EngineControlRequest::UnloadLoraAdapter {
-                request: actual,
-                response_tx,
-            }) => {
-                assert_eq!(actual, request);
-                response_tx.send(Ok(())).expect("send unload result");
-            }
-            EngineCommand::Control(
-                EngineControlRequest::LoadLoraAdapter { .. }
-                | EngineControlRequest::ListLoraAdapters { .. },
-            ) => {
-                panic!("expected LoRA unload command")
-            }
-            EngineCommand::Generate(_) => panic!("expected LoRA control command"),
-        }
-
-        unload
-            .await
-            .expect("join unload task")
-            .expect("unload succeeded");
     }
 }

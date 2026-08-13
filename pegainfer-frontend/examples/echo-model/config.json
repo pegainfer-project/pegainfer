@@ -1,0 +1,6 @@
+{
+  "model_type": "echo",
+  "architectures": ["EchoModel"],
+  "vocab_size": 256,
+  "max_position_embeddings": 4096
+}

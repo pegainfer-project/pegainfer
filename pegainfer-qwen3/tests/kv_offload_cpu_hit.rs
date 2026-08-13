@@ -144,7 +144,6 @@ fn live_gpu_and_cpu_prefix_hits() {
         pegainfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS,
         None,
         pegainfer_qwen3::Qwen3MemoryOptions::default(),
-        false,
     )
     .expect("build offload executor");
     assert!(ex.offload_enabled(), "offload must be active");

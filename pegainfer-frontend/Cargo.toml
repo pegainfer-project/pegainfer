@@ -8,6 +8,7 @@ version = "0.1.0"
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
+crossbeam-channel = { workspace = true }
 fastrace = { workspace = true }
 log = { workspace = true }
 rmp-serde = { workspace = true }

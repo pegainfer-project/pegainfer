@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use clap::Args as ClapArgs;
 use clap::FromArgMatches;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
@@ -226,7 +226,7 @@ impl ModelLine for Glm52Line {
         })
     }
 
-    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle> {
+    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         use anyhow::Context;
         let cli = cli(ctx);
         let shared = ctx.shared;
@@ -278,6 +278,7 @@ impl ModelLine for Glm52Line {
             },
         )
         .context("failed to start GLM5.2 engine")
+        .map(LaunchedEngine::Handle)
     }
 }
 

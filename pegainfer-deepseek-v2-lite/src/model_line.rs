@@ -1,6 +1,6 @@
 //! DeepSeek-V2-Lite's [`ModelLine`] implementation.
 
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
 
@@ -28,8 +28,8 @@ impl ModelLine for DeepSeekV2LiteLine {
         &["cuda_graph"]
     }
 
-    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle> {
-        crate::launch(ctx.model_path, ctx.shared.cuda_graph)
+    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
+        crate::launch(ctx.model_path, ctx.shared.cuda_graph).map(LaunchedEngine::Handle)
     }
 }
 

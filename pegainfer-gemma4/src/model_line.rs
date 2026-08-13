@@ -1,8 +1,8 @@
 //! Gemma 4's [`ModelLine`] implementation (registration only — the engine
 //! itself is not yet available).
 
-use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
 
@@ -45,8 +45,9 @@ impl ModelLine for Gemma4Line {
         &["cuda_graph"]
     }
 
-    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle> {
+    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         crate::start_engine(ctx.model_path, EngineLoadOptions::default())
+            .map(LaunchedEngine::Handle)
     }
 }
 

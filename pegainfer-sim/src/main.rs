@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     let handle = start_engine(config);
 
     pegainfer_frontend::vllm::serve(
-        std::future::ready(Ok(handle)),
+        std::future::ready(Ok(handle.into())),
         Path::new(&args.model_id),
         Vec::new(),
         args.port,

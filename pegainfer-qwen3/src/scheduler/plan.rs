@@ -19,7 +19,7 @@ use crate::speculative::VerifyPlan;
 use crate::speculative::VerifyResult;
 use crate::speculative::VerifyStepItem;
 
-pub(super) enum ExecutionPlan {
+pub(crate) enum ExecutionPlan {
     Prefill {
         pending: Vec<PendingRequest>,
     },
@@ -31,14 +31,10 @@ pub(super) enum ExecutionPlan {
     },
 }
 
-pub(super) enum ExecutionArtifacts {
+pub(crate) enum ExecutionArtifacts {
     Prefill {
         pending: Vec<PendingRequest>,
         result: PrefillResult,
-        /// Stamped before the forward pass ran — downstream metrics split
-        /// queue time (queued→scheduled) from prefill time (scheduled→first
-        /// token), so stamping after execution would fold prefill into queue.
-        scheduled_at_unix_s: f64,
     },
     Decode {
         result: DecodeResult,
@@ -49,11 +45,10 @@ pub(super) enum ExecutionArtifacts {
     Unified {
         pending: Vec<PendingRequest>,
         result: UnifiedResult,
-        scheduled_at_unix_s: f64,
     },
 }
 
-pub(super) fn build_next_plan(
+pub(crate) fn build_next_plan(
     have_active: bool,
     pending: Vec<PendingRequest>,
     speculative: bool,
@@ -86,7 +81,7 @@ pub(super) fn build_next_plan(
     }
 }
 
-pub(super) fn execute_plan(
+pub(crate) fn execute_plan(
     executor: &mut impl ModelExecutor,
     active: &mut [ActiveRequestState],
     plan: ExecutionPlan,
@@ -94,7 +89,6 @@ pub(super) fn execute_plan(
 ) -> Result<ExecutionArtifacts> {
     match plan {
         ExecutionPlan::Prefill { pending } => {
-            let scheduled_at_unix_s = pegainfer_frontend::engine::unix_now_s();
             let indices: Vec<usize> = (0..pending.len()).collect();
             let requests = build_prefill_items(&pending, &indices);
             let any_echo = pending.iter().any(|req| req.echo);
@@ -104,11 +98,7 @@ pub(super) fn execute_plan(
                 sample_seed: rand::RngExt::random(rng),
             })?;
             sort_prefill_results(&mut result.requests);
-            Ok(ExecutionArtifacts::Prefill {
-                pending,
-                result,
-                scheduled_at_unix_s,
-            })
+            Ok(ExecutionArtifacts::Prefill { pending, result })
         }
         ExecutionPlan::Decode => {
             let indices: Vec<usize> = (0..active.len()).collect();
@@ -138,7 +128,6 @@ pub(super) fn execute_plan(
             Ok(ExecutionArtifacts::SpeculativeDecode { verify })
         }
         ExecutionPlan::Unified { pending } => {
-            let scheduled_at_unix_s = pegainfer_frontend::engine::unix_now_s();
             let pending_indices: Vec<usize> = (0..pending.len()).collect();
             let active_indices: Vec<usize> = (0..active.len()).collect();
             let prefill_requests = build_prefill_items(&pending, &pending_indices);
@@ -150,11 +139,7 @@ pub(super) fn execute_plan(
             })?;
             sort_prefill_results(&mut result.prefill_requests);
             sort_decode_results(&mut result.decode_requests);
-            Ok(ExecutionArtifacts::Unified {
-                pending,
-                result,
-                scheduled_at_unix_s,
-            })
+            Ok(ExecutionArtifacts::Unified { pending, result })
         }
     }
 }
@@ -165,7 +150,7 @@ pub(super) fn execute_plan(
 /// params are NOT a gate: sampled-verify (#512) runs the regular sampler over
 /// the verify rows, so the full surface — temperature/top_k/top_p/min_p/seed —
 /// rides the speculative path.
-pub(super) fn should_speculative_decode(
+pub(crate) fn should_speculative_decode(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
 ) -> bool {
@@ -265,17 +250,14 @@ mod tests {
     use crate::executor::RequestId;
 
     fn pending() -> PendingRequest {
-        let (token_tx, _rx) = pegainfer_frontend::engine::TokenSink::standalone();
         PendingRequest {
             request_id: RequestId::new(0),
             lora_adapter: None,
             prompt_tokens: vec![1, 2, 3],
             params: SamplingParams::default(),
             max_tokens: 8,
-            token_tx,
             logprobs: 0,
             echo: false,
-            queued_at_unix_s: None,
             prefetch_offered: false,
             prefill_pos: 0,
             step_chunk: 3,
@@ -284,11 +266,9 @@ mod tests {
     }
 
     fn active(generated_count: usize, max_tokens: usize) -> ActiveRequestState {
-        let (token_tx, _rx) = pegainfer_frontend::engine::TokenSink::standalone();
         ActiveRequestState {
             request_id: RequestId::new(7),
             lora_adapter: None,
-            token_tx,
             last_token: 42,
             generated_count,
             max_tokens,

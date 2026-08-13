@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use clap::Args as ClapArgs;
 use clap::FromArgMatches;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
@@ -108,7 +108,7 @@ impl ModelLine for Qwen35Line {
         Ok(())
     }
 
-    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle> {
+    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         let cli = cli(ctx);
         crate::launch_with_options_and_policy(
             ctx.model_path,
@@ -124,6 +124,7 @@ impl ModelLine for Qwen35Line {
             },
             cli.qwen35_scheduler_policy.resolve(),
         )
+        .map(LaunchedEngine::Handle)
     }
 }
 

@@ -1,8 +1,18 @@
+//! LoRA adapter control — an optional engine capability, deliberately
+//! outside the scheduler contract.
+//!
+//! An engine that manages adapters mints the pair itself before spawning its
+//! scheduler ([`LoraClient::channel`]), lets the scheduler capture the
+//! receiver (drained inside `step`, applied when the batch is idle), and
+//! returns the client on [`super::Engine::lora`]. The `Option` is the
+//! capability: an engine without one cannot be asked, so no "unsupported"
+//! error exists. The vocabulary lives here in the frontend layer — the
+//! consumer of the client defines the words — keeping the frontend free of
+//! model-crate types.
+
 use std::path::PathBuf;
 
 use tokio::sync::oneshot;
-
-use super::request::GenerateRequest;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadLoraAdapterRequest {
@@ -17,33 +27,78 @@ pub struct UnloadLoraAdapterRequest {
     pub lora_int_id: Option<i64>,
 }
 
-pub enum EngineControlRequest {
-    LoadLoraAdapter {
+/// One command to the serving engine, carrying its reply slot. A dropped
+/// reply (the engine tore down before applying) surfaces as
+/// [`LoraControlError::EngineGone`] on the client.
+pub enum LoraControl {
+    Load {
         request: LoadLoraAdapterRequest,
-        response_tx: oneshot::Sender<std::result::Result<(), String>>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
-    UnloadLoraAdapter {
+    Unload {
         request: UnloadLoraAdapterRequest,
-        response_tx: oneshot::Sender<std::result::Result<(), String>>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
-    ListLoraAdapters {
-        response_tx: oneshot::Sender<std::result::Result<Vec<String>, String>>,
+    List {
+        reply: oneshot::Sender<Vec<String>>,
     },
 }
 
-pub enum EngineCommand {
-    Generate(Box<GenerateRequest>),
-    Control(EngineControlRequest),
-}
+/// The engine's end: captured by the scheduler before spawn, drained inside
+/// `step`.
+pub type LoraControlReceiver = crossbeam_channel::Receiver<LoraControl>;
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
-pub enum EngineControlError {
-    #[error("{0}")]
-    Unsupported(&'static str),
-    #[error("engine control channel closed")]
-    ChannelClosed,
-    #[error("engine control operation failed: {0}")]
-    OperationFailed(String),
+pub enum LoraControlError {
+    /// The engine (or its reply) went away before answering.
+    #[error("engine is gone")]
+    EngineGone,
+    #[error("LoRA control operation failed: {0}")]
+    Failed(String),
 }
 
-pub type EngineControlResult<T> = std::result::Result<T, EngineControlError>;
+/// Async client for an engine's LoRA control channel. Rides
+/// [`super::Engine::lora`] from launch to whoever serves the adapter routes.
+#[derive(Clone)]
+pub struct LoraClient {
+    tx: crossbeam_channel::Sender<LoraControl>,
+}
+
+impl LoraClient {
+    /// Mint both ends of the channel.
+    #[must_use]
+    pub fn channel() -> (Self, LoraControlReceiver) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        (Self { tx }, rx)
+    }
+
+    pub async fn load(&self, request: LoadLoraAdapterRequest) -> Result<(), LoraControlError> {
+        let (reply, rx) = oneshot::channel();
+        self.roundtrip(LoraControl::Load { request, reply }, rx)
+            .await?
+            .map_err(LoraControlError::Failed)
+    }
+
+    pub async fn unload(&self, request: UnloadLoraAdapterRequest) -> Result<(), LoraControlError> {
+        let (reply, rx) = oneshot::channel();
+        self.roundtrip(LoraControl::Unload { request, reply }, rx)
+            .await?
+            .map_err(LoraControlError::Failed)
+    }
+
+    pub async fn list(&self) -> Result<Vec<String>, LoraControlError> {
+        let (reply, rx) = oneshot::channel();
+        self.roundtrip(LoraControl::List { reply }, rx).await
+    }
+
+    async fn roundtrip<T>(
+        &self,
+        control: LoraControl,
+        rx: oneshot::Receiver<T>,
+    ) -> Result<T, LoraControlError> {
+        self.tx
+            .send(control)
+            .map_err(|_| LoraControlError::EngineGone)?;
+        rx.await.map_err(|_| LoraControlError::EngineGone)
+    }
+}

@@ -23,10 +23,15 @@
 use std::path::Path;
 
 use pegainfer_frontend::engine::EngineLoadOptions;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
+
+// Only the harness slice of the shared module is used here; this test never
+// touches the tokenizer helpers.
+#[allow(dead_code)]
+mod common;
+
+use common::harness::EngineHarness;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
@@ -51,62 +56,45 @@ fn in_window_prompt_past_old_rope_table_is_served() {
         return;
     };
 
-    let handle = pegainfer_qwen3::start_engine(
-        Path::new(&model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-    )
-    .expect("failed to start engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::start_engine(
+            Path::new(&model_path),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+        )
+        .expect("failed to start engine"),
+    );
 
     // 4097 tokens → positions 0..=4096. Position 4096 is the first index past the
     // old 4096-entry RoPE table; serving this prompt requires the resized cache.
     // Token id 1 is a valid vocab id — a forward pass actually runs here (unlike
     // the rejection test, which never reaches prefill).
     let prompt_tokens = vec![1u32; 4097];
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
+    let outcome = engine
+        .submit(common::harness::request(
             prompt_tokens,
-            params: SamplingParams::default(),
-            max_tokens: 1,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
+            SamplingParams::default(),
+            1,
+        ))
+        .outcome();
 
-    let mut generated = 0usize;
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { .. }) => generated += 1,
-            Some(
-                TokenEvent::PromptTokens { .. }
-                | TokenEvent::Scheduled { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { .. }) => break,
-            Some(TokenEvent::Error { message, .. }) => {
-                panic!("in-window prompt errored (resized RoPE cache not exercised?): {message}")
-            }
-            Some(TokenEvent::Rejected { message, .. }) => {
-                panic!("in-window prompt was wrongly rejected: {message}")
-            }
-            None => panic!("scheduler channel closed without Finished"),
+    match &outcome.terminal {
+        Terminal::Finished { .. } => {}
+        Terminal::Failed { message, .. } => {
+            panic!("in-window prompt errored (resized RoPE cache not exercised?): {message}")
+        }
+        Terminal::Rejected { reason, .. } => {
+            panic!("in-window prompt was wrongly rejected: {reason}")
         }
     }
 
     assert_eq!(
-        generated, 1,
+        outcome.tokens.len(),
+        1,
         "expected exactly one generated token for a 4097-token prompt with max_tokens=1"
     );
 }

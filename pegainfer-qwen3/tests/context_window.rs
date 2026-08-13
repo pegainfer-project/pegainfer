@@ -17,15 +17,15 @@
 
 use std::path::Path;
 
-use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::RejectReason;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
+
+use common::harness::EngineHarness;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 
@@ -46,45 +46,13 @@ fn model_path_or_skip() -> Option<String> {
 
 /// Submit `prompt` and block until the request finishes; returns the decoded text.
 fn generate_text(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
 ) -> String {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params: SamplingParams::default(),
-            max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    let mut tokens = Vec::new();
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(
-                TokenEvent::PromptTokens { .. }
-                | TokenEvent::Scheduled { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { .. }) => break,
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
-        }
-    }
+    let tokens = engine.generate(prompt_tokens, SamplingParams::default(), max_tokens);
     tokenizer.decode(&tokens, true).expect("decode failed")
 }
 
@@ -94,54 +62,46 @@ fn oversized_prompt_is_rejected_with_context_length_error() {
         return;
     };
 
-    let handle = pegainfer_qwen3::start_engine(
-        Path::new(&model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-    )
-    .expect("failed to start engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::start_engine(
+            Path::new(&model_path),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+        )
+        .expect("failed to start engine"),
+    );
 
     // Qwen3-4B's max_position_embeddings is 40960; 60k tokens overflows it outright.
     // Token id is irrelevant — the request is rejected before any embedding lookup.
     let prompt_tokens = vec![1u32; 60_000];
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
+    let outcome = engine
+        .submit(common::harness::request(
             prompt_tokens,
-            params: SamplingParams::default(),
-            max_tokens: 8,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
+            SamplingParams::default(),
+            8,
+        ))
+        .outcome();
 
-    match rx.blocking_recv().map(|(_, event)| event) {
-        Some(TokenEvent::Rejected { message, .. }) => {
+    match outcome.terminal {
+        Terminal::Rejected { reason, .. } => {
             assert!(
-                message.contains("context length"),
-                "expected a context-length rejection, got: {message}"
+                matches!(reason, RejectReason::ContextLength { .. }),
+                "expected a context-length rejection, got: {reason}"
             );
         }
-        Some(TokenEvent::Error { message, .. }) => {
+        Terminal::Failed { message, .. } => {
             panic!("oversized prompt errored instead of clean rejection: {message}")
         }
-        _ => panic!("oversized prompt should be rejected at admission"),
+        Terminal::Finished { .. } => panic!("oversized prompt should be rejected at admission"),
     }
 
     // The engine must keep serving normal requests after the rejection.
     let tokenizer = common::load_tokenizer(&model_path);
-    let text = generate_text(&handle, &tokenizer, "Hello", 5);
+    let text = generate_text(&engine, &tokenizer, "Hello", 5);
     assert!(
         !text.is_empty(),
         "scheduler dead after context-length rejection"

@@ -1,3 +1,5 @@
+pub(crate) mod harness;
+
 use std::sync::Arc;
 
 use vllm_text::Error;

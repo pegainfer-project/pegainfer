@@ -225,7 +225,7 @@ impl ToolCallSimServer {
         let model_path = model_dir.path().to_path_buf();
         let mut task = tokio::spawn(async move {
             pegainfer_frontend::vllm::serve(
-                std::future::ready(Ok(engine)),
+                std::future::ready(Ok(engine.into())),
                 &model_path,
                 vec![MODEL_NAME.to_string()],
                 port,
