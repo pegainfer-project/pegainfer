@@ -89,19 +89,53 @@ K3 uses the `pegainfer-kernels/k3` feature. The surface is TileLang-generated
 CUDA, AOT-compiled at build time from the vendored kernel definitions in
 `pegainfer-k3/kernels/tilelang_defs.py` (byte-identical to the certified
 upstream spellings — see `pegainfer-k3/kernels/README.md` for the generate /
-pre-generated / stub build tiers). Every kernel is row-independent and the
-batch dimension is a **static compile dimension**: the generator instantiates
-the buckets `{1,2,4,8,16,32,48,64,96,128}` and the ops layer rounds the live
-row count up, so callers must size buffers for the bucket, not for the live
-rows. Launchers return a raw `cudaError_t`; an uninstantiated shape gets
-`cudaErrorInvalidValue`, and a build without TileLang gets
-`cudaErrorNotSupported` from the stub tier.
+pre-generated / stub build tiers). It covers every non-GEMM step of a K3
+decode iteration; dense projections go to cuBLASLt and the routed experts to
+the DeepGEMM masked grouped-GEMM chain below.
 
-| op_id | Runtime owner | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
+Every kernel here is **batched and compiled per static shape tuple** — expert
+count, attention-residual block count, MLA context capacity and the batch
+bucket are all baked in. There is no separate single-row kernel set: `b = 1`
+is a bucket whose per-row spelling is the certified single-row kernel, which
+is what the upstream bitwise gate proves. Buckets are
+`{1,2,4,8,16,32,48,64,96,128}` and `ops::k3_batch_bucket` rounds the live row
+count up, so callers must size buffers for the bucket, not for the live rows,
+and the discarded tail rows must still point at valid memory.
+
+Each family is one translation unit with one hand-written `extern "C"`
+dispatch launcher keyed on the configuration tuple; launchers return a raw
+`cudaError_t`, with `cudaErrorInvalidValue` for a configuration that was never
+instantiated and `cudaErrorNotSupported` from the stub tier.
+
+Per-slot state tensors (`conv_silu` windows, `kda_core` recurrent state, MLA
+`Kc`/`Vc`) are `[b, ...]` contiguous with each row holding exactly the
+single-row layout — the caches are slot-indexed, not paged, and there is no
+block table.
+
+K3 dimensions the instantiations are derived from: hidden `7168`, KDA
+`96x128`, MLA `96` heads with `qk=192`/`v=128`, q LoRA `1536`, kv LoRA `512`,
+routed latent `3584`, MoE intermediate `3072` (shared `6144`), dense
+intermediate `33792`, top-k `16`, vocab `163840`, split-K `8`.
+
+The f32 side inputs are f32 on purpose: the checkpoint stores the router
+correction bias, `conv1d.weight`, `dt_bias`, `A_log` and `o_norm.weight` as
+f32, and narrowing any of them to bf16 measurably flips routing decisions.
+
+| op_id | Runtime owner | Rust wrapper | FFI symbol | Source (OUT_DIR `.cu`) | Backend | Shape / layout notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `k3.moe.router_topk` | future K3 model crate | `ops::k3_router_topk_launch` | `k3_router_topk` | `pegainfer-k3/kernels/generate.py` (OUT_DIR `k3_router_topk.cu`) | TileLang AOT CUDA | Sigmoid router + biased top-k, one block per row. Scores `[B,E]` f32, correction bias `[E]` f32 (f32 on purpose — bf16 bias flips routing), bf16 scalar `routed_scale [1]`; out `idx [B,16]` i32 and `weights [B,16]` f32 gathered from the **un-biased** scores, denominator `+1e-20`. Instantiated for E ∈ {224, 896}, TOPK = 16. |
-| `k3.attnres.scores` | future K3 model crate | `ops::k3_attnres_scores_launch` | `k3_attnres_scores` | `pegainfer-k3/kernels/generate.py` (OUT_DIR `k3_attnres_scores.cu`) | TileLang AOT CUDA | Attention-residual candidate scoring, one block per (row, candidate): weightless RMS normalization then a dot with the pre-fused f32 scoring vector `[H]`. `prefix_sum [B,H]` bf16, `blocks [B,NB,H]` bf16, out `[B,NB+1]` f32 with index `NB` = the prefix sum itself. H = 7168, NB ∈ 1..8 (the block history grows across the 93 layers). |
-| `k3.attnres.mix` | future K3 model crate | `ops::k3_attnres_mix_launch` | `k3_attnres_mix` | `pegainfer-k3/kernels/generate.py` (OUT_DIR `k3_attnres_mix.cu`) | TileLang AOT CUDA | Per-row softmax over the `NB+1` scores, then a probability-weighted mix of the **un-normalized** candidates landing in bf16 once. Grid is `(B, H/256)`; each block redoes the row's softmax. Same `[B,H]`/`[B,NB,H]` bf16 operands, out `[B,H]` bf16. H = 7168, NB ∈ 1..8. |
+| `k3.norm.rms_rbs` | future K3 model crate | `ops::k3_rms_norm_rbs_batched_launch` | `k3_rms_norm_rbs_batched` | `k3_rms_norm_rbs_batched.cu` | TileLang AOT CUDA | KimiRMSNorm, round-before-scale: the normalized value lands bf16 *before* multiplying gamma. One row per block; `X`/`O` are `[b, h]` bf16 and gamma `[h]` is shared. h ∈ {7168, 512, 3584} (layer norms, MLA kv latent, routed latent) × 10 buckets; eps compiled in. |
+| `k3.linear.land` | future K3 model crate | `ops::k3_land_batched_launch` | `k3_land_batched` | `k3_land_batched.cu` | TileLang AOT CUDA | Merge the column span `[off, off+n)` of each row's `[split_k, nt]` f32 partial and land bf16 once — the landing of every matmul. 14 (nt, n, off) spans × split_k ∈ {8, 1} × 10 buckets. `split_k = 1` is the single-partial case a cuBLASLt GEMM produces, where the merge degenerates to the slice and the cast. Masked tail store, so `n` need not divide 256. |
+| `k3.linear.land_rms_rbs` | future K3 model crate | `ops::k3_land_rms_norm_rbs_batched_launch` | `k3_land_rms_norm_rbs_batched` | `k3_land_rms_norm_rbs_batched.cu` | TileLang AOT CUDA | `k3_land_batched` fused with the round-before-scale norm. One span — MLA q_a, `[0, 1536)` of the `14400`-wide fused projection — × split_k ∈ {8, 1} × 10 buckets. |
+| `k3.elementwise.add2` | future K3 model crate | `ops::k3_add2_batched_launch` | `k3_add2_batched` | `k3_add2_batched.cu` | TileLang AOT CUDA | `O = A + Bt` in bf16 addition (residual adds, routed + shared). n = 7168 × 10 buckets. |
+| `k3.elementwise.mul_sigmoid` | future K3 model crate | `ops::k3_mul_sigmoid_batched_launch` | `k3_mul_sigmoid_batched` | `k3_mul_sigmoid_batched.cu` | TileLang AOT CUDA | `O = A * bf16(sigmoid(Bt))`, the MLA sigmoid output gate; the sigmoid is taken in f32 and lands bf16 before the product. n = 12288 × 10 buckets. |
+| `k3.act.situ` | future K3 model crate | `ops::k3_situ_batched_launch` | `k3_situ_batched` | `k3_situ_batched.cu` | TileLang AOT CUDA | `4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)` in f32, landing bf16 once; the betas are compiled in. n ∈ {49152 (16 routed rows × 3072), 6144 (shared), 33792 (dense)} × 10 buckets. The DeepGEMM chain has its own fused situ for the masked routed path; this one serves the shared and dense MLPs. |
+| `k3.moe.combine_land` | future K3 model crate | `ops::k3_combine_land_batched_launch` | `k3_combine_land_batched` | `k3_combine_land_batched.cu` | TileLang AOT CUDA | f32 multiply-accumulate of each row's `[16, 3584]` expert outputs against its routing weights, landing bf16 once. Ascending in topk, so the sum is reproducible. 10 buckets. |
+| `k3.kda.conv_silu` | future K3 model crate | `ops::k3_conv_silu_batched_launch` | `k3_conv_silu_batched` | `k3_conv_silu_batched.cu` | TileLang AOT CUDA | Causal depthwise convolution over the 4-slot window plus silu, one token per row. Consumes the projection's `[b, split_k, 12288]` f32 partial: its bf16 landing is `X`, the newest window slot; `Sn` is the shifted state the caller carries. Conv weights `[4, 12288]` are **f32** and have no batch axis; the window state is `[b, 3, 12288]`, one independent window per row. split_k ∈ {8, 1} × 10 buckets. |
+| `k3.kda.core` | future K3 model crate | `ops::k3_kda_core_batched_launch` | `k3_kda_core_batched` | `k3_kda_core_batched.cu` | TileLang AOT CUDA | One delta-rule step per row, one (row, head) per block, `threads = head_dim`. State `[b, 96, 128, 128]` f32 laid out `[head, v_dim, k_dim]` per row with decay along k, read from `State` and written to `StateN` (must not alias). `Dt`/`Alog`/`Go` f32 weights with no batch axis, `Bt`/`G2` bf16; gate lower bound and eps compiled in. Gate partial uses split-K 1. 10 buckets. |
+| `k3.attn.mla_decode` | future K3 model crate | `ops::k3_mla_attn_batched_launch` | `k3_mla_attn_batched` | `k3_mla_attn_batched.cu` | TileLang AOT CUDA | NoPE full-context attention, one (row, head) per block (no GQA — all 96 heads hold their own K). The cache is **slot indexed**: each row owns a fixed `max_ctx` window and `Kc`/`Vc` are the contiguous single-row blocks, so this is not a paged cache and there is no block table. `N` is a per-row device i32 length and slots at or past it score NEG, so the step needs no host sync and a row at length `l` is bit-identical to the single-row kernel at `l`. Score landings follow the eager chain (f32 dot → bf16 → × bf16 scale → bf16 → f32 softmax → bf16 probabilities). max_ctx ∈ {128} × 10 buckets; both the instantiation count and the per-block shared memory scale with the capacity, so extending the list is a one-line but deliberate change in `generate.py`. |
+| `k3.moe.router_topk` | future K3 model crate | `ops::k3_router_topk_batched_launch` | `k3_router_topk_batched` | `k3_router_topk_batched.cu` | TileLang AOT CUDA | Sigmoid router + biased top-k over already-merged `[b, E]` f32 score rows, one row per block. Serial O(topk*E) scan by thread 0 with lowest-index tie-break; weights gathered from the **un-biased** scores, denominator `+1e-20`, scaled by the bf16 `Rs[0]`. E ∈ {896 (full table), 224 (4-way EP shard)}, TOPK = 16, × 10 buckets. |
+| `k3.attnres.scores` | future K3 model crate | `ops::k3_attnres_scores_batched_launch` | `k3_attnres_scores_batched` | `k3_attnres_scores_batched.cu` | TileLang AOT CUDA | Attention-residual candidate scoring, one block per (row, candidate): weightless RMS normalization then a dot with the pre-fused f32 scoring vector `[7168]`. Candidate `NB` is that row's prefix sum, below it its own snapshot history `[b, NB, 7168]`. NB ∈ 1..8 (the history grows one entry per 12 layers over 93 layers) × 10 buckets. |
+| `k3.attnres.mix` | future K3 model crate | `ops::k3_attnres_mix_batched_launch` | `k3_attnres_mix_batched` | `k3_attnres_mix_batched.cu` | TileLang AOT CUDA | Softmax over each row's `NB+1` scores, then a probability-weighted mix of the **un-normalized** candidates landing bf16 once. Grid `(b, 7168/256)`; each block redoes its row's softmax. NB ∈ 1..8 × 10 buckets. |
 
 ## Kimi-K3 MoE Bring-Up Surface
 
@@ -126,6 +160,26 @@ LSB first), but the differing granularity gives them different packed K extents:
 | --- | --- | --- | --- | --- | --- | --- |
 | `k3.deepgemm.masked_grouped_fp8_fp4` | future Kimi-K3 model crate | `ops::k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch` | `k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch_cuda` | `csrc/k3/k3_deepgemm_fp8_fp4_grouped_sm100.cu` | DeepGEMM SM100 MGroupedMasked (tcgen05) | Activation `[groups, masked_cap, k]` fp8 e4m3, act scale i32 `[groups, k/512, masked_cap]`, weight `[groups, n, k]` fp4 e2m1 (2 per byte), weight scale i32 `[groups, k/128, n]`, out `[groups, masked_cap, n]` bf16. `masked_cap % 128 == 0`; `groups` dispatches over {56, 112, 224}; `num_sms` selects the B200 (148) / GB300 (152) instantiation. Requires sm_100f — NOT_SUPPORTED stub otherwise. |
 | `k3.deepgemm.fp4_sf_prepare` | future Kimi-K3 model crate | `ops::k3_fp4_sf_prepare_launch` | `k3_fp4_sf_prepare_cuda` | `csrc/k3/k3_deepgemm_fp8_fp4_grouped_sm100.cu` | CUDA layout helper for DeepGEMM | Loader-time repack of checkpoint MXFP4 weight scales `[groups, n, k/32]` u8 UE8M0 exponent bytes (K-major) into the MN-major packed SFB tensor `[groups, k/128, n]` i32. Transpose plus 4:1 pack; not a step-time kernel. |
+
+The batched-decode chain around that GEMM lives in `csrc/k3/k3_moe_chain.cu`.
+An *entry* is one expanded `(token, topk-slot)` pair at index
+`token * topk + slot`; entry order is the chain's deterministic order (it fixes
+the masked row each entry lands in and the combine's accumulation order), and an
+entry whose `topk_idx` falls outside `[0, groups)` is inactive — that is how
+padded batch rows, and later an EP shard's non-local experts, are excluded.
+Every consumer re-reads `topk_idx` rather than trusting the slot map alone. The
+local gather is fused into the W13 quant, so no bf16 expert-major staging buffer
+exists. Nothing allocates, reads back, or varies its launch geometry with device
+state, so the chain is CUDA-graph capturable; `tests/k3_moe_chain_gate.rs` is
+the end-to-end numerical gate (and asserts two runs are bit-identical).
+
+| op_id | Runtime owner | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `k3.moe.local_route_metadata` | future Kimi-K3 model crate | `ops::k3_moe_local_route_metadata_launch` | `k3_moe_local_route_metadata_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | `topk_idx [tokens, topk]` i32 -> `masked_m [groups]` i32 and `slot_map [tokens * topk]` i32 (`expert * masked_cap + rank`, `-1` when inactive). One block per expert compacts that expert's entries in entry order with a ballot scan, so the row assignment is scheduling-independent; the `-1` fill is partitioned by `entry % groups`, disjoint from the claimed writes. An expert claiming more than `masked_cap` entries traps. |
+| `k3.moe.gather_fp8_quant_masked` | future Kimi-K3 model crate | `ops::k3_moe_gather_fp8_quant_masked_launch` | `k3_moe_gather_fp8_quant_masked_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | Local gather fused with the W13 A-operand quant: bf16 `[tokens, hidden]` read through the routing map -> fp8 e4m3 `[groups * masked_cap, hidden]` plus MN-major UE8M0 f32 scales `[groups, hidden/128, masked_cap]`. Grid `(min(entries, 256), hidden/128)` x 128 threads, grid-strided over entries. `hidden % 128 == 0`. |
+| `k3.moe.situ_and_mul_fp8_quant_masked` | future Kimi-K3 model crate | `ops::k3_situ_and_mul_fp8_quant_masked_launch` | `k3_situ_and_mul_fp8_quant_masked_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | K3 situ activation over the masked W13 output `[groups * masked_cap, 2*inter]` bf16 (gate = first `inter` columns) followed by the W2 A-operand quant. In f32 over the bf16 GEMM output: `4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)`. Router weights are **not** applied here. Out fp8 `[groups * masked_cap, inter]` + f32 scales `[groups, inter/128, masked_cap]`. |
+| `k3.moe.fp8_scale_pack_ue8m0` | future Kimi-K3 model crate | `ops::k3_fp8_scale_pack_ue8m0_launch` | `k3_fp8_scale_pack_ue8m0_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | f32 MN-major group scales `[groups, scale_cols, cap]` -> packed UE8M0 i32 SFA `[groups, scale_cols/4, cap]`, LSB-first exponent bytes. Dense full-cover pass (no stale byte can reach the GEMM); inputs must already be powers of two, which the two quant kernels guarantee. `scale_cols = k/128`, multiple of 4. |
+| `k3.moe.weighted_combine` | future Kimi-K3 model crate | `ops::k3_moe_weighted_combine_launch` | `k3_moe_weighted_combine_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | Masked W2 output `[groups * masked_cap, hidden]` bf16 x `topk_weight [tokens, topk]` f32 -> `[tokens, hidden]` bf16. Grid `(tokens, ceil(hidden/256))`; each thread owns one column and accumulates its token's topk slots **in slot order** in f32 with no atomics, rounding to bf16 once. Tokens with no active entry land an exact zero, so the output is fully covered. |
 
 ## Non-Qwen3 Compatibility
 

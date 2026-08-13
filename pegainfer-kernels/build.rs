@@ -1443,7 +1443,7 @@ fn compile_triton_aot_kernels(cuda_include: &Path, out_dir: &Path, sm_targets: &
 }
 
 // ===========================================================================
-// k3 tilelang: BEGIN — K3 batched TileLang decode kernels (AOT).
+// k3 tilelang: BEGIN — K3 TileLang decode kernels (AOT).
 //
 // Self-contained section: everything the `k3` feature needs to turn
 // `pegainfer-k3/kernels/generate.py` into objects lives between these two
@@ -1466,21 +1466,60 @@ struct K3TileLangArtifacts {
     cu_files: Vec<PathBuf>,
     template_include: PathBuf,
     cutlass_include: PathBuf,
+    /// Arch the bodies were lowered for, e.g. `sm_103a`.
+    arch: Option<String>,
 }
 
 /// `extern "C"` entry points the generator emits; the stub tier has to match
 /// this list exactly or the `k3` feature fails to link.
 const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
     (
-        "k3_router_topk",
+        "k3_rms_norm_rbs_batched",
+        "const void*, const void*, void*, int, int",
+    ),
+    (
+        "k3_land_batched",
+        "const float*, void*, int, int, int, int, int",
+    ),
+    (
+        "k3_land_rms_norm_rbs_batched",
+        "const float*, const void*, void*, int, int, int, int, int",
+    ),
+    ("k3_add2_batched", "const void*, const void*, void*, int, int"),
+    (
+        "k3_mul_sigmoid_batched",
+        "const void*, const void*, void*, int, int",
+    ),
+    ("k3_situ_batched", "const void*, const void*, void*, int, int"),
+    (
+        "k3_combine_land_batched",
+        "const void*, const float*, void*, int, int, int",
+    ),
+    (
+        "k3_conv_silu_batched",
+        "const float*, const float*, const void*, void*, void*, void*, int, int, int, int",
+    ),
+    (
+        "k3_kda_core_batched",
+        "const void*, const void*, const void*, const float*, const float*, const float*, \
+         const void*, const void*, const float*, const float*, float*, void*, \
+         int, int, int, int",
+    ),
+    (
+        "k3_mla_attn_batched",
+        "const void*, const void*, const void*, const int*, const void*, void*, \
+         int, int, int, int, int",
+    ),
+    (
+        "k3_router_topk_batched",
         "const float*, const float*, const void*, int*, float*, int, int, int",
     ),
     (
-        "k3_attnres_scores",
+        "k3_attnres_scores_batched",
         "const void*, const void*, const float*, float*, int, int, int",
     ),
     (
-        "k3_attnres_mix",
+        "k3_attnres_mix_batched",
         "const void*, const void*, const float*, void*, int, int, int",
     ),
 ];
@@ -1556,13 +1595,34 @@ fn k3_tilelang_arch(sm_targets: &[String]) -> Option<String> {
     })
 }
 
+/// nvcc gencode for the exact arch the TileLang bodies were lowered for.
+///
+/// These TUs cannot ride the generic arch list: TileLang lowers a TMA copy
+/// into a warp-specialized kernel that emits `setmaxnreg`, which ptxas only
+/// assembles for the accelerated (`a`) target. Generation targets a single
+/// arch, so the objects do too — a multi-SM build gets K3 TileLang kernels for
+/// the highest SM only. `None` means this nvcc cannot assemble that arch, and
+/// the caller falls back to the stub tier rather than emitting objects that
+/// would fail to link or run.
+fn k3_tilelang_gencode(arch: &str, nvcc: &str) -> Option<Vec<String>> {
+    let target = arch.strip_prefix("sm_")?;
+    nvcc_accepts_gencode(nvcc, target, target).then(|| {
+        vec![
+            "-gencode".to_string(),
+            format!("arch=compute_{target},code=sm_{target}"),
+        ]
+    })
+}
+
 /// Parse the `KEY=VALUE` contract the generator prints on stdout and mirrors
-/// into `manifest.txt`: one `CU_PATH` per emitted translation unit plus the
-/// two header roots the generated CUDA includes.
+/// into `manifest.txt`: one `CU_PATH` per emitted translation unit, the two
+/// header roots the generated CUDA includes, and the arch the bodies were
+/// lowered for.
 fn parse_k3_tilelang_manifest(text: &str, origin: &str) -> K3TileLangArtifacts {
     let mut cu_files = Vec::new();
     let mut template_include = None;
     let mut cutlass_include = None;
+    let mut arch = None;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("CU_PATH=") {
             cu_files.push(PathBuf::from(value.trim()));
@@ -1570,6 +1630,8 @@ fn parse_k3_tilelang_manifest(text: &str, origin: &str) -> K3TileLangArtifacts {
             template_include = Some(PathBuf::from(value.trim()));
         } else if let Some(value) = line.strip_prefix("CUTLASS_INCLUDE_DIR=") {
             cutlass_include = Some(PathBuf::from(value.trim()));
+        } else if let Some(value) = line.strip_prefix("ARCH=") {
+            arch = Some(value.trim().to_string());
         }
     }
 
@@ -1590,6 +1652,7 @@ fn parse_k3_tilelang_manifest(text: &str, origin: &str) -> K3TileLangArtifacts {
         cu_files,
         template_include,
         cutlass_include,
+        arch,
     }
 }
 
@@ -1652,10 +1715,11 @@ fn generate_k3_tilelang_artifacts(
         String::from_utf8_lossy(&output.stderr).trim(),
     );
 
-    let artifacts = parse_k3_tilelang_manifest(
+    let mut artifacts = parse_k3_tilelang_manifest(
         &String::from_utf8_lossy(&output.stdout),
         "the K3 TileLang generator",
     );
+    artifacts.arch.get_or_insert(arch.clone());
     println!("cargo:warning=Generated K3 TileLang CUDA for {arch}");
     println!("cargo:rerun-if-changed={}", generator_path.display());
     println!(
@@ -1694,29 +1758,49 @@ fn k3_tilelang_nvcc_tasks(
     cuda_include: &Path,
     arch_args: &[String],
     sm_targets: &[String],
+    nvcc: &str,
 ) -> Vec<NvccTask> {
     println!("cargo:rerun-if-env-changed=PEGAINFER_K3_TILELANG_PYTHON");
     println!("cargo:rerun-if-env-changed=PEGAINFER_K3_TILELANG_PREGEN");
+    println!("cargo:rerun-if-env-changed=PEGAINFER_K3_TILELANG_JOBS");
 
     let artifacts = k3_tilelang_pregen_artifacts()
         .or_else(|| generate_k3_tilelang_artifacts(out_dir, sm_targets));
 
-    let (cu_files, extra_includes) = match artifacts {
-        Some(artifacts) => {
+    // Generated bodies need the arch they were lowered for; the stub is plain
+    // host code and rides the generic arch list.
+    let generated = artifacts.and_then(|artifacts| {
+        let arch = artifacts
+            .arch
+            .clone()
+            .or_else(|| k3_tilelang_arch(sm_targets))
+            .unwrap_or_default();
+        match k3_tilelang_gencode(&arch, nvcc) {
+            Some(gencode) => Some((artifacts, gencode)),
+            None => {
+                println!(
+                    "cargo:warning=nvcc cannot assemble {arch}, which the K3 TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs"
+                );
+                None
+            }
+        }
+    });
+
+    let (cu_files, extra_includes, tilelang_arch_args) = match generated {
+        Some((artifacts, gencode)) => {
             let includes = vec![
                 "-I".to_string(),
                 artifacts.template_include.to_string_lossy().to_string(),
                 "-I".to_string(),
                 artifacts.cutlass_include.to_string_lossy().to_string(),
             ];
-            (artifacts.cu_files, includes)
+            (artifacts.cu_files, includes, gencode)
         }
-        None => {
-            println!(
-                "cargo:warning=No TileLang and no PEGAINFER_K3_TILELANG_PREGEN; K3 TileLang kernels compile as NOT_SUPPORTED stubs"
-            );
-            (vec![write_k3_tilelang_stub(out_dir)], Vec::new())
-        }
+        None => (
+            vec![write_k3_tilelang_stub(out_dir)],
+            Vec::new(),
+            arch_args.to_vec(),
+        ),
     };
 
     cu_files
@@ -1733,7 +1817,7 @@ fn k3_tilelang_nvcc_tasks(
                 "-I".to_string(),
                 cuda_include.to_string_lossy().to_string(),
             ];
-            args.extend(arch_args.iter().cloned());
+            args.extend(tilelang_arch_args.iter().cloned());
             args.extend([
                 "--std=c++20".to_string(),
                 "--compiler-options".to_string(),
@@ -2188,6 +2272,7 @@ fn main() {
             &cuda_include,
             &arch_args,
             &sm_targets,
+            &nvcc,
         ));
     } else {
         println!(

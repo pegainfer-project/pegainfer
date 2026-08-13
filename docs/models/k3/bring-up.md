@@ -2,9 +2,10 @@
 
 **TL;DR**: New model line (`--features k3`), bring-up stage: config probe + weight
 loader + step-contract scheduler skeleton land first; model execution is not
-wired yet (requests fail with an explicit message). Kernel surface: TileLang
-generated router/attn-res kernels + DeepGEMM masked FP8xFP4 grouped-GEMM AOT
-shim, both compiled behind `pegainfer-kernels`'s `k3` feature.
+wired yet (requests fail with an explicit message). Kernel surface: thirteen
+batched TileLang decode families (every non-GEMM step, `B` a compile-time
+bucket) + DeepGEMM masked FP8xFP4 grouped-GEMM AOT shim, both compiled behind
+`pegainfer-kernels`'s `k3` feature; dense projections go to cuBLASLt.
 
 Last touched: 2026-08
 
@@ -47,11 +48,22 @@ model at EP16 — that is the development vehicle.
   kernel definitions in `pegainfer-k3/kernels/` (three tiers: live
   generation → pre-generated dir → NOT_SUPPORTED stubs). The definitions'
   spelling is certified against the HF reference in a separate harness and
-  must not drift.
+  must not drift. The set covers every non-GEMM step of a decode iteration —
+  norms, the bf16 landings of the framework GEMMs, conv+silu, the KDA delta
+  rule, MLA attention, router, situ, combine and the attention-residual mix —
+  so the executor composes launches rather than reimplementing spellings.
+  Dense projections run on cuBLASLt and the routed experts on the DeepGEMM
+  masked grouped-GEMM chain, so no GEMV is generated. Every shape is a static
+  compile dimension, batch size included: `B = 1` is a bucket whose per-row
+  spelling is the certified single-row kernel, gated bitwise upstream, so
+  single-stream and high-concurrency decode share one kernel set. See
+  `pegainfer-kernels/KERNELS.md` for the instantiation matrix.
 
 ## Next
 
 Wire the model executor: weights → device model build (SF prepare, kv_b-style
 transforms), KDA/MLA decode steps with oracle gates, then the EP4 MoE chain.
+The decode-step kernel surface is in place, so the executor's first job is
+buffer ownership and the launch sequence, mirroring the certified engine.
 Numerics gate #1: the masked FP8xFP4 GEMM TMA/barrier byte accounting (see the
 shim header in `pegainfer-kernels/csrc/k3/`).
