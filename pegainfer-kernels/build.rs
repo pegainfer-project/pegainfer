@@ -2028,6 +2028,16 @@ fn main() {
                 );
                 nvcc_args.extend(arch_args.clone());
             }
+        } else if stem == "k3_mega_moe_sm100" {
+            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
+                nvcc_args.extend(sm100f_args);
+                nvcc_args.push("-DK3_MEGA_MOE_SM100F".to_string());
+            } else {
+                println!(
+                    "cargo:warning=No sm_100f target; K3 MegaMoE {stem} kernels compile as NOT_SUPPORTED stubs"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
         // --- end k3 ---
         } else {
             nvcc_args.extend(arch_args.clone());

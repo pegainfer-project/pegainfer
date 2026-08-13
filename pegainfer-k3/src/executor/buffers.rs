@@ -25,7 +25,10 @@ use pegainfer_kernels::ops::K3_MOE_QUANT_GROUP;
 use pegainfer_kernels::ops::K3_QK_DIM;
 use pegainfer_kernels::ops::K3_ROUTER_TOPK;
 use pegainfer_kernels::ops::K3_V_DIM;
+use pegainfer_kernels::ops::K3MegaSymmLayout;
 use pegainfer_kernels::ops::argmax_batch_bf16_split_partials_len;
+use pegainfer_kernels::ops::k3_mega_symm_buffer_layout;
+use pegainfer_kernels::ops::k3_mega_token_alignment;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 
@@ -377,6 +380,53 @@ impl K3MoeScratch {
     }
 }
 
+/// The fused MegaMoE kernel's whole non-weight working set: one flat slab
+/// carrying twelve differently-typed regions (the activation and its scale
+/// factors, the routing pair, and the L1/L2 ring buffers the kernel streams
+/// through), plus the offsets that address them.
+///
+/// It doubles as the kernel's "symmetric" buffer. At `ep_size == 1` that is a
+/// plain device allocation: the kernel's cross-rank barriers compile down to
+/// grid-local synchronisation, so no IPC or NVSHMEM handle is involved. It is
+/// zeroed once here — the workspace counters that share the slab are
+/// self-restoring across launches but start from zero.
+pub(crate) struct K3MegaScratch {
+    pub(crate) layout: K3MegaSymmLayout,
+    pub(crate) symm: CudaSlice<u8>,
+    /// Row capacity the slab and the AOT kernel were built for.
+    pub(crate) max_tokens: usize,
+}
+
+impl K3MegaScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        routed_experts: usize,
+        num_sms: usize,
+        min_tokens: usize,
+    ) -> Result<Self> {
+        let alignment = k3_mega_token_alignment();
+        let max_tokens = min_tokens.div_ceil(alignment) * alignment;
+        let layout = k3_mega_symm_buffer_layout(
+            1,
+            routed_experts,
+            max_tokens,
+            K3_ROUTER_TOPK,
+            K3_ROUTED_EXPERT_HIDDEN,
+            K3_EXPERT_INTERMEDIATE,
+            num_sms,
+        )?;
+        let symm = ctx
+            .stream
+            .alloc_zeros::<u8>(layout.num_bytes)
+            .context("alloc K3 MegaMoE symmetric buffer")?;
+        Ok(Self {
+            layout,
+            symm,
+            max_tokens,
+        })
+    }
+}
+
 /// Per-step working buffers. Named after the certified engine's scratch so the
 /// launch sequence reads the same way.
 pub(crate) struct K3Scratch {
@@ -450,6 +500,8 @@ pub(crate) struct K3Scratch {
     pub(crate) dense_up: CudaSlice<bf16>,
     pub(crate) dense_act: CudaSlice<bf16>,
     pub(crate) moe: K3MoeScratch,
+    /// Present only when the routed experts run through the fused kernel.
+    pub(crate) mega: Option<K3MegaScratch>,
     // Output.
     pub(crate) logit_partial: CudaSlice<f32>,
     pub(crate) logits: CudaSlice<bf16>,
@@ -470,6 +522,7 @@ impl K3Scratch {
         routed_experts: usize,
         groups: usize,
         masked_cap: usize,
+        mega: Option<usize>,
     ) -> Result<Self> {
         let stream = &ctx.stream;
         let heads = K3_MLA_HEADS;
@@ -556,6 +609,9 @@ impl K3Scratch {
             dense_up: wide(K3_DENSE_INTERMEDIATE)?,
             dense_act: wide(K3_DENSE_INTERMEDIATE)?,
             moe: K3MoeScratch::new(ctx, chain_tokens, groups, masked_cap)?,
+            mega: mega
+                .map(|num_sms| K3MegaScratch::new(ctx, routed_experts, num_sms, chain_tokens))
+                .transpose()?,
             logit_partial: partial(K3_VOCAB).context("alloc K3 logit partial")?,
             logits: wide(K3_VOCAB).context("alloc K3 logits")?,
             argmax_partial_values: stream.alloc_zeros(argmax_partials)?,

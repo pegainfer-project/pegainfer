@@ -24,7 +24,9 @@
 //! under expert parallelism, where [`routed_experts_ep`] puts NCCL collectives
 //! inside the layer and the whole step runs eagerly (see [`super::ep`]).
 
+use anyhow::Context;
 use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_kernels::ops::K3_CONV_WIDTH;
@@ -34,6 +36,8 @@ use pegainfer_kernels::ops::K3_QK_DIM;
 use pegainfer_kernels::ops::K3_ROUTER_TOPK;
 use pegainfer_kernels::ops::K3_V_DIM;
 use pegainfer_kernels::ops::K3DeepGemmFp8Fp4Kind;
+use pegainfer_kernels::ops::K3MegaActivation;
+use pegainfer_kernels::ops::K3MegaShape;
 use pegainfer_kernels::ops::K3MoeRouteShape;
 use pegainfer_kernels::ops::argmax_bf16_split_into;
 use pegainfer_kernels::ops::copy_hidden_rows_raw_into;
@@ -49,6 +53,8 @@ use pegainfer_kernels::ops::k3_fp8_scale_pack_ue8m0_launch;
 use pegainfer_kernels::ops::k3_kda_core_batched_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_land_rms_norm_rbs_batched_launch;
+use pegainfer_kernels::ops::k3_mega_moe_launch;
+use pegainfer_kernels::ops::k3_mega_write_inputs_launch;
 use pegainfer_kernels::ops::k3_mla_attn_batched_launch;
 use pegainfer_kernels::ops::k3_moe_entry_combine_launch;
 use pegainfer_kernels::ops::k3_moe_entry_scatter_launch;
@@ -95,6 +101,7 @@ use crate::config::K3_QK_ROPE_HEAD_DIM;
 use crate::config::K3_ROUTED_EXPERT_HIDDEN;
 use crate::config::K3_SHARED_INTERMEDIATE;
 use crate::config::K3_VOCAB;
+use crate::model::K3ExpertBankForm;
 use crate::model::K3KdaWeights;
 use crate::model::K3LayerAttention;
 use crate::model::K3LayerMlp;
@@ -118,6 +125,9 @@ pub(crate) struct K3StepShape {
     pub(crate) masked_cap: usize,
     /// Multiprocessor count the masked GEMM was instantiated for.
     pub(crate) num_sms: usize,
+    /// Run the routed experts through the fused MegaMoE kernel instead of the
+    /// masked chain.
+    pub(crate) mega: bool,
 }
 
 impl K3StepShape {
@@ -814,6 +824,7 @@ fn moe_mlp(
     )?;
 
     match ep {
+        None if shape.mega => routed_experts_mega(ctx, shape, w, s)?,
         None => routed_experts(ctx, shape, w, s)?,
         Some(ep) => routed_experts_ep(ctx, shape, w, s, ep)?,
     }
@@ -886,6 +897,63 @@ fn moe_mlp(
         &mut s.shared,
     )?;
     k3_add2_batched_launch(ctx, b, K3_HIDDEN, &s.routed, &s.shared, &mut s.mlp_out)
+}
+
+/// The whole routed-expert stage as one DeepGEMM MegaMoE launch: dispatch,
+/// both FP8xFP4 GEMMs, the situ activation, the mid-quantization and the
+/// weighted combine.
+///
+/// Not bit-equivalent to [`routed_experts`], and not meant to be: the fused
+/// kernel multiplies the routing weight into the activation *before* the down
+/// projection (the chain applies it at combine time) and mid-quantizes per 32
+/// elements rather than per 128. The chain therefore stays the oracle; this
+/// path is gated on the golden fixture's noise floor, not on bitwise equality.
+fn routed_experts_mega(
+    ctx: &DeviceContext,
+    shape: K3StepShape,
+    w: &K3MoeWeights,
+    s: &mut K3Scratch,
+) -> Result<()> {
+    ensure!(
+        w.experts.form == K3ExpertBankForm::Mega,
+        "K3 MegaMoE step reached a bank built for {:?}",
+        w.experts.form
+    );
+    let mega = s
+        .mega
+        .as_mut()
+        .context("K3 MegaMoE step ran without its symmetric buffer")?;
+    k3_mega_write_inputs_launch(
+        ctx,
+        &mega.layout,
+        &mut mega.symm,
+        shape.bucket,
+        K3_ROUTED_EXPERT_HIDDEN,
+        K3_ROUTER_TOPK,
+        &s.latent,
+        &s.topk_idx,
+        &s.topk_weight,
+    )?;
+    k3_mega_moe_launch(
+        ctx,
+        &mega.layout,
+        &mut mega.symm,
+        K3MegaShape {
+            num_tokens: shape.bucket,
+            num_max_tokens_per_rank: mega.max_tokens,
+            num_experts: shape.groups,
+            num_topk: K3_ROUTER_TOPK,
+            hidden: K3_ROUTED_EXPERT_HIDDEN,
+            intermediate_hidden: K3_EXPERT_INTERMEDIATE,
+            num_sms: shape.num_sms,
+        },
+        K3MegaActivation::Situ,
+        &w.experts.w13_weight,
+        &w.experts.w13_scale,
+        &w.experts.w2_weight,
+        &w.experts.w2_scale,
+        &mut s.routed_latent,
+    )
 }
 
 /// The masked FP8xFP4 grouped-GEMM chain, standing in for the reference's

@@ -92,6 +92,9 @@ fn config(fixture: &Fixture) -> K3ExecutorConfig {
         num_layers: fixture.num_layers,
         // Eager either way: EP forces it off, and the reference has to match.
         cuda_graph: false,
+        // The EP oracle is a bitwise chain-vs-chain comparison; MegaMoE is a
+        // different arithmetic and is rejected under EP anyway.
+        mega: false,
     }
 }
 

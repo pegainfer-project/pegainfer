@@ -86,6 +86,7 @@ use crate::config::K3_DENSE_LAYERS;
 use crate::config::K3_LAYERS;
 use crate::config::K3MoeTopo;
 use crate::config::probe_config_json;
+use crate::model::K3ExpertBankForm;
 use crate::model::K3RankModel;
 use crate::scheduler::DecodeSlot;
 use crate::scheduler::SlotId;
@@ -107,6 +108,12 @@ const K3_CUDA_GRAPH_ENV: &str = "PEGAINFER_K3_CUDA_GRAPH";
 /// Concurrent slots per rank; rounded up to a compiled bucket, capped at the
 /// widest one.
 const K3_MAX_BATCH_ENV: &str = "PEGAINFER_K3_MAX_BATCH";
+/// Set to `1` to run the routed experts through DeepGEMM's fused MegaMoE
+/// kernel instead of the masked chain. Single-rank only for now.
+const K3_MEGA_ENV: &str = "PEGAINFER_K3_MEGA";
+/// The only SM count the fused MegaMoE kernel is AOT-instantiated for. Its
+/// grid sync spans the whole grid, so the launch geometry is baked in.
+const K3_MEGA_SMS: usize = 152;
 
 /// Slots per rank an expert-parallel launch takes when nothing says otherwise.
 /// The ceiling is arithmetic — the worst case is one expert claiming every
@@ -126,6 +133,11 @@ pub struct K3ExecutorConfig {
     pub num_layers: usize,
     /// Capture and replay the step, rather than launching it eagerly.
     pub cuda_graph: bool,
+    /// Route the experts through the fused MegaMoE kernel rather than the
+    /// masked chain. The two are not bit-equivalent — MegaMoE applies the
+    /// routing weights before the down projection and mid-quantizes per 32
+    /// rather than per 128 — so the chain stays the correctness oracle.
+    pub mega: bool,
 }
 
 impl Default for K3ExecutorConfig {
@@ -135,6 +147,7 @@ impl Default for K3ExecutorConfig {
             max_ctx: K3_MAX_CTX[0],
             num_layers: K3_LAYERS,
             cuda_graph: true,
+            mega: false,
         }
     }
 }
@@ -157,6 +170,9 @@ impl K3ExecutorConfig {
             && (1..=K3_MAX_BATCH).contains(&slots)
         {
             self.max_batch = slots;
+        }
+        if std::env::var(K3_MEGA_ENV).as_deref() == Ok("1") {
+            self.mega = true;
         }
         self
     }
@@ -192,6 +208,8 @@ pub struct K3Executor {
     /// Which half of the ping-pong state slabs the next decode step reads.
     parity: usize,
     cuda_graph: bool,
+    /// Routed experts run through the fused MegaMoE kernel.
+    mega: bool,
     /// One graph per (bucket, parity); the prefill pool has its own pair.
     decode_graphs: Vec<CudaGraphState>,
     prefill_graphs: Vec<CudaGraphState>,
@@ -284,7 +302,12 @@ impl K3Executor {
         let gpu = K3RankGpuContext::new(device_ordinal)?;
         let ctx = gpu.device_context()?;
         let loaded = load_rank_weights_to_gpu(&gpu, model_path, &bundle, false)?;
-        let model = K3RankModel::build(&ctx, loaded.weights, topo, rank, config.num_layers)?;
+        let form = if config.mega {
+            K3ExpertBankForm::Mega
+        } else {
+            K3ExpertBankForm::MaskedChain
+        };
+        let model = K3RankModel::build(&ctx, loaded.weights, topo, rank, config.num_layers, form)?;
         Self::new(gpu, ctx, model, config, rendezvous)
     }
 
@@ -342,6 +365,22 @@ impl K3Executor {
 
         let decode_state = K3StatePool::new(&ctx, max_batch, config.max_ctx, num_layers, blocks)?;
         let prefill_state = K3StatePool::new(&ctx, 1, config.max_ctx, num_layers, blocks)?;
+        if config.mega {
+            ensure!(
+                ep_size == 1,
+                "K3 MegaMoE is wired for ep_size 1 only (this rank is one of {ep_size}); \
+                 unset {K3_MEGA_ENV} or drop --k3-ep-size"
+            );
+            // The fused kernel's grid sync spans exactly its instantiation's SM
+            // count, so a mismatched launch grid would hang rather than
+            // misbehave. Fail here, before a whole rank's experts are rebuilt
+            // into the mega layout.
+            ensure!(
+                num_sms == K3_MEGA_SMS,
+                "K3 MegaMoE is AOT-instantiated for the GB300 {K3_MEGA_SMS}-SM grid only; \
+                 this device has {num_sms} SMs — unset {K3_MEGA_ENV} to run the masked chain"
+            );
+        }
         let scratch = K3Scratch::new(
             &ctx,
             max_batch,
@@ -349,6 +388,7 @@ impl K3Executor {
             routed_experts,
             groups,
             K3_MASKED_CAP,
+            config.mega.then_some(num_sms),
         )?;
         let ep = rendezvous
             .map(|rendezvous| {
@@ -369,9 +409,10 @@ impl K3Executor {
         info!(
             "K3 rank {} executor ready: slots={max_batch}, max_ctx={}, layers={num_layers}, \
              blocks={blocks}, local_experts={groups}, sms={num_sms}, cuda_graph={cuda_graph}, \
-             ep_size={ep_size}{}",
+             ep_size={ep_size}, moe={}{}",
             model.rank,
             config.max_ctx,
+            if config.mega { "mega" } else { "masked-chain" },
             ep.as_ref().map_or(String::new(), |ep| format!(
                 ", collectives/step={}",
                 ep.collectives_per_step()
@@ -390,6 +431,7 @@ impl K3Executor {
             num_sms,
             parity: 0,
             cuda_graph,
+            mega: config.mega,
             decode_graphs: (0..2 * bucket_count)
                 .map(|_| CudaGraphState::new())
                 .collect(),
@@ -455,6 +497,7 @@ impl K3Executor {
             groups: self.groups,
             masked_cap: K3_MASKED_CAP,
             num_sms: self.num_sms,
+            mega: self.mega,
         }
     }
 

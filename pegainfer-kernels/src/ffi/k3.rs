@@ -175,4 +175,107 @@ unsafe extern "C" {
         experts: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    // --- fused MegaMoE (see `csrc/k3/k3_mega_moe_sm100.cu`) ---
+
+    /// Token-count alignment the MegaMoE API enforces on
+    /// `num_max_tokens_per_rank` (`layout::kLCMCandidateBlockM`).
+    pub fn k3_mega_token_alignment() -> i32;
+
+    /// Symmetric-buffer sizing: total bytes plus the 12 sub-buffer byte offsets
+    /// in the order `x, x_sf, topk_idx, topk_weights, shared_l1_acts,
+    /// shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf, l1_acts,
+    /// l1_acts_sf, l2_acts, l2_acts_sf`. `out_offsets` must have room for 12.
+    pub fn k3_mega_symm_buffer_layout_cuda(
+        num_ranks: i32,
+        num_experts: i32,
+        num_max_tokens_per_rank: i32,
+        num_topk: i32,
+        hidden: i32,
+        intermediate_hidden: i32,
+        num_sms: i32,
+        out_num_bytes: *mut u64,
+        out_offsets: *mut u64,
+        out_ring_tokens: *mut i32,
+        out_sf_ring_tokens: *mut i32,
+    ) -> CUresult;
+
+    /// Gate/up interleave (granularity 8) over the packed-FP4 W13 bytes:
+    /// `[groups, n, k / 2]` u8 in, same shape out, rows permuted from
+    /// split-half `[gate | up]` into `[gate 0..7, up 0..7, gate 8..15, ...]`.
+    pub fn k3_mega_prepare_l1_weights_cuda(
+        src: *const u8,
+        dst: *mut u8,
+        groups: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Checkpoint UE8M0 scales (`[groups, n, k / 32]` u8, K-major) -> the
+    /// MegaMoE weight SF tensor (`[groups, k / 128, n]` i32, MN-major, four
+    /// exponents per word LSB-first) with the UTCCP row transpose applied, and
+    /// additionally the gate/up interleave when `interleave != 0` (W13).
+    pub fn k3_mega_prepare_sf_cuda(
+        sf: *const u8,
+        out: *mut i32,
+        groups: i32,
+        n: i32,
+        k: i32,
+        interleave: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// bf16 `[num_tokens, hidden]` -> e4m3 plus packed UE8M0 group-32 scales,
+    /// written into the symmetric buffer's `x` / `x_sf` regions. Bit-for-bit
+    /// DeepGEMM's `per_token_cast_to_fp8(use_ue8m0=True, gran_k=32,
+    /// use_packed_ue8m0=True)`.
+    pub fn k3_mega_quant_x_cuda(
+        x: *const Half,
+        x_fp8: *mut u8,
+        x_sf: *mut i32,
+        num_tokens: i32,
+        hidden: i32,
+        x_stride: i32,
+        x_sf_stride: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Routing pair into the symmetric buffer, widening K3's i32 expert ids to
+    /// the i64 the kernel reads.
+    pub fn k3_mega_write_routing_cuda(
+        topk_idx: *const i32,
+        topk_weight: *const f32,
+        dst_idx: *mut i64,
+        dst_weight: *mut f32,
+        num_tokens: i32,
+        num_topk: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// The fused MegaMoE launch. `symm_ptrs` is the per-rank base-pointer table
+    /// (one entry at `ep_size == 1`) and `symm_offsets` the 12 offsets from
+    /// [`k3_mega_symm_buffer_layout_cuda`]. `activation` is 0 for swiglu and 1
+    /// for K3's situ. Requires sm_100f (`NOT_SUPPORTED` elsewhere).
+    pub fn k3_mega_moe_launch_cuda(
+        y: *mut Half,
+        l1_weights: *const u8,
+        l1_weights_sf: *const i32,
+        l2_weights: *const u8,
+        l2_weights_sf: *const i32,
+        symm_ptrs: *const i64,
+        symm_offsets: *const u64,
+        num_ranks: i32,
+        rank_idx: i32,
+        num_max_tokens_per_rank: i32,
+        num_tokens: i32,
+        num_experts: i32,
+        num_topk: i32,
+        hidden: i32,
+        intermediate_hidden: i32,
+        num_sms: i32,
+        activation: i32,
+        cumulative_stats: *mut i32,
+        stream: CUstream,
+    ) -> CUresult;
 }

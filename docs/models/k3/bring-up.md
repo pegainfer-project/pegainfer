@@ -10,8 +10,10 @@ buckets up to `B = 128`, per-bucket CUDA graphs default-on, token-matching a
 certified 4-layer greedy golden (38/40 exact, 2 steps inside a structural
 ≤2-ULP noise floor — see below). Kernel surface: thirteen batched TileLang
 decode families + DeepGEMM masked FP8xFP4 grouped-GEMM AOT shim behind
-`pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt. Next:
-MegaMoE(situ) swap-in.
+`pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt. The fused
+MegaMoE(situ) kernel is wired at `ep_size 1` behind `PEGAINFER_K3_MEGA=1`,
+bit-identical to the Python-validated kernel and 5-8% faster per layer, with
+graphs still on. Next: MegaMoE at EP > 1.
 
 Last touched: 2026-08
 
@@ -37,10 +39,10 @@ model at EP16 — that is the development vehicle.
   legacy contract is slated for deletion.
 - **MoE decode = glm52's stepwise chain with an FP4 B side** (DeepEP dispatch →
   masked FP8xFP4 grouped GEMM W13 → situ+requant → masked GEMM W2 → combine).
-  The fused MegaMoE(situ) kernel exists in the DeepGEMM fork (`openinfer`
-  branch) and is a planned phase-2 swap-in — the SM90-era rejection of mega
-  MoE (see `docs/models/glm52/whole-step-decode-graph.md`) explicitly deferred
-  the SM100 FP8xFP4 variant.
+  The fused MegaMoE(situ) kernel from the DeepGEMM fork (`openinfer` branch)
+  is now wired alongside it at `ep_size 1` (see below) — the SM90-era
+  rejection of mega MoE (see `docs/models/glm52/whole-step-decode-graph.md`)
+  explicitly deferred the SM100 FP8xFP4 variant.
 - **MXFP4 loads raw**: the checkpoint's packed-nibble format is
   byte-isomorphic to DeepGEMM's FP4 K-major B layout (verified numerically at
   1e-6 against a dequant reference on real weights), so the loader uploads
@@ -150,7 +152,7 @@ it later:
   (comm/context lifetime is the process).
 
 This chain is the correctness oracle and the fallback; the fused
-MegaMoE(situ) kernel is the planned production swap-in, A/B'd against it.
+MegaMoE(situ) kernel below is the production swap-in, A/B'd against it.
 
 Full-depth serve (93 layers, 4×GB300, `--k3-ep-size 4`,
 `PEGAINFER_K3_MAX_BATCH=16`): each rank loads in ~68 s (backbone 100.5 GiB +
@@ -163,8 +165,58 @@ request serves normally with zero error lines. The checkpoint must be
 readable by the serving user — its ACLs may effectively be owner-only, which
 surfaces as `Permission denied` on the first shard.
 
+## MegaMoE(situ): fused routed experts (wired, ep_size 1)
+
+`PEGAINFER_K3_MEGA=1` replaces the eight-launch masked chain with one
+DeepGEMM MegaMoE launch that fuses dispatch, both FP8xFP4 GEMMs, the situ
+activation, the mid-quantization and the weighted combine. AOT-instantiated
+from the vendored device headers exactly like the masked GEMM — no JIT, no
+torch (`csrc/k3/k3_mega_moe_sm100.cu`).
+
+- **Not bit-equivalent to the chain, by construction.** MegaMoE multiplies the
+  routing weight into the activation *before* the down projection (the chain
+  applies it at combine) and mid-quantizes per 32 elements rather than per
+  128. The chain stays the oracle; the fused path is gated on the golden
+  fixture's noise floor, not on bitwise equality.
+- **One flat symmetric slab** (260 MiB at 224 experts) holds twelve
+  differently-typed regions: the FP8 activation and its packed scales, the
+  routing pair, and the L1/L2 ring buffers. Its size and offsets are pure host
+  arithmetic over the shapes, the candidate `BLOCK_M` set and the SM count —
+  and they are kernel *template parameters*, so a rounded-up allocation is
+  wrong, not merely wasteful. At `ep_size 1` the slab is a plain device
+  allocation: the kernel's cross-rank barriers compile down to grid-local
+  synchronisation, so no IPC or NVSHMEM handle is involved. `ep_size > 1` is
+  rejected at construction.
+- **The expert bank carries one layout or the other, never both** — a rank
+  holds 84-189 GiB of experts. `K3ExpertBankForm` picks the layout at build
+  time: the mega form interleaves the fused gate|up rows at granularity 8 and
+  adds the UTCCP transpose to both scale-factor tensors.
+- **CUDA graphs stay on.** The fused kernel's grid sync is atomics over the
+  slab, not a cooperative launch, and its TMA descriptors are built from
+  persistent pointers — capture and replay work unchanged, verified over every
+  bucket.
+- **Bit-level parity gate.** `pegainfer-kernels/tests/k3_mega_parity_gate.rs`
+  replays a fixture dumped from DeepGEMM's own Python path (inputs in
+  checkpoint form plus the kernel's output *bits*) through the whole Rust
+  pipeline — scale prepare, both weight transforms, activation quant, launch —
+  and requires `y` to be bit-identical. That is what pins the twelve offsets,
+  the packed-UE8M0 spelling and the block/stage/SM launch configuration to
+  what the Python wrapper would have chosen. Point
+  `PEGAINFER_K3_MEGA_FIXTURE` at the dump directory; unset, it skips.
+
+Step-time snapshot (4-layer truncated model, `PEGAINFER_K3_LAYERS=4`, one
+GB300, ms per layer):
+
+| bucket | chain eager | mega eager | chain graphs | mega graphs |
+|--------|-------------|------------|--------------|-------------|
+| 1      | 0.538       | 0.508      | 0.513        | 0.483       |
+| 16     | 0.997       | 0.919      | 0.970        | 0.895       |
+| 128    | 2.635       | 2.507      | 2.607        | 2.482       |
+
 ## Next
 
-MegaMoE(situ) swap-in (AOT instantiation + symm-buffer plumbing), then
-graphs-with-collectives (qwen3 recipe), launch-ahead, paged KV for MLA
-(current MLA cache is fixed `max_ctx = 128` per seat) and real prefill.
+MegaMoE at `ep_size > 1` (per-device slabs + peer-pointer exchange; the shim
+is instantiated for one rank today, so the second rank count is a host-side
+change plus one more AOT instantiation), then graphs-with-collectives (qwen3
+recipe), launch-ahead, paged KV for MLA (current MLA cache is fixed
+`max_ctx = 128` per seat) and real prefill.

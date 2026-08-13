@@ -116,6 +116,10 @@ fn executor(golden: &Golden, max_batch: usize, cuda_graph: bool) -> Option<K3Exe
         max_ctx: golden.max_ctx,
         num_layers: golden.num_layers,
         cuda_graph,
+        // The routed-expert implementation is the one thing left to the
+        // environment: the same fixture is replayed over the masked chain and,
+        // with `PEGAINFER_K3_MEGA=1`, over the fused MegaMoE kernel.
+        ..K3ExecutorConfig::default().from_env()
     };
     Some(
         K3Executor::load(&path, device(), 0, 1, config)
@@ -618,15 +622,15 @@ fn forced_replay_reports_per_step_agreement() {
     );
 }
 
-/// A step-time snapshot, not a gate: eager against captured, at the narrowest
-/// and the widest bucket. Run over the truncated model the fixture pins, so the
+/// A step-time snapshot, not a gate: eager against captured, at the narrowest,
+/// a mid and the widest bucket. Run over the truncated model the fixture pins, so the
 /// numbers say what the launch sequence costs per layer and what capture buys
 /// back, not what the whole model will cost.
 #[test]
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn step_time_snapshot() {
     let golden = golden();
-    for max_batch in [1usize, 128] {
+    for max_batch in [1usize, 16, 128] {
         for cuda_graph in [false, true] {
             let Some(mut executor) = executor(&golden, max_batch, cuda_graph) else {
                 eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");

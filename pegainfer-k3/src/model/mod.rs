@@ -32,6 +32,8 @@ use cudarc::driver::CudaSlice;
 use log::info;
 use pegainfer_kernels::ops::K3DeepGemmFp8Fp4Kind;
 use pegainfer_kernels::ops::k3_fp4_sf_prepare_launch;
+use pegainfer_kernels::ops::k3_mega_prepare_l1_weights_launch;
+use pegainfer_kernels::ops::k3_mega_prepare_sf_launch;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::DeviceVec;
@@ -143,6 +145,9 @@ pub(crate) struct K3MoeWeights {
 /// MN-major i32 words the GEMM's SF TMA descriptor reads.
 pub(crate) struct K3ExpertBank {
     /// Fused gate|up weights, fp4 e2m1 `[experts, 2 * moe_inter, latent / 2]`.
+    /// Row order is the checkpoint's split-half `[gate | up]` for
+    /// [`K3ExpertBankForm::MaskedChain`] and granularity-8 interleaved for
+    /// [`K3ExpertBankForm::Mega`].
     pub(crate) w13_weight: CudaSlice<u8>,
     /// Their scale factors, i32 `[experts, latent / 128, 2 * moe_inter]`.
     pub(crate) w13_scale: CudaSlice<i32>,
@@ -151,38 +156,114 @@ pub(crate) struct K3ExpertBank {
     /// Their scale factors, i32 `[experts, moe_inter / 128, latent]`.
     pub(crate) w2_scale: CudaSlice<i32>,
     pub(crate) local_experts: usize,
+    /// Which consumer this bank was laid out for.
+    pub(crate) form: K3ExpertBankForm,
+}
+
+/// The two mutually exclusive layouts a bank can carry.
+///
+/// A rank holds 84-189 GiB of experts, so the two forms are never resident at
+/// once: the build picks one and the executor's routed-expert path must match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum K3ExpertBankForm {
+    /// What the masked grouped GEMM chain reads: split-half gate|up rows and
+    /// straight MN-major packed scale factors.
+    MaskedChain,
+    /// What the fused MegaMoE kernel reads: gate|up rows interleaved at
+    /// granularity 8, and scale factors additionally UTCCP-transposed (the L1
+    /// side after the same interleave).
+    Mega,
 }
 
 impl K3ExpertBank {
     /// Adopt one layer's packed regions, repacking the two scale regions into
-    /// the GEMM's SF layout. The e8m0 source bytes are freed as soon as their
-    /// packed form exists, so the bank never holds both.
+    /// the layout `form` asks for. The e8m0 source bytes are freed as soon as
+    /// their packed form exists, so the bank never holds both.
+    ///
+    /// The mega form additionally permutes the gate|up payload, which needs a
+    /// second full-size buffer for the duration of one layer — the source is
+    /// dropped before the next layer is built, so the transient peak is one
+    /// extra layer's W13, not the whole model's.
     fn from_regions(
         ctx: &DeviceContext,
         regions: K3ExpertLayerRegions,
         local_experts: usize,
+        form: K3ExpertBankForm,
     ) -> Result<Self> {
-        let w13_scale = prepare_expert_scales(
-            ctx,
-            local_experts,
-            K3DeepGemmFp8Fp4Kind::W13,
-            &regions.w13_scale,
-        )?;
-        let w2_scale = prepare_expert_scales(
-            ctx,
-            local_experts,
-            K3DeepGemmFp8Fp4Kind::W2,
-            &regions.w2_scale,
-        )?;
-        drop(regions.w13_scale);
-        drop(regions.w2_scale);
-        Ok(Self {
-            w13_weight: regions.w13_weight,
-            w13_scale,
-            w2_weight: regions.w2_weight,
-            w2_scale,
-            local_experts,
-        })
+        match form {
+            K3ExpertBankForm::MaskedChain => {
+                let w13_scale = prepare_expert_scales(
+                    ctx,
+                    local_experts,
+                    K3DeepGemmFp8Fp4Kind::W13,
+                    &regions.w13_scale,
+                )?;
+                let w2_scale = prepare_expert_scales(
+                    ctx,
+                    local_experts,
+                    K3DeepGemmFp8Fp4Kind::W2,
+                    &regions.w2_scale,
+                )?;
+                drop(regions.w13_scale);
+                drop(regions.w2_scale);
+                Ok(Self {
+                    w13_weight: regions.w13_weight,
+                    w13_scale,
+                    w2_weight: regions.w2_weight,
+                    w2_scale,
+                    local_experts,
+                    form,
+                })
+            }
+            K3ExpertBankForm::Mega => {
+                let w13_scale = prepare_mega_expert_scales(
+                    ctx,
+                    local_experts,
+                    K3DeepGemmFp8Fp4Kind::W13,
+                    &regions.w13_scale,
+                )?;
+                let w2_scale = prepare_mega_expert_scales(
+                    ctx,
+                    local_experts,
+                    K3DeepGemmFp8Fp4Kind::W2,
+                    &regions.w2_scale,
+                )?;
+                drop(regions.w13_scale);
+                drop(regions.w2_scale);
+                let (n, k) = K3DeepGemmFp8Fp4Kind::W13.shape();
+                ensure!(
+                    regions.w13_weight.len() == local_experts * n * (k / 2),
+                    "K3 W13 weight region is {} bytes, expected {local_experts} x [{n}, {}]",
+                    regions.w13_weight.len(),
+                    k / 2
+                );
+                let mut w13_weight = ctx
+                    .stream
+                    .alloc_zeros::<u8>(regions.w13_weight.len())
+                    .context("alloc K3 MegaMoE interleaved gate|up bank")?;
+                k3_mega_prepare_l1_weights_launch(
+                    ctx,
+                    local_experts,
+                    n,
+                    k,
+                    &regions.w13_weight,
+                    &mut w13_weight,
+                )
+                .context("K3 MegaMoE gate|up interleave")?;
+                // Free the split-half source before the next layer allocates.
+                ctx.sync()
+                    .context("sync after K3 MegaMoE gate|up interleave")?;
+                drop(regions.w13_weight);
+                Ok(Self {
+                    w13_weight,
+                    w13_scale,
+                    w2_weight: regions.w2_weight,
+                    w2_scale,
+                    local_experts,
+                    form,
+                })
+            }
+        }
     }
 
     fn bytes(&self) -> usize {
@@ -215,6 +296,41 @@ fn prepare_expert_scales(
         .context("alloc K3 expert scale-factor tensor")?;
     k3_fp4_sf_prepare_launch(ctx, local_experts, n, k, source, &mut packed)
         .with_context(|| format!("K3 {kind:?} scale-factor prepare"))?;
+    Ok(packed)
+}
+
+/// Repack one region of checkpoint e8m0 scale bytes `[experts, n, k / 32]` into
+/// the MegaMoE `[experts, k / 128, n]` i32 words: the same 4:1 pack as
+/// [`prepare_expert_scales`] plus the UTCCP row transpose, and for W13 the
+/// gate|up interleave that must precede it.
+fn prepare_mega_expert_scales(
+    ctx: &DeviceContext,
+    local_experts: usize,
+    kind: K3DeepGemmFp8Fp4Kind,
+    source: &CudaSlice<u8>,
+) -> Result<CudaSlice<i32>> {
+    let (n, k) = kind.shape();
+    ensure!(
+        source.len() == local_experts * n * (k / K3_MXFP4_GROUP),
+        "K3 {kind:?} scale region is {} bytes, expected {local_experts} x [{n}, {}]",
+        source.len(),
+        k / K3_MXFP4_GROUP
+    );
+    let words = local_experts * (k / K3_FP4_SF_WORD_K) * n;
+    let mut packed = ctx
+        .stream
+        .alloc_zeros::<i32>(words)
+        .context("alloc K3 MegaMoE expert scale-factor tensor")?;
+    k3_mega_prepare_sf_launch(
+        ctx,
+        local_experts,
+        n,
+        k,
+        kind == K3DeepGemmFp8Fp4Kind::W13,
+        source,
+        &mut packed,
+    )
+    .with_context(|| format!("K3 MegaMoE {kind:?} scale-factor prepare"))?;
     Ok(packed)
 }
 
@@ -306,6 +422,7 @@ impl K3RankModel {
         topo: K3MoeTopo,
         rank: usize,
         num_layers: usize,
+        form: K3ExpertBankForm,
     ) -> Result<Self> {
         ensure!(
             (1..=K3_LAYERS).contains(&num_layers),
@@ -332,7 +449,8 @@ impl K3RankModel {
         let (geometry, blocks) = k3_layer_geometry(num_layers);
         let mut layers = Vec::with_capacity(num_layers);
         for geom in geometry {
-            let (layer, layer_vram) = build_layer(ctx, &mut weights, geom, topo, routed_experts)?;
+            let (layer, layer_vram) =
+                build_layer(ctx, &mut weights, geom, topo, routed_experts, form)?;
             vram.backbone += layer_vram.backbone;
             vram.experts += layer_vram.experts;
             layers.push(layer);
@@ -380,6 +498,7 @@ fn build_layer(
     geometry: K3LayerGeometry,
     topo: K3MoeTopo,
     routed_experts: K3RoutedExperts,
+    form: K3ExpertBankForm,
 ) -> Result<(K3LayerWeights, K3ModelVram)> {
     let layer = geometry.layer;
     let mut slots =
@@ -423,6 +542,7 @@ fn build_layer(
             ctx,
             weights.take_expert_layer(layer)?,
             topo.local_experts(),
+            form,
         )?;
         vram.experts += experts.bytes();
         K3LayerMlp::Moe(Box::new(K3MoeWeights {
@@ -623,7 +743,15 @@ mod tests {
         let ctx = gpu.device_context().unwrap();
         let loaded = load_rank_weights_to_gpu(&gpu, dir, &bundle, false).unwrap();
 
-        let model = K3RankModel::build(&ctx, loaded.weights, topo, 0, num_layers).unwrap();
+        let model = K3RankModel::build(
+            &ctx,
+            loaded.weights,
+            topo,
+            0,
+            num_layers,
+            K3ExpertBankForm::MaskedChain,
+        )
+        .unwrap();
         gpu.sync().unwrap();
 
         let expected = expected_vram(
