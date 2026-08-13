@@ -1,0 +1,45 @@
+[package]
+name = "pegainfer-higgs-audio"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+half = { workspace = true }
+memmap2 = { workspace = true }
+pegainfer-core = { workspace = true, optional = true }
+pegainfer-qwen3 = { workspace = true, optional = true }
+safetensors = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[features]
+runtime-qwen3 = ["dep:pegainfer-core", "dep:pegainfer-qwen3"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "higgs_dump_one_step_actual"
+path = "src/bin/higgs_dump_one_step_actual.rs"
+required-features = ["runtime-qwen3"]
+
+[[bin]]
+name = "higgs_prefill_prompt_session_smoke"
+path = "src/bin/higgs_prefill_prompt_session_smoke.rs"
+required-features = ["runtime-qwen3"]
+
+[[bin]]
+name = "higgs_dump_prefill_layer_hidden"
+path = "src/bin/higgs_dump_prefill_layer_hidden.rs"
+required-features = ["runtime-qwen3"]
+
+[[bin]]
+name = "higgs_dump_layer0_stages"
+path = "src/bin/higgs_dump_layer0_stages.rs"
+required-features = ["runtime-qwen3"]
+
+[lints]
+workspace = true

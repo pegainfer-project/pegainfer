@@ -15,6 +15,7 @@ members = [
   "pegainfer-kimi-k2",
   "pegainfer-qwen3",
   "pegainfer-qwen35",
+  "pegainfer-higgs-audio",
   "pegainfer-sample",
   "pegainfer-kv-cache",
   "pegainfer-kv-offload",
@@ -128,6 +129,7 @@ pegainfer-kv-offload = { path = "pegainfer-kv-offload" }
 pegainfer-kv-store = { path = "pegainfer-kv-store" }
 pegainfer-qwen3 = { path = "pegainfer-qwen3" }
 pegainfer-qwen35 = { path = "pegainfer-qwen35" }
+pegainfer-higgs-audio = { path = "pegainfer-higgs-audio" }
 pegainfer-sample = { path = "pegainfer-sample" }
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = "0.31.0"
