@@ -26,9 +26,10 @@ __device__ __forceinline__ void record_non_finite(float value, uint32_t* status)
     }
 }
 
-// One block owns one (token, native head). The y-grid is Q heads followed by
-// K heads followed by V heads. Q/K are never expanded to the V-head count.
-__global__ void gdn_prefill_native_prepare_kernel(
+// Generic diagnostic path. One block owns one (token, native head). The y-grid
+// is Q heads followed by K heads followed by V heads. Q/K are never expanded
+// to the V-head count.
+__global__ void gdn_prefill_native_prepare_generic_kernel(
     const __nv_bfloat16* __restrict__ qkv,       // [T, Hq*D + Hk*D + Hv*D]
     const __nv_bfloat16* __restrict__ b_proj,    // [T, Hv]
     const __nv_bfloat16* __restrict__ a_proj,    // [T, Hv]
@@ -104,6 +105,87 @@ __global__ void gdn_prefill_native_prepare_kernel(
     }
 }
 
+// Production Hv32 specialization. One block owns one native Q or K head and
+// the corresponding V head:
+//
+//   item [0,16)  -> Q[item] + V[item]
+//   item [16,32) -> K[item-16] + V[item]
+//
+// Q and K retain independent reductions and output layouts. Pairing each with
+// one V head removes the separate 32 V CTAs without expanding Q/K. A block
+// reports all non-finite Q/K/V/gate inputs with at most one atomic update.
+__global__ void gdn_prefill_native_prepare_hv32_kernel(
+    const __nv_bfloat16* __restrict__ qkv,       // [T, 64*D]
+    const __nv_bfloat16* __restrict__ b_proj,    // [T, 32]
+    const __nv_bfloat16* __restrict__ a_proj,    // [T, 32]
+    const __nv_bfloat16* __restrict__ dt_bias,   // [32]
+    const float* __restrict__ a_log,             // [32]
+    __nv_bfloat16* __restrict__ q_out,           // [T, 16, D]
+    __nv_bfloat16* __restrict__ k_out,           // [T, 16, D]
+    __nv_bfloat16* __restrict__ v_out,           // [T, 32, D]
+    float* __restrict__ alpha_out,               // [T, 32]
+    float* __restrict__ beta_out,                // [T, 32]
+    uint32_t* __restrict__ non_finite_status,
+    int qkv_dim,
+    int tokens) {
+    const int token = blockIdx.x;
+    const int item = blockIdx.y;
+    const int d = threadIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+
+    constexpr int kHq = 16;
+    constexpr int kHk = 16;
+    constexpr int kHv = 32;
+    const bool is_q = item < kHq;
+    const int qk_head = is_q ? item : item - kHq;
+    const int v_head = item;
+    const size_t token_base = static_cast<size_t>(token) * qkv_dim;
+    const size_t qk_base = is_q ? 0 : static_cast<size_t>(kHq) * kHeadDim;
+    const size_t v_base = static_cast<size_t>(kHq + kHk) * kHeadDim;
+
+    const float qk_value =
+        __bfloat162float(qkv[token_base + qk_base + qk_head * kHeadDim + d]);
+    const __nv_bfloat16 v = qkv[token_base + v_base + v_head * kHeadDim + d];
+    const float v_value = __bfloat162float(v);
+    bool non_finite = !isfinite(qk_value) || !isfinite(v_value);
+
+    const float inv_norm = rsqrtf(block_sum_128(qk_value * qk_value) + 1.0e-12f);
+    const __nv_bfloat16 normalized = __float2bfloat16(qk_value * inv_norm);
+    if (is_q) {
+        q_out[(static_cast<size_t>(token) * kHq + qk_head) * kHeadDim + d] =
+            normalized;
+    } else {
+        k_out[(static_cast<size_t>(token) * kHk + qk_head) * kHeadDim + d] =
+            normalized;
+    }
+    v_out[(static_cast<size_t>(token) * kHv + v_head) * kHeadDim + d] = v;
+
+    if (d == 0) {
+        const size_t gate_offset = static_cast<size_t>(token) * kHv + v_head;
+        const float a = __bfloat162float(a_proj[gate_offset]);
+        const float b = __bfloat162float(b_proj[gate_offset]);
+        const float bias = __bfloat162float(dt_bias[v_head]);
+        const float log_a = a_log[v_head];
+        non_finite |=
+            !isfinite(a) || !isfinite(b) || !isfinite(bias) || !isfinite(log_a);
+
+        const float x = a + bias;
+        const float softplus =
+            x > 20.0f ? x : (x < -20.0f ? expf(x) : log1pf(expf(x)));
+        const float log_alpha = -expf(log_a) * softplus;
+        alpha_out[gate_offset] = expf(log_alpha);
+        const float exp_b = expf(b < 0.0f ? b : -b);
+        beta_out[gate_offset] =
+            b >= 0.0f ? 1.0f / (1.0f + exp_b) : exp_b / (1.0f + exp_b);
+    }
+
+    if (__syncthreads_or(non_finite) && d == 0) {
+        atomicExch(non_finite_status, 1u);
+    }
+}
+
 CUresult map_cuda_error(cudaError_t error) {
     if (error == cudaSuccess) {
         return CUDA_SUCCESS;
@@ -146,9 +228,16 @@ extern "C" CUresult gated_delta_rule_prefill_native_prepare_cuda(
     // The chunk owner allocates this status word zeroed once. Every layer ORs
     // into the same sticky status so the host can validate once at the chunk
     // boundary instead of introducing one D2H synchronization per layer.
-    const dim3 grid(tokens, h_q + h_k + h_v);
-    gdn_prefill_native_prepare_kernel<<<grid, kThreads, 0, stream>>>(
-        qkv, b_proj, a_proj, dt_bias, a_log, q_out, k_out, v_out, alpha_out, beta_out,
-        non_finite_status, h_q, h_k, h_v, head_dim, qkv_dim, tokens);
+    if (h_v == 32) {
+        const dim3 grid(tokens, h_v);
+        gdn_prefill_native_prepare_hv32_kernel<<<grid, kThreads, 0, stream>>>(
+            qkv, b_proj, a_proj, dt_bias, a_log, q_out, k_out, v_out, alpha_out,
+            beta_out, non_finite_status, qkv_dim, tokens);
+    } else {
+        const dim3 grid(tokens, h_q + h_k + h_v);
+        gdn_prefill_native_prepare_generic_kernel<<<grid, kThreads, 0, stream>>>(
+            qkv, b_proj, a_proj, dt_bias, a_log, q_out, k_out, v_out, alpha_out,
+            beta_out, non_finite_status, h_q, h_k, h_v, head_dim, qkv_dim, tokens);
+    }
     return map_cuda_error(cudaGetLastError());
 }
