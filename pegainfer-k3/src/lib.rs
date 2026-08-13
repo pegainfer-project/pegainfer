@@ -27,6 +27,7 @@ pub mod scheduler;
 
 pub use model_line::MODEL_LINE;
 
+mod model;
 mod weights;
 pub use scheduler::DecodeSlot;
 pub use scheduler::K3Scheduler;
