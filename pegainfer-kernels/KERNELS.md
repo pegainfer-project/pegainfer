@@ -83,6 +83,50 @@ until the model crate proves their contracts.
 | `glm52.deepgemm.scale_layout` | future GLM5.2 model crate | `ops::glm52_deepgemm_mn_major_tma_aligned_f32_launch` | `glm52_deepgemm_mn_major_tma_aligned_f32_cuda` | `csrc/glm52/glm52_deepgemm_layout.cu` | CUDA layout helper for DeepGEMM | Converts row-major f32 scales `[rows, scale_cols]` into MN-major/TMA-aligned storage with `aligned_rows` padded to 16-byte f32 row alignment. |
 | `glm52.flashmla.sparse_decode` | future GLM5.2 model crate | `ops::glm52_flashmla_sparse_decode_num_sm_parts`, `ops::glm52_flashmla_sparse_decode_metadata_launch`, `ops::glm52_flashmla_sparse_decode_launch` | `glm52_flashmla_sparse_decode_num_sm_parts_cuda`, `glm52_flashmla_sparse_decode_metadata_cuda`, `glm52_flashmla_sparse_decode_launch_cuda` | `csrc/glm52/glm52_flashmla_sparse.cu` | FlashMLA SM90 sparse decode | SM90-only sparse decode for V32 layout: `batch<=128`, `heads=64`, `qk_dim=576`, `v_dim=512`, `page_size=64`, packed KV token stride `656`, fixed `topk=2048`, and `num_sm_parts<=160`. Dynamic `topk_length` is intentionally not exposed because this kernel asserts it must be null. |
 
+## Kimi-K3 TileLang Decode Surface
+
+K3 uses the `pegainfer-kernels/k3` feature. The surface is TileLang-generated
+CUDA, AOT-compiled at build time from the vendored kernel definitions in
+`pegainfer-k3/kernels/tilelang_defs.py` (byte-identical to the certified
+upstream spellings — see `pegainfer-k3/kernels/README.md` for the generate /
+pre-generated / stub build tiers). Every kernel is row-independent and the
+batch dimension is a **static compile dimension**: the generator instantiates
+the buckets `{1,2,4,8,16,32,48,64,96,128}` and the ops layer rounds the live
+row count up, so callers must size buffers for the bucket, not for the live
+rows. Launchers return a raw `cudaError_t`; an uninstantiated shape gets
+`cudaErrorInvalidValue`, and a build without TileLang gets
+`cudaErrorNotSupported` from the stub tier.
+
+| op_id | Runtime owner | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `k3.moe.router_topk` | future K3 model crate | `ops::k3_router_topk_launch` | `k3_router_topk` | `pegainfer-k3/kernels/generate.py` (OUT_DIR `k3_router_topk.cu`) | TileLang AOT CUDA | Sigmoid router + biased top-k, one block per row. Scores `[B,E]` f32, correction bias `[E]` f32 (f32 on purpose — bf16 bias flips routing), bf16 scalar `routed_scale [1]`; out `idx [B,16]` i32 and `weights [B,16]` f32 gathered from the **un-biased** scores, denominator `+1e-20`. Instantiated for E ∈ {224, 896}, TOPK = 16. |
+| `k3.attnres.scores` | future K3 model crate | `ops::k3_attnres_scores_launch` | `k3_attnres_scores` | `pegainfer-k3/kernels/generate.py` (OUT_DIR `k3_attnres_scores.cu`) | TileLang AOT CUDA | Attention-residual candidate scoring, one block per (row, candidate): weightless RMS normalization then a dot with the pre-fused f32 scoring vector `[H]`. `prefix_sum [B,H]` bf16, `blocks [B,NB,H]` bf16, out `[B,NB+1]` f32 with index `NB` = the prefix sum itself. H = 7168, NB ∈ 1..8 (the block history grows across the 93 layers). |
+| `k3.attnres.mix` | future K3 model crate | `ops::k3_attnres_mix_launch` | `k3_attnres_mix` | `pegainfer-k3/kernels/generate.py` (OUT_DIR `k3_attnres_mix.cu`) | TileLang AOT CUDA | Per-row softmax over the `NB+1` scores, then a probability-weighted mix of the **un-normalized** candidates landing in bf16 once. Grid is `(B, H/256)`; each block redoes the row's softmax. Same `[B,H]`/`[B,NB,H]` bf16 operands, out `[B,H]` bf16. H = 7168, NB ∈ 1..8. |
+
+## Kimi-K3 MoE Bring-Up Surface
+
+Kimi-K3 uses the `pegainfer-kernels/k3` feature. Unlike `glm52`, `k3` does not
+depend on the `moe` substrate — there is no DeepEP/NCCL requirement yet — but it
+does require the DeepGEMM submodule, whose device headers the FP8xFP4 masked
+grouped GEMM is AOT-instantiated from (no JIT, no torch).
+
+Per-expert shapes: W13 is the fused gate|up projection with `n=6144`, `k=3584`;
+W2 is the down projection with `n=3584`, `k=3072`. Local expert-group counts are
+instantiated for 56 (EP4 dev / EP16 full), 112 (EP8 full), and 224 (single-GPU
+bring-up).
+
+The A side is the FP8 e4m3 / per-1x128 UE8M0 activation recipe GLM5.2 uses. The
+B side is MXFP4: e2m1 weights packed K-major two-per-byte, with group-32 UE8M0
+scale factors. Both scale operands land in the same Blackwell packed-UE8M0 i32
+layout `[groups, ceil(k / gran_k / 4), mn]` (MN-major, 4 exponent bytes per i32,
+LSB first), but the differing granularity gives them different packed K extents:
+`k/512` for the activation, `k/128` for the weights.
+
+| op_id | Runtime owner | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `k3.deepgemm.masked_grouped_fp8_fp4` | future Kimi-K3 model crate | `ops::k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch` | `k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch_cuda` | `csrc/k3/k3_deepgemm_fp8_fp4_grouped_sm100.cu` | DeepGEMM SM100 MGroupedMasked (tcgen05) | Activation `[groups, masked_cap, k]` fp8 e4m3, act scale i32 `[groups, k/512, masked_cap]`, weight `[groups, n, k]` fp4 e2m1 (2 per byte), weight scale i32 `[groups, k/128, n]`, out `[groups, masked_cap, n]` bf16. `masked_cap % 128 == 0`; `groups` dispatches over {56, 112, 224}; `num_sms` selects the B200 (148) / GB300 (152) instantiation. Requires sm_100f — NOT_SUPPORTED stub otherwise. |
+| `k3.deepgemm.fp4_sf_prepare` | future Kimi-K3 model crate | `ops::k3_fp4_sf_prepare_launch` | `k3_fp4_sf_prepare_cuda` | `csrc/k3/k3_deepgemm_fp8_fp4_grouped_sm100.cu` | CUDA layout helper for DeepGEMM | Loader-time repack of checkpoint MXFP4 weight scales `[groups, n, k/32]` u8 UE8M0 exponent bytes (K-major) into the MN-major packed SFB tensor `[groups, k/128, n]` i32. Transpose plus 4:1 pack; not a step-time kernel. |
+
 ## Non-Qwen3 Compatibility
 
 The crate still builds CUDA/Triton symbols needed by the current root binary:
@@ -95,7 +139,7 @@ These are preserved for build compatibility. They are not part of the Qwen3-4B P
 
 ## Editing Rule
 
-When adding or replacing a kernel used by Qwen3-4B, Kimi-K2, or GLM5.2,
+When adding or replacing a kernel used by Qwen3-4B, Kimi-K2, GLM5.2, or K3,
 update this routing table.
 
 Do not add model-specific machine-readable manifests here. The kernels crate

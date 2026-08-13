@@ -9,6 +9,10 @@ mod elementwise;
 mod embedding;
 #[cfg(feature = "glm52")]
 mod glm52;
+#[cfg(feature = "k3")]
+mod k3;
+#[cfg(feature = "k3")]
+mod k3_tilelang;
 #[cfg(feature = "kimi-k2")]
 mod kimi_k2;
 mod linear;
@@ -107,6 +111,10 @@ pub use embedding::embedding_decode_into;
 pub use embedding::embedding_rows_into;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
+#[cfg(feature = "k3")]
+pub use k3::*;
+#[cfg(feature = "k3")]
+pub use k3_tilelang::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
 pub use linear::GEMM_LT_MAX_N;
