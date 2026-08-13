@@ -1,11 +1,10 @@
 //! Kimi-K3 expert-parallel MegaMoE oracle: the fused kernel at four ranks.
 //!
-//! MegaMoE at `ep_size > 1` replaces the whole NCCL chain — no pack, no
-//! allgather, no scatter, no allreduce, no entry combine. Each rank writes its
-//! own rows into its own symmetric slab and launches; the kernel dispatches
-//! across the world over NVLink, computes every expert it owns for whoever sent
-//! it work, and combines each token back into the rank that owns it. The host
-//! issues no collective at all.
+//! This is THE expert-parallel gate. A step issues no collective of any kind:
+//! each rank writes its own rows into its own symmetric slab and launches, and
+//! the kernel dispatches across the world over NVLink, computes every expert it
+//! owns for whoever sent it work, and combines each token back into the rank
+//! that owns it.
 //!
 //! Two things therefore need certifying, and they are not the same thing:
 //!
@@ -29,12 +28,11 @@
 //!
 //! Manual gates: CI compiles them, a Blackwell box with the checkpoint runs
 //! them with `--ignored`. Point `PEGAINFER_K3_TEST_224` at the 224-expert
-//! checkpoint directory, and set `PEGAINFER_K3_MEGA=1` — the executor reads the
-//! flag from the environment, so a run without it silently gates the masked
-//! chain instead. **Run one gate per process**, on four otherwise-free GPUs:
+//! checkpoint directory. **Run one gate per process**, on four otherwise-free
+//! GPUs:
 //!
 //! ```text
-//! PEGAINFER_K3_MEGA=1 PEGAINFER_K3_LAYERS=4 PEGAINFER_K3_MAX_BATCH=16 \
+//! PEGAINFER_K3_LAYERS=4 PEGAINFER_K3_MAX_BATCH=16 \
 //!   cargo test --release -p pegainfer-k3 --test ep_mega_oracle \
 //!   ep4_mega_matches_ep1_mega -- --ignored --nocapture
 //! ```
@@ -46,11 +44,11 @@ use pegainfer_k3::DecodeSlot;
 use pegainfer_k3::K3EpRendezvous;
 use pegainfer_k3::K3Executor;
 use pegainfer_k3::K3ExecutorConfig;
+use pegainfer_k3::K3MoeTransport;
 use pegainfer_k3::StepExecutor;
 
 const FIXTURE: &str = include_str!("fixtures/k3_4l_greedy.json");
 const CHECKPOINT_ENV: &str = "PEGAINFER_K3_TEST_224";
-const MEGA_ENV: &str = "PEGAINFER_K3_MEGA";
 
 /// Ranks under test, one per GPU. The fused kernel is AOT-instantiated for this
 /// width; there is no runtime rank count.
@@ -161,7 +159,7 @@ fn config(fixture: &Fixture) -> K3ExecutorConfig {
         // match. (The single-rank mega path does capture; this pins it off so
         // the two differ only in world size.)
         cuda_graph: false,
-        mega: true,
+        moe_transport: K3MoeTransport::MEGA,
     }
 }
 
@@ -405,15 +403,6 @@ fn peer_run(executor: &mut K3Executor, rank: usize, prompt: &[u32], peers: Peers
     }
 }
 
-fn require_mega() {
-    assert_eq!(
-        std::env::var(MEGA_ENV).ok().as_deref(),
-        Some("1"),
-        "set {MEGA_ENV}=1: this gate is about the fused MegaMoE path and there is nothing to \
-         test without it"
-    );
-}
-
 /// Gate 1 — four ranks answer what one rank answered.
 ///
 /// Rank 0 forced-replays the fixture feed; ranks 1..4 take the same number of
@@ -423,7 +412,6 @@ fn require_mega() {
 #[test]
 #[ignore = "requires four Blackwell GPUs and the K3 checkpoint; run alone in its own process"]
 fn ep4_mega_matches_ep1_mega() {
-    require_mega();
     let fixture = fixture();
     let Some(path) = checkpoint() else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
@@ -448,7 +436,6 @@ fn ep4_mega_matches_ep1_mega() {
 #[test]
 #[ignore = "requires four Blackwell GPUs and the K3 checkpoint; run alone in its own process"]
 fn ep4_mega_is_invariant_to_peer_traffic() {
-    require_mega();
     let fixture = fixture();
     let Some(path) = checkpoint() else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");

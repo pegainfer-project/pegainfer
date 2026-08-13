@@ -1,6 +1,11 @@
 // Kimi-K3 batched-decode MoE expert chain: the step-time kernels that wrap the
 // FP8xFP4 masked grouped GEMM (`k3_deepgemm_fp8_fp4_grouped_sm100.cu`) into a
-// complete routed-expert forward, single-rank or expert-parallel.
+// complete routed-expert forward.
+//
+// Production routing goes through the fused MegaMoE kernel
+// (`k3_mega_moe_sm100.cu`). This chain is the numerics anchor behind it: it is
+// what the certified f32 reference is checked against, and what the fused
+// kernel's golden gate is A/B'd against. Single rank only.
 //
 // ---------------------------------------------------------------------------
 // Chain
@@ -27,9 +32,9 @@
 // An "entry" is one expanded (token, topk-slot) pair, index `t * topk + s`, and
 // the entry order IS the deterministic order everything downstream uses.
 //
-//   topk_idx[entry]  GLOBAL expert id, or anything outside the rank's window
-//                    to mark the entry inactive (padded batch rows, and the
-//                    non-local experts of an EP shard)
+//   topk_idx[entry]  GLOBAL expert id, or anything outside `[local_expert_base,
+//                    local_expert_base + groups)` to mark the entry inactive
+//                    (that is how padded batch rows are excluded)
 //   slot_map[entry]  `local_expert * masked_cap + rank` for active entries, -1
 //                    for inactive ones, where `local_expert` is
 //                    `topk_idx[entry] - local_expert_base` and `rank` counts
@@ -37,36 +42,13 @@
 //                    in entry order
 //   masked_m[expert] number of active entries claiming that local expert
 //
-// `local_expert_base` is the rank's expert window: an entry is active exactly
-// when `topk_idx[entry] - local_expert_base` lands in `[0, groups)`. A
-// single-rank chain passes `0` with `groups` covering every routed expert,
-// which reduces the test to the original `[0, groups)` one bit for bit.
-// Windowing changes WHICH entries an expert's block claims, never the order it
-// claims them in: an expert's entry set is the same with or without the window
-// and the ballot compaction still walks entry order, so a given entry lands in
-// the same masked row either way.
+// `local_expert_base` shifts that window; the chain passes `0` with `groups`
+// covering every routed expert. The parameter survives from the expert-parallel
+// era and is kept because it costs one subtract and keeps the active-entry test
+// in one place — every consumer re-derives the local expert the same way.
 //
 // Every consumer re-reads `topk_idx` and skips inactive entries rather than
 // trusting `slot_map` alone, so a stale map can never be silently consumed.
-//
-// ---------------------------------------------------------------------------
-// Expert parallelism
-// ---------------------------------------------------------------------------
-// The EP chain runs the seven steps above over the GLOBAL batch (every rank's
-// token rows, allgathered) with its own expert window, and then merges:
-//
-//   k3_moe_ep_pack_dispatch   the rank's own contribution to the allgather,
-//                             with padding rows constructively determined
-//                             (zero latent, -1 idx, 0 weight)
-//   ... the seven steps, windowed, over `ep_size * max_batch` tokens ...
-//   k3_moe_entry_scatter      masked W2 rows -> entry-major staging, a DENSE
-//                             full-cover pass (entries this rank does not own
-//                             are written as exact zeros)
-//   [ NCCL all-reduce(sum, bf16) over the staging buffer — every entry is
-//     owned by exactly one rank, so every reduction adds a value to zeros and
-//     is exact in any order ]
-//   k3_moe_entry_combine      the weighted combine, reading entry-major
-//                             staging instead of the masked layout
 //
 // ---------------------------------------------------------------------------
 // Activation quant recipe (A operand of both GEMMs)
@@ -359,99 +341,6 @@ __global__ void moe_weighted_combine_kernel(
   out[(size_t)token * hidden + col] = __float2bfloat16_rn(acc);
 }
 
-// ---------------------------------------------------------------------------
-// Expert parallelism
-// ---------------------------------------------------------------------------
-
-// This rank's contribution to the per-layer allgather, at protocol-max shape.
-//
-// A row is live exactly when its step input `row_active[row]` (the executor's
-// per-row cache-row destination) is non-negative; every other row of the
-// `[max_batch, ...]` slabs is a padding row and is written constructively —
-// zero latent, `-1` expert id, zero router weight — rather than left holding
-// whatever the previous step's wider bucket put there. `-1` already means
-// "inactive entry" to the route metadata kernel, so a padding row imposes no
-// expert load anywhere in the fleet while keeping the wire bytes constant.
-__global__ void moe_ep_pack_dispatch_kernel(
-    const __nv_bfloat16* __restrict__ latent, const int* __restrict__ topk_idx,
-    const float* __restrict__ topk_weight, const int* __restrict__ row_active,
-    __nv_bfloat16* __restrict__ latent_out, int* __restrict__ idx_out,
-    float* __restrict__ weight_out, int rows, int topk, int hidden) {
-  const int row = blockIdx.x;
-  if (row >= rows) {
-    return;
-  }
-  const bool live = row_active[row] >= 0;
-  const int col = blockIdx.y * blockDim.x + threadIdx.x;
-  if (col < hidden) {
-    const size_t at = (size_t)row * hidden + col;
-    latent_out[at] = live ? latent[at] : __float2bfloat16_rn(0.0f);
-  }
-  if (blockIdx.y == 0 && threadIdx.x < (unsigned)topk) {
-    const size_t at = (size_t)row * topk + threadIdx.x;
-    idx_out[at] = live ? topk_idx[at] : -1;
-    weight_out[at] = live ? topk_weight[at] : 0.0f;
-  }
-}
-
-// Masked W2 rows -> entry-major staging, ready for the sum all-reduce.
-//
-// Dense full-cover pass: an entry this rank owns takes its expert's masked row,
-// every other entry is written as an exact zero. That makes the staging buffer
-// a pure function of this step's routing (no memset, no residue), and it is
-// what makes the all-reduce exact: every global entry is owned by exactly one
-// rank, so each reduction adds one value to `ep_size - 1` zeros.
-__global__ void moe_entry_scatter_kernel(
-    const __nv_bfloat16* __restrict__ expert_out,
-    const int* __restrict__ slot_map, __nv_bfloat16* __restrict__ staging,
-    int entries, int hidden) {
-  const int col = blockIdx.y * blockDim.x + threadIdx.x;
-  if (col >= hidden) {
-    return;
-  }
-  for (int entry = blockIdx.x; entry < entries; entry += gridDim.x) {
-    const int slot = slot_map[entry];
-    staging[(size_t)entry * hidden + col] =
-        slot >= 0 ? expert_out[(size_t)slot * hidden + col]
-                  : __float2bfloat16_rn(0.0f);
-  }
-}
-
-// Entry-major weighted combine: the same accumulation as
-// `moe_weighted_combine_kernel`, reading the reduced entry-major staging
-// buffer (an identity slot map) instead of the masked layout, and writing only
-// the `tokens_out` token rows starting at `token_base`.
-//
-// The inner loop is copied verbatim from the masked combine — same slot order,
-// same f32 `fmaf`, same single `__float2bfloat16_rn` — so given bit-identical
-// per-entry rows it produces bit-identical output. `experts` is the GLOBAL
-// routed-expert count: entries outside `[0, experts)` are the padding entries
-// and are skipped exactly as the masked combine skips its inactive ones, so a
-// token with no active entry still lands an exact zero.
-__global__ void moe_entry_combine_kernel(
-    const __nv_bfloat16* __restrict__ staging, const int* __restrict__ topk_idx,
-    const float* __restrict__ topk_weight, __nv_bfloat16* __restrict__ out,
-    int token_base, int topk, int hidden, int experts) {
-  const int token_out = blockIdx.x;
-  const int token = token_base + token_out;
-  const int col = blockIdx.y * blockDim.x + threadIdx.x;
-  if (col >= hidden) {
-    return;
-  }
-  float acc = 0.0f;
-  for (int slot_index = 0; slot_index < topk; ++slot_index) {
-    const int entry = token * topk + slot_index;
-    const int expert = topk_idx[entry];
-    if (expert < 0 || expert >= experts) {
-      continue;
-    }
-    const float value =
-        __bfloat162float(staging[(size_t)entry * hidden + col]);
-    acc = fmaf(topk_weight[entry], value, acc);
-  }
-  out[(size_t)token_out * hidden + col] = __float2bfloat16_rn(acc);
-}
-
 CUresult map_cuda_error(cudaError_t err) {
   if (err == cudaSuccess) return CUDA_SUCCESS;
   if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
@@ -588,73 +477,6 @@ CUresult k3_moe_weighted_combine_cuda(const __nv_bfloat16* expert_out,
   moe_weighted_combine_kernel<<<grid, kCombineThreads, 0, stream>>>(
       expert_out, topk_idx, slot_map, topk_weight, out, topk, hidden, groups,
       masked_cap);
-  return consume_last_cuda_error();
-  PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
-}
-
-// This rank's fixed-shape contribution to the per-layer EP allgather. `rows` is
-// the protocol-max row count (never the live bucket); `row_active[row] >= 0`
-// marks a live row and every other row is written as padding.
-CUresult k3_moe_ep_pack_dispatch_cuda(const __nv_bfloat16* latent,
-                                      const int* topk_idx,
-                                      const float* topk_weight,
-                                      const int* row_active,
-                                      __nv_bfloat16* latent_out, int* idx_out,
-                                      float* weight_out, int rows, int topk,
-                                      int hidden, cudaStream_t stream) {
-  PEGAINFER_FFI_GUARD_BEGIN
-  if (latent == nullptr || topk_idx == nullptr || topk_weight == nullptr ||
-      row_active == nullptr || latent_out == nullptr || idx_out == nullptr ||
-      weight_out == nullptr || rows <= 0 || topk <= 0 || hidden <= 0 ||
-      topk > kCombineThreads) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  dim3 grid(rows, (hidden + kCombineThreads - 1) / kCombineThreads, 1);
-  moe_ep_pack_dispatch_kernel<<<grid, kCombineThreads, 0, stream>>>(
-      latent, topk_idx, topk_weight, row_active, latent_out, idx_out,
-      weight_out, rows, topk, hidden);
-  return consume_last_cuda_error();
-  PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
-}
-
-// Masked W2 rows -> entry-major staging `[entries, hidden]` bf16, dense full
-// cover (entries this rank does not own become exact zeros).
-CUresult k3_moe_entry_scatter_cuda(const __nv_bfloat16* expert_out,
-                                   const int* slot_map,
-                                   __nv_bfloat16* staging, int entries,
-                                   int hidden, cudaStream_t stream) {
-  PEGAINFER_FFI_GUARD_BEGIN
-  if (expert_out == nullptr || slot_map == nullptr || staging == nullptr ||
-      entries <= 0 || hidden <= 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  dim3 grid(entry_grid(entries), (hidden + kCombineThreads - 1) / kCombineThreads,
-            1);
-  moe_entry_scatter_kernel<<<grid, kCombineThreads, 0, stream>>>(
-      expert_out, slot_map, staging, entries, hidden);
-  return consume_last_cuda_error();
-  PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
-}
-
-// Weighted combine over the reduced entry-major staging buffer. `topk_idx` and
-// `topk_weight` are the GLOBAL arrays; `token_base` is this rank's first global
-// token and `tokens_out` how many of them it wants back. `experts` is the
-// global routed-expert count, the range that marks an entry active.
-CUresult k3_moe_entry_combine_cuda(const __nv_bfloat16* staging,
-                                   const int* topk_idx,
-                                   const float* topk_weight,
-                                   __nv_bfloat16* out, int token_base,
-                                   int tokens_out, int topk, int hidden,
-                                   int experts, cudaStream_t stream) {
-  PEGAINFER_FFI_GUARD_BEGIN
-  if (staging == nullptr || topk_idx == nullptr || topk_weight == nullptr ||
-      out == nullptr || token_base < 0 || tokens_out <= 0 || topk <= 0 ||
-      hidden <= 0 || experts <= 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  dim3 grid(tokens_out, (hidden + kCombineThreads - 1) / kCombineThreads, 1);
-  moe_entry_combine_kernel<<<grid, kCombineThreads, 0, stream>>>(
-      staging, topk_idx, topk_weight, out, token_base, topk, hidden, experts);
   return consume_last_cuda_error();
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }

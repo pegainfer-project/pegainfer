@@ -12,8 +12,15 @@
 //!
 //! The reference and this executor differ in exactly two places — the dense
 //! projections merge one cuBLASLt partial instead of eight split-K segments,
-//! and the routed experts run the masked FP8xFP4 grouped-GEMM chain instead of
-//! per-row MXFP4 GEMVs — so the gate is a token match, not a bit match.
+//! and the routed experts run a quantized grouped GEMM instead of per-row MXFP4
+//! GEMVs — so the gate is a token match, not a bit match.
+//!
+//! Both routed-expert transports are held to this fixture. Production is the
+//! fused MegaMoE kernel; the masked chain is the anchor it was A/B'd against
+//! and is reachable only from test code, so gate 1 runs it explicitly. They are
+//! not bit-equal to each other (the fused kernel folds the routing weight in
+//! before the down projection and mid-quantizes per 32 rather than per 128), so
+//! each is compared to the fixture rather than to the other.
 //!
 //! The second difference sets a measured noise floor. Quantizing the expert
 //! activations to FP8 with power-of-two group scales costs about 0.7% on the
@@ -37,6 +44,7 @@ use std::path::PathBuf;
 use pegainfer_k3::DecodeSlot;
 use pegainfer_k3::K3Executor;
 use pegainfer_k3::K3ExecutorConfig;
+use pegainfer_k3::K3MoeTransport;
 use pegainfer_k3::StepExecutor;
 
 /// The noise floor, in bf16 ULP at the logit's magnitude. Measured by replaying
@@ -107,19 +115,27 @@ fn device() -> usize {
         .unwrap_or(0)
 }
 
+/// The two routed-expert transports, named for the gate reports.
+const TRANSPORTS: [(&str, K3MoeTransport); 2] = [
+    ("mega", K3MoeTransport::MEGA),
+    ("masked chain", K3MoeTransport::masked_chain_for_tests()),
+];
+
 /// Build a single-rank executor over the truncated model the fixture pins.
 /// All routed experts stay local, which is what the fixture was produced with.
-fn executor(golden: &Golden, max_batch: usize, cuda_graph: bool) -> Option<K3Executor> {
+fn executor(
+    golden: &Golden,
+    max_batch: usize,
+    cuda_graph: bool,
+    moe_transport: K3MoeTransport,
+) -> Option<K3Executor> {
     let path = checkpoint()?;
     let config = K3ExecutorConfig {
         max_batch,
         max_ctx: golden.max_ctx,
         num_layers: golden.num_layers,
         cuda_graph,
-        // The routed-expert implementation is the one thing left to the
-        // environment: the same fixture is replayed over the masked chain and,
-        // with `PEGAINFER_K3_MEGA=1`, over the fused MegaMoE kernel.
-        ..K3ExecutorConfig::default().from_env()
+        moe_transport,
     };
     Some(
         K3Executor::load(&path, device(), 0, 1, config)
@@ -225,7 +241,7 @@ fn assert_same_trajectory(baseline: &[u32], sampled: &[u32], what: &str) {
 /// gates that test it against itself. Built on a throwaway executor so the
 /// batched, captured or shared-bucket run under test cannot influence it.
 fn baseline_trajectory(golden: &Golden) -> Option<Vec<u32>> {
-    let mut executor = executor(golden, 1, false)?;
+    let mut executor = executor(golden, 1, false, K3MoeTransport::MEGA)?;
     let steps = golden.argmax.len() - golden.prompt.len();
     Some(
         executor
@@ -275,14 +291,16 @@ fn replica_run(executor: &mut K3Executor, golden: &Golden, slots: &[usize]) -> V
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn golden_replay_matches_the_reference_at_bucket_one() {
     let golden = golden();
-    let Some(mut executor) = executor(&golden, 1, false) else {
-        eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
-        return;
-    };
-    let sampled = executor
-        .forced_replay(0, &golden.feed())
-        .expect("the replay should run");
-    assert_fixture_match(&golden, &sampled, "bucket 1, eager");
+    for (name, transport) in TRANSPORTS {
+        let Some(mut executor) = executor(&golden, 1, false, transport) else {
+            eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
+            return;
+        };
+        let sampled = executor
+            .forced_replay(0, &golden.feed())
+            .expect("the replay should run");
+        assert_fixture_match(&golden, &sampled, &format!("bucket 1, eager, {name}"));
+    }
 }
 
 /// Gate 1b — the same fixture under greedy feedback, where a single flip
@@ -293,7 +311,7 @@ fn golden_replay_matches_the_reference_at_bucket_one() {
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn golden_greedy_replay_matches_up_to_the_first_coin_flip() {
     let golden = golden();
-    let Some(mut executor) = executor(&golden, 1, false) else {
+    let Some(mut executor) = executor(&golden, 1, false, K3MoeTransport::MEGA) else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
@@ -345,7 +363,7 @@ fn golden_greedy_replay_matches_up_to_the_first_coin_flip() {
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn golden_greedy_replay_is_row_independent() {
     let golden = golden();
-    let Some(mut executor) = executor(&golden, 8, false) else {
+    let Some(mut executor) = executor(&golden, 8, false, K3MoeTransport::MEGA) else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
@@ -381,7 +399,7 @@ fn golden_greedy_replay_is_row_independent() {
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn a_wider_bucket_stays_inside_the_noise_floor() {
     let golden = golden();
-    let Some(mut executor) = executor(&golden, 8, false) else {
+    let Some(mut executor) = executor(&golden, 8, false, K3MoeTransport::MEGA) else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
@@ -401,7 +419,7 @@ fn golden_greedy_replay_matches_through_cuda_graphs() {
     let golden = golden();
     let steps = golden.argmax.len() - golden.prompt.len();
     for (max_batch, slot) in [(1usize, 0usize), (8, 7)] {
-        let Some(mut eager) = executor(&golden, max_batch, false) else {
+        let Some(mut eager) = executor(&golden, max_batch, false, K3MoeTransport::MEGA) else {
             eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
             return;
         };
@@ -410,8 +428,8 @@ fn golden_greedy_replay_matches_through_cuda_graphs() {
             .expect("the eager replay should run");
         drop(eager);
 
-        let mut executor =
-            executor(&golden, max_batch, true).expect("the checkpoint was there a moment ago");
+        let mut executor = executor(&golden, max_batch, true, K3MoeTransport::MEGA)
+            .expect("the checkpoint was there a moment ago");
         let sampled = executor
             .greedy_replay(slot, &golden.prompt, steps)
             .expect("the replay should run");
@@ -436,7 +454,7 @@ fn golden_greedy_replay_matches_through_cuda_graphs() {
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn cuda_graphs_capture_and_replay_every_bucket() {
     let golden = golden();
-    let Some(mut executor) = executor(&golden, 128, true) else {
+    let Some(mut executor) = executor(&golden, 128, true, K3MoeTransport::MEGA) else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
@@ -475,7 +493,8 @@ fn four_concurrent_sequences_each_match_the_baseline() {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
-    let mut executor = executor(&golden, 4, true).expect("the checkpoint was there a moment ago");
+    let mut executor = executor(&golden, 4, true, K3MoeTransport::MEGA)
+        .expect("the checkpoint was there a moment ago");
     let total = golden.argmax.len();
     // Slot i starts i steps after slot 0.
     let stagger = [0usize, 3, 7, 11];
@@ -534,7 +553,8 @@ fn prefill_then_decode_serves_the_baseline_continuation() {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
-    let mut executor = executor(&golden, 1, true).expect("the checkpoint was there a moment ago");
+    let mut executor = executor(&golden, 1, true, K3MoeTransport::MEGA)
+        .expect("the checkpoint was there a moment ago");
     let params = pegainfer_frontend::sampler::SamplingParams::default();
     let first = executor
         .prefill(0, &golden.prompt, &params)
@@ -571,7 +591,7 @@ fn prefill_then_decode_serves_the_baseline_continuation() {
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn forced_replay_reports_per_step_agreement() {
     let golden = golden();
-    let Some(mut executor) = executor(&golden, 1, false) else {
+    let Some(mut executor) = executor(&golden, 1, false, K3MoeTransport::MEGA) else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
@@ -632,7 +652,8 @@ fn step_time_snapshot() {
     let golden = golden();
     for max_batch in [1usize, 16, 128] {
         for cuda_graph in [false, true] {
-            let Some(mut executor) = executor(&golden, max_batch, cuda_graph) else {
+            let Some(mut executor) = executor(&golden, max_batch, cuda_graph, K3MoeTransport::MEGA)
+            else {
                 eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
                 return;
             };

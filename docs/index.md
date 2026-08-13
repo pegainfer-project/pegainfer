@@ -95,7 +95,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Doc | TL;DR |
 |---|---|
-| `models/k3/bring-up.md` | New model line (`--features k3`), bring-up stage: config probe + weight loader + step-contract scheduler skeleton landed; model execution not wired yet. Kernel surface: build-time TileLang generated batched decode kernel set (13 families, every non-GEMM step, batch is a compile dimension) + DeepGEMM masked FP8xFP4 grouped-GEMM AOT shim; dense projections on cuBLASLt. Dev vehicle: 224-expert checkpoint at EP4, shape-isomorphic to the full 896-expert model at EP16. |
+| `models/k3/bring-up.md` | New model line (`--features k3`). Decode end-to-end: the full 93-layer model serves at `--k3-ep-size 4` (free-running per-rank engines, zero host collectives per step, 189 GiB/rank); routed experts are one fused DeepGEMM MegaMoE(situ) launch per layer at every world size, with the masked FP8xFP4 grouped-GEMM chain retained test-only as the numerics anchor. Single-rank: buckets to 128, per-bucket CUDA graphs on, token-matching a certified 4-layer golden. Dev vehicle: 224-expert checkpoint at EP4, shape-isomorphic to the full 896-expert model at EP16. |
 
 ## models / deepseek-v2-lite
 

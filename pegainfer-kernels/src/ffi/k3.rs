@@ -51,8 +51,8 @@ unsafe extern "C" {
     /// (`slot_map[tokens * topk]`, `-1` for inactive entries). Entry order
     /// (`token * topk + slot`) fixes the row assignment deterministically.
     /// `topk_idx` carries GLOBAL expert ids; an entry is active when
-    /// `topk_idx - local_expert_base` lands in `[0, groups)`, so a single-rank
-    /// chain passes `local_expert_base = 0`.
+    /// `topk_idx - local_expert_base` lands in `[0, groups)`; the chain passes
+    /// `local_expert_base = 0`.
     pub fn k3_moe_local_route_metadata_cuda(
         topk_idx: *const i32,
         masked_m: *mut i32,
@@ -126,53 +126,6 @@ unsafe extern "C" {
         hidden: i32,
         groups: i32,
         masked_cap: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    /// This rank's fixed-shape contribution to the per-layer EP allgather:
-    /// latent rows plus the two router arrays, with every row whose
-    /// `row_active` entry is negative written as padding (zero latent, `-1`
-    /// expert id, zero weight).
-    pub fn k3_moe_ep_pack_dispatch_cuda(
-        latent: *const Half,
-        topk_idx: *const i32,
-        topk_weight: *const f32,
-        row_active: *const i32,
-        latent_out: *mut Half,
-        idx_out: *mut i32,
-        weight_out: *mut f32,
-        rows: i32,
-        topk: i32,
-        hidden: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    /// Masked W2 rows -> entry-major staging `[entries, hidden]` bf16. Dense
-    /// full-cover pass: entries this rank does not own become exact zeros, so
-    /// the following sum all-reduce adds each entry's row to zeros.
-    pub fn k3_moe_entry_scatter_cuda(
-        expert_out: *const Half,
-        slot_map: *const i32,
-        staging: *mut Half,
-        entries: i32,
-        hidden: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    /// Weighted combine over the reduced entry-major staging buffer: same f32
-    /// accumulation in topk-slot order and same single bf16 round as
-    /// [`k3_moe_weighted_combine_cuda`], for the `tokens_out` global token rows
-    /// starting at `token_base`.
-    pub fn k3_moe_entry_combine_cuda(
-        staging: *const Half,
-        topk_idx: *const i32,
-        topk_weight: *const f32,
-        out: *mut Half,
-        token_base: i32,
-        tokens_out: i32,
-        topk: i32,
-        hidden: i32,
-        experts: i32,
         stream: CUstream,
     ) -> CUresult;
 

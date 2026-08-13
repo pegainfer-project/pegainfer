@@ -35,16 +35,19 @@ const ARCHITECTURE: &str = "KimiK3ForConditionalGeneration";
 const TEXT_MODEL_TYPE: &str = "kimi_linear";
 
 /// EP world sizes the decode topology is defined for. Experts shard whole
-/// across ranks, so the count must divide every supported expert count. Kept
-/// independent of the checkpoint on purpose: the frontend needs the partition
-/// count from the CLI alone, before any config or weights are read.
-const EP_SIZES: &[usize] = &[1, 4, 8, 16];
+/// across ranks, so the count must divide every supported expert count, and the
+/// fused MegaMoE kernel that carries the routed experts is AOT-instantiated per
+/// width — so this list is the set of instantiations that exist, not a set of
+/// arithmetically valid shardings. Kept independent of the checkpoint on
+/// purpose: the frontend needs the partition count from the CLI alone, before
+/// any config or weights are read.
+const EP_SIZES: &[usize] = &[1, 4];
 
 // K3-exclusive CLI flags.
 #[derive(ClapArgs)]
 struct K3Cli {
     /// K3 expert-parallel world size: one rank (and one scheduler partition)
-    /// per GPU, routed experts split whole across ranks. One of 1, 4, 8, 16.
+    /// per GPU, routed experts split whole across ranks. One of 1 or 4.
     #[arg(long, default_value_t = 1)]
     k3_ep_size: usize,
 }
@@ -194,18 +197,18 @@ impl ModelLine for K3Line {
         let config = K3ExecutorConfig::default().from_env().for_ep(ep_size);
         info!(
             "K3 engine starting: ep_size={ep_size}, eos_token_ids={eos_token_ids:?}, \
-             slots={}, ctx={}, layers={}, cuda_graph={}",
+             slots={}, ctx={}, layers={}, cuda_graph={}, moe=mega",
             config.max_batch, config.max_ctx, config.num_layers, config.cuda_graph
         );
         // One executor per EP rank. A single-rank run honours --device-ordinal;
         // wider runs take devices 0..ep_size, which `validate` already enforced.
         //
-        // Every rank's weights are resident before any rank is stepped, and a
-        // rank's communicator is minted on its own scheduler thread at its
-        // first step — which is after `start_with_executors` below, and so
-        // after every load. That ordering is the point: `ncclCommInitRank` has
-        // no timeout, so one rank running out of memory mid-load must not be
-        // able to strand its peers inside it.
+        // Every rank's weights are resident before any rank is stepped: a rank
+        // publishes its symmetric slab at load, but reads the world's table
+        // back on its own scheduler thread at its first step — which is after
+        // `start_with_executors` below, and so after every load. That ordering
+        // is the point: the table read blocks, so one rank running out of
+        // memory mid-load must not be able to strand its peers waiting.
         let rendezvous = (ep_size > 1).then(|| K3EpRendezvous::new(ep_size));
         let mut executors = Vec::with_capacity(ep_size);
         for rank in 0..ep_size {
@@ -354,8 +357,8 @@ mod tests {
 
     #[test]
     fn rejects_an_unsupported_ep_size() {
-        let error = partitions_for(&["pegainfer", "--k3-ep-size", "3"])
-            .expect_err("EP3 is not a defined K3 topology");
+        let error = partitions_for(&["pegainfer", "--k3-ep-size", "8"])
+            .expect_err("EP8 shards evenly but has no MegaMoE instantiation");
         assert!(
             error.to_string().contains("--k3-ep-size must be one of"),
             "{error}"

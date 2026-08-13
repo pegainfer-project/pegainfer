@@ -11,10 +11,11 @@
 //!
 //! Serving topology: EP-N decode (dev vehicle: the 224-expert checkpoint
 //! at EP4 on one 4-GPU node = 56 experts/rank, shape-isomorphic to the
-//! full 896-expert model at EP16). MoE decode follows
-//! the glm52 stepwise chain (DeepEP dispatch -> masked FP8xFP4 grouped
-//! GEMM W13 -> situ+requant -> masked GEMM W2 -> combine); the fused
-//! MegaMoE(situ) kernel is a planned phase-2 swap-in.
+//! full 896-expert model at EP16). The routed experts are one fused
+//! MegaMoE(situ) launch per layer at every world size: dispatch, both
+//! FP8xFP4 GEMMs, the situ activation and the weighted combine inside a
+//! single persistent kernel that pairs the ranks over NVLink itself, so a
+//! step issues no collective at all.
 //!
 //! KV story: dual-pool — paged KV (kv-store `BlockPool`) for the 24 MLA
 //! layers, plus a qwen35-style fixed-size slot pool for KDA recurrent
@@ -28,6 +29,7 @@ pub mod scheduler;
 
 pub use executor::K3Executor;
 pub use executor::K3ExecutorConfig;
+pub use executor::K3MoeTransport;
 pub use executor::ep::K3EpRendezvous;
 pub use model_line::MODEL_LINE;
 

@@ -414,6 +414,17 @@ pub(crate) struct K3MegaScratch {
     /// rendezvous before the first step.
     ptrs: Vec<i64>,
     base: i64,
+    /// Launches made since the current step began, and what the step owes.
+    ///
+    /// The kernel pairs the world inside itself, so a rank that skips a layer
+    /// leaves its peers in a barrier nothing satisfies. Nothing here can
+    /// *rescue* that — the guard exists so the rank that got it wrong says so,
+    /// instead of every other rank timing out sixty seconds later with no
+    /// indication of who was missing. Armed only above one rank (single-rank
+    /// steps replay from a captured graph, where a host-side counter would not
+    /// tick).
+    launches: usize,
+    launches_per_step: usize,
 }
 
 /// Open `self_ordinal` against every other device this process can see, so a
@@ -498,7 +509,34 @@ impl K3MegaScratch {
             rank_idx,
             ptrs,
             base,
+            launches: 0,
+            launches_per_step: 0,
         })
+    }
+
+    /// Count one launch against the current step.
+    pub(crate) fn count_launch(&mut self) {
+        self.launches += 1;
+    }
+
+    /// Arm the guard for a step that owes `launches` kernel launches. Zero
+    /// disarms it.
+    pub(crate) fn begin_step(&mut self, launches: usize) {
+        self.launches = 0;
+        self.launches_per_step = launches;
+    }
+
+    /// Check the step made every launch its peers are waiting on.
+    pub(crate) fn end_step(&self) -> Result<()> {
+        ensure!(
+            self.launches_per_step == 0 || self.launches == self.launches_per_step,
+            "K3 MegaMoE rank {} made {} launches this step but its peers expect {}; the group is \
+             now out of phase",
+            self.rank_idx,
+            self.launches,
+            self.launches_per_step
+        );
+        Ok(())
     }
 
     /// This rank's slab base, the value it publishes to its peers.
@@ -606,7 +644,10 @@ pub(crate) struct K3Scratch {
     pub(crate) dense_gate: CudaSlice<bf16>,
     pub(crate) dense_up: CudaSlice<bf16>,
     pub(crate) dense_act: CudaSlice<bf16>,
-    pub(crate) moe: K3MoeScratch,
+    /// Present only when the routed experts run the masked chain. The fused
+    /// kernel keeps its whole working set in the slab below, so a production
+    /// rank never allocates this.
+    pub(crate) moe: Option<K3MoeScratch>,
     /// Present only when the routed experts run through the fused kernel.
     pub(crate) mega: Option<K3MegaScratch>,
     // Output.
@@ -619,14 +660,13 @@ pub(crate) struct K3Scratch {
 }
 
 impl K3Scratch {
-    /// `rows` is this rank's row capacity; `chain_tokens` is the row count the
-    /// routed-expert chain runs at, which under expert parallelism is the whole
-    /// fleet's global batch rather than this rank's.
+    /// `rows` is this rank's row capacity. Exactly one of the two routed-expert
+    /// working sets is allocated: the fused kernel's slab when `mega` is set,
+    /// the masked chain's otherwise.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &DeviceContext,
         rows: usize,
-        chain_tokens: usize,
         routed_experts: usize,
         groups: usize,
         masked_cap: usize,
@@ -716,7 +756,10 @@ impl K3Scratch {
             dense_gate: wide(K3_DENSE_INTERMEDIATE)?,
             dense_up: wide(K3_DENSE_INTERMEDIATE)?,
             dense_act: wide(K3_DENSE_INTERMEDIATE)?,
-            moe: K3MoeScratch::new(ctx, chain_tokens, groups, masked_cap)?,
+            moe: match mega {
+                Some(_) => None,
+                None => Some(K3MoeScratch::new(ctx, rows, groups, masked_cap)?),
+            },
             mega: mega
                 .map(|geometry| {
                     K3MegaScratch::new(
