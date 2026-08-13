@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use clap::Args as ClapArgs;
 use clap::FromArgMatches;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::ArgRequirement;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
@@ -291,7 +291,7 @@ impl ModelLine for Qwen3Line {
         })
     }
 
-    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle> {
+    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         let cli = cli(ctx);
         let shared = ctx.shared;
         let offload = if shared.kv_offload {
@@ -358,11 +358,9 @@ impl ModelLine for Qwen3Line {
                 decode_overlap: cli.decode_overlap.resolve(cli.decode_sm_pct),
                 batch_invariant: cli.batch_invariant,
                 dflash_draft_model_path: shared.dflash_draft_model_path.clone(),
-                // KV block events are a Dynamo-backend concern; the plain
-                // server never publishes them.
-                enable_kv_events: false,
             },
         )
+        .map(LaunchedEngine::Stepped)
     }
 }
 

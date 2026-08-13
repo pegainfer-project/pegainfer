@@ -55,7 +55,7 @@ struct Tracked {
 
 /// Side-table of in-flight request phase spans. Owned by the scheduler loop.
 #[derive(Default)]
-pub(super) struct PhaseTracker {
+pub(crate) struct PhaseTracker {
     tracked: HashMap<RequestId, Tracked>,
 }
 
@@ -63,7 +63,7 @@ impl PhaseTracker {
     /// Begin tracing a request in the `queue` phase. `parent` is the frontend's
     /// request span context; `None` (tracing off) makes this and every later
     /// call a no-op for this request.
-    pub(super) fn enter_queue(&mut self, id: RequestId, parent: Option<SpanContext>) {
+    pub(crate) fn enter_queue(&mut self, id: RequestId, parent: Option<SpanContext>) {
         let Some(parent) = parent else { return };
         let span = Span::root("queue", parent);
         self.tracked.insert(
@@ -81,7 +81,7 @@ impl PhaseTracker {
     /// the first chunk stays open until `enter_decode`, which is what makes
     /// `prefill` prompt-phase wall time rather than per-chunk compute time
     /// (see module docs).
-    pub(super) fn enter_prefill(&mut self, id: RequestId) {
+    pub(crate) fn enter_prefill(&mut self, id: RequestId) {
         if let Some(t) = self.tracked.get_mut(&id) {
             if t.phase != Phase::Queue {
                 return;
@@ -92,7 +92,7 @@ impl PhaseTracker {
     }
 
     /// The first token was produced: close `prefill`, open `decode`.
-    pub(super) fn enter_decode(&mut self, id: RequestId) {
+    pub(crate) fn enter_decode(&mut self, id: RequestId) {
         if let Some(t) = self.tracked.get_mut(&id) {
             if t.phase == Phase::Decode {
                 return;
@@ -105,7 +105,7 @@ impl PhaseTracker {
     /// The request finished (or was dropped/rejected): close its open span and
     /// stop tracking it. Dropping the whole request trace is the frontend root
     /// span's job; this only ends the last phase span.
-    pub(super) fn finish(&mut self, id: RequestId) {
+    pub(crate) fn finish(&mut self, id: RequestId) {
         self.tracked.remove(&id);
     }
 }

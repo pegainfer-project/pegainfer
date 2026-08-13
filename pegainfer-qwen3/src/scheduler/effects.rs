@@ -1,47 +1,41 @@
-use log::debug;
+//! Pure per-step effect data produced by [`super::resolve::resolve_step`].
+//!
+//! Effects reference requests by the scheduler's internal [`RequestId`] only;
+//! translating them into the engine contract (emitter calls on the typestate
+//! handles) is `crate::frontend_adapter`'s job. Keeping this layer sink-free
+//! is what lets the decode-overlap path clone `PendingRequest`s and lets the
+//! resolve logic stay a pure function of executor results.
+
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::TokenLogprob;
-use pegainfer_frontend::engine::TokenSink;
 
 use super::ActiveRequestState;
 use super::PendingRequest;
-use super::TokenEvent;
 use crate::executor::RequestId;
 
-pub(super) struct PromptEchoEffect {
-    pub(super) token_tx: TokenSink,
-    pub(super) ids: Vec<u32>,
-    pub(super) logprobs: Vec<Option<TokenLogprob>>,
+/// The request's prefix-cache hit count, learned when its first prefill chunk
+/// lands (#246). Reported once per request.
+pub(crate) struct CachedTokensEffect {
+    pub(crate) request_id: RequestId,
+    pub(crate) cached_tokens: usize,
 }
 
-/// Emitted once per request when its prefill result lands — carries the
-/// prefix-cache hit count the frontend reports in usage (#246). The
-/// scheduled timestamp was stamped when the batch was formed, not when the
-/// event is sent, so queue-time metrics exclude prefill execution.
-pub(super) struct ScheduledEffect {
-    pub(super) token_tx: TokenSink,
-    pub(super) queued_at_unix_s: Option<f64>,
-    pub(super) scheduled_at_unix_s: f64,
-    pub(super) prompt_tokens: usize,
-    pub(super) cached_tokens: usize,
+pub(crate) struct PromptEchoEffect {
+    pub(crate) request_id: RequestId,
+    pub(crate) ids: Vec<u32>,
+    pub(crate) logprobs: Vec<Option<TokenLogprob>>,
 }
 
-pub(super) enum PendingEffect {
+pub(crate) enum PendingEffect {
     Finish {
         request_id: RequestId,
-        token_tx: TokenSink,
         finish_reason: FinishReason,
-        prompt_tokens: usize,
-        completion_tokens: usize,
     },
     EmitAndFinish {
         request_id: RequestId,
-        token_tx: TokenSink,
         token: u32,
         logprob: Option<TokenLogprob>,
         finish_reason: FinishReason,
-        prompt_tokens: usize,
-        completion_tokens: usize,
     },
     Promote {
         state: ActiveRequestState,
@@ -53,23 +47,24 @@ pub(super) enum PendingEffect {
     ContinuePrefill { req: PendingRequest },
 }
 
-pub(super) enum DecodeEffect {
+pub(crate) enum DecodeEffect {
     Finish {
         request_id: RequestId,
         finish_reason: FinishReason,
-        completion_tokens: usize,
     },
     EmitAndFinish {
         request_id: RequestId,
         token: u32,
         logprob: Option<TokenLogprob>,
         finish_reason: FinishReason,
-        completion_tokens: usize,
     },
     EmitAndContinue {
         request_id: RequestId,
         token: u32,
         logprob: Option<TokenLogprob>,
+        /// The request's running completion count after this token, for the
+        /// scheduler's own `generated_count`/`max_tokens` bookkeeping (the
+        /// wire-visible counts are tallied by the emitter).
         completion_tokens: usize,
     },
     /// Commit several accepted speculative tokens and keep the request running.
@@ -84,328 +79,23 @@ pub(super) enum DecodeEffect {
         request_id: RequestId,
         tokens: Vec<u32>,
         finish_reason: FinishReason,
-        completion_tokens: usize,
     },
 }
 
-pub(super) struct StepEffects {
-    pub(super) scheduled: Vec<ScheduledEffect>,
-    pub(super) prompt_echoes: Vec<PromptEchoEffect>,
-    pub(super) pending: Vec<PendingEffect>,
-    pub(super) decode: Vec<DecodeEffect>,
+pub(crate) struct StepEffects {
+    pub(crate) cached: Vec<CachedTokensEffect>,
+    pub(crate) prompt_echoes: Vec<PromptEchoEffect>,
+    pub(crate) pending: Vec<PendingEffect>,
+    pub(crate) decode: Vec<DecodeEffect>,
 }
 
 impl StepEffects {
-    pub(super) fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
-            scheduled: Vec::new(),
+            cached: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: Vec::new(),
         }
-    }
-}
-
-pub(super) fn apply_effects(
-    executor: &mut impl crate::executor::ModelExecutor,
-    active: &mut Vec<ActiveRequestState>,
-    prefilling: &mut Vec<PendingRequest>,
-    tracker: &mut super::phase_trace::PhaseTracker,
-    effects: StepEffects,
-) {
-    // `Finished` events are not sent inline: they are collected here and
-    // handed to the executor at the end of the step. On the plain path the
-    // executor sends them immediately; a P/D prefill executor withholds them
-    // until this step's KV saves are peer-visible (`flush_on_finish`), off
-    // the scheduler thread. Per-request ordering is safe either way — a
-    // finished request emits nothing after its `Finished`.
-    let mut finishes: Vec<(TokenSink, TokenEvent)> = Vec::new();
-
-    for scheduled in effects.scheduled {
-        let _ = scheduled.token_tx.send(TokenEvent::Scheduled {
-            queued_at_unix_s: scheduled
-                .queued_at_unix_s
-                .unwrap_or(scheduled.scheduled_at_unix_s),
-            scheduled_at_unix_s: scheduled.scheduled_at_unix_s,
-            prompt_tokens: scheduled.prompt_tokens,
-            cached_tokens: scheduled.cached_tokens,
-        });
-    }
-
-    for echo in effects.prompt_echoes {
-        let _ = echo.token_tx.send(TokenEvent::PromptTokens {
-            ids: echo.ids,
-            logprobs: echo.logprobs,
-        });
-    }
-
-    let mut to_retire = Vec::new();
-    for effect in effects.decode {
-        match effect {
-            DecodeEffect::Finish {
-                request_id,
-                finish_reason,
-                completion_tokens,
-            } => {
-                let Some(index) = active.iter().position(|req| req.request_id == request_id) else {
-                    continue;
-                };
-                let req = &active[index];
-                debug!(
-                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                    request_id, req.prompt_len, completion_tokens, finish_reason
-                );
-                finishes.push((
-                    req.token_tx.clone(),
-                    TokenEvent::Finished {
-                        finish_reason,
-                        prompt_tokens: req.prompt_len,
-                        completion_tokens,
-                    },
-                ));
-                tracker.finish(request_id);
-                let _ = executor.drop_request(request_id);
-                to_retire.push(index);
-            }
-            DecodeEffect::EmitAndFinish {
-                request_id,
-                token,
-                logprob,
-                finish_reason,
-                completion_tokens,
-            } => {
-                let Some(index) = active.iter().position(|req| req.request_id == request_id) else {
-                    continue;
-                };
-                let req = &active[index];
-                debug!(
-                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                    request_id, req.prompt_len, completion_tokens, finish_reason
-                );
-                if req
-                    .token_tx
-                    .send(TokenEvent::Token { id: token, logprob })
-                    .is_ok()
-                {
-                    finishes.push((
-                        req.token_tx.clone(),
-                        TokenEvent::Finished {
-                            finish_reason,
-                            prompt_tokens: req.prompt_len,
-                            completion_tokens,
-                        },
-                    ));
-                }
-                tracker.finish(request_id);
-                let _ = executor.drop_request(request_id);
-                to_retire.push(index);
-            }
-            DecodeEffect::EmitAndContinue {
-                request_id,
-                token,
-                logprob,
-                completion_tokens,
-            } => {
-                let Some(index) = active.iter().position(|req| req.request_id == request_id) else {
-                    continue;
-                };
-                let req = &mut active[index];
-                if req
-                    .token_tx
-                    .send(TokenEvent::Token { id: token, logprob })
-                    .is_err()
-                {
-                    debug!(
-                        "request dropped: client disconnected: request_id={:?} tokens_generated={}",
-                        request_id, completion_tokens
-                    );
-                    tracker.finish(request_id);
-                    let _ = executor.drop_request(request_id);
-                    to_retire.push(index);
-                } else {
-                    req.last_token = token;
-                    req.generated_count = completion_tokens;
-                }
-            }
-            DecodeEffect::EmitManyAndContinue {
-                request_id,
-                tokens,
-                completion_tokens,
-            } => {
-                let Some(index) = active.iter().position(|req| req.request_id == request_id) else {
-                    continue;
-                };
-                let req = &mut active[index];
-                let mut sent = true;
-                for &token in &tokens {
-                    if req
-                        .token_tx
-                        .send(TokenEvent::Token {
-                            id: token,
-                            logprob: None,
-                        })
-                        .is_err()
-                    {
-                        sent = false;
-                        break;
-                    }
-                }
-                if sent {
-                    req.last_token = *tokens
-                        .last()
-                        .expect("EmitManyAndContinue must carry at least one token");
-                    req.generated_count = completion_tokens;
-                } else {
-                    debug!(
-                        "request dropped: client disconnected: request_id={:?} tokens_generated={}",
-                        request_id, completion_tokens
-                    );
-                    tracker.finish(request_id);
-                    let _ = executor.drop_request(request_id);
-                    to_retire.push(index);
-                }
-            }
-            DecodeEffect::EmitManyAndFinish {
-                request_id,
-                tokens,
-                finish_reason,
-                completion_tokens,
-            } => {
-                let Some(index) = active.iter().position(|req| req.request_id == request_id) else {
-                    continue;
-                };
-                let req = &active[index];
-                debug!(
-                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                    request_id, req.prompt_len, completion_tokens, finish_reason
-                );
-                let mut sent = true;
-                for &token in &tokens {
-                    if req
-                        .token_tx
-                        .send(TokenEvent::Token {
-                            id: token,
-                            logprob: None,
-                        })
-                        .is_err()
-                    {
-                        sent = false;
-                        break;
-                    }
-                }
-                if sent {
-                    finishes.push((
-                        req.token_tx.clone(),
-                        TokenEvent::Finished {
-                            finish_reason,
-                            prompt_tokens: req.prompt_len,
-                            completion_tokens,
-                        },
-                    ));
-                }
-                tracker.finish(request_id);
-                let _ = executor.drop_request(request_id);
-                to_retire.push(index);
-            }
-        }
-    }
-    to_retire.sort_unstable();
-    to_retire.dedup();
-    for &i in to_retire.iter().rev() {
-        active.swap_remove(i);
-    }
-
-    // Requests that ran a non-final chunk this step came off the front of the
-    // prefilling queue; splicing them back at the front (in step order, which
-    // is request-id order) keeps the queue FIFO so chunked prompts finish
-    // before newer arrivals start.
-    let mut continued: Vec<PendingRequest> = Vec::new();
-    for effect in effects.pending {
-        match effect {
-            PendingEffect::ContinuePrefill { req } => {
-                if req.token_tx.is_closed() {
-                    tracker.finish(req.request_id);
-                    let _ = executor.drop_request(req.request_id);
-                } else {
-                    continued.push(req);
-                }
-            }
-            PendingEffect::Finish {
-                request_id,
-                token_tx,
-                finish_reason,
-                prompt_tokens,
-                completion_tokens,
-            } => {
-                debug!(
-                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                    request_id, prompt_tokens, completion_tokens, finish_reason
-                );
-                finishes.push((
-                    token_tx,
-                    TokenEvent::Finished {
-                        finish_reason,
-                        prompt_tokens,
-                        completion_tokens,
-                    },
-                ));
-                tracker.finish(request_id);
-                let _ = executor.drop_request(request_id);
-            }
-            PendingEffect::EmitAndFinish {
-                request_id,
-                token_tx,
-                token,
-                logprob,
-                finish_reason,
-                prompt_tokens,
-                completion_tokens,
-            } => {
-                debug!(
-                    "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
-                    request_id, prompt_tokens, completion_tokens, finish_reason
-                );
-                if token_tx
-                    .send(TokenEvent::Token { id: token, logprob })
-                    .is_ok()
-                {
-                    finishes.push((
-                        token_tx,
-                        TokenEvent::Finished {
-                            finish_reason,
-                            prompt_tokens,
-                            completion_tokens,
-                        },
-                    ));
-                }
-                tracker.finish(request_id);
-                let _ = executor.drop_request(request_id);
-            }
-            PendingEffect::Promote {
-                state,
-                first_token,
-                logprob,
-            } => {
-                if state
-                    .token_tx
-                    .send(TokenEvent::Token {
-                        id: first_token,
-                        logprob,
-                    })
-                    .is_ok()
-                {
-                    tracker.enter_decode(state.request_id);
-                    active.push(state);
-                } else {
-                    tracker.finish(state.request_id);
-                    let _ = executor.drop_request(state.request_id);
-                }
-            }
-        }
-    }
-    prefilling.splice(0..0, continued);
-
-    if !finishes.is_empty() {
-        executor.release_finished_events(finishes);
     }
 }

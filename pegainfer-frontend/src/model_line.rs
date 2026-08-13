@@ -2,7 +2,7 @@
 //!
 //! A model line is everything south of the engine contract: config probing,
 //! its own CLI knobs, and a `launch` that starts scheduler threads and hands
-//! back an [`EngineHandle`]. The server binary holds a feature-gated
+//! back a [`LaunchedEngine`]. The server binary holds a feature-gated
 //! [`ModelLineRegistry`] and does pure dispatch — it never names a model
 //! crate's option types.
 //!
@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::engine::EngineHandle;
+use crate::engine::LaunchedEngine;
 use crate::vllm::LoraModule;
 
 /// Model detection failed. The server branches on [`DetectError::NoMatch`]
@@ -305,7 +305,7 @@ pub trait ModelLine: Send + Sync {
     /// metadata (`with_kv_capacity`, `with_load_watch`, ...), return it.
     /// Failures here are deep context chains (CUDA, weights, topology), not
     /// something callers branch on — hence `anyhow`.
-    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle>;
+    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine>;
 }
 
 struct LineEntry {
@@ -666,7 +666,7 @@ mod tests {
             self.requirements
         }
 
-        fn launch(&self, _ctx: &LaunchContext<'_>) -> anyhow::Result<EngineHandle> {
+        fn launch(&self, _ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
             unreachable!("registry tests never launch")
         }
     }

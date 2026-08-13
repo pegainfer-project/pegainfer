@@ -43,10 +43,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pegainfer_frontend::engine::EngineHandle;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
 use pegainfer_qwen3::DEFAULT_KV_PAGE_SIZE;
@@ -58,6 +55,10 @@ use pegainfer_qwen3::Qwen3OffloadOptions;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
+
+use common::harness::EngineHarness;
+use common::harness::Outcome;
+use common::harness::request;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B-DFlash-b16");
@@ -128,7 +129,6 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: draft,
-        enable_kv_events: false,
     }
 }
 
@@ -139,49 +139,36 @@ struct Step {
     top_logprobs: Vec<(u32, f32)>,
 }
 
-/// Submit one greedy request and collect the decoded steps until `Finished`.
+/// Fold a finished request's outcome into decoded steps: tokens paired with
+/// their requested top-K distributions (empty when logprobs were off).
+fn to_steps(outcome: Outcome) -> Vec<Step> {
+    let Outcome {
+        tokens, logprobs, ..
+    } = outcome;
+    tokens
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| Step {
+            id,
+            top_logprobs: logprobs
+                .get(i)
+                .and_then(Option::as_ref)
+                .map(|lp| lp.top_logprobs.clone())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Submit one greedy request and collect the decoded steps until it finishes.
 fn generate(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     prompt_tokens: Vec<u32>,
     logprobs: usize,
     max_tokens: usize,
 ) -> Vec<Step> {
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params: SamplingParams::default(),
-            max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    let mut steps = Vec::new();
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, logprob }) => steps.push(Step {
-                id,
-                top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
-            }),
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { .. }) => return steps,
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
-        }
-    }
+    let mut req = request(prompt_tokens, SamplingParams::default(), max_tokens);
+    req.logprobs = logprobs;
+    to_steps(engine.submit(req).expect_finished())
 }
 
 /// Submit several greedy requests at once, then collect each one's steps. They
@@ -190,61 +177,24 @@ fn generate(
 /// the real bs>1 draft+verify path. Each tuple is `(prompt_tokens, max_tokens)`;
 /// logprobs are off so the speculative path stays active. Returns one step list
 /// per request, in submission order.
-fn generate_concurrent(handle: &EngineHandle, requests: Vec<(Vec<u32>, usize)>) -> Vec<Vec<Step>> {
+fn generate_concurrent(engine: &EngineHarness, requests: Vec<(Vec<u32>, usize)>) -> Vec<Vec<Step>> {
     // Submit all up front so they coexist in the engine and form real batches.
-    let receivers: Vec<_> = requests
+    let streams: Vec<_> = requests
         .into_iter()
         .map(|(prompt_tokens, max_tokens)| {
-            let (token_tx, rx) = TokenSink::standalone();
-            handle
-                .submit(GenerateRequest {
-                    trace_parent: None,
-                    request_id: None,
-                    queued_at_unix_s: None,
-                    data_parallel_rank: None,
-                    prompt_tokens,
-                    params: SamplingParams::default(),
-                    max_tokens,
-                    lora_adapter: None,
-                    kv_transfer_params: None,
-                    token_tx,
-                    logprobs: 0,
-                    echo: false,
-                })
-                .expect("submit failed");
-            rx
+            engine.submit(request(
+                prompt_tokens,
+                SamplingParams::default(),
+                max_tokens,
+            ))
         })
         .collect();
 
-    // Drain each request's channel to completion (events are buffered per-channel,
-    // so the drain order doesn't matter — they all ran concurrently).
-    receivers
+    // Fold each stream to its terminal (updates are buffered per request, so
+    // the fold order doesn't matter — they all ran concurrently).
+    streams
         .into_iter()
-        .map(|mut rx| {
-            let mut steps = Vec::new();
-            loop {
-                match rx.blocking_recv().map(|(_, event)| event) {
-                    Some(TokenEvent::Token { id, logprob }) => steps.push(Step {
-                        id,
-                        top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
-                    }),
-                    Some(
-                        TokenEvent::Scheduled { .. }
-                        | TokenEvent::PromptTokens { .. }
-                        | TokenEvent::KvTransfer { .. },
-                    ) => {}
-                    Some(TokenEvent::Finished { .. }) => break,
-                    Some(TokenEvent::Error { message, .. }) => {
-                        panic!("generation failed: {message}")
-                    }
-                    Some(TokenEvent::Rejected { message, .. }) => {
-                        panic!("generation rejected: {message}")
-                    }
-                    None => panic!("scheduler channel closed without Finished"),
-                }
-            }
-            steps
-        })
+        .map(|stream| to_steps(stream.expect_finished()))
         .collect()
 }
 
@@ -253,55 +203,27 @@ fn generate_concurrent(handle: &EngineHandle, requests: Vec<(Vec<u32>, usize)>) 
 /// the reference the spec pick should match (vs the plain-decode baseline, whose
 /// kernel resolves bifurcation ties to the other side). Returns the first
 /// generated token's `(id, top_logprobs)`.
-fn prefill_next(handle: &EngineHandle, context: Vec<u32>, logprobs: usize) -> Step {
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens: context,
-            params: SamplingParams::default(),
-            max_tokens: 1,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs,
-            echo: true,
-        })
-        .expect("submit failed");
-
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, logprob }) => {
-                return Step {
-                    id,
-                    top_logprobs: logprob.map(|lp| lp.top_logprobs).unwrap_or_default(),
-                };
-            }
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { .. }) => panic!("echo prefill finished without a token"),
-            Some(TokenEvent::Error { message, .. }) => panic!("prefill failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("prefill rejected: {message}"),
-            None => panic!("scheduler channel closed without a token"),
-        }
-    }
+fn prefill_next(engine: &EngineHarness, context: Vec<u32>, logprobs: usize) -> Step {
+    let mut req = request(context, SamplingParams::default(), 1);
+    req.logprobs = logprobs;
+    req.echo = true;
+    let mut generated = to_steps(engine.submit(req).expect_finished());
+    assert!(
+        !generated.is_empty(),
+        "echo prefill finished without a token"
+    );
+    generated.swap_remove(0)
 }
 
 /// Compare one prompt's speculative `spec` steps against its plain-greedy `base`,
 /// tolerating only the benign prefill-vs-decode kernel-gap tie flip (the spec
 /// pick sits within `MARGIN_TOL` of the prefill kernel's own argmax, measured in
 /// the prefill distribution the verify path actually runs). `Ok(())` ⇒ lossless
-/// or a benign tie; `Err(diagnostic)` ⇒ a real spec bug. `handle` must be the
+/// or a benign tie; `Err(diagnostic)` ⇒ a real spec bug. `engine` must be the
 /// live speculative engine — at a divergence it re-prefills the shared context
 /// (`prompt_tokens` + the matched prefix) to read that prefill-kernel reference.
 fn check_lossless(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     tokenizer: &DynTokenizer,
     i: usize,
     prompt: &str,
@@ -362,7 +284,7 @@ fn check_lossless(
     // other side and amplifies the gap.
     let mut context = prompt_tokens.to_vec();
     context.extend(base[..matched].iter().map(|s| s.id));
-    let prefill_ref = prefill_next(handle, context, LOGPROBS);
+    let prefill_ref = prefill_next(engine, context, LOGPROBS);
 
     if prefill_ref.id == spec_id {
         // Spec faithfully reproduced the prefill-kernel greedy pick; the
@@ -446,13 +368,15 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     // 1. Baseline: plain greedy decode (speculative off), with logprobs so the
     //    regret check has the reference distribution at the divergence point.
     let baseline: Vec<Vec<Step>> = {
-        let handle = pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
-            .expect("failed to start baseline engine");
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start baseline engine"),
+        );
         let out = encoded
             .iter()
-            .map(|t| generate(&handle, t.clone(), LOGPROBS, GENERATED_TOKENS))
+            .map(|t| generate(&engine, t.clone(), LOGPROBS, GENERATED_TOKENS))
             .collect();
-        drop(handle);
+        drop(engine);
         // Let the scheduler thread tear down and free GPU memory before the
         // speculative engine loads the same 8 GB target.
         std::thread::sleep(Duration::from_secs(2));
@@ -463,17 +387,19 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     //    Keep the engine alive through analysis: at a divergence we re-prefill
     //    the shared context to read the prefill-kernel reference (the kernel the
     //    verify path uses), which the plain-decode baseline cannot provide.
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
-    )
-    .expect("failed to start speculative engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
 
     let mut failures = Vec::new();
     for (i, &prompt) in prompts.iter().enumerate() {
-        let spec = generate(&handle, encoded[i].clone(), 0, GENERATED_TOKENS);
+        let spec = generate(&engine, encoded[i].clone(), 0, GENERATED_TOKENS);
         if let Err(failure) = check_lossless(
-            &handle,
+            &engine,
             &tokenizer,
             i,
             prompt,
@@ -485,7 +411,7 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
         }
     }
 
-    drop(handle);
+    drop(engine);
 
     assert!(
         failures.is_empty(),
@@ -547,10 +473,12 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
     // 1. Baseline: the victim's plain-greedy decode (spec off) with logprobs, for
     //    the regret reference at any divergence.
     let baseline = {
-        let handle = pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
-            .expect("failed to start baseline engine");
-        let out = generate(&handle, victim_tokens.clone(), LOGPROBS, GENERATED_TOKENS);
-        drop(handle);
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start baseline engine"),
+        );
+        let out = generate(&engine, victim_tokens.clone(), LOGPROBS, GENERATED_TOKENS);
+        drop(engine);
         // Free the target before the speculative engine loads the same 8 GB.
         std::thread::sleep(Duration::from_secs(2));
         out
@@ -558,15 +486,17 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
 
     // 2. Speculative engine, shared across both requests so the bucket-bs=1
     //    capture from the poison request persists into the victim's replay.
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
-    )
-    .expect("failed to start speculative engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
 
     // Poison: a short request whose only verify step has total_tokens < span,
     // first-capturing the bucket-bs=1 graph at the truncated shape.
-    let poison = generate(&handle, poison_tokens, 0, POISON_MAX_TOKENS);
+    let poison = generate(&engine, poison_tokens, 0, POISON_MAX_TOKENS);
     assert!(
         poison.len() <= POISON_MAX_TOKENS,
         "poison request emitted {} tokens, expected <= {POISON_MAX_TOKENS}",
@@ -574,10 +504,10 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
     );
 
     // Victim: a full-span replay of the poisoned bucket-bs=1 graph.
-    let spec = generate(&handle, victim_tokens.clone(), 0, GENERATED_TOKENS);
+    let spec = generate(&engine, victim_tokens.clone(), 0, GENERATED_TOKENS);
 
     let result = check_lossless(
-        &handle,
+        &engine,
         &tokenizer,
         0,
         victim_prompt,
@@ -585,7 +515,7 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
         &baseline,
         &spec,
     );
-    drop(handle);
+    drop(engine);
 
     assert!(
         result.is_ok(),
@@ -633,26 +563,30 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
     // 1. Baselines: each prompt's plain-greedy decode (spec off) at ITS budget,
     //    with logprobs for the regret reference. Sequential, one engine.
     let baselines: Vec<Vec<Step>> = {
-        let handle = pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
-            .expect("failed to start baseline engine");
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start baseline engine"),
+        );
         let out = encoded
             .iter()
             .zip(&cases)
-            .map(|(t, (_, max_tokens))| generate(&handle, t.clone(), LOGPROBS, *max_tokens))
+            .map(|(t, (_, max_tokens))| generate(&engine, t.clone(), LOGPROBS, *max_tokens))
             .collect();
-        drop(handle);
+        drop(engine);
         std::thread::sleep(Duration::from_secs(2));
         out
     };
 
     // 2. Speculative engine: submit all four at once so they form real batches.
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
-    )
-    .expect("failed to start speculative engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
     let specs = generate_concurrent(
-        &handle,
+        &engine,
         encoded
             .iter()
             .zip(&cases)
@@ -663,7 +597,7 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
     let mut failures = Vec::new();
     for (i, (prompt, _)) in cases.iter().enumerate() {
         if let Err(failure) = check_lossless(
-            &handle,
+            &engine,
             &tokenizer,
             i,
             prompt,
@@ -674,7 +608,7 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
             failures.push(failure);
         }
     }
-    drop(handle);
+    drop(engine);
 
     assert!(
         failures.is_empty(),
@@ -714,50 +648,36 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
     // the DFlash admission cap (max_pos - BLOCK_SIZE).
     let max_tokens = max_pos - BLOCK_SIZE / 2 - prompt_len;
 
-    let handle = pegainfer_qwen3::launch(
-        Path::new(&model_path),
-        launch_options(Some(PathBuf::from(&draft_path))),
-    )
-    .expect("failed to start speculative engine");
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
 
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens: vec![100u32; prompt_len],
-            params: SamplingParams::default(),
+    let outcome = engine
+        .submit(request(
+            vec![100u32; prompt_len],
+            SamplingParams::default(),
             max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Rejected { message, .. }) => {
-                eprintln!("draft-headroom request rejected as expected: {message}");
-                break;
-            }
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Token { .. } | TokenEvent::Finished { .. }) => {
-                panic!("draft-headroom request was admitted instead of rejected")
-            }
-            Some(TokenEvent::Error { message, .. }) => {
-                panic!(
-                    "draft-headroom request errored mid-flight instead of clean rejection: {message}"
-                )
-            }
-            None => panic!("scheduler channel closed without a rejection"),
+        ))
+        .outcome();
+    assert!(
+        outcome.tokens.is_empty(),
+        "draft-headroom request was admitted instead of rejected"
+    );
+    match outcome.terminal {
+        Terminal::Rejected { reason, .. } => {
+            eprintln!("draft-headroom request rejected as expected: {reason}");
+        }
+        Terminal::Finished { .. } => {
+            panic!("draft-headroom request was admitted instead of rejected")
+        }
+        Terminal::Failed { message, .. } => {
+            panic!(
+                "draft-headroom request errored mid-flight instead of clean rejection: {message}"
+            )
         }
     }
 }

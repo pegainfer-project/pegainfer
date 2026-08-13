@@ -33,7 +33,6 @@ fn batch_invariant_rejects_decode_overlap() {
         DecodeOverlap::SharedSm,
         true,
         None,
-        false,
     )
     .err()
     .expect("--batch-invariant + --decode-overlap must be rejected");
@@ -62,7 +61,6 @@ fn batch_invariant_rejects_dflash() {
         DecodeOverlap::Off,
         true,
         Some(Path::new("/nonexistent-draft")),
-        false,
     )
     .err()
     .expect("--batch-invariant + DFlash must be rejected");
@@ -91,7 +89,6 @@ fn batch_invariant_rejects_prefix_cache() {
         DecodeOverlap::Off,
         true,
         None,
-        false,
     )
     .err()
     .expect("--batch-invariant with the prefix cache on must be rejected");
@@ -120,7 +117,6 @@ fn batch_invariant_rejects_kv_offload() {
         DecodeOverlap::Off,
         true,
         None,
-        false,
     )
     .err()
     .expect("--batch-invariant + KV offload must be rejected");
