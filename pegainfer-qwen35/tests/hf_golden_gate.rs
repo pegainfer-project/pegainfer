@@ -714,15 +714,7 @@ fn dist(deltas: &[f32]) -> (f32, f32, f32, f32) {
     )
 }
 
-#[derive(Clone, Copy, Debug)]
-struct GateMetrics {
-    mean: f32,
-    p50: f32,
-    p99: f32,
-    max: f32,
-}
-
-fn report_and_assert(label: &str, stats: &Stats) -> GateMetrics {
+fn report_and_assert(label: &str, stats: &Stats) {
     assert!(
         stats.head_deltas.len() >= stats.positions,
         "[{label}] only {} head deltas over {} positions; top-K overlap collapsed",
@@ -754,229 +746,12 @@ fn report_and_assert(label: &str, stats: &Stats) -> GateMetrics {
         p99 <= P99_TOL,
         "[{label}] p99 head logprob delta {p99:.4} > {P99_TOL}"
     );
-    GateMetrics {
-        mean,
-        p50,
-        p99,
-        max,
-    }
+    let _ = max;
 }
 
 fn build_executor(model_path: &str) -> Qwen35Executor {
     Qwen35Executor::from_runtime(model_path, 0, MAX_EXECUTOR_BATCH)
         .expect("build Qwen3.5 logits executor")
-}
-
-fn build_triton_executor(model_path: &str) -> Qwen35Executor {
-    Qwen35Executor::from_runtime_with_triton_gdn(model_path, 0, MAX_EXECUTOR_BATCH)
-        .expect("build Qwen3.5 Triton-control logits executor")
-}
-
-fn build_flashinfer_executor(model_path: &str) -> Qwen35Executor {
-    let executor =
-        Qwen35Executor::from_runtime_with_flashinfer_gdn(model_path, 0, MAX_EXECUTOR_BATCH)
-            .expect("build Qwen3.5 FlashInfer logits executor");
-    let evidence = executor
-        .flashinfer_gdn_runtime_evidence()
-        .expect("read initial FlashInfer GDN evidence")
-        .expect("explicit FlashInfer executor must expose GDN evidence");
-    assert_eq!(
-        evidence.successful_launches, 0,
-        "FlashInfer launch evidence must start at zero before HF replay"
-    );
-    assert_eq!(
-        evidence.artifact_sha256.len(),
-        64,
-        "FlashInfer artifact identity must include a SHA-256"
-    );
-    eprintln!(
-        "qwen35 hf_golden_gate [FlashInfer identity]: object_sha256={} object_bytes={}",
-        evidence.artifact_sha256, evidence.artifact_size_bytes
-    );
-    executor
-}
-
-fn require_flashinfer_launches(
-    executor: &Qwen35Executor,
-    previous_launches: u64,
-    label: &str,
-) -> u64 {
-    let evidence = executor
-        .flashinfer_gdn_runtime_evidence()
-        .expect("read FlashInfer GDN evidence after replay")
-        .expect("FlashInfer HF replay unexpectedly lost backend identity");
-    assert!(
-        evidence.successful_launches > previous_launches,
-        "[{label}] FlashInfer launch count did not advance from {previous_launches}; replay may have used Triton"
-    );
-    eprintln!(
-        "qwen35 hf_golden_gate [{label}]: FlashInfer successful launches {} -> {}",
-        previous_launches, evidence.successful_launches
-    );
-    evidence.successful_launches
-}
-
-fn report_backend_deltas(labels: &[String], triton: &[GateMetrics], flashinfer: &[GateMetrics]) {
-    assert_eq!(labels.len(), triton.len());
-    assert_eq!(labels.len(), flashinfer.len());
-    for ((label, triton), flashinfer) in labels.iter().zip(triton).zip(flashinfer) {
-        eprintln!(
-            "qwen35 hf_golden_gate [{label}] FlashInfer-Triton delta: mean {:+.4} p50 {:+.4} p99 {:+.4} max {:+.4}",
-            flashinfer.mean - triton.mean,
-            flashinfer.p50 - triton.p50,
-            flashinfer.p99 - triton.p99,
-            flashinfer.max - triton.max,
-        );
-    }
-}
-
-#[derive(Clone, Copy)]
-enum GateBackend {
-    Triton,
-    FlashInfer,
-}
-
-impl GateBackend {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Triton => "Triton",
-            Self::FlashInfer => "FlashInfer",
-        }
-    }
-
-    fn build(self, model_path: &str) -> Qwen35Executor {
-        match self {
-            Self::Triton => build_triton_executor(model_path),
-            Self::FlashInfer => build_flashinfer_executor(model_path),
-        }
-    }
-
-    fn verify_prefill(self, executor: &Qwen35Executor, previous_launches: u64, label: &str) -> u64 {
-        match self {
-            Self::Triton => {
-                assert!(
-                    executor
-                        .flashinfer_gdn_runtime_evidence()
-                        .expect("read Triton executor backend evidence")
-                        .is_none(),
-                    "[{label}] Triton control unexpectedly owns a FlashInfer backend"
-                );
-                0
-            }
-            Self::FlashInfer => require_flashinfer_launches(executor, previous_launches, label),
-        }
-    }
-}
-
-fn run_short_backend_gate(
-    golden: &Golden,
-    model_path: &str,
-    backend: GateBackend,
-) -> (Vec<String>, Vec<GateMetrics>) {
-    let all: Vec<usize> = (0..golden.num_seqs).collect();
-    let mut labels = Vec::new();
-    let mut metrics = Vec::new();
-
-    {
-        let mut executor = backend.build(model_path);
-        let mut launches = 0;
-        let (stats, fingerprint1) = run(golden, &mut executor, &all, false);
-        let label = "sequential bs=1 graph";
-        metrics.push(report_and_assert(
-            &format!("{} {label}", backend.label()),
-            &stats,
-        ));
-        labels.push(label.to_string());
-        launches = backend.verify_prefill(&executor, launches, label);
-
-        let (_, fingerprint2) = run(golden, &mut executor, &all, false);
-        assert_eq!(
-            fingerprint1,
-            fingerprint2,
-            "{} sequential Qwen3.5 replay must reproduce identical logprobs",
-            backend.label()
-        );
-        launches = backend.verify_prefill(&executor, launches, "sequential repeat");
-
-        for n in BUCKET_STRADDLES {
-            if all.len() >= n {
-                let (stats, _) = run(golden, &mut executor, &all[..n], true);
-                let label = format!("batched graph ({n} padded)");
-                metrics.push(report_and_assert(
-                    &format!("{} {label}", backend.label()),
-                    &stats,
-                ));
-                labels.push(label.clone());
-                launches = backend.verify_prefill(&executor, launches, &label);
-            } else {
-                eprintln!(
-                    "qwen35 hf_golden_gate: skipping {} batched graph ({n} padded); fixture has only {} sequence(s)",
-                    backend.label(),
-                    all.len()
-                );
-            }
-        }
-    }
-
-    if golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2 {
-        let label = "slot-compaction graph";
-        let fingerprint1 = {
-            let mut executor = backend.build(model_path);
-            let (stats, fingerprint) =
-                run_with_slot_compaction(golden, &mut executor, &all[..SLOT_COMPACTION_BATCH]);
-            metrics.push(report_and_assert(
-                &format!("{} {label}", backend.label()),
-                &stats,
-            ));
-            labels.push(label.to_string());
-            backend.verify_prefill(&executor, 0, label);
-            fingerprint
-        };
-        let fingerprint2 = {
-            let mut executor = backend.build(model_path);
-            let (_, fingerprint) =
-                run_with_slot_compaction(golden, &mut executor, &all[..SLOT_COMPACTION_BATCH]);
-            backend.verify_prefill(&executor, 0, "slot-compaction repeat");
-            fingerprint
-        };
-        assert_eq!(
-            fingerprint1,
-            fingerprint2,
-            "{} slot-compaction Qwen3.5 replay must reproduce identical logprobs",
-            backend.label()
-        );
-    } else {
-        eprintln!(
-            "qwen35 hf_golden_gate: skipping {} slot-compaction graph; fixture has {} sequence(s), decode_len {}",
-            backend.label(),
-            golden.num_seqs,
-            golden.decode_len
-        );
-    }
-
-    (labels, metrics)
-}
-
-fn run_long_backend_gate(
-    golden: &Golden,
-    model_path: &str,
-    backend: GateBackend,
-) -> (Vec<String>, Vec<GateMetrics>) {
-    let all: Vec<usize> = (0..golden.num_seqs).collect();
-    let mut executor = backend.build(model_path);
-    let (stats, fingerprint1) = run(golden, &mut executor, &all, false);
-    let label = "long sequential bs=1 graph";
-    let metrics = report_and_assert(&format!("{} {label}", backend.label()), &stats);
-    let launches = backend.verify_prefill(&executor, 0, label);
-    let (_, fingerprint2) = run(golden, &mut executor, &all, false);
-    backend.verify_prefill(&executor, launches, "long sequential repeat");
-    assert_eq!(
-        fingerprint1,
-        fingerprint2,
-        "{} long sequential Qwen3.5 replay must reproduce identical logprobs",
-        backend.label()
-    );
-    (vec![label.to_string()], vec![metrics])
 }
 
 fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
@@ -1074,14 +849,14 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
 
 #[test]
 #[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
-fn flashinfer_gdn_and_triton_match_hf_short_golden() {
+fn production_flashinfer_gdn_matches_hf_short_golden() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
     assert_eq!(
         fixture_size_name(&model_path),
         Some("4b"),
-        "FlashInfer Stage 8 HF gate is scoped to the Qwen3.5-4B Hv32 geometry"
+        "FlashInfer production HF gate is scoped to the Qwen3.5-4B Hv32 geometry"
     );
     let Some(golden) = Golden::load_for(&model_path, false) else {
         return;
@@ -1091,69 +866,34 @@ fn flashinfer_gdn_and_triton_match_hf_short_golden() {
     }
     report_fixture_shape(&golden);
     let all = (0..golden.num_seqs).collect::<Vec<_>>();
-    {
-        // Keep only one full model resident at a time on 32 GiB cards. The
-        // production-Auto proof must be dropped before the Triton/FlashInfer
-        // same-path controls construct their own executors below.
-        let mut production = build_executor(&model_path);
-        let production_before = production
-            .flashinfer_gdn_runtime_evidence()
-            .expect("read production Auto GDN evidence before HF replay")
-            .expect("SM120/Hv32 production Auto dispatch must select FlashInfer");
-        assert_eq!(production_before.selected_backend, "flashinfer");
-        assert_eq!(production_before.successful_launches, 0);
-        let (production_stats, _) = run(&golden, &mut production, &all, false);
-        report_and_assert("production Auto sequential bs=1 graph", &production_stats);
-        let production_after = production
-            .flashinfer_gdn_runtime_evidence()
-            .expect("read production Auto GDN evidence after HF replay")
-            .expect("production Auto dispatch lost FlashInfer identity");
-        assert_eq!(
-            production_after.artifact_sha256,
-            production_before.artifact_sha256
-        );
-        assert!(
-            production_after.successful_launches > production_before.successful_launches,
-            "production Auto HF replay completed without a FlashInfer launch"
-        );
-        eprintln!(
-            "qwen35 hf_golden_gate [production Auto]: selected_backend={} object_sha256={} successful_launches={} -> {}",
-            production_after.selected_backend,
-            production_after.artifact_sha256,
-            production_before.successful_launches,
-            production_after.successful_launches,
-        );
-    }
-    let (labels, triton) = run_short_backend_gate(&golden, &model_path, GateBackend::Triton);
-    let (flashinfer_labels, flashinfer) =
-        run_short_backend_gate(&golden, &model_path, GateBackend::FlashInfer);
-    assert_eq!(labels, flashinfer_labels);
-    report_backend_deltas(&labels, &triton, &flashinfer);
-}
-
-#[test]
-#[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
-fn flashinfer_gdn_and_triton_match_hf_long_golden() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
+    let mut production = build_executor(&model_path);
+    let production_before = production
+        .flashinfer_gdn_runtime_evidence()
+        .expect("read production Auto GDN evidence before HF replay")
+        .expect("SM120/Hv32 production Auto dispatch must select FlashInfer");
+    assert_eq!(production_before.selected_backend, "flashinfer");
+    assert_eq!(production_before.successful_launches, 0);
+    let (production_stats, _) = run(&golden, &mut production, &all, false);
+    report_and_assert("production Auto sequential bs=1 graph", &production_stats);
+    let production_after = production
+        .flashinfer_gdn_runtime_evidence()
+        .expect("read production Auto GDN evidence after HF replay")
+        .expect("production Auto dispatch lost FlashInfer identity");
     assert_eq!(
-        fixture_size_name(&model_path),
-        Some("4b"),
-        "FlashInfer Stage 8 HF gate is scoped to the Qwen3.5-4B Hv32 geometry"
+        production_after.artifact_sha256,
+        production_before.artifact_sha256
     );
-    let Some(golden) = Golden::load_for(&model_path, true) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
-    report_fixture_shape(&golden);
-    let (labels, triton) = run_long_backend_gate(&golden, &model_path, GateBackend::Triton);
-    let (flashinfer_labels, flashinfer) =
-        run_long_backend_gate(&golden, &model_path, GateBackend::FlashInfer);
-    assert_eq!(labels, flashinfer_labels);
-    report_backend_deltas(&labels, &triton, &flashinfer);
+    assert!(
+        production_after.successful_launches > production_before.successful_launches,
+        "production Auto HF replay completed without a FlashInfer launch"
+    );
+    eprintln!(
+        "qwen35 hf_golden_gate [production Auto]: selected_backend={} object_sha256={} successful_launches={} -> {}",
+        production_after.selected_backend,
+        production_after.artifact_sha256,
+        production_before.successful_launches,
+        production_after.successful_launches,
+    );
 }
 
 #[test]

@@ -106,76 +106,31 @@ struct ActiveRequest {
     graph_slot_idx: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExecutorGdnPrefillBackend {
-    Auto,
-    Triton,
-    FlashInfer,
-}
-
 pub struct Qwen35Executor {
     model: Qwen35Model,
     graph_state: BatchDecodeGraphState,
     active: Vec<ActiveRequest>,
-    gdn_prefill_backend: ExecutorGdnPrefillBackend,
 }
 
 impl Qwen35Executor {
     pub fn from_runtime(model_path: &str, device_ordinal: usize, max_batch: usize) -> Result<Self> {
         let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
-        Self::from_model(model, ExecutorGdnPrefillBackend::Auto)
-    }
-
-    pub fn from_runtime_with_triton_gdn(
-        model_path: &str,
-        device_ordinal: usize,
-        max_batch: usize,
-    ) -> Result<Self> {
-        let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
-        Self::from_model(model, ExecutorGdnPrefillBackend::Triton)
-    }
-
-    /// Build the low-level accuracy executor with the pinned FlashInfer GDN
-    /// candidate selected explicitly for every prefill chunk. This is a
-    /// test/benchmark seam over the same production dispatch boundary.
-    pub fn from_runtime_with_flashinfer_gdn(
-        model_path: &str,
-        device_ordinal: usize,
-        max_batch: usize,
-    ) -> Result<Self> {
-        let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
-        model.require_flashinfer_gdn_for_test()?;
-        Self::from_model(model, ExecutorGdnPrefillBackend::FlashInfer)
-    }
-
-    fn from_model(
-        model: Qwen35Model,
-        gdn_prefill_backend: ExecutorGdnPrefillBackend,
-    ) -> Result<Self> {
         model.tune_decode_gemm_algos()?;
         let graph_state = model.create_batch_decode_graph_state()?;
         Ok(Self {
             model,
             graph_state,
             active: Vec::new(),
-            gdn_prefill_backend,
         })
     }
 
-    /// Return candidate identity and launch proof for the explicit FlashInfer
-    /// constructor. A standard Triton executor has no such evidence.
+    /// Return production backend identity and launch proof when Auto selected
+    /// the build-linked FlashInfer specialization.
     pub fn flashinfer_gdn_runtime_evidence(&self) -> Result<Option<GdnPrefillRuntimeEvidence>> {
-        match self.gdn_prefill_backend {
-            ExecutorGdnPrefillBackend::Auto => self
-                .model
-                .flashinfer_gdn_runtime_evidence()
-                .map(Some)
-                .or_else(|_| Ok(None)),
-            ExecutorGdnPrefillBackend::Triton => Ok(None),
-            ExecutorGdnPrefillBackend::FlashInfer => {
-                self.model.flashinfer_gdn_runtime_evidence().map(Some)
-            }
-        }
+        self.model
+            .flashinfer_gdn_runtime_evidence()
+            .map(Some)
+            .or_else(|_| Ok(None))
     }
 
     pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
@@ -225,22 +180,9 @@ impl Qwen35Executor {
             .map(|_| RecurrentState::new(self.model.device_ctx(), self.model.config()))
             .collect::<Result<_>>()?;
         let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
-        let logits = match self.gdn_prefill_backend {
-            ExecutorGdnPrefillBackend::Auto => {
-                self.model
-                    .batch_prefill_logits(&prompts, &mut kv_states, &mut recurrent_refs)?
-            }
-            ExecutorGdnPrefillBackend::Triton => self.model.batch_prefill_logits_triton(
-                &prompts,
-                &mut kv_states,
-                &mut recurrent_refs,
-            )?,
-            ExecutorGdnPrefillBackend::FlashInfer => self.model.batch_prefill_logits_flashinfer(
-                &prompts,
-                &mut kv_states,
-                &mut recurrent_refs,
-            )?,
-        };
+        let logits =
+            self.model
+                .batch_prefill_logits(&prompts, &mut kv_states, &mut recurrent_refs)?;
 
         let requested_logprobs: Vec<usize> = plan.requests.iter().map(|req| req.logprobs).collect();
         let cpu_logits =
