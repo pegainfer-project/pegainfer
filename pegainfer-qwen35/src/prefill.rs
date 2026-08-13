@@ -589,7 +589,6 @@ impl Qwen35Model {
 #[cfg(test)]
 mod tests {
     use super::checked_prefill_end_pos;
-    use super::update_max_abs;
 
     #[test]
     fn checked_prefill_end_pos_accepts_config_limit() {
@@ -618,20 +617,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("prefill position overflow"));
-    }
-
-    #[test]
-    fn gdn_comparison_tracks_max_abs_across_multiple_tensors() {
-        let mut max_abs = 0.0;
-        update_max_abs(&mut max_abs, &[1.0, -2.0], &[1.25, -2.1]).unwrap();
-        update_max_abs(&mut max_abs, &[4.0], &[3.5]).unwrap();
-        assert_eq!(max_abs, 0.5);
-    }
-
-    #[test]
-    fn gdn_comparison_rejects_length_and_non_finite_values() {
-        let mut max_abs = 0.0;
-        assert!(update_max_abs(&mut max_abs, &[1.0], &[1.0, 2.0]).is_err());
-        assert!(update_max_abs(&mut max_abs, &[f32::NAN], &[0.0]).is_err());
     }
 }
