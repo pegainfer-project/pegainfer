@@ -211,11 +211,13 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) attn_out: HiddenStates,
     pub(crate) attn_proj: HiddenStates,
     /// Fused QKV projection output [q_dim + 2*kv_dim, bs]
-    qkv_out: HiddenStates,
+    pub(crate) qkv_out: Option<HiddenStates>,
     /// Split MLP gate projection output [intermediate_size, bs].
-    pub(crate) gate_out: HiddenStates,
+    pub(crate) gate_out: Option<HiddenStates>,
     /// Split MLP up projection output [intermediate_size, bs].
-    pub(crate) up_out: HiddenStates,
+    pub(crate) up_out: Option<HiddenStates>,
+    /// Fused MLP gate/up projection output [2*intermediate_size, bs].
+    pub(crate) gate_up_out: Option<HiddenStates>,
     pub(crate) mlp_act: HiddenStates,
     pub(crate) mlp_out: HiddenStates,
     pub(crate) hidden: HiddenStates,
@@ -284,6 +286,7 @@ impl BatchDecodeBuffers {
         padding_page_id: i32,
         num_qo_heads: usize,
         max_context_tokens: usize,
+        fused_decode_projections: bool,
     ) -> Result<Self> {
         let bs = max_batch_size;
         // One construction-time policy snapshot sizes the split-KV workspace and is recorded in
@@ -320,9 +323,18 @@ impl BatchDecodeBuffers {
             v: HiddenStates::zeros(ctx, kv_dim, bs)?,
             attn_out: HiddenStates::zeros(ctx, q_dim, bs)?,
             attn_proj: HiddenStates::zeros(ctx, hidden_dim, bs)?,
-            qkv_out: HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, bs)?,
-            gate_out: HiddenStates::zeros(ctx, intermediate_size, bs)?,
-            up_out: HiddenStates::zeros(ctx, intermediate_size, bs)?,
+            qkv_out: fused_decode_projections
+                .then(|| HiddenStates::zeros(ctx, q_dim + 2 * kv_dim, bs))
+                .transpose()?,
+            gate_out: (!fused_decode_projections)
+                .then(|| HiddenStates::zeros(ctx, intermediate_size, bs))
+                .transpose()?,
+            up_out: (!fused_decode_projections)
+                .then(|| HiddenStates::zeros(ctx, intermediate_size, bs))
+                .transpose()?,
+            gate_up_out: fused_decode_projections
+                .then(|| HiddenStates::zeros(ctx, 2 * intermediate_size, bs))
+                .transpose()?,
             mlp_act: HiddenStates::zeros(ctx, intermediate_size, bs)?,
             mlp_out: HiddenStates::zeros(ctx, hidden_dim, bs)?,
             hidden: HiddenStates::zeros(ctx, hidden_dim, bs)?,
@@ -370,9 +382,18 @@ impl BatchDecodeBuffers {
         self.v.seq_len = bs;
         self.attn_out.seq_len = bs;
         self.attn_proj.seq_len = bs;
-        self.qkv_out.seq_len = bs;
-        self.gate_out.seq_len = bs;
-        self.up_out.seq_len = bs;
+        if let Some(qkv_out) = &mut self.qkv_out {
+            qkv_out.seq_len = bs;
+        }
+        if let Some(gate_out) = &mut self.gate_out {
+            gate_out.seq_len = bs;
+        }
+        if let Some(up_out) = &mut self.up_out {
+            up_out.seq_len = bs;
+        }
+        if let Some(gate_up_out) = &mut self.gate_up_out {
+            gate_up_out.seq_len = bs;
+        }
         self.mlp_act.seq_len = bs;
         self.mlp_out.seq_len = bs;
         self.hidden.seq_len = bs;
@@ -550,6 +571,7 @@ mod tests {
             0,
             1,
             max_context_tokens,
+            false,
         )
         .expect("buffer alloc");
 

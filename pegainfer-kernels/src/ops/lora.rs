@@ -312,3 +312,78 @@ fn validate_group_projection(
         "LoRA output row range exceeds output hidden dimension"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use half::bf16;
+
+    use super::*;
+
+    #[test]
+    fn decode_delta_respects_gate_up_row_offsets() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let max_loras = 1;
+        let max_rank = 1;
+        let rank = 1;
+        let in_dim = 2;
+        let out_dim = 3;
+        let batch = 2;
+
+        let a_packed = ctx
+            .stream
+            .clone_htod(&[bf16::from_f32(1.0), bf16::from_f32(0.0)])?;
+        let scales = ctx.stream.clone_htod(&[1.0_f32])?;
+        let token_slots = ctx.stream.clone_htod(&[0_i32, 0_i32])?;
+        let input = HiddenStates {
+            data: ctx.stream.clone_htod(&[
+                bf16::from_f32(2.0),
+                bf16::from_f32(10.0),
+                bf16::from_f32(4.0),
+                bf16::from_f32(20.0),
+            ])?,
+            hidden_dim: in_dim,
+            seq_len: batch,
+        };
+
+        let b_src = ctx.stream.clone_htod(&[
+            bf16::from_f32(1.0),
+            bf16::from_f32(2.0),
+            bf16::from_f32(3.0),
+        ])?;
+        let mut b_packed = ctx.stream.alloc_zeros(out_dim * max_rank)?;
+        pack_lora_b_rows_into(&ctx, &b_src, &mut b_packed, 0, rank, max_rank, out_dim)?;
+
+        let mut gate_up = HiddenStates::zeros(&ctx, 2 * out_dim, batch)?;
+        for row_offset in [0, out_dim] {
+            lora_decode_fused_delta_into(
+                &ctx,
+                &a_packed,
+                &b_packed,
+                &scales,
+                &token_slots,
+                &input,
+                &mut gate_up,
+                max_loras,
+                max_rank,
+                rank,
+                out_dim,
+                row_offset,
+            )?;
+        }
+
+        ctx.sync()?;
+        let actual = ctx.stream.clone_dtoh(&gate_up.data)?;
+        let expected = [
+            2.0_f32, 4.0, 6.0, 2.0, 4.0, 6.0, 4.0, 8.0, 12.0, 4.0, 8.0, 12.0,
+        ];
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                bf16::from_f32(*expected).to_bits(),
+                "gate/up LoRA row-offset mismatch at element {index}"
+            );
+        }
+        Ok(())
+    }
+}

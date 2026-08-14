@@ -36,7 +36,9 @@ use pegainfer_core::tensor::HiddenStates;
 use pegainfer_kernels::tensor::AxisTag;
 use pegainfer_kernels::tensor::Hidden;
 use pegainfer_kernels::tensor::InDim;
+use pegainfer_kernels::tensor::Inter2;
 use pegainfer_kernels::tensor::Intermediate;
+use pegainfer_kernels::tensor::OutTotal;
 use pegainfer_kernels::tensor::QDim;
 use pegainfer_kernels::tensor::Vocab;
 
@@ -231,6 +233,34 @@ impl<'a> BatchDecodeDag<'a> {
         )
     }
 
+    pub(crate) fn qkv_proj(
+        &self,
+        label: DagLabel,
+        weight: &DeviceMatrix,
+        x: &HiddenStates,
+        out: &mut HiddenStates,
+    ) {
+        self.gemm::<OutTotal, Hidden>(label, weight, x, out);
+    }
+
+    pub(crate) fn split_qkv(
+        &self,
+        label: DagLabel,
+        qkv: &HiddenStates,
+        q: &mut HiddenStates,
+        k: &mut HiddenStates,
+        v: &mut HiddenStates,
+    ) -> Result<()> {
+        #[cfg(feature = "kernel-call-trace")]
+        Self::record(call_spec::split_qkv_call(
+            label,
+            q.hidden_dim,
+            k.hidden_dim,
+            qkv.seq_len,
+        ));
+        pegainfer_kernels::ops::split_qkv_into(&self.model.ctx, qkv, q, k, v)
+    }
+
     pub(crate) fn paged_decode_attention(
         &self,
         label: DagLabel,
@@ -358,6 +388,16 @@ impl<'a> BatchDecodeDag<'a> {
         self.gemm_rows::<Intermediate>(label, weight, out.hidden_dim, out.hidden_dim, x, out);
     }
 
+    pub(crate) fn mlp_gate_up_proj(
+        &self,
+        label: DagLabel,
+        weight: &DeviceMatrix,
+        x: &HiddenStates,
+        out: &mut HiddenStates,
+    ) {
+        self.gemm::<Inter2, Hidden>(label, weight, x, out);
+    }
+
     pub(crate) fn silu_mul_split(
         &self,
         label: DagLabel,
@@ -372,6 +412,21 @@ impl<'a> BatchDecodeDag<'a> {
             gate.seq_len,
         ));
         pegainfer_kernels::ops::silu_mul_batch_into(&self.model.ctx, gate, up, out)
+    }
+
+    pub(crate) fn silu_mul_fused(
+        &self,
+        label: DagLabel,
+        gate_up: &HiddenStates,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        #[cfg(feature = "kernel-call-trace")]
+        Self::record(silu_mul_fused_batch_call(
+            label,
+            out.hidden_dim,
+            gate_up.seq_len,
+        ));
+        pegainfer_kernels::ops::silu_mul_fused_batch_into(&self.model.ctx, gate_up, out)
     }
 
     pub(crate) fn down_proj(

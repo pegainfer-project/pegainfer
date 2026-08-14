@@ -667,6 +667,7 @@ fn tune_decode_gemm_algos(
     let q_dim = model.local_q_dim();
     let kv_dim = model.local_kv_dim();
     let intermediate = model.local_intermediate_size();
+    let fused_projections = model.fused_decode_projections();
 
     if numeric_policy() == NumericPolicy::Pin {
         // Eager pin before capture: the lazy pin-workspace alloc is illegal mid-capture.
@@ -703,23 +704,40 @@ fn tune_decode_gemm_algos(
         })
         .collect();
     let o_samples: Vec<_> = layers.iter().map(|l| (&l.attention.o_proj, 0)).collect();
-    let gate_up_samples: Vec<_> = layers
-        .iter()
-        .flat_map(|l| {
-            [
-                (&l.mlp.gate_up_proj, 0),
-                (&l.mlp.gate_up_proj, intermediate),
-            ]
-        })
-        .collect();
+    let gate_up_samples: Vec<_> = if fused_projections {
+        layers.iter().map(|l| (&l.mlp.gate_up_proj, 0)).collect()
+    } else {
+        layers
+            .iter()
+            .flat_map(|l| {
+                [
+                    (&l.mlp.gate_up_proj, 0),
+                    (&l.mlp.gate_up_proj, intermediate),
+                ]
+            })
+            .collect()
+    };
     let down_samples: Vec<_> = layers.iter().map(|l| (&l.mlp.down_proj, 0)).collect();
     let lm_head_samples = [(model.output_projection(), 0)];
 
     for &n in BATCH_BUCKETS.iter().filter(|&&b| b <= ops::GEMM_LT_MAX_N) {
-        ops::gemm_lt_tune(ctx, &q_samples, q_dim, n)?;
-        ops::gemm_lt_tune(ctx, &kv_samples, kv_dim, n)?;
+        if fused_projections {
+            ops::gemm_lt_tune(ctx, &q_samples, q_dim + 2 * kv_dim, n)?;
+        } else {
+            ops::gemm_lt_tune(ctx, &q_samples, q_dim, n)?;
+            ops::gemm_lt_tune(ctx, &kv_samples, kv_dim, n)?;
+        }
         ops::gemm_lt_tune(ctx, &o_samples, hidden, n)?;
-        ops::gemm_lt_tune(ctx, &gate_up_samples, intermediate, n)?;
+        ops::gemm_lt_tune(
+            ctx,
+            &gate_up_samples,
+            if fused_projections {
+                2 * intermediate
+            } else {
+                intermediate
+            },
+            n,
+        )?;
         ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
         ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
     }
@@ -1256,6 +1274,35 @@ impl Qwen3Executor {
         dflash_draft_path: Option<&str>,
         memory_options: Qwen3MemoryOptions,
     ) -> Result<Self> {
+        Self::from_runtime_with_decode_environment(
+            model_path,
+            enable_cuda_graph,
+            device_ordinals,
+            lora_options,
+            offload_options,
+            max_prefill_tokens,
+            dflash_draft_path,
+            memory_options,
+            crate::DecodeOverlap::Off,
+        )
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::too_many_arguments,
+        reason = "executor construction is a one-shot ownership boundary"
+    )]
+    pub(crate) fn from_runtime_with_decode_environment(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinals: &[usize],
+        lora_options: Qwen3LoraOptions,
+        offload_options: Qwen3OffloadOptions,
+        max_prefill_tokens: usize,
+        dflash_draft_path: Option<&str>,
+        memory_options: Qwen3MemoryOptions,
+        decode_overlap: crate::DecodeOverlap,
+    ) -> Result<Self> {
         let mut memory_options = memory_options.validate()?;
         let lora_options = lora_options.validate()?;
         anyhow::ensure!(
@@ -1277,6 +1324,8 @@ impl Qwen3Executor {
                     device_ordinal: device_ordinals[0],
                     max_loras: lora_options.max_loras,
                     max_lora_rank: lora_options.max_lora_rank,
+                    decode_overlap,
+                    dflash_enabled: dflash_draft_path.is_some(),
                 },
             )?;
             // The DFlash draft model loads after profiling but lives outside the
@@ -1325,6 +1374,8 @@ impl Qwen3Executor {
                     device_ordinal,
                     max_loras: lora_options.max_loras,
                     max_lora_rank: lora_options.max_lora_rank,
+                    decode_overlap,
+                    dflash_enabled: false,
                 },
             )?);
         }
@@ -3177,6 +3228,7 @@ impl LocalQwen3Lane {
             padding_block_id,
             model.local_num_attention_heads(),
             model.config().max_position_embeddings,
+            model.fused_decode_projections(),
         )?;
         let sample_scratch = pegainfer_sample::SampleScratch::new(
             model.device_ctx(),

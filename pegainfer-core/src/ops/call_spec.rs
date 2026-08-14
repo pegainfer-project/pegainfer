@@ -229,6 +229,19 @@ pub fn silu_mul_fused_batch_call(
         .output("out", hidden_batch::<Intermediate>(inter, batch))
 }
 
+pub fn split_qkv_call(
+    label: impl Into<String>,
+    q_dim: usize,
+    kv_dim: usize,
+    batch: usize,
+) -> KernelCall {
+    KernelCall::new("split_qkv", label)
+        .input("qkv", hidden_batch::<OutTotal>(q_dim + 2 * kv_dim, batch))
+        .output("q", hidden_batch::<QDim>(q_dim, batch))
+        .output("k", hidden_batch::<KvDim>(kv_dim, batch))
+        .output("v", hidden_batch::<KvDim>(kv_dim, batch))
+}
+
 pub fn all_reduce_hidden_call(label: impl Into<String>, hidden: usize, batch: usize) -> KernelCall {
     KernelCall::new("all_reduce_hidden", label)
         .input("x", hidden_batch::<Hidden>(hidden, batch))

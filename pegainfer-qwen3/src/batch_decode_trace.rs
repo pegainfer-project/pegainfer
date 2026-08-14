@@ -93,6 +93,7 @@ pub fn trace_decode_kernel_calls(
         kv_mgr.pool().padding_block_id(),
         model.local_num_attention_heads(),
         model.config().max_position_embeddings,
+        model.fused_decode_projections(),
     )?;
     // This trace path bypasses the serving executor (which warms the pinned shapes at startup);
     // warm here, outside `collect_result` below so it isn't recorded as a kernel call.
