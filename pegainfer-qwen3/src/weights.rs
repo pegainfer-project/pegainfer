@@ -340,7 +340,7 @@ pub(crate) struct Qwen3Model {
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
     pub(super) tensor_parallel: TensorParallelConfig,
-    pub(super) projection_fusion: crate::projection_fusion::Qwen3ProjectionFusionPlan,
+    pub(super) decode_projection_path: crate::projection_fusion::DecodeProjectionPath,
     tp_comm: Option<Comm>,
     lora_adapters: HashMap<String, DeviceLoraAdapter>,
     packed_lora: PackedLoraRegistry,
@@ -388,7 +388,7 @@ impl Qwen3Model {
     }
 
     pub(crate) const fn fused_decode_projections(&self) -> bool {
-        self.projection_fusion.decode()
+        self.decode_projection_path.is_fused()
     }
 
     pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {

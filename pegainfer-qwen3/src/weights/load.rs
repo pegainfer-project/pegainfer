@@ -25,8 +25,7 @@ use super::Qwen3Model;
 use super::TransformerBlock;
 use crate::config::Config;
 use crate::config::TensorParallelConfig;
-use crate::projection_fusion::ProjectionFusionEnvironment;
-use crate::projection_fusion::Qwen3ProjectionFusionPlan;
+use crate::projection_fusion::select_decode_projection_path;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ModelRuntimeConfig {
@@ -76,17 +75,14 @@ impl Qwen3Model {
         let config = Config::from_file(model_path)?;
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         tensor_parallel.validate_for(&config)?;
-        let projection_fusion = Qwen3ProjectionFusionPlan::resolve(
-            &config,
+        let decode_projection_path = select_decode_projection_path(
             tensor_parallel,
-            ProjectionFusionEnvironment {
-                numeric_policy: pegainfer_kernels::ops::numeric_policy(),
-                decode_overlap: runtime.decode_overlap,
-                dflash_enabled: runtime.dflash_enabled,
-            },
+            pegainfer_kernels::ops::numeric_policy(),
+            runtime.decode_overlap,
+            runtime.dflash_enabled,
         );
         if tensor_parallel.rank == 0 {
-            info!("projection fusion: resolved={projection_fusion:?}");
+            info!("decode projection path: resolved={decode_projection_path:?}");
         }
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
@@ -284,7 +280,7 @@ impl Qwen3Model {
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
             tensor_parallel,
-            projection_fusion,
+            decode_projection_path,
             tp_comm: None,
             lora_adapters: HashMap::new(),
             packed_lora: PackedLoraRegistry::empty(runtime.max_loras, num_hidden_layers),

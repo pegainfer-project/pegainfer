@@ -1,150 +1,107 @@
 use pegainfer_kernels::ops::NumericPolicy;
 
 use crate::DecodeOverlap;
-use crate::config::Config;
 use crate::config::TensorParallelConfig;
 
-/// The measured production policy for Qwen3 projection fusion.
+/// The production path for Qwen3 decode projections.
 ///
 /// Fusion is one atomic decode topology: QKV and gate/up are either both
-/// fused or both split. Unsupported model/runtime topologies fail closed to
+/// fused or both split. Unsupported runtime topologies fail closed to
 /// the established split-GEMM path. The policy is intentionally GPU-agnostic;
 /// each device still tunes its own cuBLASLt projection shapes at startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Qwen3ProjectionFusionPlan {
-    decode: bool,
+pub(crate) enum DecodeProjectionPath {
+    Split,
+    FusedQkvGateUp,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ProjectionFusionEnvironment {
-    pub(crate) numeric_policy: NumericPolicy,
-    pub(crate) decode_overlap: DecodeOverlap,
-    pub(crate) dflash_enabled: bool,
-}
-
-impl Qwen3ProjectionFusionPlan {
-    pub(crate) fn resolve(
-        config: &Config,
-        tensor_parallel: TensorParallelConfig,
-        environment: ProjectionFusionEnvironment,
-    ) -> Self {
-        Self {
-            decode: is_qwen3_4b(config)
-                && tensor_parallel.world_size == 1
-                && environment.numeric_policy == NumericPolicy::Tuned
-                && matches!(environment.decode_overlap, DecodeOverlap::Off)
-                && !environment.dflash_enabled,
-        }
-    }
-
-    pub(crate) const fn decode(self) -> bool {
-        self.decode
+impl DecodeProjectionPath {
+    pub(crate) const fn is_fused(self) -> bool {
+        matches!(self, Self::FusedQkvGateUp)
     }
 }
 
-const fn is_qwen3_4b(config: &Config) -> bool {
-    config.hidden_size == 2560
-        && config.intermediate_size == 9728
-        && config.num_hidden_layers == 36
-        && config.num_attention_heads == 32
-        && config.num_key_value_heads == 8
-        && config.head_dim == 128
-        && config.vocab_size == 151_936
+pub(crate) fn select_decode_projection_path(
+    tensor_parallel: TensorParallelConfig,
+    numeric_policy: NumericPolicy,
+    decode_overlap: DecodeOverlap,
+    dflash_enabled: bool,
+) -> DecodeProjectionPath {
+    if tensor_parallel.world_size == 1
+        && numeric_policy == NumericPolicy::Tuned
+        && matches!(decode_overlap, DecodeOverlap::Off)
+        && !dflash_enabled
+    {
+        DecodeProjectionPath::FusedQkvGateUp
+    } else {
+        DecodeProjectionPath::Split
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn qwen3_4b() -> Config {
-        Config {
-            hidden_size: 2560,
-            intermediate_size: 9728,
-            num_hidden_layers: 36,
-            num_attention_heads: 32,
-            num_key_value_heads: 8,
-            head_dim: 128,
-            vocab_size: 151_936,
-            rms_norm_eps: 1.0e-6,
-            rope_theta: 1.0e6,
-            max_position_embeddings: 40_960,
-            eos_token_id: 151_645,
-            tie_word_embeddings: true,
-            stop_token_ids: vec![151_645],
-        }
-    }
-
-    fn environment() -> ProjectionFusionEnvironment {
-        ProjectionFusionEnvironment {
-            numeric_policy: NumericPolicy::Tuned,
-            decode_overlap: DecodeOverlap::Off,
-            dflash_enabled: false,
-        }
-    }
-
     #[test]
-    fn enables_only_qualified_tp1_decode() {
-        let plan = Qwen3ProjectionFusionPlan::resolve(
-            &qwen3_4b(),
+    fn enables_qualified_qwen3_tp1_decode() {
+        let path = select_decode_projection_path(
             TensorParallelConfig::default(),
-            environment(),
+            NumericPolicy::Tuned,
+            DecodeOverlap::Off,
+            false,
         );
-        assert!(plan.decode());
+        assert_eq!(path, DecodeProjectionPath::FusedQkvGateUp);
+        assert!(path.is_fused());
     }
 
     #[test]
-    fn fails_closed_outside_qualified_environment() {
-        let mut other_model = qwen3_4b();
-        other_model.hidden_size = 4096;
-
-        let mut pin = environment();
-        pin.numeric_policy = NumericPolicy::Pin;
-        let mut per_token = environment();
-        per_token.numeric_policy = NumericPolicy::PerToken;
-        let mut overlap = environment();
-        overlap.decode_overlap = DecodeOverlap::SharedSm;
-        let mut green_ctx = environment();
-        green_ctx.decode_overlap = DecodeOverlap::GreenCtx { decode_pct: 20 };
-        let mut dflash = environment();
-        dflash.dflash_enabled = true;
-
+    fn fails_closed_outside_qualified_runtime_environment() {
         let cases = [
-            Qwen3ProjectionFusionPlan::resolve(
-                &qwen3_4b(),
+            select_decode_projection_path(
                 TensorParallelConfig {
                     rank: 0,
                     world_size: 2,
                 },
-                environment(),
+                NumericPolicy::Tuned,
+                DecodeOverlap::Off,
+                false,
             ),
-            Qwen3ProjectionFusionPlan::resolve(
-                &other_model,
+            select_decode_projection_path(
                 TensorParallelConfig::default(),
-                environment(),
+                NumericPolicy::Pin,
+                DecodeOverlap::Off,
+                false,
             ),
-            Qwen3ProjectionFusionPlan::resolve(&qwen3_4b(), TensorParallelConfig::default(), pin),
-            Qwen3ProjectionFusionPlan::resolve(
-                &qwen3_4b(),
+            select_decode_projection_path(
                 TensorParallelConfig::default(),
-                per_token,
+                NumericPolicy::PerToken,
+                DecodeOverlap::Off,
+                false,
             ),
-            Qwen3ProjectionFusionPlan::resolve(
-                &qwen3_4b(),
+            select_decode_projection_path(
                 TensorParallelConfig::default(),
-                overlap,
+                NumericPolicy::Tuned,
+                DecodeOverlap::SharedSm,
+                false,
             ),
-            Qwen3ProjectionFusionPlan::resolve(
-                &qwen3_4b(),
+            select_decode_projection_path(
                 TensorParallelConfig::default(),
-                green_ctx,
+                NumericPolicy::Tuned,
+                DecodeOverlap::GreenCtx { decode_pct: 20 },
+                false,
             ),
-            Qwen3ProjectionFusionPlan::resolve(
-                &qwen3_4b(),
+            select_decode_projection_path(
                 TensorParallelConfig::default(),
-                dflash,
+                NumericPolicy::Tuned,
+                DecodeOverlap::Off,
+                true,
             ),
         ];
 
-        assert!(cases.into_iter().all(|plan| !plan.decode()));
+        assert!(
+            cases
+                .into_iter()
+                .all(|path| path == DecodeProjectionPath::Split && !path.is_fused())
+        );
     }
 }
