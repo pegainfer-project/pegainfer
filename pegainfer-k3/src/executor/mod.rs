@@ -120,9 +120,14 @@ const K3_MEGA_SMS: usize = 152;
 const K3_MEGA_EP_SIZES: [usize; 2] = [1, 4];
 
 /// Slots per rank an expert-parallel launch takes when nothing says otherwise.
-/// Well inside the fused kernel's 384-row protocol maximum, and the value every
-/// EP gate and serve run has been measured at.
-const K3_EP_DEFAULT_MAX_BATCH: usize = 16;
+///
+/// The fused kernel's protocol maximum is 384 rows per rank, so the compiled
+/// bucket ceiling (128) is the target once the backbone goes FP8. Today the
+/// binding constraint is the KDA state slab: ~929 MB per slot (f32 recurrent
+/// x2 parity + conv windows across 69 layers), so 64 slots cost ~58 GiB —
+/// what fits next to the 224-expert rank's weights with room left for the
+/// paged MLA pool. An explicit `PEGAINFER_K3_MAX_BATCH` still wins.
+const K3_EP_DEFAULT_MAX_BATCH: usize = 64;
 
 /// What a launch decides about an executor before its weights are read.
 #[derive(Clone, Copy, Debug)]
