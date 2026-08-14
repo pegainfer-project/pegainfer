@@ -177,7 +177,10 @@ __global__ void scaled_add_rows_indexed_kernel(
          row < rows;
          row += gridDim.x * blockDim.x) {
       int delta_idx = token * rows + row;
-      int out_idx = out_token * out_hidden_dim + row_offset + row;
+      // out_token * out_hidden_dim overflows i32 for large row pools (the K3
+      // paged-KV slab exceeds 2^31 elements), so the element index is size_t.
+      size_t out_idx =
+          (size_t)out_token * out_hidden_dim + row_offset + row;
       float base = __bfloat162float(out[out_idx]);
       float add = __bfloat162float(delta[delta_idx]) * scale;
       out[out_idx] = __float2bfloat16(base + add);

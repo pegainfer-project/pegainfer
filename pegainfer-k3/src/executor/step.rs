@@ -71,6 +71,7 @@ use super::buffers::K3_KDA_FUSED;
 use super::buffers::K3_KDA_WSM_PADDED;
 use super::buffers::K3_MLA_FUSED;
 use super::buffers::K3LayerState;
+use super::buffers::K3PagedKv;
 use super::buffers::K3Scratch;
 use super::buffers::K3StatePool;
 use super::buffers::parity_pair;
@@ -156,11 +157,14 @@ pub(crate) fn k3_decode_step(
     let b = shape.bucket;
     let K3StatePool {
         layers: layer_state,
+        kv,
         blocks: snapshots,
         block_count,
         ..
     } = state;
     let block_count = *block_count;
+    // Index of the current MLA layer within the paged pool's layer slices.
+    let mut mla_index = 0usize;
 
     embedding_rows_into(
         ctx,
@@ -218,7 +222,8 @@ pub(crate) fn k3_decode_step(
                 )?;
             }
             (K3LayerAttention::Mla(mla), K3LayerState::Mla(mla_state)) => {
-                mla_attention(ctx, b, shape, layer, mla, mla_state, scratch)?;
+                mla_attention(ctx, b, shape, layer, mla, mla_state, kv, mla_index, scratch)?;
+                mla_index += 1;
             }
             _ => anyhow::bail!("K3 layer state does not match the layer's attention kind"),
         }
@@ -591,6 +596,7 @@ fn kda_conv_stream(
 
 // ── MLA ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn mla_attention(
     ctx: &DeviceContext,
     b: usize,
@@ -598,6 +604,8 @@ fn mla_attention(
     layer: &K3LayerWeights,
     w: &K3MlaWeights,
     state: &mut super::buffers::K3MlaState,
+    kv: &mut K3PagedKv,
+    mla_index: usize,
     s: &mut K3Scratch,
 ) -> Result<()> {
     k3_rms_norm_rbs_batched_launch(
@@ -668,6 +676,11 @@ fn mla_attention(
         &w.gamma_kv_a.data,
         &mut s.kv_norm,
     )?;
+    // Paged latent append: the post-norm kv latent and the shared rope half
+    // are the whole cached quantity (NoPE — nothing here is
+    // position-dependent), written into this layer's slice of the row's
+    // current page.
+    kv.append_latent(ctx, mla_index, b, &s.kv_row, &s.kv_norm, &s.rope.data)?;
     k3_gemm_full(ctx, &w.w_q_b, &s.q_norm, b, &mut s.q_partial)?;
     k3_land_batched_launch(
         ctx,

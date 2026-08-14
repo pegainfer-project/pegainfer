@@ -154,6 +154,7 @@ fn config(fixture: &Fixture) -> K3ExecutorConfig {
     K3ExecutorConfig {
         max_batch: MAX_BATCH,
         max_ctx: fixture.max_ctx,
+        kv_pages: 0,
         num_layers: fixture.num_layers,
         // Eager either way: EP forces capture off and the reference has to
         // match. (The single-rank mega path does capture; this pins it off so

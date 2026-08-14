@@ -133,6 +133,7 @@ fn executor(
     let config = K3ExecutorConfig {
         max_batch,
         max_ctx: golden.max_ctx,
+        kv_pages: 0,
         num_layers: golden.num_layers,
         cuda_graph,
         moe_transport,
