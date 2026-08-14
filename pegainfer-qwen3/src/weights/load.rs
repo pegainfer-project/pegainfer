@@ -6,6 +6,8 @@ use std::time::Instant;
 use anyhow::Result;
 use log::debug;
 use log::info;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::weight_loader::FusedPart;
 use pegainfer_core::weight_loader::SlotId;
@@ -15,7 +17,6 @@ use pegainfer_core::weight_loader::WeightPrefetch;
 use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::mmap_shards;
-use pegainfer_core::weight_loader::precompute_rope;
 
 use super::Attention;
 use super::MLP;
@@ -208,9 +209,12 @@ impl Qwen3Model {
         debug!("Precomputing RoPE cache on GPU");
         let (cos_cache, sin_cache) = precompute_rope(
             &ctx,
-            config.head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
+            &RopeTableSpec {
+                rotary_dim: config.head_dim,
+                frequency_dim: config.head_dim,
+                max_seq_len: config.max_position_embeddings,
+                theta: config.rope_theta,
+            },
         )?;
 
         loader.finish()?;

@@ -11,6 +11,8 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 use cudarc::driver::sys;
 use half::bf16;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::rope::precompute_rope;
 use pegainfer_kernels::ffi;
 use pegainfer_kernels::ops::PrefillPagedPlan;
 use pegainfer_kernels::ops::prefill_attention_paged_into;
@@ -603,8 +605,15 @@ impl AttentionPrefillCase {
         let output = HiddenStates::zeros(&ctx, q_dim, batch_size * seq_len)?;
         let q_norm = DeviceVec::from_host(&ctx, &vec![bf16::from_f32(1.0); HEAD_DIM])?;
         let k_norm = DeviceVec::from_host(&ctx, &vec![bf16::from_f32(1.0); HEAD_DIM])?;
-        let cos_cache = DeviceVec::from_host(&ctx, &rope_cache_bf16(seq_len, true))?;
-        let sin_cache = DeviceVec::from_host(&ctx, &rope_cache_bf16(seq_len, false))?;
+        let (cos_cache, sin_cache) = precompute_rope(
+            &ctx,
+            &RopeTableSpec {
+                rotary_dim: HEAD_DIM,
+                frequency_dim: HEAD_DIM,
+                max_seq_len: seq_len,
+                theta: 1e6,
+            },
+        )?;
         let kv_buffer = ctx
             .stream
             .clone_htod(&patterned_bf16(total_pages * layout.page_stride, 0.001))?;
@@ -1297,19 +1306,22 @@ impl DenseCase {
                 let positions: Vec<i32> = (0..rows)
                     .map(|i| ((i * 997) % DENSE_ROPE_CACHE_TOKENS) as i32)
                     .collect();
+                let (cos_cache, sin_cache) = precompute_rope(
+                    &ctx,
+                    &RopeTableSpec {
+                        rotary_dim: HEAD_DIM,
+                        frequency_dim: HEAD_DIM,
+                        max_seq_len: DENSE_ROPE_CACHE_TOKENS,
+                        theta: 1e6,
+                    },
+                )?;
                 DenseBuffers::QkRope {
                     q: hidden_of(&ctx, Q_DIM, rows, 0.01)?,
                     k: hidden_of(&ctx, KV_DIM, rows, 0.01)?,
                     q_norm: ones_vec(&ctx, HEAD_DIM)?,
                     k_norm: ones_vec(&ctx, HEAD_DIM)?,
-                    cos_cache: DeviceVec::from_host(
-                        &ctx,
-                        &rope_cache_bf16(DENSE_ROPE_CACHE_TOKENS, true),
-                    )?,
-                    sin_cache: DeviceVec::from_host(
-                        &ctx,
-                        &rope_cache_bf16(DENSE_ROPE_CACHE_TOKENS, false),
-                    )?,
+                    cos_cache,
+                    sin_cache,
                     positions: ctx.stream.clone_htod(&positions)?,
                 }
             }
@@ -1489,23 +1501,4 @@ fn patterned_bf16(len: usize, scale: f32) -> Vec<bf16> {
     (0..len)
         .map(|i| bf16::from_f32((((i % 251) as f32) - 125.0) * scale))
         .collect()
-}
-
-fn rope_cache_bf16(seq_len: usize, cos: bool) -> Vec<bf16> {
-    let half_dim = HEAD_DIM / 2;
-    let inv_freq: Vec<f32> = (0..half_dim)
-        .map(|i| 1.0 / 1_000_000.0f32.powf(i as f32 * 2.0 / HEAD_DIM as f32))
-        .collect();
-    let mut out = vec![bf16::ZERO; seq_len * HEAD_DIM];
-    for pos in 0..seq_len {
-        let base = pos * HEAD_DIM;
-        for (i, inv_freq) in inv_freq.iter().copied().enumerate() {
-            let angle = pos as f32 * inv_freq;
-            let value = if cos { angle.cos() } else { angle.sin() };
-            let value = bf16::from_f32(value);
-            out[base + i] = value;
-            out[base + i + half_dim] = value;
-        }
-    }
-    out
 }

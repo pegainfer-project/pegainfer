@@ -83,6 +83,121 @@ until the model crate proves their contracts.
 | `glm52.deepgemm.scale_layout` | future GLM5.2 model crate | `ops::glm52_deepgemm_mn_major_tma_aligned_f32_launch` | `glm52_deepgemm_mn_major_tma_aligned_f32_cuda` | `csrc/glm52/glm52_deepgemm_layout.cu` | CUDA layout helper for DeepGEMM | Converts row-major f32 scales `[rows, scale_cols]` into MN-major/TMA-aligned storage with `aligned_rows` padded to 16-byte f32 row alignment. |
 | `glm52.flashmla.sparse_decode` | future GLM5.2 model crate | `ops::glm52_flashmla_sparse_decode_num_sm_parts`, `ops::glm52_flashmla_sparse_decode_metadata_launch`, `ops::glm52_flashmla_sparse_decode_launch` | `glm52_flashmla_sparse_decode_num_sm_parts_cuda`, `glm52_flashmla_sparse_decode_metadata_cuda`, `glm52_flashmla_sparse_decode_launch_cuda` | `csrc/glm52/glm52_flashmla_sparse.cu` | FlashMLA SM90 sparse decode | SM90-only sparse decode for V32 layout: `batch<=128`, `heads=64`, `qk_dim=576`, `v_dim=512`, `page_size=64`, packed KV token stride `656`, fixed `topk=2048`, and `num_sm_parts<=160`. Dynamic `topk_length` is intentionally not exposed because this kernel asserts it must be null. |
 
+## Kimi-K3 TileLang Decode Surface
+
+K3 uses the `pegainfer-kernels/k3` feature. The surface is TileLang-generated
+CUDA, AOT-compiled at build time from the vendored kernel definitions in
+`pegainfer-k3/kernels/tilelang_defs.py` (byte-identical to the certified
+upstream spellings — see `pegainfer-k3/kernels/README.md` for the generate /
+pre-generated / stub build tiers). It covers every non-GEMM step of a K3
+decode iteration; dense projections go to cuBLASLt and the routed experts to
+the DeepGEMM masked grouped-GEMM chain below.
+
+Every kernel here is **batched and compiled per static shape tuple** — expert
+count, attention-residual block count, MLA context capacity and the batch
+bucket are all baked in. There is no separate single-row kernel set: `b = 1`
+is a bucket whose per-row spelling is the certified single-row kernel, which
+is what the upstream bitwise gate proves. Buckets are
+`{1,2,4,8,16,32,48,64,96,128}` and `ops::k3_batch_bucket` rounds the live row
+count up, so callers must size buffers for the bucket, not for the live rows,
+and the discarded tail rows must still point at valid memory.
+
+Each family is one translation unit with one hand-written `extern "C"`
+dispatch launcher keyed on the configuration tuple; launchers return a raw
+`cudaError_t`, with `cudaErrorInvalidValue` for a configuration that was never
+instantiated and `cudaErrorNotSupported` from the stub tier.
+
+Per-slot state tensors (`conv_silu` windows, `kda_core` recurrent state, MLA
+`Kc`/`Vc`) are `[b, ...]` contiguous with each row holding exactly the
+single-row layout — the caches are slot-indexed, not paged, and there is no
+block table.
+
+K3 dimensions the instantiations are derived from: hidden `7168`, KDA
+`96x128`, MLA `96` heads with `qk=192`/`v=128`, q LoRA `1536`, kv LoRA `512`,
+routed latent `3584`, MoE intermediate `3072` (shared `6144`), dense
+intermediate `33792`, top-k `16`, vocab `163840`, split-K `8`.
+
+The f32 side inputs are f32 on purpose: the checkpoint stores the router
+correction bias, `conv1d.weight`, `dt_bias`, `A_log` and `o_norm.weight` as
+f32, and narrowing any of them to bf16 measurably flips routing decisions.
+
+| op_id | Runtime owner | Rust wrapper | FFI symbol | Source (OUT_DIR `.cu`) | Backend | Shape / layout notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `k3.norm.rms_rbs` | `pegainfer-k3` | `ops::k3_rms_norm_rbs_batched_launch` | `k3_rms_norm_rbs_batched` | `k3_rms_norm_rbs_batched.cu` | TileLang AOT CUDA | KimiRMSNorm, round-before-scale: the normalized value lands bf16 *before* multiplying gamma. One row per block; `X`/`O` are `[b, h]` bf16 and gamma `[h]` is shared. h ∈ {7168, 512, 3584} (layer norms, MLA kv latent, routed latent) × 10 buckets; eps compiled in. |
+| `k3.linear.land` | `pegainfer-k3` | `ops::k3_land_batched_launch` | `k3_land_batched` | `k3_land_batched.cu` | TileLang AOT CUDA | Merge the column span `[off, off+n)` of each row's `[split_k, nt]` f32 partial and land bf16 once — the landing of every matmul. 14 (nt, n, off) spans × 10 buckets, split_k = 1 only — the single partial a framework GEMM (cuBLASLt, DeepGEMM) produces, where the merge degenerates to the slice and the cast. Masked tail store, so `n` need not divide 256. |
+| `k3.linear.land_rms_rbs` | `pegainfer-k3` | `ops::k3_land_rms_norm_rbs_batched_launch` | `k3_land_rms_norm_rbs_batched` | `k3_land_rms_norm_rbs_batched.cu` | TileLang AOT CUDA | `k3_land_batched` fused with the round-before-scale norm. One span — MLA q_a, `[0, 1536)` of the `14400`-wide fused projection — × 10 buckets, split_k = 1. |
+| `k3.elementwise.add2` | `pegainfer-k3` | `ops::k3_add2_batched_launch` | `k3_add2_batched` | `k3_add2_batched.cu` | TileLang AOT CUDA | `O = A + Bt` in bf16 addition (residual adds, routed + shared). n = 7168 × 10 buckets. |
+| `k3.elementwise.mul_sigmoid` | `pegainfer-k3` | `ops::k3_mul_sigmoid_batched_launch` | `k3_mul_sigmoid_batched` | `k3_mul_sigmoid_batched.cu` | TileLang AOT CUDA | `O = A * bf16(sigmoid(Bt))`, the MLA sigmoid output gate; the sigmoid is taken in f32 and lands bf16 before the product. n = 12288 × 10 buckets. |
+| `k3.act.situ` | `pegainfer-k3` | `ops::k3_situ_batched_launch` | `k3_situ_batched` | `k3_situ_batched.cu` | TileLang AOT CUDA | `4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)` in f32, landing bf16 once; the betas are compiled in. n ∈ {6144 (shared), 33792 (dense)} × 10 buckets; the routed-expert situ is fused into the masked chain and the mega kernel, so no wide routed instantiation exists here. |
+| `k3.kda.conv_silu` | `pegainfer-k3` | `ops::k3_conv_silu_batched_launch` | `k3_conv_silu_batched` | `k3_conv_silu_batched.cu` | TileLang AOT CUDA | Causal depthwise convolution over the 4-slot window plus silu, one token per row. Consumes the projection's `[b, split_k, 12288]` f32 partial: its bf16 landing is `X`, the newest window slot; `Sn` is the shifted state the caller carries. Conv weights `[4, 12288]` are **f32** and have no batch axis; the window state is `[b, 3, 12288]`, one independent window per row. split_k = 1 × 10 buckets. |
+| `k3.kda.core` | `pegainfer-k3` | `ops::k3_kda_core_batched_launch` | `k3_kda_core_batched` | `k3_kda_core_batched.cu` | TileLang AOT CUDA | One delta-rule step per row, one (row, head) per block, `threads = head_dim`. State `[b, 96, 128, 128]` f32 laid out `[head, v_dim, k_dim]` per row with decay along k, read from `State` and written to `StateN` (must not alias). `Dt`/`Alog`/`Go` f32 weights with no batch axis, `Bt`/`G2` bf16; gate lower bound and eps compiled in. Gate partial uses split-K 1. 10 buckets. |
+| `k3.attn.mla_decode` | `pegainfer-k3` | `ops::k3_mla_attn_batched_launch` | `k3_mla_attn_batched` | `k3_mla_attn_batched.cu` | TileLang AOT CUDA | NoPE full-context attention, one (row, head) per block (no GQA — all 96 heads hold their own K). The cache is **slot indexed**: each row owns a fixed `max_ctx` window and `Kc`/`Vc` are the contiguous single-row blocks, so this is not a paged cache and there is no block table. `N` is a per-row device i32 length and slots at or past it score NEG, so the step needs no host sync and a row at length `l` is bit-identical to the single-row kernel at `l`. Score landings follow the eager chain (f32 dot → bf16 → × bf16 scale → bf16 → f32 softmax → bf16 probabilities). max_ctx ∈ {128} × 10 buckets; both the instantiation count and the per-block shared memory scale with the capacity, so extending the list is a one-line but deliberate change in `generate.py`. |
+| `k3.moe.router_topk` | `pegainfer-k3` | `ops::k3_router_topk_batched_launch` | `k3_router_topk_batched` | `k3_router_topk_batched.cu` | TileLang AOT CUDA | Sigmoid router + biased top-k over already-merged `[b, E]` f32 score rows, one row per block. Serial O(topk*E) scan by thread 0 with lowest-index tie-break; weights gathered from the **un-biased** scores, denominator `+1e-20`, scaled by the bf16 `Rs[0]`. E ∈ {896 (full table), 224 (4-way EP shard)}, TOPK = 16, × 10 buckets. |
+| `k3.attnres.scores` | `pegainfer-k3` | `ops::k3_attnres_scores_batched_launch` | `k3_attnres_scores_batched` | `k3_attnres_scores_batched.cu` | TileLang AOT CUDA | Attention-residual candidate scoring, one block per (row, candidate): weightless RMS normalization then a dot with the pre-fused f32 scoring vector `[7168]`. Candidate `NB` is that row's prefix sum, below it its own snapshot history `[b, NB, 7168]`. NB ∈ 1..8 (the history grows one entry per 12 layers over 93 layers) × 10 buckets. |
+| `k3.attnres.mix` | `pegainfer-k3` | `ops::k3_attnres_mix_batched_launch` | `k3_attnres_mix_batched` | `k3_attnres_mix_batched.cu` | TileLang AOT CUDA | Softmax over each row's `NB+1` scores, then a probability-weighted mix of the **un-normalized** candidates landing bf16 once. Grid `(b, 7168/256)`; each block redoes its row's softmax. NB ∈ 1..8 × 10 buckets. |
+
+## Kimi-K3 MoE Bring-Up Surface
+
+Kimi-K3 uses the `pegainfer-kernels/k3` feature. Unlike `glm52`, `k3` does not
+depend on the `moe` substrate — there is no DeepEP/NCCL requirement yet — but it
+does require the DeepGEMM submodule, whose device headers the FP8xFP4 masked
+grouped GEMM is AOT-instantiated from (no JIT, no torch).
+
+Per-expert shapes: W13 is the fused gate|up projection with `n=6144`, `k=3584`;
+W2 is the down projection with `n=3584`, `k=3072`. Local expert-group counts are
+instantiated for 56 (EP4 dev / EP16 full), 112 (EP8 full), and 224 (single-GPU
+bring-up).
+
+The A side is the FP8 e4m3 / per-1x128 UE8M0 activation recipe GLM5.2 uses. The
+B side is MXFP4: e2m1 weights packed K-major two-per-byte, with group-32 UE8M0
+scale factors. Both scale operands land in the same Blackwell packed-UE8M0 i32
+layout `[groups, ceil(k / gran_k / 4), mn]` (MN-major, 4 exponent bytes per i32,
+LSB first), but the differing granularity gives them different packed K extents:
+`k/512` for the activation, `k/128` for the weights.
+
+| op_id | Runtime owner | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `k3.deepgemm.masked_grouped_fp8_fp4` | `pegainfer-k3` | `ops::k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch` | `k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch_cuda` | `csrc/k3/k3_deepgemm_fp8_fp4_grouped_sm100.cu` | DeepGEMM SM100 MGroupedMasked (tcgen05) | Activation `[groups, masked_cap, k]` fp8 e4m3, act scale i32 `[groups, k/512, masked_cap]`, weight `[groups, n, k]` fp4 e2m1 (2 per byte), weight scale i32 `[groups, k/128, n]`, out `[groups, masked_cap, n]` bf16. `masked_cap % 128 == 0`; `groups` dispatches over {56, 112, 224}; `num_sms` selects the B200 (148) / GB300 (152) instantiation. Requires sm_100f — NOT_SUPPORTED stub otherwise. |
+| `k3.deepgemm.fp4_sf_prepare` | `pegainfer-k3` | `ops::k3_fp4_sf_prepare_launch` | `k3_fp4_sf_prepare_cuda` | `csrc/k3/k3_deepgemm_fp8_fp4_grouped_sm100.cu` | CUDA layout helper for DeepGEMM | Loader-time repack of checkpoint MXFP4 weight scales `[groups, n, k/32]` u8 UE8M0 exponent bytes (K-major) into the MN-major packed SFB tensor `[groups, k/128, n]` i32. Transpose plus 4:1 pack; not a step-time kernel. |
+
+The batched-decode chain around that GEMM lives in `csrc/k3/k3_moe_chain.cu`.
+An *entry* is one expanded `(token, topk-slot)` pair at index
+`token * topk + slot`; entry order is the chain's deterministic order (it fixes
+the masked row each entry lands in and the combine's accumulation order), and an
+entry whose `topk_idx` falls outside `[0, groups)` is inactive — that is how
+padded batch rows, and later an EP shard's non-local experts, are excluded.
+Every consumer re-reads `topk_idx` rather than trusting the slot map alone. The
+local gather is fused into the W13 quant, so no bf16 expert-major staging buffer
+exists. Nothing allocates, reads back, or varies its launch geometry with device
+state, so the chain is CUDA-graph capturable; `tests/k3_moe_chain_gate.rs` is
+the end-to-end numerical gate (and asserts two runs are bit-identical).
+
+| op_id | Runtime owner | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `k3.moe.local_route_metadata` | `pegainfer-k3` | `ops::k3_moe_local_route_metadata_launch` | `k3_moe_local_route_metadata_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | `topk_idx [tokens, topk]` i32 -> `masked_m [groups]` i32 and `slot_map [tokens * topk]` i32 (`expert * masked_cap + rank`, `-1` when inactive). One block per expert compacts that expert's entries in entry order with a ballot scan, so the row assignment is scheduling-independent; the `-1` fill is partitioned by `entry % groups`, disjoint from the claimed writes. An expert claiming more than `masked_cap` entries traps. |
+| `k3.moe.gather_fp8_quant_masked` | `pegainfer-k3` | `ops::k3_moe_gather_fp8_quant_masked_launch` | `k3_moe_gather_fp8_quant_masked_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | Local gather fused with the W13 A-operand quant: bf16 `[tokens, hidden]` read through the routing map -> fp8 e4m3 `[groups * masked_cap, hidden]` plus MN-major UE8M0 f32 scales `[groups, hidden/128, masked_cap]`. Grid `(min(entries, 256), hidden/128)` x 128 threads, grid-strided over entries. `hidden % 128 == 0`. |
+| `k3.moe.situ_and_mul_fp8_quant_masked` | `pegainfer-k3` | `ops::k3_situ_and_mul_fp8_quant_masked_launch` | `k3_situ_and_mul_fp8_quant_masked_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | K3 situ activation over the masked W13 output `[groups * masked_cap, 2*inter]` bf16 (gate = first `inter` columns) followed by the W2 A-operand quant. In f32 over the bf16 GEMM output: `4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)`. Router weights are **not** applied here. Out fp8 `[groups * masked_cap, inter]` + f32 scales `[groups, inter/128, masked_cap]`. |
+| `k3.moe.fp8_scale_pack_ue8m0` | `pegainfer-k3` | `ops::k3_fp8_scale_pack_ue8m0_launch` | `k3_fp8_scale_pack_ue8m0_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | f32 MN-major group scales `[groups, scale_cols, cap]` -> packed UE8M0 i32 SFA `[groups, scale_cols/4, cap]`, LSB-first exponent bytes. Dense full-cover pass (no stale byte can reach the GEMM); inputs must already be powers of two, which the two quant kernels guarantee. `scale_cols = k/128`, multiple of 4. |
+| `k3.moe.weighted_combine` | `pegainfer-k3` | `ops::k3_moe_weighted_combine_launch` | `k3_moe_weighted_combine_cuda` | `csrc/k3/k3_moe_chain.cu` | CUDA | Masked W2 output `[groups * masked_cap, hidden]` bf16 x `topk_weight [tokens, topk]` f32 -> `[tokens, hidden]` bf16. Grid `(tokens, ceil(hidden/256))`; each thread owns one column and accumulates its token's topk slots **in slot order** in f32 with no atomics, rounding to bf16 once. Tokens with no active entry land an exact zero, so the output is fully covered. |
+
+## Kimi-K3 MegaMoE Surface
+
+The production MoE transport: one fused DeepGEMM "mega" kernel per MoE layer
+covers dispatch, the two grouped GEMMs, situ, and combine across all EP ranks
+via NVLink peer access, synchronizing with device-side barriers (no host
+collectives). `ranks ∈ {1, 4}` × 3 block configs × 2 activations are
+AOT-instantiated; the serving path pins the block config to the protocol
+maximum on every rank and step so peer traffic shapes are invariant.
+`tests/k3_mega_parity_gate.rs` holds the kernel at bit parity with the
+reference implementation.
+
+| op_id | Runtime owner | Rust wrapper | FFI symbol | Source | Backend | Shape / layout notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| `k3.moe.mega` | `pegainfer-k3` | `ops::k3_mega_moe_launch` | `k3_mega_moe_launch_cuda` | `csrc/k3/k3_mega_moe_sm100.cu` | DeepGEMM SM100 fused MoE (tcgen05) | End-to-end routed-expert layer over the rank's symmetric buffer: fp8 e4m3 x (gran-8 interleaved) fp4 W13, situ, fp8 x fp4 W2, routing weights applied **before** W2, cross-rank dispatch/combine in-kernel. Requires every rank's buffer pointer table and identical block config fleet-wide; 152-SM instantiation. |
+| `k3.moe.mega_quant_x` | `pegainfer-k3` | `ops::k3_mega_write_inputs_launch` | `k3_mega_quant_x_cuda`, `k3_mega_write_routing_cuda` | `csrc/k3/k3_mega_moe_sm100.cu` | CUDA | Step-time input staging into the symm buffer: activation quant to fp8 e4m3 at gran-32 with packed ue8m0 scales, plus the routing table write (`topk_idx`/weights) the mega kernel reads. |
+| `k3.moe.mega_prepare` | `pegainfer-k3` | `ops::k3_mega_prepare_l1_weights_launch`, `ops::k3_mega_prepare_sf_launch` | `k3_mega_prepare_sf_cuda` | `csrc/k3/k3_mega_moe_sm100.cu` | CUDA layout helpers | Load-time weight transforms: gran-8 gate/up interleave of W13 and the UTCCP 4×32 scale-factor transpose. Not step-time kernels. |
+| `k3.moe.mega_symm` | `pegainfer-k3` | `ops::k3_mega_symm_buffer_layout`, `ops::k3_mega_open_peer_access`, `ops::k3_mega_token_alignment` | `k3_mega_symm_buffer_layout_cuda`, `k3_mega_open_peer_access`, `k3_mega_token_alignment` | `csrc/k3/k3_mega_moe_sm100.cu` | Host helpers | Symmetric-buffer sizing/offsets, peer-access grants (both `cudaDeviceEnablePeerAccess` **and** `cudaMemPoolSetAccess` — pool grant must precede slab allocation for `cudaMallocAsync` memory), and the 384-token alignment constant. |
+
 ## Non-Qwen3 Compatibility
 
 The crate still builds CUDA/Triton symbols needed by the current root binary:
@@ -95,7 +210,7 @@ These are preserved for build compatibility. They are not part of the Qwen3-4B P
 
 ## Editing Rule
 
-When adding or replacing a kernel used by Qwen3-4B, Kimi-K2, or GLM5.2,
+When adding or replacing a kernel used by Qwen3-4B, Kimi-K2, GLM5.2, or K3,
 update this routing table.
 
 Do not add model-specific machine-readable manifests here. The kernels crate
