@@ -9,18 +9,59 @@ validates the manifest, then statically links the exported native object and
 The source lock pins FlashInfer and the small HKV state-layout specialization.
 The generator emits only the production Hv32 candidate. SM120 +
 Hq/Hk/Hv/D=`16/16/32/128`, BF16 inputs, FP32 HKV state, single GPU is eligible
-for production selection. Other capabilities retain the Triton path; a
-selected but invalid bundle fails at build time.
+for production selection. Other capabilities retain the Triton path. An
+eligible configuration requires the validated AOT object and does not silently
+fall back when that object was not linked.
 
-The canonical generator CLI is:
+## Contract-validated local generation
+
+Run these commands from the repository root. The artifact contract currently
+requires Python 3.12.3 exactly; use an interpreter with that version rather
+than the serving or Triton environment.
+
+Initialize the pinned FlashInfer source and create an isolated generation
+environment:
 
 ```bash
-python3 pegainfer-kernels/tools/flashinfer_gdn/generate.py --help
+git submodule update --init \
+  pegainfer-kernels/third_party/flashinfer
+
+python3 -c \
+  'import sys; assert sys.version.split()[0] == "3.12.3", sys.version'
+python3 -m venv target/flashinfer-gdn-cu13-venv
+
+export PEGAINFER_GDN_AOT_PYTHON="$PWD/target/flashinfer-gdn-cu13-venv/bin/python"
+
+"$PEGAINFER_GDN_AOT_PYTHON" -m pip install \
+  -r pegainfer-kernels/tools/flashinfer_gdn/requirements-cu13.lock
 ```
 
-Its generation-only CUDA 13 environment is pinned in
-`requirements-cu13.lock`. The output must be generated with that lock and the
-pinned FlashInfer submodule; retired CUDA 12.8/PTX workflows are not supported.
+The version assertion stops immediately unless `python3` is exactly Python
+3.12.3. The generation-only CUDA 13 packages are pinned in
+`requirements-cu13.lock`; they are not serving dependencies. Retired CUDA
+12.8/PTX generation workflows are not supported.
+
+Generate a fresh production-only bundle. The generator refuses to overwrite
+an existing output directory, so remove or rename an old local output before
+reusing the same path.
+
+```bash
+"$PEGAINFER_GDN_AOT_PYTHON" \
+  pegainfer-kernels/tools/flashinfer_gdn/generate.py \
+  --python "$PEGAINFER_GDN_AOT_PYTHON" \
+  --flashinfer-dir pegainfer-kernels/third_party/flashinfer \
+  --output target/flashinfer-gdn-sm120
+```
+
+The only generated variant is
+`target/flashinfer-gdn-sm120/qwen35_4b_candidate/`.
+
+The contract pins and validates the source, patch, generator, package versions,
+compiler metadata, ABI, geometry, and hashes recorded by each bundle. Repeated
+generation has been byte-identical on the same host, but cross-host object
+identity is not currently guaranteed. Release distribution must therefore
+preserve and validate the complete bundle and its manifest rather than assume a
+globally fixed object hash.
 
 Host-side source, state-layout, and package-contract checks:
 
@@ -38,10 +79,33 @@ python3 pegainfer-kernels/tools/flashinfer_gdn/artifact_contract.py \
   --flashinfer-dir pegainfer-kernels/third_party/flashinfer
 ```
 
-At build time, `PEGAINFER_QWEN35_GDN_AOT_BUNDLE` points to the validated
-`qwen35_4b_candidate/` directory. `pegainfer-kernels/build.rs` rechecks schema,
-SM, geometry, ABI, object/header/runtime hashes and sizes before linking. The
-model crate never receives this path and sees only a semantic GDN operation.
+For a Qwen3.5 release build, point the kernel build at the validated variant.
+Qwen3.5 still needs its normal build-time Triton AOT environment; see
+[`../triton/README.md`](../triton/README.md).
+
+```bash
+export PEGAINFER_QWEN35_GDN_AOT_BUNDLE="$PWD/target/flashinfer-gdn-sm120/qwen35_4b_candidate"
+export PEGAINFER_CUDA_SM=120
+export PEGAINFER_TRITON_PYTHON="$PWD/.venv/bin/python"
+
+cargo build --release \
+  -p pegainfer-server \
+  --no-default-features \
+  --features qwen35 \
+  --bin pegainfer
+```
+
+When `PEGAINFER_QWEN35_GDN_AOT_BUNDLE` is set, `pegainfer-kernels/build.rs`
+rechecks schema, SM, geometry, ABI, object/header/runtime hashes and sizes. A
+missing, incomplete, or incompatible selected path fails the build instead of
+silently linking a different kernel.
+
+When the variable is not set, the build contains no FlashInfer GDN object.
+Unsupported SM, geometry, or tensor-parallel configurations still use the
+explicit Triton capability fallback. The supported SM120/Hv32/single-GPU
+configuration instead fails model startup with a missing-AOT error; it does not
+silently change backend. The model crate never receives the bundle path and
+sees only a semantic GDN operation.
 
 Generated headers, objects, static archives, bundles, model weights, `target/`,
 logs, and benchmark JSON are release/build artifacts and must not be committed.
