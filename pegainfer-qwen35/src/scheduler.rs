@@ -1245,12 +1245,8 @@ fn publish_load(
     num_waiting_reqs: usize,
 ) {
     let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
-    let (num_running_reqs, num_waiting_reqs) = logical_load_counts(
-        active,
-        prefilling,
-        inflight_prefill_reqs,
-        num_waiting_reqs,
-    );
+    let (num_running_reqs, num_waiting_reqs) =
+        logical_load_counts(active, prefilling, inflight_prefill_reqs, num_waiting_reqs);
     load_tx.send_replace(SchedulerMetrics {
         kv_used_blocks: kv_total_blocks
             .saturating_sub(backend.available_pages(active, prefilling) as u64),
@@ -1511,14 +1507,7 @@ fn scheduler_loop(
                 );
                 return;
             }
-            publish_load(
-                &load_tx,
-                &backend,
-                &active,
-                &prefilling,
-                0,
-                pending.len(),
-            );
+            publish_load(&load_tx, &backend, &active, &prefilling, 0, pending.len());
             if pending.is_empty() {
                 continue;
             }

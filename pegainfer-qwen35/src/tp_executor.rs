@@ -1681,9 +1681,30 @@ fn recv_runtime_responses(
     operation: &'static str,
     poison: &TpRuntimePoison,
 ) -> Result<Vec<TpWorkerResponse>> {
+    collect_runtime_responses(expected, operation, poison, || {
+        recv_runtime_response(responses, operation, poison)
+    })
+}
+
+fn collect_runtime_responses(
+    expected: usize,
+    operation: &'static str,
+    poison: &TpRuntimePoison,
+    mut recv_next: impl FnMut() -> Result<TpWorkerResponse>,
+) -> Result<Vec<TpWorkerResponse>> {
     let mut collected = Vec::with_capacity(expected);
     for _ in 0..expected {
-        collected.push(recv_runtime_response(responses, operation, poison)?);
+        let response = recv_next()?;
+        if let Err(err) = &response.result {
+            // A failed rank may leave peers blocked in a collective, so response-set
+            // completeness is no longer recoverable or useful.
+            let reason = poison.poison(format!(
+                "rank {} failed during {operation}: {err:#}",
+                response.rank
+            ));
+            return Err(anyhow::anyhow!(reason));
+        }
+        collected.push(response);
     }
     Ok(collected)
 }
@@ -2026,6 +2047,32 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("rank 1 failed"));
+        assert!(poison.ensure_healthy().is_err());
+    }
+
+    #[test]
+    fn runtime_response_collection_fails_fast_when_peer_never_responds() {
+        let poison = TpRuntimePoison::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send(TpWorkerResponse {
+            rank: 0,
+            result: Err(anyhow::anyhow!("rank 0 failed")),
+        })
+        .unwrap();
+        let _keep_peer_channel_connected = tx;
+        let mut receive_attempts = 0;
+
+        let err = collect_runtime_responses(2, "test", &poison, || {
+            receive_attempts += 1;
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .map_err(|err| anyhow::anyhow!("waited for nonresponding rank: {err}"))
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(receive_attempts, 1, "collector waited for the missing rank");
+        assert!(err.contains("rank 0 failed"));
+        assert!(!err.contains("waited for nonresponding rank"));
         assert!(poison.ensure_healthy().is_err());
     }
 
