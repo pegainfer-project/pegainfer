@@ -6,7 +6,7 @@
 //! protocol (`Scheduled` before tokens before a single terminal) are structure,
 //! not convention: a `RequestUpdate` cannot express a token after its terminal.
 //! Cross-step ordering is enforced on the producer side by the typestate
-//! handles in [`super::ticket`].
+//! handles in [`super::request_lifecycle`].
 
 use std::fmt;
 use std::time::Instant;
@@ -41,7 +41,7 @@ impl std::fmt::Display for RequestId {
 
 /// One generate request as a frontend submits it. Identity (`RequestId`),
 /// queue timestamp, and the abort flag are minted at submit time and travel in
-/// the [`super::IntakeTicket`] wrapper, not here.
+/// the [`super::QueuedRequest`] wrapper, not here.
 pub struct Request {
     pub prompt_tokens: Vec<u32>,
     pub params: crate::sampler::SamplingParams,

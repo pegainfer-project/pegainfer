@@ -2,13 +2,13 @@
 //! file.
 //!
 //! [`Qwen3Scheduler`] implements [`pegainfer_frontend::engine::Scheduler`]:
-//! the contract's driver polls `intake`/`step`/`load`; everything
+//! the contract's driver polls `submit`/`step`/`load`; everything
 //! south of here ([`crate::scheduler`], the executor) is contract-free and
 //! deals in internal ids and pure effect data. This file owns the only two
 //! contract-facing responsibilities:
 //!
 //! - the **handle registry**: each request's typestate handle
-//!   ([`IntakeTicket`] until admission, [`ActiveRequest`] after) keyed by the
+//!   ([`QueuedRequest`] until admission, [`ActiveRequest`] after) keyed by the
 //!   internal [`RequestId`], and every emitter call that moves one through
 //!   its lifecycle;
 //! - **engine assembly**: building the executor and returning the
@@ -36,13 +36,13 @@ use pegainfer_frontend::engine::DeferredFinish;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::IntakeTicket;
 use pegainfer_frontend::engine::KvCapacity;
 use pegainfer_frontend::engine::LoadSnapshot;
 use pegainfer_frontend::engine::LoraClient;
 use pegainfer_frontend::engine::LoraControl;
 use pegainfer_frontend::engine::LoraControlReceiver;
 use pegainfer_frontend::engine::PromptEcho;
+use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::StepEmitter;
@@ -218,8 +218,8 @@ where
 
 /// One request's contract handle, in whichever lifecycle state it holds.
 enum HandleSlot {
-    /// Submitted, not yet admitted: reject/retire consume the ticket.
-    Queued(IntakeTicket),
+    /// Submitted, not yet admitted: reject/retire consume the handle.
+    Queued(QueuedRequest),
     /// Admitted: token pushes go through it; finish/fail/retire consume it.
     Streaming(ActiveRequest),
 }
@@ -293,18 +293,18 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             && self.inflight_prefill_pending.is_none()
     }
 
-    /// Consume the request's queued ticket for admission. `false` (and full
+    /// Consume the request's queued handle for admission. `false` (and full
     /// cleanup) when the frontend aborted it while it waited.
     fn admit_or_retire(&mut self, req: &PendingRequest, emitter: &mut StepEmitter) -> bool {
-        let Some(HandleSlot::Queued(ticket)) = self.handles.remove(&req.request_id) else {
-            unreachable!("admitted request must hold a queued ticket");
+        let Some(HandleSlot::Queued(queued)) = self.handles.remove(&req.request_id) else {
+            unreachable!("admitted request must hold its queued handle");
         };
-        if ticket.is_aborted() {
-            emitter.retire_ticket(ticket);
+        if queued.is_aborted() {
+            emitter.retire_queued(queued);
             release_rejected(&mut self.executor, &mut self.tracker, req);
             return false;
         }
-        let handle = emitter.admit(ticket);
+        let handle = emitter.admit(queued);
         self.handles
             .insert(req.request_id, HandleSlot::Streaming(handle));
         true
@@ -316,10 +316,10 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         reason: RejectReason,
         emitter: &mut StepEmitter,
     ) {
-        let Some(HandleSlot::Queued(ticket)) = self.handles.remove(&req.request_id) else {
-            unreachable!("rejected request must hold a queued ticket");
+        let Some(HandleSlot::Queued(queued)) = self.handles.remove(&req.request_id) else {
+            unreachable!("rejected request must hold its queued handle");
         };
-        emitter.reject(ticket, reason);
+        emitter.reject(queued, reason);
         release_rejected(&mut self.executor, &mut self.tracker, req);
     }
 
@@ -666,16 +666,16 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
 }
 
 impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
-    fn intake(&mut self, mut ticket: IntakeTicket) {
-        // Already-aborted tickets ride the normal path: admission re-checks
+    fn submit(&mut self, mut req: QueuedRequest) {
+        // Already-aborted requests ride the normal path: admission re-checks
         // the abort flag and retires them (`admit_or_retire`).
-        let request = ticket
+        let request = req
             .take_request()
-            .expect("intake receives tickets with their payload");
+            .expect("queued requests arrive with their payload");
         let id = RequestId(self.next_request_id);
         self.next_request_id += 1;
         self.tracker.enter_queue(id, request.trace_parent);
-        self.handles.insert(id, HandleSlot::Queued(ticket));
+        self.handles.insert(id, HandleSlot::Queued(req));
         let pending = PendingRequest::from_request(id, request);
         if self.pending_control.is_empty() {
             self.deferred.push(pending);
@@ -759,7 +759,8 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             return Ok(());
         }
 
-        // 5. Validate + admit; every verdict consumes the request's ticket.
+        // 5. Validate + admit; every verdict consumes the request's queued
+        //    handle.
         let lora_validation =
             reject_unknown_lora_requests(std::mem::take(&mut self.deferred), &self.executor);
         for rejected in &lora_validation.rejected {

@@ -12,40 +12,41 @@ An engine is a set of schedulers, each a `Scheduler` implementation driven by th
 
 ```
 pegainfer-frontend/src/engine/
-├── step.rs        # the wire: RequestId, Request, StepOutputs { Vec<RequestUpdate> },
-│                  #   RequestUpdate { scheduled, tokens, logprobs, cached_tokens,
-│                  #   prompt_echo, kv_transfer, terminal }, Terminal
-├── ticket.rs      # typestate handles: IntakeTicket ─admit→ ActiveRequest ─finish/
-│                  #   fail/defer→ consumed; every transition is by-move, a dropped
-│                  #   handle emits Failed (drop bomb); DeferredFinish; RequestControl
-├── emitter.rs     # StepEmitter: the single writer of the per-step buffer; stamps
-│                  #   timestamps, tallies prompt/completion counts, folds each
-│                  #   request's step into one RequestUpdate; commit_step sends once
-├── wiring.rs      # scheduler_pair, SchedulerHandle (submit/take_steps/load),
-│                  #   Engine { schedulers, info, lora }, LiveScheduler,
-│                  #   EngineInfo, LaunchedEngine { Handle | Stepped }
-├── control.rs     # LoRA capability — outside the contract: LoraControl vocabulary,
-│                  #   LoraClient (the `Engine.lora: Option<LoraClient>` capability)
-└── driver.rs      # trait Scheduler { intake, step, load } + spawn_scheduler:
-                   #   the contract-owned pure-polling drive loop
+├── step.rs              # the wire: RequestId, Request, StepOutputs { Vec<RequestUpdate> },
+│                        #   RequestUpdate { scheduled, tokens, logprobs, cached_tokens,
+│                        #   prompt_echo, kv_transfer, terminal }, Terminal
+├── request_lifecycle.rs # typestate handles: QueuedRequest ─admit→
+│                        #   ActiveRequest ─finish/fail/defer→ consumed; every
+│                        #   transition is by-move, a dropped handle emits Failed
+│                        #   (drop bomb); DeferredFinish; RequestControl
+├── emitter.rs           # StepEmitter: the single writer of the per-step buffer; stamps
+│                        #   timestamps, tallies prompt/completion counts, folds each
+│                        #   request's step into one RequestUpdate; commit_step sends once
+├── wiring.rs            # scheduler_pair, SchedulerHandle (submit/take_steps/load),
+│                        #   Engine { schedulers, info, lora }, LiveScheduler,
+│                        #   EngineInfo, LaunchedEngine { Handle | Stepped }
+├── control.rs           # LoRA capability — outside the contract: LoraControl vocabulary,
+│                        #   LoraClient (the `Engine.lora: Option<LoraClient>` capability)
+└── driver.rs            # trait Scheduler { submit, step, load } + spawn_scheduler:
+                         #   the contract-owned pure-polling drive loop
 ```
 
 Design decisions worth knowing before touching it:
 
 - **Step-batched wire.** One message per scheduler step, not one channel per request: the scheduler's natural output unit is the step batch, and per-request channels were tried and rejected (the scheduler for-loop over N channels was the bottleneck). The protocol stack demuxes.
 - **Flat `RequestUpdate`.** All facts a step produced for one request travel in one struct, so intra-request ordering is structure, not convention. This is what makes `defer_finish` safe: a P/D prefill executor can withhold a request's `Finished` until its KV saves are peer-visible and send it later from any thread — the deferred message carries the request's entire buffered update, so late delivery cannot reorder.
-- **Typestate lifecycle.** `IntakeTicket` (queued) and `ActiveRequest` (streaming) are owned tokens; admit/reject/retire/finish/fail consume them, so "terminal exactly once, nothing after it" cannot be miscoded — it does not compile. A handle dropped without a transition emits `Failed` from its `Drop`, which is also how a crashed scheduler answers every in-flight request: the driver drops the scheduler, the handles fall, the terminals ship.
+- **Typestate lifecycle.** `QueuedRequest` (queued) and `ActiveRequest` (streaming) are owned tokens; admit/reject/retire/finish/fail consume them, so "terminal exactly once, nothing after it" cannot be miscoded — it does not compile. A handle dropped without a transition emits `Failed` from its `Drop`, which is also how a crashed scheduler answers every in-flight request: the driver drops the scheduler, the handles fall, the terminals ship.
 - **Emitter as single writer.** Schedulers never touch the channel; they call `StepEmitter` methods against their handles. The emitter stamps `ScheduledInfo` at admission, tallies token counts (terminal counts derive from the tally, never from model-side arithmetic), and `commit_step` publishes the whole step in one send.
-- **Pure polling driver.** `spawn_scheduler` owns the serve loop: drain intake, `Scheduler::step`, publish load, commit. No idle/park distinction — the scheduler owns the GPU and spinning on it costs nothing anyone else could use; async KV I/O (prefetch, decode-overlap prefill) is naturally absorbed by polling. An idle iteration ends in a `spin_loop` hint (relaxes the core's issue slots, no latency cost — busy iterations never pause). The loop exits when the frontend drops the handle and the queue drains.
+- **Pure polling driver.** `spawn_scheduler` owns the serve loop: drain submissions, `Scheduler::step`, publish load, commit. No idle/park distinction — the scheduler owns the GPU and spinning on it costs nothing anyone else could use; async KV I/O (prefetch, decode-overlap prefill) is naturally absorbed by polling. An idle iteration ends in a `spin_loop` hint (relaxes the core's issue slots, no latency cost — busy iterations never pause). The loop exits when the frontend drops the handle and the queue drains.
 - **Abort is a flag, not channel teardown.** `SchedulerHandle::submit` returns a `RequestControl`; the frontend flips its boolean abort flag and the scheduler retires the request silently on its next touch (no terminal — the frontend already dropped its state for that id).
-- **Channels:** intake is crossbeam (sync consumer on the scheduler thread), steps are tokio mpsc (async consumer in the bridge); load is a shared cell read via `SchedulerHandle::load()` — pull-only by design, "notify me on load change" is deliberately unrepresentable (the driver busy-polls, so a subscription edge would fire per spin). All channels unbounded on purpose — admission control is the scheduler's job, expressed as `Rejected`, never as backpressure on submit.
+- **Channels:** the submit channel is crossbeam (sync consumer on the scheduler thread), steps are tokio mpsc (async consumer in the bridge); load is a shared cell read via `SchedulerHandle::load()` — pull-only by design, "notify me on load change" is deliberately unrepresentable (the driver busy-polls, so a subscription edge would fire per spin). All channels unbounded on purpose — admission control is the scheduler's job, expressed as `Rejected`, never as backpressure on submit.
 - **Control plane lives outside the contract.** `Scheduler` has no control method and the contract carries no control channel. A capability like LoRA is a private channel the model crate mints *before* `spawn_scheduler` — the scheduler closes over the receiver, the `LoraClient` sender surfaces as `Engine.lora: Option<LoraClient>`, and the `Option` *is* the capability (no `bool` flag, no registry until a second capability exists). The vocabulary (`LoraControl`, `LoraClient`) is still defined in the frontend crate because the frontend must speak it without holding model structs; only the wiring is the model's business.
 
 ### Onboarding checklist for a new model line
 
 1. Implement `Scheduler` (see `Qwen3Scheduler` in `pegainfer-qwen3/src/frontend_adapter.rs` — the whole adaptation is deliberately in one file):
-   - `intake(ticket)` — ownership transfer only: take the payload (`ticket.take_request()`), mint your internal id, park the ticket in a registry. No emitter here by design — `step` is the single emission site, and the driver commits once per iteration so nothing is gained by emitting earlier.
-   - `step(emitter)` — one scheduling step: admit (consume tickets via `emitter.admit`/`reject`), execute, push tokens, finish/fail/retire. Return `Err` only for engine-fatal states.
+   - `submit(req)` — ownership transfer only: take the payload (`req.take_request()`), mint your internal id, park the handle in a registry. No emitter here by design — `step` is the single emission site, and the driver commits once per iteration so nothing is gained by emitting earlier.
+   - `step(emitter)` — one scheduling step: admit (consume queued handles via `emitter.admit`/`reject`), execute, push tokens, finish/fail/retire. Return `Err` only for engine-fatal states.
    - `load()` — KV occupancy + running/waiting counts for routers.
    - Extra capabilities (LoRA etc.) are not trait methods: mint the private channel before spawning, close the scheduler over the receiver, drain it inside `step`.
 2. `spawn_scheduler(name, scheduler)` per scheduler; return `Engine { schedulers, info: EngineInfo { kv_capacity, servable_len }, lora }` — the required-metadata fields are the checklist, and `lora: Some(client)` only when the line actually serves adapter control.
@@ -102,7 +103,7 @@ All six lines are onboarded. Adding a model line = write `model_line.rs` in the 
 | --- | --- |
 | `pegainfer-engine`, `pegainfer-vllm-frontend`, dynamo crates, `bench_serving` | see git history of this doc for the pre-2026-08 consolidation table |
 | Qwen3 `scheduler_loop` / `start_qwen3*` in `scheduler.rs` (double loop + sink plumbing) | contract driver (`driver.rs`) + `frontend_adapter.rs`; `scheduler.rs` is now contract-free mechanics |
-| `TokenSink` send-failure-as-cancellation (qwen3 path) | `RequestControl::abort` flag, observed via `IntakeTicket/ActiveRequest::aborted` |
+| `TokenSink` send-failure-as-cancellation (qwen3 path) | `RequestControl::abort` flag, observed via `QueuedRequest/ActiveRequest::is_aborted` |
 | `EngineCommand` + `EngineHandle` LoRA control methods | `LoraClient` over the model crate's private pre-spawn channel (`Engine.lora: Option<LoraClient>` is the capability); idle-drain policy lives in the qwen3 adapter (`pending_control` + `post_control_deferred`) |
 | Per-request event-order convention (`Scheduled` before tokens, one terminal, enforced by hand) | typestate handles + emitter: illegal orders don't compile; drop bombs turn scheduler bugs into `Failed` terminals instead of client hangs |
 | KV block-event feed (`KvBlockEvent`/`KvStoredBlock`, `EngineHandle::take_kv_events`, qwen3 `ExecutorKvEvents` + `enable_kv_events` plumbing) | none — it never had a consumer. Rebuild from git history when a cache-aware router lands; the natural re-home is a `RequestUpdate`/load-feed sibling on the step contract |

@@ -4,8 +4,9 @@
 //!
 //! - [`step`] — the wire types: `Request`, `RequestId`, `StepOutputs` with
 //!   one flat `RequestUpdate` per touched request per step.
-//! - [`ticket`] — the typestate handles (`IntakeTicket` → `ActiveRequest` →
-//!   consumed) that make the event protocol a move-checked state machine.
+//! - [`request_lifecycle`] — the typestate handles (`QueuedRequest` →
+//!   `ActiveRequest` → consumed) that make the event protocol a move-checked
+//!   state machine.
 //! - [`emitter`] — `StepEmitter`, the scheduler-side single writer of the
 //!   per-step buffer.
 //! - [`wiring`] — `scheduler_pair` wiring, `SchedulerHandle`, and the
@@ -31,9 +32,9 @@ mod event;
 mod handle;
 mod kv;
 mod request;
+mod request_lifecycle;
 mod sink;
 mod step;
-mod ticket;
 mod wiring;
 
 pub use control::*;
@@ -43,7 +44,7 @@ pub use event::*;
 pub use handle::*;
 pub use kv::*;
 pub use request::*;
+pub use request_lifecycle::*;
 pub use sink::*;
 pub use step::*;
-pub use ticket::*;
 pub use wiring::*;

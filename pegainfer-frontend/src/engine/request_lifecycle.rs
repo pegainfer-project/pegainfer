@@ -4,9 +4,9 @@
 //! protocol is enforced by move semantics instead of convention:
 //!
 //! ```text
-//! IntakeTicket ──admit──▶ ActiveRequest ──finish/fail/defer──▶ consumed
-//!      │                        │
-//!      └──reject/retire─────────┴──retire──▶ consumed (silent)
+//! QueuedRequest ──admit──▶ ActiveRequest ──finish/fail/defer──▶ consumed
+//!       │                        │
+//!       └──reject/retire─────────┴──retire──▶ consumed (silent)
 //! ```
 //!
 //! Every transition consumes the handle, so "terminal exactly once" and
@@ -57,26 +57,26 @@ impl HandleCore {
 /// A submitted request the scheduler has not yet answered. Minted only by
 /// [`super::SchedulerHandle::submit`]; consumed by exactly one of
 /// [`super::StepEmitter::admit`], [`super::StepEmitter::reject`], or
-/// [`super::StepEmitter::retire_ticket`].
-pub struct IntakeTicket {
-    /// `Some` until a transition consumes the ticket; `Drop` fires on `Some`.
-    inner: Option<TicketInner>,
+/// [`super::StepEmitter::retire_queued`].
+pub struct QueuedRequest {
+    /// `Some` until a transition consumes the handle; `Drop` fires on `Some`.
+    inner: Option<QueuedInner>,
 }
 
-pub(crate) struct TicketInner {
+pub(crate) struct QueuedInner {
     pub(crate) core: HandleCore,
-    /// Boxed so a ticket stays pointer-small in scheduler registries; `None`
-    /// after [`IntakeTicket::take_request`] moved the payload out.
+    /// Boxed so a queued request stays pointer-small in scheduler registries;
+    /// `None` after [`QueuedRequest::take_request`] moved the payload out.
     request: Option<Box<Request>>,
     /// Cached so admission facts and the drop bomb survive the payload move.
     pub(crate) prompt_len: usize,
     pub(crate) queued_at: Instant,
 }
 
-impl IntakeTicket {
+impl QueuedRequest {
     pub(crate) fn new(core: HandleCore, request: Request, queued_at: Instant) -> Self {
         Self {
-            inner: Some(TicketInner {
+            inner: Some(QueuedInner {
                 core,
                 prompt_len: request.prompt_tokens.len(),
                 request: Some(Box::new(request)),
@@ -85,14 +85,14 @@ impl IntakeTicket {
         }
     }
 
-    fn inner(&self) -> &TicketInner {
+    fn inner(&self) -> &QueuedInner {
         self.inner
             .as_ref()
-            .expect("ticket accessed after consumption")
+            .expect("queued request accessed after consumption")
     }
 
-    pub(crate) fn consume(mut self) -> TicketInner {
-        self.inner.take().expect("ticket consumed twice")
+    pub(crate) fn consume(mut self) -> QueuedInner {
+        self.inner.take().expect("queued request consumed twice")
     }
 
     pub fn id(&self) -> RequestId {
@@ -107,14 +107,14 @@ impl IntakeTicket {
             .expect("request payload already taken")
     }
 
-    /// Move the payload out, leaving a ticket that is still the request's
+    /// Move the payload out, leaving a handle that is still the request's
     /// lifecycle handle (admit/reject/retire and the drop bomb keep working
     /// off the cached prompt length). `None` on a second call — schedulers
-    /// that ingest the payload at intake take it exactly once.
+    /// that ingest the payload on submit take it exactly once.
     pub fn take_request(&mut self) -> Option<Request> {
         self.inner
             .as_mut()
-            .expect("ticket accessed after consumption")
+            .expect("queued request accessed after consumption")
             .request
             .take()
             .map(|request| *request)
@@ -125,13 +125,13 @@ impl IntakeTicket {
     }
 
     /// The frontend stopped wanting this request while it queued. The
-    /// scheduler answers by [`super::StepEmitter::retire_ticket`].
+    /// scheduler answers by [`super::StepEmitter::retire_queued`].
     pub fn is_aborted(&self) -> bool {
         self.inner().core.is_aborted()
     }
 }
 
-impl Drop for IntakeTicket {
+impl Drop for QueuedRequest {
     fn drop(&mut self) {
         let Some(inner) = self.inner.take() else {
             return;

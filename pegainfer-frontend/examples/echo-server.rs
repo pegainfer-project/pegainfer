@@ -30,9 +30,9 @@ use pegainfer_frontend::engine::ActiveRequest;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::IntakeTicket;
 use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::StepEmitter;
 use pegainfer_frontend::engine::spawn_scheduler;
@@ -98,7 +98,7 @@ impl ModelLine for EchoLine {
 /// streaming path warm instead of collapsing the response into one batch.
 #[derive(Default)]
 struct EchoScheduler {
-    queued: Vec<IntakeTicket>,
+    queued: Vec<QueuedRequest>,
     running: Vec<RunningRequest>,
 }
 
@@ -113,22 +113,22 @@ struct RunningRequest {
 }
 
 impl Scheduler for EchoScheduler {
-    fn intake(&mut self, ticket: IntakeTicket) {
-        self.queued.push(ticket);
+    fn submit(&mut self, req: QueuedRequest) {
+        self.queued.push(req);
     }
 
     fn step(&mut self, emitter: &mut StepEmitter) -> Result<()> {
-        for ticket in self.queued.drain(..) {
-            if ticket.is_aborted() {
-                emitter.retire_ticket(ticket);
+        for req in self.queued.drain(..) {
+            if req.is_aborted() {
+                emitter.retire_queued(req);
                 continue;
             }
-            let request = ticket.request();
+            let request = req.request();
             let echo_len = request.prompt_tokens.len().min(request.max_tokens);
             let truncated = echo_len < request.prompt_tokens.len();
             let mut pending = Vec::from(&request.prompt_tokens[..echo_len]);
             pending.reverse();
-            let active = emitter.admit(ticket);
+            let active = emitter.admit(req);
             self.running.push(RunningRequest {
                 active,
                 pending,

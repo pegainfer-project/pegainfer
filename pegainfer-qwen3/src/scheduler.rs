@@ -4,7 +4,7 @@
 //! This module is engine-contract-free: it owns queues of [`PendingRequest`]s
 //! and produces pure [`effects::StepEffects`] data. The serve loop itself
 //! belongs to the contract's driver, and everything that touches the engine
-//! contract (tickets, emitter calls, the `Scheduler` trait) lives in
+//! contract (typestate handles, emitter calls, the `Scheduler` trait) lives in
 //! [`crate::frontend_adapter`] — read that file to see how Qwen3 plugs into
 //! the frontend.
 
@@ -38,7 +38,7 @@ pub(crate) struct ActiveRequestState {
     pub(crate) logprobs: usize,
 }
 
-/// A request between intake and promotion, `Clone` because the decode-overlap
+/// A request between submission and promotion, `Clone` because the decode-overlap
 /// path keeps a copy for async-prefill poll resolution. Its engine-contract
 /// handle lives in the adapter's registry, keyed by `request_id` — never here.
 #[derive(Clone)]

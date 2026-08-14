@@ -165,7 +165,7 @@ impl SteppedEngineBridge {
 
         // Flip every in-flight request's abort flag so the scheduler retires
         // them on its next touch; dropping the partition handle afterwards
-        // disconnects intake and lets the driver drain out.
+        // disconnects the submission channel and lets the driver drain out.
         for state in streams.values() {
             state.control.abort();
         }

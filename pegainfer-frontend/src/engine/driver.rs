@@ -10,7 +10,7 @@
 
 use super::emitter::StepEmitter;
 use super::handle::LoadSnapshot;
-use super::ticket::IntakeTicket;
+use super::request_lifecycle::QueuedRequest;
 use super::wiring::LiveScheduler;
 use super::wiring::SchedulerBackend;
 use super::wiring::scheduler_pair;
@@ -22,8 +22,8 @@ pub trait Scheduler: Send {
     /// every verdict (admit/reject/retire) is emitted from [`Self::step`],
     /// the single emission site. Nothing is lost by deferring: the driver
     /// commits once per iteration, so a verdict buffered in `step` lands in
-    /// the same commit an intake-time verdict would have.
-    fn intake(&mut self, ticket: IntakeTicket);
+    /// the same commit a submit-time verdict would have.
+    fn submit(&mut self, req: QueuedRequest);
 
     /// Advance one step: admission, GPU work, and per-request emission. The
     /// driver loops over this without pause — an idle scheduler returns
@@ -50,25 +50,25 @@ pub fn spawn_scheduler<S: Scheduler + 'static>(name: &str, scheduler: S) -> Live
     LiveScheduler { handle, join }
 }
 
-/// The polling loop. Exits when the frontend is gone (intake disconnected)
-/// and the scheduler reports itself drained, or when `step` reports a fatal
+/// The polling loop. Exits when the frontend is gone (submission channel
+/// disconnected) and the scheduler reports itself drained, or when `step` reports a fatal
 /// error. An idle iteration (nothing running or waiting) ends in a
 /// [`std::hint::spin_loop`] before the next probe; busy iterations never
 /// pause.
 pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
     let SchedulerBackend {
-        intake,
+        submissions,
         mut emitter,
         load,
     } = backend;
-    let mut intake_open = true;
+    let mut submissions_open = true;
     loop {
         loop {
-            match intake.try_recv() {
-                Ok(ticket) => scheduler.intake(ticket),
+            match submissions.try_recv() {
+                Ok(req) => scheduler.submit(req),
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    intake_open = false;
+                    submissions_open = false;
                     break;
                 }
             }
@@ -78,13 +78,13 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
         load.publish(snapshot);
         emitter.commit_step();
         if let Err(error) = step {
-            // Dropping the scheduler drops its held tickets/handles; their
+            // Dropping the scheduler drops its held request handles; their
             // drop bombs answer every in-flight request with `Failed`.
             log::error!("scheduler fatal, engine winding down: {error:#}");
             return;
         }
         if snapshot.num_running_reqs == 0 && snapshot.num_waiting_reqs == 0 {
-            if !intake_open {
+            if !submissions_open {
                 log::info!("scheduler drained after frontend shutdown, exiting");
                 return;
             }
@@ -98,32 +98,32 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::request_lifecycle::ActiveRequest;
     use super::super::step::Request;
     use super::super::step::Terminal;
-    use super::super::ticket::ActiveRequest;
     use super::*;
     use crate::engine::FinishReason;
 
     /// Emits one token per step per request and finishes at `max_tokens`.
     #[derive(Default)]
     struct EchoScheduler {
-        queued: Vec<IntakeTicket>,
+        queued: Vec<QueuedRequest>,
         running: Vec<(ActiveRequest, usize)>,
         fatal_next_step: bool,
     }
 
     impl Scheduler for EchoScheduler {
-        fn intake(&mut self, ticket: IntakeTicket) {
-            self.queued.push(ticket);
+        fn submit(&mut self, req: QueuedRequest) {
+            self.queued.push(req);
         }
 
         fn step(&mut self, emitter: &mut StepEmitter) -> anyhow::Result<()> {
             if self.fatal_next_step {
                 anyhow::bail!("injected fatal");
             }
-            for ticket in self.queued.drain(..) {
-                let max_tokens = ticket.request().max_tokens;
-                let active = emitter.admit(ticket);
+            for req in self.queued.drain(..) {
+                let max_tokens = req.request().max_tokens;
+                let active = emitter.admit(req);
                 self.running.push((active, max_tokens));
             }
             let mut still_running = Vec::new();
@@ -196,7 +196,8 @@ mod tests {
             })
         ));
 
-        // Dropping the handle disconnects intake; a drained scheduler exits.
+        // Dropping the handle disconnects the submission channel; a drained
+        // scheduler exits.
         drop(handle);
         partition.join.join().expect("driver thread exits cleanly");
     }

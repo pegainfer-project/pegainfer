@@ -1,11 +1,11 @@
 //! How K3 plugs into the step-batched engine contract.
 //!
 //! [`K3Scheduler`] implements [`Scheduler`]: the contract's driver polls
-//! `intake` / `step` / `load`, and everything model-side sits behind
+//! `submit` / `step` / `load`, and everything model-side sits behind
 //! [`StepExecutor`]. This module owns the two contract-facing jobs:
 //!
 //! - the **handle registry**: each request's typestate handle
-//!   ([`IntakeTicket`] until admission, [`ActiveRequest`] after), keyed by the
+//!   ([`QueuedRequest`] until admission, [`ActiveRequest`] after), keyed by the
 //!   contract's [`RequestId`], plus every emitter call that moves one along;
 //! - **engine assembly**: wrapping executors in schedulers and returning the
 //!   [`Engine`] bundle a model line hands back from `launch`.
@@ -28,9 +28,9 @@ use pegainfer_frontend::engine::ActiveRequest;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::IntakeTicket;
 use pegainfer_frontend::engine::KvCapacity;
 use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestId;
@@ -122,8 +122,8 @@ fn finish_or_retire(active: ActiveRequest, reason: FinishReason, emitter: &mut S
 
 /// One request's contract handle, in whichever lifecycle state it holds.
 enum HandleSlot {
-    /// Submitted, not yet admitted: reject/retire consume the ticket.
-    Queued(IntakeTicket),
+    /// Submitted, not yet admitted: reject/retire consume the handle.
+    Queued(QueuedRequest),
     /// Admitted: token pushes go through it; finish/fail/retire consume it.
     Streaming(ActiveRequest),
 }
@@ -216,22 +216,22 @@ impl<E: StepExecutor> K3Scheduler<E> {
             let Some(pending) = self.queued.pop_front() else {
                 break;
             };
-            let HandleSlot::Queued(ticket) = self
+            let HandleSlot::Queued(req) = self
                 .handles
                 .remove(&pending.id)
-                .expect("queued request holds its ticket until admission")
+                .expect("queued request holds its handle until admission")
             else {
-                unreachable!("queued request {} must hold a ticket", pending.id);
+                unreachable!("queued request {} must hold a handle", pending.id);
             };
-            if ticket.is_aborted() {
-                emitter.retire_ticket(ticket);
+            if req.is_aborted() {
+                emitter.retire_queued(req);
                 continue;
             }
             if let Some(reason) = self.admission_refusal(&pending.request) {
-                emitter.reject(ticket, reason);
+                emitter.reject(req, reason);
                 continue;
             }
-            let mut active = emitter.admit(ticket);
+            let mut active = emitter.admit(req);
             if pending.request.max_tokens == 0 {
                 // Nothing to generate: answer without occupying a slot.
                 finish_or_retire(active, FinishReason::Length, emitter);
@@ -372,15 +372,15 @@ impl<E: StepExecutor> K3Scheduler<E> {
 }
 
 impl<E: StepExecutor> Scheduler for K3Scheduler<E> {
-    fn intake(&mut self, mut ticket: IntakeTicket) {
+    fn submit(&mut self, mut req: QueuedRequest) {
         // Ownership transfer only; every verdict is emitted from `step`.
-        // Tickets already aborted at intake ride the normal path — admission
-        // re-checks the flag and retires them.
-        let id = ticket.id();
-        let request = ticket
+        // Requests already aborted when submitted ride the normal path —
+        // admission re-checks the flag and retires them.
+        let id = req.id();
+        let request = req
             .take_request()
-            .expect("intake receives tickets with their payload");
-        self.handles.insert(id, HandleSlot::Queued(ticket));
+            .expect("queued requests arrive with their payload");
+        self.handles.insert(id, HandleSlot::Queued(req));
         self.queued.push_back(PendingRequest { id, request });
     }
 

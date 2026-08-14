@@ -4,11 +4,12 @@
 //! Both ends of a scheduler are minted together by [`scheduler_pair`], so a
 //! model crate cannot cross-wire or forget a line: the scheduler side arrives
 //! as one [`SchedulerBackend`] value, the frontend side as one
-//! [`SchedulerHandle`]. Channel choices per direction: intake is crossbeam
-//! (sync consumer on the scheduler thread; senders never block on unbounded
-//! channels), the step stream is tokio (async consumer in the protocol
-//! stack; the sync producer's send never blocks either), load is a shared
-//! cell (read-only pull, deliberately unsubscribable — see [`LoadPublisher`]).
+//! [`SchedulerHandle`]. Channel choices per direction: the submit channel is
+//! crossbeam (sync consumer on the scheduler thread; senders never block on
+//! unbounded channels), the step stream is tokio (async consumer in the
+//! protocol stack; the sync producer's send never blocks either), load is a
+//! shared cell (read-only pull, deliberately unsubscribable — see
+//! [`LoadPublisher`]).
 //!
 //! How many schedulers an engine runs and what each one means (DP replicas,
 //! anything else) is the model line's decision; the contract carries the
@@ -25,18 +26,18 @@ use std::time::Instant;
 use super::control::LoraClient;
 use super::handle::LoadSnapshot;
 use super::kv::KvCapacity;
+use super::request_lifecycle::HandleCore;
+use super::request_lifecycle::QueuedRequest;
+use super::request_lifecycle::RequestControl;
+use super::request_lifecycle::StepReceiver;
 use super::step::Request;
 use super::step::RequestId;
-use super::ticket::HandleCore;
-use super::ticket::IntakeTicket;
-use super::ticket::RequestControl;
-use super::ticket::StepReceiver;
 
 /// Everything the scheduler thread consumes and produces. The driver
 /// ([`super::drive`]) destructures this; model code only ever sees the
-/// emitter and, through trait arguments, the tickets.
+/// emitter and, through trait arguments, the request handles.
 pub struct SchedulerBackend {
-    pub(crate) intake: crossbeam_channel::Receiver<IntakeTicket>,
+    pub(crate) submissions: crossbeam_channel::Receiver<QueuedRequest>,
     pub(crate) emitter: super::emitter::StepEmitter,
     pub(crate) load: LoadPublisher,
 }
@@ -61,25 +62,26 @@ impl LoadPublisher {
 
 /// The frontend's end of one running scheduler.
 pub struct SchedulerHandle {
-    intake_tx: crossbeam_channel::Sender<IntakeTicket>,
+    submit_tx: crossbeam_channel::Sender<QueuedRequest>,
     steps: Option<StepReceiver>,
     load: Arc<Mutex<LoadSnapshot>>,
     next_id: AtomicU64,
-    /// Kept so tickets minted after the scheduler thread exits still get
-    /// their drop-bomb terminal delivered (the ticket needs a live sender).
-    step_tx: super::ticket::StepSender,
+    /// Kept so requests minted after the scheduler thread exits still get
+    /// their drop-bomb terminal delivered (the handle needs a live sender).
+    step_tx: super::request_lifecycle::StepSender,
 }
 
 impl SchedulerHandle {
     /// Mint identity, queue timestamp, and abort flag, then hand the request
-    /// to the scheduler. Never fails: if the scheduler is gone, the ticket's
-    /// drop bomb answers the request with a `Failed` terminal on the step
-    /// stream, which the caller observes like any other terminal.
+    /// to the scheduler. Never fails: if the scheduler is gone, the
+    /// `QueuedRequest`'s drop bomb answers the request with a `Failed`
+    /// terminal on the step stream, which the caller observes like any other
+    /// terminal.
     pub fn submit(&self, request: Request) -> RequestControl {
         let id = RequestId::new(self.next_id.fetch_add(1, Ordering::Relaxed));
         let abort = Arc::new(AtomicBool::new(false));
         let control = RequestControl::new(id, Arc::clone(&abort));
-        let ticket = IntakeTicket::new(
+        let request = QueuedRequest::new(
             HandleCore {
                 id,
                 abort,
@@ -88,7 +90,7 @@ impl SchedulerHandle {
             request,
             Instant::now(),
         );
-        if let Err(returned) = self.intake_tx.send(ticket) {
+        if let Err(returned) = self.submit_tx.send(request) {
             drop(returned.into_inner());
         }
         control
@@ -111,19 +113,19 @@ impl SchedulerHandle {
 /// Mint both ends of one scheduler's wiring.
 #[must_use]
 pub fn scheduler_pair() -> (SchedulerHandle, SchedulerBackend) {
-    let (intake_tx, intake_rx) = crossbeam_channel::unbounded();
+    let (submit_tx, submit_rx) = crossbeam_channel::unbounded();
     let (step_tx, step_rx) = tokio::sync::mpsc::unbounded_channel();
     let load = Arc::new(Mutex::new(LoadSnapshot::default()));
     (
         SchedulerHandle {
-            intake_tx,
+            submit_tx,
             steps: Some(step_rx),
             load: Arc::clone(&load),
             next_id: AtomicU64::new(0),
             step_tx: step_tx.clone(),
         },
         SchedulerBackend {
-            intake: intake_rx,
+            submissions: submit_rx,
             emitter: super::emitter::StepEmitter::new(step_tx),
             load: LoadPublisher(load),
         },
@@ -147,7 +149,7 @@ pub struct Engine {
 pub struct LiveScheduler {
     pub handle: SchedulerHandle,
     /// The driver thread. Joined by the server at shutdown, after the handles
-    /// (and with them the intake senders) are dropped.
+    /// (and with them the submit senders) are dropped.
     pub join: std::thread::JoinHandle<()>,
 }
 

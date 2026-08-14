@@ -13,6 +13,11 @@ use std::time::Instant;
 
 use super::event::FinishReason;
 use super::event::TokenLogprob;
+use super::request_lifecycle::ActiveRequest;
+use super::request_lifecycle::DeferredFinish;
+use super::request_lifecycle::QueuedRequest;
+use super::request_lifecycle::StepReceiver;
+use super::request_lifecycle::StepSender;
 use super::step::PromptEcho;
 use super::step::RejectReason;
 use super::step::RequestId;
@@ -20,11 +25,6 @@ use super::step::RequestUpdate;
 use super::step::ScheduledInfo;
 use super::step::StepOutputs;
 use super::step::Terminal;
-use super::ticket::ActiveRequest;
-use super::ticket::DeferredFinish;
-use super::ticket::IntakeTicket;
-use super::ticket::StepReceiver;
-use super::ticket::StepSender;
 
 pub struct StepEmitter {
     tx: StepSender,
@@ -67,12 +67,12 @@ impl StepEmitter {
         self.buffer[slot].take()
     }
 
-    // ── IntakeTicket exits ──────────────────────────────────────────────
+    // ── QueuedRequest exits ─────────────────────────────────────────
 
     /// Admit the request: stamp `scheduled_at`, buffer the admission facts,
     /// hand back the streaming-state handle.
-    pub fn admit(&mut self, ticket: IntakeTicket) -> ActiveRequest {
-        let inner = ticket.consume();
+    pub fn admit(&mut self, req: QueuedRequest) -> ActiveRequest {
+        let inner = req.consume();
         let prompt_tokens = inner.prompt_len;
         self.entry(inner.core.id).scheduled = Some(ScheduledInfo {
             queued_at: inner.queued_at,
@@ -83,8 +83,8 @@ impl StepEmitter {
     }
 
     /// Refuse the request at admission.
-    pub fn reject(&mut self, ticket: IntakeTicket, reason: RejectReason) {
-        let inner = ticket.consume();
+    pub fn reject(&mut self, req: QueuedRequest, reason: RejectReason) {
+        let inner = req.consume();
         self.entry(inner.core.id).terminal = Some(Terminal::Rejected {
             reason,
             prompt_tokens: inner.prompt_len,
@@ -92,10 +92,10 @@ impl StepEmitter {
     }
 
     /// Retire a queued request whose frontend already gave up on it (see
-    /// [`IntakeTicket::aborted`]). Silent: the frontend dropped its state for
+    /// [`QueuedRequest::is_aborted`]). Silent: the frontend dropped its state for
     /// this id, so there is no one to address.
-    pub fn retire_ticket(&mut self, ticket: IntakeTicket) {
-        let inner = ticket.consume();
+    pub fn retire_queued(&mut self, req: QueuedRequest) {
+        let inner = req.consume();
         log::debug!("request retired before admission: {}", inner.core.id);
         self.extract(inner.core.id);
     }
@@ -226,7 +226,7 @@ impl StepEmitter {
             return;
         }
         // A closed receiver means the frontend is gone; the driver notices
-        // through the intake side and winds down.
+        // through the submission channel and winds down.
         let _ = self.tx.send(StepOutputs { updates });
     }
 }
@@ -256,9 +256,9 @@ mod tests {
     fn admission_tokens_and_finish_fold_into_one_entry() {
         let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1, 2, 3]));
-        let ticket = backend.intake.try_recv().expect("ticket");
+        let req = backend.submissions.try_recv().expect("req");
 
-        let mut active = backend.emitter.admit(ticket);
+        let mut active = backend.emitter.admit(req);
         backend.emitter.push_tokens(&mut active, &[10, 11], &[]);
         backend.emitter.set_cached_tokens(&mut active, 2);
         backend.emitter.finish(active, FinishReason::Stop);
@@ -289,9 +289,9 @@ mod tests {
     fn reject_carries_prompt_len_and_no_tokens() {
         let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1; 5]));
-        let ticket = backend.intake.try_recv().expect("ticket");
+        let req = backend.submissions.try_recv().expect("req");
         backend.emitter.reject(
-            ticket,
+            req,
             RejectReason::ContextLength {
                 prompt_tokens: 5,
                 max_tokens: 8,
@@ -317,8 +317,8 @@ mod tests {
     fn retire_discards_buffered_output() {
         let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1]));
-        let ticket = backend.intake.try_recv().expect("ticket");
-        let mut active = backend.emitter.admit(ticket);
+        let req = backend.submissions.try_recv().expect("req");
+        let mut active = backend.emitter.admit(req);
         backend.emitter.push_tokens(&mut active, &[9], &[]);
         backend.emitter.retire(active);
         backend.emitter.commit_step();
@@ -332,8 +332,8 @@ mod tests {
     fn defer_finish_folds_step_output_and_delivers_late() {
         let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1, 2]));
-        let ticket = backend.intake.try_recv().expect("ticket");
-        let mut active = backend.emitter.admit(ticket);
+        let req = backend.submissions.try_recv().expect("req");
+        let mut active = backend.emitter.admit(req);
         backend.emitter.push_tokens(&mut active, &[7], &[]);
         let deferred = backend.emitter.defer_finish(active, FinishReason::Length);
         backend.emitter.commit_step();
@@ -365,12 +365,12 @@ mod tests {
         let (handle, mut backend) = scheduler_pair();
         let _c0 = handle.submit(request(vec![1]));
         let _c1 = handle.submit(request(vec![2, 3]));
-        let dropped_ticket = backend.intake.try_recv().expect("ticket 0");
+        let dropped_req = backend.submissions.try_recv().expect("req 0");
         let admitted = backend
             .emitter
-            .admit(backend.intake.try_recv().expect("ticket 1"));
+            .admit(backend.submissions.try_recv().expect("req 1"));
 
-        drop(dropped_ticket);
+        drop(dropped_req);
         drop(admitted);
 
         let mut steps = handle_steps(handle);
@@ -387,12 +387,12 @@ mod tests {
     fn abort_flag_is_visible_through_both_states() {
         let (handle, mut backend) = scheduler_pair();
         let control = handle.submit(request(vec![1]));
-        let ticket = backend.intake.try_recv().expect("ticket");
-        assert!(!ticket.is_aborted());
+        let req = backend.submissions.try_recv().expect("req");
+        assert!(!req.is_aborted());
 
         control.abort();
-        assert!(ticket.is_aborted());
-        let active = backend.emitter.admit(ticket);
+        assert!(req.is_aborted());
+        let active = backend.emitter.admit(req);
         assert!(active.is_aborted());
         backend.emitter.retire(active);
     }

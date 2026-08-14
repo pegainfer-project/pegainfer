@@ -280,7 +280,7 @@ pub fn panic_message(payload: &dyn Any) -> &str {
 
 /// Answer a request the handle cannot place (a `data_parallel_rank` outside
 /// the engine's partition topology) with the standard Scheduled → Rejected
-/// pair — the same surface a model scheduler's intake rejection produces.
+/// pair — the same surface a model scheduler's admission rejection produces.
 fn reject_unroutable(req: &GenerateRequest, partition: usize, partitions: usize) {
     let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
     let _ = req.token_tx.send(TokenEvent::Scheduled {

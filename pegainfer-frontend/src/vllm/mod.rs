@@ -333,7 +333,7 @@ where
                 while bridges.join_next().await.is_some() {}
             }
             // The bridges are gone, and with them the partition handles:
-            // intake channels are disconnected, so the drivers drain and
+            // submission channels are disconnected, so the drivers drain and
             // exit. Reap their threads to surface scheduler panics.
             if !scheduler_joins.is_empty() {
                 let _ = tokio::task::spawn_blocking(move || {
