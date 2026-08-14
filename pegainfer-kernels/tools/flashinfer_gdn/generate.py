@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and package frozen FlashInfer GDN SM120 AOT variants."""
+"""Generate and package the production FlashInfer GDN SM120 AOT object."""
 
 from __future__ import annotations
 
