@@ -129,6 +129,30 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Absorbed-MLA decode over the paged latent cache
+    /// (`csrc/k3/k3_mla_paged_attn.cu`). One (row, head) block absorbs the
+    /// query against `w_kv_b`'s W_UK, walks the row's block table, and expands
+    /// the attended latent with W_UV. `layer_offset`/`page_stride` are in
+    /// elements; `table` is `[b, max_pages]` i32 (`-1` = unmapped, read as
+    /// zero latent) and `n` the per-row device context length.
+    pub fn k3_mla_paged_attn_cuda(
+        q: *const Half,
+        w_kv_b: *const Half,
+        cache: *const Half,
+        layer_offset: i64,
+        page_stride: i64,
+        table: *const i32,
+        max_pages: i32,
+        n: *const i32,
+        scale: *const Half,
+        o: *mut Half,
+        b: i32,
+        num_heads: i32,
+        qk_dim: i32,
+        v_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // --- fused MegaMoE (see `csrc/k3/k3_mega_moe_sm100.cu`) ---
 
     /// Token-count alignment the MegaMoE API enforces on

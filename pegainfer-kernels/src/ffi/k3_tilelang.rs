@@ -137,27 +137,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    /// NoPE full-context MLA decode over a slot-indexed cache: each row owns a
-    /// fixed `max_ctx` window, so `Kc [b, max_ctx, num_heads * qk_dim]` and
-    /// `Vc [b, max_ctx, num_heads * v_dim]` are dense, not paged. `N [b]` is
-    /// the per-row device-side context length; slots at or past it score
-    /// negative infinity, so no host sync is needed. `Sc [1]` is the shared
-    /// bf16 softmax scale.
-    pub fn k3_mla_attn_batched(
-        q: *const c_void,
-        kc: *const c_void,
-        vc: *const c_void,
-        n: *const i32,
-        sc: *const c_void,
-        o: *mut c_void,
-        b: i32,
-        num_heads: i32,
-        qk_dim: i32,
-        v_dim: i32,
-        max_ctx: i32,
-        stream: CUstream,
-    ) -> i32;
-
     /// Sigmoid router plus biased top-k over merged f32 score rows
     /// `S [b, num_experts]`, with `Bias [num_experts]` f32 and the bf16 routed
     /// scale `Rs [1]`. Writes `Idx [b, topk]` i32 and `Wts [b, topk]` f32.

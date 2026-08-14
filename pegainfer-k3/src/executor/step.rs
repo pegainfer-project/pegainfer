@@ -31,9 +31,7 @@ use half::bf16;
 use pegainfer_kernels::ops::K3_CONV_WIDTH;
 use pegainfer_kernels::ops::K3_MLA_HEADS;
 use pegainfer_kernels::ops::K3_MOE_QUANT_GROUP;
-use pegainfer_kernels::ops::K3_QK_DIM;
 use pegainfer_kernels::ops::K3_ROUTER_TOPK;
-use pegainfer_kernels::ops::K3_V_DIM;
 use pegainfer_kernels::ops::K3DeepGemmFp8Fp4Kind;
 use pegainfer_kernels::ops::K3MegaActivation;
 use pegainfer_kernels::ops::K3MegaShape;
@@ -42,7 +40,6 @@ use pegainfer_kernels::ops::argmax_bf16_split_into;
 use pegainfer_kernels::ops::copy_hidden_rows_raw_into;
 use pegainfer_kernels::ops::embedding_rows_into;
 use pegainfer_kernels::ops::extract_hidden_rows_raw_into;
-use pegainfer_kernels::ops::gather_hidden_tokens_into;
 use pegainfer_kernels::ops::k3_add2_batched_launch;
 use pegainfer_kernels::ops::k3_attnres_mix_batched_launch;
 use pegainfer_kernels::ops::k3_attnres_scores_batched_launch;
@@ -54,7 +51,7 @@ use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_land_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_mega_moe_launch;
 use pegainfer_kernels::ops::k3_mega_write_inputs_launch;
-use pegainfer_kernels::ops::k3_mla_attn_batched_launch;
+use pegainfer_kernels::ops::k3_mla_paged_attn_launch;
 use pegainfer_kernels::ops::k3_moe_gather_fp8_quant_masked_launch;
 use pegainfer_kernels::ops::k3_moe_local_route_metadata_launch;
 use pegainfer_kernels::ops::k3_moe_weighted_combine_launch;
@@ -63,13 +60,14 @@ use pegainfer_kernels::ops::k3_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_router_topk_batched_launch;
 use pegainfer_kernels::ops::k3_situ_and_mul_fp8_quant_masked_launch;
 use pegainfer_kernels::ops::k3_situ_batched_launch;
-use pegainfer_kernels::ops::scaled_add_rows_indexed_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 
 use super::buffers::K3_KDA_FUSED;
 use super::buffers::K3_KDA_WSM_PADDED;
+use super::buffers::K3_KV_PAGE_TOKENS;
 use super::buffers::K3_MLA_FUSED;
+use super::buffers::K3_MLA_LATENT_ROW;
 use super::buffers::K3LayerState;
 use super::buffers::K3PagedKv;
 use super::buffers::K3Scratch;
@@ -85,11 +83,9 @@ use crate::config::K3_HEAD_DIM;
 use crate::config::K3_HEADS;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_KV_A_OUT;
-use crate::config::K3_KV_B_OUT;
 use crate::config::K3_KV_LORA_RANK;
 use crate::config::K3_Q_B_OUT;
 use crate::config::K3_Q_LORA_RANK;
-use crate::config::K3_QK_NOPE_HEAD_DIM;
 use crate::config::K3_QK_ROPE_HEAD_DIM;
 use crate::config::K3_ROUTED_EXPERT_HIDDEN;
 use crate::config::K3_SHARED_INTERMEDIATE;
@@ -114,8 +110,6 @@ pub(crate) struct K3StepShape {
     pub(crate) live_rows: usize,
     /// Which half of each ping-pong state slab this step reads.
     pub(crate) parity: usize,
-    /// Slots per sequence in the MLA cache.
-    pub(crate) max_ctx: usize,
     /// Rank-local expert groups (the masked GEMM's instantiation).
     pub(crate) groups: usize,
     /// Rows reserved per expert in the masked layout.
@@ -141,7 +135,7 @@ impl K3StepShape {
 /// Advance every row of the bucket by one token and leave the sampled ids in
 /// `scratch.argmax_indices`.
 ///
-/// Reads `scratch.token_ids`, `scratch.context_len` and `scratch.cache_row`;
+/// Reads `scratch.token_ids`, `scratch.context_len` and `scratch.kv_row`;
 /// the caller fills those before the step (or before the graph replay).
 ///
 /// Every MoE layer issues the same launches in the same order on every rank —
@@ -221,8 +215,8 @@ pub(crate) fn k3_decode_step(
                     scratch,
                 )?;
             }
-            (K3LayerAttention::Mla(mla), K3LayerState::Mla(mla_state)) => {
-                mla_attention(ctx, b, shape, layer, mla, mla_state, kv, mla_index, scratch)?;
+            (K3LayerAttention::Mla(mla), K3LayerState::Mla) => {
+                mla_attention(ctx, b, layer, mla, kv, mla_index, scratch)?;
                 mla_index += 1;
             }
             _ => anyhow::bail!("K3 layer state does not match the layer's attention kind"),
@@ -600,10 +594,8 @@ fn kda_conv_stream(
 fn mla_attention(
     ctx: &DeviceContext,
     b: usize,
-    shape: K3StepShape,
     layer: &K3LayerWeights,
     w: &K3MlaWeights,
-    state: &mut super::buffers::K3MlaState,
     kv: &mut K3PagedKv,
     mla_index: usize,
     s: &mut K3Scratch,
@@ -663,7 +655,7 @@ fn mla_attention(
         ctx,
         &s.kv_a,
         K3_KV_A_OUT,
-        &mut s.rope.data,
+        &mut s.rope,
         K3_QK_ROPE_HEAD_DIM,
         K3_KV_LORA_RANK,
         b,
@@ -679,8 +671,9 @@ fn mla_attention(
     // Paged latent append: the post-norm kv latent and the shared rope half
     // are the whole cached quantity (NoPE — nothing here is
     // position-dependent), written into this layer's slice of the row's
-    // current page.
-    kv.append_latent(ctx, mla_index, b, &s.kv_row, &s.kv_norm, &s.rope.data)?;
+    // current page. The expanded K/V the reference builds from it is folded
+    // into the absorbed attention below.
+    kv.append_latent(ctx, mla_index, b, &s.kv_row, &s.kv_norm, &s.rope)?;
     k3_gemm_full(ctx, &w.w_q_b, &s.q_norm, b, &mut s.q_partial)?;
     k3_land_batched_launch(
         ctx,
@@ -692,81 +685,21 @@ fn mla_attention(
         &s.q_partial,
         &mut s.query,
     )?;
-    k3_gemm_full(ctx, &w.w_kv_b, &s.kv_norm, b, &mut s.kv_partial)?;
-    k3_land_batched_launch(
-        ctx,
-        b,
-        K3_KV_B_OUT,
-        K3_KV_B_OUT,
-        0,
-        1,
-        &s.kv_partial,
-        &mut s.kv,
-    )?;
 
-    // `kv` is `[rows, heads, nope | value]`. The cache row wants
-    // `[heads, nope | rope]` for K and `[heads, value]` for V, with the one
-    // rope half shared by every head.
-    let per_head = K3_QK_NOPE_HEAD_DIM + K3_HEAD_DIM;
-    let head_rows = b * K3_MLA_HEADS;
-    extract_hidden_rows_raw_into(
-        ctx,
-        &s.kv,
-        per_head,
-        &mut s.k_nope,
-        K3_QK_NOPE_HEAD_DIM,
-        0,
-        head_rows,
-    )?;
-    copy_hidden_rows_raw_into(
-        ctx,
-        &s.k_nope,
-        K3_QK_NOPE_HEAD_DIM,
-        &mut s.k_new.data,
-        K3_QK_DIM,
-        0,
-        head_rows,
-    )?;
-    s.rope.seq_len = b;
-    s.rope_heads.seq_len = head_rows;
-    gather_hidden_tokens_into(ctx, &s.rope, &s.head_row, head_rows, &mut s.rope_heads)?;
-    copy_hidden_rows_raw_into(
-        ctx,
-        &s.rope_heads.data,
-        K3_QK_ROPE_HEAD_DIM,
-        &mut s.k_new.data,
-        K3_QK_DIM,
-        K3_QK_NOPE_HEAD_DIM,
-        head_rows,
-    )?;
-    extract_hidden_rows_raw_into(
-        ctx,
-        &s.kv,
-        per_head,
-        &mut s.v_new.data,
-        K3_V_DIM,
-        K3_QK_NOPE_HEAD_DIM,
-        head_rows,
-    )?;
-
-    // The destination slot is zero until this step writes it — every position
-    // is written once and `release` clears the row — so an indexed add is an
-    // exact indexed copy, and it takes the destination row from the device.
-    s.k_new.seq_len = b;
-    s.v_new.seq_len = b;
-    scaled_add_rows_indexed_into(ctx, &s.k_new, 1.0, &s.cache_row, b, &mut state.k_cache, 0)?;
-    scaled_add_rows_indexed_into(ctx, &s.v_new, 1.0, &s.cache_row, b, &mut state.v_cache, 0)?;
-
-    k3_mla_attn_batched_launch(
+    // Absorbed MLA over the paged latent: the kernel folds `w_kv_b`'s per-head
+    // W_UK into the query and expands the attended latent with W_UV, so the
+    // per-step kv_b expansion and the expanded K/V cache no longer exist.
+    k3_mla_paged_attn_launch(
         ctx,
         b,
         K3_MLA_HEADS,
-        K3_QK_DIM,
-        K3_V_DIM,
-        shape.max_ctx,
         &s.query,
-        &state.k_cache.data,
-        &state.v_cache.data,
+        &w.w_kv_b.data,
+        &kv.slab,
+        mla_index * K3_KV_PAGE_TOKENS * K3_MLA_LATENT_ROW,
+        kv.page_stride(),
+        &kv.table_dev,
+        kv.max_pages_per_slot,
         &s.context_len,
         &w.scale.data,
         &mut s.attn,

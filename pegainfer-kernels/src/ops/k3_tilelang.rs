@@ -1,12 +1,13 @@
 //! K3 TileLang batched decode kernels: safe wrappers over the AOT dispatch
 //! launchers in `ffi::k3_tilelang`.
 //!
-//! The set covers one whole K3 decode step that is not a GEMM — norms and the
-//! bf16 landings of the framework GEMMs, the KDA convolution and delta rule,
-//! MLA attention, the MoE router and expert combine, the situ activation and
-//! the attention-residual mix. Dense projections are served by cuBLASLt and
-//! the routed experts by the DeepGEMM masked grouped-GEMM chain, so no GEMV
-//! lives here. The wrappers keep the certified kernels' operand names, so an
+//! The set covers one whole K3 decode step that is not a GEMM or attention —
+//! norms and the bf16 landings of the framework GEMMs, the KDA convolution and
+//! delta rule, the MoE router and expert combine, the situ activation and the
+//! attention-residual mix. Dense projections are served by cuBLASLt, the
+//! routed experts by the DeepGEMM masked grouped-GEMM chain, and MLA decode by
+//! the hand-written absorbed paged kernel (`ops::k3::mla_paged`), so neither a
+//! GEMV nor an attention family lives here. The wrappers keep the certified kernels' operand names, so an
 //! executor written against them reads like the Python engine's launch
 //! sequence.
 //!
@@ -64,14 +65,13 @@ pub const K3_KDA_DIM: usize = K3_KDA_HEADS * K3_KDA_HEAD_DIM;
 /// Short-convolution window; the carried state is `K3_CONV_WIDTH - 1` slots.
 pub const K3_CONV_WIDTH: usize = 4;
 
-/// MLA head count and the query/key and value widths per head.
+/// MLA head count and the query/key and value widths per head. MLA decode
+/// itself is not a TileLang family — it is the hand-written absorbed paged
+/// kernel in `ops::k3::mla_paged` — but its head geometry is shared with the
+/// landings here.
 pub const K3_MLA_HEADS: usize = 96;
 pub const K3_QK_DIM: usize = 192;
 pub const K3_V_DIM: usize = 128;
-/// Cache capacities `k3_mla_attn_batched` is instantiated for. Both the
-/// instantiation count and the per-block shared memory scale with the
-/// capacity, so extending this list is a deliberate generator change.
-pub const K3_MAX_CTX: [usize; 1] = [128];
 
 /// Round a live row count up to the bucket that will run it.
 ///
@@ -512,73 +512,6 @@ pub fn k3_kda_core_batched_launch(
     )
 }
 
-/// NoPE full-context MLA decode over a slot-indexed cache.
-///
-/// Each row owns a fixed `max_ctx` window, so `kc`/`vc` are dense per row and
-/// there is no block table. `n` is the per-row context length *on the device*;
-/// slots at or past it score negative infinity, so the step needs no host
-/// sync and a row at length `l` is bit-identical to the single-row kernel run
-/// at `l`. `sc` is the shared bf16 softmax scale.
-#[allow(clippy::too_many_arguments)]
-pub fn k3_mla_attn_batched_launch(
-    ctx: &DeviceContext,
-    b: usize,
-    num_heads: usize,
-    qk_dim: usize,
-    v_dim: usize,
-    max_ctx: usize,
-    q: &CudaSlice<bf16>,
-    kc: &CudaSlice<bf16>,
-    vc: &CudaSlice<bf16>,
-    n: &CudaSlice<i32>,
-    sc: &CudaSlice<bf16>,
-    o: &mut CudaSlice<bf16>,
-) -> Result<()> {
-    check_bucket(b)?;
-    ensure!(
-        q.len() >= b * num_heads * qk_dim
-            && kc.len() >= b * max_ctx * num_heads * qk_dim
-            && vc.len() >= b * max_ctx * num_heads * v_dim
-            && n.len() >= b
-            && !sc.is_empty()
-            && o.len() >= b * num_heads * v_dim,
-        "K3 mla_attn buffers too small for b={b}, heads={num_heads}, max_ctx={max_ctx}: \
-         q {}, kc {}, vc {}, n {}, sc {}, o {}",
-        q.len(),
-        kc.len(),
-        vc.len(),
-        n.len(),
-        sc.len(),
-        o.len()
-    );
-    let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
-    let (kc_ptr, _kc_guard) = kc.device_ptr(&ctx.stream);
-    let (vc_ptr, _vc_guard) = vc.device_ptr(&ctx.stream);
-    let (n_ptr, _n_guard) = n.device_ptr(&ctx.stream);
-    let (sc_ptr, _sc_guard) = sc.device_ptr(&ctx.stream);
-    let (o_ptr, _o_guard) = o.device_ptr_mut(&ctx.stream);
-    let rc = unsafe {
-        ffi::k3_mla_attn_batched(
-            q_ptr as *const c_void,
-            kc_ptr as *const c_void,
-            vc_ptr as *const c_void,
-            n_ptr as *const i32,
-            sc_ptr as *const c_void,
-            o_ptr as *mut c_void,
-            b as i32,
-            num_heads as i32,
-            qk_dim as i32,
-            v_dim as i32,
-            max_ctx as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    check(
-        rc,
-        &format!("K3 mla_attn_batched (B={b}, NH={num_heads}, CAP={max_ctx})"),
-    )
-}
-
 /// Sigmoid router plus biased top-k over already-merged f32 score rows.
 ///
 /// The weights come from the *un-biased* scores, are normalized with a
@@ -784,6 +717,5 @@ mod tests {
         assert_eq!(K3_ATTNRES_MAX_BLOCKS, 93_usize.div_ceil(12));
         // The 4-way expert-parallel shard of the full table.
         assert_eq!(K3_ROUTER_EXPERTS[0] / 4, K3_ROUTER_EXPERTS[1]);
-        assert!(K3_MAX_CTX.iter().all(|cap| cap % 128 == 0));
     }
 }

@@ -1,7 +1,7 @@
 """Vendored TileLang kernel definitions for the K3 batched decode step.
 
 This file is a **verbatim** subset of the certified upstream kernel module: the
-shared prologue and the thirteen batched kernel factories, copied character for
+shared prologue and the eleven batched kernel factories, copied character for
 character. Nothing here is re-spelled, re-indented or "cleaned up", and no
 kernel body is edited to fit this repository. The upstream module is the
 authority on what these kernels compute; it carries the bitwise parity gates
@@ -465,71 +465,5 @@ def kda_core_batched(KH: int, KD: int, SKG: int, B: int, lb: float, eps: float):
                     attnb[d].astype(ACC) * T.rsqrt(atot[0] / KD + eps)
                     * Go[d].astype(ACC),
                 ) * T.Cast(DT, T.sigmoid(G2[bb, bh * KD + d].astype(ACC)))
-
-    return _compile(main)
-
-
-# --- MLA ------------------------------------------------------------------- #
-
-
-@lru_cache(maxsize=None)
-def mla_attn_batched(NH: int, QK: int, VD: int, CAP: int, B: int,
-                     threads: int = 128):
-    """Batched ``mla_attn``: block (b, h) attends row b's head h over row b's
-    own cache. The cache is **slot indexed** -- every sequence owns a fixed
-    CAP-slot window, so Kc/Vc simply gain a leading batch axis and a row's
-    cache is the contiguous bs=1 [CAP, NH*QK] / [CAP, NH*VD] block (this is not
-    a paged cache; there is no block table).
-
-    The context length is **per slot**: N is an i32 tensor of shape (B,) and
-    the mask predicate becomes ``s < N[bb]``, which is the only difference from
-    the bs=1 kernel's ``s < N[0]``. Out-of-range slots still score NEG, so a
-    row at length n is bit-for-bit the bs=1 kernel run at that n, whatever the
-    other rows' lengths are. Sc (the bf16 softmax scale) is a config constant
-    shared by every row. Landings (f32 dot -> bf16 -> times the bf16 scale ->
-    bf16 -> f32 softmax -> bf16 probabilities -> f32 V accumulation -> one
-    bf16 landing) are the bs=1 body verbatim."""
-    @T.prim_func
-    def main(
-        Q: T.Tensor((B, NH * QK), DT),
-        Kc: T.Tensor((B, CAP, NH * QK), DT),
-        Vc: T.Tensor((B, CAP, NH * VD), DT),
-        N: T.Tensor((B,), "int32"),
-        Sc: T.Tensor((1,), DT),
-        O: T.Tensor((B, NH * VD), DT),
-    ):
-        with T.Kernel(B, NH, threads=threads) as (bb, bh):
-            Qs = T.alloc_shared((QK,), DT)
-            probs = T.alloc_shared((CAP,), DT)
-            dot = T.alloc_fragment((CAP,), ACC)
-            scl = T.alloc_fragment((CAP,), ACC)
-            pr = T.alloc_fragment((CAP,), ACC)
-            oac = T.alloc_fragment((VD,), ACC)
-            mx = T.alloc_fragment((1,), ACC)
-            tot = T.alloc_fragment((1,), ACC)
-            T.copy(Q[bb, bh * QK:(bh + 1) * QK], Qs)
-            T.sync_threads()
-            T.clear(dot)
-            for s in T.Parallel(CAP):
-                for d in T.serial(QK):
-                    dot[s] += Qs[d].astype(ACC) * Kc[bb, s, bh * QK + d].astype(ACC)
-            for s in T.Parallel(CAP):
-                # Land bf16, times bf16 scale (product lands bf16), widen f32.
-                scl[s] = T.if_then_else(
-                    s < N[bb], (T.Cast(DT, dot[s]) * Sc[0]).astype(ACC), NEG
-                )
-            T.reduce_max(scl, mx, dim=0)
-            for s in T.Parallel(CAP):
-                pr[s] = T.exp(scl[s] - mx[0])
-            T.reduce_sum(pr, tot, dim=0)
-            for s in T.Parallel(CAP):
-                probs[s] = T.Cast(DT, pr[s] / tot[0])   # bf16 after normalizing
-            T.sync_threads()
-            T.clear(oac)
-            for dv in T.Parallel(VD):
-                for s in T.serial(CAP):
-                    oac[dv] += probs[s].astype(ACC) * Vc[bb, s, bh * VD + dv].astype(ACC)
-            for dv in T.Parallel(VD):
-                O[bb, bh * VD + dv] = T.Cast(DT, oac[dv])
 
     return _compile(main)

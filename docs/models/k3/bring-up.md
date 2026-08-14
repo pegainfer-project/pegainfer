@@ -12,10 +12,15 @@ and bitwise-invariant to peer traffic. Single-rank executor: buckets up to
 `B = 128`, per-bucket CUDA graphs default-on, token-matching a certified
 4-layer greedy golden (39/40 exact under the fused kernel, 38/40 under the
 masked-chain anchor, misses inside a structural ≤2-ULP noise floor — see
-below). Kernel surface: twelve batched TileLang decode families + DeepGEMM
-FP8xFP4 AOT shims (fused MegaMoE and the masked grouped GEMM) behind
-`pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt. Next: CUDA
-graphs over the EP4 fused path.
+below). MLA KV is a **paged latent cache** — 576-wide `[kv_lora|rope]` rows in
+64-token pages behind per-slot block tables, 27.6 KB/token — decoded by an
+absorbed-MLA CUDA kernel with no compile-time context cap (the old 1.47
+MB/token expanded slot cache and its `max_ctx = 128` are gone). Kernel surface:
+eleven batched TileLang decode families + the hand-written paged-attention
+kernel + DeepGEMM FP8xFP4 AOT shims (fused MegaMoE and the masked grouped GEMM)
+behind `pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt. Next:
+CUDA graphs over the EP4 fused path, real (chunked) prefill, kv-store
+integration.
 
 Last touched: 2026-08
 
@@ -51,20 +56,23 @@ model at EP16 — that is the development vehicle.
   1e-6 against a dequant reference on real weights), so the loader uploads
   payload and e8m0 scale bytes as-is; the SF relayout to DeepGEMM's packed
   i32 form is a device-side build step (`k3_fp4_sf_prepare`).
-- **KV story is dual-pool**: paged KV (kv-store `BlockPool`) for the 24 MLA
-  layers plus a qwen35-style fixed-size slot pool for KDA recurrent state.
+- **KV story is dual-pool**: paged KV for the 24 MLA layers (executor-owned
+  latent page pool today; kv-store `BlockPool` integration is a later
+  milestone) plus a qwen35-style fixed-size slot pool for KDA recurrent state.
   Prefix caching ships disabled: KDA state is not recomputable from tokens
   (`docs/subsystems/kv-cache/design.md`, bounded class).
 - **TileLang kernels are generated at build time** from vendored, certified
   kernel definitions in `pegainfer-k3/kernels/` (three tiers: live
   generation → pre-generated dir → NOT_SUPPORTED stubs). The definitions'
   spelling is certified against the HF reference in a separate harness and
-  must not drift. The set covers every non-GEMM step of a decode iteration —
-  norms, the bf16 landings of the framework GEMMs, conv+silu, the KDA delta
-  rule, MLA attention, router, situ, combine and the attention-residual mix —
-  so the executor composes launches rather than reimplementing spellings.
-  Dense projections run on cuBLASLt and the routed experts on the DeepGEMM
-  masked grouped-GEMM chain, so no GEMV is generated. Every shape is a static
+  must not drift. The set covers every non-GEMM, non-attention step of a
+  decode iteration — norms, the bf16 landings of the framework GEMMs,
+  conv+silu, the KDA delta rule, router, situ, combine and the
+  attention-residual mix — so the executor composes launches rather than
+  reimplementing spellings. Dense projections run on cuBLASLt, the routed
+  experts on the DeepGEMM masked grouped-GEMM chain, and MLA decode on the
+  hand-written paged kernel below, so neither a GEMV nor an attention family
+  is generated. Every shape is a static
   compile dimension, batch size included: `B = 1` is a bucket whose per-row
   spelling is the certified single-row kernel, gated bitwise upstream, so
   single-stream and high-concurrency decode share one kernel set. See
@@ -75,22 +83,24 @@ model at EP16 — that is the development vehicle.
 `pegainfer-k3/src/executor/` composes the certified kernels into the decode
 step: `step.rs` is a line-by-line port of the certified reference engine's
 launch sequence (dense projections on cuBLASLt with banded/offset landings,
-the 12 batched TileLang families, the fused MoE launch), `buffers.rs` owns the
-state pools, `mod.rs` owns graphs and the `StepExecutor` impl.
+the 11 batched TileLang families, the paged MLA attention, the fused MoE
+launch), `buffers.rs` owns the state pools and the paged KV pool, `mod.rs`
+owns graphs and the `StepExecutor` impl.
 
 - **Batching**: seat `i` is row `i` of every state pool. Buckets
   `{1,2,4,8,16,32,48,64,96,128}`; one CUDA graph per `(bucket, parity)`
   (KDA recurrent state ping-pongs across two slabs, so parity is part of the
   graph identity). Graphs are default-on; `PEGAINFER_K3_CUDA_GRAPH=0` escapes
-  to eager. H2D feed (`token_ids`, `context_len`, `cache_row`) and the single
-  argmax D2H stay outside capture.
+  to eager. H2D feed (`token_ids`, `context_len`, `kv_row`, the KV block
+  table) and the single argmax D2H stay outside capture.
 - **State contract**: a padding row is stepped like any live row, so its
   recurrent state advances — a seat's state is only meaningful while the seat
   is in *every* batch. The scheduler preserves this (running requests decode
   every step; `prefill` resets the seat at admission). Prefill runs on a
   separate one-row pool and hands its state over by row copy.
 - **Bring-up flags**: `PEGAINFER_K3_LAYERS` (layer truncation),
-  `PEGAINFER_K3_MAX_BATCH`, `PEGAINFER_K3_CUDA_GRAPH`.
+  `PEGAINFER_K3_MAX_BATCH`, `PEGAINFER_K3_CUDA_GRAPH`,
+  `PEGAINFER_K3_MAX_CTX` (per-slot context ceiling, default 4096).
 
 ### Gates and the noise floor
 
@@ -113,6 +123,79 @@ cross-bucket gate holds to the fixture with the same noise-floor rule.
 dominate — known to lose to a GEMV below ~8 rows/expert). Graphs buy ~4.5%;
 the step is not launch-bound. Absolute numbers move a few percent with box
 load, so compare within a session, not across.
+
+### MLA KV: paged latent cache + absorbed decode
+
+The MLA cache holds the **latent**, not the expanded heads: one 576-wide bf16
+row per token per MLA layer — the post-norm kv latent (512, `kv_lora_rank`)
+next to the raw shared rope half (64; K3 is NoPE, nothing is ever rotated).
+That is 27.6 KB/token against the 1.47 MB/token the expanded `[96×192 K |
+96×128 V]` slot cache used to pin, and it is what lifted the fixed
+`max_ctx = 128`.
+
+- **Layout**: one slab per rank, `[page][layer][token][576]`, 64 tokens per
+  page, every MLA layer's slice inside the same page (layer offset =
+  `mla_index × 64 × 576` elements). Pages come from a plain free list —
+  claimed when a slot's position crosses a 64 boundary, freed together when
+  the slot retires; no content addressing, no reuse (kv-store integration is
+  a later milestone). Per-slot block tables live host-side and ride to the
+  device with the step feed, outside graph capture; the captured kernels read
+  the device table by pointer. `K3ExecutorConfig::kv_pages` sizes the pool
+  (`0` = full coverage, `max_batch × ceil(max_ctx/64)`).
+- **Write path**: the step computes `kv_norm` and `rope` exactly as before
+  and lands them into the mapped page row (`kv_row` is the device-fed
+  destination index; `-1` rows are skipped). A page is zeroed when claimed
+  and every position written once, so the indexed add is an exact indexed
+  copy.
+- **Decode is absorbed MLA** (`csrc/k3/k3_mla_paged_attn.cu`, hand CUDA —
+  TileLang 0.1.12 cannot express the runtime-length page walk without a
+  compile-time capacity, which is the thing being removed): per head,
+  `score(t) = (W_UKᵀ q_nope)ᵀ c_t + q_ropeᵀ k_rope_t` and
+  `o = W_UV (Σ p_t c_t)`, with `W_UK`/`W_UV` read straight out of the
+  checkpoint's `w_kv_b` — no expansion GEMM, no expanded cache. One
+  (row, head) block; softmax is a 3-sweep recompute (max / sum /
+  probs+attend), so there is no O(ctx) storage and **no compile-time context
+  cap**. The certified rounding chain is preserved landing for landing and
+  documented step-by-step in the kernel header: q absorption lands bf16 (f32
+  dot per latent column); f32 score dot over the 576 columns ascending; the
+  dot lands bf16 and multiplies the bf16 scale in bf16; max and Σexp in f32
+  fixed order; probabilities land bf16 after normalizing; the latent
+  accumulation is f32 per column over ascending t, landing bf16; the W_UV
+  expansion is an f32 dot landing bf16.
+- **Physical page ids never enter the arithmetic** — the kernel walks the
+  block table by logical position — so any page permutation is bit-identical,
+  and an unmapped (`-1`) entry reads as zero latent, which is exactly the
+  zeroed padding row of the old cache.
+
+Gates (`pegainfer-k3/tests/paged_kv.rs`, plus the golden suite):
+
+```bash
+# Paged gates: page-permutation bitwise, long-context (2048-ctx, 1100 steps,
+# rerun + graphs-vs-eager bitwise), on a GPU box with the checkpoint:
+PEGAINFER_K3_TEST_224=<checkpoint> cargo test --release -p pegainfer-k3 \
+  --test paged_kv -- --ignored --test-threads 1
+
+# Absorbed-vs-expanded certification: dump per-step logits on the expanded
+# revision (M1) and on this one, then compare per step in bf16 ULP:
+PEGAINFER_K3_TEST_224=<checkpoint> PEGAINFER_K3_LOGIT_DUMP=/tmp/logits.bin \
+  cargo test --release -p pegainfer-k3 --test paged_kv \
+  dump_forced_replay_logits -- --ignored
+
+# And the existing suites must stay green:
+PEGAINFER_K3_TEST_224=<checkpoint> cargo test --release -p pegainfer-k3 \
+  --test golden_decode -- --ignored --test-threads 1
+```
+
+Certified (4-layer golden inputs, absorbed vs expanded per step): argmax
+identical on all 40 steps; deviation over the fixture-published top-5 logits
+median 1.0 / max 3.0 bf16 ULP — inside the measured ≤2-ULP structural noise
+floor of the FP8 expert path; whole-row max deviation at the top-logit
+magnitude median 1.75 / max 4.0 ULP. (The absorbed kernel associates the
+score dot as `(W_UKᵀ q)ᵀ c` rather than `qᵀ (W_UK c)`, so bit equality is not
+expected — the floor is.) The golden fixture holds at 39/40 (fused) and 38/40
+(masked chain) with misses only on the documented coin-flip steps; page
+permutation (200 steps) and the long-context reruns and graphs-vs-eager
+(1100 steps, ctx 2048) are bit-identical; the EP4 oracle is bitwise green.
 
 ## EP4: free-running ranks
 
@@ -285,5 +368,7 @@ recorded here as the measurement, not as a configuration you can still select.
 ## Next
 
 Graphs over the EP4 fused path (the ranks=1 path already captures), then
-launch-ahead, paged KV for MLA (current MLA cache is fixed `max_ctx = 128` per
-seat) and real prefill.
+launch-ahead, real (chunked) prefill over the paged KV, kv-store `BlockPool`
+integration (content addressing / reuse for the MLA pages), and a perf pass on
+the paged attention kernel (the 3-sweep recompute reads the cache three times;
+fine at bring-up depth, worth a fused pass at 24 MLA layers x long contexts).
