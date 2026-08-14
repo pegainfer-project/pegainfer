@@ -1,6 +1,8 @@
 use anyhow::Context;
 use anyhow::Result;
 use log::debug;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::weight_loader::deserialize_shards;
@@ -8,7 +10,6 @@ use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::load_tensor_1d;
 use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::mmap_shards;
-use pegainfer_core::weight_loader::precompute_rope;
 
 use super::DFlashDraftModel;
 use crate::config::DFlashConfig;
@@ -154,9 +155,12 @@ impl DFlashDraftModel {
 
         let (cos_cache, sin_cache) = precompute_rope(
             ctx,
-            config.head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
+            &RopeTableSpec {
+                rotary_dim: config.head_dim,
+                frequency_dim: config.head_dim,
+                max_seq_len: config.max_position_embeddings,
+                theta: config.rope_theta,
+            },
         )?;
         ctx.sync()?;
 

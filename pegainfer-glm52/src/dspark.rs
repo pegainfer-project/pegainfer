@@ -28,12 +28,13 @@ use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use pegainfer_core::cuda_graph::CudaGraphState;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::load_tensor_1d;
 use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::mmap_shards;
-use pegainfer_core::weight_loader::precompute_rope;
 use pegainfer_kernels::ops::add_batch_into;
 use pegainfer_kernels::ops::copy_hidden_token_range_into;
 use pegainfer_kernels::ops::dflash_qk_norm_rope_into;
@@ -325,8 +326,15 @@ impl Glm52DsparkModel {
         // embed_tokens / lm_head / confidence_head are intentionally not
         // loaded: the first two are byte-identical to the target's, the
         // confidence head is Phase 2.
-        let (cos_cache, sin_cache) =
-            precompute_rope(ctx, DSPARK_HEAD_DIM, cache_len, DSPARK_ROPE_THETA)?;
+        let (cos_cache, sin_cache) = precompute_rope(
+            ctx,
+            &RopeTableSpec {
+                rotary_dim: DSPARK_HEAD_DIM,
+                frequency_dim: DSPARK_HEAD_DIM,
+                max_seq_len: cache_len,
+                theta: DSPARK_ROPE_THETA,
+            },
+        )?;
         ctx.sync()?;
 
         Ok(Self {

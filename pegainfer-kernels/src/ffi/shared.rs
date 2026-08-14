@@ -1033,6 +1033,58 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+// hd512 QK-norm + partial RoPE prep (Gemma 4 global layers):
+// csrc/shared/prefill_attention_hd512.cu. Contract and validation live on
+// the Rust wrappers in ops::attention; both entries return 0 on success,
+// -1 with a diagnostic on failure.
+unsafe extern "C" {
+    // Prefill: Q → contiguous q_batch_out; K → straight into the paged KV
+    // pool at k_offset_elems (feeds batch_prefill_paged, not single_prefill).
+    pub fn qk_norm_partial_rope_paged_prefill_hd512_cuda(
+        q_batch: *const Half,
+        k_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        kv_data: *mut Half,
+        k_offset_elems: i64,
+        page_indices: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        start_pos: i32,
+        cos_max_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        page_size: i32,
+        num_pages: i32,
+        stride_page: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    // Batched decode: Q → contiguous q_batch_out; K normalised + partially
+    // rotated in place (caller scatters it into the paged pool afterwards).
+    pub fn qk_norm_partial_rope_batched_decode_hd512_cuda(
+        q_batch: *const Half,
+        k_batch: *mut Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        cos_max_pos: i32,
+        q_batch_out: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        batch_size: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    ) -> i32;
+}
+
 unsafe extern "C" {
     pub fn pegainfer_kernels_last_error() -> *const std::os::raw::c_char;
 }

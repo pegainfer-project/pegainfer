@@ -3583,6 +3583,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-k3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cudarc",
+ "half",
+ "log",
+ "memmap2",
+ "pegainfer-core",
+ "pegainfer-frontend",
+ "pegainfer-kernels",
+ "rayon",
+ "safetensors",
+ "serde_json",
+]
+
+[[package]]
 name = "pegainfer-kernels"
 version = "0.1.0"
 dependencies = [
@@ -3751,6 +3769,7 @@ dependencies = [
  "pegainfer-frontend",
  "pegainfer-gemma4",
  "pegainfer-glm52",
+ "pegainfer-k3",
  "pegainfer-kimi-k2",
  "pegainfer-qwen3",
  "pegainfer-qwen35",

@@ -29,8 +29,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Plain API check instead of KineticCafe/actions-dco: that action decodes
+      # the full commit *comparison*, whose file entries carry
+      # `blob_url: null` for submodule bumps, and its strict decoder rejects
+      # the whole payload — so any PR touching a submodule can never pass.
+      # A DCO check only needs the commit list.
       - name: Check commit sign-offs
-        uses: KineticCafe/actions-dco@v3.1.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          unsigned=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/commits?per_page=100" \
+            --jq '.[]
+                  | select(.commit.message | test("(?m)^Signed-off-by: .+ <.+@.+>") | not)
+                  | .sha[0:10] + " " + (.commit.message | split("\n")[0])')
+          if [ -n "$unsigned" ]; then
+            echo "$unsigned" | while read -r line; do
+              echo "::error::no Signed-off-by trailer on commit $line"
+            done
+            echo '::error::add sign-offs with: git rebase --signoff origin/main'
+            exit 1
+          fi
+          echo "all commits carry a Signed-off-by trailer"
 
   attribution-script:
     name: Attribution script checks

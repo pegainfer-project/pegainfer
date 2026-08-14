@@ -1,6 +1,8 @@
 use anyhow::Context;
 use anyhow::Result;
 use log::debug;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
@@ -11,7 +13,6 @@ use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::load_tensor_bool_host;
 use pegainfer_core::weight_loader::load_tensor_i64_host;
 use pegainfer_core::weight_loader::mmap_shards;
-use pegainfer_core::weight_loader::precompute_rope;
 
 use super::Eagle3DraftModel;
 use super::Eagle3Layer;
@@ -163,9 +164,12 @@ impl Eagle3DraftModel {
 
         let (cos_cache, sin_cache) = precompute_rope(
             ctx,
-            config.head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
+            &RopeTableSpec {
+                rotary_dim: config.head_dim,
+                frequency_dim: config.head_dim,
+                max_seq_len: config.max_position_embeddings,
+                theta: config.rope_theta,
+            },
         )?;
         ctx.sync()?;
 
