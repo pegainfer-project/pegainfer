@@ -195,13 +195,13 @@ impl<E: StepExecutor> K3Scheduler<E> {
     fn admission_refusal(&self, request: &Request) -> Option<RejectReason> {
         let prompt_tokens = request.prompt_tokens.len();
         let limit = self.executor.max_context_tokens();
-        (prompt_tokens.saturating_add(request.max_tokens) > limit).then(|| {
+        (prompt_tokens.saturating_add(request.max_tokens) > limit).then_some(
             RejectReason::ContextLength {
                 prompt_tokens,
                 max_tokens: request.max_tokens,
                 limit,
-            }
-        })
+            },
+        )
     }
 
     /// Whether `token` ends this request's stream by end-of-sequence.

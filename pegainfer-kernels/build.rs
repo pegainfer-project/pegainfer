@@ -1781,15 +1781,13 @@ fn k3_tilelang_nvcc_tasks(
             .clone()
             .or_else(|| k3_tilelang_arch(sm_targets))
             .unwrap_or_default();
-        match k3_tilelang_gencode(&arch, nvcc) {
-            Some(gencode) => Some((artifacts, gencode)),
-            None => {
-                println!(
-                    "cargo:warning=nvcc cannot assemble {arch}, which the K3 TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs"
-                );
-                None
-            }
-        }
+        let Some(gencode) = k3_tilelang_gencode(&arch, nvcc) else {
+            println!(
+                "cargo:warning=nvcc cannot assemble {arch}, which the K3 TileLang bodies were lowered for; they compile as NOT_SUPPORTED stubs"
+            );
+            return None;
+        };
+        Some((artifacts, gencode))
     });
 
     let (cu_files, extra_includes, tilelang_arch_args) = match generated {
