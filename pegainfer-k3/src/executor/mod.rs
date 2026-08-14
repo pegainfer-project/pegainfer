@@ -56,6 +56,7 @@
 mod buffers;
 pub mod ep;
 mod gemm;
+mod paged_kv;
 mod step;
 
 use std::path::Path;
@@ -426,7 +427,7 @@ impl K3Executor {
             cuda_graph = false;
         }
 
-        let slot_pages = config.max_ctx.div_ceil(buffers::K3_KV_PAGE_TOKENS);
+        let slot_pages = config.max_ctx.div_ceil(paged_kv::K3_KV_PAGE_TOKENS);
         let kv_pages = if config.kv_pages == 0 {
             max_batch * slot_pages
         } else {
