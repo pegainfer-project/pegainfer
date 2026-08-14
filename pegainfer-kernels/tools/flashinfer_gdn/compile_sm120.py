@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AOT-export one frozen FlashInfer GDN specialization to a C header/object."""
+"""AOT-export the production FlashInfer GDN specialization to a C header/object."""
 
 from __future__ import annotations
 
@@ -207,7 +207,7 @@ def compile_variant(variant: str, flashinfer_dir: Path) -> tuple[object, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", required=True, choices=("qwen35_4b_candidate", "operator_hv48"))
+    parser.add_argument("--variant", required=True, choices=("qwen35_4b_candidate",))
     parser.add_argument("--flashinfer-dir", required=True, type=Path)
     parser.add_argument("--base-flashinfer-dir", required=True, type=Path)
     parser.add_argument("--aot-out", required=True, type=Path)
