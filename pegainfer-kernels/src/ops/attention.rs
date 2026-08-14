@@ -2560,3 +2560,350 @@ pub fn single_prefill_hd256_into(
     }
     Ok(())
 }
+
+/// QK RMSNorm + partial RoPE for the hd512 paged-prefill prep (Gemma 4
+/// global layers). Q is normalised + partially rotated into a contiguous
+/// `q_out`; K is normalised + partially rotated straight into the paged KV
+/// pool at layer `layer`'s K block (feeds `batch_prefill_paged`, not
+/// `single_prefill`). No gate, no V; plain-w RMSNorm (not the (1+w) offset
+/// of hd256).
+///
+/// Validated here: layout geometry consistency (the derived fields are pub
+/// and hand-constructible), `layer < layout.num_layers`, `kv_pool` holding
+/// whole pages (its capacity in pages becomes the kernel's page bound),
+/// `page_indices` covering `[start_pos, start_pos + seq_len)`,
+/// `start_pos + seq_len <= cos_max_pos` (host-side layer of the position
+/// defence; the kernel `__trap()`s on any out-of-range pos or page id as
+/// the second), table lengths, and 512-element norm weights. `rotary_dim`
+/// must be positive, even and <= 512 — enforced by the launcher, which
+/// returns -1; propagated here as `Err`.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_partial_rope_paged_prefill_hd512_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    q_out: &mut HiddenStates,
+    kv_pool: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    layer: usize,
+    page_indices: &CudaSlice<i32>,
+    start_pos: usize,
+    cos_max_pos: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let seq_len = q.seq_len;
+    anyhow::ensure!(
+        q.hidden_dim == num_q_heads * 512,
+        "hd512 prefill prep q.hidden_dim {} != num_q_heads {} * 512",
+        q.hidden_dim,
+        num_q_heads
+    );
+    anyhow::ensure!(
+        q_out.hidden_dim == q.hidden_dim,
+        "hd512 prefill prep q_out.hidden_dim {} != q.hidden_dim {}",
+        q_out.hidden_dim,
+        q.hidden_dim
+    );
+    anyhow::ensure!(
+        q_out.seq_len == seq_len,
+        "hd512 prefill prep q_out.seq_len {} != q.seq_len {seq_len}",
+        q_out.seq_len
+    );
+    anyhow::ensure!(
+        k.hidden_dim == num_kv_heads * 512,
+        "hd512 prefill prep k.hidden_dim {} != num_kv_heads {} * 512",
+        k.hidden_dim,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        k.seq_len == seq_len,
+        "hd512 prefill prep k.seq_len {} != q.seq_len {seq_len}",
+        k.seq_len
+    );
+    anyhow::ensure!(
+        layout.head_dim == 512,
+        "hd512 prefill prep layout.head_dim {} != 512",
+        layout.head_dim
+    );
+    anyhow::ensure!(
+        layout.num_kv_heads == num_kv_heads,
+        "hd512 prefill prep layout.num_kv_heads {} != num_kv_heads {num_kv_heads}",
+        layout.num_kv_heads
+    );
+    // Keep the pool-capacity division below defined for public layouts.
+    anyhow::ensure!(
+        layout.page_size > 0 && layout.num_kv_heads > 0,
+        "hd512 prefill prep layout.page_size {} / num_kv_heads {} must be positive",
+        layout.page_size,
+        layout.num_kv_heads
+    );
+    let kv_block_len = layout.page_size * layout.num_kv_heads * layout.head_dim;
+    anyhow::ensure!(
+        layout.kv_block_len == kv_block_len,
+        "hd512 prefill prep layout.kv_block_len {} != page_size {} * num_kv_heads \
+         {} * head_dim {}",
+        layout.kv_block_len,
+        layout.page_size,
+        layout.num_kv_heads,
+        layout.head_dim
+    );
+    anyhow::ensure!(
+        layout.layer_stride == 2 * kv_block_len,
+        "hd512 prefill prep layout.layer_stride {} != 2 * kv_block_len {kv_block_len}",
+        layout.layer_stride
+    );
+    anyhow::ensure!(
+        layout.page_stride == layout.num_layers * layout.layer_stride,
+        "hd512 prefill prep layout.page_stride {} != num_layers {} * layer_stride {}",
+        layout.page_stride,
+        layout.num_layers,
+        layout.layer_stride
+    );
+    anyhow::ensure!(
+        layer < layout.num_layers,
+        "hd512 prefill prep layer {layer} >= layout.num_layers {}",
+        layout.num_layers
+    );
+    let num_pages = kv_pool.len() / layout.page_stride;
+    anyhow::ensure!(
+        kv_pool.len().is_multiple_of(layout.page_stride),
+        "hd512 prefill prep kv_pool.len {} is not a multiple of layout.page_stride {}",
+        kv_pool.len(),
+        layout.page_stride
+    );
+    anyhow::ensure!(
+        num_pages >= 1,
+        "hd512 prefill prep kv_pool.len {} holds no whole page (page_stride {})",
+        kv_pool.len(),
+        layout.page_stride
+    );
+    anyhow::ensure!(
+        q_norm_weight.len == 512,
+        "hd512 prefill prep q_norm_weight len {} != 512",
+        q_norm_weight.len
+    );
+    anyhow::ensure!(
+        k_norm_weight.len == 512,
+        "hd512 prefill prep k_norm_weight len {} != 512",
+        k_norm_weight.len
+    );
+    anyhow::ensure!(
+        page_indices.len() * layout.page_size >= start_pos + seq_len,
+        "hd512 prefill prep pages cover {} tokens (len {} * page_size {}), need \
+         start_pos {start_pos} + seq_len {seq_len}",
+        page_indices.len() * layout.page_size,
+        page_indices.len(),
+        layout.page_size
+    );
+    anyhow::ensure!(
+        start_pos + seq_len <= cos_max_pos,
+        "hd512 prefill prep start_pos {start_pos} + seq_len {seq_len} > \
+         cos_max_pos {cos_max_pos}"
+    );
+    anyhow::ensure!(
+        cos_cache.len >= cos_max_pos * rotary_dim,
+        "hd512 prefill prep cos_cache len {} < cos_max_pos {cos_max_pos} * \
+         rotary_dim {rotary_dim}",
+        cos_cache.len
+    );
+    anyhow::ensure!(
+        sin_cache.len >= cos_max_pos * rotary_dim,
+        "hd512 prefill prep sin_cache len {} < cos_max_pos {cos_max_pos} * \
+         rotary_dim {rotary_dim}",
+        sin_cache.len
+    );
+    q.checked_extent("hd512 prefill prep q")?;
+    q_out.checked_extent("hd512 prefill prep q_out")?;
+    k.checked_extent("hd512 prefill prep k")?;
+    ensure_vec_backed(q_norm_weight, "hd512 prefill prep q_norm_weight")?;
+    ensure_vec_backed(k_norm_weight, "hd512 prefill prep k_norm_weight")?;
+    ensure_vec_backed(cos_cache, "hd512 prefill prep cos_cache")?;
+    ensure_vec_backed(sin_cache, "hd512 prefill prep sin_cache")?;
+
+    // Derive raw offsets from the validated layout.
+    let k_offset_elems = (layer * layout.layer_stride) as i64;
+    let page_size = layout.page_size;
+    let stride_page = layout.page_stride as i64;
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    // The KV state owns mutation; this call borrows its shared pool handle.
+    let (pool_ptr, _gp) = kv_pool.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indices.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::qk_norm_partial_rope_paged_prefill_hd512_cuda(
+            q_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            qo_ptr as *mut ffi::Half,
+            pool_ptr as *mut ffi::Half,
+            k_offset_elems,
+            pi_ptr as *const i32,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            seq_len as i32,
+            start_pos as i32,
+            cos_max_pos as i32,
+            rotary_dim as i32,
+            rms_eps,
+            page_size as i32,
+            num_pages as i32,
+            stride_page,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "qk_norm_partial_rope_paged_prefill_hd512_cuda failed with error \
+             {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
+}
+
+/// Batched QK RMSNorm + partial RoPE for the hd512 decode prep (Gemma 4
+/// global layers). Q is normalised + partially rotated into a contiguous
+/// `q_out`; K is normalised + partially rotated in place (the caller
+/// scatters it into the paged pool afterwards). No gate, no V; plain-w
+/// RMSNorm.
+///
+/// Reading `positions_d` on the host would require a D2H synchronization,
+/// so the kernel `__trap()`s on positions outside [0, cos_max_pos).
+/// Validated here: table lengths, `positions_d.len() == batch_size`, and
+/// 512-element norm weights. `rotary_dim` must be positive, even and <= 512
+/// — enforced by the launcher; propagated here as `Err`.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_partial_rope_batched_decode_hd512_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    q_out: &mut HiddenStates,
+    k: &mut HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    positions_d: &CudaSlice<i32>,
+    cos_max_pos: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) -> Result<()> {
+    let batch_size = q.seq_len;
+    anyhow::ensure!(
+        q.hidden_dim == num_q_heads * 512,
+        "hd512 decode prep q.hidden_dim {} != num_q_heads {} * 512",
+        q.hidden_dim,
+        num_q_heads
+    );
+    anyhow::ensure!(
+        q_out.hidden_dim == q.hidden_dim,
+        "hd512 decode prep q_out.hidden_dim {} != q.hidden_dim {}",
+        q_out.hidden_dim,
+        q.hidden_dim
+    );
+    anyhow::ensure!(
+        q_out.seq_len == batch_size,
+        "hd512 decode prep q_out.seq_len {} != q.seq_len {batch_size}",
+        q_out.seq_len
+    );
+    anyhow::ensure!(
+        k.hidden_dim == num_kv_heads * 512,
+        "hd512 decode prep k.hidden_dim {} != num_kv_heads {} * 512",
+        k.hidden_dim,
+        num_kv_heads
+    );
+    anyhow::ensure!(
+        k.seq_len == batch_size,
+        "hd512 decode prep k.seq_len {} != q.seq_len {batch_size}",
+        k.seq_len
+    );
+    anyhow::ensure!(
+        q_norm_weight.len == 512,
+        "hd512 decode prep q_norm_weight len {} != 512",
+        q_norm_weight.len
+    );
+    anyhow::ensure!(
+        k_norm_weight.len == 512,
+        "hd512 decode prep k_norm_weight len {} != 512",
+        k_norm_weight.len
+    );
+    anyhow::ensure!(
+        positions_d.len() == batch_size,
+        "hd512 decode prep positions len {} != batch_size {batch_size}",
+        positions_d.len()
+    );
+    anyhow::ensure!(
+        cos_cache.len >= cos_max_pos * rotary_dim,
+        "hd512 decode prep cos_cache len {} < cos_max_pos {cos_max_pos} * \
+         rotary_dim {rotary_dim}",
+        cos_cache.len
+    );
+    anyhow::ensure!(
+        sin_cache.len >= cos_max_pos * rotary_dim,
+        "hd512 decode prep sin_cache len {} < cos_max_pos {cos_max_pos} * \
+         rotary_dim {rotary_dim}",
+        sin_cache.len
+    );
+    q.checked_extent("hd512 decode prep q")?;
+    q_out.checked_extent("hd512 decode prep q_out")?;
+    k.checked_extent("hd512 decode prep k")?;
+    ensure_vec_backed(q_norm_weight, "hd512 decode prep q_norm_weight")?;
+    ensure_vec_backed(k_norm_weight, "hd512 decode prep k_norm_weight")?;
+    ensure_vec_backed(cos_cache, "hd512 decode prep cos_cache")?;
+    ensure_vec_backed(sin_cache, "hd512 decode prep sin_cache")?;
+
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (qo_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pos_ptr, _gp) = positions_d.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::qk_norm_partial_rope_batched_decode_hd512_cuda(
+            q_ptr as *const ffi::Half,
+            k_ptr as *mut ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            pos_ptr as *const i32,
+            cos_max_pos as i32,
+            qo_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            batch_size as i32,
+            rotary_dim as i32,
+            rms_eps,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "qk_norm_partial_rope_batched_decode_hd512_cuda failed with error \
+             {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
+}

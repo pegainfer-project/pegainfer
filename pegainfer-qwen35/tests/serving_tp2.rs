@@ -81,7 +81,9 @@ async fn spawn_ready_server(
     let server_shutdown = shutdown.clone();
     let mut task = tokio::spawn(async move {
         pegainfer_frontend::vllm::serve(
-            std::future::ready(Ok(handle.into())),
+            std::future::ready(Ok(pegainfer_frontend::engine::LaunchedEngine::Handle(
+                handle,
+            ))),
             &frontend_model_path,
             vec![MODEL_NAME.to_string()],
             port,

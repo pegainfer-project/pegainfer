@@ -91,6 +91,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/glm52/fp8-blockwise-gemm-lab.md` | kernel_lab fp8 blockwise GEMM lab line (8 units: production CUTLASS `fp8_gemm.*` + CuTe DSL tcgen05 `fp8_gemm_dsl_tc.*`, `sm_tcgen05_only` fail-closed): GB300 sm_103 DSL passes 24/24 and beats the CUTLASS production baselines at rows=64 by 1.37–1.97x (tuning round over tile-N/split-K adds −21~−40% more), cold-L2 recheck holds; production profit estimate and SASS/PTX evidence inside. |
 | `models/glm52/kernel-lab-ops.md` | kernel_lab ops & maintenance manual: pipeline map (manifest -> registry -> adapter -> loader -> timing -> ledger), the add-a-CUTLASS-unit and add-a-python-native-DSL-unit lifecycles, capability-key semantics, warm vs `--cold-l2` protocol boundaries + the <11us event-timing floor, ledger discipline, and the GB300 tray remote-workflow record. |
 
+## models / k3
+
+| Doc | TL;DR |
+|---|---|
+| `models/k3/bring-up.md` | New model line (`--features k3`). Decode end-to-end: the full 93-layer model serves at `--k3-ep-size 4` (free-running per-rank engines, zero host collectives per step, 189 GiB/rank); routed experts are one fused DeepGEMM MegaMoE(situ) launch per layer at every world size, with the masked FP8xFP4 grouped-GEMM chain retained test-only as the numerics anchor. Single-rank: buckets to 128, per-bucket CUDA graphs on, token-matching a certified 4-layer golden. Dev vehicle: 224-expert checkpoint at EP4, shape-isomorphic to the full 896-expert model at EP16. |
+
 ## models / deepseek-v2-lite
 
 | Path | TL;DR |
@@ -210,6 +216,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `benchmarks/qwen3-4b-serving-vllm-rtx5090.md` | **Deleted** — superseded by `models/qwen3/serving-performance.md`. |
+| `benchmarks/k3-ep4-decode-profile.md` | K3 EP4 93-layer decode step profile (MegaMoE, GB300, 2026-08): 52% backbone B=1 dense GEMM at ~50% of SOL (cuBLASLt splitK), 20% fused MoE, 5% a mis-tuned router top-k; not launch-bound. Levers: near-SOL dense GEMV (~10 ms) + router fix (~2 ms) project ~50 → ~30 ms/step; FP8 backbone is the structural next step. |
 | `benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` | DeepSeek-V2-Lite EP2 2026-06-28 snapshot: PegaInfer host-staged/NCCL passed correctness, direct diagnostics, HTTP pressure, and trace rows; stock vLLM TP2/TP2+EP2 are retained as FlashInfer SM120/CUDA 12.8 setup failures, with a separate FlashInfer-fixed vLLM validation and no parity claim. |
 | `benchmarks/qwen35-4b-serving-vllm-rtx5090-2026-07.md` | Qwen3.5-4B vs vLLM 0.25.1 on 1x RTX 5090 for #469: correctness gates and retained HTTP matrix completed with zero failed requests, but PegaInfer does not reach vLLM parity; requested 1024/256 c16 is `17.36ms` / `807 tok/s` vs vLLM `9.34ms` / `1425 tok/s`, while direct c16 TPOT `9.14ms` points first to HTTP/frontend/scheduler attribution. |
 | `benchmarks/qwen35-4b-serving-vllm-rtx5090.md` | Qwen3.5-4B TP1 vs vLLM 0.23.0 on RTX 5090: latest direct PegaInfer A/B improves TPOT by 2-3%; HTTP `vllm bench serve` shows prompt-len-1 decode close, but vLLM still leads 1024/256 TPOT and high-concurrency output tok/s. Includes Nsight Systems direct/HTTP gap notes. |

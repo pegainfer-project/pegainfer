@@ -9,6 +9,10 @@ mod elementwise;
 mod embedding;
 #[cfg(feature = "glm52")]
 mod glm52;
+#[cfg(feature = "k3")]
+mod k3;
+#[cfg(feature = "k3")]
+mod k3_tilelang;
 #[cfg(feature = "kimi-k2")]
 mod kimi_k2;
 mod linear;
@@ -32,6 +36,8 @@ pub use attention::paged_attention_batch_decode_via_prefill_hd256_into;
 pub use attention::paged_attention_batch_decode_via_prefill_hd512_into;
 pub use attention::prefill_attention_paged_into;
 pub use attention::qk_norm_partial_rope_batched_decode_hd256_into;
+pub use attention::qk_norm_partial_rope_batched_decode_hd512_into;
+pub use attention::qk_norm_partial_rope_paged_prefill_hd512_into;
 pub use attention::qk_norm_rope_batch_decode_into;
 pub use attention::qk_norm_rope_prefill_hd256_plain_into;
 pub use attention::single_decode_nhd_into;
@@ -107,6 +113,10 @@ pub use embedding::embedding_decode_into;
 pub use embedding::embedding_rows_into;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
+#[cfg(feature = "k3")]
+pub use k3::*;
+#[cfg(feature = "k3")]
+pub use k3_tilelang::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
 pub use linear::GEMM_LT_MAX_N;

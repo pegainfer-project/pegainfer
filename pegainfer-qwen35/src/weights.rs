@@ -7,6 +7,8 @@ use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::ReduceOp;
 use log::debug;
 use log::info;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
@@ -20,7 +22,6 @@ use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::load_tensor_2d_col_shard;
 use pegainfer_core::weight_loader::load_tensor_2d_row_shard;
 use pegainfer_core::weight_loader::mmap_shards;
-use pegainfer_core::weight_loader::precompute_rope;
 use safetensors::SafeTensors;
 
 use super::config::Config35;
@@ -469,9 +470,12 @@ impl Qwen35Model {
         );
         let (cos_cache, sin_cache) = precompute_rope(
             &ctx,
-            config.rotary_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
+            &RopeTableSpec {
+                rotary_dim: config.rotary_dim,
+                frequency_dim: config.rotary_dim,
+                max_seq_len: config.max_position_embeddings,
+                theta: config.rope_theta,
+            },
         )?;
 
         ctx.sync()?;

@@ -16,6 +16,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 | Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Registration only — engine not yet available |
 | Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
 | GLM5.2 | `pegainfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
+| Kimi-K3 | `pegainfer-k3` | `--features k3` | Hybrid KDA + MLA, latent MoE + MXFP4, EP (bring-up — single-rank decode wired) |
 
 ## Build & Run
 

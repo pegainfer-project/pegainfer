@@ -4,7 +4,8 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use pegainfer_core::weight_loader::precompute_rope;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::rope::precompute_rope;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::DeviceVec;
@@ -36,8 +37,15 @@ impl Glm52DsparkModel {
                 down: mat(GLM52_HIDDEN, DSPARK_INTER)?,
             });
         }
-        let (cos_cache, sin_cache) =
-            precompute_rope(ctx, DSPARK_HEAD_DIM, cache_len, DSPARK_ROPE_THETA)?;
+        let (cos_cache, sin_cache) = precompute_rope(
+            ctx,
+            &RopeTableSpec {
+                rotary_dim: DSPARK_HEAD_DIM,
+                frequency_dim: DSPARK_HEAD_DIM,
+                max_seq_len: cache_len,
+                theta: DSPARK_ROPE_THETA,
+            },
+        )?;
         Ok(Self {
             layers,
             norm: DeviceVec::zeros(ctx, GLM52_HIDDEN)?,

@@ -1,4 +1,4 @@
-//! Safetensors weight loading and RoPE precomputation.
+//! Safetensors weight loading.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -723,44 +723,6 @@ pub fn load_tensor_2d_col_shard(
     let elems = tensor_bf16_cow(&tensor, name)?;
     let host = gather_cols(&elems, rows, total_cols, col_offset, cols);
     DeviceMatrix::from_host(ctx, &host, rows, cols)
-}
-
-/// Precompute RoPE cos/sin cache as contiguous GPU buffers.
-/// Layout: [max_seq_len * head_dim] — position `pos` at offset `pos * head_dim`.
-pub fn precompute_rope(
-    ctx: &DeviceContext,
-    head_dim: usize,
-    max_seq_len: usize,
-    theta: f32,
-) -> Result<(DeviceVec, DeviceVec)> {
-    let half_dim = head_dim / 2;
-
-    let inv_freq: Vec<f32> = (0..half_dim)
-        .map(|i| 1.0 / theta.powf(i as f32 * 2.0 / head_dim as f32))
-        .collect();
-
-    let total = max_seq_len * head_dim;
-    let mut cos_host = vec![bf16::ZERO; total];
-    let mut sin_host = vec![bf16::ZERO; total];
-
-    for pos in 0..max_seq_len {
-        let base = pos * head_dim;
-        for i in 0..half_dim {
-            let freq = pos as f32 * inv_freq[i];
-            let cos_val = bf16::from_f32(freq.cos());
-            let sin_val = bf16::from_f32(freq.sin());
-            // Half-split layout: [cos(0)..cos(63), cos(0)..cos(63)]
-            cos_host[base + i] = cos_val;
-            cos_host[base + i + half_dim] = cos_val;
-            sin_host[base + i] = sin_val;
-            sin_host[base + i + half_dim] = sin_val;
-        }
-    }
-
-    let cos_cache = DeviceVec::from_host(ctx, &cos_host)?;
-    let sin_cache = DeviceVec::from_host(ctx, &sin_host)?;
-
-    Ok((cos_cache, sin_cache))
 }
 
 #[allow(clippy::cast_ptr_alignment)]

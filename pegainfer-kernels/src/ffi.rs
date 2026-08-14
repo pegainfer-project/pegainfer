@@ -10,6 +10,10 @@ mod deepep;
 mod deepseek_v2_lite;
 #[cfg(feature = "glm52")]
 mod glm52;
+#[cfg(feature = "k3")]
+mod k3;
+#[cfg(feature = "k3")]
+mod k3_tilelang;
 #[cfg(feature = "kimi-k2")]
 mod kimi;
 mod lora;
@@ -21,6 +25,10 @@ pub use deepep::*;
 pub use deepseek_v2_lite::*;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
+#[cfg(feature = "k3")]
+pub use k3::*;
+#[cfg(feature = "k3")]
+pub use k3_tilelang::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi::*;
 pub use lora::*;

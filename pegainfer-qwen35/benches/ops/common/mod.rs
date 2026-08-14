@@ -178,34 +178,3 @@ pub(crate) fn decode_token_id(ctx: &DeviceContext, token_id: u32) -> Result<Cuda
         .clone_htod(&[token_id])
         .map_err(|e| anyhow!("H2D copy failed: {}", e))
 }
-
-pub(crate) fn rope_cache(
-    ctx: &DeviceContext,
-    max_seq_len: usize,
-    dim: usize,
-    theta: f32,
-) -> Result<(DeviceVec, DeviceVec)> {
-    assert_eq!(dim % 2, 0, "RoPE dimension must be even");
-    let half = dim / 2;
-    let inv_freq: Vec<f32> = (0..half)
-        .map(|idx| 1.0 / theta.powf(idx as f32 * 2.0 / dim as f32))
-        .collect();
-    let mut cos_host = vec![bf16::ZERO; max_seq_len * dim];
-    let mut sin_host = vec![bf16::ZERO; max_seq_len * dim];
-    for pos in 0..max_seq_len {
-        for idx in 0..half {
-            let freq = pos as f32 * inv_freq[idx];
-            let cos = bf16::from_f32(freq.cos());
-            let sin = bf16::from_f32(freq.sin());
-            cos_host[pos * dim + idx] = cos;
-            cos_host[pos * dim + idx + half] = cos;
-            sin_host[pos * dim + idx] = sin;
-            sin_host[pos * dim + idx + half] = sin;
-        }
-    }
-
-    Ok((
-        DeviceVec::from_host(ctx, &cos_host)?,
-        DeviceVec::from_host(ctx, &sin_host)?,
-    ))
-}
