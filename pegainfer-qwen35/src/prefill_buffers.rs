@@ -188,7 +188,7 @@ impl GdrChunkwiseScratch35 {
     /// Device bytes owned by the Triton GDN operator for one prefill chunk.
     ///
     /// This intentionally excludes model-wide hidden/MLP/full-attention
-    /// temporaries and the recurrent state, which are common to both Stage 9
+    /// temporaries and the recurrent state, which are common to both GDN
     /// backends. The allocation list mirrors [`Self::from_dims`].
     pub fn operator_scratch_bytes_from_dims(
         num_value_heads: usize,

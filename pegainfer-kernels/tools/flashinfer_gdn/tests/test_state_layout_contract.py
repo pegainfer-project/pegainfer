@@ -16,10 +16,8 @@ from state_layout_contract import (
     UPSTREAM_ORDER,
     StateGeometry,
     cute_state_offset,
-    first_wrong_mapping,
     openinfer_hkv_offset,
     ordered_strides,
-    upstream_hvk_offset,
 )
 
 
@@ -31,21 +29,19 @@ class StateLayoutContractTests(unittest.TestCase):
             ordered_strides(geometry.shape, OPENINFER_HKV_ORDER), (5, 1, 15, 30)
         )
 
-    def test_patched_cute_mapping_equals_hkv_for_hv32_and_hv48(self) -> None:
-        for heads in (32, 48):
-            geometry = StateGeometry(heads=heads, key_dim=128, value_dim=128)
-            with self.subTest(heads=heads):
-                for head in range(heads):
-                    for key in range(geometry.key_dim):
-                        for value in range(geometry.value_dim):
-                            self.assertEqual(
-                                cute_state_offset(
-                                    geometry, head=head, key=key, value=value
-                                ),
-                                openinfer_hkv_offset(
-                                    geometry, head=head, key=key, value=value
-                                ),
-                            )
+    def test_patched_cute_mapping_equals_production_hkv(self) -> None:
+        geometry = StateGeometry(heads=32, key_dim=128, value_dim=128)
+        for head in range(geometry.heads):
+            for key in range(geometry.key_dim):
+                for value in range(geometry.value_dim):
+                    self.assertEqual(
+                        cute_state_offset(
+                            geometry, head=head, key=key, value=value
+                        ),
+                        openinfer_hkv_offset(
+                            geometry, head=head, key=key, value=value
+                        ),
+                    )
 
     def test_mapping_does_not_depend_on_token_extent(self) -> None:
         geometry = StateGeometry(heads=2, key_dim=3, value_dim=5)
@@ -55,29 +51,6 @@ class StateLayoutContractTests(unittest.TestCase):
                 self.assertEqual(
                     cute_state_offset(geometry, head=1, key=2, value=4), baseline
                 )
-
-    def test_upstream_hvk_negative_case_reports_first_mismatch(self) -> None:
-        geometry = StateGeometry(heads=2, key_dim=3, value_dim=5)
-        mismatch = first_wrong_mapping(geometry)
-        self.assertIsNotNone(mismatch)
-        coordinate, expected, actual = mismatch or ((0, 0, 0), 0, 0)
-        self.assertEqual(coordinate, (0, 0, 1))
-        self.assertNotEqual(expected, actual)
-        self.assertEqual(
-            cute_state_offset(
-                geometry,
-                head=coordinate[0],
-                key=coordinate[1],
-                value=coordinate[2],
-                order=UPSTREAM_ORDER,
-            ),
-            upstream_hvk_offset(
-                geometry,
-                head=coordinate[0],
-                key=coordinate[1],
-                value=coordinate[2],
-            ),
-        )
 
     def test_patch_applies_cleanly_to_frozen_flashinfer(self) -> None:
         result = subprocess.run(

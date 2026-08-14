@@ -7,10 +7,10 @@ validates the manifest, then statically links the exported native object and
 `libcuda_dialect_runtime_static.a` behind the stable PegaInfer C ABI.
 
 The source lock pins FlashInfer and the small HKV state-layout specialization.
-The generated bundle contains an Hv32 production candidate and an Hv48
-diagnostic variant. Only SM120 + Hq/Hk/Hv/D=`16/16/32/128`, BF16 inputs, FP32
-HKV state, single GPU is eligible for production selection. Other capabilities
-retain the Triton path; a selected but invalid bundle fails at build time.
+The generator emits only the production Hv32 candidate. SM120 +
+Hq/Hk/Hv/D=`16/16/32/128`, BF16 inputs, FP32 HKV state, single GPU is eligible
+for production selection. Other capabilities retain the Triton path; a
+selected but invalid bundle fails at build time.
 
 The canonical generator CLI is:
 
@@ -18,10 +18,9 @@ The canonical generator CLI is:
 python3 pegainfer-kernels/tools/flashinfer_gdn/generate.py --help
 ```
 
-Its CUDA 13 environment is pinned in `requirements-cu13.lock`. The Stage 13 GPU
-gate records the exact environment creation, generation, validation, and
-release-link commands after they have been run on the target toolchain; do not
-copy the retired CUDA 12.8/PTX commands from older benchmark logs.
+Its generation-only CUDA 13 environment is pinned in
+`requirements-cu13.lock`. The output must be generated with that lock and the
+pinned FlashInfer submodule; retired CUDA 12.8/PTX workflows are not supported.
 
 Host-side source, state-layout, and package-contract checks:
 

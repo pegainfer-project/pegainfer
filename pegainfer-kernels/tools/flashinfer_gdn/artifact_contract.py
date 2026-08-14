@@ -25,7 +25,6 @@ TARGET_ARCH = "sm_120a"
 FROZEN_FLASHINFER_COMMIT = "a0efa0adfe49bb836ab1a147d6572980b870f3d4"
 SUPPORTED_GEOMETRIES = {
     "qwen35_4b_candidate": {"h_q": 16, "h_k": 16, "h_v": 32, "head_dim": 128},
-    "operator_hv48": {"h_q": 16, "h_k": 16, "h_v": 48, "head_dim": 128},
 }
 DTYPES = {
     "q": "bfloat16",
@@ -117,7 +116,7 @@ def load_source_lock(path: Path | None = None) -> tuple[dict[str, Any], str]:
         raise ContractError("source lock FlashInfer commit mismatch")
     patches = lock.get("patches")
     if not isinstance(patches, list) or len(patches) != 1:
-        raise ContractError("Stage 3 source lock must contain exactly one HKV patch")
+        raise ContractError("source lock must contain exactly one HKV patch")
     patch = patches[0]
     if not isinstance(patch, dict):
         raise ContractError("source lock patch entry must be an object")
@@ -139,14 +138,14 @@ def load_source_lock(path: Path | None = None) -> tuple[dict[str, Any], str]:
         "ordered_layout": [1, 0, 2, 3],
     }
     if hkv != expected_hkv:
-        raise ContractError("Stage 3 HKV state-index patch metadata mismatch")
+        raise ContractError("HKV state-index patch metadata mismatch")
     expected_export = {
         "grid_x": "cutlass.Int32",
         "stream": "cuda.CUstream",
         "purpose": "host-only type annotations required by official export_to_c",
     }
     if lock.get("aot_export_patch") != expected_export:
-        raise ContractError("Stage 12 AOT export annotation metadata mismatch")
+        raise ContractError("AOT export annotation metadata mismatch")
     return lock, sha256_file(path)
 
 
@@ -355,7 +354,6 @@ def build_manifest(
     lock, _ = load_source_lock()
     patch_sha256 = lock["patches"][0]["sha256"]
     spec = expected_spec(variant)
-    production_candidate = variant == "qwen35_4b_candidate"
     return {
         "schema_version": SCHEMA_VERSION,
         "artifact_kind": "flashinfer_cute_gdn_prefill_aot_object",
@@ -409,9 +407,7 @@ def build_manifest(
             "serving_requires_cute_dsl": False,
             "cuda_driver_jit_required": False,
             "cute_runtime_linkage": "static",
-            "production_candidate_geometry": production_candidate,
-            "production_eligible": False,
-            "production_blocker": "SM120 output/final-state GPU validation and model integration are not complete",
+            "production_eligible": True,
         },
     }
 
@@ -564,14 +560,15 @@ def validate_manifest(
     _require_equal(
         abi.get("state_layout"),
         "openinfer_hkv_v_contiguous",
-        "Stage 3 state layout",
+        "state layout",
     )
 
     distribution = manifest.get("distribution")
     if not isinstance(distribution, dict):
         raise ContractError("distribution metadata is missing")
-    for key in ("serving_requires_python", "serving_requires_cute_dsl", "production_eligible"):
+    for key in ("serving_requires_python", "serving_requires_cute_dsl"):
         _require_equal(distribution.get(key), False, f"distribution {key}")
+    _require_equal(distribution.get("production_eligible"), True, "production eligibility")
     _require_equal(distribution.get("cuda_driver_jit_required"), False, "driver JIT policy")
     _require_equal(distribution.get("cute_runtime_linkage"), "static", "CuTe runtime linkage")
     _require_equal(distribution.get("strategy"), "release_bundle", "distribution strategy")

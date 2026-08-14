@@ -33,7 +33,7 @@ def source_metadata() -> dict:
 def compile_metadata(variant: str, header: Path, obj: Path) -> dict:
     runtime = obj.parent / "libcuda_dialect_runtime_static.a"
     if not runtime.exists():
-        runtime.write_bytes(b"!<arch>\n-stage12-static-runtime")
+        runtime.write_bytes(b"!<arch>\n-test-static-runtime")
     return {
         **contract.expected_spec(variant),
         "flashinfer_commit": contract.FROZEN_FLASHINFER_COMMIT,
@@ -63,7 +63,7 @@ class ArtifactContractTests(unittest.TestCase):
         header = raw / f"pegainfer_qwen35_gdn_{variant}.h"
         obj = raw / f"pegainfer_qwen35_gdn_{variant}.o"
         header.write_text("/* generated test header */\n", encoding="utf-8")
-        obj.write_bytes(b"\x7fELF-stage12-test-object")
+        obj.write_bytes(b"\x7fELF-test-object")
         metadata = raw / "metadata.json"
         contract.write_json(metadata, compile_metadata(variant, header, obj))
         with mock.patch.object(contract, "verify_flashinfer_source", return_value=source_metadata()):
@@ -75,15 +75,16 @@ class ArtifactContractTests(unittest.TestCase):
                 flashinfer_dir=root,
             )
 
-    def test_both_geometries_and_dynamic_t_package(self) -> None:
+    def test_production_geometry_and_dynamic_t_package(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             manifests = [contract.read_json(self.package(root, variant)) for variant in contract.SUPPORTED_GEOMETRIES]
-            self.assertEqual({m["geometry"]["h_v"] for m in manifests}, {32, 48})
+            self.assertEqual({m["geometry"]["h_v"] for m in manifests}, {32})
             self.assertTrue(all(m["tokens"] == {"extent": "dynamic", "minimum": 1, "divisibility": 1} for m in manifests))
             self.assertTrue(all(m["abi"]["geometry_binding"] == "stable_project_c_wrapper" for m in manifests))
             self.assertTrue(all(m["distribution"]["cute_runtime_linkage"] == "static" for m in manifests))
             self.assertTrue(all(not m["distribution"]["cuda_driver_jit_required"] for m in manifests))
+            self.assertTrue(all(m["distribution"]["production_eligible"] for m in manifests))
 
     def test_compile_metadata_mismatches_fail(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -154,7 +155,7 @@ class ArtifactContractTests(unittest.TestCase):
             contract.write_json(bundle / "bundle.json", index)
             with mock.patch.object(contract, "verify_flashinfer_source", return_value=source_metadata()):
                 contract.validate_bundle(bundle, flashinfer_dir=root)
-                index["variants"]["operator_hv48"]["manifest_sha256"] = "0" * 64
+                index["variants"]["qwen35_4b_candidate"]["manifest_sha256"] = "0" * 64
                 contract.write_json(bundle / "bundle.json", index)
                 with self.assertRaisesRegex(contract.ContractError, "bundle manifest index"):
                     contract.validate_bundle(bundle, flashinfer_dir=root)
