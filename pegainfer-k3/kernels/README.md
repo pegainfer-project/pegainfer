@@ -28,20 +28,19 @@ every row below is its shape count × 10.
 | Kernel | Shapes per bucket | Instantiations | Launcher |
 | --- | --- | --- | --- |
 | `rms_norm_rbs_batched` | H ∈ {7168, 512, 3584} | 30 | `k3_rms_norm_rbs_batched` |
-| `land_batched` | 14 (NT, N, OFF) spans × SK ∈ {8, 1} | 280 | `k3_land_batched` |
-| `land_rms_norm_rbs_batched` | MLA q_a × SK ∈ {8, 1} | 20 | `k3_land_rms_norm_rbs_batched` |
+| `land_batched` | 14 (NT, N, OFF) spans, SK = 1 | 140 | `k3_land_batched` |
+| `land_rms_norm_rbs_batched` | MLA q_a, SK = 1 | 10 | `k3_land_rms_norm_rbs_batched` |
 | `add2_batched` | N = 7168 | 10 | `k3_add2_batched` |
 | `mul_sigmoid_batched` | N = 12288 | 10 | `k3_mul_sigmoid_batched` |
-| `situ_batched` | N ∈ {49152, 6144, 33792} | 30 | `k3_situ_batched` |
-| `combine_land_batched` | TOPK = 16, LAT = 3584 | 10 | `k3_combine_land_batched` |
-| `conv_silu_batched` | KP = 12288, W = 4, SK ∈ {8, 1} | 20 | `k3_conv_silu_batched` |
+| `situ_batched` | N ∈ {6144, 33792} | 20 | `k3_situ_batched` |
+| `conv_silu_batched` | KP = 12288, W = 4, SK = 1 | 10 | `k3_conv_silu_batched` |
 | `kda_core_batched` | 96 heads × 128 head_dim | 10 | `k3_kda_core_batched` |
 | `mla_attn_batched` | 96 heads, qk 192, v 128, CAP ∈ {128} | 10 | `k3_mla_attn_batched` |
 | `router_topk_batched` | E ∈ {896, 224}, TOPK = 16 | 20 | `k3_router_topk_batched` |
 | `attnres_scores_batched` | NB ∈ 1..8, H = 7168 | 80 | `k3_attnres_scores_batched` |
 | `attnres_mix_batched` | NB ∈ 1..8, H = 7168 | 80 | `k3_attnres_mix_batched` |
 
-**610 instantiations**, about 20 seconds of generation and 7 seconds of nvcc.
+**430 instantiations**, about 20 seconds of generation and 7 seconds of nvcc.
 The pool fans out at *instantiation* granularity, not family granularity — the
 families differ by more than an order of magnitude in size, so a family-granular
 pool would be bound by `land_batched` alone. It defaults to one worker per CPU
@@ -54,8 +53,9 @@ Two lists in `generate.py` are deliberately narrow and are one-line changes:
   the per-block shared memory scale with the capacity, so serving longer
   contexts is a deliberate widening, not a free one.
 * `SPLIT_K` — the segment counts the partial consumers (`land`,
-  `land_rms_norm_rbs`, `conv_silu`) accept. `8` is the split-K producer's
-  factor; `1` is the single-partial case a cuBLASLt GEMM produces.
+  `land_rms_norm_rbs`, `conv_silu`) accept. Only `1` — the single partial a
+  framework GEMM produces — has a launch site; the reference engine's
+  split-K-8 GEMV shapes are not generated.
 
 Neither needs a launcher edit.
 

@@ -43,11 +43,6 @@ pub const K3_BATCH_BUCKETS: [usize; 10] = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128];
 /// Largest bucket, i.e. the row capacity every reusable buffer should have.
 pub const K3_MAX_BATCH: usize = 128;
 
-/// Split factor of the split-K producers. A partial merged by `k3_land*` or
-/// `k3_conv_silu_batched` carries this many segments; a framework GEMM
-/// produces a single segment instead, which the same families also instantiate.
-pub const K3_SPLIT_K: usize = 8;
-
 /// Model hidden size, baked into the norm and attention-residual shapes.
 pub const K3_HIDDEN: usize = 7168;
 /// Routed-latent width, the working width of the MoE expert path.
@@ -345,47 +340,6 @@ pub fn k3_situ_batched_launch(
         )
     };
     check(rc, &format!("K3 situ_batched (B={b}, N={n})"))
-}
-
-/// Combine each row's `[topk, lat]` expert outputs against its routing
-/// weights in f32 and land bf16 once. The accumulation runs ascending in
-/// `topk`, which is what makes it reproducible.
-#[allow(clippy::too_many_arguments)]
-pub fn k3_combine_land_batched_launch(
-    ctx: &DeviceContext,
-    b: usize,
-    topk: usize,
-    lat: usize,
-    d: &CudaSlice<bf16>,
-    wts: &CudaSlice<f32>,
-    o: &mut CudaSlice<bf16>,
-) -> Result<()> {
-    check_bucket(b)?;
-    ensure!(
-        d.len() >= b * topk * lat && wts.len() >= b * topk && o.len() >= b * lat,
-        "K3 combine_land buffers too small for b={b}, topk={topk}, lat={lat}: d {}, wts {}, o {}",
-        d.len(),
-        wts.len(),
-        o.len()
-    );
-    let (d_ptr, _d_guard) = d.device_ptr(&ctx.stream);
-    let (wts_ptr, _wts_guard) = wts.device_ptr(&ctx.stream);
-    let (o_ptr, _o_guard) = o.device_ptr_mut(&ctx.stream);
-    let rc = unsafe {
-        ffi::k3_combine_land_batched(
-            d_ptr as *const c_void,
-            wts_ptr as *const f32,
-            o_ptr as *mut c_void,
-            b as i32,
-            topk as i32,
-            lat as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    check(
-        rc,
-        &format!("K3 combine_land_batched (B={b}, TOPK={topk}, LAT={lat})"),
-    )
 }
 
 /// KDA short convolution plus silu, one token per row.

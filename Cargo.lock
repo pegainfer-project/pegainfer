@@ -3588,7 +3588,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "crossbeam-channel",
  "cudarc",
  "half",
  "log",
@@ -3596,13 +3595,9 @@ dependencies = [
  "pegainfer-core",
  "pegainfer-frontend",
  "pegainfer-kernels",
- "pegainfer-kv-store",
- "pegainfer-sample",
  "rayon",
  "safetensors",
- "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

@@ -4,13 +4,12 @@
 Emits one `.cu` per kernel family under `--out-dir`, covering the batched
 decode kernel set:
 
-    k3_rms_norm_rbs_batched.cu      k3_combine_land_batched.cu
-    k3_land_batched.cu              k3_conv_silu_batched.cu
-    k3_land_rms_norm_rbs_batched.cu k3_kda_core_batched.cu
-    k3_add2_batched.cu              k3_mla_attn_batched.cu
-    k3_mul_sigmoid_batched.cu       k3_router_topk_batched.cu
-    k3_situ_batched.cu              k3_attnres_scores_batched.cu
-                                    k3_attnres_mix_batched.cu
+    k3_rms_norm_rbs_batched.cu      k3_conv_silu_batched.cu
+    k3_land_batched.cu              k3_kda_core_batched.cu
+    k3_land_rms_norm_rbs_batched.cu k3_mla_attn_batched.cu
+    k3_add2_batched.cu              k3_router_topk_batched.cu
+    k3_mul_sigmoid_batched.cu       k3_attnres_scores_batched.cu
+    k3_situ_batched.cu              k3_attnres_mix_batched.cu
 
 The batch size is a static compile-time dimension, so a single-stream step is
 served by the `B = 1` instantiation of the same family — its per-row spelling
@@ -106,12 +105,11 @@ ATTNRES_BLOCK_SIZE = 12     # attn_res_block_size             -> engine BS
 # the same artifact serves a single-GPU and a 4-way-EP deployment.
 EXPERTS = [896, 896 // 4]   # engine E, and engine Es under 4-way EP
 
-# The split factor every GEMV-style producer uses; `engine.SK`. A partial
-# merged by `land`/`conv_silu` has this many segments. Framework GEMMs
-# (cuBLASLt, DeepGEMM) produce a single segment instead, so every partial
-# consumer is also instantiated at 1.
-SK = 8
-SPLIT_K = [SK, 1]
+# Segment counts of the partials `land`/`conv_silu` merge. The engine's
+# producers are framework GEMMs (cuBLASLt, DeepGEMM), which emit a single
+# segment, so only SK=1 is instantiated; the reference engine's SK=8 GEMV
+# shapes have no launch site here and are not generated.
+SPLIT_K = [1]
 
 # `mla_attn`'s compile-time cache capacity; `engine.cap`, which the engine
 # asserts is a multiple of 128. Serving will want larger capacities, but both
@@ -174,12 +172,12 @@ LAND_CONFIGS = [
 # a round-before-scale norm are fused.
 LAND_RMS_NORM_CONFIGS = [(MLA_FUSED, Q_LORA, 0)]
 
-# add2 / mul_sigmoid / situ / combine_land / conv_silu / kda_core / mla_attn
-# take a single width each; situ has three (routed experts, shared, dense).
+# add2 / mul_sigmoid / situ / conv_silu / kda_core / mla_attn take a single
+# width each; situ has two (shared, dense) — the routed-expert situ is fused
+# into the masked-GEMM chain and the mega kernel.
 ADD2_N = [HIDDEN]
 MUL_SIGMOID_N = [KDA_DIM]
-SITU_N = [TOPK * MOE_INTER, SHARED_INTER, DENSE_INTER]
-COMBINE_LAND_CONFIGS = [(TOPK, LATENT)]
+SITU_N = [SHARED_INTER, DENSE_INTER]
 
 
 # --------------------------------------------------------------------------- #
@@ -207,10 +205,6 @@ BINARY_ABO_PARAMS = (
 SITU_PARAMS = (
     f"(const {BF16}* __restrict__ G, {BF16}* __restrict__ O, "
     f"const {BF16}* __restrict__ U)"
-)
-COMBINE_LAND_PARAMS = (
-    f"(const {BF16}* __restrict__ D, {BF16}* __restrict__ O, "
-    "const float* __restrict__ Wts)"
 )
 CONV_SILU_PARAMS = (
     f"(const {BF16}* __restrict__ Cs, const float* __restrict__ Cw, "
@@ -761,46 +755,6 @@ def plan_situ() -> Plan:
     )
 
 
-def plan_combine_land() -> Plan:
-    insts = []
-    for topk, lat in COMBINE_LAND_CONFIGS:
-        for batch in B_BUCKETS:
-            insts.append(Inst(
-                family="combine_land",
-                order=len(insts),
-                label=f"combine_land_batched TOPK={topk} LAT={lat} B={batch}",
-                factory="combine_land_batched",
-                args=(topk, lat, batch, THREADS),
-                num_params=3,
-                params=COMBINE_LAND_PARAMS,
-                symbol=f"k3_combine_land_b{batch}_topk{topk}_lat{lat}_kernel",
-                grid=(batch, lat // THREADS),
-                threads=THREADS,
-                guard=f"b == {batch} && topk == {topk} && lat == {lat}",
-                call_args=(_bf16("D"), _bf16("O", False), "Wts"),
-            ))
-    return Plan(
-        stem=_STEM.format("combine_land"),
-        signature=(
-            "k3_combine_land_batched(\n"
-            "    const void* D,\n"
-            "    const float* Wts,\n"
-            "    void* O,\n"
-            "    int b,\n"
-            "    int topk,\n"
-            "    int lat,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=(
-            "// f32 multiply-accumulate of each row's (topk, lat) expert outputs\n"
-            "// against that row's routing weights, landing bf16 once. The\n"
-            "// accumulation order is ascending in topk, which is what makes it\n"
-            "// reproducible."
-        ),
-        insts=tuple(insts),
-    )
-
-
 def plan_conv_silu() -> Plan:
     insts = []
     for split_k in SPLIT_K:
@@ -1104,7 +1058,6 @@ PLANNERS = [
     plan_add2,
     plan_mul_sigmoid,
     plan_situ,
-    plan_combine_land,
     plan_conv_silu,
     plan_kda_core,
     plan_mla_attn,

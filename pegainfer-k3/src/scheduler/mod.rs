@@ -295,10 +295,11 @@ impl<E: StepExecutor> K3Scheduler<E> {
             .collect();
         // The step is unconditional: an empty batch still reaches the
         // executor, which is what keeps EP ranks free-running — a rank with
-        // nothing to serve must still walk the step's fixed collective chain
-        // (padding rows in place of live ones), or its peers' collectives
-        // would pair against the wrong step. Single-rank executors simply
-        // return an empty token list without touching the device.
+        // nothing to serve must still launch the step's fixed per-layer MoE
+        // kernels (padding rows in place of live ones), or the device-side
+        // barriers inside them would pair against a peer's wrong step.
+        // Single-rank executors simply return an empty token list without
+        // touching the device.
         let tokens = match self.executor.decode(&batch) {
             Ok(tokens) => tokens,
             Err(error) => {

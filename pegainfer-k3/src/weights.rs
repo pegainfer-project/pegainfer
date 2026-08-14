@@ -346,18 +346,6 @@ impl K3WeightManifest {
             .with_context(|| format!("K3 safetensors index missing tensor {name}"))
     }
 
-    pub(crate) fn all_rank_load_bundles(&self, topo: K3MoeTopo) -> Result<Vec<K3RankLoadBundle>> {
-        ensure!(
-            topo.routed_experts() == self.routed_experts,
-            "K3 launch topology has {} routed experts but the checkpoint has {}",
-            topo.routed_experts().count(),
-            self.routed_experts.count()
-        );
-        (0..topo.device_count())
-            .map(|rank| self.rank_load_bundle(rank, topo))
-            .collect()
-    }
-
     pub(crate) fn rank_load_bundle(
         &self,
         rank: usize,
@@ -1112,7 +1100,9 @@ mod tests {
         // Every planned tensor resolves to a shard, and the contract matches
         // for every name the plan generates.
         let topo = K3MoeTopo::new(manifest.routed_experts(), 4).unwrap();
-        let bundles = manifest.all_rank_load_bundles(topo).unwrap();
+        let bundles: Vec<_> = (0..topo.device_count())
+            .map(|rank| manifest.rank_load_bundle(rank, topo).unwrap())
+            .collect();
         assert_eq!(bundles.len(), 4);
         let mut total = 0usize;
         for bundle in &bundles {

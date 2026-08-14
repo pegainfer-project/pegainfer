@@ -40,5 +40,4 @@ pub use scheduler::K3Scheduler;
 pub use scheduler::K3SchedulerConfig;
 pub use scheduler::SlotId;
 pub use scheduler::StepExecutor;
-pub use scheduler::launch_unwired;
 pub use scheduler::start_with_executors;

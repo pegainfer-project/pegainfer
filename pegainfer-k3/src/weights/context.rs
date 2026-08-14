@@ -57,17 +57,6 @@ impl K3RankGpuContext {
         })
     }
 
-    /// This rank's device free VRAM. Re-binds the rank's context first so the
-    /// query reads THIS device regardless of what the calling thread happened
-    /// to have current — the number sizes every rank's cache arenas, so a
-    /// wrong-device read must be unrepresentable.
-    pub(crate) fn free_vram_bytes(&self) -> Result<usize> {
-        self.set_current()?;
-        let (free, _total) = cudarc::driver::result::mem_get_info()
-            .map_err(|err| anyhow::anyhow!("cuMemGetInfo failed: {err:?}"))?;
-        Ok(free)
-    }
-
     pub(crate) fn sync(&self) -> Result<()> {
         self.stream
             .synchronize()
@@ -101,26 +90,6 @@ impl K3RankGpuContext {
         Ok(pegainfer_kernels::tensor::DeviceContext {
             ctx: self.ctx.clone(),
             stream: self.stream.clone(),
-            device_ordinal: self.device_ordinal,
-        })
-    }
-
-    /// A second stream on the same context, for work that overlaps the main
-    /// stream inside a step (fork/join via events — the shared experts run
-    /// concurrently with the MoE collectives).
-    pub(crate) fn auxiliary_device_context(
-        &self,
-        role: &str,
-    ) -> Result<pegainfer_kernels::tensor::DeviceContext> {
-        let stream = self.ctx.new_stream().with_context(|| {
-            format!(
-                "failed to create K3 {role} stream for device {}",
-                self.device_ordinal
-            )
-        })?;
-        Ok(pegainfer_kernels::tensor::DeviceContext {
-            ctx: self.ctx.clone(),
-            stream,
             device_ordinal: self.device_ordinal,
         })
     }

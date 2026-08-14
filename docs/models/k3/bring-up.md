@@ -12,7 +12,7 @@ and bitwise-invariant to peer traffic. Single-rank executor: buckets up to
 `B = 128`, per-bucket CUDA graphs default-on, token-matching a certified
 4-layer greedy golden (39/40 exact under the fused kernel, 38/40 under the
 masked-chain anchor, misses inside a structural ≤2-ULP noise floor — see
-below). Kernel surface: thirteen batched TileLang decode families + DeepGEMM
+below). Kernel surface: twelve batched TileLang decode families + DeepGEMM
 FP8xFP4 AOT shims (fused MegaMoE and the masked grouped GEMM) behind
 `pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt. Next: CUDA
 graphs over the EP4 fused path.
@@ -75,7 +75,7 @@ model at EP16 — that is the development vehicle.
 `pegainfer-k3/src/executor/` composes the certified kernels into the decode
 step: `step.rs` is a line-by-line port of the certified reference engine's
 launch sequence (dense projections on cuBLASLt with banded/offset landings,
-the 13 batched TileLang families, the fused MoE launch), `buffers.rs` owns the
+the 12 batched TileLang families, the fused MoE launch), `buffers.rs` owns the
 state pools, `mod.rs` owns graphs and the `StepExecutor` impl.
 
 - **Batching**: seat `i` is row `i` of every state pool. Buckets

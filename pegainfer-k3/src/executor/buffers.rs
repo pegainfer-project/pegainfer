@@ -351,9 +351,9 @@ pub(crate) struct K3MoeScratch {
 }
 
 impl K3MoeScratch {
-    /// `tokens` is the row count the *chain* runs at: this rank's bucket
-    /// capacity single-rank, the whole fleet's global batch under expert
-    /// parallelism.
+    /// `tokens` is the row count the *chain* runs at — this rank's bucket
+    /// capacity (the chain is the single-rank numerics anchor; the mega
+    /// transport never allocates this scratch).
     fn new(ctx: &DeviceContext, tokens: usize, groups: usize, masked_cap: usize) -> Result<Self> {
         let stream = &ctx.stream;
         let masked_rows = groups * masked_cap;

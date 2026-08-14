@@ -25,8 +25,8 @@ deepseek-v2-lite = []
 qwen35 = []
 # Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
 glm52 = ["moe"]
-# Kimi K3: TileLang-generated kernels + FP8xFP4 masked grouped GEMM.
-# Starts featherweight; flips to ["moe"] when the K3 DeepEP/MoE path lands.
+# Kimi K3: TileLang-generated kernels, FP8xFP4 masked grouped GEMM, and the
+# MegaMoE fused EP kernel (NVLink peer access, no DeepEP/NCCL substrate).
 k3 = []
 kimi-k2 = ["moe"]
 moe = []

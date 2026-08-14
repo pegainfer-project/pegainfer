@@ -743,7 +743,7 @@ fn require_glm52_submodules(root: &Path) {
 }
 
 // --- k3 -------------------------------------------------------------------
-/// The k3 feature has no DeepEP/NCCL dependency yet, but its FP8xFP4 masked
+/// The k3 feature has no DeepEP/NCCL dependency, but its FP8xFP4 masked
 /// grouped GEMM is AOT-instantiated straight out of the DeepGEMM device
 /// headers, which in turn need DeepGEMM's own nested CUTLASS and fmt.
 fn require_k3_submodules(root: &Path) {
@@ -1496,10 +1496,6 @@ const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
     (
         "k3_situ_batched",
         "const void*, const void*, void*, int, int",
-    ),
-    (
-        "k3_combine_land_batched",
-        "const void*, const float*, void*, int, int, int",
     ),
     (
         "k3_conv_silu_batched",

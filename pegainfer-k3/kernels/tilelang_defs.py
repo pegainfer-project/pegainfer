@@ -318,30 +318,6 @@ def situ_batched(N: int, B: int, threads: int = 256):
     return _compile(main)
 
 
-@lru_cache(maxsize=None)
-def combine_land_batched(TOPK: int, LAT: int, B: int, threads: int = 256):
-    """Batched ``combine_land``: block (b, x) combines row b's expert outputs
-    with row b's routing weights over one column segment; the ascending-t f32
-    multiply-accumulate and the single bf16 landing are the bs=1 body.
-    Requires threads|LAT."""
-    @T.prim_func
-    def main(
-        D: T.Tensor((B, TOPK, LAT), DT),
-        Wts: T.Tensor((B, TOPK), ACC),
-        O: T.Tensor((B, LAT), DT),
-    ):
-        with T.Kernel(B, LAT // threads, threads=threads) as (bb, bx):
-            acc = T.alloc_fragment((threads,), ACC)
-            T.clear(acc)
-            for j in T.Parallel(threads):
-                for t in T.serial(TOPK):
-                    acc[j] += D[bb, t, bx * threads + j].astype(ACC) * Wts[bb, t]
-            for j in T.Parallel(threads):
-                O[bb, bx * threads + j] = T.Cast(DT, acc[j])
-
-    return _compile(main)
-
-
 # --- KDA ------------------------------------------------------------------- #
 
 

@@ -92,18 +92,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    /// f32 multiply-accumulate of `D [b, topk, lat]` expert outputs against
-    /// `Wts [b, topk]`, landing `O [b, lat]` bf16 once.
-    pub fn k3_combine_land_batched(
-        d: *const c_void,
-        wts: *const f32,
-        o: *mut c_void,
-        b: i32,
-        topk: i32,
-        lat: i32,
-        stream: CUstream,
-    ) -> i32;
-
     /// Causal depthwise convolution over the `width`-slot window plus silu.
     /// `P [b, split_k, kp]` f32 partials land into `X [b, kp]` bf16, which is
     /// also the newest window slot; `Cs`/`Sn [b, width - 1, kp]` are the carried

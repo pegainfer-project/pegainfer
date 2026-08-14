@@ -536,8 +536,7 @@ impl K3Executor {
     }
 
     /// Is this executor one rank of an expert-parallel group?
-    #[must_use]
-    pub fn is_expert_parallel(&self) -> bool {
+    fn is_expert_parallel(&self) -> bool {
         self.ep.is_some()
     }
 
