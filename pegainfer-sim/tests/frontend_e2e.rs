@@ -7,6 +7,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::SpecDecodeCounters;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::start_engine;
 use reqwest::Client;
@@ -21,6 +22,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_NAME: &str = "pegainfer-sim-e2e";
 const METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-metrics";
 const CLOSED_FEED_MODEL_NAME: &str = "pegainfer-sim-e2e-closed-feed";
+const SPEC_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-spec-metrics";
 const SERVER_START_ATTEMPTS: usize = 5;
 
 struct SimServer {
@@ -42,6 +44,15 @@ impl SimServer {
             model_dir_with_minimal_metadata()?,
             2,
             METRICS_MODEL_NAME,
+        )
+        .await
+    }
+
+    async fn spawn_with_spec_metrics() -> Result<Self> {
+        Self::spawn_with_model_dir_and_engine_count(
+            model_dir_with_minimal_metadata()?,
+            2,
+            SPEC_METRICS_MODEL_NAME,
         )
         .await
     }
@@ -154,12 +165,12 @@ impl SimServer {
         })
     }
 
-    fn publish_load(&self, partition: usize, snapshot: LoadSnapshot) -> Result<()> {
+    fn publish_load(&self, partition: usize, snapshot: &LoadSnapshot) -> Result<()> {
         let sender = self
             .load_txs
             .get(partition)
             .ok_or_else(|| anyhow!("sim frontend has no load feed for partition {partition}"))?;
-        let _ = sender.send_replace(snapshot);
+        let _ = sender.send_replace(*snapshot);
         Ok(())
     }
 
@@ -240,20 +251,22 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
 
     server.publish_load(
         0,
-        LoadSnapshot {
+        &LoadSnapshot {
             kv_used_blocks: 25,
             kv_total_blocks: 100,
             num_running_reqs: 1,
             num_waiting_reqs: 0,
+            spec_decode: None,
         },
     )?;
     server.publish_load(
         1,
-        LoadSnapshot {
+        &LoadSnapshot {
             kv_used_blocks: 50,
             kv_total_blocks: 100,
             num_running_reqs: 0,
             num_waiting_reqs: 2,
+            spec_decode: None,
         },
     )?;
     wait_for_metrics(
@@ -271,20 +284,22 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
 
     server.publish_load(
         0,
-        LoadSnapshot {
+        &LoadSnapshot {
             kv_used_blocks: 75,
             kv_total_blocks: 100,
             num_running_reqs: 3,
             num_waiting_reqs: 4,
+            spec_decode: None,
         },
     )?;
     server.publish_load(
         1,
-        LoadSnapshot {
+        &LoadSnapshot {
             kv_used_blocks: 25,
             kv_total_blocks: 100,
             num_running_reqs: 5,
             num_waiting_reqs: 6,
+            spec_decode: None,
         },
     )?;
     wait_for_metrics(
@@ -302,8 +317,8 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
     )
     .await?;
 
-    server.publish_load(0, LoadSnapshot::default())?;
-    server.publish_load(1, LoadSnapshot::default())?;
+    server.publish_load(0, &LoadSnapshot::default())?;
+    server.publish_load(1, &LoadSnapshot::default())?;
     wait_for_metrics(
         &client,
         &server.base_url,
@@ -314,6 +329,130 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
             ("vllm:num_requests_waiting", "1", 0.0),
             ("vllm:kv_cache_usage_perc", "0", 0.0),
             ("vllm:kv_cache_usage_perc", "1", 0.0),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spec_decode_counters_reach_prometheus_as_cumulative_totals() -> Result<()> {
+    let server = SimServer::spawn_with_spec_metrics().await?;
+    let client = test_client()?;
+
+    let mut totals = SpecDecodeCounters::new(2).expect("K within bounds");
+    totals.observe_draft(2, 1);
+    server.publish_load(
+        0,
+        &LoadSnapshot {
+            spec_decode: Some(totals),
+            ..LoadSnapshot::default()
+        },
+    )?;
+    // `_total` is appended at exposition; the registered name scrapes empty.
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:spec_decode_num_drafts_total", "0", 1.0),
+            ("vllm:spec_decode_num_draft_tokens_total", "0", 2.0),
+            ("vllm:spec_decode_num_accepted_tokens_total", "0", 1.0),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    // Two verify steps coalesced into one snapshot, as the watch would. What
+    // must come back is the scheduler's cumulative, not this interval's delta:
+    // a delta counted twice or dropped breaks that equality, and nothing below
+    // the exposition layer can see it.
+    totals.observe_draft(2, 2);
+    totals.observe_draft(2, 2);
+    server.publish_load(
+        0,
+        &LoadSnapshot {
+            spec_decode: Some(totals),
+            ..LoadSnapshot::default()
+        },
+    )?;
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            (
+                "vllm:spec_decode_num_drafts_total",
+                "0",
+                totals.num_drafts as f64,
+            ),
+            (
+                "vllm:spec_decode_num_draft_tokens_total",
+                "0",
+                totals.num_draft_tokens as f64,
+            ),
+            (
+                "vllm:spec_decode_num_accepted_tokens_total",
+                "0",
+                totals.num_accepted_tokens as f64,
+            ),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    wait_for_labeled_metrics(
+        &client,
+        &server.base_url,
+        &[
+            (
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "0",
+                &[("position", "0")][..],
+                totals.num_accepted_tokens_per_pos[0] as f64,
+            ),
+            (
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "0",
+                &[("position", "1")][..],
+                totals.num_accepted_tokens_per_pos[1] as f64,
+            ),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    // Exposition is one series per draft slot the drafter actually has, so the
+    // fixed `MAX_SPEC_TOKENS` array width must not leak past `K = 2`.
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let leaked: Vec<_> = metrics
+        .lines()
+        .filter(|line| {
+            line.contains(&format!("model_name=\"{}\"", server.model_name))
+                && line.contains("position=\"2\"")
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "per-position series past K=2 were exposed: {leaked:?}"
+    );
+
+    // Engine 1 never drafted. Its counters are pre-registered, so they must be
+    // present and zero — which is also what pins each delta to one engine
+    // instead of being applied to both.
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:spec_decode_num_drafts_total", "1", 0.0),
+            ("vllm:spec_decode_num_draft_tokens_total", "1", 0.0),
+            ("vllm:spec_decode_num_accepted_tokens_total", "1", 0.0),
         ],
         &server.model_name,
     )
@@ -346,6 +485,25 @@ async fn wait_for_metrics(
     expected: &[(&str, &str, f64)],
     model_name: &str,
 ) -> Result<()> {
+    let expected: Vec<_> = expected
+        .iter()
+        .map(|(metric, engine, value)| (*metric, *engine, &[][..], *value))
+        .collect();
+    wait_for_labeled_metrics(client, base_url, &expected, model_name).await
+}
+
+/// One expected exposition line: metric name, `engine` label, any further
+/// labels, and the value it must carry.
+type ExpectedMetric<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], f64);
+
+/// [`wait_for_metrics`] plus arbitrary extra labels, for families keyed by more
+/// than engine and model — the per-position spec-decode counter adds `position`.
+async fn wait_for_labeled_metrics(
+    client: &Client,
+    base_url: &str,
+    expected: &[ExpectedMetric<'_>],
+    model_name: &str,
+) -> Result<()> {
     let metrics_url = format!("{base_url}/metrics");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut last_metrics = String::new();
@@ -357,17 +515,25 @@ async fn wait_for_metrics(
         if let Ok(response) = client.get(&metrics_url).send().await {
             if let Ok(response) = response.error_for_status() {
                 if let Ok(metrics) = response.text().await {
-                    let all_found = expected.iter().all(|(metric, engine, expected_value)| {
-                        metrics.lines().any(|line| {
-                            line.starts_with(metric)
-                                && line.contains(&format!("engine=\"{engine}\""))
-                                && line.contains(&format!("model_name=\"{model_name}\""))
-                                && line
-                                    .rsplit_once(' ')
-                                    .and_then(|(_, value)| value.parse::<f64>().ok())
-                                    .is_some_and(|value| (value - expected_value).abs() < 1e-9)
-                        })
-                    });
+                    let all_found =
+                        expected
+                            .iter()
+                            .all(|(metric, engine, labels, expected_value)| {
+                                metrics.lines().any(|line| {
+                                    line.starts_with(metric)
+                                        && line.contains(&format!("engine=\"{engine}\""))
+                                        && line.contains(&format!("model_name=\"{model_name}\""))
+                                        && labels.iter().all(|(name, value)| {
+                                            line.contains(&format!("{name}=\"{value}\""))
+                                        })
+                                        && line
+                                            .rsplit_once(' ')
+                                            .and_then(|(_, value)| value.parse::<f64>().ok())
+                                            .is_some_and(|value| {
+                                                (value - expected_value).abs() < 1e-9
+                                            })
+                                })
+                            });
                     if all_found {
                         return Ok(());
                     }

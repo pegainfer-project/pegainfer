@@ -842,6 +842,7 @@ fn publish_load(
         kv_total_blocks,
         num_running_reqs: (active.len() + prefilling.len()) as u64,
         num_waiting_reqs: num_waiting_reqs as u64,
+        spec_decode: None,
     });
 }
 

@@ -55,8 +55,8 @@ pub struct SchedulerBackend {
 pub struct LoadPublisher(Arc<Mutex<LoadSnapshot>>);
 
 impl LoadPublisher {
-    pub(crate) fn publish(&self, snapshot: LoadSnapshot) {
-        *self.0.lock().expect("load cell poisoned") = snapshot;
+    pub(crate) fn publish(&self, snapshot: &LoadSnapshot) {
+        *self.0.lock().expect("load cell poisoned") = *snapshot;
     }
 }
 

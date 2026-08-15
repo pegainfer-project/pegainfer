@@ -62,6 +62,8 @@ pub struct LoadSnapshot {
     pub num_running_reqs: u64,
     /// Requests admitted but not yet running (KV pressure, prefetch wait).
     pub num_waiting_reqs: u64,
+    /// Cumulative spec-decode counters, or `None` when no draft model is loaded.
+    pub spec_decode: Option<super::metrics::SpecDecodeCounters>,
 }
 
 #[derive(Clone)]

@@ -37,6 +37,7 @@ use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
+use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
 use vllm_engine_core_client::protocol::utility::UtilityOutput;
 use vllm_engine_core_client::protocol::utility::UtilityResultEnvelope;
@@ -55,6 +56,7 @@ use crate::engine::GenerateRequest;
 use crate::engine::LoadSnapshot;
 use crate::engine::RequestAbortReason;
 use crate::engine::RequestTag;
+use crate::engine::SpecDecodeCounters;
 use crate::engine::TokenEvent;
 use crate::engine::TokenSink;
 use crate::engine::TokenStreamReceiver;
@@ -589,7 +591,7 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
 /// vLLM `SchedulerStats` view of a load snapshot — what the frontend's
 /// Prometheus gauges (`scheduler_running`, `scheduler_waiting`,
 /// `kv_cache_usage`) and DP load balancer consume.
-pub(crate) fn scheduler_stats_from(snapshot: LoadSnapshot) -> SchedulerStats {
+pub(crate) fn scheduler_stats_from(snapshot: &LoadSnapshot) -> SchedulerStats {
     SchedulerStats {
         num_running_reqs: snapshot.num_running_reqs,
         num_waiting_reqs: snapshot.num_waiting_reqs,
@@ -599,6 +601,29 @@ pub(crate) fn scheduler_stats_from(snapshot: LoadSnapshot) -> SchedulerStats {
             snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
         },
         ..SchedulerStats::default()
+    }
+}
+
+/// Per-interval spec-decode delta from two cumulative snapshots, in the wire
+/// shape the frontend increments its `vllm:spec_decode_*_total` counters by (see
+/// [`SpecDecodeCounters`] for why the transport carries totals and the wire
+/// carries deltas).
+fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> SpecDecodingStats {
+    let num_accepted_tokens_per_pos = cur
+        .num_accepted_tokens_per_pos
+        .iter()
+        .zip(&last.num_accepted_tokens_per_pos)
+        .map(|(cur_pos, last_pos)| cur_pos.saturating_sub(*last_pos))
+        .take(cur.num_spec_tokens as usize)
+        .collect();
+    SpecDecodingStats {
+        num_spec_tokens: cur.num_spec_tokens,
+        num_drafts: cur.num_drafts.saturating_sub(last.num_drafts),
+        num_draft_tokens: cur.num_draft_tokens.saturating_sub(last.num_draft_tokens),
+        num_accepted_tokens: cur
+            .num_accepted_tokens
+            .saturating_sub(last.num_accepted_tokens),
+        num_accepted_tokens_per_pos,
     }
 }
 
@@ -614,8 +639,23 @@ async fn publish_scheduler_stats(
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let mut last_spec = SpecDecodeCounters::default();
     loop {
-        let stats = scheduler_stats_from(*load_rx.borrow_and_update());
+        let snapshot = *load_rx.borrow_and_update();
+        let spec_decoding_stats = if let Some(cur) = &snapshot.spec_decode {
+            let delta = spec_decode_delta(&last_spec, cur);
+            last_spec = *cur;
+            // A zero-draft interval would divide by zero in the frontend's
+            // acceptance-rate log, and every counter moves only inside
+            // `observe_draft`, so dropping it loses nothing.
+            (delta.num_drafts > 0).then_some(delta)
+        } else {
+            // Reset so a drafter loaded later diffs from zero
+            last_spec = SpecDecodeCounters::default();
+            None
+        };
+        let mut stats = scheduler_stats_from(&snapshot);
+        stats.spec_decoding_stats = spec_decoding_stats;
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),

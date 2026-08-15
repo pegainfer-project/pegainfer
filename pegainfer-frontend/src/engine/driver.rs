@@ -75,7 +75,7 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
         }
         let step = scheduler.step(&mut emitter);
         let snapshot = scheduler.load();
-        load.publish(snapshot);
+        load.publish(&snapshot);
         emitter.commit_step();
         if let Err(error) = step {
             // Dropping the scheduler drops its held request handles; their

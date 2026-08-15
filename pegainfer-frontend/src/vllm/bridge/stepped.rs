@@ -98,7 +98,7 @@ impl SteppedEngineBridge {
             &output_tx,
             RequestBatchOutputs {
                 engine_index: self.engine_index,
-                scheduler_stats: Some(Box::new(scheduler_stats_from(self.scheduler.load()))),
+                scheduler_stats: Some(Box::new(scheduler_stats_from(&self.scheduler.load()))),
                 timestamp: now_secs_f64(),
                 ..Default::default()
             }
@@ -221,7 +221,7 @@ impl SteppedEngineBridge {
                 engine_index: self.engine_index,
                 outputs,
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
-                scheduler_stats: Some(Box::new(scheduler_stats_from(self.scheduler.load()))),
+                scheduler_stats: Some(Box::new(scheduler_stats_from(&self.scheduler.load()))),
                 timestamp: now_secs_f64(),
             }
             .into(),

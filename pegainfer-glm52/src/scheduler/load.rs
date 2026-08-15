@@ -32,5 +32,6 @@ pub(super) fn publish_load(
         // the frontend's placement signal never undercounts a rank
         // mid-resolve and never counts a request twice.
         num_waiting_reqs: (pending.len() + resolving) as u64,
+        spec_decode: None,
     });
 }
