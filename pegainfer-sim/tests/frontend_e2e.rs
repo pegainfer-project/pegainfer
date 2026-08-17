@@ -6,7 +6,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::SpecDecodeCounters;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::start_engine;
@@ -30,7 +30,7 @@ struct SimServer {
     model_name: String,
     shutdown: CancellationToken,
     task: JoinHandle<Result<()>>,
-    load_txs: Vec<watch::Sender<LoadSnapshot>>,
+    metrics_txs: Vec<watch::Sender<SchedulerMetrics>>,
     _model_dir: TempDir,
 }
 
@@ -84,7 +84,7 @@ impl SimServer {
                         model_name: started.model_name,
                         shutdown: started.shutdown,
                         task: started.task,
-                        load_txs: started.load_txs,
+                        metrics_txs: started.metrics_txs,
                         _model_dir: model_dir,
                     });
                 }
@@ -112,12 +112,12 @@ impl SimServer {
         let base_url = format!("http://127.0.0.1:{port}");
         let shutdown = CancellationToken::new();
         let mut engine = start_engine(SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
-        let load_txs = if engine_count > 1 {
-            let (load_txs, load_watches) = (0..engine_count)
-                .map(|_| watch::channel(LoadSnapshot::default()))
+        let metrics_txs = if engine_count > 1 {
+            let (metrics_txs, metrics_watches) = (0..engine_count)
+                .map(|_| watch::channel(SchedulerMetrics::default()))
                 .unzip();
-            engine = engine.with_load_watches(load_watches);
-            load_txs
+            engine = engine.with_metrics_watches(metrics_watches);
+            metrics_txs
         } else {
             Vec::new()
         };
@@ -161,13 +161,13 @@ impl SimServer {
             model_name: started_model_name,
             shutdown,
             task,
-            load_txs,
+            metrics_txs,
         })
     }
 
-    fn publish_load(&self, partition: usize, snapshot: &LoadSnapshot) -> Result<()> {
+    fn publish_metrics(&self, partition: usize, snapshot: &SchedulerMetrics) -> Result<()> {
         let sender = self
-            .load_txs
+            .metrics_txs
             .get(partition)
             .ok_or_else(|| anyhow!("sim frontend has no load feed for partition {partition}"))?;
         let _ = sender.send_replace(*snapshot);
@@ -188,7 +188,7 @@ struct StartedSimServer {
     model_name: String,
     shutdown: CancellationToken,
     task: JoinHandle<Result<()>>,
-    load_txs: Vec<watch::Sender<LoadSnapshot>>,
+    metrics_txs: Vec<watch::Sender<SchedulerMetrics>>,
 }
 
 fn empty_model_dir() -> Result<TempDir> {
@@ -249,9 +249,9 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
     )
     .await?;
 
-    server.publish_load(
+    server.publish_metrics(
         0,
-        &LoadSnapshot {
+        &SchedulerMetrics {
             kv_used_blocks: 25,
             kv_total_blocks: 100,
             num_running_reqs: 1,
@@ -259,9 +259,9 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
             spec_decode: None,
         },
     )?;
-    server.publish_load(
+    server.publish_metrics(
         1,
-        &LoadSnapshot {
+        &SchedulerMetrics {
             kv_used_blocks: 50,
             kv_total_blocks: 100,
             num_running_reqs: 0,
@@ -282,9 +282,9 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
     )
     .await?;
 
-    server.publish_load(
+    server.publish_metrics(
         0,
-        &LoadSnapshot {
+        &SchedulerMetrics {
             kv_used_blocks: 75,
             kv_total_blocks: 100,
             num_running_reqs: 3,
@@ -292,9 +292,9 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
             spec_decode: None,
         },
     )?;
-    server.publish_load(
+    server.publish_metrics(
         1,
-        &LoadSnapshot {
+        &SchedulerMetrics {
             kv_used_blocks: 25,
             kv_total_blocks: 100,
             num_running_reqs: 5,
@@ -317,8 +317,8 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
     )
     .await?;
 
-    server.publish_load(0, &LoadSnapshot::default())?;
-    server.publish_load(1, &LoadSnapshot::default())?;
+    server.publish_metrics(0, &SchedulerMetrics::default())?;
+    server.publish_metrics(1, &SchedulerMetrics::default())?;
     wait_for_metrics(
         &client,
         &server.base_url,
@@ -344,11 +344,11 @@ async fn spec_decode_counters_reach_prometheus_as_cumulative_totals() -> Result<
 
     let mut totals = SpecDecodeCounters::new(2).expect("K within bounds");
     totals.observe_draft(2, 1);
-    server.publish_load(
+    server.publish_metrics(
         0,
-        &LoadSnapshot {
+        &SchedulerMetrics {
             spec_decode: Some(totals),
-            ..LoadSnapshot::default()
+            ..SchedulerMetrics::default()
         },
     )?;
     // `_total` is appended at exposition; the registered name scrapes empty.
@@ -370,11 +370,11 @@ async fn spec_decode_counters_reach_prometheus_as_cumulative_totals() -> Result<
     // the exposition layer can see it.
     totals.observe_draft(2, 2);
     totals.observe_draft(2, 2);
-    server.publish_load(
+    server.publish_metrics(
         0,
-        &LoadSnapshot {
+        &SchedulerMetrics {
             spec_decode: Some(totals),
-            ..LoadSnapshot::default()
+            ..SchedulerMetrics::default()
         },
     )?;
     wait_for_metrics(
@@ -464,7 +464,7 @@ async fn spec_decode_counters_reach_prometheus_as_cumulative_totals() -> Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_scheduler_load_feed_stops_the_endpoint() -> Result<()> {
     let mut server = SimServer::spawn_with_closed_load_feed().await?;
-    drop(server.load_txs.remove(0));
+    drop(server.metrics_txs.remove(0));
 
     let service_result = tokio::time::timeout(Duration::from_secs(10), &mut server.task)
         .await

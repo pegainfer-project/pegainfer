@@ -28,8 +28,8 @@ use super::kv::KvCapacity;
 use super::ledger::RequestLedger;
 use super::metrics::SchedulerMetrics;
 use super::request_lifecycle::RequestControl;
-use super::request_lifecycle::StepReceiver;
 use super::request_lifecycle::RequestEnvelope;
+use super::request_lifecycle::StepReceiver;
 use super::step::Request;
 use super::step::RequestId;
 

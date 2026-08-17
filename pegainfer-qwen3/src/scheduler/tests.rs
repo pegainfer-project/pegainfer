@@ -216,11 +216,15 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
 // here.
 #[test]
 fn request_local_chunks_are_independent_of_earlier_requests() {
-    let mk =
-        |id: u64, prompt_len| PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
+    let mk = |id: u64, prompt_len| {
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1))
+    };
     let simulate = |mut prefilling: Vec<PendingRequest>, request_local: bool| {
         let mut target_chunks = Vec::new();
-        while prefilling.iter().any(|req| req.request_id == RequestId::new(3)) {
+        while prefilling
+            .iter()
+            .any(|req| req.request_id == RequestId::new(3))
+        {
             let taken = take_prefill_chunks(&mut prefilling, 32, request_local);
             let mut continued = Vec::new();
             for mut req in taken {
@@ -259,8 +263,9 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
         pending.echo = true;
         pending
     };
-    let mk =
-        |id: u64, prompt_len| PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
+    let mk = |id: u64, prompt_len| {
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1))
+    };
 
     // Oversized echo is rejected by admission. If a caller bypasses
     // admission, the chunk picker must still keep it out of the profiled
@@ -300,8 +305,9 @@ fn oversized_echo_request_is_rejected_at_admission() {
         req.echo = true;
         PendingRequest::from_request(RequestId::new(id), req)
     };
-    let mk =
-        |id: u64, prompt_len| PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
+    let mk = |id: u64, prompt_len| {
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1))
+    };
 
     let outcome = admit_deferred_requests(
         vec![mk_echo(1, 33), mk(2, 64)],

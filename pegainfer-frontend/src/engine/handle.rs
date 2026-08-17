@@ -154,7 +154,10 @@ impl EngineHandle {
     /// empty vector is an invalid engine rather than a single partition with
     /// missing metrics.
     #[must_use]
-    pub fn with_metrics_watches(mut self, metrics_watches: Vec<watch::Receiver<SchedulerMetrics>>) -> Self {
+    pub fn with_metrics_watches(
+        mut self,
+        metrics_watches: Vec<watch::Receiver<SchedulerMetrics>>,
+    ) -> Self {
         assert!(
             !metrics_watches.is_empty(),
             "an engine must expose at least one scheduler partition"
@@ -173,7 +176,10 @@ impl EngineHandle {
     /// stays quiet when idle, so a consumer republishes on real change rather
     /// than polling. `None` if the partition does not report a load feed or the
     /// index is outside the engine topology.
-    pub(crate) fn metrics_watch_for(&self, partition: usize) -> Option<watch::Receiver<SchedulerMetrics>> {
+    pub(crate) fn metrics_watch_for(
+        &self,
+        partition: usize,
+    ) -> Option<watch::Receiver<SchedulerMetrics>> {
         self.metrics_watches.get(partition)?.clone()
     }
 

@@ -259,7 +259,11 @@ mod tests {
 
     #[test]
     fn batched_all_match_still_adds_block_end_posterior() {
-        let req = VerifyStepItem::new(RequestId::new(8), vec![20, 21, 22], SamplingParams::default());
+        let req = VerifyStepItem::new(
+            RequestId::new(8),
+            vec![20, 21, 22],
+            SamplingParams::default(),
+        );
         let results = build_verify_results(&[req], &[21, 22, 23]).expect("verify results");
         assert_eq!(results[0].matched_draft_tokens, 2);
         assert_eq!(results[0].accepted_tokens, vec![21, 22, 23]);

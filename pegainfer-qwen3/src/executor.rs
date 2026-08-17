@@ -55,6 +55,10 @@ mod spec;
 use dflash_lane::DFlashLaneState;
 use dflash_prefill::DFlashPrefillAction;
 use dflash_prefill::dflash_prefill_action;
+/// The contract's request id, end to end: the wiring mints it at submit and
+/// every internal queue, effect, and KV key uses it unchanged — there is no
+/// second id space to map across.
+pub use pegainfer_frontend::engine::RequestId;
 
 use crate::dflash::DFlashDraftModel;
 use crate::speculative::DraftPlan;
@@ -65,11 +69,6 @@ use crate::speculative::VerifyResult;
 use crate::speculative::VerifyStepItem;
 use crate::speculative::build_verify_results;
 use crate::verify_graph::VerifyGraphBuffers;
-
-/// The contract's request id, end to end: the wiring mints it at submit and
-/// every internal queue, effect, and KV key uses it unchanged — there is no
-/// second id space to map across.
-pub use pegainfer_frontend::engine::RequestId;
 
 #[derive(Clone)]
 pub struct PrefillStepItem {

@@ -28,15 +28,15 @@ use std::time::Instant;
 use super::event::FinishReason;
 use super::event::TokenLogprob;
 use super::request_lifecycle::DeferredFinish;
-use super::request_lifecycle::StepSender;
 use super::request_lifecycle::RequestEnvelope;
+use super::request_lifecycle::StepSender;
 use super::step::PromptEcho;
+use super::step::QueuedRequest;
 use super::step::RejectReason;
 use super::step::RequestId;
 use super::step::RequestUpdate;
 use super::step::ScheduledInfo;
 use super::step::StepOutputs;
-use super::step::QueuedRequest;
 use super::step::Terminal;
 
 /// One open account: the request's admission facts and running tally. The
@@ -116,15 +116,15 @@ impl RequestLedger {
     }
 
     fn account(&self, id: RequestId) -> &Account {
-        self.accounts
-            .get(&id)
-            .unwrap_or_else(|| panic!("no open account for {id}: already answered, or never registered"))
+        self.accounts.get(&id).unwrap_or_else(|| {
+            panic!("no open account for {id}: already answered, or never registered")
+        })
     }
 
     fn close(&mut self, id: RequestId) -> Account {
-        self.accounts
-            .remove(&id)
-            .unwrap_or_else(|| panic!("no open account for {id}: already answered, or never registered"))
+        self.accounts.remove(&id).unwrap_or_else(|| {
+            panic!("no open account for {id}: already answered, or never registered")
+        })
     }
 
     // ── Queries ─────────────────────────────────────────────────────────
@@ -158,10 +158,9 @@ impl RequestLedger {
 
     /// Admit the request: stamp `scheduled_at` and buffer the admission facts.
     pub fn admit(&mut self, id: RequestId) {
-        let account = self
-            .accounts
-            .get_mut(&id)
-            .unwrap_or_else(|| panic!("no open account for {id}: already answered, or never registered"));
+        let account = self.accounts.get_mut(&id).unwrap_or_else(|| {
+            panic!("no open account for {id}: already answered, or never registered")
+        });
         assert!(
             matches!(account.state, AccountState::Queued),
             "admit on already-admitted request {id}"
@@ -199,10 +198,9 @@ impl RequestLedger {
             logprobs.is_empty() || logprobs.len() == ids.len(),
             "logprobs must be absent or parallel to tokens"
         );
-        let account = self
-            .accounts
-            .get_mut(&id)
-            .unwrap_or_else(|| panic!("no open account for {id}: already answered, or never registered"));
+        let account = self.accounts.get_mut(&id).unwrap_or_else(|| {
+            panic!("no open account for {id}: already answered, or never registered")
+        });
         let AccountState::Active { completion_tokens } = &mut account.state else {
             panic!("push_tokens on {id} before admission");
         };
@@ -218,7 +216,10 @@ impl RequestLedger {
 
     /// Report the prefix-cache hit count, in the step the scheduler learns it.
     pub fn set_cached_tokens(&mut self, id: RequestId, cached_tokens: usize) {
-        assert!(self.is_active(id), "set_cached_tokens on {id} before admission");
+        assert!(
+            self.is_active(id),
+            "set_cached_tokens on {id} before admission"
+        );
         self.statement.entry(id).cached_tokens = Some(cached_tokens);
     }
 
