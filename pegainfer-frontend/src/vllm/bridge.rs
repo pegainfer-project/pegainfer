@@ -878,6 +878,7 @@ fn engine_output(
         stop_reason,
         events,
         kv_transfer_params: None,
+        ec_transfer_params: None,
         trace_headers: None,
         prefill_stats,
         routed_experts: None,
