@@ -27,8 +27,6 @@ use super::DecodeSlot;
 use super::K3SchedulerConfig;
 use super::SlotId;
 use super::StepExecutor;
-use super::UNWIRED_MESSAGE;
-use super::launch_unwired;
 use super::start_with_executors;
 
 const EOS_TOKEN: u32 = 99;
@@ -49,6 +47,7 @@ struct FakeExecutor {
     /// Emit [`EOS_TOKEN`] instead of the scripted token at this step index
     /// (0 = at prefill).
     eos_at: Option<u32>,
+    fail_next_prefill: bool,
     fail_next_decode: bool,
     decode_delay: Duration,
     released: Arc<Mutex<Vec<SlotId>>>,
@@ -62,6 +61,7 @@ impl FakeExecutor {
             steps: HashMap::new(),
             live: HashSet::new(),
             eos_at: None,
+            fail_next_prefill: false,
             fail_next_decode: false,
             decode_delay: Duration::ZERO,
             released,
@@ -75,6 +75,11 @@ impl FakeExecutor {
 
     fn with_eos_at(mut self, step: u32) -> Self {
         self.eos_at = Some(step);
+        self
+    }
+
+    fn with_one_prefill_failure(mut self) -> Self {
+        self.fail_next_prefill = true;
         self
     }
 
@@ -108,6 +113,11 @@ impl StepExecutor for FakeExecutor {
 
     fn prefill(&mut self, slot: SlotId, _prompt: &[u32], _params: &SamplingParams) -> Result<u32> {
         assert!(self.live.insert(slot), "slot {slot} was handed out twice");
+        if std::mem::take(&mut self.fail_next_prefill) {
+            // The scheduler already reserved the slot and will `release` it
+            // on this error, so the seat is live until then.
+            anyhow::bail!("fake prefill failure");
+        }
         self.steps.insert(slot, 0);
         Ok(self.token(slot, 0))
     }
@@ -432,6 +442,43 @@ fn aborted_request_retires_silently_and_frees_its_slot() {
 }
 
 #[test]
+fn prefill_failure_fails_the_request_and_the_scheduler_keeps_serving() {
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(4, Arc::clone(&released)).with_one_prefill_failure();
+    let (partition, mut steps) = launch(executor);
+
+    let doomed = partition.handle.submit(request(4, 8));
+    let (tokens, terminal) = steps.collect_terminal(doomed.id());
+    assert!(tokens.is_empty(), "a prefill failure produces no tokens");
+    match terminal {
+        Terminal::Failed {
+            message,
+            prompt_tokens,
+            completion_tokens,
+        } => {
+            assert!(message.contains("fake prefill failure"), "{message}");
+            assert_eq!((prompt_tokens, completion_tokens), (4, 0));
+        }
+        other => panic!("a prefill failure must surface as Failed, got {other:?}"),
+    }
+    assert!(
+        wait_until(Duration::from_secs(1), || released
+            .lock()
+            .expect("released log")
+            .contains(&0)),
+        "a failed prefill must give its slot back"
+    );
+
+    let after = partition.handle.submit(request(4, 2));
+    let (tokens, terminal) = steps.collect_terminal(after.id());
+    assert_eq!(tokens, vec![10, 11]);
+    assert!(
+        matches!(terminal, Terminal::Finished { .. }),
+        "{terminal:?}"
+    );
+}
+
+#[test]
 fn decode_failure_fails_the_batch_and_the_scheduler_keeps_serving() {
     let released = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(4, Arc::clone(&released)).with_one_decode_failure();
@@ -490,29 +537,5 @@ fn requests_beyond_the_slot_budget_wait_instead_of_being_refused() {
             ),
             "{terminal:?}"
         );
-    }
-}
-
-#[test]
-fn unwired_engine_spawns_one_scheduler_per_partition_and_fails_honestly() {
-    let engine = launch_unwired(4, vec![EOS_TOKEN]);
-    assert_eq!(engine.schedulers.len(), 4);
-    assert!(
-        engine.info.kv_capacity.is_none() && engine.lora.is_none(),
-        "the phase-1 engine reports no KV pool and no adapters"
-    );
-
-    let (partition, mut steps) = partition(engine);
-    let control = partition.handle.submit(request(4, 8));
-    let (tokens, terminal) = steps.collect_terminal(control.id());
-    assert!(
-        tokens.is_empty(),
-        "an engine without a model must not invent tokens"
-    );
-    match terminal {
-        Terminal::Failed { message, .. } => {
-            assert_eq!(message, UNWIRED_MESSAGE);
-        }
-        other => panic!("the placeholder engine must fail requests, got {other:?}"),
     }
 }
