@@ -29,14 +29,14 @@ use super::event::FinishReason;
 use super::event::TokenLogprob;
 use super::request_lifecycle::DeferredFinish;
 use super::request_lifecycle::StepSender;
-use super::request_lifecycle::Submission;
+use super::request_lifecycle::RequestEnvelope;
 use super::step::PromptEcho;
 use super::step::RejectReason;
-use super::step::Request;
 use super::step::RequestId;
 use super::step::RequestUpdate;
 use super::step::ScheduledInfo;
 use super::step::StepOutputs;
+use super::step::QueuedRequest;
 use super::step::Terminal;
 
 /// One open account: the request's admission facts and running tally. The
@@ -296,11 +296,11 @@ impl RequestLedger {
 
     // ── Driver face ─────────────────────────────────────────────────────
 
-    /// Open the account and hand back the id and payload for
+    /// Open the account and hand back the [`QueuedRequest`] for
     /// [`super::Scheduler::submit`]. Consumes (and disarms) the envelope: from
     /// here on, the account carries the answer-on-drop duty.
-    pub(crate) fn register(&mut self, submission: Submission) -> (RequestId, Request) {
-        let inner = submission.consume();
+    pub(crate) fn register(&mut self, envelope: RequestEnvelope) -> QueuedRequest {
+        let inner = envelope.consume();
         let account = Account {
             abort: inner.abort,
             prompt_len: inner.request.prompt_tokens.len(),
@@ -308,8 +308,11 @@ impl RequestLedger {
             state: AccountState::Queued,
         };
         let previous = self.accounts.insert(inner.id, account);
-        assert!(previous.is_none(), "duplicate submission id {}", inner.id);
-        (inner.id, inner.request)
+        assert!(previous.is_none(), "duplicate request id {}", inner.id);
+        QueuedRequest {
+            id: inner.id,
+            request: inner.request,
+        }
     }
 
     /// Ship the step's statement as one message; a step that touched nothing
@@ -392,8 +395,8 @@ mod tests {
     fn admission_tokens_and_finish_fold_into_one_entry() {
         let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1, 2, 3]));
-        let submission = backend.submissions.try_recv().expect("submission");
-        let (id, _request) = backend.ledger.register(submission);
+        let envelope = backend.submissions.try_recv().expect("envelope");
+        let id = backend.ledger.register(envelope).id;
 
         backend.ledger.admit(id);
         backend.ledger.push_tokens(id, &[10, 11], &[]);
@@ -426,8 +429,8 @@ mod tests {
     fn reject_carries_prompt_len_and_no_tokens() {
         let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1; 5]));
-        let submission = backend.submissions.try_recv().expect("submission");
-        let (id, _request) = backend.ledger.register(submission);
+        let envelope = backend.submissions.try_recv().expect("envelope");
+        let id = backend.ledger.register(envelope).id;
         backend.ledger.reject(
             id,
             RejectReason::ContextLength {
@@ -455,8 +458,8 @@ mod tests {
     fn retire_discards_buffered_output() {
         let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1]));
-        let submission = backend.submissions.try_recv().expect("submission");
-        let (id, _request) = backend.ledger.register(submission);
+        let envelope = backend.submissions.try_recv().expect("envelope");
+        let id = backend.ledger.register(envelope).id;
         backend.ledger.admit(id);
         backend.ledger.push_tokens(id, &[9], &[]);
         backend.ledger.retire(id);
@@ -471,8 +474,8 @@ mod tests {
     fn defer_finish_folds_step_output_and_delivers_late() {
         let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1, 2]));
-        let submission = backend.submissions.try_recv().expect("submission");
-        let (id, _request) = backend.ledger.register(submission);
+        let envelope = backend.submissions.try_recv().expect("envelope");
+        let id = backend.ledger.register(envelope).id;
         backend.ledger.admit(id);
         backend.ledger.push_tokens(id, &[7], &[]);
         let deferred = backend.ledger.defer_finish(id, FinishReason::Length);
@@ -505,12 +508,10 @@ mod tests {
         let (handle, mut backend) = scheduler_pair();
         let _c0 = handle.submit(request(vec![1]));
         let _c1 = handle.submit(request(vec![2, 3]));
-        let (_queued, _) = {
-            let submission = backend.submissions.try_recv().expect("submission 0");
-            backend.ledger.register(submission)
-        };
-        let submission = backend.submissions.try_recv().expect("submission 1");
-        let (admitted, _request) = backend.ledger.register(submission);
+        let envelope = backend.submissions.try_recv().expect("envelope 0");
+        let _queued = backend.ledger.register(envelope).id;
+        let envelope = backend.submissions.try_recv().expect("envelope 1");
+        let admitted = backend.ledger.register(envelope).id;
         backend.ledger.admit(admitted);
 
         // Ledger falls with both accounts open: one queued, one active.
@@ -534,8 +535,8 @@ mod tests {
     fn abort_flag_is_visible_through_both_states() {
         let (handle, mut backend) = scheduler_pair();
         let control = handle.submit(request(vec![1]));
-        let submission = backend.submissions.try_recv().expect("submission");
-        let (id, _request) = backend.ledger.register(submission);
+        let envelope = backend.submissions.try_recv().expect("envelope");
+        let id = backend.ledger.register(envelope).id;
         assert!(!backend.ledger.is_aborted(id));
 
         control.abort();
@@ -565,8 +566,8 @@ mod tests {
     fn touching_a_closed_account_panics() {
         let (handle, mut backend) = scheduler_pair();
         let _control = handle.submit(request(vec![1]));
-        let submission = backend.submissions.try_recv().expect("submission");
-        let (id, _request) = backend.ledger.register(submission);
+        let envelope = backend.submissions.try_recv().expect("envelope");
+        let id = backend.ledger.register(envelope).id;
         backend.ledger.admit(id);
         backend.ledger.finish(id, FinishReason::Stop);
         backend.ledger.push_tokens(id, &[1], &[]);

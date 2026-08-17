@@ -67,8 +67,16 @@ pub struct Request {
     pub client_label: Option<std::sync::Arc<str>>,
 }
 
+/// One submitted request as the scheduler receives it: the id of its open
+/// ledger account, and the payload. The id is minted by
+/// [`super::SchedulerHandle::submit`]; a payload never carries one of its own.
+pub struct QueuedRequest {
+    pub id: RequestId,
+    pub request: Request,
+}
+
 /// Everything one scheduler step produced, in one message. The scheduler-side
-/// emitter sends exactly one per step that touched any request; an idle step
+/// ledger sends exactly one per step that touched any request; an idle step
 /// sends nothing.
 #[derive(Debug, Default)]
 pub struct StepOutputs {

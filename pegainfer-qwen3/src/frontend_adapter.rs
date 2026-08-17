@@ -37,8 +37,8 @@ use pegainfer_frontend::engine::LoraClient;
 use pegainfer_frontend::engine::LoraControl;
 use pegainfer_frontend::engine::LoraControlReceiver;
 use pegainfer_frontend::engine::PromptEcho;
+use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
-use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
@@ -578,9 +578,10 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
 }
 
 impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
-    fn submit(&mut self, id: RequestId, request: Request) {
+    fn submit(&mut self, request: QueuedRequest) {
         // Already-aborted requests ride the normal path: admission re-checks
         // the abort flag and retires them (`admit_or_retire`).
+        let QueuedRequest { id, request } = request;
         self.tracker.enter_queue(id, request.trace_parent);
         let pending = PendingRequest::from_request(id, request);
         if self.pending_control.is_empty() {

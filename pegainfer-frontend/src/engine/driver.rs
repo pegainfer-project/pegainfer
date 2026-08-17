@@ -10,8 +10,7 @@
 
 use super::ledger::RequestLedger;
 use super::metrics::SchedulerMetrics;
-use super::step::Request;
-use super::step::RequestId;
+use super::step::QueuedRequest;
 use super::wiring::LiveScheduler;
 use super::wiring::SchedulerBackend;
 use super::wiring::scheduler_pair;
@@ -19,14 +18,13 @@ use super::wiring::scheduler_pair;
 /// One scheduler's runtime behavior. Runs on a dedicated OS thread spawned
 /// by [`spawn_scheduler`]; `Send` suffices.
 pub trait Scheduler: Send {
-    /// Take ownership of one submitted request: `id` names its open account
-    /// on the ledger, `request` is the payload. Ownership transfer only —
+    /// Take ownership of one submitted request. Ownership transfer only —
     /// every verdict (admit/reject/retire) is written to the ledger from
     /// [`Self::step`], the single emission site. Nothing is lost by
     /// deferring: the driver commits once per iteration, so a verdict
     /// recorded in `step` lands in the same commit a submit-time verdict
     /// would have.
-    fn submit(&mut self, id: RequestId, request: Request);
+    fn submit(&mut self, request: QueuedRequest);
 
     /// Advance one step: admission, GPU work, and per-request ledger writes.
     /// The driver loops over this without pause — an idle scheduler returns
@@ -68,9 +66,9 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
     loop {
         loop {
             match submissions.try_recv() {
-                Ok(submission) => {
-                    let (id, request) = ledger.register(submission);
-                    scheduler.submit(id, request);
+                Ok(envelope) => {
+                    let queued = ledger.register(envelope);
+                    scheduler.submit(queued);
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -107,6 +105,8 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::step::Request;
+    use super::super::step::RequestId;
     use super::super::step::Terminal;
     use super::*;
     use crate::engine::FinishReason;
@@ -120,8 +120,8 @@ mod tests {
     }
 
     impl Scheduler for EchoScheduler {
-        fn submit(&mut self, id: RequestId, request: Request) {
-            self.queued.push((id, request.max_tokens));
+        fn submit(&mut self, request: QueuedRequest) {
+            self.queued.push((request.id, request.request.max_tokens));
         }
 
         fn step(&mut self, ledger: &mut RequestLedger) -> anyhow::Result<()> {

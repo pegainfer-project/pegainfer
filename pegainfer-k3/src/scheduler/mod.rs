@@ -26,6 +26,7 @@ use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::KvCapacity;
+use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestId;
@@ -116,12 +117,6 @@ fn finish_or_retire(id: RequestId, reason: FinishReason, ledger: &mut RequestLed
     }
 }
 
-/// A submitted request waiting for a slot.
-struct PendingRequest {
-    id: RequestId,
-    request: Request,
-}
-
 /// An admitted request occupying an execution slot.
 struct RunningRequest {
     id: RequestId,
@@ -136,10 +131,10 @@ pub struct K3Scheduler<E: StepExecutor> {
     executor: E,
     eos_token_ids: Vec<u32>,
     kv_capacity: Option<KvCapacity>,
-    /// Requests waiting for a slot, in submission order. A full batch is a
+    /// Requests waiting for a slot, in submit order. A full batch is a
     /// wait, not a verdict — only permanently unservable requests are refused
     /// (see [`K3Scheduler::admission_refusal`]).
-    queued: VecDeque<PendingRequest>,
+    queued: VecDeque<QueuedRequest>,
     running: Vec<RunningRequest>,
     /// Slots not currently held by a running request.
     free_slots: Vec<SlotId>,
@@ -327,11 +322,11 @@ impl<E: StepExecutor> K3Scheduler<E> {
 }
 
 impl<E: StepExecutor> Scheduler for K3Scheduler<E> {
-    fn submit(&mut self, id: RequestId, request: Request) {
+    fn submit(&mut self, request: QueuedRequest) {
         // Ownership transfer only; every verdict is written to the ledger
         // from `step`. Requests already aborted when submitted ride the
         // normal path — admission re-checks the flag and retires them.
-        self.queued.push_back(PendingRequest { id, request });
+        self.queued.push_back(request);
     }
 
     fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {

@@ -6,7 +6,7 @@
 //! *outside* the ledger's reach and therefore need their own answer-on-drop
 //! guarantee:
 //!
-//! - [`Submission`] — the channel envelope between
+//! - [`RequestEnvelope`] — the channel envelope between
 //!   [`super::SchedulerHandle::submit`] and the driver's
 //!   [`super::RequestLedger::register`]. It covers the window where the
 //!   request exists but no ledger account does yet: sitting in the submit
@@ -41,12 +41,12 @@ pub type StepReceiver = tokio::sync::mpsc::UnboundedReceiver<StepOutputs>;
 /// Minted by [`super::SchedulerHandle::submit`]; consumed (and thereby
 /// disarmed) by [`super::RequestLedger::register`], which opens the ledger
 /// account that takes over the answer-on-drop duty.
-pub(crate) struct Submission {
+pub(crate) struct RequestEnvelope {
     /// `Some` until [`Self::consume`]; `Drop` fires on `Some`.
-    inner: Option<SubmissionInner>,
+    inner: Option<EnvelopeInner>,
 }
 
-pub(crate) struct SubmissionInner {
+pub(crate) struct EnvelopeInner {
     pub(crate) id: RequestId,
     pub(crate) abort: Arc<AtomicBool>,
     pub(crate) tx: StepSender,
@@ -54,7 +54,7 @@ pub(crate) struct SubmissionInner {
     pub(crate) queued_at: Instant,
 }
 
-impl Submission {
+impl RequestEnvelope {
     pub(crate) fn new(
         id: RequestId,
         abort: Arc<AtomicBool>,
@@ -63,7 +63,7 @@ impl Submission {
         queued_at: Instant,
     ) -> Self {
         Self {
-            inner: Some(SubmissionInner {
+            inner: Some(EnvelopeInner {
                 id,
                 abort,
                 tx,
@@ -73,7 +73,7 @@ impl Submission {
         }
     }
 
-    pub(crate) fn consume(mut self) -> SubmissionInner {
+    pub(crate) fn consume(mut self) -> EnvelopeInner {
         self.inner.take().expect("submission consumed twice")
     }
 }
@@ -81,7 +81,7 @@ impl Submission {
 /// A submission dropped unconsumed never reached a ledger account: the
 /// scheduler is gone (send failed, or the channel fell with the driver).
 /// Answer the request so the client observes a terminal instead of a hang.
-impl Drop for Submission {
+impl Drop for RequestEnvelope {
     fn drop(&mut self) {
         let Some(inner) = self.inner.take() else {
             return;

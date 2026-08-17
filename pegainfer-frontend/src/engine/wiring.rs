@@ -29,7 +29,7 @@ use super::ledger::RequestLedger;
 use super::metrics::SchedulerMetrics;
 use super::request_lifecycle::RequestControl;
 use super::request_lifecycle::StepReceiver;
-use super::request_lifecycle::Submission;
+use super::request_lifecycle::RequestEnvelope;
 use super::step::Request;
 use super::step::RequestId;
 
@@ -37,7 +37,7 @@ use super::step::RequestId;
 /// ([`super::drive`]) destructures this; model code only ever sees the
 /// ledger, through the `step` argument.
 pub struct SchedulerBackend {
-    pub(crate) submissions: crossbeam_channel::Receiver<Submission>,
+    pub(crate) submissions: crossbeam_channel::Receiver<RequestEnvelope>,
     pub(crate) ledger: RequestLedger,
     pub(crate) metrics: MetricsPublisher,
 }
@@ -62,7 +62,7 @@ impl MetricsPublisher {
 
 /// The frontend's end of one running scheduler.
 pub struct SchedulerHandle {
-    submit_tx: crossbeam_channel::Sender<Submission>,
+    submit_tx: crossbeam_channel::Sender<RequestEnvelope>,
     steps: Option<StepReceiver>,
     metrics: Arc<Mutex<SchedulerMetrics>>,
     next_id: AtomicU64,
@@ -74,15 +74,16 @@ pub struct SchedulerHandle {
 impl SchedulerHandle {
     /// Mint identity, queue timestamp, and abort flag, then hand the request
     /// to the scheduler. Never fails: if the scheduler is gone, the
-    /// [`Submission`] envelope's drop bomb answers the request with a
+    /// [`RequestEnvelope`]'s drop bomb answers the request with a
     /// `Failed` terminal on the step stream, which the caller observes like
     /// any other terminal.
     pub fn submit(&self, request: Request) -> RequestControl {
         let id = RequestId::new(self.next_id.fetch_add(1, Ordering::Relaxed));
         let abort = Arc::new(AtomicBool::new(false));
         let control = RequestControl::new(id, Arc::clone(&abort));
-        let submission = Submission::new(id, abort, self.step_tx.clone(), request, Instant::now());
-        if let Err(returned) = self.submit_tx.send(submission) {
+        let envelope =
+            RequestEnvelope::new(id, abort, self.step_tx.clone(), request, Instant::now());
+        if let Err(returned) = self.submit_tx.send(envelope) {
             drop(returned.into_inner());
         }
         control

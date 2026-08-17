@@ -30,7 +30,7 @@ use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::LaunchedEngine;
-use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
@@ -98,7 +98,7 @@ impl ModelLine for EchoLine {
 /// streaming path warm instead of collapsing the response into one batch.
 #[derive(Default)]
 struct EchoScheduler {
-    queued: Vec<(RequestId, Request)>,
+    queued: Vec<QueuedRequest>,
     running: Vec<RunningRequest>,
 }
 
@@ -114,12 +114,12 @@ struct RunningRequest {
 }
 
 impl Scheduler for EchoScheduler {
-    fn submit(&mut self, id: RequestId, request: Request) {
-        self.queued.push((id, request));
+    fn submit(&mut self, request: QueuedRequest) {
+        self.queued.push(request);
     }
 
     fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
-        for (id, request) in self.queued.drain(..) {
+        for QueuedRequest { id, request } in self.queued.drain(..) {
             if ledger.is_aborted(id) {
                 ledger.retire(id);
                 continue;
