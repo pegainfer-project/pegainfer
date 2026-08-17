@@ -29,12 +29,12 @@ fn active_state(request_id: u64, generated_count: usize, max_tokens: usize) -> A
 
 #[test]
 fn kv_budget_distinguishes_written_tokens_from_lifetime_blocks() {
-    let pending = PendingRequest::from_request(RequestId(7), request(16, 1));
+    let pending = PendingRequest::from_request(RequestId::new(7), request(16, 1));
     assert_eq!(max_request_tokens(&pending), 16);
     assert_eq!(blocks_needed(max_request_tokens(&pending), 16), 1);
     assert_eq!(pending_lifetime_blocks(&pending, 16), 1);
 
-    let pending = PendingRequest::from_request(RequestId(8), request(16, 17));
+    let pending = PendingRequest::from_request(RequestId::new(8), request(16, 17));
     assert_eq!(max_request_tokens(&pending), 32);
     assert_eq!(blocks_needed(max_request_tokens(&pending), 16), 2);
     assert_eq!(pending_lifetime_blocks(&pending, 16), 3);
@@ -62,7 +62,7 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
     }];
 
     let mk = |id: u64, prompt_len, max_tokens| {
-        PendingRequest::from_request(RequestId(id), request(prompt_len, max_tokens))
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, max_tokens))
     };
     let deferred = vec![
         mk(1, 16, 1), // one-token completion on a page boundary: admitted
@@ -75,7 +75,7 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
     let outcome =
         admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, 32, |_| 0);
 
-    let ids = |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
+    let ids = |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.raw()).collect::<Vec<_>>();
     assert_eq!(
         ids(&outcome.pending),
         vec![1, 2],
@@ -89,7 +89,7 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
     let rejected_ids = outcome
         .rejected
         .iter()
-        .map(|(r, _)| r.request_id.get())
+        .map(|(r, _)| r.request_id.raw())
         .collect::<Vec<_>>();
     assert_eq!(
         rejected_ids,
@@ -102,7 +102,7 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
 fn requests_exceeding_context_window_are_rejected() {
     let active: [ActiveRequestState; 0] = [];
     let mk = |id: u64, prompt_len, max_tokens| {
-        PendingRequest::from_request(RequestId(id), request(prompt_len, max_tokens))
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, max_tokens))
     };
 
     let deferred = vec![
@@ -117,7 +117,7 @@ fn requests_exceeding_context_window_are_rejected() {
     let pending_ids = outcome
         .pending
         .iter()
-        .map(|r| r.request_id.get())
+        .map(|r| r.request_id.raw())
         .collect::<Vec<_>>();
     assert_eq!(
         pending_ids,
@@ -128,7 +128,7 @@ fn requests_exceeding_context_window_are_rejected() {
     let rejected_ids = outcome
         .rejected
         .iter()
-        .map(|(r, _)| r.request_id.get())
+        .map(|(r, _)| r.request_id.raw())
         .collect::<Vec<_>>();
     assert_eq!(rejected_ids, vec![2, 3]);
     for (_, reason) in &outcome.rejected {
@@ -142,7 +142,7 @@ fn requests_exceeding_context_window_are_rejected() {
 #[test]
 fn admission_respects_decode_batch_capacity() {
     let active: Vec<ActiveRequestState> = (0..64).map(|id| active_state(id, 1, 2)).collect();
-    let pending = PendingRequest::from_request(RequestId(64), request(16, 1));
+    let pending = PendingRequest::from_request(RequestId::new(64), request(16, 1));
 
     let outcome = admit_deferred_requests(
         vec![pending],
@@ -163,7 +163,7 @@ fn admission_respects_decode_batch_capacity() {
     );
     assert_eq!(
         outcome.deferred[0].request_id,
-        RequestId(64),
+        RequestId::new(64),
         "capacity-starved request should stay deferred"
     );
     assert!(outcome.rejected.is_empty());
@@ -172,7 +172,7 @@ fn admission_respects_decode_batch_capacity() {
 #[test]
 fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
     let mk = |id: u64, prompt_len, max_tokens| {
-        PendingRequest::from_request(RequestId(id), request(prompt_len, max_tokens))
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, max_tokens))
     };
 
     // A prompt larger than the budget is split: the head request gets a
@@ -180,11 +180,11 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
     let mut prefilling = vec![mk(1, 64, 1), mk(2, 16, 1)];
     let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].request_id, RequestId(1));
+    assert_eq!(taken[0].request_id, RequestId::new(1));
     assert_eq!(taken[0].step_chunk, 32, "chunk is capped at the budget");
     assert_eq!(
         prefilling[0].request_id,
-        RequestId(2),
+        RequestId::new(2),
         "follow-up waits for the next step once the budget is spent"
     );
 
@@ -197,7 +197,7 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
         vec![16, 16],
         "16 + 16 fills the 32-token budget"
     );
-    assert_eq!(prefilling[0].request_id, RequestId(5));
+    assert_eq!(prefilling[0].request_id, RequestId::new(5));
 
     // A partially-prefilled head request only consumes its remainder.
     let mut head = mk(6, 64, 1);
@@ -217,14 +217,14 @@ fn prefill_chunking_caps_step_tokens_and_keeps_fifo_progress() {
 #[test]
 fn request_local_chunks_are_independent_of_earlier_requests() {
     let mk =
-        |id: u64, prompt_len| PendingRequest::from_request(RequestId(id), request(prompt_len, 1));
+        |id: u64, prompt_len| PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
     let simulate = |mut prefilling: Vec<PendingRequest>, request_local: bool| {
         let mut target_chunks = Vec::new();
-        while prefilling.iter().any(|req| req.request_id == RequestId(3)) {
+        while prefilling.iter().any(|req| req.request_id == RequestId::new(3)) {
             let taken = take_prefill_chunks(&mut prefilling, 32, request_local);
             let mut continued = Vec::new();
             for mut req in taken {
-                if req.request_id == RequestId(3) {
+                if req.request_id == RequestId::new(3) {
                     target_chunks.push(req.step_chunk);
                 }
                 req.prefill_pos += req.step_chunk;
@@ -255,12 +255,12 @@ fn request_local_chunks_are_independent_of_earlier_requests() {
 #[test]
 fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
     let mk_echo = |id: u64, prompt_len| {
-        let mut pending = PendingRequest::from_request(RequestId(id), request(prompt_len, 1));
+        let mut pending = PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
         pending.echo = true;
         pending
     };
     let mk =
-        |id: u64, prompt_len| PendingRequest::from_request(RequestId(id), request(prompt_len, 1));
+        |id: u64, prompt_len| PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
 
     // Oversized echo is rejected by admission. If a caller bypasses
     // admission, the chunk picker must still keep it out of the profiled
@@ -268,11 +268,11 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
     let mut prefilling = vec![mk_echo(1, 64), mk(2, 16)];
     let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].request_id, RequestId(2));
+    assert_eq!(taken[0].request_id, RequestId::new(2));
     assert_eq!(taken[0].step_chunk, 16);
     assert_eq!(
         prefilling[0].request_id,
-        RequestId(1),
+        RequestId::new(1),
         "oversized echo stays queued if admission was bypassed"
     );
 
@@ -284,12 +284,12 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
     assert_eq!(
         taken
             .iter()
-            .map(|r| (r.request_id.get(), r.step_chunk))
+            .map(|r| (r.request_id.raw(), r.step_chunk))
             .collect::<Vec<_>>(),
         vec![(3, 24), (5, 8)],
         "echo skipped, leftover budget goes to the next non-echo request"
     );
-    assert_eq!(prefilling[0].request_id, RequestId(4));
+    assert_eq!(prefilling[0].request_id, RequestId::new(4));
 }
 
 #[test]
@@ -298,10 +298,10 @@ fn oversized_echo_request_is_rejected_at_admission() {
     let mk_echo = |id: u64, prompt_len| {
         let mut req = request(prompt_len, 1);
         req.echo = true;
-        PendingRequest::from_request(RequestId(id), req)
+        PendingRequest::from_request(RequestId::new(id), req)
     };
     let mk =
-        |id: u64, prompt_len| PendingRequest::from_request(RequestId(id), request(prompt_len, 1));
+        |id: u64, prompt_len| PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
 
     let outcome = admit_deferred_requests(
         vec![mk_echo(1, 33), mk(2, 64)],
@@ -320,13 +320,13 @@ fn oversized_echo_request_is_rejected_at_admission() {
         outcome
             .pending
             .iter()
-            .map(|r| r.request_id.get())
+            .map(|r| r.request_id.raw())
             .collect::<Vec<_>>(),
         vec![2],
         "non-echo oversized prompts can still be admitted and chunked"
     );
     assert_eq!(outcome.rejected.len(), 1);
-    assert_eq!(outcome.rejected[0].0.request_id, RequestId(1));
+    assert_eq!(outcome.rejected[0].0.request_id, RequestId::new(1));
     assert!(
         matches!(
             outcome.rejected[0].1,
@@ -340,7 +340,7 @@ fn oversized_echo_request_is_rejected_at_admission() {
 fn page_boundary_lifetime_blocks_gate_admission() {
     let active: [ActiveRequestState; 0] = [];
     let mk = |id: u64, prompt_len, max_tokens| {
-        PendingRequest::from_request(RequestId(id), request(prompt_len, max_tokens))
+        PendingRequest::from_request(RequestId::new(id), request(prompt_len, max_tokens))
     };
 
     let under_reserved = admit_deferred_requests(
@@ -379,7 +379,7 @@ fn page_boundary_lifetime_blocks_gate_admission() {
     );
     assert_eq!(
         exactly_reserved.pending[0].request_id,
-        RequestId(2),
+        RequestId::new(2),
         "ceil((prompt + max_tokens) / block_size) admits the request"
     );
     assert!(exactly_reserved.rejected.is_empty());
@@ -483,9 +483,9 @@ fn echo_requests_are_never_offered_to_prefetch() {
     // The plain request is probed; the echo request is skipped entirely, so
     // its prefill forwards the whole prompt without parking unspendable KV.
     assert_eq!(*offers.lock().unwrap(), vec![2]);
-    let echo = deferred.iter().find(|r| r.request_id.get() == 1).unwrap();
+    let echo = deferred.iter().find(|r| r.request_id.raw() == 1).unwrap();
     assert!(!echo.prefetch_offered, "echo request must stay un-probed");
-    let plain = deferred.iter().find(|r| r.request_id.get() == 2).unwrap();
+    let plain = deferred.iter().find(|r| r.request_id.raw() == 2).unwrap();
     assert!(
         plain.prefetch_offered,
         "plain request must be marked probed"
@@ -515,7 +515,7 @@ fn spec_active(
 
 fn spec_result(id: u64, accepted: Vec<u32>) -> VerifyRequestResult {
     VerifyRequestResult {
-        request_id: RequestId(id),
+        request_id: RequestId::new(id),
         matched_draft_tokens: accepted.len().saturating_sub(1),
         accepted_tokens: accepted,
     }
@@ -537,7 +537,7 @@ fn speculative_full_span_accept_continues() {
                 completion_tokens,
             },
         ] => {
-            assert_eq!(*request_id, RequestId(1));
+            assert_eq!(*request_id, RequestId::new(1));
             assert_eq!(tokens, &vec![10, 11, 12, 13]);
             assert_eq!(
                 *completion_tokens,
@@ -651,11 +651,11 @@ fn speculative_resolves_each_request_independently() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     assert!(matches!(
         &effects[0],
-        effects::DecodeEffect::EmitManyAndContinue { request_id, .. } if *request_id == RequestId(1)
+        effects::DecodeEffect::EmitManyAndContinue { request_id, .. } if *request_id == RequestId::new(1)
     ));
     assert!(matches!(
         &effects[1],
         effects::DecodeEffect::EmitManyAndFinish { request_id, finish_reason: FinishReason::Stop, .. }
-            if *request_id == RequestId(2)
+            if *request_id == RequestId::new(2)
     ));
 }

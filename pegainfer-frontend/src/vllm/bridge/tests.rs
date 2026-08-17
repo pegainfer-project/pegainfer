@@ -564,7 +564,7 @@ fn rejected_request_is_reported_as_error() {
 /// snapshot up front, and follows every watch update with exactly one message.
 #[tokio::test]
 async fn load_snapshots_become_stats_only_batches() {
-    let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot {
+    let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics {
         kv_used_blocks: 25,
         kv_total_blocks: 100,
         num_running_reqs: 2,
@@ -592,7 +592,7 @@ async fn load_snapshots_become_stats_only_batches() {
     assert_eq!(stats.num_waiting_reqs, 1);
     assert!((stats.kv_cache_usage - 0.25).abs() < 1e-9);
 
-    load_tx.send_replace(LoadSnapshot::default());
+    load_tx.send_replace(SchedulerMetrics::default());
     let batch = match output_rx.recv().await.expect("drained stats batch") {
         EngineCoreOutputs::RequestBatch(batch) => batch,
         other => panic!("expected a stats batch, got {other:?}"),
@@ -625,9 +625,9 @@ async fn next_scheduler_stats(
 async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
     let mut totals = SpecDecodeCounters::new(2).expect("K within bounds");
     totals.observe_draft(2, 1);
-    let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot {
+    let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics {
         spec_decode: Some(totals),
-        ..LoadSnapshot::default()
+        ..SchedulerMetrics::default()
     });
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
@@ -650,10 +650,10 @@ async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
     assert_eq!(spec.num_accepted_tokens_per_pos, vec![1, 0]);
 
     // A no-op republish (same totals) is an idle interval: no spec stats.
-    load_tx.send_replace(LoadSnapshot {
+    load_tx.send_replace(SchedulerMetrics {
         spec_decode: Some(totals),
         num_running_reqs: 1,
-        ..LoadSnapshot::default()
+        ..SchedulerMetrics::default()
     });
     let idle = next_scheduler_stats(&mut output_rx).await;
     assert!(idle.spec_decoding_stats.is_none());
@@ -663,9 +663,9 @@ async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
     // which is the reason the transport carries totals instead of deltas.
     totals.observe_draft(2, 2);
     totals.observe_draft(2, 2);
-    load_tx.send_replace(LoadSnapshot {
+    load_tx.send_replace(SchedulerMetrics {
         spec_decode: Some(totals),
-        ..LoadSnapshot::default()
+        ..SchedulerMetrics::default()
     });
     let resumed = next_scheduler_stats(&mut output_rx).await;
     let spec = resumed.spec_decoding_stats.expect("second draft interval");

@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_kv_store::BlockPool;
 use tokio::sync::watch;
 
@@ -14,14 +14,14 @@ use super::RankSlots;
 /// unbound request's least-load placement (in `EngineHandle::submit`) reads
 /// the same numbers.
 pub(super) fn publish_load(
-    load_tx: &watch::Sender<LoadSnapshot>,
+    load_tx: &watch::Sender<SchedulerMetrics>,
     pool: &BlockPool,
     slots: &RankSlots,
     pending: &VecDeque<super::offload::Resolved>,
     resolving: usize,
 ) {
     let kv_total_blocks = pool.total_blocks() - 1;
-    load_tx.send_replace(LoadSnapshot {
+    load_tx.send_replace(SchedulerMetrics {
         kv_used_blocks: kv_total_blocks.saturating_sub(pool.available_blocks()) as u64,
         kv_total_blocks: kv_total_blocks as u64,
         num_running_reqs: slots.iter().flatten().count() as u64,

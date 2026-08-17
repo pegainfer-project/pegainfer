@@ -5,8 +5,9 @@
 //! event sequence, so the intra-step ordering rules of the old `TokenEvent`
 //! protocol (`Scheduled` before tokens before a single terminal) are structure,
 //! not convention: a `RequestUpdate` cannot express a token after its terminal.
-//! Cross-step ordering is enforced on the producer side by the typestate
-//! handles in [`super::request_lifecycle`].
+//! Cross-step ordering is enforced on the producer side by the
+//! [`super::RequestLedger`]: a request's account closes at its terminal, and
+//! writes against a closed account panic.
 
 use std::fmt;
 use std::time::Instant;
@@ -22,7 +23,10 @@ use super::event::TokenLogprob;
 pub struct RequestId(u64);
 
 impl RequestId {
-    pub(crate) fn new(raw: u64) -> Self {
+    /// Minting ids is [`super::SchedulerHandle::submit`]'s job in production
+    /// (a per-scheduler counter). Public so scheduler unit tests and tools
+    /// can fabricate requests.
+    pub fn new(raw: u64) -> Self {
         Self(raw)
     }
 
@@ -40,8 +44,8 @@ impl std::fmt::Display for RequestId {
 }
 
 /// One generate request as a frontend submits it. Identity (`RequestId`),
-/// queue timestamp, and the abort flag are minted at submit time and travel in
-/// the [`super::QueuedRequest`] wrapper, not here.
+/// queue timestamp, and the abort flag are minted at submit time and live on
+/// the request's ledger account, not here.
 pub struct Request {
     pub prompt_tokens: Vec<u32>,
     pub params: crate::sampler::SamplingParams,
@@ -128,7 +132,7 @@ impl RequestUpdate {
 
 /// Admission facts stamped by the contract layer, never by model code:
 /// `queued_at` at [`super::SchedulerHandle::submit`], `scheduled_at` at
-/// [`super::StepEmitter::admit`]. Monotonic `Instant`s — the wall-clock
+/// [`super::RequestLedger::admit`]. Monotonic `Instant`s — the wall-clock
 /// rendering some protocols need (vLLM's unix floats) is the protocol stack's
 /// translation, done against its own anchor.
 #[derive(Clone, Copy, Debug)]

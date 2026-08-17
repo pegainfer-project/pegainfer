@@ -246,20 +246,20 @@ mod tests {
     #[test]
     fn batched_accepts_matching_prefix_plus_posterior_bonus() {
         let req = VerifyStepItem::new(
-            RequestId(7),
+            RequestId::new(7),
             vec![10, 11, 12, 13],
             SamplingParams::default(),
         );
         let results = build_verify_results(&[req], &[11, 12, 99, 100]).expect("verify results");
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].request_id, RequestId(7));
+        assert_eq!(results[0].request_id, RequestId::new(7));
         assert_eq!(results[0].matched_draft_tokens, 2);
         assert_eq!(results[0].accepted_tokens, vec![11, 12, 99]);
     }
 
     #[test]
     fn batched_all_match_still_adds_block_end_posterior() {
-        let req = VerifyStepItem::new(RequestId(8), vec![20, 21, 22], SamplingParams::default());
+        let req = VerifyStepItem::new(RequestId::new(8), vec![20, 21, 22], SamplingParams::default());
         let results = build_verify_results(&[req], &[21, 22, 23]).expect("verify results");
         assert_eq!(results[0].matched_draft_tokens, 2);
         assert_eq!(results[0].accepted_tokens, vec![21, 22, 23]);
@@ -267,8 +267,8 @@ mod tests {
 
     #[test]
     fn batched_multi_request_splits_columns_by_span() {
-        let a = VerifyStepItem::new(RequestId(1), vec![5, 6], SamplingParams::default());
-        let b = VerifyStepItem::new(RequestId(2), vec![7, 8, 9], SamplingParams::default());
+        let a = VerifyStepItem::new(RequestId::new(1), vec![5, 6], SamplingParams::default());
+        let b = VerifyStepItem::new(RequestId::new(2), vec![7, 8, 9], SamplingParams::default());
         // a: posterior [6, 100] -> accept draft 6, bonus 100. b: posterior [8, 77, 0]
         // -> accept draft 8, correction 77.
         let results = build_verify_results(&[a, b], &[6, 100, 8, 77, 0]).expect("verify results");

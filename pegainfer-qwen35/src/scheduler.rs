@@ -23,7 +23,7 @@ use pegainfer_frontend::engine::EngineHandle as SchedulerHandle;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest as SchedulerRequest;
 use pegainfer_frontend::engine::KvCapacity;
-use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::SubmittedRequest;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenLogprob;
@@ -171,9 +171,9 @@ pub(crate) fn start_with_capacity_and_policy(
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (startup_tx, startup_rx) = std_mpsc::channel();
-    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+    let (load_tx, load_rx) = watch::channel(SchedulerMetrics {
         kv_total_blocks,
-        ..LoadSnapshot::default()
+        ..SchedulerMetrics::default()
     });
 
     let join_handle = thread::Builder::new()
@@ -214,7 +214,7 @@ pub(crate) fn start_with_capacity_and_policy(
                 total_blocks,
                 block_size,
             })
-            .with_load_watch(load_rx),
+            .with_metrics_watch(load_rx),
     )
 }
 
@@ -242,9 +242,9 @@ pub(crate) fn start_tp_with_capacity(
     };
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
-    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+    let (load_tx, load_rx) = watch::channel(SchedulerMetrics {
         kv_total_blocks: kv_capacity.total_blocks as u64,
-        ..LoadSnapshot::default()
+        ..SchedulerMetrics::default()
     });
     let join_handle = thread::Builder::new()
         .name("scheduler-qwen35-tp".into())
@@ -264,7 +264,7 @@ pub(crate) fn start_tp_with_capacity(
         SchedulerHandle::new_with_join_handle(submit_tx, join_handle)
             .with_servable_len(servable)
             .with_kv_capacity(kv_capacity)
-            .with_load_watch(load_rx),
+            .with_metrics_watch(load_rx),
     )
 }
 
@@ -829,14 +829,14 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 // ── Main loop ───────────────────────────────────────────────────────────
 
 fn publish_load(
-    load_tx: &watch::Sender<LoadSnapshot>,
+    load_tx: &watch::Sender<SchedulerMetrics>,
     backend: &SchedulerBackend,
     active: &[ActiveRequest35],
     prefilling: &[PrefillingRequest35],
     num_waiting_reqs: usize,
 ) {
     let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
-    load_tx.send_replace(LoadSnapshot {
+    load_tx.send_replace(SchedulerMetrics {
         kv_used_blocks: kv_total_blocks
             .saturating_sub(backend.available_pages(active, prefilling) as u64),
         kv_total_blocks,
@@ -853,7 +853,7 @@ fn scheduler_loop(
     seed: u64,
     prefill_budget: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
-    load_tx: watch::Sender<LoadSnapshot>,
+    load_tx: watch::Sender<SchedulerMetrics>,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequest35> = Vec::new();

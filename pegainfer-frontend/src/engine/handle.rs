@@ -46,25 +46,7 @@ pub enum EpBackend {
     DeepEp,
 }
 
-/// Live KV-cache occupancy the scheduler republishes after every step.
-///
-/// `kv_used_blocks` is the load signal an out-of-band consumer (e.g. a Dynamo
-/// KV router) scores against; `kv_total_blocks` is the engine's whole-pool
-/// capacity (the same number advertised as the servable ceiling), so the
-/// consumer can derive fractional usage without a second query. Carried over a
-/// [`watch`] channel: the scheduler is the sole writer and never blocks on a
-/// reader, and a reader only ever sees the latest snapshot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LoadSnapshot {
-    pub kv_used_blocks: u64,
-    pub kv_total_blocks: u64,
-    /// Requests currently occupying a decode/prefill slot.
-    pub num_running_reqs: u64,
-    /// Requests admitted but not yet running (KV pressure, prefetch wait).
-    pub num_waiting_reqs: u64,
-    /// Cumulative spec-decode counters, or `None` when no draft model is loaded.
-    pub spec_decode: Option<super::metrics::SpecDecodeCounters>,
-}
+use super::metrics::SchedulerMetrics;
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -76,7 +58,7 @@ pub struct EngineHandle {
     /// One optional live-load feed per scheduler partition. A normal engine
     /// has one partition; a data-parallel engine exposes one per logical DP
     /// rank. Each handle clone owns cloned receivers and `watch` fans out.
-    load_watches: Vec<Option<watch::Receiver<LoadSnapshot>>>,
+    metrics_watches: Vec<Option<watch::Receiver<SchedulerMetrics>>>,
 }
 
 struct EngineInner {
@@ -133,7 +115,7 @@ impl EngineHandle {
             }),
             servable_len: None,
             kv_capacity: None,
-            load_watches: vec![None],
+            metrics_watches: vec![None],
         }
     }
 
@@ -161,8 +143,8 @@ impl EngineHandle {
     }
 
     #[must_use]
-    pub fn with_load_watch(mut self, load_watch: watch::Receiver<LoadSnapshot>) -> Self {
-        self.load_watches = vec![Some(load_watch)];
+    pub fn with_metrics_watch(mut self, metrics_watch: watch::Receiver<SchedulerMetrics>) -> Self {
+        self.metrics_watches = vec![Some(metrics_watch)];
         self
     }
 
@@ -172,18 +154,18 @@ impl EngineHandle {
     /// empty vector is an invalid engine rather than a single partition with
     /// missing metrics.
     #[must_use]
-    pub fn with_load_watches(mut self, load_watches: Vec<watch::Receiver<LoadSnapshot>>) -> Self {
+    pub fn with_metrics_watches(mut self, metrics_watches: Vec<watch::Receiver<SchedulerMetrics>>) -> Self {
         assert!(
-            !load_watches.is_empty(),
+            !metrics_watches.is_empty(),
             "an engine must expose at least one scheduler partition"
         );
-        self.load_watches = load_watches.into_iter().map(Some).collect();
+        self.metrics_watches = metrics_watches.into_iter().map(Some).collect();
         self
     }
 
     /// Number of logical scheduler partitions exposed to the frontend.
     pub(crate) fn scheduler_partition_count(&self) -> usize {
-        self.load_watches.len()
+        self.metrics_watches.len()
     }
 
     /// A receiver for one partition's live load, if it wired one. Awaiting
@@ -191,13 +173,13 @@ impl EngineHandle {
     /// stays quiet when idle, so a consumer republishes on real change rather
     /// than polling. `None` if the partition does not report a load feed or the
     /// index is outside the engine topology.
-    pub(crate) fn load_watch_for(&self, partition: usize) -> Option<watch::Receiver<LoadSnapshot>> {
-        self.load_watches.get(partition)?.clone()
+    pub(crate) fn metrics_watch_for(&self, partition: usize) -> Option<watch::Receiver<SchedulerMetrics>> {
+        self.metrics_watches.get(partition)?.clone()
     }
 
     /// Single-partition compatibility accessor.
-    pub fn load_watch(&self) -> Option<watch::Receiver<LoadSnapshot>> {
-        self.load_watch_for(0)
+    pub fn metrics_watch(&self) -> Option<watch::Receiver<SchedulerMetrics>> {
+        self.metrics_watch_for(0)
     }
 
     /// Submit an unresolved request: no KV-prefix resolution ran for it, so
@@ -259,7 +241,7 @@ impl EngineHandle {
             .enumerate()
             .min_by_key(|(partition, _)| {
                 let score = self
-                    .load_watches
+                    .metrics_watches
                     .get(*partition)
                     .and_then(Option::as_ref)
                     .map_or(0, |watch| {
@@ -384,16 +366,16 @@ mod tests {
     fn multi_partition_submit_places_unbound_on_the_least_loaded() {
         let (tx0, mut rx0) = mpsc::unbounded_channel::<SubmittedRequest>();
         let (tx1, mut rx1) = mpsc::unbounded_channel::<SubmittedRequest>();
-        let (load_tx0, load_rx0) = watch::channel(LoadSnapshot {
+        let (load_tx0, load_rx0) = watch::channel(SchedulerMetrics {
             num_running_reqs: 2,
-            ..LoadSnapshot::default()
+            ..SchedulerMetrics::default()
         });
-        let (_load_tx1, load_rx1) = watch::channel(LoadSnapshot {
+        let (_load_tx1, load_rx1) = watch::channel(SchedulerMetrics {
             num_waiting_reqs: 1,
-            ..LoadSnapshot::default()
+            ..SchedulerMetrics::default()
         });
         let handle = EngineHandle::new_with_join_handles(vec![tx0, tx1], Vec::new())
-            .with_load_watches(vec![load_rx0, load_rx1]);
+            .with_metrics_watches(vec![load_rx0, load_rx1]);
 
         // Scores are running + 4 × waiting: rank 0 scores 2, rank 1 scores 4.
         let (req, _events) = routed_request(None);
@@ -403,9 +385,9 @@ mod tests {
 
         // Rank 0 rises to 6 running while rank 1 still waits 1: 4 < 6, so the
         // next unbound request tips to rank 1.
-        load_tx0.send_replace(LoadSnapshot {
+        load_tx0.send_replace(SchedulerMetrics {
             num_running_reqs: 6,
-            ..LoadSnapshot::default()
+            ..SchedulerMetrics::default()
         });
         let (req, _events) = routed_request(None);
         handle.submit(req).expect("submit");
@@ -454,22 +436,22 @@ mod tests {
     }
 
     #[test]
-    fn load_watches_define_scheduler_partitions() {
+    fn metrics_watches_define_scheduler_partitions() {
         let (submit_tx, _submit_rx) = mpsc::unbounded_channel::<SubmittedRequest>();
-        let (_load_tx0, load_rx0) = watch::channel(LoadSnapshot {
+        let (_load_tx0, load_rx0) = watch::channel(SchedulerMetrics {
             num_running_reqs: 1,
-            ..LoadSnapshot::default()
+            ..SchedulerMetrics::default()
         });
-        let (_load_tx1, load_rx1) = watch::channel(LoadSnapshot {
+        let (_load_tx1, load_rx1) = watch::channel(SchedulerMetrics {
             num_waiting_reqs: 2,
-            ..LoadSnapshot::default()
+            ..SchedulerMetrics::default()
         });
-        let handle = EngineHandle::new(submit_tx).with_load_watches(vec![load_rx0, load_rx1]);
+        let handle = EngineHandle::new(submit_tx).with_metrics_watches(vec![load_rx0, load_rx1]);
 
         assert_eq!(handle.scheduler_partition_count(), 2);
         assert_eq!(
             handle
-                .load_watch_for(0)
+                .metrics_watch_for(0)
                 .expect("rank 0 watch")
                 .borrow()
                 .num_running_reqs,
@@ -477,12 +459,12 @@ mod tests {
         );
         assert_eq!(
             handle
-                .load_watch_for(1)
+                .metrics_watch_for(1)
                 .expect("rank 1 watch")
                 .borrow()
                 .num_waiting_reqs,
             2
         );
-        assert!(handle.load_watch_for(2).is_none());
+        assert!(handle.metrics_watch_for(2).is_none());
     }
 }

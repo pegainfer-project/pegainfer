@@ -53,7 +53,7 @@ use zeromq::util::PeerIdentity;
 use crate::engine::EngineHandle;
 use crate::engine::FinishReason;
 use crate::engine::GenerateRequest;
-use crate::engine::LoadSnapshot;
+use crate::engine::SchedulerMetrics;
 use crate::engine::RequestAbortReason;
 use crate::engine::RequestTag;
 use crate::engine::SpecDecodeCounters;
@@ -73,7 +73,7 @@ pub(crate) struct LocalEngineBridge {
     pub(crate) max_model_len: u32,
     pub(crate) engine_index: u32,
     pub(crate) data_parallel_size: u32,
-    pub(crate) load_watch: Option<watch::Receiver<LoadSnapshot>>,
+    pub(crate) metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
 }
 
 impl LocalEngineBridge {
@@ -89,7 +89,7 @@ impl LocalEngineBridge {
             self.data_parallel_size,
             self.max_model_len,
             self.handle.kv_capacity(),
-            self.load_watch.clone(),
+            self.metrics_watch.clone(),
             &shutdown,
         )
         .await?;
@@ -591,7 +591,7 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
 /// vLLM `SchedulerStats` view of a load snapshot — what the frontend's
 /// Prometheus gauges (`scheduler_running`, `scheduler_waiting`,
 /// `kv_cache_usage`) and DP load balancer consume.
-pub(crate) fn scheduler_stats_from(snapshot: &LoadSnapshot) -> SchedulerStats {
+pub(crate) fn scheduler_stats_from(snapshot: &SchedulerMetrics) -> SchedulerStats {
     SchedulerStats {
         num_running_reqs: snapshot.num_running_reqs,
         num_waiting_reqs: snapshot.num_waiting_reqs,
@@ -635,7 +635,7 @@ fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> Spe
 /// metrics and a request-routing black hole.
 async fn publish_scheduler_stats(
     engine_index: u32,
-    mut load_rx: watch::Receiver<LoadSnapshot>,
+    mut load_rx: watch::Receiver<SchedulerMetrics>,
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -692,7 +692,7 @@ async fn connect_link(
     data_parallel_size: u32,
     max_model_len: u32,
     kv_capacity: Option<crate::engine::KvCapacity>,
-    load_watch: Option<watch::Receiver<LoadSnapshot>>,
+    metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
     shutdown: &CancellationToken,
 ) -> Result<BridgeLink> {
     wait_for_ipc_endpoint(input_address, shutdown).await?;
@@ -759,7 +759,7 @@ async fn connect_link(
     // bounded. The stepped bridge passes no watch here — its driver busy-polls
     // (every spin would become a message), so it reads the watch at send time
     // and stamps stats onto the batches it already emits instead.
-    if let Some(load_rx) = load_watch {
+    if let Some(load_rx) = metrics_watch {
         let stats_output_tx = output_tx.clone();
         let stats_shutdown = shutdown.clone();
         child_tasks.spawn(async move {

@@ -7,9 +7,9 @@
 //! [`SchedulerHandle`]. Channel choices per direction: the submit channel is
 //! crossbeam (sync consumer on the scheduler thread; senders never block on
 //! unbounded channels), the step stream is tokio (async consumer in the
-//! protocol stack; the sync producer's send never blocks either), load is a
-//! shared cell (read-only pull, deliberately unsubscribable — see
-//! [`LoadPublisher`]).
+//! protocol stack; the sync producer's send never blocks either), metrics are
+//! a shared cell (read-only pull, deliberately unsubscribable — see
+//! [`MetricsPublisher`]).
 //!
 //! How many schedulers an engine runs and what each one means (DP replicas,
 //! anything else) is the model line's decision; the contract carries the
@@ -24,73 +24,65 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use super::control::LoraClient;
-use super::handle::LoadSnapshot;
 use super::kv::KvCapacity;
-use super::request_lifecycle::HandleCore;
-use super::request_lifecycle::QueuedRequest;
+use super::ledger::RequestLedger;
+use super::metrics::SchedulerMetrics;
 use super::request_lifecycle::RequestControl;
 use super::request_lifecycle::StepReceiver;
+use super::request_lifecycle::Submission;
 use super::step::Request;
 use super::step::RequestId;
 
 /// Everything the scheduler thread consumes and produces. The driver
 /// ([`super::drive`]) destructures this; model code only ever sees the
-/// emitter and, through trait arguments, the request handles.
+/// ledger, through the `step` argument.
 pub struct SchedulerBackend {
-    pub(crate) submissions: crossbeam_channel::Receiver<QueuedRequest>,
-    pub(crate) emitter: super::emitter::StepEmitter,
-    pub(crate) load: LoadPublisher,
+    pub(crate) submissions: crossbeam_channel::Receiver<Submission>,
+    pub(crate) ledger: RequestLedger,
+    pub(crate) metrics: MetricsPublisher,
 }
 
-/// Sole writer of a scheduler's load cell; the driver publishes once per
-/// iteration from [`super::Scheduler::load`].
+/// Sole writer of a scheduler's metrics cell; the driver publishes once per
+/// iteration from [`super::Scheduler::metrics`].
 ///
 /// Deliberately a plain cell and not a `watch` channel: the driver busy-polls,
 /// so a subscription edge (`changed()`) would fire per spin and turn any
-/// subscriber into a message flood at idle. With only [`SchedulerHandle::load`]
-/// to read it, "notify me on load change" is unrepresentable — consumers pull
-/// the snapshot at the moment they need one. A `Mutex` (not per-field atomics)
-/// so a reader never sees fields torn across two steps; both sides touch it
-/// uncontended for nanoseconds.
-pub struct LoadPublisher(Arc<Mutex<LoadSnapshot>>);
+/// subscriber into a message flood at idle. With only
+/// [`SchedulerHandle::metrics`] to read it, "notify me on metrics change" is
+/// unrepresentable — consumers pull the snapshot at the moment they need one.
+/// A `Mutex` (not per-field atomics) so a reader never sees fields torn
+/// across two steps; both sides touch it uncontended for nanoseconds.
+pub struct MetricsPublisher(Arc<Mutex<SchedulerMetrics>>);
 
-impl LoadPublisher {
-    pub(crate) fn publish(&self, snapshot: &LoadSnapshot) {
-        *self.0.lock().expect("load cell poisoned") = *snapshot;
+impl MetricsPublisher {
+    pub(crate) fn publish(&self, snapshot: &SchedulerMetrics) {
+        *self.0.lock().expect("metrics cell poisoned") = *snapshot;
     }
 }
 
 /// The frontend's end of one running scheduler.
 pub struct SchedulerHandle {
-    submit_tx: crossbeam_channel::Sender<QueuedRequest>,
+    submit_tx: crossbeam_channel::Sender<Submission>,
     steps: Option<StepReceiver>,
-    load: Arc<Mutex<LoadSnapshot>>,
+    metrics: Arc<Mutex<SchedulerMetrics>>,
     next_id: AtomicU64,
     /// Kept so requests minted after the scheduler thread exits still get
-    /// their drop-bomb terminal delivered (the handle needs a live sender).
+    /// their drop-bomb terminal delivered (the envelope needs a live sender).
     step_tx: super::request_lifecycle::StepSender,
 }
 
 impl SchedulerHandle {
     /// Mint identity, queue timestamp, and abort flag, then hand the request
     /// to the scheduler. Never fails: if the scheduler is gone, the
-    /// `QueuedRequest`'s drop bomb answers the request with a `Failed`
-    /// terminal on the step stream, which the caller observes like any other
-    /// terminal.
+    /// [`Submission`] envelope's drop bomb answers the request with a
+    /// `Failed` terminal on the step stream, which the caller observes like
+    /// any other terminal.
     pub fn submit(&self, request: Request) -> RequestControl {
         let id = RequestId::new(self.next_id.fetch_add(1, Ordering::Relaxed));
         let abort = Arc::new(AtomicBool::new(false));
         let control = RequestControl::new(id, Arc::clone(&abort));
-        let request = QueuedRequest::new(
-            HandleCore {
-                id,
-                abort,
-                tx: self.step_tx.clone(),
-            },
-            request,
-            Instant::now(),
-        );
-        if let Err(returned) = self.submit_tx.send(request) {
+        let submission = Submission::new(id, abort, self.step_tx.clone(), request, Instant::now());
+        if let Err(returned) = self.submit_tx.send(submission) {
             drop(returned.into_inner());
         }
         control
@@ -102,11 +94,11 @@ impl SchedulerHandle {
         self.steps.take()
     }
 
-    /// The scheduler's most recent load snapshot. Pull-only by design (see
-    /// [`LoadPublisher`]): read it at the moment you need one — routing a
+    /// The scheduler's most recent metrics snapshot. Pull-only by design (see
+    /// [`MetricsPublisher`]): read it at the moment you need one — routing a
     /// request, stamping stats onto an outgoing batch, serving a scrape.
-    pub fn load(&self) -> LoadSnapshot {
-        *self.load.lock().expect("load cell poisoned")
+    pub fn metrics(&self) -> SchedulerMetrics {
+        *self.metrics.lock().expect("metrics cell poisoned")
     }
 }
 
@@ -115,19 +107,19 @@ impl SchedulerHandle {
 pub fn scheduler_pair() -> (SchedulerHandle, SchedulerBackend) {
     let (submit_tx, submit_rx) = crossbeam_channel::unbounded();
     let (step_tx, step_rx) = tokio::sync::mpsc::unbounded_channel();
-    let load = Arc::new(Mutex::new(LoadSnapshot::default()));
+    let metrics = Arc::new(Mutex::new(SchedulerMetrics::default()));
     (
         SchedulerHandle {
             submit_tx,
             steps: Some(step_rx),
-            load: Arc::clone(&load),
+            metrics: Arc::clone(&metrics),
             next_id: AtomicU64::new(0),
             step_tx: step_tx.clone(),
         },
         SchedulerBackend {
             submissions: submit_rx,
-            emitter: super::emitter::StepEmitter::new(step_tx),
-            load: LoadPublisher(load),
+            ledger: RequestLedger::new(step_tx),
+            metrics: MetricsPublisher(metrics),
         },
     )
 }

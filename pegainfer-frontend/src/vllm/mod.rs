@@ -265,7 +265,7 @@ where
                             max_model_len,
                             engine_index: engine_index as u32,
                             data_parallel_size,
-                            load_watch: handle.load_watch_for(engine_index),
+                            metrics_watch: handle.metrics_watch_for(engine_index),
                         };
                         let shutdown = bridge_shutdown.clone();
                         bridges.spawn(async move { (engine_index, bridge.run(shutdown).await) });

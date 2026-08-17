@@ -66,18 +66,10 @@ use crate::speculative::VerifyStepItem;
 use crate::speculative::build_verify_results;
 use crate::verify_graph::VerifyGraphBuffers;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct RequestId(pub(crate) u64);
-
-impl RequestId {
-    pub fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub(crate) fn get(self) -> u64 {
-        self.0
-    }
-}
+/// The contract's request id, end to end: the wiring mints it at submit and
+/// every internal queue, effect, and KV key uses it unchanged — there is no
+/// second id space to map across.
+pub use pegainfer_frontend::engine::RequestId;
 
 #[derive(Clone)]
 pub struct PrefillStepItem {
@@ -1905,7 +1897,7 @@ impl Qwen3Executor {
                         // Partial remote hits are a win here: the miss is
                         // recomputed locally, so never hold out for the
                         // full prefix.
-                        .query(&id.0.to_string(), &query_hashes, false)
+                        .query(&id.raw().to_string(), &query_hashes, false)
                         .map(QueryView::from)
                         .map_err(|e| {
                             query_errored = true;
@@ -2350,7 +2342,7 @@ impl ModelExecutor for Qwen3Executor {
                 offload
                     // As in the re-query: partial hits shorten the local
                     // prefill, so don't wait for the full prefix.
-                    .query(&request_id.0.to_string(), &query_hashes, false)
+                    .query(&request_id.raw().to_string(), &query_hashes, false)
                     .map(QueryView::from)
                     .map_err(|e| {
                         log::warn!("KV offload query failed for {request_id:?} (skipping): {e}");

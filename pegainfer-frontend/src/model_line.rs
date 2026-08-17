@@ -303,7 +303,7 @@ pub trait ModelLine: Send + Sync {
     }
 
     /// Start the engine: spawn scheduler threads, build the handle with its
-    /// metadata (`with_kv_capacity`, `with_load_watch`, ...), return it.
+    /// metadata (`with_kv_capacity`, `with_metrics_watch`, ...), return it.
     /// Failures here are deep context chains (CUDA, weights, topology), not
     /// something callers branch on — hence `anyhow`.
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine>;

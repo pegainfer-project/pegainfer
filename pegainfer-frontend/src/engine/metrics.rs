@@ -1,11 +1,32 @@
-//! What the scheduler republishes about itself beyond queue depths: cumulative
-//! speculative-decode acceptance counters, carried on [`LoadSnapshot`] when a
-//! draft model is loaded.
-//!
-//! [`LoadSnapshot`]: super::LoadSnapshot
+//! What the scheduler republishes about itself: [`SchedulerMetrics`], the
+//! per-iteration snapshot of occupancy gauges plus whatever richer counters a
+//! model line serves (today: cumulative speculative-decode acceptance, when a
+//! draft model is loaded).
 
 use std::error::Error;
 use std::fmt;
+
+/// The metrics snapshot a scheduler republishes after every step.
+///
+/// `kv_used_blocks` is the load signal an out-of-band consumer (e.g. a Dynamo
+/// KV router) scores against; `kv_total_blocks` is the engine's whole-pool
+/// capacity (the same number advertised as the servable ceiling), so the
+/// consumer can derive fractional usage without a second query. Readers only
+/// ever see the latest snapshot — stepped engines publish into a shared cell
+/// ([`super::MetricsPublisher`]), legacy engines over a `watch` channel — so
+/// counters carried here must be cumulative totals, not per-step deltas (see
+/// [`SpecDecodeCounters`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SchedulerMetrics {
+    pub kv_used_blocks: u64,
+    pub kv_total_blocks: u64,
+    /// Requests currently occupying a decode/prefill slot.
+    pub num_running_reqs: u64,
+    /// Requests admitted but not yet running (KV pressure, prefetch wait).
+    pub num_waiting_reqs: u64,
+    /// Cumulative spec-decode counters, or `None` when no draft model is loaded.
+    pub spec_decode: Option<SpecDecodeCounters>,
+}
 
 /// Upper bound on a drafter's `K`, fixing the width of
 /// [`SpecDecodeCounters::num_accepted_tokens_per_pos`].
@@ -30,11 +51,10 @@ impl fmt::Display for SpecWidthUnsupported {
 impl Error for SpecWidthUnsupported {}
 
 /// Cumulative speculative-decode acceptance counters, monotone since the draft
-/// model was loaded. Use totals rather than per-step deltas, because the
-/// [`LoadSnapshot`] watch only keeps the newest value: a reader that misses a
-/// step would lose that delta for good, but it can still read totals correctly.
-///
-/// [`LoadSnapshot`]: super::LoadSnapshot
+/// model was loaded. Use totals rather than per-step deltas, because a
+/// [`SchedulerMetrics`] reader only keeps the newest value: a reader that
+/// misses a step would lose that delta for good, but it can still read totals
+/// correctly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpecDecodeCounters {
     /// The drafter's configured `K`, and the number of leading
