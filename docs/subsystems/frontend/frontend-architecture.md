@@ -1,6 +1,6 @@
 # Frontend architecture: pegainfer-frontend and the engine boundary
 
-**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + typestate request handles + a contract-owned polling driver — Qwen3 is fully migrated, see `pegainfer-qwen3/src/frontend_adapter.rs`) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite/gemma4 still launch through it). **Next step: migrate glm52, then delete the legacy contract.**
+**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + typestate request handles + a contract-owned polling driver — Qwen3 and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite/gemma4 still launch through it). **Next step: migrate glm52, then delete the legacy contract.**
 
 Last touched: 2026-08
 
@@ -50,7 +50,7 @@ Design decisions worth knowing before touching it:
    - `load()` — KV occupancy + running/waiting counts for routers.
    - Extra capabilities (LoRA etc.) are not trait methods: mint the private channel before spawning, close the scheduler over the receiver, drain it inside `step`.
 2. `spawn_scheduler(name, scheduler)` per scheduler; return `Engine { schedulers, info: EngineInfo { kv_capacity, servable_len }, lora }` — the required-metadata fields are the checklist, and `lora: Some(client)` only when the line actually serves adapter control.
-3. `ModelLine::launch` returns `LaunchedEngine::Stepped(engine)`.
+3. `ModelLine::launch` returns `LaunchedEngine::Stepped(engine)`. `pegainfer-sim` is the CPU-only reference (`SimScheduler` in `pegainfer-sim/src/lib.rs`); it has no `ModelLine` and hands the `Engine` to `vllm::serve` directly.
 
 The contract's own invariants are tested in `emitter.rs`/`driver.rs` tests; the qwen3 adapter's contract tests (`frontend_adapter/tests.rs`) are the reference for testing a model's protocol behaviour end to end with a fake executor. GPU integration tests drive the contract through `pegainfer-qwen3/tests/common/harness.rs`.
 

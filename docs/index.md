@@ -164,8 +164,10 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `subsystems/frontend/frontend-architecture.md` | `pegainfer-frontend` owns everything north of the model schedulers. Two contract generations coexist: the step contract (`StepOutputs` wire + typestate handles + contract-owned polling driver; qwen3 fully migrated via `frontend_adapter.rs`) and the legacy `EngineHandle`/`TokenEvent` path (other five lines). Next: migrate glm52, then delete the legacy contract. |
-| `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA, real model weights, or real-model performance claims. |
+| `subsystems/frontend/frontend-architecture.md` | `pegainfer-frontend` owns everything north of the model schedulers. Two contract generations coexist: the step contract (qwen3 + pegainfer-sim migrated) and the legacy `EngineHandle`/`TokenEvent` path (other five lines). Next: migrate glm52, then delete the legacy contract. |
+| `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate on the step contract (`SimScheduler` → `LaunchedEngine::Stepped`) for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA or weights. |
+| `subsystems/frontend/sim-step-contract.md` | Cut `pegainfer-sim` from the legacy `EngineHandle`/`TokenEvent` path onto the step contract. |
+| `subsystems/frontend/sim-high-concurrency-bench.md` | Same-session A/B vs main: feat TPOT ~30–180× better, TTFT worse and linear in C; E2EL/throughput win at c=64 and c=1024. |
 | `subsystems/frontend/cpu-profiling-baseline.md` | Frontend CPU profiling baseline using `pegainfer-sim` with fixed TTFT=5ms/TPOT=12ms: 200 req / concurrency=16 shows ~150ms TTFT overhead (no dominant hotspot), heap allocation ~10%, stream polling ~7.5%, IPC ~1%; reproducible benchmark command and perf evidence documented. |
 | `subsystems/frontend/startup-time.md` | Qwen3-4B warm startup-to-ready: frontend tokenizer load runs concurrently with the engine load (HTTP still binds only after the engine registers); mmap teardown is paid at the end of load since #377; pinned-staging upload (2026-07) cuts warm ready 5.22s → 4.66s on sm_89, and the remaining floor is the engine's own post-load startup work. |
 | `subsystems/frontend/prometheus-metrics.md` | `/metrics` request histograms work for every model; Qwen3, Qwen3.5, and GLM5.2 schedulers also publish running/waiting/KV engine gauges through `LoadSnapshot` watches. |
