@@ -105,7 +105,9 @@ pub fn k3_chunk_bucket(rows: usize) -> Result<usize> {
         .into_iter()
         .chain(K3_PREFILL_BUCKETS)
         .find(|bucket| *bucket >= rows)
-        .ok_or_else(|| anyhow!("K3 chunk of {rows} tokens exceeds the largest bucket {K3_MAX_CHUNK}"))
+        .ok_or_else(|| {
+            anyhow!("K3 chunk of {rows} tokens exceeds the largest bucket {K3_MAX_CHUNK}")
+        })
 }
 
 fn check_bucket(b: usize) -> Result<()> {
@@ -581,7 +583,6 @@ pub fn k3_o_norm_gate_batched_launch(
         &format!("K3 o_norm_gate_batched (B={b}, KH={num_heads}, KD={head_dim})"),
     )
 }
-
 
 /// Sigmoid router plus biased top-k over already-merged f32 score rows.
 ///

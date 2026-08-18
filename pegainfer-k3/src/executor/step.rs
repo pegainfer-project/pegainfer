@@ -40,23 +40,23 @@ use pegainfer_kernels::ops::argmax_bf16_split_into;
 use pegainfer_kernels::ops::copy_hidden_rows_raw_into;
 use pegainfer_kernels::ops::embedding_rows_into;
 use pegainfer_kernels::ops::extract_hidden_rows_raw_into;
+use pegainfer_kernels::ops::gemm_rows_into_checked;
 use pegainfer_kernels::ops::k3_add2_batched_launch;
 use pegainfer_kernels::ops::k3_attnres_mix_batched_launch;
 use pegainfer_kernels::ops::k3_attnres_scores_batched_launch;
 use pegainfer_kernels::ops::k3_conv_silu_batched_launch;
 use pegainfer_kernels::ops::k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch;
-use pegainfer_kernels::ops::k3_fp8_scale_pack_ue8m0_launch;
 use pegainfer_kernels::ops::k3_flash_kda_fwd_launch;
+use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_launch;
+use pegainfer_kernels::ops::k3_fp8_scale_pack_ue8m0_launch;
 use pegainfer_kernels::ops::k3_kda_core_batched_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_land_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_mega_moe_launch;
 use pegainfer_kernels::ops::k3_mega_write_inputs_launch;
-use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_launch;
 use pegainfer_kernels::ops::k3_mla_paged_attn_launch;
 use pegainfer_kernels::ops::k3_mla_prefill_expand_k_launch;
 use pegainfer_kernels::ops::k3_mla_prefill_gather_launch;
-use pegainfer_kernels::ops::gemm_rows_into_checked;
 use pegainfer_kernels::ops::k3_moe_gather_fp8_quant_masked_launch;
 use pegainfer_kernels::ops::k3_moe_local_route_metadata_launch;
 use pegainfer_kernels::ops::k3_moe_weighted_combine_launch;
@@ -273,7 +273,16 @@ fn k3_step(
                 }
             }
             (K3LayerAttention::Mla(mla), K3LayerState::Mla) => {
-                mla_attention(ctx, shape, prefill_chunk, layer, mla, kv, mla_index, scratch)?;
+                mla_attention(
+                    ctx,
+                    shape,
+                    prefill_chunk,
+                    layer,
+                    mla,
+                    kv,
+                    mla_index,
+                    scratch,
+                )?;
                 mla_index += 1;
             }
             _ => anyhow::bail!("K3 layer state does not match the layer's attention kind"),
@@ -479,7 +488,13 @@ pub(crate) fn k3_prefill_boundary_sample(
         &model.gamma_final.data,
         &mut scratch.normed,
     )?;
-    k3_gemm_full(ctx, &model.w_lm, &scratch.normed, 1, &mut scratch.logit_partial)?;
+    k3_gemm_full(
+        ctx,
+        &model.w_lm,
+        &scratch.normed,
+        1,
+        &mut scratch.logit_partial,
+    )?;
     k3_land_batched_launch(
         ctx,
         1,
@@ -870,8 +885,7 @@ fn kda_attention_chunk(
         &mut s.kda_g,
     )?;
     {
-        let (recurrent_read, recurrent_write) =
-            parity_pair(&mut kda_state.recurrent, start_parity);
+        let (recurrent_read, recurrent_write) = parity_pair(&mut kda_state.recurrent, start_parity);
         k3_flash_kda_fwd_launch(
             ctx,
             tokens,

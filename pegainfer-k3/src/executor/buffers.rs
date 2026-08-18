@@ -29,9 +29,9 @@ use pegainfer_kernels::ops::K3_ROUTER_TOPK;
 use pegainfer_kernels::ops::K3_V_DIM;
 use pegainfer_kernels::ops::K3MegaSymmLayout;
 use pegainfer_kernels::ops::argmax_batch_bf16_split_partials_len;
+use pegainfer_kernels::ops::k3_mega_max_tokens_per_rank;
 use pegainfer_kernels::ops::k3_mega_open_peer_access;
 use pegainfer_kernels::ops::k3_mega_symm_buffer_layout;
-use pegainfer_kernels::ops::k3_mega_max_tokens_per_rank;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 
@@ -202,7 +202,13 @@ impl K3StatePool {
         } else {
             (0, self.attn_rows)
         };
-        zero_rows(ctx, &mut self.blocks, first, count, self.block_count * K3_HIDDEN)?;
+        zero_rows(
+            ctx,
+            &mut self.blocks,
+            first,
+            count,
+            self.block_count * K3_HIDDEN,
+        )?;
         self.kv.release_row(row);
         self.positions[row] = 0;
         Ok(())
@@ -288,7 +294,11 @@ impl K3StatePool {
     /// A prefill chunk leaves the final token's attention-residual snapshots
     /// in the chunk's last live row; [`Self::adopt_row`] hands row 0 over, so
     /// the prefill pool collapses the last row down first.
-    pub(crate) fn collapse_snapshots(&mut self, ctx: &DeviceContext, source_row: usize) -> Result<()> {
+    pub(crate) fn collapse_snapshots(
+        &mut self,
+        ctx: &DeviceContext,
+        source_row: usize,
+    ) -> Result<()> {
         if source_row == 0 {
             return Ok(());
         }

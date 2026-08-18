@@ -743,7 +743,9 @@ fn prefill_time_snapshot() {
     for len in [64usize, 512, 2048] {
         let prompt = prompt_of(len);
         let started = std::time::Instant::now();
-        executor.prefill(0, &prompt, &params).expect("timed prefill");
+        executor
+            .prefill(0, &prompt, &params)
+            .expect("timed prefill");
         let elapsed = started.elapsed().as_secs_f64();
         executor.release(0);
         eprintln!(
@@ -801,4 +803,3 @@ fn step_time_snapshot() {
         }
     }
 }
-

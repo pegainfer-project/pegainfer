@@ -782,7 +782,6 @@ impl K3Executor {
         self.gpu.sync()?;
         Ok(logits.into_iter().map(f32::from).collect())
     }
-
 }
 
 fn read_config(model_path: &Path) -> Result<serde_json::Value> {

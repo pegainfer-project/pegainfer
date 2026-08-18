@@ -175,3 +175,5 @@ When a session wraps up:
 # Git Conventions
 
 Commit messages use Commitizen format: `<type>(<scope>): <subject>`. Never commit directly to `main` — create a `feat/`/`fix/`/`chore/`/… branch first.
+
+Every commit must carry a DCO `Signed-off-by:` trailer (`git commit -s`, or `git rebase --signoff` to fix up a branch) — CI enforces it and rejects PRs without it. CI also runs `cargo fmt --check`; run `cargo fmt` before committing.
