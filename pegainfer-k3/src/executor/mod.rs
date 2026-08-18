@@ -27,9 +27,9 @@
 //! in one launch, the MLA layers attend `[context | chunk]` through one
 //! dense FlashMLA FMHA call per layer over kv_b-expanded scratch, and the
 //! KDA recurrence crosses the chunk as one chunkwise FlashKDA forward per
-//! layer ([`step::k3_prefill_chunk_step`]). Chunk steps skip the batched
+//! layer ([`forward::k3_prefill_chunk_step`]). Chunk steps skip the batched
 //! epilogue; the boundary token is sampled once after the final chunk
-//! ([`step::k3_prefill_boundary_sample`]). It runs on a
+//! ([`forward::k3_prefill_boundary_sample`]). It runs on a
 //! **separate state pool**
 //! rather than on the sequence's own slot, because a batched step advances
 //! every row of its bucket: prefilling in place would step the sequences
@@ -64,9 +64,8 @@
 
 mod buffers;
 pub mod ep;
-mod gemm;
+mod forward;
 mod paged_kv;
-mod step;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -93,10 +92,10 @@ use self::buffers::K3StatePool;
 use self::ep::K3EpRendezvous;
 use self::ep::K3EpRuntime;
 use self::ep::ep_fatal;
-use self::step::K3StepShape;
-use self::step::k3_decode_step;
-use self::step::k3_prefill_boundary_sample;
-use self::step::k3_prefill_chunk_step;
+use self::forward::K3StepShape;
+use self::forward::k3_decode_step;
+use self::forward::k3_prefill_boundary_sample;
+use self::forward::k3_prefill_chunk_step;
 use crate::config::K3_DENSE_LAYERS;
 use crate::config::K3_LAYERS;
 use crate::config::K3MoeTopo;
