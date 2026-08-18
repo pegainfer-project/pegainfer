@@ -768,13 +768,19 @@ pub(crate) struct K3Scratch {
 }
 
 impl K3Scratch {
-    /// `rows` is this rank's row capacity. Exactly one of the two routed-expert
-    /// working sets is allocated: the fused kernel's slab when `mega` is set,
-    /// the masked chain's otherwise.
+    /// `rows` is the widest bucket any step runs (the chunk bucket when
+    /// chunked prefill outgrows the decode ladder); `sample_rows` is the
+    /// decode row capacity, which alone sizes the epilogue buffers — a
+    /// prefill chunk skips the batched epilogue and samples its boundary
+    /// token through a one-row pass, so the vocab-wide buffers never scale
+    /// with the chunk. Exactly one of the two routed-expert working sets is
+    /// allocated: the fused kernel's slab when `mega` is set, the masked
+    /// chain's otherwise.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &DeviceContext,
         rows: usize,
+        sample_rows: usize,
         max_ctx: usize,
         routed_experts: usize,
         groups: usize,
@@ -784,7 +790,7 @@ impl K3Scratch {
         let stream = &ctx.stream;
         let wide = |width: usize| stream.alloc_zeros::<bf16>(rows * width);
         let partial = |width: usize| stream.alloc_zeros::<f32>(rows * width);
-        let argmax_partials = argmax_batch_bf16_split_partials_len(rows, K3_VOCAB);
+        let argmax_partials = argmax_batch_bf16_split_partials_len(sample_rows, K3_VOCAB);
         Ok(Self {
             token_ids: stream.alloc_zeros(rows)?,
             context_len: stream.alloc_zeros(rows)?,
@@ -878,12 +884,16 @@ impl K3Scratch {
                     )
                 })
                 .transpose()?,
-            logit_partial: partial(K3_VOCAB).context("alloc K3 logit partial")?,
-            logits: wide(K3_VOCAB).context("alloc K3 logits")?,
+            logit_partial: stream
+                .alloc_zeros(sample_rows * K3_VOCAB)
+                .context("alloc K3 logit partial")?,
+            logits: stream
+                .alloc_zeros(sample_rows * K3_VOCAB)
+                .context("alloc K3 logits")?,
             argmax_partial_values: stream.alloc_zeros(argmax_partials)?,
             argmax_partial_indices: stream.alloc_zeros(argmax_partials)?,
-            argmax_values: stream.alloc_zeros(rows)?,
-            argmax_indices: stream.alloc_zeros(rows)?,
+            argmax_values: stream.alloc_zeros(sample_rows)?,
+            argmax_indices: stream.alloc_zeros(sample_rows)?,
         })
     }
 }

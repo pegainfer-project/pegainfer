@@ -160,6 +160,7 @@ fn page_permutation_leaves_every_logit_bit_identical() {
         max_ctx: 256,
         kv_pages: 16,
         num_layers: fixture.num_layers,
+        chunk_tokens: 0,
         cuda_graph: false,
         moe_transport: K3MoeTransport::MEGA,
     };
@@ -196,6 +197,7 @@ fn long_context_decode_is_self_consistent() {
         max_ctx: 2048,
         kv_pages: 0,
         num_layers: fixture.num_layers,
+        chunk_tokens: 0,
         cuda_graph: false,
         moe_transport: K3MoeTransport::MEGA,
     };
@@ -273,6 +275,7 @@ fn dump_forced_replay_logits() {
         max_ctx: 128,
         kv_pages: 0,
         num_layers: fixture.num_layers,
+        chunk_tokens: 0,
         cuda_graph: false,
         moe_transport: K3MoeTransport::MEGA,
     };

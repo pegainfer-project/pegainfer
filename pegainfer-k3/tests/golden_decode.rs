@@ -135,6 +135,9 @@ fn executor(
         max_ctx: golden.max_ctx,
         kv_pages: 0,
         num_layers: golden.num_layers,
+        // Pin chunks to the slot count: the prefill gates engineer their
+        // chunk widths through `max_batch` (cap 1, cap 8).
+        chunk_tokens: max_batch,
         cuda_graph,
         moe_transport,
     };
@@ -719,6 +722,8 @@ fn prefill_time_snapshot() {
         max_ctx: 4096,
         kv_pages: 0,
         num_layers: golden.num_layers,
+        // Derived: the widest chunk the transport carries (protocol max).
+        chunk_tokens: 0,
         cuda_graph: true,
         moe_transport: K3MoeTransport::MEGA,
     };
@@ -796,3 +801,4 @@ fn step_time_snapshot() {
         }
     }
 }
+

@@ -134,6 +134,14 @@ THREADS = 256
 # number of distinct CUDA Graphs — bounded.
 B_BUCKETS = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
 
+# Prefill chunk buckets: the chunked-prefill step runs the same batched
+# families at chunk width, up to the MegaMoE protocol maximum (4224 rows).
+# Every family gets the extended ladder except `kda_core` — chunks cross the
+# KDA recurrence through FlashKDA, so the fused core only ever sees decode
+# buckets. Mirrors `K3_PREFILL_BUCKETS` in `ops/k3_tilelang.rs`.
+B_PREFILL_BUCKETS = [256, 512, 1024, 2048, 4224]
+B_CHUNK_BUCKETS = B_BUCKETS + B_PREFILL_BUCKETS
+
 
 # --------------------------------------------------------------------------- #
 # Per-family shape lists, in `engine._warm_kernels` order.
@@ -533,7 +541,7 @@ def _bf16(name: str, const: bool = True) -> str:
 def plan_rms_norm_rbs() -> Plan:
     insts = []
     for width in RMS_NORM_N:
-        for batch in B_BUCKETS:
+        for batch in B_CHUNK_BUCKETS:
             insts.append(Inst(
                 family="rms_norm_rbs",
                 order=len(insts),
@@ -572,7 +580,7 @@ def plan_land() -> Plan:
     insts = []
     for nt, n, off in LAND_CONFIGS:
         for split_k in SPLIT_K:
-            for batch in B_BUCKETS:
+            for batch in B_CHUNK_BUCKETS:
                 npad = ceildiv(n, THREADS) * THREADS
                 insts.append(Inst(
                     family="land",
@@ -618,7 +626,7 @@ def plan_land_rms_norm_rbs() -> Plan:
     insts = []
     for nt, n, off in LAND_RMS_NORM_CONFIGS:
         for split_k in SPLIT_K:
-            for batch in B_BUCKETS:
+            for batch in B_CHUNK_BUCKETS:
                 insts.append(Inst(
                     family="land_rms_norm_rbs",
                     order=len(insts),
@@ -667,7 +675,7 @@ def plan_land_rms_norm_rbs() -> Plan:
 def _plan_binary(family: str, widths: list[int], doc: str) -> Plan:
     insts = []
     for width in widths:
-        for batch in B_BUCKETS:
+        for batch in B_CHUNK_BUCKETS:
             insts.append(Inst(
                 family=family,
                 order=len(insts),
@@ -719,7 +727,7 @@ def plan_mul_sigmoid() -> Plan:
 def plan_situ() -> Plan:
     insts = []
     for width in SITU_N:
-        for batch in B_BUCKETS:
+        for batch in B_CHUNK_BUCKETS:
             insts.append(Inst(
                 family="situ",
                 order=len(insts),
@@ -756,7 +764,7 @@ def plan_situ() -> Plan:
 def plan_conv_silu() -> Plan:
     insts = []
     for split_k in SPLIT_K:
-        for batch in B_BUCKETS:
+        for batch in B_CHUNK_BUCKETS:
             insts.append(Inst(
                 family="conv_silu",
                 order=len(insts),
@@ -872,7 +880,7 @@ def plan_kda_core() -> Plan:
 
 def plan_o_norm_gate() -> Plan:
     insts = []
-    for batch in B_BUCKETS:
+    for batch in B_CHUNK_BUCKETS:
         insts.append(Inst(
             family="o_norm_gate",
             order=len(insts),
@@ -918,7 +926,7 @@ def plan_o_norm_gate() -> Plan:
 def plan_router_topk() -> Plan:
     insts = []
     for experts in EXPERTS:
-        for batch in B_BUCKETS:
+        for batch in B_CHUNK_BUCKETS:
             insts.append(Inst(
                 family="router_topk",
                 order=len(insts),
@@ -961,7 +969,7 @@ def plan_router_topk() -> Plan:
 def plan_attnres_scores() -> Plan:
     insts = []
     for blocks in ATTNRES_NB:
-        for batch in B_BUCKETS:
+        for batch in B_CHUNK_BUCKETS:
             insts.append(Inst(
                 family="attnres_scores",
                 order=len(insts),
@@ -1002,7 +1010,7 @@ def plan_attnres_scores() -> Plan:
 def plan_attnres_mix() -> Plan:
     insts = []
     for blocks in ATTNRES_NB:
-        for batch in B_BUCKETS:
+        for batch in B_CHUNK_BUCKETS:
             insts.append(Inst(
                 family="attnres_mix",
                 order=len(insts),

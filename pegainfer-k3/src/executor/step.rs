@@ -380,6 +380,14 @@ fn k3_step(
         )?;
     }
 
+    // A prefill chunk stops here: only the boundary token's sample is ever
+    // read, so the caller runs [`k3_prefill_boundary_sample`] once after the
+    // final chunk instead of paying a chunk-wide lm_head per step — which
+    // also keeps the vocab-wide buffers sized by the decode rows, not the
+    // chunk bucket.
+    if prefill_chunk {
+        return Ok(());
+    }
     attn_res(
         ctx,
         b,
@@ -419,6 +427,73 @@ fn k3_step(
         ctx,
         &scratch.logits,
         b,
+        K3_VOCAB,
+        &mut scratch.argmax_partial_values,
+        &mut scratch.argmax_partial_indices,
+        &mut scratch.argmax_values,
+        &mut scratch.argmax_indices,
+    )
+}
+
+/// Sample the prefill boundary token: the epilogue the chunk steps skipped,
+/// at `b = 1` over the final chunk's last live row.
+///
+/// The caller must have collapsed the last live row's attention-residual
+/// snapshots to row 0 first (the same collapse the decode handover needs) —
+/// this reads row 0 of `snapshots`. The boundary hidden state is copied from
+/// `hidden[last_row]` into row 0 of the `prefix` scratch, so the sample lands
+/// in `argmax_indices[0]`.
+pub(crate) fn k3_prefill_boundary_sample(
+    ctx: &DeviceContext,
+    model: &K3RankModel,
+    last_row: usize,
+    snapshots: &CudaSlice<bf16>,
+    scratch: &mut K3Scratch,
+) -> Result<()> {
+    copy_rows_2d(
+        ctx,
+        &scratch.hidden,
+        last_row * K3_HIDDEN,
+        K3_HIDDEN,
+        &mut scratch.prefix,
+        0,
+        K3_HIDDEN,
+        1,
+        K3_HIDDEN,
+    )?;
+    attn_res(
+        ctx,
+        1,
+        model.blocks,
+        &scratch.prefix,
+        snapshots,
+        &model.sw_out,
+        &mut scratch.scores,
+        &mut scratch.mixed,
+    )?;
+    k3_rms_norm_rbs_batched_launch(
+        ctx,
+        1,
+        K3_HIDDEN,
+        &scratch.mixed,
+        &model.gamma_final.data,
+        &mut scratch.normed,
+    )?;
+    k3_gemm_full(ctx, &model.w_lm, &scratch.normed, 1, &mut scratch.logit_partial)?;
+    k3_land_batched_launch(
+        ctx,
+        1,
+        K3_VOCAB,
+        K3_VOCAB,
+        0,
+        1,
+        &scratch.logit_partial,
+        &mut scratch.logits,
+    )?;
+    argmax_bf16_split_into(
+        ctx,
+        &scratch.logits,
+        1,
         K3_VOCAB,
         &mut scratch.argmax_partial_values,
         &mut scratch.argmax_partial_indices,

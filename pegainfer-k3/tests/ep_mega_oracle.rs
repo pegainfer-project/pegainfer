@@ -156,6 +156,7 @@ fn config(fixture: &Fixture) -> K3ExecutorConfig {
         max_ctx: fixture.max_ctx,
         kv_pages: 0,
         num_layers: fixture.num_layers,
+        chunk_tokens: 0,
         // Eager either way: EP forces capture off and the reference has to
         // match. (The single-rank mega path does capture; this pins it off so
         // the two differ only in world size.)
@@ -390,7 +391,7 @@ fn peer_run(executor: &mut K3Executor, rank: usize, prompt: &[u32], peers: Peers
             // forced replay spends one step per token, so the peer pads the
             // difference — which is exactly what a free-running rank does
             // whenever its work ends before its peers'.
-            let walked = own.len().div_ceil(executor.max_batch()) + DECODE_STEPS;
+            let walked = own.len().div_ceil(executor.chunk_tokens()) + DECODE_STEPS;
             assert!(
                 walked <= steps,
                 "rank {rank}: walked {walked} steps, rank 0 only takes {steps}"
