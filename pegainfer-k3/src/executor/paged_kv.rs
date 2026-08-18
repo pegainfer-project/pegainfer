@@ -195,6 +195,25 @@ impl K3PagedKv {
         Ok(())
     }
 
+    /// Mirror `source_row`'s block-table row into table rows `1..rows`.
+    ///
+    /// A prefill chunk runs one sequence as many batch rows — one row per
+    /// token — and the batched attention kernel walks the block table by batch
+    /// row, so every row of the chunk must see the same page chain. Causality
+    /// comes from the per-row context length, not from the table.
+    pub(crate) fn mirror_row_table(&mut self, source_row: usize, rows: usize) -> Result<()> {
+        let width = self.max_pages_per_slot;
+        ensure!(
+            source_row < self.table_host.len() / width && rows * width <= self.table_host.len(),
+            "K3 KV table mirror of {rows} rows is out of range"
+        );
+        let source = self.table_host[source_row * width..(source_row + 1) * width].to_vec();
+        for row in (0..rows).filter(|row| *row != source_row) {
+            self.table_host[row * width..(row + 1) * width].copy_from_slice(&source);
+        }
+        Ok(())
+    }
+
     /// Upload the host block table. Cheap enough to do before every step, and
     /// outside graph capture like the rest of the step inputs.
     pub(crate) fn sync_table(&mut self, ctx: &DeviceContext) -> Result<()> {

@@ -144,10 +144,14 @@ B_BUCKETS = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
 RMS_NORM_N = [HIDDEN, KV_LORA, LATENT]
 
 # land(NT, N, OFF, SK): merge one column span of a (SK, NT) partial and land
-# bf16 once. The engine's `lands` list, verbatim.
+# bf16 once. The engine's `lands` list, verbatim, plus the chunked-prefill
+# conv-input landing (the sequential engine never lands that projection alone —
+# its conv kernel casts in place; the chunk builds windows from the landed rows
+# before the conv runs, so it needs the standalone cast).
 LAND_CONFIGS = [
     #  NT                N                   OFF               engine call site
     (4 * KDA_DIM, KDA_DIM, 3 * KDA_DIM),              # KDA output gate
+    (KDA_DIM, KDA_DIM, 0),                            # chunked-prefill conv inputs
     (WSM_N, KDA_HEADS, 0),                            # KDA beta
     (WSM_N, KDA_HEAD_DIM, KDA_HEADS),                 # KDA low-rank gate input
     (MLA_FUSED, KV_LORA + ROPE_DIM, Q_LORA),          # MLA kv_a|k_rope

@@ -18,9 +18,12 @@ absorbed-MLA CUDA kernel with no compile-time context cap (the old 1.47
 MB/token expanded slot cache and its `max_ctx = 128` are gone). Kernel surface:
 eleven batched TileLang decode families + the hand-written paged-attention
 kernel + DeepGEMM FP8xFP4 AOT shims (fused MegaMoE and the masked grouped GEMM)
-behind `pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt. Next:
-CUDA graphs over the EP4 fused path, real (chunked) prefill, kv-store
-integration.
+behind `pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt.
+Prefill is **chunked**: up to `max_batch` consecutive prompt tokens per batched
+step (row-batched everything, per-token only the KDA recurrence), 4.2-7.3x
+TTFT over per-token stepping at the 4-layer snapshot. Next: CUDA graphs over
+the EP4 fused path, the KDA chunkwise delta-rule kernel and a real MLA prefill
+attention kernel, kv-store integration.
 
 Last touched: 2026-08
 
@@ -97,7 +100,7 @@ owns graphs and the `StepExecutor` impl.
   recurrent state advances — a seat's state is only meaningful while the seat
   is in *every* batch. The scheduler preserves this (running requests decode
   every step; `prefill` resets the seat at admission). Prefill runs on a
-  separate one-row pool and hands its state over by row copy.
+  separate pool and hands its state over by row copy (see Chunked prefill).
 - **Bring-up flags**: `PEGAINFER_K3_LAYERS` (layer truncation),
   `PEGAINFER_K3_MAX_BATCH`, `PEGAINFER_K3_CUDA_GRAPH`,
   `PEGAINFER_K3_MAX_CTX` (per-slot context ceiling, default 4096).
@@ -123,6 +126,58 @@ cross-bucket gate holds to the fixture with the same noise-floor rule.
 dominate — known to lose to a GEMV below ~8 rows/expert). Graphs buy ~4.5%;
 the step is not launch-bound. Absolute numbers move a few percent with box
 load, so compare within a session, not across.
+
+### Chunked prefill
+
+A prompt is walked in chunks of up to `max_batch` consecutive tokens; each
+chunk is one batched step whose *rows are the chunk's tokens* (`executor/`:
+`prefill_inner` → `step::k3_prefill_chunk_step`). What made this nearly free:
+
+- **MLA needed no new kernel.** The paged decode kernel is causal per row by
+  construction — row `t` gets `context_len = position+1` and the sequence's
+  block-table row mirrored across the bucket, so each token attends exactly
+  its prefix. (It is still a decode kernel doing O(L²) latent reads across the
+  chunk — the perf ceiling below.)
+- **The conv is batched bitwise.** Window rows are prebuilt from the landed
+  bf16 inputs themselves (`window[t][j] = x[t-3+j]`, carry from the previous
+  chunk's state), so every window value equals what sequential stepping would
+  have shifted through the slabs; one `k3_conv_silu` launch covers the chunk.
+  This needed one new AOT land config (`(KDA_DIM, KDA_DIM, 0)`) — the
+  sequential engine casts conv inputs inside the conv kernel, the chunk needs
+  them landed *before* the window build.
+- **Only the KDA delta rule walks tokens.** Per-token b=1 launches of the
+  batched kernel's own single-row body (`k3_kda_core_token_launch` offsets row
+  pointers into the same buffers), flipping recurrent parity per token. KDA
+  state stays one row per pool (~929 MB/slot forbids chunk-wide state).
+- **The prefill pool is asymmetric**: one row of KDA/conv state (the
+  recurrence is sequential anyway), a full bucket of attention-residual
+  snapshot rows and block-table rows (`attn_rows`). Handoff collapses the last
+  live row's snapshots to row 0, then `adopt_row` copies as before. Prefill
+  runs eagerly — the KDA walk makes the launch count depend on the token
+  count, so there is no fixed body to capture per bucket.
+
+Equivalence: chunk-internal conv/KDA are bitwise; what moves is the GEMM
+bucket (cuBLASLt tiling), so chunked prefill is held to the fixture's noise
+floor like any cross-bucket comparison. Gated by
+`chunked_prefill_crosses_its_bucket_boundaries` (cap 8 vs a 13-token prompt:
+full chunk + ragged odd chunk + mid-prompt parity flip + padding rows,
+force-fed continuation) alongside the existing prefill-then-decode gate, and
+the EP oracle's busy peers now prefill through chunks.
+
+TTFT snapshot (4-layer truncated, one GB300, `prefill_time_snapshot`), against
+the retired per-token prefill:
+
+| prompt | per-token | chunked | speedup |
+|--------|-----------|---------|---------|
+| 64     | 132 ms    | 21 ms   | 6.2x    |
+| 512    | 1176 ms   | 161 ms  | 7.3x    |
+| 2048   | 6377 ms   | 1508 ms | 4.2x    |
+
+The 2048 falloff is the two remaining per-token/per-row costs: the KDA core's
+sequential b=1 launches (69 layers x token count) and the decode-shaped MLA
+attention's O(L²) latent reads. Those are the next two kernels (chunkwise
+delta rule — qwen35's GDR chunkwise AOT is the in-repo precedent — and a real
+varlen prefill MLA kernel).
 
 ### MLA KV: paged latent cache + absorbed decode
 
@@ -211,9 +266,12 @@ it later:
 - **The only coupling is inside the step**, and it is a compile-time constant:
   every rank launches the same sequence at the same shapes on every step it
   takes. The scheduler calls `decode()` unconditionally — an idle rank pads the
-  step rather than skipping it — and prefill is sequential decode-shaped steps,
-  so a rank's prefill step pairs against a peer's decode step with no
-  negotiation.
+  step rather than skipping it — and a prefill chunk step issues the same
+  per-layer launch sequence as a decode step (the chunk's per-token KDA walk is
+  rank-local), so a rank's prefill step pairs against a peer's decode step with
+  no negotiation. What chunking *does* change is the step count a prompt
+  spends: `ceil(len/cap)` steps instead of one per token — a peer that finishes
+  earlier just pads, as ever.
 - **A step error is group-fatal** (log + exit). A rank that skips a launch
   leaves every peer inside a device barrier it will never reach; there is no
   state from which the group can serve a correct next token. GPU gates run one
@@ -371,11 +429,12 @@ recorded here as the measurement, not as a configuration you can still select.
 
 ## Next
 
-Real (chunked) prefill over the paged KV is in flight: the MegaMoE protocol
-maximum is already raised to 4224 rows/rank as the chunk ceiling (decode A/B
-within noise, all gates green — the row-batched step stages come for free, and
-the remaining work is the three time-axis kernels: causal conv, the KDA
-delta-rule chunk step, and MLA chunk attention). Then graphs over the EP4
+Chunked prefill's free-lunch phase has landed (see Chunked prefill above);
+what remains on the prefill axis is the two time-axis kernels it deliberately
+deferred: the KDA chunkwise delta rule (kills the 69-layers-x-tokens b=1
+launch walk) and a varlen MLA prefill attention kernel (kills the O(L²)
+decode-kernel reads) — then raising the chunk cap toward the 4224-row MegaMoE
+protocol ceiling once the step is worth widening. Then graphs over the EP4
 fused path (the ranks=1 path already captures), launch-ahead, kv-store
 `BlockPool` integration (content addressing / reuse for the MLA pages), and a
 perf pass on the paged attention kernel (the 3-sweep recompute reads the cache

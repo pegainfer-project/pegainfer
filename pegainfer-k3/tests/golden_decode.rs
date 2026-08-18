@@ -583,6 +583,62 @@ fn prefill_then_decode_serves_the_baseline_continuation() {
     eprintln!("prefill + decode reproduced the decode-only continuation");
 }
 
+/// Chunked-prefill gate: a prompt longer than the executor's bucket must split
+/// into chunks and still serve the fixture. Thirteen prompt tokens against a
+/// cap of eight force one full chunk and a ragged five-token chunk — odd, so
+/// the KDA parity the slot adopts flipped mid-prompt — with three padding rows
+/// in its bucket. The chunk's wide GEMM buckets may retile against the
+/// bucket-1 reference, so every step is held to the fixture with its
+/// noise-floor excusal rather than bit-exactness, and the continuation is
+/// force-fed so a coin flip cannot cascade into later steps.
+#[test]
+#[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
+fn chunked_prefill_crosses_its_bucket_boundaries() {
+    let golden = golden();
+    let Some(mut executor) = executor(&golden, 8, false, K3MoeTransport::MEGA) else {
+        eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
+        return;
+    };
+    let check = |step: usize, got: u32| {
+        let want = golden.argmax[step];
+        if got == want {
+            return;
+        }
+        let excused = golden.is_coin_flip(step) && golden.top5_ids[step].contains(&got);
+        assert!(
+            excused,
+            "chunked prefill: step {step} sampled {got}, fixture says {want}; \
+             reference margin {:.2} bf16 ULP, top-5 ids {:?}",
+            golden.margin_ulp(step),
+            golden.top5_ids[step]
+        );
+        eprintln!(
+            "chunked prefill: step {step} is a coin flip (reference margin {:.2} bf16 ULP): \
+             sampled {got}, fixture says {want}",
+            golden.margin_ulp(step)
+        );
+    };
+    let boundary = 13;
+    let params = pegainfer_frontend::sampler::SamplingParams::default();
+    let first = executor
+        .prefill(0, &golden.prompt[..boundary], &params)
+        .expect("chunked prefill should run");
+    check(boundary - 1, first);
+    let feed = golden.feed();
+    for step in boundary..golden.argmax.len() {
+        let tokens = executor
+            .decode(&[DecodeSlot {
+                slot: 0,
+                last_token: feed[step],
+            }])
+            .expect("decode should run");
+        check(step, tokens[0]);
+    }
+    eprintln!(
+        "chunked prefill (cap 8 over {boundary} prompt tokens) served the fixture continuation"
+    );
+}
+
 /// Localization aid, not a gate: feed the fixture's own token sequence at every
 /// step so a step's inputs never depend on the previous step's sample, and
 /// report each step's argmax and top-5 next to the reference's. A run that

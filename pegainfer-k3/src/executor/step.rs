@@ -47,6 +47,7 @@ use pegainfer_kernels::ops::k3_conv_silu_batched_launch;
 use pegainfer_kernels::ops::k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch;
 use pegainfer_kernels::ops::k3_fp8_scale_pack_ue8m0_launch;
 use pegainfer_kernels::ops::k3_kda_core_batched_launch;
+use pegainfer_kernels::ops::k3_kda_core_token_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_land_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_mega_moe_launch;
@@ -63,12 +64,15 @@ use pegainfer_kernels::ops::k3_situ_batched_launch;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 
+use super::buffers::K3_CONV_STATE;
 use super::buffers::K3_KDA_FUSED;
 use super::buffers::K3_KDA_WSM_PADDED;
 use super::buffers::K3_MLA_FUSED;
+use super::buffers::K3KdaState;
 use super::buffers::K3LayerState;
 use super::buffers::K3Scratch;
 use super::buffers::K3StatePool;
+use super::buffers::copy_rows_2d;
 use super::buffers::parity_pair;
 use super::gemm::K3PartialSpan;
 use super::gemm::k3_gemm_full;
@@ -105,8 +109,9 @@ pub(crate) struct K3StepShape {
     /// Compiled batch bucket every kernel runs at.
     pub(crate) bucket: usize,
     /// Leading rows of the bucket this rank actually owns this step; the rest
-    /// are padding. Only the expert-parallel MegaMoE path reads it — see
-    /// [`routed_experts_mega`].
+    /// are padding. The expert-parallel MegaMoE path reads it (see
+    /// [`routed_experts_mega`]), and a prefill chunk reads it as its live
+    /// token count.
     pub(crate) live_rows: usize,
     /// Which half of each ping-pong state slab this step reads.
     pub(crate) parity: usize,
@@ -145,6 +150,44 @@ pub(crate) fn k3_decode_step(
     ctx: &DeviceContext,
     model: &K3RankModel,
     shape: K3StepShape,
+    state: &mut K3StatePool,
+    scratch: &mut K3Scratch,
+) -> Result<()> {
+    k3_step(ctx, model, shape, false, state, scratch)
+}
+
+/// One prefill chunk: the same batched step, with the bucket's rows carrying
+/// consecutive tokens of ONE sequence instead of independent sequences.
+///
+/// `shape.live_rows` is the chunk's token count and `shape.parity` the KDA
+/// parity of its first token. The caller stages `token_ids`, ascending
+/// per-token `context_len` and per-token `kv_row` exactly as for decode, and
+/// mirrors the sequence's block-table row across the bucket — causality in the
+/// MLA layers comes from the per-row context length, so the batched attention
+/// kernel serves the chunk unchanged. Only the KDA layers walk the chunk's
+/// tokens through the recurrence sequentially ([`kda_attention_chunk`]);
+/// every other stage runs batched over the rows.
+pub(crate) fn k3_prefill_chunk_step(
+    ctx: &DeviceContext,
+    model: &K3RankModel,
+    shape: K3StepShape,
+    state: &mut K3StatePool,
+    scratch: &mut K3Scratch,
+) -> Result<()> {
+    ensure!(
+        (1..=shape.bucket).contains(&shape.live_rows),
+        "K3 prefill chunk of {} tokens does not fit its {} bucket",
+        shape.live_rows,
+        shape.bucket
+    );
+    k3_step(ctx, model, shape, true, state, scratch)
+}
+
+fn k3_step(
+    ctx: &DeviceContext,
+    model: &K3RankModel,
+    shape: K3StepShape,
+    prefill_chunk: bool,
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
 ) -> Result<()> {
@@ -200,20 +243,24 @@ pub(crate) fn k3_decode_step(
 
         match (&layer.attn, layer_state) {
             (K3LayerAttention::Kda(kda), K3LayerState::Kda(kda_state)) => {
-                let (recurrent_read, recurrent_write) =
-                    parity_pair(&mut kda_state.recurrent, shape.parity);
-                let (conv_read, conv_write) = parity_pair(&mut kda_state.conv, shape.parity);
-                kda_attention(
-                    ctx,
-                    b,
-                    layer,
-                    kda,
-                    recurrent_read,
-                    recurrent_write,
-                    conv_read,
-                    conv_write,
-                    scratch,
-                )?;
+                if prefill_chunk {
+                    kda_attention_chunk(ctx, shape, layer, kda, kda_state, scratch)?;
+                } else {
+                    let (recurrent_read, recurrent_write) =
+                        parity_pair(&mut kda_state.recurrent, shape.parity);
+                    let (conv_read, conv_write) = parity_pair(&mut kda_state.conv, shape.parity);
+                    kda_attention(
+                        ctx,
+                        b,
+                        layer,
+                        kda,
+                        recurrent_read,
+                        recurrent_write,
+                        conv_read,
+                        conv_write,
+                        scratch,
+                    )?;
+                }
             }
             (K3LayerAttention::Mla(mla), K3LayerState::Mla) => {
                 mla_attention(ctx, b, layer, mla, kv, mla_index, scratch)?;
@@ -585,6 +632,274 @@ fn kda_conv_stream(
         landed,
         out,
         window_write,
+    )
+}
+
+/// The KDA layer of a prefill chunk: batched projections, a batched
+/// convolution over prebuilt windows, and the delta rule walked one token at a
+/// time — the only truly sequential arithmetic in the step.
+///
+/// Bit-compatibility with per-token stepping: the convolution windows are the
+/// landed bf16 inputs themselves (`window[t][j] = x[t - 3 + j]`, carried
+/// window for the first rows), so every window value equals what the
+/// sequential path would have shifted through its slabs; and the per-token
+/// core launch is the batched kernel's own single-row body. What does move is
+/// everything upstream of them — the projections run at the chunk's bucket, a
+/// different cuBLASLt shape than per-token stepping — so chunked prefill is
+/// held to the fixture's noise floor, like any cross-bucket comparison.
+fn kda_attention_chunk(
+    ctx: &DeviceContext,
+    shape: K3StepShape,
+    layer: &K3LayerWeights,
+    w: &K3KdaWeights,
+    kda_state: &mut K3KdaState,
+    s: &mut K3Scratch,
+) -> Result<()> {
+    let b = shape.bucket;
+    let tokens = shape.live_rows;
+    let start_parity = shape.parity;
+    // Batched projections — the decode arm's launches, at the chunk's bucket.
+    k3_rms_norm_rbs_batched_launch(
+        ctx,
+        b,
+        K3_HIDDEN,
+        &s.mixed,
+        &layer.gamma_in.data,
+        &mut s.normed,
+    )?;
+    k3_gemm_partial(
+        ctx,
+        &w.wbig,
+        3 * K3_ATTN_INNER,
+        K3_ATTN_INNER,
+        &s.normed,
+        b,
+        &mut s.kda_gate_partial,
+        K3PartialSpan {
+            offset: 3 * K3_ATTN_INNER,
+            stride: K3_KDA_FUSED,
+        },
+    )?;
+    k3_gemm_full(ctx, &w.wsm, &s.normed, b, &mut s.kda_wsm_partial)?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_KDA_WSM_PADDED,
+        K3_HEADS,
+        0,
+        1,
+        &s.kda_wsm_partial,
+        &mut s.beta,
+    )?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_KDA_WSM_PADDED,
+        K3_HEAD_DIM,
+        K3_HEADS,
+        1,
+        &s.kda_wsm_partial,
+        &mut s.forget_low,
+    )?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_KDA_FUSED,
+        K3_ATTN_INNER,
+        3 * K3_ATTN_INNER,
+        1,
+        &s.kda_gate_partial,
+        &mut s.out_gate,
+    )?;
+    k3_gemm_full(ctx, &w.w_f_b, &s.forget_low, b, &mut s.kda_forget_partial)?;
+
+    kda_conv_stream_chunk(
+        ctx,
+        b,
+        tokens,
+        start_parity,
+        &w.wbig,
+        0,
+        &w.cw_q,
+        &mut kda_state.conv,
+        0,
+        &s.normed,
+        &mut s.kda_conv_partial,
+        &mut s.conv_x,
+        &mut s.conv_window,
+        &mut s.conv_window_next,
+        &mut s.conv_q,
+    )?;
+    kda_conv_stream_chunk(
+        ctx,
+        b,
+        tokens,
+        start_parity,
+        &w.wbig,
+        K3_ATTN_INNER,
+        &w.cw_k,
+        &mut kda_state.conv,
+        1,
+        &s.normed,
+        &mut s.kda_conv_partial,
+        &mut s.conv_x,
+        &mut s.conv_window,
+        &mut s.conv_window_next,
+        &mut s.conv_k,
+    )?;
+    kda_conv_stream_chunk(
+        ctx,
+        b,
+        tokens,
+        start_parity,
+        &w.wbig,
+        2 * K3_ATTN_INNER,
+        &w.cw_v,
+        &mut kda_state.conv,
+        2,
+        &s.normed,
+        &mut s.kda_conv_partial,
+        &mut s.conv_x,
+        &mut s.conv_window,
+        &mut s.conv_window_next,
+        &mut s.conv_v,
+    )?;
+
+    // The delta rule, one token at a time over the chunk's single sequence.
+    for t in 0..tokens {
+        let parity = start_parity ^ (t & 1);
+        let (recurrent_read, recurrent_write) = parity_pair(&mut kda_state.recurrent, parity);
+        k3_kda_core_token_launch(
+            ctx,
+            K3_HEADS,
+            K3_HEAD_DIM,
+            1,
+            t,
+            &s.conv_q,
+            &s.conv_k,
+            &s.conv_v,
+            &s.kda_forget_partial,
+            &w.dt_bias,
+            &w.a_log,
+            &s.beta,
+            &s.out_gate,
+            &w.gamma_o,
+            recurrent_read,
+            recurrent_write,
+            &mut s.gated,
+        )?;
+    }
+
+    // Batched output projection; rows past the chunk carry stale data the
+    // step discards with the rest of the padding.
+    k3_gemm_full(ctx, &w.w_o, &s.gated, b, &mut s.hidden_partial)?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_HIDDEN,
+        K3_HIDDEN,
+        0,
+        1,
+        &s.hidden_partial,
+        &mut s.attn_out,
+    )
+}
+
+/// One q/k/v stream of a prefill chunk: the batched band projection, the
+/// window build, one batched convolution, and the carry into the next chunk.
+#[allow(clippy::too_many_arguments)]
+fn kda_conv_stream_chunk(
+    ctx: &DeviceContext,
+    b: usize,
+    tokens: usize,
+    start_parity: usize,
+    fused: &DeviceMatrix,
+    band: usize,
+    taps: &CudaSlice<f32>,
+    conv_state: &mut [[CudaSlice<bf16>; 3]; 2],
+    stream_index: usize,
+    normed: &CudaSlice<bf16>,
+    partial: &mut CudaSlice<f32>,
+    xs: &mut CudaSlice<bf16>,
+    window: &mut CudaSlice<bf16>,
+    window_next: &mut CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    let inner = K3_ATTN_INNER;
+    k3_gemm_partial(
+        ctx,
+        fused,
+        band,
+        inner,
+        normed,
+        b,
+        partial,
+        K3PartialSpan::whole(inner),
+    )?;
+    // Land the chunk's inputs once: the window entries ARE these bf16 rows,
+    // the same cast the conv kernel itself applies.
+    k3_land_batched_launch(ctx, b, inner, inner, 0, 1, partial, xs)?;
+    // Row t's window slot j holds input `t - K3_CONV_STATE + j`: from the
+    // chunk itself once that token exists, from the carried window before it.
+    {
+        let carry = &conv_state[start_parity][stream_index];
+        for j in 0..K3_CONV_STATE {
+            let lead = K3_CONV_STATE - j;
+            if tokens > lead {
+                copy_rows_2d(
+                    ctx,
+                    xs,
+                    0,
+                    inner,
+                    window,
+                    (lead * K3_CONV_STATE + j) * inner,
+                    K3_CONV_STATE * inner,
+                    tokens - lead,
+                    inner,
+                )?;
+            }
+            for t in 0..lead.min(tokens) {
+                copy_rows_2d(
+                    ctx,
+                    carry,
+                    (t + j) * inner,
+                    inner,
+                    window,
+                    (t * K3_CONV_STATE + j) * inner,
+                    inner,
+                    1,
+                    inner,
+                )?;
+            }
+        }
+    }
+    k3_conv_silu_batched_launch(
+        ctx,
+        b,
+        inner,
+        K3_CONV_WIDTH,
+        1,
+        partial,
+        taps,
+        window,
+        xs,
+        out,
+        window_next,
+    )?;
+    // The carry into the next chunk is the successor window of the chunk's
+    // last token — for a chunk shorter than the window it already folds the
+    // slots carried in above.
+    let end_parity = start_parity ^ (tokens & 1);
+    copy_rows_2d(
+        ctx,
+        window_next,
+        (tokens - 1) * K3_CONV_STATE * inner,
+        K3_CONV_STATE * inner,
+        &mut conv_state[end_parity][stream_index],
+        0,
+        K3_CONV_STATE * inner,
+        1,
+        K3_CONV_STATE * inner,
     )
 }
 

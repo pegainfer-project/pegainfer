@@ -512,6 +512,87 @@ pub fn k3_kda_core_batched_launch(
     )
 }
 
+/// One token of the KDA delta rule, taken from row `row` of batched buffers.
+///
+/// The `b = 1` instantiation of `kda_core` launched against row `row` of the
+/// per-row operands (`q`/`k`/`v`/`gp`/`bt`/`g2`/`out`) and a one-row state
+/// pair — how a prefill chunk walks its tokens through the recurrence while
+/// every non-recurrent stage of the step stays batched. The arithmetic is the
+/// batched kernel's own single-row body, so a chunk's state trajectory is
+/// bit-identical to stepping the same tokens one at a time.
+#[allow(clippy::too_many_arguments)]
+pub fn k3_kda_core_token_launch(
+    ctx: &DeviceContext,
+    num_heads: usize,
+    head_dim: usize,
+    split_k_gate: usize,
+    row: usize,
+    q: &CudaSlice<bf16>,
+    k: &CudaSlice<bf16>,
+    v: &CudaSlice<bf16>,
+    gp: &CudaSlice<f32>,
+    dt: &CudaSlice<f32>,
+    alog: &CudaSlice<f32>,
+    bt: &CudaSlice<bf16>,
+    g2: &CudaSlice<bf16>,
+    go: &CudaSlice<f32>,
+    state: &CudaSlice<f32>,
+    state_n: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    let kp = num_heads * head_dim;
+    let recurrent = num_heads * head_dim * head_dim;
+    ensure!(
+        (row + 1) * kp <= q.len().min(k.len()).min(v.len()).min(g2.len()).min(out.len())
+            && (row + 1) * split_k_gate * kp <= gp.len()
+            && (row + 1) * num_heads <= bt.len()
+            && dt.len() >= kp
+            && alog.len() >= num_heads
+            && go.len() >= head_dim
+            && state.len() >= recurrent
+            && state_n.len() >= recurrent,
+        "K3 kda_core token buffers too small for row {row}, kp {kp}"
+    );
+    let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
+    let (k_ptr, _k_guard) = k.device_ptr(&ctx.stream);
+    let (v_ptr, _v_guard) = v.device_ptr(&ctx.stream);
+    let (gp_ptr, _gp_guard) = gp.device_ptr(&ctx.stream);
+    let (dt_ptr, _dt_guard) = dt.device_ptr(&ctx.stream);
+    let (alog_ptr, _alog_guard) = alog.device_ptr(&ctx.stream);
+    let (bt_ptr, _bt_guard) = bt.device_ptr(&ctx.stream);
+    let (g2_ptr, _g2_guard) = g2.device_ptr(&ctx.stream);
+    let (go_ptr, _go_guard) = go.device_ptr(&ctx.stream);
+    let (state_ptr, _state_guard) = state.device_ptr(&ctx.stream);
+    let (state_n_ptr, _state_n_guard) = state_n.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    let half = |ptr: u64, width: usize| (ptr + (row * width * 2) as u64) as *const c_void;
+    let rc = unsafe {
+        ffi::k3_kda_core_batched(
+            half(q_ptr, kp),
+            half(k_ptr, kp),
+            half(v_ptr, kp),
+            (gp_ptr + (row * split_k_gate * kp * 4) as u64) as *const f32,
+            dt_ptr as *const f32,
+            alog_ptr as *const f32,
+            half(bt_ptr, num_heads),
+            half(g2_ptr, kp),
+            go_ptr as *const f32,
+            state_ptr as *const f32,
+            state_n_ptr as *mut f32,
+            (out_ptr + (row * kp * 2) as u64) as *mut c_void,
+            1,
+            num_heads as i32,
+            head_dim as i32,
+            split_k_gate as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    check(
+        rc,
+        &format!("K3 kda_core token row {row} (KH={num_heads}, KD={head_dim})"),
+    )
+}
+
 /// Sigmoid router plus biased top-k over already-merged f32 score rows.
 ///
 /// The weights come from the *un-biased* scores, are normalized with a
