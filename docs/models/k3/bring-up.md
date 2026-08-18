@@ -478,6 +478,42 @@ generated), median of three:
 Both emitted the same greedy text. That A/B is why the chain was retired; it is
 recorded here as the measurement, not as a configuration you can still select.
 
+## The attnres stride bug: what "all gates green" did not cover
+
+Found 2026-08-18, when chunked prefill made full-depth serve emit garbage on
+every prompt while all 13 golden gates and both EP oracles stayed green. The
+batched attention-residual kernels declared the snapshot slab as `(B, NB, H)`
+— row stride `NB x H`, `NB` being the layer's candidate count — but the slab
+is `[rows, block_count, H]` with `block_count = ceil(layers/12)`. Row 0 is
+stride-independent, so every `b = 1` path was correct, and that turned out to
+be every path any gate or any prior serve had ever run: the 4-layer fixture
+sits at `block_count = 1 = NB` (strides agree by accident), EP4 serve
+partitions decode one request each (`b = 1`), and pre-chunked prefill walked
+prompts one token at a time. A prefill chunk is the first shipped shape with
+`b > 1` past 12 layers, and rows ≥ 1 read other rows' snapshots on every mix.
+Concurrent decode rows in one partition had the same latent corruption —
+never shipped, never caught.
+
+The fix pins the slab row stride at `K3_ATTNRES_MAX_BLOCKS` everywhere: the
+kernels compile `Bl` as `(B, BC=8, H)` and `K3StatePool` always allocates and
+copies at that stride.
+
+Two lessons with teeth:
+
+- A slab shared by kernels must have exactly one stride authority. The
+  kernel's tensor declaration *is* an indexing contract; if the host lays the
+  slab out with a different constant, only row 0 tells no tales.
+- The debugging shape that found it is now a gate:
+  `chunked_prefill_agrees_with_the_per_token_walk_at_depth` holds chunked
+  prefill to the per-token decode walk at **any** depth
+  (`PEGAINFER_K3_AB_LAYERS`, `PEGAINFER_K3_AB_CHUNK`) with no fixture in the
+  loop — boundary-logit max |Δ| plus a forced-fed continuation. The bug's
+  signature was Δ step-jumping 1.1 → 10.5 between 12 and 13 layers
+  (`block_count` 1 → 2) while a cap-1 chunk stayed at Δ ≈ 1 at every depth.
+  Text-based A/B at truncated depth is useless for this: a truncated model's
+  logits are near-uniform, so any two correct implementations diverge within
+  a few tokens anyway.
+
 ## Next
 
 Chunked prefill has landed end-to-end at the protocol width: the chunkwise

@@ -35,18 +35,18 @@ scaling nicety.
 - **EP width = x·y**: every GPU in the deployment holds an expert shard, and
   the MegaMoE pairing spans all of them.
 
-Work items, roughly in dependency order:
+Work items, roughly in dependency order (1-3 DONE 2026-08-18, see
+`multi-node-ep.md` — EP16 over 4 trays byte-identical to single-tray EP4;
+worlds 224x{1,4,8,16} and 896x{8,16,32,64} instantiated; ssh fleet launcher
+`scripts/k3_ep_fleet.sh`, sbatch variant still open):
 
-1. **Cross-machine mega transport** — the gate for everything real-model.
-   `K3EpRendezvous` is deliberately in-process (bare pointers, one thread per
-   rank; `executor/ep.rs` records the seam): replace with an out-of-band
-   exchange + `CU_MEM_HANDLE_TYPE_FABRIC` handles (NVL72: one NVLink domain
-   rack-wide, IMEX), transport otherwise unchanged.
-2. **Mega ep8/ep16 instantiation** — ring capacities are kernel template
-   parameters; `K3_MEGA_EP_SIZES` is `[1, 4]` today. DeepGEMM groups
-   56/112/224 already cover EP16/EP8/bring-up.
-3. **Fleet launch** — sbatch pattern per `~/slurm/glm52_ep16_d.sbatch`,
-   adapted; router fronts every DP scheduler.
+1. ~~**Cross-machine mega transport**~~ — fabric-handle slabs + TCP
+   rendezvous (`--k3-ranks`/`--k3-rendezvous`), transport otherwise
+   unchanged.
+2. ~~**Mega ep8/ep16 instantiation**~~ — every world is a
+   `k3_mega_world_supported` entry now, split across three TUs.
+3. ~~**Fleet launch**~~ — `scripts/k3_ep_fleet.sh` (ssh); a slurm/sbatch
+   variant per `~/slurm/glm52_ep16_d.sbatch` remains open.
 4. **Attention TP (x up to 4)** — after multi-node EP works TP1; TP shrinks
    the per-rank attention/dense replication and is what makes wide-EP
    memory-comfortable. Needs the latent-cache decision above, TP'd KDA state
@@ -84,5 +84,5 @@ and CUDA-graph capture.
 - Paged-attention decode kernel perf pass (3-sweep recompute reads the cache
   three times; matters at 24 MLA layers × long contexts).
 
-**Next action**: cross-machine mega transport (item 1) — start at the
-`K3EpRendezvous` seam.
+**Next action**: attention TP (item 4), or the varlen prefill packing —
+multi-node EP is done.
