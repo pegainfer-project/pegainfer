@@ -22,9 +22,10 @@
 //!
 //! Prefill runs the batched step over **chunks of one sequence**: the bucket's
 //! rows carry up to `max_batch` consecutive prompt tokens, so every
-//! row-independent stage (norms, projections, MLA attention via ascending
-//! per-row context lengths, MoE, epilogue) digests the whole chunk in one
-//! launch, and the KDA recurrence crosses the chunk as one chunkwise FlashKDA
+//! row-independent stage (norms, projections, MoE, epilogue) digests the
+//! whole chunk in one launch, the MLA layers attend `[context | chunk]`
+//! through one dense FlashMLA FMHA call per layer over kv_b-expanded scratch,
+//! and the KDA recurrence crosses the chunk as one chunkwise FlashKDA
 //! forward per layer ([`step::k3_prefill_chunk_step`]). It runs on a
 //! **separate state pool**
 //! rather than on the sequence's own slot, because a batched step advances
@@ -493,6 +494,7 @@ impl K3Executor {
         let mut scratch = K3Scratch::new(
             &ctx,
             max_batch,
+            config.max_ctx,
             routed_experts,
             groups,
             K3_MASKED_CAP,
@@ -606,6 +608,7 @@ impl K3Executor {
             bucket,
             live_rows,
             parity,
+            chunk_start: 0,
             groups: self.groups,
             masked_cap: K3_MASKED_CAP,
             num_sms: self.num_sms,
@@ -834,7 +837,8 @@ impl K3Executor {
             self.prefill_state.kv.mirror_row_table(0, bucket)?;
             self.feed()?;
             self.prefill_state.kv.sync_table(&self.ctx)?;
-            let shape = self.shape(bucket, parity, tokens);
+            let mut shape = self.shape(bucket, parity, tokens);
+            shape.chunk_start = consumed;
             let launches = self.mega_launches_per_step;
             if let Some(mega) = self.scratch.mega.as_mut() {
                 mega.begin_step(launches);

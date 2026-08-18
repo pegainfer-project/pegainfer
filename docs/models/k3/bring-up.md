@@ -22,10 +22,11 @@ behind `pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt.
 Prefill is **chunked**: up to `max_batch` consecutive prompt tokens per
 batched step, with the KDA recurrence crossing each chunk as one **vendored
 FlashKDA** chunkwise forward per layer (MoonshotAI, MIT,
-`third_party/flash-kda`) — 4.9-10.3x TTFT over per-token stepping at the
-4-layer snapshot. Next: CUDA graphs over the EP4 fused path, a real MLA
-prefill attention kernel (the remaining long-prompt bottleneck), kv-store
-integration.
+`third_party/flash-kda`) and the MLA layers served by **FlashMLA's SM100
+dense FMHA** over kv_b-expanded K/V in fixed workspace (vLLM's recipe; the
+paged latent stays the only persistent storage) — 5x-104x TTFT over per-token
+stepping at the 4-layer snapshot (2048 tokens: 6377 → 61 ms). Next: CUDA
+graphs over the EP4 fused path, raising the chunk cap, kv-store integration.
 
 Last touched: 2026-08
 
@@ -135,11 +136,23 @@ A prompt is walked in chunks of up to `max_batch` consecutive tokens; each
 chunk is one batched step whose *rows are the chunk's tokens* (`executor/`:
 `prefill_inner` → `step::k3_prefill_chunk_step`). What made this nearly free:
 
-- **MLA needed no new kernel.** The paged decode kernel is causal per row by
-  construction — row `t` gets `context_len = position+1` and the sequence's
-  block-table row mirrored across the bucket, so each token attends exactly
-  its prefix. (It is still a decode kernel doing O(L²) latent reads across the
-  chunk — the perf ceiling below.)
+- **MLA is one dense FMHA call per layer** over FlashMLA's SM100 CUTLASS
+  forward (`third_party/FlashMLA/csrc/sm100/prefill/dense`, shimmed torch-free
+  in `csrc/k3/k3_flash_mla_prefill.cu`), following vLLM's chunked-prefill MLA
+  recipe: gather the cached latent rows into fixed workspace (the chunk's own
+  rows were just appended, so the cache holds the whole `[context | chunk]`
+  span), expand through `kv_b` (one cuBLAS GEMM; V is read as a strided view
+  into the expansion, K assembled by a small broadcast kernel), and let
+  `CausalMask<false>`'s bottom-right alignment — Q rows sit at the *end* of
+  the KV axis — give chunk token `i` exactly `context + i + 1` visible keys.
+  While the workspace covers `max_ctx` (4096 at bring-up, ~341 MB scratch),
+  vLLM's context loop and LSE merge degenerate to this single call; the
+  W-chunked loop is the extension point if `max_ctx` outgrows the workspace.
+  **The expanded K/V is per-chunk scratch, not a cache** — the retired 1.47
+  MB/token expanded slot cache stays retired. The first cut of this phase
+  reused the absorbed *decode* kernel per row (causal via per-row
+  `context_len`), which was O(L²) latent reads per chunk — that was 95% of
+  the 2048-token TTFT.
 - **The conv is batched bitwise.** Window rows are prebuilt from the landed
   bf16 inputs themselves (`window[t][j] = x[t-3+j]`, carry from the previous
   chunk's state), so every window value equals what sequential stepping would
@@ -182,19 +195,21 @@ full chunk + ragged odd chunk + parity handling + padding rows). The EP
 oracle's busy peers prefill through chunks.
 
 TTFT snapshot (4-layer truncated, one GB300, `prefill_time_snapshot`),
-against the retired per-token prefill; note the truncation carries ~3 KDA /
-1 MLA layer where the full model is 69/24, so FlashKDA's share of the win
-grows with depth:
+against the retired per-token prefill; the truncation carries ~3 KDA / 1 MLA
+layer where the full model is 69/24:
 
-| prompt | per-token | chunked (per-token KDA) | chunked + FlashKDA | total |
-|--------|-----------|-------------------------|--------------------|-------|
-| 64     | 132 ms    | 21.2 ms                 | 18.1 ms            | 7.3x  |
-| 512    | 1176 ms   | 161.0 ms                | 114.5 ms           | 10.3x |
-| 2048   | 6377 ms   | 1508 ms                 | 1312 ms            | 4.9x  |
+| prompt | per-token | chunked | + FlashKDA | + FlashMLA | total |
+|--------|-----------|---------|------------|------------|-------|
+| 64     | 132 ms    | 21.2 ms | 18.1 ms    | 27.1 ms    | 4.9x  |
+| 512    | 1176 ms   | 161 ms  | 114.5 ms   | 37.3 ms    | 31.5x |
+| 2048   | 6377 ms   | 1508 ms | 1312 ms    | 61.1 ms    | 104x  |
 
-What remains at 2048 is dominated by the decode-shaped MLA attention's O(L²)
-latent reads — the next kernel (a real varlen prefill MLA path; FlashMLA is
-already vendored for glm52).
+The FlashMLA step killed the decode-shaped attention's O(L²) latent reads
+(~1.05 s of the 1.31 s at 2048). The 64-token column *regressed* 9 ms: the
+per-MLA-layer fixed cost (gather + cuBLAS kv_b GEMM + K assembly + FMHA
+setup) exceeds the tiny absorbed-kernel walk at that length — acceptable at
+bring-up, and a length cutover to the absorbed path is the fix if short-prompt
+TTFT ever matters at full depth.
 
 ### MLA KV: paged latent cache + absorbed decode
 
@@ -446,11 +461,11 @@ recorded here as the measurement, not as a configuration you can still select.
 
 ## Next
 
-Chunked prefill has landed, including the chunkwise KDA kernel (vendored
-FlashKDA — see Chunked prefill above); what remains on the prefill axis is a
-varlen MLA prefill attention kernel (kills the O(L²) decode-kernel reads,
-now the 2048-token bottleneck) — then raising the chunk cap toward the
-4224-row MegaMoE protocol ceiling once the step is worth widening. Then
+Chunked prefill has landed end-to-end: the chunkwise KDA kernel (vendored
+FlashKDA) and the dense MLA prefill attention (FlashMLA SM100 FMHA) — see
+Chunked prefill above. What remains on the prefill axis is raising the chunk
+cap toward the 4224-row MegaMoE protocol ceiling, and a W-chunked context
+loop (+ LSE merge) if `max_ctx` outgrows the fixed expansion workspace. Then
 graphs over the EP4
 fused path (the ranks=1 path already captures), launch-ahead, kv-store
 `BlockPool` integration (content addressing / reuse for the MLA pages), and a

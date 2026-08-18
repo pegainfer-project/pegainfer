@@ -305,4 +305,55 @@ unsafe extern "C" {
         lower_bound: f32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Chunked-prefill MLA context gather: walk one block-table row and split
+    /// `t_total` cached 576-wide latent rows into dense `[t, 512]` latent and
+    /// `[t, 64]` rope halves. Strides/offsets are in elements.
+    pub fn k3_mla_prefill_gather(
+        slab: *const Half,
+        table: *const i32,
+        page_stride: i64,
+        layer_offset: i64,
+        t_total: i32,
+        latent_out: *mut Half,
+        rope_out: *mut Half,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Assemble per-head K rows `[t, heads, 192]` from the kv_b expansion
+    /// `[t, heads, 256]` (nope half) and the shared per-token rope `[t, 64]`
+    /// broadcast across heads.
+    pub fn k3_mla_prefill_expand_k(
+        nope_v: *const Half,
+        rope: *const Half,
+        k_out: *mut Half,
+        t_total: i32,
+        heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// FlashMLA SM100 dense FMHA forward (third_party/FlashMLA), one
+    /// sequence, bottom-right-aligned causal: q `[t_q, h, 192]`,
+    /// k `[t_kv, h, 192]`, v a strided `[t_kv, h, 128]` view, out
+    /// `[t_q, h, 128]`, all bf16; strides in elements. Requires an sm_100f
+    /// build (`NOT_SUPPORTED` elsewhere).
+    pub fn k3_flash_mla_prefill_fwd(
+        q: *const Half,
+        q_stride_tok: i64,
+        q_stride_head: i64,
+        k: *const Half,
+        k_stride_tok: i64,
+        k_stride_head: i64,
+        v: *const Half,
+        v_stride_tok: i64,
+        v_stride_head: i64,
+        out: *mut Half,
+        o_stride_tok: i64,
+        o_stride_head: i64,
+        t_q: i32,
+        t_kv: i32,
+        heads: i32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
 }

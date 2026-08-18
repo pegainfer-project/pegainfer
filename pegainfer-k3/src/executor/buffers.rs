@@ -33,6 +33,7 @@ use pegainfer_kernels::ops::k3_mega_open_peer_access;
 use pegainfer_kernels::ops::k3_mega_symm_buffer_layout;
 use pegainfer_kernels::ops::k3_mega_max_tokens_per_rank;
 use pegainfer_kernels::tensor::DeviceContext;
+use pegainfer_kernels::tensor::HiddenStates;
 
 use super::paged_kv::K3PagedKv;
 use crate::config::K3_ATTN_INNER;
@@ -41,6 +42,7 @@ use crate::config::K3_EXPERT_INTERMEDIATE;
 use crate::config::K3_HEAD_DIM;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_KV_A_OUT;
+use crate::config::K3_KV_B_OUT;
 use crate::config::K3_KV_LORA_RANK;
 use crate::config::K3_Q_B_OUT;
 use crate::config::K3_Q_LORA_RANK;
@@ -720,6 +722,17 @@ pub(crate) struct K3Scratch {
     /// The shared per-token rope half, `[rows, 64]` — cached verbatim (NoPE).
     pub(crate) rope: CudaSlice<bf16>,
     pub(crate) attn: CudaSlice<bf16>,
+    /// Chunked prefill (FlashMLA): the gathered cached latent,
+    /// `[max_ctx, 512]`, wrapped for the kv_b cuBLAS expansion (`seq_len` is
+    /// set to the chunk's kv span before each GEMM).
+    pub(crate) mla_ctx_latent: HiddenStates,
+    /// Chunked prefill: the gathered shared rope halves, `[max_ctx, 64]`.
+    pub(crate) mla_ctx_rope: CudaSlice<bf16>,
+    /// Chunked prefill: the kv_b expansion, `[max_ctx, heads, 256]` per-head
+    /// `nope | value` rows — the FMHA reads V as a strided view into this.
+    pub(crate) mla_ctx_nope_v: HiddenStates,
+    /// Chunked prefill: the assembled K rows, `[max_ctx, heads, 192]`.
+    pub(crate) mla_ctx_k: CudaSlice<bf16>,
     // MLP / MoE.
     pub(crate) hidden_partial: CudaSlice<f32>,
     pub(crate) router_partial: CudaSlice<f32>,
@@ -762,6 +775,7 @@ impl K3Scratch {
     pub(crate) fn new(
         ctx: &DeviceContext,
         rows: usize,
+        max_ctx: usize,
         routed_experts: usize,
         groups: usize,
         masked_cap: usize,
@@ -814,6 +828,18 @@ impl K3Scratch {
             query: wide(K3_Q_B_OUT)?,
             rope: wide(K3_QK_ROPE_HEAD_DIM)?,
             attn: wide(K3_MLA_V_ROW)?,
+            mla_ctx_latent: HiddenStates {
+                data: stream.alloc_zeros(max_ctx * K3_KV_LORA_RANK)?,
+                hidden_dim: K3_KV_LORA_RANK,
+                seq_len: 0,
+            },
+            mla_ctx_rope: stream.alloc_zeros(max_ctx * K3_QK_ROPE_HEAD_DIM)?,
+            mla_ctx_nope_v: HiddenStates {
+                data: stream.alloc_zeros(max_ctx * K3_KV_B_OUT)?,
+                hidden_dim: K3_KV_B_OUT,
+                seq_len: 0,
+            },
+            mla_ctx_k: stream.alloc_zeros(max_ctx * K3_Q_B_OUT)?,
             hidden_partial: partial(K3_HIDDEN)?,
             router_partial: partial(routed_experts)?,
             topk_idx: stream.alloc_zeros(rows * K3_ROUTER_TOPK)?,

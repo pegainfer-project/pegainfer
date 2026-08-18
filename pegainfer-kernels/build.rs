@@ -2085,6 +2085,50 @@ fn main() {
                 );
                 nvcc_args.extend(arch_args.clone());
             }
+        } else if stem == "k3_flash_mla_prefill" {
+            // FlashMLA's SM100 dense FMHA forward rides in single-TU like the
+            // sparse decode shim; the gather/expand helpers in the same file
+            // compile either way.
+            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
+                let flashmla = root.join("third_party/FlashMLA/csrc");
+                nvcc_args.extend(sm100f_args);
+                nvcc_args.extend(
+                    [
+                        "-DK3_FLASH_MLA_SM100F",
+                        "--std=c++20",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                    ]
+                    .map(str::to_string),
+                );
+                nvcc_args.extend([
+                    "-I".to_string(),
+                    flashmla
+                        .join("sm100/prefill/dense")
+                        .to_string_lossy()
+                        .to_string(),
+                    "-I".to_string(),
+                    flashmla
+                        .join("cutlass/include")
+                        .to_string_lossy()
+                        .to_string(),
+                    "-I".to_string(),
+                    flashmla
+                        .join("cutlass/tools/util/include")
+                        .to_string_lossy()
+                        .to_string(),
+                    "-I".to_string(),
+                    flashmla
+                        .join("kerutils/include")
+                        .to_string_lossy()
+                        .to_string(),
+                ]);
+            } else {
+                println!(
+                    "cargo:warning=No sm_100f target; K3 FlashMLA prefill {stem} FMHA compiles as a NOT_SUPPORTED stub"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
         // --- end k3 ---
         } else {
             nvcc_args.extend(arch_args.clone());

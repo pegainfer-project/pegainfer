@@ -52,7 +52,11 @@ use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_land_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_mega_moe_launch;
 use pegainfer_kernels::ops::k3_mega_write_inputs_launch;
+use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_launch;
 use pegainfer_kernels::ops::k3_mla_paged_attn_launch;
+use pegainfer_kernels::ops::k3_mla_prefill_expand_k_launch;
+use pegainfer_kernels::ops::k3_mla_prefill_gather_launch;
+use pegainfer_kernels::ops::gemm_rows_into_checked;
 use pegainfer_kernels::ops::k3_moe_gather_fp8_quant_masked_launch;
 use pegainfer_kernels::ops::k3_moe_local_route_metadata_launch;
 use pegainfer_kernels::ops::k3_moe_weighted_combine_launch;
@@ -88,6 +92,7 @@ use crate::config::K3_HEAD_DIM;
 use crate::config::K3_HEADS;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_KV_A_OUT;
+use crate::config::K3_KV_B_OUT;
 use crate::config::K3_KV_LORA_RANK;
 use crate::config::K3_Q_B_OUT;
 use crate::config::K3_Q_LORA_RANK;
@@ -116,6 +121,9 @@ pub(crate) struct K3StepShape {
     pub(crate) live_rows: usize,
     /// Which half of each ping-pong state slab this step reads.
     pub(crate) parity: usize,
+    /// Prefill chunks only: tokens of the sequence already cached before this
+    /// chunk (the MLA context span). Zero for decode steps.
+    pub(crate) chunk_start: usize,
     /// Rank-local expert groups (the masked GEMM's instantiation).
     pub(crate) groups: usize,
     /// Rows reserved per expert in the masked layout.
@@ -265,7 +273,7 @@ fn k3_step(
                 }
             }
             (K3LayerAttention::Mla(mla), K3LayerState::Mla) => {
-                mla_attention(ctx, b, layer, mla, kv, mla_index, scratch)?;
+                mla_attention(ctx, shape, prefill_chunk, layer, mla, kv, mla_index, scratch)?;
                 mla_index += 1;
             }
             _ => anyhow::bail!("K3 layer state does not match the layer's attention kind"),
@@ -942,13 +950,15 @@ fn kda_conv_stream_chunk(
 #[allow(clippy::too_many_arguments)]
 fn mla_attention(
     ctx: &DeviceContext,
-    b: usize,
+    shape: K3StepShape,
+    prefill_chunk: bool,
     layer: &K3LayerWeights,
     w: &K3MlaWeights,
     kv: &mut K3PagedKv,
     mla_index: usize,
     s: &mut K3Scratch,
 ) -> Result<()> {
+    let b = shape.bucket;
     k3_rms_norm_rbs_batched_launch(
         ctx,
         b,
@@ -1035,24 +1045,36 @@ fn mla_attention(
         &mut s.query,
     )?;
 
-    // Absorbed MLA over the paged latent: the kernel folds `w_kv_b`'s per-head
-    // W_UK into the query and expands the attended latent with W_UV, so the
-    // per-step kv_b expansion and the expanded K/V cache no longer exist.
-    k3_mla_paged_attn_launch(
-        ctx,
-        b,
-        K3_MLA_HEADS,
-        &s.query,
-        &w.w_kv_b.data,
-        &kv.slab,
-        mla_index * K3_KV_PAGE_TOKENS * K3_MLA_LATENT_ROW,
-        kv.page_stride(),
-        &kv.table_dev,
-        kv.max_pages_per_slot,
-        &s.context_len,
-        &w.scale.data,
-        &mut s.attn,
-    )?;
+    if prefill_chunk {
+        // Chunked prefill takes the non-absorbed dense route (vLLM's recipe):
+        // gather the cached latent — the chunk's own rows were appended just
+        // above, so the cache holds the whole [context | chunk] span — expand
+        // it through kv_b into per-head K/V scratch, and one bottom-right-
+        // aligned causal FMHA serves every chunk query. Only the paged latent
+        // persists. Padding rows of `attn` keep stale (finite) data; their
+        // results are discarded like everywhere else in the chunk path.
+        mla_attention_chunk_fmha(ctx, shape, w, kv, mla_index, s)?;
+    } else {
+        // Absorbed MLA over the paged latent: the kernel folds `w_kv_b`'s
+        // per-head W_UK into the query and expands the attended latent with
+        // W_UV, so the per-step kv_b expansion and the expanded K/V cache no
+        // longer exist.
+        k3_mla_paged_attn_launch(
+            ctx,
+            b,
+            K3_MLA_HEADS,
+            &s.query,
+            &w.w_kv_b.data,
+            &kv.slab,
+            mla_index * K3_KV_PAGE_TOKENS * K3_MLA_LATENT_ROW,
+            kv.page_stride(),
+            &kv.table_dev,
+            kv.max_pages_per_slot,
+            &s.context_len,
+            &w.scale.data,
+            &mut s.attn,
+        )?;
+    }
     k3_mul_sigmoid_batched_launch(ctx, b, K3_ATTN_INNER, &s.attn, &s.mla_gate, &mut s.gated)?;
     k3_gemm_full(ctx, &w.w_o, &s.gated, b, &mut s.hidden_partial)?;
     k3_land_batched_launch(
@@ -1064,6 +1086,73 @@ fn mla_attention(
         1,
         &s.hidden_partial,
         &mut s.attn_out,
+    )
+}
+
+/// One prefill chunk's MLA attention over FlashMLA's dense FMHA.
+///
+/// The workspace covers the whole context (`max_ctx` rows), so the vLLM
+/// context loop degenerates to a single call: `t_q = live_rows` queries from
+/// `s.query` attend `t_kv = chunk_start + live_rows` keys expanded from the
+/// gathered latent, and `CausalMask<false>`'s Q-at-the-end alignment gives
+/// chunk token `i` exactly `chunk_start + i + 1` visible keys. Prefill drives
+/// slot 0, whose block-table row leads `table_dev`.
+fn mla_attention_chunk_fmha(
+    ctx: &DeviceContext,
+    shape: K3StepShape,
+    w: &K3MlaWeights,
+    kv: &K3PagedKv,
+    mla_index: usize,
+    s: &mut K3Scratch,
+) -> Result<()> {
+    let t_q = shape.live_rows;
+    let t_kv = shape.chunk_start + t_q;
+    ensure!(
+        t_kv * K3_KV_LORA_RANK <= s.mla_ctx_latent.data.len(),
+        "K3 MLA prefill workspace of {} tokens cannot span the {t_kv}-token context",
+        s.mla_ctx_latent.data.len() / K3_KV_LORA_RANK
+    );
+    k3_mla_prefill_gather_launch(
+        ctx,
+        t_kv,
+        &kv.slab,
+        &kv.table_dev,
+        kv.page_stride(),
+        mla_index * K3_KV_PAGE_TOKENS * K3_MLA_LATENT_ROW,
+        &mut s.mla_ctx_latent.data,
+        &mut s.mla_ctx_rope,
+    )?;
+    s.mla_ctx_latent.seq_len = t_kv;
+    s.mla_ctx_nope_v.seq_len = t_kv;
+    gemm_rows_into_checked(
+        ctx,
+        &w.w_kv_b,
+        0,
+        K3_KV_B_OUT,
+        &s.mla_ctx_latent,
+        &mut s.mla_ctx_nope_v,
+    )?;
+    k3_mla_prefill_expand_k_launch(
+        ctx,
+        t_kv,
+        K3_MLA_HEADS,
+        &s.mla_ctx_nope_v.data,
+        &s.mla_ctx_rope,
+        &mut s.mla_ctx_k,
+    )?;
+    // The decode kernel reads the softmax scale as a bf16 device scalar; feed
+    // the FMHA the same rounded constant so the two paths agree on it.
+    let scale = bf16::from_f64(crate::model::k3_mla_scale()).to_f32();
+    k3_flash_mla_prefill_fwd_launch(
+        ctx,
+        t_q,
+        t_kv,
+        K3_MLA_HEADS,
+        &s.query,
+        &s.mla_ctx_k,
+        &s.mla_ctx_nope_v.data,
+        &mut s.attn,
+        scale,
     )
 }
 

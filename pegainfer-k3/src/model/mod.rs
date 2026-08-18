@@ -67,6 +67,8 @@ mod build;
 mod plan;
 
 use build::K3SlotBuffers;
+pub(crate) use plan::k3_mla_scale;
+
 use plan::K3_KDA_BIG_ROWS;
 use plan::K3_KDA_WSM_ROWS;
 use plan::K3_MLA_FUSED_ROWS;
