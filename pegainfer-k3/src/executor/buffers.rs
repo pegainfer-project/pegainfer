@@ -29,12 +29,15 @@ use pegainfer_kernels::ops::K3_ROUTER_TOPK;
 use pegainfer_kernels::ops::K3_V_DIM;
 use pegainfer_kernels::ops::K3MegaSymmLayout;
 use pegainfer_kernels::ops::argmax_batch_bf16_split_partials_len;
+use pegainfer_kernels::ops::k3_mega_fabric_slab_alloc;
+use pegainfer_kernels::ops::k3_mega_fabric_supported;
 use pegainfer_kernels::ops::k3_mega_max_tokens_per_rank;
 use pegainfer_kernels::ops::k3_mega_open_peer_access;
 use pegainfer_kernels::ops::k3_mega_symm_buffer_layout;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 
+use super::ep::K3FabricSlab;
 use super::paged_kv::K3PagedKv;
 use crate::config::K3_ATTN_INNER;
 use crate::config::K3_DENSE_INTERMEDIATE;
@@ -487,7 +490,16 @@ impl K3MoeScratch {
 /// across launches but start from zero.
 pub(crate) struct K3MegaScratch {
     pub(crate) layout: K3MegaSymmLayout,
+    /// The slab. In-process it is a stream-ordered pool allocation; in a
+    /// fleet it is a `CU_MEM_HANDLE_TYPE_FABRIC` VMM mapping wrapped into the
+    /// same type ([`CudaStream::upgrade_device_ptr`]) so everything downstream
+    /// is identical. The wrapper's drop will try a pool free on the VMM
+    /// pointer, which the context records and ignores — acceptable, because a
+    /// mega slab's lifetime is the process's (an EP group dies as a fleet).
     pub(crate) symm: CudaSlice<u8>,
+    /// Present exactly in fleet mode: what the bootstrap publishes so peer
+    /// processes can import this slab.
+    fabric: Option<K3FabricSlab>,
     /// Row capacity the slab and the AOT kernel were built for. This is the
     /// protocol maximum, not the executor's live batch: it is a template
     /// parameter of the AOT kernel and every rank must agree on it.
@@ -548,6 +560,9 @@ pub(crate) struct K3MegaGeometry {
     pub(crate) num_ranks: usize,
     /// This rank's index in that world.
     pub(crate) rank_idx: usize,
+    /// The group spans processes: the slab must be a fabric-exportable VMM
+    /// allocation rather than a pool one, so peer processes can import it.
+    pub(crate) fleet: bool,
 }
 
 impl K3MegaScratch {
@@ -558,14 +573,17 @@ impl K3MegaScratch {
         min_tokens: usize,
         num_ranks: usize,
         rank_idx: usize,
+        fleet: bool,
     ) -> Result<Self> {
-        // Every device that will ever address this slab has to be opened
-        // BEFORE the slab exists: the memory-pool access grant only reliably
-        // covers allocations made after it. An in-process EP group's ranks are
-        // all local devices, and the group's own membership is not known until
-        // the rendezvous, so open every reachable one now and let
-        // `K3MegaEpRuntime` re-check the ranks that turn out to be in the group.
-        if num_ranks > 1 {
+        // In-process groups: every device that will ever address this slab has
+        // to be opened BEFORE the slab exists — the memory-pool access grant
+        // only reliably covers allocations made after it. The group's own
+        // membership is not known until the rendezvous, so open every
+        // reachable one now and let `K3EpRuntime` re-check the ranks that turn
+        // out to be in the group. Fleet slabs skip this entirely: they are VMM
+        // fabric allocations, whose access grants (every local device, at
+        // allocation and at import) travel with the mapping.
+        if num_ranks > 1 && !fleet {
             open_local_peer_access(ctx.device_ordinal)?;
         }
         // The slab and the layout take the AOT kernel's protocol maximum, not
@@ -587,10 +605,36 @@ impl K3MegaScratch {
             K3_EXPERT_INTERMEDIATE,
             num_sms,
         )?;
-        let symm = ctx
-            .stream
-            .alloc_zeros::<u8>(layout.num_bytes)
-            .context("alloc K3 MegaMoE symmetric buffer")?;
+        let (symm, fabric) = if fleet {
+            ensure!(
+                k3_mega_fabric_supported(ctx.device_ordinal).unwrap_or(false),
+                "K3 fleet rank on device {} cannot allocate NVLink-fabric memory; a cross-machine \
+                 EP group needs the IMEX daemon and a fabric-capable driver",
+                ctx.device_ordinal
+            );
+            let (ptr, handle) = k3_mega_fabric_slab_alloc(ctx.device_ordinal, layout.num_bytes)
+                .context("alloc K3 MegaMoE fabric symmetric buffer")?;
+            // SAFETY: the pointer is a live, zeroed mapping of at least
+            // `num_bytes` bytes; see the field's note about its drop.
+            let symm = unsafe {
+                ctx.stream
+                    .upgrade_device_ptr::<u8>(u64::try_from(ptr)?, layout.num_bytes)
+            };
+            (
+                symm,
+                Some(K3FabricSlab {
+                    handle,
+                    num_bytes: layout.num_bytes,
+                }),
+            )
+        } else {
+            (
+                ctx.stream
+                    .alloc_zeros::<u8>(layout.num_bytes)
+                    .context("alloc K3 MegaMoE symmetric buffer")?,
+                None,
+            )
+        };
         let base = {
             let (ptr, _guard) = symm.device_ptr(&ctx.stream);
             i64::try_from(ptr)?
@@ -600,6 +644,7 @@ impl K3MegaScratch {
         Ok(Self {
             layout,
             symm,
+            fabric,
             max_tokens,
             routed_experts,
             num_ranks,
@@ -609,6 +654,12 @@ impl K3MegaScratch {
             launches: 0,
             launches_per_step: 0,
         })
+    }
+
+    /// The slab's fabric identity, present exactly in fleet mode — what the
+    /// bootstrap publishes so peer processes can import this slab.
+    pub(crate) fn fabric(&self) -> Option<K3FabricSlab> {
+        self.fabric
     }
 
     /// Count one launch against the current step.
@@ -891,6 +942,7 @@ impl K3Scratch {
                         rows,
                         geometry.num_ranks,
                         geometry.rank_idx,
+                        geometry.fleet,
                     )
                 })
                 .transpose()?,

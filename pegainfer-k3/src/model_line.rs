@@ -35,21 +35,57 @@ const ARCHITECTURE: &str = "KimiK3ForConditionalGeneration";
 const TEXT_MODEL_TYPE: &str = "kimi_linear";
 
 /// EP world sizes the decode topology is defined for. Experts shard whole
-/// across ranks, so the count must divide every supported expert count, and the
-/// fused MegaMoE kernel that carries the routed experts is AOT-instantiated per
-/// width — so this list is the set of instantiations that exist, not a set of
-/// arithmetically valid shardings. Kept independent of the checkpoint on
+/// across ranks, and the fused MegaMoE kernel that carries the routed experts
+/// is AOT-instantiated per (expert count, width) world — so this list is the
+/// union of widths any checkpoint supports, not a set of arithmetically valid
+/// shardings; the exact world is validated at launch against the kernel's own
+/// matrix (`k3_mega_world_supported`). Kept independent of the checkpoint on
 /// purpose: the frontend needs the partition count from the CLI alone, before
 /// any config or weights are read.
-const EP_SIZES: &[usize] = &[1, 4];
+const EP_SIZES: &[usize] = &[1, 4, 8, 16, 32, 64];
 
 // K3-exclusive CLI flags.
 #[derive(ClapArgs)]
 struct K3Cli {
     /// K3 expert-parallel world size: one rank (and one scheduler partition)
-    /// per GPU, routed experts split whole across ranks. One of 1 or 4.
+    /// per GPU, routed experts split whole across ranks. One of 1, 4, 8, 16,
+    /// 32 or 64; widths above 4 span machines and shard per checkpoint (the
+    /// 224-expert dev checkpoint stops at 16, the full 896-expert model needs
+    /// at least 8).
     #[arg(long, default_value_t = 1)]
     k3_ep_size: usize,
+
+    /// K3 global EP ranks this process hosts, `start..end` (e.g. `4..8`).
+    /// Default: the whole world (single-process, one machine). A partial
+    /// range is the multi-process cross-machine shape: every machine runs the
+    /// same binary over its own ranks, and requires `--k3-rendezvous`.
+    #[arg(long)]
+    k3_ranks: Option<String>,
+
+    /// K3 bootstrap rendezvous address (`host:port`): the process hosting
+    /// rank 0 binds it, collects every rank's NVLink-fabric slab handle, and
+    /// serves the world's table back. A one-time handshake — after it the
+    /// engines never talk again (the MegaMoE kernel pairs the ranks itself,
+    /// over the rack-wide NVLink domain).
+    #[arg(long)]
+    k3_rendezvous: Option<String>,
+}
+
+/// Parse a `start..end` rank range.
+fn parse_rank_range(spec: &str) -> Result<std::ops::Range<usize>, String> {
+    let (start, end) = spec
+        .split_once("..")
+        .ok_or_else(|| format!("expected start..end, got {spec:?}"))?;
+    let parse = |raw: &str| {
+        raw.trim()
+            .parse::<usize>()
+            .map_err(|_| format!("expected start..end with integer bounds, got {spec:?}"))
+    };
+    let range = parse(start)?..parse(end)?;
+    if range.is_empty() {
+        return Err(format!("rank range {spec:?} is empty"));
+    }
+    Ok(range)
 }
 
 fn cli(ctx: &LaunchContext<'_>) -> K3Cli {
@@ -172,50 +208,79 @@ impl ModelLine for K3Line {
         ctx: &LaunchContext<'_>,
         provided: &BTreeSet<String>,
     ) -> Result<(), CliError> {
-        let ep_size = ep_size(&cli(ctx))?;
+        let cli = cli(ctx);
+        let ep_size = ep_size(&cli)?;
         if ep_size > 1 && provided.contains("device_ordinal") {
             return Err(CliError::rule(
-                "--device-ordinal applies to single-rank K3 only; --k3-ep-size>1 uses devices 0..ep_size",
+                "--device-ordinal applies to single-rank K3 only; --k3-ep-size>1 uses devices 0..local_ranks",
+            ));
+        }
+        let ranks = local_ranks(&cli, ep_size)?;
+        if ranks.len() < ep_size && cli.k3_rendezvous.is_none() {
+            return Err(CliError::rule(
+                "--k3-ranks hosts a slice of the EP world, which needs --k3-rendezvous for the \
+                 fleet's fabric-handle exchange",
+            ));
+        }
+        if ranks.len() == ep_size && cli.k3_rendezvous.is_some() {
+            return Err(CliError::rule(
+                "--k3-rendezvous is for a multi-process fleet; this process hosts the whole EP \
+                 world already",
             ));
         }
         Ok(())
     }
 
     fn serve_plan(&self, ctx: &LaunchContext<'_>) -> Result<ServePlan, CliError> {
+        let cli = cli(ctx);
+        let ep_size = ep_size(&cli)?;
         Ok(ServePlan {
-            // One partition per EP rank, and CLI-derivable: the frontend
-            // registers engine identities before the weights are loaded.
-            scheduler_partition_count: ep_size(&cli(ctx))?,
+            // One partition per EP rank THIS PROCESS hosts, and CLI-derivable:
+            // the frontend registers engine identities before the weights are
+            // loaded.
+            scheduler_partition_count: local_ranks(&cli, ep_size)?.len(),
             prefill_only: false,
             lora_modules: None,
         })
     }
 
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
-        let ep_size = ep_size(&cli(ctx))?;
+        let cli = cli(ctx);
+        let ep_size = ep_size(&cli)?;
+        let ranks = local_ranks(&cli, ep_size)?;
         let eos_token_ids = eos_token_ids(ctx.config);
         let config = K3ExecutorConfig::default().from_env().for_ep(ep_size);
         info!(
-            "K3 engine starting: ep_size={ep_size}, eos_token_ids={eos_token_ids:?}, \
-             slots={}, ctx={}, layers={}, cuda_graph={}, moe=mega",
+            "K3 engine starting: ep_size={ep_size}, ranks={ranks:?}, \
+             eos_token_ids={eos_token_ids:?}, slots={}, ctx={}, layers={}, cuda_graph={}, \
+             moe=mega",
             config.max_batch, config.max_ctx, config.num_layers, config.cuda_graph
         );
-        // One executor per EP rank. A single-rank run honours --device-ordinal;
-        // wider runs take devices 0..ep_size, which `validate` already enforced.
+        // One executor per EP rank this process hosts, on devices
+        // 0..ranks.len(). A single-rank run honours --device-ordinal, which
+        // `validate` already restricted.
         //
-        // Every rank's weights are resident before any rank is stepped: a rank
-        // publishes its symmetric slab at load, but reads the world's table
-        // back on its own scheduler thread at its first step — which is after
-        // `start_with_executors` below, and so after every load. That ordering
-        // is the point: the table read blocks, so one rank running out of
-        // memory mid-load must not be able to strand its peers waiting.
-        let rendezvous = (ep_size > 1).then(|| K3EpRendezvous::new(ep_size));
-        let mut executors = Vec::with_capacity(ep_size);
-        for rank in 0..ep_size {
+        // Every local rank's weights are resident before any rank is stepped:
+        // a rank publishes its symmetric slab at load, but reads the world's
+        // table back on its own scheduler thread at its first step — which is
+        // after `start_with_executors` below, and so after every load. That
+        // ordering is the point: the table read blocks, so one rank running
+        // out of memory mid-load must not be able to strand its peers waiting.
+        // Across a fleet the same story holds per process, and the bootstrap's
+        // long timeouts absorb the machines' load skew.
+        let rendezvous = match (&cli.k3_rendezvous, ep_size > 1) {
+            (_, false) => None,
+            (None, true) => Some(K3EpRendezvous::new(ep_size)),
+            (Some(addr), true) => {
+                Some(K3EpRendezvous::fleet(ep_size, ranks.clone(), addr.clone())?)
+            }
+        };
+        let mut executors = Vec::with_capacity(ranks.len());
+        for (device, rank) in ranks.clone().enumerate() {
             let device = if ep_size == 1 {
                 ctx.shared.device_ordinal
             } else {
-                rank
+                device
             };
             let executor = match rendezvous.clone() {
                 Some(rendezvous) => {
@@ -237,6 +302,27 @@ impl ModelLine for K3Line {
             ),
         ))
     }
+}
+
+/// The global ranks this process hosts: `--k3-ranks` when given, the whole
+/// world otherwise. Validated where it is read, like the EP width.
+fn local_ranks(cli: &K3Cli, ep_size: usize) -> Result<std::ops::Range<usize>, CliError> {
+    let Some(spec) = &cli.k3_ranks else {
+        return Ok(0..ep_size);
+    };
+    if ep_size == 1 {
+        return Err(CliError::rule(
+            "--k3-ranks partitions an EP world; it needs --k3-ep-size > 1",
+        ));
+    }
+    let ranks =
+        parse_rank_range(spec).map_err(|err| CliError::rule(format!("--k3-ranks: {err}")))?;
+    if ranks.end > ep_size {
+        return Err(CliError::rule(format!(
+            "--k3-ranks {spec} does not fit an EP world of {ep_size}"
+        )));
+    }
+    Ok(ranks)
 }
 
 #[cfg(test)]
@@ -357,12 +443,78 @@ mod tests {
 
     #[test]
     fn rejects_an_unsupported_ep_size() {
-        let error = partitions_for(&["pegainfer", "--k3-ep-size", "8"])
-            .expect_err("EP8 shards evenly but has no MegaMoE instantiation");
+        let error = partitions_for(&["pegainfer", "--k3-ep-size", "6"])
+            .expect_err("EP6 has no MegaMoE instantiation for any checkpoint");
         assert!(
             error.to_string().contains("--k3-ep-size must be one of"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_partial_fleet_counts_its_own_ranks() {
+        let partitions = partitions_for(&[
+            "pegainfer",
+            "--k3-ep-size",
+            "16",
+            "--k3-ranks",
+            "4..8",
+            "--k3-rendezvous",
+            "10.0.0.1:19300",
+        ])
+        .expect("a partial fleet slice should validate");
+        assert_eq!(partitions, 4);
+    }
+
+    #[test]
+    fn a_partial_fleet_requires_the_rendezvous() {
+        let error = partitions_for(&["pegainfer", "--k3-ep-size", "16", "--k3-ranks", "4..8"])
+            .expect_err("a fleet slice cannot pair without the bootstrap");
+        assert!(error.to_string().contains("--k3-rendezvous"), "{error}");
+    }
+
+    #[test]
+    fn a_whole_world_refuses_a_rendezvous() {
+        let error = partitions_for(&[
+            "pegainfer",
+            "--k3-ep-size",
+            "4",
+            "--k3-rendezvous",
+            "10.0.0.1:19300",
+        ])
+        .expect_err("an in-process world has nobody to exchange handles with");
+        assert!(error.to_string().contains("--k3-rendezvous"), "{error}");
+    }
+
+    #[test]
+    fn rank_ranges_are_validated() {
+        let error = partitions_for(&["pegainfer", "--k3-ranks", "0..2"])
+            .expect_err("--k3-ranks without a wider world is meaningless");
+        assert!(error.to_string().contains("--k3-ep-size"), "{error}");
+
+        let error = partitions_for(&[
+            "pegainfer",
+            "--k3-ep-size",
+            "8",
+            "--k3-ranks",
+            "6..10",
+            "--k3-rendezvous",
+            "10.0.0.1:19300",
+        ])
+        .expect_err("ranks past the world must be refused");
+        assert!(error.to_string().contains("does not fit"), "{error}");
+
+        let error = partitions_for(&[
+            "pegainfer",
+            "--k3-ep-size",
+            "8",
+            "--k3-ranks",
+            "4",
+            "--k3-rendezvous",
+            "10.0.0.1:19300",
+        ])
+        .expect_err("a bound without .. must be refused");
+        assert!(error.to_string().contains("start..end"), "{error}");
     }
 
     #[test]

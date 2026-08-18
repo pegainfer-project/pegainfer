@@ -125,6 +125,94 @@ pub fn k3_mega_max_tokens_per_rank() -> usize {
     (unsafe { ffi::k3_mega_max_tokens_per_rank() }) as usize
 }
 
+/// One rank's `CUmemFabricHandle`, as raw bytes: what a cross-machine EP
+/// group's rendezvous actually exchanges.
+pub const K3_MEGA_FABRIC_HANDLE_BYTES: usize = 64;
+
+/// Whether the AOT matrix carries a MegaMoE kernel for this world (GLOBAL
+/// expert count x rank count, situ activation). One source of truth — the
+/// instantiation list lives in the CUDA TUs and this asks it.
+#[must_use]
+pub fn k3_mega_world_supported(num_experts: usize, num_ranks: usize) -> bool {
+    let (Ok(experts), Ok(ranks)) = (i32::try_from(num_experts), i32::try_from(num_ranks)) else {
+        return false;
+    };
+    // SAFETY: a pure constant predicate with no device state.
+    (unsafe { ffi::k3_mega_world_supported(experts, ranks) }) != 0
+}
+
+/// Whether `device_ordinal` can allocate fabric-exportable memory at all
+/// (driver + IMEX support): the preflight for a cross-machine EP fleet.
+pub fn k3_mega_fabric_supported(device_ordinal: usize) -> Result<bool> {
+    let mut supported = 0i32;
+    // SAFETY: an ordinal-only attribute query.
+    let result = unsafe {
+        ffi::k3_mega_fabric_supported(i32::try_from(device_ordinal)?, &raw mut supported)
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("K3 fabric support query on device {device_ordinal}: {err}"))?;
+    Ok(supported != 0)
+}
+
+/// Allocate one rank's fabric-exportable symmetric slab: `num_bytes` on
+/// `device_ordinal`, mapped and access-granted for every local device, zeroed
+/// and synchronized. Returns the device pointer and the fabric handle a peer
+/// process imports. Process-lifetime — an EP group dies as a fleet, so
+/// nothing ever frees a slab.
+pub fn k3_mega_fabric_slab_alloc(
+    device_ordinal: usize,
+    num_bytes: usize,
+) -> Result<(i64, [u8; K3_MEGA_FABRIC_HANDLE_BYTES])> {
+    ensure!(num_bytes > 0, "K3 fabric slab needs a non-zero size");
+    let mut ptr = 0i64;
+    let mut handle = [0u8; K3_MEGA_FABRIC_HANDLE_BYTES];
+    // SAFETY: out-pointers are valid for the writes the FFI contract names.
+    let result = unsafe {
+        ffi::k3_mega_fabric_slab_alloc(
+            i32::try_from(device_ordinal)?,
+            u64::try_from(num_bytes)?,
+            &raw mut ptr,
+            handle.as_mut_ptr(),
+        )
+    };
+    result.result().map_err(|err| {
+        anyhow!(
+            "K3 fabric slab allocation of {num_bytes} bytes on device {device_ordinal} failed \
+             (is the NVLink IMEX domain configured?): {err}"
+        )
+    })?;
+    Ok((ptr, handle))
+}
+
+/// Import a peer rank's fabric handle and map its slab for every local
+/// device. `num_bytes` must be the peer's slab size before granularity
+/// rounding (every rank derives it from the same layout, so it is).
+pub fn k3_mega_fabric_slab_import(
+    handle: &[u8; K3_MEGA_FABRIC_HANDLE_BYTES],
+    num_bytes: usize,
+    device_ordinal: usize,
+) -> Result<i64> {
+    ensure!(num_bytes > 0, "K3 fabric slab import needs a non-zero size");
+    let mut ptr = 0i64;
+    // SAFETY: the handle buffer is 64 bytes by type; the out-pointer is valid.
+    let result = unsafe {
+        ffi::k3_mega_fabric_slab_import(
+            handle.as_ptr(),
+            u64::try_from(num_bytes)?,
+            i32::try_from(device_ordinal)?,
+            &raw mut ptr,
+        )
+    };
+    result.result().map_err(|err| {
+        anyhow!(
+            "K3 fabric slab import of {num_bytes} bytes on device {device_ordinal} failed \
+             (is the peer's node in this node's IMEX domain?): {err}"
+        )
+    })?;
+    Ok(ptr)
+}
+
 /// Open the device pair `(self_ordinal, peer_ordinal)` for the fused kernel's
 /// cross-rank addressing.
 ///
@@ -483,7 +571,8 @@ pub struct K3MegaShape {
     /// kernel derives a token's destination rank from its expert id, so the
     /// routing ids fed to the slab must be global too.
     pub num_experts: usize,
-    /// Expert-parallel world size (1, or 4 — the instantiated widths).
+    /// Expert-parallel world size. The instantiated widths depend on the
+    /// expert count — ask [`k3_mega_world_supported`].
     pub num_ranks: usize,
     /// This rank's index in that world.
     pub rank_idx: usize,
@@ -561,18 +650,42 @@ mod tests {
             0,
             "protocol max {max_tokens} is not a multiple of the {alignment} alignment"
         );
-        for ranks in [1usize, 4] {
-            match k3_mega_symm_buffer_layout(ranks, 224, max_tokens, 16, 3584, 3072, 152) {
+        for (experts, ranks) in [
+            (224usize, 1usize),
+            (224, 4),
+            (224, 8),
+            (224, 16),
+            (896, 8),
+            (896, 16),
+            (896, 32),
+            (896, 64),
+        ] {
+            assert!(
+                k3_mega_world_supported(experts, ranks),
+                "world ({experts} experts, {ranks} ranks) must be in the AOT matrix"
+            );
+            match k3_mega_symm_buffer_layout(ranks, experts, max_tokens, 16, 3584, 3072, 152) {
                 Ok(layout) => eprintln!(
-                    "ranks {ranks}: slab {:.1} MiB, ring {} tokens, sf ring {} tokens",
+                    "experts {experts} ranks {ranks}: slab {:.1} MiB, ring {} tokens, sf ring {} \
+                     tokens",
                     layout.num_bytes as f64 / (1024.0 * 1024.0),
                     layout.ring_tokens,
                     layout.sf_ring_tokens,
                 ),
                 Err(error) => {
-                    eprintln!("skipping ranks {ranks}: sm100 TU not built ({error:#})");
+                    eprintln!(
+                        "skipping experts {experts} ranks {ranks}: sm100 TU not built ({error:#})"
+                    );
                 }
             }
         }
+        assert!(
+            !k3_mega_world_supported(224, 64),
+            "224 does not divide by 64"
+        );
+        assert!(
+            !k3_mega_world_supported(896, 1),
+            "the full model fits no single rank"
+        );
     }
 }

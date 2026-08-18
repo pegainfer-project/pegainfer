@@ -163,12 +163,42 @@ unsafe extern "C" {
     /// (`num_max_tokens_per_rank`). The launch accepts exactly this value.
     pub fn k3_mega_max_tokens_per_rank() -> i32;
 
+    /// Whether the AOT matrix carries a MegaMoE kernel for this world (GLOBAL
+    /// expert count x rank count, situ activation). Non-zero means supported.
+    pub fn k3_mega_world_supported(num_experts: i32, num_ranks: i32) -> i32;
+
     /// Open the device pair `(self_ordinal, peer_ordinal)` for the kernel's
     /// cross-rank addressing: peer access from this device's context, plus a
     /// memory-pool access grant so this device's stream-ordered allocations are
     /// visible from the peer. Must precede the allocations it protects.
-    /// Idempotent, and a no-op for the self pair.
+    /// Idempotent, and a no-op for the self pair. In-process groups only —
+    /// fabric mappings carry their own access grants.
     pub fn k3_mega_open_peer_access(self_ordinal: i32, peer_ordinal: i32) -> CUresult;
+
+    /// Whether `device_ordinal` supports `CU_MEM_HANDLE_TYPE_FABRIC`
+    /// allocations (driver + IMEX). Writes 0 or 1 into `out_supported`.
+    pub fn k3_mega_fabric_supported(device_ordinal: i32, out_supported: *mut i32) -> CUresult;
+
+    /// Allocate a fabric-exportable symmetric slab of `num_bytes` on
+    /// `device_ordinal`, mapped and access-granted for every local device,
+    /// zeroed and synchronized. Writes the device pointer and the 64-byte
+    /// `CUmemFabricHandle`. Process-lifetime: nothing frees it.
+    pub fn k3_mega_fabric_slab_alloc(
+        device_ordinal: i32,
+        num_bytes: u64,
+        out_ptr: *mut i64,
+        out_handle: *mut u8,
+    ) -> CUresult;
+
+    /// Import a peer rank's 64-byte fabric handle and map it for every local
+    /// device. `num_bytes` is the slab size before granularity rounding.
+    /// Process-lifetime: nothing unmaps it.
+    pub fn k3_mega_fabric_slab_import(
+        handle: *const u8,
+        num_bytes: u64,
+        device_ordinal: i32,
+        out_ptr: *mut i64,
+    ) -> CUresult;
 
     /// Symmetric-buffer sizing: total bytes plus the 12 sub-buffer byte offsets
     /// in the order `x, x_sf, topk_idx, topk_weights, shared_l1_acts,
