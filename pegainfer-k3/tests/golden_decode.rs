@@ -643,6 +643,54 @@ fn forced_replay_reports_per_step_agreement() {
     );
 }
 
+/// A TTFT snapshot, not a gate: time `prefill` at growing prompt lengths over
+/// the truncated model. The prompt cycles the fixture's tokens — numerics are
+/// not checked here, only where the prefill time goes. Run it on the same box
+/// before and after a prefill-path change; absolute numbers move with load.
+#[test]
+#[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
+fn prefill_time_snapshot() {
+    let golden = golden();
+    let Some(path) = checkpoint() else {
+        eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
+        return;
+    };
+    let config = K3ExecutorConfig {
+        max_batch: 128,
+        max_ctx: 4096,
+        kv_pages: 0,
+        num_layers: golden.num_layers,
+        cuda_graph: true,
+        moe_transport: K3MoeTransport::MEGA,
+    };
+    let mut executor =
+        K3Executor::load(&path, device(), 0, 1, config).expect("the truncated model should load");
+    let params = pegainfer_frontend::sampler::SamplingParams::default();
+    let prompt_of = |len: usize| -> Vec<u32> {
+        (0..len)
+            .map(|i| golden.prompt[i % golden.prompt.len()])
+            .collect()
+    };
+    // Warm up: lazy driver/cuBLAS setup and, on the old path, graph capture.
+    executor
+        .prefill(0, &prompt_of(16), &params)
+        .expect("warmup prefill");
+    executor.release(0);
+    for len in [64usize, 512, 2048] {
+        let prompt = prompt_of(len);
+        let started = std::time::Instant::now();
+        executor.prefill(0, &prompt, &params).expect("timed prefill");
+        let elapsed = started.elapsed().as_secs_f64();
+        executor.release(0);
+        eprintln!(
+            "prompt {len:>5}: {:8.1} ms over {} layers ({:.0} tok/s)",
+            elapsed * 1e3,
+            golden.num_layers,
+            len as f64 / elapsed
+        );
+    }
+}
+
 /// A step-time snapshot, not a gate: eager against captured, at the narrowest,
 /// a mid and the widest bucket. Run over the truncated model the fixture pins, so the
 /// numbers say what the launch sequence costs per layer and what capture buys
