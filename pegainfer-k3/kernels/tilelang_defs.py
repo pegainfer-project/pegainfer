@@ -467,3 +467,34 @@ def kda_core_batched(KH: int, KD: int, SKG: int, B: int, lb: float, eps: float):
                 ) * T.Cast(DT, T.sigmoid(G2[bb, bh * KD + d].astype(ACC)))
 
     return _compile(main)
+
+
+def o_norm_gate_batched(KH: int, KD: int, B: int, eps: float):
+    """``kda_core``'s tail on its own: per (row, head) the f32 rms_norm of the
+    bf16 attention landing times the o_norm gamma, landed once, times the bf16
+    sigmoid of the output-gate projection -- word-for-word the last loop of
+    ``kda_core_batched``. Chunked prefill computes the attention elsewhere
+    (FlashKDA) and finishes each row through this identical spelling."""
+    KP = KH * KD
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((B, KP), DT),
+        G2: T.Tensor((B, KP), DT),
+        Go: T.Tensor((KD,), ACC),
+        Out: T.Tensor((B, KP), DT),
+    ):
+        with T.Kernel(B, KH, threads=KD) as (bb, bh):
+            asq = T.alloc_fragment((KD,), ACC)
+            atot = T.alloc_fragment((1,), ACC)
+            for d in T.Parallel(KD):
+                asq[d] = X[bb, bh * KD + d].astype(ACC) * X[bb, bh * KD + d].astype(ACC)
+            T.reduce_sum(asq, atot, dim=0)
+            for d in T.Parallel(KD):
+                Out[bb, bh * KD + d] = T.Cast(
+                    DT,
+                    X[bb, bh * KD + d].astype(ACC) * T.rsqrt(atot[0] / KD + eps)
+                    * Go[d].astype(ACC),
+                ) * T.Cast(DT, T.sigmoid(G2[bb, bh * KD + d].astype(ACC)))
+
+    return _compile(main)

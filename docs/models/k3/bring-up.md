@@ -19,11 +19,13 @@ MB/token expanded slot cache and its `max_ctx = 128` are gone). Kernel surface:
 eleven batched TileLang decode families + the hand-written paged-attention
 kernel + DeepGEMM FP8xFP4 AOT shims (fused MegaMoE and the masked grouped GEMM)
 behind `pegainfer-kernels`'s `k3` feature; dense projections on cuBLASLt.
-Prefill is **chunked**: up to `max_batch` consecutive prompt tokens per batched
-step (row-batched everything, per-token only the KDA recurrence), 4.2-7.3x
-TTFT over per-token stepping at the 4-layer snapshot. Next: CUDA graphs over
-the EP4 fused path, the KDA chunkwise delta-rule kernel and a real MLA prefill
-attention kernel, kv-store integration.
+Prefill is **chunked**: up to `max_batch` consecutive prompt tokens per
+batched step, with the KDA recurrence crossing each chunk as one **vendored
+FlashKDA** chunkwise forward per layer (MoonshotAI, MIT,
+`third_party/flash-kda`) — 4.9-10.3x TTFT over per-token stepping at the
+4-layer snapshot. Next: CUDA graphs over the EP4 fused path, a real MLA
+prefill attention kernel (the remaining long-prompt bottleneck), kv-store
+integration.
 
 Last touched: 2026-08
 
@@ -145,10 +147,20 @@ chunk is one batched step whose *rows are the chunk's tokens* (`executor/`:
   This needed one new AOT land config (`(KDA_DIM, KDA_DIM, 0)`) — the
   sequential engine casts conv inputs inside the conv kernel, the chunk needs
   them landed *before* the window build.
-- **Only the KDA delta rule walks tokens.** Per-token b=1 launches of the
-  batched kernel's own single-row body (`k3_kda_core_token_launch` offsets row
-  pointers into the same buffers), flipping recurrent parity per token. KDA
-  state stays one row per pool (~929 MB/slot forbids chunk-wide state).
+- **The KDA delta rule is one chunkwise FlashKDA forward per layer**
+  (`third_party/flash-kda` — MoonshotAI's own CUTLASS/CuTe chunkwise KDA
+  kernel, MIT, vendored; see its PROVENANCE.md). Two launches replace the
+  69-layers × tokens b=1 walk the first cut of this phase shipped. The C ABI
+  shim (`csrc/k3/k3_flash_kda.cu`) pins D=128 / f32 state / one sequence per
+  call; the gate math is the fused core's own formula applied in-kernel from
+  the same pre-activation bf16 landing, beta sigmoid in-kernel, and the f32
+  recurrent slab plugs in directly ([H, V, K] both sides). What is *not* in
+  FlashKDA — the per-head o_norm × sigmoid output gate — is the new
+  `k3_o_norm_gate` TileLang family, word-for-word the fused core's tail.
+  Parity becomes a per-chunk double buffer (read one slab, land in the
+  other) instead of a per-token flip. KDA state stays one row per pool
+  (~929 MB/slot forbids chunk-wide state). Decode is untouched: it keeps the
+  bit-matched fused TileLang core.
 - **The prefill pool is asymmetric**: one row of KDA/conv state (the
   recurrence is sequential anyway), a full bucket of attention-residual
   snapshot rows and block-table rows (`attn_rows`). Handoff collapses the last
@@ -156,28 +168,33 @@ chunk is one batched step whose *rows are the chunk's tokens* (`executor/`:
   runs eagerly — the KDA walk makes the launch count depend on the token
   count, so there is no fixed body to capture per bucket.
 
-Equivalence: chunk-internal conv/KDA are bitwise; what moves is the GEMM
-bucket (cuBLASLt tiling), so chunked prefill is held to the fixture's noise
-floor like any cross-bucket comparison. Gated by
+Equivalence: the conv is bitwise against sequential stepping; FlashKDA
+computes the same delta rule but with an f32 q/k l2norm chain (the TileLang
+core mirrors the reference's bf16 chain) and chunkwise accumulation order,
+and the GEMM bucket retiles — so chunked prefill is held to the fixture's
+noise floor, and the state a slot adopts can legitimately send a greedy
+continuation off the bit-exact baseline at a ≤2-ULP coin-flip step (observed:
+one flip at a 1-ULP step). The two prefill gates therefore force-feed the
+fixture feed and hold every step to the noise-floor excusal:
+`prefill_then_decode…` (cap 1 — the degenerate single-token chunks) and
 `chunked_prefill_crosses_its_bucket_boundaries` (cap 8 vs a 13-token prompt:
-full chunk + ragged odd chunk + mid-prompt parity flip + padding rows,
-force-fed continuation) alongside the existing prefill-then-decode gate, and
-the EP oracle's busy peers now prefill through chunks.
+full chunk + ragged odd chunk + parity handling + padding rows). The EP
+oracle's busy peers prefill through chunks.
 
-TTFT snapshot (4-layer truncated, one GB300, `prefill_time_snapshot`), against
-the retired per-token prefill:
+TTFT snapshot (4-layer truncated, one GB300, `prefill_time_snapshot`),
+against the retired per-token prefill; note the truncation carries ~3 KDA /
+1 MLA layer where the full model is 69/24, so FlashKDA's share of the win
+grows with depth:
 
-| prompt | per-token | chunked | speedup |
-|--------|-----------|---------|---------|
-| 64     | 132 ms    | 21 ms   | 6.2x    |
-| 512    | 1176 ms   | 161 ms  | 7.3x    |
-| 2048   | 6377 ms   | 1508 ms | 4.2x    |
+| prompt | per-token | chunked (per-token KDA) | chunked + FlashKDA | total |
+|--------|-----------|-------------------------|--------------------|-------|
+| 64     | 132 ms    | 21.2 ms                 | 18.1 ms            | 7.3x  |
+| 512    | 1176 ms   | 161.0 ms                | 114.5 ms           | 10.3x |
+| 2048   | 6377 ms   | 1508 ms                 | 1312 ms            | 4.9x  |
 
-The 2048 falloff is the two remaining per-token/per-row costs: the KDA core's
-sequential b=1 launches (69 layers x token count) and the decode-shaped MLA
-attention's O(L²) latent reads. Those are the next two kernels (chunkwise
-delta rule — qwen35's GDR chunkwise AOT is the in-repo precedent — and a real
-varlen prefill MLA kernel).
+What remains at 2048 is dominated by the decode-shaped MLA attention's O(L²)
+latent reads — the next kernel (a real varlen prefill MLA path; FlashMLA is
+already vendored for glm52).
 
 ### MLA KV: paged latent cache + absorbed decode
 
@@ -429,12 +446,12 @@ recorded here as the measurement, not as a configuration you can still select.
 
 ## Next
 
-Chunked prefill's free-lunch phase has landed (see Chunked prefill above);
-what remains on the prefill axis is the two time-axis kernels it deliberately
-deferred: the KDA chunkwise delta rule (kills the 69-layers-x-tokens b=1
-launch walk) and a varlen MLA prefill attention kernel (kills the O(L²)
-decode-kernel reads) — then raising the chunk cap toward the 4224-row MegaMoE
-protocol ceiling once the step is worth widening. Then graphs over the EP4
+Chunked prefill has landed, including the chunkwise KDA kernel (vendored
+FlashKDA — see Chunked prefill above); what remains on the prefill axis is a
+varlen MLA prefill attention kernel (kills the O(L²) decode-kernel reads,
+now the 2048-token bottleneck) — then raising the chunk cap toward the
+4224-row MegaMoE protocol ceiling once the step is worth widening. Then
+graphs over the EP4
 fused path (the ranks=1 path already captures), launch-ahead, kv-store
 `BlockPool` integration (content addressing / reuse for the MLA pages), and a
 perf pass on the paged attention kernel (the 3-sweep recompute reads the cache

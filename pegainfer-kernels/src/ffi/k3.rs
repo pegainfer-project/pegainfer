@@ -266,4 +266,43 @@ unsafe extern "C" {
         cumulative_stats: *mut i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Workspace bytes the FlashKDA forward needs for one sequence of
+    /// `t_total` tokens at `h` heads. Pure host arithmetic.
+    pub fn k3_flash_kda_workspace_bytes(t_total: i32, h: i32) -> i64;
+
+    /// beta `[T, H]` bf16 -> `[H, T]` bf16, the layout FlashKDA's 1D TMA
+    /// loads.
+    pub fn k3_flash_kda_beta_transpose(
+        beta_th: *const Half,
+        beta_ht: *mut Half,
+        t_total: i32,
+        h: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// One sequence through the vendored FlashKDA chunkwise forward
+    /// (third_party/flash-kda, MIT, MoonshotAI): q/k/v/g/out `[T, H, 128]`
+    /// bf16, g pre-activation (dt_bias/exp(A_log)/sigmoid/lower-bound applied
+    /// in-kernel), beta `[H, T]` bf16 logits, f32 recurrent state
+    /// `[H, 128, 128]` carried in and out. Requires an accelerated SM90+
+    /// build (`NOT_SUPPORTED` elsewhere).
+    pub fn k3_flash_kda_fwd(
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        g: *const Half,
+        beta_ht: *const Half,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        state_in: *const f32,
+        state_out: *mut f32,
+        out: *mut Half,
+        workspace: *mut core::ffi::c_void,
+        t_total: i32,
+        h: i32,
+        scale: f32,
+        lower_bound: f32,
+        stream: CUstream,
+    ) -> CUresult;
 }

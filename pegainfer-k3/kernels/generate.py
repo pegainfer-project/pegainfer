@@ -218,6 +218,10 @@ KDA_CORE_PARAMS = (
     f"const {BF16}* __restrict__ Q, const float* __restrict__ State, "
     f"float* __restrict__ StateN, const {BF16}* __restrict__ V)"
 )
+O_NORM_GATE_PARAMS = (
+    f"(const {BF16}* __restrict__ G2, const float* __restrict__ Go, "
+    f"{BF16}* __restrict__ Out, const {BF16}* __restrict__ X)"
+)
 ROUTER_PARAMS = (
     "(const float* __restrict__ Bias, int* __restrict__ Idx, "
     f"const {BF16}* __restrict__ Rs, const float* __restrict__ S, "
@@ -866,6 +870,51 @@ def plan_kda_core() -> Plan:
     )
 
 
+def plan_o_norm_gate() -> Plan:
+    insts = []
+    for batch in B_BUCKETS:
+        insts.append(Inst(
+            family="o_norm_gate",
+            order=len(insts),
+            label=f"o_norm_gate_batched KH={KDA_HEADS} KD={KDA_HEAD_DIM} B={batch}",
+            factory="o_norm_gate_batched",
+            args=(KDA_HEADS, KDA_HEAD_DIM, batch, RMS_EPS),
+            num_params=4,
+            params=O_NORM_GATE_PARAMS,
+            symbol=f"k3_o_norm_gate_b{batch}_kh{KDA_HEADS}_kd{KDA_HEAD_DIM}_kernel",
+            grid=(batch, KDA_HEADS),
+            threads=KDA_HEAD_DIM,
+            guard=(
+                f"b == {batch} && num_heads == {KDA_HEADS} && "
+                f"head_dim == {KDA_HEAD_DIM}"
+            ),
+            call_args=(
+                _bf16("G2"), "Go", _bf16("Out", False), _bf16("X"),
+            ),
+        ))
+    return Plan(
+        stem=_STEM.format("o_norm_gate"),
+        signature=(
+            "k3_o_norm_gate_batched(\n"
+            "    const void* X,\n"
+            "    const void* G2,\n"
+            "    const float* Go,\n"
+            "    void* Out,\n"
+            "    int b,\n"
+            "    int num_heads,\n"
+            "    int head_dim,\n"
+            "    cudaStream_t stream)"
+        ),
+        doc=(
+            "// kda_core's tail on its own: per (row, head) the f32 rms_norm of the\n"
+            "// bf16 attention landing times the o_norm gamma, landed once, times the\n"
+            "// bf16 sigmoid of the output gate. Chunked prefill computes attention\n"
+            "// through FlashKDA and finishes rows here; eps is compiled in."
+        ),
+        insts=tuple(insts),
+    )
+
+
 def plan_router_topk() -> Plan:
     insts = []
     for experts in EXPERTS:
@@ -999,6 +1048,7 @@ PLANNERS = [
     plan_situ,
     plan_conv_silu,
     plan_kda_core,
+    plan_o_norm_gate,
     plan_router_topk,
     plan_attnres_scores,
     plan_attnres_mix,

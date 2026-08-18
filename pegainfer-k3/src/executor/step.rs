@@ -46,8 +46,8 @@ use pegainfer_kernels::ops::k3_attnres_scores_batched_launch;
 use pegainfer_kernels::ops::k3_conv_silu_batched_launch;
 use pegainfer_kernels::ops::k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch;
 use pegainfer_kernels::ops::k3_fp8_scale_pack_ue8m0_launch;
+use pegainfer_kernels::ops::k3_flash_kda_fwd_launch;
 use pegainfer_kernels::ops::k3_kda_core_batched_launch;
-use pegainfer_kernels::ops::k3_kda_core_token_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_land_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_mega_moe_launch;
@@ -57,6 +57,7 @@ use pegainfer_kernels::ops::k3_moe_gather_fp8_quant_masked_launch;
 use pegainfer_kernels::ops::k3_moe_local_route_metadata_launch;
 use pegainfer_kernels::ops::k3_moe_weighted_combine_launch;
 use pegainfer_kernels::ops::k3_mul_sigmoid_batched_launch;
+use pegainfer_kernels::ops::k3_o_norm_gate_batched_launch;
 use pegainfer_kernels::ops::k3_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_router_topk_batched_launch;
 use pegainfer_kernels::ops::k3_situ_and_mul_fp8_quant_masked_launch;
@@ -160,7 +161,8 @@ pub(crate) fn k3_decode_step(
 /// consecutive tokens of ONE sequence instead of independent sequences.
 ///
 /// `shape.live_rows` is the chunk's token count and `shape.parity` the KDA
-/// parity of its first token. The caller stages `token_ids`, ascending
+/// state slab the chunk reads (it lands in the other — parity double-buffers
+/// per chunk here, not per token). The caller stages `token_ids`, ascending
 /// per-token `context_len` and per-token `kv_row` exactly as for decode, and
 /// mirrors the sequence's block-table row across the bucket — causality in the
 /// MLA layers comes from the per-row context length, so the batched attention
@@ -636,17 +638,19 @@ fn kda_conv_stream(
 }
 
 /// The KDA layer of a prefill chunk: batched projections, a batched
-/// convolution over prebuilt windows, and the delta rule walked one token at a
-/// time — the only truly sequential arithmetic in the step.
+/// convolution over prebuilt windows, and the delta rule as one chunkwise
+/// FlashKDA forward (third_party/flash-kda, MIT, MoonshotAI) — the per-token
+/// walk collapses into two launches per layer.
 ///
-/// Bit-compatibility with per-token stepping: the convolution windows are the
-/// landed bf16 inputs themselves (`window[t][j] = x[t - 3 + j]`, carried
-/// window for the first rows), so every window value equals what the
-/// sequential path would have shifted through its slabs; and the per-token
-/// core launch is the batched kernel's own single-row body. What does move is
-/// everything upstream of them — the projections run at the chunk's bucket, a
-/// different cuBLASLt shape than per-token stepping — so chunked prefill is
-/// held to the fixture's noise floor, like any cross-bucket comparison.
+/// Numerics: the convolution windows are the landed bf16 inputs themselves
+/// (`window[t][j] = x[t - 3 + j]`, carried window for the first rows), so the
+/// conv is bitwise against sequential stepping. FlashKDA computes the same
+/// delta rule the fused TileLang core spells — same gate formula from the
+/// same pre-activation landing, beta sigmoid in-kernel — but with an f32 q/k
+/// l2norm chain (the TileLang core mirrors the reference's bf16 chain) and
+/// chunkwise accumulation order, and the projections run at the chunk's
+/// bucket. Chunked prefill is therefore held to the fixture's noise floor,
+/// like any cross-bucket comparison; decode keeps the bit-matched fused core.
 fn kda_attention_chunk(
     ctx: &DeviceContext,
     shape: K3StepShape,
@@ -765,30 +769,59 @@ fn kda_attention_chunk(
         &mut s.conv_v,
     )?;
 
-    // The delta rule, one token at a time over the chunk's single sequence.
-    for t in 0..tokens {
-        let parity = start_parity ^ (t & 1);
-        let (recurrent_read, recurrent_write) = parity_pair(&mut kda_state.recurrent, parity);
-        k3_kda_core_token_launch(
+    // The chunkwise delta rule: the whole chunk through the vendored FlashKDA
+    // forward (third_party/flash-kda) — two launches instead of a per-token
+    // walk. The pre-activation gate lands bf16 first, the fused core's own
+    // `bf16(Σ gp)` landing; FlashKDA adds dt_bias and applies the activation
+    // in-kernel, from the same formula. The recurrent state reads the
+    // start-parity slab and lands in the other one: under the chunkwise
+    // kernel, parity is a per-chunk double buffer, not a per-token flip.
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_ATTN_INNER,
+        K3_ATTN_INNER,
+        0,
+        1,
+        &s.kda_forget_partial,
+        &mut s.kda_g,
+    )?;
+    {
+        let (recurrent_read, recurrent_write) =
+            parity_pair(&mut kda_state.recurrent, start_parity);
+        k3_flash_kda_fwd_launch(
             ctx,
+            tokens,
             K3_HEADS,
-            K3_HEAD_DIM,
-            1,
-            t,
             &s.conv_q,
             &s.conv_k,
             &s.conv_v,
-            &s.kda_forget_partial,
-            &w.dt_bias,
-            &w.a_log,
+            &s.kda_g,
             &s.beta,
-            &s.out_gate,
-            &w.gamma_o,
+            &mut s.kda_beta_t,
+            &w.a_log,
+            &w.dt_bias,
             recurrent_read,
             recurrent_write,
-            &mut s.gated,
+            &mut s.kda_attn,
+            &mut s.flash_kda_ws,
+            (K3_HEAD_DIM as f32).powf(-0.5),
+            crate::config::K3_KDA_GATE_LOWER_BOUND as f32,
         )?;
     }
+    // o_norm × output gate — the fused core's tail as its own batched launch;
+    // rows past the chunk carry stale data the step discards with the rest of
+    // the padding.
+    k3_o_norm_gate_batched_launch(
+        ctx,
+        b,
+        K3_HEADS,
+        K3_HEAD_DIM,
+        &s.kda_attn,
+        &s.out_gate,
+        &w.gamma_o,
+        &mut s.gated,
+    )?;
 
     // Batched output projection; rows past the chunk carry stale data the
     // step discards with the rest of the padding.
@@ -888,8 +921,9 @@ fn kda_conv_stream_chunk(
     )?;
     // The carry into the next chunk is the successor window of the chunk's
     // last token — for a chunk shorter than the window it already folds the
-    // slots carried in above.
-    let end_parity = start_parity ^ (tokens & 1);
+    // slots carried in above. It lands in the other parity slab, agreeing
+    // with the recurrent state's per-chunk double buffering.
+    let end_parity = start_parity ^ 1;
     copy_rows_2d(
         ctx,
         window_next,

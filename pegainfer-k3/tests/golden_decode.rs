@@ -217,6 +217,30 @@ fn assert_fixture_match(golden: &Golden, sampled: &[u32], what: &str) {
     );
 }
 
+/// One step's argmax against the fixture with the noise-floor excusal — for
+/// gates whose path is legitimately not bit-identical to the reference
+/// (chunked prefill: FlashKDA's f32 l2norm chain and chunkwise accumulation
+/// against the bucket-1 fixture).
+fn assert_step_within_noise(golden: &Golden, step: usize, got: u32, what: &str) {
+    let want = golden.argmax[step];
+    if got == want {
+        return;
+    }
+    let excused = golden.is_coin_flip(step) && golden.top5_ids[step].contains(&got);
+    assert!(
+        excused,
+        "{what}: step {step} sampled {got}, fixture says {want}; \
+         reference margin {:.2} bf16 ULP, top-5 ids {:?}",
+        golden.margin_ulp(step),
+        golden.top5_ids[step]
+    );
+    eprintln!(
+        "{what}: step {step} is a coin flip (reference margin {:.2} bf16 ULP): \
+         sampled {got}, fixture says {want}",
+        golden.margin_ulp(step)
+    );
+}
+
 /// Gates 2 to 4 hold the executor against itself, so they get no tolerance.
 fn assert_same_trajectory(baseline: &[u32], sampled: &[u32], what: &str) {
     assert_eq!(
@@ -545,42 +569,39 @@ fn four_concurrent_sequences_each_match_the_baseline() {
 }
 
 /// The serving path: `prefill` ingests the prompt and returns the request's
-/// first token, then `decode` continues it. Both must agree with the fixture.
+/// first token, then `decode` continues it — both held to the fixture with
+/// its noise-floor excusal. The chunkwise KDA prefill is legitimately not
+/// bit-identical to per-token decode stepping, so the state a slot adopts can
+/// send a greedy continuation off the baseline at a coin-flip step; the
+/// continuation is force-fed the fixture feed to keep every step
+/// independently comparable. `max_batch = 1` keeps every chunk at a single
+/// token — the chunk path's degenerate edge (the wide-chunk case is
+/// [`chunked_prefill_crosses_its_bucket_boundaries`]).
 #[test]
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn prefill_then_decode_serves_the_baseline_continuation() {
     let golden = golden();
-    let Some(baseline) = baseline_trajectory(&golden) else {
+    let Some(mut executor) = executor(&golden, 1, true, K3MoeTransport::MEGA) else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
-    let mut executor = executor(&golden, 1, true, K3MoeTransport::MEGA)
-        .expect("the checkpoint was there a moment ago");
+    let what = "prefill then decode";
     let params = pegainfer_frontend::sampler::SamplingParams::default();
     let first = executor
         .prefill(0, &golden.prompt, &params)
         .expect("prefill should run");
-    let boundary = golden.prompt.len() - 1;
-    assert_eq!(
-        first, baseline[boundary],
-        "prefill's first token: got {first}, the decode path sampled {}",
-        baseline[boundary]
-    );
-    let mut last = first;
-    for (step, &want) in baseline.iter().enumerate().skip(golden.prompt.len()) {
+    assert_step_within_noise(&golden, golden.prompt.len() - 1, first, what);
+    let feed = golden.feed();
+    for step in golden.prompt.len()..golden.argmax.len() {
         let tokens = executor
             .decode(&[DecodeSlot {
                 slot: 0,
-                last_token: last,
+                last_token: feed[step],
             }])
             .expect("decode should run");
-        last = tokens[0];
-        assert_eq!(
-            last, want,
-            "decode step {step}: got {last}, the decode path sampled {want}"
-        );
+        assert_step_within_noise(&golden, step, tokens[0], what);
     }
-    eprintln!("prefill + decode reproduced the decode-only continuation");
+    eprintln!("prefill + decode served the fixture continuation");
 }
 
 /// Chunked-prefill gate: a prompt longer than the executor's bucket must split
@@ -599,31 +620,13 @@ fn chunked_prefill_crosses_its_bucket_boundaries() {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
-    let check = |step: usize, got: u32| {
-        let want = golden.argmax[step];
-        if got == want {
-            return;
-        }
-        let excused = golden.is_coin_flip(step) && golden.top5_ids[step].contains(&got);
-        assert!(
-            excused,
-            "chunked prefill: step {step} sampled {got}, fixture says {want}; \
-             reference margin {:.2} bf16 ULP, top-5 ids {:?}",
-            golden.margin_ulp(step),
-            golden.top5_ids[step]
-        );
-        eprintln!(
-            "chunked prefill: step {step} is a coin flip (reference margin {:.2} bf16 ULP): \
-             sampled {got}, fixture says {want}",
-            golden.margin_ulp(step)
-        );
-    };
+    let what = "chunked prefill";
     let boundary = 13;
     let params = pegainfer_frontend::sampler::SamplingParams::default();
     let first = executor
         .prefill(0, &golden.prompt[..boundary], &params)
         .expect("chunked prefill should run");
-    check(boundary - 1, first);
+    assert_step_within_noise(&golden, boundary - 1, first, what);
     let feed = golden.feed();
     for step in boundary..golden.argmax.len() {
         let tokens = executor
@@ -632,7 +635,7 @@ fn chunked_prefill_crosses_its_bucket_boundaries() {
                 last_token: feed[step],
             }])
             .expect("decode should run");
-        check(step, tokens[0]);
+        assert_step_within_noise(&golden, step, tokens[0], what);
     }
     eprintln!(
         "chunked prefill (cap 8 over {boundary} prompt tokens) served the fixture continuation"

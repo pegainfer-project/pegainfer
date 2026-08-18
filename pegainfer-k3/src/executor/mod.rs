@@ -24,8 +24,9 @@
 //! rows carry up to `max_batch` consecutive prompt tokens, so every
 //! row-independent stage (norms, projections, MLA attention via ascending
 //! per-row context lengths, MoE, epilogue) digests the whole chunk in one
-//! launch, and only the KDA recurrence walks the chunk token by token
-//! ([`step::k3_prefill_chunk_step`]). It runs on a **separate state pool**
+//! launch, and the KDA recurrence crosses the chunk as one chunkwise FlashKDA
+//! forward per layer ([`step::k3_prefill_chunk_step`]). It runs on a
+//! **separate state pool**
 //! rather than on the sequence's own slot, because a batched step advances
 //! every row of its bucket: prefilling in place would step the sequences
 //! already decoding. The pool keeps one row of KDA/conv state (the recurrence
@@ -848,8 +849,9 @@ impl K3Executor {
             if let Some(mega) = self.scratch.mega.as_ref() {
                 mega.end_step()?;
             }
-            // The chunk's KDA walk flips parity once per token.
-            parity ^= tokens & 1;
+            // Under the chunkwise KDA kernel parity is a per-chunk double
+            // buffer: every chunk reads one slab and lands in the other.
+            parity ^= 1;
             consumed += tokens;
             last_tokens = tokens;
             self.prefill_state.positions[0] = consumed;

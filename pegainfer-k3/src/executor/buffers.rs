@@ -698,6 +698,16 @@ pub(crate) struct K3Scratch {
     pub(crate) conv_k: CudaSlice<bf16>,
     pub(crate) conv_v: CudaSlice<bf16>,
     pub(crate) gated: CudaSlice<bf16>,
+    /// Chunked prefill (FlashKDA): the landed pre-activation gate projection,
+    /// `[rows, inner]` — the same `bf16(Σ gp)` landing the fused core takes
+    /// before adding `dt_bias`, which FlashKDA applies in-kernel.
+    pub(crate) kda_g: CudaSlice<bf16>,
+    /// Chunked prefill: beta transposed to `[heads, rows]` for FlashKDA's TMA.
+    pub(crate) kda_beta_t: CudaSlice<bf16>,
+    /// Chunked prefill: FlashKDA's raw attention rows, pre o_norm and gate.
+    pub(crate) kda_attn: CudaSlice<bf16>,
+    /// Chunked prefill: FlashKDA's inter-kernel workspace.
+    pub(crate) flash_kda_ws: CudaSlice<u8>,
     // MLA.
     pub(crate) mla_fused_partial: CudaSlice<f32>,
     pub(crate) q_norm: CudaSlice<bf16>,
@@ -788,6 +798,12 @@ impl K3Scratch {
             conv_k: wide(K3_ATTN_INNER)?,
             conv_v: wide(K3_ATTN_INNER)?,
             gated: wide(K3_ATTN_INNER)?,
+            kda_g: wide(K3_ATTN_INNER)?,
+            kda_beta_t: wide(K3_KDA_HEADS)?,
+            kda_attn: wide(K3_ATTN_INNER)?,
+            flash_kda_ws: stream.alloc_zeros(
+                pegainfer_kernels::ops::k3_flash_kda_workspace_bytes(rows, K3_KDA_HEADS),
+            )?,
             mla_fused_partial: partial(K3_MLA_FUSED)?,
             q_norm: wide(K3_Q_LORA_RANK)?,
             kv_a: wide(K3_KV_A_OUT)?,

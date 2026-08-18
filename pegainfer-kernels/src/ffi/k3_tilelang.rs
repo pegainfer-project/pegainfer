@@ -137,6 +137,20 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    /// `kda_core`'s tail on its own: per (row, head) f32 rms_norm of the bf16
+    /// attention landing `X` times the o_norm gamma `Go [head_dim]`, landed
+    /// once, times the bf16 sigmoid of the output gate `G2`. eps compiled in.
+    pub fn k3_o_norm_gate_batched(
+        x: *const c_void,
+        g2: *const c_void,
+        go: *const f32,
+        out: *mut c_void,
+        b: i32,
+        num_heads: i32,
+        head_dim: i32,
+        stream: CUstream,
+    ) -> i32;
+
     /// Sigmoid router plus biased top-k over merged f32 score rows
     /// `S [b, num_experts]`, with `Bias [num_experts]` f32 and the bf16 routed
     /// scale `Rs [1]`. Writes `Idx [b, topk]` i32 and `Wts [b, topk]` f32.
