@@ -20,6 +20,7 @@ use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 use half::bf16;
+use pegainfer_kernels::ops::K3_ATTNRES_MAX_BLOCKS;
 use pegainfer_kernels::ops::K3_CONV_WIDTH;
 use pegainfer_kernels::ops::K3_KDA_HEAD_DIM;
 use pegainfer_kernels::ops::K3_KDA_HEADS;
@@ -102,7 +103,10 @@ pub(crate) struct K3StatePool {
     pub(crate) layers: Vec<K3LayerState>,
     /// The paged MLA latent cache all MLA layers share.
     pub(crate) kv: K3PagedKv,
-    /// Attention-residual snapshot history, `[attn_rows, blocks, hidden]` bf16.
+    /// Attention-residual snapshot history, `[attn_rows, block_count, hidden]`
+    /// bf16. The row stride is pinned at `K3_ATTNRES_MAX_BLOCKS` regardless of
+    /// the model's depth: the batched attnres kernels compile the slab's
+    /// (B, BC, H) stride in, so every pool must present the same one.
     pub(crate) blocks: CudaSlice<bf16>,
     pub(crate) block_count: usize,
     /// Tokens each sequence row has already consumed. Index into its MLA
@@ -117,9 +121,11 @@ impl K3StatePool {
         attn_rows: usize,
         max_ctx: usize,
         num_layers: usize,
-        block_count: usize,
         kv_pages: usize,
     ) -> Result<Self> {
+        // See the `blocks` field: the slab stride is the compile-time capacity
+        // the attnres kernels index by, never the truncation's block count.
+        let block_count = K3_ATTNRES_MAX_BLOCKS;
         ensure!(
             attn_rows == rows || rows == 1,
             "K3 state pool: attn_rows may exceed rows only for a one-sequence (prefill) pool"

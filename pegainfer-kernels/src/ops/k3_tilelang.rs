@@ -664,7 +664,7 @@ pub fn k3_attnres_scores_batched_launch(
     );
     ensure!(
         ps.len() >= b * h
-            && bl.len() >= b * blocks * h
+            && bl.len() >= b * K3_ATTNRES_MAX_BLOCKS * h
             && sw.len() >= h
             && sc.len() >= b * (blocks + 1),
         "K3 attnres_scores buffers too small for b={b}, blocks={blocks}, h={h}: \
@@ -716,7 +716,7 @@ pub fn k3_attnres_mix_batched_launch(
     );
     ensure!(
         ps.len() >= b * h
-            && bl.len() >= b * blocks * h
+            && bl.len() >= b * K3_ATTNRES_MAX_BLOCKS * h
             && sc.len() >= b * (blocks + 1)
             && o.len() >= b * h,
         "K3 attnres_mix buffers too small for b={b}, blocks={blocks}, h={h}: \

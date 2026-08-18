@@ -118,16 +118,18 @@ def router_topk_batched(E: int, TOPK: int, B: int, threads: int = 256):
 
 
 @lru_cache(maxsize=None)
-def attnres_scores_batched(NB: int, H: int, B: int, eps: float,
+def attnres_scores_batched(NB: int, BC: int, H: int, B: int, eps: float,
                            threads: int = 256):
     """Batched version of ``attnres_scores``: block (b, c) computes candidate c
     of row b, and within a row (weightless rms normalization -> dot with the
     f32 fused scoring vector) it is word-for-word identical to the bs=1
-    version. Bl holds each row's own snapshot history (B, NB, H)."""
+    version. Bl holds each row's own snapshot history at the slab's fixed
+    (B, BC, H) row stride — BC is the slab's block capacity, NB the mix's
+    candidate count (NB <= BC; only the first NB blocks of a row are read)."""
     @T.prim_func
     def main(
         Ps: T.Tensor((B, H), DT),
-        Bl: T.Tensor((B, NB, H), DT),
+        Bl: T.Tensor((B, BC, H), DT),
         Sw: T.Tensor((H,), ACC),
         Sc: T.Tensor((B, NB + 1), ACC),
     ):
@@ -153,15 +155,16 @@ def attnres_scores_batched(NB: int, H: int, B: int, eps: float,
 
 
 @lru_cache(maxsize=None)
-def attnres_mix_batched(NB: int, H: int, B: int, threads: int = 256):
+def attnres_mix_batched(NB: int, BC: int, H: int, B: int, threads: int = 256):
     """Batched version of ``attnres_mix``: block (b, x) mixes column segment x
     of row b, each block redoes that row's NB+1 term softmax (same as the
     bs=1 version), mixes the un-normalized candidates by probability, and
-    lands bf16 once. Requires threads|H."""
+    lands bf16 once. Bl rows sit at the slab's fixed (B, BC, H) stride, with
+    only the first NB blocks read. Requires threads|H."""
     @T.prim_func
     def main(
         Ps: T.Tensor((B, H), DT),
-        Bl: T.Tensor((B, NB, H), DT),
+        Bl: T.Tensor((B, BC, H), DT),
         Sc: T.Tensor((B, NB + 1), ACC),
         O: T.Tensor((B, H), DT),
     ):

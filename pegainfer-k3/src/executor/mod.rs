@@ -456,7 +456,6 @@ impl K3Executor {
             max_batch,
             config.max_ctx,
             num_layers,
-            blocks,
             kv_pages,
         )?;
         // The prefill chunk cap: the MegaMoE protocol maximum under the fused
@@ -488,7 +487,6 @@ impl K3Executor {
             chunk_bucket,
             config.max_ctx,
             num_layers,
-            blocks,
             slot_pages,
         )?;
         if mega {

@@ -803,3 +803,121 @@ fn step_time_snapshot() {
         }
     }
 }
+
+/// Depth probe, not a gate: hold chunked prefill to the per-token decode walk
+/// at an arbitrary layer count (`PEGAINFER_K3_AB_LAYERS`, default the
+/// fixture's). The fixture only certifies 4 layers; a numerics defect that
+/// compounds with depth is invisible there, so this test compares the two
+/// prefill routes against each other — boundary logits and a forced-fed
+/// continuation — with no fixture in the loop. Wholesale disagreement means
+/// the chunk path corrupted the state it handed to decode at that depth.
+#[test]
+#[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
+fn chunked_prefill_agrees_with_the_per_token_walk_at_depth() {
+    let golden = golden();
+    let depth: usize = std::env::var("PEGAINFER_K3_AB_LAYERS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(golden.num_layers);
+    let Some(path) = checkpoint() else {
+        eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
+        return;
+    };
+    let build = |max_batch: usize| {
+        let config = K3ExecutorConfig {
+            max_batch,
+            max_ctx: golden.max_ctx,
+            kv_pages: 0,
+            num_layers: depth,
+            chunk_tokens: max_batch,
+            cuda_graph: false,
+            moe_transport: K3MoeTransport::MEGA,
+        };
+        K3Executor::load(&path, device(), 0, 1, config)
+            .expect("the truncated rank model should load")
+    };
+    let prompt = &golden.prompt;
+    let steps = 24usize;
+
+    // Reference: the prompt walked one token per decode step, then greedy.
+    let mut reference = build(1);
+    reference.release(0);
+    let mut ref_stream: Vec<u32> = Vec::new();
+    for index in 0..prompt.len() {
+        let out = reference
+            .decode(&[DecodeSlot {
+                slot: 0,
+                last_token: prompt[index],
+            }])
+            .expect("reference decode step");
+        ref_stream.push(out[0]);
+    }
+    let ref_boundary = reference.last_logits(0).expect("reference boundary logits");
+    for _ in 0..steps {
+        let last = *ref_stream.last().unwrap();
+        let out = reference
+            .decode(&[DecodeSlot {
+                slot: 0,
+                last_token: last,
+            }])
+            .expect("reference decode step");
+        ref_stream.push(out[0]);
+    }
+    drop(reference);
+
+    // Chunked: the whole prompt as prefill chunks, then the reference's own
+    // tokens force-fed so one coin flip cannot cascade.
+    let cap: usize = std::env::var("PEGAINFER_K3_AB_CHUNK")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or_else(|| prompt.len().min(8));
+    let mut chunked = build(cap);
+    let params = pegainfer_frontend::sampler::SamplingParams::default();
+    let first = chunked
+        .prefill(0, prompt, &params)
+        .expect("chunked prefill");
+    let chunk_boundary = chunked.last_logits(0).expect("chunked boundary logits");
+
+    let top = |logits: &[f32]| -> Vec<(usize, f32)> {
+        let mut index: Vec<usize> = (0..logits.len()).collect();
+        index.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+        index[..5].iter().map(|&i| (i, logits[i])).collect()
+    };
+    let max_abs = ref_boundary
+        .iter()
+        .zip(&chunk_boundary)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("depth {depth}: boundary max |delta| = {max_abs:.4}");
+    eprintln!("  per-token top-5: {:?}", top(&ref_boundary));
+    eprintln!("  chunked   top-5: {:?}", top(&chunk_boundary));
+    eprintln!(
+        "  boundary argmax: per-token {}, chunked {first}",
+        ref_stream[prompt.len() - 1]
+    );
+
+    let mut mismatches = 0usize;
+    for step in 0..steps {
+        let fed = ref_stream[prompt.len() + step - 1];
+        let out = chunked
+            .decode(&[DecodeSlot {
+                slot: 0,
+                last_token: fed,
+            }])
+            .expect("chunked continuation step");
+        let want = ref_stream[prompt.len() + step];
+        if out[0] != want {
+            mismatches += 1;
+            eprintln!("  step {step}: chunked {} vs per-token {want}", out[0]);
+        }
+    }
+    eprintln!(
+        "depth {depth}: {}/{steps} forced continuation steps agree",
+        steps - mismatches
+    );
+    assert!(
+        mismatches * 4 <= steps,
+        "chunked prefill diverges from the per-token walk at depth {depth}: \
+         {mismatches}/{steps} steps disagree"
+    );
+}
