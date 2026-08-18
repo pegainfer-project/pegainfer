@@ -257,16 +257,18 @@ the default and the only production path; there is no flag.
   routing weight into the activation *before* the down projection (the chain
   applies it at combine) and mid-quantizes per 32 elements rather than per
   128. Each is held to the golden fixture rather than to the other.
-- **One flat symmetric slab** (260 MiB at 224 experts) holds twelve
+- **One flat symmetric slab** holds twelve
   differently-typed regions: the FP8 activation and its packed scales, the
   routing pair, and the L1/L2 ring buffers. Its size and offsets are pure host
   arithmetic over the shapes, the candidate `BLOCK_M` set and the SM count —
   and they are kernel *template parameters*, so a rounded-up allocation is
-  wrong, not merely wasteful. At `ep_size 1` the slab is a plain device
-  allocation (260 MiB): the kernel's cross-rank barriers compile down to
-  grid-local synchronisation, so no IPC or NVSHMEM handle is involved. At
-  `ep_size 4` each rank owns one (209.8 MiB, ring 17280 tokens / SF ring
-  276480) on its own device and the world exchanges bare base pointers.
+  wrong, not merely wasteful. The slab is sized at the protocol maximum
+  (`k3_mega_max_tokens_per_rank` = 4224 rows, the chunked-prefill ceiling),
+  whatever the executor's live batch is. At `ep_size 1` the slab is a plain
+  device allocation (940 MiB, ring 48000 tokens): the kernel's cross-rank
+  barriers compile down to grid-local synchronisation, so no IPC or NVSHMEM
+  handle is involved. At `ep_size 4` each rank owns one (1633 MiB, ring
+  119424 tokens) on its own device and the world exchanges bare base pointers.
 - **The expert bank carries one layout or the other, never both** — a rank
   holds 84-189 GiB of experts. `K3ExpertBankForm` picks the layout at build
   time: the mega form interleaves the fused gate|up rows at granularity 8 and
@@ -307,8 +309,10 @@ own stream.
   the ring capacities and the experts-per-rank divisor. `1` and `4` are
   instantiated (`K3_MEGA_EP_SIZES`); anything else is refused at construction.
 - **One fixed block config for every rank and every step at EP4**, derived from
-  the protocol maximum (`num_max_tokens_per_rank = 384`) rather than the live
-  token count: BLOCK_M 192 / BLOCK_K 128. Two reasons. Nothing in the kernel
+  the protocol maximum (`num_max_tokens_per_rank = 4224`) rather than the live
+  token count: BLOCK_M 192 / BLOCK_K 128 (the same entry the old 384 maximum
+  selected, so raising the ceiling for chunked prefill left EP4 decode tiles
+  untouched — confirmed by an A/B step-time run within noise at every bucket). Two reasons. Nothing in the kernel
   forces the world to agree on a config, and heterogeneous tiling across a
   collective launch is unverified territory. And a fixed config makes a row's
   tile shape independent of how much traffic its peers are sending — which is
@@ -367,8 +371,13 @@ recorded here as the measurement, not as a configuration you can still select.
 
 ## Next
 
-Graphs over the EP4 fused path (the ranks=1 path already captures), then
-launch-ahead, real (chunked) prefill over the paged KV, kv-store `BlockPool`
-integration (content addressing / reuse for the MLA pages), and a perf pass on
-the paged attention kernel (the 3-sweep recompute reads the cache three times;
-fine at bring-up depth, worth a fused pass at 24 MLA layers x long contexts).
+Real (chunked) prefill over the paged KV is in flight: the MegaMoE protocol
+maximum is already raised to 4224 rows/rank as the chunk ceiling (decode A/B
+within noise, all gates green — the row-batched step stages come for free, and
+the remaining work is the three time-axis kernels: causal conv, the KDA
+delta-rule chunk step, and MLA chunk attention). Then graphs over the EP4
+fused path (the ranks=1 path already captures), launch-ahead, kv-store
+`BlockPool` integration (content addressing / reuse for the MLA pages), and a
+perf pass on the paged attention kernel (the 3-sweep recompute reads the cache
+three times; fine at bring-up depth, worth a fused pass at 24 MLA layers x
+long contexts).
