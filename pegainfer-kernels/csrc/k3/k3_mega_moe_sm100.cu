@@ -64,17 +64,19 @@
 // Instantiation matrix
 // ---------------------------------------------------------------------------
 // hidden 3584 (K3 latent), intermediate 3072, 224 experts (GLOBAL — a rank
-// holds `224 / ranks` of them), topk 16, num_max_tokens_per_rank 384
-// (`kLCMCandidateBlockM`, the token alignment the upstream API enforces), 152
-// SMs (GB300), two world sizes: 1 rank and 4 ranks (56 experts each).
+// holds `224 / ranks` of them), topk 16, num_max_tokens_per_rank 4224 (the
+// chunked-prefill ceiling; 11x `kLCMCandidateBlockM`, the token alignment the
+// upstream API enforces), 152 SMs (GB300), two world sizes: 1 rank and 4 ranks
+// (56 experts each).
 //
-// At ranks 1 the launch picks among the three block configs reachable for
-// num_tokens <= 384 under `get_block_config_for_mega_moe`, so a single-rank
-// launch stays bit-identical to what upstream's Python wrapper would run.
+// At ranks 1 the launch picks among the block configs by live token count
+// under `get_block_config_for_mega_moe`, so a single-rank launch stays
+// bit-identical to what upstream's Python wrapper would run; at 4224 max
+// tokens the whole six-entry ladder is reachable and instantiated.
 // At ranks 4 there is exactly ONE config, taken at the protocol maximum
-// (num_tokens == 384) rather than from the live token count — see the note on
-// `kRanks4Config`. Times the two activations (situ for K3, swiglu as a
-// regression handle): 3 * 2 + 1 * 2 = 8 kernels.
+// rather than from the live token count — see the note on `kRanks4Config`.
+// Times the two activations (situ for K3, swiglu as a regression handle):
+// 6 * 2 + 1 * 2 = 14 kernels.
 //
 // The ring capacities (`kNumRingTokens`, `kNumSFRingTokens`) are template
 // parameters that depend on the rank count, so each world size carries its own
@@ -128,6 +130,15 @@ constexpr int kHidden = 3584;
 constexpr int kIntermediate = 3072;
 constexpr int kNumExperts = 224;
 constexpr int kNumTopk = 16;
+
+// Token capacity one rank's slab and kernel instantiation carry
+// (`num_max_tokens_per_rank`): the chunked-prefill ceiling, 11x the upstream
+// token alignment (`layout::kLCMCandidateBlockM`, 384 — asserted at the
+// instantiation). This is the ONLY value the launch accepts: the ring
+// capacities derived from it are kernel template parameters, so a slab
+// allocated for any other value addresses the rings wrong. Exported to the
+// Rust side through `k3_mega_max_tokens_per_rank`.
+constexpr int kProtocolMaxTokensPerRank = 4224;
 
 // MXFP4 / activation scale-factor group size along K, and how many such groups
 // pack into one i32 word.
@@ -428,7 +439,9 @@ constexpr PipelineConfig mega_pipeline(int num_experts, int block_m, int block_n
 // AOT instantiations
 // ---------------------------------------------------------------------------
 
-constexpr int kMaxTokensPerRank = 384;  // layout::kLCMCandidateBlockM
+constexpr int kMaxTokensPerRank = kProtocolMaxTokensPerRank;
+static_assert(kMaxTokensPerRank % layout::kLCMCandidateBlockM == 0,
+              "the protocol maximum must satisfy the upstream token alignment");
 constexpr int kGb300Sms = 152;
 constexpr int kBytesPerPull = mega_bytes_per_pull(kHidden);
 
@@ -476,12 +489,12 @@ struct MegaKernel {
       /*fast_math=*/false>;
 };
 
-// Single rank: the first three ladder entries are the reachable ones at
-// num_max_tokens_per_rank == 384 with 224 local experts and topk 16 (the
-// 96/128/192 entries need > 455 tokens), and the launch picks among them by
-// the upstream heuristic so a single-rank launch stays bit-identical to what
-// DeepGEMM's own Python wrapper would have run.
-constexpr int kNumReachableConfigs = 3;
+// Single rank: at num_max_tokens_per_rank == 4224 with 224 experts and topk 16
+// every ladder entry is reachable (the thresholds land at 119/231/455/903/1351
+// tokens), so the whole ladder is instantiated, and the launch picks among the
+// entries by the upstream heuristic so a single-rank launch stays bit-identical
+// to what DeepGEMM's own Python wrapper would have run.
+constexpr int kNumReachableConfigs = kNumBlockConfigs;
 static_assert(mega_block_config_index(kMaxTokensPerRank, kEpRanks1, kNumExperts, kNumTopk) <
                   kNumReachableConfigs,
               "the single-rank protocol max must land inside the instantiated ladder prefix");
@@ -688,6 +701,18 @@ CUresult launch_mega_ranks1(int cfg_idx, unsigned short* y, const unsigned char*
       return launch_mega<kEpRanks1, MegaKernel<kEpRanks1, 2, kSitu>>(
           y, l1_weights, l1_weights_sf, l2_weights, l2_weights_sf, buffers, symm_ptrs, rank_idx,
           num_tokens, cumulative_stats, stream);
+    case 3:
+      return launch_mega<kEpRanks1, MegaKernel<kEpRanks1, 3, kSitu>>(
+          y, l1_weights, l1_weights_sf, l2_weights, l2_weights_sf, buffers, symm_ptrs, rank_idx,
+          num_tokens, cumulative_stats, stream);
+    case 4:
+      return launch_mega<kEpRanks1, MegaKernel<kEpRanks1, 4, kSitu>>(
+          y, l1_weights, l1_weights_sf, l2_weights, l2_weights_sf, buffers, symm_ptrs, rank_idx,
+          num_tokens, cumulative_stats, stream);
+    case 5:
+      return launch_mega<kEpRanks1, MegaKernel<kEpRanks1, 5, kSitu>>(
+          y, l1_weights, l1_weights_sf, l2_weights, l2_weights_sf, buffers, symm_ptrs, rank_idx,
+          num_tokens, cumulative_stats, stream);
     default:
       return CUDA_ERROR_NOT_SUPPORTED;
   }
@@ -732,6 +757,12 @@ extern "C" {
 
 // Token-count alignment the mega API enforces (`layout::kLCMCandidateBlockM`).
 int k3_mega_token_alignment(void) { return 384; }
+
+// Token capacity one rank's slab and the AOT kernels are built for
+// (`num_max_tokens_per_rank`). The launch accepts exactly this value — the
+// ring capacities derived from it are kernel template parameters — so slabs
+// are allocated at exactly this size, whatever the executor's live batch is.
+int k3_mega_max_tokens_per_rank(void) { return kProtocolMaxTokensPerRank; }
 
 // Let this rank's device read and write `peer_ordinal`'s memory, and let
 // `peer_ordinal` read and write ours.

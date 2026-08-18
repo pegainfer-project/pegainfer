@@ -114,6 +114,17 @@ pub fn k3_mega_token_alignment() -> usize {
     (unsafe { ffi::k3_mega_token_alignment() }) as usize
 }
 
+/// Token capacity one rank's symmetric slab and the AOT kernels are built for
+/// (`num_max_tokens_per_rank`): the chunked-prefill ceiling. The ring
+/// capacities derived from it are kernel template parameters, so the launch
+/// accepts exactly this value and a slab must be allocated at exactly this
+/// size, whatever the executor's live batch is.
+#[must_use]
+pub fn k3_mega_max_tokens_per_rank() -> usize {
+    // SAFETY: a pure constant getter with no arguments.
+    (unsafe { ffi::k3_mega_max_tokens_per_rank() }) as usize
+}
+
 /// Open the device pair `(self_ordinal, peer_ordinal)` for the fused kernel's
 /// cross-rank addressing.
 ///
@@ -529,5 +540,39 @@ impl K3MegaShape {
             self.num_sms
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The protocol maximum must satisfy the upstream token alignment, and the
+    /// symmetric-buffer layout must be computable at exactly that value for
+    /// every instantiated world size. Host arithmetic only — prints the slab
+    /// sizes so a protocol bump shows its memory cost. Skips on builds where
+    /// the sm100 TU is stubbed out.
+    #[test]
+    fn protocol_max_layouts() {
+        let max_tokens = k3_mega_max_tokens_per_rank();
+        let alignment = k3_mega_token_alignment();
+        assert_eq!(
+            max_tokens % alignment,
+            0,
+            "protocol max {max_tokens} is not a multiple of the {alignment} alignment"
+        );
+        for ranks in [1usize, 4] {
+            match k3_mega_symm_buffer_layout(ranks, 224, max_tokens, 16, 3584, 3072, 152) {
+                Ok(layout) => eprintln!(
+                    "ranks {ranks}: slab {:.1} MiB, ring {} tokens, sf ring {} tokens",
+                    layout.num_bytes as f64 / (1024.0 * 1024.0),
+                    layout.ring_tokens,
+                    layout.sf_ring_tokens,
+                ),
+                Err(error) => {
+                    eprintln!("skipping ranks {ranks}: sm100 TU not built ({error:#})");
+                }
+            }
+        }
     }
 }

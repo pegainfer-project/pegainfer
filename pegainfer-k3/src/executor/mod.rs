@@ -127,7 +127,8 @@ const K3_MEGA_EP_SIZES: [usize; 2] = [1, 4];
 
 /// Slots per rank an expert-parallel launch takes when nothing says otherwise.
 ///
-/// The fused kernel's protocol maximum is 384 rows per rank, so the compiled
+/// The fused kernel's protocol maximum is 4224 rows per rank (sized for
+/// chunked prefill), so the compiled
 /// bucket ceiling (128) is the target once the backbone goes FP8. Today the
 /// binding constraint is the KDA state slab: ~929 MB per slot (f32 recurrent
 /// x2 parity + conv windows across 69 layers), so 64 slots cost ~58 GiB —

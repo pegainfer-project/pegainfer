@@ -30,7 +30,7 @@ use pegainfer_kernels::ops::K3MegaSymmLayout;
 use pegainfer_kernels::ops::argmax_batch_bf16_split_partials_len;
 use pegainfer_kernels::ops::k3_mega_open_peer_access;
 use pegainfer_kernels::ops::k3_mega_symm_buffer_layout;
-use pegainfer_kernels::ops::k3_mega_token_alignment;
+use pegainfer_kernels::ops::k3_mega_max_tokens_per_rank;
 use pegainfer_kernels::tensor::DeviceContext;
 
 use super::paged_kv::K3PagedKv;
@@ -442,8 +442,16 @@ impl K3MegaScratch {
         if num_ranks > 1 {
             open_local_peer_access(ctx.device_ordinal)?;
         }
-        let alignment = k3_mega_token_alignment();
-        let max_tokens = min_tokens.div_ceil(alignment) * alignment;
+        // The slab and the layout take the AOT kernel's protocol maximum, not
+        // a batch-derived size: the ring capacities are kernel template
+        // parameters and the launch rejects any other value. The executor's
+        // live capacity only has to fit under it.
+        let max_tokens = k3_mega_max_tokens_per_rank();
+        ensure!(
+            min_tokens <= max_tokens,
+            "K3 MegaMoE is instantiated for {max_tokens} rows per rank, but this executor asks \
+             for {min_tokens}"
+        );
         let layout = k3_mega_symm_buffer_layout(
             num_ranks,
             routed_experts,
@@ -695,10 +703,9 @@ impl K3Scratch {
                         routed_experts,
                         geometry.num_sms,
                         // The mega slab is a PROTOCOL-max buffer, not a
-                        // batch-sized one: the token alignment lifts whatever
-                        // this rank's live capacity is to the same 384 rows
-                        // every peer allocated, which is what the AOT kernel is
-                        // instantiated for.
+                        // batch-sized one: every peer allocates the same
+                        // AOT-instantiated row capacity, and this rank's live
+                        // capacity merely has to fit under it.
                         rows,
                         geometry.num_ranks,
                         geometry.rank_idx,

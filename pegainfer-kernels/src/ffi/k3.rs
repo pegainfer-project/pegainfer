@@ -159,6 +159,10 @@ unsafe extern "C" {
     /// `num_max_tokens_per_rank` (`layout::kLCMCandidateBlockM`).
     pub fn k3_mega_token_alignment() -> i32;
 
+    /// Token capacity one rank's slab and the AOT kernels are built for
+    /// (`num_max_tokens_per_rank`). The launch accepts exactly this value.
+    pub fn k3_mega_max_tokens_per_rank() -> i32;
+
     /// Open the device pair `(self_ordinal, peer_ordinal)` for the kernel's
     /// cross-rank addressing: peer access from this device's context, plus a
     /// memory-pool access grant so this device's stream-ordered allocations are
