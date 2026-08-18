@@ -72,7 +72,10 @@ and CUDA-graph capture.
   routed FLOPs match the real model; this is the honest perf proxy until
   EP16 exists.
 - **Real sampling** — `SamplingParams` is still ignored (argmax only).
-- CUDA graphs over the EP4 fused path; launch-ahead.
+- CUDA graphs over the EP4 fused path / launch-ahead — **evaluate before
+  building**: the EP4 decode profile (`benchmarks/k3-ep4-decode-profile.md`)
+  found the step is *not* launch-bound, so measure what capture would
+  actually buy on the EP path before spending on it.
 - kv-store `BlockPool` integration (content addressing / prefix reuse for
   the MLA latent pages).
 - W-chunked prefill context loop + LSE merge (only if `max_ctx` outgrows the
