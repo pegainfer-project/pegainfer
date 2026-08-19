@@ -665,8 +665,27 @@ mod tests {
         }
     }
 
-    fn assert_close_f32(label: &str, expected: &[f32], actual: &[f32], atol: f32, rtol: f32) {
-        assert_eq!(expected.len(), actual.len(), "{label} length mismatch");
+    #[derive(Debug)]
+    struct F32DifferenceStats {
+        first_violation: Option<(usize, f32, f32, f32)>,
+        violations: usize,
+        max_abs: f32,
+        mean_abs: f32,
+        p99_abs: f32,
+        max_rel: f32,
+    }
+
+    fn difference_stats_f32(
+        expected: &[f32],
+        actual: &[f32],
+        atol: f32,
+        rtol: f32,
+    ) -> F32DifferenceStats {
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "f32 comparison length mismatch"
+        );
         let mut absolute = Vec::with_capacity(expected.len());
         let mut max_relative = 0.0_f32;
         let mut first_violation = None;
@@ -694,16 +713,70 @@ mod tests {
         };
         let p99_index = absolute.len().saturating_sub(1) * 99 / 100;
         let p99 = absolute.get(p99_index).copied().unwrap_or(0.0);
-        eprintln!(
-            "{label}: elements={} violations={violation_count} max_abs={max:.8} mean_abs={mean:.8} p99_abs={p99:.8} max_rel={max_relative:.8} atol={atol} rtol={rtol}",
-            absolute.len()
-        );
-        assert!(
-            first_violation.is_none(),
-            "{label} first violation {:?}; violations={violation_count}/{} max_abs={max} mean_abs={mean} p99_abs={p99} max_rel={max_relative}",
+        F32DifferenceStats {
             first_violation,
+            violations: violation_count,
+            max_abs: max,
+            mean_abs: mean,
+            p99_abs: p99,
+            max_rel: max_relative,
+        }
+    }
+
+    fn report_close_f32(
+        label: &str,
+        expected: &[f32],
+        actual: &[f32],
+        atol: f32,
+        rtol: f32,
+    ) -> F32DifferenceStats {
+        let stats = difference_stats_f32(expected, actual, atol, rtol);
+        eprintln!(
+            "{label}: elements={} violations={} max_abs={:.8} mean_abs={:.8} p99_abs={:.8} max_rel={:.8} atol={atol} rtol={rtol}",
             expected.len(),
+            stats.violations,
+            stats.max_abs,
+            stats.mean_abs,
+            stats.p99_abs,
+            stats.max_rel,
         );
+        stats
+    }
+
+    fn assert_close_f32(label: &str, expected: &[f32], actual: &[f32], atol: f32, rtol: f32) {
+        let stats = report_close_f32(label, expected, actual, atol, rtol);
+        assert!(
+            stats.first_violation.is_none(),
+            "{label} first violation {:?}; violations={}/{} max_abs={} mean_abs={} p99_abs={} max_rel={}",
+            stats.first_violation,
+            stats.violations,
+            expected.len(),
+            stats.max_abs,
+            stats.mean_abs,
+            stats.p99_abs,
+            stats.max_rel,
+        );
+    }
+
+    fn report_layer_state_pair(
+        model: &Qwen35Model,
+        label: &str,
+        expected: &RecurrentState,
+        actual: &RecurrentState,
+        layer_idx: usize,
+    ) -> Result<()> {
+        let ctx = model.device_ctx();
+        let expected_host = ctx.stream.clone_dtoh(&expected.layers[layer_idx].state)?;
+        let actual_host = ctx.stream.clone_dtoh(&actual.layers[layer_idx].state)?;
+        ctx.sync()?;
+        report_close_f32(
+            label,
+            &expected_host,
+            &actual_host,
+            CHUNK_STATE_ATOL,
+            CHUNK_STATE_RTOL,
+        );
+        Ok(())
     }
 
     fn assert_recurrent_close(
@@ -815,6 +888,34 @@ mod tests {
         logits.to_host(model.device_ctx())
     }
 
+    fn run_prefill_case(
+        model: &Qwen35Model,
+        tokens: &[u32],
+        backend: GdnPrefillBackend,
+        split_at: Option<usize>,
+    ) -> Result<(pegainfer_core::kv_pool::KvState, RecurrentState, Vec<f32>)> {
+        let mut kv = model.alloc_kv();
+        let mut recurrent = RecurrentState::new(model.device_ctx(), model.config())?;
+        initialize_non_symmetric_state(model, &mut recurrent)?;
+        let hidden = match split_at {
+            Some(split) => {
+                assert!(split > 0 && split < tokens.len());
+                let first = model.prefill_chunk_forward(
+                    &tokens[..split],
+                    &mut kv,
+                    &mut recurrent,
+                    backend,
+                )?;
+                drop(first);
+                model.prefill_chunk_forward(&tokens[split..], &mut kv, &mut recurrent, backend)?
+            }
+            None => model.prefill_chunk_forward(tokens, &mut kv, &mut recurrent, backend)?,
+        };
+        let logits = last_token_logits(model, &hidden)?;
+        drop(hidden);
+        Ok((kv, recurrent, logits))
+    }
+
     fn first_decode_logits(
         model: &Qwen35Model,
         token: u32,
@@ -874,37 +975,48 @@ mod tests {
             .map(|index| 100 + (index * 17 % 1000) as u32)
             .collect::<Vec<_>>();
 
-        let mut chunked_kv = model.alloc_kv();
-        let mut chunked_state = RecurrentState::new(model.device_ctx(), model.config())?;
-        initialize_non_symmetric_state(&model, &mut chunked_state)?;
-        let first_chunk = model.prefill_chunk_forward(
-            &tokens[..64],
-            &mut chunked_kv,
-            &mut chunked_state,
-            GdnPrefillBackend::FlashInfer,
-        )?;
-        drop(first_chunk);
+        let (mut chunked_kv, chunked_state, chunked_prefill_logits) =
+            run_prefill_case(&model, &tokens, GdnPrefillBackend::FlashInfer, Some(64))?;
+        let (mut unchunked_kv, unchunked_state, unchunked_prefill_logits) =
+            run_prefill_case(&model, &tokens, GdnPrefillBackend::FlashInfer, None)?;
 
-        let chunked_hidden = model.prefill_chunk_forward(
-            &tokens[64..],
-            &mut chunked_kv,
-            &mut chunked_state,
-            GdnPrefillBackend::FlashInfer,
-        )?;
-        let chunked_prefill_logits = last_token_logits(&model, &chunked_hidden)?;
-        drop(chunked_hidden);
+        // Temporary Stage 18 attribution inside the existing production gate.
+        // This is not an additional acceptance test: it determines whether a
+        // deterministic FlashInfer chunk mismatch is shared by the established
+        // Triton implementation or belongs to one FlashInfer partition shape.
+        let (_triton_chunked_kv, triton_chunked_state, _triton_chunked_logits) =
+            run_prefill_case(&model, &tokens, GdnPrefillBackend::Triton, Some(64))?;
+        let (_triton_unchunked_kv, triton_unchunked_state, _triton_unchunked_logits) =
+            run_prefill_case(&model, &tokens, GdnPrefillBackend::Triton, None)?;
 
-        let mut unchunked_kv = model.alloc_kv();
-        let mut unchunked_state = RecurrentState::new(model.device_ctx(), model.config())?;
-        initialize_non_symmetric_state(&model, &mut unchunked_state)?;
-        let unchunked_hidden = model.prefill_chunk_forward(
-            &tokens,
-            &mut unchunked_kv,
-            &mut unchunked_state,
-            GdnPrefillBackend::FlashInfer,
+        report_layer_state_pair(
+            &model,
+            "diagnostic layer 0 FlashInfer unchunked vs chunked",
+            &unchunked_state,
+            &chunked_state,
+            0,
         )?;
-        let unchunked_prefill_logits = last_token_logits(&model, &unchunked_hidden)?;
-        drop(unchunked_hidden);
+        report_layer_state_pair(
+            &model,
+            "diagnostic layer 0 Triton unchunked vs chunked",
+            &triton_unchunked_state,
+            &triton_chunked_state,
+            0,
+        )?;
+        report_layer_state_pair(
+            &model,
+            "diagnostic layer 0 chunked Triton vs FlashInfer",
+            &triton_chunked_state,
+            &chunked_state,
+            0,
+        )?;
+        report_layer_state_pair(
+            &model,
+            "diagnostic layer 0 unchunked Triton vs FlashInfer",
+            &triton_unchunked_state,
+            &unchunked_state,
+            0,
+        )?;
 
         assert_eq!(chunked_state.seq_len, 128);
         assert_eq!(unchunked_state.seq_len, 128);
