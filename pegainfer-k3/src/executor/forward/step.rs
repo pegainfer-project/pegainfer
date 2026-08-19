@@ -175,16 +175,19 @@ pub(crate) enum K3StepMode<'a> {
 }
 
 /// Where a step deposits the aux hidden states the DSpark draft lane feeds
-/// on: after each tap layer, rows `0..rows` of the post-layer residual are
-/// copied into their column segment of `slab` (`[capacity, taps.len() *
-/// hidden]`, tap order = column order). Pure extra dtod traffic — nothing in
-/// the step reads it back.
+/// on: for each tap layer `t`, rows `0..rows` of the pre-norm snapshot
+/// mixture read at the top of layer `t + 1` (what SGLang's
+/// `_dspark_capture_stream` distilled — with the attn-res bank, K3's "stream
+/// value after layer t" is the mixture its next consumer computes, not the
+/// raw residual) are copied into their column segment of `slab`
+/// (`[capacity, taps.len() * hidden]`, tap order = column order). Pure extra
+/// dtod traffic — nothing in the step reads it back.
 pub(crate) struct K3AuxSink<'a> {
     pub(crate) slab: &'a mut CudaSlice<bf16>,
     /// Leading step rows to capture (a chunk's live tokens, a verify step's
     /// packed rows).
     pub(crate) rows: usize,
-    /// 0-based layer indices whose post-layer residual is captured.
+    /// 0-based tap layer indices; tap `t` is captured at the top of `t + 1`.
     pub(crate) taps: &'a [usize],
 }
 
@@ -234,6 +237,25 @@ pub(super) fn k3_step(
             )?;
         } else {
             copy_rows(ctx, &scratch.prefix, &mut scratch.mixed, b * K3_HIDDEN)?;
+        }
+        // DSpark aux capture. The checkpoint was distilled from SGLang's
+        // capture points, and with K3's attn-res bank those are NOT the raw
+        // residual stream: tap layer `t` captures the pre-norm snapshot
+        // mixture layer `t+1`'s attention consumes (`_dspark_capture_stream`
+        // / `aggregate_stream` upstream) — exactly `scratch.mixed` here.
+        if index > 0
+            && let Some(sink) = aux.as_mut()
+            && let Some(tap) = sink.taps.iter().position(|&t| t + 1 == index)
+        {
+            copy_hidden_rows_raw_into(
+                ctx,
+                &scratch.mixed,
+                K3_HIDDEN,
+                sink.slab,
+                sink.taps.len() * K3_HIDDEN,
+                tap * K3_HIDDEN,
+                sink.rows,
+            )?;
         }
         if geometry.snapshot {
             // `blk[:, nb_in, :] = ps` — the snapshot the later mixes see.
@@ -389,18 +411,32 @@ pub(super) fn k3_step(
             &mut scratch.hidden,
         )?;
 
-        if let Some(sink) = aux.as_mut()
-            && let Some(tap) = sink.taps.iter().position(|&t| t == index)
+        // Debug-only escape hatch while the acceptance investigation is open:
+        // dump each layer's exit hidden to
+        // `$PEGAINFER_K3_LAYER_DUMP[.dec].L<layer>.<pid>` (raw bf16, live rows).
+        if matches!(mode, K3StepMode::PrefillChunk | K3StepMode::Decode)
+            && let Ok(mut dump_path) = std::env::var("PEGAINFER_K3_LAYER_DUMP")
         {
-            copy_hidden_rows_raw_into(
-                ctx,
-                &scratch.hidden,
-                K3_HIDDEN,
-                sink.slab,
-                sink.taps.len() * K3_HIDDEN,
-                tap * K3_HIDDEN,
-                sink.rows,
-            )?;
+            if matches!(mode, K3StepMode::Decode) {
+                dump_path.push_str(".dec");
+            }
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let rows = shape.live_rows;
+            if rows > 0
+                && CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    < crate::config::K3_LAYERS * 4096
+            {
+                let view = scratch.hidden.slice(..rows * K3_HIDDEN);
+                let host: Vec<bf16> = ctx.stream.clone_dtoh(&view)?;
+                ctx.sync()?;
+                let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(format!("{dump_path}.L{index:02}.{}", std::process::id()))?
+                    .write_all(&bytes)?;
+            }
         }
     }
 

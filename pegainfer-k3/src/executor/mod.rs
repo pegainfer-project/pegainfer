@@ -268,6 +268,12 @@ impl K3ExecutorConfig {
         {
             self.max_ctx = tokens;
         }
+        if let Ok(raw) = std::env::var("PEGAINFER_K3_CHUNK_TOKENS")
+            && let Ok(tokens) = raw.parse::<usize>()
+            && tokens > 0
+        {
+            self.chunk_tokens = tokens;
+        }
         self
     }
 
@@ -899,9 +905,15 @@ impl K3Executor {
         let model = K3DsparkModel::load(&self.ctx, path, self.max_ctx)
             .with_context(|| format!("loading the K3 dspark drafter from {}", path.display()))?;
         let num_layers = self.model.layers.len();
+        // A tap's feature is the snapshot mixture read at the TOP of layer
+        // `tap + 1`, so every tap needs a successor layer inside the walk.
+        ensure!(
+            num_layers >= 2,
+            "K3 dspark aux capture needs at least 2 layers (got {num_layers})"
+        );
         let taps: Vec<usize> = K3_DSPARK_AUX_LAYERS
             .iter()
-            .map(|&layer| layer.min(num_layers - 1))
+            .map(|&layer| layer.min(num_layers - 2))
             .collect();
         if taps.as_slice() != K3_DSPARK_AUX_LAYERS.as_slice() {
             warn!(
@@ -1321,6 +1333,20 @@ impl K3Executor {
                 .enumerate()
                 .take_while(|(index, draft)| sampled[anchor_row + index] as u32 == **draft)
                 .count();
+            // Debug-only acceptance trace while the investigation is open.
+            if std::env::var("PEGAINFER_K3_SPEC_TRACE").is_ok() {
+                let span: Vec<i32> = sampled[anchor_row..anchor_row + group.spec_rows].to_vec();
+                eprintln!(
+                    "[spec-trace] rank={} slot={} pos={} anchor={} drafts={:?} sampled={:?} accepted={}",
+                    self.model.rank,
+                    entry.slot,
+                    self.decode_state.positions[entry.slot],
+                    entry.anchor,
+                    entry.drafts,
+                    span,
+                    accepted,
+                );
+            }
             let committed: Vec<u32> = (0..=accepted)
                 .map(|index| sampled[anchor_row + index] as u32)
                 .collect();
