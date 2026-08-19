@@ -836,6 +836,41 @@ fn send_rejection_reports_kv_lifetime_request_tokens() {
 }
 
 #[test]
+fn echo_request_is_rejected_before_backend_admission() {
+    let (echo_tx, mut echo_rx) = TokenSink::standalone();
+    let (regular_tx, mut regular_rx) = TokenSink::standalone();
+    let mut echo = test_request_with_shape("unsupported-echo", echo_tx, vec![1, 2, 3], 4);
+    echo.echo = true;
+    let regular = test_request("regular", regular_tx);
+    let mut pending = vec![echo, regular];
+
+    reject_unsupported_echo(&mut pending);
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].request_id.as_deref(), Some("regular"));
+    assert!(
+        !pending[0].echo,
+        "only requests eligible for backend admission may remain"
+    );
+    match echo_rx.blocking_recv().map(|(_, event)| event) {
+        Some(TokenEvent::Rejected {
+            message,
+            prompt_tokens,
+            completion_tokens,
+        }) => {
+            assert_eq!(message, UNSUPPORTED_ECHO_MESSAGE);
+            assert_eq!(prompt_tokens, 3);
+            assert_eq!(completion_tokens, 0);
+        }
+        event => panic!("expected unsupported echo rejection, got {event:?}"),
+    }
+    assert!(matches!(
+        regular_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn inflight_prefill_waits_instead_of_parking_after_last_decode_retires() {
     assert!(
         !should_block_on_submit(true, true),

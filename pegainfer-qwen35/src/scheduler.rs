@@ -1360,6 +1360,22 @@ where
     Ok(())
 }
 
+const UNSUPPORTED_ECHO_MESSAGE: &str = "echo=true is unsupported by the Qwen3.5 serving contract";
+
+fn reject_unsupported_echo(pending: &mut Vec<SchedulerRequest>) {
+    pending.retain(|req| {
+        if !req.echo {
+            return true;
+        }
+        let _ = req.token_tx.send(TokenEvent::Rejected {
+            message: UNSUPPORTED_ECHO_MESSAGE.to_string(),
+            prompt_tokens: req.prompt_tokens.len(),
+            completion_tokens: 0,
+        });
+        false
+    });
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn scheduler_loop(
     mut backend: SchedulerBackend,
@@ -1450,6 +1466,7 @@ fn scheduler_loop(
             );
             return;
         }
+        reject_unsupported_echo(&mut pending);
 
         // 3. Publish the settled post-prune state. Requests accepted from the
         // channel are waiting until admission below; closed requests never
@@ -1499,6 +1516,7 @@ fn scheduler_loop(
                 );
                 return;
             }
+            reject_unsupported_echo(&mut pending);
             publish_load(&load_tx, &backend, &active, &prefilling, 0, pending.len());
             if pending.is_empty() {
                 continue;
@@ -2373,14 +2391,6 @@ fn promote_or_requeue(
         let artifact = artifacts.final_artifact(i);
         let first_token = artifact.token;
         let logprob = artifact.logprob;
-
-        if req.echo {
-            let echo_logprobs = vec![None; req.prompt_tokens.len()];
-            let _ = req.token_tx.send(TokenEvent::PromptTokens {
-                ids: req.prompt_tokens.clone(),
-                logprobs: echo_logprobs,
-            });
-        }
 
         if !req.params.ignore_eos && backend.is_stop_token(first_token) {
             debug!(

@@ -15,6 +15,7 @@ Out of scope for this file:
 - local machine paths, NCCL symlink details, and temporary environment setup
 - raw command transcripts unless they are part of retained evidence
 - benchmark/performance claims
+- prompt echo support; Qwen3.5 accepts completion-only requests
 
 ## Phase 1 Outcome
 
@@ -371,6 +372,29 @@ The exact client/server revisions, build and run commands, request counts,
 concurrency, prompt/output lengths, per-turn history evidence, pass criteria,
 limitations, and raw JSON results are published in
 [`docs/benchmarks/qwen35-tp2-phase2a-multiturn.md`](../../benchmarks/qwen35-tp2-phase2a-multiturn.md).
+
+#### Serving scope: prompt echo is unsupported
+
+Qwen3.5 serving does not support `echo=true`. Both the legacy and stepped vLLM
+bridges submit `echo: false`, so prompt echo has never been part of the current
+HTTP serving contract. Direct engine callers can still construct the shared
+request type with `echo=true`; the Qwen3.5 scheduler now rejects those requests
+immediately after queue drain and cancellation pruning, before load accounting,
+capacity admission, backend-state allocation, or TP command dispatch.
+
+Qwen3.5 no longer emits `TokenEvent::PromptTokens` after prefill. The shared
+event variant remains in `pegainfer-frontend` because other model lines still
+use it, but it is sealed off from the Qwen3.5 scheduler path. A focused release
+test requires a `Rejected` event with the original prompt length and proves the
+request is absent from the vector eligible for backend admission.
+
+Verification on the local SM86 environment passed:
+
+- focused unsupported-echo release test: `1 passed`;
+- complete Qwen3.5 release library suite: `95 passed`, `0 failed`, `7 ignored`;
+- all retained real TP2 executor/scheduler gates on two RTX 3090 GPUs:
+  `7 passed`, `0 failed`;
+- release Clippy with `-D warnings` and formatting checks passed.
 
 Delivered constraints:
 
