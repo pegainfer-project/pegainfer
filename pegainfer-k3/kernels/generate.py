@@ -6,10 +6,9 @@ decode kernel set:
 
     k3_rms_norm_rbs_batched.cu      k3_conv_silu_batched.cu
     k3_land_batched.cu              k3_kda_core_batched.cu
-    k3_land_rms_norm_rbs_batched.cu k3_router_topk_batched.cu
-    k3_add2_batched.cu              k3_attnres_scores_batched.cu
-    k3_mul_sigmoid_batched.cu       k3_attnres_mix_batched.cu
-    k3_situ_batched.cu
+    k3_land_rms_norm_rbs_batched.cu k3_attnres_scores_batched.cu
+    k3_add2_batched.cu              k3_attnres_mix_batched.cu
+    k3_mul_sigmoid_batched.cu       k3_situ_batched.cu
 
 The batch size is a static compile-time dimension, so a single-stream step is
 served by the `B = 1` instantiation of the same family — its per-row spelling
@@ -229,11 +228,6 @@ KDA_CORE_PARAMS = (
 O_NORM_GATE_PARAMS = (
     f"(const {BF16}* __restrict__ G2, const float* __restrict__ Go, "
     f"{BF16}* __restrict__ Out, const {BF16}* __restrict__ X)"
-)
-ROUTER_PARAMS = (
-    "(const float* __restrict__ Bias, int* __restrict__ Idx, "
-    f"const {BF16}* __restrict__ Rs, const float* __restrict__ S, "
-    "float* __restrict__ Wts)"
 )
 SCORES_PARAMS = (
     f"(const {BF16}* __restrict__ Bl, const {BF16}* __restrict__ Ps, "
@@ -923,49 +917,6 @@ def plan_o_norm_gate() -> Plan:
     )
 
 
-def plan_router_topk() -> Plan:
-    insts = []
-    for experts in EXPERTS:
-        for batch in B_CHUNK_BUCKETS:
-            insts.append(Inst(
-                family="router_topk",
-                order=len(insts),
-                label=f"router_topk_batched E={experts} B={batch}",
-                factory="router_topk_batched",
-                args=(experts, TOPK, batch, THREADS),
-                num_params=5,
-                params=ROUTER_PARAMS,
-                symbol=f"k3_router_topk_b{batch}_e{experts}_topk{TOPK}_kernel",
-                grid=(batch,),
-                threads=THREADS,
-                guard=f"b == {batch} && num_experts == {experts} && topk == {TOPK}",
-                call_args=("Bias", "Idx", _bf16("Rs"), "S", "Wts"),
-            ))
-    return Plan(
-        stem=_STEM.format("router_topk"),
-        signature=(
-            "k3_router_topk_batched(\n"
-            "    const float* S,\n"
-            "    const float* Bias,\n"
-            "    const void* Rs,\n"
-            "    int* Idx,\n"
-            "    float* Wts,\n"
-            "    int b,\n"
-            "    int num_experts,\n"
-            "    int topk,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=(
-            "// Sigmoid router plus biased top-k over already-merged f32 score rows,\n"
-            "// one row per block. The selection is a serial O(topk * num_experts)\n"
-            "// scan by thread 0 with a lowest-index tie-break; the weights are\n"
-            "// gathered from the un-biased scores, the denominator carries the\n"
-            "// +1e-20 guard, and the result is scaled by the bf16 routed scale Rs."
-        ),
-        insts=tuple(insts),
-    )
-
-
 def plan_attnres_scores() -> Plan:
     insts = []
     for blocks in ATTNRES_NB:
@@ -1057,7 +1008,6 @@ PLANNERS = [
     plan_conv_silu,
     plan_kda_core,
     plan_o_norm_gate,
-    plan_router_topk,
     plan_attnres_scores,
     plan_attnres_mix,
 ]

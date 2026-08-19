@@ -3,11 +3,13 @@
 //!
 //! The set covers one whole K3 decode step that is not a GEMM or attention —
 //! norms and the bf16 landings of the framework GEMMs, the KDA convolution and
-//! delta rule, the MoE router and expert combine, the situ activation and the
+//! delta rule, the expert combine, the situ activation and the
 //! attention-residual mix. Dense projections are served by cuBLASLt, the
-//! routed experts by the DeepGEMM masked grouped-GEMM chain, and MLA decode by
-//! the hand-written absorbed paged kernel (`ops::k3::mla_paged`), so neither a
-//! GEMV nor an attention family lives here. The wrappers keep the certified kernels' operand names, so an
+//! routed experts by the DeepGEMM masked grouped-GEMM chain, MLA decode by
+//! the hand-written absorbed paged kernel (`ops::k3::mla_paged`), and the MoE
+//! router top-k by the hand-written parallel-argmax kernel
+//! (`ops::k3::router_topk`), so neither a GEMV nor an attention family lives
+//! here. The wrappers keep the certified kernels' operand names, so an
 //! executor written against them reads like the Python engine's launch
 //! sequence.
 //!
@@ -581,66 +583,6 @@ pub fn k3_o_norm_gate_batched_launch(
     check(
         rc,
         &format!("K3 o_norm_gate_batched (B={b}, KH={num_heads}, KD={head_dim})"),
-    )
-}
-
-/// Sigmoid router plus biased top-k over already-merged f32 score rows.
-///
-/// The weights come from the *un-biased* scores, are normalized with a
-/// `+1e-20` guard and scaled by the bf16 routed scale `rs`. Ties break to the
-/// lowest expert index.
-#[allow(clippy::too_many_arguments)]
-pub fn k3_router_topk_batched_launch(
-    ctx: &DeviceContext,
-    b: usize,
-    num_experts: usize,
-    topk: usize,
-    s: &CudaSlice<f32>,
-    bias: &CudaSlice<f32>,
-    rs: &CudaSlice<bf16>,
-    idx: &mut CudaSlice<i32>,
-    wts: &mut CudaSlice<f32>,
-) -> Result<()> {
-    check_bucket(b)?;
-    ensure!(
-        topk <= num_experts,
-        "K3 router topk={topk} exceeds the expert count {num_experts}"
-    );
-    ensure!(
-        s.len() >= b * num_experts
-            && bias.len() >= num_experts
-            && !rs.is_empty()
-            && idx.len() >= b * topk
-            && wts.len() >= b * topk,
-        "K3 router buffers too small for b={b}, experts={num_experts}, topk={topk}: \
-         s {}, bias {}, rs {}, idx {}, wts {}",
-        s.len(),
-        bias.len(),
-        rs.len(),
-        idx.len(),
-        wts.len()
-    );
-    let (s_ptr, _s_guard) = s.device_ptr(&ctx.stream);
-    let (bias_ptr, _bias_guard) = bias.device_ptr(&ctx.stream);
-    let (rs_ptr, _rs_guard) = rs.device_ptr(&ctx.stream);
-    let (idx_ptr, _idx_guard) = idx.device_ptr_mut(&ctx.stream);
-    let (wts_ptr, _wts_guard) = wts.device_ptr_mut(&ctx.stream);
-    let rc = unsafe {
-        ffi::k3_router_topk_batched(
-            s_ptr as *const f32,
-            bias_ptr as *const f32,
-            rs_ptr as *const c_void,
-            idx_ptr as *mut i32,
-            wts_ptr as *mut f32,
-            b as i32,
-            num_experts as i32,
-            topk as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    check(
-        rc,
-        &format!("K3 router_topk_batched (B={b}, E={num_experts}, TOPK={topk})"),
     )
 }
 

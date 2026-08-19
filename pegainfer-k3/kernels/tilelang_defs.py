@@ -1,7 +1,7 @@
 """Vendored TileLang kernel definitions for the K3 batched decode step.
 
 This file is a **verbatim** subset of the certified upstream kernel module: the
-shared prologue and the eleven batched kernel factories, copied character for
+shared prologue and the ten batched kernel factories, copied character for
 character. Nothing here is re-spelled, re-indented or "cleaned up", and no
 kernel body is edited to fit this repository. The upstream module is the
 authority on what these kernels compute; it carries the bitwise parity gates
@@ -63,58 +63,6 @@ def _compile(prim):
 # B is a static compile-time dimension: serving goes through lru_cache per
 # batch bucket, one compile per bucket.
 # --------------------------------------------------------------------------- #
-
-
-@lru_cache(maxsize=None)
-def router_topk_batched(E: int, TOPK: int, B: int, threads: int = 256):
-    """Batched version of ``router_topk``. The input S (B, E) holds **f32
-    score rows** (output of the framework-side f32 GEMM -- the authored
-    spelling already casts to f32 before the matmul; the ascending f32 merge
-    over the SK segments in the bs=1 version is equivalent to the row being
-    merged upstream). One row per block; sigmoid, bias add, serial top-k
-    selection, un-biased gather, and normalization times routed_scale are
-    word-for-word identical to the bs=1 version (lowest-index tie-break, Bias
-    taken in f32)."""
-    EP = ((E + threads - 1) // threads) * threads
-
-    @T.prim_func
-    def main(
-        S: T.Tensor((B, E), ACC),
-        Bias: T.Tensor((E,), ACC),
-        Rs: T.Tensor((1,), DT),
-        Idx: T.Tensor((B, TOPK), "int32"),
-        Wts: T.Tensor((B, TOPK), ACC),
-    ):
-        with T.Kernel(B, threads=threads) as bb:
-            scores = T.alloc_shared((E,), ACC)
-            biased = T.alloc_shared((E,), ACC)
-            best = T.alloc_var(ACC)
-            bi = T.alloc_var("int32")
-            den = T.alloc_var(ACC)
-            for e in T.Parallel(EP):
-                with T.If(e < E):
-                    with T.Then():
-                        scores[e] = T.sigmoid(S[bb, e])
-                        biased[e] = T.sigmoid(S[bb, e]) + Bias[e].astype(ACC)
-            T.sync_threads()
-            if T.get_thread_binding() == 0:
-                den = 0.0
-                for t in T.serial(TOPK):
-                    best = NEG
-                    bi = 0
-                    for e in T.serial(E):
-                        with T.If(biased[e] > best):
-                            with T.Then():
-                                best = biased[e]
-                                bi = e
-                    Idx[bb, t] = bi
-                    Wts[bb, t] = scores[bi]
-                    biased[bi] = NEG
-                    den += scores[bi]
-                for t in T.serial(TOPK):
-                    Wts[bb, t] = Wts[bb, t] / (den + 1e-20) * Rs[0].astype(ACC)
-
-    return _compile(main)
 
 
 @lru_cache(maxsize=None)

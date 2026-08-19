@@ -1536,10 +1536,6 @@ const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
         "const void*, const void*, const float*, void*, int, int, int",
     ),
     (
-        "k3_router_topk_batched",
-        "const float*, const float*, const void*, int*, float*, int, int, int",
-    ),
-    (
         "k3_attnres_scores_batched",
         "const void*, const void*, const float*, float*, int, int, int",
     ),

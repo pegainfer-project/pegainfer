@@ -9,6 +9,8 @@
 //!
 //! See `csrc/k3/k3_deepgemm_fp8_fp4_grouped_sm100.cu`.
 
+use core::ffi::c_void;
+
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
 
@@ -150,6 +152,24 @@ unsafe extern "C" {
         num_heads: i32,
         qk_dim: i32,
         v_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Sigmoid router plus biased top-k over merged f32 score rows
+    /// (`csrc/k3/k3_router_topk.cu`): `s [b, num_experts]` f32,
+    /// `bias [num_experts]` f32, the bf16 routed scale `rs [1]`; writes
+    /// `idx [b, topk]` i32 and `wts [b, topk]` f32. Block-parallel argmax
+    /// with the serial kernel's lowest-index tie-break; shapes are runtime
+    /// values (no per-bucket instantiation).
+    pub fn k3_router_topk_cuda(
+        s: *const f32,
+        bias: *const f32,
+        rs: *const c_void,
+        idx: *mut i32,
+        wts: *mut f32,
+        b: i32,
+        num_experts: i32,
+        topk: i32,
         stream: CUstream,
     ) -> CUresult;
 

@@ -151,21 +151,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    /// Sigmoid router plus biased top-k over merged f32 score rows
-    /// `S [b, num_experts]`, with `Bias [num_experts]` f32 and the bf16 routed
-    /// scale `Rs [1]`. Writes `Idx [b, topk]` i32 and `Wts [b, topk]` f32.
-    pub fn k3_router_topk_batched(
-        s: *const f32,
-        bias: *const f32,
-        rs: *const c_void,
-        idx: *mut i32,
-        wts: *mut f32,
-        b: i32,
-        num_experts: i32,
-        topk: i32,
-        stream: CUstream,
-    ) -> i32;
-
     /// Attention-residual candidate scoring: weightless RMS normalization then
     /// a dot with the fused f32 scoring vector `Sw [h]`. `Ps [b, h]` is the
     /// running prefix sum, `Bl [b, blocks, h]` that row's snapshot history;
