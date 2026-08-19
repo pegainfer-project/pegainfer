@@ -25,29 +25,31 @@
 // are W_UK[h], rows [h*256+128, h*256+256) are W_UV[h].
 //
 // ---------------------------------------------------------------------------
-// Rounding chain (each landing deliberate; 1-2 mirror every projection's
-// f32-matmul-then-one-bf16-landing, 3-6 are the certified slot-indexed
-// kernel's spelling)
+// Schedule: two passes, warp-cooperative scores
 // ---------------------------------------------------------------------------
-//   1. q_abs[0..512)  = bf16(f32 sum_d q_nope[d] * W_UK[d, j]), d ascending;
-//      q_abs[512..576) = q_rope, copied bf16.
-//   2. dot(t) = f32 sum_d q_abs[d] * c_t[d] over 576, d ascending, one thread.
-//   3. scl(t) = f32( bf16(dot) * scale ), the product taken in bf16.
-//   4. m = max_t scl;  tot = sum_t exp(scl - m) in f32 (per-thread strided
-//      partials in ascending t, then a fixed-order tree reduction).
-//   5. p_t = bf16( exp(scl - m) / tot ).
-//   6. o_lat[j] = bf16( f32 sum_t p_t * c_t[j] ), t ascending (chunk-major).
-//   7. o[dv] = bf16( f32 sum_j W_UV[dv, j] * o_lat[j] ), j ascending.
+// The context is walked twice, page by page. Pass one computes each page's
+// landed scores (a warp per token, lanes striding the 576 dims with paired
+// bf16 loads, then the retired kernel's `bf16(dot) * scale` landing — which
+// also absorbs the shuffle tree's f32 summation-order noise) and folds them
+// into a running max and an online softmax denominator. Pass two recomputes
+// the landed scores (bit-identical by construction), quantizes the
+// normalized probabilities to bf16 — the retired kernel's spelling, kept so
+// the whole probability chain stays inside the fixtures' calibrated noise
+// floor — and accumulates the attended latent in f32, tokens ascending.
+// Versus the retired kernel this trades its three serial-per-token score
+// sweeps for two warp-cooperative ones and drops nothing else.
 //
-// The context walk is three sweeps over the pages (max, sum, probs+attend):
-// scores are recomputed rather than stored, so nothing is sized by the context
-// length and there is no compile-time cap. A recomputed score is the same
-// expression over the same operands in the same order, hence bit-identical.
-// The walk is by *logical* position — the block table only selects which
-// physical page backs a 64-token window — so any permutation of physical
-// pages produces bit-identical output. A page id below zero (padding rows)
-// reads as a zero latent row, which is what the retired slot-indexed kernel's
-// zeroed cache produced.
+// Determinism (the property the verify gates require — NOT bit-compat with
+// the retired three-sweep spelling): every reduction has a fixed order (lane
+// shuffle trees, warp partials folded in ascending warp order, pages walked
+// ascending, tokens ascending within a page), so a launch at the same
+// geometry over the same operands is bit-identical run to run. The walk is by
+// *logical* position — the block table only selects which physical page backs
+// a 64-token window — so any permutation of physical pages produces
+// bit-identical output. A page id below zero (padding rows) reads as a zero
+// latent row: its score is exactly 0.0f (participating in the softmax like
+// the zeroed-cache rows of the retired slot-indexed kernel) and it
+// contributes nothing to the attended latent.
 //
 // CUDA-graph safety: no allocation, no host readback, no device-side launch;
 // launch geometry is (b, heads) with everything else read from device tensors.
@@ -103,24 +105,6 @@ __device__ __forceinline__ float block_sum(float value, float* stage) {
   return out;
 }
 
-// Landed score of logical position `s`: chain steps 2-3. Deterministic in the
-// operands alone, so the three sweeps recompute it bit-identically.
-__device__ __forceinline__ float position_score(
-    const __nv_bfloat16* __restrict__ q_abs,
-    const __nv_bfloat16* __restrict__ cache, const int* __restrict__ bt,
-    long long page_stride, int s, __nv_bfloat16 sc) {
-  const int page = bt[s / kPageTokens];
-  float acc = 0.0f;
-  if (page >= 0) {
-    const __nv_bfloat16* c = cache + (long long)page * page_stride +
-                             (long long)(s % kPageTokens) * kRow;
-    for (int d = 0; d < kRow; ++d) {
-      acc += __bfloat162float(q_abs[d]) * __bfloat162float(c[d]);
-    }
-  }
-  return __bfloat162float(__hmul(__float2bfloat16_rn(acc), sc));
-}
-
 __global__ void mla_paged_absorbed_attn_kernel(
     const __nv_bfloat16* __restrict__ q,        // [b, heads * 192]
     const __nv_bfloat16* __restrict__ w_kv_b,   // [heads * 256, 512]
@@ -135,18 +119,20 @@ __global__ void mla_paged_absorbed_attn_kernel(
   const int bh = blockIdx.y;
   const int heads = gridDim.y;
   const int tid = threadIdx.x;
+  const int warp = tid / WARP_SIZE;
+  const int lane = tid & (WARP_SIZE - 1);
   const int ctx = n[bb];
   const __nv_bfloat16* qh =
       q + ((size_t)bb * heads + bh) * (size_t)(kNope + kRope);
   const int* bt = table + (size_t)bb * max_pages;
   const __nv_bfloat16 sc = scale[0];
 
-  __shared__ __nv_bfloat16 q_abs[kRow];
-  __shared__ __nv_bfloat16 probs[kPageTokens];
-  __shared__ __nv_bfloat16 o_lat[kLatent];
+  __shared__ alignas(8) __nv_bfloat16 q_abs[kRow];
+  __shared__ float scores[kPageTokens];
   __shared__ float stage[kWarps];
 
-  // Chain step 1: the absorbed query.
+  // The absorbed query: q_abs = [W_UK[h]^T q_nope | q_rope], f32 accumulate,
+  // one bf16 landing (mirroring every projection's landing discipline).
   const __nv_bfloat16* w_uk = w_kv_b + (size_t)bh * 2 * kVd * kLatent;
   for (int j = tid; j < kLatent; j += kThreads) {
     float acc = 0.0f;
@@ -160,55 +146,102 @@ __global__ void mla_paged_absorbed_attn_kernel(
   }
   __syncthreads();
 
-  // Sweep 1 (chain step 4a): the score maximum.
-  float local = kNeg;
-  for (int s = tid; s < ctx; s += kThreads) {
-    local = fmaxf(local, position_score(q_abs, cache, bt, page_stride, s, sc));
-  }
-  const float mx = block_max(local, stage);
-
-  // Sweep 2 (chain step 4b): the softmax denominator.
-  local = 0.0f;
-  for (int s = tid; s < ctx; s += kThreads) {
-    local += expf(position_score(q_abs, cache, bt, page_stride, s, sc) - mx);
-  }
-  const float tot = block_sum(local, stage);
-
-  // Sweep 3 (chain steps 5-6): bf16 probs per page chunk, then the latent
-  // accumulation, each thread owning kDimsPerThread strided latent dims.
-  float oacc[kDimsPerThread];
-  for (int i = 0; i < kDimsPerThread; ++i) oacc[i] = 0.0f;
+  const __nv_bfloat162* q2 = reinterpret_cast<const __nv_bfloat162*>(q_abs);
   const int chunks = (ctx + kPageTokens - 1) / kPageTokens;
+
+  // A page of landed scores: a warp per token (warps stride the page), lanes
+  // stride the 576 dims in bf16 pairs, one fixed-order shuffle tree per token,
+  // then the retired kernel's landing — bf16(dot) scaled in bf16. The landing
+  // also absorbs the shuffle tree's f32 summation-order noise, and it makes
+  // the recompute in the attend pass bit-identical to the stats pass.
+  auto page_scores = [&](const __nv_bfloat16* cpage, int len) {
+    for (int t = warp; t < len; t += kWarps) {
+      float acc = 0.0f;
+      if (cpage != nullptr) {
+        const __nv_bfloat162* c2 = reinterpret_cast<const __nv_bfloat162*>(
+            cpage + (size_t)t * kRow);
+        for (int d = lane; d < kRow / 2; d += WARP_SIZE) {
+          const float2 cf = __bfloat1622float2(c2[d]);
+          const float2 qf = __bfloat1622float2(q2[d]);
+          acc += qf.x * cf.x + qf.y * cf.y;
+        }
+        acc = warp_reduce_sum(acc);
+      }
+      if (lane == 0) {
+        scores[t] = __bfloat162float(__hmul(__float2bfloat16_rn(acc), sc));
+      }
+    }
+  };
+
+  // Stats pass: the running score maximum and, online against it, the
+  // softmax denominator. The max over landed scores is order-free, so it is
+  // exactly the retired kernel's; the denominator differs from a flat
+  // ascending-t sum only in f32 summation order — noise the bf16 prob
+  // landing below absorbs.
+  float m_run = kNeg;
+  float l_run = 0.0f;
   for (int chunk = 0; chunk < chunks; ++chunk) {
     const int base = chunk * kPageTokens;
     const int len = min(kPageTokens, ctx - base);
     const int page = bt[chunk];
-    __syncthreads();  // probs from the previous chunk are consumed
-    if (tid < len) {
-      const float scl =
-          position_score(q_abs, cache, bt, page_stride, base + tid, sc);
-      probs[tid] = __float2bfloat16_rn(expf(scl - mx) / tot);
+    const __nv_bfloat16* cpage =
+        page >= 0 ? cache + (long long)page * page_stride : nullptr;
+    __syncthreads();  // scores consumed by the previous chunk's reductions
+    page_scores(cpage, len);
+    __syncthreads();
+    float local = kNeg;
+    for (int t = tid; t < len; t += kThreads) local = fmaxf(local, scores[t]);
+    const float page_max = block_max(local, stage);
+    const float m_new = fmaxf(m_run, page_max);
+    local = 0.0f;
+    for (int t = tid; t < len; t += kThreads) {
+      local += expf(scores[t] - m_new);
+    }
+    const float page_sum = block_sum(local, stage);
+    l_run = l_run * expf(m_run - m_new) + page_sum;  // exp(-1e30)==0 on entry
+    m_run = m_new;
+  }
+
+  // Attend pass: recompute each page's landed scores (bit-identical by
+  // construction), take the retired kernel's bf16 probabilities against the
+  // final max/denominator, and accumulate the latent row — threads own
+  // kDimsPerThread strided latent dims, tokens ascending.
+  float oacc[kDimsPerThread];
+  for (int i = 0; i < kDimsPerThread; ++i) oacc[i] = 0.0f;
+  for (int chunk = 0; chunk < chunks; ++chunk) {
+    const int base = chunk * kPageTokens;
+    const int len = min(kPageTokens, ctx - base);
+    const int page = bt[chunk];
+    const __nv_bfloat16* cpage =
+        page >= 0 ? cache + (long long)page * page_stride : nullptr;
+    __syncthreads();  // scores consumed by the previous chunk's attend
+    page_scores(cpage, len);
+    __syncthreads();
+    for (int t = tid; t < len; t += kThreads) {
+      scores[t] = __bfloat162float(
+          __float2bfloat16_rn(expf(scores[t] - m_run) / l_run));
     }
     __syncthreads();
-    if (page >= 0) {
-      const __nv_bfloat16* cpage = cache + (long long)page * page_stride;
+    if (cpage != nullptr) {
       for (int i = 0; i < kDimsPerThread; ++i) {
         const int j = i * kThreads + tid;
         float acc = oacc[i];
         for (int t = 0; t < len; ++t) {
-          acc += __bfloat162float(probs[t]) *
-                 __bfloat162float(cpage[(size_t)t * kRow + j]);
+          acc += scores[t] * __bfloat162float(cpage[(size_t)t * kRow + j]);
         }
         oacc[i] = acc;
       }
     }
   }
+
+  // Land the attended latent row in bf16.
+  __shared__ __nv_bfloat16 o_lat[kLatent];
   for (int i = 0; i < kDimsPerThread; ++i) {
     o_lat[i * kThreads + tid] = __float2bfloat16_rn(oacc[i]);
   }
   __syncthreads();
 
-  // Chain step 7: the W_UV expansion, one value dim per thread.
+  // The W_UV expansion, one value dim per thread.
   const __nv_bfloat16* w_uv = w_kv_b + ((size_t)bh * 2 * kVd + kNope) * kLatent;
   const int dv = tid;  // kThreads == kVd
   float acc = 0.0f;
@@ -240,7 +273,8 @@ extern "C" {
 // device block table (`-1` = unmapped, read as zero latent), `n` the per-row
 // device context lengths — no host sync anywhere. Geometry is pinned: qk_dim
 // 192 (128 nope + 64 rope), v_dim 128, 96-head `w_kv_b` rows per head
-// `[128 nope | 128 value] x 512`.
+// `[128 nope | 128 value] x 512`. `layer_offset`/`page_stride` must be even
+// (the score loop reads the cached rows as bf16 pairs).
 CUresult k3_mla_paged_attn_cuda(const __nv_bfloat16* q,
                                 const __nv_bfloat16* w_kv_b,
                                 const __nv_bfloat16* cache,
@@ -253,7 +287,8 @@ CUresult k3_mla_paged_attn_cuda(const __nv_bfloat16* q,
   if (q == nullptr || w_kv_b == nullptr || cache == nullptr ||
       table == nullptr || n == nullptr || scale == nullptr || o == nullptr ||
       b <= 0 || num_heads <= 0 || qk_dim != kNope + kRope || v_dim != kVd ||
-      max_pages <= 0 || layer_offset < 0 || page_stride < kPageTokens * kRow) {
+      max_pages <= 0 || layer_offset < 0 || page_stride < kPageTokens * kRow ||
+      (layer_offset & 1) != 0 || (page_stride & 1) != 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   dim3 grid(b, num_heads);
