@@ -306,6 +306,35 @@ Verification:
 
 P2A does not shard GDR weights/state/scratch, add a post-GDR all-reduce, enable TP CUDA Graph, or claim a performance improvement. TP1's earlier real-weight evidence remains applicable, but a same-session full TP1 model E2E rerun is still resource-blocked by external GPU occupancy.
 
+#### Merge-gate test surface
+
+The pre-merge review reduced P2A coverage to distributed behavior that cannot be
+established by restating local helpers. Removed tests enumerated start-gate
+booleans, planner choices, CUDA-ordinal bounds, unified-plan shapes, reply
+variants, artifact-alignment variants, snapshot-collector variants, and basic
+TP2 startup/prefill/chunk/decode smoke already exercised by higher-level gates.
+
+The retained P2A library surface is seven real TP2 gates:
+
+- partial dispatch cancels the delivered prefix before rank-local mutation;
+- rank-local lifecycle divergence is detected and poisons the replica;
+- a disconnected worker receiver fails closed;
+- executor and scheduler mixed prefill/decode both complete;
+- drop-all restores complete request capacity;
+- re-admission under a fresh `RequestId` reproduces the clean first-token artifact.
+
+Completion cleanup and terminal error fan-out remain covered by the focused
+scheduler lifecycle tests. The production-facing regression ladder remains the
+TP2 scheduler E2E, short/long HF logits gates, and OpenAI-compatible HTTP
+serving lifecycle test.
+
+On the local 2x RTX 3090 SM86 fixture, the complete explicit ignored run passed
+`11/11`: seven library gates, one scheduler E2E, two HF gates, and one HTTP gate.
+The regular release library suite passed `94` tests with those seven real TP2
+tests ignored by default. The HF results remained within the established
+tolerances: short sequential/batched mean deltas `0.0260`/`0.0267`, and long
+sequential mean delta `0.0228`.
+
 Delivered constraints:
 
 - Support mixed prefill+decode scheduler steps under TP.
