@@ -167,7 +167,7 @@ run_exact_gate \
 
 run_exact_gate \
   gate4-chunk-continuation \
-  prefill::tests::flashinfer_gdn_chunked_prefill_matches_unchunked_state \
+  prefill::tests::flashinfer_gdn_chunk_continuation_and_model_outputs_match \
   -p pegainfer-qwen35 --features qwen35 --lib
 
 run_exact_gate \
