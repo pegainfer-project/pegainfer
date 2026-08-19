@@ -50,10 +50,6 @@ name = "sampling_behavior"
 required-features = ["qwen35"]
 
 [[test]]
-name = "chunked_prefill"
-required-features = ["qwen35"]
-
-[[test]]
 name = "serving_tp2"
 required-features = ["qwen35"]
 
