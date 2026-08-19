@@ -11,12 +11,15 @@
 //! after 0-based layer `k`): the fc context rows are the target's residual
 //! captured AFTER 0-based layers `K3_DSPARK_AUX_LAYERS` — the ids as the
 //! config spells them, no off-by-one (unlike the vLLM-trained GLM5.2
-//! checkpoint). The block input is `[anchor, mask x 6]` and block position 0
-//! is the anchor, NOT a draft (anchor-drop) — drafts are read from block
-//! positions 1..=6, and the Markov loop starts at position 1 with
-//! `prev(1) = anchor`. The pending context always ends one row before the
-//! anchor: the anchor's own hidden is only captured when the anchor is fed
-//! to the target.
+//! checkpoint). The block input is `[anchor, mask x 6]` and draft `k` is
+//! sampled from block position `k`'s logits — position 0 (the anchor row)
+//! predicts the token right after the anchor, exactly like the reference
+//! `run_markov_block`; the Markov loop starts there with `prev(0) = anchor`.
+//! (Reading drafts from positions 1..=6 instead proposes every draft one
+//! position ahead of where verify compares it and collapses acceptance to
+//! ~0 — the bring-up bug.) The pending context always ends one row before
+//! the anchor: the anchor's own hidden is only captured when the anchor is
+//! fed to the target.
 //!
 //! The checkpoint carries NO `embed_tokens` or `lm_head` of its own — the
 //! block embedding and the draft logits reuse the target's matrices. The
@@ -445,6 +448,37 @@ impl K3DsparkModel {
 
         scratch.activate(block_rows)?;
 
+        // One-shot capture-diagnostics dump: raw pending context rows of the
+        // first propose, to `$PEGAINFER_K3_DSPARK_DUMP.<pid>` (bf16 rows of
+        // `[pending_len, 5 * 7168]` + a small text header). Debug-only escape
+        // hatch while the acceptance investigation is open.
+        if let Ok(dump_path) = std::env::var("PEGAINFER_K3_DSPARK_DUMP") {
+            static DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let state = &states[0];
+                let rows = state.pending_len;
+                let view = state.pending.data.slice(..rows * K3_DSPARK_CONTEXT_DIM);
+                let host: Vec<bf16> = ctx.stream.clone_dtoh(&view)?;
+                ctx.sync()?;
+                let path = format!("{dump_path}.{}", std::process::id());
+                let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(
+                    &path,
+                    [
+                        format!(
+                            "rows={rows} anchor={} pos={} committed={}\n",
+                            anchors[0].0, anchors[0].1, state.committed_len
+                        )
+                        .into_bytes(),
+                        bytes,
+                    ]
+                    .concat(),
+                )?;
+                eprintln!("K3 dspark dump: wrote {rows} pending rows to {path}");
+            }
+        }
+
         // Block token ids: [anchor, mask x 6] per request.
         scratch.block_token_ids_h[..block_rows].fill(DSPARK_MASK_TOKEN);
         for (i, &(anchor, _)) in anchors.iter().enumerate() {
@@ -643,8 +677,14 @@ impl K3DsparkModel {
             ctx.stream.memcpy_htod(&anchor_tokens, &mut prev)?;
         }
         // Fixed-orientation ping-pong between the two token buffers.
-        for step in 1..block {
-            let (prev, next): (&CudaSlice<u32>, &mut CudaSlice<u32>) = if step % 2 == 1 {
+        //
+        // Draft `k` reads block-row `k`'s logits: row 0 is the anchor row and
+        // its logits predict the token right after the anchor — the reference
+        // `run_markov_block` starts at row 0, and starting at row 1 instead
+        // proposes every draft one position ahead of where verify compares it
+        // (the acceptance-collapse bug this line used to be).
+        for step in 0..block - 1 {
+            let (prev, next): (&CudaSlice<u32>, &mut CudaSlice<u32>) = if step % 2 == 0 {
                 (&scratch.prev_tokens, &mut scratch.next_tokens)
             } else {
                 (&scratch.next_tokens, &mut scratch.prev_tokens)
@@ -667,7 +707,7 @@ impl K3DsparkModel {
         let sampled_view = scratch.sampled_tokens.slice(..rows * block);
         let sampled = ctx.stream.clone_dtoh(&sampled_view)?;
         Ok((0..rows)
-            .map(|i| std::array::from_fn(|k| sampled[i * block + 1 + k]))
+            .map(|i| std::array::from_fn(|k| sampled[i * block + k]))
             .collect())
     }
 }
@@ -761,3 +801,134 @@ impl K3DsparkScratch {
 #[path = "dspark_slot.rs"]
 mod slot;
 pub(crate) use slot::K3DsparkSlotState;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic synthetic bf16 value, bit-identical to the torch
+    /// reference's `synth` (splitmix-style hash, byte lane 32..39, exact
+    /// bf16 grid `[-128, 127] / 512`).
+    fn synth_val(idx: u64, seed: u64) -> bf16 {
+        let x = idx.wrapping_add(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let b = ((x >> 32) & 0xFF) as i64 - 128;
+        bf16::from_f32(b as f32 / 512.0)
+    }
+
+    fn synth_matrix(
+        ctx: &DeviceContext,
+        seed: u64,
+        rows: usize,
+        cols: usize,
+    ) -> Result<DeviceMatrix> {
+        let mut host = vec![bf16::ZERO; rows * cols];
+        for (i, v) in host.iter_mut().enumerate() {
+            *v = synth_val(i as u64, seed);
+        }
+        DeviceMatrix::from_host(ctx, &host, rows, cols)
+    }
+
+    /// Numeric cross-check against the checkpoint's own `dflash.py` /
+    /// `dspark.py` math: real drafter weights, synthetic embed/lm_head and
+    /// context rows shared bit-exactly with the torch reference
+    /// (`k3_dspark_reference.py`), compare drafts and per-row top-8 logits.
+    /// Ignored: needs a GPU and the checkpoint
+    /// (`PEGAINFER_K3_TEST_DSPARK`, default `/mnt/shared/weights/kimi-k3-dspark`).
+    fn append_synth_rows(
+        ctx: &DeviceContext,
+        state: &mut K3DsparkSlotState,
+        seed: u64,
+        rows: usize,
+    ) -> Result<()> {
+        let mut host = vec![bf16::ZERO; rows * K3_DSPARK_CONTEXT_DIM];
+        for (i, v) in host.iter_mut().enumerate() {
+            *v = synth_val(i as u64, seed);
+        }
+        let start = state.pending_len;
+        let mut dst = state
+            .pending
+            .data
+            .slice_mut(start * K3_DSPARK_CONTEXT_DIM..(start + rows) * K3_DSPARK_CONTEXT_DIM);
+        ctx.stream.memcpy_htod(&host, &mut dst)?;
+        state.pending_len = start + rows;
+        state.pending.seq_len = start + rows;
+        Ok(())
+    }
+
+    fn print_round(
+        ctx: &DeviceContext,
+        scratch: &K3DsparkScratch,
+        round: usize,
+        drafts: &[u32; K3_DSPARK_DRAFTS],
+    ) -> Result<()> {
+        let logits_view = scratch.logits.data.slice(..K3_DSPARK_BLOCK * K3_VOCAB);
+        let logits_h: Vec<bf16> = ctx.stream.clone_dtoh(&logits_view)?;
+        ctx.sync()?;
+        println!("round {round} drafts: {drafts:?}");
+        for row in 0..K3_DSPARK_BLOCK {
+            let base = row * K3_VOCAB;
+            let mut idx: Vec<usize> = (0..K3_VOCAB).collect();
+            idx.sort_by(|&a, &b| {
+                logits_h[base + b]
+                    .to_f32()
+                    .total_cmp(&logits_h[base + a].to_f32())
+            });
+            let top: Vec<String> = idx[..8]
+                .iter()
+                .map(|&i| format!("{i}:{:.4}", logits_h[base + i].to_f32()))
+                .collect();
+            println!("round {round} row {row} top8: {}", top.join(" "));
+        }
+        Ok(())
+    }
+
+    /// Numeric cross-check against the checkpoint's own `dflash.py` /
+    /// `dspark.py` math: real drafter weights, synthetic embed/lm_head and
+    /// context rows shared bit-exactly with the torch reference
+    /// (`k3_dspark_reference.py`), compare drafts and per-row top-8 logits.
+    /// Round 1 runs at serving-scale context (197 rows, cold cache); round 2
+    /// exercises the cached-KV + rope-offset path (committed 197, 5 fresh
+    /// rows). Ignored: needs a GPU and the checkpoint
+    /// (`PEGAINFER_K3_TEST_DSPARK`, default `/mnt/shared/weights/kimi-k3-dspark`).
+    #[test]
+    #[ignore]
+    fn dspark_reference_cross_check() -> Result<()> {
+        const T1: usize = 197;
+        const T2: usize = 5;
+        const ANCHOR1: (u32, usize) = (777, T1);
+        const ANCHOR2: (u32, usize) = (888, T1 + T2);
+
+        let path = std::env::var("PEGAINFER_K3_TEST_DSPARK")
+            .unwrap_or_else(|_| "/mnt/shared/weights/kimi-k3-dspark".into());
+        let ctx = DeviceContext::new()?;
+        let model = K3DsparkModel::load(&ctx, Path::new(&path), 4096)?;
+        let embed = synth_matrix(&ctx, 0x0101, K3_VOCAB, K3_HIDDEN)?;
+        let lm_head = synth_matrix(&ctx, 0x0202, K3_VOCAB, K3_HIDDEN)?;
+
+        let mut state = K3DsparkSlotState::new(&ctx, model.cache_len())?;
+        let mut scratch = K3DsparkScratch::new(&ctx, 1, model.cache_len())?;
+
+        append_synth_rows(&ctx, &mut state, 0x0303, T1)?;
+        let drafts = model.propose(
+            &ctx,
+            &embed,
+            &lm_head,
+            &mut [&mut state],
+            &[ANCHOR1],
+            &mut scratch,
+        )?;
+        print_round(&ctx, &scratch, 1, &drafts[0])?;
+
+        append_synth_rows(&ctx, &mut state, 0x0404, T2)?;
+        let drafts = model.propose(
+            &ctx,
+            &embed,
+            &lm_head,
+            &mut [&mut state],
+            &[ANCHOR2],
+            &mut scratch,
+        )?;
+        print_round(&ctx, &scratch, 2, &drafts[0])?;
+        Ok(())
+    }
+}
