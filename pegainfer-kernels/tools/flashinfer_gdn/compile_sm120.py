@@ -33,17 +33,6 @@ def package_version(distribution: str) -> str:
         raise RuntimeError(f"required generation package is missing: {distribution}") from exc
 
 
-def executable_version(executable: Path) -> str:
-    result = subprocess.run(
-        [str(executable), "--version"], check=True, capture_output=True, text=True
-    )
-    combined = result.stdout + result.stderr
-    match = re.search(r"release\s+([0-9.]+)", combined)
-    if not match:
-        raise RuntimeError(f"cannot parse CUDA version from {executable}")
-    return match.group(1)
-
-
 def ptx_metadata(ptx: str) -> dict[str, str]:
     compiler_match = re.search(
         r"Cuda compilation tools, release\s+([0-9.]+),\s+V([0-9.]+)", ptx

@@ -1,5 +1,9 @@
 //! CUDA Graph state for Qwen3.5 batched decode with bucket padding.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use anyhow::Result;
 use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::kv_pool::KvPool;
@@ -16,6 +20,75 @@ pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 /// Maximum supported batch size (= largest bucket).
 pub(crate) const MAX_BATCH: usize = 64;
+
+#[derive(Default)]
+struct DecodeGraphEvidenceCounters {
+    captures: AtomicU64,
+    replays: AtomicU64,
+    eager_fallbacks: AtomicU64,
+    state_slot_copies: AtomicU64,
+    state_slot_reuses: AtomicU64,
+    slot_compactions: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct DecodeGraphEvidenceHandle {
+    counters: Arc<DecodeGraphEvidenceCounters>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DecodeGraphEvidenceSnapshot {
+    pub(crate) captures: u64,
+    pub(crate) replays: u64,
+    pub(crate) eager_fallbacks: u64,
+    pub(crate) state_slot_copies: u64,
+    pub(crate) state_slot_reuses: u64,
+    pub(crate) slot_compactions: u64,
+}
+
+impl DecodeGraphEvidenceHandle {
+    pub(crate) fn snapshot(&self) -> DecodeGraphEvidenceSnapshot {
+        DecodeGraphEvidenceSnapshot {
+            captures: self.counters.captures.load(Ordering::Relaxed),
+            replays: self.counters.replays.load(Ordering::Relaxed),
+            eager_fallbacks: self.counters.eager_fallbacks.load(Ordering::Relaxed),
+            state_slot_copies: self.counters.state_slot_copies.load(Ordering::Relaxed),
+            state_slot_reuses: self.counters.state_slot_reuses.load(Ordering::Relaxed),
+            slot_compactions: self.counters.slot_compactions.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn record_capture(&self) {
+        self.counters.captures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_replay(&self) {
+        self.counters.replays.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_eager_fallback(&self) {
+        self.counters
+            .eager_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_state_slot_copy(&self, reused: bool) {
+        self.counters
+            .state_slot_copies
+            .fetch_add(1, Ordering::Relaxed);
+        if reused {
+            self.counters
+                .state_slot_reuses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_slot_compaction(&self) {
+        self.counters
+            .slot_compactions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Find the smallest bucket >= `bs`. Panics if `bs` > MAX_BATCH.
 pub(crate) fn bucket_for(bs: usize) -> usize {
@@ -54,6 +127,7 @@ pub(crate) struct BatchDecodeGraphState {
     pub(crate) linear_pointer_tables: LinearStatePointerTables,
     /// One `CudaGraphState` per BATCH_BUCKETS entry (indexed by position).
     pub(crate) graphs: Vec<CudaGraphState>,
+    pub(crate) evidence: DecodeGraphEvidenceHandle,
 }
 
 impl BatchDecodeGraphState {
@@ -64,6 +138,7 @@ impl BatchDecodeGraphState {
         tensor_parallel: TensorParallelConfig,
         kv_pool: &KvPool,
         max_batch: usize,
+        evidence: DecodeGraphEvidenceHandle,
     ) -> Result<Self> {
         let padding_page_id = kv_pool.padding_page_id();
         let max_total_pages = kv_pool.capacity_pages();
@@ -102,6 +177,7 @@ impl BatchDecodeGraphState {
             slot_states,
             linear_pointer_tables,
             graphs,
+            evidence,
         })
     }
 
@@ -117,6 +193,7 @@ impl BatchDecodeGraphState {
         slot_idx: usize,
     ) -> Result<()> {
         let dst = &mut self.slot_states[slot_idx];
+        let reused = dst.seq_len != 0;
         for (dst_layer, src_layer) in dst.layers.iter_mut().zip(src.layers.iter()) {
             ctx.stream
                 .memcpy_dtod(&src_layer.state, &mut dst_layer.state)
@@ -126,6 +203,11 @@ impl BatchDecodeGraphState {
                 .map_err(|e| anyhow::anyhow!("copy conv state to slot {slot_idx}: {e}"))?;
         }
         dst.seq_len = src.seq_len;
+        self.evidence.record_state_slot_copy(reused);
         Ok(())
+    }
+
+    pub(crate) fn record_slot_compaction(&self) {
+        self.evidence.record_slot_compaction();
     }
 }
