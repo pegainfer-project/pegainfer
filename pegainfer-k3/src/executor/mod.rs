@@ -1390,33 +1390,64 @@ impl K3Executor {
             return self.verify_inner(&[]);
         }
         self.enter_step()?;
-        // Propose per slot. The draft is rank-local and collective-free, so
-        // this adds no cross-rank coupling; one call per slot for now (the
-        // batched form needs disjoint `&mut` slot states).
-        let mut verify_batch = Vec::with_capacity(batch.len());
-        for entry in batch {
-            let anchor_pos = self.decode_state.positions[entry.slot];
-            let dspark = self.dspark.as_mut().expect("armed above");
-            let drafts = dspark.model.propose(
-                &self.ctx,
-                &self.model.embed,
-                &self.model.w_lm,
-                &mut [&mut dspark.slots[entry.slot]],
-                &[(entry.last_token, anchor_pos)],
-                &mut dspark.scratch,
-            )?;
-            // Admission reserves `prompt + max_tokens` context, not the
-            // draft span: near the ceiling the verify appends at
-            // `anchor_pos + 1 ..= anchor_pos + drafts` must shed drafts
-            // instead of tripping the verify guard (fatal under EP). A
-            // 0-draft verify is a legal one-token deferred-commit step.
-            let headroom = (self.max_ctx - 1).saturating_sub(anchor_pos);
-            let keep = drafts[0].len().min(headroom);
-            verify_batch.push(K3VerifySlot {
+        let max_ctx = self.max_ctx;
+        let positions: Vec<usize> = batch
+            .iter()
+            .map(|entry| self.decode_state.positions[entry.slot])
+            .collect();
+        // One batched propose for the whole round: the draft is rank-local
+        // and collective-free, the dense draft rows batch across slots, and
+        // the Markov readback becomes a single round trip instead of one per
+        // slot. `propose` wants disjoint `&mut` slot states — a sorted
+        // `split_at_mut` walk over the slot array hands them out.
+        let mut order: Vec<usize> = (0..batch.len()).collect();
+        order.sort_unstable_by_key(|&index| batch[index].slot);
+        let dspark = self.dspark.as_mut().expect("armed above");
+        let mut states: Vec<&mut K3DsparkSlotState> = Vec::with_capacity(batch.len());
+        let mut anchors = Vec::with_capacity(batch.len());
+        let mut rest: &mut [K3DsparkSlotState] = &mut dspark.slots;
+        let mut consumed = 0usize;
+        for &index in &order {
+            let entry = &batch[index];
+            ensure!(
+                entry.slot >= consumed,
+                "K3 decode-spec batch repeats slot {}",
+                entry.slot
+            );
+            let (_, tail) = rest.split_at_mut(entry.slot - consumed);
+            let (state, tail) = tail
+                .split_first_mut()
+                .with_context(|| format!("K3 decode-spec slot {} is out of range", entry.slot))?;
+            states.push(state);
+            anchors.push((entry.last_token, positions[index]));
+            consumed = entry.slot + 1;
+            rest = tail;
+        }
+        let proposed = dspark.model.propose(
+            &self.ctx,
+            &self.model.embed,
+            &self.model.w_lm,
+            &mut states,
+            &anchors,
+            &mut dspark.scratch,
+        )?;
+        // Admission reserves `prompt + max_tokens` context, not the
+        // draft span: near the ceiling the verify appends at
+        // `anchor_pos + 1 ..= anchor_pos + drafts` must shed drafts
+        // instead of tripping the verify guard (fatal under EP). A
+        // 0-draft verify is a legal one-token deferred-commit step.
+        let mut verify_batch: Vec<K3VerifySlot> = batch
+            .iter()
+            .map(|entry| K3VerifySlot {
                 slot: entry.slot,
                 anchor: entry.last_token,
-                drafts: drafts[0][..keep].to_vec(),
-            });
+                drafts: Vec::new(),
+            })
+            .collect();
+        for (&index, drafts) in order.iter().zip(&proposed) {
+            let headroom = (max_ctx - 1).saturating_sub(positions[index]);
+            let keep = drafts.len().min(headroom);
+            verify_batch[index].drafts = drafts[..keep].to_vec();
         }
         // A slot's packed rows are its deferred-commit replay plus the
         // speculative span — up to `2 * K3_DSPARK_BLOCK` — so a full batch can
