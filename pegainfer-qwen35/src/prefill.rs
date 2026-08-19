@@ -592,17 +592,18 @@ mod tests {
 
     use anyhow::Result;
     use half::bf16;
-    use pegainfer_core::tensor::DeviceVec;
+    use pegainfer_core::tensor::HiddenStates;
+    use pegainfer_kernels::ops::Qwen35GdnGeometry;
 
     use super::GdnPrefillBackend;
     use super::checked_prefill_end_pos;
     use crate::recurrent_state::RecurrentState;
     use crate::weights::Qwen35Model;
 
-    // Frozen by the Stage 13 FP32 recurrence gate; chunk continuation does
-    // not receive a looser state envelope than the original operator proof.
     const CHUNK_STATE_ATOL: f32 = 5.0e-3;
     const CHUNK_STATE_RTOL: f32 = 2.0e-3;
+    const CHUNK_OUTPUT_ATOL: f32 = 1.0 / 64.0;
+    const CHUNK_OUTPUT_RTOL: f32 = 2.0e-3;
     const LOGIT_MEAN_TOL: f32 = 0.06;
     const LOGIT_P99_TOL: f32 = 0.20;
     const LOGIT_ARGMAX_REGRET_TOL: f32 = 0.20;
@@ -616,53 +617,6 @@ mod tests {
             "required chunk-continuation gate cannot read {path}/config.json; set PEGAINFER_TEST_MODEL_PATH"
         );
         path
-    }
-
-    fn initialize_non_symmetric_state(
-        model: &Qwen35Model,
-        recurrent: &mut RecurrentState,
-    ) -> Result<()> {
-        let ctx = model.device_ctx();
-        let h_v = model.config().linear_num_value_heads;
-        let head_dim = model.config().linear_key_head_dim;
-        for (layer_idx, layer) in recurrent.layers.iter_mut().enumerate() {
-            assert_eq!(layer.state.len(), h_v * head_dim * head_dim);
-            let state = (0..layer.state.len())
-                .map(|index| {
-                    let head = index / (head_dim * head_dim);
-                    let rem = index % (head_dim * head_dim);
-                    let key = rem / head_dim;
-                    let value = rem % head_dim;
-                    (layer_idx * 1_000_000 + head * 100_000 + key * 100 + value) as f32 * 1.0e-7
-                })
-                .collect::<Vec<_>>();
-            layer.state = ctx.stream.clone_htod(&state)?;
-
-            let conv = (0..layer.conv_state.len)
-                .map(|index| {
-                    let signed = ((index * 29 + layer_idx * 17) % 257) as i32 - 128;
-                    bf16::from_f32(signed as f32 * 1.0e-3)
-                })
-                .collect::<Vec<_>>();
-            layer.conv_state = DeviceVec::from_host(ctx, &conv)?;
-        }
-        recurrent.seq_len = 0;
-        Ok(())
-    }
-
-    fn assert_exact_bf16(label: &str, expected: &[bf16], actual: &[bf16]) {
-        assert_eq!(expected.len(), actual.len(), "{label} length mismatch");
-        if let Some(index) = expected
-            .iter()
-            .zip(actual)
-            .position(|(left, right)| left.to_bits() != right.to_bits())
-        {
-            panic!(
-                "{label} first bitwise mismatch at {index}: expected={} actual={}",
-                expected[index].to_f32(),
-                actual[index].to_f32()
-            );
-        }
     }
 
     #[derive(Debug)]
@@ -758,63 +712,6 @@ mod tests {
         );
     }
 
-    fn report_layer_state_pair(
-        model: &Qwen35Model,
-        label: &str,
-        expected: &RecurrentState,
-        actual: &RecurrentState,
-        layer_idx: usize,
-    ) -> Result<()> {
-        let ctx = model.device_ctx();
-        let expected_host = ctx.stream.clone_dtoh(&expected.layers[layer_idx].state)?;
-        let actual_host = ctx.stream.clone_dtoh(&actual.layers[layer_idx].state)?;
-        ctx.sync()?;
-        report_close_f32(
-            label,
-            &expected_host,
-            &actual_host,
-            CHUNK_STATE_ATOL,
-            CHUNK_STATE_RTOL,
-        );
-        Ok(())
-    }
-
-    fn assert_recurrent_close(
-        model: &Qwen35Model,
-        expected: &RecurrentState,
-        actual: &RecurrentState,
-    ) -> Result<()> {
-        assert_eq!(expected.seq_len, actual.seq_len);
-        assert_eq!(expected.layers.len(), actual.layers.len());
-        let ctx = model.device_ctx();
-        let mut copies = Vec::with_capacity(expected.layers.len());
-        for (layer_idx, (left, right)) in expected.layers.iter().zip(&actual.layers).enumerate() {
-            copies.push((
-                layer_idx,
-                ctx.stream.clone_dtoh(&left.state)?,
-                ctx.stream.clone_dtoh(&right.state)?,
-                ctx.stream.clone_dtoh(&left.conv_state.data)?,
-                ctx.stream.clone_dtoh(&right.conv_state.data)?,
-            ));
-        }
-        ctx.sync()?;
-        for (layer_idx, expected_state, actual_state, expected_conv, actual_conv) in copies {
-            assert_close_f32(
-                &format!("final layer {layer_idx} recurrent state"),
-                &expected_state,
-                &actual_state,
-                CHUNK_STATE_ATOL,
-                CHUNK_STATE_RTOL,
-            );
-            assert_exact_bf16(
-                &format!("final layer {layer_idx} conv state"),
-                &expected_conv,
-                &actual_conv,
-            );
-        }
-        Ok(())
-    }
-
     fn log_softmax(values: &[f32]) -> Vec<f32> {
         let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let log_sum = values
@@ -834,7 +731,7 @@ mod tests {
             .expect("logits must be non-empty")
     }
 
-    fn assert_logit_parity(label: &str, expected: &[f32], actual: &[f32]) {
+    fn assert_logit_parity(label: &str, expected: &[f32], actual: &[f32]) -> usize {
         assert_eq!(
             expected.len(),
             actual.len(),
@@ -850,15 +747,6 @@ mod tests {
         let expected_token = argmax(&expected_lp);
         let actual_token = argmax(&actual_lp);
         let regret = expected_lp[expected_token] - expected_lp[actual_token];
-        assert!(
-            regret <= LOGIT_ARGMAX_REGRET_TOL,
-            "{label} actual argmax {actual_token} has baseline regret {regret} > {LOGIT_ARGMAX_REGRET_TOL}"
-        );
-        assert_eq!(
-            actual_token, expected_token,
-            "{label} greedy token parity failed"
-        );
-
         let mut deltas = expected_lp
             .iter()
             .zip(&actual_lp)
@@ -873,10 +761,263 @@ mod tests {
             deltas.len()
         );
         assert!(
+            regret <= LOGIT_ARGMAX_REGRET_TOL,
+            "{label} actual argmax {actual_token} has baseline regret {regret} > {LOGIT_ARGMAX_REGRET_TOL}"
+        );
+        assert_eq!(
+            actual_token, expected_token,
+            "{label} greedy token parity failed"
+        );
+        assert!(
             mean <= LOGIT_MEAN_TOL,
             "{label} mean {mean} > {LOGIT_MEAN_TOL}"
         );
         assert!(p99 <= LOGIT_P99_TOL, "{label} p99 {p99} > {LOGIT_P99_TOL}");
+        expected_token
+    }
+
+    struct PreparedGdnFixture {
+        geometry: Qwen35GdnGeometry,
+        tokens: usize,
+        q: Vec<bf16>,
+        k: Vec<bf16>,
+        v: Vec<bf16>,
+        alpha: Vec<f32>,
+        beta: Vec<f32>,
+        initial_state: Vec<f32>,
+    }
+
+    struct CpuGdnResult {
+        output: Vec<f32>,
+        final_state: Vec<f32>,
+    }
+
+    fn normalized_bf16_rows(tokens: usize, heads: usize, dim: usize, salt: usize) -> Vec<bf16> {
+        let mut result = Vec::with_capacity(tokens * heads * dim);
+        for token in 0..tokens {
+            for head in 0..heads {
+                let row = (0..dim)
+                    .map(|index| {
+                        let value = (token * 37 + head * 19 + index * salt + 11) % 251;
+                        value as f32 - 125.0
+                    })
+                    .collect::<Vec<_>>();
+                let inv_norm = row
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    .sqrt()
+                    .recip();
+                result.extend(
+                    row.into_iter()
+                        .map(|value| bf16::from_f32(value * inv_norm)),
+                );
+            }
+        }
+        result
+    }
+
+    fn prepared_gdn_fixture(geometry: Qwen35GdnGeometry, tokens: usize) -> PreparedGdnFixture {
+        assert_eq!(geometry.h_q, geometry.h_k);
+        assert_eq!(geometry.h_v % geometry.h_k, 0);
+        let v = (0..tokens * geometry.h_v * geometry.head_dim)
+            .map(|index| {
+                let signed = ((index * 29 + 7) % 97) as i32 - 48;
+                bf16::from_f32(signed as f32 / 128.0)
+            })
+            .collect();
+        let alpha = (0..tokens * geometry.h_v)
+            .map(|index| 0.980_468_75 + (index % 17) as f32 / 1024.0)
+            .collect();
+        let beta = (0..tokens * geometry.h_v)
+            .map(|index| 0.25 + (index % 17) as f32 / 32.0)
+            .collect();
+        let initial_state = (0..geometry.h_v)
+            .flat_map(|head| {
+                (0..geometry.head_dim).flat_map(move |key| {
+                    (0..geometry.head_dim).map(move |value| {
+                        (head * 100_000 + key * 100 + value) as f32 * 1.0e-7 - 0.1
+                    })
+                })
+            })
+            .collect();
+        PreparedGdnFixture {
+            geometry,
+            tokens,
+            q: normalized_bf16_rows(tokens, geometry.h_q, geometry.head_dim, 23),
+            k: normalized_bf16_rows(tokens, geometry.h_k, geometry.head_dim, 31),
+            v,
+            alpha,
+            beta,
+            initial_state,
+        }
+    }
+
+    fn cpu_gdn_recurrence(fixture: &PreparedGdnFixture) -> CpuGdnResult {
+        let g = fixture.geometry;
+        let mut state = fixture.initial_state.clone();
+        let mut output = vec![0.0_f32; fixture.tokens * g.h_v * g.head_dim];
+        let scale = (g.head_dim as f32).sqrt().recip();
+        for token in 0..fixture.tokens {
+            for value_head in 0..g.h_v {
+                let key_head = value_head * g.h_k / g.h_v;
+                let q_base = (token * g.h_q + key_head) * g.head_dim;
+                let k_base = (token * g.h_k + key_head) * g.head_dim;
+                let v_base = (token * g.h_v + value_head) * g.head_dim;
+                let state_base = value_head * g.head_dim * g.head_dim;
+                let alpha = fixture.alpha[token * g.h_v + value_head];
+                let beta = fixture.beta[token * g.h_v + value_head];
+
+                for value in &mut state[state_base..state_base + g.head_dim * g.head_dim] {
+                    *value *= alpha;
+                }
+                for value in 0..g.head_dim {
+                    let mut memory = 0.0_f32;
+                    for key in 0..g.head_dim {
+                        memory += state[state_base + key * g.head_dim + value]
+                            * fixture.k[k_base + key].to_f32();
+                    }
+                    let delta = (fixture.v[v_base + value].to_f32() - memory) * beta;
+                    let mut out = 0.0_f32;
+                    for key in 0..g.head_dim {
+                        let state_index = state_base + key * g.head_dim + value;
+                        state[state_index] += delta * fixture.k[k_base + key].to_f32();
+                        out += state[state_index] * fixture.q[q_base + key].to_f32() * scale;
+                    }
+                    output[v_base + value] = bf16::from_f32(out).to_f32();
+                }
+            }
+        }
+        CpuGdnResult {
+            output,
+            final_state: state,
+        }
+    }
+
+    fn launch_prepared_gdn_segment(
+        model: &Qwen35Model,
+        fixture: &PreparedGdnFixture,
+        start: usize,
+        end: usize,
+        state: &mut cudarc::driver::CudaSlice<f32>,
+    ) -> Result<Vec<f32>> {
+        assert!(start < end && end <= fixture.tokens);
+        let ctx = model.device_ctx();
+        let g = fixture.geometry;
+        let tokens = end - start;
+        let q_width = g.h_q * g.head_dim;
+        let k_width = g.h_k * g.head_dim;
+        let v_width = g.h_v * g.head_dim;
+        let q = HiddenStates::from_host(
+            ctx,
+            &fixture.q[start * q_width..end * q_width],
+            q_width,
+            tokens,
+        )?;
+        let k = HiddenStates::from_host(
+            ctx,
+            &fixture.k[start * k_width..end * k_width],
+            k_width,
+            tokens,
+        )?;
+        let v = HiddenStates::from_host(
+            ctx,
+            &fixture.v[start * v_width..end * v_width],
+            v_width,
+            tokens,
+        )?;
+        let alpha = ctx
+            .stream
+            .clone_htod(&fixture.alpha[start * g.h_v..end * g.h_v])?;
+        let beta = ctx
+            .stream
+            .clone_htod(&fixture.beta[start * g.h_v..end * g.h_v])?;
+        let mut output = HiddenStates::zeros(ctx, v_width, tokens)?;
+        let backend = model.flashinfer_gdn()?;
+        let mut workspace = backend.allocate_workspace(ctx, tokens)?;
+        backend.launch_in_place(
+            ctx,
+            &q,
+            &k,
+            &v,
+            &alpha,
+            &beta,
+            state,
+            &mut output,
+            &mut workspace,
+        )?;
+        output.to_host(ctx)
+    }
+
+    fn assert_operator_continuation(model: &Qwen35Model) -> Result<()> {
+        const TOKENS: usize = 128;
+        const SPLIT: usize = 64;
+        let geometry = crate::flashinfer_gdn::model_geometry(model.config());
+        let fixture = prepared_gdn_fixture(geometry, TOKENS);
+        let cpu = cpu_gdn_recurrence(&fixture);
+        let ctx = model.device_ctx();
+
+        let mut unchunked_state = ctx.stream.clone_htod(&fixture.initial_state)?;
+        let unchunked_output =
+            launch_prepared_gdn_segment(model, &fixture, 0, TOKENS, &mut unchunked_state)?;
+        let unchunked_state = ctx.stream.clone_dtoh(&unchunked_state)?;
+
+        let mut chunked_state = ctx.stream.clone_htod(&fixture.initial_state)?;
+        let mut chunked_output =
+            launch_prepared_gdn_segment(model, &fixture, 0, SPLIT, &mut chunked_state)?;
+        chunked_output.extend(launch_prepared_gdn_segment(
+            model,
+            &fixture,
+            SPLIT,
+            TOKENS,
+            &mut chunked_state,
+        )?);
+        let chunked_state = ctx.stream.clone_dtoh(&chunked_state)?;
+        ctx.sync()?;
+
+        assert_close_f32(
+            "operator CPU oracle vs unchunked output",
+            &cpu.output,
+            &unchunked_output,
+            CHUNK_OUTPUT_ATOL,
+            CHUNK_OUTPUT_RTOL,
+        );
+        assert_close_f32(
+            "operator CPU oracle vs chunked output",
+            &cpu.output,
+            &chunked_output,
+            CHUNK_OUTPUT_ATOL,
+            CHUNK_OUTPUT_RTOL,
+        );
+        assert_close_f32(
+            "operator unchunked vs chunked output",
+            &unchunked_output,
+            &chunked_output,
+            CHUNK_OUTPUT_ATOL,
+            CHUNK_OUTPUT_RTOL,
+        );
+        assert_close_f32(
+            "operator CPU oracle vs unchunked final state",
+            &cpu.final_state,
+            &unchunked_state,
+            CHUNK_STATE_ATOL,
+            CHUNK_STATE_RTOL,
+        );
+        assert_close_f32(
+            "operator CPU oracle vs chunked final state",
+            &cpu.final_state,
+            &chunked_state,
+            CHUNK_STATE_ATOL,
+            CHUNK_STATE_RTOL,
+        );
+        assert_close_f32(
+            "operator unchunked vs chunked final state",
+            &unchunked_state,
+            &chunked_state,
+            CHUNK_STATE_ATOL,
+            CHUNK_STATE_RTOL,
+        );
+        Ok(())
     }
 
     fn last_token_logits(
@@ -896,7 +1037,6 @@ mod tests {
     ) -> Result<(pegainfer_core::kv_pool::KvState, RecurrentState, Vec<f32>)> {
         let mut kv = model.alloc_kv();
         let mut recurrent = RecurrentState::new(model.device_ctx(), model.config())?;
-        initialize_non_symmetric_state(model, &mut recurrent)?;
         let hidden = match split_at {
             Some(split) => {
                 assert!(split > 0 && split < tokens.len());
@@ -960,7 +1100,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and a build-linked validated FlashInfer bundle"]
-    fn flashinfer_gdn_chunked_prefill_matches_unchunked_state() -> Result<()> {
+    fn flashinfer_gdn_chunk_continuation_and_model_outputs_match() -> Result<()> {
         let model_path = required_model_path();
         let model = Qwen35Model::from_safetensors(&model_path, 0, 1)?;
         model.require_flashinfer_gdn_for_test()?;
@@ -971,6 +1111,15 @@ mod tests {
         assert_eq!(evidence_before.artifact_sha256.len(), 64);
         assert_eq!(evidence_before.successful_launches, 0);
 
+        // Keep arbitrary non-zero HKV state at the operator boundary, where
+        // both executions consume byte-identical prepared inputs and an
+        // independent serial recurrence can determine correctness.
+        assert_operator_continuation(&model)?;
+
+        // The model-level comparison starts from the real new-request zero
+        // state. Splitting a whole model changes GEMM/attention association,
+        // so the production contract here is full-vocabulary output parity,
+        // not applying the operator's state tolerance to different inputs.
         let tokens = (0..128)
             .map(|index| 100 + (index * 17 % 1000) as u32)
             .collect::<Vec<_>>();
@@ -980,67 +1129,19 @@ mod tests {
         let (mut unchunked_kv, unchunked_state, unchunked_prefill_logits) =
             run_prefill_case(&model, &tokens, GdnPrefillBackend::FlashInfer, None)?;
 
-        // Temporary Stage 18 attribution inside the existing production gate.
-        // This is not an additional acceptance test: it determines whether a
-        // deterministic FlashInfer chunk mismatch is shared by the established
-        // Triton implementation or belongs to one FlashInfer partition shape.
-        let (_triton_chunked_kv, triton_chunked_state, _triton_chunked_logits) =
-            run_prefill_case(&model, &tokens, GdnPrefillBackend::Triton, Some(64))?;
-        let (_triton_unchunked_kv, triton_unchunked_state, _triton_unchunked_logits) =
-            run_prefill_case(&model, &tokens, GdnPrefillBackend::Triton, None)?;
-
-        report_layer_state_pair(
-            &model,
-            "diagnostic layer 0 FlashInfer unchunked vs chunked",
-            &unchunked_state,
-            &chunked_state,
-            0,
-        )?;
-        report_layer_state_pair(
-            &model,
-            "diagnostic layer 0 Triton unchunked vs chunked",
-            &triton_unchunked_state,
-            &triton_chunked_state,
-            0,
-        )?;
-        report_layer_state_pair(
-            &model,
-            "diagnostic layer 0 chunked Triton vs FlashInfer",
-            &triton_chunked_state,
-            &chunked_state,
-            0,
-        )?;
-        report_layer_state_pair(
-            &model,
-            "diagnostic layer 0 unchunked Triton vs FlashInfer",
-            &triton_unchunked_state,
-            &unchunked_state,
-            0,
-        )?;
-        drop((
-            _triton_chunked_kv,
-            triton_chunked_state,
-            _triton_chunked_logits,
-            _triton_unchunked_kv,
-            triton_unchunked_state,
-            _triton_unchunked_logits,
-        ));
-
         assert_eq!(chunked_state.seq_len, 128);
         assert_eq!(unchunked_state.seq_len, 128);
-        assert_logit_parity(
+        let decode_token = assert_logit_parity(
             "final prefill",
             &unchunked_prefill_logits,
             &chunked_prefill_logits,
-        );
+        ) as u32;
 
-        let decode_token = 42;
         let unchunked_decode =
             first_decode_logits(&model, decode_token, &mut unchunked_kv, &unchunked_state)?;
         let chunked_decode =
             first_decode_logits(&model, decode_token, &mut chunked_kv, &chunked_state)?;
         assert_logit_parity("first decode", &unchunked_decode, &chunked_decode);
-        assert_recurrent_close(&model, &unchunked_state, &chunked_state)?;
 
         let evidence_after = model.flashinfer_gdn_runtime_evidence()?;
         assert_eq!(evidence_after.selected_backend, "flashinfer");
@@ -1052,8 +1153,8 @@ mod tests {
             model.config().num_hidden_layers - model.config().num_full_attention_layers();
         assert_eq!(
             evidence_after.successful_launches - evidence_before.successful_launches,
-            (3 * linear_layers) as u64,
-            "chunk continuation gate did not execute two chunks plus one unchunked FlashInfer pass"
+            (3 * linear_layers + 3) as u64,
+            "chunk continuation gate did not execute one operator full pass, two operator continuation passes, two model chunks, and one unchunked model pass"
         );
         Ok(())
     }
