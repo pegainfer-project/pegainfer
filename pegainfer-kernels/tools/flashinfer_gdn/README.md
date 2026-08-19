@@ -90,12 +90,14 @@ cargo build --release \
 The production confidence gate is not the Python packager validating itself.
 On an SM120 runner with the pinned model snapshot, invoke the canonical runner;
 it validates the real bundle, builds through production `build.rs`, and runs
-the five exact GPU gates with fail-on-skip/test-count checks:
+the five exact GPU gates with fail-on-skip/test-count checks. Use a separate
+Python 3.12 environment with Triton 3.7.1 for the production Qwen3.5 build;
+do not reuse the Torch 2.7.1/CuTe generation environment for Triton AOT:
 
 ```bash
 env \
   PEGAINFER_CUDA_SM=120 \
-  PEGAINFER_TRITON_PYTHON="$PWD/target/flashinfer-gdn-cu13-venv/bin/python" \
+  PEGAINFER_TRITON_PYTHON="$PWD/target/flashinfer-gdn-triton-venv/bin/python" \
   PEGAINFER_QWEN35_GDN_AOT_BUNDLE="$PWD/target/flashinfer-gdn-sm120/qwen35_4b_candidate" \
   PEGAINFER_TEST_MODEL_PATH="$PWD/models/Qwen3.5-4B" \
   PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
