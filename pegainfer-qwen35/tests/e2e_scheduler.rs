@@ -21,8 +21,6 @@ use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
 
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
-
 const CASES: &[TestCase] = &[
     TestCase {
         name: "tell_story",
@@ -75,10 +73,6 @@ const CASES: &[TestCase] = &[
         max_new_tokens: 50,
     },
 ];
-
-fn get_model_path() -> String {
-    std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
-}
 
 fn max_position_embeddings(model_path: &str) -> usize {
     let config_path = std::path::Path::new(model_path).join("config.json");
@@ -672,7 +666,9 @@ fn run_full_scheduler_e2e(
 
 #[test]
 fn test_e2e_qwen35_scheduler() {
-    let model_path = get_model_path();
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler") else {
+        return;
+    };
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
@@ -697,7 +693,10 @@ fn test_e2e_qwen35_scheduler() {
 #[test]
 fn test_e2e_qwen35_shared_sm_last_decoder() {
     pegainfer_core::logging::init_default();
-    let model_path = get_model_path();
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_shared_sm_last_decoder")
+    else {
+        return;
+    };
     let tokenizer = common::load_tokenizer(&model_path);
     let seed_token = tokenizer
         .encode("Hello", false)
@@ -823,7 +822,9 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
 #[test]
 #[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
 fn test_e2e_qwen35_scheduler_tp2() {
-    let model_path = get_model_path();
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler_tp2") else {
+        return;
+    };
 
     info!("Loading Qwen3.5 TP2 model for scheduler test...");
     let start = Instant::now();

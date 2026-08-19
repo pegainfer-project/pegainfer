@@ -18,26 +18,10 @@ use pegainfer_frontend::sampler::SamplingParams;
 
 mod common;
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 const CHUNK_BUDGET: usize = 16;
 const BASELINE_PREFILL_BUDGET: usize = 1 << 20;
 const MAX_BATCH: usize = 2;
 const GENERATED_TOKENS: usize = 8;
-
-fn model_path_or_skip() -> Option<String> {
-    match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
-        Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
-            Some(MODEL_PATH.to_string())
-        }
-        Err(_) => {
-            eprintln!(
-                "skipping qwen35 chunked_prefill: {MODEL_PATH}/config.json is missing; set PEGAINFER_TEST_MODEL_PATH to run it"
-            );
-            None
-        }
-    }
-}
 
 fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
     pegainfer_qwen35::start_engine(
@@ -95,7 +79,9 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (Vec<u32>, Finish
 
 #[test]
 fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
-    let Some(model_path) = model_path_or_skip() else {
+    let Some(model_path) = common::model_path_or_skip(
+        "chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv",
+    ) else {
         return;
     };
     let tokenizer = common::load_tokenizer(&model_path);

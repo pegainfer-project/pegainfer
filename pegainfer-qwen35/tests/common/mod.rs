@@ -9,6 +9,10 @@ use vllm_text::tokenizer::HuggingFaceTokenizer;
 use vllm_text::tokenizer::TekkenTokenizer;
 use vllm_text::tokenizer::TiktokenTokenizer;
 
+pub(crate) mod model_fixture;
+
+pub(crate) use model_fixture::model_path_or_skip;
+
 #[allow(dead_code)]
 pub(crate) fn load_tokenizer(model_path: &str) -> DynTokenizer {
     try_load_tokenizer(model_path)

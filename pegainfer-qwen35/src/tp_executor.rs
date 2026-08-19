@@ -2213,8 +2213,11 @@ mod tests {
     #[test]
     #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
     fn tp2_drop_expectations_detect_rank_lifecycle_divergence() {
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_drop_expectations_detect_rank_lifecycle_divergence",
+        ) else {
+            return;
+        };
         let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
             .expect("start TP2 executor");
 
@@ -2260,8 +2263,11 @@ mod tests {
     #[test]
     #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
     fn tp2_partial_dispatch_gate_prevents_rank_local_mutation() {
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_partial_dispatch_gate_prevents_rank_local_mutation",
+        ) else {
+            return;
+        };
         let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
             .expect("start TP2 executor");
         let chunk = TpPrefillChunkItem::new(RequestId::new(410), vec![151_646, 9707], 0, true);
@@ -2281,8 +2287,11 @@ mod tests {
     #[test]
     #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
     fn tp2_worker_receiver_disconnect_poisons_without_snapshot_claim() {
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_worker_receiver_disconnect_poisons_without_snapshot_claim",
+        ) else {
+            return;
+        };
         let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
             .expect("start TP2 executor");
         executor
@@ -2306,8 +2315,11 @@ mod tests {
     #[test]
     #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
     fn tp2_unified_step_advances_prefill_and_decode_together() {
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_unified_step_advances_prefill_and_decode_together",
+        ) else {
+            return;
+        };
         let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 2)
             .expect("start TP2 executor");
         let decode_id = RequestId::new(30);
@@ -2365,8 +2377,11 @@ mod tests {
     fn tp2_drop_all_restores_complete_request_capacity() {
         const CONFIGURED_MAX_BATCH: usize = 2;
 
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_drop_all_restores_complete_request_capacity",
+        ) else {
+            return;
+        };
         let executor = Qwen35TpExecutor::from_runtime_with_capacity(
             &model_path,
             false,
@@ -2457,8 +2472,11 @@ mod tests {
     fn tp2_readmission_matches_clean_first_token_artifact() {
         const REQUESTED_LOGPROBS: usize = 5;
 
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_readmission_matches_clean_first_token_artifact",
+        ) else {
+            return;
+        };
         let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
             .expect("start TP2 executor");
         let prompt = vec![151_646, 9707];

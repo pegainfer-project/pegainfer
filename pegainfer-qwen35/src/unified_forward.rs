@@ -138,29 +138,10 @@ impl Qwen35Model {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use pegainfer_core::kv_pool::KvState;
     use pegainfer_core::tensor::HiddenStates;
 
     use super::*;
-
-    const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
-
-    fn get_model_path_or_skip() -> Option<String> {
-        match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
-            Ok(path) => Some(path),
-            Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
-                Some(MODEL_PATH.to_string())
-            }
-            Err(_) => {
-                eprintln!(
-                    "skipping Qwen3.5 unified forward model test because {MODEL_PATH}/config.json is missing; set PEGAINFER_TEST_MODEL_PATH to run it"
-                );
-                None
-            }
-        }
-    }
 
     fn greedy_sample_batch(model: &Qwen35Model, logits: &HiddenStates, rows: usize) -> Vec<u32> {
         let params = vec![pegainfer_frontend::sampler::SamplingParams::default(); rows];
@@ -177,7 +158,9 @@ mod tests {
     /// Verify that unified_step decode output matches batch_decode_graph standalone.
     #[test]
     fn unified_step_decode_matches_graph_decode() {
-        let Some(model_path) = get_model_path_or_skip() else {
+        let Some(model_path) =
+            crate::test_fixture::model_path_or_skip("unified_step_decode_matches_graph_decode")
+        else {
             return;
         };
         let model = Qwen35Model::from_safetensors(&model_path, 0, 2).unwrap();

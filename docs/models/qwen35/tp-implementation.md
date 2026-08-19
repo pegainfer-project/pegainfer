@@ -396,6 +396,37 @@ Verification on the local SM86 environment passed:
   `7 passed`, `0 failed`;
 - release Clippy with `-D warnings` and formatting checks passed.
 
+#### Model-backed test fixtures are explicit
+
+Qwen3.5 model-backed tests no longer embed a developer-local absolute weights
+path or fall back to a repository-relative model directory. The shared test
+fixture resolver requires `PEGAINFER_TEST_MODEL_PATH`, reads and parses its
+`config.json`, and confirms the Qwen3.5 model identity before any model or CUDA
+initialization. A missing, non-UTF-8, empty, unreadable, malformed, or non-Qwen3.5
+fixture prints one test-specific `SKIP` diagnostic and returns without GPU work.
+The optional `PEGAINFER_TEST_FRONTEND_MODEL_PATH` uses the same validation when
+set and otherwise reuses the validated engine fixture.
+
+The resolver source lives under `tests/common` and is also included only for
+crate unit-test builds, so the six retained TP executor gates, the mixed-step
+scheduler gate, and the integration targets share the same contract without
+adding a production API. Static review confirms that no Qwen3.5 test retains a
+private model path or implicit `DEFAULT_MODEL_PATH` fallback.
+
+Verification on the explicit public-compatible SM86 fixture passed:
+
+- missing fixture, missing `config.json`, and malformed JSON probes emitted the
+  expected diagnostics without GPU initialization;
+- release all-target compile and Clippy with `-D warnings` passed;
+- regular release library suite: `95 passed`, `0 failed`, `7 ignored`;
+- retained real TP2 library gates: `7 passed`, `0 failed`;
+- TP2 scheduler E2E, short/long HF gates, and HTTP serving gate passed; HF
+  mean/p99 deltas remained `0.0260/0.1081` sequential, `0.0267/0.1167`
+  batched, and `0.0228/0.0689` long;
+- the pinned multi-turn gate rerun completed `12/12` conversations and `44/44`
+  turns, followed without restart by `4/4` conversations and `8/8` turns, all
+  with zero failures; graceful shutdown returned both TP GPUs to idle.
+
 Delivered constraints:
 
 - Support mixed prefill+decode scheduler steps under TP.

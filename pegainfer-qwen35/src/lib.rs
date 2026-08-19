@@ -18,6 +18,9 @@ pub mod prefill_buffers;
 pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
+#[cfg(test)]
+#[path = "../tests/common/model_fixture.rs"]
+mod test_fixture;
 mod tp_executor;
 mod unified_forward;
 mod weights;

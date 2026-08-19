@@ -901,8 +901,11 @@ fn tp_engine_rejects_cuda_graph_before_model_load() {
 #[test]
 #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
 fn tp2_scheduler_runs_forced_mixed_steps() {
-    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-        .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+    let Some(model_path) =
+        crate::test_fixture::model_path_or_skip("tp2_scheduler_runs_forced_mixed_steps")
+    else {
+        return;
+    };
     let handle =
         start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1).expect("start TP2 scheduler");
     let (decode_tx, mut decode_rx) = TokenSink::standalone();
