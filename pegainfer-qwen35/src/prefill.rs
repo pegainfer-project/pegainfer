@@ -1017,10 +1017,17 @@ mod tests {
             &unchunked_state,
             0,
         )?;
+        drop((
+            _triton_chunked_kv,
+            triton_chunked_state,
+            _triton_chunked_logits,
+            _triton_unchunked_kv,
+            triton_unchunked_state,
+            _triton_unchunked_logits,
+        ));
 
         assert_eq!(chunked_state.seq_len, 128);
         assert_eq!(unchunked_state.seq_len, 128);
-        assert_recurrent_close(&model, &unchunked_state, &chunked_state)?;
         assert_logit_parity(
             "final prefill",
             &unchunked_prefill_logits,
@@ -1033,6 +1040,7 @@ mod tests {
         let chunked_decode =
             first_decode_logits(&model, decode_token, &mut chunked_kv, &chunked_state)?;
         assert_logit_parity("first decode", &unchunked_decode, &chunked_decode);
+        assert_recurrent_close(&model, &unchunked_state, &chunked_state)?;
 
         let evidence_after = model.flashinfer_gdn_runtime_evidence()?;
         assert_eq!(evidence_after.selected_backend, "flashinfer");
