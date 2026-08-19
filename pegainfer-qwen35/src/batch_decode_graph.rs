@@ -21,7 +21,7 @@ pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 /// Maximum supported batch size (= largest bucket).
 pub(crate) const MAX_BATCH: usize = 64;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct DecodeGraphEvidenceCounters {
     captures: AtomicU64,
     replays: AtomicU64,
@@ -31,7 +31,7 @@ struct DecodeGraphEvidenceCounters {
     slot_compactions: AtomicU64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct DecodeGraphEvidenceHandle {
     counters: Arc<DecodeGraphEvidenceCounters>,
 }
