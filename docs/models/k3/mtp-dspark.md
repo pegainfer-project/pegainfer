@@ -1,13 +1,14 @@
 # K3 speculative decoding: the DSpark drafter
 
-**TL;DR**: Speculative decoding for K3 is live end-to-end — the RadixArk
-community DSpark drafter (`--dflash-draft-model-path
-/mnt/shared/weights/kimi-k3-dspark`) proposes 6-token blocks, a packed
-verify step commits them, and full-depth EP4 serve on 4×GB300 passes
-sequential + concurrent greedy smokes with acceptance up to 2.08
-tokens/round against the 224-expert pruned target. Verify is *not* bitwise
-plain decode (chunkwise FlashKDA vs the fused core — near-tie argmaxes
-flip); the `spec_verify` gates certify what is exact instead.
+**TL;DR**: Speculative decoding for K3 is live end-to-end and accepts at
+reference rates — the RadixArk community DSpark drafter
+(`--dflash-draft-model-path /mnt/shared/weights/kimi-k3-dspark`) proposes
+6-token blocks, a packed verify step commits them, and after the Markov
+row off-by-one fix full-depth EP4 serve commits 3.3 tokens/round on the
+cycle probe and 3.13 on a 4-prompt prose probe vs the same-checkpoint
+sglang reference's 3.0 / ~2.8. Verify is *not* bitwise plain decode
+(chunkwise FlashKDA vs the fused core — near-tie argmaxes flip); the
+`spec_verify` gates certify what is exact instead.
 
 Last touched: 2026-08
 
@@ -101,9 +102,9 @@ cargo test --release -p pegainfer-k3 --test spec_verify -- --ignored`.
 complete with zero errors. Spec-vs-plain A/B on four prose prompts: 2/4
 byte-identical, 2 fork on a single-token near-tie ("should be
 at/about...", "rotation curves/speeds") — the certified noise class.
-Acceptance 1.0–2.08 tokens/round; the drafter was trained against the
-*full* K3, so the pruned 224-expert target depresses it — judge draft
-quality on the full model, not this checkpoint.
+Acceptance 1.0–2.08 tokens/round at first serve — see the acceptance
+investigation below for why, and for the fix that brought it to reference
+rates.
 
 Bugs the first serve found (all fixed, none reachable single-thread /
 single-rank): the executor's cuBLAS bind was one-shot per executor but the
@@ -115,6 +116,48 @@ built a rows=0 aux sink; the row budget overflowed at 9 rows against
 Memory: the draft arena is ≈ 500 MB/slot at max_ctx 4096 (the [cache_len,
 35840] pending slab dominates) — spec serving wants an explicit
 `PEGAINFER_K3_MAX_BATCH` well below the EP default 64.
+
+## The acceptance collapse and its root cause (2026-08-19)
+
+First serve accepted ~1.0/round where the same checkpoint under sglang
+accepted 3.0 (cycle probe) — and the investigation that found the one-line
+bug first *exonerated everything else*, which is worth keeping:
+
+- **Target numerics are equivalent to sglang's.** Per-layer fp32-truth
+  isolation (`~/k3-spec-smoke/l0_truth.py`, `l1_truth.py`, `ln_truth.py`,
+  run in the tray09 `sgl-k3-truth` container against raw per-layer dumps
+  from both engines on the same 200-token prompt): at every KDA depth
+  probed (L1–L85) our single-layer error vs the fp32 reference matches
+  sglang's within 0.2–0.8pp (both 1–3.8%). MegaMoE's FP8 activation path
+  costs only ~0.2pp over sglang's bf16-activation MXFP4 path — not the
+  story it looked like.
+- **Decode is self-consistent with prefill.** Teacher-forcing the decode
+  path's own greedy output back through chunked prefill
+  (`PEGAINFER_K3_LAYER_DUMP` on both modes) shows the same drift shape as
+  any two correct engines: a ~0.5% bf16 seed amplified up to ~70% by L58
+  and pulled back by every snapshot layer (L%12==0). Engine-vs-engine
+  prefill diverges identically — the architecture amplifies noise between
+  attn-res resets; it is inherent, not a bug.
+- **Greedy repetition loops are the checkpoint, not the engine.** The
+  224-expert pruned target degenerates into repetition on English
+  prose/code prompts under sglang too, near verbatim the same loops. Judge
+  acceptance against sglang on the *same prompts*, not against RadixArk's
+  published numbers (3.9–5.5, full model, coherent text).
+
+The actual bug: `markov_propose` sampled draft `k` from block row `k+1`'s
+logits. Row 0 — the anchor row — is the one that predicts the token right
+after the anchor (the reference `run_markov_block` in sglang
+`srt/models/dspark.py` starts at row 0). Every draft was proposed one
+position ahead of where verify compares it, so acceptance died at index 0
+regardless of draft quality. `PEGAINFER_K3_SPEC_TRACE=1` made it obvious
+in one probe: `anchor=2000 drafts=[4000, 303, ...]` vs
+`sampled=[3000, 4000, 303, ...]` — the correct continuation shifted left
+by one. Fix: read rows `0..block-1` and extract from row 0.
+
+Post-fix (tray08, EP4 full depth): cycle probe 3.3 committed/round
+(sglang: 3.0), 4-prompt prose probe 3.13 (sglang on the same four
+prompts: 5.47/2.62/1.07/2.02 ≈ 2.8). Output text byte-identical to
+plain decode on the cycle probe.
 
 **Next**: acceptance measurement on the full 896-expert target (EP16);
 batched propose (one call per slot today); CUDA-graph the verify step
