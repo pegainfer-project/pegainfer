@@ -65,10 +65,10 @@ pub(crate) enum DecodeGraphUse {
 /// independently resident graph executable.
 const PERTOKEN_GRAPH_MAX_BUCKET: usize = 32;
 
-/// Canonical CUDA Graph coverage and dispatch policy for decode
+/// Canonical CUDA Graph coverage and dispatch policy for decode.
 ///
-/// Serving and memory profiling both consum this plan so the profiler reserves
-/// every retained PerToken full-SM Graph covered by this policy
+/// Serving and memory profiling both consume this plan so the profiler reserves
+/// every retained PerToken full-SM graph covered by the runtime policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DecodeGraphPlan {
     policy: NumericPolicy,

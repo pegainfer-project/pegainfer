@@ -67,7 +67,7 @@ impl Qwen3Model {
         // Exercise decode before the unified peak sample. PerToken first captures
         // every retained graph into this one buffer set so their cumulative
         // residency remains live under the later eager/unified probes. Skip this
-        // for uncompiled-group modles; the unified sample below bounds their KV.
+        // for uncompiled-group models; the unified sample below bounds their KV.
         // TP stays eager because its ranks profile independently.
         if self.config.decode_group_is_compiled() {
             let graph_plan = DecodeGraphPlan::new(decode_bufs.policy_at_construction);
