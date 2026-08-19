@@ -31,6 +31,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <climits>
 
 #ifdef K3_FLASH_MLA_SM100F
@@ -217,6 +218,36 @@ using Operation = cutlass::fmha::device::FMHA<Sm100FmhaFwdKernelTmaWarpspecializ
 
 }  // namespace k3_flash_mla_prefill
 
+// The FMHA's max-dynamic-shared-memory attribute is per-device state, but the
+// upstream device wrapper guards the cudaFuncSetAttribute behind a
+// process-wide one-shot (`static bool initialized`). This process runs one
+// executor per GPU, so the first rank to prefill would consume the one-shot
+// for its device and leave every sibling launching ~200KB of dynamic smem
+// against the default 48KB cap — cudaLaunchKernelExC then fails with
+// `invalid argument`. Set the attribute ourselves, once per device; the
+// upstream one-shot becomes a harmless no-op after the first rank.
+static cudaError_t k3_flash_mla_prefill_ensure_smem_attr(int device) {
+    constexpr int kMaxDevices = 64;
+    static std::atomic<bool> g_smem_attr_done[kMaxDevices];
+    if (device < 0 || device >= kMaxDevices) return cudaErrorInvalidValue;
+    if (g_smem_attr_done[device].load(std::memory_order_acquire)) return cudaSuccess;
+    using Kernel = k3_flash_mla_prefill::Operation::Kernel;
+    int smem_size = Kernel::SharedStorageSize;
+    if (smem_size >= (48 << 10)) {
+        cudaError_t err = cudaFuncSetAttribute(
+            (const void*)cutlass::device_kernel<Kernel>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();  // clear so the failure is not sticky
+            return err;
+        }
+    }
+    // Concurrent first calls on the same device both set the attribute; the
+    // set is idempotent, so the race is benign.
+    g_smem_attr_done[device].store(true, std::memory_order_release);
+    return cudaSuccess;
+}
+
 extern "C" CUresult k3_flash_mla_prefill_fwd(
     const void* q,
     long long q_stride_tok,
@@ -249,6 +280,8 @@ extern "C" CUresult k3_flash_mla_prefill_fwd(
 
     int device = 0;
     cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) return k3_flash_mla_map_cuda_error(err);
+    err = k3_flash_mla_prefill_ensure_smem_attr(device);
     if (err != cudaSuccess) return k3_flash_mla_map_cuda_error(err);
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = device;
