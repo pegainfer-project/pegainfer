@@ -612,8 +612,7 @@ impl SingleGpuBackend {
     fn launch_async_prefill(&mut self, chunk: &mut ScheduledChunk) -> Result<AsyncPrefillOutput> {
         let prefill_stream = self
             .prefill_stream
-            .as_ref()
-            .cloned()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("Qwen3.5 decode overlap is disabled"))?;
 
         // Request KV/recurrent state was allocated on the model stream. Order
@@ -1269,13 +1268,8 @@ fn logical_load_counts(
     )
 }
 
-fn should_block_on_submit(
-    active_empty: bool,
-    prefilling_empty: bool,
-    pending_empty: bool,
-    inflight_prefill: bool,
-) -> bool {
-    active_empty && prefilling_empty && pending_empty && !inflight_prefill
+fn should_block_on_submit(owned_work_empty: bool, inflight_prefill: bool) -> bool {
+    owned_work_empty && !inflight_prefill
 }
 
 fn terminal_scheduler_shutdown(
@@ -1476,9 +1470,7 @@ fn scheduler_loop(
         // after wakeup because the first request may already be closed and more
         // submissions may have raced with the blocking receive.
         if should_block_on_submit(
-            active.is_empty(),
-            prefilling.is_empty(),
-            pending.is_empty(),
+            active.is_empty() && prefilling.is_empty() && pending.is_empty(),
             inflight_prefill.is_some(),
         ) {
             if let Some((req, _kv_prefix)) = submit_rx.blocking_recv() {

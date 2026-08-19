@@ -11,6 +11,7 @@ use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::TokenSink;
@@ -226,7 +227,7 @@ fn drain_tokens(rx: &mut TokenStreamReceiver, request_id: &str) -> usize {
 }
 
 fn wait_for_running_requests(
-    load: &mut tokio::sync::watch::Receiver<pegainfer_core::engine::LoadSnapshot>,
+    load: &mut tokio::sync::watch::Receiver<SchedulerMetrics>,
     expected: u64,
     timeout: std::time::Duration,
 ) {
@@ -755,7 +756,9 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
     )
     .expect("Failed to start Qwen3.5 shared-SM scheduler");
-    let mut load = handle.load_watch().expect("scheduler must expose load");
+    let mut load = handle
+        .metrics_watch()
+        .expect("scheduler must expose metrics");
 
     let mut active_rx =
         submit_repeated_token_request(&handle, "overlap-last-decoder", seed_token, 512, 128);

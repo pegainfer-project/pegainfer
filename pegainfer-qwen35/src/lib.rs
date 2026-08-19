@@ -132,20 +132,6 @@ impl Qwen35LaunchOptions {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn launch_with_options_and_policy(
-    model_path: &Path,
-    options: Qwen35LaunchOptions,
-    scheduler_policy: Qwen35SchedulerPolicy,
-) -> Result<EngineHandle> {
-    launch_with_options_policy_and_overlap(
-        model_path,
-        options,
-        scheduler_policy,
-        Qwen35DecodeOverlap::Off,
-    )
-}
-
-#[allow(clippy::needless_pass_by_value)]
 pub fn launch_with_options_policy_and_overlap(
     model_path: &Path,
     options: Qwen35LaunchOptions,

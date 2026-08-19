@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use cudarc::driver::CudaStream;
-use pegainfer_core::engine::panic_message;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_frontend::engine::panic_message;
 use pegainfer_kernels::tensor::StreamOverrideGuard;
 
 use super::batch_decode_graph::BatchDecodeGraphState;

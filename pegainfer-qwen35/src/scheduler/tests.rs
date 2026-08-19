@@ -403,7 +403,7 @@ fn prune_drop_failure_preserves_pending_for_terminal_fanout() {
     assert_eq!(pending.len(), 1);
 
     let (_submit_tx, mut submit_rx) = mpsc::unbounded_channel();
-    let (load_tx, _load_rx) = watch::channel(LoadSnapshot::default());
+    let (load_tx, _load_rx) = watch::channel(SchedulerMetrics::default());
     terminal_scheduler_shutdown(
         &mut submit_rx,
         &load_tx,
@@ -412,6 +412,7 @@ fn prune_drop_failure_preserves_pending_for_terminal_fanout() {
         prefilling,
         pending,
         Vec::new(),
+        None,
         failure,
     );
 
@@ -524,7 +525,7 @@ fn decode_completion_drop_failure_publishes_only_terminal_error() {
     ));
 
     let (_submit_tx, mut submit_rx) = mpsc::unbounded_channel();
-    let (load_tx, _load_rx) = watch::channel(LoadSnapshot::default());
+    let (load_tx, _load_rx) = watch::channel(SchedulerMetrics::default());
     terminal_scheduler_shutdown(
         &mut submit_rx,
         &load_tx,
@@ -533,6 +534,7 @@ fn decode_completion_drop_failure_publishes_only_terminal_error() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        None,
         failure,
     );
 
@@ -633,7 +635,7 @@ fn immediate_prefill_drop_failure_publishes_only_terminal_error() {
     ));
 
     let (_submit_tx, mut submit_rx) = mpsc::unbounded_channel();
-    let (load_tx, _load_rx) = watch::channel(LoadSnapshot::default());
+    let (load_tx, _load_rx) = watch::channel(SchedulerMetrics::default());
     terminal_scheduler_shutdown(
         &mut submit_rx,
         &load_tx,
@@ -642,6 +644,7 @@ fn immediate_prefill_drop_failure_publishes_only_terminal_error() {
         prefilling,
         Vec::new(),
         Vec::new(),
+        None,
         failure,
     );
 
@@ -714,11 +717,12 @@ fn terminal_shutdown_closes_drains_and_errors_every_owner_once() {
 
     before_send.wait();
     sent_before_close.wait();
-    let (load_tx, load_rx) = watch::channel(LoadSnapshot {
+    let (load_tx, load_rx) = watch::channel(SchedulerMetrics {
         kv_used_blocks: 9,
         kv_total_blocks: 64,
         num_running_reqs: 9,
         num_waiting_reqs: 9,
+        spec_decode: None,
     });
     terminal_scheduler_shutdown(
         &mut submit_rx,
@@ -728,6 +732,7 @@ fn terminal_shutdown_closes_drains_and_errors_every_owner_once() {
         prefilling,
         pending,
         deferred,
+        None,
         failure,
     );
     after_receiver_close.wait();
@@ -761,10 +766,10 @@ fn terminal_shutdown_closes_drains_and_errors_every_owner_once() {
 }
 
 fn wait_for_load(
-    load_rx: &watch::Receiver<LoadSnapshot>,
+    load_rx: &watch::Receiver<SchedulerMetrics>,
     description: &str,
-    predicate: impl Fn(LoadSnapshot) -> bool,
-) -> LoadSnapshot {
+    predicate: impl Fn(SchedulerMetrics) -> bool,
+) -> SchedulerMetrics {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let snapshot = *load_rx.borrow();
@@ -1014,7 +1019,7 @@ fn tp_decode_alignment_is_request_id_strict_and_order_independent() {
 #[test]
 fn inflight_prefill_waits_instead_of_parking_after_last_decode_retires() {
     assert!(
-        !should_block_on_submit(true, true, true, true),
+        !should_block_on_submit(true, true),
         "an in-flight prefill must keep the scheduler off submit_rx.blocking_recv()"
     );
 }
@@ -1047,7 +1052,7 @@ fn tp1_cancelled_resident_frees_capacity_before_admission() {
     let model =
         Qwen35Model::from_safetensors_with_options(&model_path, true).expect("load Qwen3.5 model");
     let handle = start_with_capacity(model, 42, 1, 1_024).expect("start TP1 scheduler");
-    let load_rx = handle.load_watch().expect("Qwen3.5 load watch");
+    let load_rx = handle.metrics_watch().expect("Qwen3.5 metrics watch");
 
     let (resident_tx, resident_rx) = TokenSink::standalone();
     handle
