@@ -29,9 +29,12 @@ All seven criteria passed.
 | `vllm-bench` version | `0.1.0` |
 | `vllm-bench` binary SHA-256 | `8131ed513d22da21186eb7ccba06dfb6d0c8657624bb72a733948841a5dd1ffe` |
 | GPUs | 2x NVIDIA RTX 3090, SM86, 24 GiB each |
-| Model fixture | Public Qwen3.5-4B-compatible fixture |
+| Model fixture | [`Qwen/Qwen3.5-4B`](https://huggingface.co/Qwen/Qwen3.5-4B/tree/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a), revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` |
 | `config.json` SHA-256 | `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670` |
 | `tokenizer.json` SHA-256 | `5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42` |
+| `model.safetensors.index.json` SHA-256 | `cf3f798ee02ba45f9622aa8892a47369ab667d0afbf154ee7c2212de42e6302d` |
+| `model.safetensors-00001-of-00002.safetensors` SHA-256 | `26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61` |
+| `model.safetensors-00002-of-00002.safetensors` SHA-256 | `cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188` |
 | TP/runtime | TP=2, eager, CUDA Graph disabled, `max_batch=2`, `max_prefill_tokens=64`, scheduler policy `off` |
 
 The repository's older pinned vLLM revision predates the Rust `vllm-bench`
@@ -41,9 +44,10 @@ sequentially within each conversation, appends each assistant response, and
 sends the accumulated message history on the next turn. A separate sequential
 chat driver was not needed.
 
-Set these paths before running the commands. `MODEL_DIR` must point to a public
-fixture matching the two hashes above; no private absolute model path is part of
-the reproduction contract.
+Set these paths before running the commands. `MODEL_DIR` must point to the
+pinned public revision above and match the complete config, tokenizer, index,
+and weight-shard hash manifest; no private absolute model path is part of the
+reproduction contract.
 
 ```bash
 MODEL_DIR=/path/to/public/Qwen3.5-4B
