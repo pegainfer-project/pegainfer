@@ -353,6 +353,25 @@ TP2 tests above. The same target surface passed locally on SM86 with nightly
 The GitHub jobs provide the independent Ubuntu, SM80, and pinned Triton 3.7.1
 verification.
 
+#### Real TP2 multi-turn serving gate
+
+The Phase 2A production-path gate starts the real OpenAI-compatible Qwen3.5
+server on two RTX 3090 GPUs with TP=2, eager execution, `max_batch=2`, and
+`max_prefill_tokens=64`. A pinned upstream Rust `vllm-bench` client runs
+dependent `openai-chat` conversations at concurrency 4, so the workload exceeds
+resident capacity and forces cleanup followed by fresh admission.
+
+The primary workload completed 12/12 conversations and 44/44 measured turns
+with zero failures. Conversation lengths varied from 2-5 turns, later prompts
+carried accumulated history, and every turn returned its configured 24 tokens.
+Without restarting the server, a second 4-conversation, 8-turn probe also
+completed with zero failures. Graceful shutdown released both TP devices.
+
+The exact client/server revisions, build and run commands, request counts,
+concurrency, prompt/output lengths, per-turn history evidence, pass criteria,
+limitations, and raw JSON results are published in
+[`docs/benchmarks/qwen35-tp2-phase2a-multiturn.md`](../../benchmarks/qwen35-tp2-phase2a-multiturn.md).
+
 Delivered constraints:
 
 - Support mixed prefill+decode scheduler steps under TP.
