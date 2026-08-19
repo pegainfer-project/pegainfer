@@ -108,6 +108,7 @@ use crate::config::K3_LAYERS;
 use crate::config::K3MoeTopo;
 use crate::config::probe_config_json;
 use crate::dspark::K3_DSPARK_AUX_LAYERS;
+use crate::dspark::K3_DSPARK_BLOCK;
 use crate::dspark::K3_DSPARK_CONTEXT_DIM;
 use crate::dspark::K3DsparkModel;
 use crate::dspark::K3DsparkScratch;
@@ -370,7 +371,11 @@ pub struct K3Executor {
     context_len_host: Vec<i32>,
     kv_row_host: Vec<i32>,
     sampled_host: Vec<i32>,
-    thread_bound: bool,
+    /// The thread whose device binding and thread-local cuBLAS handles are
+    /// current. Rechecked per bind: `load_dspark` runs on the launch thread,
+    /// then the executor moves to the scheduler's step thread, and each needs
+    /// its own `cublas_init` (the handle is `thread_local` in the FFI).
+    bound_thread: Option<std::thread::ThreadId>,
     /// Present exactly when `ep_size > 1`: this rank's slab handshake with its
     /// peers. It issues nothing per step.
     ep: Option<K3EpRuntime>,
@@ -664,19 +669,20 @@ impl K3Executor {
             context_len_host: vec![1; scratch_rows],
             kv_row_host: vec![-1; scratch_rows],
             sampled_host: vec![0; max_batch],
-            thread_bound: false,
+            bound_thread: None,
             ep,
         })
     }
 
     fn bind_thread(&mut self) -> Result<()> {
-        if !self.thread_bound {
+        let current = std::thread::current().id();
+        if self.bound_thread != Some(current) {
             self.gpu.set_current()?;
             // The cuBLAS handle is thread-local per device.
             unsafe {
                 pegainfer_kernels::ffi::cublas_init();
             }
-            self.thread_bound = true;
+            self.bound_thread = Some(current);
         }
         Ok(())
     }
@@ -879,6 +885,15 @@ impl K3Executor {
         ensure!(
             self.dspark.is_none(),
             "K3 dspark draft lane is already loaded"
+        );
+        // One slot's worst verify round packs its deferred-commit replay
+        // (up to a full accepted block) plus anchor and drafts.
+        ensure!(
+            self.max_batch >= 2 * K3_DSPARK_BLOCK,
+            "K3 dspark needs a row budget of at least {} (got {}): one slot's \
+             verify round must fit a step",
+            2 * K3_DSPARK_BLOCK,
+            self.max_batch
         );
         self.bind_thread()?;
         let model = K3DsparkModel::load(&self.ctx, path, self.max_ctx)
@@ -1272,11 +1287,17 @@ impl K3Executor {
         if let Some(mega) = self.scratch.mega.as_mut() {
             mega.begin_step(launches);
         }
-        let aux = self.dspark.as_mut().map(|dspark| K3AuxSink {
-            slab: &mut dspark.capture,
-            rows,
-            taps: &dspark.taps,
-        });
+        // A padding step (`rows == 0`) captures nothing — the sink's copy
+        // kernel rejects an empty row range.
+        let aux = self
+            .dspark
+            .as_mut()
+            .filter(|_| rows > 0)
+            .map(|dspark| K3AuxSink {
+                slab: &mut dspark.capture,
+                rows,
+                taps: &dspark.taps,
+            });
         k3_verify_step(
             &self.ctx,
             &self.model,
@@ -1375,6 +1396,37 @@ impl K3Executor {
                 drafts: drafts[0].to_vec(),
             });
         }
-        self.verify_inner(&verify_batch)
+        // A slot's packed rows are its deferred-commit replay plus the
+        // speculative span — up to `2 * K3_DSPARK_BLOCK` — so a full batch can
+        // outgrow the row budget. Split into budget-sized verify steps; each
+        // is a real step, and free-running peers cover the extras with
+        // padding steps of their own.
+        let mut outcomes = Vec::with_capacity(verify_batch.len());
+        let mut start = 0;
+        while start < verify_batch.len() {
+            let mut rows = 0;
+            let mut end = start;
+            while end < verify_batch.len() {
+                let entry = &verify_batch[end];
+                let need = self.spec[entry.slot].pending.len() + 1 + entry.drafts.len();
+                if rows + need > self.max_batch {
+                    break;
+                }
+                rows += need;
+                end += 1;
+            }
+            ensure!(
+                end > start,
+                "K3 verify slot {} needs {} rows alone — raise the row budget above {}",
+                verify_batch[start].slot,
+                self.spec[verify_batch[start].slot].pending.len()
+                    + 1
+                    + verify_batch[start].drafts.len(),
+                self.max_batch
+            );
+            outcomes.extend(self.verify_inner(&verify_batch[start..end])?);
+            start = end;
+        }
+        Ok(outcomes)
     }
 }
