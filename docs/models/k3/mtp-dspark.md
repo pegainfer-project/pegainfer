@@ -169,7 +169,20 @@ self-similar text saturate near RadixArk's published band (3.9–5.5,
 measured on chat-template benches); Chinese is the drafter's weak
 spot, not the verify path's.
 
-**Next**: batched propose (one call per slot today); CUDA-graph the
-verify step (launch geometry varies with pending lengths — needs
-bucketing by lag-profile); adaptive block length via the confidence
-head.
+**Next** (perf follow-up PR — semantics-neutral, kept out of #931 so
+the bring-up PR stays reviewable): measure end-to-end spec-on vs
+spec-off tokens/s on EP16 to size the win, then CUDA-graph the verify
+step (never existed — spec v1 is eager-only; launch geometry varies
+with per-slot pending lengths, needs bucketing by lag-profile) and
+batch the propose pass (one drafter call per slot today). These two go
+together by design: propose is 7 query rows through 5 layers —
+launch-bound, so batching only pays at concurrency — and graph capture
+constrains the same packed geometry, so batching it separately first
+would just get redone when the graph lands.
+
+**Not planned** (decided 2026-08-19): adaptive block length via the
+confidence head. The checkpoint ships a confidence head we don't load;
+using it to truncate low-confidence draft blocks would cut wasted
+verify rows where acceptance is weak (e.g. Chinese at 1.33/round).
+Recorded as an idea only — revisit if low-acceptance traffic shows up
+in real serving profiles.
