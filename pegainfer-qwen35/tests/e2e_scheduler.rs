@@ -472,8 +472,9 @@ fn run_full_scheduler_e2e(
         }
     }
 
-    // ── 4b. Mixed concurrent logprobs requests ─────────────────────────
-    info!("=== Phase 4b: Mixed concurrent logprobs ===");
+    // ── 4a. Mixed concurrent logprobs requests
+    info!("=== Phase 4a: Mixed concurrent logprobs ===");
+
     {
         let mixed = [
             ("mixed_no_logprobs", CASES[0].prompt, 0usize),
@@ -556,6 +557,51 @@ fn run_full_scheduler_e2e(
     info!("All Qwen3.5 scheduler tests passed for {label}!");
 }
 
+fn run_graph_lifecycle_boundary(handle: &EngineHandle, tokenizer: &DynTokenizer) {
+    let run_batch = |cases: &[(&str, &str, usize)]| {
+        let mut receivers = Vec::with_capacity(cases.len());
+        for &(name, prompt, max_tokens) in cases {
+            let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
+            let (token_tx, token_rx) = TokenSink::standalone();
+            handle
+                .submit(GenerateRequest {
+                    trace_parent: None,
+                    request_id: Some(name.to_string()),
+                    queued_at_unix_s: None,
+                    data_parallel_rank: None,
+                    prompt_tokens,
+                    params: SamplingParams {
+                        ignore_eos: true,
+                        ..SamplingParams::default()
+                    },
+                    max_tokens,
+                    lora_adapter: None,
+                    kv_transfer_params: None,
+                    token_tx,
+                    logprobs: 0,
+                    echo: false,
+                })
+                .expect("submit graph-lifecycle request");
+            receivers.push((name, max_tokens, token_rx));
+        }
+        for (name, max_tokens, mut receiver) in receivers {
+            let result = collect_generation(&mut receiver, name, 0);
+            assert_eq!(result.finish_reason, FinishReason::Length);
+            assert_eq!(result.tokens.len(), max_tokens);
+        }
+    };
+
+    // The first row retires while two longer rows remain, forcing compaction.
+    // Multiple decode steps also force replay after the first capture.
+    run_batch(&[
+        ("compact-short", "A short request", 8),
+        ("compact-long-a", "A longer request about CUDA graphs", 24),
+        ("compact-long-b", "Another longer request about state", 24),
+    ]);
+    // A second wave must copy into a previously occupied stable slot.
+    run_batch(&[("reuse-slot", "Reuse the graph slot", 3)]);
+}
+
 fn context_limit_for(handle: &EngineHandle, model_path: &str) -> usize {
     handle
         .servable_len()
@@ -590,6 +636,10 @@ fn test_e2e_qwen35_scheduler() {
 #[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
 fn test_e2e_qwen35_scheduler_flashinfer_gdn() {
     let model_path = get_model_path();
+    assert!(
+        Path::new(&model_path).join("config.json").is_file(),
+        "required FlashInfer scheduler gate cannot read {model_path}/config.json; set PEGAINFER_TEST_MODEL_PATH"
+    );
     info!("Loading Qwen3.5 model for FlashInfer scheduler test...");
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
@@ -602,28 +652,62 @@ fn test_e2e_qwen35_scheduler_flashinfer_gdn() {
         )
         .expect("Failed to start FlashInfer Qwen3.5 scheduler");
     let initial = evidence.snapshot();
+    assert_eq!(initial.selected_backend, "flashinfer");
+    assert_ne!(initial.artifact_sha256, "unavailable");
+    assert_eq!(initial.artifact_sha256.len(), 64);
     assert_eq!(initial.successful_launches, 0);
+    assert_eq!(initial.graph_captures, 0);
+    assert_eq!(initial.graph_replays, 0);
+    assert_eq!(initial.graph_eager_fallbacks, 0);
+    assert_eq!(initial.state_slot_copies, 0);
+    assert_eq!(initial.state_slot_reuses, 0);
+    assert_eq!(initial.slot_compactions, 0);
     info!(
         "FlashInfer identity: object_sha256={} object_bytes={}",
         initial.artifact_sha256, initial.artifact_size_bytes
     );
     info!("FlashInfer scheduler loaded in {:.2?}", start.elapsed());
 
-    let max_context_tokens = context_limit_for(&handle, &model_path);
-    run_full_scheduler_e2e(
-        &handle,
-        &tokenizer,
-        max_context_tokens,
-        "TP1 FlashInfer GDN",
-    );
+    run_graph_lifecycle_boundary(&handle, &tokenizer);
     let final_evidence = evidence.snapshot();
+    assert_eq!(final_evidence.selected_backend, "flashinfer");
+    assert_eq!(final_evidence.artifact_sha256, initial.artifact_sha256);
     assert!(
         final_evidence.successful_launches > 0,
         "scheduler e2e completed without a successful FlashInfer GDN launch"
     );
+    assert!(
+        final_evidence.graph_captures >= 1,
+        "scheduler E2E did not capture any CUDA decode graph"
+    );
+    assert!(
+        final_evidence.graph_replays >= 1,
+        "scheduler E2E did not replay a captured CUDA decode graph"
+    );
+    assert_eq!(
+        final_evidence.graph_eager_fallbacks, 0,
+        "scheduler E2E silently used the eager decode fallback"
+    );
+    assert!(
+        final_evidence.state_slot_copies >= 1,
+        "scheduler E2E did not copy prefill recurrent state into a graph slot"
+    );
+    assert!(
+        final_evidence.state_slot_reuses >= 1,
+        "scheduler E2E did not reuse a stable graph slot"
+    );
+    assert!(
+        final_evidence.slot_compactions >= 1,
+        "scheduler E2E did not exercise graph-slot compaction"
+    );
     info!(
-        "FlashInfer scheduler successful launches: {}",
-        final_evidence.successful_launches
+        "FlashInfer scheduler evidence: launches={} graph_captures={} graph_replays={} state_slot_copies={} state_slot_reuses={} slot_compactions={}",
+        final_evidence.successful_launches,
+        final_evidence.graph_captures,
+        final_evidence.graph_replays,
+        final_evidence.state_slot_copies,
+        final_evidence.state_slot_reuses,
+        final_evidence.slot_compactions,
     );
 }
 

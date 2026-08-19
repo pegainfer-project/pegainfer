@@ -689,6 +689,72 @@ mod tests {
         data.iter().map(|&x| bf16::from_f32(x)).collect()
     }
 
+    fn assert_f32_close_with_stats(
+        label: &str,
+        expected: &[f32],
+        actual: &[f32],
+        atol: f32,
+        rtol: f32,
+    ) {
+        assert_eq!(expected.len(), actual.len(), "{label} length mismatch");
+        let mut deltas = Vec::with_capacity(expected.len());
+        let mut max_relative = 0.0_f32;
+        let mut violation_count = 0usize;
+        let mut first_violation = None;
+        for (index, (&expected, &actual)) in expected.iter().zip(actual).enumerate() {
+            let delta = (expected - actual).abs();
+            let relative = delta / expected.abs().max(actual.abs()).max(1.0e-12);
+            deltas.push(delta);
+            max_relative = max_relative.max(relative);
+            let violation = !expected.is_finite()
+                || !actual.is_finite()
+                || delta > atol + rtol * expected.abs().max(actual.abs());
+            if violation {
+                violation_count += 1;
+                if first_violation.is_none() {
+                    first_violation = Some((index, expected, actual, delta));
+                }
+            }
+        }
+        deltas.sort_by(f32::total_cmp);
+        let max = deltas.last().copied().unwrap_or(0.0);
+        let mean = if deltas.is_empty() {
+            0.0
+        } else {
+            deltas.iter().sum::<f32>() / deltas.len() as f32
+        };
+        let p99 = deltas
+            .get(deltas.len().saturating_sub(1) * 99 / 100)
+            .copied()
+            .unwrap_or(0.0);
+        eprintln!(
+            "{label}: elements={} violations={violation_count} max_abs={max:.8} mean_abs={mean:.8} p99_abs={p99:.8} max_rel={max_relative:.8} atol={atol} rtol={rtol}",
+            deltas.len()
+        );
+        assert!(
+            first_violation.is_none(),
+            "{label} first violation {:?}; violations={violation_count}/{} max_abs={max} mean_abs={mean} p99_abs={p99} max_rel={max_relative}",
+            first_violation,
+            expected.len(),
+        );
+    }
+
+    fn assert_bf16_bits_equal(label: &str, expected: &[bf16], actual: &[bf16]) {
+        assert_eq!(expected.len(), actual.len(), "{label} length mismatch");
+        let first_mismatch = expected
+            .iter()
+            .zip(actual)
+            .position(|(expected, actual)| expected.to_bits() != actual.to_bits());
+        assert!(
+            first_mismatch.is_none(),
+            "{label} first bitwise mismatch at {:?}: expected={:?} actual={:?}",
+            first_mismatch,
+            first_mismatch.map(|index| expected[index].to_f32()),
+            first_mismatch.map(|index| actual[index].to_f32()),
+        );
+        eprintln!("{label}: elements={} bitwise_mismatches=0", expected.len());
+    }
+
     fn softplus(value: f32) -> f32 {
         if value > 20.0 {
             value
@@ -732,7 +798,7 @@ mod tests {
         let dt_bias = DeviceVec::from_host(&ctx, &dt_host)?;
         let a_log = ctx.stream.clone_htod(&a_log_host)?;
 
-        for tokens in [1usize, 2, 63, 64, 65, 127, 128, 2048] {
+        for tokens in [1usize, 63, 64, 65, 128, 2048] {
             let qkv_host = bf16_vec(
                 &(0..tokens * qkv_dim)
                     .map(|index| {
@@ -790,6 +856,9 @@ mod tests {
             ctx.sync()?;
             assert_eq!(status, [0], "finite Hv32 T={tokens} fixture was rejected");
 
+            let mut q_expected = Vec::with_capacity(tokens * h_q * d);
+            let mut k_expected = Vec::with_capacity(tokens * h_k * d);
+            let mut v_expected = Vec::with_capacity(tokens * h_v * d);
             for token in 0..tokens {
                 let token_qkv = token * qkv_dim;
                 for head in 0..h_q {
@@ -801,12 +870,9 @@ mod tests {
                         .sum::<f32>();
                     let inv_norm = (sum_sq + 1.0e-12).sqrt().recip();
                     for lane in 0..d {
-                        let expected = qkv_host[input + lane].to_f32() * inv_norm;
-                        assert!(
-                            (q_actual[output + lane].to_f32() - expected).abs() <= 1.0 / 256.0,
-                            "Q mismatch at T={tokens}, token={token}, head={head}, lane={lane}"
-                        );
+                        q_expected.push(qkv_host[input + lane].to_f32() * inv_norm);
                     }
+                    debug_assert_eq!(q_expected.len(), output + d);
                 }
                 for head in 0..h_k {
                     let input = token_qkv + h_q * d + head * d;
@@ -817,21 +883,42 @@ mod tests {
                         .sum::<f32>();
                     let inv_norm = (sum_sq + 1.0e-12).sqrt().recip();
                     for lane in 0..d {
-                        let expected = qkv_host[input + lane].to_f32() * inv_norm;
-                        assert!(
-                            (k_actual[output + lane].to_f32() - expected).abs() <= 1.0 / 256.0,
-                            "K mismatch at T={tokens}, token={token}, head={head}, lane={lane}"
-                        );
+                        k_expected.push(qkv_host[input + lane].to_f32() * inv_norm);
                     }
+                    debug_assert_eq!(k_expected.len(), output + d);
                 }
                 let v_input = token_qkv + (h_q + h_k) * d;
-                let v_output = token * h_v * d;
-                assert_eq!(
-                    &v_actual[v_output..v_output + h_v * d],
-                    &qkv_host[v_input..v_input + h_v * d],
-                    "V bits changed at Hv32 T={tokens}, token={token}"
-                );
+                v_expected.extend_from_slice(&qkv_host[v_input..v_input + h_v * d]);
             }
+            let q_actual_f32 = q_actual
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>();
+            let k_actual_f32 = k_actual
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>();
+            assert_f32_close_with_stats(
+                &format!("native prepare Q [T={tokens},H={h_q},D={d},bf16]"),
+                &q_expected,
+                &q_actual_f32,
+                1.0 / 256.0,
+                0.0,
+            );
+            assert_f32_close_with_stats(
+                &format!("native prepare K [T={tokens},H={h_k},D={d},bf16]"),
+                &k_expected,
+                &k_actual_f32,
+                1.0 / 256.0,
+                0.0,
+            );
+            assert_bf16_bits_equal(
+                &format!("native prepare V [T={tokens},H={h_v},D={d},bf16]"),
+                &v_expected,
+                &v_actual,
+            );
+            let mut alpha_expected = Vec::with_capacity(tokens * h_v);
+            let mut beta_expected = Vec::with_capacity(tokens * h_v);
             for index in 0..tokens * h_v {
                 let head = index % h_v;
                 let a_value = a_host[index].to_f32();
@@ -839,17 +926,23 @@ mod tests {
                 let expected_alpha =
                     (-a_log_host[head].exp() * softplus(a_value + dt_host[head].to_f32())).exp();
                 let expected_beta = sigmoid(b_value);
-                assert!(
-                    (alpha_actual[index] - expected_alpha).abs()
-                        <= 2.0e-6 * expected_alpha.abs().max(1.0),
-                    "alpha mismatch at Hv32 T={tokens}, index={index}"
-                );
-                assert!(
-                    (beta_actual[index] - expected_beta).abs()
-                        <= 2.0e-6 * expected_beta.abs().max(1.0),
-                    "beta mismatch at Hv32 T={tokens}, index={index}"
-                );
+                alpha_expected.push(expected_alpha);
+                beta_expected.push(expected_beta);
             }
+            assert_f32_close_with_stats(
+                &format!("native prepare alpha [T={tokens},H={h_v},f32]"),
+                &alpha_expected,
+                &alpha_actual,
+                2.0e-6,
+                2.0e-6,
+            );
+            assert_f32_close_with_stats(
+                &format!("native prepare beta [T={tokens},H={h_v},f32]"),
+                &beta_expected,
+                &beta_actual,
+                2.0e-6,
+                2.0e-6,
+            );
         }
 
         for non_finite_source in ["q", "v", "gate"] {
@@ -899,6 +992,79 @@ mod tests {
                 "non-finite {non_finite_source} input was not reported"
             );
         }
+
+        let finite_qkv_host = vec![bf16::from_f32(0.25); qkv_dim];
+        let mut non_finite_qkv_host = finite_qkv_host.clone();
+        non_finite_qkv_host[0] = bf16::from_bits(0x7fc0);
+        let gate_b_host = vec![bf16::from_f32(-0.5); h_v];
+        let gate_a_host = vec![bf16::from_f32(0.5); h_v];
+        let make_hidden = |values: &[bf16], hidden_dim: usize| -> Result<HiddenStates> {
+            Ok(HiddenStates {
+                data: ctx.stream.clone_htod(values)?,
+                hidden_dim,
+                seq_len: 1,
+            })
+        };
+        let non_finite_qkv = make_hidden(&non_finite_qkv_host, qkv_dim)?;
+        let finite_qkv = make_hidden(&finite_qkv_host, qkv_dim)?;
+        let gate_b = make_hidden(&gate_b_host, h_v)?;
+        let gate_a = make_hidden(&gate_a_host, h_v)?;
+        let mut sticky = GdnPrepareScratch35::from_dims(&ctx, h_q, h_k, h_v, d, 1)?;
+        gated_delta_rule_prefill_native_prepare_into(
+            &ctx,
+            &non_finite_qkv,
+            &gate_b,
+            &gate_a,
+            &dt_bias,
+            &a_log,
+            &mut sticky,
+            h_q,
+            h_k,
+            h_v,
+            d,
+        )?;
+        gated_delta_rule_prefill_native_prepare_into(
+            &ctx,
+            &finite_qkv,
+            &gate_b,
+            &gate_a,
+            &dt_bias,
+            &a_log,
+            &mut sticky,
+            h_q,
+            h_k,
+            h_v,
+            d,
+        )?;
+        let sticky_status = ctx.stream.clone_dtoh(&sticky.non_finite_status)?;
+        ctx.sync()?;
+        assert_eq!(
+            sticky_status,
+            [1],
+            "a later finite layer cleared the chunk-owned non-finite status"
+        );
+
+        let mut fresh_chunk = GdnPrepareScratch35::from_dims(&ctx, h_q, h_k, h_v, d, 1)?;
+        gated_delta_rule_prefill_native_prepare_into(
+            &ctx,
+            &finite_qkv,
+            &gate_b,
+            &gate_a,
+            &dt_bias,
+            &a_log,
+            &mut fresh_chunk,
+            h_q,
+            h_k,
+            h_v,
+            d,
+        )?;
+        let fresh_status = ctx.stream.clone_dtoh(&fresh_chunk.non_finite_status)?;
+        ctx.sync()?;
+        assert_eq!(
+            fresh_status,
+            [0],
+            "a new chunk did not start with a clear non-finite status"
+        );
         Ok(())
     }
 

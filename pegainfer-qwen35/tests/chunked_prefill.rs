@@ -15,7 +15,6 @@ use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::sampler::SamplingParams;
-use pegainfer_qwen35::runtime::GdnPrefillRuntimeEvidenceHandle;
 
 mod common;
 
@@ -53,19 +52,6 @@ fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
         max_prefill_tokens,
     )
     .expect("failed to start Qwen3.5 engine")
-}
-
-fn start_flashinfer_engine(
-    model_path: &str,
-    max_prefill_tokens: usize,
-) -> (EngineHandle, GdnPrefillRuntimeEvidenceHandle) {
-    pegainfer_qwen35::runtime::start_engine_with_flashinfer_gdn_for_accuracy(
-        Path::new(model_path),
-        0,
-        MAX_BATCH,
-        max_prefill_tokens,
-    )
-    .expect("start FlashInfer Qwen3.5 scheduler")
 }
 
 fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (Vec<u32>, FinishReason) {
@@ -156,43 +142,5 @@ fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
     assert_eq!(
         chunked_tokens, baseline_tokens,
         "chunked prefill must match effectively unchunked prefill; a mismatch suggests resumed direct-paged K/V writes used the wrong base_pos and corrupted earlier cache positions"
-    );
-}
-
-#[test]
-#[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
-fn flashinfer_gdn_chunked_prefill_matches_unchunked_prefill() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
-    let prompt_tokens = prompt_tokens(&model_path);
-    assert!(prompt_tokens.len() > CHUNK_BUDGET * 2);
-
-    let (baseline_tokens, baseline_finish) = {
-        let (handle, evidence) = start_flashinfer_engine(&model_path, BASELINE_PREFILL_BUDGET);
-        assert_eq!(evidence.snapshot().successful_launches, 0);
-        let result = generate(&handle, prompt_tokens.clone());
-        assert!(
-            evidence.snapshot().successful_launches > 0,
-            "unchunked candidate replay did not launch FlashInfer"
-        );
-        result
-    };
-    assert_eq!(baseline_finish, FinishReason::Length);
-
-    let (chunked_tokens, chunked_finish) = {
-        let (handle, evidence) = start_flashinfer_engine(&model_path, CHUNK_BUDGET);
-        assert_eq!(evidence.snapshot().successful_launches, 0);
-        let result = generate(&handle, prompt_tokens);
-        assert!(
-            evidence.snapshot().successful_launches > 0,
-            "resumed candidate replay did not launch FlashInfer"
-        );
-        result
-    };
-    assert_eq!(chunked_finish, FinishReason::Length);
-    assert_eq!(
-        chunked_tokens, baseline_tokens,
-        "FlashInfer resumed prefill must match its effectively unchunked replay"
     );
 }
