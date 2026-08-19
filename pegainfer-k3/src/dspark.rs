@@ -181,20 +181,28 @@ fn validate_config(path: &Path) -> Result<()> {
     let rope = json
         .get("rope_parameters")
         .context("dspark config missing rope_parameters")?;
+    let rope_type = rope
+        .get("rope_type")
+        .context("dspark rope_parameters missing `rope_type`")?;
+    ensure!(
+        rope_type == "yarn",
+        "dspark rope_parameters `rope_type` = {rope_type}, this build expects \"yarn\""
+    );
+    // Numeric fields compare as f64: `16` and `16.0` are the same config,
+    // but distinct `serde_json::Number`s.
     for (field, want) in [
-        ("rope_type", serde_json::json!("yarn")),
-        ("factor", serde_json::json!(DSPARK_YARN_FACTOR)),
+        ("factor", DSPARK_YARN_FACTOR as f64),
         (
             "original_max_position_embeddings",
-            (DSPARK_YARN_ORIGINAL_MAX_POS as u64).into(),
+            DSPARK_YARN_ORIGINAL_MAX_POS as f64,
         ),
-        ("rope_theta", serde_json::json!(DSPARK_ROPE_THETA)),
+        ("rope_theta", DSPARK_ROPE_THETA as f64),
     ] {
         let got = rope
             .get(field)
             .with_context(|| format!("dspark rope_parameters missing `{field}`"))?;
         ensure!(
-            *got == want,
+            got.as_f64() == Some(want),
             "dspark rope_parameters `{field}` = {got}, this build expects {want}"
         );
     }
@@ -448,37 +456,6 @@ impl K3DsparkModel {
 
         scratch.activate(block_rows)?;
 
-        // One-shot capture-diagnostics dump: raw pending context rows of the
-        // first propose, to `$PEGAINFER_K3_DSPARK_DUMP.<pid>` (bf16 rows of
-        // `[pending_len, 5 * 7168]` + a small text header). Debug-only escape
-        // hatch while the acceptance investigation is open.
-        if let Ok(dump_path) = std::env::var("PEGAINFER_K3_DSPARK_DUMP") {
-            static DUMPED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let state = &states[0];
-                let rows = state.pending_len;
-                let view = state.pending.data.slice(..rows * K3_DSPARK_CONTEXT_DIM);
-                let host: Vec<bf16> = ctx.stream.clone_dtoh(&view)?;
-                ctx.sync()?;
-                let path = format!("{dump_path}.{}", std::process::id());
-                let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
-                std::fs::write(
-                    &path,
-                    [
-                        format!(
-                            "rows={rows} anchor={} pos={} committed={}\n",
-                            anchors[0].0, anchors[0].1, state.committed_len
-                        )
-                        .into_bytes(),
-                        bytes,
-                    ]
-                    .concat(),
-                )?;
-                eprintln!("K3 dspark dump: wrote {rows} pending rows to {path}");
-            }
-        }
-
         // Block token ids: [anchor, mask x 6] per request.
         scratch.block_token_ids_h[..block_rows].fill(DSPARK_MASK_TOKEN);
         for (i, &(anchor, _)) in anchors.iter().enumerate() {
@@ -657,9 +634,10 @@ impl K3DsparkModel {
         self.markov_propose(ctx, anchors, scratch)
     }
 
-    /// Anchor-drop Markov sampling: 6 sequential steps at block positions
-    /// 1..=6, `prev(1) = anchor`, `prev(k) = draft k-1`; each step is one
-    /// embedding gather + one rank-256 GEMM + one strided argmax-with-bias.
+    /// Anchor-drop Markov sampling: 6 sequential steps reading block rows
+    /// `0..=5` (row 0 is the anchor row), `prev(0) = anchor`, `prev(k) =
+    /// draft k-1`; each step is one embedding gather + one rank-256 GEMM +
+    /// one strided argmax-with-bias.
     fn markov_propose(
         &self,
         ctx: &DeviceContext,
@@ -706,6 +684,7 @@ impl K3DsparkModel {
         }
         let sampled_view = scratch.sampled_tokens.slice(..rows * block);
         let sampled = ctx.stream.clone_dtoh(&sampled_view)?;
+        ctx.sync()?;
         Ok((0..rows)
             .map(|i| std::array::from_fn(|k| sampled[i * block + k]))
             .collect())

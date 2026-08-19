@@ -133,8 +133,8 @@ bug first *exonerated everything else*, which is worth keeping:
   costs only ~0.2pp over sglang's bf16-activation MXFP4 path — not the
   story it looked like.
 - **Decode is self-consistent with prefill.** Teacher-forcing the decode
-  path's own greedy output back through chunked prefill
-  (`PEGAINFER_K3_LAYER_DUMP` on both modes) shows the same drift shape as
+  path's own greedy output back through chunked prefill (via a temporary
+  per-layer dump hook, removed before merge) shows the same drift shape as
   any two correct engines: a ~0.5% bf16 seed amplified up to ~70% by L58
   and pulled back by every snapshot layer (L%12==0). Engine-vs-engine
   prefill diverges identically — the architecture amplifies noise between
@@ -150,8 +150,9 @@ logits. Row 0 — the anchor row — is the one that predicts the token right
 after the anchor (the reference `run_markov_block` in sglang
 `srt/models/dspark.py` starts at row 0). Every draft was proposed one
 position ahead of where verify compares it, so acceptance died at index 0
-regardless of draft quality. `PEGAINFER_K3_SPEC_TRACE=1` made it obvious
-in one probe: `anchor=2000 drafts=[4000, 303, ...]` vs
+regardless of draft quality. A temporary per-round trace of
+anchor/drafts/sampled (removed before merge) made it obvious in one
+probe: `anchor=2000 drafts=[4000, 303, ...]` vs
 `sampled=[3000, 4000, 303, ...]` — the correct continuation shifted left
 by one. Fix: read rows `0..block-1` and extract from row 0.
 

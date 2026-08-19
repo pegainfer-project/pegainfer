@@ -39,6 +39,13 @@ pub(crate) struct K3DsparkSlotState {
 }
 
 impl K3DsparkSlotState {
+    /// Device bytes one slot pins at `cache_len` (the `[cache_len, 35840]`
+    /// pending slab dominates) — what arming actually costs per batch slot.
+    pub(crate) fn device_bytes(cache_len: usize) -> usize {
+        let per_token = DSPARK_LAYERS * 2 * DSPARK_KV_DIM + K3_DSPARK_CONTEXT_DIM + 2 * K3_HIDDEN;
+        cache_len * per_token * size_of::<bf16>()
+    }
+
     pub(crate) fn new(ctx: &DeviceContext, cache_len: usize) -> Result<Self> {
         let mut layers = Vec::with_capacity(DSPARK_LAYERS);
         for _ in 0..DSPARK_LAYERS {

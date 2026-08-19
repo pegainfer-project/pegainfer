@@ -410,34 +410,6 @@ pub(super) fn k3_step(
             &scratch.mlp_out,
             &mut scratch.hidden,
         )?;
-
-        // Debug-only escape hatch while the acceptance investigation is open:
-        // dump each layer's exit hidden to
-        // `$PEGAINFER_K3_LAYER_DUMP[.dec].L<layer>.<pid>` (raw bf16, live rows).
-        if matches!(mode, K3StepMode::PrefillChunk | K3StepMode::Decode)
-            && let Ok(mut dump_path) = std::env::var("PEGAINFER_K3_LAYER_DUMP")
-        {
-            if matches!(mode, K3StepMode::Decode) {
-                dump_path.push_str(".dec");
-            }
-            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let rows = shape.live_rows;
-            if rows > 0
-                && CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    < crate::config::K3_LAYERS * 4096
-            {
-                let view = scratch.hidden.slice(..rows * K3_HIDDEN);
-                let host: Vec<bf16> = ctx.stream.clone_dtoh(&view)?;
-                ctx.sync()?;
-                let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
-                use std::io::Write as _;
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(format!("{dump_path}.L{index:02}.{}", std::process::id()))?
-                    .write_all(&bytes)?;
-            }
-        }
     }
 
     // A prefill chunk stops here: only the boundary token's sample is ever

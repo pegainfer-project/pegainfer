@@ -268,12 +268,6 @@ impl K3ExecutorConfig {
         {
             self.max_ctx = tokens;
         }
-        if let Ok(raw) = std::env::var("PEGAINFER_K3_CHUNK_TOKENS")
-            && let Ok(tokens) = raw.parse::<usize>()
-            && tokens > 0
-        {
-            self.chunk_tokens = tokens;
-        }
         self
     }
 
@@ -923,6 +917,19 @@ impl K3Executor {
         }
         let cache_len = model.cache_len();
         let capture_rows = self.max_batch.max(k3_chunk_bucket(self.chunk_tokens)?);
+        // The draft arena is preallocated per slot and the pending slab
+        // dominates — at the EP default max_batch the bill is tens of GiB.
+        // Surface the number before the allocator turns it into an OOM.
+        let arena_bytes = self.max_batch * K3DsparkSlotState::device_bytes(cache_len)
+            + capture_rows * K3_DSPARK_CONTEXT_DIM * size_of::<bf16>();
+        let arena_gib = arena_bytes as f64 / (1 << 30) as f64;
+        if arena_bytes > 16 << 30 {
+            warn!(
+                "K3 dspark draft arena wants {arena_gib:.1} GiB for {} slots — \
+                 set PEGAINFER_K3_MAX_BATCH well below the EP default",
+                self.max_batch
+            );
+        }
         let capture = self
             .ctx
             .stream
@@ -934,7 +941,7 @@ impl K3Executor {
         self.gpu.sync()?;
         info!(
             "K3 rank {} dspark draft lane armed: slots={}, cache_len={cache_len}, \
-             capture_rows={capture_rows}, taps={taps:?}",
+             capture_rows={capture_rows}, arena={arena_gib:.1} GiB, taps={taps:?}",
             self.model.rank, self.max_batch,
         );
         self.dspark = Some(K3DsparkRuntime {
@@ -945,11 +952,6 @@ impl K3Executor {
             taps,
         });
         Ok(())
-    }
-
-    /// Whether the DSpark draft lane is armed (see [`K3Executor::load_dspark`]).
-    pub fn spec_enabled(&self) -> bool {
-        self.dspark.is_some()
     }
 }
 
@@ -1333,20 +1335,6 @@ impl K3Executor {
                 .enumerate()
                 .take_while(|(index, draft)| sampled[anchor_row + index] as u32 == **draft)
                 .count();
-            // Debug-only acceptance trace while the investigation is open.
-            if std::env::var("PEGAINFER_K3_SPEC_TRACE").is_ok() {
-                let span: Vec<i32> = sampled[anchor_row..anchor_row + group.spec_rows].to_vec();
-                eprintln!(
-                    "[spec-trace] rank={} slot={} pos={} anchor={} drafts={:?} sampled={:?} accepted={}",
-                    self.model.rank,
-                    entry.slot,
-                    self.decode_state.positions[entry.slot],
-                    entry.anchor,
-                    entry.drafts,
-                    span,
-                    accepted,
-                );
-            }
             let committed: Vec<u32> = (0..=accepted)
                 .map(|index| sampled[anchor_row + index] as u32)
                 .collect();
@@ -1416,10 +1404,17 @@ impl K3Executor {
                 &[(entry.last_token, anchor_pos)],
                 &mut dspark.scratch,
             )?;
+            // Admission reserves `prompt + max_tokens` context, not the
+            // draft span: near the ceiling the verify appends at
+            // `anchor_pos + 1 ..= anchor_pos + drafts` must shed drafts
+            // instead of tripping the verify guard (fatal under EP). A
+            // 0-draft verify is a legal one-token deferred-commit step.
+            let headroom = (self.max_ctx - 1).saturating_sub(anchor_pos);
+            let keep = drafts[0].len().min(headroom);
             verify_batch.push(K3VerifySlot {
                 slot: entry.slot,
                 anchor: entry.last_token,
-                drafts: drafts[0].to_vec(),
+                drafts: drafts[0][..keep].to_vec(),
             });
         }
         // A slot's packed rows are its deferred-commit replay plus the
