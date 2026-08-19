@@ -335,6 +335,24 @@ tests ignored by default. The HF results remained within the established
 tolerances: short sequential/batched mean deltas `0.0260`/`0.0267`, and long
 sequential mean delta `0.0228`.
 
+#### Qwen3.5 feature CI gate
+
+The CUDA workflow now has separate matrix results for Qwen3.5 compile and
+Clippy. Both install the repository's CUDA 13.0.2 toolchain, Python 3.10, and
+pinned Triton 3.7.1, then build `pegainfer-qwen35` with the actual `qwen35`
+feature enabled for all targets on `sm_80`:
+
+```text
+cargo check --release --locked -p pegainfer-qwen35 --features qwen35 --all-targets
+cargo clippy --release --locked -p pegainfer-qwen35 --features qwen35 --all-targets -- -D warnings
+```
+
+This is a compile/lint merge gate, not a substitute for the ignored real-GPU
+TP2 tests above. The same target surface passed locally on SM86 with nightly
+2026-07-10 and Triton 3.4.0; both commands compiled the Qwen3.5 Triton AOT path.
+The GitHub jobs provide the independent Ubuntu, SM80, and pinned Triton 3.7.1
+verification.
+
 Delivered constraints:
 
 - Support mixed prefill+decode scheduler steps under TP.
