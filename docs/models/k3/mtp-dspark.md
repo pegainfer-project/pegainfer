@@ -6,7 +6,8 @@ reference rates — the RadixArk community DSpark drafter
 6-token blocks, a packed verify step commits them, and after the Markov
 row off-by-one fix full-depth EP4 serve commits 3.3 tokens/round on the
 cycle probe and 3.13 on a 4-prompt prose probe vs the same-checkpoint
-sglang reference's 3.0 / ~2.8. Verify is *not* bitwise plain decode
+sglang reference's 3.0 / ~2.8; the full 896-expert EP16 target commits
+4.0 on code, 2.8–2.9 on English prose, 1.3 on Chinese. Verify is *not* bitwise plain decode
 (chunkwise FlashKDA vs the fused core — near-tie argmaxes flip); the
 `spec_verify` gates certify what is exact instead.
 
@@ -159,7 +160,16 @@ Post-fix (tray08, EP4 full depth): cycle probe 3.3 committed/round
 prompts: 5.47/2.62/1.07/2.02 ≈ 2.8). Output text byte-identical to
 plain decode on the cycle probe.
 
-**Next**: acceptance measurement on the full 896-expert target (EP16);
-batched propose (one call per slot today); CUDA-graph the verify step
-(launch geometry varies with pending lengths — needs bucketing by
-lag-profile); adaptive block length via the confidence head.
+Full 896-expert target (EP16, trays 04–07, same probe suite): every
+prose/code continuation is coherent (no pruned-checkpoint repetition
+loops), per-request committed/round: cycle 4.00, English prose
+2.77 / 2.89, Chinese prose 1.33, Python code 4.00 (block cap is 7).
+The drafter was trained against full K3, and it shows — code and
+self-similar text saturate near RadixArk's published band (3.9–5.5,
+measured on chat-template benches); Chinese is the drafter's weak
+spot, not the verify path's.
+
+**Next**: batched propose (one call per slot today); CUDA-graph the
+verify step (launch geometry varies with pending lengths — needs
+bucketing by lag-profile); adaptive block length via the confidence
+head.
