@@ -12,8 +12,11 @@ sglang reference's 3.0 / ~2.8; the full 896-expert EP16 target commits
 `spec_verify` gates certify what is exact instead. E2e on the EP16 fleet
 (SPEED-Bench, 2026-08-19): **1.74× on low-entropy c1, 1.8× SLOWER on
 high-entropy c1, −27% throughput at c4 mixed** — the verify step's
-multi-row cost, not propose overhead, is the wall (see the round-anatomy
-section).
+multi-row cost, not propose overhead, is the wall. Measured on the EP16
+fleet: the 160 ms round is ~68 ms local small-batch math + **~85 ms of
+cross-tray sync stalls inside MegaMoE** (a ~2.8 ms stall every 8th
+expert layer, mechanism unidentified) — finding and hiding that stall
+outranks row packing (see the round-anatomy section).
 
 Last touched: 2026-08
 
@@ -211,11 +214,37 @@ fall out of this:
   move single-stream latency. It *does* matter at concurrency, where
   per-slot propose calls and their per-call pipeline drains stack.
 
-On EP16 the multi-row verify step inflates far worse than EP4 (round
-must be ≥ 140 ms on high-entropy for the TPOT to come out at 140 with
-≥1 commit/round, vs a 77 ms plain step) — the fabric all-to-all pays
-per row, so low-acceptance rounds are double-taxed: fewer commits AND
-a pricier step.
+**EP16 round anatomy, measured** (nsys on the full-model fleet, rank 0
+tray04, 103 clean c1 verify rounds; trace `~/k3-prof/ep16round.nsys-rep`):
+round p50 **160 ms** = local compute ~68 ms + **fabric wait ~85 ms** +
+propose ~3 ms + idle ~4 ms. The local-compute half matches the pruned
+EP4 step almost exactly (cuBLAS 24.7 ms, MLA 20.4 ms, elementwise/other
+11.8 ms, FlashKDA 3.0 ms, MegaMoE pure compute ~8 ms at 0.089 ms/launch
+— same per-launch p50 as pruned), confirming the per-rank isomorphism.
+The other half is wait **inside** the MegaMoE kernel (busy 92.8 ms vs
+~8 ms of compute): per-launch durations are bimodal (p50 0.089 ms, p95
+2.9 ms), and the slow launches recur with an exact **period of 8 expert
+layers** (positions 5,13,21,…,85 at ~2.8 ms each; 26 of 92 launches
+> 0.5 ms, the rest at compute speed) — NOT concentrated at step start
+(position 0 is cheap), so this is a recurring cross-rank
+synchronization stall, not one-time rank-arrival skew. The mechanism is
+not pinned down yet: the executor-ready `blocks=8` is the layer-geometry
+block count (`model/plan.rs`, unrelated to the fabric), and the mega
+slab holds token *rings* (`mega_ring_tokens` in
+`k3_mega_moe_sm100_common.cuh`) whose capacity is a template parameter
+— ring backpressure or a periodic barrier phase are the suspects to
+read out of the kernel. Whatever it is, it is absent on single-tray EP4
+(same kernel at 0.089–0.104 ms/launch flat), so it is cross-tray in
+origin, and it is a latency/pipelining problem before it is a bandwidth
+problem.
+
+Context for both halves: a b≤14-row step on 16×GB300 (8 TB/s HBM each)
+is ~0.2–0.5 ms of pure weight-bandwidth at the roofline. The 160 ms
+round — and the 77 ms plain step — are two orders of magnitude off,
+because the eager EP path runs one request's rows through
+latency-bound small GEMMs plus a shallow fabric pipeline. Spec-decode
+ratios measured on this baseline (the table above) will shift as the
+baseline improves.
 
 **Landed from this round**: batched propose
 (`feat/k3-batched-propose`) — `decode_spec` now makes one drafter call
@@ -233,12 +262,17 @@ main 3.45 mean tokens/round over 8 slots, no collapse → no anchor/state
 cross-wiring). `dspark_reference_cross_check` and the 6 `spec_verify`
 gates are green on the branch build.
 
-**Next, in value order**: (1) pack the verify step's per-row/per-group
-math across rows — biggest single lever on both TPOT columns; (2) size
-the EP16 fabric row-scaling directly (verify-step wall vs rows on the
-fleet) — if confirmed it caps spec at concurrency regardless of (1);
-(3) propose CUDA graph only after (1) fixes the packed geometry it
-would capture.
+**Next, in value order** (re-ranked by the EP16 measurement): (1)
+identify and hide the period-8 mega stall — read the mega kernel's
+cross-rank sync structure (token-ring capacity vs barrier phases),
+find what fires every 8th expert layer, then deepen or overlap it; the
+~85 ms of stalls is the single biggest line item; (2) pack the verify
+step's
+per-row/per-group math across rows — attacks the ~57 ms of small-batch
+cuBLAS/MLA/elementwise in the local half, and is the same work the
+plain decode step needs to approach roofline; (3) propose CUDA graph
+only after (2) fixes the packed geometry it would capture (~3 ms at
+c1, matters only at concurrency).
 
 **Not planned** (decided 2026-08-19): adaptive block length via the
 confidence head. The checkpoint ships a confidence head we don't load;
