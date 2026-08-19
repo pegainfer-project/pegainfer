@@ -19,6 +19,8 @@
 #   LOG_DIR         per-fleet logs (shared FS)             [~/k3-fleet-logs/<timestamp>]
 #   EXTRA_ENV       extra "K=V K=V" exported to every rank process
 #                   (e.g. "PEGAINFER_K3_MAX_BATCH=16 PEGAINFER_K3_MAX_CTX=8192")
+#   EXTRA_ARGS      extra CLI flags appended to every rank process
+#                   (e.g. "--dflash-draft-model-path /mnt/shared/weights/kimi-k3-dspark")
 #
 # Every process serves its own HTTP endpoint with one scheduler partition per
 # local rank; requests land on whichever host you curl (front them with a
@@ -35,6 +37,7 @@ RDV_PORT=${RDV_PORT:-19300}
 SERVED_NAME=${SERVED_NAME:-kimi-k3}
 STATE_DIR=${STATE_DIR:-$HOME/.k3-ep-fleet}
 EXTRA_ENV=${EXTRA_ENV:-}
+EXTRA_ARGS=${EXTRA_ARGS:-}
 
 SSH=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10)
 
@@ -80,6 +83,7 @@ start() {
          --k3-ep-size $world \
          --k3-ranks $start_rank..$end_rank \
          --k3-rendezvous '$rdv' \
+         $EXTRA_ARGS \
          > '$log' 2>&1 & echo \$! > '$pid_file'" </dev/null
   done
   echo "fleet launched: ep_size=$world over ${#fleet[@]} hosts, bootstrap $rdv"
