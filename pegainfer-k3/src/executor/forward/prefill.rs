@@ -35,6 +35,8 @@ use super::super::paged_kv::K3PagedKv;
 use super::gemm::K3PartialSpan;
 use super::gemm::k3_gemm_full;
 use super::gemm::k3_gemm_partial;
+use super::step::K3KdaGroup;
+use super::step::K3StepMode;
 use super::step::K3StepShape;
 use super::step::attn_res;
 use super::step::k3_step;
@@ -75,7 +77,45 @@ pub(crate) fn k3_prefill_chunk_step(
         shape.live_rows,
         shape.bucket
     );
-    k3_step(ctx, model, shape, true, state, scratch)
+    k3_step(ctx, model, shape, K3StepMode::PrefillChunk, state, scratch)
+}
+
+/// One speculative verify step: the batched step over packed per-slot row
+/// groups (deferred-commit replay + anchor + drafts per slot).
+///
+/// The caller stages `token_ids`, per-row `context_len` and `kv_row` (replay
+/// rows re-run positions whose latents are already cached, so their `kv_row`
+/// is `-1`), and stages the packed verify block table. The argmax epilogue
+/// runs over the whole bucket; the caller reads the span rows' argmaxes back
+/// and decides acceptance.
+pub(crate) fn k3_verify_step(
+    ctx: &DeviceContext,
+    model: &K3RankModel,
+    shape: K3StepShape,
+    groups: &[K3KdaGroup],
+    state: &mut K3StatePool,
+    scratch: &mut K3Scratch,
+) -> Result<()> {
+    for group in groups {
+        ensure!(
+            group.row + group.commit_rows + group.spec_rows <= shape.bucket
+                && group.spec_rows > 0
+                && group.state_row < state.rows,
+            "K3 verify group at row {} ({}+{} rows, state row {}) does not fit the step",
+            group.row,
+            group.commit_rows,
+            group.spec_rows,
+            group.state_row,
+        );
+    }
+    k3_step(
+        ctx,
+        model,
+        shape,
+        K3StepMode::Verify(groups),
+        state,
+        scratch,
+    )
 }
 
 /// Sample the prefill boundary token: the epilogue the chunk steps skipped,
@@ -151,10 +191,15 @@ pub(crate) fn k3_prefill_boundary_sample(
     )
 }
 
-/// The KDA layer of a prefill chunk: batched projections, a batched
-/// convolution over prebuilt windows, and the delta rule as one chunkwise
-/// FlashKDA forward (third_party/flash-kda, MIT, MoonshotAI) — the per-token
-/// walk collapses into two launches per layer.
+/// The KDA layer of a prefill chunk or verify step: batched projections, a
+/// batched convolution over prebuilt windows, and the delta rule as chunkwise
+/// FlashKDA forwards (third_party/flash-kda, MIT, MoonshotAI) — the per-token
+/// walk collapses into a handful of launches per layer.
+///
+/// `groups` carves the bucket into per-sequence segments (see
+/// [`K3KdaGroup`]): a prefill chunk is the one-group all-commit case, a
+/// verify step packs one group per slot with a commit prefix (the deferred
+/// replay) and a speculative tail whose successor state is discarded.
 ///
 /// Numerics: the convolution windows are the landed bf16 inputs themselves
 /// (`window[t][j] = x[t - 3 + j]`, carried window for the first rows), so the
@@ -162,20 +207,20 @@ pub(crate) fn k3_prefill_boundary_sample(
 /// delta rule the fused TileLang core spells — same gate formula from the
 /// same pre-activation landing, beta sigmoid in-kernel — but with an f32 q/k
 /// l2norm chain (the TileLang core mirrors the reference's bf16 chain) and
-/// chunkwise accumulation order, and the projections run at the chunk's
-/// bucket. Chunked prefill is therefore held to the fixture's noise floor,
-/// like any cross-bucket comparison; decode keeps the bit-matched fused core.
+/// chunkwise accumulation order, and the projections run at the step's
+/// bucket. Chunked prefill and verify are therefore held to the fixture's
+/// noise floor, like any cross-bucket comparison; decode keeps the
+/// bit-matched fused core.
 pub(super) fn kda_attention_chunk(
     ctx: &DeviceContext,
     shape: K3StepShape,
     layer: &K3LayerWeights,
     w: &K3KdaWeights,
     kda_state: &mut K3KdaState,
+    groups: &[K3KdaGroup],
     s: &mut K3Scratch,
 ) -> Result<()> {
     let b = shape.bucket;
-    let tokens = shape.live_rows;
-    let start_parity = shape.parity;
     // Batched projections — the decode arm's launches, at the chunk's bucket.
     k3_rms_norm_rbs_batched_launch(
         ctx,
@@ -234,8 +279,7 @@ pub(super) fn kda_attention_chunk(
     kda_conv_stream_chunk(
         ctx,
         b,
-        tokens,
-        start_parity,
+        groups,
         &w.wbig,
         0,
         &w.cw_q,
@@ -251,8 +295,7 @@ pub(super) fn kda_attention_chunk(
     kda_conv_stream_chunk(
         ctx,
         b,
-        tokens,
-        start_parity,
+        groups,
         &w.wbig,
         K3_ATTN_INNER,
         &w.cw_k,
@@ -268,8 +311,7 @@ pub(super) fn kda_attention_chunk(
     kda_conv_stream_chunk(
         ctx,
         b,
-        tokens,
-        start_parity,
+        groups,
         &w.wbig,
         2 * K3_ATTN_INNER,
         &w.cw_v,
@@ -283,13 +325,16 @@ pub(super) fn kda_attention_chunk(
         &mut s.conv_v,
     )?;
 
-    // The chunkwise delta rule: the whole chunk through the vendored FlashKDA
-    // forward (third_party/flash-kda) — two launches instead of a per-token
-    // walk. The pre-activation gate lands bf16 first, the fused core's own
+    // The chunkwise delta rule: each group's segment through the vendored
+    // FlashKDA forward (third_party/flash-kda) instead of a per-token walk.
+    // The pre-activation gate lands bf16 first, the fused core's own
     // `bf16(Σ gp)` landing; FlashKDA adds dt_bias and applies the activation
-    // in-kernel, from the same formula. The recurrent state reads the
-    // start-parity slab and lands in the other one: under the chunkwise
-    // kernel, parity is a per-chunk double buffer, not a per-token flip.
+    // in-kernel, from the same formula. The recurrent state reads the group's
+    // parity slab and the commit rows land in the other one: under the
+    // chunkwise kernel, parity is a per-segment double buffer, not a
+    // per-token flip. A group's speculative tail continues from the state
+    // its commit rows just landed and writes its successor back into the
+    // now-dead read slab — junk the next round's commit overwrites.
     k3_land_batched_launch(
         ctx,
         b,
@@ -300,27 +345,45 @@ pub(super) fn kda_attention_chunk(
         &s.kda_forget_partial,
         &mut s.kda_g,
     )?;
-    {
-        let (recurrent_read, recurrent_write) = parity_pair(&mut kda_state.recurrent, start_parity);
-        k3_flash_kda_fwd_launch(
-            ctx,
-            tokens,
-            K3_HEADS,
-            &s.conv_q,
-            &s.conv_k,
-            &s.conv_v,
-            &s.kda_g,
-            &s.beta,
-            &mut s.kda_beta_t,
-            &w.a_log,
-            &w.dt_bias,
-            recurrent_read,
-            recurrent_write,
-            &mut s.kda_attn,
-            &mut s.flash_kda_ws,
-            (K3_HEAD_DIM as f32).powf(-0.5),
-            crate::config::K3_KDA_GATE_LOWER_BOUND as f32,
-        )?;
+    for group in groups {
+        let segments = [
+            (group.row, group.commit_rows, group.parity),
+            (
+                group.row + group.commit_rows,
+                group.spec_rows,
+                group.parity ^ usize::from(group.commit_rows > 0),
+            ),
+        ];
+        // A pure prefill chunk has no speculative tail; a first verify round
+        // after prefill has no commit prefix.
+        for (row, rows, read_parity) in segments.into_iter().filter(|segment| segment.1 > 0) {
+            let (recurrent_read, recurrent_write) =
+                parity_pair(&mut kda_state.recurrent, read_parity);
+            k3_flash_kda_fwd_launch(
+                ctx,
+                rows,
+                K3_HEADS,
+                pegainfer_kernels::ops::K3FlashKdaSpan {
+                    row,
+                    state_in_row: group.state_row,
+                    state_out_row: group.state_row,
+                },
+                &s.conv_q,
+                &s.conv_k,
+                &s.conv_v,
+                &s.kda_g,
+                &s.beta,
+                &mut s.kda_beta_t,
+                &w.a_log,
+                &w.dt_bias,
+                recurrent_read,
+                recurrent_write,
+                &mut s.kda_attn,
+                &mut s.flash_kda_ws,
+                (K3_HEAD_DIM as f32).powf(-0.5),
+                crate::config::K3_KDA_GATE_LOWER_BOUND as f32,
+            )?;
+        }
     }
     // o_norm × output gate — the fused core's tail as its own batched launch;
     // rows past the chunk carry stale data the step discards with the rest of
@@ -351,14 +414,14 @@ pub(super) fn kda_attention_chunk(
     )
 }
 
-/// One q/k/v stream of a prefill chunk: the batched band projection, the
-/// window build, one batched convolution, and the carry into the next chunk.
+/// One q/k/v stream of a prefill chunk or verify step: the batched band
+/// projection, the per-group window builds, one batched convolution, and each
+/// group's carry into its next segment.
 #[allow(clippy::too_many_arguments)]
 fn kda_conv_stream_chunk(
     ctx: &DeviceContext,
     b: usize,
-    tokens: usize,
-    start_parity: usize,
+    groups: &[K3KdaGroup],
     fused: &DeviceMatrix,
     band: usize,
     taps: &CudaSlice<f32>,
@@ -372,6 +435,7 @@ fn kda_conv_stream_chunk(
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     let inner = K3_ATTN_INNER;
+    let window_row = K3_CONV_STATE * inner;
     k3_gemm_partial(
         ctx,
         fused,
@@ -382,24 +446,27 @@ fn kda_conv_stream_chunk(
         partial,
         K3PartialSpan::whole(inner),
     )?;
-    // Land the chunk's inputs once: the window entries ARE these bf16 rows,
+    // Land the step's inputs once: the window entries ARE these bf16 rows,
     // the same cast the conv kernel itself applies.
     k3_land_batched_launch(ctx, b, inner, inner, 0, 1, partial, xs)?;
-    // Row t's window slot j holds input `t - K3_CONV_STATE + j`: from the
-    // chunk itself once that token exists, from the carried window before it.
-    {
-        let carry = &conv_state[start_parity][stream_index];
+    // Row t of a group's window slot j holds the group's input `t -
+    // K3_CONV_STATE + j`: from the segment itself once that token exists,
+    // from the slot's carried window before it. Rows outside every group
+    // keep stale windows; their conv output is padding and is discarded.
+    for group in groups {
+        let tokens = group.commit_rows + group.spec_rows;
+        let carry = &conv_state[group.parity][stream_index];
         for j in 0..K3_CONV_STATE {
             let lead = K3_CONV_STATE - j;
             if tokens > lead {
                 copy_rows_2d(
                     ctx,
                     xs,
-                    0,
+                    group.row * inner,
                     inner,
                     window,
-                    (lead * K3_CONV_STATE + j) * inner,
-                    K3_CONV_STATE * inner,
+                    ((group.row + lead) * K3_CONV_STATE + j) * inner,
+                    window_row,
                     tokens - lead,
                     inner,
                 )?;
@@ -408,10 +475,10 @@ fn kda_conv_stream_chunk(
                 copy_rows_2d(
                     ctx,
                     carry,
-                    (t + j) * inner,
+                    (group.state_row * K3_CONV_STATE + t + j) * inner,
                     inner,
                     window,
-                    (t * K3_CONV_STATE + j) * inner,
+                    ((group.row + t) * K3_CONV_STATE + j) * inner,
                     inner,
                     1,
                     inner,
@@ -432,22 +499,26 @@ fn kda_conv_stream_chunk(
         out,
         window_next,
     )?;
-    // The carry into the next chunk is the successor window of the chunk's
-    // last token — for a chunk shorter than the window it already folds the
-    // slots carried in above. It lands in the other parity slab, agreeing
-    // with the recurrent state's per-chunk double buffering.
-    let end_parity = start_parity ^ 1;
-    copy_rows_2d(
-        ctx,
-        window_next,
-        (tokens - 1) * K3_CONV_STATE * inner,
-        K3_CONV_STATE * inner,
-        &mut conv_state[end_parity][stream_index],
-        0,
-        K3_CONV_STATE * inner,
-        1,
-        K3_CONV_STATE * inner,
-    )
+    // A group's carry into its next segment is the successor window of its
+    // last COMMIT row — for a segment shorter than the window it already
+    // folds the slots carried in above. It lands in the other parity slab,
+    // agreeing with the recurrent state's per-segment double buffering. The
+    // speculative tail's successors are never carried: its tokens replay as
+    // the next round's commit rows.
+    for group in groups.iter().filter(|group| group.commit_rows > 0) {
+        copy_rows_2d(
+            ctx,
+            window_next,
+            (group.row + group.commit_rows - 1) * window_row,
+            window_row,
+            &mut conv_state[group.parity ^ 1][stream_index],
+            group.state_row * window_row,
+            window_row,
+            1,
+            window_row,
+        )?;
+    }
+    Ok(())
 }
 
 /// One prefill chunk's MLA attention over FlashMLA's dense FMHA.

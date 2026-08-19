@@ -46,6 +46,13 @@ pub(crate) struct K3PagedKv {
     pub(crate) table_dev: CudaSlice<i32>,
     /// Host mirror; the executor mutates this and re-uploads before a step.
     table_host: Vec<i32>,
+    /// A verify step's packed block table, same shape as `table_dev`. A verify
+    /// step packs several slots' row groups into one bucket, so batch row `r`
+    /// is not slot `r` — the attention kernel walks this table instead, each
+    /// row staged from its group's slot chain, and the slot-indexed
+    /// `table_host` record stays untouched.
+    pub(crate) verify_table_dev: CudaSlice<i32>,
+    verify_table_host: Vec<i32>,
     /// Free page ids; `pop` hands them out in ascending order from fresh.
     free: Vec<i32>,
 }
@@ -77,6 +84,11 @@ impl K3PagedKv {
                 .clone_htod(&vec![-1i32; rows * max_pages_per_slot])
                 .context("alloc K3 KV block table")?,
             table_host: vec![-1; rows * max_pages_per_slot],
+            verify_table_dev: ctx
+                .stream
+                .clone_htod(&vec![-1i32; rows * max_pages_per_slot])
+                .context("alloc K3 KV verify block table")?,
+            verify_table_host: vec![-1; rows * max_pages_per_slot],
             free: (0..num_pages as i32).rev().collect(),
         })
     }
@@ -93,8 +105,9 @@ impl K3PagedKv {
     }
 
     /// Make sure the page holding `position` is mapped for `row`, zeroing a
-    /// freshly claimed page (the step's cache write is an indexed *add*, so
-    /// the destination must be zero until the write).
+    /// freshly claimed page (hygiene: the cache write is an indexed store, so
+    /// nothing reads an unwritten position, but a zeroed page keeps any stale
+    /// speculation finite).
     pub(crate) fn ensure_mapped(
         &mut self,
         ctx: &DeviceContext,
@@ -222,13 +235,34 @@ impl K3PagedKv {
             .map_err(|error| anyhow::anyhow!("K3 KV block-table feed failed: {error}"))
     }
 
+    /// Stage `slot`'s page chain into verify-table row `row`. A verify step
+    /// packs its batch rows, so several consecutive rows point at one slot's
+    /// chain; causality still comes from the per-row context length.
+    pub(crate) fn stage_verify_row(&mut self, row: usize, slot: usize) -> Result<()> {
+        let width = self.max_pages_per_slot;
+        ensure!(
+            (row + 1) * width <= self.verify_table_host.len()
+                && (slot + 1) * width <= self.table_host.len(),
+            "K3 KV verify-table stage of row {row} from slot {slot} is out of range"
+        );
+        self.verify_table_host[row * width..(row + 1) * width]
+            .copy_from_slice(&self.table_host[slot * width..(slot + 1) * width]);
+        Ok(())
+    }
+
+    /// Upload the verify-step block table, staged row by row above.
+    pub(crate) fn sync_verify_table(&mut self, ctx: &DeviceContext) -> Result<()> {
+        ctx.stream
+            .memcpy_htod(&self.verify_table_host, &mut self.verify_table_dev)
+            .map_err(|error| anyhow::anyhow!("K3 KV verify block-table feed failed: {error}"))
+    }
+
     /// Write one step's latent rows into layer `mla_index`'s page slices.
     ///
     /// `kv_row` is the per-batch-row destination from [`Self::write_index`]
     /// (`-1` for rows the step does not own — the indexed write skips them).
-    /// The destination is zero until this step writes it — a page is zeroed
-    /// when claimed and every position is written once — so the indexed add is
-    /// an exact indexed copy, taking the destination row from the device.
+    /// Store semantics: a verify step's rejected drafts leave stale latents at
+    /// their positions, and the next round's rows overwrite them in place.
     pub(crate) fn append_latent(
         &mut self,
         ctx: &DeviceContext,
@@ -262,9 +296,8 @@ impl K3PagedKv {
         ] {
             let (delta_ptr, _delta_guard) = delta.device_ptr(&ctx.stream);
             unsafe {
-                pegainfer_kernels::ffi::scaled_add_rows_indexed_cuda(
+                pegainfer_kernels::ffi::store_rows_indexed_cuda(
                     delta_ptr as *const pegainfer_kernels::ffi::Half,
-                    1.0,
                     kv_row_ptr as *const i32,
                     base as *mut pegainfer_kernels::ffi::Half,
                     K3_MLA_LATENT_ROW as i32,

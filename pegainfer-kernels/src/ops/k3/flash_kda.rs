@@ -35,19 +35,34 @@ pub fn k3_flash_kda_workspace_bytes(t_total: usize, heads: usize) -> usize {
     unsafe { ffi::k3_flash_kda_workspace_bytes(t_total as i32, heads as i32) as usize }
 }
 
-/// One prefill chunk through one KDA layer's chunkwise forward.
+/// Row offsets addressing one segment of a larger step through the forward.
 ///
-/// `q`/`k`/`v`/`g` and `out` are `[t_total, heads * 128]` bf16 rows (`g` is
-/// the pre-activation gate projection); `beta` is `[t_total, heads]` bf16
-/// logits, transposed into `beta_scratch` (`[heads, t_total]`) for the
-/// kernel's 1D TMA. `a_log [heads]` and `dt_bias [heads * 128]` are f32
-/// weights. `state_in`/`state_out` are one `[heads, 128, 128]` f32 recurrent
-/// row each — pass the parity pair, they may not alias.
+/// `row` shifts q/k/v/g/beta/out by that many token rows; `state_in_row` /
+/// `state_out_row` pick a `[heads, 128, 128]` recurrent row out of a pooled
+/// state slab. A verify step runs one call per (slot, segment) over the
+/// step-wide projection buffers, so every operand needs its own base.
+#[derive(Clone, Copy, Default)]
+pub struct K3FlashKdaSpan {
+    pub row: usize,
+    pub state_in_row: usize,
+    pub state_out_row: usize,
+}
+
+/// One token segment through one KDA layer's chunkwise forward.
+///
+/// `q`/`k`/`v`/`g` and `out` are `[t_total, heads * 128]` bf16 rows starting
+/// at `span.row` (`g` is the pre-activation gate projection); `beta` is
+/// `[t_total, heads]` bf16 logits from the same row, transposed into
+/// `beta_scratch` (`[heads, t_total]`) for the kernel's 1D TMA. `a_log
+/// [heads]` and `dt_bias [heads * 128]` are f32 weights. `state_in` /
+/// `state_out` are read at their span rows — one `[heads, 128, 128]` f32
+/// recurrent row each — and the addressed rows may not alias.
 #[allow(clippy::too_many_arguments)]
 pub fn k3_flash_kda_fwd_launch(
     ctx: &DeviceContext,
     t_total: usize,
     heads: usize,
+    span: K3FlashKdaSpan,
     q: &CudaSlice<bf16>,
     k: &CudaSlice<bf16>,
     v: &CudaSlice<bf16>,
@@ -65,18 +80,21 @@ pub fn k3_flash_kda_fwd_launch(
 ) -> Result<()> {
     let d = K3_FLASH_KDA_HEAD_DIM;
     let width = heads * d;
+    let rows = span.row + t_total;
     ensure!(t_total > 0, "K3 FlashKDA got an empty chunk");
     ensure!(
-        q.len() >= t_total * width
-            && k.len() >= t_total * width
-            && v.len() >= t_total * width
-            && g.len() >= t_total * width
-            && out.len() >= t_total * width,
-        "K3 FlashKDA q/k/v/g/out buffers too small for t={t_total}, heads={heads}"
+        q.len() >= rows * width
+            && k.len() >= rows * width
+            && v.len() >= rows * width
+            && g.len() >= rows * width
+            && out.len() >= rows * width,
+        "K3 FlashKDA q/k/v/g/out buffers too small for t={t_total}+{}, heads={heads}",
+        span.row
     );
     ensure!(
-        beta.len() >= t_total * heads && beta_scratch.len() >= t_total * heads,
-        "K3 FlashKDA beta buffers too small for t={t_total}, heads={heads}: beta {}, scratch {}",
+        beta.len() >= rows * heads && beta_scratch.len() >= t_total * heads,
+        "K3 FlashKDA beta buffers too small for t={t_total}+{}, heads={heads}: beta {}, scratch {}",
+        span.row,
         beta.len(),
         beta_scratch.len()
     );
@@ -86,10 +104,13 @@ pub fn k3_flash_kda_fwd_launch(
     );
     let state = heads * d * d;
     ensure!(
-        state_in.len() >= state && state_out.len() >= state,
-        "K3 FlashKDA state rows too small for heads={heads}: in {}, out {}",
+        state_in.len() >= (span.state_in_row + 1) * state
+            && state_out.len() >= (span.state_out_row + 1) * state,
+        "K3 FlashKDA state rows too small for heads={heads}: in {} @row {}, out {} @row {}",
         state_in.len(),
-        state_out.len()
+        span.state_in_row,
+        state_out.len(),
+        span.state_out_row
     );
     let needed = k3_flash_kda_workspace_bytes(t_total, heads);
     ensure!(
@@ -98,7 +119,9 @@ pub fn k3_flash_kda_fwd_launch(
         workspace.len()
     );
 
+    let row_shift = |ptr: u64, stride: usize| ptr + (span.row * stride * size_of::<bf16>()) as u64;
     let (beta_ptr, _beta_guard) = beta.device_ptr(&ctx.stream);
+    let beta_ptr = row_shift(beta_ptr, heads);
     let (beta_t_ptr, _beta_t_guard) = beta_scratch.device_ptr_mut(&ctx.stream);
     let rc = unsafe {
         ffi::k3_flash_kda_beta_transpose(
@@ -112,15 +135,23 @@ pub fn k3_flash_kda_fwd_launch(
     rc.result()
         .map_err(|error| anyhow!("K3 FlashKDA beta transpose (T={t_total}, H={heads}): {error}"))?;
 
+    let state_shift = |ptr: u64, row: usize| ptr + (row * state * size_of::<f32>()) as u64;
     let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
+    let q_ptr = row_shift(q_ptr, width);
     let (k_ptr, _k_guard) = k.device_ptr(&ctx.stream);
+    let k_ptr = row_shift(k_ptr, width);
     let (v_ptr, _v_guard) = v.device_ptr(&ctx.stream);
+    let v_ptr = row_shift(v_ptr, width);
     let (g_ptr, _g_guard) = g.device_ptr(&ctx.stream);
+    let g_ptr = row_shift(g_ptr, width);
     let (a_log_ptr, _a_log_guard) = a_log.device_ptr(&ctx.stream);
     let (dt_bias_ptr, _dt_bias_guard) = dt_bias.device_ptr(&ctx.stream);
     let (state_in_ptr, _state_in_guard) = state_in.device_ptr(&ctx.stream);
+    let state_in_ptr = state_shift(state_in_ptr, span.state_in_row);
     let (state_out_ptr, _state_out_guard) = state_out.device_ptr_mut(&ctx.stream);
+    let state_out_ptr = state_shift(state_out_ptr, span.state_out_row);
     let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    let out_ptr = row_shift(out_ptr, width);
     let (ws_ptr, _ws_guard) = workspace.device_ptr_mut(&ctx.stream);
     let rc = unsafe {
         ffi::k3_flash_kda_fwd(

@@ -19,6 +19,7 @@ use super::super::buffers::K3StatePool;
 use super::gemm::K3PartialSpan;
 use super::gemm::k3_gemm_full;
 use super::gemm::k3_gemm_partial;
+use super::step::K3StepMode;
 use super::step::K3StepShape;
 use super::step::k3_step;
 use crate::config::K3_ATTN_INNER;
@@ -45,7 +46,7 @@ pub(crate) fn k3_decode_step(
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
 ) -> Result<()> {
-    k3_step(ctx, model, shape, false, state, scratch)
+    k3_step(ctx, model, shape, K3StepMode::Decode, state, scratch)
 }
 
 #[allow(clippy::too_many_arguments)]

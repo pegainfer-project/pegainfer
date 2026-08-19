@@ -926,6 +926,18 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn store_rows_indexed_cuda(
+        src: *const Half,
+        token_indices: *const i32,
+        out: *mut Half,
+        out_hidden_dim: i32,
+        row_offset: i32,
+        rows: i32,
+        token_count: i32,
+        out_seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn scale_f32_cuda(values: *mut f32, scale: f32, n: i32, stream: CUstream) -> CUresult;
 
     pub fn accumulate_bf16_token_scaled_to_f32_cuda(

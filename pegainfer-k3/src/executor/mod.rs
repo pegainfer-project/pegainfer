@@ -93,10 +93,12 @@ use self::buffers::K3StatePool;
 use self::ep::K3EpRendezvous;
 use self::ep::K3EpRuntime;
 use self::ep::ep_fatal;
+use self::forward::K3KdaGroup;
 use self::forward::K3StepShape;
 use self::forward::k3_decode_step;
 use self::forward::k3_prefill_boundary_sample;
 use self::forward::k3_prefill_chunk_step;
+use self::forward::k3_verify_step;
 use crate::config::K3_DENSE_LAYERS;
 use crate::config::K3_LAYERS;
 use crate::config::K3MoeTopo;
@@ -275,6 +277,29 @@ impl K3ExecutorConfig {
     }
 }
 
+/// One slot's input to a speculative verify step.
+#[derive(Clone, Debug)]
+pub struct K3VerifySlot {
+    pub slot: SlotId,
+    /// The slot's most recent committed token — the span's first row.
+    pub anchor: u32,
+    /// The drafted continuation under verification. May be empty: a verify
+    /// step with no drafts is a one-token decode with deferred KDA commit.
+    pub drafts: Vec<u32>,
+}
+
+/// One slot's speculative-decode bookkeeping between verify steps.
+#[derive(Clone, Debug, Default)]
+struct K3SpecSlot {
+    /// Tokens the last verify round committed whose KDA state advance is
+    /// deferred (the accepted span, anchor first). They replay as the next
+    /// round's commit rows. Their MLA latents are already cached and their
+    /// count is already folded into the pool's `positions`.
+    pending: Vec<u32>,
+    /// Which parity slab holds the slot's committed KDA state.
+    parity: usize,
+}
+
 pub struct K3Executor {
     gpu: K3RankGpuContext,
     ctx: DeviceContext,
@@ -291,7 +316,14 @@ pub struct K3Executor {
     groups: usize,
     num_sms: usize,
     /// Which half of the ping-pong state slabs the next decode step reads.
+    /// Verify steps never read it — their parity is per-slot
+    /// ([`K3SpecSlot::parity`]) — which is why plain decode and verify must
+    /// not mix on one executor: a decode step advances EVERY row's state at
+    /// the global parity, clobbering the per-slot committed slabs.
     parity: usize,
+    /// Per-slot speculative-decode state, meaningful only while every decode
+    /// step on this executor is a verify step.
+    spec: Vec<K3SpecSlot>,
     cuda_graph: bool,
     /// Routed experts run through the fused MegaMoE kernel.
     mega: bool,
@@ -582,6 +614,7 @@ impl K3Executor {
             groups,
             num_sms,
             parity: 0,
+            spec: vec![K3SpecSlot::default(); max_batch],
             cuda_graph,
             mega,
             mega_launches_per_step: if mega && ep_size > 1 {
@@ -833,6 +866,9 @@ impl StepExecutor for K3Executor {
         {
             log::warn!("K3 slot {slot} release did not clear its state: {error:#}");
         }
+        if let Some(spec) = self.spec.get_mut(slot) {
+            *spec = K3SpecSlot::default();
+        }
     }
 }
 
@@ -931,6 +967,10 @@ impl K3Executor {
             slot,
             target_parity,
         )?;
+        self.spec[slot] = K3SpecSlot {
+            pending: Vec::new(),
+            parity: target_parity,
+        };
         self.gpu.sync()?;
         Ok(sampled)
     }
@@ -997,5 +1037,147 @@ impl K3Executor {
             .iter()
             .map(|entry| sampled[entry.slot] as u32)
             .collect())
+    }
+
+    /// One speculative verify round over `batch`, returning each slot's
+    /// committed tokens (accepted drafts plus the model's own token —
+    /// correction or bonus), parallel to `batch`. Greedy acceptance: a draft
+    /// stands exactly when it equals the argmax at its position.
+    ///
+    /// Verify replaces plain decode wholesale once a slot uses it: a plain
+    /// decode step advances every row's KDA state at the global parity and
+    /// would clobber the per-slot committed slabs (see the `parity` field).
+    /// An empty batch is the expert-parallel padding step, as for decode.
+    pub fn verify(&mut self, batch: &[K3VerifySlot]) -> Result<Vec<Vec<u32>>> {
+        let rank = self.model.rank;
+        match self.verify_inner(batch) {
+            Err(error) if self.is_expert_parallel() => ep_fatal(rank, "verify", &error),
+            other => other,
+        }
+    }
+
+    fn verify_inner(&mut self, batch: &[K3VerifySlot]) -> Result<Vec<Vec<u32>>> {
+        if batch.is_empty() && !self.is_expert_parallel() {
+            return Ok(Vec::new());
+        }
+        self.enter_step()?;
+        // Pack the bucket: per slot, the deferred-commit replay rows then the
+        // speculative span (anchor + drafts).
+        let mut groups = Vec::with_capacity(batch.len());
+        let mut rows = 0usize;
+        for entry in batch {
+            ensure!(
+                entry.slot < self.max_batch,
+                "K3 verify slot {} is out of range",
+                entry.slot
+            );
+            let lag = self.spec[entry.slot].pending.len();
+            groups.push(K3KdaGroup {
+                row: rows,
+                commit_rows: lag,
+                spec_rows: 1 + entry.drafts.len(),
+                state_row: entry.slot,
+                parity: self.spec[entry.slot].parity,
+            });
+            rows += lag + 1 + entry.drafts.len();
+        }
+        ensure!(
+            rows <= self.max_batch,
+            "K3 verify step of {rows} rows exceeds the {} row budget",
+            self.max_batch
+        );
+        let bucket = k3_batch_bucket(rows.max(1))?;
+
+        for row in 0..bucket {
+            self.token_host[row] = 0;
+            self.context_len_host[row] = 1;
+            self.kv_row_host[row] = -1;
+        }
+        for (entry, group) in batch.iter().zip(&groups) {
+            let slot = entry.slot;
+            let anchor_position = self.decode_state.positions[slot];
+            ensure!(
+                group.commit_rows <= anchor_position,
+                "K3 slot {slot} carries {} pending tokens but only {anchor_position} positions",
+                group.commit_rows
+            );
+            ensure!(
+                anchor_position + group.spec_rows <= self.max_ctx,
+                "K3 slot {slot} verify span reaches past its {} token context",
+                self.max_ctx
+            );
+            // Replay rows re-run positions whose latents are already cached:
+            // no KV write, context up to and including their own position.
+            for (index, token) in self.spec[slot].pending.iter().enumerate() {
+                let row = group.row + index;
+                let position = anchor_position - group.commit_rows + index;
+                self.token_host[row] = *token;
+                self.context_len_host[row] = i32::try_from(position + 1)?;
+            }
+            // The speculative span appends its latents as it goes; a later
+            // round's rows overwrite whatever a rejected draft left behind.
+            let span = std::iter::once(entry.anchor).chain(entry.drafts.iter().copied());
+            for (index, token) in span.enumerate() {
+                let row = group.row + group.commit_rows + index;
+                let position = anchor_position + index;
+                self.token_host[row] = token;
+                self.context_len_host[row] = i32::try_from(position + 1)?;
+                self.decode_state
+                    .kv
+                    .ensure_mapped(&self.ctx, slot, position)?;
+                self.kv_row_host[row] = self.decode_state.kv.write_index(slot, position)?;
+            }
+            for row in group.row..group.row + group.commit_rows + group.spec_rows {
+                self.decode_state.kv.stage_verify_row(row, slot)?;
+            }
+        }
+
+        self.feed()?;
+        self.decode_state.kv.sync_verify_table(&self.ctx)?;
+        // Always eager: the per-group launch geometry varies with the batch's
+        // pending lengths, so there is no fixed body to capture.
+        let shape = self.shape(bucket, 0, rows);
+        let launches = self.mega_launches_per_step;
+        if let Some(mega) = self.scratch.mega.as_mut() {
+            mega.begin_step(launches);
+        }
+        k3_verify_step(
+            &self.ctx,
+            &self.model,
+            shape,
+            &groups,
+            &mut self.decode_state,
+            &mut self.scratch,
+        )?;
+        if let Some(mega) = self.scratch.mega.as_ref() {
+            mega.end_step()?;
+        }
+
+        let sampled = self.sampled(self.max_batch)?.to_vec();
+        let mut outcomes = Vec::with_capacity(batch.len());
+        for (entry, group) in batch.iter().zip(&groups) {
+            let anchor_row = group.row + group.commit_rows;
+            let accepted = entry
+                .drafts
+                .iter()
+                .enumerate()
+                .take_while(|(index, draft)| sampled[anchor_row + index] as u32 == **draft)
+                .count();
+            let committed: Vec<u32> = (0..=accepted)
+                .map(|index| sampled[anchor_row + index] as u32)
+                .collect();
+            // The anchor and the accepted drafts are now cache-valid; their
+            // KDA advance replays as the next round's commit rows.
+            self.decode_state.positions[entry.slot] += accepted + 1;
+            let spec = &mut self.spec[entry.slot];
+            spec.pending.clear();
+            spec.pending.push(entry.anchor);
+            spec.pending.extend_from_slice(&entry.drafts[..accepted]);
+            if group.commit_rows > 0 {
+                spec.parity ^= 1;
+            }
+            outcomes.push(committed);
+        }
+        Ok(outcomes)
     }
 }

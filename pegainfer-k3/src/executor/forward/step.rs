@@ -133,11 +133,52 @@ impl K3StepShape {
     }
 }
 
+/// One slot's contiguous row segment of a verify step, and how its KDA state
+/// advances across it.
+///
+/// A verify step packs several slots into one bucket: each contributes its
+/// deferred-commit replay (the tokens the last round accepted, whose KDA
+/// state advance was deferred) followed by its speculative span (the anchor
+/// and the drafts under verification). The commit rows move the slot's
+/// recurrent/conv state from its parity slab into the other one; the spec
+/// rows continue from that committed state but their successor state is
+/// discarded — acceptance is not known until the host reads the argmaxes
+/// back, so the accepted prefix replays as the NEXT round's commit rows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct K3KdaGroup {
+    /// First batch row of the segment.
+    pub(crate) row: usize,
+    /// Leading replay rows whose state advance commits (parity flips).
+    pub(crate) commit_rows: usize,
+    /// Trailing speculative rows whose successor state is discarded.
+    pub(crate) spec_rows: usize,
+    /// The slot's row in the state pool's KDA/conv slabs.
+    pub(crate) state_row: usize,
+    /// Which parity slab holds the slot's committed state.
+    pub(crate) parity: usize,
+}
+
+/// Which of the three step families this launch sequence runs. The trunk is
+/// identical; the arms diverge at the KDA/MLA leaves and the epilogue.
+#[derive(Clone, Copy)]
+pub(crate) enum K3StepMode<'a> {
+    /// One independent sequence per row: fused per-token KDA core, absorbed
+    /// paged MLA, full epilogue.
+    Decode,
+    /// Rows are consecutive tokens of ONE sequence: chunkwise KDA, dense-FMHA
+    /// MLA, no epilogue (the boundary sample runs separately).
+    PrefillChunk,
+    /// Speculative verify: rows are packed per-slot segments. Chunkwise KDA
+    /// per group with deferred commit, absorbed paged MLA over the packed
+    /// verify table, full epilogue (the argmaxes decide acceptance).
+    Verify(&'a [K3KdaGroup]),
+}
+
 pub(super) fn k3_step(
     ctx: &DeviceContext,
     model: &K3RankModel,
     shape: K3StepShape,
-    prefill_chunk: bool,
+    mode: K3StepMode<'_>,
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
 ) -> Result<()> {
@@ -192,10 +233,8 @@ pub(super) fn k3_step(
         }
 
         match (&layer.attn, layer_state) {
-            (K3LayerAttention::Kda(kda), K3LayerState::Kda(kda_state)) => {
-                if prefill_chunk {
-                    kda_attention_chunk(ctx, shape, layer, kda, kda_state, scratch)?;
-                } else {
+            (K3LayerAttention::Kda(kda), K3LayerState::Kda(kda_state)) => match mode {
+                K3StepMode::Decode => {
                     let (recurrent_read, recurrent_write) =
                         parity_pair(&mut kda_state.recurrent, shape.parity);
                     let (conv_read, conv_write) = parity_pair(&mut kda_state.conv, shape.parity);
@@ -211,18 +250,24 @@ pub(super) fn k3_step(
                         scratch,
                     )?;
                 }
-            }
+                K3StepMode::PrefillChunk => {
+                    // A prefill chunk is the one-group case: the whole chunk
+                    // commits, from the pool's single state row.
+                    let chunk = [K3KdaGroup {
+                        row: 0,
+                        commit_rows: shape.live_rows,
+                        spec_rows: 0,
+                        state_row: 0,
+                        parity: shape.parity,
+                    }];
+                    kda_attention_chunk(ctx, shape, layer, kda, kda_state, &chunk, scratch)?;
+                }
+                K3StepMode::Verify(groups) => {
+                    kda_attention_chunk(ctx, shape, layer, kda, kda_state, groups, scratch)?;
+                }
+            },
             (K3LayerAttention::Mla(mla), K3LayerState::Mla) => {
-                mla_attention(
-                    ctx,
-                    shape,
-                    prefill_chunk,
-                    layer,
-                    mla,
-                    kv,
-                    mla_index,
-                    scratch,
-                )?;
+                mla_attention(ctx, shape, mode, layer, mla, kv, mla_index, scratch)?;
                 mla_index += 1;
             }
             _ => anyhow::bail!("K3 layer state does not match the layer's attention kind"),
@@ -334,7 +379,7 @@ pub(super) fn k3_step(
     // after the final chunk instead of paying a chunk-wide lm_head per step —
     // which also keeps the vocab-wide buffers sized by the decode rows, not
     // the chunk bucket.
-    if prefill_chunk {
+    if matches!(mode, K3StepMode::PrefillChunk) {
         return Ok(());
     }
     attn_res(
@@ -421,7 +466,7 @@ fn copy_rows(
 fn mla_attention(
     ctx: &DeviceContext,
     shape: K3StepShape,
-    prefill_chunk: bool,
+    mode: K3StepMode<'_>,
     layer: &K3LayerWeights,
     w: &K3MlaWeights,
     kv: &mut K3PagedKv,
@@ -515,7 +560,7 @@ fn mla_attention(
         &mut s.query,
     )?;
 
-    if prefill_chunk {
+    if matches!(mode, K3StepMode::PrefillChunk) {
         // Chunked prefill takes the non-absorbed dense route (vLLM's recipe):
         // gather the cached latent — the chunk's own rows were appended just
         // above, so the cache holds the whole [context | chunk] span — expand
@@ -528,7 +573,13 @@ fn mla_attention(
         // Absorbed MLA over the paged latent: the kernel folds `w_kv_b`'s
         // per-head W_UK into the query and expands the attended latent with
         // W_UV, so the per-step kv_b expansion and the expanded K/V cache no
-        // longer exist.
+        // longer exist. A verify step's rows are packed, not slot-indexed, so
+        // it walks the packed verify table; causality is the per-row context
+        // length either way.
+        let table = match mode {
+            K3StepMode::Verify(_) => &kv.verify_table_dev,
+            _ => &kv.table_dev,
+        };
         k3_mla_paged_attn_launch(
             ctx,
             b,
@@ -538,7 +589,7 @@ fn mla_attention(
             &kv.slab,
             mla_index * K3_KV_PAGE_TOKENS * K3_MLA_LATENT_ROW,
             kv.page_stride(),
-            &kv.table_dev,
+            table,
             kv.max_pages_per_slot,
             &s.context_len,
             &w.scale.data,

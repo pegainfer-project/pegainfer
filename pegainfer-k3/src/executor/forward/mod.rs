@@ -22,7 +22,7 @@
 //!   the fused MegaMoE launch touches peers. That is what lets an EP group
 //!   run without a coordinator.
 //!
-//! Three entry points, two of them the same sequence:
+//! Four entry points, three of them the same sequence:
 //!
 //! * [`k3_decode_step`] — advance every row of the bucket by one token.
 //! * [`k3_prefill_chunk_step`] — the identical sequence, with the bucket's
@@ -31,6 +31,11 @@
 //!   the epilogue (lm_head + sampling)...
 //! * [`k3_prefill_boundary_sample`] — ...which runs here instead, once after
 //!   the final chunk, at `b = 1` over the boundary token.
+//! * [`k3_verify_step`] — the same sequence again, with the bucket's rows
+//!   carrying packed per-slot segments ([`K3KdaGroup`]): each slot's
+//!   deferred-commit replay followed by its speculative span (anchor +
+//!   drafts). Full epilogue; the caller reads the span argmaxes back and
+//!   decides acceptance.
 
 mod decode;
 mod gemm;
@@ -40,4 +45,6 @@ mod step;
 pub(crate) use decode::k3_decode_step;
 pub(crate) use prefill::k3_prefill_boundary_sample;
 pub(crate) use prefill::k3_prefill_chunk_step;
+pub(crate) use prefill::k3_verify_step;
+pub(crate) use step::K3KdaGroup;
 pub(crate) use step::K3StepShape;
