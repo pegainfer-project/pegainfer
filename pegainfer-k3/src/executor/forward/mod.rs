@@ -46,5 +46,6 @@ pub(crate) use decode::k3_decode_step;
 pub(crate) use prefill::k3_prefill_boundary_sample;
 pub(crate) use prefill::k3_prefill_chunk_step;
 pub(crate) use prefill::k3_verify_step;
+pub(crate) use step::K3AuxSink;
 pub(crate) use step::K3KdaGroup;
 pub(crate) use step::K3StepShape;

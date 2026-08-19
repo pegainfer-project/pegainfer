@@ -28,6 +28,7 @@
 
 use std::path::PathBuf;
 
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_k3::DecodeSlot;
 use pegainfer_k3::K3Executor;
 use pegainfer_k3::K3ExecutorConfig;
@@ -38,6 +39,8 @@ use pegainfer_k3::StepExecutor;
 const FIXTURE: &str = include_str!("fixtures/k3_4l_greedy.json");
 const CHECKPOINT_ENV: &str = "PEGAINFER_K3_TEST_224";
 const DEVICE_ENV: &str = "PEGAINFER_K3_TEST_DEVICE";
+/// The RadixArk DSpark drafter checkpoint dir, for the draft-lane gates.
+const DSPARK_ENV: &str = "PEGAINFER_K3_TEST_DSPARK";
 
 fn fixture_prompt_and_layers() -> (Vec<u32>, usize) {
     let json: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture parses");
@@ -401,5 +404,75 @@ fn verify_tracks_the_oracle_off_near_ties() {
     assert!(
         worst_margin < 4.0,
         "a flip against a {worst_margin:.2}-logit margin is not a near-tie"
+    );
+}
+
+/// Gate: the whole DSpark loop — prefill capture, propose, verify, accepted
+/// -row capture — round-trips on the real drafter checkpoint. At truncated
+/// target depth the aux taps are clamped, so the drafts are garbage and this
+/// gate holds the *machinery*, not draft quality: every round commits within
+/// bounds, the propose-side position invariants hold for the whole walk (its
+/// internal asserts crash on drift), and a released-and-reprefilled slot
+/// reproduces the walk bit for bit.
+#[test]
+#[ignore = "requires a Blackwell GPU, the K3 checkpoint and the DSpark drafter"]
+fn dspark_draft_lane_round_trips() {
+    let (prompt, num_layers) = fixture_prompt_and_layers();
+    let Some(mut executor) = executor(num_layers) else {
+        eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
+        return;
+    };
+    let Some(dspark_path) = std::env::var(DSPARK_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| path.join("config.json").exists())
+    else {
+        eprintln!("skipping: {DSPARK_ENV} is not set to the DSpark drafter checkpoint");
+        return;
+    };
+    executor
+        .load_dspark(&dspark_path)
+        .expect("the drafter should load");
+
+    const STEPS: usize = 48;
+    let walk = |executor: &mut K3Executor| -> (Vec<u32>, usize, usize) {
+        executor.release(0);
+        let first = executor
+            .prefill(0, &prompt, &SamplingParams::default())
+            .expect("prefill with capture should run");
+        let mut committed_all = vec![first];
+        let mut rounds = 0usize;
+        let mut accepted = 0usize;
+        while committed_all.len() < STEPS {
+            let outcome = executor
+                .decode_spec(&[DecodeSlot {
+                    slot: 0,
+                    last_token: *committed_all.last().expect("seeded"),
+                }])
+                .expect("a spec round should run");
+            assert_eq!(outcome.len(), 1);
+            let tokens = &outcome[0];
+            assert!(
+                !tokens.is_empty() && tokens.len() <= 7,
+                "a spec round commits 1..=7 tokens, got {}",
+                tokens.len()
+            );
+            accepted += tokens.len() - 1;
+            committed_all.extend_from_slice(tokens);
+            rounds += 1;
+        }
+        (committed_all, rounds, accepted)
+    };
+
+    let (walk_1, rounds, accepted) = walk(&mut executor);
+    eprintln!(
+        "dspark round trip: {} tokens over {rounds} rounds, {accepted} drafts accepted \
+         (clamped-tap drafts — acceptance is noise, not quality)",
+        walk_1.len()
+    );
+    let (walk_2, _, _) = walk(&mut executor);
+    assert_eq!(
+        walk_1, walk_2,
+        "a released and re-prefilled slot must reproduce the spec walk exactly"
     );
 }

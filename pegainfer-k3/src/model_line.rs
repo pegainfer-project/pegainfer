@@ -200,6 +200,7 @@ impl ModelLine for K3Line {
             "port",
             "device_ordinal",
             "no_prefix_cache",
+            "dflash_draft_model_path",
         ]
     }
 
@@ -288,9 +289,17 @@ impl ModelLine for K3Line {
                 }
                 None => K3Executor::load(ctx.model_path, device, rank, ep_size, config),
             };
-            executors.push(executor.with_context(|| {
+            let mut executor = executor.with_context(|| {
                 format!("loading K3 rank {rank} of {ep_size} onto device {device}")
-            })?);
+            })?;
+            // The DSpark draft lane is rank-local and collective-free, so
+            // arming it per rank adds no cross-rank coupling.
+            if let Some(draft_path) = &ctx.shared.dflash_draft_model_path {
+                executor
+                    .load_dspark(draft_path)
+                    .with_context(|| format!("arming the K3 dspark draft lane on rank {rank}"))?;
+            }
+            executors.push(executor);
         }
         Ok(LaunchedEngine::Stepped(
             crate::scheduler::start_with_executors(

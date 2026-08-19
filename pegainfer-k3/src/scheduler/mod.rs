@@ -244,8 +244,8 @@ impl<E: StepExecutor> K3Scheduler<E> {
         // barriers inside them would pair against a peer's wrong step.
         // Single-rank executors simply return an empty token list without
         // touching the device.
-        let tokens = match self.executor.decode(&batch) {
-            Ok(tokens) => tokens,
+        let token_lists = match self.executor.decode_many(&batch) {
+            Ok(token_lists) => token_lists,
             Err(error) => {
                 // The step touched the whole running batch, so the whole
                 // batch is what dies. The scheduler stays up.
@@ -254,26 +254,49 @@ impl<E: StepExecutor> K3Scheduler<E> {
             }
         };
         assert_eq!(
-            tokens.len(),
+            token_lists.len(),
             batch.len(),
-            "executor returned {} tokens for a batch of {}",
-            tokens.len(),
+            "executor returned {} token lists for a batch of {}",
+            token_lists.len(),
             batch.len()
         );
         let mut still_running = Vec::with_capacity(self.running.len());
-        for (mut state, token) in std::mem::take(&mut self.running).into_iter().zip(tokens) {
-            state.last_token = token;
-            if self.is_stop_token(token, state.ignore_eos) {
-                self.release_slot(state.slot);
-                finish_or_retire(state.id, FinishReason::Stop, ledger);
-                continue;
+        for (mut state, committed) in std::mem::take(&mut self.running)
+            .into_iter()
+            .zip(token_lists)
+        {
+            assert!(
+                !committed.is_empty(),
+                "a round must commit at least one token"
+            );
+            // A speculative round commits several tokens at once; walk them
+            // in order and stop at the first terminal one. Tokens past a
+            // stop/length cut are computed-but-dead, like a rejected draft.
+            let already = ledger.completion_tokens(state.id);
+            let mut kept: Vec<u32> = Vec::with_capacity(committed.len());
+            let mut finished = None;
+            for &token in &committed {
+                if self.is_stop_token(token, state.ignore_eos) {
+                    // The stop token itself is not part of the completion.
+                    finished = Some(FinishReason::Stop);
+                    break;
+                }
+                kept.push(token);
+                state.last_token = token;
+                if already + kept.len() >= state.max_tokens {
+                    finished = Some(FinishReason::Length);
+                    break;
+                }
             }
-            ledger.push_tokens(state.id, &[token], &[]);
-            if ledger.completion_tokens(state.id) >= state.max_tokens {
-                self.release_slot(state.slot);
-                finish_or_retire(state.id, FinishReason::Length, ledger);
-            } else {
-                still_running.push(state);
+            if !kept.is_empty() {
+                ledger.push_tokens(state.id, &kept, &[]);
+            }
+            match finished {
+                Some(reason) => {
+                    self.release_slot(state.slot);
+                    finish_or_retire(state.id, reason, ledger);
+                }
+                None => still_running.push(state),
             }
         }
         self.running = still_running;

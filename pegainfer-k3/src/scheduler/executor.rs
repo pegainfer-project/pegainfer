@@ -61,6 +61,19 @@ pub trait StepExecutor: Send {
     /// batch with an empty vec and no device work.
     fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>>;
 
+    /// Advance every slot in `batch` by one *round*, committing one or more
+    /// tokens per slot (parallel to `batch`, each list non-empty). This is
+    /// what the scheduler drives every step; the default is plain decode —
+    /// one token per slot — and an executor with a speculative path
+    /// overrides it to return each round's accepted span.
+    fn decode_many(&mut self, batch: &[DecodeSlot]) -> Result<Vec<Vec<u32>>> {
+        Ok(self
+            .decode(batch)?
+            .into_iter()
+            .map(|token| vec![token])
+            .collect())
+    }
+
     /// Drop the slot's state. Called on every terminal path, including the
     /// silent one (abort), and always before the slot is handed out again.
     fn release(&mut self, slot: SlotId);

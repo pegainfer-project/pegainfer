@@ -35,6 +35,7 @@ use super::super::paged_kv::K3PagedKv;
 use super::gemm::K3PartialSpan;
 use super::gemm::k3_gemm_full;
 use super::gemm::k3_gemm_partial;
+use super::step::K3AuxSink;
 use super::step::K3KdaGroup;
 use super::step::K3StepMode;
 use super::step::K3StepShape;
@@ -70,6 +71,7 @@ pub(crate) fn k3_prefill_chunk_step(
     shape: K3StepShape,
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
+    aux: Option<K3AuxSink<'_>>,
 ) -> Result<()> {
     ensure!(
         (1..=shape.bucket).contains(&shape.live_rows),
@@ -77,7 +79,15 @@ pub(crate) fn k3_prefill_chunk_step(
         shape.live_rows,
         shape.bucket
     );
-    k3_step(ctx, model, shape, K3StepMode::PrefillChunk, state, scratch)
+    k3_step(
+        ctx,
+        model,
+        shape,
+        K3StepMode::PrefillChunk,
+        state,
+        scratch,
+        aux,
+    )
 }
 
 /// One speculative verify step: the batched step over packed per-slot row
@@ -95,6 +105,7 @@ pub(crate) fn k3_verify_step(
     groups: &[K3KdaGroup],
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
+    aux: Option<K3AuxSink<'_>>,
 ) -> Result<()> {
     for group in groups {
         ensure!(
@@ -115,6 +126,7 @@ pub(crate) fn k3_verify_step(
         K3StepMode::Verify(groups),
         state,
         scratch,
+        aux,
     )
 }
 

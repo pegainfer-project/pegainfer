@@ -174,6 +174,20 @@ pub(crate) enum K3StepMode<'a> {
     Verify(&'a [K3KdaGroup]),
 }
 
+/// Where a step deposits the aux hidden states the DSpark draft lane feeds
+/// on: after each tap layer, rows `0..rows` of the post-layer residual are
+/// copied into their column segment of `slab` (`[capacity, taps.len() *
+/// hidden]`, tap order = column order). Pure extra dtod traffic — nothing in
+/// the step reads it back.
+pub(crate) struct K3AuxSink<'a> {
+    pub(crate) slab: &'a mut CudaSlice<bf16>,
+    /// Leading step rows to capture (a chunk's live tokens, a verify step's
+    /// packed rows).
+    pub(crate) rows: usize,
+    /// 0-based layer indices whose post-layer residual is captured.
+    pub(crate) taps: &'a [usize],
+}
+
 pub(super) fn k3_step(
     ctx: &DeviceContext,
     model: &K3RankModel,
@@ -181,6 +195,7 @@ pub(super) fn k3_step(
     mode: K3StepMode<'_>,
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
+    mut aux: Option<K3AuxSink<'_>>,
 ) -> Result<()> {
     let b = shape.bucket;
     let K3StatePool {
@@ -202,7 +217,8 @@ pub(super) fn k3_step(
         &mut scratch.hidden,
     )?;
 
-    for (layer, layer_state) in model.layers.iter().zip(layer_state.iter_mut()) {
+    for (index, (layer, layer_state)) in model.layers.iter().zip(layer_state.iter_mut()).enumerate()
+    {
         let geometry = layer.geometry;
         copy_rows(ctx, &scratch.hidden, &mut scratch.prefix, b * K3_HIDDEN)?;
         if geometry.nb_in > 0 {
@@ -372,6 +388,20 @@ pub(super) fn k3_step(
             &scratch.mlp_out,
             &mut scratch.hidden,
         )?;
+
+        if let Some(sink) = aux.as_mut()
+            && let Some(tap) = sink.taps.iter().position(|&t| t == index)
+        {
+            copy_hidden_rows_raw_into(
+                ctx,
+                &scratch.hidden,
+                K3_HIDDEN,
+                sink.slab,
+                sink.taps.len() * K3_HIDDEN,
+                tap * K3_HIDDEN,
+                sink.rows,
+            )?;
+        }
     }
 
     // A prefill chunk stops here: only the boundary token's sample is ever
