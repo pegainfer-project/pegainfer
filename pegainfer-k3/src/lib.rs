@@ -23,7 +23,6 @@
 //! from tokens; see docs/subsystems/kv-cache/design.md, bounded class).
 
 mod config;
-mod dspark;
 pub mod executor;
 pub mod model_line;
 pub mod scheduler;

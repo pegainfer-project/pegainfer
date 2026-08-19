@@ -777,7 +777,6 @@ impl K3DsparkScratch {
     }
 }
 
-#[path = "dspark_slot.rs"]
 mod slot;
 pub(crate) use slot::K3DsparkSlotState;
 

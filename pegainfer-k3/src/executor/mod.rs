@@ -63,6 +63,7 @@
 //!   of returning into the scheduler's keep-serving path.
 
 mod buffers;
+mod dspark;
 pub mod ep;
 mod forward;
 mod paged_kv;
@@ -93,6 +94,12 @@ use self::buffers::K3MegaGeometry;
 use self::buffers::K3MegaScratch;
 use self::buffers::K3Scratch;
 use self::buffers::K3StatePool;
+use self::dspark::K3_DSPARK_AUX_LAYERS;
+use self::dspark::K3_DSPARK_BLOCK;
+use self::dspark::K3_DSPARK_CONTEXT_DIM;
+use self::dspark::K3DsparkModel;
+use self::dspark::K3DsparkScratch;
+use self::dspark::K3DsparkSlotState;
 use self::ep::K3EpRendezvous;
 use self::ep::K3EpRuntime;
 use self::ep::ep_fatal;
@@ -107,12 +114,6 @@ use crate::config::K3_DENSE_LAYERS;
 use crate::config::K3_LAYERS;
 use crate::config::K3MoeTopo;
 use crate::config::probe_config_json;
-use crate::dspark::K3_DSPARK_AUX_LAYERS;
-use crate::dspark::K3_DSPARK_BLOCK;
-use crate::dspark::K3_DSPARK_CONTEXT_DIM;
-use crate::dspark::K3DsparkModel;
-use crate::dspark::K3DsparkScratch;
-use crate::dspark::K3DsparkSlotState;
 use crate::model::K3ExpertBankForm;
 use crate::model::K3RankModel;
 use crate::scheduler::DecodeSlot;
