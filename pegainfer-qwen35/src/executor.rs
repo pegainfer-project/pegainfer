@@ -319,6 +319,7 @@ impl Qwen35Executor {
                     })?;
             }
             self.graph_state.slot_states[idx].seq_len = self.graph_state.slot_states[last].seq_len;
+            self.graph_state.record_slot_compaction();
             self.active[idx].graph_slot_idx = idx;
         }
         Ok(())

@@ -53,6 +53,62 @@ typedef struct {
     void *stream;
 } pegainfer_qwen35_gdn_args_t;
 
+#if defined(__cplusplus)
+#define PEGAINFER_GDN_STATIC_ASSERT static_assert
+#define PEGAINFER_GDN_ALIGNOF alignof
+#else
+#define PEGAINFER_GDN_STATIC_ASSERT _Static_assert
+#define PEGAINFER_GDN_ALIGNOF _Alignof
+#endif
+
+#define PEGAINFER_GDN_ASSERT_OFFSET(type, field, expected)                  \
+    PEGAINFER_GDN_STATIC_ASSERT(offsetof(type, field) == (expected),        \
+                                #type "." #field " ABI offset changed")
+
+PEGAINFER_GDN_STATIC_ASSERT(sizeof(pegainfer_qwen35_gdn_spec_t) == 40,
+                            "GDN spec ABI size changed");
+PEGAINFER_GDN_STATIC_ASSERT(PEGAINFER_GDN_ALIGNOF(pegainfer_qwen35_gdn_spec_t) == 4,
+                            "GDN spec ABI alignment changed");
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, abi_version, 0);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, struct_size, 4);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, sm, 8);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, h_q, 12);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, h_k, 16);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, h_v, 20);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, head_dim, 24);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, qkv_dtype, 28);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, state_dtype, 32);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_spec_t, state_layout, 36);
+
+PEGAINFER_GDN_STATIC_ASSERT(sizeof(pegainfer_qwen35_gdn_args_t) == 128,
+                            "GDN args ABI size changed");
+PEGAINFER_GDN_STATIC_ASSERT(PEGAINFER_GDN_ALIGNOF(pegainfer_qwen35_gdn_args_t) == 8,
+                            "GDN args ABI alignment changed");
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, abi_version, 0);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, struct_size, 4);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, q, 8);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, k, 16);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, v, 24);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, output, 32);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, alpha, 40);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, beta, 48);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, state, 56);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, initial_state, 64);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, workspace, 72);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, workspace_bytes, 80);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, cu_seqlens, 88);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, cu_seqlens_len, 96);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, tokens, 100);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, h_q, 104);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, h_k, 108);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, h_v, 112);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, head_dim, 116);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, stream, 120);
+
+#undef PEGAINFER_GDN_ASSERT_OFFSET
+#undef PEGAINFER_GDN_STATIC_ASSERT
+#undef PEGAINFER_GDN_ALIGNOF
+
 uint32_t pegainfer_qwen35_gdn_abi_version(void);
 const char *pegainfer_qwen35_gdn_artifact_sha256(void);
 uint64_t pegainfer_qwen35_gdn_artifact_size_bytes(void);

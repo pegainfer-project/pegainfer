@@ -506,6 +506,7 @@ impl SingleGpuBackend {
         }
         self.graph_state.slot_states[compaction.moved_to].seq_len =
             self.graph_state.slot_states[compaction.moved_from].seq_len;
+        self.graph_state.record_slot_compaction();
 
         match &mut active[compaction.moved_to].backend_state {
             ActiveBackendState::Single { graph_slot_idx, .. } => {

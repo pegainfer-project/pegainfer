@@ -588,7 +588,245 @@ impl Qwen35Model {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use anyhow::Result;
+    use half::bf16;
+    use pegainfer_core::tensor::DeviceVec;
+
+    use super::GdnPrefillBackend;
     use super::checked_prefill_end_pos;
+    use crate::recurrent_state::RecurrentState;
+    use crate::weights::Qwen35Model;
+
+    // Frozen by the Stage 13 FP32 recurrence gate; chunk continuation does
+    // not receive a looser state envelope than the original operator proof.
+    const CHUNK_STATE_ATOL: f32 = 5.0e-3;
+    const CHUNK_STATE_RTOL: f32 = 2.0e-3;
+    const LOGIT_MEAN_TOL: f32 = 0.06;
+    const LOGIT_P99_TOL: f32 = 0.20;
+    const LOGIT_ARGMAX_REGRET_TOL: f32 = 0.20;
+
+    fn required_model_path() -> String {
+        let default = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
+        let path =
+            std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| default.to_string());
+        assert!(
+            Path::new(&path).join("config.json").is_file(),
+            "required chunk-continuation gate cannot read {path}/config.json; set PEGAINFER_TEST_MODEL_PATH"
+        );
+        path
+    }
+
+    fn initialize_non_symmetric_state(
+        model: &Qwen35Model,
+        recurrent: &mut RecurrentState,
+    ) -> Result<()> {
+        let ctx = model.device_ctx();
+        let h_v = model.config().linear_num_value_heads;
+        let head_dim = model.config().linear_key_head_dim;
+        for (layer_idx, layer) in recurrent.layers.iter_mut().enumerate() {
+            assert_eq!(layer.state.len(), h_v * head_dim * head_dim);
+            let state = (0..layer.state.len())
+                .map(|index| {
+                    let head = index / (head_dim * head_dim);
+                    let rem = index % (head_dim * head_dim);
+                    let key = rem / head_dim;
+                    let value = rem % head_dim;
+                    (layer_idx * 1_000_000 + head * 100_000 + key * 100 + value) as f32 * 1.0e-7
+                })
+                .collect::<Vec<_>>();
+            layer.state = ctx.stream.clone_htod(&state)?;
+
+            let conv = (0..layer.conv_state.len)
+                .map(|index| {
+                    let signed = ((index * 29 + layer_idx * 17) % 257) as i32 - 128;
+                    bf16::from_f32(signed as f32 * 1.0e-3)
+                })
+                .collect::<Vec<_>>();
+            layer.conv_state = DeviceVec::from_host(ctx, &conv)?;
+        }
+        recurrent.seq_len = 0;
+        Ok(())
+    }
+
+    fn assert_exact_bf16(label: &str, expected: &[bf16], actual: &[bf16]) {
+        assert_eq!(expected.len(), actual.len(), "{label} length mismatch");
+        if let Some(index) = expected
+            .iter()
+            .zip(actual)
+            .position(|(left, right)| left.to_bits() != right.to_bits())
+        {
+            panic!(
+                "{label} first bitwise mismatch at {index}: expected={} actual={}",
+                expected[index].to_f32(),
+                actual[index].to_f32()
+            );
+        }
+    }
+
+    fn assert_close_f32(label: &str, expected: &[f32], actual: &[f32], atol: f32, rtol: f32) {
+        assert_eq!(expected.len(), actual.len(), "{label} length mismatch");
+        let mut absolute = Vec::with_capacity(expected.len());
+        let mut max_relative = 0.0_f32;
+        let mut first_violation = None;
+        let mut violation_count = 0usize;
+        for (index, (&left, &right)) in expected.iter().zip(actual).enumerate() {
+            let diff = (left - right).abs();
+            absolute.push(diff);
+            max_relative = max_relative.max(diff / left.abs().max(right.abs()).max(1.0e-12));
+            let violation = !left.is_finite()
+                || !right.is_finite()
+                || diff > atol + rtol * left.abs().max(right.abs());
+            if violation {
+                violation_count += 1;
+                if first_violation.is_none() {
+                    first_violation = Some((index, left, right, diff));
+                }
+            }
+        }
+        absolute.sort_by(f32::total_cmp);
+        let max = absolute.last().copied().unwrap_or(0.0);
+        let mean = if absolute.is_empty() {
+            0.0
+        } else {
+            absolute.iter().sum::<f32>() / absolute.len() as f32
+        };
+        let p99_index = absolute.len().saturating_sub(1) * 99 / 100;
+        let p99 = absolute.get(p99_index).copied().unwrap_or(0.0);
+        eprintln!(
+            "{label}: elements={} violations={violation_count} max_abs={max:.8} mean_abs={mean:.8} p99_abs={p99:.8} max_rel={max_relative:.8} atol={atol} rtol={rtol}",
+            absolute.len()
+        );
+        assert!(
+            first_violation.is_none(),
+            "{label} first violation {:?}; violations={violation_count}/{} max_abs={max} mean_abs={mean} p99_abs={p99} max_rel={max_relative}",
+            first_violation,
+            expected.len(),
+        );
+    }
+
+    fn assert_recurrent_close(
+        model: &Qwen35Model,
+        expected: &RecurrentState,
+        actual: &RecurrentState,
+    ) -> Result<()> {
+        assert_eq!(expected.seq_len, actual.seq_len);
+        assert_eq!(expected.layers.len(), actual.layers.len());
+        let ctx = model.device_ctx();
+        let mut copies = Vec::with_capacity(expected.layers.len());
+        for (layer_idx, (left, right)) in expected.layers.iter().zip(&actual.layers).enumerate() {
+            copies.push((
+                layer_idx,
+                ctx.stream.clone_dtoh(&left.state)?,
+                ctx.stream.clone_dtoh(&right.state)?,
+                ctx.stream.clone_dtoh(&left.conv_state.data)?,
+                ctx.stream.clone_dtoh(&right.conv_state.data)?,
+            ));
+        }
+        ctx.sync()?;
+        for (layer_idx, expected_state, actual_state, expected_conv, actual_conv) in copies {
+            assert_close_f32(
+                &format!("final layer {layer_idx} recurrent state"),
+                &expected_state,
+                &actual_state,
+                CHUNK_STATE_ATOL,
+                CHUNK_STATE_RTOL,
+            );
+            assert_exact_bf16(
+                &format!("final layer {layer_idx} conv state"),
+                &expected_conv,
+                &actual_conv,
+            );
+        }
+        Ok(())
+    }
+
+    fn log_softmax(values: &[f32]) -> Vec<f32> {
+        let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let log_sum = values
+            .iter()
+            .map(|value| (*value - max).exp())
+            .sum::<f32>()
+            .ln();
+        values.iter().map(|value| *value - max - log_sum).collect()
+    }
+
+    fn argmax(values: &[f32]) -> usize {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index)
+            .expect("logits must be non-empty")
+    }
+
+    fn assert_logit_parity(label: &str, expected: &[f32], actual: &[f32]) {
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "{label} logit length mismatch"
+        );
+        let expected_lp = log_softmax(expected);
+        let actual_lp = log_softmax(actual);
+        assert!(
+            expected_lp.iter().all(|value| value.is_finite())
+                && actual_lp.iter().all(|value| value.is_finite()),
+            "{label} contains non-finite log-probabilities"
+        );
+        let expected_token = argmax(&expected_lp);
+        let actual_token = argmax(&actual_lp);
+        let regret = expected_lp[expected_token] - expected_lp[actual_token];
+        assert!(
+            regret <= LOGIT_ARGMAX_REGRET_TOL,
+            "{label} actual argmax {actual_token} has baseline regret {regret} > {LOGIT_ARGMAX_REGRET_TOL}"
+        );
+        assert_eq!(
+            actual_token, expected_token,
+            "{label} greedy token parity failed"
+        );
+
+        let mut deltas = expected_lp
+            .iter()
+            .zip(&actual_lp)
+            .map(|(left, right)| (*left - *right).abs())
+            .collect::<Vec<_>>();
+        deltas.sort_by(f32::total_cmp);
+        let max = deltas.last().copied().unwrap_or(0.0);
+        let mean = deltas.iter().sum::<f32>() / deltas.len() as f32;
+        let p99 = deltas[deltas.len().saturating_sub(1) * 99 / 100];
+        eprintln!(
+            "{label}: vocab={} expected_tokens=[{expected_token}] actual_tokens=[{actual_token}] max_logprob_delta={max:.6} mean={mean:.6} p99={p99:.6} regret={regret:.6}",
+            deltas.len()
+        );
+        assert!(
+            mean <= LOGIT_MEAN_TOL,
+            "{label} mean {mean} > {LOGIT_MEAN_TOL}"
+        );
+        assert!(p99 <= LOGIT_P99_TOL, "{label} p99 {p99} > {LOGIT_P99_TOL}");
+    }
+
+    fn last_token_logits(
+        model: &Qwen35Model,
+        hidden: &pegainfer_core::tensor::HiddenStates,
+    ) -> Result<Vec<f32>> {
+        let last = crate::ops::extract_vec(model.device_ctx(), hidden, hidden.seq_len - 1)?;
+        let logits = model.batch_last_hidden_logits(&[last])?;
+        logits.to_host(model.device_ctx())
+    }
+
+    fn first_decode_logits(
+        model: &Qwen35Model,
+        token: u32,
+        kv: &mut pegainfer_core::kv_pool::KvState,
+        recurrent: &RecurrentState,
+    ) -> Result<Vec<f32>> {
+        let mut graph = model.create_batch_decode_graph_state_with_capacity(1)?;
+        graph.copy_state_to_slot(model.device_ctx(), recurrent, 0)?;
+        let mut kv_refs = vec![kv];
+        model.batch_decode_graph(&[token], &mut kv_refs, &mut graph)?;
+        graph.buffers.logits.to_host(model.device_ctx())
+    }
 
     #[test]
     fn checked_prefill_end_pos_accepts_config_limit() {
@@ -617,5 +855,86 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("prefill position overflow"));
+    }
+
+    #[test]
+    #[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and a build-linked validated FlashInfer bundle"]
+    fn flashinfer_gdn_chunked_prefill_matches_unchunked_state() -> Result<()> {
+        let model_path = required_model_path();
+        let model = Qwen35Model::from_safetensors(&model_path, 0, 1)?;
+        model.require_flashinfer_gdn_for_test()?;
+        assert_eq!(model.resolved_gdn_backend(), GdnPrefillBackend::FlashInfer);
+        let evidence_before = model.flashinfer_gdn_runtime_evidence()?;
+        assert_eq!(evidence_before.selected_backend, "flashinfer");
+        assert_ne!(evidence_before.artifact_sha256, "unavailable");
+        assert_eq!(evidence_before.artifact_sha256.len(), 64);
+        assert_eq!(evidence_before.successful_launches, 0);
+
+        let tokens = (0..128)
+            .map(|index| 100 + (index * 17 % 1000) as u32)
+            .collect::<Vec<_>>();
+
+        let mut chunked_kv = model.alloc_kv();
+        let mut chunked_state = RecurrentState::new(model.device_ctx(), model.config())?;
+        initialize_non_symmetric_state(&model, &mut chunked_state)?;
+        let first_chunk = model.prefill_chunk_forward(
+            &tokens[..64],
+            &mut chunked_kv,
+            &mut chunked_state,
+            GdnPrefillBackend::FlashInfer,
+        )?;
+        drop(first_chunk);
+
+        let chunked_hidden = model.prefill_chunk_forward(
+            &tokens[64..],
+            &mut chunked_kv,
+            &mut chunked_state,
+            GdnPrefillBackend::FlashInfer,
+        )?;
+        let chunked_prefill_logits = last_token_logits(&model, &chunked_hidden)?;
+        drop(chunked_hidden);
+
+        let mut unchunked_kv = model.alloc_kv();
+        let mut unchunked_state = RecurrentState::new(model.device_ctx(), model.config())?;
+        initialize_non_symmetric_state(&model, &mut unchunked_state)?;
+        let unchunked_hidden = model.prefill_chunk_forward(
+            &tokens,
+            &mut unchunked_kv,
+            &mut unchunked_state,
+            GdnPrefillBackend::FlashInfer,
+        )?;
+        let unchunked_prefill_logits = last_token_logits(&model, &unchunked_hidden)?;
+        drop(unchunked_hidden);
+
+        assert_eq!(chunked_state.seq_len, 128);
+        assert_eq!(unchunked_state.seq_len, 128);
+        assert_recurrent_close(&model, &unchunked_state, &chunked_state)?;
+        assert_logit_parity(
+            "final prefill",
+            &unchunked_prefill_logits,
+            &chunked_prefill_logits,
+        );
+
+        let decode_token = 42;
+        let unchunked_decode =
+            first_decode_logits(&model, decode_token, &mut unchunked_kv, &unchunked_state)?;
+        let chunked_decode =
+            first_decode_logits(&model, decode_token, &mut chunked_kv, &chunked_state)?;
+        assert_logit_parity("first decode", &unchunked_decode, &chunked_decode);
+
+        let evidence_after = model.flashinfer_gdn_runtime_evidence()?;
+        assert_eq!(evidence_after.selected_backend, "flashinfer");
+        assert_eq!(
+            evidence_after.artifact_sha256,
+            evidence_before.artifact_sha256
+        );
+        let linear_layers =
+            model.config().num_hidden_layers - model.config().num_full_attention_layers();
+        assert_eq!(
+            evidence_after.successful_launches - evidence_before.successful_launches,
+            (3 * linear_layers) as u64,
+            "chunk continuation gate did not execute two chunks plus one unchunked FlashInfer pass"
+        );
+        Ok(())
     }
 }

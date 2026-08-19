@@ -56,16 +56,6 @@ FORBIDDEN_TMA_CLUSTER_LOAD = (
     "cp.async.bulk.tensor.3d.shared::cluster.global.tile."
     "mbarrier::complete_tx::bytes.L2::cache_hint"
 )
-ABSOLUTE_PATH_PATTERNS = (
-    re.compile(r"(?:^|[\s\"'=])/(?:home|mnt|tmp|Users|workspace|build)/[^\s\"']+"),
-    re.compile(r"[A-Za-z]:\\[^\s\"']+"),
-)
-ENTRY_RE = re.compile(
-    r"(?:\.visible\s+)?\.entry\s+([A-Za-z_$][A-Za-z0-9_$.]*)\s*\(",
-    re.MULTILINE,
-)
-
-
 class ContractError(RuntimeError):
     """An artifact or source contract is invalid."""
 
@@ -268,17 +258,6 @@ def normalize_ptx(ptx: str) -> str:
             line = f"{match.group(1)}{name}{match.group(3)}"
         normalized_lines.append(line)
     return "\n".join(normalized_lines) + "\n"
-
-
-def leaked_absolute_paths(text: str) -> list[str]:
-    leaks: set[str] = set()
-    for pattern in ABSOLUTE_PATH_PATTERNS:
-        leaks.update(match.group(0).lstrip(" \t\"'=") for match in pattern.finditer(text))
-    return sorted(leaks)
-
-
-def parse_entry_symbols(ptx: str) -> list[str]:
-    return sorted(set(ENTRY_RE.findall(ptx)))
 
 
 def expected_spec(variant: str) -> dict[str, Any]:
