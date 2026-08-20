@@ -10,3 +10,4 @@ __pycache__/
 /docs/private/
 /profile/
 .claude/scheduled_tasks.lock
+/results/

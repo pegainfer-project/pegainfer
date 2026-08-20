@@ -512,6 +512,13 @@ Validation on 2× RTX 4090 (venv NCCL on `LD_LIBRARY_PATH`):
 
 ## Follow-Ups
 
+- 27B TP2 knowledge-benchmark parity (2026-08-20, validated pre-rebase on
+  the f4c66780 line; `docs/benchmarks/qwen35-27b-tp2-knowledge-eval.md`):
+  MMLU-Redux 94.09 vs official 93.2 (full 5330), C-Eval 88.11 vs 90.5
+  (full 1346, thinking-cap truncation rerun-merged) — inside the
+  cross-harness band, no TP-induced accuracy regression. MMLU-Pro /
+  SuperGPQA sampled runs remain outstanding; rerun on this rebased branch
+  before citing parity.
 - P2B sharded linear-attention/GDR state landed (see "Rebase onto #870"); keep the completed P2A lifecycle and ID contracts unweakened.
 - Promote any stable contract changes discovered here back into `tp-design.md` through the design-doc branch.
 - Decide whether Qwen3.5 server CLI should accept arbitrary TP device ordinals instead of only `0..tp_size`.
