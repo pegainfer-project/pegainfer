@@ -288,6 +288,21 @@ impl KvState {
         self.seq_len += count;
     }
 
+    /// Roll this request's logical KV length back to `token_count`, returning
+    /// any now-unused tail pages to the pool.
+    pub fn truncate_to(&mut self, token_count: usize) -> Result<()> {
+        anyhow::ensure!(
+            token_count <= self.seq_len,
+            "KvState cannot truncate from {} up to {token_count}",
+            self.seq_len
+        );
+        let needed = pages_needed(token_count, self.pool.inner.layout.page_size);
+        self.permit.truncate(needed);
+        self.seq_len = token_count;
+        Ok(())
+    }
+
+    /// Build kernel-facing metadata for this request's KV.
     pub fn desc(&self) -> KvDesc<'_> {
         KvDesc {
             pages: self.permit.pages(),
@@ -417,10 +432,37 @@ mod tests {
         assert_eq!(desc.last_page_len(), 1);
         assert_eq!(pool.available_pages(), 2);
 
+        // Truncate back into the first page: tail page returns immediately.
+        kv.truncate_to(15).unwrap();
+        assert_eq!(kv.seq_len(), 15);
+        let desc = kv.desc();
+        assert_eq!(desc.num_pages(), 1);
+        assert_eq!(desc.last_page_len(), 15);
+        assert_eq!(pool.available_pages(), 3);
+
+        // Truncate to zero releases all request pages.
+        kv.truncate_to(0).unwrap();
+        assert_eq!(kv.seq_len(), 0);
+        assert_eq!(kv.desc().num_pages(), 0);
+        assert_eq!(pool.available_pages(), 4);
+
         // Reset returns all pages
+        kv.ensure_capacity(17).unwrap();
+        kv.advance(17);
         kv.reset();
         assert_eq!(kv.seq_len(), 0);
         assert_eq!(pool.available_pages(), 4);
+    }
+
+    #[test]
+    fn kv_state_rejects_truncate_forward() {
+        let pool = test_pool(16, 3);
+        let mut kv = pool.alloc();
+        kv.ensure_capacity(4).unwrap();
+        kv.advance(4);
+
+        let err = kv.truncate_to(5).unwrap_err().to_string();
+        assert!(err.contains("cannot truncate from 4 up to 5"));
     }
 
     #[test]

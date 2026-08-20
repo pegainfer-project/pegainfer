@@ -463,11 +463,11 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
     let expected_chunk_ai_len = expected_chunk_a_len;
     let expected_chunk_state_len =
         GdrChunkwiseScratch35::num_chunks(qkv.seq_len) * num_value_heads * val_dim * key_dim;
-    assert_eq!(scratch.g_cumsum.len(), expected_gate_len);
-    assert_eq!(scratch.beta.len(), expected_gate_len);
-    assert_eq!(scratch.a_tril.len(), expected_chunk_a_len);
-    assert_eq!(scratch.a_inv.len(), expected_chunk_ai_len);
-    assert_eq!(scratch.chunk_state.len(), expected_chunk_state_len);
+    assert!(scratch.g_cumsum.len() >= expected_gate_len);
+    assert!(scratch.beta.len() >= expected_gate_len);
+    assert!(scratch.a_tril.len() >= expected_chunk_a_len);
+    assert!(scratch.a_inv.len() >= expected_chunk_ai_len);
+    assert!(scratch.chunk_state.len() >= expected_chunk_state_len);
 
     gated_delta_rule_prefill_chunk_prepare_into(
         ctx,

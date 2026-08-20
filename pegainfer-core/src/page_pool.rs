@@ -115,6 +115,24 @@ impl OwnedPagePermit {
         }
         true
     }
+
+    /// Return tail pages until the permit holds exactly `new_len` pages.
+    ///
+    /// Prefix page order is preserved. Pages beyond `new_len` are returned to
+    /// the same pool immediately, matching the drop-time LIFO reuse order.
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        assert!(
+            new_len <= self.pages.len(),
+            "cannot grow an OwnedPagePermit via truncate"
+        );
+        if new_len == self.pages.len() {
+            return;
+        }
+
+        let returned = self.pages.split_off(new_len);
+        let mut free_list = self.inner.free_list.lock();
+        free_list.extend(returned.into_iter().rev());
+    }
 }
 
 impl Drop for OwnedPagePermit {
@@ -190,5 +208,28 @@ mod tests {
 
         // all 4 pages back after drop
         assert_eq!(pool.available_pages(), 4);
+    }
+
+    #[test]
+    fn truncate_returns_tail_pages_and_preserves_prefix() {
+        let pool = PagePool::new(5);
+
+        {
+            let mut permit = pool.try_acquire_many(4).expect("initial acquire");
+            assert_eq!(
+                permit.pages(),
+                &[PageId(0), PageId(1), PageId(2), PageId(3)]
+            );
+            assert_eq!(pool.available_pages(), 1);
+
+            permit.truncate(2);
+            assert_eq!(permit.pages(), &[PageId(0), PageId(1)]);
+            assert_eq!(pool.available_pages(), 3);
+
+            let next = pool.try_acquire_many(2).expect("tail pages reusable");
+            assert_eq!(next.pages(), &[PageId(2), PageId(3)]);
+        }
+
+        assert_eq!(pool.available_pages(), 5);
     }
 }

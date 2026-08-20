@@ -196,10 +196,8 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     layout: &KvLayout,
     layer: usize,
     plan: &PrefillPagedPlan,
-    positions_d: &CudaSlice<i32>,
     output: &mut HiddenStates,
     num_qo_heads: usize,
-    batch_size: usize,
 ) -> Result<()> {
     pegainfer_kernels::ops::paged_attention_batch_decode_via_prefill_hd256_into(
         ctx,
@@ -210,9 +208,7 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
         &layout.kernel_layout(),
         layer,
         plan,
-        positions_d,
         output,
         num_qo_heads,
-        batch_size,
     )
 }

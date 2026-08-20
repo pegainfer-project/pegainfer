@@ -124,7 +124,7 @@ impl Qwen35Model {
             num_key_value_heads,
             self.config.rotary_dim,
             eps,
-        );
+        )?;
 
         ops::paged_attention_batch_decode_hd256_into(
             &self.ctx,
@@ -198,7 +198,7 @@ impl Qwen35Model {
             self.config.num_key_value_heads,
             self.config.rotary_dim,
             eps,
-        );
+        )?;
 
         ops::paged_attention_batch_decode_via_prefill_hd256_into(
             &self.ctx,
@@ -209,10 +209,8 @@ impl Qwen35Model {
             layout,
             layer_idx,
             plan,
-            &bufs.positions_d,
             &mut bufs.attn_out_full,
             self.config.num_attention_heads,
-            bs,
         )?;
 
         unsafe {

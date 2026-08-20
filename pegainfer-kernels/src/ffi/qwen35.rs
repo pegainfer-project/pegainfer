@@ -57,7 +57,7 @@ unsafe extern "C" {
         rotary_dim: i32,
         rms_eps: f32,
         stream: CUstream,
-    );
+    ) -> i32;
 
     // Gated delta rule recurrent decode (single step)
     pub fn gated_delta_rule_decode_cuda(

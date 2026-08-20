@@ -320,17 +320,17 @@ impl Qwen35Model {
 
         // Step 1: QK norm + partial RoPE + direct paged K/V write.
         unsafe {
-            let (qf_ptr, _) = q_full_batch.data.device_ptr(&self.ctx.stream);
-            let (k_ptr, _) = k_batch.data.device_ptr(&self.ctx.stream);
-            let (v_ptr, _) = v_batch.data.device_ptr(&self.ctx.stream);
-            let (qn_ptr, _) = attn.q_norm.data.device_ptr(&self.ctx.stream);
-            let (kn_ptr, _) = attn.k_norm.data.device_ptr(&self.ctx.stream);
-            let (cos_ptr, _) = self.cos_cache.data.device_ptr(&self.ctx.stream);
-            let (sin_ptr, _) = self.sin_cache.data.device_ptr(&self.ctx.stream);
-            let (qp_ptr, _) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-            let (buf_ptr, _) = kv_state.buffer().device_ptr(&self.ctx.stream);
-            let (pi_ptr, _) = prefill_plan.page_indices_d().device_ptr(&self.ctx.stream);
-            let (sp_ptr, _) = start_pos_cpu.device_ptr(&self.ctx.stream);
+            let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&self.ctx.stream);
+            let (k_ptr, _gk) = k_batch.data.device_ptr(&self.ctx.stream);
+            let (v_ptr, _gv) = v_batch.data.device_ptr(&self.ctx.stream);
+            let (qn_ptr, _gqn) = attn.q_norm.data.device_ptr(&self.ctx.stream);
+            let (kn_ptr, _gkn) = attn.k_norm.data.device_ptr(&self.ctx.stream);
+            let (cos_ptr, _gcos) = self.cos_cache.data.device_ptr(&self.ctx.stream);
+            let (sin_ptr, _gsin) = self.sin_cache.data.device_ptr(&self.ctx.stream);
+            let (qp_ptr, _gqp) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+            let (buf_ptr, _gkv) = kv_state.buffer().device_ptr(&self.ctx.stream);
+            let (pi_ptr, _gpi) = prefill_plan.page_indices_d().device_ptr(&self.ctx.stream);
+            let (sp_ptr, _gsp) = start_pos_cpu.device_ptr(&self.ctx.stream);
             ffi::prefill_attention_hd256_prep_paged_cuda(
                 qf_ptr as *const ffi::Half,
                 k_ptr as *const ffi::Half,

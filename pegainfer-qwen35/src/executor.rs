@@ -99,16 +99,16 @@ pub struct DecodeResult {
     pub requests: Vec<DecodeRequestResult>,
 }
 
-struct ActiveRequest {
-    request_id: RequestId,
-    kv: KvState,
-    graph_slot_idx: usize,
+pub(crate) struct ActiveRequest {
+    pub(crate) request_id: RequestId,
+    pub(crate) kv: KvState,
+    pub(crate) graph_slot_idx: usize,
 }
 
 pub struct Qwen35Executor {
-    model: Qwen35Model,
-    graph_state: BatchDecodeGraphState,
-    active: Vec<ActiveRequest>,
+    pub(crate) model: Qwen35Model,
+    pub(crate) graph_state: BatchDecodeGraphState,
+    pub(crate) active: Vec<ActiveRequest>,
 }
 
 impl Qwen35Executor {
@@ -281,37 +281,33 @@ impl Qwen35Executor {
                 self.active[idx].graph_slot_idx,
                 last
             );
-            for layer_idx in 0..self.graph_state.slot_states[last].layers.len() {
-                let (src_part, dst_part) = if idx < last {
-                    let (left, right) = self.graph_state.slot_states.split_at_mut(last);
-                    (
-                        &right[0].layers[layer_idx],
-                        &mut left[idx].layers[layer_idx],
-                    )
-                } else {
-                    unreachable!("idx < active.len() <= last");
-                };
-                self.model
-                    .device_ctx()
-                    .stream
-                    .memcpy_dtod(&src_part.state, &mut dst_part.state)
-                    .map_err(|e| {
-                        anyhow::anyhow!("compact Qwen3.5 logits executor state copy failed: {e}")
-                    })?;
-                self.model
-                    .device_ctx()
-                    .stream
-                    .memcpy_dtod(&src_part.conv_state.data, &mut dst_part.conv_state.data)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "compact Qwen3.5 logits executor conv_state copy failed: {e}"
-                        )
-                    })?;
-            }
-            self.graph_state.slot_states[idx].seq_len = self.graph_state.slot_states[last].seq_len;
+            self.graph_state
+                .copy_slot_to_slot(self.model.device_ctx(), last, idx)?;
             self.active[idx].graph_slot_idx = idx;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutorStateSummary {
+    pub(crate) request_id: RequestId,
+    pub(crate) kv_seq_len: usize,
+    pub(crate) recurrent_seq_len: usize,
+}
+
+#[cfg(test)]
+impl Qwen35Executor {
+    pub(crate) fn debug_state_summary(&self) -> Vec<ExecutorStateSummary> {
+        self.active
+            .iter()
+            .map(|active| ExecutorStateSummary {
+                request_id: active.request_id,
+                kv_seq_len: active.kv.seq_len(),
+                recurrent_seq_len: self.graph_state.slot_states[active.graph_slot_idx].seq_len,
+            })
+            .collect()
     }
 }
 

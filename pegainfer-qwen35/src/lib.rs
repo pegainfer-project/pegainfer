@@ -15,11 +15,37 @@ pub mod model_line;
 mod ops;
 mod prefill;
 pub mod prefill_buffers;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "crate-private verifier substrate is exercised by GPU tests before serving wiring"
+    )
+)]
+mod prefill_verify;
 pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "crate-private verifier substrate is exercised by GPU tests before serving wiring"
+    )
+)]
+mod speculative;
+#[cfg(test)]
+mod speculative_tests;
 mod tp_executor;
 mod unified_forward;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "crate-private verifier substrate is exercised by GPU tests before serving wiring"
+    )
+)]
+mod verify_buffers;
 mod weights;
 
 use std::path::Path;

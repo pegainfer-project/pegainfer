@@ -45,6 +45,14 @@ pub struct GdrChunkwiseScratch35 {
 
     /// Per-chunk recurrent state snapshots, fp32: [num_chunks, num_value_heads, key_dim, value_dim]
     pub(crate) chunk_state: CudaSlice<f32>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "crate-private verifier reuses this scratch before serving wiring"
+        )
+    )]
+    max_seq_len: usize,
 }
 
 impl GdrChunkwiseScratch35 {
@@ -104,7 +112,29 @@ impl GdrChunkwiseScratch35 {
             u: HiddenStates::zeros(ctx, vv_hidden_dim, seq_len)?,
             v_new: HiddenStates::zeros(ctx, vv_hidden_dim, seq_len)?,
             chunk_state,
+            max_seq_len: seq_len,
         })
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "crate-private verifier reuses this scratch before serving wiring"
+        )
+    )]
+    pub(crate) fn set_rows(&mut self, seq_len: usize) {
+        assert!(
+            seq_len <= self.max_seq_len,
+            "Qwen3.5 GDR scratch rows {seq_len} exceeds capacity {}",
+            self.max_seq_len
+        );
+        self.q_expanded.seq_len = seq_len;
+        self.k_expanded.seq_len = seq_len;
+        self.v_raw.seq_len = seq_len;
+        self.w.seq_len = seq_len;
+        self.u.seq_len = seq_len;
+        self.v_new.seq_len = seq_len;
     }
 
     pub(crate) fn num_chunks(seq_len: usize) -> usize {

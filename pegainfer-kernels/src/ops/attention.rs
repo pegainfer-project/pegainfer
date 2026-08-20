@@ -1175,10 +1175,26 @@ pub fn qk_norm_partial_rope_batched_decode_hd256_into(
     num_kv_heads: usize,
     rotary_dim: usize,
     rms_eps: f32,
-) {
+) -> Result<()> {
     let batch_size = q.seq_len;
-    debug_assert_eq!(q_full.seq_len, batch_size);
-    debug_assert_eq!(k.seq_len, batch_size);
+    anyhow::ensure!(batch_size > 0, "Qwen3.5 QK prep requires at least one row");
+    anyhow::ensure!(
+        q_full.seq_len == batch_size && k.seq_len == batch_size,
+        "Qwen3.5 QK prep row mismatch: q_full={}, q={}, k={}",
+        q_full.seq_len,
+        batch_size,
+        k.seq_len
+    );
+    anyhow::ensure!(
+        positions_d.len() >= batch_size,
+        "Qwen3.5 QK prep positions too short: rows={batch_size}, positions={}",
+        positions_d.len()
+    );
+    anyhow::ensure!(
+        u16::try_from(batch_size).is_ok(),
+        "Qwen3.5 QK prep row count {batch_size} exceeds CUDA grid.y limit {}",
+        u16::MAX
+    );
 
     let (qf_ptr, _gqf) = q_full.data.device_ptr(&ctx.stream);
     let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
@@ -1189,7 +1205,7 @@ pub fn qk_norm_partial_rope_batched_decode_hd256_into(
     let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
     let (pos_ptr, _gp) = positions_d.device_ptr(&ctx.stream);
 
-    unsafe {
+    let result = unsafe {
         ffi::qk_norm_partial_rope_batched_decode_hd256_cuda(
             qf_ptr as *const ffi::Half,
             k_ptr as *mut ffi::Half,
@@ -1205,8 +1221,15 @@ pub fn qk_norm_partial_rope_batched_decode_hd256_into(
             rotary_dim as i32,
             rms_eps,
             crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "qk_norm_partial_rope_batched_decode_hd256_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
         );
     }
+    Ok(())
 }
 
 /// Batched paged attention decode: append K/V + FlashInfer BatchDecode for batch_size >= 1.
@@ -1486,7 +1509,7 @@ pub fn paged_attention_batch_decode_split_kv_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scatter_decode_kv_into_paged(
+fn scatter_kv_into_paged(
     ctx: &DeviceContext,
     k: &HiddenStates,
     v: &HiddenStates,
@@ -1498,7 +1521,7 @@ fn scatter_decode_kv_into_paged(
     last_page_len_d: &CudaSlice<i32>,
     positions_d: &CudaSlice<i32>,
     request_indices_d: &CudaSlice<i32>,
-    batch_size: usize,
+    total_tokens: usize,
     op_name: &str,
 ) -> Result<()> {
     let num_kv_heads = layout.num_kv_heads;
@@ -1532,7 +1555,7 @@ fn scatter_decode_kv_into_paged(
             v_ptr as *const ffi::Half,
             ri_ptr as *const i32,
             pos_ptr as *const i32,
-            batch_size as i32,
+            total_tokens as i32,
             num_kv_heads as i32,
             head_dim as i32,
             page_size as i32,
@@ -1544,7 +1567,7 @@ fn scatter_decode_kv_into_paged(
     };
     if result != 0 {
         anyhow::bail!(
-            "paged_kv_scatter_cuda ({op_name}) failed for layer {layer}, bs={batch_size}, \
+            "paged_kv_scatter_cuda ({op_name}) failed for layer {layer}, rows={total_tokens}, \
              kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}: {result}{}",
             crate::ops::ffi_exception_message(result)
         );
@@ -1574,7 +1597,15 @@ pub fn paged_attention_batch_decode_hd256_into(
 ) -> Result<()> {
     let num_kv_heads = layout.num_kv_heads;
     let head_dim = layout.head_dim;
-    debug_assert_eq!(head_dim, 256);
+    anyhow::ensure!(
+        head_dim == 256,
+        "batch HD256 decode requires head_dim=256, got {head_dim}"
+    );
+    anyhow::ensure!(
+        layer < layout.num_layers,
+        "batch HD256 decode layer {layer} out of range for {} layers",
+        layout.num_layers
+    );
     let page_size = layout.page_size;
 
     let k_offset = (layer * layout.layer_stride) as i64;
@@ -1593,7 +1624,7 @@ pub fn paged_attention_batch_decode_hd256_into(
 
     let stream = crate::tensor::active_cu_stream(ctx);
 
-    scatter_decode_kv_into_paged(
+    scatter_kv_into_paged(
         ctx,
         k,
         v,
@@ -1653,22 +1684,35 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     layout: &PagedKvLayout,
     layer: usize,
     plan: &PrefillPagedPlan,
-    positions_d: &CudaSlice<i32>,
     output: &mut HiddenStates,
     num_qo_heads: usize,
-    batch_size: usize,
 ) -> Result<()> {
     let num_kv_heads = layout.num_kv_heads;
     let head_dim = layout.head_dim;
-    debug_assert_eq!(head_dim, 256);
     anyhow::ensure!(
-        batch_size == plan.total_tokens && batch_size == plan.batch_size as usize,
-        "decode-via-prefill plan shape mismatch: bs={batch_size}, total_tokens={}, plan_batch={}",
-        plan.total_tokens,
-        plan.batch_size
+        head_dim == 256,
+        "batch HD256 prefill requires head_dim=256, got {head_dim}"
+    );
+    anyhow::ensure!(
+        layer < layout.num_layers,
+        "batch HD256 prefill layer {layer} out of range for {} layers",
+        layout.num_layers
+    );
+    let total_tokens = q.seq_len;
+    anyhow::ensure!(
+        total_tokens > 0
+            && k.seq_len == total_tokens
+            && v.seq_len == total_tokens
+            && output.seq_len == total_tokens
+            && total_tokens == plan.total_tokens,
+        "batch-prefill row mismatch: q={total_tokens}, k={}, v={}, output={}, plan={}",
+        k.seq_len,
+        v.seq_len,
+        output.seq_len,
+        plan.total_tokens
     );
 
-    scatter_decode_kv_into_paged(
+    scatter_kv_into_paged(
         ctx,
         k,
         v,
@@ -1678,9 +1722,9 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
         &plan.page_indices_d,
         &plan.page_indptr_d,
         &plan.last_page_len_d,
-        positions_d,
+        &plan.positions_d,
         &plan.batch_indices_d,
-        batch_size,
+        total_tokens,
         "batch hd256 decode via prefill",
     )?;
 
@@ -1722,7 +1766,7 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
             num_kv_heads as i32,
             head_dim as i32,
             layout.page_size as i32,
-            batch_size as i32,
+            total_tokens as i32,
             plan.batch_size,
             plan.num_tiles,
             stride_page,
@@ -1732,8 +1776,9 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     };
     if result != 0 {
         anyhow::bail!(
-            "batch_prefill_paged_cuda_hd256 (decode via prefill) failed for layer {layer}, \
-             bs={batch_size}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}: {result}{}",
+            "batch_prefill_paged_cuda_hd256 failed for layer {layer}, rows={total_tokens}, \
+             batch={}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}: {result}{}",
+            plan.batch_size,
             plan.num_tiles,
             crate::ops::ffi_exception_message(result)
         );
@@ -2108,7 +2153,7 @@ pub fn paged_attention_batch_decode_via_prefill_hd512_into(
         kernel_cta_tile_q
     );
 
-    scatter_decode_kv_into_paged(
+    scatter_kv_into_paged(
         ctx,
         k,
         v,

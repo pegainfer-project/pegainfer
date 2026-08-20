@@ -291,7 +291,7 @@ __global__ void qk_norm_partial_rope_batched_decode_hd256_kernel(
 
 extern "C" {
 
-void qk_norm_partial_rope_batched_decode_hd256_cuda(
+int qk_norm_partial_rope_batched_decode_hd256_cuda(
     const __nv_bfloat16* q_full_batch,
     __nv_bfloat16* k_batch,
     const __nv_bfloat16* q_norm_weight,
@@ -323,6 +323,7 @@ void qk_norm_partial_rope_batched_decode_hd256_cuda(
         rotary_dim,
         rms_eps
     );
+    return static_cast<int>(cudaGetLastError());
 }
 
 void prefill_attention_hd256_prep_paged_cuda(
