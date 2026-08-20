@@ -69,6 +69,7 @@ use crate::tp_executor::DropExpectation;
 use crate::tp_executor::Qwen35TpExecutor;
 use crate::tp_executor::TpDecodeStepItem;
 use crate::tp_executor::TpPrefillChunkItem;
+use crate::tp_executor::TpSlotCompaction;
 use crate::tp_executor::TpUnifiedPlan;
 use crate::weights::Qwen35Model;
 
@@ -109,6 +110,9 @@ enum ActiveBackendState {
     },
     Tp {
         request_id: RequestId,
+        /// Dense decode slot (`active` position). Graph-mode workers assert
+        /// `slot_idx == row` on every decode command; eager workers ignore it.
+        slot_idx: usize,
     },
 }
 
@@ -418,13 +422,19 @@ pub(crate) fn start_tp_with_capacity(
     device_ordinals: &[usize],
     max_batch: usize,
     max_prefill_tokens: usize,
+    enable_cuda_graph: bool,
 ) -> Result<SchedulerHandle> {
     assert!(
         max_prefill_tokens > 0,
         "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
     );
-    let backend =
-        TpSchedulerBackend::new(model_path, device_ordinals, max_batch, max_prefill_tokens)?;
+    let backend = TpSchedulerBackend::new(
+        model_path,
+        device_ordinals,
+        max_batch,
+        max_prefill_tokens,
+        enable_cuda_graph,
+    )?;
     let servable = servable_len(
         backend.max_position_embeddings(),
         backend.capacity_pages_for_requests(),
@@ -530,6 +540,9 @@ fn fatal_cuda_lifecycle(message: &str) -> ! {
 struct TpSchedulerBackend {
     executor: Qwen35TpExecutor,
     next_request_id: u64,
+    /// Slot move derived by the in-flight `take_active_request`; consumed by
+    /// the paired `drop_active_state` so the workers apply the same move.
+    pending_compaction: Option<TpSlotCompaction>,
 }
 
 impl SingleGpuBackend {
@@ -706,8 +719,12 @@ impl SingleGpuBackend {
                 }
             })
             .collect();
-        self.model
-            .batch_decode_graph(&token_ids, &mut kv_refs, &mut self.graph_state)
+        self.model.batch_decode_graph(
+            &token_ids,
+            &mut kv_refs,
+            &mut self.graph_state,
+            crate::batch_decode::DecodeGraphUse::Serve,
+        )
     }
 
     fn sample_prefill_logits(
@@ -847,10 +864,11 @@ impl TpSchedulerBackend {
         device_ordinals: &[usize],
         max_batch: usize,
         max_prefill_tokens: usize,
+        enable_cuda_graph: bool,
     ) -> Result<Self> {
         let executor = Qwen35TpExecutor::from_runtime_with_limits(
             model_path,
-            false,
+            enable_cuda_graph,
             device_ordinals,
             max_batch,
             max_prefill_tokens,
@@ -858,6 +876,7 @@ impl TpSchedulerBackend {
         Ok(Self {
             executor,
             next_request_id: 1,
+            pending_compaction: None,
         })
     }
 
@@ -955,7 +974,40 @@ impl TpSchedulerBackend {
     }
 
     fn drop_request(&self, request_id: RequestId, expectation: DropExpectation) -> Result<()> {
-        self.executor.drop_request(request_id, expectation)
+        self.executor
+            .drop_request_with_compaction(request_id, expectation, None)
+    }
+
+    /// Remove the TP request at `idx` via swap_remove and stash the resulting
+    /// slot compaction for the paired `drop_active_state`. Mirrors
+    /// `compact_single_slot`: after the swap, slots `0..active.len()` stay
+    /// dense because the moved request's slot follows it.
+    fn take_active_request(
+        &mut self,
+        active: &mut Vec<ActiveRequest35>,
+        idx: usize,
+    ) -> ActiveRequest35 {
+        let compaction = compaction_after_retire(active.len(), idx);
+        let removed = active.swap_remove(idx);
+
+        self.pending_compaction = compaction.map(|compaction| {
+            let moved = &mut active[idx];
+            let ActiveBackendState::Tp {
+                request_id,
+                slot_idx,
+            } = &mut moved.backend_state
+            else {
+                panic!("TP scheduler received single-GPU active state")
+            };
+            debug_assert_eq!(*slot_idx, compaction.moved_from);
+            *slot_idx = compaction.moved_to;
+            TpSlotCompaction {
+                moved_request_id: *request_id,
+                from: compaction.moved_from,
+                to: compaction.moved_to,
+            }
+        });
+        removed
     }
 }
 
@@ -1059,15 +1111,25 @@ fn tp_prefill_items(chunk: &ScheduledChunk) -> Result<Vec<TpPrefillChunkItem>> {
 fn tp_decode_items(active: &[ActiveRequest35]) -> Result<Vec<TpDecodeStepItem>> {
     active
         .iter()
-        .map(|req| {
-            let ActiveBackendState::Tp { request_id } = &req.backend_state else {
+        .enumerate()
+        .map(|(row, req)| {
+            let ActiveBackendState::Tp {
+                request_id,
+                slot_idx,
+            } = &req.backend_state
+            else {
                 anyhow::bail!("TP decode received single-GPU active state");
             };
-            Ok(TpDecodeStepItem::new(
+            debug_assert_eq!(
+                *slot_idx, row,
+                "TP decode slots must stay dense in active order"
+            );
+            Ok(TpDecodeStepItem::new_with_slot(
                 *request_id,
                 req.last_token,
                 req.logprobs,
                 req.params,
+                *slot_idx,
             ))
         })
         .collect()
@@ -1145,7 +1207,7 @@ fn align_decode_results(
     let expected: Vec<RequestId> = active
         .iter()
         .map(|active_req| {
-            let ActiveBackendState::Tp { request_id } = active_req.backend_state else {
+            let ActiveBackendState::Tp { request_id, .. } = active_req.backend_state else {
                 anyhow::bail!("align_decode_results requires TP active state");
             };
             Ok(request_id)
@@ -2212,15 +2274,20 @@ impl DecodeDispatchBackend for SchedulerBackend {
     ) -> ActiveRequest35 {
         match self {
             SchedulerBackend::Single(backend) => compact_single_slot(backend, active, idx),
-            SchedulerBackend::Tp(_) => active.swap_remove(idx),
+            SchedulerBackend::Tp(backend) => backend.take_active_request(active, idx),
         }
     }
 
     fn drop_active_state(&mut self, state: &ActiveBackendState) -> Result<()> {
         match (self, state) {
             (SchedulerBackend::Single(_), ActiveBackendState::Single { .. }) => Ok(()),
-            (SchedulerBackend::Tp(backend), ActiveBackendState::Tp { request_id }) => {
-                backend.drop_request(*request_id, DropExpectation::MustExist)
+            (SchedulerBackend::Tp(backend), ActiveBackendState::Tp { request_id, .. }) => {
+                let compaction = backend.pending_compaction.take();
+                backend.executor.drop_request_with_compaction(
+                    *request_id,
+                    DropExpectation::MustExist,
+                    compaction,
+                )
             }
             _ => anyhow::bail!("mismatched Qwen3.5 scheduler backend state during retirement"),
         }
@@ -2586,8 +2653,13 @@ impl PrefillPromoteBackend for SchedulerBackend {
                     graph_slot_idx: slot_idx,
                 }
             }
-            (SchedulerBackend::Tp(_), PrefillBackendState::Tp { request_id }) => {
-                ActiveBackendState::Tp { request_id }
+            (SchedulerBackend::Tp(backend), PrefillBackendState::Tp { request_id }) => {
+                let slot_idx = slot_for_new_request(active_len, backend.max_batch())
+                    .expect("admission must reserve a TP decode slot");
+                ActiveBackendState::Tp {
+                    request_id,
+                    slot_idx,
+                }
             }
             _ => panic!("mismatched Qwen3.5 scheduler backend state during promotion"),
         }

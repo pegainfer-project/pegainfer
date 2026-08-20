@@ -269,6 +269,30 @@ Validation scope:
 - recurrent-state cleanup on finish/drop/cancellation
 - no stale local recurrent state after a new `RequestId` is admitted
 
+## P2c: CUDA Graph under TP
+
+Status: landed (2026-08-20) on `feat/qwen35-tp2-rebased`, gated on
+`local_decode_group_is_compiled` — 4B/9B TP2 capture and replay decode graphs;
+27B TP2 (group 6) stays on the batched eager path byte-for-byte until group-6
+batch-decode kernels are compiled. Execution record: `tp-implementation.md`
+section "P2c — CUDA Graph under TP".
+
+**Gate**: graph mode active iff `enable_cuda_graph && config.local_decode_group_is_compiled(tp)`. 27B TP2 is group-6 (`SUPPORTED_GQA_GROUP_SIZES = [1,2,3,4,8]`, group ratio is TP-invariant), so 27B TP2 keeps the batched eager path byte-for-byte until group-6 batch-decode kernels are compiled; 4B/9B TP2 capture graphs. Startup logs once when graph was requested but the group gate keeps decode eager.
+
+**State model**: scheduler owns slot semantics (TP1 mirror); workers execute slot copies on command, never infer slots worker-side.
+
+- KV paged state unchanged (pool stable; page tables are per-step H2D via `sync_paged_meta`).
+- Per rank: `BatchDecodeGraphState`-equivalent at `bucket_for(effective_max_batch)` slots — fixed-address `slot_states: Vec<RecurrentState>` + one persistent `LinearStatePointerTables` built once over slots (contents stable → replay-safe).
+- Admission: decode command rows carry explicit `slot_idx` (`slot_for_new_request`); first decode row D2D-copies prefill `RecurrentState` into the slot (`copy_state_to_slot`), drops the per-request allocation.
+- Retirement: `DropRequest` gains `compaction: Option<(RequestId, from, to)>`; worker D2D-moves slot state (`move_slot_within`), asserts occupancy, poisons on mismatch.
+- Decode rows arrive dense slot order `0..bs`; padding rows clobber free slots (benign — admission overwrites).
+
+**Capture/replay**: startup pre-capture sweep ported from qwen3 (`executor.rs:1424`): `Warmup` (port `warmup_tp_collective`, one all-reduce per bucket message size — lazy NCCL connect inside capture wedges), `Capture`/`Launch` per bucket `[1,2,4,8,16,32,64]` with synthetic rows, `Finalize` asserts all captured; dedicated 600 s abort watchdog (60 s startup timeout too small). New `TpWorkerCommand::Precapture { phase }` via existing exact-rank dispatch. Serve time: replay-only (`ensure is_captured` + `launch_captured`), never capture mid-serving. Sampling/logprobs stay rank-0 host-side outside the graph. Mixed ticks: prefill eager + decode replay; collective order canonical per plan. `TpWorkerState` declares graph state before `model` so graphs drop before the NCCL comm (teardown hang precedent qwen3 `executor.rs:3076`).
+
+**Memory** (27B TP2/rank): weights ~17.5 GB + KV pool ~5.9 GiB + slot state reserve ~6.1 GiB + buffers/graphs ~0.3 + scratch/NCCL ~2.5 ≈ 32 GiB → fits 48 GB. 9B TP2 slot state ~1.6 GiB. Loader already reserves `2 × max_batch × bytes_per_request` before sizing KV.
+
+**Validation ladder**: CPU lib suite → TP2 graph HF gate (9B: sequential + bucket-straddling + post-compaction replay vs eager stats) → e2e scheduler graph variant → serving_tp2 graph smoke → 27B TP2 regression unchanged (group-6 stays eager) → per-bucket eager-vs-graph decode benchmark recorded in `bench_snapshots/`.
+
 ## References
 
 - `docs/models/qwen3/tp-design.md`

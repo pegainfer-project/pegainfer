@@ -128,4 +128,52 @@ impl BatchDecodeGraphState {
         dst.seq_len = src.seq_len;
         Ok(())
     }
+
+    /// D2D move slot `from` into slot `to`, leaving `to` as the canonical
+    /// state. Used by TP slot compaction when a mid-batch request retires:
+    /// the last occupied slot moves into the vacated slot so decode rows stay
+    /// dense (`0..bs`). Slot `from` keeps stale bytes afterwards; admission
+    /// overwrites it (`copy_state_to_slot`), and padding rows may clobber it —
+    /// both benign by design.
+    pub(crate) fn move_slot_within(
+        &mut self,
+        ctx: &DeviceContext,
+        from: usize,
+        to: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            from != to,
+            "TP slot compaction move {from} -> {to} is a no-op"
+        );
+        anyhow::ensure!(
+            from < self.slot_states.len() && to < self.slot_states.len(),
+            "TP slot compaction move {from} -> {to} exceeds {} slots",
+            self.slot_states.len()
+        );
+        let (lo, hi) = (from.min(to), from.max(to));
+        let (left, right) = self.slot_states.split_at_mut(hi);
+        let (src, dst) = if from < to {
+            (&left[from], &mut right[0])
+        } else {
+            (&right[0], &mut left[lo])
+        };
+        anyhow::ensure!(
+            src.layers.len() == dst.layers.len(),
+            "TP slot compaction layer count mismatch: {} vs {}",
+            src.layers.len(),
+            dst.layers.len()
+        );
+        for (src_layer, dst_layer) in src.layers.iter().zip(dst.layers.iter_mut()) {
+            ctx.stream
+                .memcpy_dtod(&src_layer.state, &mut dst_layer.state)
+                .map_err(|e| anyhow::anyhow!("move recurrent state slot {from} -> {to}: {e}"))?;
+            ctx.stream
+                .memcpy_dtod(&src_layer.conv_state.data, &mut dst_layer.conv_state.data)
+                .map_err(|e| anyhow::anyhow!("move conv state slot {from} -> {to}: {e}"))?;
+        }
+        let seq_len = src.seq_len;
+        let dst = &mut self.slot_states[to];
+        dst.seq_len = seq_len;
+        Ok(())
+    }
 }

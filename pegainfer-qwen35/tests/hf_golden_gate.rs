@@ -747,6 +747,117 @@ fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
         .expect("build Qwen3.5 TP2 logits executor")
 }
 
+/// TP2 executor with CUDA Graph requested. Returns `None` when the loaded
+/// model's TP-local decode GQA group has no compiled kernel (27B group 6) —
+/// the P2c gate keeps that path eager, so there is no graph to gate on.
+fn build_tp2_graph_executor(model_path: &str, label: &str) -> Option<Qwen35TpExecutor> {
+    let devices = common::tp2_device_ordinals();
+    let ex = Qwen35TpExecutor::from_runtime_with_capacity(
+        model_path,
+        true,
+        &devices,
+        MAX_EXECUTOR_BATCH,
+    )
+    .expect("build Qwen3.5 TP2 graph logits executor");
+    if !ex.graph_enabled() {
+        eprintln!(
+            "qwen35 hf_golden_gate [{label}]: CUDA Graph gated off (uncompiled TP-local decode GQA group); skipping"
+        );
+        return None;
+    }
+    Some(ex)
+}
+
+/// Mid-batch drop with slot compaction under TP: prefill `seqs`, decode one
+/// step, retire `SLOT_COMPACTION_DROP_INDEX` (the last slot moves into the
+/// gap), then keep decoding the survivors in their new dense slot order.
+fn run_tp_with_slot_compaction(
+    g: &Golden,
+    ex: &Qwen35TpExecutor,
+    seqs: &[usize],
+) -> (Stats, Vec<f32>) {
+    assert!(
+        seqs.len() > SLOT_COMPACTION_DROP_INDEX + 1,
+        "TP slot-compaction replay needs a non-tail request to drop"
+    );
+    assert!(
+        g.decode_len >= 2,
+        "TP slot-compaction replay needs at least two decode tokens"
+    );
+
+    let mut stats = Stats::default();
+    let mut fingerprint = Vec::new();
+    let mut fold = |stats: &mut Stats, seq, pos, pega: &[(u32, f32)]| {
+        fingerprint.push(pega[0].1);
+        check_position(stats, seq, pos, pega, &g.topk(seq, pos));
+    };
+
+    let mut live: Vec<(usize, RequestId)> = seqs
+        .iter()
+        .map(|&seq| (seq, RequestId::new(30_000 + seq as u64)))
+        .collect();
+    let items: Vec<PrefillStepItem> = live
+        .iter()
+        .map(|&(seq, id)| prefill_item(id, g.prompt(seq)))
+        .collect();
+    let pr = ex
+        .execute_prefill(PrefillPlan { requests: &items })
+        .expect("TP2 prefill");
+    for (i, &(seq, _)) in live.iter().enumerate() {
+        fold(
+            &mut stats,
+            seq,
+            0,
+            &top_logprobs(pr.requests[i].first_token_logprob.as_ref()),
+        );
+    }
+
+    let step0: Vec<DecodeStepItem> = live
+        .iter()
+        .map(|&(seq, id)| decode_item(id, g.decode(seq, 0)))
+        .collect();
+    let dr = ex
+        .execute_decode(DecodePlan { requests: &step0 })
+        .expect("TP2 decode before compaction");
+    for (i, &(seq, _)) in live.iter().enumerate() {
+        fold(
+            &mut stats,
+            seq,
+            1,
+            &top_logprobs(dr.requests[i].logprob.as_ref()),
+        );
+    }
+
+    let (_, dropped_id) = live[SLOT_COMPACTION_DROP_INDEX];
+    ex.drop_request(dropped_id, DropExpectation::MustExist)
+        .expect("TP2 drop request");
+    live.swap_remove(SLOT_COMPACTION_DROP_INDEX);
+
+    for step in 1..g.decode_len {
+        let items: Vec<DecodeStepItem> = live
+            .iter()
+            .map(|&(seq, id)| decode_item(id, g.decode(seq, step)))
+            .collect();
+        let dr = ex
+            .execute_decode(DecodePlan { requests: &items })
+            .expect("TP2 decode after compaction");
+        for (i, &(seq, _)) in live.iter().enumerate() {
+            fold(
+                &mut stats,
+                seq,
+                step + 1,
+                &top_logprobs(dr.requests[i].logprob.as_ref()),
+            );
+        }
+    }
+
+    for (_, id) in live {
+        ex.drop_request(id, DropExpectation::MustExist)
+            .expect("TP2 drop request");
+    }
+    (stats, fingerprint)
+}
+
 #[test]
 fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden") else {
@@ -887,4 +998,63 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
         fp1, fp2,
         "TP2 long sequential Qwen3.5 replay must reproduce identical logprobs"
     );
+}
+
+/// P2c TP2 CUDA Graph gate: sequential replay, bucket-straddling batched
+/// replay, and post-compaction replay after a mid-batch drop, all compared
+/// against the same HF golden within the existing TP2 tolerances.
+#[test]
+#[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
+fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
+    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden_tp2_graph")
+    else {
+        return;
+    };
+    let Some(golden) = Golden::load_for(&model_path, false) else {
+        return;
+    };
+    if !check_fixture_metadata(&model_path, &golden) {
+        return;
+    }
+    report_fixture_shape(&golden);
+    let all: Vec<usize> = (0..golden.num_seqs).collect();
+
+    let Some(ex) = build_tp2_graph_executor(&model_path, "TP2 graph") else {
+        return;
+    };
+    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    report_and_assert("TP2 sequential graph", &stats);
+    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    assert_eq!(
+        fp1, fp2,
+        "TP2 sequential Qwen3.5 graph replay must reproduce identical logprobs"
+    );
+
+    for n in BUCKET_STRADDLES {
+        if all.len() >= n {
+            let (batched, _) = run_tp(&golden, &ex, &all[..n], true);
+            report_and_assert(&format!("TP2 batched graph ({n} padded)"), &batched);
+        } else {
+            eprintln!(
+                "qwen35 hf_golden_gate: skipping TP2 batched graph ({n} padded); fixture has only {} sequence(s)",
+                all.len()
+            );
+        }
+    }
+
+    if golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2 {
+        let (compacted, fp1) =
+            run_tp_with_slot_compaction(&golden, &ex, &all[..SLOT_COMPACTION_BATCH]);
+        report_and_assert("TP2 slot-compaction graph", &compacted);
+        let (_, fp2) = run_tp_with_slot_compaction(&golden, &ex, &all[..SLOT_COMPACTION_BATCH]);
+        assert_eq!(
+            fp1, fp2,
+            "TP2 slot-compaction Qwen3.5 graph replay must reproduce identical logprobs"
+        );
+    } else {
+        eprintln!(
+            "qwen35 hf_golden_gate: skipping TP2 slot-compaction graph; fixture has {} sequence(s), decode_len {}",
+            golden.num_seqs, golden.decode_len
+        );
+    }
 }

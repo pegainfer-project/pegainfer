@@ -829,7 +829,6 @@ fn test_e2e_qwen35_scheduler_tp2() {
     info!("Loading Qwen3.5 TP2 model for scheduler test...");
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
-    // TP Phase 1 is eager-only; CUDA Graph must stay disabled for multi-device startup.
     let handle = pegainfer_qwen35::start_engine_with_capacity(
         Path::new(&model_path),
         EngineLoadOptions {
@@ -846,4 +845,35 @@ fn test_e2e_qwen35_scheduler_tp2() {
 
     let max_context_tokens = max_position_embeddings(&model_path);
     run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP2");
+}
+
+#[test]
+#[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
+fn test_e2e_qwen35_scheduler_tp2_graph() {
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler_tp2_graph") else {
+        return;
+    };
+
+    info!("Loading Qwen3.5 TP2 model with CUDA Graph for scheduler test...");
+    let start = Instant::now();
+    let tokenizer = common::load_tokenizer(&model_path);
+    // P2c: decode replays pre-captured CUDA Graphs when the TP-local decode
+    // GQA group has a compiled kernel (4B/9B); uncompiled groups (27B group 6)
+    // keep the batched eager path under the same request flow.
+    let handle = pegainfer_qwen35::start_engine_with_capacity(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: common::tp2_device_ordinals(),
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+        8,
+        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+    )
+    .expect("Failed to start Qwen3.5 TP2 graph scheduler");
+    info!("TP2 graph scheduler loaded in {:.2?}", start.elapsed());
+
+    let max_context_tokens = max_position_embeddings(&model_path);
+    run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP2 graph");
 }
