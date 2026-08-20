@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use pegainfer_frontend::engine::Engine;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::LiveScheduler;
 use pegainfer_frontend::engine::RejectReason;
@@ -20,6 +21,8 @@ use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::StepReceiver;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 
@@ -47,6 +50,10 @@ struct FakeExecutor {
     /// Emit [`EOS_TOKEN`] instead of the scripted token at this step index
     /// (0 = at prefill).
     eos_at: Option<u32>,
+    /// Optional multi-token spans returned by a speculative executor. The
+    /// scheduler must classify each span in order and discard the suffix
+    /// after the first terminal token.
+    decode_spans: VecDeque<Vec<u32>>,
     fail_next_prefill: bool,
     fail_next_decode: bool,
     decode_delay: Duration,
@@ -61,6 +68,7 @@ impl FakeExecutor {
             steps: HashMap::new(),
             live: HashSet::new(),
             eos_at: None,
+            decode_spans: VecDeque::new(),
             fail_next_prefill: false,
             fail_next_decode: false,
             decode_delay: Duration::ZERO,
@@ -75,6 +83,11 @@ impl FakeExecutor {
 
     fn with_eos_at(mut self, step: u32) -> Self {
         self.eos_at = Some(step);
+        self
+    }
+
+    fn with_decode_spans(mut self, spans: impl IntoIterator<Item = Vec<u32>>) -> Self {
+        self.decode_spans = spans.into_iter().collect();
         self
     }
 
@@ -152,6 +165,31 @@ impl StepExecutor for FakeExecutor {
             .collect())
     }
 
+    fn decode_many(&mut self, batch: &[DecodeSlot]) -> Result<Vec<Vec<u32>>> {
+        if self.decode_spans.is_empty() {
+            return self
+                .decode(batch)
+                .map(|tokens| tokens.into_iter().map(|token| vec![token]).collect());
+        }
+        assert_eq!(batch.len(), 1, "scripted spans are single-request fixtures");
+        let entry = batch[0];
+        assert!(
+            self.live.contains(&entry.slot),
+            "slot {} decoded after release",
+            entry.slot
+        );
+        let span = self
+            .decode_spans
+            .pop_front()
+            .expect("scripted span queue unexpectedly empty");
+        assert!(!span.is_empty(), "a scripted decode span must not be empty");
+        self.steps
+            .entry(entry.slot)
+            .and_modify(|step| *step += span.len() as u32)
+            .or_insert(span.len() as u32);
+        Ok(vec![span])
+    }
+
     fn release(&mut self, slot: SlotId) {
         assert!(self.live.remove(&slot), "slot {slot} released while free");
         self.steps.remove(&slot);
@@ -165,6 +203,7 @@ fn request(prompt_len: usize, max_tokens: usize) -> Request {
     Request {
         prompt_tokens: vec![7; prompt_len],
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,
@@ -299,6 +338,7 @@ fn admitted_request_streams_its_tokens_and_finishes_at_max_tokens() {
             terminal,
             Terminal::Finished {
                 reason: FinishReason::Length,
+                stop_cause: None,
                 prompt_tokens: 4,
                 completion_tokens: 3,
             }
@@ -345,7 +385,7 @@ fn a_zero_length_completion_finishes_without_taking_a_slot() {
 }
 
 #[test]
-fn eos_finishes_with_stop_and_is_not_streamed() {
+fn eos_finishes_with_stop_and_retains_the_triggering_token() {
     let released = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(4, released).with_eos_at(2);
     let (partition, mut steps) = launch(executor);
@@ -354,15 +394,107 @@ fn eos_finishes_with_stop_and_is_not_streamed() {
     let (tokens, terminal) = steps.collect_terminal(control.id());
     assert_eq!(
         tokens,
-        vec![10, 11],
-        "the stop token itself is not part of the completion"
+        vec![10, 11, EOS_TOKEN],
+        "the stop token stays in the engine update for wire accounting"
     );
     assert!(
         matches!(
             terminal,
             Terminal::Finished {
                 reason: FinishReason::Stop,
+                stop_cause: Some(StopCause::Eos(EOS_TOKEN)),
+                completion_tokens: 3,
+                ..
+            }
+        ),
+        "{terminal:?}"
+    );
+}
+
+#[test]
+fn prefill_eos_finishes_and_releases_the_slot_for_reuse() {
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(1, Arc::clone(&released)).with_eos_at(0);
+    let (partition, mut steps) = launch(executor);
+
+    for _ in 0..2 {
+        let control = partition.handle.submit(request(4, 64));
+        let (tokens, terminal) = steps.collect_terminal(control.id());
+
+        assert_eq!(tokens, vec![EOS_TOKEN]);
+
+        assert!(
+            matches!(
+                terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Stop,
+                    stop_cause: Some(StopCause::Eos(EOS_TOKEN)),
+                    completion_tokens: 1,
+                    ..
+                }
+            ),
+            "{terminal:?}"
+        );
+    }
+
+    assert_eq!(
+        *released.lock().expect("released log"),
+        vec![0, 0],
+        "the only slot must be reusable after a prefill stop"
+    );
+}
+
+#[test]
+fn explicit_stop_token_finishes_independently_of_eos() {
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let (partition, mut steps) = launch(FakeExecutor::new(4, released));
+
+    let mut req = request(4, 64);
+    req.stop_policy = StopPolicy {
+        eos: EosPolicy::Ignore,
+        token_ids: vec![11],
+    };
+
+    let control = partition.handle.submit(req);
+    let (tokens, terminal) = steps.collect_terminal(control.id());
+
+    assert_eq!(tokens, vec![10, 11]);
+
+    assert!(
+        matches!(
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Stop,
+                stop_cause: Some(StopCause::Token(11)),
                 completion_tokens: 2,
+                ..
+            }
+        ),
+        "{terminal:?}"
+    );
+}
+
+#[test]
+fn ignored_eos_is_streamed_and_length_finishes_the_request() {
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(4, released).with_eos_at(2);
+    let (partition, mut steps) = launch(executor);
+
+    let mut req = request(4, 3);
+    req.stop_policy.eos = EosPolicy::Ignore;
+
+    let control = partition.handle.submit(req);
+    let (tokens, terminal) = steps.collect_terminal(control.id());
+
+    assert_eq!(tokens, vec![10, 11, EOS_TOKEN]);
+
+    assert!(
+        matches!(
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Length,
+                stop_cause: None,
+                completion_tokens: 3,
                 ..
             }
         ),
@@ -538,4 +670,102 @@ fn requests_beyond_the_slot_budget_wait_instead_of_being_refused() {
             "{terminal:?}"
         );
     }
+}
+
+#[test]
+fn speculative_span_keeps_the_first_explicit_stop_and_discards_suffix() {
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let executor =
+        FakeExecutor::new(1, Arc::clone(&released)).with_decode_spans([vec![20, 42, 77]]);
+    let (partition, mut steps) = launch(executor);
+
+    let mut req = request(4, 64);
+    req.stop_policy = StopPolicy {
+        eos: EosPolicy::Ignore,
+        token_ids: vec![42],
+    };
+    let control = partition.handle.submit(req);
+    let (tokens, terminal) = steps.collect_terminal(control.id());
+
+    assert_eq!(tokens, vec![10, 20, 42]);
+    assert!(
+        matches!(
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Stop,
+                stop_cause: Some(StopCause::Token(42)),
+                completion_tokens: 3,
+                ..
+            }
+        ),
+        "{terminal:?}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(1), || released
+            .lock()
+            .expect("released log")
+            .contains(&0)),
+        "a speculative stop must release its slot"
+    );
+}
+
+#[test]
+fn speculative_span_stops_at_max_tokens_without_a_stop_cause() {
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let executor =
+        FakeExecutor::new(1, Arc::clone(&released)).with_decode_spans([vec![20, 21, 22]]);
+    let (partition, mut steps) = launch(executor);
+
+    let control = partition.handle.submit(request(4, 2));
+    let (tokens, terminal) = steps.collect_terminal(control.id());
+
+    assert_eq!(tokens, vec![10, 20]);
+    assert!(
+        matches!(
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Length,
+                stop_cause: None,
+                completion_tokens: 2,
+                ..
+            }
+        ),
+        "{terminal:?}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(1), || released
+            .lock()
+            .expect("released log")
+            .contains(&0)),
+        "a length-truncated speculative span must release its slot"
+    );
+}
+
+#[test]
+fn speculative_eos_wins_over_an_overlapping_explicit_stop() {
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(1, released).with_decode_spans([vec![42, 77]]);
+    let (partition, mut steps) = launch(executor);
+
+    let mut req = request(4, 64);
+    req.stop_policy = StopPolicy {
+        eos: EosPolicy::Token(42),
+        token_ids: vec![42],
+    };
+    let control = partition.handle.submit(req);
+    let (tokens, terminal) = steps.collect_terminal(control.id());
+
+    assert_eq!(tokens, vec![10, 42]);
+    assert!(
+        matches!(
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Stop,
+                stop_cause: Some(StopCause::Eos(42)),
+                completion_tokens: 2,
+                ..
+            }
+        ),
+        "{terminal:?}"
+    );
 }

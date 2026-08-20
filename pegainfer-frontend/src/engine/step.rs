@@ -14,6 +14,8 @@ use std::time::Instant;
 
 use super::event::FinishReason;
 use super::event::TokenLogprob;
+use super::stop::StopCause;
+use super::stop::StopPolicy;
 
 /// In-process routing id for one generate request, minted by
 /// [`super::SchedulerHandle::submit`] from a per-scheduler counter. `Copy` and
@@ -49,6 +51,7 @@ impl std::fmt::Display for RequestId {
 pub struct Request {
     pub prompt_tokens: Vec<u32>,
     pub params: crate::sampler::SamplingParams,
+    pub stop_policy: StopPolicy,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
     /// Opaque router/P-D metadata from the request's
@@ -228,6 +231,10 @@ impl fmt::Display for RejectReason {
 pub enum Terminal {
     Finished {
         reason: FinishReason,
+        /// Present for token-driven stop finishes. The triggering token remains
+        /// in `RequestUpdate.tokens`, with its real logprob in the matching
+        /// `RequestUpdate.logprobs` entry.
+        stop_cause: Option<StopCause>,
         prompt_tokens: usize,
         completion_tokens: usize,
     },

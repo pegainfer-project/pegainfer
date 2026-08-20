@@ -12,7 +12,9 @@ use std::path::Path;
 
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::sampler::SamplingParams;
@@ -37,6 +39,10 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, params: SamplingPara
             data_parallel_rank: None,
             prompt_tokens,
             params,
+            stop_policy: StopPolicy {
+                eos: EosPolicy::Ignore,
+                token_ids: vec![],
+            },
             max_tokens: GENERATED_TOKENS,
             lora_adapter: None,
             kv_transfer_params: None,

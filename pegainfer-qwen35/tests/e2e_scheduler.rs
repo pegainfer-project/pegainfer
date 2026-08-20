@@ -9,9 +9,11 @@ use std::time::Instant;
 use log::info;
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::TokenSink;
@@ -128,6 +130,7 @@ fn generate_tokens_with_logprobs(
             data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -158,6 +161,10 @@ fn submit_repeated_token_request(
             params: SamplingParams {
                 ignore_eos: true,
                 ..SamplingParams::default()
+            },
+            stop_policy: StopPolicy {
+                eos: EosPolicy::Ignore,
+                token_ids: vec![],
             },
             max_tokens,
             lora_adapter: None,
@@ -345,6 +352,7 @@ fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: us
             data_parallel_rank: None,
             prompt_tokens: vec![1; max_context_tokens],
             params: SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens: 1,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -558,6 +566,7 @@ fn run_full_scheduler_e2e(
                     data_parallel_rank: None,
                     prompt_tokens,
                     params: concurrent_params(case_idx),
+                    stop_policy: StopPolicy::default(),
                     max_tokens: case.max_new_tokens,
                     lora_adapter: None,
                     kv_transfer_params: None,
@@ -600,6 +609,7 @@ fn run_full_scheduler_e2e(
                     data_parallel_rank: None,
                     prompt_tokens,
                     params: SamplingParams::default(),
+                    stop_policy: StopPolicy::default(),
                     max_tokens: 8,
                     lora_adapter: None,
                     kv_transfer_params: None,
@@ -643,6 +653,7 @@ fn run_full_scheduler_e2e(
                 data_parallel_rank: None,
                 prompt_tokens,
                 params: SamplingParams::default(),
+                stop_policy: StopPolicy::default(),
                 max_tokens: 10,
                 lora_adapter: None,
                 kv_transfer_params: None,

@@ -5,6 +5,7 @@ use crossbeam_channel::bounded;
 use log::error;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::SubmittedRequest;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenSink;
@@ -13,6 +14,7 @@ use pegainfer_kv_cache::RequestKv;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
+use super::emit_sampled_token;
 use super::lifecycle::preflight_prefill_candidate;
 use super::lifecycle::request_lifetime_blocks;
 use super::lifecycle::send_scheduled;
@@ -58,6 +60,7 @@ pub(in crate::runner) struct DpRankState {
 
 struct RequestState {
     token_tx: TokenSink,
+    stop_policy: StopPolicy,
     prompt_len: usize,
     completion_tokens: usize,
     max_tokens: usize,
@@ -512,38 +515,24 @@ impl DpCoordinator {
             });
             return;
         }
-        if !req.params.ignore_eos && self.stop_token_ids.contains(&last_token) {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: prompt_len,
-                completion_tokens: 0,
-            });
-            return;
-        }
-        if req
-            .token_tx
-            .send(TokenEvent::Token {
-                id: last_token,
-                logprob: owner_report.logprob,
-            })
-            .is_err()
-        {
-            return;
-        }
-
         let completion_tokens = 1;
-        if completion_tokens >= req.max_tokens {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: prompt_len,
-                completion_tokens,
-            });
+        if !emit_sampled_token(
+            &req.token_tx,
+            &req.stop_policy,
+            &self.stop_token_ids,
+            last_token,
+            owner_report.logprob,
+            prompt_len,
+            completion_tokens,
+            req.max_tokens,
+        ) {
             return;
         }
 
         let options = row_options(&req);
         self.ranks[dp_rank].slots[slot] = Some(RequestState {
             token_tx: req.token_tx,
+            stop_policy: req.stop_policy,
             prompt_len,
             completion_tokens,
             max_tokens: req.max_tokens,
@@ -647,38 +636,24 @@ impl DpCoordinator {
             });
             return;
         }
-        if !req.params.ignore_eos && self.stop_token_ids.contains(&token_id) {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: req.prompt_tokens.len(),
-                completion_tokens: 0,
-            });
-            return;
-        }
-        if req
-            .token_tx
-            .send(TokenEvent::Token {
-                id: token_id,
-                logprob: report.logprob.clone(),
-            })
-            .is_err()
-        {
-            return;
-        }
-
         let completion_tokens = 1;
-        if completion_tokens >= req.max_tokens {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: req.prompt_tokens.len(),
-                completion_tokens,
-            });
+        if !emit_sampled_token(
+            &req.token_tx,
+            &req.stop_policy,
+            &self.stop_token_ids,
+            token_id,
+            report.logprob.clone(),
+            req.prompt_tokens.len(),
+            completion_tokens,
+            req.max_tokens,
+        ) {
             return;
         }
 
         let options = row_options(&req);
         self.ranks[dp_rank].slots[slot] = Some(RequestState {
             token_tx: req.token_tx,
+            stop_policy: req.stop_policy,
             prompt_len: req.prompt_tokens.len(),
             completion_tokens,
             max_tokens: req.max_tokens,
@@ -908,36 +883,16 @@ impl DpRankState {
             return;
         }
 
-        // EOS outranks the length limit; the stop token itself is not emitted
-        // (same contract as the Qwen schedulers).
-        if !req.options.sampling.ignore_eos && stop_token_ids.contains(&token_id) {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: req.prompt_len,
-                completion_tokens: req.completion_tokens,
-            });
-            self.slots[slot_idx] = None;
-            return;
-        }
-
-        if req
-            .token_tx
-            .send(TokenEvent::Token {
-                id: token_id,
-                logprob: report.logprob.clone(),
-            })
-            .is_err()
-        {
-            self.slots[slot_idx] = None;
-            return;
-        }
-
-        if req.completion_tokens >= req.max_tokens {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: req.prompt_len,
-                completion_tokens: req.completion_tokens,
-            });
+        if !emit_sampled_token(
+            &req.token_tx,
+            &req.stop_policy,
+            stop_token_ids,
+            token_id,
+            report.logprob.clone(),
+            req.prompt_len,
+            req.completion_tokens,
+            req.max_tokens,
+        ) {
             self.slots[slot_idx] = None;
         } else {
             req.last_token = token_id;
@@ -1095,6 +1050,8 @@ fn rank_forward_loop(
 
 #[cfg(test)]
 mod tests {
+    use pegainfer_frontend::engine::EosPolicy;
+    use pegainfer_frontend::engine::StopCause;
     use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
@@ -1108,6 +1065,7 @@ mod tests {
             data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -1155,6 +1113,7 @@ mod tests {
         let (token_tx, _token_rx) = TokenSink::standalone();
         RequestState {
             token_tx,
+            stop_policy: StopPolicy::default(),
             prompt_len,
             completion_tokens,
             max_tokens,
@@ -1323,6 +1282,7 @@ mod tests {
         kv.schedule_decode(&pool).expect("decode block");
         rank.slots[0] = Some(RequestState {
             token_tx,
+            stop_policy: StopPolicy::default(),
             prompt_len: 4,
             completion_tokens: 1,
             max_tokens: 16,
@@ -1334,10 +1294,15 @@ mod tests {
         rank.process_decode_report(0, &dummy_report(163_586), &[163_586], &pool);
 
         assert!(rank.slots[0].is_none());
+        let Ok((_, TokenEvent::Token { id, .. })) = token_rx.try_recv() else {
+            panic!("expected trigger Token event");
+        };
+        assert_eq!(id, 163_586);
         let Ok((
             _,
             TokenEvent::Finished {
                 finish_reason,
+                stop_cause,
                 completion_tokens,
                 ..
             },
@@ -1346,13 +1311,13 @@ mod tests {
             panic!("expected Finished event");
         };
         assert_eq!(finish_reason, FinishReason::Stop);
+        assert_eq!(stop_cause, Some(StopCause::Eos(163_586)));
         assert_eq!(completion_tokens, 2);
-        // The stop token itself is not emitted.
         assert!(token_rx.try_recv().is_err());
     }
 
     #[test]
-    fn decode_report_honors_ignore_eos() {
+    fn decode_report_honors_request_eos_policy() {
         let pool = test_pool();
         let mut rank = DpRankState {
             slots: (0..MAX_BATCH_PER_DP).map(|_| None).collect(),
@@ -1362,6 +1327,10 @@ mod tests {
         kv.schedule_decode(&pool).expect("decode block");
         rank.slots[0] = Some(RequestState {
             token_tx,
+            stop_policy: StopPolicy {
+                eos: EosPolicy::Ignore,
+                token_ids: Vec::new(),
+            },
             prompt_len: 4,
             completion_tokens: 1,
             max_tokens: 16,
@@ -1383,6 +1352,42 @@ mod tests {
             panic!("expected Token event");
         };
         assert_eq!(id, 163_586);
+    }
+
+    #[test]
+    fn decode_report_stops_on_explicit_token_while_eos_is_ignored() {
+        let pool = test_pool();
+        let mut rank = DpRankState {
+            slots: (0..MAX_BATCH_PER_DP).map(|_| None).collect(),
+        };
+        let (token_tx, mut token_rx) = TokenSink::standalone();
+        let mut kv = dummy_kv(&pool, 4, 1, 16, 7);
+        kv.schedule_decode(&pool).expect("decode block");
+        rank.slots[0] = Some(RequestState {
+            token_tx,
+            stop_policy: StopPolicy {
+                eos: EosPolicy::Ignore,
+                token_ids: vec![42],
+            },
+            prompt_len: 4,
+            completion_tokens: 1,
+            max_tokens: 16,
+            last_token: 7,
+            options: KimiRowOptions::default(),
+            kv,
+        });
+
+        rank.process_decode_report(0, &dummy_report(42), &[163_586], &pool);
+
+        assert!(rank.slots[0].is_none());
+        assert!(matches!(
+            token_rx.try_recv(),
+            Ok((_, TokenEvent::Token { id: 42, .. }))
+        ));
+        let Ok((_, TokenEvent::Finished { stop_cause, .. })) = token_rx.try_recv() else {
+            panic!("expected terminal Finished event");
+        };
+        assert_eq!(stop_cause, Some(StopCause::Token(42)));
     }
 
     #[test]

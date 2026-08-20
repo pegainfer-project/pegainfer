@@ -343,6 +343,7 @@ mod tests {
                 data_parallel_rank: rank,
                 prompt_tokens: vec![1],
                 params: SamplingParams::default(),
+                stop_policy: crate::engine::StopPolicy::default(),
                 max_tokens: 1,
                 lora_adapter: None,
                 kv_transfer_params: None,

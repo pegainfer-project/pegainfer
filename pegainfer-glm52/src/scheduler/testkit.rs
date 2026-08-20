@@ -1,7 +1,10 @@
 //! Shared fixtures for the scheduler module tests.
 
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_kv_store::BlockPool;
 use pegainfer_kv_store::RequestKv;
 
@@ -12,7 +15,18 @@ use super::slot::Glm52StepOutcome;
 pub(super) const EOS: &[u32] = &[7];
 
 pub(super) fn state(prompt: Vec<u32>, max_tokens: usize, ignore_eos: bool) -> Glm52SlotState {
-    Glm52SlotState::new(prompt, max_tokens, ignore_eos, 0)
+    Glm52SlotState::new(prompt, max_tokens, stop_policy(ignore_eos), 0)
+}
+
+pub(super) fn stop_policy(ignore_eos: bool) -> StopPolicy {
+    StopPolicy {
+        eos: if ignore_eos {
+            EosPolicy::Ignore
+        } else {
+            EosPolicy::ModelDefault
+        },
+        token_ids: Vec::new(),
+    }
 }
 
 /// A standalone `RequestKv` for tests that never schedule KV (the pool
@@ -28,10 +42,13 @@ pub(super) fn commit(
     finish: Option<FinishReason>,
     context_rows: usize,
 ) -> Glm52StepOutcome {
+    let stop_cause = matches!(finish, Some(FinishReason::Stop))
+        .then(|| StopCause::Eos(*committed.last().expect("a stop commit has a trigger token")));
     Glm52StepOutcome::Commit {
         committed: committed.to_vec(),
         emit,
         finish,
+        stop_cause,
         context_rows,
     }
 }
@@ -42,6 +59,7 @@ pub(super) fn request(
     max_tokens: usize,
 ) -> GenerateRequest {
     let (token_tx, _token_rx) = pegainfer_frontend::engine::TokenSink::standalone();
+    let stop_policy = stop_policy(params.ignore_eos);
     GenerateRequest {
         trace_parent: None,
         request_id: None,
@@ -49,6 +67,7 @@ pub(super) fn request(
         data_parallel_rank: None,
         prompt_tokens: prompt,
         params,
+        stop_policy,
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,

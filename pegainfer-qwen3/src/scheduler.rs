@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use log::debug;
 use log::warn;
 use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::executor::ModelExecutor;
@@ -34,6 +35,7 @@ pub(crate) struct ActiveRequestState {
     pub(crate) max_tokens: usize,
     pub(crate) prompt_len: usize,
     pub(crate) params: SamplingParams,
+    pub(crate) stop_policy: StopPolicy,
     /// Number of top logprobs to return (0 = disabled).
     pub(crate) logprobs: usize,
 }
@@ -47,6 +49,7 @@ pub(crate) struct PendingRequest {
     pub(crate) lora_adapter: Option<String>,
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) params: SamplingParams,
+    pub(crate) stop_policy: StopPolicy,
     pub(crate) max_tokens: usize,
     pub(crate) logprobs: usize,
     pub(crate) echo: bool,
@@ -73,6 +76,7 @@ impl PendingRequest {
             lora_adapter: req.lora_adapter,
             prompt_tokens: req.prompt_tokens,
             params: req.params,
+            stop_policy: req.stop_policy,
             max_tokens: req.max_tokens,
             logprobs: req.logprobs,
             echo: req.echo,

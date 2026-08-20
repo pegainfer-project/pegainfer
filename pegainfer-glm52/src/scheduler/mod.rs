@@ -668,8 +668,9 @@ impl Glm52Engine {
         self.runtime.spawn(async move {
             let resolved = match native {
                 Some(handoff) => match handoff.anchor_token_id {
-                    // P consumed EOS: nothing to restore or decode — the
-                    // anchored finish happens at admission, no resolve runs.
+                    // P consumed a token-driven stop: nothing to restore or
+                    // decode — the typed finish happens at admission, no
+                    // resolve runs.
                     None => offload::Resolved::Native {
                         req,
                         prefix: KvPrefix::none(),
@@ -1046,6 +1047,7 @@ impl Glm52Engine {
                     committed,
                     emit,
                     finish,
+                    stop_cause,
                     context_rows,
                 } => {
                     // A dropped receiver (client disconnect) frees the
@@ -1071,6 +1073,7 @@ impl Glm52Engine {
                     {
                         let _ = active.req.token_tx.send(TokenEvent::Finished {
                             finish_reason,
+                            stop_cause,
                             prompt_tokens,
                             completion_tokens: active.state.completion_tokens(),
                         });
@@ -1401,6 +1404,7 @@ impl Glm52Engine {
                     committed,
                     emit,
                     finish,
+                    stop_cause,
                     ..
                 } => {
                     active.kv.apply_prefill(committed[0], pool)?;
@@ -1440,7 +1444,9 @@ impl Glm52Engine {
                             let handoff = offload::NativeMtpHandoff {
                                 fingerprint: offload::handoff_fingerprint(),
                                 committed_len,
-                                anchor_token_id: (emit == 1).then(|| committed[0]),
+                                anchor_token_id: (stop_cause.is_none() && emit == 1)
+                                    .then(|| committed[0]),
+                                stop_cause: stop_cause.map(Into::into),
                                 draft_tokens: drafts.to_vec(),
                             };
                             let _ = active.req.token_tx.send(TokenEvent::KvTransfer {
@@ -1456,6 +1462,7 @@ impl Glm52Engine {
                     {
                         let _ = active.req.token_tx.send(TokenEvent::Finished {
                             finish_reason,
+                            stop_cause,
                             prompt_tokens,
                             completion_tokens: active.state.completion_tokens(),
                         });

@@ -1,8 +1,8 @@
 # Kimi-K2 sampling: param surface and design
 
-**TL;DR**: temperature/top_k/top_p are honored on TP1/DP8 via one batched FlashInfer pass (greedy rows keep the in-graph argmax, zero perf cost); TP8 rejects non-greedy explicitly; everything else on the OpenAI surface is documented below — nothing is silently ignored anymore (#237).
+**TL;DR**: temperature/top_k/top_p are honored on TP1/DP8 via one batched FlashInfer pass (greedy rows keep the in-graph argmax, zero perf cost); TP8 rejects non-greedy explicitly; unsupported sampling fields are rejected or explicitly documented, and request stop-token IDs are carried through the shared stop policy (#237).
 
-Last touched: 2026-06
+Last touched: 2026-08
 
 ## Param surface (`/v1/completions`)
 
@@ -20,10 +20,14 @@ scheduler/worker.
 | `top_p` = 0 / out of range | **rejected** (HTTP 500, see below) | rejected | engine (`lifecycle.rs validate_sampling_params`) |
 | `top_k` ≥ 1 | **honored** (`top_k=1` routes greedy) | rejected if non-greedy | engine |
 | `top_k` = 0 | all tokens (disabled) | — | frontend maps 0 → -1; protocol type is `u32`, negatives don't parse |
-| `seed` | **accepted, ignored** — engine seed is fixed at 42, per-request seed is dropped at `convert_sampling` | same | frontend |
+| `seed` | greedy requests are **accepted, ignored**; non-greedy per-request seeds are rejected until row-local seed wiring lands | same | frontend |
 | `logprobs` | honored; for sampled rows the logprob follows the **sampled** token (reported rank is a placeholder, see PR #96) | honored (greedy only) | engine |
 | `max_tokens`, `echo`, `stop` (EOS) | honored | honored | engine / frontend |
-| `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `prompt_logprobs`, custom `stop_token_ids` | **accepted, ignored** — dropped at `convert_sampling`, never reach the engine | same | frontend (all models, not kimi-specific) |
+| `min_p` | **honored** when in `[0, 1)`; out-of-range values are rejected | same | frontend / engine |
+| `frequency_penalty`, `presence_penalty`, `repetition_penalty` | defaults are accepted; non-default values are rejected because no matching sampler path exists | same | shared frontend wire validation |
+| `logit_bias`, `prompt_logprobs` | **accepted, ignored** — no engine-side implementation yet | same | frontend (all models, not kimi-specific) |
+| `stop_token_ids` | **honored** independently of EOS; the matching token is preserved and reported as the stop cause | same | shared `StopPolicy` |
+| `min_tokens` | **rejected** — the current scheduler contracts do not carry the threshold needed to mask EOS/stop IDs | same | shared frontend wire validation |
 
 Rejection UX pitfall: an engine-side rejection surfaces as a generic HTTP 500
 (`"Internal server error"`). The real message ("top_p must be in (0, 1]…",

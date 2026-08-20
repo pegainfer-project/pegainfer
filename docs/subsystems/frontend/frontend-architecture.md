@@ -93,7 +93,7 @@ All six lines are onboarded. Adding a model line = write `model_line.rs` in the 
 
 ## Protocol stacks
 
-**`vllm` (current default, fleet-proven).** Impersonates a vLLM EngineCore process over in-process ZMQ/msgpack because upstream `vllm-server` assumes the engine is a separate process. HTTP routes, OpenAI types, tokenizer, chat templates, Prometheus live in the external `vllm-server`/`vllm-metrics`/`vllm-text` crates. `SteppedEngineBridge` translates each `RequestUpdate` 1:1 into an EngineCore output (wall-clock timestamps are reconstructed from the contract's `Instant`s via a per-bridge unix anchor; a `Finished{Stop}` appends the stop sentinel token, which is how usage keeps counting the suppressed EOS).
+**`vllm` (current default, fleet-proven).** Impersonates a vLLM EngineCore process over in-process ZMQ/msgpack because upstream `vllm-server` assumes the engine is a separate process. HTTP routes, OpenAI types, tokenizer, chat templates, Prometheus live in the external `vllm-server`/`vllm-metrics`/`vllm-text` crates. `SteppedEngineBridge` translates each `RequestUpdate` 1:1 into an EngineCore output (wall-clock timestamps are reconstructed from the contract's `Instant`s via a per-bridge unix anchor). The typed step contract carries the trigger token and `StopCause` together; only the legacy bridge retains synthetic sentinel fallback for producers that do not yet report a cause.
 
 **`dynamo` (planned second stack).** dynamo's `lib/llm` in-process path removes the wire protocol entirely (`EngineConfig::InProcessTokens` + `run_input`). The step contract was shaped so this stack can consume `StepOutputs` directly without impersonation overhead. Decision gate: prototype, A/B against the vllm stack, let TTFT/step-overhead numbers pick the default.
 

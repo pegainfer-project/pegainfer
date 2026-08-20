@@ -11,6 +11,7 @@
 use anyhow::Context as _;
 use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::KvPrefix;
+use pegainfer_frontend::engine::StopCause;
 use pegainfer_kv_store::CacheScope;
 use pegainfer_kv_store::CancelProbe;
 use pegainfer_kv_store::KvStore;
@@ -21,17 +22,44 @@ use serde::Serialize;
 
 use super::PAGE;
 
-/// The handoff envelope (v3), one struct for both sides. Boundary rule:
+/// The handoff envelope (v5), one struct for both sides. Boundary rule:
 /// content shareable in the radix is a pure prompt function and travels
 /// the KV data plane; anchor-dependent continuation state travels here.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(super) enum NativeStopCause {
+    Eos(u32),
+    Token(u32),
+}
+
+impl From<StopCause> for NativeStopCause {
+    fn from(value: StopCause) -> Self {
+        match value {
+            StopCause::Eos(id) => Self::Eos(id),
+            StopCause::Token(id) => Self::Token(id),
+        }
+    }
+}
+
+impl From<NativeStopCause> for StopCause {
+    fn from(value: NativeStopCause) -> Self {
+        match value {
+            NativeStopCause::Eos(id) => Self::Eos(id),
+            NativeStopCause::Token(id) => Self::Token(id),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct NativeMtpHandoff {
     /// Capability manifest (see [`handoff_fingerprint`]); a mismatch is an
     /// intake rejection carrying both strings.
     pub(super) fingerprint: String,
     pub(super) committed_len: usize,
-    /// P's first sampled token; `None` = EOS — nothing to restore or decode.
+    /// P's first sampled non-terminal token; `None` means no decode slot is
+    /// required (the typed terminal cause is carried separately).
     pub(super) anchor_token_id: Option<u32>,
+    #[serde(default)]
+    pub(super) stop_cause: Option<NativeStopCause>,
     pub(super) draft_tokens: Vec<u32>,
 }
 
@@ -47,7 +75,7 @@ pub(super) struct PegaInferPdEnvelope {
 /// whole per-block byte layout.
 pub(super) fn handoff_fingerprint() -> String {
     format!(
-        "glm52-native-mtp/4/page:{}/salt:{}/drafts:{}",
+        "glm52-native-mtp/5/page:{}/salt:{}/drafts:{}",
         crate::model::GLM52_KV_PAGE_STRIDE,
         super::native_mtp_cache_salt(),
         crate::mtp::glm52_mtp_draft_len(),
@@ -75,7 +103,7 @@ pub(super) fn native_mtp_handoff(
     );
     anyhow::ensure!(
         req.prompt_tokens.len() == handoff.committed_len,
-        "native P/D v3 expects the original prompt: committed_len {}, got {} prompt tokens",
+        "native P/D v5 expects the original prompt: committed_len {}, got {} prompt tokens",
         handoff.committed_len,
         req.prompt_tokens.len()
     );

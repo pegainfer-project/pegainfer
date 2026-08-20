@@ -5,7 +5,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::EpBackend;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 
 use super::*;
 
@@ -29,6 +32,10 @@ fn test_request_with_shape(
             ignore_eos: true,
             ..SamplingParams::default()
         },
+        stop_policy: StopPolicy {
+            eos: EosPolicy::Ignore,
+            token_ids: vec![],
+        },
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,
@@ -50,6 +57,7 @@ fn active_request(request_id: u64, label: &str, token_tx: TokenSink) -> ActiveRe
         max_tokens: 8,
         prompt_len: 1,
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         logprobs: 0,
     }
 }
@@ -427,7 +435,7 @@ fn prune_drop_failure_preserves_pending_for_terminal_fanout() {
 fn decode_eos_waits_for_drop_before_finished() {
     let (token_tx, token_rx) = TokenSink::standalone();
     let mut request = active_request(30, "decode-eos", token_tx);
-    request.params.ignore_eos = false;
+    request.stop_policy = StopPolicy::default();
     let mut active = vec![request];
     let mut backend = LifecycleTestBackend::new(Some(9), token_rx);
 
@@ -437,9 +445,14 @@ fn decode_eos_waits_for_drop_before_finished() {
     assert_eq!(backend.active_drops, vec![RequestId::new(30)]);
     let mut token_rx = backend.observer.take().unwrap();
     assert!(matches!(
+        next_event(&mut token_rx, "decode EOS token"),
+        TokenEvent::Token { id: 9, .. }
+    ));
+    assert!(matches!(
         next_event(&mut token_rx, "decode EOS"),
         TokenEvent::Finished {
             finish_reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Eos(9)),
             ..
         }
     ));
@@ -684,6 +697,7 @@ fn terminal_shutdown_closes_drains_and_errors_every_owner_once() {
         request: active_request(42, "candidate", candidate_tx),
         final_events: vec![TokenEvent::Finished {
             finish_reason: FinishReason::Length,
+            stop_cause: None,
             prompt_tokens: 1,
             completion_tokens: 2,
         }],
@@ -808,6 +822,7 @@ fn send_rejection_reports_kv_lifetime_request_tokens() {
         data_parallel_rank: None,
         prompt_tokens: vec![1; 16],
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         max_tokens: 65,
         lora_adapter: None,
         kv_transfer_params: None,
@@ -948,6 +963,7 @@ fn send_rejection_reports_context_window_limit() {
         data_parallel_rank: None,
         prompt_tokens: vec![1; 16],
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         max_tokens: 17,
         lora_adapter: None,
         kv_transfer_params: None,

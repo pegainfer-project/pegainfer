@@ -9,10 +9,67 @@
 
 use std::sync::atomic::Ordering;
 
+use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
+
 use super::*;
 use crate::engine::FinishReason;
 use crate::engine::RequestAbortReason;
+use crate::engine::StopCause;
 use crate::engine::TokenLogprob;
+
+#[test]
+fn legacy_bridge_rejects_min_tokens_before_scheduler_submission() {
+    let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
+    let bridge = LocalEngineBridge {
+        input_address: String::new(),
+        output_address: String::new(),
+        handle: EngineHandle::new(submit_tx),
+        max_model_len: 4096,
+        engine_index: 2,
+        data_parallel_size: 1,
+        metrics_watch: None,
+    };
+    let mut sampling_params = EngineCoreSamplingParams::for_test();
+    sampling_params.min_tokens = 1;
+    let request = EngineCoreRequest {
+        request_id: "legacy-min-tokens".to_string(),
+        prompt_token_ids: Some(vec![1, 2]),
+        sampling_params: Some(sampling_params),
+        ..EngineCoreRequest::default()
+    };
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let mut streams = HashMap::new();
+
+    bridge
+        .start_request(request, &event_tx, &output_tx, &mut streams)
+        .expect("reject min_tokens request");
+
+    assert!(submit_rx.try_recv().is_err());
+    assert!(streams.is_empty());
+
+    let batch = match output_rx.try_recv().expect("rejection output") {
+        EngineCoreOutputs::RequestBatch(batch) => batch,
+        other => panic!("expected request batch, got {other:?}"),
+    };
+    assert_eq!(batch.outputs.len(), 1);
+    let output = &batch.outputs[0];
+    assert_eq!(output.request_id, "legacy-min-tokens");
+    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
+    assert_eq!(
+        output.stop_reason,
+        Some(StopReason::Text(
+            "min_tokens=1 is not supported by current engine contracts".to_string()
+        ))
+    );
+    assert!(
+        batch
+            .finished_requests
+            .as_ref()
+            .is_some_and(|ids| ids.contains("legacy-min-tokens"))
+    );
+    assert!(output_rx.try_recv().is_err());
+}
 
 /// Test harness that exercises the bridge's demux path directly: register
 /// requests, emit tagged events onto the shared channel, drain one ready
@@ -41,14 +98,23 @@ impl Demux {
 
     /// Register a request as `start_request` does and return its abort reason.
     fn add(&mut self, id: &str) -> Arc<AtomicU8> {
-        self.add_with_stop_sentinel(id, None)
+        self.add_with_stop_candidates(id, None, Vec::new())
     }
 
     fn add_with_eos(&mut self, id: &str, eos_token_id: Option<u32>) -> Arc<AtomicU8> {
-        self.add_with_stop_sentinel(id, eos_token_id)
+        self.add_with_stop_candidates(id, eos_token_id, eos_token_id.into_iter().collect())
     }
 
     fn add_with_stop_sentinel(&mut self, id: &str, stop_sentinel_id: Option<u32>) -> Arc<AtomicU8> {
+        self.add_with_stop_candidates(id, stop_sentinel_id, stop_sentinel_id.into_iter().collect())
+    }
+
+    fn add_with_stop_candidates(
+        &mut self,
+        id: &str,
+        stop_sentinel_id: Option<u32>,
+        stop_candidate_ids: Vec<u32>,
+    ) -> Arc<AtomicU8> {
         let tag: RequestTag = Arc::from(id);
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
         self.streams.insert(
@@ -57,6 +123,7 @@ impl Demux {
                 Arc::clone(&abort_reason),
                 fastrace::Span::noop(),
                 stop_sentinel_id,
+                stop_candidate_ids,
             ),
         );
         abort_reason
@@ -135,6 +202,7 @@ fn token_and_finish_in_one_burst_coalesce() {
         "req-1",
         TokenEvent::Finished {
             finish_reason: FinishReason::Length,
+            stop_cause: None,
             prompt_tokens: 16,
             completion_tokens: 2,
         },
@@ -186,6 +254,7 @@ fn stop_output_appends_eos_for_vllm_decoder() {
         "req-stop-eos",
         TokenEvent::Finished {
             finish_reason: FinishReason::Stop,
+            stop_cause: None,
             prompt_tokens: 16,
             completion_tokens: 3,
         },
@@ -215,6 +284,7 @@ fn explicit_stop_token_is_used_as_sentinel_when_eos_is_absent() {
         "req-stop-token",
         TokenEvent::Finished {
             finish_reason: FinishReason::Stop,
+            stop_cause: None,
             prompt_tokens: 16,
             completion_tokens: 2,
         },
@@ -225,6 +295,145 @@ fn explicit_stop_token_is_used_as_sentinel_when_eos_is_absent() {
     let output = &batch.outputs[0];
     assert_eq!(output.new_token_ids, vec![11, 42]);
     assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+}
+
+/// A migrated scheduler sends the actual explicit stop token and identifies
+/// it in the terminal event. The bridge must preserve both its logprob and
+/// real token ID instead of adding a guessed sentinel from the request.
+#[test]
+fn explicit_stop_cause_uses_actual_token_without_sentinel() {
+    let mut d = Demux::new();
+    d.add_with_stop_candidates("req-explicit-stop", Some(2), vec![2, 43]);
+    d.emit(
+        "req-explicit-stop",
+        TokenEvent::Token {
+            id: 11,
+            logprob: None,
+        },
+    );
+    d.emit(
+        "req-explicit-stop",
+        TokenEvent::Token {
+            id: 43,
+            logprob: Some(TokenLogprob {
+                logprob: -0.25,
+                top_logprobs: vec![(43, -0.25), (44, -1.0)],
+            }),
+        },
+    );
+    d.emit(
+        "req-explicit-stop",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Token(43)),
+            prompt_tokens: 16,
+            completion_tokens: 2,
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("terminal output");
+    let output = &batch.outputs[0];
+    assert_eq!(output.new_token_ids, vec![11, 43]);
+    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+    assert_eq!(output.stop_reason, Some(StopReason::TokenId(43)));
+
+    let direct = match output.new_logprobs.as_ref().expect("stop-token logprob") {
+        MaybeWireLogprobs::Direct(direct) => direct,
+        MaybeWireLogprobs::Wire(_) => panic!("expected direct batched logprobs"),
+    };
+    assert_eq!(direct.positions.len(), 2);
+    assert_eq!(direct.positions[1].entries[0].token_id, 43);
+    assert!((direct.positions[1].entries[0].logprob + 0.25).abs() < f32::EPSILON);
+}
+
+/// Legacy schedulers publish the trigger and terminal through two channel
+/// sends. If the bridge wakes between them, it must hold the candidate until
+/// the terminal arrives instead of exposing it as a non-terminal token.
+#[test]
+fn explicit_stop_cause_coalesces_across_split_bursts() {
+    let mut d = Demux::new();
+    d.add_with_stop_candidates("req-split-stop", Some(2), vec![2, 43]);
+    d.emit(
+        "req-split-stop",
+        TokenEvent::Token {
+            id: 43,
+            logprob: Some(TokenLogprob {
+                logprob: -0.25,
+                top_logprobs: vec![(43, -0.25), (44, -1.0)],
+            }),
+        },
+    );
+
+    assert!(d.drain());
+    assert!(
+        d.next_output().is_none(),
+        "the possible trigger must wait for its terminal event"
+    );
+
+    d.emit(
+        "req-split-stop",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Token(43)),
+            prompt_tokens: 16,
+            completion_tokens: 1,
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("terminal output");
+    let output = &batch.outputs[0];
+    assert_eq!(output.new_token_ids, vec![43]);
+    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+    assert_eq!(output.stop_reason, Some(StopReason::TokenId(43)));
+
+    let direct = match output.new_logprobs.as_ref().expect("stop-token logprob") {
+        MaybeWireLogprobs::Direct(direct) => direct,
+        MaybeWireLogprobs::Wire(_) => panic!("expected direct batched logprobs"),
+    };
+    assert_eq!(direct.positions.len(), 1);
+    assert_eq!(direct.positions[0].entries[0].token_id, 43);
+    assert!((direct.positions[0].entries[0].logprob + 0.25).abs() < f32::EPSILON);
+    assert!(!d.streams.contains_key("req-split-stop"));
+}
+
+/// EOS stops carry no wire stop reason. Because a migrated scheduler already
+/// sent EOS, the bridge must not append a second synthetic sentinel either.
+#[test]
+fn eos_stop_cause_has_no_wire_stop_reason_or_duplicate_sentinel() {
+    let mut d = Demux::new();
+    d.add_with_eos("req-eos-stop", Some(2));
+    d.emit(
+        "req-eos-stop",
+        TokenEvent::Token {
+            id: 11,
+            logprob: None,
+        },
+    );
+    d.emit(
+        "req-eos-stop",
+        TokenEvent::Token {
+            id: 2,
+            logprob: None,
+        },
+    );
+    d.emit(
+        "req-eos-stop",
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Eos(2)),
+            prompt_tokens: 16,
+            completion_tokens: 2,
+        },
+    );
+    assert!(d.drain());
+
+    let batch = d.next_output().expect("terminal output");
+    let output = &batch.outputs[0];
+    assert_eq!(output.new_token_ids, vec![11, 2]);
+    assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+    assert_eq!(output.stop_reason, None);
 }
 
 /// A lone `Scheduled` (no token yet) emits nothing; its metadata waits in the
@@ -287,6 +496,7 @@ fn lone_kv_transfer_defers_until_terminal_output() {
         "req-handoff",
         TokenEvent::Finished {
             finish_reason: FinishReason::Stop,
+            stop_cause: None,
             prompt_tokens: 4,
             completion_tokens: 1,
         },
@@ -378,6 +588,7 @@ fn stop_on_prefill_terminal_output_carries_prefill_stats() {
         "req-stop",
         TokenEvent::Finished {
             finish_reason: FinishReason::Stop,
+            stop_cause: None,
             prompt_tokens: 16,
             completion_tokens: 0,
         },

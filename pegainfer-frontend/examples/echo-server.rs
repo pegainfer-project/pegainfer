@@ -150,7 +150,7 @@ impl Scheduler for EchoScheduler {
                 } else {
                     FinishReason::Stop
                 };
-                ledger.finish(running.id, reason);
+                ledger.finish(running.id, reason, None);
             }
         }
         self.running = still_running;

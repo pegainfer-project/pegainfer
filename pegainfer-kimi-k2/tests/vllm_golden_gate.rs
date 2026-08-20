@@ -57,7 +57,9 @@ use std::time::Instant;
 
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::EpBackend;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::TokenSink;
@@ -344,6 +346,10 @@ fn submit(
                 min_p: 0.0,
                 seed: None,
                 ignore_eos: true,
+            },
+            stop_policy: StopPolicy {
+                eos: EosPolicy::Ignore,
+                token_ids: Vec::new(),
             },
             max_tokens,
             lora_adapter: None,

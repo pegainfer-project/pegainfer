@@ -304,7 +304,12 @@ mod tests {
     /// prompt token is already fed, so `feed_want() == 1`).
     fn decoding_rank(params: pegainfer_sample::SamplingParams) -> RankSlots {
         let req = request(vec![10], params, 8);
-        let mut state = Glm52SlotState::new(req.prompt_tokens.clone(), req.max_tokens, false, 0);
+        let mut state = Glm52SlotState::new(
+            req.prompt_tokens.clone(),
+            req.max_tokens,
+            super::super::testkit::stop_policy(false),
+            0,
+        );
         assert!(matches!(
             state.advance_span(&[20], &[]),
             Glm52StepOutcome::Commit { .. }

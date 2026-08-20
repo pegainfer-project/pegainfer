@@ -1,4 +1,5 @@
 use super::sink::TokenSink;
+use super::stop::StopPolicy;
 use crate::sampler::SamplingParams;
 
 pub struct GenerateRequest {
@@ -18,6 +19,7 @@ pub struct GenerateRequest {
     pub data_parallel_rank: Option<usize>,
     pub prompt_tokens: Vec<u32>,
     pub params: SamplingParams,
+    pub stop_policy: StopPolicy,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
     /// Opaque router/P-D metadata from the request's

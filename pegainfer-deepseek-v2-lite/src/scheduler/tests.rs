@@ -1,8 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::RequestAbortReason;
 use pegainfer_frontend::engine::RequestTag;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::sampler::SamplingParams;
 use tokio::sync::mpsc;
 
@@ -27,6 +30,7 @@ fn request(
             queued_at_unix_s: None,
             prompt_tokens: vec![1; prompt_len],
             params: SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens,
             lora_adapter: None,
             token_tx,
@@ -60,10 +64,8 @@ fn active_state(
         max_tokens: 8,
         generated,
         last_token,
-        finish_policy: FinishPolicy {
-            eos_token_id: config.eos_token_id,
-            ignore_eos: false,
-        },
+        stop_policy: StopPolicy::default(),
+        model_eos_token_id: config.eos_token_id,
         cache: DecodeCache::new(config),
         stats: GenerationStats::default(),
         trace: trace(),
@@ -187,6 +189,7 @@ fn terminal_admission_events_keep_scheduler_contract() {
     assert!(send_prompt_echo(&zero));
     let _ = zero.token_tx.send(TokenEvent::Finished {
         finish_reason: FinishReason::Length,
+        stop_cause: None,
         prompt_tokens: zero.prompt_tokens.len(),
         completion_tokens: 0,
     });
@@ -203,6 +206,7 @@ fn terminal_admission_events_keep_scheduler_contract() {
         recv_event(&mut zero_rx),
         TokenEvent::Finished {
             finish_reason: FinishReason::Length,
+            stop_cause: None,
             completion_tokens: 0,
             ..
         }
@@ -304,15 +308,21 @@ fn eos_retirement_is_independent_per_request() {
     assert!(!live_state.emit_token_or_finish(12, 2, 0));
 
     match recv_event(&mut rx_stop) {
+        TokenEvent::Token { id, .. } => assert_eq!(id, config.eos_token_id),
+        _ => panic!("EOS request should emit its triggering token"),
+    }
+    match recv_event(&mut rx_stop) {
         TokenEvent::Finished {
             finish_reason,
+            stop_cause,
             completion_tokens,
             ..
         } => {
             assert_eq!(finish_reason, FinishReason::Stop);
-            assert_eq!(completion_tokens, 1);
+            assert_eq!(stop_cause, Some(StopCause::Eos(config.eos_token_id)));
+            assert_eq!(completion_tokens, 2);
         }
-        _ => panic!("EOS request should finish without emitting EOS"),
+        _ => panic!("EOS request should finish after emitting EOS"),
     }
     match recv_event(&mut rx_live) {
         TokenEvent::Token { id, .. } => assert_eq!(id, 12),
@@ -344,20 +354,98 @@ fn batch_decoded_tokens_retire_eos_independently() {
     assert_eq!(survivors[0].1.request_id.as_deref(), Some("live"));
     assert_eq!(survivors[0].1.generated, 2);
     match recv_event(&mut rx_stop) {
+        TokenEvent::Token { id, .. } => assert_eq!(id, config.eos_token_id),
+        _ => panic!("EOS row should emit its triggering token"),
+    }
+    match recv_event(&mut rx_stop) {
         TokenEvent::Finished {
             finish_reason,
+            stop_cause,
             completion_tokens,
             ..
         } => {
             assert_eq!(finish_reason, FinishReason::Stop);
-            assert_eq!(completion_tokens, 1);
+            assert_eq!(stop_cause, Some(StopCause::Eos(config.eos_token_id)));
+            assert_eq!(completion_tokens, 2);
         }
-        _ => panic!("EOS row should finish without emitting EOS"),
+        _ => panic!("EOS row should finish after emitting EOS"),
     }
     match recv_event(&mut rx_live) {
         TokenEvent::Token { id, .. } => assert_eq!(id, 12),
         _ => panic!("live row should receive its decoded token"),
     }
+}
+
+#[test]
+fn ignored_eos_does_not_disable_explicit_stop_tokens() {
+    let config = test_lite_config();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
+    let mut state = active_state("explicit-stop", token_tx, 3, 1, 10, &config);
+    state.stop_policy = StopPolicy {
+        eos: EosPolicy::Ignore,
+        token_ids: vec![42],
+    };
+    state.max_tokens = 2;
+
+    assert!(state.emit_token_or_finish(42, 0, 0));
+
+    assert!(matches!(
+        recv_event(&mut token_rx),
+        TokenEvent::Token { id: 42, .. }
+    ));
+    assert!(matches!(
+        recv_event(&mut token_rx),
+        TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Token(42)),
+            completion_tokens: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn ignored_model_eos_remains_a_normal_generated_token() {
+    let config = test_lite_config();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
+    let mut state = active_state("ignore-eos", token_tx, 3, 1, 10, &config);
+    state.stop_policy = StopPolicy {
+        eos: EosPolicy::Ignore,
+        token_ids: vec![],
+    };
+
+    assert!(!state.emit_token_or_finish(config.eos_token_id, 1, 0));
+
+    assert!(matches!(
+        recv_event(&mut token_rx),
+        TokenEvent::Token { id, .. } if id == config.eos_token_id
+    ));
+    assert_eq!(state.generated, 2);
+    assert!(token_rx.try_recv().is_err());
+}
+
+#[test]
+fn eos_wins_when_it_is_also_an_explicit_stop_token() {
+    let config = test_lite_config();
+    let (token_tx, mut token_rx) = TokenSink::standalone();
+    let mut state = active_state("overlap", token_tx, 3, 1, 10, &config);
+    state.stop_policy = StopPolicy {
+        eos: EosPolicy::ModelDefault,
+        token_ids: vec![config.eos_token_id],
+    };
+
+    assert!(state.emit_token_or_finish(config.eos_token_id, 0, 0));
+    assert!(matches!(
+        recv_event(&mut token_rx),
+        TokenEvent::Token { .. }
+    ));
+    assert!(matches!(
+        recv_event(&mut token_rx),
+        TokenEvent::Finished {
+            stop_cause: Some(StopCause::Eos(id)),
+            ..
+        } if id == config.eos_token_id
+    ));
 }
 
 #[test]

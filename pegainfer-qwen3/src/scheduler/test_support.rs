@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::sampler::SamplingParams;
 
@@ -23,6 +24,12 @@ use crate::executor::PrefillStepItem;
 use crate::executor::RequestId;
 use crate::executor::UnifiedPlan;
 use crate::executor::UnifiedResult;
+use crate::speculative::DraftPlan;
+use crate::speculative::DraftRequestResult;
+use crate::speculative::DraftResult;
+use crate::speculative::VerifyPlan;
+use crate::speculative::VerifyRequestResult;
+use crate::speculative::VerifyResult;
 
 pub(crate) struct FakeExecutor {
     pub(crate) block_size: usize,
@@ -39,6 +46,8 @@ pub(crate) struct FakeExecutor {
     pub(crate) dropped: Arc<Mutex<Vec<u64>>>,
     pub(crate) prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
+    emit_logprobs: bool,
+    speculative_accepted_tokens: Option<Vec<u32>>,
 }
 
 impl FakeExecutor {
@@ -56,11 +65,27 @@ impl FakeExecutor {
             dropped,
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
+            emit_logprobs: false,
+            speculative_accepted_tokens: None,
         }
     }
 
     pub(crate) fn with_stop_token(mut self, token: u32) -> Self {
         self.stop_token = Some(token);
+        self
+    }
+
+    pub(crate) fn with_logprobs(mut self) -> Self {
+        self.emit_logprobs = true;
+        self
+    }
+
+    pub(crate) fn with_speculative_accepted_tokens(mut self, tokens: &[u32]) -> Self {
+        assert!(
+            !tokens.is_empty(),
+            "fake speculative span must make progress"
+        );
+        self.speculative_accepted_tokens = Some(tokens.to_vec());
         self
     }
 
@@ -99,7 +124,13 @@ impl FakeExecutor {
         PrefillRequestResult {
             request_id: req.request_id,
             first_token: 100 + req.request_id.raw() as u32,
-            first_token_logprob: None,
+            first_token_logprob: self.emit_logprobs.then(|| {
+                let token = 100 + req.request_id.raw() as u32;
+                pegainfer_frontend::engine::TokenLogprob {
+                    logprob: -0.1,
+                    top_logprobs: vec![(token, -0.1)],
+                }
+            }),
             prompt_logprobs: None,
             cached_tokens: 0,
             completed,
@@ -224,7 +255,13 @@ impl ModelExecutor for FakeExecutor {
                 .map(|req| DecodeRequestResult {
                     request_id: req.request_id,
                     token: 200 + req.request_id.raw() as u32,
-                    logprob: None,
+                    logprob: self.emit_logprobs.then(|| {
+                        let token = 200 + req.request_id.raw() as u32;
+                        pegainfer_frontend::engine::TokenLogprob {
+                            logprob: -0.2,
+                            top_logprobs: vec![(token, -0.2)],
+                        }
+                    }),
                 })
                 .collect(),
         })
@@ -260,6 +297,75 @@ impl ModelExecutor for FakeExecutor {
                 .collect(),
         })
     }
+
+    fn execute_speculative_draft(&mut self, plan: DraftPlan<'_>) -> Result<DraftResult> {
+        let accepted_tokens = self
+            .speculative_accepted_tokens
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("fake speculative decoding is disabled"))?;
+
+        Ok(DraftResult {
+            requests: plan
+                .requests
+                .iter()
+                .map(|req| {
+                    let mut token_ids = Vec::with_capacity(accepted_tokens.len());
+                    token_ids.push(req.current_token);
+                    token_ids.extend(
+                        accepted_tokens
+                            .iter()
+                            .copied()
+                            .take(accepted_tokens.len().saturating_sub(1)),
+                    );
+
+                    DraftRequestResult {
+                        request_id: req.request_id,
+                        token_ids,
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    fn execute_speculative_verify(&mut self, plan: VerifyPlan<'_>) -> Result<VerifyResult> {
+        let configured = self
+            .speculative_accepted_tokens
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("fake speculative decoding is disabled"))?;
+
+        let mut requests = Vec::with_capacity(plan.requests.len());
+
+        for req in plan.requests {
+            let span_len = req.as_slice().len();
+            anyhow::ensure!(span_len > 0, "fake speculative verify span is empty");
+
+            let accepted_tokens = configured[..configured.len().min(span_len)].to_vec();
+
+            let current_tokens = self
+                .held_tokens
+                .get(&req.request_id)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("missing fake request state"))?;
+
+            self.ensure_request_tokens(req.request_id, current_tokens + accepted_tokens.len())?;
+
+            requests.push(VerifyRequestResult {
+                request_id: req.request_id,
+                matched_draft_tokens: accepted_tokens.len().saturating_sub(1),
+                accepted_tokens,
+            });
+        }
+
+        Ok(VerifyResult { requests })
+    }
+
+    fn speculative_enabled(&self) -> bool {
+        self.speculative_accepted_tokens.is_some()
+    }
+
+    fn speculative_request_ready(&self, request_id: RequestId) -> bool {
+        self.speculative_accepted_tokens.is_some() && self.held_tokens.contains_key(&request_id)
+    }
 }
 
 /// A minimal contract request: `prompt_len` filler tokens, default sampling.
@@ -267,6 +373,7 @@ pub(crate) fn request(prompt_len: usize, max_tokens: usize) -> Request {
     Request {
         prompt_tokens: vec![1; prompt_len],
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,

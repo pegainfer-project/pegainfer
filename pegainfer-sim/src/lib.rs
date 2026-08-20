@@ -12,6 +12,7 @@ use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::spawn_scheduler;
 
@@ -129,6 +130,7 @@ struct RunningRequest {
     next_token_at: Instant,
     finish_reason: FinishReason,
     logprobs: usize,
+    stop_policy: StopPolicy,
 }
 
 impl SimScheduler {
@@ -177,7 +179,7 @@ impl Scheduler for SimScheduler {
                 planned_completion(&self.config, &request.prompt_tokens, request.max_tokens);
             ledger.admit(id);
             if pending.is_empty() {
-                ledger.finish(id, finish_reason);
+                ledger.finish(id, finish_reason, None);
                 continue;
             }
             self.running.push(RunningRequest {
@@ -186,6 +188,7 @@ impl Scheduler for SimScheduler {
                 next_token_at: Instant::now() + self.config.ttft(prompt_len),
                 finish_reason,
                 logprobs: request.logprobs,
+                stop_policy: request.stop_policy,
             });
         }
 
@@ -201,7 +204,7 @@ impl Scheduler for SimScheduler {
                 continue;
             }
             let Some(token) = running.pending.pop() else {
-                ledger.finish(running.id, running.finish_reason);
+                ledger.finish(running.id, running.finish_reason, None);
                 continue;
             };
             let logprob = (running.logprobs > 0).then_some(TokenLogprob {
@@ -213,8 +216,13 @@ impl Scheduler for SimScheduler {
                 None => Vec::new(),
             };
             ledger.push_tokens(running.id, &[token], &logprobs);
-            if running.pending.is_empty() {
-                ledger.finish(running.id, running.finish_reason);
+            // The simulator has no model EOS set; explicit request stop IDs
+            // still exercise the same token-before-terminal contract as a
+            // real scheduler.
+            if let Some(stop_cause) = running.stop_policy.classify(token, |_| false) {
+                ledger.finish(running.id, FinishReason::Stop, Some(stop_cause));
+            } else if running.pending.is_empty() {
+                ledger.finish(running.id, running.finish_reason, None);
             } else {
                 running.next_token_at = Instant::now() + self.config.tpot();
                 still_running.push(running);
@@ -277,15 +285,27 @@ fn duration_from_ms(ms: f64) -> Duration {
 #[cfg(test)]
 mod tests {
     use pegainfer_frontend::engine::Request;
+    use pegainfer_frontend::engine::StopCause;
+    use pegainfer_frontend::engine::StopPolicy;
     use pegainfer_frontend::engine::Terminal;
     use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
 
     fn request(prompt_tokens: Vec<u32>, max_tokens: usize, logprobs: usize) -> Request {
+        request_with_policy(prompt_tokens, max_tokens, logprobs, StopPolicy::default())
+    }
+
+    fn request_with_policy(
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        logprobs: usize,
+        stop_policy: StopPolicy,
+    ) -> Request {
         Request {
             prompt_tokens,
             params: SamplingParams::default(),
+            stop_policy,
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -369,6 +389,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_stop_keeps_trigger_token_and_reports_cause() {
+        let config = SimulatedEngineConfig::new(0.0, 100.0, 0.0, 0)
+            .unwrap()
+            .with_scripted_completion(vec![11, 42, 99]);
+        let request = request_with_policy(
+            vec![7],
+            8,
+            0,
+            StopPolicy {
+                eos: pegainfer_frontend::engine::EosPolicy::Ignore,
+                token_ids: vec![42],
+            },
+        );
+        let (tokens, _, terminal) = collect_completion(&config, request);
+
+        assert_eq!(tokens, [11, 42]);
+        assert!(matches!(
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Stop,
+                stop_cause: Some(StopCause::Token(42)),
+                completion_tokens: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn config_rejects_invalid_timing_values() {
         assert!(SimulatedEngineConfig::new(-1.0, 100.0, 12.0, 0).is_err());
         assert!(SimulatedEngineConfig::new(5.0, 0.0, 12.0, 0).is_err());
@@ -391,6 +439,7 @@ mod tests {
                 reason: FinishReason::Length,
                 prompt_tokens: 2,
                 completion_tokens: 3,
+                ..
             }
         ));
     }
