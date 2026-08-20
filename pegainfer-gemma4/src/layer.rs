@@ -99,17 +99,15 @@ pub(crate) fn build_proportional_rope_tables(
     })?;
     let rope_angles = rotary_dim / 2;
     let half_dim = head_dim / 2;
-    let mut cos = vec![bf16::from_f32(0.0); table_len];
+    let inv_freq: Vec<f32> = (0..rope_angles)
+        .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / head_dim as f32))
+        .collect();
+    let mut cos = vec![bf16::from_f32(1.0); table_len];
     let mut sin = vec![bf16::from_f32(0.0); table_len];
     for pos in 0..max_pos {
-        for i in 0..half_dim {
-            let inv_freq = if i < rope_angles {
-                1.0f32 / rope_theta.powf(2.0 * i as f32 / head_dim as f32)
-            } else {
-                0.0
-            };
-            let angle = pos as f32 * inv_freq;
-            let row = pos * head_dim;
+        let row = pos * head_dim;
+        for (i, &frequency) in inv_freq.iter().enumerate() {
+            let angle = pos as f32 * frequency;
             let (c, s_) = (bf16::from_f32(angle.cos()), bf16::from_f32(angle.sin()));
             cos[row + i] = c;
             cos[row + i + half_dim] = c;
@@ -127,6 +125,7 @@ pub(crate) fn build_proportional_rope_tables(
 /// cache of the same total size: `[head][pos][head_dim]`, `seq_len` rows per
 /// head. Each head's column window is extracted to a `[head_dim, seq_len]`
 /// block, then placed at its head-major offset.
+#[cfg(test)]
 fn nhd_to_hnd(
     ctx: &DeviceContext,
     src: &HiddenStates,
@@ -168,6 +167,7 @@ fn nhd_to_hnd(
 /// reinterpreted as `[head_dim, seq_len * num_kv_heads]` — heads are
 /// contiguous within each token row, so the narrower row width makes the
 /// reduction per (token, head) — then the shape is restored.
+#[cfg(test)]
 fn weightless_value_norm(
     ctx: &DeviceContext,
     mut v_states: HiddenStates,
@@ -252,6 +252,7 @@ impl EpilogueScratch {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn attention_epilogue(
     ctx: &DeviceContext,
     layer: &Gemma4Layer,
@@ -362,6 +363,7 @@ pub(crate) fn attention_epilogue_into(
 /// call: this is the correctness building block, and the executor that would
 /// own persistent buffers does not exist yet.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn local_layer_forward(
     ctx: &DeviceContext,
     layer: &Gemma4Layer,
@@ -495,6 +497,7 @@ pub(crate) fn local_layer_forward(
 /// Runs one global (full-attention) layer on `x`; same per-call-buffer probe
 /// form as [`local_layer_forward`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn global_layer_forward(
     ctx: &DeviceContext,
     layer: &Gemma4Layer,

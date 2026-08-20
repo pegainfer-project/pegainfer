@@ -148,6 +148,21 @@ fixture's, because it borrows that fixture's floor. **Transformers 5.11.0** is v
 checkpoint declares `5.10.0.dev0`, a development build that was never released, so the pin is the
 release that was tested rather than a guess at what that build became.
 
+## Running the gates these fixtures serve
+
+The gates that consume them are `#[ignore]`: they need the checkpoint and a device, so CI only
+compiles them. `scripts/gemma4_gates.sh` runs them:
+
+```bash
+PEGAINFER_TEST_MODEL_PATH=<checkpoint> scripts/gemma4_gates.sh [name-filter]
+```
+
+It refuses to start when the checkpoint, a fixture, the pinned metadata or a device is missing,
+holds the crate's ignored set against the gate list it carries — so a gate cannot leave the suite
+unnoticed — and runs one gate per process. That last part is not a stylistic choice: repeated 12B
+loads inside one test binary exhaust a 48 GiB device, and a plain `cargo test -- --ignored` run
+fails its last gates on allocation rather than on any assertion.
+
 ## Why hooks rather than `output_hidden_states`
 
 That argument works here — the class declares `_can_record_outputs["hidden_states"]` and it

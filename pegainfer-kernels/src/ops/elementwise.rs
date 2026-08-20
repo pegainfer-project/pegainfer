@@ -1,5 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
@@ -938,6 +939,74 @@ pub fn softcap_bf16_in_place(ctx: &DeviceContext, buf: &mut HiddenStates, cap: f
         .map_err(|e| anyhow!("softcap_bf16_in_place_cuda failed: {e}"))?;
 
     Ok(())
+}
+
+/// Device-resident suppression ids that were held against a head width when
+/// they were uploaded. The kernel indexes `logits` by these ids without
+/// re-reading them on the host, so the bound has to be structural: this type
+/// is the only way to reach it, and it cannot be built without the check.
+pub struct SuppressIds {
+    ids: CudaSlice<u32>,
+    vocab: usize,
+}
+
+impl SuppressIds {
+    /// Upload `ids` for a head that spans `vocab` columns, refusing any id
+    /// the head does not contain.
+    pub fn upload(ctx: &DeviceContext, ids: &[u32], vocab: usize) -> Result<Self> {
+        for &id in ids {
+            if id as usize >= vocab {
+                bail!("suppression id {id} is outside the {vocab} columns the head spans");
+            }
+        }
+        let ids = ctx
+            .stream
+            .clone_htod(ids)
+            .map_err(|e| anyhow!("uploading suppression ids failed: {e}"))?;
+        Ok(Self { ids, vocab })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+/// Write negative infinity into every `(row, id)` slot in `logits` with one
+/// launch.
+pub fn suppress_logits_bf16_in_place(
+    ctx: &DeviceContext,
+    logits: &mut HiddenStates,
+    ids: &SuppressIds,
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    if logits.hidden_dim != ids.vocab {
+        bail!(
+            "suppression ids were checked against {} columns but these logits span {}",
+            ids.vocab,
+            logits.hidden_dim
+        );
+    }
+    logits.checked_extent("suppress_logits_bf16 logits")?;
+    let vocab = super::checked_i32(logits.hidden_dim, "suppression vocabulary")?;
+    let rows = super::checked_i32(logits.seq_len, "suppression rows")?;
+    let id_count = super::checked_i32(ids.ids.len(), "suppression id count")?;
+    let (logits_ptr, _logits_guard) = logits.data.device_ptr_mut(&ctx.stream);
+    let (ids_ptr, _ids_guard) = ids.ids.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::suppress_logits_bf16_in_place_cuda(
+            logits_ptr as *mut ffi::Half,
+            ids_ptr as *const u32,
+            vocab,
+            rows,
+            id_count,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|e| anyhow!("suppress_logits_bf16_in_place_cuda failed: {e}"))
 }
 
 /// In-place multiply by a host scalar — Gemma 4's per-layer `layer_scalar`,

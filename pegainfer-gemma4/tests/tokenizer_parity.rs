@@ -1,6 +1,6 @@
 //! Parity against a Hugging Face reference dumped by
 //! `tools/accuracy/dump_gemma4_tokenizer_golden.py`. Point
-//! `OPENINFER_TEST_MODEL_PATH` at the pinned 12B checkpoint the reference was
+//! `PEGAINFER_TEST_MODEL_PATH` at the pinned 12B checkpoint the reference was
 //! dumped from and run with `--ignored`; the file-hash guard binds the suite to
 //! exactly that checkpoint.
 //!
@@ -36,8 +36,8 @@ fn golden() -> Value {
 }
 
 fn model_path() -> String {
-    std::env::var("OPENINFER_TEST_MODEL_PATH").expect(
-        "OPENINFER_TEST_MODEL_PATH must point at the pinned 12B Gemma 4 checkpoint \
+    std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
+        "PEGAINFER_TEST_MODEL_PATH must point at the pinned 12B Gemma 4 checkpoint \
          the reference was dumped from",
     )
 }
@@ -83,7 +83,7 @@ fn expected_ids(value: &Value, key: &str) -> Vec<u32> {
 }
 
 #[test]
-#[ignore = "requires the pinned 12B Gemma 4 checkpoint via OPENINFER_TEST_MODEL_PATH"]
+#[ignore = "requires the pinned 12B checkpoint"]
 fn probe_ids_match_hf_reference() {
     let golden = golden();
     assert_checkpoint_matches_reference(&golden);
@@ -116,7 +116,7 @@ fn probe_ids_match_hf_reference() {
 }
 
 #[test]
-#[ignore = "requires the pinned 12B Gemma 4 checkpoint via OPENINFER_TEST_MODEL_PATH"]
+#[ignore = "requires the pinned 12B checkpoint"]
 fn special_token_ids_match_hf_reference() {
     let golden = golden();
     assert_checkpoint_matches_reference(&golden);
@@ -187,7 +187,7 @@ fn chat_request(case: &Value) -> ChatRequest {
 /// selects the parts form for this template, which renders system turns
 /// differently — see docs/models/gemma4/tokenizer.md.
 #[test]
-#[ignore = "requires the pinned 12B Gemma 4 checkpoint via OPENINFER_TEST_MODEL_PATH"]
+#[ignore = "requires the pinned 12B checkpoint"]
 fn string_form_chat_renders_match_hf_reference() {
     let golden = golden();
     assert_checkpoint_matches_reference(&golden);

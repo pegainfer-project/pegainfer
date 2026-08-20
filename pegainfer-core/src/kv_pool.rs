@@ -236,11 +236,14 @@ impl KvState {
 
     /// Page indices as i32 for GPU upload.
     pub fn page_indices_i32(&self) -> Vec<i32> {
-        self.permit
-            .pages()
-            .iter()
-            .map(|p| p.index() as i32)
-            .collect()
+        let mut pages = Vec::with_capacity(self.permit.pages().len());
+        self.extend_page_indices_i32(&mut pages);
+        pages
+    }
+
+    /// Append page indices to caller-owned planning storage.
+    pub fn extend_page_indices_i32(&self, pages: &mut Vec<i32>) {
+        pages.extend(self.permit.pages().iter().map(|p| p.index() as i32));
     }
 
     pub fn buffer(&self) -> &CudaSlice<bf16> {

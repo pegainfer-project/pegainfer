@@ -8,8 +8,7 @@ use std::path::Path;
 
 use anyhow::Context as AnyhowContext;
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
-use half::bf16;
+use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::EngineHandle;
@@ -29,7 +28,6 @@ use crate::kv::PAGE_SIZE;
 use crate::kv::admit_tokens;
 use crate::prefix_cache::PrefixCache;
 use crate::serve::GemmaServe;
-use crate::serve::LogitsSpan;
 use crate::serve::StepArena;
 use crate::weights::Gemma4Weights;
 
@@ -40,6 +38,135 @@ const MAX_CONTEXT: usize = 8192;
 /// the pool budget. Admission beyond it queues at the step boundary rather
 /// than rejecting.
 const MAX_CONCURRENCY: usize = 16;
+const ASYNC_PREFILL_ENV: &str = "PEGAINFER_ASYNC_PREFILL";
+const PREFIX_CACHE_ENV: &str = "PEGAINFER_PREFIX_CACHE";
+const MIX_CHUNK_TOKENS_ENV: &str = "PEGAINFER_MIX_CHUNK_TOKENS";
+const MAX_CONTEXT_ENV: &str = "PEGAINFER_MAX_CONTEXT";
+const DECODE_SLOTS_ENV: &str = "PEGAINFER_DECODE_SLOTS";
+const MIN_CONTEXT: usize = 1024;
+const MIN_CHUNK_TOKENS: usize = 64;
+const CEILING_DOMAIN: usize = i32::MAX as usize;
+
+/// A live-batch admission either shares all SMs or uses a capped Green
+/// Context. Disabled is represented by `Option<LaneMode>`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaneMode {
+    Shared,
+    Green(u32),
+}
+
+fn read_env(name: &str) -> Result<Option<String>> {
+    normalize_env(name, std::env::var(name))
+}
+
+fn normalize_env(
+    name: &str,
+    value: std::result::Result<String, std::env::VarError>,
+) -> Result<Option<String>> {
+    match value {
+        Ok(raw) => Ok(Some(raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} is not valid UTF-8"),
+    }
+}
+
+fn async_prefill_mode() -> Result<Option<LaneMode>> {
+    read_env(ASYNC_PREFILL_ENV)?.map_or(Ok(None), |raw| parse_async_prefill_mode(&raw))
+}
+
+fn parse_async_prefill_mode(raw: &str) -> Result<Option<LaneMode>> {
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "false" | "off" => Ok(None),
+        "shared" => Ok(Some(LaneMode::Shared)),
+        other => match other
+            .strip_prefix("green:")
+            .and_then(|pct| pct.parse().ok())
+        {
+            Some(pct) if (1..=99).contains(&pct) => Ok(Some(LaneMode::Green(pct))),
+            _ => anyhow::bail!(
+                "{ASYNC_PREFILL_ENV}={raw:?} not recognized (off | shared | green:NN, 1..=99)"
+            ),
+        },
+    }
+}
+
+/// The serving ceiling — prompt plus output per request, the pool budget
+/// axis, and the published servable length.
+fn serving_context(checkpoint_limit: usize) -> Result<usize> {
+    read_env(MAX_CONTEXT_ENV)?.map_or(Ok(MAX_CONTEXT.min(checkpoint_limit)), |raw| {
+        parse_serving_context(&raw, checkpoint_limit)
+    })
+}
+
+fn parse_serving_context(raw: &str, checkpoint_limit: usize) -> Result<usize> {
+    let limit = checkpoint_limit.min(CEILING_DOMAIN);
+    match raw.trim().parse::<usize>() {
+        Ok(value) if (MIN_CONTEXT..=limit).contains(&value) => Ok(value),
+        _ => anyhow::bail!(
+            "{MAX_CONTEXT_ENV}={raw:?} not recognized (N, {MIN_CONTEXT} <= N <= {limit}: the \
+             checkpoint's limit inside the i32 metadata domain)"
+        ),
+    }
+}
+
+/// The decode-slot count the pools are budgeted for.
+fn decode_slots() -> Result<usize> {
+    read_env(DECODE_SLOTS_ENV)?.map_or(Ok(MAX_CONCURRENCY), |raw| parse_decode_slots(&raw))
+}
+
+fn parse_decode_slots(raw: &str) -> Result<usize> {
+    match raw.trim().parse::<usize>() {
+        Ok(value) if (1..=MAX_CONCURRENCY).contains(&value) => Ok(value),
+        _ => anyhow::bail!(
+            "{DECODE_SLOTS_ENV}={raw:?} not recognized (N, 1 <= N <= {MAX_CONCURRENCY})"
+        ),
+    }
+}
+
+/// Bounds the prompt rows computed by one chunked-walk step. The effective
+/// step rounds down to whole 128-row tiles.
+fn mix_chunk_tokens(max_context: usize) -> Result<Option<usize>> {
+    read_env(MIX_CHUNK_TOKENS_ENV)?
+        .map_or(Ok(None), |raw| parse_mix_chunk_tokens(&raw, max_context))
+}
+
+/// GEMM and attention tiles consume whole 128-row blocks, so a width that is
+/// not a multiple of 128 pays for a tile it does not fill.
+fn parse_mix_chunk_tokens(raw: &str, max_context: usize) -> Result<Option<usize>> {
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "off" => Ok(None),
+        other => match other.parse::<usize>() {
+            Ok(chunk) if chunk >= MIN_CHUNK_TOKENS && chunk < max_context => {
+                Ok(Some(if chunk < 128 {
+                    chunk
+                } else {
+                    chunk - chunk % 128
+                }))
+            }
+            _ => anyhow::bail!(
+                "{MIX_CHUNK_TOKENS_ENV}={raw:?} not recognized \
+                 (off | N, {MIN_CHUNK_TOKENS} <= N < {max_context})"
+            ),
+        },
+    }
+}
+
+fn prefix_cache_cap() -> Result<Option<usize>> {
+    read_env(PREFIX_CACHE_ENV)?.map_or(Ok(None), |raw| parse_prefix_cache_cap(&raw))
+}
+
+fn parse_prefix_cache_cap(raw: &str) -> Result<Option<usize>> {
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "off" => Ok(None),
+        other => match other.parse::<usize>() {
+            Ok(cap) if cap > 0 => Ok(Some(cap)),
+            _ => anyhow::bail!("{PREFIX_CACHE_ENV}={raw:?} not recognized (off | K, K > 0)"),
+        },
+    }
+}
 
 pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
     let dir = model_path
@@ -209,67 +336,14 @@ fn token_ids(value: &serde_json::Value) -> Result<Vec<u32>> {
     }
 }
 
-/// Drop forbidden ids before sampling and logprob normalization read the row.
-fn suppress_logits(
-    ctx: &DeviceContext,
-    blocked: &CudaSlice<bf16>,
-    logits: &mut HiddenStates,
-    ids: &[u32],
-) -> Result<()> {
-    for &id in ids {
-        let index = id as usize;
-        anyhow::ensure!(
-            index < logits.hidden_dim,
-            "suppressed token {id} is outside the {} vocabulary",
-            logits.hidden_dim
-        );
-        for row in 0..logits.seq_len {
-            let at = row * logits.hidden_dim + index;
-            let mut slot = logits.data.slice_mut(at..=at);
-            ctx.stream.memcpy_dtod(blocked, &mut slot)?;
-        }
-    }
-    Ok(())
-}
-
 type Submitted = pegainfer_frontend::engine::SubmittedRequest;
 
-/// One in-flight request between decode steps: its KV, the token that feeds
-/// the next step, and its progress counters.
 /// Overlapped admission: with the lane on, a prompt arriving into a live
 /// decode batch prefills on its own stream while decode steps keep
 /// replaying on `ctx.stream` — the admission costs the streams a slowdown
 /// instead of a mixed step per prompt. `shared` lets the prefill grids
 /// compete for every SM; `green:NN` pins the lane to NN% of them, which is
 /// what actually protects decode ITL.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AsyncPrefillMode {
-    Off,
-    Shared,
-    Green(u32),
-}
-
-fn async_prefill_mode() -> Result<AsyncPrefillMode> {
-    match std::env::var("PEGAINFER_ASYNC_PREFILL") {
-        Ok(raw) => parse_async_prefill_mode(&raw),
-        Err(_) => Ok(AsyncPrefillMode::Off),
-    }
-}
-
-fn parse_async_prefill_mode(raw: &str) -> Result<AsyncPrefillMode> {
-    let v = raw.trim().to_ascii_lowercase();
-    match v.as_str() {
-        "" | "0" | "false" | "off" => Ok(AsyncPrefillMode::Off),
-        "shared" => Ok(AsyncPrefillMode::Shared),
-        other => match other.strip_prefix("green:").and_then(|p| p.parse().ok()) {
-            Some(pct) if (1..=99).contains(&pct) => Ok(AsyncPrefillMode::Green(pct)),
-            _ => anyhow::bail!(
-                "PEGAINFER_ASYNC_PREFILL={raw:?} not recognized (off | shared | green:NN, 1..=99)"
-            ),
-        },
-    }
-}
-
 /// One in-flight overlapped prefill, parked until the lane's completion
 /// event fires: the request, its KV, and the pass owning every device
 /// buffer the in-flight kernels still read.
@@ -292,11 +366,10 @@ struct AsyncPrefillLane {
 }
 
 impl AsyncPrefillLane {
-    fn new(ctx: &DeviceContext, mode: AsyncPrefillMode) -> Result<Self> {
+    fn new(ctx: &DeviceContext, mode: LaneMode) -> Result<Self> {
         let stream = match mode {
-            AsyncPrefillMode::Off => anyhow::bail!("async prefill lane built with mode Off"),
-            AsyncPrefillMode::Shared => crate::green_ctx::PrefillLaneStream::shared()?,
-            AsyncPrefillMode::Green(pct) => {
+            LaneMode::Shared => crate::green_ctx::PrefillLaneStream::shared()?,
+            LaneMode::Green(pct) => {
                 crate::green_ctx::PrefillLaneStream::green(ctx.device_ordinal, pct)?
             }
         };
@@ -429,90 +502,6 @@ fn global_account_pages(context_len: usize) -> usize {
 /// sampler-row capacity so a burst still leaves decode rows headroom.
 const MIX_MAX_PROMPTS: usize = 4;
 
-/// The serving ceiling — prompt plus output per request, the pool budget
-/// axis, and the published servable length. `PEGAINFER_MAX_CONTEXT=N`
-/// raises it past the 8192 default up to the checkpoint's own limit; the
-/// pools scale with it, so a raise buys context with device memory.
-fn serving_context(checkpoint_limit: usize) -> Result<usize> {
-    match std::env::var("PEGAINFER_MAX_CONTEXT") {
-        Ok(raw) => parse_serving_context(&raw, checkpoint_limit),
-        Err(std::env::VarError::NotPresent) => Ok(MAX_CONTEXT.min(checkpoint_limit)),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("PEGAINFER_MAX_CONTEXT is not valid UTF-8")
-        }
-    }
-}
-
-/// The widest ceiling every downstream representation can carry: kernel
-/// position and page metadata is i32, and the published servable length
-/// is u32 — a checkpoint may declare more positions than either holds,
-/// so the contract stops here, not at the checkpoint's word.
-const CEILING_DOMAIN: usize = i32::MAX as usize;
-
-fn parse_serving_context(raw: &str, checkpoint_limit: usize) -> Result<usize> {
-    let limit = checkpoint_limit.min(CEILING_DOMAIN);
-    match raw.trim().parse::<usize>() {
-        Ok(n) if (1024..=limit).contains(&n) => Ok(n),
-        _ => anyhow::bail!(
-            "PEGAINFER_MAX_CONTEXT={raw:?} not recognized \
-             (N, 1024 <= N <= {limit}: the checkpoint's limit inside the i32 metadata domain)"
-        ),
-    }
-}
-
-/// The decode-slot count — the concurrency the pools are budgeted for.
-/// `PEGAINFER_DECODE_SLOTS=N` lowers it from the default 16: the global
-/// family never releases, so its budget is slots times the ceiling, and a
-/// raised ceiling buys context back by giving up slots.
-fn decode_slots() -> Result<usize> {
-    match std::env::var("PEGAINFER_DECODE_SLOTS") {
-        Ok(raw) => parse_decode_slots(&raw),
-        Err(std::env::VarError::NotPresent) => Ok(MAX_CONCURRENCY),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("PEGAINFER_DECODE_SLOTS is not valid UTF-8")
-        }
-    }
-}
-
-fn parse_decode_slots(raw: &str) -> Result<usize> {
-    match raw.trim().parse::<usize>() {
-        Ok(n) if (1..=MAX_CONCURRENCY).contains(&n) => Ok(n),
-        _ => anyhow::bail!(
-            "PEGAINFER_DECODE_SLOTS={raw:?} not recognized (N, 1 <= N <= {MAX_CONCURRENCY})"
-        ),
-    }
-}
-
-/// The chunked-walk knob: `PEGAINFER_MIX_CHUNK_TOKENS=N` walks admitted
-/// prompts through shared segment steps of at most `N` prompt rows each —
-/// live streams then advance one token per segment instead of waiting out
-/// a whole prompt. Unset (or `off`/`0`) keeps whole-prompt steps. The
-/// effective step rounds down to whole 128-row tiles.
-fn mix_chunk_tokens(max_context: usize) -> Result<Option<usize>> {
-    match std::env::var("PEGAINFER_MIX_CHUNK_TOKENS") {
-        Ok(raw) => parse_mix_chunk_tokens(&raw, max_context),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("PEGAINFER_MIX_CHUNK_TOKENS is not valid UTF-8")
-        }
-    }
-}
-
-/// GEMM and attention tiles consume whole 128-row blocks, so a width that is
-/// not a multiple of 128 pays for a tile it does not fill.
-fn parse_mix_chunk_tokens(raw: &str, max_context: usize) -> Result<Option<usize>> {
-    let v = raw.trim().to_ascii_lowercase();
-    match v.as_str() {
-        "" | "0" | "off" => Ok(None),
-        other => match other.parse::<usize>() {
-            Ok(n) if n >= 64 && n < max_context => Ok(Some(if n < 128 { n } else { n - n % 128 })),
-            _ => anyhow::bail!(
-                "PEGAINFER_MIX_CHUNK_TOKENS={raw:?} not recognized (off | N, 64 <= N < {max_context})"
-            ),
-        },
-    }
-}
-
 /// The gathered step's prompt-row ceiling. Gathering amortizes only the
 /// step floor (~27 ms at 12B) while every live stream's inter-token gap
 /// pays the whole gathered step (~0.2 ms per row), so absorbing long
@@ -534,6 +523,18 @@ struct Walker {
     failed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum AdmissionNeed {
+    Tokens(usize),
+    GlobalPages(usize),
+}
+
+enum ReservationDecision {
+    Ready,
+    Requeue,
+    Refused(String),
+}
+
 /// One newcomer row of a mixed step's logits head, ahead of the active
 /// rows: its sampling params, its logprob request (0 = none), and whether
 /// its pick may stop it — a mid-walk segment's row is sampled and
@@ -551,7 +552,7 @@ struct HeadRow<'a> {
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn mixed_head_flow(
     ctx: &DeviceContext,
-    blocked: &CudaSlice<bf16>,
+    suppress_ids: &ops::SuppressIds,
     policy: &GenerationPolicy,
     scratch: &mut SampleScratch,
     base_seed: u64,
@@ -571,7 +572,7 @@ fn mixed_head_flow(
             });
         }
     };
-    if let Err(err) = suppress_logits(ctx, blocked, logits, &policy.suppress) {
+    if let Err(err) = ops::suppress_logits_bf16_in_place(ctx, logits, suppress_ids) {
         fail_batch(active, "mixed suppression", &err);
         return Err(format!("mixed suppression failed: {err:#}"));
     }
@@ -644,6 +645,8 @@ fn mixed_head_flow(
     Ok((picked, logprobs, stops))
 }
 
+/// One in-flight request between decode steps: its KV, the token that feeds
+/// the next step, and its progress counters.
 struct Active {
     request: GenerateRequest,
     kv: GemmaKv,
@@ -685,9 +688,9 @@ struct EngineState {
     /// `PEGAINFER_PREFIX_CACHE=K` opted in at startup.
     prefix_cache: Option<PrefixCache>,
     policy: GenerationPolicy,
-    /// The value written into a suppressed slot, resident on the device so a
-    /// step never stages a host scalar.
-    blocked: CudaSlice<bf16>,
+    /// Validated once against the head, then retained on-device for one mask
+    /// launch per logits batch.
+    suppress_ids: ops::SuppressIds,
     base_seed: u64,
     /// Seedless sampling variety across requests comes from this counter
     /// mixed into the per-call seed; a request's own `params.seed` replays
@@ -708,6 +711,47 @@ struct EngineState {
 }
 
 impl EngineState {
+    fn reserve_with_eviction(
+        &mut self,
+        kv: &mut GemmaKv,
+        need: AdmissionNeed,
+        can_wait: bool,
+    ) -> ReservationDecision {
+        loop {
+            let refusal = match need {
+                AdmissionNeed::Tokens(tokens) => {
+                    admit_tokens(&self.serve.local_pool, &self.serve.global_pool, kv, tokens)
+                        .err()
+                        .map(|err| format!("admission refused: {err:#}"))
+                }
+                AdmissionNeed::GlobalPages(pages)
+                    if pages
+                        > kv.global.held_pages() + self.serve.global_pool.available_pages() =>
+                {
+                    Some(format!(
+                        "the global family cannot hold this request's {pages} pages"
+                    ))
+                }
+                AdmissionNeed::GlobalPages(_) => None,
+            };
+            let Some(message) = refusal else {
+                return ReservationDecision::Ready;
+            };
+            if self
+                .prefix_cache
+                .as_mut()
+                .is_some_and(PrefixCache::evict_lru)
+            {
+                continue;
+            }
+            return if can_wait {
+                ReservationDecision::Requeue
+            } else {
+                ReservationDecision::Refused(message)
+            };
+        }
+    }
+
     fn load(
         dir: &str,
         device: usize,
@@ -730,7 +774,7 @@ impl EngineState {
                  scan would hold the full context in sliding pages"
             );
             anyhow::ensure!(
-                matches!(lane_mode, AsyncPrefillMode::Off),
+                lane_mode.is_none(),
                 "the overlap lane prefills whole; PEGAINFER_ASYNC_PREFILL is unsupported over \
                  the default {MAX_CONTEXT} ceiling"
             );
@@ -751,14 +795,14 @@ impl EngineState {
         let window_pages = weights.config.sliding_window.div_ceil(PAGE_SIZE) + 1;
         // The cache brings its own page budget so cached entries never eat
         // serving headroom.
-        let cache_cap = crate::prefix_cache::prefix_cache_cap();
+        let cache_cap = prefix_cache_cap()?;
         let cache_entries = cache_cap.unwrap_or(0);
         let sliding_window = weights.config.sliding_window;
         // With the chunk knob set every scan is bounded by window plus
         // segment — except the lane's, which prefills whole and keeps the
         // full transient.
         let transient_pages = match mix_chunk {
-            Some(chunk) if matches!(lane_mode, AsyncPrefillMode::Off) => {
+            Some(chunk) if lane_mode.is_none() => {
                 // A round's rows split across walkers, and every walker's
                 // reservation rounds up to its own page — so the budget
                 // carries one page of rounding per extra walker.
@@ -809,14 +853,10 @@ impl EngineState {
         let scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
         let mut arena = serve.alloc_step_arena(&ctx, arena_rows, graph_enabled)?;
         serve.precapture_decode_graphs(&ctx, &mut arena)?;
-        let blocked = ctx
-            .stream
-            .clone_htod(&[bf16::NEG_INFINITY])
-            .map_err(|err| anyhow::anyhow!("allocating the suppression sentinel failed: {err}"))?;
-        let lane = match lane_mode {
-            AsyncPrefillMode::Off => None,
-            mode => Some(AsyncPrefillLane::new(&ctx, mode)?),
-        };
+        let suppress_ids = ops::SuppressIds::upload(&ctx, &policy.suppress, vocab)?;
+        let lane = lane_mode
+            .map(|mode| AsyncPrefillLane::new(&ctx, mode))
+            .transpose()?;
         Ok(Self {
             ctx,
             serve,
@@ -824,7 +864,7 @@ impl EngineState {
             scratch,
             prefix_cache,
             policy,
-            blocked,
+            suppress_ids,
             base_seed,
             sample_nonce: 0,
             lane,
@@ -927,54 +967,19 @@ impl EngineState {
         // — parked first segments across several walkers would exhaust
         // the one shared segment transient the pool provisions.
         let lane_takes = self.lane.is_some() && !active.is_empty();
-        if self.mix_chunk.is_none() || lane_takes {
-            loop {
-                let new_tokens = prompt_tokens - kv.local.seq_len();
-                match admit_tokens(
-                    &self.serve.local_pool,
-                    &self.serve.global_pool,
-                    &mut kv,
-                    new_tokens,
-                ) {
-                    Ok(()) => break,
-                    Err(err) => {
-                        if self
-                            .prefix_cache
-                            .as_mut()
-                            .is_some_and(PrefixCache::evict_lru)
-                        {
-                            continue;
-                        }
-                        if can_wait {
-                            return Admitted::Requeue(Box::new((request, prefix)));
-                        }
-                        return reject(format!("admission refused: {err:#}"));
-                    }
-                }
-            }
+        let need = if self.mix_chunk.is_none() || lane_takes {
+            AdmissionNeed::Tokens(prompt_tokens - kv.local.seq_len())
         } else {
             // A chunked admission reserves per segment; the whole-account
             // door (see `global_account_pages`) still answers up front.
-            loop {
-                let global_want = global_account_pages(context_len);
-                if global_want <= kv.global.held_pages() + self.serve.global_pool.available_pages()
-                {
-                    break;
-                }
-                if self
-                    .prefix_cache
-                    .as_mut()
-                    .is_some_and(PrefixCache::evict_lru)
-                {
-                    continue;
-                }
-                if can_wait {
-                    return Admitted::Requeue(Box::new((request, prefix)));
-                }
-                return reject(format!(
-                    "the global family cannot hold this request's {global_want} pages"
-                ));
+            AdmissionNeed::GlobalPages(global_account_pages(context_len))
+        };
+        match self.reserve_with_eviction(&mut kv, need, can_wait) {
+            ReservationDecision::Ready => {}
+            ReservationDecision::Requeue => {
+                return Admitted::Requeue(Box::new((request, prefix)));
             }
+            ReservationDecision::Refused(message) => return reject(message),
         }
         // A restored prefix is what the bridge reports as cached: the
         // resumed KV's frontier is exactly the token count served from it.
@@ -1011,14 +1016,6 @@ impl EngineState {
                 let mut rows_budget = {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
-                };
-                // Whole-mode accounting only: those admissions reserve
-                // their prompts up front, and the pool provisions exactly
-                // one full-context transient for them. A chunked gather
-                // reserves nothing here, so it keeps no such ledger.
-                let mut transient_pages = match self.mix_chunk {
-                    Some(_) => 0,
-                    None => rows_budget.div_ceil(PAGE_SIZE),
                 };
                 while newcomers.len() < MIX_MAX_PROMPTS
                     && (self.mix_chunk.is_some() || rows_budget < MIX_GATHER_ROWS)
@@ -1090,15 +1087,6 @@ impl EngineState {
                         newcomers.push((cand, cand_kv, cand_resumed));
                         continue;
                     }
-                    let cand_pages = new_tokens.div_ceil(PAGE_SIZE);
-                    // The row ceiling is the binding bound: 512 gathered
-                    // rows round to at most ~35 pages of transient while
-                    // the smallest ceiling provisions 64 — kept as an
-                    // invariant note for future constant changes.
-                    debug_assert!(
-                        transient_pages + cand_pages <= self.max_context.div_ceil(PAGE_SIZE)
-                            || rows_budget + new_tokens > MIX_GATHER_ROWS
-                    );
                     if rows_budget + new_tokens > MIX_GATHER_ROWS {
                         pending.push_front((cand, cand_prefix));
                         break;
@@ -1118,7 +1106,6 @@ impl EngineState {
                         continue;
                     }
                     rows_budget += new_tokens;
-                    transient_pages += cand_pages;
                     newcomers.push((cand, cand_kv, cand_resumed));
                 }
                 return self.mixed_admission(newcomers, active);
@@ -1135,50 +1122,21 @@ impl EngineState {
         };
         // Under the chunk knob a solo prompt walks its own segments too:
         // residency stays window plus segment whatever the prompt length.
-        if let Some(chunk) = self.mix_chunk {
-            while request.prompt_tokens.len() - kv.local.seq_len() > chunk {
-                let off = kv.local.seq_len();
-                if let Err(err) = admit_tokens(
-                    &self.serve.local_pool,
-                    &self.serve.global_pool,
-                    &mut kv,
-                    chunk,
-                ) {
-                    return fail(format!("{err:#}"));
-                }
-                if let Err(err) = self.serve.step(
-                    &self.ctx,
-                    &mut kv,
-                    &request.prompt_tokens[off..off + chunk],
-                    LogitsSpan::LastRow,
-                ) {
-                    return fail(format!("{err:#}"));
-                }
-            }
-            let rest = request.prompt_tokens.len() - kv.local.seq_len();
-            if let Err(err) = admit_tokens(
-                &self.serve.local_pool,
-                &self.serve.global_pool,
-                &mut kv,
-                rest,
-            ) {
-                return fail(format!("{err:#}"));
-            }
-        }
-        let resume = kv.local.seq_len();
-        let mut logits = match self.serve.step(
-            &self.ctx,
-            &mut kv,
-            &request.prompt_tokens[resume..],
-            LogitsSpan::LastRow,
-        ) {
+        let stepped = if let Some(chunk) = self.mix_chunk {
+            self.walk_plain_prompt(&mut kv, &request.prompt_tokens, chunk)
+        } else {
+            let resume = kv.local.seq_len();
+            self.serve
+                .step(&self.ctx, &mut kv, &request.prompt_tokens[resume..])
+        };
+        let mut logits = match stepped {
             Ok(logits) => logits,
             Err(err) => return fail(format!("{err:#}")),
         };
         if let Some(cache) = self.prefix_cache.as_mut() {
             if let Some(entry) =
                 self.serve
-                    .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
+                    .capture_checkpoint(&self.ctx, &kv, &request.prompt_tokens)
             {
                 cache.insert(entry, resumed);
             }
@@ -1205,7 +1163,8 @@ impl EngineState {
             });
             Admitted::Done
         };
-        if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {
+        if let Err(err) = ops::suppress_logits_bf16_in_place(&self.ctx, logits, &self.suppress_ids)
+        {
             return fail(format!("{err:#}"));
         }
 
@@ -1360,7 +1319,7 @@ impl EngineState {
         if let Some(cache) = self.prefix_cache.as_mut() {
             if let Some(entry) =
                 self.serve
-                    .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
+                    .capture_checkpoint(&self.ctx, &kv, &request.prompt_tokens)
             {
                 cache.insert(entry, resumed);
             }
@@ -1380,6 +1339,75 @@ impl EngineState {
     /// walker graduates into the decode batch at the round boundary. A
     /// drained roster finishes the remaining tails on the plain path,
     /// segment by segment.
+    fn walk_plain_prompt(
+        &self,
+        kv: &mut GemmaKv,
+        prompt: &[u32],
+        chunk: usize,
+    ) -> Result<HiddenStates> {
+        while prompt.len() - kv.local.seq_len() > chunk {
+            let offset = kv.local.seq_len();
+            self.step_plain_segment(kv, &prompt[offset..offset + chunk])?;
+        }
+        let offset = kv.local.seq_len();
+        self.step_plain_segment(kv, &prompt[offset..])
+    }
+
+    fn step_plain_segment(&self, kv: &mut GemmaKv, tokens: &[u32]) -> Result<HiddenStates> {
+        admit_tokens(
+            &self.serve.local_pool,
+            &self.serve.global_pool,
+            kv,
+            tokens.len(),
+        )?;
+        self.serve.step(&self.ctx, kv, tokens)
+    }
+
+    fn finish_plain_walker(&mut self, walker: &mut Walker, chunk: usize, active: &mut Vec<Active>) {
+        let mut logits =
+            match self.walk_plain_prompt(&mut walker.kv, &walker.request.prompt_tokens, chunk) {
+                Ok(logits) => logits,
+                Err(err) => {
+                    let _ = walker.request.token_tx.send(TokenEvent::Error {
+                        message: format!("walk tail failed: {err:#}"),
+                        prompt_tokens: walker.request.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                    walker.failed = true;
+                    return;
+                }
+            };
+        walker.offset = walker.request.prompt_tokens.len();
+        let head = [HeadRow {
+            params: &walker.request.params,
+            logprobs: walker.request.logprobs,
+            ignore_eos: walker.request.params.ignore_eos,
+        }];
+        match mixed_head_flow(
+            &self.ctx,
+            &self.suppress_ids,
+            &self.policy,
+            &mut self.scratch,
+            self.base_seed,
+            &mut self.sample_nonce,
+            &head,
+            active,
+            &mut logits,
+        ) {
+            Ok((picked, mut logprobs, _)) => {
+                walker.first = Some((picked[0], logprobs[0].take()));
+            }
+            Err(message) => {
+                let _ = walker.request.token_tx.send(TokenEvent::Error {
+                    message,
+                    prompt_tokens: walker.request.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+                walker.failed = true;
+            }
+        }
+    }
+
     fn mixed_walk(
         &mut self,
         chunk: usize,
@@ -1437,96 +1465,7 @@ impl EngineState {
                     if w.failed || w.offset >= w.request.prompt_tokens.len() {
                         continue;
                     }
-                    let mut tail_failed = false;
-                    while w.request.prompt_tokens.len() - w.offset > chunk {
-                        let seg = &w.request.prompt_tokens[w.offset..w.offset + chunk];
-                        let stepped = admit_tokens(
-                            &self.serve.local_pool,
-                            &self.serve.global_pool,
-                            &mut w.kv,
-                            chunk,
-                        )
-                        .and_then(|()| {
-                            self.serve
-                                .step(&self.ctx, &mut w.kv, seg, LogitsSpan::LastRow)
-                                .map(|_| ())
-                        });
-                        if let Err(err) = stepped {
-                            let _ = w.request.token_tx.send(TokenEvent::Error {
-                                message: format!("walk tail segment failed: {err:#}"),
-                                prompt_tokens: w.request.prompt_tokens.len(),
-                                completion_tokens: 0,
-                            });
-                            w.failed = true;
-                            tail_failed = true;
-                            break;
-                        }
-                        w.offset += chunk;
-                    }
-                    if tail_failed {
-                        continue;
-                    }
-                    let rest_len = w.request.prompt_tokens.len() - w.offset;
-                    if let Err(err) = admit_tokens(
-                        &self.serve.local_pool,
-                        &self.serve.global_pool,
-                        &mut w.kv,
-                        rest_len,
-                    ) {
-                        let _ = w.request.token_tx.send(TokenEvent::Error {
-                            message: format!("walk tail admission failed: {err:#}"),
-                            prompt_tokens: w.request.prompt_tokens.len(),
-                            completion_tokens: 0,
-                        });
-                        w.failed = true;
-                        continue;
-                    }
-                    let rest = &w.request.prompt_tokens[w.offset..];
-                    w.offset = w.request.prompt_tokens.len();
-                    let mut logits =
-                        match self
-                            .serve
-                            .step(&self.ctx, &mut w.kv, rest, LogitsSpan::LastRow)
-                        {
-                            Ok(logits) => logits,
-                            Err(err) => {
-                                let _ = w.request.token_tx.send(TokenEvent::Error {
-                                    message: format!("walk tail prefill failed: {err:#}"),
-                                    prompt_tokens: w.request.prompt_tokens.len(),
-                                    completion_tokens: 0,
-                                });
-                                w.failed = true;
-                                continue;
-                            }
-                        };
-                    let head = [HeadRow {
-                        params: &w.request.params,
-                        logprobs: w.request.logprobs,
-                        ignore_eos: w.request.params.ignore_eos,
-                    }];
-                    match mixed_head_flow(
-                        &self.ctx,
-                        &self.blocked,
-                        &self.policy,
-                        &mut self.scratch,
-                        self.base_seed,
-                        &mut self.sample_nonce,
-                        &head,
-                        active,
-                        &mut logits,
-                    ) {
-                        Ok((picked, mut lps, _)) => {
-                            w.first = Some((picked[0], lps[0].take()));
-                        }
-                        Err(message) => {
-                            let _ = w.request.token_tx.send(TokenEvent::Error {
-                                message,
-                                prompt_tokens: w.request.prompt_tokens.len(),
-                                completion_tokens: 0,
-                            });
-                            w.failed = true;
-                        }
-                    }
+                    self.finish_plain_walker(w, chunk, active);
                 }
                 continue;
             }
@@ -1627,7 +1566,7 @@ impl EngineState {
                     .collect();
                 mixed_head_flow(
                     &self.ctx,
-                    &self.blocked,
+                    &self.suppress_ids,
                     &self.policy,
                     &mut self.scratch,
                     self.base_seed,
@@ -1682,7 +1621,7 @@ impl EngineState {
         if let Some(cache) = self.prefix_cache.as_mut() {
             if let Some(entry) =
                 self.serve
-                    .capture_checkpoint(&self.ctx, &kv, request.prompt_tokens.clone())
+                    .capture_checkpoint(&self.ctx, &kv, &request.prompt_tokens)
             {
                 cache.insert(entry, resumed);
             }
@@ -1814,7 +1753,7 @@ impl EngineState {
             for (request, kv, resumed) in &newcomers {
                 if let Some(entry) =
                     self.serve
-                        .capture_checkpoint(&self.ctx, kv, request.prompt_tokens.clone())
+                        .capture_checkpoint(&self.ctx, kv, &request.prompt_tokens)
                 {
                     cache.insert(entry, *resumed);
                 }
@@ -1831,7 +1770,7 @@ impl EngineState {
                 .collect();
             match mixed_head_flow(
                 &self.ctx,
-                &self.blocked,
+                &self.suppress_ids,
                 &self.policy,
                 &mut self.scratch,
                 self.base_seed,
@@ -1917,7 +1856,8 @@ impl EngineState {
                 Err(err) => return fail_batch(active, "batched decode", &err),
             }
         };
-        if let Err(err) = suppress_logits(&self.ctx, &self.blocked, logits, &self.policy.suppress) {
+        if let Err(err) = ops::suppress_logits_bf16_in_place(&self.ctx, logits, &self.suppress_ids)
+        {
             return fail_batch(active, "suppression", &err);
         }
 
@@ -2022,6 +1962,103 @@ fn emit_decode_rows(
 }
 
 #[cfg(test)]
+mod knob_tests {
+    use super::*;
+
+    #[test]
+    fn environment_boundary_distinguishes_missing_and_malformed() {
+        assert_eq!(
+            normalize_env(PREFIX_CACHE_ENV, Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        let invalid = std::ffi::OsString::from("invalid");
+        let error = normalize_env(
+            ASYNC_PREFILL_ENV,
+            Err(std::env::VarError::NotUnicode(invalid)),
+        )
+        .expect_err("non-UTF-8 must refuse");
+        assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn async_prefill_parses_or_refuses() {
+        for off in ["", "0", "false", "off", " OFF "] {
+            assert_eq!(parse_async_prefill_mode(off).unwrap(), None);
+        }
+        assert_eq!(
+            parse_async_prefill_mode("shared").unwrap(),
+            Some(LaneMode::Shared)
+        );
+        assert_eq!(
+            parse_async_prefill_mode("green:35").unwrap(),
+            Some(LaneMode::Green(35))
+        );
+        for bad in [
+            "1",
+            "true",
+            "on",
+            "green",
+            "green:0",
+            "green:100",
+            "green:x",
+        ] {
+            assert!(
+                parse_async_prefill_mode(bad).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_knobs_parse_or_refuse() {
+        assert_eq!(parse_serving_context("32768", 262_144).unwrap(), 32_768);
+        assert!(parse_serving_context("1023", 262_144).is_err());
+        assert!(parse_serving_context("262145", 262_144).is_err());
+        assert!(parse_serving_context("4294967296", usize::MAX).is_err());
+        assert_eq!(parse_decode_slots("16").unwrap(), 16);
+        assert!(parse_decode_slots("0").is_err());
+        assert!(parse_decode_slots("17").is_err());
+        assert_eq!(parse_prefix_cache_cap("4").unwrap(), Some(4));
+        for off in ["", "0", "off", " OFF "] {
+            assert_eq!(
+                parse_prefix_cache_cap(off).unwrap(),
+                None,
+                "{off:?} is how both opt in knobs spell off"
+            );
+        }
+        for bad in ["many", "-1", "4k"] {
+            assert!(parse_prefix_cache_cap(bad).is_err(), "{bad:?} must refuse");
+        }
+    }
+
+    #[test]
+    fn chunk_mode_parses_or_refuses() {
+        for off in ["", "0", "off", " OFF "] {
+            assert_eq!(parse_mix_chunk_tokens(off, 8192).unwrap(), None);
+        }
+        assert_eq!(parse_mix_chunk_tokens("64", 8192).unwrap(), Some(64));
+        assert_eq!(parse_mix_chunk_tokens("8192", 262_144).unwrap(), Some(8192));
+        assert_eq!(
+            parse_mix_chunk_tokens("2496", 262_144).unwrap(),
+            Some(2432),
+            "a step aligns down to whole tiles"
+        );
+        assert_eq!(
+            parse_mix_chunk_tokens("127", 8192).unwrap(),
+            Some(127),
+            "below one tile the width is never rounded to zero"
+        );
+        assert_eq!(parse_mix_chunk_tokens("128", 8192).unwrap(), Some(128));
+        for bad in ["63", "8192", "on", "2k", "-1"] {
+            assert!(
+                parse_mix_chunk_tokens(bad, 8192).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod gate {
     use super::*;
 
@@ -2030,11 +2067,8 @@ mod gate {
         let ctx = DeviceContext::new().expect("GPU required");
         let (vocab, rows) = (8usize, 2usize);
         let mut logits = HiddenStates::zeros(&ctx, vocab, rows).expect("logits");
-        let blocked = ctx
-            .stream
-            .clone_htod(&[bf16::NEG_INFINITY])
-            .expect("sentinel");
-        suppress_logits(&ctx, &blocked, &mut logits, &[3, 5]).expect("suppress");
+        let suppress_ids = ops::SuppressIds::upload(&ctx, &[3u32, 5], vocab).expect("ids");
+        ops::suppress_logits_bf16_in_place(&ctx, &mut logits, &suppress_ids).expect("suppress");
 
         let host = logits.to_host(&ctx).expect("D2H");
         for row in 0..rows {
@@ -2051,8 +2085,34 @@ mod gate {
             }
         }
 
-        let past_the_row = suppress_logits(&ctx, &blocked, &mut logits, &[vocab as u32]);
-        assert!(past_the_row.is_err(), "an id past the row must be refused");
+        // The bound is structural: an id the head does not span cannot reach
+        // the kernel, and neither can ids checked against a different head.
+        let past_the_head = ops::SuppressIds::upload(&ctx, &[vocab as u32], vocab);
+        assert!(
+            past_the_head.is_err(),
+            "an id at the head's width must be refused at upload"
+        );
+        let other_head = ops::SuppressIds::upload(&ctx, &[1u32], vocab + 1).expect("ids");
+        assert!(
+            ops::suppress_logits_bf16_in_place(&ctx, &mut logits, &other_head).is_err(),
+            "ids checked against a wider head must not be applied to these logits"
+        );
+    }
+
+    #[test]
+    fn the_generation_policy_refuses_ids_outside_the_head() {
+        let policy = GenerationPolicy {
+            eos: vec![1],
+            suppress: vec![8],
+        };
+        let err = policy
+            .check_against_vocab(8)
+            .expect_err("an id past the row must be refused");
+        assert!(
+            err.to_string()
+                .contains("effective suppression set lists 8"),
+            "wrong refusal: {err:#}"
+        );
     }
 }
 
@@ -2066,9 +2126,6 @@ mod lane_tests {
     use pegainfer_frontend::engine::TokenEvent;
     use pegainfer_frontend::engine::TokenSink;
     use pegainfer_frontend::engine::TokenStreamReceiver;
-
-    use super::AsyncPrefillMode;
-    use super::parse_async_prefill_mode;
 
     fn submit(
         handle: &pegainfer_frontend::engine::EngineHandle,
@@ -2112,6 +2169,32 @@ mod lane_tests {
         (0..len as u32)
             .map(|i| 1000 + (i * 37 + salt) % 50000)
             .collect()
+    }
+
+    fn pin_live_stream(handle: &pegainfer_frontend::engine::EngineHandle) -> TokenStreamReceiver {
+        let mut streamer = submit(handle, ids(40, 0), 1024);
+        let mut seen = 0;
+        while seen < 2 {
+            match streamer.blocking_recv().map(|(_, event)| event) {
+                Some(TokenEvent::Token { .. }) => seen += 1,
+                Some(TokenEvent::Error { message, .. }) => panic!("streamer: {message}"),
+                Some(_) => {}
+                None => panic!("streamer closed early"),
+            }
+        }
+        streamer
+    }
+
+    fn warm_prompt(prefix: &[u32]) -> Vec<u32> {
+        let mut prompt = prefix.to_vec();
+        prompt.extend(ids(60, 11));
+        prompt
+    }
+
+    fn assert_warm_result(rx: &mut TokenStreamReceiver, cached: usize, label: &str) {
+        let warm = drain(rx, label);
+        assert_eq!((warm.tokens, warm.finish), (4, FinishReason::Length));
+        assert_eq!(warm.cached, cached, "warm admission resume frontier");
     }
 
     /// The whole async lifecycle against one live engine, with every
@@ -2181,6 +2264,31 @@ mod lane_tests {
         EnvGuard { saved, _lock: lock }
     }
 
+    /// The raise has to arrive where a client can see it. `servable_len` is
+    /// the frontend's only view of the ceiling, and it travels a path no
+    /// state-level assertion touches: load, the ready channel, the u32
+    /// narrowing, and `EngineHandle::with_servable_len`.
+    #[test]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn the_raise_reaches_the_frontend() {
+        let dir = crate::testkit::model_path();
+        let _env = scoped_engine_env(&[
+            ("PEGAINFER_MAX_CONTEXT", "32768"),
+            ("PEGAINFER_MIX_CHUNK_TOKENS", "2048"),
+            ("PEGAINFER_DECODE_SLOTS", "2"),
+        ]);
+        let handle =
+            super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
+        assert_eq!(
+            handle.servable_len(),
+            Some(32768),
+            "the raised ceiling must reach the frontend, not just the engine state"
+        );
+        let mut rx = submit(&handle, ids(40, 5), 4);
+        let served = drain(&mut rx, "raised ceiling");
+        assert_eq!((served.tokens, served.finish), (4, FinishReason::Length));
+    }
+
     fn lane_lifecycle_script(mode: &str) {
         let dir = crate::testkit::model_path();
         let _env = scoped_engine_env(&[
@@ -2193,16 +2301,7 @@ mod lane_tests {
         // The streamer pins the decode batch non-empty for the whole
         // script: its budget is far past the script's round count, and its
         // sink drops only after the last assertion.
-        let mut streamer = submit(&handle, ids(40, 0), 1024);
-        let mut seen = 0;
-        while seen < 2 {
-            match streamer.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Token { .. }) => seen += 1,
-                Some(TokenEvent::Error { message, .. }) => panic!("streamer: {message}"),
-                Some(_) => {}
-                None => panic!("streamer closed early"),
-            }
-        }
+        let streamer = pin_live_stream(&handle);
 
         let long_prompt = ids(1500, 7);
         let mut lane_rx = submit(&handle, long_prompt.clone(), 4);
@@ -2214,15 +2313,8 @@ mod lane_tests {
 
         // Warm hit: the long prompt plus a new turn resumes at the captured
         // frontier and rides the lane with only the suffix.
-        let mut warm_prompt = long_prompt;
-        warm_prompt.extend(ids(60, 11));
-        let mut warm_rx = submit(&handle, warm_prompt, 4);
-        let warm = drain(&mut warm_rx, "warm suffix on the lane");
-        assert_eq!((warm.tokens, warm.finish), (4, FinishReason::Length));
-        assert_eq!(
-            warm.cached, 1500,
-            "the warm admission must resume at the captured frontier"
-        );
+        let mut warm_rx = submit(&handle, warm_prompt(&long_prompt), 4);
+        assert_warm_result(&mut warm_rx, 1500, "warm suffix on the lane");
 
         // In-flight cancellation: `Scheduled` is sent past every sync-path
         // exit, so a sink dropped after it lands while the lane pass runs.
@@ -2263,20 +2355,6 @@ mod lane_tests {
         let after = drain(&mut after_rx, "after the cancelled and failed lanes");
         assert_eq!((after.tokens, after.finish), (4, FinishReason::Length));
         drop(streamer);
-    }
-
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
-    fn the_lane_engine_lifecycle_completes() {
-        lane_lifecycle_script("shared");
-    }
-
-    /// The green twin exercises the partitioned completion path —
-    /// `cuGreenCtxRecordEvent` rather than the plain stream record.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
-    fn the_green_lane_engine_lifecycle_completes() {
-        lane_lifecycle_script("green:35");
     }
 
     fn walk_request(prompt: Vec<u32>, max_tokens: usize) -> (GenerateRequest, TokenStreamReceiver) {
@@ -2343,24 +2421,8 @@ mod lane_tests {
         out
     }
 
-    fn walk_fixture_prompts() -> Vec<Vec<u32>> {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../test_data/gemma4-12b-generate.safetensors"
-        );
-        let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
-        let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
-        ["a", "b", "c"]
-            .iter()
-            .map(|case| {
-                let (_, prompt_i32) =
-                    crate::testkit::i32_tensor(&fixture, &format!("{case}_prompt"));
-                prompt_i32
-                    .iter()
-                    .map(|&t| u32::try_from(t).expect("token id"))
-                    .collect()
-            })
-            .collect()
+    fn walk_prompts() -> Vec<Vec<u32>> {
+        crate::testkit::generate_fixture_prompts()
     }
 
     fn headroom_admit(
@@ -2401,7 +2463,7 @@ mod lane_tests {
     /// both refuse before the multi-GiB load — the startup policy the
     /// serving doc promises.
     #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and --test-threads=1"]
+    #[ignore = "requires the pinned 12B checkpoint and --test-threads=1"]
     fn the_raise_refuses_without_its_prerequisites() {
         let dir = crate::testkit::model_path();
         let load = |overrides: &[(&str, &str)]| {
@@ -2435,8 +2497,8 @@ mod lane_tests {
     /// leaves the third queued with no Scheduled; once an incumbent
     /// retires, the same intake admits it and it runs to its budget.
     #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
-    fn the_slots_hold_at_the_roster_edge() {
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn the_raised_ceiling_and_slots_hold_at_the_roster_edge() {
         let dir = crate::testkit::model_path();
         let policy = super::generation_policy(&dir).expect("policy");
         let _env = scoped_engine_env(&[
@@ -2446,7 +2508,11 @@ mod lane_tests {
         ]);
         let mut state =
             super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
-        let prompts = walk_fixture_prompts();
+        assert_eq!(
+            state.max_context, 32768,
+            "the engine follows the raised ceiling"
+        );
+        let prompts = walk_prompts();
         let long: Vec<u32> = prompts[0].iter().cycle().copied().take(12000).collect();
         let (req_a, mut rx_a) = walk_request(long, 4);
         let (req_b, mut rx_b) = walk_request(prompts[1].clone(), 40);
@@ -2486,36 +2552,6 @@ mod lane_tests {
         assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
     }
 
-    /// The raised ceiling's own contract, nothing else: the published
-    /// servable length follows the knob, and a prompt past the default
-    /// 8192 serves through the production engine.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
-    fn the_raised_ceiling_serves_past_the_default() {
-        let dir = crate::testkit::model_path();
-        let _env = scoped_engine_env(&[
-            ("PEGAINFER_MAX_CONTEXT", "32768"),
-            ("PEGAINFER_MIX_CHUNK_TOKENS", "2048"),
-            ("PEGAINFER_DECODE_SLOTS", "2"),
-        ]);
-        let handle =
-            super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
-        assert_eq!(
-            handle.servable_len(),
-            Some(32768),
-            "the frontend limit follows the raised ceiling"
-        );
-        let seeds = walk_fixture_prompts();
-        let long: Vec<u32> = seeds[0].iter().cycle().copied().take(12000).collect();
-        let mut rx = submit(&handle, long, 8);
-        assert_eq!(
-            drain(&mut rx, "past-default prompt").tokens,
-            8,
-            "the 12K prompt served its budget"
-        );
-        drop(handle);
-    }
-
     /// The chunked pool provisions one shared segment transient, so no
     /// walker may park pages ahead of its rounds: with the knob set before
     /// load — the reduced production pool, asserted against the provision
@@ -2523,7 +2559,7 @@ mod lane_tests {
     /// prompts entering one gather must all finish. Parked first quanta
     /// across the walkers exhausted this pool.
     #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
     fn the_gathered_transient_leaves_headroom() {
         let dir = crate::testkit::model_path();
         let mut state = walk_test_state("2048");
@@ -2544,7 +2580,7 @@ mod lane_tests {
             "the pool was sized by the reduced chunked provision"
         );
 
-        let prompts = walk_fixture_prompts();
+        let prompts = walk_prompts();
         let stream_prompt: Vec<u32> = prompts[0].iter().cycle().copied().take(1500).collect();
         let long: Vec<u32> = prompts[0].iter().cycle().copied().take(5900).collect();
 
@@ -2627,11 +2663,11 @@ mod lane_tests {
     /// phases are algorithm oracles for `mixed_walk` itself, not serving
     /// evidence: the public floor rejects spans under 64.
     #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, the generate fixture, a GPU, and --test-threads=1"]
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
     fn the_gathered_walk_matches_the_serial_path() {
         let mut state = walk_test_state("64");
         assert_eq!(state.mix_chunk, Some(64), "the knob preceded the load");
-        let prompts = walk_fixture_prompts();
+        let prompts = walk_prompts();
         let cases = ["a", "b", "c"];
         let budgets = [24usize, 17, 21];
 
@@ -2784,24 +2820,13 @@ mod lane_tests {
     /// engine; a warm prefix-cache hit whose rendered prompt exceeds the
     /// gather ceiling but whose unseen suffix does not still resolves and
     /// completes; and every survivor finishes its full budget.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH, a GPU, and --test-threads=1"]
-    fn the_gather_engine_lifecycle_completes() {
+    fn gather_lifecycle_script() {
         let dir = crate::testkit::model_path();
         let _env = scoped_engine_env(&[("PEGAINFER_PREFIX_CACHE", "4")]);
         let handle =
             super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
 
-        let mut streamer = submit(&handle, ids(40, 0), 1024);
-        let mut seen = 0;
-        while seen < 2 {
-            match streamer.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Token { .. }) => seen += 1,
-                Some(TokenEvent::Error { message, .. }) => panic!("streamer: {message}"),
-                Some(_) => {}
-                None => panic!("streamer closed early"),
-            }
-        }
+        let streamer = pin_live_stream(&handle);
 
         // Dead and invalid submissions ahead of a valid prompt: the gather
         // drains them against the shared budget and the valid one lands.
@@ -2836,84 +2861,21 @@ mod lane_tests {
             (long_done.tokens, long_done.finish),
             (4, FinishReason::Length)
         );
-        let mut warm_prompt = long_prompt;
-        warm_prompt.extend(ids(60, 11));
         let mut head_rx = submit(&handle, ids(60, 13), 4);
-        let mut warm_rx = submit(&handle, warm_prompt, 4);
+        let mut warm_rx = submit(&handle, warm_prompt(&long_prompt), 4);
         let head = drain(&mut head_rx, "gather head");
         assert_eq!((head.tokens, head.finish), (4, FinishReason::Length));
-        let warm = drain(&mut warm_rx, "warm gathered suffix");
-        assert_eq!((warm.tokens, warm.finish), (4, FinishReason::Length));
-        assert_eq!(
-            warm.cached, 1600,
-            "the warm admission must resume at the captured frontier"
-        );
+        assert_warm_result(&mut warm_rx, 1600, "warm gathered suffix");
 
         drop(streamer);
     }
 
     #[test]
-    fn async_prefill_mode_parses_or_refuses() {
-        for off in ["", "0", "false", "off", " OFF "] {
-            assert_eq!(
-                parse_async_prefill_mode(off).unwrap(),
-                AsyncPrefillMode::Off
-            );
-        }
-        assert_eq!(
-            parse_async_prefill_mode("shared").unwrap(),
-            AsyncPrefillMode::Shared
-        );
-        assert_eq!(
-            parse_async_prefill_mode("green:35").unwrap(),
-            AsyncPrefillMode::Green(35)
-        );
-        for bad in [
-            "1",
-            "true",
-            "on",
-            "green",
-            "green:0",
-            "green:100",
-            "green:x",
-        ] {
-            assert!(
-                parse_async_prefill_mode(bad).is_err(),
-                "{bad:?} must refuse, not silently degrade"
-            );
-        }
-    }
-
-    #[test]
-    fn mix_chunk_tokens_parses_or_refuses() {
-        use super::parse_mix_chunk_tokens;
-        for off in ["", "0", "off", " OFF "] {
-            assert_eq!(parse_mix_chunk_tokens(off, 8192).unwrap(), None);
-        }
-        assert_eq!(parse_mix_chunk_tokens("2048", 8192).unwrap(), Some(2048));
-        assert_eq!(parse_mix_chunk_tokens("64", 8192).unwrap(), Some(64));
-        assert_eq!(
-            parse_mix_chunk_tokens("8192", 262_144).unwrap(),
-            Some(8192),
-            "a raised ceiling admits a wider chunk"
-        );
-        assert_eq!(
-            parse_mix_chunk_tokens("2496", 262_144).unwrap(),
-            Some(2432),
-            "a step aligns down to whole tiles"
-        );
-        assert_eq!(
-            parse_mix_chunk_tokens("127", 8192).unwrap(),
-            Some(127),
-            "below one tile the width is never rounded to zero"
-        );
-        assert_eq!(parse_mix_chunk_tokens("128", 8192).unwrap(), Some(128));
-        for bad in ["63", "8192", "on", "2k", "-1"] {
-            assert!(
-                parse_mix_chunk_tokens(bad, 8192).is_err(),
-                "{bad:?} must refuse, not silently degrade"
-            );
-        }
+    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+    fn the_engine_lifecycle_variants_complete() {
+        lane_lifecycle_script("shared");
+        lane_lifecycle_script("green:35");
+        gather_lifecycle_script();
     }
 
     #[test]
@@ -2943,33 +2905,5 @@ mod lane_tests {
                 assert!(super::global_account_pages(context_len) <= provision_per_slot);
             }
         }
-    }
-
-    #[test]
-    fn decode_slots_parse_or_refuse() {
-        use super::parse_decode_slots;
-        assert_eq!(parse_decode_slots("1").unwrap(), 1);
-        assert_eq!(parse_decode_slots("16").unwrap(), 16);
-        for bad in ["0", "17", "two", ""] {
-            assert!(parse_decode_slots(bad).is_err(), "{bad:?} must refuse");
-        }
-    }
-
-    #[test]
-    fn serving_context_parses_or_refuses() {
-        use super::parse_serving_context;
-        assert_eq!(parse_serving_context("262144", 262_144).unwrap(), 262_144);
-        assert_eq!(parse_serving_context(" 32768 ", 262_144).unwrap(), 32_768);
-        assert_eq!(parse_serving_context("1024", 262_144).unwrap(), 1024);
-        for bad in ["1023", "262145", "off", "8k", "-1", ""] {
-            assert!(
-                parse_serving_context(bad, 262_144).is_err(),
-                "{bad:?} must refuse"
-            );
-        }
-        assert!(
-            parse_serving_context("4294967296", usize::MAX).is_err(),
-            "the i32 metadata domain caps a checkpoint's wider word"
-        );
     }
 }

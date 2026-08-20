@@ -2,10 +2,8 @@ use super::*;
 use crate::config::Gemma4Config;
 use crate::config::LayerKind;
 use crate::config::first_last;
-use crate::testkit::GOLDEN_PATH;
-use crate::testkit::METADATA_KEY;
-use crate::testkit::assert_checkpoint_matches;
 use crate::testkit::bf16_tensor;
+use crate::testkit::golden_bytes;
 use crate::testkit::model_path;
 use crate::weights::Gemma4Weights;
 
@@ -62,27 +60,18 @@ fn compare(got: &[f32], expected: &[bf16], hidden_size: usize, what: &str) -> us
 }
 
 #[test]
-#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
+#[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn layers_match_hf_probes() {
     let dir = model_path();
-    let fixture_bytes = std::fs::read(GOLDEN_PATH).expect("read fixture");
-    let (_, meta) =
-        safetensors::SafeTensors::read_metadata(&fixture_bytes).expect("fixture metadata");
-    let manifest: serde_json::Value = serde_json::from_str(
-        meta.metadata()
-            .as_ref()
-            .expect("fixture metadata map")
-            .get(METADATA_KEY)
-            .expect("gemma4_golden metadata key"),
-    )
-    .expect("parse fixture manifest");
-    assert_checkpoint_matches(&manifest, &dir);
+    let (fixture_bytes, manifest) = golden_bytes(&dir);
     let fixture = safetensors::SafeTensors::deserialize(&fixture_bytes).expect("parse fixture");
 
     // The layer indices come from parsing the layer map; the fixture
     // metadata records the dumper's own parse, so the two independent
     // derivations must agree before anything numeric is asserted.
     let config = Gemma4Config::from_file(&dir).expect("config");
+    let (weights, _) = Gemma4Weights::from_safetensors(&dir, 0, config).expect("load 12B weights");
+    let config = &weights.config;
     let (first, last) =
         first_last(&config.layer_types, LayerKind::Sliding).expect("12B carries sliding layers");
     let (gfirst, glast) =
@@ -130,12 +119,10 @@ fn layers_match_hf_probes() {
             .unwrap_or_else(|| panic!("cut {label} missing from fixture"))
     };
 
-    let (weights, _) =
-        Gemma4Weights::from_safetensors(&dir, 0, config.clone()).expect("load 12B weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
 
-    let geom = LayerGeometry::local_of(&config);
-    let global_geom = LayerGeometry::global_of(&config);
+    let geom = LayerGeometry::local_of(config);
+    let global_geom = LayerGeometry::global_of(config);
     let cos_max_pos = 16;
     let (cos_cache, sin_cache) = pegainfer_core::rope::precompute_rope(
         &ctx,

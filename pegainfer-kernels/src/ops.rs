@@ -79,6 +79,7 @@ pub use deepep::glm52_deepep_info;
 pub use deepep::glm52_ep_deepep_unique_id;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
+pub use elementwise::SuppressIds;
 pub use elementwise::accumulate_bf16_token_scaled_to_f32_into;
 pub use elementwise::add_batch;
 pub use elementwise::add_batch_into;
@@ -109,6 +110,7 @@ pub use elementwise::silu_mul_batch;
 pub use elementwise::silu_mul_batch_into;
 pub use elementwise::silu_mul_fused_batch_into;
 pub use elementwise::softcap_bf16_in_place;
+pub use elementwise::suppress_logits_bf16_in_place;
 pub use elementwise::write_vec_into;
 pub use embedding::embedding_batch;
 pub use embedding::embedding_batch_vocab_shard;

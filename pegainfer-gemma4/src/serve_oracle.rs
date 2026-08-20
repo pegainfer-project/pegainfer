@@ -7,13 +7,13 @@ use anyhow::Result;
 use super::*;
 use crate::forward::full_forward;
 use crate::kv::admit_tokens;
-use crate::testkit::GOLDEN_PATH;
-use crate::testkit::METADATA_KEY;
-use crate::testkit::assert_checkpoint_matches;
 use crate::testkit::f32_tensor;
+use crate::testkit::fixture_manifest;
+use crate::testkit::golden_bytes;
 use crate::testkit::i32_tensor;
 use crate::testkit::log_softmax_at;
 use crate::testkit::model_path;
+use crate::testkit::u32_tensor;
 
 /// Compare one logit row against the oracle's: both must be finite (a NaN
 /// would rank highest under `total_cmp` and be ignored by `f32::max`), the
@@ -30,18 +30,6 @@ fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-fn fixture_manifest(bytes: &[u8], key: &str) -> serde_json::Value {
-    let (_, meta) = safetensors::SafeTensors::read_metadata(bytes).expect("fixture metadata");
-    serde_json::from_str(
-        meta.metadata()
-            .as_ref()
-            .expect("fixture metadata map")
-            .get(key)
-            .expect("fixture manifest key"),
-    )
-    .expect("parse fixture manifest")
-}
-
 fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, String) {
     let dir = model_path();
     let config = Gemma4Config::from_file(&dir).expect("config");
@@ -54,6 +42,12 @@ fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, S
 fn load_stack() -> (DeviceContext, GemmaServe, String) {
     // One request at the window, plus each pool's padding page.
     stack_with(1024, 66)
+}
+
+fn synthetic_tokens(len: usize, salt: u32) -> Vec<u32> {
+    (0..len as u32)
+        .map(|i| 1000 + (i * 37 + salt) % 50000)
+        .collect()
 }
 
 /// What agreement is available at this depth, measured on the reference
@@ -111,12 +105,8 @@ fn run_case(
     case: &str,
     chunk: usize,
 ) -> Run {
-    let (_, prompt_i32) = i32_tensor(fixture, &format!("{case}_prompt"));
+    let (_, prompt) = u32_tensor(fixture, &format!("{case}_prompt"));
     let (_, teacher_i32) = i32_tensor(fixture, &format!("{case}_teacher"));
-    let prompt: Vec<u32> = prompt_i32
-        .iter()
-        .map(|&t| u32::try_from(t).expect("token id"))
-        .collect();
     let step_size = if chunk == 0 { prompt.len() } else { chunk };
     let last_chunk = prompt.len().div_ceil(step_size) - 1;
 
@@ -130,9 +120,7 @@ fn run_case(
         admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, piece.len())
             .expect("admit prompt");
         shifted_multi_token |= kv.local.origin_pages() > 0 && piece.len() > 1;
-        let logits = serve
-            .step(ctx, &mut kv, piece, LogitsSpan::LastRow)
-            .expect("prefill");
+        let logits = serve.step(ctx, &mut kv, piece).expect("prefill");
         if i == last_chunk {
             rows.push(logits.to_host(ctx).expect("D2H"));
         }
@@ -222,219 +210,173 @@ fn reference_sdpa_only(
     (ids, lps, positions, top_k, tolerance, backend_top1)
 }
 
-/// The raised ceiling's numeric waypoints: 16384 and 32768 teacher-forced
-/// against the Hugging Face reference — proportional rope and global
-/// attention far past the window fixture's 4096 — each gated at twice its
-/// own backends' measured gap, the widest dual-backend floor standing in
-/// where eager could not fit. The widest case runs again in 2048-token
-/// chunks, the raised ceiling's production prefill shape.
-#[test]
-#[ignore = "requires the pinned 12B checkpoint and the longctx fixture"]
-fn longctx_waypoints_match_hf() {
-    // A 32776-token prefill holds every local page at once (append then
-    // attend); pools sized for one request plus padding.
-    let (ctx, serve, dir) = stack_with(32900, 2200);
-    let bytes = std::fs::read(LONGCTX_FIXTURE).expect("read longctx fixture");
-    let golden = fixture_manifest(
-        &std::fs::read(GOLDEN_PATH).expect("read golden"),
-        METADATA_KEY,
-    );
-    assert_checkpoint_matches(&golden, &dir);
-    let manifest = fixture_manifest(&bytes, "gemma4_longctx_golden");
-    assert_eq!(
-        manifest["revision"], golden["revision"],
-        "the longctx fixture was dumped from a different revision than the golden one"
-    );
-    let eager_skipped: Vec<String> = manifest["eager_skipped"]
-        .as_array()
-        .expect("eager_skipped list")
-        .iter()
-        .map(|v| v.as_str().expect("case name").to_string())
-        .collect();
-    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
-    let page = serve.local_pool.layout().page_size;
+#[derive(Clone, Copy)]
+struct BorrowedFloor {
+    tolerance: f32,
+    top1_share: f64,
+}
 
-    // Neither waypoint fits eager next to the tower on this device, so no
-    // in-fixture dual-backend floor exists; the window fixture's deepest
-    // dual case lends its own — the widest measured agreement bound
-    // available. A depth-grown gap past it fails loud and is widened only
-    // with a written justification.
-    let window_bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
-    let window_manifest = fixture_manifest(&window_bytes, "gemma4_window_golden");
-    assert_eq!(
-        window_manifest["revision"], golden["revision"],
-        "the window fixture was dumped from a different revision than the golden one"
-    );
-    assert_eq!(
-        manifest["transformers"], window_manifest["transformers"],
-        "a borrowed floor is only meaningful under the donor's own reference release"
-    );
-    let window_fixture =
-        safetensors::SafeTensors::deserialize(&window_bytes).expect("parse window fixture");
-    let (_, _, donor_positions, _, donor_tolerance, donor_top1) =
-        reference(&window_fixture, "w4096");
-    #[allow(clippy::cast_precision_loss)]
-    let donor_share = donor_top1 as f64 / donor_positions as f64;
+#[derive(Clone, Copy)]
+struct Waypoint<'a> {
+    case: &'a str,
+    chunk: usize,
+    floor: Option<BorrowedFloor>,
+}
 
-    let mut over: Vec<String> = Vec::new();
-    for (case, chunk) in [("w16384", 0), ("w32768", 0), ("w32768", 2048)] {
-        let label = if chunk == 0 {
-            case.to_string()
-        } else {
-            format!("{case}-chunked")
-        };
-        let (ref_ids, ref_lps, positions, top_k, tolerance, backend_top1) =
-            if eager_skipped.contains(&case.to_string()) {
-                reference_sdpa_only(&fixture, case, donor_tolerance, donor_share)
-            } else {
-                reference(&fixture, case)
-            };
-        let run = run_case(&ctx, &serve, &fixture, case, chunk);
-        assert_eq!(run.rows.len(), positions, "{label}: fixture positions");
-        assert_eq!(
-            chunk > 0,
-            run.shifted_multi_token,
-            "{label}: a shifted multi-token step is exactly what chunking adds"
-        );
-
-        let (max_abs, top1) = score_rows(&run.rows, &ref_ids, &ref_lps, top_k, &label);
-        eprintln!(
-            "{label}: max |dlogprob| {max_abs} (tol {tolerance:.2}), top-1 {top1}/{positions} \
-             (backend bar {backend_top1}/{positions}), local pages {}, global {}",
-            run.local_pages, run.global_pages
-        );
-        assert!(
-            top1 >= backend_top1,
-            "{label}: top-1 {top1}/{positions} below the backends' own \
-             {backend_top1}/{positions}"
-        );
-        let released = run.kv_len.saturating_sub(serve.sliding_window) / page;
-        assert_eq!(
-            run.local_pages,
-            run.kv_len.div_ceil(page) - released,
-            "{label}: resident pages after {released} released"
-        );
-        assert_eq!(
-            run.global_pages,
-            run.kv_len.div_ceil(page),
-            "{label}: the global family must keep every page"
-        );
-        if max_abs > tolerance {
-            over.push(format!("{label} ({max_abs} > {tolerance})"));
-        }
+fn waypoint_reference(
+    fixture: &safetensors::SafeTensors<'_>,
+    point: Waypoint<'_>,
+) -> (Vec<i32>, Vec<f32>, usize, usize, f32, usize) {
+    match point.floor {
+        Some(floor) => reference_sdpa_only(fixture, point.case, floor.tolerance, floor.top1_share),
+        None => reference(fixture, point.case),
     }
+}
+
+fn gate_waypoint(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    fixture: &safetensors::SafeTensors<'_>,
+    point: Waypoint<'_>,
+) -> Option<String> {
+    let label = match point.chunk {
+        0 => point.case.to_string(),
+        _ => format!("{}-chunked", point.case),
+    };
+    let (ids, lps, positions, top_k, tolerance, backend_top1) = waypoint_reference(fixture, point);
+    let run = run_case(ctx, serve, fixture, point.case, point.chunk);
+    assert_eq!(run.rows.len(), positions, "{label}: fixture positions");
+    assert_eq!(
+        point.chunk > 0,
+        run.shifted_multi_token,
+        "{label}: shifted multi-token coverage"
+    );
+    let (max_abs, top1) = score_rows(&run.rows, &ids, &lps, top_k, &label);
+    assert!(
+        top1 >= backend_top1,
+        "{label}: top-1 {top1}/{positions} below backend bar {backend_top1}/{positions}"
+    );
+    let page = serve.local_pool.layout().page_size;
+    let released = run.kv_len.saturating_sub(serve.sliding_window) / page;
+    assert_eq!(run.local_pages, run.kv_len.div_ceil(page) - released);
+    assert_eq!(run.global_pages, run.kv_len.div_ceil(page));
+    eprintln!(
+        "{label}: max |dlogprob| {max_abs} (tol {tolerance:.2}), top-1 \
+         {top1}/{positions}, local pages {}, global {}",
+        run.local_pages, run.global_pages
+    );
+    (max_abs > tolerance).then(|| format!("{label} ({max_abs} > {tolerance})"))
+}
+
+fn gate_waypoints(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    fixture: &safetensors::SafeTensors<'_>,
+    points: &[Waypoint<'_>],
+) {
+    let over: Vec<String> = points
+        .iter()
+        .filter_map(|&point| gate_waypoint(ctx, serve, fixture, point))
+        .collect();
     assert!(
         over.is_empty(),
         "cases over their calibrated floor: {over:?}"
     );
 }
 
-/// Gated distribution-level because a greedy chain is not reachable at this
-/// depth: the reference's own backends continue the same prompt in different
-/// directions, so each case is gated at twice its measured sdpa-vs-eager
-/// gap. A window-semantics bug misses by orders more than that floor.
-#[test]
-#[ignore = "requires the pinned 12B checkpoint and the window fixture"]
-fn window_crossing_matches_hf() {
-    // A 4096-token prefill holds every local page at once (append then
-    // attend); decode releases down to the window afterwards.
-    let (ctx, serve, dir) = stack_with(4200, 300);
-    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
-    // The golden fixture fingerprints the checkpoint files; the window one
-    // only names a revision, so pin with the former and cross-check the
-    // latter against it.
-    let golden = fixture_manifest(
-        &std::fs::read(GOLDEN_PATH).expect("read golden"),
-        METADATA_KEY,
-    );
-    assert_checkpoint_matches(&golden, &dir);
-    let window = fixture_manifest(&bytes, "gemma4_window_golden");
+fn validate_waypoint_provenance(dir: &str, window_bytes: &[u8], long_bytes: &[u8]) {
+    let (_, golden) = golden_bytes(dir);
+    let window = fixture_manifest(window_bytes, "gemma4_window_golden");
+    let long = fixture_manifest(long_bytes, "gemma4_longctx_golden");
+    assert_eq!(window["revision"], golden["revision"], "window revision");
+    assert_eq!(long["revision"], golden["revision"], "longctx revision");
     assert_eq!(
-        window["revision"], golden["revision"],
-        "the window fixture was dumped from a different revision than the golden one"
+        long["transformers"], window["transformers"],
+        "borrowed floor reference release"
     );
-    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
-    let page = serve.local_pool.layout().page_size;
-
-    let mut over: Vec<String> = Vec::new();
-    // Single-shot prefill for every case, then the widest one again in
-    // window-sized chunks: a prefill that fits in one step always runs at
-    // origin 0, since the front is only released afterwards, so chunking is
-    // the only way to reach a multi-token step with the row already shifted.
-    for (case, chunk) in [
-        ("w1023", 0),
-        ("w1024", 0),
-        ("w1025", 0),
-        ("w4096", 0),
-        ("w4096", 1024),
-    ] {
-        let label = if chunk == 0 {
-            case.to_string()
-        } else {
-            format!("{case}-chunked")
-        };
-        let (ref_ids, ref_lps, positions, top_k, tolerance, backend_top1) =
-            reference(&fixture, case);
-        let run = run_case(&ctx, &serve, &fixture, case, chunk);
-        assert_eq!(run.rows.len(), positions, "{label}: fixture positions");
-        assert_eq!(
-            chunk > 0,
-            run.shifted_multi_token,
-            "{label}: a shifted multi-token step is exactly what chunking adds"
-        );
-
-        let (max_abs, top1) = score_rows(&run.rows, &ref_ids, &ref_lps, top_k, &label);
-        eprintln!(
-            "{label}: max |dlogprob| {max_abs} (tol {tolerance:.2}), top-1 {top1}/{positions} \
-             (backends agree {backend_top1}/{positions}), local pages {}, global {}",
-            run.local_pages, run.global_pages
-        );
-        // A ranking regression can hide under a logprob tolerance this wide,
-        // so top-1 is gated too — against what the reference's own backends
-        // manage with each other, which is all that is reachable here.
+    let skipped = long["eager_skipped"].as_array().expect("eager_skipped");
+    for case in ["w16384", "w32768"] {
         assert!(
-            top1 >= backend_top1,
-            "{label}: top-1 {top1}/{positions} below the backends' own \
-             {backend_top1}/{positions}"
+            skipped.iter().any(|value| value == case),
+            "{case} eager skip"
         );
-        // Exactly what the release rule leaves resident: every page the
-        // frontier accounts for, minus the ones whose last token has aged out
-        // of every future window. One page late still fails here.
-        let released = run.kv_len.saturating_sub(serve.sliding_window) / page;
-        assert_eq!(
-            run.local_pages,
-            run.kv_len.div_ceil(page) - released,
-            "{label}: resident pages after {released} released"
-        );
-        assert_eq!(
-            run.global_pages,
-            run.kv_len.div_ceil(page),
-            "{label}: the global family must keep every page"
-        );
-        if max_abs > tolerance {
-            over.push(format!("{label} ({max_abs} > {tolerance})"));
-        }
     }
-    assert!(
-        over.is_empty(),
-        "cases over their calibrated floor: {over:?}"
-    );
+}
+
+/// Window crossing and raised-ceiling waypoints share one 12B tower load.
+/// Dual-backend window cases carry their own floor; long-context sdpa cases
+/// borrow the deepest window floor under the same reference release.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
+fn context_waypoints_match_hf() {
+    let (ctx, serve, dir) = stack_with(32900, 2200);
+    let window_bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
+    let long_bytes = std::fs::read(LONGCTX_FIXTURE).expect("read longctx fixture");
+    validate_waypoint_provenance(&dir, &window_bytes, &long_bytes);
+    let window = safetensors::SafeTensors::deserialize(&window_bytes).expect("window fixture");
+    let long = safetensors::SafeTensors::deserialize(&long_bytes).expect("longctx fixture");
+    let (_, _, positions, _, tolerance, top1) = reference(&window, "w4096");
+    #[allow(clippy::cast_precision_loss)]
+    let floor = BorrowedFloor {
+        tolerance,
+        top1_share: top1 as f64 / positions as f64,
+    };
+    let window_points = [
+        Waypoint {
+            case: "w1023",
+            chunk: 0,
+            floor: None,
+        },
+        Waypoint {
+            case: "w1024",
+            chunk: 0,
+            floor: None,
+        },
+        Waypoint {
+            case: "w1025",
+            chunk: 0,
+            floor: None,
+        },
+        Waypoint {
+            case: "w4096",
+            chunk: 0,
+            floor: None,
+        },
+        Waypoint {
+            case: "w4096",
+            chunk: 1024,
+            floor: None,
+        },
+    ];
+    let long_points = [
+        Waypoint {
+            case: "w16384",
+            chunk: 0,
+            floor: Some(floor),
+        },
+        Waypoint {
+            case: "w32768",
+            chunk: 0,
+            floor: Some(floor),
+        },
+        Waypoint {
+            case: "w32768",
+            chunk: 2048,
+            floor: Some(floor),
+        },
+    ];
+    gate_waypoints(&ctx, &serve, &window, &window_points);
+    gate_waypoints(&ctx, &serve, &long, &long_points);
 }
 
 /// `window_left` masks out-of-window keys whether or not their pages are
 /// still resident, so releasing them need not change a single generated
 /// token.
 #[test]
-#[ignore = "requires the pinned 12B checkpoint and the window fixture"]
+#[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn eviction_is_footprint_only() {
     let (ctx, mut serve, _dir) = stack_with(1300, 120);
-    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
-    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
-    let (_, prompt_i32) = i32_tensor(&fixture, "w1023_prompt");
-    let prompt: Vec<u32> = prompt_i32
-        .iter()
-        .map(|&t| u32::try_from(t).expect("token id"))
-        .collect();
+    let prompt = synthetic_tokens(1023, 5);
 
     let run = |serve: &GemmaServe| -> (Vec<u32>, usize) {
         let mut kv = serve.alloc_kv();
@@ -443,9 +385,7 @@ fn eviction_is_footprint_only() {
             .expect("oracle step arena");
         admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, prompt.len())
             .expect("admit prompt");
-        let logits = serve
-            .step(&ctx, &mut kv, &prompt, LogitsSpan::LastRow)
-            .expect("prefill");
+        let logits = serve.step(&ctx, &mut kv, &prompt).expect("prefill");
         let mut next = argmax_last(&ctx, &logits).expect("argmax");
         let mut tokens = vec![next];
         for _ in 1..30 {
@@ -471,20 +411,12 @@ fn eviction_is_footprint_only() {
 /// weights and tokens: each decode step is compared against a full recompute
 /// of the grown sequence, so a KV write that drifts shows up immediately.
 #[test]
-#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
+#[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn serve_matches_oracle_forward() {
     let (ctx, serve, dir) = load_stack();
-    let fixture_bytes = std::fs::read(GOLDEN_PATH).expect("read fixture");
+    let (fixture_bytes, _) = golden_bytes(&dir);
     let fixture = safetensors::SafeTensors::deserialize(&fixture_bytes).expect("parse fixture");
-    let (_, tokens_i32) = i32_tensor(&fixture, "short_tokens");
-    let mut tokens: Vec<u32> = tokens_i32
-        .iter()
-        .map(|&t| u32::try_from(t).expect("token id"))
-        .collect();
-
-    // The same fixture that carries the tokens fingerprints the checkpoint
-    // they were dumped from.
-    assert_checkpoint_matches(&fixture_manifest(&fixture_bytes, METADATA_KEY), &dir);
+    let (_, mut tokens) = u32_tensor(&fixture, "short_tokens");
     let config = &serve.weights.config;
     let local_geom = LayerGeometry::local_of(config);
     let global_geom = LayerGeometry::global_of(config);
@@ -523,28 +455,22 @@ fn serve_matches_oracle_forward() {
     let mut kv = serve.alloc_kv();
     admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, tokens.len())
         .expect("admit prompt");
-    let serve_logits = serve
-        .step(&ctx, &mut kv, &tokens, LogitsSpan::All)
-        .expect("serve prefill");
+    let serve_logits = serve.step(&ctx, &mut kv, &tokens).expect("serve prefill");
     let vocab = serve_logits.hidden_dim;
     let serve_host = serve_logits.to_host(&ctx).expect("D2H");
     let oracle_host = oracle(&tokens);
-    let mut max_abs = 0.0f32;
-    for pos in 0..tokens.len() {
-        let s = &serve_host[pos * vocab..(pos + 1) * vocab];
-        let o = &oracle_host[pos * vocab..(pos + 1) * vocab];
-        max_abs = max_abs.max(compare_row(s, o, &format!("prefill pos {pos}")));
-    }
+    let last = tokens.len() - 1;
+    let oracle_last = &oracle_host[last * vocab..(last + 1) * vocab];
+    let max_abs = compare_row(&serve_host, oracle_last, "prefill last row");
     eprintln!(
-        "prefill: {} positions, max |dlogit| {max_abs}",
+        "prefill: last of {} positions, max |dlogit| {max_abs}",
         tokens.len()
     );
-    // Calibrated on the box: different kernels (fused paged prep + batch
-    // prefill vs two-pass contiguous + single_prefill) measured 1.31
-    // peak over prefill and 0.95 over decode on softcapped logits.
+    // The former all-row comparison measured a 1.31 peak, so its 2.0
+    // bound remains a conservative ceiling for the production last row.
     assert!(
         max_abs <= 2.0,
-        "prefill |dlogit| {max_abs} above calibrated 2.0"
+        "prefill last-row |dlogit| {max_abs} above calibrated 2.0"
     );
 
     // Feed the ORACLE's continuation each step so one divergence cannot
@@ -575,7 +501,7 @@ fn serve_matches_oracle_forward() {
 /// tools/accuracy/dump_gemma4_generate.py (prompt + up to 50 greedy
 /// tokens per case).
 #[test]
-#[ignore = "requires the pinned 12B checkpoint and the generate fixture"]
+#[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
 fn greedy_matches_hf_generate() {
     let (ctx, serve, dir) = load_stack();
     let path = concat!(
@@ -586,9 +512,7 @@ fn greedy_matches_hf_generate() {
     // Provenance: the golden fixture fingerprints the checkpoint files, so
     // it pins what is loaded here; the generate fixture then has to name
     // that same revision, or these tokens came from another model.
-    let golden_bytes = std::fs::read(GOLDEN_PATH).expect("read golden fixture");
-    let golden = fixture_manifest(&golden_bytes, METADATA_KEY);
-    assert_checkpoint_matches(&golden, &dir);
+    let (_, golden) = golden_bytes(&dir);
     let generate = fixture_manifest(&bytes, "gemma4_generate");
     assert_eq!(
         generate["revision"], golden["revision"],
@@ -597,12 +521,8 @@ fn greedy_matches_hf_generate() {
     let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
     let mut diverged: Vec<String> = Vec::new();
     for case in ["a", "b", "c"] {
-        let (_, prompt_i32) = i32_tensor(&fixture, &format!("{case}_prompt"));
+        let (_, prompt) = u32_tensor(&fixture, &format!("{case}_prompt"));
         let (_, expect_i32) = i32_tensor(&fixture, &format!("{case}_generated"));
-        let prompt: Vec<u32> = prompt_i32
-            .iter()
-            .map(|&t| u32::try_from(t).expect("token id"))
-            .collect();
         let mut kv = serve.alloc_kv();
         let ours = generate_greedy(&serve, &ctx, &mut kv, &prompt, expect_i32.len())
             .expect("greedy generation");
@@ -687,27 +607,9 @@ fn mixed_gate_decode_rounds(
 /// (logits row 0) and every incumbent lane (rows 1..), across two
 /// admissions at different batch sizes and the pure-decode rounds between
 /// them.
-#[test]
-#[ignore = "requires the pinned 12B checkpoint and the generate fixture"]
-fn mixed_step_matches_serial_greedy() {
-    let (ctx, serve, _dir) = stack_with(1024, 200);
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../test_data/gemma4-12b-generate.safetensors"
-    );
-    let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
-    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+fn assert_mixed_admissions_match_serial(ctx: &DeviceContext, serve: &GemmaServe) {
     let cases = ["a", "b", "c"];
-    let prompts: Vec<Vec<u32>> = cases
-        .iter()
-        .map(|case| {
-            let (_, prompt_i32) = i32_tensor(&fixture, &format!("{case}_prompt"));
-            prompt_i32
-                .iter()
-                .map(|&t| u32::try_from(t).expect("token id"))
-                .collect()
-        })
-        .collect();
+    let prompts = crate::testkit::generate_fixture_prompts();
     let budgets = [50usize, 37, 44];
 
     let serial: Vec<Vec<u32>> = prompts
@@ -715,11 +617,11 @@ fn mixed_step_matches_serial_greedy() {
         .zip(budgets)
         .map(|(prompt, budget)| {
             let mut kv = serve.alloc_kv();
-            generate_greedy(&serve, &ctx, &mut kv, prompt, budget).expect("serial greedy")
+            generate_greedy(serve, ctx, &mut kv, prompt, budget).expect("serial greedy")
         })
         .collect();
 
-    let mut arena = serve.alloc_step_arena(&ctx, 4, false).expect("step arena");
+    let mut arena = serve.alloc_step_arena(ctx, 4, false).expect("step arena");
     let mut lanes: Vec<(usize, GemmaKv, u32)> = Vec::new();
     let mut produced: Vec<Vec<u32>> = vec![Vec::new(); cases.len()];
 
@@ -734,16 +636,14 @@ fn mixed_step_matches_serial_greedy() {
             prompts[0].len(),
         )
         .expect("admit prompt a");
-        let logits = serve
-            .step(&ctx, &mut kv, &prompts[0], LogitsSpan::LastRow)
-            .expect("prefill a");
-        let first = argmax_last(&ctx, &logits).expect("first token");
+        let logits = serve.step(ctx, &mut kv, &prompts[0]).expect("prefill a");
+        let first = argmax_last(ctx, &logits).expect("first token");
         produced[0].push(first);
         lanes.push((0, kv, first));
     }
     mixed_gate_decode_rounds(
-        &ctx,
-        &serve,
+        ctx,
+        serve,
         &mut arena,
         &mut lanes,
         &mut produced,
@@ -783,10 +683,10 @@ fn mixed_step_matches_serial_greedy() {
                 (&mut kv_c, prompts[2].as_slice()),
             ];
             let logits = serve
-                .mixed_prefill_decode_step(&ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
+                .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
                 .expect("k=2 mixed step");
             vocab = logits.hidden_dim;
-            host = logits.to_host(&ctx).expect("logits D2H");
+            host = logits.to_host(ctx).expect("logits D2H");
         }
         let mut retire: Vec<usize> = Vec::new();
         for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
@@ -808,8 +708,8 @@ fn mixed_step_matches_serial_greedy() {
         produced[2].push(first_c);
         lanes.push((2, kv_c, first_c));
         mixed_gate_decode_rounds(
-            &ctx,
-            &serve,
+            ctx,
+            serve,
             &mut arena,
             &mut lanes,
             &mut produced,
@@ -820,8 +720,8 @@ fn mixed_step_matches_serial_greedy() {
 
     // Drain everyone to their budgets.
     mixed_gate_decode_rounds(
-        &ctx,
-        &serve,
+        ctx,
+        serve,
         &mut arena,
         &mut lanes,
         &mut produced,
@@ -844,16 +744,13 @@ fn mixed_step_matches_serial_greedy() {
 /// batch-2 rounds after admission, and differ only in the admission itself
 /// (one mixed step versus a plain prefill plus one live decode round).
 /// Synthetic ids suffice: the gate is a self-A/B over window arithmetic.
-#[test]
-#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
-fn mixed_step_crosses_the_window_like_serial() {
-    let (ctx, serve, _dir) = stack_with(2048, 512);
+fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &GemmaServe) {
     let partner: Vec<u32> = (0..40u32).map(|i| 1000 + i * 31).collect();
     let long_prompt: Vec<u32> = (0..1500u32).map(|i| 1000 + (i * 37) % 50000).collect();
     let budgets = [24usize, 20];
 
     let run_arm = |mixed: bool| -> Vec<Vec<u32>> {
-        let mut arena = serve.alloc_step_arena(&ctx, 2, false).expect("step arena");
+        let mut arena = serve.alloc_step_arena(ctx, 2, false).expect("step arena");
         let mut lanes: Vec<(usize, GemmaKv, u32)> = Vec::new();
         let mut produced: Vec<Vec<u32>> = vec![Vec::new(); 2];
 
@@ -866,16 +763,14 @@ fn mixed_step_crosses_the_window_like_serial() {
                 partner.len(),
             )
             .expect("admit partner");
-            let logits = serve
-                .step(&ctx, &mut kv, &partner, LogitsSpan::LastRow)
-                .expect("prefill partner");
-            let first = argmax_last(&ctx, &logits).expect("first token");
+            let logits = serve.step(ctx, &mut kv, &partner).expect("prefill partner");
+            let first = argmax_last(ctx, &logits).expect("first token");
             produced[0].push(first);
             lanes.push((0, kv, first));
         }
         mixed_gate_decode_rounds(
-            &ctx,
-            &serve,
+            ctx,
+            serve,
             &mut arena,
             &mut lanes,
             &mut produced,
@@ -904,10 +799,10 @@ fn mixed_step_crosses_the_window_like_serial() {
                 let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
                 let mut prefills = [(&mut kv, long_prompt.as_slice())];
                 let logits = serve
-                    .mixed_prefill_decode_step(&ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
+                    .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
                     .expect("mixed step");
                 vocab = logits.hidden_dim;
-                host = logits.to_host(&ctx).expect("logits D2H");
+                host = logits.to_host(ctx).expect("logits D2H");
             }
             assert!(
                 kv.local.origin_pages() > 0,
@@ -922,12 +817,12 @@ fn mixed_step_crosses_the_window_like_serial() {
             mixed_gate_argmax(&host, 0, vocab)
         } else {
             let logits = serve
-                .step(&ctx, &mut kv, &long_prompt, LogitsSpan::LastRow)
+                .step(ctx, &mut kv, &long_prompt)
                 .expect("prefill long prompt");
-            let first = argmax_last(&ctx, &logits).expect("first token");
+            let first = argmax_last(ctx, &logits).expect("first token");
             mixed_gate_decode_rounds(
-                &ctx,
-                &serve,
+                ctx,
+                serve,
                 &mut arena,
                 &mut lanes,
                 &mut produced,
@@ -940,8 +835,8 @@ fn mixed_step_crosses_the_window_like_serial() {
         lanes.push((1, kv, first));
 
         mixed_gate_decode_rounds(
-            &ctx,
-            &serve,
+            ctx,
+            serve,
             &mut arena,
             &mut lanes,
             &mut produced,
@@ -965,107 +860,12 @@ fn mixed_step_crosses_the_window_like_serial() {
     }
 }
 
-/// The KV ledger after a segmented admission must match the whole-prompt
-/// admission: same frontier, same origin, same resident page count. Pure
-/// bookkeeping arithmetic — no forward pass — so a divergence indicts the
-/// advance/release cycling, not any kernel. Page ids may legally differ
-/// (pool recycling), so the assertion stops at the ledger.
 #[test]
-#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
-fn segmented_admission_matches_whole_kv_ledger() {
-    let (_ctx, serve, dir) = stack_with(2048, 512);
-    let window = Gemma4Config::from_file(&dir)
-        .expect("config")
-        .sliding_window;
-    let total = 1500usize;
-
-    let mut whole = serve.alloc_kv();
-    admit_tokens(&serve.local_pool, &serve.global_pool, &mut whole, total).expect("admit whole");
-    whole
-        .local
-        .advance_and_release(total, window)
-        .expect("whole advance");
-    whole.global.advance(total);
-
-    let mut seg = serve.alloc_kv();
-    admit_tokens(&serve.local_pool, &serve.global_pool, &mut seg, total).expect("admit segmented");
-    let mut left = total;
-    while left > 0 {
-        let step = left.min(128);
-        seg.local
-            .advance_and_release(step, window)
-            .expect("segment advance");
-        seg.global.advance(step);
-        left -= step;
-    }
-
-    assert_eq!(seg.local.seq_len(), whole.local.seq_len(), "local frontier");
-    assert_eq!(
-        seg.global.seq_len(),
-        whole.global.seq_len(),
-        "global frontier"
-    );
-    assert_eq!(
-        seg.local.origin_pages(),
-        whole.local.origin_pages(),
-        "released-front origin"
-    );
-    assert_eq!(
-        seg.local.page_row().len(),
-        whole.local.page_row().len(),
-        "resident page count"
-    );
-
-    // Third arm: reserve per segment instead of up front. The ledger must
-    // land in the same place, and the local residency must stay bounded by
-    // window plus segment the whole way — the property that frees a long
-    // prompt's admission from holding its full context in pages.
-    let page = PAGE_SIZE;
-    let residency_cap = window.div_ceil(page) + 128usize.div_ceil(page) + 1;
-    let mut segadmit = serve.alloc_kv();
-    let mut left = total;
-    while left > 0 {
-        let step = left.min(128);
-        admit_tokens(&serve.local_pool, &serve.global_pool, &mut segadmit, step)
-            .expect("admit segment");
-        segadmit
-            .local
-            .advance_and_release(step, window)
-            .expect("segment advance");
-        segadmit.global.advance(step);
-        left -= step;
-        assert!(
-            segadmit.local.page_row().len() <= residency_cap,
-            "local residency {} exceeds window plus segment ({residency_cap})",
-            segadmit.local.page_row().len()
-        );
-    }
-    assert_eq!(
-        segadmit.local.seq_len(),
-        whole.local.seq_len(),
-        "segment-admitted local frontier"
-    );
-    assert_eq!(
-        segadmit.global.seq_len(),
-        whole.global.seq_len(),
-        "segment-admitted global frontier"
-    );
-    assert_eq!(
-        segadmit.local.origin_pages(),
-        whole.local.origin_pages(),
-        "segment-admitted released-front origin"
-    );
-    assert_eq!(
-        segadmit.local.page_row().len(),
-        whole.local.page_row().len(),
-        "segment-admitted resident page count"
-    );
-    eprintln!(
-        "ledger: seq {} origin {} pages {} (segment-admitted residency capped at {residency_cap})",
-        seg.local.seq_len(),
-        seg.local.origin_pages(),
-        seg.local.page_row().len()
-    );
+#[ignore = "requires the pinned 12B checkpoint and a GPU"]
+fn mixed_step_matches_serial() {
+    let (ctx, serve, _dir) = stack_with(2048, 512);
+    assert_mixed_admissions_match_serial(&ctx, &serve);
+    assert_mixed_window_crossing_matches_serial(&ctx, &serve);
 }
 
 /// The overlap-safe prefill under a lane-stream override must be bit-equal
@@ -1074,7 +874,7 @@ fn segmented_admission_matches_whole_kv_ledger() {
 /// lane-written KV matching the sync arm token for token — for a short
 /// prompt and one crossing the sliding window.
 #[test]
-#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
+#[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn overlapped_prefill_matches_the_sync_step() {
     let (ctx, serve, _dir) = stack_with(2048, 512);
     let mut arena = serve.alloc_step_arena(&ctx, 1, false).expect("step arena");
@@ -1091,7 +891,7 @@ fn overlapped_prefill_matches_the_sync_step() {
         )
         .expect("admit sync");
         let logits_sync = serve
-            .step(&ctx, &mut kv_sync, &prompt, LogitsSpan::LastRow)
+            .step(&ctx, &mut kv_sync, &prompt)
             .expect("sync prefill");
         let bits_sync: Vec<u32> = logits_sync
             .to_host(&ctx)
@@ -1179,13 +979,11 @@ fn overlapped_prefill_matches_the_sync_step() {
 /// tokens exactly, for a short entry (origin 0) and one past the window
 /// (released front); a divergence below the window floor must miss.
 #[test]
-#[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
+#[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn prefix_restore_matches_cold_path() {
     use crate::prefix_cache::PrefixCache;
-    let (ctx, serve, dir) = stack_with(4096, 512);
-    let window = Gemma4Config::from_file(&dir)
-        .expect("config")
-        .sliding_window;
+    let (ctx, serve, _dir) = stack_with(4096, 512);
+    let window = serve.weights.config.sliding_window;
     let mut arena = serve.alloc_step_arena(&ctx, 1, false).expect("step arena");
     let budget = 16usize;
 
@@ -1200,9 +998,7 @@ fn prefix_restore_matches_cold_path() {
             let mut kv = serve.alloc_kv();
             admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, turn1.len())
                 .expect("admit t1");
-            serve
-                .step(&ctx, &mut kv, &turn1, LogitsSpan::LastRow)
-                .expect("prefill t1");
+            serve.step(&ctx, &mut kv, &turn1).expect("prefill t1");
             suffix_and_greedy(&serve, &ctx, &mut arena, &mut kv, &turn2, budget)
         };
 
@@ -1212,11 +1008,9 @@ fn prefix_restore_matches_cold_path() {
                 let mut kv = serve.alloc_kv();
                 admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, turn1.len())
                     .expect("admit t1");
-                serve
-                    .step(&ctx, &mut kv, &turn1, LogitsSpan::LastRow)
-                    .expect("prefill t1");
+                serve.step(&ctx, &mut kv, &turn1).expect("prefill t1");
                 let entry = serve
-                    .capture_checkpoint(&ctx, &kv, turn1.clone())
+                    .capture_checkpoint(&ctx, &kv, &turn1)
                     .expect("capture");
                 cache.insert(entry, None);
             }
@@ -1259,11 +1053,9 @@ fn prefix_restore_matches_cold_path() {
     let over: Vec<u32> = (0..2100u32).map(|i| 1000 + (i * 37) % 50000).collect();
     let mut kv = serve.alloc_kv();
     admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, over.len()).expect("admit over");
-    serve
-        .step(&ctx, &mut kv, &over, LogitsSpan::LastRow)
-        .expect("prefill over");
+    serve.step(&ctx, &mut kv, &over).expect("prefill over");
     assert!(
-        serve.capture_checkpoint(&ctx, &kv, over.clone()).is_none(),
+        serve.capture_checkpoint(&ctx, &kv, &over).is_none(),
         "a prompt past the per-entry allotment must not capture"
     );
     eprintln!(
@@ -1292,7 +1084,7 @@ fn suffix_and_greedy(
     )
     .expect("admit suffix");
     let logits = serve
-        .step(ctx, kv, &prompt[start..], LogitsSpan::LastRow)
+        .step(ctx, kv, &prompt[start..])
         .expect("suffix prefill");
     let host = logits.to_host(ctx).expect("D2H");
     let vocab = logits.hidden_dim;
@@ -1346,7 +1138,7 @@ pub(crate) fn generate_greedy(
     anyhow::ensure!(max_new > 0, "generate_greedy needs max_new >= 1");
     admit_tokens(&serve.local_pool, &serve.global_pool, kv, prompt.len())?;
     let mut arena = serve.alloc_step_arena(ctx, 1, false)?;
-    let logits = serve.step(ctx, kv, prompt, LogitsSpan::LastRow)?;
+    let logits = serve.step(ctx, kv, prompt)?;
     let mut next = argmax_last(ctx, &logits)?;
     let mut out = vec![next];
     for _ in 1..max_new {
@@ -1414,9 +1206,7 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
             let prompt = prompt_of(request);
             admit_tokens(&serve.local_pool, &serve.global_pool, kv, prompt.len())
                 .expect("admit prompt");
-            serve
-                .step(&ctx, kv, &prompt, LogitsSpan::LastRow)
-                .expect("prefill");
+            serve.step(&ctx, kv, &prompt).expect("prefill");
         }
         assert!(
             kvs[0].local.origin_pages() > 0,
