@@ -340,6 +340,7 @@ pub(crate) struct Qwen3Model {
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
     pub(super) tensor_parallel: TensorParallelConfig,
+    pub(super) decode_projection_path: crate::projection_fusion::DecodeProjectionPath,
     tp_comm: Option<Comm>,
     lora_adapters: HashMap<String, DeviceLoraAdapter>,
     packed_lora: PackedLoraRegistry,
@@ -384,6 +385,10 @@ impl Qwen3Model {
 
     pub(crate) fn local_kv_dim(&self) -> usize {
         self.config.local_kv_dim(self.tensor_parallel)
+    }
+
+    pub(crate) const fn fused_decode_qkv(&self) -> bool {
+        self.decode_projection_path.fuses_qkv()
     }
 
     pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
@@ -726,6 +731,7 @@ impl Qwen3Model {
             0,
             self.local_num_attention_heads(),
             self.config.max_position_embeddings,
+            self.fused_decode_qkv(),
         )
         .context("Qwen3 memory profile decode buffer alloc failed")?;
         record_peak()?;
