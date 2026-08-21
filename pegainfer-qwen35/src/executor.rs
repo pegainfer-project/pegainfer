@@ -14,9 +14,9 @@ use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::decode_buffers::BatchDecodeBuffers35;
-use crate::logprobs::snapshot_requested_logprobs;
 #[cfg(feature = "gdn-validation")]
-use crate::prefill::GdnPrefillRuntimeEvidence;
+use crate::gdn_validation::GdnPrefillRuntimeEvidence;
+use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 

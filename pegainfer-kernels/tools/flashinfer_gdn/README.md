@@ -101,10 +101,13 @@ env \
   PEGAINFER_QWEN35_GDN_AOT_BUNDLE="$PWD/target/flashinfer-gdn-sm120/qwen35_4b_candidate" \
   PEGAINFER_TEST_MODEL_PATH="$PWD/models/Qwen3.5-4B" \
   PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
-  PEGAINFER_GDN_EXPECT_BRANCH=test/qwen35-gdn-production-gates \
   CARGO_TARGET_DIR="$PWD/target/gdn-production-gates" \
   pegainfer-qwen35/tools/run_gdn_production_gates.sh
 ```
+
+Set the optional `PEGAINFER_GDN_EXPECT_BRANCH` when the run must be pinned to a
+specific local review branch. The runner rejects a mismatch rather than
+silently validating another checkout.
 
 When `PEGAINFER_QWEN35_GDN_AOT_BUNDLE` is set, `pegainfer-kernels/build.rs`
 rechecks schema, SM, geometry, ABI, object/header/runtime hashes and sizes. A
@@ -117,6 +120,11 @@ explicit Triton capability fallback. The supported SM120/Hv32/single-GPU
 configuration instead fails model startup with a missing-AOT error; it does not
 silently change backend. The model crate never receives the bundle path and
 sees only a semantic GDN operation.
+
+CUDA Graph and successful-GDN-launch evidence used by the five-gate runner is
+compiled only with the non-default `pegainfer-qwen35/gdn-validation` feature.
+Default serving objects contain neither those counters nor their public
+validation API.
 
 Generated headers, objects, static archives, bundles, model weights, `target/`,
 logs, and benchmark JSON are release/build artifacts and must not be committed.
