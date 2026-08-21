@@ -106,9 +106,9 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 status ledger: correctness, direct attribution, lifecycle reliability, and the #466 six-child host-staged/NCCL HTTP SLO report remain separate evidence buckets; no soak, parity, or production claim. |
-| `models/deepseek-v2-lite/benchmarking.md` | Verification ladder and commands for DSV2-Lite correctness, direct decode diagnostics, retained host-staged/NCCL HTTP SLO profiles, and the separate soak/production boundary. |
-| `models/deepseek-v2-lite/roadmap.md` | Single-node EP2 roadmap: #466 retained SLO reporting is an evidence layer; soak, device KV/attention, long-prefill scheduling, and Stable promotion remain separate gates. |
+| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 status ledger: correctness, direct attribution, lifecycle reliability, #466 HTTP SLO reports, and #465 host-staged/NCCL soak evidence remain separate buckets; no parity or production claim. |
+| `models/deepseek-v2-lite/benchmarking.md` | Verification ladder and commands for DSV2-Lite correctness, direct decode diagnostics, retained host-staged/NCCL HTTP SLO profiles, and #465 sustained soak evidence. |
+| `models/deepseek-v2-lite/roadmap.md` | Single-node EP2 roadmap: #466 SLO and #465 short-shape soak are retained evidence layers; device KV/attention, long-prefill scheduling, hard budgets, and Stable promotion remain separate gates. |
 | `models/deepseek-v2-lite/benchmark-artifact-manifest.md` | Issue #467 implemented: the retained DeepSeek-V2-Lite benchmark matrix emits `artifact_manifest.json` and `regression_summary.json`, with CPU-only summarize-only tests. |
 | `models/deepseek-v2-lite/hf-accuracy-gate.md` | DeepSeek-V2-Lite EP2 HF accuracy gate after PR #149/#150/#274: HF `generate(use_cache=true)`, host-staged EP2, and NCCL EP2 are compared across the committed small case set. |
 | `models/deepseek-v2-lite/decode-attribution-gate.md` | Direct diagnostic benchmark for DeepSeek-V2-Lite EP2 `Hello`/16-token batch sizes 1/4/8: structured timing/counters and graph probes with no HTTP SLO or production claim. |
