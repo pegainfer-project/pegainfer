@@ -416,29 +416,18 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_geometry_is_explicit() {
-        let hv48 = Qwen35GdnGeometry {
-            h_v: 48,
-            ..Qwen35GdnGeometry::PRODUCTION
-        };
-        assert_eq!(
-            qwen35_gdn_capability(120, hv48),
-            Qwen35GdnSupport::UnsupportedGeometry
-        );
-        assert_eq!(
-            qwen35_gdn_capability(90, Qwen35GdnGeometry::PRODUCTION),
-            Qwen35GdnSupport::UnsupportedSm
-        );
-        assert_eq!(
-            qwen35_gdn_capability(120, Qwen35GdnGeometry::PRODUCTION),
-            Qwen35GdnSupport::Supported
-        );
-    }
-
-    #[test]
     #[ignore = "requires an SM120 GPU and a build-linked validated FlashInfer GDN AOT bundle"]
     fn sm120_stable_abi_alias_and_separate_state_are_bitwise_identical() -> Result<()> {
         let ctx = DeviceContext::new()?;
+        let unsupported = Qwen35GdnGeometry {
+            h_v: 48,
+            ..Qwen35GdnGeometry::PRODUCTION
+        };
+        ensure!(
+            Qwen35GdnAot::load_for_production(&ctx, unsupported)?.is_none(),
+            "production load boundary accepted unsupported Hv48 geometry on SM120"
+        );
+
         let geometry = Qwen35GdnGeometry::PRODUCTION;
         let backend = Qwen35GdnAot::load_for_production(&ctx, geometry)?
             .context("validated FlashInfer GDN AOT bundle is not available on SM120")?;

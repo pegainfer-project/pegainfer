@@ -15,6 +15,7 @@ use pegainfer_frontend::sampler::SamplingParams;
 use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::decode_buffers::BatchDecodeBuffers35;
 use crate::logprobs::snapshot_requested_logprobs;
+#[cfg(feature = "gdn-validation")]
 use crate::prefill::GdnPrefillRuntimeEvidence;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
@@ -126,6 +127,7 @@ impl Qwen35Executor {
 
     /// Return production backend identity and launch proof when Auto selected
     /// the build-linked FlashInfer specialization.
+    #[cfg(feature = "gdn-validation")]
     pub fn flashinfer_gdn_runtime_evidence(&self) -> Result<Option<GdnPrefillRuntimeEvidence>> {
         self.model
             .flashinfer_gdn_runtime_evidence()
@@ -319,6 +321,7 @@ impl Qwen35Executor {
                     })?;
             }
             self.graph_state.slot_states[idx].seq_len = self.graph_state.slot_states[last].seq_len;
+            #[cfg(feature = "gdn-validation")]
             self.graph_state.record_slot_compaction();
             self.active[idx].graph_slot_idx = idx;
         }

@@ -1,7 +1,10 @@
 //! CUDA Graph state for Qwen3.5 batched decode with bucket padding.
 
+#[cfg(feature = "gdn-validation")]
 use std::sync::Arc;
+#[cfg(feature = "gdn-validation")]
 use std::sync::atomic::AtomicU64;
+#[cfg(feature = "gdn-validation")]
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
@@ -21,6 +24,7 @@ pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 /// Maximum supported batch size (= largest bucket).
 pub(crate) const MAX_BATCH: usize = 64;
 
+#[cfg(feature = "gdn-validation")]
 #[derive(Debug, Default)]
 struct DecodeGraphEvidenceCounters {
     captures: AtomicU64,
@@ -31,11 +35,17 @@ struct DecodeGraphEvidenceCounters {
     slot_compactions: AtomicU64,
 }
 
+#[cfg(feature = "gdn-validation")]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecodeGraphEvidenceHandle {
     counters: Arc<DecodeGraphEvidenceCounters>,
 }
 
+#[cfg(not(feature = "gdn-validation"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DecodeGraphEvidenceHandle;
+
+#[cfg(feature = "gdn-validation")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DecodeGraphEvidenceSnapshot {
     pub(crate) captures: u64,
@@ -46,6 +56,7 @@ pub(crate) struct DecodeGraphEvidenceSnapshot {
     pub(crate) slot_compactions: u64,
 }
 
+#[cfg(feature = "gdn-validation")]
 impl DecodeGraphEvidenceHandle {
     pub(crate) fn snapshot(&self) -> DecodeGraphEvidenceSnapshot {
         DecodeGraphEvidenceSnapshot {
@@ -193,6 +204,7 @@ impl BatchDecodeGraphState {
         slot_idx: usize,
     ) -> Result<()> {
         let dst = &mut self.slot_states[slot_idx];
+        #[cfg(feature = "gdn-validation")]
         let reused = dst.seq_len != 0;
         for (dst_layer, src_layer) in dst.layers.iter_mut().zip(src.layers.iter()) {
             ctx.stream
@@ -203,10 +215,12 @@ impl BatchDecodeGraphState {
                 .map_err(|e| anyhow::anyhow!("copy conv state to slot {slot_idx}: {e}"))?;
         }
         dst.seq_len = src.seq_len;
+        #[cfg(feature = "gdn-validation")]
         self.evidence.record_state_slot_copy(reused);
         Ok(())
     }
 
+    #[cfg(feature = "gdn-validation")]
     pub(crate) fn record_slot_compaction(&self) {
         self.evidence.record_slot_compaction();
     }
