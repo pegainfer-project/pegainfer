@@ -23,11 +23,8 @@ static int cublas_status_to_error(cublasStatus_t status) {
 // CUDA context/device without racing on a process-global singleton.
 thread_local cublasHandle_t g_cublas_handle = nullptr;
 thread_local cublasHandle_t g_cublas_prefill_handle = nullptr;
-thread_local void *g_cublas_workspace = nullptr;
 thread_local std::map<int, cublasHandle_t> g_cublas_handles_by_device;
 thread_local std::map<int, cublasHandle_t> g_cublas_prefill_handles_by_device;
-thread_local std::map<int, void *> g_cublas_workspaces_by_device;
-static const size_t CUBLAS_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
 
 // cublasLt path for small-N decode GEMMs. cuBLAS's default heuristic leaves
 // 4-6% bandwidth on the table for these shapes; gemm_lt_tune_cuda times every
@@ -227,16 +224,11 @@ void cublas_init() {
   auto prefill_it = g_cublas_prefill_handles_by_device.find(device);
   if (prefill_it == g_cublas_prefill_handles_by_device.end()) {
     cublasHandle_t handle = nullptr;
-    void *workspace = nullptr;
     cublasCreate(&handle);
     cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
-    cudaMalloc(&workspace, CUBLAS_WORKSPACE_SIZE);
-    cublasSetWorkspace(handle, workspace, CUBLAS_WORKSPACE_SIZE);
     prefill_it = g_cublas_prefill_handles_by_device.emplace(device, handle).first;
-    g_cublas_workspaces_by_device.emplace(device, workspace);
   }
   g_cublas_prefill_handle = prefill_it->second;
-  g_cublas_workspace = g_cublas_workspaces_by_device[device];
 }
 
 int cublas_activate_device_handles() {
@@ -248,16 +240,13 @@ int cublas_activate_device_handles() {
 
   auto handle_it = g_cublas_handles_by_device.find(device);
   auto prefill_it = g_cublas_prefill_handles_by_device.find(device);
-  auto workspace_it = g_cublas_workspaces_by_device.find(device);
   if (handle_it == g_cublas_handles_by_device.end() ||
-      prefill_it == g_cublas_prefill_handles_by_device.end() ||
-      workspace_it == g_cublas_workspaces_by_device.end()) {
+      prefill_it == g_cublas_prefill_handles_by_device.end()) {
     return static_cast<int>(cudaErrorInvalidResourceHandle);
   }
 
   g_cublas_handle = handle_it->second;
   g_cublas_prefill_handle = prefill_it->second;
-  g_cublas_workspace = workspace_it->second;
   return static_cast<int>(cudaSuccess);
 }
 
@@ -274,15 +263,8 @@ void cublas_destroy() {
     }
   }
   g_cublas_prefill_handles_by_device.clear();
-  for (auto &entry : g_cublas_workspaces_by_device) {
-    if (entry.second != nullptr) {
-      cudaFree(entry.second);
-    }
-  }
-  g_cublas_workspaces_by_device.clear();
   g_cublas_handle = nullptr;
   g_cublas_prefill_handle = nullptr;
-  g_cublas_workspace = nullptr;
   for (auto &entry : g_lt_plans) {
     lt_plan_destroy(entry.second);
   }
@@ -308,7 +290,7 @@ void cublas_destroy() {
 
 // General GEMM: Y = W @ X where W is [M, K] row-major, X is [K, N] col-major, Y is [M, N] col-major
 // N=1 is equivalent to GEMV. N>1 enables batched prefill.
-// Uses prefill handle (with workspace) — only called from prefill path, never under CUDA Graphs.
+// Uses the prefill handle — only called from prefill path, never under CUDA Graphs.
 int gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,
               int M, int N, int K, cudaStream_t stream) {
   if (g_cublas_prefill_handle == nullptr) {

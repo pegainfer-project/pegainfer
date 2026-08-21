@@ -19,11 +19,13 @@ use crate::ffi;
 
 thread_local! {
     static STREAM_OVERRIDE: Cell<Option<CUstream>> = const { Cell::new(None) };
+    static PREFILL_STREAM_OVERRIDE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Scoped stream override for [`active_cu_stream`]; drop restores the previous value.
 pub struct StreamOverrideGuard {
     previous: Option<CUstream>,
+    previous_prefill: bool,
 }
 
 impl StreamOverrideGuard {
@@ -31,20 +33,41 @@ impl StreamOverrideGuard {
     /// The stream must be valid for the guard's lifetime and belong to the
     /// same CUDA device as the `DeviceContext`.
     pub unsafe fn activate(stream: CUstream) -> Self {
+        Self::activate_inner(stream, false)
+    }
+
+    /// # Safety
+    /// The stream must be valid for the guard's lifetime and belong to the
+    /// same CUDA device as the `DeviceContext`.
+    pub unsafe fn activate_prefill(stream: CUstream) -> Self {
+        Self::activate_inner(stream, true)
+    }
+
+    fn activate_inner(stream: CUstream, prefill: bool) -> Self {
         let previous = STREAM_OVERRIDE.with(|c| c.replace(Some(stream)));
-        Self { previous }
+        let previous_prefill = PREFILL_STREAM_OVERRIDE.with(|c| c.replace(prefill));
+        Self {
+            previous,
+            previous_prefill,
+        }
     }
 }
 
 impl Drop for StreamOverrideGuard {
     fn drop(&mut self) {
         STREAM_OVERRIDE.with(|c| c.set(self.previous));
+        PREFILL_STREAM_OVERRIDE.with(|c| c.set(self.previous_prefill));
     }
 }
 
 /// Returns true if a stream override is currently active on this thread.
 pub fn has_stream_override() -> bool {
     STREAM_OVERRIDE.with(|c| c.get().is_some())
+}
+
+/// Returns true while split-concurrent prefill owns the stream override.
+pub fn has_prefill_stream_override() -> bool {
+    PREFILL_STREAM_OVERRIDE.with(Cell::get)
 }
 
 /// Returns the effective CUDA stream: the thread-local override if set,
@@ -664,14 +687,19 @@ mod tests {
     fn stream_override_guard_restores_on_drop() {
         let outer = 0x10usize as CUstream;
         assert!(!has_stream_override());
+        assert!(!has_prefill_stream_override());
         {
-            let _outer_guard = unsafe { StreamOverrideGuard::activate(outer) };
+            let _outer_guard = unsafe { StreamOverrideGuard::activate_prefill(outer) };
+            assert!(has_prefill_stream_override());
             {
                 let _inner_guard = unsafe { StreamOverrideGuard::activate(0x20usize as CUstream) };
+                assert!(!has_prefill_stream_override());
             }
             assert_eq!(STREAM_OVERRIDE.with(Cell::get), Some(outer));
+            assert!(has_prefill_stream_override());
         }
         assert!(!has_stream_override());
+        assert!(!has_prefill_stream_override());
     }
 
     fn copy_matrix_to_host(ctx: &DeviceContext, matrix: &DeviceMatrix) -> Vec<bf16> {

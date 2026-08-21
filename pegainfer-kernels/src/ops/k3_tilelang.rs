@@ -1,12 +1,15 @@
 //! K3 TileLang batched decode kernels: safe wrappers over the AOT dispatch
 //! launchers in `ffi::k3_tilelang`.
 //!
-//! The set covers one whole K3 decode step that is not a GEMM — norms and the
-//! bf16 landings of the framework GEMMs, the KDA convolution and delta rule,
-//! MLA attention, the MoE router and expert combine, the situ activation and
-//! the attention-residual mix. Dense projections are served by cuBLASLt and
-//! the routed experts by the DeepGEMM masked grouped-GEMM chain, so no GEMV
-//! lives here. The wrappers keep the certified kernels' operand names, so an
+//! The set covers one whole K3 decode step that is not a GEMM or attention —
+//! norms and the bf16 landings of the framework GEMMs, the KDA convolution and
+//! delta rule, the expert combine, the situ activation and the
+//! attention-residual mix. Dense projections are served by cuBLASLt, the
+//! routed experts by the DeepGEMM masked grouped-GEMM chain, MLA decode by
+//! the hand-written absorbed paged kernel (`ops::k3::mla_paged`), and the MoE
+//! router top-k by the hand-written parallel-argmax kernel
+//! (`ops::k3::router_topk`), so neither a GEMV nor an attention family lives
+//! here. The wrappers keep the certified kernels' operand names, so an
 //! executor written against them reads like the Python engine's launch
 //! sequence.
 //!
@@ -40,6 +43,17 @@ use crate::tensor::DeviceContext;
 
 /// Batch buckets the generator instantiates, ascending.
 pub const K3_BATCH_BUCKETS: [usize; 10] = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128];
+
+/// Prefill chunk buckets: the chunked-prefill step runs the same batched
+/// families at chunk width, whose ceiling is the MegaMoE protocol maximum
+/// (4224 rows). Compiled for every family except `kda_core` — chunks cross
+/// the KDA recurrence through FlashKDA, so the fused core never sees a
+/// chunk-sized bucket.
+pub const K3_PREFILL_BUCKETS: [usize; 5] = [256, 512, 1024, 2048, 4224];
+
+/// The largest prefill chunk any configuration can run — the MegaMoE
+/// protocol maximum (`k3_mega_max_tokens_per_rank`).
+pub const K3_MAX_CHUNK: usize = 4224;
 /// Largest bucket, i.e. the row capacity every reusable buffer should have.
 pub const K3_MAX_BATCH: usize = 128;
 
@@ -64,14 +78,13 @@ pub const K3_KDA_DIM: usize = K3_KDA_HEADS * K3_KDA_HEAD_DIM;
 /// Short-convolution window; the carried state is `K3_CONV_WIDTH - 1` slots.
 pub const K3_CONV_WIDTH: usize = 4;
 
-/// MLA head count and the query/key and value widths per head.
+/// MLA head count and the query/key and value widths per head. MLA decode
+/// itself is not a TileLang family — it is the hand-written absorbed paged
+/// kernel in `ops::k3::mla_paged` — but its head geometry is shared with the
+/// landings here.
 pub const K3_MLA_HEADS: usize = 96;
 pub const K3_QK_DIM: usize = 192;
 pub const K3_V_DIM: usize = 128;
-/// Cache capacities `k3_mla_attn_batched` is instantiated for. Both the
-/// instantiation count and the per-block shared memory scale with the
-/// capacity, so extending this list is a deliberate generator change.
-pub const K3_MAX_CTX: [usize; 1] = [128];
 
 /// Round a live row count up to the bucket that will run it.
 ///
@@ -85,11 +98,25 @@ pub fn k3_batch_bucket(rows: usize) -> Result<usize> {
         .ok_or_else(|| anyhow!("K3 decode batch {rows} exceeds the largest bucket {K3_MAX_BATCH}"))
 }
 
+/// Round a prefill chunk's token count up to its compiled bucket — the decode
+/// ladder extended by [`K3_PREFILL_BUCKETS`] up to the [`K3_MAX_CHUNK`]
+/// protocol ceiling.
+pub fn k3_chunk_bucket(rows: usize) -> Result<usize> {
+    ensure!(rows > 0, "K3 chunk needs at least one row");
+    K3_BATCH_BUCKETS
+        .into_iter()
+        .chain(K3_PREFILL_BUCKETS)
+        .find(|bucket| *bucket >= rows)
+        .ok_or_else(|| {
+            anyhow!("K3 chunk of {rows} tokens exceeds the largest bucket {K3_MAX_CHUNK}")
+        })
+}
+
 fn check_bucket(b: usize) -> Result<()> {
     ensure!(
-        K3_BATCH_BUCKETS.contains(&b),
-        "K3 batch {b} is not a compiled bucket; round with k3_batch_bucket \
-         (buckets: {K3_BATCH_BUCKETS:?})"
+        K3_BATCH_BUCKETS.contains(&b) || K3_PREFILL_BUCKETS.contains(&b),
+        "K3 batch {b} is not a compiled bucket; round with k3_batch_bucket / k3_chunk_bucket \
+         (buckets: {K3_BATCH_BUCKETS:?} + {K3_PREFILL_BUCKETS:?})"
     );
     Ok(())
 }
@@ -512,130 +539,50 @@ pub fn k3_kda_core_batched_launch(
     )
 }
 
-/// NoPE full-context MLA decode over a slot-indexed cache.
-///
-/// Each row owns a fixed `max_ctx` window, so `kc`/`vc` are dense per row and
-/// there is no block table. `n` is the per-row context length *on the device*;
-/// slots at or past it score negative infinity, so the step needs no host
-/// sync and a row at length `l` is bit-identical to the single-row kernel run
-/// at `l`. `sc` is the shared bf16 softmax scale.
-#[allow(clippy::too_many_arguments)]
-pub fn k3_mla_attn_batched_launch(
+/// `kda_core`'s tail on its own: per (row, head) the f32 rms_norm of the bf16
+/// attention landing `x` times the o_norm gamma `go [head_dim]`, landed once,
+/// times the bf16 sigmoid of the output gate `g2` — word-for-word the batched
+/// kernel's last loop. Chunked prefill computes the attention through FlashKDA
+/// and finishes its rows here.
+pub fn k3_o_norm_gate_batched_launch(
     ctx: &DeviceContext,
     b: usize,
     num_heads: usize,
-    qk_dim: usize,
-    v_dim: usize,
-    max_ctx: usize,
-    q: &CudaSlice<bf16>,
-    kc: &CudaSlice<bf16>,
-    vc: &CudaSlice<bf16>,
-    n: &CudaSlice<i32>,
-    sc: &CudaSlice<bf16>,
-    o: &mut CudaSlice<bf16>,
+    head_dim: usize,
+    x: &CudaSlice<bf16>,
+    g2: &CudaSlice<bf16>,
+    go: &CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     check_bucket(b)?;
+    let kp = num_heads * head_dim;
     ensure!(
-        q.len() >= b * num_heads * qk_dim
-            && kc.len() >= b * max_ctx * num_heads * qk_dim
-            && vc.len() >= b * max_ctx * num_heads * v_dim
-            && n.len() >= b
-            && !sc.is_empty()
-            && o.len() >= b * num_heads * v_dim,
-        "K3 mla_attn buffers too small for b={b}, heads={num_heads}, max_ctx={max_ctx}: \
-         q {}, kc {}, vc {}, n {}, sc {}, o {}",
-        q.len(),
-        kc.len(),
-        vc.len(),
-        n.len(),
-        sc.len(),
-        o.len()
+        x.len() >= b * kp && g2.len() >= b * kp && out.len() >= b * kp && go.len() >= head_dim,
+        "K3 o_norm_gate buffers too small for b={b}, kp={kp}: x {}, g2 {}, go {}, out {}",
+        x.len(),
+        g2.len(),
+        go.len(),
+        out.len()
     );
-    let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
-    let (kc_ptr, _kc_guard) = kc.device_ptr(&ctx.stream);
-    let (vc_ptr, _vc_guard) = vc.device_ptr(&ctx.stream);
-    let (n_ptr, _n_guard) = n.device_ptr(&ctx.stream);
-    let (sc_ptr, _sc_guard) = sc.device_ptr(&ctx.stream);
-    let (o_ptr, _o_guard) = o.device_ptr_mut(&ctx.stream);
+    let (x_ptr, _x_guard) = x.device_ptr(&ctx.stream);
+    let (g2_ptr, _g2_guard) = g2.device_ptr(&ctx.stream);
+    let (go_ptr, _go_guard) = go.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
     let rc = unsafe {
-        ffi::k3_mla_attn_batched(
-            q_ptr as *const c_void,
-            kc_ptr as *const c_void,
-            vc_ptr as *const c_void,
-            n_ptr as *const i32,
-            sc_ptr as *const c_void,
-            o_ptr as *mut c_void,
+        ffi::k3_o_norm_gate_batched(
+            x_ptr as *const c_void,
+            g2_ptr as *const c_void,
+            go_ptr as *const f32,
+            out_ptr as *mut c_void,
             b as i32,
             num_heads as i32,
-            qk_dim as i32,
-            v_dim as i32,
-            max_ctx as i32,
+            head_dim as i32,
             ctx.stream.cu_stream(),
         )
     };
     check(
         rc,
-        &format!("K3 mla_attn_batched (B={b}, NH={num_heads}, CAP={max_ctx})"),
-    )
-}
-
-/// Sigmoid router plus biased top-k over already-merged f32 score rows.
-///
-/// The weights come from the *un-biased* scores, are normalized with a
-/// `+1e-20` guard and scaled by the bf16 routed scale `rs`. Ties break to the
-/// lowest expert index.
-#[allow(clippy::too_many_arguments)]
-pub fn k3_router_topk_batched_launch(
-    ctx: &DeviceContext,
-    b: usize,
-    num_experts: usize,
-    topk: usize,
-    s: &CudaSlice<f32>,
-    bias: &CudaSlice<f32>,
-    rs: &CudaSlice<bf16>,
-    idx: &mut CudaSlice<i32>,
-    wts: &mut CudaSlice<f32>,
-) -> Result<()> {
-    check_bucket(b)?;
-    ensure!(
-        topk <= num_experts,
-        "K3 router topk={topk} exceeds the expert count {num_experts}"
-    );
-    ensure!(
-        s.len() >= b * num_experts
-            && bias.len() >= num_experts
-            && !rs.is_empty()
-            && idx.len() >= b * topk
-            && wts.len() >= b * topk,
-        "K3 router buffers too small for b={b}, experts={num_experts}, topk={topk}: \
-         s {}, bias {}, rs {}, idx {}, wts {}",
-        s.len(),
-        bias.len(),
-        rs.len(),
-        idx.len(),
-        wts.len()
-    );
-    let (s_ptr, _s_guard) = s.device_ptr(&ctx.stream);
-    let (bias_ptr, _bias_guard) = bias.device_ptr(&ctx.stream);
-    let (rs_ptr, _rs_guard) = rs.device_ptr(&ctx.stream);
-    let (idx_ptr, _idx_guard) = idx.device_ptr_mut(&ctx.stream);
-    let (wts_ptr, _wts_guard) = wts.device_ptr_mut(&ctx.stream);
-    let rc = unsafe {
-        ffi::k3_router_topk_batched(
-            s_ptr as *const f32,
-            bias_ptr as *const f32,
-            rs_ptr as *const c_void,
-            idx_ptr as *mut i32,
-            wts_ptr as *mut f32,
-            b as i32,
-            num_experts as i32,
-            topk as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    check(
-        rc,
-        &format!("K3 router_topk_batched (B={b}, E={num_experts}, TOPK={topk})"),
+        &format!("K3 o_norm_gate_batched (B={b}, KH={num_heads}, KD={head_dim})"),
     )
 }
 
@@ -659,7 +606,7 @@ pub fn k3_attnres_scores_batched_launch(
     );
     ensure!(
         ps.len() >= b * h
-            && bl.len() >= b * blocks * h
+            && bl.len() >= b * K3_ATTNRES_MAX_BLOCKS * h
             && sw.len() >= h
             && sc.len() >= b * (blocks + 1),
         "K3 attnres_scores buffers too small for b={b}, blocks={blocks}, h={h}: \
@@ -711,7 +658,7 @@ pub fn k3_attnres_mix_batched_launch(
     );
     ensure!(
         ps.len() >= b * h
-            && bl.len() >= b * blocks * h
+            && bl.len() >= b * K3_ATTNRES_MAX_BLOCKS * h
             && sc.len() >= b * (blocks + 1)
             && o.len() >= b * h,
         "K3 attnres_mix buffers too small for b={b}, blocks={blocks}, h={h}: \
@@ -771,6 +718,20 @@ mod tests {
     }
 
     #[test]
+    fn chunk_buckets_extend_the_decode_ladder_to_the_protocol_max() {
+        assert!(K3_PREFILL_BUCKETS.windows(2).all(|w| w[0] < w[1]));
+        assert!(K3_PREFILL_BUCKETS[0] > K3_MAX_BATCH);
+        assert_eq!(*K3_PREFILL_BUCKETS.last().unwrap(), K3_MAX_CHUNK);
+        for bucket in K3_BATCH_BUCKETS.into_iter().chain(K3_PREFILL_BUCKETS) {
+            assert_eq!(k3_chunk_bucket(bucket).unwrap(), bucket);
+            assert!(check_bucket(bucket).is_ok());
+        }
+        assert_eq!(k3_chunk_bucket(K3_MAX_BATCH + 1).unwrap(), 256);
+        assert_eq!(k3_chunk_bucket(4096).unwrap(), K3_MAX_CHUNK);
+        assert!(k3_chunk_bucket(K3_MAX_CHUNK + 1).is_err());
+    }
+
+    #[test]
     fn model_dimensions_agree_with_the_generator() {
         // These mirror `pegainfer-k3/kernels/generate.py`; a silent divergence
         // would show up as `cudaErrorInvalidValue` from every launcher.
@@ -784,6 +745,5 @@ mod tests {
         assert_eq!(K3_ATTNRES_MAX_BLOCKS, 93_usize.div_ceil(12));
         // The 4-way expert-parallel shard of the full table.
         assert_eq!(K3_ROUTER_EXPERTS[0] / 4, K3_ROUTER_EXPERTS[1]);
-        assert!(K3_MAX_CTX.iter().all(|cap| cap % 128 == 0));
     }
 }

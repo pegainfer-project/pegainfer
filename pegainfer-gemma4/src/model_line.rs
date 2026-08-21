@@ -1,5 +1,4 @@
-//! Gemma 4's [`ModelLine`] implementation (registration only — the engine
-//! itself is not yet available).
+//! Gemma 4's [`ModelLine`] implementation.
 
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::LaunchedEngine;
@@ -42,12 +41,19 @@ impl ModelLine for Gemma4Line {
     }
 
     fn consumed_shared_args(&self) -> &'static [&'static str] {
-        &["cuda_graph"]
+        &["device_ordinal", "cuda_graph"]
     }
 
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
-        crate::start_engine(ctx.model_path, EngineLoadOptions::default())
-            .map(LaunchedEngine::Handle)
+        crate::start_engine(
+            ctx.model_path,
+            &EngineLoadOptions {
+                enable_cuda_graph: ctx.shared.cuda_graph,
+                device_ordinals: vec![ctx.shared.device_ordinal],
+                ..EngineLoadOptions::default()
+            },
+        )
+        .map(LaunchedEngine::Handle)
     }
 }
 

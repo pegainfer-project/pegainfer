@@ -19,23 +19,7 @@ use pegainfer_frontend::sampler::SamplingParams;
 
 mod common;
 
-const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 const GENERATED_TOKENS: usize = 32;
-
-fn model_path_or_skip() -> Option<String> {
-    match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
-        Ok(path) => Some(path),
-        Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
-            Some(MODEL_PATH.to_string())
-        }
-        Err(_) => {
-            eprintln!(
-                "skipping qwen35 sampling_behavior: {MODEL_PATH}/config.json is missing; set PEGAINFER_TEST_MODEL_PATH to run it"
-            );
-            None
-        }
-    }
-}
 
 fn params(mut params: SamplingParams) -> SamplingParams {
     params.ignore_eos = true;
@@ -81,7 +65,8 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, params: SamplingPara
 
 #[test]
 fn sampling_params_steer_the_qwen35_sampler() {
-    let Some(model_path) = model_path_or_skip() else {
+    let Some(model_path) = common::model_path_or_skip("sampling_params_steer_the_qwen35_sampler")
+    else {
         return;
     };
 

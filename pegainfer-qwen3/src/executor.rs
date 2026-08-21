@@ -17,6 +17,7 @@ use pegainfer_core::weight_loader::WeightPrefetch;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_frontend::engine::DeferredFinish;
 use pegainfer_frontend::engine::LoadLoraAdapterRequest;
+use pegainfer_frontend::engine::SpecDecodeCounters;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::engine::panic_message;
@@ -54,6 +55,10 @@ mod spec;
 use dflash_lane::DFlashLaneState;
 use dflash_prefill::DFlashPrefillAction;
 use dflash_prefill::dflash_prefill_action;
+/// The contract's request id, end to end: the wiring mints it at submit and
+/// every internal queue, effect, and KV key uses it unchanged — there is no
+/// second id space to map across.
+pub use pegainfer_frontend::engine::RequestId;
 
 use crate::dflash::DFlashDraftModel;
 use crate::speculative::DraftPlan;
@@ -64,19 +69,6 @@ use crate::speculative::VerifyResult;
 use crate::speculative::VerifyStepItem;
 use crate::speculative::build_verify_results;
 use crate::verify_graph::VerifyGraphBuffers;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct RequestId(pub(crate) u64);
-
-impl RequestId {
-    pub fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub(crate) fn get(self) -> u64 {
-        self.0
-    }
-}
 
 #[derive(Clone)]
 pub struct PrefillStepItem {
@@ -860,6 +852,12 @@ pub(crate) trait ModelExecutor: Send {
         false
     }
 
+    /// Cumulative spec-decode acceptance counters, or `None` when no draft
+    /// model is loaded.
+    fn spec_decode_counters(&self) -> Option<SpecDecodeCounters> {
+        None
+    }
+
     /// Whether `request_id` has captured draft context and can be drafted.
     fn speculative_request_ready(&self, _request_id: RequestId) -> bool {
         false
@@ -1022,6 +1020,10 @@ pub struct Qwen3Executor {
     /// DFlash draft metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
     speculative: Option<DFlashMeta>,
+    /// Cumulative acceptance counters for the DFlash path, set and cleared
+    /// together with `speculative` above. Written in
+    /// `execute_speculative_verify_impl`, read by `publish_load`.
+    spec_decode_counters: Option<SpecDecodeCounters>,
     /// Requests whose DFlash context is captured and ready to draft. A request
     /// enters this set when its prompt finishes prefilling with captured target
     /// context, and leaves on retire or a plain (non-speculative) decode.
@@ -1208,6 +1210,7 @@ impl Qwen3Executor {
             overlap: None,
             async_prefill: None,
             speculative: None,
+            spec_decode_counters: None,
             dflash_ready_requests: HashSet::new(),
             device_ordinal,
         })
@@ -1511,6 +1514,7 @@ impl Qwen3Executor {
             overlap: None,
             async_prefill: None,
             speculative: None,
+            spec_decode_counters: None,
             dflash_ready_requests: HashSet::new(),
             device_ordinal: device_ordinals[0],
         })
@@ -1636,11 +1640,13 @@ impl Qwen3Executor {
             "speculative decoding is not supported together with KV offload"
         );
         let meta = self.primary.load_dflash(draft_path.to_string())?;
+        let counters = SpecDecodeCounters::new(meta.num_spec_tokens)?;
         log::info!(
             "Qwen3 DFlash speculative decoding enabled: draft block size {}",
             meta.block_size
         );
         self.set_prefix_cache_enabled(false);
+        self.spec_decode_counters = Some(counters);
         self.speculative = Some(meta);
         Ok(())
     }
@@ -1890,7 +1896,7 @@ impl Qwen3Executor {
                         // Partial remote hits are a win here: the miss is
                         // recomputed locally, so never hold out for the
                         // full prefix.
-                        .query(&id.0.to_string(), &query_hashes, false)
+                        .query(&id.raw().to_string(), &query_hashes, false)
                         .map(QueryView::from)
                         .map_err(|e| {
                             query_errored = true;
@@ -2201,6 +2207,10 @@ impl ModelExecutor for Qwen3Executor {
         self.kv_mgr.pool().available_blocks()
     }
 
+    fn spec_decode_counters(&self) -> Option<SpecDecodeCounters> {
+        self.spec_decode_counters
+    }
+
     fn is_stop_token(&self, token_id: u32) -> bool {
         self.metadata.stop_token_ids.contains(&token_id)
     }
@@ -2331,7 +2341,7 @@ impl ModelExecutor for Qwen3Executor {
                 offload
                     // As in the re-query: partial hits shorten the local
                     // prefill, so don't wait for the full prefix.
-                    .query(&request_id.0.to_string(), &query_hashes, false)
+                    .query(&request_id.raw().to_string(), &query_hashes, false)
                     .map(QueryView::from)
                     .map_err(|e| {
                         log::warn!("KV offload query failed for {request_id:?} (skipping): {e}");
@@ -3051,6 +3061,10 @@ impl Drop for Qwen3Executor {
 #[derive(Clone, Debug)]
 struct DFlashMeta {
     block_size: usize,
+    /// Max drafts proposed per verify step (`K`). The span leads with the anchor
+    /// (`[anchor, draft_1, …]`), so this is `verify_span - 1` under either block
+    /// layout — anchor-first vs anchor-drop is already folded into `verify_span()`.
+    num_spec_tokens: usize,
     /// Draft's max cacheable position; with the `block_size` in-fill headroom
     /// this caps the DFlash-effective context to `max_position_embeddings - block_size`.
     max_position_embeddings: usize,
@@ -3140,7 +3154,8 @@ impl LocalQwen3Lane {
             buf_layout.num_kv_heads,
             buf_layout.head_dim,
             buf_layout.page_size,
-        );
+        )
+        .expect("kv layout geometry");
         let max_bucket = *BATCH_BUCKETS.last().unwrap();
         let bufs = BatchDecodeBuffers::new(
             model.device_ctx(),
@@ -3261,6 +3276,7 @@ impl LocalQwen3Lane {
         model.tune_gemm_algos(&self.model)?;
         let meta = DFlashMeta {
             block_size: model.block_size(),
+            num_spec_tokens: model.verify_span().saturating_sub(1),
             max_position_embeddings: model.max_position_embeddings(),
             target_layer_ids: model.target_layer_ids().to_vec(),
         };

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::KvPrefix;
-use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_kv_store::BlockPool;
 use pegainfer_kv_store::CacheScope;
@@ -84,7 +84,7 @@ fn load_snapshot_reports_the_ranks_own_state() {
     pending.push_back(plain(request(vec![20], SamplingParams::default(), 4)));
     pending.push_back(plain(request(vec![21], SamplingParams::default(), 4)));
 
-    let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot::default());
+    let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics::default());
     publish_load(&load_tx, &pool, &slots, &pending, 0);
 
     let snapshot = *load_rx.borrow();
@@ -103,7 +103,7 @@ fn load_snapshot_counts_in_flight_resolves_as_waiting() {
     let pool = Arc::new(BlockPool::new(PAGE, 8));
     let slots: RankSlots = std::array::from_fn(|_| None);
     let mut pending = VecDeque::new();
-    let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot::default());
+    let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics::default());
 
     // Intake's side: the counter rises before the resolver task spawns,
     // with the deque still empty.

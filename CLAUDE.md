@@ -13,7 +13,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 | Qwen3-4B / 8B | `pegainfer-qwen3` | `qwen3` (default) | Full attention, TP support |
 | Qwen3.5-4B / 9B / 27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention |
 | DeepSeek-V2-Lite | `pegainfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
-| Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Registration only — engine not yet available |
+| Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Sliding-window + global full attention, single-GPU eager (bring-up) |
 | Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
 | GLM5.2 | `pegainfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
 | Kimi-K3 | `pegainfer-k3` | `--features k3` | Hybrid KDA + MLA, latent MoE + MXFP4, EP (bring-up — single-rank decode wired) |
@@ -44,6 +44,11 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 - `PEGAINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
 - `PEGAINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
 - `PEGAINFER_NVCC_JOBS` — override parallel nvcc job count
+- `PEGAINFER_PREFIX_CACHE` — gemma4 opt-in conversation prefix cache: `K` entries of captured prompt state resume multi-turn prompts (pre-allocated page budget; unset = off, byte-identical serving)
+- `PEGAINFER_ASYNC_PREFILL` — gemma4 opt-in overlap lane: `green:NN` prefills live-batch admissions on an SM-capped stream to protect decode tails (`shared` for comparison; unset = off; bad values refuse to start)
+- `PEGAINFER_MIX_CHUNK_TOKENS` — gemma4 opt-in chunked walk: a mixed admission computes at most `N` prompt rows per step (`64 <= N <` the serving ceiling; unset = whole-prompt steps; bad values refuse to start)
+- `PEGAINFER_MAX_CONTEXT` — gemma4 serving ceiling raise (default 8192, up to the checkpoint's 262144; a raise past the default needs `PEGAINFER_MIX_CHUNK_TOKENS` and refuses the async lane)
+- `PEGAINFER_DECODE_SLOTS` — gemma4 decode slots (1..16, default 16): global KV budget = slots x ceiling, trade concurrency for context
 - `GLM52_DECODE_SLOTS` / `GLM52_MTP_DRAFTS` — glm52 runtime profile: decode slots per rank (default 8, ceiling 32) and MTP draft span (default 5); `slots x (1+drafts)` must fit the 96-row step (validated at launch; MTP only). Throughput ceiling profile: `32` / `2`.
 
 ## Tests
@@ -175,3 +180,5 @@ When a session wraps up:
 # Git Conventions
 
 Commit messages use Commitizen format: `<type>(<scope>): <subject>`. Never commit directly to `main` — create a `feat/`/`fix/`/`chore/`/… branch first.
+
+Every commit must carry a DCO `Signed-off-by:` trailer (`git commit -s`, or `git rebase --signoff` to fix up a branch) — CI enforces it and rejects PRs without it. CI also runs `cargo fmt --check`; run `cargo fmt` before committing.

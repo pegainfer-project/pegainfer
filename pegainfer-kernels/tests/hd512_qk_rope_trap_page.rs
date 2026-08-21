@@ -54,6 +54,7 @@ fn paged_page_id_trap_is_visible() {
         &q,
         &k,
         &mut q_out,
+        0,
         &pool,
         &layout,
         &qn,
@@ -62,6 +63,7 @@ fn paged_page_id_trap_is_visible() {
         &sin_dev,
         0, // layer
         &page_indices,
+        0,
         0, // start_pos
         4, // cos_max_pos
         NUM_Q_HEADS,

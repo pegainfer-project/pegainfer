@@ -1,16 +1,16 @@
 //! The model-side runtime trait and the polling loop that drives it.
 //!
 //! The loop lives here — once, for every model line — so its conventions
-//! (drain order, one load publish and one commit per iteration, shutdown and
-//! fatal handling) are code, not per-crate discipline. A model line's runtime
-//! obligation is exactly the three [`Scheduler`] methods. Anything beyond
-//! them (e.g. LoRA control) is not the contract's business: a scheduler that
-//! serves an extra capability captures its own channel before spawn and
-//! drains it inside `step`.
+//! (drain order, one metrics publish and one commit per iteration, shutdown
+//! and fatal handling) are code, not per-crate discipline. A model line's
+//! runtime obligation is exactly the three [`Scheduler`] methods. Anything
+//! beyond them (e.g. LoRA control) is not the contract's business: a
+//! scheduler that serves an extra capability captures its own channel before
+//! spawn and drains it inside `step`.
 
-use super::emitter::StepEmitter;
-use super::handle::LoadSnapshot;
-use super::ticket::IntakeTicket;
+use super::ledger::RequestLedger;
+use super::metrics::SchedulerMetrics;
+use super::step::QueuedRequest;
 use super::wiring::LiveScheduler;
 use super::wiring::SchedulerBackend;
 use super::wiring::scheduler_pair;
@@ -19,24 +19,25 @@ use super::wiring::scheduler_pair;
 /// by [`spawn_scheduler`]; `Send` suffices.
 pub trait Scheduler: Send {
     /// Take ownership of one submitted request. Ownership transfer only —
-    /// every verdict (admit/reject/retire) is emitted from [`Self::step`],
-    /// the single emission site. Nothing is lost by deferring: the driver
-    /// commits once per iteration, so a verdict buffered in `step` lands in
-    /// the same commit an intake-time verdict would have.
-    fn intake(&mut self, ticket: IntakeTicket);
+    /// every verdict (admit/reject/retire) is written to the ledger from
+    /// [`Self::step`], the single emission site. Nothing is lost by
+    /// deferring: the driver commits once per iteration, so a verdict
+    /// recorded in `step` lands in the same commit a submit-time verdict
+    /// would have.
+    fn submit(&mut self, request: QueuedRequest);
 
-    /// Advance one step: admission, GPU work, and per-request emission. The
-    /// driver loops over this without pause — an idle scheduler returns
+    /// Advance one step: admission, GPU work, and per-request ledger writes.
+    /// The driver loops over this without pause — an idle scheduler returns
     /// quickly and gets polled again, so in-flight completions from the
     /// scheduler's own worker threads are picked up within a step. Recoverable
     /// execution failures are the scheduler's to absorb (fail the touched
     /// requests, keep serving); `Err` means the engine is beyond use. The
-    /// driver then winds down, and every request still held by the scheduler
-    /// is answered by its handle's drop bomb.
-    fn step(&mut self, emitter: &mut StepEmitter) -> anyhow::Result<()>;
+    /// driver then writes off every open account with the error and winds
+    /// down.
+    fn step(&mut self, ledger: &mut RequestLedger) -> anyhow::Result<()>;
 
-    /// Occupancy snapshot; the driver publishes it once per iteration.
-    fn load(&self) -> LoadSnapshot;
+    /// Metrics snapshot; the driver publishes it once per iteration.
+    fn metrics(&self) -> SchedulerMetrics;
 }
 
 /// Spawn one scheduler: mint the wiring, start the driver thread, return the
@@ -50,41 +51,47 @@ pub fn spawn_scheduler<S: Scheduler + 'static>(name: &str, scheduler: S) -> Live
     LiveScheduler { handle, join }
 }
 
-/// The polling loop. Exits when the frontend is gone (intake disconnected)
-/// and the scheduler reports itself drained, or when `step` reports a fatal
-/// error. An idle iteration (nothing running or waiting) ends in a
-/// [`std::hint::spin_loop`] before the next probe; busy iterations never
+/// The polling loop. Exits when the frontend is gone (submission channel
+/// disconnected) and the scheduler reports itself drained, or when `step`
+/// reports a fatal error. An idle iteration (nothing running or waiting) ends
+/// in a [`std::hint::spin_loop`] before the next probe; busy iterations never
 /// pause.
 pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
     let SchedulerBackend {
-        intake,
-        mut emitter,
-        load,
+        submissions,
+        mut ledger,
+        metrics,
     } = backend;
-    let mut intake_open = true;
+    let mut submissions_open = true;
     loop {
         loop {
-            match intake.try_recv() {
-                Ok(ticket) => scheduler.intake(ticket),
+            match submissions.try_recv() {
+                Ok(envelope) => {
+                    let queued = ledger.register(envelope);
+                    scheduler.submit(queued);
+                }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    intake_open = false;
+                    submissions_open = false;
                     break;
                 }
             }
         }
-        let step = scheduler.step(&mut emitter);
-        let snapshot = scheduler.load();
-        load.publish(snapshot);
-        emitter.commit_step();
+        let step = scheduler.step(&mut ledger);
+        let snapshot = scheduler.metrics();
+        metrics.publish(&snapshot);
+        ledger.commit_step();
         if let Err(error) = step {
-            // Dropping the scheduler drops its held tickets/handles; their
-            // drop bombs answer every in-flight request with `Failed`.
+            // The ledger holds an account for every unanswered request, so
+            // the write-off reaches them all — including any the scheduler
+            // lost track of — with the real error attached.
             log::error!("scheduler fatal, engine winding down: {error:#}");
+            ledger.fail_all(&format!("engine fatal: {error:#}"));
+            ledger.commit_step();
             return;
         }
         if snapshot.num_running_reqs == 0 && snapshot.num_waiting_reqs == 0 {
-            if !intake_open {
+            if !submissions_open {
                 log::info!("scheduler drained after frontend shutdown, exiting");
                 return;
             }
@@ -99,56 +106,55 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
 #[cfg(test)]
 mod tests {
     use super::super::step::Request;
+    use super::super::step::RequestId;
     use super::super::step::Terminal;
-    use super::super::ticket::ActiveRequest;
     use super::*;
     use crate::engine::FinishReason;
 
     /// Emits one token per step per request and finishes at `max_tokens`.
     #[derive(Default)]
     struct EchoScheduler {
-        queued: Vec<IntakeTicket>,
-        running: Vec<(ActiveRequest, usize)>,
+        queued: Vec<(RequestId, usize)>,
+        running: Vec<(RequestId, usize)>,
         fatal_next_step: bool,
     }
 
     impl Scheduler for EchoScheduler {
-        fn intake(&mut self, ticket: IntakeTicket) {
-            self.queued.push(ticket);
+        fn submit(&mut self, request: QueuedRequest) {
+            self.queued.push((request.id, request.request.max_tokens));
         }
 
-        fn step(&mut self, emitter: &mut StepEmitter) -> anyhow::Result<()> {
-            if self.fatal_next_step {
+        fn step(&mut self, ledger: &mut RequestLedger) -> anyhow::Result<()> {
+            if self.fatal_next_step && !(self.queued.is_empty() && self.running.is_empty()) {
                 anyhow::bail!("injected fatal");
             }
-            for ticket in self.queued.drain(..) {
-                let max_tokens = ticket.request().max_tokens;
-                let active = emitter.admit(ticket);
-                self.running.push((active, max_tokens));
+            for (id, max_tokens) in self.queued.drain(..) {
+                ledger.admit(id);
+                self.running.push((id, max_tokens));
             }
             let mut still_running = Vec::new();
-            for (mut active, max_tokens) in self.running.drain(..) {
-                if active.is_aborted() {
-                    emitter.retire(active);
+            for (id, max_tokens) in self.running.drain(..) {
+                if ledger.is_aborted(id) {
+                    ledger.retire(id);
                     continue;
                 }
-                let next = active.completion_tokens() as u32;
-                emitter.push_tokens(&mut active, &[next], &[]);
-                if active.completion_tokens() >= max_tokens {
-                    emitter.finish(active, FinishReason::Length);
+                let next = ledger.completion_tokens(id) as u32;
+                ledger.push_tokens(id, &[next], &[]);
+                if ledger.completion_tokens(id) >= max_tokens {
+                    ledger.finish(id, FinishReason::Length);
                 } else {
-                    still_running.push((active, max_tokens));
+                    still_running.push((id, max_tokens));
                 }
             }
             self.running = still_running;
             Ok(())
         }
 
-        fn load(&self) -> LoadSnapshot {
-            LoadSnapshot {
+        fn metrics(&self) -> SchedulerMetrics {
+            SchedulerMetrics {
                 num_running_reqs: self.running.len() as u64,
                 num_waiting_reqs: self.queued.len() as u64,
-                ..LoadSnapshot::default()
+                ..SchedulerMetrics::default()
             }
         }
     }
@@ -196,13 +202,14 @@ mod tests {
             })
         ));
 
-        // Dropping the handle disconnects intake; a drained scheduler exits.
+        // Dropping the handle disconnects the submission channel; a drained
+        // scheduler exits.
         drop(handle);
         partition.join.join().expect("driver thread exits cleanly");
     }
 
     #[test]
-    fn fatal_step_fails_in_flight_requests_via_drop_bombs() {
+    fn fatal_step_fails_in_flight_requests_with_the_error() {
         let partition = spawn_scheduler(
             "test-fatal",
             EchoScheduler {
@@ -214,18 +221,22 @@ mod tests {
         let mut steps = handle.take_steps().expect("step stream");
 
         let _control = handle.submit(request(100));
-        let mut saw_failed = false;
+        let mut failure_message = None;
         while let Some(step) = steps.blocking_recv() {
             for update in step.updates {
-                if matches!(update.terminal, Some(Terminal::Failed { .. })) {
-                    saw_failed = true;
+                if let Some(Terminal::Failed { message, .. }) = update.terminal {
+                    failure_message = Some(message);
                 }
             }
-            if saw_failed {
+            if failure_message.is_some() {
                 break;
             }
         }
-        assert!(saw_failed, "in-flight request must be answered on fatal");
+        let message = failure_message.expect("in-flight request must be answered on fatal");
+        assert!(
+            message.contains("injected fatal"),
+            "the write-off must carry the real error: {message}"
+        );
         partition
             .join
             .join()

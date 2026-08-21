@@ -76,14 +76,14 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
     }
 }
 
-/// Reject sampling parameters the engine would otherwise silently ignore.
+/// Reject request parameters the engine would otherwise silently ignore.
 /// Returns the offending description; `None` means the request is servable.
 ///
 /// The float comparisons are exact on purpose: they detect "the client sent
 /// anything other than the wire default", not numeric closeness — a request
 /// carrying 1.0000001 wants a penalty and must be rejected, not rounded away.
 #[allow(clippy::float_cmp)]
-pub(crate) fn unsupported_sampling(params: &EngineCoreSamplingParams) -> Option<String> {
+pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> Option<String> {
     if !(0.0..1.0).contains(&params.min_p) || !params.min_p.is_finite() {
         return Some(format!("min_p {} outside [0, 1)", params.min_p));
     }
@@ -107,6 +107,26 @@ pub(crate) fn unsupported_sampling(params: &EngineCoreSamplingParams) -> Option<
             "repetition_penalty {} is not supported yet",
             params.repetition_penalty
         ));
+    }
+    // The server lowers the client's ec_transfer_params into extra_args, and
+    // this engine has no encoder cache connector to hand it to.
+    if let Some(ec) = params
+        .extra_args
+        .as_ref()
+        .and_then(|args| args.get("ec_transfer_params"))
+    {
+        let requested = match ec {
+            serde_json::Value::Null => false,
+            serde_json::Value::Object(map) => !map.is_empty(),
+            _ => true,
+        };
+        if requested {
+            return Some(
+                "ec_transfer_params is not supported yet: this engine has no encoder cache \
+                 connector"
+                    .to_string(),
+            );
+        }
     }
     None
 }
@@ -197,33 +217,55 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_sampling_rejects_what_the_engine_would_ignore() {
+    fn unsupported_sampling_params_are_refused() {
         let mut params = EngineCoreSamplingParams::for_test();
         params.repetition_penalty = 1.0;
-        assert_eq!(unsupported_sampling(&params), None);
+        assert_eq!(unsupported_request_params(&params), None);
 
         params.min_p = 0.2;
-        assert_eq!(unsupported_sampling(&params), None);
+        assert_eq!(unsupported_request_params(&params), None);
         params.min_p = 1.5;
-        assert!(unsupported_sampling(&params).is_some());
+        assert!(unsupported_request_params(&params).is_some());
         params.min_p = 0.0;
 
         params.temperature = 0.8;
         params.seed = Some(7);
-        assert!(unsupported_sampling(&params).is_some());
+        assert!(unsupported_request_params(&params).is_some());
         // A greedy request's seed is a no-op, not a lie — allowed.
         params.temperature = 0.0;
-        assert_eq!(unsupported_sampling(&params), None);
+        assert_eq!(unsupported_request_params(&params), None);
         params.seed = None;
 
         params.frequency_penalty = 0.5;
-        assert!(unsupported_sampling(&params).is_some());
+        assert!(unsupported_request_params(&params).is_some());
         params.frequency_penalty = 0.0;
         params.presence_penalty = -0.5;
-        assert!(unsupported_sampling(&params).is_some());
+        assert!(unsupported_request_params(&params).is_some());
         params.presence_penalty = 0.0;
         params.repetition_penalty = 1.2;
-        assert!(unsupported_sampling(&params).is_some());
+        assert!(unsupported_request_params(&params).is_some());
+    }
+
+    #[test]
+    fn nonempty_ec_transfer_params_is_refused_not_dropped() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.extra_args = Some(HashMap::from([(
+            "ec_transfer_params".to_string(),
+            serde_json::json!({"requested": true}),
+        )]));
+        let refusal = unsupported_request_params(&params).expect("must refuse");
+        assert!(refusal.contains("ec_transfer_params"));
+
+        params.extra_args = Some(HashMap::from([(
+            "ec_transfer_params".to_string(),
+            serde_json::json!({}),
+        )]));
+        assert_eq!(unsupported_request_params(&params), None);
+        params.extra_args = Some(HashMap::from([(
+            "ec_transfer_params".to_string(),
+            serde_json::Value::Null,
+        )]));
+        assert_eq!(unsupported_request_params(&params), None);
     }
 
     #[test]

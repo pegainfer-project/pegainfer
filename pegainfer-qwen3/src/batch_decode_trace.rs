@@ -57,7 +57,8 @@ pub fn trace_decode_kernel_calls(
         budget.num_kv_heads,
         budget.head_dim,
         budget.block_size,
-    );
+    )
+    .expect("kv layout geometry");
 
     // Build dummy RequestKvs with the target kv_len.
     //

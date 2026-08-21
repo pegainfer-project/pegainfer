@@ -1,7 +1,7 @@
 //! Tensor-parallel worker runtime for Qwen3.5.
 //!
-//! Phase 1 supports eager dense TP prefill and decode. Unified execution still
-//! fails closed until the scheduler path can drive ordered eager decode.
+//! Phase 2A adds one canonical eager unified command while retaining the
+//! replicated linear-attention state layout from Phase 1.
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
@@ -20,8 +20,6 @@ use anyhow::Result;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_frontend::sampler::SamplingParams;
 
-#[cfg(test)]
-use crate::batch_decode_graph::MAX_BATCH;
 use crate::config::TensorParallelConfig;
 use crate::decode_buffers::BatchDecodeBuffers35;
 use crate::executor::DecodePlan;
@@ -45,6 +43,7 @@ const TP_NCCL_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const TP_RUNTIME_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const TP_WORKER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const TP_RUNTIME_MEMORY_RESERVE_BYTES: usize = 512 * 1024 * 1024;
+const TRITON_AOT_DEVICE_TABLE_LEN: usize = 16;
 
 #[allow(dead_code)]
 enum TpWorkerCommand {
@@ -54,19 +53,37 @@ enum TpWorkerCommand {
     RunPrefillChunks {
         chunks: Vec<TpPrefillChunkItem>,
         sample_seed: u64,
+        start: Arc<TpCommandStartGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
     RunDecodeStep {
         requests: Vec<TpDecodeStepItem>,
         sample_seed: u64,
+        start: Arc<TpCommandStartGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
     RunUnifiedStep {
+        plan: TpUnifiedPlan,
+        start: Arc<TpCommandStartGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
     DropRequest {
         request_id: RequestId,
+        start: Arc<TpCommandStartGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    #[cfg(test)]
+    SnapshotState {
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    #[cfg(test)]
+    RemoveRequestStateForTest {
+        request_id: RequestId,
+        resp: mpsc::Sender<bool>,
+    },
+    #[cfg(test)]
+    DisconnectForTest {
+        ready: mpsc::SyncSender<()>,
     },
     Shutdown,
 }
@@ -74,14 +91,72 @@ enum TpWorkerCommand {
 #[derive(Debug)]
 enum TpWorkerReply {
     Ack,
+    DropAck {
+        existed: bool,
+    },
     Prefill(PrefillResult),
     Decode(DecodeResult),
+    Unified(TpUnifiedResult),
+    #[cfg(test)]
+    Snapshot(WorkerStateSnapshot),
 }
 
 #[derive(Debug)]
 struct TpWorkerResponse {
     rank: usize,
     result: Result<TpWorkerReply>,
+}
+
+/// Scheduler-owned lifecycle proof required from every TP rank during cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropExpectation {
+    MustBeAbsent,
+    MustExist,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TpCommandDecision {
+    #[default]
+    Pending,
+    Execute,
+    Cancel,
+}
+
+#[derive(Default)]
+struct TpCommandStartGate {
+    decision: Mutex<TpCommandDecision>,
+    changed: Condvar,
+}
+
+impl TpCommandStartGate {
+    fn execute(&self) -> bool {
+        self.resolve(TpCommandDecision::Execute)
+    }
+
+    fn cancel(&self) -> bool {
+        self.resolve(TpCommandDecision::Cancel)
+    }
+
+    fn wait(&self) -> TpCommandDecision {
+        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
+        while *decision == TpCommandDecision::Pending {
+            decision = self
+                .changed
+                .wait(decision)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *decision
+    }
+
+    fn resolve(&self, next: TpCommandDecision) -> bool {
+        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
+        if *decision != TpCommandDecision::Pending {
+            return false;
+        }
+        *decision = next;
+        self.changed.notify_all();
+        true
+    }
 }
 
 #[derive(Default)]
@@ -113,7 +188,6 @@ impl TpRuntimePoison {
 pub struct Qwen35TpExecutor {
     workers: Vec<TpWorker>,
     poison: Arc<TpRuntimePoison>,
-    #[cfg(test)]
     world_size: usize,
     max_batch: usize,
     page_size: usize,
@@ -188,16 +262,21 @@ impl TpDecodeStepItem {
     }
 }
 
-impl Qwen35TpExecutor {
-    #[cfg(test)]
-    fn from_runtime(
-        model_path: &str,
-        enable_cuda_graph: bool,
-        device_ordinals: &[usize],
-    ) -> Result<Self> {
-        Self::from_runtime_with_capacity(model_path, enable_cuda_graph, device_ordinals, MAX_BATCH)
-    }
+#[derive(Clone)]
+pub(crate) struct TpUnifiedPlan {
+    pub(crate) prefill: Vec<TpPrefillChunkItem>,
+    pub(crate) decode: Vec<TpDecodeStepItem>,
+    pub(crate) prefill_sample_seed: u64,
+    pub(crate) decode_sample_seed: u64,
+}
 
+#[derive(Debug)]
+pub(crate) struct TpUnifiedResult {
+    pub(crate) prefill: PrefillResult,
+    pub(crate) decode: DecodeResult,
+}
+
+impl Qwen35TpExecutor {
     pub fn from_runtime_with_capacity(
         model_path: &str,
         enable_cuda_graph: bool,
@@ -220,6 +299,7 @@ impl Qwen35TpExecutor {
         max_batch: usize,
         max_prefill_tokens: usize,
     ) -> Result<Self> {
+        validate_cuda_ordinals(device_ordinals)?;
         anyhow::ensure!(
             device_ordinals.len() > 1,
             "Qwen3.5 TP executor requires at least two CUDA devices, got {}",
@@ -348,7 +428,6 @@ impl Qwen35TpExecutor {
         Ok(Self {
             workers,
             poison,
-            #[cfg(test)]
             world_size,
             max_batch: min_rank_max_batch,
             page_size,
@@ -396,7 +475,12 @@ impl Qwen35TpExecutor {
             )?;
         }
         drop(resp_tx);
-        wait_for_acks(resp_rx, self.workers.len(), "ping", &self.poison)
+        let responses = recv_runtime_responses(&resp_rx, self.world_size, "ping", &self.poison)?;
+        validate_dispatched_responses(
+            validate_ack_responses(responses, self.world_size, "ping"),
+            "ping",
+            &self.poison,
+        )
     }
 
     pub fn execute_prefill(&self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
@@ -427,20 +511,23 @@ impl Qwen35TpExecutor {
             !chunks.is_empty(),
             "Qwen3.5 TP prefill chunk command requires at least one chunk"
         );
+        validate_prefill_chunks(chunks)?;
         let chunks = chunks.to_vec();
-        let (resp_tx, resp_rx) = mpsc::channel();
-        for worker in &self.workers {
-            self.send_or_poison(
-                worker,
-                TpWorkerCommand::RunPrefillChunks {
-                    chunks: chunks.clone(),
-                    sample_seed,
-                    resp: resp_tx.clone(),
-                },
-            )?;
-        }
-        drop(resp_tx);
-        wait_for_prefill(resp_rx, self.workers.len(), &self.poison)
+        let resp_rx = self.dispatch_mutating("prefill chunks", |start, resp| {
+            TpWorkerCommand::RunPrefillChunks {
+                chunks: chunks.clone(),
+                sample_seed,
+                start,
+                resp,
+            }
+        })?;
+        let responses =
+            recv_runtime_responses(&resp_rx, self.world_size, "prefill chunks", &self.poison)?;
+        validate_dispatched_responses(
+            validate_prefill_responses(responses, self.world_size),
+            "prefill chunks",
+            &self.poison,
+        )
     }
 
     pub fn execute_decode(&self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
@@ -473,38 +560,194 @@ impl Qwen35TpExecutor {
             !requests.is_empty(),
             "Qwen3.5 TP decode plan requires at least one request"
         );
+        validate_decode_requests(requests)?;
         let requests = requests.to_vec();
-        let (resp_tx, resp_rx) = mpsc::channel();
-        for worker in &self.workers {
-            self.send_or_poison(
-                worker,
-                TpWorkerCommand::RunDecodeStep {
-                    requests: requests.clone(),
-                    sample_seed,
-                    resp: resp_tx.clone(),
-                },
-            )?;
-        }
-        drop(resp_tx);
-        wait_for_decode(resp_rx, self.workers.len(), &self.poison)
+        let resp_rx = self.dispatch_mutating("decode step", |start, resp| {
+            TpWorkerCommand::RunDecodeStep {
+                requests: requests.clone(),
+                sample_seed,
+                start,
+                resp,
+            }
+        })?;
+        let responses =
+            recv_runtime_responses(&resp_rx, self.world_size, "decode step", &self.poison)?;
+        validate_dispatched_responses(
+            validate_decode_responses(responses, self.world_size),
+            "decode step",
+            &self.poison,
+        )
     }
 
-    pub fn drop_request(&self, request_id: RequestId) -> Result<()> {
+    pub(crate) fn execute_unified(&self, plan: &TpUnifiedPlan) -> Result<TpUnifiedResult> {
         self.poison.ensure_healthy()?;
+        validate_unified_plan(plan, self.max_batch)?;
+        let resp_rx = self.dispatch_mutating("unified step", |start, resp| {
+            TpWorkerCommand::RunUnifiedStep {
+                plan: plan.clone(),
+                start,
+                resp,
+            }
+        })?;
+        let responses =
+            recv_runtime_responses(&resp_rx, self.world_size, "unified step", &self.poison)?;
+        validate_dispatched_responses(
+            validate_unified_responses(responses, self.world_size),
+            "unified step",
+            &self.poison,
+        )
+    }
+
+    pub(crate) fn poison_artifact_contract(
+        &self,
+        operation: &'static str,
+        err: &anyhow::Error,
+    ) -> anyhow::Error {
+        let reason = self.poison.poison(format!(
+            "invalid Qwen3.5 TP {operation} artifact set: {err:#}"
+        ));
+        anyhow::anyhow!(reason)
+    }
+
+    pub fn drop_request(&self, request_id: RequestId, expectation: DropExpectation) -> Result<()> {
+        self.poison.ensure_healthy()?;
+        let resp_rx =
+            self.dispatch_mutating("drop request", |start, resp| TpWorkerCommand::DropRequest {
+                request_id,
+                start,
+                resp,
+            })?;
+        let responses =
+            recv_runtime_responses(&resp_rx, self.world_size, "drop request", &self.poison)?;
+        validate_dispatched_responses(
+            validate_drop_responses(responses, self.world_size, expectation),
+            "drop request",
+            &self.poison,
+        )
+    }
+
+    #[cfg(test)]
+    fn snapshot_workers(&self) -> Result<Vec<WorkerStateSnapshot>> {
+        self.poison.ensure_healthy()?;
+        self.snapshot_workers_unchecked_for_test()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn snapshot_workers_unchecked_for_test(&self) -> Result<Vec<WorkerStateSnapshot>> {
         let (resp_tx, resp_rx) = mpsc::channel();
         for worker in &self.workers {
             self.send_or_poison(
                 worker,
-                TpWorkerCommand::DropRequest {
-                    request_id,
+                TpWorkerCommand::SnapshotState {
                     resp: resp_tx.clone(),
                 },
             )?;
         }
         drop(resp_tx);
-        wait_for_acks(resp_rx, self.workers.len(), "drop request", &self.poison)
+        wait_for_worker_snapshots(&resp_rx, self.world_size, &self.poison)
     }
 
+    #[cfg(test)]
+    fn inject_prefill_dispatch_failure_for_test(
+        &self,
+        chunks: &[TpPrefillChunkItem],
+        fail_rank: usize,
+    ) -> Result<()> {
+        self.poison.ensure_healthy()?;
+        anyhow::ensure!(
+            fail_rank < self.world_size,
+            "injected TP dispatch failure rank {fail_rank} is outside world size {}",
+            self.world_size
+        );
+        validate_prefill_chunks(chunks)?;
+        let chunks = chunks.to_vec();
+        dispatch_mutating_commands(
+            self.world_size,
+            "injected prefill chunks",
+            &self.poison,
+            |start, resp| TpWorkerCommand::RunPrefillChunks {
+                chunks: chunks.clone(),
+                sample_seed: 0,
+                start,
+                resp,
+            },
+            |rank, command| {
+                if rank == fail_rank {
+                    anyhow::bail!("injected dispatch failure at rank {rank}");
+                }
+                self.workers[rank].send(command)
+            },
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn remove_worker_request_state_for_test(
+        &self,
+        rank: usize,
+        request_id: RequestId,
+    ) -> Result<bool> {
+        self.poison.ensure_healthy()?;
+        let worker = self
+            .workers
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("test worker rank {rank} is out of range"))?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        worker.send(TpWorkerCommand::RemoveRequestStateForTest {
+            request_id,
+            resp: resp_tx,
+        })?;
+        resp_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| anyhow::anyhow!("test worker rank {rank} did not remove state: {err}"))
+    }
+
+    #[cfg(test)]
+    fn disconnect_worker_receiver_for_test(&self, rank: usize) -> Result<()> {
+        self.poison.ensure_healthy()?;
+        let worker = self
+            .workers
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("test worker rank {rank} is out of range"))?;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        worker.send(TpWorkerCommand::DisconnectForTest { ready: ready_tx })?;
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| anyhow::anyhow!("test worker rank {rank} did not disconnect: {err}"))?;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (resp_tx, _resp_rx) = mpsc::channel();
+            if worker
+                .send(TpWorkerCommand::Ping { resp: resp_tx })
+                .is_err()
+            {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "test worker rank {rank} receiver remained connected"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn dispatch_mutating(
+        &self,
+        operation: &'static str,
+        build: impl Fn(Arc<TpCommandStartGate>, mpsc::Sender<TpWorkerResponse>) -> TpWorkerCommand,
+    ) -> Result<mpsc::Receiver<TpWorkerResponse>> {
+        dispatch_mutating_commands(
+            self.world_size,
+            operation,
+            &self.poison,
+            build,
+            |rank, command| self.workers[rank].send(command),
+        )
+    }
+
+    #[cfg(test)]
     fn send_or_poison(&self, worker: &TpWorker, command: TpWorkerCommand) -> Result<()> {
         worker.send(command).map_err(|err| {
             let reason = self
@@ -513,6 +756,31 @@ impl Qwen35TpExecutor {
             anyhow::anyhow!(reason)
         })
     }
+}
+
+fn dispatch_mutating_commands(
+    world_size: usize,
+    operation: &'static str,
+    poison: &TpRuntimePoison,
+    build: impl Fn(Arc<TpCommandStartGate>, mpsc::Sender<TpWorkerResponse>) -> TpWorkerCommand,
+    mut send: impl FnMut(usize, TpWorkerCommand) -> Result<()>,
+) -> Result<mpsc::Receiver<TpWorkerResponse>> {
+    let start = Arc::new(TpCommandStartGate::default());
+    let (resp_tx, resp_rx) = mpsc::channel();
+    for rank in 0..world_size {
+        let command = build(Arc::clone(&start), resp_tx.clone());
+        if let Err(err) = send(rank, command) {
+            start.cancel();
+            let reason = poison.poison(format!(
+                "failed to dispatch {operation} to TP worker rank {rank}: {err:#}"
+            ));
+            return Err(anyhow::anyhow!(reason));
+        }
+    }
+    drop(resp_tx);
+    let resolved = start.execute();
+    debug_assert!(resolved, "fresh TP command gate resolved more than once");
+    Ok(resp_rx)
 }
 
 impl Drop for Qwen35TpExecutor {
@@ -747,6 +1015,14 @@ enum TpRequestPhase {
     Decoding,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkerStateSnapshot {
+    rank: usize,
+    request_count: usize,
+    requests: Vec<(RequestId, TpRequestPhase)>,
+}
+
 impl TpWorkerPrepared {
     fn new(
         rank: usize,
@@ -884,32 +1160,75 @@ impl TpWorkerState {
                 TpWorkerCommand::RunPrefillChunks {
                     chunks,
                     sample_seed,
+                    start,
                     resp,
                 } => {
-                    let result = self.execute_prefill_chunks(&chunks, sample_seed);
-                    self.respond(resp, "prefill", result)
+                    if start.wait() == TpCommandDecision::Cancel {
+                        false
+                    } else {
+                        let result = self.execute_prefill_chunks(&chunks, sample_seed);
+                        self.respond(resp, "prefill", result)
+                    }
                 }
                 TpWorkerCommand::RunDecodeStep {
                     requests,
                     sample_seed,
+                    start,
                     resp,
                 } => {
-                    let result = self.execute_decode(&requests, sample_seed);
-                    self.respond(resp, "decode", result)
+                    if start.wait() == TpCommandDecision::Cancel {
+                        false
+                    } else {
+                        let result = self.execute_decode(&requests, sample_seed);
+                        self.respond(resp, "decode", result)
+                    }
                 }
-                TpWorkerCommand::RunUnifiedStep { resp } => {
-                    let rank = self.rank;
+                TpWorkerCommand::RunUnifiedStep { plan, start, resp } => {
+                    if start.wait() == TpCommandDecision::Cancel {
+                        false
+                    } else {
+                        let result = self.execute_unified(&plan);
+                        self.respond(resp, "unified step", result)
+                    }
+                }
+                TpWorkerCommand::DropRequest {
+                    request_id,
+                    start,
+                    resp,
+                } => {
+                    if start.wait() == TpCommandDecision::Cancel {
+                        false
+                    } else {
+                        let existed = self.drop_request(request_id);
+                        self.respond(resp, "drop request", Ok(TpWorkerReply::DropAck { existed }))
+                    }
+                }
+                #[cfg(test)]
+                TpWorkerCommand::SnapshotState { resp } => {
+                    let snapshot = WorkerStateSnapshot {
+                        rank: self.rank,
+                        request_count: self.requests.len(),
+                        requests: self
+                            .requests
+                            .iter()
+                            .map(|state| (state.request_id, state.phase))
+                            .collect(),
+                    };
                     self.respond(
                         resp,
-                        "unified step",
-                        Err(anyhow::anyhow!(
-                            "Qwen3.5 TP worker rank {rank} has no TP unified implementation yet"
-                        )),
+                        "snapshot state",
+                        Ok(TpWorkerReply::Snapshot(snapshot)),
                     )
                 }
-                TpWorkerCommand::DropRequest { request_id, resp } => {
-                    self.drop_request(request_id);
-                    self.respond(resp, "drop request", Ok(TpWorkerReply::Ack))
+                #[cfg(test)]
+                TpWorkerCommand::RemoveRequestStateForTest { request_id, resp } => {
+                    let _ = resp.send(self.drop_request(request_id));
+                    false
+                }
+                #[cfg(test)]
+                TpWorkerCommand::DisconnectForTest { ready } => {
+                    let _ = ready.send(());
+                    break;
                 }
                 TpWorkerCommand::Shutdown => break,
             };
@@ -953,6 +1272,19 @@ impl TpWorkerState {
         chunks: &[TpPrefillChunkItem],
         sample_seed: u64,
     ) -> Result<TpWorkerReply> {
+        let requests = self.execute_prefill_rows(chunks, sample_seed)?;
+        if self.rank == 0 {
+            Ok(TpWorkerReply::Prefill(PrefillResult { requests }))
+        } else {
+            Ok(TpWorkerReply::Ack)
+        }
+    }
+
+    fn execute_prefill_rows(
+        &mut self,
+        chunks: &[TpPrefillChunkItem],
+        sample_seed: u64,
+    ) -> Result<Vec<PrefillRequestResult>> {
         anyhow::ensure!(
             !chunks.is_empty(),
             "Qwen3.5 TP prefill chunk command requires at least one chunk"
@@ -1001,13 +1333,7 @@ impl TpWorkerState {
             }
         }
 
-        if self.rank == 0 {
-            Ok(TpWorkerReply::Prefill(PrefillResult {
-                requests: primary_results,
-            }))
-        } else {
-            Ok(TpWorkerReply::Ack)
-        }
+        Ok(primary_results)
     }
 
     fn sample_final_prefill_chunk(
@@ -1043,6 +1369,19 @@ impl TpWorkerState {
         requests: &[TpDecodeStepItem],
         sample_seed: u64,
     ) -> Result<TpWorkerReply> {
+        let requests = self.execute_decode_rows(requests, sample_seed)?;
+        if self.rank == 0 {
+            Ok(TpWorkerReply::Decode(DecodeResult { requests }))
+        } else {
+            Ok(TpWorkerReply::Ack)
+        }
+    }
+
+    fn execute_decode_rows(
+        &mut self,
+        requests: &[TpDecodeStepItem],
+        sample_seed: u64,
+    ) -> Result<Vec<DecodeRequestResult>> {
         anyhow::ensure!(
             !requests.is_empty(),
             "Qwen3.5 TP decode command requires at least one request"
@@ -1110,9 +1449,27 @@ impl TpWorkerState {
             }
         }
 
+        Ok(primary_results)
+    }
+
+    fn execute_unified(&mut self, plan: &TpUnifiedPlan) -> Result<TpWorkerReply> {
+        validate_unified_worker_state(self, plan)?;
+
+        // The command order is canonical across ranks. Sampling seeds are
+        // selected by the scheduler in decode-then-prefill order, independent
+        // of this forward order.
+        let prefill_requests =
+            self.execute_prefill_rows(&plan.prefill, plan.prefill_sample_seed)?;
+        let decode_requests = self.execute_decode_rows(&plan.decode, plan.decode_sample_seed)?;
+
         if self.rank == 0 {
-            Ok(TpWorkerReply::Decode(DecodeResult {
-                requests: primary_results,
+            Ok(TpWorkerReply::Unified(TpUnifiedResult {
+                prefill: PrefillResult {
+                    requests: prefill_requests,
+                },
+                decode: DecodeResult {
+                    requests: decode_requests,
+                },
             }))
         } else {
             Ok(TpWorkerReply::Ack)
@@ -1151,9 +1508,12 @@ impl TpWorkerState {
             .position(|state| state.request_id == request_id)
     }
 
-    fn drop_request(&mut self, request_id: RequestId) {
+    fn drop_request(&mut self, request_id: RequestId) -> bool {
         if let Some(idx) = self.request_index(request_id) {
             self.requests.swap_remove(idx);
+            true
+        } else {
+            false
         }
     }
 }
@@ -1187,6 +1547,101 @@ fn validate_decode_requests(requests: &[TpDecodeStepItem]) -> Result<()> {
     Ok(())
 }
 
+fn validate_cuda_ordinals(device_ordinals: &[usize]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(device_ordinals.len());
+    for &ordinal in device_ordinals {
+        anyhow::ensure!(
+            ordinal < TRITON_AOT_DEVICE_TABLE_LEN,
+            "Qwen3.5 TP CUDA ordinal {ordinal} exceeds the Triton AOT device table bound {TRITON_AOT_DEVICE_TABLE_LEN}"
+        );
+        anyhow::ensure!(
+            seen.insert(ordinal),
+            "Qwen3.5 TP CUDA ordinals must be distinct; ordinal {ordinal} appears more than once"
+        );
+    }
+    Ok(())
+}
+
+fn validate_unified_plan(plan: &TpUnifiedPlan, max_batch: usize) -> Result<()> {
+    anyhow::ensure!(
+        !plan.prefill.is_empty(),
+        "Qwen3.5 TP unified plan requires at least one prefill chunk"
+    );
+    anyhow::ensure!(
+        !plan.decode.is_empty(),
+        "Qwen3.5 TP unified plan requires at least one decode request"
+    );
+    validate_prefill_chunks(&plan.prefill)?;
+    validate_decode_requests(&plan.decode)?;
+    anyhow::ensure!(
+        plan.prefill.len().saturating_add(plan.decode.len()) <= max_batch,
+        "Qwen3.5 TP unified plan has {} rows, exceeding scheduler capacity {max_batch}",
+        plan.prefill.len().saturating_add(plan.decode.len())
+    );
+
+    let prefill_ids: HashSet<_> = plan.prefill.iter().map(|item| item.request_id).collect();
+    for decode in &plan.decode {
+        anyhow::ensure!(
+            !prefill_ids.contains(&decode.request_id),
+            "Qwen3.5 TP unified plan request id {} appears in both prefill and decode",
+            decode.request_id.get()
+        );
+    }
+    Ok(())
+}
+
+fn validate_unified_worker_state(state: &TpWorkerState, plan: &TpUnifiedPlan) -> Result<()> {
+    validate_unified_worker_layout(plan, state.max_batch, state.requests.len(), |request_id| {
+        state
+            .request_index(request_id)
+            .map(|idx| state.requests[idx].phase)
+    })
+}
+
+fn validate_unified_worker_layout(
+    plan: &TpUnifiedPlan,
+    max_batch: usize,
+    resident_count: usize,
+    mut phase_for: impl FnMut(RequestId) -> Option<TpRequestPhase>,
+) -> Result<()> {
+    validate_unified_plan(plan, max_batch)?;
+
+    let new_prefill_count = plan
+        .prefill
+        .iter()
+        .filter(|item| phase_for(item.request_id).is_none())
+        .count();
+    anyhow::ensure!(
+        resident_count.saturating_add(new_prefill_count) <= max_batch,
+        "Qwen3.5 TP unified plan would exceed worker capacity {}",
+        max_batch
+    );
+
+    for item in &plan.prefill {
+        if let Some(phase) = phase_for(item.request_id) {
+            anyhow::ensure!(
+                phase == TpRequestPhase::Prefilling,
+                "Qwen3.5 TP unified prefill request {} is already in decode state",
+                item.request_id.get()
+            );
+        }
+    }
+    for item in &plan.decode {
+        let phase = phase_for(item.request_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Qwen3.5 TP unified decode request {} has no worker state",
+                item.request_id.get()
+            )
+        })?;
+        anyhow::ensure!(
+            phase == TpRequestPhase::Decoding,
+            "Qwen3.5 TP unified request {} is not ready for decode",
+            item.request_id.get()
+        );
+    }
+    Ok(())
+}
+
 impl From<PrefillStepItem> for TpPrefillChunkItem {
     fn from(request: PrefillStepItem) -> Self {
         Self::new(
@@ -1209,88 +1664,263 @@ impl From<DecodeStepItem> for TpDecodeStepItem {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn wait_for_acks(
-    responses: mpsc::Receiver<TpWorkerResponse>,
+fn recv_runtime_responses(
+    responses: &mpsc::Receiver<TpWorkerResponse>,
     expected: usize,
-    op_name: &'static str,
+    operation: &'static str,
     poison: &TpRuntimePoison,
-) -> Result<()> {
+) -> Result<Vec<TpWorkerResponse>> {
+    collect_runtime_responses(expected, operation, poison, || {
+        recv_runtime_response(responses, operation, poison)
+    })
+}
+
+fn collect_runtime_responses(
+    expected: usize,
+    operation: &'static str,
+    poison: &TpRuntimePoison,
+    mut recv_next: impl FnMut() -> Result<TpWorkerResponse>,
+) -> Result<Vec<TpWorkerResponse>> {
+    let mut collected = Vec::with_capacity(expected);
     for _ in 0..expected {
-        let response = recv_runtime_response(&responses, op_name, poison)?;
-        match response.result? {
-            TpWorkerReply::Ack => {}
-            TpWorkerReply::Prefill(_) => {
-                anyhow::bail!("Qwen3.5 TP {op_name} unexpectedly returned prefill result")
-            }
-            TpWorkerReply::Decode(_) => {
-                anyhow::bail!("Qwen3.5 TP {op_name} unexpectedly returned decode result")
-            }
+        let response = recv_next()?;
+        if let Err(err) = &response.result {
+            // A failed rank may leave peers blocked in a collective, so response-set
+            // completeness is no longer recoverable or useful.
+            let reason = poison.poison(format!(
+                "rank {} failed during {operation}: {err:#}",
+                response.rank
+            ));
+            return Err(anyhow::anyhow!(reason));
         }
+        collected.push(response);
+    }
+    Ok(collected)
+}
+
+fn validate_dispatched_responses<T>(
+    result: Result<T>,
+    operation: &'static str,
+    poison: &TpRuntimePoison,
+) -> Result<T> {
+    result.map_err(|err| {
+        let reason = poison.poison(format!(
+            "invalid Qwen3.5 TP {operation} response set: {err:#}"
+        ));
+        anyhow::anyhow!(reason)
+    })
+}
+
+fn validate_exact_rank_responses(
+    responses: Vec<TpWorkerResponse>,
+    world_size: usize,
+    operation: &'static str,
+) -> Result<Vec<(usize, TpWorkerReply)>> {
+    anyhow::ensure!(
+        responses.len() == world_size,
+        "{operation} expected {world_size} responses, got {}",
+        responses.len()
+    );
+    let mut seen_ranks = HashSet::with_capacity(world_size);
+    let mut replies = Vec::with_capacity(world_size);
+    for response in responses {
+        anyhow::ensure!(
+            response.rank < world_size,
+            "{operation} returned out-of-range rank {} for world size {world_size}",
+            response.rank
+        );
+        anyhow::ensure!(
+            seen_ranks.insert(response.rank),
+            "{operation} returned duplicate rank {}",
+            response.rank
+        );
+        replies.push((response.rank, response.result?));
+    }
+    anyhow::ensure!(
+        (0..world_size).all(|rank| seen_ranks.contains(&rank)),
+        "{operation} response set did not contain every rank"
+    );
+    replies.sort_unstable_by_key(|(rank, _)| *rank);
+    Ok(replies)
+}
+
+#[cfg(test)]
+fn validate_ack_responses(
+    responses: Vec<TpWorkerResponse>,
+    world_size: usize,
+    operation: &'static str,
+) -> Result<()> {
+    for (rank, reply) in validate_exact_rank_responses(responses, world_size, operation)? {
+        anyhow::ensure!(
+            matches!(reply, TpWorkerReply::Ack),
+            "{operation} rank {rank} returned {} instead of acknowledgement",
+            reply_name(&reply)
+        );
     }
     Ok(())
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn wait_for_prefill(
-    responses: mpsc::Receiver<TpWorkerResponse>,
-    expected: usize,
-    poison: &TpRuntimePoison,
-) -> Result<PrefillResult> {
-    let mut result = None;
-    for _ in 0..expected {
-        let response = recv_runtime_response(&responses, "prefill", poison)?;
-        match response.result? {
-            TpWorkerReply::Ack => {}
-            TpWorkerReply::Prefill(prefill) => {
-                anyhow::ensure!(
-                    response.rank == 0,
-                    "Qwen3.5 TP prefill returned a primary result from rank {}",
-                    response.rank
-                );
-                anyhow::ensure!(
-                    result.is_none(),
-                    "Qwen3.5 TP prefill returned multiple primary results"
-                );
-                result = Some(prefill);
-            }
-            TpWorkerReply::Decode(_) => {
-                anyhow::bail!("Qwen3.5 TP prefill unexpectedly returned decode result")
-            }
-        }
+fn validate_drop_responses(
+    responses: Vec<TpWorkerResponse>,
+    world_size: usize,
+    expectation: DropExpectation,
+) -> Result<()> {
+    let mut existence = Vec::with_capacity(world_size);
+    for (rank, reply) in validate_exact_rank_responses(responses, world_size, "drop request")? {
+        let TpWorkerReply::DropAck { existed } = reply else {
+            anyhow::bail!(
+                "drop request rank {rank} returned {} instead of drop acknowledgement",
+                reply_name(&reply)
+            );
+        };
+        existence.push((rank, existed));
     }
-    result.ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP prefill returned no primary result"))
+    let expected = expectation == DropExpectation::MustExist;
+    anyhow::ensure!(
+        existence.iter().all(|(_, existed)| *existed == expected),
+        "drop request expected {expectation:?}, got rank existence {existence:?}"
+    );
+    Ok(())
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn wait_for_decode(
-    responses: mpsc::Receiver<TpWorkerResponse>,
-    expected: usize,
-    poison: &TpRuntimePoison,
+fn validate_prefill_responses(
+    responses: Vec<TpWorkerResponse>,
+    world_size: usize,
+) -> Result<PrefillResult> {
+    let mut primary = None;
+    for (rank, reply) in validate_exact_rank_responses(responses, world_size, "prefill")? {
+        match (rank, reply) {
+            (0, TpWorkerReply::Prefill(result)) => primary = Some(result),
+            (0, reply) => anyhow::bail!(
+                "prefill rank 0 returned {} instead of primary prefill result",
+                reply_name(&reply)
+            ),
+            (_, TpWorkerReply::Ack) => {}
+            (rank, reply) => anyhow::bail!(
+                "prefill non-primary rank {rank} returned {} instead of acknowledgement",
+                reply_name(&reply)
+            ),
+        }
+    }
+    primary.ok_or_else(|| anyhow::anyhow!("prefill returned no primary result"))
+}
+
+fn validate_decode_responses(
+    responses: Vec<TpWorkerResponse>,
+    world_size: usize,
 ) -> Result<DecodeResult> {
-    let mut result = None;
-    for _ in 0..expected {
-        let response = recv_runtime_response(&responses, "decode", poison)?;
+    let mut primary = None;
+    for (rank, reply) in validate_exact_rank_responses(responses, world_size, "decode")? {
+        match (rank, reply) {
+            (0, TpWorkerReply::Decode(result)) => primary = Some(result),
+            (0, reply) => anyhow::bail!(
+                "decode rank 0 returned {} instead of primary decode result",
+                reply_name(&reply)
+            ),
+            (_, TpWorkerReply::Ack) => {}
+            (rank, reply) => anyhow::bail!(
+                "decode non-primary rank {rank} returned {} instead of acknowledgement",
+                reply_name(&reply)
+            ),
+        }
+    }
+    primary.ok_or_else(|| anyhow::anyhow!("decode returned no primary result"))
+}
+
+fn validate_unified_responses(
+    responses: Vec<TpWorkerResponse>,
+    world_size: usize,
+) -> Result<TpUnifiedResult> {
+    let mut primary = None;
+    for (rank, reply) in validate_exact_rank_responses(responses, world_size, "unified step")? {
+        match (rank, reply) {
+            (0, TpWorkerReply::Unified(result)) => primary = Some(result),
+            (0, reply) => anyhow::bail!(
+                "unified step rank 0 returned {} instead of primary unified result",
+                reply_name(&reply)
+            ),
+            (_, TpWorkerReply::Ack) => {}
+            (rank, reply) => anyhow::bail!(
+                "unified step non-primary rank {rank} returned {} instead of acknowledgement",
+                reply_name(&reply)
+            ),
+        }
+    }
+    primary.ok_or_else(|| anyhow::anyhow!("unified step returned no primary result"))
+}
+
+fn reply_name(reply: &TpWorkerReply) -> &'static str {
+    match reply {
+        TpWorkerReply::Ack => "acknowledgement",
+        TpWorkerReply::DropAck { .. } => "drop acknowledgement",
+        TpWorkerReply::Prefill(_) => "prefill result",
+        TpWorkerReply::Decode(_) => "decode result",
+        TpWorkerReply::Unified(_) => "unified result",
+        #[cfg(test)]
+        TpWorkerReply::Snapshot(_) => "worker snapshot",
+    }
+}
+
+#[cfg(test)]
+fn wait_for_worker_snapshots(
+    responses: &mpsc::Receiver<TpWorkerResponse>,
+    world_size: usize,
+    poison: &TpRuntimePoison,
+) -> Result<Vec<WorkerStateSnapshot>> {
+    let mut seen_ranks = HashSet::with_capacity(world_size);
+    let mut snapshots = Vec::with_capacity(world_size);
+    for _ in 0..world_size {
+        let response = recv_runtime_response(responses, "snapshot state", poison)?;
+        anyhow::ensure!(
+            response.rank < world_size,
+            "Qwen3.5 TP snapshot returned out-of-range rank {} for world size {world_size}",
+            response.rank
+        );
+        anyhow::ensure!(
+            seen_ranks.insert(response.rank),
+            "Qwen3.5 TP snapshot returned duplicate rank {}",
+            response.rank
+        );
         match response.result? {
-            TpWorkerReply::Ack => {}
-            TpWorkerReply::Decode(decode) => {
+            TpWorkerReply::Snapshot(snapshot) => {
                 anyhow::ensure!(
-                    response.rank == 0,
-                    "Qwen3.5 TP decode returned a primary result from rank {}",
+                    snapshot.rank == response.rank,
+                    "Qwen3.5 TP snapshot payload rank {} does not match response rank {}",
+                    snapshot.rank,
                     response.rank
                 );
                 anyhow::ensure!(
-                    result.is_none(),
-                    "Qwen3.5 TP decode returned multiple primary results"
+                    snapshot.request_count == snapshot.requests.len(),
+                    "Qwen3.5 TP rank {} snapshot count {} does not match {} request entries",
+                    snapshot.rank,
+                    snapshot.request_count,
+                    snapshot.requests.len()
                 );
-                result = Some(decode);
+                snapshots.push(snapshot);
+            }
+            TpWorkerReply::Ack => {
+                anyhow::bail!("Qwen3.5 TP snapshot unexpectedly returned acknowledgement")
+            }
+            TpWorkerReply::DropAck { .. } => {
+                anyhow::bail!("Qwen3.5 TP snapshot unexpectedly returned drop acknowledgement")
             }
             TpWorkerReply::Prefill(_) => {
-                anyhow::bail!("Qwen3.5 TP decode unexpectedly returned prefill result")
+                anyhow::bail!("Qwen3.5 TP snapshot unexpectedly returned prefill result")
+            }
+            TpWorkerReply::Decode(_) => {
+                anyhow::bail!("Qwen3.5 TP snapshot unexpectedly returned decode result")
+            }
+            TpWorkerReply::Unified(_) => {
+                anyhow::bail!("Qwen3.5 TP snapshot unexpectedly returned unified result")
             }
         }
     }
-    result.ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP decode returned no primary result"))
+    anyhow::ensure!(
+        (0..world_size).all(|rank| seen_ranks.contains(&rank)),
+        "Qwen3.5 TP snapshot response set did not contain every rank"
+    );
+    snapshots.sort_unstable_by_key(|snapshot| snapshot.rank);
+    Ok(snapshots)
 }
 
 fn recv_runtime_response(
@@ -1388,19 +2018,51 @@ mod tests {
     }
 
     #[test]
-    fn runtime_response_reports_any_rank_failure_immediately() {
+    fn runtime_response_failure_poisons_executor() {
+        let poison = TpRuntimePoison::default();
+        let responses = vec![
+            reply(0, TpWorkerReply::Ack),
+            TpWorkerResponse {
+                rank: 1,
+                result: Err(anyhow::anyhow!("rank 1 failed")),
+            },
+        ];
+
+        let err = validate_dispatched_responses(
+            validate_ack_responses(responses, 2, "test"),
+            "test",
+            &poison,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("rank 1 failed"));
+        assert!(poison.ensure_healthy().is_err());
+    }
+
+    #[test]
+    fn runtime_response_collection_fails_fast_when_peer_never_responds() {
         let poison = TpRuntimePoison::default();
         let (tx, rx) = mpsc::channel();
         tx.send(TpWorkerResponse {
-            rank: 1,
-            result: Err(anyhow::anyhow!("rank 1 failed")),
+            rank: 0,
+            result: Err(anyhow::anyhow!("rank 0 failed")),
         })
         .unwrap();
+        let _keep_peer_channel_connected = tx;
+        let mut receive_attempts = 0;
 
-        let err = wait_for_acks(rx, 2, "test", &poison)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("rank 1 failed"));
+        let err = collect_runtime_responses(2, "test", &poison, || {
+            receive_attempts += 1;
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .map_err(|err| anyhow::anyhow!("waited for nonresponding rank: {err}"))
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(receive_attempts, 1, "collector waited for the missing rank");
+        assert!(err.contains("rank 0 failed"));
+        assert!(!err.contains("waited for nonresponding rank"));
+        assert!(poison.ensure_healthy().is_err());
     }
 
     #[test]
@@ -1416,36 +2078,56 @@ mod tests {
         assert!(poison.ensure_healthy().is_err());
     }
 
-    #[test]
-    fn prefill_scratch_tokens_follow_budget_and_chunk_cap() {
-        assert_eq!(prefill_scratch_tokens(1_024), 1_024);
-        assert_eq!(prefill_scratch_tokens(PREFILL_CHUNK_LEN), 20_000);
-        assert_eq!(prefill_scratch_tokens(40_000), 20_000);
+    fn reply(rank: usize, reply: TpWorkerReply) -> TpWorkerResponse {
+        TpWorkerResponse {
+            rank,
+            result: Ok(reply),
+        }
     }
 
     #[test]
-    fn recurrent_capacity_reserves_runtime_and_prefill_headroom() {
-        const MIB: usize = 1024 * 1024;
-        assert_eq!(
-            effective_recurrent_capacity(64, 10_000 * MIB, 50 * MIB, 512 * MIB, 1_000 * MIB,),
-            64
-        );
-        assert_eq!(
-            effective_recurrent_capacity(64, 2_061 * MIB, 50 * MIB, 512 * MIB, 1_000 * MIB,),
-            10
-        );
-        assert_eq!(
-            effective_recurrent_capacity(64, 1_511 * MIB, 50 * MIB, 512 * MIB, 1_000 * MIB,),
-            0
-        );
-    }
+    fn mutating_partial_dispatch_cancels_delivered_prefix_and_poisons() {
+        let poison = TpRuntimePoison::default();
+        let (rank0_tx, rank0_rx) = mpsc::channel();
+        let (rank1_tx, rank1_rx) = mpsc::channel::<TpWorkerCommand>();
+        let senders = [rank0_tx, rank1_tx];
+        let err = dispatch_mutating_commands(
+            2,
+            "test prefill",
+            &poison,
+            |start, resp| TpWorkerCommand::RunPrefillChunks {
+                chunks: vec![TpPrefillChunkItem::new(
+                    RequestId::new(2),
+                    vec![9707],
+                    0,
+                    true,
+                )],
+                sample_seed: 0,
+                start,
+                resp,
+            },
+            |rank, command| {
+                if rank == 1 {
+                    anyhow::bail!("injected prefix-only dispatch failure");
+                }
+                senders[rank]
+                    .send(command)
+                    .map_err(|_| anyhow::anyhow!("test receiver disconnected"))
+            },
+        )
+        .unwrap_err()
+        .to_string();
 
-    #[test]
-    fn zero_sized_recurrent_state_keeps_requested_capacity() {
-        assert_eq!(
-            effective_recurrent_capacity(64, 0, 0, usize::MAX, usize::MAX),
-            64
-        );
+        assert!(err.contains("injected prefix-only dispatch failure"));
+        let TpWorkerCommand::RunPrefillChunks { start, .. } = rank0_rx.recv().unwrap() else {
+            panic!("expected prefill command")
+        };
+        assert_eq!(start.wait(), TpCommandDecision::Cancel);
+        assert!(matches!(
+            rank1_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(poison.ensure_healthy().is_err());
     }
 
     #[test]
@@ -1509,111 +2191,330 @@ mod tests {
         assert!(err.contains("duplicate"));
     }
 
-    #[test]
-    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
-    fn starts_tp2_workers_and_broadcasts_lifecycle_commands() {
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
-        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
-            .expect("start TP2 executor");
-        assert_eq!(executor.world_size(), 2);
-        assert_eq!(executor.max_batch(), 1);
-        executor.ping_all().expect("ping all workers");
-        executor
-            .drop_request(RequestId::new(7))
-            .expect("drop request");
+    fn assert_workers_empty(executor: &Qwen35TpExecutor) {
+        let snapshots = executor
+            .snapshot_workers()
+            .expect("snapshot healthy TP workers");
+        assert_snapshots_empty(&snapshots, executor.world_size());
+    }
+
+    fn assert_snapshots_empty(snapshots: &[WorkerStateSnapshot], world_size: usize) {
+        assert_eq!(snapshots.len(), world_size);
+        for (rank, snapshot) in snapshots.iter().enumerate() {
+            assert_eq!(snapshot.rank, rank);
+            assert_eq!(snapshot.request_count, 0, "rank {rank} retained requests");
+            assert!(
+                snapshot.requests.is_empty(),
+                "rank {rank} retained request IDs"
+            );
+        }
     }
 
     #[test]
     #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
-    fn tp2_default_capacity_is_memory_safe() {
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
-        let executor = Qwen35TpExecutor::from_runtime(&model_path, false, &[0, 1])
-            .expect("start TP2 executor with memory-derived capacity");
-        eprintln!(
-            "Qwen3.5 TP2 memory-derived max_batch={}",
-            executor.max_batch()
+    fn tp2_drop_expectations_detect_rank_lifecycle_divergence() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_drop_expectations_detect_rank_lifecycle_divergence",
+        ) else {
+            return;
+        };
+        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
+            .expect("start TP2 executor");
+
+        executor
+            .drop_request(RequestId::new(400), DropExpectation::MustBeAbsent)
+            .expect("pre-materialization drop should observe all ranks absent");
+        executor.ping_all().expect("absent drop preserves health");
+
+        let clean_id = RequestId::new(401);
+        executor
+            .execute_prefill(PrefillPlan {
+                requests: &[PrefillStepItem::new(clean_id, vec![151_646, 9707], 0)],
+            })
+            .expect("materialize clean request");
+        executor
+            .drop_request(clean_id, DropExpectation::MustExist)
+            .expect("materialized drop should observe all ranks present");
+        assert_workers_empty(&executor);
+
+        let divergent_id = RequestId::new(402);
+        executor
+            .execute_prefill(PrefillPlan {
+                requests: &[PrefillStepItem::new(divergent_id, vec![151_646, 9707], 0)],
+            })
+            .expect("materialize divergent request");
+        assert!(
+            executor
+                .remove_worker_request_state_for_test(1, divergent_id)
+                .expect("remove rank-1 request state")
         );
-        assert!(executor.max_batch() > 0);
-        assert!(executor.max_batch() <= MAX_BATCH);
+        let err = executor
+            .drop_request(divergent_id, DropExpectation::MustExist)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MustExist"));
+        assert!(executor.ping_all().is_err());
+        let snapshots = executor
+            .snapshot_workers_unchecked_for_test()
+            .expect("snapshot workers after mixed drop poison");
+        assert_snapshots_empty(&snapshots, executor.world_size());
     }
 
     #[test]
     #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
-    fn tp2_prefill_runs_and_returns_primary_result() {
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
+    fn tp2_partial_dispatch_gate_prevents_rank_local_mutation() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_partial_dispatch_gate_prevents_rank_local_mutation",
+        ) else {
+            return;
+        };
         let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
             .expect("start TP2 executor");
-        let request_id = RequestId::new(11);
-        let request = PrefillStepItem::new(request_id, vec![151_646, 9707], 0);
-        let result = executor
-            .execute_prefill(PrefillPlan {
-                requests: &[request],
-            })
-            .expect("run TP2 prefill");
-        assert_eq!(result.requests.len(), 1);
-        assert_eq!(result.requests[0].request_id, request_id);
+        let chunk = TpPrefillChunkItem::new(RequestId::new(410), vec![151_646, 9707], 0, true);
+
+        let err = executor
+            .inject_prefill_dispatch_failure_for_test(&[chunk], 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("injected dispatch failure at rank 1"));
+        assert!(executor.ping_all().is_err());
+        let snapshots = executor
+            .snapshot_workers_unchecked_for_test()
+            .expect("snapshot workers after cancelled prefix dispatch");
+        assert_snapshots_empty(&snapshots, executor.world_size());
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_worker_receiver_disconnect_poisons_without_snapshot_claim() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_worker_receiver_disconnect_poisons_without_snapshot_claim",
+        ) else {
+            return;
+        };
+        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
+            .expect("start TP2 executor");
         executor
-            .drop_request(request_id)
-            .expect("drop prefetched request");
-    }
+            .disconnect_worker_receiver_for_test(1)
+            .expect("disconnect rank-1 worker receiver");
 
-    #[test]
-    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
-    fn tp2_chunked_prefill_advances_existing_request_state() {
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
-        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
-            .expect("start TP2 executor");
-        let request_id = RequestId::new(13);
-        let first = TpPrefillChunkItem::new(request_id, vec![151_646], 0, false);
-        let first_result = executor
-            .execute_prefill_chunks(&[first])
-            .expect("run non-final TP2 prefill chunk");
-        assert!(first_result.requests.is_empty());
-
-        let final_chunk = TpPrefillChunkItem::new(request_id, vec![9707], 0, true);
-        let final_result = executor
-            .execute_prefill_chunks(&[final_chunk])
-            .expect("run final TP2 prefill chunk");
-        assert_eq!(final_result.requests.len(), 1);
-        assert_eq!(final_result.requests[0].request_id, request_id);
-
-        executor
-            .drop_request(request_id)
-            .expect("drop chunk-prefilled request");
-    }
-
-    #[test]
-    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
-    fn tp2_decode_runs_after_prefill() {
-        let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .unwrap_or_else(|_| "/home/data/mgj/qwen35weights".to_string());
-        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
-            .expect("start TP2 executor");
-        let request_id = RequestId::new(17);
-        let request = PrefillStepItem::new(request_id, vec![151_646, 9707], 0);
-        let prefill = executor
+        let err = executor
             .execute_prefill(PrefillPlan {
-                requests: &[request],
+                requests: &[PrefillStepItem::new(
+                    RequestId::new(420),
+                    vec![151_646, 9707],
+                    0,
+                )],
             })
-            .expect("run TP2 prefill");
-        assert_eq!(prefill.requests.len(), 1);
-        assert_eq!(prefill.requests[0].request_id, request_id);
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to dispatch prefill chunks to TP worker rank 1"));
+        assert!(executor.ping_all().is_err());
+    }
 
-        let decode_request = DecodeStepItem::new(request_id, prefill.requests[0].first_token, 0);
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_unified_step_advances_prefill_and_decode_together() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_unified_step_advances_prefill_and_decode_together",
+        ) else {
+            return;
+        };
+        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 2)
+            .expect("start TP2 executor");
+        let decode_id = RequestId::new(30);
+        let decode_prefill = executor
+            .execute_prefill(PrefillPlan {
+                requests: &[PrefillStepItem::new(decode_id, vec![151_646, 9707], 1)],
+            })
+            .expect("materialize TP2 decode request");
+        let prefill_id = RequestId::new(31);
+        let unified = executor
+            .execute_unified(&TpUnifiedPlan {
+                prefill: vec![TpPrefillChunkItem::new(
+                    prefill_id,
+                    vec![151_646, 9707],
+                    1,
+                    true,
+                )],
+                decode: vec![TpDecodeStepItem::new(
+                    decode_id,
+                    decode_prefill.requests[0].first_token,
+                    1,
+                    SamplingParams::default(),
+                )],
+                prefill_sample_seed: 102,
+                decode_sample_seed: 101,
+            })
+            .expect("run TP2 unified step");
+
+        assert_eq!(unified.prefill.requests.len(), 1);
+        assert_eq!(unified.prefill.requests[0].request_id, prefill_id);
+        assert!(unified.prefill.requests[0].first_token_logprob.is_some());
+        assert_eq!(unified.decode.requests.len(), 1);
+        assert_eq!(unified.decode.requests[0].request_id, decode_id);
+        assert!(unified.decode.requests[0].logprob.is_some());
+        for snapshot in executor.snapshot_workers().expect("snapshot unified state") {
+            assert_eq!(snapshot.request_count, 2);
+            assert!(
+                snapshot
+                    .requests
+                    .iter()
+                    .all(|(_, phase)| *phase == TpRequestPhase::Decoding)
+            );
+        }
+
+        for request_id in [decode_id, prefill_id] {
+            executor
+                .drop_request(request_id, DropExpectation::MustExist)
+                .expect("drop unified request");
+        }
+        assert_workers_empty(&executor);
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_drop_all_restores_complete_request_capacity() {
+        const CONFIGURED_MAX_BATCH: usize = 2;
+
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_drop_all_restores_complete_request_capacity",
+        ) else {
+            return;
+        };
+        let executor = Qwen35TpExecutor::from_runtime_with_capacity(
+            &model_path,
+            false,
+            &[0, 1],
+            CONFIGURED_MAX_BATCH,
+        )
+        .expect("start TP2 executor");
+        assert_eq!(executor.max_batch(), CONFIGURED_MAX_BATCH);
+        assert_workers_empty(&executor);
+
+        let first_ids: Vec<_> = (100..100 + CONFIGURED_MAX_BATCH as u64)
+            .map(RequestId::new)
+            .collect();
+        let first_requests: Vec<_> = first_ids
+            .iter()
+            .map(|&request_id| PrefillStepItem::new(request_id, vec![151_646, 9707], 0))
+            .collect();
+        let first_results = executor
+            .execute_prefill(PrefillPlan {
+                requests: &first_requests,
+            })
+            .expect("fill complete TP2 request capacity");
+        assert_eq!(first_results.requests.len(), CONFIGURED_MAX_BATCH);
+        let expected_ids: HashSet<_> = first_ids.iter().copied().collect();
+        for snapshot in executor
+            .snapshot_workers()
+            .expect("snapshot full TP2 request capacity")
+        {
+            assert_eq!(snapshot.request_count, CONFIGURED_MAX_BATCH);
+            assert_eq!(
+                snapshot
+                    .requests
+                    .iter()
+                    .map(|(request_id, _)| *request_id)
+                    .collect::<HashSet<_>>(),
+                expected_ids
+            );
+            assert!(
+                snapshot
+                    .requests
+                    .iter()
+                    .all(|(_, phase)| *phase == TpRequestPhase::Decoding),
+                "rank {} retained a non-decoding request after final prefill",
+                snapshot.rank
+            );
+        }
+        for request_id in &first_ids {
+            executor
+                .drop_request(*request_id, DropExpectation::MustExist)
+                .expect("drop first-pass TP2 request");
+        }
+        assert_workers_empty(&executor);
+
+        let second_ids: Vec<_> = (200..200 + CONFIGURED_MAX_BATCH as u64)
+            .map(RequestId::new)
+            .collect();
+        let second_requests: Vec<_> = second_ids
+            .iter()
+            .map(|&request_id| PrefillStepItem::new(request_id, vec![151_646, 9707], 0))
+            .collect();
+        let second_prefill = executor
+            .execute_prefill(PrefillPlan {
+                requests: &second_requests,
+            })
+            .expect("refill complete TP2 request capacity");
+        assert_eq!(second_prefill.requests.len(), CONFIGURED_MAX_BATCH);
+        let decode_requests: Vec<_> = second_prefill
+            .requests
+            .iter()
+            .map(|result| DecodeStepItem::new(result.request_id, result.first_token, 0))
+            .collect();
         let decode = executor
             .execute_decode(DecodePlan {
-                requests: &[decode_request],
+                requests: &decode_requests,
             })
-            .expect("run TP2 eager decode");
-        assert_eq!(decode.requests.len(), 1);
-        assert_eq!(decode.requests[0].request_id, request_id);
+            .expect("complete one decode step after TP2 capacity refill");
+        assert_eq!(decode.requests.len(), CONFIGURED_MAX_BATCH);
+        for request_id in &second_ids {
+            executor
+                .drop_request(*request_id, DropExpectation::MustExist)
+                .expect("drop second-pass TP2 request");
+        }
+        assert_workers_empty(&executor);
+    }
 
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_readmission_matches_clean_first_token_artifact() {
+        const REQUESTED_LOGPROBS: usize = 5;
+
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_readmission_matches_clean_first_token_artifact",
+        ) else {
+            return;
+        };
+        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
+            .expect("start TP2 executor");
+        let prompt = vec![151_646, 9707];
+
+        let clean_id = RequestId::new(300);
+        let clean_request = PrefillStepItem::new(clean_id, prompt.clone(), REQUESTED_LOGPROBS);
+        let clean = executor
+            .execute_prefill(PrefillPlan {
+                requests: &[clean_request],
+            })
+            .expect("run clean TP2 prefill");
+        assert_eq!(clean.requests.len(), 1);
+        assert!(clean.requests[0].first_token_logprob.is_some());
+        let clean_artifact = (
+            clean.requests[0].first_token,
+            clean.requests[0].first_token_logprob.clone(),
+        );
         executor
-            .drop_request(request_id)
-            .expect("drop decoded request");
+            .drop_request(clean_id, DropExpectation::MustExist)
+            .expect("drop clean TP2 request");
+        assert_workers_empty(&executor);
+
+        let readmitted_id = RequestId::new(301);
+        let readmitted_request = PrefillStepItem::new(readmitted_id, prompt, REQUESTED_LOGPROBS);
+        let readmitted = executor
+            .execute_prefill(PrefillPlan {
+                requests: &[readmitted_request],
+            })
+            .expect("run readmitted TP2 prefill");
+        assert_eq!(readmitted.requests.len(), 1);
+        let readmitted_artifact = (
+            readmitted.requests[0].first_token,
+            readmitted.requests[0].first_token_logprob.clone(),
+        );
+        assert_eq!(readmitted_artifact, clean_artifact);
+        executor
+            .drop_request(readmitted_id, DropExpectation::MustExist)
+            .expect("drop readmitted TP2 request");
+        assert_workers_empty(&executor);
     }
 }

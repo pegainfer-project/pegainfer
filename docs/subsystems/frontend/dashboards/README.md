@@ -19,7 +19,7 @@ The dashboard intentionally omits prefix-cache query/hit, speculative-decode, re
 
 ### CPU validation
 
-- `cargo test --release -p pegainfer-sim --test frontend_e2e`: 9 passed, including request serving and per-engine scheduler metric coverage.
+- `cargo test --release -p pegainfer-sim --test frontend_e2e`: request serving plus per-engine scheduler gauges from the stepped path (idle settle after a request; running rises on a slow request).
 - Sent two batches of 8 concurrent completion requests through a standalone `pegainfer-sim` server. The first scrape recorded 8 completed requests, 64 prompt tokens, 128 generated tokens, HTTP handler/status counters, and non-empty TTFT, ITL, E2E, queue, prefill, and decode histograms.
 - Prometheus 2.51.2 scraped the simulator at one-second intervals with target health `up`. All 21 dashboard PromQL targets returned `status=success` and at least one series after substituting a 30-second rate interval and the simulator model name.
 

@@ -37,6 +37,7 @@ use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
+use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
 use vllm_engine_core_client::protocol::utility::UtilityOutput;
 use vllm_engine_core_client::protocol::utility::UtilityResultEnvelope;
@@ -52,9 +53,10 @@ use zeromq::util::PeerIdentity;
 use crate::engine::EngineHandle;
 use crate::engine::FinishReason;
 use crate::engine::GenerateRequest;
-use crate::engine::LoadSnapshot;
 use crate::engine::RequestAbortReason;
 use crate::engine::RequestTag;
+use crate::engine::SchedulerMetrics;
+use crate::engine::SpecDecodeCounters;
 use crate::engine::TokenEvent;
 use crate::engine::TokenSink;
 use crate::engine::TokenStreamReceiver;
@@ -71,7 +73,7 @@ pub(crate) struct LocalEngineBridge {
     pub(crate) max_model_len: u32,
     pub(crate) engine_index: u32,
     pub(crate) data_parallel_size: u32,
-    pub(crate) load_watch: Option<watch::Receiver<LoadSnapshot>>,
+    pub(crate) metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
 }
 
 impl LocalEngineBridge {
@@ -87,7 +89,7 @@ impl LocalEngineBridge {
             self.data_parallel_size,
             self.max_model_len,
             self.handle.kv_capacity(),
-            self.load_watch.clone(),
+            self.metrics_watch.clone(),
             &shutdown,
         )
         .await?;
@@ -265,11 +267,8 @@ impl LocalEngineBridge {
             return Ok(());
         };
 
-        // Fail loud on sampling parameters the engine cannot honor yet —
-        // silently ignoring a requested seed or penalty changes outputs
-        // without telling the client.
-        if let Some(unsupported) = crate::vllm::wire::unsupported_sampling(&sampling_params) {
-            warn!("request {request_id} rejected: unsupported sampling params: {unsupported}");
+        if let Some(unsupported) = crate::vllm::wire::unsupported_request_params(&sampling_params) {
+            warn!("request {request_id} rejected: {unsupported}");
             send_terminal_output(
                 self.engine_index,
                 output_tx,
@@ -589,7 +588,7 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
 /// vLLM `SchedulerStats` view of a load snapshot — what the frontend's
 /// Prometheus gauges (`scheduler_running`, `scheduler_waiting`,
 /// `kv_cache_usage`) and DP load balancer consume.
-pub(crate) fn scheduler_stats_from(snapshot: LoadSnapshot) -> SchedulerStats {
+pub(crate) fn scheduler_stats_from(snapshot: &SchedulerMetrics) -> SchedulerStats {
     SchedulerStats {
         num_running_reqs: snapshot.num_running_reqs,
         num_waiting_reqs: snapshot.num_waiting_reqs,
@@ -602,6 +601,29 @@ pub(crate) fn scheduler_stats_from(snapshot: LoadSnapshot) -> SchedulerStats {
     }
 }
 
+/// Per-interval spec-decode delta from two cumulative snapshots, in the wire
+/// shape the frontend increments its `vllm:spec_decode_*_total` counters by (see
+/// [`SpecDecodeCounters`] for why the transport carries totals and the wire
+/// carries deltas).
+fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> SpecDecodingStats {
+    let num_accepted_tokens_per_pos = cur
+        .num_accepted_tokens_per_pos
+        .iter()
+        .zip(&last.num_accepted_tokens_per_pos)
+        .map(|(cur_pos, last_pos)| cur_pos.saturating_sub(*last_pos))
+        .take(cur.num_spec_tokens as usize)
+        .collect();
+    SpecDecodingStats {
+        num_spec_tokens: cur.num_spec_tokens,
+        num_drafts: cur.num_drafts.saturating_sub(last.num_drafts),
+        num_draft_tokens: cur.num_draft_tokens.saturating_sub(last.num_draft_tokens),
+        num_accepted_tokens: cur
+            .num_accepted_tokens
+            .saturating_sub(last.num_accepted_tokens),
+        num_accepted_tokens_per_pos,
+    }
+}
+
 /// Forward every scheduler load snapshot as a stats-only output batch; the
 /// frontend records it into the shared Prometheus registry. Sends the current
 /// snapshot up front so the gauges initialize before the first step, then one
@@ -610,12 +632,27 @@ pub(crate) fn scheduler_stats_from(snapshot: LoadSnapshot) -> SchedulerStats {
 /// metrics and a request-routing black hole.
 async fn publish_scheduler_stats(
     engine_index: u32,
-    mut load_rx: watch::Receiver<LoadSnapshot>,
+    mut load_rx: watch::Receiver<SchedulerMetrics>,
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let mut last_spec = SpecDecodeCounters::default();
     loop {
-        let stats = scheduler_stats_from(*load_rx.borrow_and_update());
+        let snapshot = *load_rx.borrow_and_update();
+        let spec_decoding_stats = if let Some(cur) = &snapshot.spec_decode {
+            let delta = spec_decode_delta(&last_spec, cur);
+            last_spec = *cur;
+            // A zero-draft interval would divide by zero in the frontend's
+            // acceptance-rate log, and every counter moves only inside
+            // `observe_draft`, so dropping it loses nothing.
+            (delta.num_drafts > 0).then_some(delta)
+        } else {
+            // Reset so a drafter loaded later diffs from zero
+            last_spec = SpecDecodeCounters::default();
+            None
+        };
+        let mut stats = scheduler_stats_from(&snapshot);
+        stats.spec_decoding_stats = spec_decoding_stats;
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),
@@ -652,7 +689,7 @@ async fn connect_link(
     data_parallel_size: u32,
     max_model_len: u32,
     kv_capacity: Option<crate::engine::KvCapacity>,
-    load_watch: Option<watch::Receiver<LoadSnapshot>>,
+    metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
     shutdown: &CancellationToken,
 ) -> Result<BridgeLink> {
     wait_for_ipc_endpoint(input_address, shutdown).await?;
@@ -719,7 +756,7 @@ async fn connect_link(
     // bounded. The stepped bridge passes no watch here — its driver busy-polls
     // (every spin would become a message), so it reads the watch at send time
     // and stamps stats onto the batches it already emits instead.
-    if let Some(load_rx) = load_watch {
+    if let Some(load_rx) = metrics_watch {
         let stats_output_tx = output_tx.clone();
         let stats_shutdown = shutdown.clone();
         child_tasks.spawn(async move {
@@ -838,6 +875,7 @@ fn engine_output(
         stop_reason,
         events,
         kv_transfer_params: None,
+        ec_transfer_params: None,
         trace_headers: None,
         prefill_stats,
         routed_experts: None,

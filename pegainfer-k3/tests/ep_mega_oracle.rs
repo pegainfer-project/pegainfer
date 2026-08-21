@@ -154,7 +154,9 @@ fn config(fixture: &Fixture) -> K3ExecutorConfig {
     K3ExecutorConfig {
         max_batch: MAX_BATCH,
         max_ctx: fixture.max_ctx,
+        kv_pages: 0,
         num_layers: fixture.num_layers,
+        chunk_tokens: 0,
         // Eager either way: EP forces capture off and the reference has to
         // match. (The single-rank mega path does capture; this pins it off so
         // the two differ only in world size.)
@@ -378,14 +380,22 @@ fn peer_run(executor: &mut K3Executor, rank: usize, prompt: &[u32], peers: Peers
         }
         Peers::Busy => {
             // A rotation of the fixture prompt: real, in-vocab, diverse tokens,
-            // distinct per rank, and the same length, so the peer spends
-            // exactly as many steps as rank 0 does.
+            // distinct per rank, and the same length as rank 0's.
             let mut own = prompt.to_vec();
             own.rotate_left(rank);
             let params = SamplingParams::default();
             let mut last = executor
                 .prefill(0, &own, &params)
                 .expect("a peer prefill should run");
+            // Chunked prefill spends `ceil(len / cap)` steps where rank 0's
+            // forced replay spends one step per token, so the peer pads the
+            // difference — which is exactly what a free-running rank does
+            // whenever its work ends before its peers'.
+            let walked = own.len().div_ceil(executor.chunk_tokens()) + DECODE_STEPS;
+            assert!(
+                walked <= steps,
+                "rank {rank}: walked {walked} steps, rank 0 only takes {steps}"
+            );
             for _ in 0..DECODE_STEPS {
                 last = executor
                     .decode(&[DecodeSlot {
@@ -394,11 +404,11 @@ fn peer_run(executor: &mut K3Executor, rank: usize, prompt: &[u32], peers: Peers
                     }])
                     .expect("a peer decode should run")[0];
             }
-            assert_eq!(
-                own.len() + DECODE_STEPS,
-                steps,
-                "rank {rank}: a peer must walk the same number of steps as rank 0"
-            );
+            for _ in walked..steps {
+                executor
+                    .decode(&[])
+                    .expect("a peer padding step should run");
+            }
         }
     }
 }

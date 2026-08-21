@@ -28,11 +28,25 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    pub fn new(num_layers: usize, num_kv_heads: usize, head_dim: usize, page_size: usize) -> Self {
-        let kv_block_len = page_size * num_kv_heads * head_dim;
-        let layer_stride = 2 * kv_block_len;
-        let page_stride = num_layers * layer_stride;
-        Self {
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+    ) -> anyhow::Result<Self> {
+        let strides = || -> Option<(usize, usize, usize)> {
+            let kv_block_len = page_size.checked_mul(num_kv_heads)?.checked_mul(head_dim)?;
+            let layer_stride = kv_block_len.checked_mul(2)?;
+            let page_stride = num_layers.checked_mul(layer_stride)?;
+            Some((kv_block_len, layer_stride, page_stride))
+        };
+        let (kv_block_len, layer_stride, page_stride) = strides().ok_or_else(|| {
+            anyhow::anyhow!(
+                "kv layout strides overflow usize: {num_layers} layers x {num_kv_heads} heads x \
+                 {head_dim} dim x {page_size} page"
+            )
+        })?;
+        Ok(Self {
             page_size,
             num_layers,
             num_kv_heads,
@@ -40,7 +54,7 @@ impl KvLayout {
             kv_block_len,
             layer_stride,
             page_stride,
-        }
+        })
     }
 
     pub fn kernel_layout(&self) -> pegainfer_kernels::paged_kv::PagedKvLayout {
@@ -91,8 +105,22 @@ impl KvPool {
         page_size: usize,
         num_pages: usize,
     ) -> Result<Self> {
-        let layout = KvLayout::new(num_layers, num_kv_heads, head_dim, page_size);
-        let total_elements = num_pages * layout.page_stride;
+        let layout = KvLayout::new(num_layers, num_kv_heads, head_dim, page_size)?;
+        let total_elements = num_pages.checked_mul(layout.page_stride).ok_or_else(|| {
+            anyhow::anyhow!(
+                "KvPool geometry overflows: {num_pages} pages x {} elements per page",
+                layout.page_stride
+            )
+        })?;
+        // The allocator multiplies by the element size unchecked; answer
+        // for the byte domain here, before it does.
+        total_elements
+            .checked_mul(std::mem::size_of::<bf16>())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "KvPool geometry overflows the byte domain: {total_elements} bf16 elements"
+                )
+            })?;
 
         let buffer: CudaSlice<bf16> = ctx
             .stream
@@ -127,6 +155,13 @@ impl KvPool {
         &self.inner.layout
     }
 
+    /// Every state in this pool is a view into this one buffer, so an
+    /// executor can hold the pool and take page metadata from a plan rather
+    /// than from a request's state.
+    pub fn buffer(&self) -> &CudaSlice<bf16> {
+        &self.inner.buffer
+    }
+
     pub fn capacity_pages(&self) -> usize {
         self.inner.pool.capacity_pages()
     }
@@ -138,6 +173,32 @@ impl KvPool {
     /// Page index reserved for bucket CUDA Graph padding.
     pub fn padding_page_id(&self) -> i32 {
         self.inner.padding_permit.pages()[0].index() as i32
+    }
+
+    /// The schedule half of an atomic multi-pool admission: reserve from
+    /// every pool first, commit only when all reservations hold, and let a
+    /// failure roll the rest back by drop. Growing a request's own permit
+    /// instead cannot be undone.
+    pub fn try_reserve(&self, pages: usize) -> Option<KvReservation> {
+        self.inner
+            .pool
+            .try_acquire_many(pages)
+            .map(|permit| KvReservation { permit })
+    }
+}
+
+/// Returns its pages on drop unless committed via
+/// [`KvState::commit_reservation`].
+pub struct KvReservation {
+    permit: OwnedPagePermit,
+}
+
+impl KvReservation {
+    /// Append this reservation's page ids to a row the caller owns. A sliding
+    /// state rebuilds that row every step, so the pages land in one buffer
+    /// instead of one `Vec` per reservation.
+    pub fn extend_page_indices_i32(&self, row: &mut Vec<i32>) {
+        row.extend(self.permit.pages().iter().map(|p| p.index() as i32));
     }
 }
 
@@ -155,22 +216,22 @@ fn pages_needed(token_count: usize, page_size: usize) -> usize {
     token_count.div_ceil(page_size)
 }
 
+fn last_page_len_for(token_count: usize, page_size: usize) -> usize {
+    if token_count == 0 {
+        0
+    } else {
+        let rem = token_count % page_size;
+        if rem == 0 { page_size } else { rem }
+    }
+}
+
 impl KvState {
     pub fn seq_len(&self) -> usize {
         self.seq_len
     }
 
     pub fn last_page_len(&self) -> usize {
-        if self.seq_len == 0 {
-            0
-        } else {
-            let rem = self.seq_len % self.pool.inner.layout.page_size;
-            if rem == 0 {
-                self.pool.inner.layout.page_size
-            } else {
-                rem
-            }
-        }
+        last_page_len_for(self.seq_len, self.pool.inner.layout.page_size)
     }
 
     /// Page indices as i32 for GPU upload.
@@ -184,6 +245,12 @@ impl KvState {
 
     pub fn buffer(&self) -> &CudaSlice<bf16> {
         &self.pool.inner.buffer
+    }
+
+    /// Page ids only mean something against the pool that issued them, so an
+    /// executor holding a pool must check before indexing its buffer.
+    pub fn belongs_to(&self, pool: &KvPool) -> bool {
+        std::sync::Arc::ptr_eq(&self.pool.inner, &pool.inner)
     }
 
     pub fn layout(&self) -> &KvLayout {
@@ -207,17 +274,38 @@ impl KvState {
         Ok(())
     }
 
-    /// Advance sequence length after writing tokens.
+    pub fn held_pages(&self) -> usize {
+        self.permit.len()
+    }
+
+    /// The apply half of an atomic multi-pool admission. The reservation must
+    /// come from this state's pool, which the permit merge enforces.
+    pub fn commit_reservation(&mut self, reservation: KvReservation) {
+        self.permit.absorb(reservation.permit);
+    }
+
     pub fn advance(&mut self, count: usize) {
         self.seq_len += count;
     }
 
-    /// Build kernel-facing metadata for this request's KV.
     pub fn desc(&self) -> KvDesc<'_> {
         KvDesc {
             pages: self.permit.pages(),
             last_page_len: self.last_page_len(),
         }
+    }
+
+    pub fn desc_for_len(&self, seq_len: usize) -> Result<KvDesc<'_>> {
+        let held = self.permit.len();
+        let needed = pages_needed(seq_len, self.pool.inner.layout.page_size);
+        anyhow::ensure!(
+            held == needed,
+            "KvState holds {held} pages where {seq_len} tokens need exactly {needed}"
+        );
+        Ok(KvDesc {
+            pages: self.permit.pages(),
+            last_page_len: last_page_len_for(seq_len, self.pool.inner.layout.page_size),
+        })
     }
 
     /// Reset for a new request: return all pages, zero seq_len.
@@ -243,7 +331,7 @@ pub struct KvDesc<'a> {
 }
 
 impl KvDesc<'_> {
-    pub(crate) fn last_page_len(&self) -> usize {
+    pub fn last_page_len(&self) -> usize {
         self.last_page_len
     }
 
@@ -271,7 +359,7 @@ mod tests {
     #[test]
     fn stride_geometry_qwen35() {
         // Qwen3.5-4B: 8 full attn layers, 4 KV heads, head_dim=256, page_size=16
-        let l = KvLayout::new(8, 4, 256, 16);
+        let l = KvLayout::new(8, 4, 256, 16).expect("layout");
 
         assert_eq!(l.kv_block_len, 16 * 4 * 256); // 16384 elements
         assert_eq!(l.layer_stride, 2 * 16384); // 32768 (K + V)
@@ -283,7 +371,7 @@ mod tests {
     #[test]
     fn stride_geometry_qwen3() {
         // Qwen3-4B: 36 full attn layers, 4 KV heads, head_dim=128, page_size=16
-        let l = KvLayout::new(36, 4, 128, 16);
+        let l = KvLayout::new(36, 4, 128, 16).expect("layout");
 
         // 36 layers × 16384 = 589824 elements per page
         assert_eq!(l.page_stride, 589_824);

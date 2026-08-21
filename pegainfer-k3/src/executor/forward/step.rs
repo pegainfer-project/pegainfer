@@ -1,4 +1,9 @@
-//! One decode step: the certified engine's launch sequence, batched.
+//! One step of the forward pass: the certified engine's launch sequence,
+//! batched. Decode and a prefill chunk run the SAME trunk below; the arms
+//! diverge only at the leaves ([`decode`](super::decode) walks tokens through
+//! the KDA recurrence and absorbed paged MLA, [`prefill`](super::prefill)
+//! runs chunkwise FlashKDA and dense-FMHA MLA) and at the epilogue, which a
+//! chunk skips.
 //!
 //! The order below is the reference `decode_step` line for line. Two families
 //! of call replace a reference spelling rather than reproducing it, and both
@@ -28,12 +33,9 @@ use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use pegainfer_kernels::ops::K3_CONV_WIDTH;
 use pegainfer_kernels::ops::K3_MLA_HEADS;
 use pegainfer_kernels::ops::K3_MOE_QUANT_GROUP;
-use pegainfer_kernels::ops::K3_QK_DIM;
 use pegainfer_kernels::ops::K3_ROUTER_TOPK;
-use pegainfer_kernels::ops::K3_V_DIM;
 use pegainfer_kernels::ops::K3DeepGemmFp8Fp4Kind;
 use pegainfer_kernels::ops::K3MegaActivation;
 use pegainfer_kernels::ops::K3MegaShape;
@@ -42,19 +44,16 @@ use pegainfer_kernels::ops::argmax_bf16_split_into;
 use pegainfer_kernels::ops::copy_hidden_rows_raw_into;
 use pegainfer_kernels::ops::embedding_rows_into;
 use pegainfer_kernels::ops::extract_hidden_rows_raw_into;
-use pegainfer_kernels::ops::gather_hidden_tokens_into;
 use pegainfer_kernels::ops::k3_add2_batched_launch;
 use pegainfer_kernels::ops::k3_attnres_mix_batched_launch;
 use pegainfer_kernels::ops::k3_attnres_scores_batched_launch;
-use pegainfer_kernels::ops::k3_conv_silu_batched_launch;
 use pegainfer_kernels::ops::k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch;
 use pegainfer_kernels::ops::k3_fp8_scale_pack_ue8m0_launch;
-use pegainfer_kernels::ops::k3_kda_core_batched_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_land_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_mega_moe_launch;
 use pegainfer_kernels::ops::k3_mega_write_inputs_launch;
-use pegainfer_kernels::ops::k3_mla_attn_batched_launch;
+use pegainfer_kernels::ops::k3_mla_paged_attn_launch;
 use pegainfer_kernels::ops::k3_moe_gather_fp8_quant_masked_launch;
 use pegainfer_kernels::ops::k3_moe_local_route_metadata_launch;
 use pegainfer_kernels::ops::k3_moe_weighted_combine_launch;
@@ -63,38 +62,33 @@ use pegainfer_kernels::ops::k3_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::ops::k3_router_topk_batched_launch;
 use pegainfer_kernels::ops::k3_situ_and_mul_fp8_quant_masked_launch;
 use pegainfer_kernels::ops::k3_situ_batched_launch;
-use pegainfer_kernels::ops::scaled_add_rows_indexed_into;
 use pegainfer_kernels::tensor::DeviceContext;
-use pegainfer_kernels::tensor::DeviceMatrix;
 
-use super::buffers::K3_KDA_FUSED;
-use super::buffers::K3_KDA_WSM_PADDED;
-use super::buffers::K3_MLA_FUSED;
-use super::buffers::K3LayerState;
-use super::buffers::K3Scratch;
-use super::buffers::K3StatePool;
-use super::buffers::parity_pair;
-use super::gemm::K3PartialSpan;
+use super::super::buffers::K3_MLA_FUSED;
+use super::super::buffers::K3LayerState;
+use super::super::buffers::K3Scratch;
+use super::super::buffers::K3StatePool;
+use super::super::buffers::parity_pair;
+use super::super::paged_kv::K3_KV_PAGE_TOKENS;
+use super::super::paged_kv::K3_MLA_LATENT_ROW;
+use super::super::paged_kv::K3PagedKv;
+use super::decode::kda_attention;
 use super::gemm::k3_gemm_full;
-use super::gemm::k3_gemm_partial;
+use super::prefill::kda_attention_chunk;
+use super::prefill::mla_attention_chunk_fmha;
 use crate::config::K3_ATTN_INNER;
 use crate::config::K3_DENSE_INTERMEDIATE;
 use crate::config::K3_EXPERT_INTERMEDIATE;
-use crate::config::K3_HEAD_DIM;
-use crate::config::K3_HEADS;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_KV_A_OUT;
-use crate::config::K3_KV_B_OUT;
 use crate::config::K3_KV_LORA_RANK;
 use crate::config::K3_Q_B_OUT;
 use crate::config::K3_Q_LORA_RANK;
-use crate::config::K3_QK_NOPE_HEAD_DIM;
 use crate::config::K3_QK_ROPE_HEAD_DIM;
 use crate::config::K3_ROUTED_EXPERT_HIDDEN;
 use crate::config::K3_SHARED_INTERMEDIATE;
 use crate::config::K3_VOCAB;
 use crate::model::K3ExpertBankForm;
-use crate::model::K3KdaWeights;
 use crate::model::K3LayerAttention;
 use crate::model::K3LayerMlp;
 use crate::model::K3LayerWeights;
@@ -108,13 +102,15 @@ pub(crate) struct K3StepShape {
     /// Compiled batch bucket every kernel runs at.
     pub(crate) bucket: usize,
     /// Leading rows of the bucket this rank actually owns this step; the rest
-    /// are padding. Only the expert-parallel MegaMoE path reads it — see
-    /// [`routed_experts_mega`].
+    /// are padding. The expert-parallel MegaMoE path reads it (see
+    /// [`routed_experts_mega`]), and a prefill chunk reads it as its live
+    /// token count.
     pub(crate) live_rows: usize,
     /// Which half of each ping-pong state slab this step reads.
     pub(crate) parity: usize,
-    /// Slots per sequence in the MLA cache.
-    pub(crate) max_ctx: usize,
+    /// Prefill chunks only: tokens of the sequence already cached before this
+    /// chunk (the MLA context span). Zero for decode steps.
+    pub(crate) chunk_start: usize,
     /// Rank-local expert groups (the masked GEMM's instantiation).
     pub(crate) groups: usize,
     /// Rows reserved per expert in the masked layout.
@@ -137,30 +133,84 @@ impl K3StepShape {
     }
 }
 
-/// Advance every row of the bucket by one token and leave the sampled ids in
-/// `scratch.argmax_indices`.
+/// One slot's contiguous row segment of a verify step, and how its KDA state
+/// advances across it.
 ///
-/// Reads `scratch.token_ids`, `scratch.context_len` and `scratch.cache_row`;
-/// the caller fills those before the step (or before the graph replay).
-///
-/// Every MoE layer issues the same launches in the same order on every rank —
-/// including a step whose batch is empty — which is what lets an
-/// expert-parallel group run without a coordinator.
-pub(crate) fn k3_decode_step(
+/// A verify step packs several slots into one bucket: each contributes its
+/// deferred-commit replay (the tokens the last round accepted, whose KDA
+/// state advance was deferred) followed by its speculative span (the anchor
+/// and the drafts under verification). The commit rows move the slot's
+/// recurrent/conv state from its parity slab into the other one; the spec
+/// rows continue from that committed state but their successor state is
+/// discarded — acceptance is not known until the host reads the argmaxes
+/// back, so the accepted prefix replays as the NEXT round's commit rows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct K3KdaGroup {
+    /// First batch row of the segment.
+    pub(crate) row: usize,
+    /// Leading replay rows whose state advance commits (parity flips).
+    pub(crate) commit_rows: usize,
+    /// Trailing speculative rows whose successor state is discarded.
+    pub(crate) spec_rows: usize,
+    /// The slot's row in the state pool's KDA/conv slabs.
+    pub(crate) state_row: usize,
+    /// Which parity slab holds the slot's committed state.
+    pub(crate) parity: usize,
+}
+
+/// Which of the three step families this launch sequence runs. The trunk is
+/// identical; the arms diverge at the KDA/MLA leaves and the epilogue.
+#[derive(Clone, Copy)]
+pub(crate) enum K3StepMode<'a> {
+    /// One independent sequence per row: fused per-token KDA core, absorbed
+    /// paged MLA, full epilogue.
+    Decode,
+    /// Rows are consecutive tokens of ONE sequence: chunkwise KDA, dense-FMHA
+    /// MLA, no epilogue (the boundary sample runs separately).
+    PrefillChunk,
+    /// Speculative verify: rows are packed per-slot segments. Chunkwise KDA
+    /// per group with deferred commit, absorbed paged MLA over the packed
+    /// verify table, full epilogue (the argmaxes decide acceptance).
+    Verify(&'a [K3KdaGroup]),
+}
+
+/// Where a step deposits the aux hidden states the DSpark draft lane feeds
+/// on: for each tap layer `t`, rows `0..rows` of the pre-norm snapshot
+/// mixture read at the top of layer `t + 1` (what SGLang's
+/// `_dspark_capture_stream` distilled — with the attn-res bank, K3's "stream
+/// value after layer t" is the mixture its next consumer computes, not the
+/// raw residual) are copied into their column segment of `slab`
+/// (`[capacity, taps.len() * hidden]`, tap order = column order). Pure extra
+/// dtod traffic — nothing in the step reads it back.
+pub(crate) struct K3AuxSink<'a> {
+    pub(crate) slab: &'a mut CudaSlice<bf16>,
+    /// Leading step rows to capture (a chunk's live tokens, a verify step's
+    /// packed rows).
+    pub(crate) rows: usize,
+    /// 0-based tap layer indices; tap `t` is captured at the top of `t + 1`.
+    pub(crate) taps: &'a [usize],
+}
+
+pub(super) fn k3_step(
     ctx: &DeviceContext,
     model: &K3RankModel,
     shape: K3StepShape,
+    mode: K3StepMode<'_>,
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
+    mut aux: Option<K3AuxSink<'_>>,
 ) -> Result<()> {
     let b = shape.bucket;
     let K3StatePool {
         layers: layer_state,
+        kv,
         blocks: snapshots,
         block_count,
         ..
     } = state;
     let block_count = *block_count;
+    // Index of the current MLA layer within the paged pool's layer slices.
+    let mut mla_index = 0usize;
 
     embedding_rows_into(
         ctx,
@@ -170,7 +220,8 @@ pub(crate) fn k3_decode_step(
         &mut scratch.hidden,
     )?;
 
-    for (layer, layer_state) in model.layers.iter().zip(layer_state.iter_mut()) {
+    for (index, (layer, layer_state)) in model.layers.iter().zip(layer_state.iter_mut()).enumerate()
+    {
         let geometry = layer.geometry;
         copy_rows(ctx, &scratch.hidden, &mut scratch.prefix, b * K3_HIDDEN)?;
         if geometry.nb_in > 0 {
@@ -187,6 +238,25 @@ pub(crate) fn k3_decode_step(
         } else {
             copy_rows(ctx, &scratch.prefix, &mut scratch.mixed, b * K3_HIDDEN)?;
         }
+        // DSpark aux capture. The checkpoint was distilled from SGLang's
+        // capture points, and with K3's attn-res bank those are NOT the raw
+        // residual stream: tap layer `t` captures the pre-norm snapshot
+        // mixture layer `t+1`'s attention consumes (`_dspark_capture_stream`
+        // / `aggregate_stream` upstream) — exactly `scratch.mixed` here.
+        if index > 0
+            && let Some(sink) = aux.as_mut()
+            && let Some(tap) = sink.taps.iter().position(|&t| t + 1 == index)
+        {
+            copy_hidden_rows_raw_into(
+                ctx,
+                &scratch.mixed,
+                K3_HIDDEN,
+                sink.slab,
+                sink.taps.len() * K3_HIDDEN,
+                tap * K3_HIDDEN,
+                sink.rows,
+            )?;
+        }
         if geometry.snapshot {
             // `blk[:, nb_in, :] = ps` — the snapshot the later mixes see.
             copy_hidden_rows_raw_into(
@@ -201,24 +271,42 @@ pub(crate) fn k3_decode_step(
         }
 
         match (&layer.attn, layer_state) {
-            (K3LayerAttention::Kda(kda), K3LayerState::Kda(kda_state)) => {
-                let (recurrent_read, recurrent_write) =
-                    parity_pair(&mut kda_state.recurrent, shape.parity);
-                let (conv_read, conv_write) = parity_pair(&mut kda_state.conv, shape.parity);
-                kda_attention(
-                    ctx,
-                    b,
-                    layer,
-                    kda,
-                    recurrent_read,
-                    recurrent_write,
-                    conv_read,
-                    conv_write,
-                    scratch,
-                )?;
-            }
-            (K3LayerAttention::Mla(mla), K3LayerState::Mla(mla_state)) => {
-                mla_attention(ctx, b, shape, layer, mla, mla_state, scratch)?;
+            (K3LayerAttention::Kda(kda), K3LayerState::Kda(kda_state)) => match mode {
+                K3StepMode::Decode => {
+                    let (recurrent_read, recurrent_write) =
+                        parity_pair(&mut kda_state.recurrent, shape.parity);
+                    let (conv_read, conv_write) = parity_pair(&mut kda_state.conv, shape.parity);
+                    kda_attention(
+                        ctx,
+                        b,
+                        layer,
+                        kda,
+                        recurrent_read,
+                        recurrent_write,
+                        conv_read,
+                        conv_write,
+                        scratch,
+                    )?;
+                }
+                K3StepMode::PrefillChunk => {
+                    // A prefill chunk is the one-group case: the whole chunk
+                    // commits, from the pool's single state row.
+                    let chunk = [K3KdaGroup {
+                        row: 0,
+                        commit_rows: shape.live_rows,
+                        spec_rows: 0,
+                        state_row: 0,
+                        parity: shape.parity,
+                    }];
+                    kda_attention_chunk(ctx, shape, layer, kda, kda_state, &chunk, scratch)?;
+                }
+                K3StepMode::Verify(groups) => {
+                    kda_attention_chunk(ctx, shape, layer, kda, kda_state, groups, scratch)?;
+                }
+            },
+            (K3LayerAttention::Mla(mla), K3LayerState::Mla) => {
+                mla_attention(ctx, shape, mode, layer, mla, kv, mla_index, scratch)?;
+                mla_index += 1;
             }
             _ => anyhow::bail!("K3 layer state does not match the layer's attention kind"),
         }
@@ -324,6 +412,14 @@ pub(crate) fn k3_decode_step(
         )?;
     }
 
+    // A prefill chunk stops here: only the boundary token's sample is ever
+    // read, so the caller runs [`super::k3_prefill_boundary_sample`] once
+    // after the final chunk instead of paying a chunk-wide lm_head per step —
+    // which also keeps the vocab-wide buffers sized by the decode rows, not
+    // the chunk bucket.
+    if matches!(mode, K3StepMode::PrefillChunk) {
+        return Ok(());
+    }
     attn_res(
         ctx,
         b,
@@ -373,7 +469,7 @@ pub(crate) fn k3_decode_step(
 
 /// Score the `blocks + 1` attention-residual candidates and mix them.
 #[allow(clippy::too_many_arguments)]
-fn attn_res(
+pub(super) fn attn_res(
     ctx: &DeviceContext,
     b: usize,
     blocks: usize,
@@ -402,204 +498,20 @@ fn copy_rows(
         .map_err(|error| anyhow::anyhow!("K3 residual copy failed: {error}"))
 }
 
-// ── KDA ─────────────────────────────────────────────────────────────────
-
-#[allow(clippy::too_many_arguments)]
-fn kda_attention(
-    ctx: &DeviceContext,
-    b: usize,
-    layer: &K3LayerWeights,
-    w: &K3KdaWeights,
-    recurrent_read: &CudaSlice<f32>,
-    recurrent_write: &mut CudaSlice<f32>,
-    conv_read: &[CudaSlice<bf16>; 3],
-    conv_write: &mut [CudaSlice<bf16>; 3],
-    s: &mut K3Scratch,
-) -> Result<()> {
-    k3_rms_norm_rbs_batched_launch(
-        ctx,
-        b,
-        K3_HIDDEN,
-        &s.mixed,
-        &layer.gamma_in.data,
-        &mut s.normed,
-    )?;
-
-    // The output-gate quarter of the fused q|k|v|gate projection, placed where
-    // the certified `(4 * inner, inner, 3 * inner)` landing span expects it.
-    k3_gemm_partial(
-        ctx,
-        &w.wbig,
-        3 * K3_ATTN_INNER,
-        K3_ATTN_INNER,
-        &s.normed,
-        b,
-        &mut s.kda_gate_partial,
-        K3PartialSpan {
-            offset: 3 * K3_ATTN_INNER,
-            stride: K3_KDA_FUSED,
-        },
-    )?;
-    k3_gemm_full(ctx, &w.wsm, &s.normed, b, &mut s.kda_wsm_partial)?;
-    k3_land_batched_launch(
-        ctx,
-        b,
-        K3_KDA_WSM_PADDED,
-        K3_HEADS,
-        0,
-        1,
-        &s.kda_wsm_partial,
-        &mut s.beta,
-    )?;
-    k3_land_batched_launch(
-        ctx,
-        b,
-        K3_KDA_WSM_PADDED,
-        K3_HEAD_DIM,
-        K3_HEADS,
-        1,
-        &s.kda_wsm_partial,
-        &mut s.forget_low,
-    )?;
-    k3_land_batched_launch(
-        ctx,
-        b,
-        K3_KDA_FUSED,
-        K3_ATTN_INNER,
-        3 * K3_ATTN_INNER,
-        1,
-        &s.kda_gate_partial,
-        &mut s.out_gate,
-    )?;
-    k3_gemm_full(ctx, &w.w_f_b, &s.forget_low, b, &mut s.kda_forget_partial)?;
-
-    kda_conv_stream(
-        ctx,
-        b,
-        &w.wbig,
-        0,
-        &w.cw_q,
-        &conv_read[0],
-        &mut conv_write[0],
-        &s.normed,
-        &mut s.kda_conv_partial,
-        &mut s.conv_x,
-        &mut s.conv_q,
-    )?;
-    kda_conv_stream(
-        ctx,
-        b,
-        &w.wbig,
-        K3_ATTN_INNER,
-        &w.cw_k,
-        &conv_read[1],
-        &mut conv_write[1],
-        &s.normed,
-        &mut s.kda_conv_partial,
-        &mut s.conv_x,
-        &mut s.conv_k,
-    )?;
-    kda_conv_stream(
-        ctx,
-        b,
-        &w.wbig,
-        2 * K3_ATTN_INNER,
-        &w.cw_v,
-        &conv_read[2],
-        &mut conv_write[2],
-        &s.normed,
-        &mut s.kda_conv_partial,
-        &mut s.conv_x,
-        &mut s.conv_v,
-    )?;
-
-    k3_kda_core_batched_launch(
-        ctx,
-        b,
-        K3_HEADS,
-        K3_HEAD_DIM,
-        1,
-        &s.conv_q,
-        &s.conv_k,
-        &s.conv_v,
-        &s.kda_forget_partial,
-        &w.dt_bias,
-        &w.a_log,
-        &s.beta,
-        &s.out_gate,
-        &w.gamma_o,
-        recurrent_read,
-        recurrent_write,
-        &mut s.gated,
-    )?;
-    k3_gemm_full(ctx, &w.w_o, &s.gated, b, &mut s.hidden_partial)?;
-    k3_land_batched_launch(
-        ctx,
-        b,
-        K3_HIDDEN,
-        K3_HIDDEN,
-        0,
-        1,
-        &s.hidden_partial,
-        &mut s.attn_out,
-    )
-}
-
-/// One q/k/v stream: its band of the fused projection, then the window.
-///
-/// The band goes to a partial of its own rather than into the fused one: the
-/// convolution reads a dense `[rows, inner]` partial, and slicing a column
-/// block out of the fused product would cost a strided f32 copy per stream.
-#[allow(clippy::too_many_arguments)]
-fn kda_conv_stream(
-    ctx: &DeviceContext,
-    b: usize,
-    fused: &DeviceMatrix,
-    band: usize,
-    taps: &CudaSlice<f32>,
-    window_read: &CudaSlice<bf16>,
-    window_write: &mut CudaSlice<bf16>,
-    normed: &CudaSlice<bf16>,
-    partial: &mut CudaSlice<f32>,
-    landed: &mut CudaSlice<bf16>,
-    out: &mut CudaSlice<bf16>,
-) -> Result<()> {
-    k3_gemm_partial(
-        ctx,
-        fused,
-        band,
-        K3_ATTN_INNER,
-        normed,
-        b,
-        partial,
-        K3PartialSpan::whole(K3_ATTN_INNER),
-    )?;
-    k3_conv_silu_batched_launch(
-        ctx,
-        b,
-        K3_ATTN_INNER,
-        K3_CONV_WIDTH,
-        1,
-        partial,
-        taps,
-        window_read,
-        landed,
-        out,
-        window_write,
-    )
-}
-
 // ── MLA ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn mla_attention(
     ctx: &DeviceContext,
-    b: usize,
     shape: K3StepShape,
+    mode: K3StepMode<'_>,
     layer: &K3LayerWeights,
     w: &K3MlaWeights,
-    state: &mut super::buffers::K3MlaState,
+    kv: &mut K3PagedKv,
+    mla_index: usize,
     s: &mut K3Scratch,
 ) -> Result<()> {
+    let b = shape.bucket;
     k3_rms_norm_rbs_batched_launch(
         ctx,
         b,
@@ -655,7 +567,7 @@ fn mla_attention(
         ctx,
         &s.kv_a,
         K3_KV_A_OUT,
-        &mut s.rope.data,
+        &mut s.rope,
         K3_QK_ROPE_HEAD_DIM,
         K3_KV_LORA_RANK,
         b,
@@ -668,6 +580,12 @@ fn mla_attention(
         &w.gamma_kv_a.data,
         &mut s.kv_norm,
     )?;
+    // Paged latent append: the post-norm kv latent and the shared rope half
+    // are the whole cached quantity (NoPE — nothing here is
+    // position-dependent), written into this layer's slice of the row's
+    // current page. The expanded K/V the reference builds from it is folded
+    // into the absorbed attention below.
+    kv.append_latent(ctx, mla_index, b, &s.kv_row, &s.kv_norm, &s.rope)?;
     k3_gemm_full(ctx, &w.w_q_b, &s.q_norm, b, &mut s.q_partial)?;
     k3_land_batched_launch(
         ctx,
@@ -679,85 +597,43 @@ fn mla_attention(
         &s.q_partial,
         &mut s.query,
     )?;
-    k3_gemm_full(ctx, &w.w_kv_b, &s.kv_norm, b, &mut s.kv_partial)?;
-    k3_land_batched_launch(
-        ctx,
-        b,
-        K3_KV_B_OUT,
-        K3_KV_B_OUT,
-        0,
-        1,
-        &s.kv_partial,
-        &mut s.kv,
-    )?;
 
-    // `kv` is `[rows, heads, nope | value]`. The cache row wants
-    // `[heads, nope | rope]` for K and `[heads, value]` for V, with the one
-    // rope half shared by every head.
-    let per_head = K3_QK_NOPE_HEAD_DIM + K3_HEAD_DIM;
-    let head_rows = b * K3_MLA_HEADS;
-    extract_hidden_rows_raw_into(
-        ctx,
-        &s.kv,
-        per_head,
-        &mut s.k_nope,
-        K3_QK_NOPE_HEAD_DIM,
-        0,
-        head_rows,
-    )?;
-    copy_hidden_rows_raw_into(
-        ctx,
-        &s.k_nope,
-        K3_QK_NOPE_HEAD_DIM,
-        &mut s.k_new.data,
-        K3_QK_DIM,
-        0,
-        head_rows,
-    )?;
-    s.rope.seq_len = b;
-    s.rope_heads.seq_len = head_rows;
-    gather_hidden_tokens_into(ctx, &s.rope, &s.head_row, head_rows, &mut s.rope_heads)?;
-    copy_hidden_rows_raw_into(
-        ctx,
-        &s.rope_heads.data,
-        K3_QK_ROPE_HEAD_DIM,
-        &mut s.k_new.data,
-        K3_QK_DIM,
-        K3_QK_NOPE_HEAD_DIM,
-        head_rows,
-    )?;
-    extract_hidden_rows_raw_into(
-        ctx,
-        &s.kv,
-        per_head,
-        &mut s.v_new.data,
-        K3_V_DIM,
-        K3_QK_NOPE_HEAD_DIM,
-        head_rows,
-    )?;
-
-    // The destination slot is zero until this step writes it — every position
-    // is written once and `release` clears the row — so an indexed add is an
-    // exact indexed copy, and it takes the destination row from the device.
-    s.k_new.seq_len = b;
-    s.v_new.seq_len = b;
-    scaled_add_rows_indexed_into(ctx, &s.k_new, 1.0, &s.cache_row, b, &mut state.k_cache, 0)?;
-    scaled_add_rows_indexed_into(ctx, &s.v_new, 1.0, &s.cache_row, b, &mut state.v_cache, 0)?;
-
-    k3_mla_attn_batched_launch(
-        ctx,
-        b,
-        K3_MLA_HEADS,
-        K3_QK_DIM,
-        K3_V_DIM,
-        shape.max_ctx,
-        &s.query,
-        &state.k_cache.data,
-        &state.v_cache.data,
-        &s.context_len,
-        &w.scale.data,
-        &mut s.attn,
-    )?;
+    if matches!(mode, K3StepMode::PrefillChunk) {
+        // Chunked prefill takes the non-absorbed dense route (vLLM's recipe):
+        // gather the cached latent — the chunk's own rows were appended just
+        // above, so the cache holds the whole [context | chunk] span — expand
+        // it through kv_b into per-head K/V scratch, and one bottom-right-
+        // aligned causal FMHA serves every chunk query. Only the paged latent
+        // persists. Padding rows of `attn` keep stale (finite) data; their
+        // results are discarded like everywhere else in the chunk path.
+        mla_attention_chunk_fmha(ctx, shape, w, kv, mla_index, s)?;
+    } else {
+        // Absorbed MLA over the paged latent: the kernel folds `w_kv_b`'s
+        // per-head W_UK into the query and expands the attended latent with
+        // W_UV, so the per-step kv_b expansion and the expanded K/V cache no
+        // longer exist. A verify step's rows are packed, not slot-indexed, so
+        // it walks the packed verify table; causality is the per-row context
+        // length either way.
+        let table = match mode {
+            K3StepMode::Verify(_) => &kv.verify_table_dev,
+            _ => &kv.table_dev,
+        };
+        k3_mla_paged_attn_launch(
+            ctx,
+            b,
+            K3_MLA_HEADS,
+            &s.query,
+            &w.w_kv_b.data,
+            &kv.slab,
+            mla_index * K3_KV_PAGE_TOKENS * K3_MLA_LATENT_ROW,
+            kv.page_stride(),
+            table,
+            kv.max_pages_per_slot,
+            &s.context_len,
+            &w.scale.data,
+            &mut s.attn,
+        )?;
+    }
     k3_mul_sigmoid_batched_launch(ctx, b, K3_ATTN_INNER, &s.attn, &s.mla_gate, &mut s.gated)?;
     k3_gemm_full(ctx, &w.w_o, &s.gated, b, &mut s.hidden_partial)?;
     k3_land_batched_launch(

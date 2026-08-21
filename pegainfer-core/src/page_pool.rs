@@ -86,6 +86,16 @@ impl OwnedPagePermit {
         self.pages.len()
     }
 
+    /// Both permits must lease from the same pool; merging across pools would
+    /// return pages to the wrong free list.
+    pub(crate) fn absorb(&mut self, mut other: OwnedPagePermit) {
+        assert!(
+            Arc::ptr_eq(&self.inner, &other.inner),
+            "absorb requires permits from the same pool"
+        );
+        self.pages.append(&mut other.pages);
+    }
+
     /// Try to acquire `n` more pages, appending them to this permit.
     /// Returns `true` on success. On failure the permit is unchanged.
     pub(crate) fn try_grow(&mut self, n: usize) -> bool {

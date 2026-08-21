@@ -1,7 +1,7 @@
 """Vendored TileLang kernel definitions for the K3 batched decode step.
 
 This file is a **verbatim** subset of the certified upstream kernel module: the
-shared prologue and the thirteen batched kernel factories, copied character for
+shared prologue and the ten batched kernel factories, copied character for
 character. Nothing here is re-spelled, re-indented or "cleaned up", and no
 kernel body is edited to fit this repository. The upstream module is the
 authority on what these kernels compute; it carries the bitwise parity gates
@@ -66,68 +66,18 @@ def _compile(prim):
 
 
 @lru_cache(maxsize=None)
-def router_topk_batched(E: int, TOPK: int, B: int, threads: int = 256):
-    """Batched version of ``router_topk``. The input S (B, E) holds **f32
-    score rows** (output of the framework-side f32 GEMM -- the authored
-    spelling already casts to f32 before the matmul; the ascending f32 merge
-    over the SK segments in the bs=1 version is equivalent to the row being
-    merged upstream). One row per block; sigmoid, bias add, serial top-k
-    selection, un-biased gather, and normalization times routed_scale are
-    word-for-word identical to the bs=1 version (lowest-index tie-break, Bias
-    taken in f32)."""
-    EP = ((E + threads - 1) // threads) * threads
-
-    @T.prim_func
-    def main(
-        S: T.Tensor((B, E), ACC),
-        Bias: T.Tensor((E,), ACC),
-        Rs: T.Tensor((1,), DT),
-        Idx: T.Tensor((B, TOPK), "int32"),
-        Wts: T.Tensor((B, TOPK), ACC),
-    ):
-        with T.Kernel(B, threads=threads) as bb:
-            scores = T.alloc_shared((E,), ACC)
-            biased = T.alloc_shared((E,), ACC)
-            best = T.alloc_var(ACC)
-            bi = T.alloc_var("int32")
-            den = T.alloc_var(ACC)
-            for e in T.Parallel(EP):
-                with T.If(e < E):
-                    with T.Then():
-                        scores[e] = T.sigmoid(S[bb, e])
-                        biased[e] = T.sigmoid(S[bb, e]) + Bias[e].astype(ACC)
-            T.sync_threads()
-            if T.get_thread_binding() == 0:
-                den = 0.0
-                for t in T.serial(TOPK):
-                    best = NEG
-                    bi = 0
-                    for e in T.serial(E):
-                        with T.If(biased[e] > best):
-                            with T.Then():
-                                best = biased[e]
-                                bi = e
-                    Idx[bb, t] = bi
-                    Wts[bb, t] = scores[bi]
-                    biased[bi] = NEG
-                    den += scores[bi]
-                for t in T.serial(TOPK):
-                    Wts[bb, t] = Wts[bb, t] / (den + 1e-20) * Rs[0].astype(ACC)
-
-    return _compile(main)
-
-
-@lru_cache(maxsize=None)
-def attnres_scores_batched(NB: int, H: int, B: int, eps: float,
+def attnres_scores_batched(NB: int, BC: int, H: int, B: int, eps: float,
                            threads: int = 256):
     """Batched version of ``attnres_scores``: block (b, c) computes candidate c
     of row b, and within a row (weightless rms normalization -> dot with the
     f32 fused scoring vector) it is word-for-word identical to the bs=1
-    version. Bl holds each row's own snapshot history (B, NB, H)."""
+    version. Bl holds each row's own snapshot history at the slab's fixed
+    (B, BC, H) row stride — BC is the slab's block capacity, NB the mix's
+    candidate count (NB <= BC; only the first NB blocks of a row are read)."""
     @T.prim_func
     def main(
         Ps: T.Tensor((B, H), DT),
-        Bl: T.Tensor((B, NB, H), DT),
+        Bl: T.Tensor((B, BC, H), DT),
         Sw: T.Tensor((H,), ACC),
         Sc: T.Tensor((B, NB + 1), ACC),
     ):
@@ -153,15 +103,16 @@ def attnres_scores_batched(NB: int, H: int, B: int, eps: float,
 
 
 @lru_cache(maxsize=None)
-def attnres_mix_batched(NB: int, H: int, B: int, threads: int = 256):
+def attnres_mix_batched(NB: int, BC: int, H: int, B: int, threads: int = 256):
     """Batched version of ``attnres_mix``: block (b, x) mixes column segment x
     of row b, each block redoes that row's NB+1 term softmax (same as the
     bs=1 version), mixes the un-normalized candidates by probability, and
-    lands bf16 once. Requires threads|H."""
+    lands bf16 once. Bl rows sit at the slab's fixed (B, BC, H) stride, with
+    only the first NB blocks read. Requires threads|H."""
     @T.prim_func
     def main(
         Ps: T.Tensor((B, H), DT),
-        Bl: T.Tensor((B, NB, H), DT),
+        Bl: T.Tensor((B, BC, H), DT),
         Sc: T.Tensor((B, NB + 1), ACC),
         O: T.Tensor((B, H), DT),
     ):
@@ -469,67 +420,32 @@ def kda_core_batched(KH: int, KD: int, SKG: int, B: int, lb: float, eps: float):
     return _compile(main)
 
 
-# --- MLA ------------------------------------------------------------------- #
+def o_norm_gate_batched(KH: int, KD: int, B: int, eps: float):
+    """``kda_core``'s tail on its own: per (row, head) the f32 rms_norm of the
+    bf16 attention landing times the o_norm gamma, landed once, times the bf16
+    sigmoid of the output-gate projection -- word-for-word the last loop of
+    ``kda_core_batched``. Chunked prefill computes the attention elsewhere
+    (FlashKDA) and finishes each row through this identical spelling."""
+    KP = KH * KD
 
-
-@lru_cache(maxsize=None)
-def mla_attn_batched(NH: int, QK: int, VD: int, CAP: int, B: int,
-                     threads: int = 128):
-    """Batched ``mla_attn``: block (b, h) attends row b's head h over row b's
-    own cache. The cache is **slot indexed** -- every sequence owns a fixed
-    CAP-slot window, so Kc/Vc simply gain a leading batch axis and a row's
-    cache is the contiguous bs=1 [CAP, NH*QK] / [CAP, NH*VD] block (this is not
-    a paged cache; there is no block table).
-
-    The context length is **per slot**: N is an i32 tensor of shape (B,) and
-    the mask predicate becomes ``s < N[bb]``, which is the only difference from
-    the bs=1 kernel's ``s < N[0]``. Out-of-range slots still score NEG, so a
-    row at length n is bit-for-bit the bs=1 kernel run at that n, whatever the
-    other rows' lengths are. Sc (the bf16 softmax scale) is a config constant
-    shared by every row. Landings (f32 dot -> bf16 -> times the bf16 scale ->
-    bf16 -> f32 softmax -> bf16 probabilities -> f32 V accumulation -> one
-    bf16 landing) are the bs=1 body verbatim."""
     @T.prim_func
     def main(
-        Q: T.Tensor((B, NH * QK), DT),
-        Kc: T.Tensor((B, CAP, NH * QK), DT),
-        Vc: T.Tensor((B, CAP, NH * VD), DT),
-        N: T.Tensor((B,), "int32"),
-        Sc: T.Tensor((1,), DT),
-        O: T.Tensor((B, NH * VD), DT),
+        X: T.Tensor((B, KP), DT),
+        G2: T.Tensor((B, KP), DT),
+        Go: T.Tensor((KD,), ACC),
+        Out: T.Tensor((B, KP), DT),
     ):
-        with T.Kernel(B, NH, threads=threads) as (bb, bh):
-            Qs = T.alloc_shared((QK,), DT)
-            probs = T.alloc_shared((CAP,), DT)
-            dot = T.alloc_fragment((CAP,), ACC)
-            scl = T.alloc_fragment((CAP,), ACC)
-            pr = T.alloc_fragment((CAP,), ACC)
-            oac = T.alloc_fragment((VD,), ACC)
-            mx = T.alloc_fragment((1,), ACC)
-            tot = T.alloc_fragment((1,), ACC)
-            T.copy(Q[bb, bh * QK:(bh + 1) * QK], Qs)
-            T.sync_threads()
-            T.clear(dot)
-            for s in T.Parallel(CAP):
-                for d in T.serial(QK):
-                    dot[s] += Qs[d].astype(ACC) * Kc[bb, s, bh * QK + d].astype(ACC)
-            for s in T.Parallel(CAP):
-                # Land bf16, times bf16 scale (product lands bf16), widen f32.
-                scl[s] = T.if_then_else(
-                    s < N[bb], (T.Cast(DT, dot[s]) * Sc[0]).astype(ACC), NEG
-                )
-            T.reduce_max(scl, mx, dim=0)
-            for s in T.Parallel(CAP):
-                pr[s] = T.exp(scl[s] - mx[0])
-            T.reduce_sum(pr, tot, dim=0)
-            for s in T.Parallel(CAP):
-                probs[s] = T.Cast(DT, pr[s] / tot[0])   # bf16 after normalizing
-            T.sync_threads()
-            T.clear(oac)
-            for dv in T.Parallel(VD):
-                for s in T.serial(CAP):
-                    oac[dv] += probs[s].astype(ACC) * Vc[bb, s, bh * VD + dv].astype(ACC)
-            for dv in T.Parallel(VD):
-                O[bb, bh * VD + dv] = T.Cast(DT, oac[dv])
+        with T.Kernel(B, KH, threads=KD) as (bb, bh):
+            asq = T.alloc_fragment((KD,), ACC)
+            atot = T.alloc_fragment((1,), ACC)
+            for d in T.Parallel(KD):
+                asq[d] = X[bb, bh * KD + d].astype(ACC) * X[bb, bh * KD + d].astype(ACC)
+            T.reduce_sum(asq, atot, dim=0)
+            for d in T.Parallel(KD):
+                Out[bb, bh * KD + d] = T.Cast(
+                    DT,
+                    X[bb, bh * KD + d].astype(ACC) * T.rsqrt(atot[0] / KD + eps)
+                    * Go[d].astype(ACC),
+                ) * T.Cast(DT, T.sigmoid(G2[bb, bh * KD + d].astype(ACC)))
 
     return _compile(main)

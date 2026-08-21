@@ -136,6 +136,13 @@ impl Qwen3Executor {
             self.save_sealed_blocks(req_result.request_id);
         }
 
+        if let Some(counters) = self.spec_decode_counters.as_mut() {
+            for (req, req_result) in plan.requests.iter().zip(&result.requests) {
+                let num_draft_tokens = req.as_slice().len().saturating_sub(1);
+                counters.observe_draft(num_draft_tokens, req_result.matched_draft_tokens);
+            }
+        }
+
         Ok(result)
     }
 

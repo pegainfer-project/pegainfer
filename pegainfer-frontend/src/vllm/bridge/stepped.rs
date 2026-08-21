@@ -98,7 +98,7 @@ impl SteppedEngineBridge {
             &output_tx,
             RequestBatchOutputs {
                 engine_index: self.engine_index,
-                scheduler_stats: Some(Box::new(scheduler_stats_from(self.scheduler.load()))),
+                scheduler_stats: Some(Box::new(scheduler_stats_from(&self.scheduler.metrics()))),
                 timestamp: now_secs_f64(),
                 ..Default::default()
             }
@@ -165,7 +165,7 @@ impl SteppedEngineBridge {
 
         // Flip every in-flight request's abort flag so the scheduler retires
         // them on its next touch; dropping the partition handle afterwards
-        // disconnects intake and lets the driver drain out.
+        // disconnects the submission channel and lets the driver drain out.
         for state in streams.values() {
             state.control.abort();
         }
@@ -221,7 +221,7 @@ impl SteppedEngineBridge {
                 engine_index: self.engine_index,
                 outputs,
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
-                scheduler_stats: Some(Box::new(scheduler_stats_from(self.scheduler.load()))),
+                scheduler_stats: Some(Box::new(scheduler_stats_from(&self.scheduler.metrics()))),
                 timestamp: now_secs_f64(),
             }
             .into(),
@@ -321,11 +321,8 @@ impl SteppedEngineBridge {
             );
         };
 
-        // Fail loud on sampling parameters the engine cannot honor yet —
-        // silently ignoring a requested seed or penalty changes outputs
-        // without telling the client.
-        if let Some(unsupported) = crate::vllm::wire::unsupported_sampling(&sampling_params) {
-            warn!("request {request_id} rejected: unsupported sampling params: {unsupported}");
+        if let Some(unsupported) = crate::vllm::wire::unsupported_request_params(&sampling_params) {
+            warn!("request {request_id} rejected: {unsupported}");
             return send_terminal_output(
                 self.engine_index,
                 output_tx,

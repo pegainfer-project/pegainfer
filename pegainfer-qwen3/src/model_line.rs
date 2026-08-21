@@ -8,6 +8,7 @@ use clap::Args as ClapArgs;
 use clap::FromArgMatches;
 use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::ArgRequirement;
+use pegainfer_frontend::model_line::CliDecodeOverlap;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
@@ -99,18 +100,6 @@ struct Qwen3Cli {
     #[arg(long, default_value_t = crate::DEFAULT_KV_PAGE_SIZE)]
     kv_page_size: usize,
 
-    /// How prefill and decode share the GPU (single-GPU Qwen3 only).
-    /// `off` serializes them on one stream (lowest TTFT); `stream` overlaps on
-    /// two streams sharing all SMs; `green-ctx` pins each to a disjoint Green
-    /// Context SM partition (lower decode ITL p99, higher TTFT).
-    #[arg(long, value_enum, default_value_t = CliDecodeOverlap::Off)]
-    decode_overlap: CliDecodeOverlap,
-
-    /// Percent of SMs pinned to decode in `--decode-overlap green-ctx` (the rest
-    /// go to prefill); rejected if set in any other mode.
-    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=99))]
-    decode_sm_pct: u32,
-
     /// Enable single-GPU Qwen3 batch-invariant serving by pinning the numeric paths and cutting
     /// each prompt's prefill chunks on its own grid. Off by default. Requires `--no-prefix-cache`;
     /// incompatible with `--kv-offload`, which keeps prefix matching on regardless.
@@ -118,28 +107,13 @@ struct Qwen3Cli {
     batch_invariant: bool,
 }
 
-/// CLI selector for prefill/decode overlap. Mapped to [`DecodeOverlap`]
-/// together with `--decode-sm-pct`.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum CliDecodeOverlap {
-    /// One stream; prefill and decode serialize.
-    Off,
-    /// Two CUDA streams sharing all SMs.
-    Stream,
-    /// Green Context SM partition (SM-pinned streams).
-    #[value(name = "green-ctx")]
-    GreenCtx,
-}
-
-impl CliDecodeOverlap {
-    fn resolve(self, decode_sm_pct: u32) -> DecodeOverlap {
-        match self {
-            Self::Off => DecodeOverlap::Off,
-            Self::Stream => DecodeOverlap::SharedSm,
-            Self::GreenCtx => DecodeOverlap::GreenCtx {
-                decode_pct: decode_sm_pct,
-            },
-        }
+fn resolve_decode_overlap(overlap: CliDecodeOverlap, decode_sm_pct: u32) -> DecodeOverlap {
+    match overlap {
+        CliDecodeOverlap::Off => DecodeOverlap::Off,
+        CliDecodeOverlap::Stream => DecodeOverlap::SharedSm,
+        CliDecodeOverlap::GreenCtx => DecodeOverlap::GreenCtx {
+            decode_pct: decode_sm_pct,
+        },
     }
 }
 
@@ -179,6 +153,8 @@ impl ModelLine for Qwen3Line {
             "no_prefix_cache",
             "max_prefill_tokens",
             "dflash_draft_model_path",
+            "decode_overlap",
+            "decode_sm_pct",
         ]
     }
 
@@ -216,14 +192,7 @@ impl ModelLine for Qwen3Line {
                 "--dump-graph-png is not supported with --enable-lora (LoRA disables CUDA Graph)",
             ));
         }
-        if provided.contains("decode_sm_pct")
-            && !matches!(cli.decode_overlap, CliDecodeOverlap::GreenCtx)
-        {
-            return Err(CliError::rule(
-                "--decode-sm-pct only applies with --decode-overlap=green-ctx",
-            ));
-        }
-        if !matches!(cli.decode_overlap, CliDecodeOverlap::Off) && shared.tp_size > 1 {
+        if shared.decode_overlap != CliDecodeOverlap::Off && shared.tp_size > 1 {
             return Err(CliError::rule(
                 "--decode-overlap is single-GPU only; tp_size>1 has no prefill/decode overlap",
             ));
@@ -234,7 +203,7 @@ impl ModelLine for Qwen3Line {
                     "--batch-invariant is not supported with --enable-lora; enable one at a time",
                 ));
             }
-            if !matches!(cli.decode_overlap, CliDecodeOverlap::Off) {
+            if shared.decode_overlap != CliDecodeOverlap::Off {
                 return Err(CliError::rule(
                     "--batch-invariant is not compatible with --decode-overlap; the stream override would force the pinned GEMM to bail at runtime",
                 ));
@@ -355,7 +324,7 @@ impl ModelLine for Qwen3Line {
                 )
                 .validate()?,
                 lora,
-                decode_overlap: cli.decode_overlap.resolve(cli.decode_sm_pct),
+                decode_overlap: resolve_decode_overlap(shared.decode_overlap, shared.decode_sm_pct),
                 batch_invariant: cli.batch_invariant,
                 dflash_draft_model_path: shared.dflash_draft_model_path.clone(),
             },

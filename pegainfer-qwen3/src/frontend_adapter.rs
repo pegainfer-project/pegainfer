@@ -2,15 +2,13 @@
 //! file.
 //!
 //! [`Qwen3Scheduler`] implements [`pegainfer_frontend::engine::Scheduler`]:
-//! the contract's driver polls `intake`/`step`/`load`; everything
-//! south of here ([`crate::scheduler`], the executor) is contract-free and
-//! deals in internal ids and pure effect data. This file owns the only two
+//! the contract's driver polls `submit`/`step`/`metrics`; everything
+//! south of here ([`crate::scheduler`], the executor) deals in the contract's
+//! [`RequestId`] and pure effect data. This file owns the only two
 //! contract-facing responsibilities:
 //!
-//! - the **handle registry**: each request's typestate handle
-//!   ([`IntakeTicket`] until admission, [`ActiveRequest`] after) keyed by the
-//!   internal [`RequestId`], and every emitter call that moves one through
-//!   its lifecycle;
+//! - the **ledger writes**: translating each step's effects into verdicts and
+//!   tokens recorded on the [`RequestLedger`] by id;
 //! - **engine assembly**: building the executor and returning the
 //!   [`Engine`] bundle from `launch`.
 //!
@@ -18,34 +16,32 @@
 //! this adapter retires it on its next touch — the scheduler mechanics never
 //! see aborts. Finishes ride the committed step unless the executor withholds
 //! them ([`ModelExecutor::withholds_finishes`]): a P/D prefill executor takes
-//! them as [`StepEmitter::defer_finish`] tokens and delivers each request's
+//! them as [`RequestLedger::defer_finish`] tokens and delivers each request's
 //! final record once its KV saves are peer-visible.
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
 
 use anyhow::Result;
 use log::info;
 use log::warn;
-use pegainfer_frontend::engine::ActiveRequest;
 use pegainfer_frontend::engine::DeferredFinish;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::IntakeTicket;
 use pegainfer_frontend::engine::KvCapacity;
-use pegainfer_frontend::engine::LoadSnapshot;
 use pegainfer_frontend::engine::LoraClient;
 use pegainfer_frontend::engine::LoraControl;
 use pegainfer_frontend::engine::LoraControlReceiver;
 use pegainfer_frontend::engine::PromptEcho;
+use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
+use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
-use pegainfer_frontend::engine::StepEmitter;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::numeric_policy;
@@ -216,23 +212,11 @@ where
 
 // ── The Scheduler implementation ────────────────────────────────────────
 
-/// One request's contract handle, in whichever lifecycle state it holds.
-enum HandleSlot {
-    /// Submitted, not yet admitted: reject/retire consume the ticket.
-    Queued(IntakeTicket),
-    /// Admitted: token pushes go through it; finish/fail/retire consume it.
-    Streaming(ActiveRequest),
-}
-
 pub(crate) struct Qwen3Scheduler<E: ModelExecutor> {
     executor: E,
     rng: StdRng,
     max_prefill_tokens: usize,
     kv_total: u64,
-    next_request_id: u64,
-    /// Contract handle per live request, keyed by the internal id every
-    /// queue and effect uses. Entries leave exactly at terminal transitions.
-    handles: HashMap<RequestId, HandleSlot>,
     /// Host-side phase tracer (queue/prefill/decode spans). No-op when
     /// tracing is off — requests then carry no trace parent.
     tracker: PhaseTracker,
@@ -272,8 +256,6 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             rng: StdRng::seed_from_u64(seed),
             max_prefill_tokens,
             kv_total,
-            next_request_id: 0,
-            handles: HashMap::new(),
             tracker: PhaseTracker::default(),
             deferred: Vec::new(),
             loading: Vec::new(),
@@ -293,20 +275,15 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             && self.inflight_prefill_pending.is_none()
     }
 
-    /// Consume the request's queued ticket for admission. `false` (and full
-    /// cleanup) when the frontend aborted it while it waited.
-    fn admit_or_retire(&mut self, req: &PendingRequest, emitter: &mut StepEmitter) -> bool {
-        let Some(HandleSlot::Queued(ticket)) = self.handles.remove(&req.request_id) else {
-            unreachable!("admitted request must hold a queued ticket");
-        };
-        if ticket.is_aborted() {
-            emitter.retire_ticket(ticket);
+    /// Admit the request on the ledger. `false` (and full cleanup) when the
+    /// frontend aborted it while it waited.
+    fn admit_or_retire(&mut self, req: &PendingRequest, ledger: &mut RequestLedger) -> bool {
+        if ledger.is_aborted(req.request_id) {
+            ledger.retire(req.request_id);
             release_rejected(&mut self.executor, &mut self.tracker, req);
             return false;
         }
-        let handle = emitter.admit(ticket);
-        self.handles
-            .insert(req.request_id, HandleSlot::Streaming(handle));
+        ledger.admit(req.request_id);
         true
     }
 
@@ -314,36 +291,16 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         &mut self,
         req: &PendingRequest,
         reason: RejectReason,
-        emitter: &mut StepEmitter,
+        ledger: &mut RequestLedger,
     ) {
-        let Some(HandleSlot::Queued(ticket)) = self.handles.remove(&req.request_id) else {
-            unreachable!("rejected request must hold a queued ticket");
-        };
-        emitter.reject(ticket, reason);
+        ledger.reject(req.request_id, reason);
         release_rejected(&mut self.executor, &mut self.tracker, req);
-    }
-
-    /// Take a streaming handle out of the registry for a terminal transition.
-    fn take_streaming(&mut self, request_id: RequestId) -> Option<ActiveRequest> {
-        match self.handles.remove(&request_id) {
-            Some(HandleSlot::Streaming(handle)) => Some(handle),
-            Some(slot @ HandleSlot::Queued(_)) => {
-                self.handles.insert(request_id, slot);
-                None
-            }
-            None => None,
-        }
     }
 
     /// Retire one request whose frontend aborted it: silent on the wire,
     /// full cleanup on the engine side.
-    fn retire_aborted(
-        &mut self,
-        request_id: RequestId,
-        handle: ActiveRequest,
-        emitter: &mut StepEmitter,
-    ) {
-        emitter.retire(handle);
+    fn retire_aborted(&mut self, request_id: RequestId, ledger: &mut RequestLedger) {
+        ledger.retire(request_id);
         self.tracker.finish(request_id);
         let _ = self.executor.drop_request(request_id);
     }
@@ -354,11 +311,11 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         &mut self,
         targets: Vec<RequestId>,
         message: &str,
-        emitter: &mut StepEmitter,
+        ledger: &mut RequestLedger,
     ) {
         for request_id in targets {
-            if let Some(handle) = self.take_streaming(request_id) {
-                emitter.fail(handle, message);
+            if ledger.is_active(request_id) {
+                ledger.fail(request_id, message);
             }
             // Close the request's open phase span; an execution error is a
             // termination path like any other finish.
@@ -372,31 +329,31 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         self.active.clear();
     }
 
-    /// Translate one step's pure effects into emitter calls, executor
+    /// Translate one step's pure effects into ledger writes, executor
     /// bookkeeping, and state transitions. The old per-token send-failure
-    /// signal is replaced by explicit abort probes on the handles.
-    fn apply_effects(&mut self, effects: StepEffects, emitter: &mut StepEmitter) {
+    /// signal is replaced by explicit abort probes on the ledger.
+    fn apply_effects(&mut self, effects: StepEffects, ledger: &mut RequestLedger) {
         // Finishes are collected and resolved at the end of the step. A
         // withholding executor (P/D prefill: `Finished` may leave only once
         // this step's KV saves are peer-visible) takes them as
         // [`DeferredFinish`] tokens and delivers off the scheduler thread —
         // each carries the request's whole buffered record, so late delivery
-        // cannot reorder. Everyone else finishes through the emitter, so the
+        // cannot reorder. Everyone else finishes through the ledger, so the
         // terminal rides the committed step, which the driver ships after
-        // publishing load — the finishing batch's send-time stats then read
-        // the drained occupancy instead of racing the publish.
-        let mut finishes: Vec<(ActiveRequest, FinishReason)> = Vec::new();
+        // publishing metrics — the finishing batch's send-time stats then
+        // read the drained occupancy instead of racing the publish.
+        let mut finishes: Vec<(RequestId, FinishReason)> = Vec::new();
 
         for cached in effects.cached {
-            if let Some(HandleSlot::Streaming(handle)) = self.handles.get_mut(&cached.request_id) {
-                emitter.set_cached_tokens(handle, cached.cached_tokens);
+            if ledger.is_active(cached.request_id) {
+                ledger.set_cached_tokens(cached.request_id, cached.cached_tokens);
             }
         }
 
         for echo in effects.prompt_echoes {
-            if let Some(HandleSlot::Streaming(handle)) = self.handles.get_mut(&echo.request_id) {
-                emitter.echo_prompt(
-                    handle,
+            if ledger.is_active(echo.request_id) {
+                ledger.echo_prompt(
+                    echo.request_id,
                     PromptEcho {
                         ids: echo.ids,
                         logprobs: echo.logprobs,
@@ -419,11 +376,11 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     else {
                         continue;
                     };
-                    if let Some(handle) = self.take_streaming(request_id) {
-                        if handle.is_aborted() {
-                            emitter.retire(handle);
+                    if ledger.is_active(request_id) {
+                        if ledger.is_aborted(request_id) {
+                            ledger.retire(request_id);
                         } else {
-                            finishes.push((handle, finish_reason));
+                            finishes.push((request_id, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -443,12 +400,12 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     else {
                         continue;
                     };
-                    if let Some(mut handle) = self.take_streaming(request_id) {
-                        if handle.is_aborted() {
-                            emitter.retire(handle);
+                    if ledger.is_active(request_id) {
+                        if ledger.is_aborted(request_id) {
+                            ledger.retire(request_id);
                         } else {
-                            emitter.push_tokens(&mut handle, &[token], &[logprob]);
-                            finishes.push((handle, finish_reason));
+                            ledger.push_tokens(request_id, &[token], &[logprob]);
+                            finishes.push((request_id, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -468,25 +425,14 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     else {
                         continue;
                     };
-                    let aborted = matches!(
-                        self.handles.get(&request_id),
-                        Some(HandleSlot::Streaming(handle)) if handle.is_aborted()
-                    );
-                    if aborted {
-                        let handle = self
-                            .take_streaming(request_id)
-                            .expect("aborted request holds a streaming handle");
-                        self.retire_aborted(request_id, handle, emitter);
+                    if ledger.is_aborted(request_id) {
+                        self.retire_aborted(request_id, ledger);
                         to_retire.push(index);
-                    } else if let Some(HandleSlot::Streaming(handle)) =
-                        self.handles.get_mut(&request_id)
-                    {
-                        emitter.push_tokens(handle, &[token], &[logprob]);
+                    } else {
+                        ledger.push_tokens(request_id, &[token], &[logprob]);
                         let req = &mut self.active[index];
                         req.last_token = token;
                         req.generated_count = completion_tokens;
-                    } else {
-                        unreachable!("active request {request_id:?} must hold a streaming handle");
                     }
                 }
                 DecodeEffect::EmitManyAndContinue {
@@ -501,27 +447,16 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     else {
                         continue;
                     };
-                    let aborted = matches!(
-                        self.handles.get(&request_id),
-                        Some(HandleSlot::Streaming(handle)) if handle.is_aborted()
-                    );
-                    if aborted {
-                        let handle = self
-                            .take_streaming(request_id)
-                            .expect("aborted request holds a streaming handle");
-                        self.retire_aborted(request_id, handle, emitter);
+                    if ledger.is_aborted(request_id) {
+                        self.retire_aborted(request_id, ledger);
                         to_retire.push(index);
-                    } else if let Some(HandleSlot::Streaming(handle)) =
-                        self.handles.get_mut(&request_id)
-                    {
-                        emitter.push_tokens(handle, &tokens, &[]);
+                    } else {
+                        ledger.push_tokens(request_id, &tokens, &[]);
                         if let Some(&last) = tokens.last() {
                             let req = &mut self.active[index];
                             req.last_token = last;
                             req.generated_count = completion_tokens;
                         }
-                    } else {
-                        unreachable!("active request {request_id:?} must hold a streaming handle");
                     }
                 }
                 DecodeEffect::EmitManyAndFinish {
@@ -536,12 +471,12 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     else {
                         continue;
                     };
-                    if let Some(mut handle) = self.take_streaming(request_id) {
-                        if handle.is_aborted() {
-                            emitter.retire(handle);
+                    if ledger.is_active(request_id) {
+                        if ledger.is_aborted(request_id) {
+                            ledger.retire(request_id);
                         } else {
-                            emitter.push_tokens(&mut handle, &tokens, &[]);
-                            finishes.push((handle, finish_reason));
+                            ledger.push_tokens(request_id, &tokens, &[]);
+                            finishes.push((request_id, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -564,19 +499,9 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         for effect in effects.pending {
             match effect {
                 PendingEffect::ContinuePrefill { req } => {
-                    let aborted = match self.handles.get(&req.request_id) {
-                        Some(HandleSlot::Streaming(handle)) => handle.is_aborted(),
-                        _ => unreachable!(
-                            "prefilling request {:?} must hold a streaming handle",
-                            req.request_id
-                        ),
-                    };
-                    if aborted {
+                    if ledger.is_aborted(req.request_id) {
                         let request_id = req.request_id;
-                        let handle = self
-                            .take_streaming(request_id)
-                            .expect("aborted request holds a streaming handle");
-                        self.retire_aborted(request_id, handle, emitter);
+                        self.retire_aborted(request_id, ledger);
                     } else {
                         continued.push(req);
                     }
@@ -585,11 +510,11 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     request_id,
                     finish_reason,
                 } => {
-                    if let Some(handle) = self.take_streaming(request_id) {
-                        if handle.is_aborted() {
-                            emitter.retire(handle);
+                    if ledger.is_active(request_id) {
+                        if ledger.is_aborted(request_id) {
+                            ledger.retire(request_id);
                         } else {
-                            finishes.push((handle, finish_reason));
+                            finishes.push((request_id, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -601,12 +526,12 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     logprob,
                     finish_reason,
                 } => {
-                    if let Some(mut handle) = self.take_streaming(request_id) {
-                        if handle.is_aborted() {
-                            emitter.retire(handle);
+                    if ledger.is_active(request_id) {
+                        if ledger.is_aborted(request_id) {
+                            ledger.retire(request_id);
                         } else {
-                            emitter.push_tokens(&mut handle, &[token], &[logprob]);
-                            finishes.push((handle, finish_reason));
+                            ledger.push_tokens(request_id, &[token], &[logprob]);
+                            finishes.push((request_id, finish_reason));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -618,25 +543,12 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                     logprob,
                 } => {
                     let request_id = state.request_id;
-                    let aborted = matches!(
-                        self.handles.get(&request_id),
-                        Some(HandleSlot::Streaming(handle)) if handle.is_aborted()
-                    );
-                    if aborted {
-                        let handle = self
-                            .take_streaming(request_id)
-                            .expect("aborted request holds a streaming handle");
-                        self.retire_aborted(request_id, handle, emitter);
-                    } else if let Some(HandleSlot::Streaming(handle)) =
-                        self.handles.get_mut(&request_id)
-                    {
-                        emitter.push_tokens(handle, &[first_token], &[logprob]);
+                    if ledger.is_aborted(request_id) {
+                        self.retire_aborted(request_id, ledger);
+                    } else {
+                        ledger.push_tokens(request_id, &[first_token], &[logprob]);
                         self.tracker.enter_decode(request_id);
                         self.active.push(state);
-                    } else {
-                        unreachable!(
-                            "promoted request {request_id:?} must hold a streaming handle"
-                        );
                     }
                 }
             }
@@ -647,12 +559,12 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             if self.executor.withholds_finishes() {
                 let withheld: Vec<DeferredFinish> = finishes
                     .into_iter()
-                    .map(|(handle, reason)| emitter.defer_finish(handle, reason))
+                    .map(|(request_id, reason)| ledger.defer_finish(request_id, reason))
                     .collect();
                 self.executor.release_finished_events(withheld);
             } else {
-                for (handle, reason) in finishes {
-                    emitter.finish(handle, reason);
+                for (request_id, reason) in finishes {
+                    ledger.finish(request_id, reason);
                 }
             }
         }
@@ -666,16 +578,11 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
 }
 
 impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
-    fn intake(&mut self, mut ticket: IntakeTicket) {
-        // Already-aborted tickets ride the normal path: admission re-checks
+    fn submit(&mut self, request: QueuedRequest) {
+        // Already-aborted requests ride the normal path: admission re-checks
         // the abort flag and retires them (`admit_or_retire`).
-        let request = ticket
-            .take_request()
-            .expect("intake receives tickets with their payload");
-        let id = RequestId(self.next_request_id);
-        self.next_request_id += 1;
+        let QueuedRequest { id, request } = request;
         self.tracker.enter_queue(id, request.trace_parent);
-        self.handles.insert(id, HandleSlot::Queued(ticket));
         let pending = PendingRequest::from_request(id, request);
         if self.pending_control.is_empty() {
             self.deferred.push(pending);
@@ -684,7 +591,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         }
     }
 
-    fn step(&mut self, emitter: &mut StepEmitter) -> Result<()> {
+    fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
         // 0. Pull queued LoRA commands off the engine's private channel; they
         // apply only once the scheduler drains idle (`drain_idle_control`).
         if let Some(lora_rx) = &self.lora_rx {
@@ -710,7 +617,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 result: prefill_result,
             };
             let effects = resolve_step(&self.executor, &self.active, artifacts);
-            self.apply_effects(effects, emitter);
+            self.apply_effects(effects, ledger);
         }
 
         // 2. Reclaim settled prefetches, then offer fresh requests to
@@ -759,7 +666,8 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             return Ok(());
         }
 
-        // 5. Validate + admit; every verdict consumes the request's ticket.
+        // 5. Validate + admit; every verdict closes the request's queued
+        //    ledger account.
         let lora_validation =
             reject_unknown_lora_requests(std::mem::take(&mut self.deferred), &self.executor);
         for rejected in &lora_validation.rejected {
@@ -769,7 +677,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                     .clone()
                     .expect("only requests naming an adapter can fail LoRA validation"),
             };
-            self.reject_pending(rejected, reason, emitter);
+            self.reject_pending(rejected, reason, ledger);
         }
         let admission = admit_deferred_requests(
             lora_validation.accepted,
@@ -784,11 +692,11 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             |id| self.executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
-            self.reject_pending(rejected, contract_reject_reason(rejected, *reason), emitter);
+            self.reject_pending(rejected, contract_reject_reason(rejected, *reason), ledger);
         }
         self.deferred = admission.deferred;
         for req in admission.pending {
-            if self.admit_or_retire(&req, emitter) {
+            if self.admit_or_retire(&req, ledger) {
                 self.prefilling.push(req);
             }
         }
@@ -846,14 +754,14 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("Execution step failed: {e}");
-                    self.fail_touched_requests(targets, &e.to_string(), emitter);
+                    self.fail_touched_requests(targets, &e.to_string(), ledger);
                     return Ok(());
                 }
             };
             // Only decode effects come out of the unified result (its prefill
             // request list is empty until the poll resolves).
             let effects = resolve_step(&self.executor, &self.active, artifacts);
-            self.apply_effects(effects, emitter);
+            self.apply_effects(effects, ledger);
             self.inflight_prefill_pending = Some(pending_for_poll);
             return Ok(());
         }
@@ -866,12 +774,12 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("Execution step failed: {e}");
-                    self.fail_touched_requests(targets, &e.to_string(), emitter);
+                    self.fail_touched_requests(targets, &e.to_string(), ledger);
                     return Ok(());
                 }
             };
         let effects = resolve_step(&self.executor, &self.active, artifacts);
-        self.apply_effects(effects, emitter);
+        self.apply_effects(effects, ledger);
         Ok(())
     }
 
@@ -879,8 +787,8 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
     /// wants, not a transient in-step peak. `num_waiting_reqs` folds every
     /// not-yet-running queue (KV-deferred, prefetch-loading, post-control)
     /// into one number.
-    fn load(&self) -> LoadSnapshot {
-        LoadSnapshot {
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
             kv_used_blocks: self
                 .kv_total
                 .saturating_sub(self.executor.available_blocks() as u64),
@@ -892,6 +800,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             num_waiting_reqs: (self.deferred.len()
                 + self.loading.len()
                 + self.post_control_deferred.len()) as u64,
+            spec_decode: self.executor.spec_decode_counters(),
         }
     }
 }
