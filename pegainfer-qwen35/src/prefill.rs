@@ -26,10 +26,6 @@ use pegainfer_core::tensor::HiddenStates;
 
 use super::flashinfer_gdn::FlashInferGdnChunkResources;
 use super::flashinfer_gdn::GdnPrefillBackend;
-#[cfg(feature = "gdn-validation")]
-pub use super::flashinfer_gdn::GdnPrefillRuntimeEvidence;
-#[cfg(feature = "gdn-validation")]
-pub use super::flashinfer_gdn::GdnPrefillRuntimeEvidenceHandle;
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
 use super::weights::FullAttentionLayer;
@@ -62,17 +58,6 @@ fn checked_prefill_end_pos(
 }
 
 impl Qwen35Model {
-    /// Require the build-linked candidate for an explicit same-path A/B gate.
-    /// Artifact selection and validation happen in `pegainfer-kernels` at build
-    /// time; model code never consumes an artifact path at runtime.
-    pub(crate) fn require_flashinfer_gdn_for_test(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.flashinfer_gdn.is_some(),
-            "FlashInfer GDN is not available; set PEGAINFER_QWEN35_GDN_AOT_BUNDLE at build time"
-        );
-        Ok(())
-    }
-
     pub(super) fn prefill_last_hidden(
         &self,
         token_ids: &[u32],
@@ -557,6 +542,8 @@ impl Qwen35Model {
                     self.flashinfer_gdn()?,
                     &mut layer_state.state,
                 )?;
+                #[cfg(feature = "gdn-validation")]
+                self.gdn_validation_evidence.record_successful_launch();
                 ops::rms_norm_gated_batch_into(
                     &self.ctx,
                     &resources.output,

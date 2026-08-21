@@ -109,7 +109,8 @@ pub struct Qwen35Model {
     /// Opaque kernels-owned AOT operation. `None` is an explicit capability
     /// fallback (non-SM120 or non-Hv32), never a corrupt-artifact fallback.
     pub(super) flashinfer_gdn: Option<pegainfer_kernels::ops::Qwen35GdnAot>,
-    pub(super) decode_graph_evidence: super::batch_decode_graph::DecodeGraphEvidenceHandle,
+    #[cfg(feature = "gdn-validation")]
+    pub(super) gdn_validation_evidence: super::gdn_validation::GdnValidationEvidenceHandle,
     pub(super) config: Config35,
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) embed_tokens: DeviceMatrix,
@@ -575,7 +576,8 @@ impl Qwen35Model {
         Ok(Self {
             ctx,
             flashinfer_gdn,
-            decode_graph_evidence: Default::default(),
+            #[cfg(feature = "gdn-validation")]
+            gdn_validation_evidence: Default::default(),
             config,
             tensor_parallel,
             embed_tokens,
@@ -765,14 +767,16 @@ impl Qwen35Model {
             "requested graph capacity {max_batch} exceeds loaded capacity {}",
             self.reserved_decode_slots
         );
-        super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
+        let graph = super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
             &self.ctx,
             &self.config,
             self.tensor_parallel,
             &self.kv_pool,
             max_batch,
-            self.decode_graph_evidence.clone(),
-        )
+        )?;
+        #[cfg(feature = "gdn-validation")]
+        let graph = graph.with_validation_evidence(self.gdn_validation_evidence.clone());
+        Ok(graph)
     }
 
     pub(crate) fn create_batch_decode_buffers_with_capacity(

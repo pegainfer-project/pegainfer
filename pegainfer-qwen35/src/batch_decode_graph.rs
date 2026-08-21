@@ -1,12 +1,5 @@
 //! CUDA Graph state for Qwen3.5 batched decode with bucket padding.
 
-#[cfg(feature = "gdn-validation")]
-use std::sync::Arc;
-#[cfg(feature = "gdn-validation")]
-use std::sync::atomic::AtomicU64;
-#[cfg(feature = "gdn-validation")]
-use std::sync::atomic::Ordering;
-
 use anyhow::Result;
 use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::kv_pool::KvPool;
@@ -15,6 +8,8 @@ use pegainfer_core::tensor::DeviceContext;
 use super::config::Config35;
 use super::config::TensorParallelConfig;
 use super::decode_buffers::BatchDecodeBuffers35;
+#[cfg(feature = "gdn-validation")]
+use super::gdn_validation::GdnValidationEvidenceHandle;
 use super::recurrent_state::LinearStatePointerTables;
 use super::recurrent_state::RecurrentState;
 
@@ -23,83 +18,6 @@ pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 /// Maximum supported batch size (= largest bucket).
 pub(crate) const MAX_BATCH: usize = 64;
-
-#[cfg(feature = "gdn-validation")]
-#[derive(Debug, Default)]
-struct DecodeGraphEvidenceCounters {
-    captures: AtomicU64,
-    replays: AtomicU64,
-    eager_fallbacks: AtomicU64,
-    state_slot_copies: AtomicU64,
-    state_slot_reuses: AtomicU64,
-    slot_compactions: AtomicU64,
-}
-
-#[cfg(feature = "gdn-validation")]
-#[derive(Clone, Debug, Default)]
-pub(crate) struct DecodeGraphEvidenceHandle {
-    counters: Arc<DecodeGraphEvidenceCounters>,
-}
-
-#[cfg(not(feature = "gdn-validation"))]
-#[derive(Clone, Debug, Default)]
-pub(crate) struct DecodeGraphEvidenceHandle;
-
-#[cfg(feature = "gdn-validation")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct DecodeGraphEvidenceSnapshot {
-    pub(crate) captures: u64,
-    pub(crate) replays: u64,
-    pub(crate) eager_fallbacks: u64,
-    pub(crate) state_slot_copies: u64,
-    pub(crate) state_slot_reuses: u64,
-    pub(crate) slot_compactions: u64,
-}
-
-#[cfg(feature = "gdn-validation")]
-impl DecodeGraphEvidenceHandle {
-    pub(crate) fn snapshot(&self) -> DecodeGraphEvidenceSnapshot {
-        DecodeGraphEvidenceSnapshot {
-            captures: self.counters.captures.load(Ordering::Relaxed),
-            replays: self.counters.replays.load(Ordering::Relaxed),
-            eager_fallbacks: self.counters.eager_fallbacks.load(Ordering::Relaxed),
-            state_slot_copies: self.counters.state_slot_copies.load(Ordering::Relaxed),
-            state_slot_reuses: self.counters.state_slot_reuses.load(Ordering::Relaxed),
-            slot_compactions: self.counters.slot_compactions.load(Ordering::Relaxed),
-        }
-    }
-
-    pub(crate) fn record_capture(&self) {
-        self.counters.captures.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_replay(&self) {
-        self.counters.replays.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_eager_fallback(&self) {
-        self.counters
-            .eager_fallbacks
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_state_slot_copy(&self, reused: bool) {
-        self.counters
-            .state_slot_copies
-            .fetch_add(1, Ordering::Relaxed);
-        if reused {
-            self.counters
-                .state_slot_reuses
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn record_slot_compaction(&self) {
-        self.counters
-            .slot_compactions
-            .fetch_add(1, Ordering::Relaxed);
-    }
-}
 
 /// Find the smallest bucket >= `bs`. Panics if `bs` > MAX_BATCH.
 pub(crate) fn bucket_for(bs: usize) -> usize {
@@ -138,7 +56,8 @@ pub(crate) struct BatchDecodeGraphState {
     pub(crate) linear_pointer_tables: LinearStatePointerTables,
     /// One `CudaGraphState` per BATCH_BUCKETS entry (indexed by position).
     pub(crate) graphs: Vec<CudaGraphState>,
-    pub(crate) evidence: DecodeGraphEvidenceHandle,
+    #[cfg(feature = "gdn-validation")]
+    pub(crate) evidence: GdnValidationEvidenceHandle,
 }
 
 impl BatchDecodeGraphState {
@@ -149,7 +68,6 @@ impl BatchDecodeGraphState {
         tensor_parallel: TensorParallelConfig,
         kv_pool: &KvPool,
         max_batch: usize,
-        evidence: DecodeGraphEvidenceHandle,
     ) -> Result<Self> {
         let padding_page_id = kv_pool.padding_page_id();
         let max_total_pages = kv_pool.capacity_pages();
@@ -188,8 +106,18 @@ impl BatchDecodeGraphState {
             slot_states,
             linear_pointer_tables,
             graphs,
-            evidence,
+            #[cfg(feature = "gdn-validation")]
+            evidence: Default::default(),
         })
+    }
+
+    #[cfg(feature = "gdn-validation")]
+    pub(crate) fn with_validation_evidence(
+        mut self,
+        evidence: GdnValidationEvidenceHandle,
+    ) -> Self {
+        self.evidence = evidence;
+        self
     }
 
     /// D2D copy `src` recurrent state into slot `slot_idx`.
