@@ -51,9 +51,12 @@ pub mod runtime {
     pub use crate::executor::PrefillStepItem;
     pub use crate::executor::Qwen35Executor;
     pub use crate::executor::RequestId;
+    #[cfg(feature = "gdn-validation")]
     pub use crate::prefill::GdnPrefillRuntimeEvidence;
+    #[cfg(feature = "gdn-validation")]
     pub use crate::prefill::GdnPrefillRuntimeEvidenceHandle;
     pub use crate::scheduler::start_with_capacity;
+    #[cfg(feature = "gdn-validation")]
     pub use crate::start_engine_with_flashinfer_gdn_for_accuracy;
     pub use crate::tp_executor::Qwen35TpExecutor;
     pub use crate::weights::Qwen35Model;
@@ -93,6 +96,7 @@ pub fn start_engine(
 
 /// Start the normal single-GPU production scheduler and expose build-linked
 /// FlashInfer launch evidence to end-to-end accuracy tests.
+#[cfg(feature = "gdn-validation")]
 pub fn start_engine_with_flashinfer_gdn_for_accuracy(
     model_path: &Path,
     device_ordinal: usize,

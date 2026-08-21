@@ -4,8 +4,11 @@
 //! `pegainfer-kernels`. This module owns only model policy, prepared tensors,
 //! recurrent state, and observable backend evidence.
 
+#[cfg(feature = "gdn-validation")]
 use std::sync::Arc;
+#[cfg(feature = "gdn-validation")]
 use std::sync::atomic::AtomicU64;
+#[cfg(feature = "gdn-validation")]
 use std::sync::atomic::Ordering;
 
 use anyhow::Context;
@@ -113,6 +116,7 @@ impl Qwen35Model {
 }
 
 /// Runtime proof for production dispatch and same-path A/B tests.
+#[cfg(feature = "gdn-validation")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GdnPrefillRuntimeEvidence {
     pub selected_backend: String,
@@ -128,6 +132,7 @@ pub struct GdnPrefillRuntimeEvidence {
     pub slot_compactions: u64,
 }
 
+#[cfg(feature = "gdn-validation")]
 #[derive(Clone, Debug)]
 pub struct GdnPrefillRuntimeEvidenceHandle {
     selected_backend: &'static str,
@@ -138,6 +143,7 @@ pub struct GdnPrefillRuntimeEvidenceHandle {
     decode_graph: crate::batch_decode_graph::DecodeGraphEvidenceHandle,
 }
 
+#[cfg(feature = "gdn-validation")]
 impl GdnPrefillRuntimeEvidenceHandle {
     pub fn snapshot(&self) -> GdnPrefillRuntimeEvidence {
         let graph = self.decode_graph.snapshot();
@@ -157,6 +163,7 @@ impl GdnPrefillRuntimeEvidenceHandle {
     }
 }
 
+#[cfg(feature = "gdn-validation")]
 impl Qwen35Model {
     pub fn flashinfer_gdn_runtime_evidence(&self) -> Result<GdnPrefillRuntimeEvidence> {
         Ok(self.flashinfer_gdn_runtime_evidence_handle()?.snapshot())

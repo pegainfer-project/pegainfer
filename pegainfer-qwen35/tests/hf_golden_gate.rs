@@ -859,6 +859,7 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
     );
 }
 
+#[cfg(feature = "gdn-validation")]
 #[test]
 #[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
 fn production_flashinfer_gdn_matches_hf_short_golden() {
