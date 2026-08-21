@@ -128,7 +128,7 @@ impl Qwen3Model {
         let attention_path =
             BatchDecodeBuffers::attention_path(padded_bs, bufs.policy_at_construction);
         #[cfg(feature = "kernel-call-trace")]
-        let trace_kv_len = kv_views.iter().map(|v| v.seq_len()).max().unwrap_or(0);
+        let trace_kv_len = kv_views.iter().map(KvView::seq_len).max().unwrap_or(0);
         if use_cuda_graph {
             let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
             let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
@@ -258,8 +258,8 @@ impl Qwen3Model {
     ) -> Result<()> {
         let q_dim = layer.attention.q_dim;
         let kv_dim = layer.attention.kv_dim;
-        let fused_projections = self.fused_decode_projections();
-        if fused_projections {
+        let fused_qkv = self.fused_decode_qkv();
+        if fused_qkv {
             let qkv_out = bufs
                 .qkv_out
                 .as_mut()
@@ -364,78 +364,34 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        if fused_projections {
-            let gate_up_out = bufs
-                .gate_up_out
-                .as_mut()
-                .expect("fused gate/up plan requires gate_up_out");
-            dag.mlp_gate_up_proj(
-                dag_label!(format!("L{layer_idx}.mlp.gate_up_proj")),
-                &layer.mlp.gate_up_proj,
-                &bufs.normed,
-                gate_up_out,
-            );
-            self.apply_decode_lora_projection(
-                layer_idx,
-                LoraProjectionKind::Gate,
-                use_lora,
-                &bufs.normed,
-                gate_up_out,
-                0,
-                &bufs.lora_token_slots_d,
-            )?;
-            self.apply_decode_lora_projection(
-                layer_idx,
-                LoraProjectionKind::Up,
-                use_lora,
-                &bufs.normed,
-                gate_up_out,
-                self.local_intermediate_size(),
-                &bufs.lora_token_slots_d,
-            )?;
-            dag.silu_mul_fused(
-                dag_label!(format!("L{layer_idx}.mlp.silu_mul_fused")),
-                gate_up_out,
-                &mut bufs.mlp_act,
-            )?;
-        } else {
-            let gate_out = bufs
-                .gate_out
-                .as_mut()
-                .expect("split gate/up plan requires gate_out");
-            let up_out = bufs
-                .up_out
-                .as_mut()
-                .expect("split gate/up plan requires up_out");
-            dag.mlp_gate_proj(
-                dag_label!(format!("L{layer_idx}.mlp.gate_proj")),
-                &layer.mlp.gate_up_proj,
-                &bufs.normed,
-                gate_out,
-            );
-            dag.mlp_up_proj(
-                dag_label!(format!("L{layer_idx}.mlp.up_proj")),
-                &layer.mlp.gate_up_proj,
-                &bufs.normed,
-                up_out,
-            );
-            self.apply_decode_lora_projection_group2(
-                layer_idx,
-                LoraProjectionKind::Gate,
-                LoraProjectionKind::Up,
-                use_lora,
-                &bufs.normed,
-                gate_out,
-                up_out,
-                &bufs.lora_token_slots_d,
-            )?;
-            dag.silu_mul_split(
-                dag_label!(format!("L{layer_idx}.mlp.silu_mul")),
-                gate_out,
-                up_out,
-                &mut bufs.mlp_act,
-            )?;
-        }
+        dag.mlp_gate_proj(
+            dag_label!(format!("L{layer_idx}.mlp.gate_proj")),
+            &layer.mlp.gate_up_proj,
+            &bufs.normed,
+            &mut bufs.gate_out,
+        );
+        dag.mlp_up_proj(
+            dag_label!(format!("L{layer_idx}.mlp.up_proj")),
+            &layer.mlp.gate_up_proj,
+            &bufs.normed,
+            &mut bufs.up_out,
+        );
+        self.apply_decode_lora_projection_group2(
+            layer_idx,
+            LoraProjectionKind::Gate,
+            LoraProjectionKind::Up,
+            use_lora,
+            &bufs.normed,
+            &mut bufs.gate_out,
+            &mut bufs.up_out,
+            &bufs.lora_token_slots_d,
+        )?;
+        dag.silu_mul_split(
+            dag_label!(format!("L{layer_idx}.mlp.silu_mul")),
+            &bufs.gate_out,
+            &bufs.up_out,
+            &mut bufs.mlp_act,
+        )?;
         dag.down_proj(
             dag_label!(format!("L{layer_idx}.mlp.down_proj")),
             &layer.mlp.down_proj,

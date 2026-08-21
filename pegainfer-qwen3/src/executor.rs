@@ -667,7 +667,7 @@ fn tune_decode_gemm_algos(
     let q_dim = model.local_q_dim();
     let kv_dim = model.local_kv_dim();
     let intermediate = model.local_intermediate_size();
-    let fused_projections = model.fused_decode_projections();
+    let fused_qkv = model.fused_decode_qkv();
 
     if numeric_policy() == NumericPolicy::Pin {
         // Eager pin before capture: the lazy pin-workspace alloc is illegal mid-capture.
@@ -704,40 +704,27 @@ fn tune_decode_gemm_algos(
         })
         .collect();
     let o_samples: Vec<_> = layers.iter().map(|l| (&l.attention.o_proj, 0)).collect();
-    let gate_up_samples: Vec<_> = if fused_projections {
-        layers.iter().map(|l| (&l.mlp.gate_up_proj, 0)).collect()
-    } else {
-        layers
-            .iter()
-            .flat_map(|l| {
-                [
-                    (&l.mlp.gate_up_proj, 0),
-                    (&l.mlp.gate_up_proj, intermediate),
-                ]
-            })
-            .collect()
-    };
+    let gate_up_samples: Vec<_> = layers
+        .iter()
+        .flat_map(|l| {
+            [
+                (&l.mlp.gate_up_proj, 0),
+                (&l.mlp.gate_up_proj, intermediate),
+            ]
+        })
+        .collect();
     let down_samples: Vec<_> = layers.iter().map(|l| (&l.mlp.down_proj, 0)).collect();
     let lm_head_samples = [(model.output_projection(), 0)];
 
     for &n in BATCH_BUCKETS.iter().filter(|&&b| b <= ops::GEMM_LT_MAX_N) {
-        if fused_projections {
+        if fused_qkv {
             ops::gemm_lt_tune(ctx, &q_samples, q_dim + 2 * kv_dim, n)?;
         } else {
             ops::gemm_lt_tune(ctx, &q_samples, q_dim, n)?;
             ops::gemm_lt_tune(ctx, &kv_samples, kv_dim, n)?;
         }
         ops::gemm_lt_tune(ctx, &o_samples, hidden, n)?;
-        ops::gemm_lt_tune(
-            ctx,
-            &gate_up_samples,
-            if fused_projections {
-                2 * intermediate
-            } else {
-                intermediate
-            },
-            n,
-        )?;
+        ops::gemm_lt_tune(ctx, &gate_up_samples, intermediate, n)?;
         ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
         ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
     }
@@ -3228,7 +3215,7 @@ impl LocalQwen3Lane {
             padding_block_id,
             model.local_num_attention_heads(),
             model.config().max_position_embeddings,
-            model.fused_decode_projections(),
+            model.fused_decode_qkv(),
         )?;
         let sample_scratch = pegainfer_sample::SampleScratch::new(
             model.device_ctx(),

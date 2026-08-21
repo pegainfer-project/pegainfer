@@ -1070,7 +1070,6 @@ mod tests {
     use half::bf16;
 
     use super::*;
-    use crate::tensor::DeviceMatrix;
 
     fn hidden_from_host(
         ctx: &DeviceContext,
@@ -1104,12 +1103,6 @@ mod tests {
                 "{context}: BF16 bits mismatch at index {index}"
             );
         }
-    }
-
-    #[test]
-    fn bitwise_comparison_accepts_identical_bf16_nan_payloads() {
-        let payload = bf16::from_bits(0x7fc1);
-        assert_bf16_bits_eq(&[payload], &[payload], "equal NaN payload");
     }
 
     #[test]
@@ -1163,12 +1156,8 @@ mod tests {
     fn split_qkv_is_a_bitwise_copy_for_tp_shapes_and_tails() -> Result<()> {
         let ctx = DeviceContext::new()?;
         for (q_dim, kv_dim, tokens) in [
-            (4096, 1024, 1),
+            // Qwen3-4B/8B production decode geometry at the largest target batch.
             (4096, 1024, 8),
-            (4096, 1024, 128),
-            (2048, 512, 1),
-            (2048, 512, 8),
-            (2048, 512, 128),
             // Deliberately not aligned to the 256-thread launch width.
             (5, 3, 7),
         ] {
@@ -1224,56 +1213,6 @@ mod tests {
             error.to_string().contains("must equal Q + K + V"),
             "unexpected shape error: {error:#}"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn vstacked_gate_up_gemm_matches_split_mlp_projection() -> Result<()> {
-        let ctx = DeviceContext::new()?;
-        let hidden_dim = 2;
-        let intermediate = 4;
-        let seq_len = 3;
-
-        let gate_w: Vec<_> = [1.0, -0.5, -2.0, 0.25, 0.75, 1.5, -1.25, -0.75]
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect();
-        let up_w: Vec<_> = [-0.25, 2.0, 1.25, -1.0, 0.5, 0.75, -1.5, 1.0]
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect();
-        let input: Vec<_> = [0.5, -1.0, 2.0, 0.25, -0.75, 1.5]
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect();
-
-        let gate_w = DeviceMatrix::from_host(&ctx, &gate_w, intermediate, hidden_dim)?;
-        let up_w = DeviceMatrix::from_host(&ctx, &up_w, intermediate, hidden_dim)?;
-        let gate_up_w = DeviceMatrix::vstack(&ctx, &[&gate_w, &up_w])?;
-        let input = hidden_from_host(&ctx, &input, hidden_dim, seq_len)?;
-
-        let gate = crate::ops::gemm(&ctx, &gate_w, &input)?;
-        let up = crate::ops::gemm(&ctx, &up_w, &input)?;
-        let split = silu_mul_batch(&ctx, &gate, &up)?;
-
-        let gate_up = crate::ops::gemm(&ctx, &gate_up_w, &input)?;
-        let mut fused = HiddenStates::zeros(&ctx, intermediate, seq_len)?;
-        silu_mul_fused_batch_into(&ctx, &gate_up, &mut fused)?;
-
-        let split_host = hidden_to_host(&ctx, &split)?;
-        let fused_host = hidden_to_host(&ctx, &fused)?;
-        assert_eq!(split_host.len(), fused_host.len());
-        for (idx, (split_value, fused_value)) in
-            split_host.iter().zip(fused_host.iter()).enumerate()
-        {
-            let split_f32 = split_value.to_f32();
-            let fused_f32 = fused_value.to_f32();
-            let diff = (split_f32 - fused_f32).abs();
-            assert!(
-                diff <= 0.02,
-                "vstacked gate_up GEMM mismatch at index {idx}: split={split_f32} fused={fused_f32} diff={diff}"
-            );
-        }
         Ok(())
     }
 

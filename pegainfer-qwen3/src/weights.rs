@@ -387,8 +387,8 @@ impl Qwen3Model {
         self.config.local_kv_dim(self.tensor_parallel)
     }
 
-    pub(crate) const fn fused_decode_projections(&self) -> bool {
-        self.decode_projection_path.is_fused()
+    pub(crate) const fn fused_decode_qkv(&self) -> bool {
+        self.decode_projection_path.fuses_qkv()
     }
 
     pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
@@ -731,7 +731,7 @@ impl Qwen3Model {
             0,
             self.local_num_attention_heads(),
             self.config.max_position_embeddings,
-            self.fused_decode_projections(),
+            self.fused_decode_qkv(),
         )
         .context("Qwen3 memory profile decode buffer alloc failed")?;
         record_peak()?;
