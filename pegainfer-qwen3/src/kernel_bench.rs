@@ -39,8 +39,9 @@ const MEMORY_TRANSFERS_PER_CLOCK: f64 = 2.0;
 const CACHE_CLEAR_L2_MULTIPLIER: usize = 2;
 const CACHE_CLEAR_MIN_BYTES: usize = 128 * 1024 * 1024;
 
-pub use crate::batch_decode_buffers::SplitKvCsr;
-pub use crate::batch_decode_buffers::build_split_kv_csr;
+pub use pegainfer_core::ops::SplitKvCsr;
+pub use pegainfer_core::ops::build_split_kv_csr;
+
 pub use crate::split_kv::SplitKvConfig;
 
 const DEFAULT_SPLIT_KV_CONFIG: SplitKvConfig = SplitKvConfig::new(

@@ -137,39 +137,17 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    /// NoPE full-context MLA decode over a slot-indexed cache: each row owns a
-    /// fixed `max_ctx` window, so `Kc [b, max_ctx, num_heads * qk_dim]` and
-    /// `Vc [b, max_ctx, num_heads * v_dim]` are dense, not paged. `N [b]` is
-    /// the per-row device-side context length; slots at or past it score
-    /// negative infinity, so no host sync is needed. `Sc [1]` is the shared
-    /// bf16 softmax scale.
-    pub fn k3_mla_attn_batched(
-        q: *const c_void,
-        kc: *const c_void,
-        vc: *const c_void,
-        n: *const i32,
-        sc: *const c_void,
-        o: *mut c_void,
+    /// `kda_core`'s tail on its own: per (row, head) f32 rms_norm of the bf16
+    /// attention landing `X` times the o_norm gamma `Go [head_dim]`, landed
+    /// once, times the bf16 sigmoid of the output gate `G2`. eps compiled in.
+    pub fn k3_o_norm_gate_batched(
+        x: *const c_void,
+        g2: *const c_void,
+        go: *const f32,
+        out: *mut c_void,
         b: i32,
         num_heads: i32,
-        qk_dim: i32,
-        v_dim: i32,
-        max_ctx: i32,
-        stream: CUstream,
-    ) -> i32;
-
-    /// Sigmoid router plus biased top-k over merged f32 score rows
-    /// `S [b, num_experts]`, with `Bias [num_experts]` f32 and the bf16 routed
-    /// scale `Rs [1]`. Writes `Idx [b, topk]` i32 and `Wts [b, topk]` f32.
-    pub fn k3_router_topk_batched(
-        s: *const f32,
-        bias: *const f32,
-        rs: *const c_void,
-        idx: *mut i32,
-        wts: *mut f32,
-        b: i32,
-        num_experts: i32,
-        topk: i32,
+        head_dim: i32,
         stream: CUstream,
     ) -> i32;
 

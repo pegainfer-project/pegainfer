@@ -105,7 +105,10 @@ impl CudaGraphState {
 
     /// Capture, instantiate, and upload — no launch — so a later
     /// [`Self::launch_captured`] is a pure enqueue (an un-uploaded exec uploads
-    /// implicitly on first launch). Async; synchronize before launching.
+    /// implicitly on first launch). The upload is stream-ordered: a launch
+    /// enqueued after it on the same stream is ordered behind it by the
+    /// driver, so only a launch from a *different* stream needs a
+    /// synchronization in between.
     pub fn capture_only<F>(&mut self, ctx: &DeviceContext, kernels: F) -> Result<()>
     where
         F: FnOnce() -> Result<()>,

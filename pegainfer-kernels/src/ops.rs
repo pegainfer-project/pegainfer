@@ -26,20 +26,24 @@ pub use attention::Hd512DecodeMetadata;
 pub use attention::PrefillPagedPlan;
 pub use attention::SUPPORTED_GQA_GROUP_SIZES;
 pub use attention::batch_prefill_paged_hd512_into;
+pub use attention::batch_prefill_paged_window_hd256_into;
 pub use attention::dflash_qk_norm_rope_into;
 pub use attention::eagle3_rope_into;
 pub use attention::paged_attention_batch_decode_hd256_into;
-pub use attention::paged_attention_batch_decode_hd512_into;
 pub use attention::paged_attention_batch_decode_into;
+pub use attention::paged_attention_batch_decode_split_kv_hd512_into;
 pub use attention::paged_attention_batch_decode_split_kv_into;
 pub use attention::paged_attention_batch_decode_via_prefill_hd256_into;
 pub use attention::paged_attention_batch_decode_via_prefill_hd512_into;
 pub use attention::prefill_attention_paged_into;
 pub use attention::qk_norm_partial_rope_batched_decode_hd256_into;
 pub use attention::qk_norm_partial_rope_batched_decode_hd512_into;
+pub use attention::qk_norm_partial_rope_paged_decode_hd512_into;
 pub use attention::qk_norm_partial_rope_paged_prefill_hd512_into;
 pub use attention::qk_norm_rope_batch_decode_into;
 pub use attention::qk_norm_rope_prefill_hd256_plain_into;
+pub use attention::qkv_norm_rope_paged_decode_hd256_plain_into;
+pub use attention::qkv_norm_rope_paged_prefill_hd256_plain_into;
 pub use attention::single_decode_nhd_into;
 pub use attention::single_prefill_hd256_into;
 pub use attention::single_prefill_hd512_into;
@@ -106,6 +110,7 @@ pub use elementwise::scaled_add_rows_token_range_into;
 pub use elementwise::silu_mul_batch;
 pub use elementwise::silu_mul_batch_into;
 pub use elementwise::silu_mul_fused_batch_into;
+pub use elementwise::softcap_bf16_in_place;
 pub use elementwise::write_vec_into;
 pub use embedding::embedding_batch;
 pub use embedding::embedding_batch_vocab_shard;
@@ -180,6 +185,10 @@ pub use sampling::markov_step_argmax_partials_len;
 
 pub(crate) fn checked_i32(value: usize, what: &str) -> anyhow::Result<i32> {
     i32::try_from(value).map_err(|_| anyhow::anyhow!("{what} {value} does not fit i32"))
+}
+
+pub(crate) fn checked_u32(value: usize, what: &str) -> anyhow::Result<u32> {
+    u32::try_from(value).map_err(|_| anyhow::anyhow!("{what} {value} does not fit u32"))
 }
 
 /// Calling thread's last FFI exception message, ready to append to an error;

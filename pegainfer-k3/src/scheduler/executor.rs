@@ -61,50 +61,20 @@ pub trait StepExecutor: Send {
     /// batch with an empty vec and no device work.
     fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>>;
 
+    /// Advance every slot in `batch` by one *round*, committing one or more
+    /// tokens per slot (parallel to `batch`, each list non-empty). This is
+    /// what the scheduler drives every step; the default is plain decode —
+    /// one token per slot — and an executor with a speculative path
+    /// overrides it to return each round's accepted span.
+    fn decode_many(&mut self, batch: &[DecodeSlot]) -> Result<Vec<Vec<u32>>> {
+        Ok(self
+            .decode(batch)?
+            .into_iter()
+            .map(|token| vec![token])
+            .collect())
+    }
+
     /// Drop the slot's state. Called on every terminal path, including the
     /// silent one (abort), and always before the slot is handed out again.
     fn release(&mut self, slot: SlotId);
-}
-
-// ── Phase-1 placeholder ─────────────────────────────────────────────────
-
-/// What every request is told while the model is not wired up. Failing at
-/// admission is the honest answer: the protocol runs, the model does not, and
-/// no request is ever answered with invented tokens.
-pub const UNWIRED_MESSAGE: &str = "K3 model execution is not wired up in this build: \
-     the engine serves the request protocol only, so no tokens can be produced";
-
-/// Batch width the placeholder reports. Nothing runs on it — it only decides
-/// how many queued requests are answered per step.
-const UNWIRED_MAX_BATCH: usize = 8;
-
-/// Stand-in executor for the phase-1 engine: it admits nothing and says why.
-///
-/// It deliberately reports an unbounded context so that requests reach
-/// [`StepExecutor::prefill`] and get the real reason, instead of a
-/// context-length rejection that would misdescribe the situation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnwiredExecutor;
-
-impl StepExecutor for UnwiredExecutor {
-    fn max_batch(&self) -> usize {
-        UNWIRED_MAX_BATCH
-    }
-
-    fn max_context_tokens(&self) -> usize {
-        usize::MAX
-    }
-
-    fn prefill(&mut self, _slot: SlotId, _prompt: &[u32], _params: &SamplingParams) -> Result<u32> {
-        anyhow::bail!(UNWIRED_MESSAGE)
-    }
-
-    fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
-        if batch.is_empty() {
-            return Ok(Vec::new());
-        }
-        anyhow::bail!(UNWIRED_MESSAGE)
-    }
-
-    fn release(&mut self, _slot: SlotId) {}
 }

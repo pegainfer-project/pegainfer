@@ -59,7 +59,7 @@ use load::publish_load;
 use mtp::run_mtp_round;
 use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::KvPrefix;
-use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::SubmittedRequest;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_kv_store::BlockPool;
@@ -215,7 +215,7 @@ pub(crate) struct Glm52EngineSpec {
     pub(crate) max_model_len: usize,
     pub(crate) no_prefix_cache: bool,
     pub(crate) moe_topo: crate::Glm52MoeTopo,
-    pub(crate) load_tx: watch::Sender<LoadSnapshot>,
+    pub(crate) load_tx: watch::Sender<SchedulerMetrics>,
     pub(crate) graph_dump_request: Option<GraphDumpRequest>,
     /// Bootstrap report: the engine sends once after graph pre-capture (and
     /// the rank-0 graph dump), or once with the failure that killed it.
@@ -248,7 +248,7 @@ pub(crate) struct Glm52Engine {
     /// not exit (or block solely on `submit_rx`) while any are in flight.
     resolves_inflight: Arc<std::sync::atomic::AtomicUsize>,
     moe_topo: crate::Glm52MoeTopo,
-    load_tx: watch::Sender<LoadSnapshot>,
+    load_tx: watch::Sender<SchedulerMetrics>,
     graph_dump_request: Option<GraphDumpRequest>,
     startup_tx: crossbeam_channel::Sender<anyhow::Result<()>>,
     /// Tensor-replicated topology: this rank drives mirrored executors with

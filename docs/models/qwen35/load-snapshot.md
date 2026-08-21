@@ -1,8 +1,8 @@
 # Qwen3.5 Scheduler LoadSnapshot
 
-> **TL;DR:** Qwen3.5 publishes one logical `LoadSnapshot` stream from its shared single-GPU/TP scheduler: running counts active and prefilling requests, waiting counts deferred requests, and KV usage is request-page capacity minus available pages.
+> **TL;DR:** Qwen3.5 publishes one logical post-drain/post-prune `LoadSnapshot` stream from its shared single-GPU/TP scheduler: running counts active and prefilling requests, waiting counts all current pending work, and KV usage is request-page capacity minus available pages.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-08
 
 ## Preparation
 
@@ -35,28 +35,29 @@ Qwen3.5 SchedulerBackend
 
 Both Qwen3.5 execution modes own one logical request stream, so single-GPU and TP each attach one `EngineHandle::with_load_watch` receiver. The frontend bridge, metric names, labels, and scheduler-stat conversion remain unchanged.
 
-The scheduler publishes at the top of its existing loop. At that point, work retired by the previous step has been removed and its KV pages have been released, so the next snapshot can settle to idle before `blocking_recv()` waits for new work.
+Each scheduler tick first merges deferred work with every submission currently available, then prunes closed pending, active, and prefilling requests before publishing. The fixed boundary is `drain -> prune -> publish load -> admission -> plan`. If the idle scheduler wakes through `blocking_recv()`, it drains, prunes, and publishes again before admission so work closed before admission never consumes a slot or appears in the snapshot.
 
 Snapshot accounting is:
 
 | Metric field | Existing Qwen3.5 state |
 | --- | --- |
 | `num_running_reqs` | `active.len() + prefilling.len()` |
-| `num_waiting_reqs` | `deferred.len()` |
+| `num_waiting_reqs` | the merged pending queue: prior deferred work plus newly drained submissions |
 | `kv_used_blocks` | request KV capacity minus currently available request pages |
 | `kv_total_blocks` | backend request KV capacity, excluding the CUDA Graph padding page |
 
-Publication reads the scheduler's existing queues and KV allocator at the settled boundary.
+Publication reads the scheduler's queues and KV allocator after closed resident state has gone through its normal retirement path. The snapshot therefore describes the state used by the following admission decision: cancelled residents no longer count as running or hold capacity, while live pending requests count as waiting even if they were submitted during the current tick.
 
 The live gate uses `scripts/bench_http_serving.py` to create overlapping HTTP traffic and a 100 ms `curl /metrics` sampler to retain the three labeled gauges.
 
 ## Execution Log
 
 - Added load watches to `start_with_capacity` and `start_tp_with_capacity` and attached each receiver to its engine handle.
-- Added direct, backend-neutral `LoadSnapshot` publication at the top of the shared scheduler loop, following Qwen3's instrumentation shape.
+- Added direct, backend-neutral `LoadSnapshot` publication in the shared scheduler loop, following Qwen3's instrumentation shape.
 - Derived KV capacity and availability through `SchedulerBackend`, so the same publication logic serves single-GPU and TP.
 - Validated the single-GPU path with the existing scheduler E2E and live HTTP pressure: running and KV usage rose during generation, waiting reached three at `--max-batch 1`, and every gauge returned to zero after drain and recovery.
 - Updated the shared Prometheus documentation for Qwen3.5's one-logical-engine contract.
+- P2A step 2 moved publication after drain and cancellation pruning. Focused CPU tests cover closed pending and resident work, and a real TP1 `max_batch=1` gate proves a cancelled resident disappears from the post-prune load, frees capacity for same-tick admission, and leaves running, waiting, and KV usage at zero after recovery.
 
 ## Validation Boundary
 
@@ -155,10 +156,10 @@ The server exited cleanly and the metric sampler reported no errors.
 
 ## Debrief
 
-- **Outcome**: Qwen3.5 now feeds one logical `LoadSnapshot` stream to the frontend for both single-GPU and TP. Single-GPU live validation confirms running, waiting, KV usage, idle reset, and recovery; TP uses the same scheduler path but was not part of this live run.
+- **Outcome**: Qwen3.5 feeds one logical `LoadSnapshot` stream to the frontend for both single-GPU and TP. Publication now occurs after current submissions are drained and closed work is pruned, so the snapshot is the admission boundary rather than a view of only the previous tick.
 - **Pitfalls encountered**:
   - The TP scheduler rebase required KV accounting through `SchedulerBackend`; retaining model-specific `model.kv_pool()` access would not compile against the shared loop.
 - **Lessons learned**:
   - A shared scheduler loop should expose observability through `SchedulerBackend` so one implementation covers both execution topologies.
-  - Top-of-loop publication captures settled state, including the idle zero after KV pages return.
+  - Post-drain/post-prune publication captures both newly waiting work and capacity returned by cancellation before the next admission decision.
   - The existing HTTP benchmark plus raw metric sampling covers the live gauge contract.

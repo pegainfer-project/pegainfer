@@ -1,8 +1,8 @@
 # Gemma 4 tokenizer and chat template
 
-**TL;DR:** All five chat renders reproduce the Hugging Face reference when content is flattened to strings, and token ids agree across the layers that can differ — gated by `pegainfer-gemma4/tests/tokenizer_parity.rs` against the pinned 12B checkpoint, with the other two sizes covered by inspection rather than by running. One divergence is open: under the frontend's default content format the system turn gains a trailing space. Contracts the engine must honour: BOS comes only from the chat template, EOS is declared in three places with three different values, the published generation defaults are sampled rather than greedy, and modality tokens are reachable from plain text so text-only serving has to reject them instead of embedding them.
+**TL;DR:** All five chat renders reproduce the Hugging Face reference when content is flattened to strings, and token ids agree across the layers that can differ — gated by `pegainfer-gemma4/tests/tokenizer_parity.rs` against the pinned 12B checkpoint, with the other two sizes covered by inspection rather than by running. One divergence is open: under the frontend's default content format the system turn gains a trailing space. Contracts the engine must honour: BOS comes only from the chat template, EOS is declared in three places with three different values, the published generation defaults are sampled rather than greedy, and text-only serving rejects modality tokens before embedding and suppresses them before sampling.
 
-Last touched: 2026-07
+Last touched: 2026-08
 
 ## The gate runs on 12B; the result carries to the other sizes by inspection
 
@@ -122,7 +122,9 @@ Also read from the checkpoint rather than gated by a test.
 `generation_config.json` sets `do_sample: true`, `temperature: 1.0`, `top_k: 64`, `top_p: 0.95`
 at all three sizes. Any greedy comparison against a reference implementation has to state the
 override it applies. 12B alone adds `suppress_tokens: [258883, 258882]` — the end-of-audio and
-end-of-image ids; that list must not be applied to 26B or 31B, which do not declare it.
+end-of-image ids; that checkpoint-specific list must not be applied to 26B or 31B, which do not
+declare it. Independently, text-only serving suppresses all six modality placeholders at every
+size because none can be fed into the next text-tower step.
 
 ## Modality tokens are reachable from plain text
 
@@ -140,7 +142,7 @@ These encode as single ids straight from user text — `"before <|image|> after"
 admitted request carrying one of these ids would reach the embedding table with a placeholder that
 maps to nothing meaningful.
 
-So the admission path will need a rule for them once the engine exists — rejecting the request
-naming the token is the option that fails loudly; embedding the id silently is the one to avoid.
-Nothing enforces this today, so whoever writes admission has to pick it up from here or from the
-engine issue.
+The engine uses one shared six-id set at both boundaries: host-token validation rejects a prompt or
+decode input before embedding, and the effective sampling suppression set unions those ids with the
+checkpoint's own `suppress_tokens`. A placeholder therefore cannot be embedded, emitted to the
+client, or returned as the next decode input.

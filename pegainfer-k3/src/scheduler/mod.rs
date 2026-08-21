@@ -1,12 +1,11 @@
 //! How K3 plugs into the step-batched engine contract.
 //!
 //! [`K3Scheduler`] implements [`Scheduler`]: the contract's driver polls
-//! `intake` / `step` / `load`, and everything model-side sits behind
+//! `submit` / `step` / `metrics`, and everything model-side sits behind
 //! [`StepExecutor`]. This module owns the two contract-facing jobs:
 //!
-//! - the **handle registry**: each request's typestate handle
-//!   ([`IntakeTicket`] until admission, [`ActiveRequest`] after), keyed by the
-//!   contract's [`RequestId`], plus every emitter call that moves one along;
+//! - the **ledger writes**: every verdict and token for a request, recorded
+//!   against the contract's [`RequestId`] on the step's [`RequestLedger`];
 //! - **engine assembly**: wrapping executors in schedulers and returning the
 //!   [`Engine`] bundle a model line hands back from `launch`.
 //!
@@ -20,29 +19,25 @@ mod executor;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use anyhow::Result;
-use pegainfer_frontend::engine::ActiveRequest;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::IntakeTicket;
 use pegainfer_frontend::engine::KvCapacity;
-use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestId;
+use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
-use pegainfer_frontend::engine::StepEmitter;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::spawn_scheduler;
 
 pub use self::executor::DecodeSlot;
 pub use self::executor::SlotId;
 pub use self::executor::StepExecutor;
-pub use self::executor::UNWIRED_MESSAGE;
-pub use self::executor::UnwiredExecutor;
 
 // ── Engine assembly ─────────────────────────────────────────────────────
 
@@ -91,47 +86,17 @@ where
     }
 }
 
-/// `ep_size` scheduler partitions over placeholder executors: every request is
-/// admitted and then failed with [`UNWIRED_MESSAGE`], so the serving path is
-/// real end to end and no client is answered with invented tokens. Serving now
-/// goes through the GPU executor instead; what is left here is the vehicle for
-/// exercising the request protocol on a box with no GPU and no weights.
-#[must_use]
-pub fn launch_unwired(ep_size: usize, eos_token_ids: Vec<u32>) -> Engine {
-    start_with_executors(
-        vec![UnwiredExecutor; ep_size],
-        &K3SchedulerConfig {
-            eos_token_ids,
-            kv_capacity: None,
-        },
-    )
-}
-
 // ── The Scheduler implementation ────────────────────────────────────────
 
 /// Answer a request that just reached its end: silence if the frontend
 /// abandoned it since the scheduler last looked, the finish otherwise. Abort
 /// can land at any moment, so the check belongs on every finish path.
-fn finish_or_retire(active: ActiveRequest, reason: FinishReason, emitter: &mut StepEmitter) {
-    if active.is_aborted() {
-        emitter.retire(active);
+fn finish_or_retire(id: RequestId, reason: FinishReason, ledger: &mut RequestLedger) {
+    if ledger.is_aborted(id) {
+        ledger.retire(id);
     } else {
-        emitter.finish(active, reason);
+        ledger.finish(id, reason);
     }
-}
-
-/// One request's contract handle, in whichever lifecycle state it holds.
-enum HandleSlot {
-    /// Submitted, not yet admitted: reject/retire consume the ticket.
-    Queued(IntakeTicket),
-    /// Admitted: token pushes go through it; finish/fail/retire consume it.
-    Streaming(ActiveRequest),
-}
-
-/// A submitted request waiting for a slot.
-struct PendingRequest {
-    id: RequestId,
-    request: Request,
 }
 
 /// An admitted request occupying an execution slot.
@@ -148,14 +113,10 @@ pub struct K3Scheduler<E: StepExecutor> {
     executor: E,
     eos_token_ids: Vec<u32>,
     kv_capacity: Option<KvCapacity>,
-    /// Contract handle per live request. Entries leave exactly at terminal
-    /// transitions, so a request is in here iff the scheduler still owes it
-    /// an answer.
-    handles: HashMap<RequestId, HandleSlot>,
-    /// Requests waiting for a slot, in submission order. A full batch is a
+    /// Requests waiting for a slot, in submit order. A full batch is a
     /// wait, not a verdict — only permanently unservable requests are refused
     /// (see [`K3Scheduler::admission_refusal`]).
-    queued: VecDeque<PendingRequest>,
+    queued: VecDeque<QueuedRequest>,
     running: Vec<RunningRequest>,
     /// Slots not currently held by a running request.
     free_slots: Vec<SlotId>,
@@ -168,18 +129,9 @@ impl<E: StepExecutor> K3Scheduler<E> {
             executor,
             eos_token_ids: config.eos_token_ids,
             kv_capacity: config.kv_capacity,
-            handles: HashMap::new(),
             queued: VecDeque::new(),
             running: Vec::new(),
             free_slots,
-        }
-    }
-
-    /// Take a streaming handle out of the registry for a terminal transition.
-    fn take_streaming(&mut self, id: RequestId) -> ActiveRequest {
-        match self.handles.remove(&id) {
-            Some(HandleSlot::Streaming(handle)) => handle,
-            _ => unreachable!("running request {id} must hold a streaming handle"),
         }
     }
 
@@ -211,30 +163,24 @@ impl<E: StepExecutor> K3Scheduler<E> {
 
     /// Fill free slots from the queue: retire what the frontend abandoned,
     /// refuse what can never fit, prefill the rest.
-    fn admit_queued(&mut self, emitter: &mut StepEmitter) {
+    fn admit_queued(&mut self, ledger: &mut RequestLedger) {
         while !self.free_slots.is_empty() {
             let Some(pending) = self.queued.pop_front() else {
                 break;
             };
-            let HandleSlot::Queued(ticket) = self
-                .handles
-                .remove(&pending.id)
-                .expect("queued request holds its ticket until admission")
-            else {
-                unreachable!("queued request {} must hold a ticket", pending.id);
-            };
-            if ticket.is_aborted() {
-                emitter.retire_ticket(ticket);
+            let id = pending.id;
+            if ledger.is_aborted(id) {
+                ledger.retire(id);
                 continue;
             }
             if let Some(reason) = self.admission_refusal(&pending.request) {
-                emitter.reject(ticket, reason);
+                ledger.reject(id, reason);
                 continue;
             }
-            let mut active = emitter.admit(ticket);
+            ledger.admit(id);
             if pending.request.max_tokens == 0 {
                 // Nothing to generate: answer without occupying a slot.
-                finish_or_retire(active, FinishReason::Length, emitter);
+                finish_or_retire(id, FinishReason::Length, ledger);
                 continue;
             }
             let slot = self
@@ -252,12 +198,12 @@ impl<E: StepExecutor> K3Scheduler<E> {
                     // A prefill failure is this request's problem, not the
                     // engine's: answer it and keep serving.
                     self.release_slot(slot);
-                    emitter.fail(active, format!("{error:#}"));
+                    ledger.fail(id, format!("{error:#}"));
                     continue;
                 }
             };
             let state = RunningRequest {
-                id: pending.id,
+                id,
                 slot,
                 last_token: first,
                 max_tokens: pending.request.max_tokens,
@@ -266,25 +212,23 @@ impl<E: StepExecutor> K3Scheduler<E> {
             if self.is_stop_token(first, state.ignore_eos) {
                 // The stop token itself is not part of the completion.
                 self.release_slot(slot);
-                finish_or_retire(active, FinishReason::Stop, emitter);
+                finish_or_retire(id, FinishReason::Stop, ledger);
                 continue;
             }
-            emitter.push_tokens(&mut active, &[first], &[]);
-            if active.completion_tokens() >= state.max_tokens {
+            ledger.push_tokens(id, &[first], &[]);
+            if ledger.completion_tokens(id) >= state.max_tokens {
                 self.release_slot(slot);
-                finish_or_retire(active, FinishReason::Length, emitter);
+                finish_or_retire(id, FinishReason::Length, ledger);
                 continue;
             }
-            self.handles
-                .insert(pending.id, HandleSlot::Streaming(active));
             self.running.push(state);
         }
     }
 
     /// One decode step over every running request, minus the ones the
     /// frontend abandoned since the last step.
-    fn decode_running(&mut self, emitter: &mut StepEmitter) {
-        self.retire_aborted(emitter);
+    fn decode_running(&mut self, ledger: &mut RequestLedger) {
+        self.retire_aborted(ledger);
         let batch: Vec<DecodeSlot> = self
             .running
             .iter()
@@ -300,41 +244,59 @@ impl<E: StepExecutor> K3Scheduler<E> {
         // barriers inside them would pair against a peer's wrong step.
         // Single-rank executors simply return an empty token list without
         // touching the device.
-        let tokens = match self.executor.decode(&batch) {
-            Ok(tokens) => tokens,
+        let token_lists = match self.executor.decode_many(&batch) {
+            Ok(token_lists) => token_lists,
             Err(error) => {
                 // The step touched the whole running batch, so the whole
                 // batch is what dies. The scheduler stays up.
-                self.fail_running(&format!("{error:#}"), emitter);
+                self.fail_running(&format!("{error:#}"), ledger);
                 return;
             }
         };
         assert_eq!(
-            tokens.len(),
+            token_lists.len(),
             batch.len(),
-            "executor returned {} tokens for a batch of {}",
-            tokens.len(),
+            "executor returned {} token lists for a batch of {}",
+            token_lists.len(),
             batch.len()
         );
         let mut still_running = Vec::with_capacity(self.running.len());
-        for (mut state, token) in std::mem::take(&mut self.running).into_iter().zip(tokens) {
-            state.last_token = token;
-            if self.is_stop_token(token, state.ignore_eos) {
-                let active = self.take_streaming(state.id);
-                self.release_slot(state.slot);
-                finish_or_retire(active, FinishReason::Stop, emitter);
-                continue;
+        for (mut state, committed) in std::mem::take(&mut self.running)
+            .into_iter()
+            .zip(token_lists)
+        {
+            assert!(
+                !committed.is_empty(),
+                "a round must commit at least one token"
+            );
+            // A speculative round commits several tokens at once; walk them
+            // in order and stop at the first terminal one. Tokens past a
+            // stop/length cut are computed-but-dead, like a rejected draft.
+            let already = ledger.completion_tokens(state.id);
+            let mut kept: Vec<u32> = Vec::with_capacity(committed.len());
+            let mut finished = None;
+            for &token in &committed {
+                if self.is_stop_token(token, state.ignore_eos) {
+                    // The stop token itself is not part of the completion.
+                    finished = Some(FinishReason::Stop);
+                    break;
+                }
+                kept.push(token);
+                state.last_token = token;
+                if already + kept.len() >= state.max_tokens {
+                    finished = Some(FinishReason::Length);
+                    break;
+                }
             }
-            let Some(HandleSlot::Streaming(active)) = self.handles.get_mut(&state.id) else {
-                unreachable!("running request {} must hold a streaming handle", state.id);
-            };
-            emitter.push_tokens(active, &[token], &[]);
-            if active.completion_tokens() >= state.max_tokens {
-                let active = self.take_streaming(state.id);
-                self.release_slot(state.slot);
-                finish_or_retire(active, FinishReason::Length, emitter);
-            } else {
-                still_running.push(state);
+            if !kept.is_empty() {
+                ledger.push_tokens(state.id, &kept, &[]);
+            }
+            match finished {
+                Some(reason) => {
+                    self.release_slot(state.slot);
+                    finish_or_retire(state.id, reason, ledger);
+                }
+                None => still_running.push(state),
             }
         }
         self.running = still_running;
@@ -342,58 +304,46 @@ impl<E: StepExecutor> K3Scheduler<E> {
 
     /// Drop every running request the frontend gave up on. Silent on the
     /// wire — the frontend already dropped its state for these ids.
-    fn retire_aborted(&mut self, emitter: &mut StepEmitter) {
-        let aborted: Vec<usize> = self
-            .running
-            .iter()
-            .enumerate()
-            .filter(|(_, state)| match self.handles.get(&state.id) {
-                Some(HandleSlot::Streaming(handle)) => handle.is_aborted(),
-                _ => unreachable!("running request {} must hold a streaming handle", state.id),
-            })
-            .map(|(index, _)| index)
-            .collect();
-        for index in aborted.into_iter().rev() {
-            let state = self.running.swap_remove(index);
-            let handle = self.take_streaming(state.id);
-            emitter.retire(handle);
-            self.release_slot(state.slot);
+    fn retire_aborted(&mut self, ledger: &mut RequestLedger) {
+        let mut index = 0;
+        while index < self.running.len() {
+            if ledger.is_aborted(self.running[index].id) {
+                let state = self.running.swap_remove(index);
+                ledger.retire(state.id);
+                self.release_slot(state.slot);
+            } else {
+                index += 1;
+            }
         }
     }
 
     /// Fail every running request with one message and free their slots.
-    fn fail_running(&mut self, message: &str, emitter: &mut StepEmitter) {
+    fn fail_running(&mut self, message: &str, ledger: &mut RequestLedger) {
         for state in std::mem::take(&mut self.running) {
-            let handle = self.take_streaming(state.id);
-            emitter.fail(handle, message);
+            ledger.fail(state.id, message);
             self.release_slot(state.slot);
         }
     }
 }
 
 impl<E: StepExecutor> Scheduler for K3Scheduler<E> {
-    fn intake(&mut self, mut ticket: IntakeTicket) {
-        // Ownership transfer only; every verdict is emitted from `step`.
-        // Tickets already aborted at intake ride the normal path — admission
-        // re-checks the flag and retires them.
-        let id = ticket.id();
-        let request = ticket
-            .take_request()
-            .expect("intake receives tickets with their payload");
-        self.handles.insert(id, HandleSlot::Queued(ticket));
-        self.queued.push_back(PendingRequest { id, request });
+    fn submit(&mut self, request: QueuedRequest) {
+        // Ownership transfer only; every verdict is written to the ledger
+        // from `step`. Requests already aborted when submitted ride the
+        // normal path — admission re-checks the flag and retires them.
+        self.queued.push_back(request);
     }
 
-    fn step(&mut self, emitter: &mut StepEmitter) -> Result<()> {
-        self.admit_queued(emitter);
-        self.decode_running(emitter);
+    fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        self.admit_queued(ledger);
+        self.decode_running(ledger);
         // No `Err` path yet: prefill and decode failures are per-request and
         // absorbed above. `Err` here would mean the engine is beyond use.
         Ok(())
     }
 
-    fn load(&self) -> LoadSnapshot {
-        LoadSnapshot {
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
             // K3 owns no KV pool of its own yet, so occupancy is honestly
             // zero; the advertised total is whatever the line injected.
             kv_used_blocks: 0,
@@ -402,6 +352,7 @@ impl<E: StepExecutor> Scheduler for K3Scheduler<E> {
                 .map_or(0, |capacity| capacity.total_blocks as u64),
             num_running_reqs: self.running.len() as u64,
             num_waiting_reqs: self.queued.len() as u64,
+            ..SchedulerMetrics::default()
         }
     }
 }

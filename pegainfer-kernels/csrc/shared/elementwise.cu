@@ -177,10 +177,42 @@ __global__ void scaled_add_rows_indexed_kernel(
          row < rows;
          row += gridDim.x * blockDim.x) {
       int delta_idx = token * rows + row;
-      int out_idx = out_token * out_hidden_dim + row_offset + row;
+      // out_token * out_hidden_dim overflows i32 for large row pools (the K3
+      // paged-KV slab exceeds 2^31 elements), so the element index is size_t.
+      size_t out_idx =
+          (size_t)out_token * out_hidden_dim + row_offset + row;
       float base = __bfloat162float(out[out_idx]);
       float add = __bfloat162float(delta[delta_idx]) * scale;
       out[out_idx] = __float2bfloat16(base + add);
+    }
+  }
+}
+
+__global__ void store_rows_indexed_kernel(
+    const __nv_bfloat16 *__restrict__ src,
+    const int *__restrict__ token_indices,
+    __nv_bfloat16 *__restrict__ out,
+    int out_hidden_dim,
+    int row_offset,
+    int rows,
+    int token_count,
+    int out_seq_len) {
+  for (int token = blockIdx.y * blockDim.y + threadIdx.y;
+       token < token_count;
+       token += gridDim.y * blockDim.y) {
+    int out_token = token_indices[token];
+    if (out_token < 0 || out_token >= out_seq_len) {
+      continue;
+    }
+    for (int row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < rows;
+         row += gridDim.x * blockDim.x) {
+      int src_idx = token * rows + row;
+      // out_token * out_hidden_dim overflows i32 for large row pools (the K3
+      // paged-KV slab exceeds 2^31 elements), so the element index is size_t.
+      size_t out_idx =
+          (size_t)out_token * out_hidden_dim + row_offset + row;
+      out[out_idx] = src[src_idx];
     }
   }
 }
@@ -296,6 +328,25 @@ __global__ void gelu_tanh_mul_kernel(
     float inner = kSqrt2OverPi * (g + 0.044715f * g * g * g);
     float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
     out[idx] = __float2bfloat16(__bfloat162float(__float2bfloat16(gelu_g)) * u);
+  }
+}
+
+// ============================================================================
+// In-place final-logit softcap: buf[i] = bf16(cap * tanh(f32(buf[i]) / cap)).
+// Gemma 4 declares final_logit_softcapping (30.0 at every published size) and
+// applies it to the LM head output in the compute dtype; f32 internal with a
+// single rounding matches the reference's bf16 elementwise chain.
+// ============================================================================
+
+__global__ void softcap_bf16_kernel(
+    __nv_bfloat16 *__restrict__ buf,
+    float cap,
+    int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    float x = __bfloat162float(buf[idx]);
+    buf[idx] = __float2bfloat16(cap * tanhf(x / cap));
   }
 }
 
@@ -632,6 +683,34 @@ CUresult scaled_add_rows_indexed_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+CUresult store_rows_indexed_cuda(
+    const __nv_bfloat16 *src,
+    const int *token_indices,
+    __nv_bfloat16 *out,
+    int out_hidden_dim,
+    int row_offset,
+    int rows,
+    int token_count,
+    int out_seq_len,
+    cudaStream_t stream) {
+  if (src == nullptr || token_indices == nullptr || out == nullptr ||
+      out_hidden_dim <= 0 || row_offset < 0 || rows <= 0 ||
+      token_count <= 0 || out_seq_len <= 0 ||
+      row_offset + rows > out_hidden_dim) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  dim3 block(32, 8);
+  int grid_x = (rows + block.x - 1) / block.x;
+  int grid_y = (token_count + block.y - 1) / block.y;
+  grid_x = grid_x > 65535 ? 65535 : grid_x;
+  grid_y = grid_y > 65535 ? 65535 : grid_y;
+  dim3 grid(grid_x, grid_y);
+  store_rows_indexed_kernel<<<grid, block, 0, stream>>>(
+      src, token_indices, out, out_hidden_dim, row_offset, rows,
+      token_count, out_seq_len);
+  return (CUresult)cudaGetLastError();
+}
+
 CUresult bf16_to_f32_cuda(
     const __nv_bfloat16 *input, float *output, int n, cudaStream_t stream) {
   int block = 256;
@@ -708,6 +787,14 @@ CUresult scale_bf16_in_place_cuda(
   int block = 256;
   int grid = n / block + (n % block != 0);
   scale_bf16_kernel<<<grid, block, 0, stream>>>(buf, scale, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult softcap_bf16_in_place_cuda(
+    __nv_bfloat16 *buf, float cap, int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = n / block + (n % block != 0);
+  softcap_bf16_kernel<<<grid, block, 0, stream>>>(buf, cap, n);
   return (CUresult)cudaGetLastError();
 }
 

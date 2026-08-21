@@ -133,7 +133,11 @@ fn executor(
     let config = K3ExecutorConfig {
         max_batch,
         max_ctx: golden.max_ctx,
+        kv_pages: 0,
         num_layers: golden.num_layers,
+        // Pin chunks to the slot count: the prefill gates engineer their
+        // chunk widths through `max_batch` (cap 1, cap 8).
+        chunk_tokens: max_batch,
         cuda_graph,
         moe_transport,
     };
@@ -213,6 +217,30 @@ fn assert_fixture_match(golden: &Golden, sampled: &[u32], what: &str) {
         "{what}: {}/{} steps match the fixture exactly, {spent} inside the noise floor",
         sampled.len() - spent,
         sampled.len()
+    );
+}
+
+/// One step's argmax against the fixture with the noise-floor excusal — for
+/// gates whose path is legitimately not bit-identical to the reference
+/// (chunked prefill: FlashKDA's f32 l2norm chain and chunkwise accumulation
+/// against the bucket-1 fixture).
+fn assert_step_within_noise(golden: &Golden, step: usize, got: u32, what: &str) {
+    let want = golden.argmax[step];
+    if got == want {
+        return;
+    }
+    let excused = golden.is_coin_flip(step) && golden.top5_ids[step].contains(&got);
+    assert!(
+        excused,
+        "{what}: step {step} sampled {got}, fixture says {want}; \
+         reference margin {:.2} bf16 ULP, top-5 ids {:?}",
+        golden.margin_ulp(step),
+        golden.top5_ids[step]
+    );
+    eprintln!(
+        "{what}: step {step} is a coin flip (reference margin {:.2} bf16 ULP): \
+         sampled {got}, fixture says {want}",
+        golden.margin_ulp(step)
     );
 }
 
@@ -544,42 +572,77 @@ fn four_concurrent_sequences_each_match_the_baseline() {
 }
 
 /// The serving path: `prefill` ingests the prompt and returns the request's
-/// first token, then `decode` continues it. Both must agree with the fixture.
+/// first token, then `decode` continues it — both held to the fixture with
+/// its noise-floor excusal. The chunkwise KDA prefill is legitimately not
+/// bit-identical to per-token decode stepping, so the state a slot adopts can
+/// send a greedy continuation off the baseline at a coin-flip step; the
+/// continuation is force-fed the fixture feed to keep every step
+/// independently comparable. `max_batch = 1` keeps every chunk at a single
+/// token — the chunk path's degenerate edge (the wide-chunk case is
+/// [`chunked_prefill_crosses_its_bucket_boundaries`]).
 #[test]
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn prefill_then_decode_serves_the_baseline_continuation() {
     let golden = golden();
-    let Some(baseline) = baseline_trajectory(&golden) else {
+    let Some(mut executor) = executor(&golden, 1, true, K3MoeTransport::MEGA) else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
-    let mut executor = executor(&golden, 1, true, K3MoeTransport::MEGA)
-        .expect("the checkpoint was there a moment ago");
+    let what = "prefill then decode";
     let params = pegainfer_frontend::sampler::SamplingParams::default();
     let first = executor
         .prefill(0, &golden.prompt, &params)
         .expect("prefill should run");
-    let boundary = golden.prompt.len() - 1;
-    assert_eq!(
-        first, baseline[boundary],
-        "prefill's first token: got {first}, the decode path sampled {}",
-        baseline[boundary]
-    );
-    let mut last = first;
-    for (step, &want) in baseline.iter().enumerate().skip(golden.prompt.len()) {
+    assert_step_within_noise(&golden, golden.prompt.len() - 1, first, what);
+    let feed = golden.feed();
+    for step in golden.prompt.len()..golden.argmax.len() {
         let tokens = executor
             .decode(&[DecodeSlot {
                 slot: 0,
-                last_token: last,
+                last_token: feed[step],
             }])
             .expect("decode should run");
-        last = tokens[0];
-        assert_eq!(
-            last, want,
-            "decode step {step}: got {last}, the decode path sampled {want}"
-        );
+        assert_step_within_noise(&golden, step, tokens[0], what);
     }
-    eprintln!("prefill + decode reproduced the decode-only continuation");
+    eprintln!("prefill + decode served the fixture continuation");
+}
+
+/// Chunked-prefill gate: a prompt longer than the executor's bucket must split
+/// into chunks and still serve the fixture. Thirteen prompt tokens against a
+/// cap of eight force one full chunk and a ragged five-token chunk — odd, so
+/// the KDA parity the slot adopts flipped mid-prompt — with three padding rows
+/// in its bucket. The chunk's wide GEMM buckets may retile against the
+/// bucket-1 reference, so every step is held to the fixture with its
+/// noise-floor excusal rather than bit-exactness, and the continuation is
+/// force-fed so a coin flip cannot cascade into later steps.
+#[test]
+#[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
+fn chunked_prefill_crosses_its_bucket_boundaries() {
+    let golden = golden();
+    let Some(mut executor) = executor(&golden, 8, false, K3MoeTransport::MEGA) else {
+        eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
+        return;
+    };
+    let what = "chunked prefill";
+    let boundary = 13;
+    let params = pegainfer_frontend::sampler::SamplingParams::default();
+    let first = executor
+        .prefill(0, &golden.prompt[..boundary], &params)
+        .expect("chunked prefill should run");
+    assert_step_within_noise(&golden, boundary - 1, first, what);
+    let feed = golden.feed();
+    for step in boundary..golden.argmax.len() {
+        let tokens = executor
+            .decode(&[DecodeSlot {
+                slot: 0,
+                last_token: feed[step],
+            }])
+            .expect("decode should run");
+        assert_step_within_noise(&golden, step, tokens[0], what);
+    }
+    eprintln!(
+        "chunked prefill (cap 8 over {boundary} prompt tokens) served the fixture continuation"
+    );
 }
 
 /// Localization aid, not a gate: feed the fixture's own token sequence at every
@@ -642,6 +705,58 @@ fn forced_replay_reports_per_step_agreement() {
     );
 }
 
+/// A TTFT snapshot, not a gate: time `prefill` at growing prompt lengths over
+/// the truncated model. The prompt cycles the fixture's tokens — numerics are
+/// not checked here, only where the prefill time goes. Run it on the same box
+/// before and after a prefill-path change; absolute numbers move with load.
+#[test]
+#[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
+fn prefill_time_snapshot() {
+    let golden = golden();
+    let Some(path) = checkpoint() else {
+        eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
+        return;
+    };
+    let config = K3ExecutorConfig {
+        max_batch: 128,
+        max_ctx: 4096,
+        kv_pages: 0,
+        num_layers: golden.num_layers,
+        // Derived: the widest chunk the transport carries (protocol max).
+        chunk_tokens: 0,
+        cuda_graph: true,
+        moe_transport: K3MoeTransport::MEGA,
+    };
+    let mut executor =
+        K3Executor::load(&path, device(), 0, 1, config).expect("the truncated model should load");
+    let params = pegainfer_frontend::sampler::SamplingParams::default();
+    let prompt_of = |len: usize| -> Vec<u32> {
+        (0..len)
+            .map(|i| golden.prompt[i % golden.prompt.len()])
+            .collect()
+    };
+    // Warm up: lazy driver/cuBLAS setup and, on the old path, graph capture.
+    executor
+        .prefill(0, &prompt_of(16), &params)
+        .expect("warmup prefill");
+    executor.release(0);
+    for len in [64usize, 512, 2048] {
+        let prompt = prompt_of(len);
+        let started = std::time::Instant::now();
+        executor
+            .prefill(0, &prompt, &params)
+            .expect("timed prefill");
+        let elapsed = started.elapsed().as_secs_f64();
+        executor.release(0);
+        eprintln!(
+            "prompt {len:>5}: {:8.1} ms over {} layers ({:.0} tok/s)",
+            elapsed * 1e3,
+            golden.num_layers,
+            len as f64 / elapsed
+        );
+    }
+}
+
 /// A step-time snapshot, not a gate: eager against captured, at the narrowest,
 /// a mid and the widest bucket. Run over the truncated model the fixture pins, so the
 /// numbers say what the launch sequence costs per layer and what capture buys
@@ -687,4 +802,122 @@ fn step_time_snapshot() {
             );
         }
     }
+}
+
+/// Depth probe, not a gate: hold chunked prefill to the per-token decode walk
+/// at an arbitrary layer count (`PEGAINFER_K3_AB_LAYERS`, default the
+/// fixture's). The fixture only certifies 4 layers; a numerics defect that
+/// compounds with depth is invisible there, so this test compares the two
+/// prefill routes against each other — boundary logits and a forced-fed
+/// continuation — with no fixture in the loop. Wholesale disagreement means
+/// the chunk path corrupted the state it handed to decode at that depth.
+#[test]
+#[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
+fn chunked_prefill_agrees_with_the_per_token_walk_at_depth() {
+    let golden = golden();
+    let depth: usize = std::env::var("PEGAINFER_K3_AB_LAYERS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(golden.num_layers);
+    let Some(path) = checkpoint() else {
+        eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
+        return;
+    };
+    let build = |max_batch: usize| {
+        let config = K3ExecutorConfig {
+            max_batch,
+            max_ctx: golden.max_ctx,
+            kv_pages: 0,
+            num_layers: depth,
+            chunk_tokens: max_batch,
+            cuda_graph: false,
+            moe_transport: K3MoeTransport::MEGA,
+        };
+        K3Executor::load(&path, device(), 0, 1, config)
+            .expect("the truncated rank model should load")
+    };
+    let prompt = &golden.prompt;
+    let steps = 24usize;
+
+    // Reference: the prompt walked one token per decode step, then greedy.
+    let mut reference = build(1);
+    reference.release(0);
+    let mut ref_stream: Vec<u32> = Vec::new();
+    for index in 0..prompt.len() {
+        let out = reference
+            .decode(&[DecodeSlot {
+                slot: 0,
+                last_token: prompt[index],
+            }])
+            .expect("reference decode step");
+        ref_stream.push(out[0]);
+    }
+    let ref_boundary = reference.last_logits(0).expect("reference boundary logits");
+    for _ in 0..steps {
+        let last = *ref_stream.last().unwrap();
+        let out = reference
+            .decode(&[DecodeSlot {
+                slot: 0,
+                last_token: last,
+            }])
+            .expect("reference decode step");
+        ref_stream.push(out[0]);
+    }
+    drop(reference);
+
+    // Chunked: the whole prompt as prefill chunks, then the reference's own
+    // tokens force-fed so one coin flip cannot cascade.
+    let cap: usize = std::env::var("PEGAINFER_K3_AB_CHUNK")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or_else(|| prompt.len().min(8));
+    let mut chunked = build(cap);
+    let params = pegainfer_frontend::sampler::SamplingParams::default();
+    let first = chunked
+        .prefill(0, prompt, &params)
+        .expect("chunked prefill");
+    let chunk_boundary = chunked.last_logits(0).expect("chunked boundary logits");
+
+    let top = |logits: &[f32]| -> Vec<(usize, f32)> {
+        let mut index: Vec<usize> = (0..logits.len()).collect();
+        index.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+        index[..5].iter().map(|&i| (i, logits[i])).collect()
+    };
+    let max_abs = ref_boundary
+        .iter()
+        .zip(&chunk_boundary)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("depth {depth}: boundary max |delta| = {max_abs:.4}");
+    eprintln!("  per-token top-5: {:?}", top(&ref_boundary));
+    eprintln!("  chunked   top-5: {:?}", top(&chunk_boundary));
+    eprintln!(
+        "  boundary argmax: per-token {}, chunked {first}",
+        ref_stream[prompt.len() - 1]
+    );
+
+    let mut mismatches = 0usize;
+    for step in 0..steps {
+        let fed = ref_stream[prompt.len() + step - 1];
+        let out = chunked
+            .decode(&[DecodeSlot {
+                slot: 0,
+                last_token: fed,
+            }])
+            .expect("chunked continuation step");
+        let want = ref_stream[prompt.len() + step];
+        if out[0] != want {
+            mismatches += 1;
+            eprintln!("  step {step}: chunked {} vs per-token {want}", out[0]);
+        }
+    }
+    eprintln!(
+        "depth {depth}: {}/{steps} forced continuation steps agree",
+        steps - mismatches
+    );
+    assert!(
+        mismatches * 4 <= steps,
+        "chunked prefill diverges from the per-token walk at depth {depth}: \
+         {mismatches}/{steps} steps disagree"
+    );
 }

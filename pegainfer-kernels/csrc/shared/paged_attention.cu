@@ -156,6 +156,88 @@ static int decode_launch(
   PEGAINFER_FFI_GUARD_END(-1)
 }
 
+// ---------------------------------------------------------------------------
+// Paged attention decode with partition-KV / split-K.
+//
+// The caller supplies a split-K plan:
+//   request_indices[slot]  -> original batch slot
+//   kv_tile_indices[slot]  -> KV chunk id for that request
+//   o_indptr[request]      -> active split-slot range for merge
+//   block_valid_mask[slot] -> false for graph-stability padding slots
+//
+// tmp_v/tmp_s hold per-chunk partial states and are merged by FlashInfer.
+// ---------------------------------------------------------------------------
+template <uint32_t HEAD_DIM, typename VariantT>
+static int decode_split_kv_launch(
+    void*    q,                    // [batch_size * num_qo_heads * head_dim] bf16, device
+    void*    output,               // [batch_size * num_qo_heads * head_dim] bf16, device
+    void*    kv_data,
+    int64_t  k_offset_elems,
+    int64_t  v_offset_elems,
+    int32_t* page_indices,
+    int32_t* page_indptr,
+    int32_t* last_page_len_d,
+    int32_t* request_indices,
+    int32_t* kv_tile_indices,
+    int32_t* kv_chunk_size_ptr,    // GPU ptr -> 1 int32 chunk size
+    int32_t* o_indptr,             // [batch_size + 1]
+    uint8_t* block_valid_mask,     // [padded_batch_size], 0/1
+    void*    tmp_v,                // [padded_batch_size * num_qo_heads * head_dim] bf16
+    float*   tmp_s,                // [padded_batch_size * num_qo_heads]
+    int32_t  num_qo_heads,
+    int32_t  num_kv_heads,
+    int32_t  head_dim,
+    int32_t  page_size,
+    int32_t  batch_size,
+    int32_t  padded_batch_size,    // split slots, including masked padding slots
+    int64_t  stride_page,
+    float    sm_scale,
+    int32_t  window_left,
+    void*    stream)
+{
+  PEGAINFER_FFI_GUARD_BEGIN
+    auto paged_kv = make_paged_kv(
+        kv_data, k_offset_elems, v_offset_elems,
+        page_indices, page_indptr, last_page_len_d,
+        num_kv_heads, head_dim, page_size, batch_size, stride_page);
+
+    ParamsT params(
+        reinterpret_cast<DType*>(q),
+        /*q_rope_offset=*/nullptr,
+        paged_kv,
+        reinterpret_cast<DType*>(output),
+        /*lse=*/nullptr,
+        /*maybe_alibi_slopes=*/nullptr,
+        num_qo_heads,
+        /*q_stride_n=*/num_qo_heads * head_dim,
+        /*q_stride_h=*/head_dim,
+        window_left,
+        /*logits_soft_cap=*/0.0f,
+        sm_scale,
+        /*rope_scale=*/1.0f,
+        /*rope_theta=*/1e6f);
+
+    params.padded_batch_size = padded_batch_size;
+    params.request_indices   = request_indices;
+    params.kv_tile_indices   = kv_tile_indices;
+    params.o_indptr          = o_indptr;
+    params.kv_chunk_size_ptr = kv_chunk_size_ptr;
+    params.block_valid_mask  = reinterpret_cast<bool*>(block_valid_mask);
+
+    return static_cast<int>(
+        BatchDecodeWithPagedKVCacheDispatched<
+            HEAD_DIM,
+            PosEncodingMode::kNone,
+            VariantT,
+            ParamsT>(
+            params,
+            reinterpret_cast<DType*>(tmp_v),
+            tmp_s,
+            /*enable_pdl=*/false,
+            reinterpret_cast<cudaStream_t>(stream)));
+  PEGAINFER_FFI_GUARD_END(-1)
+}
+
 extern "C" {
 
 int paged_attention_decode_cuda(
@@ -175,91 +257,25 @@ int paged_attention_decode_cuda(
       stride_page, sm_scale, /*window_left=*/-1, stream);
 }
 
-// ---------------------------------------------------------------------------
-// Paged attention decode with partition-KV / split-K.
-//
-// The caller supplies a split-K plan:
-//   request_indices[slot]  -> original batch slot
-//   kv_tile_indices[slot]  -> KV chunk id for that request
-//   o_indptr[request]      -> active split-slot range for merge
-//   block_valid_mask[slot] -> false for graph-stability padding slots
-//
-// tmp_v/tmp_s hold per-chunk partial states and are merged by FlashInfer.
-// ---------------------------------------------------------------------------
 int paged_attention_decode_split_kv_cuda(
-    // Q and output
-    void*    q,                    // [batch_size * num_qo_heads * head_dim] bf16, device
-    void*    output,               // [batch_size * num_qo_heads * head_dim] bf16, device
-    // KV pool buffer (entire pool)
-    void*    kv_data,
-    int64_t  k_offset_elems,
-    int64_t  v_offset_elems,
-    // Paged KV metadata (GPU arrays)
-    int32_t* page_indices,
-    int32_t* page_indptr,
-    int32_t* last_page_len_d,
-    // Split-K plan metadata (GPU arrays)
-    int32_t* request_indices,
-    int32_t* kv_tile_indices,
-    int32_t* kv_chunk_size_ptr,    // GPU ptr -> 1 int32 chunk size
-    int32_t* o_indptr,             // [batch_size + 1]
-    uint8_t* block_valid_mask,     // [padded_batch_size], 0/1
-    // Split-K workspace
-    void*    tmp_v,                // [padded_batch_size * num_qo_heads * head_dim] bf16
-    float*   tmp_s,                // [padded_batch_size * num_qo_heads]
-    // Dimensions
-    int32_t  num_qo_heads,
-    int32_t  num_kv_heads,
-    int32_t  head_dim,
-    int32_t  page_size,
-    int32_t  batch_size,
-    int32_t  padded_batch_size,    // split slots, including masked padding slots
-    int64_t  stride_page,
-    float    sm_scale,
-    // Stream
-    void*    stream)
+    void* q, void* output, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    int32_t* page_indices, int32_t* page_indptr, int32_t* last_page_len_d,
+    int32_t* request_indices, int32_t* kv_tile_indices, int32_t* kv_chunk_size_ptr,
+    int32_t* o_indptr, uint8_t* block_valid_mask,
+    void* tmp_v, float* tmp_s,
+    int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
+    int32_t page_size, int32_t batch_size, int32_t padded_batch_size,
+    int64_t stride_page, float sm_scale, void* stream)
 {
-  PEGAINFER_FFI_GUARD_BEGIN
-    auto paged_kv = make_paged_kv(
-        kv_data, k_offset_elems, v_offset_elems,
-        page_indices, page_indptr, last_page_len_d,
-        num_kv_heads, head_dim, page_size, batch_size, stride_page);
-
-    ParamsT params(
-        reinterpret_cast<DType*>(q),
-        /*q_rope_offset=*/nullptr,
-        paged_kv,
-        reinterpret_cast<DType*>(output),
-        /*lse=*/nullptr,
-        /*maybe_alibi_slopes=*/nullptr,
-        num_qo_heads,
-        /*q_stride_n=*/num_qo_heads * head_dim,
-        /*q_stride_h=*/head_dim,
-        /*window_left=*/-1,
-        /*logits_soft_cap=*/0.0f,
-        sm_scale,
-        /*rope_scale=*/1.0f,
-        /*rope_theta=*/1e6f);
-
-    params.padded_batch_size = padded_batch_size;
-    params.request_indices   = request_indices;
-    params.kv_tile_indices   = kv_tile_indices;
-    params.o_indptr          = o_indptr;
-    params.kv_chunk_size_ptr = kv_chunk_size_ptr;
-    params.block_valid_mask  = reinterpret_cast<bool*>(block_valid_mask);
-
-    return static_cast<int>(
-        BatchDecodeWithPagedKVCacheDispatched<
-            /*HEAD_DIM=*/128,
-            PosEncodingMode::kNone,
-            Variant,
-            ParamsT>(
-            params,
-            reinterpret_cast<DType*>(tmp_v),
-            tmp_s,
-            /*enable_pdl=*/false,
-            reinterpret_cast<cudaStream_t>(stream)));
-  PEGAINFER_FFI_GUARD_END(-1)
+  return decode_split_kv_launch</*HEAD_DIM=*/128, Variant>(
+      q, output, kv_data, k_offset_elems, v_offset_elems,
+      page_indices, page_indptr, last_page_len_d,
+      request_indices, kv_tile_indices, kv_chunk_size_ptr,
+      o_indptr, block_valid_mask, tmp_v, tmp_s,
+      num_qo_heads, num_kv_heads, head_dim, page_size,
+      batch_size, padded_batch_size, stride_page, sm_scale,
+      /*window_left=*/-1, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1068,30 @@ int paged_attention_decode_window_cuda_hd256(
       request_indices, kv_tile_indices, kv_chunk_size_ptr,
       num_qo_heads, num_kv_heads, head_dim, page_size, batch_size,
       stride_page, sm_scale, window_left, stream);
+}
+
+// Split-KV decode at head_dim 512 — the Gemma global family's decode
+// read. The non-partitioned grid is (pseudo-requests, kv heads) CTAs and
+// starves the device; chunking the KV brings the grid to occupancy.
+int paged_attention_decode_split_kv_cuda_hd512(
+    void* q, void* output, void* kv_data,
+    int64_t k_offset_elems, int64_t v_offset_elems,
+    int32_t* page_indices, int32_t* page_indptr, int32_t* last_page_len_d,
+    int32_t* request_indices, int32_t* kv_tile_indices, int32_t* kv_chunk_size_ptr,
+    int32_t* o_indptr, uint8_t* block_valid_mask,
+    void* tmp_v, float* tmp_s,
+    int32_t num_qo_heads, int32_t num_kv_heads, int32_t head_dim,
+    int32_t page_size, int32_t batch_size, int32_t padded_batch_size,
+    int64_t stride_page, float sm_scale, void* stream)
+{
+  return decode_split_kv_launch</*HEAD_DIM=*/512, Variant>(
+      q, output, kv_data, k_offset_elems, v_offset_elems,
+      page_indices, page_indptr, last_page_len_d,
+      request_indices, kv_tile_indices, kv_chunk_size_ptr,
+      o_indptr, block_valid_mask, tmp_v, tmp_s,
+      num_qo_heads, num_kv_heads, head_dim, page_size,
+      batch_size, padded_batch_size, stride_page, sm_scale,
+      /*window_left=*/-1, stream);
 }
 
 int batch_prefill_paged_cuda_hd256(

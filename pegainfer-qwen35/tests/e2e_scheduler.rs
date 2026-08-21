@@ -1,17 +1,9 @@
-/// E2E scheduler integration test for Qwen3.5-4B.
-///
-/// Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
-/// CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
+//! E2E scheduler integration test for Qwen3.5-4B.
+//!
+//! Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
+//! CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
 use std::collections::HashSet;
-/// E2E scheduler integration test for Qwen3.5-4B.
-///
-/// Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
-/// CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
 use std::path::Path;
-/// E2E scheduler integration test for Qwen3.5-4B.
-///
-/// Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
-/// CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
 use std::time::Instant;
 
 use log::info;
@@ -19,6 +11,7 @@ use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::TokenSink;
@@ -27,8 +20,6 @@ use pegainfer_frontend::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
-
-const DEFAULT_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 
 const CASES: &[TestCase] = &[
     TestCase {
@@ -82,10 +73,6 @@ const CASES: &[TestCase] = &[
         max_new_tokens: 50,
     },
 ];
-
-fn get_model_path() -> String {
-    std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string())
-}
 
 fn max_position_embeddings(model_path: &str) -> usize {
     let config_path = std::path::Path::new(model_path).join("config.json");
@@ -153,15 +140,136 @@ fn generate_tokens_with_logprobs(
     collect_generation(&mut token_rx, prompt, logprobs)
 }
 
+fn submit_repeated_token_request(
+    handle: &EngineHandle,
+    request_id: &str,
+    token: u32,
+    prompt_len: usize,
+    max_tokens: usize,
+) -> TokenStreamReceiver {
+    let (token_tx, token_rx) = TokenSink::standalone();
+    handle
+        .submit(GenerateRequest {
+            trace_parent: None,
+            request_id: Some(request_id.to_string()),
+            queued_at_unix_s: None,
+            data_parallel_rank: None,
+            prompt_tokens: vec![token; prompt_len],
+            params: SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            max_tokens,
+            lora_adapter: None,
+            kv_transfer_params: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        })
+        .unwrap_or_else(|err| panic!("submit {request_id}: {err}"));
+    token_rx
+}
+
+fn wait_for_first_token(rx: &mut TokenStreamReceiver, request_id: &str) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match recv_event_before(rx, request_id, deadline) {
+            Some(TokenEvent::Token { .. }) => return,
+            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
+            Some(event) => panic!("{request_id} emitted {event:?} before its first token"),
+            None => panic!("scheduler closed before {request_id} emitted a token"),
+        }
+    }
+}
+
+fn recv_event_before(
+    rx: &mut TokenStreamReceiver,
+    request_id: &str,
+    deadline: Instant,
+) -> Option<TokenEvent> {
+    loop {
+        if let Ok((_, event)) = rx.try_recv() {
+            return Some(event);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {request_id} scheduler event"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn assert_no_generated_event(rx: &mut TokenStreamReceiver, request_id: &str) {
+    while let Ok((_, event)) = rx.try_recv() {
+        match event {
+            TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. } => {}
+            event => panic!("{request_id} emitted {event:?} before the overlap bound"),
+        }
+    }
+}
+
+fn drain_tokens(rx: &mut TokenStreamReceiver, request_id: &str) -> usize {
+    let mut tokens = 0;
+    while let Ok((_, event)) = rx.try_recv() {
+        match event {
+            TokenEvent::Token { .. } => tokens += 1,
+            TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. } => {}
+            event => panic!("{request_id} emitted {event:?} while it must remain active"),
+        }
+    }
+    tokens
+}
+
+fn wait_for_running_requests(
+    load: &mut tokio::sync::watch::Receiver<SchedulerMetrics>,
+    expected: u64,
+    timeout: std::time::Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = *load.borrow_and_update();
+        if snapshot.num_running_reqs == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} running requests; last snapshot: {snapshot:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 fn collect_generation(
     token_rx: &mut TokenStreamReceiver,
     name: &str,
     logprobs: usize,
 ) -> GenerationResult {
+    collect_generation_until(token_rx, name, logprobs, None)
+}
+
+fn collect_generation_with_timeout(
+    token_rx: &mut TokenStreamReceiver,
+    name: &str,
+    logprobs: usize,
+    timeout: std::time::Duration,
+) -> GenerationResult {
+    collect_generation_until(token_rx, name, logprobs, Some(Instant::now() + timeout))
+}
+
+fn collect_generation_until(
+    token_rx: &mut TokenStreamReceiver,
+    name: &str,
+    logprobs: usize,
+    deadline: Option<Instant>,
+) -> GenerationResult {
     let mut tokens = Vec::new();
     let mut token_logprobs = Vec::new();
     loop {
-        match token_rx.blocking_recv().map(|(_, event)| event) {
+        let event = match deadline {
+            Some(deadline) => recv_event_before(token_rx, name, deadline),
+            None => token_rx.blocking_recv().map(|(_, event)| event),
+        };
+        match event {
             Some(TokenEvent::Token { id, logprob }) => {
                 if logprobs == 0 {
                     assert!(
@@ -601,16 +709,11 @@ fn run_graph_lifecycle_boundary(handle: &EngineHandle, tokenizer: &DynTokenizer)
     // A second wave must copy into a previously occupied stable slot.
     run_batch(&[("reuse-slot", "Reuse the graph slot", 3)]);
 }
-
-fn context_limit_for(handle: &EngineHandle, model_path: &str) -> usize {
-    handle
-        .servable_len()
-        .map_or_else(|| max_position_embeddings(model_path), |len| len as usize)
-}
-
 #[test]
 fn test_e2e_qwen35_scheduler() {
-    let model_path = get_model_path();
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler") else {
+        return;
+    };
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
@@ -628,7 +731,7 @@ fn test_e2e_qwen35_scheduler() {
     .expect("Failed to start Qwen3.5 scheduler");
     info!("scheduler loaded in {:.2?}", start.elapsed());
 
-    let max_context_tokens = context_limit_for(&handle, &model_path);
+    let max_context_tokens = max_position_embeddings(&model_path);
     run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP1");
 }
 
@@ -636,7 +739,9 @@ fn test_e2e_qwen35_scheduler() {
 #[test]
 #[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
 fn test_e2e_qwen35_scheduler_flashinfer_gdn() {
-    let model_path = get_model_path();
+    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
+        "required FlashInfer scheduler gate needs PEGAINFER_TEST_MODEL_PATH set to the pinned Qwen3.5-4B snapshot",
+    );
     assert!(
         Path::new(&model_path).join("config.json").is_file(),
         "required FlashInfer scheduler gate cannot read {model_path}/config.json; set PEGAINFER_TEST_MODEL_PATH"
@@ -713,9 +818,140 @@ fn test_e2e_qwen35_scheduler_flashinfer_gdn() {
 }
 
 #[test]
+fn test_e2e_qwen35_shared_sm_last_decoder() {
+    pegainfer_core::logging::init_default();
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_shared_sm_last_decoder")
+    else {
+        return;
+    };
+    let tokenizer = common::load_tokenizer(&model_path);
+    let seed_token = tokenizer
+        .encode("Hello", false)
+        .expect("encode failed")
+        .into_iter()
+        .next()
+        .expect("test prompt must contain a token");
+
+    let off_reference_tokens = {
+        let off_handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
+            Path::new(&model_path),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+            4,
+            8192,
+            pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+            pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+        )
+        .expect("Failed to start Qwen3.5 default-Off scheduler");
+        let mut off_rx = submit_repeated_token_request(
+            &off_handle,
+            "overlap-off-reference",
+            seed_token,
+            8192,
+            2,
+        );
+        let off = collect_generation_with_timeout(
+            &mut off_rx,
+            "overlap-off-reference",
+            0,
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            off.tokens.len(),
+            2,
+            "default-Off reference request must finish before Shared-SM parity"
+        );
+        off.tokens
+    };
+
+    let handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: vec![0],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+        4,
+        8192,
+        pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+        pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
+    )
+    .expect("Failed to start Qwen3.5 shared-SM scheduler");
+    let mut load = handle
+        .metrics_watch()
+        .expect("scheduler must expose metrics");
+
+    let mut active_rx =
+        submit_repeated_token_request(&handle, "overlap-last-decoder", seed_token, 512, 128);
+    wait_for_first_token(&mut active_rx, "overlap-last-decoder");
+    let _ = drain_tokens(&mut active_rx, "overlap-last-decoder");
+    let mut prefill_rx =
+        submit_repeated_token_request(&handle, "overlap-inflight-prefill", seed_token, 8192, 2);
+
+    wait_for_running_requests(&mut load, 2, std::time::Duration::from_secs(10));
+    let _ = drain_tokens(&mut active_rx, "overlap-last-decoder");
+    for _ in 0..2 {
+        wait_for_first_token(&mut active_rx, "overlap-last-decoder");
+        assert_no_generated_event(&mut prefill_rx, "overlap-inflight-prefill");
+    }
+    drop(active_rx);
+    let prefill = collect_generation_with_timeout(
+        &mut prefill_rx,
+        "overlap-inflight-prefill",
+        0,
+        std::time::Duration::from_secs(30),
+    );
+    assert_eq!(
+        prefill.tokens.len(),
+        2,
+        "in-flight prefill must finish after the last decoder is cancelled"
+    );
+    assert_eq!(
+        prefill.tokens, off_reference_tokens,
+        "Shared-SM overlapped prefill must match the greedy default-Off reference"
+    );
+
+    let (tokens, finish_reason) = generate_tokens(&handle, &tokenizer, "Hello again", 2);
+    assert_eq!(
+        tokens.len(),
+        2,
+        "scheduler must accept work after overlap wait"
+    );
+    assert_eq!(finish_reason, FinishReason::Length);
+
+    let mut shutdown_active_rx =
+        submit_repeated_token_request(&handle, "overlap-shutdown-decoder", seed_token, 512, 128);
+    wait_for_first_token(&mut shutdown_active_rx, "overlap-shutdown-decoder");
+    let _ = drain_tokens(&mut shutdown_active_rx, "overlap-shutdown-decoder");
+    let mut shutdown_prefill_rx =
+        submit_repeated_token_request(&handle, "overlap-shutdown-prefill", seed_token, 8192, 2);
+    wait_for_running_requests(&mut load, 2, std::time::Duration::from_secs(10));
+    assert_no_generated_event(&mut shutdown_prefill_rx, "overlap-shutdown-prefill");
+    drop(shutdown_active_rx);
+    drop(shutdown_prefill_rx);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+        drop(handle);
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("dropping the last handle must drain in-flight prefill and return");
+    shutdown.join().expect("scheduler shutdown thread panicked");
+}
+
+#[test]
 #[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
 fn test_e2e_qwen35_scheduler_tp2() {
-    let model_path = get_model_path();
+    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler_tp2") else {
+        return;
+    };
 
     info!("Loading Qwen3.5 TP2 model for scheduler test...");
     let start = Instant::now();
@@ -735,6 +971,6 @@ fn test_e2e_qwen35_scheduler_tp2() {
     .expect("Failed to start Qwen3.5 TP2 scheduler");
     info!("TP2 scheduler loaded in {:.2?}", start.elapsed());
 
-    let max_context_tokens = context_limit_for(&handle, &model_path);
+    let max_context_tokens = max_position_embeddings(&model_path);
     run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP2");
 }

@@ -1,15 +1,24 @@
 use std::time::Duration;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
+use std::time::Instant;
 
 use anyhow::Result;
 use anyhow::ensure;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::Engine;
+use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::PromptEcho;
+use pegainfer_frontend::engine::QueuedRequest;
+use pegainfer_frontend::engine::RequestId;
+use pegainfer_frontend::engine::RequestLedger;
+use pegainfer_frontend::engine::Scheduler;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::TokenLogprob;
-use tokio::sync::mpsc;
+use pegainfer_frontend::engine::spawn_scheduler;
+
+/// Cap on how long `step` parks while waiting for the next due token. New
+/// submissions only drain between steps, so a full TTFT/TPOT sleep would
+/// stall admission; 1ms keeps the CPU-only sim from spinning a core.
+const WAIT_SLICE: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Debug)]
 pub struct SimulatedEngineConfig {
@@ -79,91 +88,179 @@ impl Default for SimulatedEngineConfig {
     }
 }
 
-pub fn start_engine(config: SimulatedEngineConfig) -> EngineHandle {
-    let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Some((req, _kv_prefix)) = submit_rx.recv().await {
-            tokio::spawn(run_simulated_request(req, config.clone()));
-        }
-    });
-    EngineHandle::new(submit_tx)
+/// One scheduler, no KV, no LoRA. `partitions` is the frontend-visible engine
+/// count (tests that declare N engines must spawn N schedulers).
+pub fn start_engine(config: &SimulatedEngineConfig) -> Engine {
+    start_engine_with_partitions(config, 1)
 }
 
-async fn run_simulated_request(req: GenerateRequest, config: SimulatedEngineConfig) {
-    let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(now_secs_f64);
-    let prompt_len = req.prompt_tokens.len();
-    let mut completion_tokens = 0;
-
-    if req
-        .token_tx
-        .send(TokenEvent::Scheduled {
-            queued_at_unix_s,
-            scheduled_at_unix_s: now_secs_f64(),
-            prompt_tokens: prompt_len,
-            cached_tokens: 0,
-        })
-        .is_err()
-    {
-        return;
-    }
-
-    if req.echo
-        && req
-            .token_tx
-            .send(TokenEvent::PromptTokens {
-                ids: req.prompt_tokens.clone(),
-                logprobs: vec![None; req.prompt_tokens.len()],
+pub fn start_engine_with_partitions(config: &SimulatedEngineConfig, partitions: usize) -> Engine {
+    assert!(
+        partitions > 0,
+        "an engine must expose at least one scheduler"
+    );
+    Engine {
+        schedulers: (0..partitions)
+            .map(|index| {
+                spawn_scheduler(
+                    &format!("pegainfer-sim-{index}"),
+                    SimScheduler::new(config.clone()),
+                )
             })
-            .is_err()
-    {
-        return;
+            .collect(),
+        info: EngineInfo {
+            kv_capacity: None,
+            servable_len: None,
+        },
+        lora: None,
     }
+}
 
-    let script = &config.scripted_completion;
-    let emit_count = if script.is_empty() {
-        req.max_tokens
-    } else {
-        req.max_tokens.min(script.len())
-    };
+struct SimScheduler {
+    config: SimulatedEngineConfig,
+    queued: Vec<QueuedRequest>,
+    running: Vec<RunningRequest>,
+}
 
-    if emit_count > 0 {
-        tokio::time::sleep(config.ttft(prompt_len)).await;
-    }
+struct RunningRequest {
+    id: RequestId,
+    /// Tokens not yet emitted, stored reversed for cheap pops.
+    pending: Vec<u32>,
+    next_token_at: Instant,
+    finish_reason: FinishReason,
+    logprobs: usize,
+}
 
-    for index in 0..emit_count {
-        if index > 0 {
-            tokio::time::sleep(config.tpot()).await;
+impl SimScheduler {
+    fn new(config: SimulatedEngineConfig) -> Self {
+        Self {
+            config,
+            queued: Vec::new(),
+            running: Vec::new(),
         }
+    }
 
-        let logprob = (req.logprobs > 0).then_some(TokenLogprob {
-            logprob: 0.0,
-            top_logprobs: Vec::new(),
-        });
-        let id = if script.is_empty() {
-            fake_token_id(&req.prompt_tokens, index, config.fallback_token_id)
-        } else {
-            script[index]
+    fn park_if_waiting(&self) {
+        let Some(next) = self.running.iter().map(|r| r.next_token_at).min() else {
+            return;
         };
-        if req
-            .token_tx
-            .send(TokenEvent::Token { id, logprob })
-            .is_err()
-        {
+        let now = Instant::now();
+        if next <= now {
             return;
         }
-        completion_tokens += 1;
+        std::thread::sleep((next - now).min(WAIT_SLICE));
+    }
+}
+
+impl Scheduler for SimScheduler {
+    fn submit(&mut self, request: QueuedRequest) {
+        self.queued.push(request);
     }
 
+    fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        for QueuedRequest { id, request } in self.queued.drain(..) {
+            if ledger.is_aborted(id) {
+                ledger.retire(id);
+                continue;
+            }
+            if request.echo {
+                ledger.echo_prompt(
+                    id,
+                    PromptEcho {
+                        ids: request.prompt_tokens.clone(),
+                        logprobs: vec![None; request.prompt_tokens.len()],
+                    },
+                );
+            }
+            let prompt_len = request.prompt_tokens.len();
+            let (pending, finish_reason) =
+                planned_completion(&self.config, &request.prompt_tokens, request.max_tokens);
+            ledger.admit(id);
+            if pending.is_empty() {
+                ledger.finish(id, finish_reason);
+                continue;
+            }
+            self.running.push(RunningRequest {
+                id,
+                pending,
+                next_token_at: Instant::now() + self.config.ttft(prompt_len),
+                finish_reason,
+                logprobs: request.logprobs,
+            });
+        }
+
+        let now = Instant::now();
+        let mut still_running = Vec::new();
+        for mut running in self.running.drain(..) {
+            if ledger.is_aborted(running.id) {
+                ledger.retire(running.id);
+                continue;
+            }
+            if now < running.next_token_at {
+                still_running.push(running);
+                continue;
+            }
+            let Some(token) = running.pending.pop() else {
+                ledger.finish(running.id, running.finish_reason);
+                continue;
+            };
+            let logprob = (running.logprobs > 0).then_some(TokenLogprob {
+                logprob: 0.0,
+                top_logprobs: Vec::new(),
+            });
+            let logprobs = match logprob {
+                Some(lp) => vec![Some(lp)],
+                None => Vec::new(),
+            };
+            ledger.push_tokens(running.id, &[token], &logprobs);
+            if running.pending.is_empty() {
+                ledger.finish(running.id, running.finish_reason);
+            } else {
+                running.next_token_at = Instant::now() + self.config.tpot();
+                still_running.push(running);
+            }
+        }
+        self.running = still_running;
+        self.park_if_waiting();
+        Ok(())
+    }
+
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
+            num_running_reqs: self.running.len() as u64,
+            num_waiting_reqs: self.queued.len() as u64,
+            ..SchedulerMetrics::default()
+        }
+    }
+}
+
+/// Remaining tokens (reversed) plus the terminal reason. Empty pending means
+/// finish immediately after admit.
+fn planned_completion(
+    config: &SimulatedEngineConfig,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+) -> (Vec<u32>, FinishReason) {
+    let script = &config.scripted_completion;
+    let emit_count = if script.is_empty() {
+        max_tokens
+    } else {
+        max_tokens.min(script.len())
+    };
     let finish_reason = if !script.is_empty() && emit_count == script.len() {
         FinishReason::Stop
     } else {
         FinishReason::Length
     };
-    let _ = req.token_tx.send(TokenEvent::Finished {
-        finish_reason,
-        prompt_tokens: prompt_len,
-        completion_tokens,
-    });
+    let mut pending: Vec<u32> = if script.is_empty() {
+        (0..emit_count)
+            .map(|index| fake_token_id(prompt_tokens, index, config.fallback_token_id))
+            .collect()
+    } else {
+        script[..emit_count].to_vec()
+    };
+    pending.reverse();
+    (pending, finish_reason)
 }
 
 fn fake_token_id(prompt_tokens: &[u32], index: usize, fallback_token_id: u32) -> u32 {
@@ -177,19 +274,57 @@ fn duration_from_ms(ms: f64) -> Duration {
     Duration::from_secs_f64(ms / 1000.0)
 }
 
-fn now_secs_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs_f64()
-}
-
 #[cfg(test)]
 mod tests {
-    use pegainfer_frontend::engine::TokenSink;
+    use pegainfer_frontend::engine::Request;
+    use pegainfer_frontend::engine::Terminal;
     use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
+
+    fn request(prompt_tokens: Vec<u32>, max_tokens: usize, logprobs: usize) -> Request {
+        Request {
+            prompt_tokens,
+            params: SamplingParams::default(),
+            max_tokens,
+            lora_adapter: None,
+            kv_transfer_params: None,
+            logprobs,
+            echo: false,
+            trace_parent: None,
+            client_label: None,
+        }
+    }
+
+    fn collect_completion(
+        config: &SimulatedEngineConfig,
+        req: Request,
+    ) -> (Vec<u32>, Option<usize>, Terminal) {
+        let mut engine = start_engine(config);
+        assert_eq!(engine.schedulers.len(), 1);
+        let mut partition = engine.schedulers.remove(0);
+        let mut steps = partition.handle.take_steps().expect("step stream");
+        let _control = partition.handle.submit(req);
+
+        let mut tokens = Vec::new();
+        let mut prompt_tokens = None;
+        let mut terminal = None;
+        while terminal.is_none() {
+            let step = steps.blocking_recv().expect("step message");
+            for update in step.updates {
+                if let Some(scheduled) = update.scheduled {
+                    prompt_tokens = Some(scheduled.prompt_tokens);
+                }
+                tokens.extend(update.tokens);
+                if let Some(t) = update.terminal {
+                    terminal = Some(t);
+                }
+            }
+        }
+        drop(partition.handle);
+        partition.join.join().expect("driver thread exits");
+        (tokens, prompt_tokens, terminal.expect("terminal"))
+    }
 
     #[test]
     fn fake_token_id_cycles_prompt_tokens() {
@@ -199,97 +334,37 @@ mod tests {
         assert_eq!(fake_token_id(&[], 0, 42), 42);
     }
 
-    #[tokio::test]
-    async fn scripted_completion_replays_ids_and_stops() {
+    #[test]
+    fn scripted_completion_replays_ids_and_stops() {
         let config = SimulatedEngineConfig::new(0.0, 100.0, 0.0, 0)
             .unwrap()
             .with_scripted_completion(vec![11, 22, 33]);
-        let (token_tx, mut token_rx) = TokenSink::standalone();
-
-        run_simulated_request(
-            GenerateRequest {
-                trace_parent: None,
-                request_id: Some("req-scripted".to_string()),
-                queued_at_unix_s: Some(1.0),
-                data_parallel_rank: None,
-                // Prompt is irrelevant in scripted mode; output ignores it.
-                prompt_tokens: vec![7, 9],
-                params: SamplingParams::default(),
-                max_tokens: 8,
-                lora_adapter: None,
-                kv_transfer_params: None,
-                token_tx,
-                logprobs: 0,
-                echo: false,
-            },
-            config,
-        )
-        .await;
-
+        let (tokens, _, terminal) = collect_completion(&config, request(vec![7, 9], 8, 0));
+        assert_eq!(tokens, [11, 22, 33]);
         assert!(matches!(
-            token_rx.recv().await.map(|(_, e)| e),
-            Some(TokenEvent::Scheduled { .. })
-        ));
-        for expected in [11u32, 22, 33] {
-            assert!(matches!(
-                token_rx.recv().await.map(|(_, e)| e),
-                Some(TokenEvent::Token { id, .. }) if id == expected
-            ));
-        }
-        // Whole script fit inside max_tokens -> Stop, not Length.
-        assert!(matches!(
-            token_rx.recv().await.map(|(_, e)| e),
-            Some(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Stop,
                 completion_tokens: 3,
                 ..
-            })
+            }
         ));
     }
 
-    #[tokio::test]
-    async fn scripted_completion_truncated_by_max_tokens_is_length() {
+    #[test]
+    fn scripted_completion_truncated_by_max_tokens_is_length() {
         let config = SimulatedEngineConfig::new(0.0, 100.0, 0.0, 0)
             .unwrap()
             .with_scripted_completion(vec![11, 22, 33]);
-        let (token_tx, mut token_rx) = TokenSink::standalone();
-
-        run_simulated_request(
-            GenerateRequest {
-                trace_parent: None,
-                request_id: Some("req-trunc".to_string()),
-                queued_at_unix_s: Some(1.0),
-                data_parallel_rank: None,
-                prompt_tokens: vec![7],
-                params: SamplingParams::default(),
-                max_tokens: 2,
-                lora_adapter: None,
-                kv_transfer_params: None,
-                token_tx,
-                logprobs: 0,
-                echo: false,
-            },
-            config,
-        )
-        .await;
-
+        let (tokens, _, terminal) = collect_completion(&config, request(vec![7], 2, 0));
+        assert_eq!(tokens, [11, 22]);
         assert!(matches!(
-            token_rx.recv().await.map(|(_, e)| e),
-            Some(TokenEvent::Scheduled { .. })
-        ));
-        for expected in [11u32, 22] {
-            assert!(matches!(
-                token_rx.recv().await.map(|(_, e)| e),
-                Some(TokenEvent::Token { id, .. }) if id == expected
-            ));
-        }
-        assert!(matches!(
-            token_rx.recv().await.map(|(_, e)| e),
-            Some(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Length,
                 completion_tokens: 2,
                 ..
-            })
+            }
         ));
     }
 
@@ -303,65 +378,26 @@ mod tests {
         assert!(SimulatedEngineConfig::new(5.0, 100.0, f64::INFINITY, 0).is_err());
     }
 
-    #[tokio::test]
-    async fn simulated_request_emits_scheduled_tokens_and_finished() {
+    #[test]
+    fn simulated_request_emits_scheduled_tokens_and_finished() {
         let config = SimulatedEngineConfig::new(0.0, 100.0, 0.0, 42).unwrap();
-        let (token_tx, mut token_rx) = TokenSink::standalone();
-
-        run_simulated_request(
-            GenerateRequest {
-                trace_parent: None,
-                request_id: Some("req-1".to_string()),
-                queued_at_unix_s: Some(1.0),
-                data_parallel_rank: None,
-                prompt_tokens: vec![7, 9],
-                params: SamplingParams::default(),
-                max_tokens: 3,
-                lora_adapter: None,
-                kv_transfer_params: None,
-                token_tx,
-                logprobs: 1,
-                echo: false,
-            },
-            config,
-        )
-        .await;
-
+        let (tokens, prompt_tokens, terminal) =
+            collect_completion(&config, request(vec![7, 9], 3, 1));
+        assert_eq!(prompt_tokens, Some(2));
+        assert_eq!(tokens, [7, 9, 7]);
         assert!(matches!(
-            token_rx.recv().await.map(|(_, event)| event),
-            Some(TokenEvent::Scheduled {
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Length,
                 prompt_tokens: 2,
-                ..
-            })
+                completion_tokens: 3,
+            }
         ));
-        assert!(matches!(
-            token_rx.recv().await.map(|(_, event)| event),
-            Some(TokenEvent::Token {
-                id: 7,
-                logprob: Some(_)
-            })
-        ));
-        assert!(matches!(
-            token_rx.recv().await.map(|(_, event)| event),
-            Some(TokenEvent::Token {
-                id: 9,
-                logprob: Some(_)
-            })
-        ));
-        assert!(matches!(
-            token_rx.recv().await.map(|(_, event)| event),
-            Some(TokenEvent::Token {
-                id: 7,
-                logprob: Some(_)
-            })
-        ));
-        assert!(matches!(
-            token_rx.recv().await.map(|(_, event)| event),
-            Some(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: 2,
-                completion_tokens: 3
-            })
-        ));
+    }
+
+    #[test]
+    fn start_engine_with_partitions_exposes_that_many_schedulers() {
+        let engine = start_engine_with_partitions(&SimulatedEngineConfig::default(), 3);
+        assert_eq!(engine.schedulers.len(), 3);
     }
 }

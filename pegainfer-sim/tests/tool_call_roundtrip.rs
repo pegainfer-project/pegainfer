@@ -220,7 +220,7 @@ impl ToolCallSimServer {
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let engine = start_engine(
-            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 0)?.with_scripted_completion(script),
+            &SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 0)?.with_scripted_completion(script),
         );
         let model_path = model_dir.path().to_path_buf();
         let mut task = tokio::spawn(async move {
