@@ -75,9 +75,9 @@ impl BatchDecodeBuffers35 {
         let q_proj_dim = config.local_full_attn_gated_q_dim(tensor_parallel);
         let q_dim = config.local_full_attn_q_dim(tensor_parallel);
         let kv_dim = config.local_full_attn_kv_dim(tensor_parallel);
-        let qkv_dim = config.linear_attn_qkv_dim();
-        let z_dim = config.linear_attn_z_dim();
-        let b_dim = config.linear_num_value_heads;
+        let qkv_dim = config.local_linear_qkv_dim(tensor_parallel);
+        let z_dim = config.local_linear_z_dim(tensor_parallel);
+        let b_dim = config.local_linear_num_value_heads(tensor_parallel);
         let a_dim = b_dim;
         let intermediate = config.local_intermediate_size(tensor_parallel);
 

@@ -44,6 +44,7 @@ fn active_request(request_id: u64, label: &str, token_tx: TokenSink) -> ActiveRe
         token_tx,
         backend_state: ActiveBackendState::Tp {
             request_id: RequestId::new(request_id),
+            slot_idx: 0,
         },
         last_token: 1,
         generated_count: 1,
@@ -89,7 +90,7 @@ impl DecodeDispatchBackend for PruneTestBackend {
     }
 
     fn drop_active_state(&mut self, state: &ActiveBackendState) -> Result<()> {
-        let ActiveBackendState::Tp { request_id } = state else {
+        let ActiveBackendState::Tp { request_id, .. } = state else {
             panic!("prune test expected TP active state");
         };
         self.retired_active.push(*request_id);
@@ -180,7 +181,7 @@ impl DecodeDispatchBackend for LifecycleTestBackend {
     }
 
     fn drop_active_state(&mut self, state: &ActiveBackendState) -> Result<()> {
-        let ActiveBackendState::Tp { request_id } = state else {
+        let ActiveBackendState::Tp { request_id, .. } = state else {
             panic!("lifecycle test expected TP active state");
         };
         if self.active_completion_requires_drop_ack {
@@ -879,7 +880,10 @@ fn inflight_prefill_waits_instead_of_parking_after_last_decode_retires() {
 }
 
 #[test]
-fn tp_engine_rejects_cuda_graph_before_model_load() {
+fn tp_engine_cuda_graph_passes_preload_validation() {
+    // P2c: TP + CUDA Graph is gated on the model's TP-local decode GQA group
+    // after load, so startup with a bogus path fails at load, not at the old
+    // eager-only rejection.
     let err = match crate::start_engine_with_capacity(
         Path::new("unused"),
         EngineLoadOptions {
@@ -892,10 +896,10 @@ fn tp_engine_rejects_cuda_graph_before_model_load() {
         1,
         1,
     ) {
-        Ok(_) => panic!("TP CUDA Graph startup should fail"),
+        Ok(_) => panic!("TP CUDA Graph startup with a nonexistent path should fail at load"),
         Err(err) => err.to_string(),
     };
-    assert!(err.contains("eager execution only"));
+    assert!(!err.contains("eager execution only"));
 }
 
 #[test]
@@ -907,7 +911,7 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
         return;
     };
     let handle =
-        start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1).expect("start TP2 scheduler");
+        start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false).expect("start TP2 scheduler");
     let (decode_tx, mut decode_rx) = TokenSink::standalone();
     let (prefill_tx, mut prefill_rx) = TokenSink::standalone();
 

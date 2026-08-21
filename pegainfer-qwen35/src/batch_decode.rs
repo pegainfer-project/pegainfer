@@ -26,6 +26,22 @@ use crate::ops;
 
 static LOG_UNCOMPILED_DECODE_ROUTE: std::sync::Once = std::sync::Once::new();
 
+/// How a `batch_decode_graph` call interacts with the per-bucket CUDA graphs.
+///
+/// TP serving never captures lazily: a mid-serving capture on one rank while a
+/// peer replays desyncs the recorded NCCL collectives, so tensor-parallel
+/// decodes are replay-only after the startup pre-capture sweep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DecodeGraphUse {
+    /// Replay if captured, lazily capture otherwise (single-GPU serving).
+    Serve,
+    /// Record + instantiate + upload, no launch (the TP sweep's Capture phase).
+    CaptureOnly,
+    /// Replay only; error if never captured (TP serving, and the TP sweep's
+    /// Launch phase that drains the captured collectives across ranks).
+    Replay,
+}
+
 impl Qwen35Model {
     pub(crate) fn select_tokens_from_logits_varied(
         &self,
@@ -179,6 +195,9 @@ impl Qwen35Model {
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+        let tp = self.tensor_parallel;
+        let num_attention_heads = self.config.local_num_attention_heads(tp);
+        let num_key_value_heads = self.config.local_num_key_value_heads(tp);
 
         ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
         ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
@@ -194,8 +213,8 @@ impl Qwen35Model {
             &self.cos_cache,
             &self.sin_cache,
             &bufs.positions_d,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
+            num_attention_heads,
+            num_key_value_heads,
             self.config.rotary_dim,
             eps,
         );
@@ -211,7 +230,7 @@ impl Qwen35Model {
             plan,
             &bufs.positions_d,
             &mut bufs.attn_out_full,
-            self.config.num_attention_heads,
+            num_attention_heads,
             bs,
         )?;
 
@@ -221,7 +240,7 @@ impl Qwen35Model {
             crate::ffi::attention_gate_batch_hd256_cuda(
                 qf_ptr as *const crate::ffi::Half,
                 out_ptr as *mut crate::ffi::Half,
-                self.config.num_attention_heads as i32,
+                num_attention_heads as i32,
                 bs as i32,
                 self.ctx.stream.cu_stream(),
             );
@@ -268,6 +287,7 @@ impl Qwen35Model {
         linear_pointer_tables.validate_for(&self.config, bs, "Qwen3.5 eager decode")?;
 
         let mut positions = Vec::with_capacity(bs);
+        let mut start_positions = Vec::with_capacity(bs);
         for (i, kv) in kv_states.iter_mut().enumerate() {
             let pos = kv.seq_len();
             self.ensure_rope_cache_covers(pos + 1)?;
@@ -275,6 +295,7 @@ impl Qwen35Model {
             kv.advance(1);
             recurrent_states[i].seq_len += 1;
             positions.push(pos as i32);
+            start_positions.push(pos);
         }
 
         bufs.set_batch_size(bs);
@@ -288,12 +309,53 @@ impl Qwen35Model {
         let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
         bufs.sync_paged_meta(&self.ctx, &kv_refs, bs)?;
 
+        // Route by TP-local GQA group supportability: when the rank-local
+        // q-per-kv group has no compiled batch-decode kernel, run full
+        // attention through the paged-prefill kernel with a per-step plan.
+        let prefill_attn_plan = if self
+            .config
+            .local_decode_group_is_compiled(self.tensor_parallel)
+        {
+            None
+        } else {
+            let page_indices: Vec<Vec<i32>> =
+                kv_states.iter().map(|kv| kv.page_indices_i32()).collect();
+            let last_page_lens: Vec<usize> =
+                kv_states.iter().map(|kv| kv.last_page_len()).collect();
+            let seq_lens = vec![1usize; bs];
+            // cta_tile_q 0 = the kernel's own FA2 derivation; matches the
+            // hybrid fallback path in batch_decode_batched_hybrid.
+            Some(
+                ops::PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+                    &self.ctx,
+                    &page_indices,
+                    &last_page_lens,
+                    &start_positions,
+                    &seq_lens,
+                    self.config.local_num_attention_heads(self.tensor_parallel),
+                    self.config.local_num_key_value_heads(self.tensor_parallel),
+                    self.config.head_dim,
+                    0,
+                )
+                .with_context(|| {
+                    format!(
+                        "eager decode build PrefillPagedPlan bs={bs}, pages={}, local heads={}/{}, head_dim={}",
+                        page_indices.iter().map(Vec::len).sum::<usize>(),
+                        self.config.local_num_attention_heads(self.tensor_parallel),
+                        self.config.local_num_key_value_heads(self.tensor_parallel),
+                        self.config.head_dim
+                    )
+                })?,
+            )
+        };
+
         let kv_buffer = kv_states[0].buffer();
         let layout = *kv_states[0].layout();
         self.batch_decode_kernels_graph(
             kv_buffer,
             &layout,
             bs,
+            prefill_attn_plan.as_ref(),
             &linear_pointer_tables.state_ptrs,
             &linear_pointer_tables.conv_state_ptrs,
             bufs,
@@ -318,6 +380,7 @@ impl Qwen35Model {
         token_ids: &[u32],
         kv_states: &mut [&mut KvState],
         graph_state: &mut BatchDecodeGraphState,
+        graph_use: DecodeGraphUse,
     ) -> Result<()> {
         let bs = token_ids.len();
         anyhow::ensure!(bs > 0, "batch_decode_graph requires at least one request");
@@ -329,6 +392,10 @@ impl Qwen35Model {
         );
 
         if !self.config.decode_group_is_compiled() {
+            anyhow::ensure!(
+                graph_use == DecodeGraphUse::Serve,
+                "Qwen3.5 batched hybrid eager fallback only supports lazy serve-mode decode, got {graph_use:?}"
+            );
             LOG_UNCOMPILED_DECODE_ROUTE.call_once(|| {
                 let group = self.config.num_attention_heads / self.config.num_key_value_heads;
                 log::info!(
@@ -389,16 +456,35 @@ impl Qwen35Model {
         let mut graphs = std::mem::take(&mut graph_state.graphs);
         let linear_state_ptrs = &graph_state.linear_pointer_tables.state_ptrs;
         let linear_conv_state_ptrs = &graph_state.linear_pointer_tables.conv_state_ptrs;
-        let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
-            self.batch_decode_kernels_graph(
-                kv_buffer,
-                &layout,
-                padded_bs,
-                linear_state_ptrs,
-                linear_conv_state_ptrs,
-                &mut graph_state.buffers,
-            )
-        });
+        let result = match graph_use {
+            DecodeGraphUse::Serve => graphs[bucket_idx].run_or_capture(&self.ctx, || {
+                self.batch_decode_kernels_graph(
+                    kv_buffer,
+                    &layout,
+                    padded_bs,
+                    None,
+                    linear_state_ptrs,
+                    linear_conv_state_ptrs,
+                    &mut graph_state.buffers,
+                )
+            }),
+            DecodeGraphUse::CaptureOnly => graphs[bucket_idx].capture_only(&self.ctx, || {
+                self.batch_decode_kernels_graph(
+                    kv_buffer,
+                    &layout,
+                    padded_bs,
+                    None,
+                    linear_state_ptrs,
+                    linear_conv_state_ptrs,
+                    &mut graph_state.buffers,
+                )
+            }),
+            // Replay is a pure enqueue: every bucket was recorded by the
+            // startup pre-capture sweep, so a missing graph here means the
+            // sweep was skipped or incomplete — fail loudly, never capture
+            // mid-serving (a one-sided capture desyncs TP collectives).
+            DecodeGraphUse::Replay => graphs[bucket_idx].launch_captured(&self.ctx),
+        };
         graph_state.graphs = graphs;
         result
     }
@@ -503,6 +589,7 @@ impl Qwen35Model {
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &KvLayout,
         padded_bs: usize,
+        prefill_attn_plan: Option<&ops::PrefillPagedPlan>,
         linear_state_ptrs: &[CudaSlice<u64>],
         linear_conv_state_ptrs: &[CudaSlice<u64>],
         bufs: &mut BatchDecodeBuffers35,
@@ -529,9 +616,17 @@ impl Qwen35Model {
 
             match &layer.attn {
                 LayerKind::FullAttention(attn) => {
-                    self.batch_decode_full_attention(
-                        attn, kv_buffer, layout, full_idx, padded_bs, bufs,
-                    )?;
+                    // The eager TP path passes a per-step prefill plan when the
+                    // TP-local GQA group has no compiled batch-decode kernel;
+                    // graph capture always passes None (rerouted earlier).
+                    match prefill_attn_plan {
+                        Some(plan) => self.batch_decode_full_attention_via_prefill(
+                            attn, kv_buffer, layout, plan, full_idx, padded_bs, bufs,
+                        )?,
+                        None => self.batch_decode_full_attention(
+                            attn, kv_buffer, layout, full_idx, padded_bs, bufs,
+                        )?,
+                    }
                     full_idx += 1;
                 }
                 LayerKind::LinearAttention(attn) => {
@@ -541,7 +636,7 @@ impl Qwen35Model {
                         &linear_conv_state_ptrs[linear_idx],
                         padded_bs,
                         bufs,
-                    );
+                    )?;
                     linear_idx += 1;
                 }
             }
@@ -646,7 +741,7 @@ impl Qwen35Model {
                         &linear_conv_state_ptrs[linear_idx],
                         bs,
                         bufs,
-                    );
+                    )?;
                     linear_idx += 1;
                 }
             }
@@ -719,6 +814,11 @@ impl Qwen35Model {
     /// Iterates 0..`padded_bs`. Real requests are in 0..real_bs; padding slots
     /// (real_bs..padded_bs) run but their output columns are ignored by the caller.
     /// All GPU addresses are stable per slot index, making this CUDA Graph safe.
+    ///
+    /// Phase 2b: every rank computes only its local value heads against
+    /// rank-local (never all-reduced) recurrent/conv state; the col-sharded
+    /// out_proj yields a partial hidden sum that is all-reduced under TP
+    /// (no-op at world_size 1).
     fn batch_decode_linear_attention_slots(
         &self,
         attn: &LinearAttentionLayer,
@@ -726,7 +826,9 @@ impl Qwen35Model {
         conv_state_ptrs: &CudaSlice<u64>,
         padded_bs: usize,
         bufs: &mut BatchDecodeBuffers35,
-    ) {
+    ) -> Result<()> {
+        let tp = self.tensor_parallel;
+
         ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.normed, &mut bufs.qkv);
         ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z);
         ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_proj);
@@ -750,8 +852,8 @@ impl Qwen35Model {
             state_ptrs,
             &mut bufs.gdr_out,
             padded_bs,
-            self.config.linear_num_key_heads,
-            self.config.linear_num_value_heads,
+            self.config.local_linear_num_key_heads(tp),
+            self.config.local_linear_num_value_heads(tp),
             self.config.linear_key_head_dim,
             self.config.linear_value_head_dim,
         );
@@ -762,7 +864,7 @@ impl Qwen35Model {
             &attn.norm_weight,
             &bufs.z,
             &mut bufs.normed_gated,
-            self.config.linear_num_value_heads,
+            self.config.local_linear_num_value_heads(tp),
             self.config.linear_value_head_dim,
             self.config.rms_norm_eps,
         );
@@ -772,5 +874,7 @@ impl Qwen35Model {
             &bufs.normed_gated,
             &mut bufs.attn_results,
         );
+        self.all_reduce_hidden(&mut bufs.attn_results)?;
+        Ok(())
     }
 }
