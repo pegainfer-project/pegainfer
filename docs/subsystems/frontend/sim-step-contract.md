@@ -52,6 +52,3 @@
   - Metrics e2e used `EngineHandle::with_metrics_watches` to inject snapshots. Stepped has no watch; injecting would have been a second fake contract. Replaced with occupancy the scheduler actually reports.
 - **Lessons learned**:
   - The Cargo dep was already there; "切到 frontend" here means the step contract, not adding a crate edge.
-  - Stepped `scheduler_stats_from` still drops `spec_decode`. That is a frontend gap (qwen3 already publishes counters). Do not fake it in sim.
-- **Follow-ups**:
-  - Stamp `spec_decode` on the stepped bridge when a line that actually drafts is ready to prove it.
