@@ -26,15 +26,15 @@ use std::path::PathBuf;
 use anyhow::Context;
 use anyhow::Result;
 use clap::FromArgMatches;
-use pegainfer_frontend::engine::ActiveRequest;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::IntakeTicket;
 use pegainfer_frontend::engine::LaunchedEngine;
-use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::QueuedRequest;
+use pegainfer_frontend::engine::RequestId;
+use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
-use pegainfer_frontend::engine::StepEmitter;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
@@ -98,14 +98,15 @@ impl ModelLine for EchoLine {
 /// streaming path warm instead of collapsing the response into one batch.
 #[derive(Default)]
 struct EchoScheduler {
-    queued: Vec<IntakeTicket>,
+    queued: Vec<QueuedRequest>,
     running: Vec<RunningRequest>,
 }
 
-/// One admission onward: the request handle plus its echo cursor — prompt
-/// tokens not yet echoed and whether `max_tokens` trimmed the echo short.
+/// One admission onward: the request's ledger id plus its echo cursor —
+/// prompt tokens not yet echoed and whether `max_tokens` trimmed the echo
+/// short.
 struct RunningRequest {
-    active: ActiveRequest,
+    id: RequestId,
     /// Prompt tokens not yet echoed, stored reversed for cheap pops.
     pending: Vec<u32>,
     /// Whether `max_tokens` trimmed the prompt (decides the finish reason).
@@ -113,36 +114,35 @@ struct RunningRequest {
 }
 
 impl Scheduler for EchoScheduler {
-    fn intake(&mut self, ticket: IntakeTicket) {
-        self.queued.push(ticket);
+    fn submit(&mut self, request: QueuedRequest) {
+        self.queued.push(request);
     }
 
-    fn step(&mut self, emitter: &mut StepEmitter) -> Result<()> {
-        for ticket in self.queued.drain(..) {
-            if ticket.is_aborted() {
-                emitter.retire_ticket(ticket);
+    fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        for QueuedRequest { id, request } in self.queued.drain(..) {
+            if ledger.is_aborted(id) {
+                ledger.retire(id);
                 continue;
             }
-            let request = ticket.request();
             let echo_len = request.prompt_tokens.len().min(request.max_tokens);
             let truncated = echo_len < request.prompt_tokens.len();
             let mut pending = Vec::from(&request.prompt_tokens[..echo_len]);
             pending.reverse();
-            let active = emitter.admit(ticket);
+            ledger.admit(id);
             self.running.push(RunningRequest {
-                active,
+                id,
                 pending,
                 truncated,
             });
         }
         let mut still_running = Vec::new();
         for mut running in self.running.drain(..) {
-            if running.active.is_aborted() {
-                emitter.retire(running.active);
+            if ledger.is_aborted(running.id) {
+                ledger.retire(running.id);
                 continue;
             }
             if let Some(token) = running.pending.pop() {
-                emitter.push_tokens(&mut running.active, &[token], &[]);
+                ledger.push_tokens(running.id, &[token], &[]);
                 still_running.push(running);
             } else {
                 let reason = if running.truncated {
@@ -150,18 +150,18 @@ impl Scheduler for EchoScheduler {
                 } else {
                     FinishReason::Stop
                 };
-                emitter.finish(running.active, reason);
+                ledger.finish(running.id, reason);
             }
         }
         self.running = still_running;
         Ok(())
     }
 
-    fn load(&self) -> LoadSnapshot {
-        LoadSnapshot {
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
             num_running_reqs: self.running.len() as u64,
             num_waiting_reqs: self.queued.len() as u64,
-            ..LoadSnapshot::default()
+            ..SchedulerMetrics::default()
         }
     }
 }

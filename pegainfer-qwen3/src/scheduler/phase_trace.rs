@@ -136,7 +136,7 @@ mod tests {
         // hand its context to the tracker at admission.
         let root = Span::root("request", SpanContext::random());
         let ctx = SpanContext::from_span(&root).expect("root span is sampled");
-        let id = RequestId(1);
+        let id = RequestId::new(1);
         tracker.enter_queue(id, Some(ctx));
         tracker.enter_prefill(id);
         // Chunked prefill re-enters once per step: must not open a second span.
@@ -149,14 +149,14 @@ mod tests {
         // transitions are no-ops.
         let rejected_root = Span::root("request", SpanContext::random());
         let rejected_ctx = SpanContext::from_span(&rejected_root).unwrap();
-        let rejected = RequestId(2);
+        let rejected = RequestId::new(2);
         tracker.enter_queue(rejected, Some(rejected_ctx));
         tracker.finish(rejected);
         tracker.enter_decode(rejected);
         drop(rejected_root);
 
         // Tracing off: no parent context, no spans, no lingering state.
-        let untraced = RequestId(3);
+        let untraced = RequestId::new(3);
         tracker.enter_queue(untraced, None);
         tracker.enter_prefill(untraced);
         tracker.enter_decode(untraced);

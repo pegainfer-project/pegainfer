@@ -2,9 +2,12 @@
 
 **TL;DR**: `generate.py` AOT-compiles the vendored TileLang kernel definitions
 in `tilelang_defs.py` into CUDA that `pegainfer-kernels/build.rs` hands to
-nvcc under the `k3` feature. Thirteen batched families cover every non-GEMM
-step of a K3 decode iteration — three tiers (generate, pre-generated, stub),
-and the generated CUDA is a Cargo `OUT_DIR` artifact that is never checked in.
+nvcc under the `k3` feature. Eleven batched families cover every non-GEMM,
+non-attention step of a K3 decode iteration — three tiers (generate,
+pre-generated, stub), and the generated CUDA is a Cargo `OUT_DIR` artifact
+that is never checked in. MLA decode is a hand-written absorbed paged-KV CUDA
+kernel (`pegainfer-kernels/csrc/k3/k3_mla_paged_attn.cu`), not a TileLang
+family.
 
 ## What lives here
 
@@ -35,36 +38,36 @@ every row below is its shape count × 10.
 | `situ_batched` | N ∈ {6144, 33792} | 20 | `k3_situ_batched` |
 | `conv_silu_batched` | KP = 12288, W = 4, SK = 1 | 10 | `k3_conv_silu_batched` |
 | `kda_core_batched` | 96 heads × 128 head_dim | 10 | `k3_kda_core_batched` |
-| `mla_attn_batched` | 96 heads, qk 192, v 128, CAP ∈ {128} | 10 | `k3_mla_attn_batched` |
 | `router_topk_batched` | E ∈ {896, 224}, TOPK = 16 | 20 | `k3_router_topk_batched` |
 | `attnres_scores_batched` | NB ∈ 1..8, H = 7168 | 80 | `k3_attnres_scores_batched` |
 | `attnres_mix_batched` | NB ∈ 1..8, H = 7168 | 80 | `k3_attnres_mix_batched` |
 
-**430 instantiations**, about 20 seconds of generation and 7 seconds of nvcc.
+**420 instantiations**, about 20 seconds of generation and 7 seconds of nvcc.
 The pool fans out at *instantiation* granularity, not family granularity — the
 families differ by more than an order of magnitude in size, so a family-granular
 pool would be bound by `land_batched` alone. It defaults to one worker per CPU
 capped at 32; each worker holds a TileLang lowering, so lower it with
 `PEGAINFER_K3_TILELANG_JOBS` on memory-tight hosts.
 
-Two lists in `generate.py` are deliberately narrow and are one-line changes:
+One list in `generate.py` is deliberately narrow and is a one-line change:
 
-* `MAX_CTX` — the MLA context-capacity list. Both the instantiation count and
-  the per-block shared memory scale with the capacity, so serving longer
-  contexts is a deliberate widening, not a free one.
 * `SPLIT_K` — the segment counts the partial consumers (`land`,
   `land_rms_norm_rbs`, `conv_silu`) accept. Only `1` — the single partial a
   framework GEMM produces — has a launch site; the reference engine's
   split-K-8 GEMV shapes are not generated.
 
-Neither needs a launcher edit.
+It needs no launcher edit.
 
 ### What is deliberately *not* here
 
-No GEMV family. Dense projections run on cuBLASLt and the routed experts on
-the DeepGEMM masked grouped-GEMM chain (`csrc/k3/k3_moe_chain.cu` and the
-`k3.deepgemm.*` ops), so the upstream `gemv`, `expert_gemv` and
-`packed_expert_gemv` kernels would be dead weight. Their consumers are still
+No GEMV family, and no attention family. Dense projections run on cuBLASLt,
+the routed experts on the DeepGEMM masked grouped-GEMM chain
+(`csrc/k3/k3_moe_chain.cu` and the `k3.deepgemm.*` ops), and MLA decode on the
+absorbed paged-KV kernel (`csrc/k3/k3_mla_paged_attn.cu` — a runtime page walk
+needs no per-capacity instantiation, which is what retired the upstream
+`mla_attn` family and its `MAX_CTX` list), so the upstream `gemv`,
+`expert_gemv`, `packed_expert_gemv` and `mla_attn` kernels would be dead
+weight. Their consumers are still
 here — `land_batched` at `SK = 1` is exactly the bf16 landing of a cuBLASLt
 f32 output.
 
@@ -115,18 +118,18 @@ trim them.
 The same parse also asserts that no body lowers to TMA. A warp-specialized
 TileLang kernel takes `CUtensorMap` descriptors instead of pointers and adds a
 producer warpgroup to the block, so the launchers — which bind plain pointers
-and the requested thread count — would be silently wrong. None of the batched
-bodies do this today (their only bulk copy is `mla_attn`'s one-dimensional
-query load), but that is a property of TileLang, not of the kernels, so it is
-asserted rather than assumed.
+and the requested thread count — would be silently wrong. None of the batched bodies use a bulk
+copy at all today, but that is a property of TileLang, not of the kernels, so
+it is asserted rather than assumed.
 
 ## TileLang codegen is not byte-reproducible
 
 Re-running the same instantiation can swap the names of two *aliases of the
-same* dynamic-shared-memory offset — `mla_attn` emits `void* workspace` and
-`void* workspace_1`, both `buf_dyn_shmem + 0`, and which one each `AllReduce`
-scratch argument gets flips run to run (measured 8/10 vs 2/10 on an otherwise
-identical invocation). Nothing else moves: same offsets, same instructions.
+same* dynamic-shared-memory offset — the retired `mla_attn` family emitted
+`void* workspace` and `void* workspace_1`, both `buf_dyn_shmem + 0`, and which
+one each `AllReduce` scratch argument got flipped run to run (measured 8/10 vs
+2/10 on an otherwise identical invocation). Nothing else moves: same offsets,
+same instructions.
 
 The practical consequence is only for tooling: a byte-diff of a generated
 body against a fresh upstream `get_kernel_source()` dump has to canonicalize
@@ -175,6 +178,7 @@ Allocating at `K3_MAX_BATCH` once and reusing keeps the pointers stable for
 CUDA Graph capture.
 
 Per-slot state is `[b, ...]` contiguous with each row holding exactly the
-single-row layout: the `conv_silu` windows, the `kda_core` recurrent state and
-the MLA `Kc`/`Vc` caches. That contract is what the upstream bitwise gate
-proves, and it is why the caches are slot-indexed rather than paged.
+single-row layout: the `conv_silu` windows and the `kda_core` recurrent state.
+That contract is what the upstream bitwise gate proves. (The MLA KV cache is
+*not* per-slot state anymore — it is the paged latent pool owned by the
+executor and consumed by `csrc/k3/k3_mla_paged_attn.cu`.)

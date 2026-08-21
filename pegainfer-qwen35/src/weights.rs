@@ -498,7 +498,8 @@ impl Qwen35Model {
             config.local_num_key_value_heads(tensor_parallel),
             config.head_dim,
             page_size,
-        );
+        )
+        .expect("kv layout geometry");
         let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
         let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
             .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
@@ -728,6 +729,9 @@ impl Qwen35Model {
         for &n in super::batch_decode_graph::BATCH_BUCKETS
             .iter()
             .filter(|&&bucket| {
+                // Keep in sync with MAX_SHARED_SM_DECODE_BATCH: buckets above
+                // GEMM_LT_MAX_N do not have an independent tuned decode GEMM
+                // route today, so Shared-SM overlap rejects them at startup.
                 bucket <= crate::ops::GEMM_LT_MAX_N && bucket <= self.reserved_decode_slots
             })
         {

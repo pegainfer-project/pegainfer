@@ -911,6 +911,35 @@ pub fn gelu_tanh_mul_batch_into(
     Ok(())
 }
 
+/// In-place final-logit softcap: `x = cap * tanh(x / cap)` in f32 with a
+/// single rounding back to bf16, matching the reference's compute-dtype
+/// application. Gemma 4 declares `final_logit_softcapping` 30.0 at every
+/// published size.
+pub fn softcap_bf16_in_place(ctx: &DeviceContext, buf: &mut HiddenStates, cap: f32) -> Result<()> {
+    if !cap.is_finite() || cap <= 0.0 {
+        return Err(anyhow!(
+            "softcap_bf16_in_place cap {cap} must be positive and finite"
+        ));
+    }
+    let n = buf.checked_extent("softcap_bf16 buf")?;
+    let n = super::checked_i32(n, "softcap_bf16 extent")?;
+    let (buf_ptr, _gb) = buf.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::softcap_bf16_in_place_cuda(
+            buf_ptr as *mut ffi::Half,
+            cap,
+            n,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result
+        .result()
+        .map_err(|e| anyhow!("softcap_bf16_in_place_cuda failed: {e}"))?;
+
+    Ok(())
+}
+
 /// In-place multiply by a host scalar — Gemma 4's per-layer `layer_scalar`,
 /// a `[1]` weight the model reads to the host at load.
 pub fn scale_bf16_in_place(ctx: &DeviceContext, buf: &mut HiddenStates, scale: f32) -> Result<()> {

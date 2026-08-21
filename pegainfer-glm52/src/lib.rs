@@ -55,7 +55,7 @@ pub(crate) use config::GLM52_ROUTED_EXPERTS;
 pub(crate) use config::probe_config_json;
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::KvCapacity;
-use pegainfer_frontend::engine::LoadSnapshot;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_kv_store::ArenaSpec;
 use pegainfer_kv_store::BlockPool;
 use pegainfer_kv_store::KvStore;
@@ -1092,9 +1092,9 @@ fn start_engine(
     let local_ranks = if mirrored { 1 } else { loaded.workers.len() };
     let (load_txs, load_rxs): (Vec<_>, Vec<_>) = (0..local_ranks)
         .map(|_| {
-            watch::channel(LoadSnapshot {
+            watch::channel(SchedulerMetrics {
                 kv_total_blocks: kv_total_blocks as u64,
-                ..LoadSnapshot::default()
+                ..SchedulerMetrics::default()
             })
         })
         .unzip();
@@ -1225,7 +1225,7 @@ fn start_engine(
                 total_blocks: kv_total_blocks,
                 block_size: GLM52_MODEL_LEN_ALIGN,
             })
-            .with_load_watches(load_rxs),
+            .with_metrics_watches(load_rxs),
     )
 }
 

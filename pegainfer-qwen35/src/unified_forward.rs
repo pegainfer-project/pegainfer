@@ -9,9 +9,14 @@
 //!   2. `batch_decode_graph` for existing decode requests (CUDA Graph for
 //!      compiled GQA groups; eager prefill fallback for uncompiled ones).
 
+use std::sync::Arc;
+
 use anyhow::Result;
+use cudarc::driver::CudaStream;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_frontend::engine::panic_message;
+use pegainfer_kernels::tensor::StreamOverrideGuard;
 
 use super::batch_decode_graph::BatchDecodeGraphState;
 use super::recurrent_state::RecurrentState;
@@ -52,6 +57,33 @@ impl Qwen35Model {
             last_hiddens.push(last_hidden);
         }
         self.batch_last_hidden_logits(&last_hiddens)
+    }
+
+    /// Run the complete prefill path on `stream`, including allocations, copies,
+    /// kernels, and stream-ordered frees. The model is scheduler-thread owned, so
+    /// the temporary context swap cannot race another host caller.
+    pub(crate) fn batch_prefill_logits_on_stream(
+        &mut self,
+        stream: Arc<CudaStream>,
+        prompts: &[&[u32]],
+        kv_states: &mut [KvState],
+        recurrent_states: &mut [&mut RecurrentState],
+    ) -> Result<HiddenStates> {
+        let cu_stream = stream.cu_stream();
+        let original_stream = std::mem::replace(&mut self.ctx.stream, stream);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _stream_override = unsafe { StreamOverrideGuard::activate_prefill(cu_stream) };
+            self.batch_prefill_logits(prompts, kv_states, recurrent_states)
+        }));
+        self.ctx.stream = original_stream;
+
+        match result {
+            Ok(result) => result,
+            Err(panic) => anyhow::bail!(
+                "Qwen3.5 async prefill panicked: {}",
+                panic_message(panic.as_ref())
+            ),
+        }
     }
 
     /// Unified step: prefill new requests and decode existing requests in one call.
@@ -106,29 +138,10 @@ impl Qwen35Model {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use pegainfer_core::kv_pool::KvState;
     use pegainfer_core::tensor::HiddenStates;
 
     use super::*;
-
-    const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
-
-    fn get_model_path_or_skip() -> Option<String> {
-        match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
-            Ok(path) => Some(path),
-            Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
-                Some(MODEL_PATH.to_string())
-            }
-            Err(_) => {
-                eprintln!(
-                    "skipping Qwen3.5 unified forward model test because {MODEL_PATH}/config.json is missing; set PEGAINFER_TEST_MODEL_PATH to run it"
-                );
-                None
-            }
-        }
-    }
 
     fn greedy_sample_batch(model: &Qwen35Model, logits: &HiddenStates, rows: usize) -> Vec<u32> {
         let params = vec![pegainfer_frontend::sampler::SamplingParams::default(); rows];
@@ -145,7 +158,9 @@ mod tests {
     /// Verify that unified_step decode output matches batch_decode_graph standalone.
     #[test]
     fn unified_step_decode_matches_graph_decode() {
-        let Some(model_path) = get_model_path_or_skip() else {
+        let Some(model_path) =
+            crate::test_fixture::model_path_or_skip("unified_step_decode_matches_graph_decode")
+        else {
             return;
         };
         let model = Qwen35Model::from_safetensors(&model_path, 0, 2).unwrap();

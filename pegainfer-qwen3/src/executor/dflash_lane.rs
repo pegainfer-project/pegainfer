@@ -204,7 +204,7 @@ impl LocalQwen3Lane {
             };
             log::debug!(
                 "Qwen3 DFlash request={} accepted_draft={} committed_tokens={} cumulative_accept_rate={:.3}",
-                req.request_id.get(),
+                req.request_id.raw(),
                 result.matched_draft_tokens,
                 result.accepted_tokens.len(),
                 rate,

@@ -9,7 +9,10 @@ mod common;
 
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use pegainfer_kernels::ops::Hd512DecodeMetadata;
+use pegainfer_kernels::ops::paged_attention_batch_decode_split_kv_hd512_into;
 use pegainfer_kernels::ops::qk_norm_partial_rope_batched_decode_hd512_into;
+use pegainfer_kernels::ops::qk_norm_partial_rope_paged_decode_hd512_into;
 use pegainfer_kernels::ops::qk_norm_partial_rope_paged_prefill_hd512_into;
 use pegainfer_kernels::paged_kv::PagedKvLayout;
 use pegainfer_kernels::tensor::DeviceContext;
@@ -116,11 +119,14 @@ fn expected_full(
     full
 }
 
-/// K side only; everything else stays 0.0. The layer offset is derived
-/// from the layout, so oracle and kernel share no hand-picked raw offset.
+/// K and V blocks; everything else stays 0.0. The offsets are derived from
+/// the layout, so oracle and kernel share no hand-picked raw offset. V is
+/// the K=V fork: the same raw vector under the shared inv_rms, weightless
+/// and un-rotated.
 fn expected_pool(x: f32, w: &[bf16], inv: f32, layout: &PagedKvLayout, layer: usize) -> Vec<f32> {
     let mut exp = vec![0.0f32; POOL_LEN];
     let layer_offset = (layer * layout.layer_stride) as i64;
+    let v_val = bf16::from_f32(x * inv).to_f32();
     for t in 0..SEQ_LEN {
         let pos = START_POS + t;
         let page = PAGE_INDICES[pos / PAGE_SIZE] as i64;
@@ -131,6 +137,7 @@ fn expected_pool(x: f32, w: &[bf16], inv: f32, layout: &PagedKvLayout, layer: us
                 + h as i64 * HD as i64;
             for d in 0..HD {
                 exp[(base + d as i64) as usize] = expected_prep(x, w, inv, d, pos);
+                exp[(base + layout.kv_block_len as i64 + d as i64) as usize] = v_val;
             }
         }
     }
@@ -148,8 +155,8 @@ fn assert_close(got: &[f32], expected: &[f32], what: &str) {
 }
 
 /// Exact zero is the assertion, not sloppiness: it marks a slot the kernel
-/// must never have written. That covers the V blocks too, so they get no
-/// separate check.
+/// must never have written — unreferenced pages, the other layer, and the
+/// slots outside the request's positions.
 #[allow(clippy::float_cmp)]
 fn assert_pool(got: &[f32], expected: &[f32]) {
     assert_eq!(got.len(), expected.len());
@@ -212,6 +219,7 @@ fn prefill_prep_matches_closed_form() {
         &q,
         &k,
         &mut q_out,
+        0,
         &pool,
         &layout,
         &qn,
@@ -220,6 +228,7 @@ fn prefill_prep_matches_closed_form() {
         &sin_dev,
         layer,
         &page_indices,
+        0,
         START_POS,
         8, // cos_max_pos
         NUM_Q_HEADS,
@@ -241,6 +250,96 @@ fn prefill_prep_matches_closed_form() {
         &pool_f,
         &expected_pool(K_INPUT, &kw, inv_rms(K_INPUT), &layout, layer),
     );
+}
+
+#[test]
+fn paged_decode_prep_matches_closed_form() {
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let qw = q_norm_weights();
+    let kw = k_norm_weights();
+    let layer = 1;
+    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
+    let batch = 2usize;
+    let positions: [i32; 2] = [3, 1];
+    let pages_cat: [i32; 3] = [3, 7, 5];
+    let indptr: [i32; 3] = [0, 2, 3];
+
+    let ones_q = vec![bf16::from_f32(Q_INPUT); Q_DIM * batch];
+    let q = HiddenStates::from_host(ctx, &ones_q, Q_DIM, batch).expect("q H2D");
+    let ones_k = vec![bf16::from_f32(K_INPUT); KV_DIM * batch];
+    let k = HiddenStates::from_host(ctx, &ones_k, KV_DIM, batch).expect("k H2D");
+    let mut q_out = HiddenStates::zeros(ctx, Q_DIM, batch).expect("q_out alloc");
+
+    let (cos_dev, sin_dev) = cos_sin_tables(ctx, 8);
+    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
+    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
+    let pool: CudaSlice<bf16> = ctx.stream.alloc_zeros(POOL_LEN).expect("pool alloc");
+    let pages_d: CudaSlice<i32> = ctx.stream.clone_htod(&pages_cat).expect("pages H2D");
+    let indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
+    let origins_zero_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32; 2]).expect("origins H2D");
+    let positions_d: CudaSlice<i32> = ctx.stream.clone_htod(&positions).expect("positions H2D");
+
+    qk_norm_partial_rope_paged_decode_hd512_into(
+        ctx,
+        &q,
+        &k,
+        &mut q_out,
+        0,
+        &pool,
+        &layout,
+        &qn,
+        &kn,
+        &cos_dev,
+        &sin_dev,
+        layer,
+        &pages_d,
+        &indptr_d,
+        &origins_zero_d,
+        &positions_d,
+        8, // cos_max_pos
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        ROTARY_DIM,
+        EPS,
+    )
+    .expect("paged decode prep launch");
+
+    let qo = q_out.to_host(ctx).expect("q_out D2H");
+    let q_inv = inv_rms(Q_INPUT);
+    let mut q_exp = vec![0.0f32; Q_DIM * batch];
+    for (t, &pos) in positions.iter().enumerate() {
+        for h in 0..NUM_Q_HEADS {
+            for d in 0..HD {
+                q_exp[t * Q_DIM + h * HD + d] = expected_prep(Q_INPUT, &qw, q_inv, d, pos as usize);
+            }
+        }
+    }
+    assert_close(&qo, &q_exp, "paged decode pairing/tail");
+
+    let inv = inv_rms(K_INPUT);
+    let v_val = bf16::from_f32(K_INPUT * inv).to_f32();
+    let mut exp = vec![0.0f32; POOL_LEN];
+    let layer_offset = (layer * layout.layer_stride) as i64;
+    // (row, its page, its position): row 0's window [3, 7] covers pos 3 in
+    // page 7; row 1's window [5] covers pos 1 in page 5.
+    for (page, pos) in [(7i64, 3usize), (5, 1)] {
+        for h in 0..NUM_KV_HEADS {
+            let base = page * PAGE_STRIDE
+                + layer_offset
+                + (pos % PAGE_SIZE) as i64 * KV_DIM as i64
+                + h as i64 * HD as i64;
+            for d in 0..HD {
+                exp[(base + d as i64) as usize] = expected_prep(K_INPUT, &kw, inv, d, pos);
+                exp[(base + layout.kv_block_len as i64 + d as i64) as usize] = v_val;
+            }
+        }
+    }
+    let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
+    let pool_f: Vec<f32> = pool_host.iter().map(|x| x.to_f32()).collect();
+    assert_pool(&pool_f, &exp);
 }
 
 #[test]
@@ -333,6 +432,7 @@ fn rejects_bad_rotary_dim() {
             &q,
             &k,
             &mut q_out,
+            0,
             &pool,
             &layout,
             &qn,
@@ -341,6 +441,7 @@ fn rejects_bad_rotary_dim() {
             &sin_dev,
             0, // layer
             &page_indices,
+            0,
             0, // start_pos
             8, // cos_max_pos
             NUM_Q_HEADS,
@@ -404,6 +505,7 @@ fn prefill_rejects_position_beyond_cos_table() {
         &q,
         &k,
         &mut q_out,
+        0,
         &pool,
         &layout,
         &qn,
@@ -412,6 +514,7 @@ fn prefill_rejects_position_beyond_cos_table() {
         &sin_dev,
         0, // layer
         &page_indices,
+        0,
         1, // start_pos
         4, // cos_max_pos
         NUM_Q_HEADS,
@@ -459,6 +562,7 @@ fn prefill_rejects_undersized_kv_pool() {
             &q,
             &k,
             &mut q_out,
+            0,
             &pool,
             &layout,
             &qn,
@@ -467,6 +571,7 @@ fn prefill_rejects_undersized_kv_pool() {
             &sin_dev,
             0, // layer
             &page_indices,
+            0,
             0, // start_pos
             8, // cos_max_pos
             NUM_Q_HEADS,
@@ -489,4 +594,358 @@ fn prefill_rejects_undersized_kv_pool() {
             );
         }
     }
+}
+
+/// The row-offset suffix contract for the hd512 decode prep: the prefix row
+/// of `q_out` stays untouched, and the suffix outputs and pool writes equal
+/// a zero-offset run over the same two suffix rows.
+#[test]
+fn decode_prep_row_offset_serves_only_the_suffix() {
+    const SENTINEL: f32 = 777.0;
+    const FILLER: f32 = 9.25;
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let qw = q_norm_weights();
+    let kw = k_norm_weights();
+    let layer = 1;
+    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
+    let batch = 2usize;
+    let positions: [i32; 2] = [3, 1];
+    let pages_cat: [i32; 3] = [3, 7, 5];
+    let indptr: [i32; 3] = [0, 2, 3];
+
+    // Per-row distinct suffix bytes shared between the arms; the offset
+    // arm's prefix row is filler the prep must neither read nor overwrite.
+    let suffix = |base: f32, dim: usize| -> Vec<bf16> {
+        (0..batch)
+            .flat_map(|t| vec![bf16::from_f32(base + t as f32); dim])
+            .collect()
+    };
+    let with_prefix = |sfx: &[bf16], dim: usize| -> Vec<bf16> {
+        let mut host = vec![bf16::from_f32(FILLER); dim];
+        host.extend_from_slice(sfx);
+        host
+    };
+    let (qs, ks) = (suffix(Q_INPUT, Q_DIM), suffix(K_INPUT, KV_DIM));
+    let (cos_dev, sin_dev) = cos_sin_tables(ctx, 8);
+    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
+    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
+    let pages_d: CudaSlice<i32> = ctx.stream.clone_htod(&pages_cat).expect("pages H2D");
+    let indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
+    let origins_zero_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32; 2]).expect("origins H2D");
+    let positions_d: CudaSlice<i32> = ctx.stream.clone_htod(&positions).expect("positions H2D");
+
+    let run = |offset: usize, q_host: &[bf16], k_host: &[bf16]| {
+        let rows = offset + batch;
+        let q = HiddenStates::from_host(ctx, q_host, Q_DIM, rows).expect("q H2D");
+        let k = HiddenStates::from_host(ctx, k_host, KV_DIM, rows).expect("k H2D");
+        let sentinel = vec![bf16::from_f32(SENTINEL); Q_DIM * rows];
+        let mut q_out = HiddenStates::from_host(ctx, &sentinel, Q_DIM, rows).expect("q_out H2D");
+        let pool: CudaSlice<bf16> = ctx.stream.alloc_zeros(POOL_LEN).expect("pool alloc");
+        qk_norm_partial_rope_paged_decode_hd512_into(
+            ctx,
+            &q,
+            &k,
+            &mut q_out,
+            offset,
+            &pool,
+            &layout,
+            &qn,
+            &kn,
+            &cos_dev,
+            &sin_dev,
+            layer,
+            &pages_d,
+            &indptr_d,
+            &origins_zero_d,
+            &positions_d,
+            8,
+            NUM_Q_HEADS,
+            NUM_KV_HEADS,
+            ROTARY_DIM,
+            EPS,
+        )
+        .expect("decode prep launch");
+        let out: Vec<u32> = q_out
+            .to_host(ctx)
+            .expect("q_out D2H")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
+        let pool_bits: Vec<u16> = pool_host.iter().map(|x| x.to_bits()).collect();
+        (out, pool_bits)
+    };
+
+    let (out_a, pool_a) = run(1, &with_prefix(&qs, Q_DIM), &with_prefix(&ks, KV_DIM));
+    let (out_b, pool_b) = run(0, &qs, &ks);
+
+    let sentinel_bits = bf16::from_f32(SENTINEL).to_f32().to_bits();
+    assert!(
+        out_a[..Q_DIM].iter().all(|&b| b == sentinel_bits),
+        "the prefix row of q_out must stay untouched"
+    );
+    assert_eq!(
+        out_a[Q_DIM..],
+        out_b[..],
+        "suffix q_out rows must match the zero-offset run bit for bit"
+    );
+    assert_eq!(
+        pool_a, pool_b,
+        "pool writes must match the zero-offset run bit for bit"
+    );
+}
+
+/// The row-offset suffix contract for the split-KV hd512 read: over a pool
+/// both arms share, the offset arm's prefix output row stays untouched and
+/// its suffix rows equal a zero-offset read of the same two requests. Eight
+/// query heads over the single KV head keep the GQA group dispatchable.
+#[test]
+fn split_read_row_offset_serves_only_the_suffix() {
+    const SENTINEL: f32 = 777.0;
+    const FILLER: f32 = 9.25;
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let layer = 1;
+    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
+    let batch = 2usize;
+    let read_heads = 8usize;
+    let read_dim = read_heads * HD;
+
+    // Populate the pool through the zero-offset prep: request 0 writes
+    // position 3 into page 7, request 1 writes position 1 into page 5.
+    let qw = q_norm_weights();
+    let kw = k_norm_weights();
+    let prep_q = HiddenStates::from_host(
+        ctx,
+        &vec![bf16::from_f32(Q_INPUT); Q_DIM * batch],
+        Q_DIM,
+        batch,
+    )
+    .expect("prep q H2D");
+    let prep_k = HiddenStates::from_host(
+        ctx,
+        &vec![bf16::from_f32(K_INPUT); KV_DIM * batch],
+        KV_DIM,
+        batch,
+    )
+    .expect("prep k H2D");
+    let mut prep_q_out = HiddenStates::zeros(ctx, Q_DIM, batch).expect("prep q_out alloc");
+    let (cos_dev, sin_dev) = cos_sin_tables(ctx, 8);
+    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
+    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
+    let pool: CudaSlice<bf16> = ctx.stream.alloc_zeros(POOL_LEN).expect("pool alloc");
+    let positions: [i32; 2] = [3, 1];
+    let pages_cat: [i32; 3] = [3, 7, 5];
+    let indptr: [i32; 3] = [0, 2, 3];
+    let pages_d: CudaSlice<i32> = ctx.stream.clone_htod(&pages_cat).expect("pages H2D");
+    let indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
+    let origins_zero_d: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32; 2]).expect("origins H2D");
+    let positions_d: CudaSlice<i32> = ctx.stream.clone_htod(&positions).expect("positions H2D");
+    qk_norm_partial_rope_paged_decode_hd512_into(
+        ctx,
+        &prep_q,
+        &prep_k,
+        &mut prep_q_out,
+        0,
+        &pool,
+        &layout,
+        &qn,
+        &kn,
+        &cos_dev,
+        &sin_dev,
+        layer,
+        &pages_d,
+        &indptr_d,
+        &origins_zero_d,
+        &positions_d,
+        8,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        ROTARY_DIM,
+        EPS,
+    )
+    .expect("pool populate");
+
+    // Read metadata: kv_len 4 (pages [3, 7], last 2) and kv_len 2
+    // (page [5], last 2); one chunk per request.
+    let last: [i32; 2] = [2, 2];
+    let req: [i32; 2] = [0, 1];
+    let tile: [i32; 2] = [0, 0];
+    let chunk: [i32; 1] = [8];
+    let o_indptr: [i32; 3] = [0, 1, 2];
+    let mask: [u8; 2] = [1, 1];
+    let last_d: CudaSlice<i32> = ctx.stream.clone_htod(&last).expect("last H2D");
+    let req_d: CudaSlice<i32> = ctx.stream.clone_htod(&req).expect("req H2D");
+    let tile_d: CudaSlice<i32> = ctx.stream.clone_htod(&tile).expect("tile H2D");
+    let chunk_d: CudaSlice<i32> = ctx.stream.clone_htod(&chunk).expect("chunk H2D");
+    let o_indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&o_indptr).expect("o_indptr H2D");
+    let mask_d: CudaSlice<u8> = ctx.stream.clone_htod(&mask).expect("mask H2D");
+
+    let suffix_q: Vec<bf16> = (0..batch)
+        .flat_map(|t| vec![bf16::from_f32(0.5 + t as f32); read_dim])
+        .collect();
+    let run = |offset: usize, q_host: &[bf16]| {
+        let rows = offset + batch;
+        let q = HiddenStates::from_host(ctx, q_host, read_dim, rows).expect("read q H2D");
+        let sentinel = vec![bf16::from_f32(SENTINEL); read_dim * rows];
+        let mut out = HiddenStates::from_host(ctx, &sentinel, read_dim, rows).expect("out H2D");
+        let mut tmp_v: CudaSlice<bf16> = ctx.stream.alloc_zeros(2 * read_dim).expect("tmp_v alloc");
+        let mut tmp_s: CudaSlice<f32> =
+            ctx.stream.alloc_zeros(2 * read_heads).expect("tmp_s alloc");
+        let meta =
+            Hd512DecodeMetadata::new(&pages_d, &indptr_d, &last_d, &req_d, &tile_d, &chunk_d);
+        paged_attention_batch_decode_split_kv_hd512_into(
+            ctx,
+            &q,
+            offset,
+            &pool,
+            &layout,
+            layer,
+            &meta,
+            &o_indptr_d,
+            &mask_d,
+            &mut tmp_v,
+            &mut tmp_s,
+            2,
+            &mut out,
+            read_heads,
+            1.0,
+        )
+        .expect("split read launch");
+        let bits: Vec<u32> = out
+            .to_host(ctx)
+            .expect("out D2H")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        bits
+    };
+
+    let mut with_prefix = vec![bf16::from_f32(FILLER); read_dim];
+    with_prefix.extend_from_slice(&suffix_q);
+    let out_a = run(1, &with_prefix);
+    let out_b = run(0, &suffix_q);
+
+    let sentinel_bits = bf16::from_f32(SENTINEL).to_f32().to_bits();
+    assert!(
+        out_a[..read_dim].iter().all(|&b| b == sentinel_bits),
+        "the prefix output row must stay untouched"
+    );
+    assert_eq!(
+        out_a[read_dim..],
+        out_b[..],
+        "suffix outputs must match the zero-offset read bit for bit"
+    );
+}
+
+/// The row and page-table windows of the hd512 prefill prep: the offset arm
+/// carries a filler prefix row and a junk leading table entry the kernel
+/// must neither read nor dereference; its suffix outputs and pool writes
+/// must equal a zero-offset run bit for bit, and the prefix row of `q_out`
+/// stays untouched.
+#[test]
+fn prefill_prep_row_offset_serves_only_the_suffix() {
+    const SENTINEL: f32 = 777.0;
+    const FILLER: f32 = 9.25;
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let qw = q_norm_weights();
+    let kw = k_norm_weights();
+    let layer = 1;
+    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
+    let (cos_dev, sin_dev) = cos_sin_tables(ctx, 8);
+    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
+    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
+
+    // Per-row distinct suffix bytes shared between the arms.
+    let suffix = |base: f32, dim: usize| -> Vec<bf16> {
+        (0..SEQ_LEN)
+            .flat_map(|t| vec![bf16::from_f32(base + t as f32); dim])
+            .collect()
+    };
+    let with_prefix = |sfx: &[bf16], dim: usize| -> Vec<bf16> {
+        let mut host = vec![bf16::from_f32(FILLER); dim];
+        host.extend_from_slice(sfx);
+        host
+    };
+    let (qs, ks) = (suffix(Q_INPUT, Q_DIM), suffix(K_INPUT, KV_DIM));
+
+    let run =
+        |offset: usize, q_host: &[bf16], k_host: &[bf16], table: &[i32], pages_offset: usize| {
+            let rows = offset + SEQ_LEN;
+            let q = HiddenStates::from_host(ctx, q_host, Q_DIM, rows).expect("q H2D");
+            let k = HiddenStates::from_host(ctx, k_host, KV_DIM, rows).expect("k H2D");
+            let sentinel = vec![bf16::from_f32(SENTINEL); Q_DIM * rows];
+            let mut q_out =
+                HiddenStates::from_host(ctx, &sentinel, Q_DIM, rows).expect("q_out H2D");
+            let pool: CudaSlice<bf16> = ctx.stream.alloc_zeros(POOL_LEN).expect("pool alloc");
+            let page_indices: CudaSlice<i32> = ctx.stream.clone_htod(table).expect("pages H2D");
+            qk_norm_partial_rope_paged_prefill_hd512_into(
+                ctx,
+                &q,
+                &k,
+                &mut q_out,
+                offset,
+                &pool,
+                &layout,
+                &qn,
+                &kn,
+                &cos_dev,
+                &sin_dev,
+                layer,
+                &page_indices,
+                pages_offset,
+                START_POS,
+                8,
+                NUM_Q_HEADS,
+                NUM_KV_HEADS,
+                ROTARY_DIM,
+                EPS,
+            )
+            .expect("prefill prep launch");
+            let out: Vec<u32> = q_out
+                .to_host(ctx)
+                .expect("q_out D2H")
+                .iter()
+                .map(|x| x.to_bits())
+                .collect();
+            let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
+            let pool_bits: Vec<u16> = pool_host.iter().map(|x| x.to_bits()).collect();
+            (out, pool_bits)
+        };
+
+    // The junk entry is a valid, unreferenced page: a wrong dereference
+    // lands visibly in the pool comparison instead of out of bounds.
+    let mut junk_table = vec![6i32];
+    junk_table.extend_from_slice(&PAGE_INDICES);
+    let (out_a, pool_a) = run(
+        1,
+        &with_prefix(&qs, Q_DIM),
+        &with_prefix(&ks, KV_DIM),
+        &junk_table,
+        1,
+    );
+    let (out_b, pool_b) = run(0, &qs, &ks, &PAGE_INDICES, 0);
+
+    let sentinel_bits = bf16::from_f32(SENTINEL).to_f32().to_bits();
+    assert!(
+        out_a[..Q_DIM].iter().all(|&b| b == sentinel_bits),
+        "the prefix row of q_out must stay untouched"
+    );
+    assert_eq!(
+        out_a[Q_DIM..],
+        out_b[..],
+        "suffix q_out rows must match the zero-offset run bit for bit"
+    );
+    assert_eq!(
+        pool_a, pool_b,
+        "pool writes must match the zero-offset run bit for bit"
+    );
 }

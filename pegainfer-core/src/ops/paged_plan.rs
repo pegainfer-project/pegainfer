@@ -6,6 +6,68 @@ use cudarc::driver::CudaSlice;
 use crate::kv_pool::KvDesc;
 use crate::tensor::DeviceContext;
 
+/// Host-side CSR for the split-KV decode kernel: padded request/chunk indices,
+/// the per-slot validity mask, and the per-request chunk offsets.
+pub struct SplitKvCsr {
+    pub request_indices: Vec<i32>,
+    pub kv_tile_indices: Vec<i32>,
+    pub block_valid_mask: Vec<u8>,
+    pub o_indptr: Vec<i32>,
+}
+
+/// Build the split-KV CSR for `kv_lens` at a fixed `chunk_size`, padded to
+/// `padded_bs * cap` slots. Errors if a request needs more than `cap` chunks.
+pub fn build_split_kv_csr(
+    chunk_size: usize,
+    cap: usize,
+    kv_lens: &[usize],
+    padded_bs: usize,
+) -> Result<SplitKvCsr> {
+    anyhow::ensure!(chunk_size > 0, "split-KV chunk_size must be > 0");
+    anyhow::ensure!(cap > 0, "split-KV cap must be > 0");
+    anyhow::ensure!(
+        kv_lens.len() <= padded_bs,
+        "kv_lens length {} exceeds padded batch {padded_bs}",
+        kv_lens.len()
+    );
+    let padded_slots = padded_bs * cap;
+    let mut request_indices = Vec::with_capacity(padded_slots);
+    let mut kv_tile_indices = Vec::with_capacity(padded_slots);
+    let mut block_valid_mask = Vec::with_capacity(padded_slots);
+    let mut o_indptr = Vec::with_capacity(padded_bs + 1);
+    o_indptr.push(0);
+
+    for (request_idx, &kv_len) in kv_lens.iter().enumerate() {
+        let chunks = kv_len.div_ceil(chunk_size).max(1);
+        anyhow::ensure!(
+            chunks <= cap,
+            "split-KV chunk count {chunks} exceeds bound {cap} \
+             (kv_len={kv_len}, chunk_size={chunk_size}); context limit misconfigured"
+        );
+        for chunk_idx in 0..chunks {
+            request_indices.push(request_idx as i32);
+            kv_tile_indices.push(chunk_idx as i32);
+            block_valid_mask.push(1);
+        }
+        o_indptr.push(request_indices.len() as i32);
+    }
+    for _ in kv_lens.len()..padded_bs {
+        o_indptr.push(request_indices.len() as i32);
+    }
+    while request_indices.len() < padded_slots {
+        request_indices.push(0);
+        kv_tile_indices.push(0);
+        block_valid_mask.push(0);
+    }
+
+    Ok(SplitKvCsr {
+        request_indices,
+        kv_tile_indices,
+        block_valid_mask,
+        o_indptr,
+    })
+}
+
 pub struct PrefillPagedPlan {
     inner: pegainfer_kernels::ops::PrefillPagedPlan,
 }

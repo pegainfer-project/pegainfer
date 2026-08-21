@@ -807,6 +807,30 @@ fn glm52_sm100f_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<
 fn k3_sm100f_only_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
     glm52_sm100f_only_arch_args(normalized_sms, nvcc)
 }
+
+/// FlashKDA (vendored, third_party/flash-kda) is SM90 TMA + cluster barriers,
+/// portable across the accelerated (`a`) variants — upstream supports
+/// 90a/100a/103a/120a with one code path. Compile the accelerated variant of
+/// every requested target that nvcc accepts; `None` means no target can carry
+/// the kernel and the TU falls back to its NOT_SUPPORTED stub.
+fn k3_flash_kda_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    for sm in normalized_sms {
+        let Some(numeric) = sm_numeric_prefix(sm) else {
+            continue;
+        };
+        if numeric < 90 {
+            continue;
+        }
+        let accelerated = format!("{numeric}a");
+        if !nvcc_accepts_gencode(nvcc, &accelerated, &accelerated) {
+            continue;
+        }
+        args.push("-gencode".to_string());
+        args.push(format!("arch=compute_{accelerated},code=sm_{accelerated}"));
+    }
+    (!args.is_empty()).then_some(args)
+}
 // --- end k3 ---------------------------------------------------------------
 
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1673,13 +1697,8 @@ const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
          int, int, int, int",
     ),
     (
-        "k3_mla_attn_batched",
-        "const void*, const void*, const void*, const int*, const void*, void*, \
-         int, int, int, int, int",
-    ),
-    (
-        "k3_router_topk_batched",
-        "const float*, const float*, const void*, int*, float*, int, int, int",
+        "k3_o_norm_gate_batched",
+        "const void*, const void*, const float*, void*, int, int, int",
     ),
     (
         "k3_attnres_scores_batched",
@@ -2192,13 +2211,90 @@ fn main() {
                 );
                 nvcc_args.extend(arch_args.clone());
             }
-        } else if stem == "k3_mega_moe_sm100" {
+        } else if stem == "k3_mega_moe_sm100"
+            || stem == "k3_mega_moe_sm100_wide224"
+            || stem == "k3_mega_moe_sm100_wide896"
+        {
             if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
                 nvcc_args.extend(sm100f_args);
                 nvcc_args.push("-DK3_MEGA_MOE_SM100F".to_string());
             } else {
                 println!(
                     "cargo:warning=No sm_100f target; K3 MegaMoE {stem} kernels compile as NOT_SUPPORTED stubs"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
+        } else if stem == "k3_flash_kda" {
+            if let Some(kda_args) = k3_flash_kda_arch_args(&nvcc_sm_targets, &nvcc) {
+                let flash_kda = root.join("third_party/flash-kda/csrc");
+                nvcc_args.extend(kda_args);
+                // Upstream setup.py flags (torch adds -std=c++17); fast_math
+                // is part of the configuration vLLM ships, keep it.
+                nvcc_args.extend(
+                    [
+                        "-DK3_FLASH_KDA_SM90A",
+                        "--std=c++17",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                        "--use_fast_math",
+                    ]
+                    .map(str::to_string),
+                );
+                nvcc_args.extend([
+                    "-I".to_string(),
+                    flash_kda.to_string_lossy().to_string(),
+                    "-I".to_string(),
+                    flash_kda.join("smxx").to_string_lossy().to_string(),
+                    "-I".to_string(),
+                    flashinfer.cutlass.to_string_lossy().to_string(),
+                ]);
+            } else {
+                println!(
+                    "cargo:warning=No accelerated SM target; K3 FlashKDA {stem} compiles as a NOT_SUPPORTED stub"
+                );
+                nvcc_args.extend(arch_args.clone());
+            }
+        } else if stem == "k3_flash_mla_prefill" {
+            // FlashMLA's SM100 dense FMHA forward rides in single-TU like the
+            // sparse decode shim; the gather/expand helpers in the same file
+            // compile either way.
+            if let Some(sm100f_args) = k3_sm100f_only_arch_args(&nvcc_sm_targets, &nvcc) {
+                let flashmla = root.join("third_party/FlashMLA/csrc");
+                nvcc_args.extend(sm100f_args);
+                nvcc_args.extend(
+                    [
+                        "-DK3_FLASH_MLA_SM100F",
+                        "--std=c++20",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                    ]
+                    .map(str::to_string),
+                );
+                nvcc_args.extend([
+                    "-I".to_string(),
+                    flashmla
+                        .join("sm100/prefill/dense")
+                        .to_string_lossy()
+                        .to_string(),
+                    "-I".to_string(),
+                    flashmla
+                        .join("cutlass/include")
+                        .to_string_lossy()
+                        .to_string(),
+                    "-I".to_string(),
+                    flashmla
+                        .join("cutlass/tools/util/include")
+                        .to_string_lossy()
+                        .to_string(),
+                    "-I".to_string(),
+                    flashmla
+                        .join("kerutils/include")
+                        .to_string_lossy()
+                        .to_string(),
+                ]);
+            } else {
+                println!(
+                    "cargo:warning=No sm_100f target; K3 FlashMLA prefill {stem} FMHA compiles as a NOT_SUPPORTED stub"
                 );
                 nvcc_args.extend(arch_args.clone());
             }
@@ -2454,6 +2550,17 @@ fn main() {
             &sm_targets,
             &nvcc,
         ));
+        // The vendored FlashKDA sources ride into csrc/k3/k3_flash_kda.cu by
+        // include; csrc rerun tracking does not see them.
+        for vendored in [
+            "third_party/flash-kda/csrc/fwd.h",
+            "third_party/flash-kda/csrc/smxx/utils.cuh",
+            "third_party/flash-kda/csrc/smxx/fwd_kernel1.cuh",
+            "third_party/flash-kda/csrc/smxx/fwd_kernel2.cuh",
+            "third_party/flash-kda/csrc/smxx/fwd_launch.cu",
+        ] {
+            println!("cargo:rerun-if-changed={}", root.join(vendored).display());
+        }
     } else {
         println!(
             "cargo:warning=K3 TileLang kernels disabled; enable the pegainfer-kernels `k3` feature to build them"

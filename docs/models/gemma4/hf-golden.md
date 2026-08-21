@@ -1,13 +1,15 @@
-# Gemma 4 HF golden fixture
+# Gemma 4 HF golden fixtures
 
-**TL;DR:** `test_data/gemma4-12b-hf-golden.safetensors` is the Hugging Face reference for Gemma 4
-12B — layer-boundary activations at both ends of both layer types, plus top-64 logprobs, over a
-single-token, a nine-token and a 1024-token (exactly the sliding window) case. Nothing consumes it
-yet; it exists so the layer and forward comparisons have something to compare against.
+**TL;DR:** three Hugging Face references for Gemma 4 12B. `test_data/gemma4-12b-hf-golden.safetensors`
+covers the window and everything below it — layer-boundary activations at both ends of both layer
+types, plus top-64 logprobs, over a single-token, a nine-token and a 1024-token case.
+`test_data/gemma4-12b-hf-window-golden.safetensors` goes past it, recorded under both attention
+backends. `test_data/gemma4-12b-hf-longctx-golden.safetensors` takes the same teacher-forced
+comparison to 16384 and 32768 tokens for the raised serving ceiling.
 
 Last touched: 2026-08.
 
-## What the fixture contains
+## What the base fixture contains
 
 | case | tokens | probes | what it answers |
 | --- | --- | --- | --- |
@@ -69,17 +71,66 @@ after both residual adds — so that tensor applies to the layer's output, not t
 **Logits are softcapped at 30.0** via `tanh(logits / 30) * 30`, after the LM head. The dumper
 refuses to write a fixture whose logits exceed the cap.
 
+## The window-crossing fixture
+
+`gemma4-12b-hf-window-golden.safetensors` answers a different question: whether attention still
+agrees with the reference once the oldest keys have aged out of the window. Four prompt lengths —
+1023, 1024, 1025 and 4096 — each followed by eight teacher-forced continuation tokens from the
+corpus, with the top-64 ids and logprobs recorded at the last prompt position and after each forced
+token.
+
+Both sdpa and eager are recorded because a token-for-token reference is not reachable at this
+depth: the per-step top1-top2 margin collapses once the context passes ~1000 tokens, and the two
+backends then continue the same prompt in different directions. The pair is what gives the gate a
+floor — the gap the reference already has with itself.
+
+Per case: `{case}_prompt` and `{case}_teacher` (int32), plus `{case}_sdpa_ids` /
+`{case}_sdpa_logprobs` and `{case}_eager_ids` / `{case}_eager_logprobs` (`[9, 64]`, int32 and
+fp32). The name follows `qwen35-*-hf-long-golden`: one model line, a second context régime.
+
+## The long-context fixture
+
+`gemma4-12b-hf-longctx-golden.safetensors` extends the window fixture's question to the raised
+serving ceiling: 16384- and 32768-token prompts from the same corpus, each followed by eight
+teacher-forced continuation tokens, with the top-64 ids and logprobs recorded at the last prompt
+position and after each forced token — proportional RoPE and global attention far past the window
+fixture's 4096.
+
+At these depths eager does not fit next to the reference tower on the dump device, so both cases
+record sdpa alone and the manifest names them in `eager_skipped`. A case without its own
+dual-backend pair borrows the window fixture's deepest dual case (`w4096`) for its tolerance and
+top-1 floor — the widest measured agreement bound available. That loan is only meaningful if both
+fixtures were dumped under the same reference release, so the gate requires the two manifests to
+name the same Transformers version, on top of the same checkpoint revision. The gate also runs the
+widest case a second time in 2048-token chunks, the raised ceiling's production prefill shape.
+
+Per case: `{case}_prompt` and `{case}_teacher` (int32), plus `{case}_sdpa_ids` /
+`{case}_sdpa_logprobs` (`[9, 64]`, int32 and fp32).
+
 ## Regenerating
 
 ```bash
 python tools/accuracy/dump_gemma4_hf_golden.py <checkpoint-dir> \
     test_data/gemma4-12b-hf-golden.safetensors \
     --source-repo google/gemma-4-12B-it --revision 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+
+python tools/accuracy/dump_gemma4_window_golden.py <checkpoint-dir> \
+    test_data/gemma4-12b-hf-window-golden.safetensors \
+    --source-repo google/gemma-4-12B-it --revision 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+
+python tools/accuracy/dump_gemma4_longctx_golden.py <checkpoint-dir> \
+    test_data/gemma4-12b-hf-longctx-golden.safetensors \
+    --source-repo google/gemma-4-12B-it --revision 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
 ```
 
 Two runs against the same checkpoint produce the same bytes, so regeneration is checked with
-`sha256sum` alone. The current fixture is
-`c30a338d499512e6f0505bd12b184ebb5af9d7536f0b7fc9ea2bdfdb18b1a46d`.
+`sha256sum` alone. The current fixtures are
+
+| file | sha256 |
+| --- | --- |
+| `gemma4-12b-hf-golden.safetensors` | `c30a338d499512e6f0505bd12b184ebb5af9d7536f0b7fc9ea2bdfdb18b1a46d` |
+| `gemma4-12b-hf-window-golden.safetensors` | `b72edd51a5977592f3d4b637152aaf794a33e356c9599ab14035dacbb9574c0e` |
+| `gemma4-12b-hf-longctx-golden.safetensors` | `1c8442a51913f858af6bc7205bd85c5b67db91373d7bdbdc034bf1ce2e86889d` |
 
 That only holds because the metadata is a **single sorted-JSON key**. safetensors serializes its
 metadata map in randomized order, so a multi-key block makes two runs differ byte for byte while
@@ -87,9 +138,13 @@ carrying identical content — which is how a fixture that *is* reproducible can
 is not.
 
 Provenance is passed in, not inferred: a checkpoint directory carries no record of where it came
-from. The metadata also records sha256 of `config.json`, `generation_config.json` and the
+from. The base fixture's metadata records sha256 of `config.json`, `generation_config.json` and the
 safetensors *header* — the header pins the tensor layout without reading 22 GiB of payload, the
-revision pins the payload. **Transformers 5.11.0** is verified to load `gemma4_unified`; the
+revision pins the payload. The window and long-context fixtures record the source repo, the
+revision and the Transformers release: their gates validate the running checkpoint against the base
+fixture's hashes, then require every fixture to name the same revision, so one set of hashes covers
+all three. The long-context gate additionally requires its Transformers release to match the window
+fixture's, because it borrows that fixture's floor. **Transformers 5.11.0** is verified to load `gemma4_unified`; the
 checkpoint declares `5.10.0.dev0`, a development build that was never released, so the pin is the
 release that was tested rather than a guess at what that build became.
 

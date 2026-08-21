@@ -213,7 +213,7 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        // Closing the intake lets the scheduler drain and exit.
+        // Closing the submission channel lets the scheduler drain and exit.
         drop(self.handle.take());
         if let Some(join) = self.scheduler_join.take() {
             let _ = join.join();

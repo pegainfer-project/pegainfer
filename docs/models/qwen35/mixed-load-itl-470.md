@@ -86,7 +86,7 @@ compared against a decode-only **baseline**.
 
 | Gate | Rule |
 |---|---|
-| **valid** | ≥1 `ITL_STEP` with `prefill_tok>0` **and** `decode_n == bg_concurrency` (the injection actually overlapped a full background batch) |
+| **valid** | ≥1 `ITL_STEP` with `prefill_tok>0` **and** `decode_n == bg_concurrency` (the injection intersected a full background batch; `plan=overlap_*` is concurrent work, not a serial freeze) |
 | **negative control** | `max_batch = bg = 4` must be **invalid** — proves the old artifact reproduces |
 | **cross ON/OFF comparison** | compare only `mixed_itl.all` p99/max + `ITL_STEP` per-step stall; never compare the window-attributed stall buckets across configs |
 | **saturation** | `qps·prefill_s ≳ 1` and/or a clearly lifted mixed **p50** ⇒ throughput wall, not a tail |

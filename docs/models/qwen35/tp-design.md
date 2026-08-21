@@ -1,8 +1,8 @@
 # Qwen3.5 Tensor Parallelism Design
 
-> **TL;DR:** Qwen3.5 tensor parallelism should reuse Qwen3's controller/worker TP runtime and stay degree-parametric. Phase 1 is correctness-first eager dense TP: validate `TP=2` first, fail closed on indivisible degrees and `TP > 1` CUDA Graph, shard dense full-attention/MLP, and keep linear-attention/GDR state replicated per rank before tackling sharded GDR state.
+> **TL;DR:** Qwen3.5 TP Phase 2 is two separately delivered correctness milestones: P2a adds eager `RunUnifiedStep` with a shared ordered `RequestId` plan while retaining Phase 1 replicated GDR; P2b shards the head-indexed linear-attention/GDR surface and adds only the hidden all-reduce after local `out_proj`.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-08
 
 ## Goal
 
@@ -18,7 +18,7 @@ Reuse the Qwen3 TP shape:
 - `RequestId` request identity
 - coarse-grained prefill/decode/unified/drop step protocol
 - rank-local worker-owned model state
-- rank-local CUDA context, cuBLAS, graph, and NCCL resources
+- rank-local CUDA context, cuBLAS, and NCCL resources
 - hidden all-reduce after row-parallel projections
 - replicated embedding/lm_head as the first-pass simplification
 
@@ -44,20 +44,22 @@ These decisions are settled before implementation starts.
 - Each rank worker owns and mutates its own full linear-attention conv state and GDR recurrent state copy.
 - The scheduler owns logical request lifecycle and logical KV/page lifecycle only.
 - Full-attention KV is physically rank-local and sharded by local KV heads, but one logical request/page assignment is mirrored across all ranks.
-- `DropRequest`, finish cleanup, cancellation cleanup, and slot reuse must release or reset the corresponding rank-local KV/recurrent/conv state on every rank.
+- `DropRequest`, finish cleanup, cancellation cleanup, and client disconnect must release or reset the corresponding rank-local KV/recurrent/conv state on every rank by `RequestId`.
 - Qwen3.5 gated `q_proj` slicing is an explicit acceptance gate: every rank must receive both q rows and gate rows for its local query heads.
 - MLP gate/up row sharding and down column sharding require explicit reconstruction or layout tests.
 
-## Still Open / Future Discussion
+## Phase 2 Delivery Boundaries
 
-These topics should not block Phase 1 eager dense TP, but they remain design work before any later implementation.
+P2a and P2b are separate implementation series. P2a must complete its protocol and lifecycle gates before P2b changes loader, kernel, or state shapes. This keeps worker-protocol failures distinguishable from local-head loader/kernel/state failures.
 
-- TP CUDA Graph support: graph state ownership per rank, synchronized capture/replay order, NCCL capture behavior, graph padding slots, and recurrent/conv D2D slot compaction under capture.
-- Sharded linear-attention/GDR execution: local GDR AOT kernel shapes, local recurrent-state layout, local conv state layout, and Phase 2 weight slicing.
-- TP-aware prefix cache or recurrent-state snapshots.
-- Vocab-parallel embedding or `lm_head`.
+The following are separate follow-up RFCs, not Phase 2 deliverables:
+
+- TP CUDA Graph capture/replay, including graph slots, padding, synchronized capture, and recurrent/conv D2D compaction.
+- TP-aware prefix caching and recurrent-state snapshots.
+- Vocabulary-parallel embedding or `lm_head`.
 - Multi-node TP, data parallelism, and pipeline parallelism.
-- Performance optimization claims. Phase 1 is a correctness/runtime milestone, not a throughput milestone.
+
+Phase 2 is a correctness and per-rank HBM-reduction milestone. It makes no speedup promise: P2b adds one hidden all-reduce in each of the 24 linear-attention layers. Report a matched Phase 1 TP2 versus P2b TP2 A/B before making any performance claim.
 
 ## Why Dense First, GDR Second
 
@@ -65,7 +67,7 @@ Qwen3.5 has two separable TP problems.
 
 The dense part is already proven by Qwen3: full-attention head sharding, local KV heads, MLP intermediate sharding, all-reduce after row-parallel projections, and worker-thread CUDA/NCCL execution.
 
-The linear-attention part is Qwen3.5-specific: conv state and GDR recurrent state are long-lived request state, current GDR AOT kernels are built for the global value-head shape, and slot compaction / graph padding / `DropRequest` must all preserve rank-local recurrent state. If dense TP and GDR TP land together, failures are hard to attribute. Phase 1 narrows correctness debugging to runtime + dense sharding; Phase 2 then isolates the GDR/recurrent contract.
+The linear-attention part is Qwen3.5-specific: conv state and GDR recurrent state are long-lived request state, current GDR AOT kernels are built for the global value-head shape, and `DropRequest` cleanup plus re-admission must preserve rank-local recurrent-state boundaries. If dense TP and GDR TP land together, failures are hard to attribute. Phase 1 narrows correctness debugging to runtime + dense sharding; Phase 2 then isolates the GDR/recurrent contract. CUDA Graph slot, padding, and compaction semantics remain a separate follow-up RFC.
 
 ## Architecture Summary
 
@@ -166,7 +168,7 @@ State ownership:
 - rank workers own rank-local model shards, rank-local physical KV buffers, rank-local decode buffers, and rank-local recurrent/conv state
 - rank 0 is not special for state mutation; it follows the same worker command protocol as other ranks
 - non-primary workers may return acknowledgement or step failure only, while the primary worker returns artifacts for scheduler-side result resolution
-- all workers must observe the same ordered `RunPrefillStep`, `RunDecodeStep`, `RunUnifiedStep`, `DropRequest`, and `Shutdown` commands
+- all workers must observe the same ordered `RunPrefillChunks`, `RunDecodeStep`, `DropRequest`, and `Shutdown` commands
 
 CUDA Graph:
 
@@ -180,35 +182,71 @@ Validation scope:
 - Qwen3.5 HF logits gate
 - Qwen3.5 scheduler e2e
 - long prompt / chunked prefill path
-- slot-compaction replay
-- finish/drop followed by slot reuse without stale recurrent or conv state
+- finish, explicit drop, cancellation, and client-disconnect cleanup by `RequestId`
+- subsequent admission with a new `RequestId` observes no stale KV, recurrent, or conv state
 - gated `q_proj` head-local q/gate slicing test
 - MLP gate/up shard and down shard reconstruction/layout test
 - basic TP2 serving smoke
 - startup fails closed for unsupported or indivisible degrees
 - startup fails closed for `tp_size > 1` with CUDA Graph enabled
 
-## Phase 2: Sharded Linear Attention / GDR
+## P2a: Eager TP Unified Execution
 
-Phase 2 converts linear attention from replicated execution to true TP execution.
+P2a implements eager TP `RunUnifiedStep` while retaining the Phase 1 replicated linear-attention/GDR weights, kernels, conv state, recurrent state, and scratch shapes.
 
-Shard:
+Every rank receives the same canonical `UnifiedPlan`: ordered prefill and decode items, each carrying a `RequestId` and the request-local execution inputs needed for that row. The order is the collective-order contract; every rank executes the actual plan rows in that order. P2a does not introduce CUDA Graph padded-slot semantics, D2D state movement, or a cross-rank slot-compaction protocol.
 
-- `in_proj_qkv`, `in_proj_z`, `in_proj_b`, `in_proj_a`
-- `dt_bias`, `A_log`
-- conv state
-- GDR recurrent state
-- linear-attention `out_proj`
+State and artifacts are keyed by `RequestId`:
 
-Execution:
+- worker-local KV, conv, and recurrent state is found, created, promoted, and released by `RequestId`;
+- the primary worker returns prefill and decode artifacts carrying their `RequestId`;
+- the scheduler resolves artifacts by ID and rejects unknown, duplicate, or missing results instead of relying on returned row position;
+- finish, explicit drop, cancellation, and client disconnect broadcast the same `DropRequest(RequestId)` lifecycle command to every rank;
+- each worker returns `DropAck { existed: bool }`, where `existed` reports whether that rank actually found and removed the request state;
+- every controller-side drop carries a `DropExpectation::{MustBeAbsent, MustExist}` derived from scheduler-owned lifecycle state, not from a separate `worker_state_materialized` flag;
+- cancellation before the first successful prefill dispatch requires `MustBeAbsent` and an exact-rank all-false `DropAck` set; partially prefetched, active, disconnected, and completion-candidate requests require `MustExist` and an exact-rank all-true set;
+- uniformity alone is insufficient. All-false for `MustExist`, all-true for `MustBeAbsent`, or mixed true/false values prove lifecycle divergence and poison the whole TP executor even if the drop leaves every rank absent. Dispatch failure, a missing acknowledgement, or a rank-local drop failure is likewise fatal; the scheduler must not warn and continue promotion or serving.
 
-- each rank computes local q/k/v/z/b/a
-- each rank updates only local conv state and local GDR recurrent state
-- each rank runs local gated RMSNorm/output-gate work
-- each rank runs local `out_proj`
-- all-reduce happens after `out_proj`
+The scheduler allocates a TP `RequestId` before the first prefill command materializes worker state, so cancellation in that interval legitimately requires `MustBeAbsent`; every successfully prefetched or active request requires `MustExist`. If execution mutates state and then fails, the executor is already poisoned and no healthy-path drop is attempted. Worker replies prove cross-rank existence, while scheduler lifecycle determines which value is valid.
 
-Never all-reduce GDR recurrent state or conv state. Their ownership is rank-local and request-local.
+Successful request completion has a fail-closed commit boundary. After computing a terminal artifact, the scheduler keeps the request unresolved in a local completion candidate and withholds its user-visible terminal events. An EOS candidate buffers only `Finished`; a length-limited candidate buffers the final `Token` followed by `Finished`; completion on the first prefill token, including `max_tokens <= 1`, follows the same rule. A completion candidate is materialized, so the scheduler first requires a valid `MustExist` all-rank all-true `DropAck` contract, then removes the logical request from scheduler state, and only then publishes the buffered events in order. A client that observes `Finished` can therefore rely on consistent rank-local cleanup acknowledgement for that request.
+
+If completion drop fails, the scheduler publishes neither the buffered final `Token` nor `Finished`, poisons the replica, and keeps the candidate unresolved for the complete terminal error fan-out. The client may already have received earlier streamed tokens, so this boundary makes only successful termination atomic; it does not make the complete streamed response transactional. The completion candidate is a scheduler-local prepare/commit abstraction, not a distributed `ValidateUnified -> ExecuteUnified` protocol. A process-level fail-stop may still prevent both the acknowledgement and the terminal `Error` from being delivered.
+
+Controller response collection validates an exact rank set, not only a message count. Every response rank must be in `0..world_size` and appear exactly once. Ping requires `Ack` from every rank; drop requires a `DropAck` from every rank whose existence values match the controller's `DropExpectation`; prefill, decode, and unified execution require exactly one matching typed result from rank 0 and `Ack` from every non-primary rank. Missing, duplicate, out-of-range, wrong-variant, mixed drop-existence, or uniformly unexpected drop-existence responses are protocol failures. If workers may already have mutated state, any such response-set failure poisons the complete TP replica.
+
+Cancellation cleanup is a scheduler-tick boundary, not a late planning cleanup. At the start of each tick the scheduler first merges deferred work with newly received submissions, then prunes every already-closed sink from active, prefilling, and pending work. Healthy active/prefilling TP removals complete their all-rank `DropRequest` before the scheduler publishes load or computes admission capacity; pending requests have no worker state and are discarded directly. The required order is `drain -> prune -> publish load -> admission -> plan`. This keeps cancelled requests out of running/waiting metrics, decode slots, future-KV reservation, and the current tick's prefill budget. A cancellation racing after the prune check is still retired by the existing token-send failure path.
+
+Artifact alignment follows the ordered plan rather than returned row position. Prefill expects artifacts only for `finish_prefill == true` IDs and preserves explicit absence for non-final rows; decode expects one artifact for every row. Unknown, duplicate, or missing IDs are fatal after execution. This TP adapter contract does not require the TP1/single-GPU logits-and-sampling path to adopt sparse artifacts.
+
+P2a separates recoverable plan rejection from fatal replica failure. Controller-provable structural errors reject before dispatch without poisoning. Worker-local existence, phase, materialization, or capacity mismatches are not protected by an all-rank validation barrier and are therefore replica-fatal, as is any CUDA/NCCL, response-set, artifact, or lifecycle failure after execution is released.
+
+When fatal failure returns control, the scheduler closes and drains submissions, emits exactly one terminal `Error` for every unresolved stable or tick-local request, publishes an idle load snapshot, exits, and begins whole-executor teardown. Exactly-once fan-out comes from consuming mutually exclusive request owners; pre-admission requests do not yet have a TP `RequestId`, so that ID is not a global deduplication key. The scheduler does not retry per-request drops or claim rank-local cleanup after poison. Collective or teardown timeout remains process-level fail-stop, where client fan-out cannot be guaranteed; rollback, communicator recovery, and in-place restart remain out of scope.
+
+The worker's internal request table may remove and reinsert entries as an implementation detail, but that is not CUDA Graph slot semantics and must not require state copying between request identities.
+
+The fixed 16-device Triton AOT handle table remains. Before model loading or worker launch, TP startup validates every requested logical CUDA ordinal against that supported range; dynamic handle allocation is not a P2a prerequisite. `tp_size > 1` with CUDA Graph requested continues to fail closed.
+
+P2a acceptance retains the Phase 1 TP1/TP2 gates and adds TP2 mixed chunked-prefill/decode, cleanup and re-admission, strict artifact-ID checks, and fatal-path coverage. Drop tests must accept only `MustBeAbsent`/all-false and `MustExist`/all-true exact-rank sets, rejecting mixed or uniformly unexpected existence and malformed rank/reply sets. Completion tests must withhold EOS, length, and immediate-prefill success events until `MustExist` cleanup succeeds; controller-rejected plans must preserve executor health, while worker-local or post-execution failures must stop the scheduler and fan out terminal errors to every accepted unresolved request. All work remains eager and uses the replicated GDR path.
+
+Lifecycle observability, cancellation ordering, fail-closed cleanup, and unified execution remain separately reviewable implementation boundaries. Cancellation ordering fixes a pre-existing TP1 scheduler issue but stays in P2a because unified planning depends on the pruned state.
+
+## P2b: Local-Head Linear Attention / GDR
+
+P2b converts the 24 linear-attention layers from replicated execution to true TP execution. It additionally requires `linear_num_key_heads % tp == 0` and `linear_num_value_heads % tp == 0`; unsupported degrees and unsupported local kernel shapes fail before model loading.
+
+Shard every head-indexed linear-attention/GDR surface by the local key/value-head ranges:
+
+- `in_proj_qkv`, preserving local q/k/value channel layout;
+- `in_proj_z`, `in_proj_b`, `in_proj_a`, `conv1d_weight`, `dt_bias`, and `A_log`;
+- `out_proj` input columns;
+- conv state, recurrent state, GDR scratch, and intermediate buffers.
+
+The head-dimension `norm_weight` remains deliberately replicated because it is shared by every local value head; it is not a head-indexed state or collective surface. Embedding and tied `lm_head` also remain replicated.
+
+Each rank runs local projections, convolution, GDR prefill/decode kernels, gated RMSNorm/output-gate work, and local `out_proj` against local dimensions. The only linear-attention collective is the hidden all-reduce after `out_proj`. Conv state and GDR recurrent state are request-local and rank-local for their full lifetime and are never all-reduced or centralized.
+
+P2b acceptance requires loader reconstruction/layout tests, local AOT-kernel shape validation, rank-local allocation checks, Phase 1 and P2a regression gates, short and long TP2 HF replay, cleanup without stale request state, and a matched Phase 1 TP2 versus P2b TP2 HBM/latency/throughput report. The report is evidence, not a speedup threshold.
 
 ### vLLM Reference
 
@@ -221,21 +259,21 @@ Use vLLM's `Qwen3NextForCausalLM` / `QwenGatedDeltaNetAttention` as the referenc
 - b/a projections are local-value-head aware; some quantized paths may replicate small projections and slice locally
 - GDR prefill/decode kernels consume local head/state shapes
 
-PegaInfer-specific work remains: worker-owned rank-local recurrent state, `RequestId` lifecycle, local-state slot compaction, `DropRequest` cleanup, and fail-closed kernel-shape validation.
+PegaInfer-specific work remains: worker-owned rank-local recurrent state, `RequestId` lifecycle, request-state removal and re-admission, `DropRequest` cleanup, and fail-closed kernel-shape validation.
 
 Validation scope:
 
 - Phase 1 gates still pass
 - long HF logits replay under the validated degree
-- slot compaction replay
-- recurrent-state cleanup on finish/drop
-- no stale local recurrent state after slot reuse
+- request-state cleanup and re-admission replay
+- recurrent-state cleanup on finish/drop/cancellation
+- no stale local recurrent state after a new `RequestId` is admitted
 
 ## References
 
 - `docs/models/qwen3/tp-design.md`
-- `pegainfer-qwen3-4b/src/config.rs`
-- `pegainfer-qwen3-4b/src/executor.rs`
+- `pegainfer-qwen3/src/config.rs`
+- `pegainfer-qwen3/src/executor.rs`
 - `pegainfer-qwen35/src/config.rs`
 - `pegainfer-qwen35/src/weights.rs`
 - `pegainfer-qwen35/src/recurrent_state.rs`

@@ -51,10 +51,10 @@ async fn main() -> Result<()> {
         args.tpot_ms,
         args.fallback_token_id,
     )?;
-    let handle = start_engine(config);
+    let engine = start_engine(&config);
 
     pegainfer_frontend::vllm::serve(
-        std::future::ready(Ok(handle.into())),
+        std::future::ready(Ok(engine.into())),
         Path::new(&args.model_id),
         Vec::new(),
         args.port,

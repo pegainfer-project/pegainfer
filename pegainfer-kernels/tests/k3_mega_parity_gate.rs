@@ -28,6 +28,7 @@ use cudarc::driver::DevicePtr;
 use half::bf16;
 use pegainfer_kernels::ops::K3MegaActivation;
 use pegainfer_kernels::ops::K3MegaShape;
+use pegainfer_kernels::ops::k3_mega_max_tokens_per_rank;
 use pegainfer_kernels::ops::k3_mega_moe_launch;
 use pegainfer_kernels::ops::k3_mega_prepare_l1_weights_launch;
 use pegainfer_kernels::ops::k3_mega_prepare_sf_launch;
@@ -40,7 +41,6 @@ const INTER: usize = 3072;
 const EXPERTS: usize = 224;
 const TOPK: usize = 16;
 const TOKENS: usize = 64;
-const MAX_TOKENS: usize = 384;
 /// Experts whose transformed weights the fixture carries for the
 /// localise-the-failure half of the gate.
 const TRANSFORM_EXPERTS: usize = 4;
@@ -264,7 +264,10 @@ fn mega_moe_matches_the_python_kernel_bit_for_bit() {
     }
 
     // --- symmetric buffer -------------------------------------------------
-    let layout = k3_mega_symm_buffer_layout(1, EXPERTS, MAX_TOKENS, TOPK, HIDDEN, INTER, num_sms)
+    // The slab takes the AOT protocol maximum, whatever the fixture's live
+    // token count is — the launch rejects any other value.
+    let max_tokens = k3_mega_max_tokens_per_rank();
+    let layout = k3_mega_symm_buffer_layout(1, EXPERTS, max_tokens, TOPK, HIDDEN, INTER, num_sms)
         .expect("symmetric-buffer layout");
     let mut symm = ctx
         .stream
@@ -284,7 +287,7 @@ fn mega_moe_matches_the_python_kernel_bit_for_bit() {
 
     let shape = K3MegaShape {
         num_tokens: TOKENS,
-        num_max_tokens_per_rank: MAX_TOKENS,
+        num_max_tokens_per_rank: max_tokens,
         num_experts: EXPERTS,
         num_topk: TOPK,
         hidden: HIDDEN,

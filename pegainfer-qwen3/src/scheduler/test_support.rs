@@ -98,7 +98,7 @@ impl FakeExecutor {
         }
         PrefillRequestResult {
             request_id: req.request_id,
-            first_token: 100 + req.request_id.get() as u32,
+            first_token: 100 + req.request_id.raw() as u32,
             first_token_logprob: None,
             prompt_logprobs: None,
             cached_tokens: 0,
@@ -155,7 +155,7 @@ impl ModelExecutor for FakeExecutor {
             self.available_blocks += blocks_needed(tokens, self.block_size);
         }
         self.prefill_positions.remove(&request_id);
-        self.dropped.lock().unwrap().push(request_id.get());
+        self.dropped.lock().unwrap().push(request_id.raw());
         Ok(())
     }
 
@@ -166,7 +166,7 @@ impl ModelExecutor for FakeExecutor {
         _lora_adapter: Option<&str>,
         _reserve_floor: usize,
     ) -> bool {
-        self.prefetch_offers.lock().unwrap().push(request_id.get());
+        self.prefetch_offers.lock().unwrap().push(request_id.raw());
         false
     }
 
@@ -223,7 +223,7 @@ impl ModelExecutor for FakeExecutor {
                 .iter()
                 .map(|req| DecodeRequestResult {
                     request_id: req.request_id,
-                    token: 200 + req.request_id.get() as u32,
+                    token: 200 + req.request_id.raw() as u32,
                     logprob: None,
                 })
                 .collect(),
@@ -254,7 +254,7 @@ impl ModelExecutor for FakeExecutor {
                 .iter()
                 .map(|req| DecodeRequestResult {
                     request_id: req.request_id,
-                    token: 200 + req.request_id.get() as u32,
+                    token: 200 + req.request_id.raw() as u32,
                     logprob: None,
                 })
                 .collect(),

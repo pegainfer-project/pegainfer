@@ -6,21 +6,20 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use pegainfer_frontend::engine::LoadSnapshot;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::start_engine;
+use pegainfer_sim::start_engine_with_partitions;
 use reqwest::Client;
 use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_NAME: &str = "pegainfer-sim-e2e";
 const METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-metrics";
-const CLOSED_FEED_MODEL_NAME: &str = "pegainfer-sim-e2e-closed-feed";
+const SLOW_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-slow-metrics";
 const SERVER_START_ATTEMPTS: usize = 5;
 
 struct SimServer {
@@ -28,7 +27,6 @@ struct SimServer {
     model_name: String,
     shutdown: CancellationToken,
     task: JoinHandle<Result<()>>,
-    load_txs: Vec<watch::Sender<LoadSnapshot>>,
     _model_dir: TempDir,
 }
 
@@ -38,42 +36,50 @@ impl SimServer {
     }
 
     async fn spawn_partitioned() -> Result<Self> {
-        Self::spawn_with_model_dir_and_engine_count(
+        Self::spawn_with_config(
             model_dir_with_minimal_metadata()?,
             2,
             METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?,
         )
         .await
     }
 
-    async fn spawn_with_closed_load_feed() -> Result<Self> {
-        Self::spawn_with_model_dir_and_engine_count(
+    async fn spawn_slow() -> Result<Self> {
+        Self::spawn_with_config(
             model_dir_with_minimal_metadata()?,
-            2,
-            CLOSED_FEED_MODEL_NAME,
+            1,
+            SLOW_METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 80.0, 1)?,
         )
         .await
     }
 
     async fn spawn_with_model_dir(model_dir: TempDir) -> Result<Self> {
-        Self::spawn_with_model_dir_and_engine_count(model_dir, 1, MODEL_NAME).await
+        Self::spawn_with_config(
+            model_dir,
+            1,
+            MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?,
+        )
+        .await
     }
 
-    async fn spawn_with_model_dir_and_engine_count(
+    async fn spawn_with_config(
         model_dir: TempDir,
         engine_count: usize,
         model_name: &str,
+        config: SimulatedEngineConfig,
     ) -> Result<Self> {
         let mut last_error = None;
         for attempt in 1..=SERVER_START_ATTEMPTS {
-            match Self::spawn_once(&model_dir, engine_count, model_name).await {
+            match Self::spawn_once(&model_dir, engine_count, model_name, config.clone()).await {
                 Ok(started) => {
                     return Ok(Self {
                         base_url: started.base_url,
                         model_name: started.model_name,
                         shutdown: started.shutdown,
                         task: started.task,
-                        load_txs: started.load_txs,
                         _model_dir: model_dir,
                     });
                 }
@@ -96,20 +102,12 @@ impl SimServer {
         model_dir: &TempDir,
         engine_count: usize,
         model_name: &str,
+        config: SimulatedEngineConfig,
     ) -> Result<StartedSimServer> {
         let port = reserve_loopback_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let shutdown = CancellationToken::new();
-        let mut engine = start_engine(SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
-        let load_txs = if engine_count > 1 {
-            let (load_txs, load_watches) = (0..engine_count)
-                .map(|_| watch::channel(LoadSnapshot::default()))
-                .unzip();
-            engine = engine.with_load_watches(load_watches);
-            load_txs
-        } else {
-            Vec::new()
-        };
+        let engine = start_engine_with_partitions(&config, engine_count);
         let server_shutdown = shutdown.clone();
         let served_model_name = model_name.to_string();
         let started_model_name = served_model_name.clone();
@@ -150,17 +148,7 @@ impl SimServer {
             model_name: started_model_name,
             shutdown,
             task,
-            load_txs,
         })
-    }
-
-    fn publish_load(&self, partition: usize, snapshot: LoadSnapshot) -> Result<()> {
-        let sender = self
-            .load_txs
-            .get(partition)
-            .ok_or_else(|| anyhow!("sim frontend has no load feed for partition {partition}"))?;
-        let _ = sender.send_replace(snapshot);
-        Ok(())
     }
 
     async fn shutdown(self) -> Result<()> {
@@ -177,7 +165,6 @@ struct StartedSimServer {
     model_name: String,
     shutdown: CancellationToken,
     task: JoinHandle<Result<()>>,
-    load_txs: Vec<watch::Sender<LoadSnapshot>>,
 }
 
 fn empty_model_dir() -> Result<TempDir> {
@@ -223,87 +210,8 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
 
     assert_non_streaming_completion_has_output(&client, &server.base_url, &server.model_name)
         .await?;
-    wait_for_metrics(
-        &client,
-        &server.base_url,
-        &[
-            ("vllm:num_requests_running", "0", 0.0),
-            ("vllm:num_requests_running", "1", 0.0),
-            ("vllm:num_requests_waiting", "0", 0.0),
-            ("vllm:num_requests_waiting", "1", 0.0),
-            ("vllm:kv_cache_usage_perc", "0", 0.0),
-            ("vllm:kv_cache_usage_perc", "1", 0.0),
-        ],
-        &server.model_name,
-    )
-    .await?;
-
-    server.publish_load(
-        0,
-        LoadSnapshot {
-            kv_used_blocks: 25,
-            kv_total_blocks: 100,
-            num_running_reqs: 1,
-            num_waiting_reqs: 0,
-        },
-    )?;
-    server.publish_load(
-        1,
-        LoadSnapshot {
-            kv_used_blocks: 50,
-            kv_total_blocks: 100,
-            num_running_reqs: 0,
-            num_waiting_reqs: 2,
-        },
-    )?;
-    wait_for_metrics(
-        &client,
-        &server.base_url,
-        &[
-            ("vllm:num_requests_running", "0", 1.0),
-            ("vllm:num_requests_waiting", "1", 2.0),
-            ("vllm:kv_cache_usage_perc", "0", 0.25),
-            ("vllm:kv_cache_usage_perc", "1", 0.5),
-        ],
-        &server.model_name,
-    )
-    .await?;
-
-    server.publish_load(
-        0,
-        LoadSnapshot {
-            kv_used_blocks: 75,
-            kv_total_blocks: 100,
-            num_running_reqs: 3,
-            num_waiting_reqs: 4,
-        },
-    )?;
-    server.publish_load(
-        1,
-        LoadSnapshot {
-            kv_used_blocks: 25,
-            kv_total_blocks: 100,
-            num_running_reqs: 5,
-            num_waiting_reqs: 6,
-        },
-    )?;
-    wait_for_metrics(
-        &client,
-        &server.base_url,
-        &[
-            ("vllm:num_requests_running", "0", 3.0),
-            ("vllm:num_requests_running", "1", 5.0),
-            ("vllm:num_requests_waiting", "0", 4.0),
-            ("vllm:num_requests_waiting", "1", 6.0),
-            ("vllm:kv_cache_usage_perc", "0", 0.75),
-            ("vllm:kv_cache_usage_perc", "1", 0.25),
-        ],
-        &server.model_name,
-    )
-    .await?;
-
-    server.publish_load(0, LoadSnapshot::default())?;
-    server.publish_load(1, LoadSnapshot::default())?;
+    // Two real schedulers: a finishing step stamps drained occupancy, so both
+    // engines settle at zero. There is no watch to inject fake KV/running.
     wait_for_metrics(
         &client,
         &server.base_url,
@@ -323,27 +231,75 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn closed_scheduler_load_feed_stops_the_endpoint() -> Result<()> {
-    let mut server = SimServer::spawn_with_closed_load_feed().await?;
-    drop(server.load_txs.remove(0));
+async fn running_gauge_rises_during_a_slow_request() -> Result<()> {
+    let server = SimServer::spawn_slow().await?;
+    let client = test_client()?;
 
-    let service_result = tokio::time::timeout(Duration::from_secs(10), &mut server.task)
-        .await
-        .context("frontend did not stop after a scheduler load feed closed")?
-        .context("sim frontend task panicked")?;
-    let error = service_result.expect_err("closed scheduler load feed must fail the endpoint");
-    let message = format!("{error:#}");
-    if !message.contains("scheduler load feed closed") {
-        bail!("closed scheduler load feed returned unexpected error: {message}");
-    }
+    let inflight = {
+        let client = client.clone();
+        let url = format!("{}/v1/completions", server.base_url);
+        let body = json!({
+            "model": server.model_name,
+            "prompt": [1, 2],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "ignore_eos": true,
+        });
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_string())
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok::<_, anyhow::Error>(())
+        })
+    };
 
-    Ok(())
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[("vllm:num_requests_running", "0", 1.0)],
+        &server.model_name,
+    )
+    .await?;
+
+    inflight.await.context("slow completion task panicked")??;
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[("vllm:num_requests_running", "0", 0.0)],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
 }
 
 async fn wait_for_metrics(
     client: &Client,
     base_url: &str,
     expected: &[(&str, &str, f64)],
+    model_name: &str,
+) -> Result<()> {
+    let expected: Vec<_> = expected
+        .iter()
+        .map(|(metric, engine, value)| (*metric, *engine, &[][..], *value))
+        .collect();
+    wait_for_labeled_metrics(client, base_url, &expected, model_name).await
+}
+
+/// One expected exposition line: metric name, `engine` label, any further
+/// labels, and the value it must carry.
+type ExpectedMetric<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], f64);
+
+/// [`wait_for_metrics`] plus arbitrary extra labels, for families keyed by more
+/// than engine and model — the per-position spec-decode counter adds `position`.
+async fn wait_for_labeled_metrics(
+    client: &Client,
+    base_url: &str,
+    expected: &[ExpectedMetric<'_>],
     model_name: &str,
 ) -> Result<()> {
     let metrics_url = format!("{base_url}/metrics");
@@ -357,17 +313,25 @@ async fn wait_for_metrics(
         if let Ok(response) = client.get(&metrics_url).send().await {
             if let Ok(response) = response.error_for_status() {
                 if let Ok(metrics) = response.text().await {
-                    let all_found = expected.iter().all(|(metric, engine, expected_value)| {
-                        metrics.lines().any(|line| {
-                            line.starts_with(metric)
-                                && line.contains(&format!("engine=\"{engine}\""))
-                                && line.contains(&format!("model_name=\"{model_name}\""))
-                                && line
-                                    .rsplit_once(' ')
-                                    .and_then(|(_, value)| value.parse::<f64>().ok())
-                                    .is_some_and(|value| (value - expected_value).abs() < 1e-9)
-                        })
-                    });
+                    let all_found =
+                        expected
+                            .iter()
+                            .all(|(metric, engine, labels, expected_value)| {
+                                metrics.lines().any(|line| {
+                                    line.starts_with(metric)
+                                        && line.contains(&format!("engine=\"{engine}\""))
+                                        && line.contains(&format!("model_name=\"{model_name}\""))
+                                        && labels.iter().all(|(name, value)| {
+                                            line.contains(&format!("{name}=\"{value}\""))
+                                        })
+                                        && line
+                                            .rsplit_once(' ')
+                                            .and_then(|(_, value)| value.parse::<f64>().ok())
+                                            .is_some_and(|value| {
+                                                (value - expected_value).abs() < 1e-9
+                                            })
+                                })
+                            });
                     if all_found {
                         return Ok(());
                     }
@@ -383,7 +347,7 @@ async fn wait_for_metrics(
 async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
     let model_dir = model_dir_with_minimal_metadata()?;
     let port = reserve_loopback_port()?;
-    let engine = start_engine(SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
+    let engine = start_engine(&SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         pegainfer_frontend::vllm::serve_with_engine_count(
@@ -401,7 +365,7 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
     let error = result.expect_err("one scheduler partition cannot register as two engines");
     if !error
         .to_string()
-        .contains("declared 2 engines but the resolved handle exposes 1 scheduler partitions")
+        .contains("declared 2 engines but the launched engine exposes 1 schedulers")
     {
         bail!("unexpected partition-mismatch error: {error:#}");
     }
@@ -411,7 +375,7 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
 // The old "mounted LoRA routes report unsupported" sim test is gone by
 // construction: `serve_model_with_lora_routes` now requires an `Engine` whose
 // `lora` capability is `Some(LoraClient)` — the `Option` is the capability —
-// and the simulated handle engine cannot provide one. The gone-engine HTTP
+// and the simulated engine does not mint a LoRA channel. The gone-engine HTTP
 // mapping is pinned by the `vllm::lora` route tests.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

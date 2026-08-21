@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://open-infer.org/">
-    <img src="https://img.shields.io/badge/Docs%20%26%20Blog-open--infer.org-2ea44f" alt="Docs & Blog at open-infer.org">
+  <a href="https://pegainfer.org/">
+    <img src="https://img.shields.io/badge/Docs%20%26%20Blog-pegainfer.org-2ea44f" alt="Docs & Blog at pegainfer.org">
   </a>
   <a href="https://join.slack.com/t/openinferhq/shared_invite/zt-41scnc53a-d0McNJDjK2lVqFGoSLUgXA">
     <img src="https://img.shields.io/badge/Slack-join%20the%20community-4A154B?logo=slack&logoColor=white" alt="Join the PegaInfer Slack">
@@ -23,7 +23,7 @@
   <a href="#api">API</a> &middot;
   <a href="#performance">Performance</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
-  <a href="https://open-infer.org/blog/">Blog</a>
+  <a href="https://pegainfer.org/blog/">Blog</a>
 </p>
 
 ---
@@ -32,9 +32,13 @@ PegaInfer is an LLM inference engine built entirely in Rust and CUDA — no PyTo
 
 It serves frontier-scale models, from Qwen3 to the trillion-parameter Kimi-K2, and already holds its own against the best open-source inference frameworks.
 
-Docs, guides, and engineering deep-dives live at [open-infer.org](https://open-infer.org/) — start with
-[PegaInfer 0.1.0: Writing a Production-Grade Inference Engine in Rust](https://open-infer.org/blog/openinfer-010/)
-and [Co-locating Prefill and Decode on One GPU](https://open-infer.org/blog/green-ctx/).
+Docs, guides, and engineering deep-dives live at [pegainfer.org](https://pegainfer.org/):
+
+- [PegaInfer 0.1.0: Production-Grade Rust Inference](https://pegainfer.org/blog/pegainfer-010/)
+- [Weight Loading: From Safetensors to GPU](https://pegainfer.org/blog/weight-loading/)
+- [Speculative Decoding](https://pegainfer.org/blog/speculative-decoding/)
+- [See Qwen3 Decode as a CUDA Graph](https://pegainfer.org/blog/cuda-graph-export/)
+- [Co-locating Prefill and Decode on One GPU](https://pegainfer.org/blog/green-ctx/)
 
 ## Quickstart
 
@@ -92,7 +96,7 @@ cargo run --release -- --cuda-graph=false
 |----------|-------------|
 | `CUDA_HOME` | CUDA Toolkit path (default: `/usr/local/cuda`) |
 | `PEGAINFER_TRITON_PYTHON` | Python with Triton for `qwen35` build-time AOT compilation |
-| `PEGAINFER_TILELANG_PYTHON` | Python with TileLang for the `glm52` sparse-MLA build-time kernel generation (sm_90a) |
+| `PEGAINFER_TILELANG_PYTHON` | Python with TileLang for `k3` build-time kernel generation |
 | `PEGAINFER_CUDA_SM` | GPU SM target override when `nvidia-smi` unavailable (e.g. `120`) |
 
 </details>
@@ -125,6 +129,7 @@ cargo run --release --features qwen35 -- --model-path models/Qwen3.5-4B
 | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) / [9B](https://huggingface.co/Qwen/Qwen3.5-9B) / [27B](https://huggingface.co/Qwen/Qwen3.5-27B) | Hybrid Gated DeltaNet + full attention | 4B / 9B / 27B | Text-only BF16, greedy + sampling, feature-gated, `--features qwen35` (build-time Triton) |
 | [DeepSeek-V2-Lite](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite) | MoE + EP | 15.7B total / 2.4B active | Feature-gated, `--features deepseek-v2-lite`, 2-GPU EP2 correctness path |
 | [Kimi-K2-Instruct](https://huggingface.co/moonshotai/Kimi-K2-Instruct) | MLA + MoE + Marlin INT4 | 1T total / 32B active | Feature-gated, `--features kimi-k2`, 8-GPU EP path |
+| [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2-FP8) | Sparse MLA (DSA) + MoE + native MTP | FP8, ~704 GB | Feature-gated, `--features glm52`, Blackwell-only; EP decode, TP4 prefill, P/D disaggregation — see the [GLM-5.2 guide](https://pegainfer.org/models/glm52/) |
 
 Model type is auto-detected from `config.json` — just point `--model-path` at any supported model directory. Every model line is controlled by a cargo feature; only `qwen3` is on by default, so the stock build serves Qwen3 with zero Python. Other lines require rebuilding `pegainfer-server` with the matching `--features ...` flag before launch.
 
@@ -134,18 +139,9 @@ DeepSeek support is intentionally narrower than the Qwen paths:
 
 ## API
 
-OpenAI-compatible `/v1/completions` endpoint.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `prompt` | string | (required) | Input text |
-| `max_tokens` | int | 128 | Maximum tokens to generate |
-| `temperature` | float | 0.0 | Sampling temperature (0 = greedy) |
-| `top_k` | int | 50 | Top-k sampling |
-| `top_p` | float | 1.0 | Nucleus sampling threshold |
-| `stream` | bool | false | Enable SSE streaming |
-
-Sampling and logprob support is model-dependent; Qwen models support the sampling controls above.
+OpenAI-compatible `/v1/completions` and `/v1/chat/completions` endpoints;
+point any OpenAI SDK at `http://localhost:8000/v1`. Field reference and
+per-model limits are documented at [pegainfer.org](https://pegainfer.org/).
 
 ## Performance
 
@@ -153,7 +149,7 @@ Single RTX 5090 (32 GB), Qwen3-4B, BF16, TP1 — PegaInfer @ `0b42ed3`, vLLM 0.2
 by the same `vllm bench serve` client (prefix cache on, seed 42, 1k-in / 128-out). Full tables
 and method are in the [benchmark report](docs/benchmarks/qwen3-4b-serving-vllm-rtx5090.md);
 the story behind these numbers is in the
-[0.1.0 release blog](https://open-infer.org/blog/openinfer-010/).
+[0.1.0 release blog](https://pegainfer.org/blog/pegainfer-010/).
 
 ### Footprint
 
@@ -338,10 +334,3 @@ Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Components ported fr
 NVIDIA Dynamo (the `kvbm/kvbm-logical` crate) retain their original Apache-2.0 headers; see
 [NOTICE_DYNAMO](NOTICE_DYNAMO).
 
-## Star History
-
-<p align="center">
-  <a href="https://star-history.com/#pegainfer-project/pegainfer&Date">
-    <img src="https://api.star-history.com/svg?repos=pegainfer-project/pegainfer&type=Date" alt="Star History Chart">
-  </a>
-</p>

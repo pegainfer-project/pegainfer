@@ -564,11 +564,12 @@ fn rejected_request_is_reported_as_error() {
 /// snapshot up front, and follows every watch update with exactly one message.
 #[tokio::test]
 async fn load_snapshots_become_stats_only_batches() {
-    let (load_tx, load_rx) = tokio::sync::watch::channel(LoadSnapshot {
+    let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics {
         kv_used_blocks: 25,
         kv_total_blocks: 100,
         num_running_reqs: 2,
         num_waiting_reqs: 1,
+        spec_decode: None,
     });
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
@@ -591,7 +592,7 @@ async fn load_snapshots_become_stats_only_batches() {
     assert_eq!(stats.num_waiting_reqs, 1);
     assert!((stats.kv_cache_usage - 0.25).abs() < 1e-9);
 
-    load_tx.send_replace(LoadSnapshot::default());
+    load_tx.send_replace(SchedulerMetrics::default());
     let batch = match output_rx.recv().await.expect("drained stats batch") {
         EngineCoreOutputs::RequestBatch(batch) => batch,
         other => panic!("expected a stats batch, got {other:?}"),
@@ -599,6 +600,79 @@ async fn load_snapshots_become_stats_only_batches() {
     let stats = batch.scheduler_stats.expect("scheduler stats");
     assert_eq!(stats.num_running_reqs, 0);
     assert_eq!(stats.kv_cache_usage.to_bits(), 0.0_f64.to_bits());
+
+    shutdown.cancel();
+    task.await
+        .expect("stats task exits on shutdown")
+        .expect("stats publisher shuts down cleanly");
+}
+
+/// Await one stats-only batch and unwrap its scheduler stats.
+async fn next_scheduler_stats(
+    rx: &mut mpsc::UnboundedReceiver<EngineCoreOutputs>,
+) -> Box<SchedulerStats> {
+    match rx.recv().await.expect("stats batch") {
+        EngineCoreOutputs::RequestBatch(batch) => batch.scheduler_stats.expect("scheduler stats"),
+        other => panic!("expected a stats batch, got {other:?}"),
+    }
+}
+
+/// The publisher diffs the scheduler's cumulative totals into the per-interval
+/// deltas the frontend `inc_by`s, and attaches `spec_decoding_stats` only on
+/// intervals that actually ran a draft step — an idle interval would divide by
+/// a zero `num_drafts` in the frontend's acceptance-rate log.
+#[tokio::test]
+async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
+    let mut totals = SpecDecodeCounters::new(2).expect("K within bounds");
+    totals.observe_draft(2, 1);
+    let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics {
+        spec_decode: Some(totals),
+        ..SchedulerMetrics::default()
+    });
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(publish_scheduler_stats(
+        0,
+        load_rx,
+        output_tx,
+        shutdown.clone(),
+    ));
+
+    // First publish diffs against zero, so it carries the whole cumulative.
+    let first = next_scheduler_stats(&mut output_rx).await;
+    let spec = first
+        .spec_decoding_stats
+        .expect("first interval has a draft");
+    assert_eq!(spec.num_spec_tokens, 2);
+    assert_eq!(spec.num_drafts, 1);
+    assert_eq!(spec.num_accepted_tokens, 1);
+    // Widened to the drafter's K, not the array's.
+    assert_eq!(spec.num_accepted_tokens_per_pos, vec![1, 0]);
+
+    // A no-op republish (same totals) is an idle interval: no spec stats.
+    load_tx.send_replace(SchedulerMetrics {
+        spec_decode: Some(totals),
+        num_running_reqs: 1,
+        ..SchedulerMetrics::default()
+    });
+    let idle = next_scheduler_stats(&mut output_rx).await;
+    assert!(idle.spec_decoding_stats.is_none());
+
+    // Two verify steps land in one snapshot — the watch coalesced them. The
+    // delta has to cover the whole gap, per position as well as in total,
+    // which is the reason the transport carries totals instead of deltas.
+    totals.observe_draft(2, 2);
+    totals.observe_draft(2, 2);
+    load_tx.send_replace(SchedulerMetrics {
+        spec_decode: Some(totals),
+        ..SchedulerMetrics::default()
+    });
+    let resumed = next_scheduler_stats(&mut output_rx).await;
+    let spec = resumed.spec_decoding_stats.expect("second draft interval");
+    assert_eq!(spec.num_drafts, 2);
+    assert_eq!(spec.num_draft_tokens, 4);
+    assert_eq!(spec.num_accepted_tokens, 4);
+    assert_eq!(spec.num_accepted_tokens_per_pos, vec![2, 2]);
 
     shutdown.cancel();
     task.await

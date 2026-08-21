@@ -319,3 +319,71 @@ jobs:
           CUDA_PATH: /usr/local/cuda
           PEGAINFER_CUDA_SM: "80"
           PEGAINFER_NVCC_JOBS: "2"
+
+  qwen35-cuda:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    name: Qwen3.5 CUDA ${{ matrix.gate }} (sm_80)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gate: Compile
+            cargo_command: check
+            trailing_args: ""
+          - gate: Clippy
+            cargo_command: clippy
+            trailing_args: "-- -D warnings"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          components: clippy
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.0.2"
+          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install Qwen3.5 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libibverbs-dev
+          python -m pip install "triton==3.7.1"
+
+      - name: Run Qwen3.5 ${{ matrix.gate }}
+        run: >-
+          cargo ${{ matrix.cargo_command }} --release --locked
+          -p pegainfer-qwen35 --features qwen35 --all-targets
+          ${{ matrix.trailing_args }}
+        env:
+          CUDA_PATH: /usr/local/cuda
+          PEGAINFER_CUDA_SM: "80"
+          PEGAINFER_NVCC_JOBS: "2"
+          PEGAINFER_TRITON_PYTHON: python

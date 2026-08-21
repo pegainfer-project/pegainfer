@@ -149,8 +149,8 @@ impl EngineHarness {
 
 impl Drop for EngineHarness {
     fn drop(&mut self) {
-        // Closing the intake lets the scheduler drain and exit; the step
-        // stream then closes and the pump follows.
+        // Closing the submission channel lets the scheduler drain and exit;
+        // the step stream then closes and the pump follows.
         drop(self.handle.take());
         if let Some(join) = self.scheduler_join.take() {
             let _ = join.join();

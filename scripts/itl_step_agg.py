@@ -4,14 +4,14 @@
 The Qwen3.5 scheduler, when run with `PEGAINFER_ITL_DEBUG` set, emits one line
 per executed step:
 
-    ITL_STEP mono_us=<u> epoch_us=<u> plan=unified|prefill|decode \
+    ITL_STEP mono_us=<u> epoch_us=<u> plan=<kind> \
         prefill_tok=<n> prefill_reqs=<n> decode_n=<n> dur_us=<n>
 
-`dur_us` is the step's CPU wall-time, which — because decode sampling forces a
-D2H sync — closely tracks the GPU time the active decode rows actually wait on
-this step. A step with `prefill_tok > 0` is the only kind that freezes active
-decodes behind real prefill work; a `plan=decode` step (`prefill_tok=0`) is a
-genuine steady gap.
+`dur_us` is the scheduler action's CPU wall-time. Decode actions include their
+D2H sampling sync. Serial `unified` steps freeze active decode behind prefill;
+`overlap_launch` and `overlap_decode` run a decode while prefill is in flight;
+`overlap_complete` measures completion sampling and state promotion; and
+`overlap_wait` blocks only after the last active decoder has retired.
 
 This script reports the *true per-step stall* distribution straight from the
 scheduler, independent of the mixed-load bench's coarse `[submit, last-token]`
@@ -98,28 +98,60 @@ def report(label, path):
     total = len(steps)
     plan_counts = Counter(s["plan"] for s in steps)
 
-    # Steps that actually ran prefill work.
-    prefill_steps = [s for s in steps if s["ptok"] > 0]
-    # Steps that froze *active decodes* behind a prefill chunk (the real ITL
-    # stall the background streams experience): prefill_tok>0 AND decode_n>0.
-    stall_steps = [s for s in prefill_steps if s["dn"] > 0]
-    # Pure decode steps (steady gaps).
-    decode_steps = [s for s in steps if s["ptok"] == 0 and s["dn"] > 0]
+    # Each forwarded chunk appears exactly once in one of these launch plans.
+    prefill_launch_steps = [
+        s for s in steps if s["plan"] in {"prefill", "unified", "overlap_launch"}
+    ]
+    serial_stall_steps = [
+        s for s in steps if s["plan"] == "unified" and s["dn"] > 0
+    ]
+    overlap_launch_steps = [s for s in steps if s["plan"] == "overlap_launch"]
+    overlap_decode_steps = [s for s in steps if s["plan"] == "overlap_decode"]
+    overlap_complete_steps = [s for s in steps if s["plan"] == "overlap_complete"]
+    overlap_wait_steps = [s for s in steps if s["plan"] == "overlap_wait"]
+    prefill_associated_steps = [
+        s
+        for s in steps
+        if s["plan"]
+        in {
+            "prefill",
+            "unified",
+            "overlap_launch",
+            "overlap_decode",
+            "overlap_complete",
+            "overlap_wait",
+        }
+    ]
+    decode_steps = [
+        s
+        for s in steps
+        if s["plan"] in {"decode", "overlap_launch", "overlap_decode"} and s["dn"] > 0
+    ]
 
     print(f"=== {label}  ({path}) ===")
     print(f"total ITL_STEP: {total}  " + "  ".join(f"{k}={v}" for k, v in sorted(plan_counts.items())))
-    print(f"prefill-executing steps (prefill_tok>0): {len(prefill_steps)}")
-    print("  per-step dur_us [ALL prefill steps]:")
-    print(fmt(summarize_us([s["dur"] for s in prefill_steps])))
-    print(f"stall steps (prefill_tok>0 AND decode_n>0) — TRUE per-step decode stall: {len(stall_steps)}")
-    print(fmt(summarize_us([s["dur"] for s in stall_steps])))
-    print("  steady decode steps (prefill_tok=0, decode_n>0):")
-    print(fmt(summarize_us([s["dur"] for s in decode_steps])))
-    ptok_dist = Counter(s["ptok"] for s in prefill_steps)
-    print("  prefill_tok distribution (chunk sizes actually forwarded):")
+    print(f"prefill chunk launches (counted once): {len(prefill_launch_steps)}")
+    ptok_dist = Counter(s["ptok"] for s in prefill_launch_steps)
+    print("  forwarded prefill_tok distribution:")
     for tok, cnt in sorted(ptok_dist.items()):
-        print(f"    prefill_tok={tok}: {cnt} step(s)")
-    dn_dist = Counter(s["dn"] for s in stall_steps)
+        print(f"    prefill_tok={tok}: {cnt} chunk(s)")
+    print(f"serial unified stalls with active decode: {len(serial_stall_steps)}")
+    print(fmt(summarize_us([s["dur"] for s in serial_stall_steps])))
+    print(f"overlap launches with decode: {len(overlap_launch_steps)}")
+    print(fmt(summarize_us([s["dur"] for s in overlap_launch_steps])))
+    print(f"in-flight overlap decode steps: {len(overlap_decode_steps)}")
+    print(fmt(summarize_us([s["dur"] for s in overlap_decode_steps])))
+    print(f"overlap completion steps: {len(overlap_complete_steps)}")
+    print(fmt(summarize_us([s["dur"] for s in overlap_complete_steps])))
+    print(f"overlap waits after decode retires: {len(overlap_wait_steps)}")
+    print(fmt(summarize_us([s["dur"] for s in overlap_wait_steps])))
+    print("  all decode-producing scheduler actions:")
+    print(fmt(summarize_us([s["dur"] for s in decode_steps])))
+    associated_dn_dist = Counter(s["dn"] for s in prefill_associated_steps)
+    print("  active decode width during prefill-associated actions (decode_n):")
+    for dn, cnt in sorted(associated_dn_dist.items()):
+        print(f"    decode_n={dn}: {cnt} action(s)")
+    dn_dist = Counter(s["dn"] for s in serial_stall_steps)
     if dn_dist:
         print("  frozen decode width during stall steps (decode_n):")
         for dn, cnt in sorted(dn_dist.items()):

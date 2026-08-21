@@ -21,26 +21,30 @@ Use this workflow for multi-turn work:
 
 ## Install
 
-Install from the upstream repository:
+`vllm-bench` has moved into the main vLLM repository as a crate in the Rust
+workspace (`vllm-project/vllm` → `rust/src/bench`); the standalone
+`vllm-project/vllm-bench` repo is archived and read-only. Build the maintained
+version from the new home:
 
 ```bash
-cargo install --git https://github.com/vllm-project/vllm-bench vllm-bench
+git clone --depth 1 https://github.com/vllm-project/vllm.git
+cd vllm/rust
+cargo build --release -p vllm-bench   # -> target/release/vllm-bench
 ```
 
-The trailing `vllm-bench` package name matters: the repo also contains another
-binary, so omitting it can fail with "multiple packages with binaries found".
-Cargo installs the binary to `~/.cargo/bin/vllm-bench`.
+`--depth 1` keeps the clone small; vLLM full history is large and not needed
+for a build.
 
-Alternatives from the README:
+To install onto PATH from the clone (the build above left the shell in
+`vllm/rust`):
 
 ```bash
-curl -fsSL https://github.com/vllm-project/vllm-bench/releases/latest/download/vllm-bench-$(uname -m)-linux-musl \
-  -o vllm-bench && chmod +x vllm-bench
-
-git clone https://github.com/vllm-project/vllm-bench.git
-cd vllm-bench
-./install.sh
+cargo install --path src/bench        # from vllm/rust -> ~/.cargo/bin/vllm-bench
 ```
+
+Note: upstream `rust/src/bench/README.md` may still show the archived
+standalone-repo install commands; the migration notice on the archived repo is
+the authoritative pointer, and `--help` on a fresh build is the flag authority.
 
 After install, run:
 
@@ -198,7 +202,7 @@ curl -s http://127.0.0.1:18080/v1/models
 Run a tiny multi-turn benchmark:
 
 ```bash
-cd <vllm-bench-repo>
+cd <vllm-repo>/rust
 target/release/vllm-bench \
   --backend openai-chat \
   --base-url http://127.0.0.1:18080 \

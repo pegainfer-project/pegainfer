@@ -50,7 +50,8 @@ impl Qwen3Model {
             kv_buffer.layout().num_kv_heads,
             kv_buffer.layout().head_dim,
             kv_buffer.layout().page_size,
-        );
+        )
+        .expect("kv layout geometry");
         let page_size = layout.page_size;
         let num_prefill_reqs = 1;
         let prefill_pages = max_prefill_tokens.div_ceil(page_size);

@@ -661,7 +661,8 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
     let page_size = axis(kv, "pos_in_page")?;
     let kv_len = attr_usize(call, "kv_len")?;
     let pages_per_request = kv_len.div_ceil(page_size);
-    let layout = KvLayout::new(num_layers, kv_heads, head_dim, page_size);
+    let layout =
+        KvLayout::new(num_layers, kv_heads, head_dim, page_size).expect("kv layout geometry");
     let ctx = DeviceContext::new()?;
     let q = HiddenStates::zeros(&ctx, q_dim, batch)?;
     let k = HiddenStates::zeros(&ctx, KV_DIM_VALUE, batch)?;

@@ -74,6 +74,7 @@ use plan::K3LayerGeometry;
 use plan::k3_bookend_slots;
 use plan::k3_layer_geometry;
 use plan::k3_layer_slots;
+pub(crate) use plan::k3_mla_scale;
 
 /// K elements one packed i32 scale-factor word covers on the FP4 weight side:
 /// four consecutive group-32 exponents, LSB first.
