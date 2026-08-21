@@ -39,6 +39,7 @@ mod request;
 mod request_lifecycle;
 mod sink;
 mod step;
+mod stop;
 mod wiring;
 
 pub use control::*;
@@ -52,4 +53,5 @@ pub use request::*;
 pub use request_lifecycle::*;
 pub use sink::*;
 pub use step::*;
+pub use stop::*;
 pub use wiring::*;

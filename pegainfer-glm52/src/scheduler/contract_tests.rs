@@ -68,7 +68,12 @@ fn load_snapshot_reports_the_ranks_own_state() {
     let mut slots: RankSlots = std::array::from_fn(|_| None);
 
     let req = request(vec![10, 11], SamplingParams::default(), 4);
-    let state = Glm52SlotState::new(req.prompt_tokens.clone(), req.max_tokens, true, 0);
+    let state = Glm52SlotState::new(
+        req.prompt_tokens.clone(),
+        req.max_tokens,
+        super::testkit::stop_policy(true),
+        0,
+    );
     let mut kv = pool.new_request(req.prompt_tokens.clone(), req.max_tokens, None);
     kv.schedule_prefill(1, &pool).expect("one live KV block");
     slots[0] = Some(ActiveRequest {
@@ -420,6 +425,7 @@ fn resolved_native(
         fingerprint: super::offload::handoff_fingerprint(),
         committed_len: committed.len(),
         anchor_token_id: Some(anchor),
+        stop_cause: None,
         draft_tokens: vec![anchor; crate::mtp::GLM52_MTP_DRAFTS],
     };
     let mut req = request(committed, SamplingParams::default(), max_tokens);
@@ -613,6 +619,7 @@ fn suppressed_eos_finishes_at_admission_without_a_slot() {
         fingerprint: super::offload::handoff_fingerprint(),
         committed_len: 3,
         anchor_token_id: None,
+        stop_cause: Some(super::offload::NativeStopCause::Eos(7)),
         draft_tokens: Vec::new(),
     };
     let mut req = request(vec![10, 11, 12], SamplingParams::default(), 8);
@@ -650,8 +657,16 @@ fn suppressed_eos_finishes_at_admission_without_a_slot() {
         rx.try_recv(),
         Ok((
             _,
+            pegainfer_frontend::engine::TokenEvent::Token { id: 7, .. }
+        ))
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok((
+            _,
             pegainfer_frontend::engine::TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
+                stop_cause: Some(pegainfer_frontend::engine::StopCause::Eos(7)),
                 completion_tokens: 1,
                 ..
             }
@@ -673,6 +688,7 @@ fn suppressed_eos_finishes_behind_a_budget_stalled_front() {
         fingerprint: super::offload::handoff_fingerprint(),
         committed_len: 3,
         anchor_token_id: None,
+        stop_cause: Some(super::offload::NativeStopCause::Eos(7)),
         draft_tokens: Vec::new(),
     };
     let mut req = request(vec![10, 11, 12], SamplingParams::default(), 8);
@@ -717,8 +733,16 @@ fn suppressed_eos_finishes_behind_a_budget_stalled_front() {
         rx.try_recv(),
         Ok((
             _,
+            pegainfer_frontend::engine::TokenEvent::Token { id: 7, .. }
+        ))
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok((
+            _,
             pegainfer_frontend::engine::TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
+                stop_cause: Some(pegainfer_frontend::engine::StopCause::Eos(7)),
                 completion_tokens: 1,
                 ..
             }
@@ -736,6 +760,7 @@ fn anchor_exhausting_max_tokens_finishes_as_length() {
         fingerprint: super::offload::handoff_fingerprint(),
         committed_len: 3,
         anchor_token_id: Some(70_001),
+        stop_cause: None,
         draft_tokens: Vec::new(),
     };
     let mut req = request(vec![10, 11, 12], SamplingParams::default(), 1);
@@ -852,7 +877,12 @@ fn drive_request(
     with_drafts: bool,
 ) -> Result<(), String> {
     let prompt: Vec<u32> = (0..prompt_len as u32).map(|t| 10_000 + t).collect();
-    let mut state = Glm52SlotState::new(prompt.clone(), max_tokens, true, 0);
+    let mut state = Glm52SlotState::new(
+        prompt.clone(),
+        max_tokens,
+        super::testkit::stop_policy(true),
+        0,
+    );
     let mut kv = pool.new_request(prompt, max_tokens, None);
     let mut fresh = 60_000u32;
     loop {
@@ -958,7 +988,7 @@ fn eos_truncated_speculative_apply_stays_in_contract() {
     // the release must both stay clean.
     let pool = Arc::new(BlockPool::new(PAGE, 16));
     let prompt: Vec<u32> = (0..70).collect();
-    let mut state = Glm52SlotState::new(prompt.clone(), 32, false, 0);
+    let mut state = Glm52SlotState::new(prompt.clone(), 32, super::testkit::stop_policy(false), 0);
     let mut kv = pool.new_request(prompt, 32, None);
     loop {
         if !state.mid_prefill() {
@@ -988,14 +1018,19 @@ fn eos_truncated_speculative_apply_stays_in_contract() {
         committed,
         emit,
         finish,
+        stop_cause,
         ..
     } = outcome
     else {
         panic!("verify span must commit");
     };
     assert_eq!(committed, vec![21, 7], "truncated to the consumed run");
-    assert_eq!(emit, 1, "the suppressed EOS is consumed, not emitted");
+    assert_eq!(emit, 2, "the triggering EOS is retained exactly once");
     assert_eq!(finish, Some(FinishReason::Stop));
+    assert_eq!(
+        stop_cause,
+        Some(pegainfer_frontend::engine::StopCause::Eos(7))
+    );
     kv.apply_speculative(&committed, &pool)
         .expect("apply_speculative with the truncated run");
     kv.release().expect("release");

@@ -5,7 +5,9 @@ use vllm_engine_core_client::protocol::logprobs::TokenLogprob as WireTokenLogpro
 use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
+use crate::engine::EosPolicy;
 use crate::engine::FinishReason;
+use crate::engine::StopPolicy;
 use crate::engine::TokenLogprob;
 use crate::sampler::SamplingParams;
 
@@ -44,9 +46,10 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
     // None`, but `_all_stop_token_ids` always carries the model EOS set (it
     // exists for min_tokens masking, not stop detection). Deriving ignore_eos
     // from all_stop_token_ids would therefore void every ignore_eos request on
-    // models with a real EOS. Only `_eos_token_id` and the client's explicit
-    // `stop_token_ids` express a stop intent.
-    let ignore_eos = params.eos_token_id.is_none() && params.stop_token_ids.is_empty();
+    // models with a real EOS. Explicit stop tokens travel independently in
+    // StopPolicy, so they must not re-enable model EOS after vLLM lowered
+    // `ignore_eos=true` to a missing `_eos_token_id`.
+    let ignore_eos = params.eos_token_id.is_none();
     if params.temperature <= 0.0 {
         return SamplingParams {
             temperature: 0.0,
@@ -76,6 +79,15 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
     }
 }
 
+pub(crate) fn convert_stop_policy(params: &EngineCoreSamplingParams) -> StopPolicy {
+    StopPolicy {
+        eos: params
+            .eos_token_id
+            .map_or(EosPolicy::Ignore, EosPolicy::Token),
+        token_ids: params.stop_token_ids.clone(),
+    }
+}
+
 /// Reject request parameters the engine would otherwise silently ignore.
 /// Returns the offending description; `None` means the request is servable.
 ///
@@ -84,6 +96,12 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
 /// carrying 1.0000001 wants a penalty and must be rejected, not rounded away.
 #[allow(clippy::float_cmp)]
 pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> Option<String> {
+    if params.min_tokens != 0 {
+        return Some(format!(
+            "min_tokens={} is not supported by current engine contracts",
+            params.min_tokens
+        ));
+    }
     if !(0.0..1.0).contains(&params.min_p) || !params.min_p.is_finite() {
         return Some(format!("min_p {} outside [0, 1)", params.min_p));
     }
@@ -191,11 +209,46 @@ mod tests {
         params.eos_token_id = Some(163_586);
         assert!(!convert_sampling(&params).ignore_eos);
 
-        // Explicit client stop tokens keep EOS detection on even when the
-        // frontend dropped _eos_token_id.
+        // Explicit client stop tokens do not re-enable EOS after the frontend
+        // dropped _eos_token_id for ignore_eos=true.
         params.eos_token_id = None;
         params.stop_token_ids = vec![42];
-        assert!(!convert_sampling(&params).ignore_eos);
+        assert!(convert_sampling(&params).ignore_eos);
+    }
+
+    #[test]
+    fn convert_stop_policy_keeps_eos_and_explicit_stops_independent() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.eos_token_id = Some(99);
+        params.stop_token_ids = vec![11];
+
+        assert_eq!(
+            convert_stop_policy(&params),
+            StopPolicy {
+                eos: EosPolicy::Token(99),
+                token_ids: vec![11],
+            }
+        );
+    }
+
+    #[test]
+    fn all_stop_tokens_do_not_reenable_ignored_eos() {
+        let mut params = EngineCoreSamplingParams::for_test();
+
+        // `_all_stop_token_ids` is the model's masking set. It must not turn
+        // EOS detection back on after vLLM lowers `ignore_eos=true` to a
+        // missing `_eos_token_id`.
+        params.eos_token_id = None;
+        params.stop_token_ids = vec![42];
+        params.all_stop_token_ids = BTreeSet::from([99]);
+
+        assert_eq!(
+            convert_stop_policy(&params),
+            StopPolicy {
+                eos: EosPolicy::Ignore,
+                token_ids: vec![42],
+            }
+        );
     }
 
     #[test]
@@ -244,6 +297,17 @@ mod tests {
         params.presence_penalty = 0.0;
         params.repetition_penalty = 1.2;
         assert!(unsupported_request_params(&params).is_some());
+    }
+
+    #[test]
+    fn unsupported_sampling_rejects_min_tokens_until_masking_is_implemented() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.min_tokens = 1;
+
+        assert_eq!(
+            unsupported_request_params(&params),
+            Some("min_tokens=1 is not supported by current engine contracts".to_string())
+        );
     }
 
     #[test]

@@ -5,7 +5,11 @@ use pegainfer_core::ops::call_trace;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_frontend::engine::EngineLoadOptions;
 #[cfg(feature = "kernel-call-trace")]
+use pegainfer_frontend::engine::EosPolicy;
+#[cfg(feature = "kernel-call-trace")]
 use pegainfer_frontend::engine::GenerateRequest;
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_frontend::engine::StopPolicy;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_frontend::engine::TokenEvent;
 #[cfg(feature = "kernel-call-trace")]
@@ -151,6 +155,10 @@ pub fn trace_runtime_decode_kernel_calls(
                     min_p: 0.0,
                     seed: None,
                     ignore_eos: true,
+                },
+                stop_policy: StopPolicy {
+                    eos: EosPolicy::Ignore,
+                    token_ids: Vec::new(),
                 },
                 max_tokens: 2,
                 lora_adapter: None,

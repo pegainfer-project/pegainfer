@@ -13,6 +13,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::StopCause;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::unix_now_s;
 use pegainfer_kv_store::BlockPool;
@@ -155,30 +156,44 @@ pub(super) fn admit_from_queue(
 ) -> anyhow::Result<()> {
     // Zero-capacity natives finish at intake, before the slot and budget
     // gates — a saturated rank must never delay a reply that needs no
-    // capacity. Two forms: P consumed EOS (anchor None → Stop), and the
+    // capacity. Two forms: P consumed a typed stop token, and the
     // replayed anchor exhausting max_tokens (→ Length); neither restores KV.
     pending.retain(|entry| {
         let Resolved::Native { req, handoff, .. } = entry else {
             return true;
         };
-        let (anchor, finish_reason) = match handoff.anchor_token_id {
-            None => (None, FinishReason::Stop),
-            Some(anchor) if req.max_tokens == 1 => (Some(anchor), FinishReason::Length),
-            Some(_) => return true,
-        };
+        let (terminal_token, finish_reason, stop_cause) =
+            match (handoff.stop_cause, handoff.anchor_token_id) {
+                (Some(cause), _) => {
+                    let cause = StopCause::from(cause);
+                    let token = match cause {
+                        StopCause::Eos(id) | StopCause::Token(id) => id,
+                    };
+                    (Some(token), FinishReason::Stop, Some(cause))
+                }
+                // Compatibility for a v5 envelope that omitted the optional
+                // cause. Its fingerprint prevents mixing with older peers,
+                // but retaining the fallback makes malformed metadata fail in
+                // the same non-allocating way as the old EOS marker.
+                (None, None) => (None, FinishReason::Stop, None),
+                (None, Some(anchor)) if req.max_tokens == 1 => {
+                    (Some(anchor), FinishReason::Length, None)
+                }
+                (None, Some(_)) => return true,
+            };
         let prompt_tokens = req.prompt_tokens.len();
         let _ = req.token_tx.send(TokenEvent::Scheduled {
             queued_at_unix_s: req.queued_at_unix_s.unwrap_or_else(unix_now_s),
             scheduled_at_unix_s: unix_now_s(),
             prompt_tokens,
-            cached_tokens: anchor.map_or(0, |_| handoff.committed_len),
+            cached_tokens: terminal_token.map_or(0, |_| handoff.committed_len),
         });
-        // P sampled the anchor but never sent it; it reaches the client here.
-        if let Some(anchor) = anchor {
+        // P sampled the terminal/anchor token; replay it to this request once.
+        if let Some(token) = terminal_token {
             if req
                 .token_tx
                 .send(TokenEvent::Token {
-                    id: anchor,
+                    id: token,
                     logprob: None,
                 })
                 .is_err()
@@ -188,6 +203,7 @@ pub(super) fn admit_from_queue(
         }
         let _ = req.token_tx.send(TokenEvent::Finished {
             finish_reason,
+            stop_cause,
             prompt_tokens,
             completion_tokens: 1,
         });
@@ -384,7 +400,7 @@ pub(super) fn admit_from_queue(
                 let state = Glm52SlotState::new(
                     req.prompt_tokens.clone(),
                     req.max_tokens,
-                    req.params.ignore_eos,
+                    req.stop_policy.clone(),
                     cached_tokens,
                 );
                 if drafter_enabled {
@@ -517,7 +533,7 @@ fn admit_native(
     let mut state = Glm52SlotState::new(
         req.prompt_tokens.clone(),
         req.max_tokens,
-        req.params.ignore_eos,
+        req.stop_policy.clone(),
         handoff.committed_len,
     );
     state.seed_native_pd_replayed_anchor();
@@ -679,6 +695,7 @@ mod tests {
             fingerprint: offload::handoff_fingerprint(),
             committed_len: PAGE,
             anchor_token_id: Some(11),
+            stop_cause: None,
             draft_tokens: vec![1, 2],
         };
         let req = request(vec![10; PAGE], SamplingParams::default(), PAGE);

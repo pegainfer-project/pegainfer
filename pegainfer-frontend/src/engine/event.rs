@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use super::stop::StopCause;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TokenLogprob {
     pub logprob: f32,
@@ -36,6 +38,7 @@ pub enum TokenEvent {
     KvTransfer { params: serde_json::Value },
     Finished {
         finish_reason: FinishReason,
+        stop_cause: Option<StopCause>,
         prompt_tokens: usize,
         completion_tokens: usize,
     },

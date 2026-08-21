@@ -18,8 +18,10 @@ use anyhow::Result;
 use anyhow::ensure;
 use pegainfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::engine::TokenStreamReceiver;
@@ -47,6 +49,17 @@ const DSV2_LITE_HIDDEN_SIZE: usize = 2048;
 const DSV2_LITE_MOE_LAYERS: usize = 26;
 const E2E_JSON_OUT_ENV: &str = "PEGAINFER_DSV2_LITE_E2E_JSON_OUT";
 const E2E_CASE_SET_ENV: &str = "PEGAINFER_DSV2_LITE_E2E_CASE_SET";
+
+fn request_stop_policy(ignore_eos: bool) -> StopPolicy {
+    StopPolicy {
+        eos: if ignore_eos {
+            EosPolicy::Ignore
+        } else {
+            EosPolicy::ModelDefault
+        },
+        token_ids: vec![],
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct CaseSet {
@@ -634,6 +647,7 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
                 ignore_eos,
                 ..SamplingParams::default()
             },
+            stop_policy: request_stop_policy(ignore_eos),
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -721,6 +735,7 @@ fn run_mixed_serving_position_fallback(
                 ignore_eos,
                 ..SamplingParams::default()
             },
+            stop_policy: request_stop_policy(ignore_eos),
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -789,6 +804,7 @@ fn run_mixed_serving_rejection_isolation(
         data_parallel_rank: None,
         prompt_tokens: vec![1, 2, 3],
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         max_tokens: 4,
         lora_adapter: None,
         kv_transfer_params: None,
@@ -805,6 +821,7 @@ fn run_mixed_serving_rejection_isolation(
         data_parallel_rank: None,
         prompt_tokens: valid_prompt_tokens,
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         max_tokens: 6,
         lora_adapter: None,
         kv_transfer_params: None,

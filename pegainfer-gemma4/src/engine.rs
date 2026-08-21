@@ -195,6 +195,54 @@ impl GenerationPolicy {
     }
 }
 
+/// Emit one sampled token and, when it is terminal, the matching finish
+/// event. Token delivery comes first so the frontend can retain the exact
+/// trigger token and its logprob before applying protocol stop semantics.
+fn emit_sampled_token(
+    request: &GenerateRequest,
+    policy: &GenerationPolicy,
+    token_id: u32,
+    logprob: Option<TokenLogprob>,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> bool {
+    if request
+        .token_tx
+        .send(TokenEvent::Token {
+            id: token_id,
+            logprob,
+        })
+        .is_err()
+    {
+        return false;
+    }
+
+    if let Some(stop_cause) = request
+        .stop_policy
+        .classify(token_id, |id| policy.eos.contains(&id))
+    {
+        let _ = request.token_tx.send(TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            stop_cause: Some(stop_cause),
+            prompt_tokens,
+            completion_tokens,
+        });
+        return false;
+    }
+
+    if completion_tokens >= request.max_tokens {
+        let _ = request.token_tx.send(TokenEvent::Finished {
+            finish_reason: FinishReason::Length,
+            stop_cause: None,
+            prompt_tokens,
+            completion_tokens,
+        });
+        return false;
+    }
+
+    true
+}
+
 fn token_ids(value: &serde_json::Value) -> Result<Vec<u32>> {
     fn one(value: &serde_json::Value) -> Result<u32> {
         let raw = value
@@ -532,18 +580,17 @@ struct Walker {
 }
 
 /// One newcomer row of a mixed step's logits head, ahead of the active
-/// rows: its sampling params, its logprob request (0 = none), and whether
-/// its pick may stop it — a mid-walk segment's row is sampled and
-/// discarded, so it never stops.
+/// rows: its sampling params and logprob request (0 = none). A mid-walk
+/// segment's row is sampled and discarded; its request policy is applied
+/// only when the final sampled row is actually emitted.
 struct HeadRow<'a> {
     params: &'a pegainfer_frontend::sampler::SamplingParams,
     logprobs: usize,
-    ignore_eos: bool,
 }
 
 /// Suppress, sample and score one mixed step's logits — `head` describes
 /// rows `0..head.len()`, the active rows follow — then deliver the active
-/// rows' events. Returns every row's pick, logprob and stop flag; `Err`
+/// rows' events. Returns every row's pick and logprob; `Err`
 /// carries the failure message after the active batch has been failed.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn mixed_head_flow(
@@ -556,7 +603,7 @@ fn mixed_head_flow(
     head: &[HeadRow<'_>],
     active: &mut Vec<Active>,
     logits: &mut HiddenStates,
-) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>, Vec<bool>), String> {
+) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>), String> {
     let k = head.len();
     let fail_batch = |active: &mut Vec<Active>, what: &str, err: &anyhow::Error| {
         log::error!("{what} failed: {err:#}");
@@ -592,18 +639,11 @@ fn mixed_head_flow(
             }
         }
     };
-    let mut stops = vec![false; active.len() + k];
-    for (j, h) in head.iter().enumerate() {
-        stops[j] = !h.ignore_eos && policy.eos.contains(&picked[j]);
-    }
-    for (row, entry) in active.iter().enumerate() {
-        stops[row + k] = !entry.request.params.ignore_eos && policy.eos.contains(&picked[row + k]);
-    }
     let mut lp_requests: Vec<LogprobRequest> = Vec::new();
     lp_requests.extend(
         head.iter()
             .enumerate()
-            .filter(|(j, h)| h.logprobs > 0 && !stops[*j])
+            .filter(|(_, h)| h.logprobs > 0)
             .map(|(j, h)| LogprobRequest {
                 row: j,
                 picked: picked[j],
@@ -614,7 +654,7 @@ fn mixed_head_flow(
         active
             .iter()
             .enumerate()
-            .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[row + k])
+            .filter(|(_, entry)| entry.request.logprobs > 0)
             .map(|(row, entry)| LogprobRequest {
                 row: row + k,
                 picked: picked[row + k],
@@ -637,8 +677,8 @@ fn mixed_head_flow(
     }
 
     // Active rows: the decode-round event flow, `k` logits rows up.
-    emit_decode_rows(active, &picked, &stops, &mut logprobs, k);
-    Ok((picked, logprobs, stops))
+    emit_decode_rows(active, &picked, &mut logprobs, k, policy);
+    Ok((picked, logprobs))
 }
 
 struct Active {
@@ -1219,21 +1259,6 @@ impl EngineState {
             Ok(tokens) => tokens[0],
             Err(err) => return fail(format!("{err:#}")),
         };
-        let finish = |reason: FinishReason, completion_tokens: usize| {
-            let _ = sink.send(TokenEvent::Finished {
-                finish_reason: reason,
-                prompt_tokens,
-                completion_tokens,
-            });
-            Admitted::Done
-        };
-        // The stop token retires the request without being emitted: the
-        // frontend appends its own sentinel for a terminal Stop and drops the
-        // last id, so an engine that emits EOS costs the client its final
-        // visible token.
-        if !request.params.ignore_eos && self.policy.eos.contains(&next) {
-            return finish(FinishReason::Stop, 0);
-        }
         let logprob = if request.logprobs > 0 {
             match pegainfer_sample::token_logprobs_batch(
                 &self.ctx,
@@ -1250,11 +1275,8 @@ impl EngineState {
         } else {
             None
         };
-        if sink.send(TokenEvent::Token { id: next, logprob }).is_err() {
+        if !emit_sampled_token(&request, &self.policy, next, logprob, prompt_tokens, 1) {
             return Admitted::Done;
-        }
-        if request.max_tokens <= 1 {
-            return finish(FinishReason::Length, 1);
         }
         Admitted::Active(Box::new(Active {
             request,
@@ -1499,7 +1521,6 @@ impl EngineState {
                     let head = [HeadRow {
                         params: &w.request.params,
                         logprobs: w.request.logprobs,
-                        ignore_eos: w.request.params.ignore_eos,
                     }];
                     match mixed_head_flow(
                         &self.ctx,
@@ -1512,7 +1533,7 @@ impl EngineState {
                         active,
                         &mut logits,
                     ) {
-                        Ok((picked, mut lps, _)) => {
+                        Ok((picked, mut lps)) => {
                             w.first = Some((picked[0], lps[0].take()));
                         }
                         Err(message) => {
@@ -1614,11 +1635,6 @@ impl EngineState {
                         HeadRow {
                             params: &w.request.params,
                             logprobs: if last { w.request.logprobs } else { 0 },
-                            ignore_eos: if last {
-                                w.request.params.ignore_eos
-                            } else {
-                                true
-                            },
                         }
                     })
                     .collect();
@@ -1635,7 +1651,7 @@ impl EngineState {
                 )
             };
             match flow {
-                Ok((picked, mut lps, _)) => {
+                Ok((picked, mut lps)) => {
                     let mut si = 0usize;
                     for (w, t) in walkers.iter_mut().zip(&takes) {
                         if let Some((take, last)) = *t {
@@ -1684,29 +1700,7 @@ impl EngineState {
                 cache.insert(entry, resumed);
             }
         }
-        // The stop token retires the request without being emitted, the
-        // same contract as every other admission path.
-        if !request.params.ignore_eos && self.policy.eos.contains(&next) {
-            let _ = request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens,
-                completion_tokens: 0,
-            });
-            return;
-        }
-        if request
-            .token_tx
-            .send(TokenEvent::Token { id: next, logprob })
-            .is_err()
-        {
-            return;
-        }
-        if request.max_tokens <= 1 {
-            let _ = request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens,
-                completion_tokens: 1,
-            });
+        if !emit_sampled_token(&request, &self.policy, next, logprob, prompt_tokens, 1) {
             return;
         }
         active.push(Active {
@@ -1817,13 +1811,12 @@ impl EngineState {
                 }
             }
         }
-        let (picked, mut logprobs, stops) = {
+        let (picked, mut logprobs) = {
             let head: Vec<HeadRow<'_>> = newcomers
                 .iter()
                 .map(|(request, _, _)| HeadRow {
                     params: &request.params,
                     logprobs: request.logprobs,
-                    ignore_eos: request.params.ignore_eos,
                 })
                 .collect();
             match mixed_head_flow(
@@ -1845,30 +1838,15 @@ impl EngineState {
         // The newcomers: their first tokens are logits rows `0..k`.
         for (j, (request, kv, _)) in newcomers.into_iter().enumerate() {
             let prompt_tokens = request.prompt_tokens.len();
-            let finish = |reason: FinishReason, completion_tokens: usize| {
-                let _ = request.token_tx.send(TokenEvent::Finished {
-                    finish_reason: reason,
-                    prompt_tokens,
-                    completion_tokens,
-                });
-            };
-            if stops[j] {
-                finish(FinishReason::Stop, 0);
-                continue;
-            }
             let next = picked[j];
-            if request
-                .token_tx
-                .send(TokenEvent::Token {
-                    id: next,
-                    logprob: logprobs[j].take(),
-                })
-                .is_err()
-            {
-                continue;
-            }
-            if request.max_tokens <= 1 {
-                finish(FinishReason::Length, 1);
+            if !emit_sampled_token(
+                &request,
+                &self.policy,
+                next,
+                logprobs[j].take(),
+                prompt_tokens,
+                1,
+            ) {
                 continue;
             }
             active.push(Active {
@@ -1935,14 +1913,10 @@ impl EngineState {
                 Err(err) => return fail_batch(active, "batched sampling", &err),
             }
         };
-        let mut stops = vec![false; active.len()];
-        for (row, entry) in active.iter().enumerate() {
-            stops[row] = !entry.request.params.ignore_eos && self.policy.eos.contains(&picked[row]);
-        }
         let lp_requests: Vec<LogprobRequest> = active
             .iter()
             .enumerate()
-            .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[*row])
+            .filter(|(_, entry)| entry.request.logprobs > 0)
             .map(|(row, entry)| LogprobRequest {
                 row,
                 picked: picked[row],
@@ -1961,53 +1935,34 @@ impl EngineState {
             }
         }
 
-        emit_decode_rows(active, &picked, &stops, &mut logprobs, 0);
+        emit_decode_rows(active, &picked, &mut logprobs, 0, &self.policy);
     }
 }
 
 /// Deliver one decode step's outcome to every active row and retire the
 /// finished ones — the event flow both the pure decode round and the mixed
 /// admission share; `row_base` is the row's offset into the step's logits
-/// (the mixed step's row 0 is the newcomer). A stop token retires the
-/// request without being emitted; a send failure retires a cancelled one.
+/// (the mixed step's row 0 is the newcomer). A send failure or terminal
+/// token retires the request after the sampled token has been delivered.
 fn emit_decode_rows(
     active: &mut Vec<Active>,
     picked: &[u32],
-    stops: &[bool],
     logprobs: &mut [Option<TokenLogprob>],
     row_base: usize,
+    policy: &GenerationPolicy,
 ) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, entry) in active.iter_mut().enumerate() {
-        if stops[row + row_base] {
-            let _ = entry.request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: entry.prompt_tokens,
-                completion_tokens: entry.emitted,
-            });
-            retire.push(row);
-            continue;
-        }
         let token = picked[row + row_base];
         entry.emitted += 1;
-        if entry
-            .request
-            .token_tx
-            .send(TokenEvent::Token {
-                id: token,
-                logprob: logprobs[row + row_base].take(),
-            })
-            .is_err()
-        {
-            retire.push(row);
-            continue;
-        }
-        if entry.emitted >= entry.request.max_tokens {
-            let _ = entry.request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: entry.prompt_tokens,
-                completion_tokens: entry.emitted,
-            });
+        if !emit_sampled_token(
+            &entry.request,
+            policy,
+            token,
+            logprobs[row + row_base].take(),
+            entry.prompt_tokens,
+            entry.emitted,
+        ) {
             retire.push(row);
             continue;
         }
@@ -2015,6 +1970,136 @@ fn emit_decode_rows(
     }
     for row in retire.into_iter().rev() {
         active.swap_remove(row);
+    }
+}
+
+#[cfg(test)]
+mod stop_contract_tests {
+    use pegainfer_frontend::engine::EosPolicy;
+    use pegainfer_frontend::engine::StopCause;
+    use pegainfer_frontend::engine::StopPolicy;
+    use pegainfer_frontend::engine::TokenSink;
+    use pegainfer_frontend::sampler::SamplingParams;
+
+    use super::*;
+
+    fn request(
+        stop_policy: StopPolicy,
+        max_tokens: usize,
+    ) -> (
+        GenerateRequest,
+        pegainfer_frontend::engine::TokenStreamReceiver,
+    ) {
+        let (token_tx, token_rx) = TokenSink::standalone();
+        (
+            GenerateRequest {
+                trace_parent: None,
+                request_id: None,
+                queued_at_unix_s: None,
+                data_parallel_rank: None,
+                prompt_tokens: vec![1, 2],
+                params: SamplingParams::default(),
+                stop_policy,
+                max_tokens,
+                lora_adapter: None,
+                kv_transfer_params: None,
+                token_tx,
+                logprobs: 1,
+                echo: false,
+            },
+            token_rx,
+        )
+    }
+
+    fn policy() -> GenerationPolicy {
+        GenerationPolicy {
+            eos: vec![99],
+            suppress: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn model_eos_is_emitted_before_its_stop_finish() {
+        let (request, mut rx) = request(StopPolicy::default(), 8);
+        let logprob = TokenLogprob {
+            logprob: -0.25,
+            top_logprobs: vec![(99, -0.25)],
+        };
+
+        assert!(!emit_sampled_token(
+            &request,
+            &policy(),
+            99,
+            Some(logprob.clone()),
+            2,
+            1,
+        ));
+
+        let Ok((_, TokenEvent::Token { id, logprob: seen })) = rx.try_recv() else {
+            panic!("expected trigger Token event");
+        };
+        assert_eq!(id, 99);
+        assert_eq!(seen, Some(logprob));
+        let Ok((
+            _,
+            TokenEvent::Finished {
+                finish_reason,
+                stop_cause,
+                completion_tokens,
+                ..
+            },
+        )) = rx.try_recv()
+        else {
+            panic!("expected terminal Finished event");
+        };
+        assert_eq!(finish_reason, FinishReason::Stop);
+        assert_eq!(stop_cause, Some(StopCause::Eos(99)));
+        assert_eq!(completion_tokens, 1);
+    }
+
+    #[test]
+    fn ignored_eos_still_honors_an_explicit_stop_token() {
+        let (request, mut rx) = request(
+            StopPolicy {
+                eos: EosPolicy::Ignore,
+                token_ids: vec![99],
+            },
+            8,
+        );
+
+        assert!(!emit_sampled_token(&request, &policy(), 99, None, 2, 1));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok((_, TokenEvent::Token { id: 99, .. }))
+        ));
+        let Ok((_, TokenEvent::Finished { stop_cause, .. })) = rx.try_recv() else {
+            panic!("expected terminal Finished event");
+        };
+        assert_eq!(stop_cause, Some(StopCause::Token(99)));
+    }
+
+    #[test]
+    fn unmatched_token_at_the_budget_finishes_by_length() {
+        let (request, mut rx) = request(StopPolicy::default(), 1);
+
+        assert!(!emit_sampled_token(&request, &policy(), 7, None, 2, 1));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok((_, TokenEvent::Token { id: 7, .. }))
+        ));
+        let Ok((
+            _,
+            TokenEvent::Finished {
+                finish_reason,
+                stop_cause,
+                ..
+            },
+        )) = rx.try_recv()
+        else {
+            panic!("expected terminal Finished event");
+        };
+        assert_eq!(finish_reason, FinishReason::Length);
+        assert_eq!(stop_cause, None);
     }
 }
 
@@ -2058,8 +2143,10 @@ mod lane_tests {
     use std::path::Path;
 
     use pegainfer_frontend::engine::EngineLoadOptions;
+    use pegainfer_frontend::engine::EosPolicy;
     use pegainfer_frontend::engine::FinishReason;
     use pegainfer_frontend::engine::GenerateRequest;
+    use pegainfer_frontend::engine::StopPolicy;
     use pegainfer_frontend::engine::TokenEvent;
     use pegainfer_frontend::engine::TokenSink;
     use pegainfer_frontend::engine::TokenStreamReceiver;
@@ -2288,6 +2375,10 @@ mod lane_tests {
                 params: pegainfer_frontend::sampler::SamplingParams {
                     ignore_eos: true,
                     ..pegainfer_frontend::sampler::SamplingParams::default()
+                },
+                stop_policy: StopPolicy {
+                    eos: EosPolicy::Ignore,
+                    token_ids: Vec::new(),
                 },
                 max_tokens,
                 lora_adapter: None,

@@ -6,6 +6,7 @@
 //! module owns only the KV bookkeeping the executor thread is responsible for.
 
 use anyhow::Result;
+use pegainfer_frontend::engine::StopPolicy;
 
 use super::Qwen3Executor;
 use super::RequestId;
@@ -14,7 +15,28 @@ use super::WorkerStepOutcome;
 use crate::speculative::DraftPlan;
 use crate::speculative::DraftResult;
 use crate::speculative::VerifyPlan;
+use crate::speculative::VerifyRequestResult;
 use crate::speculative::VerifyResult;
+
+/// Remove accepted tokens after the first request-terminal token before the
+/// speculative KV transaction commits. The scheduler classifies the same
+/// retained trigger later to produce the typed protocol stop cause.
+fn truncate_after_terminal(
+    result: &mut VerifyRequestResult,
+    policy: &StopPolicy,
+    model_eos: &[u32],
+) {
+    let Some(keep) = result.accepted_tokens.iter().position(|&token| {
+        policy
+            .classify(token, |id| model_eos.contains(&id))
+            .is_some()
+    }) else {
+        return;
+    };
+    let keep = keep + 1;
+    result.accepted_tokens.truncate(keep);
+    result.matched_draft_tokens = result.matched_draft_tokens.min(keep);
+}
 
 impl Qwen3Executor {
     pub(super) fn execute_speculative_verify_impl(
@@ -24,6 +46,12 @@ impl Qwen3Executor {
         anyhow::ensure!(
             self.speculative.is_some(),
             "speculative verification requested but no draft model is loaded"
+        );
+        anyhow::ensure!(
+            plan.stop_policies.len() == plan.requests.len(),
+            "speculative verify received {} stop policies for {} requests",
+            plan.stop_policies.len(),
+            plan.requests.len()
         );
         for req in plan.requests {
             anyhow::ensure!(
@@ -80,7 +108,7 @@ impl Qwen3Executor {
                 return Err(e);
             }
         };
-        let result = match outcome {
+        let mut result = match outcome {
             WorkerStepOutcome::SpeculativeVerify(result) => result,
             other => {
                 self.revert_speculative_schedules(&scheduled);
@@ -107,6 +135,12 @@ impl Qwen3Executor {
                     req.request_id
                 ));
             }
+        }
+        // The worker returns the mathematically accepted span. Apply the
+        // request contract before touching RequestKv so a terminal token's
+        // speculative suffix is rolled back with the unused reservation.
+        for (policy, req_result) in plan.stop_policies.iter().zip(&mut result.requests) {
+            truncate_after_terminal(req_result, policy, &self.metadata.stop_token_ids);
         }
 
         // Commit the accepted prefix of each request's KV and free the rest.
@@ -189,5 +223,62 @@ impl Qwen3Executor {
                 log::warn!("failed to revert speculative schedule for {request_id:?}: {error}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pegainfer_frontend::engine::EosPolicy;
+
+    use super::*;
+
+    #[test]
+    fn explicit_stop_truncates_the_kv_commit_after_the_trigger() {
+        let policy = StopPolicy {
+            eos: EosPolicy::Ignore,
+            token_ids: vec![7],
+        };
+        let mut result = VerifyRequestResult {
+            request_id: RequestId::new(1),
+            matched_draft_tokens: 3,
+            accepted_tokens: vec![5, 7, 8, 9],
+        };
+
+        truncate_after_terminal(&mut result, &policy, &[99]);
+
+        assert_eq!(result.accepted_tokens, vec![5, 7]);
+        assert_eq!(result.matched_draft_tokens, 2);
+    }
+
+    #[test]
+    fn model_eos_truncates_but_keeps_the_trigger() {
+        let mut result = VerifyRequestResult {
+            request_id: RequestId::new(2),
+            matched_draft_tokens: 3,
+            accepted_tokens: vec![5, 99, 8, 9],
+        };
+
+        truncate_after_terminal(&mut result, &StopPolicy::default(), &[99]);
+
+        assert_eq!(result.accepted_tokens, vec![5, 99]);
+        assert_eq!(result.matched_draft_tokens, 2);
+    }
+
+    #[test]
+    fn posterior_stop_does_not_reduce_the_matched_draft_count() {
+        let policy = StopPolicy {
+            eos: EosPolicy::Ignore,
+            token_ids: vec![99],
+        };
+        let mut result = VerifyRequestResult {
+            request_id: RequestId::new(3),
+            matched_draft_tokens: 2,
+            accepted_tokens: vec![5, 6, 99],
+        };
+
+        truncate_after_terminal(&mut result, &policy, &[7]);
+
+        assert_eq!(result.accepted_tokens, vec![5, 6, 99]);
+        assert_eq!(result.matched_draft_tokens, 2);
     }
 }

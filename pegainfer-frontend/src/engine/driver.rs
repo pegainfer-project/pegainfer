@@ -108,6 +108,7 @@ mod tests {
     use super::super::step::Request;
     use super::super::step::RequestId;
     use super::super::step::Terminal;
+    use super::super::stop::StopPolicy;
     use super::*;
     use crate::engine::FinishReason;
 
@@ -141,7 +142,7 @@ mod tests {
                 let next = ledger.completion_tokens(id) as u32;
                 ledger.push_tokens(id, &[next], &[]);
                 if ledger.completion_tokens(id) >= max_tokens {
-                    ledger.finish(id, FinishReason::Length);
+                    ledger.finish(id, FinishReason::Length, None);
                 } else {
                     still_running.push((id, max_tokens));
                 }
@@ -163,6 +164,7 @@ mod tests {
         Request {
             prompt_tokens: vec![1, 2],
             params: crate::sampler::SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -197,6 +199,7 @@ mod tests {
             terminal,
             Some(Terminal::Finished {
                 reason: FinishReason::Length,
+                stop_cause: None,
                 prompt_tokens: 2,
                 completion_tokens: 3,
             })

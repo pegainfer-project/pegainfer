@@ -14,8 +14,10 @@ use lifecycle::validate_kv_capacity;
 use log::error;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::SubmittedRequest;
 use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_kv_cache::BlockPool;
 use pegainfer_kv_cache::RequestKv;
@@ -43,8 +45,55 @@ fn row_options(req: &GenerateRequest) -> KimiRowOptions {
     }
 }
 
+/// Deliver a sampled token before its terminal event so the protocol layer
+/// receives the exact trigger token and logprob. Stop classification stays on
+/// the host and does not change the GPU sampling row or CUDA graph inputs.
+fn emit_sampled_token(
+    token_tx: &TokenSink,
+    stop_policy: &StopPolicy,
+    model_eos: &[u32],
+    token_id: u32,
+    logprob: Option<TokenLogprob>,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    max_tokens: usize,
+) -> bool {
+    if token_tx
+        .send(TokenEvent::Token {
+            id: token_id,
+            logprob,
+        })
+        .is_err()
+    {
+        return false;
+    }
+
+    if let Some(stop_cause) = stop_policy.classify(token_id, |id| model_eos.contains(&id)) {
+        let _ = token_tx.send(TokenEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            stop_cause: Some(stop_cause),
+            prompt_tokens,
+            completion_tokens,
+        });
+        return false;
+    }
+
+    if completion_tokens >= max_tokens {
+        let _ = token_tx.send(TokenEvent::Finished {
+            finish_reason: FinishReason::Length,
+            stop_cause: None,
+            prompt_tokens,
+            completion_tokens,
+        });
+        return false;
+    }
+
+    true
+}
+
 struct ActiveKimiRequest {
     token_tx: TokenSink,
+    stop_policy: StopPolicy,
     prompt_len: usize,
     completion_tokens: usize,
     max_tokens: usize,
@@ -328,34 +377,16 @@ impl KimiK2Scheduler {
                     retire.push(idx);
                     continue;
                 }
-                // EOS outranks the length limit; the stop token itself is not
-                // emitted (same contract as the Qwen schedulers).
-                if !req.options.sampling.ignore_eos && self.stop_token_ids.contains(&token_id) {
-                    let _ = req.token_tx.send(TokenEvent::Finished {
-                        finish_reason: FinishReason::Stop,
-                        prompt_tokens: req.prompt_len,
-                        completion_tokens: req.completion_tokens,
-                    });
-                    retire.push(idx);
-                    continue;
-                }
-                if req
-                    .token_tx
-                    .send(TokenEvent::Token {
-                        id: token_id,
-                        logprob: report.logprob,
-                    })
-                    .is_err()
-                {
-                    retire.push(idx);
-                    continue;
-                }
-                if req.completion_tokens >= req.max_tokens {
-                    let _ = req.token_tx.send(TokenEvent::Finished {
-                        finish_reason: FinishReason::Length,
-                        prompt_tokens: req.prompt_len,
-                        completion_tokens: req.completion_tokens,
-                    });
+                if !emit_sampled_token(
+                    &req.token_tx,
+                    &req.stop_policy,
+                    &self.stop_token_ids,
+                    token_id,
+                    report.logprob,
+                    req.prompt_len,
+                    req.completion_tokens,
+                    req.max_tokens,
+                ) {
                     retire.push(idx);
                 } else {
                     req.last_token = token_id;
@@ -441,22 +472,16 @@ impl KimiK2Scheduler {
                     });
                     return None;
                 }
-                if !req.params.ignore_eos && self.stop_token_ids.contains(&token_id) {
-                    let _ = req.token_tx.send(TokenEvent::Finished {
-                        finish_reason: FinishReason::Stop,
-                        prompt_tokens: req.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
-                    return None;
-                }
-                if req
-                    .token_tx
-                    .send(TokenEvent::Token {
-                        id: token_id,
-                        logprob: report.logprob,
-                    })
-                    .is_err()
-                {
+                if !emit_sampled_token(
+                    &req.token_tx,
+                    &req.stop_policy,
+                    &self.stop_token_ids,
+                    token_id,
+                    report.logprob,
+                    req.prompt_tokens.len(),
+                    1,
+                    req.max_tokens,
+                ) {
                     return None;
                 }
                 token_id
@@ -476,17 +501,10 @@ impl KimiK2Scheduler {
             }
         };
         let completion_tokens = completion_tokens + 1;
-        if completion_tokens >= req.max_tokens {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: req.prompt_tokens.len(),
-                completion_tokens,
-            });
-            return None;
-        }
         let options = row_options(&req);
         Some(ActiveKimiRequest {
             token_tx: req.token_tx,
+            stop_policy: req.stop_policy,
             prompt_len: req.prompt_tokens.len(),
             completion_tokens,
             max_tokens: req.max_tokens,
@@ -576,36 +594,23 @@ impl KimiK2Scheduler {
                 });
                 continue;
             }
-            if !req.params.ignore_eos && self.stop_token_ids.contains(&token_id) {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
-                    prompt_tokens: req.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
-                continue;
-            }
-            if req
-                .token_tx
-                .send(TokenEvent::Token {
-                    id: token_id,
-                    logprob: report.logprob,
-                })
-                .is_err()
-            {
-                continue;
-            }
             let completion_tokens = 1usize;
-            if completion_tokens >= req.max_tokens {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Length,
-                    prompt_tokens: req.prompt_tokens.len(),
-                    completion_tokens,
-                });
+            if !emit_sampled_token(
+                &req.token_tx,
+                &req.stop_policy,
+                &self.stop_token_ids,
+                token_id,
+                report.logprob,
+                req.prompt_tokens.len(),
+                completion_tokens,
+                req.max_tokens,
+            ) {
                 continue;
             }
             let options = row_options(&req);
             active.push(ActiveKimiRequest {
                 token_tx: req.token_tx,
+                stop_policy: req.stop_policy,
                 prompt_len: req.prompt_tokens.len(),
                 completion_tokens,
                 max_tokens: req.max_tokens,
@@ -624,6 +629,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use pegainfer_frontend::engine::EosPolicy;
+    use pegainfer_frontend::engine::StopCause;
     use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
@@ -775,6 +782,7 @@ mod tests {
             data_parallel_rank: None,
             prompt_tokens,
             params: SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -783,6 +791,75 @@ mod tests {
             echo: false,
         };
         (req, token_rx)
+    }
+
+    #[test]
+    fn sampled_model_eos_is_emitted_before_stop_finish() {
+        let (req, mut token_rx) = request_with_channel(vec![11, 22], 4);
+        let logprob = TokenLogprob {
+            logprob: -0.5,
+            top_logprobs: vec![(99, -0.5)],
+        };
+
+        assert!(!emit_sampled_token(
+            &req.token_tx,
+            &req.stop_policy,
+            &[99],
+            99,
+            Some(logprob.clone()),
+            2,
+            1,
+            req.max_tokens,
+        ));
+
+        let Ok((_, TokenEvent::Token { id, logprob: seen })) = token_rx.try_recv() else {
+            panic!("expected trigger Token event");
+        };
+        assert_eq!(id, 99);
+        assert_eq!(seen, Some(logprob));
+        let Ok((
+            _,
+            TokenEvent::Finished {
+                finish_reason,
+                stop_cause,
+                completion_tokens,
+                ..
+            },
+        )) = token_rx.try_recv()
+        else {
+            panic!("expected terminal Finished event");
+        };
+        assert_eq!(finish_reason, FinishReason::Stop);
+        assert_eq!(stop_cause, Some(StopCause::Eos(99)));
+        assert_eq!(completion_tokens, 1);
+    }
+
+    #[test]
+    fn ignored_eos_still_honors_request_stop_token() {
+        let (mut req, mut token_rx) = request_with_channel(vec![11, 22], 4);
+        req.stop_policy = StopPolicy {
+            eos: EosPolicy::Ignore,
+            token_ids: vec![99],
+        };
+
+        assert!(!emit_sampled_token(
+            &req.token_tx,
+            &req.stop_policy,
+            &[99],
+            99,
+            None,
+            2,
+            1,
+            req.max_tokens,
+        ));
+        assert!(matches!(
+            token_rx.try_recv(),
+            Ok((_, TokenEvent::Token { id: 99, .. }))
+        ));
+        let Ok((_, TokenEvent::Finished { stop_cause, .. })) = token_rx.try_recv() else {
+            panic!("expected terminal Finished event");
+        };
+        assert_eq!(stop_cause, Some(StopCause::Token(99)));
     }
 
     #[test]

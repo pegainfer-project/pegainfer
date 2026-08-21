@@ -57,7 +57,9 @@ use crate::engine::RequestAbortReason;
 use crate::engine::RequestTag;
 use crate::engine::SchedulerMetrics;
 use crate::engine::SpecDecodeCounters;
+use crate::engine::StopCause;
 use crate::engine::TokenEvent;
+use crate::engine::TokenLogprob;
 use crate::engine::TokenSink;
 use crate::engine::TokenStreamReceiver;
 use crate::vllm::wire::convert_finish_reason;
@@ -274,7 +276,7 @@ impl LocalEngineBridge {
                 output_tx,
                 request_id,
                 EngineCoreFinishReason::Error,
-                None,
+                Some(StopReason::Text(unsupported)),
                 None,
                 None,
             )?;
@@ -306,6 +308,13 @@ impl LocalEngineBridge {
             sampling_params.eos_token_id,
             &sampling_params.stop_token_ids,
         );
+        let mut stop_candidate_ids = sampling_params.stop_token_ids.clone();
+        if let Some(eos_token_id) = sampling_params.eos_token_id
+            && !stop_candidate_ids.contains(&eos_token_id)
+        {
+            stop_candidate_ids.push(eos_token_id);
+        }
+        let stop_policy = crate::vllm::wire::convert_stop_policy(&sampling_params);
 
         let tag: RequestTag = Arc::from(request_id.as_str());
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
@@ -333,6 +342,7 @@ impl LocalEngineBridge {
                 data_parallel_rank: Some(self.engine_index as usize),
                 prompt_tokens,
                 params: convert_sampling(&sampling_params),
+                stop_policy,
                 max_tokens: sampling_params.max_tokens as usize,
                 lora_adapter,
                 kv_transfer_params,
@@ -344,7 +354,12 @@ impl LocalEngineBridge {
 
         streams.insert(
             tag,
-            RequestStreamState::new(abort_reason, trace_root, stop_sentinel_id),
+            RequestStreamState::new(
+                abort_reason,
+                trace_root,
+                stop_sentinel_id,
+                stop_candidate_ids,
+            ),
         );
         Ok(())
     }
@@ -364,6 +379,12 @@ struct RequestStreamState {
     /// The vLLM text decoder removes the final token from a stop-finished
     /// output. Keep an EOS or explicit stop token as that removable sentinel.
     stop_sentinel_id: Option<u32>,
+    /// Potential terminal ids are held until the matching `Finished` event.
+    /// Legacy producers send the token and terminal in separate channel sends;
+    /// this prevents a wakeup between those sends from leaking the trigger in
+    /// a non-terminal output.
+    stop_candidate_ids: Vec<u32>,
+    pending_stop_token: Option<(u32, Option<TokenLogprob>)>,
     abort_reason: Arc<AtomicU8>,
     has_emitted_tokens: bool,
     /// Request-lifetime root span (submit → finish). The scheduler opens
@@ -378,16 +399,27 @@ struct RequestStreamState {
 }
 
 impl RequestStreamState {
-    fn new(abort_reason: Arc<AtomicU8>, trace_root: Span, stop_sentinel_id: Option<u32>) -> Self {
+    fn new(
+        abort_reason: Arc<AtomicU8>,
+        trace_root: Span,
+        stop_sentinel_id: Option<u32>,
+        stop_candidate_ids: Vec<u32>,
+    ) -> Self {
         Self {
             first_token_events: None,
             first_token_prefill_stats: None,
             kv_transfer_params: None,
             stop_sentinel_id,
+            stop_candidate_ids,
+            pending_stop_token: None,
             abort_reason,
             has_emitted_tokens: false,
             trace_root,
         }
+    }
+
+    fn is_stop_candidate(&self, token_id: u32) -> bool {
+        self.stop_candidate_ids.contains(&token_id)
     }
 
     fn abort(&self, reason: RequestAbortReason) {
@@ -469,6 +501,24 @@ fn dispatch_burst(
 /// output goes first. A lone `Scheduled` (no token, no terminal) yields no
 /// output — its metadata waits in `state` for the first real output. Returns
 /// `(output, terminated)`.
+fn append_token(
+    token_ids: &mut Vec<u32>,
+    positions: &mut Vec<PositionLogprobs>,
+    has_logprobs: &mut bool,
+    id: u32,
+    logprob: Option<TokenLogprob>,
+) {
+    token_ids.push(id);
+    if let Some(position) = to_wire_position_logprobs(id, logprob) {
+        *has_logprobs = true;
+        positions.push(position);
+    } else {
+        positions.push(PositionLogprobs {
+            entries: Vec::new(),
+        });
+    }
+}
+
 fn reduce_request(
     request_id: &str,
     state: &mut RequestStreamState,
@@ -511,14 +561,25 @@ fn reduce_request(
                 });
             }
             TokenEvent::Token { id, logprob } => {
-                token_ids.push(id);
-                if let Some(position) = to_wire_position_logprobs(id, logprob) {
-                    has_logprobs = true;
-                    positions.push(position);
+                if let Some((pending_id, pending_logprob)) = state.pending_stop_token.take() {
+                    append_token(
+                        &mut token_ids,
+                        &mut positions,
+                        &mut has_logprobs,
+                        pending_id,
+                        pending_logprob,
+                    );
+                }
+                if state.is_stop_candidate(id) {
+                    state.pending_stop_token = Some((id, logprob));
                 } else {
-                    positions.push(PositionLogprobs {
-                        entries: Vec::new(),
-                    });
+                    append_token(
+                        &mut token_ids,
+                        &mut positions,
+                        &mut has_logprobs,
+                        id,
+                        logprob,
+                    );
                 }
             }
             TokenEvent::PromptTokens { .. } => {
@@ -528,25 +589,62 @@ fn reduce_request(
                 state.kv_transfer_params = Some(params);
             }
             TokenEvent::Finished {
-                finish_reason: fr, ..
+                finish_reason: fr,
+                stop_cause,
+                ..
             } => {
-                // PegaInfer suppresses EOS before emitting TokenEvents, while
-                // vLLM's text decoder expects the terminal Stop output to
-                // contain EOS and unconditionally removes its final token.
-                // Without this protocol token, a speculative step that commits
-                // [visible token, EOS] loses the visible token at the frontend.
-                if fr == FinishReason::Stop
-                    && let Some(stop_sentinel_id) = state.stop_sentinel_id
-                {
-                    token_ids.push(stop_sentinel_id);
-                    positions.push(PositionLogprobs {
-                        entries: Vec::new(),
-                    });
+                let had_pending_stop = state
+                    .pending_stop_token
+                    .take()
+                    .map(|(id, logprob)| {
+                        append_token(
+                            &mut token_ids,
+                            &mut positions,
+                            &mut has_logprobs,
+                            id,
+                            logprob,
+                        );
+                    })
+                    .is_some();
+                if fr == FinishReason::Stop {
+                    match stop_cause {
+                        // A migrated scheduler already emitted the triggering
+                        // token with its real logprob. Tell vLLM which token it
+                        // is instead of guessing from the request's policy.
+                        Some(StopCause::Token(token_id)) => {
+                            stop_reason = Some(StopReason::TokenId(token_id));
+                        }
+                        // EOS has no wire stop_reason. The emitted EOS token
+                        // remains the terminal sentinel for vLLM's decoder.
+                        Some(StopCause::Eos(_)) => {}
+                        // Older schedulers suppress their terminal token and
+                        // cannot report its cause. Preserve the old fallback
+                        // until every producer has migrated to StopCause.
+                        None => {
+                            if !had_pending_stop
+                                && let Some(stop_sentinel_id) = state.stop_sentinel_id
+                            {
+                                token_ids.push(stop_sentinel_id);
+                                positions.push(PositionLogprobs {
+                                    entries: Vec::new(),
+                                });
+                            }
+                        }
+                    }
                 }
                 finish_reason = Some(convert_finish_reason(fr));
                 terminated = true;
             }
             TokenEvent::Error { message, .. } => {
+                if let Some((id, logprob)) = state.pending_stop_token.take() {
+                    append_token(
+                        &mut token_ids,
+                        &mut positions,
+                        &mut has_logprobs,
+                        id,
+                        logprob,
+                    );
+                }
                 warn!("request {request_id} failed: {message}");
                 finish_reason = Some(EngineCoreFinishReason::Error);
                 stop_reason = Some(StopReason::Text(message));
@@ -555,6 +653,15 @@ fn reduce_request(
             TokenEvent::Rejected { message, .. } => {
                 // Rejected means the request could not be admitted, not that it
                 // completed cleanly.
+                if let Some((id, logprob)) = state.pending_stop_token.take() {
+                    append_token(
+                        &mut token_ids,
+                        &mut positions,
+                        &mut has_logprobs,
+                        id,
+                        logprob,
+                    );
+                }
                 warn!("request {request_id} rejected: {message}");
                 finish_reason = Some(EngineCoreFinishReason::Error);
                 stop_reason = Some(StopReason::Text(message));

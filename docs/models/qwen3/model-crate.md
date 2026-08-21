@@ -157,7 +157,7 @@ pub fn start_engine(
 ### Step 7: Retire ModelForward and Fix Length Limit
 - Deleted `pegainfer_core::model::{ModelForward, GenerationState}` and removed the root `src/model.rs` re-export.
 - Deleted the Qwen3 `forward.rs` compatibility path. Qwen3 tests that used it now build their baselines from `batch_prefill(bs=1)` plus `batch_decode(bs=1)`, so they exercise the same phase APIs as production.
-- Fixed Qwen3 decode length-limit handling by adding `DecodeEffect::EmitAndFinish`. EOS behavior is unchanged: EOS finishes without emitting the stop token. Length limit now emits the sampled final token, then sends `Finished { finish_reason: Length }`.
+- Fixed Qwen3 decode length-limit handling by adding `DecodeEffect::EmitAndFinish`. At that point EOS still finished without emitting the stop token; the current typed stop contract emits the trigger token and its `StopCause` together. Length-limited output likewise retains the sampled final token before `Finished { finish_reason: Length }`.
 - Regenerated `test_data/Qwen3-4B.json` because every length-limited golden output now includes the final requested token.
 - Re-ran `bench_serving snapshot` on the CUDA validation host and pulled back `bench_snapshots/rtx-5090/qwen3-4b.json`; `decode_heavy (1024,256)` now records `generated_tokens min=max=avg=256`.
 - Performance stayed within noise on RTX 5090:

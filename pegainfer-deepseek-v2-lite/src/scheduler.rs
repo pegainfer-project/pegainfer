@@ -20,6 +20,7 @@ use grouping::take_decode_position_groups;
 use log::info;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::SubmittedRequest;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenSink;
@@ -51,6 +52,7 @@ struct PendingRequest {
     queued_at_unix_s: Option<f64>,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
+    stop_policy: StopPolicy,
     max_tokens: usize,
     lora_adapter: Option<String>,
     token_tx: TokenSink,
@@ -65,16 +67,11 @@ struct ActiveRequestState {
     max_tokens: usize,
     generated: usize,
     last_token: u32,
-    finish_policy: FinishPolicy,
+    stop_policy: StopPolicy,
+    model_eos_token_id: u32,
     cache: DecodeCache,
     stats: GenerationStats,
     trace: RequestTrace,
-}
-
-#[derive(Clone, Copy)]
-struct FinishPolicy {
-    eos_token_id: u32,
-    ignore_eos: bool,
 }
 
 struct AdmissionBatch {
@@ -186,6 +183,7 @@ impl MixedRequestScheduler {
                     );
                     let _ = pending.token_tx.send(TokenEvent::Finished {
                         finish_reason: FinishReason::Length,
+                        stop_cause: None,
                         prompt_tokens: pending.prompt_tokens.len(),
                         completion_tokens: 0,
                     });
@@ -279,10 +277,8 @@ impl MixedRequestScheduler {
             max_tokens: pending.max_tokens,
             generated: 0,
             last_token: next,
-            finish_policy: FinishPolicy {
-                eos_token_id: self.generator.config().eos_token_id,
-                ignore_eos: pending.params.ignore_eos,
-            },
+            stop_policy: pending.stop_policy,
+            model_eos_token_id: self.generator.config().eos_token_id,
             cache,
             stats,
             trace: RequestTrace::new(
@@ -535,6 +531,7 @@ impl From<GenerateRequest> for PendingRequest {
             queued_at_unix_s: req.queued_at_unix_s,
             prompt_tokens: req.prompt_tokens,
             params: req.params,
+            stop_policy: req.stop_policy,
             max_tokens: req.max_tokens,
             lora_adapter: req.lora_adapter,
             token_tx: req.token_tx,
@@ -568,20 +565,9 @@ impl ActiveRequestState {
         pending_queue_size_at_terminal: usize,
     ) -> bool {
         self.last_token = token;
-        if !self.finish_policy.ignore_eos && token == self.finish_policy.eos_token_id {
-            self.log_http_trace(
-                FinishReason::Stop,
-                None,
-                active_set_size_at_terminal,
-                pending_queue_size_at_terminal,
-            );
-            let _ = self.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: self.prompt_len,
-                completion_tokens: self.generated,
-            });
-            return true;
-        }
+        let stop_cause = self
+            .stop_policy
+            .classify(token, |token_id| token_id == self.model_eos_token_id);
 
         let first_emit_at = self
             .trace
@@ -610,6 +596,22 @@ impl ActiveRequestState {
         }
         self.generated += 1;
 
+        if let Some(stop_cause) = stop_cause {
+            self.log_http_trace(
+                FinishReason::Stop,
+                None,
+                active_set_size_at_terminal,
+                pending_queue_size_at_terminal,
+            );
+            let _ = self.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                stop_cause: Some(stop_cause),
+                prompt_tokens: self.prompt_len,
+                completion_tokens: self.generated,
+            });
+            return true;
+        }
+
         if self.generated == self.max_tokens {
             self.log_http_trace(
                 FinishReason::Length,
@@ -619,6 +621,7 @@ impl ActiveRequestState {
             );
             let _ = self.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
+                stop_cause: None,
                 prompt_tokens: self.prompt_len,
                 completion_tokens: self.generated,
             });

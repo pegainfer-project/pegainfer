@@ -17,7 +17,6 @@ vllm-bench \
   --multi-turn --multi-turn-num-turns 5 \
   --random-input-len 4096 --per-turn-input-len 1024 --random-output-len 128 \
   --num-prompts 20 --multi-turn-concurrency 10 \
-  --extra-body '{"min_tokens":1}' \
   --temperature 0
 ```
 

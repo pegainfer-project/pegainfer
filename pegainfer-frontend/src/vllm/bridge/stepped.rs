@@ -44,8 +44,6 @@ use super::scheduler_stats_from;
 use super::send_outputs;
 use super::send_terminal_output;
 use super::send_utility_response;
-use super::stop_sentinel_id;
-use crate::engine::FinishReason;
 use crate::engine::KvCapacity;
 use crate::engine::Request;
 use crate::engine::RequestControl;
@@ -53,9 +51,11 @@ use crate::engine::RequestId;
 use crate::engine::RequestUpdate;
 use crate::engine::SchedulerHandle;
 use crate::engine::StepOutputs;
+use crate::engine::StopCause;
 use crate::engine::Terminal;
 use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
+use crate::vllm::wire::convert_stop_policy;
 use crate::vllm::wire::lora_adapter_from_sampling_params;
 use crate::vllm::wire::requested_logprobs;
 use crate::vllm::wire::to_wire_position_logprobs;
@@ -328,11 +328,12 @@ impl SteppedEngineBridge {
                 output_tx,
                 request_id,
                 EngineCoreFinishReason::Error,
-                None,
+                Some(StopReason::Text(unsupported)),
                 None,
                 None,
             );
         }
+
         let lora_adapter = match lora_adapter_from_sampling_params(&sampling_params) {
             Ok(adapter) => adapter,
             Err(error) => {
@@ -354,10 +355,6 @@ impl SteppedEngineBridge {
             .as_ref()
             .and_then(|args| args.get("kv_transfer_params"))
             .cloned();
-        let stop_sentinel_id = stop_sentinel_id(
-            sampling_params.eos_token_id,
-            &sampling_params.stop_token_ids,
-        );
 
         // Open the request's root span before submit so its context travels
         // into the scheduler as the parent of the queue/prefill/decode spans;
@@ -369,9 +366,11 @@ impl SteppedEngineBridge {
             Span::noop()
         };
         let trace_parent = SpanContext::from_span(&trace_root);
+
         let control = self.scheduler.submit(Request {
             prompt_tokens,
             params: convert_sampling(&sampling_params),
+            stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
             lora_adapter,
             kv_transfer_params,
@@ -384,7 +383,7 @@ impl SteppedEngineBridge {
         names.insert(request_id.clone(), control.id());
         streams.insert(
             control.id(),
-            SteppedStream::new(request_id, control, trace_root, stop_sentinel_id),
+            SteppedStream::new(request_id, control, trace_root),
         );
         Ok(())
     }
@@ -404,9 +403,6 @@ struct SteppedStream {
     /// P/D handoff metadata can arrive in an update with no token or
     /// terminal, so retain it until the next output carries it to the router.
     kv_transfer_params: Option<serde_json::Value>,
-    /// The vLLM text decoder removes the final token from a stop-finished
-    /// output. Keep an EOS or explicit stop token as that removable sentinel.
-    stop_sentinel_id: Option<u32>,
     /// Request-lifetime root span; held only for its `Drop`, which closes the
     /// trace when the stream state is removed.
     #[allow(dead_code)]
@@ -414,12 +410,7 @@ struct SteppedStream {
 }
 
 impl SteppedStream {
-    fn new(
-        request_id: String,
-        control: RequestControl,
-        trace_root: Span,
-        stop_sentinel_id: Option<u32>,
-    ) -> Self {
+    fn new(request_id: String, control: RequestControl, trace_root: Span) -> Self {
         Self {
             request_id,
             control,
@@ -428,7 +419,6 @@ impl SteppedStream {
             cached_tokens: 0,
             prefill_stats_sent: false,
             kv_transfer_params: None,
-            stop_sentinel_id,
             trace_root,
         }
     }
@@ -485,7 +475,7 @@ fn reduce_update(
     // before submission), matching the legacy bridge. Wiring it up means mapping
     // PromptEcho into EngineCoreOutput's prompt_logprobs fields.
 
-    let mut token_ids = update.tokens;
+    let token_ids = update.tokens;
     let mut has_logprobs = false;
     let mut positions: Vec<PositionLogprobs> = Vec::with_capacity(token_ids.len());
     for (i, &id) in token_ids.iter().enumerate() {
@@ -505,18 +495,13 @@ fn reduce_update(
     let mut terminated = false;
     match update.terminal {
         None => {}
-        Some(Terminal::Finished { reason, .. }) => {
-            // PegaInfer suppresses EOS before emitting tokens, while vLLM's
-            // text decoder expects the terminal Stop output to contain EOS
-            // and unconditionally removes its final token.
-            if reason == FinishReason::Stop
-                && let Some(stop_sentinel_id) = state.stop_sentinel_id
-            {
-                token_ids.push(stop_sentinel_id);
-                positions.push(PositionLogprobs {
-                    entries: Vec::new(),
-                });
+        Some(Terminal::Finished {
+            reason, stop_cause, ..
+        }) => {
+            if let Some(StopCause::Token(token_id)) = stop_cause {
+                stop_reason = Some(StopReason::TokenId(token_id));
             }
+
             finish_reason = Some(convert_finish_reason(reason));
             terminated = true;
         }
@@ -577,5 +562,140 @@ impl UnixAnchor {
         } else {
             self.sys - (self.instant - t).as_secs_f64()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use vllm_engine_core_client::protocol::output::EngineCoreOutputs;
+    use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
+
+    use super::*;
+    use crate::engine::FinishReason;
+    use crate::engine::TokenLogprob;
+
+    #[test]
+    fn min_tokens_is_rejected_before_scheduler_submission() {
+        let (scheduler, backend) = crate::engine::scheduler_pair();
+        let bridge = SteppedEngineBridge {
+            input_address: String::new(),
+            output_address: String::new(),
+            scheduler,
+            kv_capacity: None,
+            max_model_len: 4096,
+            engine_index: 3,
+            data_parallel_size: 1,
+        };
+        let mut sampling_params = EngineCoreSamplingParams::for_test();
+        sampling_params.min_tokens = 1;
+        let request = EngineCoreRequest {
+            request_id: "min-tokens".to_string(),
+            prompt_token_ids: Some(vec![1, 2]),
+            sampling_params: Some(sampling_params),
+            ..EngineCoreRequest::default()
+        };
+        let mut streams = HashMap::new();
+        let mut names = HashMap::new();
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        bridge
+            .start_request(request, &mut streams, &mut names, &output_tx)
+            .expect("reject min_tokens request");
+
+        assert!(matches!(
+            backend.submissions.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+        assert!(streams.is_empty());
+        assert!(names.is_empty());
+
+        let batch = match output_rx.try_recv().expect("rejection output") {
+            EngineCoreOutputs::RequestBatch(batch) => batch,
+            other => panic!("expected request batch, got {other:?}"),
+        };
+        assert_eq!(batch.outputs.len(), 1);
+        let output = &batch.outputs[0];
+        assert_eq!(output.request_id, "min-tokens");
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
+        assert_eq!(
+            output.stop_reason,
+            Some(StopReason::Text(
+                "min_tokens=1 is not supported by current engine contracts".to_string()
+            ))
+        );
+        assert!(
+            batch
+                .finished_requests
+                .as_ref()
+                .is_some_and(|ids| ids.contains("min-tokens"))
+        );
+        assert!(output_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn request_stop_maps_the_actual_token_and_preserves_its_logprob() {
+        let id = RequestId::new(7);
+        let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
+        let mut state = SteppedStream::new("request-7".to_string(), control, Span::noop());
+
+        let mut update = RequestUpdate::empty(id);
+        update.tokens = vec![11, 43];
+        update.logprobs = vec![
+            None,
+            Some(TokenLogprob {
+                logprob: -0.25,
+                top_logprobs: vec![(43, -0.25), (44, -1.0)],
+            }),
+        ];
+        update.terminal = Some(Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Token(43)),
+            prompt_tokens: 16,
+            completion_tokens: 2,
+        });
+
+        let (output, terminated) = reduce_update(&mut state, update, &UnixAnchor::now());
+        let output = output.expect("terminal output");
+
+        assert!(terminated);
+        assert_eq!(output.new_token_ids, vec![11, 43]);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+        assert_eq!(output.stop_reason, Some(StopReason::TokenId(43)));
+
+        let direct = match output.new_logprobs.expect("stop-token logprob") {
+            MaybeWireLogprobs::Direct(direct) => direct,
+            MaybeWireLogprobs::Wire(_) => panic!("expected direct logprobs"),
+        };
+
+        assert_eq!(direct.positions.len(), 2);
+        assert_eq!(direct.positions[1].entries[0].token_id, 43);
+        assert!((direct.positions[1].entries[0].logprob + 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn model_eos_has_no_wire_stop_reason() {
+        let id = RequestId::new(8);
+        let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
+        let mut state = SteppedStream::new("request-8".to_string(), control, Span::noop());
+
+        let mut update = RequestUpdate::empty(id);
+        update.tokens = vec![2];
+        update.logprobs = vec![None];
+        update.terminal = Some(Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Eos(2)),
+            prompt_tokens: 16,
+            completion_tokens: 1,
+        });
+
+        let (output, terminated) = reduce_update(&mut state, update, &UnixAnchor::now());
+        let output = output.expect("terminal output");
+
+        assert!(terminated);
+        assert_eq!(output.new_token_ids, vec![2]);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+        assert_eq!(output.stop_reason, None);
     }
 }

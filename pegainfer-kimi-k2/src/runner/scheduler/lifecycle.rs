@@ -75,6 +75,7 @@ pub(in crate::runner) fn preflight_prefill_candidate(
         UnschedulableVerdict::Finish => {
             let _ = req.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Length,
+                stop_cause: None,
                 prompt_tokens: req.prompt_tokens.len(),
                 completion_tokens: 0,
             });

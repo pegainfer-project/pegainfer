@@ -27,7 +27,9 @@ use std::path::PathBuf;
 use anyhow::Context;
 use anyhow::Result;
 use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_sample::SamplingParams;
@@ -95,6 +97,10 @@ fn run_request(
         data_parallel_rank: Some(rank),
         prompt_tokens: PATHOLOGICAL_PROMPT[..prompt_len].to_vec(),
         params,
+        stop_policy: StopPolicy {
+            eos: EosPolicy::Ignore,
+            token_ids: Vec::new(),
+        },
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,

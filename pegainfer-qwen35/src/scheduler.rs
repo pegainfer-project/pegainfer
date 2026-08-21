@@ -31,6 +31,7 @@ use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest as SchedulerRequest;
 use pegainfer_frontend::engine::KvCapacity;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::SubmittedRequest;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenLogprob;
@@ -85,6 +86,7 @@ struct ActiveRequest35 {
     max_tokens: usize,
     prompt_len: usize,
     params: SamplingParams,
+    stop_policy: StopPolicy,
     /// Number of top logprobs to return (0 = disabled).
     logprobs: usize,
 }
@@ -2073,10 +2075,12 @@ fn dispatch_decode_tokens(
         let req = &mut active[i];
         req.generated_count += 1;
 
-        let is_eos = !req.params.ignore_eos && backend.is_stop_token(token);
+        let stop_cause = req
+            .stop_policy
+            .classify(token, |token_id| backend.is_stop_token(token_id));
         let at_limit = req.generated_count >= req.max_tokens;
 
-        if is_eos {
+        if let Some(stop_cause) = stop_cause {
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
                 req.request_id,
@@ -2084,15 +2088,21 @@ fn dispatch_decode_tokens(
                 req.generated_count,
                 FinishReason::Stop
             );
-            let event = TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens: req.prompt_len,
-                completion_tokens: req.generated_count,
-            };
+            let events = vec![
+                TokenEvent::Token { id: token, logprob },
+                TokenEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    stop_cause: Some(stop_cause),
+                    prompt_tokens: req.prompt_len,
+                    completion_tokens: req.generated_count,
+                },
+            ];
             if backend.completion_requires_drop_ack() {
-                to_retire.push((i, Retirement::Completion(vec![event])));
+                to_retire.push((i, Retirement::Completion(events)));
             } else {
-                let _ = req.token_tx.send(event);
+                for event in events {
+                    let _ = req.token_tx.send(event);
+                }
                 to_retire.push((i, Retirement::CleanupOnly));
             }
         } else if at_limit {
@@ -2107,6 +2117,7 @@ fn dispatch_decode_tokens(
                 TokenEvent::Token { id: token, logprob },
                 TokenEvent::Finished {
                     finish_reason: FinishReason::Length,
+                    stop_cause: None,
                     prompt_tokens: req.prompt_len,
                     completion_tokens: req.generated_count,
                 },
@@ -2392,21 +2403,31 @@ fn promote_or_requeue(
         let first_token = artifact.token;
         let logprob = artifact.logprob;
 
-        if !req.params.ignore_eos && backend.is_stop_token(first_token) {
+        let stop_cause = req
+            .stop_policy
+            .classify(first_token, |token_id| backend.is_stop_token(token_id));
+        if let Some(stop_cause) = stop_cause {
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
                 req.request_id,
                 prompt_len,
-                0,
+                1,
                 FinishReason::Stop
             );
             let candidate = CompletionCandidate {
                 request: PrefillCompletionRequest { req, backend_state },
-                final_events: vec![TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
-                    prompt_tokens: prompt_len,
-                    completion_tokens: 0,
-                }],
+                final_events: vec![
+                    TokenEvent::Token {
+                        id: first_token,
+                        logprob,
+                    },
+                    TokenEvent::Finished {
+                        finish_reason: FinishReason::Stop,
+                        stop_cause: Some(stop_cause),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: 1,
+                    },
+                ],
             };
             if let Err(err) = backend
                 .drop_prefill_state(&candidate.request.backend_state, DropExpectation::MustExist)
@@ -2439,6 +2460,7 @@ fn promote_or_requeue(
                     },
                     TokenEvent::Finished {
                         finish_reason: FinishReason::Length,
+                        stop_cause: None,
                         prompt_tokens: prompt_len,
                         completion_tokens: 1,
                     },
@@ -2494,6 +2516,7 @@ fn promote_or_requeue(
             max_tokens: req.max_tokens,
             prompt_len,
             params: req.params,
+            stop_policy: req.stop_policy,
             logprobs: req.logprobs,
         });
     }

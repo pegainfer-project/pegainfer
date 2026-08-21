@@ -4,6 +4,8 @@
 //! ([`Glm52SlotState::advance_span`]).
 
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 
 use crate::dspark::GLM52_DSPARK_DRAFTS;
 use crate::dspark::accept_prefix_match;
@@ -85,15 +87,17 @@ pub(super) enum Glm52StepOutcome {
     /// Mid-prefill: the model's outputs are discarded, keep feeding the prompt.
     Prefilling,
     /// Commit the span's agreed tokens: `committed` is the consumed run
-    /// (what advances the request's KV bookkeeping — a suppressed EOS is its
-    /// last entry), of which the leading `emit` tokens are sent to the
-    /// client, then finish if `finish` is set. Plain decode commits exactly
-    /// one token; a verify span commits the accepted draft prefix plus the
+    /// (what advances the request's KV bookkeeping), of which the leading
+    /// `emit` tokens are sent to the client, then finish if `finish` is set.
+    /// A token-driven finish includes its trigger in both `committed` and
+    /// `emit`, with the typed cause retained separately. Plain decode commits
+    /// exactly one token; a verify span commits the accepted draft prefix plus the
     /// model's correction or bonus token (1..=span tokens).
     Commit {
         committed: Vec<u32>,
         emit: usize,
         finish: Option<FinishReason>,
+        stop_cause: Option<StopCause>,
         /// Leading span rows whose tokens are now committed context for the
         /// draft lane: all rows of a prompt span; anchor + accepted drafts of
         /// a verify span (rejected rows' captured hidden is dead).
@@ -109,10 +113,10 @@ pub(super) enum Glm52StepOutcome {
 pub(super) struct Glm52SlotState {
     prompt: Vec<u32>,
     max_tokens: usize,
-    ignore_eos: bool,
+    stop_policy: StopPolicy,
     /// Prompt tokens already fed to the model.
     fed: usize,
-    /// Generated tokens (a suppressed EOS counts).
+    /// Generated tokens, including a token that triggers termination.
     completion: usize,
     /// Sampling steps already consumed outside this D request's client-visible
     /// completion budget. Manual native-P/D uses one: P sampled the forwarded
@@ -155,7 +159,7 @@ impl Glm52SlotState {
     pub(super) fn new(
         prompt: Vec<u32>,
         max_tokens: usize,
-        ignore_eos: bool,
+        stop_policy: StopPolicy,
         cached_tokens: usize,
     ) -> Self {
         debug_assert!(cached_tokens < prompt.len());
@@ -163,7 +167,7 @@ impl Glm52SlotState {
             fed: cached_tokens,
             prompt,
             max_tokens,
-            ignore_eos,
+            stop_policy,
             completion: 0,
             sampling_offset: 0,
             last_token: 0,
@@ -391,28 +395,32 @@ impl Glm52SlotState {
         let mut committed = committed;
         let mut emit = 0usize;
         let mut finish = None;
+        let mut stop_cause = None;
         for &token in &committed {
             self.completion += 1;
-            if !self.ignore_eos && eos_token_ids.contains(&token) {
-                finish = Some(FinishReason::Stop);
-                break;
-            }
             emit += 1;
             self.last_token = token;
+            if let Some(cause) = self
+                .stop_policy
+                .classify(token, |id| eos_token_ids.contains(&id))
+            {
+                finish = Some(FinishReason::Stop);
+                stop_cause = Some(cause);
+                break;
+            }
             if self.completion >= self.max_tokens {
                 finish = Some(FinishReason::Length);
                 break;
             }
         }
-        // Truncate to the consumed run (a suppressed EOS is consumed but not
-        // emitted) so the caller's KV bookkeeping advances by exactly the
-        // tokens this state accounted for.
-        let consumed = emit + usize::from(matches!(finish, Some(FinishReason::Stop)));
-        committed.truncate(consumed);
+        // Truncate after the first terminal token so speculative suffixes are
+        // neither committed to KV nor exposed to the client.
+        committed.truncate(emit);
         Glm52StepOutcome::Commit {
             committed,
             emit,
             finish,
+            stop_cause,
             context_rows,
         }
     }
@@ -450,6 +458,7 @@ mod tests {
     use crate::scheduler::testkit::EOS;
     use crate::scheduler::testkit::commit;
     use crate::scheduler::testkit::state;
+    use crate::scheduler::testkit::stop_policy;
 
     #[test]
     fn prefill_rides_decode_then_emits() {
@@ -567,11 +576,11 @@ mod tests {
     }
 
     #[test]
-    fn eos_is_suppressed_and_counts_toward_completion() {
+    fn eos_is_emitted_and_counts_toward_completion() {
         let mut state = state(vec![10], 4, false);
         assert_eq!(
             state.advance_span(&[7], EOS),
-            commit(&[7], 0, Some(FinishReason::Stop), 1)
+            commit(&[7], 1, Some(FinishReason::Stop), 1)
         );
         assert_eq!(state.completion_tokens(), 1);
     }
@@ -605,7 +614,55 @@ mod tests {
         let mut state = state(vec![10], 1, false);
         assert_eq!(
             state.advance_span(&[7], EOS),
-            commit(&[7], 0, Some(FinishReason::Stop), 1)
+            commit(&[7], 1, Some(FinishReason::Stop), 1)
+        );
+    }
+
+    #[test]
+    fn ignored_eos_does_not_disable_an_explicit_stop_token() {
+        let mut state = Glm52SlotState::new(
+            vec![10],
+            4,
+            StopPolicy {
+                eos: pegainfer_frontend::engine::EosPolicy::Ignore,
+                token_ids: vec![42],
+            },
+            0,
+        );
+
+        assert_eq!(
+            state.advance_span(&[42], EOS),
+            Glm52StepOutcome::Commit {
+                committed: vec![42],
+                emit: 1,
+                finish: Some(FinishReason::Stop),
+                stop_cause: Some(StopCause::Token(42)),
+                context_rows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn eos_precedes_an_overlapping_explicit_stop_token() {
+        let mut state = Glm52SlotState::new(
+            vec![10],
+            4,
+            StopPolicy {
+                eos: pegainfer_frontend::engine::EosPolicy::Token(7),
+                token_ids: vec![7],
+            },
+            0,
+        );
+
+        assert_eq!(
+            state.advance_span(&[7], EOS),
+            Glm52StepOutcome::Commit {
+                committed: vec![7],
+                emit: 1,
+                finish: Some(FinishReason::Stop),
+                stop_cause: Some(StopCause::Eos(7)),
+                context_rows: 1,
+            }
         );
     }
 
@@ -666,7 +723,7 @@ mod tests {
 
     #[test]
     fn native_pd_starts_by_verifying_the_forwarded_anchor() {
-        let mut state = Glm52SlotState::new(vec![10, 11, 20], 8, false, 2);
+        let mut state = Glm52SlotState::new(vec![10, 11, 20], 8, stop_policy(false), 2);
         state.seed_native_pd_anchor();
         state.set_drafts(vec![21, 22, 99, 98, 97], GLM52_MTP_DRAFTS);
 
@@ -700,7 +757,7 @@ mod tests {
 
     #[test]
     fn manual_native_pd_advances_rng_without_spending_client_budget() {
-        let mut state = Glm52SlotState::new(vec![10, 11, 12, 42], 4, true, 3);
+        let mut state = Glm52SlotState::new(vec![10, 11, 12, 42], 4, stop_policy(true), 3);
         state.seed_native_pd_anchor();
 
         assert_eq!(
@@ -720,7 +777,7 @@ mod tests {
 
     #[test]
     fn native_pd_replayed_anchor_counts_against_the_router_budget() {
-        let mut state = Glm52SlotState::new(vec![10, 11, 20], 8, false, 2);
+        let mut state = Glm52SlotState::new(vec![10, 11, 20], 8, stop_policy(false), 2);
         state.seed_native_pd_replayed_anchor();
         state.set_drafts(vec![21, 22, 99, 98, 97], GLM52_MTP_DRAFTS);
 
@@ -770,7 +827,7 @@ mod tests {
     fn eos_inside_the_committed_run_truncates_and_finishes() {
         let mut state = state(vec![10], 32, false);
         assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
-        // Draft 2 is the EOS token (7): accepted, counted, suppressed; the
+        // Draft 2 is the EOS token (7): accepted, counted, emitted; the
         // rest of the committed run is dropped.
         state.set_drafts(
             vec![21, 7, 23, 24, 25, 26, 27],
@@ -779,7 +836,7 @@ mod tests {
         let outputs = [21, 7, 23, 24];
         assert_eq!(
             state.advance_span(&outputs, EOS),
-            commit(&[21, 7], 1, Some(FinishReason::Stop), 4)
+            commit(&[21, 7], 2, Some(FinishReason::Stop), 4)
         );
         assert_eq!(state.completion_tokens(), 3);
     }
@@ -898,7 +955,7 @@ mod tests {
         // 3 blocks of prompt with the first 2 cache-hit: feeding starts at
         // position 128 and only the suffix is ever fed.
         let prompt: Vec<u32> = (0..192).collect();
-        let s = Glm52SlotState::new(prompt, 8, false, 128);
+        let s = Glm52SlotState::new(prompt, 8, stop_policy(false), 128);
         assert_eq!(s.feed_want(), 64);
         assert_eq!(s.next_input_at(0).position, 128);
         assert_eq!(s.next_input_at(0).token, 128);

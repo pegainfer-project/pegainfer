@@ -33,6 +33,8 @@ use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::spawn_scheduler;
 
 pub use self::executor::DecodeSlot;
@@ -44,8 +46,9 @@ pub use self::executor::StepExecutor;
 /// Scheduler facts that come from the model line rather than the executor.
 #[derive(Clone, Debug, Default)]
 pub struct K3SchedulerConfig {
-    /// Token ids that end a stream with [`FinishReason::Stop`]. Requests that
-    /// set `ignore_eos` opt out.
+    /// Model-default token ids that can end a stream with
+    /// [`FinishReason::Stop`]. A request's [`StopPolicy`] decides whether the
+    /// model EOS set is active and which explicit stop ids also apply.
     pub eos_token_ids: Vec<u32>,
     /// KV pool capacity to advertise, or `None` from an engine that does not
     /// own a pool yet. Injected rather than asked of the executor so the
@@ -91,11 +94,16 @@ where
 /// Answer a request that just reached its end: silence if the frontend
 /// abandoned it since the scheduler last looked, the finish otherwise. Abort
 /// can land at any moment, so the check belongs on every finish path.
-fn finish_or_retire(id: RequestId, reason: FinishReason, ledger: &mut RequestLedger) {
+fn finish_or_retire(
+    id: RequestId,
+    reason: FinishReason,
+    stop_cause: Option<StopCause>,
+    ledger: &mut RequestLedger,
+) {
     if ledger.is_aborted(id) {
         ledger.retire(id);
     } else {
-        ledger.finish(id, reason);
+        ledger.finish(id, reason, stop_cause);
     }
 }
 
@@ -106,7 +114,7 @@ struct RunningRequest {
     /// This request's most recent committed token — next step's input.
     last_token: u32,
     max_tokens: usize,
-    ignore_eos: bool,
+    stop_policy: StopPolicy,
 }
 
 pub struct K3Scheduler<E: StepExecutor> {
@@ -156,9 +164,10 @@ impl<E: StepExecutor> K3Scheduler<E> {
         )
     }
 
-    /// Whether `token` ends this request's stream by end-of-sequence.
-    fn is_stop_token(&self, token: u32, ignore_eos: bool) -> bool {
-        !ignore_eos && self.eos_token_ids.contains(&token)
+    /// Classify a generated token under the request's independent EOS and
+    /// explicit stop-token policy. EOS wins when an id appears in both sets.
+    fn stop_cause(&self, token: u32, policy: &StopPolicy) -> Option<StopCause> {
+        policy.classify(token, |id| self.eos_token_ids.contains(&id))
     }
 
     /// Fill free slots from the queue: retire what the frontend abandoned,
@@ -180,7 +189,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
             ledger.admit(id);
             if pending.request.max_tokens == 0 {
                 // Nothing to generate: answer without occupying a slot.
-                finish_or_retire(id, FinishReason::Length, ledger);
+                finish_or_retire(id, FinishReason::Length, None, ledger);
                 continue;
             }
             let slot = self
@@ -207,18 +216,21 @@ impl<E: StepExecutor> K3Scheduler<E> {
                 slot,
                 last_token: first,
                 max_tokens: pending.request.max_tokens,
-                ignore_eos: pending.request.params.ignore_eos,
+                stop_policy: pending.request.stop_policy,
             };
-            if self.is_stop_token(first, state.ignore_eos) {
-                // The stop token itself is not part of the completion.
+            if let Some(stop_cause) = self.stop_cause(first, &state.stop_policy) {
+                // Keep the triggering token in the contract update. The vLLM
+                // bridge uses it for usage/logprob accounting and maps only
+                // explicit request stops to a wire stop reason.
+                ledger.push_tokens(id, &[first], &[]);
                 self.release_slot(slot);
-                finish_or_retire(id, FinishReason::Stop, ledger);
+                finish_or_retire(id, FinishReason::Stop, Some(stop_cause), ledger);
                 continue;
             }
             ledger.push_tokens(id, &[first], &[]);
             if ledger.completion_tokens(id) >= state.max_tokens {
                 self.release_slot(slot);
-                finish_or_retire(id, FinishReason::Length, ledger);
+                finish_or_retire(id, FinishReason::Length, None, ledger);
                 continue;
             }
             self.running.push(state);
@@ -274,17 +286,20 @@ impl<E: StepExecutor> K3Scheduler<E> {
             // stop/length cut are computed-but-dead, like a rejected draft.
             let already = ledger.completion_tokens(state.id);
             let mut kept: Vec<u32> = Vec::with_capacity(committed.len());
-            let mut finished = None;
+            let mut finished: Option<(FinishReason, Option<StopCause>)> = None;
             for &token in &committed {
-                if self.is_stop_token(token, state.ignore_eos) {
-                    // The stop token itself is not part of the completion.
-                    finished = Some(FinishReason::Stop);
+                if let Some(stop_cause) = self.stop_cause(token, &state.stop_policy) {
+                    // The trigger is a real completion token. Suffix tokens
+                    // from the speculative round are computed-but-dead.
+                    kept.push(token);
+                    state.last_token = token;
+                    finished = Some((FinishReason::Stop, Some(stop_cause)));
                     break;
                 }
                 kept.push(token);
                 state.last_token = token;
                 if already + kept.len() >= state.max_tokens {
-                    finished = Some(FinishReason::Length);
+                    finished = Some((FinishReason::Length, None));
                     break;
                 }
             }
@@ -292,9 +307,9 @@ impl<E: StepExecutor> K3Scheduler<E> {
                 ledger.push_tokens(state.id, &kept, &[]);
             }
             match finished {
-                Some(reason) => {
+                Some((reason, stop_cause)) => {
                     self.release_slot(state.slot);
-                    finish_or_retire(state.id, reason, ledger);
+                    finish_or_retire(state.id, reason, stop_cause, ledger);
                 }
                 None => still_running.push(state),
             }

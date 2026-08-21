@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::GenerateRequest;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_sample::SamplingParams;
@@ -59,6 +61,10 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
         params: SamplingParams {
             ignore_eos: true,
             ..SamplingParams::default()
+        },
+        stop_policy: StopPolicy {
+            eos: EosPolicy::Ignore,
+            token_ids: Vec::new(),
         },
         max_tokens: 256,
         lora_adapter: None,
@@ -118,6 +124,10 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
             params: SamplingParams {
                 ignore_eos: true,
                 ..SamplingParams::default()
+            },
+            stop_policy: StopPolicy {
+                eos: EosPolicy::Ignore,
+                token_ids: Vec::new(),
             },
             max_tokens: output_lengths[rank],
             lora_adapter: None,
