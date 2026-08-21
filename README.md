@@ -334,3 +334,11 @@ Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Components ported fr
 NVIDIA Dynamo (the `kvbm/kvbm-logical` crate) retain their original Apache-2.0 headers; see
 [NOTICE_DYNAMO](NOTICE_DYNAMO).
 
+## Star History
+
+<p align="center">
+  <a href="https://star-history.dera.page/#pegainfer-project/pegainfer&Date">
+    <img src="https://star-history.dera.page/svg?repos=pegainfer-project/pegainfer&type=Date" alt="Star History Chart">
+  </a>
+</p>
+
