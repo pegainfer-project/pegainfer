@@ -632,6 +632,7 @@ fn test_e2e_qwen35_scheduler() {
     run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP1");
 }
 
+#[cfg(feature = "gdn-validation")]
 #[test]
 #[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
 fn test_e2e_qwen35_scheduler_flashinfer_gdn() {

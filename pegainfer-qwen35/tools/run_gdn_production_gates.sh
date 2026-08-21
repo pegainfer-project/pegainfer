@@ -27,8 +27,11 @@ python="$PEGAINFER_TRITON_PYTHON"
 log_root="${PEGAINFER_GDN_GATE_LOG_DIR:-$repo_root/target/gdn-production-gate-logs}"
 
 mkdir -p "$log_root"
+echo "GDN gate log root: $log_root"
 
-for command in git nvidia-smi nvcc rustc cargo rg sha256sum awk sed tee timeout; do
+for command in \
+  git nvidia-smi nvcc rustc cargo protoc cc c++ clang cmake ninja pkg-config \
+  rg sha256sum awk sed tee timeout; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "required GDN gate command is missing: $command" >&2
     exit 2
@@ -107,6 +110,10 @@ object_sha="$(sha256sum "$bundle/kernel.o" | awk '{print $1}')"
   nvcc --version
   rustc --version
   cargo --version
+  protoc --version
+  clang --version | sed -n '1p'
+  cmake --version | sed -n '1p'
+  ninja --version
   "$python" --version
 } | tee "$log_root/provenance.log"
 
@@ -121,7 +128,10 @@ timeout 60m cargo test --release --locked \
   2>&1 | tee "$log_root/kernels-tests-build.log"
 timeout 60m cargo test --release --locked \
   -p pegainfer-qwen35 --features qwen35 --lib --tests --no-run \
-  2>&1 | tee "$log_root/qwen35-tests-build.log"
+  2>&1 | tee "$log_root/qwen35-default-tests-build.log"
+timeout 60m cargo test --release --locked \
+  -p pegainfer-qwen35 --features qwen35,gdn-validation --lib --tests --no-run \
+  2>&1 | tee "$log_root/qwen35-validation-tests-build.log"
 
 run_exact_gate() {
   local label="$1"
@@ -158,21 +168,21 @@ run_exact_gate \
 run_exact_gate \
   gate2-native-prepare-cpu-oracle \
   recurrent::tests::native_prepare_hv32_dynamic_t_and_non_finite_inputs \
-  -p pegainfer-qwen35 --features qwen35 --lib
+  -p pegainfer-qwen35 --features qwen35,gdn-validation --lib
 
 run_exact_gate \
   gate3-production-hf-golden \
   production_flashinfer_gdn_matches_hf_short_golden \
-  -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate
+  -p pegainfer-qwen35 --features qwen35,gdn-validation --test hf_golden_gate
 
 run_exact_gate \
   gate4-chunk-continuation \
   prefill::tests::flashinfer_gdn_chunk_continuation_and_model_outputs_match \
-  -p pegainfer-qwen35 --features qwen35 --lib
+  -p pegainfer-qwen35 --features qwen35,gdn-validation --lib
 
 run_exact_gate \
   gate5-scheduler-cuda-graph \
   test_e2e_qwen35_scheduler_flashinfer_gdn \
-  -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler
+  -p pegainfer-qwen35 --features qwen35,gdn-validation --test e2e_scheduler
 
 echo "all five Qwen3.5 GDN production gates passed for $commit_sha object $object_sha"

@@ -32,6 +32,7 @@ vllm-text = { workspace = true }
 
 [features]
 default = []
+gdn-validation = []
 qwen35 = ["pegainfer-kernels/qwen35"]
 
 [lints]
