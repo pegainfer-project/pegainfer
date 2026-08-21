@@ -330,7 +330,7 @@ impl Qwen35Model {
 
         if !self.config.decode_group_is_compiled() {
             #[cfg(feature = "gdn-validation")]
-            graph_state.evidence.record_eager_fallback();
+            graph_state.evidence.record_graph_eager_fallback();
             LOG_UNCOMPILED_DECODE_ROUTE.call_once(|| {
                 let group = self.config.num_attention_heads / self.config.num_key_value_heads;
                 log::info!(
@@ -406,9 +406,9 @@ impl Qwen35Model {
         #[cfg(feature = "gdn-validation")]
         if result.is_ok() {
             if was_captured {
-                graph_state.evidence.record_replay();
+                graph_state.evidence.record_graph_replay();
             } else {
-                graph_state.evidence.record_capture();
+                graph_state.evidence.record_graph_capture();
             }
         }
         graph_state.graphs = graphs;

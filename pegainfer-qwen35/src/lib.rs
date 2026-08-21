@@ -11,6 +11,8 @@ mod decode_buffers;
 mod executor;
 mod ffi;
 mod flashinfer_gdn;
+#[cfg(feature = "gdn-validation")]
+mod gdn_validation;
 mod logprobs;
 pub mod model_line;
 mod ops;
@@ -65,9 +67,9 @@ pub mod runtime {
     pub use crate::executor::Qwen35Executor;
     pub use crate::executor::RequestId;
     #[cfg(feature = "gdn-validation")]
-    pub use crate::prefill::GdnPrefillRuntimeEvidence;
+    pub use crate::gdn_validation::GdnPrefillRuntimeEvidence;
     #[cfg(feature = "gdn-validation")]
-    pub use crate::prefill::GdnPrefillRuntimeEvidenceHandle;
+    pub use crate::gdn_validation::GdnPrefillRuntimeEvidenceHandle;
     pub use crate::scheduler::start_with_capacity;
     #[cfg(feature = "gdn-validation")]
     pub use crate::start_engine_with_flashinfer_gdn_for_accuracy;
@@ -126,7 +128,10 @@ pub fn start_engine_with_flashinfer_gdn_for_accuracy(
     device_ordinal: usize,
     max_batch: usize,
     max_prefill_tokens: usize,
-) -> Result<(EngineHandle, prefill::GdnPrefillRuntimeEvidenceHandle)> {
+) -> Result<(
+    EngineHandle,
+    gdn_validation::GdnPrefillRuntimeEvidenceHandle,
+)> {
     anyhow::ensure!(
         (1..=MAX_DECODE_BATCH).contains(&max_batch),
         "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
@@ -135,7 +140,6 @@ pub fn start_engine_with_flashinfer_gdn_for_accuracy(
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
     let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
-    model.require_flashinfer_gdn_for_test()?;
     let evidence = model.flashinfer_gdn_runtime_evidence_handle()?;
     let handle = scheduler::start_with_capacity(model, 42, max_batch, max_prefill_tokens)?;
     Ok((handle, evidence))

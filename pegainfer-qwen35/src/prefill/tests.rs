@@ -13,9 +13,10 @@ use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 
 // Stage 18 measured the real-model FP32 recurrent-state partition floor at
-// mean=1.3146e-4 and p99=1.0670e-3. These bounds are intentionally just under
-// 2x that observed floor. The BF16 conv-state bounds are provisional until the
-// Stage 19 zero-state SM120 calibration run records its distribution.
+// mean=1.3146e-4 and p99=1.0670e-3. Stage 19 then calibrated the BF16 conv-state
+// distribution on the real zero-state SM120 continuation gate. These bounds
+// retain margin over those observed floors without turning token parity into
+// the only continuation criterion.
 #[cfg(feature = "gdn-validation")]
 const RECURRENT_STATE_MEAN_TOL: f32 = 2.5e-4;
 #[cfg(feature = "gdn-validation")]
@@ -240,7 +241,6 @@ fn checked_prefill_end_pos_rejects_overflow() {
 fn flashinfer_gdn_chunk_continuation_and_model_outputs_match() -> Result<()> {
     let model_path = required_model_path();
     let model = Qwen35Model::from_safetensors(&model_path, 0, 1)?;
-    model.require_flashinfer_gdn_for_test()?;
     let backend = model.resolved_gdn_backend();
     assert_eq!(backend, GdnPrefillBackend::FlashInfer);
 
