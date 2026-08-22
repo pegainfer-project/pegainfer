@@ -232,9 +232,19 @@ def _require_equal(actual: Any, expected: Any, label: str) -> None:
 def validate_compile_metadata(
     metadata: dict[str, Any], source: dict[str, Any]
 ) -> None:
-    spec = expected_spec(VARIANT)
-    for key in ("variant", "target_arch", "geometry", "dtypes", "tokens"):
-        _require_equal(metadata.get(key), spec[key], f"compile metadata {key}")
+    _require_equal(
+        set(metadata),
+        {
+            "flashinfer_commit",
+            "kernel_source_sha256",
+            "source_lock_sha256",
+            "generator_sha256",
+            "requirements_lock_sha256",
+            "toolchain",
+            "aot",
+        },
+        "compile metadata keys",
+    )
     for key in ("flashinfer_commit", "kernel_source_sha256", "source_lock_sha256"):
         _require_equal(metadata.get(key), source[key], f"compile metadata {key}")
     _require_equal(
@@ -247,7 +257,6 @@ def validate_compile_metadata(
         sha256_file(requirements_lock_path()),
         "compile metadata requirements lock hash",
     )
-    _require_equal(metadata.get("workspace"), WORKSPACE, "workspace metadata")
     aot = metadata.get("aot")
     if not isinstance(aot, dict):
         raise ContractError("compile metadata is missing AOT export metadata")
@@ -260,11 +269,8 @@ def validate_compile_metadata(
 def build_manifest(
     *,
     variant: str,
-    header_name: str,
     header_bytes: bytes,
-    object_name: str,
     object_bytes: bytes,
-    runtime_name: str,
     runtime_bytes: bytes,
     compile_metadata: dict[str, Any],
     source: dict[str, Any],
@@ -298,28 +304,20 @@ def build_manifest(
         "artifact": {
             "format": "elf_relocatable_with_embedded_cubin",
             "header": {
-                "file": header_name,
                 "sha256": sha256_bytes(header_bytes),
                 "size_bytes": len(header_bytes),
             },
             "object": {
-                "file": object_name,
                 "sha256": sha256_bytes(object_bytes),
                 "size_bytes": len(object_bytes),
             },
             "native_runtime": {
-                "file": runtime_name,
                 "sha256": sha256_bytes(runtime_bytes),
                 "size_bytes": len(runtime_bytes),
             },
         },
         "distribution": {
-            "strategy": "release_bundle",
-            "serving_requires_python": False,
-            "serving_requires_cute_dsl": False,
-            "cuda_driver_jit_required": False,
             "cute_runtime_linkage": "static",
-            "production_eligible": True,
         },
     }
 
@@ -363,19 +361,16 @@ def package_candidate(
     )
 
     output_dir.mkdir(parents=True)
-    header_name = "kernel.h"
-    object_name = "kernel.o"
-    runtime_name = "libcuda_dialect_runtime_static.a"
+    header_name = ARTIFACT_FILES["header"]
+    object_name = ARTIFACT_FILES["object"]
+    runtime_name = ARTIFACT_FILES["native_runtime"]
     (output_dir / header_name).write_bytes(header_bytes)
     (output_dir / object_name).write_bytes(object_bytes)
     (output_dir / runtime_name).write_bytes(runtime_bytes)
     manifest = build_manifest(
         variant=VARIANT,
-        header_name=header_name,
         header_bytes=header_bytes,
-        object_name=object_name,
         object_bytes=object_bytes,
-        runtime_name=runtime_name,
         runtime_bytes=runtime_bytes,
         compile_metadata=metadata,
         source=source,
@@ -440,8 +435,12 @@ def validate_manifest(
         entry = artifact.get(component)
         if not isinstance(entry, dict):
             raise ContractError(f"artifact {component} metadata is missing")
-        name = entry.get("file")
-        _require_equal(name, ARTIFACT_FILES[component], f"artifact {component} file")
+        _require_equal(
+            set(entry),
+            {"sha256", "size_bytes"},
+            f"artifact {component} metadata keys",
+        )
+        name = ARTIFACT_FILES[component]
         path = manifest_path.parent / name
         if not path.is_file():
             raise ContractError(f"artifact {component} file is missing: {path}")
@@ -469,14 +468,11 @@ def validate_manifest(
     )
 
     distribution = manifest.get("distribution")
-    if not isinstance(distribution, dict):
-        raise ContractError("distribution metadata is missing")
-    for key in ("serving_requires_python", "serving_requires_cute_dsl"):
-        _require_equal(distribution.get(key), False, f"distribution {key}")
-    _require_equal(distribution.get("production_eligible"), True, "production eligibility")
-    _require_equal(distribution.get("cuda_driver_jit_required"), False, "driver JIT policy")
-    _require_equal(distribution.get("cute_runtime_linkage"), "static", "CuTe runtime linkage")
-    _require_equal(distribution.get("strategy"), "release_bundle", "distribution strategy")
+    _require_equal(
+        distribution,
+        {"cute_runtime_linkage": "static"},
+        "distribution metadata",
+    )
     return manifest
 
 

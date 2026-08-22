@@ -16,7 +16,6 @@ from artifact_contract import (
     FORBIDDEN_TMA_CLUSTER_LOAD,
     TARGET_ARCH,
     VARIANT,
-    WORKSPACE,
     expected_spec,
     compiler_path,
     normalize_ptx,
@@ -207,7 +206,6 @@ def main() -> int:
     source = verify_prepared_flashinfer_source(
         args.flashinfer_dir, args.base_flashinfer_dir
     )
-    spec = expected_spec(args.variant)
     compiled, ptx = compile_variant(args.variant, args.flashinfer_dir.resolve())
     prefix = f"pegainfer_qwen35_gdn_{args.variant}"
     args.aot_out.mkdir(parents=True, exist_ok=True)
@@ -218,13 +216,11 @@ def main() -> int:
         raise RuntimeError("CuTe export_to_c did not produce the expected .h/.o pair")
     runtime_archive = find_static_cuda_dialect_runtime()
     metadata = {
-        **spec,
         "flashinfer_commit": source["flashinfer_commit"],
         "kernel_source_sha256": source["kernel_source_sha256"],
         "source_lock_sha256": source["source_lock_sha256"],
         "generator_sha256": sha256_file(compiler_path()),
         "requirements_lock_sha256": sha256_file(requirements_lock_path()),
-        "workspace": WORKSPACE,
         "toolchain": {
             "python": sys.version.split()[0],
             **ptx_metadata(ptx),
