@@ -1,6 +1,7 @@
 #include "flashinfer_gdn_aot.h"
 
 #include <cuda_runtime.h>
+#include <limits.h>
 #include <stdlib.h>
 
 #include "flashinfer_gdn_build_config.h"
@@ -115,6 +116,8 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
 #ifdef PEGAINFER_QWEN35_GDN_AOT
     if (handle == NULL || args == NULL ||
         args->struct_size != sizeof(*args) || args->tokens == 0 ||
+        args->tokens > (uint32_t)(INT32_MAX / 32) ||
+        args->workspace_bytes > (size_t)INT32_MAX ||
         args->q == NULL || args->k == NULL || args->v == NULL ||
         args->output == NULL || args->alpha == NULL || args->beta == NULL ||
         args->state == NULL || args->initial_state == NULL ||
