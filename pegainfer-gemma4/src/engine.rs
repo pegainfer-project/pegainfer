@@ -302,6 +302,12 @@ fn generation_policy(dir: &str) -> Result<GenerationPolicy> {
 }
 
 impl GenerationPolicy {
+    /// Whether this pick retires its row instead of being emitted. Every path
+    /// that can stop a request asks here, so the rule cannot drift.
+    fn stops(&self, id: u32, ignore_eos: bool) -> bool {
+        !ignore_eos && self.eos.contains(&id)
+    }
+
     /// Both sets index the vocabulary, so both are checked against it once
     /// the head is loaded: an out-of-range suppressed id would fail the first
     /// request, and an out-of-range stop id would never match at all and turn
@@ -535,21 +541,113 @@ enum ReservationDecision {
     Refused(String),
 }
 
-/// One newcomer row of a mixed step's logits head, ahead of the active
-/// rows: its sampling params, its logprob request (0 = none), and whether
-/// its pick may stop it — a mid-walk segment's row is sampled and
-/// discarded, so it never stops.
-struct HeadRow<'a> {
+/// One row of a step's sampler call. A mid-walk segment's row is sampled and
+/// discarded, so it carries `ignore_eos` whatever its request asked and a
+/// `logprobs` of 0: it never stops and is never scored.
+#[derive(Clone, Copy)]
+struct SampleRow<'a> {
     params: &'a pegainfer_frontend::sampler::SamplingParams,
+    step: u64,
     logprobs: usize,
     ignore_eos: bool,
 }
 
-/// Suppress, sample and score one mixed step's logits — `head` describes
-/// rows `0..head.len()`, the active rows follow — then deliver the active
-/// rows' events. Returns every row's pick, logprob and stop flag; `Err`
-/// carries the failure message after the active batch has been failed.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// One sampler call's outcome, row-aligned with the logits it read.
+struct SampledRows {
+    picked: Vec<u32>,
+    logprobs: Vec<Option<TokenLogprob>>,
+    stops: Vec<bool>,
+}
+
+/// Suppress, sample and score one step's logits, with the failed stage on the
+/// error's context chain. Nothing here sends an event or moves request state:
+/// what a pick means for its row is the only thing the callers disagree about.
+#[allow(clippy::too_many_arguments)]
+fn sample_logits_rows(
+    ctx: &DeviceContext,
+    suppress_ids: &ops::SuppressIds,
+    policy: &GenerationPolicy,
+    scratch: &mut SampleScratch,
+    base_seed: u64,
+    sample_nonce: &mut u64,
+    rows: &[SampleRow<'_>],
+    logits: &mut HiddenStates,
+) -> Result<SampledRows> {
+    ops::suppress_logits_bf16_in_place(ctx, logits, suppress_ids).context("suppression")?;
+
+    *sample_nonce = sample_nonce.wrapping_add(1);
+    let call_seed = base_seed ^ sample_nonce.rotate_left(17);
+    let picked = {
+        let params: Vec<_> = rows.iter().map(|row| row.params).collect();
+        let steps: Vec<u64> = rows.iter().map(|row| row.step).collect();
+        pegainfer_sample::select_batch(ctx, logits, &params, &steps, call_seed, scratch)
+            .context("sampling")?
+    };
+    let stops: Vec<bool> = rows
+        .iter()
+        .zip(&picked)
+        .map(|(row, &id)| policy.stops(id, row.ignore_eos))
+        .collect();
+    let requests: Vec<LogprobRequest> = rows
+        .iter()
+        .enumerate()
+        .filter(|(row, spec)| spec.logprobs > 0 && !stops[*row])
+        .map(|(row, spec)| LogprobRequest {
+            row,
+            picked: picked[row],
+            top_k: spec.logprobs,
+        })
+        .collect();
+    let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; rows.len()];
+    if !requests.is_empty() {
+        let scored =
+            pegainfer_sample::token_logprobs_batch(ctx, logits, &requests).context("logprobs")?;
+        for (request, logprob) in requests.iter().zip(scored) {
+            logprobs[request.row] = Some(logprob);
+        }
+    }
+    Ok(SampledRows {
+        picked,
+        logprobs,
+        stops,
+    })
+}
+
+/// Capture this prompt's tail into the prefix cache when one is configured and
+/// the state qualifies; `resumed` is the entry it supersedes. The fields come
+/// in apart rather than as `&mut self` because a caller still holding the
+/// step's logits holds a borrow of the arena.
+fn capture_prefix(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    cache: &mut Option<PrefixCache>,
+    kv: &GemmaKv,
+    prompt: &[u32],
+    resumed: Option<u64>,
+) {
+    if let Some(cache) = cache.as_mut() {
+        if let Some(entry) = serve.capture_checkpoint(ctx, kv, prompt) {
+            cache.insert(entry, resumed);
+        }
+    }
+}
+
+/// Retire the whole live batch: a step that could not run leaves no row a token.
+fn fail_active_batch(active: &mut Vec<Active>, what: &str, err: &anyhow::Error) {
+    log::error!("{what} failed: {err:#}");
+    for entry in active.drain(..) {
+        let _ = entry.request.token_tx.send(TokenEvent::Error {
+            message: format!("{what} failed: {err:#}"),
+            prompt_tokens: entry.prompt_tokens,
+            completion_tokens: entry.emitted,
+        });
+    }
+}
+
+/// Sample one mixed step's logits — `head` describes rows `0..head.len()`, the
+/// active rows follow — then deliver the active rows' events. `Err` carries the
+/// failure message after the active batch has been failed.
+#[allow(clippy::too_many_arguments)]
 fn mixed_head_flow(
     ctx: &DeviceContext,
     suppress_ids: &ops::SuppressIds,
@@ -557,92 +655,38 @@ fn mixed_head_flow(
     scratch: &mut SampleScratch,
     base_seed: u64,
     sample_nonce: &mut u64,
-    head: &[HeadRow<'_>],
+    head: &[SampleRow<'_>],
     active: &mut Vec<Active>,
     logits: &mut HiddenStates,
-) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>, Vec<bool>), String> {
+) -> Result<SampledRows, String> {
     let k = head.len();
-    let fail_batch = |active: &mut Vec<Active>, what: &str, err: &anyhow::Error| {
-        log::error!("{what} failed: {err:#}");
-        for entry in active.drain(..) {
-            let _ = entry.request.token_tx.send(TokenEvent::Error {
-                message: format!("{what} failed: {err:#}"),
-                prompt_tokens: entry.prompt_tokens,
-                completion_tokens: entry.emitted,
-            });
+    let sampled = {
+        let rows: Vec<SampleRow<'_>> = head
+            .iter()
+            .copied()
+            .chain(active.iter().map(Active::sample_row))
+            .collect();
+        sample_logits_rows(
+            ctx,
+            suppress_ids,
+            policy,
+            scratch,
+            base_seed,
+            sample_nonce,
+            &rows,
+            logits,
+        )
+    };
+    let mut sampled = match sampled {
+        Ok(sampled) => sampled,
+        Err(err) => {
+            fail_active_batch(active, "mixed step", &err);
+            return Err(format!("mixed step failed: {err:#}"));
         }
     };
-    if let Err(err) = ops::suppress_logits_bf16_in_place(ctx, logits, suppress_ids) {
-        fail_batch(active, "mixed suppression", &err);
-        return Err(format!("mixed suppression failed: {err:#}"));
-    }
-
-    *sample_nonce = sample_nonce.wrapping_add(1);
-    let call_seed = base_seed ^ sample_nonce.rotate_left(17);
-    let picked = {
-        let params: Vec<_> = head
-            .iter()
-            .map(|h| h.params)
-            .chain(active.iter().map(|entry| &entry.request.params))
-            .collect();
-        let steps: Vec<u64> = std::iter::repeat_n(0u64, k)
-            .chain(active.iter().map(|entry| entry.emitted as u64))
-            .collect();
-        match pegainfer_sample::select_batch(ctx, logits, &params, &steps, call_seed, scratch) {
-            Ok(picked) => picked,
-            Err(err) => {
-                fail_batch(active, "mixed sampling", &err);
-                return Err(format!("mixed sampling failed: {err:#}"));
-            }
-        }
-    };
-    let mut stops = vec![false; active.len() + k];
-    for (j, h) in head.iter().enumerate() {
-        stops[j] = !h.ignore_eos && policy.eos.contains(&picked[j]);
-    }
-    for (row, entry) in active.iter().enumerate() {
-        stops[row + k] = !entry.request.params.ignore_eos && policy.eos.contains(&picked[row + k]);
-    }
-    let mut lp_requests: Vec<LogprobRequest> = Vec::new();
-    lp_requests.extend(
-        head.iter()
-            .enumerate()
-            .filter(|(j, h)| h.logprobs > 0 && !stops[*j])
-            .map(|(j, h)| LogprobRequest {
-                row: j,
-                picked: picked[j],
-                top_k: h.logprobs,
-            }),
-    );
-    lp_requests.extend(
-        active
-            .iter()
-            .enumerate()
-            .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[row + k])
-            .map(|(row, entry)| LogprobRequest {
-                row: row + k,
-                picked: picked[row + k],
-                top_k: entry.request.logprobs,
-            }),
-    );
-    let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; active.len() + k];
-    if !lp_requests.is_empty() {
-        match pegainfer_sample::token_logprobs_batch(ctx, logits, &lp_requests) {
-            Ok(scored) => {
-                for (lp, scored) in lp_requests.iter().zip(scored) {
-                    logprobs[lp.row] = Some(scored);
-                }
-            }
-            Err(err) => {
-                fail_batch(active, "mixed logprobs", &err);
-                return Err(format!("mixed logprobs failed: {err:#}"));
-            }
-        }
-    }
-
     // Active rows: the decode-round event flow, `k` logits rows up.
-    emit_decode_rows(active, &picked, &stops, &mut logprobs, k);
-    Ok((picked, logprobs, stops))
+    emit_decode_rows(active, &mut sampled, k);
+    Ok(sampled)
 }
 
 /// One in-flight request between decode steps: its KV, the token that feeds
@@ -653,6 +697,17 @@ struct Active {
     next: u32,
     emitted: usize,
     prompt_tokens: usize,
+}
+
+impl Active {
+    fn sample_row(&self) -> SampleRow<'_> {
+        SampleRow {
+            params: &self.request.params,
+            step: self.emitted as u64,
+            logprobs: self.request.logprobs,
+            ignore_eos: self.request.params.ignore_eos,
+        }
+    }
 }
 
 enum Admitted {
@@ -1133,98 +1188,64 @@ impl EngineState {
             Ok(logits) => logits,
             Err(err) => return fail(format!("{err:#}")),
         };
-        if let Some(cache) = self.prefix_cache.as_mut() {
-            if let Some(entry) =
-                self.serve
-                    .capture_checkpoint(&self.ctx, &kv, &request.prompt_tokens)
-            {
-                cache.insert(entry, resumed);
-            }
-        }
+        capture_prefix(
+            &self.ctx,
+            &self.serve,
+            &mut self.prefix_cache,
+            &kv,
+            &request.prompt_tokens,
+            resumed,
+        );
         self.first_token_flow(request, kv, &mut logits)
     }
 
-    /// Suppress, sample and emit a prefill's first token from logits row 0,
-    /// then finish the request or hand it to the decode batch — the shared
-    /// tail of a sync admission and an overlapped-prefill join.
+    /// Sample and settle a prefill's first token from logits row 0 — the
+    /// shared tail of a sync admission and an overlapped-prefill join.
     fn first_token_flow(
         &mut self,
         request: GenerateRequest,
         kv: GemmaKv,
         logits: &mut HiddenStates,
     ) -> Admitted {
-        let sink = request.token_tx.clone();
-        let prompt_tokens = request.prompt_tokens.len();
-        let fail = |message: String| {
-            let _ = sink.send(TokenEvent::Error {
-                message,
-                prompt_tokens,
-                completion_tokens: 0,
-            });
-            Admitted::Done
-        };
-        if let Err(err) = ops::suppress_logits_bf16_in_place(&self.ctx, logits, &self.suppress_ids)
-        {
-            return fail(format!("{err:#}"));
-        }
-
-        self.sample_nonce = self.sample_nonce.wrapping_add(1);
-        let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
-        let next = match pegainfer_sample::select_batch(
-            &self.ctx,
-            logits,
-            &[&request.params],
-            &[0],
-            call_seed,
-            &mut self.scratch,
-        ) {
-            Ok(tokens) => tokens[0],
-            Err(err) => return fail(format!("{err:#}")),
-        };
-        let finish = |reason: FinishReason, completion_tokens: usize| {
-            let _ = sink.send(TokenEvent::Finished {
-                finish_reason: reason,
-                prompt_tokens,
-                completion_tokens,
-            });
-            Admitted::Done
-        };
-        // The stop token retires the request without being emitted: the
-        // frontend appends its own sentinel for a terminal Stop and drops the
-        // last id, so an engine that emits EOS costs the client its final
-        // visible token.
-        if !request.params.ignore_eos && self.policy.eos.contains(&next) {
-            return finish(FinishReason::Stop, 0);
-        }
-        let logprob = if request.logprobs > 0 {
-            match pegainfer_sample::token_logprobs_batch(
+        let sampled = {
+            let rows = [SampleRow {
+                params: &request.params,
+                step: 0,
+                logprobs: request.logprobs,
+                ignore_eos: request.params.ignore_eos,
+            }];
+            sample_logits_rows(
                 &self.ctx,
+                &self.suppress_ids,
+                &self.policy,
+                &mut self.scratch,
+                self.base_seed,
+                &mut self.sample_nonce,
+                &rows,
                 logits,
-                &[LogprobRequest {
-                    row: 0,
-                    picked: next,
-                    top_k: request.logprobs,
-                }],
-            ) {
-                Ok(mut scored) => scored.pop(),
-                Err(err) => return fail(format!("{err:#}")),
-            }
-        } else {
-            None
+            )
         };
-        if sink.send(TokenEvent::Token { id: next, logprob }).is_err() {
-            return Admitted::Done;
-        }
-        if request.max_tokens <= 1 {
-            return finish(FinishReason::Length, 1);
-        }
-        Admitted::Active(Box::new(Active {
+        let mut sampled = match sampled {
+            Ok(sampled) => sampled,
+            Err(err) => {
+                let _ = request.token_tx.send(TokenEvent::Error {
+                    message: format!("{err:#}"),
+                    prompt_tokens: request.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+                return Admitted::Done;
+            }
+        };
+        match settle_first_token(
+            &self.policy,
             request,
             kv,
-            next,
-            emitted: 1,
-            prompt_tokens,
-        }))
+            sampled.picked[0],
+            sampled.logprobs[0].take(),
+        ) {
+            Some(entry) => Admitted::Active(Box::new(entry)),
+            None => Admitted::Done,
+        }
     }
 
     /// Launch one whole-prompt prefill onto the lane stream and record the
@@ -1316,14 +1337,14 @@ impl EngineState {
             });
             return;
         }
-        if let Some(cache) = self.prefix_cache.as_mut() {
-            if let Some(entry) =
-                self.serve
-                    .capture_checkpoint(&self.ctx, &kv, &request.prompt_tokens)
-            {
-                cache.insert(entry, resumed);
-            }
-        }
+        capture_prefix(
+            &self.ctx,
+            &self.serve,
+            &mut self.prefix_cache,
+            &kv,
+            &request.prompt_tokens,
+            resumed,
+        );
         if let Admitted::Active(entry) = self.first_token_flow(request, kv, &mut pass.logits) {
             active.push(*entry);
         }
@@ -1378,8 +1399,9 @@ impl EngineState {
                 }
             };
         walker.offset = walker.request.prompt_tokens.len();
-        let head = [HeadRow {
+        let head = [SampleRow {
             params: &walker.request.params,
+            step: 0,
             logprobs: walker.request.logprobs,
             ignore_eos: walker.request.params.ignore_eos,
         }];
@@ -1394,8 +1416,8 @@ impl EngineState {
             active,
             &mut logits,
         ) {
-            Ok((picked, mut logprobs, _)) => {
-                walker.first = Some((picked[0], logprobs[0].take()));
+            Ok(mut sampled) => {
+                walker.first = Some((sampled.picked[0], sampled.logprobs[0].take()));
             }
             Err(message) => {
                 let _ = walker.request.token_tx.send(TokenEvent::Error {
@@ -1527,14 +1549,7 @@ impl EngineState {
             let logits = match stepped {
                 Ok(logits) => logits,
                 Err(err) => {
-                    log::error!("walk step failed: {err:#}");
-                    for entry in active.drain(..) {
-                        let _ = entry.request.token_tx.send(TokenEvent::Error {
-                            message: format!("walk step failed: {err:#}"),
-                            prompt_tokens: entry.prompt_tokens,
-                            completion_tokens: entry.emitted,
-                        });
-                    }
+                    fail_active_batch(active, "walk step", &err);
                     for w in walkers.drain(..) {
                         let _ = w.request.token_tx.send(TokenEvent::Error {
                             message: format!("walk step failed: {err:#}"),
@@ -1547,14 +1562,15 @@ impl EngineState {
             };
 
             let flow = {
-                let head: Vec<HeadRow<'_>> = walkers
+                let head: Vec<SampleRow<'_>> = walkers
                     .iter()
                     .zip(&takes)
                     .filter(|(_, t)| t.is_some())
                     .map(|(w, t)| {
                         let (_, last) = t.expect("filtered");
-                        HeadRow {
+                        SampleRow {
                             params: &w.request.params,
+                            step: 0,
                             logprobs: if last { w.request.logprobs } else { 0 },
                             ignore_eos: if last {
                                 w.request.params.ignore_eos
@@ -1577,13 +1593,13 @@ impl EngineState {
                 )
             };
             match flow {
-                Ok((picked, mut lps, _)) => {
+                Ok(mut sampled) => {
                     let mut si = 0usize;
                     for (w, t) in walkers.iter_mut().zip(&takes) {
                         if let Some((take, last)) = *t {
                             w.offset += take;
                             if last {
-                                w.first = Some((picked[si], lps[si].take()));
+                                w.first = Some((sampled.picked[si], sampled.logprobs[si].take()));
                             }
                             si += 1;
                         }
@@ -1616,48 +1632,18 @@ impl EngineState {
             first,
             ..
         } = w;
-        let prompt_tokens = request.prompt_tokens.len();
         let (next, logprob) = first.expect("graduation follows a final segment");
-        if let Some(cache) = self.prefix_cache.as_mut() {
-            if let Some(entry) =
-                self.serve
-                    .capture_checkpoint(&self.ctx, &kv, &request.prompt_tokens)
-            {
-                cache.insert(entry, resumed);
-            }
+        capture_prefix(
+            &self.ctx,
+            &self.serve,
+            &mut self.prefix_cache,
+            &kv,
+            &request.prompt_tokens,
+            resumed,
+        );
+        if let Some(entry) = settle_first_token(&self.policy, request, kv, next, logprob) {
+            active.push(entry);
         }
-        // The stop token retires the request without being emitted, the
-        // same contract as every other admission path.
-        if !request.params.ignore_eos && self.policy.eos.contains(&next) {
-            let _ = request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
-                prompt_tokens,
-                completion_tokens: 0,
-            });
-            return;
-        }
-        if request
-            .token_tx
-            .send(TokenEvent::Token { id: next, logprob })
-            .is_err()
-        {
-            return;
-        }
-        if request.max_tokens <= 1 {
-            let _ = request.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens,
-                completion_tokens: 1,
-            });
-            return;
-        }
-        active.push(Active {
-            request,
-            kv,
-            next,
-            emitted: 1,
-            prompt_tokens,
-        });
     }
 
     /// Retire every active request the next step cannot serve — a closed
@@ -1703,16 +1689,6 @@ impl EngineState {
         if let Some(chunk) = self.mix_chunk {
             return self.mixed_walk(chunk, newcomers, active);
         }
-        let fail_batch = |active: &mut Vec<Active>, what: &str, err: &anyhow::Error| {
-            log::error!("{what} failed: {err:#}");
-            for entry in active.drain(..) {
-                let _ = entry.request.token_tx.send(TokenEvent::Error {
-                    message: format!("{what} failed: {err:#}"),
-                    prompt_tokens: entry.prompt_tokens,
-                    completion_tokens: entry.emitted,
-                });
-            }
-        };
         let fail_newcomers = |newcomers: &mut Vec<(GenerateRequest, GemmaKv, Option<u64>)>,
                               message: &str| {
             for (request, _, _) in newcomers.drain(..) {
@@ -1744,26 +1720,27 @@ impl EngineState {
             ) {
                 Ok(logits) => logits,
                 Err(err) => {
-                    fail_batch(active, "mixed step", &err);
+                    fail_active_batch(active, "mixed step", &err);
                     return fail_newcomers(&mut newcomers, &format!("mixed step failed: {err:#}"));
                 }
             }
         };
-        if let Some(cache) = self.prefix_cache.as_mut() {
-            for (request, kv, resumed) in &newcomers {
-                if let Some(entry) =
-                    self.serve
-                        .capture_checkpoint(&self.ctx, kv, &request.prompt_tokens)
-                {
-                    cache.insert(entry, *resumed);
-                }
-            }
+        for (request, kv, resumed) in &newcomers {
+            capture_prefix(
+                &self.ctx,
+                &self.serve,
+                &mut self.prefix_cache,
+                kv,
+                &request.prompt_tokens,
+                *resumed,
+            );
         }
-        let (picked, mut logprobs, stops) = {
-            let head: Vec<HeadRow<'_>> = newcomers
+        let mut sampled = {
+            let head: Vec<SampleRow<'_>> = newcomers
                 .iter()
-                .map(|(request, _, _)| HeadRow {
+                .map(|(request, _, _)| SampleRow {
                     params: &request.params,
+                    step: 0,
                     logprobs: request.logprobs,
                     ignore_eos: request.params.ignore_eos,
                 })
@@ -1779,47 +1756,22 @@ impl EngineState {
                 active,
                 logits,
             ) {
-                Ok(flow) => flow,
+                Ok(sampled) => sampled,
                 Err(message) => return fail_newcomers(&mut newcomers, &message),
             }
         };
 
         // The newcomers: their first tokens are logits rows `0..k`.
         for (j, (request, kv, _)) in newcomers.into_iter().enumerate() {
-            let prompt_tokens = request.prompt_tokens.len();
-            let finish = |reason: FinishReason, completion_tokens: usize| {
-                let _ = request.token_tx.send(TokenEvent::Finished {
-                    finish_reason: reason,
-                    prompt_tokens,
-                    completion_tokens,
-                });
-            };
-            if stops[j] {
-                finish(FinishReason::Stop, 0);
-                continue;
-            }
-            let next = picked[j];
-            if request
-                .token_tx
-                .send(TokenEvent::Token {
-                    id: next,
-                    logprob: logprobs[j].take(),
-                })
-                .is_err()
-            {
-                continue;
-            }
-            if request.max_tokens <= 1 {
-                finish(FinishReason::Length, 1);
-                continue;
-            }
-            active.push(Active {
+            if let Some(entry) = settle_first_token(
+                &self.policy,
                 request,
                 kv,
-                next,
-                emitted: 1,
-                prompt_tokens,
-            });
+                sampled.picked[j],
+                sampled.logprobs[j].take(),
+            ) {
+                active.push(entry);
+            }
         }
         Admitted::Done
     }
@@ -1834,17 +1786,6 @@ impl EngineState {
             return;
         }
 
-        let fail_batch = |active: &mut Vec<Active>, what: &str, err: &anyhow::Error| {
-            log::error!("{what} failed: {err:#}");
-            for entry in active.drain(..) {
-                let _ = entry.request.token_tx.send(TokenEvent::Error {
-                    message: format!("{what} failed: {err:#}"),
-                    prompt_tokens: entry.prompt_tokens,
-                    completion_tokens: entry.emitted,
-                });
-            }
-        };
-
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         let logits = {
             let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
@@ -1853,58 +1794,26 @@ impl EngineState {
                 .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, &tokens)
             {
                 Ok(logits) => logits,
-                Err(err) => return fail_batch(active, "batched decode", &err),
+                Err(err) => return fail_active_batch(active, "batched decode", &err),
             }
         };
-        if let Err(err) = ops::suppress_logits_bf16_in_place(&self.ctx, logits, &self.suppress_ids)
-        {
-            return fail_batch(active, "suppression", &err);
-        }
-
-        self.sample_nonce = self.sample_nonce.wrapping_add(1);
-        let call_seed = self.base_seed ^ self.sample_nonce.rotate_left(17);
-        let picked = {
-            let params: Vec<_> = active.iter().map(|entry| &entry.request.params).collect();
-            let steps: Vec<u64> = active.iter().map(|entry| entry.emitted as u64).collect();
-            match pegainfer_sample::select_batch(
+        let sampled = {
+            let rows: Vec<SampleRow<'_>> = active.iter().map(Active::sample_row).collect();
+            sample_logits_rows(
                 &self.ctx,
-                logits,
-                &params,
-                &steps,
-                call_seed,
+                &self.suppress_ids,
+                &self.policy,
                 &mut self.scratch,
-            ) {
-                Ok(picked) => picked,
-                Err(err) => return fail_batch(active, "batched sampling", &err),
-            }
+                self.base_seed,
+                &mut self.sample_nonce,
+                &rows,
+                logits,
+            )
         };
-        let mut stops = vec![false; active.len()];
-        for (row, entry) in active.iter().enumerate() {
-            stops[row] = !entry.request.params.ignore_eos && self.policy.eos.contains(&picked[row]);
+        match sampled {
+            Ok(mut sampled) => emit_decode_rows(active, &mut sampled, 0),
+            Err(err) => fail_active_batch(active, "batched decode", &err),
         }
-        let lp_requests: Vec<LogprobRequest> = active
-            .iter()
-            .enumerate()
-            .filter(|(row, entry)| entry.request.logprobs > 0 && !stops[*row])
-            .map(|(row, entry)| LogprobRequest {
-                row,
-                picked: picked[row],
-                top_k: entry.request.logprobs,
-            })
-            .collect();
-        let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; active.len()];
-        if !lp_requests.is_empty() {
-            match pegainfer_sample::token_logprobs_batch(&self.ctx, logits, &lp_requests) {
-                Ok(scored) => {
-                    for (request, logprob) in lp_requests.iter().zip(scored) {
-                        logprobs[request.row] = Some(logprob);
-                    }
-                }
-                Err(err) => return fail_batch(active, "batched logprobs", &err),
-            }
-        }
-
-        emit_decode_rows(active, &picked, &stops, &mut logprobs, 0);
     }
 }
 
@@ -1913,16 +1822,10 @@ impl EngineState {
 /// admission share; `row_base` is the row's offset into the step's logits
 /// (the mixed step's row 0 is the newcomer). A stop token retires the
 /// request without being emitted; a send failure retires a cancelled one.
-fn emit_decode_rows(
-    active: &mut Vec<Active>,
-    picked: &[u32],
-    stops: &[bool],
-    logprobs: &mut [Option<TokenLogprob>],
-    row_base: usize,
-) {
+fn emit_decode_rows(active: &mut Vec<Active>, sampled: &mut SampledRows, row_base: usize) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, entry) in active.iter_mut().enumerate() {
-        if stops[row + row_base] {
+        if sampled.stops[row + row_base] {
             let _ = entry.request.token_tx.send(TokenEvent::Finished {
                 finish_reason: FinishReason::Stop,
                 prompt_tokens: entry.prompt_tokens,
@@ -1931,14 +1834,14 @@ fn emit_decode_rows(
             retire.push(row);
             continue;
         }
-        let token = picked[row + row_base];
+        let token = sampled.picked[row + row_base];
         entry.emitted += 1;
         if entry
             .request
             .token_tx
             .send(TokenEvent::Token {
                 id: token,
-                logprob: logprobs[row + row_base].take(),
+                logprob: sampled.logprobs[row + row_base].take(),
             })
             .is_err()
         {
@@ -1959,6 +1862,48 @@ fn emit_decode_rows(
     for row in retire.into_iter().rev() {
         active.swap_remove(row);
     }
+}
+
+/// Deliver one admission's first token and decide whether the request joins the
+/// decode batch. The stop token retires the request without being emitted: the
+/// frontend appends its own sentinel for a terminal Stop and drops the last id,
+/// so an engine that emits EOS costs the client its final visible token.
+fn settle_first_token(
+    policy: &GenerationPolicy,
+    request: GenerateRequest,
+    kv: GemmaKv,
+    next: u32,
+    logprob: Option<TokenLogprob>,
+) -> Option<Active> {
+    let prompt_tokens = request.prompt_tokens.len();
+    let finish = |reason: FinishReason, completion_tokens: usize| -> Option<Active> {
+        let _ = request.token_tx.send(TokenEvent::Finished {
+            finish_reason: reason,
+            prompt_tokens,
+            completion_tokens,
+        });
+        None
+    };
+    if policy.stops(next, request.params.ignore_eos) {
+        return finish(FinishReason::Stop, 0);
+    }
+    if request
+        .token_tx
+        .send(TokenEvent::Token { id: next, logprob })
+        .is_err()
+    {
+        return None;
+    }
+    if request.max_tokens <= 1 {
+        return finish(FinishReason::Length, 1);
+    }
+    Some(Active {
+        request,
+        kv,
+        next,
+        emitted: 1,
+        prompt_tokens,
+    })
 }
 
 #[cfg(test)]

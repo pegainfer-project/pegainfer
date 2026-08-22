@@ -560,6 +560,65 @@ fn mixed_gate_argmax(host: &[f32], row: usize, vocab: usize) -> u32 {
     u32::try_from(argmax(&host[row * vocab..(row + 1) * vocab])).expect("token id")
 }
 
+/// Reserve a lane's whole prompt. These gates drive the serving primitives
+/// directly, so a pool that cannot hold it fails here rather than in a step.
+fn gate_admit_kv(serve: &GemmaServe, prompt: &[u32], what: &str) -> GemmaKv {
+    let mut kv = serve.alloc_kv();
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, prompt.len())
+        .unwrap_or_else(|err| panic!("admit {what}: {err:#}"));
+    kv
+}
+
+fn gate_open_lane(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    prompt: &[u32],
+    what: &str,
+) -> (GemmaKv, u32) {
+    let mut kv = gate_admit_kv(serve, prompt, what);
+    let logits = serve
+        .step(ctx, &mut kv, prompt)
+        .unwrap_or_else(|err| panic!("prefill {what}: {err:#}"));
+    let first = argmax_last(ctx, &logits).expect("first token");
+    (kv, first)
+}
+
+fn gate_step_tokens(serve: &GemmaServe, lanes: &mut [(usize, GemmaKv, u32)]) -> Vec<u32> {
+    for (_, kv, _) in lanes.iter_mut() {
+        admit_tokens(&serve.local_pool, &serve.global_pool, kv, 1).expect("admit decode");
+    }
+    lanes.iter().map(|(_, _, next)| *next).collect()
+}
+
+fn gate_host_logits(ctx: &DeviceContext, logits: &HiddenStates) -> (usize, Vec<f32>) {
+    (logits.hidden_dim, logits.to_host(ctx).expect("logits D2H"))
+}
+
+/// Read a step's incumbent rows — `row_base` past any newcomer rows — into the
+/// live lanes, so a mixed round and a pure one advance the batch alike.
+fn settle_gate_lanes(
+    host: &[f32],
+    vocab: usize,
+    row_base: usize,
+    lanes: &mut Vec<(usize, GemmaKv, u32)>,
+    produced: &mut [Vec<u32>],
+    budgets: &[usize],
+) {
+    let mut retire: Vec<usize> = Vec::new();
+    for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
+        let token = mixed_gate_argmax(host, row + row_base, vocab);
+        produced[*req].push(token);
+        if produced[*req].len() >= budgets[*req] {
+            retire.push(row);
+        } else {
+            *next = token;
+        }
+    }
+    for row in retire.into_iter().rev() {
+        lanes.swap_remove(row);
+    }
+}
+
 fn mixed_gate_decode_rounds(
     ctx: &DeviceContext,
     serve: &GemmaServe,
@@ -573,32 +632,15 @@ fn mixed_gate_decode_rounds(
         if lanes.is_empty() {
             break;
         }
-        let tokens: Vec<u32> = lanes.iter().map(|(_, _, next)| *next).collect();
-        for (_, kv, _) in lanes.iter_mut() {
-            admit_tokens(&serve.local_pool, &serve.global_pool, kv, 1).expect("admit decode");
-        }
-        let (vocab, host);
-        {
+        let tokens = gate_step_tokens(serve, lanes);
+        let (vocab, host) = {
             let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
             let logits = serve
                 .decode_batch_step(ctx, arena, &mut kvs, &tokens)
                 .expect("batched decode");
-            vocab = logits.hidden_dim;
-            host = logits.to_host(ctx).expect("logits D2H");
-        }
-        let mut retire: Vec<usize> = Vec::new();
-        for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
-            let token = mixed_gate_argmax(&host, row, vocab);
-            produced[*req].push(token);
-            if produced[*req].len() >= budgets[*req] {
-                retire.push(row);
-            } else {
-                *next = token;
-            }
-        }
-        for row in retire.into_iter().rev() {
-            lanes.swap_remove(row);
-        }
+            gate_host_logits(ctx, logits)
+        };
+        settle_gate_lanes(&host, vocab, 0, lanes, produced, budgets);
     }
 }
 
@@ -627,20 +669,9 @@ fn assert_mixed_admissions_match_serial(ctx: &DeviceContext, serve: &GemmaServe)
 
     // Lane a arrives alone — the plain prefill path — then three decode
     // rounds so the mixed admissions below meet a warm batch.
-    {
-        let mut kv = serve.alloc_kv();
-        admit_tokens(
-            &serve.local_pool,
-            &serve.global_pool,
-            &mut kv,
-            prompts[0].len(),
-        )
-        .expect("admit prompt a");
-        let logits = serve.step(ctx, &mut kv, &prompts[0]).expect("prefill a");
-        let first = argmax_last(ctx, &logits).expect("first token");
-        produced[0].push(first);
-        lanes.push((0, kv, first));
-    }
+    let (kv_a, first_a) = gate_open_lane(ctx, serve, &prompts[0], "prompt a");
+    produced[0].push(first_a);
+    lanes.push((0, kv_a, first_a));
     mixed_gate_decode_rounds(
         ctx,
         serve,
@@ -655,28 +686,10 @@ fn assert_mixed_admissions_match_serial(ctx: &DeviceContext, serve: &GemmaServe)
     // prefills both prompts as segments and samples both first tokens
     // (logits rows 0..2) ahead of the incumbent rows.
     {
-        let mut kv_b = serve.alloc_kv();
-        admit_tokens(
-            &serve.local_pool,
-            &serve.global_pool,
-            &mut kv_b,
-            prompts[1].len(),
-        )
-        .expect("admit prompt b");
-        let mut kv_c = serve.alloc_kv();
-        admit_tokens(
-            &serve.local_pool,
-            &serve.global_pool,
-            &mut kv_c,
-            prompts[2].len(),
-        )
-        .expect("admit prompt c");
-        for (_, lane_kv, _) in &mut lanes {
-            admit_tokens(&serve.local_pool, &serve.global_pool, lane_kv, 1).expect("admit decode");
-        }
-        let tokens: Vec<u32> = lanes.iter().map(|(_, _, next)| *next).collect();
-        let (vocab, host);
-        {
+        let mut kv_b = gate_admit_kv(serve, &prompts[1], "prompt b");
+        let mut kv_c = gate_admit_kv(serve, &prompts[2], "prompt c");
+        let tokens = gate_step_tokens(serve, &mut lanes);
+        let (vocab, host) = {
             let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
             let mut prefills = [
                 (&mut kv_b, prompts[1].as_slice()),
@@ -685,22 +698,9 @@ fn assert_mixed_admissions_match_serial(ctx: &DeviceContext, serve: &GemmaServe)
             let logits = serve
                 .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
                 .expect("k=2 mixed step");
-            vocab = logits.hidden_dim;
-            host = logits.to_host(ctx).expect("logits D2H");
-        }
-        let mut retire: Vec<usize> = Vec::new();
-        for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
-            let token = mixed_gate_argmax(&host, row + 2, vocab);
-            produced[*req].push(token);
-            if produced[*req].len() >= budgets[*req] {
-                retire.push(row);
-            } else {
-                *next = token;
-            }
-        }
-        for row in retire.into_iter().rev() {
-            lanes.swap_remove(row);
-        }
+            gate_host_logits(ctx, logits)
+        };
+        settle_gate_lanes(&host, vocab, 2, &mut lanes, &mut produced, &budgets);
         let first_b = mixed_gate_argmax(&host, 0, vocab);
         produced[1].push(first_b);
         lanes.push((1, kv_b, first_b));
@@ -754,20 +754,9 @@ fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &Gemm
         let mut lanes: Vec<(usize, GemmaKv, u32)> = Vec::new();
         let mut produced: Vec<Vec<u32>> = vec![Vec::new(); 2];
 
-        {
-            let mut kv = serve.alloc_kv();
-            admit_tokens(
-                &serve.local_pool,
-                &serve.global_pool,
-                &mut kv,
-                partner.len(),
-            )
-            .expect("admit partner");
-            let logits = serve.step(ctx, &mut kv, &partner).expect("prefill partner");
-            let first = argmax_last(ctx, &logits).expect("first token");
-            produced[0].push(first);
-            lanes.push((0, kv, first));
-        }
+        let (kv_partner, first_partner) = gate_open_lane(ctx, serve, &partner, "partner");
+        produced[0].push(first_partner);
+        lanes.push((0, kv_partner, first_partner));
         mixed_gate_decode_rounds(
             ctx,
             serve,
@@ -778,42 +767,25 @@ fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &Gemm
             3,
         );
 
-        let mut kv = serve.alloc_kv();
-        admit_tokens(
-            &serve.local_pool,
-            &serve.global_pool,
-            &mut kv,
-            long_prompt.len(),
-        )
-        .expect("admit long prompt");
+        let mut kv = gate_admit_kv(serve, &long_prompt, "long prompt");
         let first = if mixed {
             // The long prompt rides the live lane; its prefill crosses the
             // window inside the mixed step.
-            for (_, lane_kv, _) in &mut lanes {
-                admit_tokens(&serve.local_pool, &serve.global_pool, lane_kv, 1)
-                    .expect("admit decode");
-            }
-            let tokens: Vec<u32> = lanes.iter().map(|(_, _, next)| *next).collect();
-            let (vocab, host);
-            {
+            let tokens = gate_step_tokens(serve, &mut lanes);
+            let (vocab, host) = {
                 let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
                 let mut prefills = [(&mut kv, long_prompt.as_slice())];
                 let logits = serve
                     .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
                     .expect("mixed step");
-                vocab = logits.hidden_dim;
-                host = logits.to_host(ctx).expect("logits D2H");
-            }
+                gate_host_logits(ctx, logits)
+            };
             assert!(
                 kv.local.origin_pages() > 0,
                 "the mixed prefill must have released its window front (origin {})",
                 kv.local.origin_pages()
             );
-            for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
-                let token = mixed_gate_argmax(&host, row + 1, vocab);
-                produced[*req].push(token);
-                *next = token;
-            }
+            settle_gate_lanes(&host, vocab, 1, &mut lanes, &mut produced, &budgets);
             mixed_gate_argmax(&host, 0, vocab)
         } else {
             let logits = serve
@@ -1090,14 +1062,28 @@ fn suffix_and_greedy(
     let vocab = logits.hidden_dim;
     let last = &host[(logits.seq_len - 1) * vocab..logits.seq_len * vocab];
     let bits: Vec<u32> = last.iter().map(|v| v.to_bits()).collect();
-    let mut next = u32::try_from(argmax(last)).expect("token id");
-    let mut tokens = vec![next];
-    for _ in 1..budget {
-        let row = decode_serving(serve, ctx, arena, kv, next).expect("decode");
-        next = u32::try_from(argmax(&row)).expect("token id");
-        tokens.push(next);
-    }
+    let first = u32::try_from(argmax(last)).expect("token id");
+    let tokens = greedy_continuation(serve, ctx, arena, kv, first, budget).expect("greedy suffix");
     (bits, tokens)
+}
+
+/// Decode `budget` greedy tokens, counting the `first` a prefill already picked.
+fn greedy_continuation(
+    serve: &GemmaServe,
+    ctx: &DeviceContext,
+    arena: &mut StepArena,
+    kv: &mut GemmaKv,
+    first: u32,
+    budget: usize,
+) -> Result<Vec<u32>> {
+    let mut next = first;
+    let mut out = vec![next];
+    for _ in 1..budget {
+        let row = decode_serving(serve, ctx, arena, kv, next)?;
+        next = u32::try_from(argmax(&row)).context("token id")?;
+        out.push(next);
+    }
+    Ok(out)
 }
 
 /// One serving-path decode step for a single request: the batched decode
@@ -1139,14 +1125,8 @@ pub(crate) fn generate_greedy(
     admit_tokens(&serve.local_pool, &serve.global_pool, kv, prompt.len())?;
     let mut arena = serve.alloc_step_arena(ctx, 1, false)?;
     let logits = serve.step(ctx, kv, prompt)?;
-    let mut next = argmax_last(ctx, &logits)?;
-    let mut out = vec![next];
-    for _ in 1..max_new {
-        let row = decode_serving(serve, ctx, &mut arena, kv, next)?;
-        next = u32::try_from(argmax(&row)).context("token id")?;
-        out.push(next);
-    }
-    Ok(out)
+    let first = argmax_last(ctx, &logits)?;
+    greedy_continuation(serve, ctx, &mut arena, kv, first, max_new)
 }
 
 fn argmax_last(ctx: &DeviceContext, logits: &HiddenStates) -> Result<u32> {

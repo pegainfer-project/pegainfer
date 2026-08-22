@@ -514,6 +514,15 @@ struct SplitKvState {
     cap: usize,
 }
 
+/// The host buffers a split-KV pseudo expansion fills, borrowed apart so one
+/// builder serves every step shape.
+struct PseudoTables<'a> {
+    pages: &'a mut Vec<i32>,
+    indptr: &'a mut Vec<i32>,
+    last_lens: &'a mut Vec<i32>,
+    kv_lens: &'a mut Vec<usize>,
+}
+
 pub(crate) struct StepArena {
     tower: TowerScratch,
     host: HostPlanningScratch,
@@ -1577,6 +1586,61 @@ impl GemmaServe {
         attention_epilogue_into(ctx, layer, geom, x, &scratch.attn, epilogue, out)
     }
 
+    /// Expand each global row into `global_split_factor` pseudo requests, build
+    /// the CSR the split kernel walks over their kv lengths, and upload both.
+    /// Pure decode and the mixed step differ only in which rows they hand in.
+    fn upload_split_kv_tables(
+        &self,
+        ctx: &DeviceContext,
+        rows: &[Vec<i32>],
+        lasts: &[usize],
+        pseudo: PseudoTables<'_>,
+        global_tables: &mut GlobalTables,
+        global_split: &mut SplitKvState,
+    ) -> Result<()> {
+        let PseudoTables {
+            pages,
+            indptr,
+            last_lens,
+            kv_lens,
+        } = pseudo;
+        let global_page = self.global_pool.layout().page_size;
+        let factor = self.global_split_factor;
+        for (row, &row_last) in rows.iter().zip(lasts) {
+            let row_len = i32::try_from(row.len()).context("global pages fit i32")?;
+            let last = i32::try_from(row_last).context("global last-page len fits i32")?;
+            let kv_len = (row.len() - 1) * global_page + row_last;
+            for _ in 0..factor {
+                pages.extend_from_slice(row);
+                indptr.push(indptr.last().unwrap() + row_len);
+                last_lens.push(last);
+                kv_lens.push(kv_len);
+            }
+        }
+        let csr = ops::build_split_kv_csr(
+            GLOBAL_SPLIT_CHUNK_TOKENS,
+            global_split.cap,
+            kv_lens,
+            factor * rows.len(),
+        )?;
+        upload_prefix(ctx, &mut global_tables.pseudo_pages, pages)?;
+        upload_prefix(ctx, &mut global_tables.pseudo_indptr, indptr)?;
+        upload_prefix(ctx, &mut global_tables.pseudo_last, last_lens)?;
+        upload_prefix(
+            ctx,
+            &mut global_split.request_indices_d,
+            &csr.request_indices,
+        )?;
+        upload_prefix(
+            ctx,
+            &mut global_split.kv_tile_indices_d,
+            &csr.kv_tile_indices,
+        )?;
+        upload_prefix(ctx, &mut global_split.o_indptr_d, &csr.o_indptr)?;
+        upload_prefix(ctx, &mut global_split.valid_mask_d, &csr.block_valid_mask)?;
+        Ok(())
+    }
+
     fn plan_decode_batch(
         &self,
         ctx: &DeviceContext,
@@ -1644,50 +1708,28 @@ impl GemmaServe {
             self.local_geom.head_dim,
             0,
         )?;
-        let global_page = self.global_pool.layout().page_size;
-        let factor = self.global_split_factor;
         for r in 0..padded {
             let row = &global_rows[r];
             let row_len = i32::try_from(row.len()).context("global pages fit i32")?;
-            let last = i32::try_from(global_last[r]).context("global last-page len fits i32")?;
-            let kv_len = (row.len() - 1) * global_page + global_last[r];
             positions.push(i32::try_from(global_start[r]).context("position fits i32")?);
             global_indptr.push(global_indptr.last().unwrap() + row_len);
             global_pages_cat.extend_from_slice(row);
-            for _ in 0..factor {
-                pseudo_pages.extend_from_slice(row);
-                pseudo_indptr.push(pseudo_indptr.last().unwrap() + row_len);
-                pseudo_last.push(last);
-                pseudo_kv_lens.push(kv_len);
-            }
         }
-        let global_csr = ops::build_split_kv_csr(
-            GLOBAL_SPLIT_CHUNK_TOKENS,
-            global_split.cap,
-            pseudo_kv_lens,
-            factor * padded,
-        )?;
         upload_prefix(ctx, &mut global_tables.pages, global_pages_cat)?;
         upload_prefix(ctx, &mut global_tables.indptr, global_indptr)?;
         upload_prefix(ctx, &mut global_tables.positions, positions)?;
-        upload_prefix(ctx, &mut global_tables.pseudo_pages, pseudo_pages)?;
-        upload_prefix(ctx, &mut global_tables.pseudo_indptr, pseudo_indptr)?;
-        upload_prefix(ctx, &mut global_tables.pseudo_last, pseudo_last)?;
-        upload_prefix(
+        self.upload_split_kv_tables(
             ctx,
-            &mut global_split.request_indices_d,
-            &global_csr.request_indices,
-        )?;
-        upload_prefix(
-            ctx,
-            &mut global_split.kv_tile_indices_d,
-            &global_csr.kv_tile_indices,
-        )?;
-        upload_prefix(ctx, &mut global_split.o_indptr_d, &global_csr.o_indptr)?;
-        upload_prefix(
-            ctx,
-            &mut global_split.valid_mask_d,
-            &global_csr.block_valid_mask,
+            &global_rows[..padded],
+            &global_last[..padded],
+            PseudoTables {
+                pages: pseudo_pages,
+                indptr: pseudo_indptr,
+                last_lens: pseudo_last,
+                kv_lens: pseudo_kv_lens,
+            },
+            global_tables,
+            global_split,
         )?;
         upload_prefix(ctx, origins_slot, local_origins)
     }
@@ -2026,50 +2068,24 @@ impl GemmaServe {
             self.global_geom.head_dim,
             0,
         )?;
-        // The pseudo tables for the split-KV attention read, over the
-        // decode rows only.
-        let factor = self.global_split_factor;
-        for r in 0..batch {
-            let row = &global_rows[r];
-            let row_len = i32::try_from(row.len()).context("global pages fit i32")?;
-            let last = i32::try_from(global_last[r]).context("global last-page len fits i32")?;
-            let kv_len = (row.len() - 1) * global_page + global_last[r];
-            for _ in 0..factor {
-                pseudo_pages.extend_from_slice(row);
-                pseudo_indptr.push(pseudo_indptr.last().unwrap() + row_len);
-                pseudo_last.push(last);
-                pseudo_kv_lens.push(kv_len);
-            }
-        }
-        let global_csr = ops::build_split_kv_csr(
-            GLOBAL_SPLIT_CHUNK_TOKENS,
-            global_split.cap,
-            pseudo_kv_lens,
-            factor * batch,
-        )?;
         upload_prefix(ctx, mix_positions, &mix_rows.positions)?;
         upload_prefix(ctx, mix_local_pages, &mix_rows.local_pages)?;
         upload_prefix(ctx, mix_local_origins, &mix_rows.local_origins)?;
         upload_prefix(ctx, mix_global_pages, &mix_rows.global_pages)?;
         upload_prefix(ctx, mix_global_origins, &mix_rows.global_origins)?;
-        upload_prefix(ctx, &mut global_tables.pseudo_pages, pseudo_pages)?;
-        upload_prefix(ctx, &mut global_tables.pseudo_indptr, pseudo_indptr)?;
-        upload_prefix(ctx, &mut global_tables.pseudo_last, pseudo_last)?;
-        upload_prefix(
+        // The split-KV attention read covers the decode rows only.
+        self.upload_split_kv_tables(
             ctx,
-            &mut global_split.request_indices_d,
-            &global_csr.request_indices,
-        )?;
-        upload_prefix(
-            ctx,
-            &mut global_split.kv_tile_indices_d,
-            &global_csr.kv_tile_indices,
-        )?;
-        upload_prefix(ctx, &mut global_split.o_indptr_d, &global_csr.o_indptr)?;
-        upload_prefix(
-            ctx,
-            &mut global_split.valid_mask_d,
-            &global_csr.block_valid_mask,
+            &global_rows[..batch],
+            &global_last[..batch],
+            PseudoTables {
+                pages: pseudo_pages,
+                indptr: pseudo_indptr,
+                last_lens: pseudo_last,
+                kv_lens: pseudo_kv_lens,
+            },
+            global_tables,
+            global_split,
         )?;
 
         for (_, prompt) in prefills.iter() {
@@ -2247,6 +2263,68 @@ impl GemmaServe {
         ctx.sync()
     }
 
+    /// The host-side prologue every single-request prompt pass shares. All of it
+    /// runs on `ctx.stream`, so the overlap-safe form can fence once after it
+    /// and leave everything downstream in flight.
+    fn prepare_single(
+        &self,
+        ctx: &DeviceContext,
+        kv: &GemmaKv,
+        tokens: &[u32],
+        what: &str,
+    ) -> Result<SinglePass> {
+        let seq_len = tokens.len();
+        anyhow::ensure!(seq_len > 0, "{what} needs at least one token");
+        self.check_stream(ctx)?;
+        validate_tokens(&self.weights, self.local_geom.hidden_size, tokens)?;
+        let start_pos = kv.local.seq_len();
+        self.check_step_bounds(kv, start_pos + seq_len)?;
+        let plan = self.plan_step(ctx, kv, start_pos, seq_len)?;
+        let tower = TowerScratch::new(ctx, &self.local_geom, &self.global_geom, seq_len)?;
+        let ids = ctx
+            .stream
+            .clone_htod(tokens)
+            .map_err(|e| anyhow::anyhow!("token ids H2D failed: {e}"))?;
+        let last = HiddenStates::zeros(ctx, self.local_geom.hidden_size, 1)?;
+        Ok(SinglePass {
+            plan,
+            tower,
+            ids,
+            last,
+        })
+    }
+
+    /// The kernel half of a single-request pass, launched after the overlap-safe
+    /// form has fenced.
+    fn run_single_tower(
+        &self,
+        ctx: &DeviceContext,
+        pass: &mut SinglePass,
+        seq_len: usize,
+    ) -> Result<()> {
+        let src = self.run_tower(
+            ctx,
+            &mut pass.tower,
+            &pass.ids,
+            seq_len,
+            &pass.plan.local_plan,
+            PrepRef::Single {
+                start_pos: pass.plan.start_pos,
+                local_page_origin: pass.plan.local_page_origin,
+                global_plan: &pass.plan.global_plan,
+            },
+            None,
+        )?;
+        ops::copy_hidden_token_range_into(
+            ctx,
+            &pass.tower.hidden[src],
+            seq_len - 1,
+            &mut pass.last,
+            0,
+            1,
+        )
+    }
+
     pub(crate) fn step(
         &self,
         ctx: &DeviceContext,
@@ -2254,44 +2332,18 @@ impl GemmaServe {
         tokens: &[u32],
     ) -> Result<HiddenStates> {
         let seq_len = tokens.len();
-        anyhow::ensure!(seq_len > 0, "step needs at least one token");
-        self.check_stream(ctx)?;
-        let weights = &self.weights;
-        validate_tokens(weights, self.local_geom.hidden_size, tokens)?;
-        let start_pos = kv.local.seq_len();
-        self.check_step_bounds(kv, start_pos + seq_len)?;
-        let plan = self.plan_step(ctx, kv, start_pos, seq_len)?;
+        let mut pass = self.prepare_single(ctx, kv, tokens, "step")?;
         log::debug!(
-            "gemma4 step: start_pos {start_pos} seq_len {seq_len} pages local {} global {}",
+            "gemma4 step: start_pos {} seq_len {seq_len} pages local {} global {}",
+            kv.local.seq_len(),
             kv.local.held_pages(),
             kv.global.held_pages()
         );
-
-        let mut tower = TowerScratch::new(ctx, &self.local_geom, &self.global_geom, seq_len)?;
-        let ids = ctx
-            .stream
-            .clone_htod(tokens)
-            .map_err(|e| anyhow::anyhow!("token ids H2D failed: {e}"))?;
-        let src = self.run_tower(
-            ctx,
-            &mut tower,
-            &ids,
-            seq_len,
-            &plan.local_plan,
-            PrepRef::Single {
-                start_pos: plan.start_pos,
-                local_page_origin: plan.local_page_origin,
-                global_plan: &plan.global_plan,
-            },
-            None,
-        )?;
-        let hidden = &tower.hidden[src];
-        let mut last = HiddenStates::zeros(ctx, hidden.hidden_dim, 1)?;
-        ops::copy_hidden_token_range_into(ctx, hidden, seq_len - 1, &mut last, 0, 1)?;
+        self.run_single_tower(ctx, &mut pass, seq_len)?;
         let logits = logits_tail(
             ctx,
-            weights,
-            &last,
+            &self.weights,
+            &pass.last,
             self.local_geom.rms_norm_eps,
             self.final_logit_softcapping,
         )?;
@@ -2324,41 +2376,15 @@ impl GemmaServe {
         tokens: &[u32],
     ) -> Result<PrefillPass> {
         let seq_len = tokens.len();
-        anyhow::ensure!(seq_len > 0, "prefill needs at least one token");
-        self.check_stream(ctx)?;
-        let weights = &self.weights;
-        validate_tokens(weights, self.local_geom.hidden_size, tokens)?;
-        let start_pos = kv.local.seq_len();
-        self.check_step_bounds(kv, start_pos + seq_len)?;
-        let plan = self.plan_step(ctx, kv, start_pos, seq_len)?;
-        let mut tower = TowerScratch::new(ctx, &self.local_geom, &self.global_geom, seq_len)?;
-        let ids = ctx
-            .stream
-            .clone_htod(tokens)
-            .map_err(|e| anyhow::anyhow!("token ids H2D failed: {e}"))?;
-        let mut last = HiddenStates::zeros(ctx, self.local_geom.hidden_size, 1)?;
+        let mut pass = self.prepare_single(ctx, kv, tokens, "prefill")?;
         let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, 1)?;
-        let mut logits = HiddenStates::zeros(ctx, weights.embed_tokens.rows, 1)?;
+        let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, 1)?;
         fence_producers_before_override(ctx)?;
-        let src = self.run_tower(
-            ctx,
-            &mut tower,
-            &ids,
-            seq_len,
-            &plan.local_plan,
-            PrepRef::Single {
-                start_pos: plan.start_pos,
-                local_page_origin: plan.local_page_origin,
-                global_plan: &plan.global_plan,
-            },
-            None,
-        )?;
-        let hidden = &tower.hidden[src];
-        ops::copy_hidden_token_range_into(ctx, hidden, seq_len - 1, &mut last, 0, 1)?;
+        self.run_single_tower(ctx, &mut pass, seq_len)?;
         logits_tail_into(
             ctx,
-            weights,
-            &last,
+            &self.weights,
+            &pass.last,
             self.local_geom.rms_norm_eps,
             self.final_logit_softcapping,
             &mut normed,
@@ -2368,10 +2394,7 @@ impl GemmaServe {
         kv.global.advance(seq_len);
         Ok(PrefillPass {
             logits,
-            _tower: tower,
-            _plan: plan,
-            _ids: ids,
-            _last: last,
+            _pass: pass,
             _normed: normed,
         })
     }
@@ -2384,15 +2407,21 @@ impl GemmaServe {
     }
 }
 
+/// What one single-request prompt pass allocates before any layer runs and
+/// keeps alive until its kernels retire.
+struct SinglePass {
+    plan: GemmaStepPlan,
+    tower: TowerScratch,
+    ids: CudaSlice<u32>,
+    last: HiddenStates,
+}
+
 /// Everything an overlapped prefill keeps alive while its kernels are in
 /// flight on the lane stream: dropping any of it before the completion
 /// event fires would free device memory the pass still reads.
 pub(crate) struct PrefillPass {
     pub(crate) logits: HiddenStates,
-    _tower: TowerScratch,
-    _plan: GemmaStepPlan,
-    _ids: CudaSlice<u32>,
-    _last: HiddenStates,
+    _pass: SinglePass,
     _normed: HiddenStates,
 }
 
