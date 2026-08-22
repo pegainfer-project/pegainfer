@@ -87,6 +87,14 @@ pub(crate) struct StepEffects {
     pub(crate) prompt_echoes: Vec<PromptEchoEffect>,
     pub(crate) pending: Vec<PendingEffect>,
     pub(crate) decode: Vec<DecodeEffect>,
+    /// Prefix-cache queries counted this step (one per request whose first
+    /// prefill chunk was resolved — that is where the cache is consulted).
+    /// Cumulative counters live on the scheduler; this is the per-step delta.
+    pub(crate) prefix_queries: u64,
+    /// Prefix-cache hits counted this step, in tokens (the cached prefix
+    /// length of each first-chunk request). Cumulative counters live on the
+    /// scheduler; this is the per-step delta.
+    pub(crate) prefix_hits: u64,
 }
 
 impl StepEffects {
@@ -96,6 +104,8 @@ impl StepEffects {
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: Vec::new(),
+            prefix_queries: 0,
+            prefix_hits: 0,
         }
     }
 }

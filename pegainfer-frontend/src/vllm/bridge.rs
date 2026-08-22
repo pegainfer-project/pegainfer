@@ -35,7 +35,9 @@ use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::output::UtilityCallOutput;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
+use vllm_engine_core_client::protocol::stats::BaseCacheStats;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::stats::PrefixCacheStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
@@ -597,6 +599,14 @@ pub(crate) fn scheduler_stats_from(snapshot: &SchedulerMetrics) -> SchedulerStat
             0.0
         } else {
             snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
+        },
+        prefix_cache_stats: PrefixCacheStats {
+            base: BaseCacheStats {
+                queries: snapshot.prefix_cache_queries,
+                hits: snapshot.prefix_cache_hits,
+                ..BaseCacheStats::default()
+            },
+            ..PrefixCacheStats::default()
         },
         ..SchedulerStats::default()
     }

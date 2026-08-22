@@ -26,6 +26,12 @@ pub struct SchedulerMetrics {
     pub num_waiting_reqs: u64,
     /// Cumulative spec-decode counters, or `None` when no draft model is loaded.
     pub spec_decode: Option<SpecDecodeCounters>,
+    /// Cumulative prefix-cache queries (one per request that reached its first
+    /// prefill chunk). Monotonic; mapped to vLLM `PrefixCacheStats.queries`.
+    pub prefix_cache_queries: u64,
+    /// Cumulative prefix-cache hits, in tokens. Monotonic; mapped to vLLM
+    /// `PrefixCacheStats.hits`.
+    pub prefix_cache_hits: u64,
 }
 
 /// Upper bound on a drafter's `K`, fixing the width of

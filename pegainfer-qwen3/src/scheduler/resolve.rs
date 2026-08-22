@@ -27,12 +27,16 @@ pub(crate) fn resolve_step(
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
         },
         ExecutionArtifacts::SpeculativeDecode { verify } => StepEffects {
             cached: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_speculative_outputs(executor, active, &verify.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
         },
         ExecutionArtifacts::Unified { pending, result } => {
             let mut effects = resolve_prefill_outputs(executor, pending, result.prefill_requests);
@@ -107,6 +111,10 @@ fn resolve_prefill_outputs(
                 request_id: req.request_id,
                 cached_tokens: result.cached_tokens,
             });
+            // One cache query per request (the cache is consulted once, on the
+            // first chunk); the cached prefix length is the hit count, in tokens.
+            effects.prefix_queries += 1;
+            effects.prefix_hits += result.cached_tokens as u64;
         }
 
         if !result.completed {
