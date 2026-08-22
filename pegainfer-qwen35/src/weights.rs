@@ -555,9 +555,8 @@ impl Qwen35Model {
         };
         if let Some(backend) = &flashinfer_gdn {
             info!(
-                "Qwen3.5 GDN production backend: FlashInfer AOT object {} ({} bytes)",
-                backend.artifact_sha256(),
-                backend.artifact_size_bytes()
+                "Qwen3.5 GDN production backend: FlashInfer AOT object {}",
+                backend.artifact_sha256()
             );
         } else if tensor_parallel.world_size > 1 {
             info!(

@@ -20,11 +20,7 @@ use crate::tensor::DeviceContext;
 use crate::tensor::HiddenStates;
 
 const QWEN35_GDN_ABI_VERSION: u32 = 1;
-const BF16_DTYPE: u32 = 1;
-const F32_DTYPE: u32 = 2;
-const HKV_V_CONTIGUOUS_LAYOUT: u32 = 1;
 const STATUS_OK: i32 = 0;
-const STATUS_NOT_SUPPORTED: i32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen35GdnGeometry {
@@ -41,21 +37,6 @@ impl Qwen35GdnGeometry {
         h_v: 32,
         head_dim: 128,
     };
-
-    fn spec(self, sm: i32) -> Result<ffi::FlashInferGdnSpec> {
-        Ok(ffi::FlashInferGdnSpec {
-            abi_version: QWEN35_GDN_ABI_VERSION,
-            struct_size: size_of::<ffi::FlashInferGdnSpec>() as u32,
-            sm,
-            h_q: self.h_q.try_into().context("GDN Hq exceeds u32")?,
-            h_k: self.h_k.try_into().context("GDN Hk exceeds u32")?,
-            h_v: self.h_v.try_into().context("GDN Hv exceeds u32")?,
-            head_dim: self.head_dim.try_into().context("GDN D exceeds u32")?,
-            qkv_dtype: BF16_DTYPE,
-            state_dtype: F32_DTYPE,
-            state_layout: HKV_V_CONTIGUOUS_LAYOUT,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,20 +53,6 @@ fn qwen35_gdn_capability(sm: i32, geometry: Qwen35GdnGeometry) -> Qwen35GdnSuppo
         Qwen35GdnSupport::UnsupportedGeometry
     } else {
         Qwen35GdnSupport::Supported
-    }
-}
-
-fn linked_artifact_support(sm: i32, geometry: Qwen35GdnGeometry) -> Result<Qwen35GdnSupport> {
-    let spec = geometry.spec(sm)?;
-    let status = unsafe { ffi::pegainfer_qwen35_gdn_supported(&raw const spec) };
-    match status {
-        STATUS_OK => Ok(Qwen35GdnSupport::Supported),
-        STATUS_NOT_SUPPORTED => Ok(if sm != 120 {
-            Qwen35GdnSupport::UnsupportedSm
-        } else {
-            Qwen35GdnSupport::UnsupportedGeometry
-        }),
-        other => anyhow::bail!("Qwen3.5 GDN support query failed with stable ABI status {other}"),
     }
 }
 
@@ -106,7 +73,6 @@ pub struct Qwen35GdnWorkspace {
 // The handle is bound to one CUDA device and all launches are issued by the
 // owning model thread on its DeviceContext stream.
 unsafe impl Send for Qwen35GdnAot {}
-unsafe impl Sync for Qwen35GdnAot {}
 
 impl Qwen35GdnAot {
     pub fn load_for_production(
@@ -125,10 +91,6 @@ impl Qwen35GdnAot {
         ensure!(
             unsafe { ffi::pegainfer_qwen35_gdn_aot_available() } == 1,
             "SM120/Hv32 selects FlashInfer GDN, but the validated prebuilt AOT artifact was not linked; set PEGAINFER_QWEN35_GDN_AOT_BUNDLE at build time"
-        );
-        ensure!(
-            linked_artifact_support(sm, geometry)? == Qwen35GdnSupport::Supported,
-            "linked Qwen3.5 GDN artifact rejected its production specialization"
         );
         let mut raw = std::ptr::null_mut();
         let status =
@@ -162,10 +124,6 @@ impl Qwen35GdnAot {
         unsafe { CStr::from_ptr(pointer) }
             .to_str()
             .unwrap_or("invalid-utf8")
-    }
-
-    pub fn artifact_size_bytes(&self) -> u64 {
-        unsafe { ffi::pegainfer_qwen35_gdn_artifact_size_bytes() }
     }
 
     pub fn allocate_workspace(
@@ -286,12 +244,7 @@ impl Qwen35GdnAot {
             workspace: workspace_ptr,
             workspace_bytes,
             cu_seqlens: cu_ptr,
-            cu_seqlens_len: 2,
             tokens: t.try_into().context("Qwen3.5 GDN T exceeds u32")?,
-            h_q: g.h_q as u32,
-            h_k: g.h_k as u32,
-            h_v: g.h_v as u32,
-            head_dim: g.head_dim as u32,
             stream: ctx.stream.cu_stream(),
         };
         let status =
