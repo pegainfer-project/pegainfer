@@ -15,6 +15,8 @@ tvm-ffi = { version = "0.1.0-alpha.0", optional = true }
 [build-dependencies]
 cc = { workspace = true }
 pegainfer-build = { workspace = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -22,7 +24,7 @@ tvm-ffi-triton-cubin = ["dep:tvm-ffi", "qwen35"]
 # Qwen3.5 Triton AOT kernels (GDR chunkwise prefill) — the only feature that
 # needs Python + Triton at build time.
 deepseek-v2-lite = []
-qwen35 = []
+qwen35 = ["dep:serde_json", "dep:sha2"]
 # Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
 glm52 = ["moe"]
 # Kimi K3: TileLang-generated kernels, FP8xFP4 masked grouped GEMM, and the

@@ -106,6 +106,11 @@ impl Default for ModelRuntimeConfig {
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
+    /// Opaque kernels-owned AOT operation. `None` is an explicit capability
+    /// fallback (non-SM120 or non-Hv32), never a corrupt-artifact fallback.
+    pub(super) flashinfer_gdn: Option<pegainfer_kernels::ops::Qwen35GdnAot>,
+    #[cfg(feature = "gdn-validation")]
+    pub(super) gdn_validation_evidence: super::gdn_validation::GdnValidationEvidenceHandle,
     pub(super) config: Config35,
     pub(super) tensor_parallel: TensorParallelConfig,
     pub(super) embed_tokens: DeviceMatrix,
@@ -538,8 +543,40 @@ impl Qwen35Model {
             num_pages,
         )?;
 
+        // The first production specialization is deliberately single-GPU.
+        // TP remains an explicit capability fallback to the existing Triton path.
+        let flashinfer_gdn = if tensor_parallel.world_size == 1 {
+            pegainfer_kernels::ops::Qwen35GdnAot::load_for_production(
+                &ctx,
+                super::flashinfer_gdn::model_geometry(&config),
+            )?
+        } else {
+            None
+        };
+        if let Some(backend) = &flashinfer_gdn {
+            info!(
+                "Qwen3.5 GDN production backend: FlashInfer AOT object {}",
+                backend.artifact_sha256()
+            );
+        } else if tensor_parallel.world_size > 1 {
+            info!(
+                "Qwen3.5 GDN production backend: Triton (explicit capability fallback: TP world_size={})",
+                tensor_parallel.world_size
+            );
+        } else {
+            let (major, minor) = ctx.ctx.compute_capability()?;
+            info!(
+                "Qwen3.5 GDN production backend: Triton (explicit capability fallback: sm_{}{}, geometry={:?})",
+                major,
+                minor,
+                super::flashinfer_gdn::model_geometry(&config)
+            );
+        }
         Ok(Self {
             ctx,
+            flashinfer_gdn,
+            #[cfg(feature = "gdn-validation")]
+            gdn_validation_evidence: Default::default(),
             config,
             tensor_parallel,
             embed_tokens,
@@ -729,13 +766,16 @@ impl Qwen35Model {
             "requested graph capacity {max_batch} exceeds loaded capacity {}",
             self.reserved_decode_slots
         );
-        super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
+        let graph = super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
             &self.ctx,
             &self.config,
             self.tensor_parallel,
             &self.kv_pool,
             max_batch,
-        )
+        )?;
+        #[cfg(feature = "gdn-validation")]
+        let graph = graph.with_validation_evidence(self.gdn_validation_evidence.clone());
+        Ok(graph)
     }
 
     pub(crate) fn create_batch_decode_buffers_with_capacity(

@@ -1,0 +1,11 @@
+{
+  "schema_version": 3,
+  "flashinfer_commit": "a0efa0adfe49bb836ab1a147d6572980b870f3d4",
+  "patches": [
+    {
+      "path": "patches/0001-openinfer-hkv-state-layout.patch",
+      "sha256": "76aff3ef6d5fc1ecb9895640ee88d29d63ebbeecdabd622264e638335d3c6f22"
+    }
+  ],
+  "patched_kernel_sha256": "4e3c6f81edf39b5444f20353b1307c8028b2496d702b7bfb9ebfbcebf4f7b35b"
+}

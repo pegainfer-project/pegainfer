@@ -9,6 +9,9 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
 
+#[cfg(feature = "qwen35")]
+use sha2::Digest as _;
+
 struct TritonKernelSpec {
     artifact_dir: &'static str,
     kernel_path: &'static str,
@@ -37,6 +40,175 @@ struct FlashInferIncludes {
     /// copy — FlashInfer v0.6+ uses APIs (e.g. `cuda::fast_mod_div`) that older
     /// CTK CCCL lacks. Mirrors upstream flashinfer/jit/cpp_ext.py ordering.
     cccl: Vec<PathBuf>,
+}
+
+#[cfg(feature = "qwen35")]
+const QWEN35_GDN_AOT_ABI_VERSION: u64 = 1;
+#[cfg(feature = "qwen35")]
+const QWEN35_GDN_AOT_ENV: &str = "PEGAINFER_QWEN35_GDN_AOT_BUNDLE";
+
+#[cfg(feature = "qwen35")]
+fn sha256_file(path: &Path) -> String {
+    let bytes =
+        fs::read(path).unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(feature = "qwen35")]
+fn json_u64<'a>(value: &'a serde_json::Value, path: &[&str]) -> u64 {
+    let mut cursor = value;
+    for key in path {
+        cursor = &cursor[*key];
+    }
+    cursor.as_u64().unwrap_or_else(|| {
+        panic!(
+            "GDN AOT manifest field {} must be an unsigned integer",
+            path.join(".")
+        )
+    })
+}
+
+#[cfg(feature = "qwen35")]
+fn json_str<'a>(value: &'a serde_json::Value, path: &[&str]) -> &'a str {
+    let mut cursor = value;
+    for key in path {
+        cursor = &cursor[*key];
+    }
+    cursor
+        .as_str()
+        .unwrap_or_else(|| panic!("GDN AOT manifest field {} must be a string", path.join(".")))
+}
+
+/// Validate and attach the release-provided Qwen3.5 GDN object. The generated
+/// object and its native CuTe runtime archive are linked statically; serving
+/// never reads a manifest, loads PTX, or discovers a Python wheel.
+#[cfg(feature = "qwen35")]
+fn build_qwen35_flashinfer_gdn_aot(
+    root: &Path,
+    out_dir: &Path,
+    cuda_include: &Path,
+) -> (Vec<PathBuf>, Option<PathBuf>) {
+    println!("cargo:rerun-if-env-changed={QWEN35_GDN_AOT_ENV}");
+    let shim = root.join("csrc/qwen35/flashinfer_gdn_aot.c");
+    let shim_header = root.join("csrc/qwen35/flashinfer_gdn_aot.h");
+    println!("cargo:rerun-if-changed={}", shim.display());
+    println!("cargo:rerun-if-changed={}", shim_header.display());
+
+    let config_header = out_dir.join("flashinfer_gdn_build_config.h");
+    let mut includes = vec![root.join("csrc/qwen35"), out_dir.to_path_buf()];
+    let mut linked_objects = Vec::new();
+    let mut runtime_dir = None;
+    let mut config = String::from(
+        "#pragma once\n#define PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256 \"unavailable\"\n#define PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM 128u\n",
+    );
+
+    if let Some(bundle) = std::env::var_os(QWEN35_GDN_AOT_ENV) {
+        let bundle = PathBuf::from(bundle);
+        let manifest_path = bundle.join("manifest.json");
+        let manifest_bytes = fs::read(&manifest_path).unwrap_or_else(|error| {
+            panic!("read GDN AOT manifest {}: {error}", manifest_path.display())
+        });
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .unwrap_or_else(|error| panic!("parse GDN AOT manifest: {error}"));
+        assert_eq!(json_u64(&manifest, &["schema_version"]), 3);
+        assert_eq!(json_str(&manifest, &["variant"]), "qwen35_4b_candidate");
+        assert_eq!(json_str(&manifest, &["target", "arch"]), "sm_120a");
+        assert_eq!(
+            json_str(&manifest, &["target", "code_object"]),
+            "embedded_cubin"
+        );
+        assert_eq!(
+            json_u64(&manifest, &["abi", "version"]),
+            QWEN35_GDN_AOT_ABI_VERSION
+        );
+        assert_eq!(json_u64(&manifest, &["geometry", "h_q"]), 16);
+        assert_eq!(json_u64(&manifest, &["geometry", "h_k"]), 16);
+        assert_eq!(json_u64(&manifest, &["geometry", "h_v"]), 32);
+        assert_eq!(json_u64(&manifest, &["geometry", "head_dim"]), 128);
+        assert_eq!(json_str(&manifest, &["tokens", "extent"]), "dynamic");
+        assert_eq!(json_u64(&manifest, &["tokens", "minimum"]), 1);
+        assert_eq!(
+            json_str(&manifest, &["abi", "state_layout"]),
+            "openinfer_hkv_v_contiguous"
+        );
+        assert_eq!(json_str(&manifest, &["workspace", "kind"]), "per_sm");
+        let workspace_bytes_per_sm = json_u64(&manifest, &["workspace", "bytes_per_sm"]);
+        assert_eq!(workspace_bytes_per_sm, 128);
+        assert_eq!(json_u64(&manifest, &["workspace", "alignment_bytes"]), 128);
+
+        let header = bundle.join("kernel.h");
+        let object = bundle.join("kernel.o");
+        let runtime = bundle.join("libcuda_dialect_runtime_static.a");
+        for (label, path, hash_path, size_path) in [
+            (
+                "header",
+                &header,
+                ["artifact", "header", "sha256"],
+                ["artifact", "header", "size_bytes"],
+            ),
+            (
+                "object",
+                &object,
+                ["artifact", "object", "sha256"],
+                ["artifact", "object", "size_bytes"],
+            ),
+            (
+                "native runtime",
+                &runtime,
+                ["artifact", "native_runtime", "sha256"],
+                ["artifact", "native_runtime", "size_bytes"],
+            ),
+        ] {
+            assert!(
+                path.is_file(),
+                "GDN AOT {label} is missing: {}",
+                path.display()
+            );
+            assert_eq!(sha256_file(path), json_str(&manifest, &hash_path));
+            assert_eq!(
+                fs::metadata(path).expect("read GDN AOT metadata").len(),
+                json_u64(&manifest, &size_path)
+            );
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        println!("cargo:rerun-if-changed={}", manifest_path.display());
+
+        let object_hash = json_str(&manifest, &["artifact", "object", "sha256"]);
+        config = format!(
+            "#pragma once\n#define PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256 \"{object_hash}\"\n#define PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM {workspace_bytes_per_sm}u\n"
+        );
+        includes.push(bundle.clone());
+        linked_objects.push(object);
+        runtime_dir = runtime.parent().map(Path::to_path_buf);
+    }
+    fs::write(&config_header, config).expect("write GDN AOT build config");
+
+    let shim_obj = out_dir.join("qwen35_flashinfer_gdn_aot.o");
+    let compiler = cc::Build::new().get_compiler();
+    let mut command = compiler.to_command();
+    command
+        .arg("-c")
+        .arg(&shim)
+        .arg("-o")
+        .arg(&shim_obj)
+        .arg("-O3")
+        .arg("-std=c11")
+        .arg("-fPIC")
+        .arg("-isystem")
+        .arg(cuda_include);
+    for include in includes {
+        command.arg("-I").arg(include);
+    }
+    if runtime_dir.is_some() {
+        command.arg("-DPEGAINFER_QWEN35_GDN_AOT");
+    }
+    let status = command.status().expect("compile Qwen3.5 GDN AOT shim");
+    assert!(status.success(), "Qwen3.5 GDN AOT shim compilation failed");
+    linked_objects.push(shim_obj);
+    (linked_objects, runtime_dir)
 }
 
 const GLM52_TRTLLM_FMHA_CUBINS: &[(&str, &str)] = &[
@@ -1880,6 +2052,14 @@ fn main() {
     // --- k3: DeepGEMM-only, no DeepEP/NCCL dependency ---
     let k3_enabled = cfg!(feature = "k3");
     let qwen35_enabled = cfg!(feature = "qwen35");
+    #[cfg(feature = "qwen35")]
+    let (qwen35_gdn_objects, qwen35_gdn_runtime_dir) = if qwen35_enabled {
+        build_qwen35_flashinfer_gdn_aot(&crate_root(), &out_dir, &cuda_include)
+    } else {
+        (Vec::new(), None)
+    };
+    #[cfg(not(feature = "qwen35"))]
+    let (qwen35_gdn_objects, qwen35_gdn_runtime_dir) = (Vec::new(), None::<PathBuf>);
     if glm52_enabled {
         generate_glm52_trtllm_fmha_cubins(&crate_root(), &out_dir);
         build_glm52_cutedsl_fp8_dsl(&crate_root(), &out_dir, &cuda_include);
@@ -1938,6 +2118,9 @@ fn main() {
                 return None;
             }
             if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
+                return None;
+            }
+            if !qwen35_enabled && file_name == "gdn_prepare.cu" {
                 return None;
             }
             // --- k3 ---
@@ -2454,6 +2637,7 @@ fn main() {
     ar_args.extend(
         obj_files
             .into_iter()
+            .chain(qwen35_gdn_objects)
             .map(|path| path.to_string_lossy().to_string()),
     );
 
@@ -2493,6 +2677,10 @@ fn main() {
         toolkit.link_search();
     }
     println!("cargo:rustc-link-lib=static=kernels_cuda");
+    if let Some(runtime_dir) = qwen35_gdn_runtime_dir {
+        println!("cargo:rustc-link-search=native={}", runtime_dir.display());
+        println!("cargo:rustc-link-lib=static=cuda_dialect_runtime_static");
+    }
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cublasLt");

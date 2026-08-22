@@ -329,6 +329,8 @@ impl Qwen35Model {
         );
 
         if !self.config.decode_group_is_compiled() {
+            #[cfg(feature = "gdn-validation")]
+            graph_state.evidence.record_graph_eager_fallback();
             LOG_UNCOMPILED_DECODE_ROUTE.call_once(|| {
                 let group = self.config.num_attention_heads / self.config.num_key_value_heads;
                 log::info!(
@@ -389,6 +391,8 @@ impl Qwen35Model {
         let mut graphs = std::mem::take(&mut graph_state.graphs);
         let linear_state_ptrs = &graph_state.linear_pointer_tables.state_ptrs;
         let linear_conv_state_ptrs = &graph_state.linear_pointer_tables.conv_state_ptrs;
+        #[cfg(feature = "gdn-validation")]
+        let was_captured = graphs[bucket_idx].is_captured();
         let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
             self.batch_decode_kernels_graph(
                 kv_buffer,
@@ -399,6 +403,14 @@ impl Qwen35Model {
                 &mut graph_state.buffers,
             )
         });
+        #[cfg(feature = "gdn-validation")]
+        if result.is_ok() {
+            if was_captured {
+                graph_state.evidence.record_graph_replay();
+            } else {
+                graph_state.evidence.record_graph_capture();
+            }
+        }
         graph_state.graphs = graphs;
         result
     }

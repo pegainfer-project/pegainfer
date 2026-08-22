@@ -8,6 +8,8 @@ use pegainfer_core::tensor::DeviceContext;
 use super::config::Config35;
 use super::config::TensorParallelConfig;
 use super::decode_buffers::BatchDecodeBuffers35;
+#[cfg(feature = "gdn-validation")]
+use super::gdn_validation::GdnValidationEvidenceHandle;
 use super::recurrent_state::LinearStatePointerTables;
 use super::recurrent_state::RecurrentState;
 
@@ -54,6 +56,8 @@ pub(crate) struct BatchDecodeGraphState {
     pub(crate) linear_pointer_tables: LinearStatePointerTables,
     /// One `CudaGraphState` per BATCH_BUCKETS entry (indexed by position).
     pub(crate) graphs: Vec<CudaGraphState>,
+    #[cfg(feature = "gdn-validation")]
+    pub(crate) evidence: GdnValidationEvidenceHandle,
 }
 
 impl BatchDecodeGraphState {
@@ -102,7 +106,18 @@ impl BatchDecodeGraphState {
             slot_states,
             linear_pointer_tables,
             graphs,
+            #[cfg(feature = "gdn-validation")]
+            evidence: Default::default(),
         })
+    }
+
+    #[cfg(feature = "gdn-validation")]
+    pub(crate) fn with_validation_evidence(
+        mut self,
+        evidence: GdnValidationEvidenceHandle,
+    ) -> Self {
+        self.evidence = evidence;
+        self
     }
 
     /// D2D copy `src` recurrent state into slot `slot_idx`.
@@ -117,6 +132,8 @@ impl BatchDecodeGraphState {
         slot_idx: usize,
     ) -> Result<()> {
         let dst = &mut self.slot_states[slot_idx];
+        #[cfg(feature = "gdn-validation")]
+        let reused = dst.seq_len != 0;
         for (dst_layer, src_layer) in dst.layers.iter_mut().zip(src.layers.iter()) {
             ctx.stream
                 .memcpy_dtod(&src_layer.state, &mut dst_layer.state)
@@ -126,6 +143,13 @@ impl BatchDecodeGraphState {
                 .map_err(|e| anyhow::anyhow!("copy conv state to slot {slot_idx}: {e}"))?;
         }
         dst.seq_len = src.seq_len;
+        #[cfg(feature = "gdn-validation")]
+        self.evidence.record_state_slot_copy(reused);
         Ok(())
+    }
+
+    #[cfg(feature = "gdn-validation")]
+    pub(crate) fn record_slot_compaction(&self) {
+        self.evidence.record_slot_compaction();
     }
 }

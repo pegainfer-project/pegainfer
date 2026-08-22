@@ -10,6 +10,9 @@ pub(crate) mod config;
 mod decode_buffers;
 mod executor;
 mod ffi;
+mod flashinfer_gdn;
+#[cfg(feature = "gdn-validation")]
+mod gdn_validation;
 mod logprobs;
 pub mod model_line;
 mod ops;
@@ -63,7 +66,13 @@ pub mod runtime {
     pub use crate::executor::PrefillStepItem;
     pub use crate::executor::Qwen35Executor;
     pub use crate::executor::RequestId;
+    #[cfg(feature = "gdn-validation")]
+    pub use crate::gdn_validation::GdnPrefillRuntimeEvidence;
+    #[cfg(feature = "gdn-validation")]
+    pub use crate::gdn_validation::GdnPrefillRuntimeEvidenceHandle;
     pub use crate::scheduler::start_with_capacity;
+    #[cfg(feature = "gdn-validation")]
+    pub use crate::start_engine_with_flashinfer_gdn_for_accuracy;
     pub use crate::tp_executor::DropExpectation;
     pub use crate::tp_executor::Qwen35TpExecutor;
     pub use crate::weights::Qwen35Model;
@@ -109,6 +118,31 @@ pub fn start_engine(
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
     )
+}
+
+/// Start the normal single-GPU production scheduler and expose build-linked
+/// FlashInfer launch evidence to end-to-end accuracy tests.
+#[cfg(feature = "gdn-validation")]
+pub fn start_engine_with_flashinfer_gdn_for_accuracy(
+    model_path: &Path,
+    device_ordinal: usize,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+) -> Result<(
+    EngineHandle,
+    gdn_validation::GdnPrefillRuntimeEvidenceHandle,
+)> {
+    anyhow::ensure!(
+        (1..=MAX_DECODE_BATCH).contains(&max_batch),
+        "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
+    );
+    let model_path = model_path
+        .to_str()
+        .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
+    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+    let evidence = model.flashinfer_gdn_runtime_evidence_handle()?;
+    let handle = scheduler::start_with_capacity(model, 42, max_batch, max_prefill_tokens)?;
+    Ok((handle, evidence))
 }
 
 #[derive(Clone, Debug)]

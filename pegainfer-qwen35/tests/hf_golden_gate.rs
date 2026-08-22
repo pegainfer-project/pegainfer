@@ -94,6 +94,18 @@ const BUCKET_STRADDLES: [usize; 2] = [5, 3];
 const SLOT_COMPACTION_BATCH: usize = 5;
 const SLOT_COMPACTION_DROP_INDEX: usize = 1;
 
+fn required_model_path() -> String {
+    let path = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
+        "required Qwen3.5 production gate needs PEGAINFER_TEST_MODEL_PATH set to the pinned Qwen3.5-4B snapshot",
+    );
+    let config = Path::new(&path).join("config.json");
+    assert!(
+        config.is_file(),
+        "required Qwen3.5 production gate cannot read {}; set PEGAINFER_TEST_MODEL_PATH to the pinned Qwen3.5-4B snapshot",
+        config.display()
+    );
+    path
+}
 fn sha256_file(path: impl AsRef<Path>) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let mut digest = Sha256::new();
@@ -831,6 +843,55 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
     assert_eq!(
         fp1, fp2,
         "long sequential Qwen3.5 replay must reproduce identical logprobs"
+    );
+}
+
+#[cfg(feature = "gdn-validation")]
+#[test]
+#[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
+fn production_flashinfer_gdn_matches_hf_short_golden() {
+    let model_path = required_model_path();
+    assert_eq!(
+        fixture_size_name(&model_path),
+        Some("4b"),
+        "FlashInfer production HF gate is scoped to the Qwen3.5-4B Hv32 geometry"
+    );
+    let golden = Golden::load_for(&model_path, false)
+        .expect("required Qwen3.5-4B HF fixture is missing or unrecognized");
+    assert!(
+        check_fixture_metadata(&model_path, &golden),
+        "required Qwen3.5 production gate could not prove the pinned model revision"
+    );
+    report_fixture_shape(&golden);
+    let all = (0..golden.num_seqs).collect::<Vec<_>>();
+    let mut production = build_executor(&model_path);
+    let production_before = production
+        .flashinfer_gdn_runtime_evidence()
+        .expect("SM120/Hv32 production Auto dispatch must expose FlashInfer evidence");
+    assert_eq!(production_before.selected_backend, "flashinfer");
+    assert_ne!(production_before.artifact_sha256, "unavailable");
+    assert_eq!(production_before.artifact_sha256.len(), 64);
+    assert_eq!(production_before.successful_launches, 0);
+    let (production_stats, _) = run(&golden, &mut production, &all, false);
+    report_and_assert("production Auto sequential bs=1 graph", &production_stats);
+    let production_after = production
+        .flashinfer_gdn_runtime_evidence()
+        .expect("production Auto dispatch lost FlashInfer identity");
+    assert_eq!(
+        production_after.artifact_sha256,
+        production_before.artifact_sha256
+    );
+    assert_eq!(production_after.selected_backend, "flashinfer");
+    assert!(
+        production_after.successful_launches > production_before.successful_launches,
+        "production Auto HF replay completed without a FlashInfer launch"
+    );
+    eprintln!(
+        "qwen35 hf_golden_gate [production Auto]: selected_backend={} object_sha256={} successful_launches={} -> {}",
+        production_after.selected_backend,
+        production_after.artifact_sha256,
+        production_before.successful_launches,
+        production_after.successful_launches,
     );
 }
 

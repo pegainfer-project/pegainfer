@@ -32,6 +32,7 @@ vllm-text = { workspace = true }
 
 [features]
 default = []
+gdn-validation = ["qwen35"]
 qwen35 = ["pegainfer-kernels/qwen35"]
 
 [lints]
@@ -47,10 +48,6 @@ required-features = ["qwen35"]
 
 [[test]]
 name = "sampling_behavior"
-required-features = ["qwen35"]
-
-[[test]]
-name = "chunked_prefill"
 required-features = ["qwen35"]
 
 [[test]]
