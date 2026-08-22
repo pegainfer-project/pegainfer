@@ -280,11 +280,13 @@ impl Gemma4Weights {
             skipped_modality_tensors,
         };
         info!(
-            "Gemma 4 weights resident: {:.2} GiB manifest, {:.2} GiB device, {:.2} GiB free; \
+            "Gemma 4 weights resident: {:.2} GiB manifest, {:.2} GiB device, {:.2} GiB free, \
+             {} modality tensors skipped; \
              {:.0} ms total, of which {:.0} validate, {:.0} record-api, {:.0} execute-and-drain",
             gib(stats.manifest_bytes as i64),
             gib(stats.device_bytes),
             gib(stats.device_free_bytes as i64),
+            stats.skipped_modality_tensors,
             stats.elapsed_ms,
             stats.validate_wall_ms,
             stats.record_api_wall_ms,
@@ -316,10 +318,12 @@ mod tests {
     ///
     /// ```text
     /// PEGAINFER_TEST_MODEL_PATH=/path/to/gemma-4-12B-it cargo test --release \
-    ///   -p pegainfer-gemma4 --features gemma4 --lib -- --ignored --nocapture
+    ///   -p pegainfer-gemma4 --features gemma4 --lib \
+    ///   weights::load::tests::loads_the_text_tower_and_reports_residency -- \
+    ///   --exact --ignored --nocapture --test-threads=1
     /// ```
     #[test]
-    #[ignore = "needs a Gemma 4 checkpoint and a device"]
+    #[ignore = "requires the pinned 12B checkpoint and a GPU"]
     fn loads_the_text_tower_and_reports_residency() -> Result<()> {
         let path = model_path()?;
         let config = Gemma4Config::from_file(&path)?;
@@ -371,7 +375,7 @@ mod tests {
     /// ordinal: a load that created its context first would fail with a driver
     /// error instead of the manifest's.
     #[test]
-    #[ignore = "needs a Gemma 4 checkpoint"]
+    #[ignore = "requires the pinned 12B checkpoint"]
     fn a_disagreeing_config_names_every_faulty_tensor() -> Result<()> {
         let path = model_path()?;
         let staged = tempfile::tempdir()?;

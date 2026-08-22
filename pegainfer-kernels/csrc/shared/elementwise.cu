@@ -1,6 +1,8 @@
 #include "common.cuh"
+#include <climits>
 #include <cstdint>
 #include <cuda.h>
+#include <math_constants.h>
 
 // ============================================================================
 // Element-wise add: out = a + b (bf16, computed in f32)
@@ -347,6 +349,27 @@ __global__ void softcap_bf16_kernel(
        idx += gridDim.x * blockDim.x) {
     float x = __bfloat162float(buf[idx]);
     buf[idx] = __float2bfloat16(cap * tanhf(x / cap));
+  }
+}
+
+// ============================================================================
+// In-place logit suppression. Ids reach here only through the Rust
+// `SuppressIds` type, which refuses any id outside the head at upload.
+// ============================================================================
+
+__global__ void suppress_logits_bf16_kernel(
+    __nv_bfloat16 *__restrict__ logits,
+    const uint32_t *__restrict__ ids,
+    int vocab,
+    int id_count,
+    int total) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int row = idx / id_count;
+    int id_slot = idx % id_count;
+    logits[(size_t)row * vocab + ids[id_slot]] =
+        __float2bfloat16(-CUDART_INF_F);
   }
 }
 
@@ -795,6 +818,21 @@ CUresult softcap_bf16_in_place_cuda(
   int block = 256;
   int grid = n / block + (n % block != 0);
   softcap_bf16_kernel<<<grid, block, 0, stream>>>(buf, cap, n);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult suppress_logits_bf16_in_place_cuda(
+    __nv_bfloat16 *logits, const uint32_t *ids,
+    int vocab, int rows, int id_count, cudaStream_t stream) {
+  if (logits == nullptr || ids == nullptr || vocab <= 0 || rows <= 0 ||
+      id_count <= 0 || id_count > INT_MAX / rows) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = rows * id_count;
+  int block = 256;
+  int grid = total / block + (total % block != 0);
+  suppress_logits_bf16_kernel<<<grid, block, 0, stream>>>(
+      logits, ids, vocab, id_count, total);
   return (CUresult)cudaGetLastError();
 }
 

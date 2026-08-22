@@ -11,6 +11,47 @@ pub(crate) const GOLDEN_PATH: &str = concat!(
 );
 pub(crate) const METADATA_KEY: &str = "gemma4_golden";
 
+pub(crate) fn fixture_manifest(bytes: &[u8], key: &str) -> serde_json::Value {
+    let (_, metadata) = safetensors::SafeTensors::read_metadata(bytes).expect("fixture metadata");
+    serde_json::from_str(
+        metadata
+            .metadata()
+            .as_ref()
+            .expect("fixture metadata map")
+            .get(key)
+            .expect("fixture manifest key"),
+    )
+    .expect("parse fixture manifest")
+}
+
+/// The base golden fixture's bytes and manifest, with the manifest already
+/// held against the checkpoint under test — the prologue every in-crate
+/// oracle opens with. The bytes come back because `SafeTensors` borrows them.
+pub(crate) fn golden_bytes(dir: &str) -> (Vec<u8>, serde_json::Value) {
+    let bytes = std::fs::read(GOLDEN_PATH).expect("read fixture");
+    let manifest = fixture_manifest(&bytes, METADATA_KEY);
+    assert_checkpoint_matches(&manifest, dir);
+    (bytes, manifest)
+}
+
+/// The generate fixture's three prompts. Greedy equality across differing
+/// batch compositions only means something on prompts whose next-token
+/// margins are real: synthetic id arithmetic drives the tower into a
+/// degenerate distribution where the top two candidates sit within
+/// reduction-order noise, and the comparison becomes a coin flip.
+pub(crate) fn generate_fixture_prompts() -> Vec<Vec<u32>> {
+    const PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../test_data/gemma4-12b-generate.safetensors"
+    );
+    let bytes = std::fs::read(PATH).expect("read generate fixture (dump on the box first)");
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+    ["a", "b", "c"]
+        .iter()
+        .map(|case| u32_tensor(&fixture, &format!("{case}_prompt")).1)
+        .collect()
+}
+
 pub(crate) fn model_path() -> String {
     std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
         "PEGAINFER_TEST_MODEL_PATH must point at the pinned 12B Gemma 4 \
@@ -109,6 +150,18 @@ pub(crate) fn i32_tensor(
         .map(|b| i32::from_le_bytes(*b))
         .collect();
     (view.shape().to_vec(), host)
+}
+
+pub(crate) fn u32_tensor(
+    fixture: &safetensors::SafeTensors<'_>,
+    name: &str,
+) -> (Vec<usize>, Vec<u32>) {
+    let (shape, tokens) = i32_tensor(fixture, name);
+    let tokens = tokens
+        .into_iter()
+        .map(|token| u32::try_from(token).expect("token id fits u32"))
+        .collect();
+    (shape, tokens)
 }
 
 pub(crate) fn f32_tensor(

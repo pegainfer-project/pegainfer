@@ -82,7 +82,7 @@ That is a hardware floor, not a target. A 32 GiB device cannot start this config
 
 ## The conversation prefix cache (opt-in)
 
-`PEGAINFER_PREFIX_CACHE=K` (unset by default) keeps copies of up to K completed prompt states, so the next turn of a conversation resumes where its history ends instead of prefilling all of it again. Unset, nothing is allocated and admission behaves exactly as above.
+`PEGAINFER_PREFIX_CACHE=K` (unset by default) keeps copies of up to K completed prompt states, so the next turn of a conversation resumes where its history ends instead of prefilling all of it again. Unset, `0` or `off`, nothing is allocated and admission behaves exactly as above — the same spelling of off the chunked walk takes. Any other unparseable or non-UTF-8 value refuses startup instead of silently disabling the cache.
 
 When a request's prefill completes, the engine copies its prompt-state pages — the global family up to the prompt frontier plus the local family's resident window — into cache-owned pages. Only the prompt region is captured: generated tokens do not re-render into the next turn's prompt verbatim, so only the prompt prefix can ever be hit again. At admission the prompt resolves against the cache by longest common prefix, clamped to the sliding-window floor — a resume below the released window front cannot be rebuilt and misses by construction. A hit restores by copying the pages back and prefilling only the unseen suffix, and `Scheduled` reports the resumed count as `cached_tokens`.
 

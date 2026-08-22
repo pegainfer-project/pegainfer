@@ -9,6 +9,52 @@ use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::kv_pool::KvReservation;
 use pegainfer_core::kv_pool::KvState;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReleaseState {
+    frontier: usize,
+    origin_pages: usize,
+    resident_pages: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ReleaseStep {
+    tokens: usize,
+    window: usize,
+    page_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReleasePlan {
+    frontier: usize,
+    origin_pages: usize,
+    release_pages: usize,
+}
+
+fn plan_release(state: ReleaseState, step: ReleaseStep) -> Result<ReleasePlan> {
+    let frontier = state
+        .frontier
+        .checked_add(step.tokens)
+        .ok_or_else(|| anyhow::anyhow!("the KV frontier overflows while advancing"))?;
+    let origin_pages = frontier.saturating_sub(step.window) / step.page_size;
+    let release_pages = origin_pages.checked_sub(state.origin_pages).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the origin is already {} pages in where a frontier of {frontier} allows {origin_pages}",
+            state.origin_pages
+        )
+    })?;
+    anyhow::ensure!(
+        release_pages <= state.resident_pages,
+        "releasing {release_pages} pages needs more than the {} resident: the row and \
+         a frontier of {frontier} have drifted apart",
+        state.resident_pages
+    );
+    Ok(ReleasePlan {
+        frontier,
+        origin_pages,
+        release_pages,
+    })
+}
+
 /// The local family's state once the window can move: pages are held as
 /// one reservation each so the front can be released page by page, which a
 /// single request-owned permit cannot do. `origin_pages` counts what has
@@ -63,10 +109,14 @@ impl SlidingLocalKv {
 
     pub(crate) fn page_row(&self) -> Vec<i32> {
         let mut row = Vec::with_capacity(self.resident.len());
-        for reservation in &self.resident {
-            reservation.extend_page_indices_i32(&mut row);
-        }
+        self.extend_page_row(&mut row);
         row
+    }
+
+    pub(crate) fn extend_page_row(&self, row: &mut Vec<i32>) {
+        for reservation in &self.resident {
+            reservation.extend_page_indices_i32(row);
+        }
     }
 
     pub(crate) fn layout(&self) -> &KvLayout {
@@ -96,24 +146,21 @@ impl SlidingLocalKv {
     /// prospective frontier before any field changes, so a refused move
     /// leaves the request exactly where it was.
     pub(crate) fn advance_and_release(&mut self, count: usize, window: usize) -> Result<()> {
-        let page = self.pool.layout().page_size;
-        let frontier = self.frontier + count;
-        let target = frontier.saturating_sub(window) / page;
-        let release = target.checked_sub(self.origin_pages).ok_or_else(|| {
-            anyhow::anyhow!(
-                "the origin is already {} pages in where a frontier of {frontier} allows {target}",
-                self.origin_pages
-            )
-        })?;
-        anyhow::ensure!(
-            release <= self.resident.len(),
-            "releasing {release} pages needs more than the {} resident: the row and \
-             a frontier of {frontier} have drifted apart",
-            self.resident.len()
-        );
-        self.resident.drain(..release);
-        self.origin_pages = target;
-        self.frontier = frontier;
+        let plan = plan_release(
+            ReleaseState {
+                frontier: self.frontier,
+                origin_pages: self.origin_pages,
+                resident_pages: self.resident.len(),
+            },
+            ReleaseStep {
+                tokens: count,
+                window,
+                page_size: self.pool.layout().page_size,
+            },
+        )?;
+        self.resident.drain(..plan.release_pages);
+        self.origin_pages = plan.origin_pages;
+        self.frontier = plan.frontier;
         Ok(())
     }
 }
@@ -126,6 +173,13 @@ pub(crate) struct GemmaKv {
 /// A refused side drops the other reservation, leaving both pools at their
 /// pre-request occupancy. The page count is the exact frontier account: a
 /// ceiling over the post-step kv_len, per family.
+/// Pages a family still has to reserve to cover `kv_len` tokens, given what
+/// its account already holds. `None` means the account is already past the
+/// frontier — a bookkeeping error, not a surplus to spend.
+pub(crate) fn pages_to_reserve(kv_len: usize, accounted: usize, page_size: usize) -> Option<usize> {
+    kv_len.div_ceil(page_size).checked_sub(accounted)
+}
+
 pub(crate) fn admit_tokens(
     local_pool: &KvPool,
     global_pool: &KvPool,
@@ -163,8 +217,8 @@ pub(crate) fn admit_tokens(
     .into_iter()
     .enumerate()
     {
-        let want = kv_len.div_ceil(page_size);
-        need[slot] = want.checked_sub(accounted).ok_or_else(|| {
+        need[slot] = pages_to_reserve(kv_len, accounted, page_size).ok_or_else(|| {
+            let want = kv_len.div_ceil(page_size);
             anyhow::anyhow!(
                 "{family} family already accounts for {accounted} pages where \
                  {kv_len} tokens need {want}"
@@ -225,12 +279,13 @@ mod tests {
 
     use super::*;
 
+    const WINDOW: usize = 1024;
+    const SEGMENT: usize = 128;
+    const TOTAL: usize = 1500;
+
     fn tiny_pools(ctx: &DeviceContext) -> (KvPool, KvPool) {
-        // 1 layer, 1 head, dim 1: just enough to exercise page accounting.
-        // Capacities include the padding page each pool reserves: 4 -> 3
-        // usable, 2 -> 1 usable.
-        let local = KvPool::new(ctx, 1, 1, 1, 16, 4).expect("local pool");
-        let global = KvPool::new(ctx, 1, 1, 1, 16, 2).expect("global pool");
+        let local = KvPool::new(ctx, 1, 1, 1, PAGE_SIZE, 4).expect("local pool");
+        let global = KvPool::new(ctx, 1, 1, 1, PAGE_SIZE, 2).expect("global pool");
         (local, global)
     }
 
@@ -241,22 +296,89 @@ mod tests {
         }
     }
 
+    fn apply_release(state: ReleaseState, tokens: usize) -> ReleaseState {
+        let plan = plan_release(
+            state,
+            ReleaseStep {
+                tokens,
+                window: WINDOW,
+                page_size: PAGE_SIZE,
+            },
+        )
+        .expect("release plan");
+        ReleaseState {
+            frontier: plan.frontier,
+            origin_pages: plan.origin_pages,
+            resident_pages: state.resident_pages - plan.release_pages,
+        }
+    }
+
+    fn segmented(mut state: ReleaseState) -> ReleaseState {
+        let mut left = TOTAL;
+        while left > 0 {
+            let tokens = left.min(SEGMENT);
+            state = apply_release(state, tokens);
+            left -= tokens;
+        }
+        state
+    }
+
+    #[test]
+    fn whole_and_segmented_release_share_one_ledger() {
+        let initial = ReleaseState {
+            frontier: 0,
+            origin_pages: 0,
+            resident_pages: TOTAL.div_ceil(PAGE_SIZE),
+        };
+        assert_eq!(segmented(initial), apply_release(initial, TOTAL));
+    }
+
+    #[test]
+    fn segment_admission_keeps_the_same_ledger_and_bounds_residency() {
+        let mut state = ReleaseState {
+            frontier: 0,
+            origin_pages: 0,
+            resident_pages: 0,
+        };
+        let mut peak = 0;
+        let mut left = TOTAL;
+        while left > 0 {
+            let tokens = left.min(SEGMENT);
+            state.resident_pages += pages_to_reserve(
+                state.frontier + tokens,
+                state.origin_pages + state.resident_pages,
+                PAGE_SIZE,
+            )
+            .expect("the account cannot sit past its own frontier");
+            peak = peak.max(state.resident_pages);
+            state = apply_release(state, tokens);
+            left -= tokens;
+        }
+        let whole = apply_release(
+            ReleaseState {
+                frontier: 0,
+                origin_pages: 0,
+                resident_pages: TOTAL.div_ceil(PAGE_SIZE),
+            },
+            TOTAL,
+        );
+        assert_eq!(state, whole);
+        let cap = WINDOW.div_ceil(PAGE_SIZE) + SEGMENT.div_ceil(PAGE_SIZE) + 1;
+        assert!(peak <= cap, "resident peak {peak} exceeds cap {cap}");
+    }
+
     #[test]
     fn admission_is_atomic_across_pools() {
         let ctx = DeviceContext::new().expect("GPU required");
         let (local, global) = tiny_pools(&ctx);
         let mut kv = kv_from(&local, &global);
-
-        // 17 tokens: local needs 2 of 3 (grantable), global needs 2 of 1
-        // (refused). The grantable half must roll back.
         let refused = admit_tokens(&local, &global, &mut kv, 17);
         assert!(refused.is_err(), "partial admission must refuse");
         assert_eq!(local.available_pages(), 3, "local occupancy must roll back");
         assert_eq!(global.available_pages(), 1, "global occupancy untouched");
-        assert_eq!(kv.local.held_pages(), 0);
-        assert_eq!(kv.global.held_pages(), 0);
+        assert_eq!((kv.local.held_pages(), kv.global.held_pages()), (0, 0));
 
-        admit_tokens(&local, &global, &mut kv, 16).expect("one page each");
+        admit_tokens(&local, &global, &mut kv, PAGE_SIZE).expect("one page each");
         assert_eq!((local.available_pages(), global.available_pages()), (2, 0));
         assert_eq!((kv.local.held_pages(), kv.global.held_pages()), (1, 1));
     }

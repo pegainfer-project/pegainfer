@@ -12,12 +12,17 @@ use anyhow::Result;
 use half::bf16;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
+#[cfg(test)]
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
+#[cfg(test)]
 use crate::config::LayerKind;
+#[cfg(test)]
 use crate::layer::LayerGeometry;
+#[cfg(test)]
 use crate::layer::global_layer_forward;
+#[cfg(test)]
 use crate::layer::local_layer_forward;
 use crate::weights::Gemma4Weights;
 
@@ -61,6 +66,7 @@ pub(crate) fn validate_tokens(
 
 /// Runs the full text tower over `tokens` at positions `0..len`, returning
 /// softcapped logits (`[vocab_size, seq_len]`).
+#[cfg(test)]
 pub(crate) fn full_forward(
     ctx: &DeviceContext,
     weights: &Gemma4Weights,
@@ -199,36 +205,27 @@ mod oracle {
     use super::*;
     use crate::config::Gemma4Config;
     use crate::layer::build_proportional_rope_tables;
-    use crate::testkit::GOLDEN_PATH;
-    use crate::testkit::METADATA_KEY;
-    use crate::testkit::assert_checkpoint_matches;
     use crate::testkit::f32_tensor;
+    use crate::testkit::golden_bytes;
     use crate::testkit::i32_tensor;
     use crate::testkit::log_softmax_at;
     use crate::testkit::model_path;
+    use crate::testkit::u32_tensor;
 
     #[test]
-    #[ignore = "requires the pinned 12B checkpoint via PEGAINFER_TEST_MODEL_PATH and a GPU"]
+    #[ignore = "requires the pinned 12B checkpoint and a GPU"]
     // float_cmp: the embed-scale assert is intentionally exact — both sides
     // are the same bf16-representable value.
     #[allow(clippy::float_cmp)]
     fn full_forward_matches_hf_topk() {
         let dir = model_path();
-        let fixture_bytes = std::fs::read(GOLDEN_PATH).expect("read fixture");
-        let (_, meta) =
-            safetensors::SafeTensors::read_metadata(&fixture_bytes).expect("fixture metadata");
-        let manifest: serde_json::Value = serde_json::from_str(
-            meta.metadata()
-                .as_ref()
-                .expect("fixture metadata map")
-                .get(METADATA_KEY)
-                .expect("gemma4_golden metadata key"),
-        )
-        .expect("parse fixture manifest");
-        assert_checkpoint_matches(&manifest, &dir);
+        let (fixture_bytes, manifest) = golden_bytes(&dir);
         let fixture = safetensors::SafeTensors::deserialize(&fixture_bytes).expect("parse fixture");
 
         let config = Gemma4Config::from_file(&dir).expect("config");
+        let (weights, _) =
+            Gemma4Weights::from_safetensors(&dir, 0, config).expect("load 12B weights");
+        let config = &weights.config;
         // The scale chain is load-bearing enough that the fixture records it;
         // our derivation must agree before it multiplies anything.
         assert_eq!(
@@ -238,8 +235,6 @@ mod oracle {
                 .expect("embed_scale_bf16"),
             "embed scale disagrees with the fixture's recorded bf16 value"
         );
-        let (weights, _) =
-            Gemma4Weights::from_safetensors(&dir, 0, config.clone()).expect("load 12B weights");
         let ctx = DeviceContext::new_with_device(0).expect("device context");
 
         let cos_max_pos = 1024;
@@ -280,12 +275,8 @@ mod oracle {
             ("short", 0.9, 1.0, 1.0),
             ("edge", 20.0, 0.75, 0.65),
         ] {
-            let (tshape, tokens_i32) = i32_tensor(&fixture, &format!("{case}_tokens"));
-            assert_eq!(tshape.len(), 1, "{case}_tokens rank");
-            let tokens: Vec<u32> = tokens_i32
-                .iter()
-                .map(|&t| u32::try_from(t).expect("token id fits u32"))
-                .collect();
+            let (token_shape, tokens) = u32_tensor(&fixture, &format!("{case}_tokens"));
+            assert_eq!(token_shape.len(), 1, "{case}_tokens rank");
 
             let logits = full_forward(
                 &ctx,

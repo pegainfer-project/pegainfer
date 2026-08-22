@@ -11,25 +11,20 @@ mod probe;
 #[cfg(feature = "gemma4")]
 mod engine;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod forward;
 #[cfg(feature = "gemma4")]
 mod green_ctx;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod kv;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod layer;
 #[cfg(feature = "gemma4")]
 mod prefix_cache;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod serve;
 #[cfg(all(test, feature = "gemma4"))]
 mod testkit;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod weights;
 
 use std::path::Path;

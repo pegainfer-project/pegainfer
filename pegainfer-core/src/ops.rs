@@ -20,6 +20,7 @@ pub use pegainfer_kernels::ops::GEMM_LT_MAX_N;
 pub use pegainfer_kernels::ops::Hd512DecodeMetadata;
 pub use pegainfer_kernels::ops::LoraDecodeGroupedProjection;
 pub use pegainfer_kernels::ops::SUPPORTED_GQA_GROUP_SIZES;
+pub use pegainfer_kernels::ops::SuppressIds;
 pub use pegainfer_kernels::ops::accumulate_bf16_token_scaled_to_f32_into;
 pub use pegainfer_kernels::ops::add_batch;
 pub use pegainfer_kernels::ops::add_batch_into;
@@ -99,6 +100,7 @@ pub use pegainfer_kernels::ops::single_prefill_hd512_into;
 pub use pegainfer_kernels::ops::single_prefill_nhd_causal_into;
 pub use pegainfer_kernels::ops::single_prefill_nhd_noncausal_into;
 pub use pegainfer_kernels::ops::softcap_bf16_in_place;
+pub use pegainfer_kernels::ops::suppress_logits_bf16_in_place;
 pub use pegainfer_kernels::ops::write_vec_into;
 #[cfg(feature = "kernel-call-trace")]
 pub use traced::embedding_batch;

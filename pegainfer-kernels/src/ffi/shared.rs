@@ -146,6 +146,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn suppress_logits_bf16_in_place_cuda(
+        logits: *mut Half,
+        ids: *const u32,
+        vocab: i32,
+        rows: i32,
+        id_count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn embedding_batched_cuda(
         embed: *const Half,
         token_ids: *const u32,
