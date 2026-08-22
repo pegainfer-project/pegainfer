@@ -13,9 +13,10 @@ import types
 from pathlib import Path
 
 from artifact_contract import (
-    DTYPES,
     FORBIDDEN_TMA_CLUSTER_LOAD,
     TARGET_ARCH,
+    VARIANT,
+    WORKSPACE,
     expected_spec,
     compiler_path,
     normalize_ptx,
@@ -196,7 +197,7 @@ def compile_variant(variant: str, flashinfer_dir: Path) -> tuple[object, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", required=True, choices=("qwen35_4b_candidate",))
+    parser.add_argument("--variant", required=True, choices=(VARIANT,))
     parser.add_argument("--flashinfer-dir", required=True, type=Path)
     parser.add_argument("--base-flashinfer-dir", required=True, type=Path)
     parser.add_argument("--aot-out", required=True, type=Path)
@@ -220,9 +221,10 @@ def main() -> int:
         **spec,
         "flashinfer_commit": source["flashinfer_commit"],
         "kernel_source_sha256": source["kernel_source_sha256"],
+        "source_lock_sha256": source["source_lock_sha256"],
         "generator_sha256": sha256_file(compiler_path()),
         "requirements_lock_sha256": sha256_file(requirements_lock_path()),
-        "workspace": source["workspace"],
+        "workspace": WORKSPACE,
         "toolchain": {
             "python": sys.version.split()[0],
             **ptx_metadata(ptx),
@@ -237,6 +239,7 @@ def main() -> int:
             "function_prefix": prefix,
             "header": header.name,
             "header_sha256": sha256_file(header),
+            "header_size_bytes": header.stat().st_size,
             "object": object_file.name,
             "object_sha256": sha256_file(object_file),
             "object_size_bytes": object_file.stat().st_size,

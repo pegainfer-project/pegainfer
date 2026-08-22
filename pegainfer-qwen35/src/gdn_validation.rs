@@ -70,7 +70,6 @@ impl GdnValidationEvidenceHandle {
 pub struct GdnPrefillRuntimeEvidence {
     pub selected_backend: String,
     pub artifact_sha256: String,
-    pub artifact_size_bytes: u64,
     pub successful_launches: u64,
     pub graph_captures: u64,
     pub graph_replays: u64,
@@ -84,7 +83,6 @@ pub struct GdnPrefillRuntimeEvidence {
 pub struct GdnPrefillRuntimeEvidenceHandle {
     selected_backend: &'static str,
     artifact_sha256: String,
-    artifact_size_bytes: u64,
     validation: GdnValidationEvidenceHandle,
 }
 
@@ -94,7 +92,6 @@ impl GdnPrefillRuntimeEvidenceHandle {
         GdnPrefillRuntimeEvidence {
             selected_backend: self.selected_backend.to_owned(),
             artifact_sha256: self.artifact_sha256.clone(),
-            artifact_size_bytes: self.artifact_size_bytes,
             successful_launches: counters.successful_launches.load(Ordering::Relaxed),
             graph_captures: counters.graph_captures.load(Ordering::Relaxed),
             graph_replays: counters.graph_replays.load(Ordering::Relaxed),
@@ -118,7 +115,6 @@ impl Qwen35Model {
         Ok(GdnPrefillRuntimeEvidenceHandle {
             selected_backend: "flashinfer",
             artifact_sha256: backend.artifact_sha256().to_owned(),
-            artifact_size_bytes: backend.artifact_size_bytes(),
             validation: self.gdn_validation_evidence.clone(),
         })
     }

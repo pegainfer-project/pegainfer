@@ -186,7 +186,6 @@ pub(crate) fn conv1d_prefill_batch_into(
 /// status word owned by the chunk. The caller validates it once after the
 /// layer loop, avoiding one D2H synchronization per layer while still refusing
 /// to return a candidate result containing invalid inputs.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gated_delta_rule_prefill_native_prepare_into(
     ctx: &DeviceContext,
@@ -196,62 +195,58 @@ pub(crate) fn gated_delta_rule_prefill_native_prepare_into(
     dt_bias: &DeviceVec,
     a_log: &CudaSlice<f32>,
     scratch: &mut GdnPrepareScratch35,
-    h_q: usize,
-    h_k: usize,
-    h_v: usize,
-    head_dim: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
-        matches!((h_q, h_k, h_v, head_dim), (16, 16, 32 | 48, 128)),
-        "native GDN prepare supports Hq/Hk/Hv/D=16/16/{{32,48}}/128, got {h_q}/{h_k}/{h_v}/{head_dim}"
-    );
+    const H_Q: usize = 16;
+    const H_K: usize = 16;
+    const H_V: usize = 32;
+    const HEAD_DIM: usize = 128;
     anyhow::ensure!(qkv.seq_len > 0, "native GDN prepare requires T>=1");
-    let expected_qkv = (h_q + h_k + h_v) * head_dim;
+    let expected_qkv = (H_Q + H_K + H_V) * HEAD_DIM;
     anyhow::ensure!(
         qkv.hidden_dim == expected_qkv,
         "native GDN qkv hidden dim mismatch: expected {expected_qkv}, got {}",
         qkv.hidden_dim
     );
     anyhow::ensure!(
-        b_proj.hidden_dim == h_v && b_proj.seq_len == qkv.seq_len,
+        b_proj.hidden_dim == H_V && b_proj.seq_len == qkv.seq_len,
         "native GDN b projection must be [T,Hv]=[{},{}]",
         qkv.seq_len,
-        h_v
+        H_V
     );
     anyhow::ensure!(
-        a_proj.hidden_dim == h_v && a_proj.seq_len == qkv.seq_len,
+        a_proj.hidden_dim == H_V && a_proj.seq_len == qkv.seq_len,
         "native GDN a projection must be [T,Hv]=[{},{}]",
         qkv.seq_len,
-        h_v
+        H_V
     );
     anyhow::ensure!(
-        dt_bias.len == h_v,
-        "native GDN dt_bias length must be {h_v}, got {}",
+        dt_bias.len == H_V,
+        "native GDN dt_bias length must be {H_V}, got {}",
         dt_bias.len
     );
     anyhow::ensure!(
-        a_log.len() == h_v,
-        "native GDN A_log length must be {h_v}, got {}",
+        a_log.len() == H_V,
+        "native GDN A_log length must be {H_V}, got {}",
         a_log.len()
     );
     anyhow::ensure!(
-        scratch.q.hidden_dim == h_q * head_dim && scratch.q.seq_len == qkv.seq_len,
+        scratch.q.hidden_dim == H_Q * HEAD_DIM && scratch.q.seq_len == qkv.seq_len,
         "native GDN Q output shape mismatch"
     );
     anyhow::ensure!(
-        scratch.k.hidden_dim == h_k * head_dim && scratch.k.seq_len == qkv.seq_len,
+        scratch.k.hidden_dim == H_K * HEAD_DIM && scratch.k.seq_len == qkv.seq_len,
         "native GDN K output shape mismatch"
     );
     anyhow::ensure!(
-        scratch.v.hidden_dim == h_v * head_dim && scratch.v.seq_len == qkv.seq_len,
+        scratch.v.hidden_dim == H_V * HEAD_DIM && scratch.v.seq_len == qkv.seq_len,
         "native GDN V output shape mismatch"
     );
     anyhow::ensure!(
-        scratch.alpha.len() == qkv.seq_len * h_v,
+        scratch.alpha.len() == qkv.seq_len * H_V,
         "native GDN alpha output length mismatch"
     );
     anyhow::ensure!(
-        scratch.beta.len() == qkv.seq_len * h_v,
+        scratch.beta.len() == qkv.seq_len * H_V,
         "native GDN beta output length mismatch"
     );
     anyhow::ensure!(
@@ -285,11 +280,6 @@ pub(crate) fn gated_delta_rule_prefill_native_prepare_into(
                 alpha_out as *mut f32,
                 beta_out as *mut f32,
                 status_out as *mut u32,
-                h_q as i32,
-                h_k as i32,
-                h_v as i32,
-                head_dim as i32,
-                qkv.hidden_dim as i32,
                 qkv.seq_len as i32,
                 ctx.stream.cu_stream(),
             )

@@ -1,4 +1,6 @@
+#[cfg(feature = "qwen35")]
 use std::ffi::c_char;
+#[cfg(feature = "qwen35")]
 use std::ffi::c_void;
 
 use cudarc::driver::sys::CUresult;
@@ -9,6 +11,7 @@ use super::Half;
 /// Kernels-private Rust mirror of the stable C ABI. Model crates never import
 /// this struct: the safe `ops::Qwen35GdnAot` wrapper owns validation, workspace,
 /// handle lifetime, and conversion from semantic tensors to device addresses.
+#[cfg(feature = "qwen35")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FlashInferGdnPrefillArgs {
@@ -25,48 +28,33 @@ pub struct FlashInferGdnPrefillArgs {
     pub workspace: u64,
     pub workspace_bytes: u64,
     pub cu_seqlens: u64,
-    pub cu_seqlens_len: u32,
     pub tokens: u32,
-    pub h_q: u32,
-    pub h_k: u32,
-    pub h_v: u32,
-    pub head_dim: u32,
     pub stream: CUstream,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct FlashInferGdnSpec {
-    pub abi_version: u32,
-    pub struct_size: u32,
-    pub sm: i32,
-    pub h_q: u32,
-    pub h_k: u32,
-    pub h_v: u32,
-    pub head_dim: u32,
-    pub qkv_dtype: u32,
-    pub state_dtype: u32,
-    pub state_layout: u32,
 }
 
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
 // Sources: csrc/qwen35/*.cu. The paged HD256 attention entry points are shared
 // with Gemma 4 and are declared in `shared.rs`.
 unsafe extern "C" {
+    #[cfg(feature = "qwen35")]
     pub fn pegainfer_qwen35_gdn_abi_version() -> u32;
+    #[cfg(feature = "qwen35")]
     pub fn pegainfer_qwen35_gdn_artifact_sha256() -> *const c_char;
-    pub fn pegainfer_qwen35_gdn_artifact_size_bytes() -> u64;
+    #[cfg(feature = "qwen35")]
     pub fn pegainfer_qwen35_gdn_aot_available() -> i32;
-    pub fn pegainfer_qwen35_gdn_supported(spec: *const FlashInferGdnSpec) -> i32;
+    #[cfg(feature = "qwen35")]
     pub fn pegainfer_qwen35_gdn_create(handle: *mut *mut c_void, device: i32) -> i32;
+    #[cfg(feature = "qwen35")]
     pub fn pegainfer_qwen35_gdn_workspace_bytes(
         handle: *mut c_void,
         workspace_bytes: *mut usize,
     ) -> i32;
+    #[cfg(feature = "qwen35")]
     pub fn pegainfer_qwen35_gdn_launch(
         handle: *mut c_void,
         args: *const FlashInferGdnPrefillArgs,
     ) -> i32;
+    #[cfg(feature = "qwen35")]
     pub fn pegainfer_qwen35_gdn_destroy(handle: *mut c_void);
 
     /// Native, non-expanded FlashInfer-GDN input preparation.
@@ -74,6 +62,7 @@ unsafe extern "C" {
     /// `q_out`, `k_out`, and `v_out` are token-major `[T,H,D]`; alpha/beta are
     /// FP32 `[T,Hv]`. `non_finite_status` is zeroed asynchronously and set to
     /// one by the kernel if any consumed input is non-finite.
+    #[cfg(feature = "qwen35")]
     pub fn gated_delta_rule_prefill_native_prepare_cuda(
         qkv: *const Half,
         b_proj: *const Half,
@@ -86,11 +75,6 @@ unsafe extern "C" {
         alpha_out: *mut f32,
         beta_out: *mut f32,
         non_finite_status: *mut u32,
-        h_q: i32,
-        h_k: i32,
-        h_v: i32,
-        head_dim: i32,
-        qkv_dim: i32,
         tokens: i32,
         stream: CUstream,
     ) -> CUresult;

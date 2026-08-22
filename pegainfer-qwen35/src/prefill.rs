@@ -532,10 +532,6 @@ impl Qwen35Model {
                     &attn.dt_bias,
                     &attn.a_log,
                     &mut resources.prepare,
-                    c.linear_num_key_heads,
-                    c.linear_num_key_heads,
-                    c.linear_num_value_heads,
-                    c.linear_key_head_dim,
                 )?;
                 resources.launch_in_place(
                     &self.ctx,

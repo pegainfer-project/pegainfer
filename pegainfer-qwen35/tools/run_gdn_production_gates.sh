@@ -89,7 +89,7 @@ if [[ "$actual_config_sha" != "$expected_config_sha" ]]; then
 fi
 
 "$python" pegainfer-kernels/tools/flashinfer_gdn/artifact_contract.py \
-  validate-bundle "$(dirname "$bundle")" \
+  validate-candidate "$bundle" \
   --flashinfer-dir pegainfer-kernels/third_party/flashinfer
 
 commit_sha="$(git rev-parse HEAD)"

@@ -769,8 +769,8 @@ fn test_e2e_qwen35_scheduler_flashinfer_gdn() {
     assert_eq!(initial.state_slot_reuses, 0);
     assert_eq!(initial.slot_compactions, 0);
     info!(
-        "FlashInfer identity: object_sha256={} object_bytes={}",
-        initial.artifact_sha256, initial.artifact_size_bytes
+        "FlashInfer identity: object_sha256={}",
+        initial.artifact_sha256
     );
     info!("FlashInfer scheduler loaded in {:.2?}", start.elapsed());
 

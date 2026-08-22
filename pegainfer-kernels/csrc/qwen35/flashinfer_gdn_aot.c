@@ -19,6 +19,7 @@ static int32_t status_from_cuda(cudaError_t error) {
 typedef struct {
     pegainfer_qwen35_gdn_qwen35_4b_candidate_Kernel_Module_t module;
     int32_t device;
+    size_t workspace_bytes;
 } gdn_handle_t;
 
 static int32_t load_current_device(
@@ -52,32 +53,12 @@ const char *pegainfer_qwen35_gdn_artifact_sha256(void) {
     return PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256;
 }
 
-uint64_t pegainfer_qwen35_gdn_artifact_size_bytes(void) {
-    return PEGAINFER_QWEN35_GDN_ARTIFACT_SIZE_BYTES;
-}
-
 int32_t pegainfer_qwen35_gdn_aot_available(void) {
 #ifdef PEGAINFER_QWEN35_GDN_AOT
     return 1;
 #else
     return 0;
 #endif
-}
-
-int32_t pegainfer_qwen35_gdn_supported(
-    const pegainfer_qwen35_gdn_spec_t *spec) {
-    if (spec == NULL || spec->struct_size != sizeof(*spec))
-        return PEGAINFER_QWEN35_GDN_INVALID_ARGUMENT;
-    if (spec->abi_version != PEGAINFER_QWEN35_GDN_ABI_VERSION)
-        return PEGAINFER_QWEN35_GDN_ABI_MISMATCH;
-#ifdef PEGAINFER_QWEN35_GDN_AOT
-    if (spec->sm == 120 && spec->h_q == 16 && spec->h_k == 16 &&
-        spec->h_v == 32 && spec->head_dim == 128 &&
-        spec->qkv_dtype == 1 && spec->state_dtype == 2 &&
-        spec->state_layout == 1)
-        return PEGAINFER_QWEN35_GDN_OK;
-#endif
-    return PEGAINFER_QWEN35_GDN_NOT_SUPPORTED;
 }
 
 int32_t pegainfer_qwen35_gdn_create(void **handle, int32_t device) {
@@ -94,9 +75,15 @@ int32_t pegainfer_qwen35_gdn_create(void **handle, int32_t device) {
                                  device);
     if (ret != cudaSuccess) return status_from_cuda(ret);
     if (major != 12 || minor != 0) return PEGAINFER_QWEN35_GDN_NOT_SUPPORTED;
+    int32_t sm_count = 0;
+    ret = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                 device);
+    if (ret != cudaSuccess) return status_from_cuda(ret);
     gdn_handle_t *owner = (gdn_handle_t *)calloc(1, sizeof(*owner));
     if (owner == NULL) return PEGAINFER_QWEN35_GDN_CUDA_ERROR;
     owner->device = device;
+    owner->workspace_bytes =
+        (size_t)sm_count * PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM;
     int32_t rc = load_current_device(&owner->module, device);
     if (rc != (int32_t)cudaSuccess) {
         free(owner);
@@ -116,11 +103,7 @@ int32_t pegainfer_qwen35_gdn_workspace_bytes(void *handle,
         return PEGAINFER_QWEN35_GDN_INVALID_ARGUMENT;
 #ifdef PEGAINFER_QWEN35_GDN_AOT
     gdn_handle_t *owner = (gdn_handle_t *)handle;
-    int32_t sm_count = 0;
-    cudaError_t rc = cudaDeviceGetAttribute(
-        &sm_count, cudaDevAttrMultiProcessorCount, owner->device);
-    if (rc != cudaSuccess) return status_from_cuda(rc);
-    *workspace_bytes = (size_t)sm_count * 128u;
+    *workspace_bytes = owner->workspace_bytes;
     return PEGAINFER_QWEN35_GDN_OK;
 #else
     return PEGAINFER_QWEN35_GDN_NOT_SUPPORTED;
@@ -132,8 +115,6 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
 #ifdef PEGAINFER_QWEN35_GDN_AOT
     if (handle == NULL || args == NULL ||
         args->struct_size != sizeof(*args) || args->tokens == 0 ||
-        args->h_q != 16 || args->h_k != 16 || args->h_v != 32 ||
-        args->head_dim != 128 || args->cu_seqlens_len != 2 ||
         args->q == NULL || args->k == NULL || args->v == NULL ||
         args->output == NULL || args->alpha == NULL || args->beta == NULL ||
         args->state == NULL || args->initial_state == NULL ||
@@ -146,12 +127,7 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
     gdn_handle_t *owner = (gdn_handle_t *)handle;
     cudaError_t cuda_rc = cudaSetDevice(owner->device);
     if (cuda_rc != cudaSuccess) return status_from_cuda(cuda_rc);
-    int32_t sm_count = 0;
-    cuda_rc = cudaDeviceGetAttribute(&sm_count,
-                                     cudaDevAttrMultiProcessorCount,
-                                     owner->device);
-    if (cuda_rc != cudaSuccess) return status_from_cuda(cuda_rc);
-    if (args->workspace_bytes < (size_t)sm_count * 128u)
+    if (args->workspace_bytes < owner->workspace_bytes)
         return PEGAINFER_QWEN35_GDN_INVALID_ARGUMENT;
 
     int32_t tokens = (int32_t)args->tokens;
