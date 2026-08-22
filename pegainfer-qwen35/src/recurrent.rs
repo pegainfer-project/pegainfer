@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -253,6 +254,10 @@ pub(crate) fn gated_delta_rule_prefill_native_prepare_into(
         scratch.non_finite_status.len() == 1,
         "native GDN status output length mismatch"
     );
+    let tokens: i32 = qkv
+        .seq_len
+        .try_into()
+        .context("native GDN prepare T exceeds i32")?;
 
     {
         let (qkv_ptr, _gqkv) = qkv.data.device_ptr(&ctx.stream);
@@ -280,7 +285,7 @@ pub(crate) fn gated_delta_rule_prefill_native_prepare_into(
                 alpha_out as *mut f32,
                 beta_out as *mut f32,
                 status_out as *mut u32,
-                qkv.seq_len as i32,
+                tokens,
                 ctx.stream.cu_stream(),
             )
         };
