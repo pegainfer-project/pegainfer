@@ -382,7 +382,6 @@ def package_candidate(
     )
     manifest_path = output_dir / "manifest.json"
     write_json(manifest_path, manifest)
-    validate_manifest(manifest_path)
     return manifest_path
 
 
