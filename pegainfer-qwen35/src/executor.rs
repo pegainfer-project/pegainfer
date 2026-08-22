@@ -128,8 +128,8 @@ impl Qwen35Executor {
     /// Return production backend identity and launch proof when Auto selected
     /// the build-linked FlashInfer specialization.
     #[cfg(feature = "gdn-validation")]
-    pub fn flashinfer_gdn_runtime_evidence(&self) -> Result<Option<GdnPrefillRuntimeEvidence>> {
-        self.model.flashinfer_gdn_runtime_evidence().map(Some)
+    pub fn flashinfer_gdn_runtime_evidence(&self) -> Result<GdnPrefillRuntimeEvidence> {
+        self.model.flashinfer_gdn_runtime_evidence()
     }
 
     pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {

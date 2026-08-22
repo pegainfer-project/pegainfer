@@ -867,8 +867,7 @@ fn production_flashinfer_gdn_matches_hf_short_golden() {
     let mut production = build_executor(&model_path);
     let production_before = production
         .flashinfer_gdn_runtime_evidence()
-        .expect("read production Auto GDN evidence before HF replay")
-        .expect("SM120/Hv32 production Auto dispatch must select FlashInfer");
+        .expect("SM120/Hv32 production Auto dispatch must expose FlashInfer evidence");
     assert_eq!(production_before.selected_backend, "flashinfer");
     assert_ne!(production_before.artifact_sha256, "unavailable");
     assert_eq!(production_before.artifact_sha256.len(), 64);
@@ -877,7 +876,6 @@ fn production_flashinfer_gdn_matches_hf_short_golden() {
     report_and_assert("production Auto sequential bs=1 graph", &production_stats);
     let production_after = production
         .flashinfer_gdn_runtime_evidence()
-        .expect("read production Auto GDN evidence after HF replay")
         .expect("production Auto dispatch lost FlashInfer identity");
     assert_eq!(
         production_after.artifact_sha256,
