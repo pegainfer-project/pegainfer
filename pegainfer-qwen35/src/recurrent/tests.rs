@@ -160,7 +160,7 @@ fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
             hidden_dim: h_v,
             seq_len: tokens,
         };
-        let mut prepared = GdnPrepareScratch35::from_dims(&ctx, h_q, h_k, h_v, d, tokens)?;
+        let mut prepared = GdnPrepareScratch35::for_tokens(&ctx, tokens)?;
         gated_delta_rule_prefill_native_prepare_into(
             &ctx,
             &qkv,
@@ -169,10 +169,6 @@ fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
             &dt_bias,
             &a_log,
             &mut prepared,
-            h_q,
-            h_k,
-            h_v,
-            d,
         )?;
 
         let status = ctx.stream.clone_dtoh(&prepared.non_finite_status)?;
@@ -298,7 +294,7 @@ fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
             hidden_dim: h_v,
             seq_len: 1,
         };
-        let mut prepared = GdnPrepareScratch35::from_dims(&ctx, h_q, h_k, h_v, d, 1)?;
+        let mut prepared = GdnPrepareScratch35::for_tokens(&ctx, 1)?;
         gated_delta_rule_prefill_native_prepare_into(
             &ctx,
             &qkv,
@@ -307,10 +303,6 @@ fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
             &dt_bias,
             &a_log,
             &mut prepared,
-            h_q,
-            h_k,
-            h_v,
-            d,
         )?;
         let status = ctx.stream.clone_dtoh(&prepared.non_finite_status)?;
         ctx.sync()?;
@@ -337,7 +329,7 @@ fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
     let finite_qkv = make_hidden(&finite_qkv_host, qkv_dim)?;
     let gate_b = make_hidden(&gate_b_host, h_v)?;
     let gate_a = make_hidden(&gate_a_host, h_v)?;
-    let mut sticky = GdnPrepareScratch35::from_dims(&ctx, h_q, h_k, h_v, d, 1)?;
+    let mut sticky = GdnPrepareScratch35::for_tokens(&ctx, 1)?;
     gated_delta_rule_prefill_native_prepare_into(
         &ctx,
         &non_finite_qkv,
@@ -346,10 +338,6 @@ fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
         &dt_bias,
         &a_log,
         &mut sticky,
-        h_q,
-        h_k,
-        h_v,
-        d,
     )?;
     gated_delta_rule_prefill_native_prepare_into(
         &ctx,
@@ -359,10 +347,6 @@ fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
         &dt_bias,
         &a_log,
         &mut sticky,
-        h_q,
-        h_k,
-        h_v,
-        d,
     )?;
     let sticky_status = ctx.stream.clone_dtoh(&sticky.non_finite_status)?;
     ctx.sync()?;
@@ -372,7 +356,7 @@ fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
         "a later finite layer cleared the chunk-owned non-finite status"
     );
 
-    let mut fresh_chunk = GdnPrepareScratch35::from_dims(&ctx, h_q, h_k, h_v, d, 1)?;
+    let mut fresh_chunk = GdnPrepareScratch35::for_tokens(&ctx, 1)?;
     gated_delta_rule_prefill_native_prepare_into(
         &ctx,
         &finite_qkv,
@@ -381,10 +365,6 @@ fn native_prepare_hv32_dynamic_t_and_non_finite_inputs() -> Result<()> {
         &dt_bias,
         &a_log,
         &mut fresh_chunk,
-        h_q,
-        h_k,
-        h_v,
-        d,
     )?;
     let fresh_status = ctx.stream.clone_dtoh(&fresh_chunk.non_finite_status)?;
     ctx.sync()?;

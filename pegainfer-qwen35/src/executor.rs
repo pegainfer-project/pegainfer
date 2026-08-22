@@ -129,10 +129,7 @@ impl Qwen35Executor {
     /// the build-linked FlashInfer specialization.
     #[cfg(feature = "gdn-validation")]
     pub fn flashinfer_gdn_runtime_evidence(&self) -> Result<Option<GdnPrefillRuntimeEvidence>> {
-        self.model
-            .flashinfer_gdn_runtime_evidence()
-            .map(Some)
-            .or_else(|_| Ok(None))
+        self.model.flashinfer_gdn_runtime_evidence().map(Some)
     }
 
     pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {

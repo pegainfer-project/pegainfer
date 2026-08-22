@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
-"""Package and validate FlashInfer CuTe GDN SM120 native AOT artifacts.
-
-This module intentionally uses only the Python standard library. CuTe and
-PyTorch are generation-time dependencies isolated in ``compile_sm120.py``.
-"""
+"""Prepare, package, and validate the single production GDN AOT candidate."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+VARIANT = "qwen35_4b_candidate"
 TARGET_ARCH = "sm_120a"
 FROZEN_FLASHINFER_COMMIT = "a0efa0adfe49bb836ab1a147d6572980b870f3d4"
-SUPPORTED_GEOMETRIES = {
-    "qwen35_4b_candidate": {"h_q": 16, "h_k": 16, "h_v": 32, "head_dim": 128},
-}
+GEOMETRY = {"h_q": 16, "h_k": 16, "h_v": 32, "head_dim": 128}
+TOKENS = {"extent": "dynamic", "minimum": 1}
+WORKSPACE = {"kind": "per_sm", "bytes_per_sm": 128, "alignment_bytes": 128}
 DTYPES = {
     "q": "bfloat16",
     "k": "bfloat16",
@@ -49,9 +44,12 @@ PINNED_TOOLCHAIN = {
     "cuda_bindings": "13.0.3",
     "cuda_pathfinder": "1.6.0",
 }
-WORKSPACE_SOURCE = (
-    "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py"
-)
+KERNEL_SOURCE = "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py"
+ARTIFACT_FILES = {
+    "header": "kernel.h",
+    "object": "kernel.o",
+    "native_runtime": "libcuda_dialect_runtime_static.a",
+}
 FORBIDDEN_TMA_CLUSTER_LOAD = (
     "cp.async.bulk.tensor.3d.shared::cluster.global.tile."
     "mbarrier::complete_tx::bytes.L2::cache_hint"
@@ -121,21 +119,6 @@ def load_source_lock(path: Path | None = None) -> tuple[dict[str, Any], str]:
     patched_kernel_sha256 = lock.get("patched_kernel_sha256")
     if not isinstance(patched_kernel_sha256, str) or len(patched_kernel_sha256) != 64:
         raise ContractError("source lock patched kernel hash is missing")
-    hkv = lock.get("hkv_state_index_patch")
-    expected_hkv = {
-        "applied": True,
-        "state_layout": "openinfer_hkv_v_contiguous",
-        "ordered_layout": [1, 0, 2, 3],
-    }
-    if hkv != expected_hkv:
-        raise ContractError("HKV state-index patch metadata mismatch")
-    expected_export = {
-        "grid_x": "cutlass.Int32",
-        "stream": "cuda.CUstream",
-        "purpose": "host-only type annotations required by official export_to_c",
-    }
-    if lock.get("aot_export_patch") != expected_export:
-        raise ContractError("AOT export annotation metadata mismatch")
     return lock, sha256_file(path)
 
 
@@ -166,34 +149,18 @@ def verify_flashinfer_base(flashinfer_dir: Path) -> str:
 
 
 def inspect_kernel_source(source_dir: Path, commit: str) -> dict[str, Any]:
-    kernel_path = source_dir / WORKSPACE_SOURCE
-    source = kernel_path.read_text(encoding="utf-8")
-    workspace_match = re.search(
-        r"workspace_size\s*=\s*get_device_sm_count\(q\.device\)\s*\*\s*(\d+)",
-        source,
+    kernel_path = source_dir / KERNEL_SOURCE
+    if not kernel_path.is_file():
+        raise ContractError(f"patched GDN kernel is missing: {kernel_path}")
+    lock, source_lock_sha256 = load_source_lock()
+    kernel_sha256 = sha256_file(kernel_path)
+    _require_equal(
+        kernel_sha256, lock["patched_kernel_sha256"], "patched GDN kernel hash"
     )
-    alignment_match = re.search(
-        r"from_dlpack\(tensormaps_t,\s*assumed_align\s*=\s*(\d+)\)",
-        source,
-    )
-    target_match = re.search(r'cute\.GPUArch\("([^"]+)"\)', source)
-    if not workspace_match or not alignment_match or not target_match:
-        raise ContractError("cannot derive workspace/target metadata from frozen kernel source")
-    target = target_match.group(1)
-    if target != TARGET_ARCH:
-        raise ContractError(f"kernel source target mismatch: expected {TARGET_ARCH}, got {target}")
-
     return {
         "flashinfer_commit": commit,
-        "kernel_source_sha256": sha256_file(kernel_path),
-        "workspace": {
-            "kind": "per_sm",
-            "bytes_per_sm": int(workspace_match.group(1)),
-            "alignment_bytes": int(alignment_match.group(1)),
-            "formula": "sm_count * bytes_per_sm",
-            "source": WORKSPACE_SOURCE,
-        },
-        "target_arch": target,
+        "kernel_source_sha256": kernel_sha256,
+        "source_lock_sha256": source_lock_sha256,
     }
 
 
@@ -215,16 +182,7 @@ def prepare_flashinfer_source(flashinfer_dir: Path, destination: Path) -> dict[s
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
             raise ContractError(f"failed to apply HKV patch: {detail}")
-    source = inspect_kernel_source(destination, commit)
-    _require_equal(
-        source["kernel_source_sha256"],
-        lock["patched_kernel_sha256"],
-        "prepared HKV kernel hash",
-    )
-    kernel_text = (destination / WORKSPACE_SOURCE).read_text(encoding="utf-8")
-    if kernel_text.count("order=(1, 0, 2, 3)") != 2:
-        raise ContractError("prepared source does not contain both HKV ordered layouts")
-    return source
+    return inspect_kernel_source(destination, commit)
 
 
 def verify_prepared_flashinfer_source(
@@ -239,11 +197,6 @@ def verify_prepared_flashinfer_source(
         "prepared HKV kernel hash",
     )
     return source
-
-
-def verify_flashinfer_source(flashinfer_dir: Path) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="openinfer-gdn-hkv-source-") as temp_name:
-        return prepare_flashinfer_source(flashinfer_dir, Path(temp_name) / "patched")
 
 
 def normalize_ptx(ptx: str) -> str:
@@ -261,16 +214,13 @@ def normalize_ptx(ptx: str) -> str:
 
 
 def expected_spec(variant: str) -> dict[str, Any]:
-    try:
-        geometry = SUPPORTED_GEOMETRIES[variant]
-    except KeyError as exc:
-        raise ContractError(f"unknown artifact variant: {variant}") from exc
+    _require_equal(variant, VARIANT, "artifact variant")
     return {
-        "variant": variant,
+        "variant": VARIANT,
         "target_arch": TARGET_ARCH,
-        "geometry": dict(geometry),
+        "geometry": dict(GEOMETRY),
         "dtypes": dict(DTYPES),
-        "tokens": {"extent": "dynamic", "minimum": 1, "divisibility": 1},
+        "tokens": dict(TOKENS),
     }
 
 
@@ -280,21 +230,13 @@ def _require_equal(actual: Any, expected: Any, label: str) -> None:
 
 
 def validate_compile_metadata(
-    metadata: dict[str, Any], variant: str, source: dict[str, Any]
+    metadata: dict[str, Any], source: dict[str, Any]
 ) -> None:
-    spec = expected_spec(variant)
+    spec = expected_spec(VARIANT)
     for key in ("variant", "target_arch", "geometry", "dtypes", "tokens"):
         _require_equal(metadata.get(key), spec[key], f"compile metadata {key}")
-    _require_equal(
-        metadata.get("flashinfer_commit"),
-        FROZEN_FLASHINFER_COMMIT,
-        "compile metadata FlashInfer SHA",
-    )
-    _require_equal(
-        metadata.get("kernel_source_sha256"),
-        source["kernel_source_sha256"],
-        "compile metadata kernel source hash",
-    )
+    for key in ("flashinfer_commit", "kernel_source_sha256", "source_lock_sha256"):
+        _require_equal(metadata.get(key), source[key], f"compile metadata {key}")
     _require_equal(
         metadata.get("generator_sha256"),
         sha256_file(compiler_path()),
@@ -305,12 +247,10 @@ def validate_compile_metadata(
         sha256_file(requirements_lock_path()),
         "compile metadata requirements lock hash",
     )
-    _require_equal(metadata.get("workspace"), source["workspace"], "workspace metadata")
+    _require_equal(metadata.get("workspace"), WORKSPACE, "workspace metadata")
     aot = metadata.get("aot")
     if not isinstance(aot, dict):
         raise ContractError("compile metadata is missing AOT export metadata")
-    expected_prefix = f"pegainfer_qwen35_gdn_{variant}"
-    _require_equal(aot.get("function_prefix"), expected_prefix, "AOT function prefix")
     toolchain = metadata.get("toolchain")
     if not isinstance(toolchain, dict):
         raise ContractError("compile metadata is missing toolchain")
@@ -328,10 +268,7 @@ def build_manifest(
     runtime_bytes: bytes,
     compile_metadata: dict[str, Any],
     source: dict[str, Any],
-    patch_set_sha256: str,
 ) -> dict[str, Any]:
-    lock, _ = load_source_lock()
-    patch_sha256 = lock["patches"][0]["sha256"]
     spec = expected_spec(variant)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -351,15 +288,11 @@ def build_manifest(
             "o_view": {"shape": [128, "T", spec["geometry"]["h_v"]], "stride": [1, spec["geometry"]["h_v"] * 128, 128]},
             "state_layout": "openinfer_hkv_v_contiguous",
         },
-        "workspace": source["workspace"],
+        "workspace": dict(WORKSPACE),
         "source": {
-            "flashinfer_commit": FROZEN_FLASHINFER_COMMIT,
-            "kernel_source_sha256": source["kernel_source_sha256"],
+            **source,
             "generator_sha256": compile_metadata["generator_sha256"],
             "requirements_lock_sha256": compile_metadata["requirements_lock_sha256"],
-            "patch_set_sha256": patch_set_sha256,
-            "hkv_state_index_patch_sha256": patch_sha256,
-            "hkv_state_index_patch_applied": True,
         },
         "toolchain": compile_metadata["toolchain"],
         "artifact": {
@@ -391,20 +324,17 @@ def build_manifest(
     }
 
 
-def package_variant(
+def package_candidate(
     *,
-    variant: str,
     raw_aot_dir: Path,
     compile_metadata_path: Path,
     output_dir: Path,
-    flashinfer_dir: Path,
+    source: dict[str, Any],
 ) -> Path:
     if output_dir.exists():
         raise ContractError(f"refusing to overwrite existing output directory: {output_dir}")
-    source = verify_flashinfer_source(flashinfer_dir)
-    _, patch_set_sha256 = load_source_lock()
     metadata = read_json(compile_metadata_path)
-    validate_compile_metadata(metadata, variant, source)
+    validate_compile_metadata(metadata, source)
 
     aot = metadata["aot"]
     header_path = raw_aot_dir / aot["header"]
@@ -418,6 +348,7 @@ def package_variant(
         raise ContractError("CuTe static runtime archive is missing")
     runtime_bytes = runtime_path.read_bytes()
     _require_equal(aot["header_sha256"], sha256_bytes(header_bytes), "AOT header hash")
+    _require_equal(aot["header_size_bytes"], len(header_bytes), "AOT header size")
     _require_equal(aot["object_sha256"], sha256_bytes(object_bytes), "AOT object hash")
     _require_equal(aot["object_size_bytes"], len(object_bytes), "AOT object size")
     _require_equal(
@@ -439,7 +370,7 @@ def package_variant(
     (output_dir / object_name).write_bytes(object_bytes)
     (output_dir / runtime_name).write_bytes(runtime_bytes)
     manifest = build_manifest(
-        variant=variant,
+        variant=VARIANT,
         header_name=header_name,
         header_bytes=header_bytes,
         object_name=object_name,
@@ -448,11 +379,10 @@ def package_variant(
         runtime_bytes=runtime_bytes,
         compile_metadata=metadata,
         source=source,
-        patch_set_sha256=patch_set_sha256,
     )
     manifest_path = output_dir / "manifest.json"
     write_json(manifest_path, manifest)
-    validate_manifest(manifest_path, flashinfer_dir=flashinfer_dir)
+    validate_manifest(manifest_path)
     return manifest_path
 
 
@@ -478,14 +408,17 @@ def validate_manifest(
     if not isinstance(source_manifest, dict):
         raise ContractError("manifest source is missing")
     _require_equal(source_manifest.get("flashinfer_commit"), FROZEN_FLASHINFER_COMMIT, "FlashInfer SHA")
-    lock, patch_set_sha256 = load_source_lock()
-    _require_equal(source_manifest.get("patch_set_sha256"), patch_set_sha256, "patch-set hash")
+    lock, source_lock_sha256 = load_source_lock()
     _require_equal(
-        source_manifest.get("hkv_state_index_patch_sha256"),
-        lock["patches"][0]["sha256"],
-        "HKV patch hash",
+        source_manifest.get("source_lock_sha256"),
+        source_lock_sha256,
+        "source lock hash",
     )
-    _require_equal(source_manifest.get("hkv_state_index_patch_applied"), True, "HKV patch state")
+    _require_equal(
+        source_manifest.get("kernel_source_sha256"),
+        lock["patched_kernel_sha256"],
+        "patched kernel hash",
+    )
     _require_equal(source_manifest.get("generator_sha256"), sha256_file(compiler_path()), "generator hash")
     _require_equal(
         source_manifest.get("requirements_lock_sha256"),
@@ -494,16 +427,11 @@ def validate_manifest(
     )
 
     if flashinfer_dir is not None:
-        source = verify_flashinfer_source(flashinfer_dir)
-        _require_equal(source_manifest.get("kernel_source_sha256"), source["kernel_source_sha256"], "kernel source hash")
-        _require_equal(manifest.get("workspace"), source["workspace"], "workspace")
+        verify_flashinfer_base(flashinfer_dir)
     workspace = manifest.get("workspace")
     if not isinstance(workspace, dict):
         raise ContractError("workspace is missing")
-    if workspace.get("kind") != "per_sm" or workspace.get("formula") != "sm_count * bytes_per_sm":
-        raise ContractError("workspace must be expressed as per-SM generation metadata")
-    if workspace.get("bytes_per_sm") == 256 * 128:
-        raise ContractError("workspace bytes_per_sm must not be the old guessed 256*128 allocation")
+    _require_equal(workspace, WORKSPACE, "workspace")
 
     artifact = manifest.get("artifact")
     if not isinstance(artifact, dict):
@@ -514,8 +442,7 @@ def validate_manifest(
         if not isinstance(entry, dict):
             raise ContractError(f"artifact {component} metadata is missing")
         name = entry.get("file")
-        if not isinstance(name, str) or Path(name).name != name:
-            raise ContractError(f"artifact {component} file must be a relative basename")
+        _require_equal(name, ARTIFACT_FILES[component], f"artifact {component} file")
         path = manifest_path.parent / name
         if not path.is_file():
             raise ContractError(f"artifact {component} file is missing: {path}")
@@ -554,33 +481,6 @@ def validate_manifest(
     return manifest
 
 
-def validate_bundle(bundle_dir: Path, flashinfer_dir: Path | None = None) -> None:
-    expected = set(SUPPORTED_GEOMETRIES)
-    present = {path.parent.name for path in bundle_dir.glob("*/manifest.json")}
-    _require_equal(present, expected, "bundle variants")
-    manifests = [
-        validate_manifest(
-            bundle_dir / variant / "manifest.json",
-            flashinfer_dir=flashinfer_dir,
-            expected_variant=variant,
-        )
-        for variant in sorted(expected)
-    ]
-    if {manifest["tokens"]["extent"] for manifest in manifests} != {"dynamic"}:
-        raise ContractError("all bundle variants must use dynamic T")
-    bundle_path = bundle_dir / "bundle.json"
-    bundle = read_json(bundle_path)
-    _require_equal(bundle.get("schema_version"), SCHEMA_VERSION, "bundle schema_version")
-    expected_entries = {
-        variant: {
-            "manifest": f"{variant}/manifest.json",
-            "manifest_sha256": sha256_file(bundle_dir / variant / "manifest.json"),
-        }
-        for variant in sorted(expected)
-    }
-    _require_equal(bundle.get("variants"), expected_entries, "bundle manifest index")
-
-
 def default_flashinfer_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "third_party" / "flashinfer"
 
@@ -588,27 +488,15 @@ def default_flashinfer_dir() -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    source_parser = subparsers.add_parser("verify-source")
-    source_parser.add_argument("--flashinfer-dir", type=Path, default=default_flashinfer_dir())
-    manifest_parser = subparsers.add_parser("validate-manifest")
-    manifest_parser.add_argument("manifest", type=Path)
-    manifest_parser.add_argument("--flashinfer-dir", type=Path)
-    bundle_parser = subparsers.add_parser("validate-bundle")
-    bundle_parser.add_argument("bundle", type=Path)
-    bundle_parser.add_argument("--flashinfer-dir", type=Path)
+    candidate_parser = subparsers.add_parser("validate-candidate")
+    candidate_parser.add_argument("candidate", type=Path)
+    candidate_parser.add_argument("--flashinfer-dir", type=Path)
     args = parser.parse_args()
 
     try:
-        if args.command == "verify-source":
-            source = verify_flashinfer_source(args.flashinfer_dir)
-            _, patch_hash = load_source_lock()
-            print(json.dumps({**source, "patch_set_sha256": patch_hash}, indent=2, sort_keys=True))
-        elif args.command == "validate-manifest":
-            validate_manifest(args.manifest, flashinfer_dir=args.flashinfer_dir)
-            print(f"validated {args.manifest}")
-        else:
-            validate_bundle(args.bundle, flashinfer_dir=args.flashinfer_dir)
-            print(f"validated {args.bundle}")
+        manifest = args.candidate / "manifest.json"
+        validate_manifest(manifest, flashinfer_dir=args.flashinfer_dir)
+        print(f"validated {args.candidate}")
     except ContractError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

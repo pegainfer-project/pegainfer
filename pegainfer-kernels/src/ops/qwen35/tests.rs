@@ -68,22 +68,12 @@ fn assert_stable_c_struct_layout() {
         };
     }
 
-    assert_eq!(size_of::<ffi::FlashInferGdnSpec>(), 40);
-    assert_eq!(align_of::<ffi::FlashInferGdnSpec>(), 4);
-    assert_offsets!(ffi::FlashInferGdnSpec, {
-        abi_version: 0, struct_size: 4, sm: 8, h_q: 12, h_k: 16,
-        h_v: 20, head_dim: 24, qkv_dtype: 28, state_dtype: 32,
-        state_layout: 36,
-    });
-
-    assert_eq!(size_of::<ffi::FlashInferGdnPrefillArgs>(), 128);
+    assert_eq!(size_of::<ffi::FlashInferGdnPrefillArgs>(), 112);
     assert_eq!(align_of::<ffi::FlashInferGdnPrefillArgs>(), 8);
     assert_offsets!(ffi::FlashInferGdnPrefillArgs, {
         abi_version: 0, struct_size: 4, q: 8, k: 16, v: 24, output: 32,
         alpha: 40, beta: 48, state: 56, initial_state: 64, workspace: 72,
-        workspace_bytes: 80, cu_seqlens: 88, cu_seqlens_len: 96,
-        tokens: 100, h_q: 104, h_k: 108, h_v: 112, head_dim: 116,
-        stream: 120,
+        workspace_bytes: 80, cu_seqlens: 88, tokens: 96, stream: 104,
     });
 }
 
@@ -114,10 +104,6 @@ fn sm120_stable_abi_alias_and_separate_state_are_bitwise_identical() -> Result<(
             && backend.artifact_sha256() != "invalid-utf8"
             && backend.artifact_sha256().len() == 64,
         "production boundary did not expose a linked object SHA-256"
-    );
-    ensure!(
-        backend.artifact_size_bytes() > 0,
-        "production boundary reported an empty linked object"
     );
     let bf16_values = |elements: usize, modulus: usize, scale: f32| {
         (0..elements)

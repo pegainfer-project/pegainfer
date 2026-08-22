@@ -13,7 +13,6 @@ use super::config::Config35;
 /// This buffer is intentionally separate from `GdrChunkwiseScratch35`: the
 /// production Triton path below still requires value-head-expanded Q/K, while
 /// the FlashInfer candidate consumes native Hq/Hk tensors directly.
-#[allow(dead_code)]
 pub(crate) struct GdnPrepareScratch35 {
     /// Normalized native Q, bf16 token-major `[T,Hq,D]`.
     pub(crate) q: HiddenStates,
@@ -29,50 +28,37 @@ pub(crate) struct GdnPrepareScratch35 {
     pub(crate) non_finite_status: CudaSlice<u32>,
 }
 
-#[allow(dead_code)]
 impl GdnPrepareScratch35 {
     pub(crate) fn new(ctx: &DeviceContext, config: &Config35, seq_len: usize) -> Result<Self> {
-        Self::from_dims(
-            ctx,
-            config.linear_num_key_heads,
-            config.linear_num_key_heads,
-            config.linear_num_value_heads,
-            config.linear_key_head_dim,
-            seq_len,
-        )
+        anyhow::ensure!(
+            config.linear_num_key_heads == 16
+                && config.linear_num_value_heads == 32
+                && config.linear_key_head_dim == 128
+                && config.linear_value_head_dim == 128,
+            "native GDN prepare requires Hq/Hk/Hv/D=16/16/32/128"
+        );
+        Self::for_tokens(ctx, seq_len)
     }
 
-    pub(crate) fn from_dims(
-        ctx: &DeviceContext,
-        h_q: usize,
-        h_k: usize,
-        h_v: usize,
-        head_dim: usize,
-        seq_len: usize,
-    ) -> Result<Self> {
-        anyhow::ensure!(h_q == 16, "native GDN prepare requires Hq=16, got {h_q}");
-        anyhow::ensure!(h_k == 16, "native GDN prepare requires Hk=16, got {h_k}");
-        anyhow::ensure!(
-            matches!(h_v, 32 | 48),
-            "native GDN prepare requires Hv=32 or 48, got {h_v}"
-        );
-        anyhow::ensure!(
-            head_dim == 128,
-            "native GDN prepare requires D=128, got {head_dim}"
-        );
+    pub(crate) fn for_tokens(ctx: &DeviceContext, seq_len: usize) -> Result<Self> {
         anyhow::ensure!(seq_len > 0, "native GDN prepare requires T>=1");
 
+        const H_Q: usize = 16;
+        const H_K: usize = 16;
+        const H_V: usize = 32;
+        const HEAD_DIM: usize = 128;
+
         Ok(Self {
-            q: HiddenStates::zeros(ctx, h_q * head_dim, seq_len)?,
-            k: HiddenStates::zeros(ctx, h_k * head_dim, seq_len)?,
-            v: HiddenStates::zeros(ctx, h_v * head_dim, seq_len)?,
+            q: HiddenStates::zeros(ctx, H_Q * HEAD_DIM, seq_len)?,
+            k: HiddenStates::zeros(ctx, H_K * HEAD_DIM, seq_len)?,
+            v: HiddenStates::zeros(ctx, H_V * HEAD_DIM, seq_len)?,
             alpha: ctx
                 .stream
-                .alloc_zeros(seq_len * h_v)
+                .alloc_zeros(seq_len * H_V)
                 .map_err(|e| anyhow::anyhow!("Alloc native GDN alpha failed: {e}"))?,
             beta: ctx
                 .stream
-                .alloc_zeros(seq_len * h_v)
+                .alloc_zeros(seq_len * H_V)
                 .map_err(|e| anyhow::anyhow!("Alloc native GDN beta failed: {e}"))?,
             non_finite_status: ctx
                 .stream
@@ -190,7 +176,7 @@ impl GdrChunkwiseScratch35 {
     /// This intentionally excludes model-wide hidden/MLP/full-attention
     /// temporaries and the recurrent state, which are common to both GDN
     /// backends. The allocation list mirrors [`Self::from_dims`].
-    pub fn operator_scratch_bytes_from_dims(
+    fn operator_scratch_bytes_from_dims(
         num_value_heads: usize,
         key_dim: usize,
         value_dim: usize,

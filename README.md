@@ -47,7 +47,7 @@ Docs, guides, and engineering deep-dives live at [pegainfer.org](https://pegainf
 - Rust (2024 edition), CUDA Toolkit (nvcc, cuBLAS), CUDA-capable GPU
 - NVIDIA driver R545 (CUDA 12.3) or newer; `cuFuncGetName` sets this floor, while per-symbol lazy loading keeps the `cuda-12090` cudarc binding from requiring a CUDA 12.9 driver
 - The default build (Qwen3-4B / 8B) is pure Rust + CUDA — no Python at all
-- Python 3 + Triton for `qwen35` feature builds (build-time only — no Python at runtime). The supported Qwen3.5-4B SM120/Hv32 path can additionally link a pre-generated FlashInfer/CuTe GDN AOT bundle; generation is separate from serving
+- Python 3 + Triton for `qwen35` feature builds (build-time only — no Python at runtime). The supported Qwen3.5-4B SM120/Hv32 path can additionally link a pre-generated FlashInfer/CuTe GDN AOT candidate; generation is separate from serving
 - The `kimi-k2` EP path additionally needs NCCL ≥ 2.27 at runtime (`ncclAlltoAll`)
 
 ### Build & Run
@@ -82,7 +82,7 @@ curl -N http://localhost:8000/v1/completions \
 
 ```bash
 # Qwen3.5 uses build-time Triton AOT; a validated SM120/Hv32 FlashInfer GDN
-# bundle can additionally be selected through PEGAINFER_QWEN35_GDN_AOT_BUNDLE
+# candidate can additionally be selected through PEGAINFER_QWEN35_GDN_AOT_BUNDLE
 uv venv && uv pip install triton
 export PEGAINFER_TRITON_PYTHON=.venv/bin/python
 cargo run --release --features qwen35 -- --model-path models/Qwen3.5-4B
@@ -97,7 +97,7 @@ cargo run --release -- --cuda-graph=false
 |----------|-------------|
 | `CUDA_HOME` | CUDA Toolkit path (default: `/usr/local/cuda`) |
 | `PEGAINFER_TRITON_PYTHON` | Python with Triton for `qwen35` build-time AOT compilation |
-| `PEGAINFER_QWEN35_GDN_AOT_BUNDLE` | Validated Qwen3.5-4B SM120/Hv32 FlashInfer GDN bundle linked by `pegainfer-kernels/build.rs` |
+| `PEGAINFER_QWEN35_GDN_AOT_BUNDLE` | Validated Qwen3.5-4B SM120/Hv32 FlashInfer GDN candidate directory linked by `pegainfer-kernels/build.rs` |
 | `PEGAINFER_TILELANG_PYTHON` | Python with TileLang for `k3` build-time kernel generation |
 | `PEGAINFER_CUDA_SM` | GPU SM target override when `nvidia-smi` unavailable (e.g. `120`) |
 
@@ -281,7 +281,7 @@ flowchart TB
 **Key design decisions:**
 
 - **GPU-first runtime** — model execution stays in native Rust/CUDA paths
-- **Custom GPU kernels** — CUDA for decode-critical paths; Triton AOT for the general Qwen3.5 GDN path; a statically linked FlashInfer/CuTe AOT specialization for Qwen3.5-4B SM120/Hv32 when a validated bundle is supplied; FlashInfer for paged attention/sampling; NCCL for multi-GPU reductions; and cuBLAS for matrix multiplication
+- **Custom GPU kernels** — CUDA for decode-critical paths; Triton AOT for the general Qwen3.5 GDN path; a statically linked FlashInfer/CuTe AOT specialization for Qwen3.5-4B SM120/Hv32 when a validated candidate is supplied; FlashInfer for paged attention/sampling; NCCL for multi-GPU reductions; and cuBLAS for matrix multiplication
 - **CUDA Graph** on Qwen decode paths — eliminates kernel launch overhead where enabled
 - **Per-model crate boundary** — Qwen3-4B owns its config, weights, scheduler/executor, tests, benches, and kernel plan in `pegainfer-qwen3`
 
@@ -328,7 +328,7 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qw
 PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite cargo test --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 ```
 
-The SM120 FlashInfer GDN production boundary has a separate fail-closed five-gate runner because it requires a real generated bundle, the pinned Qwen3.5-4B snapshot, and an SM120 GPU. See [`pegainfer-kernels/tools/flashinfer_gdn/README.md`](pegainfer-kernels/tools/flashinfer_gdn/README.md); the non-default `gdn-validation` feature exists only for that runner and adds no counters or validation API to a default serving build.
+The SM120 FlashInfer GDN production boundary has a separate fail-closed five-gate runner because it requires a real generated candidate, the pinned Qwen3.5-4B snapshot, and an SM120 GPU. See [`pegainfer-kernels/tools/flashinfer_gdn/README.md`](pegainfer-kernels/tools/flashinfer_gdn/README.md); the non-default `gdn-validation` feature exists only for that runner and adds no counters or validation API to a default serving build.
 
 The DeepSeek-V2-Lite E2E is a correctness/integration gate. Direct diagnostics and HTTP SLO report commands live in [`benchmarking.md`](docs/models/deepseek-v2-lite/benchmarking.md).
 

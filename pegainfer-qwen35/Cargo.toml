@@ -19,12 +19,12 @@ rand = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
@@ -32,7 +32,7 @@ vllm-text = { workspace = true }
 
 [features]
 default = []
-gdn-validation = []
+gdn-validation = ["qwen35"]
 qwen35 = ["pegainfer-kernels/qwen35"]
 
 [lints]

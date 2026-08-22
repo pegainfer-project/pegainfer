@@ -12,14 +12,12 @@ import tempfile
 from pathlib import Path
 
 from artifact_contract import (
-    SUPPORTED_GEOMETRIES,
+    VARIANT,
     ContractError,
     default_flashinfer_dir,
-    package_variant,
+    package_candidate,
     prepare_flashinfer_source,
-    sha256_file,
-    validate_bundle,
-    write_json,
+    validate_manifest,
 )
 
 
@@ -38,56 +36,44 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="openinfer-gdn-sm120-") as temp_name:
             temp = Path(temp_name)
             prepared = temp / "patched-flashinfer"
-            prepare_flashinfer_source(args.flashinfer_dir, prepared)
-            staged = temp / "bundle"
+            source = prepare_flashinfer_source(args.flashinfer_dir, prepared)
+            staged = temp / "candidate"
             compiler = Path(__file__).with_name("compile_sm120.py")
-            for variant in sorted(SUPPORTED_GEOMETRIES):
-                raw_dir = temp / "raw" / variant
-                metadata_path = raw_dir / "compile-metadata.json"
-                subprocess.run(
-                    [
-                        str(args.python),
-                        str(compiler),
-                        "--variant",
-                        variant,
-                        "--flashinfer-dir",
-                        str(prepared),
-                        "--base-flashinfer-dir",
-                        str(args.flashinfer_dir),
-                        "--aot-out",
-                        str(raw_dir),
-                        "--metadata-out",
-                        str(metadata_path),
-                    ],
-                    check=True,
-                )
-                package_variant(
-                    variant=variant,
-                    raw_aot_dir=raw_dir,
-                    compile_metadata_path=metadata_path,
-                    output_dir=staged / variant,
-                    flashinfer_dir=args.flashinfer_dir,
-                )
-
-            bundle = {
-                "schema_version": 2,
-                "variants": {
-                    variant: {
-                        "manifest": f"{variant}/manifest.json",
-                        "manifest_sha256": sha256_file(staged / variant / "manifest.json"),
-                    }
-                    for variant in sorted(SUPPORTED_GEOMETRIES)
-                },
-            }
-            write_json(staged / "bundle.json", bundle)
-            validate_bundle(staged, flashinfer_dir=args.flashinfer_dir)
+            raw_dir = temp / "raw"
+            metadata_path = raw_dir / "compile-metadata.json"
+            subprocess.run(
+                [
+                    str(args.python),
+                    str(compiler),
+                    "--variant",
+                    VARIANT,
+                    "--flashinfer-dir",
+                    str(prepared),
+                    "--base-flashinfer-dir",
+                    str(args.flashinfer_dir),
+                    "--aot-out",
+                    str(raw_dir),
+                    "--metadata-out",
+                    str(metadata_path),
+                ],
+                check=True,
+            )
+            package_candidate(
+                raw_aot_dir=raw_dir,
+                compile_metadata_path=metadata_path,
+                output_dir=staged,
+                source=source,
+            )
+            validate_manifest(
+                staged / "manifest.json", flashinfer_dir=args.flashinfer_dir
+            )
             output.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(staged), output)
     except (ContractError, OSError, subprocess.CalledProcessError) as exc:
         print(f"error: generation failed: {exc}", file=sys.stderr)
         return 2
 
-    print(json.dumps({"bundle": str(output), "variants": sorted(SUPPORTED_GEOMETRIES)}, sort_keys=True))
+    print(json.dumps({"candidate": str(output), "variant": VARIANT}, sort_keys=True))
     return 0
 
 
