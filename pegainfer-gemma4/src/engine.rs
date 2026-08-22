@@ -486,7 +486,8 @@ fn parse_decode_slots(raw: &str) -> Result<usize> {
 /// The chunked-walk knob: `PEGAINFER_MIX_CHUNK_TOKENS=N` walks admitted
 /// prompts through shared segment steps of at most `N` prompt rows each —
 /// live streams then advance one token per segment instead of waiting out
-/// a whole prompt. Unset (or `off`/`0`) keeps whole-prompt steps.
+/// a whole prompt. Unset (or `off`/`0`) keeps whole-prompt steps. The
+/// effective step rounds down to whole 128-row tiles.
 fn mix_chunk_tokens(max_context: usize) -> Result<Option<usize>> {
     match std::env::var("PEGAINFER_MIX_CHUNK_TOKENS") {
         Ok(raw) => parse_mix_chunk_tokens(&raw, max_context),
@@ -497,12 +498,14 @@ fn mix_chunk_tokens(max_context: usize) -> Result<Option<usize>> {
     }
 }
 
+/// GEMM and attention tiles consume whole 128-row blocks, so a width that is
+/// not a multiple of 128 pays for a tile it does not fill.
 fn parse_mix_chunk_tokens(raw: &str, max_context: usize) -> Result<Option<usize>> {
     let v = raw.trim().to_ascii_lowercase();
     match v.as_str() {
         "" | "0" | "off" => Ok(None),
         other => match other.parse::<usize>() {
-            Ok(n) if n >= 64 && n < max_context => Ok(Some(n)),
+            Ok(n) if n >= 64 && n < max_context => Ok(Some(if n < 128 { n } else { n - n % 128 })),
             _ => anyhow::bail!(
                 "PEGAINFER_MIX_CHUNK_TOKENS={raw:?} not recognized (off | N, 64 <= N < {max_context})"
             ),
@@ -2894,6 +2897,17 @@ mod lane_tests {
             Some(8192),
             "a raised ceiling admits a wider chunk"
         );
+        assert_eq!(
+            parse_mix_chunk_tokens("2496", 262_144).unwrap(),
+            Some(2432),
+            "a step aligns down to whole tiles"
+        );
+        assert_eq!(
+            parse_mix_chunk_tokens("127", 8192).unwrap(),
+            Some(127),
+            "below one tile the width is never rounded to zero"
+        );
+        assert_eq!(parse_mix_chunk_tokens("128", 8192).unwrap(), Some(128));
         for bad in ["63", "8192", "on", "2k", "-1"] {
             assert!(
                 parse_mix_chunk_tokens(bad, 8192).is_err(),
