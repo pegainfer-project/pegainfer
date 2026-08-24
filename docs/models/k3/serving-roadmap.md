@@ -1,9 +1,16 @@
 # K3 serving roadmap
 
-**TL;DR**: The target deliverable is **TP x × DP y × EP (x·y)** with TP never
-crossing a machine (x ≤ 4, one GB300 tray), plus **MTP speculative decoding**
-(draft: [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark)).
-Everything below is ordered by what gates the real 896-expert model.
+**TL;DR**: The target deliverable is a **mix engine** (no P/D disaggregation):
+steady state TP1 × DP N × EP N with always-on speculative decoding
+(draft: [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark)),
+plus long prefills running as **elastic CP-gang lanes** inside the fixed EP16
+superstep (topology never reshapes; TP is out entirely — external baselines
+come from vLLM/sglang) — the lane architecture, KCP algorithm, cache design
+and M0–M3 phases live in `cp-lane-design.md` (2026-08-24), which supersedes
+the transient CP4×TP4 whale mode in `mix-engine-design.md`; the batch/step
+shape convergence (span primitive, steady/whale step forms, kernel list)
+remains in `mix-engine-design.md`. Multi-node EP and spec decode are landed;
+everything below is ordered by what gates the real 896-expert model.
 
 Last touched: 2026-08
 
@@ -47,10 +54,15 @@ worlds 224x{1,4,8,16} and 896x{8,16,32,64} instantiated; ssh fleet launcher
    `k3_mega_world_supported` entry now, split across three TUs.
 3. ~~**Fleet launch**~~ — `scripts/k3_ep_fleet.sh` (ssh); a slurm/sbatch
    variant per `~/slurm/glm52_ep16_d.sbatch` remains open.
-4. **Attention TP (x up to 4)** — after multi-node EP works TP1; TP shrinks
-   the per-rank attention/dense replication and is what makes wide-EP
-   memory-comfortable. Needs the latent-cache decision above, TP'd KDA state
-   slabs, and a tray-local all-reduce in the step.
+4. ~~**Attention TP (x up to 4)**~~ — **superseded 2026-08-24, twice**: first
+   by the transient CP4×TP4 whale mode, then by `cp-lane-design.md`, which
+   removes TP from the design entirely — long prefills run as CP-gang lanes
+   coexisting with local lanes in the fixed EP16 superstep (MoE stays
+   full-width automatically), and the only motivation TP ever had (a
+   baseline) is served by vLLM/sglang externally. Resident TP never bought
+   steady-state TPOT anyway (latent-bandwidth-bound; sharding heads doesn't
+   shard latent reads). The latent-cache decision above dissolves: pages
+   land in the owner's pool in all modes.
 
 ## MTP (speculative decoding)
 
@@ -66,7 +78,18 @@ and CUDA-graph capture.
 - **Varlen multi-request prefill chunks** — pack several prompts into one
   4224-row step (FlashMLA varlen entry + FlashKDA varlen config both exist
   upstream in the vendored sources; scheduler-side continuous batching of
-  prefills). The single-instance input-throughput lever.
+  prefills). The single-instance input-throughput lever. Priority raised
+  2026-08-24: 16 independent T14 calls cost 9.1× one single-sequence T224
+  call, so fixed launch cost makes a varlen implementation first-tier work.
+  This is priority evidence, not measured varlen speedup: the real kernel has
+  16 independent recurrent states and must be remeasured after instantiation
+  (see `mix-engine-design.md`).
+- **Mega world expansion past 4224** — whale chunk steps want 12–16k rows:
+  the EP16 full-model contiguous padding floor needs chunk/56 ≥ BLOCK_M 192
+  (≈10.7k tokens) to fill expert tiles (measured:
+  `~/code/bench_results/2026-08-17-k3-prefill-tp-vs-ep`). Evaluate a
+  whale-only larger instantiation vs raising the fleet-wide protocol max
+  under the one-instantiation lockstep constraint.
 - **Full-depth TTFT baseline** — measure the pruned checkpoint at 93 layers,
   single-tray EP4. topk = 16 is unchanged by the pruning, so per-token
   routed FLOPs match the real model; this is the honest perf proxy until
@@ -84,5 +107,5 @@ and CUDA-graph capture.
 - Paged-attention decode kernel perf pass (3-sweep recompute reads the cache
   three times; matters at 24 MLA layers × long contexts).
 
-**Next action**: attention TP (item 4), or the varlen prefill packing —
-multi-node EP is done.
+**Next action**: latent FMHA and the varlen FlashKDA instantiation in
+`mix-engine-design.md`; multi-node EP is done.
