@@ -3,6 +3,7 @@ use std::ffi::c_char;
 #[cfg(feature = "qwen35")]
 use std::ffi::c_void;
 
+#[cfg(feature = "qwen35")]
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
 

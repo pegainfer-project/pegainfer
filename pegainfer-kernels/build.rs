@@ -51,14 +51,16 @@ const QWEN35_GDN_AOT_ENV: &str = "PEGAINFER_QWEN35_GDN_AOT_BUNDLE";
 fn sha256_file(path: &Path) -> String {
     let bytes =
         fs::read(path).unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    sha2::Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = sha2::Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("write SHA-256 hex to String");
+    }
+    hex
 }
 
 #[cfg(feature = "qwen35")]
-fn json_u64<'a>(value: &'a serde_json::Value, path: &[&str]) -> u64 {
+fn json_u64(value: &serde_json::Value, path: &[&str]) -> u64 {
     let mut cursor = value;
     for key in path {
         cursor = &cursor[*key];
@@ -180,7 +182,7 @@ fn build_qwen35_flashinfer_gdn_aot(
         config = format!(
             "#pragma once\n#define PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256 \"{object_hash}\"\n#define PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM {workspace_bytes_per_sm}u\n"
         );
-        includes.push(bundle.clone());
+        includes.push(bundle);
         linked_objects.push(object);
         runtime_dir = runtime.parent().map(Path::to_path_buf);
     }
