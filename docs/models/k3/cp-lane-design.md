@@ -14,8 +14,11 @@ TP4-DP2-EP8 baseline，不做 CP8-EP8 部署形态**。阶段：M0 pruned@EP4 �
 （**DONE 2026-08-24：CP4 16k logits gate 绿，零 CUDA 改动**）→ M0.5 CP serving
 集成（**DONE 2026-08-24：gang = free-running leveling loop，decode 归 owner；
 HTTP e2e 同脚本 4 卡对 4 卡：16k CP4 1161 ms vs vLLM TP4 1181 ms 首次同口径
-险胜，对内 CP1 3045 ms = 2.62×，交叉点 ~1k tokens，详表见 §M0.5**）→ M1
-full@EP16 交叉矩阵 + lane-vs-独占步系统 A/B → M2 agent cache 闭环 → M3 弹性调度。
+险胜，对内 CP1 3045 ms = 2.62×，交叉点 ~1k tokens，详表见 §M0.5。**16 卡全量
+对局 DONE：EP16 CP4 16k 1072 ms，CP4/CP1 2.86×；1–2k 赢 vLLM TP16-MNNVL
+1.3–1.5×，8k+ 输 0.68×（我们 CP 宽度钉在 4）——M1 加宽的立项数据，详表见
+§16 卡对局**）→ M1 full@EP16 交叉矩阵 + lane-vs-独占步系统 A/B → M2 agent
+cache 闭环 → M3 弹性调度。
 
 Last touched: 2026-08
 
@@ -352,9 +355,41 @@ gang——生产默认 2048 以下走本地）：
 （我们 132 ms vs vLLM 59 ms）：剥离截距后 8k/16k 计算部分快 4–9%，
 4k 慢 ~9%。截距是下一个杠杆，不在 CP lane 范围内。
 
+### 16 卡对局（2026-08-24，DONE：vLLM TP16 vs 本引擎 EP16 全量）
+
+4×GB300 tray（tray05/10/13/14）×4 卡，全量 1.5T checkpoint，同一
+`bench_vllm_ttft.py` n=4 取 min。本引擎裸机 EP16（每进程 4 rank，
+`--k3-ep-size 16`，MoE 走 NVLink fabric）；vLLM 容器化 ray TP16
+（bring-up 12 连坑全录见 `bench_results/2026-08-24-k3-tp16-vs-ep16/`
+存档 README——MNNVL/IMEX/GID/FlashInfer fusion 死锁）。CP4 档
+`PEGAINFER_K3_CP=4 PEGAINFER_K3_CP_MIN=128` 全长度强制走 gang。
+
+| tokens | vLLM TP16 (MNNVL) | vLLM TP16 (RoCE) | CP1 | CP4 | CP4/CP1 | CP4 vs MNNVL |
+|---|---|---|---|---|---|---|
+| 122 | 98 | 117 | 133 | 132 | — | 0.74× |
+| 258 | 96 | 197 | 174 | 236 | 0.74× | 0.41× |
+| 494 | 116 | 319 | 183 | 243 | 0.75× | 0.48× |
+| 1014 | 391 | 576 | 261 | 259 | 1.01× | **1.51×** |
+| 2004 | 406 | 1110 | 425 | 302 | 1.41× | **1.34×** |
+| 4131 | 418 | 2193 | 782 | 441 | 1.77× | 0.95× |
+| 8083 | 439 | 4385 | 1516 | 604 | 2.51× | 0.73× |
+| 16395 | 728 | 8921 | 3061 | **1072** | **2.86×** | 0.68× |
+
+判读：
+- **CP4/CP1 的纵向账在全量 EP16 上完全兑现**（16k 2.86×，比 pruned@EP4
+  的 2.62× 还好——全量 MoE 更重，CP 摊薄的 attention 份额相对更大）。
+- **对 vLLM 的横向账分两段**：1–2k CP4 赢 1.3–1.5×（他们的 TP16 中段
+  掉进 ~400ms 平台）；4k 基本打平；8k+ 输 0.68–0.73×——vLLM prefill 是
+  16 路全切，我们 M0 的 CP 宽度被单 superstep 约束钉在 4（每段 ≤4224）。
+  **8k+ 的差距就是 M1 多 superstep + CP8/CP16 的立项理由**：CP4 已把
+  CP1 的 3061 压到 1072，宽度每翻倍理论上还有 ~1.6–1.8× 空间。
+- vLLM 两列的差距（16k 728 vs 8921，12×）是 fabric 的账不是引擎的账：
+  任何一台 tray 的 nvidia-imex daemon 挂掉，整个 MNNVL 域的 fabric
+  import 全崩（CUDA 801/600 报的是 import 方不是病灶方），NCCL 静默落
+  RoCE。基线以 MNNVL 列为准。
+
 ## Next action
 
-16 卡对局（vLLM TP16 vs 本引擎 EP16 全量，CP1 与 CP4-per-process 两档，
-同脚本）——等 4-tray 窗口（占位 sbatch 已排队）。另：查前端固定截距（132 vs 59 ms @122
-tokens）；然后 M1：full@EP16 交叉矩阵 + 系统 A/B（前置：mega world
->4224、多 superstep 段游走）。
+M1 立项：mega world >4224 + 多 superstep 段游走 → CP8/CP16，8k+ 追平
+vLLM TP16 的 16 路切分；full@EP16 交叉矩阵 + 系统 A/B。次优先：前端固定
+截距（132 vs 59 ms @122 tokens）。
