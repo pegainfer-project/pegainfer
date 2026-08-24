@@ -105,6 +105,12 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 ---
 
+# AI-Assisted Contributions
+
+AI-assisted PRs must be accountable and verifiable. Show that the work is not duplicated, name the production invariant being changed, and provide real evidence: production E2E for features and fixes, same-context A/B for performance, and model evals for output or accuracy changes. Every changed file must serve that invariant; remove unrelated cleanup, thin wrappers, generated scaffolding, and mock or source-text tests presented as production evidence.
+
+---
+
 # Team Documentation Workflow
 
 Collaboration centered on the `docs/` directory.
