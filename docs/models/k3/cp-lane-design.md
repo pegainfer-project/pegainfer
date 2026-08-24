@@ -11,9 +11,11 @@ KDA CP 采用 affine-summary + prefix-merge 的 KCP 算法（FLA PR #691 路线�
 2026-08-24 实测 KCP4 比同后端 TP4 快 2.70%）；M0 先做 **contiguous（可不等长）切分，
 zigzag 缓议**。Baseline = main（CP1 chunked prefill，attn-DP16×EP16）；**不建
 TP4-DP2-EP8 baseline，不做 CP8-EP8 部署形态**。阶段：M0 pruned@EP4 算子正确性
-（**DONE 2026-08-24：CP4 16k logits gate 绿，TTFT 2980→1026 ms = 2.90x，压过
-vLLM TP4 的 1181 ms，零 CUDA 改动**）→ M1 full@EP16 交叉矩阵 + lane-vs-独占步
-系统 A/B → M2 agent cache 闭环 → M3 弹性调度。
+（**DONE 2026-08-24：CP4 16k logits gate 绿，零 CUDA 改动，内部墙钟 2980→1026 ms
+= 2.90x；HTTP e2e 同脚本实测 CP1 serving 3048 ms 落后 vLLM TP4 1181 ms ~2.6×，
+CP4 e2e 预估 ~1100-1150 ms 仅险胜——真 e2e 待 serving 集成**）→ M0.5 CP serving
+集成（gang 协调 + KV/state 归拢到 decode home rank）→ M1 full@EP16 交叉矩阵 +
+lane-vs-独占步系统 A/B → M2 agent cache 闭环 → M3 弹性调度。
 
 Last touched: 2026-08
 
@@ -217,7 +219,7 @@ peer D2D 读（MegaMoE mempool 已开 peer access）。M0 约束：单 superstep
   1.6e-2 → 4 层 4.2e-2 → 93 层 2.5e-1），bar 定为 `4e-2·√layers`；硬门禁是
   argmax + token。方向反的 merge（M·S）在 4 层就打出 2.3e-1 + argmax 翻转，
   与噪声可区分。
-- **TTFT（min-of-4，one-shot）**：
+- **TTFT，内部墙钟（min-of-4，one-shot，forward 直测）**：
 
   | tokens | CP1 ms | CP4 ms | speedup |
   |-------:|-------:|-------:|--------:|
@@ -226,8 +228,33 @@ peer D2D 读（MegaMoE mempool 已开 peer access）。M0 约束：单 superstep
   | 8192 | 1442.4 | 517.0 | 2.79x |
   | 16384 | 2980.2 | 1026.2 | **2.90x** |
 
-  16k 处 CP4 1026 ms < vLLM pruned TP4 baseline 1181 ms（外部 yardstick，
-  `~/code/bench_results/2026-08-17-k3-vllm-ttft-baseline`）。
+- **跨引擎口径 = HTTP e2e 同脚本打两边、卡数对等（4 卡对 4 卡）**。
+  我们 serving（CP1 chunked prefill @EP4，tray14，`PEGAINFER_K3_MAX_CTX=32768`）
+  与 vLLM pruned TP4（chunk 16k 档，存档 2026-08-17）同用一份
+  `bench_vllm_ttft.py`，e2e min-of-4：
+
+  | tokens | pegainfer CP1 e2e | vLLM TP4 e2e |
+  |-------:|------:|------:|
+  | 122 | 132 | 59 |
+  | 258 | 173 | 64 |
+  | 494 | 182 | 76 |
+  | 1014 | 258 | 251 |
+  | 2004 | 421 | 251 |
+  | 4131 | 774 | 321 |
+  | 8083 | 1506 | 595 |
+  | 16395 | 3048 | **1181** |
+
+  读法：单请求 TTFT 下 CP1 只有 1 卡在算 prefill（DP 的另 3 卡陪跑 padding），
+  对 vLLM 4 卡切一个 prompt 慢 ~2.6×——这正是 CP lane 存在的理由。CP4 是
+  我们的 4 卡形态：内部墙钟 1026 ms + 本引擎 ~70-130 ms 前端截距 ≈
+  **~1100-1150 ms e2e 预估，对 1181 仅险胜个位数百分比**。真 CP4 e2e 要
+  serving 集成后用同脚本实测（见 Next action）；固定截距我们比 vLLM 高
+  （122-token 档 132 vs 59 ms），也是待办。
+- 全量 fairness 账（2026-08-24 实算）：checkpoint 1453.7 GiB = expert
+  1347.1 + dense 106.5；attn-DP 下 dense 每 rank 全复制 ⇒ **EP8 权重
+  274.9 GiB/rank > GB300 可用 277.5 GiB 减 runtime，放不下；全量最少
+  EP16（190.7 GiB/rank）**。vLLM 8 卡能起全量是 TP 连 dense 一起切
+  （~182 GiB/rank）；全量对局 = 16 卡对 16 卡（vLLM TP×PP 或 sglang EP16）。
 - microbench：`k3_flash_kda_bench`（FlashKDA 段长吞吐扫描）进
   `pegainfer-kernels` bench 系列。
 
@@ -269,7 +296,11 @@ goodput 高于静态 DP16 与独占步方案，且长上下文请求无 OOM、�
 
 ## Next action
 
-M0 已落地（见 §9），进 M1：full@EP16 的交叉矩阵（`T_cp(c)` × extend 长度）+
-whale-as-lane vs 独占步系统 A/B。前置依赖是 mega world >4224（roadmap 已挂账，
-whale chunk 12–16k 需要）；同时把 M0 的单 superstep 约束推广到多 superstep
-（段长 > chunk 时逐 chunk 交换）。
+M0 已落地（见 §9）。**M0.5：CP prefill 接进 serving，拿真 HTTP e2e**——
+(a) gang 协调：长 prompt 触发全体 rank 走 `prefill_cp`（scheduler 是
+per-rank partition 自由跑，需要跨 partition 的 gang 招募）；(b) decode 归属
+末 CP rank：KDA 终态与 conv 窗口天然在它那，MLA 上游行在 CP 交换时顺手写进
+它的 pool（全局位置，~340 MB D2D），之后 decode 全本地，不需要 DIST_CTX；
+(c) 用同一份 bench 脚本重测 e2e 表。顺带查前端固定截距（我们 132 ms vs
+vLLM 59 ms @122 tokens）。然后 M1：full@EP16 交叉矩阵 + 系统 A/B（前置：
+mega world >4224、多 superstep 段游走）。

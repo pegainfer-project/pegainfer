@@ -46,8 +46,8 @@ use pegainfer_k3::StepExecutor;
 const CHECKPOINT_ENV: &str = "PEGAINFER_K3_TEST_224";
 const EP_SIZE: usize = 4;
 /// Serving ceiling for the gate; the one-shot 16k prompt is the yardstick
-/// the vLLM TTFT baseline (`~/code/bench_results/2026-08-17-k3-vllm-ttft-baseline`)
-/// was measured at.
+/// the external vLLM TTFT baseline was measured at (see
+/// `docs/models/k3/cp-lane-design.md`).
 const MAX_CTX: usize = 16384;
 /// Logits gate: relative L2 across the vocab row, CP4 vs CP1. The noise
 /// floor is a `sqrt(depth)` diffusion off ~2e-2 per split (module docs);
@@ -216,13 +216,16 @@ fn cp4_prefill_matches_cp1() {
     );
 }
 
-/// The crossover table: T_cp(4) vs T_cp(1) at the vLLM-baseline sweep
-/// lengths, min of 4 (one-shot per length; the 16k row is the yardstick —
-/// vLLM pruned TP4 one-shot 16k min was 1181 ms).
+/// The crossover table: T_cp(4) vs T_cp(1) at the external vLLM baseline's
+/// sweep lengths (the full 128–16k ladder), min of 4, one-shot per length.
+/// Comparison caliper: the vLLM numbers are server e2e TTFT minus the fixed
+/// intercept (its 128-token min); ours here are the forward wall clock
+/// directly — the honest cross-engine comparison is HTTP e2e on both sides
+/// (see `docs/models/k3/cp-lane-design.md` for the numbers).
 #[test]
 #[ignore = "needs 4 GPUs and the 224-expert checkpoint"]
 fn cp4_prefill_ttft_sweep() {
-    let lengths = [2048usize, 4096, 8192, 16384];
+    let lengths = [128usize, 256, 512, 1024, 2048, 4096, 8192, 16384];
     let runs = 4;
     let (first, last) = run_gang(&lengths, runs);
     println!("| tokens | CP1 min ms | CP4 min ms | speedup |");
