@@ -140,6 +140,17 @@ fn sync_stream(ctx: &DeviceContext) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("K3 CP stream sync failed: {error}"))
 }
 
+/// Whether a prompt of `total` tokens is CP-eligible: every segment must
+/// outspan the conv window (the halo exchange publishes exactly
+/// [`K3_CONV_STATE`] rows) and fit one chunk step (M0: one superstep). This
+/// is the one place the admission window lives — the scheduler asks it, and
+/// [`k3_cp_segments`]' consumers re-check it defensively.
+pub fn k3_cp_admits(total: usize, cp_size: usize, chunk_tokens: usize) -> bool {
+    let shortest = total / cp_size;
+    let longest = shortest + usize::from(!total.is_multiple_of(cp_size));
+    shortest > K3_CONV_STATE && longest <= chunk_tokens
+}
+
 /// Split `total` prompt tokens into `cp_size` contiguous segments, earlier
 /// ranks taking the remainder — the later segments carry the taller MLA
 /// context triangle, so they get the shorter extends.
@@ -158,8 +169,10 @@ pub(crate) fn k3_cp_segments(total: usize, cp_size: usize) -> Vec<(usize, usize)
 
 /// One rank's CP working set: the buffers it publishes to its peers, the
 /// receive arenas it folds their packages in, and the gang handle. Allocated
-/// once per executor (after the MegaMoE peer-access grants, so the pool
-/// covers every buffer) and re-armed per superstep.
+/// exactly once per executor — the pool grants to the gang's devices must
+/// precede every allocation they cover — and re-armed per superstep with
+/// that superstep's split and CP rank (the rank is a function of the job's
+/// poster, so it rotates job to job while the buffers stay put).
 pub(crate) struct K3CpScratch {
     pub(crate) group: Arc<K3CpGroup>,
     pub(crate) cp_rank: usize,
@@ -197,18 +210,17 @@ pub(crate) struct K3CpScratch {
     pub(crate) recv_d: CudaSlice<f32>,
     merge_a: CudaSlice<f32>,
     merge_b: CudaSlice<f32>,
+    /// Pool write indices for the upstream rows `0..upstream_len` — set on
+    /// the owner (last CP rank) so the MLA exchange persists the received
+    /// context into the owner's paged pool for decode; 0 elsewhere.
+    pub(crate) upstream_kv_rows: CudaSlice<i32>,
+    pub(crate) upstream_len: usize,
     seg_cap: usize,
 }
 
 impl K3CpScratch {
-    pub(crate) fn new(
-        ctx: &DeviceContext,
-        group: Arc<K3CpGroup>,
-        cp_rank: usize,
-        seg_cap: usize,
-    ) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, group: Arc<K3CpGroup>, seg_cap: usize) -> Result<Self> {
         let cp_size = group.cp_size();
-        ensure!(cp_rank < cp_size, "K3 CP rank {cp_rank} of {cp_size}");
         let stream = &ctx.stream;
         let d = K3_KDA_HEAD_DIM;
         let mut identity_host = vec![0f32; K3_KDA_STATE];
@@ -218,7 +230,8 @@ impl K3CpScratch {
             }
         }
         Ok(Self {
-            cp_rank,
+            // Meaningful only between an `arm` and the superstep it opened.
+            cp_rank: 0,
             cp_size,
             segments: Vec::new(),
             peers: Vec::new(),
@@ -245,6 +258,10 @@ impl K3CpScratch {
             recv_d: stream.alloc_zeros(cp_size * K3_KDA_STATE)?,
             merge_a: stream.alloc_zeros(K3_KDA_STATE)?,
             merge_b: stream.alloc_zeros(K3_KDA_STATE)?,
+            upstream_kv_rows: stream
+                .alloc_zeros(seg_cap.saturating_mul(cp_size.saturating_sub(1)).max(1))
+                .context("alloc K3 CP upstream index buffer")?,
+            upstream_len: 0,
             seg_cap,
             group,
         })
@@ -254,9 +271,43 @@ impl K3CpScratch {
         self.seg_cap
     }
 
-    /// Enter one superstep: adopt the split and swap pointer tables with the
-    /// gang. Collective.
-    pub(crate) fn arm(&mut self, ctx: &DeviceContext, segments: Vec<(usize, usize)>) -> Result<()> {
+    /// Arm the upstream persist: `indices` are the owner's pool write indices
+    /// for global positions `0..indices.len()` (pages already mapped).
+    pub(crate) fn set_upstream_rows(&mut self, ctx: &DeviceContext, indices: &[i32]) -> Result<()> {
+        ensure!(
+            indices.len() <= self.upstream_kv_rows.len(),
+            "K3 CP upstream span of {} rows exceeds the {} buffer",
+            indices.len(),
+            self.upstream_kv_rows.len()
+        );
+        if !indices.is_empty() {
+            let mut window = self.upstream_kv_rows.slice_mut(0..indices.len());
+            ctx.stream
+                .memcpy_htod(indices, &mut window)
+                .map_err(|error| anyhow::anyhow!("K3 CP upstream index feed failed: {error}"))?;
+        }
+        self.upstream_len = indices.len();
+        Ok(())
+    }
+
+    pub(crate) fn clear_upstream_rows(&mut self) {
+        self.upstream_len = 0;
+    }
+
+    /// Enter one superstep: take this superstep's CP rank, adopt the split,
+    /// and swap pointer tables with the gang. Collective.
+    pub(crate) fn arm(
+        &mut self,
+        ctx: &DeviceContext,
+        cp_rank: usize,
+        segments: Vec<(usize, usize)>,
+    ) -> Result<()> {
+        ensure!(
+            cp_rank < self.cp_size,
+            "K3 CP rank {cp_rank} of {}",
+            self.cp_size
+        );
+        self.cp_rank = cp_rank;
         ensure!(
             segments.len() == self.cp_size,
             "K3 CP split of {} segments for a {}-rank gang",

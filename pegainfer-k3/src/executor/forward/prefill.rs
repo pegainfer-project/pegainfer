@@ -782,6 +782,8 @@ pub(super) fn mla_attention_chunk_cp(
     ctx: &DeviceContext,
     shape: K3StepShape,
     w: &K3MlaWeights,
+    kv: &mut K3PagedKv,
+    mla_index: usize,
     s: &mut K3Scratch,
     cp: &mut K3CpScratch,
 ) -> Result<()> {
@@ -852,6 +854,20 @@ pub(super) fn mla_attention_chunk_cp(
         t_q,
         crate::config::K3_QK_ROPE_HEAD_DIM,
     )?;
+    // The owner rank persists the upstream context it just assembled into its
+    // paged pool so decode after the CP handoff attends fully locally. The
+    // upstream rows sit at 0..upstream_len of the assembled context, exactly
+    // the layout `append_latent` reads.
+    if cp.upstream_len > 0 {
+        kv.append_latent(
+            ctx,
+            mla_index,
+            cp.upstream_len,
+            &cp.upstream_kv_rows,
+            &s.mla_ctx_latent.data,
+            &s.mla_ctx_rope,
+        )?;
+    }
     mla_chunk_attend(ctx, t_q, t_kv, w, s)
 }
 

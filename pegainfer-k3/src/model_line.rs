@@ -20,7 +20,10 @@ use crate::config::K3_LAYERS;
 use crate::config::K3_SUPPORTED_ROUTED_EXPERTS;
 use crate::executor::K3Executor;
 use crate::executor::K3ExecutorConfig;
+use crate::executor::cp::K3CpGroup;
 use crate::executor::ep::K3EpRendezvous;
+use crate::scheduler::K3CpGang;
+use crate::scheduler::K3CpServing;
 use crate::scheduler::K3SchedulerConfig;
 
 pub static MODEL_LINE: K3Line = K3Line;
@@ -301,16 +304,73 @@ impl ModelLine for K3Line {
             }
             executors.push(executor);
         }
+        let dspark_armed = ctx.shared.dflash_draft_model_path.is_some();
+        let chunk_tokens = executors
+            .first()
+            .context("K3 EP serving needs at least one local rank")?
+            .chunk_tokens();
+        let cp = cp_serving(ranks.len(), dspark_armed, chunk_tokens)?;
         Ok(LaunchedEngine::Stepped(
             crate::scheduler::start_with_executors(
                 executors,
                 &K3SchedulerConfig {
                     eos_token_ids,
                     kv_capacity: None,
+                    cp,
                 },
             ),
         ))
     }
+}
+
+/// Arm the CP prefill lane from `PEGAINFER_K3_CP` (the CP width — must equal
+/// this process's local rank count) and `PEGAINFER_K3_CP_MIN` (admission
+/// floor in prompt tokens, default 2048). Bad values refuse to start rather
+/// than serving something other than what was asked.
+fn cp_serving(
+    local_ranks: usize,
+    dspark_armed: bool,
+    chunk_tokens: usize,
+) -> anyhow::Result<Option<K3CpServing>> {
+    let Some(raw) = std::env::var_os("PEGAINFER_K3_CP") else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !dspark_armed,
+        "PEGAINFER_K3_CP does not compose with the dspark draft lane yet; disarm one of them"
+    );
+    let raw = raw.to_string_lossy();
+    let cp_size: usize = raw
+        .parse()
+        .ok()
+        .filter(|&size| size > 1)
+        .with_context(|| format!("PEGAINFER_K3_CP={raw} is not a CP width > 1"))?;
+    anyhow::ensure!(
+        cp_size == local_ranks,
+        "PEGAINFER_K3_CP={cp_size} must equal this process's local rank count ({local_ranks}): \
+         the gang spans the process's scheduler partitions, and every one of them must serve. \
+         On a fleet each process runs its own gang over its local GPUs — remote EP ranks pad \
+         the chunk steps like any other step"
+    );
+    let min_tokens = match std::env::var_os("PEGAINFER_K3_CP_MIN") {
+        None => 2048,
+        Some(raw) => {
+            let raw = raw.to_string_lossy();
+            raw.parse()
+                .ok()
+                .filter(|&min| min > 0)
+                .with_context(|| format!("PEGAINFER_K3_CP_MIN={raw} is not a token count"))?
+        }
+    };
+    info!(
+        "K3 CP prefill lane armed: cp_size={cp_size}, min_tokens={min_tokens}, \
+         chunk_tokens={chunk_tokens}"
+    );
+    Ok(Some(K3CpServing {
+        gang: K3CpGang::new(K3CpGroup::new(cp_size)?),
+        min_tokens,
+        chunk_tokens,
+    }))
 }
 
 /// The global ranks this process hosts: `--k3-ranks` when given, the whole

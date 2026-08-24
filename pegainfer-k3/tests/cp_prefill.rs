@@ -155,7 +155,7 @@ fn run_gang(lengths: &[usize], runs: usize) -> (RankReport, RankReport) {
                         // CP4: everyone owns a segment of the same prompt.
                         let start = Instant::now();
                         let token = executor
-                            .prefill_cp(&prompt, &group, rank)
+                            .prefill_cp(0, &prompt, &group, rank)
                             .expect("CP4 prefill");
                         let seconds = start.elapsed().as_secs_f64();
                         if rank + 1 == EP_SIZE {

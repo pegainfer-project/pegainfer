@@ -633,7 +633,7 @@ fn mla_attention(
         // Under CP the gather is replaced by assembly from the gang's
         // published latents; the FMHA is the same call.
         if let Some(cp) = cp {
-            mla_attention_chunk_cp(ctx, shape, w, s, cp)?;
+            mla_attention_chunk_cp(ctx, shape, w, kv, mla_index, s, cp)?;
         } else {
             mla_attention_chunk_fmha(ctx, shape, w, kv, mla_index, s)?;
         }

@@ -11,11 +11,11 @@ KDA CP 采用 affine-summary + prefix-merge 的 KCP 算法（FLA PR #691 路线�
 2026-08-24 实测 KCP4 比同后端 TP4 快 2.70%）；M0 先做 **contiguous（可不等长）切分，
 zigzag 缓议**。Baseline = main（CP1 chunked prefill，attn-DP16×EP16）；**不建
 TP4-DP2-EP8 baseline，不做 CP8-EP8 部署形态**。阶段：M0 pruned@EP4 算子正确性
-（**DONE 2026-08-24：CP4 16k logits gate 绿，零 CUDA 改动，内部墙钟 2980→1026 ms
-= 2.90x；HTTP e2e 同脚本实测 CP1 serving 3048 ms 落后 vLLM TP4 1181 ms ~2.6×，
-CP4 e2e 预估 ~1100-1150 ms 仅险胜——真 e2e 待 serving 集成**）→ M0.5 CP serving
-集成（gang 协调 + KV/state 归拢到 decode home rank）→ M1 full@EP16 交叉矩阵 +
-lane-vs-独占步系统 A/B → M2 agent cache 闭环 → M3 弹性调度。
+（**DONE 2026-08-24：CP4 16k logits gate 绿，零 CUDA 改动**）→ M0.5 CP serving
+集成（**DONE 2026-08-24：gang = free-running leveling loop，decode 归 owner；
+HTTP e2e 同脚本 4 卡对 4 卡：16k CP4 1161 ms vs vLLM TP4 1181 ms 首次同口径
+险胜，对内 CP1 3045 ms = 2.62×，交叉点 ~1k tokens，详表见 §M0.5**）→ M1
+full@EP16 交叉矩阵 + lane-vs-独占步系统 A/B → M2 agent cache 闭环 → M3 弹性调度。
 
 Last touched: 2026-08
 
@@ -294,13 +294,67 @@ SLO 下 goodput、EP barrier wait、rank pre-EP 偏差、CP 通信时间、cache
 **验收不是 CP kernel 快几倍，而是：同 decode SLO 下，弹性 lane 的 agent
 goodput 高于静态 DP16 与独占步方案，且长上下文请求无 OOM、无长期饥饿。**
 
+### M0.5 — CP prefill 接进 serving（2026-08-24，DONE，e2e 实测落表）
+
+实现形态（`scheduler/gang.rs` + executor trait 扩展）：
+
+- **Gang = 贴任务板 + free-running 纪律**。admit 到长 prompt 的 partition 把
+  `(prompt, poster)` 贴上板（`K3CpGang`），自己即 owner（CP rank `size-1`，
+  末段——KDA 终态/conv 窗口天然是全 prompt 的）；其余 partition 每步开头查板，
+  全员按**贴板顺序**执行（否则两个 gang 的 exchange 窗口会交叉）。
+- **Leveling loop（唯一的会合原语）**：EP mega launch 跨 rank 按绝对序号
+  **双边**配对——一个 step 的 device sync 只有在所有 peer 排队了同号 launch
+  后才返回，free-running 下各 rank 天然被钉在 ±1 launch。gang 成员的纪律
+  是**任何时刻不许安静等待**：每轮把自己（即将到达）的 launch 数写上板
+  （pump 前先写 `count+1`，防 stale bid），人未齐或自己低于 `max(bids)` 就
+  `pump_step`（阻塞到完成，即背压），只有"人齐且自己 == max"才进
+  `prefill_cp`。人齐后 max 不再增长（只有低于 max 的才 pump 且 bid ≤ max），
+  全员在**同一 launch 数**进 compute——这是 `prefill_cp` mid-step CPU
+  exchange 的先决条件（不等长进入时，领先 rank 的 mid-step sync 等的
+  peer launch 永远不会来）。
+  灵感直接来自 `models/glm52/free-running-dp.md`：曾试过 arrive/bid/equalize
+  三阶段 + condvar 纯等待，四连死锁（60s DeepGEMM grid-sync timeout）——
+  最后到齐的 partition break 后停止发射，其余 partition 还堵在 pump 的
+  `gpu.sync()` 里等它的下一个 launch。任何"到齐后改纯等待"的协议都有这个洞。
+- **pump 不翻 parity**（关键坑）：plain decode 的不变量是"所有 running slot
+  的 KDA 态/conv 窗口住在 `self.parity` 侧"。pump 可能在本 rank 有活跃
+  slot 时跑；钉在当前 parity 上它只读 committed 侧、涂写 scratch 侧，下一
+  个真 step 会整行覆写。翻了 parity 就是把 decode 指向 token-0 垃圾态。
+- **decode 归属 owner**：owner 把 paged pool 按全局位置 stage（自己段走
+  step 的正常 latent append；上游段在 MLA exchange 时从拼好的 `mla_ctx`
+  经 `append_latent` 落 pool），epilogue 边界采样 + `adopt_row` 进 decode
+  slot——之后 decode 与普通 prefill 后完全一致，全本地，无 DIST_CTX。
+- 开关：`PEGAINFER_K3_CP`（须 = 本进程 local rank 数；fleet 上每进程自己
+  一个 gang，远端 EP rank 以 padding 陪跑；dspark 互斥）、
+  `PEGAINFER_K3_CP_MIN`（准入下限，默认 2048）。资格窗上限 = 每段 ≤
+  chunk_tokens（M0 单 chunk 约束）。
+- M0 gate 在 M0.5 executor 改动后复跑绿：16k rel_l2 2.52e-1（bar 0.386），
+  argmax/token 一致。serving 验证：512-token 探针 48 greedy token 连贯；
+  并发双请求 3 gang job 全执行、输出一致。
+
+**e2e HTTP 实测**（2026-08-24，tray14 pruned@EP4，同一 `bench_vllm_ttft.py`
+n=4 取 min，4 卡对 4 卡；CP 档用 `PEGAINFER_K3_CP_MIN=128` 全长度强制走
+gang——生产默认 2048 以下走本地）：
+
+| tokens | vLLM TP4 | 本引擎 CP1 | 本引擎 CP4 serving | CP4/CP1 | CP4 vs vLLM |
+|---|---|---|---|---|---|
+| 122 | 59 | 132 | 132（<128 不走 CP） | — | 0.45× |
+| 258 | 64 | 173 | 230 | 0.75× | 0.28× |
+| 494 | 76 | 182 | 238 | 0.76× | 0.32× |
+| 1014 | 251 | 258 | 258 | 1.00× | 0.97× |
+| 2004 | 251 | 420 | 307 | 1.37× | 0.82× |
+| 4131 | 321 | 774 | 417 | 1.86× | 0.77× |
+| 8083 | 595 | 1506 | 649 | 2.32× | 0.92× |
+| 16395 | **1181** | 3045 | **1161** | **2.62×** | **1.02×** |
+
+判读：CP4/CP1 交叉点 ~1k tokens（默认 `CP_MIN=2048` 合理）；16k 档 e2e
+**首次同口径压过 vLLM TP4**。中段（2–8k）落后主要吃在前端固定截距
+（我们 132 ms vs vLLM 59 ms）：剥离截距后 8k/16k 计算部分快 4–9%，
+4k 慢 ~9%。截距是下一个杠杆，不在 CP lane 范围内。
+
 ## Next action
 
-M0 已落地（见 §9）。**M0.5：CP prefill 接进 serving，拿真 HTTP e2e**——
-(a) gang 协调：长 prompt 触发全体 rank 走 `prefill_cp`（scheduler 是
-per-rank partition 自由跑，需要跨 partition 的 gang 招募）；(b) decode 归属
-末 CP rank：KDA 终态与 conv 窗口天然在它那，MLA 上游行在 CP 交换时顺手写进
-它的 pool（全局位置，~340 MB D2D），之后 decode 全本地，不需要 DIST_CTX；
-(c) 用同一份 bench 脚本重测 e2e 表。顺带查前端固定截距（我们 132 ms vs
-vLLM 59 ms @122 tokens）。然后 M1：full@EP16 交叉矩阵 + 系统 A/B（前置：
-mega world >4224、多 superstep 段游走）。
+16 卡对局（vLLM TP16 vs 本引擎 EP16 全量，CP1 与 CP4-per-process 两档，
+同脚本）——等 4-tray 窗口（占位 sbatch 已排队）。另：查前端固定截距（132 vs 59 ms @122
+tokens）；然后 M1：full@EP16 交叉矩阵 + 系统 A/B（前置：mega world
+>4224、多 superstep 段游走）。
