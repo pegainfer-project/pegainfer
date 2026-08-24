@@ -681,3 +681,59 @@ async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
         .expect("stats task exits on shutdown")
         .expect("stats publisher shuts down cleanly");
 }
+
+/// The scheduler holds running prefix-cache totals; the bridge must ship
+/// per-send DELTAS (like spec-decode), never the running total. Otherwise the
+/// frontend's `prefix_cache_*_total` counters re-add the whole history on every
+/// token batch and overcount until restart. Regression test for the P2 review
+/// on the prefix-cache counters.
+#[tokio::test]
+async fn prefix_cache_stats_are_per_interval_deltas_not_running_totals() {
+    let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics {
+        prefix_cache_queries: 100,
+        prefix_cache_hits: 37,
+        ..SchedulerMetrics::default()
+    });
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(publish_scheduler_stats(
+        0,
+        load_rx,
+        output_tx,
+        shutdown.clone(),
+    ));
+
+    // First publish diffs against zero: carries the whole cumulative.
+    let first = next_scheduler_stats(&mut output_rx).await;
+    let pc = first.prefix_cache_stats.base;
+    assert_eq!(pc.queries, 100, "first interval diffs against zero");
+    assert_eq!(pc.hits, 37);
+
+    // The running total doubles; the sent value must be the DELTA (100, 37),
+    // not the new running total (200, 74). This is the overcount bug.
+    load_tx.send_replace(SchedulerMetrics {
+        prefix_cache_queries: 200,
+        prefix_cache_hits: 74,
+        ..SchedulerMetrics::default()
+    });
+    let second = next_scheduler_stats(&mut output_rx).await;
+    let pc = second.prefix_cache_stats.base;
+    assert_eq!(pc.queries, 100, "second interval ships the delta, not 200");
+    assert_eq!(pc.hits, 37, "second interval ships the delta, not 74");
+
+    // No further change: an idle interval ships a zero delta (not a re-add).
+    load_tx.send_replace(SchedulerMetrics {
+        prefix_cache_queries: 200,
+        prefix_cache_hits: 74,
+        ..SchedulerMetrics::default()
+    });
+    let idle = next_scheduler_stats(&mut output_rx).await;
+    let pc = idle.prefix_cache_stats.base;
+    assert_eq!(pc.queries, 0, "unchanged interval ships a zero delta");
+    assert_eq!(pc.hits, 0);
+
+    shutdown.cancel();
+    task.await
+        .expect("stats task exits on shutdown")
+        .expect("stats publisher shuts down cleanly");
+}

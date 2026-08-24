@@ -245,8 +245,12 @@ pub(crate) struct Qwen3Scheduler<E: ModelExecutor> {
     /// Cumulative prefix-cache queries (one per admitted request that reached
     /// its first prefill chunk). Monotonic; reported verbatim in `SchedulerMetrics`.
     prefix_cache_queries: u64,
-    /// Cumulative prefix-cache hits, in tokens (sum of cached prefix lengths).
-    /// Monotonic; reported verbatim in `SchedulerMetrics`.
+    /// Cumulative prefix-cache hits, token-granularity (the total number of
+    /// queried prompt tokens that were already cached, summed across requests).
+    /// Same unit as `prefix_cache_queries`, so `hit_rate = hits/queries` ∈ [0, 1].
+    /// Monotonic; the bridge exports per-send deltas of this total (see
+    /// `scheduler_stats_from` / the stepped bridge) so Prometheus does not
+    /// re-add the running total on every token batch.
     prefix_cache_hits: u64,
 }
 
