@@ -23,12 +23,16 @@ use pegainfer_kernels::tensor::DeviceMatrix;
 
 use super::super::buffers::K3_CONV_STATE;
 use super::super::buffers::K3_KDA_FUSED;
+use super::super::buffers::K3_KDA_STATE;
 use super::super::buffers::K3_KDA_WSM_PADDED;
 use super::super::buffers::K3KdaState;
 use super::super::buffers::K3Scratch;
 use super::super::buffers::K3StatePool;
+use super::super::buffers::copy_rows;
 use super::super::buffers::copy_rows_2d;
 use super::super::buffers::parity_pair;
+use super::super::cp::K3CpScratch;
+use super::super::cp::k3_cp_copy_in;
 use super::super::paged_kv::K3_KV_PAGE_TOKENS;
 use super::super::paged_kv::K3_MLA_LATENT_ROW;
 use super::super::paged_kv::K3PagedKv;
@@ -72,6 +76,7 @@ pub(crate) fn k3_prefill_chunk_step(
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
     aux: Option<K3AuxSink<'_>>,
+    cp: Option<&mut K3CpScratch>,
 ) -> Result<()> {
     ensure!(
         (1..=shape.bucket).contains(&shape.live_rows),
@@ -87,6 +92,7 @@ pub(crate) fn k3_prefill_chunk_step(
         state,
         scratch,
         aux,
+        cp,
     )
 }
 
@@ -127,6 +133,7 @@ pub(crate) fn k3_verify_step(
         state,
         scratch,
         aux,
+        None,
     )
 }
 
@@ -231,6 +238,7 @@ pub(super) fn kda_attention_chunk(
     kda_state: &mut K3KdaState,
     groups: &[K3KdaGroup],
     s: &mut K3Scratch,
+    mut cp: Option<&mut K3CpScratch>,
 ) -> Result<()> {
     let b = shape.bucket;
     // Batched projections — the decode arm's launches, at the chunk's bucket.
@@ -287,6 +295,88 @@ pub(super) fn kda_attention_chunk(
         &mut s.out_gate,
     )?;
     k3_gemm_full(ctx, &w.w_f_b, &s.forget_low, b, &mut s.kda_forget_partial)?;
+
+    // CP conv halo: this segment's last normed rows go upstream-to-downstream
+    // so the next rank's first conv windows see them; the receiver projects
+    // them through the very bands above and lands them as its carried window.
+    if let Some(cp) = cp.as_deref_mut() {
+        ensure!(
+            groups.len() == 1
+                && groups[0].spec_rows == 0
+                && groups[0].commit_rows == shape.live_rows
+                && groups[0].state_row == 0,
+            "K3 CP prefill runs the one-group all-commit chunk"
+        );
+        if cp.cp_rank + 1 < cp.cp_size {
+            copy_rows_2d(
+                ctx,
+                &s.normed,
+                (shape.live_rows - K3_CONV_STATE) * K3_HIDDEN,
+                K3_HIDDEN,
+                &mut cp.normed_tail,
+                0,
+                K3_HIDDEN,
+                K3_CONV_STATE,
+                K3_HIDDEN,
+            )?;
+        }
+        let group = cp.group.clone();
+        group.exchange(ctx, || {
+            if cp.cp_rank > 0 {
+                let source = cp.peers[cp.cp_rank - 1].normed_tail;
+                k3_cp_copy_in(
+                    ctx,
+                    source,
+                    0,
+                    &mut cp.halo_normed,
+                    0,
+                    K3_CONV_STATE * K3_HIDDEN,
+                )?;
+            }
+            Ok(())
+        })?;
+        if cp.cp_rank > 0 {
+            // Bucket 4 is the narrowest compiled batch covering the
+            // K3_CONV_STATE halo rows; row 3 is zero padding, never copied out.
+            let halo_bucket = K3_CONV_STATE + 1;
+            for (stream_index, band) in [0usize, K3_ATTN_INNER, 2 * K3_ATTN_INNER]
+                .into_iter()
+                .enumerate()
+            {
+                k3_gemm_partial(
+                    ctx,
+                    &w.wbig,
+                    band,
+                    K3_ATTN_INNER,
+                    &cp.halo_normed,
+                    halo_bucket,
+                    &mut cp.halo_partial,
+                    K3PartialSpan::whole(K3_ATTN_INNER),
+                )?;
+                k3_land_batched_launch(
+                    ctx,
+                    halo_bucket,
+                    K3_ATTN_INNER,
+                    K3_ATTN_INNER,
+                    0,
+                    1,
+                    &cp.halo_partial,
+                    &mut cp.halo_xs,
+                )?;
+                copy_rows_2d(
+                    ctx,
+                    &cp.halo_xs,
+                    0,
+                    K3_ATTN_INNER,
+                    &mut kda_state.conv[shape.parity][stream_index],
+                    0,
+                    K3_ATTN_INNER,
+                    K3_CONV_STATE,
+                    K3_ATTN_INNER,
+                )?;
+            }
+        }
+    }
 
     kda_conv_stream_chunk(
         ctx,
@@ -357,44 +447,156 @@ pub(super) fn kda_attention_chunk(
         &s.kda_forget_partial,
         &mut s.kda_g,
     )?;
-    for group in groups {
-        let segments = [
-            (group.row, group.commit_rows, group.parity),
-            (
-                group.row + group.commit_rows,
-                group.spec_rows,
-                group.parity ^ usize::from(group.commit_rows > 0),
-            ),
-        ];
-        // A pure prefill chunk has no speculative tail; a first verify round
-        // after prefill has no commit prefix.
-        for (row, rows, read_parity) in segments.into_iter().filter(|segment| segment.1 > 0) {
-            let (recurrent_read, recurrent_write) =
-                parity_pair(&mut kda_state.recurrent, read_parity);
-            k3_flash_kda_fwd_launch(
-                ctx,
-                rows,
-                K3_HEADS,
-                pegainfer_kernels::ops::K3FlashKdaSpan {
-                    row,
-                    state_in_row: group.state_row,
-                    state_out_row: group.state_row,
-                },
-                &s.conv_q,
-                &s.conv_k,
-                &s.conv_v,
-                &s.kda_g,
-                &s.beta,
-                &mut s.kda_beta_t,
-                &w.a_log,
-                &w.dt_bias,
-                recurrent_read,
-                recurrent_write,
-                &mut s.kda_attn,
-                &mut s.flash_kda_ws,
-                (K3_HEAD_DIM as f32).powf(-0.5),
-                crate::config::K3_KDA_GATE_LOWER_BOUND as f32,
-            )?;
+    match cp {
+        None => {
+            for group in groups {
+                let segments = [
+                    (group.row, group.commit_rows, group.parity),
+                    (
+                        group.row + group.commit_rows,
+                        group.spec_rows,
+                        group.parity ^ usize::from(group.commit_rows > 0),
+                    ),
+                ];
+                // A pure prefill chunk has no speculative tail; a first verify
+                // round after prefill has no commit prefix.
+                for (row, rows, read_parity) in segments.into_iter().filter(|segment| segment.1 > 0)
+                {
+                    let (recurrent_read, recurrent_write) =
+                        parity_pair(&mut kda_state.recurrent, read_parity);
+                    k3_flash_kda_fwd_launch(
+                        ctx,
+                        rows,
+                        K3_HEADS,
+                        pegainfer_kernels::ops::K3FlashKdaSpan {
+                            row,
+                            state_in_row: group.state_row,
+                            state_out_row: group.state_row,
+                        },
+                        &s.conv_q,
+                        &s.conv_k,
+                        &s.conv_v,
+                        &s.kda_g,
+                        &s.beta,
+                        &mut s.kda_beta_t,
+                        &w.a_log,
+                        &w.dt_bias,
+                        recurrent_read,
+                        recurrent_write,
+                        &mut s.kda_attn,
+                        &mut s.flash_kda_ws,
+                        (K3_HEAD_DIM as f32).powf(-0.5),
+                        crate::config::K3_KDA_GATE_LOWER_BOUND as f32,
+                    )?;
+                }
+            }
+        }
+        Some(cp) => {
+            // KCP: the recurrence is affine in the state, so the segment is
+            // `S_out = M·S_in + D`. Export `(M, D)` by running the same
+            // forward with doctored operands (`v = 0` from identity gives
+            // `M`; real `v` from zero gives `D`), exchange, fold the
+            // upstream packages, and run the real forward from the true
+            // input state. Rank 0's real forward doubles as its package.
+            let group = groups[0];
+            let rows = shape.live_rows;
+            let scale = (K3_HEAD_DIM as f32).powf(-0.5);
+            let lower_bound = crate::config::K3_KDA_GATE_LOWER_BOUND as f32;
+            let K3Scratch {
+                conv_q,
+                conv_k,
+                conv_v,
+                kda_g,
+                beta,
+                kda_beta_t,
+                kda_attn,
+                flash_kda_ws,
+                ..
+            } = s;
+            let mut forward = |v: &CudaSlice<bf16>,
+                               state_in: &CudaSlice<f32>,
+                               state_out: &mut CudaSlice<f32>|
+             -> Result<()> {
+                k3_flash_kda_fwd_launch(
+                    ctx,
+                    rows,
+                    K3_HEADS,
+                    pegainfer_kernels::ops::K3FlashKdaSpan::default(),
+                    conv_q,
+                    conv_k,
+                    v,
+                    kda_g,
+                    beta,
+                    kda_beta_t,
+                    &w.a_log,
+                    &w.dt_bias,
+                    state_in,
+                    state_out,
+                    kda_attn,
+                    flash_kda_ws,
+                    scale,
+                    lower_bound,
+                )
+            };
+            if cp.cp_rank == 0 {
+                // The true initial state is the zeroed slab: one real forward
+                // is both the answer and the package (its final state IS
+                // `D_0`, and downstream never needs `M_0`).
+                let (recurrent_read, recurrent_write) =
+                    parity_pair(&mut kda_state.recurrent, group.parity);
+                forward(&*conv_v, recurrent_read, recurrent_write)?;
+                copy_rows(
+                    ctx,
+                    &kda_state.recurrent[group.parity ^ 1],
+                    0,
+                    &mut cp.kda_d,
+                    0,
+                    1,
+                    K3_KDA_STATE,
+                )?;
+            } else if cp.cp_rank + 1 < cp.cp_size {
+                forward(&cp.zero_v, &cp.identity, &mut cp.kda_m)?;
+                forward(&*conv_v, &cp.zero_state, &mut cp.kda_d)?;
+            }
+            let cp_group = cp.group.clone();
+            cp_group.exchange(ctx, || {
+                for j in 0..cp.cp_rank {
+                    k3_cp_copy_in(
+                        ctx,
+                        cp.peers[j].kda_d,
+                        0,
+                        &mut cp.recv_d,
+                        j * K3_KDA_STATE,
+                        K3_KDA_STATE,
+                    )?;
+                    if j > 0 {
+                        k3_cp_copy_in(
+                            ctx,
+                            cp.peers[j].kda_m,
+                            0,
+                            &mut cp.recv_m,
+                            j * K3_KDA_STATE,
+                            K3_KDA_STATE,
+                        )?;
+                    }
+                }
+                Ok(())
+            })?;
+            if cp.cp_rank > 0 {
+                let merged = cp.merge_upstream(ctx)?;
+                copy_rows(
+                    ctx,
+                    merged,
+                    0,
+                    &mut kda_state.recurrent[group.parity],
+                    0,
+                    1,
+                    K3_KDA_STATE,
+                )?;
+                let (recurrent_read, recurrent_write) =
+                    parity_pair(&mut kda_state.recurrent, group.parity);
+                forward(&*conv_v, recurrent_read, recurrent_write)?;
+            }
         }
     }
     // o_norm × output gate — the fused core's tail as its own batched launch;
@@ -566,6 +768,107 @@ pub(super) fn mla_attention_chunk_fmha(
         &mut s.mla_ctx_latent.data,
         &mut s.mla_ctx_rope,
     )?;
+    mla_chunk_attend(ctx, t_q, t_kv, w, s)
+}
+
+/// The CP variant of one chunk's MLA attention: the paged gather is replaced
+/// by assembly from the gang's published post-norm latents. Each rank
+/// publishes its own segment's `kv_norm`/`rope` rows, copies its upstream
+/// peers' rows into the context scratch at their global offsets, lands its
+/// own rows from local scratch, and runs the same bottom-right-aligned FMHA
+/// at `t_kv = seg_start + seg_len` — causality falls out of the alignment
+/// exactly as for a local chunk.
+pub(super) fn mla_attention_chunk_cp(
+    ctx: &DeviceContext,
+    shape: K3StepShape,
+    w: &K3MlaWeights,
+    s: &mut K3Scratch,
+    cp: &mut K3CpScratch,
+) -> Result<()> {
+    let t_q = shape.live_rows;
+    let t_kv = shape.chunk_start + t_q;
+    let (seg_start, seg_len) = cp.segments[cp.cp_rank];
+    ensure!(
+        seg_len == t_q && seg_start == shape.chunk_start,
+        "K3 CP MLA step shape ({}+{t_q}) disagrees with the rank's segment ({seg_start}+{seg_len})",
+        shape.chunk_start
+    );
+    copy_rows(
+        ctx,
+        &s.kv_norm,
+        0,
+        &mut cp.mla_latent_pub,
+        0,
+        t_q,
+        K3_KV_LORA_RANK,
+    )?;
+    copy_rows(
+        ctx,
+        &s.rope,
+        0,
+        &mut cp.mla_rope_pub,
+        0,
+        t_q,
+        crate::config::K3_QK_ROPE_HEAD_DIM,
+    )?;
+    let group = cp.group.clone();
+    group.exchange(ctx, || {
+        for j in 0..cp.cp_rank {
+            let (peer_start, peer_len) = cp.segments[j];
+            k3_cp_copy_in(
+                ctx,
+                cp.peers[j].mla_latent,
+                0,
+                &mut s.mla_ctx_latent.data,
+                peer_start * K3_KV_LORA_RANK,
+                peer_len * K3_KV_LORA_RANK,
+            )?;
+            k3_cp_copy_in(
+                ctx,
+                cp.peers[j].mla_rope,
+                0,
+                &mut s.mla_ctx_rope,
+                peer_start * crate::config::K3_QK_ROPE_HEAD_DIM,
+                peer_len * crate::config::K3_QK_ROPE_HEAD_DIM,
+            )?;
+        }
+        Ok(())
+    })?;
+    copy_rows(
+        ctx,
+        &s.kv_norm,
+        0,
+        &mut s.mla_ctx_latent.data,
+        seg_start,
+        t_q,
+        K3_KV_LORA_RANK,
+    )?;
+    copy_rows(
+        ctx,
+        &s.rope,
+        0,
+        &mut s.mla_ctx_rope,
+        seg_start,
+        t_q,
+        crate::config::K3_QK_ROPE_HEAD_DIM,
+    )?;
+    mla_chunk_attend(ctx, t_q, t_kv, w, s)
+}
+
+/// The shared tail of a chunk's MLA attention: kv_b expansion of the
+/// assembled `[t_kv]` context latents and one causal Q-at-the-end FMHA.
+fn mla_chunk_attend(
+    ctx: &DeviceContext,
+    t_q: usize,
+    t_kv: usize,
+    w: &K3MlaWeights,
+    s: &mut K3Scratch,
+) -> Result<()> {
+    ensure!(
+        t_kv * K3_KV_LORA_RANK <= s.mla_ctx_latent.data.len(),
+        "K3 MLA prefill workspace of {} tokens cannot span the {t_kv}-token context",
+        s.mla_ctx_latent.data.len() / K3_KV_LORA_RANK
+    );
     s.mla_ctx_latent.seq_len = t_kv;
     s.mla_ctx_nope_v.seq_len = t_kv;
     gemm_rows_into_checked(
