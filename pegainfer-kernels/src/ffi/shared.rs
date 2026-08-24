@@ -327,6 +327,16 @@ unsafe extern "C" {
         bs: i32,
         stream: CUstream,
     ) -> i32;
+    pub fn split_qkv_cuda(
+        qkv: *const Half,
+        q: *mut Half,
+        k: *mut Half,
+        v: *mut Half,
+        q_dim: i32,
+        kv_dim: i32,
+        tokens: i32,
+        stream: CUstream,
+    ) -> i32;
 
     pub fn cublas_init();
     pub fn cublas_activate_device_handles() -> i32;

@@ -25,6 +25,7 @@ use super::Qwen3Model;
 use super::TransformerBlock;
 use crate::config::Config;
 use crate::config::TensorParallelConfig;
+use crate::projection_fusion::select_decode_projection_path;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ModelRuntimeConfig {
@@ -33,6 +34,8 @@ pub(crate) struct ModelRuntimeConfig {
     pub(crate) device_ordinal: usize,
     pub(crate) max_loras: usize,
     pub(crate) max_lora_rank: usize,
+    pub(crate) decode_overlap: crate::DecodeOverlap,
+    pub(crate) dflash_enabled: bool,
 }
 
 impl Default for ModelRuntimeConfig {
@@ -43,6 +46,8 @@ impl Default for ModelRuntimeConfig {
             device_ordinal: 0,
             max_loras: crate::Qwen3LoraOptions::DEFAULT_MAX_LORAS,
             max_lora_rank: crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
+            decode_overlap: crate::DecodeOverlap::Off,
+            dflash_enabled: false,
         }
     }
 }
@@ -70,6 +75,29 @@ impl Qwen3Model {
         let config = Config::from_file(model_path)?;
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         tensor_parallel.validate_for(&config)?;
+        let (cc_major, cc_minor) = ctx.ctx.compute_capability()?;
+        let device_sm = cc_major * 10 + cc_minor;
+        let q_dim = config.local_q_dim(tensor_parallel);
+        let kv_dim = config.local_kv_dim(tensor_parallel);
+        let (decode_projection_path, decode_projection_reason) = select_decode_projection_path(
+            tensor_parallel,
+            pegainfer_kernels::ops::numeric_policy(),
+            runtime.decode_overlap,
+            runtime.dflash_enabled,
+            device_sm,
+            config.hidden_size,
+            q_dim,
+            kv_dim,
+            config.num_hidden_layers,
+        );
+        if tensor_parallel.rank == 0 {
+            info!(
+                "decode projection path: resolved={decode_projection_path:?}, \
+                 reason={decode_projection_reason}, sm={device_sm}, hidden={}, q_dim={q_dim}, \
+                 kv_dim={kv_dim}, layers={}",
+                config.hidden_size, config.num_hidden_layers
+            );
+        }
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
@@ -266,6 +294,7 @@ impl Qwen3Model {
             sin_cache,
             enable_cuda_graph: runtime.enable_cuda_graph,
             tensor_parallel,
+            decode_projection_path,
             tp_comm: None,
             lora_adapters: HashMap::new(),
             packed_lora: PackedLoraRegistry::empty(runtime.max_loras, num_hidden_layers),

@@ -12,6 +12,7 @@ use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::SpecDecodeCounters;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::spawn_scheduler;
 
@@ -29,6 +30,8 @@ pub struct SimulatedEngineConfig {
     /// Explicit completion token-id sequence to replay verbatim. Empty (the
     /// default) keeps the legacy behaviour of cycling the prompt tokens.
     scripted_completion: Vec<u32>,
+    /// A pretend drafter: `(K, accepted per verify step)`; `None` is no drafter.
+    spec_decode: Option<(usize, usize)>,
 }
 
 impl SimulatedEngineConfig {
@@ -57,7 +60,25 @@ impl SimulatedEngineConfig {
             tpot_ms,
             fallback_token_id,
             scripted_completion: Vec::new(),
+            spec_decode: None,
         })
+    }
+
+    /// Make every decode step a verify step, so the metrics path has a drafter
+    /// without a GPU or a checkpoint. Panics on a `K` past `MAX_SPEC_TOKENS`.
+    #[must_use]
+    pub fn with_speculative_decoding(
+        mut self,
+        num_spec_tokens: usize,
+        num_accepted: usize,
+    ) -> Self {
+        assert!(
+            num_accepted <= num_spec_tokens,
+            "a verify step cannot accept more draft tokens than it proposed"
+        );
+        SpecDecodeCounters::new(num_spec_tokens).expect("K within MAX_SPEC_TOKENS");
+        self.spec_decode = Some((num_spec_tokens, num_accepted));
+        self
     }
 
     /// Replay `ids` verbatim as the completion for every request
@@ -84,6 +105,7 @@ impl Default for SimulatedEngineConfig {
             tpot_ms: 12.0,
             fallback_token_id: 0,
             scripted_completion: Vec::new(),
+            spec_decode: None,
         }
     }
 }
@@ -120,6 +142,7 @@ struct SimScheduler {
     config: SimulatedEngineConfig,
     queued: Vec<QueuedRequest>,
     running: Vec<RunningRequest>,
+    spec_decode: Option<SpecDecodeCounters>,
 }
 
 struct RunningRequest {
@@ -133,10 +156,14 @@ struct RunningRequest {
 
 impl SimScheduler {
     fn new(config: SimulatedEngineConfig) -> Self {
+        let spec_decode = config
+            .spec_decode
+            .map(|(k, _)| SpecDecodeCounters::new(k).expect("K checked at config time"));
         Self {
             config,
             queued: Vec::new(),
             running: Vec::new(),
+            spec_decode,
         }
     }
 
@@ -212,6 +239,12 @@ impl Scheduler for SimScheduler {
                 Some(lp) => vec![Some(lp)],
                 None => Vec::new(),
             };
+            // Every decode step of a drafted engine is one verify step.
+            if let (Some(counters), Some((k, accepted))) =
+                (self.spec_decode.as_mut(), self.config.spec_decode)
+            {
+                counters.observe_draft(k, accepted);
+            }
             ledger.push_tokens(running.id, &[token], &logprobs);
             if running.pending.is_empty() {
                 ledger.finish(running.id, running.finish_reason);
@@ -229,6 +262,7 @@ impl Scheduler for SimScheduler {
         SchedulerMetrics {
             num_running_reqs: self.running.len() as u64,
             num_waiting_reqs: self.queued.len() as u64,
+            spec_decode: self.spec_decode,
             ..SchedulerMetrics::default()
         }
     }
