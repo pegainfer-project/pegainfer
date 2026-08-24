@@ -213,8 +213,9 @@ impl<E: StepExecutor> K3Scheduler<E> {
     }
 
     /// Fill free slots from the queue: retire what the frontend abandoned,
-    /// refuse what can never fit, prefill the rest.
-    fn admit_queued(&mut self, ledger: &mut RequestLedger) {
+    /// refuse what can never fit, prefill the rest. `Err` means a gang
+    /// prefill failed — never a local one, which is the request's problem.
+    fn admit_queued(&mut self, ledger: &mut RequestLedger) -> Result<()> {
         while !self.free_slots.is_empty() {
             let Some(pending) = self.queued.pop_front() else {
                 break;
@@ -239,26 +240,40 @@ impl<E: StepExecutor> K3Scheduler<E> {
                 .pop()
                 .expect("loop runs only while a slot is free");
             let first = match self.cp_gang_for(pending.request.prompt_tokens.len()) {
-                Some(gang) => gang.post_and_run(
-                    self.partition,
-                    slot,
-                    Arc::from(pending.request.prompt_tokens.as_slice()),
-                    &mut self.executor,
-                ),
-                None => self.executor.prefill(
-                    slot,
-                    &pending.request.prompt_tokens,
-                    &pending.request.params,
-                ),
-            };
-            let first = match first {
-                Ok(token) => token,
-                Err(error) => {
-                    // A prefill failure is this request's problem, not the
-                    // engine's: answer it and keep serving.
-                    self.release_slot(slot);
-                    ledger.fail(id, format!("{error:#}"));
-                    continue;
+                Some(gang) => {
+                    match gang.post_and_run(
+                        self.partition,
+                        slot,
+                        Arc::from(pending.request.prompt_tokens.as_slice()),
+                        &mut self.executor,
+                    ) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            // A gang failure is never per-request: this
+                            // partition may have left its peers mid-protocol,
+                            // so the engine is beyond use.
+                            self.release_slot(slot);
+                            ledger.fail(id, format!("{error:#}"));
+                            return Err(error);
+                        }
+                    }
+                }
+                None => {
+                    match self.executor.prefill(
+                        slot,
+                        &pending.request.prompt_tokens,
+                        &pending.request.params,
+                    ) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            // A local prefill failure is this request's
+                            // problem, not the engine's: answer it and keep
+                            // serving.
+                            self.release_slot(slot);
+                            ledger.fail(id, format!("{error:#}"));
+                            continue;
+                        }
+                    }
                 }
             };
             let state = RunningRequest {
@@ -282,6 +297,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
             }
             self.running.push(state);
         }
+        Ok(())
     }
 
     /// One decode step over every running request, minus the ones the
@@ -399,9 +415,10 @@ impl<E: StepExecutor> Scheduler for K3Scheduler<E> {
         // whole extra step time. A serve error propagates: this partition can
         // no longer hold up its end of the gang, so the engine is beyond use.
         self.serve_gang()?;
-        self.admit_queued(ledger);
+        self.admit_queued(ledger)?;
         self.decode_running(ledger);
-        // Prefill and decode failures are per-request and absorbed above.
+        // Local prefill and decode failures are per-request and absorbed
+        // above; gang failures propagate the same way a serve error does.
         Ok(())
     }
 

@@ -179,41 +179,46 @@ fn run_gang(lengths: &[usize], runs: usize) -> (RankReport, RankReport) {
     (first, last)
 }
 
-/// THE M0 gate: CP4 boundary logits match CP1 on one 16k prompt.
+/// THE M0 gate: CP4 boundary logits match CP1 at the 16k ceiling and one
+/// token under it — the odd length splits into unequal segments, which is
+/// what arbitrary serving prompts do (equal splits are the special case).
 #[test]
 #[ignore = "needs 4 GPUs and the 224-expert checkpoint"]
 fn cp4_prefill_matches_cp1() {
-    let len = std::env::var("PEGAINFER_K3_CP_PROMPT")
+    let ceiling = std::env::var("PEGAINFER_K3_CP_PROMPT")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or(MAX_CTX);
-    let (first, last) = run_gang(&[len], 1);
-    let (cp1_token, cp1_logits, cp1_seconds) = &first.cp1[0];
-    let (cp4_token, cp4_logits, cp4_seconds) = &last.cp4[0];
-    let rel = rel_l2(cp4_logits, cp1_logits);
-    let cp1_argmax = argmax(cp1_logits);
-    let cp4_argmax = argmax(cp4_logits);
-    println!(
-        "CP1 vs CP4 @ {len} tokens: rel_l2={rel:.3e}, argmax {cp1_argmax} vs {cp4_argmax}, \
-         sampled {cp1_token} vs {cp4_token}, wall {:.1} ms vs {:.1} ms",
-        cp1_seconds * 1e3,
-        cp4_seconds * 1e3,
-    );
-    let mut top: Vec<(usize, f32)> = cp1_logits.iter().copied().enumerate().collect();
-    top.sort_by(|a, b| b.1.total_cmp(&a.1));
-    for (id, value) in top.iter().take(5) {
+    let lengths = [ceiling, ceiling - 1];
+    let (first, last) = run_gang(&lengths, 1);
+    for (index, &len) in lengths.iter().enumerate() {
+        let (cp1_token, cp1_logits, cp1_seconds) = &first.cp1[index];
+        let (cp4_token, cp4_logits, cp4_seconds) = &last.cp4[index];
+        let rel = rel_l2(cp4_logits, cp1_logits);
+        let cp1_argmax = argmax(cp1_logits);
+        let cp4_argmax = argmax(cp4_logits);
         println!(
-            "  cp1 top: id {id} logit {value:.4} (cp4 {:.4})",
-            cp4_logits[*id]
+            "CP1 vs CP4 @ {len} tokens: rel_l2={rel:.3e}, argmax {cp1_argmax} vs {cp4_argmax}, \
+             sampled {cp1_token} vs {cp4_token}, wall {:.1} ms vs {:.1} ms",
+            cp1_seconds * 1e3,
+            cp4_seconds * 1e3,
+        );
+        let mut top: Vec<(usize, f32)> = cp1_logits.iter().copied().enumerate().collect();
+        top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (id, value) in top.iter().take(5) {
+            println!(
+                "  cp1 top: id {id} logit {value:.4} (cp4 {:.4})",
+                cp4_logits[*id]
+            );
+        }
+        assert_eq!(cp1_token, cp4_token, "boundary samples diverged @ {len}");
+        assert_eq!(cp1_argmax, cp4_argmax, "boundary argmax diverged @ {len}");
+        let bar = rel_l2_bar();
+        assert!(
+            rel < bar,
+            "CP4 boundary logits drifted {rel:.3e} from CP1 @ {len} (bar {bar:.3e})"
         );
     }
-    assert_eq!(cp1_token, cp4_token, "boundary samples diverged");
-    assert_eq!(cp1_argmax, cp4_argmax, "boundary argmax diverged");
-    let bar = rel_l2_bar();
-    assert!(
-        rel < bar,
-        "CP4 boundary logits drifted {rel:.3e} from CP1 (bar {bar:.3e})"
-    );
 }
 
 /// The crossover table: T_cp(4) vs T_cp(1) at the external vLLM baseline's

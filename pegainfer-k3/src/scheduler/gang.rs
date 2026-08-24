@@ -154,14 +154,16 @@ impl K3CpGang {
         self.run_jobs(partition, None, executor).map(|_| ())
     }
 
-    /// Run pending jobs in posting order until the board holds nothing for
-    /// this partition (or until `until` — the partition's own job — is done,
-    /// so a poster returns its token without dragging later jobs into its
-    /// admission). Returns the boundary token of `until`, when given.
+    /// Run this partition's pending jobs in posting order, up to a horizon:
+    /// `own` (the poster's just-posted job), or for a serving pass the last
+    /// job already on the board. Jobs posted while this runs wait for the
+    /// next pass — without the horizon a partition could be trapped serving
+    /// a stream of peers' postings while its own decode stalls. Returns the
+    /// boundary token of `own`, when given.
     fn run_jobs<E>(
         &self,
         partition: usize,
-        until: Option<u64>,
+        own: Option<u64>,
         executor: &mut E,
     ) -> Result<Option<u32>>
     where
@@ -169,13 +171,16 @@ impl K3CpGang {
     {
         let mut token = None;
         let mut board = self.board.lock().expect("gang board poisoned");
+        let Some(horizon) = own.or_else(|| board.jobs.last().map(|job| job.id)) else {
+            return Ok(None);
+        };
         // The lowest-id job this partition has not executed, each pass. Every
         // partition picks jobs this way, so the execution order is the
         // posting order everywhere.
         while let Some(id) = board
             .jobs
             .iter()
-            .find(|job| !job.executed[partition])
+            .find(|job| job.id <= horizon && !job.executed[partition])
             .map(|job| job.id)
         {
             // Level up: pump until every partition has checked in and this
@@ -201,13 +206,17 @@ impl K3CpGang {
                 job.entries[partition] = Some(count + 1);
                 drop(board);
                 executor.pump_step()?;
+                anyhow::ensure!(
+                    executor.step_count() > count,
+                    "pump_step did not advance the launch count; the gang cannot level"
+                );
                 board = self.board.lock().expect("gang board poisoned");
             }
             let job = board.job_mut(id);
             let prompt = job.prompt.clone();
             let cp_rank = self.cp_rank(partition, job.poster);
-            let own = job.poster == partition;
-            let slot = if own { job.slot } else { 0 };
+            let owner = job.poster == partition;
+            let slot = if owner { job.slot } else { 0 };
             drop(board);
             log::info!(
                 "K3 CP gang job {id}: partition {partition} computing as cp_rank {cp_rank} \
@@ -221,22 +230,14 @@ impl K3CpGang {
             // still serving the board must not find a permanently unrunnable
             // job wedging every later one.
             board = self.board.lock().expect("gang board poisoned");
-            let index = board
+            board.job_mut(id).executed[partition] = true;
+            board
                 .jobs
-                .iter()
-                .position(|job| job.id == id)
-                .expect("a job leaves the board only after everyone executed it");
-            board.jobs[index].executed[partition] = true;
-            if board.jobs[index].executed.iter().all(|&executed| executed) {
-                board.jobs.remove(index);
-            }
-            if own {
+                .retain(|job| !job.executed.iter().all(|&executed| executed));
+            if owner {
                 token = Some(sampled?.context("the owner's CP prefill returned no token")?);
             } else {
                 sampled?;
-            }
-            if until == Some(id) {
-                break;
             }
         }
         Ok(token)

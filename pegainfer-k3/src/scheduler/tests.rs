@@ -557,7 +557,15 @@ impl CpWorld {
     /// Launch one step as `partition` and wait for it to pair: blocks until
     /// every live peer has launched a step with the same index.
     fn step(&self, partition: usize) {
-        let count = self.counts[partition].fetch_add(1, Ordering::SeqCst) + 1;
+        self.burst(partition, 1);
+    }
+
+    /// Launch `n` steps back-to-back, waiting only for the last to pair —
+    /// the way a local multi-chunk prefill queues its whole ladder before
+    /// its one sync. This is the cross-partition skew the leveling loop
+    /// must absorb.
+    fn burst(&self, partition: usize, n: u64) {
+        let count = self.counts[partition].fetch_add(n, Ordering::SeqCst) + n;
         let deadline = Instant::now() + CP_TIMEOUT;
         loop {
             let paired = self.counts.iter().zip(&self.finished).all(|(peer, gone)| {
@@ -616,10 +624,13 @@ impl StepExecutor for FakeCpExecutor {
     }
 
     fn prefill(&mut self, _slot: SlotId, prompt: &[u32], _params: &SamplingParams) -> Result<u32> {
-        anyhow::bail!(
+        anyhow::ensure!(
+            prompt.len() < 32,
             "a CP-eligible prompt of {} tokens took the local prefill path",
             prompt.len()
-        )
+        );
+        self.world.burst(self.partition, 4);
+        Ok(500)
     }
 
     fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
@@ -768,6 +779,35 @@ fn concurrent_cp_posters_run_in_one_order_on_every_partition() {
             "partitions disagree on the job order: {orders:?}"
         );
     }
+
+    for (partition, _) in partitions.drain(..) {
+        drop(partition.handle);
+        partition.join.join().expect("scheduler thread exits");
+    }
+}
+
+#[test]
+fn a_local_prefill_burst_does_not_unlevel_the_gang() {
+    let (world, mut partitions) = launch_cp(3);
+
+    // Partition 0 runs a local multi-chunk prefill — a 4-launch burst that
+    // puts it several launches ahead — while partition 1 posts a gang job.
+    // The laggards must pump up to the burst's count before anyone computes.
+    let local = partitions[0].0.handle.submit(request(4, 1));
+    let gang = partitions[1].0.handle.submit(cp_request(5, 1));
+    let (tokens, _) = partitions[0].1.collect_terminal(local.id());
+    assert_eq!(tokens, vec![500]);
+    let (tokens, _) = partitions[1].1.collect_terminal(gang.id());
+    assert_eq!(tokens, vec![1005]);
+
+    let entries = world.entries.lock().expect("entry log");
+    let job = &entries[&5];
+    assert_eq!(job.len(), 3);
+    assert!(
+        job.iter().all(|&(_, count)| count == job[0].1),
+        "the gang entered unlevel across a local burst: {job:?}"
+    );
+    drop(entries);
 
     for (partition, _) in partitions.drain(..) {
         drop(partition.handle);

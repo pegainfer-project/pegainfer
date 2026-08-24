@@ -1388,12 +1388,14 @@ impl K3Executor {
         cp_rank: usize,
         segments: Vec<(usize, usize)>,
     ) -> Result<()> {
-        let seg_cap = k3_chunk_bucket(self.chunk_tokens)?;
-        let rebuild = match self.cp_scratch.as_ref() {
-            Some(scratch) => !Arc::ptr_eq(&scratch.group, group) || scratch.seg_cap() < seg_cap,
-            None => true,
-        };
-        if rebuild {
+        if let Some(scratch) = self.cp_scratch.as_ref() {
+            // One gang per process, one seg_cap per executor — the scratch
+            // built once serves every superstep.
+            ensure!(
+                Arc::ptr_eq(&scratch.group, group),
+                "K3 CP scratch was built for a different gang"
+            );
+        } else {
             for device in 0..group.cp_size() {
                 pegainfer_kernels::ops::k3_mega_open_peer_access(self.ctx.device_ordinal, device)
                     .with_context(|| {
@@ -1406,7 +1408,7 @@ impl K3Executor {
             self.cp_scratch = Some(Box::new(K3CpScratch::new(
                 &self.ctx,
                 group.clone(),
-                seg_cap,
+                k3_chunk_bucket(self.chunk_tokens)?,
             )?));
             // Live and zeroed before any peer learns the pointers.
             self.gpu.sync()?;
