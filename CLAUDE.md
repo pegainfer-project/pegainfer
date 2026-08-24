@@ -105,6 +105,12 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 ---
 
+# AI-Assisted Contributions
+
+AI-assisted PRs must be accountable and verifiable. Show that the work is not duplicated, name the production invariant being changed, and provide real evidence: production E2E for features and fixes, same-context A/B for performance, and model evals for output or accuracy changes. Every changed file must serve that invariant; remove unrelated cleanup, thin wrappers, generated scaffolding, and mock or source-text tests presented as production evidence.
+
+---
+
 # Team Documentation Workflow
 
 Collaboration centered on the `docs/` directory.
@@ -181,4 +187,4 @@ When a session wraps up:
 
 Commit messages use Commitizen format: `<type>(<scope>): <subject>`. Never commit directly to `main` — create a `feat/`/`fix/`/`chore/`/… branch first.
 
-Every commit must carry a DCO `Signed-off-by:` trailer (`git commit -s`, or `git rebase --signoff` to fix up a branch) — CI enforces it and rejects PRs without it. CI also runs `cargo fmt --check`; run `cargo fmt` before committing.
+CI runs `cargo fmt --check`; run `cargo fmt` before committing.
