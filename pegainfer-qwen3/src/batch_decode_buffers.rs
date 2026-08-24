@@ -17,8 +17,8 @@ use crate::split_kv::SplitKvConfig;
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
 /// Based on vLLM's CUDA Graph capture list up to 256. Activation buffers are shared
 /// at the largest size, but every captured `(bucket, attention path)` owns an
-/// independently resident graph executable. PerToken therefore retains graphs only
-/// through bucket 32.
+/// independently resident graph executable. The diagnostic PerToken policy
+/// therefore retains graphs only through bucket 32.
 ///
 /// Buckets 8/16 are viable only because decode GEMMs at N <= GEMM_LT_MAX_N run
 /// tuned cublasLt algos: cuBLAS's GemmEx heuristic skips split-K for batch in

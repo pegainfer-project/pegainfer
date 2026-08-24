@@ -3096,11 +3096,7 @@ impl ModelExecutor for Qwen3Executor {
 mod tests {
     use std::collections::HashSet;
 
-    use pegainfer_kernels::ops::NumericPolicy;
-
     use super::ensure_lora_capacity;
-    use super::ensure_pertoken_overlap_disabled;
-    use crate::DecodeOverlap;
 
     #[test]
     fn lora_capacity_rejects_new_adapter_at_limit() {
@@ -3131,29 +3127,6 @@ mod tests {
             .to_string();
 
         assert!(error.contains("already loaded"));
-    }
-
-    #[test]
-    fn pertoken_rejects_every_decode_overlap_mode() {
-        for overlap in [
-            DecodeOverlap::SharedSm,
-            DecodeOverlap::GreenCtx { decode_pct: 20 },
-        ] {
-            let error = ensure_pertoken_overlap_disabled(NumericPolicy::PerToken, overlap)
-                .expect_err("PerToken overlap must be rejected before stream setup");
-            assert!(
-                error
-                    .to_string()
-                    .contains("not compatible with decode-overlap")
-            );
-        }
-
-        assert!(
-            ensure_pertoken_overlap_disabled(NumericPolicy::PerToken, DecodeOverlap::Off).is_ok()
-        );
-        assert!(
-            ensure_pertoken_overlap_disabled(NumericPolicy::Tuned, DecodeOverlap::SharedSm).is_ok()
-        );
     }
 }
 

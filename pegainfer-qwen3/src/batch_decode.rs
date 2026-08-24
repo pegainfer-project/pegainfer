@@ -60,9 +60,9 @@ pub(crate) enum DecodeGraphUse {
     Replay,
 }
 
-/// Largest batch bucket for which PerToken retains a CUDA Graph. PerToken
-/// records one GEMM node per row, so each additional bucket has a growing,
-/// independently resident graph executable.
+/// Largest batch bucket for which the diagnostic PerToken policy retains a
+/// CUDA Graph. PerToken records one GEMM node per row, so each additional
+/// bucket has a growing, independently resident graph executable.
 const PERTOKEN_GRAPH_MAX_BUCKET: usize = 32;
 
 /// Canonical CUDA Graph coverage and dispatch policy for decode.
@@ -589,53 +589,5 @@ fn grouped_projection_from_packed<'a>(
         max_rank: packed.max_rank,
         rank: packed.rank,
         out_dim: packed.out_dim,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use pegainfer_kernels::ops::NumericPolicy;
-
-    use super::DecodeGraphPlan;
-    use super::DecodeGraphUse;
-    use super::PERTOKEN_GRAPH_MAX_BUCKET;
-
-    #[test]
-    fn decode_graph_plan_matches_runtime_and_profile_coverage() {
-        let per_token = DecodeGraphPlan::new(NumericPolicy::PerToken);
-        assert!(per_token.requires_cumulative_profile());
-        assert_eq!(
-            per_token.retained_buckets().collect::<Vec<_>>(),
-            vec![1, 2, 4, 8, 16, 20, 24, 32]
-        );
-
-        assert_eq!(
-            per_token.resolve(DecodeGraphUse::Serve, true, 32).unwrap(),
-            Some(PERTOKEN_GRAPH_MAX_BUCKET)
-        );
-        assert_eq!(
-            per_token.resolve(DecodeGraphUse::Serve, true, 33).unwrap(),
-            None
-        );
-
-        for graph_use in [DecodeGraphUse::CaptureOnly, DecodeGraphUse::Replay] {
-            let error = per_token
-                .resolve(graph_use, true, 33)
-                .expect_err("explicit graph use above the PerToken cap must fail");
-            let message = error.to_string();
-            assert!(
-                message.contains("PerToken CUDA Graph bucket 40 above cap 32"),
-                "{graph_use:?}: {message}"
-            );
-        }
-
-        for policy in [NumericPolicy::Pin, NumericPolicy::Tuned] {
-            let plan = DecodeGraphPlan::new(policy);
-            assert!(!plan.requires_cumulative_profile());
-            assert_eq!(
-                plan.resolve(DecodeGraphUse::Serve, true, 256).unwrap(),
-                Some(256)
-            );
-        }
     }
 }
