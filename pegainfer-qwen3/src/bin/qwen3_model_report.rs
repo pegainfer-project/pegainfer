@@ -503,6 +503,7 @@ fn measure_call(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
         "gemm" => measure_gemm(call, iters),
         "fused_add_rms_norm_batch" => measure_fused_add_rms_norm(call, iters),
         "silu_mul_fused_batch" => measure_silu_mul_fused(call, iters),
+        "split_qkv" => measure_split_qkv(call, iters),
         other => bail!("no benchmark provider for op `{other}`"),
     }
 }
@@ -608,6 +609,30 @@ fn measure_silu_mul_fused(call: &KernelCall, iters: u64) -> Result<LatencyStats>
     let mut out = HiddenStates::zeros(&ctx, inter, batch)?;
     measure_loop(&ctx, iters, || {
         ops::silu_mul_fused_batch_into(&ctx, &gate_up, &mut out)?;
+        Ok(())
+    })
+}
+
+fn measure_split_qkv(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let qkv = input(call, "qkv")?;
+    let q = output(call, "q")?;
+    let k = output(call, "k")?;
+    let v = output(call, "v")?;
+    let q_dim = axis(q, "q_dim")?;
+    let kv_dim = axis(k, "kv_dim")?;
+    let batch = axis(qkv, "batch")?;
+    anyhow::ensure!(axis(v, "kv_dim")? == kv_dim, "K/V dimensions must match");
+    anyhow::ensure!(
+        axis(qkv, "out_total")? == q_dim + 2 * kv_dim,
+        "QKV dimension must equal Q + 2*KV"
+    );
+    let ctx = DeviceContext::new()?;
+    let qkv = HiddenStates::zeros(&ctx, q_dim + 2 * kv_dim, batch)?;
+    let mut q = HiddenStates::zeros(&ctx, q_dim, batch)?;
+    let mut k = HiddenStates::zeros(&ctx, kv_dim, batch)?;
+    let mut v = HiddenStates::zeros(&ctx, kv_dim, batch)?;
+    measure_loop(&ctx, iters, || {
+        ops::split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)?;
         Ok(())
     })
 }

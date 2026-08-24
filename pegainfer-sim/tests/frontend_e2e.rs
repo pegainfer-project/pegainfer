@@ -20,6 +20,11 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const MODEL_NAME: &str = "pegainfer-sim-e2e";
 const METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-metrics";
 const SLOW_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-slow-metrics";
+const SPEC_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-spec-metrics";
+/// The pretend drafter the spec-metrics server runs: `K` and how many of those
+/// draft tokens each verify step accepts.
+const SPEC_K: usize = 3;
+const SPEC_ACCEPTED: usize = 2;
 const SERVER_START_ATTEMPTS: usize = 5;
 
 struct SimServer {
@@ -41,6 +46,19 @@ impl SimServer {
             2,
             METRICS_MODEL_NAME,
             SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?,
+        )
+        .await
+    }
+
+    /// A single engine whose every decode step is a verify step, so the
+    /// stepped bridge has spec-decode counters to stamp onto its batches.
+    async fn spawn_with_drafter() -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir_with_minimal_metadata()?,
+            1,
+            SPEC_METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?
+                .with_speculative_decoding(SPEC_K, SPEC_ACCEPTED),
         )
         .await
     }
@@ -226,6 +244,104 @@ async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> 
         &server.model_name,
     )
     .await?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stepped_bridge_reports_spec_decode_counters_to_prometheus() -> Result<()> {
+    // One verify step per decode step, so the totals are the drafter's shape
+    // times the tokens generated: 4 drafts, 4 x 3 = 12 proposed, 4 x 2 = 8
+    // accepted, and positions 0 and 1 credited every step.
+    const SPEC_MAX_TOKENS: usize = 4;
+
+    let server = SimServer::spawn_with_drafter().await?;
+    let client = test_client()?;
+
+    let body = json!({
+        "model": server.model_name,
+        "prompt": [1, 2],
+        "max_tokens": SPEC_MAX_TOKENS,
+        "temperature": 0.0,
+        "ignore_eos": true,
+    });
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let drafts = SPEC_MAX_TOKENS as f64;
+    // `_total` is appended at exposition; the registered name scrapes empty.
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:spec_decode_num_drafts_total", "0", drafts),
+            (
+                "vllm:spec_decode_num_draft_tokens_total",
+                "0",
+                drafts * SPEC_K as f64,
+            ),
+            (
+                "vllm:spec_decode_num_accepted_tokens_total",
+                "0",
+                drafts * SPEC_ACCEPTED as f64,
+            ),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    wait_for_labeled_metrics(
+        &client,
+        &server.base_url,
+        &[
+            (
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "0",
+                &[("position", "0")][..],
+                drafts,
+            ),
+            (
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "0",
+                &[("position", "1")][..],
+                drafts,
+            ),
+            (
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "0",
+                &[("position", "2")][..],
+                0.0,
+            ),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    // Exposition is one series per draft slot the drafter has, so the fixed
+    // `MAX_SPEC_TOKENS` array width must not leak past `K`.
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let leaked: Vec<_> = metrics
+        .lines()
+        .filter(|line| {
+            line.contains(&format!("model_name=\"{}\"", server.model_name))
+                && line.contains(&format!("position=\"{SPEC_K}\""))
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "per-position series past K={SPEC_K} were exposed: {leaked:?}"
+    );
 
     server.shutdown().await
 }

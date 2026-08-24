@@ -128,7 +128,7 @@ impl Qwen3Model {
         let attention_path =
             BatchDecodeBuffers::attention_path(padded_bs, bufs.policy_at_construction);
         #[cfg(feature = "kernel-call-trace")]
-        let trace_kv_len = kv_views.iter().map(|v| v.seq_len()).max().unwrap_or(0);
+        let trace_kv_len = kv_views.iter().map(KvView::seq_len).max().unwrap_or(0);
         if use_cuda_graph {
             let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
             let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
@@ -256,36 +256,54 @@ impl Qwen3Model {
         use_lora: bool,
         bufs: &mut BatchDecodeBuffers,
     ) -> Result<()> {
-        // Match prefill numerics: compute Q/K/V via row-sliced GEMMs instead of
-        // fused qkv GEMM + deinterleave. The fused path is mathematically
-        // equivalent but diverges enough under shard-local TP to flip greedy
-        // decode in parity tests.
         let q_dim = layer.attention.q_dim;
         let kv_dim = layer.attention.kv_dim;
-        dag.gemm_rows::<QDim>(
-            dag_label!(format!("L{layer_idx}.attn.q_proj")),
-            &layer.attention.qkv_proj,
-            0,
-            q_dim,
-            &bufs.normed,
-            &mut bufs.q,
-        );
-        dag.gemm_rows::<KvDim>(
-            dag_label!(format!("L{layer_idx}.attn.k_proj")),
-            &layer.attention.qkv_proj,
-            q_dim,
-            kv_dim,
-            &bufs.normed,
-            &mut bufs.k,
-        );
-        dag.gemm_rows::<KvDim>(
-            dag_label!(format!("L{layer_idx}.attn.v_proj")),
-            &layer.attention.qkv_proj,
-            q_dim + kv_dim,
-            kv_dim,
-            &bufs.normed,
-            &mut bufs.v,
-        );
+        let fused_qkv = self.fused_decode_qkv();
+        if fused_qkv {
+            let qkv_out = bufs
+                .qkv_out
+                .as_mut()
+                .expect("fused QKV plan requires qkv_out");
+            dag.qkv_proj(
+                dag_label!(format!("L{layer_idx}.attn.qkv_proj")),
+                &layer.attention.qkv_proj,
+                &bufs.normed,
+                qkv_out,
+            );
+            dag.split_qkv(
+                dag_label!(format!("L{layer_idx}.attn.split_qkv")),
+                qkv_out,
+                &mut bufs.q,
+                &mut bufs.k,
+                &mut bufs.v,
+            )?;
+        } else {
+            // The split path is the numerical baseline retained by #75.
+            dag.gemm_rows::<QDim>(
+                dag_label!(format!("L{layer_idx}.attn.q_proj")),
+                &layer.attention.qkv_proj,
+                0,
+                q_dim,
+                &bufs.normed,
+                &mut bufs.q,
+            );
+            dag.gemm_rows::<KvDim>(
+                dag_label!(format!("L{layer_idx}.attn.k_proj")),
+                &layer.attention.qkv_proj,
+                q_dim,
+                kv_dim,
+                &bufs.normed,
+                &mut bufs.k,
+            );
+            dag.gemm_rows::<KvDim>(
+                dag_label!(format!("L{layer_idx}.attn.v_proj")),
+                &layer.attention.qkv_proj,
+                q_dim + kv_dim,
+                kv_dim,
+                &bufs.normed,
+                &mut bufs.v,
+            );
+        }
         self.apply_decode_lora_projection_group3(
             layer_idx,
             LoraProjectionKind::Q,
@@ -346,7 +364,6 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        // MLP: split gate/up GEMMs → silu_mul → down GEMM
         dag.mlp_gate_proj(
             dag_label!(format!("L{layer_idx}.mlp.gate_proj")),
             &layer.mlp.gate_up_proj,

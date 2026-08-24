@@ -792,6 +792,106 @@ pub fn silu_mul_fused_batch_into(
     Ok(())
 }
 
+/// Split contiguous `[Q; K; V]` projection output into compact Q/K/V tensors.
+///
+/// This is a BF16 bitwise copy. The checked shape boundary matters because a
+/// wrong local TP dimension would otherwise corrupt the following attention
+/// buffers and surface only at a later CUDA call.
+pub fn split_qkv_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    q: &mut HiddenStates,
+    k: &mut HiddenStates,
+    v: &mut HiddenStates,
+) -> Result<()> {
+    anyhow::ensure!(
+        q.hidden_dim > 0 && k.hidden_dim > 0 && qkv.seq_len > 0,
+        "split_qkv requires non-empty Q, KV, and token dimensions; got q_dim={}, kv_dim={}, tokens={}",
+        q.hidden_dim,
+        k.hidden_dim,
+        qkv.seq_len
+    );
+    anyhow::ensure!(
+        k.hidden_dim == v.hidden_dim,
+        "K/V dimensions must match: k_dim={}, v_dim={}",
+        k.hidden_dim,
+        v.hidden_dim
+    );
+    anyhow::ensure!(
+        qkv.hidden_dim == q.hidden_dim + k.hidden_dim + v.hidden_dim,
+        "QKV input dimension {} must equal Q + K + V ({} + {} + {})",
+        qkv.hidden_dim,
+        q.hidden_dim,
+        k.hidden_dim,
+        v.hidden_dim
+    );
+    anyhow::ensure!(
+        qkv.seq_len == q.seq_len,
+        "QKV/Q token count mismatch: qkv={}, q={}",
+        qkv.seq_len,
+        q.seq_len
+    );
+    anyhow::ensure!(
+        qkv.seq_len == k.seq_len,
+        "QKV/K token count mismatch: qkv={}, k={}",
+        qkv.seq_len,
+        k.seq_len
+    );
+    anyhow::ensure!(
+        qkv.seq_len == v.seq_len,
+        "QKV/V token count mismatch: qkv={}, v={}",
+        qkv.seq_len,
+        v.seq_len
+    );
+
+    let q_dim = i32::try_from(q.hidden_dim)
+        .map_err(|_| anyhow!("Q dimension {} exceeds i32", q.hidden_dim))?;
+    let kv_dim = i32::try_from(k.hidden_dim)
+        .map_err(|_| anyhow!("KV dimension {} exceeds i32", k.hidden_dim))?;
+    let tokens = i32::try_from(qkv.seq_len)
+        .map_err(|_| anyhow!("QKV token count {} exceeds i32", qkv.seq_len))?;
+    i32::try_from(qkv.hidden_dim)
+        .map_err(|_| anyhow!("QKV dimension {} exceeds i32", qkv.hidden_dim))?;
+    i32::try_from(
+        qkv.hidden_dim
+            .checked_mul(qkv.seq_len)
+            .ok_or_else(|| anyhow!("QKV element count overflow"))?,
+    )
+    .map_err(|_| {
+        anyhow!(
+            "QKV element count {}×{} exceeds CUDA kernel i32 indexing",
+            qkv.hidden_dim,
+            qkv.seq_len
+        )
+    })?;
+
+    let (qkv_ptr, _gqkv) = qkv.data.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (v_ptr, _gv) = v.data.device_ptr_mut(&ctx.stream);
+    let status = unsafe {
+        ffi::split_qkv_cuda(
+            qkv_ptr as *const ffi::Half,
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            v_ptr as *mut ffi::Half,
+            q_dim,
+            kv_dim,
+            tokens,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if status != 0 {
+        return Err(anyhow!(
+            "split_qkv CUDA launch failed: cuda_status={status}, q_dim={}, kv_dim={}, tokens={}",
+            q.hidden_dim,
+            k.hidden_dim,
+            qkv.seq_len
+        ));
+    }
+    Ok(())
+}
+
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)
 pub fn extract_vec(
     ctx: &DeviceContext,
@@ -970,7 +1070,6 @@ mod tests {
     use half::bf16;
 
     use super::*;
-    use crate::tensor::DeviceMatrix;
 
     fn hidden_from_host(
         ctx: &DeviceContext,
@@ -989,6 +1088,21 @@ mod tests {
         let host = ctx.stream.clone_dtoh(&hidden.data)?;
         ctx.sync()?;
         Ok(host)
+    }
+
+    fn assert_bf16_bits_eq(actual: &[bf16], expected: &[bf16], context: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{context}: element count mismatch"
+        );
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "{context}: BF16 bits mismatch at index {index}"
+            );
+        }
     }
 
     #[test]
@@ -1039,52 +1153,66 @@ mod tests {
     }
 
     #[test]
-    fn vstacked_gate_up_gemm_matches_split_mlp_projection() -> Result<()> {
+    fn split_qkv_is_a_bitwise_copy_for_tp_shapes_and_tails() -> Result<()> {
         let ctx = DeviceContext::new()?;
-        let hidden_dim = 2;
-        let intermediate = 4;
-        let seq_len = 3;
+        for (q_dim, kv_dim, tokens) in [
+            // Qwen3-4B/8B production decode geometry at the largest target batch.
+            (4096, 1024, 8),
+            // Deliberately not aligned to the 256-thread launch width.
+            (5, 3, 7),
+        ] {
+            let qkv_dim = q_dim + 2 * kv_dim;
+            let source: Vec<_> = (0..qkv_dim * tokens)
+                .map(|idx| bf16::from_bits((idx as u16).wrapping_mul(977).wrapping_add(13)))
+                .collect();
+            let qkv = hidden_from_host(&ctx, &source, qkv_dim, tokens)?;
+            let mut q = HiddenStates::zeros(&ctx, q_dim, tokens)?;
+            let mut k = HiddenStates::zeros(&ctx, kv_dim, tokens)?;
+            let mut v = HiddenStates::zeros(&ctx, kv_dim, tokens)?;
 
-        let gate_w: Vec<_> = [1.0, -0.5, -2.0, 0.25, 0.75, 1.5, -1.25, -0.75]
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect();
-        let up_w: Vec<_> = [-0.25, 2.0, 1.25, -1.0, 0.5, 0.75, -1.5, 1.0]
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect();
-        let input: Vec<_> = [0.5, -1.0, 2.0, 0.25, -0.75, 1.5]
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect();
+            split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)?;
 
-        let gate_w = DeviceMatrix::from_host(&ctx, &gate_w, intermediate, hidden_dim)?;
-        let up_w = DeviceMatrix::from_host(&ctx, &up_w, intermediate, hidden_dim)?;
-        let gate_up_w = DeviceMatrix::vstack(&ctx, &[&gate_w, &up_w])?;
-        let input = hidden_from_host(&ctx, &input, hidden_dim, seq_len)?;
-
-        let gate = crate::ops::gemm(&ctx, &gate_w, &input)?;
-        let up = crate::ops::gemm(&ctx, &up_w, &input)?;
-        let split = silu_mul_batch(&ctx, &gate, &up)?;
-
-        let gate_up = crate::ops::gemm(&ctx, &gate_up_w, &input)?;
-        let mut fused = HiddenStates::zeros(&ctx, intermediate, seq_len)?;
-        silu_mul_fused_batch_into(&ctx, &gate_up, &mut fused)?;
-
-        let split_host = hidden_to_host(&ctx, &split)?;
-        let fused_host = hidden_to_host(&ctx, &fused)?;
-        assert_eq!(split_host.len(), fused_host.len());
-        for (idx, (split_value, fused_value)) in
-            split_host.iter().zip(fused_host.iter()).enumerate()
-        {
-            let split_f32 = split_value.to_f32();
-            let fused_f32 = fused_value.to_f32();
-            let diff = (split_f32 - fused_f32).abs();
-            assert!(
-                diff <= 0.02,
-                "vstacked gate_up GEMM mismatch at index {idx}: split={split_f32} fused={fused_f32} diff={diff}"
-            );
+            let q_host = hidden_to_host(&ctx, &q)?;
+            let k_host = hidden_to_host(&ctx, &k)?;
+            let v_host = hidden_to_host(&ctx, &v)?;
+            for token in 0..tokens {
+                let src = token * qkv_dim;
+                let q_start = token * q_dim;
+                let kv_start = token * kv_dim;
+                assert_bf16_bits_eq(
+                    &q_host[q_start..q_start + q_dim],
+                    &source[src..src + q_dim],
+                    &format!("Q q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+                assert_bf16_bits_eq(
+                    &k_host[kv_start..kv_start + kv_dim],
+                    &source[src + q_dim..src + q_dim + kv_dim],
+                    &format!("K q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+                assert_bf16_bits_eq(
+                    &v_host[kv_start..kv_start + kv_dim],
+                    &source[src + q_dim + kv_dim..src + qkv_dim],
+                    &format!("V q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn split_qkv_rejects_mismatched_shapes_without_launching() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let qkv = HiddenStates::zeros(&ctx, 12, 1)?;
+        let mut q = HiddenStates::zeros(&ctx, 5, 1)?;
+        let mut k = HiddenStates::zeros(&ctx, 3, 1)?;
+        let mut v = HiddenStates::zeros(&ctx, 3, 1)?;
+
+        let error = split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)
+            .expect_err("mismatched QKV dimensions must fail before launch");
+        assert!(
+            error.to_string().contains("must equal Q + K + V"),
+            "unexpected shape error: {error:#}"
+        );
         Ok(())
     }
 

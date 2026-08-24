@@ -15,6 +15,7 @@ pub mod model_line;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use lora::fixtures as lora_fixtures;
 mod prefill;
+mod projection_fusion;
 mod scheduler;
 mod speculative;
 mod split_kv;

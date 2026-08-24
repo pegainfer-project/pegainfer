@@ -37,6 +37,7 @@ use pegainfer_kernels::tensor::AxisTag;
 use pegainfer_kernels::tensor::Hidden;
 use pegainfer_kernels::tensor::InDim;
 use pegainfer_kernels::tensor::Intermediate;
+use pegainfer_kernels::tensor::OutTotal;
 use pegainfer_kernels::tensor::QDim;
 use pegainfer_kernels::tensor::Vocab;
 
@@ -229,6 +230,34 @@ impl<'a> BatchDecodeDag<'a> {
             self.model.config.head_dim,
             self.model.config.rms_norm_eps,
         )
+    }
+
+    pub(crate) fn qkv_proj(
+        &self,
+        label: DagLabel,
+        weight: &DeviceMatrix,
+        x: &HiddenStates,
+        out: &mut HiddenStates,
+    ) {
+        self.gemm::<OutTotal, Hidden>(label, weight, x, out);
+    }
+
+    pub(crate) fn split_qkv(
+        &self,
+        label: DagLabel,
+        qkv: &HiddenStates,
+        q: &mut HiddenStates,
+        k: &mut HiddenStates,
+        v: &mut HiddenStates,
+    ) -> Result<()> {
+        #[cfg(feature = "kernel-call-trace")]
+        Self::record(call_spec::split_qkv_call(
+            label,
+            q.hidden_dim,
+            k.hidden_dim,
+            qkv.seq_len,
+        ));
+        pegainfer_kernels::ops::split_qkv_into(&self.model.ctx, qkv, q, k, v)
     }
 
     pub(crate) fn paged_decode_attention(

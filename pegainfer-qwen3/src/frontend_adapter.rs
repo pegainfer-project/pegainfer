@@ -94,7 +94,7 @@ pub(crate) fn start_qwen3(
     dflash_draft_model_path: Option<&str>,
     dump_graph_png: Option<&Path>,
 ) -> Result<Engine> {
-    let mut executor = Qwen3Executor::from_runtime_with_lora_options(
+    let mut executor = Qwen3Executor::from_runtime_with_decode_environment(
         model_path,
         enable_cuda_graph,
         device_ordinals,
@@ -103,6 +103,7 @@ pub(crate) fn start_qwen3(
         max_prefill_tokens,
         dflash_draft_model_path,
         memory_options,
+        decode_overlap,
     )?;
     if let Some(path) = dump_graph_png {
         let summary = executor.dump_decode_graph_png(path)?;

@@ -32,11 +32,13 @@ use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
 use zeromq::ZmqMessage;
 use zeromq::prelude::SocketRecv;
 
 use super::BridgeLink;
+use super::SpecDecodeTracker;
 use super::connect_link;
 use super::engine_output;
 use super::now_secs_f64;
@@ -76,6 +78,7 @@ impl SteppedEngineBridge {
             .scheduler
             .take_steps()
             .context("partition step stream already taken")?;
+        let mut spec = SpecDecodeTracker::default();
         // Stats are pull-at-send: no push task, the load cell is read when a
         // batch goes out (and once here, so the frontend's gauges initialize
         // before any traffic). An idle engine publishes nothing.
@@ -98,7 +101,7 @@ impl SteppedEngineBridge {
             &output_tx,
             RequestBatchOutputs {
                 engine_index: self.engine_index,
-                scheduler_stats: Some(Box::new(scheduler_stats_from(&self.scheduler.metrics()))),
+                scheduler_stats: Some(Box::new(self.stats(&mut spec))),
                 timestamp: now_secs_f64(),
                 ..Default::default()
             }
@@ -141,6 +144,7 @@ impl SteppedEngineBridge {
                         &anchor,
                         &mut streams,
                         &mut names,
+                        &mut spec,
                         &output_tx,
                     ) {
                         break Err(error).context("failed to dispatch local engine step");
@@ -176,12 +180,22 @@ impl SteppedEngineBridge {
         run_result
     }
 
+    /// Stats for an outgoing batch; the spec delta runs from the last batch
+    /// stamped, not the last step run.
+    fn stats(&self, spec: &mut SpecDecodeTracker) -> SchedulerStats {
+        let snapshot = self.scheduler.metrics();
+        let mut stats = scheduler_stats_from(&snapshot);
+        stats.spec_decoding_stats = spec.interval(&snapshot);
+        stats
+    }
+
     fn dispatch_step(
         &self,
         step: StepOutputs,
         anchor: &UnixAnchor,
         streams: &mut HashMap<RequestId, SteppedStream>,
         names: &mut HashMap<String, RequestId>,
+        spec: &mut SpecDecodeTracker,
         output_tx: &tokio::sync::mpsc::UnboundedSender<
             vllm_engine_core_client::protocol::output::EngineCoreOutputs,
         >,
@@ -209,6 +223,21 @@ impl SteppedEngineBridge {
         }
 
         if outputs.is_empty() {
+            // A drafted step with no batch to ride would strand its increment
+            // until the next batch, which may never come.
+            let stats = self.stats(spec);
+            if stats.spec_decoding_stats.is_some() {
+                send_outputs(
+                    output_tx,
+                    RequestBatchOutputs {
+                        engine_index: self.engine_index,
+                        scheduler_stats: Some(Box::new(stats)),
+                        timestamp: now_secs_f64(),
+                        ..Default::default()
+                    }
+                    .into(),
+                )?;
+            }
             return Ok(());
         }
         // The cell already holds this step's snapshot (the driver publishes
@@ -221,7 +250,7 @@ impl SteppedEngineBridge {
                 engine_index: self.engine_index,
                 outputs,
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
-                scheduler_stats: Some(Box::new(scheduler_stats_from(&self.scheduler.metrics()))),
+                scheduler_stats: Some(Box::new(self.stats(spec))),
                 timestamp: now_secs_f64(),
             }
             .into(),

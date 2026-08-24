@@ -624,6 +624,30 @@ fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> Spe
     }
 }
 
+#[derive(Default)]
+pub(crate) struct SpecDecodeTracker {
+    last: SpecDecodeCounters,
+}
+
+impl SpecDecodeTracker {
+    /// The delta to stamp on the next outgoing batch, or `None` when nothing
+    /// drafted. Advances the baseline, so a caller that declines to send after
+    /// calling this drops only a no-op interval.
+    pub(crate) fn interval(&mut self, snapshot: &SchedulerMetrics) -> Option<SpecDecodingStats> {
+        let Some(cur) = &snapshot.spec_decode else {
+            // Reset so a drafter loaded later diffs from zero.
+            self.last = SpecDecodeCounters::default();
+            return None;
+        };
+        let delta = spec_decode_delta(&self.last, cur);
+        self.last = *cur;
+        // A zero-draft interval would divide by zero in the frontend's
+        // acceptance-rate log, and every counter moves only inside
+        // `observe_draft`, so dropping it loses nothing.
+        (delta.num_drafts > 0).then_some(delta)
+    }
+}
+
 /// Forward every scheduler load snapshot as a stats-only output batch; the
 /// frontend records it into the shared Prometheus registry. Sends the current
 /// snapshot up front so the gauges initialize before the first step, then one
@@ -636,23 +660,11 @@ async fn publish_scheduler_stats(
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let mut last_spec = SpecDecodeCounters::default();
+    let mut spec = SpecDecodeTracker::default();
     loop {
         let snapshot = *load_rx.borrow_and_update();
-        let spec_decoding_stats = if let Some(cur) = &snapshot.spec_decode {
-            let delta = spec_decode_delta(&last_spec, cur);
-            last_spec = *cur;
-            // A zero-draft interval would divide by zero in the frontend's
-            // acceptance-rate log, and every counter moves only inside
-            // `observe_draft`, so dropping it loses nothing.
-            (delta.num_drafts > 0).then_some(delta)
-        } else {
-            // Reset so a drafter loaded later diffs from zero
-            last_spec = SpecDecodeCounters::default();
-            None
-        };
         let mut stats = scheduler_stats_from(&snapshot);
-        stats.spec_decoding_stats = spec_decoding_stats;
+        stats.spec_decoding_stats = spec.interval(&snapshot);
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),
