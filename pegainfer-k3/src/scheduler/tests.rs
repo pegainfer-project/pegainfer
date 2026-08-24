@@ -535,7 +535,11 @@ const CP_TIMEOUT: Duration = Duration::from_secs(10);
 struct CpWorld {
     counts: Vec<AtomicU64>,
     /// Partitions whose scheduler thread has exited (executor dropped) — a
-    /// gone peer no longer holds back anyone's step pairing.
+    /// gone peer no longer holds back anyone's step pairing. This is where
+    /// the model is kinder than the device: a real EP rank that stops
+    /// launching wedges its peers in the mega kernel until the watchdog
+    /// fires. The flag only lets the *teardown* of a passed test drain;
+    /// while a test runs, every live partition must keep pairing.
     finished: Vec<AtomicBool>,
     /// Per job (keyed by the prompt's first token): each partition's launch
     /// count on entering `prefill_cp`.
