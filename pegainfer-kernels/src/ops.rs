@@ -144,6 +144,7 @@ pub use linear::gemm_per_token;
 pub use linear::gemm_rows_into;
 pub use linear::gemm_rows_into_checked;
 pub use linear::gemm_strided_batched_bf16;
+pub use linear::gemm_strided_batched_f32;
 pub use linear::gemm_token_range_into_checked;
 pub use linear::gemv;
 pub use linear::linear;

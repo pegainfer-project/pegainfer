@@ -276,6 +276,28 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    /// cuBLAS `cublasGemmStridedBatchedEx` (f32 in/out, f32 compute). `beta`
+    /// selects overwrite (0.0) vs accumulate-into-C (1.0).
+    pub fn gemm_strided_batched_f32_cuda(
+        op_a: i32,
+        op_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const f32,
+        lda: i32,
+        stride_a: i64,
+        b: *const f32,
+        ldb: i32,
+        stride_b: i64,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn gemm_bf16_f32_cuda(
         op_a: i32,
         op_b: i32,
