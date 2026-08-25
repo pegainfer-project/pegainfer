@@ -178,6 +178,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `subsystems/frontend/startup-time.md` | Qwen3-4B warm startup-to-ready: frontend tokenizer load runs concurrently with the engine load (HTTP still binds only after the engine registers); mmap teardown is paid at the end of load since #377; pinned-staging upload (2026-07) cuts warm ready 5.22s → 4.66s on sm_89, and the remaining floor is the engine's own post-load startup work. |
 | `subsystems/frontend/prometheus-metrics.md` | `/metrics` request histograms work for every model; Qwen3, Qwen3.5, and GLM5.2 schedulers also publish running/waiting/KV engine gauges through `LoadSnapshot` watches. |
 | `subsystems/frontend/dashboards/README.md` | Grafana 10.4-validated dashboard for PegaInfer's live `/metrics` surface: HTTP traffic, request outcomes, scheduler/KV state, token throughput, and request latency. |
+| `subsystems/frontend/bump-vllm-crates.md` | Bumped `vllm-*` to `d3e2888c`. Mac sim 3200/c=320 0-fail; steady-state req/s flat at 402. |
 
 ## subsystems / correctness
 

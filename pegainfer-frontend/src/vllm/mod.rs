@@ -358,6 +358,7 @@ where
             output_address,
             engine_start_index: 0,
             engine_count,
+            data_parallel_size: engine_count,
             // The in-process bridge registers once the engine future resolves,
             // so this bounds the whole engine load (multi-GPU MoE models take
             // minutes, cold starts longer). Load *failure* already cancels the
@@ -366,6 +367,7 @@ where
         },
         coordinator_mode: CoordinatorMode::None,
         model: model_id,
+        generation_config: Default::default(),
         served_model_name,
         listener_mode: HttpListenerMode::BindTcp { host, port },
         tool_call_parser: ParserSelection::default(),
@@ -373,6 +375,7 @@ where
         renderer: RendererSelection::default(),
         chat_template: None,
         default_chat_template_kwargs: None,
+        limit_mm_per_prompt: Default::default(),
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         max_logprobs: None,
         language_model_only: true,
