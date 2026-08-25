@@ -595,12 +595,26 @@ cap 到均值所在 bucket（attention 是 varlen，cap 内仍按深度配平）
 期议题）。剩余对理想 8× 的缺口 = 850ms 截距 + bucket 内 padding + causal
 残余不均衡，留 profile 期。
 
+⑥ **whale CP8@128k 首次 nsys 剖析**（2026-08-25，全账
+`~/code/bench_results/2026-08-25-k3-whale-cp16-smoke/` README 末节）：tray09
+上 BIN wrapper `nsys --delay 150 --duration 90 --kill=none`，窗口内探针命中。
+128k superstep wall 6,233ms（锁步全程）：**FMHA 35.8%**（深位 rank 2,230ms）
+> mega MoE 19.8%（1,237ms，含双侧配对等待）> dense GEMM 15.5% > elementwise
+10.4% > KDA 4.2%，kernel 间隙 6.7%。深/中位 rank 的 fmha+mega 之和相等
+（~3,470ms）——mega 等待吸收了 attention 深度不均衡，真 MoE 算量 ≲1.2s。
+Amdahl 账：CP1 的 MoE 墙钟与 CP8 同额（mega dispatch 本就全 EP 宽，与 CP 无
+关）≈1.26s → 128k 理论顶 = 32/8+1.26 ≈ 5.3s = **6.4×**；实测扣截距 6.0× =
+顶的 93%。剩余 7% 有了名字：**128k 均值 16k 正好顶 16896 bucket cap，
+leveling 被钳成等长切分，深位 attention ≈ 均摊 1.6×** → 下一刀 = FMHA
+条带化配段。扣除 MoE 的极限即 CP 宽度本身（非 MoE 家族完美缩放，CP4 已证、
+本次未推翻）；CP16@EP16 验收配置推演顶 ≈ 12–13×@128k。
+
 ## Next action
 
 256k 单 superstep 门禁只差机器：需 CP16（16×16896=270k 盖 256k，CP8 上限
 135k），而 tray14 在重启窗口被第三方 NeMo LoRA 抢走，2026-08-25 时点全集群无
 第 4 台空 tray（监视器在轮询）。拿到机器即跑 256k 门禁（ctx=262144 batch=1，
 已验证 armed 无 OOM）→ **验收：full 896@EP16 对 vLLM TP16-MNNVL 重赛
-8k/16k/64k/256k**。EP16 全量下 19.6 GiB slab 的 HBM 账实测。次优先：whale
-固定截距 ~850ms 剖析（slack/armed decode-only/前端合账）、FMHA 条带化配段、
-KDA 包 prefix-scan（profile 后决定）。
+8k/16k/64k/256k**。EP16 全量下 19.6 GiB slab 的 HBM 账实测。次优先（whale
+剖析 ⑥ 定序）：FMHA 条带化配段（剩余 7% 缺口的主项）、固定截距 ~850ms
+剖析（slack/armed decode-only/前端合账）、KDA 包 prefix-scan。
