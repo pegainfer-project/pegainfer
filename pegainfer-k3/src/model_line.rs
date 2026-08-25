@@ -24,6 +24,7 @@ use crate::config::K3_LAYERS;
 use crate::config::K3_SUPPORTED_ROUTED_EXPERTS;
 use crate::executor::K3Executor;
 use crate::executor::K3ExecutorConfig;
+use crate::executor::cp::K3_WHALE_SEGMENT_FLOOR;
 use crate::executor::cp::K3CpGroup;
 use crate::executor::ep::K3EpRendezvous;
 use crate::scheduler::K3CpGang;
@@ -330,13 +331,9 @@ impl ModelLine for K3Line {
             ep_size,
             ranks.clone(),
             dspark_armed,
+            cp.is_some(),
             chunk_tokens,
         )?;
-        anyhow::ensure!(
-            cp.is_none() || whale.is_none(),
-            "PEGAINFER_K3_CP and PEGAINFER_K3_WHALE are exclusive: the in-process gang and the \
-             fleet whale lane coordinate the same superstep"
-        );
         Ok(LaunchedEngine::Stepped(
             crate::scheduler::start_with_executors(
                 executors,
@@ -354,8 +351,8 @@ impl ModelLine for K3Line {
 /// Arm the fleet whale lane from `PEGAINFER_K3_WHALE` (the rendezvous
 /// address — the process hosting global rank 0 binds it and runs the
 /// sequencer, everyone else connects) and `PEGAINFER_K3_WHALE_MIN` (admission
-/// floor in prompt tokens, default 4096 — twice the fleet segment floor, the
-/// narrowest prompt a width-2 gang can serve).
+/// floor in prompt tokens, at least twice [`K3_WHALE_SEGMENT_FLOOR`] — the
+/// narrowest prompt a width-2 gang can serve — which is also the default).
 ///
 /// Arming stands the whole data plane up before any engine steps: every
 /// local rank allocates its fabric slab, the hub's startup exchange moves the
@@ -368,6 +365,7 @@ fn whale_serving(
     world: usize,
     ranks: std::ops::Range<usize>,
     dspark_armed: bool,
+    cp_armed: bool,
     chunk_tokens: usize,
 ) -> anyhow::Result<Option<K3WhaleServing>> {
     let Some(raw) = std::env::var_os("PEGAINFER_K3_WHALE") else {
@@ -379,25 +377,42 @@ fn whale_serving(
         "PEGAINFER_K3_WHALE does not compose with the dspark draft lane yet; disarm one of them"
     );
     anyhow::ensure!(
+        !cp_armed,
+        "PEGAINFER_K3_CP and PEGAINFER_K3_WHALE are exclusive: the in-process gang and the fleet \
+         whale lane coordinate the same superstep"
+    );
+    anyhow::ensure!(
         world >= 2,
         "PEGAINFER_K3_WHALE needs an EP world of at least two ranks; a whale gang is never \
          narrower than two"
     );
+    let narrowest = 2 * K3_WHALE_SEGMENT_FLOOR;
     let min_tokens = match std::env::var_os("PEGAINFER_K3_WHALE_MIN") {
-        None => 4096,
+        None => narrowest,
         Some(raw) => {
             let raw = raw.to_string_lossy();
             raw.parse()
                 .ok()
-                .filter(|&min| min > 0)
-                .with_context(|| format!("PEGAINFER_K3_WHALE_MIN={raw} is not a token count"))?
+                .filter(|&min| min >= narrowest)
+                .with_context(|| {
+                    format!(
+                        "PEGAINFER_K3_WHALE_MIN={raw} must be a token count of at least \
+                         {narrowest} — no gang serves a shorter prompt"
+                    )
+                })?
         }
     };
     let arm_started = Instant::now();
-    let slabs = executors
+    let armed = executors
         .iter_mut()
         .map(|executor| executor.arm_whale_slab(world))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let slabs: Vec<_> = armed.iter().map(|&(_, wire)| wire).collect();
+    let local: Vec<(usize, u64)> = armed
+        .iter()
+        .enumerate()
+        .map(|(offset, &(base, _))| (ranks.start + offset, base))
+        .collect();
     let slabs_armed = Instant::now();
     let (hub, table) = if ranks.start == 0 {
         TcpWhaleHub::host(&addr, world, chunk_tokens, 0, ranks.len(), slabs)
@@ -407,16 +422,6 @@ fn whale_serving(
             .context("join the K3 whale hub")?
     };
     let world_exchanged = Instant::now();
-    let local: Vec<(usize, u64)> = executors
-        .iter()
-        .enumerate()
-        .map(|(offset, executor)| {
-            (
-                ranks.start + offset,
-                executor.whale_slab_base().expect("armed above"),
-            )
-        })
-        .collect();
     let bases = executors[0].import_whale_world(&table, &local)?;
     for executor in executors.iter_mut() {
         executor.install_whale_gang(bases.clone())?;

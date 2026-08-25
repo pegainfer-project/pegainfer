@@ -609,12 +609,18 @@ impl CpWorld {
     }
 }
 
-/// One partition of the fake world. Every stepping method launches through
+/// One partition of the fake world, serving whichever lane the test armed
+/// (CP gang or whale). Every stepping method launches through
 /// [`CpWorld::step`], so the scheduler's own cadence (decode padding, gang
 /// pumps, the chunk step) is what drives the pairing.
 struct FakeCpExecutor {
     world: Arc<CpWorld>,
+    /// Per-whale role log; stays empty when only the CP lane is armed.
+    roles: WhaleRoles,
     partition: usize,
+    /// The armed lane's admission floor: a prompt at or past it taking the
+    /// plain local prefill path is the failure under test.
+    local_floor: usize,
 }
 
 impl Drop for FakeCpExecutor {
@@ -629,13 +635,13 @@ impl StepExecutor for FakeCpExecutor {
     }
 
     fn max_context_tokens(&self) -> usize {
-        4096
+        65536
     }
 
     fn prefill(&mut self, _slot: SlotId, prompt: &[u32], _params: &SamplingParams) -> Result<u32> {
         anyhow::ensure!(
-            prompt.len() < 32,
-            "a CP-eligible prompt of {} tokens took the local prefill path",
+            prompt.len() < self.local_floor,
+            "a gang-eligible prompt of {} tokens took the local prefill path",
             prompt.len()
         );
         self.world.burst(self.partition, 4);
@@ -668,6 +674,31 @@ impl StepExecutor for FakeCpExecutor {
         Ok((cp_rank == group.cp_size() - 1).then_some(1000 + key))
     }
 
+    fn prefill_whale(
+        &mut self,
+        whale: &CommittedWhale,
+        slot: Option<SlotId>,
+    ) -> Result<Option<u32>> {
+        let key = whale.descriptor.prompt[0];
+        {
+            let mut entries = self.world.entries.lock().expect("entry log");
+            entries.entry(key).or_default().push((
+                self.partition,
+                self.world.counts[self.partition].load(Ordering::SeqCst),
+            ));
+            self.world.orders.lock().expect("order log")[self.partition].push(key);
+            self.roles
+                .lock()
+                .expect("role log")
+                .entry(key)
+                .or_default()
+                .push((self.partition, whale.cp_rank, slot.is_some()));
+        }
+        self.world.await_gang(key, whale.descriptor.gang.len());
+        self.world.step(self.partition);
+        Ok(slot.map(|_| 2000 + key))
+    }
+
     fn pump_step(&mut self) -> Result<()> {
         self.world.step(self.partition);
         Ok(())
@@ -686,7 +717,9 @@ fn launch_cp(size: usize) -> (Arc<CpWorld>, Vec<(LiveScheduler, StepCollector)>)
     let executors = (0..size)
         .map(|partition| FakeCpExecutor {
             world: Arc::clone(&world),
+            roles: Arc::default(),
             partition,
+            local_floor: 32,
         })
         .collect();
     let config = K3SchedulerConfig {
@@ -753,10 +786,7 @@ fn cp_gang_enters_prefill_cp_at_one_launch_count() {
         "the gang must enter prefill_cp at one launch count: {job:?}"
     );
 
-    for (partition, _) in partitions.drain(..) {
-        drop(partition.handle);
-        partition.join.join().expect("scheduler thread exits");
-    }
+    drain_partitions(partitions);
 }
 
 #[test]
@@ -790,10 +820,7 @@ fn concurrent_cp_posters_run_in_one_order_on_every_partition() {
         );
     }
 
-    for (partition, _) in partitions.drain(..) {
-        drop(partition.handle);
-        partition.join.join().expect("scheduler thread exits");
-    }
+    drain_partitions(partitions);
 }
 
 #[test]
@@ -819,20 +846,15 @@ fn a_local_prefill_burst_does_not_unlevel_the_gang() {
     );
     drop(entries);
 
-    for (partition, _) in partitions.drain(..) {
-        drop(partition.handle);
-        partition.join.join().expect("scheduler thread exits");
-    }
+    drain_partitions(partitions);
 }
 
 // ── The whale lane ──────────────────────────────────────────────────────
 //
-// Same fake world as the CP gang — the launch counts and their pairing are
-// the physics under test — but coordination runs through the whale
-// rendezvous ([`super::whale`]) over a [`LocalWhaleHub`], the in-process
-// degenerate fleet. What these pin: a committed whale enters `prefill_whale`
-// on every gang member at one launch count, non-members never hear of it,
-// and concurrent whales serialize. The cancel → local-fallback path has no
+// Same fake world and executor as the CP gang — the launch counts and their
+// pairing are the physics under test — but coordination runs through the
+// whale rendezvous ([`super::whale`]) over a [`LocalWhaleHub`], the
+// in-process degenerate fleet. The cancel → local-fallback path has no
 // in-process trigger (the poster's eligibility check and the sequencer's
 // admission are the same deterministic predicate, and gather timeouts live
 // in the TCP hub), so it is pinned at the state-machine level in
@@ -844,77 +866,6 @@ const WHALE_MIN: usize = 2048;
 /// Per whale (keyed by the prompt's first token): each member's view on
 /// entry — partition, CP rank, and whether it owns the result slot.
 type WhaleRoles = Arc<Mutex<HashMap<u32, Vec<(usize, usize, bool)>>>>;
-
-/// One partition of the fake fleet. Pacing (launch counts, pairing, the
-/// entry/order logs) reuses [`CpWorld`]; `roles` records what only the whale
-/// lane decides.
-struct FakeWhaleExecutor {
-    world: Arc<CpWorld>,
-    roles: WhaleRoles,
-    partition: usize,
-}
-
-impl Drop for FakeWhaleExecutor {
-    fn drop(&mut self) {
-        self.world.finished[self.partition].store(true, Ordering::SeqCst);
-    }
-}
-
-impl StepExecutor for FakeWhaleExecutor {
-    fn max_batch(&self) -> usize {
-        2
-    }
-
-    fn max_context_tokens(&self) -> usize {
-        65536
-    }
-
-    fn prefill(&mut self, _slot: SlotId, prompt: &[u32], _params: &SamplingParams) -> Result<u32> {
-        anyhow::ensure!(
-            prompt.len() < WHALE_MIN,
-            "a whale-eligible prompt of {} tokens took the local prefill path",
-            prompt.len()
-        );
-        self.world.burst(self.partition, 4);
-        Ok(500)
-    }
-
-    fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
-        self.world.step(self.partition);
-        Ok(vec![7; batch.len()])
-    }
-
-    fn prefill_whale(
-        &mut self,
-        whale: &CommittedWhale,
-        slot: Option<SlotId>,
-    ) -> Result<Option<u32>> {
-        let key = whale.descriptor.prompt[0];
-        {
-            let mut entries = self.world.entries.lock().expect("entry log");
-            entries.entry(key).or_default().push((
-                self.partition,
-                self.world.counts[self.partition].load(Ordering::SeqCst),
-            ));
-            self.world.orders.lock().expect("order log")[self.partition].push(key);
-            self.roles
-                .lock()
-                .expect("role log")
-                .entry(key)
-                .or_default()
-                .push((self.partition, whale.cp_rank, slot.is_some()));
-        }
-        self.world.await_gang(key, whale.descriptor.gang.len());
-        self.world.step(self.partition);
-        Ok(slot.map(|_| 2000 + key))
-    }
-
-    fn step_count(&self) -> u64 {
-        self.world.counts[self.partition].load(Ordering::SeqCst)
-    }
-
-    fn release(&mut self, _slot: SlotId) {}
-}
 
 /// A `size`-partition engine over one fake world, whale lane armed through a
 /// local hub (`world == size`, global rank == partition).
@@ -928,10 +879,11 @@ fn launch_whale(
     let world = CpWorld::new(size);
     let roles: WhaleRoles = Arc::default();
     let executors = (0..size)
-        .map(|partition| FakeWhaleExecutor {
+        .map(|partition| FakeCpExecutor {
             world: Arc::clone(&world),
             roles: Arc::clone(&roles),
             partition,
+            local_floor: WHALE_MIN,
         })
         .collect();
     let config = K3SchedulerConfig {
@@ -969,8 +921,9 @@ fn whale_request(key: u32, prompt_len: usize, max_tokens: usize) -> Request {
     }
 }
 
-fn drain_partitions(mut partitions: Vec<(LiveScheduler, StepCollector)>) {
-    for (partition, _) in partitions.drain(..) {
+/// Tear the engine down: drop every handle and join the scheduler threads.
+fn drain_partitions(partitions: Vec<(LiveScheduler, StepCollector)>) {
+    for (partition, _) in partitions {
         drop(partition.handle);
         partition.join.join().expect("scheduler thread exits");
     }

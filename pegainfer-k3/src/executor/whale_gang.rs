@@ -41,6 +41,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::sys as cu_sys;
+use half::bf16;
 use pegainfer_kernels::ops::K3_MEGA_FABRIC_HANDLE_BYTES;
 use pegainfer_kernels::ops::k3_mega_fabric_slab_alloc;
 use pegainfer_kernels::ops::k3_mega_fabric_slab_import;
@@ -100,11 +101,11 @@ impl K3WhaleSlabLayout {
         };
         let publish_inbox = region(world * K3_WHALE_ALIGN);
         let consume_inbox = region(world * K3_WHALE_ALIGN);
-        let normed_tail = region(K3_CONV_STATE * K3_HIDDEN * 2);
-        let kda_m = region(K3_KDA_STATE * 4);
-        let kda_d = region(K3_KDA_STATE * 4);
-        let mla_latent = region(seg_cap * K3_KV_LORA_RANK * 2);
-        let mla_rope = region(seg_cap * K3_QK_ROPE_HEAD_DIM * 2);
+        let normed_tail = region(K3_CONV_STATE * K3_HIDDEN * size_of::<bf16>());
+        let kda_m = region(K3_KDA_STATE * size_of::<f32>());
+        let kda_d = region(K3_KDA_STATE * size_of::<f32>());
+        let mla_latent = region(seg_cap * K3_KV_LORA_RANK * size_of::<bf16>());
+        let mla_rope = region(seg_cap * K3_QK_ROPE_HEAD_DIM * size_of::<bf16>());
         Self {
             publish_inbox,
             consume_inbox,
@@ -162,7 +163,6 @@ pub(crate) fn k3_whale_slab_alloc(
 /// hub's slab exchange; process-lifetime, like the mega slabs (a whale fleet
 /// dies together).
 pub(crate) struct K3WhaleGang {
-    world: usize,
     /// This executor's global rank — where peers ring my doorbells.
     rank: usize,
     layout: K3WhaleSlabLayout,
@@ -226,7 +226,6 @@ impl K3WhaleGang {
             "K3 whale slab table has an unmapped rank"
         );
         Ok(Self {
-            world: bases.len(),
             rank,
             layout,
             bases,
@@ -234,7 +233,7 @@ impl K3WhaleGang {
     }
 
     pub(crate) fn world(&self) -> usize {
-        self.world
+        self.bases.len()
     }
 
     pub(crate) fn rank(&self) -> usize {
@@ -242,7 +241,7 @@ impl K3WhaleGang {
     }
 
     /// This rank's own slab base — where its publish buffers are carved.
-    pub(crate) fn my_base(&self) -> u64 {
+    fn my_base(&self) -> u64 {
         self.bases[self.rank]
     }
 
@@ -251,9 +250,9 @@ impl K3WhaleGang {
     /// doorbells, never on events.
     pub(crate) fn peer_ptrs(&self, rank: usize) -> Result<K3CpPeerPtrs> {
         ensure!(
-            rank < self.world,
+            rank < self.bases.len(),
             "K3 whale peer rank {rank} outside the {} world",
-            self.world
+            self.bases.len()
         );
         let base = self.bases[rank];
         Ok(K3CpPeerPtrs {
@@ -280,27 +279,20 @@ impl K3WhaleGang {
     /// One exchange window over the fabric — the four-beat protocol of
     /// [`super::cp::K3CpGroup::exchange`] with doorbells for events. `gang`
     /// is the whale's global ranks in CP order and `cp_rank` this rank's
-    /// position in it; `consume` issues this rank's reads of peer buffers on
-    /// its own stream. Entirely stream-ordered: the host enqueues and
-    /// returns, and every wait is a `cuStreamWaitValue64` on this rank's own
-    /// slab.
+    /// position in it (both validated when the superstep armed); `consume`
+    /// issues this rank's reads of peer buffers on its own stream. Entirely
+    /// stream-ordered: the host enqueues and returns, and every wait is a
+    /// `cuStreamWaitValue64` on this rank's own slab.
     pub(crate) fn exchange(
         &self,
         ctx: &DeviceContext,
         cp_rank: usize,
         kind: K3CpWindowKind,
         gang: &[usize],
-        value: u64,
+        doorbell: u64,
         consume: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let cp_size = gang.len();
-        ensure!(cp_rank < cp_size, "K3 whale CP rank {cp_rank} of {cp_size}");
-        ensure!(
-            gang[cp_rank] == self.rank,
-            "K3 whale gang seats rank {} at CP position {cp_rank}, but this executor is rank {}",
-            gang[cp_rank],
-            self.rank
-        );
         let my_base = self.my_base();
         // Beat 1: announce my publication to every rank that reads it, in one
         // ring. The kernel's system fence releases my preceding stream work,
@@ -313,13 +305,13 @@ impl K3WhaleGang {
             })
             .collect();
         if !publish_flags.is_empty() {
-            k3_whale_doorbell_ring(&publish_flags, value, active_cu_stream(ctx))
+            k3_whale_doorbell_ring(&publish_flags, doorbell, active_cu_stream(ctx))
                 .context("K3 whale publish doorbell ring")?;
         }
         // Beat 2: wait for every publication I read this window.
         for source in kind.reads_from(cp_rank) {
             let flag = self.layout.publish_flag(my_base, gang[source]);
-            stream_wait_value(ctx, flag, value).context("K3 whale publish doorbell wait")?;
+            stream_wait_value(ctx, flag, doorbell).context("K3 whale publish doorbell wait")?;
         }
         // Beat 3: enqueue my reads, then acknowledge them to their owners.
         consume()?;
@@ -331,14 +323,14 @@ impl K3WhaleGang {
             })
             .collect();
         if !consume_flags.is_empty() {
-            k3_whale_doorbell_ring(&consume_flags, value, active_cu_stream(ctx))
+            k3_whale_doorbell_ring(&consume_flags, doorbell, active_cu_stream(ctx))
                 .context("K3 whale consume doorbell ring")?;
         }
         // Beat 4: wait for my readers, so my next window's publish writes
         // cannot overwrite what a peer is still reading.
         for reader in kind.read_by(cp_rank, cp_size) {
             let flag = self.layout.consume_flag(my_base, gang[reader]);
-            stream_wait_value(ctx, flag, value).context("K3 whale consume doorbell wait")?;
+            stream_wait_value(ctx, flag, doorbell).context("K3 whale consume doorbell wait")?;
         }
         Ok(())
     }
@@ -374,11 +366,20 @@ mod tests {
         let regions = [
             (layout.publish_inbox, world * K3_WHALE_ALIGN),
             (layout.consume_inbox, world * K3_WHALE_ALIGN),
-            (layout.normed_tail, K3_CONV_STATE * K3_HIDDEN * 2),
-            (layout.kda_m, K3_KDA_STATE * 4),
-            (layout.kda_d, K3_KDA_STATE * 4),
-            (layout.mla_latent, seg_cap * K3_KV_LORA_RANK * 2),
-            (layout.mla_rope, seg_cap * K3_QK_ROPE_HEAD_DIM * 2),
+            (
+                layout.normed_tail,
+                K3_CONV_STATE * K3_HIDDEN * size_of::<bf16>(),
+            ),
+            (layout.kda_m, K3_KDA_STATE * size_of::<f32>()),
+            (layout.kda_d, K3_KDA_STATE * size_of::<f32>()),
+            (
+                layout.mla_latent,
+                seg_cap * K3_KV_LORA_RANK * size_of::<bf16>(),
+            ),
+            (
+                layout.mla_rope,
+                seg_cap * K3_QK_ROPE_HEAD_DIM * size_of::<bf16>(),
+            ),
         ];
         for (offset, _) in regions {
             assert_eq!(offset % K3_WHALE_ALIGN, 0, "unaligned region at {offset}");
@@ -431,19 +432,27 @@ mod tests {
     }
 
     #[test]
-    fn flag_slots_are_one_line_apart_per_source_rank() {
+    fn flag_slots_are_aligned_and_one_line_apart() {
         let layout = K3WhaleSlabLayout::new(4, 4224);
         let base = 1 << 20;
-        for from in 0..4 {
-            let publish = layout.publish_flag(base, from);
-            let consume = layout.consume_flag(base, from);
-            assert_eq!(publish % 8, 0);
-            assert_eq!(consume % 8, 0);
-            assert_eq!(
-                publish,
-                base + layout.publish_inbox as u64 + (from * K3_WHALE_ALIGN) as u64
+        let flags: Vec<u64> = (0..4)
+            .flat_map(|from| {
+                [
+                    layout.publish_flag(base, from),
+                    layout.consume_flag(base, from),
+                ]
+            })
+            .collect();
+        for &flag in &flags {
+            assert_eq!(flag % 8, 0, "a doorbell store at {flag:#x} would tear");
+        }
+        let mut sorted = flags;
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= K3_WHALE_ALIGN as u64,
+                "flag slots share a cache line: {pair:x?}"
             );
-            assert!(consume >= base + layout.consume_inbox as u64);
         }
     }
 }

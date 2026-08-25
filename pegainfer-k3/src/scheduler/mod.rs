@@ -111,13 +111,11 @@ pub struct K3WhaleServing {
 
 /// A whale request this poster sent to the sequencer and is waiting to hear
 /// back about. Its slot is reserved the whole time, so the commit can never
-/// arrive to a full batch.
-struct PendingWhale {
+/// arrive to a full batch. `id.raw()` rides the descriptor's `request` field,
+/// pairing gathers, commits, and cancels with this admission.
+struct PostedWhale {
     id: RequestId,
     slot: SlotId,
-    /// The request key echoed through the descriptor — how the poster pairs
-    /// gathers, commits, and cancels with this admission.
-    key: u64,
     /// The sequence this whale got, learned from our own gather broadcast.
     /// `None` until the gather arrives; a cancel for an unknown sequence can
     /// only be the width refusal of this one outstanding post.
@@ -125,7 +123,6 @@ struct PendingWhale {
     prompt: Arc<[u32]>,
     params: SamplingParams,
     max_tokens: usize,
-    ignore_eos: bool,
 }
 
 /// One partition's live whale state: the protocol member plus the poster-side
@@ -135,12 +132,11 @@ struct WhaleLane {
     serving: K3WhaleServing,
     member: WhaleMember,
     rank: GlobalRank,
-    next_key: u64,
     /// The outstanding post, if any (awaiting commit or cancel).
-    pending: Option<PendingWhale>,
+    posted: Option<PostedWhale>,
     /// A cancelled post falling back to a local prefill, run at the next
     /// unrestricted launch.
-    fallback: Option<PendingWhale>,
+    fallback: Option<PostedWhale>,
 }
 
 /// Wrap ready executors in schedulers and hand the whole thing to the
@@ -241,8 +237,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
             WhaleLane {
                 member: WhaleMember::new(rank),
                 rank,
-                next_key: 0,
-                pending: None,
+                posted: None,
                 fallback: None,
                 serving,
             }
@@ -305,7 +300,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
     ) -> Result<bool> {
         loop {
             for message in lane.serving.hub.drain(lane.rank) {
-                Self::note_poster_pairing(lane, &message);
+                Self::track_own_post(lane, &message);
                 let count = self.executor.step_count();
                 if let Some(reply) = lane.member.on_message(message, count)? {
                     lane.serving.hub.send(reply)?;
@@ -315,8 +310,8 @@ impl<E: StepExecutor> K3Scheduler<E> {
                 // The superstep advanced the count; consult the next boundary
                 // before leaving — a second whale may sit right behind it.
                 WhaleDuty::Enter(whale) => self.enter_whale(lane, *whale, ledger)?,
-                WhaleDuty::Free { clearance } => {
-                    if clearance.is_some() {
+                WhaleDuty::Free => {
+                    if !lane.member.is_quiet() {
                         return Ok(false);
                     }
                     self.run_whale_fallback(lane, ledger);
@@ -326,27 +321,27 @@ impl<E: StepExecutor> K3Scheduler<E> {
         }
     }
 
-    /// Pair an inbound rendezvous message with the poster's outstanding post,
+    /// Pair an inbound rendezvous message with this rank's outstanding post,
     /// before the member consumes it. A gather for our own request records
     /// its sequence; a cancel routes the post to the local-prefill fallback —
     /// either by its recorded sequence, or, for a post that never gathered
     /// (unknown sequence, not armed here), as the sequencer's width refusal.
-    fn note_poster_pairing(lane: &mut WhaleLane, message: &WhaleToMember) {
+    fn track_own_post(lane: &mut WhaleLane, message: &WhaleToMember) {
         match message {
             WhaleToMember::Gather { descriptor } if descriptor.poster == lane.rank => {
-                if let Some(pending) = lane.pending.as_mut()
-                    && pending.key == descriptor.request
+                if let Some(posted) = lane.posted.as_mut()
+                    && posted.id.raw() == descriptor.request
                 {
-                    pending.seq = Some(descriptor.seq);
+                    posted.seq = Some(descriptor.seq);
                 }
             }
             WhaleToMember::Cancel { seq } => {
-                let refused = lane.pending.as_ref().is_some_and(|pending| {
-                    pending.seq == Some(*seq)
-                        || (pending.seq.is_none() && !lane.member.is_armed(*seq))
+                let refused = lane.posted.as_ref().is_some_and(|posted| {
+                    posted.seq == Some(*seq)
+                        || (posted.seq.is_none() && !lane.member.is_armed(*seq))
                 });
                 if refused {
-                    lane.fallback = lane.pending.take();
+                    lane.fallback = lane.posted.take();
                 }
             }
             _ => {}
@@ -364,28 +359,28 @@ impl<E: StepExecutor> K3Scheduler<E> {
         whale: CommittedWhale,
         ledger: &mut RequestLedger,
     ) -> Result<()> {
-        let pending = if whale.descriptor.poster == lane.rank {
-            let pending = lane.pending.take().ok_or_else(|| {
+        let posted = if whale.descriptor.poster == lane.rank {
+            let posted = lane.posted.take().ok_or_else(|| {
                 anyhow::anyhow!(
                     "whale {} committed for this poster, but no post is outstanding",
                     whale.descriptor.seq
                 )
             })?;
             anyhow::ensure!(
-                pending.key == whale.descriptor.request,
-                "whale {} answers request key {}, but the outstanding post is {}",
+                posted.id.raw() == whale.descriptor.request,
+                "whale {} answers request {}, but the outstanding post is {}",
                 whale.descriptor.seq,
                 whale.descriptor.request,
-                pending.key
+                posted.id.raw()
             );
-            Some(pending)
+            Some(posted)
         } else {
             None
         };
         let first = self
             .executor
-            .prefill_whale(&whale, pending.as_ref().map(|pending| pending.slot))?;
-        let Some(pending) = pending else {
+            .prefill_whale(&whale, posted.as_ref().map(|posted| posted.slot))?;
+        let Some(posted) = posted else {
             return Ok(());
         };
         let first = first.ok_or_else(|| {
@@ -394,19 +389,19 @@ impl<E: StepExecutor> K3Scheduler<E> {
                 whale.descriptor.seq
             )
         })?;
-        if ledger.is_aborted(pending.id) {
+        if ledger.is_aborted(posted.id) {
             // The whale ran regardless (unanimity is the contract); only the
             // answer is dropped.
-            ledger.retire(pending.id);
-            self.release_slot(pending.slot);
+            ledger.retire(posted.id);
+            self.release_slot(posted.slot);
             return Ok(());
         }
         self.commit_first_token(
-            pending.id,
-            pending.slot,
+            posted.id,
+            posted.slot,
             first,
-            pending.max_tokens,
-            pending.ignore_eos,
+            posted.max_tokens,
+            posted.params.ignore_eos,
             ledger,
         );
         Ok(())
@@ -415,31 +410,31 @@ impl<E: StepExecutor> K3Scheduler<E> {
     /// A cancelled whale post answers its request with a plain local prefill,
     /// run at the first unrestricted launch after the cancel.
     fn run_whale_fallback(&mut self, lane: &mut WhaleLane, ledger: &mut RequestLedger) {
-        let Some(pending) = lane.fallback.take() else {
+        let Some(posted) = lane.fallback.take() else {
             return;
         };
-        if ledger.is_aborted(pending.id) {
-            ledger.retire(pending.id);
-            self.release_slot(pending.slot);
+        if ledger.is_aborted(posted.id) {
+            ledger.retire(posted.id);
+            self.release_slot(posted.slot);
             return;
         }
         match self
             .executor
-            .prefill(pending.slot, &pending.prompt, &pending.params)
+            .prefill(posted.slot, &posted.prompt, &posted.params)
         {
             Ok(first) => self.commit_first_token(
-                pending.id,
-                pending.slot,
+                posted.id,
+                posted.slot,
                 first,
-                pending.max_tokens,
-                pending.ignore_eos,
+                posted.max_tokens,
+                posted.params.ignore_eos,
                 ledger,
             ),
             Err(error) => {
                 // A local prefill failure is this request's problem, exactly
                 // as on the ordinary admission path.
-                self.release_slot(pending.slot);
-                ledger.fail(pending.id, format!("{error:#}"));
+                self.release_slot(posted.slot);
+                ledger.fail(posted.id, format!("{error:#}"));
             }
         }
     }
@@ -554,27 +549,22 @@ impl<E: StepExecutor> K3Scheduler<E> {
             }
             if self.whale_eligible(prompt_len) {
                 let lane = self.whale.as_ref().expect("eligibility implies the lane");
-                if lane.pending.is_some() || lane.fallback.is_some() {
+                if lane.posted.is_some() || lane.fallback.is_some() {
                     // One outstanding whale per rank keeps the cancel pairing
                     // trivial; whales are sparse and the rendezvous is a few
                     // launches, so the head of the queue waits.
                     break;
                 }
-                let pending = self.queued.pop_front().expect("front just observed");
+                let (poster, hub) = (lane.rank, lane.serving.hub.clone());
+                let queued = self.queued.pop_front().expect("front just observed");
                 ledger.admit(id);
                 let slot = self
                     .free_slots
                     .pop()
                     .expect("loop runs only while a slot is free");
-                let prompt: Arc<[u32]> = Arc::from(pending.request.prompt_tokens.as_slice());
-                let (key, poster, hub) = {
-                    let lane = self.whale.as_mut().expect("eligibility implies the lane");
-                    let key = lane.next_key;
-                    lane.next_key += 1;
-                    (key, lane.rank, lane.serving.hub.clone())
-                };
+                let prompt: Arc<[u32]> = Arc::from(queued.request.prompt_tokens.as_slice());
                 if let Err(error) = hub.send(WhaleToSequencer::Request {
-                    request: key,
+                    request: id.raw(),
                     poster,
                     prompt: prompt.clone(),
                 }) {
@@ -584,17 +574,14 @@ impl<E: StepExecutor> K3Scheduler<E> {
                     ledger.fail(id, format!("{error:#}"));
                     return Err(error);
                 }
-                let ignore_eos = pending.request.params.ignore_eos;
                 let lane = self.whale.as_mut().expect("eligibility implies the lane");
-                lane.pending = Some(PendingWhale {
+                lane.posted = Some(PostedWhale {
                     id,
                     slot,
-                    key,
                     seq: None,
                     prompt,
-                    params: pending.request.params,
-                    max_tokens: pending.request.max_tokens,
-                    ignore_eos,
+                    params: queued.request.params,
+                    max_tokens: queued.request.max_tokens,
                 });
                 continue;
             }

@@ -155,9 +155,9 @@ impl K3CpSyncHandle {
                     cp_rank,
                     kind,
                     gang: members,
-                    value,
+                    doorbell,
                 },
-            ) => gang.exchange(ctx, *cp_rank, *kind, members, *value, consume),
+            ) => gang.exchange(ctx, *cp_rank, *kind, members, *doorbell, consume),
             _ => anyhow::bail!("K3 CP window sync does not match its coordination substrate"),
         }
     }
@@ -178,7 +178,7 @@ pub(crate) enum K3CpWindowSync {
         /// The whale's global ranks in CP order.
         gang: Vec<usize>,
         /// This window's doorbell value.
-        value: u64,
+        doorbell: u64,
     },
 }
 
@@ -375,7 +375,7 @@ fn wait_event(ctx: &DeviceContext, event: u64) -> Result<()> {
 /// 58%), so a wider gang stops paying for itself. The in-process lane's floor
 /// stays [`K3_CONV_STATE`]-based ([`k3_cp_admits`]) — its width is fixed at
 /// arm time, not chosen per prompt.
-pub const K3_CP_SEGMENT_FLOOR: usize = 2048;
+pub const K3_WHALE_SEGMENT_FLOOR: usize = 2048;
 
 /// Whether a prompt of `total` tokens is CP-eligible: every segment must
 /// outspan the conv window (the halo exchange publishes exactly
@@ -452,62 +452,62 @@ pub(crate) struct K3CpScratch {
     /// exactly on the in-process substrate — the fleet orders with doorbells.
     publish_event: Option<CudaEvent>,
     consume_event: Option<CudaEvent>,
-    /// The committed whale sequence the current fleet superstep serves —
-    /// the doorbell value base. Meaningless on the in-process substrate.
-    whale_seq: u64,
+    /// The committed whale sequence the current fleet superstep serves — the
+    /// doorbell value base. `None` until the first [`K3CpScratch::arm_fleet`];
+    /// re-arms must strictly increase it or doorbell values would alias a
+    /// previous superstep's.
+    whale_seq: Option<u64>,
     /// Exchange windows this fleet superstep has opened so far.
     whale_window: u64,
     /// The current whale's global ranks in CP order (fleet only).
-    whale_gang: Vec<usize>,
+    gang_ranks: Vec<usize>,
+}
+
+/// The five buffers a CP rank publishes to its peers: pool allocations
+/// in-process, fabric-slab carvings on the fleet.
+struct K3CpPublish {
+    normed_tail: CudaSlice<bf16>,
+    kda_m: CudaSlice<f32>,
+    kda_d: CudaSlice<f32>,
+    mla_latent: CudaSlice<bf16>,
+    mla_rope: CudaSlice<bf16>,
 }
 
 impl K3CpScratch {
     pub(crate) fn new(ctx: &DeviceContext, group: Arc<K3CpGroup>, seg_cap: usize) -> Result<Self> {
         let cp_size = group.cp_size();
         let stream = &ctx.stream;
-        Ok(Self {
-            // Meaningful only between an `arm` and the superstep it opened.
-            cp_rank: 0,
-            cp_size,
-            segments: Vec::new(),
-            peers: Vec::new(),
+        let publish = K3CpPublish {
             normed_tail: stream.alloc_zeros(K3_CONV_STATE * K3_HIDDEN)?,
             kda_m: stream
                 .alloc_zeros(K3_KDA_STATE)
                 .context("alloc K3 CP transition package")?,
             kda_d: stream.alloc_zeros(K3_KDA_STATE)?,
-            mla_latent_pub: stream
+            mla_latent: stream
                 .alloc_zeros(seg_cap * K3_KV_LORA_RANK)
                 .context("alloc K3 CP latent publish buffer")?,
-            mla_rope_pub: stream.alloc_zeros(seg_cap * K3_QK_ROPE_HEAD_DIM)?,
-            halo_normed: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_HIDDEN)?,
-            halo_partial: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_ATTN_INNER)?,
-            halo_xs: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_ATTN_INNER)?,
-            recv_m: stream
-                .alloc_zeros(cp_size * K3_KDA_STATE)
-                .context("alloc K3 CP package arena")?,
-            recv_d: stream.alloc_zeros(cp_size * K3_KDA_STATE)?,
-            merge_a: stream.alloc_zeros(K3_KDA_STATE)?,
-            merge_b: stream.alloc_zeros(K3_KDA_STATE)?,
-            upstream_kv_rows: stream
-                .alloc_zeros(seg_cap.saturating_mul(cp_size.saturating_sub(1)).max(1))
-                .context("alloc K3 CP upstream index buffer")?,
-            upstream_len: 0,
+            mla_rope: stream.alloc_zeros(seg_cap * K3_QK_ROPE_HEAD_DIM)?,
+        };
+        let events = Some((
+            new_event(ctx).context("create K3 CP publish event")?,
+            new_event(ctx).context("create K3 CP consume event")?,
+        ));
+        Self::new_inner(
+            ctx,
+            K3CpSyncHandle::Local(group),
+            cp_size,
             seg_cap,
-            publish_event: Some(new_event(ctx).context("create K3 CP publish event")?),
-            consume_event: Some(new_event(ctx).context("create K3 CP consume event")?),
-            whale_seq: 0,
-            whale_window: 0,
-            whale_gang: Vec::new(),
-            sync: K3CpSyncHandle::Local(group),
-        })
+            publish,
+            events,
+        )
     }
 
     /// The fleet variant: publish buffers are carved out of this rank's
     /// fabric slab (so peers across processes can read them), local working
     /// buffers stay pool allocations, and the recv arenas are sized for the
     /// widest gang the world can seat. The slab arrives zeroed from its
-    /// allocation, matching the local constructor's `alloc_zeros`.
+    /// allocation, matching the local constructor's `alloc_zeros`; doorbells
+    /// replace events.
     pub(crate) fn new_fleet(
         ctx: &DeviceContext,
         gang: Arc<K3WhaleGang>,
@@ -524,37 +524,69 @@ impl K3CpScratch {
             |base: u64, len: usize| unsafe { ctx.stream.upgrade_device_ptr::<bf16>(base, len) };
         let carve_f32 =
             |base: u64, len: usize| unsafe { ctx.stream.upgrade_device_ptr::<f32>(base, len) };
-        let stream = &ctx.stream;
-        Ok(Self {
-            cp_rank: 0,
-            cp_size: world,
-            segments: Vec::new(),
-            peers: Vec::new(),
+        let publish = K3CpPublish {
             normed_tail: carve_bf16(mine.normed_tail, K3_CONV_STATE * K3_HIDDEN),
             kda_m: carve_f32(mine.kda_m, K3_KDA_STATE),
             kda_d: carve_f32(mine.kda_d, K3_KDA_STATE),
-            mla_latent_pub: carve_bf16(mine.mla_latent, seg_cap * K3_KV_LORA_RANK),
-            mla_rope_pub: carve_bf16(mine.mla_rope, seg_cap * K3_QK_ROPE_HEAD_DIM),
+            mla_latent: carve_bf16(mine.mla_latent, seg_cap * K3_KV_LORA_RANK),
+            mla_rope: carve_bf16(mine.mla_rope, seg_cap * K3_QK_ROPE_HEAD_DIM),
+        };
+        Self::new_inner(
+            ctx,
+            K3CpSyncHandle::Fleet(gang),
+            world,
+            seg_cap,
+            publish,
+            None,
+        )
+    }
+
+    /// The substrate-independent remainder of both constructors: local
+    /// working buffers plus the not-yet-armed bookkeeping.
+    fn new_inner(
+        ctx: &DeviceContext,
+        sync: K3CpSyncHandle,
+        cp_size: usize,
+        seg_cap: usize,
+        publish: K3CpPublish,
+        events: Option<(CudaEvent, CudaEvent)>,
+    ) -> Result<Self> {
+        let stream = &ctx.stream;
+        let (publish_event, consume_event) = match events {
+            Some((publish, consume)) => (Some(publish), Some(consume)),
+            None => (None, None),
+        };
+        Ok(Self {
+            // Meaningful only between an `arm` and the superstep it opened.
+            cp_rank: 0,
+            cp_size,
+            segments: Vec::new(),
+            peers: Vec::new(),
+            normed_tail: publish.normed_tail,
+            kda_m: publish.kda_m,
+            kda_d: publish.kda_d,
+            mla_latent_pub: publish.mla_latent,
+            mla_rope_pub: publish.mla_rope,
             halo_normed: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_HIDDEN)?,
             halo_partial: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_ATTN_INNER)?,
             halo_xs: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_ATTN_INNER)?,
             recv_m: stream
-                .alloc_zeros(world * K3_KDA_STATE)
-                .context("alloc K3 whale package arena")?,
-            recv_d: stream.alloc_zeros(world * K3_KDA_STATE)?,
+                .alloc_zeros(cp_size * K3_KDA_STATE)
+                .context("alloc K3 CP package arena")?,
+            recv_d: stream.alloc_zeros(cp_size * K3_KDA_STATE)?,
             merge_a: stream.alloc_zeros(K3_KDA_STATE)?,
             merge_b: stream.alloc_zeros(K3_KDA_STATE)?,
             upstream_kv_rows: stream
-                .alloc_zeros(seg_cap.saturating_mul(world.saturating_sub(1)).max(1))
-                .context("alloc K3 whale upstream index buffer")?,
+                .alloc_zeros(seg_cap.saturating_mul(cp_size.saturating_sub(1)).max(1))
+                .context("alloc K3 CP upstream index buffer")?,
             upstream_len: 0,
             seg_cap,
-            publish_event: None,
-            consume_event: None,
-            whale_seq: 0,
+            publish_event,
+            consume_event,
+            whale_seq: None,
             whale_window: 0,
-            whale_gang: Vec::new(),
-            sync: K3CpSyncHandle::Fleet(gang),
+            gang_ranks: Vec::new(),
+            sync,
         })
     }
 
@@ -680,6 +712,12 @@ impl K3CpScratch {
             segments[cp_rank].1,
             self.seg_cap
         );
+        ensure!(
+            self.whale_seq.is_none_or(|previous| seq > previous),
+            "K3 whale superstep re-armed at seq {seq}, not after {:?} — its doorbell values \
+             would alias an earlier superstep's",
+            self.whale_seq
+        );
         self.cp_rank = cp_rank;
         self.cp_size = width;
         self.segments = segments;
@@ -687,9 +725,9 @@ impl K3CpScratch {
             .iter()
             .map(|&member| gang.peer_ptrs(member))
             .collect::<Result<_>>()?;
-        self.whale_seq = seq;
+        self.whale_seq = Some(seq);
         self.whale_window = 0;
-        self.whale_gang = gang_ranks.to_vec();
+        self.gang_ranks = gang_ranks.to_vec();
         Ok(())
     }
 
@@ -709,13 +747,16 @@ impl K3CpScratch {
                     .collect(),
             },
             K3CpSyncHandle::Fleet(_) => {
-                let value = K3WhaleGang::window_value(self.whale_seq, self.whale_window)?;
+                let seq = self
+                    .whale_seq
+                    .context("K3 fleet exchange window before any arm_fleet")?;
+                let doorbell = K3WhaleGang::window_value(seq, self.whale_window)?;
                 self.whale_window += 1;
                 K3CpWindowSync::Fleet {
                     cp_rank: self.cp_rank,
                     kind,
-                    gang: self.whale_gang.clone(),
-                    value,
+                    gang: self.gang_ranks.clone(),
+                    doorbell,
                 }
             }
         })

@@ -542,16 +542,20 @@ MegaMoE 同款基底。每 rank 的 CP 发布面（halo tail、KDA (M,D)、MLA
 latent/rope）整体挪进一块 fabric slab；whale hub 启动时加一轮 slab
 allgather（64 字节 handle × world，兼作 fleet 启动 barrier，对齐 ep.rs
 bootstrap 语义），每进程 import 一次全表。four-beat 协议原样翻译成
-doorbell：远端 `cuStreamWriteValue64` 宣布、本地 `cuStreamWaitValue64/GEQ`
-等待——等待永远在本 rank 自己的内存上，远端只有 NVLink store，superstep 内
-host 零同步。doorbell 值全由 rendezvous 推导（`(seq+1)*4096 + window`）：
+doorbell：宣布 = 单线程 SM kernel 批量 store 进各 peer 的 flag 槽（GB300
+memops 引擎拒绝 fabric-imported VA，见下方 CP8 门禁 bug ②）、本地
+`cuStreamWaitValue64/GEQ` 等待——等待永远在本 rank 自己的内存上，远端只有
+NVLink store，superstep 内 host 零同步。doorbell 值全由 rendezvous 推导（`(seq+1)*4096 + window`）：
 seq 严格递增 + 每 superstep 窗口数固定 ⇒ 值跨 whale 单调，gang 轮换不需要
 任何 host 协商（flag 槽按 global rank 索引）。forward 路径零改动：
 `K3CpScratch` 换 `K3CpSyncHandle`（Local/Fleet 枚举）分发三个交换窗口，
 `prefill_whale` 与 `prefill_cp` 共享同一 superstep 主体（whale 用 leveled
 分段）。`PEGAINFER_K3_WHALE=<addr>` 一个变量拉起全部（rank0 进程 host
 sequencer；端口选 <32768 避 ephemeral 坑）；`PEGAINFER_K3_WHALE_MIN` 准入
-下限默认 4096。与 `PEGAINFER_K3_CP`、dspark 互斥。
+下限默认 4096。与 `PEGAINFER_K3_CP`、dspark 互斥。隐含约定：分段是
+descriptor 的确定性函数、不上 wire，各进程按自己的 prefill chunk 上限
+（`chunk_tokens`）本地重算——全 fleet 必须跑同一 binary/配置，chunk 上限
+不一致会算出不同分段而各自入场。
 
 **CP8@2-tray 真机门禁 PASS（2026-08-25，tray08+tray09 pruned EP8，全账
 `~/code/bench_results/2026-08-25-k3-whale-cp8-smoke/`）**：8-wide 跨机 whale

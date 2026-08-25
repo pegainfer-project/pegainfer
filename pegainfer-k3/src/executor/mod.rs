@@ -129,6 +129,7 @@ use crate::scheduler::DecodeSlot;
 use crate::scheduler::SlotId;
 use crate::scheduler::StepExecutor;
 use crate::scheduler::whale::CommittedWhale;
+use crate::scheduler::whale::k3_whale_admits;
 use crate::scheduler::whale::k3_whale_segments;
 use crate::weights::K3RankGpuContext;
 use crate::weights::K3WeightManifest;
@@ -1514,8 +1515,9 @@ impl K3Executor {
     /// Allocate this rank's whale slab — its fleet CP publish surface plus
     /// doorbells — before the fleet's handle exchange. `world` is the whale
     /// world size; every rank must derive the identical layout, which the
-    /// import checks byte-for-byte. Once per executor.
-    pub fn arm_whale_slab(&mut self, world: usize) -> Result<K3WhaleSlabWire> {
+    /// import checks byte-for-byte. Once per executor. Returns the local base
+    /// (for the process-wide import table) and the wire identity peers import.
+    pub fn arm_whale_slab(&mut self, world: usize) -> Result<(u64, K3WhaleSlabWire)> {
         ensure!(
             self.whale_slab.is_none(),
             "K3 rank {} armed its whale slab twice",
@@ -1524,12 +1526,7 @@ impl K3Executor {
         let layout = K3WhaleSlabLayout::new(world, k3_chunk_bucket(self.chunk_tokens)?);
         let (base, wire) = k3_whale_slab_alloc(self.ctx.device_ordinal, &layout)?;
         self.whale_slab = Some((base, layout));
-        Ok(wire)
-    }
-
-    /// This rank's local slab base, for the process-wide import table.
-    pub fn whale_slab_base(&self) -> Option<u64> {
-        self.whale_slab.map(|(base, _)| base)
+        Ok((base, wire))
     }
 
     /// Map the exchanged world table into this process — once, on any one
@@ -1576,13 +1573,15 @@ impl K3Executor {
             prompt.len(),
             self.max_ctx
         );
-        // The poster is always the gang's last CP rank, and only the poster
-        // adopts a decode slot.
-        let owner = cp_rank + 1 == width;
+        // The descriptor crossed a process boundary: re-check the admission
+        // predicate its segments are derived from before trusting it.
         ensure!(
-            owner == slot.is_some(),
-            "K3 whale {}: the owner and only the owner passes a slot",
-            descriptor.seq
+            k3_whale_admits(prompt.len(), width, self.chunk_tokens),
+            "K3 whale {}: {} tokens across a width-{width} gang does not fit the {}-token chunk \
+             cap",
+            descriptor.seq,
+            prompt.len(),
+            self.chunk_tokens
         );
         if let Some(slot) = slot {
             ensure!(
@@ -1590,10 +1589,6 @@ impl K3Executor {
                 "K3 whale slot {slot} is out of range"
             );
         }
-        ensure!(
-            self.dspark.is_none(),
-            "K3 whale prefill does not feed the dspark draft lane; disarm it"
-        );
         let segments = k3_whale_segments(prompt.len(), width, self.chunk_tokens);
         self.enter_step()?;
         self.prefill_state.reset_row(&self.ctx, 0)?;

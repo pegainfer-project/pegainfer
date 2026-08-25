@@ -36,20 +36,18 @@
 //!    advanced at most one per launch period while the commit was in flight,
 //!    and the slack covers that), so each one steps normally until its count
 //!    reaches `L` and enters the CP superstep there. All members enter at the
-//!    same absolute launch or none do — the failure mode of a member entering
-//!    a superstep its peers never join cannot arise from ordering, only from
-//!    a death, which the exchange deadline already turns into a fleet-fatal
-//!    error.
+//!    same absolute launch or none do; a member that dies instead of entering
+//!    is caught by the exchange deadline (fleet-fatal), not here.
 //!
 //! Ranks outside the gang never hear about the whale: their launch `L` is an
 //! ordinary step, and the mega collective pairs it against the gang's
 //! superstep exactly as it pairs any other heterogeneous step.
 //!
-//! The state machines below are pure — every transition consumes one event
-//! and returns the messages to send — so the whole protocol is exercised by
-//! the deterministic fleet simulation and the seeded fuzzer in the tests, and
-//! the transports ([`LocalWhaleHub`], [`super::whale_hub::TcpWhaleHub`]) stay
-//! I/O-only.
+//! The state machines below are pure — one event in, the messages to send
+//! out — so the transports ([`LocalWhaleHub`],
+//! [`super::whale_hub::TcpWhaleHub`]) stay I/O-only.
+//!
+//! [`LocalWhaleHub`]: super::whale_hub::LocalWhaleHub
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -58,7 +56,7 @@ use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 
-use crate::executor::cp::K3_CP_SEGMENT_FLOOR;
+use crate::executor::cp::K3_WHALE_SEGMENT_FLOOR;
 
 /// A rank's identity across the whole EP world (not its process-local index).
 pub type GlobalRank = usize;
@@ -236,7 +234,7 @@ impl WhaleSequencer {
                 prompt,
             } => {
                 self.queue.push_back((request, poster, prompt));
-                self.pump()
+                self.start_next_gather()
             }
             WhaleToSequencer::Ready { seq, rank, count } => {
                 let Some(gathering) = self.gathering.as_mut() else {
@@ -280,16 +278,14 @@ impl WhaleSequencer {
         let seq = gathering.descriptor.seq;
         log::warn!("K3 whale {seq}: gather timed out; cancelling");
         let mut outbound = broadcast(&gathering.descriptor.gang, &WhaleToMember::Cancel { seq });
-        outbound.extend(self.pump()?);
+        outbound.extend(self.start_next_gather()?);
         Ok(outbound)
     }
 
     /// Start the next gatherable queued whale, if none is gathering. A
     /// refused whale must not strand the ones queued behind it: no later
-    /// message is guaranteed to ever arrive and pump again, so a quiet
-    /// early-return after a refusal is a wedged queue (the fuzzer found
-    /// exactly that).
-    fn pump(&mut self) -> Result<Vec<WhaleOutbound>> {
+    /// message is guaranteed to ever arrive.
+    fn start_next_gather(&mut self) -> Result<Vec<WhaleOutbound>> {
         let mut outbound = Vec::new();
         while self.gathering.is_none() {
             let Some((request, poster, prompt)) = self.queue.pop_front() else {
@@ -324,7 +320,6 @@ impl WhaleSequencer {
                 prompt,
                 prompt_hash,
             };
-            descriptor.verify()?;
             outbound.extend(broadcast(
                 &descriptor.gang,
                 &WhaleToMember::Gather {
@@ -365,7 +360,7 @@ impl WhaleSequencer {
             &gathering.descriptor.gang,
             &WhaleToMember::Commit { seq, launch },
         );
-        outbound.extend(self.pump()?);
+        outbound.extend(self.start_next_gather()?);
         Ok(outbound)
     }
 }
@@ -385,11 +380,9 @@ pub struct CommittedWhale {
 /// What the scheduler must do at a launch boundary.
 #[derive(Debug)]
 pub enum WhaleDuty {
-    /// Nothing scheduled at this count: run a normal step. `clearance` is how
-    /// many launches a multi-launch operation may span from here without
-    /// straddling a scheduled (or still-gathering) whale — `None` means
-    /// unbounded.
-    Free { clearance: Option<u64> },
+    /// Nothing scheduled here: run a normal step. While the member is not
+    /// [`WhaleMember::is_quiet`] that step must stay single-launch.
+    Free,
     /// This launch is a committed whale's superstep: enter `prefill_cp` now.
     Enter(Box<CommittedWhale>),
 }
@@ -497,22 +490,12 @@ impl WhaleMember {
                 return Ok(WhaleDuty::Enter(Box::new(whale)));
             }
         }
-        // A committed whale bounds operations to the launches before its
-        // superstep; a gathered-but-uncommitted whale bounds them to one —
-        // its commit may name any launch above the reply. Both can hold at
-        // once (a second whale gathering behind a committed first): take the
-        // tighter bound.
-        let committed_cap = self.committed.front().map(|front| front.launch - count);
-        let armed_cap = if self.armed.is_empty() { None } else { Some(1) };
-        let clearance = match (committed_cap, armed_cap) {
-            (Some(commit), Some(arm)) => Some(commit.min(arm)),
-            (committed, armed) => committed.or(armed),
-        };
-        Ok(WhaleDuty::Free { clearance })
+        Ok(WhaleDuty::Free)
     }
 
-    /// Whether this member currently constrains the scheduler at all — used
-    /// by tests and by the scheduler's idle accounting.
+    /// Whether nothing is gathered or committed here. A member that is not
+    /// quiet must step one launch at a time: an armed reply is an exact floor
+    /// on reachable launches, and a committed superstep must be hit exactly.
     pub fn is_quiet(&self) -> bool {
         self.armed.is_empty() && self.committed.is_empty()
     }
@@ -553,17 +536,16 @@ pub fn k3_whale_width(total: usize, world: usize, chunk_tokens: usize) -> Option
 /// segment above the floor and within one chunk step (one superstep per rank
 /// — the multi-superstep walk is out of scope until profiles demand it).
 pub fn k3_whale_admits(total: usize, width: usize, chunk_tokens: usize) -> bool {
-    if width < 2 || total < width * K3_CP_SEGMENT_FLOOR {
+    if width < 2 || total < width * K3_WHALE_SEGMENT_FLOOR {
         return false;
     }
     let segments = k3_whale_segments(total, width, chunk_tokens);
-    segments.len() == width
-        && segments
-            .last()
-            .is_some_and(|&(start, len)| start + len == total)
+    segments
+        .last()
+        .is_some_and(|&(start, len)| start + len == total)
         && segments
             .iter()
-            .all(|&(_, len)| len >= K3_CP_SEGMENT_FLOOR && len <= chunk_tokens)
+            .all(|&(_, len)| len >= K3_WHALE_SEGMENT_FLOOR && len <= chunk_tokens)
 }
 
 /// The gang for a `width`-wide whale posted by `poster`: the tray-aligned
@@ -575,12 +557,11 @@ pub fn k3_whale_admits(total: usize, width: usize, chunk_tokens: usize) -> bool 
 pub fn k3_whale_gang(poster: GlobalRank, width: usize, world: usize) -> Vec<GlobalRank> {
     debug_assert!(poster < world && width <= world);
     const TRAY: usize = 4;
-    let aligned = if width >= TRAY {
+    let start = if width >= TRAY {
         (poster / TRAY * TRAY).min(world.saturating_sub(width))
     } else {
         poster.min(world.saturating_sub(width))
     };
-    let start = aligned.min(poster);
     let mut gang: Vec<GlobalRank> = (start..start + width).filter(|&r| r != poster).collect();
     gang.push(poster);
     gang
@@ -598,20 +579,18 @@ const K3_CP_QUAD_PER_LINEAR: f64 = 2.7e-6;
 
 /// Split `total` tokens into `width` contiguous leveled segments: earlier
 /// ranks get longer segments, so every rank's modeled superstep time — walk
-/// plus its MLA triangle — comes out even. At 16k the difference from an even
-/// split is small; at 256k the last rank's triangle is two thirds of its
-/// walk, and an even split would put the whole fleet on its tail.
+/// plus its MLA triangle — comes out even.
 ///
-/// Segments are found by bisecting the per-rank time budget: given a budget,
-/// each rank greedily takes the longest affordable segment (capped at
-/// `chunk_tokens`), which is monotone in the budget. The floor is *not*
-/// enforced here — [`k3_whale_admits`] rejects splits that level below it —
-/// but coverage is: the returned segments always partition `total` exactly,
-/// or the result is shorter than `width` (inadmissible).
+/// Bisected on the per-rank time budget; coverage is monotone in the budget,
+/// so the smallest covering budget is the leveled split. The floor is *not*
+/// enforced here — [`k3_whale_admits`] rejects splits that level below it.
+/// The returned segments always number `width` and start at 0; they
+/// under-cover `total` when the chunk cap makes an exact partition
+/// impossible, which admission rejects too.
 pub fn k3_whale_segments(total: usize, width: usize, chunk_tokens: usize) -> Vec<(usize, usize)> {
-    debug_assert!(width >= 1);
-    if width == 1 || total == 0 {
-        return vec![(0, total)];
+    debug_assert!(width >= 2);
+    if total == 0 {
+        return vec![(0, 0)];
     }
     // The padded per-row families (KDA, norms, projections, MoE entry) run at
     // the covering chunk *bucket*, a step function of segment length — only
@@ -666,7 +645,7 @@ pub fn k3_whale_segments(total: usize, width: usize, chunk_tokens: usize) -> Vec
             remaining.min(chunk_tokens)
         } else {
             affordable(start, hi)
-                .clamp(1, chunk_tokens)
+                .max(1)
                 .min(remaining.saturating_sub(ranks_left - 1))
         };
         segments.push((start, len));
@@ -674,10 +653,6 @@ pub fn k3_whale_segments(total: usize, width: usize, chunk_tokens: usize) -> Vec
     }
     segments
 }
-
-// ---------------------------------------------------------------------------
-// Tests: the protocol never runs its first fleet — it runs here first
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -701,7 +676,10 @@ mod tests {
     #[test]
     fn width_refuses_hopeless_prompts() {
         // Below two floors no gang splits legally...
-        assert_eq!(k3_whale_width(2 * K3_CP_SEGMENT_FLOOR - 1, 16, CHUNK), None);
+        assert_eq!(
+            k3_whale_width(2 * K3_WHALE_SEGMENT_FLOOR - 1, 16, CHUNK),
+            None
+        );
         assert_eq!(k3_whale_width(1024, 16, CHUNK), None);
         // ...and past world x chunk the M0 one-superstep-per-rank walk ends.
         assert_eq!(k3_whale_width(16 * CHUNK + 1, 16, CHUNK), None);
@@ -864,9 +842,7 @@ mod tests {
             for count in 12..=launch {
                 match member.at_launch(count).unwrap() {
                     WhaleDuty::Enter(whale) => entered = Some((count, whale)),
-                    WhaleDuty::Free { clearance } => {
-                        assert_eq!(clearance, Some(launch - count));
-                    }
+                    WhaleDuty::Free => assert!(!member.is_quiet()),
                 }
             }
             let (count, whale) = entered.expect("member never entered");
@@ -1010,10 +986,7 @@ mod tests {
             .on_message(WhaleToMember::Cancel { seq: 0 }, 6)
             .unwrap();
         assert!(member.is_quiet());
-        assert!(matches!(
-            member.at_launch(7).unwrap(),
-            WhaleDuty::Free { clearance: None }
-        ));
+        assert!(matches!(member.at_launch(7).unwrap(), WhaleDuty::Free));
         // And the sequencer lives on: the next whale gathers normally.
         let next = sequencer
             .on_message(WhaleToSequencer::Request {
@@ -1228,55 +1201,28 @@ mod tests {
     }
 
     #[test]
-    fn clearance_shrinks_to_one_while_a_second_whale_is_gathering() {
+    fn a_pending_whale_pins_the_member_until_its_superstep() {
+        // Committed but before the launch: free steps, not quiet — the
+        // scheduler keeps a non-quiet member single-launch.
         let (mut member, launch) = committed_member();
-        // Behind the committed whale alone, the clearance is the distance.
-        let count = launch - 3;
-        match member.at_launch(count).unwrap() {
-            WhaleDuty::Free { clearance } => assert_eq!(clearance, Some(3)),
-            duty => panic!("expected free, got {duty:?}"),
-        }
-        // A second whale gathering on the same member caps it at one: the
-        // pending commit may name any launch above the reply, and a
-        // multi-launch operation would overshoot it.
-        let mut second = WhaleSequencer::new(4, CHUNK);
-        let mut gathers = one_gather(&mut second, 0);
-        // committed_member's rank is gathers[0].to of an identical whale, so
-        // the same gang covers it; re-seq the descriptor so the member sees a
-        // distinct, later whale.
-        let Some(WhaleOutbound {
-            message: WhaleToMember::Gather { mut descriptor },
-            ..
-        }) = gathers.drain(..1).next()
-        else {
-            panic!("expected gather");
-        };
-        descriptor.seq = 7;
-        member
-            .on_message(WhaleToMember::Gather { descriptor }, count)
-            .unwrap()
-            .expect("a gather demands a ready");
-        match member.at_launch(count).unwrap() {
-            WhaleDuty::Free { clearance } => assert_eq!(clearance, Some(1)),
-            duty => panic!("expected free, got {duty:?}"),
-        }
-        // Armed alone (no commit yet) also caps at one.
-        let rank = member_rank(&member);
-        let mut fresh = WhaleMember::new(rank);
+        assert!(matches!(
+            member.at_launch(launch - 3).unwrap(),
+            WhaleDuty::Free
+        ));
+        assert!(!member.is_quiet());
+        assert!(matches!(
+            member.at_launch(launch).unwrap(),
+            WhaleDuty::Enter(_)
+        ));
+        assert!(member.is_quiet());
+        // Gathered alone (no commit yet) pins too: the pending commit may
+        // name any launch above the reply.
+        let mut fresh = WhaleMember::new(2);
         let gathers = one_gather(&mut WhaleSequencer::new(4, CHUNK), 0);
-        let mine = gathers
-            .into_iter()
-            .find(|gather| gather.to == rank)
-            .unwrap();
+        let mine = gathers.into_iter().find(|gather| gather.to == 2).unwrap();
         fresh.on_message(mine.message, 0).unwrap();
-        match fresh.at_launch(1).unwrap() {
-            WhaleDuty::Free { clearance } => assert_eq!(clearance, Some(1)),
-            duty => panic!("expected free, got {duty:?}"),
-        }
-    }
-
-    fn member_rank(member: &WhaleMember) -> GlobalRank {
-        member.rank
+        assert!(matches!(fresh.at_launch(1).unwrap(), WhaleDuty::Free));
+        assert!(!fresh.is_quiet());
     }
 }
 
@@ -1360,11 +1306,11 @@ mod fuzz {
             // a runt the sequencer must refuse without wedging the queue.
             if posted < whales && rng.below(3) == 0 {
                 let poster = rng.below(WORLD as u64) as usize;
-                let span = (WORLD * CHUNK - 2 * K3_CP_SEGMENT_FLOOR) as u64;
+                let span = (WORLD * CHUNK - 2 * K3_WHALE_SEGMENT_FLOOR) as u64;
                 let total = if rng.below(4) != 0 {
-                    2 * K3_CP_SEGMENT_FLOOR + rng.below(span) as usize
+                    2 * K3_WHALE_SEGMENT_FLOOR + rng.below(span) as usize
                 } else {
-                    1 + rng.below(K3_CP_SEGMENT_FLOOR as u64) as usize
+                    1 + rng.below(K3_WHALE_SEGMENT_FLOOR as u64) as usize
                 };
                 if k3_whale_width(total, WORLD, CHUNK).is_some() {
                     admissible += 1;
@@ -1413,10 +1359,12 @@ mod fuzz {
                         ));
                         rank.count += 1;
                     }
-                    WhaleDuty::Free { clearance } => {
+                    WhaleDuty::Free => {
                         // Start an operation spanning 1..=cap launches; the
-                        // boundaries inside it go unconsulted.
-                        let cap = clearance.unwrap_or(3).min(3);
+                        // boundaries inside it go unconsulted. A non-quiet
+                        // member must stay single-launch — that pin is the
+                        // production contract this fuzz drives.
+                        let cap = if rank.member.is_quiet() { 3 } else { 1 };
                         rank.busy = rng.below(cap);
                         rank.count += 1;
                     }
