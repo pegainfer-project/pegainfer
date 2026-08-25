@@ -553,10 +553,29 @@ seq 严格递增 + 每 superstep 窗口数固定 ⇒ 值跨 whale 单调，gang 
 sequencer；端口选 <32768 避 ephemeral 坑）；`PEGAINFER_K3_WHALE_MIN` 准入
 下限默认 4096。与 `PEGAINFER_K3_CP`、dspark 互斥。
 
+**CP8@2-tray 真机门禁 PASS（2026-08-25，tray08+tray09 pruned EP8，全账
+`~/code/bench_results/2026-08-25-k3-whale-cp8-smoke/`）**：8-wide 跨机 whale
+单 superstep prefill 打通，16k prompt + 48 greedy 两端点逐字节一致。同 fleet
+同配置 A/B（min TTFT ms，CP1 local vs CP8 whale）：4.2k 1246→893（1.40×）、
+8.25k 1502→1042（1.44×）、16.7k 3005→1042（**2.88×**）、28.5k 5881→1286
+（**4.57×**）。固定截距 ~850ms（4k 与 16k 同 TTFT）= rendezvous slack + armed
+期 decode-only + 前端截距合账，profile 阶段第一杠杆。真机修掉两个 bug：
+① sequencer bind 字面 addr 踩 127.0.1.1 回环（`da7c6dc9`，EP bootstrap 同款）；
+② **GB300 stream memops 引擎拒绝 fabric-imported 映射**——
+`cuStreamWriteValue64` 对 import 进来的 VA 报 `CUDA_ERROR_INVALID_VALUE`，同
+映射 DtoD copy / SM store 正常（两进程 C probe 定案，
+`~/.fabric-test/memops_import.c`）。doorbell 写改单线程 SM kernel
+（`k3_whale_doorbell_ring`，一个 beat 的全部 flag 批一次 launch）；wait 不动
+——等的全是本地 slab，本地 fabric 分配 memops 接受（`6b7ae0e4`）。运维注意：
+fleet OOM 后重启前必须逐 tray 杀干净旧进程（`nvidia-smi
+--query-compute-apps`，pgrep 会匹配自己的 ssh shell）；EP8@32k ctx 要
+`PEGAINFER_K3_MAX_BATCH=8`（默认 64 slots 的 KV 预算超 288 GiB HBM）。
+
 ## Next action
 
-M1 后半剩余（代码全落地，进入真机阶段）：CP8@2-tray pruned EP8 门禁（首个
-真 doorbell/fabric 冒烟）→ CP16@4-tray pruned EP16 → 256k 单 superstep 门禁
-→ **验收：full 896@EP16 对 vLLM TP16-MNNVL 重赛 8k/16k/64k/256k**。EP16
-全量下 19.6 GiB slab 的 HBM 账实测。次优先：FMHA 条带化配段、前端固定截距
-（132 vs 59 ms @122 tokens）、KDA 包 prefix-scan（profile 后决定）。
+M1 后半（CP8@2-tray 门禁已过）：CP16@4-tray pruned EP16（等第 4 台空 tray，
+2026-08-25 时点只有 tray08/09/17 空）→ 256k 单 superstep 门禁（需 CP16：
+16×16896=270k 盖 256k，CP8 只到 135k）→ **验收：full 896@EP16 对 vLLM
+TP16-MNNVL 重赛 8k/16k/64k/256k**。EP16 全量下 19.6 GiB slab 的 HBM 账实测。
+次优先：whale 固定截距 ~850ms 剖析（slack/armed decode-only/前端合账）、FMHA
+条带化配段、KDA 包 prefix-scan（profile 后决定）。
