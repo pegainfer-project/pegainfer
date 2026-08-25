@@ -25,6 +25,7 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -33,6 +34,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
+use pegainfer_kernels::ops::K3_MEGA_FABRIC_HANDLE_BYTES;
 
 use super::whale::GlobalRank;
 use super::whale::WhaleDescriptor;
@@ -41,6 +43,7 @@ use super::whale::WhaleSeq;
 use super::whale::WhaleSequencer;
 use super::whale::WhaleToMember;
 use super::whale::WhaleToSequencer;
+use crate::executor::whale_gang::K3WhaleSlabWire;
 
 /// `"K3WH"`: a stray connection to the wrong port dies loudly.
 const WHALE_MAGIC: u32 = u32::from_le_bytes(*b"K3WH");
@@ -219,6 +222,10 @@ const KIND_READY: u32 = 2;
 const KIND_GATHER: u32 = 3;
 const KIND_COMMIT: u32 = 4;
 const KIND_CANCEL: u32 = 5;
+/// Startup only, peer → host: one local rank's whale-slab fabric identity.
+const KIND_SLAB: u32 = 6;
+/// Startup only, host → peer: the world's completed slab table.
+const KIND_TABLE: u32 = 7;
 
 fn write_header(writer: &mut impl Write, kind: u32) -> Result<()> {
     let mut frame = FrameWriter(writer);
@@ -360,10 +367,13 @@ fn read_to_member(reader: &mut impl Read, kind: u32) -> Result<(GlobalRank, Whal
 // TCP hub
 // ---------------------------------------------------------------------------
 
-/// What one peer process announces on connect: the global ranks it hosts.
+/// What one peer process announces on connect: the global ranks it hosts,
+/// and how many slab frames follow (0 = no data-plane exchange, or exactly
+/// `count` — one per hosted rank).
 struct Hello {
     first: GlobalRank,
     count: usize,
+    slabs: usize,
 }
 
 fn write_hello(writer: &mut impl Write, hello: &Hello) -> Result<()> {
@@ -371,7 +381,102 @@ fn write_hello(writer: &mut impl Write, hello: &Hello) -> Result<()> {
     let mut frame = FrameWriter(writer);
     frame.u32(u32::try_from(hello.first).context("whale hello rank")?)?;
     frame.u32(u32::try_from(hello.count).context("whale hello count")?)?;
+    frame.u32(u32::try_from(hello.slabs).context("whale hello slabs")?)?;
     writer.flush().context("whale link flush")
+}
+
+fn write_slab(writer: &mut impl Write, rank: GlobalRank, slab: &K3WhaleSlabWire) -> Result<()> {
+    write_header(writer, KIND_SLAB)?;
+    let mut frame = FrameWriter(writer);
+    frame.u32(u32::try_from(rank).context("whale slab rank")?)?;
+    frame.u64(u64::try_from(slab.num_bytes).context("whale slab size")?)?;
+    writer
+        .write_all(&slab.handle)
+        .context("whale slab handle write")?;
+    writer.flush().context("whale link flush")
+}
+
+fn read_slab(reader: &mut impl Read) -> Result<(GlobalRank, K3WhaleSlabWire)> {
+    let mut frame = FrameReader(reader);
+    let rank = frame.u32()? as GlobalRank;
+    let num_bytes = usize::try_from(frame.u64()?).context("whale slab size")?;
+    let mut handle = [0u8; K3_MEGA_FABRIC_HANDLE_BYTES];
+    reader
+        .read_exact(&mut handle)
+        .context("whale slab handle read")?;
+    Ok((rank, K3WhaleSlabWire { handle, num_bytes }))
+}
+
+fn write_table(writer: &mut impl Write, table: &[K3WhaleSlabWire]) -> Result<()> {
+    write_header(writer, KIND_TABLE)?;
+    let mut frame = FrameWriter(writer);
+    frame.u32(u32::try_from(table.len()).context("whale table size")?)?;
+    for slab in table {
+        let mut frame = FrameWriter(writer);
+        frame.u64(u64::try_from(slab.num_bytes).context("whale slab size")?)?;
+        writer
+            .write_all(&slab.handle)
+            .context("whale table handle write")?;
+    }
+    writer.flush().context("whale link flush")
+}
+
+fn read_table(reader: &mut impl Read) -> Result<Vec<K3WhaleSlabWire>> {
+    let world = FrameReader(reader).u32()?;
+    ensure!(world <= 1024, "whale link: table of {world} ranks");
+    (0..world)
+        .map(|_| {
+            let num_bytes = usize::try_from(FrameReader(reader).u64()?)?;
+            let mut handle = [0u8; K3_MEGA_FABRIC_HANDLE_BYTES];
+            reader
+                .read_exact(&mut handle)
+                .context("whale table handle read")?;
+            Ok(K3WhaleSlabWire { handle, num_bytes })
+        })
+        .collect()
+}
+
+/// The startup slab allgather's shared state on the host: one slot per world
+/// rank, completed when every process has checked its slabs in.
+struct SlabBoard {
+    table: Mutex<Vec<Option<K3WhaleSlabWire>>>,
+    done: Condvar,
+}
+
+impl SlabBoard {
+    fn insert(&self, rank: GlobalRank, slab: K3WhaleSlabWire) -> Result<()> {
+        let mut table = self.table.lock().expect("whale slab board poisoned");
+        let slot = table
+            .get_mut(rank)
+            .with_context(|| format!("whale slab for rank {rank}, outside the world"))?;
+        ensure!(slot.is_none(), "whale slab for rank {rank} arrived twice");
+        *slot = Some(slab);
+        self.done.notify_all();
+        Ok(())
+    }
+
+    /// Block until every rank's slab is in, then return the completed table.
+    fn wait_complete(&self, timeout: Duration) -> Result<Vec<K3WhaleSlabWire>> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut table = self.table.lock().expect("whale slab board poisoned");
+        loop {
+            if table.iter().all(Option::is_some) {
+                return Ok(table.iter().map(|slot| slot.expect("checked")).collect());
+            }
+            let now = std::time::Instant::now();
+            ensure!(
+                now < deadline,
+                "whale slab exchange timed out: {} of {} ranks checked in",
+                table.iter().filter(|slot| slot.is_some()).count(),
+                table.len()
+            );
+            let (next, _) = self
+                .done
+                .wait_timeout(table, deadline - now)
+                .expect("whale slab board poisoned");
+            table = next;
+        }
+    }
 }
 
 /// The fleet transport. Construct with [`TcpWhaleHub::host`] on the process
@@ -406,13 +511,38 @@ impl TcpWhaleHub {
     /// Host the sequencer for a `world`-rank fleet, serving `local` ranks
     /// `first_local..first_local + local` from this process. Binds `addr` and
     /// accepts peer processes for the hub's whole lifetime.
+    ///
+    /// `local_slabs` arms the startup data-plane exchange: this process's
+    /// slab identities, one per local rank in rank order. When non-empty,
+    /// every peer must check in its own (`connect` with slabs), the call
+    /// blocks until the world's table is complete — the fleet's startup
+    /// barrier, like the EP bootstrap — and the table comes back alongside
+    /// the hub. Empty runs the pure rendezvous with no exchange.
     pub fn host(
         addr: &str,
         world: usize,
         chunk_tokens: usize,
         first_local: GlobalRank,
         local: usize,
-    ) -> Result<Arc<Self>> {
+        local_slabs: Vec<K3WhaleSlabWire>,
+    ) -> Result<(Arc<Self>, Vec<K3WhaleSlabWire>)> {
+        ensure!(
+            local_slabs.is_empty() || local_slabs.len() == local,
+            "whale hub: {} slabs for {local} local ranks",
+            local_slabs.len()
+        );
+        let board = if local_slabs.is_empty() {
+            None
+        } else {
+            let mut table = vec![None; world];
+            for (offset, slab) in local_slabs.into_iter().enumerate() {
+                table[first_local + offset] = Some(slab);
+            }
+            Some(Arc::new(SlabBoard {
+                table: Mutex::new(table),
+                done: Condvar::new(),
+            }))
+        };
         let listener =
             TcpListener::bind(addr).with_context(|| format!("whale hub: bind {addr}"))?;
         let bound = listener.local_addr().ok();
@@ -435,10 +565,15 @@ impl TcpWhaleHub {
         });
 
         // Acceptor: one reader thread per peer process, forwarding its
-        // sequencer-bound frames into the channel.
+        // sequencer-bound frames into the channel. When the data-plane
+        // exchange is armed it runs first on each connection: the peer's slab
+        // frames check in, and the completed world table goes back before the
+        // steady-state protocol starts — so the sequencer can never
+        // interleave a write with the table.
         {
             let peers = peers.clone();
             let failed = failed.clone();
+            let board = board.clone();
             std::thread::Builder::new()
                 .name("k3-whale-accept".into())
                 .spawn(move || {
@@ -450,8 +585,13 @@ impl TcpWhaleHub {
                             let mut frame = FrameReader(&mut socket);
                             let first = frame.u32()? as GlobalRank;
                             let count = frame.u32()? as usize;
+                            let slabs = frame.u32()? as usize;
                             ensure!(count <= 1024, "whale hub: hello claims {count} ranks");
-                            Ok(Hello { first, count })
+                            Ok(Hello {
+                                first,
+                                count,
+                                slabs,
+                            })
                         }) {
                             Ok(hello) => hello,
                             Err(error) => {
@@ -459,6 +599,15 @@ impl TcpWhaleHub {
                                 continue;
                             }
                         };
+                        if let Err(error) = serve_slab_exchange(&mut socket, &hello, board.as_ref())
+                        {
+                            log::warn!(
+                                "K3 whale hub: slab exchange with ranks {}..{} failed: {error:#}",
+                                hello.first,
+                                hello.first + hello.count
+                            );
+                            continue;
+                        }
                         let Ok(writer) = socket.try_clone() else {
                             continue;
                         };
@@ -562,13 +711,34 @@ impl TcpWhaleHub {
                 })
                 .expect("spawn whale sequencer");
         }
-        Ok(hub)
+        let table = match board {
+            None => Vec::new(),
+            // The wait doubles as the fleet's startup barrier: every process
+            // has connected and published its data plane before any engine
+            // serves — mirroring the EP bootstrap's semantics.
+            Some(board) => board
+                .wait_complete(WHALE_CONNECT_TIMEOUT)
+                .context("whale hub: the world never completed its slab exchange")?,
+        };
+        Ok((hub, table))
     }
 
     /// Join the fleet's whale hub as the process serving `local` ranks
     /// `first_local..`, connecting to the sequencer at `addr` (retrying
-    /// through its weight load, like the EP bootstrap).
-    pub fn connect(addr: &str, first_local: GlobalRank, local: usize) -> Result<Arc<Self>> {
+    /// through its weight load, like the EP bootstrap). Non-empty
+    /// `local_slabs` join the startup data-plane exchange and block until
+    /// the host serves the world's completed table back.
+    pub fn connect(
+        addr: &str,
+        first_local: GlobalRank,
+        local: usize,
+        local_slabs: Vec<K3WhaleSlabWire>,
+    ) -> Result<(Arc<Self>, Vec<K3WhaleSlabWire>)> {
+        ensure!(
+            local_slabs.is_empty() || local_slabs.len() == local,
+            "whale hub: {} slabs for {local} local ranks",
+            local_slabs.len()
+        );
         let deadline = std::time::Instant::now() + WHALE_CONNECT_TIMEOUT;
         let mut socket = loop {
             match TcpStream::connect(addr) {
@@ -591,8 +761,31 @@ impl TcpWhaleHub {
             &Hello {
                 first: first_local,
                 count: local,
+                slabs: local_slabs.len(),
             },
         )?;
+        let table = if local_slabs.is_empty() {
+            Vec::new()
+        } else {
+            for (offset, slab) in local_slabs.iter().enumerate() {
+                write_slab(&mut socket, first_local + offset, slab)?;
+            }
+            // The table lands only when the SLOWEST process has loaded and
+            // checked in, so this read is a fleet-load bound, not an IO one.
+            socket
+                .set_read_timeout(Some(WHALE_CONNECT_TIMEOUT))
+                .context("whale hub: set table read timeout")?;
+            let kind = read_header(&mut socket)?;
+            ensure!(
+                kind == KIND_TABLE,
+                "whale hub: expected the slab table, got frame kind {kind}"
+            );
+            let table = read_table(&mut socket)?;
+            socket
+                .set_read_timeout(None)
+                .context("whale hub: clear table read timeout")?;
+            table
+        };
         let mailboxes: Mailboxes = Arc::new(Mutex::new(vec![VecDeque::new(); local]));
         let failed: Arc<Mutex<Option<String>>> = Arc::default();
         let reader_boxes = mailboxes.clone();
@@ -623,15 +816,18 @@ impl TcpWhaleHub {
                 }
             })
             .expect("spawn whale reader");
-        Ok(Arc::new(Self {
-            first_local,
-            addr: None,
-            mailboxes,
-            outbound: HubRole::Peer {
-                link: Mutex::new(socket),
-            },
-            failed,
-        }))
+        Ok((
+            Arc::new(Self {
+                first_local,
+                addr: None,
+                mailboxes,
+                outbound: HubRole::Peer {
+                    link: Mutex::new(socket),
+                },
+                failed,
+            }),
+            table,
+        ))
     }
 
     /// The listener address (host side only; `None` on a peer). A host bound
@@ -667,6 +863,44 @@ impl TcpWhaleHub {
             .map(|inbox| inbox.drain(..).collect())
             .unwrap_or_default()
     }
+}
+
+/// The host side of one connection's startup slab exchange: read the peer's
+/// slab frames onto the board, wait for the world to complete, and serve the
+/// table back. A no-op when neither side armed the exchange; an error when
+/// they disagree.
+fn serve_slab_exchange(
+    socket: &mut TcpStream,
+    hello: &Hello,
+    board: Option<&Arc<SlabBoard>>,
+) -> Result<()> {
+    match (board, hello.slabs) {
+        (None, 0) => return Ok(()),
+        (None, _) => bail!("the peer sent slabs, but this host has no data-plane exchange armed"),
+        (Some(_), 0) => bail!("this host runs a data-plane exchange, but the peer sent no slabs"),
+        (Some(_), slabs) if slabs != hello.count => {
+            bail!(
+                "the peer hosts {} ranks but sent {slabs} slabs",
+                hello.count
+            )
+        }
+        (Some(_), _) => {}
+    }
+    let board = board.expect("matched above");
+    for _ in 0..hello.slabs {
+        let kind = read_header(socket)?;
+        ensure!(kind == KIND_SLAB, "expected a slab frame, got kind {kind}");
+        let (rank, slab) = read_slab(socket)?;
+        ensure!(
+            (hello.first..hello.first + hello.count).contains(&rank),
+            "a slab for rank {rank} from the process hosting {}..{}",
+            hello.first,
+            hello.first + hello.count
+        );
+        board.insert(rank, slab)?;
+    }
+    let table = board.wait_complete(WHALE_CONNECT_TIMEOUT)?;
+    write_table(socket, &table)
 }
 
 fn fail(failed: &Arc<Mutex<Option<String>>>, reason: String) {
@@ -730,9 +964,9 @@ mod tests {
         // serves ranks 2..4 and posts the whale. One simulated launch period
         // per loop pass keeps the loopback latency far below it, which is the
         // commit slack's stated assumption.
-        let host = TcpWhaleHub::host("127.0.0.1:0", 4, CHUNK, 0, 2).unwrap();
+        let (host, _) = TcpWhaleHub::host("127.0.0.1:0", 4, CHUNK, 0, 2, Vec::new()).unwrap();
         let addr = host.local_addr().expect("host knows its port").to_string();
-        let peer = TcpWhaleHub::connect(&addr, 2, 2).unwrap();
+        let (peer, _) = TcpWhaleHub::connect(&addr, 2, 2, Vec::new()).unwrap();
         peer.send(WhaleToSequencer::Request {
             request: 5,
             poster: 2,
@@ -767,5 +1001,34 @@ mod tests {
             launches.iter().all(|&launch| launch == launches[0]),
             "{launches:?}"
         );
+    }
+
+    #[test]
+    fn slab_exchange_serves_every_process_the_same_world_table() {
+        fn slab(seed: u8) -> K3WhaleSlabWire {
+            K3WhaleSlabWire {
+                handle: [seed; K3_MEGA_FABRIC_HANDLE_BYTES],
+                num_bytes: 4096 + seed as usize,
+            }
+        }
+        // The host serves ranks 0..2 and blocks until the world checks in, so
+        // the peer joins from another thread.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let peer_addr = addr.clone();
+        let peer = std::thread::spawn(move || {
+            TcpWhaleHub::connect(&peer_addr, 2, 2, vec![slab(2), slab(3)]).unwrap()
+        });
+        let (_host, host_table) =
+            TcpWhaleHub::host(&addr, 4, CHUNK, 0, 2, vec![slab(0), slab(1)]).unwrap();
+        let (_peer, peer_table) = peer.join().expect("peer joins the exchange");
+        assert_eq!(host_table.len(), 4);
+        assert_eq!(peer_table.len(), 4);
+        for (rank, (host_slab, peer_slab)) in host_table.iter().zip(&peer_table).enumerate() {
+            assert_eq!(host_slab.handle, [rank as u8; K3_MEGA_FABRIC_HANDLE_BYTES]);
+            assert_eq!(host_slab.handle, peer_slab.handle);
+            assert_eq!(host_slab.num_bytes, peer_slab.num_bytes);
+        }
     }
 }

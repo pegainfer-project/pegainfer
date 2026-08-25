@@ -1,0 +1,426 @@
+//! The fleet whale gang's data plane: the cross-process counterpart of the
+//! in-process CP gang in [`super::cp`].
+//!
+//! An in-process gang exchanges segment publications through peer-access
+//! device copies ordered by CUDA events. Neither survives a process boundary:
+//! peers in another process cannot dereference a pool pointer, and a CUDA
+//! event handle is meaningless outside the context that created it. The fleet
+//! replaces both with the same substrate the MegaMoE kernel already runs on —
+//! NVLink-fabric memory (NVL72 + IMEX):
+//!
+//! * **Buffers**: every rank's whole CP publish surface (conv halo tail, KDA
+//!   `(M, D)` packages, MLA latent/rope rows) lives in one
+//!   `CU_MEM_HANDLE_TYPE_FABRIC` slab, allocated at startup and imported once
+//!   by every process in the world. After that import, a peer's publication
+//!   is an ordinary device pointer — [`super::cp::k3_cp_copy_in`] works
+//!   unchanged.
+//! * **Ordering**: CUDA events give way to **doorbells** — `u64` flag arrays
+//!   in the same slabs, written with `cuStreamWriteValue64` and waited on
+//!   with `cuStreamWaitValue64`. Writes go to the *remote* rank's slab and
+//!   waits watch the rank's *own* slab, so every wait is on local memory and
+//!   every remote touch is a plain NVLink store — the direction the fabric
+//!   is built for. The four-beat window protocol is the in-process one
+//!   verbatim (publish, await publications, consume, await consumers); only
+//!   the primitive changed.
+//!
+//! Doorbell values must be agreed without any host negotiation, across gangs
+//! that rotate membership whale to whale. They are derived entirely from the
+//! whale rendezvous ([`crate::scheduler::whale`]): window `w` of whale `seq`
+//! carries the value `(seq + 1) * K3_WHALE_WINDOW_STRIDE + w + 1`. The
+//! sequencer hands out `seq` strictly increasing and every superstep runs the
+//! same fixed window schedule, so the values a rank writes are strictly
+//! monotonic even across whales it sits out — which is exactly what the
+//! `GEQ` wait condition needs. Flag arrays are indexed by *global* rank, so
+//! rotation never aliases a slot.
+
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::sys as cu_sys;
+use pegainfer_kernels::ops::K3_MEGA_FABRIC_HANDLE_BYTES;
+use pegainfer_kernels::ops::k3_mega_fabric_slab_alloc;
+use pegainfer_kernels::ops::k3_mega_fabric_slab_import;
+use pegainfer_kernels::ops::k3_mega_fabric_supported;
+use pegainfer_kernels::tensor::DeviceContext;
+use pegainfer_kernels::tensor::active_cu_stream;
+
+use super::buffers::K3_CONV_STATE;
+use super::buffers::K3_KDA_STATE;
+use super::cp::K3CpPeerPtrs;
+use super::cp::K3CpWindowKind;
+use crate::config::K3_HIDDEN;
+use crate::config::K3_KV_LORA_RANK;
+use crate::config::K3_QK_ROPE_HEAD_DIM;
+
+/// Doorbell values per whale: window `w` of whale `seq` rings
+/// `(seq + 1) * STRIDE + w + 1`. The stride bounds the windows one superstep
+/// may run (the real schedule is ~`2 x layers + mix layers`, far below it),
+/// and `window_value` asserts the bound instead of silently aliasing the
+/// next whale's values.
+pub(crate) const K3_WHALE_WINDOW_STRIDE: u64 = 4096;
+
+/// Byte offsets of one rank's regions inside its whale slab. Every rank in
+/// the world derives the identical layout from the same `(world, seg_cap)`,
+/// which is what lets a peer address a remote region with nothing but the
+/// imported base.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct K3WhaleSlabLayout {
+    /// `[world] u64` — inbox: rank `r` announces its window publication here.
+    publish_inbox: usize,
+    /// `[world] u64` — inbox: rank `r` acknowledges consuming my publication.
+    consume_inbox: usize,
+    normed_tail: usize,
+    kda_m: usize,
+    kda_d: usize,
+    mla_latent: usize,
+    mla_rope: usize,
+    pub(crate) num_bytes: usize,
+}
+
+/// Every region starts on a fresh cache line; the doorbell flags get one
+/// line per slot so a remote store never false-shares with a neighbour.
+const K3_WHALE_ALIGN: usize = 128;
+
+fn aligned(offset: usize) -> usize {
+    offset.next_multiple_of(K3_WHALE_ALIGN)
+}
+
+impl K3WhaleSlabLayout {
+    pub(crate) fn new(world: usize, seg_cap: usize) -> Self {
+        let mut offset = 0usize;
+        let mut region = |bytes: usize| -> usize {
+            let base = aligned(offset);
+            offset = base + bytes;
+            base
+        };
+        let publish_inbox = region(world * K3_WHALE_ALIGN);
+        let consume_inbox = region(world * K3_WHALE_ALIGN);
+        let normed_tail = region(K3_CONV_STATE * K3_HIDDEN * 2);
+        let kda_m = region(K3_KDA_STATE * 4);
+        let kda_d = region(K3_KDA_STATE * 4);
+        let mla_latent = region(seg_cap * K3_KV_LORA_RANK * 2);
+        let mla_rope = region(seg_cap * K3_QK_ROPE_HEAD_DIM * 2);
+        Self {
+            publish_inbox,
+            consume_inbox,
+            normed_tail,
+            kda_m,
+            kda_d,
+            mla_latent,
+            mla_rope,
+            num_bytes: aligned(offset),
+        }
+    }
+
+    fn publish_flag(&self, base: u64, from: usize) -> u64 {
+        base + (self.publish_inbox + from * K3_WHALE_ALIGN) as u64
+    }
+
+    fn consume_flag(&self, base: u64, from: usize) -> u64 {
+        base + (self.consume_inbox + from * K3_WHALE_ALIGN) as u64
+    }
+}
+
+/// One rank's slab identity on the wire: what the whale hub's startup
+/// exchange moves between processes.
+#[derive(Clone, Copy, Debug)]
+pub struct K3WhaleSlabWire {
+    pub handle: [u8; K3_MEGA_FABRIC_HANDLE_BYTES],
+    pub num_bytes: usize,
+}
+
+/// Allocate this rank's whale slab on `device_ordinal`: zeroed, mapped for
+/// every local device, fabric-exportable. Returns the local base pointer and
+/// the wire identity peers import.
+pub(crate) fn k3_whale_slab_alloc(
+    device_ordinal: usize,
+    layout: &K3WhaleSlabLayout,
+) -> Result<(u64, K3WhaleSlabWire)> {
+    ensure!(
+        k3_mega_fabric_supported(device_ordinal).unwrap_or(false),
+        "K3 whale rank on device {device_ordinal} cannot allocate NVLink-fabric memory; a \
+         cross-machine whale gang needs the IMEX daemon and a fabric-capable driver"
+    );
+    let (ptr, handle) = k3_mega_fabric_slab_alloc(device_ordinal, layout.num_bytes)
+        .context("alloc K3 whale CP fabric slab")?;
+    Ok((
+        u64::try_from(ptr).context("K3 whale slab base pointer")?,
+        K3WhaleSlabWire {
+            handle,
+            num_bytes: layout.num_bytes,
+        },
+    ))
+}
+
+/// The world's whale data plane as seen from one rank: every rank's slab
+/// mapped into this process, plus the shared layout. Built once after the
+/// hub's slab exchange; process-lifetime, like the mega slabs (a whale fleet
+/// dies together).
+pub(crate) struct K3WhaleGang {
+    world: usize,
+    /// This executor's global rank — where peers ring my doorbells.
+    rank: usize,
+    layout: K3WhaleSlabLayout,
+    /// Per world rank: the slab base as addressed from this process (my own
+    /// entry is the local allocation).
+    bases: Vec<u64>,
+}
+
+/// Map the whole world's whale slabs into this process, once: `local` maps
+/// the ranks this process hosts to their locally allocated bases (already
+/// mapped for every local device by their allocation); every other rank's
+/// handle is imported through `device_ordinal`, which likewise maps it for
+/// all local devices. Every local executor then builds its own
+/// [`K3WhaleGang`] over one clone of the returned table.
+pub(crate) fn k3_whale_import_world(
+    world_slabs: &[K3WhaleSlabWire],
+    local: &[(usize, u64)],
+    layout: &K3WhaleSlabLayout,
+    device_ordinal: usize,
+) -> Result<Vec<u64>> {
+    let world = world_slabs.len();
+    let mut bases = vec![0u64; world];
+    let mut have = vec![false; world];
+    for &(local_rank, base) in local {
+        ensure!(
+            local_rank < world,
+            "K3 whale local rank {local_rank} outside the {world} world"
+        );
+        bases[local_rank] = base;
+        have[local_rank] = true;
+    }
+    for (peer, wire) in world_slabs.iter().enumerate() {
+        if have[peer] {
+            continue;
+        }
+        ensure!(
+            wire.num_bytes == layout.num_bytes,
+            "K3 whale rank {peer} published a {}-byte slab, expected {} — the fleet disagrees on \
+             the slab layout",
+            wire.num_bytes,
+            layout.num_bytes
+        );
+        let ptr = k3_mega_fabric_slab_import(&wire.handle, wire.num_bytes, device_ordinal)
+            .with_context(|| format!("import K3 whale rank {peer}'s slab"))?;
+        bases[peer] = u64::try_from(ptr).context("K3 whale imported base")?;
+    }
+    Ok(bases)
+}
+
+impl K3WhaleGang {
+    /// One rank's view over the process-wide base table from
+    /// [`k3_whale_import_world`].
+    pub(crate) fn new(bases: Vec<u64>, rank: usize, layout: K3WhaleSlabLayout) -> Result<Self> {
+        ensure!(
+            rank < bases.len(),
+            "K3 whale rank {rank} outside the {}-slab table",
+            bases.len()
+        );
+        ensure!(
+            bases.iter().all(|&base| base != 0),
+            "K3 whale slab table has an unmapped rank"
+        );
+        Ok(Self {
+            world: bases.len(),
+            rank,
+            layout,
+            bases,
+        })
+    }
+
+    pub(crate) fn world(&self) -> usize {
+        self.world
+    }
+
+    pub(crate) fn rank(&self) -> usize {
+        self.rank
+    }
+
+    /// This rank's own slab base — where its publish buffers are carved.
+    pub(crate) fn my_base(&self) -> u64 {
+        self.bases[self.rank]
+    }
+
+    /// The publish-surface pointers of `rank`'s slab, as addressed from this
+    /// process. The event fields stay zero: fleet ordering runs on
+    /// doorbells, never on events.
+    pub(crate) fn peer_ptrs(&self, rank: usize) -> Result<K3CpPeerPtrs> {
+        ensure!(
+            rank < self.world,
+            "K3 whale peer rank {rank} outside the {} world",
+            self.world
+        );
+        let base = self.bases[rank];
+        Ok(K3CpPeerPtrs {
+            normed_tail: base + self.layout.normed_tail as u64,
+            kda_m: base + self.layout.kda_m as u64,
+            kda_d: base + self.layout.kda_d as u64,
+            mla_latent: base + self.layout.mla_latent as u64,
+            mla_rope: base + self.layout.mla_rope as u64,
+            publish_event: 0,
+            consume_event: 0,
+        })
+    }
+
+    /// The doorbell value window `window` of whale `seq` rings.
+    pub(crate) fn window_value(seq: u64, window: u64) -> Result<u64> {
+        ensure!(
+            window + 1 < K3_WHALE_WINDOW_STRIDE,
+            "K3 whale superstep ran {window} exchange windows, past the {K3_WHALE_WINDOW_STRIDE} \
+             doorbell stride"
+        );
+        Ok((seq + 1) * K3_WHALE_WINDOW_STRIDE + window + 1)
+    }
+
+    /// One exchange window over the fabric — the four-beat protocol of
+    /// [`super::cp::K3CpGroup::exchange`] with doorbells for events. `gang`
+    /// is the whale's global ranks in CP order and `cp_rank` this rank's
+    /// position in it; `consume` issues this rank's reads of peer buffers on
+    /// its own stream. Entirely stream-ordered: the host enqueues and
+    /// returns, and every wait is a `cuStreamWaitValue64` on this rank's own
+    /// slab.
+    pub(crate) fn exchange(
+        &self,
+        ctx: &DeviceContext,
+        cp_rank: usize,
+        kind: K3CpWindowKind,
+        gang: &[usize],
+        value: u64,
+        consume: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let cp_size = gang.len();
+        ensure!(cp_rank < cp_size, "K3 whale CP rank {cp_rank} of {cp_size}");
+        ensure!(
+            gang[cp_rank] == self.rank,
+            "K3 whale gang seats rank {} at CP position {cp_rank}, but this executor is rank {}",
+            gang[cp_rank],
+            self.rank
+        );
+        let my_base = self.my_base();
+        // Beat 1: announce my publication to every rank that reads it. The
+        // default write flag fences my preceding stream work first, so the
+        // publication bytes are visible before the doorbell rings.
+        for reader in kind.read_by(cp_rank, cp_size) {
+            let flag = self
+                .layout
+                .publish_flag(self.bases[gang[reader]], self.rank);
+            stream_write_value(ctx, flag, value).context("K3 whale publish doorbell write")?;
+        }
+        // Beat 2: wait for every publication I read this window.
+        for source in kind.reads_from(cp_rank) {
+            let flag = self.layout.publish_flag(my_base, gang[source]);
+            stream_wait_value(ctx, flag, value).context("K3 whale publish doorbell wait")?;
+        }
+        // Beat 3: enqueue my reads, then acknowledge them to their owners.
+        consume()?;
+        for source in kind.reads_from(cp_rank) {
+            let flag = self
+                .layout
+                .consume_flag(self.bases[gang[source]], self.rank);
+            stream_write_value(ctx, flag, value).context("K3 whale consume doorbell write")?;
+        }
+        // Beat 4: wait for my readers, so my next window's publish writes
+        // cannot overwrite what a peer is still reading.
+        for reader in kind.read_by(cp_rank, cp_size) {
+            let flag = self.layout.consume_flag(my_base, gang[reader]);
+            stream_wait_value(ctx, flag, value).context("K3 whale consume doorbell wait")?;
+        }
+        Ok(())
+    }
+}
+
+fn stream_write_value(ctx: &DeviceContext, addr: u64, value: u64) -> Result<()> {
+    // SAFETY: `addr` is inside a live fabric mapping (local or imported) that
+    // is never freed; the default flag performs the system-scope fence the
+    // publish ordering needs.
+    unsafe {
+        cu_sys::cuStreamWriteValue64_v2(
+            active_cu_stream(ctx),
+            addr,
+            value,
+            cu_sys::CUstreamWriteValue_flags::CU_STREAM_WRITE_VALUE_DEFAULT as u32,
+        )
+    }
+    .result()
+    .map_err(|error| anyhow::anyhow!("cuStreamWriteValue64 failed: {error}"))
+}
+
+fn stream_wait_value(ctx: &DeviceContext, addr: u64, value: u64) -> Result<()> {
+    // SAFETY: as above; GEQ is what monotonic doorbell values need — a rank
+    // that sat out intermediate whales left its flags behind, and any later
+    // ring satisfies every earlier wait.
+    unsafe {
+        cu_sys::cuStreamWaitValue64_v2(
+            active_cu_stream(ctx),
+            addr,
+            value,
+            cu_sys::CUstreamWaitValue_flags::CU_STREAM_WAIT_VALUE_GEQ as u32,
+        )
+    }
+    .result()
+    .map_err(|error| anyhow::anyhow!("cuStreamWaitValue64 failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_regions_are_disjoint_aligned_and_world_scaled() {
+        let world = 16;
+        let seg_cap = 16896;
+        let layout = K3WhaleSlabLayout::new(world, seg_cap);
+        let regions = [
+            (layout.publish_inbox, world * K3_WHALE_ALIGN),
+            (layout.consume_inbox, world * K3_WHALE_ALIGN),
+            (layout.normed_tail, K3_CONV_STATE * K3_HIDDEN * 2),
+            (layout.kda_m, K3_KDA_STATE * 4),
+            (layout.kda_d, K3_KDA_STATE * 4),
+            (layout.mla_latent, seg_cap * K3_KV_LORA_RANK * 2),
+            (layout.mla_rope, seg_cap * K3_QK_ROPE_HEAD_DIM * 2),
+        ];
+        for (offset, _) in regions {
+            assert_eq!(offset % K3_WHALE_ALIGN, 0, "unaligned region at {offset}");
+        }
+        let mut sorted = regions;
+        sorted.sort_by_key(|&(offset, _)| offset);
+        for pair in sorted.windows(2) {
+            assert!(
+                pair[0].0 + pair[0].1 <= pair[1].0,
+                "regions overlap: {pair:?}"
+            );
+        }
+        let (last_offset, last_bytes) = sorted[sorted.len() - 1];
+        assert!(last_offset + last_bytes <= layout.num_bytes);
+    }
+
+    #[test]
+    fn doorbell_values_are_strictly_monotonic_across_whales_and_windows() {
+        let mut previous = 0u64;
+        for seq in [0u64, 1, 2, 7, 8] {
+            for window in 0..4u64 {
+                let value = K3WhaleGang::window_value(seq, window).unwrap();
+                assert!(value > previous, "seq {seq} window {window}");
+                previous = value;
+            }
+        }
+        assert!(K3WhaleGang::window_value(0, K3_WHALE_WINDOW_STRIDE).is_err());
+    }
+
+    #[test]
+    fn flag_slots_are_one_line_apart_per_source_rank() {
+        let layout = K3WhaleSlabLayout::new(4, 4224);
+        let base = 1 << 20;
+        for from in 0..4 {
+            let publish = layout.publish_flag(base, from);
+            let consume = layout.consume_flag(base, from);
+            assert_eq!(publish % 8, 0);
+            assert_eq!(consume % 8, 0);
+            assert_eq!(
+                publish,
+                base + layout.publish_inbox as u64 + (from * K3_WHALE_ALIGN) as u64
+            );
+            assert!(consume >= base + layout.consume_inbox as u64);
+        }
+    }
+}

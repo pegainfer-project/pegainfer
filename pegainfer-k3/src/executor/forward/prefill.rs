@@ -321,8 +321,8 @@ pub(super) fn kda_attention_chunk(
                 K3_HIDDEN,
             )?;
         }
-        let group = cp.group.clone();
-        let sync = cp.window_sync(K3CpWindowKind::Halo);
+        let group = cp.sync.clone();
+        let sync = cp.window_sync(K3CpWindowKind::Halo)?;
         group.exchange(ctx, &sync, || {
             if cp.cp_rank > 0 {
                 let source = cp.peers[cp.cp_rank - 1].normed_tail;
@@ -579,8 +579,8 @@ pub(super) fn kda_attention_chunk(
                     K3_KDA_STATE,
                 )?;
             }
-            let cp_group = cp.group.clone();
-            let cp_sync = cp.window_sync(K3CpWindowKind::Upstream);
+            let cp_group = cp.sync.clone();
+            let cp_sync = cp.window_sync(K3CpWindowKind::Upstream)?;
             cp_group.exchange(ctx, &cp_sync, || {
                 for j in 0..cp.cp_rank {
                     k3_cp_copy_in(
@@ -835,8 +835,8 @@ pub(super) fn mla_attention_chunk_cp(
         t_q,
         crate::config::K3_QK_ROPE_HEAD_DIM,
     )?;
-    let group = cp.group.clone();
-    let sync = cp.window_sync(K3CpWindowKind::Upstream);
+    let group = cp.sync.clone();
+    let sync = cp.window_sync(K3CpWindowKind::Upstream)?;
     group.exchange(ctx, &sync, || {
         for j in 0..cp.cp_rank {
             let (peer_start, peer_len) = cp.segments[j];
