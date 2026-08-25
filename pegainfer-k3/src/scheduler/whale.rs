@@ -613,13 +613,24 @@ pub fn k3_whale_segments(total: usize, width: usize, chunk_tokens: usize) -> Vec
     if width == 1 || total == 0 {
         return vec![(0, total)];
     }
+    // The padded per-row families (KDA, norms, projections, MoE entry) run at
+    // the covering chunk *bucket*, a step function of segment length — only
+    // attention is varlen. Pure leveling stretches the earliest segment past
+    // the bucket the mean sits in whenever the mean runs close to a boundary
+    // (65k over 8 ranks: mean 8,140, leveled head 8.6k → the 16,896 bucket,
+    // doubling its padded rows while the lockstep superstep waits — a
+    // measured ~900ms step). Cap segments at the mean's bucket: everyone
+    // stays in the same bucket, and leveling still balances the attention
+    // triangle inside it.
+    let cap = pegainfer_kernels::ops::k3_chunk_bucket(total.div_ceil(width))
+        .map_or(chunk_tokens, |bucket| bucket.min(chunk_tokens));
     let affordable = |start: usize, budget: f64| -> usize {
         // Largest len with len + Q·(start + len/2)·len <= budget:
         // (Q/2)·len² + (1 + Q·start)·len − budget = 0.
         let a = K3_CP_QUAD_PER_LINEAR / 2.0;
         let b = 1.0 + K3_CP_QUAD_PER_LINEAR * start as f64;
         let len = (2.0 * budget) / (b + (b * b + 4.0 * a * budget).sqrt());
-        (len.floor() as usize).min(chunk_tokens)
+        (len.floor() as usize).min(cap)
     };
     let coverage = |budget: f64| -> usize {
         let mut start = 0usize;
@@ -727,6 +738,28 @@ mod tests {
             // Later ranks sit on deeper prefixes: leveling only shortens them.
             for pair in segments.windows(2) {
                 assert!(pair[0].1 >= pair[1].1, "{total} @ {width}: {segments:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn segments_stay_inside_the_mean_chunk_bucket() {
+        // The padded per-row families run at the covering chunk bucket, so a
+        // leveled head stretching past the bucket the mean sits in doubles
+        // that rank's padded rows and stalls the lockstep superstep on it
+        // (the measured ~900ms TTFT step at 65k over 8 ranks, where pure
+        // leveling pushed the head from a mean of 8,140 past 8,448). Every
+        // segment must sit in the mean's bucket.
+        for (total, width) in [(65116usize, 8usize), (66000, 8), (33000, 8), (131072, 16)] {
+            let cap = pegainfer_kernels::ops::k3_chunk_bucket(total.div_ceil(width)).unwrap();
+            let segments = k3_whale_segments(total, width, CHUNK);
+            assert_eq!(segments.iter().map(|&(_, len)| len).sum::<usize>(), total);
+            for &(_, len) in &segments {
+                assert!(
+                    len <= cap,
+                    "{total} @ {width}: segment of {len} rows leaves the {cap} bucket: \
+                     {segments:?}"
+                );
             }
         }
     }
