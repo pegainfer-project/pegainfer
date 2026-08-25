@@ -61,6 +61,15 @@ fn rel_l2_bar() -> f64 {
     4e-2 * (layers as f64).sqrt()
 }
 
+/// The prompt length the logits gate runs at (`PEGAINFER_K3_CP_PROMPT`,
+/// default [`MAX_CTX`]).
+fn gate_prompt_ceiling() -> usize {
+    std::env::var("PEGAINFER_K3_CP_PROMPT")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(MAX_CTX)
+}
+
 fn checkpoint() -> PathBuf {
     let path = std::env::var(CHECKPOINT_ENV)
         .unwrap_or_else(|_| panic!("set {CHECKPOINT_ENV} to the 224-expert checkpoint directory"));
@@ -69,7 +78,10 @@ fn checkpoint() -> PathBuf {
 
 fn config() -> K3ExecutorConfig {
     let mut config = K3ExecutorConfig::default().from_env();
-    config.max_ctx = MAX_CTX;
+    // `PEGAINFER_K3_CP_PROMPT` raises the serving ceiling with the prompt:
+    // the 16896-token MegaMoE protocol maximum makes CP4 span 64k prompts in
+    // one superstep, and the gate must be able to follow it up.
+    config.max_ctx = MAX_CTX.max(gate_prompt_ceiling());
     // One decode slot: the gate never decodes, and a slot's KDA state slab is
     // ~1 GiB across the full depth.
     config.max_batch = 1;
@@ -185,10 +197,7 @@ fn run_gang(lengths: &[usize], runs: usize) -> (RankReport, RankReport) {
 #[test]
 #[ignore = "needs 4 GPUs and the 224-expert checkpoint"]
 fn cp4_prefill_matches_cp1() {
-    let ceiling = std::env::var("PEGAINFER_K3_CP_PROMPT")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(MAX_CTX);
+    let ceiling = gate_prompt_ceiling();
     let lengths = [ceiling, ceiling - 1];
     let (first, last) = run_gang(&lengths, 1);
     for (index, &len) in lengths.iter().enumerate() {

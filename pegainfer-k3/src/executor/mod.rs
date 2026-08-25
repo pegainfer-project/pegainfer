@@ -22,7 +22,7 @@
 //!
 //! Prefill runs the batched step over **chunks of one sequence**: the bucket's
 //! rows carry up to `chunk_tokens` consecutive prompt tokens (default: the
-//! 4224-row MegaMoE protocol maximum, clamped to `max_ctx`), so every
+//! 16896-row MegaMoE protocol maximum, clamped to `max_ctx`), so every
 //! row-independent stage (norms, projections, MoE) digests the whole chunk
 //! in one launch, the MLA layers attend `[context | chunk]` through one
 //! dense FlashMLA FMHA call per layer over kv_b-expanded scratch, and the
@@ -152,7 +152,7 @@ const K3_MEGA_SMS: usize = 152;
 
 /// Slots per rank an expert-parallel launch takes when nothing says otherwise.
 ///
-/// The fused kernel's protocol maximum is 4224 rows per rank (sized for
+/// The fused kernel's protocol maximum is 16896 rows per rank (sized for
 /// chunked prefill), so the compiled
 /// bucket ceiling (128) is the target once the backbone goes FP8. Today the
 /// binding constraint is the KDA state slab: ~929 MB per slot (f32 recurrent
@@ -179,7 +179,7 @@ pub struct K3ExecutorConfig {
     /// Layers to build; `K3_LAYERS` for the whole model.
     pub num_layers: usize,
     /// Prefill chunk cap in tokens. `0` derives the widest the transport
-    /// carries: the MegaMoE protocol maximum (4224, clamped to `max_ctx`)
+    /// carries: the MegaMoE protocol maximum (16896, clamped to `max_ctx`)
     /// under the fused kernel, `max_batch` under the masked chain (whose
     /// layout reserves at most [`K3_MASKED_CAP`] rows per expert).
     pub chunk_tokens: usize,

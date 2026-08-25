@@ -20,7 +20,9 @@ HTTP e2e 同脚本 4 卡对 4 卡：16k CP4 1161 ms vs vLLM TP4 1181 ms 首次�
 §16 卡对局**；**gap anatomy 2026-08-25：2.86× 的缺口 40% 是 MoE 不吃 CP 的
 Amdahl 项，CP4 硬顶 3.49×，通信仅 0.6% 且纯 peer D2D 已快过 NCCL 地板，
 详见 §CP4 gap anatomy；event 门控交换 + M+D 融合 kernel 双双落地后
-CP4/CP1 = 2.95×，剩余缺口只剩 FMHA 三角与 Amdahl 项**）→ M1 full@EP16
+CP4/CP1 = 2.95×，剩余缺口只剩 FMHA 三角与 Amdahl 项；**mega 协议上限
+2026-08-25 直升 16896：CP4 单 superstep 盖 67.5k，64k 门禁绿 CP4 5.0s vs
+CP1 13.9s，CP8/CP16 只差 gang 侧**）→ M1 full@EP16
 交叉矩阵 + lane-vs-独占步系统 A/B
 → M2 agent cache 闭环 → M3 弹性调度。
 
@@ -217,7 +219,8 @@ strided-batched GEMM（96×128³，新增 `gemm_strided_batched_f32`）。conv h
 接收方把上游 3 行 normed 过 wbig band 投影（bucket 4 + 零 pad 行）。MLA 交换
 post-norm latent + rope，绕过 paged gather 直接拼 `mla_ctx`。进程内 barrier +
 peer D2D 读（MegaMoE mempool 已开 peer access）。M0 约束：单 superstep，每段
-≤ chunk_tokens（4224）。
+≤ chunk_tokens（当时 4224；2026-08-25 mega 协议上限升 16896 后 CP4 单
+superstep 盖到 67.5k，见 §Mega 协议上限）。
 
 实测（tray14，pruned 224-expert @EP4，`cp_prefill.rs`）：
 
@@ -274,7 +277,8 @@ peer D2D 读（MegaMoE mempool 已开 peer access）。M0 约束：单 superstep
   方案，可用 CP4 独占近似，不必真建 TP4），指标 = whale TTFT / decode TPOT
   p99 / goodput / EP barrier wait；
 - 单 gang、gang 内 BS=1、暂无 prefix hit 进 CP 路径；
-- 依赖：mega world >4224（roadmap 已挂账，whale chunk 12–16k 需要）。
+- 依赖：mega world >4224 —— **DONE 2026-08-25，直接 4 倍到 16896**（见
+  §Mega 协议上限）。
 
 ### M2 — Agent cache 闭环
 
@@ -384,8 +388,9 @@ gang——生产默认 2048 以下走本地）：
   的 2.62× 还好——全量 MoE 更重，CP 摊薄的 attention 份额相对更大）。
 - **对 vLLM 的横向账分两段**：1–2k CP4 赢 1.3–1.5×（他们的 TP16 中段
   掉进 ~400ms 平台）；4k 基本打平；8k+ 输 0.68–0.73×——vLLM prefill 是
-  16 路全切，我们 M0 的 CP 宽度被单 superstep 约束钉在 4（每段 ≤4224）。
-  **8k+ 的差距就是 M1 多 superstep + CP8/CP16 的立项理由**：CP4 已把
+  16 路全切，我们 M0 的 CP 宽度被单 superstep 约束钉在 4（每段 ≤4224；
+  2026-08-25 mega 升 16896 后该约束实际消失，CP8/CP16 只差 gang 侧）。
+  **8k+ 的差距就是 M1 CP8/CP16 的立项理由**：CP4 已把
   CP1 的 3061 压到 1072，宽度每翻倍理论上还有 ~1.6–1.8× 空间。
 - vLLM 两列的差距（16k 728 vs 8921，12×）是 fabric 的账不是引擎的账：
   任何一台 tray 的 nvidia-imex daemon 挂掉，整个 MNNVL 域的 fabric
@@ -447,8 +452,39 @@ argmax/token 一致）：暖跑 CP4 forward 墙钟 **1037.7→1001.6 ms，CP4/CP
 （2.95×）→ FMHA 条带化配段（≈3.1–3.2×）→ **3.49× 是 EP 共享 MoE 的硬顶，
 再往上只有 M1 加宽**。
 
+## Mega 协议上限 4224 → 16896（M1 的前半，2026-08-25）
+
+`kProtocolMaxTokensPerRank` 直接 4 倍到 16896（=44×384 对齐；ring 容量随
+之线性缩放，是 kernel 模板参数所以全 world 重实例化）。动机：**单
+superstep 的 CP 天花板从 16.9k 直升 67.5k @CP4**（CP16@EP16 理论 256k+，
+FlashKDA 264k 线性已证 kernel 侧免费），多 superstep 段游走在实用长度内
+基本失去必要性；CP1 本地 chunked prefill 同时受益（16k = 单 chunk，mega
+发射数 ÷4，GEMM 形状进高效区）。
+
+代价是 symm slab 随协议上限线性长（`k3_mega_symm_buffer_layout` 实测）：
+EP4/224 1.6→6.3 GiB，**EP16/896 5.1→19.6 GiB**——EP16 全量（权重 190.7
+GiB/rank）后 HBM 收紧 ~15 GiB，fleet 复测时要盯。TileLang prefill bucket
+梯子补 8448/16896 两档（AOT 全家 +24s 构建）。
+
+验证链（tray14/06，pruned@EP4）：
+- **16k 门禁与旧协议逐位同答案**（rel_l2 2.523e-1/4.511e-2 与 4224 时代
+  完全一致——GEMM 行独立 + FlashKDA 跨 call 状态 bf16↔fp32 无损 + FMHA
+  行内在线 softmax，chunking 对 CP1 逐位稳定）；CP4 墙钟不变（段仍 4096）。
+- **64k 单 superstep CP4 落地**：argmax/token 与 CP1 一致，rel_l2
+  9.4e-2/7.0e-2（bar 0.386）；暖跑墙钟 **CP1 13870 ms vs CP4 5006 ms =
+  2.77×**。
+- mega oracle 双绿且 **Gate 1 bitwise**（EP4 vs EP1 全 40 token +
+  163840 logits 逐位一致），Gate 2 流量不变性 bitwise 保持。
+- ttft sweep（tray06，min-of-4）：CP1 @16k 2980→2870 ms（单 chunk mega
+  赚 ~110 ms），CP4 @16k 1003.5 持平（段仍 4096），CP4/CP1 2.86×；
+  128–8k 档与旧表一致（128: 0.84× / 1k: 1.68× / 4k: 2.60× / 8k: 2.82×，
+  交叉点 ~400 tokens 不动）。
+- golden_decode 串行 13/13 绿（`--test-threads 1`，bring-up.md 的规定跑
+  法；默认并行会 13 实例同租一卡 OOM——mega slab EP1 涨到 3.2 GiB 后更
+  容易炸，跑法不对怪跑法）。
+
 ## Next action
 
-M1 立项：mega world >4224 + 多 superstep 段游走 → CP8/CP16，8k+ 追平
-vLLM TP16 的 16 路切分；full@EP16 交叉矩阵 + 系统 A/B。次优先：前端固定
-截距（132 vs 59 ms @122 tokens）。
+M1 后半：CP8/CP16 gang（full@EP16 交叉矩阵 + 系统 A/B），8k+ 追平 vLLM
+TP16 的 16 路切分；EP16 全量下 19.6 GiB slab 的 HBM 账实测。次优先：FMHA
+条带化配段、前端固定截距（132 vs 59 ms @122 tokens）。
