@@ -37,12 +37,15 @@
 //! `GEQ` wait condition needs. Flag arrays are indexed by *global* rank, so
 //! rotation never aliases a slot.
 
+use std::sync::Arc;
+
 use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::sys as cu_sys;
 use half::bf16;
 use pegainfer_kernels::ops::K3_MEGA_FABRIC_HANDLE_BYTES;
+use pegainfer_kernels::ops::k3_chunk_bucket;
 use pegainfer_kernels::ops::k3_mega_fabric_slab_alloc;
 use pegainfer_kernels::ops::k3_mega_fabric_slab_import;
 use pegainfer_kernels::ops::k3_mega_fabric_supported;
@@ -53,6 +56,8 @@ use pegainfer_kernels::tensor::active_cu_stream;
 use super::buffers::K3_CONV_STATE;
 use super::buffers::K3_KDA_STATE;
 use super::cp::K3CpPeerPtrs;
+use super::cp::K3CpScratch;
+use super::cp::K3CpSyncHandle;
 use super::cp::K3CpWindowKind;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_KV_LORA_RANK;
@@ -333,6 +338,92 @@ impl K3WhaleGang {
             stream_wait_value(ctx, flag, doorbell).context("K3 whale consume doorbell wait")?;
         }
         Ok(())
+    }
+}
+
+/// The whale lane's startup dance on one executor, in call order: allocate
+/// the slab, exchange handles through the hub (the caller's job), import the
+/// world, install the gang. Serving needs nothing further — a committed
+/// whale re-arms the scratch per superstep.
+impl super::K3Executor {
+    /// Allocate this rank's whale slab — its fleet CP publish surface plus
+    /// doorbells — before the fleet's handle exchange. `world` is the whale
+    /// world size; every rank must derive the identical layout, which the
+    /// import checks byte-for-byte. Once per executor. Returns the local base
+    /// (for the process-wide import table) and the wire identity peers import.
+    pub fn arm_whale_slab(&mut self, world: usize) -> Result<(u64, K3WhaleSlabWire)> {
+        ensure!(
+            self.whale_slab.is_none(),
+            "K3 rank {} armed its whale slab twice",
+            self.model.rank
+        );
+        let layout = K3WhaleSlabLayout::new(world, k3_chunk_bucket(self.chunk_tokens)?);
+        let (base, wire) = k3_whale_slab_alloc(self.ctx.device_ordinal, &layout)?;
+        self.whale_slab = Some((base, layout));
+        Ok((base, wire))
+    }
+
+    /// Map the exchanged world table into this process — once, on any one
+    /// local executor; every local rank then installs one clone of the
+    /// result. `local` maps this process's ranks to their slab bases.
+    pub fn import_whale_world(
+        &self,
+        table: &[K3WhaleSlabWire],
+        local: &[(usize, u64)],
+    ) -> Result<Vec<u64>> {
+        let (_, layout) = self
+            .whale_slab
+            .context("K3 whale import before arm_whale_slab")?;
+        k3_whale_import_world(table, local, &layout, self.ctx.device_ordinal)
+    }
+
+    /// Install the imported world table ([`k3_whale_import_world`]'s result)
+    /// and stand the whale data plane up for this rank.
+    pub fn install_whale_gang(&mut self, bases: Vec<u64>) -> Result<()> {
+        let (base, layout) = self
+            .whale_slab
+            .context("K3 whale gang install before arm_whale_slab")?;
+        let rank = self.model.rank;
+        ensure!(
+            bases.get(rank).copied() == Some(base),
+            "K3 whale slab table does not carry rank {rank}'s own base"
+        );
+        self.whale_gang = Some(Arc::new(K3WhaleGang::new(bases, rank, layout)?));
+        Ok(())
+    }
+
+    /// Build (or re-arm) the fleet CP working set for this whale superstep.
+    /// Unlike the in-process path this opens no peer access — the fabric
+    /// mappings carry their own grants — and arms without any collective.
+    pub(crate) fn ensure_whale_scratch(
+        &mut self,
+        seq: u64,
+        cp_rank: usize,
+        gang_ranks: &[usize],
+        segments: Vec<(usize, usize)>,
+    ) -> Result<()> {
+        let gang = self
+            .whale_gang
+            .clone()
+            .context("K3 whale prefill before the gang was installed")?;
+        if let Some(scratch) = self.cp_scratch.as_ref() {
+            ensure!(
+                matches!(&scratch.sync, K3CpSyncHandle::Fleet(mine) if Arc::ptr_eq(mine, &gang)),
+                "K3 CP scratch was built for a different substrate than the whale gang"
+            );
+        } else {
+            self.cp_scratch = Some(Box::new(K3CpScratch::new_fleet(
+                &self.ctx,
+                gang,
+                k3_chunk_bucket(self.chunk_tokens)?,
+            )?));
+            // Local arenas live and zeroed before the superstep touches them.
+            self.gpu.sync()?;
+        }
+        self.cp_scratch
+            .as_mut()
+            .expect("built above")
+            .arm_fleet(seq, cp_rank, gang_ranks, segments)
     }
 }
 

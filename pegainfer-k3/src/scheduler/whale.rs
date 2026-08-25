@@ -56,7 +56,8 @@ use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 
-use crate::executor::cp::K3_WHALE_SEGMENT_FLOOR;
+use crate::executor::cp::k3_whale_gang;
+use crate::executor::cp::k3_whale_width;
 
 /// A rank's identity across the whole EP world (not its process-local index).
 pub type GlobalRank = usize;
@@ -508,152 +509,6 @@ impl WhaleMember {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Policy: width, gang membership, segment leveling
-// ---------------------------------------------------------------------------
-
-/// The widest gang the prompt admits, or `None` when no width in
-/// `1 < w <= world` (powers of two, tray-aligned) does. Wider is better: the
-/// whale superstep stalls the *whole* fleet on the gang's finish line (the
-/// mega collective is global), so the gang that spreads the prompt thinnest —
-/// subject to every leveled segment staying above the floor and below one
-/// chunk — minimizes everyone's stall, not just the whale's latency.
-pub fn k3_whale_width(total: usize, world: usize, chunk_tokens: usize) -> Option<usize> {
-    let mut width = 1usize;
-    while width * 2 <= world {
-        width *= 2;
-    }
-    while width >= 2 {
-        if k3_whale_admits(total, width, chunk_tokens) {
-            return Some(width);
-        }
-        width /= 2;
-    }
-    None
-}
-
-/// Whether `total` tokens split over `width` ranks keeps every leveled
-/// segment above the floor and within one chunk step (one superstep per rank
-/// — the multi-superstep walk is out of scope until profiles demand it).
-pub fn k3_whale_admits(total: usize, width: usize, chunk_tokens: usize) -> bool {
-    if width < 2 || total < width * K3_WHALE_SEGMENT_FLOOR {
-        return false;
-    }
-    let segments = k3_whale_segments(total, width, chunk_tokens);
-    segments
-        .last()
-        .is_some_and(|&(start, len)| start + len == total)
-        && segments
-            .iter()
-            .all(|&(_, len)| len >= K3_WHALE_SEGMENT_FLOOR && len <= chunk_tokens)
-}
-
-/// The gang for a `width`-wide whale posted by `poster`: the tray-aligned
-/// contiguous block of ranks containing the poster (trays are 4 ranks; a
-/// contiguous block keeps the halo hop and most upstream traffic inside a
-/// tray or between adjacent trays), with the poster rotated to the end — the
-/// owner is the last CP rank, so the final KDA state and the whole MLA
-/// context land on the rank that will decode.
-pub fn k3_whale_gang(poster: GlobalRank, width: usize, world: usize) -> Vec<GlobalRank> {
-    debug_assert!(poster < world && width <= world);
-    const TRAY: usize = 4;
-    let start = if width >= TRAY {
-        (poster / TRAY * TRAY).min(world.saturating_sub(width))
-    } else {
-        poster.min(world.saturating_sub(width))
-    };
-    let mut gang: Vec<GlobalRank> = (start..start + width).filter(|&r| r != poster).collect();
-    gang.push(poster);
-    gang
-}
-
-/// How much one context token costs relative to one segment token, in the
-/// per-rank superstep time model `t_i ∝ len_i + Q·(start_i + len_i/2)·len_i`:
-/// the linear term is the full-depth per-token walk (MoE, KDA, dense GEMMs),
-/// the quadratic term is the MLA context triangle (each of the segment's rows
-/// attends its whole prefix). Calibrated from the CP4 16k profile
-/// (2026-08-25: a 12k-deeper prefix cost the last rank ~32ms against a
-/// ~1000ms/4k-row superstep); refit when the fleet profile lands. Leveling
-/// only needs the ratio, not the absolute times.
-const K3_CP_QUAD_PER_LINEAR: f64 = 2.7e-6;
-
-/// Split `total` tokens into `width` contiguous leveled segments: earlier
-/// ranks get longer segments, so every rank's modeled superstep time — walk
-/// plus its MLA triangle — comes out even.
-///
-/// Bisected on the per-rank time budget; coverage is monotone in the budget,
-/// so the smallest covering budget is the leveled split. The floor is *not*
-/// enforced here — [`k3_whale_admits`] rejects splits that level below it.
-/// The returned segments always number `width` and start at 0; they
-/// under-cover `total` when the chunk cap makes an exact partition
-/// impossible, which admission rejects too.
-pub fn k3_whale_segments(total: usize, width: usize, chunk_tokens: usize) -> Vec<(usize, usize)> {
-    debug_assert!(width >= 2);
-    if total == 0 {
-        return vec![(0, 0)];
-    }
-    // The padded per-row families (KDA, norms, projections, MoE entry) run at
-    // the covering chunk *bucket*, a step function of segment length — only
-    // attention is varlen. Pure leveling stretches the earliest segment past
-    // the bucket the mean sits in whenever the mean runs close to a boundary
-    // (65k over 8 ranks: mean 8,140, leveled head 8.6k → the 16,896 bucket,
-    // doubling its padded rows while the lockstep superstep waits — a
-    // measured ~900ms step). Cap segments at the mean's bucket: everyone
-    // stays in the same bucket, and leveling still balances the attention
-    // triangle inside it.
-    let cap = pegainfer_kernels::ops::k3_chunk_bucket(total.div_ceil(width))
-        .map_or(chunk_tokens, |bucket| bucket.min(chunk_tokens));
-    let affordable = |start: usize, budget: f64| -> usize {
-        // Largest len with len + Q·(start + len/2)·len <= budget:
-        // (Q/2)·len² + (1 + Q·start)·len − budget = 0.
-        let a = K3_CP_QUAD_PER_LINEAR / 2.0;
-        let b = 1.0 + K3_CP_QUAD_PER_LINEAR * start as f64;
-        let len = (2.0 * budget) / (b + (b * b + 4.0 * a * budget).sqrt());
-        (len.floor() as usize).min(cap)
-    };
-    let coverage = |budget: f64| -> usize {
-        let mut start = 0usize;
-        for _ in 0..width {
-            start += affordable(start, budget);
-        }
-        start
-    };
-    // Bisect the smallest budget that covers the prompt. The even split's
-    // per-rank cost bounds it above (leveling can only lower the maximum).
-    let per = total.div_ceil(width) as f64;
-    let mut hi = per * (1.0 + K3_CP_QUAD_PER_LINEAR * total as f64);
-    let mut lo = 0.0f64;
-    for _ in 0..64 {
-        let mid = (lo + hi) / 2.0;
-        if coverage(mid) >= total {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    let mut segments = Vec::with_capacity(width);
-    let mut start = 0usize;
-    for rank in 0..width {
-        let remaining = total - start;
-        let ranks_left = width - rank;
-        // The bisected budget's segment, clamped to leave every later rank at
-        // least one token; the last rank takes whatever is left. Leveling is
-        // a preference, the exact partition is the contract — when the chunk
-        // cap makes exactness impossible the result under-covers and
-        // [`k3_whale_admits`] rejects it.
-        let len = if ranks_left == 1 {
-            remaining.min(chunk_tokens)
-        } else {
-            affordable(start, hi)
-                .max(1)
-                .min(remaining.saturating_sub(ranks_left - 1))
-        };
-        segments.push((start, len));
-        start += len;
-    }
-    segments
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,129 +519,6 @@ mod tests {
 
     fn prompt_of(total: usize) -> Arc<[u32]> {
         (0..total as u32).collect()
-    }
-
-    // ---- policy: width -----------------------------------------------------
-
-    #[test]
-    fn width_covers_256k_at_ep16() {
-        assert_eq!(k3_whale_width(262144, 16, CHUNK), Some(16));
-    }
-
-    #[test]
-    fn width_refuses_hopeless_prompts() {
-        // Below two floors no gang splits legally...
-        assert_eq!(
-            k3_whale_width(2 * K3_WHALE_SEGMENT_FLOOR - 1, 16, CHUNK),
-            None
-        );
-        assert_eq!(k3_whale_width(1024, 16, CHUNK), None);
-        // ...and past world x chunk the M0 one-superstep-per-rank walk ends.
-        assert_eq!(k3_whale_width(16 * CHUNK + 1, 16, CHUNK), None);
-    }
-
-    #[test]
-    fn width_is_the_widest_admitting_power_of_two() {
-        for total in [8192usize, 12288, 16384, 32768, 65536, 131072, 262144] {
-            let width = k3_whale_width(total, 16, CHUNK)
-                .unwrap_or_else(|| panic!("{total} tokens should admit some width"));
-            assert!(k3_whale_admits(total, width, CHUNK), "{total} @ {width}");
-            let mut wider = width * 2;
-            while wider <= 16 {
-                assert!(!k3_whale_admits(total, wider, CHUNK), "{total} @ {wider}");
-                wider *= 2;
-            }
-        }
-    }
-
-    // ---- policy: segments --------------------------------------------------
-
-    #[test]
-    fn segments_partition_exactly_and_level_downward() {
-        for (total, width) in [(262144usize, 16usize), (65536, 8), (12288, 4), (8192, 2)] {
-            let segments = k3_whale_segments(total, width, CHUNK);
-            assert_eq!(segments.len(), width, "{total} @ {width}");
-            let mut expected_start = 0;
-            for &(start, len) in &segments {
-                assert_eq!(start, expected_start, "{total} @ {width}: {segments:?}");
-                assert!(len <= CHUNK);
-                expected_start += len;
-            }
-            assert_eq!(expected_start, total, "{total} @ {width}: {segments:?}");
-            // Later ranks sit on deeper prefixes: leveling only shortens them.
-            for pair in segments.windows(2) {
-                assert!(pair[0].1 >= pair[1].1, "{total} @ {width}: {segments:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn segments_stay_inside_the_mean_chunk_bucket() {
-        // The padded per-row families run at the covering chunk bucket, so a
-        // leveled head stretching past the bucket the mean sits in doubles
-        // that rank's padded rows and stalls the lockstep superstep on it
-        // (the measured ~900ms TTFT step at 65k over 8 ranks, where pure
-        // leveling pushed the head from a mean of 8,140 past 8,448). Every
-        // segment must sit in the mean's bucket.
-        for (total, width) in [(65116usize, 8usize), (66000, 8), (33000, 8), (131072, 16)] {
-            let cap = pegainfer_kernels::ops::k3_chunk_bucket(total.div_ceil(width)).unwrap();
-            let segments = k3_whale_segments(total, width, CHUNK);
-            assert_eq!(segments.iter().map(|&(_, len)| len).sum::<usize>(), total);
-            for &(_, len) in &segments {
-                assert!(
-                    len <= cap,
-                    "{total} @ {width}: segment of {len} rows leaves the {cap} bucket: \
-                     {segments:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn segments_leveling_bites_at_depth() {
-        // At 256k the last rank's MLA triangle is ~2/3 of its walk; an even
-        // split would park the whole fleet on its tail.
-        let segments = k3_whale_segments(262144, 16, CHUNK);
-        let first = segments.first().unwrap().1;
-        let last = segments.last().unwrap().1;
-        assert!(
-            first > last + 1000,
-            "leveling too timid at 256k: first {first}, last {last}"
-        );
-    }
-
-    // ---- policy: gang ------------------------------------------------------
-
-    #[test]
-    fn gang_is_tray_aligned_with_the_poster_last() {
-        assert_eq!(k3_whale_gang(5, 8, 16), vec![4, 6, 7, 8, 9, 10, 11, 5]);
-        assert_eq!(k3_whale_gang(14, 8, 16), vec![8, 9, 10, 11, 12, 13, 15, 14]);
-        let full = k3_whale_gang(0, 16, 16);
-        assert_eq!(full.len(), 16);
-        assert_eq!(full.last(), Some(&0));
-    }
-
-    #[test]
-    fn gang_is_always_a_contiguous_in_world_block_containing_the_poster() {
-        for world in [4usize, 8, 16] {
-            for width in [2usize, 4, 8, 16].into_iter().filter(|&w| w <= world) {
-                for poster in 0..world {
-                    let gang = k3_whale_gang(poster, width, world);
-                    assert_eq!(gang.len(), width);
-                    assert_eq!(gang.last(), Some(&poster));
-                    let mut sorted = gang.clone();
-                    sorted.sort_unstable();
-                    sorted.dedup();
-                    assert_eq!(sorted.len(), width, "duplicates in {gang:?}");
-                    assert!(sorted.iter().all(|&rank| rank < world));
-                    assert_eq!(
-                        sorted.last().unwrap() - sorted.first().unwrap(),
-                        width - 1,
-                        "gang {gang:?} is not contiguous"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
@@ -1240,6 +972,7 @@ mod fuzz {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::executor::cp::K3_WHALE_SEGMENT_FLOOR;
 
     struct Rng(u64);
 

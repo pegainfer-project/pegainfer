@@ -99,6 +99,8 @@ use self::buffers::K3Scratch;
 use self::buffers::K3StatePool;
 use self::cp::K3CpGroup;
 use self::cp::K3CpScratch;
+use self::cp::k3_whale_admits;
+use self::cp::k3_whale_segments;
 use self::dspark::K3_DSPARK_AUX_LAYERS;
 use self::dspark::K3_DSPARK_BLOCK;
 use self::dspark::K3_DSPARK_CONTEXT_DIM;
@@ -115,10 +117,6 @@ use self::forward::k3_decode_step;
 use self::forward::k3_prefill_boundary_sample;
 use self::forward::k3_prefill_chunk_step;
 use self::forward::k3_verify_step;
-use self::whale_gang::K3WhaleGang;
-use self::whale_gang::K3WhaleSlabLayout;
-use self::whale_gang::K3WhaleSlabWire;
-use self::whale_gang::k3_whale_slab_alloc;
 use crate::config::K3_DENSE_LAYERS;
 use crate::config::K3_LAYERS;
 use crate::config::K3MoeTopo;
@@ -129,8 +127,6 @@ use crate::scheduler::DecodeSlot;
 use crate::scheduler::SlotId;
 use crate::scheduler::StepExecutor;
 use crate::scheduler::whale::CommittedWhale;
-use crate::scheduler::whale::k3_whale_admits;
-use crate::scheduler::whale::k3_whale_segments;
 use crate::weights::K3RankGpuContext;
 use crate::weights::K3WeightManifest;
 use crate::weights::load_rank_weights_to_gpu;
@@ -1512,52 +1508,6 @@ impl K3Executor {
             .arm(&self.ctx, cp_rank, segments)
     }
 
-    /// Allocate this rank's whale slab — its fleet CP publish surface plus
-    /// doorbells — before the fleet's handle exchange. `world` is the whale
-    /// world size; every rank must derive the identical layout, which the
-    /// import checks byte-for-byte. Once per executor. Returns the local base
-    /// (for the process-wide import table) and the wire identity peers import.
-    pub fn arm_whale_slab(&mut self, world: usize) -> Result<(u64, K3WhaleSlabWire)> {
-        ensure!(
-            self.whale_slab.is_none(),
-            "K3 rank {} armed its whale slab twice",
-            self.model.rank
-        );
-        let layout = K3WhaleSlabLayout::new(world, k3_chunk_bucket(self.chunk_tokens)?);
-        let (base, wire) = k3_whale_slab_alloc(self.ctx.device_ordinal, &layout)?;
-        self.whale_slab = Some((base, layout));
-        Ok((base, wire))
-    }
-
-    /// Map the exchanged world table into this process — once, on any one
-    /// local executor; every local rank then installs one clone of the
-    /// result. `local` maps this process's ranks to their slab bases.
-    pub fn import_whale_world(
-        &self,
-        table: &[K3WhaleSlabWire],
-        local: &[(usize, u64)],
-    ) -> Result<Vec<u64>> {
-        let (_, layout) = self
-            .whale_slab
-            .context("K3 whale import before arm_whale_slab")?;
-        whale_gang::k3_whale_import_world(table, local, &layout, self.ctx.device_ordinal)
-    }
-
-    /// Install the imported world table ([`k3_whale_import_world`]'s result)
-    /// and stand the whale data plane up for this rank.
-    pub fn install_whale_gang(&mut self, bases: Vec<u64>) -> Result<()> {
-        let (base, layout) = self
-            .whale_slab
-            .context("K3 whale gang install before arm_whale_slab")?;
-        let rank = self.model.rank;
-        ensure!(
-            bases.get(rank).copied() == Some(base),
-            "K3 whale slab table does not carry rank {rank}'s own base"
-        );
-        self.whale_gang = Some(Arc::new(K3WhaleGang::new(bases, rank, layout)?));
-        Ok(())
-    }
-
     fn prefill_whale_inner(
         &mut self,
         whale: &CommittedWhale,
@@ -1594,40 +1544,6 @@ impl K3Executor {
         self.prefill_state.reset_row(&self.ctx, 0)?;
         self.ensure_whale_scratch(descriptor.seq, cp_rank, &descriptor.gang, segments)?;
         self.cp_superstep(slot, prompt, cp_rank, width)
-    }
-
-    /// Build (or re-arm) the fleet CP working set for this whale superstep.
-    /// Unlike the in-process path this opens no peer access — the fabric
-    /// mappings carry their own grants — and arms without any collective.
-    fn ensure_whale_scratch(
-        &mut self,
-        seq: u64,
-        cp_rank: usize,
-        gang_ranks: &[usize],
-        segments: Vec<(usize, usize)>,
-    ) -> Result<()> {
-        let gang = self
-            .whale_gang
-            .clone()
-            .context("K3 whale prefill before the gang was installed")?;
-        if let Some(scratch) = self.cp_scratch.as_ref() {
-            ensure!(
-                matches!(&scratch.sync, cp::K3CpSyncHandle::Fleet(mine) if Arc::ptr_eq(mine, &gang)),
-                "K3 CP scratch was built for a different substrate than the whale gang"
-            );
-        } else {
-            self.cp_scratch = Some(Box::new(K3CpScratch::new_fleet(
-                &self.ctx,
-                gang,
-                k3_chunk_bucket(self.chunk_tokens)?,
-            )?));
-            // Local arenas live and zeroed before the superstep touches them.
-            self.gpu.sync()?;
-        }
-        self.cp_scratch
-            .as_mut()
-            .expect("built above")
-            .arm_fleet(seq, cp_rank, gang_ranks, segments)
     }
 
     /// One decode step.

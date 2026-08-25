@@ -51,9 +51,9 @@ use self::whale::WhaleMember;
 use self::whale::WhaleSeq;
 use self::whale::WhaleToMember;
 use self::whale::WhaleToSequencer;
-use self::whale::k3_whale_width;
 pub use self::whale_hub::K3WhaleHub;
 use crate::executor::cp::k3_cp_admits;
+use crate::executor::cp::k3_whale_width;
 
 // ── Engine assembly ─────────────────────────────────────────────────────
 
