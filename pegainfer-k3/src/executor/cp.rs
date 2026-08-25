@@ -23,27 +23,54 @@
 //!   bottom-right-aligned causal FMHA serves its queries at
 //!   `t_kv = seg_start + seg_len`.
 //!
-//! The exchange transport is M0-grade: in-process ranks, plain peer-access
-//! device-to-device copies, and a host [`Barrier`] bracketing each window
-//! (sync own stream → barrier → copy from peers → sync → barrier). Roughly
-//! `2 × 69 + 24` windows per superstep — measurable host overhead that an M1
-//! pass moves onto events, but free of ordering hazards.
+//! The exchange transport is in-process ranks and plain peer-access
+//! device-to-device copies, with every ordering edge expressed **on-device**
+//! through CUDA events — the host never syncs a stream inside a superstep.
+//! Each of the roughly `2 × 69 + 24` windows per superstep runs the same
+//! four-beat protocol on every rank:
+//!
+//! 1. record my *publish* event (all my publish writes are enqueued), then
+//!    announce it through my `published` counter;
+//! 2. for each rank I read from this window, spin (host, enqueue-side only)
+//!    until it announced, then make my stream wait on its publish event;
+//! 3. enqueue my peer reads, record my *consume* event, announce it;
+//! 4. for each rank that reads *my* buffers this window, spin until it
+//!    announced, then make my stream wait on its consume event — so my next
+//!    window's publish writes cannot overwrite what a peer is still reading.
+//!
+//! The host spins wait only for peer *enqueue* progress (announces follow
+//! enqueue-only work), so enqueue threads run the whole superstep ahead of
+//! the GPUs and every real dependency resolves stream-to-stream. One event
+//! pair per rank suffices: a wait can only ever attach to the intended
+//! record or a *later* one on the same stream (the counter handshake orders
+//! record before wait at enqueue time), which is at worst conservative,
+//! never early. Counters are monotonic across supersteps — every rank
+//! passes the same collective window count, so the slots agree at each
+//! superstep boundary even as CP ranks rotate.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
+use cudarc::driver::CudaEvent;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
+use cudarc::driver::sys as cu_sys;
 use half::bf16;
 use pegainfer_kernels::ops::K3_KDA_HEAD_DIM;
 use pegainfer_kernels::ops::K3_KDA_HEADS;
 use pegainfer_kernels::ops::gemm_strided_batched_f32;
 use pegainfer_kernels::tensor::DeviceContext;
+use pegainfer_kernels::tensor::active_cu_stream;
 
 use super::buffers::K3_CONV_STATE;
 use super::buffers::K3_KDA_STATE;
@@ -63,6 +90,47 @@ pub(crate) struct K3CpPeerPtrs {
     pub(crate) kda_d: u64,
     pub(crate) mla_latent: u64,
     pub(crate) mla_rope: u64,
+    /// Raw `CUevent` handles for the owning rank's publish/consume events —
+    /// peers wait on these cross-device (the safe wrapper refuses foreign
+    /// contexts); the owning [`K3CpScratch`] keeps the events alive.
+    pub(crate) publish_event: u64,
+    pub(crate) consume_event: u64,
+}
+
+/// Which ranks a window couples. `Halo` moves the conv carry one hop down
+/// the chain; `Upstream` fans every upstream rank's publication down to all
+/// of its successors (KDA packages, MLA latents).
+#[derive(Clone, Copy)]
+pub(crate) enum K3CpWindowKind {
+    Halo,
+    Upstream,
+}
+
+impl K3CpWindowKind {
+    /// Ranks whose publications `me` reads this window.
+    fn reads_from(self, me: usize) -> Range<usize> {
+        match self {
+            Self::Halo => me.saturating_sub(1)..me,
+            Self::Upstream => 0..me,
+        }
+    }
+
+    /// Ranks that read `me`'s publications this window.
+    fn read_by(self, me: usize, cp_size: usize) -> Range<usize> {
+        match self {
+            Self::Halo => (me + 1).min(cp_size)..(me + 2).min(cp_size),
+            Self::Upstream => me + 1..cp_size,
+        }
+    }
+}
+
+/// The borrow-free snapshot one exchange window needs: taken from the
+/// scratch *before* the `consume` closure mutably captures it.
+pub(crate) struct K3CpWindowSync {
+    cp_rank: usize,
+    kind: K3CpWindowKind,
+    /// `(publish_event, consume_event)` raw handles per CP rank.
+    events: Vec<(u64, u64)>,
 }
 
 /// The in-process CP gang: a barrier and a published pointer table shared by
@@ -72,7 +140,18 @@ pub struct K3CpGroup {
     cp_size: usize,
     barrier: Barrier,
     ptrs: Mutex<Vec<Option<K3CpPeerPtrs>>>,
+    /// Per-rank monotonic count of windows whose publish event is recorded.
+    /// Announces enqueue-side progress only — never device completion.
+    published: Vec<AtomicU64>,
+    /// Same for the consume events.
+    consumed: Vec<AtomicU64>,
 }
+
+/// A peer that stops announcing mid-superstep died mid-protocol (a gang
+/// prefill failure is engine-fatal); give slow enqueue threads — which can
+/// legitimately block on launch-queue backpressure for a superstep — ample
+/// slack before declaring it.
+const K3_CP_EXCHANGE_DEADLINE: Duration = Duration::from_secs(60);
 
 impl K3CpGroup {
     pub fn new(cp_size: usize) -> Result<Arc<Self>> {
@@ -84,6 +163,8 @@ impl K3CpGroup {
             cp_size,
             barrier: Barrier::new(cp_size),
             ptrs: Mutex::new(vec![None; cp_size]),
+            published: (0..cp_size).map(|_| AtomicU64::new(0)).collect(),
+            consumed: (0..cp_size).map(|_| AtomicU64::new(0)).collect(),
         }))
     }
 
@@ -110,6 +191,19 @@ impl K3CpGroup {
                 .map(|entry| entry.context("a K3 CP rank never published its buffers"))
                 .collect::<Result<Vec<_>>>()?
         };
+        // Every rank ran the same collective window count last superstep, so
+        // the counters must agree here — a skew means a rank skipped a
+        // window, which the event protocol cannot survive.
+        let base = self.published[0].load(Ordering::Acquire);
+        for rank in 0..self.cp_size {
+            let published = self.published[rank].load(Ordering::Acquire);
+            let consumed = self.consumed[rank].load(Ordering::Acquire);
+            ensure!(
+                published == base && consumed == base,
+                "K3 CP window counters skewed at superstep entry: \
+                 rank {rank} at publish {published} / consume {consumed}, expected {base}"
+            );
+        }
         // Hold everyone until the slowest reader has its snapshot, so a rank
         // entering the NEXT superstep cannot republish underneath it.
         self.barrier.wait();
@@ -118,26 +212,104 @@ impl K3CpGroup {
 
     /// One exchange window: everything this rank published is on-device
     /// before its peers read, and everything it read is on-device before its
-    /// peers overwrite. `consume` issues this rank's reads of peer buffers on
-    /// its own stream. Collective — every rank must reach every window.
+    /// peers overwrite — both edges expressed as stream waits on peer
+    /// events, never as host syncs (see the module doc for the four-beat
+    /// protocol and its safety argument). `consume` issues this rank's reads
+    /// of peer buffers on its own stream. Collective — every rank must reach
+    /// every window, in the same order, with the same window kind.
     pub(crate) fn exchange(
         &self,
         ctx: &DeviceContext,
+        sync: &K3CpWindowSync,
         consume: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        sync_stream(ctx)?;
-        self.barrier.wait();
+        let me = sync.cp_rank;
+        ensure!(
+            sync.events.len() == self.cp_size,
+            "K3 CP window sync of {} ranks in a {}-rank gang",
+            sync.events.len(),
+            self.cp_size
+        );
+        // Only this thread advances its own slot, so Relaxed reads it back.
+        let window = self.published[me].load(Ordering::Relaxed) + 1;
+        record_event(ctx, sync.events[me].0).context("K3 CP publish event record failed")?;
+        self.published[me].store(window, Ordering::Release);
+        for rank in sync.kind.reads_from(me) {
+            self.await_announce(&self.published[rank], window, rank, "publish")?;
+            wait_event(ctx, sync.events[rank].0).context("K3 CP publish event wait failed")?;
+        }
         consume()?;
-        sync_stream(ctx)?;
-        self.barrier.wait();
+        record_event(ctx, sync.events[me].1).context("K3 CP consume event record failed")?;
+        self.consumed[me].store(window, Ordering::Release);
+        for rank in sync.kind.read_by(me, self.cp_size) {
+            self.await_announce(&self.consumed[rank], window, rank, "consume")?;
+            wait_event(ctx, sync.events[rank].1).context("K3 CP consume event wait failed")?;
+        }
+        Ok(())
+    }
+
+    /// Spin until `counter` reaches `window` — waiting on a peer *thread*'s
+    /// enqueue progress, never on a device. A peer that stops announcing has
+    /// died mid-protocol; time out instead of hanging the gang.
+    fn await_announce(
+        &self,
+        counter: &AtomicU64,
+        window: u64,
+        rank: usize,
+        stage: &str,
+    ) -> Result<()> {
+        if counter.load(Ordering::Acquire) >= window {
+            return Ok(());
+        }
+        let deadline = Instant::now() + K3_CP_EXCHANGE_DEADLINE;
+        let mut lap = 0u32;
+        while counter.load(Ordering::Acquire) < window {
+            lap = lap.wrapping_add(1);
+            if lap % 1024 == 0 {
+                ensure!(
+                    Instant::now() < deadline,
+                    "K3 CP rank {rank} never announced its {stage} for exchange window \
+                     {window} — a gang member died mid-protocol"
+                );
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
         Ok(())
     }
 }
 
-fn sync_stream(ctx: &DeviceContext) -> Result<()> {
+fn new_event(ctx: &DeviceContext) -> Result<CudaEvent> {
     ctx.stream
-        .synchronize()
-        .map_err(|error| anyhow::anyhow!("K3 CP stream sync failed: {error}"))
+        .context()
+        .new_event(None)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn record_event(ctx: &DeviceContext, event: u64) -> Result<()> {
+    // SAFETY: the handle is a live event published through the gang table —
+    // its owning scratch outlives the gang's supersteps — recorded on this
+    // rank's active stream.
+    unsafe {
+        cudarc::driver::result::event::record(event as cu_sys::CUevent, active_cu_stream(ctx))
+    }
+    .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn wait_event(ctx: &DeviceContext, event: u64) -> Result<()> {
+    // SAFETY: as above; cross-device stream waits are exactly what
+    // `cuStreamWaitEvent` supports (the safe wrapper just refuses foreign
+    // contexts). The counter handshake ordered the peer's record before this
+    // call, so the wait attaches to the intended record or a later one.
+    unsafe {
+        cudarc::driver::result::stream::wait_event(
+            active_cu_stream(ctx),
+            event as cu_sys::CUevent,
+            cu_sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+        )
+    }
+    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// Whether a prompt of `total` tokens is CP-eligible: every segment must
@@ -216,6 +388,10 @@ pub(crate) struct K3CpScratch {
     pub(crate) upstream_kv_rows: CudaSlice<i32>,
     pub(crate) upstream_len: usize,
     seg_cap: usize,
+    /// This rank's exchange events; peers wait on their raw handles via the
+    /// gang table, so they must live exactly as long as the scratch.
+    publish_event: CudaEvent,
+    consume_event: CudaEvent,
 }
 
 impl K3CpScratch {
@@ -263,6 +439,8 @@ impl K3CpScratch {
                 .context("alloc K3 CP upstream index buffer")?,
             upstream_len: 0,
             seg_cap,
+            publish_event: new_event(ctx).context("create K3 CP publish event")?,
+            consume_event: new_event(ctx).context("create K3 CP consume event")?,
             group,
         })
     }
@@ -335,9 +513,25 @@ impl K3CpScratch {
             kda_d: ptr(&self.kda_d),
             mla_latent: ptr_bf(&self.mla_latent_pub),
             mla_rope: ptr_bf(&self.mla_rope_pub),
+            publish_event: self.publish_event.cu_event() as u64,
+            consume_event: self.consume_event.cu_event() as u64,
         };
         self.peers = self.group.publish_and_snapshot(self.cp_rank, mine)?;
         Ok(())
+    }
+
+    /// Snapshot the event handles one exchange window needs — plain copied
+    /// data, so the `consume` closure is free to capture the scratch.
+    pub(crate) fn window_sync(&self, kind: K3CpWindowKind) -> K3CpWindowSync {
+        K3CpWindowSync {
+            cp_rank: self.cp_rank,
+            kind,
+            events: self
+                .peers
+                .iter()
+                .map(|peer| (peer.publish_event, peer.consume_event))
+                .collect(),
+        }
     }
 
     /// Fold the received upstream packages into this rank's true KDA input
@@ -402,8 +596,9 @@ pub(crate) fn k3_cp_copy_in<T: cudarc::driver::DeviceRepr>(
     let element = size_of::<T>();
     let (dst_ptr, _guard) = dst.device_ptr_mut(&ctx.stream);
     // SAFETY: the destination range was bounds-checked; the source is a live
-    // peer publish buffer inside an exchange window (its owner is parked at
-    // the window's closing barrier until this copy's stream sync).
+    // peer publish buffer inside an exchange window — this copy runs after
+    // the enqueued wait on its owner's publish event, and the owner's next
+    // overwrite waits on this rank's consume event recorded behind it.
     unsafe {
         cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
             dst_ptr + (dst_elem_offset * element) as u64,

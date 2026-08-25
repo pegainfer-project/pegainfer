@@ -32,6 +32,7 @@ use super::super::buffers::copy_rows;
 use super::super::buffers::copy_rows_2d;
 use super::super::buffers::parity_pair;
 use super::super::cp::K3CpScratch;
+use super::super::cp::K3CpWindowKind;
 use super::super::cp::k3_cp_copy_in;
 use super::super::paged_kv::K3_KV_PAGE_TOKENS;
 use super::super::paged_kv::K3_MLA_LATENT_ROW;
@@ -321,7 +322,8 @@ pub(super) fn kda_attention_chunk(
             )?;
         }
         let group = cp.group.clone();
-        group.exchange(ctx, || {
+        let sync = cp.window_sync(K3CpWindowKind::Halo);
+        group.exchange(ctx, &sync, || {
             if cp.cp_rank > 0 {
                 let source = cp.peers[cp.cp_rank - 1].normed_tail;
                 k3_cp_copy_in(
@@ -559,7 +561,8 @@ pub(super) fn kda_attention_chunk(
                 forward(&*conv_v, &cp.zero_state, &mut cp.kda_d)?;
             }
             let cp_group = cp.group.clone();
-            cp_group.exchange(ctx, || {
+            let cp_sync = cp.window_sync(K3CpWindowKind::Upstream);
+            cp_group.exchange(ctx, &cp_sync, || {
                 for j in 0..cp.cp_rank {
                     k3_cp_copy_in(
                         ctx,
@@ -814,7 +817,8 @@ pub(super) fn mla_attention_chunk_cp(
         crate::config::K3_QK_ROPE_HEAD_DIM,
     )?;
     let group = cp.group.clone();
-    group.exchange(ctx, || {
+    let sync = cp.window_sync(K3CpWindowKind::Upstream);
+    group.exchange(ctx, &sync, || {
         for j in 0..cp.cp_rank {
             let (peer_start, peer_len) = cp.segments[j];
             k3_cp_copy_in(
