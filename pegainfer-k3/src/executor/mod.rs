@@ -1083,6 +1083,13 @@ impl StepExecutor for K3Executor {
     /// Held at the current parity, the pump only reads the committed side and
     /// scribbles the scratch side — which the next real step overwrites in
     /// full before anything reads it.
+    ///
+    /// The two single-buffered per-row surfaces are safe by the same
+    /// write-before-read shape: the attn-res snapshot bank has no cross-step
+    /// lifetime (layer 0 is a snapshot layer, and block `j` is recaptured by
+    /// the `j`-th snapshot layer of every step before any `nb_in > j` mix
+    /// reads it — see `k3_layer_geometry`), and the paged KV write skips pump
+    /// rows outright (`kv_row = -1`).
     fn pump_step(&mut self) -> Result<()> {
         if !self.is_expert_parallel() {
             return Ok(());
