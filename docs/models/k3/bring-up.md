@@ -329,7 +329,10 @@ That is 27.6 KB/token against the 1.47 MB/token the expanded `[96×192 K |
   and an unmapped (`-1`) entry reads as zero latent, which is exactly the
   zeroed padding row of the old cache.
 
-Gates (`pegainfer-k3/tests/paged_kv.rs`, plus the golden suite):
+Gates (`pegainfer-k3/tests/paged_kv.rs`, plus the golden suite).
+`scripts/k3_gates.sh` runs the whole checkpoint-backed battery on a tray with
+the invocations below baked in (idle-tray check, prebuilt binaries, per-gate
+logs) — the commands here remain the reference for running one gate by hand:
 
 ```bash
 # Paged gates: page-permutation bitwise, long-context (2048-ctx, 1100 steps,
