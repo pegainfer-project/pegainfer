@@ -17,8 +17,10 @@ HTTP e2e 同脚本 4 卡对 4 卡：16k CP4 1161 ms vs vLLM TP4 1181 ms 首次�
 险胜，对内 CP1 3045 ms = 2.62×，交叉点 ~1k tokens，详表见 §M0.5。**16 卡全量
 对局 DONE：EP16 CP4 16k 1072 ms，CP4/CP1 2.86×；1–2k 赢 vLLM TP16-MNNVL
 1.3–1.5×，8k+ 输 0.68×（我们 CP 宽度钉在 4）——M1 加宽的立项数据，详表见
-§16 卡对局**）→ M1 full@EP16 交叉矩阵 + lane-vs-独占步系统 A/B → M2 agent
-cache 闭环 → M3 弹性调度。
+§16 卡对局**；**gap anatomy 2026-08-25：2.86× 的缺口 40% 是 MoE 不吃 CP 的
+Amdahl 项，CP4 硬顶 3.49×，通信仅 0.6% 且纯 peer D2D 已快过 NCCL 地板，
+详见 §CP4 gap anatomy**）→ M1 full@EP16 交叉矩阵 + lane-vs-独占步系统 A/B
+→ M2 agent cache 闭环 → M3 弹性调度。
 
 Last touched: 2026-08
 
@@ -387,6 +389,38 @@ gang——生产默认 2048 以下走本地）：
   任何一台 tray 的 nvidia-imex daemon 挂掉，整个 MNNVL 域的 fabric
   import 全崩（CUDA 801/600 报的是 import 方不是病灶方），NCCL 静默落
   RoCE。基线以 MNNVL 列为准。
+
+### CP4 gap anatomy（2026-08-25：为什么是 2.86× 不是 4×）
+
+nsys 剖析 `cp_prefill` gate（pruned@EP4，tray13，CP1/CP4 同进程背靠背
+@16384/16383），全账 + NCCL/D2D 通信地板见
+`~/code/bench_results/2026-08-25-k3-cp4-16k-profile/`。核账（kernel 墙钟
+CP1 3159.8ms / CP4 1116.8ms = 2.83×，暖跑 2.88×，与 serving 2.86× 对上）：
+
+- **完美缩放的部分**：elementwise 3.99×、dense GEMM 3.93×、DtoD 3.93×——
+  4k 行的 kernel 效率没有损失。
+- **+132ms：MoE 不吃 CP（Amdahl 项，缺口的 ~40%）**。专家算量每 rank 在
+  CP 下不变（mega 本来就把 token 全 EP 分发）；CP4 的 mega 反而比 CP1 快
+  （93 发 ×16k tokens 比 372 发 ×4k 批得好，391→~229ms），但永远到不了
+  97.8。**硬天花板 = 2700/4+229 = 904ms → CP4 极限 3.49×**，4× 从一开始
+  就不存在。
+- **+141ms：临界 rank（dev3=owner）的空转**——57ms 一次性（首 gang 的
+  peer grant + scratch 建立，暖跑消失）+ ~100ms 每层 0.5–2ms 的交换
+  barrier 等待。
+- **+32ms：FMHA 三角**。causal 使 rank r 的 context 是 r+1 段：每层
+  766/1696/2605/3562µs（正好 4k/8k/12k/16k），总量守恒但墙钟付末 rank 的。
+- KDA 3× doctored 调用（dev1/2 +68ms kernel 时间；rank0/rank3 各 1×，
+  rank3 只等 merge）**大多被隐藏**：跑在等上游 state 的窗口里，只经 mega
+  两侧配对的 skew 上墙。
+- **通信不是缺口，也不是 NCCL**：CP 窗口零 NCCL kernel，纯 peer D2D。
+  PtoP 字节与理论逐 rank 对上（KDA 包 6.29MB fp32 占大头，r3=2513MB
+  实测 vs 2509 理论），拷贝引擎共 7.1ms = **墙钟 0.6%**。同 tray torch
+  地板：raw D2D 779GB/s，NCCL 复刻整个交换 pattern 要 17.5ms——比我们
+  现在还慢 2.5×（6.29MB 消息在 NCCL 协议开销区，91 vs 213GB/s）。
+  MegaMoE 式融合没有字节可藏，可融的是 barrier 空转那 ~100ms。
+
+杠杆排序：暖路径已 2.88×；交换/merge 融进 recurrence 尾（≈3.1×）→ FMHA
+条带化配段（≈3.2×）→ **3.49× 是 EP 共享 MoE 的硬顶，再往上只有 M1 加宽**。
 
 ## Next action
 
