@@ -287,12 +287,9 @@ extern "C" CUresult k3_flash_mla_prefill_fwd(
         t_q, t_kv, cute::make_tuple(K3_FMP_NOPE, K3_FMP_ROPE),
         cute::make_tuple(cute::make_tuple(1, heads), 1));
 
-    // The batch stride slots are materialized as ints, and `t_kv *
-    // k_stride_tok` overflows int32 past ~116k tokens (heads=96) — but with
-    // b = 1 the batch coordinate is always 0, so the stride value is never
-    // used to offset anything. Pass 0 instead of the true extent; the
-    // per-token and per-head strides carry all real addressing, and TMA's
-    // in-descriptor address math is 64-bit.
+    // b = 1 (ProblemShape above): the batch coordinate is always 0, so these
+    // int batch strides never offset. They carry 0 because the true extent
+    // t_kv * stride_tok overflows int32 past ~116k tokens at heads = 96.
     fmp::StrideQ stride_q = cute::make_stride(
         (int)q_stride_tok, cute::_1{},
         cute::make_stride(cute::make_stride((int)q_stride_head, (int)q_stride_head), 0));

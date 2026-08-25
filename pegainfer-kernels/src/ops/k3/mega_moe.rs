@@ -213,23 +213,29 @@ pub fn k3_mega_fabric_slab_import(
     Ok(ptr)
 }
 
-/// Ring a whale doorbell: store `value` into every 8-byte-aligned u64 flag
-/// address in `addrs` (local or fabric-imported device VAs), stream-ordered
-/// after preceding work on `stream`. One-thread SM kernel, because the
-/// stream memops engine rejects imported fabric mappings.
+/// Store `value` into every 8-byte-aligned u64 flag address in `flag_addrs`
+/// (local or fabric-imported device VAs), stream-ordered after preceding
+/// work on `stream`; see `csrc/k3/k3_whale_doorbell.cu`.
 pub fn k3_whale_doorbell_ring(
-    addrs: &[u64],
+    flag_addrs: &[u64],
     value: u64,
     stream: cudarc::driver::sys::CUstream,
 ) -> Result<()> {
-    ensure!(!addrs.is_empty(), "K3 whale doorbell with no targets");
-    // SAFETY: `addrs` is a live host slice; the launcher copies it by value.
+    // SAFETY: `flag_addrs` is a live host slice; the launcher copies it by value.
     let result = unsafe {
-        ffi::k3_whale_doorbell_ring(addrs.as_ptr(), i32::try_from(addrs.len())?, value, stream)
+        ffi::k3_whale_doorbell_ring(
+            flag_addrs.as_ptr(),
+            i32::try_from(flag_addrs.len())?,
+            value,
+            stream,
+        )
     };
-    result
-        .result()
-        .map_err(|err| anyhow!("K3 whale doorbell ring over {} flags: {err}", addrs.len()))
+    result.result().map_err(|err| {
+        anyhow!(
+            "K3 whale doorbell ring over {} flags: {err}",
+            flag_addrs.len()
+        )
+    })
 }
 
 /// Open the device pair `(self_ordinal, peer_ordinal)` for the fused kernel's

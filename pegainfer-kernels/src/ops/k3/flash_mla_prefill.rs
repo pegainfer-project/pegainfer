@@ -182,17 +182,13 @@ pub fn k3_flash_mla_prefill_fwd_launch(
 mod tests {
     use super::*;
 
-    /// `t_kv * (heads * 192)` passes i32 past ~116k tokens (heads=96); the
-    /// wrapper used to refuse that product as a batch stride, capping context
-    /// at 116k and failing the whale's 256k prefill. The fix passes 0 batch
-    /// strides (b = 1 never offsets by them), so this drives the kernel at
-    /// full 256k depth and checks addressing: identical K rows make every
-    /// causal softmax uniform, and V rows that vary only per head make the
-    /// expected output exactly the per-head value — any high-offset
-    /// addressing error surfaces as a wrong or non-finite element. Needs an
-    /// sm_100f GPU with ~23 GiB free.
+    /// Drives the kernel past the int32 batch-stride ceiling
+    /// (`t_kv * heads * 192`). Identical K rows make every causal softmax
+    /// uniform, and V rows that vary only per head make the expected output
+    /// exactly the per-head value, so any high-offset addressing error shows
+    /// up as a wrong or non-finite element.
     #[test]
-    #[ignore = "needs an sm_100f GPU with ~23 GiB free"]
+    #[ignore = "needs an sm_100f GPU with ~23 GiB free and ~13 GiB host RAM"]
     fn deep_context_attention_addresses_past_int32() {
         use crate::tensor::DeviceContext;
         let ctx = DeviceContext::new_with_device(0).expect("device 0");
@@ -217,7 +213,7 @@ mod tests {
             .collect();
         let mut nope_v_host = vec![bf16::ZERO; t_kv * heads * K3_MLA_PREFILL_NV];
         for chunk in nope_v_host.chunks_mut(row.len()) {
-            chunk.copy_from_slice(&row[..chunk.len()]);
+            chunk.copy_from_slice(&row);
         }
         let nope_v = ctx.stream.clone_htod(&nope_v_host).expect("nope_v");
         drop(nope_v_host);
