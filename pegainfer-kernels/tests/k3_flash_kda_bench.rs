@@ -14,6 +14,36 @@
 //! Operand sets rotate round-robin over >= `L2_BUST_BYTES` so every timed
 //! call is L2-cold on its tensor operands, mirroring prefill (each layer's
 //! activations pass through once per chunk).
+//!
+//! Reference run (2026-08-25, one idle GB300, sm_103a, driver-visible bare
+//! host) — for checking a rerun without a fleet:
+//!
+//! ```text
+//!       T    ms/call     Mtok/s  us/16tok
+//!      14     0.0259       0.54    29.624
+//!      64     0.0267       2.40     6.664
+//!     132     0.0378       3.49     4.587
+//!     224     0.0458       4.89     3.273
+//!     264     0.0543       4.86     3.292
+//!     528     0.0811       6.51     2.457
+//!    1056     0.1428       7.40     2.163
+//!    2112     0.2648       7.97     2.006
+//!    4224     0.5076       8.32     1.923
+//!    8448     0.9937       8.50     1.882
+//!   16896     1.9695       8.58     1.865
+//!   33792     3.9191       8.62     1.856
+//!   67584     7.8210       8.64     1.852
+//!  135168    15.6235       8.65     1.849
+//!  270336    31.2152       8.66     1.847
+//! ```
+//!
+//! Shape of the curve: throughput plateaus at ~8.6 Mtok/s from ~4k and stays
+//! perfectly linear through 264k — the chunkwise recurrence has no long-T
+//! cliff, so the efficiency question is only ever about short segments. The
+//! per-rank cliff sits below ~2k tokens: local-shape eff 96% at 4224, 93% at
+//! 2112, 87% at 1056, 58% at 264; a 270336-token chunk split 16 ways is
+//! still 99.1%. Launch-pressure proxy: 16 x T=14 calls = 9.05x one T=224
+//! call.
 
 #![cfg(feature = "k3")]
 
@@ -152,7 +182,14 @@ fn build_sets(ctx: &DeviceContext, t: usize, heads: usize, seed: &mut u64) -> Ve
         + 2 * t * heads * 2
         + 2 * heads * D * D * 4
         + k3_flash_kda_workspace_bytes(t, heads);
-    let copies = (L2_BUST_BYTES / set_bytes).clamp(3, 48);
+    // A set at least as large as the rotation target self-evicts within one
+    // call, so a single copy is already L2-cold call-to-call; rotation only
+    // buys anything for sets smaller than that.
+    let copies = if set_bytes >= L2_BUST_BYTES {
+        1
+    } else {
+        (L2_BUST_BYTES / set_bytes).clamp(3, 48)
+    };
     (0..copies)
         .map(|_| build_set(ctx, t, heads, seed))
         .collect()
@@ -167,9 +204,14 @@ fn flash_kda_segment_sweep() {
     let mut seed = 0x5eed_cafe_f00d_u64;
 
     // 14 = worst per-slot verify pack tail; 224 = 16 slots x 14 (varlen
-    // comparison); 264..16896 = whale chunk / s for chunk sizes 4224-16896.
+    // comparison); 264..16896 = whale chunk / s for chunk sizes 4224-16896;
+    // 33792..270336 extend the 4224-aligned ladder to ~264k tokens (past the
+    // 256k context ceiling) so the single-GPU curve is checkable without a
+    // fleet. T=270336 needs ~56 GiB (operands + workspace) — any idle GB300
+    // fits it in one operand set.
     let ts = [
-        14usize, 64, 132, 224, 264, 528, 1056, 2112, 4224, 8448, 16896,
+        14usize, 64, 132, 224, 264, 528, 1056, 2112, 4224, 8448, 16896, 33792, 67584, 135168,
+        270336,
     ];
 
     eprintln!("FlashKDA fwd sweep: heads={FULL_HEADS} d={D} (bf16 in/out, f32 state)");
@@ -208,7 +250,7 @@ fn flash_kda_segment_sweep() {
             16.0 * c14 / c224
         );
     }
-    for chunk in [4224usize, 8448, 16896] {
+    for chunk in [4224usize, 8448, 16896, 270336] {
         eprintln!(
             "\nCP local-shape split of a {chunk}-token whale chunk (not end-to-end KCP; ideal = cost(chunk)/c):"
         );
