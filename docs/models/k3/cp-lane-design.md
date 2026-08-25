@@ -527,16 +527,36 @@ admits 的最大 2 的幂：粗梯子 ≈ CP4 @ 8k–16k / CP8 @ 16k–32k / CP1
 (M,D)∘(M',D') = (MM', DM'+D') 可结合 → Blelloch 并行前缀扫描 log₂CP 轮是
 现成后手；按拍板**先 naive 实现，profile 后再决定**。
 
-数据面（GPU 阶段）：CUDA event 是进程局部的，跨机 four-beat 协议换成
-doorbell（`cuStreamWriteValue32/WaitValue32` 打在 fabric 映射的 flag 上，
-mega kernel 内已用同一技术）；CP scratch 一次性分配指针稳定，fabric handle
-在 gang 形成时一次交换。
+**Scheduler 接线（`a474f7f6`）**：每步 `serve_whale` 在 launch boundary 干三
+件事——drain 收件箱回 Gather、恰在 committed L 进 `prefill_whale`、给本步一个
+`may_prefill` 判决（armed/committed 期间只许 decode，count 恰好每步 +1，正是
+arming 契约的 scheduler 半边）。poster 一次只挂一头（cancel 配对因此平凡；
+slot 在 post 时刻就预留，commit 到达永远有座）；宽度拒绝/超时 Cancel →
+下一个非受限 launch 本地 prefill 兜底。Mock 舰队测试（真 scheduler ×
+LocalWhaleHub × 假 executor 计 launch 配对）钉住：全 gang 同一 count 入场、
+poster 恰为 CP 末位持 slot、gang 外 rank 全程不知情、双 whale（跨 rank 与
+同 rank 排队）串到两个不同 superstep、短 prompt 走本地。
+
+**数据面（`b2091501`）**：CUDA event 与 pool 指针都活不过进程边界，换成
+MegaMoE 同款基底。每 rank 的 CP 发布面（halo tail、KDA (M,D)、MLA
+latent/rope）整体挪进一块 fabric slab；whale hub 启动时加一轮 slab
+allgather（64 字节 handle × world，兼作 fleet 启动 barrier，对齐 ep.rs
+bootstrap 语义），每进程 import 一次全表。four-beat 协议原样翻译成
+doorbell：远端 `cuStreamWriteValue64` 宣布、本地 `cuStreamWaitValue64/GEQ`
+等待——等待永远在本 rank 自己的内存上，远端只有 NVLink store，superstep 内
+host 零同步。doorbell 值全由 rendezvous 推导（`(seq+1)*4096 + window`）：
+seq 严格递增 + 每 superstep 窗口数固定 ⇒ 值跨 whale 单调，gang 轮换不需要
+任何 host 协商（flag 槽按 global rank 索引）。forward 路径零改动：
+`K3CpScratch` 换 `K3CpSyncHandle`（Local/Fleet 枚举）分发三个交换窗口，
+`prefill_whale` 与 `prefill_cp` 共享同一 superstep 主体（whale 用 leveled
+分段）。`PEGAINFER_K3_WHALE=<addr>` 一个变量拉起全部（rank0 进程 host
+sequencer；端口选 <32768 避 ephemeral 坑）；`PEGAINFER_K3_WHALE_MIN` 准入
+下限默认 4096。与 `PEGAINFER_K3_CP`、dspark 互斥。
 
 ## Next action
 
-M1 后半剩余：whale 接入 scheduler（每个 launch boundary 询 `at_launch`，含
-chunk 边界；clearance 约束多 launch 操作）→ CP scratch fabric 化 + doorbell
-交换 → CP8@2-tray / CP16@4-tray pruned 门禁 → 256k 单 superstep 门禁 →
-**验收：full 896@EP16 对 vLLM TP16-MNNVL 重赛 8k/16k/64k/256k**。EP16 全量下
-19.6 GiB slab 的 HBM 账实测。次优先：FMHA 条带化配段、前端固定截距
-（132 vs 59 ms @122 tokens）。
+M1 后半剩余（代码全落地，进入真机阶段）：CP8@2-tray pruned EP8 门禁（首个
+真 doorbell/fabric 冒烟）→ CP16@4-tray pruned EP16 → 256k 单 superstep 门禁
+→ **验收：full 896@EP16 对 vLLM TP16-MNNVL 重赛 8k/16k/64k/256k**。EP16
+全量下 19.6 GiB slab 的 HBM 账实测。次优先：FMHA 条带化配段、前端固定截距
+（132 vs 59 ms @122 tokens）、KDA 包 prefix-scan（profile 后决定）。
