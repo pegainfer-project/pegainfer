@@ -177,3 +177,66 @@ pub fn k3_flash_mla_prefill_fwd_launch(
         anyhow!("K3 FlashMLA prefill forward (t_q={t_q}, t_kv={t_kv}, heads={heads}) failed: {error} (NOT_SUPPORTED = built without an sm_100f target)")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `t_kv * (heads * 192)` passes i32 past ~116k tokens (heads=96); the
+    /// wrapper used to refuse that product as a batch stride, capping context
+    /// at 116k and failing the whale's 256k prefill. The fix passes 0 batch
+    /// strides (b = 1 never offsets by them), so this drives the kernel at
+    /// full 256k depth and checks addressing: identical K rows make every
+    /// causal softmax uniform, and V rows that vary only per head make the
+    /// expected output exactly the per-head value — any high-offset
+    /// addressing error surfaces as a wrong or non-finite element. Needs an
+    /// sm_100f GPU with ~23 GiB free.
+    #[test]
+    #[ignore = "needs an sm_100f GPU with ~23 GiB free"]
+    fn deep_context_attention_addresses_past_int32() {
+        use crate::tensor::DeviceContext;
+        let ctx = DeviceContext::new_with_device(0).expect("device 0");
+        let (t_q, t_kv, heads) = (256usize, 260_096usize, 96usize);
+        assert!(
+            t_kv * heads * K3_MLA_PREFILL_QK > i32::MAX as usize,
+            "depth no longer covers the i32 ceiling"
+        );
+        let q = ctx
+            .stream
+            .clone_htod(&vec![bf16::from_f32(0.05); t_q * heads * K3_MLA_PREFILL_QK])
+            .expect("q");
+        let k = ctx
+            .stream
+            .clone_htod(&vec![
+                bf16::from_f32(0.03);
+                t_kv * heads * K3_MLA_PREFILL_QK
+            ])
+            .expect("k");
+        let row: Vec<bf16> = (0..heads * K3_MLA_PREFILL_NV)
+            .map(|i| bf16::from_f32((i / K3_MLA_PREFILL_NV) as f32 / 128.0))
+            .collect();
+        let mut nope_v_host = vec![bf16::ZERO; t_kv * heads * K3_MLA_PREFILL_NV];
+        for chunk in nope_v_host.chunks_mut(row.len()) {
+            chunk.copy_from_slice(&row[..chunk.len()]);
+        }
+        let nope_v = ctx.stream.clone_htod(&nope_v_host).expect("nope_v");
+        drop(nope_v_host);
+        let mut out = ctx
+            .stream
+            .alloc_zeros::<bf16>(t_q * heads * K3_MLA_PREFILL_V)
+            .expect("out");
+        k3_flash_mla_prefill_fwd_launch(&ctx, t_q, t_kv, heads, &q, &k, &nope_v, &mut out, 0.072)
+            .expect("deep-context forward");
+        let host_out = ctx.stream.clone_dtoh(&out).expect("out to host");
+        ctx.sync().expect("sync");
+        for (i, &value) in host_out.iter().enumerate() {
+            let head = (i / K3_MLA_PREFILL_V) % heads;
+            let expected = head as f32 / 128.0;
+            let got = value.to_f32();
+            assert!(
+                (got - expected).abs() < 1e-2,
+                "out[{i}] (head {head}): got {got}, expected {expected}"
+            );
+        }
+    }
+}

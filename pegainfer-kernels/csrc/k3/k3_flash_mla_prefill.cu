@@ -32,7 +32,6 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
-#include <climits>
 
 #ifdef K3_FLASH_MLA_SM100F
 #include "collective/fmha_fusion.hpp"
@@ -272,12 +271,6 @@ extern "C" CUresult k3_flash_mla_prefill_fwd(
         || heads <= 0 || heads % fmp::Scheduler::TileH != 0 || t_q > t_kv) {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // b = 1, but the batch stride slots are still materialized as ints.
-    if ((long long)t_q * q_stride_tok > INT_MAX || (long long)t_kv * k_stride_tok > INT_MAX
-        || (long long)t_kv * v_stride_tok > INT_MAX || (long long)t_q * o_stride_tok > INT_MAX) {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-
     int device = 0;
     cudaError_t err = cudaGetDevice(&device);
     if (err != cudaSuccess) return k3_flash_mla_map_cuda_error(err);
@@ -294,22 +287,24 @@ extern "C" CUresult k3_flash_mla_prefill_fwd(
         t_q, t_kv, cute::make_tuple(K3_FMP_NOPE, K3_FMP_ROPE),
         cute::make_tuple(cute::make_tuple(1, heads), 1));
 
+    // The batch stride slots are materialized as ints, and `t_kv *
+    // k_stride_tok` overflows int32 past ~116k tokens (heads=96) — but with
+    // b = 1 the batch coordinate is always 0, so the stride value is never
+    // used to offset anything. Pass 0 instead of the true extent; the
+    // per-token and per-head strides carry all real addressing, and TMA's
+    // in-descriptor address math is 64-bit.
     fmp::StrideQ stride_q = cute::make_stride(
         (int)q_stride_tok, cute::_1{},
-        cute::make_stride(cute::make_stride((int)q_stride_head, (int)q_stride_head),
-                          t_q * (int)q_stride_tok));
+        cute::make_stride(cute::make_stride((int)q_stride_head, (int)q_stride_head), 0));
     fmp::StrideK stride_k = cute::make_stride(
         (int)k_stride_tok, cute::_1{},
-        cute::make_stride(cute::make_stride(cute::_0{}, (int)k_stride_head),
-                          t_kv * (int)k_stride_tok));
+        cute::make_stride(cute::make_stride(cute::_0{}, (int)k_stride_head), 0));
     fmp::StrideV stride_v = cute::make_stride(
         (int)v_stride_tok, cute::_1{},
-        cute::make_stride(cute::make_stride(cute::_0{}, (int)v_stride_head),
-                          t_kv * (int)v_stride_tok));
+        cute::make_stride(cute::make_stride(cute::_0{}, (int)v_stride_head), 0));
     fmp::StrideO stride_o = cute::make_stride(
         (int)o_stride_tok, cute::_1{},
-        cute::make_stride(cute::make_stride((int)o_stride_head, (int)o_stride_head),
-                          t_q * (int)o_stride_tok));
+        cute::make_stride(cute::make_stride((int)o_stride_head, (int)o_stride_head), 0));
     // LSE is not written; the stride only has to be well-formed.
     fmp::StrideLSE stride_lse =
         cute::make_stride(cute::_1{}, cute::make_stride(cute::make_stride(t_q, t_q), t_q));
