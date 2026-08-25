@@ -419,8 +419,20 @@ CP1 3159.8ms / CP4 1116.8ms = 2.83×，暖跑 2.88×，与 serving 2.86× 对上
   现在还慢 2.5×（6.29MB 消息在 NCCL 协议开销区，91 vs 213GB/s）。
   MegaMoE 式融合没有字节可藏，可融的是 barrier 空转那 ~100ms。
 
-杠杆排序：暖路径已 2.88×；交换/merge 融进 recurrence 尾（≈3.1×）→ FMHA
-条带化配段（≈3.2×）→ **3.49× 是 EP 共享 MoE 的硬顶，再往上只有 M1 加宽**。
+**Event 门控交换已落地（2026-08-25，`f0399a6b`）**：per-window host
+Barrier + 双 stream sync 换成四拍 CUDA event 协议（publish/consume event
+跨卡 stream wait + enqueue 侧原子计数保证 record-before-wait；等待集合按
+窗口收窄——halo 只挂前驱，upstream 扇出只挂真生产者）。host 线程整个
+superstep free-run，只有真依赖 stall stream。同门禁复测：logits 逐位一致，
+CP4 kernel 墙钟 1116.8→1071.9 ms（冷）/ 1054.9→1037.7（暖），
+**CP4/CP1 2.83→2.92×**；非临界 rank 空转 93/91→12/10 ms。剩余空转全部
+有名有姓：dev3 的 72.8 ms（×69 层）= 等 dev1/2 M/D doctored 调用的真依赖
+（下一刀 = M+D 融成单 kernel，~-35 ms）；dev0 的 53 ms 是 consume-wait
+挂在窗口尾的保守放置（不在临界路径，修了墙钟不动，暂不动）。
+
+杠杆排序（更新）：event 门控 DONE（2.92×）；M+D 单 kernel 融合（≈3.0×）
+→ FMHA 条带化配段（≈3.1–3.2×）→ **3.49× 是 EP 共享 MoE 的硬顶，再往上
+只有 M1 加宽**。
 
 ## Next action
 
