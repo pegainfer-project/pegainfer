@@ -199,6 +199,17 @@ unsafe extern "C" {
     /// allocations (driver + IMEX). Writes 0 or 1 into `out_supported`.
     pub fn k3_mega_fabric_supported(device_ordinal: i32, out_supported: *mut i32) -> CUresult;
 
+    /// Ring a whale doorbell: store `value` into `count` 8-byte-aligned u64
+    /// flag addresses (local or fabric-imported device VAs) from a one-thread
+    /// kernel on `stream`. SM-path stores — the stream memops engine rejects
+    /// imported fabric mappings (`csrc/k3/k3_whale_doorbell.cu`).
+    pub fn k3_whale_doorbell_ring(
+        addrs: *const u64,
+        count: i32,
+        value: u64,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Allocate a fabric-exportable symmetric slab of `num_bytes` on
     /// `device_ordinal`, mapped and access-granted for every local device,
     /// zeroed and synchronized. Writes the device pointer and the 64-byte

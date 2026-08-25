@@ -15,13 +15,17 @@
 //!   is an ordinary device pointer — [`super::cp::k3_cp_copy_in`] works
 //!   unchanged.
 //! * **Ordering**: CUDA events give way to **doorbells** — `u64` flag arrays
-//!   in the same slabs, written with `cuStreamWriteValue64` and waited on
-//!   with `cuStreamWaitValue64`. Writes go to the *remote* rank's slab and
-//!   waits watch the rank's *own* slab, so every wait is on local memory and
-//!   every remote touch is a plain NVLink store — the direction the fabric
-//!   is built for. The four-beat window protocol is the in-process one
-//!   verbatim (publish, await publications, consume, await consumers); only
-//!   the primitive changed.
+//!   in the same slabs, rung by a one-thread SM kernel
+//!   (`k3_whale_doorbell_ring`) and waited on with `cuStreamWaitValue64`.
+//!   Writes go to the *remote* rank's slab and waits watch the rank's *own*
+//!   slab, so every wait is stream-memops on local memory and every remote
+//!   touch is a plain NVLink store — the direction the fabric is built for.
+//!   The split is forced, not stylistic: the stream memops engine rejects
+//!   fabric-imported mappings outright (`CUDA_ERROR_INVALID_VALUE` on GB300,
+//!   two-process probe), while SM stores go through them on every MegaMoE
+//!   step. The four-beat window protocol is the in-process one verbatim
+//!   (publish, await publications, consume, await consumers); only the
+//!   primitive changed.
 //!
 //! Doorbell values must be agreed without any host negotiation, across gangs
 //! that rotate membership whale to whale. They are derived entirely from the
@@ -41,6 +45,7 @@ use pegainfer_kernels::ops::K3_MEGA_FABRIC_HANDLE_BYTES;
 use pegainfer_kernels::ops::k3_mega_fabric_slab_alloc;
 use pegainfer_kernels::ops::k3_mega_fabric_slab_import;
 use pegainfer_kernels::ops::k3_mega_fabric_supported;
+use pegainfer_kernels::ops::k3_whale_doorbell_ring;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::active_cu_stream;
 
@@ -297,14 +302,19 @@ impl K3WhaleGang {
             self.rank
         );
         let my_base = self.my_base();
-        // Beat 1: announce my publication to every rank that reads it. The
-        // default write flag fences my preceding stream work first, so the
-        // publication bytes are visible before the doorbell rings.
-        for reader in kind.read_by(cp_rank, cp_size) {
-            let flag = self
-                .layout
-                .publish_flag(self.bases[gang[reader]], self.rank);
-            stream_write_value(ctx, flag, value).context("K3 whale publish doorbell write")?;
+        // Beat 1: announce my publication to every rank that reads it, in one
+        // ring. The kernel's system fence releases my preceding stream work,
+        // so the publication bytes are visible before the doorbell rings.
+        let publish_flags: Vec<u64> = kind
+            .read_by(cp_rank, cp_size)
+            .map(|reader| {
+                self.layout
+                    .publish_flag(self.bases[gang[reader]], self.rank)
+            })
+            .collect();
+        if !publish_flags.is_empty() {
+            k3_whale_doorbell_ring(&publish_flags, value, active_cu_stream(ctx))
+                .context("K3 whale publish doorbell ring")?;
         }
         // Beat 2: wait for every publication I read this window.
         for source in kind.reads_from(cp_rank) {
@@ -313,11 +323,16 @@ impl K3WhaleGang {
         }
         // Beat 3: enqueue my reads, then acknowledge them to their owners.
         consume()?;
-        for source in kind.reads_from(cp_rank) {
-            let flag = self
-                .layout
-                .consume_flag(self.bases[gang[source]], self.rank);
-            stream_write_value(ctx, flag, value).context("K3 whale consume doorbell write")?;
+        let consume_flags: Vec<u64> = kind
+            .reads_from(cp_rank)
+            .map(|source| {
+                self.layout
+                    .consume_flag(self.bases[gang[source]], self.rank)
+            })
+            .collect();
+        if !consume_flags.is_empty() {
+            k3_whale_doorbell_ring(&consume_flags, value, active_cu_stream(ctx))
+                .context("K3 whale consume doorbell ring")?;
         }
         // Beat 4: wait for my readers, so my next window's publish writes
         // cannot overwrite what a peer is still reading.
@@ -329,24 +344,10 @@ impl K3WhaleGang {
     }
 }
 
-fn stream_write_value(ctx: &DeviceContext, addr: u64, value: u64) -> Result<()> {
-    // SAFETY: `addr` is inside a live fabric mapping (local or imported) that
-    // is never freed; the default flag performs the system-scope fence the
-    // publish ordering needs.
-    unsafe {
-        cu_sys::cuStreamWriteValue64_v2(
-            active_cu_stream(ctx),
-            addr,
-            value,
-            cu_sys::CUstreamWriteValue_flags::CU_STREAM_WRITE_VALUE_DEFAULT as u32,
-        )
-    }
-    .result()
-    .map_err(|error| anyhow::anyhow!("cuStreamWriteValue64 failed: {error}"))
-}
-
 fn stream_wait_value(ctx: &DeviceContext, addr: u64, value: u64) -> Result<()> {
-    // SAFETY: as above; GEQ is what monotonic doorbell values need — a rank
+    // SAFETY: `addr` is inside this rank's own live fabric slab (locally
+    // allocated — the memops engine accepts local fabric memory, unlike
+    // imported mappings); GEQ is what monotonic doorbell values need — a rank
     // that sat out intermediate whales left its flags behind, and any later
     // ring satisfies every earlier wait.
     unsafe {
@@ -405,6 +406,28 @@ mod tests {
             }
         }
         assert!(K3WhaleGang::window_value(0, K3_WHALE_WINDOW_STRIDE).is_err());
+    }
+
+    /// GPU: ring a doorbell on a freshly allocated whale slab through the
+    /// exact production call chain (fabric alloc -> `k3_whale_doorbell_ring`
+    /// -> `stream_wait_value`). Needs one fabric-capable GPU. Cross-process
+    /// import coverage is the fleet smoke's job — a single process cannot
+    /// import its own handle.
+    #[test]
+    #[ignore = "needs a fabric-capable GPU"]
+    fn doorbell_rings_on_a_real_fabric_slab() {
+        use pegainfer_kernels::tensor::DeviceContext;
+        let ctx = DeviceContext::new_with_device(0).expect("device 0");
+        let layout = K3WhaleSlabLayout::new(8, 16896);
+        let (base, _wire) = k3_whale_slab_alloc(0, &layout).expect("fabric slab");
+        let value = K3WhaleGang::window_value(0, 0).unwrap();
+        let flags: Vec<u64> = (0..8).map(|from| layout.publish_flag(base, from)).collect();
+        k3_whale_doorbell_ring(&flags, value, active_cu_stream(&ctx)).expect("doorbell ring");
+        for (from, &flag) in flags.iter().enumerate() {
+            stream_wait_value(&ctx, flag, value)
+                .unwrap_or_else(|e| panic!("publish wait from={from}: {e:#}"));
+        }
+        ctx.stream.synchronize().expect("stream sync");
     }
 
     #[test]
