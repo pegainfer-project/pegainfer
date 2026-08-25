@@ -393,10 +393,12 @@ fn whale_serving(
                 .with_context(|| format!("PEGAINFER_K3_WHALE_MIN={raw} is not a token count"))?
         }
     };
+    let arm_started = Instant::now();
     let slabs = executors
         .iter_mut()
         .map(|executor| executor.arm_whale_slab(world))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let slabs_armed = Instant::now();
     let (hub, table) = if ranks.start == 0 {
         TcpWhaleHub::host(&addr, world, chunk_tokens, 0, ranks.len(), slabs)
             .context("host the K3 whale hub")?
@@ -404,6 +406,7 @@ fn whale_serving(
         TcpWhaleHub::connect(&addr, ranks.start, ranks.len(), slabs)
             .context("join the K3 whale hub")?
     };
+    let world_exchanged = Instant::now();
     let local: Vec<(usize, u64)> = executors
         .iter()
         .enumerate()
@@ -420,7 +423,11 @@ fn whale_serving(
     }
     info!(
         "K3 whale lane armed: world={world}, local_ranks={ranks:?}, min_tokens={min_tokens}, \
-         chunk_tokens={chunk_tokens}, rendezvous={addr}"
+         chunk_tokens={chunk_tokens}, rendezvous={addr}, slab_alloc={:.2}s, \
+         slab_exchange={:.2}s (fleet startup barrier), import_install={:.2}s",
+        (slabs_armed - arm_started).as_secs_f64(),
+        (world_exchanged - slabs_armed).as_secs_f64(),
+        world_exchanged.elapsed().as_secs_f64(),
     );
     Ok(Some(K3WhaleServing {
         hub: K3WhaleHub::Tcp(hub),

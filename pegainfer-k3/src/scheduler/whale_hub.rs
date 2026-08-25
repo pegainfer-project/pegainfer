@@ -573,12 +573,15 @@ impl TcpWhaleHub {
             failed: failed.clone(),
         });
 
-        // Acceptor: one reader thread per peer process, forwarding its
-        // sequencer-bound frames into the channel. When the data-plane
-        // exchange is armed it runs first on each connection: the peer's slab
-        // frames check in, and the completed world table goes back before the
-        // steady-state protocol starts — so the sequencer can never
-        // interleave a write with the table.
+        // Acceptor: one connection thread per peer process. Each thread runs
+        // the hello, then — when the data-plane exchange is armed — the slab
+        // exchange, then registers its writer and settles into the reader
+        // loop. The exchange must run OFF the accept loop: `wait_complete`
+        // blocks until every peer's slabs are in, and a serial acceptor
+        // holding it would leave the remaining peers unaccepted in the
+        // backlog — a startup deadlock for any world with more than one peer
+        // process. Registration stays after the exchange so the sequencer
+        // can never interleave a commit with the table frame on one socket.
         {
             let peers = peers.clone();
             let failed = failed.clone();
@@ -589,51 +592,59 @@ impl TcpWhaleHub {
                     for connection in listener.incoming() {
                         let Ok(mut socket) = connection else { continue };
                         let _ = socket.set_nodelay(true);
-                        let hello = match read_header(&mut socket).and_then(|kind| {
-                            ensure!(kind == KIND_HELLO, "whale hub: first frame kind {kind}");
-                            let mut frame = FrameReader(&mut socket);
-                            let first = frame.u32()? as GlobalRank;
-                            let count = frame.u32()? as usize;
-                            let slabs = frame.u32()? as usize;
-                            ensure!(count <= 1024, "whale hub: hello claims {count} ranks");
-                            Ok(Hello {
-                                first,
-                                count,
-                                slabs,
-                            })
-                        }) {
-                            Ok(hello) => hello,
-                            Err(error) => {
-                                log::warn!("K3 whale hub: rejected connection: {error:#}");
-                                continue;
-                            }
-                        };
-                        if let Err(error) = serve_slab_exchange(&mut socket, &hello, board.as_ref())
-                        {
-                            log::warn!(
-                                "K3 whale hub: slab exchange with ranks {}..{} failed: {error:#}",
-                                hello.first,
-                                hello.first + hello.count
-                            );
-                            continue;
-                        }
-                        let Ok(writer) = socket.try_clone() else {
-                            continue;
-                        };
-                        // The sequencer thread writes commits through this
-                        // handle while holding the peer table; a wedged peer
-                        // must fail the hub, not park the sequencer forever.
-                        let _ = writer.set_write_timeout(Some(WHALE_IO_TIMEOUT));
-                        peers.lock().expect("whale peers poisoned").push((
-                            hello.first,
-                            hello.count,
-                            writer,
-                        ));
+                        let peers = peers.clone();
+                        let board = board.clone();
                         let inbound = inbound_tx.clone();
                         let failed = failed.clone();
                         std::thread::Builder::new()
-                            .name("k3-whale-read".into())
+                            .name("k3-whale-conn".into())
                             .spawn(move || {
+                                let hello = match read_header(&mut socket).and_then(|kind| {
+                                    ensure!(
+                                        kind == KIND_HELLO,
+                                        "whale hub: first frame kind {kind}"
+                                    );
+                                    let mut frame = FrameReader(&mut socket);
+                                    let first = frame.u32()? as GlobalRank;
+                                    let count = frame.u32()? as usize;
+                                    let slabs = frame.u32()? as usize;
+                                    ensure!(count <= 1024, "whale hub: hello claims {count} ranks");
+                                    Ok(Hello {
+                                        first,
+                                        count,
+                                        slabs,
+                                    })
+                                }) {
+                                    Ok(hello) => hello,
+                                    Err(error) => {
+                                        log::warn!("K3 whale hub: rejected connection: {error:#}");
+                                        return;
+                                    }
+                                };
+                                if let Err(error) =
+                                    serve_slab_exchange(&mut socket, &hello, board.as_ref())
+                                {
+                                    log::warn!(
+                                        "K3 whale hub: slab exchange with ranks {}..{} failed: \
+                                         {error:#}",
+                                        hello.first,
+                                        hello.first + hello.count
+                                    );
+                                    return;
+                                }
+                                let Ok(writer) = socket.try_clone() else {
+                                    return;
+                                };
+                                // The sequencer thread writes commits through
+                                // this handle while holding the peer table; a
+                                // wedged peer must fail the hub, not park the
+                                // sequencer forever.
+                                let _ = writer.set_write_timeout(Some(WHALE_IO_TIMEOUT));
+                                peers.lock().expect("whale peers poisoned").push((
+                                    hello.first,
+                                    hello.count,
+                                    writer,
+                                ));
                                 loop {
                                     let message = read_header(&mut socket)
                                         .and_then(|kind| read_to_sequencer(&mut socket, kind));
@@ -650,7 +661,7 @@ impl TcpWhaleHub {
                                     }
                                 }
                             })
-                            .expect("spawn whale reader");
+                            .expect("spawn whale connection");
                     }
                 })
                 .expect("spawn whale acceptor");
@@ -1040,6 +1051,49 @@ mod tests {
             assert_eq!(host_slab.handle, [rank as u8; K3_MEGA_FABRIC_HANDLE_BYTES]);
             assert_eq!(host_slab.handle, peer_slab.handle);
             assert_eq!(host_slab.num_bytes, peer_slab.num_bytes);
+        }
+    }
+
+    #[test]
+    fn slab_exchange_completes_with_more_than_one_peer_process() {
+        fn slab(seed: u8) -> K3WhaleSlabWire {
+            K3WhaleSlabWire {
+                handle: [seed; K3_MEGA_FABRIC_HANDLE_BYTES],
+                num_bytes: 4096 + seed as usize,
+            }
+        }
+        // Regression: with a serial acceptor the first accepted peer's
+        // exchange blocked in `wait_complete` until the whole world checked
+        // in, so the second peer was never accepted — a startup deadlock at
+        // any world with more than one peer process (worked at two processes,
+        // wedged the CP16 4-tray fleet). Three processes here: host ranks
+        // 0..2, peers 2..4 and 4..6.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let peers: Vec<_> = [2usize, 4]
+            .into_iter()
+            .map(|first| {
+                let addr = addr.clone();
+                std::thread::spawn(move || {
+                    let slabs = vec![slab(first as u8), slab(first as u8 + 1)];
+                    TcpWhaleHub::connect(&addr, first, 2, slabs).unwrap()
+                })
+            })
+            .collect();
+        let (_host, host_table) =
+            TcpWhaleHub::host(&addr, 6, CHUNK, 0, 2, vec![slab(0), slab(1)]).unwrap();
+        let mut tables = vec![host_table];
+        for peer in peers {
+            let (_peer, table) = peer.join().expect("peer joins the exchange");
+            tables.push(table);
+        }
+        for table in &tables {
+            assert_eq!(table.len(), 6);
+            for (rank, entry) in table.iter().enumerate() {
+                assert_eq!(entry.handle, [rank as u8; K3_MEGA_FABRIC_HANDLE_BYTES]);
+                assert_eq!(entry.num_bytes, 4096 + rank);
+            }
         }
     }
 }
