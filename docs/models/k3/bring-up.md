@@ -332,7 +332,10 @@ That is 27.6 KB/token against the 1.47 MB/token the expanded `[96×192 K |
 Gates (`pegainfer-k3/tests/paged_kv.rs`, plus the golden suite).
 `scripts/k3_gates.sh` runs the whole checkpoint-backed battery on a tray with
 the invocations below baked in (idle-tray check, prebuilt binaries, per-gate
-logs) — the commands here remain the reference for running one gate by hand:
+logs) — the commands here remain the reference for running one gate by hand.
+Either way the gates load weights through the pinned staged uploader by
+default (`PEGAINFER_K3_WEIGHT_STAGING=0` restores serial pageable mmap; same
+bytes, the whole battery drops to ~3 minutes on a warm page cache):
 
 ```bash
 # Paged gates: page-permutation bitwise, long-context (2048-ctx, 1100 steps,

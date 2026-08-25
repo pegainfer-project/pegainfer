@@ -16,6 +16,11 @@
 #   PEGAINFER_K3_TEST_224=<224-expert checkpoint> scripts/k3_gates.sh [filter]
 #
 # Optional environment:
+#   PEGAINFER_K3_WEIGHT_STAGING  the gates load weights through the pinned
+#                            double-buffer uploader by default (#964) — same
+#                            bytes, ~6x faster full-depth loads on a warm page
+#                            cache. Set 0 for the serial pageable-mmap path,
+#                            e.g. on a cold network-filesystem first run.
 #   PEGAINFER_K3_NCCL_LIB    directory prepended to LD_LIBRARY_PATH (the
 #                            bare-host NCCL 2.30.7; must contain the
 #                            unversioned libnccl.so symlink — see #810)

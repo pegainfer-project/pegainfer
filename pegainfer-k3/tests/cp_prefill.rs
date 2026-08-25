@@ -61,6 +61,16 @@ fn rel_l2_bar() -> f64 {
     4e-2 * (layers as f64).sqrt()
 }
 
+/// The gates load through the pinned double-buffer uploader by default —
+/// the same bytes, much faster on a warm page cache.
+/// `PEGAINFER_K3_WEIGHT_STAGING=0` falls back to the serial pageable-mmap
+/// path (e.g. a cold network-filesystem first run). This gate
+/// pays two full-depth loads (the gang world and the CP1 baseline), the
+/// heaviest loads in the battery.
+fn weight_staging() -> bool {
+    std::env::var("PEGAINFER_K3_WEIGHT_STAGING").as_deref() != Ok("0")
+}
+
 /// The prompt length the logits gate runs at (`PEGAINFER_K3_CP_PROMPT`,
 /// default [`MAX_CTX`]).
 fn gate_prompt_ceiling() -> usize {
@@ -85,6 +95,7 @@ fn config() -> K3ExecutorConfig {
     // One decode slot: the gate never decodes, and a slot's KDA state slab is
     // ~1 GiB across the full depth.
     config.max_batch = 1;
+    config.weight_staging = weight_staging();
     config
 }
 

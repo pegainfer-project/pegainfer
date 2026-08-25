@@ -66,6 +66,15 @@ fn device() -> usize {
         .unwrap_or(0)
 }
 
+/// The gates load through the pinned double-buffer uploader by default —
+/// the same bytes, much faster on a warm page cache.
+/// `PEGAINFER_K3_WEIGHT_STAGING=0` falls back to the serial pageable-mmap
+/// path (e.g. a cold network-filesystem first run). The gates'
+/// answers are load-path independent.
+fn weight_staging() -> bool {
+    std::env::var("PEGAINFER_K3_WEIGHT_STAGING").as_deref() != Ok("0")
+}
+
 fn executor(num_layers: usize) -> Option<K3Executor> {
     let path = checkpoint()?;
     let config = K3ExecutorConfig {
@@ -75,7 +84,7 @@ fn executor(num_layers: usize) -> Option<K3Executor> {
         num_layers,
         chunk_tokens: 0,
         cuda_graph: false,
-        weight_staging: false,
+        weight_staging: weight_staging(),
         moe_transport: K3MoeTransport::MEGA,
     };
     Some(
