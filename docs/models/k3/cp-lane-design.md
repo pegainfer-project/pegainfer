@@ -604,10 +604,29 @@ cap 到均值所在 bucket（attention 是 varlen，cap 内仍按深度配平）
 （~3,470ms）——mega 等待吸收了 attention 深度不均衡，真 MoE 算量 ≲1.2s。
 Amdahl 账：CP1 的 MoE 墙钟与 CP8 同额（mega dispatch 本就全 EP 宽，与 CP 无
 关）≈1.26s → 128k 理论顶 = 32/8+1.26 ≈ 5.3s = **6.4×**；实测扣截距 6.0× =
-顶的 93%。剩余 7% 有了名字：**128k 均值 16k 正好顶 16896 bucket cap，
-leveling 被钳成等长切分，深位 attention ≈ 均摊 1.6×** → 下一刀 = FMHA
-条带化配段。扣除 MoE 的极限即 CP 宽度本身（非 MoE 家族完美缩放，CP4 已证、
-本次未推翻）；CP16@EP16 验收配置推演顶 ≈ 12–13×@128k。
+顶的 93%。剩余缺口：**128k 均值 16k 正好顶 16896 bucket cap，leveling 被钳
+成等长切分，深位 attention ≈ 均摊 1.6×**。扣除 MoE 的极限即 CP 宽度本身
+（非 MoE 家族完美缩放，CP4 已证、本次未推翻）；CP16@EP16 验收配置推演顶
+≈ 12–13×@128k。
+
+同一 profile 的 65k superstep（cluster #3，深位 rank，wall 2,524ms）修正了
+两笔旧账，并给 vLLM 对标定了性（`2026-08-18-k3-vllm-layout-e2e`，full 模型
+8 卡最优布局 TP8×EP8：64k 1,959ms / 128k 4,477ms，截距 ~75ms）：
+
+- **"~850ms 固定截距"是高估**：65k e2e 2,790 − superstep 2,520 = 协调+前端
+  实际 ~270ms。850 来自 4k–16k 平台，但那个平台的大头是 bucket 翻倍
+  （16k/8=2,090 行 → 4224 桶，全行族 padding 2×）——短中档输 TP8×EP8
+  （1,042 vs 442）的主因是桶，不是协调。
+- **65k 纯算力慢 vLLM 34%（2,520 vs ~1,884）**，拆账：FMHA 579ms（深位超额
+  ~270，均衡应 ~310；TP8 按头切无此项）、mega 566（同款+等待）、dense GEMM
+  503（1,455 launch，M≈8.4k 在"chunk<8k contiguous padding 吃一半算力"临界
+  区）、elementwise 325（2,076 launch；CP 行数只有 TP 的 1/8，本应优势项）、
+  间隙 176（单 superstep ~5,000 launch）。可回收 ≈0.5s（不均衡+间隙+padding）
+  → 修完**追平** TP8×EP8；反超还差 ~120ms 的 GEMM 形状/融合效率债。
+- **杠杆重排（实测定序）**：① FMHA 条带化配段（65k −270ms / 128k −800ms，
+  唯一救两档）；② superstep 层遍历图化/融合（5,000 launch → 间隙+尾巴）；
+  ③ bucket 阶梯细化（2048–4224、8448–16896 之间加档；16k 档 1,042→~700 的
+  主杠杆）；④ 协调 270→~150ms（降级，不再是主要矛盾）。
 
 ## Next action
 
@@ -615,6 +634,6 @@ leveling 被钳成等长切分，深位 attention ≈ 均摊 1.6×** → 下一�
 135k），而 tray14 在重启窗口被第三方 NeMo LoRA 抢走，2026-08-25 时点全集群无
 第 4 台空 tray（监视器在轮询）。拿到机器即跑 256k 门禁（ctx=262144 batch=1，
 已验证 armed 无 OOM）→ **验收：full 896@EP16 对 vLLM TP16-MNNVL 重赛
-8k/16k/64k/256k**。EP16 全量下 19.6 GiB slab 的 HBM 账实测。次优先（whale
-剖析 ⑥ 定序）：FMHA 条带化配段（剩余 7% 缺口的主项）、固定截距 ~850ms
-剖析（slack/armed decode-only/前端合账）、KDA 包 prefix-scan。
+8k/16k/64k/256k**。EP16 全量下 19.6 GiB slab 的 HBM 账实测。次优先按 ⑥ 的
+实测定序：FMHA 条带化 → superstep 图化/融合 → bucket 细化 → 协调压缩；
+KDA 包 prefix-scan 排后。
