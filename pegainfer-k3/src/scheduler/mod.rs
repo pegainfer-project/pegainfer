@@ -112,7 +112,7 @@ pub struct K3WhaleServing {
 /// A whale request this poster sent to the sequencer and is waiting to hear
 /// back about. Its slot is reserved the whole time, so the commit can never
 /// arrive to a full batch. `id.raw()` rides the descriptor's `request` field,
-/// pairing gathers, commits, and cancels with this admission.
+/// pairing gathers and commits with this admission.
 struct PostedWhale {
     id: RequestId,
     slot: SlotId,

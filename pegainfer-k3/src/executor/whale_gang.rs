@@ -300,8 +300,8 @@ impl K3WhaleGang {
         let cp_size = gang.len();
         let my_base = self.my_base();
         // Beat 1: announce my publication to every rank that reads it, in one
-        // ring. The kernel's system fence releases my preceding stream work,
-        // so the publication bytes are visible before the doorbell rings.
+        // ring. Stream order puts those bytes complete before the ring kernel
+        // launches.
         let publish_flags: Vec<u64> = kind
             .read_by(cp_rank, cp_size)
             .map(|reader| {

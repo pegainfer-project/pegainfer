@@ -481,9 +481,6 @@ const K3_CP_QUAD_PER_LINEAR: f64 = 2.7e-6;
 /// impossible, which admission rejects too.
 pub fn k3_whale_segments(total: usize, width: usize, chunk_tokens: usize) -> Vec<(usize, usize)> {
     debug_assert!(width >= 2);
-    if total == 0 {
-        return vec![(0, 0)];
-    }
     // The padded per-row families (KDA, norms, projections, MoE entry) run at
     // the covering chunk *bucket*, a step function of segment length — only
     // attention is varlen. Pure leveling stretches the earliest segment past

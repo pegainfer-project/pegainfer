@@ -45,7 +45,9 @@
 //!
 //! The state machines below are pure — one event in, the messages to send
 //! out — so the transports ([`LocalWhaleHub`],
-//! [`super::whale_hub::TcpWhaleHub`]) stay I/O-only.
+//! [`super::whale_hub::TcpWhaleHub`]) stay I/O-only. Width and gang policy
+//! live with the data plane ([`crate::executor::cp`]); this module only
+//! applies them.
 //!
 //! [`LocalWhaleHub`]: super::whale_hub::LocalWhaleHub
 
@@ -120,7 +122,7 @@ impl WhaleDescriptor {
 /// FNV-1a, the token stream fed as little-endian bytes. Not cryptographic —
 /// the threat is corruption and framing bugs, not an adversary on the fabric
 /// management network.
-pub fn k3_whale_prompt_hash(prompt: &[u32]) -> u64 {
+fn k3_whale_prompt_hash(prompt: &[u32]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for &token in prompt {
         for byte in token.to_le_bytes() {
