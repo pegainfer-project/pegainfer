@@ -495,11 +495,13 @@ pub(super) fn kda_attention_chunk(
         }
         Some(cp) => {
             // KCP: the recurrence is affine in the state, so the segment is
-            // `S_out = M·S_in + D`. Export `(M, D)` by running the same
-            // forward with doctored operands (`v = 0` from identity gives
-            // `M`; real `v` from zero gives `D`), exchange, fold the
+            // `S_out = S_in·M + D`. Export `(M, D)`, exchange, fold the
             // upstream packages, and run the real forward from the true
-            // input state. Rank 0's real forward doubles as its package.
+            // input state. Rank 0's real forward doubles as its package; a
+            // middle rank derives both package halves in one fused pass
+            // (`k3_flash_kda_fwd_md_launch` — one kernel-1 sweep, dual-state
+            // kernel 2, bit-identical to the two doctored forwards it
+            // replaced, pinned by the `k3_flash_kda_md_equiv` gate).
             let group = groups[0];
             let rows = shape.live_rows;
             let scale = (K3_HEAD_DIM as f32).powf(-0.5);
@@ -515,6 +517,26 @@ pub(super) fn kda_attention_chunk(
                 flash_kda_ws,
                 ..
             } = s;
+            if cp.cp_rank != 0 && cp.cp_rank + 1 < cp.cp_size {
+                pegainfer_kernels::ops::k3_flash_kda_fwd_md_launch(
+                    ctx,
+                    rows,
+                    K3_HEADS,
+                    conv_q,
+                    conv_k,
+                    conv_v,
+                    kda_g,
+                    beta,
+                    kda_beta_t,
+                    &w.a_log,
+                    &w.dt_bias,
+                    &mut cp.kda_d,
+                    &mut cp.kda_m,
+                    flash_kda_ws,
+                    scale,
+                    lower_bound,
+                )?;
+            }
             let mut forward = |v: &CudaSlice<bf16>,
                                state_in: &CudaSlice<f32>,
                                state_out: &mut CudaSlice<f32>|
@@ -556,9 +578,6 @@ pub(super) fn kda_attention_chunk(
                     1,
                     K3_KDA_STATE,
                 )?;
-            } else if cp.cp_rank + 1 < cp.cp_size {
-                forward(&cp.zero_v, &cp.identity, &mut cp.kda_m)?;
-                forward(&*conv_v, &cp.zero_state, &mut cp.kda_d)?;
             }
             let cp_group = cp.group.clone();
             let cp_sync = cp.window_sync(K3CpWindowKind::Upstream);

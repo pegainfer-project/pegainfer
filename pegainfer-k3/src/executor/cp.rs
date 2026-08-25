@@ -6,12 +6,13 @@
 //! * **KDA (KCP)**: the recurrence's per-token update is affine in the state
 //!   (`S' = A·S + b` with `A`, `b` functions of the inputs alone), so a whole
 //!   segment collapses to `S_out = M_seg·S_in + D_seg`. Each rank exports its
-//!   `(M, D)` package by running the vendored FlashKDA forward twice with
-//!   doctored operands — `v = 0` from an identity state yields `M`, real `v`
-//!   from a zero state yields `D` — then every rank folds its upstream
-//!   packages into its true input state with per-head fp32 GEMMs and runs the
-//!   real forward once. Rank 0's real forward *is* its package (`D`, with a
-//!   known zero input), and the last rank exports nothing.
+//!   `(M, D)` package in one fused FlashKDA pass (`k3_flash_kda_fwd_md` —
+//!   kernel 1 once, a dual-state kernel 2 carrying `M` from an in-kernel
+//!   identity seed with `v = 0` and `D` from a zero seed with real `v`) —
+//!   then every rank folds its upstream packages into its true input state
+//!   with per-head fp32 GEMMs and runs the real forward once. Rank 0's real
+//!   forward *is* its package (`D`, with a known zero input), and the last
+//!   rank exports nothing.
 //! * **conv halo**: a segment's first `K3_CONV_STATE` convolution windows
 //!   reach into the previous segment. The upstream rank publishes its last
 //!   `K3_CONV_STATE` *normed* rows; the receiver projects them through the
@@ -371,12 +372,6 @@ pub(crate) struct K3CpScratch {
     pub(crate) halo_partial: CudaSlice<f32>,
     /// Landed halo inputs, `[4, inner]` bf16.
     pub(crate) halo_xs: CudaSlice<bf16>,
-    /// All-zero `v` operand for the transition (`M`) forward.
-    pub(crate) zero_v: CudaSlice<bf16>,
-    /// All-zero input state for the `D` forward.
-    pub(crate) zero_state: CudaSlice<f32>,
-    /// Per-head identity input state for the `M` forward.
-    pub(crate) identity: CudaSlice<f32>,
     /// Received packages, `[cp_size, K3_KDA_STATE]` each.
     pub(crate) recv_m: CudaSlice<f32>,
     pub(crate) recv_d: CudaSlice<f32>,
@@ -398,13 +393,6 @@ impl K3CpScratch {
     pub(crate) fn new(ctx: &DeviceContext, group: Arc<K3CpGroup>, seg_cap: usize) -> Result<Self> {
         let cp_size = group.cp_size();
         let stream = &ctx.stream;
-        let d = K3_KDA_HEAD_DIM;
-        let mut identity_host = vec![0f32; K3_KDA_STATE];
-        for head in 0..K3_KDA_HEADS {
-            for i in 0..d {
-                identity_host[head * d * d + i * d + i] = 1.0;
-            }
-        }
         Ok(Self {
             // Meaningful only between an `arm` and the superstep it opened.
             cp_rank: 0,
@@ -423,11 +411,6 @@ impl K3CpScratch {
             halo_normed: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_HIDDEN)?,
             halo_partial: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_ATTN_INNER)?,
             halo_xs: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_ATTN_INNER)?,
-            zero_v: stream
-                .alloc_zeros(seg_cap * K3_ATTN_INNER)
-                .context("alloc K3 CP zero-v operand")?,
-            zero_state: stream.alloc_zeros(K3_KDA_STATE)?,
-            identity: stream.clone_htod(&identity_host)?,
             recv_m: stream
                 .alloc_zeros(cp_size * K3_KDA_STATE)
                 .context("alloc K3 CP package arena")?,
@@ -443,10 +426,6 @@ impl K3CpScratch {
             consume_event: new_event(ctx).context("create K3 CP consume event")?,
             group,
         })
-    }
-
-    pub(crate) fn seg_cap(&self) -> usize {
-        self.seg_cap
     }
 
     /// Arm the upstream persist: `indices` are the owner's pool write indices

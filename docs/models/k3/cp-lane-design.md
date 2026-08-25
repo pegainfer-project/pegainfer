@@ -19,7 +19,9 @@ HTTP e2e 同脚本 4 卡对 4 卡：16k CP4 1161 ms vs vLLM TP4 1181 ms 首次�
 1.3–1.5×，8k+ 输 0.68×（我们 CP 宽度钉在 4）——M1 加宽的立项数据，详表见
 §16 卡对局**；**gap anatomy 2026-08-25：2.86× 的缺口 40% 是 MoE 不吃 CP 的
 Amdahl 项，CP4 硬顶 3.49×，通信仅 0.6% 且纯 peer D2D 已快过 NCCL 地板，
-详见 §CP4 gap anatomy**）→ M1 full@EP16 交叉矩阵 + lane-vs-独占步系统 A/B
+详见 §CP4 gap anatomy；event 门控交换 + M+D 融合 kernel 双双落地后
+CP4/CP1 = 2.95×，剩余缺口只剩 FMHA 三角与 Amdahl 项**）→ M1 full@EP16
+交叉矩阵 + lane-vs-独占步系统 A/B
 → M2 agent cache 闭环 → M3 弹性调度。
 
 Last touched: 2026-08
@@ -427,12 +429,23 @@ superstep free-run，只有真依赖 stall stream。同门禁复测：logits 逐
 CP4 kernel 墙钟 1116.8→1071.9 ms（冷）/ 1054.9→1037.7（暖），
 **CP4/CP1 2.83→2.92×**；非临界 rank 空转 93/91→12/10 ms。剩余空转全部
 有名有姓：dev3 的 72.8 ms（×69 层）= 等 dev1/2 M/D doctored 调用的真依赖
-（下一刀 = M+D 融成单 kernel，~-35 ms）；dev0 的 53 ms 是 consume-wait
+（下一段：已被 M+D 融合 kernel 砍半）；dev0 的 53 ms 是 consume-wait
 挂在窗口尾的保守放置（不在临界路径，修了墙钟不动，暂不动）。
 
-杠杆排序（更新）：event 门控 DONE（2.92×）；M+D 单 kernel 融合（≈3.0×）
-→ FMHA 条带化配段（≈3.1–3.2×）→ **3.49× 是 EP 共享 MoE 的硬顶，再往上
-只有 M1 加宽**。
+**M+D 融合 kernel 已落地（2026-08-25）**：中间 rank 的两次 doctored 调用
+（M：v=0+单位态；D：真 v+零态）本就共享整个 kernel-1（prepare 与 v/state
+无关）且丢弃 token 输出，融成 `k3_flash_kda_fwd_md` —— 一次 K1 扫 + 双态
+K2（砍 q-GEMM/Phase4/Phase5/out-store，每 tile 6 发 GEMM 对 10 发）。保持
+上游 GEMM 形状与逐态累积顺序 → **与两次 doctored 调用逐位一致**
+（`k3_flash_kda_md_equiv` gate，T∈{14,224,1056,4223,4224} 全 0 diff）；
+微基准 pair 1.0165→0.5943 ms @4224（1.71×）。整机同门禁复测（tray13，
+argmax/token 一致）：暖跑 CP4 forward 墙钟 **1037.7→1001.6 ms，CP4/CP1
+2.92→2.95×**，−36 ms 正中 −28 ms×69 层预估区间。顺手删掉 `zero_v`/
+`zero_state`/`identity` scratch，每 rank 省 ~117 MB。
+
+杠杆排序（更新）：event 门控 DONE（2.92×）；M+D 单 kernel 融合 DONE
+（2.95×）→ FMHA 条带化配段（≈3.1–3.2×）→ **3.49× 是 EP 共享 MoE 的硬顶，
+再往上只有 M1 加宽**。
 
 ## Next action
 

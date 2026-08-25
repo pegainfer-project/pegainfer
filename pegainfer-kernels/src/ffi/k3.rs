@@ -356,6 +356,29 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Fused KCP package forward: one kernel-1 pass plus a dual-state
+    /// kernel 2 producing the segment's affine package in one sweep —
+    /// `state_out_d` = D (real v from zero state), `state_out_m` = M (v = 0
+    /// from identity state), both `[H, 128, 128]` f32. No token output.
+    /// Same operand contract and workspace as [`k3_flash_kda_fwd`].
+    pub fn k3_flash_kda_fwd_md(
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        g: *const Half,
+        beta_ht: *const Half,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        state_out_d: *mut f32,
+        state_out_m: *mut f32,
+        workspace: *mut core::ffi::c_void,
+        t_total: i32,
+        h: i32,
+        scale: f32,
+        lower_bound: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Chunked-prefill MLA context gather: walk one block-table row and split
     /// `t_total` cached 576-wide latent rows into dense `[t, 512]` latent and
     /// `[t, 64]` rope halves. Strides/offsets are in elements.
