@@ -543,8 +543,17 @@ impl TcpWhaleHub {
                 done: Condvar::new(),
             }))
         };
-        let listener =
-            TcpListener::bind(addr).with_context(|| format!("whale hub: bind {addr}"))?;
+        // Bind the port on every interface rather than whatever the hostname
+        // in `addr` resolves to locally: /etc/hosts commonly maps a machine's
+        // own name to 127.0.1.1, which would put the listener on loopback
+        // while the peers dial the fabric address — connection refused with
+        // nothing in the sequencer's log (the EP bootstrap hit exactly this).
+        let port = addr
+            .rsplit_once(':')
+            .map(|(_, port)| port)
+            .with_context(|| format!("whale hub: address {addr} carries no port"))?;
+        let listener = TcpListener::bind(("0.0.0.0", port.parse::<u16>()?))
+            .with_context(|| format!("whale hub: bind 0.0.0.0:{port} ({addr})"))?;
         let bound = listener.local_addr().ok();
         let mailboxes: Mailboxes = Arc::new(Mutex::new(vec![VecDeque::new(); local]));
         let failed: Arc<Mutex<Option<String>>> = Arc::default();
@@ -965,7 +974,9 @@ mod tests {
         // per loop pass keeps the loopback latency far below it, which is the
         // commit slack's stated assumption.
         let (host, _) = TcpWhaleHub::host("127.0.0.1:0", 4, CHUNK, 0, 2, Vec::new()).unwrap();
-        let addr = host.local_addr().expect("host knows its port").to_string();
+        // The listener binds every interface, so dial loopback explicitly.
+        let port = host.local_addr().expect("host knows its port").port();
+        let addr = format!("127.0.0.1:{port}");
         let (peer, _) = TcpWhaleHub::connect(&addr, 2, 2, Vec::new()).unwrap();
         peer.send(WhaleToSequencer::Request {
             request: 5,
