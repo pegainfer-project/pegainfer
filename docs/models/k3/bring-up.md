@@ -27,8 +27,12 @@ layers served by **FlashMLA's SM100 dense FMHA** over kv_b-expanded K/V in
 fixed workspace (vLLM's recipe; the paged latent stays the only persistent
 storage). Chunk steps skip the batched epilogue — the boundary token is
 sampled once, at one row, after the final chunk. 6x-247x TTFT over per-token
-stepping at the 4-layer snapshot (2048 tokens: 6377 → 25.8 ms). Next: CUDA
-graphs over the EP4 fused path, kv-store integration.
+stepping at the 4-layer snapshot (2048 tokens: 6377 → 25.8 ms). Warm-cache
+startup now has one opt-in fast path combining pinned double-buffer upload with
+concurrent local-rank load/build; it cuts the full-depth EP4 process start →
+HTTP ready **126.27 → 22.08 s (5.72x)**, and the same rank-local path serves
+the full 896-expert EP16 fleet. Next: CUDA graphs over the EP4 fused path,
+kv-store integration.
 
 Last touched: 2026-08
 
@@ -46,6 +50,58 @@ multimodal wrapper (`KimiK3ForConditionalGeneration`, text tower under
 Two published checkpoints differ only in `num_experts` (224 vs 896). The
 224-expert variant at EP4 (56 experts/rank) is shape-isomorphic to the full
 model at EP16 — that is the development vehicle.
+
+## Weight-loading startup
+
+The K3 loader already shared GLM5.2's rank-resident load plan, shard-at-a-time
+mmap lifetime events, expert-major placement, and pinned double-buffer
+implementation. The missing production wiring was above that layer: the
+pinned uploader was always passed `false`, and a process completed one local
+rank's weight load, model build, executor allocation, and optional DSpark load
+before starting the next rank. Mirroring GLM5.2, one production switch enables
+the complete fast path:
+
+- `--k3-weight-staging`: load/build every rank hosted by this process
+  concurrently, with two 32 MiB pinned slots and four persistent fill workers
+  per active rank loader. It operates on the hosted `--k3-ranks` slice, not
+  the global EP width, so EP4/8/16/32/64 use the same path and map their local
+  ranks to devices 0..N.
+
+The 2026-08-25 same-binary EP4 A/B used the full 93-layer 224-expert
+checkpoint (189.08 GiB and 33,372 tensors per rank), four GB300s, warm page
+cache, one decode slot/rank, and a real HTTP completion after readiness. All
+four arms produced the same completion bytes:
+
+| Local-rank scheduling | Uploader | Local critical path | HTTP ready | Critical-path speedup |
+| --- | --- | ---: | ---: | ---: |
+| serial | pageable mmap | 125.16 s | 126.27 s | 1.00x |
+| serial | pinned double buffer | 47.15 s | 48.12 s | 2.65x |
+| parallel | pageable mmap | 44.54 s | 46.11 s | 2.81x |
+| parallel | pinned double buffer | **20.96 s** | **22.08 s** | **5.97x** |
+
+In the winning arm, the four rank weight loads were 15.96--18.58 s; model
+build was below one second/rank. This rules out the per-MoE-layer weight
+repack syncs as the current startup bottleneck: source-page materialization
+and H2D dominate.
+
+The CPU-affinity boundary is part of this result. A first Slurm run allocated
+the whole 144-core node but left `CPUs/Task=1`, pinning the process and all 16
+fill workers to CPU 0; the same parallel+pinned arm then took 100.61 s. The
+correct launch used `--cpus-per-task=144 --cpu-bind=none`. Startup now warns
+when the process affinity exposes fewer CPUs than the selected rank-loader +
+pinned-fill teams can use, rather than silently making a starved run look like
+a loader regression.
+
+The EP-width invariant was then closed on the full 896-expert model at EP16:
+four processes each hosted four ranks with parallel+pinned loading, all four
+HTTP endpoints reached ready, and the same prompt returned byte-identical
+text from every endpoint. Forced-cold/partially resident node critical paths
+were 134--194 s. On the immediate restart, three nodes whose selected pages
+survived reached 18.60/23.73/29.20 s; one node whose selected pages did not
+survive took 198.65 s despite a large aggregate page cache. Therefore the fast
+path remains opt-in: changing the default needs residency detection over
+the actual rank load plan (for example `mincore`), not a host-level free/cache
+memory heuristic.
 
 ## Decisions and why
 

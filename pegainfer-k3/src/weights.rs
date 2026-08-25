@@ -70,6 +70,7 @@ pub(crate) use load::K3ExpertLayerRegions;
 pub(crate) use load::K3RankGpuWeights;
 #[allow(unused_imports)]
 pub(crate) use load::load_rank_weights_to_gpu;
+pub(crate) use staging::FILL_THREADS as K3_WEIGHT_FILL_THREADS;
 
 const K3_WEIGHT_INDEX: &str = "model.safetensors.index.json";
 const K3_CONFIG: &str = "config.json";

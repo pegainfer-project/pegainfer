@@ -139,6 +139,7 @@ fn executor(
         // chunk widths through `max_batch` (cap 1, cap 8).
         chunk_tokens: max_batch,
         cuda_graph,
+        weight_staging: false,
         moe_transport,
     };
     Some(
@@ -725,6 +726,7 @@ fn prefill_time_snapshot() {
         // Derived: the widest chunk the transport carries (protocol max).
         chunk_tokens: 0,
         cuda_graph: true,
+        weight_staging: false,
         moe_transport: K3MoeTransport::MEGA,
     };
     let mut executor =
@@ -831,6 +833,7 @@ fn chunked_prefill_agrees_with_the_per_token_walk_at_depth() {
             num_layers: depth,
             chunk_tokens: max_batch,
             cuda_graph: false,
+            weight_staging: false,
             moe_transport: K3MoeTransport::MEGA,
         };
         K3Executor::load(&path, device(), 0, 1, config)

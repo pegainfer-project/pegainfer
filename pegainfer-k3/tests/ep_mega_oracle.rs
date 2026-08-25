@@ -161,6 +161,7 @@ fn config(fixture: &Fixture) -> K3ExecutorConfig {
         // match. (The single-rank mega path does capture; this pins it off so
         // the two differ only in world size.)
         cuda_graph: false,
+        weight_staging: false,
         moe_transport: K3MoeTransport::MEGA,
     }
 }

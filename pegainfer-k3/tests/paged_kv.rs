@@ -162,6 +162,7 @@ fn page_permutation_leaves_every_logit_bit_identical() {
         num_layers: fixture.num_layers,
         chunk_tokens: 0,
         cuda_graph: false,
+        weight_staging: false,
         moe_transport: K3MoeTransport::MEGA,
     };
     let Some(mut executor) = executor(config) else {
@@ -199,6 +200,7 @@ fn long_context_decode_is_self_consistent() {
         num_layers: fixture.num_layers,
         chunk_tokens: 0,
         cuda_graph: false,
+        weight_staging: false,
         moe_transport: K3MoeTransport::MEGA,
     };
     let mut feed = fixture.feed;
@@ -277,6 +279,7 @@ fn dump_forced_replay_logits() {
         num_layers: fixture.num_layers,
         chunk_tokens: 0,
         cuda_graph: false,
+        weight_staging: false,
         moe_transport: K3MoeTransport::MEGA,
     };
     let Some(mut executor) = executor(config) else {

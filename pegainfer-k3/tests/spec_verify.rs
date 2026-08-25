@@ -75,6 +75,7 @@ fn executor(num_layers: usize) -> Option<K3Executor> {
         num_layers,
         chunk_tokens: 0,
         cuda_graph: false,
+        weight_staging: false,
         moe_transport: K3MoeTransport::MEGA,
     };
     Some(

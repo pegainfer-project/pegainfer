@@ -71,6 +71,7 @@ mod paged_kv;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -185,6 +186,10 @@ pub struct K3ExecutorConfig {
     pub chunk_tokens: usize,
     /// Capture and replay the step, rather than launching it eagerly.
     pub cuda_graph: bool,
+    /// Stage checkpoint bytes through two pinned host buffers, overlapping
+    /// host fills with H2D DMA. Intended for warm-page-cache starts; cold
+    /// network-filesystem loads can prefer the direct pageable path.
+    pub weight_staging: bool,
     /// Which kernel runs the routed experts. Production is always
     /// [`K3MoeTransport::MEGA`]; see that type for why the alternative exists
     /// and why it is not selectable from a serving configuration.
@@ -242,6 +247,7 @@ impl Default for K3ExecutorConfig {
             num_layers: K3_LAYERS,
             chunk_tokens: 0,
             cuda_graph: true,
+            weight_staging: false,
             moe_transport: K3MoeTransport::MEGA,
         }
     }
@@ -455,6 +461,8 @@ impl K3Executor {
         config: K3ExecutorConfig,
         rendezvous: Option<Arc<K3EpRendezvous>>,
     ) -> Result<Self> {
+        let startup_started = Instant::now();
+        let plan_started = Instant::now();
         probe_config_json(&read_config(model_path)?)
             .with_context(|| format!("validate the K3 config at {}", model_path.display()))?;
         let manifest = K3WeightManifest::from_model_dir(model_path)?;
@@ -470,16 +478,37 @@ impl K3Executor {
         // the rest, but not before they are resident, and at low expert
         // parallelism a whole rank does not fit on one device.
         let bundle = manifest.rank_load_bundle_for_layers(rank, topo, config.num_layers)?;
+        let plan_secs = plan_started.elapsed().as_secs_f64();
+
+        let context_started = Instant::now();
         let gpu = K3RankGpuContext::new(device_ordinal)?;
         let ctx = gpu.device_context()?;
-        let loaded = load_rank_weights_to_gpu(&gpu, model_path, &bundle, false)?;
+        let context_secs = context_started.elapsed().as_secs_f64();
+
+        let weights_started = Instant::now();
+        let loaded = load_rank_weights_to_gpu(&gpu, model_path, &bundle, config.weight_staging)?;
+        let weights_secs = weights_started.elapsed().as_secs_f64();
         let form = if config.moe_transport.is_mega() {
             K3ExpertBankForm::Mega
         } else {
             K3ExpertBankForm::MaskedChain
         };
+        let model_started = Instant::now();
         let model = K3RankModel::build(&ctx, loaded.weights, topo, rank, config.num_layers, form)?;
-        Self::new(gpu, ctx, model, config, rendezvous)
+        let model_secs = model_started.elapsed().as_secs_f64();
+
+        let executor_started = Instant::now();
+        let executor = Self::new(gpu, ctx, model, config, rendezvous)?;
+        let executor_secs = executor_started.elapsed().as_secs_f64();
+        info!(
+            "K3 rank {rank} startup profile: total={:.2}s, plan={plan_secs:.2}s, \
+             cuda_context={context_secs:.2}s, weights={weights_secs:.2}s, \
+             model_build={model_secs:.2}s, executor_build={executor_secs:.2}s, \
+             weight_staging={}",
+            startup_started.elapsed().as_secs_f64(),
+            config.weight_staging,
+        );
+        Ok(executor)
     }
 
     /// Wrap an already-built rank model.

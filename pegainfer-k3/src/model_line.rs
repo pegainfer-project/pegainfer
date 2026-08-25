@@ -3,11 +3,15 @@
 //! and launch.
 
 use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context as _;
 use clap::Args as ClapArgs;
 use clap::FromArgMatches;
 use log::info;
+use log::warn;
 use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
@@ -25,6 +29,7 @@ use crate::executor::ep::K3EpRendezvous;
 use crate::scheduler::K3CpGang;
 use crate::scheduler::K3CpServing;
 use crate::scheduler::K3SchedulerConfig;
+use crate::weights::K3_WEIGHT_FILL_THREADS;
 
 pub static MODEL_LINE: K3Line = K3Line;
 
@@ -72,6 +77,12 @@ struct K3Cli {
     /// over the rack-wide NVLink domain).
     #[arg(long)]
     k3_rendezvous: Option<String>,
+
+    /// Load hosted K3 ranks concurrently and stage checkpoint bytes through
+    /// pinned double buffers. This can substantially accelerate
+    /// warm-page-cache loads; leave off for cold network-filesystem starts.
+    #[arg(long)]
+    k3_weight_staging: bool,
 }
 
 /// Parse a `start..end` rank range.
@@ -253,12 +264,18 @@ impl ModelLine for K3Line {
         let ep_size = ep_size(&cli)?;
         let ranks = local_ranks(&cli, ep_size)?;
         let eos_token_ids = eos_token_ids(ctx.config);
-        let config = K3ExecutorConfig::default().from_env().for_ep(ep_size);
+        let mut config = K3ExecutorConfig::default().from_env().for_ep(ep_size);
+        config.weight_staging = cli.k3_weight_staging;
+        warn_if_loader_cpu_starved(ranks.len(), config.weight_staging);
         info!(
             "K3 engine starting: ep_size={ep_size}, ranks={ranks:?}, \
              eos_token_ids={eos_token_ids:?}, slots={}, ctx={}, layers={}, cuda_graph={}, \
-             moe=mega",
-            config.max_batch, config.max_ctx, config.num_layers, config.cuda_graph
+             moe=mega, weight_staging={}",
+            config.max_batch,
+            config.max_ctx,
+            config.num_layers,
+            config.cuda_graph,
+            config.weight_staging,
         );
         // One executor per EP rank this process hosts, on devices
         // 0..ranks.len(). A single-rank run honours --device-ordinal, which
@@ -279,31 +296,26 @@ impl ModelLine for K3Line {
                 Some(K3EpRendezvous::fleet(ep_size, ranks.clone(), addr.clone())?)
             }
         };
-        let mut executors = Vec::with_capacity(ranks.len());
-        for (device, rank) in ranks.clone().enumerate() {
-            let device = if ep_size == 1 {
-                ctx.shared.device_ordinal
+        let load_started = Instant::now();
+        let executors = load_rank_executors(
+            ctx.model_path,
+            ctx.shared.dflash_draft_model_path.as_deref(),
+            ctx.shared.device_ordinal,
+            ranks.clone(),
+            ep_size,
+            config,
+            rendezvous.as_ref(),
+        )?;
+        info!(
+            "K3 local rank startup complete: ranks={}, mode={}, critical_path={:.2}s",
+            executors.len(),
+            if config.weight_staging {
+                "parallel"
             } else {
-                device
-            };
-            let executor = match rendezvous.clone() {
-                Some(rendezvous) => {
-                    K3Executor::load_ep(ctx.model_path, device, rank, config, rendezvous)
-                }
-                None => K3Executor::load(ctx.model_path, device, rank, ep_size, config),
-            };
-            let mut executor = executor.with_context(|| {
-                format!("loading K3 rank {rank} of {ep_size} onto device {device}")
-            })?;
-            // The DSpark draft lane is rank-local and collective-free, so
-            // arming it per rank adds no cross-rank coupling.
-            if let Some(draft_path) = &ctx.shared.dflash_draft_model_path {
-                executor
-                    .load_dspark(draft_path)
-                    .with_context(|| format!("arming the K3 dspark draft lane on rank {rank}"))?;
-            }
-            executors.push(executor);
-        }
+                "serial"
+            },
+            load_started.elapsed().as_secs_f64(),
+        );
         let dspark_armed = ctx.shared.dflash_draft_model_path.is_some();
         let chunk_tokens = executors
             .first()
@@ -321,6 +333,137 @@ impl ModelLine for K3Line {
             ),
         ))
     }
+}
+
+fn warn_if_loader_cpu_starved(local_ranks: usize, weight_staging: bool) {
+    let loader_threads = if weight_staging { local_ranks } else { 1 };
+    let fill_threads = if weight_staging {
+        K3_WEIGHT_FILL_THREADS * loader_threads
+    } else {
+        0
+    };
+    let wanted = loader_threads + fill_threads;
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    if available < wanted {
+        warn!(
+            "K3 weight startup is CPU-starved: affinity exposes {available} CPU(s), but \
+             weight_staging={weight_staging} can use {wanted} \
+             ({loader_threads} rank loader(s) + {fill_threads} pinned-fill worker(s)); \
+             widen the process CPU affinity or expect serialized host fills"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_rank_executors(
+    model_path: &Path,
+    draft_path: Option<&Path>,
+    single_rank_device: usize,
+    ranks: std::ops::Range<usize>,
+    ep_size: usize,
+    config: K3ExecutorConfig,
+    rendezvous: Option<&Arc<K3EpRendezvous>>,
+) -> anyhow::Result<Vec<K3Executor>> {
+    let placements = rank_placements(single_rank_device, ranks, ep_size);
+
+    if !config.weight_staging || placements.len() == 1 {
+        return placements
+            .into_iter()
+            .map(|(device, rank)| {
+                load_rank_executor(
+                    model_path,
+                    draft_path,
+                    device,
+                    rank,
+                    ep_size,
+                    config,
+                    rendezvous.cloned(),
+                )
+            })
+            .collect();
+    }
+
+    std::thread::scope(|scope| {
+        let handles = placements
+            .into_iter()
+            .map(|(device, rank)| {
+                let rendezvous = rendezvous.cloned();
+                (
+                    rank,
+                    scope.spawn(move || {
+                        load_rank_executor(
+                            model_path, draft_path, device, rank, ep_size, config, rendezvous,
+                        )
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(rank, handle)| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("K3 rank {rank} loader thread panicked"))?
+            })
+            .collect()
+    })
+}
+
+fn rank_placements(
+    single_rank_device: usize,
+    ranks: std::ops::Range<usize>,
+    ep_size: usize,
+) -> Vec<(usize, usize)> {
+    ranks
+        .enumerate()
+        .map(|(local_device, rank)| {
+            let device = if ep_size == 1 {
+                single_rank_device
+            } else {
+                local_device
+            };
+            (device, rank)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_rank_executor(
+    model_path: &Path,
+    draft_path: Option<&Path>,
+    device: usize,
+    rank: usize,
+    ep_size: usize,
+    config: K3ExecutorConfig,
+    rendezvous: Option<Arc<K3EpRendezvous>>,
+) -> anyhow::Result<K3Executor> {
+    let started = Instant::now();
+    let target_started = Instant::now();
+    let executor = match rendezvous {
+        Some(rendezvous) => K3Executor::load_ep(model_path, device, rank, config, rendezvous),
+        None => K3Executor::load(model_path, device, rank, ep_size, config),
+    };
+    let mut executor = executor
+        .with_context(|| format!("loading K3 rank {rank} of {ep_size} onto device {device}"))?;
+    let target_secs = target_started.elapsed().as_secs_f64();
+
+    let draft_started = Instant::now();
+    if let Some(draft_path) = draft_path {
+        // The DSpark draft lane is rank-local and collective-free, so arming
+        // it per rank adds no cross-rank coupling.
+        executor
+            .load_dspark(draft_path)
+            .with_context(|| format!("arming the K3 dspark draft lane on rank {rank}"))?;
+    }
+    let draft_secs = draft_path
+        .is_some()
+        .then(|| draft_started.elapsed().as_secs_f64());
+    info!(
+        "K3 rank {rank} complete startup: total={:.2}s, target={target_secs:.2}s, dspark={}",
+        started.elapsed().as_secs_f64(),
+        draft_secs.map_or_else(|| "off".to_owned(), |secs| format!("{secs:.2}s")),
+    );
+    Ok(executor)
 }
 
 /// Arm the CP prefill lane from `PEGAINFER_K3_CP` (the CP width — must equal
@@ -507,6 +650,26 @@ mod tests {
             let partitions = partitions_for(&["pegainfer", "--k3-ep-size", &ep_size.to_string()])
                 .expect("a supported EP width should validate");
             assert_eq!(partitions, *ep_size);
+        }
+    }
+
+    #[test]
+    fn weight_staging_flag_is_k3_owned() {
+        let partitions = partitions_for(&["pegainfer", "--k3-ep-size", "4", "--k3-weight-staging"])
+            .expect("K3 should accept its weight staging flag");
+        assert_eq!(partitions, 4);
+    }
+
+    #[test]
+    fn every_ep_width_maps_hosted_ranks_to_local_device_ordinals() {
+        assert_eq!(rank_placements(7, 0..1, 1), vec![(7, 0)]);
+        for ep_size in [4, 8, 16, 32, 64] {
+            let start = ep_size - 4;
+            assert_eq!(
+                rank_placements(7, start..ep_size, ep_size),
+                vec![(0, start), (1, start + 1), (2, start + 2), (3, start + 3)],
+                "EP{ep_size}",
+            );
         }
     }
 
