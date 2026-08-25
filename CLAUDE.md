@@ -105,6 +105,15 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 1. Compiles `pegainfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
 2. Feature-gated codegen: `qwen35` runs Triton AOT via `pegainfer-kernels/tools/triton/gen_triton_aot.py`; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA plus TileLang sparse-MLA codegen on sm_90a
 
+## EP Free-Running Discipline
+
+Canonical doc: `docs/models/glm52/free-running-dp.md` (K3's gang lane follows it). Invariants — violating any of these is a deadlock design:
+
+- **No rank ever stops or waits.** Every engine loop runs unconditionally at full speed; idle ranks step with padding rows. Any quiet wait (condvar, sleep-poll) inside EP coordination is a bug, and the fleet is never asleep, so never design "wake up" or "pump until X" steps.
+- **The per-step collective chain is fixed** — no conditional collectives. Skipping work happens inside kernels via zero-load padding entry, never by host negotiation.
+- **The launch count is the global clock** (pairing pins all ranks within ±1 launch). Coordination means agreeing ahead of time on *what step N contains*, never "wait until everyone is ready".
+- **Padding rows are protocol surface**: their bytes reach peers, so every dummy-row input must be constructively deterministic.
+
 ---
 
 # AI-Assisted Contributions
