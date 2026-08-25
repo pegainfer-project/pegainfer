@@ -571,11 +571,36 @@ fleet OOM 后重启前必须逐 tray 杀干净旧进程（`nvidia-smi
 --query-compute-apps`，pgrep 会匹配自己的 ssh shell）；EP8@32k ctx 要
 `PEGAINFER_K3_MAX_BATCH=8`（默认 64 slots 的 KV 预算超 288 GiB HBM）。
 
+**CP16@4-tray 真机门禁 PASS（2026-08-25，tray08/09/14/17 pruned EP16，全账
+`~/code/bench_results/2026-08-25-k3-whale-cp16-smoke/`）**：4/4 armed ~120s，
+512/16k 四端点逐字节一致；TTFT 与 CP8 持平（28.5k 1228ms = 对 CP1 4.79×；
+这些长度全被 ~850ms 截距压着，CP16 收益在更长 prompt 与 256k 容量）。又修掉
+两个真 bug：③ **whale hub acceptor 串行死锁**（`c2e4ba99`）——acceptor 内联跑
+slab 交换，`wait_complete` 等全世界；2 进程恰好能过（CP8 掩盖），4 进程第一个
+peer 锁死 accept 循环。修：每连接独立线程，writer 注册仍在 table 帧后；附 3
+进程回归测试 + whale arming 分阶段计时日志（顺带证明旧"4.5 分钟 arming 谜团"
+就是这个死锁的轻症形态，修后 slab_exchange barrier = 权重加载 skew 0–24s）。
+④ **FlashMLA prefill 116k 上下文天花板**（`6650ef91`）——wrapper 把
+`t_kv×heads×192 > INT_MAX`（heads=96 时 ~116k token）当 batch stride 溢出拒绝，
+256k 请求 fail-stop 全 fleet；但 b=1 的 batch stride 恒不参与寻址（TMA 描述符
+内 64 位算术），传 0 删守卫即可。附 260k×96 头 ignored GPU 深度测试（均匀 K +
+按头 V，输出须精确等每头 V 值）。修复后 CP8@ctx131072 e2e：**128,459 token
+连贯且两端一致**；同配置 A/B：65k 13,922ms local、128k 33,609ms local。
+⑤ **leveling 跨 bucket 台阶**（`7c6dcd96`）——细阶梯（40k–128k）暴露 57k→65k
+间 ~+900ms 台阶：leveled 分段在均值贴近 bucket 边界时把头段推过 8448，头
+rank 落进 16896 bucket，padded 行翻倍、lockstep 全员等它。修：leveling 段长
+cap 到均值所在 bucket（attention 是 varlen，cap 内仍按深度配平）。实测
+65,116 tok 3,638→**2,747ms（5.07×）**、128k 6,382ms（**5.27×**），邻档不动。
+73k 起均值 >8448 的 16896-bucket 台阶是 AOT 阶梯固有（加 12672 档 = profile
+期议题）。剩余对理想 8× 的缺口 = 850ms 截距 + bucket 内 padding + causal
+残余不均衡，留 profile 期。
+
 ## Next action
 
-M1 后半（CP8@2-tray 门禁已过）：CP16@4-tray pruned EP16（等第 4 台空 tray，
-2026-08-25 时点只有 tray08/09/17 空）→ 256k 单 superstep 门禁（需 CP16：
-16×16896=270k 盖 256k，CP8 只到 135k）→ **验收：full 896@EP16 对 vLLM
-TP16-MNNVL 重赛 8k/16k/64k/256k**。EP16 全量下 19.6 GiB slab 的 HBM 账实测。
-次优先：whale 固定截距 ~850ms 剖析（slack/armed decode-only/前端合账）、FMHA
-条带化配段、KDA 包 prefix-scan（profile 后决定）。
+256k 单 superstep 门禁只差机器：需 CP16（16×16896=270k 盖 256k，CP8 上限
+135k），而 tray14 在重启窗口被第三方 NeMo LoRA 抢走，2026-08-25 时点全集群无
+第 4 台空 tray（监视器在轮询）。拿到机器即跑 256k 门禁（ctx=262144 batch=1，
+已验证 armed 无 OOM）→ **验收：full 896@EP16 对 vLLM TP16-MNNVL 重赛
+8k/16k/64k/256k**。EP16 全量下 19.6 GiB slab 的 HBM 账实测。次优先：whale
+固定截距 ~850ms 剖析（slack/armed decode-only/前端合账）、FMHA 条带化配段、
+KDA 包 prefix-scan（profile 后决定）。
