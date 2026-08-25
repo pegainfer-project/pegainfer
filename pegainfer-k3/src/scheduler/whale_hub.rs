@@ -5,7 +5,7 @@
 //! * [`LocalWhaleHub`] — one process hosts the whole world: the sequencer
 //!   lives behind a mutex and outbound messages land straight in per-rank
 //!   mailboxes. This is the in-process degenerate case of the fleet protocol,
-//!   and what the protocol tests and the fuzzer drive.
+//!   and what the scheduler's mock-fleet tests drive.
 //! * [`TcpWhaleHub`] — the fleet: the process hosting global rank 0 runs the
 //!   sequencer and listens; every other process keeps one connection open
 //!   (the same lifetime as the EP bootstrap link, `executor/ep.rs`) and
@@ -16,8 +16,9 @@
 //!
 //! Either hub presents the same two calls to the scheduler: `send` a message
 //! toward the sequencer, `drain` this rank's pending messages at a launch
-//! boundary. Both are non-blocking — the free-running loop never waits on
-//! the rendezvous, it only checks in as it passes.
+//! boundary. Neither waits on another rank's progress: `drain` empties a
+//! local mailbox and a host's `send` is a channel put; a peer's `send`
+//! writes the frame inline, bounded by the write timeout, not by a peer.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -53,7 +54,9 @@ const WHALE_VERSION: u32 = 1;
 /// the fleet through the collective's own deadline; this bound only keeps
 /// the whale queue from wedging behind a slow joiner.
 const WHALE_GATHER_DEADLINE: Duration = Duration::from_secs(30);
-const WHALE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Socket writes only; reads are unbounded (a link is engine-lifetime) except
+/// the one startup table read, which waits on the whole fleet's load.
+const WHALE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const WHALE_CONNECT_RETRY: Duration = Duration::from_secs(2);
 /// The sequencer process binds after its (possibly enormous) weight load;
 /// peers retry for a window that survives it, exactly like the EP bootstrap.
@@ -61,6 +64,8 @@ const WHALE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3600);
 /// A prompt is at most the serving ceiling; anything claiming more than this
 /// many tokens is a framing bug, not a request.
 const WHALE_MAX_PROMPT_TOKENS: u32 = 1 << 22;
+/// No fleet is bigger than this; larger counts in a frame are framing bugs.
+const WHALE_MAX_WORLD: usize = 1024;
 
 /// Per-rank inbox of sequencer messages, drained at launch boundaries.
 type Mailboxes = Arc<Mutex<Vec<VecDeque<WhaleToMember>>>>;
@@ -75,6 +80,18 @@ fn deliver_local(mailboxes: &Mailboxes, first_local: GlobalRank, outbound: &Whal
     };
     inbox.push_back(outbound.message.clone());
     true
+}
+
+fn drain_mailbox(
+    mailboxes: &Mailboxes,
+    first_local: GlobalRank,
+    rank: GlobalRank,
+) -> Vec<WhaleToMember> {
+    let mut boxes = mailboxes.lock().expect("whale mailboxes poisoned");
+    rank.checked_sub(first_local)
+        .and_then(|slot| boxes.get_mut(slot))
+        .map(|inbox| inbox.drain(..).collect())
+        .unwrap_or_default()
 }
 
 /// The transport a whale serving lane holds, whichever process shape the
@@ -137,21 +154,13 @@ impl LocalWhaleHub {
             .expect("whale sequencer poisoned")
             .on_message(message)?;
         for out in outbound {
-            ensure!(
-                deliver_local(&self.mailboxes, 0, &out),
-                "whale sequencer addressed rank {} outside the local world",
-                out.to
-            );
+            deliver_local(&self.mailboxes, 0, &out);
         }
         Ok(())
     }
 
     pub fn drain(&self, rank: GlobalRank) -> Vec<WhaleToMember> {
-        let mut boxes = self.mailboxes.lock().expect("whale mailboxes poisoned");
-        boxes
-            .get_mut(rank)
-            .map(|inbox| inbox.drain(..).collect())
-            .unwrap_or_default()
+        drain_mailbox(&self.mailboxes, 0, rank)
     }
 }
 
@@ -159,61 +168,62 @@ impl LocalWhaleHub {
 // Wire format
 // ---------------------------------------------------------------------------
 
-struct FrameWriter<'a, W: Write>(&'a mut W);
-
-impl<W: Write> FrameWriter<'_, W> {
-    fn u32(&mut self, value: u32) -> Result<()> {
-        self.0
-            .write_all(&value.to_le_bytes())
-            .context("whale frame write")
-    }
-
-    fn u64(&mut self, value: u64) -> Result<()> {
-        self.0
-            .write_all(&value.to_le_bytes())
-            .context("whale frame write")
-    }
-
-    fn tokens(&mut self, tokens: &[u32]) -> Result<()> {
-        self.u32(u32::try_from(tokens.len()).context("whale prompt length")?)?;
-        // One pass over a re-encoded buffer beats one syscall per token for
-        // megabyte prompts.
-        let mut bytes = Vec::with_capacity(tokens.len() * 4);
-        for &token in tokens {
-            bytes.extend_from_slice(&token.to_le_bytes());
-        }
-        self.0.write_all(&bytes).context("whale frame write")
-    }
+fn put_u32(writer: &mut impl Write, value: u32) -> Result<()> {
+    writer
+        .write_all(&value.to_le_bytes())
+        .context("whale frame write")
 }
 
-struct FrameReader<'a, R: Read>(&'a mut R);
+fn put_u64(writer: &mut impl Write, value: u64) -> Result<()> {
+    writer
+        .write_all(&value.to_le_bytes())
+        .context("whale frame write")
+}
 
-impl<R: Read> FrameReader<'_, R> {
-    fn u32(&mut self) -> Result<u32> {
-        let mut buf = [0u8; 4];
-        self.0.read_exact(&mut buf).context("whale frame read")?;
-        Ok(u32::from_le_bytes(buf))
-    }
+fn put_rank(writer: &mut impl Write, rank: GlobalRank) -> Result<()> {
+    put_u32(writer, u32::try_from(rank).context("whale rank")?)
+}
 
-    fn u64(&mut self) -> Result<u64> {
-        let mut buf = [0u8; 8];
-        self.0.read_exact(&mut buf).context("whale frame read")?;
-        Ok(u64::from_le_bytes(buf))
+fn put_tokens(writer: &mut impl Write, tokens: &[u32]) -> Result<()> {
+    put_u32(
+        writer,
+        u32::try_from(tokens.len()).context("whale prompt length")?,
+    )?;
+    let mut bytes = Vec::with_capacity(tokens.len() * 4);
+    for &token in tokens {
+        bytes.extend_from_slice(&token.to_le_bytes());
     }
+    writer.write_all(&bytes).context("whale frame write")
+}
 
-    fn tokens(&mut self) -> Result<Arc<[u32]>> {
-        let len = self.u32()?;
-        ensure!(
-            len <= WHALE_MAX_PROMPT_TOKENS,
-            "whale frame claims {len} prompt tokens — framing bug"
-        );
-        let mut bytes = vec![0u8; len as usize * 4];
-        self.0.read_exact(&mut bytes).context("whale frame read")?;
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("chunks_exact(4)")))
-            .collect())
-    }
+fn get_u32(reader: &mut impl Read) -> Result<u32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf).context("whale frame read")?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn get_u64(reader: &mut impl Read) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf).context("whale frame read")?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn get_rank(reader: &mut impl Read) -> Result<GlobalRank> {
+    Ok(get_u32(reader)? as GlobalRank)
+}
+
+fn get_tokens(reader: &mut impl Read) -> Result<Arc<[u32]>> {
+    let len = get_u32(reader)?;
+    ensure!(
+        len <= WHALE_MAX_PROMPT_TOKENS,
+        "whale frame claims {len} prompt tokens — framing bug"
+    );
+    let mut bytes = vec![0u8; len as usize * 4];
+    reader.read_exact(&mut bytes).context("whale frame read")?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("chunks_exact(4)")))
+        .collect())
 }
 
 const KIND_HELLO: u32 = 0;
@@ -228,22 +238,20 @@ const KIND_SLAB: u32 = 6;
 const KIND_TABLE: u32 = 7;
 
 fn write_header(writer: &mut impl Write, kind: u32) -> Result<()> {
-    let mut frame = FrameWriter(writer);
-    frame.u32(WHALE_MAGIC)?;
-    frame.u32(WHALE_VERSION)?;
-    frame.u32(kind)
+    put_u32(writer, WHALE_MAGIC)?;
+    put_u32(writer, WHALE_VERSION)?;
+    put_u32(writer, kind)
 }
 
 fn read_header(reader: &mut impl Read) -> Result<u32> {
-    let mut frame = FrameReader(reader);
-    let magic = frame.u32()?;
+    let magic = get_u32(reader)?;
     ensure!(magic == WHALE_MAGIC, "whale link: bad magic {magic:#x}");
-    let version = frame.u32()?;
+    let version = get_u32(reader)?;
     ensure!(
         version == WHALE_VERSION,
         "whale link: version {version}, expected {WHALE_VERSION}"
     );
-    frame.u32()
+    get_u32(reader)
 }
 
 fn write_to_sequencer(writer: &mut impl Write, message: &WhaleToSequencer) -> Result<()> {
@@ -254,29 +262,26 @@ fn write_to_sequencer(writer: &mut impl Write, message: &WhaleToSequencer) -> Re
             prompt,
         } => {
             write_header(writer, KIND_REQUEST)?;
-            let mut frame = FrameWriter(writer);
-            frame.u64(*request)?;
-            frame.u32(u32::try_from(*poster).context("whale poster rank")?)?;
-            frame.tokens(prompt)?;
+            put_u64(writer, *request)?;
+            put_rank(writer, *poster)?;
+            put_tokens(writer, prompt)?;
         }
         WhaleToSequencer::Ready { seq, rank, count } => {
             write_header(writer, KIND_READY)?;
-            let mut frame = FrameWriter(writer);
-            frame.u64(*seq)?;
-            frame.u32(u32::try_from(*rank).context("whale ready rank")?)?;
-            frame.u64(*count)?;
+            put_u64(writer, *seq)?;
+            put_rank(writer, *rank)?;
+            put_u64(writer, *count)?;
         }
     }
     writer.flush().context("whale link flush")
 }
 
 fn read_to_sequencer(reader: &mut impl Read, kind: u32) -> Result<WhaleToSequencer> {
-    let mut frame = FrameReader(reader);
     match kind {
         KIND_REQUEST => {
-            let request = frame.u64()?;
-            let poster = frame.u32()? as GlobalRank;
-            let prompt = frame.tokens()?;
+            let request = get_u64(reader)?;
+            let poster = get_rank(reader)?;
+            let prompt = get_tokens(reader)?;
             Ok(WhaleToSequencer::Request {
                 request,
                 poster,
@@ -284,9 +289,9 @@ fn read_to_sequencer(reader: &mut impl Read, kind: u32) -> Result<WhaleToSequenc
             })
         }
         KIND_READY => {
-            let seq = frame.u64()?;
-            let rank = frame.u32()? as GlobalRank;
-            let count = frame.u64()?;
+            let seq = get_u64(reader)?;
+            let rank = get_rank(reader)?;
+            let count = get_u64(reader)?;
             Ok(WhaleToSequencer::Ready { seq, rank, count })
         }
         other => bail!("whale link: kind {other} is not a sequencer-bound message"),
@@ -294,53 +299,54 @@ fn read_to_sequencer(reader: &mut impl Read, kind: u32) -> Result<WhaleToSequenc
 }
 
 fn write_to_member(writer: &mut impl Write, to: GlobalRank, message: &WhaleToMember) -> Result<()> {
+    let kind = match message {
+        WhaleToMember::Gather { .. } => KIND_GATHER,
+        WhaleToMember::Commit { .. } => KIND_COMMIT,
+        WhaleToMember::Cancel { .. } => KIND_CANCEL,
+    };
+    write_header(writer, kind)?;
+    put_rank(writer, to)?;
     match message {
         WhaleToMember::Gather { descriptor } => {
-            write_header(writer, KIND_GATHER)?;
-            let mut frame = FrameWriter(writer);
-            frame.u32(u32::try_from(to).context("whale member rank")?)?;
-            frame.u64(descriptor.seq)?;
-            frame.u64(descriptor.request)?;
-            frame.u32(u32::try_from(descriptor.poster).context("whale poster rank")?)?;
-            frame.u32(u32::try_from(descriptor.gang.len()).context("whale gang size")?)?;
+            put_u64(writer, descriptor.seq)?;
+            put_u64(writer, descriptor.request)?;
+            put_rank(writer, descriptor.poster)?;
+            put_u32(
+                writer,
+                u32::try_from(descriptor.gang.len()).context("whale gang size")?,
+            )?;
             for &member in descriptor.gang.iter() {
-                frame.u32(u32::try_from(member).context("whale gang rank")?)?;
+                put_rank(writer, member)?;
             }
-            frame.u64(descriptor.prompt_hash)?;
-            frame.tokens(&descriptor.prompt)?;
+            put_u64(writer, descriptor.prompt_hash)?;
+            put_tokens(writer, &descriptor.prompt)?;
         }
         WhaleToMember::Commit { seq, launch } => {
-            write_header(writer, KIND_COMMIT)?;
-            let mut frame = FrameWriter(writer);
-            frame.u32(u32::try_from(to).context("whale member rank")?)?;
-            frame.u64(*seq)?;
-            frame.u64(*launch)?;
+            put_u64(writer, *seq)?;
+            put_u64(writer, *launch)?;
         }
-        WhaleToMember::Cancel { seq } => {
-            write_header(writer, KIND_CANCEL)?;
-            let mut frame = FrameWriter(writer);
-            frame.u32(u32::try_from(to).context("whale member rank")?)?;
-            frame.u64(*seq)?;
-        }
+        WhaleToMember::Cancel { seq } => put_u64(writer, *seq)?,
     }
     writer.flush().context("whale link flush")
 }
 
 fn read_to_member(reader: &mut impl Read, kind: u32) -> Result<(GlobalRank, WhaleToMember)> {
-    let mut frame = FrameReader(reader);
-    let to = frame.u32()? as GlobalRank;
+    let to = get_rank(reader)?;
     let message = match kind {
         KIND_GATHER => {
-            let seq = frame.u64()?;
-            let request = frame.u64()?;
-            let poster = frame.u32()? as GlobalRank;
-            let gang_len = frame.u32()?;
-            ensure!(gang_len <= 1024, "whale link: gang of {gang_len} ranks");
+            let seq = get_u64(reader)?;
+            let request = get_u64(reader)?;
+            let poster = get_rank(reader)?;
+            let gang_len = get_u32(reader)? as usize;
+            ensure!(
+                gang_len <= WHALE_MAX_WORLD,
+                "whale link: gang of {gang_len} ranks"
+            );
             let gang: Arc<[GlobalRank]> = (0..gang_len)
-                .map(|_| frame.u32().map(|rank| rank as GlobalRank))
+                .map(|_| get_rank(reader))
                 .collect::<Result<_>>()?;
-            let prompt_hash = frame.u64()?;
-            let prompt = frame.tokens()?;
+            let prompt_hash = get_u64(reader)?;
+            let prompt = get_tokens(reader)?;
             let descriptor = WhaleDescriptor {
                 seq,
                 request,
@@ -353,11 +359,13 @@ fn read_to_member(reader: &mut impl Read, kind: u32) -> Result<(GlobalRank, Whal
             WhaleToMember::Gather { descriptor }
         }
         KIND_COMMIT => {
-            let seq = frame.u64()?;
-            let launch = frame.u64()?;
+            let seq = get_u64(reader)?;
+            let launch = get_u64(reader)?;
             WhaleToMember::Commit { seq, launch }
         }
-        KIND_CANCEL => WhaleToMember::Cancel { seq: frame.u64()? },
+        KIND_CANCEL => WhaleToMember::Cancel {
+            seq: get_u64(reader)?,
+        },
         other => bail!("whale link: kind {other} is not a member-bound message"),
     };
     Ok((to, message))
@@ -369,71 +377,75 @@ fn read_to_member(reader: &mut impl Read, kind: u32) -> Result<(GlobalRank, Whal
 
 /// What one peer process announces on connect: the global ranks it hosts,
 /// and how many slab frames follow (0 = no data-plane exchange, or exactly
-/// `count` — one per hosted rank).
+/// one per hosted rank).
 struct Hello {
-    first: GlobalRank,
-    count: usize,
+    ranks: std::ops::Range<GlobalRank>,
     slabs: usize,
 }
 
 fn write_hello(writer: &mut impl Write, hello: &Hello) -> Result<()> {
     write_header(writer, KIND_HELLO)?;
-    let mut frame = FrameWriter(writer);
-    frame.u32(u32::try_from(hello.first).context("whale hello rank")?)?;
-    frame.u32(u32::try_from(hello.count).context("whale hello count")?)?;
-    frame.u32(u32::try_from(hello.slabs).context("whale hello slabs")?)?;
+    put_rank(writer, hello.ranks.start)?;
+    put_u32(
+        writer,
+        u32::try_from(hello.ranks.len()).context("whale hello count")?,
+    )?;
+    put_u32(
+        writer,
+        u32::try_from(hello.slabs).context("whale hello slabs")?,
+    )?;
     writer.flush().context("whale link flush")
 }
 
-fn write_slab(writer: &mut impl Write, rank: GlobalRank, slab: &K3WhaleSlabWire) -> Result<()> {
-    write_header(writer, KIND_SLAB)?;
-    let mut frame = FrameWriter(writer);
-    frame.u32(u32::try_from(rank).context("whale slab rank")?)?;
-    frame.u64(u64::try_from(slab.num_bytes).context("whale slab size")?)?;
+fn put_slab_body(writer: &mut impl Write, slab: &K3WhaleSlabWire) -> Result<()> {
+    put_u64(
+        writer,
+        u64::try_from(slab.num_bytes).context("whale slab size")?,
+    )?;
     writer
         .write_all(&slab.handle)
-        .context("whale slab handle write")?;
-    writer.flush().context("whale link flush")
+        .context("whale slab handle write")
 }
 
-fn read_slab(reader: &mut impl Read) -> Result<(GlobalRank, K3WhaleSlabWire)> {
-    let mut frame = FrameReader(reader);
-    let rank = frame.u32()? as GlobalRank;
-    let num_bytes = usize::try_from(frame.u64()?).context("whale slab size")?;
+fn get_slab_body(reader: &mut impl Read) -> Result<K3WhaleSlabWire> {
+    let num_bytes = usize::try_from(get_u64(reader)?).context("whale slab size")?;
     let mut handle = [0u8; K3_MEGA_FABRIC_HANDLE_BYTES];
     reader
         .read_exact(&mut handle)
         .context("whale slab handle read")?;
-    Ok((rank, K3WhaleSlabWire { handle, num_bytes }))
+    Ok(K3WhaleSlabWire { handle, num_bytes })
+}
+
+fn write_slab(writer: &mut impl Write, rank: GlobalRank, slab: &K3WhaleSlabWire) -> Result<()> {
+    write_header(writer, KIND_SLAB)?;
+    put_rank(writer, rank)?;
+    put_slab_body(writer, slab)?;
+    writer.flush().context("whale link flush")
+}
+
+fn read_slab(reader: &mut impl Read) -> Result<(GlobalRank, K3WhaleSlabWire)> {
+    Ok((get_rank(reader)?, get_slab_body(reader)?))
 }
 
 fn write_table(writer: &mut impl Write, table: &[K3WhaleSlabWire]) -> Result<()> {
     write_header(writer, KIND_TABLE)?;
-    let mut frame = FrameWriter(writer);
-    frame.u32(u32::try_from(table.len()).context("whale table size")?)?;
+    put_u32(
+        writer,
+        u32::try_from(table.len()).context("whale table size")?,
+    )?;
     for slab in table {
-        let mut frame = FrameWriter(writer);
-        frame.u64(u64::try_from(slab.num_bytes).context("whale slab size")?)?;
-        writer
-            .write_all(&slab.handle)
-            .context("whale table handle write")?;
+        put_slab_body(writer, slab)?;
     }
     writer.flush().context("whale link flush")
 }
 
 fn read_table(reader: &mut impl Read) -> Result<Vec<K3WhaleSlabWire>> {
-    let world = FrameReader(reader).u32()?;
-    ensure!(world <= 1024, "whale link: table of {world} ranks");
-    (0..world)
-        .map(|_| {
-            let num_bytes = usize::try_from(FrameReader(reader).u64()?)?;
-            let mut handle = [0u8; K3_MEGA_FABRIC_HANDLE_BYTES];
-            reader
-                .read_exact(&mut handle)
-                .context("whale table handle read")?;
-            Ok(K3WhaleSlabWire { handle, num_bytes })
-        })
-        .collect()
+    let world = get_u32(reader)? as usize;
+    ensure!(
+        world <= WHALE_MAX_WORLD,
+        "whale link: table of {world} ranks"
+    );
+    (0..world).map(|_| get_slab_body(reader)).collect()
 }
 
 /// The startup slab allgather's shared state on the host: one slot per world
@@ -482,17 +494,12 @@ impl SlabBoard {
 /// The fleet transport. Construct with [`TcpWhaleHub::host`] on the process
 /// hosting global rank 0 (it runs the sequencer) or [`TcpWhaleHub::connect`]
 /// everywhere else. Both sides serve `send`/`drain` for their local ranks;
-/// the reader/sequencer threads live for the hub's lifetime, like the engine
-/// threads they serve — a dead link is engine-fatal, reported at the next
-/// `send`.
+/// the reader/sequencer threads live for the process's lifetime, like the
+/// engine threads they serve — a dead link is engine-fatal, reported at the
+/// next `send`.
 pub struct TcpWhaleHub {
     first_local: GlobalRank,
-    /// The bound listener address (host side only) — lets a hub bound to
-    /// port 0 tell its peers where to connect.
-    addr: Option<std::net::SocketAddr>,
     mailboxes: Mailboxes,
-    /// Where this process's `send` goes: straight into the sequencer channel
-    /// (host) or up the socket (peer).
     outbound: HubRole,
     /// The first error any background thread hit; `send` reports it.
     failed: Arc<Mutex<Option<String>>>,
@@ -500,10 +507,10 @@ pub struct TcpWhaleHub {
 
 enum HubRole {
     Host {
-        inbound: mpsc::Sender<WhaleToSequencer>,
+        to_sequencer: mpsc::Sender<WhaleToSequencer>,
     },
     Peer {
-        link: Mutex<TcpStream>,
+        to_host: Mutex<TcpStream>,
     },
 }
 
@@ -554,34 +561,30 @@ impl TcpWhaleHub {
             .with_context(|| format!("whale hub: address {addr} carries no port"))?;
         let listener = TcpListener::bind(("0.0.0.0", port.parse::<u16>()?))
             .with_context(|| format!("whale hub: bind 0.0.0.0:{port} ({addr})"))?;
-        let bound = listener.local_addr().ok();
         let mailboxes: Mailboxes = Arc::new(Mutex::new(vec![VecDeque::new(); local]));
         let failed: Arc<Mutex<Option<String>>> = Arc::default();
         let (inbound_tx, inbound_rx) = mpsc::channel::<WhaleToSequencer>();
         // Peer connections register their writer half here, keyed by the rank
         // range from their hello.
-        type PeerLinks = Arc<Mutex<Vec<(GlobalRank, usize, TcpStream)>>>;
+        type PeerLinks = Arc<Mutex<Vec<(std::ops::Range<GlobalRank>, TcpStream)>>>;
         let peers: PeerLinks = Arc::default();
 
         let hub = Arc::new(Self {
             first_local,
-            addr: bound,
             mailboxes: mailboxes.clone(),
             outbound: HubRole::Host {
-                inbound: inbound_tx.clone(),
+                to_sequencer: inbound_tx.clone(),
             },
             failed: failed.clone(),
         });
 
-        // Acceptor: one connection thread per peer process. Each thread runs
-        // the hello, then — when the data-plane exchange is armed — the slab
-        // exchange, then registers its writer and settles into the reader
-        // loop. The exchange must run OFF the accept loop: `wait_complete`
-        // blocks until every peer's slabs are in, and a serial acceptor
-        // holding it would leave the remaining peers unaccepted in the
-        // backlog — a startup deadlock for any world with more than one peer
-        // process. Registration stays after the exchange so the sequencer
-        // can never interleave a commit with the table frame on one socket.
+        // One connection thread per peer process: the slab exchange blocks
+        // until the whole world checks in, so a serial acceptor deadlocks any
+        // world with more than one peer process. The writer registers only
+        // after the exchange, or the sequencer could interleave a commit
+        // with the table frame on one socket. A peer that dies mid-exchange
+        // only logs here; the world then times out `wait_complete` at
+        // WHALE_CONNECT_TIMEOUT — that is the error the operator sees.
         {
             let peers = peers.clone();
             let failed = failed.clone();
@@ -604,14 +607,15 @@ impl TcpWhaleHub {
                                         kind == KIND_HELLO,
                                         "whale hub: first frame kind {kind}"
                                     );
-                                    let mut frame = FrameReader(&mut socket);
-                                    let first = frame.u32()? as GlobalRank;
-                                    let count = frame.u32()? as usize;
-                                    let slabs = frame.u32()? as usize;
-                                    ensure!(count <= 1024, "whale hub: hello claims {count} ranks");
+                                    let first = get_rank(&mut socket)?;
+                                    let count = get_u32(&mut socket)? as usize;
+                                    let slabs = get_u32(&mut socket)? as usize;
+                                    ensure!(
+                                        count <= WHALE_MAX_WORLD,
+                                        "whale hub: hello claims {count} ranks"
+                                    );
                                     Ok(Hello {
-                                        first,
-                                        count,
+                                        ranks: first..first + count,
                                         slabs,
                                     })
                                 }) {
@@ -625,10 +629,9 @@ impl TcpWhaleHub {
                                     serve_slab_exchange(&mut socket, &hello, board.as_ref())
                                 {
                                     log::warn!(
-                                        "K3 whale hub: slab exchange with ranks {}..{} failed: \
+                                        "K3 whale hub: slab exchange with ranks {:?} failed: \
                                          {error:#}",
-                                        hello.first,
-                                        hello.first + hello.count
+                                        hello.ranks
                                     );
                                     return;
                                 }
@@ -639,12 +642,11 @@ impl TcpWhaleHub {
                                 // this handle while holding the peer table; a
                                 // wedged peer must fail the hub, not park the
                                 // sequencer forever.
-                                let _ = writer.set_write_timeout(Some(WHALE_IO_TIMEOUT));
-                                peers.lock().expect("whale peers poisoned").push((
-                                    hello.first,
-                                    hello.count,
-                                    writer,
-                                ));
+                                let _ = writer.set_write_timeout(Some(WHALE_WRITE_TIMEOUT));
+                                peers
+                                    .lock()
+                                    .expect("whale peers poisoned")
+                                    .push((hello.ranks, writer));
                                 loop {
                                     let message = read_header(&mut socket)
                                         .and_then(|kind| read_to_sequencer(&mut socket, kind));
@@ -711,10 +713,8 @@ impl TcpWhaleHub {
                                 continue;
                             }
                             let mut links = peers.lock().expect("whale peers poisoned");
-                            let Some((_, _, writer)) =
-                                links.iter_mut().find(|(first, count, _)| {
-                                    (*first..*first + *count).contains(&out.to)
-                                })
+                            let Some((_, writer)) =
+                                links.iter_mut().find(|(ranks, _)| ranks.contains(&out.to))
                             else {
                                 fail(
                                     &failed,
@@ -733,9 +733,6 @@ impl TcpWhaleHub {
         }
         let table = match board {
             None => Vec::new(),
-            // The wait doubles as the fleet's startup barrier: every process
-            // has connected and published its data plane before any engine
-            // serves — mirroring the EP bootstrap's semantics.
             Some(board) => board
                 .wait_complete(WHALE_CONNECT_TIMEOUT)
                 .context("whale hub: the world never completed its slab exchange")?,
@@ -774,13 +771,12 @@ impl TcpWhaleHub {
         };
         socket.set_nodelay(true).ok();
         socket
-            .set_write_timeout(Some(WHALE_IO_TIMEOUT))
+            .set_write_timeout(Some(WHALE_WRITE_TIMEOUT))
             .context("whale hub: set write timeout")?;
         write_hello(
             &mut socket,
             &Hello {
-                first: first_local,
-                count: local,
+                ranks: first_local..first_local + local,
                 slabs: local_slabs.len(),
             },
         )?;
@@ -839,21 +835,14 @@ impl TcpWhaleHub {
         Ok((
             Arc::new(Self {
                 first_local,
-                addr: None,
                 mailboxes,
                 outbound: HubRole::Peer {
-                    link: Mutex::new(socket),
+                    to_host: Mutex::new(socket),
                 },
                 failed,
             }),
             table,
         ))
-    }
-
-    /// The listener address (host side only; `None` on a peer). A host bound
-    /// to port 0 reads its actual port here.
-    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
-        self.addr
     }
 
     pub fn send(&self, message: WhaleToSequencer) -> Result<()> {
@@ -866,22 +855,22 @@ impl TcpWhaleHub {
             bail!("whale hub failed: {reason}");
         }
         match &self.outbound {
-            HubRole::Host { inbound } => inbound
+            HubRole::Host { to_sequencer } => to_sequencer
                 .send(message)
                 .map_err(|_| anyhow::anyhow!("whale sequencer thread is gone")),
-            HubRole::Peer { link } => {
-                let mut socket = link.lock().expect("whale link poisoned");
+            HubRole::Peer { to_host } => {
+                let mut socket = to_host.lock().expect("whale link poisoned");
+                // A failed (or timed-out partial) write leaves the stream
+                // mid-frame: poison the hub so a sibling rank's next send
+                // cannot append into the abandoned frame.
                 write_to_sequencer(&mut *socket, &message)
+                    .inspect_err(|error| fail(&self.failed, format!("host link died: {error:#}")))
             }
         }
     }
 
     pub fn drain(&self, rank: GlobalRank) -> Vec<WhaleToMember> {
-        let mut boxes = self.mailboxes.lock().expect("whale mailboxes poisoned");
-        rank.checked_sub(self.first_local)
-            .and_then(|slot| boxes.get_mut(slot))
-            .map(|inbox| inbox.drain(..).collect())
-            .unwrap_or_default()
+        drain_mailbox(&self.mailboxes, self.first_local, rank)
     }
 }
 
@@ -894,28 +883,27 @@ fn serve_slab_exchange(
     hello: &Hello,
     board: Option<&Arc<SlabBoard>>,
 ) -> Result<()> {
-    match (board, hello.slabs) {
-        (None, 0) => return Ok(()),
-        (None, _) => bail!("the peer sent slabs, but this host has no data-plane exchange armed"),
-        (Some(_), 0) => bail!("this host runs a data-plane exchange, but the peer sent no slabs"),
-        (Some(_), slabs) if slabs != hello.count => {
-            bail!(
-                "the peer hosts {} ranks but sent {slabs} slabs",
-                hello.count
-            )
-        }
-        (Some(_), _) => {}
-    }
-    let board = board.expect("matched above");
+    let Some(board) = board else {
+        ensure!(
+            hello.slabs == 0,
+            "the peer sent slabs, but this host has no data-plane exchange armed"
+        );
+        return Ok(());
+    };
+    ensure!(
+        hello.slabs == hello.ranks.len(),
+        "the peer hosts {} ranks but sent {} slabs",
+        hello.ranks.len(),
+        hello.slabs
+    );
     for _ in 0..hello.slabs {
         let kind = read_header(socket)?;
         ensure!(kind == KIND_SLAB, "expected a slab frame, got kind {kind}");
         let (rank, slab) = read_slab(socket)?;
         ensure!(
-            (hello.first..hello.first + hello.count).contains(&rank),
-            "a slab for rank {rank} from the process hosting {}..{}",
-            hello.first,
-            hello.first + hello.count
+            hello.ranks.contains(&rank),
+            "a slab for rank {rank} from the process hosting {:?}",
+            hello.ranks
         );
         board.insert(rank, slab)?;
     }
@@ -984,10 +972,10 @@ mod tests {
         // serves ranks 2..4 and posts the whale. One simulated launch period
         // per loop pass keeps the loopback latency far below it, which is the
         // commit slack's stated assumption.
-        let (host, _) = TcpWhaleHub::host("127.0.0.1:0", 4, CHUNK, 0, 2, Vec::new()).unwrap();
-        // The listener binds every interface, so dial loopback explicitly.
-        let port = host.local_addr().expect("host knows its port").port();
-        let addr = format!("127.0.0.1:{port}");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let (host, _) = TcpWhaleHub::host(&addr, 4, CHUNK, 0, 2, Vec::new()).unwrap();
         let (peer, _) = TcpWhaleHub::connect(&addr, 2, 2, Vec::new()).unwrap();
         peer.send(WhaleToSequencer::Request {
             request: 5,
