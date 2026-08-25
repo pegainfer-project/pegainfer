@@ -483,8 +483,60 @@ GiB/rank）后 HBM 收紧 ~15 GiB，fleet 复测时要盯。TileLang prefill buc
   法；默认并行会 13 实例同租一卡 OOM——mega slab EP1 涨到 3.2 GiB 后更
   容易炸，跑法不对怪跑法）。
 
+## Whale rendezvous：跨机 gang 的共识层（M1 后半，2026-08-25 无 GPU 部分落地）
+
+CP8/CP16 的 gang 成员跨进程跨机器，M0.5 的 in-process board（一个 Mutex）不再
+可用，而 free-running 纪律禁止任何"等"。协议内容退化到一条：**whale w 在绝对
+launch L 跑**——launch count 本身是全局时钟（mega 双边配对把全 world 钉在 ±1
+以内），所以约定 L 就是约定一个全局时刻，谁都不用被叫醒。实现是 host 侧两阶段
+广播（`scheduler/whale.rs` 纯状态机 + `whale_hub.rs` 传输；rank0 进程当唯一
+sequencer，复用 ep.rs bootstrap 风格的常驻 TCP）：
+
+1. **Gather**：poster 把 prompt 发给 sequencer；sequencer 选宽度（能宽就宽：
+   superstep 挡的是全 fleet，最宽的 gang = 最短的全局 stall）、tray 对齐选
+   gang（poster 转到 CP 末位，KDA 终态和全量 MLA ctx 落在 decode 它的 rank），
+   广播 descriptor。成员回自己当前 launch count 并 **arm**：从此到 commit 不再
+   发起多 launch 操作（每步恰好 +1），但一步不停。
+2. **Commit**：`L = max(replies) + slack(4)`，且严格大于上一头 whale 的 L。
+   armed 成员每 period +1，所以 commit 在 slack 个 period 内送达就一定还没越过
+   L——host TCP 亚毫秒 vs launch period 数十毫秒起，裕量 ~2 个数量级；真迟到
+   在成员侧响亮报错，不会错配 collective。gang 外的 rank 全程不知情：它们的
+   launch L 是普通步，mega 照常配对异构步。Cancel 只作用于 armed（gather 超时
+   /宽度拒绝）；committed 不可撤销——unanimity 就是全部意义，不要的结果跑完丢弃。
+
+**正确性靠仿真而非机器**：状态机纯函数化（transition 进事件出消息），单测覆盖
+happy path、mid-op 迟回、双 whale 串行化（L 严格递增）、超时取消 + 迟到 Ready
+静默丢弃、hash 篡改/非成员/重复 Ready/漏询 boundary/slack 击穿全部响亮死；外加
+48 seed xorshift 舰队 fuzz（8 rank 逐轮 ±1 pinning、消息 0–1 轮延迟 per-dest
+FIFO、随机多 launch 操作跳询 boundary），不变量 = 每头可入场 whale 全 gang 同一
+L 入场、CP rank 恰为 0..width 排列、commit 顺序=seq 顺序、fleet 必静默。
+
+**分段理论模型**（`k3_whale_segments`）：per-rank superstep 时间
+`t_i ∝ len_i + Q·(start_i + len_i/2)·len_i`，线性项是全深度逐 token 走
+（MoE/KDA/dense GEMM），二次项是 MLA ctx 三角；Q = 2.7e-6（CP4 16k profile
+标定：12k 深 prefix 对 ~1000ms superstep 贵 ~32ms）。256k 下末 rank 三角 ≈ 走
+的 2/3，均匀切会把全 fleet 挂在它尾巴上——按预算二分 + 贪心填充做 leveling
+（前 rank 长后 rank 短，封顶 16896）。段下限 `K3_CP_SEGMENT_FLOOR = 2048`
+（FlashKDA 段长扫描：4224 段 96% 饱和、1056 段 87%、264 段 58%），宽度取
+admits 的最大 2 的幂：粗梯子 ≈ CP4 @ 8k–16k / CP8 @ 16k–32k / CP16 @ 32k+，
+16×16896 恰盖 262144（#962 抬协议的动机闭环）。
+
+**KDA 包流量账**（naive 右乘链 vs prefix-scan 的立项数据）：(M,D) 每层
+~12.6 MB，upstream fan-out 全量 O(CP²)、末 rank O(CP)——CP16 末 rank 每层收
+15 对 ≈ 189 MB，全 93 层 ≈ 12.6 GiB/whale，占 256k superstep ~4%、64k ~15%。
+(M,D)∘(M',D') = (MM', DM'+D') 可结合 → Blelloch 并行前缀扫描 log₂CP 轮是
+现成后手；按拍板**先 naive 实现，profile 后再决定**。
+
+数据面（GPU 阶段）：CUDA event 是进程局部的，跨机 four-beat 协议换成
+doorbell（`cuStreamWriteValue32/WaitValue32` 打在 fabric 映射的 flag 上，
+mega kernel 内已用同一技术）；CP scratch 一次性分配指针稳定，fabric handle
+在 gang 形成时一次交换。
+
 ## Next action
 
-M1 后半：CP8/CP16 gang（full@EP16 交叉矩阵 + 系统 A/B），8k+ 追平 vLLM
-TP16 的 16 路切分；EP16 全量下 19.6 GiB slab 的 HBM 账实测。次优先：FMHA
-条带化配段、前端固定截距（132 vs 59 ms @122 tokens）。
+M1 后半剩余：whale 接入 scheduler（每个 launch boundary 询 `at_launch`，含
+chunk 边界；clearance 约束多 launch 操作）→ CP scratch fabric 化 + doorbell
+交换 → CP8@2-tray / CP16@4-tray pruned 门禁 → 256k 单 superstep 门禁 →
+**验收：full 896@EP16 对 vLLM TP16-MNNVL 重赛 8k/16k/64k/256k**。EP16 全量下
+19.6 GiB slab 的 HBM 账实测。次优先：FMHA 条带化配段、前端固定截距
+（132 vs 59 ms @122 tokens）。

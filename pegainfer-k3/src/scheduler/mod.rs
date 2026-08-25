@@ -19,6 +19,8 @@ mod executor;
 mod gang;
 #[cfg(test)]
 mod tests;
+pub mod whale;
+pub mod whale_hub;
 
 use std::collections::VecDeque;
 use std::sync::Arc;

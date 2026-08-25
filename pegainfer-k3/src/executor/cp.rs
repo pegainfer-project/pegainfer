@@ -313,6 +313,14 @@ fn wait_event(ctx: &DeviceContext, event: u64) -> Result<()> {
     .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
+/// The per-rank segment floor for a *fleet* whale gang, in tokens: below
+/// ~2k-token segments FlashKDA falls off its throughput plateau (the 2026-08
+/// segment sweep: 4224-token segments run at 96% of peak, 1056 at 87%, 264 at
+/// 58%), so a wider gang stops paying for itself. The in-process lane's floor
+/// stays [`K3_CONV_STATE`]-based ([`k3_cp_admits`]) — its width is fixed at
+/// arm time, not chosen per prompt.
+pub const K3_CP_SEGMENT_FLOOR: usize = 2048;
+
 /// Whether a prompt of `total` tokens is CP-eligible: every segment must
 /// outspan the conv window (the halo exchange publishes exactly
 /// [`K3_CONV_STATE`] rows) and fit one chunk step (M0: one superstep). This
