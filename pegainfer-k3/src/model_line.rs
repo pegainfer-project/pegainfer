@@ -329,6 +329,9 @@ impl ModelLine for K3Line {
                     eos_token_ids,
                     kv_capacity: None,
                     cp,
+                    // The whale lane arms with the fleet data plane (fabric
+                    // scratch + doorbells), not from a single-process launch.
+                    whale: None,
                 },
             ),
         ))

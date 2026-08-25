@@ -74,6 +74,40 @@ fn deliver_local(mailboxes: &Mailboxes, first_local: GlobalRank, outbound: &Whal
     true
 }
 
+/// The transport a whale serving lane holds, whichever process shape the
+/// deployment has: one process hosting the whole world ([`LocalWhaleHub`]) or
+/// a fleet peer/host ([`TcpWhaleHub`]).
+#[derive(Clone)]
+pub enum K3WhaleHub {
+    Local(Arc<LocalWhaleHub>),
+    Tcp(Arc<TcpWhaleHub>),
+}
+
+impl K3WhaleHub {
+    pub fn send(&self, message: WhaleToSequencer) -> Result<()> {
+        match self {
+            Self::Local(hub) => hub.send(message),
+            Self::Tcp(hub) => hub.send(message),
+        }
+    }
+
+    pub fn drain(&self, rank: GlobalRank) -> Vec<WhaleToMember> {
+        match self {
+            Self::Local(hub) => hub.drain(rank),
+            Self::Tcp(hub) => hub.drain(rank),
+        }
+    }
+}
+
+impl std::fmt::Debug for K3WhaleHub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Local(_) => "K3WhaleHub::Local",
+            Self::Tcp(_) => "K3WhaleHub::Tcp",
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Local hub
 // ---------------------------------------------------------------------------

@@ -516,6 +516,13 @@ impl WhaleMember {
     pub fn is_quiet(&self) -> bool {
         self.armed.is_empty() && self.committed.is_empty()
     }
+
+    /// Whether `seq` is armed here (gathered, commit pending). The poster
+    /// uses this to tell a helper-side cancel from the width refusal of its
+    /// own not-yet-gathered post.
+    pub fn is_armed(&self, seq: WhaleSeq) -> bool {
+        self.armed.iter().any(|armed| armed.seq == seq)
+    }
 }
 
 // ---------------------------------------------------------------------------
