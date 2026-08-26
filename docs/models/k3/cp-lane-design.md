@@ -647,7 +647,7 @@ Amdahl 账：CP1 的 MoE 墙钟与 CP8 同额（mega dispatch 本就全 EP 宽�
 | 16,725 | **794** | 1,020 | 0.78× |
 | 66,677 | 3,251 | **1,734** | **1.88×** |
 | 130,232 | 6,199 | **3,615** | **1.71×** |
-| 254,811 | 13,155 | （full 挂 W-chunk）pruned 9,316 | ~1.41×* |
+| 254,808 | 13,155 | **8,850**（W-chunk 后 @262144 实测） | **1.49×** |
 
 交叉点 16k–64k 之间；短档输 = bucket 阶梯（16.7k/16=1,045 行 → 4224 桶
 padding 4×）+ ~270ms 截距，与 ⑥ 的杠杆排序一致。full CP16@128k 比 pruned
@@ -676,10 +676,15 @@ gather 仍按 max_ctx 长。**full-256k 的结构性 blocker 解除**（账面 ~
 k3 门禁 6/6、`PEGAINFER_K3_CP_PROMPT=65536` 的 cp_prefill 门禁（CP1/CP4 双双
 压出窗口循环）全过。这套 merge 原语同时就是 FMHA 条带化和 DIST_CTX 的底座。
 
+**同日实测（full 1.5T @ctx=262144，tray03/04/06/07，账在 bench 档案追加节）**：
+16 卡整齐 268.3 GiB used / 余量 ~9.3 GiB；254,808 tok TTFT **8,850 ms**（对
+vLLM 13,155 = **1.49×**，快过 pruned CP16 的 9,316）；64k/128k 与 W-chunk 前
+逐 ms 持平（1,717/3,618 vs 1,734/3,615，零回归）；249,891 tok + 48 greedy
+生成连贯。验收表 256k 行补齐——**64k 及以上全档反超 vLLM TP16-MNNVL**。
+
 ## Next action
 
-PR #970 已带三修（`07be170e`）+ W-chunk（`91c23211`）push，track CI 到全绿。
-待 4 tray 空档复跑 full 1.5T @ctx=262144 的 256k 档补上验收表的 `*` 行。
+PR #970 CI 17/17 全绿（`05da7961`），待 susun review。
 性能杠杆按 ⑥ 实测定序不变：FMHA 条带化（merge 原语已在）→ superstep
 图化/融合 → **bucket 细化（8k/16k 档翻盘的主杠杆，验收表的 0.39×/0.78× 就是
 它）** → 协调压缩。KDA 包 prefix-scan 排后。
