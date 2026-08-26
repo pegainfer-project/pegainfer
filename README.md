@@ -42,6 +42,24 @@ Docs, guides, and engineering deep-dives live at [pegainfer.org](https://pegainf
 
 ## Quickstart
 
+### Prebuilt Qwen3 binary
+
+Starting with v0.1.1, PegaInfer provides a Qwen3-only CUDA 13 binary for Linux
+x86_64. The archive includes the CUDA runtime and cuBLAS; the host supplies
+NVIDIA driver 580 or newer, glibc 2.35 or newer, and OpenSSL 3. Install or
+update it in the current user's home directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pegainfer-project/pegainfer/main/install.sh | bash
+```
+
+Set `PEGAINFER_VERSION=v0.1.1` to install that exact release. Model weights are
+not part of the binary archive; download a Qwen3 checkpoint separately and run:
+
+```bash
+pegainfer --model-path models/Qwen3-4B
+```
+
 ### Prerequisites
 
 - Rust (2024 edition), CUDA Toolkit (nvcc, cuBLAS), CUDA-capable GPU
@@ -333,4 +351,3 @@ The DeepSeek-V2-Lite E2E is a correctness/integration gate. Direct diagnostics a
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Components ported from
 NVIDIA Dynamo (the `kvbm/kvbm-logical` crate) retain their original Apache-2.0 headers; see
 [NOTICE_DYNAMO](NOTICE_DYNAMO).
-

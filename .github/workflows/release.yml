@@ -1,0 +1,94 @@
+name: Release Qwen3 binary
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  qwen3-linux-x86_64-cu130:
+    name: Qwen3 Linux x86_64 CUDA 13.0
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CUDA_PATH: /usr/local/cuda
+      PEGAINFER_CUDA_SM: "80,86,89,90,100,110,120"
+      PEGAINFER_NVCC_JOBS: "2"
+      RELEASE_NOTES: >-
+        Prebuilt Qwen3-only server for Linux x86_64. The archive contains CUDA
+        13.0 runtime libraries and supports NVIDIA compute capabilities 8.x
+        through 12.x. NVIDIA driver 580 or newer, glibc 2.35 or newer, and
+        OpenSSL 3 are required. Model weights are not included.
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.0.2"
+          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
+
+      - name: Install build and packaging dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          protobuf-compiler libibverbs-dev patchelf
+
+      - name: Verify tag matches the server version
+        run: |
+          set -euo pipefail
+          package_version=$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq -r '.packages[]
+                | select(.name == "pegainfer-server")
+                | .version'
+          )
+          test "$GITHUB_REF_NAME" = "v$package_version"
+
+      - name: Build Qwen3-only fat binary
+        run: >-
+          cargo build --release --locked -p pegainfer-server
+          --no-default-features --features qwen3
+
+      - name: Package release
+        run: scripts/package_qwen3_release.sh "$GITHUB_REF_NAME" dist
+
+      - name: Attest release archive
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/pegainfer-qwen3-linux-x86_64-cu130.tar.gz
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists;" \
+              "refusing to replace its assets" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            dist/pegainfer-qwen3-linux-x86_64-cu130.tar.gz \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --notes "$RELEASE_NOTES" \
+            --title "PegaInfer $GITHUB_REF_NAME"
