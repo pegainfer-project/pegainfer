@@ -57,8 +57,8 @@ impl VerifyStepItem {
 #[derive(Clone, Copy)]
 pub(crate) struct VerifyPlan<'a> {
     pub requests: &'a [VerifyStepItem],
-    /// Request-local stop policies in the same order as `requests`. They stay
-    /// executor-side and are not copied into the worker command or GPU batch.
+    /// Request-local stop policies in the same order as `requests`. They remain
+    /// host-side and are not copied into GPU buffers.
     pub stop_policies: &'a [StopPolicy],
     /// Engine step seed for the verify rows' sampler pass (same contract as
     /// decode: fresh per step; seeded rows re-mix their own request seed).

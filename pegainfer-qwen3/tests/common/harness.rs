@@ -18,6 +18,7 @@ use std::sync::Mutex;
 
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::LoraClient;
 use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::Request;
@@ -37,10 +38,19 @@ pub(crate) fn request(
     params: SamplingParams,
     max_tokens: usize,
 ) -> Request {
+    let stop_policy = StopPolicy {
+        eos: if params.ignore_eos {
+            EosPolicy::Ignore
+        } else {
+            EosPolicy::ModelDefault
+        },
+        ..StopPolicy::default()
+    };
+
     Request {
         prompt_tokens,
         params,
-        stop_policy: StopPolicy::default(),
+        stop_policy,
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,
