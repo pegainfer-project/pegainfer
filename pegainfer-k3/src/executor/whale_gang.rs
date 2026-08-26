@@ -357,6 +357,10 @@ impl super::K3Executor {
             "K3 rank {} armed its whale slab twice",
             self.model.rank
         );
+        // Arming runs on the engine-launch thread, which under parallel
+        // (staged) loading has never held a CUDA context — the VMM calls
+        // behind the slab alloc need one current.
+        self.bind_thread()?;
         let layout = K3WhaleSlabLayout::new(world, k3_chunk_bucket(self.chunk_tokens)?);
         let (base, wire) = k3_whale_slab_alloc(self.ctx.device_ordinal, &layout)?;
         self.whale_slab = Some((base, layout));
