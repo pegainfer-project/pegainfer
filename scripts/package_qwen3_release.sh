@@ -71,24 +71,26 @@ install -m 0644 "$cuda_root/EULA.txt" "$package_root/NVIDIA-CUDA-EULA.txt"
 
 patchelf --set-rpath "\$ORIGIN/../lib" "$package_root/bin/pegainfer"
 
-binary_version=$("$package_root/bin/pegainfer" --version | awk '{print $2}')
+binary_version=$(env -u LD_LIBRARY_PATH \
+  "$package_root/bin/pegainfer" --version | awk '{print $2}')
 [[ $binary_version == "$version" ]] || {
   echo "binary version $binary_version does not match release version $version" >&2
   exit 1
 }
 
-if ldd "$package_root/bin/pegainfer" | grep -Fq 'not found'; then
+packaged_dependencies=$(env -u LD_LIBRARY_PATH ldd "$package_root/bin/pegainfer")
+if grep -Fq 'not found' <<<"$packaged_dependencies"; then
   echo "packaged binary has unresolved dynamic libraries" >&2
-  ldd "$package_root/bin/pegainfer" >&2
+  printf '%s\n' "$packaged_dependencies" >&2
   exit 1
 fi
 for library in libcudart.so.13 libcublas.so.13 libcublasLt.so.13; do
-  resolved_library=$(ldd "$package_root/bin/pegainfer" \
-    | awk -v library="$library" '$1 == library {print $3}')
+  resolved_library=$(awk -v library="$library" \
+    '$1 == library {print $3}' <<<"$packaged_dependencies")
   if [[ -z $resolved_library \
     || $(readlink -f "$resolved_library") != $(readlink -f "$package_root/lib/$library") ]]; then
     echo "packaged binary does not resolve bundled $library" >&2
-    ldd "$package_root/bin/pegainfer" >&2
+    printf '%s\n' "$packaged_dependencies" >&2
     exit 1
   fi
 done
