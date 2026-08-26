@@ -1,4 +1,5 @@
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
 
 use super::ActiveRequestState;
 use super::PendingRequest;
@@ -12,6 +13,24 @@ use crate::executor::DecodeRequestResult;
 use crate::executor::ModelExecutor;
 use crate::executor::PrefillRequestResult;
 use crate::speculative::VerifyRequestResult;
+
+fn stop_cause(
+    executor: &impl ModelExecutor,
+    req: &ActiveRequestState,
+    token: u32,
+) -> Option<StopCause> {
+    req.stop_policy
+        .classify(token, |token_id| executor.is_stop_token(token_id))
+}
+
+fn pending_stop_cause(
+    executor: &impl ModelExecutor,
+    req: &PendingRequest,
+    token: u32,
+) -> Option<StopCause> {
+    req.stop_policy
+        .classify(token, |token_id| executor.is_stop_token(token_id))
+}
 
 pub(crate) fn resolve_step(
     executor: &impl ModelExecutor,
@@ -60,26 +79,30 @@ pub(crate) fn resolve_speculative_outputs(
                 .expect("speculative request_id must exist in active set");
             let mut emitted = Vec::new();
             let mut completion_tokens = req.generated_count;
+
             for &token in &result.accepted_tokens {
                 completion_tokens += 1;
-                let is_eos = !req.params.ignore_eos && executor.is_stop_token(token);
-                if is_eos {
-                    return DecodeEffect::EmitManyAndFinish {
+                emitted.push(token);
+
+                if let Some(stop_cause) = stop_cause(executor, req, token) {
+                    return DecodeEffect::FinishMany {
                         request_id: result.request_id,
                         tokens: emitted,
                         finish_reason: FinishReason::Stop,
+                        stop_cause: Some(stop_cause),
                     };
                 }
-                emitted.push(token);
+
                 if completion_tokens >= req.max_tokens {
-                    return DecodeEffect::EmitManyAndFinish {
+                    return DecodeEffect::FinishMany {
                         request_id: result.request_id,
                         tokens: emitted,
                         finish_reason: FinishReason::Length,
+                        stop_cause: None,
                     };
                 }
             }
-            DecodeEffect::EmitManyAndContinue {
+            DecodeEffect::ContinueMany {
                 request_id: result.request_id,
                 tokens: emitted,
                 completion_tokens,
@@ -126,10 +149,13 @@ fn resolve_prefill_outputs(
             });
         }
 
-        if !req.params.ignore_eos && executor.is_stop_token(result.first_token) {
-            effects.pending.push(PendingEffect::Finish {
+        if let Some(stop_cause) = pending_stop_cause(executor, &req, result.first_token) {
+            effects.pending.push(PendingEffect::EmitAndFinish {
                 request_id: req.request_id,
+                token: result.first_token,
+                logprob: result.first_token_logprob,
                 finish_reason: FinishReason::Stop,
+                stop_cause: Some(stop_cause),
             });
             continue;
         }
@@ -140,6 +166,7 @@ fn resolve_prefill_outputs(
                 token: result.first_token,
                 logprob: result.first_token_logprob,
                 finish_reason: FinishReason::Length,
+                stop_cause: None,
             });
             continue;
         }
@@ -154,6 +181,7 @@ fn resolve_prefill_outputs(
                 max_tokens: req.max_tokens,
                 prompt_len,
                 params: req.params,
+                stop_policy: req.stop_policy,
                 logprobs: req.logprobs,
             },
             first_token: result.first_token,
@@ -177,22 +205,27 @@ fn resolve_decode_outputs(
                 .find(|req| req.request_id == result.request_id)
                 .expect("decode request_id must exist in active set");
             let completion_tokens = req.generated_count + 1;
-            let is_eos = !req.params.ignore_eos && executor.is_stop_token(result.token);
+            let stop_cause = stop_cause(executor, req, result.token);
             let at_limit = completion_tokens >= req.max_tokens;
-            if is_eos {
+
+            if let Some(stop_cause) = stop_cause {
                 DecodeEffect::Finish {
                     request_id: result.request_id,
+                    token: result.token,
+                    logprob: result.logprob.clone(),
                     finish_reason: FinishReason::Stop,
+                    stop_cause: Some(stop_cause),
                 }
             } else if at_limit {
-                DecodeEffect::EmitAndFinish {
+                DecodeEffect::Finish {
                     request_id: result.request_id,
                     token: result.token,
                     logprob: result.logprob.clone(),
                     finish_reason: FinishReason::Length,
+                    stop_cause: None,
                 }
             } else {
-                DecodeEffect::EmitAndContinue {
+                DecodeEffect::Continue {
                     request_id: result.request_id,
                     token: result.token,
                     logprob: result.logprob.clone(),

@@ -6,7 +6,10 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_kv_cache::BlockPool;
 
 use super::test_support::FakeExecutor;
@@ -23,6 +26,7 @@ fn active_state(request_id: u64, generated_count: usize, max_tokens: usize) -> A
         max_tokens,
         prompt_len: 16,
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         logprobs: 0,
     }
 }
@@ -515,6 +519,14 @@ fn spec_active(
             ignore_eos,
             ..SamplingParams::default()
         },
+        stop_policy: StopPolicy {
+            eos: if ignore_eos {
+                EosPolicy::Ignore
+            } else {
+                EosPolicy::ModelDefault
+            },
+            token_ids: Vec::new(),
+        },
         ..active_state(id, generated_count, max_tokens)
     }
 }
@@ -537,7 +549,7 @@ fn speculative_full_span_accept_continues() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndContinue {
+            effects::DecodeEffect::ContinueMany {
                 request_id,
                 tokens,
                 completion_tokens,
@@ -551,7 +563,7 @@ fn speculative_full_span_accept_continues() {
                 "completion = prior generated + span len"
             );
         }
-        _ => panic!("expected EmitManyAndContinue"),
+        _ => panic!("expected ContinueMany"),
     }
 }
 
@@ -564,41 +576,41 @@ fn speculative_stop_token_midspan_finishes_and_suppresses_eos() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndFinish {
+            effects::DecodeEffect::FinishMany {
                 tokens,
                 finish_reason,
+                stop_cause,
                 ..
             },
         ] => {
-            assert_eq!(
-                tokens,
-                &vec![10, 11],
-                "EOS itself is suppressed from emission"
-            );
+            assert_eq!(tokens, &vec![10, 11, SPEC_EOS],);
             assert!(matches!(finish_reason, FinishReason::Stop));
+            assert_eq!(*stop_cause, Some(StopCause::Eos(SPEC_EOS)));
         }
-        _ => panic!("expected EmitManyAndFinish(Stop)"),
+        _ => panic!("expected FinishMany(Stop)"),
     }
 }
 
 #[test]
-fn speculative_stop_token_at_span_start_emits_nothing() {
+fn speculative_stop_token_at_span_start_retains_the_token() {
     let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
     let active = [spec_active(1, 5, 100, false)];
     let results = [spec_result(1, vec![SPEC_EOS, 11, 12])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndFinish {
+            effects::DecodeEffect::FinishMany {
                 tokens,
                 finish_reason,
+                stop_cause,
                 ..
             },
         ] => {
-            assert!(tokens.is_empty(), "stop at position 0 emits no tokens");
+            assert_eq!(tokens, &vec![SPEC_EOS]);
             assert!(matches!(finish_reason, FinishReason::Stop));
+            assert_eq!(*stop_cause, Some(StopCause::Eos(SPEC_EOS)));
         }
-        _ => panic!("expected EmitManyAndFinish(Stop)"),
+        _ => panic!("expected FinishMany(Stop)"),
     }
 }
 
@@ -611,7 +623,7 @@ fn speculative_max_tokens_truncates_midspan() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndFinish {
+            effects::DecodeEffect::FinishMany {
                 tokens,
                 finish_reason,
                 ..
@@ -624,7 +636,7 @@ fn speculative_max_tokens_truncates_midspan() {
             );
             assert!(matches!(finish_reason, FinishReason::Length));
         }
-        _ => panic!("expected EmitManyAndFinish(Length)"),
+        _ => panic!("expected FinishMany(Length)"),
     }
 }
 
@@ -635,14 +647,43 @@ fn speculative_ignore_eos_does_not_stop() {
     let results = [spec_result(1, vec![SPEC_EOS, SPEC_EOS])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
-        [effects::DecodeEffect::EmitManyAndContinue { tokens, .. }] => {
+        [effects::DecodeEffect::ContinueMany { tokens, .. }] => {
             assert_eq!(
                 tokens,
                 &vec![SPEC_EOS, SPEC_EOS],
                 "ignore_eos passes stop tokens through"
             );
         }
-        _ => panic!("expected EmitManyAndContinue"),
+        _ => panic!("expected ContinueMany"),
+    }
+}
+
+#[test]
+fn speculative_request_stop_truncates_the_span_when_eos_is_ignored() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
+
+    let mut request = spec_active(1, 0, 100, true);
+    request.stop_policy.token_ids = vec![12];
+
+    let active = [request];
+    let results = [spec_result(1, vec![10, 11, 12, 13])];
+
+    let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
+
+    match &effects[..] {
+        [
+            effects::DecodeEffect::FinishMany {
+                tokens,
+                finish_reason,
+                stop_cause,
+                ..
+            },
+        ] => {
+            assert_eq!(tokens, &vec![10, 11, 12]);
+            assert_eq!(*finish_reason, FinishReason::Stop);
+            assert_eq!(*stop_cause, Some(StopCause::Token(12)));
+        }
+        _ => panic!("expected request stop to finish the speculative span"),
     }
 }
 
@@ -657,11 +698,11 @@ fn speculative_resolves_each_request_independently() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     assert!(matches!(
         &effects[0],
-        effects::DecodeEffect::EmitManyAndContinue { request_id, .. } if *request_id == RequestId::new(1)
+        effects::DecodeEffect::ContinueMany { request_id, .. } if *request_id == RequestId::new(1)
     ));
     assert!(matches!(
         &effects[1],
-        effects::DecodeEffect::EmitManyAndFinish { request_id, finish_reason: FinishReason::Stop, .. }
+        effects::DecodeEffect::FinishMany { request_id, finish_reason: FinishReason::Stop, .. }
             if *request_id == RequestId::new(2)
     ));
 }

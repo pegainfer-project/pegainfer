@@ -5,7 +5,9 @@ use vllm_engine_core_client::protocol::logprobs::TokenLogprob as WireTokenLogpro
 use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
+use crate::engine::EosPolicy;
 use crate::engine::FinishReason;
+use crate::engine::StopPolicy;
 use crate::engine::TokenLogprob;
 use crate::sampler::SamplingParams;
 
@@ -44,8 +46,8 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
     // None`, but `_all_stop_token_ids` always carries the model EOS set (it
     // exists for min_tokens masking, not stop detection). Deriving ignore_eos
     // from all_stop_token_ids would therefore void every ignore_eos request on
-    // models with a real EOS. Only `_eos_token_id` and the client's explicit
-    // `stop_token_ids` express a stop intent.
+    // models with a real EOS. Only _eos_token_id and the client's explicit
+    // stop_token_ids express the legacy scheduler's stop intent.
     let ignore_eos = params.eos_token_id.is_none() && params.stop_token_ids.is_empty();
     if params.temperature <= 0.0 {
         return SamplingParams {
@@ -76,7 +78,23 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
     }
 }
 
-/// Reject request parameters the engine would otherwise silently ignore.
+pub(crate) fn convert_stop_policy(params: &EngineCoreSamplingParams) -> StopPolicy {
+    StopPolicy {
+        // Qwen3 owns the complete model EOS set in generation_config. The
+        // protocol's optional primary ID only tells us whether EOS is active;
+        // using it as a singleton would miss secondary model EOS IDs.
+        eos: params
+            .eos_token_id
+            .map_or(EosPolicy::Ignore, |_| EosPolicy::ModelDefault),
+        token_ids: params.stop_token_ids.clone(),
+    }
+}
+
+/// Reject request parameters the frontend cannot represent faithfully.
+///
+/// The stepped contract carries explicit request stop IDs independently in
+/// [`StopPolicy`]; this helper only validates unrelated sampling/transfer
+/// fields that would otherwise be silently ignored.
 /// Returns the offending description; `None` means the request is servable.
 ///
 /// The float comparisons are exact on purpose: they detect "the client sent
@@ -191,11 +209,21 @@ mod tests {
         params.eos_token_id = Some(163_586);
         assert!(!convert_sampling(&params).ignore_eos);
 
-        // Explicit client stop tokens keep EOS detection on even when the
-        // frontend dropped _eos_token_id.
+        // The legacy scheduler keeps EOS active when an explicit stop token is
+        // present; the stepped bridge carries explicit stops in StopPolicy.
         params.eos_token_id = None;
         params.stop_token_ids = vec![42];
         assert!(!convert_sampling(&params).ignore_eos);
+    }
+
+    #[test]
+    fn convert_stop_policy_keeps_eos_and_explicit_stops_independent() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.eos_token_id = Some(99);
+        params.stop_token_ids = vec![11];
+
+        assert_eq!(convert_stop_policy(&params).eos, EosPolicy::ModelDefault);
+        assert_eq!(convert_stop_policy(&params).token_ids, vec![11]);
     }
 
     #[test]

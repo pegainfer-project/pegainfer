@@ -55,9 +55,11 @@ use crate::engine::RequestId;
 use crate::engine::RequestUpdate;
 use crate::engine::SchedulerHandle;
 use crate::engine::StepOutputs;
+use crate::engine::StopCause;
 use crate::engine::Terminal;
 use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
+use crate::vllm::wire::convert_stop_policy;
 use crate::vllm::wire::lora_adapter_from_sampling_params;
 use crate::vllm::wire::requested_logprobs;
 use crate::vllm::wire::to_wire_position_logprobs;
@@ -362,6 +364,7 @@ impl SteppedEngineBridge {
                 None,
             );
         }
+
         let lora_adapter = match lora_adapter_from_sampling_params(&sampling_params) {
             Ok(adapter) => adapter,
             Err(error) => {
@@ -383,6 +386,10 @@ impl SteppedEngineBridge {
             .as_ref()
             .and_then(|args| args.get("kv_transfer_params"))
             .cloned();
+        // Older stepped model producers still suppress their terminal token
+        // and report only `FinishReason::Stop`. Keep the legacy sentinel for
+        // that producer shape; typed stop causes carry the real token and do
+        // not need a synthetic suffix.
         let stop_sentinel_id = stop_sentinel_id(
             sampling_params.eos_token_id,
             &sampling_params.stop_token_ids,
@@ -398,9 +405,14 @@ impl SteppedEngineBridge {
             Span::noop()
         };
         let trace_parent = SpanContext::from_span(&trace_root);
+
         let control = self.scheduler.submit(Request {
             prompt_tokens,
+            // Keep the legacy SamplingParams lowering unchanged for stepped
+            // producers that have not migrated to StopPolicy. Qwen3 uses the
+            // independent policy below for stop classification.
             params: convert_sampling(&sampling_params),
+            stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
             lora_adapter,
             kv_transfer_params,
@@ -435,8 +447,9 @@ struct SteppedStream {
     /// P/D handoff metadata can arrive in an update with no token or
     /// terminal, so retain it until the next output carries it to the router.
     kv_transfer_params: Option<serde_json::Value>,
-    /// The vLLM text decoder removes the final token from a stop-finished
-    /// output. Keep an EOS or explicit stop token as that removable sentinel.
+    /// Compatibility sentinel for stepped producers that predate typed
+    /// [`StopCause`]. New producers must include their triggering token in the
+    /// update and therefore bypass this fallback.
     stop_sentinel_id: Option<u32>,
     /// Request-lifetime root span; held only for its `Drop`, which closes the
     /// trace when the stream state is removed.
@@ -539,11 +552,11 @@ fn reduce_update(
     let mut terminated = false;
     match update.terminal {
         None => {}
-        Some(Terminal::Finished { reason, .. }) => {
-            // PegaInfer suppresses EOS before emitting tokens, while vLLM's
-            // text decoder expects the terminal Stop output to contain EOS
-            // and unconditionally removes its final token.
+        Some(Terminal::Finished {
+            reason, stop_cause, ..
+        }) => {
             if reason == FinishReason::Stop
+                && stop_cause.is_none()
                 && let Some(stop_sentinel_id) = state.stop_sentinel_id
             {
                 token_ids.push(stop_sentinel_id);
@@ -551,6 +564,10 @@ fn reduce_update(
                     entries: Vec::new(),
                 });
             }
+            if let Some(StopCause::Token(token_id)) = stop_cause {
+                stop_reason = Some(StopReason::TokenId(token_id));
+            }
+
             finish_reason = Some(convert_finish_reason(reason));
             terminated = true;
         }
@@ -616,14 +633,18 @@ impl UnixAnchor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
     use crate::engine::RejectReason;
     use crate::engine::scheduler_pair;
+    use crate::engine::TokenLogprob;
 
     fn request() -> Request {
         Request {
             prompt_tokens: vec![1, 2],
             params: crate::sampler::SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens: 1,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -661,5 +682,94 @@ mod tests {
             output.prefill_stats.is_none(),
             "a request refused while queued did no prefill"
         );
+    }
+
+    #[test]
+    fn request_stop_maps_the_actual_token_and_preserves_its_logprob() {
+        let id = RequestId::new(7);
+        let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
+        let mut state = SteppedStream::new("request-7".to_string(), control, Span::noop(), None);
+
+        let mut update = RequestUpdate::empty(id);
+        update.tokens = vec![11, 43];
+        update.logprobs = vec![
+            None,
+            Some(TokenLogprob {
+                logprob: -0.25,
+                top_logprobs: vec![(43, -0.25), (44, -1.0)],
+            }),
+        ];
+        update.terminal = Some(Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Token(43)),
+            prompt_tokens: 16,
+            completion_tokens: 2,
+        });
+
+        let (output, terminated) = reduce_update(&mut state, update, &UnixAnchor::now());
+        let output = output.expect("terminal output");
+
+        assert!(terminated);
+        assert_eq!(output.new_token_ids, vec![11, 43]);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+        assert_eq!(output.stop_reason, Some(StopReason::TokenId(43)));
+
+        let direct = match output.new_logprobs.expect("stop-token logprob") {
+            MaybeWireLogprobs::Direct(direct) => direct,
+            MaybeWireLogprobs::Wire(_) => panic!("expected direct logprobs"),
+        };
+
+        assert_eq!(direct.positions.len(), 2);
+        assert_eq!(direct.positions[1].entries[0].token_id, 43);
+        assert!((direct.positions[1].entries[0].logprob + 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn model_eos_has_no_wire_stop_reason() {
+        let id = RequestId::new(8);
+        let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
+        let mut state = SteppedStream::new("request-8".to_string(), control, Span::noop(), None);
+
+        let mut update = RequestUpdate::empty(id);
+        update.tokens = vec![2];
+        update.logprobs = vec![None];
+        update.terminal = Some(Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Eos(2)),
+            prompt_tokens: 16,
+            completion_tokens: 1,
+        });
+
+        let (output, terminated) = reduce_update(&mut state, update, &UnixAnchor::now());
+        let output = output.expect("terminal output");
+
+        assert!(terminated);
+        assert_eq!(output.new_token_ids, vec![2]);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+        assert_eq!(output.stop_reason, None);
+    }
+
+    #[test]
+    fn legacy_stop_without_typed_cause_keeps_the_wire_sentinel() {
+        let id = RequestId::new(9);
+        let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
+        let mut state =
+            SteppedStream::new("request-9".to_string(), control, Span::noop(), Some(99));
+
+        let mut update = RequestUpdate::empty(id);
+        update.tokens = vec![11];
+        update.terminal = Some(Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: None,
+            prompt_tokens: 16,
+            completion_tokens: 1,
+        });
+
+        let (output, terminated) = reduce_update(&mut state, update, &UnixAnchor::now());
+        let output = output.expect("terminal output");
+
+        assert!(terminated);
+        assert_eq!(output.new_token_ids, vec![11, 99]);
+        assert_eq!(output.stop_reason, None);
     }
 }

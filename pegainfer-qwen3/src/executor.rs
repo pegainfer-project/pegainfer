@@ -19,6 +19,7 @@ use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_frontend::engine::DeferredFinish;
 use pegainfer_frontend::engine::LoadLoraAdapterRequest;
 use pegainfer_frontend::engine::SpecDecodeCounters;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::engine::panic_message;
@@ -594,6 +595,7 @@ fn execute_step_on_lane(
         StepCommand::SpeculativeVerify {
             requests,
             kv_views,
+            stop_policies,
             sample_seed,
         } => {
             // One target forward over each request's K+1 draft span with a
@@ -602,7 +604,8 @@ fn execute_step_on_lane(
             // token at each span position) and captures the target hidden states
             // (at the DFlash layers) to seed the next draft — all into reused,
             // pointer-stable scratch (`VerifyGraphBuffers`).
-            let result = lane.execute_dflash_verify(requests, kv_views, *sample_seed)?;
+            let result =
+                lane.execute_dflash_verify(requests, kv_views, stop_policies, *sample_seed)?;
             Ok(WorkerStepOutcome::SpeculativeVerify(result))
         }
         StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
@@ -3705,8 +3708,15 @@ impl LocalQwen3Lane {
         &mut self,
         requests: &[VerifyStepItem],
         kv_views: &[KvView],
+        stop_policies: &[StopPolicy],
         sample_seed: u64,
     ) -> Result<VerifyResult> {
+        anyhow::ensure!(
+            stop_policies.len() == requests.len(),
+            "DFlash verify received {} stop policies for {} requests",
+            stop_policies.len(),
+            requests.len()
+        );
         let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
             anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
         })?;
@@ -3791,8 +3801,13 @@ impl LocalQwen3Lane {
                 .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
                 .collect();
             let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
-            let request_results = build_verify_results(requests, &target_tokens)?;
-
+            let mut request_results = build_verify_results(requests, &target_tokens)?;
+            // Apply the request policy before recording target hidden states;
+            // otherwise a suffix discarded by terminal handling would leak
+            // into the next DFlash draft context and acceptance counters.
+            for (policy, result) in stop_policies.iter().zip(&mut request_results) {
+                spec::truncate_after_terminal(result, policy, &self.model.config().stop_token_ids);
+            }
             self.record_verify_dflash_context(
                 requests,
                 &request_results,
@@ -3905,6 +3920,9 @@ enum StepCommand {
     SpeculativeVerify {
         requests: Vec<VerifyStepItem>,
         kv_views: Vec<KvView>,
+        /// Request-local stop policies used before DFlash context recording;
+        /// these are host metadata and never enter the GPU batch.
+        stop_policies: Vec<StopPolicy>,
         sample_seed: u64,
     },
     /// Speculative draft: roll the DFlash draft model forward one block per
