@@ -632,12 +632,42 @@ Amdahl 账：CP1 的 MoE 墙钟与 CP8 同额（mega dispatch 本就全 EP 宽�
   ③ bucket 阶梯细化（2048–4224、8448–16896 之间加档；16k 档 1,042→~700 的
   主杠杆）；④ 协调 270→~150ms（降级，不再是主要矛盾）。
 
+## 256k 门禁 + full 16 卡验收（2026-08-26，账在
+`~/bench_results/2026-08-26-k3-cp16-256k-gate/`）
+
+**256k 门禁 PASS**（pruned CP16@tray09/11/12/14, ctx=262144 batch=1）：
+254,808-token TTFT min **9,316 ms** 三跑稳定，CP1 local 基线 90,459 →
+**9.71×**；249,891-token 生成 tray09/tray14 逐字节一致。
+
+**Full 1.5T 16v16 验收**（tray03/04/06/07 前后脚跑双方，同脚本 min-of-3）：
+
+| tokens | vLLM TP16-MNNVL | full CP16 whale | 比 |
+|---:|---:|---:|---|
+| 8,251 | **404** | 1,044 | 0.39× |
+| 16,725 | **794** | 1,020 | 0.78× |
+| 66,677 | 3,251 | **1,734** | **1.88×** |
+| 130,232 | 6,199 | **3,615** | **1.71×** |
+| 254,811 | 13,155 | （full 挂 W-chunk）pruned 9,316 | ~1.41×* |
+
+交叉点 16k–64k 之间；短档输 = bucket 阶梯（16.7k/16=1,045 行 → 4224 桶
+padding 4×）+ ~270ms 截距，与 ⑥ 的杠杆排序一致。full CP16@128k 比 pruned
+CP8@2-tray 快近 2×（宽度 + EP16 每 rank expert 减半）。vLLM TP16 深档还慢于
+其 8 卡 TP8×EP8（08-18: 64k 1,959 / 128k 4,477）——16 路 TP prefill 深上下文
+反噬，我方 64k 已压过它 8 卡最优布局。
+
+**HBM 账实测（都在 `07be170e` 修）**：mega slab 19.65 GiB 分配失败的元凶是
+pool release threshold=MAX 让加载 churn 后 used 达 255.75 GiB（权重 190 之外
+~66 GiB 活分配：max_ctx-scaled MLA 物化 buffer 21.3 + KV ~7 + rows-scaled
+scratch ~37.5）→ slab allocator OOM 时 trim-then-retry。**full@262144 结构性
+放不下**（需 ~283 > 276.6 GiB）：`mla_ctx_nope_v` 12 GiB + `mla_ctx_k` 9 GiB
+是 `mla_chunk_attend` 一发整 ctx 物化——**W-chunked ctx loop + scratch trim
+升格为 full-256k 的硬前置**。验收跑在 ctx=135168（~270 GiB，实测过）。
+另修 whale arming × staged 加载的 INVALID_CONTEXT（launch 线程无 context，
+`arm_whale_slab` 补 `bind_thread`；此前 whale 门禁从未开过 staging）。
+
 ## Next action
 
-256k 单 superstep 门禁只差机器：需 CP16（16×16896=270k 盖 256k，CP8 上限
-135k），而 tray14 在重启窗口被第三方 NeMo LoRA 抢走，2026-08-25 时点全集群无
-第 4 台空 tray（监视器在轮询）。拿到机器即跑 256k 门禁（ctx=262144 batch=1，
-已验证 armed 无 OOM）→ **验收：full 896@EP16 对 vLLM TP16-MNNVL 重赛
-8k/16k/64k/256k**。EP16 全量下 19.6 GiB slab 的 HBM 账实测。次优先按 ⑥ 的
-实测定序：FMHA 条带化 → superstep 图化/融合 → bucket 细化 → 协调压缩；
-KDA 包 prefix-scan 排后。
+PR #970 已带三修 push（`07be170e`），track CI 到全绿。性能杠杆按 ⑥ 实测定序
+不变：FMHA 条带化 → superstep 图化/融合 → **bucket 细化（8k/16k 档翻盘的
+主杠杆，验收表的 0.39×/0.78× 就是它）** → 协调压缩；**W-chunked ctx loop +
+scratch trim 新增为 full-256k 前置**。KDA 包 prefix-scan 排后。
