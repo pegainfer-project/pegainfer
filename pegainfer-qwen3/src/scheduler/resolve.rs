@@ -63,8 +63,9 @@ pub(crate) fn resolve_step(
 
 /// Turn each request's accepted speculative span into a decode effect. A span
 /// commits 1..=K+1 tokens at once; we walk it in order so a stop token or the
-/// max-output budget truncates exactly where it lands (the executor already
-/// suppressed nothing — stop handling lives here, mirroring single-token decode).
+/// max-output budget lands exactly where expected. The executor has already
+/// truncated any suffix after a request-terminal token to keep speculative
+/// state consistent; the resolver classifies its typed cause here.
 pub(crate) fn resolve_speculative_outputs(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],

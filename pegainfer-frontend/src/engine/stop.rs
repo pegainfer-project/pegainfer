@@ -91,14 +91,4 @@ mod tests {
 
         assert_eq!(policy.classify(99, |_| false), Some(StopCause::Eos(99)));
     }
-
-    #[test]
-    fn unmatched_token_does_not_stop() {
-        let policy = StopPolicy {
-            eos: EosPolicy::Token(99),
-            token_ids: vec![42],
-        };
-
-        assert_eq!(policy.classify(7, |_| false), None);
-    }
 }

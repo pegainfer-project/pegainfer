@@ -568,10 +568,10 @@ fn speculative_full_span_accept_continues() {
 }
 
 #[test]
-fn speculative_stop_token_midspan_finishes_and_suppresses_eos() {
+fn speculative_stop_token_midspan_finishes_and_retains_the_trigger() {
     let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
     let active = [spec_active(1, 5, 100, false)];
-    // EOS lands at span position 2; tokens before it are emitted, EOS is not.
+    // EOS lands at span position 2; the trigger is retained and the suffix is not.
     let results = [spec_result(1, vec![10, 11, SPEC_EOS, 13])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {

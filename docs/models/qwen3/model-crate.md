@@ -1,7 +1,7 @@
 # Qwen3-4B Model Crate
 
 **Created**: 2026-05-03
-**Last touched**: 2026-07
+**Last touched**: 2026-08
 **TL;DR**: `crates/pegainfer-qwen3` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `pegainfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. The old `ModelForward` path has been removed; decode length-limit now emits the final token before `Finished`. Long-context `bs=1` TPOT was traced to non-partition FlashInfer paged decode under-filling the GPU; Qwen3 runtime gates FlashInfer split-K decode on `padded_bs<=32` (the `seq_len>=1024` gate was dropped in #437) with a 64-token chunk floor (`Tuned` capped at 64 chunks; opt-in `--batch-invariant` pins a fixed 160-token split), cutting 4k/64 serving steady TPOT from about `11.7ms` to `6.46ms` on RTX 5090. Qwen3 now keeps a single model-crate bench entry: `qwen3_kernel_snapshot`, a JSON snapshot runner with warm/cold-L2 latency, default-on CUPTI counters, and compare. Correctness/truth is intentionally out of this snapshot for now.
 
 ## Determinism scope
@@ -9,6 +9,18 @@
 `--batch-invariant` is scoped to one process, one toolchain, and one GPU. The cuBLASLt algo is re-tuned on every boot and cached per executor thread (`thread_local`), so it does not promise stability across cuBLAS or driver versions; startup logging records the pinned `splitk` and `reduction_scheme` per `(M,K)`. The builder rejects decode-overlap, DFlash speculative decoding, LoRA, and tensor parallelism.
 
 It also **requires `--no-prefix-cache` and rejects `--kv-offload`**. A prefix hit advances a prompt's `chunk_start` off the request-local chunk grid, re-cutting its prefill chunks according to prior traffic. `--no-prefix-cache` closes that — except under offload, where it only disables HBM retention and deliberately leaves prefix *matching* on (host-tier reuse is the point of that mode), so that pair is rejected outright.
+
+## Stop contract
+
+The stepped Qwen3 scheduler keeps the request's EOS policy and explicit
+`stop_token_ids` independent in `StopPolicy`. When a generated token triggers
+either policy, that token is retained exactly once in the internal
+`RequestUpdate`; decode results carry its real logprob when one is available,
+and the terminal carries a typed `StopCause`. `StopCause::Eos` maps to
+`finish_reason=stop` without a wire
+`stop_reason`; an explicit request stop maps to the actual token ID.
+`ignore_eos=true` disables only model EOS and does not disable explicit request
+stop IDs. A length finish has no token-level stop cause.
 
 ## Preparation
 
@@ -157,7 +169,7 @@ pub fn start_engine(
 ### Step 7: Retire ModelForward and Fix Length Limit
 - Deleted `pegainfer_core::model::{ModelForward, GenerationState}` and removed the root `src/model.rs` re-export.
 - Deleted the Qwen3 `forward.rs` compatibility path. Qwen3 tests that used it now build their baselines from `batch_prefill(bs=1)` plus `batch_decode(bs=1)`, so they exercise the same phase APIs as production.
-- Fixed Qwen3 decode length-limit handling by adding `DecodeEffect::EmitAndFinish`. EOS behavior is unchanged: EOS finishes without emitting the stop token. Length limit now emits the sampled final token, then sends `Finished { finish_reason: Length }`.
+- Fixed Qwen3 decode length-limit handling by adding `DecodeEffect::EmitAndFinish`. The stepped stop contract now retains an EOS trigger in the internal token update and records `StopCause::Eos`; the bridge omits EOS from wire `stop_reason`. Length limit emits the sampled final token, then sends `Finished { finish_reason: Length }`.
 - Regenerated `test_data/Qwen3-4B.json` because every length-limited golden output now includes the final requested token.
 - Re-ran `bench_serving snapshot` on the CUDA validation host and pulled back `bench_snapshots/rtx-5090/qwen3-4b.json`; `decode_heavy (1024,256)` now records `generated_tokens min=max=avg=256`.
 - Performance stayed within noise on RTX 5090:
