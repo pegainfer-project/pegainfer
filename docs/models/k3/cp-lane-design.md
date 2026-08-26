@@ -660,14 +660,26 @@ pool release threshold=MAX 让加载 churn 后 used 达 255.75 GiB（权重 190 
 ~66 GiB 活分配：max_ctx-scaled MLA 物化 buffer 21.3 + KV ~7 + rows-scaled
 scratch ~37.5）→ slab allocator OOM 时 trim-then-retry。**full@262144 结构性
 放不下**（需 ~283 > 276.6 GiB）：`mla_ctx_nope_v` 12 GiB + `mla_ctx_k` 9 GiB
-是 `mla_chunk_attend` 一发整 ctx 物化——**W-chunked ctx loop + scratch trim
-升格为 full-256k 的硬前置**。验收跑在 ctx=135168（~270 GiB，实测过）。
+是 `mla_chunk_attend` 一发整 ctx 物化。验收跑在 ctx=135168（~270 GiB，实测过）。
 另修 whale arming × staged 加载的 INVALID_CONTEXT（launch 线程无 context，
 `arm_whale_slab` 补 `bind_thread`；此前 whale 门禁从未开过 staging）。
 
+**W-chunked ctx loop 已落地（`91c23211`，2026-08-26）**：物化 scratch 从
+max_ctx 行缩到 `min(max_ctx, 16896)` 行（W = 4×4224 chunk cap）。`t_kv ≤ W`
+仍是原单发 causal FMHA（bitwise 不变，既有门禁不动）；更深的 ctx 用 dense
+窗口（ResidualMask + individual scheduler 新入口，t_q/t_kv 无约束，ragged 尾
+可以比 chunk 窄）扫过去，每窗输出连 LSE 一起 `lse_merge` 进 f32 累加器，最后
+一发 t_q×t_q causal 收 chunk 自身的键，`o_finalize` 回 bf16。262144 档物化
+buffer 21 GiB → 1.4 GiB，新增累加器 ~210 MB；只剩 576 B/token 的 latent/rope
+gather 仍按 max_ctx 长。**full-256k 的结构性 blocker 解除**（账面 ~283 →
+~263 GiB < 276.6）。验证：windowed-vs-single 等价 GPU 测试（含 ragged 尾）、
+k3 门禁 6/6、`PEGAINFER_K3_CP_PROMPT=65536` 的 cp_prefill 门禁（CP1/CP4 双双
+压出窗口循环）全过。这套 merge 原语同时就是 FMHA 条带化和 DIST_CTX 的底座。
+
 ## Next action
 
-PR #970 已带三修 push（`07be170e`），track CI 到全绿。性能杠杆按 ⑥ 实测定序
-不变：FMHA 条带化 → superstep 图化/融合 → **bucket 细化（8k/16k 档翻盘的
-主杠杆，验收表的 0.39×/0.78× 就是它）** → 协调压缩；**W-chunked ctx loop +
-scratch trim 新增为 full-256k 前置**。KDA 包 prefix-scan 排后。
+PR #970 已带三修（`07be170e`）+ W-chunk（`91c23211`）push，track CI 到全绿。
+待 4 tray 空档复跑 full 1.5T @ctx=262144 的 256k 档补上验收表的 `*` 行。
+性能杠杆按 ⑥ 实测定序不变：FMHA 条带化（merge 原语已在）→ superstep
+图化/融合 → **bucket 细化（8k/16k 档翻盘的主杠杆，验收表的 0.39×/0.78× 就是
+它）** → 协调压缩。KDA 包 prefix-scan 排后。
