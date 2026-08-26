@@ -43,7 +43,7 @@ jobs:
           cuda: "13.0.2"
           linux-local-args: '["--toolkit"]'
           method: network
-          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev", "driver-dev"]'
           non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
 
       - name: Install build and packaging dependencies
