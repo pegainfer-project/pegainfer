@@ -649,8 +649,12 @@ Amdahl 账：CP1 的 MoE 墙钟与 CP8 同额（mega dispatch 本就全 EP 宽�
 | 130,232 | 6,199 | **3,615** | **1.71×** |
 | 254,808 | 13,155 | **8,850**（W-chunk 后 @262144 实测） | **1.49×** |
 
-交叉点 16k–64k 之间；短档输 = bucket 阶梯（16.7k/16=1,045 行 → 4224 桶
-padding 4×）+ ~270ms 截距，与 ⑥ 的杠杆排序一致。full CP16@128k 比 pruned
+交叉点 16k–64k 之间。短档账（08-26 复核修正）：桶阶梯是几何级
+（`K3_PREFILL_BUCKETS` 256..16896），1,045 行落 2048 桶 ≤2×，且只作用于按
+`shape.bucket` 整跑的本地 dense 批处理族——mega dispatch 在 EP>1 只发 live 行
+（`step.rs`，padding 不上线），MoE 免疫。短档主因是 ~270ms 协调截距 + 固定
+开销；杠杆 = 本地 dense 族 de-bucket（cuBLAS 按 live_rows 发射，纯 host 改动）
++ 截距剖析，"加桶档"收益很小。full CP16@128k 比 pruned
 CP8@2-tray 快近 2×（宽度 + EP16 每 rank expert 减半）。vLLM TP16 深档还慢于
 其 8 卡 TP8×EP8（08-18: 64k 1,959 / 128k 4,477）——16 路 TP prefill 深上下文
 反噬，我方 64k 已压过它 8 卡最优布局。
