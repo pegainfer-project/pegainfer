@@ -19,6 +19,8 @@ jobs:
       CUDA_PATH: /usr/local/cuda
       PEGAINFER_CUDA_SM: "80,86,89,90,100,110,120"
       PEGAINFER_NVCC_JOBS: "2"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
       RELEASE_NOTES: >-
         Prebuilt Qwen3-only server for Linux x86_64. The archive contains CUDA
         13.0 runtime libraries and supports NVIDIA compute capabilities 8.x
@@ -36,6 +38,9 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.35
@@ -63,9 +68,15 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$package_version"
 
       - name: Build Qwen3-only fat binary
-        run: >-
-          cargo build --release --locked -p pegainfer-server
-          --no-default-features --features qwen3
+        run: |
+          set -euo pipefail
+          driver_stub="$CUDA_PATH/targets/x86_64-linux/lib/stubs"
+          test -f "$driver_stub/libcuda.so"
+          export LIBRARY_PATH="$driver_stub${LIBRARY_PATH:+:$LIBRARY_PATH}"
+          cc -fuse-ld=lld -shared -Wl,--no-as-needed -lcuda \
+            -o /dev/null -x c /dev/null
+          cargo build --release --locked -p pegainfer-server \
+            --no-default-features --features qwen3
 
       - name: Package release
         run: scripts/package_qwen3_release.sh "$GITHUB_REF_NAME" dist
