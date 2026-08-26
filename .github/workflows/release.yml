@@ -73,8 +73,9 @@ jobs:
           driver_stub="$CUDA_PATH/targets/x86_64-linux/lib/stubs"
           test -f "$driver_stub/libcuda.so"
           export LIBRARY_PATH="$driver_stub${LIBRARY_PATH:+:$LIBRARY_PATH}"
-          cc -fuse-ld=lld -shared -Wl,--no-as-needed -lcuda \
-            -o /dev/null -x c /dev/null
+          probe_dir=$(mktemp -d)
+          rustc - --crate-name cuda_link_probe -l cuda \
+            -o "$probe_dir/cuda-link-probe" <<< 'fn main() {}'
           cargo build --release --locked -p pegainfer-server \
             --no-default-features --features qwen3
 
