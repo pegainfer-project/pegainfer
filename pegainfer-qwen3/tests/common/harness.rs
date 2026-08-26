@@ -25,6 +25,7 @@ use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::SchedulerHandle;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
@@ -39,6 +40,7 @@ pub(crate) fn request(
     Request {
         prompt_tokens,
         params,
+        stop_policy: StopPolicy::default(),
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,
