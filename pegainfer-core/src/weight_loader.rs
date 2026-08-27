@@ -783,6 +783,128 @@ pub fn load_tensor_2d_col_shard(
     DeviceMatrix::from_host(ctx, &host, rows, cols)
 }
 
+/// Load a 2D tensor assembled from multiple row ranges of one source tensor,
+/// stitched in `ranges` order: each entry is (row_offset, rows).
+pub fn load_tensor_2d_row_stitch(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    ranges: &[(usize, usize)],
+) -> Result<DeviceMatrix> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    if shape.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "Tensor '{}' expected 2D, got shape {:?}",
+            name,
+            shape
+        ));
+    }
+    let total_rows = shape[0];
+    let cols = shape[1];
+    let mut total = 0usize;
+    for &(row_offset, rows) in ranges {
+        if row_offset + rows > total_rows {
+            return Err(anyhow::anyhow!(
+                "2D row stitch out of bounds for '{}': row_offset={} rows={} total_rows={}",
+                name,
+                row_offset,
+                rows,
+                total_rows
+            ));
+        }
+        total += rows;
+    }
+    let elems = tensor_bf16_cow(&tensor, name)?;
+    let mut host = Vec::with_capacity(total * cols);
+    for &(row_offset, rows) in ranges {
+        let start = row_offset * cols;
+        host.extend_from_slice(&elems[start..start + rows * cols]);
+    }
+    DeviceMatrix::from_host(ctx, &host, total, cols)
+}
+
+/// Load a 1D BF16 tensor assembled from multiple element ranges of one source
+/// tensor, stitched in `ranges` order: each entry is (offset, len).
+pub fn load_tensor_1d_stitch(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    ranges: &[(usize, usize)],
+) -> Result<DeviceVec> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let elems = tensor_bf16_cow(&tensor, name)?;
+    let mut total = 0usize;
+    for &(offset, len) in ranges {
+        if offset + len > elems.len() {
+            return Err(anyhow::anyhow!(
+                "1D stitch out of bounds for '{}': offset={} len={} total_len={}",
+                name,
+                offset,
+                len,
+                elems.len()
+            ));
+        }
+        total += len;
+    }
+    let mut host = Vec::with_capacity(total);
+    for &(offset, len) in ranges {
+        host.extend_from_slice(&elems[offset..offset + len]);
+    }
+    DeviceVec::from_host(ctx, &host)
+}
+
+/// Load a 1D BF16 element range to GPU (tensor-parallel shard of a 1D weight).
+pub fn load_tensor_1d_shard(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    offset: usize,
+    len: usize,
+) -> Result<DeviceVec> {
+    load_tensor_1d_stitch(ctx, shards, weight_map, name, &[(offset, len)])
+}
+
+#[allow(clippy::cast_ptr_alignment)]
+/// Load a 1D F32 element range to GPU (tensor-parallel shard of a 1D weight).
+pub fn load_tensor_1d_f32_shard(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    offset: usize,
+    len: usize,
+) -> Result<CudaSlice<f32>> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let data = tensor.data();
+    if data.len() % 4 != 0 {
+        return Err(anyhow::anyhow!(
+            "F32 tensor '{}': data length {} not multiple of 4",
+            name,
+            data.len()
+        ));
+    }
+    let total = data.len() / 4;
+    if offset + len > total {
+        return Err(anyhow::anyhow!(
+            "F32 1D shard out of bounds for '{}': offset={} len={} total_len={}",
+            name,
+            offset,
+            len,
+            total
+        ));
+    }
+    let slice = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<f32>(), total) };
+    let gpu_data = ctx
+        .stream
+        .clone_htod(&slice[offset..offset + len])
+        .map_err(|e| anyhow::anyhow!("H2D copy failed for '{}': {}", name, e))?;
+    Ok(gpu_data)
+}
+
 #[allow(clippy::cast_ptr_alignment)]
 /// Load a 1D F32 tensor to GPU as CudaSlice<f32>.
 /// For weights stored in float32 (e.g., A_log, norm.weight in linear attention).

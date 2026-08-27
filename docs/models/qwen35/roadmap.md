@@ -47,7 +47,7 @@ out:
 | Fault isolation | Open risk: batch-level execution errors can still fail multiple active requests | #654 |
 | Prefix reuse | Open: bounded joint KV/recurrent/conv snapshot design and implementation | #257 |
 | DFlash | In flight and opt-in: correctness-first work must stay default-off until gates pass | #434, PR #626, #654 |
-| Tensor parallel | Phase 1 complete: eager dense TP2 worker/scheduler execution; Phase 2 still needs mixed-step execution and sharded linear-attention/GDR state. | `docs/models/qwen35/tp-implementation.md`, #446 |
+| Tensor parallel | Done through Phase 2b: eager dense TP2, mixed-step unified execution, and sharded linear/GDR state, verified on 2× RTX 4090 for 9B and 27B; TP CUDA Graph + perf gates remain | `docs/models/qwen35/tp-implementation.md`, #446 |
 
 ## Active Contract
 
