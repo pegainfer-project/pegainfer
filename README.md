@@ -53,6 +53,12 @@ update it in the current user's home directory:
 curl -fsSL https://raw.githubusercontent.com/pegainfer-project/pegainfer/main/install.sh | bash
 ```
 
+If `pegainfer` is not found in the current shell after installation, run:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 Set `PEGAINFER_VERSION=v0.1.1` to install that exact release. Model weights are
 not part of the binary archive; download a Qwen3 checkpoint separately and run:
 
@@ -85,12 +91,12 @@ cargo run --release
 # Try it
 curl -s http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "The capital of France is", "max_tokens": 32}'
+  -d '{"model": "models/Qwen3-4B", "prompt": "The capital of France is", "max_tokens": 32}'
 
 # Streaming
 curl -N http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Write a haiku about Rust:", "max_tokens": 64, "stream": true}'
+  -d '{"model": "models/Qwen3-4B", "prompt": "Write a haiku about Rust:", "max_tokens": 64, "stream": true}'
 ```
 
 > Always use `--release`. Debug builds are extremely slow for GPU/CUDA code.

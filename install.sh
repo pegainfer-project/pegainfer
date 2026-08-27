@@ -90,5 +90,7 @@ ln -sfn "$install_root/current/bin/pegainfer" "$bin_dir/pegainfer"
 echo "installed PegaInfer v$installed_version to $version_dir"
 echo "binary: $bin_dir/pegainfer"
 if [[ :$PATH: != *":$bin_dir:"* ]]; then
-  echo "add $bin_dir to PATH before running pegainfer"
+  echo "pegainfer is not on PATH in this shell; run:"
+  printf '  export PATH="%s:%s"\n' "$bin_dir" "\$PATH"
+  echo "add the same line to your shell profile to keep it available"
 fi
