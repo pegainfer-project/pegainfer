@@ -147,6 +147,16 @@ prose): 4-concurrent 96.3 → 103.0 tok/s (+7%), 32-concurrent 495 → 594 tok/s
 near-tie token and continue at comparable quality. Native path with the flag
 unset is untouched (same launch sequence, byte-identical).
 
+vLLM v0.28.0 itself on the same phases (DP4×EP4, production defaults —
+cudagraphs ON, `--max-num-seqs 64`, no CUPTI): 4-concurrent 139 tok/s
+(TPOT ≈ 28.8 ms), 32-concurrent 724–788 tok/s (TPOT ≈ 41–44 ms). Against
+our capsule serve (38.8 / 53.9 ms) it is ~25% ahead at both points — but it
+replays graphs while our EP4 path is forced eager at ~4.3k launches per
+rank-step, so a large slice of the remaining gap is launch overhead, not
+kernel time; graphs over the EP4 fused path (serving-roadmap item) and the
+skinny-GEMM lever are the two remaining structural differences. Raw phases in
+`/data/susun/kernel-capture/capsule-ab-2026-08-28/`.
+
 Offline-build recipe: standalone TUs (upstream `.cu` cut above the torch
 host-launcher block, `namespace { ... }` reopened around an explicit template
 instantiation of the captured flag set) live at
