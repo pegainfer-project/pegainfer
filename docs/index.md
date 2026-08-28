@@ -195,6 +195,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `subsystems/kernels/kernel-op-reports.md` | Qwen3 kernel/report tooling is feature-gated: `qwen3_kernel_report` covers per-op kernel reports, and `qwen3_model_report` emits runtime-traced eager-DAG decode operator rollups with TensorSpec `KernelCall`s, latency stats, tables, and Graphviz DOT; measured FA2 `CTA_TILE_Q=64` prefill default in place. |
 | `subsystems/kernels/typed-forward-pipeline.md` | Reusable typed tensor pipeline macro in `pegainfer-kernels` so model crates can express common `typed_ops` chains without model-specific wrapper macros. |
 | `subsystems/kernels/tvm-ffi-mvp.md` | Optional `tvm-ffi-triton-cubin` bridge in `pegainfer-kernels` plus a packed TVM wrapper for the Qwen3.5 GDR solve Triton AOT CUBIN launcher. |
+| `subsystems/kernels/kernel-mining.md` | Kernel mining/capsule substrate: `--dump-graph-png` now emits a machine `.json` (per-kernel ABI + staged params), and `tools/kernel-capture/` is a provider-agnostic CUPTI injection lib that lifts every cubin + call ABI out of vLLM/sglang. JSON-level A/B of Qwen3-4B bs=1 decode located the levers (attention two-pass vs vLLM's fused `fmhaSm100fKernel`; GEMM tile dispatch) and cleared norm/rope/silu/kv-append. Storage/license discipline follows the existing `cubin/glm52/` precedent. |
 
 ## playbooks
 
