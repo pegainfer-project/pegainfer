@@ -2,19 +2,17 @@
 
 > **TL;DR:** Mined both engines' decode kernel streams on the same tray/checkpoint
 > (`/mnt/shared/weights/kimi-k3-pruned-75pct`, bs ∈ {1,8,32}, CUPTI capture, eager
-> both sides). PegaInfer launches ~2x more kernels per rank-step; the gap is
-> concentrated in three places: **KDA decode** (vLLM = 1 fused kernel/layer, ours =
-> 1 core + 3 conv + ≥4 land/rms slices + projections), **attn-res** (vLLM = 1
-> online fused kernel, ours = scores+mix × 8 nb-blocks = 16 tiny launches), and
-> **GEMM dispatch** (our cuBLASLt algo choice is bit-identical across bs — narrow
-> 64x8 tiles + `splitKreduce` as our single most-launched kernel at 17% — while
-> vLLM re-picks per M and lands fat 64x32/128x16 2-CTA tiles at bs32, and swaps in
-> its own CuTe-DSL skinny GEMMs at bs=1). MoE is the reverse: our MegaMoE is 3
-> launches/layer vs vLLM's ~7, and we have zero collectives vs their per-layer TP4
-> allreduce. Cross-referenced with `benchmarks/k3-ep4-decode-profile.md` (52% of
-> our step is that B=1 GEMM cliff, 5% the router top-k), the ranked port list is:
-> **vLLM's CuTe skinny-GEMM family, their E=224 routing kernel, then KDA/attn-res
-> fusion — next step is a per-op nsys A/B of skinny GEMM vs our nvjet-splitK.**
+> both sides), then **ported the two biggest levers as capsule cubins**
+> (`PEGAINFER_K3_CAPSULE=all`): vLLM v0.28.0's fused KDA decode kernel and its
+> `single_group_topk` router selection, loaded from vendored cubins with a
+> fail-closed ABI check — zero vLLM source in our build. E2E on the same serve:
+> **+7% decode throughput at 4-concurrent (96.3 → 103.0 tok/s), +20% at
+> 32-concurrent (495 → 594 tok/s)**, greedy text 4/8 byte-identical and 4/8
+> diverging at a near-tie token with comparable quality (rounding-chain
+> difference, per-kernel gates bound it). Remaining mined-but-not-ported: CuTe
+> skinny GEMM (only covers M≤2; CuTe param-staging complexity), attn-res
+> (structure mismatch — their NB=3 online kernel vs our 8-block walk — for ≤2%
+> of step). MoE stays ours (MegaMoE more fused, zero collectives).
 >
 > **Last touched:** 2026-08
 
@@ -108,6 +106,59 @@ proprietary — steal the decision, never the cubin.)
    split-kv), MoE (we are already more fused than vLLM), M-aware nvjet re-pick
    for larger buckets (real, but attn-DP keeps per-rank M small; matters only
    when per-rank batch grows).
+
+## Port log (2026-08-28): capsule cubins for KDA + router top-k
+
+Shipped as the **capsule substrate**: the serving kernel is an external cubin
+artifact (`pegainfer-kernels/cubin/k3/`, provenance + sha256 in its README),
+embedded at build time and bound in `csrc/k3/k3_capsule.cu` via
+`cuModuleLoadData` + a fail-closed `cuFuncGetParamInfo` walk against the ABI
+recorded at capture. No vLLM source enters the build; the native kernels stay
+as the reference twin and `PEGAINFER_K3_CAPSULE` (unset ⇒ byte-identical
+serving; `all` or csv of `topk,kda`) flips ops per launch site.
+
+- **Router top-k** (`single_group_topk_warp_kernel<f32,f32,i32,SIGMOID,512,22>`,
+  offline single-instantiation build, 54 KB): drop-in at the `step.rs` router
+  call; weights come back in descending-score order vs our selection order —
+  consumers treat the pairs as unordered. Needs the host-scalar routed scale
+  (`rs_host` beside the device `rs`). Gate `k3_capsule_topk_gate`: expert sets
+  equal, weights ≤1e-5, b ∈ {1,3,8,32}.
+- **KDA decode** (`kda_decode_fusion_many_heads_kernel`, h96 static-layout
+  head-grid variant, 42 KB): one launch replaces conv_silu×3 + kda_core, and
+  the four projection GEMMs collapse to one full `wbig` GEMM + two landings
+  (`out_gate`, new packed `q|k|v` land config). Formulas are our exact
+  spellings (`GATE_LOWER_BOUND=-5`, `scale=128^-0.5`, `RMS_EPS=1e-5`, same tap
+  order, same `[head, v, k]` state layout) — the captured scalars decode to
+  precisely our generator constants, and **no new weights are needed**
+  (`cw_*`, `dt_bias`, `a_log`, `gamma_o` are layout-identical). Two structural
+  deltas: (1) the kernel's conv-tap stride is compiled as `3*12288`, so
+  capsule mode allocates a packed `[rows, 3 taps, q|k|v, 12288]` slab filled
+  by `adopt_row` at the prefill→decode handover (the only state-flow boundary;
+  continuations re-prefill from scratch); (2) conv + recurrent state update
+  **in place**, so capsule decode pins recurrent parity slab 0 and skips the
+  ping-pong — dspark and CP refuse to arm with the flag set. Gate
+  `k3_capsule_kda_gate`: conv windows bitwise-equal, state ≤1.6% / out ≤6.3%
+  rel err (bf16-rounding chains; native lands intermediates in bf16, vLLM
+  keeps f32).
+
+**E2E A/B** (same tray, same serve config, 128-token completions, diverse
+prose): 4-concurrent 96.3 → 103.0 tok/s (+7%), 32-concurrent 495 → 594 tok/s
+(+20%). Greedy 100-token texts: 4/8 byte-identical, 4/8 diverge at a
+near-tie token and continue at comparable quality. Native path with the flag
+unset is untouched (same launch sequence, byte-identical).
+
+Offline-build recipe: standalone TUs (upstream `.cu` cut above the torch
+host-launcher block, `namespace { ... }` reopened around an explicit template
+instantiation of the captured flag set) live at
+`/data/susun/kernel-capture/offline-build/{kda_tu.cu,topk_tu.cu}` (tray03)
+next to the captured ABI manifest `port_abi.json`.
+
+**Not ported, and why:** skinny GEMM/dotprod — captured cubins only
+instantiate M ∈ {1,2} (M is a CuTe compile-time), the A/B buckets (4/32) never
+hit them, and staging CuTe's 24-byte tensor-view params is the highest-effort
+ABI in the set; attn-res — vLLM's online kernel is templated NB=3 vs our
+8-block snapshot walk (structural mismatch, not a slot-for-slot swap) for ≤2%
+of step. Both stay mined in the capture with full ABI if the calculus changes.
 
 ## Caveats
 
