@@ -234,7 +234,9 @@ pub struct Qwen3LaunchOptions {
     /// under tensor parallelism every decode graph is pre-captured at startup.
     pub cuda_graph: bool,
     /// Export the live rank-0, batch-1 SplitKv decode graph during startup.
-    /// The requested PNG gets a detailed sibling `.dot` for LLM inspection.
+    /// The requested PNG gets a detailed sibling `.dot` for LLM inspection and
+    /// a sibling `.json` with per-kernel attributes and staged parameter bytes
+    /// for machine consumption.
     pub dump_graph_png: Option<PathBuf>,
     pub offload: Qwen3OffloadOptions,
     pub no_prefix_cache: bool,

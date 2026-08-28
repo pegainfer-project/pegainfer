@@ -108,12 +108,13 @@ pub(crate) fn start_qwen3(
     if let Some(path) = dump_graph_png {
         let summary = executor.dump_decode_graph_png(path)?;
         info!(
-            "Qwen3 decode CUDA Graph exported: nodes={}, kernels={}, edges={}, dot={}, png={}",
+            "Qwen3 decode CUDA Graph exported: nodes={}, kernels={}, edges={}, dot={}, png={}, json={}",
             summary.nodes,
             summary.kernels,
             summary.edges,
             summary.dot_path.display(),
-            summary.png_path.display()
+            summary.png_path.display(),
+            summary.json_path.display()
         );
     }
     executor.set_no_prefix_cache(no_prefix_cache);
