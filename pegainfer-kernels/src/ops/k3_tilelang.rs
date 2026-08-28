@@ -727,7 +727,8 @@ mod tests {
             assert!(check_bucket(bucket).is_ok());
         }
         assert_eq!(k3_chunk_bucket(K3_MAX_BATCH + 1).unwrap(), 256);
-        assert_eq!(k3_chunk_bucket(4096).unwrap(), K3_MAX_CHUNK);
+        assert_eq!(k3_chunk_bucket(4096).unwrap(), 4224);
+        assert_eq!(k3_chunk_bucket(8449).unwrap(), K3_MAX_CHUNK);
         assert!(k3_chunk_bucket(K3_MAX_CHUNK + 1).is_err());
     }
 
