@@ -9,6 +9,7 @@ use pegainfer_frontend::model_line::CliDecodeOverlap;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
+use pegainfer_frontend::model_line::ServePlan;
 
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35LaunchOptions;
@@ -144,6 +145,10 @@ impl ModelLine for Qwen35Line {
         Ok(())
     }
 
+    fn serve_plan(&self, _ctx: &LaunchContext<'_>) -> Result<ServePlan, CliError> {
+        Ok(ServePlan::default())
+    }
+
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         let cli = cli(ctx);
         crate::launch_with_options_policy_and_overlap(
@@ -162,7 +167,7 @@ impl ModelLine for Qwen35Line {
             resolve_decode_overlap(ctx.shared.decode_overlap)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
         )
-        .map(LaunchedEngine::Handle)
+        .map(LaunchedEngine::Stepped)
     }
 }
 

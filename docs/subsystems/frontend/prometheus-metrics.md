@@ -2,7 +2,7 @@
 
 **TL;DR:** `/metrics` exposes request histograms for every model and engine gauges for schedulers that publish `LoadSnapshot`: Qwen3 and Qwen3.5 use one logical engine, while GLM5.2 EP8/DP8 uses eight rank-local engines and GLM5.2 TP8 uses one logical engine. The bridge forwards each partition's stats under the same identity the vLLM frontend uses for least-load routing.
 
-Last touched: 2026-07
+Last touched: 2026-08
 
 ## How the numbers flow
 
@@ -11,7 +11,7 @@ Two independent paths feed the upstream Prometheus registry (`vllm-metrics`, ser
 1. **Per-request path (works for every model crate).** The bridge stamps each request's first output with `Queued`/`Scheduled` timestamps and `PrefillStats` (prompt/computed/cached token split). The upstream `RequestMetricsTracker` turns those into `time_to_first_token_seconds`, `inter_token_latency_seconds`, `request_queue_time_seconds`, `prompt_tokens_total`, `generation_tokens_total`, `request_success_total`, `prompt_tokens_by_source_total`, … unconditionally — `disable_log_stats` only gates the periodic *text* logger, not Prometheus.
 2. **Engine-gauge path (needs one `LoadSnapshot` watch per scheduler partition).** The scheduler publishes `LoadSnapshot { kv_used_blocks, kv_total_blocks, num_running_reqs, num_waiting_reqs }` at scheduler boundaries; one bridge identity per partition forwards its snapshot as a stats-only `RequestBatchOutputs`. The enclosing `engine_index` is both the routing identity and the Prometheus `engine` label. Watches coalesce to ≤1 message per scheduler step, and the scheduler's final idle publish settles the gauges back to 0.
 
-For a single-partition model, `EngineHandle::with_load_watch` keeps the original one-engine contract. Qwen3.5 uses that contract for both its single-GPU backend and its TP backend because both execute one logical request stream through one scheduler. A partitioned scheduler uses `with_load_watches`, and the frontend launch declares the same engine count; a mismatch fails startup. GLM5.2 EP8 therefore registers engines 0–7, each bound to its own pending queue and KV pool. TP8 registers only engine 0 because its eight workers mirror one logical request stream.
+One logical request stream is one engine. Qwen3 and Qwen3.5 publish `Scheduler::metrics` after each `step` (single-GPU and TP share that one stream); the stepped bridge pulls the snapshot once per driver iteration. Legacy-handle lines still attach `EngineHandle::with_load_watch`. A partitioned scheduler uses one watch per partition, and the frontend launch declares the same engine count; a mismatch fails startup. GLM5.2 EP8 therefore registers engines 0–7, each bound to its own pending queue and KV pool. TP8 registers only engine 0 because its eight workers mirror one logical request stream.
 
 Measured cost is noise in both covered configurations:
 

@@ -30,7 +30,7 @@ use std::path::Path;
 use anyhow::Result;
 use anyhow::anyhow;
 pub(crate) use config::probe_config_json;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
@@ -101,7 +101,7 @@ pub fn start_engine(
     options: EngineLoadOptions,
     max_batch: usize,
     max_prefill_tokens: usize,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     start_engine_with_capacity_and_policy(
         model_path,
         options,
@@ -140,7 +140,7 @@ pub fn launch_with_options_policy_and_overlap(
     options: Qwen35LaunchOptions,
     scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     let device_ordinals = options.device_ordinals()?;
     start_engine_with_capacity_policy_and_overlap(
         model_path,
@@ -163,7 +163,7 @@ pub fn start_engine_with_capacity(
     options: EngineLoadOptions,
     max_batch: usize,
     max_prefill_tokens: usize,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     start_engine_with_capacity_and_policy(
         model_path,
         options,
@@ -179,7 +179,7 @@ pub(crate) fn start_engine_with_capacity_and_policy(
     max_batch: usize,
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     start_engine_with_capacity_policy_and_overlap(
         model_path,
         options,
@@ -197,7 +197,7 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     anyhow::ensure!(
         (1..=MAX_DECODE_BATCH).contains(&max_batch),
         "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"

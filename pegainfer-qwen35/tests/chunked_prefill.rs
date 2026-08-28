@@ -8,73 +8,52 @@
 
 use std::path::Path;
 
-use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 
 mod common;
+
+use common::harness::EngineHarness;
 
 const CHUNK_BUDGET: usize = 16;
 const BASELINE_PREFILL_BUDGET: usize = 1 << 20;
 const MAX_BATCH: usize = 2;
 const GENERATED_TOKENS: usize = 8;
 
-fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
-    pegainfer_qwen35::start_engine(
-        Path::new(model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        MAX_BATCH,
-        max_prefill_tokens,
+fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHarness {
+    EngineHarness::new(
+        pegainfer_qwen35::start_engine(
+            Path::new(model_path),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+            MAX_BATCH,
+            max_prefill_tokens,
+        )
+        .expect("failed to start Qwen3.5 engine"),
     )
-    .expect("failed to start Qwen3.5 engine")
 }
 
-fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (Vec<u32>, FinishReason) {
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
+fn generate(harness: &EngineHarness, prompt_tokens: Vec<u32>) -> (Vec<u32>, FinishReason) {
+    let outcome = harness
+        .submit(common::harness::request(
             prompt_tokens,
-            params: SamplingParams {
+            SamplingParams {
                 ignore_eos: true,
                 ..SamplingParams::default()
             },
-            max_tokens: GENERATED_TOKENS,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    let mut tokens = Vec::new();
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { finish_reason, .. }) => return (tokens, finish_reason),
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
-        }
-    }
+            GENERATED_TOKENS,
+        ))
+        .expect_finished();
+    let Terminal::Finished { reason, .. } = outcome.terminal else {
+        unreachable!("expect_finished returned a non-Finished terminal");
+    };
+    (outcome.tokens, reason)
 }
 
 #[test]
@@ -102,8 +81,8 @@ fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
     );
 
     let (baseline_tokens, baseline_finish) = {
-        let handle = start_engine(&model_path, BASELINE_PREFILL_BUDGET);
-        generate(&handle, prompt_tokens.clone())
+        let harness = start_engine(&model_path, BASELINE_PREFILL_BUDGET);
+        generate(&harness, prompt_tokens.clone())
     };
     assert_eq!(
         baseline_finish,
@@ -112,8 +91,8 @@ fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
     );
 
     let (chunked_tokens, chunked_finish) = {
-        let handle = start_engine(&model_path, CHUNK_BUDGET);
-        generate(&handle, prompt_tokens)
+        let harness = start_engine(&model_path, CHUNK_BUDGET);
+        generate(&harness, prompt_tokens)
     };
     assert_eq!(
         chunked_finish,

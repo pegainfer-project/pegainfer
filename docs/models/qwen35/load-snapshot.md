@@ -1,6 +1,6 @@
 # Qwen3.5 Scheduler LoadSnapshot
 
-> **TL;DR:** Qwen3.5 publishes one logical post-drain/post-prune `LoadSnapshot` stream from its shared single-GPU/TP scheduler: running counts active and prefilling requests, waiting counts all current pending work, and KV usage is request-page capacity minus available pages.
+> **TL;DR:** Qwen3.5 publishes one logical `SchedulerMetrics` snapshot from its shared single-GPU/TP backend after each `step` (same cadence as Qwen3): running counts active, prefilling, and in-flight overlap prefill; waiting counts deferred/queued work; KV usage is request-page capacity minus available pages.
 >
 > **Last touched:** 2026-08
 
@@ -25,28 +25,28 @@
 The data path reuses the existing frontend contract:
 
 ```text
-Qwen3.5 SchedulerBackend
-  -> LoadSnapshot watch
-  -> EngineHandle
-  -> LocalEngineBridge
+Qwen3.5 Qwen35Backend
+  -> Scheduler::metrics after prune (inside step)
+  -> driver publishes once per iteration
+  -> SchedulerHandle::metrics / SteppedEngineBridge
   -> SchedulerStats
   -> /metrics
 ```
 
-Both Qwen3.5 execution modes own one logical request stream, so single-GPU and TP each attach one `EngineHandle::with_load_watch` receiver. The frontend bridge, metric names, labels, and scheduler-stat conversion remain unchanged.
+Both Qwen3.5 execution modes own one logical request stream, so single-GPU and TP each expose one scheduler. The frontend bridge, metric names, labels, and scheduler-stat conversion remain unchanged.
 
-Each scheduler tick first merges deferred work with every submission currently available, then prunes closed pending, active, and prefilling requests before publishing. The fixed boundary is `drain -> prune -> publish load -> admission -> plan`. If the idle scheduler wakes through `blocking_recv()`, it drains, prunes, and publishes again before admission so work closed before admission never consumes a slot or appears in the snapshot.
+The driver publishes *after* `step()` returns, same as Qwen3. `step` prunes aborted work before admission, then admits and executes; `metrics()` reads the queues at the end of that step. In-flight overlap prefill counts as running so an overlap wait inside `step` is never published as idle.
 
 Snapshot accounting is:
 
 | Metric field | Existing Qwen3.5 state |
 | --- | --- |
-| `num_running_reqs` | `active.len() + prefilling.len()` |
-| `num_waiting_reqs` | the merged pending queue: prior deferred work plus newly drained submissions |
+| `num_running_reqs` | `active.len() + prefilling.len() + inflight_prefill` |
+| `num_waiting_reqs` | deferred/queued work not yet admitted |
 | `kv_used_blocks` | request KV capacity minus currently available request pages |
 | `kv_total_blocks` | backend request KV capacity, excluding the CUDA Graph padding page |
 
-Publication reads the scheduler's queues and KV allocator after closed resident state has gone through its normal retirement path. The snapshot therefore describes the state used by the following admission decision: cancelled residents no longer count as running or hold capacity, while live pending requests count as waiting even if they were submitted during the current tick.
+Publication reads the scheduler's queues and KV allocator after aborted resident state has gone through its normal retirement path. Live pending requests count as waiting even if they were submitted during the current driver drain.
 
 The live gate uses `scripts/bench_http_serving.py` to create overlapping HTTP traffic and a 100 ms `curl /metrics` sampler to retain the three labeled gauges.
 
