@@ -1,2 +1,2 @@
-libkernelcapture.so
+libkernelcapture*.so
 kernel-capture/

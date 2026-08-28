@@ -11,9 +11,11 @@
 //   KERNEL_CAPTURE_DIR=/some/out \
 //     python -m vllm.entrypoints.openai.api_server ...
 //
-// Output under KERNEL_CAPTURE_DIR (default ./kernel-capture):
-//   module_<moduleId>.cubin   one file per distinct loaded module
-//   launches.jsonl            one JSON object per captured kernel launch
+// Output under KERNEL_CAPTURE_DIR (default ./kernel-capture), in a pid<N>/
+// subdirectory per injected process so multi-rank engines (TP/EP workers)
+// don't clobber each other:
+//   pid<N>/module_<moduleId>.cubin   one file per distinct loaded module
+//   pid<N>/launches.jsonl            one JSON object per captured kernel launch
 //
 // The driver calls InitializeInjection() once, before the first CUDA call, on
 // any library named by CUDA_INJECTION64_PATH.
@@ -31,6 +33,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 // A kernel's parameter buffer is a few KiB at most; a walk past this many
 // indices means cuFuncGetParamInfo is misbehaving, not that the kernel is huge.
@@ -263,14 +266,14 @@ static void record_launch(const char *symbol, CUfunction func,
                           unsigned int block_y, unsigned int block_z,
                           unsigned int shared_bytes, void **kernel_params) {
   KernelAttrs attrs = read_attrs(func);
+
+  pthread_mutex_lock(&g_lock);
   if (attrs.num_regs == 0) {
     const KernelAbi *abi = abi_lookup(symbol);
     if (abi) {
       attrs = abi->attrs;
     }
   }
-
-  pthread_mutex_lock(&g_lock);
   fprintf(g_launches, "{\"symbol\":\"%s\",", symbol ? symbol : "");
   fprintf(g_launches, "\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],",
           grid_x, grid_y, grid_z, block_x, block_y, block_z);
@@ -335,8 +338,15 @@ static void CUPTIAPI callback(void *userdata, CUpti_CallbackDomain domain,
       const CUpti_ResourceData *resource = (const CUpti_ResourceData *)cbdata;
       const CUpti_ModuleResourceData *module =
           (const CUpti_ModuleResourceData *)resource->resourceDescriptor;
+      // Multi-rank engines (one process, one thread per GPU) hit this path
+      // concurrently on lazy module loads; g_seen_* and the g_abi table are
+      // shared, so the whole module path holds the same lock as the readers.
+      // The recursive MODULE_LOADED from our own cuModuleLoadData is filtered
+      // by g_in_self_load above, before it could reach the lock.
+      pthread_mutex_lock(&g_lock);
       write_cubin(module);
       cache_module_abi(module);
+      pthread_mutex_unlock(&g_lock);
     }
     return;
   }
@@ -372,8 +382,12 @@ static void CUPTIAPI callback(void *userdata, CUpti_CallbackDomain domain,
 // dlsym's it out of every library on CUDA_INJECTION64_PATH.
 int InitializeInjection(void) {
   const char *dir = getenv("KERNEL_CAPTURE_DIR");
-  snprintf(g_out_dir, sizeof(g_out_dir), "%s",
+  char base_dir[4096];
+  snprintf(base_dir, sizeof(base_dir), "%s",
            dir && *dir ? dir : "./kernel-capture");
+  mkdir(base_dir, 0755);
+  snprintf(g_out_dir, sizeof(g_out_dir), "%.4080s/pid%d", base_dir,
+           (int)getpid());
   mkdir(g_out_dir, 0755);
 
   char path[4200];
