@@ -3,6 +3,22 @@
 //! Manual gate: CI compiles this but never runs it. Run on a GPU box with
 //! PEGAINFER_REQUIRE_GPU=1, which turns a missing device into a failure
 //! rather than a skip.
+//!
+//! Two closed-form anchors, then a chain. `full_rotation_matches_closed_form`
+//! and `partial_rotation_exercises_tail` are the only tests here that restate
+//! the operator, and they are two because rotary_dim == HD and rotary_dim < HD
+//! are different control flow: at full width no thread reaches the
+//! pass-through tail at all, and full width is the Gemma 4 local-layer
+//! production config. From there each gate is measured against an arm the
+//! anchors certify — the contiguous kernel certifies the values the paged
+//! prefill must land at its layout addresses, and the paged prefill certifies
+//! the bits the paged decode must reproduce. Nothing below the anchors
+//! recomputes the norm, the RoPE, or the paged address formula.
+//!
+//! Extend the chain, do not grow a host oracle: a new dispatch variant is
+//! compared against the arm one link above it. See
+//! docs/subsystems/kernels/qk-rope-smoke-oracles.md for why, and for the
+//! negative controls that keep a GPU-vs-GPU gate honest.
 
 mod common;
 
@@ -202,67 +218,82 @@ const NUM_LAYERS: usize = 2;
 const PAGE_INDICES: [i32; 4] = [3, 7, 5, 9];
 const POOL_PAGES: usize = 8;
 
-/// K and V blocks at their layout-derived offsets; everything else stays
-/// 0.0. V is the weightless norm of the v input — never rotated, no weight.
-fn expected_pool(layout: &PagedKvLayout, layer: usize, kw: &[bf16]) -> Vec<f32> {
-    let mut exp = vec![0.0f32; layout.page_stride * POOL_PAGES];
-    let layer_offset = (layer * layout.layer_stride) as i64;
-    for t in 0..SEQ_LEN {
-        let pos = START_POS + t;
-        let page = PAGE_INDICES[pos / PAGE_SIZE] as i64;
-        for h in 0..NUM_KV_HEADS {
-            let k_x = signed(K_BASE, h, t);
-            let k_inv = inv_rms(k_x);
-            let v_x = signed(V_BASE, h, t);
-            let v_val = bf16::from_f32(v_x * inv_rms(v_x)).to_f32();
-            let base = page * layout.page_stride as i64
-                + layer_offset
-                + (pos % PAGE_SIZE) as i64 * KV_DIM as i64
-                + h as i64 * HD as i64;
-            for d in 0..HD {
-                exp[(base + d as i64) as usize] = expected_prep(k_x, kw, k_inv, d, pos, HD);
-                exp[(base + layout.kv_block_len as i64 + d as i64) as usize] = v_val;
-            }
-        }
-    }
-    exp
+/// The pool slot a (position, kv head, element) triple owns, read straight
+/// off the production `PagedKvLayout` rather than restated from the page
+/// geometry. This is the only address arithmetic left in the file: the
+/// decode gate below compares two pools element for element and needs none.
+fn pool_k_offset(
+    layout: &PagedKvLayout,
+    layer: usize,
+    page: usize,
+    pos: usize,
+    kv_head: usize,
+) -> usize {
+    page * layout.page_stride
+        + layer * layout.layer_stride
+        + (pos % layout.page_size) * layout.num_kv_heads * layout.head_dim
+        + kv_head * layout.head_dim
 }
 
-/// Exact zero is the assertion, not sloppiness: it marks a slot the kernel
-/// must never have written — unreferenced pages, the other layer, and the
-/// slots outside the request's positions.
-#[allow(clippy::float_cmp)]
-fn assert_pool(got: &[f32], expected: &[f32]) {
-    assert_eq!(got.len(), expected.len());
+/// Bitwise, not approximate: every expectation here is a value another GPU
+/// arm produced from the same input at the same position, so the two cannot
+/// differ at all. The lone host-computed expectation (the weightless V norm)
+/// is exact too, for reasons worth reading before loosening this: see
+/// docs/subsystems/kernels/qk-rope-smoke-oracles.md.
+///
+/// A zero expectation in a pool comparison is a slot the kernel must never
+/// have written — unreferenced pages, the other layer, the slots outside the
+/// request's positions — so it is asserted as hard as any other value.
+///
+/// Reports the first differing element. `assert_eq!` on the whole slice
+/// would dump two vectors of tens of thousands of values and bury it.
+fn assert_bits_eq(got: &[u16], expected: &[u16], what: &str) {
+    assert_eq!(got.len(), expected.len(), "{what}: length differs");
     for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
-        if e == 0.0 {
-            assert_eq!(g, 0.0, "pool[{i}]: expected untouched, got {g}");
-        } else {
-            assert!(
-                (g - e).abs() < 0.02,
-                "pool[{i}]: got {g}, expected {e} (tolerance 0.02)"
-            );
-        }
+        assert_eq!(
+            g,
+            e,
+            "{what}[{i}]: got {}, expected {}",
+            bf16::from_bits(g),
+            bf16::from_bits(e)
+        );
     }
 }
 
-#[test]
-fn pool_write_matches_closed_form_and_touches_nothing_else() {
-    let Some(ctx) = common::device_or_skip() else {
-        return;
-    };
-    let ctx = &ctx;
-    let qw = q_norm_weights();
-    let kw = k_norm_weights();
-    let layer = 1;
-    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
+/// bf16 bits, not the widened f32: the pool stores bf16, so reading both
+/// sides the same way lets one comparison cover Q rows and pool slots alike.
+fn row_bits(rows: &[f32]) -> Vec<u16> {
+    rows.iter().map(|&v| bf16::from_f32(v).to_bits()).collect()
+}
+
+/// Norm weights and RoPE tables on device: the setup both paged gates share.
+fn device_fixture(ctx: &DeviceContext) -> (DeviceVec, DeviceVec, DeviceVec, DeviceVec) {
+    let (cos_dev, sin_dev) = cos_sin_tables(ctx, COS_MAX_POS, HD);
+    (
+        DeviceVec::from_host(ctx, &q_norm_weights()).expect("q_norm_weight H2D"),
+        DeviceVec::from_host(ctx, &k_norm_weights()).expect("k_norm_weight H2D"),
+        cos_dev,
+        sin_dev,
+    )
+}
+
+/// The paged prefill over the fixture window, read back as (Q rows, pool)
+/// bit patterns. Both gates below need this arm — one as the subject, one as
+/// the oracle the decode form must reproduce — and the wrapper takes
+/// twenty-two arguments, so it is spelled once here rather than twice.
+fn run_paged_prefill(
+    ctx: &DeviceContext,
+    layout: &PagedKvLayout,
+    layer: usize,
+    qn: &DeviceVec,
+    kn: &DeviceVec,
+    cos_dev: &DeviceVec,
+    sin_dev: &DeviceVec,
+) -> (Vec<u16>, Vec<u16>) {
     let q = hidden_input(ctx, Q_BASE, NUM_Q_HEADS, SEQ_LEN);
     let k = hidden_input(ctx, K_BASE, NUM_KV_HEADS, SEQ_LEN);
     let v = hidden_input(ctx, V_BASE, NUM_KV_HEADS, SEQ_LEN);
     let mut q_out = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("q_out alloc");
-    let (cos_dev, sin_dev) = cos_sin_tables(ctx, COS_MAX_POS, HD);
-    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
-    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
     let pool: CudaSlice<bf16> = ctx
         .stream
         .alloc_zeros(layout.page_stride * POOL_PAGES)
@@ -271,7 +302,6 @@ fn pool_write_matches_closed_form_and_touches_nothing_else() {
         .stream
         .clone_htod(&PAGE_INDICES)
         .expect("page_indices H2D");
-
     qkv_norm_rope_paged_prefill_hd256_plain_into(
         ctx,
         &q,
@@ -280,11 +310,11 @@ fn pool_write_matches_closed_form_and_touches_nothing_else() {
         &mut q_out,
         0,
         &pool,
-        &layout,
-        &qn,
-        &kn,
-        &cos_dev,
-        &sin_dev,
+        layout,
+        qn,
+        kn,
+        cos_dev,
+        sin_dev,
         layer,
         &page_indices,
         0,
@@ -296,17 +326,85 @@ fn pool_write_matches_closed_form_and_touches_nothing_else() {
         HD,
         EPS,
     )
-    .expect("pool prep launch");
-
-    let qo = q_out.to_host(ctx).expect("q_out D2H");
-    assert_close(
-        &qo,
-        &expected_full(Q_BASE, &qw, Q_DIM, HD),
-        "pool-write Q pairing",
-    );
+    .expect("paged prefill launch");
     let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
-    let pool_f: Vec<f32> = pool_host.iter().map(|x| x.to_f32()).collect();
-    assert_pool(&pool_f, &expected_pool(&layout, layer, &kw));
+    (
+        row_bits(&q_out.to_host(ctx).expect("q_out D2H")),
+        pool_host.iter().map(|x| x.to_bits()).collect(),
+    )
+}
+
+/// The paged prefill's addressing, against the contiguous arm rather than a
+/// second copy of the operator. `full_rotation_matches_closed_form`
+/// certifies that arm's norm and RoPE at this rotary width, so driving it on
+/// the same rows from the same start_pos yields the Q and K this prefill
+/// must produce, and the only open question left here is whether the paged
+/// form lands those values in the slots `PagedKvLayout` names and leaves
+/// every other slot alone.
+///
+/// V has no contiguous counterpart — the flat kernel carries no V band — so
+/// its weightless norm stays as a one-line expectation. That is one multiply
+/// over a reduction the anchor already pins, not a second operator.
+#[test]
+fn paged_prefill_lands_flat_values_at_layout_addresses() {
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let layer = 1;
+    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
+    let (qn, kn, cos_dev, sin_dev) = device_fixture(ctx);
+
+    // Oracle arm: the same rows over the same position window, through the
+    // contiguous kernel the closed-form anchors certify.
+    let oracle_q = hidden_input(ctx, Q_BASE, NUM_Q_HEADS, SEQ_LEN);
+    let oracle_k = hidden_input(ctx, K_BASE, NUM_KV_HEADS, SEQ_LEN);
+    let mut oracle_q_out = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("oracle q_out alloc");
+    let mut oracle_k_out = HiddenStates::zeros(ctx, KV_DIM, SEQ_LEN).expect("oracle k_out alloc");
+    qk_norm_rope_prefill_hd256_plain_into(
+        ctx,
+        &oracle_q,
+        &oracle_k,
+        &mut oracle_q_out,
+        &mut oracle_k_out,
+        &qn,
+        &kn,
+        &cos_dev,
+        &sin_dev,
+        START_POS,
+        COS_MAX_POS,
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        HD,
+        EPS,
+    )
+    .expect("oracle flat prep launch");
+    let oracle_q_bits = row_bits(&oracle_q_out.to_host(ctx).expect("oracle q_out D2H"));
+    let oracle_k_vals = oracle_k_out.to_host(ctx).expect("oracle k_out D2H");
+
+    let (q_bits, pool_bits) = run_paged_prefill(ctx, &layout, layer, &qn, &kn, &cos_dev, &sin_dev);
+    assert_bits_eq(
+        &q_bits,
+        &oracle_q_bits,
+        "paged Q vs the contiguous arm over the same window",
+    );
+
+    let mut expected = vec![0u16; layout.page_stride * POOL_PAGES];
+    for t in 0..SEQ_LEN {
+        let pos = START_POS + t;
+        let page = PAGE_INDICES[pos / PAGE_SIZE] as usize;
+        for h in 0..NUM_KV_HEADS {
+            let v_x = bf16::from_f32(signed(V_BASE, h, t)).to_f32();
+            let v_val = bf16::from_f32(v_x * inv_rms(v_x)).to_bits();
+            let base = pool_k_offset(&layout, layer, page, pos, h);
+            for d in 0..HD {
+                expected[base + d] =
+                    bf16::from_f32(oracle_k_vals[t * KV_DIM + h * HD + d]).to_bits();
+                expected[base + layout.kv_block_len + d] = v_val;
+            }
+        }
+    }
+    assert_bits_eq(&pool_bits, &expected, "pool");
 }
 
 /// rotary_dim = 256 is the Gemma 4 local-layer case: the full head rotates
@@ -439,47 +537,74 @@ fn rejects_position_beyond_cos_table() {
     );
 }
 
+/// The per-token metadata form against the whole-window form. Both are
+/// instantiations of one template, differing only in where `pos`, the page
+/// window and the window's origin come from, so driving the decode arm with
+/// a table replicated per row and the origin the prefill arm was handed must
+/// reproduce that arm bit for bit.
+///
+/// Everything the two share cancels: the norm, the RoPE, the V band, the
+/// pool addressing. What is left under test is exactly the routing —
+/// `positions[]`, the CSR window, the per-token origin — which is the only
+/// code `PER_TOKEN_META` switches on. No host expectation is computed here
+/// and no address is derived.
 #[test]
-fn batched_decode_prep_matches_closed_form() {
+fn paged_decode_equals_paged_prefill_over_the_same_positions() {
     let Some(ctx) = common::device_or_skip() else {
         return;
     };
     let ctx = &ctx;
-    let qw = q_norm_weights();
-    let kw = k_norm_weights();
     let layer = 1;
     let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
-    let batch = 2usize;
-    // [7] at origin 1 maps pos 3 to page 7; [3, 5] at origin 0 maps it to page 5.
-    let positions: [i32; 2] = [3, 3];
-    let origins: [i32; 2] = [1, 0];
-    let pages_cat: [i32; 3] = [7, 3, 5];
-    let indptr: [i32; 3] = [0, 1, 3];
+    let (qn, kn, cos_dev, sin_dev) = device_fixture(ctx);
 
-    let q = hidden_input(ctx, Q_BASE, NUM_Q_HEADS, batch);
-    let k = hidden_input(ctx, K_BASE, NUM_KV_HEADS, batch);
-    let v = hidden_input(ctx, V_BASE, NUM_KV_HEADS, batch);
-    let mut q_out = HiddenStates::zeros(ctx, Q_DIM, batch).expect("q_out alloc");
-    let (cos_dev, sin_dev) = cos_sin_tables(ctx, COS_MAX_POS, HD);
-    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
-    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
-    let pool: CudaSlice<bf16> = ctx
+    // Whole-window arm: one table for the whole prompt, positions derived
+    // from start_pos, one scalar origin for every row.
+    let (prefill_q, prefill_kv) =
+        run_paged_prefill(ctx, &layout, layer, &qn, &kn, &cos_dev, &sin_dev);
+
+    // Per-token arm: equivalent metadata in the form the decode path takes.
+    // Each row's window is compressed to start at the page holding that row's
+    // own position — a caller that released the front passes exactly this —
+    // so the origins differ across rows (0, 1, 1, 2) and no two rows share a
+    // table span. The per-token origin and the CSR window are both
+    // load-bearing here, not defaulted: a form that ignored
+    // page_origins[token] would take row pos/page_size into a window that no
+    // longer starts at page 0 and land somewhere else. Page 9 stays past
+    // every reachable row in both arms, so dereferencing the out-of-range
+    // sentinel traps rather than passing quietly.
+    let mut per_token_pages: Vec<i32> = Vec::new();
+    let mut indptr: Vec<i32> = vec![0];
+    let mut origins: Vec<i32> = Vec::new();
+    let mut positions: Vec<i32> = Vec::new();
+    for t in 0..SEQ_LEN {
+        let pos = START_POS + t;
+        let origin = pos / PAGE_SIZE;
+        per_token_pages.extend_from_slice(&PAGE_INDICES[origin..]);
+        indptr.push(per_token_pages.len() as i32);
+        origins.push(origin as i32);
+        positions.push(pos as i32);
+    }
+    let q = hidden_input(ctx, Q_BASE, NUM_Q_HEADS, SEQ_LEN);
+    let k = hidden_input(ctx, K_BASE, NUM_KV_HEADS, SEQ_LEN);
+    let v = hidden_input(ctx, V_BASE, NUM_KV_HEADS, SEQ_LEN);
+    let mut decode_q_out = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("q_out alloc");
+    let decode_pool: CudaSlice<bf16> = ctx
         .stream
         .alloc_zeros(layout.page_stride * POOL_PAGES)
         .expect("pool alloc");
-    let pages_d: CudaSlice<i32> = ctx.stream.clone_htod(&pages_cat).expect("pages H2D");
+    let pages_d: CudaSlice<i32> = ctx.stream.clone_htod(&per_token_pages).expect("pages H2D");
     let indptr_d: CudaSlice<i32> = ctx.stream.clone_htod(&indptr).expect("indptr H2D");
     let origins_d: CudaSlice<i32> = ctx.stream.clone_htod(&origins).expect("origins H2D");
     let positions_d: CudaSlice<i32> = ctx.stream.clone_htod(&positions).expect("positions H2D");
-
     qkv_norm_rope_paged_decode_hd256_plain_into(
         ctx,
         &q,
         &k,
         &v,
-        &mut q_out,
+        &mut decode_q_out,
         0,
-        &pool,
+        &decode_pool,
         &layout,
         &qn,
         &kn,
@@ -496,43 +621,17 @@ fn batched_decode_prep_matches_closed_form() {
         HD,
         EPS,
     )
-    .expect("batched decode prep launch");
+    .expect("paged decode prep launch");
 
-    let qo = q_out.to_host(ctx).expect("q_out D2H");
-    let mut q_exp = vec![0.0f32; Q_DIM * batch];
-    for (row, &pos) in positions.iter().enumerate() {
-        for h in 0..NUM_Q_HEADS {
-            let x = signed(Q_BASE, h, row);
-            let inv = inv_rms(x);
-            for d in 0..HD {
-                q_exp[row * Q_DIM + h * HD + d] = expected_prep(x, &qw, inv, d, pos as usize, HD);
-            }
-        }
-    }
-    assert_close(&qo, &q_exp, "batched decode pairing/tail");
-
-    let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
-    let got: Vec<f32> = pool_host.iter().map(|x| x.to_f32()).collect();
-    let mut exp = vec![0.0f32; layout.page_stride * POOL_PAGES];
-    let layer_offset = (layer * layout.layer_stride) as i64;
-    for (row, (&pos, &page)) in positions.iter().zip([7i32, 5i32].iter()).enumerate() {
-        for h in 0..NUM_KV_HEADS {
-            let k_x = signed(K_BASE, h, row);
-            let k_inv = inv_rms(k_x);
-            let v_x = signed(V_BASE, h, row);
-            let v_val = bf16::from_f32(v_x * inv_rms(v_x)).to_f32();
-            let base = page as i64 * layout.page_stride as i64
-                + layer_offset
-                + (pos as usize % PAGE_SIZE) as i64 * KV_DIM as i64
-                + h as i64 * HD as i64;
-            for d in 0..HD {
-                exp[(base + d as i64) as usize] =
-                    expected_prep(k_x, &kw, k_inv, d, pos as usize, HD);
-                exp[(base + layout.kv_block_len as i64 + d as i64) as usize] = v_val;
-            }
-        }
-    }
-    assert_pool(&got, &exp);
+    let decode_q = row_bits(&decode_q_out.to_host(ctx).expect("q_out D2H"));
+    let decode_pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&decode_pool).expect("pool D2H");
+    let decode_kv: Vec<u16> = decode_pool_host.iter().map(|x| x.to_bits()).collect();
+    assert_bits_eq(&decode_q, &prefill_q, "per-token Q vs the whole-window run");
+    assert_bits_eq(
+        &decode_kv,
+        &prefill_kv,
+        "per-token pool writes vs the whole-window run",
+    );
 }
 
 /// The row-offset suffix contract: with `row_offset = 1` over three rows,
