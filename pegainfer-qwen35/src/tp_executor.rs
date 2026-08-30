@@ -1350,19 +1350,40 @@ impl TpWorkerPrepared {
         );
         // Graph mode pre-allocates one fixed-address slot state per decode
         // bucket position up front; reserve that before sizing per-request
-        // (prefill-transient) state capacity.
-        let graph_slot_reserve = if graph_enabled {
-            bucket_for(requested_max_batch) * recurrent_bytes
+        // (prefill-transient) state capacity. The reserve must track the
+        // bucket of the *effective* batch, not the requested one: reserving
+        // for `bucket_for(requested)` can starve a tight-memory rank down to
+        // zero capacity. Iterate the bucket downward until it stabilises —
+        // the bucket only shrinks, so this converges — and clamp the fitted
+        // batch to the reserved bucket so the later `bucket_for(effective)`
+        // graph allocation never exceeds the reserve.
+        let max_batch = if graph_enabled {
+            let mut slot_bucket = bucket_for(requested_max_batch);
+            loop {
+                let reserve = slot_bucket * recurrent_bytes;
+                let candidate = effective_recurrent_capacity(
+                    requested_max_batch,
+                    free_bytes.saturating_sub(reserve),
+                    recurrent_bytes,
+                    TP_RUNTIME_MEMORY_RESERVE_BYTES,
+                    prefill_scratch_bytes,
+                );
+                let fitted = candidate.min(slot_bucket);
+                let next = bucket_for(fitted);
+                if next >= slot_bucket {
+                    break fitted;
+                }
+                slot_bucket = next;
+            }
         } else {
-            0
+            effective_recurrent_capacity(
+                requested_max_batch,
+                free_bytes,
+                recurrent_bytes,
+                TP_RUNTIME_MEMORY_RESERVE_BYTES,
+                prefill_scratch_bytes,
+            )
         };
-        let max_batch = effective_recurrent_capacity(
-            requested_max_batch,
-            free_bytes.saturating_sub(graph_slot_reserve),
-            recurrent_bytes,
-            TP_RUNTIME_MEMORY_RESERVE_BYTES,
-            prefill_scratch_bytes,
-        );
         anyhow::ensure!(
             max_batch > 0,
             "Qwen3.5 TP rank {rank} has {} MiB free after fixed buffers, but one recurrent request needs {} MiB plus {} MiB runtime reserve and {} MiB prefill scratch for {} tokens",
