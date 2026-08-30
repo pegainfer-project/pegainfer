@@ -103,7 +103,9 @@ def mmlupro_extract(text):
 
 
 # ---------------------------------------------------------------- mmlu-redux
-MMLUREDUX_RE = re.compile(r'([ABCD])')
+# Extraction reuses the SuperGPQA marker-preferring patterns with the MMLU
+# letter range: a first-anywhere `[ABCD]` search scores "Answer: B" as the
+# "A" of "Answer", silently flipping correct answers (codex review on #946).
 
 
 # ---------------------------------------------------------------- supergpqa
@@ -240,8 +242,7 @@ async def evaluate(name, items, prompts, golds, args, out_dir):
         elif name == 'mmlu_pro':
             pred = mmlupro_extract(text).lower()
         elif name == 'mmlu_redux':
-            m = MMLUREDUX_RE.search(text)
-            pred = m.group(1) if m else ''
+            pred = sg_extract_labels(text, 'ABCD') or ''
         else:
             pred = sg_extract_labels(text)
             if pred is None:
