@@ -3,6 +3,8 @@
 > TL;DR:Qwen3.5-27B 在 pegainfer TP2(2× RTX 4090,batched eager decode)上跑知识基准,C-Eval 88.11(官方 90.5)、MMLU-Redux 94.09(官方 93.2),均在跨 harness 正常带内;MMLU-Pro / SuperGPQA 因运行时长原因仅完成抽样冒烟,未出最终分(见下文)。模型数值无 TP 引入的精度问题。
 >
 > 注:分数实测于 rebase 前的 f4c66780 分支(自研 Phase 1/2a 线);rebase 到 #870 后 logits golden gate 两侧一致通过,数值可迁移,但若正式引用请在本 PR 分支上复跑确认。
+>
+> 另注:**MMLU-Redux 94.09 是在旧抽取器下实测的,在复跑前不要引用**。旧抽取取全文首个 `[ABCD]`,"Answer: B" 会被算成 "Answer" 里的 A(codex review 发现);本 PR 已修复为 marker 优先 + 独立字母抽取,需以修复后的 `scripts/eval_mc.py` 在 exact head 上重测。
 
 ## 环境
 
@@ -11,7 +13,7 @@
 - 采样:temperature=0.0,top_p=1.0,chat completions(thinking 模式,即模板默认行为)
 - 评测器:`scripts/eval_mc.py`(自研,统一 `/v1/chat/completions` 并发 48),配方逐项复刻官方 harness:
   - **C-Eval** = OpenCompass `ceval_gen`:52 学科 val split 全量 1346 题,dev split 5-shot,"答案: " 续写,首大写字母抽取
-  - **MMLU-Redux** = lm-eval `mmlu_redux_generative`:`fxmarty/mmlu-redux-2.0-ok` 57 学科 test 全量 5330 题,0-shot,首个 `[ABCD]` 抽取
+  - **MMLU-Redux** = lm-eval `mmlu_redux_generative`:`fxmarty/mmlu-redux-2.0-ok` 57 学科 test 全量 5330 题,0-shot,marker/独立字母抽取(早期版本为全文首个 `[ABCD]`,会误吸 "Answer: X" 前缀,已修复待复跑)
   - **MMLU-Pro** = lm-eval `mmlu_pro`:TIGER-Lab/MMLU-Pro test,validation split 5-shot CoT,`answer is (X)` 抽取
   - **SuperGPQA** = OpenCompass `supergpqa_gen`:`m-a-p/SuperGPQA` train 26529 题,0-shot,"Answer: X" 字母/内容两层抽取
 - 启动命令:`LD_LIBRARY_PATH=<.venv>/nvidia/nccl/lib ./target/release/pegainfer --model-path <27B> --served-model-name qwen35-27b-tp2 --tp-size 2 --cuda-graph false --port 18082`
