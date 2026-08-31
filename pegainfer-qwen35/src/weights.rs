@@ -542,7 +542,7 @@ impl Qwen35Model {
 
         // The first production specialization is deliberately single-GPU.
         // TP remains an explicit capability fallback to the existing Triton path.
-        let flashinfer_gdn = if tensor_parallel.world_size == 1 {
+        let flashinfer_gdn = if geometry.world_size() == 1 {
             pegainfer_kernels::ops::Qwen35GdnAot::load_for_production(
                 &ctx,
                 super::flashinfer_gdn::model_geometry(&config),
@@ -555,10 +555,10 @@ impl Qwen35Model {
                 "Qwen3.5 GDN production backend: FlashInfer AOT object {}",
                 backend.artifact_sha256()
             );
-        } else if tensor_parallel.world_size > 1 {
+        } else if geometry.world_size() > 1 {
             info!(
                 "Qwen3.5 GDN production backend: Triton (explicit capability fallback: TP world_size={})",
-                tensor_parallel.world_size
+                geometry.world_size()
             );
         } else {
             let (major, minor) = ctx.ctx.compute_capability()?;
