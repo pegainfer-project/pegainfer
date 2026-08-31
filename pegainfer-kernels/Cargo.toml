@@ -24,6 +24,8 @@ tvm-ffi-triton-cubin = ["dep:tvm-ffi", "qwen35"]
 # Qwen3.5 Triton AOT kernels (GDR chunkwise prefill) — the only feature that
 # needs Python + Triton at build time.
 deepseek-v2-lite = []
+# Gemma 4: NVFP4 dequantization, whose conversion intrinsics need CUDA >= 12.8.
+gemma4 = []
 qwen35 = ["dep:serde_json", "dep:sha2"]
 # Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
 glm52 = ["moe"]

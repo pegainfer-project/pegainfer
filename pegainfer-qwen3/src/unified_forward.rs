@@ -17,6 +17,8 @@ use pegainfer_kernels::ops::numeric_policy;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvView;
 
+use super::batch_decode::DecodeGraphPlan;
+use super::batch_decode::DecodeGraphUse;
 use super::batch_decode_buffers::BatchDecodeBuffers;
 use super::config::PREFILL_ATTENTION_CTA_TILE_Q;
 use super::prefill::PrefillBuffers;
@@ -62,17 +64,41 @@ impl Qwen3Model {
         let decode_tokens = vec![0u32; profile_decode_rows];
         let decode_adapters = vec![None; profile_decode_rows];
 
-        // Force the decode CUDA-Graph/buffer path before the unified peak
-        // sample. The synthetic views are short, but the pre-allocated decode
-        // arena and graph state are the same serving objects used later. Skip it
-        // for uncompiled-group models: the unified sample below bounds their KV.
-        // Eager under TP: ranks profile uncoordinated, so an in-profile capture
-        // would hit the same deadlock the sweep avoids (see `PrecapturePhase`).
+        // Exercise decode before the unified peak sample. PerToken first captures
+        // every retained graph into this one buffer set so their cumulative
+        // residency remains live under the later eager/unified probes. Skip this
+        // for uncompiled-group models; the unified sample below bounds their KV.
+        // TP stays eager because its ranks profile independently.
         if self.config.decode_group_is_compiled() {
+            let graph_plan = DecodeGraphPlan::new(decode_bufs.policy_at_construction);
+            if self.enable_cuda_graph
+                && self.tensor_parallel.world_size == 1
+                && graph_plan.requires_cumulative_profile()
+            {
+                for graph_rows in graph_plan.retained_buckets() {
+                    anyhow::ensure!(
+                        graph_rows <= profile_decode_rows,
+                        "retained decode Graph bucket {graph_rows} exceeds profile row capacity \
+                        {profile_decode_rows}"
+                    );
+                    self.batch_decode(
+                        &decode_tokens[..graph_rows],
+                        &decode_views[..graph_rows],
+                        &decode_adapters[..graph_rows],
+                        kv_buffer.buffer(),
+                        &layout,
+                        decode_bufs,
+                        DecodeGraphUse::Serve,
+                    )?;
+                    self.ctx.sync()?;
+                    mark_peak()?;
+                }
+            }
+
             let graph_use = if self.tensor_parallel.world_size > 1 {
-                crate::batch_decode::DecodeGraphUse::Eager
+                DecodeGraphUse::Eager
             } else {
-                crate::batch_decode::DecodeGraphUse::Serve
+                DecodeGraphUse::Serve
             };
             self.batch_decode(
                 &decode_tokens,

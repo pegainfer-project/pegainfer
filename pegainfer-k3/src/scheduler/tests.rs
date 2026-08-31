@@ -8,6 +8,9 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -24,10 +27,13 @@ use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use super::DecodeSlot;
+use super::K3CpGang;
+use super::K3CpServing;
 use super::K3SchedulerConfig;
 use super::SlotId;
 use super::StepExecutor;
 use super::start_with_executors;
+use crate::executor::cp::K3CpGroup;
 
 const EOS_TOKEN: u32 = 99;
 
@@ -179,6 +185,7 @@ fn launch(executor: FakeExecutor) -> (LiveScheduler, StepCollector) {
     let config = K3SchedulerConfig {
         eos_token_ids: vec![EOS_TOKEN],
         kv_capacity: None,
+        cp: None,
     };
     partition(start_with_executors(vec![executor], &config))
 }
@@ -510,6 +517,306 @@ fn decode_failure_fails_the_batch_and_the_scheduler_keeps_serving() {
         matches!(terminal, Terminal::Finished { .. }),
         "{terminal:?}"
     );
+}
+
+// ── CP gang protocol ────────────────────────────────────────────────────
+//
+// These tests pin the gang's one hard invariant on a fake EP world: every
+// partition enters `prefill_cp` for a job at the same launch count, without
+// anyone ever waiting quietly. The world models the mega launches' two-sided
+// pairing — a step completes only once every partition has launched a step
+// with the same index — with a timeout panic standing in for the device
+// watchdog, so a protocol regression fails as a deadlock report, not a hang.
+
+const CP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The shared fake EP world: per-partition launch counts plus the protocol
+/// log the assertions read.
+struct CpWorld {
+    counts: Vec<AtomicU64>,
+    /// Partitions whose scheduler thread has exited (executor dropped) — a
+    /// gone peer no longer holds back anyone's step pairing. This is where
+    /// the model is kinder than the device: a real EP rank that stops
+    /// launching wedges its peers in the mega kernel until the watchdog
+    /// fires. The flag only lets the *teardown* of a passed test drain;
+    /// while a test runs, every live partition must keep pairing.
+    finished: Vec<AtomicBool>,
+    /// Per job (keyed by the prompt's first token): each partition's launch
+    /// count on entering `prefill_cp`.
+    entries: Mutex<HashMap<u32, Vec<(usize, u64)>>>,
+    /// Per partition: job keys in execution order.
+    orders: Mutex<Vec<Vec<u32>>>,
+}
+
+impl CpWorld {
+    fn new(size: usize) -> Arc<Self> {
+        Arc::new(Self {
+            counts: (0..size).map(|_| AtomicU64::new(0)).collect(),
+            finished: (0..size).map(|_| AtomicBool::new(false)).collect(),
+            entries: Mutex::new(HashMap::new()),
+            orders: Mutex::new(vec![Vec::new(); size]),
+        })
+    }
+
+    /// Launch one step as `partition` and wait for it to pair: blocks until
+    /// every live peer has launched a step with the same index.
+    fn step(&self, partition: usize) {
+        self.burst(partition, 1);
+    }
+
+    /// Launch `n` steps back-to-back, waiting only for the last to pair —
+    /// the way a local multi-chunk prefill queues its whole ladder before
+    /// its one sync. This is the cross-partition skew the leveling loop
+    /// must absorb.
+    fn burst(&self, partition: usize, n: u64) {
+        let count = self.counts[partition].fetch_add(n, Ordering::SeqCst) + n;
+        let deadline = Instant::now() + CP_TIMEOUT;
+        loop {
+            let paired = self.counts.iter().zip(&self.finished).all(|(peer, gone)| {
+                peer.load(Ordering::SeqCst) >= count || gone.load(Ordering::SeqCst)
+            });
+            if paired {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition {partition} deadlocked: step {count} never paired"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Wait until every partition has logged its `prefill_cp` entry for
+    /// `key` — the stand-in for the chunk step's exchange windows, which no
+    /// member leaves before the whole gang has arrived.
+    fn await_gang(&self, key: u32, size: usize) {
+        let deadline = Instant::now() + CP_TIMEOUT;
+        loop {
+            if self.entries.lock().expect("entry log")[&key].len() == size {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gang for job {key} never fully entered prefill_cp"
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// One partition of the fake world. Every stepping method launches through
+/// [`CpWorld::step`], so the scheduler's own cadence (decode padding, gang
+/// pumps, the chunk step) is what drives the pairing.
+struct FakeCpExecutor {
+    world: Arc<CpWorld>,
+    partition: usize,
+}
+
+impl Drop for FakeCpExecutor {
+    fn drop(&mut self) {
+        self.world.finished[self.partition].store(true, Ordering::SeqCst);
+    }
+}
+
+impl StepExecutor for FakeCpExecutor {
+    fn max_batch(&self) -> usize {
+        2
+    }
+
+    fn max_context_tokens(&self) -> usize {
+        4096
+    }
+
+    fn prefill(&mut self, _slot: SlotId, prompt: &[u32], _params: &SamplingParams) -> Result<u32> {
+        anyhow::ensure!(
+            prompt.len() < 32,
+            "a CP-eligible prompt of {} tokens took the local prefill path",
+            prompt.len()
+        );
+        self.world.burst(self.partition, 4);
+        Ok(500)
+    }
+
+    fn decode(&mut self, batch: &[DecodeSlot]) -> Result<Vec<u32>> {
+        self.world.step(self.partition);
+        Ok(vec![7; batch.len()])
+    }
+
+    fn prefill_cp(
+        &mut self,
+        _slot: SlotId,
+        prompt: &[u32],
+        group: &Arc<K3CpGroup>,
+        cp_rank: usize,
+    ) -> Result<Option<u32>> {
+        let key = prompt[0];
+        {
+            let mut entries = self.world.entries.lock().expect("entry log");
+            entries.entry(key).or_default().push((
+                self.partition,
+                self.world.counts[self.partition].load(Ordering::SeqCst),
+            ));
+            self.world.orders.lock().expect("order log")[self.partition].push(key);
+        }
+        self.world.await_gang(key, group.cp_size());
+        self.world.step(self.partition);
+        Ok((cp_rank == group.cp_size() - 1).then_some(1000 + key))
+    }
+
+    fn pump_step(&mut self) -> Result<()> {
+        self.world.step(self.partition);
+        Ok(())
+    }
+
+    fn step_count(&self) -> u64 {
+        self.world.counts[self.partition].load(Ordering::SeqCst)
+    }
+
+    fn release(&mut self, _slot: SlotId) {}
+}
+
+/// A `size`-partition engine over one fake world, CP lane armed.
+fn launch_cp(size: usize) -> (Arc<CpWorld>, Vec<(LiveScheduler, StepCollector)>) {
+    let world = CpWorld::new(size);
+    let executors = (0..size)
+        .map(|partition| FakeCpExecutor {
+            world: Arc::clone(&world),
+            partition,
+        })
+        .collect();
+    let config = K3SchedulerConfig {
+        eos_token_ids: vec![EOS_TOKEN],
+        kv_capacity: None,
+        cp: Some(K3CpServing {
+            gang: K3CpGang::new(K3CpGroup::new(size).expect("CP group")),
+            min_tokens: 32,
+            chunk_tokens: 4096,
+        }),
+    };
+    let mut engine = start_with_executors(executors, &config);
+    let partitions = engine
+        .schedulers
+        .drain(..)
+        .map(|mut scheduler| {
+            let steps = scheduler
+                .handle
+                .take_steps()
+                .expect("a fresh scheduler yields its step stream once");
+            (scheduler, StepCollector::new(steps))
+        })
+        .collect();
+    (world, partitions)
+}
+
+/// A CP-eligible request whose prompt is keyed by its first token.
+fn cp_request(key: u32, max_tokens: usize) -> Request {
+    Request {
+        prompt_tokens: vec![key; 60],
+        ..request(0, max_tokens)
+    }
+}
+
+#[test]
+fn cp_gang_enters_prefill_cp_at_one_launch_count() {
+    let (world, mut partitions) = launch_cp(3);
+
+    let control = partitions[0].0.handle.submit(cp_request(5, 2));
+    let (tokens, terminal) = partitions[0].1.collect_terminal(control.id());
+    assert_eq!(
+        tokens,
+        vec![1005, 7],
+        "the owner streams the boundary token, then decodes"
+    );
+    assert!(
+        matches!(
+            terminal,
+            Terminal::Finished {
+                reason: FinishReason::Length,
+                completion_tokens: 2,
+                ..
+            }
+        ),
+        "{terminal:?}"
+    );
+
+    let entries = world.entries.lock().expect("entry log");
+    let job = &entries[&5];
+    assert_eq!(job.len(), 3, "every partition ran the job exactly once");
+    assert!(
+        job.iter().all(|&(_, count)| count == job[0].1),
+        "the gang must enter prefill_cp at one launch count: {job:?}"
+    );
+
+    for (partition, _) in partitions.drain(..) {
+        drop(partition.handle);
+        partition.join.join().expect("scheduler thread exits");
+    }
+}
+
+#[test]
+fn concurrent_cp_posters_run_in_one_order_on_every_partition() {
+    let (world, mut partitions) = launch_cp(3);
+
+    // Two posters race: whatever order the board assigns, every partition
+    // must execute the jobs in that same order — interleaved gangs would
+    // cross their exchange windows.
+    let first = partitions[0].0.handle.submit(cp_request(5, 1));
+    let second = partitions[1].0.handle.submit(cp_request(6, 1));
+    let (tokens, _) = partitions[0].1.collect_terminal(first.id());
+    assert_eq!(tokens, vec![1005]);
+    let (tokens, _) = partitions[1].1.collect_terminal(second.id());
+    assert_eq!(tokens, vec![1006]);
+
+    {
+        let entries = world.entries.lock().expect("entry log");
+        for key in [5, 6] {
+            let job = &entries[&key];
+            assert_eq!(job.len(), 3);
+            assert!(
+                job.iter().all(|&(_, count)| count == job[0].1),
+                "job {key} entered unlevel: {job:?}"
+            );
+        }
+        let orders = world.orders.lock().expect("order log");
+        assert!(
+            orders.iter().all(|order| *order == orders[0]),
+            "partitions disagree on the job order: {orders:?}"
+        );
+    }
+
+    for (partition, _) in partitions.drain(..) {
+        drop(partition.handle);
+        partition.join.join().expect("scheduler thread exits");
+    }
+}
+
+#[test]
+fn a_local_prefill_burst_does_not_unlevel_the_gang() {
+    let (world, mut partitions) = launch_cp(3);
+
+    // Partition 0 runs a local multi-chunk prefill — a 4-launch burst that
+    // puts it several launches ahead — while partition 1 posts a gang job.
+    // The laggards must pump up to the burst's count before anyone computes.
+    let local = partitions[0].0.handle.submit(request(4, 1));
+    let gang = partitions[1].0.handle.submit(cp_request(5, 1));
+    let (tokens, _) = partitions[0].1.collect_terminal(local.id());
+    assert_eq!(tokens, vec![500]);
+    let (tokens, _) = partitions[1].1.collect_terminal(gang.id());
+    assert_eq!(tokens, vec![1005]);
+
+    let entries = world.entries.lock().expect("entry log");
+    let job = &entries[&5];
+    assert_eq!(job.len(), 3);
+    assert!(
+        job.iter().all(|&(_, count)| count == job[0].1),
+        "the gang entered unlevel across a local burst: {job:?}"
+    );
+    drop(entries);
+
+    for (partition, _) in partitions.drain(..) {
+        drop(partition.handle);
+        partition.join.join().expect("scheduler thread exits");
+    }
 }
 
 #[test]

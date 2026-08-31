@@ -5,31 +5,30 @@ mod config;
 #[cfg(any(feature = "gemma4", test))]
 mod manifest;
 pub mod model_line;
+#[cfg(any(feature = "gemma4", test))]
+mod nvfp4;
 mod probe;
 // The engine is the live consumer; the oracles reach the rest, so an
 // `expect(dead_code)` cannot hold in every build.
 #[cfg(feature = "gemma4")]
 mod engine;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod forward;
 #[cfg(feature = "gemma4")]
 mod green_ctx;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod kv;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod layer;
+#[cfg(feature = "gemma4")]
+mod moe;
 #[cfg(feature = "gemma4")]
 mod prefix_cache;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod serve;
 #[cfg(all(test, feature = "gemma4"))]
 mod testkit;
 #[cfg(feature = "gemma4")]
-#[allow(dead_code)]
 mod weights;
 
 use std::path::Path;

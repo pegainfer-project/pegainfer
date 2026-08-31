@@ -321,7 +321,7 @@ impl Qwen35TpExecutor {
                 model_path,
                 ModelRuntimeConfig {
                     enable_cuda_graph: false,
-                    tensor_parallel: Some(TensorParallelConfig { rank, world_size }),
+                    tensor_parallel: Some(TensorParallelConfig::try_from((rank, world_size))?),
                     device_ordinal,
                 },
             )?);

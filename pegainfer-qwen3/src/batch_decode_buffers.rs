@@ -15,9 +15,10 @@ use pegainfer_kv_cache::KvView;
 use crate::split_kv::SplitKvConfig;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
-/// Based on vLLM's cudagraph capture list up to 256; graphs are captured lazily per
-/// bucket, and activation buffers are shared (sized once at the largest bucket), so
-/// extra buckets cost capture time on first hit, not memory.
+/// Based on vLLM's CUDA Graph capture list up to 256. Activation buffers are shared
+/// at the largest size, but every captured `(bucket, attention path)` owns an
+/// independently resident graph executable. The diagnostic PerToken policy
+/// therefore retains graphs only through bucket 32.
 ///
 /// Buckets 8/16 are viable only because decode GEMMs at N <= GEMM_LT_MAX_N run
 /// tuned cublasLt algos: cuBLAS's GemmEx heuristic skips split-K for batch in
@@ -27,6 +28,7 @@ pub(crate) const BATCH_BUCKETS: &[usize] = &[
     1, 2, 4, 8, 16, 20, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152,
     160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
+
 const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // Split-KV decode attention: the non-partitioned kernel issues one CTA per
 // (request x kv-head), starving SMs at small batch. The path is therefore

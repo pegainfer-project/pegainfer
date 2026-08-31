@@ -5,7 +5,7 @@
 [files]
 extend-exclude = [
   "pegainfer-kernels/third_party/",
-  "pegainfer-kernels/csrc/kimi_k2/vllm_marlin/",
+  "pegainfer-kernels/csrc/marlin/vllm_marlin/",
   "**/*.cubin",
   "Cargo.lock",
 ]

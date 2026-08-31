@@ -46,7 +46,16 @@ pub(crate) fn k3_decode_step(
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
 ) -> Result<()> {
-    k3_step(ctx, model, shape, K3StepMode::Decode, state, scratch, None)
+    k3_step(
+        ctx,
+        model,
+        shape,
+        K3StepMode::Decode,
+        state,
+        scratch,
+        None,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

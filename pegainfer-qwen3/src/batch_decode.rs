@@ -5,6 +5,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
+use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::tensor::KvDim;
 use pegainfer_kernels::tensor::QDim;
 use pegainfer_kv_cache::KvView;
@@ -59,6 +60,75 @@ pub(crate) enum DecodeGraphUse {
     Replay,
 }
 
+/// Largest batch bucket for which the diagnostic PerToken policy retains a
+/// CUDA Graph. PerToken records one GEMM node per row, so each additional
+/// bucket has a growing, independently resident graph executable.
+const PERTOKEN_GRAPH_MAX_BUCKET: usize = 32;
+
+/// Canonical CUDA Graph coverage and dispatch policy for decode.
+///
+/// Serving and memory profiling both consume this plan so the profiler reserves
+/// every retained PerToken full-SM graph covered by the runtime policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DecodeGraphPlan {
+    policy: NumericPolicy,
+}
+
+impl DecodeGraphPlan {
+    pub(crate) const fn new(policy: NumericPolicy) -> Self {
+        Self { policy }
+    }
+
+    const fn allows_bucket(self, bucket: usize) -> bool {
+        !matches!(self.policy, NumericPolicy::PerToken) || bucket <= PERTOKEN_GRAPH_MAX_BUCKET
+    }
+
+    pub(crate) const fn requires_cumulative_profile(self) -> bool {
+        matches!(self.policy, NumericPolicy::PerToken)
+    }
+
+    pub(crate) fn retained_buckets(self) -> impl Iterator<Item = usize> {
+        BATCH_BUCKETS
+            .iter()
+            .copied()
+            .filter(move |&bucket| self.allows_bucket(bucket))
+    }
+
+    fn resolve(
+        self,
+        graph_use: DecodeGraphUse,
+        graphs_available: bool,
+        batch_size: usize,
+    ) -> Result<Option<usize>> {
+        if !graphs_available {
+            anyhow::ensure!(
+                matches!(graph_use, DecodeGraphUse::Serve | DecodeGraphUse::Eager),
+                "batch_decode {graph_use:?} requires CUDA graph enabled and no LoRA rows"
+            );
+            return Ok(None);
+        }
+        if graph_use == DecodeGraphUse::Eager {
+            return Ok(None);
+        }
+
+        let bucket = bucket_for(batch_size);
+        if self.allows_bucket(bucket) {
+            return Ok(Some(bucket));
+        }
+
+        match graph_use {
+            DecodeGraphUse::Serve => Ok(None),
+            DecodeGraphUse::CaptureOnly | DecodeGraphUse::Replay => {
+                anyhow::bail!(
+                    "batch_decode {graph_use:?} requested PerToken CUDA Graph bucket {bucket} \
+                    above cap {PERTOKEN_GRAPH_MAX_BUCKET}"
+                )
+            }
+            DecodeGraphUse::Eager => unreachable!("handled above"),
+        }
+    }
+}
+
 impl Qwen3Model {
     /// Batch decode step: N requests, 1 new token each, one forward pass.
     ///
@@ -90,17 +160,14 @@ impl Qwen3Model {
         let lora_slots = self.decode_lora_slots(lora_adapters)?;
         let use_lora = lora_slots.is_some();
         let graphs_available = self.enable_cuda_graph && lora_slots.is_none();
-        anyhow::ensure!(
-            graphs_available || matches!(graph_use, DecodeGraphUse::Serve | DecodeGraphUse::Eager),
-            "batch_decode {graph_use:?} requires CUDA graphs enabled and no LoRA rows"
-        );
-        let use_cuda_graph = graphs_available && graph_use != DecodeGraphUse::Eager;
+        let graph_plan = DecodeGraphPlan::new(bufs.policy_at_construction);
+        let graph_bucket = graph_plan.resolve(graph_use, graphs_available, bs)?;
 
         // Derive positions from views (seq_len - 1 = position of the new token)
         let mut positions: Vec<i32> = kv_views.iter().map(|v| (v.seq_len() - 1) as i32).collect();
 
         // Pad to bucket size for CUDA Graph stability
-        let padded_bs = if use_cuda_graph { bucket_for(bs) } else { bs };
+        let padded_bs = graph_bucket.unwrap_or(bs);
 
         // Set batch size on all buffers (padded — kernels run at bucket width)
         bufs.set_batch_size(padded_bs);
@@ -129,8 +196,12 @@ impl Qwen3Model {
             BatchDecodeBuffers::attention_path(padded_bs, bufs.policy_at_construction);
         #[cfg(feature = "kernel-call-trace")]
         let trace_kv_len = kv_views.iter().map(KvView::seq_len).max().unwrap_or(0);
-        if use_cuda_graph {
-            let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
+
+        if let Some(bucket) = graph_bucket {
+            let bucket_idx = BATCH_BUCKETS
+                .iter()
+                .position(|&candidate| candidate == bucket)
+                .expect("resolved graph bucket must exist in BATCH_BUCKETS");
             let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);
             // Override-stream captures use the split cache; full-SM captures use the normal cache.
             let on_split_stream = pegainfer_kernels::tensor::has_stream_override();
@@ -157,7 +228,7 @@ impl Qwen3Model {
                 DecodeGraphUse::Serve => graph.run_or_capture(&self.ctx, kernels),
                 DecodeGraphUse::CaptureOnly => graph.capture_only(&self.ctx, kernels),
                 DecodeGraphUse::Replay => graph.launch_captured(&self.ctx),
-                DecodeGraphUse::Eager => unreachable!("use_cuda_graph excludes Eager"),
+                DecodeGraphUse::Eager => unreachable!("graph_bucket excludes Eager"),
             };
             if on_split_stream {
                 bufs.graphs_split = graphs;

@@ -134,11 +134,11 @@ THREADS = 256
 B_BUCKETS = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128]
 
 # Prefill chunk buckets: the chunked-prefill step runs the same batched
-# families at chunk width, up to the MegaMoE protocol maximum (4224 rows).
+# families at chunk width, up to the MegaMoE protocol maximum (16896 rows).
 # Every family gets the extended ladder except `kda_core` — chunks cross the
 # KDA recurrence through FlashKDA, so the fused core only ever sees decode
 # buckets. Mirrors `K3_PREFILL_BUCKETS` in `ops/k3_tilelang.rs`.
-B_PREFILL_BUCKETS = [256, 512, 1024, 2048, 4224]
+B_PREFILL_BUCKETS = [256, 512, 1024, 2048, 4224, 8448, 16896]
 B_CHUNK_BUCKETS = B_BUCKETS + B_PREFILL_BUCKETS
 
 

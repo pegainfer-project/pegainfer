@@ -46,14 +46,14 @@ pub const K3_BATCH_BUCKETS: [usize; 10] = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128];
 
 /// Prefill chunk buckets: the chunked-prefill step runs the same batched
 /// families at chunk width, whose ceiling is the MegaMoE protocol maximum
-/// (4224 rows). Compiled for every family except `kda_core` — chunks cross
+/// (16896 rows). Compiled for every family except `kda_core` — chunks cross
 /// the KDA recurrence through FlashKDA, so the fused core never sees a
 /// chunk-sized bucket.
-pub const K3_PREFILL_BUCKETS: [usize; 5] = [256, 512, 1024, 2048, 4224];
+pub const K3_PREFILL_BUCKETS: [usize; 7] = [256, 512, 1024, 2048, 4224, 8448, 16896];
 
 /// The largest prefill chunk any configuration can run — the MegaMoE
 /// protocol maximum (`k3_mega_max_tokens_per_rank`).
-pub const K3_MAX_CHUNK: usize = 4224;
+pub const K3_MAX_CHUNK: usize = 16896;
 /// Largest bucket, i.e. the row capacity every reusable buffer should have.
 pub const K3_MAX_BATCH: usize = 128;
 

@@ -22,6 +22,7 @@ use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::engine::panic_message;
 use pegainfer_frontend::sampler::SamplingParams;
+use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kv_cache::KvBlockGuard;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvCacheManager;
@@ -1108,6 +1109,25 @@ struct VllmCompatState {
     consecutive_miss_windows: u32,
 }
 
+fn ensure_pertoken_single_gpu(policy: NumericPolicy, device_count: usize) -> Result<()> {
+    anyhow::ensure!(
+        policy != NumericPolicy::PerToken || device_count <= 1,
+        "NumericPolicy::PerToken is only supported on the single-GPU path; got {device_count} devices"
+    );
+    Ok(())
+}
+
+fn ensure_pertoken_overlap_disabled(
+    policy: NumericPolicy,
+    overlap: crate::DecodeOverlap,
+) -> Result<()> {
+    anyhow::ensure!(
+        policy != NumericPolicy::PerToken || matches!(overlap, crate::DecodeOverlap::Off),
+        "NumericPolicy::PerToken is not compatible with decode-overlap: PerToken CUDA-Graph memory is budgeted only for the full-SM graph cache"
+    );
+    Ok(())
+}
+
 impl Qwen3Executor {
     pub(crate) fn dump_decode_graph_png(&self, png_path: &Path) -> Result<CudaGraphDumpSummary> {
         self.primary.dump_decode_graph_png(png_path.to_path_buf())
@@ -1293,6 +1313,28 @@ impl Qwen3Executor {
              shards KV per rank); got {} devices",
             device_ordinals.len()
         );
+        let policy = pegainfer_kernels::ops::numeric_policy();
+        ensure_pertoken_single_gpu(policy, device_ordinals.len())?;
+        ensure_pertoken_overlap_disabled(policy, decode_overlap)?;
+
+        if policy == NumericPolicy::PerToken {
+            if enable_cuda_graph {
+                let max_graph_bucket = crate::batch_decode::DecodeGraphPlan::new(policy)
+                    .retained_buckets()
+                    .last()
+                    .expect("BATCH_BUCKETS is non-empty");
+                log::info!(
+                    "PerToken decode graph policy: eligible non-LoRA buckets <= \
+                    {max_graph_bucket} use lazy CUDA Graph capture/replay; larger \
+                    buckets execute eagerly"
+                );
+            } else {
+                log::info!(
+                    "PerToken decode graph policy: CUDA Graph disabled; all decode \
+                    buckets execute eagerly"
+                );
+            }
+        }
         if device_ordinals.len() == 1 {
             let model = Qwen3Model::from_safetensors_with_runtime(
                 model_path,
@@ -1616,6 +1658,10 @@ impl Qwen3Executor {
                 || matches!(overlap, crate::DecodeOverlap::Off),
             "--batch-invariant (NumericPolicy::Pin) is not compatible with decode-overlap: the stream override would force the pinned GEMM to bail at runtime"
         );
+        // PerToken profiles only the full-SM graph cache. Overlap captures into
+        // the independent split-stream cache, which would otherwise be unbudgeted.
+        ensure_pertoken_overlap_disabled(pegainfer_kernels::ops::numeric_policy(), overlap)?;
+
         // Overlap's split-concurrent decode stream uses the group-limited decode
         // kernel this GQA group can't instantiate; reject at load, not mid-serving.
         anyhow::ensure!(

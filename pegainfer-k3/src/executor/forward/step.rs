@@ -69,12 +69,14 @@ use super::super::buffers::K3LayerState;
 use super::super::buffers::K3Scratch;
 use super::super::buffers::K3StatePool;
 use super::super::buffers::parity_pair;
+use super::super::cp::K3CpScratch;
 use super::super::paged_kv::K3_KV_PAGE_TOKENS;
 use super::super::paged_kv::K3_MLA_LATENT_ROW;
 use super::super::paged_kv::K3PagedKv;
 use super::decode::kda_attention;
 use super::gemm::k3_gemm_full;
 use super::prefill::kda_attention_chunk;
+use super::prefill::mla_attention_chunk_cp;
 use super::prefill::mla_attention_chunk_fmha;
 use crate::config::K3_ATTN_INNER;
 use crate::config::K3_DENSE_INTERMEDIATE;
@@ -191,6 +193,7 @@ pub(crate) struct K3AuxSink<'a> {
     pub(crate) taps: &'a [usize],
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn k3_step(
     ctx: &DeviceContext,
     model: &K3RankModel,
@@ -199,6 +202,7 @@ pub(super) fn k3_step(
     state: &mut K3StatePool,
     scratch: &mut K3Scratch,
     mut aux: Option<K3AuxSink<'_>>,
+    mut cp: Option<&mut K3CpScratch>,
 ) -> Result<()> {
     let b = shape.bucket;
     let K3StatePool {
@@ -298,14 +302,33 @@ pub(super) fn k3_step(
                         state_row: 0,
                         parity: shape.parity,
                     }];
-                    kda_attention_chunk(ctx, shape, layer, kda, kda_state, &chunk, scratch)?;
+                    kda_attention_chunk(
+                        ctx,
+                        shape,
+                        layer,
+                        kda,
+                        kda_state,
+                        &chunk,
+                        scratch,
+                        cp.as_deref_mut(),
+                    )?;
                 }
                 K3StepMode::Verify(groups) => {
-                    kda_attention_chunk(ctx, shape, layer, kda, kda_state, groups, scratch)?;
+                    kda_attention_chunk(ctx, shape, layer, kda, kda_state, groups, scratch, None)?;
                 }
             },
             (K3LayerAttention::Mla(mla), K3LayerState::Mla) => {
-                mla_attention(ctx, shape, mode, layer, mla, kv, mla_index, scratch)?;
+                mla_attention(
+                    ctx,
+                    shape,
+                    mode,
+                    layer,
+                    mla,
+                    kv,
+                    mla_index,
+                    scratch,
+                    cp.as_deref_mut(),
+                )?;
                 mla_index += 1;
             }
             _ => anyhow::bail!("K3 layer state does not match the layer's attention kind"),
@@ -510,6 +533,7 @@ fn mla_attention(
     kv: &mut K3PagedKv,
     mla_index: usize,
     s: &mut K3Scratch,
+    cp: Option<&mut K3CpScratch>,
 ) -> Result<()> {
     let b = shape.bucket;
     k3_rms_norm_rbs_batched_launch(
@@ -606,7 +630,13 @@ fn mla_attention(
         // aligned causal FMHA serves every chunk query. Only the paged latent
         // persists. Padding rows of `attn` keep stale (finite) data; their
         // results are discarded like everywhere else in the chunk path.
-        mla_attention_chunk_fmha(ctx, shape, w, kv, mla_index, s)?;
+        // Under CP the gather is replaced by assembly from the gang's
+        // published latents; the FMHA is the same call.
+        if let Some(cp) = cp {
+            mla_attention_chunk_cp(ctx, shape, w, kv, mla_index, s, cp)?;
+        } else {
+            mla_attention_chunk_fmha(ctx, shape, w, kv, mla_index, s)?;
+        }
     } else {
         // Absorbed MLA over the paged latent: the kernel folds `w_kv_b`'s
         // per-head W_UK into the query and expands the attended latent with

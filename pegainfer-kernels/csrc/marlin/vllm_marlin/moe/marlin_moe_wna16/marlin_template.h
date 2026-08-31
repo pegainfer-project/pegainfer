@@ -53,7 +53,8 @@ template <typename scalar_t,  // compute dtype, half or nv_float16
           const bool has_act_order,  // whether act_order is enabled
           const int group_blocks,    // number of consecutive 16x16 blocks
                                      // with a separate quantization scale
-          const bool is_zp_float     // is zero point of float16 type?
+          const bool is_zp_float,    // is zero point of float16 type?
+          const bool whole_k_stripes
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -246,7 +247,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool whole_k_stripes
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -416,6 +418,11 @@ __global__ void Marlin(
       iters = (group_blocks / thread_k_blocks) *
               div_ceil(iters, (group_blocks / thread_k_blocks));
     }
+  }
+
+  // Whole-K stripes make accumulation order independent of grid partitioning.
+  if constexpr (whole_k_stripes) {
+    iters = k_tiles * div_ceil(iters, k_tiles);
   }
 
   int slice_row = 0;

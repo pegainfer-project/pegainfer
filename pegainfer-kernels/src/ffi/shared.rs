@@ -24,11 +24,71 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn rms_norm_batched_dual_cuda(
+        x: *const Half,
+        weight_a: *const Half,
+        weight_b: *const Half,
+        out_a: *mut Half,
+        out_b: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale_a: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dual_rms_norm_add_batched_cuda(
+        a: *const Half,
+        weight_a: *const Half,
+        b: *const Half,
+        weight_b: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_rms_norm_round_batched_cuda(
+        x: *const Half,
+        weight_post: *const Half,
+        res_in: *const Half,
+        weight_pre: *const Half,
+        residual_out: *mut Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_scale_batched_cuda(
+        x: *const Half,
+        weight: *const Half,
+        residual: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn add_cuda(
         a: *const Half,
         b: *const Half,
         out: *mut Half,
         n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn advance_decode_metadata_cuda(
+        positions: *mut i32,
+        local_last: *mut i32,
+        pseudo_last: *mut i32,
+        kv_chunk: *mut i32,
+        rows: i32,
+        factor: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -143,6 +203,15 @@ unsafe extern "C" {
         buf: *mut Half,
         cap: f32,
         n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn suppress_logits_bf16_in_place_cuda(
+        logits: *mut Half,
+        ids: *const u32,
+        vocab: i32,
+        rows: i32,
+        id_count: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -261,6 +330,28 @@ unsafe extern "C" {
         ldb: i32,
         stride_b: i64,
         c: *mut Half,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    /// cuBLAS `cublasGemmStridedBatchedEx` (f32 in/out, f32 compute). `beta`
+    /// selects overwrite (0.0) vs accumulate-into-C (1.0).
+    pub fn gemm_strided_batched_f32_cuda(
+        op_a: i32,
+        op_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const f32,
+        lda: i32,
+        stride_a: i64,
+        b: *const f32,
+        ldb: i32,
+        stride_b: i64,
+        beta: f32,
+        c: *mut f32,
         ldc: i32,
         stride_c: i64,
         batch_count: i32,

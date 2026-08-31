@@ -17,6 +17,10 @@ Last touched: 2026-08.
 | `short` | 9 | yes | the compact multi-token case — causal masking and non-zero positions are live from two tokens on |
 | `edge` | 1024 | no | the widest prefill that evicts nothing, at exactly `sliding_window` |
 
+No gate reads the probe activations any more: the layer-probe comparison ran a test-only second
+implementation of the decoder layers, and it went when that implementation did. The probes stay in
+the fixture and in the dumper, so a future per-layer gate needs no re-dump.
+
 Global layers have no `v_proj` — the value is the `k_proj` output on its scale-free branch — so
 `single` exercises `k_proj` too. The window edge is 1024 rather than 1023, measured rather than
 read off the mask: changing token 0 still moves the last position of layer 0's output at 1023 and
@@ -147,6 +151,43 @@ all three. The long-context gate additionally requires its Transformers release 
 fixture's, because it borrows that fixture's floor. **Transformers 5.11.0** is verified to load `gemma4_unified`; the
 checkpoint declares `5.10.0.dev0`, a development build that was never released, so the pin is the
 release that was tested rather than a guess at what that build became.
+
+## Running the gates these fixtures serve
+
+The gates that consume them are `#[ignore]`: they need the checkpoint and a device, so CI only
+compiles them. `scripts/gemma4_gates.sh` runs them:
+
+```bash
+PEGAINFER_TEST_MODEL_PATH=<12b-checkpoint> \
+  PEGAINFER_NVFP4_MODEL=<26b-checkpoint> \
+  PEGAINFER_GATE_GPU=<index-or-UUID> scripts/gemma4_gates.sh [name-filter]
+```
+
+An unfiltered run owns both checkpoint-backed suites. The sync/lane parity, ragged graph/eager
+parity and shared/green lifecycle gates run once with the dense checkpoint and once with the routed
+checkpoint; the runner binds `PEGAINFER_TEST_MODEL_PATH` to the selected profile for each process.
+Fixture-backed and raised-context gates remain dense-only. A filter requires the inputs declared by
+all execution profiles selected for that gate.
+
+The isolated routed-block diagnostic uses the 26B checkpoint separately:
+
+```bash
+PEGAINFER_NVFP4_MODEL=<26b-checkpoint> \
+  PEGAINFER_GATE_GPU=<index-or-UUID> \
+  scripts/gemma4_gates.sh the_routed_block_matches_the_reference_formulas
+```
+
+This diagnostic localizes router, expert GEMM, and combine errors; it is not a serving E2E.
+
+It refuses to start when the checkpoint, a fixture, the pinned metadata or a device is missing,
+holds the crate's ignored set against the gate list it carries — so a gate cannot leave the suite
+unnoticed — and runs one gate per process. For a GPU-backed selection it resolves the requested
+device to its stable UUID, exports that UUID as the sole `CUDA_VISIBLE_DEVICES` entry, and holds a
+non-blocking cross-process lock on it until the suite exits. Lock contention refuses the run before
+the first gate; when no selector is supplied the runner uses an existing single-device
+`CUDA_VISIBLE_DEVICES`, then physical device 0. This ownership and one-process execution are not
+stylistic choices: repeated checkpoint loads inside one test binary exhaust a 48 GiB device, while two
+runners sharing a card can fail each other's gates on allocation rather than on any assertion.
 
 ## Why hooks rather than `output_hidden_states`
 

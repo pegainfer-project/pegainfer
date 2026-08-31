@@ -17,17 +17,6 @@ pub(crate) enum LayerKind {
     Global,
 }
 
-#[cfg(all(feature = "gemma4", test))]
-pub(crate) fn first_last(layer_types: &[LayerKind], kind: LayerKind) -> Option<(usize, usize)> {
-    let mut matching = layer_types
-        .iter()
-        .enumerate()
-        .filter(|(_, k)| **k == kind)
-        .map(|(index, _)| index);
-    let first = matching.next()?;
-    Some((first, matching.next_back().unwrap_or(first)))
-}
-
 /// What the manifest is derived from. Only [`Gemma4Config::from_file`] is
 /// probe-backed; a value built directly is not, so consumers check what they
 /// depend on.
@@ -47,8 +36,10 @@ pub(crate) struct Gemma4Config {
     pub(crate) global_head_dim: usize,
     pub(crate) layer_types: Vec<LayerKind>,
     pub(crate) tie_word_embeddings: bool,
-    /// The MoE size keeps its dense MLP and adds experts alongside it.
-    pub(crate) moe_enabled: bool,
+    /// Present on the size that routes: it keeps its dense MLP and adds
+    /// experts alongside it. The dimensions travel with the flag so that
+    /// "routing, but we do not know how wide" is not a state.
+    pub(crate) moe: Option<MoeConfig>,
     pub(crate) rms_norm_eps: f32,
     /// The sliding-attention rope theta; the global family reads its own.
     pub(crate) sliding_rope_theta: f32,
@@ -64,6 +55,30 @@ pub(crate) struct Gemma4Config {
     /// The checkpoint's own position limit — the ceiling a raised serving
     /// context may not pass.
     pub(crate) max_position_embeddings: usize,
+}
+
+/// The routed half of a MoE layer. The dense MLP beside it keeps using
+/// [`Gemma4Config::intermediate_size`]; experts have their own width.
+#[cfg_attr(not(feature = "gemma4"), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MoeConfig {
+    pub(crate) num_experts: usize,
+    pub(crate) top_k: usize,
+    pub(crate) intermediate_size: usize,
+}
+
+#[cfg(feature = "gemma4")]
+impl MoeConfig {
+    fn from_text_config(tc: &serde_json::Value) -> Result<Option<Self>> {
+        if !bool_field(tc, "enable_moe_block")? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            num_experts: usize_field(tc, "num_experts")?,
+            top_k: usize_field(tc, "top_k_experts")?,
+            intermediate_size: usize_field(tc, "moe_intermediate_size")?,
+        }))
+    }
 }
 
 #[cfg(feature = "gemma4")]
@@ -162,7 +177,7 @@ impl Gemma4Config {
             global_head_dim,
             layer_types,
             tie_word_embeddings: bool_field(tc, "tie_word_embeddings")?,
-            moe_enabled: bool_field(tc, "enable_moe_block")?,
+            moe: MoeConfig::from_text_config(tc)?,
             rms_norm_eps: f32_field(tc, "text_config", "rms_norm_eps")?,
             sliding_rope_theta,
             sliding_window,

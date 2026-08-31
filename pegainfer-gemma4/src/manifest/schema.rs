@@ -4,10 +4,17 @@ use std::collections::HashMap;
 use std::fmt;
 
 use anyhow::Result;
+use safetensors::Dtype;
 
 use super::EXPECTED_DTYPE;
 use crate::config::Gemma4Config;
 use crate::config::LayerKind;
+use crate::config::MoeConfig;
+
+/// Two NVFP4 values share a byte.
+const FP4_PER_BYTE: usize = 2;
+/// One block scale per this many values along the reduction axis.
+const FP4_GROUP: usize = 16;
 
 /// Every text tensor lives here, which is what keeps the modality skip list
 /// from shadowing a required one.
@@ -34,6 +41,47 @@ pub(crate) struct AttentionTensors {
     pub(crate) k_norm: Vector1d,
 }
 
+/// A tensor the checkpoint stores in something other than the model dtype.
+/// The dense schema implies bf16 everywhere; the routed experts do not, so
+/// they carry their own.
+pub(crate) struct TypedTensor {
+    pub(crate) name: String,
+    pub(crate) shape: ExpectedShape,
+    pub(crate) dtype: Dtype,
+}
+
+/// One projection of one expert, stored as NVFP4: packed values, an e4m3
+/// block scale per [`FP4_GROUP`] of them along the reduction axis, a
+/// tensor-level scale, and the activation scale a W4A4 kernel would consume.
+pub(crate) struct QuantMatrix {
+    pub(crate) weight: TypedTensor,
+    pub(crate) weight_scale: TypedTensor,
+    pub(crate) weight_scale_2: TypedTensor,
+    pub(crate) input_scale: TypedTensor,
+}
+
+pub(crate) struct ExpertTensors {
+    pub(crate) gate: QuantMatrix,
+    pub(crate) up: QuantMatrix,
+    pub(crate) down: QuantMatrix,
+}
+
+pub(crate) struct RouterTensors {
+    pub(crate) proj: Matrix2d,
+    pub(crate) scale: Vector1d,
+    pub(crate) per_expert_scale: Vector1d,
+}
+
+/// What a routed layer carries beyond the dense schema. The dense MLP stays
+/// where it is: this size keeps it and adds these alongside.
+pub(crate) struct MoeTensors {
+    pub(crate) pre_feedforward_layernorm_2: Vector1d,
+    pub(crate) post_feedforward_layernorm_1: Vector1d,
+    pub(crate) post_feedforward_layernorm_2: Vector1d,
+    pub(crate) router: RouterTensors,
+    pub(crate) experts: Vec<ExpertTensors>,
+}
+
 pub(crate) struct MlpTensors {
     pub(crate) gate: Matrix2d,
     pub(crate) up: Matrix2d,
@@ -48,6 +96,8 @@ pub(crate) struct LayerTensors {
     pub(crate) layer_scalar: Vector1d,
     pub(crate) attention: AttentionTensors,
     pub(crate) mlp: MlpTensors,
+    /// Present only on the routing size.
+    pub(crate) moe: Option<MoeTensors>,
 }
 
 pub(crate) struct Manifest {
@@ -56,26 +106,35 @@ pub(crate) struct Manifest {
     pub(crate) layers: Vec<LayerTensors>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ExpectedShape {
-    Matrix { rows: usize, cols: usize },
-    Vector { len: usize },
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExpectedShape {
+    Matrix {
+        rows: usize,
+        cols: usize,
+    },
+    Vector {
+        len: usize,
+    },
+    /// Rank zero, which the quantization scales are stored as.
+    Scalar,
 }
 
 impl ExpectedShape {
-    pub(super) fn matches(self, shape: &[usize]) -> bool {
+    pub(crate) fn matches(self, shape: &[usize]) -> bool {
         match self {
             Self::Matrix { rows, cols } => shape == [rows, cols],
             Self::Vector { len } => shape == [len],
+            Self::Scalar => shape.is_empty(),
         }
     }
 
-    fn checked_bytes(self) -> Option<usize> {
+    fn checked_bytes(self, dtype: Dtype) -> Option<usize> {
         let elements = match self {
             Self::Matrix { rows, cols } => rows.checked_mul(cols)?,
             Self::Vector { len } => len,
+            Self::Scalar => 1,
         };
-        elements.checked_mul(EXPECTED_DTYPE.bitsize() / 8)
+        elements.checked_mul(dtype.bitsize() / 8)
     }
 }
 
@@ -84,6 +143,7 @@ impl fmt::Display for ExpectedShape {
         match self {
             Self::Matrix { rows, cols } => write!(f, "[{rows}, {cols}]"),
             Self::Vector { len } => write!(f, "[{len}]"),
+            Self::Scalar => write!(f, "[]"),
         }
     }
 }
@@ -114,12 +174,6 @@ impl Vector1d {
 impl Manifest {
     pub(crate) fn from_config(config: &Gemma4Config) -> Result<Self> {
         anyhow::ensure!(
-            !config.moe_enabled,
-            "Gemma 4: this checkpoint enables the MoE block. Its decoder layers keep their dense \
-             MLP and add routed experts, a router and three more norm sites on top; the loader \
-             describes only the dense schema, so it cannot name what those layers also carry"
-        );
-        anyhow::ensure!(
             config.tie_word_embeddings,
             "Gemma 4: this checkpoint unties the LM head, which the loader has no tensor name for; \
              every published size ties it to the input embedding"
@@ -142,12 +196,15 @@ impl Manifest {
         })
     }
 
-    pub(super) fn expected_shapes(&self) -> HashMap<&str, ExpectedShape> {
-        fn matrix(m: &Matrix2d) -> (&str, ExpectedShape) {
-            (m.name.as_str(), m.expected())
+    pub(super) fn expected_tensors(&self) -> HashMap<&str, (ExpectedShape, Dtype)> {
+        fn matrix(m: &Matrix2d) -> (&str, (ExpectedShape, Dtype)) {
+            (m.name.as_str(), (m.expected(), EXPECTED_DTYPE))
         }
-        fn vector(v: &Vector1d) -> (&str, ExpectedShape) {
-            (v.name.as_str(), v.expected())
+        fn vector(v: &Vector1d) -> (&str, (ExpectedShape, Dtype)) {
+            (v.name.as_str(), (v.expected(), EXPECTED_DTYPE))
+        }
+        fn typed(t: &TypedTensor) -> (&str, (ExpectedShape, Dtype)) {
+            (t.name.as_str(), (t.shape, t.dtype))
         }
         let mut out = HashMap::new();
         out.extend([matrix(&self.embed_tokens), vector(&self.norm)]);
@@ -168,7 +225,23 @@ impl Manifest {
                 matrix(&layer.mlp.down),
             ]);
             if let Some(v_proj) = &layer.attention.v_proj {
-                out.insert(v_proj.name.as_str(), v_proj.expected());
+                out.extend([matrix(v_proj)]);
+            }
+            let Some(moe) = &layer.moe else {
+                continue;
+            };
+            out.extend([
+                vector(&moe.pre_feedforward_layernorm_2),
+                vector(&moe.post_feedforward_layernorm_1),
+                vector(&moe.post_feedforward_layernorm_2),
+                matrix(&moe.router.proj),
+                vector(&moe.router.scale),
+                vector(&moe.router.per_expert_scale),
+            ]);
+            for expert in &moe.experts {
+                for projection in [&expert.gate, &expert.up, &expert.down] {
+                    out.extend(projection.tensors().map(typed));
+                }
             }
         }
         out
@@ -176,14 +249,118 @@ impl Manifest {
 
     /// Before any allocator rounding.
     pub(crate) fn weight_bytes(&self) -> Result<usize> {
-        self.expected_shapes()
+        self.expected_tensors()
             .values()
-            .try_fold(0usize, |total, shape| {
+            .try_fold(0usize, |total, (shape, dtype)| {
                 shape
-                    .checked_bytes()
+                    .checked_bytes(*dtype)
                     .and_then(|bytes| total.checked_add(bytes))
             })
             .ok_or_else(|| anyhow::anyhow!("Gemma 4: the manifest's total size overflows usize"))
+    }
+}
+
+impl QuantMatrix {
+    /// `reduction` is the axis the block scales run along, in logical values.
+    fn new(prefix: &str, rows: usize, reduction: usize) -> Result<Self> {
+        anyhow::ensure!(
+            reduction.is_multiple_of(FP4_GROUP),
+            "Gemma 4: '{prefix}' reduces over {reduction} values, which is not a whole number of \
+             {FP4_GROUP}-value scale blocks, so the checkpoint's scale shape cannot be derived"
+        );
+        let packed = ExpectedShape::Matrix {
+            rows,
+            cols: reduction / FP4_PER_BYTE,
+        };
+        let scales = ExpectedShape::Matrix {
+            rows,
+            cols: reduction / FP4_GROUP,
+        };
+        Ok(Self {
+            weight: TypedTensor {
+                name: format!("{prefix}.weight"),
+                shape: packed,
+                dtype: Dtype::U8,
+            },
+            weight_scale: TypedTensor {
+                name: format!("{prefix}.weight_scale"),
+                shape: scales,
+                dtype: Dtype::F8_E4M3,
+            },
+            weight_scale_2: TypedTensor {
+                name: format!("{prefix}.weight_scale_2"),
+                shape: ExpectedShape::Scalar,
+                dtype: Dtype::F32,
+            },
+            input_scale: TypedTensor {
+                name: format!("{prefix}.input_scale"),
+                shape: ExpectedShape::Scalar,
+                dtype: Dtype::F32,
+            },
+        })
+    }
+
+    /// Rows, and the logical values each row holds before packing.
+    pub(crate) fn geometry(&self) -> Result<(usize, usize)> {
+        match self.weight.shape {
+            ExpectedShape::Matrix { rows, cols } => Ok((rows, cols * FP4_PER_BYTE)),
+            other => anyhow::bail!(
+                "Gemma 4: '{}' is {other}, which is not a packed matrix",
+                self.weight.name
+            ),
+        }
+    }
+
+    fn tensors(&self) -> [&TypedTensor; 4] {
+        [
+            &self.weight,
+            &self.weight_scale,
+            &self.weight_scale_2,
+            &self.input_scale,
+        ]
+    }
+}
+
+impl MoeTensors {
+    fn new(prefix: &str, hidden: usize, moe: &MoeConfig) -> Result<Self> {
+        let width = moe.intermediate_size;
+        let experts = (0..moe.num_experts)
+            .map(|expert| {
+                let at = format!("{prefix}experts.{expert}");
+                Ok(ExpertTensors {
+                    gate: QuantMatrix::new(&format!("{at}.gate_proj"), width, hidden)?,
+                    up: QuantMatrix::new(&format!("{at}.up_proj"), width, hidden)?,
+                    down: QuantMatrix::new(&format!("{at}.down_proj"), hidden, width)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            pre_feedforward_layernorm_2: Vector1d::new(
+                format!("{prefix}pre_feedforward_layernorm_2.weight"),
+                hidden,
+            ),
+            post_feedforward_layernorm_1: Vector1d::new(
+                format!("{prefix}post_feedforward_layernorm_1.weight"),
+                hidden,
+            ),
+            post_feedforward_layernorm_2: Vector1d::new(
+                format!("{prefix}post_feedforward_layernorm_2.weight"),
+                hidden,
+            ),
+            router: RouterTensors {
+                proj: Matrix2d::new(
+                    format!("{prefix}router.proj.weight"),
+                    moe.num_experts,
+                    hidden,
+                ),
+                scale: Vector1d::new(format!("{prefix}router.scale"), hidden),
+                per_expert_scale: Vector1d::new(
+                    format!("{prefix}router.per_expert_scale"),
+                    moe.num_experts,
+                ),
+            },
+            experts,
+        })
     }
 }
 
@@ -252,13 +429,17 @@ impl LayerTensors {
                     config.intermediate_size,
                 ),
             },
+            moe: config
+                .moe
+                .map(|moe| MoeTensors::new(&prefix, hidden, &moe))
+                .transpose()?,
         })
     }
 }
 
 /// Two sliding layers and one global, at the published 12B dimensions.
 #[cfg(test)]
-pub(super) fn sample_config() -> Gemma4Config {
+pub(crate) fn sample_config() -> Gemma4Config {
     Gemma4Config {
         hidden_size: 3840,
         intermediate_size: 15360,
@@ -270,7 +451,7 @@ pub(super) fn sample_config() -> Gemma4Config {
         global_head_dim: 512,
         layer_types: vec![LayerKind::Sliding, LayerKind::Sliding, LayerKind::Global],
         tie_word_embeddings: true,
-        moe_enabled: false,
+        moe: None,
         rms_norm_eps: 1e-6,
         sliding_rope_theta: 10_000.0,
         sliding_window: 1024,
@@ -307,13 +488,90 @@ mod tests {
         assert_eq!(global.q_norm.len, 512);
     }
 
-    #[test]
-    fn moe_and_untied_configs_are_rejected_before_any_tensor_is_named() {
-        let mut moe = config();
-        moe.moe_enabled = true;
-        let err = rejection(&moe);
-        assert!(err.contains("MoE block"), "{err}");
+    /// The published 26B dimensions, so the shapes below are the ones its
+    /// checkpoint actually carries.
+    fn moe_config() -> Gemma4Config {
+        let mut config = config();
+        config.hidden_size = 2816;
+        config.intermediate_size = 2112;
+        config.moe = Some(MoeConfig {
+            num_experts: 128,
+            top_k: 8,
+            intermediate_size: 704,
+        });
+        config
+    }
 
+    #[test]
+    fn routed_layers_name_their_experts_at_the_packed_shapes() {
+        let manifest = Manifest::from_config(&moe_config()).unwrap();
+        let moe = manifest.layers[0].moe.as_ref().expect("layer 0 routes");
+        assert_eq!(moe.experts.len(), 128);
+        assert_eq!(
+            moe.router.proj.name,
+            "model.language_model.layers.0.router.proj.weight"
+        );
+        assert_eq!((moe.router.proj.rows, moe.router.proj.cols), (128, 2816));
+        assert_eq!(moe.router.per_expert_scale.len, 128);
+        assert_eq!(moe.router.scale.len, 2816);
+
+        let gate = &moe.experts[0].gate;
+        assert_eq!(
+            gate.weight.name,
+            "model.language_model.layers.0.experts.0.gate_proj.weight"
+        );
+        // Two values to a byte, one e4m3 scale to sixteen.
+        assert_eq!(
+            gate.weight.shape,
+            ExpectedShape::Matrix {
+                rows: 704,
+                cols: 1408
+            }
+        );
+        assert_eq!(gate.weight.dtype, Dtype::U8);
+        assert_eq!(
+            gate.weight_scale.shape,
+            ExpectedShape::Matrix {
+                rows: 704,
+                cols: 176
+            }
+        );
+        assert_eq!(gate.weight_scale.dtype, Dtype::F8_E4M3);
+        assert_eq!(gate.weight_scale_2.shape, ExpectedShape::Scalar);
+        assert_eq!(gate.weight_scale_2.dtype, Dtype::F32);
+
+        // down reduces over the expert width instead of the hidden size.
+        let down = &moe.experts[0].down;
+        assert_eq!(
+            down.weight.shape,
+            ExpectedShape::Matrix {
+                rows: 2816,
+                cols: 352
+            }
+        );
+        assert_eq!(
+            down.weight_scale.shape,
+            ExpectedShape::Matrix {
+                rows: 2816,
+                cols: 44
+            }
+        );
+
+        // The dense MLP stays beside the experts, unquantized.
+        let dense = &manifest.layers[0].mlp;
+        assert_eq!((dense.gate.rows, dense.gate.cols), (2112, 2816));
+    }
+
+    #[test]
+    fn a_reduction_that_is_not_whole_scale_blocks_is_refused() {
+        let mut ragged = moe_config();
+        ragged.hidden_size = 2810;
+        let err = rejection(&ragged);
+        assert!(err.contains("scale blocks"), "{err}");
+    }
+
+    #[test]
+    fn an_untied_config_is_rejected_before_any_tensor_is_named() {
         let mut untied = config();
         untied.tie_word_embeddings = false;
         let err = rejection(&untied);

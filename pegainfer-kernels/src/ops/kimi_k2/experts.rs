@@ -11,7 +11,6 @@ use crate::tensor::AxisSpec;
 use crate::tensor::DeviceContext;
 use crate::tensor::GpuTensor;
 #[cfg(test)]
-use crate::tensor::KernelCall;
 #[cfg(test)]
 use crate::tensor::TensorSpec;
 
@@ -510,7 +509,6 @@ pub struct KimiMarlinRouteWorkspace {
     expert_ids: CudaSlice<i32>,
     num_tokens_post_padded: CudaSlice<i32>,
     expert_offsets: CudaSlice<u32>,
-    expert_cursor: CudaSlice<u32>,
     max_active_tokens: usize,
     max_padded_tokens: usize,
     pub max_m_blocks: usize,
@@ -533,7 +531,6 @@ impl KimiMarlinRouteWorkspace {
             expert_ids: ctx.stream.alloc_zeros(max_m_blocks)?,
             num_tokens_post_padded: ctx.stream.alloc_zeros(1)?,
             expert_offsets: ctx.stream.alloc_zeros(KIMI_K2_LOCAL_EXPERTS + 1)?,
-            expert_cursor: ctx.stream.alloc_zeros(KIMI_K2_LOCAL_EXPERTS)?,
             max_active_tokens,
             max_padded_tokens,
             max_m_blocks,
@@ -582,12 +579,6 @@ impl KimiMarlinRouteWorkspace {
             "expert_offsets len must be {}, got {}",
             KIMI_K2_LOCAL_EXPERTS + 1,
             self.expert_offsets.len()
-        );
-        ensure!(
-            self.expert_cursor.len() == KIMI_K2_LOCAL_EXPERTS,
-            "expert_cursor len must be {}, got {}",
-            KIMI_K2_LOCAL_EXPERTS,
-            self.expert_cursor.len()
         );
         ensure!(
             self.topk == KIMI_K2_TOPK && self.local_experts == KIMI_K2_LOCAL_EXPERTS,
@@ -706,62 +697,14 @@ impl KimiMarlinWna16Workspace {
 }
 
 pub struct KimiMarlinRouting<'a> {
-    // Read only by the test-only `manifest_call`; kept as manifest metadata.
-    #[allow(dead_code)]
-    batch_size: usize,
     active_tokens: usize,
     pub route_elems: usize,
-    // Read only by the test-only `manifest_call`.
-    #[allow(dead_code)]
-    global_expert_start: usize,
     block_size: usize,
     max_padded_tokens: usize,
     pub max_m_blocks: usize,
     sorted_token_ids: &'a CudaSlice<i32>,
     expert_ids: &'a CudaSlice<i32>,
     pub num_tokens_post_padded: &'a CudaSlice<i32>,
-}
-
-impl KimiMarlinRouting<'_> {
-    #[must_use]
-    #[cfg(test)]
-    fn manifest_call(&self) -> KernelCall {
-        KernelCall::new(
-            "kimi_k2.moe.marlin_align_block_size",
-            "Kimi-K2 vLLM Marlin WNA16 route alignment metadata",
-        )
-        .output(
-            "sorted_token_ids",
-            TensorSpec::named(
-                "i32",
-                "marlin_sorted_route_ids_padded",
-                [AxisSpec::named("max_padded_tokens", self.max_padded_tokens)],
-            ),
-        )
-        .output(
-            "expert_ids",
-            TensorSpec::named(
-                "i32",
-                "marlin_expert_id_per_m_block",
-                [AxisSpec::named("max_m_blocks", self.max_m_blocks)],
-            ),
-        )
-        .output(
-            "num_tokens_post_padded",
-            TensorSpec::named("i32", "scalar_device", [AxisSpec::named("value", 1)]),
-        )
-        .attr("batch_size", self.batch_size.to_string())
-        .attr("active_tokens", self.active_tokens.to_string())
-        .attr("route_elems", self.route_elems.to_string())
-        .attr("topk", KIMI_K2_TOPK.to_string())
-        .attr("local_experts", KIMI_K2_LOCAL_EXPERTS.to_string())
-        .attr("global_expert_start", self.global_expert_start.to_string())
-        .attr("block_size", self.block_size.to_string())
-        .attr("sentinel_token_id", self.route_elems.to_string())
-        .attr("device_resident_metadata", "true".to_string())
-        .attr("decode_step_allocation", "forbidden".to_string())
-        .attr("decode_step_d2h", "forbidden".to_string())
-    }
 }
 
 pub fn kimi_moe_marlin_align_block_size<'a>(
@@ -812,7 +755,6 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
         let (num_tokens_ptr, _num_tokens_guard) =
             workspace.num_tokens_post_padded.device_ptr_mut(&ctx.stream);
         let (offsets_ptr, _offsets_guard) = workspace.expert_offsets.device_ptr_mut(&ctx.stream);
-        let (cursor_ptr, _cursor_guard) = workspace.expert_cursor.device_ptr_mut(&ctx.stream);
         let result = unsafe {
             ffi::kimi_moe_marlin_align_block_size_cuda(
                 topk_ptr as *const i32,
@@ -820,7 +762,7 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
                 expert_ids_ptr as *mut i32,
                 num_tokens_ptr as *mut i32,
                 offsets_ptr as *mut u32,
-                cursor_ptr as *mut u32,
+                std::ptr::null_mut(),
                 active_tokens as i32,
                 KIMI_K2_TOPK as i32,
                 global_expert_start as i32,
@@ -834,10 +776,8 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
         result.result()?;
     }
     Ok(KimiMarlinRouting {
-        batch_size,
         active_tokens,
         route_elems,
-        global_expert_start,
         block_size: workspace.block_size,
         max_padded_tokens: workspace.max_padded_tokens,
         max_m_blocks: workspace.max_m_blocks,
@@ -1311,10 +1251,8 @@ pub fn kimi_deepep_build_marlin_routing_on_stream<'a>(
     }
 
     Ok(KimiMarlinRouting {
-        batch_size: tight_max,
         active_tokens: tight_max,
         route_elems: tight_max,
-        global_expert_start: 0,
         block_size,
         max_padded_tokens: tight_max,
         max_m_blocks: tight_m_blocks,
@@ -1641,90 +1579,115 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "H20-only: verifies vLLM Marlin WNA16 route alignment metadata on device"]
-    fn h20_kimi_marlin_align_block_size_matches_vllm_contract() {
+    #[ignore = "requires a CUDA GPU"]
+    fn kimi_marlin_align_boundary_matches_vllm_contract() {
+        const BATCH_SIZE: usize = 16;
+        const BLOCK_SIZE: usize = 8;
+        const GLOBAL_START: usize = 96;
+        const SMALL_PATH_ROUTES: usize = 1016;
+        const LARGE_PATH_ROUTES: usize = 1024;
+        const LOCAL_GROUP_A: usize = 13;
+        const LOCAL_GROUP_B: usize = 17;
+        const LOCAL_GROUP_C: usize = KIMI_K2_LOCAL_EXPERTS - LOCAL_GROUP_A - LOCAL_GROUP_B;
+        const BELOW_GROUP: usize = 32;
+        const ABOVE_GROUP: usize = 64;
+        const STRIDE_B: usize = 3;
+        const STRIDE_C: usize = 5;
+        const STRIDE_ABOVE: usize = 7;
+
         let ctx = crate::tensor::DeviceContext::new().expect("CUDA context");
-        let batch_size = 4usize;
-        let active_tokens = 7usize;
-        let block_size = 8usize;
-        let global_start = 96usize;
-        let topk = KIMI_K2_TOPK;
-        let route_elems = active_tokens * topk;
-        let topk_host = vec![
-            96, 97, 12, 143, 144, 98, 380, 99, 97, 96, 100, 101, 102, 103, 104, 105, 106, 107, 108,
-            109, 110, 111, 112, 113, 96, 96, 96, 96, 96, 96, 96, 96, 120, 121, 122, 123, 124, 125,
-            126, 127, 143, 143, 143, 143, 143, 143, 143, 143, 0, 383, 95, 144, 145, 146, 147, 148,
-        ];
-        assert_eq!(topk_host.len(), route_elems);
-
-        let topk_dev = ctx.stream.clone_htod(&topk_host).expect("topk H2D");
         let mut workspace =
-            KimiMarlinRouteWorkspace::new(&ctx, active_tokens, block_size).expect("workspace");
-        let routing = kimi_moe_marlin_align_block_size(
-            &ctx,
-            &mut workspace,
-            &topk_dev,
-            batch_size,
-            active_tokens,
-            global_start,
-        )
-        .expect("align");
-
-        let num_tokens = ctx
-            .stream
-            .clone_dtoh(routing.num_tokens_post_padded)
-            .expect("num_tokens D2H");
-        let total = usize::try_from(num_tokens[0]).expect("nonnegative padded tokens");
-        assert!(total.is_multiple_of(block_size));
-
-        let sorted = ctx
-            .stream
-            .clone_dtoh(routing.sorted_token_ids)
-            .expect("sorted D2H");
-        let expert_ids = ctx
-            .stream
-            .clone_dtoh(routing.expert_ids)
-            .expect("expert_ids D2H");
-
-        let mut expected_sorted = Vec::<i32>::new();
-        let mut expected_expert_ids = Vec::<i32>::new();
-        let sentinel = i32::try_from(route_elems).expect("route sentinel");
-        for local_expert in 0..KIMI_K2_LOCAL_EXPERTS {
-            let global_expert = global_start + local_expert;
-            let mut routes = topk_host
-                .iter()
-                .enumerate()
-                .filter(|&(_, &expert)| usize::try_from(expert).ok() == Some(global_expert))
-                .map(|(route_offset, _)| i32::try_from(route_offset).expect("route offset"))
+            KimiMarlinRouteWorkspace::new(&ctx, LARGE_PATH_ROUTES / KIMI_K2_TOPK, BLOCK_SIZE)
+                .expect("workspace");
+        let first_non_local = GLOBAL_START + KIMI_K2_LOCAL_EXPERTS;
+        for route_elems in [SMALL_PATH_ROUTES, LARGE_PATH_ROUTES] {
+            let active_tokens = route_elems / KIMI_K2_TOPK;
+            let topk_host = (0..active_tokens)
+                .flat_map(|token| {
+                    [
+                        GLOBAL_START + token % LOCAL_GROUP_A,
+                        token % BELOW_GROUP,
+                        GLOBAL_START + LOCAL_GROUP_A + (token * STRIDE_B) % LOCAL_GROUP_B,
+                        first_non_local + token % ABOVE_GROUP,
+                        GLOBAL_START
+                            + LOCAL_GROUP_A
+                            + LOCAL_GROUP_B
+                            + (token * STRIDE_C) % LOCAL_GROUP_C,
+                        BELOW_GROUP + (token * STRIDE_B) % BELOW_GROUP,
+                        first_non_local + ABOVE_GROUP + (token * STRIDE_ABOVE) % ABOVE_GROUP,
+                        2 * BELOW_GROUP + (token * STRIDE_C) % BELOW_GROUP,
+                    ]
+                    .map(|expert| i32::try_from(expert).expect("expert id"))
+                })
                 .collect::<Vec<_>>();
-            if routes.is_empty() {
-                continue;
+            assert_eq!(topk_host.len(), route_elems);
+
+            let topk_dev = ctx.stream.clone_htod(&topk_host).expect("topk H2D");
+            let (num_tokens, sorted, expert_ids) = {
+                let routing = kimi_moe_marlin_align_block_size(
+                    &ctx,
+                    &mut workspace,
+                    &topk_dev,
+                    BATCH_SIZE,
+                    active_tokens,
+                    GLOBAL_START,
+                )
+                .expect("align");
+                let num_tokens = ctx
+                    .stream
+                    .clone_dtoh(routing.num_tokens_post_padded)
+                    .expect("num_tokens D2H");
+                let sorted = ctx
+                    .stream
+                    .clone_dtoh(routing.sorted_token_ids)
+                    .expect("sorted D2H");
+                let expert_ids = ctx
+                    .stream
+                    .clone_dtoh(routing.expert_ids)
+                    .expect("expert_ids D2H");
+                (num_tokens, sorted, expert_ids)
+            };
+            let expert_offsets = ctx
+                .stream
+                .clone_dtoh(&workspace.expert_offsets)
+                .expect("expert_offsets D2H");
+            let total = usize::try_from(num_tokens[0]).expect("nonnegative padded tokens");
+            assert!(total.is_multiple_of(BLOCK_SIZE));
+
+            let mut expected_sorted = Vec::<i32>::new();
+            let mut expected_expert_ids = Vec::<i32>::new();
+            let mut expected_offsets = Vec::<u32>::with_capacity(KIMI_K2_LOCAL_EXPERTS + 1);
+            let sentinel = i32::try_from(route_elems).expect("route sentinel");
+            for local_expert in 0..KIMI_K2_LOCAL_EXPERTS {
+                expected_offsets.push(u32::try_from(expected_sorted.len()).expect("expert offset"));
+                let global_expert = GLOBAL_START + local_expert;
+                let mut routes = topk_host
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &expert)| usize::try_from(expert).ok() == Some(global_expert))
+                    .map(|(route_offset, _)| i32::try_from(route_offset).expect("route offset"))
+                    .collect::<Vec<_>>();
+                if routes.is_empty() {
+                    continue;
+                }
+                let padded = routes.len().div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
+                expected_expert_ids.extend(std::iter::repeat_n(
+                    i32::try_from(local_expert).expect("local expert"),
+                    padded / BLOCK_SIZE,
+                ));
+                routes.extend(std::iter::repeat_n(sentinel, padded - routes.len()));
+                expected_sorted.extend(routes);
             }
-            let padded = routes.len().div_ceil(block_size) * block_size;
-            expected_expert_ids.extend(std::iter::repeat_n(
-                i32::try_from(local_expert).expect("local expert"),
-                padded / block_size,
-            ));
-            routes.extend(std::iter::repeat_n(sentinel, padded - routes.len()));
-            expected_sorted.extend(routes);
+            expected_offsets.push(u32::try_from(expected_sorted.len()).expect("padded total"));
+
+            assert_eq!(total, expected_sorted.len());
+            assert_eq!(&sorted[..total], expected_sorted.as_slice());
+            assert_eq!(
+                &expert_ids[..expected_expert_ids.len()],
+                expected_expert_ids.as_slice()
+            );
+            assert_eq!(expert_offsets, expected_offsets);
         }
-
-        assert_eq!(total, expected_sorted.len());
-        assert_eq!(&sorted[..total], expected_sorted.as_slice());
-        assert_eq!(
-            &expert_ids[..expected_expert_ids.len()],
-            expected_expert_ids.as_slice()
-        );
-
-        let call = routing.manifest_call();
-        let attrs: std::collections::HashMap<&str, &str> = call
-            .attrs
-            .iter()
-            .map(|a| (a.name.as_str(), a.value.as_str()))
-            .collect();
-        assert_eq!(attrs.get("device_resident_metadata"), Some(&"true"));
-        assert_eq!(attrs.get("decode_step_d2h"), Some(&"forbidden"));
-        assert_eq!(attrs.get("sentinel_token_id"), Some(&"56"));
     }
 
     #[test]

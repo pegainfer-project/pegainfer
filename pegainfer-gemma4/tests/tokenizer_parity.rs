@@ -1,15 +1,14 @@
-//! Parity against a Hugging Face reference dumped by
+//! Chat-render parity against a Hugging Face reference dumped by
 //! `tools/accuracy/dump_gemma4_tokenizer_golden.py`. Point
-//! `OPENINFER_TEST_MODEL_PATH` at the pinned 12B checkpoint the reference was
-//! dumped from and run with `--ignored`; the file-hash guard binds the suite to
+//! `PEGAINFER_TEST_MODEL_PATH` at the pinned 12B checkpoint the reference was
+//! dumped from and run with `--ignored`; the file-hash guard binds it to
 //! exactly that checkpoint.
 //!
-//! Both sides tokenize with the same `tokenizers` crate, so the token-id tests
-//! gate the Python wrapper's behaviour and version skew, not the tokenization
-//! algorithm. The render test compares two different Jinja implementations and
-//! carries the weight here.
-
-mod common;
+//! Only the render comparison lives here, because only it compares two
+//! implementations: minijinja against the reference's Jinja2. The token-id
+//! comparisons that used to sit alongside it ran the same `tokenizers` crate on
+//! both sides, so they gated the Python wrapper's version skew rather than
+//! anything this repository decides.
 
 use serde_json::Value;
 use sha2::Digest;
@@ -36,8 +35,8 @@ fn golden() -> Value {
 }
 
 fn model_path() -> String {
-    std::env::var("OPENINFER_TEST_MODEL_PATH").expect(
-        "OPENINFER_TEST_MODEL_PATH must point at the pinned 12B Gemma 4 checkpoint \
+    std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
+        "PEGAINFER_TEST_MODEL_PATH must point at the pinned 12B Gemma 4 checkpoint \
          the reference was dumped from",
     )
 }
@@ -68,85 +67,6 @@ fn assert_checkpoint_matches_reference(golden: &Value) {
              ({actual} vs {expected}); this suite runs against that checkpoint only"
         );
     }
-}
-
-fn expected_ids(value: &Value, key: &str) -> Vec<u32> {
-    value[key]
-        .as_array()
-        .unwrap_or_else(|| panic!("golden entry missing {key}"))
-        .iter()
-        .map(|id| {
-            u32::try_from(id.as_u64().expect("token id must be a number"))
-                .expect("token id must fit u32")
-        })
-        .collect()
-}
-
-#[test]
-#[ignore = "requires the pinned 12B Gemma 4 checkpoint via OPENINFER_TEST_MODEL_PATH"]
-fn probe_ids_match_hf_reference() {
-    let golden = golden();
-    assert_checkpoint_matches_reference(&golden);
-    let tokenizer = common::load_tokenizer(&model_path());
-    let mut mismatches = Vec::new();
-
-    for probe in golden["probes"].as_array().expect("golden probes") {
-        let name = probe["name"].as_str().expect("probe name");
-        let text = probe["text"].as_str().expect("probe text");
-        for (key, add_specials) in [("ids_plain", false), ("ids_with_specials", true)] {
-            let expected = expected_ids(probe, key);
-            let actual = tokenizer
-                .encode(text, add_specials)
-                .unwrap_or_else(|err| panic!("encode failed for {name}/{key}: {err}"));
-            if actual != expected {
-                mismatches.push(format!(
-                    "{name}/{key}: expected {expected:?}, got {actual:?}"
-                ));
-            }
-        }
-    }
-
-    assert!(
-        mismatches.is_empty(),
-        "{} of {} probe encodings disagree with the reference:\n{}",
-        mismatches.len(),
-        golden["probes"].as_array().map_or(0, Vec::len) * 2,
-        mismatches.join("\n")
-    );
-}
-
-#[test]
-#[ignore = "requires the pinned 12B Gemma 4 checkpoint via OPENINFER_TEST_MODEL_PATH"]
-fn special_token_ids_match_hf_reference() {
-    let golden = golden();
-    assert_checkpoint_matches_reference(&golden);
-    let tokenizer = common::load_tokenizer(&model_path());
-    let specials = golden["special_tokens"]
-        .as_object()
-        .expect("golden special_tokens");
-    let mut mismatches = Vec::new();
-
-    for (name, entry) in specials {
-        let token = entry["token"].as_str().expect("special token text");
-        let expected = u32::try_from(entry["id"].as_u64().expect("special token id"))
-            .expect("special token id must fit u32");
-        let actual = tokenizer
-            .encode(token, false)
-            .unwrap_or_else(|err| panic!("encode failed for {name}: {err}"));
-        if actual != vec![expected] {
-            mismatches.push(format!(
-                "{name} ({token}): expected [{expected}], got {actual:?}"
-            ));
-        }
-    }
-
-    assert!(
-        mismatches.is_empty(),
-        "{} of {} special tokens disagree with the reference:\n{}",
-        mismatches.len(),
-        specials.len(),
-        mismatches.join("\n")
-    );
 }
 
 fn chat_request(case: &Value) -> ChatRequest {
@@ -187,7 +107,7 @@ fn chat_request(case: &Value) -> ChatRequest {
 /// selects the parts form for this template, which renders system turns
 /// differently — see docs/models/gemma4/tokenizer.md.
 #[test]
-#[ignore = "requires the pinned 12B Gemma 4 checkpoint via OPENINFER_TEST_MODEL_PATH"]
+#[ignore = "requires the pinned 12B checkpoint"]
 fn string_form_chat_renders_match_hf_reference() {
     let golden = golden();
     assert_checkpoint_matches_reference(&golden);
