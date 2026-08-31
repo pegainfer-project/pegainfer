@@ -19,6 +19,7 @@
 
 #include "common.cuh"
 #include "ffi_guard.cuh"
+#include "qk_prep.cuh"
 
 #define HD256_PLAIN 256
 #define THREADS_HD256_PLAIN 256
@@ -28,17 +29,6 @@ __device__ __forceinline__ __nv_bfloat16 rms_norm_elem_hd256_plain(
     __nv_bfloat16 x, float rms_inv, __nv_bfloat16 weight) {
     float w = __bfloat162float(weight);
     return __float2bfloat16(__bfloat162float(x) * rms_inv * w);
-}
-
-__device__ __forceinline__ void apply_rope_pair_hd256_plain(
-    __nv_bfloat16& x0, __nv_bfloat16& x1,
-    __nv_bfloat16 cos_val, __nv_bfloat16 sin_val) {
-    float fx0 = __bfloat162float(x0);
-    float fx1 = __bfloat162float(x1);
-    float fc = __bfloat162float(cos_val);
-    float fs = __bfloat162float(sin_val);
-    x0 = __float2bfloat16(fx0 * fc - fx1 * fs);
-    x1 = __float2bfloat16(fx0 * fs + fx1 * fc);
 }
 
 __global__ void qk_norm_rope_prefill_hd256_plain_kernel(
@@ -105,7 +95,7 @@ __global__ void qk_norm_rope_prefill_hd256_plain_kernel(
     if (d < half_rotary) {
         __nv_bfloat16 lo = smem[d];
         __nv_bfloat16 hi = smem[d + half_rotary];
-        apply_rope_pair_hd256_plain(
+        apply_rope_pair(
             lo,
             hi,
             cos_cache[pos * rotary_dim + d],
@@ -132,23 +122,6 @@ __global__ void qk_norm_rope_prefill_hd256_plain_kernel(
             k_batch_out[dst + d] = smem[d];
         }
     }
-}
-
-__device__ __forceinline__ int64_t paged_kv_offset_hd256_plain(
-    int page_id,
-    int64_t block_offset_elems,
-    int64_t stride_page,
-    int page_size,
-    int num_kv_heads,
-    int pos,
-    int kv_head,
-    int d) {
-    int offset_in_page = pos % page_size;
-    return static_cast<int64_t>(page_id) * stride_page
-        + block_offset_elems
-        + static_cast<int64_t>(offset_in_page) * num_kv_heads * HD256_PLAIN
-        + static_cast<int64_t>(kv_head) * HD256_PLAIN
-        + d;
 }
 
 // Paged serving prep. grid.y carries three bands: [0, num_q_heads) Q,
@@ -252,7 +225,7 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
 
     if (!is_q && !is_k) {
         // V band: weightless norm, no RoPE — the whole block exits here.
-        int64_t dst = paged_kv_offset_hd256_plain(
+        int64_t dst = paged_kv_offset<HD256_PLAIN>(
             page_id, v_offset_elems, stride_page, page_size,
             num_kv_heads, pos, head_local, d);
         kv_data[dst] = __float2bfloat16(__bfloat162float(x) * inv_rms);
@@ -268,7 +241,7 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
     if (d < half_rotary) {
         __nv_bfloat16 lo = smem[d];
         __nv_bfloat16 hi = smem[d + half_rotary];
-        apply_rope_pair_hd256_plain(
+        apply_rope_pair(
             lo,
             hi,
             cos_cache[pos * rotary_dim + d],
@@ -280,7 +253,7 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
             q_batch_out[dst + d] = lo;
             q_batch_out[dst + d + half_rotary] = hi;
         } else {
-            int64_t dst = paged_kv_offset_hd256_plain(
+            int64_t dst = paged_kv_offset<HD256_PLAIN>(
                 page_id, k_offset_elems, stride_page, page_size,
                 num_kv_heads, pos, head_local, d);
             kv_data[dst] = lo;
@@ -293,7 +266,7 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
             int dst = token * q_dim + head_local * HD256_PLAIN;
             q_batch_out[dst + d] = smem[d];
         } else {
-            int64_t dst = paged_kv_offset_hd256_plain(
+            int64_t dst = paged_kv_offset<HD256_PLAIN>(
                 page_id, k_offset_elems, stride_page, page_size,
                 num_kv_heads, pos, head_local, d);
             kv_data[dst] = smem[d];

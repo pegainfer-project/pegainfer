@@ -50,6 +50,8 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 - `PEGAINFER_MAX_CONTEXT` — gemma4 serving ceiling raise (default 8192, up to the checkpoint's 262144; a raise past the default needs `PEGAINFER_MIX_CHUNK_TOKENS` and refuses the async lane)
 - `PEGAINFER_DECODE_SLOTS` — gemma4 decode slots (1..16, default 16): global KV budget = slots x ceiling, trade concurrency for context
 - `GLM52_DECODE_SLOTS` / `GLM52_MTP_DRAFTS` — glm52 runtime profile: decode slots per rank (default 8, ceiling 32) and MTP draft span (default 5); `slots x (1+drafts)` must fit the 96-row step (validated at launch; MTP only). Throughput ceiling profile: `32` / `2`.
+- `PEGAINFER_K3_CP` — k3 opt-in context-parallel prefill lane: CP width, must equal the process's local rank count (on a fleet each process runs its own gang; remote ranks pad). Mutually exclusive with the dspark draft lane.
+- `PEGAINFER_K3_CP_MIN` — k3 CP admission floor in prompt tokens (default 2048; measured crossover ~1k). Prompts below it, or too long for one chunk step per rank (M0), prefill locally.
 
 ## Tests
 

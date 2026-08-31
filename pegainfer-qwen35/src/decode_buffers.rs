@@ -7,7 +7,7 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 
 use super::config::Config35;
-use super::config::TensorParallelConfig;
+use super::config::LocalGeometry;
 
 /// Pre-allocated GPU buffers for Qwen3.5 batch decode (N requests, 1 token each).
 pub(crate) struct BatchDecodeBuffers35 {
@@ -65,21 +65,21 @@ impl BatchDecodeBuffers35 {
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &Config35,
-        tensor_parallel: TensorParallelConfig,
+        geometry: LocalGeometry,
         max_batch_size: usize,
         max_total_pages: usize,
         padding_page_id: i32,
     ) -> Result<Self> {
         let h = config.hidden_size;
         let bs = max_batch_size;
-        let q_proj_dim = config.local_full_attn_gated_q_dim(tensor_parallel);
-        let q_dim = config.local_full_attn_q_dim(tensor_parallel);
-        let kv_dim = config.local_full_attn_kv_dim(tensor_parallel);
+        let q_proj_dim = geometry.local_full_attn_gated_q_dim();
+        let q_dim = geometry.local_full_attn_q_dim();
+        let kv_dim = geometry.local_full_attn_kv_dim();
         let qkv_dim = config.linear_attn_qkv_dim();
         let z_dim = config.linear_attn_z_dim();
         let b_dim = config.linear_num_value_heads;
         let a_dim = b_dim;
-        let intermediate = config.local_intermediate_size(tensor_parallel);
+        let intermediate = geometry.local_intermediate_size();
 
         Ok(Self {
             max_batch_size: bs,

@@ -13,8 +13,13 @@
 //! sizes from [`StepExecutor::max_batch`], returning each slot on every
 //! terminal path (finish, fail, abort).
 
+use std::sync::Arc;
+
 use anyhow::Result;
+use anyhow::bail;
 use pegainfer_frontend::sampler::SamplingParams;
+
+use crate::executor::cp::K3CpGroup;
 
 /// Index of one execution slot, in `0..max_batch`.
 pub type SlotId = usize;
@@ -72,6 +77,45 @@ pub trait StepExecutor: Send {
             .into_iter()
             .map(|token| vec![token])
             .collect())
+    }
+
+    /// Context-parallel prefill: run this executor's segment of `prompt` as
+    /// CP rank `cp_rank` of the gang in `group`, in lockstep with the whole
+    /// gang. The last CP rank owns the sequence — it ingests the result into
+    /// `slot` and returns the boundary token; other ranks ignore `slot` and
+    /// return `None`. Default: this executor serves no CP.
+    fn prefill_cp(
+        &mut self,
+        slot: SlotId,
+        prompt: &[u32],
+        group: &Arc<K3CpGroup>,
+        cp_rank: usize,
+    ) -> Result<Option<u32>> {
+        let _ = (slot, prompt, group, cp_rank);
+        bail!("this executor does not serve context-parallel prefill")
+    }
+
+    /// Run one padding step and wait for it. A scheduler thread waiting at a
+    /// CP-gang rendezvous calls this so a peer blocked inside its own step's
+    /// sync keeps receiving the mega launches that pair against its queued
+    /// ones, while the wait keeps this rank's launch count within a step of
+    /// the world's. Executors with no cross-rank obligations do nothing.
+    fn pump_step(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Steps this executor has launched, of every kind. On an EP rank the
+    /// mega launches pair across ranks by absolute index, so a CP gang
+    /// equalizes the world's counts (pumping the laggards) before a step
+    /// whose mid-step stream sync would otherwise wait on peer launches that
+    /// can no longer come. Executors with no cross-rank obligations report 0.
+    ///
+    /// The gang's leveling is sound only if every stepping method returns
+    /// with its steps fully launched — a method that kept launching after
+    /// returning would advance this count under a peer already leveled
+    /// against it.
+    fn step_count(&self) -> u64 {
+        0
     }
 
     /// Drop the slot's state. Called on every terminal path, including the

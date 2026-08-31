@@ -1,0 +1,193 @@
+name: Release Qwen3 binary
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/package_qwen3_release.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Qwen3 Linux x86_64 CUDA 13.0
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.server.outputs.version }}
+    env:
+      CUDA_PATH: /usr/local/cuda
+      PEGAINFER_CUDA_SM: "80,86,89,90,100,110,120"
+      PEGAINFER_NVCC_JOBS: "2"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Install CUDA build toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.0.2"
+          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
+
+      - name: Install build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          protobuf-compiler libibverbs-dev
+
+      - name: Resolve server version
+        id: server
+        run: |
+          set -euo pipefail
+          package_version=$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq -r '.packages[]
+                | select(.name == "pegainfer-server")
+                | .version'
+          )
+          if [[ $GITHUB_REF_TYPE == tag ]]; then
+            test "$GITHUB_REF_NAME" = "v$package_version"
+          fi
+          echo "version=$package_version" >>"$GITHUB_OUTPUT"
+
+      - name: Build Qwen3-only fat binary
+        run: |
+          set -euo pipefail
+          driver_stub="$CUDA_PATH/targets/x86_64-linux/lib/stubs"
+          test -f "$driver_stub/libcuda.so"
+          export LIBRARY_PATH="$driver_stub${LIBRARY_PATH:+:$LIBRARY_PATH}"
+          probe_dir=$(mktemp -d)
+          rustc - --crate-name cuda_link_probe -l cuda \
+            -o "$probe_dir/cuda-link-probe" <<< 'fn main() {}'
+          cargo build --release --locked -p pegainfer-server \
+            --no-default-features --features qwen3
+
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pegainfer-qwen3-server
+          path: target/release/pegainfer
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          overwrite: true
+
+  package:
+    name: Package Qwen3 Linux x86_64 CUDA 13.0
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CUDA_PATH: /usr/local/cuda
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install CUDA runtime and EULA
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.0.2"
+          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: '["cudart-dev", "documentation"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - name: Install packaging dependencies
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pegainfer-qwen3-server
+          path: target/release
+
+      - name: Package release candidate
+        run: |
+          chmod +x target/release/pegainfer
+          scripts/package_qwen3_release.sh \
+            "v${{ needs.build.outputs.version }}" dist
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: pegainfer-qwen3-linux-x86_64-cu130-release
+          path: |
+            dist/pegainfer-qwen3-linux-x86_64-cu130.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          overwrite: true
+
+  publish:
+    name: Publish Qwen3 Linux x86_64 CUDA 13.0
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_NOTES: >-
+        Prebuilt Qwen3-only server for Linux x86_64. The archive contains CUDA
+        13.0 runtime libraries and supports NVIDIA compute capabilities 8.x
+        through 12.x. NVIDIA driver 580 or newer, glibc 2.35 or newer, and
+        OpenSSL 3 are required. Model weights are not included.
+
+    steps:
+      - name: Download release candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: pegainfer-qwen3-linux-x86_64-cu130-release
+          path: dist
+
+      - name: Attest release archive
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/pegainfer-qwen3-linux-x86_64-cu130.tar.gz
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists;" \
+              "refusing to replace its assets" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            dist/pegainfer-qwen3-linux-x86_64-cu130.tar.gz \
+            dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --notes "$RELEASE_NOTES" \
+            --title "PegaInfer $GITHUB_REF_NAME"

@@ -3,7 +3,6 @@
 use anyhow::Result;
 use safetensors::Dtype;
 
-use super::EXPECTED_DTYPE;
 use super::schema::Manifest;
 
 /// Spans every published size; a checkpoint matches only its own.
@@ -22,10 +21,10 @@ pub(crate) struct ObservedTensor<'a> {
 
 impl Manifest {
     pub(crate) fn classify(&self, observed: &[ObservedTensor]) -> ManifestReport {
-        let mut expected = self.expected_shapes();
+        let mut expected = self.expected_tensors();
         let mut report = ManifestReport::default();
         for tensor in observed {
-            let Some(shape) = expected.remove(tensor.name) else {
+            let Some((shape, dtype)) = expected.remove(tensor.name) else {
                 if OPTIONAL_MODALITY_PREFIXES
                     .iter()
                     .any(|prefix| tensor.name.starts_with(prefix))
@@ -42,9 +41,9 @@ impl Manifest {
                     tensor.name, tensor.shape
                 ));
             }
-            if tensor.dtype != EXPECTED_DTYPE {
+            if tensor.dtype != dtype {
                 report.dtype_mismatch.push(format!(
-                    "{}: checkpoint has {:?}, expected {EXPECTED_DTYPE:?}",
+                    "{}: checkpoint has {:?}, expected {dtype:?}",
                     tensor.name, tensor.dtype
                 ));
             }
@@ -107,14 +106,15 @@ mod tests {
 
     fn faultless(manifest: &Manifest) -> Vec<(String, Dtype, Vec<usize>)> {
         manifest
-            .expected_shapes()
+            .expected_tensors()
             .into_iter()
-            .map(|(name, shape)| {
+            .map(|(name, (shape, dtype))| {
                 let dims = match shape {
                     ExpectedShape::Matrix { rows, cols } => vec![rows, cols],
                     ExpectedShape::Vector { len } => vec![len],
+                    ExpectedShape::Scalar => vec![],
                 };
-                (name.to_string(), Dtype::BF16, dims)
+                (name.to_string(), dtype, dims)
             })
             .collect()
     }
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn no_modality_prefix_can_shadow_a_text_tensor() {
         let manifest = Manifest::from_config(&config()).unwrap();
-        for name in manifest.expected_shapes().keys() {
+        for name in manifest.expected_tensors().keys() {
             for prefix in OPTIONAL_MODALITY_PREFIXES {
                 assert!(
                     !name.starts_with(prefix),

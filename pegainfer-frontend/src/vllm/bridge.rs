@@ -508,6 +508,7 @@ fn reduce_request(
                     num_cached_tokens: cached_tokens as u32,
                     num_local_cached_tokens: cached_tokens as u32,
                     num_external_cached_tokens: 0,
+                    num_cache_creation_tokens: 0,
                 });
             }
             TokenEvent::Token { id, logprob } => {
@@ -707,7 +708,9 @@ async fn connect_link(
     wait_for_ipc_endpoint(input_address, shutdown).await?;
     wait_for_ipc_endpoint(output_address, shutdown).await?;
 
-    let engine_id = EngineId::from_engine_index(engine_index);
+    let engine_id = EngineId::from_engine_index(
+        u16::try_from(engine_index).context("engine_index exceeds u16 EngineId")?,
+    );
     let mut socket_options = SocketOptions::default();
     socket_options.peer_identity(PeerIdentity::try_from(engine_id)?);
 
@@ -739,9 +742,24 @@ async fn connect_link(
         dtype: ModelDtype::BFloat16,
         vllm_version: "pegainfer-local-bridge".to_string(),
         world_size: 1,
-        data_parallel_size: u64::from(data_parallel_size),
+        effective_data_parallel_size: u64::from(data_parallel_size),
+        tensor_parallel_size: 1,
+        pipeline_parallel_size: 1,
+        decode_context_parallel_size: 1,
+        data_parallel_rank: engine_index,
+        // Discovery metadata for gRPC control; HTTP completions do not admit
+        // against these caps. Keep them above any sim concurrency we bench.
+        max_num_seqs: 8192,
+        max_num_batched_tokens: u64::from(max_model_len),
+        instance_id: format!("pegainfer-local-{engine_index}"),
+        supports_lora: false,
+        max_loras: 0,
         kv_cache_size_tokens,
         kv_cache_max_concurrency,
+        kv_events_config: None,
+        weight_transfer_backend: None,
+        enable_sleep_mode: false,
+        supports_draft_weight_updates: false,
     };
     info!(
         "local engine {engine_index} KV capacity: {kv_capacity:?} -> \
@@ -892,6 +910,9 @@ fn engine_output(
         prefill_stats,
         routed_experts: None,
         num_nans_in_logits: 0,
+        mm_cache_miss_hashes: None,
+        new_sampling_mask: None,
+        spec_decode_metrics: None,
     }
 }
 

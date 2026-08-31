@@ -7,7 +7,15 @@ name = "pegainfer-gemma4"
 version = "0.1.0"
 
 [features]
-gemma4 = ["dep:cudarc", "dep:half", "dep:log", "dep:pegainfer-core", "dep:pegainfer-sample", "dep:tokio"]
+gemma4 = [
+  "dep:cudarc",
+  "dep:half",
+  "dep:log",
+  "dep:pegainfer-core",
+  "dep:pegainfer-kernels",
+  "dep:pegainfer-sample",
+  "dep:tokio",
+]
 default = []
 
 [dependencies]
@@ -17,6 +25,7 @@ half = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 pegainfer-core = { workspace = true, optional = true }
 pegainfer-frontend = { workspace = true }
+pegainfer-kernels = { workspace = true, features = ["gemma4"], optional = true }
 pegainfer-sample = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"], optional = true }
 safetensors = { workspace = true }

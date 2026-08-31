@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
@@ -18,6 +19,7 @@ use vllm_server::Config;
 use vllm_server::CoordinatorMode;
 use vllm_server::CorsConfig;
 use vllm_server::DEFAULT_KEEP_ALIVE_TIMEOUT;
+use vllm_server::GenerationConfigMode;
 use vllm_server::HttpListenerMode;
 use vllm_server::ParserSelection;
 use vllm_server::RendererSelection;
@@ -358,6 +360,7 @@ where
             output_address,
             engine_start_index: 0,
             engine_count,
+            data_parallel_size: engine_count,
             // The in-process bridge registers once the engine future resolves,
             // so this bounds the whole engine load (multi-GPU MoE models take
             // minutes, cold starts longer). Load *failure* already cancels the
@@ -366,6 +369,7 @@ where
         },
         coordinator_mode: CoordinatorMode::None,
         model: model_id,
+        generation_config: GenerationConfigMode::Auto,
         served_model_name,
         listener_mode: HttpListenerMode::BindTcp { host, port },
         tool_call_parser: ParserSelection::default(),
@@ -373,6 +377,7 @@ where
         renderer: RendererSelection::default(),
         chat_template: None,
         default_chat_template_kwargs: None,
+        limit_mm_per_prompt: HashMap::new(),
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         max_logprobs: None,
         language_model_only: true,

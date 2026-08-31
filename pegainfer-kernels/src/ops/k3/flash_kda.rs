@@ -177,3 +177,112 @@ pub fn k3_flash_kda_fwd_launch(
         anyhow!("K3 FlashKDA forward (T={t_total}, H={heads}) failed: {error} (NOT_SUPPORTED = built without an accelerated SM90+ target)")
     })
 }
+
+/// Fused KCP package forward: one segment through kernel 1 plus a dual-state
+/// kernel 2, producing the segment's affine package `S_out = S_in·M + D` in
+/// one sweep — `state_out_d` = D (real `v` from zero state) and
+/// `state_out_m` = M (`v = 0` from identity state), each one `[heads, 128,
+/// 128]` f32 row. The doctored initial states are seeded in-kernel and the
+/// token output is not computed (a CP middle rank discards it). Operand
+/// contract otherwise matches [`k3_flash_kda_fwd_launch`] at span zero;
+/// `state_out_d` and `state_out_m` may not alias.
+#[allow(clippy::too_many_arguments)]
+pub fn k3_flash_kda_fwd_md_launch(
+    ctx: &DeviceContext,
+    t_total: usize,
+    heads: usize,
+    q: &CudaSlice<bf16>,
+    k: &CudaSlice<bf16>,
+    v: &CudaSlice<bf16>,
+    g: &CudaSlice<bf16>,
+    beta: &CudaSlice<bf16>,
+    beta_scratch: &mut CudaSlice<bf16>,
+    a_log: &CudaSlice<f32>,
+    dt_bias: &CudaSlice<f32>,
+    state_out_d: &mut CudaSlice<f32>,
+    state_out_m: &mut CudaSlice<f32>,
+    workspace: &mut CudaSlice<u8>,
+    scale: f32,
+    lower_bound: f32,
+) -> Result<()> {
+    let d = K3_FLASH_KDA_HEAD_DIM;
+    let width = heads * d;
+    ensure!(t_total > 0, "K3 FlashKDA MD got an empty segment");
+    ensure!(
+        q.len() >= t_total * width
+            && k.len() >= t_total * width
+            && v.len() >= t_total * width
+            && g.len() >= t_total * width,
+        "K3 FlashKDA MD q/k/v/g buffers too small for t={t_total}, heads={heads}"
+    );
+    ensure!(
+        beta.len() >= t_total * heads && beta_scratch.len() >= t_total * heads,
+        "K3 FlashKDA MD beta buffers too small for t={t_total}, heads={heads}: beta {}, scratch {}",
+        beta.len(),
+        beta_scratch.len()
+    );
+    ensure!(
+        a_log.len() >= heads && dt_bias.len() >= width,
+        "K3 FlashKDA MD a_log/dt_bias too small for heads={heads}"
+    );
+    let state = heads * d * d;
+    ensure!(
+        state_out_d.len() >= state && state_out_m.len() >= state,
+        "K3 FlashKDA MD state slabs too small for heads={heads}: d {}, m {}",
+        state_out_d.len(),
+        state_out_m.len()
+    );
+    let needed = k3_flash_kda_workspace_bytes(t_total, heads);
+    ensure!(
+        workspace.len() >= needed,
+        "K3 FlashKDA MD workspace of {} bytes is under the {needed} the segment needs",
+        workspace.len()
+    );
+
+    let (beta_ptr, _beta_guard) = beta.device_ptr(&ctx.stream);
+    let (beta_t_ptr, _beta_t_guard) = beta_scratch.device_ptr_mut(&ctx.stream);
+    let rc = unsafe {
+        ffi::k3_flash_kda_beta_transpose(
+            beta_ptr as *const Half,
+            beta_t_ptr as *mut Half,
+            t_total as i32,
+            heads as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    rc.result().map_err(|error| {
+        anyhow!("K3 FlashKDA MD beta transpose (T={t_total}, H={heads}): {error}")
+    })?;
+
+    let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
+    let (k_ptr, _k_guard) = k.device_ptr(&ctx.stream);
+    let (v_ptr, _v_guard) = v.device_ptr(&ctx.stream);
+    let (g_ptr, _g_guard) = g.device_ptr(&ctx.stream);
+    let (a_log_ptr, _a_log_guard) = a_log.device_ptr(&ctx.stream);
+    let (dt_bias_ptr, _dt_bias_guard) = dt_bias.device_ptr(&ctx.stream);
+    let (state_d_ptr, _state_d_guard) = state_out_d.device_ptr_mut(&ctx.stream);
+    let (state_m_ptr, _state_m_guard) = state_out_m.device_ptr_mut(&ctx.stream);
+    let (ws_ptr, _ws_guard) = workspace.device_ptr_mut(&ctx.stream);
+    let rc = unsafe {
+        ffi::k3_flash_kda_fwd_md(
+            q_ptr as *const Half,
+            k_ptr as *const Half,
+            v_ptr as *const Half,
+            g_ptr as *const Half,
+            beta_t_ptr as *const Half,
+            a_log_ptr as *const f32,
+            dt_bias_ptr as *const f32,
+            state_d_ptr as *mut f32,
+            state_m_ptr as *mut f32,
+            ws_ptr as *mut core::ffi::c_void,
+            t_total as i32,
+            heads as i32,
+            scale,
+            lower_bound,
+            ctx.stream.cu_stream(),
+        )
+    };
+    rc.result().map_err(|error| {
+        anyhow!("K3 FlashKDA MD forward (T={t_total}, H={heads}) failed: {error} (NOT_SUPPORTED = built without an accelerated SM90+ target)")
+    })
+}

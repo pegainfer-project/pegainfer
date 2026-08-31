@@ -23,6 +23,11 @@ struct GreenContexts {
     _ctx_prefill: sys::CUcontext,
 }
 
+fn sm_for_prefill(total_sm: u32, min_sm: u32, prefill_pct: u32) -> Option<u32> {
+    let target = (total_sm * prefill_pct / 100 / min_sm) * min_sm;
+    (target >= min_sm && total_sm - target >= min_sm).then_some(target)
+}
+
 /// The prefill lane's stream, either a plain primary-context stream
 /// (shared SMs) or a Green Context stream pinned to `prefill_pct`% of them.
 pub(crate) struct PrefillLaneStream {
@@ -86,13 +91,12 @@ impl PrefillLaneStream {
         )?;
         let min_sm = unsafe { probe_grp.__bindgen_anon_1.sm.smCount };
 
-        let sm_for_prefill = (total_sm * prefill_pct / 100 / min_sm) * min_sm;
-        if sm_for_prefill < min_sm || total_sm - sm_for_prefill < min_sm {
-            bail!(
+        let sm_for_prefill = sm_for_prefill(total_sm, min_sm, prefill_pct).ok_or_else(|| {
+            anyhow::anyhow!(
                 "green-ctx prefill partition not viable: total={total_sm} min={min_sm} \
-                 prefill_pct={prefill_pct} prefill_target={sm_for_prefill}"
-            );
-        }
+                 prefill_pct={prefill_pct}"
+            )
+        })?;
 
         let mut grp_prefill: sys::CUdevResource = unsafe { std::mem::zeroed() };
         let mut grp_rest: sys::CUdevResource = unsafe { std::mem::zeroed() };
@@ -188,5 +192,24 @@ impl Drop for PrefillLaneStream {
                 sys::cuGreenCtxDestroy(green.gctx_prefill);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sm_for_prefill;
+
+    #[test]
+    fn prefill_partition_rounds_to_the_split_granularity() {
+        assert_eq!(sm_for_prefill(128, 8, 35), Some(40));
+        assert_eq!(sm_for_prefill(128, 8, 50), Some(64));
+        assert_eq!(sm_for_prefill(128, 8, 99), Some(120));
+    }
+
+    #[test]
+    fn prefill_partition_keeps_one_group_for_decode() {
+        assert_eq!(sm_for_prefill(128, 8, 1), None);
+        assert_eq!(sm_for_prefill(128, 8, 100), None);
+        assert_eq!(sm_for_prefill(8, 8, 50), None);
     }
 }

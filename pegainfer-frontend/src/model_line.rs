@@ -106,8 +106,8 @@ pub struct SharedArgs {
 
     /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to
     /// disable). Rejected for GLM5.2; forced off in Qwen3 LoRA mode; Qwen3.5
-    /// always captures and rejects `false`; Gemma 4 captures per batch
-    /// bucket.
+    /// always captures and rejects `false`; dense Gemma 4 captures per batch
+    /// bucket while routed checkpoints warn and serve eagerly.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub cuda_graph: bool,
 

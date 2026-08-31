@@ -68,7 +68,7 @@
 // Instantiation matrix
 // ---------------------------------------------------------------------------
 // hidden 3584 (K3 latent), intermediate 3072, topk 16, num_max_tokens_per_rank
-// 4224 (the chunked-prefill ceiling; 11x `kLCMCandidateBlockM`, the token
+// 16896 (the chunked-prefill ceiling; 44x `kLCMCandidateBlockM`, the token
 // alignment the upstream API enforces), 152 SMs (GB300). The GLOBAL expert
 // count and the rank count together name a world, and the worlds are split
 // across translation units so nvcc compiles them in parallel:
@@ -85,8 +85,8 @@
 //
 // At ranks 1 the launch picks among the block configs by live token count
 // under `get_block_config_for_mega_moe`, so a single-rank launch stays
-// bit-identical to what upstream's Python wrapper would run; at 4224 max
-// tokens the whole six-entry ladder is reachable and instantiated.
+// bit-identical to what upstream's Python wrapper would run; at the protocol
+// maximum the whole six-entry ladder is reachable and instantiated.
 // Every multi-rank world has exactly ONE config, taken at the protocol maximum
 // rather than from the live token count — see `k3_mega::pinned_config`.
 //
@@ -298,8 +298,8 @@ __global__ void mega_write_routing_kernel(const int* __restrict__ topk_idx,
 
 constexpr int kPrunedExperts = 224;
 
-// Single rank: at num_max_tokens_per_rank == 4224 with 224 experts and topk 16
-// every ladder entry is reachable (the thresholds land at 119/231/455/903/1351
+// Single rank: with 224 experts and topk 16 every ladder entry is reachable
+// below the protocol maximum (the thresholds land at 119/231/455/903/1351
 // tokens), so the whole ladder is instantiated, and the launch picks among the
 // entries by the upstream heuristic so a single-rank launch stays bit-identical
 // to what DeepGEMM's own Python wrapper would have run.
@@ -375,7 +375,7 @@ int k3_mega_token_alignment(void) { return 384; }
 // (`num_max_tokens_per_rank`). The launch accepts exactly this value — the
 // ring capacities derived from it are kernel template parameters — so slabs
 // are allocated at exactly this size, whatever the executor's live batch is.
-int k3_mega_max_tokens_per_rank(void) { return 4224; }
+int k3_mega_max_tokens_per_rank(void) { return 16896; }
 
 // Whether the AOT matrix carries a kernel for this world (GLOBAL expert count
 // x rank count, situ activation). One definition of the supported set — the

@@ -102,9 +102,9 @@ impl Qwen35Model {
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
-        let tp = self.tensor_parallel;
-        let num_attention_heads = self.config.local_num_attention_heads(tp);
-        let num_key_value_heads = self.config.local_num_key_value_heads(tp);
+        let geom = self.geometry;
+        let num_attention_heads = geom.local_num_attention_heads();
+        let num_key_value_heads = geom.local_num_key_value_heads();
 
         ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
         ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);

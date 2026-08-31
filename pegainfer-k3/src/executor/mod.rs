@@ -22,7 +22,7 @@
 //!
 //! Prefill runs the batched step over **chunks of one sequence**: the bucket's
 //! rows carry up to `chunk_tokens` consecutive prompt tokens (default: the
-//! 4224-row MegaMoE protocol maximum, clamped to `max_ctx`), so every
+//! 16896-row MegaMoE protocol maximum, clamped to `max_ctx`), so every
 //! row-independent stage (norms, projections, MoE) digests the whole chunk
 //! in one launch, the MLA layers attend `[context | chunk]` through one
 //! dense FlashMLA FMHA call per layer over kv_b-expanded scratch, and the
@@ -63,6 +63,7 @@
 //!   of returning into the scheduler's keep-serving path.
 
 mod buffers;
+pub mod cp;
 mod dspark;
 pub mod ep;
 mod forward;
@@ -70,6 +71,7 @@ mod paged_kv;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -94,6 +96,8 @@ use self::buffers::K3MegaGeometry;
 use self::buffers::K3MegaScratch;
 use self::buffers::K3Scratch;
 use self::buffers::K3StatePool;
+use self::cp::K3CpGroup;
+use self::cp::K3CpScratch;
 use self::dspark::K3_DSPARK_AUX_LAYERS;
 use self::dspark::K3_DSPARK_BLOCK;
 use self::dspark::K3_DSPARK_CONTEXT_DIM;
@@ -149,7 +153,7 @@ const K3_MEGA_SMS: usize = 152;
 
 /// Slots per rank an expert-parallel launch takes when nothing says otherwise.
 ///
-/// The fused kernel's protocol maximum is 4224 rows per rank (sized for
+/// The fused kernel's protocol maximum is 16896 rows per rank (sized for
 /// chunked prefill), so the compiled
 /// bucket ceiling (128) is the target once the backbone goes FP8. Today the
 /// binding constraint is the KDA state slab: ~929 MB per slot (f32 recurrent
@@ -176,12 +180,16 @@ pub struct K3ExecutorConfig {
     /// Layers to build; `K3_LAYERS` for the whole model.
     pub num_layers: usize,
     /// Prefill chunk cap in tokens. `0` derives the widest the transport
-    /// carries: the MegaMoE protocol maximum (4224, clamped to `max_ctx`)
+    /// carries: the MegaMoE protocol maximum (16896, clamped to `max_ctx`)
     /// under the fused kernel, `max_batch` under the masked chain (whose
     /// layout reserves at most [`K3_MASKED_CAP`] rows per expert).
     pub chunk_tokens: usize,
     /// Capture and replay the step, rather than launching it eagerly.
     pub cuda_graph: bool,
+    /// Stage checkpoint bytes through two pinned host buffers, overlapping
+    /// host fills with H2D DMA. Intended for warm-page-cache starts; cold
+    /// network-filesystem loads can prefer the direct pageable path.
+    pub weight_staging: bool,
     /// Which kernel runs the routed experts. Production is always
     /// [`K3MoeTransport::MEGA`]; see that type for why the alternative exists
     /// and why it is not selectable from a serving configuration.
@@ -239,6 +247,7 @@ impl Default for K3ExecutorConfig {
             num_layers: K3_LAYERS,
             chunk_tokens: 0,
             cuda_graph: true,
+            weight_staging: false,
             moe_transport: K3MoeTransport::MEGA,
         }
     }
@@ -354,6 +363,12 @@ pub struct K3Executor {
     /// not mix on one executor: a decode step advances EVERY row's state at
     /// the global parity, clobbering the per-slot committed slabs.
     parity: usize,
+    /// Steps this executor has launched, of every kind (decode, prefill
+    /// chunk, CP chunk, pump). On an EP rank the mega launches pair across
+    /// ranks by absolute index, so a CP gang uses this to equalize the
+    /// world's counts before a step whose mid-step stream sync would
+    /// otherwise wait on peer launches that can no longer come.
+    steps_launched: u64,
     /// Per-slot speculative-decode state, meaningful only while every decode
     /// step on this executor is a verify step.
     spec: Vec<K3SpecSlot>,
@@ -380,6 +395,8 @@ pub struct K3Executor {
     /// Present exactly when `ep_size > 1`: this rank's slab handshake with its
     /// peers. It issues nothing per step.
     ep: Option<K3EpRuntime>,
+    /// Context-parallel working set, allocated at the first [`Self::prefill_cp`].
+    cp_scratch: Option<Box<K3CpScratch>>,
 }
 
 // SAFETY: the executor owns one rank's context, stream and device buffers, and
@@ -444,6 +461,8 @@ impl K3Executor {
         config: K3ExecutorConfig,
         rendezvous: Option<Arc<K3EpRendezvous>>,
     ) -> Result<Self> {
+        let startup_started = Instant::now();
+        let plan_started = Instant::now();
         probe_config_json(&read_config(model_path)?)
             .with_context(|| format!("validate the K3 config at {}", model_path.display()))?;
         let manifest = K3WeightManifest::from_model_dir(model_path)?;
@@ -459,16 +478,37 @@ impl K3Executor {
         // the rest, but not before they are resident, and at low expert
         // parallelism a whole rank does not fit on one device.
         let bundle = manifest.rank_load_bundle_for_layers(rank, topo, config.num_layers)?;
+        let plan_secs = plan_started.elapsed().as_secs_f64();
+
+        let context_started = Instant::now();
         let gpu = K3RankGpuContext::new(device_ordinal)?;
         let ctx = gpu.device_context()?;
-        let loaded = load_rank_weights_to_gpu(&gpu, model_path, &bundle, false)?;
+        let context_secs = context_started.elapsed().as_secs_f64();
+
+        let weights_started = Instant::now();
+        let loaded = load_rank_weights_to_gpu(&gpu, model_path, &bundle, config.weight_staging)?;
+        let weights_secs = weights_started.elapsed().as_secs_f64();
         let form = if config.moe_transport.is_mega() {
             K3ExpertBankForm::Mega
         } else {
             K3ExpertBankForm::MaskedChain
         };
+        let model_started = Instant::now();
         let model = K3RankModel::build(&ctx, loaded.weights, topo, rank, config.num_layers, form)?;
-        Self::new(gpu, ctx, model, config, rendezvous)
+        let model_secs = model_started.elapsed().as_secs_f64();
+
+        let executor_started = Instant::now();
+        let executor = Self::new(gpu, ctx, model, config, rendezvous)?;
+        let executor_secs = executor_started.elapsed().as_secs_f64();
+        info!(
+            "K3 rank {rank} startup profile: total={:.2}s, plan={plan_secs:.2}s, \
+             cuda_context={context_secs:.2}s, weights={weights_secs:.2}s, \
+             model_build={model_secs:.2}s, executor_build={executor_secs:.2}s, \
+             weight_staging={}",
+            startup_started.elapsed().as_secs_f64(),
+            config.weight_staging,
+        );
+        Ok(executor)
     }
 
     /// Wrap an already-built rank model.
@@ -653,6 +693,7 @@ impl K3Executor {
             groups,
             num_sms,
             parity: 0,
+            steps_launched: 0,
             spec: vec![K3SpecSlot::default(); max_batch],
             dspark: None,
             cuda_graph,
@@ -672,6 +713,7 @@ impl K3Executor {
             sampled_host: vec![0; max_batch],
             bound_thread: None,
             ep,
+            cp_scratch: None,
         })
     }
 
@@ -760,6 +802,7 @@ impl K3Executor {
         // The block table rides outside capture with the rest of the step
         // inputs; the captured kernels read the device table by pointer.
         pool.kv.sync_table(ctx)?;
+        self.steps_launched += 1;
         if !self.cuda_graph {
             let launches = self.mega_launches_per_step;
             if let Some(mega) = scratch.mega.as_mut() {
@@ -1016,9 +1059,98 @@ impl StepExecutor for K3Executor {
                 .collect())
         }
     }
+
+    /// Context-parallel prefill: this executor is CP rank `cp_rank` of the
+    /// gang in `group`, and consumes only its own contiguous segment of
+    /// `prompt` — the whole gang must call this with the same prompt, in
+    /// lockstep with its expert-parallel step schedule (one chunk step per
+    /// rank). Returns the boundary token on the LAST CP rank (which also
+    /// leaves the boundary logits in row 0 for [`Self::last_logits`]) and
+    /// `None` elsewhere.
+    ///
+    /// The last CP rank is the sequence's owner: its final KDA states and
+    /// conv windows are the whole prompt's, its paged pool is staged at
+    /// GLOBAL positions (its own segment lands there through the step's
+    /// normal append; the gang's upstream rows are persisted during the MLA
+    /// exchange), and the epilogue adopts everything into decode `slot` —
+    /// decode continues on this rank like after any prefill. Other ranks
+    /// ignore `slot`.
+    ///
+    /// M0 scope: one chunk per rank — the segment must fit `chunk_tokens`.
+    fn prefill_cp(
+        &mut self,
+        slot: SlotId,
+        prompt: &[u32],
+        group: &Arc<K3CpGroup>,
+        cp_rank: usize,
+    ) -> Result<Option<u32>> {
+        let rank = self.model.rank;
+        match self.prefill_cp_inner(slot, prompt, group, cp_rank) {
+            Err(error) if self.is_expert_parallel() => ep_fatal(rank, "prefill-cp", &error),
+            other => other,
+        }
+    }
+
+    /// One padding step, waited to completion.
+    ///
+    /// A scheduler thread leveling up at a CP-gang board must keep feeding
+    /// its device: a peer may be blocked inside its own step's sync, which
+    /// only completes once this rank queues the matching mega launches. The
+    /// pump runs one empty decode step (the launch-count unit) and waits for
+    /// it — the sync is load-bearing twice over. It keeps the gang's launch
+    /// counts within a step of the world's (the mega barrier tolerates only
+    /// bounded skew; an unsynced pump loop queues hundreds of steps in
+    /// milliseconds and wraps the barrier ring into garbage), and it paces
+    /// the wait loop to real step time. It cannot deadlock: a pump's pairs
+    /// come from launches the blocked peer already queued, and the peer's
+    /// own sync completes off the pump's launches — the two release each
+    /// other step by step.
+    ///
+    /// Unlike a real step the pump does NOT flip the parity: plain decode's
+    /// invariant is that every running slot's committed KDA state and conv
+    /// window sit at `self.parity`, and a pump may run while slots are live.
+    /// Held at the current parity, the pump only reads the committed side and
+    /// scribbles the scratch side — which the next real step overwrites in
+    /// full before anything reads it.
+    ///
+    /// The two single-buffered per-row surfaces are safe by the same
+    /// write-before-read shape: the attn-res snapshot bank has no cross-step
+    /// lifetime (layer 0 is a snapshot layer, and block `j` is recaptured by
+    /// the `j`-th snapshot layer of every step before any `nb_in > j` mix
+    /// reads it — see `k3_layer_geometry`), and the paged KV write skips pump
+    /// rows outright (`kv_row = -1`).
+    fn pump_step(&mut self) -> Result<()> {
+        if !self.is_expert_parallel() {
+            return Ok(());
+        }
+        // A failed pump left the world short a launch — the same missed-step
+        // wreckage as any other EP step failure, so the same exit.
+        let rank = self.model.rank;
+        match self.pump_step_inner() {
+            Err(error) => ep_fatal(rank, "cp-pump", &error),
+            other => other,
+        }
+    }
+
+    fn step_count(&self) -> u64 {
+        self.steps_launched
+    }
 }
 
 impl K3Executor {
+    fn pump_step_inner(&mut self) -> Result<()> {
+        self.enter_step()?;
+        for row in 0..self.max_batch {
+            self.token_host[row] = 0;
+            self.context_len_host[row] = 1;
+            self.kv_row_host[row] = -1;
+        }
+        self.feed()?;
+        let parity = self.parity;
+        self.run_step(k3_batch_bucket(1)?, parity, 0)?;
+        self.gpu.sync()
+    }
+
     fn prefill_inner(
         &mut self,
         slot: SlotId,
@@ -1072,6 +1204,7 @@ impl K3Executor {
             let mut shape = self.shape(bucket, parity, tokens);
             shape.chunk_start = consumed;
             let launches = self.mega_launches_per_step;
+            self.steps_launched += 1;
             if let Some(mega) = self.scratch.mega.as_mut() {
                 mega.begin_step(launches);
             }
@@ -1087,6 +1220,7 @@ impl K3Executor {
                 &mut self.prefill_state,
                 &mut self.scratch,
                 aux,
+                None,
             )?;
             if let Some(mega) = self.scratch.mega.as_ref() {
                 mega.end_step()?;
@@ -1134,6 +1268,191 @@ impl K3Executor {
         };
         self.gpu.sync()?;
         Ok(sampled)
+    }
+
+    fn prefill_cp_inner(
+        &mut self,
+        slot: SlotId,
+        prompt: &[u32],
+        group: &Arc<K3CpGroup>,
+        cp_rank: usize,
+    ) -> Result<Option<u32>> {
+        let cp_size = group.cp_size();
+        ensure!(cp_rank < cp_size, "K3 CP rank {cp_rank} of {cp_size}");
+        ensure!(
+            prompt.len() <= self.max_ctx,
+            "K3 CP prompt of {} tokens exceeds the {} context",
+            prompt.len(),
+            self.max_ctx
+        );
+        ensure!(
+            cp::k3_cp_admits(prompt.len(), cp_size, self.chunk_tokens),
+            "K3 CP prefill cannot serve {} tokens over {cp_size} ranks: every segment must \
+             outspan the conv window and fit the {} chunk cap (M0: one chunk per rank)",
+            prompt.len(),
+            self.chunk_tokens
+        );
+        let segments = cp::k3_cp_segments(prompt.len(), cp_size);
+        let (seg_start, seg_len) = segments[cp_rank];
+        let owner = cp_rank + 1 == cp_size;
+        ensure!(
+            !owner || slot < self.max_batch,
+            "K3 CP slot {slot} is out of range"
+        );
+        ensure!(
+            self.dspark.is_none(),
+            "K3 CP prefill does not feed the dspark draft lane; disarm it"
+        );
+        self.enter_step()?;
+        self.prefill_state.reset_row(&self.ctx, 0)?;
+        self.ensure_cp_scratch(group, cp_rank, segments)?;
+
+        // Stage the segment at global positions for causality. Only the OWNER
+        // stages the paged pool (at global positions): the step's normal
+        // latent append lands its own segment where decode will read it, and
+        // the upstream rows are persisted during the MLA exchange into the
+        // pages mapped here. The FMHA reads the exchanged context, never the
+        // pool, so non-owner rows carry the padding row index and the append
+        // skips them.
+        let bucket = k3_chunk_bucket(seg_len)?;
+        if owner {
+            for position in 0..seg_start {
+                self.prefill_state
+                    .kv
+                    .ensure_mapped(&self.ctx, 0, position)?;
+            }
+            let upstream: Vec<i32> = (0..seg_start)
+                .map(|position| self.prefill_state.kv.write_index(0, position))
+                .collect::<Result<_>>()?;
+            let scratch = self
+                .cp_scratch
+                .as_mut()
+                .expect("ensure_cp_scratch just built this");
+            scratch.set_upstream_rows(&self.ctx, &upstream)?;
+        } else if let Some(scratch) = self.cp_scratch.as_mut() {
+            scratch.clear_upstream_rows();
+        }
+        for (row, token) in prompt[seg_start..seg_start + seg_len].iter().enumerate() {
+            self.token_host[row] = *token;
+            self.context_len_host[row] = i32::try_from(seg_start + row + 1)?;
+            self.kv_row_host[row] = if owner {
+                let position = seg_start + row;
+                self.prefill_state
+                    .kv
+                    .ensure_mapped(&self.ctx, 0, position)?;
+                self.prefill_state.kv.write_index(0, position)?
+            } else {
+                -1
+            };
+        }
+        for row in seg_len..bucket {
+            self.token_host[row] = 0;
+            self.context_len_host[row] = 1;
+            self.kv_row_host[row] = -1;
+        }
+        self.prefill_state.kv.mirror_row_table(0, bucket)?;
+        self.feed()?;
+        self.prefill_state.kv.sync_table(&self.ctx)?;
+        let mut shape = self.shape(bucket, 0, seg_len);
+        shape.chunk_start = seg_start;
+        let launches = self.mega_launches_per_step;
+        self.steps_launched += 1;
+        if let Some(mega) = self.scratch.mega.as_mut() {
+            mega.begin_step(launches);
+        }
+        k3_prefill_chunk_step(
+            &self.ctx,
+            &self.model,
+            shape,
+            &mut self.prefill_state,
+            &mut self.scratch,
+            None,
+            self.cp_scratch.as_deref_mut(),
+        )?;
+        if let Some(mega) = self.scratch.mega.as_ref() {
+            mega.end_step()?;
+        }
+        if owner {
+            // The owner's post-chunk state IS the whole prompt's: the merged
+            // upstream KDA state fed its chunk, its conv window is the prompt
+            // tail, and its pool covers positions 0..len. Sample the boundary
+            // and adopt into the decode slot exactly like a CP1 prefill.
+            self.prefill_state.positions[0] = prompt.len();
+            self.prefill_state
+                .collapse_snapshots(&self.ctx, seg_len - 1)?;
+            k3_prefill_boundary_sample(
+                &self.ctx,
+                &self.model,
+                seg_len - 1,
+                &self.prefill_state.blocks,
+                &mut self.scratch,
+            )?;
+            let sampled = self.sampled(1)?[0] as u32;
+            self.decode_state.reset_row(&self.ctx, slot)?;
+            let target_parity = self.parity;
+            // The single CP chunk ran at parity 0 and wrote parity 1.
+            self.decode_state.adopt_row(
+                &self.ctx,
+                &self.prefill_state,
+                0,
+                1,
+                slot,
+                target_parity,
+            )?;
+            self.spec[slot] = K3SpecSlot {
+                parity: target_parity,
+                ..K3SpecSlot::default()
+            };
+            self.gpu.sync()?;
+            Ok(Some(sampled))
+        } else {
+            self.gpu.sync()?;
+            Ok(None)
+        }
+    }
+
+    /// Build (or re-arm) the CP working set for this superstep. The pool
+    /// grants to the gang's other local devices are opened BEFORE the
+    /// buffers are allocated — a grant covers only allocations made after it.
+    /// In-process EP worlds opened these pairs for the MegaMoE slabs already
+    /// (the call is idempotent); on a fleet the mega slabs are fabric
+    /// mappings and never touch the pool, so the CP exchange must open its
+    /// own.
+    fn ensure_cp_scratch(
+        &mut self,
+        group: &Arc<K3CpGroup>,
+        cp_rank: usize,
+        segments: Vec<(usize, usize)>,
+    ) -> Result<()> {
+        if let Some(scratch) = self.cp_scratch.as_ref() {
+            // One gang per process, one seg_cap per executor — the scratch
+            // built once serves every superstep.
+            ensure!(
+                Arc::ptr_eq(&scratch.group, group),
+                "K3 CP scratch was built for a different gang"
+            );
+        } else {
+            for device in 0..group.cp_size() {
+                pegainfer_kernels::ops::k3_mega_open_peer_access(self.ctx.device_ordinal, device)
+                    .with_context(|| {
+                    format!(
+                        "K3 CP rank {cp_rank} cannot grant device {device} access to its \
+                             exchange buffers"
+                    )
+                })?;
+            }
+            self.cp_scratch = Some(Box::new(K3CpScratch::new(
+                &self.ctx,
+                group.clone(),
+                k3_chunk_bucket(self.chunk_tokens)?,
+            )?));
+            // Live and zeroed before any peer learns the pointers.
+            self.gpu.sync()?;
+        }
+        self.cp_scratch
+            .as_mut()
+            .expect("built above")
+            .arm(&self.ctx, cp_rank, segments)
     }
 
     /// One decode step.
@@ -1299,6 +1618,7 @@ impl K3Executor {
         // pending lengths, so there is no fixed body to capture.
         let shape = self.shape(bucket, 0, rows);
         let launches = self.mega_launches_per_step;
+        self.steps_launched += 1;
         if let Some(mega) = self.scratch.mega.as_mut() {
             mega.begin_step(launches);
         }

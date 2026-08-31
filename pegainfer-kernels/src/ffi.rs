@@ -8,6 +8,8 @@ pub type Half = u16;
 mod deepep;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
+#[cfg(feature = "gemma4")]
+mod gemma4;
 #[cfg(feature = "glm52")]
 mod glm52;
 #[cfg(feature = "k3")]
@@ -23,6 +25,8 @@ mod shared;
 pub use deepep::*;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
+#[cfg(feature = "gemma4")]
+pub use gemma4::*;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
 #[cfg(feature = "k3")]

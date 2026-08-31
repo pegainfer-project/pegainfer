@@ -320,22 +320,41 @@ jobs:
           PEGAINFER_CUDA_SM: "80"
           PEGAINFER_NVCC_JOBS: "2"
 
-  qwen35-cuda:
+  feature-model-cuda:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
-    name: Qwen3.5 CUDA ${{ matrix.gate }} (sm_80)
+    name: ${{ matrix.model_name }} CUDA ${{ matrix.gate_name }} (sm_80)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
+      CUDA_PATH: /usr/local/cuda
+      PEGAINFER_CUDA_SM: "80"
+      PEGAINFER_NVCC_JOBS: "2"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
       matrix:
+        model: [gemma4, qwen35]
+        gate: [compile, clippy]
         include:
-          - gate: Compile
+          - model: gemma4
+            model_name: Gemma 4
+            package: pegainfer-gemma4
+            feature: gemma4
+            needs_triton: false
+            triton_python: ""
+          - model: qwen35
+            model_name: Qwen3.5
+            package: pegainfer-qwen35
+            feature: qwen35
+            needs_triton: true
+            triton_python: python
+          - gate: compile
+            gate_name: Compile
             cargo_command: check
             trailing_args: ""
-          - gate: Clippy
+          - gate: clippy
+            gate_name: Clippy
             cargo_command: clippy
             trailing_args: "-- -D warnings"
 
@@ -367,23 +386,22 @@ jobs:
           non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
 
       - name: Install Python
+        if: matrix.needs_triton
         uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
-      - name: Install Qwen3.5 build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libibverbs-dev
-          python -m pip install "triton==3.7.1"
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libibverbs-dev
 
-      - name: Run Qwen3.5 ${{ matrix.gate }}
+      - name: Install Triton
+        if: matrix.needs_triton
+        run: python -m pip install "triton==3.7.1"
+
+      - name: Run ${{ matrix.model_name }} ${{ matrix.gate_name }}
         run: >-
           cargo ${{ matrix.cargo_command }} --release --locked
-          -p pegainfer-qwen35 --features qwen35 --all-targets
+          -p ${{ matrix.package }} --features ${{ matrix.feature }} --all-targets
           ${{ matrix.trailing_args }}
         env:
-          CUDA_PATH: /usr/local/cuda
-          PEGAINFER_CUDA_SM: "80"
-          PEGAINFER_NVCC_JOBS: "2"
-          PEGAINFER_TRITON_PYTHON: python
+          PEGAINFER_TRITON_PYTHON: ${{ matrix.triton_python }}

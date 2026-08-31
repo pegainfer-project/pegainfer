@@ -42,6 +42,30 @@ Docs, guides, and engineering deep-dives live at [pegainfer.org](https://pegainf
 
 ## Quickstart
 
+### Prebuilt Qwen3 binary
+
+Starting with v0.1.1, PegaInfer provides a Qwen3-only CUDA 13 binary for Linux
+x86_64. The archive includes the CUDA runtime and cuBLAS; the host supplies
+NVIDIA driver 580 or newer, glibc 2.35 or newer, and OpenSSL 3. Install or
+update it in the current user's home directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pegainfer-project/pegainfer/main/install.sh | bash
+```
+
+If `pegainfer` is not found in the current shell after installation, run:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Set `PEGAINFER_VERSION=v0.1.1` to install that exact release. Model weights are
+not part of the binary archive; download a Qwen3 checkpoint separately and run:
+
+```bash
+pegainfer --model-path models/Qwen3-4B
+```
+
 ### Prerequisites
 
 - Rust (2024 edition), CUDA Toolkit (nvcc, cuBLAS), CUDA-capable GPU
@@ -67,12 +91,12 @@ cargo run --release
 # Try it
 curl -s http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "The capital of France is", "max_tokens": 32}'
+  -d '{"model": "models/Qwen3-4B", "prompt": "The capital of France is", "max_tokens": 32}'
 
 # Streaming
 curl -N http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Write a haiku about Rust:", "max_tokens": 64, "stream": true}'
+  -d '{"model": "models/Qwen3-4B", "prompt": "Write a haiku about Rust:", "max_tokens": 64, "stream": true}'
 ```
 
 > Always use `--release`. Debug builds are extremely slow for GPU/CUDA code.

@@ -30,6 +30,7 @@
 
 #ifdef K3_FLASH_KDA_SM90A
 #include "fwd_launch.cu"
+#include "k3_flash_kda_md.cuh"
 #endif
 
 // Not in an anonymous namespace: nvcc's device-stub generation trips over an
@@ -139,6 +140,59 @@ CUresult k3_flash_kda_fwd(
         h,
         /*N=*/1,
         /*cu_seqlens=*/nullptr,
+        a_log,
+        dt_bias,
+        gate_scale,
+        stream
+    );
+    return k3_flash_kda_map_cuda_error(cudaGetLastError());
+#endif
+}
+
+// Fused KCP package forward: one kernel-1 pass plus the dual-state kernel 2
+// (k3_flash_kda_md.cuh), producing the segment's affine package in one sweep:
+// `state_out_d` = D (real v from zero state) and `state_out_m` = M (v = 0
+// from identity state). No token output — a CP middle rank discards it.
+// Same operand contract and workspace as k3_flash_kda_fwd.
+CUresult k3_flash_kda_fwd_md(
+    const void* q,          // [T, H, 128] bf16
+    const void* k,          // [T, H, 128] bf16
+    const void* v,          // [T, H, 128] bf16
+    const void* g,          // [T, H, 128] bf16, pre-activation gate
+    const void* beta_ht,    // [H, T] bf16, beta logits
+    const float* a_log,     // [H]
+    const float* dt_bias,   // [H, 128]
+    void* state_out_d,      // [H, 128, 128] f32
+    void* state_out_m,      // [H, 128, 128] f32
+    void* workspace,        // k3_flash_kda_workspace_bytes(t_total, h)
+    int t_total,
+    int h,
+    float scale,
+    float lower_bound,
+    cudaStream_t stream
+) {
+#ifndef K3_FLASH_KDA_SM90A
+    (void)q; (void)k; (void)v; (void)g; (void)beta_ht; (void)a_log;
+    (void)dt_bias; (void)state_out_d; (void)state_out_m; (void)workspace;
+    (void)t_total; (void)h; (void)scale; (void)lower_bound; (void)stream;
+    return CUDA_ERROR_NOT_SUPPORTED;
+#else
+    constexpr int kChunk = 16;
+    int total_tiles = (t_total + kChunk - 1) / kChunk;
+    float gate_scale = lower_bound * 1.4426950408889634f;
+    launch_fwd_md<128>(
+        static_cast<cutlass::bfloat16_t const*>(q),
+        static_cast<cutlass::bfloat16_t const*>(k),
+        static_cast<cutlass::bfloat16_t const*>(v),
+        static_cast<cutlass::bfloat16_t const*>(g),
+        static_cast<cutlass::bfloat16_t const*>(beta_ht),
+        scale,
+        static_cast<float*>(state_out_d),
+        static_cast<float*>(state_out_m),
+        workspace,
+        total_tiles,
+        t_total,
+        h,
         a_log,
         dt_bias,
         gate_scale,

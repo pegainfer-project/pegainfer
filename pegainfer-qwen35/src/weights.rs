@@ -26,6 +26,7 @@ use safetensors::SafeTensors;
 
 use super::config::Config35;
 use super::config::LayerType;
+use super::config::LocalGeometry;
 use super::config::TensorParallelConfig;
 
 /// Full attention layer weights (8 layers in Qwen3.5-4B).
@@ -112,7 +113,7 @@ pub struct Qwen35Model {
     #[cfg(feature = "gdn-validation")]
     pub(super) gdn_validation_evidence: super::gdn_validation::GdnValidationEvidenceHandle,
     pub(super) config: Config35,
-    pub(super) tensor_parallel: TensorParallelConfig,
+    pub(super) geometry: LocalGeometry,
     pub(super) embed_tokens: DeviceMatrix,
     lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock35>,
@@ -213,7 +214,8 @@ impl Qwen35Model {
 
         let mut config = Config35::from_file(model_path)?;
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
-        tensor_parallel.validate_for(&config, runtime.enable_cuda_graph)?;
+        let geometry = LocalGeometry::try_new(&config, tensor_parallel, runtime.enable_cuda_graph)
+            .map_err(anyhow::Error::from)?;
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}, tp_rank={}, tp_world_size={}",
             config.hidden_size,
@@ -221,28 +223,23 @@ impl Qwen35Model {
             config.num_full_attention_layers(),
             config.num_hidden_layers - config.num_full_attention_layers(),
             config.max_position_embeddings,
-            tensor_parallel.rank,
-            tensor_parallel.world_size,
+            geometry.rank(),
+            geometry.world_size(),
         );
         let effective_vocab = super::config::tokenizer_effective_vocab(model_path)?;
-        anyhow::ensure!(
-            effective_vocab <= config.vocab_size,
-            "tokenizer defines ids up to {} but checkpoint vocab_size is {}",
-            effective_vocab - 1,
-            config.vocab_size,
-        );
-        if effective_vocab < config.vocab_size {
-            config.selection_vocab = effective_vocab;
+        config
+            .bound_selection_vocab(effective_vocab)
+            .map_err(anyhow::Error::from)?;
+        if config.selection_vocab < config.vocab_size {
             info!(
                 "output projection: selection bounded to decodable vocab {} (checkpoint pads to {})",
-                effective_vocab, config.vocab_size
+                config.selection_vocab, config.vocab_size
             );
         }
 
         let (shard_paths, weight_map) = load_shard_info_fixed(model_path)?;
         debug!("Loading {} safetensor shard(s)", shard_paths.len());
-        let prefetch =
-            (tensor_parallel.world_size == 1).then(|| WeightPrefetch::spawn(&shard_paths));
+        let prefetch = (geometry.world_size() == 1).then(|| WeightPrefetch::spawn(&shard_paths));
         let mmaps = mmap_shards(&shard_paths)?;
         let shards = deserialize_shards(&mmaps)?;
 
@@ -284,9 +281,9 @@ impl Qwen35Model {
             config.num_hidden_layers
         );
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        let (_, q_rows) = tensor_parallel.shard_range(config.full_attn_q_dim());
-        let (kv_row_offset, kv_rows) = tensor_parallel.shard_range(config.full_attn_kv_dim());
-        let (inter_row_offset, inter_rows) = tensor_parallel.shard_range(config.intermediate_size);
+        let (_, q_rows) = geometry.shard_range(config.full_attn_q_dim());
+        let (kv_row_offset, kv_rows) = geometry.shard_range(config.full_attn_kv_dim());
+        let (inter_row_offset, inter_rows) = geometry.shard_range(config.intermediate_size);
         for i in 0..config.num_hidden_layers {
             let prefix = format!("{}.layers.{}", wp, i);
             let layer_type = config.layer_types[i];
@@ -301,14 +298,14 @@ impl Qwen35Model {
                             &weight_map,
                             &format!("{}.q_proj.weight", attn_prefix),
                             &config,
-                            tensor_parallel,
+                            geometry,
                         )?,
                         k_proj: load_tensor_2d_row_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.k_proj.weight", attn_prefix),
-                            tensor_parallel,
+                            geometry,
                             kv_row_offset,
                             kv_rows,
                         )?,
@@ -317,7 +314,7 @@ impl Qwen35Model {
                             &shards,
                             &weight_map,
                             &format!("{}.v_proj.weight", attn_prefix),
-                            tensor_parallel,
+                            geometry,
                             kv_row_offset,
                             kv_rows,
                         )?,
@@ -326,8 +323,8 @@ impl Qwen35Model {
                             &shards,
                             &weight_map,
                             &format!("{}.o_proj.weight", attn_prefix),
-                            tensor_parallel,
-                            tensor_parallel.shard_range(config.full_attn_q_dim()).0,
+                            geometry,
+                            geometry.shard_range(config.full_attn_q_dim()).0,
                             q_rows,
                         )?,
                         q_norm: load_tensor_1d(
@@ -410,7 +407,7 @@ impl Qwen35Model {
                 &shards,
                 &weight_map,
                 &format!("{}.mlp.gate_proj.weight", prefix),
-                tensor_parallel,
+                geometry,
                 inter_row_offset,
                 inter_rows,
             )?;
@@ -419,7 +416,7 @@ impl Qwen35Model {
                 &shards,
                 &weight_map,
                 &format!("{}.mlp.up_proj.weight", prefix),
-                tensor_parallel,
+                geometry,
                 inter_row_offset,
                 inter_rows,
             )?;
@@ -448,7 +445,7 @@ impl Qwen35Model {
                         &shards,
                         &weight_map,
                         &format!("{}.mlp.down_proj.weight", prefix),
-                        tensor_parallel,
+                        geometry,
                         inter_row_offset,
                         inter_rows,
                     )?,
@@ -496,7 +493,7 @@ impl Qwen35Model {
         let num_full_layers = config.num_full_attention_layers();
         let layout = pegainfer_core::kv_pool::KvLayout::new(
             num_full_layers,
-            config.local_num_key_value_heads(tensor_parallel),
+            geometry.local_num_key_value_heads(),
             config.head_dim,
             page_size,
         )
@@ -537,7 +534,7 @@ impl Qwen35Model {
         let kv_pool = pegainfer_core::kv_pool::KvPool::new(
             &ctx,
             num_full_layers,
-            config.local_num_key_value_heads(tensor_parallel),
+            geometry.local_num_key_value_heads(),
             config.head_dim,
             page_size,
             num_pages,
@@ -578,7 +575,7 @@ impl Qwen35Model {
             #[cfg(feature = "gdn-validation")]
             gdn_validation_evidence: Default::default(),
             config,
-            tensor_parallel,
+            geometry,
             embed_tokens,
             lm_head,
             layers,
@@ -647,13 +644,13 @@ impl Qwen35Model {
         let ctx = &self.ctx;
         let hidden = self.config.hidden_size;
         let vocab = self.config.selection_vocab;
-        let tp = self.tensor_parallel;
-        let full_q = self.config.local_full_attn_gated_q_dim(tp);
-        let full_kv = self.config.local_full_attn_kv_dim(tp);
+        let geom = self.geometry;
+        let full_q = geom.local_full_attn_gated_q_dim();
+        let full_kv = geom.local_full_attn_kv_dim();
         let linear_qkv = self.config.linear_attn_qkv_dim();
         let linear_z = self.config.linear_attn_z_dim();
         let linear_ba = self.config.linear_num_value_heads;
-        let intermediate = self.config.local_intermediate_size(tp);
+        let intermediate = geom.local_intermediate_size();
 
         let full_q_samples: Vec<_> = self
             .layers
@@ -769,7 +766,7 @@ impl Qwen35Model {
         let graph = super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
             &self.ctx,
             &self.config,
-            self.tensor_parallel,
+            self.geometry,
             &self.kv_pool,
             max_batch,
         )?;
@@ -785,7 +782,7 @@ impl Qwen35Model {
         super::decode_buffers::BatchDecodeBuffers35::new(
             &self.ctx,
             &self.config,
-            self.tensor_parallel,
+            self.geometry,
             max_batch,
             self.kv_pool.capacity_pages(),
             self.kv_pool.padding_page_id(),
@@ -817,12 +814,12 @@ struct GatedQShardRange {
 
 fn full_attention_gated_q_shard_range(
     config: &Config35,
-    tensor_parallel: TensorParallelConfig,
+    geometry: LocalGeometry,
 ) -> GatedQShardRange {
     // HF/PegaInfer kernels interpret q_proj rows as per-head [q, gate] chunks.
     // Keep each local head's q rows adjacent to its gate rows.
-    let local_heads = config.local_num_attention_heads(tensor_parallel);
-    let head_start = tensor_parallel.rank * local_heads;
+    let local_heads = geometry.local_num_attention_heads();
+    let head_start = geometry.rank() * local_heads;
     GatedQShardRange {
         row_offset: head_start * config.head_dim * 2,
         rows: local_heads * config.head_dim * 2,
@@ -835,13 +832,13 @@ fn load_full_attention_gated_q_proj(
     weight_map: &HashMap<String, usize>,
     name: &str,
     config: &Config35,
-    tensor_parallel: TensorParallelConfig,
+    geometry: LocalGeometry,
 ) -> Result<DeviceMatrix> {
-    if !tensor_parallel.is_sharded() {
+    if !geometry.is_sharded() {
         return load_tensor_2d(ctx, shards, weight_map, name);
     }
 
-    let range = full_attention_gated_q_shard_range(config, tensor_parallel);
+    let range = full_attention_gated_q_shard_range(config, geometry);
     load_tensor_2d_row_shard(ctx, shards, weight_map, name, range.row_offset, range.rows)
 }
 
@@ -850,11 +847,11 @@ fn load_tensor_2d_row_shard_if_needed(
     shards: &[SafeTensors],
     weight_map: &HashMap<String, usize>,
     name: &str,
-    tensor_parallel: TensorParallelConfig,
+    geometry: LocalGeometry,
     row_offset: usize,
     rows: usize,
 ) -> Result<DeviceMatrix> {
-    if tensor_parallel.is_sharded() {
+    if geometry.is_sharded() {
         load_tensor_2d_row_shard(ctx, shards, weight_map, name, row_offset, rows)
     } else {
         load_tensor_2d(ctx, shards, weight_map, name)
@@ -866,11 +863,11 @@ fn load_tensor_2d_col_shard_if_needed(
     shards: &[SafeTensors],
     weight_map: &HashMap<String, usize>,
     name: &str,
-    tensor_parallel: TensorParallelConfig,
+    geometry: LocalGeometry,
     col_offset: usize,
     cols: usize,
 ) -> Result<DeviceMatrix> {
-    if tensor_parallel.is_sharded() {
+    if geometry.is_sharded() {
         load_tensor_2d_col_shard(ctx, shards, weight_map, name, col_offset, cols)
     } else {
         load_tensor_2d(ctx, shards, weight_map, name)
@@ -882,41 +879,47 @@ mod tests {
     use super::*;
 
     fn test_config() -> Config35 {
-        Config35 {
-            hidden_size: 2560,
-            intermediate_size: 9216,
-            num_hidden_layers: 32,
-            vocab_size: 248_320,
-            selection_vocab: 248_320,
-            rms_norm_eps: 1e-6,
-            eos_token_id: 151_645,
-            num_attention_heads: 16,
-            num_key_value_heads: 4,
-            head_dim: 256,
-            linear_num_key_heads: 16,
-            linear_key_head_dim: 128,
-            linear_num_value_heads: 32,
-            linear_value_head_dim: 128,
-            linear_conv_kernel_dim: 4,
-            rope_theta: 10_000.0,
-            rotary_dim: 64,
-            max_position_embeddings: 262_144,
-            tie_word_embeddings: true,
-            layer_types: vec![LayerType::LinearAttention; 32],
-        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+  "max_position_embeddings": 262144,
+  "tie_word_embeddings": true,
+  "text_config": {
+    "hidden_size": 2560,
+    "intermediate_size": 9216,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "vocab_size": 248320,
+    "rms_norm_eps": 1e-6,
+    "layer_types": ["linear_attention"],
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_value_head_dim": 128,
+    "rope_parameters": { "rope_theta": 10000.0, "partial_rotary_factor": 0.25 },
+    "eos_token_id": 151645
+  }
+}"#,
+        )
+        .unwrap();
+        Config35::from_file(dir.path().to_str().unwrap()).expect("fixture validates")
+    }
+
+    fn test_geometry(rank: usize, world_size: usize) -> LocalGeometry {
+        let config = test_config();
+        let tp = TensorParallelConfig::try_from((rank, world_size)).unwrap();
+        LocalGeometry::try_new(&config, tp, false).unwrap()
     }
 
     #[test]
     fn gated_q_shard_range_keeps_matching_q_and_gate_rows() {
         let config = test_config();
 
-        let rank0 = full_attention_gated_q_shard_range(
-            &config,
-            TensorParallelConfig {
-                rank: 0,
-                world_size: 2,
-            },
-        );
+        let rank0 = full_attention_gated_q_shard_range(&config, test_geometry(0, 2));
         assert_eq!(
             rank0,
             GatedQShardRange {
@@ -925,13 +928,7 @@ mod tests {
             }
         );
 
-        let rank1 = full_attention_gated_q_shard_range(
-            &config,
-            TensorParallelConfig {
-                rank: 1,
-                world_size: 2,
-            },
-        );
+        let rank1 = full_attention_gated_q_shard_range(&config, test_geometry(1, 2));
         assert_eq!(
             rank1,
             GatedQShardRange {
@@ -944,14 +941,11 @@ mod tests {
     #[test]
     fn mlp_tp2_uses_matching_gate_up_rows_and_down_cols() {
         let config = test_config();
-        let tp = TensorParallelConfig {
-            rank: 1,
-            world_size: 2,
-        };
+        let geom = test_geometry(1, 2);
 
-        let (inter_offset, inter_rows) = tp.shard_range(config.intermediate_size);
+        let (inter_offset, inter_rows) = geom.shard_range(config.intermediate_size);
         assert_eq!((inter_offset, inter_rows), (4608, 4608));
-        assert_eq!(config.local_intermediate_size(tp), inter_rows);
+        assert_eq!(geom.local_intermediate_size(), inter_rows);
 
         let local_gate_up_rows = 2 * inter_rows;
         let local_down_cols = inter_rows;

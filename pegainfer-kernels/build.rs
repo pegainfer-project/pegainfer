@@ -890,6 +890,29 @@ fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
     }
 }
 
+/// The Marlin substrate (csrc/marlin/): shared by every four-bit weight, so it
+/// rides whichever of its consumers is enabled rather than a feature of its own.
+fn is_marlin_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "marlin"),
+        Err(_) => false,
+    }
+}
+
+/// Gemma 4 model-local CUDA. The NVFP4 conversion intrinsics arrived in CUDA
+/// 12.8, so keeping this out of the default build keeps the toolkit floor
+/// where the other model lines put it.
+fn is_gemma4_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "gemma4"),
+        Err(_) => false,
+    }
+}
+
 /// GLM5.2 model-local CUDA shims over DeepGEMM/FlashMLA contracts.
 fn is_glm52_source(csrc_dir: &Path, path: &Path) -> bool {
     match path.strip_prefix(csrc_dir) {
@@ -2049,6 +2072,7 @@ fn main() {
     let arch_args = nvcc_arch_args(&nvcc_sm_targets);
     let deepseek_v2_lite_enabled = cfg!(feature = "deepseek-v2-lite");
     let moe_enabled = cfg!(feature = "moe");
+    let gemma4_enabled = cfg!(feature = "gemma4");
     let glm52_enabled = cfg!(feature = "glm52");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
     // --- k3: DeepGEMM-only, no DeepEP/NCCL dependency ---
@@ -2114,6 +2138,12 @@ fn main() {
             // The GLM5.2 shim instantiations (EP4..EP64) ride the deepep
             // flags but only exist for the glm52 feature.
             if !glm52_enabled && file_name.starts_with("deepep_shim_glm52") {
+                return None;
+            }
+            if !gemma4_enabled && is_gemma4_source(&csrc_dir, path) {
+                return None;
+            }
+            if !gemma4_enabled && !kimi_k2_enabled && is_marlin_source(&csrc_dir, path) {
                 return None;
             }
             if !glm52_enabled && is_glm52_source(&csrc_dir, path) {
@@ -2344,7 +2374,7 @@ fn main() {
                 flashinfer.spdlog.to_string_lossy().to_string(),
                 "-I".to_string(),
                 csrc_dir
-                    .join("kimi_k2/vllm_marlin")
+                    .join("marlin/vllm_marlin")
                     .to_string_lossy()
                     .to_string(),
             ]);
@@ -2378,7 +2408,7 @@ fn main() {
             ]);
         }
 
-        if stem.starts_with("kimi_") {
+        if stem.starts_with("kimi_") || stem.starts_with("marlin_nvfp4") {
             for dir in &flashinfer.cccl {
                 nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
             }
@@ -2396,8 +2426,10 @@ fn main() {
                 "-I".to_string(),
                 flashinfer.spdlog.to_string_lossy().to_string(),
                 "-I".to_string(),
+                csrc_dir.join("marlin").to_string_lossy().to_string(),
+                "-I".to_string(),
                 csrc_dir
-                    .join("kimi_k2/vllm_marlin")
+                    .join("marlin/vllm_marlin")
                     .to_string_lossy()
                     .to_string(),
             ]);

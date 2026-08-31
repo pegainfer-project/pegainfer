@@ -148,6 +148,15 @@ fn checkpoint() -> Option<PathBuf> {
     path.join("config.json").exists().then_some(path)
 }
 
+/// The gates load through the pinned double-buffer uploader by default —
+/// the same bytes, much faster on a warm page cache.
+/// `PEGAINFER_K3_WEIGHT_STAGING=0` falls back to the serial pageable-mmap
+/// path (e.g. a cold network-filesystem first run). Both worlds
+/// see the same setting, so the oracle still differs only in world size.
+fn weight_staging() -> bool {
+    std::env::var("PEGAINFER_K3_WEIGHT_STAGING").as_deref() != Ok("0")
+}
+
 /// Every rank — and the single-rank reference — runs the same geometry, so the
 /// only thing under test is the expert parallelism.
 fn config(fixture: &Fixture) -> K3ExecutorConfig {
@@ -161,6 +170,7 @@ fn config(fixture: &Fixture) -> K3ExecutorConfig {
         // match. (The single-rank mega path does capture; this pins it off so
         // the two differ only in world size.)
         cuda_graph: false,
+        weight_staging: weight_staging(),
         moe_transport: K3MoeTransport::MEGA,
     }
 }

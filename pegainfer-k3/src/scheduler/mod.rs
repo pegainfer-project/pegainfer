@@ -16,10 +16,12 @@
 //! silence, on its next touch.
 
 mod executor;
+mod gang;
 #[cfg(test)]
 mod tests;
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use anyhow::Result;
 use pegainfer_frontend::engine::Engine;
@@ -38,6 +40,8 @@ use pegainfer_frontend::engine::spawn_scheduler;
 pub use self::executor::DecodeSlot;
 pub use self::executor::SlotId;
 pub use self::executor::StepExecutor;
+pub use self::gang::K3CpGang;
+use crate::executor::cp::k3_cp_admits;
 
 // ── Engine assembly ─────────────────────────────────────────────────────
 
@@ -51,6 +55,22 @@ pub struct K3SchedulerConfig {
     /// own a pool yet. Injected rather than asked of the executor so the
     /// number the frontend plans against is decided in one place.
     pub kv_capacity: Option<KvCapacity>,
+    /// Context-parallel prefill serving, when armed. `None` = every prompt
+    /// prefills on its own partition.
+    pub cp: Option<K3CpServing>,
+}
+
+/// The armed CP prefill lane: the gang handle plus the admission window that
+/// decides which prompts are worth gang-prefilling.
+#[derive(Clone, Debug)]
+pub struct K3CpServing {
+    pub gang: Arc<K3CpGang>,
+    /// Prompts shorter than this prefill locally — below it the gang's
+    /// coordination overhead outweighs the split.
+    pub min_tokens: usize,
+    /// The executors' prefill chunk cap. A CP segment must fit one chunk
+    /// (M0: one chunk step per rank), so this bounds eligibility from above.
+    pub chunk_tokens: usize,
 }
 
 /// Wrap ready executors in schedulers and hand the whole thing to the
@@ -69,7 +89,7 @@ where
         .map(|(rank, executor)| {
             spawn_scheduler(
                 &format!("k3-scheduler-{rank}"),
-                K3Scheduler::new(executor, config.clone()),
+                K3Scheduler::new(executor, rank, config.clone()),
             )
         })
         .collect();
@@ -111,8 +131,12 @@ struct RunningRequest {
 
 pub struct K3Scheduler<E: StepExecutor> {
     executor: E,
+    /// This scheduler's partition index — its identity in the CP gang.
+    partition: usize,
     eos_token_ids: Vec<u32>,
     kv_capacity: Option<KvCapacity>,
+    /// The CP prefill lane, when the engine armed one.
+    cp: Option<K3CpServing>,
     /// Requests waiting for a slot, in submit order. A full batch is a
     /// wait, not a verdict — only permanently unservable requests are refused
     /// (see [`K3Scheduler::admission_refusal`]).
@@ -123,16 +147,43 @@ pub struct K3Scheduler<E: StepExecutor> {
 }
 
 impl<E: StepExecutor> K3Scheduler<E> {
-    pub fn new(executor: E, config: K3SchedulerConfig) -> Self {
+    pub fn new(executor: E, partition: usize, config: K3SchedulerConfig) -> Self {
+        if let Some(cp) = &config.cp {
+            assert!(
+                partition < cp.gang.size(),
+                "partition {partition} outside the CP gang of {}",
+                cp.gang.size()
+            );
+        }
         let free_slots = (0..executor.max_batch()).rev().collect();
         Self {
             executor,
+            partition,
             eos_token_ids: config.eos_token_ids,
             kv_capacity: config.kv_capacity,
+            cp: config.cp,
             queued: VecDeque::new(),
             running: Vec::new(),
             free_slots,
         }
+    }
+
+    /// The gang to CP-prefill `prompt_len` tokens with, if the lane is armed
+    /// and the prompt sits in its window: long enough to be worth the gang,
+    /// and admissible under the executors' chunk cap (M0).
+    fn cp_gang_for(&self, prompt_len: usize) -> Option<Arc<K3CpGang>> {
+        let cp = self.cp.as_ref()?;
+        (prompt_len >= cp.min_tokens && k3_cp_admits(prompt_len, cp.gang.size(), cp.chunk_tokens))
+            .then(|| cp.gang.clone())
+    }
+
+    /// Serve pending CP gang jobs posted by peer partitions. Runs at the top
+    /// of every step so a posted gang assembles within one step time.
+    fn serve_gang(&mut self) -> Result<()> {
+        let Some(gang) = self.cp.as_ref().map(|cp| cp.gang.clone()) else {
+            return Ok(());
+        };
+        gang.serve(self.partition, &mut self.executor)
     }
 
     /// Hand a slot back: the executor drops its state, the scheduler its
@@ -162,8 +213,9 @@ impl<E: StepExecutor> K3Scheduler<E> {
     }
 
     /// Fill free slots from the queue: retire what the frontend abandoned,
-    /// refuse what can never fit, prefill the rest.
-    fn admit_queued(&mut self, ledger: &mut RequestLedger) {
+    /// refuse what can never fit, prefill the rest. `Err` means a gang
+    /// prefill failed — never a local one, which is the request's problem.
+    fn admit_queued(&mut self, ledger: &mut RequestLedger) -> Result<()> {
         while !self.free_slots.is_empty() {
             let Some(pending) = self.queued.pop_front() else {
                 break;
@@ -187,19 +239,41 @@ impl<E: StepExecutor> K3Scheduler<E> {
                 .free_slots
                 .pop()
                 .expect("loop runs only while a slot is free");
-            let first = self.executor.prefill(
-                slot,
-                &pending.request.prompt_tokens,
-                &pending.request.params,
-            );
-            let first = match first {
-                Ok(token) => token,
-                Err(error) => {
-                    // A prefill failure is this request's problem, not the
-                    // engine's: answer it and keep serving.
-                    self.release_slot(slot);
-                    ledger.fail(id, format!("{error:#}"));
-                    continue;
+            let first = match self.cp_gang_for(pending.request.prompt_tokens.len()) {
+                Some(gang) => {
+                    match gang.post_and_run(
+                        self.partition,
+                        slot,
+                        Arc::from(pending.request.prompt_tokens.as_slice()),
+                        &mut self.executor,
+                    ) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            // A gang failure is never per-request: this
+                            // partition may have left its peers mid-protocol,
+                            // so the engine is beyond use.
+                            self.release_slot(slot);
+                            ledger.fail(id, format!("{error:#}"));
+                            return Err(error);
+                        }
+                    }
+                }
+                None => {
+                    match self.executor.prefill(
+                        slot,
+                        &pending.request.prompt_tokens,
+                        &pending.request.params,
+                    ) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            // A local prefill failure is this request's
+                            // problem, not the engine's: answer it and keep
+                            // serving.
+                            self.release_slot(slot);
+                            ledger.fail(id, format!("{error:#}"));
+                            continue;
+                        }
+                    }
                 }
             };
             let state = RunningRequest {
@@ -223,6 +297,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
             }
             self.running.push(state);
         }
+        Ok(())
     }
 
     /// One decode step over every running request, minus the ones the
@@ -335,10 +410,15 @@ impl<E: StepExecutor> Scheduler for K3Scheduler<E> {
     }
 
     fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
-        self.admit_queued(ledger);
+        // Gang jobs first: a peer partition may be waiting at a CP prefill
+        // rendezvous, and this step's decode would keep it pumping for a
+        // whole extra step time. A serve error propagates: this partition can
+        // no longer hold up its end of the gang, so the engine is beyond use.
+        self.serve_gang()?;
+        self.admit_queued(ledger)?;
         self.decode_running(ledger);
-        // No `Err` path yet: prefill and decode failures are per-request and
-        // absorbed above. `Err` here would mean the engine is beyond use.
+        // Local prefill and decode failures are per-request and absorbed
+        // above; gang failures propagate the same way a serve error does.
         Ok(())
     }
 

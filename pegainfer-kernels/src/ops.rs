@@ -7,6 +7,8 @@ mod deepep;
 mod deepseek_v2_lite;
 mod elementwise;
 mod embedding;
+#[cfg(feature = "gemma4")]
+mod gemma4;
 #[cfg(feature = "glm52")]
 mod glm52;
 #[cfg(feature = "k3")]
@@ -81,11 +83,13 @@ pub use deepep::glm52_deepep_info;
 pub use deepep::glm52_ep_deepep_unique_id;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
+pub use elementwise::SuppressIds;
 pub use elementwise::accumulate_bf16_token_scaled_to_f32_into;
 pub use elementwise::add_batch;
 pub use elementwise::add_batch_into;
 pub use elementwise::add_into;
 pub use elementwise::add_scaled_bf16_into;
+pub use elementwise::advance_decode_metadata;
 pub use elementwise::bf16_bytes_to_f32_into;
 pub use elementwise::bf16_hidden_to_f32_into;
 pub use elementwise::copy_hidden_rows_into;
@@ -112,11 +116,14 @@ pub use elementwise::silu_mul_batch_into;
 pub use elementwise::silu_mul_fused_batch_into;
 pub use elementwise::softcap_bf16_in_place;
 pub use elementwise::split_qkv_into;
+pub use elementwise::suppress_logits_bf16_in_place;
 pub use elementwise::write_vec_into;
 pub use embedding::embedding_batch;
 pub use embedding::embedding_batch_vocab_shard;
 pub use embedding::embedding_decode_into;
 pub use embedding::embedding_rows_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4::*;
 #[cfg(feature = "glm52")]
 pub use glm52::*;
 #[cfg(feature = "k3")]
@@ -144,6 +151,7 @@ pub use linear::gemm_per_token;
 pub use linear::gemm_rows_into;
 pub use linear::gemm_rows_into_checked;
 pub use linear::gemm_strided_batched_bf16;
+pub use linear::gemm_strided_batched_f32;
 pub use linear::gemm_token_range_into_checked;
 pub use linear::gemv;
 pub use linear::linear;
@@ -156,12 +164,16 @@ pub use lora::LoraDecodeGroupedProjection;
 pub use lora::lora_decode_fused_delta_group3_into;
 pub use lora::lora_decode_fused_delta_into;
 pub use lora::pack_lora_b_rows_into;
+pub use norm::dual_rms_norm_add_batch_into;
 pub use norm::fused_add_rms_norm_batch_into;
 pub use norm::fused_add_rms_norm_into;
 pub use norm::fused_add_rms_norm_round_batch_into;
 pub use norm::fused_add_rms_norm_round_into;
 pub use norm::layer_norm_into;
 pub use norm::rms_norm;
+pub use norm::rms_norm_add_rms_norm_round_batch_into;
+pub use norm::rms_norm_add_scale_batch_into;
+pub use norm::rms_norm_batch_dual_into;
 pub use norm::rms_norm_batch_into;
 pub use norm::rms_norm_batch_offset_into;
 pub use norm::rms_norm_gated_batch_into;

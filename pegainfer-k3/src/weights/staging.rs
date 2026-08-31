@@ -28,7 +28,7 @@ use super::K3RankGpuContext;
 const STAGE_BYTES: usize = 32 << 20;
 /// Persistent host memcpy workers per rank; retaining them avoids repeated
 /// thread creation across the tens of thousands of uploads a rank performs.
-const FILL_THREADS: usize = 4;
+pub(crate) const FILL_THREADS: usize = 4;
 /// MXFP4 expert scale tensors are only a few hundred KiB; channel fan-out costs
 /// more than their memcpy. Large projections still use all persistent workers.
 const PARALLEL_FILL_MIN_BYTES: usize = 1 << 20;

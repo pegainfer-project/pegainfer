@@ -125,8 +125,11 @@ async fn main() -> anyhow::Result<()> {
     pegainfer_core::tracing::init();
 
     let registry = ModelLineRegistry::new(model_lines());
-    let cmd = registry
-        .build_command(clap::Command::new("pegainfer").about("PegaInfer GPU inference server"));
+    let cmd = registry.build_command(
+        clap::Command::new("pegainfer")
+            .version(env!("CARGO_PKG_VERSION"))
+            .about("PegaInfer GPU inference server"),
+    );
     let matches = cmd.clone().get_matches();
     let shared = SharedArgs::from_arg_matches(&matches)
         .map_err(|error| anyhow::anyhow!("invalid CLI args: {error}"))?;

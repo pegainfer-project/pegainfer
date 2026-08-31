@@ -1,6 +1,8 @@
 #include "common.cuh"
+#include <climits>
 #include <cstdint>
 #include <cuda.h>
+#include <math_constants.h>
 
 // ============================================================================
 // Element-wise add: out = a + b (bf16, computed in f32)
@@ -351,6 +353,27 @@ __global__ void softcap_bf16_kernel(
 }
 
 // ============================================================================
+// In-place logit suppression. Ids reach here only through the Rust
+// `SuppressIds` type, which refuses any id outside the head at upload.
+// ============================================================================
+
+__global__ void suppress_logits_bf16_kernel(
+    __nv_bfloat16 *__restrict__ logits,
+    const uint32_t *__restrict__ ids,
+    int vocab,
+    int id_count,
+    int total) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int row = idx / id_count;
+    int id_slot = idx % id_count;
+    logits[(size_t)row * vocab + ids[id_slot]] =
+        __float2bfloat16(-CUDART_INF_F);
+  }
+}
+
+// ============================================================================
 // In-place multiply by a host scalar: buf[i] = bf16(f32(buf[i]) * scale).
 // Serves Gemma 4's per-layer layer_scalar, a [1] weight the model reads to
 // the host at load; f32 compute with a single rounding matches HF's bf16
@@ -491,6 +514,27 @@ __global__ void embedding_batched_vocab_shard_vec4_kernel(
     for (int v = blockIdx.y * blockDim.x + threadIdx.x; v < hidden_vec;
          v += gridDim.y * blockDim.x) {
       dst[v] = zero;
+    }
+  }
+}
+
+// Advances the device tables a regular decode step will consume next.
+static const int ADVANCE_DECODE_METADATA_BLOCK = 32;
+
+__global__ void advance_decode_metadata_kernel(
+    int *__restrict__ positions,
+    int *__restrict__ local_last,
+    int *__restrict__ pseudo_last,
+    int *__restrict__ kv_chunk,
+    int rows,
+    int factor) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < rows) {
+    positions[row] += 1;
+    local_last[row] += 1;
+    kv_chunk[row] += 1;
+    for (int copy = 0; copy < factor; ++copy) {
+      pseudo_last[row * factor + copy] += 1;
     }
   }
 }
@@ -798,6 +842,21 @@ CUresult softcap_bf16_in_place_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+CUresult suppress_logits_bf16_in_place_cuda(
+    __nv_bfloat16 *logits, const uint32_t *ids,
+    int vocab, int rows, int id_count, cudaStream_t stream) {
+  if (logits == nullptr || ids == nullptr || vocab <= 0 || rows <= 0 ||
+      id_count <= 0 || id_count > INT_MAX / rows) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = rows * id_count;
+  int block = 256;
+  int grid = total / block + (total % block != 0);
+  suppress_logits_bf16_kernel<<<grid, block, 0, stream>>>(
+      logits, ids, vocab, id_count, total);
+  return (CUresult)cudaGetLastError();
+}
+
 CUresult embedding_decode_cuda(
     const __nv_bfloat16 *embed, const uint32_t *token_id,
     __nv_bfloat16 *out, int hidden_size, cudaStream_t stream) {
@@ -863,6 +922,20 @@ CUresult embedding_batched_vocab_shard_cuda(
   int grid = (total + block - 1) / block;
   embedding_batched_vocab_shard_kernel<<<grid, block, 0, stream>>>(
       embed, token_ids, out, hidden_size, seq_len, vocab_start, part_vocab_size);
+  return (CUresult)cudaGetLastError();
+}
+
+CUresult advance_decode_metadata_cuda(
+    int *positions, int *local_last, int *pseudo_last, int *kv_chunk,
+    int rows, int factor, cudaStream_t stream) {
+  if (positions == nullptr || local_last == nullptr || pseudo_last == nullptr ||
+      kv_chunk == nullptr || rows <= 0 || factor <= 0 || rows > INT_MAX / factor) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int block = ADVANCE_DECODE_METADATA_BLOCK;
+  int grid = 1 + (rows - 1) / block;
+  advance_decode_metadata_kernel<<<grid, block, 0, stream>>>(
+      positions, local_last, pseudo_last, kv_chunk, rows, factor);
   return (CUresult)cudaGetLastError();
 }
 

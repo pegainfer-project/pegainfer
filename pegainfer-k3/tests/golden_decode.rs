@@ -115,6 +115,15 @@ fn device() -> usize {
         .unwrap_or(0)
 }
 
+/// The gates load through the pinned double-buffer uploader by default —
+/// the same bytes, much faster on a warm page cache.
+/// `PEGAINFER_K3_WEIGHT_STAGING=0` falls back to the serial pageable-mmap
+/// path (e.g. a cold network-filesystem first run). The gates'
+/// answers are load-path independent.
+fn weight_staging() -> bool {
+    std::env::var("PEGAINFER_K3_WEIGHT_STAGING").as_deref() != Ok("0")
+}
+
 /// The two routed-expert transports, named for the gate reports.
 const TRANSPORTS: [(&str, K3MoeTransport); 2] = [
     ("mega", K3MoeTransport::MEGA),
@@ -139,6 +148,7 @@ fn executor(
         // chunk widths through `max_batch` (cap 1, cap 8).
         chunk_tokens: max_batch,
         cuda_graph,
+        weight_staging: weight_staging(),
         moe_transport,
     };
     Some(
@@ -725,6 +735,7 @@ fn prefill_time_snapshot() {
         // Derived: the widest chunk the transport carries (protocol max).
         chunk_tokens: 0,
         cuda_graph: true,
+        weight_staging: weight_staging(),
         moe_transport: K3MoeTransport::MEGA,
     };
     let mut executor =
@@ -831,6 +842,7 @@ fn chunked_prefill_agrees_with_the_per_token_walk_at_depth() {
             num_layers: depth,
             chunk_tokens: max_batch,
             cuda_graph: false,
+            weight_staging: weight_staging(),
             moe_transport: K3MoeTransport::MEGA,
         };
         K3Executor::load(&path, device(), 0, 1, config)

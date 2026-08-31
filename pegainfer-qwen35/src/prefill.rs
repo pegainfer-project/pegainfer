@@ -199,14 +199,14 @@ impl Qwen35Model {
         kv_state.ensure_capacity(end_pos)?;
         kv_state.advance(seq_len);
         let kv_desc = kv_state.desc();
-        let tp = self.tensor_parallel;
+        let geom = self.geometry;
         let prefill_plan = PrefillPagedPlan::new(
             &self.ctx,
             &kv_desc,
             base_pos,
             seq_len,
-            c.local_num_attention_heads(tp),
-            c.local_num_key_value_heads(tp),
+            geom.local_num_attention_heads(),
+            geom.local_num_key_value_heads(),
             c.head_dim,
         )?;
 
@@ -264,9 +264,9 @@ impl Qwen35Model {
             self.batched_rms_norm_offset(hidden_batch, &layer.input_layernorm, eps)?;
 
         // 2. Attention / Linear attention — per-token for correctness
-        let tp = self.tensor_parallel;
+        let geom = self.geometry;
         let attn_out_dim = match &layer.attn {
-            LayerKind::FullAttention(_) => c.local_full_attn_q_dim(tp),
+            LayerKind::FullAttention(_) => geom.local_full_attn_q_dim(),
             LayerKind::LinearAttention(_) => c.linear_attn_z_dim(),
         };
 
@@ -300,7 +300,7 @@ impl Qwen35Model {
 
         // 4. MLP (batched)
         let gate_up_out = ops::gemm(&self.ctx, &layer.mlp.gate_up_proj, &normed_batch)?;
-        let mut act_out = HiddenStates::zeros(&self.ctx, c.local_intermediate_size(tp), seq_len)?;
+        let mut act_out = HiddenStates::zeros(&self.ctx, geom.local_intermediate_size(), seq_len)?;
         ops::silu_mul_fused_batch_into(&self.ctx, &gate_up_out, &mut act_out)?;
         let mut mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
         self.all_reduce_hidden(&mut mlp_out)?;
@@ -321,10 +321,10 @@ impl Qwen35Model {
         seq_len: usize,
     ) -> Result<HiddenStates> {
         let c = &self.config;
-        let tp = self.tensor_parallel;
-        let num_attention_heads = c.local_num_attention_heads(tp);
-        let num_key_value_heads = c.local_num_key_value_heads(tp);
-        let attn_out_dim = c.local_full_attn_q_dim(tp);
+        let geom = self.geometry;
+        let num_attention_heads = geom.local_num_attention_heads();
+        let num_key_value_heads = geom.local_num_key_value_heads();
+        let attn_out_dim = geom.local_full_attn_q_dim();
         let eps = c.rms_norm_eps;
         let q_full_batch = ops::gemm(&self.ctx, &attn.q_proj, normed_batch)?;
         let k_batch = ops::gemm(&self.ctx, &attn.k_proj, normed_batch)?;

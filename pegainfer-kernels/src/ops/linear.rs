@@ -96,6 +96,84 @@ pub fn gemm_strided_batched_bf16(
     Ok(())
 }
 
+/// f32 strided-batched GEMM, same cuBLAS boundary as
+/// [`gemm_strided_batched_bf16`] but with f32 operands and an `accumulate`
+/// switch (`C += A·B` instead of `C = A·B`). The consumer is the K3 KCP state
+/// merge (per-head fp32 `S' = M·S + D`), which pre-fills `C` with `D` and
+/// accumulates the transition product in one call.
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+pub fn gemm_strided_batched_f32(
+    ctx: &DeviceContext,
+    transpose_a: bool,
+    transpose_b: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &impl cudarc::driver::DevicePtr<f32>,
+    lda: usize,
+    stride_a: usize,
+    b: &impl cudarc::driver::DevicePtr<f32>,
+    ldb: usize,
+    stride_b: usize,
+    accumulate: bool,
+    c: &mut cudarc::driver::CudaSlice<f32>,
+    ldc: usize,
+    stride_c: usize,
+    batch: usize,
+) -> Result<()> {
+    ensure!(
+        m > 0 && n > 0 && k > 0 && batch > 0,
+        "gemm_strided_batched_f32 empty dims: m={m} n={n} k={k} batch={batch}"
+    );
+    ensure!(
+        a.len() >= stride_a * batch,
+        "gemm_strided_batched_f32 A too small: have {}, need {}",
+        a.len(),
+        stride_a * batch
+    );
+    ensure!(
+        b.len() >= stride_b * batch,
+        "gemm_strided_batched_f32 B too small: have {}, need {}",
+        b.len(),
+        stride_b * batch
+    );
+    ensure!(
+        c.len() >= stride_c * batch,
+        "gemm_strided_batched_f32 C too small: have {}, need {}",
+        c.len(),
+        stride_c * batch
+    );
+    let (a_ptr, _ga) = a.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.device_ptr(&ctx.stream);
+    let (c_ptr, _gc) = c.device_ptr_mut(&ctx.stream);
+    let status = unsafe {
+        ffi::gemm_strided_batched_f32_cuda(
+            i32::from(transpose_a),
+            i32::from(transpose_b),
+            m as i32,
+            n as i32,
+            k as i32,
+            a_ptr as *const f32,
+            lda as i32,
+            stride_a as i64,
+            b_ptr as *const f32,
+            ldb as i32,
+            stride_b as i64,
+            if accumulate { 1.0 } else { 0.0 },
+            c_ptr as *mut f32,
+            ldc as i32,
+            stride_c as i64,
+            batch as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    ensure!(
+        status == 0,
+        "gemm_strided_batched_f32 failed: status={status} (m={m} n={n} k={k} batch={batch})"
+    );
+    Ok(())
+}
+
 #[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
 pub fn gemm_bf16_f32(
     ctx: &DeviceContext,

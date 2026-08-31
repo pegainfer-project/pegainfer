@@ -477,6 +477,7 @@ impl SteppedStream {
             num_cached_tokens: self.cached_tokens as u32,
             num_local_cached_tokens: self.cached_tokens as u32,
             num_external_cached_tokens: 0,
+            num_cache_creation_tokens: 0,
         })
     }
 }

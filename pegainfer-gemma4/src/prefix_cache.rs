@@ -19,6 +19,28 @@ use crate::kv::PAGE_SIZE;
 /// A resume below this many tokens is not worth its page copies.
 const MIN_RESUME_TOKENS: usize = 64;
 
+#[derive(Clone, Copy)]
+struct ResumeCandidate<'a> {
+    token_ids: &'a [u32],
+    local_origin: usize,
+}
+
+fn resume_point(candidate: ResumeCandidate<'_>, window: usize, prompt: &[u32]) -> Option<usize> {
+    let lcp = candidate
+        .token_ids
+        .iter()
+        .zip(prompt)
+        .take_while(|(cached, requested)| cached == requested)
+        .count();
+    let resume = lcp.min(prompt.len().checked_sub(1)?);
+    let floor = if candidate.local_origin == 0 {
+        MIN_RESUME_TOKENS
+    } else {
+        (candidate.local_origin * PAGE_SIZE + window).max(MIN_RESUME_TOKENS)
+    };
+    (resume >= floor).then_some(resume)
+}
+
 /// One captured conversation tail. The page reservations are cache-owned;
 /// dropping the entry returns every page to its pool.
 pub(crate) struct CachedKv {
@@ -73,15 +95,6 @@ pub(crate) fn entry_global_pages(max_context: usize) -> usize {
     max_context.div_ceil(PAGE_SIZE) / 2
 }
 
-/// The fail-closed gate: `PEGAINFER_PREFIX_CACHE=K` enables a K-entry
-/// cache; unset or unparsable-as-positive disables it entirely.
-pub(crate) fn prefix_cache_cap() -> Option<usize> {
-    std::env::var("PEGAINFER_PREFIX_CACHE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&k| k > 0)
-}
-
 impl PrefixCache {
     pub(crate) fn new(cap: usize, window: usize) -> Self {
         Self {
@@ -105,22 +118,15 @@ impl PrefixCache {
             .entries
             .iter_mut()
             .filter_map(|e| {
-                let lcp = e
-                    .token_ids
-                    .iter()
-                    .zip(prompt)
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                let t = lcp.min(prompt.len() - 1);
-                let floor = if e.local_origin == 0 {
-                    MIN_RESUME_TOKENS
-                } else {
-                    (e.local_origin * PAGE_SIZE + self.window).max(MIN_RESUME_TOKENS)
-                };
-                if t < floor {
-                    return None;
-                }
-                Some((e, t))
+                let resume = resume_point(
+                    ResumeCandidate {
+                        token_ids: &e.token_ids,
+                        local_origin: e.local_origin,
+                    },
+                    self.window,
+                    prompt,
+                )?;
+                Some((e, resume))
             })
             .max_by_key(|&(_, t)| t);
         let (best, t) = picked?;
@@ -143,7 +149,7 @@ impl PrefixCache {
         entry.stamp = self.clock;
         entry.id = self.clock;
         if let Some(id) = ancestor {
-            self.entries.retain(|e| e.id != id);
+            self.entries.retain(|entry| entry.id != id);
         }
         if self.entries.len() >= self.cap {
             self.evict_lru();
@@ -155,47 +161,69 @@ impl PrefixCache {
     /// the pool-pressure valve: an admission that cannot reserve pages
     /// evicts and retries before requeueing.
     pub(crate) fn evict_lru(&mut self) -> bool {
-        let Some((idx, _)) = self.entries.iter().enumerate().min_by_key(|(_, e)| e.stamp) else {
+        let Some((index, _)) = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.stamp)
+        else {
             return false;
         };
-        self.entries.swap_remove(idx);
+        self.entries.swap_remove(index);
         true
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Host-side index logic only; the GPU capture/restore halves live in
-    // `serve` and are covered by the on-box restore gate. Reservations
-    // require a pool, so the resolve arithmetic is exercised through a
-    // pool-free twin.
+    use super::*;
 
-    /// The resolve arithmetic, extracted: lcp clamped to the tail-window
-    /// floor; returns the resume point.
-    fn resume_at(entry: &[u32], origin: usize, window: usize, prompt: &[u32]) -> Option<usize> {
-        let lcp = entry.iter().zip(prompt).take_while(|(a, b)| a == b).count();
-        let t = lcp.min(prompt.len() - 1);
-        let floor = if origin == 0 { 1 } else { origin * 16 + window };
-        (t >= floor).then_some(t)
+    fn resume(entry: &[u32], local_origin: usize, window: usize, prompt: &[u32]) -> Option<usize> {
+        resume_point(
+            ResumeCandidate {
+                token_ids: entry,
+                local_origin,
+            },
+            window,
+            prompt,
+        )
     }
 
     #[test]
-    fn lcp_clamps_and_respects_window_floor() {
-        // Short entry (origin 0): any common prefix resumes, clamped to
-        // leave one suffix token.
-        assert_eq!(resume_at(&[1, 2, 3, 4], 0, 16, &[1, 2, 3, 4, 5]), Some(4));
-        assert_eq!(resume_at(&[1, 2, 3, 4], 0, 16, &[1, 2, 9, 9, 9]), Some(2));
-        assert_eq!(resume_at(&[1, 2, 3, 4], 0, 16, &[1, 2, 3, 4]), Some(3));
-        assert_eq!(resume_at(&[9, 9], 0, 16, &[1, 2]), None);
-        // Released-front entry: resume only inside the surviving window
-        // (origin 2, window 16 -> floor 48).
-        let entry: Vec<u32> = (0..64).collect();
-        let mut prompt = entry.clone();
-        prompt.push(999);
-        assert_eq!(resume_at(&entry, 2, 16, &prompt), Some(64));
-        // Divergence before the floor: the window cannot serve it.
-        let mut early = entry.clone();
-        early[40] = 777;
-        assert_eq!(resume_at(&entry, 2, 16, &early), None);
+    fn resume_calls_the_production_helper_at_the_63_64_boundary() {
+        let entry: Vec<u32> = (0..80).collect();
+        let mut at_63 = entry.clone();
+        at_63[63] = 999;
+        let mut at_64 = entry.clone();
+        at_64[64] = 999;
+        assert_eq!(resume(&entry, 0, PAGE_SIZE, &at_63), None);
+        assert_eq!(resume(&entry, 0, PAGE_SIZE, &at_64), Some(64));
+    }
+
+    #[test]
+    fn resume_clamps_to_suffix_and_respects_the_window_floor() {
+        let entry: Vec<u32> = (0..96).collect();
+        let mut extended = entry.clone();
+        extended.push(999);
+        assert_eq!(resume(&entry, 0, PAGE_SIZE, &extended), Some(96));
+        assert_eq!(resume(&entry, 0, PAGE_SIZE, &entry), Some(95));
+        assert_eq!(resume(&entry, 0, PAGE_SIZE, &[]), None);
+
+        let mut before_window = entry.clone();
+        before_window[47] = 777;
+        assert_eq!(resume(&entry, 2, PAGE_SIZE, &before_window), None);
+        let mut at_window = entry.clone();
+        at_window[48] = 777;
+        assert_eq!(resume(&entry, 2, PAGE_SIZE, &at_window), None);
+        let mut after_minimum = entry.clone();
+        after_minimum[64] = 777;
+        assert_eq!(resume(&entry, 2, PAGE_SIZE, &after_minimum), Some(64));
+    }
+
+    #[test]
+    fn global_page_budget_rounds_before_halving() {
+        assert_eq!(entry_global_pages(8192), 256);
+        assert_eq!(entry_global_pages(8193), 256);
+        assert_eq!(entry_global_pages(8224), 257);
     }
 }

@@ -282,7 +282,7 @@ unsafe extern "C" {
         expert_ids: *mut i32,
         num_tokens_post_padded: *mut i32,
         expert_offsets: *mut u32,
-        expert_cursor: *mut u32,
+        unused_expert_cursor: *mut u32,
         active_tokens: i32,
         topk: i32,
         global_start: i32,
