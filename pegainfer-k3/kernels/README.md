@@ -32,16 +32,13 @@ every row below is its shape count × 10.
 | --- | --- | --- | --- |
 | `rms_norm_rbs_batched` | H ∈ {7168, 512, 3584} | 30 | `k3_rms_norm_rbs_batched` |
 | `land_rms_norm_rbs_batched` | MLA q_a, SK = 1 | 10 | `k3_land_rms_norm_rbs_batched` |
-| `add2_batched` | N = 7168 | 10 | `k3_add2_batched` |
-| `mul_sigmoid_batched` | N = 12288 | 10 | `k3_mul_sigmoid_batched` |
-| `situ_batched` | N ∈ {6144, 33792} | 20 | `k3_situ_batched` |
 | `conv_silu_batched` | KP = 12288, W = 4, SK = 1 | 10 | `k3_conv_silu_batched` |
 | `kda_core_batched` | 96 heads × 128 head_dim | 10 | `k3_kda_core_batched` |
 | `router_topk_batched` | E ∈ {896, 224}, TOPK = 16 | 20 | `k3_router_topk_batched` |
 | `attnres_scores_batched` | NB ∈ 1..8, H = 7168 | 80 | `k3_attnres_scores_batched` |
 | `attnres_mix_batched` | NB ∈ 1..8, H = 7168 | 80 | `k3_attnres_mix_batched` |
 
-**280 instantiations**, about 20 seconds of generation and 7 seconds of nvcc.
+**240 instantiations**, about 20 seconds of generation and 7 seconds of nvcc.
 The pool fans out at *instantiation* granularity, not family granularity — the
 families differ by more than an order of magnitude in size, so a family-granular
 pool would be bound by the largest family alone. It defaults to one worker per CPU

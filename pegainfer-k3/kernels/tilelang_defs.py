@@ -49,7 +49,6 @@ def _compile(prim):
     return tilelang.compile(prim)
 
 
-
 # --------------------------------------------------------------------------- #
 # Batched decode kernels, vendored verbatim (including the upstream section
 # comment below, which names the parity gates that certified them).
@@ -190,58 +189,6 @@ def land_rms_norm_rbs_batched(NT: int, N: int, OFF: int, SK: int, B: int,
             T.reduce_sum(sq, tot, dim=0)
             for i in T.Parallel(N):
                 O[bb, i] = (xs[i] * T.rsqrt(tot[0] / N + eps)).astype(DT) * G[i]
-
-    return _compile(main)
-
-
-@lru_cache(maxsize=None)
-def add2_batched(N: int, B: int, threads: int = 256):
-    """Batched ``add2``: block (b, x) adds one column segment of row b in bf16.
-    Requires threads|N."""
-    @T.prim_func
-    def main(A: T.Tensor((B, N), DT), Bt: T.Tensor((B, N), DT),
-             O: T.Tensor((B, N), DT)):
-        with T.Kernel(B, N // threads, threads=threads) as (bb, bx):
-            for j in T.Parallel(threads):
-                O[bb, bx * threads + j] = (A[bb, bx * threads + j]
-                                           + Bt[bb, bx * threads + j])
-
-    return _compile(main)
-
-
-@lru_cache(maxsize=None)
-def mul_sigmoid_batched(N: int, B: int, threads: int = 256):
-    """Batched ``mul_sigmoid``: block (b, x) gates one column segment of row b.
-    f32 sigmoid landing back in bf16, then the bf16 product -- the bs=1 body
-    verbatim. Requires threads|N."""
-    @T.prim_func
-    def main(A: T.Tensor((B, N), DT), Bt: T.Tensor((B, N), DT),
-             O: T.Tensor((B, N), DT)):
-        with T.Kernel(B, N // threads, threads=threads) as (bb, bx):
-            for j in T.Parallel(threads):
-                n = bx * threads + j
-                O[bb, n] = A[bb, n] * T.Cast(DT, T.sigmoid(Bt[bb, n].astype(ACC)))
-
-    return _compile(main)
-
-
-@lru_cache(maxsize=None)
-def situ_batched(N: int, B: int, threads: int = 256):
-    """Batched ``situ``: block (b, x) applies the activation to one column
-    segment of row b; beta=4 / linear_beta=25 stay compiled in and the f32
-    chain lands bf16 once, as in the bs=1 body. Requires threads|N."""
-    @T.prim_func
-    def main(G: T.Tensor((B, N), DT), U: T.Tensor((B, N), DT),
-             O: T.Tensor((B, N), DT)):
-        with T.Kernel(B, N // threads, threads=threads) as (bb, bx):
-            for j in T.Parallel(threads):
-                n = bx * threads + j
-                g = G[bb, n].astype(ACC)
-                u = U[bb, n].astype(ACC)
-                O[bb, n] = T.Cast(
-                    DT,
-                    4.0 * T.tanh(g / 4.0) * T.sigmoid(g) * (25.0 * T.tanh(u / 25.0)),
-                )
 
     return _compile(main)
 
@@ -397,32 +344,3 @@ def kda_core_batched(KH: int, KD: int, SKG: int, B: int, lb: float, eps: float):
     return _compile(main)
 
 
-def o_norm_gate_batched(KH: int, KD: int, B: int, eps: float):
-    """``kda_core``'s tail on its own: per (row, head) the f32 rms_norm of the
-    bf16 attention landing times the o_norm gamma, landed once, times the bf16
-    sigmoid of the output-gate projection -- word-for-word the last loop of
-    ``kda_core_batched``. Chunked prefill computes the attention elsewhere
-    (FlashKDA) and finishes each row through this identical spelling."""
-    KP = KH * KD
-
-    @T.prim_func
-    def main(
-        X: T.Tensor((B, KP), DT),
-        G2: T.Tensor((B, KP), DT),
-        Go: T.Tensor((KD,), ACC),
-        Out: T.Tensor((B, KP), DT),
-    ):
-        with T.Kernel(B, KH, threads=KD) as (bb, bh):
-            asq = T.alloc_fragment((KD,), ACC)
-            atot = T.alloc_fragment((1,), ACC)
-            for d in T.Parallel(KD):
-                asq[d] = X[bb, bh * KD + d].astype(ACC) * X[bb, bh * KD + d].astype(ACC)
-            T.reduce_sum(asq, atot, dim=0)
-            for d in T.Parallel(KD):
-                Out[bb, bh * KD + d] = T.Cast(
-                    DT,
-                    X[bb, bh * KD + d].astype(ACC) * T.rsqrt(atot[0] / KD + eps)
-                    * Go[d].astype(ACC),
-                ) * T.Cast(DT, T.sigmoid(G2[bb, bh * KD + d].astype(ACC)))
-
-    return _compile(main)

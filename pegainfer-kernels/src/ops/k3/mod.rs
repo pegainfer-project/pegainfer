@@ -2,6 +2,7 @@
 
 mod conv_silu_chunk;
 mod deepgemm;
+mod elementwise;
 mod flash_kda;
 mod flash_mla_prefill;
 mod land;
@@ -12,6 +13,7 @@ mod router_topk;
 
 pub use conv_silu_chunk::*;
 pub use deepgemm::*;
+pub use elementwise::*;
 pub use flash_kda::*;
 pub use flash_mla_prefill::*;
 pub use land::*;

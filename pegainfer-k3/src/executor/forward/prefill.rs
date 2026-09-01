@@ -56,6 +56,7 @@ use crate::config::K3_HEADS;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_KV_B_OUT;
 use crate::config::K3_KV_LORA_RANK;
+use crate::config::K3_RMS_EPS;
 use crate::config::K3_VOCAB;
 use crate::model::K3KdaWeights;
 use crate::model::K3LayerWeights;
@@ -624,6 +625,7 @@ pub(super) fn kda_attention_chunk(
         b,
         K3_HEADS,
         K3_HEAD_DIM,
+        K3_RMS_EPS,
         &s.kda_attn,
         &s.out_gate,
         &w.gamma_o,

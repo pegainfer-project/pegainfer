@@ -6,9 +6,7 @@ decode kernel set:
 
     k3_rms_norm_rbs_batched.cu      k3_conv_silu_batched.cu
     k3_land_rms_norm_rbs_batched.cu k3_kda_core_batched.cu
-    k3_add2_batched.cu              k3_attnres_scores_batched.cu
-    k3_mul_sigmoid_batched.cu       k3_attnres_mix_batched.cu
-    k3_situ_batched.cu
+    k3_attnres_scores_batched.cu    k3_attnres_mix_batched.cu
 
 The batch size is a static compile-time dimension, so a single-stream step is
 served by the `B = 1` instantiation of the same family — its per-row spelling
@@ -157,12 +155,9 @@ RMS_NORM_N = [HIDDEN, KV_LORA, LATENT]
 # a round-before-scale norm are fused.
 LAND_RMS_NORM_CONFIGS = [(MLA_FUSED, Q_LORA, 0)]
 
-# add2 / mul_sigmoid / situ / conv_silu / kda_core take a single width each;
-# situ has two (shared, dense) — the routed-expert situ is fused into the
-# masked-GEMM chain and the mega kernel.
-ADD2_N = [HIDDEN]
-MUL_SIGMOID_N = [KDA_DIM]
-SITU_N = [SHARED_INTER, DENSE_INTER]
+# conv_silu / kda_core take a single width each. The bf16 elementwise family
+# (add2, mul_sigmoid, situ, o_norm_gate) is hand-written CUDA now
+# (`csrc/k3/k3_elementwise.cu`), shape-agnostic.
 
 
 # --------------------------------------------------------------------------- #
@@ -182,14 +177,6 @@ LAND_RMS_NORM_PARAMS = (
     f"(const {BF16}* __restrict__ G, {BF16}* __restrict__ O, "
     "const float* __restrict__ P)"
 )
-BINARY_ABO_PARAMS = (
-    f"(const {BF16}* __restrict__ A, const {BF16}* __restrict__ Bt, "
-    f"{BF16}* __restrict__ O)"
-)
-SITU_PARAMS = (
-    f"(const {BF16}* __restrict__ G, {BF16}* __restrict__ O, "
-    f"const {BF16}* __restrict__ U)"
-)
 CONV_SILU_PARAMS = (
     f"(const {BF16}* __restrict__ Cs, const float* __restrict__ Cw, "
     f"const float* __restrict__ P, {BF16}* __restrict__ Sn, "
@@ -202,10 +189,6 @@ KDA_CORE_PARAMS = (
     f"const {BF16}* __restrict__ K, {BF16}* __restrict__ Out, "
     f"const {BF16}* __restrict__ Q, const float* __restrict__ State, "
     f"float* __restrict__ StateN, const {BF16}* __restrict__ V)"
-)
-O_NORM_GATE_PARAMS = (
-    f"(const {BF16}* __restrict__ G2, const float* __restrict__ Go, "
-    f"{BF16}* __restrict__ Out, const {BF16}* __restrict__ X)"
 )
 SCORES_PARAMS = (
     f"(const {BF16}* __restrict__ Bl, const {BF16}* __restrict__ Ps, "
@@ -598,95 +581,6 @@ def plan_land_rms_norm_rbs() -> Plan:
     )
 
 
-def _plan_binary(family: str, widths: list[int], doc: str) -> Plan:
-    insts = []
-    for width in widths:
-        for batch in B_CHUNK_BUCKETS:
-            insts.append(Inst(
-                family=family,
-                order=len(insts),
-                label=f"{family}_batched N={width} B={batch}",
-                factory=f"{family}_batched",
-                args=(width, batch, THREADS),
-                num_params=3,
-                params=BINARY_ABO_PARAMS,
-                symbol=f"k3_{family}_b{batch}_n{width}_kernel",
-                grid=(batch, width // THREADS),
-                threads=THREADS,
-                guard=f"b == {batch} && n == {width}",
-                call_args=(_bf16("A"), _bf16("Bt"), _bf16("O", False)),
-            ))
-    return Plan(
-        stem=_STEM.format(family),
-        signature=(
-            f"k3_{family}_batched(\n"
-            "    const void* A,\n"
-            "    const void* Bt,\n"
-            "    void* O,\n"
-            "    int b,\n"
-            "    int n,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=doc,
-        insts=tuple(insts),
-    )
-
-
-def plan_add2() -> Plan:
-    return _plan_binary(
-        "add2",
-        ADD2_N,
-        "// O = A + B in bf16 addition (the residual adds, and routed + shared).\n"
-        "// One block per (row, column segment).",
-    )
-
-
-def plan_mul_sigmoid() -> Plan:
-    return _plan_binary(
-        "mul_sigmoid",
-        MUL_SIGMOID_N,
-        "// O = A * bf16(sigmoid(B)), the MLA sigmoid output gate. The sigmoid is\n"
-        "// taken in f32 and lands in bf16 before the product.",
-    )
-
-
-def plan_situ() -> Plan:
-    insts = []
-    for width in SITU_N:
-        for batch in B_CHUNK_BUCKETS:
-            insts.append(Inst(
-                family="situ",
-                order=len(insts),
-                label=f"situ_batched N={width} B={batch}",
-                factory="situ_batched",
-                args=(width, batch, THREADS),
-                num_params=3,
-                params=SITU_PARAMS,
-                symbol=f"k3_situ_b{batch}_n{width}_kernel",
-                grid=(batch, width // THREADS),
-                threads=THREADS,
-                guard=f"b == {batch} && n == {width}",
-                call_args=(_bf16("G"), _bf16("O", False), _bf16("U")),
-            ))
-    return Plan(
-        stem=_STEM.format("situ"),
-        signature=(
-            "k3_situ_batched(\n"
-            "    const void* G,\n"
-            "    const void* U,\n"
-            "    void* O,\n"
-            "    int b,\n"
-            "    int n,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=(
-            "// 4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25), computed in f32 and landed in\n"
-            "// bf16 once; the two betas are compiled in."
-        ),
-        insts=tuple(insts),
-    )
-
-
 def plan_conv_silu() -> Plan:
     insts = []
     for split_k in SPLIT_K:
@@ -804,51 +698,6 @@ def plan_kda_core() -> Plan:
     )
 
 
-def plan_o_norm_gate() -> Plan:
-    insts = []
-    for batch in B_CHUNK_BUCKETS:
-        insts.append(Inst(
-            family="o_norm_gate",
-            order=len(insts),
-            label=f"o_norm_gate_batched KH={KDA_HEADS} KD={KDA_HEAD_DIM} B={batch}",
-            factory="o_norm_gate_batched",
-            args=(KDA_HEADS, KDA_HEAD_DIM, batch, RMS_EPS),
-            num_params=4,
-            params=O_NORM_GATE_PARAMS,
-            symbol=f"k3_o_norm_gate_b{batch}_kh{KDA_HEADS}_kd{KDA_HEAD_DIM}_kernel",
-            grid=(batch, KDA_HEADS),
-            threads=KDA_HEAD_DIM,
-            guard=(
-                f"b == {batch} && num_heads == {KDA_HEADS} && "
-                f"head_dim == {KDA_HEAD_DIM}"
-            ),
-            call_args=(
-                _bf16("G2"), "Go", _bf16("Out", False), _bf16("X"),
-            ),
-        ))
-    return Plan(
-        stem=_STEM.format("o_norm_gate"),
-        signature=(
-            "k3_o_norm_gate_batched(\n"
-            "    const void* X,\n"
-            "    const void* G2,\n"
-            "    const float* Go,\n"
-            "    void* Out,\n"
-            "    int b,\n"
-            "    int num_heads,\n"
-            "    int head_dim,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=(
-            "// kda_core's tail on its own: per (row, head) the f32 rms_norm of the\n"
-            "// bf16 attention landing times the o_norm gamma, landed once, times the\n"
-            "// bf16 sigmoid of the output gate. Chunked prefill computes attention\n"
-            "// through FlashKDA and finishes rows here; eps is compiled in."
-        ),
-        insts=tuple(insts),
-    )
-
-
 def plan_attnres_scores() -> Plan:
     insts = []
     for blocks in ATTNRES_NB:
@@ -933,12 +782,8 @@ def plan_attnres_mix() -> Plan:
 PLANNERS = [
     plan_rms_norm_rbs,
     plan_land_rms_norm_rbs,
-    plan_add2,
-    plan_mul_sigmoid,
-    plan_situ,
     plan_conv_silu,
     plan_kda_core,
-    plan_o_norm_gate,
     plan_attnres_scores,
     plan_attnres_mix,
 ]
