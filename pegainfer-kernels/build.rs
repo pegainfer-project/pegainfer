@@ -1525,10 +1525,6 @@ const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
         "const void*, const void*, void*, int, int",
     ),
     (
-        "k3_land_batched",
-        "const float*, void*, int, int, int, int, int",
-    ),
-    (
         "k3_land_rms_norm_rbs_batched",
         "const float*, const void*, void*, int, int, int, int, int",
     ),

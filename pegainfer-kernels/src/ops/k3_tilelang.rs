@@ -163,52 +163,7 @@ pub fn k3_rms_norm_rbs_batched_launch(
     check(rc, &format!("K3 rms_norm_rbs_batched (B={b}, H={h})"))
 }
 
-/// Merge the column span `[off, off + n)` of each row's `[split_k, nt]`
-/// partials and land bf16 once — the landing of every matmul in the certified
-/// spelling.
-#[allow(clippy::too_many_arguments)]
-pub fn k3_land_batched_launch(
-    ctx: &DeviceContext,
-    b: usize,
-    nt: usize,
-    n: usize,
-    off: usize,
-    split_k: usize,
-    p: &CudaSlice<f32>,
-    o: &mut CudaSlice<bf16>,
-) -> Result<()> {
-    check_bucket(b)?;
-    ensure!(
-        off + n <= nt,
-        "K3 land span [{off}, {off}+{n}) does not fit the partial width {nt}"
-    );
-    ensure!(
-        p.len() >= b * split_k * nt && o.len() >= b * n,
-        "K3 land buffers too small for b={b}, nt={nt}, n={n}, split_k={split_k}: p {}, o {}",
-        p.len(),
-        o.len()
-    );
-    let (p_ptr, _p_guard) = p.device_ptr(&ctx.stream);
-    let (o_ptr, _o_guard) = o.device_ptr_mut(&ctx.stream);
-    let rc = unsafe {
-        ffi::k3_land_batched(
-            p_ptr as *const f32,
-            o_ptr as *mut c_void,
-            b as i32,
-            nt as i32,
-            n as i32,
-            off as i32,
-            split_k as i32,
-            ctx.stream.cu_stream(),
-        )
-    };
-    check(
-        rc,
-        &format!("K3 land_batched (B={b}, NT={nt}, N={n}, OFF={off}, SK={split_k})"),
-    )
-}
-
-/// [`k3_land_batched_launch`] fused with the round-before-scale norm — MLA's
+/// The matmul landing (`k3_land_batched_launch`) fused with the round-before-scale norm — MLA's
 /// `q_a`, the one place the engine fuses a merge and a norm.
 #[allow(clippy::too_many_arguments)]
 pub fn k3_land_rms_norm_rbs_batched_launch(

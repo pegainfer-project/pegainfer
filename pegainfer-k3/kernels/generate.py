@@ -5,10 +5,10 @@ Emits one `.cu` per kernel family under `--out-dir`, covering the batched
 decode kernel set:
 
     k3_rms_norm_rbs_batched.cu      k3_conv_silu_batched.cu
-    k3_land_batched.cu              k3_kda_core_batched.cu
-    k3_land_rms_norm_rbs_batched.cu k3_attnres_scores_batched.cu
-    k3_add2_batched.cu              k3_attnres_mix_batched.cu
-    k3_mul_sigmoid_batched.cu       k3_situ_batched.cu
+    k3_land_rms_norm_rbs_batched.cu k3_kda_core_batched.cu
+    k3_add2_batched.cu              k3_attnres_scores_batched.cu
+    k3_mul_sigmoid_batched.cu       k3_attnres_mix_batched.cu
+    k3_situ_batched.cu
 
 The batch size is a static compile-time dimension, so a single-stream step is
 served by the `B = 1` instantiation of the same family — its per-row spelling
@@ -106,7 +106,7 @@ ATTNRES_BLOCK_SIZE = 12     # attn_res_block_size             -> engine BS
 # the same artifact serves a single-GPU and a 4-way-EP deployment.
 EXPERTS = [896, 896 // 4]   # engine E, and engine Es under 4-way EP
 
-# Segment counts of the partials `land`/`conv_silu` merge. The engine's
+# Segment counts of the partials `conv_silu` (and the hand-written landing) merge. The engine's
 # producers are framework GEMMs (cuBLASLt, DeepGEMM), which emit a single
 # segment, so only SK=1 is instantiated; the reference engine's SK=8 GEMV
 # shapes have no launch site here and are not generated.
@@ -150,29 +150,8 @@ B_CHUNK_BUCKETS = B_BUCKETS + B_PREFILL_BUCKETS
 # the routed-latent norm (LAT).
 RMS_NORM_N = [HIDDEN, KV_LORA, LATENT]
 
-# land(NT, N, OFF, SK): merge one column span of a (SK, NT) partial and land
-# bf16 once. The engine's `lands` list, verbatim, plus the chunked-prefill
-# conv-input landing (the sequential engine never lands that projection alone —
-# its conv kernel casts in place; the chunk builds windows from the landed rows
-# before the conv runs, so it needs the standalone cast).
-LAND_CONFIGS = [
-    #  NT                N                   OFF               engine call site
-    (4 * KDA_DIM, KDA_DIM, 3 * KDA_DIM),              # KDA output gate
-    (KDA_DIM, KDA_DIM, 0),                            # chunked-prefill conv inputs
-    (WSM_N, KDA_HEADS, 0),                            # KDA beta
-    (WSM_N, KDA_HEAD_DIM, KDA_HEADS),                 # KDA low-rank gate input
-    (MLA_FUSED, KV_LORA + ROPE_DIM, Q_LORA),          # MLA kv_a|k_rope
-    (MLA_FUSED, KDA_DIM, Q_LORA + KV_LORA + ROPE_DIM),  # MLA output gate
-    (MLA_HEADS * QK_DIM, MLA_HEADS * QK_DIM, 0),      # MLA q_b
-    (MLA_HEADS * 256, MLA_HEADS * 256, 0),            # MLA kv_b
-    (HIDDEN, HIDDEN, 0),                              # o_proj / routed / shared
-    (LATENT, LATENT, 0),                              # routed latent
-    (2 * SHARED_INTER, SHARED_INTER, 0),              # shared gate
-    (2 * SHARED_INTER, SHARED_INTER, SHARED_INTER),   # shared up
-    (2 * DENSE_INTER, DENSE_INTER, 0),                # dense gate
-    (2 * DENSE_INTER, DENSE_INTER, DENSE_INTER),      # dense up
-    (VOCAB, VOCAB, 0),                                # logits
-]
+# land(NT, N, OFF, SK) is no longer generated: the matmul landing is the
+# hand-written `csrc/k3/k3_land.cu` (batch a runtime value).
 
 # land_rms_norm_rbs(NT, N, OFF, SK, eps): MLA's q_a, the one place a merge and
 # a round-before-scale norm are fused.
@@ -199,7 +178,6 @@ RMS_NORM_PARAMS = (
     f"(const {BF16}* __restrict__ G, {BF16}* __restrict__ O, "
     f"const {BF16}* __restrict__ X)"
 )
-LAND_PARAMS = f"({BF16}* __restrict__ O, const float* __restrict__ P)"
 LAND_RMS_NORM_PARAMS = (
     f"(const {BF16}* __restrict__ G, {BF16}* __restrict__ O, "
     "const float* __restrict__ P)"
@@ -570,52 +548,6 @@ def plan_rms_norm_rbs() -> Plan:
     )
 
 
-def plan_land() -> Plan:
-    insts = []
-    for nt, n, off in LAND_CONFIGS:
-        for split_k in SPLIT_K:
-            for batch in B_CHUNK_BUCKETS:
-                npad = ceildiv(n, THREADS) * THREADS
-                insts.append(Inst(
-                    family="land",
-                    order=len(insts),
-                    label=f"land_batched NT={nt} N={n} OFF={off} SK={split_k} B={batch}",
-                    factory="land_batched",
-                    args=(nt, n, off, split_k, batch, THREADS),
-                    num_params=2,
-                    params=LAND_PARAMS,
-                    symbol=f"k3_land_b{batch}_nt{nt}_n{n}_off{off}_sk{split_k}_kernel",
-                    grid=(batch, npad // THREADS),
-                    threads=THREADS,
-                    guard=(
-                        f"b == {batch} && nt == {nt} && n == {n} && "
-                        f"off == {off} && split_k == {split_k}"
-                    ),
-                    call_args=(_bf16("O", False), "P"),
-                ))
-    return Plan(
-        stem=_STEM.format("land"),
-        signature=(
-            "k3_land_batched(\n"
-            "    const float* P,\n"
-            "    void* O,\n"
-            "    int b,\n"
-            "    int nt,\n"
-            "    int n,\n"
-            "    int off,\n"
-            "    int split_k,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=(
-            "// Merge the column span [off, off+n) of each row's (split_k, nt) f32\n"
-            "// partial and land bf16 once -- the landing of every matmul. split_k = 1\n"
-            "// is the single-partial case a framework GEMM produces, where the merge\n"
-            "// degenerates to the slice and the cast."
-        ),
-        insts=tuple(insts),
-    )
-
-
 def plan_land_rms_norm_rbs() -> Plan:
     insts = []
     for nt, n, off in LAND_RMS_NORM_CONFIGS:
@@ -659,7 +591,7 @@ def plan_land_rms_norm_rbs() -> Plan:
             "    cudaStream_t stream)"
         ),
         doc=(
-            "// k3_land_batched fused with the round-before-scale norm: MLA's q_a,\n"
+            "// The matmul landing fused with the round-before-scale norm: MLA's q_a,\n"
             "// the one place the engine fuses a merge and a norm."
         ),
         insts=tuple(insts),
@@ -1000,7 +932,6 @@ def plan_attnres_mix() -> Plan:
 
 PLANNERS = [
     plan_rms_norm_rbs,
-    plan_land,
     plan_land_rms_norm_rbs,
     plan_add2,
     plan_mul_sigmoid,

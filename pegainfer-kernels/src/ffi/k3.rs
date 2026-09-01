@@ -173,6 +173,22 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Matmul landing (`csrc/k3/k3_land.cu`): merge the column span
+    /// `[off, off + n)` of each row's `p [b, split_k, nt]` f32 partial and
+    /// land `o [b, n]` bf16 once — ascending-segment f32 sum, one
+    /// round-to-nearest-even cast, bit-identical to the retired TileLang
+    /// kernel. Shapes are runtime values (no per-bucket instantiation).
+    pub fn k3_land_cuda(
+        p: *const f32,
+        o: *mut c_void,
+        b: i32,
+        nt: i32,
+        n: i32,
+        off: i32,
+        split_k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // --- fused MegaMoE (see `csrc/k3/k3_mega_moe_sm100.cu`) ---
 
     /// Token-count alignment the MegaMoE API enforces on

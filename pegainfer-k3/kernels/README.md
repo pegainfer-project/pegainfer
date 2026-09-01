@@ -31,7 +31,6 @@ every row below is its shape count × 10.
 | Kernel | Shapes per bucket | Instantiations | Launcher |
 | --- | --- | --- | --- |
 | `rms_norm_rbs_batched` | H ∈ {7168, 512, 3584} | 30 | `k3_rms_norm_rbs_batched` |
-| `land_batched` | 14 (NT, N, OFF) spans, SK = 1 | 140 | `k3_land_batched` |
 | `land_rms_norm_rbs_batched` | MLA q_a, SK = 1 | 10 | `k3_land_rms_norm_rbs_batched` |
 | `add2_batched` | N = 7168 | 10 | `k3_add2_batched` |
 | `mul_sigmoid_batched` | N = 12288 | 10 | `k3_mul_sigmoid_batched` |
@@ -42,17 +41,17 @@ every row below is its shape count × 10.
 | `attnres_scores_batched` | NB ∈ 1..8, H = 7168 | 80 | `k3_attnres_scores_batched` |
 | `attnres_mix_batched` | NB ∈ 1..8, H = 7168 | 80 | `k3_attnres_mix_batched` |
 
-**420 instantiations**, about 20 seconds of generation and 7 seconds of nvcc.
+**280 instantiations**, about 20 seconds of generation and 7 seconds of nvcc.
 The pool fans out at *instantiation* granularity, not family granularity — the
 families differ by more than an order of magnitude in size, so a family-granular
-pool would be bound by `land_batched` alone. It defaults to one worker per CPU
+pool would be bound by the largest family alone. It defaults to one worker per CPU
 capped at 32; each worker holds a TileLang lowering, so lower it with
 `PEGAINFER_K3_TILELANG_JOBS` on memory-tight hosts.
 
 One list in `generate.py` is deliberately narrow and is a one-line change:
 
-* `SPLIT_K` — the segment counts the partial consumers (`land`,
-  `land_rms_norm_rbs`, `conv_silu`) accept. Only `1` — the single partial a
+* `SPLIT_K` — the segment counts the partial consumers (`land_rms_norm_rbs`,
+  `conv_silu`) accept. Only `1` — the single partial a
   framework GEMM produces — has a launch site; the reference engine's
   split-K-8 GEMV shapes are not generated.
 
@@ -67,9 +66,10 @@ absorbed paged-KV kernel (`csrc/k3/k3_mla_paged_attn.cu` — a runtime page walk
 needs no per-capacity instantiation, which is what retired the upstream
 `mla_attn` family and its `MAX_CTX` list), so the upstream `gemv`,
 `expert_gemv`, `packed_expert_gemv` and `mla_attn` kernels would be dead
-weight. Their consumers are still
-here — `land_batched` at `SK = 1` is exactly the bf16 landing of a cuBLASLt
-f32 output.
+weight. Nor the matmul landing itself: `land_batched` was retired for the
+hand-written `csrc/k3/k3_land.cu` (same arithmetic, 8 columns per thread,
+batch a runtime value) once the chunked-prefill anatomy showed the
+one-element-per-thread kernel at a third of HBM rate.
 
 TileLang always names the entry point `main_kernel`, so every instantiation is
 renamed to a shape-tagged symbol before the sources are concatenated. Each

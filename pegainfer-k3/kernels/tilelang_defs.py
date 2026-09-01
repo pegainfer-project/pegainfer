@@ -169,29 +169,6 @@ def rms_norm_rbs_batched(H: int, B: int, eps: float, threads: int = 256):
 
 
 @lru_cache(maxsize=None)
-def land_batched(NT: int, N: int, OFF: int, SK: int, B: int, threads: int = 256):
-    """Batched ``land``: block (b, x) merges row b's partials for one column
-    span. The serial ascending-s merge and the single bf16 landing are the
-    bs=1 body verbatim."""
-    NPAD = ((N + threads - 1) // threads) * threads
-
-    @T.prim_func
-    def main(P: T.Tensor((B, SK, NT), ACC), O: T.Tensor((B, N), DT)):
-        with T.Kernel(B, NPAD // threads, threads=threads) as (bb, bx):
-            acc = T.alloc_fragment((threads,), ACC)
-            T.clear(acc)
-            for j in T.Parallel(threads):
-                for s in T.serial(SK):
-                    acc[j] += P[bb, s, OFF + T.min(bx * threads + j, N - 1)]
-            for j in T.Parallel(threads):
-                with T.If(bx * threads + j < N):
-                    with T.Then():
-                        O[bb, bx * threads + j] = T.Cast(DT, acc[j])
-
-    return _compile(main)
-
-
-@lru_cache(maxsize=None)
 def land_rms_norm_rbs_batched(NT: int, N: int, OFF: int, SK: int, B: int,
                               eps: float, threads: int = 256):
     """Batched ``land_rms_norm_rbs``: one row per block, merge -> bf16 landing
