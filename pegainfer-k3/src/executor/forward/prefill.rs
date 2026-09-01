@@ -12,11 +12,13 @@ use pegainfer_kernels::ops::gemm_rows_span_into_checked;
 use pegainfer_kernels::ops::k3_conv_silu_chunk_launch;
 use pegainfer_kernels::ops::k3_flash_kda_fwd_launch;
 use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_dense_launch;
+use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_dense_peer_q_launch;
 use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_mla_prefill_expand_k_launch;
 use pegainfer_kernels::ops::k3_mla_prefill_gather_launch;
 use pegainfer_kernels::ops::k3_mla_prefill_lse_merge_launch;
+use pegainfer_kernels::ops::k3_mla_prefill_lse_merge_peer_launch;
 use pegainfer_kernels::ops::k3_mla_prefill_o_finalize_launch;
 use pegainfer_kernels::ops::k3_o_norm_gate_batched_launch;
 use pegainfer_kernels::ops::k3_rms_norm_rbs_batched_launch;
@@ -750,12 +752,20 @@ pub(super) fn mla_attention_chunk_fmha(
 }
 
 /// The CP variant of one chunk's MLA attention: the paged gather is replaced
-/// by assembly from the gang's published post-norm latents. Each rank
-/// publishes its own segment's `kv_norm`/`rope` rows, copies its upstream
-/// peers' rows into the context scratch at their global offsets, lands its
-/// own rows from local scratch, and runs the same bottom-right-aligned FMHA
-/// at `t_kv = seg_start + seg_len` — causality falls out of the alignment
-/// exactly as for a local chunk.
+/// by assembly from the gang's published post-norm latents, and the causal
+/// triangle is striped across the gang (`cp::k3_cp_stripe_kept`).
+///
+/// Each rank publishes its own segment's `kv_norm`/`rope` rows and copies
+/// its upstream peers' rows into the context scratch at their global
+/// offsets. Then, per layer: it publishes its queries; attends its *kept*
+/// upstream segments densely and its own segment causally, folding every
+/// window into the f32 log-sum-exp accumulator; and runs the return slots —
+/// in slot `i` it attends the `i`-th owner it helps (that owner's published
+/// queries over this rank's own expanded keys, straight into a return slab)
+/// and merges what its own slot-`i` helpers returned, reading their slabs in
+/// place. The finalize lands `s.attn`. Merge order is fixed (kept segments
+/// ascending, own diagonal, helpers by slot), so the result is deterministic
+/// and identical on the in-process and fleet substrates.
 pub(super) fn mla_attention_chunk_cp(
     ctx: &DeviceContext,
     shape: K3StepShape,
@@ -772,6 +782,17 @@ pub(super) fn mla_attention_chunk_cp(
         seg_len == t_q && seg_start == shape.chunk_start,
         "K3 CP MLA step shape ({}+{t_q}) disagrees with the rank's segment ({seg_start}+{seg_len})",
         shape.chunk_start
+    );
+    ensure!(
+        t_kv * K3_KV_LORA_RANK <= s.mla_ctx_latent.data.len(),
+        "K3 MLA prefill workspace of {} tokens cannot span the {t_kv}-token context",
+        s.mla_ctx_latent.data.len() / K3_KV_LORA_RANK
+    );
+    let win = s.mla_ctx_k.len() / crate::config::K3_Q_B_OUT;
+    ensure!(
+        cp.segments.iter().all(|&(_, len)| len <= win),
+        "K3 CP segments {:?} exceed the {win}-row expansion window",
+        cp.segments
     );
     copy_rows(
         ctx,
@@ -790,6 +811,17 @@ pub(super) fn mla_attention_chunk_cp(
         0,
         t_q,
         crate::config::K3_QK_ROPE_HEAD_DIM,
+    )?;
+    // The stripe's query publication rides the same window as the latents:
+    // both are ready, and one window fewer per layer.
+    copy_rows(
+        ctx,
+        &s.query,
+        0,
+        &mut cp.mla_q_pub,
+        0,
+        t_q,
+        crate::config::K3_Q_B_OUT,
     )?;
     let group = cp.sync.clone();
     let sync = cp.window_sync(K3CpWindowKind::Upstream)?;
@@ -815,6 +847,11 @@ pub(super) fn mla_attention_chunk_cp(
         }
         Ok(())
     })?;
+    // The query window proper: nothing is read inside it — every helper's
+    // read of my queries is an FMHA launched before a return-window publish
+    // I wait on, which orders my next layer's overwrite behind it.
+    let sync = cp.window_sync(cp.stripe_query_kind())?;
+    group.exchange(ctx, &sync, || Ok(()))?;
     copy_rows(
         ctx,
         &s.kv_norm,
@@ -847,7 +884,115 @@ pub(super) fn mla_attention_chunk_cp(
             &s.mla_ctx_rope,
         )?;
     }
-    mla_chunk_attend(ctx, t_q, t_kv, w, s)
+
+    // The decode kernel reads the softmax scale as a bf16 device scalar; feed
+    // the FMHA the same rounded constant so the two paths agree on it.
+    let scale = bf16::from_f64(crate::model::k3_mla_scale()).to_f32();
+    s.mla_ctx_latent.seq_len = t_kv;
+    // Kept upstream segments, densely, in key order.
+    let mut first = true;
+    for k in cp.stripe_kept() {
+        let (k_start, k_len) = cp.segments[k];
+        mla_expand_window(ctx, w, s, k_start, k_len)?;
+        k3_flash_mla_prefill_fwd_dense_launch(
+            ctx,
+            t_q,
+            k_len,
+            K3_MLA_HEADS,
+            &s.query,
+            &s.mla_ctx_k,
+            &s.mla_ctx_nope_v.data,
+            &mut s.attn,
+            Some(&mut s.mla_lse_win),
+            scale,
+        )?;
+        k3_mla_prefill_lse_merge_launch(
+            ctx,
+            t_q,
+            K3_MLA_HEADS,
+            &s.attn,
+            &s.mla_lse_win,
+            &mut s.mla_o_acc,
+            &mut s.mla_lse_acc,
+            first,
+        )?;
+        first = false;
+    }
+    // The own diagonal — and the expansion the helper slots below read.
+    mla_expand_window(ctx, w, s, seg_start, t_q)?;
+    k3_flash_mla_prefill_fwd_launch(
+        ctx,
+        t_q,
+        t_q,
+        K3_MLA_HEADS,
+        &s.query,
+        &s.mla_ctx_k,
+        &s.mla_ctx_nope_v.data,
+        &mut s.attn,
+        Some(&mut s.mla_lse_win),
+        scale,
+    )?;
+    k3_mla_prefill_lse_merge_launch(
+        ctx,
+        t_q,
+        K3_MLA_HEADS,
+        &s.attn,
+        &s.mla_lse_win,
+        &mut s.mla_o_acc,
+        &mut s.mla_lse_acc,
+        first,
+    )?;
+
+    // Return slots. Slot i's helped FMHA is launched before window i opens
+    // (slot 0 here, slot i+1 inside window i's consume, so it needs no wait
+    // on window i's readers); it lands in slab i % 2, whose previous readers
+    // window i-2 already waited for. The owner merges each returned window
+    // in place inside window i.
+    let slots = cp.stripe_slots();
+    let helped = cp.stripe_helped();
+    let peers = cp.peers.clone();
+    let segments = cp.segments.clone();
+    let helped_fmha = |cp: &mut K3CpScratch, s: &mut K3Scratch, slot: usize| -> Result<()> {
+        let Some(&owner) = helped.get(slot) else {
+            return Ok(());
+        };
+        let (_, owner_len) = segments[owner];
+        let slab = slot % 2;
+        let (ret_o, ret_lse) = (&mut cp.mla_ret_o[slab], &mut cp.mla_ret_lse[slab]);
+        k3_flash_mla_prefill_fwd_dense_peer_q_launch(
+            ctx,
+            owner_len,
+            t_q,
+            K3_MLA_HEADS,
+            peers[owner].mla_q,
+            &s.mla_ctx_k,
+            &s.mla_ctx_nope_v.data,
+            ret_o,
+            Some(ret_lse),
+            scale,
+        )
+    };
+    helped_fmha(cp, s, 0)?;
+    for slot in 0..slots {
+        let returns = cp.stripe_returns(slot);
+        let sync = cp.window_sync(cp.stripe_return_kind(slot))?;
+        group.exchange(ctx, &sync, || {
+            for helper in returns {
+                k3_mla_prefill_lse_merge_peer_launch(
+                    ctx,
+                    t_q,
+                    K3_MLA_HEADS,
+                    peers[helper].mla_ret_o[slot % 2],
+                    peers[helper].mla_ret_lse[slot % 2],
+                    &mut s.mla_o_acc,
+                    &mut s.mla_lse_acc,
+                    false,
+                )?;
+            }
+            helped_fmha(cp, s, slot + 1)
+        })?;
+    }
+    k3_mla_prefill_o_finalize_launch(ctx, t_q, K3_MLA_HEADS, &s.mla_o_acc, &mut s.attn)
 }
 
 /// The shared tail of a chunk's MLA attention: kv_b expansion of the
