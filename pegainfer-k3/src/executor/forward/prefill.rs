@@ -6,11 +6,10 @@ use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use pegainfer_kernels::ops::K3_CONV_WIDTH;
 use pegainfer_kernels::ops::K3_MLA_HEADS;
 use pegainfer_kernels::ops::argmax_bf16_split_into;
 use pegainfer_kernels::ops::gemm_rows_span_into_checked;
-use pegainfer_kernels::ops::k3_conv_silu_batched_launch;
+use pegainfer_kernels::ops::k3_conv_silu_chunk_launch;
 use pegainfer_kernels::ops::k3_flash_kda_fwd_launch;
 use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_dense_launch;
 use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_launch;
@@ -394,9 +393,6 @@ pub(super) fn kda_attention_chunk(
         0,
         &s.normed,
         &mut s.kda_conv_partial,
-        &mut s.conv_x,
-        &mut s.conv_window,
-        &mut s.conv_window_next,
         &mut s.conv_q,
     )?;
     kda_conv_stream_chunk(
@@ -410,9 +406,6 @@ pub(super) fn kda_attention_chunk(
         1,
         &s.normed,
         &mut s.kda_conv_partial,
-        &mut s.conv_x,
-        &mut s.conv_window,
-        &mut s.conv_window_next,
         &mut s.conv_k,
     )?;
     kda_conv_stream_chunk(
@@ -426,9 +419,6 @@ pub(super) fn kda_attention_chunk(
         2,
         &s.normed,
         &mut s.kda_conv_partial,
-        &mut s.conv_x,
-        &mut s.conv_window,
-        &mut s.conv_window_next,
         &mut s.conv_v,
     )?;
 
@@ -654,8 +644,8 @@ pub(super) fn kda_attention_chunk(
 }
 
 /// One q/k/v stream of a prefill chunk or verify step: the batched band
-/// projection, the per-group window builds, one batched convolution, and each
-/// group's carry into its next segment.
+/// projection, then one conv launch per group that walks the segment's
+/// partial rows in place and carries the window into its next segment.
 #[allow(clippy::too_many_arguments)]
 fn kda_conv_stream_chunk(
     ctx: &DeviceContext,
@@ -668,13 +658,9 @@ fn kda_conv_stream_chunk(
     stream_index: usize,
     normed: &CudaSlice<bf16>,
     partial: &mut CudaSlice<f32>,
-    xs: &mut CudaSlice<bf16>,
-    window: &mut CudaSlice<bf16>,
-    window_next: &mut CudaSlice<bf16>,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
     let inner = K3_ATTN_INNER;
-    let window_row = K3_CONV_STATE * inner;
     k3_gemm_partial(
         ctx,
         fused,
@@ -685,76 +671,43 @@ fn kda_conv_stream_chunk(
         partial,
         K3PartialSpan::whole(inner),
     )?;
-    // Land the step's inputs once: the window entries ARE these bf16 rows,
-    // the same cast the conv kernel itself applies.
-    k3_land_batched_launch(ctx, b, inner, inner, 0, 1, partial, xs)?;
-    // Row t of a group's window slot j holds the group's input `t -
-    // K3_CONV_STATE + j`: from the segment itself once that token exists,
-    // from the slot's carried window before it. Rows outside every group
-    // keep stale windows; their conv output is padding and is discarded.
-    for group in groups {
-        let tokens = group.commit_rows + group.spec_rows;
-        let carry = &conv_state[group.parity][stream_index];
-        for j in 0..K3_CONV_STATE {
-            let lead = K3_CONV_STATE - j;
-            if tokens > lead {
-                copy_rows_2d(
-                    ctx,
-                    xs,
-                    group.row * inner,
-                    inner,
-                    window,
-                    ((group.row + lead) * K3_CONV_STATE + j) * inner,
-                    window_row,
-                    tokens - lead,
-                    inner,
-                )?;
-            }
-            for t in 0..lead.min(tokens) {
-                copy_rows_2d(
-                    ctx,
-                    carry,
-                    (group.state_row * K3_CONV_STATE + t + j) * inner,
-                    inner,
-                    window,
-                    ((group.row + t) * K3_CONV_STATE + j) * inner,
-                    inner,
-                    1,
-                    inner,
-                )?;
-            }
-        }
-    }
-    k3_conv_silu_batched_launch(
-        ctx,
-        b,
-        inner,
-        K3_CONV_WIDTH,
-        1,
-        partial,
-        taps,
-        window,
-        xs,
-        out,
-        window_next,
-    )?;
+    // Row t of a group's window slot j is the group's input `t -
+    // K3_CONV_STATE + j`: the segment's own partial row once that token
+    // exists (the kernel lands it, the same cast the conv applies), the
+    // slot's carried window before it. Nothing is materialized: the kernel
+    // reads the neighbouring rows in place. Rows outside every group are
+    // not touched; their conv output is padding and is discarded.
+    //
     // A group's carry into its next segment is the successor window of its
     // last COMMIT row — for a segment shorter than the window it already
-    // folds the slots carried in above. It lands in the other parity slab,
+    // folds the slots carried in. It lands in the other parity slab,
     // agreeing with the recurrent state's per-segment double buffering. The
     // speculative tail's successors are never carried: its tokens replay as
     // the next round's commit rows.
-    for group in groups.iter().filter(|group| group.commit_rows > 0) {
-        copy_rows_2d(
+    let (even, odd) = conv_state.split_at_mut(1);
+    for group in groups {
+        let tokens = group.commit_rows + group.spec_rows;
+        if tokens == 0 {
+            continue;
+        }
+        let (carry, next) = if group.parity == 0 {
+            (&even[0][stream_index], &mut odd[0][stream_index])
+        } else {
+            (&odd[0][stream_index], &mut even[0][stream_index])
+        };
+        k3_conv_silu_chunk_launch(
             ctx,
-            window_next,
-            (group.row + group.commit_rows - 1) * window_row,
-            window_row,
-            &mut conv_state[group.parity ^ 1][stream_index],
-            group.state_row * window_row,
-            window_row,
-            1,
-            window_row,
+            inner,
+            tokens,
+            group.commit_rows,
+            partial,
+            group.row,
+            taps,
+            carry,
+            group.state_row,
+            out,
+            group.row,
+            (group.commit_rows > 0).then_some((next, group.state_row)),
         )?;
     }
     Ok(())

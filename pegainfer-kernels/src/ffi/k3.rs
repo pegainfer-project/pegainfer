@@ -189,6 +189,26 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Chunked-prefill conv + silu over one q/k/v stream of one segment
+    /// (`csrc/k3/k3_conv_silu_chunk.cu`): `p [tokens, inner]` f32 partial,
+    /// `cw [4, inner]` f32 taps, `carry [3, inner]` bf16 window preceding
+    /// the segment, `y [tokens, inner]` bf16 output; `next [3, inner]` bf16
+    /// receives the window after row `commit_rows - 1` and is null exactly
+    /// when `commit_rows == 0`. Reads the partial rows in place — no window
+    /// is materialized — with the batched conv kernel's arithmetic term for
+    /// term. Shapes are runtime values.
+    pub fn k3_conv_silu_chunk_cuda(
+        p: *const f32,
+        cw: *const f32,
+        carry: *const c_void,
+        y: *mut c_void,
+        next: *mut c_void,
+        tokens: i32,
+        commit_rows: i32,
+        inner: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // --- fused MegaMoE (see `csrc/k3/k3_mega_moe_sm100.cu`) ---
 
     /// Token-count alignment the MegaMoE API enforces on

@@ -8,8 +8,8 @@
 // segment, one 16-byte store — so the pass streams at HBM rate.
 //
 // The arithmetic is the retired kernel's spelling: the segments are summed in
-// f32 in ascending s order starting from segment 0 (0 + P[0] is P[0]
-// exactly), then cast once, round-to-nearest-even. At split_k = 1 — the only
+// f32 in ascending s order onto a zero accumulator (so a -0 partial lands as
+// +0, as it did), then cast once, round-to-nearest-even. At split_k = 1 — the only
 // launch site — that is the bare cast, so the landing is bit-identical to the
 // retired kernel and the certified single-row spelling.
 //
@@ -46,8 +46,10 @@ __global__ void land_vec8_kernel(const float* __restrict__ P,
     const long long row = v / vec_per_row;
     const int col = (int)(v - row * vec_per_row) * kVec;
     const float* src = P + row * (long long)split_k * nt + off + col;
-    float4 lo = *reinterpret_cast<const float4*>(src);
-    float4 hi = *reinterpret_cast<const float4*>(src + 4);
+    float4 lo = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 hi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    add4(lo, *reinterpret_cast<const float4*>(src));
+    add4(hi, *reinterpret_cast<const float4*>(src + 4));
     for (int s = 1; s < split_k; ++s) {
       src += nt;
       add4(lo, *reinterpret_cast<const float4*>(src));
@@ -71,7 +73,8 @@ __global__ void land_scalar_kernel(const float* __restrict__ P,
     const long long row = i / n;
     const int col = (int)(i - row * n);
     const float* src = P + row * (long long)split_k * nt + off + col;
-    float acc = src[0];
+    float acc = 0.0f;
+    acc = acc + src[0];
     for (int s = 1; s < split_k; ++s) {
       acc += src[(long long)s * nt];
     }
