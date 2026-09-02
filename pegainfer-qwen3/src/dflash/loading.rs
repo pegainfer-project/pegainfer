@@ -12,7 +12,13 @@ use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::mmap_shards;
 
 use super::DFlashDraftModel;
+use super::manifest::HIDDEN_PROJECTION_TENSOR;
+use super::manifest::PREDECESSOR_CODEBOOK_TENSOR;
+use super::manifest::SUCCESSOR_CODEBOOK_TENSOR;
+use super::manifest::validate_selector_tensors;
+use super::selector::SelectorWeights;
 use crate::config::DFlashConfig;
+use crate::config::DFlashProposal;
 use crate::dspark::MARKOV_W1_TENSOR;
 use crate::dspark::MARKOV_W2_TENSOR;
 use crate::dspark::MarkovHead;
@@ -30,6 +36,8 @@ impl DFlashDraftModel {
         let config = DFlashConfig::from_file(model_path)
             .with_context(|| format!("load DFlash config from {model_path}"))?;
         config.validate_for_target(target.config())?;
+        // Reject unsupported capabilities before GPU allocation.
+        config.validate_runtime_capabilities()?;
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
         debug!(
@@ -38,6 +46,32 @@ impl DFlashDraftModel {
         );
         let mmaps = mmap_shards(&shard_paths)?;
         let shards = deserialize_shards(&mmaps)?;
+
+        let selector = if let DFlashProposal::TopKSelector { rank, .. } = &config.proposal {
+            validate_selector_tensors(
+                &shards,
+                &weight_map,
+                *rank,
+                config.hidden_size,
+                config.draft_vocab_size,
+            )?;
+            let hidden_projection =
+                load_tensor_2d(ctx, &shards, &weight_map, HIDDEN_PROJECTION_TENSOR)?;
+            let predecessor_codebook =
+                load_tensor_2d(ctx, &shards, &weight_map, PREDECESSOR_CODEBOOK_TENSOR)?;
+            let successor_codebook =
+                load_tensor_2d(ctx, &shards, &weight_map, SUCCESSOR_CODEBOOK_TENSOR)?;
+            Some(SelectorWeights::new(
+                *rank,
+                config.hidden_size,
+                config.draft_vocab_size,
+                hidden_projection,
+                predecessor_codebook,
+                successor_codebook,
+            )?)
+        } else {
+            None
+        };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
@@ -139,16 +173,16 @@ impl DFlashDraftModel {
         // DSpark Markov head (Phase 1). The confidence head and the tied
         // embed_tokens/lm_head are intentionally skipped: the head is byte-identical
         // to the target's, which we reuse for the verify-equivalent logits.
+        if config.enable_confidence_head {
+            log::info!(
+                "DFlash confidence head present in {model_path} but unused in Phase 1 \
+                 (full-block verify, no confidence-scheduled truncation)"
+            );
+        }
         let markov = if config.uses_markov_head() {
             let w1 = load_tensor_2d(ctx, &shards, &weight_map, MARKOV_W1_TENSOR)?;
             let w2 = load_tensor_2d(ctx, &shards, &weight_map, MARKOV_W2_TENSOR)?;
-            if config.enable_confidence_head {
-                log::info!(
-                    "DSpark confidence head present in {model_path} but unused in Phase 1 \
-                     (full-block verify, no confidence-scheduled truncation)"
-                );
-            }
-            Some(MarkovHead::new(config.markov_rank, w1, w2)?)
+            Some(MarkovHead::new(config.markov_rank(), w1, w2)?)
         } else {
             None
         };
@@ -173,6 +207,7 @@ impl DFlashDraftModel {
             cos_cache,
             sin_cache,
             markov,
+            selector,
         })
     }
 }

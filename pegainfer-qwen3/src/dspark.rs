@@ -147,7 +147,7 @@ impl MarkovHead {
             return 0;
         }
         let vocab = config.vocab_size;
-        let rank = config.markov_rank;
+        let rank = config.markov_rank();
         let weights = 2 * vocab * rank * BF16;
         let scratch = MarkovScratch::bytes(vocab, rank, config.block_size, max_decode_batch_size);
         weights + scratch
@@ -180,7 +180,7 @@ impl MarkovScratch {
             "DSpark markov scratch needs a non-zero batch size"
         );
         let vocab = config.vocab_size;
-        let rank = config.markov_rank;
+        let rank = config.markov_rank();
         let partials = markov_step_argmax_partials_len(max_decode_batch_size, vocab);
         let sampled = max_decode_batch_size * config.block_size;
         Ok(Self {

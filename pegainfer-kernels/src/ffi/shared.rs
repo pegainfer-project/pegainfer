@@ -940,6 +940,38 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // DFlash2 proposer-side selector. The first launch writes a deterministic
+    // top-k candidate list for each logits row; the second launch walks those
+    // candidates request by request and writes one selected token per row.
+    pub fn dflash2_selector_topk_cuda(
+        logits: *const Half,
+        candidate_ids: *mut u32,
+        candidate_scores: *mut f32,
+        rows: i32,
+        input_block_size: i32,
+        position_offset: i32,
+        positions_per_request: i32,
+        vocab: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn dflash2_selector_walk_cuda(
+        projected_hidden: *const Half,
+        predecessor: *const Half,
+        successor: *const Half,
+        anchor_tokens: *const u32,
+        candidate_ids: *const u32,
+        candidate_unary: *const f32,
+        output: *mut u32,
+        requests: i32,
+        input_block_size: i32,
+        position_offset: i32,
+        positions_per_request: i32,
+        vocab: i32,
+        rank: i32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn bf16_to_f32_cuda(
         input: *const Half,
         output: *mut f32,

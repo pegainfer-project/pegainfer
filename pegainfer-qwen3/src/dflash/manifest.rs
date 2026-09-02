@@ -1,0 +1,91 @@
+//! Preflight validation for DFlash2 selector tensors.
+
+use std::collections::HashMap;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use safetensors::Dtype;
+use safetensors::SafeTensors;
+use safetensors::tensor::TensorView;
+
+pub(crate) const HIDDEN_PROJECTION_TENSOR: &str = "candidate_selector.hidden_projection.weight";
+pub(crate) const PREDECESSOR_CODEBOOK_TENSOR: &str = "candidate_selector.predecessor_codebook";
+pub(crate) const SUCCESSOR_CODEBOOK_TENSOR: &str = "candidate_selector.successor_codebook";
+
+/// Validate selector dtype and shapes before GPU upload.
+pub(crate) fn validate_selector_tensors(
+    shards: &[SafeTensors<'_>],
+    weight_map: &HashMap<String, usize>,
+    rank: usize,
+    hidden_size: usize,
+    vocab_size: usize,
+) -> Result<()> {
+    validate_matrix(
+        shards,
+        weight_map,
+        HIDDEN_PROJECTION_TENSOR,
+        rank,
+        hidden_size,
+    )?;
+    validate_matrix(
+        shards,
+        weight_map,
+        PREDECESSOR_CODEBOOK_TENSOR,
+        vocab_size,
+        rank,
+    )?;
+    validate_matrix(
+        shards,
+        weight_map,
+        SUCCESSOR_CODEBOOK_TENSOR,
+        vocab_size,
+        rank,
+    )?;
+
+    Ok(())
+}
+
+fn validate_matrix(
+    shards: &[SafeTensors<'_>],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    expected_rows: usize,
+    expected_cols: usize,
+) -> Result<()> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    ensure!(
+        tensor.dtype() == Dtype::BF16,
+        "DFlash selector tensor {name:?} must be BF16, got {:?}",
+        tensor.dtype()
+    );
+    ensure!(
+        tensor.shape() == [expected_rows, expected_cols],
+        "DFlash selector tensor {name:?} has shape {:?}, expected [{expected_rows}, {expected_cols}]",
+        tensor.shape()
+    );
+    Ok(())
+}
+
+fn find_tensor<'a>(
+    shards: &'a [SafeTensors<'a>],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<TensorView<'a>> {
+    if let Some(&shard_idx) = weight_map.get(name) {
+        let shard = shards.get(shard_idx).with_context(|| {
+            format!("DFlash selector tensor {name:?} references missing shard index {shard_idx}")
+        })?;
+        return shard
+            .tensor(name)
+            .with_context(|| format!("load DFlash selector tensor {name:?}"));
+    }
+
+    for shard in shards {
+        if let Ok(tensor) = shard.tensor(name) {
+            return Ok(tensor);
+        }
+    }
+
+    anyhow::bail!("DFlash selector tensor {name:?} is missing")
+}

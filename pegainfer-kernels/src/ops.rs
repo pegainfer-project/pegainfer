@@ -5,6 +5,7 @@ mod attention;
 mod deepep;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
+mod dflash2;
 mod elementwise;
 mod embedding;
 #[cfg(feature = "gemma4")]
@@ -83,6 +84,10 @@ pub use deepep::glm52_deepep_info;
 pub use deepep::glm52_ep_deepep_unique_id;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
+pub use dflash2::DFlash2SelectorScratch;
+pub use dflash2::dflash2_selector_into;
+pub use dflash2::dflash2_selector_scratch_bytes;
+pub use dflash2::dflash2_selector_selected_host;
 pub use elementwise::SuppressIds;
 pub use elementwise::accumulate_bf16_token_scaled_to_f32_into;
 pub use elementwise::add_batch;

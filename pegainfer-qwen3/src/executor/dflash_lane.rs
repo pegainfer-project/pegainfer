@@ -277,8 +277,9 @@ impl LocalQwen3Lane {
             // Propose tokens from the base logits. DFlash takes an independent
             // greedy argmax per position; DSpark adds the Markov bias and samples
             // the block left-to-right (anchor-first, all `block_size` positions).
-            let markov = model.uses_markov_head();
-            let sampled = if markov {
+            let sampled = if model.uses_selector() {
+                model.selector_draft_tokens(self.model.device_ctx(), &current_tokens, scratch)?
+            } else if model.uses_markov_head() {
                 model.markov_draft_tokens(self.model.device_ctx(), &current_tokens, scratch)?
             } else {
                 let greedy = SamplingParams::default();
