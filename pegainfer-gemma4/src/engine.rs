@@ -845,9 +845,10 @@ struct EngineState {
 
 /// The scheduler thread is not the thread that loaded the engine: the
 /// primary context must be made current there and the thread-local cuBLAS
-/// handle created, or the first eager GEMM fails with an invalid handle.
-/// Same three steps the Qwen3 model thread takes.
-fn bind_engine_thread(ctx: &DeviceContext) -> Result<()> {
+/// handles created, or the first eager GEMM fails with an invalid handle.
+/// Same three steps the Qwen3 model thread takes; the returned guard tears
+/// the handles down when the scheduler drops on that thread.
+fn bind_engine_thread(ctx: &DeviceContext) -> Result<CublasThreadGuard> {
     let err = unsafe { pegainfer_core::ffi::cuda_set_device(ctx.device_ordinal as i32) };
     anyhow::ensure!(
         err == 0,
@@ -858,30 +859,41 @@ fn bind_engine_thread(ctx: &DeviceContext) -> Result<()> {
         .bind_to_thread()
         .map_err(|e| anyhow::anyhow!("bind the CUDA context to the scheduler thread: {e}"))?;
     unsafe { pegainfer_core::ffi::cublas_init() };
-    Ok(())
+    Ok(CublasThreadGuard)
+}
+
+/// Destroys the thread-local cuBLAS handles [`bind_engine_thread`] created.
+/// The scheduler holds it so the drop lands on the driver thread that owns
+/// the handles, once the engine state has released its device work.
+struct CublasThreadGuard;
+
+impl Drop for CublasThreadGuard {
+    fn drop(&mut self) {
+        unsafe { pegainfer_core::ffi::cublas_destroy() };
+    }
 }
 
 struct Gemma4Scheduler {
-    /// Set once the driver thread has bound the context; see
-    /// [`bind_engine_thread`].
-    thread_bound: bool,
     state: EngineState,
     pending: VecDeque<QueuedRequest>,
     active: Vec<Active>,
     door: Option<CoalesceDoor>,
     walk: Option<Walk>,
+    /// `Some` once the driver thread has bound the context; declared last so
+    /// the handles outlive the engine state's teardown.
+    cublas: Option<CublasThreadGuard>,
 }
 
 impl Gemma4Scheduler {
     fn new(state: EngineState) -> Self {
         let door = state.coalesce_door();
         Self {
-            thread_bound: false,
             state,
             pending: VecDeque::new(),
             active: Vec::new(),
             door,
             walk: None,
+            cublas: None,
         }
     }
 }
@@ -2242,9 +2254,8 @@ impl Scheduler for Gemma4Scheduler {
     }
 
     fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
-        if !self.thread_bound {
-            bind_engine_thread(&self.state.ctx)?;
-            self.thread_bound = true;
+        if self.cublas.is_none() {
+            self.cublas = Some(bind_engine_thread(&self.state.ctx)?);
         }
         if self.walk.is_some() {
             return self.advance_walk(ledger);
