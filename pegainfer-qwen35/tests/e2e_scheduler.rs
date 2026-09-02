@@ -1,25 +1,28 @@
 //! E2E scheduler integration test for Qwen3.5-4B.
 //!
 //! Tests the Qwen3.5 reduced-capacity scheduler path (batch prefill +
-//! CUDA Graph decode) with sequential, concurrent, and consumer-drop requests.
+//! CUDA Graph decode) with sequential, concurrent, and client-abort requests.
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use log::info;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::SchedulerMetrics;
-use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::RejectReason;
+use pegainfer_frontend::engine::RequestUpdate;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
-use pegainfer_frontend::engine::TokenSink;
-use pegainfer_frontend::engine::TokenStreamReceiver;
 use pegainfer_frontend::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
+
+use common::harness::EngineHarness;
+use common::harness::RequestStream;
 
 const CASES: &[TestCase] = &[
     TestCase {
@@ -101,133 +104,114 @@ struct GenerationResult {
 }
 
 fn generate_tokens(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
 ) -> (Vec<u32>, FinishReason) {
-    let result = generate_tokens_with_logprobs(handle, tokenizer, prompt, max_tokens, 0);
+    let result = generate_tokens_with_logprobs(engine, tokenizer, prompt, max_tokens, 0);
     (result.tokens, result.finish_reason)
 }
 
 fn generate_tokens_with_logprobs(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     tokenizer: &DynTokenizer,
     prompt: &str,
     max_tokens: usize,
     logprobs: usize,
 ) -> GenerationResult {
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-    let (token_tx, mut token_rx) = TokenSink::standalone();
-
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params: SamplingParams::default(),
-            max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    collect_generation(&mut token_rx, prompt, logprobs)
+    let mut request =
+        common::harness::request(prompt_tokens, SamplingParams::default(), max_tokens);
+    request.logprobs = logprobs;
+    collect_generation(engine.submit(request), prompt, logprobs)
 }
 
 fn submit_repeated_token_request(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     request_id: &str,
     token: u32,
     prompt_len: usize,
     max_tokens: usize,
-) -> TokenStreamReceiver {
-    let (token_tx, token_rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: Some(request_id.to_string()),
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens: vec![token; prompt_len],
-            params: SamplingParams {
-                ignore_eos: true,
-                ..SamplingParams::default()
-            },
-            max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .unwrap_or_else(|err| panic!("submit {request_id}: {err}"));
-    token_rx
+) -> RequestStream {
+    let mut request = common::harness::request(
+        vec![token; prompt_len],
+        SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        },
+        max_tokens,
+    );
+    request.client_label = Some(Arc::from(request_id));
+    engine.submit(request)
 }
 
-fn wait_for_first_token(rx: &mut TokenStreamReceiver, request_id: &str) {
-    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+fn wait_for_first_token(stream: &mut RequestStream, request_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match recv_event_before(rx, request_id, deadline) {
-            Some(TokenEvent::Token { .. }) => return,
-            Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
-            Some(event) => panic!("{request_id} emitted {event:?} before its first token"),
+        match recv_update_before(stream, request_id, deadline) {
+            Some(update) if !update.tokens.is_empty() => return,
+            Some(update) if update.terminal.is_some() => {
+                panic!(
+                    "{request_id} emitted {:?} before its first token",
+                    update.terminal
+                )
+            }
+            Some(_) => {}
             None => panic!("scheduler closed before {request_id} emitted a token"),
         }
     }
 }
 
-fn recv_event_before(
-    rx: &mut TokenStreamReceiver,
+fn recv_update_before(
+    stream: &mut RequestStream,
     request_id: &str,
     deadline: Instant,
-) -> Option<TokenEvent> {
+) -> Option<RequestUpdate> {
     loop {
-        if let Ok((_, event)) = rx.try_recv() {
-            return Some(event);
+        if let Some(update) = stream.try_recv() {
+            return Some(update);
         }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {request_id} scheduler event"
         );
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
-fn assert_no_generated_event(rx: &mut TokenStreamReceiver, request_id: &str) {
-    while let Ok((_, event)) = rx.try_recv() {
-        match event {
-            TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. } => {}
-            event => panic!("{request_id} emitted {event:?} before the overlap bound"),
-        }
+fn assert_no_generated_event(stream: &mut RequestStream, request_id: &str) {
+    while let Some(update) = stream.try_recv() {
+        assert!(
+            update.tokens.is_empty(),
+            "{request_id} emitted tokens {:?} before the overlap bound",
+            update.tokens
+        );
+        assert!(
+            update.terminal.is_none(),
+            "{request_id} emitted {:?} before the overlap bound",
+            update.terminal
+        );
     }
 }
 
-fn drain_tokens(rx: &mut TokenStreamReceiver, request_id: &str) -> usize {
+fn drain_tokens(stream: &mut RequestStream, request_id: &str) -> usize {
     let mut tokens = 0;
-    while let Ok((_, event)) = rx.try_recv() {
-        match event {
-            TokenEvent::Token { .. } => tokens += 1,
-            TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. } => {}
-            event => panic!("{request_id} emitted {event:?} while it must remain active"),
-        }
+    while let Some(update) = stream.try_recv() {
+        assert!(
+            update.terminal.is_none(),
+            "{request_id} emitted {:?} while it must remain active",
+            update.terminal
+        );
+        tokens += update.tokens.len();
     }
     tokens
 }
 
-fn wait_for_running_requests(
-    load: &mut tokio::sync::watch::Receiver<SchedulerMetrics>,
-    expected: u64,
-    timeout: std::time::Duration,
-) {
+fn wait_for_running_requests(engine: &EngineHarness, expected: u64, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let snapshot = *load.borrow_and_update();
+        let snapshot = engine.metrics();
         if snapshot.num_running_reqs == expected {
             return;
         }
@@ -235,29 +219,25 @@ fn wait_for_running_requests(
             Instant::now() < deadline,
             "timed out waiting for {expected} running requests; last snapshot: {snapshot:?}"
         );
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
-fn collect_generation(
-    token_rx: &mut TokenStreamReceiver,
-    name: &str,
-    logprobs: usize,
-) -> GenerationResult {
-    collect_generation_until(token_rx, name, logprobs, None)
+fn collect_generation(stream: RequestStream, name: &str, logprobs: usize) -> GenerationResult {
+    collect_generation_until(stream, name, logprobs, None)
 }
 
 fn collect_generation_with_timeout(
-    token_rx: &mut TokenStreamReceiver,
+    stream: RequestStream,
     name: &str,
     logprobs: usize,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> GenerationResult {
-    collect_generation_until(token_rx, name, logprobs, Some(Instant::now() + timeout))
+    collect_generation_until(stream, name, logprobs, Some(Instant::now() + timeout))
 }
 
 fn collect_generation_until(
-    token_rx: &mut TokenStreamReceiver,
+    mut stream: RequestStream,
     name: &str,
     logprobs: usize,
     deadline: Option<Instant>,
@@ -265,59 +245,85 @@ fn collect_generation_until(
     let mut tokens = Vec::new();
     let mut token_logprobs = Vec::new();
     loop {
-        let event = match deadline {
-            Some(deadline) => recv_event_before(token_rx, name, deadline),
-            None => token_rx.blocking_recv().map(|(_, event)| event),
+        let update = match deadline {
+            Some(deadline) => recv_update_before(&mut stream, name, deadline),
+            None => stream.recv(),
         };
-        match event {
-            Some(TokenEvent::Token { id, logprob }) => {
-                if logprobs == 0 {
-                    assert!(
-                        logprob.is_none(),
-                        "{name}: logprobs=0 should not return token logprobs"
-                    );
-                } else {
-                    let lp = logprob
-                        .as_ref()
-                        .unwrap_or_else(|| panic!("{name}: logprobs={logprobs} returned None"));
-                    assert!(
-                        lp.logprob.is_finite(),
-                        "{name}: sampled token logprob must be finite"
-                    );
-                    assert_eq!(
-                        lp.top_logprobs.len(),
-                        logprobs,
-                        "{name}: top_logprobs length should match the request"
-                    );
-                    assert!(
-                        lp.top_logprobs.iter().all(|&(_, v)| v.is_finite()),
-                        "{name}: top_logprobs must be finite"
-                    );
-                    assert_eq!(
-                        lp.top_logprobs.first().map(|&(token, _)| token),
-                        Some(id),
-                        "{name}: greedy sampled token should match top-1 logprob row"
-                    );
+        match update {
+            Some(update) => {
+                apply_update(name, logprobs, &update, &mut tokens, &mut token_logprobs);
+                if let Some(terminal) = update.terminal {
+                    return generation_from_terminal(name, tokens, token_logprobs, terminal);
                 }
-                tokens.push(id);
-                token_logprobs.push(logprob);
             }
-            Some(
-                TokenEvent::PromptTokens { .. }
-                | TokenEvent::Scheduled { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { finish_reason, .. }) => {
-                return GenerationResult {
-                    tokens,
-                    logprobs: token_logprobs,
-                    finish_reason,
-                };
-            }
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
             None => panic!("{name}: scheduler channel closed without Finished"),
         }
+    }
+}
+
+fn apply_update(
+    name: &str,
+    requested_logprobs: usize,
+    update: &RequestUpdate,
+    tokens: &mut Vec<u32>,
+    token_logprobs: &mut Vec<Option<TokenLogprob>>,
+) {
+    if requested_logprobs == 0 {
+        assert!(
+            update.logprobs.iter().all(Option::is_none),
+            "{name}: logprobs=0 should not return token logprobs"
+        );
+    } else if !update.tokens.is_empty() {
+        assert_eq!(
+            update.logprobs.len(),
+            update.tokens.len(),
+            "{name}: logprobs must be parallel to tokens"
+        );
+        for (id, logprob) in update.tokens.iter().copied().zip(update.logprobs.iter()) {
+            let lp = logprob
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: logprobs={requested_logprobs} returned None"));
+            assert!(
+                lp.logprob.is_finite(),
+                "{name}: sampled token logprob must be finite"
+            );
+            assert_eq!(
+                lp.top_logprobs.len(),
+                requested_logprobs,
+                "{name}: top_logprobs length should match the request"
+            );
+            assert!(
+                lp.top_logprobs.iter().all(|&(_, v)| v.is_finite()),
+                "{name}: top_logprobs must be finite"
+            );
+            assert_eq!(
+                lp.top_logprobs.first().map(|&(token, _)| token),
+                Some(id),
+                "{name}: greedy sampled token should match top-1 logprob row"
+            );
+        }
+    }
+    tokens.extend_from_slice(&update.tokens);
+    token_logprobs.extend(update.logprobs.iter().cloned());
+}
+
+fn generation_from_terminal(
+    name: &str,
+    tokens: Vec<u32>,
+    logprobs: Vec<Option<TokenLogprob>>,
+    terminal: Terminal,
+) -> GenerationResult {
+    match terminal {
+        Terminal::Finished {
+            reason: finish_reason,
+            ..
+        } => GenerationResult {
+            tokens,
+            logprobs,
+            finish_reason,
+        },
+        Terminal::Rejected { reason, .. } => panic!("{name}: generation rejected: {reason}"),
+        Terminal::Failed { message, .. } => panic!("{name}: generation failed: {message}"),
     }
 }
 
@@ -334,45 +340,37 @@ fn concurrent_params(case_idx: usize) -> SamplingParams {
     }
 }
 
-fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: usize) {
-    let (token_tx, mut token_rx) = TokenSink::standalone();
+fn expect_context_window_rejection(engine: &EngineHarness, max_context_tokens: usize) {
+    let mut request =
+        common::harness::request(vec![1; max_context_tokens], SamplingParams::default(), 1);
+    request.client_label = Some(Arc::from("over-context-window"));
 
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: Some("over-context-window".to_string()),
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens: vec![1; max_context_tokens],
-            params: SamplingParams::default(),
-            max_tokens: 1,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit over-context request");
-
-    match token_rx.blocking_recv().map(|(_, event)| event) {
-        Some(TokenEvent::Rejected {
-            message,
-            prompt_tokens,
-            completion_tokens,
-        }) => {
+    match engine.submit(request).outcome().terminal {
+        Terminal::Rejected {
+            reason:
+                RejectReason::ContextLength {
+                    prompt_tokens,
+                    max_tokens,
+                    limit,
+                },
+            prompt_tokens: reported_prompt,
+        } => {
+            assert_eq!(reported_prompt, max_context_tokens);
             assert_eq!(prompt_tokens, max_context_tokens);
-            assert_eq!(completion_tokens, 0);
-            assert!(
-                message.contains("maximum context length"),
-                "expected context-window rejection, got: {message}"
-            );
-            assert!(
-                message.contains(&(max_context_tokens + 1).to_string()),
-                "rejection should report prompt + max_tokens, got: {message}"
+            assert_eq!(max_tokens, 1);
+            assert_eq!(limit, max_context_tokens);
+            assert_eq!(
+                prompt_tokens.saturating_add(max_tokens),
+                max_context_tokens + 1
             );
         }
-        Some(_) => panic!("expected context-window rejection"),
-        None => panic!("scheduler channel closed without rejection"),
+        Terminal::Rejected { reason, .. } => {
+            panic!("expected context-window rejection, got: {reason}")
+        }
+        Terminal::Failed { message, .. } => {
+            panic!("oversized prompt errored instead of clean rejection: {message}")
+        }
+        Terminal::Finished { .. } => panic!("expected context-window rejection"),
     }
 }
 
@@ -449,7 +447,7 @@ fn assert_no_model_wide_collapse(collapses: &[(&str, Collapse)]) {
 }
 
 fn run_full_scheduler_e2e(
-    handle: &EngineHandle,
+    engine: &EngineHarness,
     tokenizer: &DynTokenizer,
     max_context_tokens: usize,
     label: &str,
@@ -458,7 +456,7 @@ fn run_full_scheduler_e2e(
 
     // ── 0. Static context-window rejection ─────────────────────────────
     info!("=== Phase 0: Context-window rejection ===");
-    expect_context_window_rejection(handle, max_context_tokens);
+    expect_context_window_rejection(engine, max_context_tokens);
     info!("  PASS: over-context request rejected before prefill");
 
     // ── 1. logprobs must not change greedy tokens ─────────────────────
@@ -466,9 +464,9 @@ fn run_full_scheduler_e2e(
     for case in CASES.iter().take(3) {
         let max_tokens = case.max_new_tokens.min(16);
         let no_logprobs =
-            generate_tokens_with_logprobs(handle, tokenizer, case.prompt, max_tokens, 0);
+            generate_tokens_with_logprobs(engine, tokenizer, case.prompt, max_tokens, 0);
         let with_logprobs =
-            generate_tokens_with_logprobs(handle, tokenizer, case.prompt, max_tokens, 1);
+            generate_tokens_with_logprobs(engine, tokenizer, case.prompt, max_tokens, 1);
         assert_eq!(no_logprobs.finish_reason, with_logprobs.finish_reason);
         assert_eq!(
             no_logprobs.tokens, with_logprobs.tokens,
@@ -503,7 +501,7 @@ fn run_full_scheduler_e2e(
         info!("--- {:?} ---", case.name);
         let start = Instant::now();
         let (tokens, finish_reason) =
-            generate_tokens(handle, tokenizer, case.prompt, case.max_new_tokens);
+            generate_tokens(engine, tokenizer, case.prompt, case.max_new_tokens);
         let elapsed = start.elapsed();
 
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
@@ -530,7 +528,7 @@ fn run_full_scheduler_e2e(
     // ── 3. Multi-request (scheduler state reuse) ────────────────────────
     info!("=== Phase 3: Multi-request ===");
     for case in CASES {
-        let (tokens, _) = generate_tokens(handle, tokenizer, case.prompt, case.max_new_tokens);
+        let (tokens, _) = generate_tokens(engine, tokenizer, case.prompt, case.max_new_tokens);
         let text = tokenizer.decode(&tokens, true).expect("decode failed");
         assert!(
             !text.is_empty(),
@@ -543,35 +541,23 @@ fn run_full_scheduler_e2e(
     // ── 4. Concurrent requests ──────────────────────────────────────────
     info!("=== Phase 4: Concurrent requests ===");
     {
-        let mut receivers: Vec<(String, usize, TokenStreamReceiver)> = Vec::new();
+        let mut streams: Vec<(String, usize, RequestStream)> = Vec::new();
 
         // Submit all cases concurrently, alternating greedy and sampled rows so
         // batch decode covers the mixed token-selection path from #284.
         for (case_idx, case) in CASES.iter().enumerate() {
             let prompt_tokens = tokenizer.encode(case.prompt, false).expect("encode failed");
-            let (token_tx, token_rx) = TokenSink::standalone();
-            handle
-                .submit(GenerateRequest {
-                    trace_parent: None,
-                    request_id: None,
-                    queued_at_unix_s: None,
-                    data_parallel_rank: None,
-                    prompt_tokens,
-                    params: concurrent_params(case_idx),
-                    max_tokens: case.max_new_tokens,
-                    lora_adapter: None,
-                    kv_transfer_params: None,
-                    token_tx,
-                    logprobs: 0,
-                    echo: false,
-                })
-                .expect("submit failed");
-            receivers.push((case.name.to_string(), 0, token_rx));
+            let mut request = common::harness::request(
+                prompt_tokens,
+                concurrent_params(case_idx),
+                case.max_new_tokens,
+            );
+            request.client_label = Some(Arc::from(case.name));
+            streams.push((case.name.to_string(), 0, engine.submit(request)));
         }
 
-        // Collect all results
-        for (name, logprobs, mut rx) in receivers {
-            let result = collect_generation(&mut rx, &name, logprobs);
+        for (name, logprobs, stream) in streams {
+            let result = collect_generation(stream, &name, logprobs);
             let text = tokenizer
                 .decode(&result.tokens, true)
                 .expect("decode failed");
@@ -587,32 +573,18 @@ fn run_full_scheduler_e2e(
             ("mixed_no_logprobs", CASES[0].prompt, 0usize),
             ("mixed_with_logprobs", CASES[1].prompt, 1usize),
         ];
-        let mut receivers: Vec<(&str, usize, TokenStreamReceiver)> = Vec::new();
+        let mut streams: Vec<(&str, usize, RequestStream)> = Vec::new();
 
         for (name, prompt, logprobs) in mixed {
             let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-            let (token_tx, token_rx) = TokenSink::standalone();
-            handle
-                .submit(GenerateRequest {
-                    trace_parent: None,
-                    request_id: Some(name.to_string()),
-                    queued_at_unix_s: None,
-                    data_parallel_rank: None,
-                    prompt_tokens,
-                    params: SamplingParams::default(),
-                    max_tokens: 8,
-                    lora_adapter: None,
-                    kv_transfer_params: None,
-                    token_tx,
-                    logprobs,
-                    echo: false,
-                })
-                .expect("submit failed");
-            receivers.push((name, logprobs, token_rx));
+            let mut request = common::harness::request(prompt_tokens, SamplingParams::default(), 8);
+            request.logprobs = logprobs;
+            request.client_label = Some(Arc::from(name));
+            streams.push((name, logprobs, engine.submit(request)));
         }
 
-        for (name, logprobs, mut rx) in receivers {
-            let result = collect_generation(&mut rx, name, logprobs);
+        for (name, logprobs, stream) in streams {
+            let result = collect_generation(stream, name, logprobs);
             assert!(!result.tokens.is_empty(), "{name}: produced no tokens");
             if logprobs == 0 {
                 assert!(
@@ -629,37 +601,26 @@ fn run_full_scheduler_e2e(
         }
     }
 
-    // ── 5. Consumer drop safety ─────────────────────────────────────────
-    info!("=== Phase 5: Consumer drop ===");
+    // ── 5. Client abort safety ──────────────────────────────────────────
+    info!("=== Phase 5: Client abort ===");
     {
         let prompt_tokens = tokenizer.encode("Hello", false).expect("encode failed");
-        let (token_tx, rx) = TokenSink::standalone();
-        drop(rx);
-        handle
-            .submit(GenerateRequest {
-                trace_parent: None,
-                request_id: None,
-                queued_at_unix_s: None,
-                data_parallel_rank: None,
-                prompt_tokens,
-                params: SamplingParams::default(),
-                max_tokens: 10,
-                lora_adapter: None,
-                kv_transfer_params: None,
-                token_tx,
-                logprobs: 0,
-                echo: false,
-            })
-            .expect("submit failed");
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        info!("  PASS: consumer drop handled");
+        let stream = engine.submit(common::harness::request(
+            prompt_tokens,
+            SamplingParams::default(),
+            10,
+        ));
+        stream.control.abort();
+        drop(stream);
+        std::thread::sleep(Duration::from_millis(500));
+        info!("  PASS: client abort handled");
     }
 
     // Verify scheduler survives
-    let (tokens, _) = generate_tokens(handle, tokenizer, "Hello", 5);
+    let (tokens, _) = generate_tokens(engine, tokenizer, "Hello", 5);
     let text = tokenizer.decode(&tokens, true).expect("decode failed");
-    assert!(!text.is_empty(), "scheduler dead after consumer drop");
-    info!("  PASS: scheduler survived consumer drop");
+    assert!(!text.is_empty(), "scheduler dead after client abort");
+    info!("  PASS: scheduler survived client abort");
 
     info!("All Qwen3.5 scheduler tests passed for {label}!");
 }
@@ -672,22 +633,27 @@ fn test_e2e_qwen35_scheduler() {
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
-    let model =
-        pegainfer_qwen35::runtime::Qwen35Model::from_safetensors_with_options(&model_path, true)
-            .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
-    // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
-    let handle = pegainfer_qwen35::runtime::start_with_capacity(
-        model,
-        42,
+    // Load through `start_engine_with_capacity` so recurrent-state reservation
+    // matches the intended 8-slot 16GB budget. `from_safetensors_with_options`
+    // still sizes to MAX_BATCH=64 and OOMs on a 16GB card before start.
+    let engine: Engine = pegainfer_qwen35::start_engine_with_capacity(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: vec![0],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
         8,
         pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 scheduler");
+    let engine = EngineHarness::new(engine);
     info!("scheduler loaded in {:.2?}", start.elapsed());
 
     let max_context_tokens = max_position_embeddings(&model_path);
-    run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP1");
+    run_full_scheduler_e2e(&engine, &tokenizer, max_context_tokens, "TP1");
 }
 
 #[test]
@@ -706,7 +672,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         .expect("test prompt must contain a token");
 
     let off_reference_tokens = {
-        let off_handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
+        let off_engine: Engine = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
             Path::new(&model_path),
             EngineLoadOptions {
                 enable_cuda_graph: true,
@@ -720,18 +686,19 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
             pegainfer_qwen35::Qwen35DecodeOverlap::Off,
         )
         .expect("Failed to start Qwen3.5 default-Off scheduler");
-        let mut off_rx = submit_repeated_token_request(
-            &off_handle,
+        let off_engine = EngineHarness::new(off_engine);
+        let off_stream = submit_repeated_token_request(
+            &off_engine,
             "overlap-off-reference",
             seed_token,
             8192,
             2,
         );
         let off = collect_generation_with_timeout(
-            &mut off_rx,
+            off_stream,
             "overlap-off-reference",
             0,
-            std::time::Duration::from_secs(30),
+            Duration::from_secs(30),
         );
         assert_eq!(
             off.tokens.len(),
@@ -741,7 +708,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         off.tokens
     };
 
-    let handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
+    let engine: Engine = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
@@ -755,29 +722,28 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
     )
     .expect("Failed to start Qwen3.5 shared-SM scheduler");
-    let mut load = handle
-        .metrics_watch()
-        .expect("scheduler must expose metrics");
+    let engine = EngineHarness::new(engine);
 
-    let mut active_rx =
-        submit_repeated_token_request(&handle, "overlap-last-decoder", seed_token, 512, 128);
-    wait_for_first_token(&mut active_rx, "overlap-last-decoder");
-    let _ = drain_tokens(&mut active_rx, "overlap-last-decoder");
-    let mut prefill_rx =
-        submit_repeated_token_request(&handle, "overlap-inflight-prefill", seed_token, 8192, 2);
+    let mut active =
+        submit_repeated_token_request(&engine, "overlap-last-decoder", seed_token, 512, 128);
+    wait_for_first_token(&mut active, "overlap-last-decoder");
+    let _ = drain_tokens(&mut active, "overlap-last-decoder");
+    let mut prefill =
+        submit_repeated_token_request(&engine, "overlap-inflight-prefill", seed_token, 8192, 2);
 
-    wait_for_running_requests(&mut load, 2, std::time::Duration::from_secs(10));
-    let _ = drain_tokens(&mut active_rx, "overlap-last-decoder");
+    wait_for_running_requests(&engine, 2, Duration::from_secs(10));
+    let _ = drain_tokens(&mut active, "overlap-last-decoder");
     for _ in 0..2 {
-        wait_for_first_token(&mut active_rx, "overlap-last-decoder");
-        assert_no_generated_event(&mut prefill_rx, "overlap-inflight-prefill");
+        wait_for_first_token(&mut active, "overlap-last-decoder");
+        assert_no_generated_event(&mut prefill, "overlap-inflight-prefill");
     }
-    drop(active_rx);
+    active.control.abort();
+    drop(active);
     let prefill = collect_generation_with_timeout(
-        &mut prefill_rx,
+        prefill,
         "overlap-inflight-prefill",
         0,
-        std::time::Duration::from_secs(30),
+        Duration::from_secs(30),
     );
     assert_eq!(
         prefill.tokens.len(),
@@ -789,7 +755,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         "Shared-SM overlapped prefill must match the greedy default-Off reference"
     );
 
-    let (tokens, finish_reason) = generate_tokens(&handle, &tokenizer, "Hello again", 2);
+    let (tokens, finish_reason) = generate_tokens(&engine, &tokenizer, "Hello again", 2);
     assert_eq!(
         tokens.len(),
         2,
@@ -797,24 +763,26 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
     );
     assert_eq!(finish_reason, FinishReason::Length);
 
-    let mut shutdown_active_rx =
-        submit_repeated_token_request(&handle, "overlap-shutdown-decoder", seed_token, 512, 128);
-    wait_for_first_token(&mut shutdown_active_rx, "overlap-shutdown-decoder");
-    let _ = drain_tokens(&mut shutdown_active_rx, "overlap-shutdown-decoder");
-    let mut shutdown_prefill_rx =
-        submit_repeated_token_request(&handle, "overlap-shutdown-prefill", seed_token, 8192, 2);
-    wait_for_running_requests(&mut load, 2, std::time::Duration::from_secs(10));
-    assert_no_generated_event(&mut shutdown_prefill_rx, "overlap-shutdown-prefill");
-    drop(shutdown_active_rx);
-    drop(shutdown_prefill_rx);
+    let mut shutdown_active =
+        submit_repeated_token_request(&engine, "overlap-shutdown-decoder", seed_token, 512, 128);
+    wait_for_first_token(&mut shutdown_active, "overlap-shutdown-decoder");
+    let _ = drain_tokens(&mut shutdown_active, "overlap-shutdown-decoder");
+    let mut shutdown_prefill =
+        submit_repeated_token_request(&engine, "overlap-shutdown-prefill", seed_token, 8192, 2);
+    wait_for_running_requests(&engine, 2, Duration::from_secs(10));
+    assert_no_generated_event(&mut shutdown_prefill, "overlap-shutdown-prefill");
+    shutdown_active.control.abort();
+    shutdown_prefill.control.abort();
+    drop(shutdown_active);
+    drop(shutdown_prefill);
 
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let shutdown = std::thread::spawn(move || {
-        drop(handle);
+        drop(engine);
         let _ = done_tx.send(());
     });
     done_rx
-        .recv_timeout(std::time::Duration::from_secs(30))
+        .recv_timeout(Duration::from_secs(30))
         .expect("dropping the last handle must drain in-flight prefill and return");
     shutdown.join().expect("scheduler shutdown thread panicked");
 }
@@ -830,7 +798,7 @@ fn test_e2e_qwen35_scheduler_tp2() {
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
     // TP Phase 1 is eager-only; CUDA Graph must stay disabled for multi-device startup.
-    let handle = pegainfer_qwen35::start_engine_with_capacity(
+    let engine: Engine = pegainfer_qwen35::start_engine_with_capacity(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: false,
@@ -842,8 +810,9 @@ fn test_e2e_qwen35_scheduler_tp2() {
         pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 TP2 scheduler");
+    let engine = EngineHarness::new(engine);
     info!("TP2 scheduler loaded in {:.2?}", start.elapsed());
 
     let max_context_tokens = max_position_embeddings(&model_path);
-    run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP2");
+    run_full_scheduler_e2e(&engine, &tokenizer, max_context_tokens, "TP2");
 }

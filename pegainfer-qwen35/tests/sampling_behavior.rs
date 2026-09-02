@@ -10,14 +10,12 @@
 
 use std::path::Path;
 
-use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::sampler::SamplingParams;
 
 mod common;
+
+use common::harness::EngineHarness;
 
 const GENERATED_TOKENS: usize = 32;
 
@@ -27,40 +25,15 @@ fn params(mut params: SamplingParams) -> SamplingParams {
 }
 
 /// Submit one request and collect the generated token ids until `Finished`.
-fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, params: SamplingParams) -> Vec<u32> {
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
+fn generate(harness: &EngineHarness, prompt_tokens: Vec<u32>, params: SamplingParams) -> Vec<u32> {
+    harness
+        .submit(common::harness::request(
             prompt_tokens,
             params,
-            max_tokens: GENERATED_TOKENS,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: 0,
-            echo: false,
-        })
-        .expect("submit failed");
-
-    let mut tokens = Vec::new();
-    loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { .. }) => return tokens,
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
-        }
-    }
+            GENERATED_TOKENS,
+        ))
+        .expect_finished()
+        .tokens
 }
 
 #[test]
@@ -70,18 +43,20 @@ fn sampling_params_steer_the_qwen35_sampler() {
         return;
     };
 
-    let handle = pegainfer_qwen35::start_engine(
-        Path::new(&model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        4,
-        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
-    )
-    .expect("failed to start Qwen3.5 engine");
+    let harness = EngineHarness::new(
+        pegainfer_qwen35::start_engine(
+            Path::new(&model_path),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0],
+                seed: 42,
+                ..EngineLoadOptions::default()
+            },
+            4,
+            pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+        )
+        .expect("failed to start Qwen3.5 engine"),
+    );
     let tokenizer = common::load_tokenizer(&model_path);
 
     let prompt = "Here is a short story about a dragon. Once upon a time";
@@ -89,17 +64,17 @@ fn sampling_params_steer_the_qwen35_sampler() {
 
     let greedy_params = params(SamplingParams::default());
 
-    let greedy = generate(&handle, prompt_tokens.clone(), greedy_params);
+    let greedy = generate(&harness, prompt_tokens.clone(), greedy_params);
     assert_eq!(
         greedy.len(),
         GENERATED_TOKENS,
         "ignore_eos should force a full 32-token generation"
     );
-    let greedy_again = generate(&handle, prompt_tokens.clone(), greedy_params);
+    let greedy_again = generate(&harness, prompt_tokens.clone(), greedy_params);
     assert_eq!(greedy, greedy_again, "greedy decode must be deterministic");
 
     let top_k_one = generate(
-        &handle,
+        &harness,
         prompt_tokens.clone(),
         params(SamplingParams {
             temperature: 0.8,
@@ -110,7 +85,7 @@ fn sampling_params_steer_the_qwen35_sampler() {
     assert_eq!(top_k_one, greedy, "top_k=1 must collapse to greedy");
 
     let top_p_tiny = generate(
-        &handle,
+        &harness,
         prompt_tokens.clone(),
         params(SamplingParams {
             temperature: 1.0,
@@ -127,7 +102,7 @@ fn sampling_params_steer_the_qwen35_sampler() {
         ..SamplingParams::default()
     });
     let runs: Vec<Vec<u32>> = (0..4)
-        .map(|_| generate(&handle, prompt_tokens.clone(), hot))
+        .map(|_| generate(&harness, prompt_tokens.clone(), hot))
         .collect();
     assert!(
         runs.iter().any(|run| *run != runs[0]),

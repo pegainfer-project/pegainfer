@@ -1,6 +1,6 @@
 # Frontend architecture: pegainfer-frontend and the engine boundary
 
-**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + typestate request handles + a contract-owned polling driver — Qwen3 and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite/gemma4 still launch through it). **Next step: migrate glm52, then delete the legacy contract.**
+**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + typestate request handles + a contract-owned polling driver — Qwen3, Qwen3.5, and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/kimi-k2/deepseek-v2-lite/gemma4 still launch through it). **Next step: migrate glm52, then delete the legacy contract.**
 
 Last touched: 2026-08
 
@@ -56,7 +56,7 @@ The contract's own invariants are tested in `emitter.rs`/`driver.rs` tests; the 
 
 ## The legacy handle contract (migration pending)
 
-`request.rs`/`event.rs`/`sink.rs`/`kv.rs`/`handle.rs` still carry the previous generation: `launch -> EngineHandle`, per-request `TokenSink` events (`Scheduled … Token* … terminal` by convention), send-failure-as-cancellation. glm52, qwen35, kimi-k2, deepseek-v2-lite, and gemma4 launch through it (`LaunchedEngine::Handle`), and the vllm stack keeps both bridge paths (`bridge.rs` for handles, `bridge/stepped.rs` for step engines). KV-prefix resolution (`KvPrefix`, `submit_resolved`) currently exists only on the legacy path; fold it into the step contract when the first offload-capable line migrates.
+`request.rs`/`event.rs`/`sink.rs`/`kv.rs`/`handle.rs` still carry the previous generation: `launch -> EngineHandle`, per-request `TokenSink` events (`Scheduled … Token* … terminal` by convention), send-failure-as-cancellation. glm52, kimi-k2, deepseek-v2-lite, and gemma4 launch through it (`LaunchedEngine::Handle`), and the vllm stack keeps both bridge paths (`bridge.rs` for handles, `bridge/stepped.rs` for step engines). KV-prefix resolution (`KvPrefix`, `submit_resolved`) currently exists only on the legacy path; fold it into the step contract when the first offload-capable line migrates.
 
 ## Crate layout
 
@@ -111,4 +111,4 @@ All six lines are onboarded. Adding a model line = write `model_line.rs` in the 
 
 ## Next step
 
-Migrate glm52 onto the step contract (second pilot; brings P/D and EP multi-scheduler requirements), then qwen35/kimi-k2/deepseek-v2-lite, then delete the legacy contract modules and `LaunchedEngine::Handle`.
+Migrate glm52 onto the step contract (P/D and EP multi-scheduler requirements), then kimi-k2/deepseek-v2-lite/gemma4, then delete the legacy contract modules and `LaunchedEngine::Handle`.

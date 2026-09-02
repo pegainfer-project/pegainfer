@@ -1,8 +1,8 @@
 # Qwen3.5-4B Model Crate
 
 **Created**: 2026-05-05
-**TL;DR**: `pegainfer-qwen35` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, scheduler integration tests, and Qwen3.5 op benches. The whole crate is behind the `qwen35` feature (`--features qwen35` on `pegainfer-server`) because its GDR prefill kernels are Triton AOT-generated — this keeps the default Qwen3 build Python-free. Root `pegainfer` loads Qwen3.5 through `pegainfer_qwen35::start_engine(...)` / generic `EngineHandle`; root no longer exposes `pegainfer::model::Qwen35Model` or `pegainfer::scheduler_qwen35`. The original exact-text e2e/regen tests described in this migration record were later retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
-**Last touched**: 2026-07
+**TL;DR**: `pegainfer-qwen35` now owns Qwen3.5 config, weights, prefill/decode/unified forward, recurrent state, scheduler, recurrent op wrappers, scheduler integration tests, and Qwen3.5 op benches. The whole crate is behind the `qwen35` feature (`--features qwen35` on `pegainfer-server`) because its GDR prefill kernels are Triton AOT-generated — this keeps the default Qwen3 build Python-free. Root `pegainfer` loads Qwen3.5 through `pegainfer_qwen35::start_engine(...)` / `Engine` (`LaunchedEngine::Stepped`); root no longer exposes `pegainfer::model::Qwen35Model` or `pegainfer::scheduler_qwen35`. The original exact-text e2e/regen tests described in this migration record were later retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
+**Last touched**: 2026-08
 
 ## Feature gate (2026-06)
 

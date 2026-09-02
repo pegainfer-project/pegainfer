@@ -1,3 +1,12 @@
+//! TP2 eager generate smoke on the step-contract Engine, plus OpenAI HTTP
+//! serving through `vllm::serve(LaunchedEngine::Stepped)`.
+//!
+//! CUDA Graph + TP is fail-closed before load. Live generate coverage is
+//! in-process via [`common::harness::EngineHarness`]. The HTTP gate drives
+//! `/v1/models` and `/v1/completions` (streaming and concurrent) against a
+//! real frontend.
+
+use std::mem::ManuallyDrop;
 use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
@@ -8,6 +17,11 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::LaunchedEngine;
+use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::Terminal;
+use pegainfer_frontend::sampler::SamplingParams;
 use reqwest::Client;
 use serde_json::Value;
 use serde_json::json;
@@ -16,6 +30,13 @@ use tokio_util::sync::CancellationToken;
 
 mod common;
 
+use common::harness::EngineHarness;
+use common::harness::Outcome;
+
+const PROMPT: &[u32] = &[151_644, 872, 198, 9707, 151_645, 198, 151_644, 77091, 198];
+const ALTERNATE_PROMPT: &[u32] = &[
+    151_644, 872, 198, 3838, 374, 220, 17, 489, 220, 17, 30, 151_645, 198, 151_644, 77091, 198,
+];
 const MODEL_NAME: &str = "qwen35-tp2-serving-smoke";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -35,6 +56,78 @@ impl Qwen35Tp2Server {
     }
 }
 
+#[test]
+fn tp2_rejects_cuda_graph_before_loading_model() {
+    let err = pegainfer_qwen35::start_engine_with_capacity(
+        Path::new("unused-model-path"),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: vec![0, 1],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+        8,
+        1,
+    )
+    .err()
+    .expect("TP2 + CUDA Graph must fail before serving requests")
+    .to_string();
+    assert!(
+        err.contains("eager execution only"),
+        "unexpected TP2 + CUDA Graph startup error: {err}"
+    );
+}
+
+#[test]
+#[ignore = "requires two CUDA devices, CUDA-12 NCCL, and Qwen3.5 weights"]
+fn qwen35_tp2_generates_greedy_logprobs_and_concurrent() {
+    let Some(model_path) =
+        common::model_path_or_skip("qwen35_tp2_generates_greedy_logprobs_and_concurrent")
+    else {
+        return;
+    };
+    let gpus = cuda_device_count();
+    if gpus < 2 {
+        eprintln!(
+            "SKIP qwen35_tp2_generates_greedy_logprobs_and_concurrent: needs >=2 GPUs, have {gpus}"
+        );
+        return;
+    }
+
+    let engine = pegainfer_qwen35::start_engine_with_capacity(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: false,
+            device_ordinals: common::tp2_device_ordinals(),
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+        8,
+        1,
+    )
+    .expect("start Qwen3.5 TP2 engine");
+    // Dropping the harness joins the scheduler thread; on a panic the engine may
+    // be wedged and the join would hang, so panics leak it — only the happy path
+    // drops.
+    let harness = ManuallyDrop::new(EngineHarness::new(engine));
+
+    let outcome = harness
+        .submit(completion_request(PROMPT.to_vec(), 5, 1))
+        .expect_finished();
+    assert_length_outcome(&outcome, 5);
+    assert_logprobs(&outcome);
+
+    let first = harness.submit(completion_request(PROMPT.to_vec(), 3, 0));
+    let second = harness.submit(completion_request(ALTERNATE_PROMPT.to_vec(), 3, 1));
+    let first = first.expect_finished();
+    let second = second.expect_finished();
+    assert_length_outcome(&first, 3);
+    assert_length_outcome(&second, 3);
+    assert_logprobs(&second);
+
+    drop(ManuallyDrop::into_inner(harness));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires two CUDA devices, CUDA-12 NCCL, Qwen3.5 weights, and real HTTP frontend startup"]
 async fn qwen35_tp2_serves_openai_completions_over_http() -> Result<()> {
@@ -51,7 +144,6 @@ async fn qwen35_tp2_serves_openai_completions_over_http() -> Result<()> {
         return Ok(());
     };
     let frontend_model_path = PathBuf::from(frontend_model_path);
-    let invalid_graph_model_path = engine_model_path.clone();
     let server = spawn_ready_server(engine_model_path, frontend_model_path, 1).await?;
     let client = test_client()?;
 
@@ -59,11 +151,6 @@ async fn qwen35_tp2_serves_openai_completions_over_http() -> Result<()> {
     assert_non_streaming_completion(&client, &server.base_url).await?;
     assert_streaming_completion(&client, &server.base_url).await?;
     assert_concurrent_completions(&client, &server.base_url).await?;
-    assert_invalid_cuda_graph_tp_startup_fails(
-        invalid_graph_model_path
-            .to_str()
-            .context("Qwen3.5 engine fixture path is not valid UTF-8")?,
-    )?;
 
     server.shutdown().await
 }
@@ -74,7 +161,7 @@ async fn spawn_ready_server(
     max_prefill_tokens: usize,
 ) -> Result<Qwen35Tp2Server> {
     let device_ordinals = common::tp2_device_ordinals();
-    let handle = tokio::task::spawn_blocking(move || {
+    let engine = tokio::task::spawn_blocking(move || {
         pegainfer_qwen35::start_engine_with_capacity(
             &engine_model_path,
             EngineLoadOptions {
@@ -96,9 +183,7 @@ async fn spawn_ready_server(
     let server_shutdown = shutdown.clone();
     let mut task = tokio::spawn(async move {
         pegainfer_frontend::vllm::serve(
-            std::future::ready(Ok(pegainfer_frontend::engine::LaunchedEngine::Handle(
-                handle,
-            ))),
+            std::future::ready(Ok(LaunchedEngine::Stepped(engine))),
             &frontend_model_path,
             vec![MODEL_NAME.to_string()],
             port,
@@ -166,7 +251,7 @@ async fn assert_non_streaming_completion(client: &Client, base_url: &str) -> Res
         bail!("expected length finish_reason for ignore_eos request, got {completion}");
     }
     assert_usage(&completion, 5)?;
-    assert_logprobs(&completion)?;
+    assert_http_logprobs(&completion)?;
     Ok(())
 }
 
@@ -195,28 +280,7 @@ async fn assert_concurrent_completions(client: &Client, base_url: &str) -> Resul
     let (first, second) = tokio::try_join!(first, second)?;
     assert_usage(&first, 3)?;
     assert_usage(&second, 3)?;
-    assert_logprobs(&second)?;
-    Ok(())
-}
-
-fn assert_invalid_cuda_graph_tp_startup_fails(model_path: &str) -> Result<()> {
-    let Err(error) = pegainfer_qwen35::start_engine_with_capacity(
-        Path::new(model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: common::tp2_device_ordinals(),
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        8,
-        1,
-    ) else {
-        bail!("TP2 + CUDA Graph must fail before serving requests");
-    };
-    let message = error.to_string();
-    if !message.contains("eager execution only") {
-        bail!("unexpected TP2 + CUDA Graph startup error: {message}");
-    }
+    assert_http_logprobs(&second)?;
     Ok(())
 }
 
@@ -247,7 +311,7 @@ async fn post_completion_stream(client: &Client, base_url: &str, body: Value) ->
 fn completion_body(stream: bool, max_tokens: usize, logprobs: usize) -> Value {
     let mut body = json!({
         "model": MODEL_NAME,
-        "prompt": [151_644, 872, 198, 9707, 151_645, 198, 151_644, 77091, 198],
+        "prompt": PROMPT,
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "ignore_eos": true,
@@ -262,7 +326,7 @@ fn completion_body(stream: bool, max_tokens: usize, logprobs: usize) -> Value {
 fn alternate_completion_body(stream: bool, max_tokens: usize, logprobs: usize) -> Value {
     let mut body = json!({
         "model": MODEL_NAME,
-        "prompt": [151_644, 872, 198, 3838, 374, 220, 17, 489, 220, 17, 30, 151_645, 198, 151_644, 77091, 198],
+        "prompt": ALTERNATE_PROMPT,
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "ignore_eos": true,
@@ -294,7 +358,7 @@ fn assert_usage(completion: &Value, expected_completion_tokens: usize) -> Result
     Ok(())
 }
 
-fn assert_logprobs(completion: &Value) -> Result<()> {
+fn assert_http_logprobs(completion: &Value) -> Result<()> {
     let logprobs = &completion["choices"][0]["logprobs"];
     if logprobs.is_null() {
         bail!("completion requested logprobs but response has null logprobs: {completion}");
@@ -343,4 +407,69 @@ fn reserve_loopback_port() -> Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .context("failed to reserve loopback port for Qwen3.5 TP2 serving test")?;
     Ok(listener.local_addr()?.port())
+}
+
+fn completion_request(prompt_tokens: Vec<u32>, max_tokens: usize, logprobs: usize) -> Request {
+    let mut request = common::harness::request(
+        prompt_tokens,
+        SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        },
+        max_tokens,
+    );
+    request.logprobs = logprobs;
+    request
+}
+
+fn assert_length_outcome(outcome: &Outcome, expected_completion_tokens: usize) {
+    assert_eq!(
+        outcome.tokens.len(),
+        expected_completion_tokens,
+        "expected {expected_completion_tokens} generated tokens, got {}",
+        outcome.tokens.len()
+    );
+    let Terminal::Finished {
+        reason,
+        prompt_tokens,
+        completion_tokens,
+    } = &outcome.terminal
+    else {
+        panic!("expected Finished, got {:?}", outcome.terminal);
+    };
+    assert_eq!(
+        *reason,
+        FinishReason::Length,
+        "expected length stop for ignore_eos request"
+    );
+    assert_eq!(
+        *completion_tokens, expected_completion_tokens,
+        "expected {expected_completion_tokens} completion tokens, got {completion_tokens}"
+    );
+    assert!(*prompt_tokens > 0, "engine reported zero prompt tokens");
+}
+
+fn assert_logprobs(outcome: &Outcome) {
+    assert!(
+        !outcome.logprobs.is_empty(),
+        "request asked for logprobs but received none"
+    );
+    assert_eq!(
+        outcome.logprobs.len(),
+        outcome.tokens.len(),
+        "logprobs length must match generated tokens"
+    );
+    assert!(
+        outcome.logprobs.iter().all(|value| {
+            value
+                .as_ref()
+                .is_some_and(|logprob| logprob.logprob.is_finite())
+        }),
+        "logprobs contain missing or non-finite values: {:?}",
+        outcome.logprobs
+    );
+}
+
+fn cuda_device_count() -> usize {
+    cudarc::driver::CudaContext::device_count().map_or(0, |n| n.max(0) as usize)
 }
