@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::config::DFlashConfig;
+use crate::config::DFlashHeadSource;
 use crate::config::DFlashProposal;
 use crate::dflash::selector::SelectorScratch;
 use crate::dspark::MarkovHead;
@@ -91,10 +92,14 @@ impl DFlashMemoryReservation {
             }
             _ => 0,
         };
+        let native_head = match config.head_source {
+            DFlashHeadSource::DraftOutput => BF16 * config.draft_vocab_size * hidden,
+            DFlashHeadSource::Target => 0,
+        };
 
         Self {
             kv_bytes_per_token,
-            fixed_bytes: weights + scratch_total + block_headroom + markov + selector,
+            fixed_bytes: weights + scratch_total + block_headroom + markov + selector + native_head,
         }
     }
 }

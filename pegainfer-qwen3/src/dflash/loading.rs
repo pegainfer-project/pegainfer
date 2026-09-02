@@ -12,12 +12,15 @@ use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::mmap_shards;
 
 use super::DFlashDraftModel;
+use super::manifest::DRAFT_LM_HEAD_TENSOR;
 use super::manifest::HIDDEN_PROJECTION_TENSOR;
 use super::manifest::PREDECESSOR_CODEBOOK_TENSOR;
 use super::manifest::SUCCESSOR_CODEBOOK_TENSOR;
+use super::manifest::validate_native_output_head;
 use super::manifest::validate_selector_tensors;
 use super::selector::SelectorWeights;
 use crate::config::DFlashConfig;
+use crate::config::DFlashHeadSource;
 use crate::config::DFlashProposal;
 use crate::dspark::MARKOV_W1_TENSOR;
 use crate::dspark::MARKOV_W2_TENSOR;
@@ -71,6 +74,24 @@ impl DFlashDraftModel {
             )?)
         } else {
             None
+        };
+
+        let draft_lm_head = match config.head_source {
+            DFlashHeadSource::Target => None,
+            DFlashHeadSource::DraftOutput => {
+                validate_native_output_head(
+                    &shards,
+                    &weight_map,
+                    config.draft_vocab_size,
+                    config.hidden_size,
+                )?;
+                Some(load_tensor_2d(
+                    ctx,
+                    &shards,
+                    &weight_map,
+                    DRAFT_LM_HEAD_TENSOR,
+                )?)
+            }
         };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -170,9 +191,8 @@ impl DFlashDraftModel {
         let hidden_norm = load_tensor_1d(ctx, &shards, &weight_map, "hidden_norm.weight")?;
         let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
 
-        // DSpark Markov head (Phase 1). The confidence head and the tied
-        // embed_tokens/lm_head are intentionally skipped: the head is byte-identical
-        // to the target's, which we reuse for the verify-equivalent logits.
+        // The confidence head is outside Phase 1; native DFlash2 heads were
+        // loaded above according to the checkpoint's tie policy.
         if config.enable_confidence_head {
             log::info!(
                 "DFlash confidence head present in {model_path} but unused in Phase 1 \
@@ -208,6 +228,7 @@ impl DFlashDraftModel {
             sin_cache,
             markov,
             selector,
+            draft_lm_head,
         })
     }
 }

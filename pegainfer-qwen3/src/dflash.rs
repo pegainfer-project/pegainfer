@@ -36,6 +36,8 @@ pub(crate) struct DFlashDraftModel {
     markov: Option<MarkovHead>,
     /// DFlash2 selector, mutually exclusive with the DSpark Markov head.
     selector: Option<SelectorWeights>,
+    /// Native untied DFlash2 output head; tied checkpoints reuse the target.
+    draft_lm_head: Option<DeviceMatrix>,
 }
 
 pub(crate) struct DFlashRequestState {
@@ -773,7 +775,7 @@ impl DFlashDraftModel {
         for (i, state) in states.iter_mut().enumerate() {
             state.committed_len += context_lens[i];
         }
-        self.compute_logits_with_target_head_into(target, scratch);
+        self.compute_logits_into(target, scratch);
         Ok(&scratch.logits)
     }
 
@@ -866,11 +868,7 @@ impl DFlashDraftModel {
         );
     }
 
-    fn compute_logits_with_target_head_into(
-        &self,
-        target: &Qwen3Model,
-        scratch: &mut DFlashBatchScratch,
-    ) {
+    fn compute_logits_into(&self, target: &Qwen3Model, scratch: &mut DFlashBatchScratch) {
         let ctx = target.device_ctx();
         ops::rms_norm_batch_into(
             ctx,
@@ -879,9 +877,13 @@ impl DFlashDraftModel {
             self.config.rms_norm_eps,
             &mut scratch.logits_normed,
         );
+        let output_projection = self
+            .draft_lm_head
+            .as_ref()
+            .unwrap_or_else(|| target.output_projection());
         ops::gemm_into(
             ctx,
-            target.output_projection(),
+            output_projection,
             &scratch.logits_normed,
             &mut scratch.logits,
         );

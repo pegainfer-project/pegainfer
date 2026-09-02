@@ -35,9 +35,10 @@
 //! Runs the two engines sequentially (baseline dropped before the speculative
 //! engine loads) so only one Qwen3-4B is resident at a time.
 //!
-//! Requires a CUDA GPU, Qwen3-4B weights, and the DFlash drafter. Set
-//! `PEGAINFER_TEST_MODEL_PATH` (target) and `PEGAINFER_DFLASH_TEST_MODEL_PATH`
-//! (drafter); skips cleanly when either is absent.
+//! Requires a CUDA GPU, Qwen3-4B weights, and a drafter. Legacy gates use
+//! `PEGAINFER_DFLASH_TEST_MODEL_PATH` and skip when weights are absent. The
+//! ignored native-selector gate requires `PEGAINFER_DFLASH2_TEST_MODEL_PATH`
+//! and fails when its explicitly requested checkpoint is not usable.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -105,6 +106,52 @@ fn draft_path_or_skip() -> Option<String> {
             None
         }
     }
+}
+
+fn required_model_path(name: &str) -> String {
+    let path = std::env::var(name).unwrap_or_else(|_| panic!("set {name} to run this test"));
+    assert!(
+        Path::new(&path).join("config.json").is_file(),
+        "{name}={path:?} has no config.json"
+    );
+    path
+}
+
+fn native_dflash2_path() -> String {
+    let path = required_model_path("PEGAINFER_DFLASH2_TEST_MODEL_PATH");
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&path).join("config.json"))
+            .expect("read native DFlash2 config"),
+    )
+    .expect("parse native DFlash2 config");
+    assert_eq!(
+        config
+            .get("speculators_model_type")
+            .and_then(serde_json::Value::as_str),
+        Some("dflash2"),
+        "native selector gate requires speculators_model_type=dflash2"
+    );
+    assert!(
+        config
+            .get("architectures")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value == "DFlash2DraftModel")),
+        "native selector gate requires DFlash2DraftModel"
+    );
+    let tied = config
+        .get("tie_word_embeddings")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            config
+                .pointer("/transformer_layer_config/tie_word_embeddings")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
+    assert!(
+        !tied,
+        "this gate must exercise native DFlash2's independent draft lm_head"
+    );
+    path
 }
 
 fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
@@ -417,6 +464,67 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
         failures.is_empty(),
         "speculative greedy decode is not lossless:\n{}",
         failures.join("\n")
+    );
+}
+
+/// Production gate for the native DFlash2 selector and its independent draft
+/// output head. The native schema guarantees that the speculative launch
+/// dispatches through the CUDA top-k and path-walk kernels; target verification
+/// must still produce a lossless greedy continuation.
+#[test]
+#[ignore = "requires CUDA, Qwen3-4B, and a selector-only native DFlash2 checkpoint"]
+fn dflash2_native_selector_untied_head_greedy_gate() {
+    const NATIVE_GENERATED_TOKENS: usize = 32;
+
+    let model_path = required_model_path("PEGAINFER_TEST_MODEL_PATH");
+    let draft_path = native_dflash2_path();
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let prompt = "def fibonacci(n):";
+    let tokenizer = common::load_tokenizer(&model_path);
+    let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
+
+    let baseline = {
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start baseline engine"),
+        );
+        let output = generate(
+            &engine,
+            prompt_tokens.clone(),
+            LOGPROBS,
+            NATIVE_GENERATED_TOKENS,
+        );
+        drop(engine);
+        std::thread::sleep(Duration::from_secs(2));
+        output
+    };
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to load native DFlash2 selector checkpoint"),
+    );
+    let speculative = generate(&engine, prompt_tokens.clone(), 0, NATIVE_GENERATED_TOKENS);
+    let result = check_lossless(
+        &engine,
+        &tokenizer,
+        0,
+        prompt,
+        &prompt_tokens,
+        &baseline,
+        &speculative,
+    );
+    drop(engine);
+
+    assert!(
+        result.is_ok(),
+        "native DFlash2 selector is not greedy-lossless:\n{}",
+        result.unwrap_err()
     );
 }
 

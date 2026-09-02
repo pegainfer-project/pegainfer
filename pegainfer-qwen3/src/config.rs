@@ -61,6 +61,14 @@ pub(crate) enum DFlashLayout {
     AnchorFirst,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DFlashHeadSource {
+    /// Use the verifier's embedding and output projection.
+    Target,
+    /// Native DFlash2 provides a separate draft output projection.
+    DraftOutput,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DynamicConv {
     pub(crate) kernel_size: usize,
@@ -97,8 +105,7 @@ pub(crate) struct DFlashConfig {
     /// Proposal capability selected by the checkpoint schema.
     pub(crate) proposal: DFlashProposal,
     pub(crate) layout: DFlashLayout,
-    /// Whether the target output head can be reused by the drafter.
-    pub(crate) reuse_target_head: bool,
+    pub(crate) head_source: DFlashHeadSource,
     pub(crate) enable_confidence_head: bool,
     pub(crate) dynamic_convolution: Option<DynamicConv>,
     pub(crate) sliding_window: Option<SlidingWindow>,
@@ -182,6 +189,8 @@ struct RawDFlash2TransformerConfig {
     use_sliding_window: bool,
     #[serde(default)]
     layer_types: Vec<String>,
+    #[serde(default)]
+    tie_word_embeddings: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +220,8 @@ struct RawDFlash2Config {
     selector_rank: usize,
     selector_top_k: usize,
     sample_from_anchor: bool,
+    #[serde(default)]
+    tie_word_embeddings: Option<bool>,
     #[serde(default)]
     target_hidden_size: Option<usize>,
 
@@ -503,7 +514,7 @@ impl DFlashConfig {
             } else {
                 DFlashLayout::AnchorDrop
             },
-            reuse_target_head: true,
+            head_source: DFlashHeadSource::Target,
             enable_confidence_head: raw.enable_confidence_head,
             dynamic_convolution: None,
             sliding_window: None,
@@ -520,6 +531,7 @@ impl DFlashConfig {
             selector_rank,
             selector_top_k,
             sample_from_anchor,
+            tie_word_embeddings,
             target_hidden_size,
             conv_kernel_size,
             conv_group_size,
@@ -541,7 +553,12 @@ impl DFlashConfig {
             sliding_window,
             use_sliding_window,
             layer_types,
+            tie_word_embeddings: transformer_tie_word_embeddings,
         } = transformer_layer_config;
+
+        let tie_word_embeddings = tie_word_embeddings
+            .or(transformer_tie_word_embeddings)
+            .unwrap_or(false);
 
         ensure!(
             speculators_config.algorithm == "dflash2",
@@ -678,7 +695,11 @@ impl DFlashConfig {
             draft_vocab_size,
             proposal,
             layout,
-            reuse_target_head: false,
+            head_source: if tie_word_embeddings {
+                DFlashHeadSource::Target
+            } else {
+                DFlashHeadSource::DraftOutput
+            },
 
             enable_confidence_head: false,
 
@@ -780,10 +801,6 @@ impl DFlashConfig {
             bail!("DFlash Phase 1 supports only anchor-drop selector checkpoints");
         }
 
-        ensure!(
-            self.reuse_target_head,
-            "DFlash checkpoint uses an independent draft output head, which the current runtime does not load"
-        );
         Ok(())
     }
 
