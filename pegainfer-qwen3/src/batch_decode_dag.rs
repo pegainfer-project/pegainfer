@@ -35,10 +35,10 @@ use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_kernels::tensor::AxisTag;
 use pegainfer_kernels::tensor::Hidden;
-use pegainfer_kernels::tensor::InDim;
 use pegainfer_kernels::tensor::Intermediate;
 use pegainfer_kernels::tensor::OutTotal;
 use pegainfer_kernels::tensor::QDim;
+#[cfg(feature = "kernel-call-trace")]
 use pegainfer_kernels::tensor::Vocab;
 
 use crate::batch_decode_buffers::BatchDecodeBuffers;
@@ -416,11 +416,21 @@ impl<'a> BatchDecodeDag<'a> {
     pub(crate) fn lm_head(
         &self,
         label: DagLabel,
-        weight: &DeviceMatrix,
         x: &HiddenStates,
         out: &mut HiddenStates,
-    ) {
-        self.gemm::<Vocab, InDim>(label, weight, x, out);
+    ) -> Result<()> {
+        let weight = self.model.output_projection();
+        let logits_rows = self.model.config.logits_rows;
+        #[cfg(feature = "kernel-call-trace")]
+        Self::record(gemm_rows_call::<Vocab>(
+            label,
+            weight.rows,
+            weight.cols,
+            logits_rows,
+            0,
+            x.seq_len,
+        ));
+        self.model.project_logits(&self.model.ctx, x, out)
     }
 
     #[cfg(feature = "kernel-call-trace")]

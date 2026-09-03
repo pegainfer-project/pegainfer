@@ -159,7 +159,7 @@ impl Qwen3Model {
 
     /// Unified step: prefill + decode in one forward pass.
     ///
-    /// Returns batched last-token logits `[vocab_size, n_prefill + n_decode]`:
+    /// Returns batched last-token logits `[logits_rows, n_prefill + n_decode]`:
     /// prefill request columns first (in request order), then decode columns.
     pub(crate) fn unified_step(
         &self,

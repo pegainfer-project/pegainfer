@@ -6,6 +6,7 @@ use std::time::Instant;
 use anyhow::Result;
 use log::debug;
 use log::info;
+use pegainfer_core::ops;
 use pegainfer_core::rope::RopeTableSpec;
 use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
@@ -25,6 +26,7 @@ use super::Qwen3Model;
 use super::TransformerBlock;
 use crate::config::Config;
 use crate::config::TensorParallelConfig;
+use crate::config::logits_rows;
 use crate::projection_fusion::select_decode_projection_path;
 
 #[derive(Clone, Copy, Debug)]
@@ -72,7 +74,28 @@ impl Qwen3Model {
         debug!("Initializing GPU device {}", runtime.device_ordinal);
         let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
 
-        let config = Config::from_file(model_path)?;
+        let mut config = Config::from_file(model_path)?;
+        let effective_vocab = pegainfer_core::decodable_vocab::decodable_vocab_width(model_path)?;
+        anyhow::ensure!(
+            effective_vocab <= config.vocab_size,
+            "tokenizer defines ids up to {} but checkpoint vocab_size is {}",
+            effective_vocab - 1,
+            config.vocab_size
+        );
+        config.selection_vocab = effective_vocab;
+        config.logits_rows = logits_rows(config.selection_vocab, config.vocab_size);
+        if config.selection_vocab < config.vocab_size {
+            info!(
+                "output projection: selection bounded to decodable vocab {}, projecting {} aligned rows (checkpoint pads to {})",
+                config.selection_vocab, config.logits_rows, config.vocab_size
+            );
+        }
+        let tail_ids = (config.selection_vocab..config.logits_rows)
+            .map(u32::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let logits_tail_suppress = (!tail_ids.is_empty())
+            .then(|| ops::SuppressIds::upload(&ctx, &tail_ids, config.logits_rows))
+            .transpose()?;
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         tensor_parallel.validate_for(&config)?;
         let (cc_major, cc_minor) = ctx.ctx.compute_capability()?;
@@ -288,6 +311,7 @@ impl Qwen3Model {
             config,
             embed_tokens,
             lm_head,
+            logits_tail_suppress,
             layers,
             norm,
             cos_cache,
