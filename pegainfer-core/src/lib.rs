@@ -2,6 +2,7 @@
 
 pub mod cpu_topology;
 pub mod cuda_graph;
+pub mod decodable_vocab;
 pub mod ffi;
 pub mod kv_pool;
 pub mod logging;

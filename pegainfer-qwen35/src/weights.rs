@@ -172,7 +172,7 @@ impl Qwen35Model {
             geometry.rank(),
             geometry.world_size(),
         );
-        let effective_vocab = super::config::tokenizer_effective_vocab(model_path)?;
+        let effective_vocab = pegainfer_core::decodable_vocab::decodable_vocab_width(model_path)?;
         config
             .bound_selection_vocab(effective_vocab)
             .map_err(anyhow::Error::from)?;
