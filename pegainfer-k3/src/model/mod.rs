@@ -125,6 +125,9 @@ pub(crate) struct K3MoeWeights {
     pub(crate) bias: CudaSlice<f32>,
     /// Routed scaling factor as a device scalar, bf16 `[1]`.
     pub(crate) rs: DeviceVec,
+    /// The same routed scaling factor as a host scalar, read back once at
+    /// build for kernels that take it by value (the capsule router top-k).
+    pub(crate) rs_host: f32,
     pub(crate) w_lat_down: DeviceMatrix,
     pub(crate) w_lat_up: DeviceMatrix,
     pub(crate) gamma_lat: DeviceVec,
@@ -546,10 +549,13 @@ fn build_layer(
             form,
         )?;
         vram.experts += experts.bytes();
+        let rs = slots.vector("rs", 1)?;
+        let rs_host = rs.to_host(ctx)?[0];
         K3LayerMlp::Moe(Box::new(K3MoeWeights {
             w_router: slots.matrix("w_router", routed_experts.count(), K3_HIDDEN)?,
             bias: slots.f32("bias", routed_experts.count(), 1)?,
-            rs: slots.vector("rs", 1)?,
+            rs,
+            rs_host,
             w_lat_down: slots.matrix("w_lat_down", K3_ROUTED_EXPERT_HIDDEN, K3_HIDDEN)?,
             w_lat_up: slots.matrix("w_lat_up", K3_HIDDEN, K3_ROUTED_EXPERT_HIDDEN)?,
             gamma_lat: slots.vector("gamma_lat", K3_ROUTED_EXPERT_HIDDEN)?,

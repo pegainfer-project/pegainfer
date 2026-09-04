@@ -452,6 +452,15 @@ mod tests {
                 grid: [1, 1, 1],
                 block: [32, 1, 1],
                 dynamic_shared_mem_bytes: 0,
+                attributes: super::super::KernelAttributes {
+                    num_regs: 0,
+                    static_shared_bytes: 0,
+                    const_bytes: 0,
+                    local_bytes: 0,
+                    ptx_version: 0,
+                    binary_version: 0,
+                },
+                params: None,
             },
         }
     }
