@@ -174,8 +174,8 @@ mod tests {
             let prompts_ref: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
             let mut kv_states: Vec<KvState> = vec![model.alloc_kv(), model.alloc_kv()];
             let mut rec_states: Vec<RecurrentState> = vec![
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
+                RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
+                RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
             ];
             let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
             let first_logits = model
@@ -213,8 +213,8 @@ mod tests {
             let prompts_ref: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
             let mut kv_states: Vec<KvState> = vec![model.alloc_kv(), model.alloc_kv()];
             let mut rec_states: Vec<RecurrentState> = vec![
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
+                RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
+                RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
             ];
             let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
 

@@ -79,7 +79,7 @@ impl BatchDecodeGraphState {
 
         let mut slot_states = Vec::with_capacity(max_batch);
         for _ in 0..max_batch {
-            slot_states.push(RecurrentState::new(ctx, config)?);
+            slot_states.push(RecurrentState::new(ctx, config, geometry)?);
         }
         let linear_pointer_tables = {
             let mut slot_refs: Vec<&mut RecurrentState> = slot_states.iter_mut().collect();

@@ -167,7 +167,13 @@ impl Qwen35Executor {
         let mut recurrent_states: Vec<RecurrentState> = plan
             .requests
             .iter()
-            .map(|_| RecurrentState::new(self.model.device_ctx(), self.model.config()))
+            .map(|_| {
+                RecurrentState::new(
+                    self.model.device_ctx(),
+                    self.model.config(),
+                    self.model.geometry,
+                )
+            })
             .collect::<Result<_>>()?;
         let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
         let logits =

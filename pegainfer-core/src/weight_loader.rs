@@ -393,6 +393,49 @@ fn tensor_bf16_cow<'d>(
     }
 }
 
+/// Typed F32 payload with dtype and 1D-shape validation. Aligned payloads
+/// borrow zero-copy; misaligned ones (legal in safetensors) decode
+/// little-endian into an owned buffer, since a misaligned f32 view is UB.
+#[allow(clippy::cast_ptr_alignment)]
+fn tensor_f32_cow<'d>(
+    tensor: &safetensors::tensor::TensorView<'d>,
+    name: &str,
+) -> Result<Cow<'d, [f32]>> {
+    anyhow::ensure!(
+        tensor.dtype() == Dtype::F32,
+        "Tensor '{name}': expected dtype F32, got {:?}",
+        tensor.dtype()
+    );
+    anyhow::ensure!(
+        tensor.shape().len() == 1,
+        "Tensor '{name}': expected 1D shape, got {:?}",
+        tensor.shape()
+    );
+    let data = tensor.data();
+    anyhow::ensure!(
+        data.len().is_multiple_of(std::mem::size_of::<f32>()),
+        "Tensor '{name}': {} bytes is not a whole number of f32 elements",
+        data.len()
+    );
+    if (data.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+        // SAFETY: alignment checked; any bit pattern is a valid f32.
+        Ok(Cow::Borrowed(unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr().cast::<f32>(),
+                data.len() / std::mem::size_of::<f32>(),
+            )
+        }))
+    } else {
+        Ok(Cow::Owned(
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| f32::from_le_bytes(b))
+                .collect(),
+        ))
+    }
+}
+
 /// One row-consecutive part of a fused matrix: `rows` rows starting at
 /// `row_offset` of a source tensor that must have exactly `src_rows` rows.
 pub struct FusedPart<'a> {
@@ -805,7 +848,118 @@ pub fn load_tensor_2d_col_shard(
     DeviceMatrix::from_host(ctx, &host, rows, cols)
 }
 
-#[allow(clippy::cast_ptr_alignment)]
+/// Load a 2D tensor assembled from multiple row ranges of one source tensor,
+/// stitched in `ranges` order: each entry is (row_offset, rows).
+pub fn load_tensor_2d_row_stitch(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    ranges: &[(usize, usize)],
+) -> Result<DeviceMatrix> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    if shape.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "Tensor '{}' expected 2D, got shape {:?}",
+            name,
+            shape
+        ));
+    }
+    let total_rows = shape[0];
+    let cols = shape[1];
+    let mut total = 0usize;
+    for &(row_offset, rows) in ranges {
+        if row_offset + rows > total_rows {
+            return Err(anyhow::anyhow!(
+                "2D row stitch out of bounds for '{}': row_offset={} rows={} total_rows={}",
+                name,
+                row_offset,
+                rows,
+                total_rows
+            ));
+        }
+        total += rows;
+    }
+    let elems = tensor_bf16_cow(&tensor, name)?;
+    let mut host = Vec::with_capacity(total * cols);
+    for &(row_offset, rows) in ranges {
+        let start = row_offset * cols;
+        host.extend_from_slice(&elems[start..start + rows * cols]);
+    }
+    DeviceMatrix::from_host(ctx, &host, total, cols)
+}
+
+/// Load a 1D BF16 tensor assembled from multiple element ranges of one source
+/// tensor, stitched in `ranges` order: each entry is (offset, len).
+pub fn load_tensor_1d_stitch(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    ranges: &[(usize, usize)],
+) -> Result<DeviceVec> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let elems = tensor_bf16_cow(&tensor, name)?;
+    let mut total = 0usize;
+    for &(offset, len) in ranges {
+        if offset + len > elems.len() {
+            return Err(anyhow::anyhow!(
+                "1D stitch out of bounds for '{}': offset={} len={} total_len={}",
+                name,
+                offset,
+                len,
+                elems.len()
+            ));
+        }
+        total += len;
+    }
+    let mut host = Vec::with_capacity(total);
+    for &(offset, len) in ranges {
+        host.extend_from_slice(&elems[offset..offset + len]);
+    }
+    DeviceVec::from_host(ctx, &host)
+}
+
+/// Load a 1D BF16 element range to GPU (tensor-parallel shard of a 1D weight).
+pub fn load_tensor_1d_shard(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    offset: usize,
+    len: usize,
+) -> Result<DeviceVec> {
+    load_tensor_1d_stitch(ctx, shards, weight_map, name, &[(offset, len)])
+}
+
+/// Load a 1D F32 element range to GPU (tensor-parallel shard of a 1D weight).
+pub fn load_tensor_1d_f32_shard(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    offset: usize,
+    len: usize,
+) -> Result<CudaSlice<f32>> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let elems = tensor_f32_cow(&tensor, name)?;
+    if offset + len > elems.len() {
+        return Err(anyhow::anyhow!(
+            "F32 1D shard out of bounds for '{}': offset={} len={} total_len={}",
+            name,
+            offset,
+            len,
+            elems.len()
+        ));
+    }
+    let gpu_data = ctx
+        .stream
+        .clone_htod(&elems[offset..offset + len])
+        .map_err(|e| anyhow::anyhow!("H2D copy failed for '{}': {}", name, e))?;
+    Ok(gpu_data)
+}
+
 /// Load a 1D F32 tensor to GPU as CudaSlice<f32>.
 /// For weights stored in float32 (e.g., A_log, norm.weight in linear attention).
 pub fn load_tensor_1d_f32(
@@ -815,19 +969,10 @@ pub fn load_tensor_1d_f32(
     name: &str,
 ) -> Result<CudaSlice<f32>> {
     let tensor = find_tensor(shards, weight_map, name)?;
-    let data = tensor.data();
-    if data.len() % 4 != 0 {
-        return Err(anyhow::anyhow!(
-            "F32 tensor '{}': data length {} not multiple of 4",
-            name,
-            data.len()
-        ));
-    }
-    let len = data.len() / 4;
-    let slice = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<f32>(), len) };
+    let elems = tensor_f32_cow(&tensor, name)?;
     let gpu_data = ctx
         .stream
-        .clone_htod(slice)
+        .clone_htod(elems.as_ref())
         .map_err(|e| anyhow::anyhow!("H2D copy failed for '{}': {}", name, e))?;
     Ok(gpu_data)
 }
@@ -945,6 +1090,45 @@ mod tests {
     use safetensors::tensor::TensorView;
 
     use super::tensor_bf16_cow;
+    use super::tensor_f32_cow;
+
+    #[test]
+    fn tensor_f32_cow_borrows_aligned_and_decodes_unaligned() {
+        let vals: [u32; 4] = [0x3f80_0000, 0x0000_0001, 0xbf12_3456, 0x7f80_0001];
+        let mut bytes = vec![0u8; vals.len() * 4 + 3];
+        // A Vec<u8> base has no alignment guarantee; derive both offsets from
+        // the actual address so each branch is forced deterministically.
+        let base = bytes.as_ptr() as usize;
+        let aligned_off = base.next_multiple_of(4) - base;
+        for (off, expect_borrowed) in [(aligned_off, true), (aligned_off + 1, false)] {
+            for (i, v) in vals.iter().enumerate() {
+                bytes[off + i * 4..off + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            let view = TensorView::new(
+                Dtype::F32,
+                vec![vals.len()],
+                &bytes[off..off + vals.len() * 4],
+            )
+            .unwrap();
+            let cow = tensor_f32_cow(&view, "w").unwrap();
+            assert_eq!(
+                matches!(cow, Cow::Borrowed(_)),
+                expect_borrowed,
+                "off={off}"
+            );
+            let got: Vec<u32> = cow.iter().map(|f| f.to_bits()).collect();
+            assert_eq!(got, vals, "off={off}");
+        }
+    }
+
+    #[test]
+    fn tensor_f32_cow_rejects_wrong_dtype_and_rank() {
+        let bytes = vec![0u8; 8];
+        let bf16_view = TensorView::new(Dtype::BF16, vec![4], &bytes).unwrap();
+        assert!(tensor_f32_cow(&bf16_view, "w").is_err());
+        let f32_2d_view = TensorView::new(Dtype::F32, vec![2, 1], &bytes).unwrap();
+        assert!(tensor_f32_cow(&f32_2d_view, "w").is_err());
+    }
 
     #[test]
     fn tensor_bf16_cow_borrows_aligned_and_decodes_unaligned() {

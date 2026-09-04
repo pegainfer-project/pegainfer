@@ -1,7 +1,9 @@
 //! Tensor-parallel worker runtime for Qwen3.5.
 //!
-//! Phase 2A adds one canonical eager unified command while retaining the
-//! replicated linear-attention state layout from Phase 1.
+//! Phase 2A adds one canonical eager unified command. Phase 2b shards the
+//! linear-attention/GDR weight and state surface per rank, and decode rows
+//! run as one batched forward per step plus one batched rank-0 sampling pass
+//! instead of a per-request bs=1 loop.
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
@@ -1006,7 +1008,6 @@ struct TpRequestState {
     phase: TpRequestPhase,
     kv: KvState,
     recurrent: RecurrentState,
-    linear_pointer_tables: LinearStatePointerTables,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1037,10 +1038,15 @@ impl TpWorkerPrepared {
             .ctx
             .mem_get_info()
             .map_err(|err| anyhow::anyhow!("failed to query TP rank {rank} memory: {err}"))?;
-        let recurrent_bytes = RecurrentState::allocation_bytes(model.config());
+        // Phase 2b: per-request recurrent state is rank-local, so worker
+        // capacity math uses the local value-head/qkv sizes.
+        let recurrent_bytes = RecurrentState::allocation_bytes(model.config(), model.geometry);
         let prefill_scratch_tokens = prefill_scratch_tokens(max_prefill_tokens);
-        let prefill_scratch_bytes =
-            GdrChunkwiseScratch35::estimate_bytes(model.config(), prefill_scratch_tokens);
+        let prefill_scratch_bytes = GdrChunkwiseScratch35::estimate_bytes(
+            model.config(),
+            model.geometry,
+            prefill_scratch_tokens,
+        );
         let max_batch = effective_recurrent_capacity(
             requested_max_batch,
             free_bytes,
@@ -1336,6 +1342,133 @@ impl TpWorkerState {
         Ok(primary_results)
     }
 
+    /// Run one batched eager decode step over all rows in command order: a
+    /// single forward for the whole batch on every rank, then (rank 0 only)
+    /// one batched sampling pass over the per-row sampling params.
+    ///
+    /// Seeded rows keep their former per-row semantics: they pass step 0 and
+    /// `select_batch` isolates each seeded row into its own single-row philox
+    /// call keyed on (request seed, step), so seeded output stays independent
+    /// of batch composition. Unseeded rows decorrelate inside the batched
+    /// call through the per-step command seed, same as the single-GPU batched
+    /// path. Returns one result row per request in command order on rank 0,
+    /// empty elsewhere.
+    fn run_decode_batch(
+        &mut self,
+        requests: &[TpDecodeStepItem],
+        sample_seed: u64,
+    ) -> Result<Vec<DecodeRequestResult>> {
+        let bs = requests.len();
+        if bs == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Resolve the worker state slot of every row in command order.
+        // Decode request ids are unique within one command
+        // (validate_decode_requests), so each slot is borrowed at most once.
+        let mut row_of_state: Vec<Option<usize>> = vec![None; self.requests.len()];
+        for (row, request) in requests.iter().enumerate() {
+            let state_idx = self.request_index(request.request_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Qwen3.5 TP decode request {} has no worker state",
+                    request.request_id.get()
+                )
+            })?;
+            anyhow::ensure!(
+                self.requests[state_idx].phase == TpRequestPhase::Decoding,
+                "Qwen3.5 TP request {} is not ready for decode",
+                request.request_id.get()
+            );
+            debug_assert!(row_of_state[state_idx].is_none());
+            row_of_state[state_idx] = Some(row);
+        }
+        let mut kv_slots: Vec<Option<&mut KvState>> =
+            std::iter::repeat_with(|| None).take(bs).collect();
+        let mut recurrent_slots: Vec<Option<&mut RecurrentState>> =
+            std::iter::repeat_with(|| None).take(bs).collect();
+        for (state_idx, state) in self.requests.iter_mut().enumerate() {
+            if let Some(row) = row_of_state[state_idx] {
+                kv_slots[row] = Some(&mut state.kv);
+                recurrent_slots[row] = Some(&mut state.recurrent);
+            }
+        }
+        let mut kv_refs: Vec<&mut KvState> = Vec::with_capacity(bs);
+        let mut recurrent_refs: Vec<&mut RecurrentState> = Vec::with_capacity(bs);
+        for (kv, recurrent) in kv_slots.into_iter().zip(recurrent_slots) {
+            kv_refs.push(kv.expect("decode row state resolved above"));
+            recurrent_refs.push(recurrent.expect("decode row state resolved above"));
+        }
+
+        // Step-scoped GDR pointer tables over the full decode batch. They are
+        // rebuilt every step, so swap_remove retirement between steps can
+        // never leave a stale table behind.
+        let linear_pointer_tables = LinearStatePointerTables::from_recurrent_refs(
+            self.model.device_ctx(),
+            self.model.config(),
+            &mut recurrent_refs,
+            bs,
+            "Qwen3.5 TP eager decode",
+        )?;
+        let token_ids: Vec<u32> = requests.iter().map(|request| request.token_id).collect();
+        self.model.batch_decode_eager_logits(
+            &token_ids,
+            &mut kv_refs,
+            &mut recurrent_refs,
+            &linear_pointer_tables,
+            &mut self.decode_buffers,
+        )?;
+
+        if self.rank != 0 {
+            return Ok(Vec::new());
+        }
+
+        // Snapshot requested logits rows BEFORE sampling: the sampler may
+        // modify bufs.logits in place.
+        let requested_logprobs: Vec<usize> =
+            requests.iter().map(|request| request.logprobs).collect();
+        let cpu_logits = snapshot_requested_logprobs(
+            self.model.device_ctx(),
+            &self.decode_buffers.logits,
+            &requested_logprobs,
+        )?;
+        let params_refs: Vec<&SamplingParams> = requests
+            .iter()
+            .map(|request| &request.sampling_params)
+            .collect();
+        let steps = vec![0u64; bs];
+        let tokens = pegainfer_sample::select_batch(
+            self.model.device_ctx(),
+            &self.decode_buffers.logits,
+            &params_refs,
+            &steps,
+            sample_seed,
+            &mut self.sample_scratch,
+        )?;
+        anyhow::ensure!(
+            tokens.len() == bs,
+            "Qwen3.5 TP decode sampling returned {} tokens for {bs} rows",
+            tokens.len()
+        );
+        Ok(requests
+            .iter()
+            .enumerate()
+            .map(|(row, request)| {
+                let logprob = cpu_logits[row].as_ref().and_then(|logits_row| {
+                    pegainfer_sample::token_logprob_from_row(
+                        logits_row,
+                        tokens[row],
+                        request.logprobs,
+                    )
+                });
+                DecodeRequestResult {
+                    request_id: request.request_id,
+                    token: tokens[row],
+                    logprob,
+                }
+            })
+            .collect())
+    }
+
     fn sample_final_prefill_chunk(
         &mut self,
         chunk: &TpPrefillChunkItem,
@@ -1394,60 +1527,7 @@ impl TpWorkerState {
             self.max_batch
         );
 
-        let mut primary_results =
-            Vec::with_capacity(if self.rank == 0 { requests.len() } else { 0 });
-        for (row_idx, request) in requests.iter().enumerate() {
-            let state_idx = self.request_index(request.request_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Qwen3.5 TP decode request {} has no worker state",
-                    request.request_id.get()
-                )
-            })?;
-            anyhow::ensure!(
-                self.requests[state_idx].phase == TpRequestPhase::Decoding,
-                "Qwen3.5 TP request {} is not ready for decode",
-                request.request_id.get()
-            );
-
-            {
-                let state = &mut self.requests[state_idx];
-                let mut kv_refs = [&mut state.kv];
-                let mut recurrent_refs = [&mut state.recurrent];
-                self.model.batch_decode_eager_logits(
-                    &[request.token_id],
-                    &mut kv_refs,
-                    &mut recurrent_refs,
-                    &state.linear_pointer_tables,
-                    &mut self.decode_buffers,
-                )?;
-            }
-
-            if self.rank == 0 {
-                let cpu_logits = snapshot_requested_logprobs(
-                    self.model.device_ctx(),
-                    &self.decode_buffers.logits,
-                    &[request.logprobs],
-                )?;
-                let params_refs = [&request.sampling_params];
-                let tokens = pegainfer_sample::select_batch(
-                    self.model.device_ctx(),
-                    &self.decode_buffers.logits,
-                    &params_refs,
-                    &[0],
-                    sample_seed.wrapping_add(row_idx as u64),
-                    &mut self.sample_scratch,
-                )?;
-                let token = tokens[0];
-                let logprob = cpu_logits[0].as_ref().and_then(|row| {
-                    pegainfer_sample::token_logprob_from_row(row, token, request.logprobs)
-                });
-                primary_results.push(DecodeRequestResult {
-                    request_id: request.request_id,
-                    token,
-                    logprob,
-                });
-            }
-        }
+        let primary_results = self.run_decode_batch(requests, sample_seed)?;
 
         Ok(primary_results)
     }
@@ -1480,23 +1560,16 @@ impl TpWorkerState {
         if let Some(idx) = self.request_index(request_id) {
             return Ok(idx);
         }
-        let mut recurrent = RecurrentState::new(self.model.device_ctx(), self.model.config())?;
-        let linear_pointer_tables = {
-            let mut recurrent_refs = [&mut recurrent];
-            LinearStatePointerTables::from_recurrent_refs(
-                self.model.device_ctx(),
-                self.model.config(),
-                &mut recurrent_refs,
-                1,
-                "Qwen3.5 TP eager",
-            )?
-        };
+        let recurrent = RecurrentState::new(
+            self.model.device_ctx(),
+            self.model.config(),
+            self.model.geometry,
+        )?;
         let state = TpRequestState {
             request_id,
             phase: TpRequestPhase::Prefilling,
             kv: self.model.alloc_kv(),
             recurrent,
-            linear_pointer_tables,
         };
         self.requests.push(state);
         Ok(self.requests.len() - 1)

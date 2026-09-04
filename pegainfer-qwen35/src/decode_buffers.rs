@@ -75,9 +75,9 @@ impl BatchDecodeBuffers35 {
         let q_proj_dim = geometry.local_full_attn_gated_q_dim();
         let q_dim = geometry.local_full_attn_q_dim();
         let kv_dim = geometry.local_full_attn_kv_dim();
-        let qkv_dim = config.linear_attn_qkv_dim();
-        let z_dim = config.linear_attn_z_dim();
-        let b_dim = config.linear_num_value_heads;
+        let qkv_dim = geometry.local_linear_qkv_dim();
+        let z_dim = geometry.local_linear_z_dim();
+        let b_dim = geometry.local_linear_num_value_heads();
         let a_dim = b_dim;
         let intermediate = geometry.local_intermediate_size();
 
