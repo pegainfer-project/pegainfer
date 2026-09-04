@@ -7,6 +7,7 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 
 use super::config::Config35;
+use super::config::LocalGeometry;
 
 /// Scratch buffers for a single Qwen3.5 linear-attention chunk-wise GDR prefill call.
 ///
@@ -50,10 +51,17 @@ pub struct GdrChunkwiseScratch35 {
 impl GdrChunkwiseScratch35 {
     pub(crate) const CHUNK_SIZE: usize = 64;
 
-    pub(crate) fn new(ctx: &DeviceContext, config: &Config35, seq_len: usize) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        config: &Config35,
+        geometry: LocalGeometry,
+        seq_len: usize,
+    ) -> Result<Self> {
+        // GDR scratch is rank-local under TP: local value heads, global dims
+        // at world_size 1.
         Self::from_dims(
             ctx,
-            config.linear_num_value_heads,
+            geometry.local_linear_num_value_heads(),
             config.linear_key_head_dim,
             config.linear_value_head_dim,
             seq_len,
@@ -120,8 +128,12 @@ impl GdrChunkwiseScratch35 {
     ///
     /// Direct-paged prefill writes full-attention K/V into the paged pool, so
     /// HND KVCache staging buffers are no longer part of the prefill scratch.
-    pub(crate) fn estimate_bytes(config: &Config35, max_seq_len: usize) -> usize {
-        let num_vh = config.linear_num_value_heads;
+    pub(crate) fn estimate_bytes(
+        config: &Config35,
+        geometry: LocalGeometry,
+        max_seq_len: usize,
+    ) -> usize {
+        let num_vh = geometry.local_linear_num_value_heads();
         let key_dim = config.linear_key_head_dim;
         let val_dim = config.linear_value_head_dim;
         let chunk_sz = Self::CHUNK_SIZE;
@@ -150,15 +162,15 @@ impl GdrChunkwiseScratch35 {
         // 2. Per-layer transient peak (all bf16 = 2 bytes).
         //    Attention and MLP temps don't coexist — MLP runs after attention.
         let hidden_dim = config.hidden_size;
-        let intermediate = config.intermediate_size;
+        let intermediate = geometry.local_intermediate_size();
 
         // Shared: hidden_batch + normed + hidden_plus_attn + normed_for_mlp
         let shared_layer = hidden_dim * seq * 4;
 
         // Full attention: q_full(with gate) + k + v + attn_out + q_prepped
-        let full_qkv = config.num_attention_heads * config.head_dim * 2;
-        let full_kv = config.num_key_value_heads * config.head_dim;
-        let full_out = config.num_attention_heads * config.head_dim;
+        let full_qkv = geometry.local_full_attn_gated_q_dim();
+        let full_kv = geometry.local_full_attn_kv_dim();
+        let full_out = geometry.local_full_attn_q_dim();
         let full_attn_temps = (full_qkv + full_kv * 2 + full_out * 2) * seq;
 
         // MLP: gate_up_out + act_out (same peak footprint as separate gate/up)

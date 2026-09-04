@@ -1,7 +1,7 @@
 //! Tensor-parallel worker runtime for Qwen3.5.
 //!
-//! Phase 2A adds one canonical eager unified command while retaining the
-//! replicated linear-attention state layout from Phase 1.
+//! Phase 2A adds one canonical eager unified command. Phase 2b shards the
+//! linear-attention/GDR weight and state surface per rank.
 
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
@@ -1037,10 +1037,15 @@ impl TpWorkerPrepared {
             .ctx
             .mem_get_info()
             .map_err(|err| anyhow::anyhow!("failed to query TP rank {rank} memory: {err}"))?;
-        let recurrent_bytes = RecurrentState::allocation_bytes(model.config());
+        // Phase 2b: per-request recurrent state is rank-local, so worker
+        // capacity math uses the local value-head/qkv sizes.
+        let recurrent_bytes = RecurrentState::allocation_bytes(model.config(), model.geometry);
         let prefill_scratch_tokens = prefill_scratch_tokens(max_prefill_tokens);
-        let prefill_scratch_bytes =
-            GdrChunkwiseScratch35::estimate_bytes(model.config(), prefill_scratch_tokens);
+        let prefill_scratch_bytes = GdrChunkwiseScratch35::estimate_bytes(
+            model.config(),
+            model.geometry,
+            prefill_scratch_tokens,
+        );
         let max_batch = effective_recurrent_capacity(
             requested_max_batch,
             free_bytes,
@@ -1480,7 +1485,11 @@ impl TpWorkerState {
         if let Some(idx) = self.request_index(request_id) {
             return Ok(idx);
         }
-        let mut recurrent = RecurrentState::new(self.model.device_ctx(), self.model.config())?;
+        let mut recurrent = RecurrentState::new(
+            self.model.device_ctx(),
+            self.model.config(),
+            self.model.geometry,
+        )?;
         let linear_pointer_tables = {
             let mut recurrent_refs = [&mut recurrent];
             LinearStatePointerTables::from_recurrent_refs(

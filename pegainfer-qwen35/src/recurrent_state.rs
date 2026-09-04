@@ -1,8 +1,11 @@
 //! Recurrent state for Qwen3.5 linear attention layers.
 //!
 //! Each linear attention layer maintains:
-//! - Recurrent state: [num_value_heads, key_head_dim, value_head_dim] f32, V contiguous ([H,K,V])
-//! - Conv state: [qkv_dim × (conv_kernel_dim - 1)] bf16
+//! - Recurrent state: [local_value_heads, key_head_dim, value_head_dim] f32, V contiguous ([H,K,V])
+//! - Conv state: [local_qkv_dim × (conv_kernel_dim - 1)] bf16
+//!
+//! Under TP both are rank-local: Phase 2b shards value heads (and fused qkv
+//! channels) across ranks. Recurrent and conv state are NEVER all-reduced.
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -11,14 +14,16 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceVec;
 
 use super::config::Config35;
+use super::config::LocalGeometry;
 
 /// Per-layer recurrent state for a single linear attention layer.
 pub(crate) struct LayerRecurrentState {
-    /// Recurrent state matrix: [num_value_heads * key_head_dim * value_head_dim] f32
-    /// Stored as f32 per mamba_ssm_dtype="float32" in config.
+    /// Recurrent state matrix: [local_value_heads * key_head_dim * value_head_dim] f32
+    /// Stored as f32 per mamba_ssm_dtype="float32" in config. Rank-local under
+    /// TP (local dims equal global dims at world_size 1). Never all-reduced.
     pub(crate) state: CudaSlice<f32>,
-    /// Conv1d state buffer: [qkv_dim * (conv_kernel_dim - 1)] bf16
-    /// Stores the last (kernel_dim - 1) inputs for causal conv1d.
+    /// Conv1d state buffer: [local_linear_qkv_dim * (conv_kernel_dim - 1)] bf16
+    /// Stores the last (kernel_dim - 1) inputs for causal conv1d. Rank-local.
     pub(crate) conv_state: DeviceVec,
 }
 
@@ -42,19 +47,25 @@ pub(crate) struct LinearStatePointerTables {
 }
 
 /// Per-layer element counts shared by allocation and reservation:
-/// (linear layers, f32 state elements, bf16 conv elements).
-fn per_layer_dims(config: &Config35) -> (usize, usize, usize) {
+/// (linear layers, f32 state elements, bf16 conv elements). Sizes are
+/// rank-local under TP; at world_size 1 they equal the global dims.
+fn per_layer_dims(config: &Config35, geometry: LocalGeometry) -> (usize, usize, usize) {
     let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
-    let state_size =
-        config.linear_num_value_heads * config.linear_key_head_dim * config.linear_value_head_dim;
-    let conv_state_size = config.linear_attn_qkv_dim() * (config.linear_conv_kernel_dim - 1);
+    let state_size = geometry.local_linear_num_value_heads()
+        * config.linear_key_head_dim
+        * config.linear_value_head_dim;
+    let conv_state_size = geometry.local_linear_qkv_dim() * (config.linear_conv_kernel_dim - 1);
     (num_linear_layers, state_size, conv_state_size)
 }
 
 impl RecurrentState {
     /// Allocate zeroed recurrent state for all linear attention layers.
-    pub(crate) fn new(ctx: &DeviceContext, config: &Config35) -> Result<Self> {
-        let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config);
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        config: &Config35,
+        geometry: LocalGeometry,
+    ) -> Result<Self> {
+        let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config, geometry);
 
         let mut layers = Vec::with_capacity(num_linear_layers);
         for _ in 0..num_linear_layers {
@@ -144,17 +155,17 @@ impl LinearStatePointerTables {
     }
 }
 
-/// Device bytes of one request's recurrent state.
-pub(crate) fn bytes_per_request(config: &Config35) -> usize {
-    let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config);
+/// Device bytes of one request's (rank-local) recurrent state.
+pub(crate) fn bytes_per_request(config: &Config35, geometry: LocalGeometry) -> usize {
+    let (num_linear_layers, state_size, conv_state_size) = per_layer_dims(config, geometry);
     num_linear_layers
         * (state_size * std::mem::size_of::<f32>()
             + conv_state_size * std::mem::size_of::<half::bf16>())
 }
 
 impl RecurrentState {
-    pub(crate) fn allocation_bytes(config: &Config35) -> usize {
-        bytes_per_request(config)
+    pub(crate) fn allocation_bytes(config: &Config35, geometry: LocalGeometry) -> usize {
+        bytes_per_request(config, geometry)
     }
 }
 
