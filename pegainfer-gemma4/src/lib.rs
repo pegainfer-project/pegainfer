@@ -34,17 +34,17 @@ mod weights;
 use std::path::Path;
 
 use anyhow::Result;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
 pub(crate) use probe::probe_config_json;
 
 #[cfg(feature = "gemma4")]
-fn start_engine(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
+fn start_engine(model_path: &Path, options: &EngineLoadOptions) -> Result<Engine> {
     engine::start(model_path, options)
 }
 
 #[cfg(not(feature = "gemma4"))]
-fn start_engine(_model_path: &Path, _options: &EngineLoadOptions) -> Result<EngineHandle> {
+fn start_engine(_model_path: &Path, _options: &EngineLoadOptions) -> Result<Engine> {
     anyhow::bail!(
         "Gemma 4 support is feature-gated; rebuild pegainfer-server with --features gemma4"
     )

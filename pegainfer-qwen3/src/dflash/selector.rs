@@ -233,15 +233,26 @@ impl SelectorScratch {
         Ok(())
     }
 
-    pub(crate) fn bytes(config: &DFlashConfig, max_decode_batch_size: usize) -> usize {
+    pub(crate) fn bytes(config: &DFlashConfig, max_decode_batch_size: usize) -> Result<usize> {
         const BF16: usize = 2;
         let rank = match &config.proposal {
             crate::config::DFlashProposal::TopKSelector { rank, .. } => *rank,
-            _ => return 0,
+            _ => return Ok(0),
         };
-        let rows = max_decode_batch_size * config.block_size;
-        rows * rank * BF16
-            + max_decode_batch_size * std::mem::size_of::<u32>()
-            + dflash2_selector_scratch_bytes(rows)
+        let rows = max_decode_batch_size
+            .checked_mul(config.block_size)
+            .context("selector scratch row count overflow")?;
+        let projected = rows
+            .checked_mul(rank)
+            .and_then(|bytes| bytes.checked_mul(BF16))
+            .context("selector projected-hidden scratch size overflow")?;
+        let anchors = max_decode_batch_size
+            .checked_mul(std::mem::size_of::<u32>())
+            .context("selector anchor scratch size overflow")?;
+        let selector = dflash2_selector_scratch_bytes(rows);
+        projected
+            .checked_add(anchors)
+            .and_then(|bytes| bytes.checked_add(selector))
+            .context("selector scratch size overflow")
     }
 }

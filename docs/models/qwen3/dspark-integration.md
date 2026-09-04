@@ -1,8 +1,8 @@
 # DSpark Integration (Qwen3-4B)
 
-**TL;DR:** DeepSeek's **DSpark** (paper + DeepSpec repo, Jun 2026) is **our DFlash drafter plus two bolt-ons**: (1) a *semi-autoregressive* **Markov head** — a rank-256 logit bias added in a short sequential loop over the block so each draft token conditions on the previously sampled one; this is the whole draft-quality win (+16–18% accepted length over DFlash in their offline table, paper Table 1), and (2) a **confidence head** (tiny linear → per-position survival probability) feeding a **hardware-aware prefix scheduler** that trims verify length under load — the production throughput/Pareto win. The released checkpoint `dspark_qwen3_4b_block7` has an **identical backbone to our `Qwen3-4B-DFlash-b16`** (same hidden 2560 / 5 layers / `target_layer_ids=[1,9,17,25,33]` / KV-injection) — it differs only by `block_size=7`, +4 tensors (`markov_w1 [V,256]`, `markov_w2 [V,256]`, `confidence_head.proj.weight [1,2816]`, `.bias [1]`), and an "anchor-is-the-first-prediction" block-layout tweak. **Our verify/accept/KV-transaction stack is reused unchanged** — DSpark only changes the *propose* step. On the 5090 greedy sweep, DSpark beats the matched block7 DFlash baseline by **+3.6% geomean output tok/s** overall, with the expected wins on text/code (+3.1% to +15.8%; random is the synthetic exception) and a better accepted-draft distribution (**2.52 vs 2.30** accepted draft tokens/round, full-7 accept **17.4% vs 13.9%**). Decisions settled: **block_size = 7**, **reuse the target head** (DSpark's `embed_tokens`/`lm_head` are byte-identical to target Qwen3-4B's — skip loading them). **Phase 1 delta over DFlash is small: config + 2 tensor loads + one sequential Markov loop in `execute_dflash_draft`; no new verify/KV/graph.**
+**TL;DR:** DeepSeek's **DSpark** (paper + DeepSpec repo, Jun 2026) is **our DFlash drafter plus two bolt-ons**: (1) a *semi-autoregressive* **Markov head** — a rank-256 logit bias added in a short sequential loop over the block so each draft token conditions on the previously sampled one; this is the whole draft-quality win (+16–18% accepted length over DFlash in their offline table, paper Table 1), and (2) a **confidence head** (tiny linear → per-position survival probability) feeding a **hardware-aware prefix scheduler** that trims verify length under load — the production throughput/Pareto win. The released checkpoint `dspark_qwen3_4b_block7` has an **identical backbone to our `Qwen3-4B-DFlash-b16`** (same hidden 2560 / 5 layers / `target_layer_ids=[1,9,17,25,33]` / KV-injection) — it differs only by `block_size=7`, +4 tensors (`markov_w1 [V,256]`, `markov_w2 [V,256]`, `confidence_head.proj.weight [1,2816]`, `.bias [1]`), and an "anchor-is-the-first-prediction" block-layout tweak. **Our verify/accept/KV-transaction stack is reused unchanged** — DSpark only changes the *propose* step (the later env-gated hedge, `PEGAINFER_SPEC_HEDGE*`, additionally expands verify with extra chain spans over scratch KV pages; off by default). On the 5090 greedy sweep, DSpark beats the matched block7 DFlash baseline by **+3.6% geomean output tok/s** overall, with the expected wins on text/code (+3.1% to +15.8%; random is the synthetic exception) and a better accepted-draft distribution (**2.52 vs 2.30** accepted draft tokens/round, full-7 accept **17.4% vs 13.9%**). Decisions settled: **block_size = 7**, **reuse the target head** (DSpark's `embed_tokens`/`lm_head` are byte-identical to target Qwen3-4B's — skip loading them). **Phase 1 delta over DFlash is small: config + 2 tensor loads + one sequential Markov loop in `execute_dflash_draft`; no new verify/KV/graph** *(true of Phase 1 as landed — the later opt-in hedge adds expanded verify spans, scratch KV pages, and per-shape Markov graphs, all behind `PEGAINFER_SPEC_HEDGE*`)*.
 
-Last touched: 2026-06
+Last touched: 2026-08
 
 ## Implementation status — Phase 1 built & lossless
 
@@ -11,9 +11,17 @@ Last touched: 2026-06
 ```
 PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \
 PEGAINFER_DFLASH_TEST_MODEL_PATH=/data/models/dspark_qwen3_4b_block7 \
+PEGAINFER_REQUIRE_HEDGE_GATE=1 \
 cargo test --release -p pegainfer-qwen3 --test dflash_speculative_gate
-# → 4 passed; all prompts 100% lossless. (The "kernel-gap flip … Not a spec bug"
-#   diagnostics are the pre-existing DFlash prefill/decode numeric gap, unrelated.)
+# → 5 passed. The fifth, hedged_ladder_passes_the_lossless_gates, re-runs the
+#   lossless suites with PEGAINFER_SPEC_HEDGE on and asserts that hedged rounds
+#   and chain spans actually executed, with at least one chain win and one
+#   loss. It needs a DSpark checkpoint; the REQUIRE flag above turns a missing
+#   one into a failure instead of a green skip, so always set it when the run
+#   is meant to be evidence. See the test's own doc for what it does and does
+#   not prove.
+#   The "kernel-gap flip … Not a spec bug" diagnostics are the pre-existing
+#   DFlash prefill/decode numeric gap, unrelated.
 ```
 
 What was actually built (the new DSpark code lives in its own module `pegainfer-qwen3/src/dspark.rs`):

@@ -9,7 +9,6 @@ mod eagle3;
 mod executor;
 mod frontend_adapter;
 pub(crate) mod green_ctx;
-pub mod kernel_bench;
 mod lora;
 pub mod model_line;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -17,6 +16,7 @@ pub use lora::fixtures as lora_fixtures;
 mod prefill;
 mod projection_fusion;
 mod scheduler;
+mod sizing;
 mod speculative;
 mod split_kv;
 mod unified_forward;
@@ -199,6 +199,8 @@ impl Default for Qwen3OffloadOptions {
 /// This is the production phase boundary used by the Qwen3 scheduler and by
 /// model-local benchmarks. The root server should use `start_engine` instead.
 pub mod runtime {
+    pub use crate::batch_decode_buffers::SPLIT_KV_CHUNK_TOKENS;
+    pub use crate::batch_decode_buffers::SPLIT_KV_TUNED_MAX_CHUNKS;
     pub use crate::batch_decode_buffers::split_chunk_size_for;
     pub use crate::executor::DecodePlan;
     pub use crate::executor::DecodeRequestResult;
@@ -212,6 +214,7 @@ pub mod runtime {
     pub use crate::executor::RequestId;
     pub use crate::executor::UnifiedPlan;
     pub use crate::executor::UnifiedResult;
+    pub use crate::split_kv::SplitKvConfig;
 }
 
 /// Server-facing launch knobs for the Qwen3 engine.

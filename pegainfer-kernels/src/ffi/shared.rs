@@ -931,6 +931,8 @@ unsafe extern "C" {
         bias: *const Half,
         block_size: i32,
         step: i32,
+        chains: i32,
+        req_map: *const i32,
         rows: i32,
         n: i32,
         partial_values: *mut f32,
@@ -938,7 +940,39 @@ unsafe extern "C" {
         out_tokens: *mut u32,
         sampled_tokens: *mut u32,
         stream: CUstream,
-    );
+    ) -> i32;
+
+    pub fn hedge_ladder_force_cuda(
+        prev: *mut u32,
+        sampled: *mut u32,
+        runners: *const u32,
+        req_map: *const i32,
+        n: i32,
+        c: i32,
+        j: i32,
+        runner_stride: i32,
+        block_size: i32,
+        step: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn markov_step_top2_cuda(
+        base: *const Half,
+        bias: *const Half,
+        block_size: i32,
+        step: i32,
+        chains: i32,
+        rows: i32,
+        n: i32,
+        partial_v1: *mut f32,
+        partial_i1: *mut i32,
+        partial_v2: *mut f32,
+        partial_i2: *mut i32,
+        out_tokens: *mut u32,
+        sampled_tokens: *mut u32,
+        out_top2: *mut u32,
+        stream: CUstream,
+    ) -> i32;
 
     // DFlash2 proposer-side selector. The first launch writes a deterministic
     // top-k candidate list for each logits row; the second launch walks those

@@ -746,7 +746,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1278,7 +1278,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1476,7 +1476,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2027,12 +2027,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hound"
-version = "3.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
-
-[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2419,7 +2413,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2473,7 +2467,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2643,7 +2637,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "llm-multimodal"
 version = "1.7.1"
-source = "git+https://github.com/smg-project/llm-multimodal?rev=15adba5e025d8636ba4a334fb379b1371f6196a1#15adba5e025d8636ba4a334fb379b1371f6196a1"
+source = "git+https://github.com/smg-project/llm-multimodal?rev=74f64753e040ade87c9d7f4bb0ad2f4dd7764652#74f64753e040ade87c9d7f4bb0ad2f4dd7764652"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2654,7 +2648,7 @@ dependencies = [
  "hf-hub",
  "image",
  "libloading 0.8.9",
- "ndarray 0.17.2",
+ "ndarray",
  "once_cell",
  "pkg-config",
  "rayon",
@@ -3093,21 +3087,6 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
- "rawpointer",
-]
-
-[[package]]
-name = "ndarray"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
@@ -3119,6 +3098,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
+ "serde",
 ]
 
 [[package]]
@@ -3156,7 +3136,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3715,7 +3695,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -4315,7 +4294,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -4336,7 +4315,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -4877,18 +4856,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ade083ccbb4bf536df69d1f6432cc23deb7acccff86b183f3923a6fd56a1153"
 
 [[package]]
-name = "rubato"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5258099699851cfd0082aeb645feb9c084d9a5e1f1b8d5372086b989fc5e56a1"
-dependencies = [
- "num-complex",
- "num-integer",
- "num-traits",
- "realfft",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4946,7 +4913,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5930,25 +5897,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "tekken-rs"
-version = "0.1.1"
+name = "tekken"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49623843103837f53f7ebe8cfafc19ccff28ff0e15e7c4b9f6ad21e36fbfde3a"
+checksum = "1d1481e6bbb98c7e1b04124420b6e7c367c87fc897aae340edcdeb4e91b639d2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "env_logger",
- "hound",
  "log",
- "ndarray 0.16.1",
  "regex",
- "rubato",
  "rustc-hash 1.1.0",
- "rustfft",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tiktoken-rs 0.7.0",
+ "tiktoken-rs",
 ]
 
 [[package]]
@@ -5961,7 +5924,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6053,21 +6016,6 @@ dependencies = [
  "quick-error 2.0.1",
  "weezl",
  "zune-jpeg",
-]
-
-[[package]]
-name = "tiktoken-rs"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25563eeba904d770acf527e8b370fe9a5547bacd20ff84a0b6c3bc41288e5625"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bstr",
- "fancy-regex 0.13.0",
- "lazy_static",
- "regex",
- "rustc-hash 1.1.0",
 ]
 
 [[package]]
@@ -6914,12 +6862,12 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 [[package]]
 name = "vllm-build-info"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=d3e2888c7588fe3a7be93606c7c626dbfd304d2e#d3e2888c7588fe3a7be93606c7c626dbfd304d2e"
+source = "git+https://github.com/vllm-project/vllm.git?rev=60857baa53a743913d4e919f12b5fd8d608ded86#60857baa53a743913d4e919f12b5fd8d608ded86"
 
 [[package]]
 name = "vllm-chat"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=d3e2888c7588fe3a7be93606c7c626dbfd304d2e#d3e2888c7588fe3a7be93606c7c626dbfd304d2e"
+source = "git+https://github.com/vllm-project/vllm.git?rev=60857baa53a743913d4e919f12b5fd8d608ded86#60857baa53a743913d4e919f12b5fd8d608ded86"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -6930,6 +6878,7 @@ dependencies = [
  "llm-multimodal",
  "minijinja",
  "minijinja-contrib",
+ "ndarray",
  "oss-harmony",
  "reqwest 0.13.4",
  "serde",
@@ -6956,7 +6905,7 @@ dependencies = [
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=d3e2888c7588fe3a7be93606c7c626dbfd304d2e#d3e2888c7588fe3a7be93606c7c626dbfd304d2e"
+source = "git+https://github.com/vllm-project/vllm.git?rev=60857baa53a743913d4e919f12b5fd8d608ded86#60857baa53a743913d4e919f12b5fd8d608ded86"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -6990,7 +6939,7 @@ dependencies = [
 [[package]]
 name = "vllm-llm"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=d3e2888c7588fe3a7be93606c7c626dbfd304d2e#d3e2888c7588fe3a7be93606c7c626dbfd304d2e"
+source = "git+https://github.com/vllm-project/vllm.git?rev=60857baa53a743913d4e919f12b5fd8d608ded86#60857baa53a743913d4e919f12b5fd8d608ded86"
 dependencies = [
  "easy-ext",
  "enum-as-inner",
@@ -7010,7 +6959,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=d3e2888c7588fe3a7be93606c7c626dbfd304d2e#d3e2888c7588fe3a7be93606c7c626dbfd304d2e"
+source = "git+https://github.com/vllm-project/vllm.git?rev=60857baa53a743913d4e919f12b5fd8d608ded86#60857baa53a743913d4e919f12b5fd8d608ded86"
 dependencies = [
  "itertools 0.14.0",
  "prometheus-client",
@@ -7019,7 +6968,7 @@ dependencies = [
 [[package]]
 name = "vllm-parser"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=d3e2888c7588fe3a7be93606c7c626dbfd304d2e#d3e2888c7588fe3a7be93606c7c626dbfd304d2e"
+source = "git+https://github.com/vllm-project/vllm.git?rev=60857baa53a743913d4e919f12b5fd8d608ded86#60857baa53a743913d4e919f12b5fd8d608ded86"
 dependencies = [
  "easy-ext",
  "serde",
@@ -7034,7 +6983,7 @@ dependencies = [
 [[package]]
 name = "vllm-server"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=d3e2888c7588fe3a7be93606c7c626dbfd304d2e#d3e2888c7588fe3a7be93606c7c626dbfd304d2e"
+source = "git+https://github.com/vllm-project/vllm.git?rev=60857baa53a743913d4e919f12b5fd8d608ded86#60857baa53a743913d4e919f12b5fd8d608ded86"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7060,6 +7009,7 @@ dependencies = [
  "sha2 0.10.9",
  "socket2",
  "subtle",
+ "thiserror 2.0.18",
  "thiserror-ext",
  "tls-listener",
  "tokio",
@@ -7089,7 +7039,7 @@ dependencies = [
 [[package]]
 name = "vllm-text"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=d3e2888c7588fe3a7be93606c7c626dbfd304d2e#d3e2888c7588fe3a7be93606c7c626dbfd304d2e"
+source = "git+https://github.com/vllm-project/vllm.git?rev=60857baa53a743913d4e919f12b5fd8d608ded86#60857baa53a743913d4e919f12b5fd8d608ded86"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7114,7 +7064,7 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=d3e2888c7588fe3a7be93606c7c626dbfd304d2e#d3e2888c7588fe3a7be93606c7c626dbfd304d2e"
+source = "git+https://github.com/vllm-project/vllm.git?rev=60857baa53a743913d4e919f12b5fd8d608ded86#60857baa53a743913d4e919f12b5fd8d608ded86"
 dependencies = [
  "base64 0.22.1",
  "fastokens",
@@ -7122,10 +7072,11 @@ dependencies = [
  "rustc-hash 1.1.0",
  "serde",
  "serde_json",
- "tekken-rs",
+ "smallvec",
+ "tekken",
  "thiserror 2.0.18",
  "thiserror-ext",
- "tiktoken-rs 0.9.1",
+ "tiktoken-rs",
  "tokenizers",
  "tracing",
 ]
@@ -7395,7 +7346,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

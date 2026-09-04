@@ -35,8 +35,8 @@ use crate::nvfp4::QuantSource;
 /// redemption, prefetch join and unmap fall between them, and the allocations
 /// submitted under `record_api_wall_ms` execute under
 /// `execute_and_drain_wall_ms`. `elapsed_ms` is the submission total: it
-/// samples when the call returns, after the A4B expert kernels are enqueued
-/// but without draining them.
+/// samples when the call returns, after the A4B expert kernels have drained
+/// on the loader stream; the unmap's host cost overlaps that drain.
 struct LoadStats {
     /// Every required tensor at its dtype.
     manifest_bytes: usize,
@@ -519,6 +519,11 @@ impl Gemma4Weights {
         // once an executor wants it too.
         drop(mmaps);
 
+        // The expert kernels ran on this stream while the unmap paid its host cost.
+        // Every later weight consumer uses another stream, so this drain is the handoff.
+        ctx.sync()
+            .map_err(|e| anyhow::anyhow!("Gemma 4: cannot drain the expert kernels: {e}"))?;
+
         let stats = LoadStats {
             manifest_bytes,
             device_bytes: free_before as i64 - device_free_bytes as i64,
@@ -533,7 +538,7 @@ impl Gemma4Weights {
             "Gemma 4 weights resident: {:.2} GiB manifest, {:.2} GiB device, {:.2} GiB free, \
              {} modality tensors skipped; \
              {:.0} ms submission total, of which {:.0} validate, {:.0} record-api, \
-             {:.0} execute-and-drain (expert kernels enqueued, not drained)",
+             {:.0} execute-and-drain (expert kernels drained)",
             gib(stats.manifest_bytes as i64),
             gib(stats.device_bytes),
             gib(stats.device_free_bytes as i64),

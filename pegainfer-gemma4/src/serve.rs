@@ -705,11 +705,6 @@ impl StepArena {
     pub(crate) fn invalidate_decode_fingerprint(&mut self) {
         self.steady = None;
     }
-
-    #[cfg(test)]
-    pub(crate) fn has_decode_fingerprint(&self) -> bool {
-        self.steady.is_some()
-    }
 }
 
 /// How many pseudo-requests the global decode read presents each request

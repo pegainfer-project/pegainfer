@@ -31,7 +31,7 @@ impl ModelLine for Gemma4Line {
                 ..EngineLoadOptions::default()
             },
         )
-        .map(LaunchedEngine::Handle)
+        .map(LaunchedEngine::Stepped)
     }
 }
 

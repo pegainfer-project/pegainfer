@@ -14,7 +14,6 @@ gemma4 = [
   "dep:pegainfer-core",
   "dep:pegainfer-kernels",
   "dep:pegainfer-sample",
-  "dep:tokio",
 ]
 default = []
 
@@ -27,14 +26,12 @@ pegainfer-core = { workspace = true, optional = true }
 pegainfer-frontend = { workspace = true }
 pegainfer-kernels = { workspace = true, features = ["gemma4"], optional = true }
 pegainfer-sample = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["sync"], optional = true }
 safetensors = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

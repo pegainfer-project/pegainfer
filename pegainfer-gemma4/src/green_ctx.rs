@@ -35,6 +35,12 @@ pub(crate) struct PrefillLaneStream {
     green: Option<GreenContexts>,
 }
 
+// SAFETY: the stream and green-context handles are process-wide CUDA driver
+// objects with no thread affinity. The lane is built on the launching thread
+// and handed to the scheduler thread with the rest of the engine state, which
+// is its only user from then on; nothing here is shared or aliased.
+unsafe impl Send for PrefillLaneStream {}
+
 impl PrefillLaneStream {
     /// A plain primary-context stream — both engines share every SM.
     pub(crate) fn shared() -> Result<Self> {

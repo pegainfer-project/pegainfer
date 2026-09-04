@@ -1,4 +1,5 @@
-//! The Gemma 4 engine: one owned thread with iteration-level scheduling.
+//! The Gemma 4 engine: one contract-driven scheduler with iteration-level
+//! scheduling.
 //! Prefill runs at the step boundary, whole unless the chunk knob splits it
 //! (the overlap lane always prefills whole);
 //! every active request then
@@ -15,16 +16,20 @@ use pegainfer_core::kv_pool::KvStorage;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::Engine;
+use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::QueuedRequest;
+use pegainfer_frontend::engine::RejectReason;
+use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::RequestLedger;
+use pegainfer_frontend::engine::Scheduler;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::TokenLogprob;
-use pegainfer_frontend::engine::unix_now_s;
+use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_sample::LogprobRequest;
 use pegainfer_sample::SampleScratch;
-use tokio::sync::mpsc;
 
 use crate::forward::MULTIMODAL_PLACEHOLDER_IDS;
 use crate::kv::GemmaKv;
@@ -254,7 +259,7 @@ impl CoalesceDoor {
     }
 }
 
-pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<EngineHandle> {
+pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<Engine> {
     let dir = model_path
         .to_str()
         .context("model path is not valid UTF-8")?
@@ -274,97 +279,23 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
 
     let policy = generation_policy(&dir)?;
 
-    let (submit_tx, mut submit_rx) =
-        mpsc::unbounded_channel::<pegainfer_frontend::engine::SubmittedRequest>();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<usize>>();
-    let join = std::thread::Builder::new()
-        .name("gemma4-engine".into())
-        .spawn(move || {
-            let state = EngineState::load(&dir, device, policy, base_seed, graph_enabled);
-            let mut state = match state {
-                Ok(state) => {
-                    let _ = ready_tx.send(Ok(state.max_context));
-                    state
-                }
-                Err(err) => {
-                    let _ = ready_tx.send(Err(err));
-                    return;
-                }
-            };
-            let mut pending: VecDeque<Submitted> = VecDeque::new();
-            let mut active: Vec<Active> = Vec::new();
-            let mut disconnected = false;
-            let mut door = state.coalesce_door();
-            'engine: loop {
-                loop {
-                    match submit_rx.try_recv() {
-                        Ok(item) => pending.push_back(item),
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            disconnected = true;
-                            break;
-                        }
-                    }
-                }
-                // Join a finished overlapped prefill: poll while other work
-                // exists, block on the lane when it is the only work left.
-                let lane_ready = match state.lane.as_mut() {
-                    Some(lane) if lane.inflight.is_some() => {
-                        let lane_is_only_work = active.is_empty() && pending.is_empty();
-                        if lane_is_only_work {
-                            lane.drain_or_abort();
-                        }
-                        lane_is_only_work || lane.inflight_complete()
-                    }
-                    _ => false,
-                };
-                if lane_ready {
-                    state.join_async_prefill(&mut active);
-                }
-                if active.is_empty()
-                    && pending.is_empty()
-                    && state
-                        .lane
-                        .as_ref()
-                        .is_none_or(|lane| lane.inflight.is_none())
-                {
-                    if disconnected {
-                        break 'engine;
-                    }
-                    match submit_rx.blocking_recv() {
-                        Some(item) => pending.push_back(item),
-                        None => break 'engine,
-                    }
-                }
-                // A request that finishes inside its own prefill never takes
-                // a slot, so slot occupancy alone does not bound this loop:
-                // a backlog of one-token requests would prefill in full
-                // before the next decode round and stall every stream in
-                // flight for its whole length. Bound the attempts too, so a
-                // burst costs the streams a bounded number of prefills per
-                // token however deep it is.
-                state.intake_turn(
-                    &mut door,
-                    &mut pending,
-                    &mut active,
-                    std::time::Instant::now(),
-                );
-                if !active.is_empty() {
-                    state.decode_round(&mut active);
-                }
-            }
-        })
-        .context("spawn gemma4 engine thread")?;
-    let servable = ready_rx
-        .recv()
-        .context("gemma4 engine thread died during load")??;
+    let state = EngineState::load(&dir, device, policy, base_seed, graph_enabled)?;
+    let servable = state.max_context;
     // Publishing the real ceiling is what lets the frontend refuse an
     // over-length request with its own message instead of forwarding one the
     // engine can only fail mid-stream.
     // The ceiling domain keeps the value inside i32, so this API-boundary
     // conversion cannot fail.
     let servable = u32::try_from(servable).expect("ceiling domain holds servable inside u32");
-    Ok(EngineHandle::new_with_join_handle(submit_tx, join).with_servable_len(servable))
+    let scheduler = Gemma4Scheduler::new(state);
+    Ok(Engine {
+        schedulers: vec![spawn_scheduler("gemma4-engine", scheduler)],
+        info: EngineInfo {
+            kv_capacity: None,
+            servable_len: Some(servable),
+        },
+        lora: None,
+    })
 }
 
 struct GenerationPolicy {
@@ -434,8 +365,6 @@ fn token_ids(value: &serde_json::Value) -> Result<Vec<u32>> {
     }
 }
 
-type Submitted = pegainfer_frontend::engine::SubmittedRequest;
-
 /// Overlapped admission: with the lane on, a prompt arriving into a live
 /// decode batch prefills on its own stream while decode steps keep
 /// replaying on `ctx.stream` — the admission costs the streams a slowdown
@@ -446,7 +375,7 @@ type Submitted = pegainfer_frontend::engine::SubmittedRequest;
 /// event fires: the request, its KV, and the pass owning every device
 /// buffer the in-flight kernels still read.
 struct InflightPrefill {
-    request: GenerateRequest,
+    request: QueuedRequest,
     kv: GemmaKv,
     pass: crate::serve::PrefillPass,
     /// The cache entry this request resumed from, if any — its stale
@@ -483,84 +412,79 @@ impl AsyncPrefillLane {
     }
 
     /// True once the in-flight prefill's event has fired. An unexpected
-    /// query error aborts: the pass's buffers may still be in use and no
-    /// safe recovery exists.
-    fn inflight_complete(&self) -> bool {
+    /// query error is engine-fatal: the driver writes off every request and
+    /// exits instead of guessing whether the pass is safe to join.
+    fn inflight_complete(&self) -> Result<bool> {
         debug_assert!(self.inflight.is_some());
         let query = unsafe { cudarc::driver::sys::cuEventQuery(self.event.cu_event()) };
         match query {
-            cudarc::driver::sys::CUresult::CUDA_SUCCESS => true,
-            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => false,
-            other => {
-                log::error!("FATAL: cuEventQuery(prefill) failed ({other:?}); aborting");
-                std::process::abort();
-            }
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS => Ok(true),
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => Ok(false),
+            other => anyhow::bail!("cuEventQuery(prefill) failed ({other:?})"),
         }
     }
 
-    /// Block until the lane stream is drained; abort on failure rather
-    /// than let the pass's buffers be reused under in-flight kernels.
-    fn drain_or_abort(&self) {
+    /// Block until the lane stream is drained. Failure is returned to
+    /// `Scheduler::step` as an engine-fatal error.
+    fn drain(&self) -> Result<()> {
         let sync = unsafe { cudarc::driver::sys::cuStreamSynchronize(self.stream.stream) };
-        if sync != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            log::error!("FATAL: cuStreamSynchronize(prefill) failed ({sync:?}); aborting");
-            std::process::abort();
-        }
+        anyhow::ensure!(
+            sync == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "cuStreamSynchronize(prefill) failed ({sync:?})"
+        );
+        Ok(())
     }
 }
 
 impl Drop for AsyncPrefillLane {
     fn drop(&mut self) {
-        self.drain_or_abort();
+        if let Err(error) = self.drain() {
+            log::error!("prefill lane teardown failed: {error:#}");
+        }
     }
 }
 
 /// The fail-closed request validation every admission path shares; `Err`
-/// carries the rejection message. The contract refuses every capability
-/// this engine does not implement — echo, a frontend-resolved prefix, P/D
-/// transfer metadata, a multi-partition placement — loudly, not silently.
-fn validate_request(
-    request: &GenerateRequest,
-    prefix_hit_tokens: usize,
-    max_context: usize,
-) -> Result<usize, String> {
+/// carries the typed refusal. Refuse every unsupported capability carried by
+/// the stepped `Request` (echo, LoRA and P/D transfer metadata) rather than
+/// silently ignoring it. Legacy frontend-resolved prefixes and DP ranks are
+/// not fields on this contract; scheduler placement consumes the latter.
+fn validate_request(request: &Request, max_context: usize) -> Result<usize, RejectReason> {
     let prompt_tokens = request.prompt_tokens.len();
     if prompt_tokens == 0 {
-        return Err("empty prompt".into());
+        return Err(RejectReason::Unsupported {
+            feature: "empty prompts".into(),
+        });
     }
     if request.max_tokens == 0 {
-        return Err("max_tokens must be positive".into());
+        return Err(RejectReason::Unsupported {
+            feature: "zero max_tokens".into(),
+        });
     }
     let Some(context_len) = prompt_tokens
         .checked_add(request.max_tokens)
         .filter(|len| *len <= max_context)
     else {
-        return Err(format!(
-            "prompt {prompt_tokens} + max_tokens {} exceeds the serving ceiling {max_context}",
-            request.max_tokens
-        ));
+        return Err(RejectReason::ContextLength {
+            prompt_tokens,
+            max_tokens: request.max_tokens,
+            limit: max_context,
+        });
     };
     if request.lora_adapter.is_some() {
-        return Err("gemma4 has no LoRA support".into());
+        return Err(RejectReason::Unsupported {
+            feature: "LoRA".into(),
+        });
     }
     if request.echo {
-        return Err("gemma4 does not echo the prompt".into());
-    }
-    if prefix_hit_tokens > 0 {
-        return Err(format!(
-            "gemma4 resolves its own prefix cache; refusing a frontend resolution claiming \
-             {prefix_hit_tokens} cached tokens"
-        ));
+        return Err(RejectReason::Unsupported {
+            feature: "echo".into(),
+        });
     }
     if request.kv_transfer_params.is_some() {
-        return Err("gemma4 has no P/D transfer support; kv_transfer_params refused".into());
-    }
-    if let Some(rank) = request.data_parallel_rank {
-        if rank != 0 {
-            return Err(format!(
-                "gemma4 is single-partition; data_parallel_rank {rank} refused"
-            ));
-        }
+        return Err(RejectReason::Unsupported {
+            feature: "kv_transfer".into(),
+        });
     }
     Ok(context_len)
 }
@@ -615,12 +539,22 @@ const MIX_GATHER_ROWS: usize = 512;
 /// One prompt mid-walk: its unseen suffix begins at `offset`, and `first`
 /// holds the token its final segment sampled until the walker graduates.
 struct Walker {
-    request: GenerateRequest,
+    request: QueuedRequest,
     kv: GemmaKv,
     resumed: Option<u64>,
     offset: usize,
     first: Option<(u32, Option<TokenLogprob>)>,
     failed: bool,
+}
+
+/// Persistent chunked-admission state. One scheduler step advances one round:
+/// the contract driver commits the ledger once per step, so running the whole
+/// walk inside one call would withhold every live stream's tokens until all
+/// prompt suffixes had completed.
+struct Walk {
+    walkers: Vec<Walker>,
+    chunk: usize,
+    first_round: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -635,7 +569,7 @@ enum ReservationDecision {
     Refused(String),
 }
 
-type Newcomer = (GenerateRequest, GemmaKv, Option<u64>);
+type Newcomer = (QueuedRequest, GemmaKv, Option<u64>);
 
 #[derive(Clone, Copy)]
 struct NewcomerOptions {
@@ -648,7 +582,7 @@ struct NewcomerOptions {
 enum PreparedNewcomer {
     Ready(Newcomer, usize),
     Done,
-    Requeue(Submitted),
+    Requeue(QueuedRequest),
 }
 
 /// One row of a step's sampler call. A mid-walk segment's row is sampled and
@@ -743,14 +677,17 @@ fn capture_prefix(
 }
 
 /// Retire the whole live batch: a step that could not run leaves no row a token.
-fn fail_active_batch(active: &mut Vec<Active>, what: &str, err: &anyhow::Error) {
+fn fail_active_batch(
+    active: &mut Vec<Active>,
+    what: &str,
+    err: &anyhow::Error,
+    ledger: &mut RequestLedger,
+) {
     log::error!("{what} failed: {err:#}");
     for entry in active.drain(..) {
-        let _ = entry.request.token_tx.send(TokenEvent::Error {
-            message: format!("{what} failed: {err:#}"),
-            prompt_tokens: entry.prompt_tokens,
-            completion_tokens: entry.emitted,
-        });
+        if ledger.is_active(entry.request.id) {
+            ledger.fail(entry.request.id, format!("{what} failed: {err:#}"));
+        }
     }
 }
 
@@ -768,13 +705,14 @@ fn mixed_head_flow(
     head: &[SampleRow<'_>],
     active: &mut Vec<Active>,
     logits: &mut HiddenStates,
-) -> Result<SampledRows, String> {
+    ledger: &mut RequestLedger,
+) -> Result<SampledRows> {
     let k = head.len();
     let sampled = {
         let rows: Vec<SampleRow<'_>> = head
             .iter()
             .copied()
-            .chain(active.iter().map(Active::sample_row))
+            .chain(active.iter().map(|entry| entry.sample_row(ledger)))
             .collect();
         sample_logits_rows(
             ctx,
@@ -790,43 +728,41 @@ fn mixed_head_flow(
     let mut sampled = match sampled {
         Ok(sampled) => sampled,
         Err(err) => {
-            fail_active_batch(active, "mixed step", &err);
-            return Err(format!("mixed step failed: {err:#}"));
+            fail_active_batch(active, "mixed step", &err, ledger);
+            return Err(err.context("mixed step"));
         }
     };
     // Active rows: the decode-round event flow, `k` logits rows up.
-    emit_decode_rows(active, &mut sampled, k);
+    emit_decode_rows(active, &mut sampled, k, ledger);
     Ok(sampled)
 }
 
 /// One in-flight request between decode steps: its KV, the token that feeds
 /// the next step, and its progress counters.
 struct Active {
-    request: GenerateRequest,
+    request: QueuedRequest,
     kv: GemmaKv,
     next: u32,
-    emitted: usize,
-    prompt_tokens: usize,
     /// The row has finished while a speculative step over its slot is still
     /// in flight and retires when that step drains.
     stopping: bool,
 }
 
 impl Active {
-    fn sample_row(&self) -> SampleRow<'_> {
+    fn sample_row(&self, ledger: &RequestLedger) -> SampleRow<'_> {
         SampleRow {
-            params: &self.request.params,
-            step: self.emitted as u64,
-            logprobs: self.request.logprobs,
-            ignore_eos: self.request.params.ignore_eos,
+            params: &self.request.request.params,
+            step: ledger.completion_tokens(self.request.id) as u64,
+            logprobs: self.request.request.logprobs,
+            ignore_eos: self.request.request.params.ignore_eos,
         }
     }
 
-    fn settle_staged(&mut self, policy: &GenerationPolicy, token: u32) {
+    fn settle_staged(&mut self, policy: &GenerationPolicy, token: u32, ledger: &mut RequestLedger) {
         if self.stopping {
             return;
         }
-        let stop = policy.stops(token, self.request.params.ignore_eos);
+        let stop = policy.stops(token, self.request.request.params.ignore_eos);
         self.stopping = deliver_decode_row(
             self,
             DecodeToken {
@@ -834,6 +770,7 @@ impl Active {
                 logprob: None,
                 stop,
             },
+            ledger,
         );
     }
 }
@@ -851,36 +788,23 @@ enum Admitted {
     /// Finished, refused, cancelled or failed: nothing carries forward.
     Done,
     /// The pools cannot hold it right now; retry once pages return.
-    Requeue(Box<Submitted>),
+    Requeue(Box<QueuedRequest>),
 }
 
-fn send_scheduled(request: &GenerateRequest, prompt_tokens: usize, cached_tokens: usize) -> bool {
-    request
-        .token_tx
-        .send(TokenEvent::Scheduled {
-            queued_at_unix_s: request.queued_at_unix_s.unwrap_or_else(unix_now_s),
-            scheduled_at_unix_s: unix_now_s(),
-            prompt_tokens,
-            cached_tokens,
-        })
-        .is_ok()
-}
-
-fn reject_newcomer(request: &GenerateRequest, message: String) {
-    let prompt_tokens = request.prompt_tokens.len();
-    if send_scheduled(request, prompt_tokens, 0) {
-        let _ = request.token_tx.send(TokenEvent::Rejected {
-            message,
-            prompt_tokens,
-            completion_tokens: 0,
-        });
+fn send_scheduled(request: &QueuedRequest, cached_tokens: usize, ledger: &mut RequestLedger) {
+    ledger.admit(request.id);
+    if cached_tokens > 0 {
+        ledger.set_cached_tokens(request.id, cached_tokens);
     }
 }
 
-/// Everything the engine thread owns for the life of the process. CUDA state
-/// is thread-affine, so it is built here rather than handed in: a context or
-/// cuBLAS handle minted on the caller thread fails with invalid-handle on the
-/// first GEMM.
+fn reject_newcomer(request: &QueuedRequest, reason: RejectReason, ledger: &mut RequestLedger) {
+    ledger.reject(request.id, reason);
+}
+
+/// Everything the contract-owned scheduler thread owns for the life of the
+/// engine. Loading completes before the driver thread is spawned, so launch
+/// failures return synchronously to the caller.
 struct EngineState {
     ctx: DeviceContext,
     serve: GemmaServe,
@@ -919,6 +843,61 @@ struct EngineState {
     admit_coalesce: Option<std::time::Duration>,
 }
 
+/// The scheduler thread is not the thread that loaded the engine: the
+/// primary context must be made current there and the thread-local cuBLAS
+/// handles created, or the first eager GEMM fails with an invalid handle.
+/// Same three steps the Qwen3 model thread takes; the returned guard tears
+/// the handles down when the scheduler drops on that thread.
+fn bind_engine_thread(ctx: &DeviceContext) -> Result<CublasThreadGuard> {
+    let err = unsafe { pegainfer_core::ffi::cuda_set_device(ctx.device_ordinal as i32) };
+    anyhow::ensure!(
+        err == 0,
+        "cudaSetDevice({}) on the scheduler thread failed: cudaError={err}",
+        ctx.device_ordinal
+    );
+    ctx.ctx
+        .bind_to_thread()
+        .map_err(|e| anyhow::anyhow!("bind the CUDA context to the scheduler thread: {e}"))?;
+    unsafe { pegainfer_core::ffi::cublas_init() };
+    Ok(CublasThreadGuard)
+}
+
+/// Destroys the thread-local cuBLAS handles [`bind_engine_thread`] created.
+/// The scheduler holds it so the drop lands on the driver thread that owns
+/// the handles, once the engine state has released its device work.
+struct CublasThreadGuard;
+
+impl Drop for CublasThreadGuard {
+    fn drop(&mut self) {
+        unsafe { pegainfer_core::ffi::cublas_destroy() };
+    }
+}
+
+struct Gemma4Scheduler {
+    state: EngineState,
+    pending: VecDeque<QueuedRequest>,
+    active: Vec<Active>,
+    door: Option<CoalesceDoor>,
+    walk: Option<Walk>,
+    /// `Some` once the driver thread has bound the context; declared last so
+    /// the handles outlive the engine state's teardown.
+    cublas: Option<CublasThreadGuard>,
+}
+
+impl Gemma4Scheduler {
+    fn new(state: EngineState) -> Self {
+        let door = state.coalesce_door();
+        Self {
+            state,
+            pending: VecDeque::new(),
+            active: Vec::new(),
+            door,
+            walk: None,
+            cublas: None,
+        }
+    }
+}
+
 impl EngineState {
     fn coalesce_door(&self) -> Option<CoalesceDoor> {
         self.admit_coalesce.map(CoalesceDoor::new)
@@ -927,17 +906,19 @@ impl EngineState {
     fn intake_turn(
         &mut self,
         door: &mut Option<CoalesceDoor>,
-        pending: &mut VecDeque<Submitted>,
+        pending: &mut VecDeque<QueuedRequest>,
         active: &mut Vec<Active>,
+        walk: &mut Option<Walk>,
         now: std::time::Instant,
-    ) -> bool {
+        ledger: &mut RequestLedger,
+    ) -> Result<bool> {
         let open = door
             .as_mut()
             .is_none_or(|door| door.opens(pending.len(), active.len(), self.slots, now));
         if open {
-            self.admit_from_queue(pending, active);
+            self.admit_from_queue(pending, active, walk, ledger)?;
         }
-        open
+        Ok(open)
     }
 
     fn reserve_with_eviction(
@@ -983,7 +964,7 @@ impl EngineState {
         }
     }
 
-    fn resolve_newcomer_kv(&mut self, request: &GenerateRequest) -> (GemmaKv, Option<u64>) {
+    fn resolve_newcomer_kv(&mut self, request: &Request) -> (GemmaKv, Option<u64>) {
         match self
             .prefix_cache
             .as_mut()
@@ -1000,25 +981,30 @@ impl EngineState {
         }
     }
 
-    fn prepare_newcomer(&mut self, item: Submitted, options: NewcomerOptions) -> PreparedNewcomer {
-        let (request, prefix) = item;
-        if request.token_tx.is_closed() {
+    fn prepare_newcomer(
+        &mut self,
+        request: QueuedRequest,
+        options: NewcomerOptions,
+        ledger: &mut RequestLedger,
+    ) -> PreparedNewcomer {
+        if ledger.is_aborted(request.id) {
+            ledger.retire(request.id);
             return PreparedNewcomer::Done;
         }
-        let context_len = match validate_request(&request, prefix.hit_tokens(), self.max_context) {
+        let context_len = match validate_request(&request.request, self.max_context) {
             Ok(len) => len,
-            Err(message) => {
-                reject_newcomer(&request, message);
+            Err(reason) => {
+                reject_newcomer(&request, reason, ledger);
                 return PreparedNewcomer::Done;
             }
         };
-        let (mut kv, resumed) = self.resolve_newcomer_kv(&request);
-        let new_tokens = request.prompt_tokens.len() - kv.local.seq_len();
+        let (mut kv, resumed) = self.resolve_newcomer_kv(&request.request);
+        let new_tokens = request.request.prompt_tokens.len() - kv.local.seq_len();
         if options
             .max_new_tokens
             .is_some_and(|limit| new_tokens > limit)
         {
-            return PreparedNewcomer::Requeue((request, prefix));
+            return PreparedNewcomer::Requeue(request);
         }
         let need = if options.reserve_whole {
             AdmissionNeed::Tokens(new_tokens)
@@ -1028,17 +1014,22 @@ impl EngineState {
         match self.reserve_with_eviction(&mut kv, need, options.evict_cache, options.can_wait) {
             ReservationDecision::Ready => {}
             ReservationDecision::Requeue => {
-                return PreparedNewcomer::Requeue((request, prefix));
+                return PreparedNewcomer::Requeue(request);
             }
             ReservationDecision::Refused(message) => {
-                reject_newcomer(&request, message);
+                log::warn!("gemma4 KV admission refused {}: {message}", request.id);
+                reject_newcomer(
+                    &request,
+                    RejectReason::KvBudget {
+                        prompt_tokens: request.request.prompt_tokens.len(),
+                        worst_case_tokens: context_len,
+                    },
+                    ledger,
+                );
                 return PreparedNewcomer::Done;
             }
         }
-        let prompt_tokens = request.prompt_tokens.len();
-        if !send_scheduled(&request, prompt_tokens, kv.local.seq_len()) {
-            return PreparedNewcomer::Done;
-        }
+        send_scheduled(&request, kv.local.seq_len(), ledger);
         PreparedNewcomer::Ready((request, kv, resumed), new_tokens)
     }
 
@@ -1176,8 +1167,10 @@ impl EngineState {
                 sampler_graphs.push(graph);
                 bucket *= 2;
             }
-            ctx.sync()?;
         }
+        // The KV pools, arena and warm passes were enqueued on this stream. The lane
+        // stream and everything after it must see them complete, graphs or not.
+        ctx.sync()?;
         let lane = lane_mode
             .map(|mode| AsyncPrefillLane::new(&ctx, mode))
             .transpose()?;
@@ -1206,9 +1199,15 @@ impl EngineState {
     /// request has to wait for pages. Attempts are bounded so a burst
     /// costs the streams a bounded number of prefills per token however
     /// deep the queue is.
-    fn admit_from_queue(&mut self, pending: &mut VecDeque<Submitted>, active: &mut Vec<Active>) {
+    fn admit_from_queue(
+        &mut self,
+        pending: &mut VecDeque<QueuedRequest>,
+        active: &mut Vec<Active>,
+        walk: &mut Option<Walk>,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
         if pending.is_empty() {
-            return;
+            return Ok(());
         }
         let mut attempts = 0;
         while attempts < self.slots && active.len() < self.slots {
@@ -1226,7 +1225,15 @@ impl EngineState {
             };
             attempts += 1;
             let can_wait = !active.is_empty();
-            match self.admit_and_prefill(item, can_wait, active, pending, &mut attempts) {
+            match self.admit_and_prefill(
+                item,
+                can_wait,
+                active,
+                pending,
+                walk,
+                &mut attempts,
+                ledger,
+            )? {
                 Admitted::Active(request) => active.push(*request),
                 Admitted::Done => {}
                 Admitted::Requeue(item) => {
@@ -1234,7 +1241,11 @@ impl EngineState {
                     break;
                 }
             }
+            if walk.is_some() {
+                break;
+            }
         }
+        Ok(())
     }
 
     /// Validate and admit one request. The synchronous arms prefill it, emit
@@ -1245,12 +1256,14 @@ impl EngineState {
     /// the queue head.
     fn admit_and_prefill(
         &mut self,
-        item: Submitted,
+        item: QueuedRequest,
         can_wait: bool,
         active: &mut Vec<Active>,
-        pending: &mut VecDeque<Submitted>,
+        pending: &mut VecDeque<QueuedRequest>,
+        walk: &mut Option<Walk>,
         attempts: &mut usize,
-    ) -> Admitted {
+        ledger: &mut RequestLedger,
+    ) -> Result<Admitted> {
         // The lane prefills whole on its own stream, so a lane-bound
         // admission still reserves everything up front. A chunked
         // admission reserves nothing here: every segment admits its own
@@ -1264,13 +1277,12 @@ impl EngineState {
             can_wait,
             max_new_tokens: None,
         };
-        let (request, mut kv, resumed) = match self.prepare_newcomer(item, options) {
+        let (request, mut kv, resumed) = match self.prepare_newcomer(item, options, ledger) {
             PreparedNewcomer::Ready(newcomer, _) => newcomer,
-            PreparedNewcomer::Done => return Admitted::Done,
-            PreparedNewcomer::Requeue(item) => return Admitted::Requeue(Box::new(item)),
+            PreparedNewcomer::Done => return Ok(Admitted::Done),
+            PreparedNewcomer::Requeue(item) => return Ok(Admitted::Requeue(Box::new(item))),
         };
-        let prompt_tokens = request.prompt_tokens.len();
-        let sink = request.token_tx.clone();
+        let prompt_tokens = request.request.prompt_tokens.len();
 
         // Overlapped admission: the prefill launches onto the lane stream
         // and this call returns immediately — decode steps continue while it
@@ -1278,7 +1290,7 @@ impl EngineState {
         // path: there is nothing to protect, and full-SM speed wins the head
         // of every refill burst.
         if self.lane.is_some() && !active.is_empty() {
-            return self.launch_async_prefill(request, kv, resumed);
+            return self.launch_async_prefill(request, kv, resumed, ledger);
         }
 
         // Mixed admission: with a live decode batch, prompts ride its
@@ -1286,8 +1298,8 @@ impl EngineState {
         // advances every active row.
         if !active.is_empty() {
             self.arena.invalidate_decode_fingerprint();
-            self.drain_pipeline(active);
-            self.ready_decode_rows(active);
+            self.drain_pipeline(active, ledger)?;
+            self.ready_decode_rows(active, ledger);
             if !active.is_empty() {
                 // Gather more admissible prompts into the same step. A
                 // pool-refused or over-budget candidate returns to the queue
@@ -1323,7 +1335,7 @@ impl EngineState {
                             .is_none()
                             .then(|| MIX_GATHER_ROWS - rows_budget),
                     };
-                    match self.prepare_newcomer(candidate, options) {
+                    match self.prepare_newcomer(candidate, options, ledger) {
                         PreparedNewcomer::Ready(newcomer, new_tokens) => {
                             rows_budget += new_tokens;
                             newcomers.push(newcomer);
@@ -1335,18 +1347,10 @@ impl EngineState {
                         }
                     }
                 }
-                return self.mixed_admission(newcomers, active);
+                return self.mixed_admission(newcomers, active, walk, ledger);
             }
         }
 
-        let fail = |message: String| {
-            let _ = sink.send(TokenEvent::Error {
-                message,
-                prompt_tokens,
-                completion_tokens: 0,
-            });
-            Admitted::Done
-        };
         // A solo admission starts a new roster: the fingerprint the retired
         // one left would otherwise pass a new request whose frontier and
         // page structure happen to line up, and its first step would keep
@@ -1355,41 +1359,48 @@ impl EngineState {
         // Under the chunk knob a solo prompt walks its own segments too:
         // residency stays window plus segment whatever the prompt length.
         let stepped = if let Some(chunk) = self.mix_chunk {
-            self.walk_plain_prompt(&mut kv, &request.prompt_tokens, chunk)
+            self.walk_plain_prompt(&mut kv, &request.request.prompt_tokens, chunk)
         } else {
             let resume = kv.local.seq_len();
             self.serve
-                .step(&self.ctx, &mut kv, &request.prompt_tokens[resume..])
+                .step(&self.ctx, &mut kv, &request.request.prompt_tokens[resume..])
         };
         let mut logits = match stepped {
             Ok(logits) => logits,
-            Err(err) => return fail(format!("{err:#}")),
+            Err(err) => {
+                // This prompt's prefill failed; its pages return with `kv`
+                // and the engine keeps serving.
+                log::error!("gemma4 solo prefill failed: {err:#}");
+                ledger.fail(request.id, format!("prefill failed: {err:#}"));
+                return Ok(Admitted::Done);
+            }
         };
         capture_prefix(
             &self.ctx,
             &self.serve,
             &mut self.prefix_cache,
             &kv,
-            &request.prompt_tokens,
+            &request.request.prompt_tokens,
             resumed,
         );
-        self.first_token_flow(request, kv, &mut logits)
+        Ok(self.first_token_flow(request, kv, &mut logits, ledger))
     }
 
     /// Sample and settle a prefill's first token from logits row 0 — the
     /// shared tail of a sync admission and an overlapped-prefill join.
     fn first_token_flow(
         &mut self,
-        request: GenerateRequest,
+        request: QueuedRequest,
         kv: GemmaKv,
         logits: &mut HiddenStates,
+        ledger: &mut RequestLedger,
     ) -> Admitted {
         let sampled = {
             let rows = [SampleRow {
-                params: &request.params,
+                params: &request.request.params,
                 step: 0,
-                logprobs: request.logprobs,
-                ignore_eos: request.params.ignore_eos,
+                logprobs: request.request.logprobs,
+                ignore_eos: request.request.params.ignore_eos,
             }];
             sample_logits_rows(
                 &self.ctx,
@@ -1405,11 +1416,8 @@ impl EngineState {
         let mut sampled = match sampled {
             Ok(sampled) => sampled,
             Err(err) => {
-                let _ = request.token_tx.send(TokenEvent::Error {
-                    message: format!("{err:#}"),
-                    prompt_tokens: request.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
+                log::error!("gemma4 first-token sampling failed: {err:#}");
+                ledger.fail(request.id, format!("first-token sampling failed: {err:#}"));
                 return Admitted::Done;
             }
         };
@@ -1419,6 +1427,7 @@ impl EngineState {
             kv,
             sampled.picked[0],
             sampled.logprobs[0].take(),
+            ledger,
         ) {
             Some(entry) => Admitted::Active(Box::new(entry)),
             None => Admitted::Done,
@@ -1431,10 +1440,11 @@ impl EngineState {
     /// written by a stale kernel.
     fn launch_async_prefill(
         &mut self,
-        request: GenerateRequest,
+        request: QueuedRequest,
         mut kv: GemmaKv,
         resumed: Option<u64>,
-    ) -> Admitted {
+        ledger: &mut RequestLedger,
+    ) -> Result<Admitted> {
         let lane = self.lane.as_mut().expect("gated by the caller");
         debug_assert!(lane.inflight.is_none());
         // A restored prefix is already in the KV: the lane prefills only the
@@ -1444,8 +1454,11 @@ impl EngineState {
             let _guard = unsafe {
                 pegainfer_core::tensor::StreamOverrideGuard::activate(lane.stream.stream)
             };
-            self.serve
-                .prefill_into_logits(&self.ctx, &mut kv, &request.prompt_tokens[resume..])
+            self.serve.prefill_into_logits(
+                &self.ctx,
+                &mut kv,
+                &request.request.prompt_tokens[resume..],
+            )
         };
         let recorded = launched.and_then(|pass| {
             lane.stream
@@ -1460,17 +1473,16 @@ impl EngineState {
                     pass,
                     resumed,
                 });
-                Admitted::Done
+                Ok(Admitted::Done)
             }
             Err(err) => {
+                // This prompt's launch failed. Drain the lane so no stale
+                // kernel can write the pages `kv` returns, fail the request,
+                // keep serving; only a failed drain is engine-fatal.
                 log::error!("gemma4 async prefill launch failed: {err:#}");
-                lane.drain_or_abort();
-                let _ = request.token_tx.send(TokenEvent::Error {
-                    message: format!("prefill failed: {err:#}"),
-                    prompt_tokens: request.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
-                Admitted::Done
+                lane.drain()?;
+                ledger.fail(request.id, format!("prefill failed: {err:#}"));
+                Ok(Admitted::Done)
             }
         }
     }
@@ -1478,20 +1490,24 @@ impl EngineState {
     /// Join a completed overlapped prefill: run the deferred window
     /// release, capture into the prefix cache, and take the first-token
     /// flow the sync path uses.
-    fn join_async_prefill(&mut self, active: &mut Vec<Active>) {
+    fn join_async_prefill(
+        &mut self,
+        active: &mut Vec<Active>,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
         if self
             .lane
             .as_ref()
             .is_some_and(|lane| lane.inflight.is_some())
         {
             self.arena.invalidate_decode_fingerprint();
-            self.drain_pipeline(active);
+            self.drain_pipeline(active, ledger)?;
         }
         let Some(lane) = self.lane.as_mut() else {
-            return;
+            return Ok(());
         };
         let Some(inflight) = lane.inflight.take() else {
-            return;
+            return Ok(());
         };
         let InflightPrefill {
             request,
@@ -1499,40 +1515,41 @@ impl EngineState {
             mut pass,
             resumed,
         } = inflight;
+        if ledger.is_aborted(request.id) {
+            ledger.retire(request.id);
+            return Ok(());
+        }
         // The frontier after any prefill equals the prompt length; a lane
         // pass that processed the wrong suffix cannot pass this gate.
-        if kv.local.seq_len() != request.prompt_tokens.len() {
-            log::error!(
+        if kv.local.seq_len() != request.request.prompt_tokens.len() {
+            let message = format!(
                 "gemma4 async prefill frontier {} != prompt {}",
                 kv.local.seq_len(),
-                request.prompt_tokens.len()
+                request.request.prompt_tokens.len()
             );
-            let _ = request.token_tx.send(TokenEvent::Error {
-                message: "async prefill frontier mismatch".into(),
-                prompt_tokens: request.prompt_tokens.len(),
-                completion_tokens: 0,
-            });
-            return;
+            log::error!("{message}");
+            ledger.fail(request.id, message);
+            return Ok(());
         }
         if let Err(err) = self.serve.release_prefill_window(&mut kv) {
-            let _ = request.token_tx.send(TokenEvent::Error {
-                message: format!("prefill window release failed: {err:#}"),
-                prompt_tokens: request.prompt_tokens.len(),
-                completion_tokens: 0,
-            });
-            return;
+            log::error!("gemma4 async prefill window release failed: {err:#}");
+            ledger.fail(request.id, format!("prefill failed: {err:#}"));
+            return Ok(());
         }
         capture_prefix(
             &self.ctx,
             &self.serve,
             &mut self.prefix_cache,
             &kv,
-            &request.prompt_tokens,
+            &request.request.prompt_tokens,
             resumed,
         );
-        if let Admitted::Active(entry) = self.first_token_flow(request, kv, &mut pass.logits) {
+        if let Admitted::Active(entry) =
+            self.first_token_flow(request, kv, &mut pass.logits, ledger)
+        {
             active.push(*entry);
         }
+        Ok(())
     }
 
     /// The chunked walk behind `PEGAINFER_MIX_CHUNK_TOKENS`: every
@@ -1569,28 +1586,33 @@ impl EngineState {
         self.serve.step(&self.ctx, kv, tokens)
     }
 
-    fn finish_plain_walker(&mut self, walker: &mut Walker, chunk: usize, active: &mut Vec<Active>) {
-        let mut logits =
-            match self.walk_plain_prompt(&mut walker.kv, &walker.request.prompt_tokens, chunk) {
-                Ok(logits) => logits,
-                Err(err) => {
-                    let _ = walker.request.token_tx.send(TokenEvent::Error {
-                        message: format!("walk tail failed: {err:#}"),
-                        prompt_tokens: walker.request.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
-                    walker.failed = true;
-                    return;
-                }
-            };
-        walker.offset = walker.request.prompt_tokens.len();
+    fn finish_plain_walker(
+        &mut self,
+        walker: &mut Walker,
+        chunk: usize,
+        active: &mut Vec<Active>,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
+        let mut logits = match self.walk_plain_prompt(
+            &mut walker.kv,
+            &walker.request.request.prompt_tokens,
+            chunk,
+        ) {
+            Ok(logits) => logits,
+            Err(err) => {
+                ledger.fail(walker.request.id, format!("walk tail failed: {err:#}"));
+                walker.failed = true;
+                return Ok(());
+            }
+        };
+        walker.offset = walker.request.request.prompt_tokens.len();
         let head = [SampleRow {
-            params: &walker.request.params,
+            params: &walker.request.request.params,
             step: 0,
-            logprobs: walker.request.logprobs,
-            ignore_eos: walker.request.params.ignore_eos,
+            logprobs: walker.request.request.logprobs,
+            ignore_eos: walker.request.request.params.ignore_eos,
         }];
-        match mixed_head_flow(
+        let mut sampled = mixed_head_flow(
             &self.ctx,
             &self.suppress_ids,
             &self.policy,
@@ -1600,28 +1622,14 @@ impl EngineState {
             &head,
             active,
             &mut logits,
-        ) {
-            Ok(mut sampled) => {
-                walker.first = Some((sampled.picked[0], sampled.logprobs[0].take()));
-            }
-            Err(message) => {
-                let _ = walker.request.token_tx.send(TokenEvent::Error {
-                    message,
-                    prompt_tokens: walker.request.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
-                walker.failed = true;
-            }
-        }
+            ledger,
+        )?;
+        walker.first = Some((sampled.picked[0], sampled.logprobs[0].take()));
+        Ok(())
     }
 
-    fn mixed_walk(
-        &mut self,
-        chunk: usize,
-        newcomers: Vec<Newcomer>,
-        active: &mut Vec<Active>,
-    ) -> Admitted {
-        let mut walkers: Vec<Walker> = newcomers
+    fn start_mixed_walk(chunk: usize, newcomers: Vec<Newcomer>) -> Walk {
+        let walkers = newcomers
             .into_iter()
             .map(|(request, kv, resumed)| Walker {
                 offset: kv.local.seq_len(),
@@ -1632,184 +1640,203 @@ impl EngineState {
                 failed: false,
             })
             .collect();
+        Walk {
+            walkers,
+            chunk,
+            first_round: true,
+        }
+    }
 
-        let mut first_round = true;
-        loop {
-            // A client that disconnected mid-walk stops consuming rounds;
-            // its pages return with the walker.
-            for w in &mut walkers {
-                if !w.failed && w.request.token_tx.is_closed() {
-                    w.failed = true;
-                }
-            }
-            // A finished walker graduates at the round boundary instead of
-            // idling out the other walkers.
-            let mut i = 0;
-            while i < walkers.len() {
-                if !walkers[i].failed && walkers[i].first.is_some() {
-                    let w = walkers.remove(i);
-                    self.graduate_walker(w, active);
-                } else {
-                    i += 1;
-                }
-            }
-            if !walkers
-                .iter()
-                .any(|w| !w.failed && w.offset < w.request.prompt_tokens.len())
-            {
-                break;
-            }
-            if !first_round {
-                self.ready_decode_rows(active);
-            }
-            first_round = false;
-
-            if active.is_empty() {
-                // The batch drained mid-walk: finish each remaining tail
-                // on the plain path, one segment at a time — the KV
-                // frontier carries the position.
-                for w in &mut walkers {
-                    if w.failed || w.offset >= w.request.prompt_tokens.len() {
-                        continue;
-                    }
-                    self.finish_plain_walker(w, chunk, active);
-                }
-                continue;
-            }
-
-            // This round's slate, in walker order: rows to take per walker
-            // and whether that take completes its prompt.
-            let mut budget = chunk;
-            let mut takes: Vec<Option<(usize, bool)>> = vec![None; walkers.len()];
-            for (wi, w) in walkers.iter_mut().enumerate() {
-                if w.failed {
-                    continue;
-                }
-                let rest = w.request.prompt_tokens.len() - w.offset;
-                if rest == 0 || budget == 0 {
-                    continue;
-                }
-                let take = rest.min(budget);
-                // Reserve what this round writes; a walker holding these
-                // pages already skips the call. A refusal means the pool's
-                // provision failed — fail the walker loud rather than
-                // stall the round.
-                if let Err(err) = admit_tokens(
-                    &self.serve.local_pool,
-                    &self.serve.global_pool,
-                    &mut w.kv,
-                    take,
-                ) {
-                    let _ = w.request.token_tx.send(TokenEvent::Error {
-                        message: format!("walk segment admission failed: {err:#}"),
-                        prompt_tokens: w.request.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
-                    w.failed = true;
-                    continue;
-                }
-                takes[wi] = Some((take, take == rest));
-                budget -= take;
-            }
-
-            let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
-            let stepped = {
-                let mut kvs: Vec<&mut GemmaKv> =
-                    active.iter_mut().map(|entry| &mut entry.kv).collect();
-                let mut prefills: Vec<(&mut GemmaKv, &[u32])> = Vec::new();
-                for (w, t) in walkers.iter_mut().zip(&takes) {
-                    if let Some((take, _)) = *t {
-                        let seg = &w.request.prompt_tokens[w.offset..w.offset + take];
-                        prefills.push((&mut w.kv, seg));
-                    }
-                }
-                self.serve.mixed_prefill_decode_step(
-                    &self.ctx,
-                    &mut self.arena,
-                    &mut prefills,
-                    &mut kvs,
-                    &decode_tokens,
-                )
-            };
-            let logits = match stepped {
-                Ok(logits) => logits,
-                Err(err) => {
-                    fail_active_batch(active, "walk step", &err);
-                    for w in walkers.drain(..) {
-                        let _ = w.request.token_tx.send(TokenEvent::Error {
-                            message: format!("walk step failed: {err:#}"),
-                            prompt_tokens: w.request.prompt_tokens.len(),
-                            completion_tokens: 0,
-                        });
-                    }
-                    return Admitted::Done;
-                }
-            };
-
-            let flow = {
-                let head: Vec<SampleRow<'_>> = walkers
-                    .iter()
-                    .zip(&takes)
-                    .filter(|(_, t)| t.is_some())
-                    .map(|(w, t)| {
-                        let (_, last) = t.expect("filtered");
-                        SampleRow {
-                            params: &w.request.params,
-                            step: 0,
-                            logprobs: if last { w.request.logprobs } else { 0 },
-                            ignore_eos: if last {
-                                w.request.params.ignore_eos
-                            } else {
-                                true
-                            },
-                        }
-                    })
-                    .collect();
-                mixed_head_flow(
-                    &self.ctx,
-                    &self.suppress_ids,
-                    &self.policy,
-                    &mut self.scratch,
-                    self.base_seed,
-                    &mut self.sample_nonce,
-                    &head,
-                    active,
-                    logits,
-                )
-            };
-            match flow {
-                Ok(mut sampled) => {
-                    let mut si = 0usize;
-                    for (w, t) in walkers.iter_mut().zip(&takes) {
-                        if let Some((take, last)) = *t {
-                            w.offset += take;
-                            if last {
-                                w.first = Some((sampled.picked[si], sampled.logprobs[si].take()));
-                            }
-                            si += 1;
-                        }
-                    }
-                }
-                Err(message) => {
-                    for w in walkers.drain(..) {
-                        let _ = w.request.token_tx.send(TokenEvent::Error {
-                            message: message.clone(),
-                            prompt_tokens: w.request.prompt_tokens.len(),
-                            completion_tokens: 0,
-                        });
-                    }
-                    return Admitted::Done;
-                }
+    /// Advance exactly one chunked-walk round. Returns `true` when no walker
+    /// remains. The caller drops the scheduler's `walk` only after this
+    /// boundary so the driver can commit this round's live tokens first.
+    fn advance_walk_round(
+        &mut self,
+        walk: &mut Walk,
+        active: &mut Vec<Active>,
+        ledger: &mut RequestLedger,
+    ) -> Result<bool> {
+        for walker in &mut walk.walkers {
+            if !walker.failed && ledger.is_aborted(walker.request.id) {
+                ledger.retire(walker.request.id);
+                walker.failed = true;
             }
         }
+        self.graduate_ready_walkers(&mut walk.walkers, active, ledger);
+        if !walk
+            .walkers
+            .iter()
+            .any(|w| !w.failed && w.offset < w.request.request.prompt_tokens.len())
+        {
+            return Ok(true);
+        }
+        if !walk.first_round {
+            self.ready_decode_rows(active, ledger);
+        }
+        walk.first_round = false;
 
-        Admitted::Done
+        if active.is_empty() {
+            for walker in &mut walk.walkers {
+                if walker.failed || walker.offset >= walker.request.request.prompt_tokens.len() {
+                    continue;
+                }
+                self.finish_plain_walker(walker, walk.chunk, active, ledger)?;
+            }
+            self.graduate_ready_walkers(&mut walk.walkers, active, ledger);
+            return Ok(true);
+        }
+
+        let mut budget = walk.chunk;
+        let mut takes: Vec<Option<(usize, bool)>> = vec![None; walk.walkers.len()];
+        for (index, walker) in walk.walkers.iter_mut().enumerate() {
+            if walker.failed {
+                continue;
+            }
+            let rest = walker.request.request.prompt_tokens.len() - walker.offset;
+            if rest == 0 || budget == 0 {
+                continue;
+            }
+            let take = rest.min(budget);
+            if let Err(err) = admit_tokens(
+                &self.serve.local_pool,
+                &self.serve.global_pool,
+                &mut walker.kv,
+                take,
+            ) {
+                ledger.fail(
+                    walker.request.id,
+                    format!("walk segment admission failed: {err:#}"),
+                );
+                walker.failed = true;
+                continue;
+            }
+            takes[index] = Some((take, take == rest));
+            budget -= take;
+        }
+
+        let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
+        let stepped = {
+            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
+            let mut prefills: Vec<(&mut GemmaKv, &[u32])> = Vec::new();
+            for (walker, take) in walk.walkers.iter_mut().zip(&takes) {
+                if let Some((take, _)) = *take {
+                    let segment =
+                        &walker.request.request.prompt_tokens[walker.offset..walker.offset + take];
+                    prefills.push((&mut walker.kv, segment));
+                }
+            }
+            self.serve.mixed_prefill_decode_step(
+                &self.ctx,
+                &mut self.arena,
+                &mut prefills,
+                &mut kvs,
+                &decode_tokens,
+            )
+        };
+        let logits = match stepped {
+            Ok(logits) => logits,
+            Err(err) => {
+                fail_active_batch(active, "walk step", &err, ledger);
+                Self::fail_walkers(&mut walk.walkers, "walk step", &err, ledger);
+                return Err(err.context("gemma4 walk step"));
+            }
+        };
+
+        let head: Vec<SampleRow<'_>> = walk
+            .walkers
+            .iter()
+            .zip(&takes)
+            .filter(|(_, take)| take.is_some())
+            .map(|(walker, take)| {
+                let (_, last) = take.expect("filtered");
+                SampleRow {
+                    params: &walker.request.request.params,
+                    step: 0,
+                    logprobs: if last {
+                        walker.request.request.logprobs
+                    } else {
+                        0
+                    },
+                    ignore_eos: if last {
+                        walker.request.request.params.ignore_eos
+                    } else {
+                        true
+                    },
+                }
+            })
+            .collect();
+        let mut sampled = match mixed_head_flow(
+            &self.ctx,
+            &self.suppress_ids,
+            &self.policy,
+            &mut self.scratch,
+            self.base_seed,
+            &mut self.sample_nonce,
+            &head,
+            active,
+            logits,
+            ledger,
+        ) {
+            Ok(sampled) => sampled,
+            Err(err) => {
+                Self::fail_walkers(&mut walk.walkers, "walk step", &err, ledger);
+                return Err(err);
+            }
+        };
+        let mut sampled_index = 0usize;
+        for (walker, take) in walk.walkers.iter_mut().zip(&takes) {
+            if let Some((take, last)) = *take {
+                walker.offset += take;
+                if last {
+                    walker.first = Some((
+                        sampled.picked[sampled_index],
+                        sampled.logprobs[sampled_index].take(),
+                    ));
+                }
+                sampled_index += 1;
+            }
+        }
+        self.graduate_ready_walkers(&mut walk.walkers, active, ledger);
+        Ok(!walk
+            .walkers
+            .iter()
+            .any(|walker| !walker.failed && walker.first.is_none()))
+    }
+
+    fn fail_walkers(
+        walkers: &mut Vec<Walker>,
+        what: &str,
+        error: &anyhow::Error,
+        ledger: &mut RequestLedger,
+    ) {
+        for walker in walkers.drain(..) {
+            if ledger.is_active(walker.request.id) {
+                ledger.fail(walker.request.id, format!("{what} failed: {error:#}"));
+            }
+        }
+    }
+
+    fn graduate_ready_walkers(
+        &mut self,
+        walkers: &mut Vec<Walker>,
+        active: &mut Vec<Active>,
+        ledger: &mut RequestLedger,
+    ) {
+        let mut index = 0;
+        while index < walkers.len() {
+            if !walkers[index].failed && walkers[index].first.is_some() {
+                let walker = walkers.remove(index);
+                self.graduate_walker(walker, active, ledger);
+            } else {
+                index += 1;
+            }
+        }
     }
 
     /// One finished walker joins the batch at its round boundary: capture
     /// its prompt state, then emit or retire its first token exactly like
     /// the whole-prompt form.
-    fn graduate_walker(&mut self, w: Walker, active: &mut Vec<Active>) {
+    fn graduate_walker(&mut self, w: Walker, active: &mut Vec<Active>, ledger: &mut RequestLedger) {
         let Walker {
             request,
             kv,
@@ -1823,22 +1850,26 @@ impl EngineState {
             &self.serve,
             &mut self.prefix_cache,
             &kv,
-            &request.prompt_tokens,
+            &request.request.prompt_tokens,
             resumed,
         );
-        if let Some(entry) = settle_first_token(&self.policy, request, kv, next, logprob) {
+        if let Some(entry) = settle_first_token(&self.policy, request, kv, next, logprob, ledger) {
             active.push(entry);
         }
     }
 
-    /// Retire every active request the next step cannot serve — a closed
-    /// sink, or a pool that cannot grow its KV by one token — and admit the
-    /// step's token for the rest.
-    fn ready_decode_rows(&self, active: &mut Vec<Active>) {
+    /// Retire every aborted row and fail a request whose KV cannot grow by
+    /// one token; admit the step's token for the rest.
+    fn ready_decode_rows(&self, active: &mut Vec<Active>, ledger: &mut RequestLedger) {
         let mut row = 0;
         while row < active.len() {
             let entry = &mut active[row];
-            if entry.request.token_tx.is_closed() {
+            if entry.stopping {
+                active.swap_remove(row);
+                continue;
+            }
+            if ledger.is_aborted(entry.request.id) {
+                ledger.retire(entry.request.id);
                 active.swap_remove(row);
                 continue;
             }
@@ -1848,11 +1879,10 @@ impl EngineState {
                 &mut entry.kv,
                 1,
             ) {
-                let _ = entry.request.token_tx.send(TokenEvent::Error {
-                    message: format!("{err:#}"),
-                    prompt_tokens: entry.prompt_tokens,
-                    completion_tokens: entry.emitted,
-                });
+                ledger.fail(
+                    entry.request.id,
+                    format!("decode KV admission failed: {err:#}"),
+                );
                 active.swap_remove(row);
                 continue;
             }
@@ -1860,25 +1890,29 @@ impl EngineState {
         }
     }
 
-    fn pipeline_eligible(&self, active: &[Active]) -> bool {
+    fn pipeline_eligible(&self, active: &[Active], ledger: &RequestLedger) -> bool {
         !active.is_empty()
             && active.len() <= self.scratch.max_rows()
             && active.iter().all(|entry| {
                 !entry.stopping
-                    && entry.request.logprobs == 0
-                    && entry.request.max_tokens.saturating_sub(entry.emitted)
+                    && entry.request.request.logprobs == 0
+                    && entry
+                        .request
+                        .request
+                        .max_tokens
+                        .saturating_sub(ledger.completion_tokens(entry.request.id))
                         >= DECODE_PIPELINE_DEPTH
                     && pegainfer_sample::effectively_greedy(
-                        &entry.request.params,
+                        &entry.request.request.params,
                         self.scratch.vocab(),
                     )
             })
     }
 
     /// Reserve the next token without retiring or reordering a row.
-    fn ready_rows_pinned(&self, active: &mut [Active]) -> bool {
+    fn ready_rows_pinned(&self, active: &mut [Active], ledger: &RequestLedger) -> bool {
         active.iter_mut().all(|entry| {
-            !entry.request.token_tx.is_closed()
+            !ledger.is_aborted(entry.request.id)
                 && admit_tokens(
                     &self.serve.local_pool,
                     &self.serve.global_pool,
@@ -1889,12 +1923,13 @@ impl EngineState {
         })
     }
 
-    fn fence_or_abort(&self) {
+    fn fence(&self) -> Result<()> {
         let sync = unsafe { cudarc::driver::sys::cuStreamSynchronize(self.ctx.stream.cu_stream()) };
-        if sync != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            log::error!("FATAL: cuStreamSynchronize(decode) failed ({sync:?}); aborting");
-            std::process::abort();
-        }
+        anyhow::ensure!(
+            sync == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "cuStreamSynchronize(decode) failed ({sync:?})"
+        );
+        Ok(())
     }
 
     /// Queue one decode and stage its greedy picks into the next embedding's
@@ -1945,7 +1980,12 @@ impl EngineState {
 
     /// Deliver a staged step without changing the row order. Finished rows
     /// stay pinned until the speculative successor drains.
-    fn collect_pending(&mut self, active: &mut [Active], pending: &PendingDecode) -> Result<()> {
+    fn collect_pending(
+        &mut self,
+        active: &mut [Active],
+        pending: &PendingDecode,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
         anyhow::ensure!(
             pending.rows == active.len(),
             "pipeline collected {} rows against a batch of {}",
@@ -1958,20 +1998,26 @@ impl EngineState {
             &mut self.scratch,
         )?;
         for (entry, token) in active.iter_mut().zip(picked) {
-            entry.settle_staged(&self.policy, token);
+            entry.settle_staged(&self.policy, token, ledger);
         }
         Ok(())
     }
 
-    fn drain_pipeline(&mut self, active: &mut Vec<Active>) {
+    fn drain_pipeline(
+        &mut self,
+        active: &mut Vec<Active>,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
         let Some(pending) = self.pipeline.take() else {
-            return;
+            return Ok(());
         };
-        if let Err(err) = self.collect_pending(active, &pending) {
-            self.fence_or_abort();
-            return fail_active_batch(active, "pipelined decode drain", &err);
+        if let Err(err) = self.collect_pending(active, &pending, ledger) {
+            self.fence()?;
+            fail_active_batch(active, "pipelined decode drain", &err, ledger);
+            return Err(err.context("pipelined decode drain"));
         }
         active.retain(|entry| !entry.stopping);
+        Ok(())
     }
 
     /// The mixed-admission tail of [`Self::admit_and_prefill`]: every
@@ -1984,20 +2030,14 @@ impl EngineState {
         &mut self,
         mut newcomers: Vec<Newcomer>,
         active: &mut Vec<Active>,
-    ) -> Admitted {
+        walk: &mut Option<Walk>,
+        ledger: &mut RequestLedger,
+    ) -> Result<Admitted> {
         if let Some(chunk) = self.mix_chunk {
-            return self.mixed_walk(chunk, newcomers, active);
+            debug_assert!(walk.is_none());
+            *walk = Some(Self::start_mixed_walk(chunk, newcomers));
+            return Ok(Admitted::Done);
         }
-        let fail_newcomers = |newcomers: &mut Vec<Newcomer>, message: &str| {
-            for (request, _, _) in newcomers.drain(..) {
-                let _ = request.token_tx.send(TokenEvent::Error {
-                    message: message.to_string(),
-                    prompt_tokens: request.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
-            }
-            Admitted::Done
-        };
 
         let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         let logits = {
@@ -2006,7 +2046,7 @@ impl EngineState {
                 .iter_mut()
                 .map(|(request, kv, _)| {
                     let resume = kv.local.seq_len();
-                    (kv, &request.prompt_tokens[resume..])
+                    (kv, &request.request.prompt_tokens[resume..])
                 })
                 .collect();
             match self.serve.mixed_prefill_decode_step(
@@ -2018,8 +2058,9 @@ impl EngineState {
             ) {
                 Ok(logits) => logits,
                 Err(err) => {
-                    fail_active_batch(active, "mixed step", &err);
-                    return fail_newcomers(&mut newcomers, &format!("mixed step failed: {err:#}"));
+                    fail_active_batch(active, "mixed step", &err, ledger);
+                    Self::fail_newcomers(&mut newcomers, "mixed step", &err, ledger);
+                    return Err(err.context("gemma4 mixed step"));
                 }
             }
         };
@@ -2029,7 +2070,7 @@ impl EngineState {
                 &self.serve,
                 &mut self.prefix_cache,
                 kv,
-                &request.prompt_tokens,
+                &request.request.prompt_tokens,
                 *resumed,
             );
         }
@@ -2037,10 +2078,10 @@ impl EngineState {
             let head: Vec<SampleRow<'_>> = newcomers
                 .iter()
                 .map(|(request, _, _)| SampleRow {
-                    params: &request.params,
+                    params: &request.request.params,
                     step: 0,
-                    logprobs: request.logprobs,
-                    ignore_eos: request.params.ignore_eos,
+                    logprobs: request.request.logprobs,
+                    ignore_eos: request.request.params.ignore_eos,
                 })
                 .collect();
             match mixed_head_flow(
@@ -2053,9 +2094,13 @@ impl EngineState {
                 &head,
                 active,
                 logits,
+                ledger,
             ) {
                 Ok(sampled) => sampled,
-                Err(message) => return fail_newcomers(&mut newcomers, &message),
+                Err(err) => {
+                    Self::fail_newcomers(&mut newcomers, "mixed step", &err, ledger);
+                    return Err(err);
+                }
             }
         };
 
@@ -2067,14 +2112,32 @@ impl EngineState {
                 kv,
                 sampled.picked[j],
                 sampled.logprobs[j].take(),
+                ledger,
             ) {
                 active.push(entry);
             }
         }
-        Admitted::Done
+        Ok(Admitted::Done)
     }
 
-    fn decode_round_collect(&mut self, active: &mut Vec<Active>) {
+    fn fail_newcomers(
+        newcomers: &mut Vec<Newcomer>,
+        what: &str,
+        error: &anyhow::Error,
+        ledger: &mut RequestLedger,
+    ) {
+        for (request, _, _) in newcomers.drain(..) {
+            if ledger.is_active(request.id) {
+                ledger.fail(request.id, format!("{what} failed: {error:#}"));
+            }
+        }
+    }
+
+    fn decode_round_collect(
+        &mut self,
+        active: &mut Vec<Active>,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         let logits = {
             let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
@@ -2084,13 +2147,17 @@ impl EngineState {
             {
                 Ok(logits) => logits,
                 Err(err) => {
-                    self.fence_or_abort();
-                    return fail_active_batch(active, "batched decode", &err);
+                    self.fence()?;
+                    fail_active_batch(active, "batched decode", &err, ledger);
+                    return Err(err.context("batched decode"));
                 }
             }
         };
         let sampled = {
-            let rows: Vec<SampleRow<'_>> = active.iter().map(Active::sample_row).collect();
+            let rows: Vec<SampleRow<'_>> = active
+                .iter()
+                .map(|entry| entry.sample_row(ledger))
+                .collect();
             sample_logits_rows(
                 &self.ctx,
                 &self.suppress_ids,
@@ -2103,26 +2170,28 @@ impl EngineState {
             )
         };
         match sampled {
-            Ok(mut sampled) => emit_decode_rows(active, &mut sampled, 0),
+            Ok(mut sampled) => emit_decode_rows(active, &mut sampled, 0, ledger),
             Err(err) => {
-                self.fence_or_abort();
-                fail_active_batch(active, "batched decode", &err);
+                self.fence()?;
+                fail_active_batch(active, "batched decode", &err, ledger);
+                return Err(err.context("batched decode sampling"));
             }
         }
+        Ok(())
     }
 
     /// One batched decode step. Eligible greedy batches keep one speculative
     /// successor in flight and drain before any row-order change.
-    fn decode_round(&mut self, active: &mut Vec<Active>) {
+    fn decode_round(&mut self, active: &mut Vec<Active>, ledger: &mut RequestLedger) -> Result<()> {
         if let Some(pending) = self.pipeline.take() {
-            if self.pipeline_eligible(active) && self.ready_rows_pinned(active) {
+            if self.pipeline_eligible(active, ledger) && self.ready_rows_pinned(active, ledger) {
                 let next_slot = (pending.slot + 1) % DECODE_PIPELINE_DEPTH;
                 match self.launch_staged(active, true, next_slot) {
                     Ok(rows) => {
-                        if let Err(err) = self.collect_pending(active, &pending) {
-                            self.fence_or_abort();
-                            fail_active_batch(active, "pipelined decode collect", &err);
-                            return;
+                        if let Err(err) = self.collect_pending(active, &pending, ledger) {
+                            self.fence()?;
+                            fail_active_batch(active, "pipelined decode collect", &err, ledger);
+                            return Err(err.context("pipelined decode collect"));
                         }
                         self.pipeline = Some(PendingDecode {
                             rows,
@@ -2130,37 +2199,122 @@ impl EngineState {
                         });
                     }
                     Err(err) => {
-                        if let Err(collect_err) = self.collect_pending(active, &pending) {
+                        if let Err(collect_err) = self.collect_pending(active, &pending, ledger) {
                             log::error!("collect during launch failure failed: {collect_err:#}");
                         }
-                        self.fence_or_abort();
-                        fail_active_batch(active, "pipelined decode launch", &err);
+                        self.fence()?;
+                        fail_active_batch(active, "pipelined decode launch", &err, ledger);
+                        return Err(err.context("pipelined decode launch"));
                     }
                 }
-                return;
+                return Ok(());
             }
             self.pipeline = Some(pending);
-            self.drain_pipeline(active);
+            self.drain_pipeline(active, ledger)?;
             if active.is_empty() {
-                return;
+                return Ok(());
             }
         }
 
-        self.ready_decode_rows(active);
+        self.ready_decode_rows(active, ledger);
         if active.is_empty() {
-            return;
+            return Ok(());
         }
-        if self.pipeline_eligible(active) {
+        if self.pipeline_eligible(active, ledger) {
             match self.launch_staged(active, false, 0) {
                 Ok(rows) => self.pipeline = Some(PendingDecode { rows, slot: 0 }),
                 Err(err) => {
-                    self.fence_or_abort();
-                    fail_active_batch(active, "batched decode", &err);
+                    self.fence()?;
+                    fail_active_batch(active, "batched decode", &err, ledger);
+                    return Err(err.context("batched decode launch"));
                 }
             }
-            return;
+            return Ok(());
         }
-        self.decode_round_collect(active);
+        self.decode_round_collect(active, ledger)
+    }
+}
+
+impl Gemma4Scheduler {
+    fn advance_walk(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        let Some(mut walk) = self.walk.take() else {
+            return Ok(());
+        };
+        let done = self
+            .state
+            .advance_walk_round(&mut walk, &mut self.active, ledger)?;
+        if !done {
+            self.walk = Some(walk);
+        }
+        Ok(())
+    }
+}
+
+impl Scheduler for Gemma4Scheduler {
+    fn submit(&mut self, request: QueuedRequest) {
+        self.pending.push_back(request);
+    }
+
+    fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        if self.cublas.is_none() {
+            self.cublas = Some(bind_engine_thread(&self.state.ctx)?);
+        }
+        if self.walk.is_some() {
+            return self.advance_walk(ledger);
+        }
+
+        let lane_ready = match self.state.lane.as_ref() {
+            Some(lane) if lane.inflight.is_some() => {
+                let lane_is_only_work = self.active.is_empty() && self.pending.is_empty();
+                if lane_is_only_work {
+                    lane.drain()?;
+                }
+                lane_is_only_work || lane.inflight_complete()?
+            }
+            _ => false,
+        };
+        if lane_ready {
+            self.state.join_async_prefill(&mut self.active, ledger)?;
+        }
+
+        self.state.intake_turn(
+            &mut self.door,
+            &mut self.pending,
+            &mut self.active,
+            &mut self.walk,
+            std::time::Instant::now(),
+            ledger,
+        )?;
+        if self.walk.is_some() {
+            return self.advance_walk(ledger);
+        }
+        if !self.active.is_empty() {
+            self.state.decode_round(&mut self.active, ledger)?;
+        }
+        Ok(())
+    }
+
+    fn metrics(&self) -> SchedulerMetrics {
+        let local_total = self.state.serve.local_pool.capacity_pages();
+        let global_total = self.state.serve.global_pool.capacity_pages();
+        let local_used = local_total.saturating_sub(self.state.serve.local_pool.available_pages());
+        let global_used =
+            global_total.saturating_sub(self.state.serve.global_pool.available_pages());
+        let walkers = self.walk.as_ref().map_or(0, |walk| {
+            walk.walkers.iter().filter(|walker| !walker.failed).count()
+        });
+        let lane_inflight = self
+            .state
+            .lane
+            .as_ref()
+            .is_some_and(|lane| lane.inflight.is_some()) as usize;
+        SchedulerMetrics {
+            kv_used_blocks: (local_used + global_used) as u64,
+            kv_total_blocks: (local_total + global_total) as u64,
+            num_running_reqs: (self.active.len() + walkers + lane_inflight) as u64,
+            num_waiting_reqs: self.pending.len() as u64,
+            spec_decode: None,
+        }
     }
 }
 
@@ -2171,33 +2325,19 @@ struct DecodeToken {
     stop: bool,
 }
 
-fn deliver_decode_row(entry: &mut Active, token: DecodeToken) -> bool {
+fn deliver_decode_row(entry: &mut Active, token: DecodeToken, ledger: &mut RequestLedger) -> bool {
+    let id = entry.request.id;
+    if ledger.is_aborted(id) {
+        ledger.retire(id);
+        return true;
+    }
     if token.stop {
-        let _ = entry.request.token_tx.send(TokenEvent::Finished {
-            finish_reason: FinishReason::Stop,
-            prompt_tokens: entry.prompt_tokens,
-            completion_tokens: entry.emitted,
-        });
+        ledger.finish(id, FinishReason::Stop);
         return true;
     }
-    entry.emitted += 1;
-    if entry
-        .request
-        .token_tx
-        .send(TokenEvent::Token {
-            id: token.id,
-            logprob: token.logprob,
-        })
-        .is_err()
-    {
-        return true;
-    }
-    if entry.emitted >= entry.request.max_tokens {
-        let _ = entry.request.token_tx.send(TokenEvent::Finished {
-            finish_reason: FinishReason::Length,
-            prompt_tokens: entry.prompt_tokens,
-            completion_tokens: entry.emitted,
-        });
+    ledger.push_tokens(id, &[token.id], &[token.logprob]);
+    if ledger.completion_tokens(id) >= entry.request.request.max_tokens {
+        ledger.finish(id, FinishReason::Length);
         return true;
     }
     entry.next = token.id;
@@ -2209,8 +2349,13 @@ fn deliver_decode_row(entry: &mut Active, token: DecodeToken) -> bool {
 /// admission share; `row_base` is the row's offset into the step's logits
 /// (a mixed step's first `row_base` rows are its newcomers). A stop token
 /// retires the request without being emitted; a send failure retires a
-/// cancelled one.
-fn emit_decode_rows(active: &mut Vec<Active>, sampled: &mut SampledRows, row_base: usize) {
+/// frontend-aborted one.
+fn emit_decode_rows(
+    active: &mut Vec<Active>,
+    sampled: &mut SampledRows,
+    row_base: usize,
+    ledger: &mut RequestLedger,
+) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, entry) in active.iter_mut().enumerate() {
         let index = row + row_base;
@@ -2221,6 +2366,7 @@ fn emit_decode_rows(active: &mut Vec<Active>, sampled: &mut SampledRows, row_bas
                 logprob: sampled.logprobs[index].take(),
                 stop: sampled.stops[index],
             },
+            ledger,
         ) {
             retire.push(row);
         }
@@ -2236,39 +2382,30 @@ fn emit_decode_rows(active: &mut Vec<Active>, sampled: &mut SampledRows, row_bas
 /// so an engine that emits EOS costs the client its final visible token.
 fn settle_first_token(
     policy: &GenerationPolicy,
-    request: GenerateRequest,
+    request: QueuedRequest,
     kv: GemmaKv,
     next: u32,
     logprob: Option<TokenLogprob>,
+    ledger: &mut RequestLedger,
 ) -> Option<Active> {
-    let prompt_tokens = request.prompt_tokens.len();
-    let finish = |reason: FinishReason, completion_tokens: usize| -> Option<Active> {
-        let _ = request.token_tx.send(TokenEvent::Finished {
-            finish_reason: reason,
-            prompt_tokens,
-            completion_tokens,
-        });
-        None
-    };
-    if policy.stops(next, request.params.ignore_eos) {
-        return finish(FinishReason::Stop, 0);
-    }
-    if request
-        .token_tx
-        .send(TokenEvent::Token { id: next, logprob })
-        .is_err()
-    {
+    let id = request.id;
+    if ledger.is_aborted(id) {
+        ledger.retire(id);
         return None;
     }
-    if request.max_tokens <= 1 {
-        return finish(FinishReason::Length, 1);
+    if policy.stops(next, request.request.params.ignore_eos) {
+        ledger.finish(id, FinishReason::Stop);
+        return None;
+    }
+    ledger.push_tokens(id, &[next], &[logprob]);
+    if request.request.max_tokens <= 1 {
+        ledger.finish(id, FinishReason::Length);
+        return None;
     }
     Some(Active {
         request,
         kv,
         next,
-        emitted: 1,
-        prompt_tokens,
         stopping: false,
     })
 }
@@ -2496,1144 +2633,25 @@ mod gate {
 }
 
 #[cfg(test)]
-mod lane_tests {
-    use std::path::Path;
-
-    use pegainfer_frontend::engine::EngineLoadOptions;
-    use pegainfer_frontend::engine::FinishReason;
-    use pegainfer_frontend::engine::GenerateRequest;
-    use pegainfer_frontend::engine::TokenEvent;
-    use pegainfer_frontend::engine::TokenSink;
-    use pegainfer_frontend::engine::TokenStreamReceiver;
-
-    fn submit(
-        handle: &pegainfer_frontend::engine::EngineHandle,
-        prompt_tokens: Vec<u32>,
-        max_tokens: usize,
-    ) -> TokenStreamReceiver {
-        let (request, token_rx) = walk_request(prompt_tokens, max_tokens);
-        handle.submit(request).expect("submit");
-        token_rx
-    }
-
-    struct Drained {
-        tokens: usize,
-        cached: usize,
-        scheduled: usize,
-        finish: FinishReason,
-        ids: Vec<u32>,
-    }
-
-    fn drain(rx: &mut TokenStreamReceiver, name: &str) -> Drained {
-        let mut tokens = 0;
-        let mut cached = 0;
-        let mut scheduled = 0;
-        let mut ids = Vec::new();
-        loop {
-            match rx.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Token { id, .. }) => {
-                    tokens += 1;
-                    ids.push(id);
-                }
-                Some(TokenEvent::Scheduled { cached_tokens, .. }) => {
-                    cached = cached_tokens;
-                    scheduled += 1;
-                }
-                Some(TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. }) => {}
-                Some(TokenEvent::Finished { finish_reason, .. }) => {
-                    return Drained {
-                        tokens,
-                        cached,
-                        scheduled,
-                        finish: finish_reason,
-                        ids,
-                    };
-                }
-                Some(TokenEvent::Error { message, .. }) => panic!("{name}: error: {message}"),
-                Some(TokenEvent::Rejected { message, .. }) => panic!("{name}: rejected: {message}"),
-                None => panic!("{name}: channel closed without Finished"),
-            }
-        }
-    }
-
-    fn ids(len: usize, salt: u32) -> Vec<u32> {
-        (0..len as u32)
-            .map(|i| 1000 + (i * 37 + salt) % 50000)
-            .collect()
-    }
-
-    fn pin_live_stream(handle: &pegainfer_frontend::engine::EngineHandle) -> TokenStreamReceiver {
-        let mut streamer = submit(handle, ids(40, 0), 1024);
-        let mut seen = 0;
-        while seen < 2 {
-            match streamer.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Token { .. }) => seen += 1,
-                Some(TokenEvent::Error { message, .. }) => panic!("streamer: {message}"),
-                Some(_) => {}
-                None => panic!("streamer closed early"),
-            }
-        }
-        streamer
-    }
-
-    fn warm_prompt(prefix: &[u32]) -> Vec<u32> {
-        let mut prompt = prefix.to_vec();
-        prompt.extend(ids(60, 11));
-        prompt
-    }
-
-    fn assert_warm_result(rx: &mut TokenStreamReceiver, cached: usize, label: &str) {
-        let warm = drain(rx, label);
-        assert_eq!((warm.tokens, warm.finish), (4, FinishReason::Length));
-        assert_eq!(warm.cached, cached, "warm admission resume frontier");
-    }
-
-    /// The whole async lifecycle against one live engine, with every
-    /// interleaving pinned by construction: the streamer's budget outlasts
-    /// the script and its sink is dropped only at the end, so the decode
-    /// batch is never empty and every admission below takes the lane. A
-    /// long prompt rides the lane while a second arrival waits out the busy
-    /// lane; a warm prefix-cache hit launches with only its unseen suffix
-    /// (the join gate refuses a pass that processed the wrong one); a
-    /// request cancelled after `Scheduled` — past every sync-path exit, so
-    /// the drop lands while its pass is in flight — exits through the join;
-    /// an out-of-vocab prompt fails the launch itself and the lane drains;
-    /// and the engine still serves after all of it.
-    /// Serialize the serving-knob environment across every gate and put it
-    /// back afterwards — including on panic — so no gate can poison another
-    /// or be poisoned by the operator's shell. Values round-trip as OsString.
-    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: the guard's lock serializes all environment access
-            // among gates, and the ignored suites run single-threaded.
-            unsafe {
-                for (k, v) in self.saved.drain(..) {
-                    match v {
-                        Some(v) => std::env::set_var(k, v),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
-        }
-    }
-
-    const SERVING_KNOBS: [&str; 7] = [
-        super::ASYNC_PREFILL_ENV,
-        super::PREFIX_CACHE_ENV,
-        super::MIX_CHUNK_TOKENS_ENV,
-        super::MAX_CONTEXT_ENV,
-        super::DECODE_SLOTS_ENV,
-        super::ADMIT_COALESCE_ENV,
-        super::KV_FP8_ENV,
-    ];
-
-    /// Clear every serving knob, set `overrides`, and hand back the guard
-    /// that restores the environment when it drops.
-    fn scoped_engine_env(overrides: &[(&str, &str)]) -> EnvGuard {
-        let lock = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("env lock");
-        let saved = SERVING_KNOBS
-            .iter()
-            .map(|k| (*k, std::env::var_os(k)))
-            .collect();
-        // SAFETY: as in Drop — the lock serializes environment access.
-        unsafe {
-            for k in SERVING_KNOBS {
-                std::env::remove_var(k);
-            }
-            for (k, v) in overrides {
-                std::env::set_var(k, v);
-            }
-        }
-        EnvGuard { saved, _lock: lock }
-    }
-
-    /// The raise has to arrive where a client can see it. `servable_len` is
-    /// the frontend's only view of the ceiling, and it travels a path no
-    /// state-level assertion touches: load, the ready channel, the u32
-    /// narrowing, and `EngineHandle::with_servable_len`.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-    fn the_raise_reaches_the_frontend() {
-        let dir = crate::testkit::model_path();
-        let _env = scoped_engine_env(&[
-            ("PEGAINFER_MAX_CONTEXT", "32768"),
-            ("PEGAINFER_MIX_CHUNK_TOKENS", "2048"),
-            ("PEGAINFER_DECODE_SLOTS", "2"),
-        ]);
-        let handle =
-            super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
-        assert_eq!(
-            handle.servable_len(),
-            Some(32768),
-            "the raised ceiling must reach the frontend, not just the engine state"
-        );
-        let mut rx = submit(&handle, ids(40, 5), 4);
-        let served = drain(&mut rx, "raised ceiling");
-        assert_eq!((served.tokens, served.finish), (4, FinishReason::Length));
-    }
-
-    fn lane_lifecycle_script(mode: &str) {
-        let dir = crate::testkit::model_path();
-        let _env = scoped_engine_env(&[
-            ("PEGAINFER_ASYNC_PREFILL", mode),
-            ("PEGAINFER_PREFIX_CACHE", "4"),
-        ]);
-        let handle =
-            super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
-
-        // The streamer pins the decode batch non-empty for the whole
-        // script: its budget is far past the script's round count, and its
-        // sink drops only after the last assertion.
-        let streamer = pin_live_stream(&handle);
-
-        let long_prompt = ids(1500, 7);
-        let mut lane_rx = submit(&handle, long_prompt.clone(), 4);
-        let mut queued_rx = submit(&handle, ids(60, 3), 4);
-        let lane = drain(&mut lane_rx, "lane prefill");
-        assert_eq!((lane.tokens, lane.finish), (4, FinishReason::Length));
-        let queued = drain(&mut queued_rx, "queued behind the lane");
-        assert_eq!((queued.tokens, queued.finish), (4, FinishReason::Length));
-
-        // Warm hit: the long prompt plus a new turn resumes at the captured
-        // frontier and rides the lane with only the suffix.
-        let mut warm_rx = submit(&handle, warm_prompt(&long_prompt), 4);
-        assert_warm_result(&mut warm_rx, 1500, "warm suffix on the lane");
-
-        // In-flight cancellation: `Scheduled` is sent past every sync-path
-        // exit, so a sink dropped after it lands while the lane pass runs.
-        let mut cancel_rx = submit(&handle, ids(1500, 23), 8);
-        loop {
-            match cancel_rx.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Scheduled { .. }) => break,
-                Some(TokenEvent::Error { message, .. }) => panic!("cancel arm: {message}"),
-                Some(_) => {}
-                None => panic!("cancel arm closed before Scheduled"),
-            }
-        }
-        drop(cancel_rx);
-
-        // Launch failure: an out-of-vocab id passes admission and fails
-        // inside the lane pass; the lane drains and reports, loudly.
-        let mut bad = ids(200, 31);
-        bad[100] = 300_000;
-        let mut bad_rx = submit(&handle, bad, 4);
-        loop {
-            match bad_rx.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Error { message, .. }) => {
-                    assert!(
-                        message.contains("prefill failed"),
-                        "launch failure must name the prefill: {message}"
-                    );
-                    break;
-                }
-                Some(TokenEvent::Token { .. } | TokenEvent::Finished { .. }) => {
-                    panic!("an out-of-vocab prompt must not produce tokens")
-                }
-                Some(_) => {}
-                None => panic!("launch failure lost its error event"),
-            }
-        }
-
-        let mut after_rx = submit(&handle, ids(40, 29), 4);
-        let after = drain(&mut after_rx, "after the cancelled and failed lanes");
-        assert_eq!((after.tokens, after.finish), (4, FinishReason::Length));
-        drop(streamer);
-    }
-
-    fn walk_request(prompt: Vec<u32>, max_tokens: usize) -> (GenerateRequest, TokenStreamReceiver) {
-        let (token_tx, token_rx) = TokenSink::standalone();
-        (
-            GenerateRequest {
-                trace_parent: None,
-                request_id: None,
-                queued_at_unix_s: None,
-                data_parallel_rank: None,
-                prompt_tokens: prompt,
-                params: pegainfer_frontend::sampler::SamplingParams {
-                    ignore_eos: true,
-                    ..pegainfer_frontend::sampler::SamplingParams::default()
-                },
-                max_tokens,
-                lora_adapter: None,
-                kv_transfer_params: None,
-                token_tx,
-                logprobs: 0,
-                echo: false,
-            },
-            token_rx,
-        )
-    }
-
-    fn walk_drain(rx: &mut TokenStreamReceiver, name: &str, into: &mut Vec<u32>) {
-        loop {
-            match rx.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Token { id, .. }) => into.push(id),
-                Some(TokenEvent::Finished { .. }) => return,
-                Some(TokenEvent::Error { message, .. } | TokenEvent::Rejected { message, .. }) => {
-                    panic!("{name}: {message}")
-                }
-                Some(_) => {}
-                None => panic!("{name}: channel closed without Finished"),
-            }
-        }
-    }
-
-    /// A single-request episode through the plain admission path — the
-    /// engine's own serial reference: same suppression, same sampler.
-    fn walk_serial(state: &mut super::EngineState, prompt: &[u32], budget: usize) -> Vec<u32> {
-        let (request, mut rx) = walk_request(prompt.to_vec(), budget);
-        let mut active = Vec::new();
-        let mut pending = std::collections::VecDeque::new();
-        let mut attempts = 0usize;
-        match state.admit_and_prefill(
-            (request, pegainfer_frontend::engine::KvPrefix::none()),
-            false,
-            &mut active,
-            &mut pending,
-            &mut attempts,
-        ) {
-            super::Admitted::Active(entry) => active.push(*entry),
-            super::Admitted::Done => {}
-            super::Admitted::Requeue(_) => panic!("serial episode requeued"),
-        }
-        while !active.is_empty() {
-            state.decode_round(&mut active);
-        }
-        let mut out = Vec::new();
-        walk_drain(&mut rx, "serial episode", &mut out);
-        out
-    }
-
-    fn walk_prompts() -> Vec<Vec<u32>> {
-        crate::testkit::generate_fixture_prompts()
-    }
-
-    fn headroom_admit(
-        state: &mut super::EngineState,
-        prompt: Vec<u32>,
-        max_tokens: usize,
-        active: &mut Vec<super::Active>,
-        pending: &mut std::collections::VecDeque<pegainfer_frontend::engine::SubmittedRequest>,
-    ) -> TokenStreamReceiver {
-        let (request, rx) = walk_request(prompt, max_tokens);
-        let mut attempts = 0usize;
-        match state.admit_and_prefill(
-            (request, pegainfer_frontend::engine::KvPrefix::none()),
-            false,
-            active,
-            pending,
-            &mut attempts,
-        ) {
-            super::Admitted::Active(entry) => active.push(*entry),
-            super::Admitted::Done => {}
-            super::Admitted::Requeue(_) => panic!("headroom admission requeued"),
-        }
-        rx
-    }
-
-    /// Load an engine with the chunk knob set ahead of the load — the pool
-    /// is sized by it — while the other serving knobs are cleared for the
-    /// duration, so the outside environment cannot change the pool or the
-    /// admission route under the test.
-    fn walk_test_state(chunk: &str) -> super::EngineState {
-        let dir = crate::testkit::model_path();
-        let policy = super::generation_policy(&dir).expect("policy");
-        let _env = scoped_engine_env(&[("PEGAINFER_MIX_CHUNK_TOKENS", chunk)]);
-        super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state")
-    }
-
-    /// Invalid knob combinations refuse before the multi-GiB load — the
-    /// startup policy the serving doc promises.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint and --test-threads=1"]
-    fn the_raise_refuses_without_its_prerequisites() {
-        let dir = crate::testkit::model_path();
-        let load = |overrides: &[(&str, &str)]| {
-            let policy = super::generation_policy(&dir).expect("policy");
-            let _env = scoped_engine_env(overrides);
-            super::EngineState::load(&dir, 0, policy, 0x5EED, true)
-        };
-        let err = load(&[("PEGAINFER_MAX_CONTEXT", "32768")])
-            .err()
-            .expect("a raise without the chunk knob must refuse");
-        assert!(
-            format!("{err:#}").contains("needs PEGAINFER_MIX_CHUNK_TOKENS"),
-            "unexpected refusal: {err:#}"
-        );
-        let err = load(&[
-            ("PEGAINFER_MAX_CONTEXT", "32768"),
-            ("PEGAINFER_MIX_CHUNK_TOKENS", "2048"),
-            ("PEGAINFER_ASYNC_PREFILL", "green:35"),
-        ])
-        .err()
-        .expect("the lane over the default ceiling must refuse");
-        assert!(
-            format!("{err:#}").contains("unsupported over"),
-            "unexpected refusal: {err:#}"
-        );
-        let err = load(&[
-            (super::ADMIT_COALESCE_ENV, "300"),
-            (super::ASYNC_PREFILL_ENV, "green:35"),
-        ])
-        .err()
-        .expect("the coalesce door and async lane must refuse");
-        assert!(
-            format!("{err:#}").contains("the door could only delay it"),
-            "unexpected refusal: {err:#}"
-        );
-    }
-
-    /// Drive the production intake turn with an injected clock: closed turns
-    /// preserve the live stream, cohort and timeout releases each drain one
-    /// burst, and an open door still respects slot capacity.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-    fn the_coalesce_door_releases_one_admission_burst() {
-        let dir = crate::testkit::model_path();
-        let policy = super::generation_policy(&dir).expect("policy");
-        let _env = scoped_engine_env(&[
-            (super::ADMIT_COALESCE_ENV, "2000"),
-            (super::DECODE_SLOTS_ENV, "4"),
-        ]);
-        let mut state =
-            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
-        let mut pending = std::collections::VecDeque::new();
-        let mut active = Vec::new();
-        let mut door = state.coalesce_door();
-        let now = std::time::Instant::now();
-        let (incumbent, mut incumbent_rx) = walk_request(ids(40, 1), 64);
-        pending.push_back((incumbent, pegainfer_frontend::engine::KvPrefix::none()));
-        assert!(
-            state.intake_turn(&mut door, &mut pending, &mut active, now),
-            "closed-wait setup: an idle roster opens"
-        );
-        assert_eq!(active.len(), 1, "closed-wait setup: the roster is live");
-        let mut incumbent_tokens = 0;
-        while let Ok((_, event)) = incumbent_rx.try_recv() {
-            if matches!(event, TokenEvent::Token { .. }) {
-                incumbent_tokens += 1;
-            }
-        }
-
-        let (second, mut second_rx) = walk_request(ids(40, 2), 4);
-        let (third, mut third_rx) = walk_request(ids(40, 3), 4);
-        pending.push_back((second, pegainfer_frontend::engine::KvPrefix::none()));
-        pending.push_back((third, pegainfer_frontend::engine::KvPrefix::none()));
-        assert!(
-            !state.intake_turn(&mut door, &mut pending, &mut active, now),
-            "closed wait: two arrivals stay behind the door"
-        );
-        assert!(
-            second_rx.try_recv().is_err(),
-            "closed wait: the second arrival is not scheduled"
-        );
-        assert!(
-            third_rx.try_recv().is_err(),
-            "closed wait: the third arrival is not scheduled"
-        );
-        // The decode pipeline emits one step behind, so give the token a
-        // bounded number of rounds to surface.
-        let before_closed_decode = incumbent_tokens;
-        for _ in 0..3 {
-            state.decode_round(&mut active);
-            while let Ok((_, event)) = incumbent_rx.try_recv() {
-                if matches!(event, TokenEvent::Token { .. }) {
-                    incumbent_tokens += 1;
-                }
-            }
-            if incumbent_tokens > before_closed_decode {
-                break;
-            }
-        }
-        assert!(
-            incumbent_tokens > before_closed_decode,
-            "closed wait: decode advances the incumbent between intake turns"
-        );
-
-        let (fourth, mut fourth_rx) = walk_request(ids(40, 4), 4);
-        pending.push_back((fourth, pegainfer_frontend::engine::KvPrefix::none()));
-        assert!(
-            state.intake_turn(&mut door, &mut pending, &mut active, now),
-            "cohort release: the third arrival opens the door"
-        );
-        assert!(
-            pending.is_empty(),
-            "cohort release: one turn drains the queue"
-        );
-        assert_eq!(active.len(), 4, "cohort release: every waiter is admitted");
-        while active.len() > 1 {
-            state.decode_round(&mut active);
-        }
-        let second = drain(&mut second_rx, "second");
-        let third = drain(&mut third_rx, "third");
-        let fourth = drain(&mut fourth_rx, "fourth");
-        assert_eq!(
-            (second.scheduled, third.scheduled, fourth.scheduled),
-            (1, 1, 1),
-            "cohort release: every waiter carries exactly one Scheduled event"
-        );
-        assert_eq!(
-            active.len(),
-            1,
-            "cohort release: the incumbent keeps its stream"
-        );
-
-        let timeout_start = now + std::time::Duration::from_secs(3);
-        let (timeout_a, mut timeout_a_rx) = walk_request(ids(40, 5), 4);
-        let (timeout_b, mut timeout_b_rx) = walk_request(ids(40, 6), 4);
-        pending.push_back((timeout_a, pegainfer_frontend::engine::KvPrefix::none()));
-        pending.push_back((timeout_b, pegainfer_frontend::engine::KvPrefix::none()));
-        assert!(
-            !state.intake_turn(&mut door, &mut pending, &mut active, timeout_start),
-            "timeout release: a fresh sub-cohort starts closed"
-        );
-        let timeout_release = timeout_start + state.admit_coalesce.expect("door enabled");
-        assert!(
-            state.intake_turn(&mut door, &mut pending, &mut active, timeout_release),
-            "timeout release: the window opens the next intake turn"
-        );
-        assert!(
-            pending.is_empty(),
-            "timeout release: one turn drains the waiters"
-        );
-        while active.len() > 1 {
-            state.decode_round(&mut active);
-        }
-        assert_eq!(
-            (
-                drain(&mut timeout_a_rx, "timeout a").scheduled,
-                drain(&mut timeout_b_rx, "timeout b").scheduled,
-            ),
-            (1, 1),
-            "timeout release: every waiter carries one Scheduled event"
-        );
-
-        // The injected clock stays monotonic past the timeout release.
-        let free_slot_now = timeout_release + std::time::Duration::from_secs(1);
-        let (short, mut short_rx) = walk_request(ids(40, 7), 2);
-        let (long_a, mut long_a_rx) = walk_request(ids(40, 8), 8);
-        let (long_b, mut long_b_rx) = walk_request(ids(40, 9), 8);
-        pending.push_back((short, pegainfer_frontend::engine::KvPrefix::none()));
-        pending.push_back((long_a, pegainfer_frontend::engine::KvPrefix::none()));
-        pending.push_back((long_b, pegainfer_frontend::engine::KvPrefix::none()));
-        assert!(
-            state.intake_turn(&mut door, &mut pending, &mut active, free_slot_now),
-            "one free slot setup: a full cohort opens"
-        );
-        assert_eq!(active.len(), 4, "one free slot setup: the roster is full");
-        let (replacement, mut replacement_rx) = walk_request(ids(40, 10), 4);
-        pending.push_back((replacement, pegainfer_frontend::engine::KvPrefix::none()));
-        assert!(
-            state.intake_turn(&mut door, &mut pending, &mut active, free_slot_now),
-            "one free slot: the capacity-bounded floor opens the turn"
-        );
-        assert_eq!(
-            pending.len(),
-            1,
-            "one free slot: a full roster admits nothing"
-        );
-        assert!(
-            replacement_rx.try_recv().is_err(),
-            "one free slot: the replacement is not scheduled while full"
-        );
-        state.decode_round(&mut active);
-        assert_eq!(
-            active.len(),
-            3,
-            "one free slot: exactly one incumbent finishes"
-        );
-        assert!(
-            state.intake_turn(&mut door, &mut pending, &mut active, free_slot_now),
-            "one free slot: the next turn opens for the replacement"
-        );
-        assert!(
-            pending.is_empty(),
-            "one free slot: the replacement is admitted"
-        );
-        while !active.is_empty() {
-            state.decode_round(&mut active);
-        }
-        assert_eq!(
-            drain(&mut replacement_rx, "replacement").scheduled,
-            1,
-            "one free slot: the replacement carries one Scheduled event"
-        );
-        let short = drain(&mut short_rx, "short incumbent");
-        let long_a = drain(&mut long_a_rx, "long incumbent a");
-        let long_b = drain(&mut long_b_rx, "long incumbent b");
-        let incumbent = drain(&mut incumbent_rx, "incumbent");
-        assert_eq!(
-            incumbent_tokens + incumbent.tokens,
-            64,
-            "one free slot: the original incumbent keeps its whole stream"
-        );
-        assert_eq!(
-            (short.tokens, long_a.tokens, long_b.tokens),
-            (2, 8, 8),
-            "one free slot: every incumbent keeps its stream"
-        );
-    }
-
-    /// The slots boundary, driven at the roster edge the engine loop owns
-    /// — the same intake method, single-threaded, no clocks, no
-    /// thresholds: with both slots held by live requests an intake pass
-    /// leaves the third queued with no Scheduled; once an incumbent
-    /// retires, the same intake admits it and it runs to its budget.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-    fn the_raised_ceiling_and_slots_hold_at_the_roster_edge() {
-        let dir = crate::testkit::model_path();
-        let policy = super::generation_policy(&dir).expect("policy");
-        let _env = scoped_engine_env(&[
-            ("PEGAINFER_MAX_CONTEXT", "32768"),
-            ("PEGAINFER_MIX_CHUNK_TOKENS", "2048"),
-            ("PEGAINFER_DECODE_SLOTS", "2"),
-        ]);
-        let mut state =
-            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
-        assert_eq!(
-            state.max_context, 32768,
-            "the engine follows the raised ceiling"
-        );
-        let prompts = walk_prompts();
-        let long: Vec<u32> = prompts[0].iter().cycle().copied().take(12000).collect();
-        let (req_a, mut rx_a) = walk_request(long, 4);
-        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), 40);
-        let (req_c, mut rx_c) = walk_request(prompts[2].clone(), 6);
-
-        let mut pending = std::collections::VecDeque::new();
-        let mut active: Vec<super::Active> = Vec::new();
-        pending.push_back((req_a, pegainfer_frontend::engine::KvPrefix::none()));
-        pending.push_back((req_b, pegainfer_frontend::engine::KvPrefix::none()));
-        state.admit_from_queue(&mut pending, &mut active);
-        assert_eq!(active.len(), 2, "both slots are held by live requests");
-        assert!(pending.is_empty(), "nothing waits yet");
-
-        pending.push_back((req_c, pegainfer_frontend::engine::KvPrefix::none()));
-        state.admit_from_queue(&mut pending, &mut active);
-        assert_eq!(
-            pending.len(),
-            1,
-            "the intake leaves the third request queued at full slots"
-        );
-        assert!(
-            rx_c.try_recv().is_err(),
-            "no Scheduled while both slots are held"
-        );
-
-        while active.len() == 2 {
-            state.decode_round(&mut active);
-        }
-        state.admit_from_queue(&mut pending, &mut active);
-        assert_eq!(active.len(), 2, "the freed slot admits the third request");
-        assert!(pending.is_empty(), "the queue drained");
-        while !active.is_empty() {
-            state.decode_round(&mut active);
-        }
-        assert_eq!(drain(&mut rx_a, "incumbent a").tokens, 4);
-        assert_eq!(drain(&mut rx_b, "incumbent b").tokens, 40);
-        assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
-    }
-
-    /// The production loop runs an intake pass before every decode round.
-    /// With both slots held and a request queued, that pass can admit
-    /// nothing, so it must leave the staged successor and the step
-    /// fingerprint alone; the third request joins only once a slot frees.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-    fn the_full_roster_keeps_its_pipeline_under_a_queue() {
-        let dir = crate::testkit::model_path();
-        let policy = super::generation_policy(&dir).expect("policy");
-        let _env = scoped_engine_env(&[("PEGAINFER_DECODE_SLOTS", "2")]);
-        let mut state =
-            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
-        let prompts = walk_prompts();
-        let (req_a, mut rx_a) = walk_request(prompts[0].clone(), 24);
-        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), 40);
-        let (req_c, mut rx_c) = walk_request(prompts[2].clone(), 6);
-
-        let mut pending = std::collections::VecDeque::new();
-        let mut active: Vec<super::Active> = Vec::new();
-        pending.push_back((req_a, pegainfer_frontend::engine::KvPrefix::none()));
-        pending.push_back((req_b, pegainfer_frontend::engine::KvPrefix::none()));
-        state.admit_from_queue(&mut pending, &mut active);
-        assert_eq!(active.len(), 2, "both slots are held by live requests");
-        pending.push_back((req_c, pegainfer_frontend::engine::KvPrefix::none()));
-
-        state.decode_round(&mut active);
-        state.decode_round(&mut active);
-        assert!(
-            state.pipeline.is_some(),
-            "a greedy batch stages a successor"
-        );
-        assert!(
-            state.arena.has_decode_fingerprint(),
-            "a regular step leaves its fingerprint"
-        );
-        for round in 0..4 {
-            state.admit_from_queue(&mut pending, &mut active);
-            assert_eq!(
-                pending.len(),
-                1,
-                "round {round}: full slots keep the third queued"
-            );
-            assert!(
-                state.pipeline.is_some(),
-                "round {round}: an intake that admits nothing keeps the pipeline"
-            );
-            assert!(
-                state.arena.has_decode_fingerprint(),
-                "round {round}: and the fingerprint"
-            );
-            state.decode_round(&mut active);
-        }
-
-        while active.len() == 2 {
-            state.admit_from_queue(&mut pending, &mut active);
-            state.decode_round(&mut active);
-        }
-        state.admit_from_queue(&mut pending, &mut active);
-        assert_eq!(active.len(), 2, "the freed slot admits the third request");
-        assert!(pending.is_empty(), "the queue drained");
-        while !active.is_empty() {
-            state.admit_from_queue(&mut pending, &mut active);
-            state.decode_round(&mut active);
-        }
-        assert_eq!(drain(&mut rx_a, "incumbent a").tokens, 24);
-        assert_eq!(drain(&mut rx_b, "incumbent b").tokens, 40);
-        assert_eq!(drain(&mut rx_c, "queued third").tokens, 6);
-    }
-
-    /// A roster that empties leaves its last fingerprint in the arena. The
-    /// solo admission that refills the idle engine must drop it: a new
-    /// request whose frontier sits one token past the retired one's, with
-    /// the same page structure, would otherwise take the regular-step skip
-    /// on its first decode and keep the retired roster's page tables.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-    fn an_idle_refill_drops_the_retired_fingerprint() {
-        let dir = crate::testkit::model_path();
-        let policy = super::generation_policy(&dir).expect("policy");
-        let _env = scoped_engine_env(&[("PEGAINFER_DECODE_SLOTS", "2")]);
-        let prompts = walk_prompts();
-        let first_len = 64usize;
-        let budget = 8usize;
-        let first: Vec<u32> = prompts[0].iter().cycle().copied().take(first_len).collect();
-        // The retired request's last step ran at kv_len = first_len + budget - 1;
-        // this prompt's first decode step runs at exactly one more.
-        let second: Vec<u32> = prompts[1]
-            .iter()
-            .cycle()
-            .copied()
-            .take(first_len + budget - 1)
-            .collect();
-
-        let run_second_alone = |state: &mut super::EngineState| -> Drained {
-            let (req, mut rx) = walk_request(second.clone(), budget);
-            let mut pending = std::collections::VecDeque::new();
-            let mut active: Vec<super::Active> = Vec::new();
-            pending.push_back((req, pegainfer_frontend::engine::KvPrefix::none()));
-            state.admit_from_queue(&mut pending, &mut active);
-            assert_eq!(active.len(), 1, "the prompt is admitted");
-            assert!(
-                !state.arena.has_decode_fingerprint(),
-                "a solo admission starts with no fingerprint"
-            );
-            while !active.is_empty() {
-                state.admit_from_queue(&mut pending, &mut active);
-                state.decode_round(&mut active);
-            }
-            drain(&mut rx, "second")
-        };
-
-        let mut state =
-            super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state");
-        let (req_a, mut rx_a) = walk_request(first, budget);
-        let mut pending = std::collections::VecDeque::new();
-        let mut active: Vec<super::Active> = Vec::new();
-        pending.push_back((req_a, pegainfer_frontend::engine::KvPrefix::none()));
-        state.admit_from_queue(&mut pending, &mut active);
-        while !active.is_empty() {
-            state.admit_from_queue(&mut pending, &mut active);
-            state.decode_round(&mut active);
-        }
-        assert_eq!(drain(&mut rx_a, "first").tokens, budget);
-        assert!(
-            state.arena.has_decode_fingerprint(),
-            "the retired roster leaves its fingerprint behind"
-        );
-        let refilled = run_second_alone(&mut state);
-
-        drop(state);
-        let fresh_policy = super::generation_policy(&dir).expect("policy");
-        let mut fresh = super::EngineState::load(&dir, 0, fresh_policy, 0x5EED, true)
-            .expect("fresh engine state");
-        let alone = run_second_alone(&mut fresh);
-        assert_eq!(refilled.tokens, budget);
-        assert_eq!(
-            refilled.ids, alone.ids,
-            "the refill answers exactly as a fresh engine does"
-        );
-    }
-
-    /// The chunked pool provisions one shared segment transient, so no
-    /// walker may park pages ahead of its rounds: with the knob set before
-    /// load — the reduced production pool, asserted against the provision
-    /// arithmetic — twelve streams at full window plus three near-context
-    /// prompts entering one gather must all finish. Parked first quanta
-    /// across the walkers exhausted this pool.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-    fn the_gathered_transient_leaves_headroom() {
-        let dir = crate::testkit::model_path();
-        let mut state = walk_test_state("2048");
-        assert_eq!(state.mix_chunk, Some(2048), "the knob preceded the load");
-        assert_eq!(state.max_context, 8192, "the ceiling default held");
-        assert_eq!(state.slots, 16, "the slots default held");
-        let window = crate::config::Gemma4Config::from_file(&dir)
-            .expect("config")
-            .sliding_window;
-        let window_pages = window.div_ceil(crate::kv::PAGE_SIZE) + 1;
-        let provisioned = window_pages
-            + 2048usize.div_ceil(crate::kv::PAGE_SIZE)
-            + (super::MIX_MAX_PROMPTS - 1)
-            + (super::MAX_CONCURRENCY - 1) * window_pages;
-        assert_eq!(
-            state.serve.local_pool.available_pages(),
-            provisioned,
-            "the pool was sized by the reduced chunked provision"
-        );
-
-        let prompts = walk_prompts();
-        let stream_prompt: Vec<u32> = prompts[0].iter().cycle().copied().take(1500).collect();
-        let long: Vec<u32> = prompts[0].iter().cycle().copied().take(5900).collect();
-
-        let mut active: Vec<super::Active> = Vec::new();
-        let mut pending = std::collections::VecDeque::new();
-        let mut stream_rx: Vec<TokenStreamReceiver> = (0..12)
-            .map(|_| {
-                headroom_admit(
-                    &mut state,
-                    stream_prompt.clone(),
-                    60,
-                    &mut active,
-                    &mut pending,
-                )
-            })
-            .collect();
-        assert_eq!(active.len(), 12, "every stream holds a decode slot");
-
-        let mut long_rx: Vec<TokenStreamReceiver> = Vec::new();
-        let (first_long, first_rx) = walk_request(long.clone(), 2);
-        long_rx.push(first_rx);
-        for _ in 0..2 {
-            let (request, rx) = walk_request(long.clone(), 2);
-            pending.push_back((request, pegainfer_frontend::engine::KvPrefix::none()));
-            long_rx.push(rx);
-        }
-        let mut attempts = 0usize;
-        match state.admit_and_prefill(
-            (first_long, pegainfer_frontend::engine::KvPrefix::none()),
-            false,
-            &mut active,
-            &mut pending,
-            &mut attempts,
-        ) {
-            super::Admitted::Done => {}
-            _ => panic!("the gathered walk must land every walker in the batch"),
-        }
-        assert!(
-            pending.is_empty(),
-            "all three newcomers must enter one gather"
-        );
-        // Walkers graduate at their final segment's round and may retire
-        // through their two-token budgets before the walk returns; the
-        // streams must all still be decoding, and the drains below hold
-        // every request to its full budget.
-        assert!(
-            active.len() >= 12,
-            "a stream lost its slot during the walk: {} active",
-            active.len()
-        );
-        while !active.is_empty() {
-            state.decode_round(&mut active);
-        }
-        for (i, rx) in long_rx.iter_mut().enumerate() {
-            let mut produced = Vec::new();
-            walk_drain(rx, &format!("long prompt {i}"), &mut produced);
-            assert_eq!(produced.len(), 2, "long prompt {i} reached its budget");
-        }
-        for (i, rx) in stream_rx.iter_mut().enumerate() {
-            let mut produced = Vec::new();
-            walk_drain(rx, &format!("stream {i}"), &mut produced);
-            assert_eq!(produced.len(), 60, "stream {i} reached its budget");
-        }
-    }
-
-    /// One shared walk against the engine's own serial path, on the reduced
-    /// production pool with the 64-row production floor: three fixture
-    /// prompts get their reference sequences from single-request episodes
-    /// through the production admission path, then a rider decodes while
-    /// the other two enter one gathered walk, both walk again from an idle
-    /// roster (the segment-by-segment tail path) at a 24-row span so
-    /// boundary rounds carry a final and a non-final segment, and a walker
-    /// cancelled before the first round is dropped without touching its
-    /// partner or the rider. Every surviving request's greedy sequence
-    /// must match its reference whole. The direct `mixed_walk` calls in
-    /// the later phases stage what the production loop cannot pin
-    /// deterministically — a drained roster, a mid-walk disconnect, a
-    /// span below the knob floor — with the production zero-ahead
-    /// reservation shape: nothing is admitted before the walk. Those
-    /// phases are algorithm oracles for `mixed_walk` itself, not serving
-    /// evidence: the public floor rejects spans under 64.
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-    fn the_gathered_walk_matches_the_serial_path() {
-        let mut state = walk_test_state("64");
-        assert_eq!(state.mix_chunk, Some(64), "the knob preceded the load");
-        let prompts = walk_prompts();
-        let cases = ["a", "b", "c"];
-        let budgets = [24usize, 17, 21];
-
-        let serial: Vec<Vec<u32>> = prompts
-            .iter()
-            .zip(budgets)
-            .map(|(prompt, budget)| walk_serial(&mut state, prompt, budget))
-            .collect();
-        for (i, sequence) in serial.iter().enumerate() {
-            assert_eq!(
-                sequence.len(),
-                budgets[i],
-                "serial episode {i} reached its budget"
-            );
-        }
-
-        // Rider live, walkers b and c entering one production gather.
-        let mut active: Vec<super::Active> = Vec::new();
-        let mut pending = std::collections::VecDeque::new();
-        let mut rx_a = headroom_admit(
-            &mut state,
-            prompts[0].clone(),
-            budgets[0],
-            &mut active,
-            &mut pending,
-        );
-        assert_eq!(active.len(), 1, "the rider holds a decode slot");
-
-        let (req_b, mut rx_b) = walk_request(prompts[1].clone(), budgets[1]);
-        let (req_c, mut rx_c) = walk_request(prompts[2].clone(), budgets[2]);
-        pending.push_back((req_c, pegainfer_frontend::engine::KvPrefix::none()));
-        let mut attempts = 0usize;
-        match state.admit_and_prefill(
-            (req_b, pegainfer_frontend::engine::KvPrefix::none()),
-            false,
-            &mut active,
-            &mut pending,
-            &mut attempts,
-        ) {
-            super::Admitted::Done => {}
-            _ => panic!("the gathered walk must land every walker in the batch"),
-        }
-        assert!(pending.is_empty(), "both walkers must enter one gather");
-        assert_eq!(active.len(), 3, "rider plus both walkers keep decoding");
-        while !active.is_empty() {
-            state.decode_round(&mut active);
-        }
-        let mut produced: Vec<Vec<u32>> = vec![Vec::new(); 3];
-        walk_drain(&mut rx_a, "rider", &mut produced[0]);
-        walk_drain(&mut rx_b, "walker b", &mut produced[1]);
-        walk_drain(&mut rx_c, "walker c", &mut produced[2]);
-        for (i, case) in cases.iter().enumerate() {
-            assert_eq!(
-                produced[i], serial[i],
-                "case {case}: the gathered walk diverged from the serial path"
-            );
-            eprintln!("case {case}: {} tokens gathered == serial", serial[i].len());
-        }
-
-        // The same walk from an idle roster — the tails feed segment by
-        // segment through the drained-roster path, nothing admitted ahead.
-        let (req_a2, mut rx_a2) = walk_request(prompts[0].clone(), budgets[0]);
-        let (req_b2, mut rx_b2) = walk_request(prompts[1].clone(), budgets[1]);
-        let kv_a2 = state.serve.alloc_kv();
-        let kv_b2 = state.serve.alloc_kv();
-        let mut active2: Vec<super::Active> = Vec::new();
-        let admitted2 = state.mixed_walk(
-            24,
-            vec![(req_a2, kv_a2, None), (req_b2, kv_b2, None)],
-            &mut active2,
-        );
-        assert!(
-            matches!(admitted2, super::Admitted::Done),
-            "the idle walk returns Done"
-        );
-        assert_eq!(active2.len(), 2, "both idle walkers keep decoding");
-        while !active2.is_empty() {
-            state.decode_round(&mut active2);
-        }
-        let mut produced2: Vec<Vec<u32>> = vec![Vec::new(); 2];
-        walk_drain(&mut rx_a2, "idle walker a", &mut produced2[0]);
-        walk_drain(&mut rx_b2, "idle walker b", &mut produced2[1]);
-        for i in 0..2 {
-            assert_eq!(
-                produced2[i], serial[i],
-                "idle case {}: the walk diverged from the serial path",
-                cases[i]
-            );
-        }
-
-        // A walker whose client disconnected before the first round is
-        // dropped without consuming rounds — while a rider decodes through
-        // them — and the survivors still match the serial path.
-        let (req_c3, mut rx_c3) = walk_request(prompts[2].clone(), budgets[2]);
-        let mut pending3 = std::collections::VecDeque::new();
-        let mut attempts3 = 0usize;
-        let mut active3: Vec<super::Active> = Vec::new();
-        match state.admit_and_prefill(
-            (req_c3, pegainfer_frontend::engine::KvPrefix::none()),
-            false,
-            &mut active3,
-            &mut pending3,
-            &mut attempts3,
-        ) {
-            super::Admitted::Active(entry) => active3.push(*entry),
-            _ => panic!("phase three rider admission must hand back an active lane"),
-        }
-        let (req_a3, rx_a3) = walk_request(prompts[0].clone(), budgets[0]);
-        let (req_b3, mut rx_b3) = walk_request(prompts[1].clone(), budgets[1]);
-        drop(rx_a3);
-        let kv_a3 = state.serve.alloc_kv();
-        let kv_b3 = state.serve.alloc_kv();
-        state.ready_decode_rows(&mut active3);
-        let admitted3 = state.mixed_walk(
-            24,
-            vec![(req_a3, kv_a3, None), (req_b3, kv_b3, None)],
-            &mut active3,
-        );
-        assert!(
-            matches!(admitted3, super::Admitted::Done),
-            "the walk with a cancelled walker returns Done"
-        );
-        assert_eq!(
-            active3.len(),
-            2,
-            "the rider and the surviving walker keep decoding"
-        );
-        while !active3.is_empty() {
-            state.decode_round(&mut active3);
-        }
-        let mut produced3 = Vec::new();
-        walk_drain(&mut rx_b3, "surviving walker", &mut produced3);
-        assert_eq!(
-            produced3, serial[1],
-            "the surviving walker diverged from the serial path"
-        );
-        let mut produced_rider3 = Vec::new();
-        walk_drain(&mut rx_c3, "phase three rider", &mut produced_rider3);
-        assert_eq!(
-            produced_rider3, serial[2],
-            "the phase three rider diverged from the serial path"
-        );
-    }
-
-    /// The production gather against one live engine, interleavings pinned:
-    /// the streamer's budget outlasts the script and its sink drops last,
-    /// so the decode batch is never empty and every admission takes the
-    /// gather path. Dead and invalid submissions queued ahead of a valid
-    /// prompt drain within the shared admission budget without wedging the
-    /// engine; a warm prefix-cache hit whose rendered prompt exceeds the
-    /// gather ceiling but whose unseen suffix does not still resolves and
-    /// completes; and every survivor finishes its full budget.
-    fn gather_lifecycle_script() {
-        let dir = crate::testkit::model_path();
-        let _env = scoped_engine_env(&[("PEGAINFER_PREFIX_CACHE", "4")]);
-        let handle =
-            super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
-
-        let streamer = pin_live_stream(&handle);
-
-        // Dead and invalid submissions ahead of a valid prompt: the gather
-        // drains them against the shared budget and the valid one lands.
-        drop(submit(&handle, ids(50, 1), 4));
-        drop(submit(&handle, ids(50, 2), 4));
-        let mut invalid_rx = submit(&handle, Vec::new(), 4);
-        let mut valid_rx = submit(&handle, ids(60, 3), 4);
-        loop {
-            match invalid_rx.blocking_recv().map(|(_, event)| event) {
-                Some(TokenEvent::Rejected { message, .. }) => {
-                    assert!(message.contains("empty prompt"), "unexpected: {message}");
-                    break;
-                }
-                Some(TokenEvent::Token { .. } | TokenEvent::Finished { .. }) => {
-                    panic!("an empty prompt must be rejected")
-                }
-                Some(_) => {}
-                None => panic!("invalid submission lost its rejection"),
-            }
-        }
-        let valid = drain(&mut valid_rx, "valid after the corpses");
-        assert_eq!((valid.tokens, valid.finish), (4, FinishReason::Length));
-
-        // Warm gather: a captured long conversation resumes with a short
-        // suffix while a short primary sits ahead in the same intake — the
-        // rendered prompt is far past the gather ceiling, its unseen suffix
-        // far under it.
-        let long_prompt = ids(1600, 7);
-        let mut long_rx = submit(&handle, long_prompt.clone(), 4);
-        let long_done = drain(&mut long_rx, "long prefill");
-        assert_eq!(
-            (long_done.tokens, long_done.finish),
-            (4, FinishReason::Length)
-        );
-        let mut head_rx = submit(&handle, ids(60, 13), 4);
-        let mut warm_rx = submit(&handle, warm_prompt(&long_prompt), 4);
-        let head = drain(&mut head_rx, "gather head");
-        assert_eq!((head.tokens, head.finish), (4, FinishReason::Length));
-        assert_warm_result(&mut warm_rx, 1600, "warm gathered suffix");
-
-        drop(streamer);
-    }
-
-    #[test]
-    #[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
-    fn the_shared_lane_lifecycle_completes() {
-        lane_lifecycle_script("shared");
-    }
-
-    #[test]
-    #[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
-    fn the_green_lane_lifecycle_completes() {
-        lane_lifecycle_script("green:35");
-    }
-
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
-    fn the_gathered_lifecycle_completes() {
-        gather_lifecycle_script();
-    }
-
-    #[test]
-    fn pool_pages_follow_the_knobs() {
-        // The documented defaults: 8192 ceiling, 16 slots, no cache.
-        assert_eq!(
-            super::pool_pages(512, 65, 512, 16, 0, 256),
-            Some((1488, 8193))
-        );
-        // Raised 32768 x 2 slots with a 2048 chunk: transient = W + 128 + 3.
-        assert_eq!(
-            super::pool_pages(196, 65, 2048, 2, 0, 1024),
-            Some((262, 4097))
-        );
-        assert_eq!(super::pool_pages(usize::MAX, 65, 512, 16, 0, 256), None);
-    }
-}
+#[path = "engine/lane_test_env.rs"]
+mod lane_test_env;
+
+#[cfg(test)]
+#[path = "engine/lane_step_collector.rs"]
+mod lane_step_collector;
+
+#[cfg(test)]
+#[path = "engine/lane_tests.rs"]
+mod lane_tests;
+
+#[cfg(test)]
+#[path = "engine/lane_gates_lifecycle.rs"]
+mod lane_gates_lifecycle;
+
+#[cfg(test)]
+#[path = "engine/lane_gates_roster.rs"]
+mod lane_gates_roster;
+
+#[cfg(test)]
+#[path = "engine/lane_gates_walk.rs"]
+mod lane_gates_walk;

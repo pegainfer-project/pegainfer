@@ -68,4 +68,33 @@ impl KvBuffer {
     pub fn num_blocks(&self) -> usize {
         self.inner.num_blocks
     }
+
+    /// Stream-ordered device-to-device copy of one whole page (every layer's
+    /// K/V for `page_size` tokens — one contiguous `page_stride` range in the
+    /// page-first layout). Both pages must lie inside the buffer; scratch
+    /// pages past the pool's block count are valid targets.
+    pub fn copy_page(
+        &self,
+        stream: &CudaStream,
+        src_page: usize,
+        dst_page: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            src_page < self.inner.num_blocks && dst_page < self.inner.num_blocks,
+            "KV page copy out of range: {src_page} -> {dst_page} of {}",
+            self.inner.num_blocks
+        );
+        if src_page == dst_page {
+            return Ok(());
+        }
+        let stride = self.inner.layout.page_stride;
+        let elem = std::mem::size_of::<bf16>();
+        let (base, _guard) = self.inner.buffer.device_ptr(stream);
+        let src = base + (src_page * stride * elem) as u64;
+        let dst = base + (dst_page * stride * elem) as u64;
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(dst, src, stride * elem, stream.cu_stream())
+        }
+        .map_err(|e| anyhow::anyhow!("KV page copy failed: {e}"))
+    }
 }

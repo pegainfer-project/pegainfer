@@ -376,7 +376,9 @@ pub fn argmax_batch_bf16_split_partials_len(rows: usize, vocab: usize) -> usize 
 /// `MARKOV_STEP_TILE_ELEMS` in `argmax.cu`).
 pub fn markov_step_argmax_partials_len(rows: usize, vocab: usize) -> usize {
     const TILE_ELEMS: usize = 1024;
-    rows * vocab.div_ceil(TILE_ELEMS)
+    // Saturating: an overflowing request then fails every buffer-length check
+    // downstream instead of wrapping into a small (falsely satisfiable) need.
+    rows.saturating_mul(vocab.div_ceil(TILE_ELEMS))
 }
 
 /// Row-wise two-stage bf16 argmax over `rows` rows of `n`: tile-parallel
@@ -604,7 +606,8 @@ pub unsafe fn logprob_topk_batch_bf16_into(
 /// u32 (so it feeds straight back as the next step's prev-token lookup).
 /// `base` is the request-major block logits `[rows*block_size, vocab]`; `bias`
 /// is the per-request Markov logit bias `[rows, vocab]` for this step. `partial_*`
-/// must hold `argmax_batch_bf16_split_partials_len(rows, vocab)` elements.
+/// must hold [`markov_step_argmax_partials_len`] elements — this path tiles
+/// finer than the batched argmax, so its partials buffer is NOT the same size.
 /// `sampled_tokens` receives the request-major block token at
 /// `row * block_size + step`, allowing callers to D2H the finished block once.
 #[allow(clippy::too_many_arguments)]
@@ -620,8 +623,103 @@ pub fn markov_step_argmax_into(
     out_tokens: &mut CudaSlice<u32>,
     sampled_tokens: &mut CudaSlice<u32>,
 ) -> Result<()> {
+    markov_step_argmax_impl(
+        ctx,
+        base,
+        bias,
+        block_size,
+        step,
+        1,
+        None,
+        rows,
+        partial_values,
+        partial_indices,
+        out_tokens,
+        sampled_tokens,
+    )
+}
+
+/// [`markov_step_argmax_into`] over `rows = groups * chains` chain-rows with a
+/// per-chain-group request map: chain-row `r` belongs to group `r / chains`
+/// and reads base block `req_map[r / chains]`, so a hedged subset that is not
+/// a batch prefix still addresses its own requests' logits.
+///
+/// # Safety
+///
+/// The map lives on device, so its CONTENTS cannot be validated here. The
+/// caller must guarantee every `req_map[0..rows/chains]` value is in
+/// `0..base.seq_len / block_size` — the kernel uses them directly as base
+/// block indices, and an out-of-range or negative value reads out of bounds
+/// on the GPU. Validate on the host before uploading.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn markov_step_argmax_mapped_into(
+    ctx: &DeviceContext,
+    base: &HiddenStates,
+    bias: &HiddenStates,
+    block_size: usize,
+    step: usize,
+    chains: usize,
+    req_map: &CudaSlice<i32>,
+    rows: usize,
+    partial_values: &mut CudaSlice<f32>,
+    partial_indices: &mut CudaSlice<i32>,
+    out_tokens: &mut CudaSlice<u32>,
+    sampled_tokens: &mut CudaSlice<u32>,
+) -> Result<()> {
+    markov_step_argmax_impl(
+        ctx,
+        base,
+        bias,
+        block_size,
+        step,
+        chains,
+        Some(req_map),
+        rows,
+        partial_values,
+        partial_indices,
+        out_tokens,
+        sampled_tokens,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn markov_step_argmax_impl(
+    ctx: &DeviceContext,
+    base: &HiddenStates,
+    bias: &HiddenStates,
+    block_size: usize,
+    step: usize,
+    chains: usize,
+    req_map: Option<&CudaSlice<i32>>,
+    rows: usize,
+    partial_values: &mut CudaSlice<f32>,
+    partial_indices: &mut CudaSlice<i32>,
+    out_tokens: &mut CudaSlice<u32>,
+    sampled_tokens: &mut CudaSlice<u32>,
+) -> Result<()> {
     if rows == 0 {
         return Err(anyhow!("markov step argmax requires at least one row"));
+    }
+    if base.hidden_dim == 0 {
+        return Err(anyhow!(
+            "markov step argmax requires a non-zero vocab (zero tiles would launch an empty grid)"
+        ));
+    }
+    if step >= block_size {
+        return Err(anyhow!(
+            "markov step step {step} >= block_size {block_size}"
+        ));
+    }
+    base.checked_extent("markov step base")?;
+    bias.checked_extent("markov step bias")?;
+    // The kernels derive their indices in signed int, so the products need
+    // bounding, not just each factor.
+    super::checked_i32(base.seq_len, "markov step base rows")?;
+    if rows > 65_535 {
+        return Err(anyhow!("markov step rows {rows} exceeds grid-y limit"));
+    }
+    if base.hidden_dim > (i32::MAX as usize) - 1024 {
+        return Err(anyhow!("markov step vocab {} too large", base.hidden_dim));
     }
     let vocab = base.hidden_dim;
     if bias.hidden_dim != vocab {
@@ -631,12 +729,29 @@ pub fn markov_step_argmax_into(
             vocab
         ));
     }
-    if base.seq_len < rows * block_size {
+    if chains == 0 || !rows.is_multiple_of(chains) {
         return Err(anyhow!(
-            "markov step base rows {} < rows*block_size {}",
-            base.seq_len,
-            rows * block_size
+            "markov step rows {rows} not divisible by chains {chains}"
         ));
+    }
+    let base_needed = (rows / chains)
+        .checked_mul(block_size)
+        .ok_or_else(|| anyhow!("markov step (rows/chains)*block_size overflow"))?;
+    if req_map.is_none() && base.seq_len < base_needed {
+        return Err(anyhow!(
+            "markov step base rows {} < (rows/chains)*block_size {}",
+            base.seq_len,
+            base_needed
+        ));
+    }
+    if let Some(map) = req_map {
+        if map.len() < rows / chains {
+            return Err(anyhow!(
+                "markov step req_map {} < chain groups {}",
+                map.len(),
+                rows / chains
+            ));
+        }
     }
     if bias.seq_len < rows {
         return Err(anyhow!("markov step bias rows {} < {}", bias.seq_len, rows));
@@ -648,11 +763,14 @@ pub fn markov_step_argmax_into(
             rows
         ));
     }
-    if sampled_tokens.len() < rows * block_size {
+    let sampled_needed = rows
+        .checked_mul(block_size)
+        .ok_or_else(|| anyhow!("markov step rows*block_size overflow"))?;
+    if sampled_tokens.len() < sampled_needed {
         return Err(anyhow!(
             "markov sampled-token scratch too small: {} < {}",
             sampled_tokens.len(),
-            rows * block_size
+            sampled_needed
         ));
     }
     let needed = markov_step_argmax_partials_len(rows, vocab);
@@ -664,6 +782,11 @@ pub fn markov_step_argmax_into(
             needed
         ));
     }
+    if needed > i32::MAX as usize || sampled_needed > i32::MAX as usize {
+        return Err(anyhow!(
+            "markov step index space too large: partials {needed}, sampled {sampled_needed}"
+        ));
+    }
 
     let (base_ptr, _gb) = base.data.device_ptr(&ctx.stream);
     let (bias_ptr, _gbi) = bias.data.device_ptr(&ctx.stream);
@@ -671,23 +794,271 @@ pub fn markov_step_argmax_into(
     let (pi_ptr, _gpi) = partial_indices.device_ptr_mut(&ctx.stream);
     let (out_ptr, _go) = out_tokens.device_ptr_mut(&ctx.stream);
     let (sampled_ptr, _gs) = sampled_tokens.device_ptr_mut(&ctx.stream);
+    let map_guard = req_map.map(|map| map.device_ptr(&ctx.stream));
+    let map_ptr = map_guard
+        .as_ref()
+        .map_or(std::ptr::null(), |(ptr, _)| *ptr as *const i32);
 
-    unsafe {
+    let rc = unsafe {
         ffi::markov_step_argmax_cuda(
             base_ptr as *const ffi::Half,
             bias_ptr as *const ffi::Half,
-            block_size as i32,
-            step as i32,
-            rows as i32,
-            vocab as i32,
+            super::checked_i32(block_size, "markov step block_size")?,
+            super::checked_i32(step, "markov step step")?,
+            super::checked_i32(chains, "markov step chains")?,
+            map_ptr,
+            super::checked_i32(rows, "markov step rows")?,
+            super::checked_i32(vocab, "markov step vocab")?,
             pv_ptr as *mut f32,
             pi_ptr as *mut i32,
             out_ptr as *mut u32,
             sampled_ptr as *mut u32,
             crate::tensor::active_cu_stream(ctx),
-        );
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow!("markov step argmax launch failed: cuda error {rc}"));
     }
 
+    Ok(())
+}
+
+/// Top-2 of `base[(row*block+step), v] + bias[row, v]` per row (exact for
+/// rows with two or more finite candidates; see the sentinel below). The
+/// top-1 is written exactly like [`markov_step_argmax_into`]'s output (the
+/// ping-pong `output` plus the `sampled_tokens` stamp), so a branch step needs
+/// no separate argmax pass; the runner-up lands in `out_top2` — the
+/// speculative hedge's branch source.
+/// A row with fewer than two finite logits returns index 0 as the runner-up
+/// sentinel (possibly duplicating top-1); callers must deduplicate — the
+/// hedge expansion drops chains identical to the greedy one.
+#[allow(clippy::too_many_arguments)]
+pub fn markov_step_top2_into(
+    ctx: &DeviceContext,
+    base: &HiddenStates,
+    bias: &HiddenStates,
+    block_size: usize,
+    step: usize,
+    rows: usize,
+    partial_v1: &mut CudaSlice<f32>,
+    partial_i1: &mut CudaSlice<i32>,
+    partial_v2: &mut CudaSlice<f32>,
+    partial_i2: &mut CudaSlice<i32>,
+    output: &mut CudaSlice<u32>,
+    sampled_tokens: &mut CudaSlice<u32>,
+    out_top2: &mut CudaSlice<u32>,
+) -> Result<()> {
+    if rows == 0 {
+        return Err(anyhow!("markov step top2 requires at least one row"));
+    }
+    if base.hidden_dim == 0 {
+        return Err(anyhow!(
+            "markov step top2 requires a non-zero vocab (zero tiles would launch an empty grid)"
+        ));
+    }
+    if step >= block_size {
+        return Err(anyhow!(
+            "markov top2 step {step} >= block_size {block_size}"
+        ));
+    }
+    base.checked_extent("markov top2 base")?;
+    bias.checked_extent("markov top2 bias")?;
+    super::checked_i32(base.seq_len, "markov top2 base rows")?;
+    if rows > 65_535 {
+        return Err(anyhow!("markov top2 rows {rows} exceeds grid-y limit"));
+    }
+    if base.hidden_dim > (i32::MAX as usize) - 1024 {
+        return Err(anyhow!("markov top2 vocab {} too large", base.hidden_dim));
+    }
+    let sampled_needed = rows
+        .checked_mul(block_size)
+        .ok_or_else(|| anyhow!("markov top2 rows*block_size overflow"))?;
+    if sampled_tokens.len() < sampled_needed {
+        return Err(anyhow!(
+            "markov top2 sampled buffer {} < rows*block_size {}",
+            sampled_tokens.len(),
+            sampled_needed
+        ));
+    }
+    let vocab = base.hidden_dim;
+    if bias.hidden_dim != vocab {
+        return Err(anyhow!(
+            "markov top2 bias vocab {} != base vocab {}",
+            bias.hidden_dim,
+            vocab
+        ));
+    }
+    let base_needed = rows
+        .checked_mul(block_size)
+        .ok_or_else(|| anyhow!("markov top2 rows*block_size overflow"))?;
+    if base.seq_len < base_needed {
+        return Err(anyhow!(
+            "markov top2 base rows {} < rows*block_size {}",
+            base.seq_len,
+            base_needed
+        ));
+    }
+    if bias.seq_len < rows {
+        return Err(anyhow!("markov top2 bias rows {} < {}", bias.seq_len, rows));
+    }
+    if output.len() < rows || out_top2.len() < rows {
+        return Err(anyhow!(
+            "markov top2 out too small: {}/{} < {}",
+            output.len(),
+            out_top2.len(),
+            rows
+        ));
+    }
+    let needed = markov_step_argmax_partials_len(rows, vocab);
+    if partial_v1.len() < needed
+        || partial_i1.len() < needed
+        || partial_v2.len() < needed
+        || partial_i2.len() < needed
+    {
+        return Err(anyhow!(
+            "markov top2 partials too small: need {needed} per pair"
+        ));
+    }
+    if needed > i32::MAX as usize || sampled_needed > i32::MAX as usize {
+        return Err(anyhow!(
+            "markov top2 index space too large: partials {needed}, sampled {sampled_needed}"
+        ));
+    }
+
+    let (base_ptr, _gb) = base.data.device_ptr(&ctx.stream);
+    let (bias_ptr, _gbi) = bias.data.device_ptr(&ctx.stream);
+    let (pv1_ptr, _g1) = partial_v1.device_ptr_mut(&ctx.stream);
+    let (pi1_ptr, _g2) = partial_i1.device_ptr_mut(&ctx.stream);
+    let (pv2_ptr, _g3) = partial_v2.device_ptr_mut(&ctx.stream);
+    let (pi2_ptr, _g4) = partial_i2.device_ptr_mut(&ctx.stream);
+    let (out_ptr, _g5) = output.device_ptr_mut(&ctx.stream);
+    let (samp_ptr, _g6) = sampled_tokens.device_ptr_mut(&ctx.stream);
+    let (o2_ptr, _g7) = out_top2.device_ptr_mut(&ctx.stream);
+
+    let block_i = super::checked_i32(block_size, "markov top2 block_size")?;
+    let step_i = super::checked_i32(step, "markov top2 step")?;
+    // One chain-row per request: the ladder's multi-chain rows go through the
+    // argmax path, which has the mapped variant.
+    let chains_i = 1i32;
+    let rows_i = super::checked_i32(rows, "markov top2 rows")?;
+    let vocab_i = super::checked_i32(vocab, "markov top2 vocab")?;
+    let rc = unsafe {
+        ffi::markov_step_top2_cuda(
+            base_ptr as *const ffi::Half,
+            bias_ptr as *const ffi::Half,
+            block_i,
+            step_i,
+            chains_i,
+            rows_i,
+            vocab_i,
+            pv1_ptr as *mut f32,
+            pi1_ptr as *mut i32,
+            pv2_ptr as *mut f32,
+            pi2_ptr as *mut i32,
+            out_ptr as *mut u32,
+            samp_ptr as *mut u32,
+            o2_ptr as *mut u32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow!("markov top2 launch failed: cuda error {rc}"));
+    }
+
+    Ok(())
+}
+
+/// Hedge-ladder branch force (see `hedge_ladder_force_cuda`): stamps chain
+/// `(i, j)`'s device-resident runner token into the prev buffer and the
+/// sampled block at `step`, for all `n` requests.
+#[allow(clippy::too_many_arguments)]
+///
+/// # Safety
+///
+/// `req_map` lives on device and cannot be validated here: every
+/// `req_map[0..n]` value must be in `0..runner_stride`, or the runner gather
+/// reads out of bounds on the GPU. Validate on the host before uploading.
+pub unsafe fn hedge_ladder_force_into(
+    ctx: &DeviceContext,
+    prev_tokens: &mut CudaSlice<u32>,
+    sampled_tokens: &mut CudaSlice<u32>,
+    runner_tokens: &CudaSlice<u32>,
+    req_map: &CudaSlice<i32>,
+    n: usize,
+    c: usize,
+    j: usize,
+    runner_stride: usize,
+    block_size: usize,
+    step: usize,
+) -> Result<()> {
+    if n == 0 || c == 0 || j >= c {
+        return Err(anyhow!("hedge force bad shape: n={n} c={c} j={j}"));
+    }
+    let rows = n
+        .checked_mul(c)
+        .ok_or_else(|| anyhow!("hedge force n*c overflow"))?;
+    let sampled_needed = rows
+        .checked_mul(block_size)
+        .ok_or_else(|| anyhow!("hedge force n*c*block_size overflow"))?;
+    // Mapped indices may address anywhere in `0..runner_stride`, so the WHOLE
+    // stripe must be backed, not just its first `n` entries.
+    let runner_needed = j
+        .checked_add(1)
+        .and_then(|v| v.checked_mul(runner_stride))
+        .ok_or_else(|| anyhow!("hedge force runner stripe overflow"))?;
+    if prev_tokens.len() < rows
+        || sampled_tokens.len() < sampled_needed
+        || runner_tokens.len() < runner_needed
+    {
+        return Err(anyhow!("hedge force buffers too small"));
+    }
+    if step >= block_size {
+        return Err(anyhow!(
+            "hedge force step {step} >= block_size {block_size}"
+        ));
+    }
+    if runner_stride < n {
+        return Err(anyhow!("hedge force runner stride {runner_stride} < n {n}"));
+    }
+    if req_map.len() < n {
+        return Err(anyhow!("hedge force req_map {} < n {n}", req_map.len()));
+    }
+    if n > (i32::MAX as usize) - 128 {
+        return Err(anyhow!("hedge force n {n} too large"));
+    }
+    if sampled_needed > i32::MAX as usize || runner_needed > i32::MAX as usize {
+        return Err(anyhow!(
+            "hedge force index space too large: sampled {sampled_needed}, runner {runner_needed}"
+        ));
+    }
+    let n_i = super::checked_i32(n, "hedge force n")?;
+    let c_i = super::checked_i32(c, "hedge force c")?;
+    let j_i = super::checked_i32(j, "hedge force j")?;
+    let stride_i = super::checked_i32(runner_stride, "hedge force runner_stride")?;
+    let block_i = super::checked_i32(block_size, "hedge force block_size")?;
+    let step_i = super::checked_i32(step, "hedge force step")?;
+    let (prev_ptr, _g1) = prev_tokens.device_ptr_mut(&ctx.stream);
+    let (samp_ptr, _g2) = sampled_tokens.device_ptr_mut(&ctx.stream);
+    let (run_ptr, _g3) = runner_tokens.device_ptr(&ctx.stream);
+    let (map_ptr, _g4) = req_map.device_ptr(&ctx.stream);
+    let rc = unsafe {
+        ffi::hedge_ladder_force_cuda(
+            prev_ptr as *mut u32,
+            samp_ptr as *mut u32,
+            run_ptr as *const u32,
+            map_ptr as *const i32,
+            n_i,
+            c_i,
+            j_i,
+            stride_i,
+            block_i,
+            step_i,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow!("hedge ladder force launch failed: cuda error {rc}"));
+    }
     Ok(())
 }
 

@@ -40,8 +40,11 @@
 //! ignored native-selector gate requires `PEGAINFER_DFLASH2_TEST_MODEL_PATH`
 //! and fails when its explicitly requested checkpoint is not usable.
 
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 use pegainfer_frontend::engine::Terminal;
@@ -63,6 +66,7 @@ use common::harness::request;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B-DFlash-b16");
+const DFLASH2_PATH_ENV: &str = "PEGAINFER_DFLASH2_TEST_MODEL_PATH";
 const GENERATED_TOKENS: usize = 64;
 /// Top-K logprobs requested from the baseline; wide enough that the speculative
 /// pick is in the set on any real tie (a pick outside the top-K is itself a red
@@ -118,7 +122,7 @@ fn required_model_path(name: &str) -> String {
 }
 
 fn native_dflash2_path() -> String {
-    let path = required_model_path("PEGAINFER_DFLASH2_TEST_MODEL_PATH");
+    let path = required_model_path(DFLASH2_PATH_ENV);
     let config: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(Path::new(&path).join("config.json"))
             .expect("read native DFlash2 config"),
@@ -138,20 +142,93 @@ fn native_dflash2_path() -> String {
             .is_some_and(|values| values.iter().any(|value| value == "DFlash2DraftModel")),
         "native selector gate requires DFlash2DraftModel"
     );
-    let tied = config
-        .get("tie_word_embeddings")
-        .and_then(serde_json::Value::as_bool)
-        .or_else(|| {
-            config
-                .pointer("/transformer_layer_config/tie_word_embeddings")
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(false);
-    assert!(
-        !tied,
-        "this gate must exercise native DFlash2's independent draft lm_head"
-    );
     path
+}
+
+struct DFlash2Phase1View {
+    _temp_dir: Option<tempfile::TempDir>,
+    path: PathBuf,
+}
+
+/// Remove only Phase 2 capability declarations for the selector gate while
+/// sharing the source checkpoint's real weight files.
+fn dflash2_phase1_view(source: &Path) -> DFlash2Phase1View {
+    let config_path = source.join("config.json");
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&config_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display())),
+    )
+    .unwrap_or_else(|e| panic!("parse {}: {e}", config_path.display()));
+    let mut phase1_config = config;
+    let mut changed = false;
+    if let Some(root) = phase1_config.as_object_mut() {
+        changed |= root.remove("conv_kernel_size").is_some();
+        changed |= root.remove("conv_group_size").is_some();
+        changed |= root.remove("sliding_window_non_causal").is_some();
+    }
+    if let Some(transformer) = phase1_config
+        .get_mut("transformer_layer_config")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        changed |= transformer.remove("sliding_window").is_some();
+        changed |= transformer.remove("use_sliding_window").is_some();
+        changed |= transformer.remove("layer_types").is_some();
+    }
+    if !changed {
+        return DFlash2Phase1View {
+            _temp_dir: None,
+            path: source.to_path_buf(),
+        };
+    }
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("pegainfer-dflash2-phase1-")
+        .tempdir_in(source.parent().unwrap_or_else(|| Path::new(".")))
+        .unwrap_or_else(|e| panic!("create native DFlash2 test view: {e}"));
+    fs::write(
+        temp_dir.path().join("config.json"),
+        serde_json::to_vec_pretty(&phase1_config).expect("serialize native DFlash2 test config"),
+    )
+    .unwrap_or_else(|e| panic!("write native DFlash2 test config: {e}"));
+
+    let single_file = source.join("model.safetensors");
+    if single_file.is_file() {
+        fs::hard_link(&single_file, temp_dir.path().join("model.safetensors"))
+            .unwrap_or_else(|e| panic!("link {} into test view: {e}", single_file.display()));
+    } else {
+        let index_path = source.join("model.safetensors.index.json");
+        fs::copy(
+            &index_path,
+            temp_dir.path().join("model.safetensors.index.json"),
+        )
+        .unwrap_or_else(|e| panic!("copy {}: {e}", index_path.display()));
+        let index: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&index_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", index_path.display())),
+        )
+        .unwrap_or_else(|e| panic!("parse {}: {e}", index_path.display()));
+        let shard_files: BTreeSet<&str> = index
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .expect("native DFlash2 index has weight_map")
+            .values()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("native DFlash2 shard name is a string")
+            })
+            .collect();
+        for shard_file in shard_files {
+            let source_shard = source.join(shard_file);
+            fs::hard_link(&source_shard, temp_dir.path().join(shard_file))
+                .unwrap_or_else(|e| panic!("link {} into test view: {e}", source_shard.display()));
+        }
+    }
+
+    DFlash2Phase1View {
+        path: temp_dir.path().to_path_buf(),
+        _temp_dir: Some(temp_dir),
+    }
 }
 
 fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
@@ -391,6 +468,7 @@ fn check_lossless(
 
 #[test]
 fn dflash_speculative_greedy_matches_plain_greedy() {
+    common::harness::init_capture_logging();
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
@@ -467,17 +545,17 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     );
 }
 
-/// Production gate for the native DFlash2 selector and its independent draft
-/// output head. The native schema guarantees that the speculative launch
-/// dispatches through the CUDA top-k and path-walk kernels; target verification
-/// must still produce a lossless greedy continuation.
+/// Production gate for the native DFlash2 selector. The native schema guarantees
+/// that the speculative launch dispatches through the CUDA top-k and path-walk
+/// kernels; target verification must still produce a lossless greedy continuation.
 #[test]
 #[ignore = "requires CUDA, Qwen3-4B, and a selector-only native DFlash2 checkpoint"]
-fn dflash2_native_selector_untied_head_greedy_gate() {
+fn dflash2_native_selector_greedy_gate() {
     const NATIVE_GENERATED_TOKENS: usize = 32;
 
     let model_path = required_model_path("PEGAINFER_TEST_MODEL_PATH");
     let draft_path = native_dflash2_path();
+    let dflash2_view = dflash2_phase1_view(Path::new(&draft_path));
     let _gpu = GPU
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -505,7 +583,7 @@ fn dflash2_native_selector_untied_head_greedy_gate() {
     let engine = EngineHarness::new(
         pegainfer_qwen3::launch(
             Path::new(&model_path),
-            launch_options(Some(PathBuf::from(&draft_path))),
+            launch_options(Some(dflash2_view.path.clone())),
         )
         .expect("failed to load native DFlash2 selector checkpoint"),
     );
@@ -643,6 +721,7 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
 /// (non-tie) divergence.
 #[test]
 fn dflash_concurrent_heterogeneous_is_lossless() {
+    common::harness::init_capture_logging();
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
@@ -732,8 +811,6 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
 /// panicked mid-prefill when the draft allocated KV past its own max positions.
 #[test]
 fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
-    const BLOCK_SIZE: usize = 16; // DFlash drafter block size.
-
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
@@ -741,9 +818,10 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Read the real context window so the boundary is exact regardless of the
-    // checkpoint, then size the request to sit inside the draft's final in-fill
-    // block — it fits the target window but not the DFlash-effective one.
+    // Read both context windows so the boundary is exact for ANY checkpoint
+    // pairing: the request must clear the target's own limit but land inside
+    // the draft's final in-fill block `(draft_max - block_size, draft_max]`,
+    // where the DFlash admission cap (`draft_max - block_size`) rejects it.
     let config: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(Path::new(&model_path).join("config.json")).expect("read config"),
     )
@@ -751,10 +829,26 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
     let max_pos = config["max_position_embeddings"]
         .as_u64()
         .expect("max_position_embeddings") as usize;
+    let draft_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&draft_path).join("config.json"))
+            .expect("read draft config"),
+    )
+    .expect("parse draft config");
+    let block_size = draft_config["block_size"]
+        .as_u64()
+        .expect("draft block_size") as usize;
+    let draft_max = draft_config["max_position_embeddings"]
+        .as_u64()
+        .map_or(max_pos, |v| v as usize);
     let prompt_len = 16usize;
-    // total in (max_pos - BLOCK_SIZE, max_pos]: clears the target check, trips
-    // the DFlash admission cap (max_pos - BLOCK_SIZE).
-    let max_tokens = max_pos - BLOCK_SIZE / 2 - prompt_len;
+    let total = (draft_max - block_size / 2).min(max_pos);
+    if total <= draft_max - block_size {
+        eprintln!(
+            "skipping draft-headroom case: target max {max_pos} cannot reach the draft in-fill window (draft max {draft_max}, block {block_size})"
+        );
+        return;
+    }
+    let max_tokens = total - prompt_len;
 
     let engine = EngineHarness::new(
         pegainfer_qwen3::launch(
@@ -788,4 +882,112 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
             )
         }
     }
+}
+
+/// Execution gate for the hedge ladder: re-runs the two losslessness tests
+/// above in child processes, since the hedge config is read once per process
+/// and cannot be toggled in-process.
+///
+/// Scope: this proves the copy-back and discard branches were ENTERED, not
+/// that a later round consumes the winner's state correctly — `check_lossless`
+/// returns at the first benign tie flip, so the suffix past it is never
+/// compared. A tie is also a non-win (the win test is strictly-greater), so
+/// the counters cannot separate a tie from a shorter chain.
+///
+/// Strict token equality against an unhedged run is NOT a valid contract:
+/// hedged rounds change the verify batch shape, which legally flips bf16 ties,
+/// and `--batch-invariant` rejects DFlash.
+#[test]
+fn hedged_ladder_passes_the_lossless_gates() {
+    // Strict mode (CI / validation boxes): every skip below is a failure —
+    // the gate must not go green without actually executing the hedge.
+    let strict = std::env::var("PEGAINFER_REQUIRE_HEDGE_GATE").is_ok_and(|v| v == "1");
+    let (target, draft) = (target_path_or_skip(), draft_path_or_skip());
+    let (Some(_), Some(draft_path)) = (target, draft) else {
+        assert!(
+            !strict,
+            "hedged gate requires model fixtures when PEGAINFER_REQUIRE_HEDGE_GATE is set"
+        );
+        return;
+    };
+    // A plain DFlash drafter (markov_rank == 0) never hedges; a green run
+    // against it would be vacuous.
+    let draft_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&draft_path).join("config.json"))
+            .expect("read draft config"),
+    )
+    .expect("parse draft config");
+    if draft_config["markov_rank"].as_u64().unwrap_or(0) == 0 {
+        assert!(
+            !strict,
+            "hedged gate requires a DSpark drafter but {draft_path} has markov_rank 0"
+        );
+        eprintln!(
+            "skipping hedged gate: {draft_path} is a plain DFlash drafter (markov_rank 0); \
+             point PEGAINFER_DFLASH_TEST_MODEL_PATH at a DSpark checkpoint"
+        );
+        return;
+    }
+    // Hold this process's GPU slot for the whole child run: the children own
+    // the card, and sibling tests here must not load an engine beside them.
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let exe = std::env::current_exe().expect("test binary path");
+    // One child per lossless suite, each with a single exact filter, so the
+    // invocation shape is beyond dispute on any libtest version.
+    // A hedge-free child would make its lossless pass vacuous, so each child
+    // must show expanded spans in the executor's per-round trace.
+    let mut total_spans = 0usize;
+    let mut total_wins = 0usize;
+    let mut total_rounds = 0usize;
+    for child_test in [
+        "dflash_speculative_greedy_matches_plain_greedy",
+        "dflash_concurrent_heterogeneous_is_lossless",
+    ] {
+        let output = Command::new(&exe)
+            .args(["--exact", child_test, "--test-threads=1", "--nocapture"])
+            .env("PEGAINFER_SPEC_HEDGE", "8")
+            .env("PEGAINFER_SPEC_HEDGE_POSITIONS", "0,1,2")
+            .env("PEGAINFER_TEST_LOG", "1")
+            .env_remove("PEGAINFER_SPEC_HEDGE_AUTO")
+            .output()
+            .expect("spawn hedged child gate");
+        let child_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "hedged lossless gate '{child_test}' failed:\n{}\n{child_stderr}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let mut rounds = 0usize;
+        let mut spans = 0usize;
+        let mut wins = 0usize;
+        for line in child_stderr.lines() {
+            let Some(rest) = line.split("DFlash hedge: ").nth(1) else {
+                continue;
+            };
+            let mut nums = rest
+                .split(|ch: char| !ch.is_ascii_digit())
+                .filter(|tok| !tok.is_empty())
+                .map(|tok| tok.parse::<usize>().expect("hedge trace number"));
+            spans += nums.next().expect("span count");
+            wins += nums.next().expect("win count");
+            rounds += 1;
+        }
+        assert!(
+            rounds > 0 && spans > 0,
+            "child '{child_test}' executed no hedged verify round:\n{child_stderr}"
+        );
+        total_rounds += rounds;
+        total_spans += spans;
+        total_wins += wins;
+    }
+    assert!(
+        total_wins > 0,
+        "no hedge chain ever won across {total_rounds} hedged rounds"
+    );
+    assert!(
+        total_spans > total_wins,
+        "every hedge span won ({total_wins}/{total_spans}) — the discard path never executed"
+    );
 }

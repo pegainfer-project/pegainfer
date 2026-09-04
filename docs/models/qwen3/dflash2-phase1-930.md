@@ -94,7 +94,7 @@ PEGAINFER_TEST_MODEL_PATH=/database/ricardo.zheng/models/Qwen3/Qwen3-4B \
 PEGAINFER_DFLASH2_TEST_MODEL_PATH=/tmp/dflash2-phase1-native-overlay \
 cargo test --release -p pegainfer-qwen3 \
   --test dflash_speculative_gate \
-  dflash2_native_selector_untied_head_greedy_gate \
+  dflash2_native_selector_greedy_gate \
   -- --ignored --nocapture --test-threads=1
 ```
 
@@ -130,12 +130,32 @@ CUDA top-k/path-walk path and matched the plain Qwen3 greedy continuation.
   The public Qwen3-4B DFlash2 artifact is currently Phase 2-capable, so the
   gate uses a config-only overlay while preserving every model tensor.
 
+### Step 7: Merge current main and make the native gate executable
+
+- Merged `upstream/main` at `bc923e08` into `feat/qwen3-dflash2-phase1-930`.
+- Resolved the four overlapping Qwen3/DSpark executor files while retaining
+  both the Phase 1 selector path and mainline DSpark hedge changes.
+- Added a test-only selector view that removes only Phase 2 capability fields
+  and hard-links the original SafeTensors files. The native gate now covers
+  both tied and untied head metadata instead of rejecting tied checkpoints.
+- Updated the documented gate name and staged the resolved merge. No commit or
+  push was created.
+
+| Merge verification | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Passed |
+| `git diff --cached --check` | Passed |
+| Linux `cargo check --release -p pegainfer-qwen3 --tests` | Passed |
+| Linux `cargo check --release -p pegainfer-server --bin pegainfer` | Passed |
+| Linux `cargo test --release -p pegainfer-build --lib` | 7 passed, 0 failed |
+| Linux Qwen3 unit-test link | Blocked by existing `cudaLaunchKernelExC` linker mismatch |
+
 ## Debrief
 
-- **Outcome:** Phase 1 selector wiring, anchor-drop mapping, native untied-head
-  loading, and a focused cleanup of redundant scaffolding are complete in the
-  feature branch. The checkout is based on upstream main; no changes are
-  staged or committed.
+- **Outcome:** Phase 1 selector wiring, anchor-drop mapping, native tied/untied
+  head loading, an executable selector gate, and the merge with current
+  upstream main are complete in the feature branch. The merge result is staged
+  but not committed or pushed.
 - **Pitfalls encountered:** The first verification command omitted system
   directories from `PATH`, so `pegainfer-kernels/build.rs` could not spawn
   `git`. Re-running with `/usr/bin:/bin` succeeded. The row mapping bug was a
@@ -144,7 +164,8 @@ CUDA top-k/path-walk path and matched the plain Qwen3 greedy continuation.
   from the compact set of positions actually proposed. The anchor is a
   request-level predecessor, not a selector candidate when the executor drops
   row 0.
-- **Follow-ups:** Run the full native checkpoint import only after Phase 2
-  convolution and sliding-window execution land, because the public checkpoint
-  intentionally advertises those capabilities and Phase 1 rejects them. Phase 3
-  remains responsible for sampled losslessness/rejection sampling.
+- **Follow-ups:** Run the native selector gate on Linux with the real checkpoint
+  and review the staged file list before committing. The full native checkpoint
+  import still waits for Phase 2 convolution and sliding-window execution,
+  because the public checkpoint intentionally advertises those capabilities.
+  Phase 3 remains responsible for sampled losslessness/rejection sampling.

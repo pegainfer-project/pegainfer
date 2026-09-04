@@ -44,28 +44,29 @@ GATES_NUMERIC_PARITY=(
 GATES_ADMISSION=(
   "gpu,ckpt,prompts serve::oracle::mixed_step_matches_serial"
   "gpu,ckpt,prompts serve::oracle::fp8_mixed_walk_holds_its_structure"
-  "gpu,ckpt,prompts engine::lane_tests::the_gathered_walk_matches_the_serial_path"
-  "gpu,ckpt,prompts engine::lane_tests::the_gathered_transient_leaves_headroom"
+  "gpu,ckpt,prompts engine::lane_gates_walk::the_gathered_walk_does_not_depend_on_its_batching"
+  "gpu,ckpt,prompts engine::lane_gates_walk::the_gathered_transient_leaves_headroom"
 )
 # These production contracts apply to both checkpoint geometries. They stay
 # unique in the ignored-test manifest and expand into two execution profiles.
 GATES_DENSE_AND_ROUTED=(
-  "gpu,ckpt engine::lane_tests::the_shared_lane_lifecycle_completes"
-  "gpu,ckpt engine::lane_tests::the_green_lane_lifecycle_completes"
+  "gpu,ckpt engine::lane_gates_lifecycle::the_shared_lane_lifecycle_completes"
+  "gpu,ckpt engine::lane_gates_lifecycle::the_green_lane_lifecycle_completes"
   "gpu,ckpt serve::oracle::overlapped_prefill_matches_the_sync_step"
   "gpu,ckpt serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
 )
-# The roster-edge gate borrows the generate fixture's prompts too; the raise
-# refusals are settled by `EngineState::load` before it opens a device or
-# reads a weight, so that one needs the config and nothing else.
+# The idle-refill gate borrows the generate fixture's prompts; the roster-edge
+# gates build their own. The raise refusals are settled by `EngineState::load`
+# before it opens a device or reads a weight, so that one needs the config and
+# nothing else.
 GATES_SERVING_CONTRACT=(
-  "gpu,ckpt engine::lane_tests::the_gathered_lifecycle_completes"
-  "gpu,ckpt engine::lane_tests::the_coalesce_door_releases_one_admission_burst"
-  "gpu,ckpt,prompts engine::lane_tests::the_raised_ceiling_and_slots_hold_at_the_roster_edge"
-  "gpu,ckpt,prompts engine::lane_tests::the_full_roster_keeps_its_pipeline_under_a_queue"
-  "gpu,ckpt,prompts engine::lane_tests::an_idle_refill_drops_the_retired_fingerprint"
-  "gpu,ckpt engine::lane_tests::the_raise_reaches_the_frontend"
-  "ckpt engine::lane_tests::the_raise_refuses_without_its_prerequisites"
+  "gpu,ckpt engine::lane_gates_lifecycle::the_gathered_lifecycle_completes"
+  "gpu,ckpt engine::lane_gates_roster::the_coalesce_door_releases_one_admission_burst"
+  "gpu,ckpt engine::lane_gates_roster::the_raised_ceiling_and_slots_hold_at_the_roster_edge"
+  "gpu,ckpt engine::lane_gates_roster::the_full_roster_keeps_its_pipeline_under_a_queue"
+  "gpu,ckpt,prompts engine::lane_gates_roster::an_idle_refill_matches_a_fresh_engine"
+  "gpu,ckpt engine::lane_gates_lifecycle::the_raise_reaches_the_frontend"
+  "ckpt engine::lane_gates_lifecycle::the_raise_refuses_without_its_prerequisites"
 )
 GATES_KV_AND_LANES=(
   "gpu,ckpt,fixtures serve::oracle::incremental_serving_matches_recompute"
@@ -220,18 +221,41 @@ require_gpu() {
   fi
 }
 
+# A config alone is not a checkpoint. This mirrors the loader's discovery
+# (`load_shard_info`): a single-file model.safetensors, else every shard the
+# safetensors index names, so an incomplete download stops the suite here
+# rather than inside its first 12B load.
+require_weights() {
+  local dir=$1 label=$2
+  [ -d "$dir" ] || die "$label directory $dir does not exist"
+  [ -f "$dir/config.json" ] || die "$dir has no config.json"
+  python3 - "$dir" "$label" <<'PY' || die "$label weight preflight failed"
+import json, os, sys
+
+ckpt, label = sys.argv[1], sys.argv[2]
+if os.path.isfile(os.path.join(ckpt, "model.safetensors")):
+    raise SystemExit(0)
+index = os.path.join(ckpt, "model.safetensors.index.json")
+if not os.path.isfile(index):
+    raise SystemExit(f"{label} {ckpt}: neither model.safetensors nor model.safetensors.index.json")
+with open(index) as fh:
+    shards = sorted(set(json.load(fh)["weight_map"].values()))
+missing = [s for s in shards if not os.path.isfile(os.path.join(ckpt, s))]
+if missing:
+    raise SystemExit(f"{label} {ckpt}: the index names {len(shards)} shards; missing {missing}")
+PY
+}
+
 require_ckpt() {
   [ -n "${PEGAINFER_TEST_MODEL_PATH:-}" ] || die "PEGAINFER_TEST_MODEL_PATH is unset"
   ckpt=$PEGAINFER_TEST_MODEL_PATH
-  [ -d "$ckpt" ] || die "checkpoint directory $ckpt does not exist"
-  [ -f "$ckpt/config.json" ] || die "$ckpt has no config.json"
+  require_weights "$ckpt" checkpoint
 }
 
 require_moeckpt() {
   [ -n "${PEGAINFER_NVFP4_MODEL:-}" ] || die "PEGAINFER_NVFP4_MODEL is unset"
   moe_ckpt=$PEGAINFER_NVFP4_MODEL
-  [ -d "$moe_ckpt" ] || die "routed checkpoint directory $moe_ckpt does not exist"
-  [ -f "$moe_ckpt/config.json" ] || die "$moe_ckpt has no config.json"
+  require_weights "$moe_ckpt" "routed checkpoint"
 }
 
 require_prompts() {
