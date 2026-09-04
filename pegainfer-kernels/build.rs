@@ -1525,24 +1525,8 @@ const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
         "const void*, const void*, void*, int, int",
     ),
     (
-        "k3_land_batched",
-        "const float*, void*, int, int, int, int, int",
-    ),
-    (
         "k3_land_rms_norm_rbs_batched",
         "const float*, const void*, void*, int, int, int, int, int",
-    ),
-    (
-        "k3_add2_batched",
-        "const void*, const void*, void*, int, int",
-    ),
-    (
-        "k3_mul_sigmoid_batched",
-        "const void*, const void*, void*, int, int",
-    ),
-    (
-        "k3_situ_batched",
-        "const void*, const void*, void*, int, int",
     ),
     (
         "k3_conv_silu_batched",
@@ -1553,10 +1537,6 @@ const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
         "const void*, const void*, const void*, const float*, const float*, const float*, \
          const void*, const void*, const float*, const float*, float*, void*, \
          int, int, int, int",
-    ),
-    (
-        "k3_o_norm_gate_batched",
-        "const void*, const void*, const float*, void*, int, int, int",
     ),
     (
         "k3_attnres_scores_batched",

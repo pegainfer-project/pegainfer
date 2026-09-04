@@ -138,16 +138,54 @@ pub fn k3_mla_prefill_lse_merge_launch(
     lse_acc: &mut CudaSlice<f32>,
     reset: bool,
 ) -> Result<()> {
-    ensure!(t_q > 0, "K3 MLA prefill LSE merge got an empty span");
     ensure!(
-        o_win.len() >= t_q * heads * K3_MLA_PREFILL_V
-            && lse_win.len() >= heads * t_q
-            && o_acc.len() >= t_q * heads * K3_MLA_PREFILL_V
-            && lse_acc.len() >= heads * t_q,
-        "K3 MLA prefill LSE merge buffers too small for t_q={t_q}, heads={heads}"
+        o_win.len() >= t_q * heads * K3_MLA_PREFILL_V && lse_win.len() >= heads * t_q,
+        "K3 MLA prefill LSE merge window too small for t_q={t_q}, heads={heads}"
     );
     let (ow_ptr, _ow_guard) = o_win.device_ptr(&ctx.stream);
     let (lw_ptr, _lw_guard) = lse_win.device_ptr(&ctx.stream);
+    lse_merge_raw(ctx, t_q, heads, ow_ptr, lw_ptr, o_acc, lse_acc, reset)
+}
+
+/// [`k3_mla_prefill_lse_merge_launch`] over a window a *peer* rank computed
+/// and published: `o_win`/`lse_win` are raw device pointers into the peer's
+/// publish slab, valid inside the exchange window that consumes them (the
+/// caller's stream already waits on the peer's publish). The kernel reads
+/// them once over the fabric; nothing is staged locally.
+#[allow(clippy::too_many_arguments)]
+pub fn k3_mla_prefill_lse_merge_peer_launch(
+    ctx: &DeviceContext,
+    t_q: usize,
+    heads: usize,
+    o_win: u64,
+    lse_win: u64,
+    o_acc: &mut CudaSlice<f32>,
+    lse_acc: &mut CudaSlice<f32>,
+    reset: bool,
+) -> Result<()> {
+    ensure!(
+        o_win != 0 && lse_win != 0,
+        "K3 MLA prefill LSE merge got a null peer window"
+    );
+    lse_merge_raw(ctx, t_q, heads, o_win, lse_win, o_acc, lse_acc, reset)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lse_merge_raw(
+    ctx: &DeviceContext,
+    t_q: usize,
+    heads: usize,
+    ow_ptr: u64,
+    lw_ptr: u64,
+    o_acc: &mut CudaSlice<f32>,
+    lse_acc: &mut CudaSlice<f32>,
+    reset: bool,
+) -> Result<()> {
+    ensure!(t_q > 0, "K3 MLA prefill LSE merge got an empty span");
+    ensure!(
+        o_acc.len() >= t_q * heads * K3_MLA_PREFILL_V && lse_acc.len() >= heads * t_q,
+        "K3 MLA prefill LSE merge accumulators too small for t_q={t_q}, heads={heads}"
+    );
     let (oa_ptr, _oa_guard) = o_acc.device_ptr_mut(&ctx.stream);
     let (la_ptr, _la_guard) = lse_acc.device_ptr_mut(&ctx.stream);
     let rc = unsafe {
@@ -234,17 +272,46 @@ fn k3_flash_mla_prefill_fmha(
     scale: f32,
 ) -> Result<()> {
     ensure!(
+        q.len() >= t_q * heads * K3_MLA_PREFILL_QK,
+        "K3 FlashMLA prefill query buffer too small for t_q={t_q}, heads={heads}"
+    );
+    let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
+    fmha_raw_q(
+        ctx, entry, kind, t_q, t_kv, heads, q_ptr, k, nope_v, out, lse_out, scale,
+    )
+}
+
+/// The FMHA core over a raw query pointer: `q_ptr` addresses `[t_q, heads,
+/// 192]` bf16 rows that are either this rank's own buffer or a peer's
+/// published one inside an exchange window (the stream already waits on the
+/// publish). The kernel loads each query tile once, so a fabric-resident Q
+/// costs its bytes exactly once.
+#[allow(clippy::too_many_arguments)]
+fn fmha_raw_q(
+    ctx: &DeviceContext,
+    entry: FmhaEntry,
+    kind: &str,
+    t_q: usize,
+    t_kv: usize,
+    heads: usize,
+    q_ptr: u64,
+    k: &CudaSlice<bf16>,
+    nope_v: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    lse_out: Option<&mut CudaSlice<f32>>,
+    scale: f32,
+) -> Result<()> {
+    ensure!(
         t_q > 0 && t_kv > 0,
         "K3 FlashMLA prefill got an empty span: t_q={t_q}, t_kv={t_kv}"
     );
+    ensure!(q_ptr != 0, "K3 FlashMLA prefill got a null query pointer");
     ensure!(
-        q.len() >= t_q * heads * K3_MLA_PREFILL_QK
-            && k.len() >= t_kv * heads * K3_MLA_PREFILL_QK
+        k.len() >= t_kv * heads * K3_MLA_PREFILL_QK
             && nope_v.len() >= t_kv * heads * K3_MLA_PREFILL_NV
             && out.len() >= t_q * heads * K3_MLA_PREFILL_V,
         "K3 FlashMLA prefill buffers too small for t_q={t_q}, t_kv={t_kv}, heads={heads}"
     );
-    let (q_ptr, _q_guard) = q.device_ptr(&ctx.stream);
     let (k_ptr, _k_guard) = k.device_ptr(&ctx.stream);
     let (nv_ptr, _nv_guard) = nope_v.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
@@ -350,6 +417,41 @@ pub fn k3_flash_mla_prefill_fwd_dense_launch(
         t_kv,
         heads,
         q,
+        k,
+        nope_v,
+        out,
+        lse_out,
+        scale,
+    )
+}
+
+/// [`k3_flash_mla_prefill_fwd_dense_launch`] with the queries read from a
+/// *peer* rank's published `[t_q, heads, 192]` rows at raw device pointer
+/// `q_peer` — the context-parallel stripe: the rank that holds a key segment
+/// attends another rank's queries over it and hands back output + LSE for
+/// the owner's merge. Valid only inside the exchange window that published
+/// the queries.
+#[allow(clippy::too_many_arguments)]
+pub fn k3_flash_mla_prefill_fwd_dense_peer_q_launch(
+    ctx: &DeviceContext,
+    t_q: usize,
+    t_kv: usize,
+    heads: usize,
+    q_peer: u64,
+    k: &CudaSlice<bf16>,
+    nope_v: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    lse_out: Option<&mut CudaSlice<f32>>,
+    scale: f32,
+) -> Result<()> {
+    fmha_raw_q(
+        ctx,
+        ffi::k3_flash_mla_prefill_fwd_dense,
+        "dense (peer queries)",
+        t_q,
+        t_kv,
+        heads,
+        q_peer,
         k,
         nope_v,
         out,
