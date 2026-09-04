@@ -1,6 +1,6 @@
 # Qwen3.5 TP Implementation Record
 
-> **TL;DR:** Qwen3.5 TP Phase 1 and P2A are complete: TP2 now supports start-gated eager unified prefill+decode with strict ID-aligned artifacts, fail-closed lifecycle recovery, and pre-load CUDA ordinal validation; P2B GDR state sharding is next.
+> **TL;DR:** Qwen3.5 TP is complete through Phase 2b plus batched eager TP decode: TP2 supports start-gated eager unified prefill+decode with strict ID-aligned artifacts, fail-closed lifecycle recovery, and pre-load CUDA ordinal validation (#870); linear-attention/GDR state is sharded per rank (27B TP2 fits on 2×48 GB) and TP decode rows run as one batched forward per step. Remaining TP work: CUDA Graph under TP (still fail-closed), perf gates.
 >
 > **Last touched:** 2026-08
 
@@ -460,9 +460,66 @@ Non-negotiable invariant:
 
 - Never all-reduce GDR recurrent state or conv state. These states are owned by rank-local request state.
 
+## Rebase onto #870 (2026-08-20)
+
+#870 landed its own Phase 1/2a upstream while the parallel line on
+`feat/qwen35-tp2-batched-decode` (f4c66780) had implemented its own Phase
+1/2a/2b plus a batched-decode fix on the old main. The rebase onto #870
+ported only the two deltas #870 lacks, with #870's code as the base:
+
+1. **Phase 2b — sharded linear-attention/GDR state** (commit
+   `feat(qwen35): shard linear-attention/GDR state per TP rank`). #870's
+   `recurrent_state.rs` had no rank sharding and its linear-attention
+   weights loaded replicated; the port adds rank-local slices end to end
+   (`weight_loader` stitch/shard loaders, `config.rs` `local_linear_*`
+   accessors, `weights.rs` per-rank stitched qkv/conv1d + row/col shards,
+   `recurrent_state`/`decode_buffers`/`prefill_buffers` at local sizes,
+   `batch_decode`/`prefill` local head counts + all-reduce after linear
+   `out_proj`, TP-local `batch_decode_full_attention_via_prefill` so 27B
+   TP2 group-6 eager decode routes through prefill). `tp_executor.rs`
+   only took the capacity-math and `RecurrentState::new` signature
+   changes; #870's worker protocol untouched.
+2. **Step 3 — batched eager TP decode** (commit
+   `perf(qwen35): batch eager decode rows under TP`). #870's
+   `execute_decode_rows` looped per request with bs=1 forwards and
+   capacity-1 per-request pointer tables. The port adds `run_decode_batch`
+   (one `batch_decode_eager_logits` over all decode rows, step-scoped
+   `LinearStatePointerTables::from_recurrent_refs(..., bs, ...)`, one
+   batched rank-0 `select_batch`, per-row fan-out in command order) inside
+   #870's `execute_decode_rows`, keeping its validation and response
+   contracts; `TpRequestState.linear_pointer_tables` removed.
+
+What #870 already covered (not ported): Phase 1 dense TP, the Phase 2a
+unified command/scheduler surface (`TpUnifiedPlan`, command start gates,
+dispatch/response validators, drop-expectation lifecycle proofs), and the
+scheduler planner-gate/test updates — ours' `scheduler.rs`,
+`scheduler/tests.rs`, and `e2e_scheduler.rs` deltas were subsumed
+upstream, so those files resolved to #870's versions except the
+`alloc_recurrent` signature change.
+
+Validation on 2× RTX 4090 (venv NCCL on `LD_LIBRARY_PATH`):
+
+- `cargo check --release -p pegainfer-qwen35 --features qwen35` clean;
+  `cargo fmt --check -p pegainfer-qwen35` clean.
+- Lib unit suite 101/101 (includes the four sharding layout tests:
+  segment tables, conv kernel-dim scaling, TP1 identity, synthetic
+  safetensors stitch contract).
+- 9B TP2 HF short+long gates PASS (24.7 s); 9B TP2 scheduler e2e
+  (`test_e2e_qwen35_scheduler_tp2`) PASS (27.1 s).
+- 27B TP2 HF short+long gates PASS (64.7 s) — 27B TP2 fits on 2×48 GB
+  only because of the Phase-2b sharding (the acceptance criterion for the
+  port). 27B TP2 scheduler e2e PASS (68.8 s).
+
 ## Follow-Ups
 
-- Design and implement P2B sharded linear-attention/GDR state without weakening the completed P2A lifecycle and ID contracts.
+- 27B TP2 knowledge-benchmark parity (2026-08-20, validated pre-rebase on
+  the f4c66780 line; `docs/benchmarks/qwen35-27b-tp2-knowledge-eval.md`):
+  MMLU-Redux 94.09 vs official 93.2 (full 5330), C-Eval 88.11 vs 90.5
+  (full 1346, thinking-cap truncation rerun-merged) — inside the
+  cross-harness band, no TP-induced accuracy regression. MMLU-Pro /
+  SuperGPQA sampled runs remain outstanding; rerun on this rebased branch
+  before citing parity.
+- P2B sharded linear-attention/GDR state landed (see "Rebase onto #870"); keep the completed P2A lifecycle and ID contracts unweakened.
 - Promote any stable contract changes discovered here back into `tp-design.md` through the design-doc branch.
 - Decide whether Qwen3.5 server CLI should accept arbitrary TP device ordinals instead of only `0..tp_size`.
 - Consider lifting the per-device Triton AOT handle lesson into a kernels or runtime subsystem doc if another model hits the same issue.
