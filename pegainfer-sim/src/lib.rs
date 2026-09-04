@@ -311,6 +311,7 @@ fn duration_from_ms(ms: f64) -> Duration {
 #[cfg(test)]
 mod tests {
     use pegainfer_frontend::engine::Request;
+    use pegainfer_frontend::engine::StopPolicy;
     use pegainfer_frontend::engine::Terminal;
     use pegainfer_frontend::sampler::SamplingParams;
 
@@ -320,6 +321,7 @@ mod tests {
         Request {
             prompt_tokens,
             params: SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -425,6 +427,7 @@ mod tests {
                 reason: FinishReason::Length,
                 prompt_tokens: 2,
                 completion_tokens: 3,
+                ..
             }
         ));
     }

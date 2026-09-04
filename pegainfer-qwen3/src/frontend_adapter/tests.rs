@@ -89,6 +89,28 @@ impl StepCollector {
         }
     }
 
+    fn collect_terminal_with_logprobs(
+        &mut self,
+        id: RequestId,
+    ) -> (
+        Vec<u32>,
+        Vec<Option<pegainfer_frontend::engine::TokenLogprob>>,
+        Terminal,
+    ) {
+        let mut tokens = Vec::new();
+        let mut logprobs = Vec::new();
+
+        loop {
+            let update = self.next_for(id);
+            tokens.extend_from_slice(&update.tokens);
+            logprobs.extend(update.logprobs);
+
+            if let Some(terminal) = update.terminal {
+                return (tokens, logprobs, terminal);
+            }
+        }
+    }
+
     /// Drain the remaining stream (until the scheduler is gone) and return
     /// every terminal seen for `id`. For asserting silence after an abort.
     fn drain_terminals_for(&mut self, id: RequestId) -> Vec<Terminal> {
@@ -121,6 +143,105 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+#[test]
+fn request_stop_token_beats_length_during_prefill_when_eos_is_ignored() {
+    let executor = FakeExecutor::new(4, Arc::new(Mutex::new(Vec::new()))).with_logprobs();
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let mut req = request(16, 1);
+    req.stop_policy.eos = pegainfer_frontend::engine::EosPolicy::Ignore;
+    req.stop_policy.token_ids = vec![100];
+
+    let control = partition.handle.submit(req);
+    let (tokens, logprobs, terminal) = steps.collect_terminal_with_logprobs(control.id());
+
+    assert_eq!(tokens, vec![100]);
+    assert_eq!(logprobs.len(), 1);
+    assert!((logprobs[0].as_ref().expect("stop-token logprob").logprob + 0.1).abs() < f32::EPSILON);
+    assert!(matches!(
+        terminal,
+        Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(pegainfer_frontend::engine::StopCause::Token(100)),
+            completion_tokens: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn request_stop_token_beats_length_during_decode_when_eos_is_ignored() {
+    let executor = FakeExecutor::new(4, Arc::new(Mutex::new(Vec::new()))).with_logprobs();
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let mut req = request(16, 2);
+    req.stop_policy.eos = pegainfer_frontend::engine::EosPolicy::Ignore;
+    req.stop_policy.token_ids = vec![200];
+
+    let control = partition.handle.submit(req);
+    let (tokens, logprobs, terminal) = steps.collect_terminal_with_logprobs(control.id());
+
+    assert_eq!(tokens, vec![100, 200]);
+    assert_eq!(logprobs.len(), 2);
+    assert!((logprobs[1].as_ref().expect("stop-token logprob").logprob + 0.2).abs() < f32::EPSILON);
+    assert!(matches!(
+        terminal,
+        Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(pegainfer_frontend::engine::StopCause::Token(200)),
+            completion_tokens: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn speculative_request_stop_beats_length_midspan_and_cleans_up() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(4, Arc::clone(&dropped))
+        .with_stop_token(12)
+        .with_speculative_accepted_tokens(&[10, 11, 12, 13]);
+
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let mut req = request(16, 4);
+    req.stop_policy.eos = pegainfer_frontend::engine::EosPolicy::Ignore;
+    req.stop_policy.token_ids = vec![12];
+
+    let control = partition.handle.submit(req);
+    let (tokens, terminal) = steps.collect_terminal(control.id());
+
+    assert_eq!(
+        tokens,
+        vec![100, 10, 11, 12],
+        "the trigger is retained and the accepted suffix is discarded"
+    );
+    assert!(matches!(
+        terminal,
+        Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(pegainfer_frontend::engine::StopCause::Token(12)),
+            completion_tokens: 4,
+            ..
+        }
+    ));
+
+    assert!(
+        wait_until(Duration::from_secs(1), || {
+            dropped.lock().unwrap().contains(&0)
+        }),
+        "stopped speculative request state should be dropped"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(1), || {
+            let metrics = partition.handle.metrics();
+            metrics.num_running_reqs == 0 && metrics.kv_used_blocks == 0
+        }),
+        "stopped speculative request should release scheduler state and KV blocks"
+    );
 }
 
 #[test]

@@ -24,6 +24,7 @@
 //! target distribution; acceptance only decides how many ride one step.
 
 use anyhow::Result;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::executor::RequestId;
@@ -56,6 +57,9 @@ impl VerifyStepItem {
 #[derive(Clone, Copy)]
 pub(crate) struct VerifyPlan<'a> {
     pub requests: &'a [VerifyStepItem],
+    /// Request-local stop policies in the same order as `requests`. They remain
+    /// host-side and are not copied into GPU buffers.
+    pub stop_policies: &'a [StopPolicy],
     /// Engine step seed for the verify rows' sampler pass (same contract as
     /// decode: fresh per step; seeded rows re-mix their own request seed).
     pub sample_seed: u64,
@@ -69,8 +73,9 @@ pub(crate) struct VerifyRequestResult {
     /// Tokens to commit: the accepted draft prefix followed by the target's
     /// posterior token at the first mismatch (or the block-end continuation
     /// when every draft is accepted). Always `1..=K + 1` tokens, so a verify
-    /// step always makes at least one token of progress. The scheduler still
-    /// owns stop-token suppression before client emission.
+    /// step always makes at least one token of progress. Before KV commit the
+    /// executor truncates this span after the first request-terminal token;
+    /// the scheduler retains ownership of typed stop-cause emission.
     pub accepted_tokens: Vec<u32>,
 }
 

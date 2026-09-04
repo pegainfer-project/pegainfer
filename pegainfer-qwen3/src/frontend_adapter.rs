@@ -42,6 +42,7 @@ use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopCause;
 use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::numeric_policy;
@@ -343,7 +344,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         // terminal rides the committed step, which the driver ships after
         // publishing metrics — the finishing batch's send-time stats then
         // read the drained occupancy instead of racing the publish.
-        let mut finishes: Vec<(RequestId, FinishReason)> = Vec::new();
+        let mut finishes: Vec<(RequestId, FinishReason, Option<StopCause>)> = Vec::new();
 
         for cached in effects.cached {
             if ledger.is_active(cached.request_id) {
@@ -368,31 +369,10 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             match effect {
                 DecodeEffect::Finish {
                     request_id,
-                    finish_reason,
-                } => {
-                    let Some(index) = self
-                        .active
-                        .iter()
-                        .position(|req| req.request_id == request_id)
-                    else {
-                        continue;
-                    };
-                    if ledger.is_active(request_id) {
-                        if ledger.is_aborted(request_id) {
-                            ledger.retire(request_id);
-                        } else {
-                            finishes.push((request_id, finish_reason));
-                        }
-                    }
-                    self.tracker.finish(request_id);
-                    let _ = self.executor.drop_request(request_id);
-                    to_retire.push(index);
-                }
-                DecodeEffect::EmitAndFinish {
-                    request_id,
                     token,
                     logprob,
                     finish_reason,
+                    stop_cause,
                 } => {
                     let Some(index) = self
                         .active
@@ -406,14 +386,14 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                             ledger.retire(request_id);
                         } else {
                             ledger.push_tokens(request_id, &[token], &[logprob]);
-                            finishes.push((request_id, finish_reason));
+                            finishes.push((request_id, finish_reason, stop_cause));
                         }
                     }
                     self.tracker.finish(request_id);
                     let _ = self.executor.drop_request(request_id);
                     to_retire.push(index);
                 }
-                DecodeEffect::EmitAndContinue {
+                DecodeEffect::Continue {
                     request_id,
                     token,
                     logprob,
@@ -436,7 +416,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         req.generated_count = completion_tokens;
                     }
                 }
-                DecodeEffect::EmitManyAndContinue {
+                DecodeEffect::ContinueMany {
                     request_id,
                     tokens,
                     completion_tokens,
@@ -460,10 +440,11 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         }
                     }
                 }
-                DecodeEffect::EmitManyAndFinish {
+                DecodeEffect::FinishMany {
                     request_id,
                     tokens,
                     finish_reason,
+                    stop_cause,
                 } => {
                     let Some(index) = self
                         .active
@@ -477,7 +458,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                             ledger.retire(request_id);
                         } else {
                             ledger.push_tokens(request_id, &tokens, &[]);
-                            finishes.push((request_id, finish_reason));
+                            finishes.push((request_id, finish_reason, stop_cause));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -507,32 +488,19 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         continued.push(req);
                     }
                 }
-                PendingEffect::Finish {
-                    request_id,
-                    finish_reason,
-                } => {
-                    if ledger.is_active(request_id) {
-                        if ledger.is_aborted(request_id) {
-                            ledger.retire(request_id);
-                        } else {
-                            finishes.push((request_id, finish_reason));
-                        }
-                    }
-                    self.tracker.finish(request_id);
-                    let _ = self.executor.drop_request(request_id);
-                }
                 PendingEffect::EmitAndFinish {
                     request_id,
                     token,
                     logprob,
                     finish_reason,
+                    stop_cause,
                 } => {
                     if ledger.is_active(request_id) {
                         if ledger.is_aborted(request_id) {
                             ledger.retire(request_id);
                         } else {
                             ledger.push_tokens(request_id, &[token], &[logprob]);
-                            finishes.push((request_id, finish_reason));
+                            finishes.push((request_id, finish_reason, stop_cause));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -560,12 +528,14 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             if self.executor.withholds_finishes() {
                 let withheld: Vec<DeferredFinish> = finishes
                     .into_iter()
-                    .map(|(request_id, reason)| ledger.defer_finish(request_id, reason))
+                    .map(|(request_id, reason, stop_cause)| {
+                        ledger.defer_finish_with_cause(request_id, reason, stop_cause)
+                    })
                     .collect();
                 self.executor.release_finished_events(withheld);
             } else {
-                for (request_id, reason) in finishes {
-                    ledger.finish(request_id, reason);
+                for (request_id, reason, stop_cause) in finishes {
+                    ledger.finish_with_cause(request_id, reason, stop_cause);
                 }
             }
         }
