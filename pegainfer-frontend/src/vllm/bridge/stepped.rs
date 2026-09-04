@@ -659,6 +659,7 @@ mod tests {
     use super::*;
     use crate::engine::PromptEcho;
     use crate::engine::RejectReason;
+    use crate::engine::StopPolicy;
     use crate::engine::TokenLogprob;
     use crate::engine::scheduler_pair;
 
