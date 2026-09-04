@@ -637,8 +637,9 @@ mod tests {
 
     use super::*;
     use crate::engine::RejectReason;
-    use crate::engine::scheduler_pair;
+    use crate::engine::StopPolicy;
     use crate::engine::TokenLogprob;
+    use crate::engine::scheduler_pair;
 
     fn request() -> Request {
         Request {
