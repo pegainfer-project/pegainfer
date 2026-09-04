@@ -21,6 +21,7 @@ use pegainfer_kernels::tensor::StreamOverrideGuard;
 use super::batch_decode_graph::BatchDecodeGraphState;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
+use crate::batch_decode::DecodeGraphUse;
 
 pub(crate) struct UnifiedStepOutput {
     pub(crate) prefill_logits: Option<HiddenStates>,
@@ -125,7 +126,12 @@ impl Qwen35Model {
         let decoded = if decode_tokens.is_empty() {
             false
         } else {
-            self.batch_decode_graph(decode_tokens, decode_kv_states, graph_state)?;
+            self.batch_decode_graph(
+                decode_tokens,
+                decode_kv_states,
+                graph_state,
+                DecodeGraphUse::Serve,
+            )?;
             true
         };
 
@@ -174,8 +180,8 @@ mod tests {
             let prompts_ref: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
             let mut kv_states: Vec<KvState> = vec![model.alloc_kv(), model.alloc_kv()];
             let mut rec_states: Vec<RecurrentState> = vec![
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
+                RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
+                RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
             ];
             let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
             let first_logits = model
@@ -199,7 +205,7 @@ mod tests {
             for _ in 1..num_steps {
                 let tids = [*tokens_a.last().unwrap(), *tokens_b.last().unwrap()];
                 model
-                    .batch_decode_graph(&tids, &mut kv_refs, &mut gs)
+                    .batch_decode_graph(&tids, &mut kv_refs, &mut gs, DecodeGraphUse::Serve)
                     .unwrap();
                 let next = greedy_sample_batch(&model, &gs.buffers.logits, 2);
                 tokens_a.push(next[0]);
@@ -213,8 +219,8 @@ mod tests {
             let prompts_ref: Vec<&[u32]> = vec![&prompt_a, &prompt_b];
             let mut kv_states: Vec<KvState> = vec![model.alloc_kv(), model.alloc_kv()];
             let mut rec_states: Vec<RecurrentState> = vec![
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
-                RecurrentState::new(&model.ctx, &model.config).unwrap(),
+                RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
+                RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
             ];
             let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
 

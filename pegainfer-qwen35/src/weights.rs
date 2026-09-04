@@ -18,9 +18,13 @@ use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info_fixed;
 use pegainfer_core::weight_loader::load_tensor_1d;
 use pegainfer_core::weight_loader::load_tensor_1d_f32;
+use pegainfer_core::weight_loader::load_tensor_1d_f32_shard;
+use pegainfer_core::weight_loader::load_tensor_1d_shard;
+use pegainfer_core::weight_loader::load_tensor_1d_stitch;
 use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::load_tensor_2d_col_shard;
 use pegainfer_core::weight_loader::load_tensor_2d_row_shard;
+use pegainfer_core::weight_loader::load_tensor_2d_row_stitch;
 use pegainfer_core::weight_loader::mmap_shards;
 use safetensors::SafeTensors;
 
@@ -46,23 +50,28 @@ pub(super) struct FullAttentionLayer {
 
 /// Linear attention layer weights (24 layers in Qwen3.5-4B).
 pub(super) struct LinearAttentionLayer {
-    /// Fused QKV projection: [q_dim + k_dim + v_dim, hidden_size]
+    /// Fused QKV projection: [local_linear_qkv_dim, hidden_size] — rows keep
+    /// the global [q | k | v] segment layout, with each segment restricted to
+    /// this rank's head-local slice (see `linear_qkv_shard_segments`).
     pub(super) in_proj_qkv: DeviceMatrix,
-    /// Z projection (for output gating): [z_dim, hidden_size]
+    /// Z projection (for output gating): [local_linear_z_dim, hidden_size]
     pub(super) in_proj_z: DeviceMatrix,
-    /// Beta projection: [num_value_heads, hidden_size]
+    /// Beta projection: [local_linear_num_value_heads, hidden_size]
     pub(super) in_proj_b: DeviceMatrix,
-    /// Alpha projection: [num_value_heads, hidden_size]
+    /// Alpha projection: [local_linear_num_value_heads, hidden_size]
     pub(super) in_proj_a: DeviceMatrix,
-    /// Depthwise conv1d weight: [qkv_dim * conv_kernel_dim] (flattened from [qkv_dim, 1, 4])
+    /// Depthwise conv1d weight: [local_linear_qkv_dim * conv_kernel_dim]
+    /// (flattened from [qkv_dim, 1, 4]); channel layout mirrors in_proj_qkv.
     pub(super) conv1d_weight: DeviceVec,
-    /// dt_bias: [num_value_heads] bf16
+    /// dt_bias: [local_linear_num_value_heads] bf16
     pub(super) dt_bias: DeviceVec,
-    /// A_log: [num_value_heads] f32
+    /// A_log: [local_linear_num_value_heads] f32
     pub(super) a_log: CudaSlice<f32>,
-    /// RMSNorm weight for output normalization: [value_head_dim] f32
+    /// RMSNorm weight for output normalization: [value_head_dim] f32 —
+    /// head-shared, so replicated on every rank.
     pub(super) norm_weight: CudaSlice<f32>,
-    /// Output projection: [hidden_size, z_dim]
+    /// Output projection: [hidden_size, local_linear_z_dim] (row-parallel;
+    /// the layer all-reduces the partial hidden sum under TP).
     pub(super) out_proj: DeviceMatrix,
 }
 
@@ -209,8 +218,8 @@ impl Qwen35Model {
 
         let mut config = Config35::from_file(model_path)?;
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
-        let geometry = LocalGeometry::try_new(&config, tensor_parallel, runtime.enable_cuda_graph)
-            .map_err(anyhow::Error::from)?;
+        let geometry =
+            LocalGeometry::try_new(&config, tensor_parallel).map_err(anyhow::Error::from)?;
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}, tp_rank={}, tp_world_size={}",
             config.hidden_size,
@@ -338,60 +347,110 @@ impl Qwen35Model {
                 }
                 LayerType::LinearAttention => {
                     let attn_prefix = format!("{}.linear_attn", prefix);
+                    // Phase 2b: shard linear attention over TP ranks. Value-head
+                    // unit drives z/b/a/dt_bias/a_log rows; the fused qkv weight
+                    // and conv need per-segment head-local stitching.
+                    let (vh_offset, vh_rows) =
+                        tensor_parallel.shard_range(config.linear_num_value_heads);
+                    let (z_row_offset, z_rows) =
+                        tensor_parallel.shard_range(config.linear_attn_z_dim());
+                    let (z_col_offset, z_cols) = (z_row_offset, z_rows);
                     LayerKind::LinearAttention(LinearAttentionLayer {
-                        in_proj_qkv: load_tensor_2d(
+                        in_proj_qkv: load_linear_in_proj_qkv_shard(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.in_proj_qkv.weight", attn_prefix),
+                            &config,
+                            tensor_parallel,
                         )?,
-                        in_proj_z: load_tensor_2d(
+                        in_proj_z: load_tensor_2d_row_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.in_proj_z.weight", attn_prefix),
+                            geometry,
+                            z_row_offset,
+                            z_rows,
                         )?,
-                        in_proj_b: load_tensor_2d(
+                        in_proj_b: load_tensor_2d_row_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.in_proj_b.weight", attn_prefix),
+                            geometry,
+                            vh_offset,
+                            vh_rows,
                         )?,
-                        in_proj_a: load_tensor_2d(
+                        in_proj_a: load_tensor_2d_row_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.in_proj_a.weight", attn_prefix),
+                            geometry,
+                            vh_offset,
+                            vh_rows,
                         )?,
-                        conv1d_weight: load_tensor_1d(
+                        conv1d_weight: load_linear_conv1d_shard(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.conv1d.weight", attn_prefix),
+                            &config,
+                            tensor_parallel,
                         )?,
-                        dt_bias: load_tensor_1d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.dt_bias", attn_prefix),
-                        )?,
-                        a_log: load_tensor_1d_f32(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.A_log", attn_prefix),
-                        )?,
+                        dt_bias: if tensor_parallel.is_sharded() {
+                            load_tensor_1d_shard(
+                                &ctx,
+                                &shards,
+                                &weight_map,
+                                &format!("{}.dt_bias", attn_prefix),
+                                vh_offset,
+                                vh_rows,
+                            )?
+                        } else {
+                            load_tensor_1d(
+                                &ctx,
+                                &shards,
+                                &weight_map,
+                                &format!("{}.dt_bias", attn_prefix),
+                            )?
+                        },
+                        a_log: if tensor_parallel.is_sharded() {
+                            load_tensor_1d_f32_shard(
+                                &ctx,
+                                &shards,
+                                &weight_map,
+                                &format!("{}.A_log", attn_prefix),
+                                vh_offset,
+                                vh_rows,
+                            )?
+                        } else {
+                            load_tensor_1d_f32(
+                                &ctx,
+                                &shards,
+                                &weight_map,
+                                &format!("{}.A_log", attn_prefix),
+                            )?
+                        },
+                        // Gated RMSNorm weight is per value-head dim (128) and
+                        // shared by every head: replicated, never sharded.
                         norm_weight: load_tensor_1d_f32(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.norm.weight", attn_prefix),
                         )?,
-                        out_proj: load_tensor_2d(
+                        // Row-parallel out_proj: shard input columns to the
+                        // local z dim; the layer all-reduces the partial sum.
+                        out_proj: load_tensor_2d_col_shard_if_needed(
                             &ctx,
                             &shards,
                             &weight_map,
                             &format!("{}.out_proj.weight", attn_prefix),
+                            geometry,
+                            z_col_offset,
+                            z_cols,
                         )?,
                     })
                 }
@@ -499,10 +558,14 @@ impl Qwen35Model {
         // Reserve space for prefill scratch (GDR chunkwise + per-layer transients)
         // before allocating KV pool, so prefill doesn't OOM.
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
-        let scratch_reserve =
-            super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
-        let recurrent_reserve =
-            STATES_PER_DECODE_SLOT * max_batch * super::recurrent_state::bytes_per_request(&config);
+        let scratch_reserve = super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
+            &config,
+            geometry,
+            max_prefill_len,
+        );
+        let recurrent_reserve = STATES_PER_DECODE_SLOT
+            * max_batch
+            * super::recurrent_state::bytes_per_request(&config, geometry);
         let min_kv_bytes = MIN_KV_PAGES * bytes_per_page;
         anyhow::ensure!(
             free_bytes >= scratch_reserve + recurrent_reserve + min_kv_bytes,
@@ -586,6 +649,34 @@ impl Qwen35Model {
         self.tp_comm = Some(comm);
     }
 
+    /// Force NCCL connect before any CUDA Graph capture records a collective
+    /// (lazy connect inside `cuStreamBeginCapture` wedges the capture). NCCL
+    /// 2.22+ connects per size-selected algorithm, so warm one all-reduce at
+    /// every decode bucket's message size. No-op without a TP communicator.
+    pub(crate) fn warmup_tp_collective(&self) -> Result<()> {
+        if let Some(comm) = &self.tp_comm {
+            let buckets = super::batch_decode_graph::BATCH_BUCKETS;
+            let max_elems = buckets.last().unwrap() * self.config.hidden_size;
+            let mut scratch = self
+                .ctx
+                .stream
+                .alloc_zeros::<half::bf16>(max_elems)
+                .map_err(|e| anyhow::anyhow!("alloc NCCL warm-up scratch: {e}"))?;
+            for &bucket in buckets {
+                let mut view = scratch.slice_mut(0..bucket * self.config.hidden_size);
+                comm.all_reduce_in_place(&mut view, &ReduceOp::Sum)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Qwen3.5 NCCL warm-up all-reduce failed: {e:?}")
+                    })?;
+            }
+            self.ctx
+                .stream
+                .synchronize()
+                .map_err(|e| anyhow::anyhow!("Qwen3.5 NCCL warm-up sync failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn all_reduce_hidden(&self, hidden: &mut HiddenStates) -> Result<()> {
         self.all_reduce_hidden_untraced(hidden)
     }
@@ -610,9 +701,9 @@ impl Qwen35Model {
         let geom = self.geometry;
         let full_q = geom.local_full_attn_gated_q_dim();
         let full_kv = geom.local_full_attn_kv_dim();
-        let linear_qkv = self.config.linear_attn_qkv_dim();
-        let linear_z = self.config.linear_attn_z_dim();
-        let linear_ba = self.config.linear_num_value_heads;
+        let linear_qkv = geom.local_linear_qkv_dim();
+        let linear_z = geom.local_linear_z_dim();
+        let linear_ba = geom.local_linear_num_value_heads();
         let intermediate = geom.local_intermediate_size();
 
         let full_q_samples: Vec<_> = self
@@ -802,6 +893,70 @@ fn load_full_attention_gated_q_proj(
     load_tensor_2d_row_shard(ctx, shards, weight_map, name, range.row_offset, range.rows)
 }
 
+/// Row ranges this rank owns inside the fused global linear-attention qkv
+/// projection. The checkpoint stores [all q rows | all k rows | all v rows];
+/// each segment contributes its head-local slice so the rank's stitched rows
+/// stay [q_local | k_local | v_local]. Never reblock across segments — q rows
+/// key on key heads, v rows on value heads (the gated-q lesson).
+fn linear_qkv_shard_segments(
+    config: &Config35,
+    tensor_parallel: TensorParallelConfig,
+) -> [(usize, usize); 3] {
+    let global_q = config.linear_num_key_heads * config.linear_key_head_dim;
+    let global_k = global_q;
+    let global_v = config.linear_attn_z_dim();
+    let (q_rel, q_rows) = tensor_parallel.shard_range(global_q);
+    let (k_rel, k_rows) = tensor_parallel.shard_range(global_k);
+    let (v_rel, v_rows) = tensor_parallel.shard_range(global_v);
+    [
+        (q_rel, q_rows),
+        (global_q + k_rel, k_rows),
+        (global_q + global_k + v_rel, v_rows),
+    ]
+}
+
+fn load_linear_in_proj_qkv_shard(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    config: &Config35,
+    tensor_parallel: TensorParallelConfig,
+) -> Result<DeviceMatrix> {
+    if !tensor_parallel.is_sharded() {
+        return load_tensor_2d(ctx, shards, weight_map, name);
+    }
+    let segments = linear_qkv_shard_segments(config, tensor_parallel);
+    load_tensor_2d_row_stitch(ctx, shards, weight_map, name, &segments)
+}
+
+/// The flattened conv1d weight keeps each channel's kernel taps contiguous
+/// ([channel, 1, kernel_dim]); its channel layout mirrors the fused qkv rows,
+/// so shard it with the same per-segment ranges scaled by the kernel dim.
+fn linear_conv1d_shard_segments(
+    config: &Config35,
+    tensor_parallel: TensorParallelConfig,
+) -> [(usize, usize); 3] {
+    let kernel_dim = config.linear_conv_kernel_dim;
+    linear_qkv_shard_segments(config, tensor_parallel)
+        .map(|(offset, len)| (offset * kernel_dim, len * kernel_dim))
+}
+
+fn load_linear_conv1d_shard(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    config: &Config35,
+    tensor_parallel: TensorParallelConfig,
+) -> Result<DeviceVec> {
+    if !tensor_parallel.is_sharded() {
+        return load_tensor_1d(ctx, shards, weight_map, name);
+    }
+    let segments = linear_conv1d_shard_segments(config, tensor_parallel);
+    load_tensor_1d_stitch(ctx, shards, weight_map, name, &segments)
+}
+
 fn load_tensor_2d_row_shard_if_needed(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -872,7 +1027,7 @@ mod tests {
     fn test_geometry(rank: usize, world_size: usize) -> LocalGeometry {
         let config = test_config();
         let tp = TensorParallelConfig::try_from((rank, world_size)).unwrap();
-        LocalGeometry::try_new(&config, tp, false).unwrap()
+        LocalGeometry::try_new(&config, tp).unwrap()
     }
 
     #[test]
@@ -911,5 +1066,154 @@ mod tests {
         let local_down_cols = inter_rows;
         assert_eq!(local_gate_up_rows, 9216);
         assert_eq!(local_down_cols, 4608);
+    }
+
+    #[test]
+    fn linear_qkv_shard_segments_stitch_head_local_slices() {
+        // test_config: k heads 16, v heads 32, head dim 128 → q=k=2048, v=4096.
+        let config = test_config();
+        let rank0 =
+            linear_qkv_shard_segments(&config, TensorParallelConfig::try_from((0, 2)).unwrap());
+        assert_eq!(rank0, [(0, 1024), (2048, 1024), (4096, 2048)]);
+
+        let rank1 =
+            linear_qkv_shard_segments(&config, TensorParallelConfig::try_from((1, 2)).unwrap());
+        assert_eq!(rank1, [(1024, 1024), (3072, 1024), (6144, 2048)]);
+
+        // Every rank's stitched rows tile [0, qkv) with no overlap: each
+        // segment's local slices across ranks are contiguous and complete.
+        for (r0, r1) in rank0.iter().zip(rank1.iter()) {
+            assert_eq!(r0.1, r1.1);
+            assert_eq!(r1.0, r0.0 + r0.1);
+        }
+    }
+
+    #[test]
+    fn linear_conv1d_shard_segments_scale_by_kernel_dim() {
+        let config = test_config();
+        let rank1 =
+            linear_conv1d_shard_segments(&config, TensorParallelConfig::try_from((1, 2)).unwrap());
+        // conv1d.weight is [qkv * 4]: same ranges as qkv, scaled by 4.
+        assert_eq!(rank1, [(4096, 4096), (12288, 4096), (24576, 8192)]);
+    }
+
+    #[test]
+    fn tp1_linear_qkv_shard_segments_cover_full_segments() {
+        // TP1 identity: the segments used by the sharded loader would reproduce
+        // the full tensor (TP1 itself never stitches — it uses load_tensor_2d).
+        let config = test_config();
+        let segments = linear_qkv_shard_segments(&config, TensorParallelConfig::default());
+        assert_eq!(segments, [(0, 2048), (2048, 2048), (4096, 4096)]);
+    }
+
+    /// In-memory safetensors fixture: one F32 tensor whose element `i`
+    /// carries value `i` (exact in f32), so any slice maps back to its source
+    /// offset. The row/col range math is dtype-agnostic (element units), so
+    /// an f32 blob exercises the same layout contract as the bf16 loaders.
+    fn safetensors_fixture_f32(name: &str, shape: &[usize]) -> Vec<u8> {
+        let len: usize = shape.iter().product();
+        let data: Vec<u8> = (0..len).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.to_vec(), &data)
+                .unwrap();
+        safetensors::serialize([(name.to_string(), view)], None).unwrap()
+    }
+
+    #[test]
+    fn linear_attention_tp2_slices_match_synthetic_checkpoint() {
+        // CPU-only layout contract test: parse a synthetic safetensors blob and
+        // verify each rank's stitched slices land on the expected source
+        // offsets, including per-segment head-local contiguity.
+        let config = test_config();
+        let qkv_rows = test_geometry(0, 1).local_linear_qkv_dim(); // 8192
+        let kernel_dim = config.linear_conv_kernel_dim; // 4
+        // Column count is irrelevant to the row range math; keep it tiny.
+        let cols = 8;
+
+        let qkv_blob = safetensors_fixture_f32("w", &[qkv_rows, cols]);
+        let qkv = safetensors::SafeTensors::deserialize(&qkv_blob).unwrap();
+        let qkv_view = qkv.tensor("w").unwrap();
+        assert_eq!(qkv_view.shape(), [qkv_rows, cols]);
+        let qkv_elems: Vec<f32> = qkv_view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+
+        // conv1d.weight fixture: [qkv * kernel_dim] flattened channels.
+        let conv_blob = safetensors_fixture_f32("c", &[qkv_rows * kernel_dim]);
+        let conv = safetensors::SafeTensors::deserialize(&conv_blob).unwrap();
+        let conv_view = conv.tensor("c").unwrap();
+        let conv_elems: Vec<f32> = conv_view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+
+        let global_q = config.linear_num_key_heads * config.linear_key_head_dim;
+        for rank in 0..2usize {
+            let tp = TensorParallelConfig::try_from((rank, 2)).unwrap();
+            let geom = LocalGeometry::try_new(&config, tp).unwrap();
+            let segments = linear_qkv_shard_segments(&config, tp);
+
+            // Stitched matrix = per-segment head-local row slices, in storage
+            // order; assert full row content of every stitched row.
+            let mut stitched = Vec::new();
+            for &(offset, rows) in &segments {
+                stitched.extend_from_slice(&qkv_elems[offset * cols..(offset + rows) * cols]);
+            }
+            assert_eq!(stitched.len(), geom.local_linear_qkv_dim() * cols);
+            let mut expected = Vec::new();
+            for row in (0..segments[0].1) // q: rank-local key-head slice
+                .map(|r| segments[0].0 + r)
+                .chain((0..segments[1].1).map(|r| segments[1].0 + r))
+                .chain((0..segments[2].1).map(|r| segments[2].0 + r))
+            {
+                expected.extend_from_slice(&qkv_elems[row * cols..(row + 1) * cols]);
+            }
+            assert_eq!(stitched, expected, "rank {rank} fused qkv layout");
+
+            // Head-locality: q segment stays inside the rank's key-head range,
+            // v segment starts after all global q+k rows plus the rank offset.
+            // Local segment dims derive from the fixture config (TP2).
+            let lq = config.linear_num_key_heads / 2 * config.linear_key_head_dim;
+            let lk = lq;
+            let lv = config.linear_num_value_heads / 2 * config.linear_value_head_dim;
+            assert_eq!(segments[0].0, rank * lq);
+            assert_eq!(segments[2].0, 2 * global_q + rank * lv);
+
+            // conv1d channels mirror qkv rows, each scaled by kernel_dim.
+            // The expectation is built from first principles (rank-local
+            // head-dim channel windows), not from the segment tuples.
+            let conv_segments = linear_conv1d_shard_segments(&config, tp);
+            let mut conv_stitched = Vec::new();
+            for &(conv_off, conv_len) in &conv_segments {
+                conv_stitched.extend_from_slice(&conv_elems[conv_off..conv_off + conv_len]);
+            }
+            let channels = (rank * lq..(rank + 1) * lq)
+                .chain(global_q + rank * lk..global_q + (rank + 1) * lk)
+                .chain(2 * global_q + rank * lv..2 * global_q + (rank + 1) * lv);
+            let mut conv_expected = Vec::new();
+            for c in channels {
+                conv_expected.extend_from_slice(&conv_elems[c * kernel_dim..(c + 1) * kernel_dim]);
+            }
+            assert_eq!(
+                conv_stitched.len(),
+                geom.local_linear_qkv_dim() * kernel_dim
+            );
+            assert_eq!(conv_stitched, conv_expected, "rank {rank} conv1d layout");
+
+            // Value-head unit drives in_proj_z rows, in_proj_b/a rows, dt_bias
+            // and a_log; out_proj takes the same range as columns.
+            let (vh_offset, vh_rows) = tp.shard_range(config.linear_num_value_heads);
+            assert_eq!((vh_offset, vh_rows), (rank * 16, 16));
+            let (z_offset, z_rows) = tp.shard_range(config.linear_attn_z_dim());
+            assert_eq!((z_offset, z_rows), (rank * 2048, 2048));
+            assert_eq!(z_rows, geom.local_linear_z_dim());
+        }
     }
 }

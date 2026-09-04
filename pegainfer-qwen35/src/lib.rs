@@ -96,6 +96,9 @@ pub enum Qwen35DecodeOverlap {
     SharedSm,
 }
 
+/// TP decode runs CUDA Graphs when `cuda_graph` is set AND the rank-local
+/// decode GQA group has a compiled kernel (`tp-design.md` P2c gate); otherwise
+/// TP keeps the batched eager path.
 pub fn start_engine(
     model_path: &Path,
     options: EngineLoadOptions,
@@ -117,7 +120,8 @@ pub struct Qwen35LaunchOptions {
     device_ordinal: usize,
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
     tp_size: usize,
-    /// TP Phase 1 supports eager-only multi-GPU execution.
+    /// TP decode captures CUDA Graphs when the rank-local decode GQA group has
+    /// a compiled kernel; uncompiled groups (27B) stay on the eager path.
     cuda_graph: bool,
     max_batch: usize,
     max_prefill_tokens: usize,
@@ -229,11 +233,6 @@ pub fn start_engine_with_capacity_policy_and_overlap(
                 "Qwen3.5 TP uses the fixed off scheduler policy; --qwen35-scheduler-policy=auto is single-GPU only"
             ));
         }
-        if enable_cuda_graph {
-            return Err(anyhow!(
-                "Qwen3.5 TP Phase 1 supports eager execution only; disable CUDA Graph"
-            ));
-        }
         let model_path = model_path
             .to_str()
             .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
@@ -243,6 +242,7 @@ pub fn start_engine_with_capacity_policy_and_overlap(
             &device_ordinals,
             max_batch,
             max_prefill_tokens,
+            enable_cuda_graph,
         );
     }
 
@@ -305,6 +305,31 @@ mod tests {
     #[test]
     fn scheduler_policy_defaults_to_off() {
         assert_eq!(Qwen35SchedulerPolicy::default(), Qwen35SchedulerPolicy::Off);
+    }
+
+    #[test]
+    fn tp_cuda_graph_is_no_longer_rejected_before_model_load() {
+        // P2c: the graph/eager decision is gated on the model's TP-local decode
+        // GQA group, which needs the loaded config — so TP + CUDA Graph passes
+        // pre-load validation and fails here only because the path is bogus.
+        let err = start_engine_with_capacity_and_policy(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: true,
+                device_ordinals: vec![0, 1],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            1,
+            1,
+            Qwen35SchedulerPolicy::Off,
+        )
+        .err()
+        .expect("nonexistent model path should fail at load")
+        .to_string();
+
+        assert!(!err.contains("eager execution only"));
     }
 
     #[test]

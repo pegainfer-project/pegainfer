@@ -167,7 +167,13 @@ impl Qwen35Executor {
         let mut recurrent_states: Vec<RecurrentState> = plan
             .requests
             .iter()
-            .map(|_| RecurrentState::new(self.model.device_ctx(), self.model.config()))
+            .map(|_| {
+                RecurrentState::new(
+                    self.model.device_ctx(),
+                    self.model.config(),
+                    self.model.geometry,
+                )
+            })
             .collect::<Result<_>>()?;
         let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
         let logits =
@@ -226,8 +232,12 @@ impl Qwen35Executor {
         let token_ids: Vec<u32> = plan.requests.iter().map(|req| req.token_id).collect();
         let mut kv_refs: Vec<&mut KvState> =
             self.active.iter_mut().map(|req| &mut req.kv).collect();
-        self.model
-            .batch_decode_graph(&token_ids, &mut kv_refs, &mut self.graph_state)?;
+        self.model.batch_decode_graph(
+            &token_ids,
+            &mut kv_refs,
+            &mut self.graph_state,
+            crate::batch_decode::DecodeGraphUse::Serve,
+        )?;
 
         let requested_logprobs: Vec<usize> = plan.requests.iter().map(|req| req.logprobs).collect();
         let cpu_logits = snapshot_requested_logprobs(

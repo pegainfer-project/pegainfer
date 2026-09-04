@@ -83,28 +83,29 @@ pub(crate) struct LocalGeometry {
     local_full_attn_q_dim: usize,
     local_full_attn_kv_dim: usize,
     local_full_attn_gated_q_dim: usize,
+    local_linear_num_key_heads: usize,
+    local_linear_num_value_heads: usize,
+    local_linear_q_dim: usize,
+    local_linear_v_dim: usize,
+    local_linear_qkv_dim: usize,
 }
 
 impl LocalGeometry {
-    /// Validate `config` against `tp` and the runtime execution mode, then derive
-    /// this rank's local dimensions.
+    /// Validate `config` against `tp`, then derive this rank's local dimensions.
     ///
     /// Fails on unsupported combinations before expensive loading:
-    /// - sharded TP demands eager execution (`enable_cuda_graph` off);
     /// - every sharded model dimension must divide evenly by `world_size`
-    ///   (linear-attention head counts are intentionally exempt);
+    ///   (linear-attention heads included: Phase 2b shards them per rank);
     /// - `rank < world_size` and `world_size >= 1` are guaranteed by
     ///   `TensorParallelConfig::try_from`.
+    ///
+    /// CUDA Graph under TP is gated at executor startup on
+    /// [`LocalGeometry::local_decode_group_is_compiled`] (P2c): uncompiled GQA
+    /// groups keep the batched eager path instead of failing validation here.
     pub(crate) fn try_new(
         config: &Config35,
         tp: TensorParallelConfig,
-        enable_cuda_graph: bool,
     ) -> Result<Self, ConfigError> {
-        if tp.is_sharded() && enable_cuda_graph {
-            return Err(ConfigError::TpRequiresEager {
-                world_size: tp.world_size(),
-            });
-        }
         if !config.num_attention_heads.is_multiple_of(tp.world_size()) {
             return Err(ConfigError::TpIndivisible {
                 field: "num_attention_heads",
@@ -126,12 +127,37 @@ impl LocalGeometry {
                 world_size: tp.world_size(),
             });
         }
+        // Phase 2b shards linear attention/GDR heads per rank; fail closed on
+        // indivisible head counts rather than falling back to replication.
+        if !config.linear_num_key_heads.is_multiple_of(tp.world_size()) {
+            return Err(ConfigError::TpIndivisible {
+                field: "linear_num_key_heads",
+                value: config.linear_num_key_heads,
+                world_size: tp.world_size(),
+            });
+        }
+        if !config
+            .linear_num_value_heads
+            .is_multiple_of(tp.world_size())
+        {
+            return Err(ConfigError::TpIndivisible {
+                field: "linear_num_value_heads",
+                value: config.linear_num_value_heads,
+                world_size: tp.world_size(),
+            });
+        }
 
         let local_num_attention_heads = config.num_attention_heads / tp.world_size();
         let local_num_key_value_heads = config.num_key_value_heads / tp.world_size();
         let local_intermediate_size = config.intermediate_size / tp.world_size();
         let local_full_attn_q_dim = local_num_attention_heads * config.head_dim;
         let local_full_attn_kv_dim = local_num_key_value_heads * config.head_dim;
+        let local_linear_num_key_heads = config.linear_num_key_heads / tp.world_size();
+        let local_linear_num_value_heads = config.linear_num_value_heads / tp.world_size();
+        // Local q/k segment rows of the fused linear-attention qkv projection;
+        // q is keyed by key heads (one key head per value-head group).
+        let local_linear_q_dim = local_linear_num_key_heads * config.linear_key_head_dim;
+        let local_linear_v_dim = local_linear_num_value_heads * config.linear_value_head_dim;
 
         Ok(Self {
             tp,
@@ -141,6 +167,12 @@ impl LocalGeometry {
             local_full_attn_q_dim,
             local_full_attn_kv_dim,
             local_full_attn_gated_q_dim: local_full_attn_q_dim * 2,
+            local_linear_num_key_heads,
+            local_linear_num_value_heads,
+            local_linear_q_dim,
+            local_linear_v_dim,
+            // [q_local | k_local | v_local] in storage order; k == q.
+            local_linear_qkv_dim: local_linear_q_dim * 2 + local_linear_v_dim,
         })
     }
 
@@ -183,6 +215,38 @@ impl LocalGeometry {
     /// Local gated full-attention q projection output dimension.
     pub(crate) fn local_full_attn_gated_q_dim(&self) -> usize {
         self.local_full_attn_gated_q_dim
+    }
+
+    // ── Linear-attention local dims (Phase 2b TP sharding) ────────────────
+    // TP1 contract: at world_size 1 every local dim equals the global dim, so
+    // all linear-attention kernels/buffers/state keep their pre-TP shapes.
+
+    pub(crate) fn local_linear_num_key_heads(&self) -> usize {
+        self.local_linear_num_key_heads
+    }
+
+    pub(crate) fn local_linear_num_value_heads(&self) -> usize {
+        self.local_linear_num_value_heads
+    }
+
+    /// Local fused qkv rows: [q_local | k_local | v_local] in storage order.
+    pub(crate) fn local_linear_qkv_dim(&self) -> usize {
+        self.local_linear_qkv_dim
+    }
+
+    /// Local z projection output dimension (equals local v dim).
+    pub(crate) fn local_linear_z_dim(&self) -> usize {
+        self.local_linear_v_dim
+    }
+
+    /// TP-local decode GQA group supportability for the eager decode path:
+    /// whether the FlashInfer batch-decode kernel supports the rank-local
+    /// q-per-kv group. Deterministic per model and identical on every rank,
+    /// so both arms are collective-safe (the reroute adds no collectives).
+    /// At world_size 1 this equals `Config35::decode_group_is_compiled`.
+    pub(crate) fn local_decode_group_is_compiled(&self) -> bool {
+        pegainfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
+            .contains(&(self.local_num_attention_heads / self.local_num_key_value_heads))
     }
 }
 
@@ -231,7 +295,7 @@ mod tests {
     fn tp2_local_geometry_matches_dense_dims() {
         let cfg = config();
         let tp = TensorParallelConfig::try_from((1, 2)).unwrap();
-        let geom = LocalGeometry::try_new(&cfg, tp, false).unwrap();
+        let geom = LocalGeometry::try_new(&cfg, tp).unwrap();
         assert!(geom.is_sharded());
         assert_eq!(geom.shard_range(4096), (2048, 2048));
         assert_eq!(geom.local_num_attention_heads(), 8);
@@ -261,7 +325,7 @@ mod tests {
     fn rejects_indivisible_dense_dimensions() {
         let tp = TensorParallelConfig::try_from((0, 3)).unwrap();
         let cfg = config();
-        let mut err = LocalGeometry::try_new(&cfg, tp, false).unwrap_err();
+        let mut err = LocalGeometry::try_new(&cfg, tp).unwrap_err();
         assert_eq!(
             err,
             ConfigError::TpIndivisible {
@@ -274,7 +338,7 @@ mod tests {
         let mut broken = cfg;
         broken.num_attention_heads = 15;
         broken.num_key_value_heads = 4;
-        err = LocalGeometry::try_new(&broken, tp, false).unwrap_err();
+        err = LocalGeometry::try_new(&broken, tp).unwrap_err();
         assert_eq!(
             err,
             ConfigError::TpIndivisible {
@@ -286,7 +350,7 @@ mod tests {
 
         broken.num_key_value_heads = 3;
         broken.intermediate_size = 9217;
-        err = LocalGeometry::try_new(&broken, tp, false).unwrap_err();
+        err = LocalGeometry::try_new(&broken, tp).unwrap_err();
         assert_eq!(
             err,
             ConfigError::TpIndivisible {
@@ -298,21 +362,59 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tensor_parallel_with_cuda_graph() {
-        let cfg = config();
-        let tp = TensorParallelConfig::try_from((0, 2)).unwrap();
+    fn requires_linear_attention_head_divisibility() {
+        let tp = TensorParallelConfig::try_from((1, 2)).unwrap();
+        let mut broken = config();
+        broken.linear_num_key_heads = 17;
+        let err = LocalGeometry::try_new(&broken, tp).unwrap_err();
         assert_eq!(
-            LocalGeometry::try_new(&cfg, tp, true),
-            Err(ConfigError::TpRequiresEager { world_size: 2 })
+            err,
+            ConfigError::TpIndivisible {
+                field: "linear_num_key_heads",
+                value: 17,
+                world_size: 2,
+            }
+        );
+
+        let mut broken = config();
+        broken.linear_num_value_heads = 31;
+        let err = LocalGeometry::try_new(&broken, tp).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::TpIndivisible {
+                field: "linear_num_value_heads",
+                value: 31,
+                world_size: 2,
+            }
         );
     }
 
     #[test]
-    fn linear_attention_heads_need_not_divide_world_size() {
-        let mut cfg = config();
-        cfg.linear_num_key_heads = 17;
-        cfg.linear_num_value_heads = 31;
+    fn computes_tp2_linear_attention_local_dimensions() {
+        let cfg = config();
         let tp = TensorParallelConfig::try_from((1, 2)).unwrap();
-        LocalGeometry::try_new(&cfg, tp, false).unwrap();
+        let geom = LocalGeometry::try_new(&cfg, tp).unwrap();
+        assert_eq!(geom.local_linear_num_key_heads(), 8);
+        assert_eq!(geom.local_linear_num_value_heads(), 16);
+        assert_eq!(geom.local_linear_q_dim, 1024);
+        assert_eq!(geom.local_linear_v_dim, 2048);
+        assert_eq!(geom.local_linear_qkv_dim(), 4096);
+        assert_eq!(geom.local_linear_z_dim(), 2048);
+    }
+
+    #[test]
+    fn tp1_linear_attention_local_dimensions_equal_global() {
+        // TP1 invariant: every local dim equals the global dim, keeping TP1
+        // numerics byte-identical to pre-sharding execution.
+        let cfg = config();
+        let geom = LocalGeometry::try_new(&cfg, TensorParallelConfig::default()).unwrap();
+        assert_eq!(geom.local_linear_num_key_heads(), 16);
+        assert_eq!(geom.local_linear_num_value_heads(), 32);
+        assert_eq!(geom.local_linear_q_dim, 2048);
+        assert_eq!(geom.local_linear_v_dim, 4096);
+        let global_qkv =
+            2 * (cfg.linear_num_key_heads * cfg.linear_key_head_dim) + cfg.linear_attn_z_dim();
+        assert_eq!(geom.local_linear_qkv_dim(), global_qkv);
+        assert_eq!(geom.local_linear_z_dim(), cfg.linear_attn_z_dim());
     }
 }
