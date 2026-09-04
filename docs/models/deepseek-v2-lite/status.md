@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite keeps correctness, direct decode diagnostics, retained HTTP SLO reports, and soak readiness as separate gates. HF/host-staged/NCCL exactness and HTTP lifecycle evidence are retained; issue #466 added fixed host-staged/NCCL SLO artifacts, and the follow-up NCCL readiness fix covers the no-selector short HTTP path without claiming production readiness.
+> **TL;DR:** DeepSeek-V2-Lite keeps correctness, direct decode diagnostics, retained HTTP SLO reports, and sustained soak evidence as separate gates. HF/host-staged/NCCL exactness, HTTP lifecycle evidence, #466 SLO artifacts, and #465 host-staged/NCCL soak artifacts are retained without claiming production readiness.
 
 Last touched: 2026-07
 
@@ -24,6 +24,7 @@ Last touched: 2026-07
 | HTTP trace and measured MoE throughput optimization | HTTP and direct evidence | Issue #280 logs DeepSeek-V2-Lite `pegainfer_http_trace` records and batches same-position decode subgroups. Issue #464 extends phase/decode-step attribution, groups host-staged and NCCL routes by stable `(owner_rank, global_expert)`, and moves the NCCL gate GEMM to a bitwise-matched CUDA logits kernel while keeping host top-k/softmax. Diagnostic serial/host rollback switches remain available for retained A/B and emergency rollback; they are not production tuning knobs. |
 | HTTP reliability lifecycle gate | Available | Issue #453 adds `scripts/bench_dsv2lite_http_reliability.py`, which drives real streaming `/v1/completions` scenarios for client cancel/disconnect, unsupported params, active-cap overload, mixed short/long prompts with adjacent failures, and clean follow-up recovery. The 2026-07-04 2x RTX 5090 host-staged and NCCL runs both passed with terminal trace coverage, stable output hashes, active/pending/decode maxima, and healthy final scheduler baselines. |
 | Retained HTTP serving SLO report | Retained HTTP evidence | Issue #466 adds model-owned short/mixed/long profiles on the shared HTTP benchmark scripts. The current retained run covered all six host-staged/NCCL children with zero failures/timeouts and full trace coverage. The #466 follow-up fixed NCCL no-selector readiness by discovering a compatible Python-wheel NCCL runtime from `PATH`; the short NCCL c1 HTTP smoke now reaches readiness and completes without startup failure or layer-1 illegal address. This is HTTP pressure/SLO evidence only; command details and artifact hashes live in `benchmarking.md`. |
+| Sustained HTTP soak report | Retained soak evidence | Issue #465 adds `scripts/bench_dsv2lite_http_soak.py`, which reuses the shared HTTP leaf benchmark inside fixed time buckets, then retains backend-level and host-staged/NCCL combined JSON. The 2026-07-18 2x RTX 5090 run covered host-staged and NCCL with zero failures/timeouts, full required trace coverage, clean follow-up recovery, output hashes, resource samples, and first/last-quartile drift fields. The NCCL row used NCCL `2.26.2` with `NCCL_IB_DISABLE=1` and `NCCL_P2P_DISABLE=1`, so this is sustained HTTP soak evidence for that runtime contract, not a default-runtime speed claim or production-readiness claim. Current tooling also fails missing duration coverage, capped retained runs, missing leaf artifacts, missing clean follow-up, failed child gates, provenance drift, contract drift, and missing/generic runtime boundaries. |
 | Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, PegaInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, PegaInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus PegaInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 rows are gap-finding evidence from a documented contract. The supplemental validation run is not serving parity or a stock-install claim. |
 
@@ -66,6 +67,17 @@ On Blackwell (`sm_120`), DSV2-Lite NCCL rejects runtimes older than `2.26.2` bef
 The #466 follow-up readiness fix keeps this fail-closed floor but also scans Python executables on `PATH` for the `nvidia-nccl-cu12` wheel library. On the 2026-07-15 2x RTX 5090 run, `PATH=<conda-root>/bin:...` was enough to load NCCL `2.26.2` with no explicit selector. The same run preserved HF / host-staged / NCCL exactness, passed NCCL direct batch 1, passed NCCL short HTTP c1, and passed a host-staged short HTTP c1 no-regression smoke. This does not claim #465 soak, #452 long-prompt readiness, #635 device attention/KV readiness, #636 route-plan readiness, production readiness, or vLLM parity.
 
 The current-source #466 aggregate is retained under `artifacts/bench/dsv2-lite/<run-id>/` (gitignored). `benchmarking.md` contains the command, artifact fields, aggregate hash, and claim boundary.
+
+### Issue #465 Retained HTTP Soak Report
+
+The retained soak layer uses model-owned `scripts/bench_dsv2lite_http_soak.py` over the generic `bench_http_serving.py` leaf runner. The retained 2026-07-18 rerun used commit `a5703d0424d917ce99b4bd8691b0b86eecde966f`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x RTX 5090, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, 120-second duration, and 60-second buckets. Both backends passed `soak_gate.passed=true` under that run's gate. Later commits harden the retained gate semantics; regenerate artifacts before claiming final-head retained evidence. Command details and artifact hashes live in `benchmarking.md`.
+
+| Backend | Runtime boundary | Completed | Failed/timeouts | Buckets / leafs | Combined output hash | Boundary |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| host-staged | `host-staged` | 112 | 0 / 0 | 4 / 14 | `6912777bed672f57` | Sustained HTTP soak evidence for the host-staged oracle path |
+| NCCL | NCCL `2.26.2`, `NCCL_IB_DISABLE=1`, `NCCL_P2P_DISABLE=1` | 128 | 0 / 0 | 4 / 16 | `24f2db9fc47acc10` | Sustained HTTP soak evidence for this conservative single-node NCCL runtime |
+
+The combined retained report passed child gates for both backends, commit consistency, model provenance consistency, and runtime-boundary retention. The soak JSON records first/last-quartile tail, throughput, RSS, and device-memory drift, but numeric drift is still reported evidence rather than a production budget. Current tooling also records per-device and total VRAM drift so one EP rank cannot hide behind the max-device summary. Treat long-duration and long/mixed-prompt soaks as follow-up contracts, not implied coverage from this short-shape baseline.
 
 ### Retained vLLM TP2/EP2 Matrix
 
@@ -275,6 +287,7 @@ Use these labels consistently:
 | `NCCL device logits router slice` | The gate GEMM runs on CUDA with bitwise host-logit coverage; existing host top-k/softmax builds the route plan. | Fully device-resident routing, no routing D2H, general numerical equivalence, or non-NCCL improvement. |
 | `HTTP reliability lifecycle gate` | `/v1/completions` cancel/disconnect/reject/overload/mixed-failure scenarios have terminal reason counts, trace coverage, active/pending/decode maxima, output hashes, and clean follow-up recovery evidence. | Production EP readiness, soak stability, SLO latency, vLLM parity, throughput improvement, sparse dispatch, or multi-node EP support. |
 | `retained HTTP serving SLO` | Named short/mixed/long `/v1/completions` contracts report latency percentiles, throughput, outcomes, full trace coverage, hashes, and repeat spread for one backend/hardware/toolchain. | Direct attribution, sustained soak, production readiness, vLLM parity, or performance outside a matched contract. |
+| `retained HTTP soak` | Fixed-shape `/v1/completions` contracts run inside time buckets and report declared-duration coverage, completion, failures/timeouts, trace coverage, output hashes, complete leaf artifacts, clean follow-up recovery, resource samples, and first/last-quartile drift. | Direct attribution, long/mixed-prompt readiness, production budgets, default-runtime speed, vLLM parity, or multi-node recovery. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
 | `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True PegaInfer batch size unless the engine path proves it. |
 | `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 from the retained matrix or the separate FlashInfer-fixed validation. | Stock vLLM install support, PegaInfer serving parity, or production readiness. |
@@ -326,7 +339,7 @@ The next implementation should be chosen from measured evidence:
 5. Keep the #453 HTTP reliability evidence retained.
    - rerun the reliability runner for host-staged and NCCL when scheduler or HTTP lifecycle code changes;
    - keep the JSON artifact hashes and server-log trace coverage in the PR evidence;
-   - keep #452 long/mixed-prompt latency, #465 soak, the completed #466 SLO report layer, and #467 benchmark manifest separate.
+   - keep #452 long/mixed-prompt latency, the completed #465 soak baseline, the completed #466 SLO report layer, and #467 benchmark manifest separate.
 
 6. Keep MoE internals readable.
    - routing, dispatch, expert execution, and combine should remain distinguishable in code and attribution;

@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Verification And Benchmarking
 
-> **TL;DR:** Use `e2e_ep2` for correctness, `dsv2_lite_ep2_decode_attribution` for direct decode diagnostics, and `bench_dsv2lite_http_slo.py` for retained HTTP SLO evidence. The #466 follow-up NCCL readiness fix lets the backend discover a compatible Python-wheel NCCL runtime from `PATH`; these artifacts still answer different questions, and none of them alone proves production readiness.
+> **TL;DR:** Use `e2e_ep2` for correctness, `dsv2_lite_ep2_decode_attribution` for direct decode diagnostics, `bench_dsv2lite_http_slo.py` for retained HTTP SLO evidence, and `bench_dsv2lite_http_soak.py` for issue #465 sustained HTTP soak evidence. These artifacts still answer different questions, and none of them alone proves production readiness.
 >
 > Last touched: 2026-07
 
@@ -11,7 +11,7 @@
 | Correctness / integration | `pegainfer-deepseek-v2-lite/tests/e2e_ep2.rs` | EP2 load, host-staged/NCCL generation, request isolation, output tokens/text/hashes, route and collective accounting | Latency, throughput, SLO, soak, production readiness |
 | Direct diagnostic | `dsv2_lite_ep2_decode_attribution` | Fixed-shape CPU/CUDA section timing, route/collective counters, graph-readiness diagnostics | HTTP behavior, client pressure, serving SLO |
 | HTTP serving SLO | `scripts/bench_dsv2lite_http_slo.py` over the shared HTTP harness | Streaming TTFT/TPOT/ITL, request/output throughput, failures/timeouts, server trace coverage, output hashes, repeat spread | Direct-kernel attribution, sustained soak, production readiness |
-| Soak / production readiness | Separate sustained-run gate | Memory drift, long-duration tails, recovery and deployment limits | Out of scope for issue #466 |
+| Soak / production readiness | `scripts/bench_dsv2lite_http_soak.py` | Sustained request completion, first/last-quartile tail and throughput drift, RSS/VRAM drift, terminal reasons, clean follow-up recovery | Direct decode attribution, vLLM parity, multi-node recovery, or production readiness by itself |
 
 ## Correctness Gate
 
@@ -132,20 +132,92 @@ Each `sweep_summary.json` records:
 
 A cell is `noisy` when repeat spread exceeds 10% of the median for TTFT/TPOT/ITL p95, request throughput, or output-token throughput.
 
-## Local Tooling Gate
+## Sustained HTTP Soak
 
-These commands were run on 2026-07-13:
+Issue #465 uses `scripts/bench_dsv2lite_http_soak.py`. It reuses the generic streaming `/v1/completions` leaf benchmark inside fixed time buckets, then writes a backend-level `soak_summary.json` and an optional host-staged/NCCL combined report. A failed soak is still useful evidence when the JSON keeps the failing leaf artifact, server log pointer, terminal reasons, and clean follow-up result.
+
+The default retained shape is greedy, ignore-EOS, `prompt_words=64`, `max_tokens=64`, concurrency `4,8`, and no production latency budget. Tune `--duration-s`, `--bucket-s`, and `--num-requests` for the validation host; `--bucket-s` controls the target wall-clock window per bucket, while `--num-requests` controls each leaf chunk launched continuously inside that window. The summary records actual elapsed time, bucket count, and leaf count.
 
 ```bash
-python3 -m py_compile scripts/bench_http_common.py scripts/bench_http_serving.py scripts/bench_http_sweep.py scripts/bench_dsv2lite_http_slo.py
-python3 -m unittest -v tests/test_bench_http_serving.py tests/test_bench_http_sweep.py tests/test_bench_dsv2lite_http_slo.py
+# Template: run one backend soak after the server is ready.
+python3 scripts/bench_dsv2lite_http_soak.py run \
+  --backend BACKEND \
+  --base-url http://127.0.0.1:18000 \
+  --server-log artifacts/bench/dsv2-lite/RUN_ID/BACKEND/server.log \
+  --model-path MODEL_PATH \
+  --server-command "SERVER_COMMAND" \
+  --commit COMMIT \
+  --model-revision MODEL_REVISION \
+  --server-binary SERVER_BINARY \
+  --backend-runtime-version BACKEND_RUNTIME_VERSION \
+  --duration-s 1800 \
+  --bucket-s 300 \
+  --num-requests 32 \
+  --concurrency 4,8 \
+  --prompt-words 64 \
+  --max-tokens 64 \
+  --out-dir artifacts/bench/dsv2-lite/RUN_ID/BACKEND/soak
+
+# Template: combine host-staged and NCCL backend summaries.
+python3 scripts/bench_dsv2lite_http_soak.py combine \
+  --summary artifacts/bench/dsv2-lite/RUN_ID/host-staged/soak/soak_summary.json \
+  --summary artifacts/bench/dsv2-lite/RUN_ID/nccl/soak/soak_summary.json \
+  --out artifacts/bench/dsv2-lite/RUN_ID/retained_soak_report.json
+```
+
+Each backend summary records:
+
+- leaf artifact path and SHA-256 for every leaf chunk inside each bucket;
+- completed, failed, timeout, terminal-reason, and error counts;
+- TTFT, TPOT, ITL, request throughput, and output-token throughput per bucket;
+- first/last-quartile drift summaries for tails, throughput, RSS, per-device
+  VRAM, and total VRAM;
+- active-set, pending-queue, decode-batch, token-timing, and missing-trace coverage when server traces are available;
+- output hash distribution and combined hash;
+- process RSS plus per-device, total, and max device-memory samples;
+- post-soak clean follow-up result.
+
+`soak_gate.passed` means every requested concurrency has loaded bucket evidence for the declared duration, every leaf artifact is readable and hashed, leaf commands completed successfully with zero failures/timeouts, optional trace coverage passed for every bucket, and the clean follow-up completed. Runs capped by `--max-buckets` are smoke/debug evidence and do not pass the retained gate. Numeric drift is reported but not a hard budget until deployment limits are ratified.
+
+The combined host-staged/NCCL report hard-fails when either backend is missing, a child `soak_gate` fails any required sub-gate, the child commits differ, model/server provenance differs, the soak contract differs, or a backend runtime boundary is missing or generic. This keeps NCCL selector evidence attached to the soak result instead of turning a conservative runtime run into a default-runtime claim.
+
+## Local Tooling Gate
+
+These commands were run on 2026-07-18:
+
+```bash
+python3 -m py_compile scripts/bench_http_common.py scripts/bench_http_serving.py scripts/bench_http_sweep.py scripts/bench_dsv2lite_http_slo.py scripts/bench_dsv2lite_http_soak.py
+python3 -m unittest -v tests/test_bench_http_common.py tests/test_bench_http_serving.py tests/test_bench_http_sweep.py tests/test_bench_dsv2lite_http_slo.py tests/test_bench_dsv2lite_http_soak.py
 cargo fmt --all --check
 cargo metadata --locked --no-deps --format-version 1
 ```
 
 ## Current-Source Evidence
 
-Regenerate the retained report when its profile, schema, or measurement contract changes. The current retained 2x RTX 5090 evidence completed all six host-staged/NCCL children with zero failures/timeouts and full required trace coverage. The gitignored local copy is under `artifacts/bench/dsv2-lite/<run-id>/`; aggregate SHA-256: `a7e677c63d1ce92ad0c069f83acfcc8b381e07d06bed9364ab899adecef8d317`.
+Regenerate retained reports when their profile, schema, or measurement contract changes. The gitignored local copies live under `artifacts/bench/dsv2-lite/<run-id>/`; keep public docs to artifact basenames, hashes, contract shape, and claim boundaries.
+
+### Issue #465 Retained HTTP Soak
+
+The retained #465 rerun used code commit `a5703d0424d917ce99b4bd8691b0b86eecde966f`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x RTX 5090, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, `duration_s=120`, `bucket_s=60`, `num_requests=8`, and full required trace coverage. Later commits harden the retained gate semantics; regenerate the artifacts before claiming final-head evidence for the changed benchmark schema or runtime path. The combined report SHA-256 is `1c06e8825da70888277f1485f54d7f4fb9b2f61d617149d3ac7357cd5a03e7f1`.
+
+| Artifact basename | Backend | SHA-256 | Result | Boundary |
+| --- | --- | --- | --- | --- |
+| `soak_summary.json` | host-staged | `3fe4f163024602a51f10cac0c15cc24a5feffd92bbcb93091e175cd63e49bd33` | `completed=112`, `failed=0`, `timeouts=0`, `soak_gate.passed=true`, clean follow-up passed, combined output hash `6912777bed672f57` | Host-staged sustained HTTP soak evidence |
+| `soak_summary.json` | NCCL | `52c2a70d895fc0c080233961ea06824097fbf5b7241a0983e41c0ca6646e762f` | `completed=128`, `failed=0`, `timeouts=0`, `soak_gate.passed=true`, clean follow-up passed, combined output hash `24f2db9fc47acc10` | NCCL sustained HTTP soak evidence with NCCL `2.26.2`, `NCCL_IB_DISABLE=1`, `NCCL_P2P_DISABLE=1` |
+| `retained_soak_report.json` | combined | `1c06e8825da70888277f1485f54d7f4fb9b2f61d617149d3ac7357cd5a03e7f1` | `coverage_gate.passed=true`, `child_gates={host-staged:true,nccl:true}`, commit/model provenance consistent, runtime boundaries present | Combined host-staged/NCCL #465 report |
+
+Resource and drift fields are retained for diagnosis, not hard budgets. Host-staged max device memory stayed flat in both concurrency buckets, with output-token throughput drift `-1.5%` at c4 and `-0.8%` at c8; RSS moved `+1.6%` at c4 and `+12.1%` at c8. NCCL max device memory stayed flat, with output-token throughput drift `-1.0%` at c4 and `+1.1%` at c8; RSS moved `+1.6%` at c4 and `+3.8%` at c8. The NCCL server used a conservative single-node runtime selection and reached readiness after the NCCL communicator init path completed; do not turn this row into a default-runtime speed claim.
+
+Reviewer evidence summary for issue/PR text:
+
+- Combined artifact basename/SHA: `retained_soak_report.json` / `1c06e8825da70888277f1485f54d7f4fb9b2f61d617149d3ac7357cd5a03e7f1`.
+- Child artifact basenames/SHA: host-staged `soak_summary.json` / `3fe4f163024602a51f10cac0c15cc24a5feffd92bbcb93091e175cd63e49bd33`; NCCL `soak_summary.json` / `52c2a70d895fc0c080233961ea06824097fbf5b7241a0983e41c0ca6646e762f`.
+- Gate result: host-staged and NCCL child gates passed, combined gate passed, commit/model provenance consistent, runtime boundary retained.
+- Claim boundary: short-shape sustained HTTP soak evidence only; no production-readiness, default-runtime NCCL, long/mixed-prompt, or vLLM-parity claim.
+
+### Issue #466 Retained HTTP SLO Evidence
+
+The current retained #466 2x RTX 5090 evidence completed all six host-staged/NCCL children with zero failures/timeouts and full required trace coverage. The gitignored local copy is under `artifacts/bench/dsv2-lite/<run-id>/`; aggregate SHA-256: `a7e677c63d1ce92ad0c069f83acfcc8b381e07d06bed9364ab899adecef8d317`.
 
 ### Issue #466 Follow-Up NCCL Readiness Smoke
 
