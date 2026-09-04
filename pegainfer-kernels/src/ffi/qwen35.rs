@@ -1,13 +1,85 @@
 #[cfg(feature = "qwen35")]
+use std::ffi::c_char;
+#[cfg(feature = "qwen35")]
+use std::ffi::c_void;
+
+#[cfg(feature = "qwen35")]
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
 
 use super::Half;
 
+/// Kernels-private Rust mirror of the stable C ABI. Model crates never import
+/// this struct: the safe `ops::Qwen35GdnAot` wrapper owns validation, workspace,
+/// handle lifetime, and conversion from semantic tensors to device addresses.
+#[cfg(feature = "qwen35")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FlashInferGdnPrefillArgs {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub output: u64,
+    pub alpha: u64,
+    pub beta: u64,
+    pub state: u64,
+    pub initial_state: u64,
+    pub workspace: u64,
+    pub workspace_bytes: u64,
+    pub cu_seqlens: u64,
+    pub tokens: u32,
+    pub stream: CUstream,
+}
+
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
 // Sources: csrc/qwen35/*.cu. The paged HD256 attention entry points are shared
 // with Gemma 4 and are declared in `shared.rs`.
 unsafe extern "C" {
+    #[cfg(feature = "qwen35")]
+    pub fn pegainfer_qwen35_gdn_abi_version() -> u32;
+    #[cfg(feature = "qwen35")]
+    pub fn pegainfer_qwen35_gdn_artifact_sha256() -> *const c_char;
+    #[cfg(feature = "qwen35")]
+    pub fn pegainfer_qwen35_gdn_aot_available() -> i32;
+    #[cfg(feature = "qwen35")]
+    pub fn pegainfer_qwen35_gdn_create(handle: *mut *mut c_void, device: i32) -> i32;
+    #[cfg(feature = "qwen35")]
+    pub fn pegainfer_qwen35_gdn_workspace_bytes(
+        handle: *mut c_void,
+        workspace_bytes: *mut usize,
+    ) -> i32;
+    #[cfg(feature = "qwen35")]
+    pub fn pegainfer_qwen35_gdn_launch(
+        handle: *mut c_void,
+        args: *const FlashInferGdnPrefillArgs,
+    ) -> i32;
+    #[cfg(feature = "qwen35")]
+    pub fn pegainfer_qwen35_gdn_destroy(handle: *mut c_void);
+
+    /// Native, non-expanded FlashInfer-GDN input preparation.
+    ///
+    /// `q_out`, `k_out`, and `v_out` are token-major `[T,H,D]`; alpha/beta are
+    /// FP32 `[T,Hv]`. `non_finite_status` is zeroed asynchronously and set to
+    /// one by the kernel if any consumed input is non-finite.
+    #[cfg(feature = "qwen35")]
+    pub fn gated_delta_rule_prefill_native_prepare_cuda(
+        qkv: *const Half,
+        b_proj: *const Half,
+        a_proj: *const Half,
+        dt_bias: *const Half,
+        a_log: *const f32,
+        q_out: *mut Half,
+        k_out: *mut Half,
+        v_out: *mut Half,
+        alpha_out: *mut f32,
+        beta_out: *mut f32,
+        non_finite_status: *mut u32,
+        tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // Qwen3.5 full-attention prefill prep that writes K/V directly into paged KV.
     pub fn prefill_attention_hd256_prep_paged_cuda(
         q_full_batch: *const Half,

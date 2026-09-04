@@ -231,7 +231,7 @@ The crate still builds CUDA/Triton symbols needed by the current root binary:
 
 - Qwen3.5 HD256 full-attention kernels: `csrc/qwen35/prefill_attention_hd256.cu`, `csrc/shared/paged_attention.cu`.
 - Qwen3.5 linear-attention decode kernels: `csrc/qwen35/conv1d.cu`, `csrc/qwen35/gated_delta_rule.cu`.
-- Qwen3.5 chunk-wise GDR prefill Triton AOT kernels: `tools/triton/gated_delta_rule_chunkwise_kernels.py`.
+- Qwen3.5 chunk-wise GDR prefill uses the Triton AOT kernels in `tools/triton/gated_delta_rule_chunkwise_kernels.py` generally. A validated build-linked candidate selects the FlashInfer/CuTe AOT specialization in `csrc/qwen35/flashinfer_gdn_aot.c` for single-GPU SM120 Qwen3.5-4B (`Hq/Hk/Hv/D=16/16/32/128`); unsupported SM, geometry, and TP configurations retain Triton.
 
 These are preserved for build compatibility. They are not part of the Qwen3-4B Phase 1 API surface.
 
