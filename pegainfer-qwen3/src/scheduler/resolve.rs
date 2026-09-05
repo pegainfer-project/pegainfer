@@ -27,12 +27,16 @@ pub(crate) fn resolve_step(
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
         },
         ExecutionArtifacts::SpeculativeDecode { verify } => StepEffects {
             cached: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_speculative_outputs(executor, active, &verify.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
         },
         ExecutionArtifacts::Unified { pending, result } => {
             let mut effects = resolve_prefill_outputs(executor, pending, result.prefill_requests);
@@ -100,13 +104,24 @@ fn resolve_prefill_outputs(
         // release builds too.
         assert_eq!(req.request_id, result.request_id);
 
-        // Report the prefix-cache hit count on the request's first chunk only
-        // — that is where it is determined. Later chunks must not re-report.
+        // Report the prefix-cache counters on the request's first chunk only —
+        // that is where they are determined. Later chunks must not re-report.
+        //
+        // Both counters are TOKEN-granularity, matching vLLM's `PrefixCacheStats`
+        // (the frontend compares `hits / queries` as hit tokens / queried tokens):
+        //   * `prefix_queries` = the number of prompt tokens this request looked
+        //     up in the cache (the whole prompt is consulted once, on chunk 0).
+        //   * `prefix_hits`    = the number of those tokens already cached
+        //     (`cached_tokens`).
+        // Because `cached_tokens <= prompt_tokens`, `hits <= queries` holds and
+        // the hit rate stays in [0, 1] with no impossible >100% rates.
         if req.prefill_pos == 0 {
             effects.cached.push(CachedTokensEffect {
                 request_id: req.request_id,
                 cached_tokens: result.cached_tokens,
             });
+            effects.prefix_queries += req.prompt_tokens.len() as u64;
+            effects.prefix_hits += result.cached_tokens as u64;
         }
 
         if !result.completed {

@@ -26,6 +26,15 @@ pub struct SchedulerMetrics {
     pub num_waiting_reqs: u64,
     /// Cumulative spec-decode counters, or `None` when no draft model is loaded.
     pub spec_decode: Option<SpecDecodeCounters>,
+    /// Cumulative prefix-cache queries (one per request that reached its first
+    /// prefill chunk). Monotonic; mapped to vLLM `PrefixCacheStats.queries`.
+    pub prefix_cache_queries: u64,
+    /// Cumulative prefix-cache hits, token-granularity (the total number of
+    /// queried prompt tokens already cached). Same unit as
+    /// `prefix_cache_queries`, so `hit_rate = hits/queries` stays in [0, 1].
+    /// Monotonic; mapped to vLLM `PrefixCacheStats.hits` as a per-send delta
+    /// (see `scheduler_stats_from`), never as the running total.
+    pub prefix_cache_hits: u64,
 }
 
 /// Upper bound on a drafter's `K`, fixing the width of

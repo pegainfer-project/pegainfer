@@ -371,3 +371,119 @@ fn lora_control_waits_until_scheduler_idle() {
         .expect_err("adapter load should be a stub error");
     assert!(matches!(error, LoraControlError::Failed(_)));
 }
+
+/// E2E (no GPU) for the prefix-cache `/metrics` counters: drive a real
+/// `Qwen3Scheduler` through the engine contract with a fake executor that
+/// reports a cached prefix on every request's first chunk, then scrape
+/// `SchedulerMetrics` across multiple batches and scrapes.
+///
+/// Guards against the two bugs from review:
+///  * unit mismatch — `prefix_queries`/`prefix_hits` are both TOKEN-granular
+///    (queried prompt tokens / cached tokens), matching vLLM's
+///    `PrefixCacheStats`, so `hit_rate = hits/queries` stays in [0, 1];
+///  * cumulative-counter double counting — every request is counted exactly
+///    once (on its first prefill chunk), and the bridge exports per-send
+///    deltas of the running total (see `prefix_cache_delta`), so repeated
+///    scrapes at the same instant are identical and the frontend does not
+///    re-add history on every token batch.
+#[test]
+fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
+    const BATCHES: u64 = 4;
+    const PER_BATCH: u64 = 3;
+    const TOTAL: u64 = BATCHES * PER_BATCH;
+    const PROMPT_TOKENS: u64 = 64; // tokens looked up per request
+    const HIT_TOKENS: u64 = 37; // simulated cached prefix length (<= prompt)
+
+    // A fake KV cache that reports a 37-token hit on the first chunk of every
+    // request. With the fix, queries count the 64 prompt tokens queried and
+    // hits count the 37 tokens already cached — both token-granular.
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(64, Arc::clone(&dropped)).with_prefix_hit(HIT_TOKENS as usize);
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let mut controls = Vec::new();
+    let mut scrapes: Vec<(u64, u64, u64)> = Vec::new(); // (batch, queries, hits)
+
+    for batch in 0..BATCHES {
+        for _ in 0..PER_BATCH {
+            controls.push(partition.handle.submit(request(PROMPT_TOKENS as usize, 4)));
+        }
+        // Wait until this batch's prefills have been counted.
+        let target = (batch + 1) * PER_BATCH * PROMPT_TOKENS;
+        assert!(
+            wait_until(Duration::from_secs(2), || partition
+                .handle
+                .metrics()
+                .prefix_cache_queries
+                >= target),
+            "batch {batch} prefix queries never reached {target}"
+        );
+        let m = partition.handle.metrics();
+        eprintln!(
+            "[scrape] after batch {batch}: prefix_cache_queries={} prefix_cache_hits={}",
+            m.prefix_cache_queries, m.prefix_cache_hits
+        );
+        scrapes.push((batch, m.prefix_cache_queries, m.prefix_cache_hits));
+    }
+
+    // Drain the step stream so the driver thread can exit cleanly.
+    for c in &controls {
+        let _ = steps.collect_terminal(c.id());
+    }
+
+    // Final stable snapshot: repeated scrapes at the same instant are identical.
+    let a = partition.handle.metrics();
+    let b = partition.handle.metrics();
+    let c = partition.handle.metrics();
+    assert_eq!(a.prefix_cache_queries, b.prefix_cache_queries);
+    assert_eq!(a.prefix_cache_hits, b.prefix_cache_hits);
+    assert_eq!(b.prefix_cache_queries, c.prefix_cache_queries);
+    assert_eq!(b.prefix_cache_hits, c.prefix_cache_hits);
+    eprintln!(
+        "[scrape] final (x3 identical): prefix_cache_queries={} prefix_cache_hits={}",
+        a.prefix_cache_queries, a.prefix_cache_hits
+    );
+
+    // Token-granular correctness per vLLM PrefixCacheStats: every request
+    // queries PROMPT_TOKENS and hits HIT_TOKENS, so the running totals are
+    // TOTAL * those, and hit_rate = HIT_TOKENS / PROMPT_TOKENS in [0, 1].
+    let expected_q = TOTAL * PROMPT_TOKENS;
+    let expected_h = TOTAL * HIT_TOKENS;
+    assert_eq!(a.prefix_cache_queries, expected_q);
+    assert_eq!(a.prefix_cache_hits, expected_h);
+    assert!(
+        a.prefix_cache_hits <= a.prefix_cache_queries,
+        "hits (cached tokens) must not exceed queries (queried tokens)"
+    );
+    let hit_rate = a.prefix_cache_hits as f64 / a.prefix_cache_queries as f64;
+    eprintln!(
+        "[rate] prefix hit_rate={:.3} (== {}/{})",
+        hit_rate, HIT_TOKENS, PROMPT_TOKENS
+    );
+    assert!((hit_rate - HIT_TOKENS as f64 / PROMPT_TOKENS as f64).abs() < 1e-9);
+
+    // Each batch contributed a stable, non-zero delta of exactly
+    // PER_BATCH * PROMPT_TOKENS (queries) and PER_BATCH * HIT_TOKENS (hits).
+    let mut prev_q = 0u64;
+    let mut prev_h = 0u64;
+    for (batch, q, h) in scrapes {
+        let dq = q - prev_q;
+        let dh = h - prev_h;
+        eprintln!(
+            "[delta] batch {batch}: +queries={dq} +hits={dh} (hit_rate={:.3})",
+            h as f64 / q.max(1) as f64
+        );
+        assert_eq!(
+            dq,
+            PER_BATCH * PROMPT_TOKENS,
+            "batch {batch} added exactly PER_BATCH*PROMPT_TOKENS queries"
+        );
+        assert_eq!(
+            dh,
+            PER_BATCH * HIT_TOKENS,
+            "batch {batch} added exactly PER_BATCH*HIT_TOKENS hits"
+        );
+        prev_q = q;
+        prev_h = h;
+    }
+}

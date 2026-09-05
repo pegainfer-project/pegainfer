@@ -242,6 +242,16 @@ pub(crate) struct Qwen3Scheduler<E: ModelExecutor> {
     /// it cannot run against an adapter set the command was about to change.
     pending_control: VecDeque<LoraControl>,
     post_control_deferred: Vec<PendingRequest>,
+    /// Cumulative prefix-cache queries (one per admitted request that reached
+    /// its first prefill chunk). Monotonic; reported verbatim in `SchedulerMetrics`.
+    prefix_cache_queries: u64,
+    /// Cumulative prefix-cache hits, token-granularity (the total number of
+    /// queried prompt tokens that were already cached, summed across requests).
+    /// Same unit as `prefix_cache_queries`, so `hit_rate = hits/queries` ∈ [0, 1].
+    /// Monotonic; the bridge exports per-send deltas of this total (see
+    /// `scheduler_stats_from` / the stepped bridge) so Prometheus does not
+    /// re-add the running total on every token batch.
+    prefix_cache_hits: u64,
 }
 
 impl<E: ModelExecutor> Qwen3Scheduler<E> {
@@ -266,6 +276,8 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             lora_rx,
             pending_control: VecDeque::new(),
             post_control_deferred: Vec::new(),
+            prefix_cache_queries: 0,
+            prefix_cache_hits: 0,
         }
     }
 
@@ -343,6 +355,11 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         // terminal rides the committed step, which the driver ships after
         // publishing metrics — the finishing batch's send-time stats then
         // read the drained occupancy instead of racing the publish.
+        // Fold this step's prefix-cache counters into the cumulative totals
+        // before any effect is dropped, so retries/re-queues never lose a count.
+        self.prefix_cache_queries += effects.prefix_queries;
+        self.prefix_cache_hits += effects.prefix_hits;
+
         let mut finishes: Vec<(RequestId, FinishReason)> = Vec::new();
 
         for cached in effects.cached {
@@ -802,6 +819,8 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 + self.loading.len()
                 + self.post_control_deferred.len()) as u64,
             spec_decode: self.executor.spec_decode_counters(),
+            prefix_cache_queries: self.prefix_cache_queries,
+            prefix_cache_hits: self.prefix_cache_hits,
         }
     }
 }

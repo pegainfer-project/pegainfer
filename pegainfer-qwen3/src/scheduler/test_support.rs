@@ -39,6 +39,10 @@ pub(crate) struct FakeExecutor {
     pub(crate) dropped: Arc<Mutex<Vec<u64>>>,
     pub(crate) prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
+    // When > 0, the first prefill chunk of every request reports this many
+    // `cached_tokens` (a simulated prefix-cache hit). Drives the prefix-cache
+    // query/hit counters without a real GPU KV cache.
+    prefix_hit_tokens: usize,
 }
 
 impl FakeExecutor {
@@ -56,7 +60,15 @@ impl FakeExecutor {
             dropped,
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
+            prefix_hit_tokens: 0,
         }
+    }
+
+    /// Simulate a prefix-cache hit on every request's first prefill chunk by
+    /// reporting `tokens` cached tokens.
+    pub(crate) fn with_prefix_hit(mut self, tokens: usize) -> Self {
+        self.prefix_hit_tokens = tokens;
+        self
     }
 
     pub(crate) fn with_stop_token(mut self, token: u32) -> Self {
@@ -101,7 +113,13 @@ impl FakeExecutor {
             first_token: 100 + req.request_id.raw() as u32,
             first_token_logprob: None,
             prompt_logprobs: None,
-            cached_tokens: 0,
+            // A simulated prefix-cache hit is reported only on the request's
+            // first chunk (start == 0); later chunks carry no cached prefix.
+            cached_tokens: if start == 0 {
+                self.prefix_hit_tokens
+            } else {
+                0
+            },
             completed,
             prefill_pos,
         }
