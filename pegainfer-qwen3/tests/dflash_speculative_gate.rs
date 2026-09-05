@@ -583,7 +583,7 @@ fn dflash2_native_selector_greedy_gate() {
     let engine = EngineHarness::new(
         pegainfer_qwen3::launch(
             Path::new(&model_path),
-            launch_options(Some(dflash2_view.path.clone())),
+            launch_options(Some(dflash2_view.path)),
         )
         .expect("failed to load native DFlash2 selector checkpoint"),
     );

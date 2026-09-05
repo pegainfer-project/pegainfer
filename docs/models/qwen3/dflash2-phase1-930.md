@@ -150,12 +150,30 @@ CUDA top-k/path-walk path and matched the plain Qwen3 greedy continuation.
 | Linux `cargo test --release -p pegainfer-build --lib` | 7 passed, 0 failed |
 | Linux Qwen3 unit-test link | Blocked by existing `cudaLaunchKernelExC` linker mismatch |
 
+### Step 8: Fix the Qwen3 CUDA Clippy gate
+
+- Reproduced the failing CI command on Linux at commit `7d04ca5a`.
+- Clippy reported one `redundant_clone` in
+  `pegainfer-qwen3/tests/dflash_speculative_gate.rs:586`; the native gate
+  consumed `dflash2_view.path`, so cloning it was unnecessary.
+- Removed only that clone. The same CI package set now passes with
+  `--all-targets -- -D warnings`.
+- Local Windows Clippy could not reach project diagnostics because its
+  environment lacks OpenSSL and builds `esaxx-rs` with exceptions disabled;
+  this is an environment limitation, not a source failure.
+
+| CI follow-up verification | Result |
+| --- | --- |
+| Linux Qwen3 CUDA Clippy package set, `sm_80` | Passed |
+| `cargo fmt --all -- --check` | Passed |
+| `git diff --check` | Passed |
+
 ## Debrief
 
 - **Outcome:** Phase 1 selector wiring, anchor-drop mapping, native tied/untied
-  head loading, an executable selector gate, and the merge with current
-  upstream main are complete in the feature branch. The merge result is staged
-  but not committed or pushed.
+  head loading, an executable selector gate, the merge with current upstream
+  main, and the Qwen3 CUDA Clippy cleanup are complete in the feature branch.
+  The source fix is unstaged and not committed or pushed.
 - **Pitfalls encountered:** The first verification command omitted system
   directories from `PATH`, so `pegainfer-kernels/build.rs` could not spawn
   `git`. Re-running with `/usr/bin:/bin` succeeded. The row mapping bug was a
