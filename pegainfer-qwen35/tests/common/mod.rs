@@ -14,6 +14,29 @@ pub(crate) mod model_fixture;
 pub(crate) use model_fixture::model_path_or_skip;
 
 #[allow(dead_code)]
+pub(crate) fn launch_options(
+    max_batch: usize,
+    max_prefill_tokens: usize,
+) -> pegainfer_qwen35::Qwen35LaunchOptions {
+    use clap::ValueEnum;
+    use pegainfer_qwen35::Qwen35GdnBackend;
+
+    let backend = match std::env::var("PEGAINFER_TEST_QWEN35_GDN_BACKEND") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "triton".to_string(),
+        Err(error) => panic!("invalid PEGAINFER_TEST_QWEN35_GDN_BACKEND: {error}"),
+    };
+    pegainfer_qwen35::Qwen35LaunchOptions {
+        cuda_graph: true,
+        max_batch,
+        max_prefill_tokens,
+        gdn_backend: Qwen35GdnBackend::from_str(&backend, false)
+            .expect("PEGAINFER_TEST_QWEN35_GDN_BACKEND must be a production backend name"),
+        ..Default::default()
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) fn load_tokenizer(model_path: &str) -> DynTokenizer {
     try_load_tokenizer(model_path)
         .unwrap_or_else(|err| panic!("Failed to load tokenizer for {model_path}: {err}"))

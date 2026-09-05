@@ -25,7 +25,6 @@ use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
 use super::flashinfer_gdn::FlashInferGdnChunkResources;
-use super::flashinfer_gdn::GdnPrefillBackend;
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
 use super::weights::FullAttentionLayer;
@@ -84,13 +83,11 @@ impl Qwen35Model {
         // per-pass GDR scratch (which grows with the pass length) at the budget
         // reserved at startup, so prompts longer than one chunk prefill without OOM.
         let mut hidden_batch: Option<HiddenStates> = None;
-        let gdn_backend = self.resolved_gdn_backend();
         for chunk in token_ids.chunks(PREFILL_CHUNK_LEN) {
             // Free the previous chunk's hidden states before allocating the next
             // chunk's scratch so peak memory stays within one chunk's reservation.
             drop(hidden_batch.take());
-            hidden_batch =
-                Some(self.prefill_chunk_forward(chunk, kv_state, recurrent, gdn_backend)?);
+            hidden_batch = Some(self.prefill_chunk_forward(chunk, kv_state, recurrent)?);
         }
         // `seq_len > 0` guarantees at least one chunk produced hidden states.
         let hidden_batch = hidden_batch.expect("prefill produced no chunk despite seq_len > 0");
@@ -149,7 +146,6 @@ impl Qwen35Model {
         token_ids: &[u32],
         kv_state: &mut KvState,
         recurrent: &mut RecurrentState,
-        gdn_backend: GdnPrefillBackend,
     ) -> Result<HiddenStates> {
         let seq_len = token_ids.len();
         anyhow::ensure!(
@@ -180,19 +176,13 @@ impl Qwen35Model {
         // Allocate the chunk scratch before advancing the KV state. It is the
         // largest, most allocation-prone buffer here, so failing first leaves
         // `kv_state` untouched and the request can be rejected cleanly.
-        let mut gdn_scratch = match gdn_backend {
-            GdnPrefillBackend::Triton => GdnPrefillChunkScratch::Triton(Box::new(
-                GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?,
+        let mut gdn_scratch = match &self.flashinfer_gdn {
+            None => GdnPrefillChunkScratch::Triton(Box::new(GdrChunkwiseScratch35::new(
+                &self.ctx, c, seq_len,
+            )?)),
+            Some(backend) => GdnPrefillChunkScratch::FlashInfer(Box::new(
+                FlashInferGdnChunkResources::new(&self.ctx, backend, seq_len)?,
             )),
-            GdnPrefillBackend::FlashInfer => {
-                let backend = self.flashinfer_gdn()?;
-                GdnPrefillChunkScratch::FlashInfer(Box::new(FlashInferGdnChunkResources::new(
-                    &self.ctx,
-                    &self.config,
-                    backend,
-                    seq_len,
-                )?))
-            }
         };
 
         // Advance paged KV state and build this chunk's prefill plan.
@@ -226,10 +216,6 @@ impl Qwen35Model {
                 &prefill_plan,
                 recurrent,
             )?;
-        }
-
-        if let GdnPrefillChunkScratch::FlashInfer(resources) = &gdn_scratch {
-            resources.ensure_prepare_inputs_finite(&self.ctx)?;
         }
 
         // Advance recurrent token count for the next chunk / decode step; the
@@ -538,8 +524,6 @@ impl Qwen35Model {
                     self.flashinfer_gdn()?,
                     &mut layer_state.state,
                 )?;
-                #[cfg(feature = "gdn-validation")]
-                self.gdn_validation_evidence.record_successful_launch();
                 ops::rms_norm_gated_batch_into(
                     &self.ctx,
                     &resources.output,

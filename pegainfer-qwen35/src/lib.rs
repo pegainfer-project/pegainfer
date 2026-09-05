@@ -13,8 +13,6 @@ mod decode_buffers;
 mod executor;
 mod ffi;
 mod flashinfer_gdn;
-#[cfg(feature = "gdn-validation")]
-mod gdn_validation;
 mod logprobs;
 pub mod model_line;
 mod ops;
@@ -68,13 +66,7 @@ pub mod runtime {
     pub use crate::executor::PrefillStepItem;
     pub use crate::executor::Qwen35Executor;
     pub use crate::executor::RequestId;
-    #[cfg(feature = "gdn-validation")]
-    pub use crate::gdn_validation::GdnPrefillRuntimeEvidence;
-    #[cfg(feature = "gdn-validation")]
-    pub use crate::gdn_validation::GdnPrefillRuntimeEvidenceHandle;
     pub use crate::scheduler::start_with_capacity;
-    #[cfg(feature = "gdn-validation")]
-    pub use crate::start_engine_with_flashinfer_gdn_for_accuracy;
     pub use crate::tp_executor::DropExpectation;
     pub use crate::tp_executor::Qwen35TpExecutor;
     pub use crate::weights::Qwen35Model;
@@ -107,6 +99,26 @@ pub enum Qwen35DecodeOverlap {
     SharedSm,
 }
 
+/// GDN prefill implementation requested when loading Qwen3.5.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub enum Qwen35GdnBackend {
+    /// Use the existing Triton implementation, irrespective of linked candidates.
+    #[default]
+    Triton,
+    /// Use the build-linked SM120/Hv32/TP1 candidate; unsupported loads fail.
+    #[value(name = "flashinfer-candidate")]
+    FlashInferCandidate,
+}
+
+impl std::fmt::Display for Qwen35GdnBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Triton => "triton",
+            Self::FlashInferCandidate => "flashinfer-candidate",
+        })
+    }
+}
+
 pub fn start_engine(
     model_path: &Path,
     options: EngineLoadOptions,
@@ -122,41 +134,30 @@ pub fn start_engine(
     )
 }
 
-/// Start the normal single-GPU production scheduler and expose build-linked
-/// FlashInfer launch evidence to end-to-end accuracy tests.
-#[cfg(feature = "gdn-validation")]
-pub fn start_engine_with_flashinfer_gdn_for_accuracy(
-    model_path: &Path,
-    device_ordinal: usize,
-    max_batch: usize,
-    max_prefill_tokens: usize,
-) -> Result<(
-    EngineHandle,
-    gdn_validation::GdnPrefillRuntimeEvidenceHandle,
-)> {
-    anyhow::ensure!(
-        (1..=MAX_DECODE_BATCH).contains(&max_batch),
-        "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
-    );
-    let model_path = model_path
-        .to_str()
-        .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
-    let evidence = model.flashinfer_gdn_runtime_evidence_handle()?;
-    let handle = scheduler::start_with_capacity(model, 42, max_batch, max_prefill_tokens)?;
-    Ok((handle, evidence))
-}
-
 #[derive(Clone, Debug)]
 pub struct Qwen35LaunchOptions {
     /// CUDA device for single-GPU loads (ignored when `tp_size > 1`).
-    device_ordinal: usize,
+    pub device_ordinal: usize,
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
-    tp_size: usize,
+    pub tp_size: usize,
     /// TP Phase 1 supports eager-only multi-GPU execution.
-    cuda_graph: bool,
-    max_batch: usize,
-    max_prefill_tokens: usize,
+    pub cuda_graph: bool,
+    pub max_batch: usize,
+    pub max_prefill_tokens: usize,
+    pub gdn_backend: Qwen35GdnBackend,
+}
+
+impl Default for Qwen35LaunchOptions {
+    fn default() -> Self {
+        Self {
+            device_ordinal: 0,
+            tp_size: 1,
+            cuda_graph: true,
+            max_batch: MAX_DECODE_BATCH,
+            max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
+            gdn_backend: Qwen35GdnBackend::Triton,
+        }
+    }
 }
 
 impl Qwen35LaunchOptions {
@@ -178,7 +179,7 @@ pub fn launch_with_options_policy_and_overlap(
     decode_overlap: Qwen35DecodeOverlap,
 ) -> Result<EngineHandle> {
     let device_ordinals = options.device_ordinals()?;
-    start_engine_with_capacity_policy_and_overlap(
+    start_engine_with_backend(
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: options.cuda_graph,
@@ -191,6 +192,7 @@ pub fn launch_with_options_policy_and_overlap(
         options.max_prefill_tokens,
         scheduler_policy,
         decode_overlap,
+        options.gdn_backend,
     )
 }
 
@@ -234,6 +236,26 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
 ) -> Result<EngineHandle> {
+    start_engine_with_backend(
+        model_path,
+        options,
+        max_batch,
+        max_prefill_tokens,
+        scheduler_policy,
+        decode_overlap,
+        Qwen35GdnBackend::Triton,
+    )
+}
+
+fn start_engine_with_backend(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    scheduler_policy: Qwen35SchedulerPolicy,
+    decode_overlap: Qwen35DecodeOverlap,
+    gdn_backend: Qwen35GdnBackend,
+) -> Result<EngineHandle> {
     anyhow::ensure!(
         (1..=MAX_DECODE_BATCH).contains(&max_batch),
         "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
@@ -256,6 +278,10 @@ pub fn start_engine_with_capacity_policy_and_overlap(
         );
     }
     if device_ordinals.len() > 1 {
+        anyhow::ensure!(
+            gdn_backend == Qwen35GdnBackend::Triton,
+            "Qwen3.5 flashinfer-candidate requires TP world_size=1"
+        );
         anyhow::ensure!(
             decode_overlap == Qwen35DecodeOverlap::Off,
             "Qwen3.5 decode overlap is supported on a single GPU only"
@@ -299,7 +325,16 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+    let model = weights::Qwen35Model::from_safetensors_with_options(
+        model_path,
+        &Qwen35LaunchOptions {
+            device_ordinal,
+            max_batch,
+            max_prefill_tokens,
+            gdn_backend,
+            ..Default::default()
+        },
+    )?;
     scheduler::start_with_capacity_and_policy(
         model,
         seed,
@@ -332,6 +367,7 @@ mod tests {
             cuda_graph: false,
             max_batch: 1,
             max_prefill_tokens: 1,
+            gdn_backend: super::Qwen35GdnBackend::Triton,
         };
 
         let err = options.device_ordinals().unwrap_err().to_string();

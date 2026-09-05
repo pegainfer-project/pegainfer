@@ -170,11 +170,11 @@ fn submit_repeated_token_request(
     token_rx
 }
 
-fn wait_for_first_token(rx: &mut TokenStreamReceiver, request_id: &str) {
+fn wait_for_first_token(rx: &mut TokenStreamReceiver, request_id: &str) -> u32 {
     let deadline = Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match recv_event_before(rx, request_id, deadline) {
-            Some(TokenEvent::Token { .. }) => return,
+            Some(TokenEvent::Token { id, .. }) => return id,
             Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
             Some(event) => panic!("{request_id} emitted {event:?} before its first token"),
             None => panic!("scheduler closed before {request_id} emitted a token"),
@@ -208,11 +208,11 @@ fn assert_no_generated_event(rx: &mut TokenStreamReceiver, request_id: &str) {
     }
 }
 
-fn drain_tokens(rx: &mut TokenStreamReceiver, request_id: &str) -> usize {
-    let mut tokens = 0;
+fn drain_tokens(rx: &mut TokenStreamReceiver, request_id: &str) -> Vec<u32> {
+    let mut tokens = Vec::new();
     while let Ok((_, event)) = rx.try_recv() {
         match event {
-            TokenEvent::Token { .. } => tokens += 1,
+            TokenEvent::Token { id, .. } => tokens.push(id),
             TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. } => {}
             event => panic!("{request_id} emitted {event:?} while it must remain active"),
         }
@@ -580,9 +580,8 @@ fn run_full_scheduler_e2e(
         }
     }
 
-    // ── 4a. Mixed concurrent logprobs requests
-    info!("=== Phase 4a: Mixed concurrent logprobs ===");
-
+    // ── 4b. Mixed concurrent logprobs requests ─────────────────────────
+    info!("=== Phase 4b: Mixed concurrent logprobs ===");
     {
         let mixed = [
             ("mixed_no_logprobs", CASES[0].prompt, 0usize),
@@ -665,50 +664,6 @@ fn run_full_scheduler_e2e(
     info!("All Qwen3.5 scheduler tests passed for {label}!");
 }
 
-fn run_graph_lifecycle_boundary(handle: &EngineHandle, tokenizer: &DynTokenizer) {
-    let run_batch = |cases: &[(&str, &str, usize)]| {
-        let mut receivers = Vec::with_capacity(cases.len());
-        for &(name, prompt, max_tokens) in cases {
-            let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
-            let (token_tx, token_rx) = TokenSink::standalone();
-            handle
-                .submit(GenerateRequest {
-                    trace_parent: None,
-                    request_id: Some(name.to_string()),
-                    queued_at_unix_s: None,
-                    data_parallel_rank: None,
-                    prompt_tokens,
-                    params: SamplingParams {
-                        ignore_eos: true,
-                        ..SamplingParams::default()
-                    },
-                    max_tokens,
-                    lora_adapter: None,
-                    kv_transfer_params: None,
-                    token_tx,
-                    logprobs: 0,
-                    echo: false,
-                })
-                .expect("submit graph-lifecycle request");
-            receivers.push((name, max_tokens, token_rx));
-        }
-        for (name, max_tokens, mut receiver) in receivers {
-            let result = collect_generation(&mut receiver, name, 0);
-            assert_eq!(result.finish_reason, FinishReason::Length);
-            assert_eq!(result.tokens.len(), max_tokens);
-        }
-    };
-
-    // The first row retires while two longer rows remain, forcing compaction.
-    // Multiple decode steps also force replay after the first capture.
-    run_batch(&[
-        ("compact-short", "A short request", 8),
-        ("compact-long-a", "A longer request about CUDA graphs", 24),
-        ("compact-long-b", "Another longer request about state", 24),
-    ]);
-    // A second wave must copy into a previously occupied stable slot.
-    run_batch(&[("reuse-slot", "Reuse the graph slot", 3)]);
-}
 #[test]
 fn test_e2e_qwen35_scheduler() {
     let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler") else {
@@ -717,104 +672,25 @@ fn test_e2e_qwen35_scheduler() {
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
-    let model =
-        pegainfer_qwen35::runtime::Qwen35Model::from_safetensors_with_options(&model_path, true)
-            .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
-    // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
-    let handle = pegainfer_qwen35::runtime::start_with_capacity(
-        model,
-        42,
-        8,
-        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+    let options = common::launch_options(8, pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS);
+    let overlap = if options.gdn_backend == pegainfer_qwen35::Qwen35GdnBackend::FlashInferCandidate
+    {
+        pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm
+    } else {
+        pegainfer_qwen35::Qwen35DecodeOverlap::Off
+    };
+    let handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
+        Path::new(&model_path),
+        options,
+        pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+        overlap,
     )
     .expect("Failed to start Qwen3.5 scheduler");
     info!("scheduler loaded in {:.2?}", start.elapsed());
 
     let max_context_tokens = max_position_embeddings(&model_path);
     run_full_scheduler_e2e(&handle, &tokenizer, max_context_tokens, "TP1");
-}
-
-#[cfg(feature = "gdn-validation")]
-#[test]
-#[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and the validated Hv32 FlashInfer artifact"]
-fn test_e2e_qwen35_scheduler_flashinfer_gdn() {
-    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
-        "required FlashInfer scheduler gate needs PEGAINFER_TEST_MODEL_PATH set to the pinned Qwen3.5-4B snapshot",
-    );
-    assert!(
-        Path::new(&model_path).join("config.json").is_file(),
-        "required FlashInfer scheduler gate cannot read {model_path}/config.json; set PEGAINFER_TEST_MODEL_PATH"
-    );
-    info!("Loading Qwen3.5 model for FlashInfer scheduler test...");
-    let start = Instant::now();
-    let tokenizer = common::load_tokenizer(&model_path);
-    let (handle, evidence) =
-        pegainfer_qwen35::runtime::start_engine_with_flashinfer_gdn_for_accuracy(
-            Path::new(&model_path),
-            0,
-            8,
-            pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
-        )
-        .expect("Failed to start FlashInfer Qwen3.5 scheduler");
-    let initial = evidence.snapshot();
-    assert_eq!(initial.selected_backend, "flashinfer");
-    assert_ne!(initial.artifact_sha256, "unavailable");
-    assert_eq!(initial.artifact_sha256.len(), 64);
-    assert_eq!(initial.successful_launches, 0);
-    assert_eq!(initial.graph_captures, 0);
-    assert_eq!(initial.graph_replays, 0);
-    assert_eq!(initial.graph_eager_fallbacks, 0);
-    assert_eq!(initial.state_slot_copies, 0);
-    assert_eq!(initial.state_slot_reuses, 0);
-    assert_eq!(initial.slot_compactions, 0);
-    info!(
-        "FlashInfer identity: object_sha256={}",
-        initial.artifact_sha256
-    );
-    info!("FlashInfer scheduler loaded in {:.2?}", start.elapsed());
-
-    run_graph_lifecycle_boundary(&handle, &tokenizer);
-    let final_evidence = evidence.snapshot();
-    assert_eq!(final_evidence.selected_backend, "flashinfer");
-    assert_eq!(final_evidence.artifact_sha256, initial.artifact_sha256);
-    assert!(
-        final_evidence.successful_launches > 0,
-        "scheduler e2e completed without a successful FlashInfer GDN launch"
-    );
-    assert!(
-        final_evidence.graph_captures >= 1,
-        "scheduler E2E did not capture any CUDA decode graph"
-    );
-    assert!(
-        final_evidence.graph_replays >= 1,
-        "scheduler E2E did not replay a captured CUDA decode graph"
-    );
-    assert_eq!(
-        final_evidence.graph_eager_fallbacks, 0,
-        "scheduler E2E silently used the eager decode fallback"
-    );
-    assert!(
-        final_evidence.state_slot_copies >= 1,
-        "scheduler E2E did not copy prefill recurrent state into a graph slot"
-    );
-    assert!(
-        final_evidence.state_slot_reuses >= 1,
-        "scheduler E2E did not reuse a stable graph slot"
-    );
-    assert!(
-        final_evidence.slot_compactions >= 1,
-        "scheduler E2E did not exercise graph-slot compaction"
-    );
-    info!(
-        "FlashInfer scheduler evidence: launches={} graph_captures={} graph_replays={} state_slot_copies={} state_slot_reuses={} slot_compactions={}",
-        final_evidence.successful_launches,
-        final_evidence.graph_captures,
-        final_evidence.graph_replays,
-        final_evidence.state_slot_copies,
-        final_evidence.state_slot_reuses,
-        final_evidence.slot_compactions,
-    );
 }
 
 #[test]
@@ -832,17 +708,10 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         .next()
         .expect("test prompt must contain a token");
 
-    let off_reference_tokens = {
-        let off_handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
+    let (off_reference_tokens, off_decoder_tokens) = {
+        let off_handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
             Path::new(&model_path),
-            EngineLoadOptions {
-                enable_cuda_graph: true,
-                device_ordinals: vec![0],
-                seed: 42,
-                ..EngineLoadOptions::default()
-            },
-            4,
-            8192,
+            common::launch_options(4, 8192),
             pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
             pegainfer_qwen35::Qwen35DecodeOverlap::Off,
         )
@@ -865,19 +734,26 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
             2,
             "default-Off reference request must finish before Shared-SM parity"
         );
-        off.tokens
+        let mut decoder_rx = submit_repeated_token_request(
+            &off_handle,
+            "overlap-off-decoder-reference",
+            seed_token,
+            512,
+            128,
+        );
+        let decoder = collect_generation_with_timeout(
+            &mut decoder_rx,
+            "overlap-off-decoder-reference",
+            0,
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(decoder.tokens.len(), 128);
+        (off.tokens, decoder.tokens)
     };
 
-    let handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
+    let handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
         Path::new(&model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        4,
-        8192,
+        common::launch_options(4, 8192),
         pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
         pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
     )
@@ -888,17 +764,22 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
 
     let mut active_rx =
         submit_repeated_token_request(&handle, "overlap-last-decoder", seed_token, 512, 128);
-    wait_for_first_token(&mut active_rx, "overlap-last-decoder");
-    let _ = drain_tokens(&mut active_rx, "overlap-last-decoder");
+    let mut active_tokens = vec![wait_for_first_token(&mut active_rx, "overlap-last-decoder")];
+    active_tokens.extend(drain_tokens(&mut active_rx, "overlap-last-decoder"));
     let mut prefill_rx =
         submit_repeated_token_request(&handle, "overlap-inflight-prefill", seed_token, 8192, 2);
 
     wait_for_running_requests(&mut load, 2, std::time::Duration::from_secs(10));
-    let _ = drain_tokens(&mut active_rx, "overlap-last-decoder");
+    active_tokens.extend(drain_tokens(&mut active_rx, "overlap-last-decoder"));
     for _ in 0..2 {
-        wait_for_first_token(&mut active_rx, "overlap-last-decoder");
+        active_tokens.push(wait_for_first_token(&mut active_rx, "overlap-last-decoder"));
         assert_no_generated_event(&mut prefill_rx, "overlap-inflight-prefill");
     }
+    assert_eq!(
+        active_tokens,
+        off_decoder_tokens[..active_tokens.len()],
+        "Shared-SM active decoder must match the greedy default-Off reference"
+    );
     drop(active_rx);
     let prefill = collect_generation_with_timeout(
         &mut prefill_rx,

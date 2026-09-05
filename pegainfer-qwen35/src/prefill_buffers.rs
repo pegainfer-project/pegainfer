@@ -24,23 +24,10 @@ pub(crate) struct GdnPrepareScratch35 {
     pub(crate) alpha: CudaSlice<f32>,
     /// Per-token beta, fp32 `[T,Hv]`.
     pub(crate) beta: CudaSlice<f32>,
-    /// Async validation result: zero means all consumed inputs were finite.
-    pub(crate) non_finite_status: CudaSlice<u32>,
 }
 
 impl GdnPrepareScratch35 {
-    pub(crate) fn new(ctx: &DeviceContext, config: &Config35, seq_len: usize) -> Result<Self> {
-        anyhow::ensure!(
-            config.linear_num_key_heads == 16
-                && config.linear_num_value_heads == 32
-                && config.linear_key_head_dim == 128
-                && config.linear_value_head_dim == 128,
-            "native GDN prepare requires Hq/Hk/Hv/D=16/16/32/128"
-        );
-        Self::for_tokens(ctx, seq_len)
-    }
-
-    pub(crate) fn for_tokens(ctx: &DeviceContext, seq_len: usize) -> Result<Self> {
+    pub(crate) fn new(ctx: &DeviceContext, seq_len: usize) -> Result<Self> {
         anyhow::ensure!(seq_len > 0, "native GDN prepare requires T>=1");
 
         const H_Q: usize = 16;
@@ -60,10 +47,6 @@ impl GdnPrepareScratch35 {
                 .stream
                 .alloc_zeros(seq_len * H_V)
                 .map_err(|e| anyhow::anyhow!("Alloc native GDN beta failed: {e}"))?,
-            non_finite_status: ctx
-                .stream
-                .alloc_zeros(1)
-                .map_err(|e| anyhow::anyhow!("Alloc native GDN status failed: {e}"))?,
         })
     }
 }
@@ -171,30 +154,6 @@ impl GdrChunkwiseScratch35 {
         seq_len.div_ceil(Self::CHUNK_SIZE)
     }
 
-    /// Device bytes owned by the Triton GDN operator for one prefill chunk.
-    ///
-    /// This intentionally excludes model-wide hidden/MLP/full-attention
-    /// temporaries and the recurrent state, which are common to both GDN
-    /// backends. The allocation list mirrors [`Self::from_dims`].
-    fn operator_scratch_bytes_from_dims(
-        num_value_heads: usize,
-        key_dim: usize,
-        value_dim: usize,
-        seq_len: usize,
-    ) -> usize {
-        let kv_hidden_dim = num_value_heads * key_dim;
-        let vv_hidden_dim = num_value_heads * value_dim;
-        let num_chunks = seq_len.div_ceil(Self::CHUNK_SIZE);
-
-        let f32_elems = seq_len * num_value_heads * 2
-            + seq_len * num_value_heads * Self::CHUNK_SIZE
-            + num_chunks * num_value_heads * value_dim * key_dim;
-        let bf16_elems = seq_len * num_value_heads * Self::CHUNK_SIZE
-            + kv_hidden_dim * seq_len * 3
-            + vv_hidden_dim * seq_len * 3;
-        f32_elems * size_of::<f32>() + bf16_elems * size_of::<bf16>()
-    }
-
     /// Estimate peak GPU memory (bytes) for prefill scratch at a given seq_len.
     ///
     /// Accounts for:
@@ -208,11 +167,28 @@ impl GdrChunkwiseScratch35 {
         let num_vh = config.linear_num_value_heads;
         let key_dim = config.linear_key_head_dim;
         let val_dim = config.linear_value_head_dim;
+        let chunk_sz = Self::CHUNK_SIZE;
+        let num_chunks = max_seq_len.div_ceil(chunk_sz);
         let seq = max_seq_len;
 
+        let kv_hidden = num_vh * key_dim;
+        let vv_hidden = num_vh * val_dim;
+
         // 1. GDR scratch (bf16 = 2 bytes, f32 = 4 bytes)
-        let gdr_bytes =
-            Self::operator_scratch_bytes_from_dims(num_vh, key_dim, val_dim, max_seq_len);
+        let gdr_bytes = {
+            let f32_elems = seq * num_vh                            // g_cumsum
+                + seq * num_vh                                      // beta
+                + seq * num_vh * chunk_sz                           // a_tril
+                + num_chunks * num_vh * val_dim * key_dim; // chunk_state
+            let bf16_elems = seq * num_vh * chunk_sz                // a_inv
+                + kv_hidden * seq                                   // q_expanded
+                + kv_hidden * seq                                   // k_expanded
+                + vv_hidden * seq                                   // v_raw
+                + kv_hidden * seq                                   // w
+                + vv_hidden * seq                                   // u
+                + vv_hidden * seq; // v_new
+            f32_elems * 4 + bf16_elems * 2
+        };
 
         // 2. Per-layer transient peak (all bf16 = 2 bytes).
         //    Attention and MLP temps don't coexist — MLP runs after attention.

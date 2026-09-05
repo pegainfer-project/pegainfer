@@ -1,5 +1,6 @@
 #include "flashinfer_gdn_aot.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -42,7 +43,26 @@ static int32_t load_current_device(
     } load_args = {&library, &device, &ret};
     _mlir_pegainfer_qwen35_gdn_qwen35_4b_candidate_cuda_load_to_device(
         (void **)&load_args);
-    return (int32_t)ret;
+    if (ret != cudaSuccess) return (int32_t)ret;
+
+    // A library or context-specific function handle may still be lazy. Force
+    // code residency before the model measures free memory for its KV budget.
+    CUlibrary driver_library = (CUlibrary)module->module;
+    unsigned int kernel_count = 0;
+    CUresult result = cuLibraryGetKernelCount(&kernel_count, driver_library);
+    if (result != CUDA_SUCCESS) return (int32_t)result;
+    if (kernel_count == 0) return (int32_t)CUDA_ERROR_INVALID_IMAGE;
+    CUkernel *kernels = (CUkernel *)calloc(kernel_count, sizeof(*kernels));
+    if (kernels == NULL) return (int32_t)CUDA_ERROR_OUT_OF_MEMORY;
+    result = cuLibraryEnumerateKernels(kernels, kernel_count, driver_library);
+    for (unsigned int index = 0; result == CUDA_SUCCESS && index < kernel_count;
+         ++index) {
+        CUfunction function = NULL;
+        result = cuKernelGetFunction(&function, kernels[index]);
+        if (result == CUDA_SUCCESS) result = cuFuncLoad(function);
+    }
+    free(kernels);
+    return (int32_t)result;
 }
 #endif
 
@@ -87,6 +107,7 @@ int32_t pegainfer_qwen35_gdn_create(void **handle, int32_t device) {
         (size_t)sm_count * PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM;
     int32_t rc = load_current_device(&owner->module, device);
     if (rc != (int32_t)cudaSuccess) {
+        if (owner->module.module != NULL) cudaLibraryUnload(owner->module.module);
         free(owner);
         return PEGAINFER_QWEN35_GDN_CUDA_ERROR;
     }
@@ -120,7 +141,7 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
         args->workspace_bytes > (size_t)INT32_MAX ||
         args->q == NULL || args->k == NULL || args->v == NULL ||
         args->output == NULL || args->alpha == NULL || args->beta == NULL ||
-        args->state == NULL || args->initial_state == NULL ||
+        args->state == NULL ||
         args->workspace == NULL || args->cu_seqlens == NULL ||
         args->stream == NULL) {
         return PEGAINFER_QWEN35_GDN_INVALID_ARGUMENT;
@@ -130,7 +151,8 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
     gdn_handle_t *owner = (gdn_handle_t *)handle;
     cudaError_t cuda_rc = cudaSetDevice(owner->device);
     if (cuda_rc != cudaSuccess) return status_from_cuda(cuda_rc);
-    if (args->workspace_bytes < owner->workspace_bytes)
+    if (args->workspace_bytes < owner->workspace_bytes ||
+        (uintptr_t)args->workspace % 128 != 0)
         return PEGAINFER_QWEN35_GDN_INVALID_ARGUMENT;
 
     int32_t tokens = (int32_t)args->tokens;
@@ -152,7 +174,7 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
     pegainfer_qwen35_gdn_qwen35_4b_candidate_Tensor_g_state_t state = {
         args->state};
     pegainfer_qwen35_gdn_qwen35_4b_candidate_Tensor_g_init_state_t initial = {
-        (void *)args->initial_state};
+        args->state};
     pegainfer_qwen35_gdn_qwen35_4b_candidate_Tensor_g_tensormaps_t workspace = {
         args->workspace, {workspace_bytes}};
     pegainfer_qwen35_gdn_qwen35_4b_candidate_Tensor_cu_seqlens_t cu_seqlens = {

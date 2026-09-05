@@ -11,6 +11,7 @@ use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
 
 use crate::Qwen35DecodeOverlap;
+use crate::Qwen35GdnBackend;
 use crate::Qwen35LaunchOptions;
 use crate::Qwen35SchedulerPolicy;
 
@@ -31,6 +32,11 @@ struct Qwen35Cli {
     /// opt-in and currently single-GPU only.
     #[arg(long, value_enum, default_value_t = CliQwen35SchedulerPolicy::Off)]
     qwen35_scheduler_policy: CliQwen35SchedulerPolicy,
+
+    /// GDN prefill backend. The FlashInfer candidate requires a build-linked
+    /// artifact and SM120/Hv32/TP1; Triton remains the default.
+    #[arg(long, value_enum, default_value_t = Qwen35GdnBackend::Triton)]
+    qwen35_gdn_backend: Qwen35GdnBackend,
 }
 
 /// CLI selector for the Qwen3.5 adaptive scheduler policy.
@@ -105,6 +111,11 @@ impl ModelLine for Qwen35Line {
     ) -> Result<(), CliError> {
         let cli = cli(ctx);
         let decode_overlap = resolve_decode_overlap(ctx.shared.decode_overlap)?;
+        if ctx.shared.tp_size > 1 && cli.qwen35_gdn_backend != Qwen35GdnBackend::Triton {
+            return Err(CliError::rule(
+                "Qwen3.5 --qwen35-gdn-backend=flashinfer-candidate requires TP world_size=1",
+            ));
+        }
         if let Some(max_batch) = cli.max_batch {
             if !(1..=crate::MAX_DECODE_BATCH).contains(&max_batch) {
                 return Err(CliError::rule(format!(
@@ -152,6 +163,7 @@ impl ModelLine for Qwen35Line {
                 device_ordinal: ctx.shared.device_ordinal,
                 tp_size: ctx.shared.tp_size,
                 cuda_graph: ctx.shared.cuda_graph,
+                gdn_backend: cli.qwen35_gdn_backend,
                 max_batch: cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
                 max_prefill_tokens: ctx
                     .shared

@@ -15,7 +15,7 @@ use super::Half;
 #[cfg(feature = "qwen35")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct FlashInferGdnPrefillArgs {
+pub(crate) struct FlashInferGdnPrefillArgs {
     pub abi_version: u32,
     pub struct_size: u32,
     pub q: u64,
@@ -25,7 +25,6 @@ pub struct FlashInferGdnPrefillArgs {
     pub alpha: u64,
     pub beta: u64,
     pub state: u64,
-    pub initial_state: u64,
     pub workspace: u64,
     pub workspace_bytes: u64,
     pub cu_seqlens: u64,
@@ -38,31 +37,30 @@ pub struct FlashInferGdnPrefillArgs {
 // with Gemma 4 and are declared in `shared.rs`.
 unsafe extern "C" {
     #[cfg(feature = "qwen35")]
-    pub fn pegainfer_qwen35_gdn_abi_version() -> u32;
+    pub(crate) fn pegainfer_qwen35_gdn_abi_version() -> u32;
     #[cfg(feature = "qwen35")]
-    pub fn pegainfer_qwen35_gdn_artifact_sha256() -> *const c_char;
+    pub(crate) fn pegainfer_qwen35_gdn_artifact_sha256() -> *const c_char;
     #[cfg(feature = "qwen35")]
-    pub fn pegainfer_qwen35_gdn_aot_available() -> i32;
+    pub(crate) fn pegainfer_qwen35_gdn_aot_available() -> i32;
     #[cfg(feature = "qwen35")]
-    pub fn pegainfer_qwen35_gdn_create(handle: *mut *mut c_void, device: i32) -> i32;
+    pub(crate) fn pegainfer_qwen35_gdn_create(handle: *mut *mut c_void, device: i32) -> i32;
     #[cfg(feature = "qwen35")]
-    pub fn pegainfer_qwen35_gdn_workspace_bytes(
+    pub(crate) fn pegainfer_qwen35_gdn_workspace_bytes(
         handle: *mut c_void,
         workspace_bytes: *mut usize,
     ) -> i32;
     #[cfg(feature = "qwen35")]
-    pub fn pegainfer_qwen35_gdn_launch(
+    pub(crate) fn pegainfer_qwen35_gdn_launch(
         handle: *mut c_void,
         args: *const FlashInferGdnPrefillArgs,
     ) -> i32;
     #[cfg(feature = "qwen35")]
-    pub fn pegainfer_qwen35_gdn_destroy(handle: *mut c_void);
+    pub(crate) fn pegainfer_qwen35_gdn_destroy(handle: *mut c_void);
 
     /// Native, non-expanded FlashInfer-GDN input preparation.
     ///
     /// `q_out`, `k_out`, and `v_out` are token-major `[T,H,D]`; alpha/beta are
-    /// FP32 `[T,Hv]`. `non_finite_status` is zeroed asynchronously and set to
-    /// one by the kernel if any consumed input is non-finite.
+    /// FP32 `[T,Hv]`.
     #[cfg(feature = "qwen35")]
     pub fn gated_delta_rule_prefill_native_prepare_cuda(
         qkv: *const Half,
@@ -75,7 +73,6 @@ unsafe extern "C" {
         v_out: *mut Half,
         alpha_out: *mut f32,
         beta_out: *mut f32,
-        non_finite_status: *mut u32,
         tokens: i32,
         stream: CUstream,
     ) -> CUresult;

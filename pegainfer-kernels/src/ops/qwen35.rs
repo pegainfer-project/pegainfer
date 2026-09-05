@@ -19,7 +19,7 @@ use crate::ffi;
 use crate::tensor::DeviceContext;
 use crate::tensor::HiddenStates;
 
-const QWEN35_GDN_ABI_VERSION: u32 = 1;
+const QWEN35_GDN_ABI_VERSION: u32 = 2;
 const STATUS_OK: i32 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,28 +39,10 @@ impl Qwen35GdnGeometry {
     };
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen35GdnSupport {
-    Supported,
-    UnsupportedSm,
-    UnsupportedGeometry,
-}
-
-fn qwen35_gdn_capability(sm: i32, geometry: Qwen35GdnGeometry) -> Qwen35GdnSupport {
-    if sm != 120 {
-        Qwen35GdnSupport::UnsupportedSm
-    } else if geometry != Qwen35GdnGeometry::PRODUCTION {
-        Qwen35GdnSupport::UnsupportedGeometry
-    } else {
-        Qwen35GdnSupport::Supported
-    }
-}
-
 #[derive(Debug)]
 pub struct Qwen35GdnAot {
     handle: NonNull<c_void>,
     device_ordinal: usize,
-    geometry: Qwen35GdnGeometry,
     workspace_bytes: usize,
 }
 
@@ -75,22 +57,24 @@ pub struct Qwen35GdnWorkspace {
 unsafe impl Send for Qwen35GdnAot {}
 
 impl Qwen35GdnAot {
-    pub fn load_for_production(
-        ctx: &DeviceContext,
-        geometry: Qwen35GdnGeometry,
-    ) -> Result<Option<Self>> {
+    pub fn load_for_production(ctx: &DeviceContext, geometry: Qwen35GdnGeometry) -> Result<Self> {
         let (major, minor) = ctx.ctx.compute_capability()?;
         let sm = major * 10 + minor;
-        if qwen35_gdn_capability(sm, geometry) != Qwen35GdnSupport::Supported {
-            return Ok(None);
-        }
+        ensure!(
+            sm == 120,
+            "Qwen3.5 FlashInfer candidate requires SM120, got SM{sm}"
+        );
+        ensure!(
+            geometry == Qwen35GdnGeometry::PRODUCTION,
+            "Qwen3.5 FlashInfer candidate requires Hq=16/Hk=16/Hv=32/D=128, got {geometry:?}"
+        );
         ensure!(
             unsafe { ffi::pegainfer_qwen35_gdn_abi_version() } == QWEN35_GDN_ABI_VERSION,
             "Qwen3.5 GDN stable C ABI version mismatch"
         );
         ensure!(
             unsafe { ffi::pegainfer_qwen35_gdn_aot_available() } == 1,
-            "SM120/Hv32 selects FlashInfer GDN, but the validated prebuilt AOT artifact was not linked; set PEGAINFER_QWEN35_GDN_AOT_BUNDLE at build time"
+            "Qwen3.5 FlashInfer candidate was explicitly selected, but no AOT candidate was linked; set PEGAINFER_QWEN35_GDN_AOT_BUNDLE at build time"
         );
         let mut raw = std::ptr::null_mut();
         let status =
@@ -104,16 +88,22 @@ impl Qwen35GdnAot {
         let status = unsafe {
             ffi::pegainfer_qwen35_gdn_workspace_bytes(handle.as_ptr(), &raw mut workspace_bytes)
         };
-        if status != STATUS_OK {
+        if status != STATUS_OK || workspace_bytes == 0 || workspace_bytes > i32::MAX as usize {
             unsafe { ffi::pegainfer_qwen35_gdn_destroy(handle.as_ptr()) };
-            anyhow::bail!("Qwen3.5 GDN workspace query failed with stable ABI status {status}");
+            anyhow::bail!(
+                "Qwen3.5 GDN workspace query failed: stable ABI status {status}, bytes={workspace_bytes}"
+            );
         }
-        Ok(Some(Self {
+        Ok(Self {
             handle,
             device_ordinal: ctx.device_ordinal,
-            geometry,
             workspace_bytes,
-        }))
+        })
+    }
+
+    /// Device workspace reserved alongside native prefill buffers in KV budgeting.
+    pub fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes
     }
 
     pub fn artifact_sha256(&self) -> &'static str {
@@ -131,7 +121,10 @@ impl Qwen35GdnAot {
         ctx: &DeviceContext,
         tokens: usize,
     ) -> Result<Qwen35GdnWorkspace> {
-        ensure!(tokens > 0, "Qwen3.5 GDN workspace requires T>=1");
+        ensure!(
+            tokens > 0 && tokens <= (i32::MAX as usize / Qwen35GdnGeometry::PRODUCTION.h_v),
+            "Qwen3.5 GDN T must fit the generated i32 gate extent"
+        );
         let workspace = ctx
             .stream
             .alloc_zeros(self.workspace_bytes)
@@ -161,48 +154,23 @@ impl Qwen35GdnAot {
         output: &mut HiddenStates,
         launch_workspace: &mut Qwen35GdnWorkspace,
     ) -> Result<()> {
-        let state_elements = self.geometry.h_v * self.geometry.head_dim * self.geometry.head_dim;
+        let g = Qwen35GdnGeometry::PRODUCTION;
+        let state_elements = g.h_v * g.head_dim * g.head_dim;
         ensure!(
             state.len() == state_elements,
             "Qwen3.5 GDN state length mismatch"
         );
-        let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
-        self.launch_with_state_pointers(
-            ctx,
-            q,
-            k,
-            v,
-            alpha,
-            beta,
-            state_ptr,
-            state_ptr,
-            output,
-            launch_workspace,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn launch_with_state_pointers(
-        &self,
-        ctx: &DeviceContext,
-        q: &HiddenStates,
-        k: &HiddenStates,
-        v: &HiddenStates,
-        alpha: &CudaSlice<f32>,
-        beta: &CudaSlice<f32>,
-        state_ptr: u64,
-        initial_state_ptr: u64,
-        output: &mut HiddenStates,
-        launch_workspace: &mut Qwen35GdnWorkspace,
-    ) -> Result<()> {
         let t = q.seq_len;
-        let g = self.geometry;
         ensure!(
             ctx.device_ordinal == self.device_ordinal,
             "Qwen3.5 GDN device mismatch"
         );
         ensure!(
-            t > 0 && k.seq_len == t && v.seq_len == t && output.seq_len == t,
+            t > 0
+                && t <= (i32::MAX as usize / g.h_v)
+                && k.seq_len == t
+                && v.seq_len == t
+                && output.seq_len == t,
             "Qwen3.5 GDN token extents do not match"
         );
         ensure!(
@@ -226,6 +194,7 @@ impl Qwen35GdnAot {
         let (v_ptr, _v) = v.data.device_ptr(&ctx.stream);
         let (alpha_ptr, _alpha) = alpha.device_ptr(&ctx.stream);
         let (beta_ptr, _beta) = beta.device_ptr(&ctx.stream);
+        let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
         let (output_ptr, _output) = output.data.device_ptr_mut(&ctx.stream);
         let workspace_bytes = launch_workspace.workspace.len() as u64;
         let (workspace_ptr, _workspace) = launch_workspace.workspace.device_ptr_mut(&ctx.stream);
@@ -240,7 +209,6 @@ impl Qwen35GdnAot {
             alpha: alpha_ptr,
             beta: beta_ptr,
             state: state_ptr,
-            initial_state: initial_state_ptr,
             workspace: workspace_ptr,
             workspace_bytes,
             cu_seqlens: cu_ptr,

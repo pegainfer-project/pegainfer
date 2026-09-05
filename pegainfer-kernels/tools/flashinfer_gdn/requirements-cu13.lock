@@ -5,4 +5,5 @@ nvidia-cutlass-dsl-libs-base==4.5.0
 cuda-python==13.0.1
 cuda-bindings==13.0.3
 cuda-pathfinder==1.6.0
-torch==2.7.1
+# SM120 needs the CUDA 12.8 wheel; PyPI's 2.7.1 build targets CUDA 12.6.
+torch @ https://download.pytorch.org/whl/cu128/torch-2.7.1%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=0b64f7d0a6f2a739ed052ba959f7b67c677028c9566ce51997f9f90fe573ddaa

@@ -9,9 +9,6 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
 
-#[cfg(feature = "qwen35")]
-use sha2::Digest as _;
-
 struct TritonKernelSpec {
     artifact_dir: &'static str,
     kernel_path: &'static str,
@@ -43,48 +40,9 @@ struct FlashInferIncludes {
 }
 
 #[cfg(feature = "qwen35")]
-const QWEN35_GDN_AOT_ABI_VERSION: u64 = 1;
-#[cfg(feature = "qwen35")]
 const QWEN35_GDN_AOT_ENV: &str = "PEGAINFER_QWEN35_GDN_AOT_BUNDLE";
 
-#[cfg(feature = "qwen35")]
-fn sha256_file(path: &Path) -> String {
-    let bytes =
-        fs::read(path).unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let digest = sha2::Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut hex, "{byte:02x}").expect("write SHA-256 hex to String");
-    }
-    hex
-}
-
-#[cfg(feature = "qwen35")]
-fn json_u64(value: &serde_json::Value, path: &[&str]) -> u64 {
-    let mut cursor = value;
-    for key in path {
-        cursor = &cursor[*key];
-    }
-    cursor.as_u64().unwrap_or_else(|| {
-        panic!(
-            "GDN AOT manifest field {} must be an unsigned integer",
-            path.join(".")
-        )
-    })
-}
-
-#[cfg(feature = "qwen35")]
-fn json_str<'a>(value: &'a serde_json::Value, path: &[&str]) -> &'a str {
-    let mut cursor = value;
-    for key in path {
-        cursor = &cursor[*key];
-    }
-    cursor
-        .as_str()
-        .unwrap_or_else(|| panic!("GDN AOT manifest field {} must be a string", path.join(".")))
-}
-
-/// Validate and attach the release-provided Qwen3.5 GDN object. The generated
+/// Validate and attach the explicitly supplied Qwen3.5 GDN candidate. The generated
 /// object and its native CuTe runtime archive are linked statically; serving
 /// never reads a manifest, loads PTX, or discovers a Python wheel.
 #[cfg(feature = "qwen35")]
@@ -109,82 +67,34 @@ fn build_qwen35_flashinfer_gdn_aot(
 
     if let Some(bundle) = std::env::var_os(QWEN35_GDN_AOT_ENV) {
         let bundle = PathBuf::from(bundle);
-        let manifest_path = bundle.join("manifest.json");
-        let manifest_bytes = fs::read(&manifest_path).unwrap_or_else(|error| {
-            panic!("read GDN AOT manifest {}: {error}", manifest_path.display())
-        });
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
-            .unwrap_or_else(|error| panic!("parse GDN AOT manifest: {error}"));
-        assert_eq!(json_u64(&manifest, &["schema_version"]), 3);
-        assert_eq!(json_str(&manifest, &["variant"]), "qwen35_4b_candidate");
-        assert_eq!(json_str(&manifest, &["target", "arch"]), "sm_120a");
-        assert_eq!(
-            json_str(&manifest, &["target", "code_object"]),
-            "embedded_cubin"
-        );
-        assert_eq!(
-            json_u64(&manifest, &["abi", "version"]),
-            QWEN35_GDN_AOT_ABI_VERSION
-        );
-        assert_eq!(json_u64(&manifest, &["geometry", "h_q"]), 16);
-        assert_eq!(json_u64(&manifest, &["geometry", "h_k"]), 16);
-        assert_eq!(json_u64(&manifest, &["geometry", "h_v"]), 32);
-        assert_eq!(json_u64(&manifest, &["geometry", "head_dim"]), 128);
-        assert_eq!(json_str(&manifest, &["tokens", "extent"]), "dynamic");
-        assert_eq!(json_u64(&manifest, &["tokens", "minimum"]), 1);
-        assert_eq!(
-            json_str(&manifest, &["abi", "state_layout"]),
-            "openinfer_hkv_v_contiguous"
-        );
-        assert_eq!(json_str(&manifest, &["workspace", "kind"]), "per_sm");
-        let workspace_bytes_per_sm = json_u64(&manifest, &["workspace", "bytes_per_sm"]);
-        assert_eq!(workspace_bytes_per_sm, 128);
-        assert_eq!(json_u64(&manifest, &["workspace", "alignment_bytes"]), 128);
-
-        let header = bundle.join("kernel.h");
-        let object = bundle.join("kernel.o");
-        let runtime = bundle.join("libcuda_dialect_runtime_static.a");
-        for (label, path, hash_path, size_path) in [
-            (
-                "header",
-                &header,
-                ["artifact", "header", "sha256"],
-                ["artifact", "header", "size_bytes"],
-            ),
-            (
-                "object",
-                &object,
-                ["artifact", "object", "sha256"],
-                ["artifact", "object", "size_bytes"],
-            ),
-            (
-                "native runtime",
-                &runtime,
-                ["artifact", "native_runtime", "sha256"],
-                ["artifact", "native_runtime", "size_bytes"],
-            ),
-        ] {
-            assert!(
-                path.is_file(),
-                "GDN AOT {label} is missing: {}",
-                path.display()
-            );
-            assert_eq!(sha256_file(path), json_str(&manifest, &hash_path));
-            assert_eq!(
-                fs::metadata(path).expect("read GDN AOT metadata").len(),
-                json_u64(&manifest, &size_path)
-            );
-            println!("cargo:rerun-if-changed={}", path.display());
+        let pins = root.join("tools/flashinfer_gdn");
+        for name in pegainfer_build::qwen35_gdn::PIN_FILES {
+            println!("cargo:rerun-if-changed={}", pins.join(name).display());
         }
-        println!("cargo:rerun-if-changed={}", manifest_path.display());
-
-        let object_hash = json_str(&manifest, &["artifact", "object", "sha256"]);
+        for name in ["manifest.json"]
+            .into_iter()
+            .chain(pegainfer_build::qwen35_gdn::ARTIFACT_FILES)
+        {
+            println!("cargo:rerun-if-changed={}", bundle.join(name).display());
+        }
+        let candidate = pegainfer_build::qwen35_gdn::validate_candidate(root, &bundle)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let linked_bundle = out_dir.join("qwen35-gdn-candidate");
+        fs::create_dir_all(&linked_bundle).expect("create GDN candidate link directory");
+        for (name, bytes) in &candidate.files {
+            fs::write(linked_bundle.join(name), bytes).expect("stage verified GDN candidate bytes");
+        }
+        // Validate the final inputs too, before any compiler or linker sees them.
+        pegainfer_build::qwen35_gdn::validate_candidate(root, &linked_bundle)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let object_hash = candidate.object_sha256;
+        let workspace_bytes_per_sm = candidate.workspace_bytes_per_sm;
         config = format!(
             "#pragma once\n#define PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256 \"{object_hash}\"\n#define PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM {workspace_bytes_per_sm}u\n"
         );
-        includes.push(bundle);
-        linked_objects.push(object);
-        runtime_dir = runtime.parent().map(Path::to_path_buf);
+        linked_objects.push(linked_bundle.join("kernel.o"));
+        includes.push(linked_bundle.clone());
+        runtime_dir = Some(linked_bundle);
     }
     fs::write(&config_header, config).expect("write GDN AOT build config");
 

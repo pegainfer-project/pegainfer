@@ -34,6 +34,7 @@ pub(crate) struct ModelRuntimeConfig {
     pub(crate) enable_cuda_graph: bool,
     pub(crate) tensor_parallel: Option<TensorParallelConfig>,
     pub(crate) device_ordinal: usize,
+    pub(crate) gdn_backend: crate::Qwen35GdnBackend,
 }
 
 impl Default for ModelRuntimeConfig {
@@ -42,6 +43,7 @@ impl Default for ModelRuntimeConfig {
             enable_cuda_graph: true,
             tensor_parallel: None,
             device_ordinal: 0,
+            gdn_backend: crate::Qwen35GdnBackend::Triton,
         }
     }
 }
@@ -49,11 +51,8 @@ impl Default for ModelRuntimeConfig {
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
-    /// Opaque kernels-owned AOT operation. `None` is an explicit capability
-    /// fallback (non-SM120 or non-Hv32), never a corrupt-artifact fallback.
+    /// The selected, already-loaded candidate. `None` means Triton was requested.
     pub(super) flashinfer_gdn: Option<pegainfer_kernels::ops::Qwen35GdnAot>,
-    #[cfg(feature = "gdn-validation")]
-    pub(super) gdn_validation_evidence: super::gdn_validation::GdnValidationEvidenceHandle,
     pub(super) config: Config35,
     pub(super) geometry: LocalGeometry,
     pub(super) embed_tokens: DeviceMatrix,
@@ -91,38 +90,26 @@ const MIN_KV_PAGES: usize = 64;
 impl Qwen35Model {
     pub fn from_safetensors_with_options(
         model_path: &str,
-        enable_cuda_graph: bool,
+        options: &crate::Qwen35LaunchOptions,
     ) -> Result<Self> {
-        Self::from_safetensors_with_runtime(
+        anyhow::ensure!(
+            options.tp_size == 1,
+            "rank-local model loading requires tp_size=1"
+        );
+        Self::from_safetensors_with_runtime_and_capacity(
             model_path,
             ModelRuntimeConfig {
-                enable_cuda_graph,
+                enable_cuda_graph: options.cuda_graph,
+                device_ordinal: options.device_ordinal,
+                gdn_backend: options.gdn_backend,
                 ..Default::default()
             },
+            options.max_batch,
         )
     }
 }
 
 impl Qwen35Model {
-    /// `max_batch` is the requested concurrent-request cap in `1..=MAX_BATCH`.
-    /// It need not be a decode bucket: the physical decode capacity is rounded
-    /// up to the next `BATCH_BUCKETS` value while the scheduler still admits at
-    /// most `max_batch` (see #470 and `decode_admission_batch`).
-    pub(crate) fn from_safetensors(
-        model_path: &str,
-        device_ordinal: usize,
-        max_batch: usize,
-    ) -> Result<Self> {
-        Self::from_safetensors_with_runtime_and_capacity(
-            model_path,
-            ModelRuntimeConfig {
-                device_ordinal,
-                ..Default::default()
-            },
-            max_batch,
-        )
-    }
-
     pub(crate) fn from_safetensors_with_runtime(
         model_path: &str,
         runtime: ModelRuntimeConfig,
@@ -158,6 +145,37 @@ impl Qwen35Model {
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         let geometry = LocalGeometry::try_new(&config, tensor_parallel, runtime.enable_cuda_graph)
             .map_err(anyhow::Error::from)?;
+        // Resolve and preload exactly once, before measuring free memory or
+        // allocating KV. A linked artifact alone never changes the default.
+        let flashinfer_gdn = match runtime.gdn_backend {
+            crate::Qwen35GdnBackend::Triton => None,
+            crate::Qwen35GdnBackend::FlashInferCandidate => {
+                anyhow::ensure!(
+                    geometry.world_size() == 1,
+                    "Qwen3.5 flashinfer-candidate requires TP world_size=1"
+                );
+                anyhow::ensure!(
+                    config.linear_value_head_dim == 128,
+                    "Qwen3.5 flashinfer-candidate requires value head dimension 128"
+                );
+                Some(pegainfer_kernels::ops::Qwen35GdnAot::load_for_production(
+                    &ctx,
+                    super::flashinfer_gdn::model_geometry(&config),
+                )?)
+            }
+        };
+        if let Some(backend) = &flashinfer_gdn {
+            info!(
+                "Qwen3.5 GDN: requested={} resolved=flashinfer-candidate object_sha256={}",
+                runtime.gdn_backend,
+                backend.artifact_sha256()
+            );
+        } else {
+            info!(
+                "Qwen3.5 GDN: requested={} resolved=triton",
+                runtime.gdn_backend
+            );
+        }
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}, tp_rank={}, tp_world_size={}",
             config.hidden_size,
@@ -274,8 +292,18 @@ impl Qwen35Model {
         // Reserve space for prefill scratch (GDR chunkwise + per-layer transients)
         // before allocating KV pool, so prefill doesn't OOM.
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
-        let scratch_reserve =
-            super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(&config, max_prefill_len);
+        let scratch_reserve = match &flashinfer_gdn {
+            Some(backend) => super::flashinfer_gdn::FlashInferGdnChunkResources::estimate_bytes(
+                &config,
+                backend,
+                max_prefill_len,
+                page_size,
+            ),
+            None => super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
+                &config,
+                max_prefill_len,
+            ),
+        };
         let recurrent_reserve =
             STATES_PER_DECODE_SLOT * max_batch * super::recurrent_state::bytes_per_request(&config);
         let min_kv_bytes = MIN_KV_PAGES * bytes_per_page;
@@ -297,7 +325,8 @@ impl Qwen35Model {
         let scratch_mb = scratch_reserve / (1024 * 1024);
         let recurrent_mb = recurrent_reserve / (1024 * 1024);
         info!(
-            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), {:.0}% of {:.0} MB free",
+            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), backend={}, prefill scratch reserve: {scratch_mb} MB ({scratch_reserve} bytes), recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), {:.0}% of {:.0} MB free",
+            runtime.gdn_backend,
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
@@ -310,40 +339,9 @@ impl Qwen35Model {
             num_pages,
         )?;
 
-        // The first production specialization is deliberately single-GPU.
-        // TP remains an explicit capability fallback to the existing Triton path.
-        let flashinfer_gdn = if geometry.world_size() == 1 {
-            pegainfer_kernels::ops::Qwen35GdnAot::load_for_production(
-                &ctx,
-                super::flashinfer_gdn::model_geometry(&config),
-            )?
-        } else {
-            None
-        };
-        if let Some(backend) = &flashinfer_gdn {
-            info!(
-                "Qwen3.5 GDN production backend: FlashInfer AOT object {}",
-                backend.artifact_sha256()
-            );
-        } else if geometry.world_size() > 1 {
-            info!(
-                "Qwen3.5 GDN production backend: Triton (explicit capability fallback: TP world_size={})",
-                geometry.world_size()
-            );
-        } else {
-            let (major, minor) = ctx.ctx.compute_capability()?;
-            info!(
-                "Qwen3.5 GDN production backend: Triton (explicit capability fallback: sm_{}{}, geometry={:?})",
-                major,
-                minor,
-                super::flashinfer_gdn::model_geometry(&config)
-            );
-        }
         Ok(Self {
             ctx,
             flashinfer_gdn,
-            #[cfg(feature = "gdn-validation")]
-            gdn_validation_evidence: Default::default(),
             config,
             geometry,
             embed_tokens,
@@ -484,16 +482,13 @@ impl Qwen35Model {
             "requested graph capacity {max_batch} exceeds loaded capacity {}",
             self.reserved_decode_slots
         );
-        let graph = super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
+        super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
             &self.ctx,
             &self.config,
             self.geometry,
             &self.kv_pool,
             max_batch,
-        )?;
-        #[cfg(feature = "gdn-validation")]
-        let graph = graph.with_validation_evidence(self.gdn_validation_evidence.clone());
-        Ok(graph)
+        )
     }
 
     pub(crate) fn create_batch_decode_buffers_with_capacity(

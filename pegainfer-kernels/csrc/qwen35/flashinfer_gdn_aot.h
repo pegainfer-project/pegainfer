@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define PEGAINFER_QWEN35_GDN_ABI_VERSION 1u
+#define PEGAINFER_QWEN35_GDN_ABI_VERSION 2u
 
 typedef enum {
     PEGAINFER_QWEN35_GDN_OK = 0,
@@ -27,7 +27,6 @@ typedef struct {
     const void *alpha;
     const void *beta;
     void *state;
-    const void *initial_state;
     void *workspace;
     size_t workspace_bytes;
     const int64_t *cu_seqlens;
@@ -47,7 +46,7 @@ typedef struct {
     PEGAINFER_GDN_STATIC_ASSERT(offsetof(type, field) == (expected),        \
                                 #type "." #field " ABI offset changed")
 
-PEGAINFER_GDN_STATIC_ASSERT(sizeof(pegainfer_qwen35_gdn_args_t) == 112,
+PEGAINFER_GDN_STATIC_ASSERT(sizeof(pegainfer_qwen35_gdn_args_t) == 104,
                             "GDN args ABI size changed");
 PEGAINFER_GDN_STATIC_ASSERT(PEGAINFER_GDN_ALIGNOF(pegainfer_qwen35_gdn_args_t) == 8,
                             "GDN args ABI alignment changed");
@@ -60,12 +59,11 @@ PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, output, 32);
 PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, alpha, 40);
 PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, beta, 48);
 PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, state, 56);
-PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, initial_state, 64);
-PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, workspace, 72);
-PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, workspace_bytes, 80);
-PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, cu_seqlens, 88);
-PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, tokens, 96);
-PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, stream, 104);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, workspace, 64);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, workspace_bytes, 72);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, cu_seqlens, 80);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, tokens, 88);
+PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, stream, 96);
 
 #undef PEGAINFER_GDN_ASSERT_OFFSET
 #undef PEGAINFER_GDN_STATIC_ASSERT

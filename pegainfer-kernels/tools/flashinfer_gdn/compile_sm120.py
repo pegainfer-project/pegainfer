@@ -14,11 +14,11 @@ from pathlib import Path
 
 from artifact_contract import (
     FORBIDDEN_TMA_CLUSTER_LOAD,
+    FROZEN_CONTRACT,
+    GEOMETRY,
     TARGET_ARCH,
     VARIANT,
-    expected_spec,
     compiler_path,
-    normalize_ptx,
     requirements_lock_path,
     sha256_file,
     verify_prepared_flashinfer_source,
@@ -37,7 +37,7 @@ def ptx_metadata(ptx: str) -> dict[str, str]:
     compiler_match = re.search(
         r"Cuda compilation tools, release\s+([0-9.]+),\s+V([0-9.]+)", ptx
     )
-    isa_match = re.search(r"^\.version\s+([0-9.]+)$", ptx, re.MULTILINE)
+    isa_match = re.search(r"^\.version[ \t]+([0-9.]+)[ \t\r]*$", ptx, re.MULTILINE)
     if not compiler_match or not isa_match:
         raise RuntimeError("cannot derive CUDA compiler/PTX ISA from generated PTX")
     return {
@@ -119,18 +119,16 @@ def import_frozen_kernel(flashinfer_dir: Path):
     return cache_module.cached_compile, kernel_module._FullyFusedDeltaRuleSm120
 
 
-def compile_variant(variant: str, flashinfer_dir: Path) -> tuple[object, str]:
-    spec = expected_spec(variant)
-    geometry = spec["geometry"]
+def compile_kernel(flashinfer_dir: Path) -> tuple[object, str]:
     import cutlass
     import cutlass.cute as cute
 
     cached_compile, kernel_type = import_frozen_kernel(flashinfer_dir)
 
-    h_q = geometry["h_q"]
-    h_k = geometry["h_k"]
-    h_v = geometry["h_v"]
-    d = geometry["head_dim"]
+    h_q = GEOMETRY["h_q"]
+    h_k = GEOMETRY["h_k"]
+    h_v = GEOMETRY["h_v"]
+    d = GEOMETRY["head_dim"]
     t = cute.sym_int()
     flat_tokens = cute.sym_int()
     workspace_bytes = cute.sym_int()
@@ -188,7 +186,7 @@ def compile_variant(variant: str, flashinfer_dir: Path) -> tuple[object, str]:
         stream,
     )
     compiled = cached_compile(kernel, *args, compile_options=(cute.GPUArch(TARGET_ARCH),))
-    ptx = normalize_ptx(read_compiled_ptx(compiled))
+    ptx = read_compiled_ptx(compiled)
     if FORBIDDEN_TMA_CLUSTER_LOAD in ptx:
         raise RuntimeError("upstream SM120 TMA workaround was not applied")
     return compiled, ptx
@@ -196,7 +194,7 @@ def compile_variant(variant: str, flashinfer_dir: Path) -> tuple[object, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", required=True, choices=(VARIANT,))
+    parser.add_argument("--upstream-layout", action="store_true", help="generation-only HVK oracle")
     parser.add_argument("--flashinfer-dir", required=True, type=Path)
     parser.add_argument("--base-flashinfer-dir", required=True, type=Path)
     parser.add_argument("--aot-out", required=True, type=Path)
@@ -204,10 +202,11 @@ def main() -> int:
     args = parser.parse_args()
 
     source = verify_prepared_flashinfer_source(
-        args.flashinfer_dir, args.base_flashinfer_dir
+        args.flashinfer_dir, args.base_flashinfer_dir, upstream_layout=args.upstream_layout
     )
-    compiled, ptx = compile_variant(args.variant, args.flashinfer_dir.resolve())
-    prefix = f"pegainfer_qwen35_gdn_{args.variant}"
+    compiled, ptx = compile_kernel(args.flashinfer_dir.resolve())
+    prefix = ("pegainfer_qwen35_gdn_upstream_hvk" if args.upstream_layout
+              else FROZEN_CONTRACT["abi"]["function_prefix"])
     args.aot_out.mkdir(parents=True, exist_ok=True)
     compiled.export_to_c(str(args.aot_out), prefix, prefix)
     header = args.aot_out / f"{prefix}.h"
@@ -245,7 +244,7 @@ def main() -> int:
         },
     }
     write_json(args.metadata_out, metadata)
-    print(json.dumps({"variant": args.variant, "aot": str(args.aot_out), "metadata": str(args.metadata_out)}, sort_keys=True))
+    print(json.dumps({"variant": VARIANT, "aot": str(args.aot_out), "metadata": str(args.metadata_out)}, sort_keys=True))
     return 0
 
 

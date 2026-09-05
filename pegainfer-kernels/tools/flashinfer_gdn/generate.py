@@ -45,8 +45,6 @@ def main() -> int:
                 [
                     str(args.python),
                     str(compiler),
-                    "--variant",
-                    VARIANT,
                     "--flashinfer-dir",
                     str(prepared),
                     "--base-flashinfer-dir",

@@ -163,7 +163,14 @@ mod tests {
         else {
             return;
         };
-        let model = Qwen35Model::from_safetensors(&model_path, 0, 2).unwrap();
+        let model = Qwen35Model::from_safetensors_with_options(
+            &model_path,
+            &crate::Qwen35LaunchOptions {
+                max_batch: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let prompt_a: Vec<u32> = vec![9707];
         let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];

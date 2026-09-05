@@ -3,47 +3,24 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 3
-VARIANT = "qwen35_4b_candidate"
-TARGET_ARCH = "sm_120a"
-FROZEN_FLASHINFER_COMMIT = "a0efa0adfe49bb836ab1a147d6572980b870f3d4"
-GEOMETRY = {"h_q": 16, "h_k": 16, "h_v": 32, "head_dim": 128}
-TOKENS = {"extent": "dynamic", "minimum": 1}
-WORKSPACE = {"kind": "per_sm", "bytes_per_sm": 128, "alignment_bytes": 128}
-DTYPES = {
-    "q": "bfloat16",
-    "k": "bfloat16",
-    "v": "bfloat16",
-    "o": "bfloat16",
-    "alpha": "float32",
-    "beta": "float32",
-    "state": "float32",
-    "cu_seqlens": "int64",
-    "workspace": "uint8",
-}
-PINNED_TOOLCHAIN = {
-    "python": "3.12.3",
-    "ptx_compiler_release": "13.1",
-    "ptx_compiler_version": "13.1.66",
-    "ptx_isa": "9.1",
-    "cutlass_dsl": "4.5.0",
-    "cutlass_dsl_libs_base": "4.5.0",
-    "torch": "2.7.1",
-    "cuda_python": "13.0.1",
-    "cuda_bindings": "13.0.3",
-    "cuda_pathfinder": "1.6.0",
-}
+# One project-owned frozen contract is read by both generation and the independent
+# Rust pre-link validator. Artifact values never supply their own expected pins.
+_FROZEN_LOCK = json.loads(Path(__file__).with_name("source-lock.json").read_text())
+FROZEN_CONTRACT = _FROZEN_LOCK["contract"]
+VARIANT = FROZEN_CONTRACT["variant"]
+TARGET_ARCH = FROZEN_CONTRACT["target"]["arch"]
+FROZEN_FLASHINFER_COMMIT = _FROZEN_LOCK["flashinfer_commit"]
+GEOMETRY = FROZEN_CONTRACT["geometry"]
+PINNED_TOOLCHAIN = FROZEN_CONTRACT["toolchain"]
 KERNEL_SOURCE = "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py"
 ARTIFACT_FILES = {
     "header": "kernel.h",
@@ -95,13 +72,9 @@ def compiler_path() -> Path:
     return Path(__file__).with_name("compile_sm120.py")
 
 
-def load_source_lock(path: Path | None = None) -> tuple[dict[str, Any], str]:
-    path = path or source_lock_path()
+def load_source_lock() -> tuple[dict[str, Any], str]:
+    path = source_lock_path()
     lock = read_json(path)
-    if lock.get("schema_version") != SCHEMA_VERSION:
-        raise ContractError("source lock schema_version mismatch")
-    if lock.get("flashinfer_commit") != FROZEN_FLASHINFER_COMMIT:
-        raise ContractError("source lock FlashInfer commit mismatch")
     patches = lock.get("patches")
     if not isinstance(patches, list) or len(patches) != 1:
         raise ContractError("source lock must contain exactly one HKV patch")
@@ -148,15 +121,14 @@ def verify_flashinfer_base(flashinfer_dir: Path) -> str:
     return commit
 
 
-def inspect_kernel_source(source_dir: Path, commit: str) -> dict[str, Any]:
+def inspect_kernel_source(source_dir: Path, commit: str, *, upstream_layout: bool = False) -> dict[str, Any]:
     kernel_path = source_dir / KERNEL_SOURCE
     if not kernel_path.is_file():
         raise ContractError(f"patched GDN kernel is missing: {kernel_path}")
     lock, source_lock_sha256 = load_source_lock()
     kernel_sha256 = sha256_file(kernel_path)
-    _require_equal(
-        kernel_sha256, lock["patched_kernel_sha256"], "patched GDN kernel hash"
-    )
+    expected_hash = lock["upstream_export_kernel_sha256" if upstream_layout else "patched_kernel_sha256"]
+    _require_equal(kernel_sha256, expected_hash, "GDN kernel source hash")
     return {
         "flashinfer_commit": commit,
         "kernel_source_sha256": kernel_sha256,
@@ -164,7 +136,9 @@ def inspect_kernel_source(source_dir: Path, commit: str) -> dict[str, Any]:
     }
 
 
-def prepare_flashinfer_source(flashinfer_dir: Path, destination: Path) -> dict[str, Any]:
+def prepare_flashinfer_source(
+    flashinfer_dir: Path, destination: Path, *, upstream_layout: bool = False
+) -> dict[str, Any]:
     commit = verify_flashinfer_base(flashinfer_dir)
     lock, _ = load_source_lock()
     if destination.exists():
@@ -172,8 +146,15 @@ def prepare_flashinfer_source(flashinfer_dir: Path, destination: Path) -> dict[s
     shutil.copytree(flashinfer_dir / "flashinfer", destination / "flashinfer")
     for patch in lock["patches"]:
         patch_path = source_lock_path().parent / patch["path"]
+        patch_text = patch_path.read_text()
+        if upstream_layout:
+            # Keep only export type annotations. Both layout hunks are omitted,
+            # so the oracle retains the pinned upstream HVK representation.
+            hunks = re.split(r"(?=^@@ )", patch_text, flags=re.MULTILINE)
+            patch_text = "".join(hunk for hunk in hunks if "order=" not in hunk)
         result = subprocess.run(
-            ["git", "apply", "--unsafe-paths", str(patch_path)],
+            ["git", "apply", "--unsafe-paths", "-"],
+            input=patch_text,
             cwd=destination,
             check=False,
             capture_output=True,
@@ -182,46 +163,14 @@ def prepare_flashinfer_source(flashinfer_dir: Path, destination: Path) -> dict[s
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
             raise ContractError(f"failed to apply HKV patch: {detail}")
-    return inspect_kernel_source(destination, commit)
+    return inspect_kernel_source(destination, commit, upstream_layout=upstream_layout)
 
 
 def verify_prepared_flashinfer_source(
-    source_dir: Path, flashinfer_dir: Path
+    source_dir: Path, flashinfer_dir: Path, *, upstream_layout: bool = False
 ) -> dict[str, Any]:
     commit = verify_flashinfer_base(flashinfer_dir)
-    lock, _ = load_source_lock()
-    source = inspect_kernel_source(source_dir, commit)
-    _require_equal(
-        source["kernel_source_sha256"],
-        lock["patched_kernel_sha256"],
-        "prepared HKV kernel hash",
-    )
-    return source
-
-
-def normalize_ptx(ptx: str) -> str:
-    """Normalize harmless path/debug text without changing PTX instructions."""
-    normalized_lines: list[str] = []
-    file_directive = re.compile(r'^(\s*\.file\s+\d+\s+")([^"]+)(".*)$')
-    for raw_line in ptx.replace("\r\n", "\n").replace("\r", "\n").splitlines():
-        line = raw_line.rstrip()
-        match = file_directive.match(line)
-        if match:
-            name = Path(match.group(2).replace("\\", "/")).name
-            line = f"{match.group(1)}{name}{match.group(3)}"
-        normalized_lines.append(line)
-    return "\n".join(normalized_lines) + "\n"
-
-
-def expected_spec(variant: str) -> dict[str, Any]:
-    _require_equal(variant, VARIANT, "artifact variant")
-    return {
-        "variant": VARIANT,
-        "target_arch": TARGET_ARCH,
-        "geometry": dict(GEOMETRY),
-        "dtypes": dict(DTYPES),
-        "tokens": dict(TOKENS),
-    }
+    return inspect_kernel_source(source_dir, commit, upstream_layout=upstream_layout)
 
 
 def _require_equal(actual: Any, expected: Any, label: str) -> None:
@@ -268,56 +217,22 @@ def validate_compile_metadata(
 
 def build_manifest(
     *,
-    variant: str,
-    header_bytes: bytes,
-    object_bytes: bytes,
-    runtime_bytes: bytes,
-    compile_metadata: dict[str, Any],
+    artifacts: dict[str, bytes],
     source: dict[str, Any],
 ) -> dict[str, Any]:
-    spec = expected_spec(variant)
     return {
-        "schema_version": SCHEMA_VERSION,
-        "artifact_kind": "flashinfer_cute_gdn_prefill_aot_object",
-        "variant": variant,
-        "target": {"arch": TARGET_ARCH, "code_object": "embedded_cubin"},
-        "geometry": spec["geometry"],
-        "dtypes": spec["dtypes"],
-        "tokens": spec["tokens"],
-        "abi": {
-            "version": 1,
-            "function_prefix": compile_metadata["aot"]["function_prefix"],
-            "geometry_binding": "stable_project_c_wrapper",
-            "q_view": {"shape": ["T", 128, spec["geometry"]["h_q"]], "stride": [spec["geometry"]["h_q"] * 128, 1, 128]},
-            "k_view": {"shape": [128, "T", spec["geometry"]["h_k"]], "stride": [1, spec["geometry"]["h_k"] * 128, 128]},
-            "v_view": {"shape": [128, "T", spec["geometry"]["h_v"]], "stride": [1, spec["geometry"]["h_v"] * 128, 128]},
-            "o_view": {"shape": [128, "T", spec["geometry"]["h_v"]], "stride": [1, spec["geometry"]["h_v"] * 128, 128]},
-            "state_layout": "openinfer_hkv_v_contiguous",
-        },
-        "workspace": dict(WORKSPACE),
+        **FROZEN_CONTRACT,
         "source": {
             **source,
-            "generator_sha256": compile_metadata["generator_sha256"],
-            "requirements_lock_sha256": compile_metadata["requirements_lock_sha256"],
+            "generator_sha256": sha256_file(compiler_path()),
+            "requirements_lock_sha256": sha256_file(requirements_lock_path()),
         },
-        "toolchain": compile_metadata["toolchain"],
         "artifact": {
             "format": "elf_relocatable_with_embedded_cubin",
-            "header": {
-                "sha256": sha256_bytes(header_bytes),
-                "size_bytes": len(header_bytes),
+            **{
+                name: {"sha256": sha256_bytes(artifacts[name]), "size_bytes": len(artifacts[name])}
+                for name in ARTIFACT_FILES
             },
-            "object": {
-                "sha256": sha256_bytes(object_bytes),
-                "size_bytes": len(object_bytes),
-            },
-            "native_runtime": {
-                "sha256": sha256_bytes(runtime_bytes),
-                "size_bytes": len(runtime_bytes),
-            },
-        },
-        "distribution": {
-            "cute_runtime_linkage": "static",
         },
     }
 
@@ -335,46 +250,31 @@ def package_candidate(
     validate_compile_metadata(metadata, source)
 
     aot = metadata["aot"]
-    header_path = raw_aot_dir / aot["header"]
-    object_path = raw_aot_dir / aot["object"]
-    if not header_path.is_file() or not object_path.is_file():
-        raise ContractError("AOT export header/object is missing")
-    header_bytes = header_path.read_bytes()
-    object_bytes = object_path.read_bytes()
-    runtime_path = Path(aot["native_runtime"])
-    if not runtime_path.is_file():
-        raise ContractError("CuTe static runtime archive is missing")
-    runtime_bytes = runtime_path.read_bytes()
-    _require_equal(aot["header_sha256"], sha256_bytes(header_bytes), "AOT header hash")
-    _require_equal(aot["header_size_bytes"], len(header_bytes), "AOT header size")
-    _require_equal(aot["object_sha256"], sha256_bytes(object_bytes), "AOT object hash")
-    _require_equal(aot["object_size_bytes"], len(object_bytes), "AOT object size")
     _require_equal(
-        aot["native_runtime_sha256"],
-        sha256_bytes(runtime_bytes),
-        "CuTe static runtime hash",
+        aot["function_prefix"], FROZEN_CONTRACT["abi"]["function_prefix"],
+        "generated function prefix",
     )
-    _require_equal(
-        aot["native_runtime_size_bytes"],
-        len(runtime_bytes),
-        "CuTe static runtime size",
-    )
+    paths = {
+        "header": raw_aot_dir / aot["header"],
+        "object": raw_aot_dir / aot["object"],
+        "native_runtime": Path(aot["native_runtime"]),
+    }
+    artifacts = {}
+    for name, path in paths.items():
+        if not path.is_file():
+            raise ContractError(f"AOT {name} is missing: {path}")
+        artifacts[name] = path.read_bytes()
+    manifest = build_manifest(artifacts=artifacts, source=source)
+    for name in ARTIFACT_FILES:
+        for field in ("sha256", "size_bytes"):
+            _require_equal(
+                aot[f"{name}_{field}"], manifest["artifact"][name][field],
+                f"AOT {name} {field}",
+            )
 
     output_dir.mkdir(parents=True)
-    header_name = ARTIFACT_FILES["header"]
-    object_name = ARTIFACT_FILES["object"]
-    runtime_name = ARTIFACT_FILES["native_runtime"]
-    (output_dir / header_name).write_bytes(header_bytes)
-    (output_dir / object_name).write_bytes(object_bytes)
-    (output_dir / runtime_name).write_bytes(runtime_bytes)
-    manifest = build_manifest(
-        variant=VARIANT,
-        header_bytes=header_bytes,
-        object_bytes=object_bytes,
-        runtime_bytes=runtime_bytes,
-        compile_metadata=metadata,
-        source=source,
-    )
+    for name, filename in ARTIFACT_FILES.items():
+        (output_dir / filename).write_bytes(artifacts[name])
     manifest_path = output_dir / "manifest.json"
     write_json(manifest_path, manifest)
     return manifest_path
@@ -383,120 +283,36 @@ def package_candidate(
 def validate_manifest(
     manifest_path: Path,
     *,
-    flashinfer_dir: Path | None = None,
-    expected_variant: str | None = None,
+    flashinfer_dir: Path,
 ) -> dict[str, Any]:
     manifest = read_json(manifest_path)
-    _require_equal(manifest.get("schema_version"), SCHEMA_VERSION, "schema_version")
-    variant = expected_variant or manifest.get("variant")
-    if not isinstance(variant, str):
-        raise ContractError("manifest variant is missing")
-    spec = expected_spec(variant)
-    _require_equal(manifest.get("variant"), variant, "variant")
-    _require_equal(manifest.get("target"), {"arch": TARGET_ARCH, "code_object": "embedded_cubin"}, "target")
-    _require_equal(manifest.get("geometry"), spec["geometry"], "geometry")
-    _require_equal(manifest.get("dtypes"), spec["dtypes"], "dtypes")
-    _require_equal(manifest.get("tokens"), spec["tokens"], "dynamic token contract")
-
-    source_manifest = manifest.get("source")
-    if not isinstance(source_manifest, dict):
-        raise ContractError("manifest source is missing")
-    _require_equal(source_manifest.get("flashinfer_commit"), FROZEN_FLASHINFER_COMMIT, "FlashInfer SHA")
-    lock, source_lock_sha256 = load_source_lock()
-    _require_equal(
-        source_manifest.get("source_lock_sha256"),
-        source_lock_sha256,
-        "source lock hash",
-    )
-    _require_equal(
-        source_manifest.get("kernel_source_sha256"),
-        lock["patched_kernel_sha256"],
-        "patched kernel hash",
-    )
-    _require_equal(source_manifest.get("generator_sha256"), sha256_file(compiler_path()), "generator hash")
-    _require_equal(
-        source_manifest.get("requirements_lock_sha256"),
-        sha256_file(requirements_lock_path()),
-        "requirements lock hash",
-    )
-
-    if flashinfer_dir is not None:
-        verify_flashinfer_base(flashinfer_dir)
-    workspace = manifest.get("workspace")
-    if not isinstance(workspace, dict):
-        raise ContractError("workspace is missing")
-    _require_equal(workspace, WORKSPACE, "workspace")
-
-    artifact = manifest.get("artifact")
-    if not isinstance(artifact, dict):
-        raise ContractError("artifact metadata is missing")
-    _require_equal(artifact.get("format"), "elf_relocatable_with_embedded_cubin", "artifact format")
-    for component in ("header", "object", "native_runtime"):
-        entry = artifact.get(component)
-        if not isinstance(entry, dict):
-            raise ContractError(f"artifact {component} metadata is missing")
-        _require_equal(
-            set(entry),
-            {"sha256", "size_bytes"},
-            f"artifact {component} metadata keys",
-        )
-        name = ARTIFACT_FILES[component]
-        path = manifest_path.parent / name
-        if not path.is_file():
-            raise ContractError(f"artifact {component} file is missing: {path}")
-        data = path.read_bytes()
-        _require_equal(entry.get("size_bytes"), len(data), f"artifact {component} size")
-        _require_equal(entry.get("sha256"), sha256_bytes(data), f"artifact {component} hash")
-    manifest_toolchain = manifest.get("toolchain")
-    if not isinstance(manifest_toolchain, dict):
-        raise ContractError("manifest toolchain is missing")
-    _require_equal(manifest_toolchain, PINNED_TOOLCHAIN, "manifest toolchain")
-    abi = manifest.get("abi")
-    if not isinstance(abi, dict):
-        raise ContractError("ABI metadata is missing")
-    _require_equal(abi.get("version"), 1, "stable C ABI version")
-    _require_equal(abi.get("function_prefix"), f"pegainfer_qwen35_gdn_{variant}", "AOT function prefix")
-    _require_equal(
-        abi.get("geometry_binding"),
-        "stable_project_c_wrapper",
-        "geometry binding",
-    )
-    _require_equal(
-        abi.get("state_layout"),
-        "openinfer_hkv_v_contiguous",
-        "state layout",
-    )
-
-    distribution = manifest.get("distribution")
-    _require_equal(
-        distribution,
-        {"cute_runtime_linkage": "static"},
-        "distribution metadata",
-    )
+    lock, lock_hash = load_source_lock()
+    verify_flashinfer_base(flashinfer_dir)
+    for path in (manifest_path.parent, *manifest_path.parent.parents):
+        if path.is_symlink():
+            raise ContractError(f"symlink in candidate path: {path}")
+    if ".." in manifest_path.parts:
+        raise ContractError("candidate path traversal")
+    artifacts = {}
+    for name, filename in {"manifest": "manifest.json", **ARTIFACT_FILES}.items():
+        path = manifest_path.parent / filename
+        if path.is_symlink() or not path.is_file():
+            raise ContractError(f"candidate must be a regular file: {path}")
+        if name != "manifest":
+            data = path.read_bytes()
+            if not data:
+                raise ContractError(f"empty candidate artifact: {path}")
+            artifacts[name] = data
+    # Reconstruct the whole document from project pins and actual artifact bytes,
+    # so extra/missing fields cannot be supplied by the candidate itself.
+    expected = build_manifest(artifacts=artifacts, source={
+        "flashinfer_commit": FROZEN_FLASHINFER_COMMIT,
+        "kernel_source_sha256": lock["patched_kernel_sha256"],
+        "source_lock_sha256": lock_hash,
+    })
+    _require_equal(manifest, expected, "complete candidate contract")
     return manifest
 
 
 def default_flashinfer_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "third_party" / "flashinfer"
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    candidate_parser = subparsers.add_parser("validate-candidate")
-    candidate_parser.add_argument("candidate", type=Path)
-    candidate_parser.add_argument("--flashinfer-dir", type=Path)
-    args = parser.parse_args()
-
-    try:
-        manifest = args.candidate / "manifest.json"
-        validate_manifest(manifest, flashinfer_dir=args.flashinfer_dir)
-        print(f"validated {args.candidate}")
-    except ContractError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
