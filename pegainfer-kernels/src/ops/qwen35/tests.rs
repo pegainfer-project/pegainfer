@@ -172,6 +172,27 @@ fn sm120_stable_in_place_abi_matches_upstream_layout_reference() -> Result<()> {
                 cu_seqlens == [0, chunk_tokens as i64],
                 "{case}: sequence metadata does not match the launched extent"
             );
+            if case == "t65" {
+                let mut short_q = HiddenStates::from_host(&ctx, &q_host[..q_width], q_width, 1)?;
+                short_q.seq_len = chunk_tokens;
+                let error = backend
+                    .launch_in_place(
+                        &ctx,
+                        &short_q,
+                        &k,
+                        &v,
+                        &alpha,
+                        &beta,
+                        &mut state,
+                        &mut output,
+                        &mut workspace,
+                    )
+                    .expect_err("logical shape must not exceed the nonempty Q allocation");
+                ensure!(
+                    error.to_string().contains("Qwen3.5 GDN Q backing len"),
+                    "short Q backing failed for the wrong reason: {error}"
+                );
+            }
             backend.launch_in_place(
                 &ctx,
                 &q,

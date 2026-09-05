@@ -58,6 +58,11 @@ unsafe impl Send for Qwen35GdnAot {}
 
 impl Qwen35GdnAot {
     pub fn load_for_production(ctx: &DeviceContext, geometry: Qwen35GdnGeometry) -> Result<Self> {
+        ensure!(
+            ctx.stream.context() == &ctx.ctx,
+            "Qwen3.5 GDN stream/context mismatch"
+        );
+        let device_ordinal = ctx.ctx.ordinal();
         let (major, minor) = ctx.ctx.compute_capability()?;
         let sm = major * 10 + minor;
         ensure!(
@@ -78,7 +83,7 @@ impl Qwen35GdnAot {
         );
         let mut raw = std::ptr::null_mut();
         let status =
-            unsafe { ffi::pegainfer_qwen35_gdn_create(&raw mut raw, ctx.device_ordinal as i32) };
+            unsafe { ffi::pegainfer_qwen35_gdn_create(&raw mut raw, device_ordinal as i32) };
         ensure!(
             status == STATUS_OK,
             "Qwen3.5 GDN preload failed with stable ABI status {status}"
@@ -96,7 +101,7 @@ impl Qwen35GdnAot {
         }
         Ok(Self {
             handle,
-            device_ordinal: ctx.device_ordinal,
+            device_ordinal,
             workspace_bytes,
         })
     }
@@ -121,6 +126,10 @@ impl Qwen35GdnAot {
         ctx: &DeviceContext,
         tokens: usize,
     ) -> Result<Qwen35GdnWorkspace> {
+        ensure!(
+            ctx.stream.context() == &ctx.ctx && ctx.ctx.ordinal() == self.device_ordinal,
+            "Qwen3.5 GDN workspace context mismatch"
+        );
         ensure!(
             tokens > 0 && tokens <= (i32::MAX as usize / Qwen35GdnGeometry::PRODUCTION.h_v),
             "Qwen3.5 GDN T must fit the generated i32 gate extent"
@@ -162,8 +171,25 @@ impl Qwen35GdnAot {
         );
         let t = q.seq_len;
         ensure!(
-            ctx.device_ordinal == self.device_ordinal,
+            ctx.stream.context().ordinal() == self.device_ordinal,
             "Qwen3.5 GDN device mismatch"
+        );
+        ensure!(
+            [
+                &ctx.ctx,
+                q.data.context(),
+                k.data.context(),
+                v.data.context(),
+                output.data.context(),
+                alpha.context(),
+                beta.context(),
+                state.context(),
+                launch_workspace.workspace.context(),
+                launch_workspace.cu_seqlens.context(),
+            ]
+            .into_iter()
+            .all(|context| context == ctx.stream.context()),
+            "Qwen3.5 GDN buffer/stream context mismatch"
         );
         ensure!(
             t > 0
@@ -188,6 +214,10 @@ impl Qwen35GdnAot {
                 && launch_workspace.tokens == t,
             "Qwen3.5 GDN buffer contract mismatch"
         );
+        q.checked_extent("Qwen3.5 GDN Q")?;
+        k.checked_extent("Qwen3.5 GDN K")?;
+        v.checked_extent("Qwen3.5 GDN V")?;
+        output.checked_extent("Qwen3.5 GDN output")?;
 
         let (q_ptr, _q) = q.data.device_ptr(&ctx.stream);
         let (k_ptr, _k) = k.data.device_ptr(&ctx.stream);
