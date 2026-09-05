@@ -18,10 +18,11 @@ from artifact_contract import (
     GEOMETRY,
     TARGET_ARCH,
     VARIANT,
-    compiler_path,
-    requirements_lock_path,
+    _COMPILER_PATH,
+    _REQUIREMENTS_LOCK_PATH,
+    inspect_kernel_source,
     sha256_file,
-    verify_prepared_flashinfer_source,
+    verify_flashinfer_base,
     write_json,
 )
 
@@ -201,8 +202,9 @@ def main() -> int:
     parser.add_argument("--metadata-out", required=True, type=Path)
     args = parser.parse_args()
 
-    source = verify_prepared_flashinfer_source(
-        args.flashinfer_dir, args.base_flashinfer_dir, upstream_layout=args.upstream_layout
+    commit = verify_flashinfer_base(args.base_flashinfer_dir)
+    source = inspect_kernel_source(
+        args.flashinfer_dir, commit, upstream_layout=args.upstream_layout
     )
     compiled, ptx = compile_kernel(args.flashinfer_dir.resolve())
     prefix = ("pegainfer_qwen35_gdn_upstream_hvk" if args.upstream_layout
@@ -218,8 +220,8 @@ def main() -> int:
         "flashinfer_commit": source["flashinfer_commit"],
         "kernel_source_sha256": source["kernel_source_sha256"],
         "source_lock_sha256": source["source_lock_sha256"],
-        "generator_sha256": sha256_file(compiler_path()),
-        "requirements_lock_sha256": sha256_file(requirements_lock_path()),
+        "generator_sha256": sha256_file(_COMPILER_PATH),
+        "requirements_lock_sha256": sha256_file(_REQUIREMENTS_LOCK_PATH),
         "toolchain": {
             "python": sys.version.split()[0],
             **ptx_metadata(ptx),

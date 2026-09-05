@@ -62,7 +62,7 @@ fn build_qwen35_flashinfer_gdn_aot(
     let mut linked_objects = Vec::new();
     let mut runtime_dir = None;
     let mut config = String::from(
-        "#pragma once\n#define PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256 \"unavailable\"\n#define PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM 128u\n",
+        "#pragma once\n#define PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256 \"unavailable\"\n",
     );
 
     if let Some(bundle) = std::env::var_os(QWEN35_GDN_AOT_ENV) {
@@ -1989,11 +1989,8 @@ fn main() {
     let k3_enabled = cfg!(feature = "k3");
     let qwen35_enabled = cfg!(feature = "qwen35");
     #[cfg(feature = "qwen35")]
-    let (qwen35_gdn_objects, qwen35_gdn_runtime_dir) = if qwen35_enabled {
-        build_qwen35_flashinfer_gdn_aot(&crate_root(), &out_dir, &cuda_include)
-    } else {
-        (Vec::new(), None)
-    };
+    let (qwen35_gdn_objects, qwen35_gdn_runtime_dir) =
+        build_qwen35_flashinfer_gdn_aot(&crate_root(), &out_dir, &cuda_include);
     #[cfg(not(feature = "qwen35"))]
     let (qwen35_gdn_objects, qwen35_gdn_runtime_dir) = (Vec::new(), None::<PathBuf>);
     if glm52_enabled {

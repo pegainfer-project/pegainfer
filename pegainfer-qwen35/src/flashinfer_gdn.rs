@@ -4,7 +4,6 @@
 //! `pegainfer-kernels`. This module owns only model policy, prepared tensors,
 //! and recurrent state.
 
-use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use pegainfer_core::tensor::DeviceContext;
@@ -15,7 +14,6 @@ use pegainfer_kernels::ops::Qwen35GdnWorkspace;
 
 use crate::config::Config35;
 use crate::prefill_buffers::GdnPrepareScratch35;
-use crate::weights::Qwen35Model;
 
 pub(crate) struct FlashInferGdnChunkResources {
     pub(crate) prepare: GdnPrepareScratch35,
@@ -109,13 +107,5 @@ pub(crate) fn model_geometry(config: &Config35) -> Qwen35GdnGeometry {
         h_k: config.linear_num_key_heads,
         h_v: config.linear_num_value_heads,
         head_dim: config.linear_key_head_dim,
-    }
-}
-
-impl Qwen35Model {
-    pub(super) fn flashinfer_gdn(&self) -> Result<&Qwen35GdnAot> {
-        self.flashinfer_gdn
-            .as_ref()
-            .context("FlashInfer GDN was not selected when loading this model")
     }
 }

@@ -14,6 +14,7 @@ from pathlib import Path
 from artifact_contract import (
     VARIANT,
     ContractError,
+    _COMPILER_PATH,
     package_candidate,
     prepare_flashinfer_source,
     validate_manifest,
@@ -37,13 +38,12 @@ def main() -> int:
             prepared = temp / "patched-flashinfer"
             source = prepare_flashinfer_source(args.flashinfer_dir, prepared)
             staged = temp / "candidate"
-            compiler = Path(__file__).with_name("compile_sm120.py")
             raw_dir = temp / "raw"
             metadata_path = raw_dir / "compile-metadata.json"
             subprocess.run(
                 [
                     str(args.python),
-                    str(compiler),
+                    str(_COMPILER_PATH),
                     "--flashinfer-dir",
                     str(prepared),
                     "--base-flashinfer-dir",

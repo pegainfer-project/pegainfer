@@ -100,10 +100,9 @@ pub enum Qwen35DecodeOverlap {
 }
 
 /// GDN prefill implementation requested when loading Qwen3.5.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 enum Qwen35GdnBackend {
     /// Use the existing Triton implementation, irrespective of linked candidates.
-    #[default]
     Triton,
     /// Use the build-linked SM120/Hv32/TP1 candidate; unsupported loads fail.
     #[value(name = "flashinfer-candidate")]

@@ -30,22 +30,19 @@ impl GdnPrepareScratch35 {
     pub(crate) fn new(ctx: &DeviceContext, seq_len: usize) -> Result<Self> {
         anyhow::ensure!(seq_len > 0, "native GDN prepare requires T>=1");
 
-        const H_Q: usize = 16;
-        const H_K: usize = 16;
-        const H_V: usize = 32;
-        const HEAD_DIM: usize = 128;
+        let geometry = pegainfer_kernels::ops::Qwen35GdnGeometry::PRODUCTION;
 
         Ok(Self {
-            q: HiddenStates::zeros(ctx, H_Q * HEAD_DIM, seq_len)?,
-            k: HiddenStates::zeros(ctx, H_K * HEAD_DIM, seq_len)?,
-            v: HiddenStates::zeros(ctx, H_V * HEAD_DIM, seq_len)?,
+            q: HiddenStates::zeros(ctx, geometry.h_q * geometry.head_dim, seq_len)?,
+            k: HiddenStates::zeros(ctx, geometry.h_k * geometry.head_dim, seq_len)?,
+            v: HiddenStates::zeros(ctx, geometry.h_v * geometry.head_dim, seq_len)?,
             alpha: ctx
                 .stream
-                .alloc_zeros(seq_len * H_V)
+                .alloc_zeros(seq_len * geometry.h_v)
                 .map_err(|e| anyhow::anyhow!("Alloc native GDN alpha failed: {e}"))?,
             beta: ctx
                 .stream
-                .alloc_zeros(seq_len * H_V)
+                .alloc_zeros(seq_len * geometry.h_v)
                 .map_err(|e| anyhow::anyhow!("Alloc native GDN beta failed: {e}"))?,
         })
     }

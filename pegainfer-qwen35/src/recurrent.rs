@@ -192,57 +192,59 @@ pub(crate) fn gated_delta_rule_prefill_native_prepare_into(
     a_log: &CudaSlice<f32>,
     scratch: &mut GdnPrepareScratch35,
 ) -> Result<()> {
-    const H_Q: usize = 16;
-    const H_K: usize = 16;
-    const H_V: usize = 32;
-    const HEAD_DIM: usize = 128;
+    let geometry = pegainfer_kernels::ops::Qwen35GdnGeometry::PRODUCTION;
     anyhow::ensure!(qkv.seq_len > 0, "native GDN prepare requires T>=1");
-    let expected_qkv = (H_Q + H_K + H_V) * HEAD_DIM;
+    let expected_qkv = (geometry.h_q + geometry.h_k + geometry.h_v) * geometry.head_dim;
     anyhow::ensure!(
         qkv.hidden_dim == expected_qkv,
         "native GDN qkv hidden dim mismatch: expected {expected_qkv}, got {}",
         qkv.hidden_dim
     );
     anyhow::ensure!(
-        b_proj.hidden_dim == H_V && b_proj.seq_len == qkv.seq_len,
+        b_proj.hidden_dim == geometry.h_v && b_proj.seq_len == qkv.seq_len,
         "native GDN b projection must be [T,Hv]=[{},{}]",
         qkv.seq_len,
-        H_V
+        geometry.h_v
     );
     anyhow::ensure!(
-        a_proj.hidden_dim == H_V && a_proj.seq_len == qkv.seq_len,
+        a_proj.hidden_dim == geometry.h_v && a_proj.seq_len == qkv.seq_len,
         "native GDN a projection must be [T,Hv]=[{},{}]",
         qkv.seq_len,
-        H_V
+        geometry.h_v
     );
     anyhow::ensure!(
-        dt_bias.len == H_V,
-        "native GDN dt_bias length must be {H_V}, got {}",
+        dt_bias.len == geometry.h_v,
+        "native GDN dt_bias length must be {}, got {}",
+        geometry.h_v,
         dt_bias.len
     );
     anyhow::ensure!(
-        a_log.len() == H_V,
-        "native GDN A_log length must be {H_V}, got {}",
+        a_log.len() == geometry.h_v,
+        "native GDN A_log length must be {}, got {}",
+        geometry.h_v,
         a_log.len()
     );
     anyhow::ensure!(
-        scratch.q.hidden_dim == H_Q * HEAD_DIM && scratch.q.seq_len == qkv.seq_len,
+        scratch.q.hidden_dim == geometry.h_q * geometry.head_dim
+            && scratch.q.seq_len == qkv.seq_len,
         "native GDN Q output shape mismatch"
     );
     anyhow::ensure!(
-        scratch.k.hidden_dim == H_K * HEAD_DIM && scratch.k.seq_len == qkv.seq_len,
+        scratch.k.hidden_dim == geometry.h_k * geometry.head_dim
+            && scratch.k.seq_len == qkv.seq_len,
         "native GDN K output shape mismatch"
     );
     anyhow::ensure!(
-        scratch.v.hidden_dim == H_V * HEAD_DIM && scratch.v.seq_len == qkv.seq_len,
+        scratch.v.hidden_dim == geometry.h_v * geometry.head_dim
+            && scratch.v.seq_len == qkv.seq_len,
         "native GDN V output shape mismatch"
     );
     anyhow::ensure!(
-        scratch.alpha.len() == qkv.seq_len * H_V,
+        scratch.alpha.len() == qkv.seq_len * geometry.h_v,
         "native GDN alpha output length mismatch"
     );
     anyhow::ensure!(
-        scratch.beta.len() == qkv.seq_len * H_V,
+        scratch.beta.len() == qkv.seq_len * geometry.h_v,
         "native GDN beta output length mismatch"
     );
     let tokens: i32 = qkv

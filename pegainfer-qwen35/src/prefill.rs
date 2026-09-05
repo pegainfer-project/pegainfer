@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -480,61 +481,58 @@ impl Qwen35Model {
         );
 
         let mut normed_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-        match gdn_scratch {
-            GdnPrefillChunkScratch::Triton(scratch) => {
-                let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-                ops::gated_delta_rule_prefill_chunkwise_into(
-                    &self.ctx,
-                    &qkv_conv_batch,
-                    &b_batch,
-                    &a_batch,
-                    &attn.dt_bias,
-                    &attn.a_log,
-                    &mut layer_state.state,
-                    scratch,
-                    &mut gdr_out_batch,
-                    c.linear_num_key_heads,
-                    c.linear_num_value_heads,
-                    c.linear_key_head_dim,
-                    c.linear_value_head_dim,
-                )?;
-                ops::rms_norm_gated_batch_into(
-                    &self.ctx,
-                    &gdr_out_batch,
-                    &attn.norm_weight,
-                    &z_batch,
-                    &mut normed_out_batch,
-                    c.linear_num_value_heads,
-                    c.linear_value_head_dim,
-                    c.rms_norm_eps,
-                );
-            }
-            GdnPrefillChunkScratch::FlashInfer(resources) => {
-                ops::gated_delta_rule_prefill_native_prepare_into(
-                    &self.ctx,
-                    &qkv_conv_batch,
-                    &b_batch,
-                    &a_batch,
-                    &attn.dt_bias,
-                    &attn.a_log,
-                    &mut resources.prepare,
-                )?;
-                resources.launch_in_place(
-                    &self.ctx,
-                    self.flashinfer_gdn()?,
-                    &mut layer_state.state,
-                )?;
-                ops::rms_norm_gated_batch_into(
-                    &self.ctx,
-                    &resources.output,
-                    &attn.norm_weight,
-                    &z_batch,
-                    &mut normed_out_batch,
-                    c.linear_num_value_heads,
-                    c.linear_value_head_dim,
-                    c.rms_norm_eps,
-                );
-            }
+        {
+            let mut triton_output;
+            let gdr_output = match gdn_scratch {
+                GdnPrefillChunkScratch::Triton(scratch) => {
+                    triton_output = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+                    ops::gated_delta_rule_prefill_chunkwise_into(
+                        &self.ctx,
+                        &qkv_conv_batch,
+                        &b_batch,
+                        &a_batch,
+                        &attn.dt_bias,
+                        &attn.a_log,
+                        &mut layer_state.state,
+                        scratch,
+                        &mut triton_output,
+                        c.linear_num_key_heads,
+                        c.linear_num_value_heads,
+                        c.linear_key_head_dim,
+                        c.linear_value_head_dim,
+                    )?;
+                    &triton_output
+                }
+                GdnPrefillChunkScratch::FlashInfer(resources) => {
+                    ops::gated_delta_rule_prefill_native_prepare_into(
+                        &self.ctx,
+                        &qkv_conv_batch,
+                        &b_batch,
+                        &a_batch,
+                        &attn.dt_bias,
+                        &attn.a_log,
+                        &mut resources.prepare,
+                    )?;
+                    resources.launch_in_place(
+                        &self.ctx,
+                        self.flashinfer_gdn
+                            .as_ref()
+                            .context("FlashInfer GDN was not selected when loading this model")?,
+                        &mut layer_state.state,
+                    )?;
+                    &resources.output
+                }
+            };
+            ops::rms_norm_gated_batch_into(
+                &self.ctx,
+                gdr_output,
+                &attn.norm_weight,
+                &z_batch,
+                &mut normed_out_batch,
+                c.linear_num_value_heads,
+                c.linear_value_head_dim,
+                c.rms_norm_eps,
+            );
         }
 
         *linear_idx += 1;

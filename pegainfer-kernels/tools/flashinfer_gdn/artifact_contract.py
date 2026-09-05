@@ -14,7 +14,10 @@ from typing import Any
 
 # One project-owned frozen contract is read by both generation and the independent
 # Rust pre-link validator. Artifact values never supply their own expected pins.
-_FROZEN_LOCK = json.loads(Path(__file__).with_name("source-lock.json").read_text())
+_SOURCE_LOCK_PATH = Path(__file__).with_name("source-lock.json")
+_REQUIREMENTS_LOCK_PATH = Path(__file__).with_name("requirements-cu13.lock")
+_COMPILER_PATH = Path(__file__).with_name("compile_sm120.py")
+_FROZEN_LOCK = json.loads(_SOURCE_LOCK_PATH.read_text())
 FROZEN_CONTRACT = _FROZEN_LOCK["contract"]
 VARIANT = FROZEN_CONTRACT["variant"]
 TARGET_ARCH = FROZEN_CONTRACT["target"]["arch"]
@@ -60,20 +63,8 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
     )
 
 
-def source_lock_path() -> Path:
-    return Path(__file__).with_name("source-lock.json")
-
-
-def requirements_lock_path() -> Path:
-    return Path(__file__).with_name("requirements-cu13.lock")
-
-
-def compiler_path() -> Path:
-    return Path(__file__).with_name("compile_sm120.py")
-
-
 def load_source_lock() -> tuple[dict[str, Any], str]:
-    path = source_lock_path()
+    path = _SOURCE_LOCK_PATH
     lock = read_json(path)
     patches = lock.get("patches")
     if not isinstance(patches, list) or len(patches) != 1:
@@ -145,7 +136,7 @@ def prepare_flashinfer_source(
         raise ContractError(f"refusing to overwrite prepared source: {destination}")
     shutil.copytree(flashinfer_dir / "flashinfer", destination / "flashinfer")
     for patch in lock["patches"]:
-        patch_path = source_lock_path().parent / patch["path"]
+        patch_path = _SOURCE_LOCK_PATH.parent / patch["path"]
         patch_text = patch_path.read_text()
         if upstream_layout:
             # Keep only export type annotations. Both layout hunks are omitted,
@@ -164,13 +155,6 @@ def prepare_flashinfer_source(
             detail = result.stderr.strip() or result.stdout.strip()
             raise ContractError(f"failed to apply HKV patch: {detail}")
     return inspect_kernel_source(destination, commit, upstream_layout=upstream_layout)
-
-
-def verify_prepared_flashinfer_source(
-    source_dir: Path, flashinfer_dir: Path, *, upstream_layout: bool = False
-) -> dict[str, Any]:
-    commit = verify_flashinfer_base(flashinfer_dir)
-    return inspect_kernel_source(source_dir, commit, upstream_layout=upstream_layout)
 
 
 def _require_equal(actual: Any, expected: Any, label: str) -> None:
@@ -198,12 +182,12 @@ def validate_compile_metadata(
         _require_equal(metadata.get(key), source[key], f"compile metadata {key}")
     _require_equal(
         metadata.get("generator_sha256"),
-        sha256_file(compiler_path()),
+        sha256_file(_COMPILER_PATH),
         "compile metadata generator hash",
     )
     _require_equal(
         metadata.get("requirements_lock_sha256"),
-        sha256_file(requirements_lock_path()),
+        sha256_file(_REQUIREMENTS_LOCK_PATH),
         "compile metadata requirements lock hash",
     )
     aot = metadata.get("aot")
@@ -224,8 +208,8 @@ def build_manifest(
         **FROZEN_CONTRACT,
         "source": {
             **source,
-            "generator_sha256": sha256_file(compiler_path()),
-            "requirements_lock_sha256": sha256_file(requirements_lock_path()),
+            "generator_sha256": sha256_file(_COMPILER_PATH),
+            "requirements_lock_sha256": sha256_file(_REQUIREMENTS_LOCK_PATH),
         },
         "artifact": {
             "format": "elf_relocatable_with_embedded_cubin",
@@ -243,7 +227,7 @@ def package_candidate(
     compile_metadata_path: Path,
     output_dir: Path,
     source: dict[str, Any],
-) -> Path:
+) -> None:
     if output_dir.exists():
         raise ContractError(f"refusing to overwrite existing output directory: {output_dir}")
     metadata = read_json(compile_metadata_path)
@@ -275,9 +259,7 @@ def package_candidate(
     output_dir.mkdir(parents=True)
     for name, filename in ARTIFACT_FILES.items():
         (output_dir / filename).write_bytes(artifacts[name])
-    manifest_path = output_dir / "manifest.json"
-    write_json(manifest_path, manifest)
-    return manifest_path
+    write_json(output_dir / "manifest.json", manifest)
 
 
 def validate_manifest(
