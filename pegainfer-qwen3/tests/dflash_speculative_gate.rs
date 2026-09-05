@@ -35,10 +35,13 @@
 //! Runs the two engines sequentially (baseline dropped before the speculative
 //! engine loads) so only one Qwen3-4B is resident at a time.
 //!
-//! Requires a CUDA GPU, Qwen3-4B weights, and the DFlash drafter. Set
-//! `PEGAINFER_TEST_MODEL_PATH` (target) and `PEGAINFER_DFLASH_TEST_MODEL_PATH`
-//! (drafter); skips cleanly when either is absent.
+//! Requires a CUDA GPU, Qwen3-4B weights, and a drafter. Legacy gates use
+//! `PEGAINFER_DFLASH_TEST_MODEL_PATH` and skip when weights are absent. The
+//! ignored native-selector gate requires `PEGAINFER_DFLASH2_TEST_MODEL_PATH`
+//! and fails when its explicitly requested checkpoint is not usable.
 
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -63,6 +66,7 @@ use common::harness::request;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B-DFlash-b16");
+const DFLASH2_PATH_ENV: &str = "PEGAINFER_DFLASH2_TEST_MODEL_PATH";
 const GENERATED_TOKENS: usize = 64;
 /// Top-K logprobs requested from the baseline; wide enough that the speculative
 /// pick is in the set on any real tie (a pick outside the top-K is itself a red
@@ -105,6 +109,125 @@ fn draft_path_or_skip() -> Option<String> {
             );
             None
         }
+    }
+}
+
+fn required_model_path(name: &str) -> String {
+    let path = std::env::var(name).unwrap_or_else(|_| panic!("set {name} to run this test"));
+    assert!(
+        Path::new(&path).join("config.json").is_file(),
+        "{name}={path:?} has no config.json"
+    );
+    path
+}
+
+fn native_dflash2_path() -> String {
+    let path = required_model_path(DFLASH2_PATH_ENV);
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&path).join("config.json"))
+            .expect("read native DFlash2 config"),
+    )
+    .expect("parse native DFlash2 config");
+    assert_eq!(
+        config
+            .get("speculators_model_type")
+            .and_then(serde_json::Value::as_str),
+        Some("dflash2"),
+        "native selector gate requires speculators_model_type=dflash2"
+    );
+    assert!(
+        config
+            .get("architectures")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value == "DFlash2DraftModel")),
+        "native selector gate requires DFlash2DraftModel"
+    );
+    path
+}
+
+struct DFlash2Phase1View {
+    _temp_dir: Option<tempfile::TempDir>,
+    path: PathBuf,
+}
+
+/// Remove only Phase 2 capability declarations for the selector gate while
+/// sharing the source checkpoint's real weight files.
+fn dflash2_phase1_view(source: &Path) -> DFlash2Phase1View {
+    let config_path = source.join("config.json");
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&config_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display())),
+    )
+    .unwrap_or_else(|e| panic!("parse {}: {e}", config_path.display()));
+    let mut phase1_config = config;
+    let mut changed = false;
+    if let Some(root) = phase1_config.as_object_mut() {
+        changed |= root.remove("conv_kernel_size").is_some();
+        changed |= root.remove("conv_group_size").is_some();
+        changed |= root.remove("sliding_window_non_causal").is_some();
+    }
+    if let Some(transformer) = phase1_config
+        .get_mut("transformer_layer_config")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        changed |= transformer.remove("sliding_window").is_some();
+        changed |= transformer.remove("use_sliding_window").is_some();
+        changed |= transformer.remove("layer_types").is_some();
+    }
+    if !changed {
+        return DFlash2Phase1View {
+            _temp_dir: None,
+            path: source.to_path_buf(),
+        };
+    }
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("pegainfer-dflash2-phase1-")
+        .tempdir_in(source.parent().unwrap_or_else(|| Path::new(".")))
+        .unwrap_or_else(|e| panic!("create native DFlash2 test view: {e}"));
+    fs::write(
+        temp_dir.path().join("config.json"),
+        serde_json::to_vec_pretty(&phase1_config).expect("serialize native DFlash2 test config"),
+    )
+    .unwrap_or_else(|e| panic!("write native DFlash2 test config: {e}"));
+
+    let single_file = source.join("model.safetensors");
+    if single_file.is_file() {
+        fs::hard_link(&single_file, temp_dir.path().join("model.safetensors"))
+            .unwrap_or_else(|e| panic!("link {} into test view: {e}", single_file.display()));
+    } else {
+        let index_path = source.join("model.safetensors.index.json");
+        fs::copy(
+            &index_path,
+            temp_dir.path().join("model.safetensors.index.json"),
+        )
+        .unwrap_or_else(|e| panic!("copy {}: {e}", index_path.display()));
+        let index: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&index_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", index_path.display())),
+        )
+        .unwrap_or_else(|e| panic!("parse {}: {e}", index_path.display()));
+        let shard_files: BTreeSet<&str> = index
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .expect("native DFlash2 index has weight_map")
+            .values()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("native DFlash2 shard name is a string")
+            })
+            .collect();
+        for shard_file in shard_files {
+            let source_shard = source.join(shard_file);
+            fs::hard_link(&source_shard, temp_dir.path().join(shard_file))
+                .unwrap_or_else(|e| panic!("link {} into test view: {e}", source_shard.display()));
+        }
+    }
+
+    DFlash2Phase1View {
+        path: temp_dir.path().to_path_buf(),
+        _temp_dir: Some(temp_dir),
     }
 }
 
@@ -419,6 +542,67 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
         failures.is_empty(),
         "speculative greedy decode is not lossless:\n{}",
         failures.join("\n")
+    );
+}
+
+/// Production gate for the native DFlash2 selector. The native schema guarantees
+/// that the speculative launch dispatches through the CUDA top-k and path-walk
+/// kernels; target verification must still produce a lossless greedy continuation.
+#[test]
+#[ignore = "requires CUDA, Qwen3-4B, and a selector-only native DFlash2 checkpoint"]
+fn dflash2_native_selector_greedy_gate() {
+    const NATIVE_GENERATED_TOKENS: usize = 32;
+
+    let model_path = required_model_path("PEGAINFER_TEST_MODEL_PATH");
+    let draft_path = native_dflash2_path();
+    let dflash2_view = dflash2_phase1_view(Path::new(&draft_path));
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let prompt = "def fibonacci(n):";
+    let tokenizer = common::load_tokenizer(&model_path);
+    let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
+
+    let baseline = {
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start baseline engine"),
+        );
+        let output = generate(
+            &engine,
+            prompt_tokens.clone(),
+            LOGPROBS,
+            NATIVE_GENERATED_TOKENS,
+        );
+        drop(engine);
+        std::thread::sleep(Duration::from_secs(2));
+        output
+    };
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(dflash2_view.path)),
+        )
+        .expect("failed to load native DFlash2 selector checkpoint"),
+    );
+    let speculative = generate(&engine, prompt_tokens.clone(), 0, NATIVE_GENERATED_TOKENS);
+    let result = check_lossless(
+        &engine,
+        &tokenizer,
+        0,
+        prompt,
+        &prompt_tokens,
+        &baseline,
+        &speculative,
+    );
+    drop(engine);
+
+    assert!(
+        result.is_ok(),
+        "native DFlash2 selector is not greedy-lossless:\n{}",
+        result.unwrap_err()
     );
 }
 

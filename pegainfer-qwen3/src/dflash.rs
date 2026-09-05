@@ -6,6 +6,8 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
+use selector::SelectorScratch;
+use selector::SelectorWeights;
 
 use crate::config::DFlashConfig;
 use crate::dspark::MarkovHead;
@@ -14,7 +16,9 @@ use crate::weights::Qwen3Model;
 use crate::weights::TransformerBlock;
 
 mod loading;
+mod manifest;
 mod reservation;
+pub(crate) mod selector;
 
 pub(crate) use reservation::DFlashMemoryReservation;
 
@@ -30,6 +34,10 @@ pub(crate) struct DFlashDraftModel {
     /// draft proposes via [`MarkovHead::sample_block`] (anchor-first, all
     /// `block_size` positions) instead of an independent per-position argmax.
     markov: Option<MarkovHead>,
+    /// DFlash2 selector, mutually exclusive with the DSpark Markov head.
+    selector: Option<SelectorWeights>,
+    /// Native untied DFlash2 output head; tied checkpoints reuse the target.
+    draft_lm_head: Option<DeviceMatrix>,
 }
 
 pub(crate) struct DFlashRequestState {
@@ -95,6 +103,8 @@ pub(crate) struct DFlashBatchScratch {
     v_tail: HiddenStates,
     // DSpark Markov sample-loop scratch; `None` for plain DFlash drafters.
     markov: Option<MarkovScratch>,
+    // DFlash2 selector scratch; absent for legacy drafters.
+    selector: Option<SelectorScratch>,
 }
 
 impl DFlashRequestState {
@@ -260,6 +270,10 @@ impl DFlashBatchScratch {
                 .uses_markov_head()
                 .then(|| MarkovScratch::new(ctx, config, max_decode_batch_size))
                 .transpose()?,
+            selector: config
+                .uses_selector()
+                .then(|| SelectorScratch::new(ctx, config, max_decode_batch_size))
+                .transpose()?,
         })
     }
 
@@ -346,6 +360,10 @@ impl DFlashDraftModel {
 
     pub(crate) fn uses_markov_head(&self) -> bool {
         self.markov.is_some()
+    }
+
+    pub(crate) fn uses_selector(&self) -> bool {
+        self.selector.is_some()
     }
 
     /// Anchor-first block layout (a checkpoint property, see
@@ -765,7 +783,7 @@ impl DFlashDraftModel {
         for (i, state) in states.iter_mut().enumerate() {
             state.committed_len += context_lens[i];
         }
-        self.compute_logits_with_target_head_into(target, scratch);
+        self.compute_logits_into(target, scratch);
         Ok(&scratch.logits)
     }
 
@@ -799,6 +817,37 @@ impl DFlashDraftModel {
             current_tokens,
             self.block_size(),
             markov_scratch,
+        )
+    }
+
+    /// Select one bounded path per request from the draft outputs.
+    pub(crate) fn selector_draft_tokens(
+        &self,
+        ctx: &DeviceContext,
+        current_tokens: &[u32],
+        scratch: &mut DFlashBatchScratch,
+    ) -> Result<Vec<u32>> {
+        let selector = self
+            .selector
+            .as_ref()
+            .context("selector_draft_tokens called on a non-selector drafter")?;
+        let DFlashBatchScratch {
+            logits,
+            logits_normed,
+            selector: selector_scratch,
+            ..
+        } = scratch;
+        let selector_scratch = selector_scratch
+            .as_mut()
+            .context("selector scratch was not allocated for this drafter")?;
+        selector.select_block(
+            ctx,
+            logits,
+            logits_normed,
+            current_tokens,
+            self.block_size(),
+            self.anchor_first(),
+            selector_scratch,
         )
     }
 
@@ -867,7 +916,7 @@ impl DFlashDraftModel {
     }
 
     fn context_feature_dim(&self) -> usize {
-        self.config.hidden_size * self.target_layer_ids().len()
+        self.config.target_hidden_size * self.target_layer_ids().len()
     }
 
     fn project_context_into(
@@ -891,11 +940,7 @@ impl DFlashDraftModel {
         );
     }
 
-    fn compute_logits_with_target_head_into(
-        &self,
-        target: &Qwen3Model,
-        scratch: &mut DFlashBatchScratch,
-    ) {
+    fn compute_logits_into(&self, target: &Qwen3Model, scratch: &mut DFlashBatchScratch) {
         let ctx = target.device_ctx();
         ops::rms_norm_batch_into(
             ctx,
@@ -904,9 +949,13 @@ impl DFlashDraftModel {
             self.config.rms_norm_eps,
             &mut scratch.logits_normed,
         );
+        let output_projection = self
+            .draft_lm_head
+            .as_ref()
+            .unwrap_or_else(|| target.output_projection());
         ops::gemm_into(
             ctx,
-            target.output_projection(),
+            output_projection,
             &scratch.logits_normed,
             &mut scratch.logits,
         );

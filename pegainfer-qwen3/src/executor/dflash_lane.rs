@@ -337,6 +337,11 @@ impl LocalQwen3Lane {
             // Propose tokens from the base logits. DFlash takes an independent
             // greedy argmax per position; DSpark adds the Markov bias and samples
             // the block left-to-right (anchor-first, all `block_size` positions).
+            // Selector checkpoints own their proposal path and do not use
+            // the DSpark hedge ladder. Clear any stale chains from a prior
+            // round before dispatching the configured proposer.
+            hedge_blocks.clear();
+            *round_chains = 0;
             let markov = model.uses_markov_head();
             let hedge_positions = if *hedge_cap > 0 {
                 hedge_branch_positions.as_slice()
@@ -350,7 +355,6 @@ impl LocalQwen3Lane {
             // lane-side; the draft/verify token-span seam is unchanged (the
             // scheduler never sees hedge chains). Skipped when the ladder
             // would exceed the Markov scratch's max batch.
-            hedge_blocks.clear();
             // Auto mode: the controller picks how many of the configured
             // positions to ladder this round. Always a PREFIX — runner
             // stripes are indexed by position order, so prefixes keep the
@@ -409,7 +413,9 @@ impl LocalQwen3Lane {
             );
             let hedging = ladder_chains > 0 && !hedged.is_empty();
             *round_chains = if hedging { ladder_chains } else { 0 };
-            let sampled = if markov {
+            let sampled = if model.uses_selector() {
+                model.selector_draft_tokens(self.model.device_ctx(), &current_tokens, scratch)?
+            } else if markov {
                 if hedging {
                     let ctx = self.model.device_ctx();
                     let chain_a = model.markov_draft_with_runners(
