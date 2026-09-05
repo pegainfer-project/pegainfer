@@ -132,9 +132,8 @@ impl SlidingLocalKv {
     }
 
     /// Move the frontier without releasing anything: the overlapped
-    /// prefill defers its release to join time, and the eviction A/B pins
-    /// the footprint. Everything else goes through
-    /// [`Self::advance_and_release`].
+    /// prefill defers its release to join time. Everything else goes
+    /// through [`Self::advance_and_release`].
     pub(crate) fn advance(&mut self, count: usize) {
         self.frontier += count;
     }
@@ -170,16 +169,16 @@ pub(crate) struct GemmaKv {
     pub(crate) global: KvState,
 }
 
-/// A refused side drops the other reservation, leaving both pools at their
-/// pre-request occupancy. The page count is the exact frontier account: a
-/// ceiling over the post-step kv_len, per family.
 /// Pages a family still has to reserve to cover `kv_len` tokens, given what
-/// its account already holds. `None` means the account is already past the
-/// frontier — a bookkeeping error, not a surplus to spend.
+/// its account already holds — the exact frontier account, a ceiling over
+/// the post-step kv_len. `None` means the account is already past the
+/// frontier: a bookkeeping error, not a surplus to spend.
 pub(crate) fn pages_to_reserve(kv_len: usize, accounted: usize, page_size: usize) -> Option<usize> {
     kv_len.div_ceil(page_size).checked_sub(accounted)
 }
 
+/// Atomic across the two pools: a refused side drops the other side's
+/// reservation, leaving both pools at their pre-request occupancy.
 pub(crate) fn admit_tokens(
     local_pool: &KvPool,
     global_pool: &KvPool,

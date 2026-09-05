@@ -249,6 +249,8 @@ __global__ void markov_step_partial_kernel(
     const __nv_bfloat16* __restrict__ bias,
     int block_size,
     int step,
+    int chains,
+    const int* __restrict__ req_map,
     float* __restrict__ partial_values,
     int* __restrict__ partial_indices,
     int rows,
@@ -267,7 +269,11 @@ __global__ void markov_step_partial_kernel(
   int end = start + MARKOV_STEP_TILE_ELEMS;
   if (end > n) end = n;
   const __nv_bfloat16* base_row =
-      base + static_cast<size_t>(row * block_size + step) * n;
+      base +
+      static_cast<size_t>(
+          (req_map ? req_map[row / chains] : (row / chains)) * block_size +
+          step) *
+          n;
   const __nv_bfloat16* bias_row = bias + static_cast<size_t>(row) * n;
   int tid = threadIdx.x;
 
@@ -356,6 +362,166 @@ __global__ void markov_step_finalize_kernel(
   }
 }
 
+// Top-2 over `base[(row*block_size + step)*n + v] + bias[row*n + v]` — exact
+// when a row has two or more finite candidates; a fully masked row emits
+// index 0 for both slots (callers deduplicate).
+// The single-best partial kernel above cannot back a top-2: when the winner
+// and runner-up land in the same tile, the tile's top-1 partial has already
+// discarded the runner-up. So the partial stage tracks a (top1, top2) pair per
+// tile and the finalize merges pairs. Used by the speculative hedge to open a
+// second draft chain at the runner-up token.
+__device__ __forceinline__ void top2_consider(float val, int idx, float& v1,
+                                              int& i1, float& v2, int& i2) {
+  if (argmax_better(val, idx, v1, i1)) {
+    v2 = v1;
+    i2 = i1;
+    v1 = val;
+    i1 = idx;
+  } else if (argmax_better(val, idx, v2, i2)) {
+    v2 = val;
+    i2 = idx;
+  }
+}
+
+__global__ void markov_step_top2_partial_kernel(
+    const __nv_bfloat16* __restrict__ base,
+    const __nv_bfloat16* __restrict__ bias,
+    int block_size,
+    int step,
+    int chains,
+    float* __restrict__ partial_v1,
+    int* __restrict__ partial_i1,
+    float* __restrict__ partial_v2,
+    int* __restrict__ partial_i2,
+    int rows,
+    int n,
+    int tiles_per_row) {
+  extern __shared__ char shared_mem[];
+  float* sv1 = reinterpret_cast<float*>(shared_mem);
+  float* sv2 = sv1 + blockDim.x;
+  int* si1 = reinterpret_cast<int*>(sv2 + blockDim.x);
+  int* si2 = si1 + blockDim.x;
+
+  int tile = blockIdx.x;
+  int row = blockIdx.y;
+  if (row >= rows || tile >= tiles_per_row) return;
+
+  int start = tile * MARKOV_STEP_TILE_ELEMS;
+  int end = start + MARKOV_STEP_TILE_ELEMS;
+  if (end > n) end = n;
+  const __nv_bfloat16* base_row =
+      base + static_cast<size_t>((row / chains) * block_size + step) * n;
+  const __nv_bfloat16* bias_row = bias + static_cast<size_t>(row) * n;
+  int tid = threadIdx.x;
+
+  float v1 = -INFINITY, v2 = -INFINITY;
+  int i1 = 0, i2 = 0;
+  for (int i = start + tid; i < end; i += blockDim.x) {
+    float val = __bfloat162float(base_row[i]) + __bfloat162float(bias_row[i]);
+    top2_consider(val, i, v1, i1, v2, i2);
+  }
+  sv1[tid] = v1;
+  si1[tid] = i1;
+  sv2[tid] = v2;
+  si2[tid] = i2;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      top2_consider(sv1[tid + s], si1[tid + s], sv1[tid], si1[tid], sv2[tid],
+                    si2[tid]);
+      top2_consider(sv2[tid + s], si2[tid + s], sv1[tid], si1[tid], sv2[tid],
+                    si2[tid]);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    int out = row * tiles_per_row + tile;
+    partial_v1[out] = sv1[0];
+    partial_i1[out] = si1[0];
+    partial_v2[out] = sv2[0];
+    partial_i2[out] = si2[0];
+  }
+}
+
+__global__ void markov_step_top2_finalize_kernel(
+    const float* __restrict__ partial_v1,
+    const int* __restrict__ partial_i1,
+    const float* __restrict__ partial_v2,
+    const int* __restrict__ partial_i2,
+    unsigned int* __restrict__ out_tokens,
+    unsigned int* __restrict__ sampled_tokens,
+    unsigned int* __restrict__ out_top2,
+    int block_size,
+    int step,
+    int rows,
+    int tiles_per_row) {
+  extern __shared__ char shared_mem[];
+  float* sv1 = reinterpret_cast<float*>(shared_mem);
+  float* sv2 = sv1 + blockDim.x;
+  int* si1 = reinterpret_cast<int*>(sv2 + blockDim.x);
+  int* si2 = si1 + blockDim.x;
+
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+  int base = row * tiles_per_row;
+  float v1 = -INFINITY, v2 = -INFINITY;
+  int i1 = 0, i2 = 0;
+  for (int tile = tid; tile < tiles_per_row; tile += blockDim.x) {
+    top2_consider(partial_v1[base + tile], partial_i1[base + tile], v1, i1, v2,
+                  i2);
+    top2_consider(partial_v2[base + tile], partial_i2[base + tile], v1, i1, v2,
+                  i2);
+  }
+  sv1[tid] = v1;
+  si1[tid] = i1;
+  sv2[tid] = v2;
+  si2[tid] = i2;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      top2_consider(sv1[tid + s], si1[tid + s], sv1[tid], si1[tid], sv2[tid],
+                    si2[tid]);
+      top2_consider(sv2[tid + s], si2[tid + s], sv1[tid], si1[tid], sv2[tid],
+                    si2[tid]);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    unsigned int token = static_cast<unsigned int>(si1[0]);
+    out_tokens[row] = token;
+    sampled_tokens[row * block_size + step] = token;
+    out_top2[row] = static_cast<unsigned int>(si2[0]);
+  }
+}
+
+
+// Hedge-ladder branch forcing: chain-row (i*c + j) takes its device-resident
+// runner-up token at `step` — written into both the ping-pong prev buffer
+// (so later steps condition on it) and the sampled block (so the single
+// final D2H carries it). Replaces per-branch-step D2H syncs.
+__global__ void hedge_ladder_force_kernel(unsigned int* __restrict__ prev,
+                                          unsigned int* __restrict__ sampled,
+                                          const unsigned int* __restrict__ runners,
+                                          const int* __restrict__ req_map,
+                                          int n,
+                                          int c,
+                                          int j,
+                                          int runner_stride,
+                                          int block_size,
+                                          int step) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int req = req_map[i];
+  unsigned int tok = runners[j * runner_stride + req];
+  int row = i * c + j;
+  prev[row] = tok;
+  sampled[row * block_size + step] = tok;
+}
+
 extern "C" {
 void argmax_cuda(const __nv_bfloat16* x, int* out, int n, cudaStream_t stream) {
   argmax_kernel<<<1, SAMPLE_BLOCK,
@@ -396,22 +562,28 @@ void argmax_batch_bf16_split_indexed_cuda(const __nv_bfloat16* x,
       partial_values, partial_indices, values, indices, rows, tiles_per_row);
 }
 
-void markov_step_argmax_cuda(const __nv_bfloat16* base,
-                             const __nv_bfloat16* bias, int block_size, int step,
-                             int rows, int n, float* partial_values,
-                             int* partial_indices, unsigned int* out_tokens,
-                             unsigned int* sampled_tokens,
-                             cudaStream_t stream) {
+// The three markov/hedge launchers below return `cudaGetLastError()` so the
+// safe wrappers fail closed on launch rejection (bad grid, shared-memory
+// exhaustion) instead of surfacing it at the next unrelated CUDA call.
+// Legal during stream capture: the error state is thread-local and querying
+// it does not touch the stream.
+cudaError_t markov_step_argmax_cuda(const __nv_bfloat16* base,
+                                    const __nv_bfloat16* bias, int block_size, int step,
+                                    int chains, const int* req_map, int rows, int n,
+                                    float* partial_values,
+                                    int* partial_indices, unsigned int* out_tokens,
+                                    unsigned int* sampled_tokens,
+                                    cudaStream_t stream) {
   int tiles_per_row = (n + MARKOV_STEP_TILE_ELEMS - 1) / MARKOV_STEP_TILE_ELEMS;
   size_t smem = SAMPLE_BLOCK * (sizeof(float) + sizeof(int));
   markov_step_partial_kernel<<<dim3(tiles_per_row, rows), SAMPLE_BLOCK, smem, stream>>>(
-      base, bias, block_size, step, partial_values, partial_indices, rows, n,
-      tiles_per_row);
+      base, bias, block_size, step, chains, req_map, partial_values,
+      partial_indices, rows, n, tiles_per_row);
   if (!markov_pdl_supported_on_current_device()) {
     markov_step_finalize_kernel<<<rows, SAMPLE_BLOCK, smem, stream>>>(
         partial_values, partial_indices, out_tokens, sampled_tokens, block_size,
         step, rows, tiles_per_row);
-    return;
+    return cudaGetLastError();
   }
 
   cudaLaunchAttribute attr[1] = {};
@@ -428,5 +600,35 @@ void markov_step_argmax_cuda(const __nv_bfloat16* base,
   cudaLaunchKernelEx(&config, markov_step_finalize_kernel, partial_values,
                      partial_indices, out_tokens, sampled_tokens, block_size,
                      step, rows, tiles_per_row);
+  return cudaGetLastError();
+}
+
+cudaError_t markov_step_top2_cuda(const __nv_bfloat16* base, const __nv_bfloat16* bias,
+                                  int block_size, int step, int chains, int rows, int n,
+                                  float* partial_v1, int* partial_i1, float* partial_v2,
+                                  int* partial_i2, unsigned int* out_tokens,
+                                  unsigned int* sampled_tokens, unsigned int* out_top2,
+                                  cudaStream_t stream) {
+  int tiles_per_row = (n + MARKOV_STEP_TILE_ELEMS - 1) / MARKOV_STEP_TILE_ELEMS;
+  size_t smem = SAMPLE_BLOCK * 2 * (sizeof(float) + sizeof(int));
+  markov_step_top2_partial_kernel<<<dim3(tiles_per_row, rows), SAMPLE_BLOCK, smem,
+                                    stream>>>(base, bias, block_size, step, chains,
+                                              partial_v1, partial_i1, partial_v2,
+                                              partial_i2, rows, n, tiles_per_row);
+  markov_step_top2_finalize_kernel<<<rows, SAMPLE_BLOCK, smem, stream>>>(
+      partial_v1, partial_i1, partial_v2, partial_i2, out_tokens, sampled_tokens,
+      out_top2, block_size, step, rows, tiles_per_row);
+  return cudaGetLastError();
+}
+
+cudaError_t hedge_ladder_force_cuda(unsigned int* prev, unsigned int* sampled,
+                                    const unsigned int* runners, const int* req_map,
+                                    int n, int c, int j, int runner_stride,
+                                    int block_size, int step, cudaStream_t stream) {
+  int threads = 128;
+  int blocks = (n + threads - 1) / threads;
+  hedge_ladder_force_kernel<<<blocks, threads, 0, stream>>>(
+      prev, sampled, runners, req_map, n, c, j, runner_stride, block_size, step);
+  return cudaGetLastError();
 }
 }

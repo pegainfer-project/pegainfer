@@ -38,8 +38,8 @@ const DECODE_ATTENTION_PATH_COUNT: usize = 2;
 // already saturate the SMs (bs<=8 wins big, ~bs16 even, bs32 within ~1%).
 // 64-token chunks measured fastest on RTX 5090 (128/256 are 1-7% slower, 32
 // past the merge-overhead knee). Measurements: docs/models/qwen3/decode-attention.md.
-pub(crate) const SPLIT_KV_CHUNK_TOKENS: usize = 64;
-pub(crate) const SPLIT_KV_TUNED_MAX_CHUNKS: usize = 64; // Tuned adaptive-split count cap
+pub const SPLIT_KV_CHUNK_TOKENS: usize = 64;
+pub const SPLIT_KV_TUNED_MAX_CHUNKS: usize = 64; // Tuned adaptive-split count cap
 const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 256; // split-KV workspace/guard bound
 const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
 

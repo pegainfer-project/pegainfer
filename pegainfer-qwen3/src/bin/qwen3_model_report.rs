@@ -37,6 +37,7 @@ use pegainfer_kernels::ops::per_token_served;
 use pegainfer_kernels::ops::pin_served;
 use pegainfer_kernels::ops::reset_numeric_policy_counters;
 use pegainfer_kernels::ops::set_numeric_policy;
+use pegainfer_kernels::ops::split_qkv_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceVec;
 use pegainfer_kernels::tensor::HiddenStates;
@@ -52,9 +53,16 @@ use pegainfer_qwen3::batch_decode_trace::PHASE_DECODE;
 use pegainfer_qwen3::batch_decode_trace::RMS_NORM_EPS;
 use pegainfer_qwen3::batch_decode_trace::normalize_call_site;
 use pegainfer_qwen3::batch_decode_trace::trace_decode_kernel_calls;
-use pegainfer_qwen3::kernel_bench::L2CacheClear;
-use pegainfer_qwen3::kernel_bench::build_split_kv_csr;
 use serde::Serialize;
+
+// Only `L2CacheClear` is needed here; the rest of the `report_support` tree
+// belongs to `qwen3_kernel_report`. The allow covers the sibling helpers in
+// `common` that this binary does not call.
+#[allow(dead_code)]
+#[path = "report_support/common.rs"]
+mod common;
+
+use common::L2CacheClear;
 
 const DEFAULT_ITERS: u64 = 32;
 
@@ -477,14 +485,13 @@ fn measure_catalog(
         if catalog.contains_key(&key) {
             continue;
         }
-        let measure = match classify(policy, &call.op) {
-            Some(reason) => Measure::Excluded(reason),
-            None => {
-                let stats = measure_call(call, iters).with_context(|| {
-                    format!("failed to measure {}\n{}", call.label, describe_call(call))
-                })?;
-                Measure::Faithful(stats)
-            }
+        let measure = if let Some(reason) = classify(policy, &call.op) {
+            Measure::Excluded(reason)
+        } else {
+            let stats = measure_call(call, iters).with_context(|| {
+                format!("failed to measure {}\n{}", call.label, describe_call(call))
+            })?;
+            Measure::Faithful(stats)
         };
         catalog.insert(key.clone(), BenchEntry { key, measure });
     }
@@ -632,7 +639,7 @@ fn measure_split_qkv(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let mut k = HiddenStates::zeros(&ctx, kv_dim, batch)?;
     let mut v = HiddenStates::zeros(&ctx, kv_dim, batch)?;
     measure_loop(&ctx, iters, || {
-        ops::split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)?;
+        split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)?;
         Ok(())
     })
 }
@@ -715,7 +722,8 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
         let split_chunk_size = attr_usize(call, "split_chunk_size")?;
         let cap = attr_usize(call, "split_max_chunks")?;
         let padded_slots = batch * cap;
-        let split_csr = build_split_kv_csr(split_chunk_size, cap, &vec![kv_len; batch], batch)?;
+        let split_csr =
+            ops::build_split_kv_csr(split_chunk_size, cap, &vec![kv_len; batch], batch)?;
         let split_kv_chunk_size = [split_chunk_size as i32];
         let split_request_indices_d = ctx.stream.clone_htod(&split_csr.request_indices)?;
         let split_kv_tile_indices_d = ctx.stream.clone_htod(&split_csr.kv_tile_indices)?;

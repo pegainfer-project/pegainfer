@@ -199,6 +199,16 @@ unsafe extern "C" {
     /// allocations (driver + IMEX). Writes 0 or 1 into `out_supported`.
     pub fn k3_mega_fabric_supported(device_ordinal: i32, out_supported: *mut i32) -> CUresult;
 
+    /// Store `value` into `flag_count` 8-byte-aligned u64 flag slots (local
+    /// or fabric-imported device VAs) from a kernel on `stream`; see
+    /// `csrc/k3/k3_whale_doorbell.cu`.
+    pub fn k3_whale_doorbell_ring(
+        flag_addrs: *const u64,
+        flag_count: i32,
+        value: u64,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Allocate a fabric-exportable symmetric slab of `num_bytes` on
     /// `device_ordinal`, mapped and access-granted for every local device,
     /// zeroed and synchronized. Writes the device pointer and the 64-byte
@@ -408,8 +418,10 @@ unsafe extern "C" {
     /// FlashMLA SM100 dense FMHA forward (third_party/FlashMLA), one
     /// sequence, bottom-right-aligned causal: q `[t_q, h, 192]`,
     /// k `[t_kv, h, 192]`, v a strided `[t_kv, h, 128]` view, out
-    /// `[t_q, h, 128]`, all bf16; strides in elements. Requires an sm_100f
-    /// build (`NOT_SUPPORTED` elsewhere).
+    /// `[t_q, h, 128]`, all bf16; strides in elements. `lse_out`, when
+    /// non-null, receives f32 `[h, t_q]` log-sum-exp (natural log, softmax
+    /// scale absorbed). Requires an sm_100f build (`NOT_SUPPORTED`
+    /// elsewhere).
     pub fn k3_flash_mla_prefill_fwd(
         q: *const Half,
         q_stride_tok: i64,
@@ -423,10 +435,59 @@ unsafe extern "C" {
         out: *mut Half,
         o_stride_tok: i64,
         o_stride_head: i64,
+        lse_out: *mut f32,
         t_q: i32,
         t_kv: i32,
         heads: i32,
         scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// The full-visibility twin of `k3_flash_mla_prefill_fwd` for context
+    /// windows entirely in the queries' past: no causal mask, `t_q` and
+    /// `t_kv` unrelated. Same layouts and LSE contract.
+    pub fn k3_flash_mla_prefill_fwd_dense(
+        q: *const Half,
+        q_stride_tok: i64,
+        q_stride_head: i64,
+        k: *const Half,
+        k_stride_tok: i64,
+        k_stride_head: i64,
+        v: *const Half,
+        v_stride_tok: i64,
+        v_stride_head: i64,
+        out: *mut Half,
+        o_stride_tok: i64,
+        o_stride_head: i64,
+        lse_out: *mut f32,
+        t_q: i32,
+        t_kv: i32,
+        heads: i32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Fold one window's FMHA output `[t_q, h, 128]` bf16 + `[h, t_q]` f32
+    /// LSE into the f32 running accumulator pair via the log-sum-exp
+    /// identity; `reset != 0` starts a fresh accumulation.
+    pub fn k3_mla_prefill_lse_merge(
+        o_win: *const Half,
+        lse_win: *const f32,
+        o_acc: *mut f32,
+        lse_acc: *mut f32,
+        t_q: i32,
+        heads: i32,
+        reset: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Convert the merged f32 accumulator back to the bf16 attention output
+    /// `[t_q, h, 128]`.
+    pub fn k3_mla_prefill_o_finalize(
+        o_acc: *const f32,
+        out: *mut Half,
+        t_q: i32,
+        heads: i32,
         stream: CUstream,
     ) -> CUresult;
 }

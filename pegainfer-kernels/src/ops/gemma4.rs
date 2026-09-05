@@ -6,6 +6,10 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
+use crate::ops::marlin_face::MarlinAlignBuffers;
+use crate::ops::marlin_face::MarlinGemmBuffers;
+use crate::ops::marlin_face::launch_marlin_align;
+use crate::ops::marlin_face::launch_marlin_gemm;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
@@ -159,44 +163,48 @@ pub fn gemma4_marlin_nvfp4_moe(
         out.hidden_dim,
         rows * dispatch.top_k
     );
-    let (input_ptr, _input_guard) = input.data.device_ptr(&ctx.stream);
-    let (qweight_ptr, _qweight_guard) = qweight.device_ptr(&ctx.stream);
-    let (scales_ptr, _scales_guard) = scales.device_ptr(&ctx.stream);
     let (global_ptr, _global_guard) = global_scale.device_ptr(&ctx.stream);
-    let (sorted_ptr, _sorted_guard) = dispatch.sorted_token_ids.device_ptr(&ctx.stream);
-    let (expert_ptr, _expert_guard) = dispatch.expert_ids.device_ptr(&ctx.stream);
-    let (padded_ptr, _padded_guard) = dispatch.num_tokens_post_padded.device_ptr(&ctx.stream);
-    let (weights_ptr, _weights_guard) = dispatch.topk_weights.device_ptr(&ctx.stream);
     let workspace_len = workspace.len();
     let sorted_len = dispatch.sorted_token_ids.len();
-    let (workspace_ptr, _workspace_guard) = workspace.device_ptr_mut(&ctx.stream);
-    let (c_tmp_ptr, _c_tmp_guard) = c_tmp.device_ptr_mut(&ctx.stream);
-    let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::gemma4_marlin_nvfp4_moe_cuda(
-            input_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            c_tmp_ptr as *mut f32,
-            qweight_ptr as *const u8,
-            scales_ptr as *const u8,
-            global_ptr as *const f32,
-            workspace_ptr as *mut i32,
-            sorted_ptr as *const i32,
-            expert_ptr as *const i32,
-            padded_ptr as *const i32,
-            weights_ptr as *const f32,
-            i32::try_from(workspace_len)?,
-            i32::try_from(sorted_len)?,
-            i32::try_from(dispatch.block_size)?,
-            i32::try_from(dispatch.top_k)?,
-            dispatch.mul_topk_weights,
-            i32::try_from(rows)?,
-            i32::try_from(size_n)?,
-            i32::try_from(size_k)?,
-            0,
-            crate::tensor::active_cu_stream(ctx),
-        )
+    let buffers = MarlinGemmBuffers {
+        input: &input.data,
+        output: &mut out.data,
+        c_tmp,
+        qweight,
+        scales,
+        workspace,
+        sorted_token_ids: dispatch.sorted_token_ids,
+        expert_ids: dispatch.expert_ids,
+        num_tokens_post_padded: dispatch.num_tokens_post_padded,
+        topk_weights: dispatch.topk_weights,
     };
+    let result = launch_marlin_gemm(ctx, buffers, |ptrs| {
+        Ok(unsafe {
+            ffi::gemma4_marlin_nvfp4_moe_cuda(
+                ptrs.input,
+                ptrs.output,
+                ptrs.c_tmp,
+                ptrs.qweight,
+                ptrs.scales,
+                global_ptr as *const f32,
+                ptrs.workspace,
+                ptrs.sorted_token_ids,
+                ptrs.expert_ids,
+                ptrs.num_tokens_post_padded,
+                ptrs.topk_weights,
+                i32::try_from(workspace_len)?,
+                i32::try_from(sorted_len)?,
+                i32::try_from(dispatch.block_size)?,
+                i32::try_from(dispatch.top_k)?,
+                dispatch.mul_topk_weights,
+                i32::try_from(rows)?,
+                i32::try_from(size_n)?,
+                i32::try_from(size_k)?,
+                0,
+                crate::tensor::active_cu_stream(ctx),
+            )
+        })
+    })?;
     result.result()?;
     Ok(())
 }
@@ -309,29 +317,37 @@ pub fn marlin_moe_align_block_size(
         "marlin_moe_align_block_size: {max_padded} padded slots cannot hold {routes} routes with \
          one part filled block per expert"
     );
-    let (idx_ptr, _idx_guard) = topk_idx.device_ptr(&ctx.stream);
-    let (sorted_ptr, _sorted_guard) = out.sorted_token_ids.device_ptr_mut(&ctx.stream);
-    let (expert_ptr, _expert_guard) = out.expert_ids.device_ptr_mut(&ctx.stream);
-    let (padded_ptr, _padded_guard) = out.num_tokens_post_padded.device_ptr_mut(&ctx.stream);
-    let (offsets_ptr, _offsets_guard) = out.expert_offsets.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::marlin_moe_align_block_size_cuda(
-            idx_ptr as *const i32,
-            sorted_ptr as *mut i32,
-            expert_ptr as *mut i32,
-            padded_ptr as *mut i32,
-            offsets_ptr as *mut u32,
-            std::ptr::null_mut(),
-            i32::try_from(rows)?,
-            i32::try_from(top_k)?,
-            0,
-            i32::try_from(experts)?,
-            i32::try_from(block_size)?,
-            i32::try_from(max_padded)?,
-            i32::try_from(max_blocks)?,
-            crate::tensor::active_cu_stream(ctx),
-        )
+    let buffers = MarlinAlignBuffers {
+        topk_idx,
+        sorted_token_ids: out.sorted_token_ids,
+        expert_ids: out.expert_ids,
+        num_tokens_post_padded: out.num_tokens_post_padded,
+        expert_offsets: out.expert_offsets,
     };
+    let result = launch_marlin_align(
+        ctx,
+        buffers,
+        |idx_ptr, sorted_ptr, expert_ptr, padded_ptr, offsets_ptr| {
+            Ok(unsafe {
+                ffi::marlin_moe_align_block_size_cuda(
+                    idx_ptr,
+                    sorted_ptr,
+                    expert_ptr,
+                    padded_ptr,
+                    offsets_ptr,
+                    std::ptr::null_mut(),
+                    i32::try_from(rows)?,
+                    i32::try_from(top_k)?,
+                    0,
+                    i32::try_from(experts)?,
+                    i32::try_from(block_size)?,
+                    i32::try_from(max_padded)?,
+                    i32::try_from(max_blocks)?,
+                    crate::tensor::active_cu_stream(ctx),
+                )
+            })
+        },
+    )?;
     result.result()?;
     Ok(())
 }

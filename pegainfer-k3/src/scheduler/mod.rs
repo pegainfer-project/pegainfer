@@ -19,6 +19,8 @@ mod executor;
 mod gang;
 #[cfg(test)]
 mod tests;
+pub mod whale;
+pub mod whale_hub;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -36,12 +38,22 @@ use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::spawn_scheduler;
+use pegainfer_frontend::sampler::SamplingParams;
 
 pub use self::executor::DecodeSlot;
 pub use self::executor::SlotId;
 pub use self::executor::StepExecutor;
 pub use self::gang::K3CpGang;
+use self::whale::CommittedWhale;
+use self::whale::GlobalRank;
+use self::whale::WhaleDuty;
+use self::whale::WhaleMember;
+use self::whale::WhaleSeq;
+use self::whale::WhaleToMember;
+use self::whale::WhaleToSequencer;
+pub use self::whale_hub::K3WhaleHub;
 use crate::executor::cp::k3_cp_admits;
+use crate::executor::cp::k3_whale_width;
 
 // ── Engine assembly ─────────────────────────────────────────────────────
 
@@ -58,6 +70,10 @@ pub struct K3SchedulerConfig {
     /// Context-parallel prefill serving, when armed. `None` = every prompt
     /// prefills on its own partition.
     pub cp: Option<K3CpServing>,
+    /// The fleet whale lane, when armed. Mutually exclusive with `cp`: the
+    /// in-process gang and the fleet rendezvous are two coordination layers
+    /// for the same superstep, and a deployment runs exactly one.
+    pub whale: Option<K3WhaleServing>,
 }
 
 /// The armed CP prefill lane: the gang handle plus the admission window that
@@ -71,6 +87,56 @@ pub struct K3CpServing {
     /// The executors' prefill chunk cap. A CP segment must fit one chunk
     /// (M0: one chunk step per rank), so this bounds eligibility from above.
     pub chunk_tokens: usize,
+}
+
+/// The armed whale lane: fleet-wide CP prefill through the whale rendezvous
+/// ([`whale`]). One hub per process; each scheduler partition is one global
+/// rank in the fleet's world.
+#[derive(Clone, Debug)]
+pub struct K3WhaleServing {
+    /// The rendezvous transport. The process hosting global rank 0 also
+    /// hosts the sequencer inside its hub.
+    pub hub: K3WhaleHub,
+    /// Total ranks in the fleet.
+    pub world: usize,
+    /// The global rank of this process's partition 0; partition `p` serves
+    /// global rank `first_local + p`.
+    pub first_local: GlobalRank,
+    /// Prompts shorter than this prefill locally.
+    pub min_tokens: usize,
+    /// The executors' prefill chunk cap — bounds a whale segment from above
+    /// (one superstep per rank).
+    pub chunk_tokens: usize,
+}
+
+/// A whale request this poster sent to the sequencer and is waiting to hear
+/// back about. Its slot is reserved the whole time, so the commit can never
+/// arrive to a full batch. `id.raw()` rides the descriptor's `request` field,
+/// pairing gathers and commits with this admission.
+struct PostedWhale {
+    id: RequestId,
+    slot: SlotId,
+    /// The sequence this whale got, learned from our own gather broadcast.
+    /// `None` until the gather arrives; a cancel for an unknown sequence can
+    /// only be the width refusal of this one outstanding post.
+    seq: Option<WhaleSeq>,
+    prompt: Arc<[u32]>,
+    params: SamplingParams,
+    max_tokens: usize,
+}
+
+/// One partition's live whale state: the protocol member plus the poster-side
+/// bookkeeping. At most one whale post is outstanding per rank at a time —
+/// whales are sparse, and one-at-a-time keeps the cancel pairing trivial.
+struct WhaleLane {
+    serving: K3WhaleServing,
+    member: WhaleMember,
+    rank: GlobalRank,
+    /// The outstanding post, if any (awaiting commit or cancel).
+    posted: Option<PostedWhale>,
+    /// A cancelled post falling back to a local prefill, run at the next
+    /// unrestricted launch.
+    fallback: Option<PostedWhale>,
 }
 
 /// Wrap ready executors in schedulers and hand the whole thing to the
@@ -137,6 +203,8 @@ pub struct K3Scheduler<E: StepExecutor> {
     kv_capacity: Option<KvCapacity>,
     /// The CP prefill lane, when the engine armed one.
     cp: Option<K3CpServing>,
+    /// The whale lane, when the engine armed one.
+    whale: Option<WhaleLane>,
     /// Requests waiting for a slot, in submit order. A full batch is a
     /// wait, not a verdict — only permanently unservable requests are refused
     /// (see [`K3Scheduler::admission_refusal`]).
@@ -155,6 +223,25 @@ impl<E: StepExecutor> K3Scheduler<E> {
                 cp.gang.size()
             );
         }
+        assert!(
+            config.cp.is_none() || config.whale.is_none(),
+            "the in-process CP gang and the fleet whale lane are exclusive"
+        );
+        let whale = config.whale.map(|serving| {
+            let rank = serving.first_local + partition;
+            assert!(
+                rank < serving.world,
+                "partition {partition} maps to global rank {rank}, outside the {}-rank world",
+                serving.world
+            );
+            WhaleLane {
+                member: WhaleMember::new(rank),
+                rank,
+                posted: None,
+                fallback: None,
+                serving,
+            }
+        });
         let free_slots = (0..executor.max_batch()).rev().collect();
         Self {
             executor,
@@ -162,6 +249,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
             eos_token_ids: config.eos_token_ids,
             kv_capacity: config.kv_capacity,
             cp: config.cp,
+            whale,
             queued: VecDeque::new(),
             running: Vec::new(),
             free_slots,
@@ -184,6 +272,214 @@ impl<E: StepExecutor> K3Scheduler<E> {
             return Ok(());
         };
         gang.serve(self.partition, &mut self.executor)
+    }
+
+    /// Serve the whale lane at this launch boundary: drain the rendezvous,
+    /// answer gathers, enter any whale committed for this exact launch, and
+    /// say whether multi-launch admissions are allowed this step.
+    ///
+    /// `false` (an armed or committed whale is pending) restricts the step to
+    /// single-launch work: the scheduler then only decodes, the launch count
+    /// advances exactly one per step, and this member hits the committed
+    /// launch dead on. That is the scheduler's half of the arming contract in
+    /// [`whale`] — the member's replies stay exact floors on reachable
+    /// launches because nothing multi-launch starts while one is pending.
+    fn serve_whale(&mut self, ledger: &mut RequestLedger) -> Result<bool> {
+        let Some(mut lane) = self.whale.take() else {
+            return Ok(true);
+        };
+        let verdict = self.serve_whale_lane(&mut lane, ledger);
+        self.whale = Some(lane);
+        verdict
+    }
+
+    fn serve_whale_lane(
+        &mut self,
+        lane: &mut WhaleLane,
+        ledger: &mut RequestLedger,
+    ) -> Result<bool> {
+        loop {
+            for message in lane.serving.hub.drain(lane.rank) {
+                Self::track_own_post(lane, &message);
+                let count = self.executor.step_count();
+                if let Some(reply) = lane.member.on_message(message, count)? {
+                    lane.serving.hub.send(reply)?;
+                }
+            }
+            match lane.member.at_launch(self.executor.step_count())? {
+                // The superstep advanced the count; consult the next boundary
+                // before leaving — a second whale may sit right behind it.
+                WhaleDuty::Enter(whale) => self.enter_whale(lane, *whale, ledger)?,
+                WhaleDuty::Free => {
+                    if !lane.member.is_quiet() {
+                        return Ok(false);
+                    }
+                    self.run_whale_fallback(lane, ledger);
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    /// Pair an inbound rendezvous message with this rank's outstanding post,
+    /// before the member consumes it. A gather for our own request records
+    /// its sequence; a cancel routes the post to the local-prefill fallback —
+    /// either by its recorded sequence, or, for a post that never gathered
+    /// (unknown sequence, not armed here), as the sequencer's width refusal.
+    fn track_own_post(lane: &mut WhaleLane, message: &WhaleToMember) {
+        match message {
+            WhaleToMember::Gather { descriptor } if descriptor.poster == lane.rank => {
+                if let Some(posted) = lane.posted.as_mut()
+                    && posted.id.raw() == descriptor.request
+                {
+                    posted.seq = Some(descriptor.seq);
+                }
+            }
+            WhaleToMember::Cancel { seq } => {
+                let refused = lane.posted.as_ref().is_some_and(|posted| {
+                    posted.seq == Some(*seq)
+                        || (posted.seq.is_none() && !lane.member.is_armed(*seq))
+                });
+                if refused {
+                    lane.fallback = lane.posted.take();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Enter a committed whale's superstep. Every gang member calls the
+    /// executor at this exact launch, unconditionally — a committed whale
+    /// cannot be cancelled, and an unwanted result is dropped, not prevented.
+    /// An executor error here is engine-fatal: this rank just left its gang
+    /// mid-superstep.
+    fn enter_whale(
+        &mut self,
+        lane: &mut WhaleLane,
+        whale: CommittedWhale,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
+        let posted = if whale.descriptor.poster == lane.rank {
+            let posted = lane.posted.take().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "whale {} committed for this poster, but no post is outstanding",
+                    whale.descriptor.seq
+                )
+            })?;
+            anyhow::ensure!(
+                posted.id.raw() == whale.descriptor.request,
+                "whale {} answers request {}, but the outstanding post is {}",
+                whale.descriptor.seq,
+                whale.descriptor.request,
+                posted.id.raw()
+            );
+            Some(posted)
+        } else {
+            None
+        };
+        let first = self
+            .executor
+            .prefill_whale(&whale, posted.as_ref().map(|posted| posted.slot))?;
+        let Some(posted) = posted else {
+            return Ok(());
+        };
+        let first = first.ok_or_else(|| {
+            anyhow::anyhow!(
+                "whale {} owner sampled no boundary token",
+                whale.descriptor.seq
+            )
+        })?;
+        if ledger.is_aborted(posted.id) {
+            // The whale ran regardless (unanimity is the contract); only the
+            // answer is dropped.
+            ledger.retire(posted.id);
+            self.release_slot(posted.slot);
+            return Ok(());
+        }
+        self.commit_first_token(
+            posted.id,
+            posted.slot,
+            first,
+            posted.max_tokens,
+            posted.params.ignore_eos,
+            ledger,
+        );
+        Ok(())
+    }
+
+    /// A cancelled whale post answers its request with a plain local prefill,
+    /// run at the first unrestricted launch after the cancel.
+    fn run_whale_fallback(&mut self, lane: &mut WhaleLane, ledger: &mut RequestLedger) {
+        let Some(posted) = lane.fallback.take() else {
+            return;
+        };
+        if ledger.is_aborted(posted.id) {
+            ledger.retire(posted.id);
+            self.release_slot(posted.slot);
+            return;
+        }
+        match self
+            .executor
+            .prefill(posted.slot, &posted.prompt, &posted.params)
+        {
+            Ok(first) => self.commit_first_token(
+                posted.id,
+                posted.slot,
+                first,
+                posted.max_tokens,
+                posted.params.ignore_eos,
+                ledger,
+            ),
+            Err(error) => {
+                // A local prefill failure is this request's problem, exactly
+                // as on the ordinary admission path.
+                self.release_slot(posted.slot);
+                ledger.fail(posted.id, format!("{error:#}"));
+            }
+        }
+    }
+
+    /// Record a freshly prefilled request's first token: finish it on the
+    /// spot when the token is terminal, seat it in the running batch
+    /// otherwise.
+    fn commit_first_token(
+        &mut self,
+        id: RequestId,
+        slot: SlotId,
+        first: u32,
+        max_tokens: usize,
+        ignore_eos: bool,
+        ledger: &mut RequestLedger,
+    ) {
+        if self.is_stop_token(first, ignore_eos) {
+            // The stop token itself is not part of the completion.
+            self.release_slot(slot);
+            finish_or_retire(id, FinishReason::Stop, ledger);
+            return;
+        }
+        ledger.push_tokens(id, &[first], &[]);
+        if ledger.completion_tokens(id) >= max_tokens {
+            self.release_slot(slot);
+            finish_or_retire(id, FinishReason::Length, ledger);
+            return;
+        }
+        self.running.push(RunningRequest {
+            id,
+            slot,
+            last_token: first,
+            max_tokens,
+            ignore_eos,
+        });
+    }
+
+    /// Whether the whale lane should carry this prompt: lane armed, prompt in
+    /// its window, and some gang width admits it.
+    fn whale_eligible(&self, prompt_len: usize) -> bool {
+        self.whale.as_ref().is_some_and(|lane| {
+            prompt_len >= lane.serving.min_tokens
+                && k3_whale_width(prompt_len, lane.serving.world, lane.serving.chunk_tokens)
+                    .is_some()
+        })
     }
 
     /// Hand a slot back: the executor drops its state, the scheduler its
@@ -213,33 +509,92 @@ impl<E: StepExecutor> K3Scheduler<E> {
     }
 
     /// Fill free slots from the queue: retire what the frontend abandoned,
-    /// refuse what can never fit, prefill the rest. `Err` means a gang
-    /// prefill failed — never a local one, which is the request's problem.
-    fn admit_queued(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+    /// refuse what can never fit, post whale-window prompts to the
+    /// rendezvous, prefill the rest. `Err` means a gang prefill or the
+    /// rendezvous transport failed — never a local prefill, which is the
+    /// request's problem.
+    ///
+    /// `may_prefill = false` (an armed or committed whale pins this rank's
+    /// launch count) defers admissions that would launch — a multi-launch
+    /// local prefill would overshoot the committed superstep. Verdicts that
+    /// never touch the device (aborts, rejections, empty completions) flow
+    /// regardless.
+    fn admit_queued(&mut self, ledger: &mut RequestLedger, may_prefill: bool) -> Result<()> {
         while !self.free_slots.is_empty() {
-            let Some(pending) = self.queued.pop_front() else {
+            // Peek: a wait verdict must leave the request untouched (no
+            // ledger writes) for a later step.
+            let Some(next) = self.queued.front() else {
                 break;
             };
-            let id = pending.id;
+            let id = next.id;
+            let prompt_len = next.request.prompt_tokens.len();
+            let refusal = self.admission_refusal(&next.request);
+            let empty_completion = next.request.max_tokens == 0;
             if ledger.is_aborted(id) {
+                self.queued.pop_front();
                 ledger.retire(id);
                 continue;
             }
-            if let Some(reason) = self.admission_refusal(&pending.request) {
+            if let Some(reason) = refusal {
+                self.queued.pop_front();
                 ledger.reject(id, reason);
                 continue;
             }
-            ledger.admit(id);
-            if pending.request.max_tokens == 0 {
+            if empty_completion {
                 // Nothing to generate: answer without occupying a slot.
+                self.queued.pop_front();
+                ledger.admit(id);
                 finish_or_retire(id, FinishReason::Length, ledger);
                 continue;
             }
+            if self.whale_eligible(prompt_len) {
+                let lane = self.whale.as_ref().expect("eligibility implies the lane");
+                if lane.posted.is_some() || lane.fallback.is_some() {
+                    // One outstanding whale per rank keeps the cancel pairing
+                    // trivial; whales are sparse and the rendezvous is a few
+                    // launches, so the head of the queue waits.
+                    break;
+                }
+                let (poster, hub) = (lane.rank, lane.serving.hub.clone());
+                let queued = self.queued.pop_front().expect("front just observed");
+                ledger.admit(id);
+                let slot = self
+                    .free_slots
+                    .pop()
+                    .expect("loop runs only while a slot is free");
+                let prompt: Arc<[u32]> = Arc::from(queued.request.prompt_tokens.as_slice());
+                if let Err(error) = hub.send(WhaleToSequencer::Request {
+                    request: id.raw(),
+                    poster,
+                    prompt: prompt.clone(),
+                }) {
+                    // The rendezvous transport is fleet infrastructure; its
+                    // loss is the engine's, not the request's.
+                    self.release_slot(slot);
+                    ledger.fail(id, format!("{error:#}"));
+                    return Err(error);
+                }
+                let lane = self.whale.as_mut().expect("eligibility implies the lane");
+                lane.posted = Some(PostedWhale {
+                    id,
+                    slot,
+                    seq: None,
+                    prompt,
+                    params: queued.request.params,
+                    max_tokens: queued.request.max_tokens,
+                });
+                continue;
+            }
+            if !may_prefill {
+                break;
+            }
+            let pending = self.queued.pop_front().expect("front just observed");
+            ledger.admit(id);
             let slot = self
                 .free_slots
                 .pop()
                 .expect("loop runs only while a slot is free");
-            let first = match self.cp_gang_for(pending.request.prompt_tokens.len()) {
+            let first = match self.cp_gang_for(prompt_len) {
                 Some(gang) => {
                     match gang.post_and_run(
                         self.partition,
@@ -276,26 +631,14 @@ impl<E: StepExecutor> K3Scheduler<E> {
                     }
                 }
             };
-            let state = RunningRequest {
+            self.commit_first_token(
                 id,
                 slot,
-                last_token: first,
-                max_tokens: pending.request.max_tokens,
-                ignore_eos: pending.request.params.ignore_eos,
-            };
-            if self.is_stop_token(first, state.ignore_eos) {
-                // The stop token itself is not part of the completion.
-                self.release_slot(slot);
-                finish_or_retire(id, FinishReason::Stop, ledger);
-                continue;
-            }
-            ledger.push_tokens(id, &[first], &[]);
-            if ledger.completion_tokens(id) >= state.max_tokens {
-                self.release_slot(slot);
-                finish_or_retire(id, FinishReason::Length, ledger);
-                continue;
-            }
-            self.running.push(state);
+                first,
+                pending.request.max_tokens,
+                pending.request.params.ignore_eos,
+                ledger,
+            );
         }
         Ok(())
     }
@@ -415,10 +758,16 @@ impl<E: StepExecutor> Scheduler for K3Scheduler<E> {
         // whole extra step time. A serve error propagates: this partition can
         // no longer hold up its end of the gang, so the engine is beyond use.
         self.serve_gang()?;
-        self.admit_queued(ledger)?;
+        // Then the whale lane, at what is a launch boundary by construction:
+        // it drains the rendezvous, enters a committed superstep when this is
+        // its launch, and its verdict caps this step's admissions at
+        // single-launch work while a whale is pending.
+        let may_prefill = self.serve_whale(ledger)?;
+        self.admit_queued(ledger, may_prefill)?;
         self.decode_running(ledger);
         // Local prefill and decode failures are per-request and absorbed
-        // above; gang failures propagate the same way a serve error does.
+        // above; gang, whale, and transport failures propagate the same way a
+        // serve error does.
         Ok(())
     }
 

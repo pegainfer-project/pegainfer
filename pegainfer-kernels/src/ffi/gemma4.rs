@@ -97,4 +97,35 @@ unsafe extern "C" {
         max_m_blocks: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// fp8-KV twin of `batch_prefill_paged_window_hd256_cuda`: same launch
+    /// body over an e4m3 pool (scale 1.0), Q and output bf16.
+    pub fn gemma4_batch_prefill_paged_window_hd256_fp8kv_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const core::ffi::c_void,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        q_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        seq_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        cta_tile_q_override: i32,
+        window_left: i32,
+        stream: CUstream,
+    ) -> i32;
 }

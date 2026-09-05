@@ -2,6 +2,8 @@
 // `pegainfer-kernels/qwen35`, which need Python + Triton at build time.
 // Without the feature this compiles to an empty crate so plain workspace
 // builds stay Python-free.
+// Submodule `use self::*` globs are the established module-tree convention.
+#![allow(clippy::wildcard_imports)]
 #![cfg(feature = "qwen35")]
 
 mod batch_decode;

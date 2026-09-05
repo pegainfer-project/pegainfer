@@ -795,11 +795,21 @@ pub(crate) struct K3Scratch {
     pub(crate) mla_ctx_latent: HiddenStates,
     /// Chunked prefill: the gathered shared rope halves, `[max_ctx, 64]`.
     pub(crate) mla_ctx_rope: CudaSlice<bf16>,
-    /// Chunked prefill: the kv_b expansion, `[max_ctx, heads, 256]` per-head
+    /// Chunked prefill: the kv_b expansion, `[win, heads, 256]` per-head
     /// `nope | value` rows — the FMHA reads V as a strided view into this.
+    /// `win = min(max_ctx, K3_MLA_CTX_WINDOW)`: deeper contexts re-expand
+    /// window by window and merge through the LSE, so only the latent/rope
+    /// gather above scales with `max_ctx`.
     pub(crate) mla_ctx_nope_v: HiddenStates,
-    /// Chunked prefill: the assembled K rows, `[max_ctx, heads, 192]`.
+    /// Chunked prefill: the assembled K rows, `[win, heads, 192]`.
     pub(crate) mla_ctx_k: CudaSlice<bf16>,
+    /// Chunked prefill: the windowed walk's f32 output accumulator,
+    /// `[rows, heads, 128]`.
+    pub(crate) mla_o_acc: CudaSlice<f32>,
+    /// Chunked prefill: the running log-sum-exp, `[heads, rows]`.
+    pub(crate) mla_lse_acc: CudaSlice<f32>,
+    /// Chunked prefill: one window's LSE from the FMHA, `[heads, rows]`.
+    pub(crate) mla_lse_win: CudaSlice<f32>,
     // MLP / MoE.
     pub(crate) hidden_partial: CudaSlice<f32>,
     pub(crate) router_partial: CudaSlice<f32>,
@@ -908,11 +918,16 @@ impl K3Scratch {
             },
             mla_ctx_rope: stream.alloc_zeros(max_ctx * K3_QK_ROPE_HEAD_DIM)?,
             mla_ctx_nope_v: HiddenStates {
-                data: stream.alloc_zeros(max_ctx * K3_KV_B_OUT)?,
+                data: stream
+                    .alloc_zeros(max_ctx.min(crate::config::K3_MLA_CTX_WINDOW) * K3_KV_B_OUT)?,
                 hidden_dim: K3_KV_B_OUT,
                 seq_len: 0,
             },
-            mla_ctx_k: stream.alloc_zeros(max_ctx * K3_Q_B_OUT)?,
+            mla_ctx_k: stream
+                .alloc_zeros(max_ctx.min(crate::config::K3_MLA_CTX_WINDOW) * K3_Q_B_OUT)?,
+            mla_o_acc: stream.alloc_zeros(rows * K3_MLA_V_ROW)?,
+            mla_lse_acc: stream.alloc_zeros(K3_MLA_HEADS * rows)?,
+            mla_lse_win: stream.alloc_zeros(K3_MLA_HEADS * rows)?,
             hidden_partial: partial(K3_HIDDEN)?,
             router_partial: partial(routed_experts)?,
             topk_idx: stream.alloc_zeros(rows * K3_ROUTER_TOPK)?,

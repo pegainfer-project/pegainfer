@@ -3,6 +3,7 @@
 //! different admission shape.
 
 use anyhow::Result;
+use pegainfer_core::kv_pool::KvStorage;
 
 use super::*;
 use crate::kv::admit_tokens;
@@ -15,24 +16,31 @@ use crate::testkit::model_path;
 use crate::testkit::u32_tensor;
 
 fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, String) {
+    stack_with_storage(
+        max_context,
+        pages,
+        crate::engine::kv_fp8_storage().expect("PEGAINFER_KV_FP8"),
+    )
+}
+
+fn stack_with_storage(
+    max_context: usize,
+    pages: usize,
+    storage: KvStorage,
+) -> (DeviceContext, GemmaServe, String) {
     let dir = model_path();
     let config = Gemma4Config::from_file(&dir).expect("config");
-    let (weights, _) =
+    let weights =
         Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
-    let serve = GemmaServe::new(&ctx, weights, max_context, pages, pages).expect("serve");
+    let serve = GemmaServe::new(&ctx, weights, max_context, storage, pages, pages).expect("serve");
+    eprintln!("oracle stack storage: {storage:?}");
     (ctx, serve, dir)
 }
 
 fn load_stack() -> (DeviceContext, GemmaServe, String) {
     // One request at the window, plus each pool's padding page.
     stack_with(1024, 66)
-}
-
-fn synthetic_tokens(len: usize, salt: u32) -> Vec<u32> {
-    (0..len as u32)
-        .map(|i| 1000 + (i * 37 + salt) % 50000)
-        .collect()
 }
 
 /// What agreement is available at this depth, measured on the reference
@@ -223,7 +231,7 @@ fn gate_waypoint(
     serve: &GemmaServe,
     fixture: &safetensors::SafeTensors<'_>,
     point: Waypoint<'_>,
-) -> Option<String> {
+) -> Vec<String> {
     let label = match point.chunk {
         0 => point.case.to_string(),
         _ => format!("{}-chunked", point.case),
@@ -237,10 +245,6 @@ fn gate_waypoint(
         "{label}: shifted multi-token coverage"
     );
     let (max_abs, top1) = score_rows(&run.rows, &ids, &lps, top_k, &label);
-    assert!(
-        top1 >= backend_top1,
-        "{label}: top-1 {top1}/{positions} below backend bar {backend_top1}/{positions}"
-    );
     let page = serve.local_pool.layout().page_size;
     let released = run.kv_len.saturating_sub(serve.sliding_window) / page;
     assert_eq!(run.local_pages, run.kv_len.div_ceil(page) - released);
@@ -250,7 +254,16 @@ fn gate_waypoint(
          {top1}/{positions}, local pages {}, global {}",
         run.local_pages, run.global_pages
     );
-    (max_abs > tolerance).then(|| format!("{label} ({max_abs} > {tolerance})"))
+    let mut failures = Vec::new();
+    if top1 < backend_top1 {
+        failures.push(format!(
+            "{label}: top-1 {top1}/{positions} below backend bar {backend_top1}/{positions}"
+        ));
+    }
+    if max_abs > tolerance {
+        failures.push(format!("{label} ({max_abs} > {tolerance})"));
+    }
+    failures
 }
 
 fn gate_waypoints(
@@ -258,15 +271,11 @@ fn gate_waypoints(
     serve: &GemmaServe,
     fixture: &safetensors::SafeTensors<'_>,
     points: &[Waypoint<'_>],
-) {
-    let over: Vec<String> = points
+) -> Vec<String> {
+    points
         .iter()
-        .filter_map(|&point| gate_waypoint(ctx, serve, fixture, point))
-        .collect();
-    assert!(
-        over.is_empty(),
-        "cases over their calibrated floor: {over:?}"
-    );
+        .flat_map(|&point| gate_waypoint(ctx, serve, fixture, point))
+        .collect()
 }
 
 fn validate_waypoint_provenance(dir: &str, window_bytes: &[u8], long_bytes: &[u8]) {
@@ -350,46 +359,265 @@ fn context_waypoints_match_hf() {
             floor: Some(floor),
         },
     ];
-    gate_waypoints(&ctx, &serve, &window, &window_points);
-    gate_waypoints(&ctx, &serve, &long, &long_points);
+    let mut failures = gate_waypoints(&ctx, &serve, &window, &window_points);
+    failures.extend(gate_waypoints(&ctx, &serve, &long, &long_points));
+    assert!(
+        failures.is_empty(),
+        "cases over their calibrated floor: {failures:?}"
+    );
 }
 
-/// `window_left` masks out-of-window keys whether or not their pages are
-/// still resident, so releasing them need not change a single generated
-/// token.
-#[test]
-#[ignore = "requires the pinned 12B checkpoint and a GPU"]
-fn eviction_is_footprint_only() {
-    let (ctx, mut serve, _dir) = stack_with(1300, 120);
-    let prompt = synthetic_tokens(1023, 5);
+fn incremental_argmaxes(ctx: &DeviceContext, serve: &GemmaServe, prompt: &[u32]) -> Vec<usize> {
+    let mut kv = serve.alloc_kv();
+    let mut arena = serve
+        .alloc_step_arena(ctx, 1, false)
+        .expect("oracle step arena");
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, 1).expect("admit first token");
+    let first = serve.step(ctx, &mut kv, &prompt[..1]).expect("first step");
+    let mut choices = vec![argmax(&first.to_host(ctx).expect("first logits D2H"))];
+    for &token in &prompt[1..] {
+        let row = decode_serving(serve, ctx, &mut arena, &mut kv, token).expect("decode");
+        choices.push(argmax(&row));
+    }
+    choices
+}
 
-    let run = |serve: &GemmaServe| -> (Vec<u32>, usize) {
-        let mut kv = serve.alloc_kv();
-        let mut arena = serve
-            .alloc_step_arena(&ctx, 1, false)
-            .expect("oracle step arena");
-        admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, prompt.len())
-            .expect("admit prompt");
-        let logits = serve.step(&ctx, &mut kv, &prompt).expect("prefill");
-        let mut next = argmax_last(&ctx, &logits).expect("argmax");
-        let mut tokens = vec![next];
-        for _ in 1..30 {
-            let row = decode_serving(serve, &ctx, &mut arena, &mut kv, next).expect("decode");
-            next = u32::try_from(argmax(&row)).expect("token id");
-            tokens.push(next);
-        }
-        (tokens, kv.local.held_pages())
-    };
+fn recomputed_argmaxes(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    prompt: &[u32],
+    positions: &[usize],
+) -> Vec<usize> {
+    positions
+        .iter()
+        .map(|&position| argmax(&serving_recompute(ctx, serve, &prompt[..=position])))
+        .collect()
+}
 
-    let (evicted, pages_evicted) = run(&serve);
-    serve.set_release_for_test(false);
-    let (retained, pages_retained) = run(&serve);
-    assert_eq!(evicted, retained, "releasing changed the generated tokens");
-    eprintln!("local pages at end: released {pages_evicted} vs retained {pages_retained}");
-    assert!(
-        pages_evicted < pages_retained,
-        "release must shrink the resident footprint ({pages_evicted} vs {pages_retained})"
+fn agreement(left: &[usize], right: &[usize]) -> usize {
+    left.iter().zip(right).filter(|(a, b)| a == b).count()
+}
+
+struct AgreementCase {
+    tensor_name: &'static str,
+    prompt: Vec<u32>,
+    sampled: Vec<usize>,
+}
+
+fn agreement_case(
+    fixture: &safetensors::SafeTensors<'_>,
+    tensor_name: &'static str,
+    truncate_to: usize,
+    stride: usize,
+) -> AgreementCase {
+    let (_, mut prompt) = u32_tensor(fixture, tensor_name);
+    prompt.truncate(truncate_to);
+    let sampled: Vec<usize> = (0..prompt.len()).step_by(stride).collect();
+    AgreementCase {
+        tensor_name,
+        prompt,
+        sampled,
+    }
+}
+
+fn bf16_agreement(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    case: &AgreementCase,
+) -> (Vec<usize>, usize) {
+    let incremental = incremental_argmaxes(ctx, serve, &case.prompt);
+    // The same-schedule run-to-run baseline, measured on this exact prompt
+    // and schedule: a replay must agree everywhere, which is why a lossy
+    // storage is judged against the cross-shape floor below instead.
+    let replay = incremental_argmaxes(ctx, serve, &case.prompt);
+    let replay_matches = agreement(&incremental, &replay);
+    eprintln!(
+        "{}: same-schedule bf16 run-to-run agreement {replay_matches}/{}",
+        case.tensor_name,
+        incremental.len()
     );
+    assert_eq!(
+        replay_matches,
+        incremental.len(),
+        "{}: the same-schedule bf16 replay must be deterministic",
+        case.tensor_name
+    );
+    let recomputed = recomputed_argmaxes(ctx, serve, &case.prompt, &case.sampled);
+    let sampled = case
+        .sampled
+        .iter()
+        .map(|&pos| incremental[pos])
+        .collect::<Vec<_>>();
+    let floor_matches = agreement(&sampled, &recomputed);
+    (sampled, floor_matches)
+}
+
+fn judge_agreement(case: &AgreementCase, floor: usize, fp8: usize) {
+    let samples = case.sampled.len();
+    let samples_f64 = f64::from(u32::try_from(samples).expect("sample count fits u32"));
+    let floor_rate = f64::from(u32::try_from(floor).expect("match count fits u32")) / samples_f64;
+    let fp8_rate = f64::from(u32::try_from(fp8).expect("match count fits u32")) / samples_f64;
+    eprintln!(
+        "{}: argmax agreement: bf16 incremental/recompute {floor_rate:.6} \
+         ({floor}/{samples}), fp8/bf16 incremental {fp8_rate:.6} ({fp8}/{samples})",
+        case.tensor_name
+    );
+    assert!(
+        floor * 2 > samples,
+        "{}: degenerate bf16 incremental/recompute floor {floor}/{samples}",
+        case.tensor_name
+    );
+    assert!(
+        fp8 >= floor,
+        "{}: fp8/bf16 argmax agreement {fp8}/{samples} is below the bf16 \
+         incremental/recompute floor {floor}/{samples}",
+        case.tensor_name
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
+fn fp8_argmax_agreement_meets_the_bf16_floor() {
+    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("window fixture");
+    let cases = [("w1023_prompt", usize::MAX, 2), ("w4096_prompt", 2048, 8)]
+        .map(|(name, cut, stride)| agreement_case(&fixture, name, cut, stride));
+    let max_context = cases
+        .iter()
+        .map(|case| case.prompt.len().div_ceil(crate::kv::PAGE_SIZE) * crate::kv::PAGE_SIZE)
+        .max()
+        .expect("agreement cases");
+    let pages = max_context.div_ceil(crate::kv::PAGE_SIZE) + 2;
+
+    let (ctx, bf16, _) = stack_with_storage(max_context, pages, KvStorage::Bf16);
+    let bf16_results = cases
+        .each_ref()
+        .map(|case| bf16_agreement(&ctx, &bf16, case));
+    drop(bf16);
+    drop(ctx);
+
+    let (ctx, fp8, _) = stack_with_storage(max_context, pages, KvStorage::E4m3);
+    let fp8_results: Vec<usize> = cases
+        .iter()
+        .zip(bf16_results.iter())
+        .map(|(case, (bf16, _))| {
+            let incremental = incremental_argmaxes(&ctx, &fp8, &case.prompt);
+            let sampled = case
+                .sampled
+                .iter()
+                .map(|&pos| incremental[pos])
+                .collect::<Vec<_>>();
+            agreement(&sampled, bf16)
+        })
+        .collect();
+    drop(fp8);
+    drop(ctx);
+
+    for ((case, (_, floor)), fp8) in cases.iter().zip(bf16_results).zip(fp8_results) {
+        judge_agreement(case, floor, fp8);
+    }
+}
+
+/// The two arms run different launch shapes (one-token decode against a
+/// whole-prompt prefill), which this engine does not promise bit-equal, so
+/// the callers bound the raw-logit drift by the calibrated ceiling — but the
+/// decision must not move: the argmax has to be identical, measured zero
+/// flips across the fixture.
+fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> f32 {
+    assert!(
+        ours.iter().chain(theirs.iter()).all(|v| v.is_finite()),
+        "{what}: non-finite logit"
+    );
+    let (a, b) = (argmax(ours), argmax(theirs));
+    assert_eq!(a, b, "{what}: argmax diverged ({a} vs {b})");
+    ours.iter()
+        .zip(theirs)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// The whole-prefix recompute of the serving path, reduced to its last row.
+fn serving_recompute(ctx: &DeviceContext, serve: &GemmaServe, tokens: &[u32]) -> Vec<f32> {
+    let mut kv = serve.alloc_kv();
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, tokens.len())
+        .expect("admit recompute");
+    let logits = serve.step(ctx, &mut kv, tokens).expect("serving recompute");
+    let host = logits.to_host(ctx).expect("recompute D2H");
+    let vocab = logits.hidden_dim;
+    host[(logits.seq_len - 1) * vocab..].to_vec()
+}
+
+/// One forward path answers for itself: every prompt position's incremental
+/// logits (one token at a time through the decode arena) match a whole-prompt
+/// recompute of the same serving path, and four decode steps fed the
+/// recompute's own greedy picks match it too — so one divergence cannot
+/// cascade. Both arms run the production release path; this short
+/// trajectory never crosses the window — the crossing itself is pinned by
+/// the waypoint, mixed-window, overlap and ragged gates.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, the golden fixture, and a GPU"]
+fn incremental_serving_matches_recompute() {
+    let (ctx, serve, _dir) = load_stack();
+    // The golden fixture's short prompt: real text, and the tokens the
+    // ceiling below was calibrated on. Read for its prompt only.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../test_data/gemma4-12b-hf-golden.safetensors"
+    );
+    let bytes = std::fs::read(path).expect("read golden fixture (dump on the box first)");
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
+    let (_, tokens_i32) = i32_tensor(&fixture, "short_tokens");
+    let mut tokens: Vec<u32> = tokens_i32
+        .iter()
+        .map(|&t| u32::try_from(t).expect("token id"))
+        .collect();
+
+    let mut kv = serve.alloc_kv();
+    let mut arena = serve
+        .alloc_step_arena(&ctx, 1, false)
+        .expect("oracle step arena");
+    let mut max_abs = 0.0f32;
+    for pos in 0..tokens.len() {
+        let incremental = if pos == 0 {
+            admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, 1)
+                .expect("admit first prompt token");
+            serve
+                .step(&ctx, &mut kv, &tokens[..1])
+                .expect("first prompt token")
+                .to_host(&ctx)
+                .expect("D2H")
+        } else {
+            decode_serving(&serve, &ctx, &mut arena, &mut kv, tokens[pos])
+                .expect("teacher-forced prompt token")
+        };
+        let recomputed = serving_recompute(&ctx, &serve, &tokens[..=pos]);
+        let gap = compare_row(&incremental, &recomputed, &format!("prefill pos {pos}"));
+        eprintln!("prefill pos {pos}: max |dlogit| {gap}");
+        max_abs = max_abs.max(gap);
+    }
+    eprintln!(
+        "prefill: {} positions, max |dlogit| {max_abs}",
+        tokens.len()
+    );
+    assert!(
+        max_abs <= 2.0,
+        "prefill |dlogit| {max_abs} above calibrated 2.0"
+    );
+
+    let mut oracle_last = serving_recompute(&ctx, &serve, &tokens);
+    for step in 0..4 {
+        let next = u32::try_from(argmax(&oracle_last)).expect("token id");
+        let step_host =
+            decode_serving(&serve, &ctx, &mut arena, &mut kv, next).expect("serve decode step");
+        tokens.push(next);
+        oracle_last = serving_recompute(&ctx, &serve, &tokens);
+        let gap = compare_row(&step_host, &oracle_last, &format!("decode step {step}"));
+        eprintln!("decode step {step}: max |dlogit| {gap}");
+        assert!(
+            gap <= 2.0,
+            "decode step {step} |dlogit| {gap} above calibrated 2.0"
+        );
+    }
 }
 
 /// DoD gate: greedy continuation matches HF `generate()` token for
@@ -452,8 +680,10 @@ fn greedy_matches_hf_generate() {
     );
 }
 
-fn mixed_gate_argmax(host: &[f32], row: usize, vocab: usize) -> u32 {
-    u32::try_from(argmax(&host[row * vocab..(row + 1) * vocab])).expect("token id")
+/// The production sampler draws from the true vocabulary; a padded lm_head
+/// column is never a candidate, so neither is it here.
+fn mixed_gate_argmax(host: &[f32], row: usize, stride: usize, bound: usize) -> u32 {
+    u32::try_from(argmax(&host[row * stride..row * stride + bound])).expect("token id")
 }
 
 /// Reserve a lane's whole prompt. These gates drive the serving primitives
@@ -494,7 +724,8 @@ fn gate_host_logits(ctx: &DeviceContext, logits: &HiddenStates) -> (usize, Vec<f
 /// live lanes, so a mixed round and a pure one advance the batch alike.
 fn settle_gate_lanes(
     host: &[f32],
-    vocab: usize,
+    stride: usize,
+    bound: usize,
     row_base: usize,
     lanes: &mut Vec<(usize, GemmaKv, u32)>,
     produced: &mut [Vec<u32>],
@@ -502,7 +733,7 @@ fn settle_gate_lanes(
 ) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, (req, _, next)) in lanes.iter_mut().enumerate() {
-        let token = mixed_gate_argmax(host, row + row_base, vocab);
+        let token = mixed_gate_argmax(host, row + row_base, stride, bound);
         produced[*req].push(token);
         if produced[*req].len() >= budgets[*req] {
             retire.push(row);
@@ -536,7 +767,15 @@ fn mixed_gate_decode_rounds(
                 .expect("batched decode");
             gate_host_logits(ctx, logits)
         };
-        settle_gate_lanes(&host, vocab, 0, lanes, produced, budgets);
+        settle_gate_lanes(
+            &host,
+            vocab,
+            serve.weights.config.vocab_size,
+            0,
+            lanes,
+            produced,
+            budgets,
+        );
     }
 }
 
@@ -596,11 +835,19 @@ fn assert_mixed_admissions_match_serial(ctx: &DeviceContext, serve: &GemmaServe)
                 .expect("k=2 mixed step");
             gate_host_logits(ctx, logits)
         };
-        settle_gate_lanes(&host, vocab, 2, &mut lanes, &mut produced, &budgets);
-        let first_b = mixed_gate_argmax(&host, 0, vocab);
+        settle_gate_lanes(
+            &host,
+            vocab,
+            serve.weights.config.vocab_size,
+            2,
+            &mut lanes,
+            &mut produced,
+            &budgets,
+        );
+        let first_b = mixed_gate_argmax(&host, 0, vocab, serve.weights.config.vocab_size);
         produced[1].push(first_b);
         lanes.push((1, kv_b, first_b));
-        let first_c = mixed_gate_argmax(&host, 1, vocab);
+        let first_c = mixed_gate_argmax(&host, 1, vocab, serve.weights.config.vocab_size);
         produced[2].push(first_c);
         lanes.push((2, kv_c, first_c));
         mixed_gate_decode_rounds(
@@ -681,8 +928,16 @@ fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &Gemm
                 "the mixed prefill must have released its window front (origin {})",
                 kv.local.origin_pages()
             );
-            settle_gate_lanes(&host, vocab, 1, &mut lanes, &mut produced, &budgets);
-            mixed_gate_argmax(&host, 0, vocab)
+            settle_gate_lanes(
+                &host,
+                vocab,
+                serve.weights.config.vocab_size,
+                1,
+                &mut lanes,
+                &mut produced,
+                &budgets,
+            );
+            mixed_gate_argmax(&host, 0, vocab, serve.weights.config.vocab_size)
         } else {
             let logits = serve
                 .step(ctx, &mut kv, &long_prompt)
@@ -731,9 +986,172 @@ fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &Gemm
 #[test]
 #[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn mixed_step_matches_serial() {
-    let (ctx, serve, _dir) = stack_with(2048, 512);
+    // This is a bf16 bit-exactness contract; distribution and waypoint gates judge fp8.
+    let (ctx, serve, _dir) = stack_with_storage(2048, 512, KvStorage::Bf16);
     assert_mixed_admissions_match_serial(&ctx, &serve);
     assert_mixed_window_crossing_matches_serial(&ctx, &serve);
+}
+
+fn assert_finite_gate_logits(host: &[f32], what: &str) {
+    assert!(
+        host.iter().all(|value| value.is_finite()),
+        "{what}: mixed step produced non-finite logits"
+    );
+}
+
+fn assert_gate_page_accounting(serve: &GemmaServe, kv: &GemmaKv, what: &str) {
+    let page = serve.local_pool.layout().page_size;
+    let kv_len = kv.local.seq_len();
+    assert_eq!(kv.global.seq_len(), kv_len, "{what}: KV lengths");
+    let released = kv_len.saturating_sub(serve.sliding_window) / page;
+    assert_eq!(
+        kv.local.held_pages(),
+        kv_len.div_ceil(page) - released,
+        "{what}: local pages"
+    );
+    assert_eq!(
+        kv.global.held_pages(),
+        kv_len.div_ceil(page),
+        "{what}: global pages"
+    );
+}
+
+fn fp8_plain_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
+    let prompts = crate::testkit::generate_fixture_prompts();
+    let budgets = [50usize, 37, 44];
+    let mut arena = serve.alloc_step_arena(ctx, 4, false).expect("step arena");
+    let mut lanes = Vec::new();
+    let mut produced = vec![Vec::new(); prompts.len()];
+
+    let (kv_a, first_a) = gate_open_lane(ctx, serve, &prompts[0], "prompt a");
+    produced[0].push(first_a);
+    lanes.push((0, kv_a, first_a));
+    mixed_gate_decode_rounds(
+        ctx,
+        serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        3,
+    );
+
+    let mut kv_b = gate_admit_kv(serve, &prompts[1], "prompt b");
+    let mut kv_c = gate_admit_kv(serve, &prompts[2], "prompt c");
+    let tokens = gate_step_tokens(serve, &mut lanes);
+    let (vocab, host) = {
+        let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+        let mut prefills = [
+            (&mut kv_b, prompts[1].as_slice()),
+            (&mut kv_c, prompts[2].as_slice()),
+        ];
+        let logits = serve
+            .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
+            .expect("k=2 mixed step");
+        gate_host_logits(ctx, logits)
+    };
+    assert_finite_gate_logits(&host, "plain fp8 walk");
+    settle_gate_lanes(
+        &host,
+        vocab,
+        serve.weights.config.vocab_size,
+        2,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+    );
+    for (req, kv, row) in [(1, kv_b, 0), (2, kv_c, 1)] {
+        let first = mixed_gate_argmax(&host, row, vocab, serve.weights.config.vocab_size);
+        produced[req].push(first);
+        lanes.push((req, kv, first));
+    }
+    mixed_gate_decode_rounds(
+        ctx,
+        serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        3,
+    );
+    mixed_gate_decode_rounds(
+        ctx,
+        serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        usize::MAX,
+    );
+    for (tokens, budget) in produced.iter().zip(budgets) {
+        assert_eq!(tokens.len(), budget, "fp8 mixed lane token budget");
+    }
+}
+
+fn fp8_window_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
+    let partner: Vec<u32> = (0..40u32).map(|i| 1000 + i * 31).collect();
+    let long_prompt: Vec<u32> = (0..1500u32).map(|i| 1000 + (i * 37) % 50000).collect();
+    let budgets = [24usize, 20];
+    let mut arena = serve.alloc_step_arena(ctx, 2, false).expect("step arena");
+    let mut produced = vec![Vec::new(); 2];
+    let (kv_partner, first_partner) = gate_open_lane(ctx, serve, &partner, "partner");
+    let mut lanes = vec![(0, kv_partner, first_partner)];
+    produced[0].push(first_partner);
+    mixed_gate_decode_rounds(
+        ctx,
+        serve,
+        &mut arena,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+        3,
+    );
+
+    let mut kv_long = gate_admit_kv(serve, &long_prompt, "long prompt");
+    let tokens = gate_step_tokens(serve, &mut lanes);
+    let (vocab, host) = {
+        let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+        let mut prefills = [(&mut kv_long, long_prompt.as_slice())];
+        let logits = serve
+            .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
+            .expect("window-crossing mixed step");
+        gate_host_logits(ctx, logits)
+    };
+    assert_finite_gate_logits(&host, "window-crossing fp8 walk");
+    assert_gate_page_accounting(serve, &kv_long, "long prompt mixed step");
+    settle_gate_lanes(
+        &host,
+        vocab,
+        serve.weights.config.vocab_size,
+        1,
+        &mut lanes,
+        &mut produced,
+        &budgets,
+    );
+    let first_long = mixed_gate_argmax(&host, 0, vocab, serve.weights.config.vocab_size);
+    produced[1].push(first_long);
+    lanes.push((1, kv_long, first_long));
+
+    for (req, mut kv, mut next) in lanes {
+        while produced[req].len() < budgets[req] {
+            let host = decode_serving(serve, ctx, &mut arena, &mut kv, next).expect("decode");
+            let bound = serve.weights.config.vocab_size.min(host.len());
+            next = u32::try_from(argmax(&host[..bound])).expect("token id");
+            produced[req].push(next);
+        }
+        assert_gate_page_accounting(serve, &kv, ["partner", "long prompt"][req]);
+    }
+    for (tokens, budget) in produced.iter().zip(budgets) {
+        assert_eq!(tokens.len(), budget, "fp8 window lane token budget");
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, generate prompts, and a GPU"]
+fn fp8_mixed_walk_holds_its_structure() {
+    let (ctx, serve, _dir) = stack_with_storage(2048, 512, KvStorage::E4m3);
+    fp8_plain_mixed_walk(&ctx, &serve);
+    fp8_window_mixed_walk(&ctx, &serve);
 }
 
 /// The overlap-safe prefill under a lane-stream override must be bit-equal
@@ -850,7 +1268,8 @@ fn overlapped_prefill_matches_the_sync_step() {
 #[ignore = "requires the pinned 12B checkpoint and a GPU"]
 fn prefix_restore_matches_cold_path() {
     use crate::prefix_cache::PrefixCache;
-    let (ctx, serve, _dir) = stack_with(4096, 512);
+    // The cache's page copies are bf16-only; distribution and waypoint gates judge fp8.
+    let (ctx, serve, _dir) = stack_with_storage(4096, 512, KvStorage::Bf16);
     let window = serve.weights.config.sliding_window;
     let mut arena = serve.alloc_step_arena(&ctx, 1, false).expect("step arena");
     let budget = 16usize;

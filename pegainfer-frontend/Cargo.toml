@@ -25,7 +25,10 @@ vllm-server = { workspace = true }
 zeromq = { workspace = true }
 
 [dev-dependencies]
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+vllm-chat = { workspace = true }
+vllm-text = { workspace = true }
 
 [lints]
 workspace = true

@@ -9,13 +9,16 @@ use half::bf16;
 use pegainfer_kernels::ops::K3_CONV_WIDTH;
 use pegainfer_kernels::ops::K3_MLA_HEADS;
 use pegainfer_kernels::ops::argmax_bf16_split_into;
-use pegainfer_kernels::ops::gemm_rows_into_checked;
+use pegainfer_kernels::ops::gemm_rows_span_into_checked;
 use pegainfer_kernels::ops::k3_conv_silu_batched_launch;
 use pegainfer_kernels::ops::k3_flash_kda_fwd_launch;
+use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_dense_launch;
 use pegainfer_kernels::ops::k3_flash_mla_prefill_fwd_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
 use pegainfer_kernels::ops::k3_mla_prefill_expand_k_launch;
 use pegainfer_kernels::ops::k3_mla_prefill_gather_launch;
+use pegainfer_kernels::ops::k3_mla_prefill_lse_merge_launch;
+use pegainfer_kernels::ops::k3_mla_prefill_o_finalize_launch;
 use pegainfer_kernels::ops::k3_o_norm_gate_batched_launch;
 use pegainfer_kernels::ops::k3_rms_norm_rbs_batched_launch;
 use pegainfer_kernels::tensor::DeviceContext;
@@ -321,8 +324,8 @@ pub(super) fn kda_attention_chunk(
                 K3_HIDDEN,
             )?;
         }
-        let group = cp.group.clone();
-        let sync = cp.window_sync(K3CpWindowKind::Halo);
+        let group = cp.sync.clone();
+        let sync = cp.window_sync(K3CpWindowKind::Halo)?;
         group.exchange(ctx, &sync, || {
             if cp.cp_rank > 0 {
                 let source = cp.peers[cp.cp_rank - 1].normed_tail;
@@ -579,8 +582,8 @@ pub(super) fn kda_attention_chunk(
                     K3_KDA_STATE,
                 )?;
             }
-            let cp_group = cp.group.clone();
-            let cp_sync = cp.window_sync(K3CpWindowKind::Upstream);
+            let cp_group = cp.sync.clone();
+            let cp_sync = cp.window_sync(K3CpWindowKind::Upstream)?;
             cp_group.exchange(ctx, &cp_sync, || {
                 for j in 0..cp.cp_rank {
                     k3_cp_copy_in(
@@ -835,8 +838,8 @@ pub(super) fn mla_attention_chunk_cp(
         t_q,
         crate::config::K3_QK_ROPE_HEAD_DIM,
     )?;
-    let group = cp.group.clone();
-    let sync = cp.window_sync(K3CpWindowKind::Upstream);
+    let group = cp.sync.clone();
+    let sync = cp.window_sync(K3CpWindowKind::Upstream)?;
     group.exchange(ctx, &sync, || {
         for j in 0..cp.cp_rank {
             let (peer_start, peer_len) = cp.segments[j];
@@ -895,7 +898,14 @@ pub(super) fn mla_attention_chunk_cp(
 }
 
 /// The shared tail of a chunk's MLA attention: kv_b expansion of the
-/// assembled `[t_kv]` context latents and one causal Q-at-the-end FMHA.
+/// assembled `[t_kv]` context latents and the Q-at-the-end FMHA.
+///
+/// The expansion scratch holds `min(max_ctx, K3_MLA_CTX_WINDOW)` rows. A
+/// context that fits takes today's single causal call, bitwise unchanged. A
+/// deeper one walks the past in dense windows — expand a window, attend all
+/// `t_q` queries over it unmasked, fold output and log-sum-exp into the f32
+/// accumulator — and closes with the causal `t_q x t_q` call over the chunk's
+/// own keys; the finalize converts the merged accumulator into `s.attn`.
 fn mla_chunk_attend(
     ctx: &DeviceContext,
     t_q: usize,
@@ -908,36 +918,113 @@ fn mla_chunk_attend(
         "K3 MLA prefill workspace of {} tokens cannot span the {t_kv}-token context",
         s.mla_ctx_latent.data.len() / K3_KV_LORA_RANK
     );
-    s.mla_ctx_latent.seq_len = t_kv;
-    s.mla_ctx_nope_v.seq_len = t_kv;
-    gemm_rows_into_checked(
-        ctx,
-        &w.w_kv_b,
-        0,
-        K3_KV_B_OUT,
-        &s.mla_ctx_latent,
-        &mut s.mla_ctx_nope_v,
-    )?;
-    k3_mla_prefill_expand_k_launch(
-        ctx,
-        t_kv,
-        K3_MLA_HEADS,
-        &s.mla_ctx_nope_v.data,
-        &s.mla_ctx_rope,
-        &mut s.mla_ctx_k,
-    )?;
     // The decode kernel reads the softmax scale as a bf16 device scalar; feed
     // the FMHA the same rounded constant so the two paths agree on it.
     let scale = bf16::from_f64(crate::model::k3_mla_scale()).to_f32();
+    s.mla_ctx_latent.seq_len = t_kv;
+    let win = s.mla_ctx_k.len() / crate::config::K3_Q_B_OUT;
+    if t_kv <= win {
+        mla_expand_window(ctx, w, s, 0, t_kv)?;
+        return k3_flash_mla_prefill_fwd_launch(
+            ctx,
+            t_q,
+            t_kv,
+            K3_MLA_HEADS,
+            &s.query,
+            &s.mla_ctx_k,
+            &s.mla_ctx_nope_v.data,
+            &mut s.attn,
+            None,
+            scale,
+        );
+    }
+    // Dense windows over the past context, then the chunk's own causal window.
+    let ctx_len = t_kv - t_q;
+    ensure!(
+        t_q <= win,
+        "K3 MLA prefill chunk of {t_q} queries exceeds the {win}-row expansion window"
+    );
+    let mut row = 0;
+    while row < ctx_len {
+        let len = win.min(ctx_len - row);
+        mla_expand_window(ctx, w, s, row, len)?;
+        k3_flash_mla_prefill_fwd_dense_launch(
+            ctx,
+            t_q,
+            len,
+            K3_MLA_HEADS,
+            &s.query,
+            &s.mla_ctx_k,
+            &s.mla_ctx_nope_v.data,
+            &mut s.attn,
+            Some(&mut s.mla_lse_win),
+            scale,
+        )?;
+        k3_mla_prefill_lse_merge_launch(
+            ctx,
+            t_q,
+            K3_MLA_HEADS,
+            &s.attn,
+            &s.mla_lse_win,
+            &mut s.mla_o_acc,
+            &mut s.mla_lse_acc,
+            row == 0,
+        )?;
+        row += len;
+    }
+    mla_expand_window(ctx, w, s, ctx_len, t_q)?;
     k3_flash_mla_prefill_fwd_launch(
         ctx,
         t_q,
-        t_kv,
+        t_q,
         K3_MLA_HEADS,
         &s.query,
         &s.mla_ctx_k,
         &s.mla_ctx_nope_v.data,
         &mut s.attn,
+        Some(&mut s.mla_lse_win),
         scale,
+    )?;
+    k3_mla_prefill_lse_merge_launch(
+        ctx,
+        t_q,
+        K3_MLA_HEADS,
+        &s.attn,
+        &s.mla_lse_win,
+        &mut s.mla_o_acc,
+        &mut s.mla_lse_acc,
+        false,
+    )?;
+    k3_mla_prefill_o_finalize_launch(ctx, t_q, K3_MLA_HEADS, &s.mla_o_acc, &mut s.attn)
+}
+
+/// Expand context rows `[row, row + len)` through `kv_b` into the window
+/// scratch: the nope|value expansion lands in `mla_ctx_nope_v` and the
+/// assembled per-head K rows in `mla_ctx_k`, both window-relative.
+fn mla_expand_window(
+    ctx: &DeviceContext,
+    w: &K3MlaWeights,
+    s: &mut K3Scratch,
+    row: usize,
+    len: usize,
+) -> Result<()> {
+    s.mla_ctx_nope_v.seq_len = len;
+    gemm_rows_span_into_checked(
+        ctx,
+        &w.w_kv_b,
+        0,
+        K3_KV_B_OUT,
+        &s.mla_ctx_latent,
+        row,
+        &mut s.mla_ctx_nope_v,
+    )?;
+    k3_mla_prefill_expand_k_launch(
+        ctx,
+        len,
+        K3_MLA_HEADS,
+        &s.mla_ctx_nope_v.data,
+        &s.mla_ctx_rope,
+        row,
+        &mut s.mla_ctx_k,
     )
 }

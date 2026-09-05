@@ -68,6 +68,7 @@ mod dspark;
 pub mod ep;
 mod forward;
 mod paged_kv;
+pub(crate) mod whale_gang;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -98,6 +99,8 @@ use self::buffers::K3Scratch;
 use self::buffers::K3StatePool;
 use self::cp::K3CpGroup;
 use self::cp::K3CpScratch;
+use self::cp::k3_whale_admits;
+use self::cp::k3_whale_segments;
 use self::dspark::K3_DSPARK_AUX_LAYERS;
 use self::dspark::K3_DSPARK_BLOCK;
 use self::dspark::K3_DSPARK_CONTEXT_DIM;
@@ -123,6 +126,7 @@ use crate::model::K3RankModel;
 use crate::scheduler::DecodeSlot;
 use crate::scheduler::SlotId;
 use crate::scheduler::StepExecutor;
+use crate::scheduler::whale::CommittedWhale;
 use crate::weights::K3RankGpuContext;
 use crate::weights::K3WeightManifest;
 use crate::weights::load_rank_weights_to_gpu;
@@ -395,8 +399,14 @@ pub struct K3Executor {
     /// Present exactly when `ep_size > 1`: this rank's slab handshake with its
     /// peers. It issues nothing per step.
     ep: Option<K3EpRuntime>,
-    /// Context-parallel working set, allocated at the first [`Self::prefill_cp`].
+    /// Context-parallel working set, allocated at the first
+    /// [`Self::prefill_cp`] (in-process) or [`Self::prefill_whale`] (fleet).
     cp_scratch: Option<Box<K3CpScratch>>,
+    /// This rank's whale slab, allocated by [`Self::arm_whale_slab`] before
+    /// the fleet's handle exchange: local base plus the world-agreed layout.
+    whale_slab: Option<(u64, whale_gang::K3WhaleSlabLayout)>,
+    /// The imported whale data plane, installed after the exchange.
+    whale_gang: Option<Arc<whale_gang::K3WhaleGang>>,
 }
 
 // SAFETY: the executor owns one rank's context, stream and device buffers, and
@@ -714,6 +724,8 @@ impl K3Executor {
             bound_thread: None,
             ep,
             cp_scratch: None,
+            whale_slab: None,
+            whale_gang: None,
         })
     }
 
@@ -1091,6 +1103,24 @@ impl StepExecutor for K3Executor {
         }
     }
 
+    /// Enter a committed whale's superstep as the gang member the descriptor
+    /// seats at `whale.cp_rank` — the fleet counterpart of
+    /// [`Self::prefill_cp`], with the same segment walk over the same chunk
+    /// step; only the exchange substrate differs (fabric slabs and doorbells
+    /// for peer copies and events). The owner (the poster, always the last
+    /// CP rank) passes its decode `slot` and gets the boundary token back.
+    fn prefill_whale(
+        &mut self,
+        whale: &CommittedWhale,
+        slot: Option<SlotId>,
+    ) -> Result<Option<u32>> {
+        let rank = self.model.rank;
+        match self.prefill_whale_inner(whale, slot) {
+            Err(error) if self.is_expert_parallel() => ep_fatal(rank, "prefill-whale", &error),
+            other => other,
+        }
+    }
+
     /// One padding step, waited to completion.
     ///
     /// A scheduler thread leveling up at a CP-gang board must keep feeding
@@ -1293,7 +1323,6 @@ impl K3Executor {
             self.chunk_tokens
         );
         let segments = cp::k3_cp_segments(prompt.len(), cp_size);
-        let (seg_start, seg_len) = segments[cp_rank];
         let owner = cp_rank + 1 == cp_size;
         ensure!(
             !owner || slot < self.max_batch,
@@ -1306,6 +1335,30 @@ impl K3Executor {
         self.enter_step()?;
         self.prefill_state.reset_row(&self.ctx, 0)?;
         self.ensure_cp_scratch(group, cp_rank, segments)?;
+        self.cp_superstep(owner.then_some(slot), prompt, cp_rank, cp_size)
+    }
+
+    /// The shared body of one CP superstep, run after the scratch is armed
+    /// with this superstep's split — the in-process gang and the fleet whale
+    /// gang differ only in how they got here. `slot` is set exactly on the
+    /// owner (the last CP rank).
+    fn cp_superstep(
+        &mut self,
+        slot: Option<SlotId>,
+        prompt: &[u32],
+        cp_rank: usize,
+        cp_size: usize,
+    ) -> Result<Option<u32>> {
+        let owner = cp_rank + 1 == cp_size;
+        ensure!(
+            owner == slot.is_some(),
+            "K3 CP superstep: the owner and only the owner adopts a decode slot"
+        );
+        let (seg_start, seg_len) = self
+            .cp_scratch
+            .as_ref()
+            .context("K3 CP superstep needs an armed scratch")?
+            .segments[cp_rank];
 
         // Stage the segment at global positions for causality. Only the OWNER
         // stages the paged pool (at global positions): the step's normal
@@ -1372,7 +1425,7 @@ impl K3Executor {
         if let Some(mega) = self.scratch.mega.as_ref() {
             mega.end_step()?;
         }
-        if owner {
+        if let Some(slot) = slot {
             // The owner's post-chunk state IS the whole prompt's: the merged
             // upstream KDA state fed its chunk, its conv window is the prompt
             // tail, and its pool covers positions 0..len. Sample the boundary
@@ -1428,7 +1481,7 @@ impl K3Executor {
             // One gang per process, one seg_cap per executor — the scratch
             // built once serves every superstep.
             ensure!(
-                Arc::ptr_eq(&scratch.group, group),
+                matches!(&scratch.sync, cp::K3CpSyncHandle::Local(mine) if Arc::ptr_eq(mine, group)),
                 "K3 CP scratch was built for a different gang"
             );
         } else {
@@ -1453,6 +1506,44 @@ impl K3Executor {
             .as_mut()
             .expect("built above")
             .arm(&self.ctx, cp_rank, segments)
+    }
+
+    fn prefill_whale_inner(
+        &mut self,
+        whale: &CommittedWhale,
+        slot: Option<SlotId>,
+    ) -> Result<Option<u32>> {
+        let descriptor = &whale.descriptor;
+        let width = descriptor.gang.len();
+        let cp_rank = whale.cp_rank;
+        let prompt: &[u32] = &descriptor.prompt;
+        ensure!(
+            prompt.len() <= self.max_ctx,
+            "K3 whale prompt of {} tokens exceeds the {} context",
+            prompt.len(),
+            self.max_ctx
+        );
+        // The descriptor crossed a process boundary: re-check the admission
+        // predicate its segments are derived from before trusting it.
+        ensure!(
+            k3_whale_admits(prompt.len(), width, self.chunk_tokens),
+            "K3 whale {}: {} tokens across a width-{width} gang does not fit the {}-token chunk \
+             cap",
+            descriptor.seq,
+            prompt.len(),
+            self.chunk_tokens
+        );
+        if let Some(slot) = slot {
+            ensure!(
+                slot < self.max_batch,
+                "K3 whale slot {slot} is out of range"
+            );
+        }
+        let segments = k3_whale_segments(prompt.len(), width, self.chunk_tokens);
+        self.enter_step()?;
+        self.prefill_state.reset_row(&self.ctx, 0)?;
+        self.ensure_whale_scratch(descriptor.seq, cp_rank, &descriptor.gang, segments)?;
+        self.cp_superstep(slot, prompt, cp_rank, width)
     }
 
     /// One decode step.

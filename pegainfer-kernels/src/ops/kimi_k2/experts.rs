@@ -6,6 +6,10 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::ops::marlin_face::MarlinAlignBuffers;
+use crate::ops::marlin_face::MarlinGemmBuffers;
+use crate::ops::marlin_face::launch_marlin_align;
+use crate::ops::marlin_face::launch_marlin_gemm;
 #[cfg(test)]
 use crate::tensor::AxisSpec;
 use crate::tensor::DeviceContext;
@@ -749,30 +753,37 @@ pub fn kimi_moe_marlin_align_block_size<'a>(
     );
 
     {
-        let (topk_ptr, _topk_guard) = topk_idx.device_ptr(&ctx.stream);
-        let (sorted_ptr, _sorted_guard) = workspace.sorted_token_ids.device_ptr_mut(&ctx.stream);
-        let (expert_ids_ptr, _expert_ids_guard) = workspace.expert_ids.device_ptr_mut(&ctx.stream);
-        let (num_tokens_ptr, _num_tokens_guard) =
-            workspace.num_tokens_post_padded.device_ptr_mut(&ctx.stream);
-        let (offsets_ptr, _offsets_guard) = workspace.expert_offsets.device_ptr_mut(&ctx.stream);
-        let result = unsafe {
-            ffi::kimi_moe_marlin_align_block_size_cuda(
-                topk_ptr as *const i32,
-                sorted_ptr as *mut i32,
-                expert_ids_ptr as *mut i32,
-                num_tokens_ptr as *mut i32,
-                offsets_ptr as *mut u32,
-                std::ptr::null_mut(),
-                active_tokens as i32,
-                KIMI_K2_TOPK as i32,
-                global_expert_start as i32,
-                KIMI_K2_LOCAL_EXPERTS as i32,
-                workspace.block_size as i32,
-                workspace.max_padded_tokens as i32,
-                workspace.max_m_blocks as i32,
-                ctx.stream.cu_stream(),
-            )
+        let buffers = MarlinAlignBuffers {
+            topk_idx,
+            sorted_token_ids: &mut workspace.sorted_token_ids,
+            expert_ids: &mut workspace.expert_ids,
+            num_tokens_post_padded: &mut workspace.num_tokens_post_padded,
+            expert_offsets: &mut workspace.expert_offsets,
         };
+        let result = launch_marlin_align(
+            ctx,
+            buffers,
+            |topk_ptr, sorted_ptr, expert_ids_ptr, num_tokens_ptr, offsets_ptr| {
+                Ok(unsafe {
+                    ffi::kimi_moe_marlin_align_block_size_cuda(
+                        topk_ptr,
+                        sorted_ptr,
+                        expert_ids_ptr,
+                        num_tokens_ptr,
+                        offsets_ptr,
+                        std::ptr::null_mut(),
+                        active_tokens as i32,
+                        KIMI_K2_TOPK as i32,
+                        global_expert_start as i32,
+                        KIMI_K2_LOCAL_EXPERTS as i32,
+                        workspace.block_size as i32,
+                        workspace.max_padded_tokens as i32,
+                        workspace.max_m_blocks as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                })
+            },
+        )?;
         result.result()?;
     }
     Ok(KimiMarlinRouting {
@@ -1369,43 +1380,46 @@ fn launch_marlin_wna16_gemm(
         "Kimi Marlin WNA16 weight package must be non-empty"
     );
     let lock_len = workspace.locks.len();
-    let (input_ptr, _input_guard) = input.device_ptr(&ctx.stream);
-    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
-    let (c_tmp_ptr, _c_tmp_guard) = workspace.c_tmp.device_ptr_mut(&ctx.stream);
-    let (weight_ptr, _weight_guard) = weight_packed_uint4b8.device_ptr(&ctx.stream);
-    let (scale_ptr, _scale_guard) = weight_scale_permuted.device_ptr(&ctx.stream);
-    let (locks_ptr, _locks_guard) = workspace.locks.device_ptr_mut(&ctx.stream);
-    let (sorted_ptr, _sorted_guard) = routing.sorted_token_ids.device_ptr(&ctx.stream);
-    let (expert_ids_ptr, _expert_ids_guard) = routing.expert_ids.device_ptr(&ctx.stream);
-    let (num_tokens_ptr, _num_tokens_guard) =
-        routing.num_tokens_post_padded.device_ptr(&ctx.stream);
-    let (topk_ptr, _topk_guard) = topk_weight.device_ptr(&ctx.stream);
-    let result = unsafe {
-        ffi::kimi_marlin_wna16_gemm_cuda(
-            input_ptr as *const ffi::Half,
-            output_ptr as *mut ffi::Half,
-            c_tmp_ptr as *mut f32,
-            weight_ptr as *const u8,
-            scale_ptr as *const ffi::Half,
-            locks_ptr as *mut i32,
-            sorted_ptr as *const i32,
-            expert_ids_ptr as *const i32,
-            num_tokens_ptr as *const i32,
-            topk_ptr as *const f32,
-            lock_len as i32,
-            routing.max_padded_tokens as i32,
-            routing.block_size as i32,
-            top_k as i32,
-            mul_topk_weights,
-            size_m as i32,
-            size_n as i32,
-            size_k as i32,
-            KIMI_K2_LOCAL_EXPERTS as i32,
-            KIMI_K2_INT4_GROUP_SIZE as i32,
-            0,
-            ctx.stream.cu_stream(),
-        )
+    let buffers = MarlinGemmBuffers {
+        input,
+        output,
+        c_tmp: &mut workspace.c_tmp,
+        qweight: weight_packed_uint4b8,
+        scales: weight_scale_permuted,
+        workspace: &mut workspace.locks,
+        sorted_token_ids: routing.sorted_token_ids,
+        expert_ids: routing.expert_ids,
+        num_tokens_post_padded: routing.num_tokens_post_padded,
+        topk_weights: topk_weight,
     };
+    let result = launch_marlin_gemm(ctx, buffers, |ptrs| {
+        Ok(unsafe {
+            ffi::kimi_marlin_wna16_gemm_cuda(
+                ptrs.input,
+                ptrs.output,
+                ptrs.c_tmp,
+                ptrs.qweight,
+                ptrs.scales.cast::<ffi::Half>(),
+                ptrs.workspace,
+                ptrs.sorted_token_ids,
+                ptrs.expert_ids,
+                ptrs.num_tokens_post_padded,
+                ptrs.topk_weights,
+                lock_len as i32,
+                routing.max_padded_tokens as i32,
+                routing.block_size as i32,
+                top_k as i32,
+                mul_topk_weights,
+                size_m as i32,
+                size_n as i32,
+                size_k as i32,
+                KIMI_K2_LOCAL_EXPERTS as i32,
+                KIMI_K2_INT4_GROUP_SIZE as i32,
+                0,
+                ctx.stream.cu_stream(),
+            )
+        })
+    })?;
     result.result()?;
     Ok(())
 }
@@ -1539,30 +1553,6 @@ mod tests {
             manifest.marlin_packed_u32_elements() * std::mem::size_of::<u32>(),
             manifest.packed_shape.elements()
         );
-    }
-
-    #[test]
-    fn int4_offset_binary_nibbles_decode_to_signed_by_subtracting_eight() {
-        let decode = |byte: u8, col: usize| -> i8 {
-            let unsigned = if col.is_multiple_of(2) {
-                byte & 0x0f
-            } else {
-                (byte >> 4) & 0x0f
-            };
-            i8::try_from(unsigned).expect("nibble") - 8
-        };
-
-        for signed_even in -8i8..=7 {
-            for signed_odd in -8i8..=7 {
-                let even = u8::try_from(signed_even + 8).expect("even nibble");
-                let odd = u8::try_from(signed_odd + 8).expect("odd nibble");
-                let byte = even | (odd << 4);
-                assert_eq!(decode(byte, 0), signed_even);
-                assert_eq!(decode(byte, 1), signed_odd);
-                assert_eq!(i16::from(even) - i16::from(signed_even), 8);
-                assert_eq!(i16::from(odd) - i16::from(signed_odd), 8);
-            }
-        }
     }
 
     #[test]

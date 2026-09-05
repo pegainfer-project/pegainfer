@@ -159,6 +159,13 @@ impl VerifyGraphBuffers {
         &self.all_logits
     }
 
+    /// Mutable view, for truncating `seq_len` back to the unexpanded row count
+    /// after the hedge's winner rows have been compacted onto chain A's
+    /// offsets.
+    pub(crate) fn captured_hidden_mut(&mut self) -> &mut HiddenStates {
+        &mut self.captured_hidden
+    }
+
     /// Captured target hidden states `[hidden_size * num_capture_layers, total_rows]`.
     pub(crate) fn captured_hidden(&self) -> &HiddenStates {
         &self.captured_hidden
@@ -279,6 +286,12 @@ impl Qwen3Model {
         let full_shape = total_tokens == batch_size * bufs.span;
         match BATCH_BUCKETS.iter().position(|&b| b == batch_size) {
             Some(bidx) if full_shape => {
+                if bufs.graphs[bidx].is_empty() || !bufs.graphs[bidx][0].is_captured() {
+                    log::info!(
+                        "verify graph capturing: bucket {batch_size} span {span}",
+                        span = bufs.span
+                    );
+                }
                 assert_eq!(
                     numeric_policy(),
                     bufs.policy_at_construction,

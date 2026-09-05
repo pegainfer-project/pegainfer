@@ -483,8 +483,212 @@ GiB/rank）后 HBM 收紧 ~15 GiB，fleet 复测时要盯。TileLang prefill buc
   法；默认并行会 13 实例同租一卡 OOM——mega slab EP1 涨到 3.2 GiB 后更
   容易炸，跑法不对怪跑法）。
 
+## Whale rendezvous：跨机 gang 的共识层（M1 后半，2026-08-25 无 GPU 部分落地）
+
+CP8/CP16 的 gang 成员跨进程跨机器，M0.5 的 in-process board（一个 Mutex）不再
+可用，而 free-running 纪律禁止任何"等"。协议内容退化到一条：**whale w 在绝对
+launch L 跑**——launch count 本身是全局时钟（mega 双边配对把全 world 钉在 ±1
+以内），所以约定 L 就是约定一个全局时刻，谁都不用被叫醒。实现是 host 侧两阶段
+广播（`scheduler/whale.rs` 纯状态机 + `whale_hub.rs` 传输；rank0 进程当唯一
+sequencer，复用 ep.rs bootstrap 风格的常驻 TCP）：
+
+1. **Gather**：poster 把 prompt 发给 sequencer；sequencer 选宽度（能宽就宽：
+   superstep 挡的是全 fleet，最宽的 gang = 最短的全局 stall）、tray 对齐选
+   gang（poster 转到 CP 末位，KDA 终态和全量 MLA ctx 落在 decode 它的 rank），
+   广播 descriptor。成员回自己当前 launch count 并 **arm**：从此到 commit 不再
+   发起多 launch 操作（每步恰好 +1），但一步不停。
+2. **Commit**：`L = max(replies) + slack(4)`，且严格大于上一头 whale 的 L。
+   armed 成员每 period +1，所以 commit 在 slack 个 period 内送达就一定还没越过
+   L——host TCP 亚毫秒 vs launch period 数十毫秒起，裕量 ~2 个数量级；真迟到
+   在成员侧响亮报错，不会错配 collective。gang 外的 rank 全程不知情：它们的
+   launch L 是普通步，mega 照常配对异构步。Cancel 只作用于 armed（gather 超时
+   /宽度拒绝）；committed 不可撤销——unanimity 就是全部意义，不要的结果跑完丢弃。
+
+**正确性靠仿真而非机器**：状态机纯函数化（transition 进事件出消息），单测覆盖
+happy path、mid-op 迟回、双 whale 串行化（L 严格递增）、超时取消 + 迟到 Ready
+静默丢弃、hash 篡改/非成员/重复 Ready/漏询 boundary/slack 击穿全部响亮死；外加
+48 seed xorshift 舰队 fuzz（8 rank 逐轮 ±1 pinning、消息 0–1 轮延迟 per-dest
+FIFO、随机多 launch 操作跳询 boundary），不变量 = 每头可入场 whale 全 gang 同一
+L 入场、CP rank 恰为 0..width 排列、commit 顺序=seq 顺序、fleet 必静默。
+
+**分段理论模型**（`k3_whale_segments`）：per-rank superstep 时间
+`t_i ∝ len_i + Q·(start_i + len_i/2)·len_i`，线性项是全深度逐 token 走
+（MoE/KDA/dense GEMM），二次项是 MLA ctx 三角；Q = 2.7e-6（CP4 16k profile
+标定：12k 深 prefix 对 ~1000ms superstep 贵 ~32ms）。256k 下末 rank 三角 ≈ 走
+的 2/3，均匀切会把全 fleet 挂在它尾巴上——按预算二分 + 贪心填充做 leveling
+（前 rank 长后 rank 短，封顶 16896）。段下限 `K3_CP_SEGMENT_FLOOR = 2048`
+（FlashKDA 段长扫描：4224 段 96% 饱和、1056 段 87%、264 段 58%），宽度取
+admits 的最大 2 的幂：粗梯子 ≈ CP4 @ 8k–16k / CP8 @ 16k–32k / CP16 @ 32k+，
+16×16896 恰盖 262144（#962 抬协议的动机闭环）。
+
+**KDA 包流量账**（naive 右乘链 vs prefix-scan 的立项数据）：(M,D) 每层
+~12.6 MB，upstream fan-out 全量 O(CP²)、末 rank O(CP)——CP16 末 rank 每层收
+15 对 ≈ 189 MB，全 93 层 ≈ 12.6 GiB/whale，占 256k superstep ~4%、64k ~15%。
+(M,D)∘(M',D') = (MM', DM'+D') 可结合 → Blelloch 并行前缀扫描 log₂CP 轮是
+现成后手；按拍板**先 naive 实现，profile 后再决定**。
+
+**Scheduler 接线（`a474f7f6`）**：每步 `serve_whale` 在 launch boundary 干三
+件事——drain 收件箱回 Gather、恰在 committed L 进 `prefill_whale`、给本步一个
+`may_prefill` 判决（armed/committed 期间只许 decode，count 恰好每步 +1，正是
+arming 契约的 scheduler 半边）。poster 一次只挂一头（cancel 配对因此平凡；
+slot 在 post 时刻就预留，commit 到达永远有座）；宽度拒绝/超时 Cancel →
+下一个非受限 launch 本地 prefill 兜底。Mock 舰队测试（真 scheduler ×
+LocalWhaleHub × 假 executor 计 launch 配对）钉住：全 gang 同一 count 入场、
+poster 恰为 CP 末位持 slot、gang 外 rank 全程不知情、双 whale（跨 rank 与
+同 rank 排队）串到两个不同 superstep、短 prompt 走本地。
+
+**数据面（`b2091501`）**：CUDA event 与 pool 指针都活不过进程边界，换成
+MegaMoE 同款基底。每 rank 的 CP 发布面（halo tail、KDA (M,D)、MLA
+latent/rope）整体挪进一块 fabric slab；whale hub 启动时加一轮 slab
+allgather（64 字节 handle × world，兼作 fleet 启动 barrier，对齐 ep.rs
+bootstrap 语义），每进程 import 一次全表。four-beat 协议原样翻译成
+doorbell：宣布 = 单线程 SM kernel 批量 store 进各 peer 的 flag 槽（GB300
+memops 引擎拒绝 fabric-imported VA，见下方 CP8 门禁 bug ②）、本地
+`cuStreamWaitValue64/GEQ` 等待——等待永远在本 rank 自己的内存上，远端只有
+NVLink store，superstep 内 host 零同步。doorbell 值全由 rendezvous 推导（`(seq+1)*4096 + window`）：
+seq 严格递增 + 每 superstep 窗口数固定 ⇒ 值跨 whale 单调，gang 轮换不需要
+任何 host 协商（flag 槽按 global rank 索引）。forward 路径零改动：
+`K3CpScratch` 换 `K3CpSyncHandle`（Local/Fleet 枚举）分发三个交换窗口，
+`prefill_whale` 与 `prefill_cp` 共享同一 superstep 主体（whale 用 leveled
+分段）。`PEGAINFER_K3_WHALE=<addr>` 一个变量拉起全部（rank0 进程 host
+sequencer；端口选 <32768 避 ephemeral 坑）；`PEGAINFER_K3_WHALE_MIN` 准入
+下限默认 4096。与 `PEGAINFER_K3_CP`、dspark 互斥。隐含约定：分段是
+descriptor 的确定性函数、不上 wire，各进程按自己的 prefill chunk 上限
+（`chunk_tokens`）本地重算——全 fleet 必须跑同一 binary/配置，chunk 上限
+不一致会算出不同分段而各自入场。
+
+**CP8@2-tray 真机门禁 PASS（2026-08-25，tray08+tray09 pruned EP8，全账
+`~/code/bench_results/2026-08-25-k3-whale-cp8-smoke/`）**：8-wide 跨机 whale
+单 superstep prefill 打通，16k prompt + 48 greedy 两端点逐字节一致。同 fleet
+同配置 A/B（min TTFT ms，CP1 local vs CP8 whale）：4.2k 1246→893（1.40×）、
+8.25k 1502→1042（1.44×）、16.7k 3005→1042（**2.88×**）、28.5k 5881→1286
+（**4.57×**）。固定截距 ~850ms（4k 与 16k 同 TTFT）= rendezvous slack + armed
+期 decode-only + 前端截距合账，profile 阶段第一杠杆。真机修掉两个 bug：
+① sequencer bind 字面 addr 踩 127.0.1.1 回环（`da7c6dc9`，EP bootstrap 同款）；
+② **GB300 stream memops 引擎拒绝 fabric-imported 映射**——
+`cuStreamWriteValue64` 对 import 进来的 VA 报 `CUDA_ERROR_INVALID_VALUE`，同
+映射 DtoD copy / SM store 正常（两进程 C probe 定案，
+`~/.fabric-test/memops_import.c`）。doorbell 写改单线程 SM kernel
+（`k3_whale_doorbell_ring`，一个 beat 的全部 flag 批一次 launch）；wait 不动
+——等的全是本地 slab，本地 fabric 分配 memops 接受（`6b7ae0e4`）。运维注意：
+fleet OOM 后重启前必须逐 tray 杀干净旧进程（`nvidia-smi
+--query-compute-apps`，pgrep 会匹配自己的 ssh shell）；EP8@32k ctx 要
+`PEGAINFER_K3_MAX_BATCH=8`（默认 64 slots 的 KV 预算超 288 GiB HBM）。
+
+**CP16@4-tray 真机门禁 PASS（2026-08-25，tray08/09/14/17 pruned EP16，全账
+`~/code/bench_results/2026-08-25-k3-whale-cp16-smoke/`）**：4/4 armed ~120s，
+512/16k 四端点逐字节一致；TTFT 与 CP8 持平（28.5k 1228ms = 对 CP1 4.79×；
+这些长度全被 ~850ms 截距压着，CP16 收益在更长 prompt 与 256k 容量）。又修掉
+两个真 bug：③ **whale hub acceptor 串行死锁**（`c2e4ba99`）——acceptor 内联跑
+slab 交换，`wait_complete` 等全世界；2 进程恰好能过（CP8 掩盖），4 进程第一个
+peer 锁死 accept 循环。修：每连接独立线程，writer 注册仍在 table 帧后；附 3
+进程回归测试 + whale arming 分阶段计时日志（顺带证明旧"4.5 分钟 arming 谜团"
+就是这个死锁的轻症形态，修后 slab_exchange barrier = 权重加载 skew 0–24s）。
+④ **FlashMLA prefill 116k 上下文天花板**（`6650ef91`）——wrapper 把
+`t_kv×heads×192 > INT_MAX`（heads=96 时 ~116k token）当 batch stride 溢出拒绝，
+256k 请求 fail-stop 全 fleet；但 b=1 的 batch stride 恒不参与寻址（TMA 描述符
+内 64 位算术），传 0 删守卫即可。附 260k×96 头 ignored GPU 深度测试（均匀 K +
+按头 V，输出须精确等每头 V 值）。修复后 CP8@ctx131072 e2e：**128,459 token
+连贯且两端一致**；同配置 A/B：65k 13,922ms local、128k 33,609ms local。
+⑤ **leveling 跨 bucket 台阶**（`7c6dcd96`）——细阶梯（40k–128k）暴露 57k→65k
+间 ~+900ms 台阶：leveled 分段在均值贴近 bucket 边界时把头段推过 8448，头
+rank 落进 16896 bucket，padded 行翻倍、lockstep 全员等它。修：leveling 段长
+cap 到均值所在 bucket（attention 是 varlen，cap 内仍按深度配平）。实测
+65,116 tok 3,638→**2,747ms（5.07×）**、128k 6,382ms（**5.27×**），邻档不动。
+73k 起均值 >8448 的 16896-bucket 台阶是 AOT 阶梯固有（加 12672 档 = profile
+期议题）。剩余对理想 8× 的缺口 = 850ms 截距 + bucket 内 padding + causal
+残余不均衡，留 profile 期。
+
+⑥ **whale CP8@128k 首次 nsys 剖析**（2026-08-25，全账
+`~/code/bench_results/2026-08-25-k3-whale-cp16-smoke/` README 末节）：tray09
+上 BIN wrapper `nsys --delay 150 --duration 90 --kill=none`，窗口内探针命中。
+128k superstep wall 6,233ms（锁步全程）：**FMHA 35.8%**（深位 rank 2,230ms）
+> mega MoE 19.8%（1,237ms，含双侧配对等待）> dense GEMM 15.5% > elementwise
+10.4% > KDA 4.2%，kernel 间隙 6.7%。深/中位 rank 的 fmha+mega 之和相等
+（~3,470ms）——mega 等待吸收了 attention 深度不均衡，真 MoE 算量 ≲1.2s。
+Amdahl 账：CP1 的 MoE 墙钟与 CP8 同额（mega dispatch 本就全 EP 宽，与 CP 无
+关）≈1.26s → 128k 理论顶 = 32/8+1.26 ≈ 5.3s = **6.4×**；实测扣截距 6.0× =
+顶的 93%。剩余缺口：**128k 均值 16k 正好顶 16896 bucket cap，leveling 被钳
+成等长切分，深位 attention ≈ 均摊 1.6×**。扣除 MoE 的极限即 CP 宽度本身
+（非 MoE 家族完美缩放，CP4 已证、本次未推翻）；CP16@EP16 验收配置推演顶
+≈ 12–13×@128k。
+
+同一 profile 的 65k superstep（cluster #3，深位 rank，wall 2,524ms）修正了
+两笔旧账，并给 vLLM 对标定了性（`2026-08-18-k3-vllm-layout-e2e`，full 模型
+8 卡最优布局 TP8×EP8：64k 1,959ms / 128k 4,477ms，截距 ~75ms）：
+
+- **"~850ms 固定截距"是高估**：65k e2e 2,790 − superstep 2,520 = 协调+前端
+  实际 ~270ms。850 来自 4k–16k 平台，但那个平台的大头是 bucket 翻倍
+  （16k/8=2,090 行 → 4224 桶，全行族 padding 2×）——短中档输 TP8×EP8
+  （1,042 vs 442）的主因是桶，不是协调。
+- **65k 纯算力慢 vLLM 34%（2,520 vs ~1,884）**，拆账：FMHA 579ms（深位超额
+  ~270，均衡应 ~310；TP8 按头切无此项）、mega 566（同款+等待）、dense GEMM
+  503（1,455 launch，M≈8.4k 在"chunk<8k contiguous padding 吃一半算力"临界
+  区）、elementwise 325（2,076 launch；CP 行数只有 TP 的 1/8，本应优势项）、
+  间隙 176（单 superstep ~5,000 launch）。可回收 ≈0.5s（不均衡+间隙+padding）
+  → 修完**追平** TP8×EP8；反超还差 ~120ms 的 GEMM 形状/融合效率债。
+- **杠杆重排（实测定序）**：① FMHA 条带化配段（65k −270ms / 128k −800ms，
+  唯一救两档）；② superstep 层遍历图化/融合（5,000 launch → 间隙+尾巴）；
+  ③ bucket 阶梯细化（2048–4224、8448–16896 之间加档；16k 档 1,042→~700 的
+  主杠杆）；④ 协调 270→~150ms（降级，不再是主要矛盾）。
+
+## 256k 门禁 + full 16 卡验收（2026-08-26，账在
+`~/bench_results/2026-08-26-k3-cp16-256k-gate/`）
+
+**256k 门禁 PASS**（pruned CP16@tray09/11/12/14, ctx=262144 batch=1）：
+254,808-token TTFT min **9,316 ms** 三跑稳定，CP1 local 基线 90,459 →
+**9.71×**；249,891-token 生成 tray09/tray14 逐字节一致。
+
+**Full 1.5T 16v16 验收**（tray03/04/06/07 前后脚跑双方，同脚本 min-of-3）：
+
+| tokens | vLLM TP16-MNNVL | full CP16 whale | 比 |
+|---:|---:|---:|---|
+| 8,251 | **404** | 1,044 | 0.39× |
+| 16,725 | **794** | 1,020 | 0.78× |
+| 66,677 | 3,251 | **1,734** | **1.88×** |
+| 130,232 | 6,199 | **3,615** | **1.71×** |
+| 254,808 | 13,155 | **8,850**（W-chunk 后 @262144 实测） | **1.49×** |
+
+交叉点 16k–64k 之间。短档账（08-26 复核修正）：桶阶梯是几何级
+（`K3_PREFILL_BUCKETS` 256..16896），1,045 行落 2048 桶 ≤2×，且只作用于按
+`shape.bucket` 整跑的本地 dense 批处理族——mega dispatch 在 EP>1 只发 live 行
+（`step.rs`，padding 不上线），MoE 免疫。短档主因是 ~270ms 协调截距 + 固定
+开销；杠杆 = 本地 dense 族 de-bucket（cuBLAS 按 live_rows 发射，纯 host 改动）
++ 截距剖析，"加桶档"收益很小。full CP16@128k 比 pruned
+CP8@2-tray 快近 2×（宽度 + EP16 每 rank expert 减半）。vLLM TP16 深档还慢于
+其 8 卡 TP8×EP8（08-18: 64k 1,959 / 128k 4,477）——16 路 TP prefill 深上下文
+反噬，我方 64k 已压过它 8 卡最优布局。
+
+**HBM 账实测（都在 `07be170e` 修）**：mega slab 19.65 GiB 分配失败的元凶是
+pool release threshold=MAX 让加载 churn 后 used 达 255.75 GiB（权重 190 之外
+~66 GiB 活分配：max_ctx-scaled MLA 物化 buffer 21.3 + KV ~7 + rows-scaled
+scratch ~37.5）→ slab allocator OOM 时 trim-then-retry。**full@262144 结构性
+放不下**（需 ~283 > 276.6 GiB）：`mla_ctx_nope_v` 12 GiB + `mla_ctx_k` 9 GiB
+是 `mla_chunk_attend` 一发整 ctx 物化。验收跑在 ctx=135168（~270 GiB，实测过）。
+另修 whale arming × staged 加载的 INVALID_CONTEXT（launch 线程无 context，
+`arm_whale_slab` 补 `bind_thread`；此前 whale 门禁从未开过 staging）。
+
+**W-chunked ctx loop 已落地（`91c23211`，2026-08-26）**：物化 scratch 从
+max_ctx 行缩到 `min(max_ctx, 16896)` 行（W = 4×4224 chunk cap）。`t_kv ≤ W`
+仍是原单发 causal FMHA（bitwise 不变，既有门禁不动）；更深的 ctx 用 dense
+窗口（ResidualMask + individual scheduler 新入口，t_q/t_kv 无约束，ragged 尾
+可以比 chunk 窄）扫过去，每窗输出连 LSE 一起 `lse_merge` 进 f32 累加器，最后
+一发 t_q×t_q causal 收 chunk 自身的键，`o_finalize` 回 bf16。262144 档物化
+buffer 21 GiB → 1.4 GiB，新增累加器 ~210 MB；只剩 576 B/token 的 latent/rope
+gather 仍按 max_ctx 长。**full-256k 的结构性 blocker 解除**（账面 ~283 →
+~263 GiB < 276.6）。验证：windowed-vs-single 等价 GPU 测试（含 ragged 尾）、
+k3 门禁 6/6、`PEGAINFER_K3_CP_PROMPT=65536` 的 cp_prefill 门禁（CP1/CP4 双双
+压出窗口循环）全过。这套 merge 原语同时就是 FMHA 条带化和 DIST_CTX 的底座。
+
+**同日实测（full 1.5T @ctx=262144，tray03/04/06/07，账在 bench 档案追加节）**：
+16 卡整齐 268.3 GiB used / 余量 ~9.3 GiB；254,808 tok TTFT **8,850 ms**（对
+vLLM 13,155 = **1.49×**，快过 pruned CP16 的 9,316）；64k/128k 与 W-chunk 前
+逐 ms 持平（1,717/3,618 vs 1,734/3,615，零回归）；249,891 tok + 48 greedy
+生成连贯。验收表 256k 行补齐——**64k 及以上全档反超 vLLM TP16-MNNVL**。
+
 ## Next action
 
-M1 后半：CP8/CP16 gang（full@EP16 交叉矩阵 + 系统 A/B），8k+ 追平 vLLM
-TP16 的 16 路切分；EP16 全量下 19.6 GiB slab 的 HBM 账实测。次优先：FMHA
-条带化配段、前端固定截距（132 vs 59 ms @122 tokens）。
+PR #970 CI 17/17 全绿（`05da7961`），待 susun review。
+性能杠杆按 ⑥ 实测定序不变：FMHA 条带化（merge 原语已在）→ superstep
+图化/融合 → **bucket 细化（8k/16k 档翻盘的主杠杆，验收表的 0.39×/0.78× 就是
+它）** → 协调压缩。KDA 包 prefix-scan 排后。

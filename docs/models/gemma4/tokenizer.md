@@ -1,8 +1,8 @@
 # Gemma 4 tokenizer and chat template
 
-**TL;DR:** All five chat renders reproduce the Hugging Face reference when content is flattened to strings, and token ids agree across the layers that can differ — gated by `pegainfer-gemma4/tests/tokenizer_parity.rs` against the pinned 12B checkpoint, with the other two sizes covered by inspection rather than by running. One divergence is open: under the frontend's default content format the system turn gains a trailing space. Contracts the engine must honour: BOS comes only from the chat template, EOS is declared in three places with three different values, the published generation defaults are sampled rather than greedy, and text-only serving rejects modality tokens before embedding and suppresses them before sampling.
+**TL;DR:** All five chat renders reproduce the Hugging Face reference when content is flattened to strings — gated by `pegainfer-frontend/tests/gemma4_tokenizer_parity.rs` (runner-owned) against the pinned 12B checkpoint, with the other two sizes covered by inspection rather than by running. The token-id probes are retired: both sides run the same `tokenizers` crate, so they gated the Python wrapper's version skew rather than behavior. One divergence is open: under the frontend's default content format the system turn gains a trailing space. Contracts the engine must honour: BOS comes only from the chat template, EOS is declared in three places with three different values, the published generation defaults are sampled rather than greedy, and text-only serving rejects modality tokens before embedding and suppresses them before sampling.
 
-Last touched: 2026-08
+Last touched: 2026-09
 
 ## The gate runs on 12B; the result carries to the other sizes by inspection
 
@@ -47,19 +47,17 @@ except those two and the transformers version, which are provenance — they rec
 reference came from and cannot be checked from here. No local path is recorded.
 
 Both sides tokenize with the same `tokenizers` crate — Python's fast tokenizer wraps it and
-`vllm-tokenizer` calls it directly — so broad script coverage would re-run one implementation
-twice. The probes instead target the layers that can genuinely disagree: the Python wrapper's
-added-token and `add_special_tokens` handling, and version skew between the crate this workspace
-pins and the one the transformers wheel bundles. One case per algorithm class (whitespace, digits,
-multibyte, multi-codepoint graphemes, combining marks, byte fallback), every special token
-standalone, and one embedded in a sentence to cover adjacency.
+`vllm-tokenizer` calls it directly — which is why the token-id probes retired: they compared one
+implementation with itself and could only gate the Python wrapper's version skew. What remains,
+and what the gate asserts, is the chat render: minijinja against the reference's Jinja2, the one
+comparison with two genuinely independent sides.
 
-The parity tests carry `#[ignore]` because they need the checkpoint; run them explicitly against
-the pinned 12B one:
+The parity test carries `#[ignore]` because it needs the checkpoint; the maintainer runner
+executes it, or run it directly against the pinned 12B one:
 
 ```bash
-OPENINFER_TEST_MODEL_PATH=<pinned-12B-checkpoint-dir> \
-  cargo test --release -p pegainfer-gemma4 --test tokenizer_parity -- --ignored
+PEGAINFER_TEST_MODEL_PATH=<pinned-12B-checkpoint-dir> \
+  cargo test --release -p pegainfer-frontend --test gemma4_tokenizer_parity -- --ignored
 ```
 
 ## The chat template lives in its own file
@@ -96,8 +94,9 @@ frontend today, so changing it touches every model line and needs its own review
 
 ## BOS comes from the template, not the tokenizer
 
-`add_special_tokens` is a no-op for this tokenizer: every probe encodes identically with it on
-and off. The leading `<bos>` in a chat request comes from the template. An engine that adds BOS
+`add_special_tokens` was established as a no-op for this tokenizer by the retired token-id
+probes (every probe encoded identically with it on and off); the fixture no longer carries them.
+The leading `<bos>` in a chat request comes from the template. An engine that adds BOS
 itself would double it.
 
 ## EOS is declared three times

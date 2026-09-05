@@ -427,7 +427,9 @@ struct SteppedStream {
     /// Queued/Scheduled wire events, held until the request's first shipped
     /// output (a scheduled-only update ships nothing on its own).
     first_token_events: Option<Vec<EngineCoreEvent>>,
-    prompt_tokens: usize,
+    /// Set by `Scheduled`; a request refused or failed while still queued
+    /// never prefilled and reports no prefill stats.
+    prompt_tokens: Option<usize>,
     cached_tokens: usize,
     prefill_stats_sent: bool,
     /// P/D handoff metadata can arrive in an update with no token or
@@ -453,7 +455,7 @@ impl SteppedStream {
             request_id,
             control,
             first_token_events: None,
-            prompt_tokens: 0,
+            prompt_tokens: None,
             cached_tokens: 0,
             prefill_stats_sent: false,
             kv_transfer_params: None,
@@ -465,15 +467,17 @@ impl SteppedStream {
     /// Prefill stats for the request's first shipped output. Built lazily so
     /// a `cached_tokens` fact arriving after `Scheduled` (chunked prefill
     /// reports it with the first chunk) still lands in the stats. Upstream
-    /// invariant: computed + cached == prompt.
+    /// invariant: computed + cached == prompt. `None` for a request that
+    /// never reached `Scheduled`.
     fn take_prefill_stats(&mut self) -> Option<PrefillStats> {
         if self.prefill_stats_sent {
             return None;
         }
+        let prompt_tokens = self.prompt_tokens?;
         self.prefill_stats_sent = true;
         Some(PrefillStats {
-            num_prompt_tokens: self.prompt_tokens as u32,
-            num_computed_tokens: self.prompt_tokens.saturating_sub(self.cached_tokens) as u32,
+            num_prompt_tokens: prompt_tokens as u32,
+            num_computed_tokens: prompt_tokens.saturating_sub(self.cached_tokens) as u32,
             num_cached_tokens: self.cached_tokens as u32,
             num_local_cached_tokens: self.cached_tokens as u32,
             num_external_cached_tokens: 0,
@@ -502,7 +506,7 @@ fn reduce_update(
                 timestamp: anchor.unix(scheduled.scheduled_at),
             },
         ]);
-        state.prompt_tokens = scheduled.prompt_tokens;
+        state.prompt_tokens = Some(scheduled.prompt_tokens);
     }
     if let Some(cached) = update.cached_tokens {
         state.cached_tokens = cached;
@@ -607,5 +611,55 @@ impl UnixAnchor {
         } else {
             self.sys - (self.instant - t).as_secs_f64()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::RejectReason;
+    use crate::engine::scheduler_pair;
+
+    fn request() -> Request {
+        Request {
+            prompt_tokens: vec![1, 2],
+            params: crate::sampler::SamplingParams::default(),
+            max_tokens: 1,
+            lora_adapter: None,
+            kv_transfer_params: None,
+            logprobs: 0,
+            echo: false,
+            trace_parent: None,
+            client_label: None,
+        }
+    }
+
+    #[test]
+    fn unsupported_rejection_is_rendered_for_vllm() {
+        let (handle, _backend) = scheduler_pair();
+        let control = handle.submit(request());
+        let mut stream = SteppedStream::new("unsupported".into(), control, Span::noop(), None);
+        let mut update = RequestUpdate::empty(stream.control.id());
+        update.terminal = Some(Terminal::Rejected {
+            reason: RejectReason::Unsupported {
+                feature: "kv_transfer".into(),
+            },
+            prompt_tokens: 2,
+        });
+
+        let (output, terminated) = reduce_update(&mut stream, update, &UnixAnchor::now());
+        let output = output.expect("rejection produces a wire output");
+        assert!(terminated);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
+        assert_eq!(
+            output.stop_reason,
+            Some(StopReason::Text(
+                "this engine does not support kv_transfer".into()
+            ))
+        );
+        assert!(
+            output.prefill_stats.is_none(),
+            "a request refused while queued did no prefill"
+        );
     }
 }

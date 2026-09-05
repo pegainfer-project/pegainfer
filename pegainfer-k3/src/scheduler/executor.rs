@@ -19,6 +19,7 @@ use anyhow::Result;
 use anyhow::bail;
 use pegainfer_frontend::sampler::SamplingParams;
 
+use super::whale::CommittedWhale;
 use crate::executor::cp::K3CpGroup;
 
 /// Index of one execution slot, in `0..max_batch`.
@@ -93,6 +94,23 @@ pub trait StepExecutor: Send {
     ) -> Result<Option<u32>> {
         let _ = (slot, prompt, group, cp_rank);
         bail!("this executor does not serve context-parallel prefill")
+    }
+
+    /// Enter a committed whale's CP superstep — the fleet-wide counterpart of
+    /// [`StepExecutor::prefill_cp`]. Called exactly at the whale's committed
+    /// launch, on every gang member, by the whale serving lane
+    /// ([`super::whale`]); the descriptor names the gang and the segments are
+    /// a deterministic function of it. `slot` is set on the owner (the
+    /// poster, always the last CP rank), which ingests the result and returns
+    /// the boundary token; helpers pass `None` and return `None`. One
+    /// superstep is one launch. Default: this executor serves no whale lane.
+    fn prefill_whale(
+        &mut self,
+        whale: &CommittedWhale,
+        slot: Option<SlotId>,
+    ) -> Result<Option<u32>> {
+        let _ = (whale, slot);
+        bail!("this executor does not serve whale prefill")
     }
 
     /// Run one padding step and wait for it. A scheduler thread waiting at a

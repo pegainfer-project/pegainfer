@@ -19,6 +19,8 @@ mod k3_tilelang;
 mod kimi_k2;
 mod linear;
 mod lora;
+#[cfg(any(feature = "gemma4", feature = "kimi-k2"))]
+mod marlin_face;
 mod norm;
 #[cfg(feature = "qwen35")]
 mod qwen35;
@@ -150,6 +152,7 @@ pub use linear::gemm_lt_tune;
 pub use linear::gemm_per_token;
 pub use linear::gemm_rows_into;
 pub use linear::gemm_rows_into_checked;
+pub use linear::gemm_rows_span_into_checked;
 pub use linear::gemm_strided_batched_bf16;
 pub use linear::gemm_strided_batched_f32;
 pub use linear::gemm_token_range_into_checked;
@@ -192,9 +195,12 @@ pub use sampling::argmax_bf16_split_into;
 pub use sampling::flashinfer_top1_batch_into;
 pub use sampling::flashinfer_top1_row_states_bytes;
 pub use sampling::gpu_sample_batch_into;
+pub use sampling::hedge_ladder_force_into;
 pub use sampling::logprob_topk_batch_bf16_into;
 pub use sampling::markov_step_argmax_into;
+pub use sampling::markov_step_argmax_mapped_into;
 pub use sampling::markov_step_argmax_partials_len;
+pub use sampling::markov_step_top2_into;
 
 pub(crate) fn checked_i32(value: usize, what: &str) -> anyhow::Result<i32> {
     i32::try_from(value).map_err(|_| anyhow::anyhow!("{what} {value} does not fit i32"))

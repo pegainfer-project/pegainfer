@@ -2,7 +2,7 @@
 
 > **TL;DR:** Qwen3-4B is the maturity bar of the project — continuous batching, TP=2, default-on prefix cache (#216), and the HF logits golden gate are all live — so its roadmap is sharpening, not bring-up. The #220 RoPE OOB bug is fixed (cos/sin cache sized from `max_position_embeddings`, admission rejects past the window, kernel traps an out-of-range position; gated by both an oversized-reject and an in-window >4096 IT). Since the 2026-06-04 open-set review, batched greedy sampling (#307), mixed greedy/non-greedy batched sampling (#284), and in-process pegaflow KV offload / L2 host tier (#316, pure-L2 TTFT 195→40ms) have landed in the table below. Remaining open set: zero TP correctness coverage, LoRA gated only by a zero-adapter smoke, prefix-cache observability dropped at the scheduler boundary, stale docs, and the YaRN #8 follow-up for rope-scaled checkpoints.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-08
 
 Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model items stay in `docs/roadmap/execution.md`; this doc owns the qwen3 line.
 
@@ -48,7 +48,7 @@ Tracking issue: see the `[Model] Qwen3-4B roadmap` GitHub issue. Cross-model ite
 
 - **Issue hygiene:** #188 references a test target deleted in #194 — close as superseded by the golden gate. #203 §1 still claims qwen3 has no prefix reuse — stale since #216.
 - **Dead code:** ~~`batch_decode_trace.rs` `HIDDEN_SIZE`/`INTERMEDIATE_SIZE` consts; qwen3 `probe_model()`+`ModelInfo`~~ — removed in the hawk dead-public sweep (#743).
-- **File size:** `executor.rs` (1435), `scheduler.rs` (1420, ~826 of them inline tests), `kernel_bench.rs` (1112) breach the 1k-line redline.
+- **File size:** `executor.rs` (1435) and `scheduler.rs` (1420, ~826 of them inline tests) breach the 1k-line redline. ~~`kernel_bench.rs` (1112)~~ — the report harness left the library in #944; it now lives under `src/bin/report_support/`, split across five modules and compiled only by the `kernel-report` binaries.
 - **Docs:** `model-crate.md` TL;DR advertises a deleted `qwen3_kernel_snapshot` bench and, with `kernels-crate.md`, uses the obsolete `crates/` layout in every command — collapse both into one slim layout doc. `tp-design.md` describes the implemented controller/worker runtime as future direction — rewrite to past tense, promote the 3 real open items. `kv-pressure-hang.md` — lift the KV-lifetime-reservation lessons to `docs/lessons/`, then delete. `execution.md` Done list predates #216.
 
 ## Done criteria

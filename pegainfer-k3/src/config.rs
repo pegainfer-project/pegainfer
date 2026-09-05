@@ -52,6 +52,13 @@ pub(crate) const K3_Q_B_OUT: usize = K3_HEADS * K3_QK_HEAD_DIM;
 pub(crate) const K3_KV_A_OUT: usize = K3_KV_LORA_RANK + K3_QK_ROPE_HEAD_DIM;
 pub(crate) const K3_KV_B_OUT: usize = K3_HEADS * (K3_QK_NOPE_HEAD_DIM + K3_V_HEAD_DIM);
 pub(crate) const K3_O_PROJ_IN: usize = K3_HEADS * K3_V_HEAD_DIM;
+/// Chunked-prefill MLA context window: the expanded K/V workspace covers this
+/// many rows, and deeper contexts walk in windows merged through the FMHA's
+/// log-sum-exp. The expansion is the 74x-inflation side of MLA prefill
+/// (576 B/token latent -> 42 KiB/token K+V), so the window is what keeps the
+/// scratch off the `max_ctx` scale; 4x the 4224 chunk cap keeps the per-window
+/// FMHA long enough to stay compute-bound.
+pub(crate) const K3_MLA_CTX_WINDOW: usize = 16_896;
 
 // ---- KDA (linear-attention) layers ---------------------------------------
 /// Short depthwise conv window in front of the KDA q/k/v streams.

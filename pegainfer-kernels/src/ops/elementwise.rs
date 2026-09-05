@@ -1187,6 +1187,47 @@ mod tests {
 
     use super::*;
 
+    /// The suppression contract, beside the kernel that owns it: writes are
+    /// exactly the given ids, the upload refuses an id at the head's width,
+    /// and ids validated against a different head never reach these logits.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_suppression_mask_writes_only_the_ids_it_is_given() {
+        let ctx = DeviceContext::new().expect("GPU required");
+        let (vocab, rows) = (8usize, 2usize);
+        let mut logits = HiddenStates::zeros(&ctx, vocab, rows).expect("logits");
+        let suppress_ids = SuppressIds::upload(&ctx, &[3u32, 5], vocab).expect("ids");
+        suppress_logits_bf16_in_place(&ctx, &mut logits, &suppress_ids).expect("suppress");
+
+        let host = logits.to_host(&ctx).expect("D2H");
+        for row in 0..rows {
+            for id in 0..vocab {
+                let value = host[row * vocab + id];
+                if id == 3 || id == 5 {
+                    assert!(
+                        value == f32::NEG_INFINITY,
+                        "row {row} id {id} is {value}, not suppressed"
+                    );
+                } else {
+                    assert!(value == 0.0, "row {row} id {id} moved to {value}");
+                }
+            }
+        }
+
+        // The bound is structural: an id the head does not span cannot reach
+        // the kernel, and neither can ids checked against a different head.
+        let past_the_head = SuppressIds::upload(&ctx, &[vocab as u32], vocab);
+        assert!(
+            past_the_head.is_err(),
+            "an id at the head's width must be refused at upload"
+        );
+        let other_head = SuppressIds::upload(&ctx, &[1u32], vocab + 1).expect("ids");
+        assert!(
+            suppress_logits_bf16_in_place(&ctx, &mut logits, &other_head).is_err(),
+            "ids checked against a wider head must not be applied to these logits"
+        );
+    }
+
     fn hidden_from_host(
         ctx: &DeviceContext,
         data: &[bf16],

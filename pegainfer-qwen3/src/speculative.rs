@@ -86,13 +86,21 @@ pub(crate) struct VerifyResult {
 pub(crate) struct DraftStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) current_token: u32,
+    /// Remaining output budget when the request may be hedged (greedy
+    /// sampler), `0` otherwise. Carried through the draft seam so the draft
+    /// lane — which owns the effective branch positions — makes the final
+    /// eligibility call: a chain only survives the verify-side span clamp
+    /// when some branch position fits inside `remaining - 1` kept drafts,
+    /// and a request that cannot show its chain must not burn a hedge slot.
+    pub(crate) hedge_budget: usize,
 }
 
 impl DraftStepItem {
-    pub(crate) fn new(request_id: RequestId, current_token: u32) -> Self {
+    pub(crate) fn new(request_id: RequestId, current_token: u32, hedge_budget: usize) -> Self {
         Self {
             request_id,
             current_token,
+            hedge_budget,
         }
     }
 }

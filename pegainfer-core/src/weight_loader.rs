@@ -31,6 +31,28 @@ mod staging;
 use staging::ColShardPlan;
 use staging::WeightStager;
 
+/// Raw-byte uploads through the same pinned double buffers used by the BF16
+/// checkpoint loader. Source slices are concatenated into staging chunks.
+pub struct ByteWeightStager {
+    stream: Arc<cudarc::driver::CudaStream>,
+    stager: WeightStager,
+}
+
+impl ByteWeightStager {
+    pub fn new(ctx: &DeviceContext) -> Result<Self> {
+        Ok(Self {
+            stream: ctx.stream.clone(),
+            stager: WeightStager::new(ctx)?,
+        })
+    }
+
+    pub fn upload(&mut self, srcs: &[&[u8]], dst: &mut CudaSlice<u8>) -> Result<()> {
+        let dst_at = staging::prepare_bytes(&self.stream, srcs, dst)?;
+        // SAFETY: prepare_bytes validated the destination and concatenated size.
+        unsafe { self.stager.upload_slices_at(srcs, dst_at) }
+    }
+}
+
 /// Load shard metadata. Returns (shard_file_paths, weight_map: tensor_name -> shard_index)
 pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {
     let single_path = format!("{}/model.safetensors", model_path);

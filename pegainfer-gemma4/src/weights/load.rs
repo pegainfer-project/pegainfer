@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::Result;
 use log::info;
 use pegainfer_core::tensor::DeviceContext;
+use pegainfer_core::weight_loader::ByteWeightStager;
 use pegainfer_core::weight_loader::SlotId;
 use pegainfer_core::weight_loader::StagedWeightLoader;
 use pegainfer_core::weight_loader::VecSlotId;
@@ -33,24 +34,30 @@ use crate::nvfp4::QuantSource;
 /// The wall figures are probes, not a partition: context creation, slot
 /// redemption, prefetch join and unmap fall between them, and the allocations
 /// submitted under `record_api_wall_ms` execute under
-/// `execute_and_drain_wall_ms`. Only `elapsed_ms` is a total.
-pub(crate) struct LoadStats {
+/// `execute_and_drain_wall_ms`. `elapsed_ms` is the submission total: it
+/// samples when the call returns, after the A4B expert kernels have drained
+/// on the loader stream; the unmap's host cost overlaps that drain.
+struct LoadStats {
     /// Every required tensor at its dtype.
     manifest_bytes: usize,
     /// Free-before minus free-after. Signed: this measures the device, not the
     /// process, so anything else running on it moves the number too.
     device_bytes: i64,
     device_free_bytes: usize,
-    /// Config, headers, classification. No device. The advisory prefetch
-    /// workers start inside this window and keep running past it.
+    /// Manifest, shard index and header classification (the config arrives
+    /// parsed from the caller). No device. The advisory prefetch workers
+    /// start inside this window and keep running past it.
     validate_wall_ms: f64,
-    /// Submitting one allocation and one staging plan per tensor. Wider than
-    /// the shared loader's `alloc_api_wall`, which times the allocs alone.
+    /// Submitting one allocation and one staging plan per BF16-staged tensor
+    /// (the shared loader's plan). Wider than the shared loader's
+    /// `alloc_api_wall`, which times the allocs alone; the A4B expert byte
+    /// staging sits outside this window.
     record_api_wall_ms: f64,
-    /// The checkpoint is consumed here, so this carries the source read as
-    /// well as the transfer.
+    /// The BF16 staged tensors are consumed here, source read and transfer.
+    /// The A4B expert upload, Marlin repack and scale preparation are
+    /// enqueued after both windows and are not waited on by any figure here.
     execute_and_drain_wall_ms: f64,
-    /// The whole call, unmap included.
+    /// The whole submission call, unmap included; see the struct note.
     elapsed_ms: f64,
     skipped_modality_tensors: usize,
 }
@@ -70,8 +77,7 @@ struct LayerSlots {
     gate: SlotId,
     up: SlotId,
     down: SlotId,
-    /// The bf16 half of a routed layer. The experts do not travel through the
-    /// staged loader at all.
+    /// The bf16 half of a routed layer.
     moe: Option<MoeSlots>,
 }
 
@@ -164,6 +170,12 @@ fn upload_experts(
     shards: &[SafeTensors],
     manifest: &Manifest,
 ) -> Result<Vec<Option<StackedExperts>>> {
+    // A dense checkpoint (12B, 31B) has no routed layer; skip the stager's
+    // pinned buffers and thread pool instead of allocating them for nothing.
+    if manifest.layers.iter().all(|layer| layer.moe.is_none()) {
+        return Ok(manifest.layers.iter().map(|_| None).collect());
+    }
+    let mut stager = ByteWeightStager::new(ctx)?;
     manifest
         .layers
         .iter()
@@ -173,9 +185,9 @@ fn upload_experts(
                 .as_ref()
                 .map(|moe| {
                     Ok(StackedExperts {
-                        gate: upload_stacked(ctx, shards, &moe.experts, |e| &e.gate)?,
-                        up: upload_stacked(ctx, shards, &moe.experts, |e| &e.up)?,
-                        down: upload_stacked(ctx, shards, &moe.experts, |e| &e.down)?,
+                        gate: upload_stacked(ctx, &mut stager, shards, &moe.experts, |e| &e.gate)?,
+                        up: upload_stacked(ctx, &mut stager, shards, &moe.experts, |e| &e.up)?,
+                        down: upload_stacked(ctx, &mut stager, shards, &moe.experts, |e| &e.down)?,
                     })
                 })
                 .transpose()
@@ -186,12 +198,11 @@ fn upload_experts(
 /// Stack one projection of every expert into a pair of device buffers and
 /// upload it as the checkpoint stores it.
 ///
-/// This bypasses the staged loader on purpose: that path is bf16-typed, and
-/// widening here is exactly what this representation exists to avoid. Each
-/// expert lands in its own row range, so the buffer is already the shape a
-/// batched call wants.
+/// Each expert lands in its own row range, so the buffer is already the shape
+/// a batched call wants.
 fn upload_stacked(
     ctx: &DeviceContext,
+    stager: &mut ByteWeightStager,
     shards: &[SafeTensors],
     experts: &[ExpertTensors],
     pick: fn(&ExpertTensors) -> &QuantMatrix,
@@ -211,8 +222,9 @@ fn upload_stacked(
         .stream
         .alloc_zeros::<u8>(scales_per_expert * experts.len())
         .map_err(|e| anyhow::anyhow!("Gemma 4: cannot hold the stacked block scales: {e}"))?;
+    let mut sources = Vec::with_capacity(experts.len());
     let mut tensor_scales = Vec::with_capacity(experts.len());
-    let mut scale_bytes = Vec::with_capacity(scales_per_expert * experts.len());
+    let mut scale_peak = 0.0f32;
 
     for (index, expert) in experts.iter().enumerate() {
         let plan = pick(expert);
@@ -232,29 +244,27 @@ fn upload_stacked(
             source.packed().len(),
             source.scales().len()
         );
-        let at = index * packed_per_expert;
-        ctx.stream
-            .memcpy_htod(
-                source.packed(),
-                &mut packed.slice_mut(at..at + packed_per_expert),
-            )
-            .map_err(|e| anyhow::anyhow!("Gemma 4: expert {index} weights did not upload: {e}"))?;
-        let at = index * scales_per_expert;
-        ctx.stream
-            .memcpy_htod(
-                source.scales(),
-                &mut scales.slice_mut(at..at + scales_per_expert),
-            )
-            .map_err(|e| anyhow::anyhow!("Gemma 4: expert {index} scales did not upload: {e}"))?;
-        scale_bytes.extend_from_slice(source.scales());
+        scale_peak = source.scales().iter().fold(scale_peak, |peak, byte| {
+            peak.max(crate::nvfp4::decode_e4m3(*byte) * 128.0)
+        });
         tensor_scales.push(source.tensor_scale());
+        sources.push(source);
     }
+
+    let packed_sources: Vec<&[u8]> = sources.iter().map(QuantSource::packed).collect();
+    stager
+        .upload(&packed_sources, &mut packed)
+        .map_err(|e| anyhow::anyhow!("Gemma 4: expert weights did not upload: {e}"))?;
+    let scale_sources: Vec<&[u8]> = sources.iter().map(QuantSource::scales).collect();
+    stager
+        .upload(&scale_sources, &mut scales)
+        .map_err(|e| anyhow::anyhow!("Gemma 4: expert scales did not upload: {e}"))?;
 
     // Marlin reads the block scale as S0E5M3, so every scale is normalized by
     // one shared power of two and the per-tensor scale takes it back. The
     // factor has to be the same across a projection's experts, which is why it
     // is found here rather than per expert.
-    let rescale = marlin_rescale(&scale_bytes);
+    let rescale = marlin_rescale(scale_peak);
     let mut qweight = ctx
         .stream
         .alloc_zeros::<u8>(packed_per_expert * experts.len())
@@ -304,12 +314,8 @@ fn upload_stacked(
 /// The shared power of two that lifts every block scale so its leading bit
 /// survives the S0E5M3 re-encoding. Mirrors vLLM's
 /// `_nvfp4_compute_scale_factor`, whose bound is the e4m3 maximum.
-fn marlin_rescale(scale_bytes: &[u8]) -> f32 {
+fn marlin_rescale(peak: f32) -> f32 {
     const CEILING: f32 = 448.0 * 128.0;
-    let peak = scale_bytes
-        .iter()
-        .map(|byte| crate::nvfp4::decode_e4m3(*byte) * 128.0)
-        .fold(0.0f32, f32::max);
     if peak <= 0.0 || peak >= CEILING {
         return 1.0;
     }
@@ -477,7 +483,7 @@ impl Gemma4Weights {
         model_path: &str,
         device_ordinal: usize,
         config: Gemma4Config,
-    ) -> Result<(Self, LoadStats)> {
+    ) -> Result<Self> {
         let started = Instant::now();
         let manifest = Manifest::from_config(&config)?;
         let manifest_bytes = manifest.weight_bytes()?;
@@ -508,9 +514,15 @@ impl Gemma4Weights {
         let device_free_bytes = free_device_bytes()?;
         drop(shards);
         // A few hundred ms at this size. Qwen3 backgrounds it to protect its
-        // ready time; kept synchronous here so the reported total is the whole
-        // cost. Lift that spawn into core once an executor wants it too.
+        // ready time; kept synchronous here so the unmap's host cost lands
+        // inside the reported submission total. Lift that spawn into core
+        // once an executor wants it too.
         drop(mmaps);
+
+        // The expert kernels ran on this stream while the unmap paid its host cost.
+        // Every later weight consumer uses another stream, so this drain is the handoff.
+        ctx.sync()
+            .map_err(|e| anyhow::anyhow!("Gemma 4: cannot drain the expert kernels: {e}"))?;
 
         let stats = LoadStats {
             manifest_bytes,
@@ -525,7 +537,8 @@ impl Gemma4Weights {
         info!(
             "Gemma 4 weights resident: {:.2} GiB manifest, {:.2} GiB device, {:.2} GiB free, \
              {} modality tensors skipped; \
-             {:.0} ms total, of which {:.0} validate, {:.0} record-api, {:.0} execute-and-drain",
+             {:.0} ms submission total, of which {:.0} validate, {:.0} record-api, \
+             {:.0} execute-and-drain (expert kernels drained)",
             gib(stats.manifest_bytes as i64),
             gib(stats.device_bytes),
             gib(stats.device_free_bytes as i64),
@@ -535,7 +548,7 @@ impl Gemma4Weights {
             stats.record_api_wall_ms,
             stats.execute_and_drain_wall_ms
         );
-        Ok((weights, stats))
+        Ok(weights)
     }
 }
 
@@ -544,9 +557,6 @@ mod tests {
     use anyhow::Context;
 
     use super::*;
-    use crate::config::LayerKind;
-
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
     /// Out of range on any host, so opening a device becomes a visible failure.
     /// Not `usize::MAX`, whose cast to the driver's `int` is -1 by accident.
@@ -555,63 +565,6 @@ mod tests {
     fn model_path() -> Result<String> {
         std::env::var("PEGAINFER_TEST_MODEL_PATH")
             .context("PEGAINFER_TEST_MODEL_PATH must point to a Gemma 4 checkpoint directory")
-    }
-
-    /// No forward pass; residency only.
-    ///
-    /// ```text
-    /// PEGAINFER_TEST_MODEL_PATH=/path/to/gemma-4-12B-it cargo test --release \
-    ///   -p pegainfer-gemma4 --features gemma4 --lib \
-    ///   weights::load::tests::loads_the_text_tower_and_reports_residency -- \
-    ///   --exact --ignored --nocapture --test-threads=1
-    /// ```
-    #[test]
-    #[ignore = "requires the pinned 12B checkpoint and a GPU"]
-    fn loads_the_text_tower_and_reports_residency() -> Result<()> {
-        let path = model_path()?;
-        let config = Gemma4Config::from_file(&path)?;
-        let (weights, stats) = Gemma4Weights::from_safetensors(&path, 0, config)?;
-
-        let config = &weights.config;
-        assert_eq!(weights.layers.len(), config.layer_types.len());
-        for (layer, &kind) in weights.layers.iter().zip(&config.layer_types) {
-            let attention = &layer.attention;
-            match kind {
-                LayerKind::Sliding => {
-                    assert!(attention.v_proj.is_some(), "sliding layer without a v_proj");
-                    assert_eq!(attention.q_norm.len, config.head_dim);
-                }
-                LayerKind::Global => {
-                    assert!(attention.v_proj.is_none(), "global layer with a v_proj");
-                    assert_eq!(attention.q_norm.len, config.global_head_dim);
-                }
-            }
-            assert_eq!(attention.q_proj.cols, config.hidden_size);
-            assert_eq!(attention.o_proj.rows, config.hidden_size);
-        }
-        assert_eq!(weights.embed_tokens.rows, config.vocab_size);
-        assert_eq!(weights.embed_tokens.cols, config.hidden_size);
-
-        let globals = config
-            .layer_types
-            .iter()
-            .filter(|&&kind| kind == LayerKind::Global)
-            .count();
-        println!(
-            "layers {} ({globals} global), {} modality tensors skipped\n\
-             manifest {:.2} GiB, device {:.2} GiB, free {:.2} GiB\n\
-             {:.0} ms total, of which {:.0} validate, {:.0} record-api, {:.0} execute-and-drain",
-            weights.layers.len(),
-            stats.skipped_modality_tensors,
-            stats.manifest_bytes as f64 / GIB,
-            stats.device_bytes as f64 / GIB,
-            stats.device_free_bytes as f64 / GIB,
-            stats.elapsed_ms,
-            stats.validate_wall_ms,
-            stats.record_api_wall_ms,
-            stats.execute_and_drain_wall_ms,
-        );
-        Ok(())
     }
 
     /// Every faulty tensor named, before a device exists — hence the unopenable

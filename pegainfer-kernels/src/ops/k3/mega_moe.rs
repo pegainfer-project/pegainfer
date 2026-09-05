@@ -213,6 +213,31 @@ pub fn k3_mega_fabric_slab_import(
     Ok(ptr)
 }
 
+/// Store `value` into every 8-byte-aligned u64 flag address in `flag_addrs`
+/// (local or fabric-imported device VAs), stream-ordered after preceding
+/// work on `stream`; see `csrc/k3/k3_whale_doorbell.cu`.
+pub fn k3_whale_doorbell_ring(
+    flag_addrs: &[u64],
+    value: u64,
+    stream: cudarc::driver::sys::CUstream,
+) -> Result<()> {
+    // SAFETY: `flag_addrs` is a live host slice; the launcher copies it by value.
+    let result = unsafe {
+        ffi::k3_whale_doorbell_ring(
+            flag_addrs.as_ptr(),
+            i32::try_from(flag_addrs.len())?,
+            value,
+            stream,
+        )
+    };
+    result.result().map_err(|err| {
+        anyhow!(
+            "K3 whale doorbell ring over {} flags: {err}",
+            flag_addrs.len()
+        )
+    })
+}
+
 /// Open the device pair `(self_ordinal, peer_ordinal)` for the fused kernel's
 /// cross-rank addressing.
 ///

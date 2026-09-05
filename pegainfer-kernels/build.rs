@@ -2356,6 +2356,7 @@ fn main() {
             || stem == "flashinfer_sampling"
             || stem == "flashinfer_top1"
             || stem == "glm52_topk"
+            || stem == "local_kv_fp8"
         {
             for dir in &flashinfer.cccl {
                 nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);

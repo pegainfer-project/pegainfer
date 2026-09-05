@@ -4,6 +4,7 @@ use anyhow::Result;
 use anyhow::bail;
 use cudarc::driver::CudaSlice;
 use half::bf16;
+pub use pegainfer_kernels::paged_kv::KvStorage;
 
 use crate::page_pool::OwnedPagePermit;
 use crate::page_pool::PageId;
@@ -25,6 +26,7 @@ pub struct KvLayout {
     pub layer_stride: usize,
     /// Elements per page (all layers): num_layers × layer_stride.
     pub page_stride: usize,
+    pub storage: KvStorage,
 }
 
 impl KvLayout {
@@ -33,6 +35,22 @@ impl KvLayout {
         num_kv_heads: usize,
         head_dim: usize,
         page_size: usize,
+    ) -> anyhow::Result<Self> {
+        Self::with_storage(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            KvStorage::Bf16,
+        )
+    }
+
+    pub fn with_storage(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        storage: KvStorage,
     ) -> anyhow::Result<Self> {
         let strides = || -> Option<(usize, usize, usize)> {
             let kv_block_len = page_size.checked_mul(num_kv_heads)?.checked_mul(head_dim)?;
@@ -54,6 +72,7 @@ impl KvLayout {
             kv_block_len,
             layer_stride,
             page_stride,
+            storage,
         })
     }
 
@@ -66,6 +85,7 @@ impl KvLayout {
             kv_block_len: self.kv_block_len,
             layer_stride: self.layer_stride,
             page_stride: self.page_stride,
+            storage: self.storage,
         }
     }
 }
@@ -105,7 +125,29 @@ impl KvPool {
         page_size: usize,
         num_pages: usize,
     ) -> Result<Self> {
-        let layout = KvLayout::new(num_layers, num_kv_heads, head_dim, page_size)?;
+        Self::with_storage(
+            ctx,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            num_pages,
+            KvStorage::Bf16,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_storage(
+        ctx: &DeviceContext,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        num_pages: usize,
+        storage: KvStorage,
+    ) -> Result<Self> {
+        let layout =
+            KvLayout::with_storage(num_layers, num_kv_heads, head_dim, page_size, storage)?;
         let total_elements = num_pages.checked_mul(layout.page_stride).ok_or_else(|| {
             anyhow::anyhow!(
                 "KvPool geometry overflows: {num_pages} pages x {} elements per page",
@@ -114,17 +156,18 @@ impl KvPool {
         })?;
         // The allocator multiplies by the element size unchecked; answer
         // for the byte domain here, before it does.
-        total_elements
-            .checked_mul(std::mem::size_of::<bf16>())
+        let total_bytes = total_elements
+            .checked_mul(layout.storage.elem_bytes())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "KvPool geometry overflows the byte domain: {total_elements} bf16 elements"
+                    "KvPool geometry overflows the byte domain: {total_elements} elements"
                 )
             })?;
+        let backing_slots = total_bytes.div_ceil(std::mem::size_of::<bf16>());
 
         let buffer: CudaSlice<bf16> = ctx
             .stream
-            .alloc_zeros(total_elements)
+            .alloc_zeros(backing_slots)
             .map_err(|e| anyhow::anyhow!("KvPool alloc failed: {e}"))?;
 
         let pool = PagePool::new(num_pages);
@@ -357,6 +400,21 @@ mod tests {
         let ctx = DeviceContext::new().expect("GPU required for kv_pool tests");
         // Tiny allocation: 1 layer, 1 head, dim=1 — just enough to exercise logic.
         KvPool::new(&ctx, 1, 1, 1, page_size, num_pages).expect("KvPool::new failed")
+    }
+
+    #[test]
+    fn storage_width_sets_backing_capacity() {
+        let ctx = DeviceContext::new().expect("GPU required for kv_pool tests");
+        let pages = 3;
+        let fp8 =
+            KvPool::with_storage(&ctx, 1, 1, 1, 16, pages, KvStorage::E4m3).expect("fp8 KvPool");
+        let bf16 =
+            KvPool::with_storage(&ctx, 1, 1, 1, 16, pages, KvStorage::Bf16).expect("bf16 KvPool");
+        assert_eq!(
+            fp8.buffer().len(),
+            (pages * fp8.layout().page_stride).div_ceil(2)
+        );
+        assert_eq!(bf16.buffer().len(), pages * bf16.layout().page_stride);
     }
 
     #[test]

@@ -490,7 +490,7 @@ fn the_routed_block_matches_the_reference_formulas() {
     assert_eq!(super::marlin_block(NARROW_EDGE_ROWS * top_k), 16);
     assert_eq!(super::marlin_block(COARSE_ROWS * top_k), 64);
 
-    let (weights, _) =
+    let weights =
         crate::weights::Gemma4Weights::from_safetensors(&model, 0, config).expect("weights");
     let ctx = DeviceContext::new_with_device(0).expect("device");
     let layer = &weights.layers[0];

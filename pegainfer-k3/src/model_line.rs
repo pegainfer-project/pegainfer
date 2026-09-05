@@ -24,11 +24,15 @@ use crate::config::K3_LAYERS;
 use crate::config::K3_SUPPORTED_ROUTED_EXPERTS;
 use crate::executor::K3Executor;
 use crate::executor::K3ExecutorConfig;
+use crate::executor::cp::K3_WHALE_SEGMENT_FLOOR;
 use crate::executor::cp::K3CpGroup;
 use crate::executor::ep::K3EpRendezvous;
 use crate::scheduler::K3CpGang;
 use crate::scheduler::K3CpServing;
 use crate::scheduler::K3SchedulerConfig;
+use crate::scheduler::K3WhaleHub;
+use crate::scheduler::K3WhaleServing;
+use crate::scheduler::whale_hub::TcpWhaleHub;
 use crate::weights::K3_WEIGHT_FILL_THREADS;
 
 pub static MODEL_LINE: K3Line = K3Line;
@@ -297,7 +301,7 @@ impl ModelLine for K3Line {
             }
         };
         let load_started = Instant::now();
-        let executors = load_rank_executors(
+        let mut executors = load_rank_executors(
             ctx.model_path,
             ctx.shared.dflash_draft_model_path.as_deref(),
             ctx.shared.device_ordinal,
@@ -322,6 +326,14 @@ impl ModelLine for K3Line {
             .context("K3 EP serving needs at least one local rank")?
             .chunk_tokens();
         let cp = cp_serving(ranks.len(), dspark_armed, chunk_tokens)?;
+        let whale = whale_serving(
+            &mut executors,
+            ep_size,
+            ranks.clone(),
+            dspark_armed,
+            cp.is_some(),
+            chunk_tokens,
+        )?;
         Ok(LaunchedEngine::Stepped(
             crate::scheduler::start_with_executors(
                 executors,
@@ -329,10 +341,106 @@ impl ModelLine for K3Line {
                     eos_token_ids,
                     kv_capacity: None,
                     cp,
+                    whale,
                 },
             ),
         ))
     }
+}
+
+/// Arm the fleet whale lane from `PEGAINFER_K3_WHALE` (the rendezvous
+/// address — the process hosting global rank 0 binds it and runs the
+/// sequencer, everyone else connects) and `PEGAINFER_K3_WHALE_MIN` (admission
+/// floor in prompt tokens, at least twice [`K3_WHALE_SEGMENT_FLOOR`] — the
+/// narrowest prompt a width-2 gang can serve — which is also the default).
+///
+/// Arming stands the whole data plane up before any engine steps: every
+/// local rank allocates its fabric slab, the hub's startup exchange moves the
+/// world's handles (doubling as the fleet's startup barrier), and each
+/// executor imports the table. From then on a committed whale needs no
+/// further setup — the scheduler consults the rendezvous at every launch
+/// boundary and enters supersteps at the committed launch.
+fn whale_serving(
+    executors: &mut [K3Executor],
+    world: usize,
+    ranks: std::ops::Range<usize>,
+    dspark_armed: bool,
+    cp_armed: bool,
+    chunk_tokens: usize,
+) -> anyhow::Result<Option<K3WhaleServing>> {
+    let Some(raw) = std::env::var_os("PEGAINFER_K3_WHALE") else {
+        return Ok(None);
+    };
+    let addr = raw.to_string_lossy().into_owned();
+    anyhow::ensure!(
+        !dspark_armed,
+        "PEGAINFER_K3_WHALE does not compose with the dspark draft lane yet; disarm one of them"
+    );
+    anyhow::ensure!(
+        !cp_armed,
+        "PEGAINFER_K3_CP and PEGAINFER_K3_WHALE are exclusive: the in-process gang and the fleet \
+         whale lane coordinate the same superstep"
+    );
+    anyhow::ensure!(
+        world >= 2,
+        "PEGAINFER_K3_WHALE needs an EP world of at least two ranks; a whale gang is never \
+         narrower than two"
+    );
+    let narrowest = 2 * K3_WHALE_SEGMENT_FLOOR;
+    let min_tokens = match std::env::var_os("PEGAINFER_K3_WHALE_MIN") {
+        None => narrowest,
+        Some(raw) => {
+            let raw = raw.to_string_lossy();
+            raw.parse()
+                .ok()
+                .filter(|&min| min >= narrowest)
+                .with_context(|| {
+                    format!(
+                        "PEGAINFER_K3_WHALE_MIN={raw} must be a token count of at least \
+                         {narrowest} — no gang serves a shorter prompt"
+                    )
+                })?
+        }
+    };
+    let arm_started = Instant::now();
+    let armed = executors
+        .iter_mut()
+        .map(|executor| executor.arm_whale_slab(world))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let slabs: Vec<_> = armed.iter().map(|&(_, wire)| wire).collect();
+    let local: Vec<(usize, u64)> = armed
+        .iter()
+        .enumerate()
+        .map(|(offset, &(base, _))| (ranks.start + offset, base))
+        .collect();
+    let slabs_armed = Instant::now();
+    let (hub, table) = if ranks.start == 0 {
+        TcpWhaleHub::host(&addr, world, chunk_tokens, 0, ranks.len(), slabs)
+            .context("host the K3 whale hub")?
+    } else {
+        TcpWhaleHub::connect(&addr, ranks.start, ranks.len(), slabs)
+            .context("join the K3 whale hub")?
+    };
+    let world_exchanged = Instant::now();
+    let bases = executors[0].import_whale_world(&table, &local)?;
+    for executor in executors.iter_mut() {
+        executor.install_whale_gang(bases.clone())?;
+    }
+    info!(
+        "K3 whale lane armed: world={world}, local_ranks={ranks:?}, min_tokens={min_tokens}, \
+         chunk_tokens={chunk_tokens}, rendezvous={addr}, slab_alloc={:.2}s, \
+         slab_exchange={:.2}s (fleet startup barrier), import_install={:.2}s",
+        (slabs_armed - arm_started).as_secs_f64(),
+        (world_exchanged - slabs_armed).as_secs_f64(),
+        world_exchanged.elapsed().as_secs_f64(),
+    );
+    Ok(Some(K3WhaleServing {
+        hub: K3WhaleHub::Tcp(hub),
+        world,
+        first_local: ranks.start,
+        min_tokens,
+        chunk_tokens,
+    }))
 }
 
 fn warn_if_loader_cpu_starved(local_ranks: usize, weight_staging: bool) {

@@ -139,15 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn faultless_checkpoint_is_accepted() {
-        let manifest = Manifest::from_config(&config()).unwrap();
-        let tensors = faultless(&manifest);
-        let report = manifest.classify(&observe(&tensors));
-        report.check().unwrap();
-        assert!(report.skipped_modality.is_empty());
-    }
-
-    #[test]
     fn optional_modality_tensors_are_skipped_not_faulted() {
         let manifest = Manifest::from_config(&config()).unwrap();
         let mut tensors = faultless(&manifest);

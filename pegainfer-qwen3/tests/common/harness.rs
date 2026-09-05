@@ -249,3 +249,32 @@ pub(crate) struct Outcome {
     pub(crate) prompt_echo: Option<PromptEcho>,
     pub(crate) terminal: Terminal,
 }
+
+/// Minimal stderr logger for gate children (`PEGAINFER_TEST_LOG=1`): the
+/// hedged execution gate counts the executor's per-round hedge trace lines,
+/// and cargo test binaries install no logger of their own. Forwarding only
+/// this crate's records keeps child stderr parseable.
+struct TestLogger;
+
+impl log::Log for TestLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.target().starts_with("pegainfer_qwen3")
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static TEST_LOGGER: TestLogger = TestLogger;
+
+pub(crate) fn init_capture_logging() {
+    if std::env::var("PEGAINFER_TEST_LOG").is_ok() {
+        let _ = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(log::LevelFilter::Debug);
+    }
+}

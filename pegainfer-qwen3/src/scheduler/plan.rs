@@ -166,7 +166,17 @@ pub(crate) fn should_speculative_decode(
 fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStepItem> {
     active
         .iter()
-        .map(|r| DraftStepItem::new(r.request_id, r.last_token))
+        .map(|r| {
+            // Only greedy requests may hedge; the draft lane turns the
+            // remaining budget into eligibility against its effective branch
+            // positions (a chain must survive the verify-side span clamp).
+            let budget = if r.params.is_greedy() {
+                r.max_tokens.saturating_sub(r.generated_count)
+            } else {
+                0
+            };
+            DraftStepItem::new(r.request_id, r.last_token, budget)
+        })
         .collect()
 }
 
@@ -276,6 +286,18 @@ mod tests {
             params: SamplingParams::default(),
             logprobs: 0,
         }
+    }
+
+    #[test]
+    fn draft_items_carry_the_remaining_budget_for_greedy_requests_only() {
+        let exhausted = active(31, 32);
+        let fresh = active(0, 32);
+        let mut sampled = active(0, 32);
+        sampled.params.temperature = 0.7;
+        let items = build_speculative_draft_items(&[exhausted, fresh, sampled]);
+        assert_eq!(items[0].hedge_budget, 1);
+        assert_eq!(items[1].hedge_budget, 32);
+        assert_eq!(items[2].hedge_budget, 0);
     }
 
     #[test]

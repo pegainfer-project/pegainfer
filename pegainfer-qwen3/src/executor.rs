@@ -8,6 +8,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
 use crossbeam_channel as channel;
+use cudarc::driver::DevicePtr;
 use pegainfer_core::cuda_graph::CudaGraphDumpSummary;
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
@@ -45,6 +46,7 @@ use crate::weights::ModelRuntimeConfig;
 use crate::weights::Qwen3MemoryOptions;
 use crate::weights::Qwen3Model;
 
+mod auto_hedge;
 mod dflash_lane;
 mod dflash_prefill;
 mod remote_fetch;
@@ -66,6 +68,7 @@ use crate::speculative::DraftPlan;
 use crate::speculative::DraftResult;
 use crate::speculative::DraftStepItem;
 use crate::speculative::VerifyPlan;
+use crate::speculative::VerifyRequestResult;
 use crate::speculative::VerifyResult;
 use crate::speculative::VerifyStepItem;
 use crate::speculative::build_verify_results;
@@ -989,7 +992,9 @@ pub struct Qwen3Executor {
     primary: RankWorker,
     workers: Vec<RankWorker>,
     loaded_lora_adapters: HashSet<String>,
-    prefix_cache_enabled: bool,
+    /// Requested prefix-cache state; read through `prefix_cache_enabled()`,
+    /// which also honours the drafter override.
+    prefix_cache_requested: bool,
     lora_options: Qwen3LoraOptions,
     /// pegaflow KV-offload bridge; `None` unless offload is opted in on the
     /// single-GPU path. Drives both the SAVE hook and the async LOAD prefetch.
@@ -1139,6 +1144,7 @@ impl Qwen3Executor {
         max_prefill_tokens: usize,
         dflash_kv_bytes_per_token: usize,
         memory_options: Qwen3MemoryOptions,
+        hedge_scratch_pages: usize,
     ) -> Result<Self> {
         let (model, budget) = profile_kv_budget_on_worker(
             model,
@@ -1146,13 +1152,14 @@ impl Qwen3Executor {
             dflash_kv_bytes_per_token,
             memory_options,
         )?;
-        let kv_mgr = KvCacheManager::new(
+        let kv_mgr = KvCacheManager::new_with_scratch_pages(
             &model.device_ctx().stream,
             budget.num_layers,
             budget.num_kv_heads,
             budget.head_dim,
             budget.block_size,
             budget.num_blocks,
+            hedge_scratch_pages,
         )?;
         let device_ordinal = model.device_ctx().device_ordinal;
         let metadata = Qwen3ExecutorMetadata {
@@ -1219,7 +1226,7 @@ impl Qwen3Executor {
             )?,
             workers: Vec::new(),
             loaded_lora_adapters: HashSet::new(),
-            prefix_cache_enabled: true,
+            prefix_cache_requested: true,
             lora_options: Qwen3LoraOptions::default(),
             offload,
             saved_cursor: HashMap::new(),
@@ -1352,23 +1359,56 @@ impl Qwen3Executor {
             // paged KV pool, so reserve its footprint up front from the draft
             // config: fixed bytes (weights + block scratch) via the margin, and
             // pool-scaling per-token bytes folded into the block budget.
-            let dflash_kv_bytes_per_token = match dflash_draft_path {
+            let max_verify_batch = *BATCH_BUCKETS.last().unwrap();
+            let (dflash_kv_bytes_per_token, hedge_scratch_pages) = match dflash_draft_path {
                 Some(path) => {
-                    let reservation = crate::dflash::DFlashMemoryReservation::from_path(
-                        path,
-                        *BATCH_BUCKETS.last().unwrap(),
-                    )?;
-                    memory_options.kv_cache_memory_margin_bytes += reservation.fixed_bytes;
-                    reservation.kv_bytes_per_token
+                    let reservation =
+                        crate::dflash::DFlashMemoryReservation::from_path(path, max_verify_batch)?;
+                    memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
+                        memory_options.kv_cache_memory_margin_bytes,
+                        reservation.fixed_bytes,
+                    ])?;
+                    // Hedge-chain scratch KV pages (PEGAINFER_SPEC_HEDGE)
+                    // live in the KV buffer but outside the pool; bill them
+                    // via the margin so the profiled block budget shrinks to
+                    // fit instead of OOMing. Two bounds: the effective
+                    // geometry (worst-case span pages per chain) and the
+                    // expanded verify batch, which holds at most
+                    // `max_verify_batch - 1` hedge spans at once.
+                    let geometry = dflash_lane::spec_hedge_effective(reservation.block_size);
+                    let pages_per_chain = dflash_lane::hedge_pages_per_chain(
+                        reservation.block_size,
+                        memory_options.page_size,
+                    );
+                    let pages = if reservation.uses_markov_head {
+                        geometry
+                            .cap
+                            .saturating_mul(pages_per_chain)
+                            .saturating_mul(geometry.positions.len())
+                            .min(pages_per_chain.saturating_mul(max_verify_batch - 1))
+                    } else {
+                        // A plain DFlash drafter can never hedge; a nonzero
+                        // hedge env must not reserve scratch it cannot use.
+                        0
+                    };
+                    (reservation.kv_bytes_per_token, pages)
                 }
-                None => 0,
+                None => (0, 0),
             };
+            if hedge_scratch_pages > 0 {
+                let page_bytes = model.kv_page_bytes(memory_options.page_size)?;
+                memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
+                    memory_options.kv_cache_memory_margin_bytes,
+                    crate::sizing::product(&[hedge_scratch_pages, page_bytes])?,
+                ])?;
+            }
             let mut executor = Self::single(
                 model,
                 &offload_options,
                 max_prefill_tokens,
                 dflash_kv_bytes_per_token,
                 memory_options,
+                hedge_scratch_pages,
             )?;
             executor.lora_options = lora_options;
             return Ok(executor);
@@ -1582,7 +1622,7 @@ impl Qwen3Executor {
             primary,
             workers,
             loaded_lora_adapters: HashSet::new(),
-            prefix_cache_enabled: true,
+            prefix_cache_requested: true,
             lora_options,
             // Offload is single-GPU only (asserted above); never built here.
             offload: None,
@@ -1627,14 +1667,23 @@ impl Qwen3Executor {
     /// creates duplicate primaries outside request-level capacity accounting.
     pub fn set_prefix_cache_enabled(&mut self, enabled: bool) {
         let retained_before = self.retains_completed_kv_blocks();
-        self.prefix_cache_enabled = enabled;
+        self.prefix_cache_requested = enabled;
         self.finish_retention_transition(retained_before);
+    }
+
+    /// Whether prefix reuse is actually in effect. A loaded drafter forces it
+    /// off: speculative capture needs uncached hidden states, and the KV budget
+    /// charges the draft's out-of-pool cache per POOL block, which only holds
+    /// while blocks are not shared between requests. `load_dflash_draft_model`
+    /// also clears the requested flag; this makes the override structural.
+    fn prefix_cache_enabled(&self) -> bool {
+        self.prefix_cache_requested && self.speculative.is_none()
     }
 
     /// Whether a completed request should leave its registered GPU blocks in
     /// the inactive L1 cache for a later prefix match.
     fn retains_completed_kv_blocks(&self) -> bool {
-        self.prefix_cache_enabled && !self.l1_retention_disabled
+        self.prefix_cache_enabled() && !self.l1_retention_disabled
     }
 
     /// Drain blocks retained under the old policy once when L1 retention is
@@ -1845,7 +1894,7 @@ impl Qwen3Executor {
             );
             // Echo needs logits for every prompt position; cached positions
             // are never forwarded, so echo requests prefill from scratch.
-            if self.prefix_cache_enabled && !req.echo {
+            if self.prefix_cache_enabled() && !req.echo {
                 req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
             }
             self.request_kvs.insert(req.request_id, rkv);
@@ -2366,7 +2415,7 @@ impl ModelExecutor for Qwen3Executor {
         let Some(offload) = self.offload.as_ref() else {
             return false;
         };
-        if !self.prefix_cache_enabled {
+        if !self.prefix_cache_enabled() {
             return false;
         }
         if self.l1_retention_disabled {
@@ -3460,10 +3509,198 @@ impl LocalQwen3Lane {
         )
     }
 
+    /// Parallel multi-chain hedge (`PEGAINFER_SPEC_HEDGE`): verify each hedged
+    /// request's greedy chain (chain A) **and** its hedge-ladder alternative
+    /// chains in one expanded forward, then commit whichever chain the target
+    /// accepts further. Each hedge chain's span KV is written to lane-owned
+    /// scratch pages via a synthesized [`KvView`] (prefix pages shared
+    /// read-only, the partial committed page copied first); on a hedge win the
+    /// touched pages are copied back into the request's reservation before
+    /// `apply_speculative`, and the winning chain's captured hidden rows are
+    /// compacted onto chain A's offsets so
+    /// `record_verify_dflash_context` sees a plain N-request layout. The KV
+    /// transaction interface is untouched. Returns `Ok(None)` when nothing is
+    /// hedgeable this round (caller falls back to the plain pass).
+    fn try_execute_hedged_verify(
+        &mut self,
+        requests: &[VerifyStepItem],
+        kv_views: &[KvView],
+        capture_layer_ids: &[usize],
+        sample_seed: u64,
+        bufs: &mut VerifyGraphBuffers,
+    ) -> Result<Option<VerifyResult>> {
+        let page_size = self.layout.page_size;
+        let scratch_end = self.kv_buffer.num_blocks();
+        let max_batch = *BATCH_BUCKETS.last().unwrap();
+        let cap = self.dflash.as_ref().map_or(0, DFlashLaneState::hedge_cap);
+        if cap == 0 || scratch_end == self.total_blocks {
+            return Ok(None);
+        }
+
+        let ctx = self.model.device_ctx().clone();
+        // Single pass: expanded layout keeps the N chain-A spans first
+        // (offsets unchanged) and appends every accepted hedge span, walking a
+        // scratch-page cursor. `hedge_spans[slot]` = (request idx, replaced
+        // (original page, scratch page) pairs) for the winner copy-back.
+        let mut expanded: Vec<VerifyStepItem> = requests.to_vec();
+        let mut views: Vec<KvView> = kv_views.to_vec();
+        let mut hedge_spans: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+        let mut next_scratch = self.total_blocks;
+        {
+            let Some(dflash) = self.dflash.as_ref() else {
+                return Ok(None);
+            };
+            if !dflash.model.uses_markov_head() {
+                return Ok(None);
+            }
+            let drafts_start = usize::from(!dflash.model.anchor_first());
+            let pages_per_chain =
+                dflash_lane::hedge_pages_per_chain(dflash.model.block_size(), page_size);
+            let mut hedged_requests = 0usize;
+            for (idx, req) in requests.iter().enumerate() {
+                if hedged_requests == cap {
+                    break;
+                }
+                if !req.params.is_greedy() || req.token_ids.len() < 2 {
+                    continue;
+                }
+                let Some(chains) = dflash.hedge_blocks.get(&req.request_id) else {
+                    continue;
+                };
+                let v = &kv_views[idx];
+                let committed = v.seq_len() - req.token_ids.len();
+                let first_span_page = committed / page_size;
+                let span_pages = v.page_indices().len() - first_span_page;
+                if span_pages > pages_per_chain {
+                    continue;
+                }
+                let keep = req.token_ids.len() - 1;
+                let mut added: Vec<Vec<u32>> = Vec::new();
+                for block in chains {
+                    if expanded.len() == max_batch || next_scratch + span_pages > scratch_end {
+                        break;
+                    }
+                    let mut ids = Vec::with_capacity(keep + 1);
+                    ids.push(req.token_ids[0]);
+                    ids.extend(block[drafts_start..].iter().take(keep).copied());
+                    if ids.len() != req.token_ids.len()
+                        || ids[1..] == req.token_ids[1..]
+                        || added.iter().any(|prev| prev[1..] == ids[1..])
+                    {
+                        continue;
+                    }
+                    let mut pages = v.page_indices().to_vec();
+                    let mut replaced = Vec::with_capacity(span_pages);
+                    for (k, page_slot) in (first_span_page..pages.len()).enumerate() {
+                        let orig = pages[page_slot] as usize;
+                        let scratch_page = next_scratch + k;
+                        if k == 0 && !committed.is_multiple_of(page_size) {
+                            // The hedge chain shares this page's committed
+                            // prefix rows: give it a full copy to write its
+                            // span into.
+                            self.kv_buffer.copy_page(&ctx.stream, orig, scratch_page)?;
+                        }
+                        pages[page_slot] = scratch_page as i32;
+                        replaced.push((orig, scratch_page));
+                    }
+                    next_scratch += span_pages;
+                    expanded.push(VerifyStepItem::new(req.request_id, ids.clone(), req.params));
+                    views.push(KvView::new(pages, v.seq_len(), page_size));
+                    hedge_spans.push((idx, replaced));
+                    added.push(ids);
+                }
+                if !added.is_empty() {
+                    hedged_requests += 1;
+                }
+            }
+        }
+        if hedge_spans.is_empty() {
+            return Ok(None);
+        }
+
+        let spans: Vec<&[u32]> = expanded.iter().map(VerifyStepItem::as_slice).collect();
+        self.model.batch_prefill_into(
+            &spans,
+            &views,
+            self.kv_buffer.buffer(),
+            &self.layout,
+            capture_layer_ids,
+            bufs,
+        )?;
+        let params: Vec<&SamplingParams> = expanded
+            .iter()
+            .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
+            .collect();
+        let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
+        let all_results = build_verify_results(&expanded, &target_tokens)?;
+        let (results_a, results_b) = all_results.split_at(requests.len());
+
+        // Per request keep the best-accepting chain; ties keep chain A (no
+        // copies). A later chain of the same request only replaces the
+        // running winner when strictly better, so the final page/hidden
+        // copies always belong to the final winner.
+        let a_total_rows: usize = requests.iter().map(|r| r.token_ids.len()).sum();
+        let hidden_dim = bufs.captured_hidden().hidden_dim;
+        let elem = std::mem::size_of::<half::bf16>();
+        let mut final_requests: Vec<VerifyStepItem> = requests.to_vec();
+        let mut final_results: Vec<VerifyRequestResult> = results_a.to_vec();
+        let mut b_wins = 0usize;
+        let mut b_row_offset = a_total_rows;
+        for (slot, (idx, replaced)) in hedge_spans.iter().enumerate() {
+            let span_len = requests[*idx].token_ids.len();
+            let res_b = &results_b[slot];
+            if res_b.accepted_tokens.len() > final_results[*idx].accepted_tokens.len() {
+                // Winning chain: canonical pages take its span KV, and its
+                // captured hidden rows land on A's row offsets in place.
+                for &(orig, scratch_page) in replaced {
+                    self.kv_buffer.copy_page(&ctx.stream, scratch_page, orig)?;
+                }
+                let a_row_offset: usize = requests[..*idx].iter().map(|r| r.token_ids.len()).sum();
+                let (hid_ptr, _guard) = bufs.captured_hidden().data.device_ptr(&ctx.stream);
+                let src = hid_ptr + (b_row_offset * hidden_dim * elem) as u64;
+                let dst = hid_ptr + (a_row_offset * hidden_dim * elem) as u64;
+                unsafe {
+                    cudarc::driver::result::memcpy_dtod_async(
+                        dst,
+                        src,
+                        span_len * hidden_dim * elem,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+                .map_err(|e| anyhow::anyhow!("hedge hidden compaction failed: {e}"))?;
+                b_wins += 1;
+                final_requests[*idx] = expanded[requests.len() + slot].clone();
+                final_results[*idx] = res_b.clone();
+            }
+            b_row_offset += span_len;
+        }
+        let b_extra: usize = final_results
+            .iter()
+            .zip(results_a)
+            .map(|(f, a)| f.accepted_tokens.len() - a.accepted_tokens.len())
+            .sum();
+        log::debug!(
+            "Qwen3 DFlash hedge: {} chain span(s), {b_wins} win event(s), +{b_extra} committed token(s)",
+            hedge_spans.len()
+        );
+
+        // The expanded forward left seq_len at A+B rows; the winner layout is
+        // exactly the N chain-A offsets.
+        bufs.captured_hidden_mut().seq_len = a_total_rows;
+        self.record_verify_dflash_context(
+            &final_requests,
+            &final_results,
+            Some(bufs.captured_hidden()),
+        )?;
+        Ok(Some(VerifyResult {
+            requests: final_results,
+        }))
+    }
+
     /// DFlash verify forward over each request's `block_size`-token span, using
-    /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation).
-    /// Numerically equivalent to the `batch_prefill(echo=true)` verify path it
-    /// replaces; the buffers are lazily built on first use.
+    /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation),
+    /// lazily built on first use. Numerically equivalent to the
+    /// `batch_prefill(echo=true)` verify path it replaces.
     fn execute_dflash_verify(
         &mut self,
         requests: &[VerifyStepItem],
@@ -3484,12 +3721,29 @@ impl LocalQwen3Lane {
 
         if self.verify_bufs.is_none() {
             let max_batch = *BATCH_BUCKETS.last().unwrap();
+            // Each hedged request repeats its full prefix page list once per
+            // chain, so the plan's page-index capacity must budget the
+            // duplicates on top of the pool-wide worst case.
+            // Base page lists are disjoint pool pages (sum <= total_blocks):
+            // loading a drafter force-disables the prefix cache (see
+            // `load_dflash_draft_model`), so no two active requests share
+            // pages on any path that can hedge. Each chain layer duplicates at
+            // most one pool-wide list, so the multiplier is the chain count
+            // alone, bounded by the expanded verify batch.
+            let hedge_dup = self.dflash.as_ref().map_or(0, |dflash| {
+                if dflash.hedge_cap() == 0 {
+                    0
+                } else {
+                    dflash.hedge_branch_count().min(max_batch - 1)
+                }
+            });
             self.verify_bufs = Some(VerifyGraphBuffers::new(
                 &self.model,
                 max_batch,
                 verify_span,
                 capture_layer_ids.len(),
-                self.total_blocks,
+                self.total_blocks
+                    .saturating_mul(hedge_dup.saturating_add(1)),
             )?);
         }
 
@@ -3498,6 +3752,23 @@ impl LocalQwen3Lane {
         // and context record (`&mut self.dflash`) don't alias a `self` borrow.
         let mut bufs = self.verify_bufs.take().expect("verify buffers just set");
         let result = (|| -> Result<VerifyResult> {
+            if self.dflash.as_ref().is_some_and(|d| d.hedge_cap() > 0) {
+                if let Some(result) = self.try_execute_hedged_verify(
+                    requests,
+                    kv_views,
+                    &capture_layer_ids,
+                    sample_seed,
+                    &mut bufs,
+                )? {
+                    return Ok(result);
+                }
+                // Fell back to the plain pass: whatever the draft prepared,
+                // this round executed unhedged — the controller must not book
+                // ladder cost to a chain count that never ran a verify span.
+                if let Some(dflash) = self.dflash.as_mut() {
+                    dflash.clear_round_chains();
+                }
+            }
             let spans: Vec<&[u32]> = requests.iter().map(VerifyStepItem::as_slice).collect();
             self.model.batch_prefill_into(
                 &spans,
@@ -3521,6 +3792,7 @@ impl LocalQwen3Lane {
                 .collect();
             let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
             let request_results = build_verify_results(requests, &target_tokens)?;
+
             self.record_verify_dflash_context(
                 requests,
                 &request_results,

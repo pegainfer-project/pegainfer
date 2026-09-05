@@ -46,7 +46,7 @@ pub struct Qwen3MemoryOptions {
     pub(crate) kv_cache_memory_margin_bytes: usize,
     /// KV cache page (block) size in tokens (`--kv-page-size`). FlashInfer
     /// constrains this to [`VALID_KV_PAGE_SIZES`]; 16 by default.
-    page_size: usize,
+    pub(crate) page_size: usize,
 }
 
 impl Qwen3MemoryOptions {
@@ -651,7 +651,7 @@ impl Qwen3Model {
     #[cfg(feature = "kernel-call-trace")]
     pub(crate) fn kv_budget(&self) -> KvBudget {
         let geometry = self.kv_budget_geometry(DEFAULT_KV_PAGE_SIZE);
-        let bytes_per_block = Self::kv_bytes_per_block(&geometry);
+        let bytes_per_block = Self::kv_bytes_per_block(&geometry).expect("KV bytes per block");
         let (free_bytes, _) = cudarc::driver::result::mem_get_info().expect("cuMemGetInfo failed");
         let kv_budget_bytes = (free_bytes as f64 * 0.85) as usize;
         Self::kv_budget_from_bytes(
@@ -662,6 +662,7 @@ impl Qwen3Model {
             free_bytes,
             "heuristic",
         )
+        .expect("KV budget")
     }
 
     pub(crate) fn profiled_kv_budget(
@@ -673,7 +674,7 @@ impl Qwen3Model {
     ) -> Result<KvBudget> {
         let memory_options = memory_options.validate()?;
         let geometry = self.kv_budget_geometry(memory_options.page_size);
-        let bytes_per_block = Self::kv_bytes_per_block(&geometry);
+        let bytes_per_block = Self::kv_bytes_per_block(&geometry)?;
         let (initial_free_bytes, total_bytes) = mem_info_bytes()?;
         let requested_bytes =
             (total_bytes as f64 * memory_options.gpu_memory_utilization).ceil() as usize;
@@ -700,7 +701,7 @@ impl Qwen3Model {
         let profile_rows = profile_prefill_rows + profile_decode_rows;
         let profile_blocks =
             profile_temp_blocks(max_prefill_tokens, profile_decode_rows, geometry.block_size);
-        let profile_kv_bytes = profile_blocks * bytes_per_block;
+        let profile_kv_bytes = crate::sizing::product(&[profile_blocks, bytes_per_block])?;
         let mut peak_used_bytes = initial_used_bytes;
         let mut record_peak = || -> Result<()> {
             let (free_bytes, total_bytes) = mem_info_bytes()?;
@@ -771,13 +772,6 @@ impl Qwen3Model {
             memory_options.kv_cache_memory_margin_bytes / (1024 * 1024)
         );
         let kv_budget_bytes = requested_bytes - non_kv_bytes;
-        let min_kv_bytes = 64 * bytes_per_block;
-        anyhow::ensure!(
-            kv_budget_bytes >= min_kv_bytes,
-            "Qwen3 memory profile leaves too little KV cache: available={} MiB, minimum={} MiB",
-            kv_budget_bytes / (1024 * 1024),
-            min_kv_bytes / (1024 * 1024)
-        );
         log::info!(
             "memory profile: total={} MiB requested={} MiB ({:.0}%) initial_used={} MiB \
              peak_non_kv_increase={} MiB margin={} MiB -> KV budget={} MiB",
@@ -789,14 +783,21 @@ impl Qwen3Model {
             memory_options.kv_cache_memory_margin_bytes / (1024 * 1024),
             kv_budget_bytes / (1024 * 1024),
         );
-        Ok(Self::kv_budget_from_bytes(
+        Self::kv_budget_from_bytes(
             geometry,
             bytes_per_block,
             dflash_kv_bytes_per_token,
             kv_budget_bytes,
             initial_free_bytes,
             "profiled",
-        ))
+        )
+    }
+
+    /// Bytes one KV page costs in the pool, for a given page size. The single
+    /// owner of this formula — callers that bill KV pages (hedge scratch,
+    /// budgets) must not re-derive it.
+    pub(crate) fn kv_page_bytes(&self, page_size: usize) -> Result<usize> {
+        Self::kv_bytes_per_block(&self.kv_budget_geometry(page_size))
     }
 
     fn kv_budget_geometry(&self, page_size: usize) -> KvBudget {
@@ -810,15 +811,33 @@ impl Qwen3Model {
         }
     }
 
-    fn kv_bytes_per_block(geometry: &KvBudget) -> usize {
+    fn kv_bytes_per_block(geometry: &KvBudget) -> Result<usize> {
+        // Checked BEFORE constructing the layout: `KvLayout::new` derives its
+        // strides with plain products, and this full product dominates every
+        // partial one, so clearing it clears them all.
+        let bytes = crate::sizing::product(&[
+            geometry.num_layers,
+            2,
+            geometry.num_kv_heads,
+            geometry.head_dim,
+            geometry.block_size,
+            std::mem::size_of::<half::bf16>(),
+        ])?;
         let layout = pegainfer_kv_cache::KvLayout::new(
             geometry.num_layers,
             geometry.num_kv_heads,
             geometry.head_dim,
             geometry.block_size,
         );
-        layout.page_stride * std::mem::size_of::<half::bf16>()
+        debug_assert_eq!(
+            bytes,
+            layout.page_stride * std::mem::size_of::<half::bf16>()
+        );
+        Ok(bytes)
     }
+
+    /// Smallest pool the scheduler can make progress with.
+    const MIN_KV_BLOCKS: usize = 64;
 
     fn kv_budget_from_bytes(
         mut geometry: KvBudget,
@@ -827,23 +846,57 @@ impl Qwen3Model {
         kv_budget_bytes: usize,
         free_bytes: usize,
         source: &'static str,
-    ) -> KvBudget {
+    ) -> Result<KvBudget> {
         // DFlash keeps its own per-request KV (plus prompt-scaling scratch) outside
         // the paged pool, scaling with the same token count. Charge it as extra
         // bytes per pool token so the target block count shrinks to leave room; the
         // pool itself is still allocated at the target-only `bytes_per_block`.
-        let effective_bytes_per_block =
-            bytes_per_block + dflash_kv_bytes_per_token * geometry.block_size;
-        let num_blocks = (kv_budget_bytes / effective_bytes_per_block).max(64);
-        let kv_mb = num_blocks * bytes_per_block / (1024 * 1024);
+        //
+        // Checked: the draft config is not shape-validated against the draft
+        // weights until the model loads, which is after this budget is fixed.
+        let effective_bytes_per_block = crate::sizing::sum(&[
+            bytes_per_block,
+            crate::sizing::product(&[dflash_kv_bytes_per_token, geometry.block_size])?,
+        ])?;
+        anyhow::ensure!(
+            effective_bytes_per_block > 0,
+            "KV budget ({source}): degenerate geometry gives zero bytes per block"
+        );
+        // Against `effective`, not `bytes_per_block`: a budget that affords 64
+        // target blocks can still be short once the draft's out-of-pool KV is
+        // charged, and forcing the floor anyway defers the shortfall into a
+        // draft-growth OOM at serving time.
+        let affordable = kv_budget_bytes / effective_bytes_per_block;
+        anyhow::ensure!(
+            affordable >= Self::MIN_KV_BLOCKS,
+            "KV cache ({source}) affords only {affordable} blocks, below the \
+             {}-block minimum: budget={} MiB, needed={} MiB \
+             ({} KiB per block = {} target + {} draft)",
+            Self::MIN_KV_BLOCKS,
+            kv_budget_bytes / (1024 * 1024),
+            crate::sizing::product(&[Self::MIN_KV_BLOCKS, effective_bytes_per_block])?
+                / (1024 * 1024),
+            effective_bytes_per_block / 1024,
+            bytes_per_block / 1024,
+            (effective_bytes_per_block - bytes_per_block) / 1024,
+        );
+        let num_blocks = affordable;
+        // Saturating, not checked: log-only figures must not abort startup.
+        // Reported on the same basis the blocks were derived from — pool and
+        // draft split out, since only the pool shows up in the KV allocation.
+        let pool_mb = num_blocks.saturating_mul(bytes_per_block) / (1024 * 1024);
+        let draft_mb =
+            num_blocks.saturating_mul(effective_bytes_per_block - bytes_per_block) / (1024 * 1024);
+        let spent = num_blocks.saturating_mul(effective_bytes_per_block);
         let page_size = geometry.block_size;
         log::info!(
-            "KV cache ({source}): {num_blocks} blocks ({kv_mb} MB, page size {page_size}, {:.0}% of {:.0} MB free)",
-            kv_budget_bytes as f64 / free_bytes as f64 * 100.0,
+            "KV cache ({source}): {num_blocks} blocks (pool {pool_mb} MB + draft {draft_mb} MB, \
+             page size {page_size}, {:.0}% of {:.0} MB free)",
+            spent as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
         geometry.num_blocks = num_blocks;
-        geometry
+        Ok(geometry)
     }
 }
 
@@ -884,6 +937,94 @@ mod tests {
     use super::*;
     use crate::lora::DeviceLoraLayer;
     use crate::lora::LoraAdapterManifest;
+
+    /// The draft config drives `dflash_kv_bytes_per_token`, and it is not
+    /// shape-validated against the draft weights until the model loads — after
+    /// this budget is fixed. A malformed value must fail the budget instead of
+    /// wrapping into an under-reservation.
+    #[test]
+    fn a_malformed_draft_config_fails_the_kv_budget_instead_of_wrapping() {
+        let geometry = KvBudget {
+            num_layers: 36,
+            num_kv_heads: 8,
+            head_dim: 128,
+            block_size: 16,
+            num_blocks: 0,
+        };
+        let bytes_per_block = Qwen3Model::kv_bytes_per_block(&geometry).expect("sane geometry");
+        let sane = Qwen3Model::kv_budget_from_bytes(
+            geometry,
+            bytes_per_block,
+            65_536,
+            8 << 30,
+            16 << 30,
+            "test",
+        )
+        .expect("sane draft config budgets");
+        assert!(sane.num_blocks >= 64);
+
+        let err = Qwen3Model::kv_budget_from_bytes(
+            geometry,
+            bytes_per_block,
+            usize::MAX / 8,
+            8 << 30,
+            16 << 30,
+            "test",
+        )
+        .expect_err("overflowing draft bytes-per-token must fail closed");
+        assert!(
+            err.to_string().contains("overflow"),
+            "expected a sizing-overflow error, got: {err}"
+        );
+    }
+
+    /// The pool costs `bytes_per_block`, but each pool block also drags the
+    /// draft's out-of-pool KV along. A budget that affords the minimum in
+    /// target bytes alone must still be rejected when it cannot afford it in
+    /// effective bytes — otherwise the shortfall lands as a draft-growth OOM
+    /// once requests actually fill the pool.
+    #[test]
+    fn a_budget_that_affords_the_floor_only_without_the_draft_charge_is_rejected() {
+        let geometry = KvBudget {
+            num_layers: 36,
+            num_kv_heads: 8,
+            head_dim: 128,
+            block_size: 16,
+            num_blocks: 0,
+        };
+        let bytes_per_block = Qwen3Model::kv_bytes_per_block(&geometry).expect("sane geometry");
+        let per_token = 65_536;
+        let effective = bytes_per_block + per_token * geometry.block_size;
+        assert!(bytes_per_block < effective);
+
+        let between = (Qwen3Model::MIN_KV_BLOCKS * bytes_per_block + 1)
+            .max((Qwen3Model::MIN_KV_BLOCKS * effective) / 2);
+        let err = Qwen3Model::kv_budget_from_bytes(
+            geometry,
+            bytes_per_block,
+            per_token,
+            between,
+            16 << 30,
+            "test",
+        )
+        .expect_err("a budget short of the effective floor must be rejected");
+        assert!(
+            err.to_string().contains("below the"),
+            "expected a minimum-blocks error, got: {err}"
+        );
+
+        let exact = Qwen3Model::MIN_KV_BLOCKS * effective;
+        let budget = Qwen3Model::kv_budget_from_bytes(
+            geometry,
+            bytes_per_block,
+            per_token,
+            exact,
+            16 << 30,
+            "test",
+        )
+        .expect("the effective floor itself is affordable");
+        assert_eq!(budget.num_blocks, Qwen3Model::MIN_KV_BLOCKS);
+    }
 
     fn test_device_adapter(name: &str, path: &Path) -> DeviceLoraAdapter {
         DeviceLoraAdapter {

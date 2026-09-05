@@ -27,6 +27,7 @@
 #include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
+#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -43,6 +44,34 @@ CUmemAllocationProp fabric_prop(int device_ordinal) {
   prop.location.id = device_ordinal;
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
   return prop;
+}
+
+// The VMM allocator and the stream-ordered pool compete for the same
+// physical pages, and the engine pins the pool's release threshold at MAX
+// (weight loading and the step path churn large short-lived allocations).
+// After a full-model load the pool can hoard tens of GiB of freed pages
+// that cuMemCreate cannot see. Returning them is only needed — and only
+// correct to force — when a fabric allocation actually fails for space.
+CUresult trim_default_pool(int device_ordinal) {
+  CUdevice dev;
+  CUresult err = cuDeviceGet(&dev, device_ordinal);
+  if (err != CUDA_SUCCESS) return err;
+  CUmemoryPool pool;
+  err = cuDeviceGetDefaultMemPool(&pool, dev);
+  if (err != CUDA_SUCCESS) return err;
+  // Pending stream-ordered frees only become trimmable once they retire.
+  err = cuCtxSynchronize();
+  if (err != CUDA_SUCCESS) return err;
+  unsigned long long reserved = 0, used = 0;
+  (void)cuMemPoolGetAttribute(pool, CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT, &reserved);
+  (void)cuMemPoolGetAttribute(pool, CU_MEMPOOL_ATTR_USED_MEM_CURRENT, &used);
+  err = cuMemPoolTrimTo(pool, 0);
+  unsigned long long after = 0;
+  (void)cuMemPoolGetAttribute(pool, CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT, &after);
+  fprintf(stderr,
+          "k3_mega_fabric: dev%d pool reserved=%.2f GiB used=%.2f GiB -> trimmed to %.2f GiB\n",
+          device_ordinal, reserved / 1073741824.0, used / 1073741824.0, after / 1073741824.0);
+  return err;
 }
 
 // Round `num_bytes` up to the allocation granularity the fabric prop wants.
@@ -134,6 +163,9 @@ CUresult k3_mega_fabric_slab_alloc(int device_ordinal, unsigned long long num_by
   const CUmemAllocationProp prop = fabric_prop(device_ordinal);
   CUmemGenericAllocationHandle handle;
   err = cuMemCreate(&handle, size, &prop, 0);
+  if (err == CUDA_ERROR_OUT_OF_MEMORY && trim_default_pool(device_ordinal) == CUDA_SUCCESS) {
+    err = cuMemCreate(&handle, size, &prop, 0);
+  }
   if (err != CUDA_SUCCESS) return err;
 
   CUmemFabricHandle fabric;

@@ -17,8 +17,6 @@ using namespace flashinfer;
 
 using DType  = __nv_bfloat16;
 using IdType = int32_t;
-using ParamsT = BatchDecodeParams<DType, DType, DType, IdType>;
-using BatchPrefillParamsT = BatchPrefillPagedParams<DType, DType, DType, IdType>;
 using PrefillParamsT = SinglePrefillParams<DType, DType, DType>;
 using Variant = DefaultAttention</*custom_mask=*/false,
                                  /*sliding_window=*/false,
@@ -32,7 +30,8 @@ using WindowVariant = DefaultAttention</*custom_mask=*/false,
                                        /*logits_soft_cap=*/false,
                                        /*alibi=*/false>;
 
-static paged_kv_t<DType, IdType> make_paged_kv(
+template <typename KvT = DType>
+static paged_kv_t<KvT, IdType> make_paged_kv(
     void*    kv_data,
     int64_t  k_offset_elems,
     int64_t  v_offset_elems,
@@ -45,8 +44,8 @@ static paged_kv_t<DType, IdType> make_paged_kv(
     int32_t  batch_size,
     int64_t  stride_page)
 {
-    DType* k_data = reinterpret_cast<DType*>(kv_data) + k_offset_elems;
-    DType* v_data = reinterpret_cast<DType*>(kv_data) + v_offset_elems;
+    KvT* k_data = reinterpret_cast<KvT*>(kv_data) + k_offset_elems;
+    KvT* v_data = reinterpret_cast<KvT*>(kv_data) + v_offset_elems;
 
     // kv_strides[0] = stride_page, [1] = stride for NHD-n, [2] = stride for NHD-h
     int64_t kv_strides[3] = {
@@ -55,7 +54,7 @@ static paged_kv_t<DType, IdType> make_paged_kv(
         static_cast<int64_t>(head_dim),
     };
 
-    return paged_kv_t<DType, IdType>(
+    return paged_kv_t<KvT, IdType>(
         num_kv_heads, page_size, head_dim, batch_size,
         QKVLayout::kNHD,
         k_data, v_data, kv_strides,
@@ -63,7 +62,7 @@ static paged_kv_t<DType, IdType> make_paged_kv(
         /*rope_pos_offset=*/nullptr);
 }
 
-template <uint32_t HEAD_DIM, typename VariantT>
+template <uint32_t HEAD_DIM, typename VariantT, typename KvT = DType>
 static int decode_launch(
     // Q and output
     void*    q,                    // [num_qo_heads * head_dim] bf16, device
@@ -93,7 +92,8 @@ static int decode_launch(
     void*    stream)
 {
   PEGAINFER_FFI_GUARD_BEGIN
-    auto paged_kv = make_paged_kv(
+    using ParamsT = BatchDecodeParams<DType, KvT, DType, IdType>;
+    auto paged_kv = make_paged_kv<KvT>(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
         num_kv_heads, head_dim, page_size, batch_size, stride_page);
@@ -148,7 +148,7 @@ static int decode_launch(
 //
 // tmp_v/tmp_s hold per-chunk partial states and are merged by FlashInfer.
 // ---------------------------------------------------------------------------
-template <uint32_t HEAD_DIM, typename VariantT>
+template <uint32_t HEAD_DIM, typename VariantT, typename KvT = DType>
 static int decode_split_kv_launch(
     void*    q,                    // [batch_size * num_qo_heads * head_dim] bf16, device
     void*    output,               // [batch_size * num_qo_heads * head_dim] bf16, device
@@ -177,7 +177,8 @@ static int decode_split_kv_launch(
     void*    stream)
 {
   PEGAINFER_FFI_GUARD_BEGIN
-    auto paged_kv = make_paged_kv(
+    using ParamsT = BatchDecodeParams<DType, KvT, DType, IdType>;
+    auto paged_kv = make_paged_kv<KvT>(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
         num_kv_heads, head_dim, page_size, batch_size, stride_page);
@@ -235,7 +236,7 @@ static uint32_t resolve_prefill_cta_tile_q(
     return 0;
 }
 
-template <uint32_t HEAD_DIM, typename VariantT>
+template <uint32_t HEAD_DIM, typename VariantT, typename KvT = DType>
 static int prefill_paged_launch(
     // Q and output (HiddenStates col-major: [q_dim, total_seq_len])
     void*    q,
@@ -271,7 +272,8 @@ static int prefill_paged_launch(
     void*    stream)
 {
   PEGAINFER_FFI_GUARD_BEGIN
-    auto paged_kv = make_paged_kv(
+    using BatchPrefillParamsT = BatchPrefillPagedParams<DType, KvT, DType, IdType>;
+    auto paged_kv = make_paged_kv<KvT>(
         kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indptr, last_page_len_d,
         num_kv_heads, head_dim, page_size, batch_size, stride_page);
