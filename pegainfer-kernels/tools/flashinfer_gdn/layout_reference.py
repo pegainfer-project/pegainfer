@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from artifact_contract import (
-    ContractError, default_flashinfer_dir,
+    ContractError,
     prepare_flashinfer_source, read_json, sha256_file,
     validate_compile_metadata, validate_manifest, write_json,
 )
@@ -20,7 +20,7 @@ from artifact_contract import (
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--flashinfer-dir", type=Path, default=default_flashinfer_dir())
+    parser.add_argument("--flashinfer-dir", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

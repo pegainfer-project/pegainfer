@@ -21,6 +21,12 @@ link inputs too. These Rust dependencies are enabled only by Qwen3.5.
 
 `generate.py` prepares the pinned source, applies the HKV specialization and
 packages `manifest.json`, `kernel.h`, `kernel.o`, and the native static runtime.
+Pass `--flashinfer-dir` explicitly to an independent clean checkout at the
+`source-lock.json` FlashInfer pin (`a0efa0adfe49bb836ab1a147d6572980b870f3d4`).
+Keep that generation checkout outside the serving repository. The shared
+`pegainfer-kernels/third_party/flashinfer` submodule stays at the repository's
+existing pin: its headers also implement other models' production attention.
+The GDN source pin must not replace that shared dependency or its include path.
 Its Python interpreter must match `requirements-cu13.lock` and the exact
 Python/toolchain versions in the source lock. Qwen3.5's normal Triton build
 uses a separate environment. Python/CuTe and manifests are generation/build
@@ -35,6 +41,11 @@ the actual candidate object hash for comparison with the linked Rust backend. Th
 only the existing export type-annotation hunks are applied. The small
 `upstream_adapter.c` launches that generated object in-place and is never
 included by the production build.
+The runner requires `PEGAINFER_GDN_FLASHINFER_DIR` pointing to the same independent
+checkout and passes it through `--flashinfer-dir`. It validates the frozen source
+before any builds and records both the shared submodule and generation checkout
+SHAs in its provenance log. This variable is consumed only by the gate runner;
+Cargo and the server do not use it.
 
 The validator writes raw little-endian fixtures for T=1/63/64/65/128 and a
 64+64 resumed sequence under its temporary output directory. Inputs and states
@@ -51,6 +62,9 @@ against the real generated bundle. It shares one valid fixture across all
 metadata and file/path rejection cases; it does not manufacture a fake object
 or claim host validation proves GPU execution. One corrupted real object also
 exercises the actual build-script rejection before linking.
+Gate 3 reuses both existing short and long HF golden tests. The long test checks
+4097/8192-token outputs against an external oracle; the production HTTP and
+Shared-SM checks cover request flow and overlap, so they do not replace it.
 
 Generated objects, oracle source copies, references, logs, model weights and
 profiling results remain outside the source tree's tracked files. The runner

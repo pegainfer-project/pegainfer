@@ -312,7 +312,3 @@ def validate_manifest(
     })
     _require_equal(manifest, expected, "complete candidate contract")
     return manifest
-
-
-def default_flashinfer_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "third_party" / "flashinfer"

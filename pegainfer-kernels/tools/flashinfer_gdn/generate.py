@@ -14,7 +14,6 @@ from pathlib import Path
 from artifact_contract import (
     VARIANT,
     ContractError,
-    default_flashinfer_dir,
     package_candidate,
     prepare_flashinfer_source,
     validate_manifest,
@@ -24,7 +23,7 @@ from artifact_contract import (
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
-    parser.add_argument("--flashinfer-dir", type=Path, default=default_flashinfer_dir())
+    parser.add_argument("--flashinfer-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("target/flashinfer-gdn-sm120"))
     args = parser.parse_args()
 

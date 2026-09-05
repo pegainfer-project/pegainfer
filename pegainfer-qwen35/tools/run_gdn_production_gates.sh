@@ -12,7 +12,7 @@ require_env() {
 }
 for name in PEGAINFER_QWEN35_GDN_AOT_BUNDLE PEGAINFER_TEST_MODEL_PATH \
   PEGAINFER_TEST_MODEL_REVISION PEGAINFER_TRITON_PYTHON PEGAINFER_GDN_AOT_PYTHON \
-  PEGAINFER_CUDA_SM CARGO_TARGET_DIR; do
+  PEGAINFER_GDN_FLASHINFER_DIR PEGAINFER_CUDA_SM CARGO_TARGET_DIR; do
   require_env "$name"
 done
 for command in git nvidia-smi nvcc rustc cargo protoc cc c++ clang cmake ninja \
@@ -24,6 +24,7 @@ if [[ -n "${PEGAINFER_GDN_NSYS_REPORT:-}" ]]; then
 fi
 
 bundle="$(realpath "$PEGAINFER_QWEN35_GDN_AOT_BUNDLE")"
+gdn_flashinfer="$(realpath "$PEGAINFER_GDN_FLASHINFER_DIR")"
 model="$(realpath "$PEGAINFER_TEST_MODEL_PATH")"
 python="$PEGAINFER_TRITON_PYTHON"
 aot_python="$PEGAINFER_GDN_AOT_PYTHON"
@@ -52,6 +53,14 @@ for input in "$model/config.json" "$bundle/manifest.json" "$bundle/kernel.o" \
   [[ -f "$input" ]] || { echo "missing input: $input" >&2; exit 2; }
 done
 [[ -x "$python" && -x "$aot_python" ]] || { echo "Python inputs must be executable" >&2; exit 2; }
+generation_flashinfer_sha="$("$aot_python" - "$gdn_flashinfer" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, "pegainfer-kernels/tools/flashinfer_gdn")
+from artifact_contract import verify_flashinfer_base
+print(verify_flashinfer_base(Path(sys.argv[1])))
+PY
+)"
 gpu_compute_cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sed -n '1p' | tr -d '[:space:]')"
 [[ "$gpu_compute_cap" == 12.0 ]] || { echo "real SM120 GPU required" >&2; exit 2; }
 config_sha="$(sha256sum "$model/config.json" | awk '{print $1}')"
@@ -71,6 +80,7 @@ object_sha="$(sha256sum "$bundle/kernel.o" | awk '{print $1}')"
   echo "tree_sha=$tree_sha"
   echo "branch=$(git branch --show-current)"
   echo "flashinfer_submodule_sha=$(git -C pegainfer-kernels/third_party/flashinfer rev-parse HEAD)"
+  echo "gdn_generation_flashinfer_sha=$generation_flashinfer_sha"
   echo "model_revision=$expected_revision"
   echo "model_config_sha256=$config_sha"
   echo "candidate_object_sha256=$object_sha"
@@ -181,7 +191,7 @@ expect_startup_rejection gate1-missing-candidate "$target_root/stock/release/peg
   "no AOT candidate was linked"
 
 "$aot_python" pegainfer-kernels/tools/flashinfer_gdn/layout_reference.py \
-  --flashinfer-dir pegainfer-kernels/third_party/flashinfer --candidate "$bundle" \
+  --flashinfer-dir "$gdn_flashinfer" --candidate "$bundle" \
   --output "$PEGAINFER_QWEN35_GDN_LAYOUT_REFERENCE" \
   2>&1 | tee "$log_root/gate1-layout-generation.log"
 export CARGO_TARGET_DIR="$target_root/candidate"
@@ -266,6 +276,8 @@ run_exact_gate gate2-native-prepare-cpu-oracle \
   recurrent::native_prepare_tests::test_gdn_native_prepare_matches_cpu_reference_on_finite_inputs ignored \
   -p pegainfer-qwen35 --features qwen35 --lib
 run_exact_gate gate3-hf-golden pega_logprobs_match_hf_golden_within_qwen35_tolerance ordinary \
+  -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate
+run_exact_gate gate3-hf-long-golden pega_logprobs_match_hf_long_golden_within_qwen35_tolerance ordinary \
   -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate
 run_exact_gate gate4-model-continuation \
   prefill::tests::flashinfer_gdn_chunk_continuation_and_model_outputs_match ignored \
