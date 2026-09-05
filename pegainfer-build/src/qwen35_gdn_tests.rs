@@ -100,7 +100,9 @@ fn candidate_contract_rejects_mutations() {
         corrupted[0] ^= 1;
         fs::write(&path, &corrupted).unwrap();
         reject(&format!("same-size corruption {name}"));
-        fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        // Remove content, not just a trailing newline that is optional in JSON.
+        let truncated_len = bytes.trim_ascii_end().len() - 1;
+        fs::write(&path, &bytes[..truncated_len]).unwrap();
         reject(&format!("truncated {name}"));
         fs::write(&path, bytes).unwrap();
     }
