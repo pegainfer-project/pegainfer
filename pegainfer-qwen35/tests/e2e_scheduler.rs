@@ -673,17 +673,15 @@ fn test_e2e_qwen35_scheduler() {
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
-    let options = common::launch_options(8, pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS);
-    let overlap = if options.gdn_backend == pegainfer_qwen35::Qwen35GdnBackend::FlashInferCandidate
-    {
+    let overlap = if common::gdn_backend() == "flashinfer-candidate" {
         pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm
     } else {
         pegainfer_qwen35::Qwen35DecodeOverlap::Off
     };
-    let handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
-        Path::new(&model_path),
-        options,
-        pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+    let handle = common::launch_engine(
+        &model_path,
+        8,
+        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
         overlap,
     )
     .expect("Failed to start Qwen3.5 scheduler");
@@ -709,10 +707,10 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         .expect("test prompt must contain a token");
 
     let (off_reference_tokens, off_decoder_tokens) = {
-        let off_handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
-            Path::new(&model_path),
-            common::launch_options(4, 8192),
-            pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+        let off_handle = common::launch_engine(
+            &model_path,
+            4,
+            8192,
             pegainfer_qwen35::Qwen35DecodeOverlap::Off,
         )
         .expect("Failed to start Qwen3.5 default-Off scheduler");
@@ -751,10 +749,10 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         (off.tokens, decoder.tokens)
     };
 
-    let handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
-        Path::new(&model_path),
-        common::launch_options(4, 8192),
-        pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+    let handle = common::launch_engine(
+        &model_path,
+        4,
+        8192,
         pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
     )
     .expect("Failed to start Qwen3.5 shared-SM scheduler");

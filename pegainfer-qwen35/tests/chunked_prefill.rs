@@ -6,8 +6,6 @@
 //! also run with an effectively unchunked budget and the generated greedy token
 //! ids must match.
 
-use std::path::Path;
-
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
@@ -23,10 +21,10 @@ const MAX_BATCH: usize = 2;
 const GENERATED_TOKENS: usize = 8;
 
 fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
-    pegainfer_qwen35::launch_with_options_policy_and_overlap(
-        Path::new(model_path),
-        common::launch_options(MAX_BATCH, max_prefill_tokens),
-        pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+    common::launch_engine(
+        model_path,
+        MAX_BATCH,
+        max_prefill_tokens,
         pegainfer_qwen35::Qwen35DecodeOverlap::Off,
     )
     .expect("failed to start Qwen3.5 engine")

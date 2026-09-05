@@ -180,12 +180,15 @@ fn flashinfer_gdn_chunk_continuation_and_model_outputs_match() -> Result<()> {
         "flashinfer_gdn_chunk_continuation_and_model_outputs_match",
     )
     .expect("chunk-continuation gate requires PEGAINFER_TEST_MODEL_PATH");
-    let model = Qwen35Model::from_safetensors_with_options(
+    let model = Qwen35Model::from_safetensors_with_launch_options(
         &model_path,
         &crate::Qwen35LaunchOptions {
+            device_ordinal: 0,
+            tp_size: 1,
+            cuda_graph: true,
             max_batch: 1,
+            max_prefill_tokens: crate::DEFAULT_MAX_PREFILL_TOKENS,
             gdn_backend: crate::Qwen35GdnBackend::FlashInferCandidate,
-            ..Default::default()
         },
     )?;
     assert!(model.flashinfer_gdn.is_some());

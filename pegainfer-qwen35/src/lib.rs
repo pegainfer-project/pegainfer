@@ -101,7 +101,7 @@ pub enum Qwen35DecodeOverlap {
 
 /// GDN prefill implementation requested when loading Qwen3.5.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
-pub enum Qwen35GdnBackend {
+enum Qwen35GdnBackend {
     /// Use the existing Triton implementation, irrespective of linked candidates.
     #[default]
     Triton,
@@ -137,27 +137,14 @@ pub fn start_engine(
 #[derive(Clone, Debug)]
 pub struct Qwen35LaunchOptions {
     /// CUDA device for single-GPU loads (ignored when `tp_size > 1`).
-    pub device_ordinal: usize,
+    device_ordinal: usize,
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
-    pub tp_size: usize,
+    tp_size: usize,
     /// TP Phase 1 supports eager-only multi-GPU execution.
-    pub cuda_graph: bool,
-    pub max_batch: usize,
-    pub max_prefill_tokens: usize,
-    pub gdn_backend: Qwen35GdnBackend,
-}
-
-impl Default for Qwen35LaunchOptions {
-    fn default() -> Self {
-        Self {
-            device_ordinal: 0,
-            tp_size: 1,
-            cuda_graph: true,
-            max_batch: MAX_DECODE_BATCH,
-            max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
-            gdn_backend: Qwen35GdnBackend::Triton,
-        }
-    }
+    cuda_graph: bool,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    gdn_backend: Qwen35GdnBackend,
 }
 
 impl Qwen35LaunchOptions {
@@ -325,14 +312,15 @@ fn start_engine_with_backend(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors_with_options(
+    let model = weights::Qwen35Model::from_safetensors_with_launch_options(
         model_path,
         &Qwen35LaunchOptions {
             device_ordinal,
+            tp_size: 1,
+            cuda_graph: enable_cuda_graph,
             max_batch,
             max_prefill_tokens,
             gdn_backend,
-            ..Default::default()
         },
     )?;
     scheduler::start_with_capacity_and_policy(

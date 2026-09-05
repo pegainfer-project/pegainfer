@@ -163,11 +163,15 @@ mod tests {
         else {
             return;
         };
-        let model = Qwen35Model::from_safetensors_with_options(
+        let model = Qwen35Model::from_safetensors_with_launch_options(
             &model_path,
             &crate::Qwen35LaunchOptions {
+                device_ordinal: 0,
+                tp_size: 1,
+                cuda_graph: true,
                 max_batch: 2,
-                ..Default::default()
+                max_prefill_tokens: crate::DEFAULT_MAX_PREFILL_TOKENS,
+                gdn_backend: crate::Qwen35GdnBackend::Triton,
             },
         )
         .unwrap();

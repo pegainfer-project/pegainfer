@@ -14,26 +14,79 @@ pub(crate) mod model_fixture;
 pub(crate) use model_fixture::model_path_or_skip;
 
 #[allow(dead_code)]
-pub(crate) fn launch_options(
-    max_batch: usize,
-    max_prefill_tokens: usize,
-) -> pegainfer_qwen35::Qwen35LaunchOptions {
-    use clap::ValueEnum;
-    use pegainfer_qwen35::Qwen35GdnBackend;
-
-    let backend = match std::env::var("PEGAINFER_TEST_QWEN35_GDN_BACKEND") {
+pub(crate) fn gdn_backend() -> String {
+    match std::env::var("PEGAINFER_TEST_QWEN35_GDN_BACKEND") {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => "triton".to_string(),
         Err(error) => panic!("invalid PEGAINFER_TEST_QWEN35_GDN_BACKEND: {error}"),
-    };
-    pegainfer_qwen35::Qwen35LaunchOptions {
-        cuda_graph: true,
-        max_batch,
-        max_prefill_tokens,
-        gdn_backend: Qwen35GdnBackend::from_str(&backend, false)
-            .expect("PEGAINFER_TEST_QWEN35_GDN_BACKEND must be a production backend name"),
-        ..Default::default()
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn with_launch_context<T>(
+    model_path: &str,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    overlap: pegainfer_qwen35::Qwen35DecodeOverlap,
+    operation: impl FnOnce(&pegainfer_frontend::model_line::LaunchContext<'_>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    use pegainfer_frontend::model_line::LaunchContext;
+    use pegainfer_frontend::model_line::ModelLine;
+    use pegainfer_frontend::model_line::parse_for_line;
+    use pegainfer_qwen35::model_line::MODEL_LINE;
+
+    let backend = gdn_backend();
+    let max_batch = max_batch.to_string();
+    let max_prefill_tokens = max_prefill_tokens.to_string();
+    let overlap = match overlap {
+        pegainfer_qwen35::Qwen35DecodeOverlap::Off => "off",
+        pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm => "stream",
+    };
+    let (shared, matches, provided) = parse_for_line(
+        &MODEL_LINE,
+        &[
+            "pegainfer",
+            "--model-path",
+            model_path,
+            "--max-batch",
+            &max_batch,
+            "--max-prefill-tokens",
+            &max_prefill_tokens,
+            "--decode-overlap",
+            overlap,
+            "--qwen35-gdn-backend",
+            &backend,
+        ],
+    )?;
+    let model_path = std::path::Path::new(model_path);
+    let config = serde_json::from_slice(&std::fs::read(model_path.join("config.json"))?)?;
+    MODEL_LINE.probe(&config).map_err(anyhow::Error::msg)?;
+    let ctx = LaunchContext {
+        model_path,
+        config: &config,
+        shared: &shared,
+        matches: &matches,
+    };
+    MODEL_LINE.validate(&ctx, &provided)?;
+    operation(&ctx)
+}
+
+#[allow(dead_code)]
+pub(crate) fn launch_engine(
+    model_path: &str,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    overlap: pegainfer_qwen35::Qwen35DecodeOverlap,
+) -> anyhow::Result<pegainfer_frontend::engine::EngineHandle> {
+    use pegainfer_frontend::engine::LaunchedEngine;
+    use pegainfer_frontend::model_line::ModelLine;
+
+    with_launch_context(model_path, max_batch, max_prefill_tokens, overlap, |ctx| {
+        match pegainfer_qwen35::model_line::MODEL_LINE.launch(ctx)? {
+            LaunchedEngine::Handle(handle) => Ok(handle),
+            LaunchedEngine::Stepped(_) => anyhow::bail!("Qwen3.5 must launch its scheduler handle"),
+        }
+    })
 }
 
 #[allow(dead_code)]

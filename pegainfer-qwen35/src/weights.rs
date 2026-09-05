@@ -90,6 +90,19 @@ const MIN_KV_PAGES: usize = 64;
 impl Qwen35Model {
     pub fn from_safetensors_with_options(
         model_path: &str,
+        enable_cuda_graph: bool,
+    ) -> Result<Self> {
+        Self::from_safetensors_with_runtime(
+            model_path,
+            ModelRuntimeConfig {
+                enable_cuda_graph,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub(crate) fn from_safetensors_with_launch_options(
+        model_path: &str,
         options: &crate::Qwen35LaunchOptions,
     ) -> Result<Self> {
         anyhow::ensure!(

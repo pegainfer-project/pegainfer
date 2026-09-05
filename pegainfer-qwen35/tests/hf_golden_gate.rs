@@ -737,12 +737,12 @@ fn report_and_assert(label: &str, stats: &Stats) {
 }
 
 fn build_executor(model_path: &str) -> Qwen35Executor {
-    Qwen35Executor::from_runtime(
+    common::with_launch_context(
         model_path,
-        &common::launch_options(
-            MAX_EXECUTOR_BATCH,
-            pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
-        ),
+        MAX_EXECUTOR_BATCH,
+        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+        pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+        Qwen35Executor::from_runtime,
     )
     .expect("build Qwen3.5 logits executor")
 }

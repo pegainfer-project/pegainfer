@@ -62,6 +62,21 @@ fn cli(ctx: &LaunchContext<'_>) -> Qwen35Cli {
     Qwen35Cli::from_arg_matches(ctx.matches).expect("Qwen35Cli parses from the merged command")
 }
 
+pub(crate) fn launch_options(ctx: &LaunchContext<'_>) -> Qwen35LaunchOptions {
+    let cli = cli(ctx);
+    Qwen35LaunchOptions {
+        device_ordinal: ctx.shared.device_ordinal,
+        tp_size: ctx.shared.tp_size,
+        cuda_graph: ctx.shared.cuda_graph,
+        gdn_backend: cli.qwen35_gdn_backend,
+        max_batch: cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
+        max_prefill_tokens: ctx
+            .shared
+            .max_prefill_tokens
+            .unwrap_or(crate::DEFAULT_MAX_PREFILL_TOKENS),
+    }
+}
+
 fn resolve_decode_overlap(overlap: CliDecodeOverlap) -> Result<Qwen35DecodeOverlap, CliError> {
     match overlap {
         CliDecodeOverlap::Off => Ok(Qwen35DecodeOverlap::Off),
@@ -159,17 +174,7 @@ impl ModelLine for Qwen35Line {
         let cli = cli(ctx);
         crate::launch_with_options_policy_and_overlap(
             ctx.model_path,
-            Qwen35LaunchOptions {
-                device_ordinal: ctx.shared.device_ordinal,
-                tp_size: ctx.shared.tp_size,
-                cuda_graph: ctx.shared.cuda_graph,
-                gdn_backend: cli.qwen35_gdn_backend,
-                max_batch: cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
-                max_prefill_tokens: ctx
-                    .shared
-                    .max_prefill_tokens
-                    .unwrap_or(crate::DEFAULT_MAX_PREFILL_TOKENS),
-            },
+            launch_options(ctx),
             cli.qwen35_scheduler_policy.resolve(),
             resolve_decode_overlap(ctx.shared.decode_overlap)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
