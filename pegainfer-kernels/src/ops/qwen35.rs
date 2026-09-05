@@ -163,8 +163,8 @@ impl Qwen35GdnAot {
         output: &mut HiddenStates,
         launch_workspace: &mut Qwen35GdnWorkspace,
     ) -> Result<()> {
-        let g = Qwen35GdnGeometry::PRODUCTION;
-        let state_elements = g.h_v * g.head_dim * g.head_dim;
+        let geometry = Qwen35GdnGeometry::PRODUCTION;
+        let state_elements = geometry.h_v * geometry.head_dim * geometry.head_dim;
         ensure!(
             state.len() == state_elements,
             "Qwen3.5 GDN state length mismatch"
@@ -193,22 +193,22 @@ impl Qwen35GdnAot {
         );
         ensure!(
             t > 0
-                && t <= (i32::MAX as usize / g.h_v)
+                && t <= (i32::MAX as usize / geometry.h_v)
                 && k.seq_len == t
                 && v.seq_len == t
                 && output.seq_len == t,
             "Qwen3.5 GDN token extents do not match"
         );
         ensure!(
-            q.hidden_dim == g.h_q * g.head_dim
-                && k.hidden_dim == g.h_k * g.head_dim
-                && v.hidden_dim == g.h_v * g.head_dim
-                && output.hidden_dim == g.h_v * g.head_dim,
+            q.hidden_dim == geometry.h_q * geometry.head_dim
+                && k.hidden_dim == geometry.h_k * geometry.head_dim
+                && v.hidden_dim == geometry.h_v * geometry.head_dim
+                && output.hidden_dim == geometry.h_v * geometry.head_dim,
             "Qwen3.5 GDN tensor geometry mismatch"
         );
         ensure!(
-            alpha.len() == t * g.h_v
-                && beta.len() == t * g.h_v
+            alpha.len() == t * geometry.h_v
+                && beta.len() == t * geometry.h_v
                 && launch_workspace.workspace.len() >= self.workspace_bytes
                 && launch_workspace.cu_seqlens.len() == 2
                 && launch_workspace.tokens == t,
