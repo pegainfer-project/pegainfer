@@ -234,7 +234,7 @@ timeout 90m cargo clippy --release --locked -p pegainfer-server \
 timeout 60m cargo test --release --locked -p pegainfer-kernels --features qwen35 --lib --no-run \
   2>&1 | tee "$log_root/kernels-tests-build.log"
 timeout 60m cargo test --release --locked -p pegainfer-qwen35 --features qwen35 \
-  --lib --test hf_golden_gate --test e2e_scheduler --test chunked_prefill --no-run \
+  --lib --test e2e_scheduler --test chunked_prefill --no-run \
   2>&1 | tee "$log_root/qwen35-tests-build.log"
 
 run_exact_gate() {
@@ -275,10 +275,12 @@ run_exact_gate gate1-in-place-layout \
 run_exact_gate gate2-native-prepare-cpu-oracle \
   recurrent::native_prepare_tests::test_gdn_native_prepare_matches_cpu_reference_on_finite_inputs ignored \
   -p pegainfer-qwen35 --features qwen35 --lib
-run_exact_gate gate3-hf-golden pega_logprobs_match_hf_golden_within_qwen35_tolerance ordinary \
-  -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate
-run_exact_gate gate3-hf-long-golden pega_logprobs_match_hf_long_golden_within_qwen35_tolerance ordinary \
-  -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate
+run_exact_gate gate3-hf-golden \
+  executor::hf_golden_gate::pega_logprobs_match_hf_golden_within_qwen35_tolerance ordinary \
+  -p pegainfer-qwen35 --features qwen35 --lib
+run_exact_gate gate3-hf-long-golden \
+  executor::hf_golden_gate::pega_logprobs_match_hf_long_golden_within_qwen35_tolerance ordinary \
+  -p pegainfer-qwen35 --features qwen35 --lib
 run_exact_gate gate4-model-continuation \
   prefill::tests::flashinfer_gdn_chunk_continuation_and_model_outputs_match ignored \
   -p pegainfer-qwen35 --features qwen35 --lib

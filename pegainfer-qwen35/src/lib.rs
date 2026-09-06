@@ -6,6 +6,9 @@
 #![allow(clippy::wildcard_imports)]
 #![cfg(feature = "qwen35")]
 
+#[cfg(test)]
+extern crate self as pegainfer_qwen35;
+
 mod batch_decode;
 pub(crate) mod batch_decode_graph;
 pub(crate) mod config;
@@ -22,7 +25,7 @@ pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
 #[cfg(test)]
-#[path = "../tests/common/model_fixture.rs"]
+#[path = "../tests/common/mod.rs"]
 mod test_fixture;
 mod tp_executor;
 mod unified_forward;

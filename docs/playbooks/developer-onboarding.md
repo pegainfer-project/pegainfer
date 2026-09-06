@@ -115,7 +115,7 @@ Accuracy tests live in each model crate:
 
 ```bash
 cargo test -r -p pegainfer-qwen3  --test hf_golden_gate   # Qwen3-4B logits vs stored HF golden (bf16 tolerance)
-cargo test -r -p pegainfer-qwen35 --test hf_golden_gate   # Qwen3.5-4B logits vs stored HF golden (bf16 tolerance)
+cargo test -r -p pegainfer-qwen35 --features qwen35 --lib executor::hf_golden_gate -- --test-threads=1   # Qwen3.5-4B logits vs stored HF golden (bf16 tolerance)
 cargo test -r -p pegainfer-qwen35 --test e2e_scheduler    # Qwen3.5-4B scheduler request-flow integration
 ```
 

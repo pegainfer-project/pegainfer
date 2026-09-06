@@ -123,6 +123,25 @@ impl Qwen35Model {
 }
 
 impl Qwen35Model {
+    /// `max_batch` is the requested concurrent-request cap in `1..=MAX_BATCH`.
+    /// It need not be a decode bucket: the physical decode capacity is rounded
+    /// up to the next `BATCH_BUCKETS` value while the scheduler still admits at
+    /// most `max_batch` (see #470 and `decode_admission_batch`).
+    pub(crate) fn from_safetensors(
+        model_path: &str,
+        device_ordinal: usize,
+        max_batch: usize,
+    ) -> Result<Self> {
+        Self::from_safetensors_with_runtime_and_capacity(
+            model_path,
+            ModelRuntimeConfig {
+                device_ordinal,
+                ..Default::default()
+            },
+            max_batch,
+        )
+    }
+
     pub(crate) fn from_safetensors_with_runtime(
         model_path: &str,
         runtime: ModelRuntimeConfig,

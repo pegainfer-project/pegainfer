@@ -18,8 +18,11 @@ fn read_tensor<T, const N: usize>(
         bytes.len()
     );
     Ok(bytes
-        .chunks_exact(N)
-        .map(|chunk| decode(chunk.try_into().expect("exact tensor element width")))
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .copied()
+        .map(decode)
         .collect())
 }
 
@@ -136,7 +139,7 @@ fn sm120_stable_in_place_abi_matches_upstream_layout_reference() -> Result<()> {
         ensure!(
             initial.iter().all(|value| value.is_finite())
                 && initial.iter().any(|&value| value != 0.0)
-                && initial[1] != initial[geometry.head_dim],
+                && (initial[1] - initial[geometry.head_dim]).abs() > 0.0,
             "{case}: initial HKV state must be finite, nonzero and asymmetric"
         );
         let mut state = ctx.stream.clone_htod(&initial)?;

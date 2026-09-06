@@ -10,7 +10,6 @@ use anyhow::Result;
 use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::TokenLogprob;
-use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::batch_decode_graph::BatchDecodeGraphState;
@@ -18,6 +17,9 @@ use crate::decode_buffers::BatchDecodeBuffers35;
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
+
+#[cfg(test)]
+mod hf_golden_gate;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(u64);
@@ -113,15 +115,8 @@ pub struct Qwen35Executor {
 }
 
 impl Qwen35Executor {
-    pub fn from_runtime(ctx: &LaunchContext<'_>) -> Result<Self> {
-        let model_path = ctx
-            .model_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("model path must be valid UTF-8"))?;
-        let model = Qwen35Model::from_safetensors_with_launch_options(
-            model_path,
-            &crate::model_line::launch_options(ctx),
-        )?;
+    pub fn from_runtime(model_path: &str, device_ordinal: usize, max_batch: usize) -> Result<Self> {
+        let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
         model.tune_decode_gemm_algos()?;
         let graph_state = model.create_batch_decode_graph_state()?;
         Ok(Self {

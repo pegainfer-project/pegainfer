@@ -163,18 +163,7 @@ mod tests {
         else {
             return;
         };
-        let model = Qwen35Model::from_safetensors_with_launch_options(
-            &model_path,
-            &crate::Qwen35LaunchOptions {
-                device_ordinal: 0,
-                tp_size: 1,
-                cuda_graph: true,
-                max_batch: 2,
-                max_prefill_tokens: crate::DEFAULT_MAX_PREFILL_TOKENS,
-                gdn_backend: crate::Qwen35GdnBackend::Triton,
-            },
-        )
-        .unwrap();
+        let model = Qwen35Model::from_safetensors(&model_path, 0, 2).unwrap();
 
         let prompt_a: Vec<u32> = vec![9707];
         let prompt_b: Vec<u32> = vec![3838, 374, 220, 17, 10, 17];

@@ -17,20 +17,21 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use pegainfer_frontend::engine::TokenLogprob;
-use pegainfer_qwen35::runtime::DecodePlan;
-use pegainfer_qwen35::runtime::DecodeStepItem;
-use pegainfer_qwen35::runtime::DropExpectation;
-use pegainfer_qwen35::runtime::PrefillPlan;
-use pegainfer_qwen35::runtime::PrefillStepItem;
-use pegainfer_qwen35::runtime::Qwen35Executor;
-use pegainfer_qwen35::runtime::Qwen35TpExecutor;
-use pegainfer_qwen35::runtime::RequestId;
 use safetensors::Dtype;
 use safetensors::SafeTensors;
 use sha2::Digest;
 use sha2::Sha256;
 
-mod common;
+use crate::runtime::DecodePlan;
+use crate::runtime::DecodeStepItem;
+use crate::runtime::DropExpectation;
+use crate::runtime::PrefillPlan;
+use crate::runtime::PrefillStepItem;
+use crate::runtime::Qwen35Executor;
+use crate::runtime::Qwen35TpExecutor;
+use crate::runtime::RequestId;
+use crate::test_fixture as common;
+use crate::weights::Qwen35Model;
 
 const GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_GOLDEN";
 const LONG_GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_LONG_GOLDEN";
@@ -740,9 +741,21 @@ fn build_executor(model_path: &str) -> Qwen35Executor {
     common::with_launch_context(
         model_path,
         MAX_EXECUTOR_BATCH,
-        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
-        pegainfer_qwen35::Qwen35DecodeOverlap::Off,
-        Qwen35Executor::from_runtime,
+        crate::DEFAULT_MAX_PREFILL_TOKENS,
+        crate::Qwen35DecodeOverlap::Off,
+        |ctx| {
+            let model = Qwen35Model::from_safetensors_with_launch_options(
+                model_path,
+                &crate::model_line::launch_options(ctx),
+            )?;
+            model.tune_decode_gemm_algos()?;
+            let graph_state = model.create_batch_decode_graph_state()?;
+            Ok(Qwen35Executor {
+                model,
+                graph_state,
+                active: Vec::new(),
+            })
+        },
     )
     .expect("build Qwen3.5 logits executor")
 }
