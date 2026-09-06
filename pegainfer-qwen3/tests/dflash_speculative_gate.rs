@@ -663,8 +663,10 @@ fn dflash_hedged_midspan_stop_retains_trigger() {
         )
         .expect("failed to start speculative engine"),
     );
-    let mut baseline_params = SamplingParams::default();
-    baseline_params.ignore_eos = true;
+    let baseline_params = SamplingParams {
+        ignore_eos: true,
+        ..SamplingParams::default()
+    };
     let baseline = engine
         .submit(request(
             prompt_tokens.clone(),
@@ -686,8 +688,10 @@ fn dflash_hedged_midspan_stop_retains_trigger() {
         "selected stop token at position {stop_index}, expected inside the first {block_size}-token verify span"
     );
 
-    let mut stopped_params = SamplingParams::default();
-    stopped_params.ignore_eos = true;
+    let stopped_params = SamplingParams {
+        ignore_eos: true,
+        ..SamplingParams::default()
+    };
     let mut stopped = request(prompt_tokens, stopped_params, GENERATED_TOKENS);
     stopped.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![stop_id]);
     let outcome = engine.submit(stopped).expect_finished();
