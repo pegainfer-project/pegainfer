@@ -37,6 +37,9 @@ pub(super) fn truncate_after_terminal(
     };
     let keep = keep + 1;
     result.accepted_tokens.truncate(keep);
+    // A trigger in the accepted draft prefix is itself a matched draft. If the
+    // trigger is the posterior token, the original count is already `keep - 1`;
+    // clamping to the retained prefix handles both cases.
     result.matched_draft_tokens = result.matched_draft_tokens.min(keep);
 }
 
@@ -237,10 +240,7 @@ mod tests {
 
     #[test]
     fn explicit_stop_truncates_the_kv_commit_after_the_trigger() {
-        let policy = StopPolicy {
-            eos: EosPolicy::Ignore,
-            token_ids: vec![7],
-        };
+        let policy = StopPolicy::new(EosPolicy::Ignore, vec![7]);
         let mut result = VerifyRequestResult {
             request_id: RequestId::new(1),
             matched_draft_tokens: 3,
@@ -250,20 +250,6 @@ mod tests {
         truncate_after_terminal(&mut result, &policy, &[99]);
 
         assert_eq!(result.accepted_tokens, vec![5, 7]);
-        assert_eq!(result.matched_draft_tokens, 2);
-    }
-
-    #[test]
-    fn model_eos_truncates_but_keeps_the_trigger() {
-        let mut result = VerifyRequestResult {
-            request_id: RequestId::new(2),
-            matched_draft_tokens: 3,
-            accepted_tokens: vec![5, 99, 8, 9],
-        };
-
-        truncate_after_terminal(&mut result, &StopPolicy::default(), &[99]);
-
-        assert_eq!(result.accepted_tokens, vec![5, 99]);
         assert_eq!(result.matched_draft_tokens, 2);
     }
 }

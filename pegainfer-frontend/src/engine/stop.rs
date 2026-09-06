@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /// How a request treats end-of-sequence tokens.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum EosPolicy {
@@ -6,8 +8,6 @@ pub enum EosPolicy {
     /// Use the model executor's configured EOS set.
     #[default]
     ModelDefault,
-    /// Stop only on this protocol-provided primary EOS token.
-    Token(u32),
 }
 
 /// Request-scoped token stopping policy.
@@ -18,10 +18,31 @@ pub enum EosPolicy {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StopPolicy {
     pub eos: EosPolicy,
-    pub token_ids: Vec<u32>,
+    /// Sorted and deduplicated explicit stop IDs.
+    ///
+    /// Requests clone this policy while building a plan and sending it to
+    /// worker ranks. Keeping the normalized set behind an `Arc` makes those
+    /// clones cheap and lets classification use binary search for large stop
+    /// sets without regressing the common one-ID case.
+    pub token_ids: Arc<[u32]>,
 }
 
 impl StopPolicy {
+    /// Build a policy from wire-provided stop IDs.
+    ///
+    /// Normalization happens once at the request boundary. Internal copies can
+    /// then share the immutable slice instead of repeatedly sorting, deduping,
+    /// or cloning the caller's vector.
+    #[must_use]
+    pub fn new(eos: EosPolicy, mut token_ids: Vec<u32>) -> Self {
+        token_ids.sort_unstable();
+        token_ids.dedup();
+        Self {
+            eos,
+            token_ids: token_ids.into(),
+        }
+    }
+
     /// Classify a token using vLLM's priority: EOS first, then the request's
     /// explicit stop-token set.
     #[must_use]
@@ -33,12 +54,11 @@ impl StopPolicy {
         let is_eos = match self.eos {
             EosPolicy::Ignore => false,
             EosPolicy::ModelDefault => is_model_eos(token_id),
-            EosPolicy::Token(eos_token_id) => token_id == eos_token_id,
         };
 
         if is_eos {
             Some(StopCause::Eos(token_id))
-        } else if self.token_ids.contains(&token_id) {
+        } else if self.token_ids.binary_search(&token_id).is_ok() {
             Some(StopCause::Token(token_id))
         } else {
             None
@@ -71,10 +91,7 @@ mod tests {
 
     #[test]
     fn ignored_eos_does_not_disable_an_explicit_stop() {
-        let policy = StopPolicy {
-            eos: EosPolicy::Ignore,
-            token_ids: vec![99],
-        };
+        let policy = StopPolicy::new(EosPolicy::Ignore, vec![99]);
 
         assert_eq!(
             policy.classify(99, |token_id| token_id == 99),
@@ -83,12 +100,23 @@ mod tests {
     }
 
     #[test]
-    fn eos_wins_when_the_same_id_is_also_an_explicit_stop() {
-        let policy = StopPolicy {
-            eos: EosPolicy::Token(99),
-            token_ids: vec![99],
-        };
+    fn normalizes_stop_sets_across_common_sizes() {
+        let empty = StopPolicy::default();
+        assert!(empty.classify(7, |_| false).is_none());
 
-        assert_eq!(policy.classify(99, |_| false), Some(StopCause::Eos(99)));
+        let single = StopPolicy::new(EosPolicy::Ignore, vec![42]);
+        assert_eq!(single.classify(42, |_| false), Some(StopCause::Token(42)));
+        assert!(single.classify(43, |_| false).is_none());
+
+        let policy = StopPolicy::new(EosPolicy::Ignore, vec![7, 3, 7, 1]);
+        assert_eq!(policy.token_ids.as_ref(), [1, 3, 7]);
+        assert!(policy.classify(7, |_| false).is_some());
+        assert!(policy.classify(8, |_| false).is_none());
+
+        let full = StopPolicy::new(EosPolicy::Ignore, (0..151_936).collect());
+        assert_eq!(full.token_ids.len(), 151_936);
+        assert!(full.classify(0, |_| false).is_some());
+        assert!(full.classify(151_935, |_| false).is_some());
+        assert!(full.classify(151_936, |_| false).is_none());
     }
 }

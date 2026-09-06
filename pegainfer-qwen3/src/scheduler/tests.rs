@@ -522,14 +522,14 @@ fn spec_active(
             ignore_eos,
             ..SamplingParams::default()
         },
-        stop_policy: StopPolicy {
-            eos: if ignore_eos {
+        stop_policy: StopPolicy::new(
+            if ignore_eos {
                 EosPolicy::Ignore
             } else {
                 EosPolicy::ModelDefault
             },
-            token_ids: Vec::new(),
-        },
+            Vec::new(),
+        ),
         ..active_state(id, generated_count, max_tokens)
     }
 }
@@ -666,7 +666,7 @@ fn speculative_request_stop_truncates_the_span_when_eos_is_ignored() {
     let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
 
     let mut request = spec_active(1, 0, 100, true);
-    request.stop_policy.token_ids = vec![12];
+    request.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![12]);
 
     let active = [request];
     let results = [spec_result(1, vec![10, 11, 12, 13])];

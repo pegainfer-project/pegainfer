@@ -1,5 +1,6 @@
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 
 use super::ActiveRequestState;
 use super::PendingRequest;
@@ -14,22 +15,12 @@ use crate::executor::ModelExecutor;
 use crate::executor::PrefillRequestResult;
 use crate::speculative::VerifyRequestResult;
 
-fn stop_cause(
+fn classify_stop(
     executor: &impl ModelExecutor,
-    req: &ActiveRequestState,
+    policy: &StopPolicy,
     token: u32,
 ) -> Option<StopCause> {
-    req.stop_policy
-        .classify(token, |token_id| executor.is_stop_token(token_id))
-}
-
-fn pending_stop_cause(
-    executor: &impl ModelExecutor,
-    req: &PendingRequest,
-    token: u32,
-) -> Option<StopCause> {
-    req.stop_policy
-        .classify(token, |token_id| executor.is_stop_token(token_id))
+    policy.classify(token, |token_id| executor.is_stop_token(token_id))
 }
 
 pub(crate) fn resolve_step(
@@ -85,7 +76,7 @@ pub(crate) fn resolve_speculative_outputs(
                 completion_tokens += 1;
                 emitted.push(token);
 
-                if let Some(stop_cause) = stop_cause(executor, req, token) {
+                if let Some(stop_cause) = classify_stop(executor, &req.stop_policy, token) {
                     return DecodeEffect::FinishMany {
                         request_id: result.request_id,
                         tokens: emitted,
@@ -148,7 +139,7 @@ fn resolve_prefill_outputs(
             });
         }
 
-        if let Some(stop_cause) = pending_stop_cause(executor, &req, result.first_token) {
+        if let Some(stop_cause) = classify_stop(executor, &req.stop_policy, result.first_token) {
             effects.pending.push(PendingEffect::EmitAndFinish {
                 request_id: req.request_id,
                 token: result.first_token,
@@ -204,7 +195,7 @@ fn resolve_decode_outputs(
                 .find(|req| req.request_id == result.request_id)
                 .expect("decode request_id must exist in active set");
             let completion_tokens = req.generated_count + 1;
-            let stop_cause = stop_cause(executor, req, result.token);
+            let stop_cause = classify_stop(executor, &req.stop_policy, result.token);
             let at_limit = completion_tokens >= req.max_tokens;
 
             if let Some(stop_cause) = stop_cause {

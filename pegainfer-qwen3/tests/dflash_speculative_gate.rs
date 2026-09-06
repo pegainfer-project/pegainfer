@@ -44,6 +44,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use pegainfer_frontend::engine::EosPolicy;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
@@ -620,6 +624,88 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
     );
 }
 
+/// Production hedge regression: an explicit stop in the middle of a verify
+/// span must be applied before the hedge winner is selected and committed.
+/// The trigger is retained, while every accepted suffix token is discarded.
+#[test]
+fn dflash_hedged_midspan_stop_retains_trigger() {
+    common::harness::init_capture_logging();
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    if std::env::var_os("PEGAINFER_SPEC_HEDGE").is_none() {
+        eprintln!(
+            "skipping hedged mid-span stop gate: run it through hedged_ladder_passes_the_lossless_gates"
+        );
+        return;
+    }
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let prompt = "Write a short paragraph about a blue bicycle:";
+    let tokenizer = common::load_tokenizer(&model_path);
+    let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
+    let draft_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&draft_path).join("config.json"))
+            .expect("read draft config"),
+    )
+    .expect("parse draft config");
+    let block_size = draft_config["block_size"]
+        .as_u64()
+        .expect("draft block_size") as usize;
+    let min_index = (block_size / 2).max(1);
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
+    let mut baseline_params = SamplingParams::default();
+    baseline_params.ignore_eos = true;
+    let baseline = engine
+        .submit(request(
+            prompt_tokens.clone(),
+            baseline_params,
+            GENERATED_TOKENS,
+        ))
+        .expect_finished()
+        .tokens;
+    let Some((stop_index, &stop_id)) = baseline
+        .iter()
+        .enumerate()
+        .skip(min_index)
+        .find(|(index, token)| !baseline[..*index].contains(token))
+    else {
+        panic!("baseline did not produce a unique token after the middle of the verify span");
+    };
+    assert!(
+        stop_index < block_size,
+        "selected stop token at position {stop_index}, expected inside the first {block_size}-token verify span"
+    );
+
+    let mut stopped_params = SamplingParams::default();
+    stopped_params.ignore_eos = true;
+    let mut stopped = request(prompt_tokens, stopped_params, GENERATED_TOKENS);
+    stopped.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![stop_id]);
+    let outcome = engine.submit(stopped).expect_finished();
+
+    assert_eq!(outcome.tokens.len(), stop_index + 1);
+    assert_eq!(outcome.tokens.last(), Some(&stop_id));
+    assert!(!outcome.tokens[..stop_index].contains(&stop_id));
+    assert!(matches!(
+        outcome.terminal,
+        Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Token(id)),
+            completion_tokens,
+            ..
+        } if id == stop_id && completion_tokens == stop_index + 1
+    ));
+}
+
 /// P2 regression: a request that fits the target context window but lands in the
 /// draft's `block_size` in-fill headroom (`max_pos - block_size < prompt +
 /// max_tokens <= max_pos`) must be rejected cleanly at admission. Before the
@@ -760,6 +846,7 @@ fn hedged_ladder_passes_the_lossless_gates() {
     for child_test in [
         "dflash_speculative_greedy_matches_plain_greedy",
         "dflash_concurrent_heterogeneous_is_lossless",
+        "dflash_hedged_midspan_stop_retains_trigger",
     ] {
         let output = Command::new(&exe)
             .args(["--exact", child_test, "--test-threads=1", "--nocapture"])

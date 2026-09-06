@@ -3428,6 +3428,7 @@ impl LocalQwen3Lane {
         &mut self,
         requests: &[VerifyStepItem],
         kv_views: &[KvView],
+        stop_policies: &[StopPolicy],
         capture_layer_ids: &[usize],
         sample_seed: u64,
         bufs: &mut VerifyGraphBuffers,
@@ -3535,9 +3536,22 @@ impl LocalQwen3Lane {
             .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
             .collect();
         let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
-        let all_results = build_verify_results(&expanded, &target_tokens)?;
-        let (results_a, results_b) = all_results.split_at(requests.len());
-
+        let mut all_results = build_verify_results(&expanded, &target_tokens)?;
+        // A terminal token ends the request even when it appears in the middle
+        // of a speculative span. Normalize every candidate before selecting a
+        // winner; otherwise a discarded suffix can win the hedge and advance
+        // the wrong KV/hidden state and acceptance statistics.
+        let (results_a, results_b) = all_results.split_at_mut(requests.len());
+        for (result, policy) in results_a.iter_mut().zip(stop_policies) {
+            spec::truncate_after_terminal(result, policy, &self.model.config().stop_token_ids);
+        }
+        for (slot, (idx, _)) in hedge_spans.iter().enumerate() {
+            spec::truncate_after_terminal(
+                &mut results_b[slot],
+                &stop_policies[*idx],
+                &self.model.config().stop_token_ids,
+            );
+        }
         // Per request keep the best-accepting chain; ties keep chain A (no
         // copies). A later chain of the same request only replaces the
         // running winner when strictly better, so the final page/hidden
@@ -3566,7 +3580,7 @@ impl LocalQwen3Lane {
                     cudarc::driver::result::memcpy_dtod_async(
                         dst,
                         src,
-                        span_len * hidden_dim * elem,
+                        res_b.accepted_tokens.len() * hidden_dim * elem,
                         ctx.stream.cu_stream(),
                     )
                 }
@@ -3666,6 +3680,7 @@ impl LocalQwen3Lane {
                 if let Some(result) = self.try_execute_hedged_verify(
                     requests,
                     kv_views,
+                    stop_policies,
                     &capture_layer_ids,
                     sample_seed,
                     &mut bufs,
