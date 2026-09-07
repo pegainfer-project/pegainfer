@@ -81,10 +81,6 @@ pub(crate) struct VerifyRequestResult {
 
 pub(crate) struct VerifyResult {
     pub requests: Vec<VerifyRequestResult>,
-    /// Whether this result came from the expanded hedge path. Test-only
-    /// tracing uses this marker to pair worker context and KV commit records
-    /// without confusing them with a plain verify round.
-    pub hedged: bool,
 }
 
 /// One request's draft request: the proposer continues from `current_token`.

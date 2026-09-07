@@ -814,10 +814,11 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
 /// above in child processes, since the hedge config is read once per process
 /// and cannot be toggled in-process.
 ///
-/// The stop child additionally checks the request-local raw/retained winner,
-/// selected winner, context append, and KV commit lengths. The losslessness
-/// children retain their numerical tie tolerance and only require that the
-/// configured hedge path actually ran.
+/// The stop child additionally checks that an untrimmed B candidate is not
+/// selected over the truncated A candidate, and that context append and KV
+/// commit use the same retained length. The losslessness children retain their
+/// numerical tie tolerance and only require that the configured hedge path
+/// actually ran.
 ///
 /// Strict token equality against an unhedged run is NOT a valid contract:
 /// hedged rounds change the verify batch shape, which legally flips bf16 ties,
@@ -865,6 +866,7 @@ fn hedged_ladder_passes_the_lossless_gates() {
     // must show expanded spans in the executor's per-round trace.
     let mut total_spans = 0usize;
     let mut total_rounds = 0usize;
+    let mut total_wins = 0usize;
     for child_test in [
         "dflash_speculative_greedy_matches_plain_greedy",
         "dflash_concurrent_heterogeneous_is_lossless",
@@ -895,7 +897,10 @@ fn hedged_ladder_passes_the_lossless_gates() {
                 .filter(|tok| !tok.is_empty())
                 .map(|tok| tok.parse::<usize>().expect("hedge trace number"));
             spans += nums.next().expect("span count");
-            let _ = nums.next().expect("win count");
+            let wins = nums.next().expect("win count");
+            if child_test != "dflash_hedged_midspan_stop_retains_trigger" {
+                total_wins += wins;
+            }
             rounds += 1;
         }
         assert!(
@@ -951,12 +956,15 @@ fn hedged_ladder_passes_the_lossless_gates() {
                     line.split_whitespace()
                         .find_map(|field| field.strip_prefix(name))
                 };
-                let retained_winner = value("retained_winner=");
                 let selected = value("selected=");
-                let raw_winner = value("raw_winner=");
                 let request = value("request=");
-                let raw_best_len = value("raw_best_len=").and_then(|v| v.parse().ok());
-                let retained_best_len = value("retained_best_len=").and_then(|v| v.parse().ok());
+                let raw_a = value("raw_a=").and_then(|v| v.parse().ok());
+                let raw_b_lens = value("raw_b_lens=").map(|v| {
+                    v.split(',')
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.parse::<usize>().expect("raw B length"))
+                        .collect::<Vec<_>>()
+                });
                 let selected_len = value("selected_len=").and_then(|v| v.parse().ok());
                 if !request.is_some_and(|id| stop_requests.contains(id)) {
                     continue;
@@ -967,13 +975,14 @@ fn hedged_ladder_passes_the_lossless_gates() {
                 let commit_len = request
                     .and_then(|id| commit_by_request.get_mut(id))
                     .and_then(VecDeque::pop_front);
-                if raw_winner == Some("B")
-                    && retained_winner == Some("A")
+                let raw_b_max = raw_b_lens
+                    .as_ref()
+                    .and_then(|lengths| lengths.iter().copied().max());
+                if raw_b_max.is_some_and(|raw_b| raw_a.is_some_and(|raw_a| raw_b > raw_a))
                     && selected == Some("A")
-                    && retained_best_len
-                        .is_some_and(|retained| raw_best_len.is_some_and(|raw| retained < raw))
+                    && selected_len
+                        .is_some_and(|selected| raw_b_max.is_some_and(|raw| selected < raw))
                     && selected_len.is_some()
-                    && selected_len == retained_best_len
                     && selected_len == context_len
                     && selected_len == commit_len
                 {
@@ -986,8 +995,12 @@ fn hedged_ladder_passes_the_lossless_gates() {
                 "stop hedge never truncated a candidate before winner/context commit:\n{child_stderr}"
             );
         }
-        total_rounds += rounds;
-        total_spans += spans;
+        if child_test != "dflash_hedged_midspan_stop_retains_trigger" {
+            total_rounds += rounds;
+            total_spans += spans;
+        }
     }
     assert!(total_rounds > 0 && total_spans > 0);
+    assert!(total_wins > 0);
+    assert!(total_spans > total_wins);
 }
