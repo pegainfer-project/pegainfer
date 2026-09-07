@@ -3549,22 +3549,22 @@ impl LocalQwen3Lane {
             hedge_spans.len()
         );
         let trace = std::env::var_os("PEGAINFER_TEST_LOG").is_some();
-        let raw_a_lengths: Vec<usize> = trace
-            .then(|| {
-                results_a
-                    .iter()
-                    .map(|result| result.accepted_tokens.len())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let raw_b_lengths: Vec<usize> = trace
-            .then(|| {
-                results_b
-                    .iter()
-                    .map(|result| result.accepted_tokens.len())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let raw_a_lengths: Vec<usize> = if trace {
+            results_a
+                .iter()
+                .map(|result| result.accepted_tokens.len())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let raw_b_lengths: Vec<usize> = if trace {
+            results_b
+                .iter()
+                .map(|result| result.accepted_tokens.len())
+                .collect()
+        } else {
+            Vec::new()
+        };
         for (result, policy) in results_a.iter_mut().zip(stop_policies) {
             spec::truncate_after_terminal(result, policy, &self.model.config().stop_token_ids);
         }
