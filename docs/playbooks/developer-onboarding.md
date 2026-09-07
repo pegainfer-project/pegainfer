@@ -116,7 +116,7 @@ Accuracy tests live in each model crate:
 ```bash
 cargo test -r -p pegainfer-qwen3  --test hf_golden_gate   # Qwen3-4B logits vs stored HF golden (bf16 tolerance)
 cargo test -r -p pegainfer-qwen35 --features qwen35 --lib executor::hf_golden_gate -- --test-threads=1   # Qwen3.5-4B logits vs stored HF golden (bf16 tolerance)
-cargo test -r -p pegainfer-qwen35 --test e2e_scheduler    # Qwen3.5-4B scheduler request-flow integration
+cargo test -r -p pegainfer-qwen35 --features qwen35 --lib scheduler::e2e_tests -- --test-threads=1    # Qwen3.5-4B scheduler request-flow integration
 ```
 
 Qwen3-4B no longer pins exact greedy text: a bit-wise baseline false-positives across GPUs (per-card bf16 GEMM drifts the low bits). `hf_golden_gate` instead teacher-forces a fixed set of sequences and asserts pegainfer's logprobs land within the bf16 noise floor of a stored HuggingFace reference — across bs=1, batched, and the CUDA-graph path. The reasoning and tolerances are in `docs/models/qwen3/accuracy-gate.md`.

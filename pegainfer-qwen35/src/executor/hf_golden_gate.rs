@@ -31,7 +31,6 @@ use crate::runtime::Qwen35Executor;
 use crate::runtime::Qwen35TpExecutor;
 use crate::runtime::RequestId;
 use crate::test_fixture as common;
-use crate::weights::Qwen35Model;
 
 const GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_GOLDEN";
 const LONG_GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_LONG_GOLDEN";
@@ -177,7 +176,7 @@ fn require_metadata<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a
         .unwrap_or_else(|| panic!("qwen35 hf_golden_gate fixture missing metadata key {key}"))
 }
 
-fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
+fn check_fixture_metadata(model_path: &str, golden: &Golden) {
     let metadata = &golden.metadata;
     assert_eq!(
         require_metadata(metadata, "dtype"),
@@ -208,12 +207,11 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
         expected_revision, "unknown",
         "qwen35 hf_golden_gate fixture must record a pinned model_revision"
     );
-    let Some(actual_revision) = model_revision(model_path) else {
-        eprintln!(
-            "skipping qwen35 hf_golden_gate: fixture requires model_revision={expected_revision}, but local model revision is unknown"
-        );
-        return false;
-    };
+    let actual_revision = model_revision(model_path).unwrap_or_else(|| {
+        panic!(
+            "qwen35 hf_golden_gate cannot verify model_revision={expected_revision}: local model revision is unknown"
+        )
+    });
     assert_eq!(
         actual_revision, expected_revision,
         "qwen35 hf_golden_gate model revision mismatch; set PEGAINFER_TEST_MODEL_REVISION or use the fixture's model snapshot"
@@ -225,7 +223,6 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
             "qwen35 hf_golden_gate fixture must record a pinned tokenizer_revision"
         );
     }
-    true
 }
 
 fn as_i32(st: &SafeTensors, name: &str) -> (Vec<i32>, Vec<usize>) {
@@ -737,27 +734,26 @@ fn report_and_assert(label: &str, stats: &Stats) {
     let _ = max;
 }
 
-fn build_executor(model_path: &str) -> Qwen35Executor {
-    common::with_launch_context(
-        model_path,
-        MAX_EXECUTOR_BATCH,
-        crate::DEFAULT_MAX_PREFILL_TOKENS,
-        crate::Qwen35DecodeOverlap::Off,
-        |ctx| {
-            let model = Qwen35Model::from_safetensors_with_launch_options(
-                model_path,
-                &crate::model_line::launch_options(ctx),
-            )?;
-            model.tune_decode_gemm_algos()?;
-            let graph_state = model.create_batch_decode_graph_state()?;
-            Ok(Qwen35Executor {
-                model,
-                graph_state,
-                active: Vec::new(),
-            })
-        },
-    )
-    .expect("build Qwen3.5 logits executor")
+fn build_executor(model_path: &str, acceptance: &common::GdnAcceptance) -> Qwen35Executor {
+    let model = acceptance
+        .load_model(
+            model_path,
+            MAX_EXECUTOR_BATCH,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            crate::Qwen35DecodeOverlap::Off,
+        )
+        .expect("load Qwen3.5 logits executor model");
+    model
+        .tune_decode_gemm_algos()
+        .expect("tune Qwen3.5 logits executor GEMMs");
+    let graph_state = model
+        .create_batch_decode_graph_state()
+        .expect("capture Qwen3.5 logits executor graph");
+    Qwen35Executor {
+        model,
+        graph_state,
+        active: Vec::new(),
+    }
 }
 
 fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
@@ -768,20 +764,38 @@ fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
 
 #[test]
 fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
-    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden") else {
+    run_short_golden(&common::GdnAcceptance::Triton);
+}
+
+#[test]
+#[ignore = "requires SM120, a linked FlashInfer candidate with expected object SHA, and Qwen3.5 weights"]
+fn candidate_pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
+    run_short_golden(&common::GdnAcceptance::candidate());
+}
+
+fn run_short_golden(acceptance: &common::GdnAcceptance) {
+    let Some(model_path) = acceptance.model_path("pega_logprobs_match_hf_golden") else {
         return;
     };
     let Some(golden) = Golden::load_for(&model_path, false) else {
+        assert!(
+            !acceptance.is_candidate(),
+            "candidate HF acceptance requires a short golden fixture"
+        );
         return;
     };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
+    check_fixture_metadata(&model_path, &golden);
+    if acceptance.is_candidate() {
+        assert!(
+            golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2,
+            "candidate short HF acceptance requires both bucket-straddling batches and slot-compaction coverage"
+        );
     }
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
     {
-        let mut ex = build_executor(&model_path);
+        let mut ex = build_executor(&model_path, acceptance);
 
         let (stats, fp1) = run(&golden, &mut ex, &all, false);
         report_and_assert("sequential bs=1 graph", &stats);
@@ -806,14 +820,14 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
 
     if golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2 {
         let fp1 = {
-            let mut ex = build_executor(&model_path);
+            let mut ex = build_executor(&model_path, acceptance);
             let (compacted, fp) =
                 run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
             report_and_assert("slot-compaction graph", &compacted);
             fp
         };
         let fp2 = {
-            let mut ex = build_executor(&model_path);
+            let mut ex = build_executor(&model_path, acceptance);
             let (_, fp) = run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
             fp
         };
@@ -831,19 +845,39 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
 
 #[test]
 fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
-    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_long_golden") else {
+    run_long_golden(&common::GdnAcceptance::Triton);
+}
+
+#[test]
+#[ignore = "requires SM120, a linked FlashInfer candidate with expected object SHA, and Qwen3.5 weights"]
+fn candidate_pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
+    run_long_golden(&common::GdnAcceptance::candidate());
+}
+
+fn run_long_golden(acceptance: &common::GdnAcceptance) {
+    let Some(model_path) = acceptance.model_path("pega_logprobs_match_hf_long_golden") else {
         return;
     };
     let Some(golden) = Golden::load_for(&model_path, true) else {
+        assert!(
+            !acceptance.is_candidate(),
+            "candidate HF acceptance requires a long golden fixture"
+        );
         return;
     };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
+    check_fixture_metadata(&model_path, &golden);
+    if acceptance.is_candidate() {
+        assert!(
+            golden.prompt_lens.contains(&4097)
+                && golden.prompt_lens.contains(&8192)
+                && golden.decode_len > 0,
+            "candidate long HF acceptance requires 4097/8192-token prefill and decode coverage"
+        );
     }
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let mut ex = build_executor(&model_path);
+    let mut ex = build_executor(&model_path, acceptance);
     let (stats, fp1) = run(&golden, &mut ex, &all, false);
     report_and_assert("long sequential bs=1 graph", &stats);
     let (_, fp2) = run(&golden, &mut ex, &all, false);
@@ -862,9 +896,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     let Some(golden) = Golden::load_for(&model_path, false) else {
         return;
     };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -892,9 +924,7 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     let Some(golden) = Golden::load_for(&model_path, true) else {
         return;
     };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 

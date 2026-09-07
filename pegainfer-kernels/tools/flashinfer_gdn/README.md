@@ -7,7 +7,9 @@ Qwen3.5 defaults to Triton whether or not a candidate is linked. Building with
 `PEGAINFER_QWEN35_GDN_AOT_BUNDLE` only makes the candidate available; the
 Qwen3.5 production selector must explicitly request `flashinfer-candidate`.
 That selection fails before KV allocation if its artifact, device, geometry,
-TP configuration, or module load is invalid. Local candidate hashes establish
+TP configuration, runtime identity, or module load is invalid. The GDN wrapper
+validates and stores the linked object SHA during construction; serving does
+not depend on test environment variables. Local candidate hashes establish
 internal consistency and compatibility, not trusted distribution provenance.
 
 `source-lock.json` owns the frozen geometry, dtypes, dynamic-token bounds,
@@ -62,7 +64,25 @@ against the real generated bundle. It shares one valid fixture across all
 metadata and file/path rejection cases; it does not manufacture a fake object
 or claim host validation proves GPU execution. One corrupted real object also
 exercises the actual build-script rejection before linking.
-Gate 3 reuses both existing short and long HF golden tests. The long test checks
+The same runner checks null, invalid UTF-8, short, long and non-hexadecimal
+identities through the real runtime constructor. Linker `--wrap` applies only
+to the `gdn_identity` test executable; production and the subsequent real-layout
+positive retain the original identity query. There are no production injection
+hooks.
+
+Candidate HF, scheduler, continuation and Shared-SM entries explicitly select
+the candidate and check the actual loaded model against
+`PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256`, which the runner computes from
+`kernel.o`. Missing inputs or a mismatched identity fail even when an entry is
+run directly. These ignored GPU entries reuse the original scenario bodies in
+crate-private test modules; ordinary entries continue to select Triton.
+
+Before positive HF replay, Gate 3 invokes the same candidate short entry with
+missing/malformed expected SHA, missing model/fixture, unresolved/wrong model
+revision and a different valid SHA. Each must fail for its specific reason;
+only then does the runner report admission validation success and continue.
+All HF entries reject an unresolved revision. Gate 3 reuses both existing short
+and long HF golden scenarios. The long test checks
 4097/8192-token outputs against an external oracle; the production HTTP and
 Shared-SM checks cover request flow and overlap, so they do not replace it.
 

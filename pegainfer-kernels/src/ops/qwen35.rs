@@ -44,6 +44,7 @@ pub struct Qwen35GdnAot {
     handle: NonNull<c_void>,
     device_ordinal: usize,
     workspace_bytes: usize,
+    artifact_sha256: &'static str,
 }
 
 pub struct Qwen35GdnWorkspace {
@@ -81,6 +82,24 @@ impl Qwen35GdnAot {
             unsafe { ffi::pegainfer_qwen35_gdn_aot_available() } == 1,
             "Qwen3.5 FlashInfer candidate was explicitly selected, but no AOT candidate was linked; set PEGAINFER_QWEN35_GDN_AOT_BUNDLE at build time"
         );
+        let identity = unsafe { ffi::pegainfer_qwen35_gdn_artifact_sha256() };
+        ensure!(
+            !identity.is_null(),
+            "Qwen3.5 GDN artifact identity pointer is null"
+        );
+        // The linked C shim returns a static string literal, independent of
+        // the generated module's lifetime. Reject it before allocating a handle.
+        let artifact_sha256: &'static str = unsafe { CStr::from_ptr(identity) }
+            .to_str()
+            .context("Qwen3.5 GDN artifact identity is not valid UTF-8")?;
+        ensure!(
+            artifact_sha256.len() == 64,
+            "Qwen3.5 GDN artifact identity must contain exactly 64 hexadecimal characters"
+        );
+        ensure!(
+            artifact_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Qwen3.5 GDN artifact identity contains non-hexadecimal characters"
+        );
         let mut raw = std::ptr::null_mut();
         let status =
             unsafe { ffi::pegainfer_qwen35_gdn_create(&raw mut raw, device_ordinal as i32) };
@@ -103,6 +122,7 @@ impl Qwen35GdnAot {
             handle,
             device_ordinal,
             workspace_bytes,
+            artifact_sha256,
         })
     }
 
@@ -112,13 +132,7 @@ impl Qwen35GdnAot {
     }
 
     pub fn artifact_sha256(&self) -> &'static str {
-        let pointer = unsafe { ffi::pegainfer_qwen35_gdn_artifact_sha256() };
-        if pointer.is_null() {
-            return "unavailable";
-        }
-        unsafe { CStr::from_ptr(pointer) }
-            .to_str()
-            .unwrap_or("invalid-utf8")
+        self.artifact_sha256
     }
 
     pub fn allocate_workspace(

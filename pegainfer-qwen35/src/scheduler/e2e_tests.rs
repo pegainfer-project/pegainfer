@@ -19,7 +19,8 @@ use pegainfer_frontend::engine::TokenStreamReceiver;
 use pegainfer_frontend::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
-mod common;
+use crate::test_fixture as common;
+use crate::test_fixture::GdnAcceptance;
 
 const CASES: &[TestCase] = &[
     TestCase {
@@ -666,25 +667,36 @@ fn run_full_scheduler_e2e(
 
 #[test]
 fn test_e2e_qwen35_scheduler() {
-    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler") else {
+    run_scheduler_e2e(&GdnAcceptance::Triton);
+}
+
+#[test]
+#[ignore = "requires SM120, a validated candidate identity, and Qwen3.5 weights"]
+fn candidate_e2e_qwen35_scheduler() {
+    run_scheduler_e2e(&GdnAcceptance::candidate());
+}
+
+fn run_scheduler_e2e(acceptance: &GdnAcceptance) {
+    let Some(model_path) = acceptance.model_path("test_e2e_qwen35_scheduler") else {
         return;
     };
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
-    let overlap = if common::gdn_backend() == "flashinfer-candidate" {
+    let overlap = if acceptance.is_candidate() {
         pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm
     } else {
         pegainfer_qwen35::Qwen35DecodeOverlap::Off
     };
-    let handle = common::launch_engine(
-        &model_path,
-        8,
-        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
-        overlap,
-    )
-    .expect("Failed to start Qwen3.5 scheduler");
+    let handle = acceptance
+        .launch_engine(
+            &model_path,
+            8,
+            pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+            overlap,
+        )
+        .expect("Failed to start Qwen3.5 scheduler");
     info!("scheduler loaded in {:.2?}", start.elapsed());
 
     let max_context_tokens = max_position_embeddings(&model_path);
@@ -693,9 +705,18 @@ fn test_e2e_qwen35_scheduler() {
 
 #[test]
 fn test_e2e_qwen35_shared_sm_last_decoder() {
+    run_shared_sm_last_decoder(&GdnAcceptance::Triton);
+}
+
+#[test]
+#[ignore = "requires SM120, a validated candidate identity, and Qwen3.5 weights"]
+fn candidate_e2e_qwen35_shared_sm_last_decoder() {
+    run_shared_sm_last_decoder(&GdnAcceptance::candidate());
+}
+
+fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
     pegainfer_core::logging::init_default();
-    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_shared_sm_last_decoder")
-    else {
+    let Some(model_path) = acceptance.model_path("test_e2e_qwen35_shared_sm_last_decoder") else {
         return;
     };
     let tokenizer = common::load_tokenizer(&model_path);
@@ -707,13 +728,14 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         .expect("test prompt must contain a token");
 
     let (off_reference_tokens, off_decoder_tokens) = {
-        let off_handle = common::launch_engine(
-            &model_path,
-            4,
-            8192,
-            pegainfer_qwen35::Qwen35DecodeOverlap::Off,
-        )
-        .expect("Failed to start Qwen3.5 default-Off scheduler");
+        let off_handle = acceptance
+            .launch_engine(
+                &model_path,
+                4,
+                8192,
+                pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+            )
+            .expect("Failed to start Qwen3.5 default-Off scheduler");
         let mut off_rx = submit_repeated_token_request(
             &off_handle,
             "overlap-off-reference",
@@ -749,13 +771,14 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         (off.tokens, decoder.tokens)
     };
 
-    let handle = common::launch_engine(
-        &model_path,
-        4,
-        8192,
-        pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
-    )
-    .expect("Failed to start Qwen3.5 shared-SM scheduler");
+    let handle = acceptance
+        .launch_engine(
+            &model_path,
+            4,
+            8192,
+            pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
+        )
+        .expect("Failed to start Qwen3.5 shared-SM scheduler");
     let mut load = handle
         .metrics_watch()
         .expect("scheduler must expose metrics");

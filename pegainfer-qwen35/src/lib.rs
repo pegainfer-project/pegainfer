@@ -25,8 +25,10 @@ pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
 #[cfg(test)]
-#[path = "../tests/common/mod.rs"]
 mod test_fixture;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_fixture_common;
 mod tp_executor;
 mod unified_forward;
 mod weights;

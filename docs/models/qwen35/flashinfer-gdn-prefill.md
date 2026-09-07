@@ -9,8 +9,8 @@
 
 The candidate supports TP1 and Hq/Hk/Hv/D = 16/16/32/128, validated with
 Qwen3.5-4B. Linking an AOT bundle does not select it. Invalid bundles fail
-during the build; unsupported or unavailable candidates fail at model load
-without silently falling back.
+during the build; unsupported or unavailable candidates and invalid runtime
+artifact identities fail at model load without silently falling back.
 
 `pegainfer-kernels` owns pinned generation, artifact validation and the
 stable in-place C ABI. Generated symbols and TMA argument layouts stay
@@ -25,8 +25,9 @@ diagnostic host barriers.
 
 Validation covers real build/load/HTTP paths, upstream-to-patched state-layout
 parity, the native-prepare CPU oracle, and existing HF, continuation and
-scheduler/CUDA Graph gates. Backend-specific HF setup stays in private test
-modules.
+scheduler/CUDA Graph gates. Candidate entries require the expected artifact
+SHA and check the loaded model; HF gates require a resolved model revision.
+This acceptance setup stays in private test modules.
 
 The candidate reduces prefill scratch requirements. Same-context HTTP
 comparisons against seven-stage Triton, using synthetic token-ID prompts

@@ -174,24 +174,18 @@ fn first_decode_logits(
 }
 
 #[test]
-#[ignore = "requires an SM120 GPU, Qwen3.5-4B weights, and a build-linked validated FlashInfer bundle"]
+#[ignore = "requires SM120, a validated candidate identity, and Qwen3.5-4B weights"]
 fn flashinfer_gdn_chunk_continuation_and_model_outputs_match() -> Result<()> {
-    let model_path = crate::test_fixture::model_path_or_skip(
-        "flashinfer_gdn_chunk_continuation_and_model_outputs_match",
-    )
-    .expect("chunk-continuation gate requires PEGAINFER_TEST_MODEL_PATH");
-    let model = Qwen35Model::from_safetensors_with_launch_options(
+    let acceptance = crate::test_fixture::GdnAcceptance::candidate();
+    let model_path = acceptance
+        .model_path("flashinfer_gdn_chunk_continuation_and_model_outputs_match")
+        .expect("chunk-continuation gate requires PEGAINFER_TEST_MODEL_PATH");
+    let model = acceptance.load_model(
         &model_path,
-        &crate::Qwen35LaunchOptions {
-            device_ordinal: 0,
-            tp_size: 1,
-            cuda_graph: true,
-            max_batch: 1,
-            max_prefill_tokens: crate::DEFAULT_MAX_PREFILL_TOKENS,
-            gdn_backend: crate::Qwen35GdnBackend::FlashInferCandidate,
-        },
+        1,
+        crate::DEFAULT_MAX_PREFILL_TOKENS,
+        crate::Qwen35DecodeOverlap::Off,
     )?;
-    assert!(model.flashinfer_gdn.is_some());
 
     // These deterministic token ids are only model inputs. All hidden values,
     // Q/K/V/gates, recurrent state, and logits come from the real 4B weights.

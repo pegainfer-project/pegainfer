@@ -220,7 +220,7 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B \
   cargo test --release -p pegainfer-qwen35 --features qwen35 --lib executor::hf_golden_gate -- --test-threads=1
 
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B \
-  cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler
+  cargo test --release -p pegainfer-qwen35 --features qwen35 --lib scheduler::e2e_tests -- --test-threads=1
 ```
 
 Browse the [engineering docs index](docs/index.md) for model-specific gates, [profiling](docs/playbooks/profiling-guide.md), and [benchmark methodology](docs/playbooks/bench-vs-vllm.md).

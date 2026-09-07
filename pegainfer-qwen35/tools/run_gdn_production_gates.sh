@@ -67,14 +67,14 @@ config_sha="$(sha256sum "$model/config.json" | awk '{print $1}')"
 [[ "$config_sha" == "$expected_config_sha" ]] || { echo "model config SHA mismatch" >&2; exit 2; }
 mkdir -p "$log_root" "$target_root"
 export PEGAINFER_TEST_MODEL_PATH="$model"
-export PEGAINFER_TEST_QWEN35_GDN_BACKEND=flashinfer-candidate
 export PEGAINFER_QWEN35_GDN_LAYOUT_REFERENCE="$log_root/layout-reference"
 # The committed oracle must be used; per-developer fixture overrides are not acceptance inputs.
 unset PEGAINFER_QWEN35_HF_GOLDEN PEGAINFER_QWEN35_HF_LONG_GOLDEN
 
 commit_sha="$(git rev-parse HEAD)"
-tree_sha="$(git rev-parse HEAD^{tree})"
+tree_sha="$(git rev-parse 'HEAD^{tree}')"
 object_sha="$(sha256sum "$bundle/kernel.o" | awk '{print $1}')"
+export PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256="$object_sha"
 {
   echo "commit_sha=$commit_sha"
   echo "tree_sha=$tree_sha"
@@ -229,13 +229,36 @@ set -e
 rg 'kernel\.o.*(size|hash|SHA|digest).*mismatch' "$log_root/gate1-corrupt-candidate.log"
 
 timeout 90m cargo clippy --release --locked -p pegainfer-server \
-  -p pegainfer-qwen35 -p pegainfer-kernels --no-default-features --features qwen35 \
+  -p pegainfer-qwen35 -p pegainfer-kernels --all-targets --no-default-features --features qwen35 \
   -- -D warnings 2>&1 | tee "$log_root/candidate-clippy.log"
 timeout 60m cargo test --release --locked -p pegainfer-kernels --features qwen35 --lib --no-run \
   2>&1 | tee "$log_root/kernels-tests-build.log"
 timeout 60m cargo test --release --locked -p pegainfer-qwen35 --features qwen35 \
-  --lib --test e2e_scheduler --test chunked_prefill --no-run \
+  --lib --no-run --message-format=json-render-diagnostics \
   2>&1 | tee "$log_root/qwen35-tests-build.log"
+
+test_executable() {
+  "$python" - "$1" "$2" <<'PY'
+import json, os, sys
+executables = set()
+with open(sys.argv[1]) as records:
+    for line in records:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (record.get("reason") == "compiler-artifact"
+                and record["target"]["name"] == sys.argv[2]
+                and record["profile"]["test"] and record.get("executable")):
+            executables.add(record["executable"])
+assert len(executables) == 1, f"expected one {sys.argv[2]} test executable: {executables}"
+executable = executables.pop()
+assert os.path.isfile(executable) and os.access(executable, os.X_OK), executable
+print(executable)
+PY
+}
+qwen35_test_binary="$(test_executable "$log_root/qwen35-tests-build.log" pegainfer_qwen35)"
+sha256sum "$qwen35_test_binary" | tee "$log_root/qwen35-test-binary-sha256.log"
 
 run_exact_gate() {
   local label="$1" exact_name="$2" mode="$3"
@@ -244,7 +267,7 @@ run_exact_gate() {
   local profiler=()
   [[ "$mode" != ignored ]] || extra=(--ignored)
   if [[ "$label" == gate5-shared-sm && -n "${PEGAINFER_GDN_NSYS_REPORT:-}" ]]; then
-    profiler=(nsys profile --trace=cuda,nvtx --cuda-graph-trace=node --sample=none
+    profiler=(nsys profile "--trace=cuda,nvtx" --cuda-graph-trace=node --sample=none
       --output "${PEGAINFER_GDN_NSYS_REPORT%.nsys-rep}")
   fi
   timeout 60m cargo test --release --locked "$@" "$exact_name" \
@@ -265,34 +288,138 @@ run_exact_gate() {
       echo "Shared-SM test passed without the requested Nsight report" >&2; exit 3;
     }
   fi
+  case "$label" in
+    gate3-hf-*|gate4-model-continuation|gate4-scheduler-chunks|gate5-scheduler|gate5-shared-sm)
+      rg -F "CANDIDATE_MODEL_IDENTITY_OK object_sha256=$object_sha" "$log_root/$label.log"
+      ;;
+  esac
 }
 
 run_exact_gate gate1-candidate-contract qwen35_gdn::tests::candidate_contract_rejects_mutations ordinary \
   -p pegainfer-build --features qwen35-gdn --lib
+
+# Only this test executable wraps the C identity query; never carry the flag into
+# a production binary or invoke cargo test here (it would rebuild without --wrap).
+timeout 60m cargo rustc --release --locked -p pegainfer-kernels --features qwen35 \
+  --test gdn_identity --message-format=json-render-diagnostics \
+  -- -C link-arg=-Wl,--wrap=pegainfer_qwen35_gdn_artifact_sha256 \
+  2>&1 | tee "$log_root/gate1-identity-rejections-build.log"
+identity_test_binary="$(test_executable "$log_root/gate1-identity-rejections-build.log" gdn_identity)"
+identity_test=production_loader_rejects_invalid_artifact_identity
+sha256sum "$identity_test_binary" | tee "$log_root/gate1-identity-rejections-binary-sha256.log"
+"$identity_test_binary" "$identity_test" --exact --ignored --list \
+  >"$log_root/gate1-identity-rejections-list.log" 2>&1
+[[ "$(rg -Fxc "$identity_test: test" "$log_root/gate1-identity-rejections-list.log" || true)" == 1 ]]
+timeout --kill-after=10s 5m "$identity_test_binary" "$identity_test" \
+  --exact --ignored --test-threads=1 --nocapture \
+  2>&1 | tee "$log_root/gate1-identity-rejections.log"
+[[ "$(rg -c '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log_root/gate1-identity-rejections.log" || true)" == 1 ]]
+for rejection in null invalid-utf8 short long non-hex; do
+  [[ "$(rg -c "(^|[[:space:]])identity_rejection_passed=$rejection$" "$log_root/gate1-identity-rejections.log" || true)" == 1 ]]
+done
+[[ "$(rg -Fxc 'identity_rejections_passed=5' "$log_root/gate1-identity-rejections.log" || true)" == 1 ]]
+echo "gate1 validations passed"
 run_exact_gate gate1-in-place-layout \
   ops::qwen35::tests::sm120_stable_in_place_abi_matches_upstream_layout_reference ignored \
   -p pegainfer-kernels --features qwen35 --lib
 run_exact_gate gate2-native-prepare-cpu-oracle \
   recurrent::native_prepare_tests::test_gdn_native_prepare_matches_cpu_reference_on_finite_inputs ignored \
   -p pegainfer-qwen35 --features qwen35 --lib
+
+# Reuse the actual candidate HF entry without running its numeric body. All
+# admission failures precede inference; the last case loads the real model first.
+hf_short=executor::hf_golden_gate::candidate_pega_logprobs_match_hf_golden_within_qwen35_tolerance
+"$qwen35_test_binary" "$hf_short" --exact --ignored --list \
+  >"$log_root/gate3-acceptance-rejections-list.log" 2>&1
+[[ "$(rg -Fxc "$hf_short: test" "$log_root/gate3-acceptance-rejections-list.log" || true)" == 1 ]]
+rejections_root="$(mktemp -d "$log_root/acceptance-rejections.XXXXXX")"
+expect_acceptance_rejection() {
+  local label="$1" message="$2" status=0
+  shift 2
+  local log="$log_root/gate3-reject-$label.log"
+  (ulimit -c 0
+    timeout --kill-after=10s 5m env "$@" "$qwen35_test_binary" "$hf_short" \
+      --exact --ignored --test-threads=1 --nocapture
+  ) >"$log" 2>&1 || status=$?
+  "$python" - "$log" "$status" "$hf_short" "$message" <<'PY'
+from pathlib import Path
+import re, sys
+log, status, name, expected = sys.argv[1:]
+text = Path(log).read_text()
+assert status in ("101", "134"), f"unexpected failure/timeout (exit {status}); retain {log}"
+assert re.search(r"(?m)^running 1 test$", text), f"harness did not run one test: {log}"
+panic = re.search(r"(?m)^thread '" + re.escape(name)
+                  + r"'(?: \(\d+\))? panicked at [^\n]*\n([^\n]*)", text)
+assert panic, f"missing the exact test's panic: {log}"
+assert expected in panic[1], f"wrong rejection reason; expected {expected!r}; retain {log}"
+assert "test result: ok." not in text, f"negative case unexpectedly passed: {log}"
+if status == "101":
+    assert re.search(r"(?m)^test result: FAILED\. 0 passed; 1 failed; 0 ignored;", text), log
+# Some CUDA-linked release test binaries abort while unwinding. Exit 134 alone
+# is not evidence: the exact test's panic and its expected reason are mandatory.
+print(f"GDN_ACCEPTANCE_REJECTION_OK log={log} exit={status} reason={expected}")
+PY
+}
+expect_acceptance_rejection missing-identity \
+  'candidate acceptance requires PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256:' \
+  -u PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256
+expect_acceptance_rejection malformed-identity \
+  'candidate acceptance requires a 64-character hexadecimal object SHA256' \
+  PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256=not-a-sha256
+expect_acceptance_rejection missing-model \
+  'candidate acceptance requires a readable Qwen3.5 model fixture' \
+  "PEGAINFER_TEST_MODEL_PATH=$rejections_root/missing-model"
+expect_acceptance_rejection missing-fixture \
+  "read $rejections_root/missing-short-golden.safetensors: No such file or directory (os error 2)" \
+  "PEGAINFER_QWEN35_HF_GOLDEN=$rejections_root/missing-short-golden.safetensors"
+
+# Remove the temporary symlinks even on failure so evidence packers cannot
+# follow them and accidentally archive the model weights. Keep the failure log.
+model_without_revision="$rejections_root/model-without-revision"
+(
+trap 'rm -rf -- "$model_without_revision"' EXIT
+"$python" - "$model" "$model_without_revision" <<'PY'
+from pathlib import Path
+import sys
+source, view = map(Path, sys.argv[1:])
+assert "snapshots" not in view.resolve().parts, "revision-negative view must not imply a snapshot revision"
+view.mkdir()
+for item in source.iterdir():
+    if item.name not in (".cache", ".git") and item.is_file():
+        (view / item.name).symlink_to(item.resolve())
+assert (view / "config.json").is_file()
+PY
+expect_acceptance_rejection unknown-revision \
+  "cannot verify model_revision=$expected_revision: local model revision is unknown" \
+  -u PEGAINFER_TEST_MODEL_REVISION "PEGAINFER_TEST_MODEL_PATH=$model_without_revision"
+)
+expect_acceptance_rejection wrong-revision \
+  'qwen35 hf_golden_gate model revision mismatch;' \
+  PEGAINFER_TEST_MODEL_REVISION=0000000000000000000000000000000000000000
+wrong_sha="0${object_sha:1}"
+[[ "$wrong_sha" != "$object_sha" ]] || wrong_sha="1${object_sha:1}"
+expect_acceptance_rejection wrong-identity \
+  "candidate acceptance artifact identity mismatch: expected $wrong_sha, loaded $object_sha" \
+  "PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256=$wrong_sha"
+echo "GDN_ACCEPTANCE_REJECTIONS_OK"
 run_exact_gate gate3-hf-golden \
-  executor::hf_golden_gate::pega_logprobs_match_hf_golden_within_qwen35_tolerance ordinary \
+  "$hf_short" ignored \
   -p pegainfer-qwen35 --features qwen35 --lib
 run_exact_gate gate3-hf-long-golden \
-  executor::hf_golden_gate::pega_logprobs_match_hf_long_golden_within_qwen35_tolerance ordinary \
+  executor::hf_golden_gate::candidate_pega_logprobs_match_hf_long_golden_within_qwen35_tolerance ignored \
   -p pegainfer-qwen35 --features qwen35 --lib
 run_exact_gate gate4-model-continuation \
   prefill::tests::flashinfer_gdn_chunk_continuation_and_model_outputs_match ignored \
   -p pegainfer-qwen35 --features qwen35 --lib
 run_exact_gate gate4-scheduler-chunks \
-  chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv ordinary \
-  -p pegainfer-qwen35 --features qwen35 --test chunked_prefill
-run_exact_gate gate5-scheduler test_e2e_qwen35_scheduler ordinary \
-  -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler
-run_exact_gate gate5-shared-sm test_e2e_qwen35_shared_sm_last_decoder ordinary \
-  -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler
+  scheduler::chunked_prefill_tests::candidate_chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv ignored \
+  -p pegainfer-qwen35 --features qwen35 --lib
+run_exact_gate gate5-scheduler scheduler::e2e_tests::candidate_e2e_qwen35_scheduler ignored \
+  -p pegainfer-qwen35 --features qwen35 --lib
+run_exact_gate gate5-shared-sm scheduler::e2e_tests::candidate_e2e_qwen35_shared_sm_last_decoder ignored \
+  -p pegainfer-qwen35 --features qwen35 --lib
 
-[[ "$(git rev-parse HEAD)" == "$commit_sha" && "$(git rev-parse HEAD^{tree})" == "$tree_sha" \
+[[ "$(git rev-parse HEAD)" == "$commit_sha" && "$(git rev-parse 'HEAD^{tree}')" == "$tree_sha" \
   && -z "$(git status --short --untracked-files=no)" ]] || {
   echo "validated source changed during acceptance" >&2; exit 3;
 }

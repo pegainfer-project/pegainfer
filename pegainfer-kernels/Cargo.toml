@@ -37,5 +37,9 @@ moe = []
 name = "triton_cubin_tvm_ffi"
 required-features = ["tvm-ffi-triton-cubin"]
 
+[[test]]
+name = "gdn_identity"
+required-features = ["qwen35"]
+
 [lints]
 workspace = true
