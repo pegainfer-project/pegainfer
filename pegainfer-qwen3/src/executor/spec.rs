@@ -142,9 +142,10 @@ impl Qwen3Executor {
                 ));
             }
         }
-        // The worker returns the mathematically accepted span. Apply the
-        // request contract before touching RequestKv so a terminal token's
-        // speculative suffix is rolled back with the unused reservation.
+        // The worker normally applies the request contract before copying
+        // worker-side state. Recheck the same invariant here before touching
+        // RequestKv so a terminal suffix is rolled back with its reservation,
+        // including legacy workers that return an untrimmed span.
         for (policy, req_result) in plan.stop_policies.iter().zip(&mut result.requests) {
             truncate_after_terminal(req_result, policy, &self.metadata.stop_token_ids);
         }
@@ -169,6 +170,13 @@ impl Qwen3Executor {
                     "apply_speculative failed for {:?}: {e}",
                     req_result.request_id
                 ));
+            }
+            if result.hedged && std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
+                log::debug!(
+                    "Qwen3 DFlash hedge commit request={} accepted_len={}",
+                    req_result.request_id,
+                    req_result.accepted_tokens.len(),
+                );
             }
             applied.push(req_result.request_id);
         }

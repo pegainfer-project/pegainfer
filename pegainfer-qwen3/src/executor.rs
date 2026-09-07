@@ -3542,6 +3542,29 @@ impl LocalQwen3Lane {
         // winner; otherwise a discarded suffix can win the hedge and advance
         // the wrong KV/hidden state and acceptance statistics.
         let (results_a, results_b) = all_results.split_at_mut(requests.len());
+        anyhow::ensure!(
+            results_b.len() == hedge_spans.len(),
+            "hedge returned {} B results for {} hedge spans",
+            results_b.len(),
+            hedge_spans.len()
+        );
+        let trace = std::env::var_os("PEGAINFER_TEST_LOG").is_some();
+        let raw_a_lengths: Vec<usize> = trace
+            .then(|| {
+                results_a
+                    .iter()
+                    .map(|result| result.accepted_tokens.len())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let raw_b_lengths: Vec<usize> = trace
+            .then(|| {
+                results_b
+                    .iter()
+                    .map(|result| result.accepted_tokens.len())
+                    .collect()
+            })
+            .unwrap_or_default();
         for (result, policy) in results_a.iter_mut().zip(stop_policies) {
             spec::truncate_after_terminal(result, policy, &self.model.config().stop_token_ids);
         }
@@ -3552,6 +3575,54 @@ impl LocalQwen3Lane {
                 &self.model.config().stop_token_ids,
             );
         }
+        let (
+            retained_a_lengths,
+            retained_b_lengths,
+            raw_best_lengths,
+            raw_best_is_b,
+            retained_best_lengths,
+            retained_best_is_b,
+        ) = if trace {
+            let retained_a_lengths: Vec<usize> = results_a
+                .iter()
+                .map(|result| result.accepted_tokens.len())
+                .collect();
+            let retained_b_lengths: Vec<usize> = results_b
+                .iter()
+                .map(|result| result.accepted_tokens.len())
+                .collect();
+            let mut raw_best_lengths = raw_a_lengths.clone();
+            let mut raw_best_is_b = vec![false; requests.len()];
+            let mut retained_best_lengths = retained_a_lengths.clone();
+            let mut retained_best_is_b = vec![false; requests.len()];
+            for (slot, (idx, _)) in hedge_spans.iter().enumerate() {
+                if raw_b_lengths[slot] > raw_best_lengths[*idx] {
+                    raw_best_lengths[*idx] = raw_b_lengths[slot];
+                    raw_best_is_b[*idx] = true;
+                }
+                if retained_b_lengths[slot] > retained_best_lengths[*idx] {
+                    retained_best_lengths[*idx] = retained_b_lengths[slot];
+                    retained_best_is_b[*idx] = true;
+                }
+            }
+            (
+                retained_a_lengths,
+                retained_b_lengths,
+                raw_best_lengths,
+                raw_best_is_b,
+                retained_best_lengths,
+                retained_best_is_b,
+            )
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
         // Per request keep the best-accepting chain; ties keep chain A (no
         // copies). A later chain of the same request only replaces the
         // running winner when strictly better, so the final page/hidden
@@ -3561,6 +3632,7 @@ impl LocalQwen3Lane {
         let elem = std::mem::size_of::<half::bf16>();
         let mut final_requests: Vec<VerifyStepItem> = requests.to_vec();
         let mut final_results: Vec<VerifyRequestResult> = results_a.to_vec();
+        let mut selected_is_b = trace.then(|| vec![false; requests.len()]);
         let mut b_wins = 0usize;
         let mut b_row_offset = a_total_rows;
         for (slot, (idx, replaced)) in hedge_spans.iter().enumerate() {
@@ -3586,6 +3658,9 @@ impl LocalQwen3Lane {
                 }
                 .map_err(|e| anyhow::anyhow!("hedge hidden compaction failed: {e}"))?;
                 b_wins += 1;
+                if let Some(selected) = selected_is_b.as_mut() {
+                    selected[*idx] = true;
+                }
                 final_requests[*idx] = expanded[requests.len() + slot].clone();
                 final_results[*idx] = res_b.clone();
             }
@@ -3608,9 +3683,57 @@ impl LocalQwen3Lane {
             &final_requests,
             &final_results,
             Some(bufs.captured_hidden()),
+            true,
         )?;
+        if std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
+            for idx in 0..requests.len() {
+                let has_hedge = hedge_spans
+                    .iter()
+                    .any(|(request_idx, _)| *request_idx == idx);
+                if !has_hedge {
+                    continue;
+                }
+                let raw_winner = if raw_best_is_b[idx] { 'B' } else { 'A' };
+                let retained_winner = if retained_best_is_b[idx] { 'B' } else { 'A' };
+                let selected = if selected_is_b.as_ref().is_some_and(|selected| selected[idx]) {
+                    'B'
+                } else {
+                    'A'
+                };
+                let raw_b_lens = hedge_spans
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (request_idx, _))| *request_idx == idx)
+                    .map(|(slot, _)| raw_b_lengths[slot].to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let retained_b_lens = hedge_spans
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (request_idx, _))| *request_idx == idx)
+                    .map(|(slot, _)| retained_b_lengths[slot].to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                log::debug!(
+                    "Qwen3 DFlash hedge detail request={} raw_a={} raw_b_lens={} raw_best_len={} kept_a={} kept_b_lens={} retained_best_len={} raw_winner={} retained_winner={} selected={} selected_len={} matched_draft={}",
+                    requests[idx].request_id,
+                    raw_a_lengths[idx],
+                    raw_b_lens,
+                    raw_best_lengths[idx],
+                    retained_a_lengths[idx],
+                    retained_b_lens,
+                    retained_best_lengths[idx],
+                    raw_winner,
+                    retained_winner,
+                    selected,
+                    final_results[idx].accepted_tokens.len(),
+                    final_results[idx].matched_draft_tokens,
+                );
+            }
+        }
         Ok(Some(VerifyResult {
             requests: final_results,
+            hedged: true,
         }))
     }
 
@@ -3727,9 +3850,11 @@ impl LocalQwen3Lane {
                 requests,
                 &request_results,
                 Some(bufs.captured_hidden()),
+                false,
             )?;
             Ok(VerifyResult {
                 requests: request_results,
+                hedged: false,
             })
         })();
         self.verify_bufs = Some(bufs);

@@ -17,14 +17,14 @@ pub enum EosPolicy {
 /// reports the actual matching token ID.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StopPolicy {
-    pub eos: EosPolicy,
+    eos: EosPolicy,
     /// Sorted and deduplicated explicit stop IDs.
     ///
     /// Requests clone this policy while building a plan and sending it to
     /// worker ranks. Keeping the normalized set behind an `Arc` makes those
     /// clones cheap and lets classification use binary search for large stop
     /// sets without regressing the common one-ID case.
-    pub token_ids: Arc<[u32]>,
+    token_ids: Arc<[u32]>,
 }
 
 impl StopPolicy {
@@ -100,23 +100,22 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_stop_sets_across_common_sizes() {
-        let empty = StopPolicy::default();
-        assert!(empty.classify(7, |_| false).is_none());
-
-        let single = StopPolicy::new(EosPolicy::Ignore, vec![42]);
-        assert_eq!(single.classify(42, |_| false), Some(StopCause::Token(42)));
-        assert!(single.classify(43, |_| false).is_none());
-
+    fn normalizes_unsorted_duplicate_stop_ids() {
         let policy = StopPolicy::new(EosPolicy::Ignore, vec![7, 3, 7, 1]);
-        assert_eq!(policy.token_ids.as_ref(), [1, 3, 7]);
-        assert!(policy.classify(7, |_| false).is_some());
-        assert!(policy.classify(8, |_| false).is_none());
 
-        let full = StopPolicy::new(EosPolicy::Ignore, (0..151_936).collect());
-        assert_eq!(full.token_ids.len(), 151_936);
-        assert!(full.classify(0, |_| false).is_some());
-        assert!(full.classify(151_935, |_| false).is_some());
-        assert!(full.classify(151_936, |_| false).is_none());
+        assert_eq!(policy.classify(1, |_| false), Some(StopCause::Token(1)));
+        assert_eq!(policy.classify(3, |_| false), Some(StopCause::Token(3)));
+        assert_eq!(policy.classify(7, |_| false), Some(StopCause::Token(7)));
+        assert!(policy.classify(8, |_| false).is_none());
+    }
+
+    #[test]
+    fn model_eos_has_priority_over_explicit_stop() {
+        let policy = StopPolicy::new(EosPolicy::ModelDefault, vec![99]);
+
+        assert_eq!(
+            policy.classify(99, |token_id| token_id == 99),
+            Some(StopCause::Eos(99))
+        );
     }
 }

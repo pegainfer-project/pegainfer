@@ -201,6 +201,7 @@ impl LocalQwen3Lane {
         requests: &[VerifyStepItem],
         results: &[VerifyRequestResult],
         captured_hidden: Option<&HiddenStates>,
+        hedged: bool,
     ) -> Result<()> {
         let Some(captured_hidden) = captured_hidden else {
             anyhow::bail!("DFlash verify context capture requested but no hidden states returned");
@@ -242,6 +243,14 @@ impl LocalQwen3Lane {
                 token_offset,
                 result.accepted_tokens.len(),
             )?;
+            if hedged && std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
+                log::debug!(
+                    "Qwen3 DFlash hedge context request={} appended={} matched_draft={}",
+                    req.request_id,
+                    result.accepted_tokens.len(),
+                    result.matched_draft_tokens,
+                );
+            }
             dflash.requests.insert(req.request_id, state);
             dflash.verified_draft_tokens += req.token_ids.len().saturating_sub(1);
             dflash.accepted_draft_tokens += result.matched_draft_tokens;

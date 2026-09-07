@@ -271,8 +271,15 @@ mod tests {
         params.eos_token_id = Some(99);
         params.stop_token_ids = vec![11];
 
-        assert_eq!(convert_stop_policy(&params).eos, EosPolicy::ModelDefault);
-        assert_eq!(convert_stop_policy(&params).token_ids.as_ref(), [11]);
+        let policy = convert_stop_policy(&params);
+        assert_eq!(
+            policy.classify(99, |token_id| token_id == 99),
+            Some(crate::engine::StopCause::Eos(99))
+        );
+        assert_eq!(
+            policy.classify(11, |_| false),
+            Some(crate::engine::StopCause::Token(11))
+        );
     }
 
     #[test]

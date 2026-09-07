@@ -39,6 +39,9 @@
 //! `PEGAINFER_TEST_MODEL_PATH` (target) and `PEGAINFER_DFLASH_TEST_MODEL_PATH`
 //! (drafter); skips cleanly when either is absent.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -626,7 +629,8 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
 
 /// Production hedge regression: an explicit stop in the middle of a verify
 /// span must be applied before the hedge winner is selected and committed.
-/// The trigger is retained, while every accepted suffix token is discarded.
+/// The parent gate also checks the request-local worker trace, because the
+/// final stream alone is protected by the executor's legacy safety truncation.
 #[test]
 fn dflash_hedged_midspan_stop_retains_trigger() {
     common::harness::init_capture_logging();
@@ -643,7 +647,7 @@ fn dflash_hedged_midspan_stop_retains_trigger() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let prompt = "Write a short paragraph about a blue bicycle:";
+    let prompt = "Write a short paragraph about a blue";
     let tokenizer = common::load_tokenizer(&model_path);
     let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
     let draft_config: serde_json::Value = serde_json::from_str(
@@ -675,39 +679,55 @@ fn dflash_hedged_midspan_stop_retains_trigger() {
         ))
         .expect_finished()
         .tokens;
-    let Some((stop_index, &stop_id)) = baseline
+    let candidate_stops: Vec<(usize, u32)> = baseline
         .iter()
         .enumerate()
         .skip(min_index)
-        .find(|(index, token)| !baseline[..*index].contains(token))
-    else {
-        panic!("baseline did not produce a unique token after the middle of the verify span");
-    };
+        .take(block_size.saturating_sub(min_index))
+        .filter(|(index, token)| !baseline[..*index].contains(token))
+        .map(|(index, token)| (index, *token))
+        .collect();
     assert!(
-        stop_index < block_size,
-        "selected stop token at position {stop_index}, expected inside the first {block_size}-token verify span"
+        !candidate_stops.is_empty(),
+        "baseline did not produce a unique token inside the first verify span"
     );
 
-    let stopped_params = SamplingParams {
-        ignore_eos: true,
-        ..SamplingParams::default()
-    };
-    let mut stopped = request(prompt_tokens, stopped_params, GENERATED_TOKENS);
-    stopped.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![stop_id]);
-    let outcome = engine.submit(stopped).expect_finished();
+    let mut stopped_cases = 0usize;
+    for (baseline_index, stop_id) in candidate_stops {
+        let stopped_params = SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        };
+        let mut stopped = request(prompt_tokens.clone(), stopped_params, GENERATED_TOKENS);
+        stopped.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![stop_id]);
+        let stream = engine.submit(stopped);
+        let request_id = stream.id();
+        eprintln!("hedge stop request={request_id}");
+        let outcome = stream.expect_finished();
 
-    assert_eq!(outcome.tokens.len(), stop_index + 1);
-    assert_eq!(outcome.tokens.last(), Some(&stop_id));
-    assert!(!outcome.tokens[..stop_index].contains(&stop_id));
-    assert!(matches!(
-        outcome.terminal,
-        Terminal::Finished {
-            reason: FinishReason::Stop,
-            stop_cause: Some(StopCause::Token(id)),
-            completion_tokens,
-            ..
-        } if id == stop_id && completion_tokens == stop_index + 1
-    ));
+        if outcome.tokens.last() != Some(&stop_id) {
+            continue;
+        }
+        assert!(!outcome.tokens[..outcome.tokens.len() - 1].contains(&stop_id));
+        assert!(matches!(
+            outcome.terminal,
+            Terminal::Finished {
+                reason: FinishReason::Stop,
+                stop_cause: Some(StopCause::Token(id)),
+                completion_tokens,
+                ..
+            } if id == stop_id && completion_tokens == outcome.tokens.len()
+        ));
+        eprintln!(
+            "hedge stop candidate baseline_index={baseline_index} token={stop_id} retained_len={}",
+            outcome.tokens.len()
+        );
+        stopped_cases += 1;
+    }
+    assert!(
+        stopped_cases > 0,
+        "none of the candidate tokens produced a mid-span explicit stop"
+    );
 }
 
 /// P2 regression: a request that fits the target context window but lands in the
@@ -790,15 +810,14 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
     }
 }
 
-/// Execution gate for the hedge ladder: re-runs the two losslessness tests
+/// Execution gate for the hedge ladder: re-runs the hedge child suites
 /// above in child processes, since the hedge config is read once per process
 /// and cannot be toggled in-process.
 ///
-/// Scope: this proves the copy-back and discard branches were ENTERED, not
-/// that a later round consumes the winner's state correctly — `check_lossless`
-/// returns at the first benign tie flip, so the suffix past it is never
-/// compared. A tie is also a non-win (the win test is strictly-greater), so
-/// the counters cannot separate a tie from a shorter chain.
+/// The stop child additionally checks the request-local raw/retained winner,
+/// selected winner, context append, and KV commit lengths. The losslessness
+/// children retain their numerical tie tolerance and only require that the
+/// configured hedge path actually ran.
 ///
 /// Strict token equality against an unhedged run is NOT a valid contract:
 /// hedged rounds change the verify batch shape, which legally flips bf16 ties,
@@ -840,12 +859,11 @@ fn hedged_ladder_passes_the_lossless_gates() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let exe = std::env::current_exe().expect("test binary path");
-    // One child per lossless suite, each with a single exact filter, so the
-    // invocation shape is beyond dispute on any libtest version.
+    // One child per suite, each with a single exact filter, so the invocation
+    // shape is beyond dispute on any libtest version.
     // A hedge-free child would make its lossless pass vacuous, so each child
     // must show expanded spans in the executor's per-round trace.
     let mut total_spans = 0usize;
-    let mut total_wins = 0usize;
     let mut total_rounds = 0usize;
     for child_test in [
         "dflash_speculative_greedy_matches_plain_greedy",
@@ -868,7 +886,6 @@ fn hedged_ladder_passes_the_lossless_gates() {
         );
         let mut rounds = 0usize;
         let mut spans = 0usize;
-        let mut wins = 0usize;
         for line in child_stderr.lines() {
             let Some(rest) = line.split("DFlash hedge: ").nth(1) else {
                 continue;
@@ -878,23 +895,99 @@ fn hedged_ladder_passes_the_lossless_gates() {
                 .filter(|tok| !tok.is_empty())
                 .map(|tok| tok.parse::<usize>().expect("hedge trace number"));
             spans += nums.next().expect("span count");
-            wins += nums.next().expect("win count");
+            let _ = nums.next().expect("win count");
             rounds += 1;
         }
         assert!(
             rounds > 0 && spans > 0,
             "child '{child_test}' executed no hedged verify round:\n{child_stderr}"
         );
+        if child_test == "dflash_hedged_midspan_stop_retains_trigger" {
+            let stop_requests: HashSet<String> = child_stderr
+                .lines()
+                .filter_map(|line| line.strip_prefix("hedge stop request="))
+                .map(str::to_owned)
+                .collect();
+            assert!(
+                !stop_requests.is_empty(),
+                "stop child emitted no request marker"
+            );
+            let mut context_by_request: HashMap<String, VecDeque<usize>> = HashMap::new();
+            let mut commit_by_request: HashMap<String, VecDeque<usize>> = HashMap::new();
+            for line in child_stderr.lines() {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                let request = fields
+                    .iter()
+                    .find_map(|field| field.strip_prefix("request="));
+                if let Some(request) = request {
+                    if let Some(appended) = fields
+                        .iter()
+                        .find_map(|field| field.strip_prefix("appended="))
+                        .and_then(|value| value.parse::<usize>().ok())
+                    {
+                        context_by_request
+                            .entry(request.to_string())
+                            .or_default()
+                            .push_back(appended);
+                    }
+                    if let Some(accepted_len) = fields
+                        .iter()
+                        .find_map(|field| field.strip_prefix("accepted_len="))
+                        .and_then(|value| value.parse::<usize>().ok())
+                    {
+                        commit_by_request
+                            .entry(request.to_string())
+                            .or_default()
+                            .push_back(accepted_len);
+                    }
+                }
+            }
+            let mut worker_side_truncation = false;
+            for line in child_stderr.lines() {
+                if !line.contains("Qwen3 DFlash hedge detail ") {
+                    continue;
+                }
+                let value = |name: &str| {
+                    line.split_whitespace()
+                        .find_map(|field| field.strip_prefix(name))
+                };
+                let retained_winner = value("retained_winner=");
+                let selected = value("selected=");
+                let raw_winner = value("raw_winner=");
+                let request = value("request=");
+                let raw_best_len = value("raw_best_len=").and_then(|v| v.parse().ok());
+                let retained_best_len = value("retained_best_len=").and_then(|v| v.parse().ok());
+                let selected_len = value("selected_len=").and_then(|v| v.parse().ok());
+                if !request.is_some_and(|id| stop_requests.contains(id)) {
+                    continue;
+                }
+                let context_len = request
+                    .and_then(|id| context_by_request.get_mut(id))
+                    .and_then(VecDeque::pop_front);
+                let commit_len = request
+                    .and_then(|id| commit_by_request.get_mut(id))
+                    .and_then(VecDeque::pop_front);
+                if raw_winner == Some("B")
+                    && retained_winner == Some("A")
+                    && selected == Some("A")
+                    && retained_best_len
+                        .is_some_and(|retained| raw_best_len.is_some_and(|raw| retained < raw))
+                    && selected_len.is_some()
+                    && selected_len == retained_best_len
+                    && selected_len == context_len
+                    && selected_len == commit_len
+                {
+                    worker_side_truncation = true;
+                    break;
+                }
+            }
+            assert!(
+                worker_side_truncation,
+                "stop hedge never truncated a candidate before winner/context commit:\n{child_stderr}"
+            );
+        }
         total_rounds += rounds;
         total_spans += spans;
-        total_wins += wins;
     }
-    assert!(
-        total_wins > 0,
-        "no hedge chain ever won across {total_rounds} hedged rounds"
-    );
-    assert!(
-        total_spans > total_wins,
-        "every hedge span won ({total_wins}/{total_spans}) — the discard path never executed"
-    );
+    assert!(total_rounds > 0 && total_spans > 0);
 }

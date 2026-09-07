@@ -38,14 +38,14 @@ pub(crate) fn request(
     params: SamplingParams,
     max_tokens: usize,
 ) -> Request {
-    let stop_policy = StopPolicy {
-        eos: if params.ignore_eos {
+    let stop_policy = StopPolicy::new(
+        if params.ignore_eos {
             EosPolicy::Ignore
         } else {
             EosPolicy::ModelDefault
         },
-        ..StopPolicy::default()
-    };
+        Vec::new(),
+    );
 
     Request {
         prompt_tokens,
