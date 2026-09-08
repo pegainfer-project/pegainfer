@@ -35,7 +35,9 @@ use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::output::UtilityCallOutput;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
+use vllm_engine_core_client::protocol::stats::BaseCacheStats;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::stats::PrefixCacheStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
@@ -589,6 +591,10 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
 /// vLLM `SchedulerStats` view of a load snapshot — what the frontend's
 /// Prometheus gauges (`scheduler_running`, `scheduler_waiting`,
 /// `kv_cache_usage`) and DP load balancer consume.
+///
+/// `prefix_cache_stats` is left at zero here: callers fill it from
+/// [`PrefixCacheTracker::interval`], which owns the totals-to-deltas
+/// conversion and the reason for it.
 pub(crate) fn scheduler_stats_from(snapshot: &SchedulerMetrics) -> SchedulerStats {
     SchedulerStats {
         num_running_reqs: snapshot.num_running_reqs,
@@ -599,6 +605,64 @@ pub(crate) fn scheduler_stats_from(snapshot: &SchedulerMetrics) -> SchedulerStat
             snapshot.kv_used_blocks as f64 / snapshot.kv_total_blocks as f64
         },
         ..SchedulerStats::default()
+    }
+}
+
+/// Prefix-cache counterpart of [`SpecDecodeTracker`]: the scheduler holds
+/// running totals while the wire must carry per-interval deltas, because the
+/// frontend increments its `prefix_cache_*_total` counters by the value of
+/// *every* `SchedulerStats` it receives. Shipping the running total would
+/// re-add the whole history on each subsequent batch, so both bridges convert
+/// through this type and cannot drift.
+#[derive(Default)]
+pub(crate) struct PrefixCacheTracker {
+    last_queries: u64,
+    last_hits: u64,
+    last_external_queries: u64,
+    last_external_hits: u64,
+}
+
+impl PrefixCacheTracker {
+    /// The local delta to stamp on the next outgoing batch. Advances the
+    /// baseline, so a caller that declines to send after calling this drops
+    /// only a no-op interval.
+    pub(crate) fn interval(&mut self, snapshot: &SchedulerMetrics) -> BaseCacheStats {
+        let delta = BaseCacheStats {
+            queries: snapshot
+                .prefix_cache_queries
+                .saturating_sub(self.last_queries),
+            hits: snapshot.prefix_cache_hits.saturating_sub(self.last_hits),
+            ..BaseCacheStats::default()
+        };
+        self.last_queries = snapshot.prefix_cache_queries;
+        self.last_hits = snapshot.prefix_cache_hits;
+        delta
+    }
+
+    /// The same conversion for the external (connector) side — blocks restored
+    /// from CPU offload or over P2P rather than found in local KV. Kept on a
+    /// separate baseline so the two families cannot pollute each other, and
+    /// `None` when nothing was restored: a line with no connector leaves
+    /// `connector_prefix_cache_stats` unset instead of reporting zeros.
+    pub(crate) fn external_interval(
+        &mut self,
+        snapshot: &SchedulerMetrics,
+    ) -> Option<PrefixCacheStats> {
+        let base = BaseCacheStats {
+            queries: snapshot
+                .prefix_cache_external_queries
+                .saturating_sub(self.last_external_queries),
+            hits: snapshot
+                .prefix_cache_external_hits
+                .saturating_sub(self.last_external_hits),
+            ..BaseCacheStats::default()
+        };
+        self.last_external_queries = snapshot.prefix_cache_external_queries;
+        self.last_external_hits = snapshot.prefix_cache_external_hits;
+        (base.queries > 0 || base.hits > 0).then(|| PrefixCacheStats {
+            base,
+            ..PrefixCacheStats::default()
+        })
     }
 }
 
@@ -662,9 +726,12 @@ async fn publish_scheduler_stats(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let mut spec = SpecDecodeTracker::default();
+    let mut prefix = PrefixCacheTracker::default();
     loop {
         let snapshot = *load_rx.borrow_and_update();
         let mut stats = scheduler_stats_from(&snapshot);
+        stats.prefix_cache_stats.base = prefix.interval(&snapshot);
+        stats.connector_prefix_cache_stats = prefix.external_interval(&snapshot);
         stats.spec_decoding_stats = spec.interval(&snapshot);
         let outputs = RequestBatchOutputs {
             engine_index,

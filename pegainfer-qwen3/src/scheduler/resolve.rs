@@ -27,12 +27,20 @@ pub(crate) fn resolve_step(
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
+            prefix_external_queries: 0,
+            prefix_external_hits: 0,
         },
         ExecutionArtifacts::SpeculativeDecode { verify } => StepEffects {
             cached: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_speculative_outputs(executor, active, &verify.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
+            prefix_external_queries: 0,
+            prefix_external_hits: 0,
         },
         ExecutionArtifacts::Unified { pending, result } => {
             let mut effects = resolve_prefill_outputs(executor, pending, result.prefill_requests);
@@ -100,18 +108,48 @@ fn resolve_prefill_outputs(
         // release builds too.
         assert_eq!(req.request_id, result.request_id);
 
-        // Report the prefix-cache hit count on the request's first chunk only
-        // — that is where it is determined. Later chunks must not re-report.
+        // Report the prefix-cache counters on the request's first chunk only —
+        // that is where they are determined. Later chunks must not re-report.
+        //
+        // Only count a request whose prefix the executor actually looked up.
+        // The executor calls `match_and_add_prefix` strictly under
+        // `prefix_cache_enabled() && !echo`, so a cache-disabled or echo
+        // request performs no lookup at all and must contribute neither a
+        // query nor a hit — otherwise the counters report lookups that never
+        // happened and the hit rate is diluted by phantom queries.
+        //
+        // Both counters are TOKEN-granularity, matching vLLM's `PrefixCacheStats`
+        // (the frontend compares `hits / queries` as hit tokens / queried tokens):
+        //   * `prefix_queries` = the number of prompt tokens this request looked
+        //     up in the cache (the whole prompt is consulted once, on chunk 0).
+        //   * `prefix_hits`    = the number of those tokens already cached
+        //     (`cached_tokens`).
+        // Because `cached_tokens <= prompt_tokens`, `hits <= queries` holds and
+        // the hit rate stays in [0, 1] with no impossible >100% rates.
         if req.prefill_pos == 0 {
+            // The cached-token report drives the `cached_tokens` usage field
+            // and stays unconditional: it reports what the executor reused,
+            // which is simply zero when no lookup happened.
             effects.cached.push(CachedTokensEffect {
                 request_id: req.request_id,
-                cached_tokens: result.cached_tokens,
+                cached_tokens: result.cached_tokens.unwrap_or(0),
             });
+            // `None` means no lookup ran at all (cache disabled, or an echo
+            // request), so nothing is counted — the executor owns that
+            // condition and reports it here rather than the resolver
+            // re-deriving it. `Some(0)` is a miss: the query still counts.
+            if let Some(matched) = result.cached_tokens {
+                let external = result.external_hit_tokens.min(matched);
+                effects.prefix_queries += req.prompt_tokens.len() as u64;
+                effects.prefix_hits += (matched - external) as u64;
+                effects.prefix_external_queries += req.prompt_tokens.len() as u64;
+                effects.prefix_external_hits += external as u64;
+            }
         }
 
         if !result.completed {
             req.prefill_pos = result.prefill_pos;
-            req.cached_tokens = req.cached_tokens.max(result.cached_tokens);
+            req.cached_tokens = req.cached_tokens.max(result.cached_tokens.unwrap_or(0));
             effects.pending.push(PendingEffect::ContinuePrefill { req });
             continue;
         }

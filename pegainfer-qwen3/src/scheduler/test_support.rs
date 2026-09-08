@@ -39,6 +39,14 @@ pub(crate) struct FakeExecutor {
     pub(crate) dropped: Arc<Mutex<Vec<u64>>>,
     pub(crate) prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
+    // When > 0, the first prefill chunk of every request reports this many
+    // `cached_tokens` (a simulated prefix-cache hit). Drives the prefix-cache
+    // query/hit counters without a real GPU KV cache.
+    prefix_hit_tokens: usize,
+    // Whether the fake executor claims to consult a prefix cache at all.
+    // `false` models a real executor with prefix caching switched off, which
+    // never calls `match_and_add_prefix` and must therefore report no queries.
+    prefix_cache_enabled: bool,
 }
 
 impl FakeExecutor {
@@ -56,7 +64,31 @@ impl FakeExecutor {
             dropped,
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
+            prefix_hit_tokens: 0,
+            prefix_cache_enabled: true,
+            prefix_external_hit_tokens: 0,
         }
+    }
+
+    /// Simulate a prefix-cache hit on every request's first prefill chunk by
+    /// reporting `tokens` cached tokens.
+    pub(crate) fn with_prefix_hit(mut self, tokens: usize) -> Self {
+        self.prefix_hit_tokens = tokens;
+        self
+    }
+
+    /// Model an executor that never consults a prefix cache (caching switched
+    /// off): no `match_and_add_prefix` happens, so no query may be counted.
+    pub(crate) fn without_prefix_cache(mut self) -> Self {
+        self.prefix_cache_enabled = false;
+        self
+    }
+
+    /// Simulate hits restored from the external side (CPU offload / P2P) rather
+    /// than found in local KV.
+    pub(crate) fn with_external_prefix_hit(mut self, tokens: usize) -> Self {
+        self.prefix_external_hit_tokens = tokens;
+        self
     }
 
     pub(crate) fn with_stop_token(mut self, token: u32) -> Self {
@@ -101,7 +133,16 @@ impl FakeExecutor {
             first_token: 100 + req.request_id.raw() as u32,
             first_token_logprob: None,
             prompt_logprobs: None,
-            cached_tokens: 0,
+            // A simulated lookup is reported only on the request's first chunk
+            // (start == 0); later chunks carry no cached prefix. `None` models
+            // a cache that never ran a lookup (switched off, or echo).
+            cached_tokens: (start == 0 && self.prefix_cache_enabled)
+                .then_some(self.prefix_hit_tokens),
+            external_hit_tokens: if start == 0 {
+                self.prefix_external_hit_tokens
+            } else {
+                0
+            },
             completed,
             prefill_pos,
         }
@@ -141,6 +182,9 @@ impl ModelExecutor for FakeExecutor {
     fn max_decode_batch_size(&self) -> usize {
         64
     }
+
+    // No capability query: the fake reports `None` from `fake_prefill_result`
+    // when the cache is off, which is what the resolver consumes.
 
     fn available_blocks(&self) -> usize {
         self.available_blocks

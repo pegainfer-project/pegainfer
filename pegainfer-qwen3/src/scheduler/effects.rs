@@ -87,6 +87,22 @@ pub(crate) struct StepEffects {
     pub(crate) prompt_echoes: Vec<PromptEchoEffect>,
     pub(crate) pending: Vec<PendingEffect>,
     pub(crate) decode: Vec<DecodeEffect>,
+    /// Prefix-cache queries counted this step, token-granularity: the number of
+    /// prompt tokens looked up in the cache (summed over requests whose first
+    /// prefill chunk was resolved this step — that is where the cache is
+    /// consulted). Same unit as `prefix_hits`. Cumulative counters live on the
+    /// scheduler; this is the per-step delta.
+    pub(crate) prefix_queries: u64,
+    /// Prefix-cache hits counted this step, token-granularity: the number of
+    /// queried prompt tokens that were already cached locally. Same unit as
+    /// `prefix_queries`, so `hit_rate = hits/queries` stays in [0, 1].
+    /// Cumulative counters live on the scheduler; this is the per-step delta.
+    pub(crate) prefix_hits: u64,
+    /// The same figures for the external/connector side: tokens restored from
+    /// CPU offload or over P2P rather than found in local KV. Reported
+    /// separately so external reuse is never counted as a local hit.
+    pub(crate) prefix_external_queries: u64,
+    pub(crate) prefix_external_hits: u64,
 }
 
 impl StepEffects {
@@ -96,6 +112,10 @@ impl StepEffects {
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: Vec::new(),
+            prefix_queries: 0,
+            prefix_hits: 0,
+            prefix_external_queries: 0,
+            prefix_external_hits: 0,
         }
     }
 }

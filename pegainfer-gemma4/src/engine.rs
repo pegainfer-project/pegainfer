@@ -2314,6 +2314,13 @@ impl Scheduler for Gemma4Scheduler {
             num_running_reqs: (self.active.len() + walkers + lane_inflight) as u64,
             num_waiting_reqs: self.pending.len() as u64,
             spec_decode: None,
+            // The conversation-tail prefix cache resolves hits through
+            // `send_scheduled`'s `cached_tokens`, not through counters yet,
+            // so this line reports zero queries/hits until it is wired up.
+            prefix_cache_queries: 0,
+            prefix_cache_hits: 0,
+            prefix_cache_external_queries: 0,
+            prefix_cache_external_hits: 0,
         }
     }
 }

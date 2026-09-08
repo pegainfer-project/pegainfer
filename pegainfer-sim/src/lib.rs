@@ -32,6 +32,10 @@ pub struct SimulatedEngineConfig {
     scripted_completion: Vec<u32>,
     /// A pretend drafter: `(K, accepted per verify step)`; `None` is no drafter.
     spec_decode: Option<(usize, usize)>,
+    /// A pretend prefix lookup: `(local hit tokens, externally restored hit
+    /// tokens)` reported on each request's first chunk; `None` models an engine
+    /// that never consults a prefix cache (disabled, or an echo request).
+    prefix_cache: Option<(usize, usize)>,
 }
 
 impl SimulatedEngineConfig {
@@ -61,6 +65,7 @@ impl SimulatedEngineConfig {
             fallback_token_id,
             scripted_completion: Vec::new(),
             spec_decode: None,
+            prefix_cache: None,
         })
     }
 
@@ -78,6 +83,15 @@ impl SimulatedEngineConfig {
         );
         SpecDecodeCounters::new(num_spec_tokens).expect("K within MAX_SPEC_TOKENS");
         self.spec_decode = Some((num_spec_tokens, num_accepted));
+        self
+    }
+
+    /// Report a prefix-cache lookup on every non-echo request's first chunk:
+    /// `hit_tokens` served from local KV and `external_hit_tokens` restored
+    /// from the connector (CPU offload / P2P) instead. Hit 0 models a miss.
+    #[must_use]
+    pub fn with_prefix_cache(mut self, hit_tokens: usize, external_hit_tokens: usize) -> Self {
+        self.prefix_cache = Some((hit_tokens, external_hit_tokens));
         self
     }
 
@@ -106,6 +120,7 @@ impl Default for SimulatedEngineConfig {
             fallback_token_id: 0,
             scripted_completion: Vec::new(),
             spec_decode: None,
+            prefix_cache: None,
         }
     }
 }
@@ -143,6 +158,10 @@ struct SimScheduler {
     queued: Vec<QueuedRequest>,
     running: Vec<RunningRequest>,
     spec_decode: Option<SpecDecodeCounters>,
+    prefix_cache_queries: u64,
+    prefix_cache_hits: u64,
+    prefix_cache_external_queries: u64,
+    prefix_cache_external_hits: u64,
 }
 
 struct RunningRequest {
@@ -164,6 +183,10 @@ impl SimScheduler {
             queued: Vec::new(),
             running: Vec::new(),
             spec_decode,
+            prefix_cache_queries: 0,
+            prefix_cache_hits: 0,
+            prefix_cache_external_queries: 0,
+            prefix_cache_external_hits: 0,
         }
     }
 
@@ -200,6 +223,18 @@ impl Scheduler for SimScheduler {
                 );
             }
             let prompt_len = request.prompt_tokens.len();
+            // The pretend lookup happens exactly where a real engine would do
+            // it: once, on admission, and never for an echo request (whose
+            // prompt is recomputed in full). Without a knob there is no lookup
+            // at all, so the counters stay at zero rather than inventing one.
+            if let Some((hits, external_hits)) = self.config.prefix_cache {
+                if !request.echo {
+                    self.prefix_cache_queries += prompt_len as u64;
+                    self.prefix_cache_hits += (hits.min(prompt_len)) as u64;
+                    self.prefix_cache_external_queries += prompt_len as u64;
+                    self.prefix_cache_external_hits += (external_hits.min(prompt_len)) as u64;
+                }
+            }
             let (pending, finish_reason) =
                 planned_completion(&self.config, &request.prompt_tokens, request.max_tokens);
             ledger.admit(id);
@@ -263,6 +298,10 @@ impl Scheduler for SimScheduler {
             num_running_reqs: self.running.len() as u64,
             num_waiting_reqs: self.queued.len() as u64,
             spec_decode: self.spec_decode,
+            prefix_cache_queries: self.prefix_cache_queries,
+            prefix_cache_hits: self.prefix_cache_hits,
+            prefix_cache_external_queries: self.prefix_cache_external_queries,
+            prefix_cache_external_hits: self.prefix_cache_external_hits,
             ..SchedulerMetrics::default()
         }
     }
