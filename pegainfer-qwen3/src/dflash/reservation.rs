@@ -1,6 +1,9 @@
 use anyhow::Result;
 
 use crate::config::DFlashConfig;
+use crate::config::DFlashHeadSource;
+use crate::config::DFlashProposal;
+use crate::dflash::selector::SelectorScratch;
 use crate::dspark::MarkovHead;
 use crate::sizing;
 
@@ -37,12 +40,14 @@ pub(crate) struct DFlashMemoryReservation {
 impl DFlashMemoryReservation {
     pub(crate) fn from_path(draft_path: &str, max_decode_batch_size: usize) -> Result<Self> {
         let config = DFlashConfig::from_file(draft_path)?;
+        config.validate_runtime_capabilities()?;
         Self::from_config(&config, max_decode_batch_size)
     }
 
     pub(crate) fn from_config(config: &DFlashConfig, max_decode_batch_size: usize) -> Result<Self> {
         const BF16: usize = 2;
         let hidden = config.hidden_size;
+        let target_hidden = config.target_hidden_size;
         let kv_dim = sizing::product(&[config.num_key_value_heads, config.head_dim])?;
         let q_dim = sizing::product(&[config.num_attention_heads, config.head_dim])?;
         let inter = config.intermediate_size;
@@ -60,7 +65,7 @@ impl DFlashMemoryReservation {
             sizing::sum(&[hidden, sizing::product(&[2, kv_dim])?])?,
             BF16,
         ])?;
-        let pending = sizing::product(&[hidden, capture_layers, BF16])?; // context_feature_dim
+        let pending = sizing::product(&[target_hidden, capture_layers, BF16])?; // context_feature_dim
         let kv_bytes_per_token = sizing::sum(&[draft_kv, context_scratch, tail_scratch, pending])?;
 
         // Lane-level batched dense scratch: every dense buffer is sized for the
@@ -97,7 +102,7 @@ impl DFlashMemoryReservation {
             ])?,
         ])?;
         // context projection
-        let fc = sizing::product(&[BF16, hidden, hidden, capture_layers])?;
+        let fc = sizing::product(&[BF16, hidden, target_hidden, capture_layers])?;
         let weights = sizing::sum(&[sizing::product(&[per_layer, config.num_hidden_layers])?, fc])?;
         let weights = sizing::sum(&[weights, weights / 10])?;
 
@@ -115,10 +120,40 @@ impl DFlashMemoryReservation {
         // DSpark Markov head: weights (2 × vocab × rank) + sample scratch (the
         // per-step bias is the dominant term). Zero for plain DFlash drafters.
         let markov = MarkovHead::reservation_bytes(config, max_decode_batch_size)?;
+        let selector = match &config.proposal {
+            DFlashProposal::TopKSelector { rank, .. } => {
+                // Selector weights and persistent launch scratch.
+                let weights = sizing::product(&[
+                    BF16,
+                    sizing::sum(&[
+                        sizing::product(&[*rank, hidden])?,
+                        sizing::product(&[2, config.draft_vocab_size, *rank])?,
+                    ])?,
+                ])?;
+                sizing::sum(&[
+                    weights,
+                    SelectorScratch::bytes(config, max_decode_batch_size)?,
+                ])?
+            }
+            _ => 0,
+        };
+        let native_head = match config.head_source {
+            DFlashHeadSource::DraftOutput => {
+                sizing::product(&[BF16, config.draft_vocab_size, hidden])?
+            }
+            DFlashHeadSource::Target => 0,
+        };
 
         Ok(Self {
             kv_bytes_per_token,
-            fixed_bytes: sizing::sum(&[weights, scratch_total, block_headroom, markov])?,
+            fixed_bytes: sizing::sum(&[
+                weights,
+                scratch_total,
+                block_headroom,
+                markov,
+                selector,
+                native_head,
+            ])?,
             block_size: config.block_size,
             uses_markov_head: config.uses_markov_head(),
         })
