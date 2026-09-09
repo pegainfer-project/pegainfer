@@ -76,6 +76,7 @@ use crate::tp_executor::DropExpectation;
 use crate::tp_executor::Qwen35TpExecutor;
 use crate::tp_executor::TpDecodeStepItem;
 use crate::tp_executor::TpPrefillChunkItem;
+use crate::tp_executor::TpSlotCompaction;
 use crate::tp_executor::TpUnifiedPlan;
 use crate::weights::Qwen35Model;
 
@@ -116,6 +117,9 @@ enum ActiveBackendState {
     },
     Tp {
         request_id: RequestId,
+        /// Dense decode slot (`active` position). Graph-mode workers assert
+        /// `slot_idx == row` on every decode command; eager workers ignore it.
+        slot_idx: usize,
     },
 }
 
@@ -425,13 +429,19 @@ pub(crate) fn start_tp_with_capacity(
     device_ordinals: &[usize],
     max_batch: usize,
     max_prefill_tokens: usize,
+    enable_cuda_graph: bool,
 ) -> Result<SchedulerHandle> {
     assert!(
         max_prefill_tokens > 0,
         "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
     );
-    let backend =
-        TpSchedulerBackend::new(model_path, device_ordinals, max_batch, max_prefill_tokens)?;
+    let backend = TpSchedulerBackend::new(
+        model_path,
+        device_ordinals,
+        max_batch,
+        max_prefill_tokens,
+        enable_cuda_graph,
+    )?;
     let servable = servable_len(
         backend.max_position_embeddings(),
         backend.capacity_pages_for_requests(),
@@ -1492,15 +1502,20 @@ impl DecodeDispatchBackend for SchedulerBackend {
     ) -> ActiveRequest35 {
         match self {
             SchedulerBackend::Single(backend) => compact_single_slot(backend, active, idx),
-            SchedulerBackend::Tp(_) => active.swap_remove(idx),
+            SchedulerBackend::Tp(backend) => backend.take_active_request(active, idx),
         }
     }
 
     fn drop_active_state(&mut self, state: &ActiveBackendState) -> Result<()> {
         match (self, state) {
             (SchedulerBackend::Single(_), ActiveBackendState::Single { .. }) => Ok(()),
-            (SchedulerBackend::Tp(backend), ActiveBackendState::Tp { request_id }) => {
-                backend.drop_request(*request_id, DropExpectation::MustExist)
+            (SchedulerBackend::Tp(backend), ActiveBackendState::Tp { request_id, .. }) => {
+                let compaction = backend.pending_compaction.take();
+                backend.executor.drop_request_with_compaction(
+                    *request_id,
+                    DropExpectation::MustExist,
+                    compaction,
+                )
             }
             _ => anyhow::bail!("mismatched Qwen3.5 scheduler backend state during retirement"),
         }
@@ -1855,19 +1870,16 @@ impl PrefillPromoteBackend for SchedulerBackend {
         state: PrefillBackendState,
     ) -> ActiveBackendState {
         match (self, state) {
-            (SchedulerBackend::Single(single), PrefillBackendState::Single { kv, rec }) => {
-                let slot_idx = slot_for_new_request(active_len, single.max_batch())
-                    .expect("admission must reserve a graph slot");
-                single
-                    .copy_recurrent_to_slot(&rec, slot_idx)
-                    .expect("copy recurrent state to slot failed");
-                ActiveBackendState::Single {
-                    kv,
-                    graph_slot_idx: slot_idx,
-                }
+            (SchedulerBackend::Single(single), state @ PrefillBackendState::Single { .. }) => {
+                single.promote_prefill_state(active_len, state)
             }
-            (SchedulerBackend::Tp(_), PrefillBackendState::Tp { request_id }) => {
-                ActiveBackendState::Tp { request_id }
+            (SchedulerBackend::Tp(backend), PrefillBackendState::Tp { request_id }) => {
+                let slot_idx = slot_for_new_request(active_len, backend.max_batch())
+                    .expect("admission must reserve a TP decode slot");
+                ActiveBackendState::Tp {
+                    request_id,
+                    slot_idx,
+                }
             }
             _ => panic!("mismatched Qwen3.5 scheduler backend state during promotion"),
         }

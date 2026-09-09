@@ -7,14 +7,22 @@
 > per-stream cuBLAS route. The original HTTP table below predates that cap and
 > used the server's implicit Qwen3.5 max-batch default, so treat it as pre-cap
 > evidence until the HTTP cells are re-run with an explicit safe max batch.
+> The `auto` scheduler policy may now be combined with `stream` (the #715
+> startup rejection is retired): `auto` shapes the per-step prefill budget,
+> `stream` moves the chunk off the decode step. On A100-40GB (`70a600b7` +
+> this change, vLLM 0.27.0 baseline), the combination dominates every
+> single-lever config: 1024/256 c8 ITL p99 `65.5 → 34.2 ms`, c16 p99
+> `81.4 → 36.5 ms` (vLLM `83.3`), QPS16 TPOT `36.7 → 20.8 ms` (vLLM `23.6`)
+> and QPS16 ITL p99 `101 → 42 ms` (vLLM `93.4`); the trade is open-loop TTFT
+> (QPS16 `867 → 1828 ms`, vLLM `218`) and −15% QPS16 output throughput.
 >
-> **Last touched:** 2026-08
+> **Last touched:** 2026-09
 
 ## Preparation
 
 - **Read**:
   - `docs/index.md` - routes Qwen3.5 scheduler, accuracy, mixed-load, and profiling evidence.
-  - `docs/models/qwen35/adaptive-scheduler-policy.md` - `off` stays the default; `auto` is a separate opt-in policy and cannot be combined with overlap yet.
+  - `docs/models/qwen35/adaptive-scheduler-policy.md` - `off` stays the default; `auto` is a separate opt-in policy and may now be combined with `stream`.
   - `docs/models/qwen35/mixed-load-itl-470.md` - valid mixed load needs spare admission capacity and an observed prefill/decode intersection.
   - `docs/models/qwen35/accuracy.md` - `hf_golden_gate` is the numerical oracle; generated-text hashes are sanity evidence.
   - `docs/playbooks/bench-vs-vllm.md` and `docs/playbooks/profiling-guide.md` - bind A/B numbers and profiler claims to a fixed environment and raw artifacts.
@@ -52,7 +60,6 @@
 Unsupported combinations fail before model loading:
 
 - Qwen3.5 TP plus overlap;
-- `--qwen35-scheduler-policy auto --decode-overlap stream`;
 - Qwen3.5 `--decode-overlap green-ctx`;
 - Qwen3.5 `--decode-overlap stream` with `--max-batch > 32`.
 

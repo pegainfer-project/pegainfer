@@ -29,7 +29,11 @@ scheduler/CUDA Graph gates. Candidate entries require the expected artifact
 SHA and check the loaded model; HF gates require a resolved model revision.
 This acceptance setup stays in private test modules.
 
-The candidate reduces prefill scratch requirements. Same-context HTTP
+The short HF gate has exposed a configuration-dependent candidate regression
+in padded decode. Passing retries do not establish numerical stability;
+the cause and a production fix remain unconfirmed.
+
+The candidate reduces prefill scratch requirements. Retained same-context HTTP
 comparisons against seven-stage Triton, using synthetic token-ID prompts
 with Shared-SM enabled, show modest throughput gains with workload-dependent
 tail-latency regressions. These results do not establish natural-language

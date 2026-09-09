@@ -34,15 +34,25 @@ pub(super) fn tp_prefill_items(chunk: &ScheduledChunk) -> Result<Vec<TpPrefillCh
 pub(super) fn tp_decode_items(active: &[ActiveRequest35]) -> Result<Vec<TpDecodeStepItem>> {
     active
         .iter()
-        .map(|req| {
-            let ActiveBackendState::Tp { request_id } = &req.backend_state else {
+        .enumerate()
+        .map(|(row, req)| {
+            let ActiveBackendState::Tp {
+                request_id,
+                slot_idx,
+            } = &req.backend_state
+            else {
                 anyhow::bail!("TP decode received single-GPU active state");
             };
-            Ok(TpDecodeStepItem::new(
+            debug_assert_eq!(
+                *slot_idx, row,
+                "TP decode slots must stay dense in active order"
+            );
+            Ok(TpDecodeStepItem::new_with_slot(
                 *request_id,
                 req.last_token,
                 req.logprobs,
                 req.params,
+                *slot_idx,
             ))
         })
         .collect()
@@ -120,7 +130,7 @@ pub(super) fn align_decode_results(
     let expected: Vec<RequestId> = active
         .iter()
         .map(|active_req| {
-            let ActiveBackendState::Tp { request_id } = active_req.backend_state else {
+            let ActiveBackendState::Tp { request_id, .. } = active_req.backend_state else {
                 anyhow::bail!("align_decode_results requires TP active state");
             };
             Ok(request_id)

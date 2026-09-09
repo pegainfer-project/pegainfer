@@ -1,8 +1,8 @@
 # Numerical correctness: the logits golden gate
 
-**TL;DR**: How to guard that a model's logits stay correct across prompts, hardware, and batch size — *without* binding to one GPU's exact bits. The pattern: store a reference (HuggingFace bf16) of top-K logprobs for fixed teacher-forced sequences, replay them through pegainfer, and assert (a) a structural *regret* check on the argmax and (b) the **mean** and **p99** of the per-token logprob delta stay at the bf16 noise floor. NOT exact text, NOT a hash, NOT bit-identical-across-batch, NOT the absolute max. Qwen3-4B is the reference implementation (`pegainfer-qwen3/tests/hf_golden_gate.rs`, see `models/qwen3/accuracy-gate.md`); Qwen3.5-4B applies the same method with an HF `past_key_values` oracle and graph-only replay (`pegainfer-qwen35/src/executor/hf_golden_gate.rs`, see `models/qwen35/accuracy.md`).
+**TL;DR**: How to guard that a model's logits stay correct across prompts, hardware, and batch size — *without* binding to one GPU's exact bits. The pattern: store a reference (HuggingFace bf16) of top-K logprobs for fixed teacher-forced sequences, replay them through pegainfer, and assert (a) a structural *regret* check on the argmax and (b) the **mean** and **p99** of the per-token logprob delta stay at the bf16 noise floor. NOT exact text, NOT a hash, NOT bit-identical-across-batch, NOT the absolute max. Qwen3-4B is the reference implementation (`pegainfer-qwen3/tests/hf_golden_gate.rs`, see `models/qwen3/accuracy-gate.md`); Qwen3.5-4B applies the same method with an HF `past_key_values` oracle and single-GPU graph plus TP eager/graph replay (`pegainfer-qwen35/src/executor/hf_golden_gate.rs`, see `models/qwen35/accuracy.md`).
 
-Last touched: 2026-05
+Last touched: 2026-09
 
 ## The invariant we actually protect
 
@@ -66,4 +66,4 @@ The single worst token is the **same** one across bs=1 / eager-9 / graph-9 — a
 2. **Gate** (`tests/hf_golden_gate.rs`) — load the golden, teacher-force the same sequences, apply the regret + mean + p99 guards, replay the paths that model line actually owns: bs=1, batched eager when it exists, graph-padded bucket straddles, and any model-local state handoff surface such as Qwen3.5 slot compaction.
 3. **Calibrate** — measure the floor, set tolerances as a small recorded multiple, write them down.
 
-Qwen3-4B is the reference implementation. Qwen3.5 currently has no eager batched decode path, so its instance covers sequential graph replay, bucket-straddling batched graph replay, and slot-compaction replay.
+Qwen3-4B is the reference implementation. Qwen3.5 single-GPU coverage uses sequential graph replay, bucket-straddling batched graph replay, and slot-compaction replay; its TP gates cover eager and graph replay.

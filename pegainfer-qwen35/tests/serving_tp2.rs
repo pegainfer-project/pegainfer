@@ -1,5 +1,4 @@
 use std::net::TcpListener;
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -51,7 +50,10 @@ async fn qwen35_tp2_serves_openai_completions_over_http() -> Result<()> {
         return Ok(());
     };
     let frontend_model_path = PathBuf::from(frontend_model_path);
-    let invalid_graph_model_path = engine_model_path.clone();
+    // P2c graph acceptance smoke: CUDA Graph requested at TP2. Models with a
+    // compiled TP-local decode GQA group (4B/9B) replay pre-captured decode
+    // graphs; uncompiled groups (27B group 6) stay on the batched eager path
+    // under the same serving flow.
     let server = spawn_ready_server(engine_model_path, frontend_model_path, 1).await?;
     let client = test_client()?;
 
@@ -59,11 +61,6 @@ async fn qwen35_tp2_serves_openai_completions_over_http() -> Result<()> {
     assert_non_streaming_completion(&client, &server.base_url).await?;
     assert_streaming_completion(&client, &server.base_url).await?;
     assert_concurrent_completions(&client, &server.base_url).await?;
-    assert_invalid_cuda_graph_tp_startup_fails(
-        invalid_graph_model_path
-            .to_str()
-            .context("Qwen3.5 engine fixture path is not valid UTF-8")?,
-    )?;
 
     server.shutdown().await
 }
@@ -78,7 +75,7 @@ async fn spawn_ready_server(
         pegainfer_qwen35::start_engine_with_capacity(
             &engine_model_path,
             EngineLoadOptions {
-                enable_cuda_graph: false,
+                enable_cuda_graph: true,
                 device_ordinals,
                 seed: 42,
                 ..EngineLoadOptions::default()
@@ -196,27 +193,6 @@ async fn assert_concurrent_completions(client: &Client, base_url: &str) -> Resul
     assert_usage(&first, 3)?;
     assert_usage(&second, 3)?;
     assert_logprobs(&second)?;
-    Ok(())
-}
-
-fn assert_invalid_cuda_graph_tp_startup_fails(model_path: &str) -> Result<()> {
-    let Err(error) = pegainfer_qwen35::start_engine_with_capacity(
-        Path::new(model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: common::tp2_device_ordinals(),
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        8,
-        1,
-    ) else {
-        bail!("TP2 + CUDA Graph must fail before serving requests");
-    };
-    let message = error.to_string();
-    if !message.contains("eager execution only") {
-        bail!("unexpected TP2 + CUDA Graph startup error: {message}");
-    }
     Ok(())
 }
 

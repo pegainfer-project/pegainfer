@@ -123,6 +123,9 @@ impl std::fmt::Display for Qwen35GdnBackend {
     }
 }
 
+/// TP decode runs CUDA Graphs when `cuda_graph` is set AND the rank-local
+/// decode GQA group has a compiled kernel (`tp-design.md` P2c gate); otherwise
+/// TP keeps the batched eager path.
 pub fn start_engine(
     model_path: &Path,
     options: EngineLoadOptions,
@@ -144,7 +147,8 @@ pub struct Qwen35LaunchOptions {
     device_ordinal: usize,
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
     tp_size: usize,
-    /// TP Phase 1 supports eager-only multi-GPU execution.
+    /// TP decode captures CUDA Graphs when the rank-local decode GQA group has
+    /// a compiled kernel; uncompiled groups (27B) stay on the eager path.
     cuda_graph: bool,
     max_batch: usize,
     max_prefill_tokens: usize,
@@ -257,11 +261,6 @@ fn start_engine_with_backend(
         seed,
         ..
     } = options;
-    anyhow::ensure!(
-        scheduler_policy == Qwen35SchedulerPolicy::Off
-            || decode_overlap == Qwen35DecodeOverlap::Off,
-        "Qwen3.5 --decode-overlap=stream requires --qwen35-scheduler-policy=off"
-    );
     if decode_overlap == Qwen35DecodeOverlap::SharedSm {
         anyhow::ensure!(
             max_batch <= MAX_SHARED_SM_DECODE_BATCH,
@@ -282,11 +281,6 @@ fn start_engine_with_backend(
                 "Qwen3.5 TP uses the fixed off scheduler policy; --qwen35-scheduler-policy=auto is single-GPU only"
             ));
         }
-        if enable_cuda_graph {
-            return Err(anyhow!(
-                "Qwen3.5 TP Phase 1 supports eager execution only; disable CUDA Graph"
-            ));
-        }
         let model_path = model_path
             .to_str()
             .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
@@ -296,6 +290,7 @@ fn start_engine_with_backend(
             &device_ordinals,
             max_batch,
             max_prefill_tokens,
+            enable_cuda_graph,
         );
     }
 
@@ -415,29 +410,6 @@ mod tests {
         .to_string();
 
         assert!(err.contains("single GPU"));
-    }
-
-    #[test]
-    fn auto_policy_rejects_decode_overlap_before_loading_model() {
-        let err = start_engine_with_capacity_policy_and_overlap(
-            Path::new("unused-model-path"),
-            EngineLoadOptions {
-                enable_cuda_graph: true,
-                device_ordinals: vec![0],
-                parallel_config: None,
-                ep_backend: EpBackend::Nccl,
-                seed: 42,
-            },
-            1,
-            1,
-            Qwen35SchedulerPolicy::Auto,
-            Qwen35DecodeOverlap::SharedSm,
-        )
-        .err()
-        .expect("decode-overlap validation should reject auto policy")
-        .to_string();
-
-        assert!(err.contains("scheduler-policy=off"));
     }
 
     #[test]

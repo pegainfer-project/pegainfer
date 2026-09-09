@@ -141,14 +141,6 @@ impl Config35 {
             .contains(&(self.num_attention_heads / self.num_key_value_heads))
     }
 
-    /// QKV projection output dimension for linear attention.
-    pub(crate) fn linear_attn_qkv_dim(&self) -> usize {
-        let q_dim = self.linear_num_key_heads * self.linear_key_head_dim;
-        let k_dim = q_dim;
-        let v_dim = self.linear_num_value_heads * self.linear_value_head_dim;
-        q_dim + k_dim + v_dim
-    }
-
     /// Z projection output dimension for linear attention.
     pub(crate) fn linear_attn_z_dim(&self) -> usize {
         self.linear_num_value_heads * self.linear_value_head_dim

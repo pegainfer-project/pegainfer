@@ -51,6 +51,7 @@ impl GdnAcceptance {
         model_path: &str,
         max_batch: usize,
         max_prefill_tokens: usize,
+        policy: Qwen35SchedulerPolicy,
         overlap: Qwen35DecodeOverlap,
     ) -> Result<Qwen35Model> {
         let backend = match self {
@@ -60,6 +61,10 @@ impl GdnAcceptance {
         let overlap = match overlap {
             Qwen35DecodeOverlap::Off => "off",
             Qwen35DecodeOverlap::SharedSm => "stream",
+        };
+        let scheduler_policy = match policy {
+            Qwen35SchedulerPolicy::Off => "off",
+            Qwen35SchedulerPolicy::Auto => "auto",
         };
         let max_batch = max_batch.to_string();
         let max_prefill_tokens = max_prefill_tokens.to_string();
@@ -77,6 +82,8 @@ impl GdnAcceptance {
                 overlap,
                 "--qwen35-gdn-backend",
                 backend,
+                "--qwen35-scheduler-policy",
+                scheduler_policy,
             ],
         )?;
         let path = std::path::Path::new(model_path);
@@ -124,16 +131,17 @@ impl GdnAcceptance {
         model_path: &str,
         max_batch: usize,
         max_prefill_tokens: usize,
+        policy: Qwen35SchedulerPolicy,
         overlap: Qwen35DecodeOverlap,
     ) -> Result<EngineHandle> {
         // The identity-checked model is the one moved into the real scheduler.
-        let model = self.load_model(model_path, max_batch, max_prefill_tokens, overlap)?;
+        let model = self.load_model(model_path, max_batch, max_prefill_tokens, policy, overlap)?;
         crate::scheduler::start_with_capacity_and_policy(
             model,
             42,
             max_batch,
             max_prefill_tokens,
-            Qwen35SchedulerPolicy::Off,
+            policy,
             overlap,
         )
     }

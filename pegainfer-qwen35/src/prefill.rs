@@ -179,7 +179,10 @@ impl Qwen35Model {
         // `kv_state` untouched and the request can be rejected cleanly.
         let mut gdn_scratch = match &self.flashinfer_gdn {
             None => GdnPrefillChunkScratch::Triton(Box::new(GdrChunkwiseScratch35::new(
-                &self.ctx, c, seq_len,
+                &self.ctx,
+                c,
+                self.geometry,
+                seq_len,
             )?)),
             Some(backend) => GdnPrefillChunkScratch::FlashInfer(Box::new(
                 FlashInferGdnChunkResources::new(&self.ctx, backend, seq_len)?,
@@ -254,7 +257,7 @@ impl Qwen35Model {
         let geom = self.geometry;
         let attn_out_dim = match &layer.attn {
             LayerKind::FullAttention(_) => geom.local_full_attn_q_dim(),
-            LayerKind::LinearAttention(_) => c.linear_attn_z_dim(),
+            LayerKind::LinearAttention(_) => geom.local_linear_z_dim(),
         };
 
         // Batch project, then per-token attention/recurrent
@@ -459,6 +462,7 @@ impl Qwen35Model {
         seq_len: usize,
     ) -> Result<HiddenStates> {
         let c = &self.config;
+        let geom = self.geometry;
 
         // Batch projections
         let qkv_batch = ops::gemm(&self.ctx, &attn.in_proj_qkv, normed_batch)?;
@@ -466,8 +470,8 @@ impl Qwen35Model {
         let b_batch = ops::gemm(&self.ctx, &attn.in_proj_b, normed_batch)?;
         let a_batch = ops::gemm(&self.ctx, &attn.in_proj_a, normed_batch)?;
 
-        let qkv_dim = c.linear_attn_qkv_dim();
-        let z_dim = c.linear_attn_z_dim();
+        let qkv_dim = geom.local_linear_qkv_dim();
+        let z_dim = geom.local_linear_z_dim();
         let layer_state = &mut recurrent.layers[*linear_idx];
 
         let mut qkv_conv_batch = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;
@@ -496,8 +500,8 @@ impl Qwen35Model {
                         &mut layer_state.state,
                         scratch,
                         &mut triton_output,
-                        c.linear_num_key_heads,
-                        c.linear_num_value_heads,
+                        geom.local_linear_num_key_heads(),
+                        geom.local_linear_num_value_heads(),
                         c.linear_key_head_dim,
                         c.linear_value_head_dim,
                     )?;
@@ -529,7 +533,7 @@ impl Qwen35Model {
                 &attn.norm_weight,
                 &z_batch,
                 &mut normed_out_batch,
-                c.linear_num_value_heads,
+                geom.local_linear_num_value_heads(),
                 c.linear_value_head_dim,
                 c.rms_norm_eps,
             );
@@ -538,7 +542,9 @@ impl Qwen35Model {
         *linear_idx += 1;
 
         // Output projection (batched)
-        ops::gemm(&self.ctx, &attn.out_proj, &normed_out_batch)
+        let mut projected = ops::gemm(&self.ctx, &attn.out_proj, &normed_out_batch)?;
+        self.all_reduce_hidden(&mut projected)?;
+        Ok(projected)
     }
 
     fn batched_rms_norm_offset(

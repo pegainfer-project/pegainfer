@@ -67,9 +67,59 @@ pub(super) fn fatal_cuda_lifecycle(message: &str) -> ! {
     std::process::abort();
 }
 
+/// Borrowed single-GPU prefill inputs, in request order: token windows, KV
+/// states, recurrent states.
+type SinglePrefillViews<'a> = (
+    Vec<&'a [u32]>,
+    &'a mut Vec<KvState>,
+    Vec<&'a mut RecurrentState>,
+);
+
+/// Borrow a single-GPU prefill chunk as the model's prefill inputs.
+fn single_prefill_views(chunk: &mut ScheduledChunk) -> Result<SinglePrefillViews<'_>> {
+    let windows = chunk.windows.iter().map(Vec::as_slice).collect();
+    let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
+        anyhow::bail!("single-GPU prefill received TP chunk state");
+    };
+    Ok((windows, kvs, recs.iter_mut().collect()))
+}
+
+/// Borrow the active decode batch as the model's decode inputs, in slot order:
+/// last tokens and KV states.
+fn single_decode_views(active: &mut [ActiveRequest35]) -> (Vec<u32>, Vec<&mut KvState>) {
+    let tokens = active.iter().map(|r| r.last_token).collect();
+    let kvs = active
+        .iter_mut()
+        .map(|r| match &mut r.backend_state {
+            ActiveBackendState::Single { kv, .. } => kv,
+            ActiveBackendState::Tp { .. } => panic!("single-GPU decode received TP active state"),
+        })
+        .collect();
+    (tokens, kvs)
+}
+
+/// Pair each sampled token with its host logprob row, where one was requested.
+fn attached_logprobs(
+    cpu_logits: Vec<Option<Vec<f32>>>,
+    tokens: &[u32],
+    requested: &[usize],
+) -> Vec<Option<TokenLogprob>> {
+    cpu_logits
+        .into_iter()
+        .zip(tokens)
+        .zip(requested)
+        .map(|((row, &token), &top_k)| {
+            row.and_then(|row| pegainfer_sample::token_logprob_from_row(&row, token, top_k))
+        })
+        .collect()
+}
+
 pub(super) struct TpSchedulerBackend {
-    executor: Qwen35TpExecutor,
+    pub(super) executor: Qwen35TpExecutor,
     next_request_id: u64,
+    /// Slot move derived by the in-flight `take_active_request`; consumed by
+    /// the paired `drop_active_state` so the workers apply the same move.
+    pub(super) pending_compaction: Option<TpSlotCompaction>,
 }
 
 impl SingleGpuBackend {
@@ -132,17 +182,16 @@ impl SingleGpuBackend {
     }
 
     pub(super) fn alloc_recurrent(&self) -> Result<RecurrentState> {
-        RecurrentState::new(self.model.device_ctx(), self.model.config())
+        RecurrentState::new(
+            self.model.device_ctx(),
+            self.model.config(),
+            self.model.geometry,
+        )
     }
 
     pub(super) fn batch_prefill_logits(&self, chunk: &mut ScheduledChunk) -> Result<HiddenStates> {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
-            anyhow::bail!("single-GPU prefill received TP chunk state");
-        };
-        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
-        self.model
-            .batch_prefill_logits(&window_refs, kvs, &mut rec_refs)
+        let (windows, kvs, mut recs) = single_prefill_views(chunk)?;
+        self.model.batch_prefill_logits(&windows, kvs, &mut recs)
     }
 
     pub(super) fn overlap_enabled(&self) -> bool {
@@ -164,16 +213,12 @@ impl SingleGpuBackend {
             .join(&self.model.device_ctx().stream)
             .map_err(|err| anyhow::anyhow!("join Qwen3.5 prefill stream: {err}"))?;
 
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
-            anyhow::bail!("single-GPU async prefill received TP chunk state");
-        };
-        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
+        let (windows, kvs, mut recs) = single_prefill_views(chunk)?;
         let logits = match self.model.batch_prefill_logits_on_stream(
             Arc::clone(&prefill_stream),
-            &window_refs,
+            &windows,
             kvs,
-            &mut rec_refs,
+            &mut recs,
         ) {
             Ok(logits) => logits,
             Err(err) => {
@@ -209,44 +254,26 @@ impl SingleGpuBackend {
         chunk: &mut ScheduledChunk,
         active: &mut [ActiveRequest35],
     ) -> Result<crate::unified_forward::UnifiedStepOutput> {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
-            anyhow::bail!("single-GPU unified step received TP chunk state");
-        };
-        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
-        let decode_tokens: Vec<u32> = active.iter().map(|r| r.last_token).collect();
-        let mut decode_kv_refs: Vec<&mut KvState> = active
-            .iter_mut()
-            .map(|r| match &mut r.backend_state {
-                ActiveBackendState::Single { kv, .. } => kv,
-                ActiveBackendState::Tp { .. } => {
-                    panic!("single-GPU unified step received TP active state")
-                }
-            })
-            .collect();
+        let (windows, kvs, mut recs) = single_prefill_views(chunk)?;
+        let (decode_tokens, mut decode_kvs) = single_decode_views(active);
         self.model.unified_step(
-            &window_refs,
+            &windows,
             kvs,
-            &mut rec_refs,
+            &mut recs,
             &decode_tokens,
-            &mut decode_kv_refs,
+            &mut decode_kvs,
             &mut self.graph_state,
         )
     }
 
     pub(super) fn decode_graph(&mut self, active: &mut [ActiveRequest35]) -> Result<()> {
-        let token_ids: Vec<u32> = active.iter().map(|r| r.last_token).collect();
-        let mut kv_refs: Vec<&mut KvState> = active
-            .iter_mut()
-            .map(|r| match &mut r.backend_state {
-                ActiveBackendState::Single { kv, .. } => kv,
-                ActiveBackendState::Tp { .. } => {
-                    panic!("single-GPU decode received TP active state")
-                }
-            })
-            .collect();
-        self.model
-            .batch_decode_graph(&token_ids, &mut kv_refs, &mut self.graph_state)
+        let (tokens, mut kvs) = single_decode_views(active);
+        self.model.batch_decode_graph(
+            &tokens,
+            &mut kvs,
+            &mut self.graph_state,
+            crate::batch_decode::DecodeGraphUse::Serve,
+        )
     }
 
     pub(super) fn sample_prefill_logits(
@@ -271,19 +298,7 @@ impl SingleGpuBackend {
             sample_seed,
         )?;
 
-        let logprobs = cpu_logits
-            .into_iter()
-            .enumerate()
-            .map(|(i, logits_opt)| {
-                logits_opt.and_then(|logits_f32| {
-                    pegainfer_sample::token_logprob_from_row(
-                        &logits_f32,
-                        tokens[i],
-                        pending[i].logprobs,
-                    )
-                })
-            })
-            .collect();
+        let logprobs = attached_logprobs(cpu_logits, &tokens, &requested_logprobs);
         Ok((tokens, logprobs))
     }
 
@@ -305,19 +320,7 @@ impl SingleGpuBackend {
             sample_seed,
         )?;
 
-        let logprobs = cpu_logits
-            .into_iter()
-            .enumerate()
-            .map(|(i, logits_opt)| {
-                logits_opt.and_then(|logits_f32| {
-                    pegainfer_sample::token_logprob_from_row(
-                        &logits_f32,
-                        tokens[i],
-                        active[i].logprobs,
-                    )
-                })
-            })
-            .collect();
+        let logprobs = attached_logprobs(cpu_logits, &tokens, &requested_logprobs);
         Ok((tokens, logprobs))
     }
 
@@ -390,10 +393,11 @@ impl TpSchedulerBackend {
         device_ordinals: &[usize],
         max_batch: usize,
         max_prefill_tokens: usize,
+        enable_cuda_graph: bool,
     ) -> Result<Self> {
         let executor = Qwen35TpExecutor::from_runtime_with_limits(
             model_path,
-            false,
+            enable_cuda_graph,
             device_ordinals,
             max_batch,
             max_prefill_tokens,
@@ -401,6 +405,7 @@ impl TpSchedulerBackend {
         Ok(Self {
             executor,
             next_request_id: 1,
+            pending_compaction: None,
         })
     }
 
@@ -502,7 +507,40 @@ impl TpSchedulerBackend {
         request_id: RequestId,
         expectation: DropExpectation,
     ) -> Result<()> {
-        self.executor.drop_request(request_id, expectation)
+        self.executor
+            .drop_request_with_compaction(request_id, expectation, None)
+    }
+
+    /// Remove the TP request at `idx` via swap_remove and stash the resulting
+    /// slot compaction for the paired `drop_active_state`. Mirrors
+    /// `compact_single_slot`: after the swap, slots `0..active.len()` stay
+    /// dense because the moved request's slot follows it.
+    pub(super) fn take_active_request(
+        &mut self,
+        active: &mut Vec<ActiveRequest35>,
+        idx: usize,
+    ) -> ActiveRequest35 {
+        let compaction = compaction_after_retire(active.len(), idx);
+        let removed = active.swap_remove(idx);
+
+        self.pending_compaction = compaction.map(|compaction| {
+            let moved = &mut active[idx];
+            let ActiveBackendState::Tp {
+                request_id,
+                slot_idx,
+            } = &mut moved.backend_state
+            else {
+                panic!("TP scheduler received single-GPU active state")
+            };
+            debug_assert_eq!(*slot_idx, compaction.moved_from);
+            *slot_idx = compaction.moved_to;
+            TpSlotCompaction {
+                moved_request_id: *request_id,
+                from: compaction.moved_from,
+                to: compaction.moved_to,
+            }
+        });
+        removed
     }
 }
 

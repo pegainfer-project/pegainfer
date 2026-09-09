@@ -148,13 +148,6 @@ impl ModelLine for Qwen35Line {
                 )));
             }
         }
-        if decode_overlap != Qwen35DecodeOverlap::Off
-            && matches!(cli.qwen35_scheduler_policy, CliQwen35SchedulerPolicy::Auto)
-        {
-            return Err(CliError::rule(
-                "Qwen3.5 --decode-overlap=stream requires --qwen35-scheduler-policy=off",
-            ));
-        }
         if ctx.shared.tp_size > 1 && decode_overlap != Qwen35DecodeOverlap::Off {
             return Err(CliError::rule(
                 "--decode-overlap is single-GPU only; tp_size>1 has no prefill/decode overlap",
@@ -259,8 +252,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_auto_policy_with_overlap() {
-        let error = validate_argv(&[
+    fn accepts_auto_policy_with_overlap() {
+        validate_argv(&[
             "pegainfer",
             "--decode-overlap",
             "stream",
@@ -269,8 +262,7 @@ mod tests {
             "--qwen35-scheduler-policy",
             "auto",
         ])
-        .expect_err("Qwen3.5 should reject auto policy with overlap");
-        assert!(error.to_string().contains("scheduler-policy=off"));
+        .expect("Qwen3.5 should accept the auto policy together with stream overlap");
     }
 
     #[test]

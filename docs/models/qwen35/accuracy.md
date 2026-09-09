@@ -66,7 +66,9 @@ PEGAINFER_CUDA_SM=120 \
 PEGAINFER_TRITON_PYTHON=$TRITON_PYTHON \
 PEGAINFER_TEST_MODEL_PATH=$MODEL_PATH \
 PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
-cargo test --release -p pegainfer-qwen35 --test hf_golden_gate -- --nocapture
+cargo test --release -p pegainfer-qwen35 --features qwen35 --lib \
+  executor::hf_golden_gate::pega_logprobs_match_hf_golden_within_qwen35_tolerance \
+  -- --exact --test-threads=1 --nocapture
 ```
 
 Observed floor from that run:
@@ -103,7 +105,9 @@ PEGAINFER_CUDA_SM=120 \
 PEGAINFER_TRITON_PYTHON=$TRITON_PYTHON \
 PEGAINFER_TEST_MODEL_PATH=$MODEL_PATH \
 PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
-cargo test --release -p pegainfer-qwen35 --test hf_golden_gate -- --nocapture
+cargo test --release -p pegainfer-qwen35 --features qwen35 --lib \
+  executor::hf_golden_gate::pega_logprobs_match_hf_long_golden_within_qwen35_tolerance \
+  -- --exact --test-threads=1 --nocapture
 ```
 
 Observed long-prompt floor from that run:

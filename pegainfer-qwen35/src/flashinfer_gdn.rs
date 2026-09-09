@@ -40,7 +40,7 @@ impl FlashInferGdnChunkResources {
         let hidden = config.hidden_size;
         let full_q = config.num_attention_heads * config.head_dim;
         let full_kv = config.num_key_value_heads * config.head_dim;
-        let linear_qkv = config.linear_attn_qkv_dim();
+        let linear_qkv = (geometry.h_q + geometry.h_k + geometry.h_v) * geometry.head_dim;
         let linear_z = config.linear_attn_z_dim();
         // Both attention paths retain input hidden + normed + projected output.
         let full_attention = 3 * hidden + 4 * full_q + 2 * full_kv;

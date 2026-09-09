@@ -1,8 +1,8 @@
 # Qwen3.5 TP Implementation Record
 
-> **TL;DR:** Qwen3.5 TP Phase 1 and P2A are complete: TP2 now supports start-gated eager unified prefill+decode with strict ID-aligned artifacts, fail-closed lifecycle recovery, and pre-load CUDA ordinal validation; P2B GDR state sharding is next.
+> **TL;DR:** Qwen3.5 TP is complete through Phase 2b plus batched eager TP decode and P2c CUDA Graph under TP: TP2 supports start-gated eager unified prefill+decode with strict ID-aligned artifacts, fail-closed lifecycle recovery, and pre-load CUDA ordinal validation (#870); linear-attention/GDR state is sharded per rank (27B TP2 fits on 2×48 GB); TP decode rows run as one batched forward per step; and 4B/9B TP2 decode replays pre-captured CUDA Graphs (27B group-6 stays eager by gate). Remaining TP work: group-6 batch-decode kernels for 27B graphs, perf gates.
 >
-> **Last touched:** 2026-08
+> **Last touched:** 2026-09
 
 ## Scope
 
@@ -139,7 +139,7 @@ Stable test knobs:
 
 ## Phase 2 Progress
 
-Phase 2 is locked in `docs/models/qwen35/tp-design.md` as two separate implementation series: P2a is eager mixed unified execution on the replicated Phase 1 GDR path; P2b shards the head-indexed linear-attention/GDR weight and state surface. P2a protocol/lifecycle gates are complete, so P2b can now change loader, kernel, and state shapes while preserving those contracts.
+Phase 2 is locked in `docs/models/qwen35/tp-design.md` as two separate implementation series: P2a is eager mixed unified execution on the replicated Phase 1 GDR path; P2b shards the head-indexed linear-attention/GDR weight and state surface. P2a protocol/lifecycle gates are complete, and P2b's core sharding has landed on top of them without weakening the P2A lifecycle and ID contracts (see below). Batched eager TP decode (#1004) has landed on top of P2b (see below); the remaining Phase 2 work is TP CUDA Graph (#1005).
 
 ### P2a: TP mixed-step unified execution
 
@@ -445,24 +445,155 @@ Why this should be separated from GDR sharding:
 
 ### P2b: sharded linear-attention/GDR state
 
-Shard the Qwen3.5 linear-attention/GDR path after P2a establishes the mixed-step and state-lifecycle contract.
+Landed as #946 split 1/4 (#1003), after P2a had established the mixed-step and state-lifecycle contract. Each TP rank now owns a rank-local slice of the linear-attention/GDR surface instead of replicating it:
 
-Expected work:
+- `LocalGeometry` computes rank-local linear dims (`local_linear_num_key_heads`, `local_linear_num_value_heads`, `local_linear_v_dim`, `local_linear_qkv_dim`, `local_linear_z_dim`) and fails closed with `ConfigError::TpIndivisible` when `linear_num_key_heads` does not divide by `world_size`; there is no silent replication fallback. Value-head divisibility needs no second guard: `Config35` already validates `linear_num_value_heads % linear_num_key_heads == 0`.
+- Weight loading shards the head-indexed tensors: the fused QKV projection and the depthwise conv1d are stitched head-locally per segment (`load_linear_in_proj_qkv_shard` / `load_linear_conv1d_shard`; Q/K segments follow key-head ranges, V/conv follow value-head ranges), z/beta/alpha are row shards, `dt_bias`/`A_log` are 1-D shards (A_log stays f32), and linear `out_proj` is column sharded as a row-parallel `[hidden, local_z]` matrix.
+- `RecurrentState` (`[local_value_heads, K, V]` f32), conv state (`[local_qkv x (kernel_dim - 1)]` bf16), and all prefill/decode scratch (`GdrChunkwiseScratch35`, prefill/decode buffers) size themselves from the local geometry; worker capacity math uses the same locals.
+- The hidden-residual all-reduce happens once after the local linear-attention `out_proj` (`all_reduce_hidden`), on prefill and decode alike; the column-sharded `out_proj` is what makes that reduction point sufficient.
+- Full-attention decode-group supportability uses the config-level GQA group (`Config35::decode_group_is_compiled`): head sharding leaves the q-per-kv group size unchanged, so the predicate is identical on every rank and the reroute adds no collectives. The 27B case leaves `q/kv = 6`, which has no compiled FlashInfer batch-decode kernel, so those layers reroute decode through the eager/paged fallback.
+- TP1 contract is unchanged: at `world_size == 1` every local dim equals the global dim, so kernels, buffers, and fixture behavior are byte-identical to pre-P2b.
 
-- shard linear-attention projection weights
-- shard conv state and GDR recurrent state by local value/key heads
-- adapt or regenerate GDR kernels for local state shapes
-- keep recurrent/conv state rank-local and request-local
-- all-reduce only after local linear-attention `out_proj`
-- report matched Phase 1 TP2 versus P2b TP2 HBM/latency/throughput data before making a performance claim
-
-Non-negotiable invariant:
+Non-negotiable invariant (still held):
 
 - Never all-reduce GDR recurrent state or conv state. These states are owned by rank-local request state.
 
+Acceptance on the #1003 branch before its final rebase (27B TP2 on 2x RTX 4090 48GB, sm_89; fixture-pinned 27B revision `fc05daec`):
+
+- TP2 short HF logits gate passes:
+  - sequential eager: `108` positions, mean `0.0210`, p99 `0.0749`, max `0.1240`
+  - batched eager: `72` positions, mean `0.0201`, p99 `0.0749`, max `0.0803`; the batched leg includes drop -> re-prefill slot cycles
+- TP2 long HF logits gate passes with prompts `4097` and `8192`: sequential eager, `18` positions, mean `0.0177`, p99 `0.0660`
+- TP2 scheduler E2E and TP2 HTTP serving gate pass.
+- Peak per-rank HBM is `35,988` / `36,822` MiB of `49,140` MiB: 27B TP2 now fits the 2x48GB pair that Phase-1 replicated state OOMed, and memory fully releases between test processes.
+
+Not in this step: batching the TP decode loop across rows, TP CUDA Graph capture, and the matched Phase-1-vs-P2b HBM/latency/throughput A/B promised in #1001; no performance claim is made until that rerun lands on the merged stack.
+
+### Batched eager TP decode (#1004)
+
+Landed as #946 split 2/4 (#1004). #870's `execute_decode_rows` looped per
+request with bs=1 forwards and capacity-1 per-request pointer tables.
+`run_decode_batch` now runs one `batch_decode_eager_logits` over every decode
+row in command order on each rank, then one batched rank-0 `select_batch` with
+per-row fan-out; #870's validation and response contracts are unchanged and
+`TpRequestState.linear_pointer_tables` is gone. Seeded rows keep per-row
+semantics (`select_batch` isolates each seeded row into its own philox call
+keyed on request seed and step), so seeded output is independent of batch
+composition; unseeded rows decorrelate through the per-step command seed, as on
+the single-GPU batched path.
+
+GDR pointer tables honour `LinearStatePointerTables`' build-once contract: each
+worker allocates one table set at `max_batch` capacity (`with_capacity`) and
+refills rows `0..bs` from the live decode rows every step
+(`refill_from_recurrent_refs`: H2D copies into the existing allocations).
+Refilling every step means swap_remove retirement between steps can never leave
+a stale row addressed; allocating once removes the `2 x linear_layers` device
+allocations per token per rank that a per-step `from_recurrent_refs` cost
+(review follow-up on #1004). The 27B TP2 group-6 full-attention layers still
+route decode through the one-token paged plan.
+
+Acceptance (27B TP2 on 2x RTX 4090 48GB, sm_89; revision `fc05daec`):
+
+- TP2 short HF logits gate passes: sequential eager `108` positions, mean `0.0210`, p99 `0.0749`, max `0.1240` (identical to the P2b acceptance run above); batched eager `72` positions, mean `0.0199`, p99 `0.0692`, max `0.0887`, the batched leg including drop -> re-prefill slot cycles.
+- TP2 long HF logits gate passes with prompts `4097` and `8192`: sequential eager `18` positions, mean `0.0177`, p99 `0.0660`, max `0.0660`.
+- Both run with the persistent, per-step refilled pointer tables (`2 passed`, 65 s).
+
+Not in this step: TP CUDA Graph capture (#1005) and the same-context
+per-request-vs-batched throughput A/B tracked in #1001; no performance claim is
+made before that rerun lands.
+
+## P2c — CUDA Graph under TP (2026-08-20)
+
+Implemented the locked P2c design from `tp-design.md`: decode CUDA Graphs
+under TP, gated on the TP-local decode GQA group.
+
+**Gate.** Graph mode is active iff `enable_cuda_graph &&
+config.decode_group_is_compiled()`. The group ratio is TP-invariant,
+so 27B TP2 (group 6, not in `SUPPORTED_GQA_GROUP_SIZES`) keeps the batched
+eager path byte-for-byte while 4B/9B TP2 capture. The old fail-closed
+rejections (`config.rs` `validate_for`, `tp_executor.rs` startup ensure,
+`lib.rs` TP branch) were replaced by the gate; startup logs once when graph
+was requested but the group gate keeps decode eager.
+
+**State model.** Scheduler owns slots, workers execute:
+
+- `ActiveBackendState::Tp` gains `slot_idx` (dense `active` position, assigned
+  at promote via `slot_for_new_request`, updated on compaction);
+  `tp_decode_items` emits rows with explicit `slot_idx` and workers assert
+  `slot_idx == row`.
+- Graph workers hold a `BatchDecodeGraphState` at
+  `bucket_for(effective_max_batch)` fixed-address slots plus a
+  `slot_map: Vec<Option<RequestId>>`. On a request's first decode row the
+  worker D2D-copies its prefill recurrent state into the slot
+  (`copy_state_to_slot`) and drops the per-request allocation.
+- `DropRequest` carries `compaction: Option<TpSlotCompaction>`; the worker
+  validates occupancy against `slot_map` (`slot_compact`), applies the D2D
+  move (`BatchDecodeGraphState::move_slot_within`), and poisons on mismatch.
+  Requests retired between promotion and their first decode row legitimately
+  have no materialized slot; `slot_compact` tolerates exactly that case and
+  skips the GPU move.
+- Convenience `execute_prefill`/`execute_decode`/`drop_request` (model-local
+  tests) keep a Mutex-guarded slot tracker mirroring the single-GPU
+  `Qwen35Executor`; scheduler flows pass explicit slots via
+  `execute_decode_items`/`drop_request_with_compaction` and never touch the
+  tracker.
+
+**Capture/replay.** Startup pre-capture sweep ported from qwen3:
+`TpWorkerCommand::Precapture { phase }` over Warmup (new
+`Qwen35Model::warmup_tp_collective` — one all-reduce per bucket message size;
+without it the lazy NCCL connect wedges inside capture), Capture + Launch per
+bucket `[1,2,4,8,16,32,64]` up to `bucket_for(max_batch)` with synthetic rows,
+Finalize asserting all buckets captured. Dedicated 600 s abort watchdog (the
+60 s NCCL startup timeout is too small for the sweep).
+`batch_decode_graph` gained `DecodeGraphUse` (Serve lazy / CaptureOnly /
+Replay); TP serve time is Replay-only. Workers tune decode GEMM algos on the
+worker thread before capture (cuBLASLt plans are thread-local). Graph state
+is declared before `model` in `TpWorkerState` so graphs drop before the NCCL
+comm. Sampling/logprobs stay rank-0 host-side outside the graph. Eager
+workers ignore `slot_idx`/`compaction`, keeping 27B TP2 byte-identical.
+
+**Validation (2× RTX 4090):**
+
+- `cargo check --release -p pegainfer-qwen35 --features qwen35` clean; lib
+  suite 105/105 (new: slot map admit/compact/mismatch CPU tests);
+  `cargo fmt --check` clean.
+- 9B TP2 HF gates (`--test-threads=1`): eager sequential+batched PASS;
+  graph sequential replay (identical fingerprints across reruns),
+  bucket-straddling batched replay (5→bucket 8, 3→bucket 4), and
+  post-compaction replay after a mid-batch drop all within the existing TP2
+  tolerances (worst graph arm: mean 0.0228, p99 0.1002 against MEAN_TOL 0.06
+  / P99_TOL 0.20; eager arm mean 0.0227/0.0230).
+- 9B TP2 scheduler e2e eager + graph variants PASS; 9B TP2 serving smoke now
+  launches with `--cuda-graph true` (graph acceptance replaced the old
+  rejection assertion).
+- 27B TP2 HF short+long and scheduler e2e PASS unchanged — the gate log
+  confirms group 6 keeps decode eager (the graph test variant skips itself
+  via `graph_enabled()`).
+- **Historical, not re-measured on this stack:** 9B TP2 serving benchmark
+  from the pre-rebase #946 branch (2026-08-20; `pegainfer-server --tp-size 2 --port 18093`,
+  vllm-bench `openai` backend, random 128-in/256-out, 64 prompts at
+  concurrency 16, greedy, ignore_eos, seed 42):
+
+  | arm | steady output tok/s | mean TPOT (ms) | total tok/s |
+  |-----|--------------------:|---------------:|------------:|
+  | CUDA Graph on  | 767.15 | 20.04 | 1146.65 |
+  | CUDA Graph off | 705.86 | 21.99 | 1054.56 |
+
+  On that branch graph decode measured +8.7% steady output tok/s (-8.8% TPOT)
+  at 16 concurrent. No performance claim is made for this stack until the
+  same-context A/B is rerun on it (tracked in #1001).
+
+**Test-isolation note:** TP2 GPU tests must run with `--test-threads=1`. Two
+TP executors sharing the GPUs perturb cuBLASLt algorithm selection (workspace
+pressure), which once flipped a sequential-replay fingerprint comparison in
+the *eager* test while the graph test ran concurrently.
+
 ## Follow-Ups
 
-- Design and implement P2B sharded linear-attention/GDR state without weakening the completed P2A lifecycle and ID contracts.
+- P2c CUDA Graph under TP landed for compiled decode GQA groups (4B/9B); 27B
+  TP2 graphs stay gated off until group-6 batch-decode kernels are compiled
+  (`SUPPORTED_GQA_GROUP_SIZES`). The eager path is the 27B fallback and must
+  not regress.
 - Promote any stable contract changes discovered here back into `tp-design.md` through the design-doc branch.
 - Decide whether Qwen3.5 server CLI should accept arbitrary TP device ordinals instead of only `0..tp_size`.
 - Consider lifting the per-device Triton AOT handle lesson into a kernels or runtime subsystem doc if another model hits the same issue.

@@ -137,7 +137,7 @@ fn run_prefill_case(
     split_at: Option<usize>,
 ) -> Result<(pegainfer_core::kv_pool::KvState, RecurrentState, Vec<f32>)> {
     let mut kv = model.alloc_kv();
-    let mut recurrent = RecurrentState::new(model.device_ctx(), model.config())?;
+    let mut recurrent = RecurrentState::new(model.device_ctx(), model.config(), model.geometry)?;
     let hidden = match split_at {
         Some(split) => {
             assert!(split > 0 && split < tokens.len());
@@ -169,7 +169,12 @@ fn first_decode_logits(
     let mut graph = model.create_batch_decode_graph_state_with_capacity(1)?;
     graph.copy_state_to_slot(model.device_ctx(), recurrent, 0)?;
     let mut kv_refs = vec![kv];
-    model.batch_decode_graph(&[token], &mut kv_refs, &mut graph)?;
+    model.batch_decode_graph(
+        &[token],
+        &mut kv_refs,
+        &mut graph,
+        crate::batch_decode::DecodeGraphUse::Serve,
+    )?;
     graph.buffers.logits.to_host(model.device_ctx())
 }
 
@@ -184,6 +189,7 @@ fn flashinfer_gdn_chunk_continuation_and_model_outputs_match() -> Result<()> {
         &model_path,
         1,
         crate::DEFAULT_MAX_PREFILL_TOKENS,
+        crate::Qwen35SchedulerPolicy::Off,
         crate::Qwen35DecodeOverlap::Off,
     )?;
 

@@ -31,6 +31,7 @@ fn start_engine(
             model_path,
             MAX_BATCH,
             max_prefill_tokens,
+            pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
             pegainfer_qwen35::Qwen35DecodeOverlap::Off,
         )
         .expect("failed to start Qwen3.5 engine")

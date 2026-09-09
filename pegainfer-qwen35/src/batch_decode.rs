@@ -26,6 +26,22 @@ use crate::ops;
 
 static LOG_UNCOMPILED_DECODE_ROUTE: std::sync::Once = std::sync::Once::new();
 
+/// How a `batch_decode_graph` call interacts with the per-bucket CUDA graphs.
+///
+/// TP serving never captures lazily: a mid-serving capture on one rank while a
+/// peer replays desyncs the recorded NCCL collectives, so tensor-parallel
+/// decodes are replay-only after the startup pre-capture sweep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DecodeGraphUse {
+    /// Replay if captured, lazily capture otherwise (single-GPU serving).
+    Serve,
+    /// Record + instantiate + upload, no launch (the TP sweep's Capture phase).
+    CaptureOnly,
+    /// Replay only; error if never captured (TP serving, and the TP sweep's
+    /// Launch phase that drains the captured collectives across ranks).
+    Replay,
+}
+
 impl Qwen35Model {
     pub(crate) fn select_tokens_from_logits_varied(
         &self,
@@ -179,6 +195,9 @@ impl Qwen35Model {
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let eps = self.config.rms_norm_eps;
+        let geom = self.geometry;
+        let num_attention_heads = geom.local_num_attention_heads();
+        let num_key_value_heads = geom.local_num_key_value_heads();
 
         ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
         ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
@@ -194,8 +213,8 @@ impl Qwen35Model {
             &self.cos_cache,
             &self.sin_cache,
             &bufs.positions_d,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
+            num_attention_heads,
+            num_key_value_heads,
             self.config.rotary_dim,
             eps,
         );
@@ -211,7 +230,7 @@ impl Qwen35Model {
             plan,
             &bufs.positions_d,
             &mut bufs.attn_out_full,
-            self.config.num_attention_heads,
+            num_attention_heads,
             bs,
         )?;
 
@@ -221,7 +240,7 @@ impl Qwen35Model {
             crate::ffi::attention_gate_batch_hd256_cuda(
                 qf_ptr as *const crate::ffi::Half,
                 out_ptr as *mut crate::ffi::Half,
-                self.config.num_attention_heads as i32,
+                num_attention_heads as i32,
                 bs as i32,
                 self.ctx.stream.cu_stream(),
             );
@@ -288,12 +307,31 @@ impl Qwen35Model {
         let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
         bufs.sync_paged_meta(&self.ctx, &kv_refs, bs)?;
 
+        // When this GQA group has no compiled batch-decode kernel, run full
+        // attention through the paged-prefill kernel with a per-step plan.
+        // Head sharding leaves the q-per-kv group size unchanged, so the
+        // config-level predicate decides the per-rank route identically on
+        // every rank; the reroute adds no collectives.
+        let prefill_attn_plan = if self.config.decode_group_is_compiled() {
+            None
+        } else {
+            let start_positions: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+            Some(self.one_token_paged_plan(
+                &kv_refs,
+                &start_positions,
+                self.geometry.local_num_attention_heads(),
+                self.geometry.local_num_key_value_heads(),
+                "eager decode",
+            )?)
+        };
+
         let kv_buffer = kv_states[0].buffer();
         let layout = *kv_states[0].layout();
         self.batch_decode_kernels_graph(
             kv_buffer,
             &layout,
             bs,
+            prefill_attn_plan.as_ref(),
             &linear_pointer_tables.state_ptrs,
             &linear_pointer_tables.conv_state_ptrs,
             bufs,
@@ -318,6 +356,25 @@ impl Qwen35Model {
         token_ids: &[u32],
         kv_states: &mut [&mut KvState],
         graph_state: &mut BatchDecodeGraphState,
+        graph_use: DecodeGraphUse,
+    ) -> Result<()> {
+        let padded_bs = bucket_for(token_ids.len());
+        self.batch_decode_graph_padded(token_ids, kv_states, graph_state, graph_use, padded_bs)
+    }
+
+    /// `batch_decode_graph` with the bucket chosen by the caller instead of
+    /// derived from `bs`. Rows `bs..padded_bs` are padding either way — they
+    /// ride the pool's reserved padding page and a free recurrent slot — so a
+    /// caller that only needs a *bucket* (the TP pre-capture sweep) can pass
+    /// one real row and still capture or launch the bucket-`padded_bs` graph
+    /// without holding `padded_bs` KV pages.
+    pub(crate) fn batch_decode_graph_padded(
+        &self,
+        token_ids: &[u32],
+        kv_states: &mut [&mut KvState],
+        graph_state: &mut BatchDecodeGraphState,
+        graph_use: DecodeGraphUse,
+        padded_bs: usize,
     ) -> Result<()> {
         let bs = token_ids.len();
         anyhow::ensure!(bs > 0, "batch_decode_graph requires at least one request");
@@ -327,8 +384,16 @@ impl Qwen35Model {
             "batch size {bs} exceeds decode capacity {}",
             graph_state.slot_states.len()
         );
+        anyhow::ensure!(
+            padded_bs >= bs && BATCH_BUCKETS.contains(&padded_bs),
+            "padded batch {padded_bs} is not a decode bucket covering bs={bs}"
+        );
 
         if !self.config.decode_group_is_compiled() {
+            anyhow::ensure!(
+                graph_use == DecodeGraphUse::Serve,
+                "Qwen3.5 batched hybrid eager fallback only supports lazy serve-mode decode, got {graph_use:?}"
+            );
             LOG_UNCOMPILED_DECODE_ROUTE.call_once(|| {
                 let group = self.config.num_attention_heads / self.config.num_key_value_heads;
                 log::info!(
@@ -343,7 +408,6 @@ impl Qwen35Model {
             return self.batch_decode_batched_hybrid(token_ids, kv_states, graph_state);
         }
 
-        let padded_bs = bucket_for(bs);
         graph_state.linear_pointer_tables.validate_for(
             &self.config,
             padded_bs,
@@ -389,16 +453,35 @@ impl Qwen35Model {
         let mut graphs = std::mem::take(&mut graph_state.graphs);
         let linear_state_ptrs = &graph_state.linear_pointer_tables.state_ptrs;
         let linear_conv_state_ptrs = &graph_state.linear_pointer_tables.conv_state_ptrs;
-        let result = graphs[bucket_idx].run_or_capture(&self.ctx, || {
-            self.batch_decode_kernels_graph(
-                kv_buffer,
-                &layout,
-                padded_bs,
-                linear_state_ptrs,
-                linear_conv_state_ptrs,
-                &mut graph_state.buffers,
-            )
-        });
+        let result = match graph_use {
+            DecodeGraphUse::Serve => graphs[bucket_idx].run_or_capture(&self.ctx, || {
+                self.batch_decode_kernels_graph(
+                    kv_buffer,
+                    &layout,
+                    padded_bs,
+                    None,
+                    linear_state_ptrs,
+                    linear_conv_state_ptrs,
+                    &mut graph_state.buffers,
+                )
+            }),
+            DecodeGraphUse::CaptureOnly => graphs[bucket_idx].capture_only(&self.ctx, || {
+                self.batch_decode_kernels_graph(
+                    kv_buffer,
+                    &layout,
+                    padded_bs,
+                    None,
+                    linear_state_ptrs,
+                    linear_conv_state_ptrs,
+                    &mut graph_state.buffers,
+                )
+            }),
+            // Replay is a pure enqueue: every bucket was recorded by the
+            // startup pre-capture sweep, so a missing graph here means the
+            // sweep was skipped or incomplete — fail loudly, never capture
+            // mid-serving (a one-sided capture desyncs TP collectives).
+            DecodeGraphUse::Replay => graphs[bucket_idx].launch_captured(&self.ctx),
+        };
         graph_state.graphs = graphs;
         result
     }
@@ -450,31 +533,14 @@ impl Qwen35Model {
                 )
             })?;
 
-        let page_indices: Vec<Vec<i32>> =
-            kv_states.iter().map(|kv| kv.page_indices_i32()).collect();
-        let last_page_lens: Vec<usize> = kv_states.iter().map(|kv| kv.last_page_len()).collect();
-        let seq_lens = vec![1usize; bs];
-        // cta_tile_q 0 = the kernel's own FA2 derivation; the hd256 FFI takes no override.
-        let plan = ops::PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
-            &self.ctx,
-            &page_indices,
-            &last_page_lens,
+        let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
+        let plan = self.one_token_paged_plan(
+            &kv_refs,
             &start_positions,
-            &seq_lens,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
-            self.config.head_dim,
-            0,
-        )
-        .with_context(|| {
-            format!(
-                "hybrid decode build PrefillPagedPlan bs={bs}, pages={}, heads={}/{}, head_dim={}",
-                page_indices.iter().map(Vec::len).sum::<usize>(),
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                self.config.head_dim
-            )
-        })?;
+            self.geometry.local_num_attention_heads(),
+            self.geometry.local_num_key_value_heads(),
+            "hybrid decode",
+        )?;
 
         let kv_buffer = kv_states[0].buffer();
         let layout = *kv_states[0].layout();
@@ -498,11 +564,48 @@ impl Qwen35Model {
         )
     }
 
+    /// Paged-prefill plan that runs one decode row per request through the
+    /// prefill attention kernel; used when the GQA group has no compiled
+    /// batch-decode kernel. `cta_tile_q` 0 = the kernel's own FA2 derivation;
+    /// the hd256 FFI takes no override.
+    fn one_token_paged_plan(
+        &self,
+        kv_refs: &[&KvState],
+        start_positions: &[usize],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        label: &str,
+    ) -> Result<ops::PrefillPagedPlan> {
+        let bs = kv_refs.len();
+        let page_indices: Vec<Vec<i32>> = kv_refs.iter().map(|kv| kv.page_indices_i32()).collect();
+        let last_page_lens: Vec<usize> = kv_refs.iter().map(|kv| kv.last_page_len()).collect();
+        let seq_lens = vec![1usize; bs];
+        ops::PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+            &self.ctx,
+            &page_indices,
+            &last_page_lens,
+            start_positions,
+            &seq_lens,
+            num_q_heads,
+            num_kv_heads,
+            self.config.head_dim,
+            0,
+        )
+        .with_context(|| {
+            format!(
+                "{label} build PrefillPagedPlan bs={bs}, pages={}, heads={num_q_heads}/{num_kv_heads}, head_dim={}",
+                page_indices.iter().map(Vec::len).sum::<usize>(),
+                self.config.head_dim
+            )
+        })
+    }
+
     fn batch_decode_kernels_graph(
         &self,
         kv_buffer: &cudarc::driver::CudaSlice<half::bf16>,
         layout: &KvLayout,
         padded_bs: usize,
+        prefill_attn_plan: Option<&ops::PrefillPagedPlan>,
         linear_state_ptrs: &[CudaSlice<u64>],
         linear_conv_state_ptrs: &[CudaSlice<u64>],
         bufs: &mut BatchDecodeBuffers35,
@@ -529,9 +632,14 @@ impl Qwen35Model {
 
             match &layer.attn {
                 LayerKind::FullAttention(attn) => {
-                    self.batch_decode_full_attention(
-                        attn, kv_buffer, layout, full_idx, padded_bs, bufs,
-                    )?;
+                    match prefill_attn_plan {
+                        Some(plan) => self.batch_decode_full_attention_via_prefill(
+                            attn, kv_buffer, layout, plan, full_idx, padded_bs, bufs,
+                        )?,
+                        None => self.batch_decode_full_attention(
+                            attn, kv_buffer, layout, full_idx, padded_bs, bufs,
+                        )?,
+                    }
                     full_idx += 1;
                 }
                 LayerKind::LinearAttention(attn) => {
@@ -541,7 +649,7 @@ impl Qwen35Model {
                         &linear_conv_state_ptrs[linear_idx],
                         padded_bs,
                         bufs,
-                    );
+                    )?;
                     linear_idx += 1;
                 }
             }
@@ -646,7 +754,7 @@ impl Qwen35Model {
                         &linear_conv_state_ptrs[linear_idx],
                         bs,
                         bufs,
-                    );
+                    )?;
                     linear_idx += 1;
                 }
             }
@@ -726,7 +834,9 @@ impl Qwen35Model {
         conv_state_ptrs: &CudaSlice<u64>,
         padded_bs: usize,
         bufs: &mut BatchDecodeBuffers35,
-    ) {
+    ) -> Result<()> {
+        let geom = self.geometry;
+
         ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.normed, &mut bufs.qkv);
         ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z);
         ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_proj);
@@ -750,8 +860,8 @@ impl Qwen35Model {
             state_ptrs,
             &mut bufs.gdr_out,
             padded_bs,
-            self.config.linear_num_key_heads,
-            self.config.linear_num_value_heads,
+            geom.local_linear_num_key_heads(),
+            geom.local_linear_num_value_heads(),
             self.config.linear_key_head_dim,
             self.config.linear_value_head_dim,
         );
@@ -762,7 +872,7 @@ impl Qwen35Model {
             &attn.norm_weight,
             &bufs.z,
             &mut bufs.normed_gated,
-            self.config.linear_num_value_heads,
+            geom.local_linear_num_value_heads(),
             self.config.linear_value_head_dim,
             self.config.rms_norm_eps,
         );
@@ -772,5 +882,7 @@ impl Qwen35Model {
             &bufs.normed_gated,
             &mut bufs.attn_results,
         );
+        self.all_reduce_hidden(&mut bufs.attn_results)?;
+        Ok(())
     }
 }

@@ -175,8 +175,8 @@ impl Qwen35Model {
 
         let mut config = Config35::from_file(model_path)?;
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
-        let geometry = LocalGeometry::try_new(&config, tensor_parallel, runtime.enable_cuda_graph)
-            .map_err(anyhow::Error::from)?;
+        let geometry =
+            LocalGeometry::try_new(&config, tensor_parallel).map_err(anyhow::Error::from)?;
         // Resolve and preload exactly once, before measuring free memory or
         // allocating KV. A linked artifact alone never changes the default.
         let flashinfer_gdn = match runtime.gdn_backend {
@@ -333,11 +333,13 @@ impl Qwen35Model {
             ),
             None => super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
                 &config,
+                geometry,
                 max_prefill_len,
             ),
         };
-        let recurrent_reserve =
-            STATES_PER_DECODE_SLOT * max_batch * super::recurrent_state::bytes_per_request(&config);
+        let recurrent_reserve = STATES_PER_DECODE_SLOT
+            * max_batch
+            * super::recurrent_state::bytes_per_request(&config, geometry);
         let min_kv_bytes = MIN_KV_PAGES * bytes_per_page;
         anyhow::ensure!(
             free_bytes >= scratch_reserve + recurrent_reserve + min_kv_bytes,
@@ -423,6 +425,34 @@ impl Qwen35Model {
         self.tp_comm = Some(comm);
     }
 
+    /// Force NCCL connect before any CUDA Graph capture records a collective
+    /// (lazy connect inside `cuStreamBeginCapture` wedges the capture). NCCL
+    /// 2.22+ connects per size-selected algorithm, so warm one all-reduce at
+    /// every decode bucket's message size. No-op without a TP communicator.
+    pub(crate) fn warmup_tp_collective(&self) -> Result<()> {
+        if let Some(comm) = &self.tp_comm {
+            let buckets = super::batch_decode_graph::BATCH_BUCKETS;
+            let max_elems = buckets.last().unwrap() * self.config.hidden_size;
+            let mut scratch = self
+                .ctx
+                .stream
+                .alloc_zeros::<half::bf16>(max_elems)
+                .map_err(|e| anyhow::anyhow!("alloc NCCL warm-up scratch: {e}"))?;
+            for &bucket in buckets {
+                let mut view = scratch.slice_mut(0..bucket * self.config.hidden_size);
+                comm.all_reduce_in_place(&mut view, &ReduceOp::Sum)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Qwen3.5 NCCL warm-up all-reduce failed: {e:?}")
+                    })?;
+            }
+            self.ctx
+                .stream
+                .synchronize()
+                .map_err(|e| anyhow::anyhow!("Qwen3.5 NCCL warm-up sync failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn all_reduce_hidden(&self, hidden: &mut HiddenStates) -> Result<()> {
         self.all_reduce_hidden_untraced(hidden)
     }
@@ -447,9 +477,9 @@ impl Qwen35Model {
         let geom = self.geometry;
         let full_q = geom.local_full_attn_gated_q_dim();
         let full_kv = geom.local_full_attn_kv_dim();
-        let linear_qkv = self.config.linear_attn_qkv_dim();
-        let linear_z = self.config.linear_attn_z_dim();
-        let linear_ba = self.config.linear_num_value_heads;
+        let linear_qkv = geom.local_linear_qkv_dim();
+        let linear_z = geom.local_linear_z_dim();
+        let linear_ba = geom.local_linear_num_value_heads();
         let intermediate = geom.local_intermediate_size();
 
         let full_attn = || {
