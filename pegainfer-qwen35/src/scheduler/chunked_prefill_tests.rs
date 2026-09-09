@@ -6,36 +6,35 @@
 //! also run with an effectively unchunked budget and the generated greedy token
 //! ids must match.
 
-use std::path::Path;
-
 use pegainfer_frontend::engine::EngineHandle;
-use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::sampler::SamplingParams;
 
-mod common;
+use crate::test_fixture as common;
+use crate::test_fixture::GdnAcceptance;
 
 const CHUNK_BUDGET: usize = 16;
 const BASELINE_PREFILL_BUDGET: usize = 1 << 20;
 const MAX_BATCH: usize = 2;
 const GENERATED_TOKENS: usize = 8;
 
-fn start_engine(model_path: &str, max_prefill_tokens: usize) -> EngineHandle {
-    pegainfer_qwen35::start_engine(
-        Path::new(model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        MAX_BATCH,
-        max_prefill_tokens,
-    )
-    .expect("failed to start Qwen3.5 engine")
+fn start_engine(
+    acceptance: &GdnAcceptance,
+    model_path: &str,
+    max_prefill_tokens: usize,
+) -> EngineHandle {
+    acceptance
+        .launch_engine(
+            model_path,
+            MAX_BATCH,
+            max_prefill_tokens,
+            pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+            pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+        )
+        .expect("failed to start Qwen3.5 engine")
 }
 
 fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (Vec<u32>, FinishReason) {
@@ -79,9 +78,19 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (Vec<u32>, Finish
 
 #[test]
 fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
-    let Some(model_path) = common::model_path_or_skip(
-        "chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv",
-    ) else {
+    run_chunked_prefill(&GdnAcceptance::Triton);
+}
+
+#[test]
+#[ignore = "requires SM120, a validated candidate identity, and Qwen3.5 weights"]
+fn candidate_chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
+    run_chunked_prefill(&GdnAcceptance::candidate());
+}
+
+fn run_chunked_prefill(acceptance: &GdnAcceptance) {
+    let Some(model_path) =
+        acceptance.model_path("chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv")
+    else {
         return;
     };
     let tokenizer = common::load_tokenizer(&model_path);
@@ -102,7 +111,7 @@ fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
     );
 
     let (baseline_tokens, baseline_finish) = {
-        let handle = start_engine(&model_path, BASELINE_PREFILL_BUDGET);
+        let handle = start_engine(acceptance, &model_path, BASELINE_PREFILL_BUDGET);
         generate(&handle, prompt_tokens.clone())
     };
     assert_eq!(
@@ -110,9 +119,10 @@ fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
         FinishReason::Length,
         "ignore_eos should force baseline generation to the requested length"
     );
+    assert_eq!(baseline_tokens.len(), GENERATED_TOKENS);
 
     let (chunked_tokens, chunked_finish) = {
-        let handle = start_engine(&model_path, CHUNK_BUDGET);
+        let handle = start_engine(acceptance, &model_path, CHUNK_BUDGET);
         generate(&handle, prompt_tokens)
     };
     assert_eq!(
@@ -120,6 +130,7 @@ fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
         FinishReason::Length,
         "ignore_eos should force chunked generation to the requested length"
     );
+    assert_eq!(chunked_tokens.len(), GENERATED_TOKENS);
 
     assert_eq!(
         chunked_tokens, baseline_tokens,

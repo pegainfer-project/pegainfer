@@ -402,6 +402,7 @@ impl Qwen35TpExecutor {
                     enable_cuda_graph,
                     tensor_parallel: Some(TensorParallelConfig::try_from((rank, world_size))?),
                     device_ordinal,
+                    gdn_backend: crate::Qwen35GdnBackend::Triton,
                 },
             )?);
         }

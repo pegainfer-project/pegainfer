@@ -1,0 +1,125 @@
+{
+  "schema_version": 4,
+  "flashinfer_commit": "a0efa0adfe49bb836ab1a147d6572980b870f3d4",
+  "patches": [
+    {
+      "path": "patches/0001-openinfer-hkv-state-layout.patch",
+      "sha256": "76aff3ef6d5fc1ecb9895640ee88d29d63ebbeecdabd622264e638335d3c6f22"
+    }
+  ],
+  "patched_kernel_sha256": "4e3c6f81edf39b5444f20353b1307c8028b2496d702b7bfb9ebfbcebf4f7b35b",
+  "contract": {
+    "schema_version": 4,
+    "artifact_kind": "candidate",
+    "variant": "qwen35_4b_candidate",
+    "target": {
+      "arch": "sm_120a",
+      "code_object": "embedded_cubin"
+    },
+    "geometry": {
+      "h_q": 16,
+      "h_k": 16,
+      "h_v": 32,
+      "head_dim": 128
+    },
+    "dtypes": {
+      "q": "bfloat16",
+      "k": "bfloat16",
+      "v": "bfloat16",
+      "o": "bfloat16",
+      "alpha": "float32",
+      "beta": "float32",
+      "state": "float32",
+      "cu_seqlens": "int64",
+      "workspace": "uint8"
+    },
+    "tokens": {
+      "extent": "dynamic",
+      "minimum": 1,
+      "maximum": 67108863
+    },
+    "abi": {
+      "version": 2,
+      "function_prefix": "pegainfer_qwen35_gdn_qwen35_4b_candidate",
+      "geometry_binding": "stable_project_c_wrapper",
+      "symbols": [
+        "pegainfer_qwen35_gdn_abi_version",
+        "pegainfer_qwen35_gdn_artifact_sha256",
+        "pegainfer_qwen35_gdn_aot_available",
+        "pegainfer_qwen35_gdn_workspace_bytes",
+        "pegainfer_qwen35_gdn_create",
+        "pegainfer_qwen35_gdn_launch",
+        "pegainfer_qwen35_gdn_destroy"
+      ],
+      "q_view": {
+        "shape": [
+          "T",
+          128,
+          16
+        ],
+        "stride": [
+          2048,
+          1,
+          128
+        ]
+      },
+      "k_view": {
+        "shape": [
+          128,
+          "T",
+          16
+        ],
+        "stride": [
+          1,
+          2048,
+          128
+        ]
+      },
+      "v_view": {
+        "shape": [
+          128,
+          "T",
+          32
+        ],
+        "stride": [
+          1,
+          4096,
+          128
+        ]
+      },
+      "o_view": {
+        "shape": [
+          128,
+          "T",
+          32
+        ],
+        "stride": [
+          1,
+          4096,
+          128
+        ]
+      },
+      "state_layout": "openinfer_hkv_v_contiguous",
+      "state_update": "in_place"
+    },
+    "workspace": {
+      "kind": "per_sm",
+      "formula": "sm_count * bytes_per_sm",
+      "bytes_per_sm": 128,
+      "alignment_bytes": 128
+    },
+    "toolchain": {
+      "python": "3.12.3",
+      "ptx_compiler_release": "13.1",
+      "ptx_compiler_version": "13.1.66",
+      "ptx_isa": "9.1",
+      "cutlass_dsl": "4.5.0",
+      "cutlass_dsl_libs_base": "4.5.0",
+      "torch": "2.7.1+cu128",
+      "cuda_python": "13.0.1",
+      "cuda_bindings": "13.0.3",
+      "cuda_pathfinder": "1.6.0"
+    }
+  },
+  "upstream_export_kernel_sha256": "b70f8439dc0422c0b0a2a866ec12f7571aa0904aa8c246831eca792b350c4900"
+}

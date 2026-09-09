@@ -63,14 +63,14 @@ cargo test --release --workspace --lib
 
 # Accuracy and integration tests — require GPU + model weights
 cargo test --release -p pegainfer-qwen3 --test hf_golden_gate
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate
-PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --lib executor::hf_golden_gate -- --test-threads=1
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --lib scheduler::e2e_tests -- --test-threads=1
 
 # Single test (filter by name)
 cargo test --release --workspace --lib prefix_cache -- --nocapture
 ```
 
-Qwen accuracy gates compare logits against stored HF golden fixtures. Qwen3.5 exact-text JSON baselines are retired; keep `e2e_scheduler` for scheduler liveness and request-flow coverage.
+Qwen accuracy gates compare logits against stored HF golden fixtures. Qwen3.5 exact-text JSON baselines are retired; keep `scheduler::e2e_tests` for scheduler liveness and request-flow coverage.
 
 ## Architecture
 

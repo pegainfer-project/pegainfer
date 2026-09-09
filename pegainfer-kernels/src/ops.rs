@@ -22,6 +22,8 @@ mod lora;
 #[cfg(any(feature = "gemma4", feature = "kimi-k2"))]
 mod marlin_face;
 mod norm;
+#[cfg(feature = "qwen35")]
+mod qwen35;
 mod sampling;
 
 pub use attention::Hd512DecodeMetadata;
@@ -181,6 +183,8 @@ pub use norm::rms_norm_gated_batch_into;
 pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::*;
 pub use sampling::BatchSamplingRow;
 pub use sampling::BatchSamplingScratch;
 pub use sampling::argmax;

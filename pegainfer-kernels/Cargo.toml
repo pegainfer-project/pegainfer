@@ -24,7 +24,7 @@ tvm-ffi-triton-cubin = ["dep:tvm-ffi", "qwen35"]
 deepseek-v2-lite = []
 # Gemma 4: NVFP4 dequantization, whose conversion intrinsics need CUDA >= 12.8.
 gemma4 = []
-qwen35 = []
+qwen35 = ["pegainfer-build/qwen35-gdn"]
 # Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
 glm52 = ["moe"]
 # Kimi K3: TileLang-generated kernels, FP8xFP4 masked grouped GEMM, and the
@@ -36,6 +36,10 @@ moe = []
 [[example]]
 name = "triton_cubin_tvm_ffi"
 required-features = ["tvm-ffi-triton-cubin"]
+
+[[test]]
+name = "gdn_identity"
+required-features = ["qwen35"]
 
 [lints]
 workspace = true

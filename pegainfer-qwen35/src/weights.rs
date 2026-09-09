@@ -34,6 +34,7 @@ pub(crate) struct ModelRuntimeConfig {
     pub(crate) enable_cuda_graph: bool,
     pub(crate) tensor_parallel: Option<TensorParallelConfig>,
     pub(crate) device_ordinal: usize,
+    pub(crate) gdn_backend: crate::Qwen35GdnBackend,
 }
 
 impl Default for ModelRuntimeConfig {
@@ -42,6 +43,7 @@ impl Default for ModelRuntimeConfig {
             enable_cuda_graph: true,
             tensor_parallel: None,
             device_ordinal: 0,
+            gdn_backend: crate::Qwen35GdnBackend::Triton,
         }
     }
 }
@@ -49,6 +51,8 @@ impl Default for ModelRuntimeConfig {
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
+    /// The selected, already-loaded candidate. `None` means Triton was requested.
+    pub(super) flashinfer_gdn: Option<pegainfer_kernels::ops::Qwen35GdnAot>,
     pub(super) config: Config35,
     pub(super) geometry: LocalGeometry,
     pub(super) embed_tokens: DeviceMatrix,
@@ -94,6 +98,26 @@ impl Qwen35Model {
                 enable_cuda_graph,
                 ..Default::default()
             },
+        )
+    }
+
+    pub(crate) fn from_safetensors_with_launch_options(
+        model_path: &str,
+        options: &crate::Qwen35LaunchOptions,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            options.tp_size == 1,
+            "rank-local model loading requires tp_size=1"
+        );
+        Self::from_safetensors_with_runtime_and_capacity(
+            model_path,
+            ModelRuntimeConfig {
+                enable_cuda_graph: options.cuda_graph,
+                device_ordinal: options.device_ordinal,
+                gdn_backend: options.gdn_backend,
+                ..Default::default()
+            },
+            options.max_batch,
         )
     }
 }
@@ -153,6 +177,37 @@ impl Qwen35Model {
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         let geometry =
             LocalGeometry::try_new(&config, tensor_parallel).map_err(anyhow::Error::from)?;
+        // Resolve and preload exactly once, before measuring free memory or
+        // allocating KV. A linked artifact alone never changes the default.
+        let flashinfer_gdn = match runtime.gdn_backend {
+            crate::Qwen35GdnBackend::Triton => None,
+            crate::Qwen35GdnBackend::FlashInferCandidate => {
+                anyhow::ensure!(
+                    geometry.world_size() == 1,
+                    "Qwen3.5 flashinfer-candidate requires TP world_size=1"
+                );
+                anyhow::ensure!(
+                    config.linear_value_head_dim == 128,
+                    "Qwen3.5 flashinfer-candidate requires value head dimension 128"
+                );
+                Some(pegainfer_kernels::ops::Qwen35GdnAot::load_for_production(
+                    &ctx,
+                    super::flashinfer_gdn::model_geometry(&config),
+                )?)
+            }
+        };
+        if let Some(backend) = &flashinfer_gdn {
+            info!(
+                "Qwen3.5 GDN: requested={} resolved=flashinfer-candidate object_sha256={}",
+                runtime.gdn_backend,
+                backend.artifact_sha256()
+            );
+        } else {
+            info!(
+                "Qwen3.5 GDN: requested={} resolved=triton",
+                runtime.gdn_backend
+            );
+        }
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}, tp_rank={}, tp_world_size={}",
             config.hidden_size,
@@ -269,11 +324,19 @@ impl Qwen35Model {
         // Reserve space for prefill scratch (GDR chunkwise + per-layer transients)
         // before allocating KV pool, so prefill doesn't OOM.
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
-        let scratch_reserve = super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
-            &config,
-            geometry,
-            max_prefill_len,
-        );
+        let scratch_reserve = match &flashinfer_gdn {
+            Some(backend) => super::flashinfer_gdn::FlashInferGdnChunkResources::estimate_bytes(
+                &config,
+                backend,
+                max_prefill_len,
+                page_size,
+            ),
+            None => super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
+                &config,
+                geometry,
+                max_prefill_len,
+            ),
+        };
         let recurrent_reserve = STATES_PER_DECODE_SLOT
             * max_batch
             * super::recurrent_state::bytes_per_request(&config, geometry);
@@ -296,7 +359,8 @@ impl Qwen35Model {
         let scratch_mb = scratch_reserve / (1024 * 1024);
         let recurrent_mb = recurrent_reserve / (1024 * 1024);
         info!(
-            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), {:.0}% of {:.0} MB free",
+            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), backend={}, prefill scratch reserve: {scratch_mb} MB ({scratch_reserve} bytes), recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), {:.0}% of {:.0} MB free",
+            runtime.gdn_backend,
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
@@ -311,6 +375,7 @@ impl Qwen35Model {
 
         Ok(Self {
             ctx,
+            flashinfer_gdn,
             config,
             geometry,
             embed_tokens,
