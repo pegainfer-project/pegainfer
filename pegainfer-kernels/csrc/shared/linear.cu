@@ -2,10 +2,17 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <map>
 #include <mutex>
 
@@ -179,6 +186,112 @@ static cublasStatus_t lt_plan_create(LtGemmPlan &plan, int M, int N, int K) {
     return status;
   }
   return cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16BF, M, N, M);
+}
+
+// The tuned table above dies with the process, so every start re-searches shapes
+// whose winner was already known here. Behind PEGAINFER_GEMM_LT_CACHE a winner is
+// carried across processes. It is a cache and never a source of truth: every
+// failure below falls back to the online search, changing start-up time and never
+// a result. The record format and the file live in lt_algo_store.cu.
+extern "C" int pegainfer_lt_store_lookup(const char *path, const char *key,
+                                         unsigned long long out[8]);
+extern "C" void pegainfer_lt_store_append(const char *path, const char *key,
+                                          const unsigned long long words[8]);
+
+static const char *lt_store_path() {
+  static const char *cached = [] {
+    const char *s = std::getenv("PEGAINFER_GEMM_LT_CACHE");
+    return (s != nullptr && *s != '\0') ? s : nullptr;
+  }();
+  return cached;
+}
+
+// A stored winner only means anything under the conditions that produced it, and
+// the device ordinal the in-process key uses is not one of them — ordinal 0 on
+// another machine is other hardware. So the on-disk key carries what actually
+// decides the ranking, plus the runtime, driver and library versions, because
+// cublasLtMatmulAlgo_t is opaque and is not promised to survive a version change.
+static bool lt_store_key(int device, int M, int N, int K, std::string &out) {
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+    return false;
+  }
+  int runtime = 0;
+  if (cudaRuntimeGetVersion(&runtime) != cudaSuccess) {
+    return false;
+  }
+  // Reports the CUDA level the installed driver supports, not its build number,
+  // so a driver update that keeps the same level is not distinguished here.
+  int driver = 0;
+  if (cudaDriverGetVersion(&driver) != cudaSuccess) {
+    return false;
+  }
+  std::string name(prop.name);
+  for (char &c : name) {
+    if (c == ' ') {
+      c = '_';
+    }
+  }
+  char buf[512];
+  // dtype and layout are constants of this translation unit; recorded anyway so
+  // a future width cannot silently adopt a bf16 winner.
+  const int n = std::snprintf(buf, sizeof(buf), "%s %d.%d %d %d %d %zu %d %d %d bf16 TN %zu",
+                              name.c_str(), prop.major, prop.minor, prop.multiProcessorCount,
+                              runtime, driver, cublasLtGetVersion(), M, N, K, LT_WORKSPACE_SIZE);
+  if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf)) {
+    return false;
+  }
+  out.assign(buf);
+  return true;
+}
+
+// A matching key is not enough. The stored bytes are an opaque struct another
+// process wrote; ask cublasLt whether they still describe something runnable
+// against these descriptors, and whether it fits the workspace we will hand it.
+static bool lt_algo_usable(const LtGemmPlan &plan, const cublasLtMatmulAlgo_t &algo) {
+  cublasLtMatmulHeuristicResult_t result{};
+  const cublasStatus_t status = cublasLtMatmulAlgoCheck(g_lt_handle, plan.op, plan.a, plan.b,
+                                                        plan.c, plan.c, &algo, &result);
+  return status == CUBLAS_STATUS_SUCCESS && result.state == CUBLAS_STATUS_SUCCESS &&
+         result.workspaceSize <= LT_WORKSPACE_SIZE;
+}
+
+// One launch before an algo is published. `gemm_lt_cuda` says the tuned kernel has
+// already executed and CUDA Graph capture leans on that; the search path gets it from
+// its timing loop, while an algo adopted from the store has never run in this process.
+static bool lt_algo_warm(const LtGemmPlan &plan, const __nv_bfloat16 *W, int M, int N, int K,
+                         cudaStream_t stream) {
+  __nv_bfloat16 *x = nullptr;
+  __nv_bfloat16 *y = nullptr;
+  bool ok = cudaMalloc(&x, static_cast<size_t>(K) * N * sizeof(__nv_bfloat16)) == cudaSuccess;
+  if (ok) {
+    ok = cudaMemset(x, 0, static_cast<size_t>(K) * N * sizeof(__nv_bfloat16)) == cudaSuccess;
+  }
+  if (ok) {
+    ok = cudaMalloc(&y, static_cast<size_t>(M) * N * sizeof(__nv_bfloat16)) == cudaSuccess;
+  }
+  if (ok) {
+    const float h_alpha = 1.0f;
+    const float h_beta = 0.0f;
+    ok = cublasLtMatmul(g_lt_handle, plan.op, &h_alpha,
+                        W, plan.a,
+                        x, plan.b,
+                        &h_beta,
+                        y, plan.c,
+                        y, plan.c,
+                        &plan.algo, g_lt_workspace, LT_WORKSPACE_SIZE,
+                        stream) == CUBLAS_STATUS_SUCCESS;
+  }
+  if (ok) {
+    ok = cudaStreamSynchronize(stream) == cudaSuccess;
+  }
+  if (x != nullptr) {
+    cudaFree(x);
+  }
+  if (y != nullptr) {
+    cudaFree(y);
+  }
+  return ok;
 }
 
 // Repeats a tuning pass spends on one candidate. Timing noise is roughly a fixed
@@ -542,6 +655,47 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
     }
   } claim{shared_key};
 
+  // A winner an earlier process on this machine already paid for, if the store
+  // has one that still checks out. Publishing follows the same path the search
+  // would, so the in-process table and every waiter see one behaviour.
+  const char *const store_path = lt_store_path();
+  std::string store_key;
+  const bool store_keyed = store_path != nullptr && lt_store_key(device, M, N, K, store_key);
+  if (store_keyed) {
+    unsigned long long words[8];
+    if (pegainfer_lt_store_lookup(store_path, store_key.c_str(), words) == 1) {
+      cublasLtMatmulAlgo_t stored{};
+      static_assert(sizeof(stored.data) == sizeof(words), "algo blob is eight 64-bit words");
+      std::memcpy(&stored.data, words, sizeof(words));
+      LtGemmPlan reused;
+      bool adopted = false;
+      if (lt_plan_create(reused, M, N, K) == CUBLAS_STATUS_SUCCESS &&
+          lt_algo_usable(reused, stored)) {
+        reused.algo = stored;
+        adopted = lt_algo_warm(reused, Ws[0], M, N, K, stream);
+      }
+      if (adopted) {
+        {
+          std::lock_guard<std::mutex> lock(g_lt_tuned_mu);
+          g_lt_tuned_algos[shared_key] = LtTunedEntry{true, stored};
+        }
+        g_lt_tuned_cv.notify_all();
+        claim.published = true;
+        g_lt_plans.emplace(key, reused);
+        return static_cast<int>(cudaSuccess);
+      }
+      // The one store outcome worth saying out loud: a key that matches but no
+      // longer applies — or no longer runs — is a library or driver change under
+      // a file written before it, and staying silent would make a whole stale
+      // file look like a miss.
+      std::fprintf(stderr,
+                   "gemm_lt_tune: stored algo rejected for [%s]; retuning "
+                   "(cublasLt or driver moved under this cache?)\n",
+                   store_key.c_str());
+      lt_plan_destroy(reused);
+    }
+  }
+
   LtGemmPlan plan;
   cublasStatus_t status = lt_plan_create(plan, M, N, K);
   cublasLtMatmulHeuristicResult_t results[16];
@@ -639,6 +793,11 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
   }
   g_lt_tuned_cv.notify_all();
   claim.published = true;
+  if (store_keyed) {
+    unsigned long long words[8];
+    std::memcpy(words, &plan.algo.data, sizeof(words));
+    pegainfer_lt_store_append(store_path, store_key.c_str(), words);
+  }
   g_lt_plans.emplace(key, plan);
   return static_cast<int>(cudaSuccess);
 }

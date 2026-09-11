@@ -383,6 +383,21 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    // The tuned-algo store's record format and file (csrc/shared/lt_algo_store.cu).
+    // `linear.cu` is the caller; declared here because the format and its recovery
+    // from a short write are what `tests/lt_algo_store.rs` exercises, and that
+    // half needs no GPU.
+    pub fn pegainfer_lt_store_lookup(
+        path: *const std::os::raw::c_char,
+        key: *const std::os::raw::c_char,
+        out: *mut u64,
+    ) -> i32;
+    pub fn pegainfer_lt_store_append(
+        path: *const std::os::raw::c_char,
+        key: *const std::os::raw::c_char,
+        words: *const u64,
+    );
+
     // Batch-invariant pinned-algo path (csrc/shared/linear.cu).
     pub fn gemm_lt_pin_tune_cuda(
         M: i32,

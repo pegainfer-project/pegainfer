@@ -3750,6 +3750,7 @@ dependencies = [
  "cc",
  "cudarc",
  "half",
+ "libc",
  "log",
  "pegainfer-build",
  "serde",

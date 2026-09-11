@@ -12,6 +12,10 @@ log = { workspace = true }
 serde = { workspace = true }
 tvm-ffi = { version = "0.1.0-alpha.0", optional = true }
 
+[dev-dependencies]
+# RLIMIT_FSIZE, to produce a real short write in the algo-store test.
+libc = { workspace = true }
+
 [build-dependencies]
 cc = { workspace = true }
 pegainfer-build = { workspace = true }
