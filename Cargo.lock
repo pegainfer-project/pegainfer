@@ -6863,12 +6863,12 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 [[package]]
 name = "vllm-build-info"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6ff479e1f798048829f884b4229f28c9b9b0c8d7#6ff479e1f798048829f884b4229f28c9b9b0c8d7"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
 
 [[package]]
 name = "vllm-chat"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6ff479e1f798048829f884b4229f28c9b9b0c8d7#6ff479e1f798048829f884b4229f28c9b9b0c8d7"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -6906,7 +6906,7 @@ dependencies = [
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6ff479e1f798048829f884b4229f28c9b9b0c8d7#6ff479e1f798048829f884b4229f28c9b9b0c8d7"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -6940,7 +6940,7 @@ dependencies = [
 [[package]]
 name = "vllm-llm"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6ff479e1f798048829f884b4229f28c9b9b0c8d7#6ff479e1f798048829f884b4229f28c9b9b0c8d7"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
 dependencies = [
  "easy-ext",
  "enum-as-inner",
@@ -6960,7 +6960,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6ff479e1f798048829f884b4229f28c9b9b0c8d7#6ff479e1f798048829f884b4229f28c9b9b0c8d7"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
 dependencies = [
  "itertools 0.14.0",
  "prometheus-client",
@@ -6969,7 +6969,7 @@ dependencies = [
 [[package]]
 name = "vllm-parser"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6ff479e1f798048829f884b4229f28c9b9b0c8d7#6ff479e1f798048829f884b4229f28c9b9b0c8d7"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
 dependencies = [
  "easy-ext",
  "serde",
@@ -6982,9 +6982,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vllm-proto"
+version = "0.1.0"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
+dependencies = [
+ "prost",
+ "prost-types",
+ "protox",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "vllm-server"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6ff479e1f798048829f884b4229f28c9b9b0c8d7#6ff479e1f798048829f884b4229f28c9b9b0c8d7"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7000,9 +7013,7 @@ dependencies = [
  "libc",
  "llm-multimodal",
  "openssl",
- "prost",
  "prost-types",
- "protox",
  "rmpv",
  "serde",
  "serde_json",
@@ -7019,8 +7030,6 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-health",
- "tonic-prost",
- "tonic-prost-build",
  "tower",
  "tower-http",
  "tracing",
@@ -7034,13 +7043,14 @@ dependencies = [
  "vllm-engine-core-client",
  "vllm-llm",
  "vllm-metrics",
+ "vllm-proto",
  "vllm-text",
 ]
 
 [[package]]
 name = "vllm-text"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6ff479e1f798048829f884b4229f28c9b9b0c8d7#6ff479e1f798048829f884b4229f28c9b9b0c8d7"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7065,7 +7075,7 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=6ff479e1f798048829f884b4229f28c9b9b0c8d7#6ff479e1f798048829f884b4229f28c9b9b0c8d7"
+source = "git+https://github.com/vllm-project/vllm.git?rev=295ac4e52e8a35772b2a63c028f6510e221a65cf#295ac4e52e8a35772b2a63c028f6510e221a65cf"
 dependencies = [
  "base64 0.22.1",
  "fastokens",
