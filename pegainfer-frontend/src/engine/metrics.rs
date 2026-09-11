@@ -1,7 +1,6 @@
 //! What the scheduler republishes about itself: [`SchedulerMetrics`], the
 //! per-iteration snapshot of occupancy gauges plus whatever richer counters a
-//! model line serves (today: cumulative speculative-decode acceptance, when a
-//! draft model is loaded).
+//! model line serves (prefix-cache reuse and speculative-decode acceptance).
 
 use std::error::Error;
 use std::fmt;
@@ -26,6 +25,18 @@ pub struct SchedulerMetrics {
     pub num_waiting_reqs: u64,
     /// Cumulative spec-decode counters, or `None` when no draft model is loaded.
     pub spec_decode: Option<SpecDecodeCounters>,
+    /// Cumulative prefix-cache lookups; count each admitted request once.
+    pub prefix_cache: PrefixCacheCounters,
+}
+
+/// Lifetime prefix-cache totals, independent of periodic logging windows.
+/// Queries count all prompt tokens and hits count tokens actually reused,
+/// including locally offloaded prefixes. Admission retries must not count again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixCacheCounters {
+    pub requests: u64,
+    pub queries: u64,
+    pub hits: u64,
 }
 
 /// Upper bound on a drafter's `K`, fixing the width of

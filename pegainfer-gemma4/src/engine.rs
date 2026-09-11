@@ -2316,6 +2316,7 @@ impl Scheduler for Gemma4Scheduler {
             kv_total_blocks: (local_total + global_total) as u64,
             num_running_reqs: (self.active.len() + walkers + lane_inflight) as u64,
             num_waiting_reqs: self.pending.len() as u64,
+            prefix_cache: pegainfer_frontend::engine::PrefixCacheCounters::default(),
             spec_decode: None,
         }
     }

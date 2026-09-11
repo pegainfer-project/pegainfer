@@ -719,6 +719,7 @@ fn terminal_shutdown_closes_drains_and_errors_every_owner_once() {
         kv_total_blocks: 64,
         num_running_reqs: 9,
         num_waiting_reqs: 9,
+        prefix_cache: pegainfer_frontend::engine::PrefixCacheCounters::default(),
         spec_decode: None,
     });
     terminal_scheduler_shutdown(

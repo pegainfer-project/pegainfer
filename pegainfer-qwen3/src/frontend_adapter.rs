@@ -801,6 +801,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             num_waiting_reqs: (self.deferred.len()
                 + self.loading.len()
                 + self.post_control_deferred.len()) as u64,
+            prefix_cache: pegainfer_frontend::engine::PrefixCacheCounters::default(),
             spec_decode: self.executor.spec_decode_counters(),
         }
     }
