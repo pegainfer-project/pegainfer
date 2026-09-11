@@ -1,6 +1,6 @@
 # Frontend architecture: pegainfer-frontend and the engine boundary
 
-**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + `RequestLedger` lifecycle + a contract-owned polling driver — Qwen3, Gemma 4 and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite still launch through it). **Next step: migrate glm52, then delete the legacy contract.**
+**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + `RequestLedger` lifecycle + a contract-owned polling driver — Qwen3, Gemma 4 and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite still launch through it). The vLLM Rust dependencies are pinned to `295ac4e5`, including the DeepSeek V4/V4.1 tool-argument encoding fix. **Next step: migrate glm52, then delete the legacy contract.**
 
 Last touched: 2026-09
 
@@ -110,3 +110,34 @@ All six lines are onboarded. Adding a model line = write `model_line.rs` in the 
 ## Next step
 
 Migrate glm52 onto the step contract (the multi-scheduler pilot; brings P/D and EP requirements), then qwen35/kimi-k2/deepseek-v2-lite, then delete the legacy contract modules and `LaunchedEngine::Handle`.
+
+## September 2026 upstream dependency refresh
+
+Preparation: read `docs/index.md`, this architecture document, and the previous
+frontend bump (#1040). No open dependency-refresh PR duplicates this work.
+The user authorized updating to latest upstream, opening a PR, and squash merging
+after all CI checks pass.
+
+Plan: pin all five vLLM dependencies to the same current upstream main commit,
+refresh the lockfile, run release frontend/simulator tests and HTTP E2E plus
+formatting and Clippy, then track the PR through CI and merge.
+The invariant is that the production frontend consumes one coherent upstream
+revision, including the official DeepSeek V4/V4.1 tool-argument encoding fix.
+
+Execution: updating `6ff479e1` to `295ac4e52e8a35772b2a63c028f6510e221a65cf`
+(upstream main observed on 2026-09-11). This includes vllm-project/vllm#56260;
+non-object tool arguments are preserved verbatim according to deepseek-recipe.
+The lockfile adds upstream's extracted `vllm-proto` crate; no local API adaptation
+was needed. Incidental resolver changes to unrelated dependency edges were removed.
+
+Validation in the development container:
+
+- `cargo fmt --all -- --check` and locked Cargo metadata passed.
+- Release frontend/simulator library tests: 71 + 6 passed.
+- Release simulator HTTP frontend E2E: 18 passed.
+- Release frontend/simulator Clippy, all targets with `-D warnings`: passed.
+
+Debrief: the dependency refresh compiles and preserves the existing HTTP serving
+contract. The simulated HTTP gate does not establish DeepSeek model accuracy or
+exercise the V4.1 renderer with a real checkpoint; no GPU/model evaluation was run.
+Next action: require all PR CI checks to pass before squash merging.
