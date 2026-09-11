@@ -755,14 +755,6 @@ pub(crate) struct K3Scratch {
     pub(crate) forget_low: CudaSlice<bf16>,
     pub(crate) out_gate: CudaSlice<bf16>,
     pub(crate) conv_x: CudaSlice<bf16>,
-    /// Prefill-chunk convolution windows, `[rows, K3_CONV_STATE, inner]`: row
-    /// `t` holds the three landed inputs preceding token `t`, prebuilt from
-    /// the chunk itself (and the carried window for the first rows), so one
-    /// batched conv launch serves the whole chunk.
-    pub(crate) conv_window: CudaSlice<bf16>,
-    /// The batched conv launch's successor windows; row `tokens - 1` is the
-    /// window to carry into the next chunk.
-    pub(crate) conv_window_next: CudaSlice<bf16>,
     pub(crate) conv_q: CudaSlice<bf16>,
     pub(crate) conv_k: CudaSlice<bf16>,
     pub(crate) conv_v: CudaSlice<bf16>,
@@ -889,8 +881,6 @@ impl K3Scratch {
             forget_low: wide(K3_HEAD_DIM)?,
             out_gate: wide(K3_ATTN_INNER)?,
             conv_x: wide(K3_ATTN_INNER)?,
-            conv_window: wide(K3_CONV_STATE * K3_ATTN_INNER)?,
-            conv_window_next: wide(K3_CONV_STATE * K3_ATTN_INNER)?,
             conv_q: wide(K3_ATTN_INNER)?,
             conv_k: wide(K3_ATTN_INNER)?,
             conv_v: wide(K3_ATTN_INNER)?,
