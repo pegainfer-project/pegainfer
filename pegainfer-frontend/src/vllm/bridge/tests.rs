@@ -571,6 +571,7 @@ async fn load_snapshots_become_stats_only_batches() {
         kv_total_blocks: 100,
         num_running_reqs: 2,
         num_waiting_reqs: 1,
+        prefix_cache: crate::engine::PrefixCacheCounters::default(),
         spec_decode: None,
     });
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
@@ -680,4 +681,73 @@ async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
     task.await
         .expect("stats task exits on shutdown")
         .expect("stats publisher shuts down cleanly");
+}
+
+/// Every possible coalescing of four admissions must preserve the same totals.
+/// Reading a snapshot twice (or changing only gauges) must never count twice.
+#[test]
+fn prefix_stats_preserve_totals_across_all_coalescings() {
+    let admissions = [(10, 0), (20, 10), (30, 20), (40, 0)];
+    for mask in 0..8 {
+        let mut tracker = SchedulerStatsTracker::default();
+        let mut snapshot = SchedulerMetrics::default();
+        let mut observed = (0, 0, 0);
+        for (i, (queries, hits)) in admissions.into_iter().enumerate() {
+            snapshot.prefix_cache.requests += 1;
+            snapshot.prefix_cache.queries += queries;
+            snapshot.prefix_cache.hits += hits;
+            if i == 3 || mask & (1 << i) != 0 {
+                let stats = tracker.interval(&snapshot).prefix_cache_stats.base;
+                observed.0 += stats.requests;
+                observed.1 += stats.queries;
+                observed.2 += stats.hits;
+                snapshot.num_running_reqs += 1;
+                let repeated = tracker.interval(&snapshot).prefix_cache_stats.base;
+                assert_eq!(
+                    (repeated.requests, repeated.queries, repeated.hits),
+                    (0, 0, 0)
+                );
+            }
+        }
+        assert_eq!(observed, (4, 100, 30), "coalescing mask {mask}");
+    }
+}
+
+#[tokio::test]
+async fn prefix_stats_are_forwarded_by_the_watch_publisher() {
+    let snapshot = SchedulerMetrics {
+        prefix_cache: PrefixCacheCounters {
+            requests: 2,
+            queries: 100,
+            hits: 40,
+        },
+        ..Default::default()
+    };
+    let (load_tx, load_rx) = tokio::sync::watch::channel(snapshot);
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(publish_scheduler_stats(
+        0,
+        load_rx,
+        output_tx,
+        shutdown.clone(),
+    ));
+    let first = next_scheduler_stats(&mut output_rx)
+        .await
+        .prefix_cache_stats
+        .base
+        .clone();
+    assert_eq!((first.requests, first.queries, first.hits), (2, 100, 40));
+    load_tx.send_replace(snapshot);
+    let repeated = next_scheduler_stats(&mut output_rx)
+        .await
+        .prefix_cache_stats
+        .base
+        .clone();
+    assert_eq!(
+        (repeated.requests, repeated.queries, repeated.hits),
+        (0, 0, 0)
+    );
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
 }
