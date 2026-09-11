@@ -1,5 +1,6 @@
 //! Kimi-K3 GPU operators.
 
+mod capsule_kda;
 mod deepgemm;
 mod flash_kda;
 mod flash_mla_prefill;
@@ -8,6 +9,7 @@ mod mla_paged;
 mod moe_chain;
 mod router_topk;
 
+pub use capsule_kda::*;
 pub use deepgemm::*;
 pub use flash_kda::*;
 pub use flash_mla_prefill::*;

@@ -942,6 +942,12 @@ impl K3Executor {
             self.dspark.is_none(),
             "K3 dspark draft lane is already loaded"
         );
+        // The capsule KDA kernel updates recurrent/conv state in place on a
+        // fixed slab, which the verify lane's parity replay cannot rewind.
+        ensure!(
+            !forward::capsule::capsule_flags().kda,
+            "K3 dspark draft lane is incompatible with PEGAINFER_K3_CAPSULE=kda"
+        );
         // One slot's worst verify round packs its deferred-commit replay
         // (up to a full accepted block) plus anchor and drafts.
         ensure!(
@@ -1477,6 +1483,10 @@ impl K3Executor {
         cp_rank: usize,
         segments: Vec<(usize, usize)>,
     ) -> Result<()> {
+        ensure!(
+            !forward::capsule::capsule_flags().kda,
+            "K3 CP prefill is incompatible with PEGAINFER_K3_CAPSULE=kda"
+        );
         if let Some(scratch) = self.cp_scratch.as_ref() {
             // One gang per process, one seg_cap per executor — the scratch
             // built once serves every superstep.

@@ -80,3 +80,56 @@ pub fn k3_router_topk_batched_launch(
         anyhow!("K3 router_topk (B={b}, E={num_experts}, TOPK={topk}) launch failed: {err}")
     })
 }
+
+/// Capsule-vendored vLLM router top-k (`cubin/k3/single_group_topk_*`): same
+/// selection semantics family as [`k3_router_topk_batched_launch`] (sigmoid,
+/// biased selection, unbiased renormalized weights, scaled), but the routed
+/// scale is a host scalar and the (idx, weight) pairs come back in the
+/// kernel's descending-score order rather than selection order. Consumers
+/// treat the pairs as unordered.
+#[allow(clippy::too_many_arguments)]
+pub fn k3_capsule_router_topk_launch(
+    ctx: &DeviceContext,
+    b: usize,
+    num_experts: usize,
+    topk: usize,
+    s: &CudaSlice<f32>,
+    bias: &CudaSlice<f32>,
+    routed_scaling: f32,
+    idx: &mut CudaSlice<i32>,
+    wts: &mut CudaSlice<f32>,
+) -> Result<()> {
+    ensure!(b > 0, "K3 capsule router needs rows");
+    ensure!(
+        num_experts <= 512 && topk <= 22 && topk <= num_experts,
+        "K3 capsule router tier is <=512 experts, <=22 topk; got E={num_experts}, topk={topk}"
+    );
+    ensure!(
+        s.len() >= b * num_experts
+            && bias.len() >= num_experts
+            && idx.len() >= b * topk
+            && wts.len() >= b * topk,
+        "K3 capsule router buffers too small for b={b}, experts={num_experts}, topk={topk}"
+    );
+    let (s_ptr, _s_guard) = s.device_ptr(&ctx.stream);
+    let (bias_ptr, _bias_guard) = bias.device_ptr(&ctx.stream);
+    let (idx_ptr, _idx_guard) = idx.device_ptr_mut(&ctx.stream);
+    let (wts_ptr, _wts_guard) = wts.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::k3_capsule_router_topk_cuda(
+            s_ptr as *const f32,
+            bias_ptr as *const f32,
+            idx_ptr as *mut i32,
+            wts_ptr as *mut f32,
+            i32::try_from(b)?,
+            i32::try_from(num_experts)?,
+            i32::try_from(topk)?,
+            routed_scaling,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| {
+        anyhow!("K3 capsule router_topk (B={b}, E={num_experts}, TOPK={topk}) launch failed: {err}")
+    })
+}

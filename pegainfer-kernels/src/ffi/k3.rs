@@ -173,6 +173,64 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Capsule-vendored vLLM v0.28.0 router top-k (`cubin/k3/`, loader in
+    /// `csrc/k3/k3_capsule.cu`): same contract as [`k3_router_topk_cuda`]
+    /// except the routed scale is a host scalar and weights are written in
+    /// the kernel's descending-score order.
+    pub fn k3_capsule_router_topk_cuda(
+        scores: *const f32,
+        bias: *const f32,
+        topk_idx: *mut i32,
+        topk_wts: *mut f32,
+        b: i32,
+        num_experts: i32,
+        topk: i32,
+        routed_scaling: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Capsule-vendored vLLM v0.28.0 fused KDA decode (96-head variant, see
+    /// `csrc/k3/k3_capsule.cu`): consumes projected bf16 x_q|x_k|x_v rows,
+    /// updates the bf16 conv windows and fp32 recurrent state in place,
+    /// applies the gated output norm, writes bf16 out rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k3_capsule_kda_decode_cuda(
+        x_q: *const c_void,
+        x_k: *const c_void,
+        x_v: *const c_void,
+        w_q_t: *const f32,
+        w_k_t: *const f32,
+        w_v_t: *const f32,
+        bias_q: *const f32,
+        bias_k: *const f32,
+        bias_v: *const f32,
+        cs_q: *mut c_void,
+        cs_k: *mut c_void,
+        cs_v: *mut c_void,
+        a_log: *const f32,
+        g: *const c_void,
+        dt_bias: *const f32,
+        beta: *const c_void,
+        onorm_g: *const c_void,
+        onorm_weight: *const f32,
+        ssm_state_indices: *const i32,
+        cu_seqlens: *const i32,
+        state: *mut f32,
+        out: *mut c_void,
+        b: i32,
+        heads: i32,
+        value_heads: i32,
+        lower_bound: f32,
+        scale: f32,
+        onorm_eps: f32,
+        x_row: i64,
+        beta_row: i64,
+        onorm_row: i64,
+        conv_slot: i64,
+        state_slot: i64,
+        stream: CUstream,
+    ) -> CUresult;
+
     // --- fused MegaMoE (see `csrc/k3/k3_mega_moe_sm100.cu`) ---
 
     /// Token-count alignment the MegaMoE API enforces on

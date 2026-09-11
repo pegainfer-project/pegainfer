@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
@@ -27,6 +28,7 @@ pub struct CudaGraphDumpSummary {
     pub kernels: usize,
     pub dot_path: PathBuf,
     pub png_path: PathBuf,
+    pub json_path: PathBuf,
 }
 
 struct GraphDescription {
@@ -67,10 +69,41 @@ enum GraphNodeKind {
         grid: [u32; 3],
         block: [u32; 3],
         dynamic_shared_mem_bytes: u32,
+        attributes: KernelAttributes,
+        /// `None` when the node carries no staged `kernelParams` array (e.g.
+        /// packed `extra` launch buffers, which stream capture never produces).
+        params: Option<Vec<KernelParamDump>>,
     },
     Other {
         node_type: String,
     },
+}
+
+/// Per-function facts a replayer needs beyond the launch configuration.
+#[derive(Clone, Copy)]
+struct KernelAttributes {
+    num_regs: i32,
+    static_shared_bytes: i32,
+    const_bytes: i32,
+    local_bytes: i32,
+    ptx_version: i32,
+    binary_version: i32,
+}
+
+/// One kernel parameter's staged bytes, captured at graph-capture time.
+struct KernelParamDump {
+    offset: usize,
+    size: usize,
+    bytes: Vec<u8>,
+    /// Present when an 8-byte value resolves as a live CUDA allocation.
+    /// Advisory: an integer that collides with an allocation also matches.
+    pointer: Option<PointerRange>,
+}
+
+struct PointerRange {
+    memory_type: &'static str,
+    range_start: u64,
+    range_size: usize,
 }
 
 pub fn validate_graph_dump_request(png_path: &Path) -> Result<()> {
@@ -99,7 +132,8 @@ pub fn validate_graph_dump_request(png_path: &Path) -> Result<()> {
 }
 
 fn require_graph_dump_driver() -> Result<()> {
-    const MIN_DRIVER_API_VERSION: i32 = 12_030;
+    // 12.3 for cuFuncGetName, 12.4 for cuFuncGetParamInfo.
+    const MIN_DRIVER_API_VERSION: i32 = 12_040;
 
     let mut version = 0i32;
     check(
@@ -108,7 +142,8 @@ fn require_graph_dump_driver() -> Result<()> {
     )?;
     ensure!(
         version >= MIN_DRIVER_API_VERSION,
-        "--dump-graph-png requires CUDA driver API 12.3 or newer for kernel names; found {}",
+        "--dump-graph-png requires CUDA driver API 12.4 or newer for kernel names \
+         and parameter layouts; found {}",
         format_driver_api_version(version)
     );
     Ok(())
@@ -141,6 +176,9 @@ impl CudaGraphState {
         let dot_path = png_path.with_extension("dot");
         std::fs::write(&dot_path, graph.detailed_dot())
             .with_context(|| format!("write detailed CUDA Graph DOT to {}", dot_path.display()))?;
+        let json_path = png_path.with_extension("json");
+        std::fs::write(&json_path, graph.machine_json(title)?)
+            .with_context(|| format!("write CUDA Graph JSON to {}", json_path.display()))?;
         render_png(&graph.human_dot(title), png_path)?;
         Ok(CudaGraphDumpSummary {
             nodes: graph.nodes.len(),
@@ -152,6 +190,7 @@ impl CudaGraphState {
                 .count(),
             dot_path,
             png_path: png_path.to_path_buf(),
+            json_path,
         })
     }
 
@@ -184,6 +223,8 @@ impl CudaGraphState {
                         grid,
                         block,
                         dynamic_shared_mem_bytes,
+                        attributes,
+                        params,
                     } => GraphNodeKind::Kernel {
                         raw_symbol,
                         demangled: demangled
@@ -192,6 +233,8 @@ impl CudaGraphState {
                         grid,
                         block,
                         dynamic_shared_mem_bytes,
+                        attributes,
+                        params,
                     },
                     RawNodeKind::Other { node_type } => GraphNodeKind::Other { node_type },
                 },
@@ -227,6 +270,8 @@ enum RawNodeKind {
         grid: [u32; 3],
         block: [u32; 3],
         dynamic_shared_mem_bytes: u32,
+        attributes: KernelAttributes,
+        params: Option<Vec<KernelParamDump>>,
     },
     Other {
         node_type: String,
@@ -331,11 +376,149 @@ fn inspect_node(node: CUgraphNode) -> Result<RawNodeKind> {
         .to_str()
         .context("CUDA kernel name is not UTF-8")?
         .to_owned();
+    let attributes = kernel_attributes(params.func)?;
+    let staged_params = kernel_param_dumps(params.func, params.kernelParams)
+        .with_context(|| format!("read staged kernel parameters of `{raw_symbol}`"))?;
     Ok(RawNodeKind::Kernel {
         raw_symbol,
         grid: [params.gridDimX, params.gridDimY, params.gridDimZ],
         block: [params.blockDimX, params.blockDimY, params.blockDimZ],
         dynamic_shared_mem_bytes: params.sharedMemBytes,
+        attributes,
+        params: staged_params,
+    })
+}
+
+fn kernel_attributes(func: sys::CUfunction) -> Result<KernelAttributes> {
+    use sys::CUfunction_attribute_enum as Attr;
+    let attribute = |attribute: sys::CUfunction_attribute, what: &str| -> Result<i32> {
+        let mut value = 0i32;
+        check(
+            unsafe { sys::cuFuncGetAttribute(&raw mut value, attribute, func) },
+            what,
+        )?;
+        Ok(value)
+    };
+    Ok(KernelAttributes {
+        num_regs: attribute(
+            Attr::CU_FUNC_ATTRIBUTE_NUM_REGS,
+            "cuFuncGetAttribute(num_regs)",
+        )?,
+        static_shared_bytes: attribute(
+            Attr::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+            "cuFuncGetAttribute(shared_size_bytes)",
+        )?,
+        const_bytes: attribute(
+            Attr::CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES,
+            "cuFuncGetAttribute(const_size_bytes)",
+        )?,
+        local_bytes: attribute(
+            Attr::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+            "cuFuncGetAttribute(local_size_bytes)",
+        )?,
+        ptx_version: attribute(
+            Attr::CU_FUNC_ATTRIBUTE_PTX_VERSION,
+            "cuFuncGetAttribute(ptx_version)",
+        )?,
+        binary_version: attribute(
+            Attr::CU_FUNC_ATTRIBUTE_BINARY_VERSION,
+            "cuFuncGetAttribute(binary_version)",
+        )?,
+    })
+}
+
+/// Read every staged parameter value of one captured kernel node.
+///
+/// `cuFuncGetParamInfo` walks the function's parameter layout; the graph node's
+/// `kernelParams` array points at graph-owned host staging for each value.
+fn kernel_param_dumps(
+    func: sys::CUfunction,
+    kernel_params: *mut *mut c_void,
+) -> Result<Option<Vec<KernelParamDump>>> {
+    // The driver caps a kernel's parameter buffer at a few KiB; a runaway index
+    // here means the walk is broken, not that the kernel is huge.
+    const MAX_PARAMS: usize = 4_096;
+    if kernel_params.is_null() {
+        return Ok(None);
+    }
+    let mut dumps = Vec::new();
+    for index in 0..MAX_PARAMS {
+        let mut offset = 0usize;
+        let mut size = 0usize;
+        let result =
+            unsafe { sys::cuFuncGetParamInfo(func, index, &raw mut offset, &raw mut size) };
+        if result == sys::CUresult::CUDA_ERROR_INVALID_VALUE {
+            break;
+        }
+        check(result, "cuFuncGetParamInfo")?;
+        let staged = unsafe { *kernel_params.add(index) };
+        ensure!(
+            !staged.is_null(),
+            "kernel parameter {index} has no staged value"
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(staged.cast::<u8>(), size) }.to_vec();
+        let pointer = (size == 8)
+            .then(|| {
+                let value = u64::from_le_bytes(bytes[..8].try_into().expect("size == 8"));
+                classify_pointer(value)
+            })
+            .flatten();
+        dumps.push(KernelParamDump {
+            offset,
+            size,
+            bytes,
+            pointer,
+        });
+    }
+    Ok(Some(dumps))
+}
+
+/// Resolve an 8-byte parameter value against the CUDA allocation map.
+fn classify_pointer(value: u64) -> Option<PointerRange> {
+    use sys::CUpointer_attribute_enum as Attr;
+    if value == 0 {
+        return None;
+    }
+    let mut memory_type = 0u32;
+    let result = unsafe {
+        sys::cuPointerGetAttribute(
+            (&raw mut memory_type).cast::<c_void>(),
+            Attr::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            value,
+        )
+    };
+    if result != sys::CUresult::CUDA_SUCCESS {
+        return None;
+    }
+    let memory_type = match memory_type {
+        1 => "host",
+        2 => "device",
+        3 => "array",
+        4 => "unified",
+        _ => "unknown",
+    };
+    let mut range_start = 0u64;
+    let mut range_size = 0usize;
+    // Best-effort: a pointer with a memory type but no queryable range keeps
+    // the zero placeholders rather than failing the dump.
+    let _ = unsafe {
+        sys::cuPointerGetAttribute(
+            (&raw mut range_start).cast::<c_void>(),
+            Attr::CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+            value,
+        )
+    };
+    let _ = unsafe {
+        sys::cuPointerGetAttribute(
+            (&raw mut range_size).cast::<c_void>(),
+            Attr::CU_POINTER_ATTRIBUTE_RANGE_SIZE,
+            value,
+        )
+    };
+    Some(PointerRange {
+        memory_type,
+        range_start,
+        range_size,
     })
 }
 
@@ -414,6 +597,93 @@ fn communicate(mut child: Child, input: String, program: &'static str) -> Result
 }
 
 impl GraphDescription {
+    /// Machine-readable dump: everything the DOT carries plus per-kernel
+    /// function attributes and staged parameter bytes, for downstream tooling
+    /// (kernel ledger, capsule extraction) rather than human inspection.
+    fn machine_json(&self, title: &str) -> Result<String> {
+        let mut version = 0i32;
+        check(
+            unsafe { sys::cuDriverGetVersion(&raw mut version) },
+            "cuDriverGetVersion",
+        )?;
+        let nodes = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| match &node.kind {
+                GraphNodeKind::Kernel {
+                    raw_symbol,
+                    demangled,
+                    grid,
+                    block,
+                    dynamic_shared_mem_bytes,
+                    attributes,
+                    params,
+                } => serde_json::json!({
+                    "id": index,
+                    "type": "kernel",
+                    "symbol": raw_symbol,
+                    "name": demangled,
+                    "grid": grid,
+                    "block": block,
+                    "dynamic_shared_mem_bytes": dynamic_shared_mem_bytes,
+                    "attributes": {
+                        "num_regs": attributes.num_regs,
+                        "static_shared_bytes": attributes.static_shared_bytes,
+                        "const_bytes": attributes.const_bytes,
+                        "local_bytes": attributes.local_bytes,
+                        "ptx_version": attributes.ptx_version,
+                        "binary_version": attributes.binary_version,
+                    },
+                    "params": params.as_ref().map(|params| {
+                        params
+                            .iter()
+                            .map(|param| {
+                                serde_json::json!({
+                                    "offset": param.offset,
+                                    "size": param.size,
+                                    "data": hex(&param.bytes),
+                                    "pointer": param.pointer.as_ref().map(|pointer| {
+                                        serde_json::json!({
+                                            "memory_type": pointer.memory_type,
+                                            "range_start": format!("{:#x}", pointer.range_start),
+                                            "range_size": pointer.range_size,
+                                        })
+                                    }),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                }),
+                GraphNodeKind::Other { node_type } => serde_json::json!({
+                    "id": index,
+                    "type": node_type,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let edges = self
+            .edges
+            .iter()
+            .map(|edge| {
+                serde_json::json!({
+                    "from": edge.from,
+                    "to": edge.to,
+                    "from_port": edge.from_port,
+                    "to_port": edge.to_port,
+                    "dependency_type": dependency_type_name(edge.dependency_type),
+                })
+            })
+            .collect::<Vec<_>>();
+        let dump = serde_json::json!({
+            "schema": "pegainfer-cuda-graph-dump/v1",
+            "title": title,
+            "driver_api_version": format_driver_api_version(version),
+            "nodes": nodes,
+            "edges": edges,
+        });
+        serde_json::to_string_pretty(&dump).context("serialize CUDA Graph JSON dump")
+    }
+
     fn detailed_dot(&self) -> String {
         let mut dot = String::from("digraph cuda_graph_detailed {\n");
         dot.push_str("  graph [rankdir=TB];\n  node [shape=box];\n");
@@ -425,6 +695,7 @@ impl GraphDescription {
                     grid,
                     block,
                     dynamic_shared_mem_bytes,
+                    ..
                 } => format!(
                     "id={index}\\ntype=kernel\\nname={}\\nraw_symbol={}\\ngrid={}\\nblock={}\\ndynamic_shared_mem_bytes={dynamic_shared_mem_bytes}",
                     dot_escape(demangled),
@@ -456,6 +727,14 @@ impl GraphDescription {
 
 fn dims(dims: [u32; 3]) -> String {
     format!("({},{},{})", dims[0], dims[1], dims[2])
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn dependency_type_name(dependency_type: u8) -> String {
