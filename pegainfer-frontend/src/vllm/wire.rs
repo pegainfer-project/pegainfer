@@ -115,12 +115,12 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
 
 pub(crate) fn convert_stop_policy(params: &EngineCoreSamplingParams) -> StopPolicy {
     StopPolicy::new(
-        // Qwen3 owns the complete model EOS set in generation_config. The
-        // protocol's optional primary ID only tells us whether EOS is active;
-        // using it as a singleton would miss secondary model EOS IDs.
+        // vLLM lowers secondary model EOS IDs into stop_token_ids. Keep its
+        // primary EOS separate so secondary stops retain their wire reason;
+        // all_stop_token_ids is only for min_tokens masking.
         params
             .eos_token_id
-            .map_or(EosPolicy::Ignore, |_| EosPolicy::ModelDefault),
+            .map_or(EosPolicy::Ignore, EosPolicy::Token),
         params.stop_token_ids.clone(),
     )
 }
@@ -269,7 +269,7 @@ mod tests {
     fn convert_stop_policy_keeps_eos_and_explicit_stops_independent() {
         let mut params = EngineCoreSamplingParams::for_test();
         params.eos_token_id = Some(99);
-        params.stop_token_ids = vec![11];
+        params.stop_token_ids = vec![11, 100];
 
         let policy = convert_stop_policy(&params);
         assert_eq!(
@@ -280,6 +280,21 @@ mod tests {
             policy.classify(11, |_| false),
             Some(crate::engine::StopCause::Token(11))
         );
+        assert_eq!(
+            policy.classify(100, |_| true),
+            Some(crate::engine::StopCause::Token(100)),
+            "secondary EOS IDs must retain a token stop reason"
+        );
+
+        params.eos_token_id = None;
+        params.stop_token_ids = vec![99];
+        params.all_stop_token_ids = BTreeSet::from([99, 100]);
+        let policy = convert_stop_policy(&params);
+        assert_eq!(
+            policy.classify(99, |_| true),
+            Some(crate::engine::StopCause::Token(99))
+        );
+        assert_eq!(policy.classify(100, |_| true), None);
     }
 
     #[test]

@@ -41,7 +41,6 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -917,35 +916,35 @@ fn hedged_ladder_passes_the_lossless_gates() {
                 !stop_requests.is_empty(),
                 "stop child emitted no request marker"
             );
-            let mut context_by_request: HashMap<String, VecDeque<usize>> = HashMap::new();
-            let mut commit_by_request: HashMap<String, VecDeque<usize>> = HashMap::new();
+            let mut context_by_round_request: HashMap<(u64, String), usize> = HashMap::new();
+            let mut commit_by_round_request: HashMap<(u64, String), usize> = HashMap::new();
             for line in child_stderr.lines() {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                let request = fields
-                    .iter()
-                    .find_map(|field| field.strip_prefix("request="));
-                if let Some(request) = request {
-                    if let Some(appended) = fields
-                        .iter()
-                        .find_map(|field| field.strip_prefix("appended="))
-                        .and_then(|value| value.parse::<usize>().ok())
-                    {
-                        context_by_request
-                            .entry(request.to_string())
-                            .or_default()
-                            .push_back(appended);
-                    }
-                    if let Some(accepted_len) = fields
-                        .iter()
-                        .find_map(|field| field.strip_prefix("accepted_len="))
-                        .and_then(|value| value.parse::<usize>().ok())
-                    {
-                        commit_by_request
-                            .entry(request.to_string())
-                            .or_default()
-                            .push_back(accepted_len);
-                    }
-                }
+                let (length_field, lengths) = if line.contains("Qwen3 DFlash context ") {
+                    ("context_len=", &mut context_by_round_request)
+                } else if line.contains("Qwen3 DFlash commit ") {
+                    ("accepted_len=", &mut commit_by_round_request)
+                } else {
+                    continue;
+                };
+                let value = |name: &str| {
+                    line.split_whitespace()
+                        .find_map(|field| field.strip_prefix(name))
+                };
+                let round = value("round=")
+                    .expect("verify round")
+                    .parse::<u64>()
+                    .expect("numeric verify round");
+                let request = value("request=").expect("verify request");
+                let length = value(length_field)
+                    .expect("verify length")
+                    .parse::<usize>()
+                    .expect("numeric verify length");
+                assert!(
+                    lengths
+                        .insert((round, request.to_string()), length)
+                        .is_none(),
+                    "duplicate {length_field} for round={round} request={request}"
+                );
             }
             let mut worker_side_truncation = false;
             for line in child_stderr.lines() {
@@ -957,7 +956,11 @@ fn hedged_ladder_passes_the_lossless_gates() {
                         .find_map(|field| field.strip_prefix(name))
                 };
                 let selected = value("selected=");
-                let request = value("request=");
+                let round = value("round=")
+                    .expect("hedge round")
+                    .parse::<u64>()
+                    .expect("numeric hedge round");
+                let request = value("request=").expect("hedge request");
                 let raw_a = value("raw_a=").and_then(|v| v.parse().ok());
                 let raw_b_lens = value("raw_b_lens=").map(|v| {
                     v.split(',')
@@ -965,29 +968,36 @@ fn hedged_ladder_passes_the_lossless_gates() {
                         .map(|value| value.parse::<usize>().expect("raw B length"))
                         .collect::<Vec<_>>()
                 });
-                let selected_len = value("selected_len=").and_then(|v| v.parse().ok());
-                if !request.is_some_and(|id| stop_requests.contains(id)) {
+                let selected_len = value("selected_len=")
+                    .expect("selected length")
+                    .parse::<usize>()
+                    .expect("numeric selected length");
+                if !stop_requests.contains(request) {
                     continue;
                 }
-                let context_len = request
-                    .and_then(|id| context_by_request.get_mut(id))
-                    .and_then(VecDeque::pop_front);
-                let commit_len = request
-                    .and_then(|id| commit_by_request.get_mut(id))
-                    .and_then(VecDeque::pop_front);
+                let key = (round, request.to_string());
+                let context_len = context_by_round_request
+                    .get(&key)
+                    .expect("same-round DFlash context record");
+                let commit_len = commit_by_round_request
+                    .get(&key)
+                    .expect("same-round KV commit record");
+                assert_eq!(
+                    selected_len, *context_len,
+                    "hedge/context mismatch for round={round} request={request}"
+                );
+                assert_eq!(
+                    selected_len, *commit_len,
+                    "hedge/commit mismatch for round={round} request={request}"
+                );
                 let raw_b_max = raw_b_lens
                     .as_ref()
                     .and_then(|lengths| lengths.iter().copied().max());
                 if raw_b_max.is_some_and(|raw_b| raw_a.is_some_and(|raw_a| raw_b > raw_a))
                     && selected == Some("A")
-                    && selected_len
-                        .is_some_and(|selected| raw_b_max.is_some_and(|raw| selected < raw))
-                    && selected_len.is_some()
-                    && selected_len == context_len
-                    && selected_len == commit_len
+                    && raw_b_max.is_some_and(|raw| selected_len < raw)
                 {
                     worker_side_truncation = true;
-                    break;
                 }
             }
             assert!(

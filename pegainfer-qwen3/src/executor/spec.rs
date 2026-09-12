@@ -48,6 +48,8 @@ impl Qwen3Executor {
         &mut self,
         plan: VerifyPlan<'_>,
     ) -> Result<VerifyResult> {
+        let verify_round = self.verify_round;
+        self.verify_round = self.verify_round.wrapping_add(1);
         anyhow::ensure!(
             self.speculative.is_some(),
             "speculative verification requested but no draft model is loaded"
@@ -106,6 +108,7 @@ impl Qwen3Executor {
             kv_views,
             stop_policies: plan.stop_policies.to_vec(),
             sample_seed: plan.sample_seed,
+            verify_round,
         };
         let outcome = match self.run_step(&step) {
             Ok(outcome) => outcome,
@@ -173,7 +176,8 @@ impl Qwen3Executor {
             }
             if std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
                 log::debug!(
-                    "Qwen3 DFlash commit request={} accepted_len={}",
+                    "Qwen3 DFlash commit round={} request={} accepted_len={}",
+                    verify_round,
                     req_result.request_id,
                     req_result.accepted_tokens.len(),
                 );

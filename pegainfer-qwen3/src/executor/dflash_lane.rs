@@ -201,6 +201,7 @@ impl LocalQwen3Lane {
         requests: &[VerifyStepItem],
         results: &[VerifyRequestResult],
         captured_hidden: Option<&HiddenStates>,
+        verify_round: u64,
     ) -> Result<()> {
         let Some(captured_hidden) = captured_hidden else {
             anyhow::bail!("DFlash verify context capture requested but no hidden states returned");
@@ -242,6 +243,7 @@ impl LocalQwen3Lane {
                 token_offset,
                 result.accepted_tokens.len(),
             )?;
+            let context_len = state.pending_context_len().unwrap_or(0);
             dflash.requests.insert(req.request_id, state);
             dflash.verified_draft_tokens += req.token_ids.len().saturating_sub(1);
             dflash.accepted_draft_tokens += result.matched_draft_tokens;
@@ -251,10 +253,12 @@ impl LocalQwen3Lane {
                 dflash.accepted_draft_tokens as f64 / dflash.verified_draft_tokens as f64
             };
             log::debug!(
-                "Qwen3 DFlash request={} accepted_draft={} committed_tokens={} cumulative_accept_rate={:.3}",
-                req.request_id.raw(),
+                "Qwen3 DFlash context round={} request={} accepted_draft={} committed_tokens={} context_len={} cumulative_accept_rate={:.3}",
+                verify_round,
+                req.request_id,
                 result.matched_draft_tokens,
                 result.accepted_tokens.len(),
+                context_len,
                 rate,
             );
             token_offset += req.token_ids.len();

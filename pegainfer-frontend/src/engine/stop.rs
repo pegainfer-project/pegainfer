@@ -8,6 +8,9 @@ pub enum EosPolicy {
     /// Use the model executor's configured EOS set.
     #[default]
     ModelDefault,
+    /// Use this protocol-provided primary EOS ID; secondary EOS IDs arrive
+    /// in the request's explicit stop-token set.
+    Token(u32),
 }
 
 /// Request-scoped token stopping policy.
@@ -51,12 +54,13 @@ impl StopPolicy {
         token_id: u32,
         is_model_eos: impl FnOnce(u32) -> bool,
     ) -> Option<StopCause> {
-        let is_eos = match self.eos {
+        let is_primary_eos = match self.eos {
             EosPolicy::Ignore => false,
             EosPolicy::ModelDefault => is_model_eos(token_id),
+            EosPolicy::Token(eos_token_id) => token_id == eos_token_id,
         };
 
-        if is_eos {
+        if is_primary_eos {
             Some(StopCause::Eos(token_id))
         } else if self.token_ids.binary_search(&token_id).is_ok() {
             Some(StopCause::Token(token_id))
@@ -117,5 +121,14 @@ mod tests {
             policy.classify(99, |token_id| token_id == 99),
             Some(StopCause::Eos(99))
         );
+    }
+
+    #[test]
+    fn primary_eos_keeps_secondary_model_eos_as_token_stop() {
+        let policy = StopPolicy::new(EosPolicy::Token(1), vec![1, 2]);
+
+        assert_eq!(policy.classify(1, |_| true), Some(StopCause::Eos(1)));
+        assert_eq!(policy.classify(2, |_| true), Some(StopCause::Token(2)));
+        assert_eq!(policy.classify(3, |_| true), None);
     }
 }

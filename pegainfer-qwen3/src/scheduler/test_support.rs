@@ -111,6 +111,7 @@ impl FakeExecutor {
                 let token = 100 + req.request_id.raw() as u32;
                 pegainfer_frontend::engine::TokenLogprob {
                     logprob: -0.1,
+                    rank: 0,
                     top_logprobs: vec![(token, -0.1)],
                 }
             }),
@@ -242,6 +243,7 @@ impl ModelExecutor for FakeExecutor {
                         let token = 200 + req.request_id.raw() as u32;
                         pegainfer_frontend::engine::TokenLogprob {
                             logprob: -0.2,
+                            rank: 0,
                             top_logprobs: vec![(token, -0.2)],
                         }
                     }),
