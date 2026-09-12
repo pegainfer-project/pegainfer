@@ -40,6 +40,24 @@ Not implemented in Phase 1:
 - Prefix-cache or recurrent-state snapshot support.
 - Performance claims.
 
+## Post-Phase 1 Follow-up: RequestKv and Joint Prefix Cache
+
+This follow-up unifies the TP and single-GPU request lifecycle around `RequestKv` and adds joint full-attention KV plus recurrent/conv prefix reuse.
+
+1. **Unified KV lifecycle**
+   - The controller uses one `KvCacheManager` for prefill/decode scheduling and commit.
+   - Immutable `KvView`s carry the logical page ids to every worker; each rank writes its local KV shard into its own `KvBuffer`.
+2. **TP capacity and layout**
+   - Startup validates identical KV geometry and snapshot-slot counts across ranks.
+   - The logical pool is capped by the smallest rank-local physical capacity.
+3. **Joint recurrent snapshots**
+   - Key, pin, and LRU metadata is centralized; recurrent/conv tensors remain rank-local.
+   - Publication reserves one common slot, saves it on every rank, verifies the committed boundary, and only then publishes the key.
+   - Restore follows the same all-rank rule and reports a hit only after every rank confirms the selected boundary.
+4. **Opt-in budget**
+   - `--qwen35-prefix-cache-mib` reserves the snapshot budget independently on each rank.
+   - `0` keeps cold serving.
+
 ## Important Fixes
 
 ### Gated q projection layout

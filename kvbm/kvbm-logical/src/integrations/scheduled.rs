@@ -437,10 +437,23 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         &mut self,
         manager: &BlockManager<T>,
     ) -> Result<usize, ScheduleError> {
+        self.match_and_add_prefix_up_to(manager, usize::MAX)
+    }
+
+    /// Match and add at most `requested_max_blocks` prefix blocks.
+    ///
+    /// This is useful for hybrid models whose auxiliary state
+    /// may only be restorable at a boundary shorter than the longest KV hit.
+    pub fn match_and_add_prefix_up_to(
+        &mut self,
+        manager: &BlockManager<T>,
+        requested_max_blocks: usize,
+    ) -> Result<usize, ScheduleError> {
         self.require_idle()?;
 
         let bs = self.inner.block_size();
-        let max_blocks = self.inner.num_input_tokens().saturating_sub(1) / bs;
+        let max_blocks =
+            (self.inner.num_input_tokens().saturating_sub(1) / bs).min(requested_max_blocks);
         let count = self
             .inner
             .match_and_add_prefix(manager, max_blocks)

@@ -2,9 +2,9 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kv_cache::KvView;
 
 use super::config::Config35;
 use super::config::LocalGeometry;
@@ -67,11 +67,15 @@ impl BatchDecodeBuffers35 {
         config: &Config35,
         geometry: LocalGeometry,
         max_batch_size: usize,
-        max_total_pages: usize,
+        page_size: usize,
         padding_page_id: i32,
     ) -> Result<Self> {
         let h = config.hidden_size;
         let bs = max_batch_size;
+        let max_view_pages = config.max_position_embeddings.div_ceil(page_size).max(1);
+        let page_index_capacity = bs
+            .checked_mul(max_view_pages)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 decode page-index capacity overflow"))?;
         let q_proj_dim = geometry.local_full_attn_gated_q_dim();
         let q_dim = geometry.local_full_attn_q_dim();
         let kv_dim = geometry.local_full_attn_kv_dim();
@@ -108,8 +112,7 @@ impl BatchDecodeBuffers35 {
 
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
-            // Extra capacity for padding slots (at most max_batch_size padding entries).
-            page_indices_d: ctx.stream.alloc_zeros(max_total_pages + bs)?,
+            page_indices_d: ctx.stream.alloc_zeros(page_index_capacity)?,
             page_indptr_d: ctx.stream.alloc_zeros(bs + 1)?,
             last_page_len_d: ctx.stream.alloc_zeros(bs)?,
             request_indices_d: ctx.stream.alloc_zeros(bs)?,
@@ -151,15 +154,15 @@ impl BatchDecodeBuffers35 {
 
     /// Sync paged attention metadata to GPU.
     ///
-    /// `padded_bs` >= `kv_states.len()`: padding slots (if any) point to the
+    /// `padded_bs` >= `views.len()`: padding slots (if any) point to the
     /// reserved padding page with seq_len=1 so FlashInfer accesses valid memory.
-    pub(crate) fn sync_paged_meta(
+    pub(crate) fn sync_paged_views(
         &mut self,
         ctx: &DeviceContext,
-        kv_states: &[&KvState],
+        views: &[KvView],
         padded_bs: usize,
     ) -> Result<()> {
-        let real_bs = kv_states.len();
+        let real_bs = views.len();
         debug_assert!(padded_bs >= real_bs);
 
         let mut all_page_indices = Vec::new();
@@ -167,12 +170,11 @@ impl BatchDecodeBuffers35 {
         let mut last_page_lens = Vec::with_capacity(padded_bs);
         let mut chunk_sizes = Vec::with_capacity(padded_bs);
 
-        for kv in kv_states {
-            let pages = kv.page_indices_i32();
-            all_page_indices.extend_from_slice(&pages);
+        for view in views {
+            all_page_indices.extend_from_slice(view.page_indices());
             indptr.push(all_page_indices.len() as i32);
-            last_page_lens.push(kv.last_page_len() as i32);
-            chunk_sizes.push(kv.seq_len() as i32);
+            last_page_lens.push(view.last_page_len() as i32);
+            chunk_sizes.push(view.seq_len() as i32);
         }
 
         // Padding slots: 1 page (the padding page), seq_len=1, last_page_len=1.
@@ -186,6 +188,12 @@ impl BatchDecodeBuffers35 {
         let request_indices: Vec<i32> = (0..padded_bs as i32).collect();
         let kv_tile_indices = vec![0i32; padded_bs];
 
+        anyhow::ensure!(
+            all_page_indices.len() <= self.page_indices_d.len(),
+            "Qwen3.5 decode page-index overflow: {} view pages exceed buffer capacity {}",
+            all_page_indices.len(),
+            self.page_indices_d.len()
+        );
         ctx.stream
             .memcpy_htod(&all_page_indices, &mut self.page_indices_d)?;
         ctx.stream.memcpy_htod(&indptr, &mut self.page_indptr_d)?;

@@ -2,9 +2,12 @@
 
 use super::*;
 use crate::logprobs::LogprobSnapshot;
+use crate::tp_executor::TpBeginRequestError;
 
 pub(super) struct SingleGpuBackend {
-    model: Qwen35Model,
+    pub(super) model: Qwen35Model,
+    pub(super) kv_cache: Qwen35PrefixCache,
+    recurrent_store: RecurrentStateStore,
     graph_state: BatchDecodeGraphState,
     prefill_stream: Option<Arc<CudaStream>>,
 }
@@ -14,6 +17,12 @@ pub(super) struct SingleGpuBackend {
 pub(super) enum SchedulerBackend {
     Single(SingleGpuBackend),
     Tp(TpSchedulerBackend),
+}
+
+impl Drop for SchedulerBackend {
+    fn drop(&mut self) {
+        self.log_prefix_cache_stats();
+    }
 }
 
 pub(super) struct AsyncPrefillOutput {
@@ -68,37 +77,6 @@ pub(super) fn fatal_cuda_lifecycle(message: &str) -> ! {
     std::process::abort();
 }
 
-/// Borrowed single-GPU prefill inputs, in request order: token windows, KV
-/// states, recurrent states.
-type SinglePrefillViews<'a> = (
-    Vec<&'a [u32]>,
-    &'a mut Vec<KvState>,
-    Vec<&'a mut RecurrentState>,
-);
-
-/// Borrow a single-GPU prefill chunk as the model's prefill inputs.
-fn single_prefill_views(chunk: &mut ScheduledChunk) -> Result<SinglePrefillViews<'_>> {
-    let windows = chunk.windows.iter().map(Vec::as_slice).collect();
-    let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
-        anyhow::bail!("single-GPU prefill received TP chunk state");
-    };
-    Ok((windows, kvs, recs.iter_mut().collect()))
-}
-
-/// Borrow the active decode batch as the model's decode inputs, in slot order:
-/// last tokens and KV states.
-fn single_decode_views(active: &mut [ActiveRequest35]) -> (Vec<u32>, Vec<&mut KvState>) {
-    let tokens = active.iter().map(|r| r.last_token).collect();
-    let kvs = active
-        .iter_mut()
-        .map(|r| match &mut r.backend_state {
-            ActiveBackendState::Single { kv, .. } => kv,
-            ActiveBackendState::Tp { .. } => panic!("single-GPU decode received TP active state"),
-        })
-        .collect();
-    (tokens, kvs)
-}
-
 /// Pair each sampled token with its host logprob row, where one was requested.
 fn attached_logprobs(
     cpu_logits: Vec<Option<LogprobSnapshot>>,
@@ -123,15 +101,155 @@ pub(super) struct TpSchedulerBackend {
     pub(super) pending_compaction: Option<TpSlotCompaction>,
 }
 
+pub(super) enum AdmissionError {
+    Recoverable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl From<TpBeginRequestError> for AdmissionError {
+    fn from(error: TpBeginRequestError) -> Self {
+        match error {
+            TpBeginRequestError::Recoverable(error) => Self::Recoverable(error),
+            TpBeginRequestError::Fatal(error) => Self::Fatal(error),
+        }
+    }
+}
+
 impl SingleGpuBackend {
+    fn schedule_prefill_views(
+        &self,
+        kvs: &mut [Box<RequestKv>],
+        windows: &[Vec<u32>],
+    ) -> Result<Vec<KvView>> {
+        debug_assert_eq!(kvs.len(), windows.len());
+        for (scheduled, (kv, window)) in kvs.iter_mut().zip(windows).enumerate() {
+            if let Err(error) = self.kv_cache.schedule_prefill(kv, window.len()) {
+                revert_scheduled_requests(
+                    &self.kv_cache,
+                    kvs.iter_mut().take(scheduled).map(Box::as_mut),
+                );
+                return Err(error);
+            }
+        }
+        Ok(kvs
+            .iter()
+            .zip(windows)
+            .map(|(kv, window)| self.kv_cache.prefill_view(kv, window.len()))
+            .collect())
+    }
+
+    fn schedule_decode_views(&self, active: &mut [ActiveRequest35]) -> Result<Vec<KvView>> {
+        for (scheduled, request) in active.iter_mut().enumerate() {
+            let ActiveBackendState::Single { kv, .. } = &mut request.backend_state else {
+                panic!("single-GPU decode received TP active state")
+            };
+            if let Err(error) = self.kv_cache.schedule_decode(kv) {
+                revert_scheduled_requests(
+                    &self.kv_cache,
+                    active
+                        .iter_mut()
+                        .take(scheduled)
+                        .filter_map(active_request_kv),
+                );
+                return Err(error);
+            }
+        }
+        Ok(active
+            .iter()
+            .map(|request| match &request.backend_state {
+                ActiveBackendState::Single { kv, .. } => self.kv_cache.decode_view(kv),
+                ActiveBackendState::Tp { .. } => {
+                    panic!("single-GPU decode received TP active state")
+                }
+            })
+            .collect())
+    }
+
+    pub(super) fn apply_prefill(
+        &mut self,
+        chunk: &mut ScheduledChunk,
+        tokens: &[u32],
+    ) -> Result<()> {
+        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
+            anyhow::bail!("single-GPU commit received TP chunk state")
+        };
+        for (i, (kv, rec)) in kvs.iter_mut().zip(recs.iter()).enumerate() {
+            let is_final = chunk.ends[i] == chunk.reqs[i].prompt_tokens.len();
+            let boundary = self
+                .kv_cache
+                .apply_prefill(kv, is_final.then_some(tokens[i]))?;
+            anyhow::ensure!(
+                rec.seq_len == boundary,
+                "Qwen3.5 prefill apply position mismatch: kv={boundary}, recurrent={}",
+                rec.seq_len
+            );
+            if let Some(reservation) = self.kv_cache.reserve_snapshot(kv, boundary)? {
+                if let Err(error) = self.recurrent_store.save(
+                    self.model.device_ctx(),
+                    reservation.recurrent_slot(),
+                    rec,
+                ) {
+                    self.kv_cache.abort_snapshot(reservation);
+                    return Err(error);
+                }
+                self.kv_cache.publish_snapshot(reservation);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_decode(
+        &self,
+        active: &mut [ActiveRequest35],
+        tokens: &[u32],
+    ) -> Result<()> {
+        anyhow::ensure!(active.len() == tokens.len(), "decode apply row mismatch");
+        for (req, &token) in active.iter_mut().zip(tokens) {
+            let ActiveBackendState::Single { kv, .. } = &mut req.backend_state else {
+                anyhow::bail!("single-GPU decode apply received TP state")
+            };
+            self.kv_cache.apply_decode(kv, token)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn log_prefix_cache_stats(&self) {
+        let cache = &self.kv_cache;
+        let stats = cache.stats();
+        info!(
+            "Qwen3.5 prefix cache summary: joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
+            stats.joint_hits,
+            stats.joint_hit_tokens,
+            stats.kv_only_fallbacks,
+            stats.snapshot_misses,
+            stats.inserts,
+            stats.evictions,
+            cache.snapshot_occupancy(),
+            cache.snapshot_slots(),
+        );
+    }
+
     pub(super) fn new(
         model: Qwen35Model,
         max_batch: usize,
         decode_overlap: Qwen35DecodeOverlap,
     ) -> Result<Self> {
         anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
+        let manager =
+            KvCacheManager::from_buffer(model.kv_buffer().clone(), model.kv_buffer().num_blocks())?;
+        let kv_cache = Qwen35PrefixCache::new(manager, model.prefix_snapshot_slots())?;
+        let recurrent_store = RecurrentStateStore::new(
+            model.device_ctx(),
+            model.config(),
+            model.geometry,
+            model.prefix_snapshot_slots(),
+        )?;
+        debug_assert_eq!(recurrent_store.len(), kv_cache.snapshot_slots());
         let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
-        let graph_state = model.create_batch_decode_graph_state_with_capacity(graph_capacity)?;
+        let graph_state = model.create_batch_decode_graph_state_with_capacity(
+            graph_capacity,
+            kv_cache.pool().padding_block_id(),
+        )?;
         let prefill_stream = match decode_overlap {
             Qwen35DecodeOverlap::Off => None,
             Qwen35DecodeOverlap::SharedSm => Some(
@@ -144,6 +262,8 @@ impl SingleGpuBackend {
         };
         Ok(Self {
             model,
+            kv_cache,
+            recurrent_store,
             graph_state,
             prefill_stream,
         })
@@ -163,23 +283,68 @@ impl SingleGpuBackend {
     }
 
     pub(super) fn page_size(&self) -> usize {
-        self.model.kv_pool().layout().page_size
+        self.kv_cache.pool().block_size()
     }
 
     pub(super) fn available_pages(&self) -> usize {
-        self.model.kv_pool().available_pages()
+        self.kv_cache.pool().available_blocks()
+    }
+
+    pub(super) fn active_joint_prefix_pages(&self, req: &SchedulerRequest) -> usize {
+        self.kv_cache
+            .active_joint_prefix_pages(&req.prompt_tokens, req.lora_adapter.as_deref())
     }
 
     pub(super) fn capacity_pages_for_requests(&self) -> usize {
-        self.model.kv_pool().capacity_pages().saturating_sub(1)
+        self.kv_cache.pool().max_request_blocks()
     }
 
     pub(super) fn max_position_embeddings(&self) -> usize {
         self.model.config().max_position_embeddings
     }
 
-    pub(super) fn alloc_kv(&self) -> KvState {
-        self.model.alloc_kv()
+    pub(super) fn alloc_prefill_state(
+        &mut self,
+        req: &SchedulerRequest,
+    ) -> Result<(PrefillBackendState, usize), AdmissionError> {
+        let mut rec = self
+            .alloc_recurrent()
+            .map_err(AdmissionError::Recoverable)?;
+        let (mut kv, restore) = self
+            .kv_cache
+            .begin_request(
+                &req.prompt_tokens,
+                req.max_tokens,
+                req.lora_adapter.as_deref(),
+                true,
+            )
+            .map_err(AdmissionError::Recoverable)?;
+        let cached_tokens = if let Some(restore) = restore {
+            if let Err(error) = self.recurrent_store.restore(
+                self.model.device_ctx(),
+                restore.recurrent_slot(),
+                &mut rec,
+            ) {
+                let _ = self.kv_cache.release_request(&mut kv);
+                return Err(AdmissionError::Recoverable(error));
+            }
+            match self.kv_cache.finish_restore(&kv, restore, &[rec.seq_len]) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    let _ = self.kv_cache.release_request(&mut kv);
+                    return Err(AdmissionError::Recoverable(error));
+                }
+            }
+        } else {
+            0
+        };
+        Ok((
+            PrefillBackendState::Single {
+                kv: Box::new(kv),
+                rec,
+            },
+            cached_tokens,
+        ))
     }
 
     pub(super) fn alloc_recurrent(&self) -> Result<RecurrentState> {
@@ -191,8 +356,22 @@ impl SingleGpuBackend {
     }
 
     pub(super) fn batch_prefill_logits(&self, chunk: &mut ScheduledChunk) -> Result<HiddenStates> {
-        let (windows, kvs, mut recs) = single_prefill_views(chunk)?;
-        self.model.batch_prefill_logits(&windows, kvs, &mut recs)
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
+        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
+            anyhow::bail!("single-GPU prefill received TP chunk state");
+        };
+        let views = self.schedule_prefill_views(kvs, &chunk.windows)?;
+        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
+        let result = self.model.batch_prefill_logits(
+            &window_refs,
+            &views,
+            &mut rec_refs,
+            self.kv_cache.buffer(),
+        );
+        if result.is_err() {
+            revert_scheduled_requests(&self.kv_cache, kvs.iter_mut().map(Box::as_mut));
+        }
+        result
     }
 
     pub(super) fn overlap_enabled(&self) -> bool {
@@ -214,12 +393,18 @@ impl SingleGpuBackend {
             .join(&self.model.device_ctx().stream)
             .map_err(|err| anyhow::anyhow!("join Qwen3.5 prefill stream: {err}"))?;
 
-        let (windows, kvs, mut recs) = single_prefill_views(chunk)?;
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
+        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
+            anyhow::bail!("single-GPU async prefill received TP chunk state");
+        };
+        let views = self.schedule_prefill_views(kvs, &chunk.windows)?;
+        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
         let logits = match self.model.batch_prefill_logits_on_stream(
             Arc::clone(&prefill_stream),
-            &windows,
-            kvs,
-            &mut recs,
+            &window_refs,
+            &views,
+            self.kv_cache.buffer(),
+            &mut rec_refs,
         ) {
             Ok(logits) => logits,
             Err(err) => {
@@ -228,6 +413,7 @@ impl SingleGpuBackend {
                         "Qwen3.5 async prefill failed ({err}); stream drain failed: {sync_err}"
                     ));
                 }
+                revert_scheduled_requests(&self.kv_cache, kvs.iter_mut().map(Box::as_mut));
                 return Err(err);
             }
         };
@@ -255,26 +441,56 @@ impl SingleGpuBackend {
         chunk: &mut ScheduledChunk,
         active: &mut [ActiveRequest35],
     ) -> Result<crate::unified_forward::UnifiedStepOutput> {
-        let (windows, kvs, mut recs) = single_prefill_views(chunk)?;
-        let (decode_tokens, mut decode_kvs) = single_decode_views(active);
-        self.model.unified_step(
-            &windows,
-            kvs,
-            &mut recs,
+        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
+        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
+            anyhow::bail!("single-GPU unified step received TP chunk state");
+        };
+        let prefill_views = self.schedule_prefill_views(kvs, &chunk.windows)?;
+        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
+        let decode_tokens: Vec<u32> = active.iter().map(|r| r.last_token).collect();
+        let decode_views = match self.schedule_decode_views(active) {
+            Ok(views) => views,
+            Err(error) => {
+                revert_scheduled_requests(&self.kv_cache, kvs.iter_mut().map(Box::as_mut));
+                return Err(error);
+            }
+        };
+        let result = self.model.unified_step(
+            &window_refs,
+            &prefill_views,
+            &mut rec_refs,
             &decode_tokens,
-            &mut decode_kvs,
+            &decode_views,
+            self.kv_cache.buffer(),
             &mut self.graph_state,
-        )
+        );
+        if result.is_err() {
+            revert_scheduled_requests(&self.kv_cache, kvs.iter_mut().map(Box::as_mut));
+            revert_scheduled_requests(
+                &self.kv_cache,
+                active.iter_mut().filter_map(active_request_kv),
+            );
+        }
+        result
     }
 
     pub(super) fn decode_graph(&mut self, active: &mut [ActiveRequest35]) -> Result<()> {
-        let (tokens, mut kvs) = single_decode_views(active);
-        self.model.batch_decode_graph(
-            &tokens,
-            &mut kvs,
+        let token_ids: Vec<u32> = active.iter().map(|r| r.last_token).collect();
+        let views = self.schedule_decode_views(active)?;
+        let result = self.model.batch_decode_graph(
+            &token_ids,
+            &views,
+            self.kv_cache.buffer(),
             &mut self.graph_state,
             crate::batch_decode::DecodeGraphUse::Serve,
-        )
+        );
+        if result.is_err() {
+            revert_scheduled_requests(
+                &self.kv_cache,
+                active.iter_mut().filter_map(active_request_kv),
+            );
+        }
+        result
     }
 
     pub(super) fn sample_prefill_logits(
@@ -389,19 +605,44 @@ impl SingleGpuBackend {
 }
 
 impl TpSchedulerBackend {
+    pub(super) fn alloc_prefill_state(
+        &mut self,
+        req: &SchedulerRequest,
+    ) -> Result<(PrefillBackendState, usize), AdmissionError> {
+        let request_id = self.alloc_request_id();
+        let cached_tokens = self
+            .executor
+            .begin_request(
+                request_id,
+                &req.prompt_tokens,
+                req.max_tokens,
+                req.lora_adapter.as_deref(),
+                true,
+            )
+            .map_err(AdmissionError::from)?;
+        Ok((PrefillBackendState::Tp { request_id }, cached_tokens))
+    }
+
+    pub(super) fn active_joint_prefix_pages(&self, req: &SchedulerRequest) -> usize {
+        self.executor
+            .active_joint_prefix_pages(&req.prompt_tokens, req.lora_adapter.as_deref())
+    }
+
     pub(super) fn new(
         model_path: &str,
         device_ordinals: &[usize],
         max_batch: usize,
         max_prefill_tokens: usize,
         enable_cuda_graph: bool,
+        prefix_snapshot_bytes: usize,
     ) -> Result<Self> {
-        let executor = Qwen35TpExecutor::from_runtime_with_limits(
+        let executor = Qwen35TpExecutor::from_runtime_with_limits_and_prefix(
             model_path,
             enable_cuda_graph,
             device_ordinals,
             max_batch,
             max_prefill_tokens,
+            prefix_snapshot_bytes,
         )?;
         Ok(Self {
             executor,
@@ -438,24 +679,14 @@ impl TpSchedulerBackend {
 
     pub(super) fn available_pages(
         &self,
-        active: &[ActiveRequest35],
-        prefilling: &[PrefillingRequest35],
+        _active: &[ActiveRequest35],
+        _prefilling: &[PrefillingRequest35],
     ) -> usize {
-        let page_size = self.page_size();
-        let active_pages: usize = active
-            .iter()
-            .map(|req| pages_needed(current_active_tokens(req), page_size))
-            .sum();
-        let prefilling_pages: usize = prefilling
-            .iter()
-            .map(|req| pages_needed(req.cursor, page_size))
-            .sum();
-        self.capacity_pages_for_requests()
-            .saturating_sub(active_pages.saturating_add(prefilling_pages))
+        self.executor.available_pages()
     }
 
     pub(super) fn execute_prefill_chunk(
-        &self,
+        &mut self,
         chunk: &ScheduledChunk,
         sample_seed: u64,
     ) -> Result<Vec<Option<PrefillArtifact>>> {
@@ -463,23 +694,27 @@ impl TpSchedulerBackend {
         let result = self
             .executor
             .execute_prefill_chunks_with_seed(&items, sample_seed)?;
-        align_prefill_results(chunk, &result)
-            .map_err(|err| self.executor.poison_artifact_contract("prefill", &err))
+        align_prefill_results(chunk, &result).map_err(|err| {
+            self.executor
+                .poison_after_mutation("prefill artifacts", &err)
+        })
     }
 
     pub(super) fn execute_decode(
-        &self,
+        &mut self,
         active: &[ActiveRequest35],
         sample_seed: u64,
     ) -> Result<Vec<DecodeArtifact>> {
         let items = tp_decode_items(active)?;
         let result = self.executor.execute_decode_items(&items, sample_seed)?;
-        align_decode_results(active, &result)
-            .map_err(|err| self.executor.poison_artifact_contract("decode", &err))
+        align_decode_results(active, &result).map_err(|err| {
+            self.executor
+                .poison_after_mutation("decode artifacts", &err)
+        })
     }
 
     pub(super) fn execute_unified(
-        &self,
+        &mut self,
         chunk: &ScheduledChunk,
         active: &[ActiveRequest35],
         decode_sample_seed: u64,
@@ -494,17 +729,17 @@ impl TpSchedulerBackend {
         let result = self.executor.execute_unified(&plan)?;
         let prefill = align_prefill_results(chunk, &result.prefill).map_err(|err| {
             self.executor
-                .poison_artifact_contract("unified prefill", &err)
+                .poison_after_mutation("unified prefill artifacts", &err)
         })?;
         let decode = align_decode_results(active, &result.decode).map_err(|err| {
             self.executor
-                .poison_artifact_contract("unified decode", &err)
+                .poison_after_mutation("unified decode artifacts", &err)
         })?;
         Ok(AlignedUnifiedArtifacts { prefill, decode })
     }
 
     pub(super) fn drop_request(
-        &self,
+        &mut self,
         request_id: RequestId,
         expectation: DropExpectation,
     ) -> Result<()> {
@@ -546,6 +781,32 @@ impl TpSchedulerBackend {
 }
 
 impl SchedulerBackend {
+    pub(super) fn log_prefix_cache_stats(&self) {
+        match self {
+            Self::Single(backend) => backend.log_prefix_cache_stats(),
+            Self::Tp(backend) => backend.executor.log_prefix_cache_stats(),
+        }
+    }
+
+    pub(super) fn active_joint_prefix_pages(&self, req: &SchedulerRequest) -> usize {
+        match self {
+            Self::Single(backend) => backend.active_joint_prefix_pages(req),
+            Self::Tp(backend) => backend.active_joint_prefix_pages(req),
+        }
+    }
+
+    pub(super) fn snapshot_stride(&self) -> Option<usize> {
+        match self {
+            Self::Single(backend) if backend.kv_cache.enabled() => {
+                Some(crate::prefix_cache::SNAPSHOT_STRIDE_TOKENS)
+            }
+            Self::Tp(backend) if backend.executor.prefix_cache_enabled() => {
+                Some(crate::prefix_cache::SNAPSHOT_STRIDE_TOKENS)
+            }
+            Self::Single(_) | Self::Tp(_) => None,
+        }
+    }
+
     pub(super) fn max_batch(&self) -> usize {
         match self {
             Self::Single(backend) => backend.max_batch(),
@@ -585,15 +846,13 @@ impl SchedulerBackend {
         }
     }
 
-    pub(super) fn alloc_prefill_state(&mut self) -> Result<PrefillBackendState> {
+    pub(super) fn alloc_prefill_state(
+        &mut self,
+        req: &SchedulerRequest,
+    ) -> Result<(PrefillBackendState, usize), AdmissionError> {
         match self {
-            Self::Single(backend) => Ok(PrefillBackendState::Single {
-                kv: backend.alloc_kv(),
-                rec: backend.alloc_recurrent()?,
-            }),
-            Self::Tp(backend) => Ok(PrefillBackendState::Tp {
-                request_id: backend.alloc_request_id(),
-            }),
+            Self::Single(backend) => backend.alloc_prefill_state(req),
+            Self::Tp(backend) => backend.alloc_prefill_state(req),
         }
     }
 

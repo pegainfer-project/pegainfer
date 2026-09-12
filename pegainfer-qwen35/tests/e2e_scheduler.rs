@@ -718,6 +718,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
             8192,
             pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
             pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+            0,
         )
         .expect("Failed to start Qwen3.5 default-Off scheduler");
         let mut off_rx = submit_repeated_token_request(
@@ -757,6 +758,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
             8192,
             pegainfer_qwen35::Qwen35SchedulerPolicy::Auto,
             pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
+            0,
         )
         .expect("Failed to start Qwen3.5 auto + shared-SM scheduler");
         let mut auto_load = auto_handle
@@ -811,6 +813,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         8192,
         pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
         pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
+        0,
     )
     .expect("Failed to start Qwen3.5 shared-SM scheduler");
     let mut load = handle

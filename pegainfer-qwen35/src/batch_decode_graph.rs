@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use pegainfer_core::cuda_graph::CudaGraphState;
-use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::tensor::DeviceContext;
 
 use super::config::Config35;
@@ -62,18 +61,16 @@ impl BatchDecodeGraphState {
         ctx: &DeviceContext,
         config: &Config35,
         geometry: LocalGeometry,
-        kv_pool: &KvPool,
+        page_size: usize,
+        padding_page_id: i32,
         max_batch: usize,
     ) -> Result<Self> {
-        let padding_page_id = kv_pool.padding_page_id();
-        let max_total_pages = kv_pool.capacity_pages();
-
         let buffers = BatchDecodeBuffers35::new(
             ctx,
             config,
             geometry,
             max_batch,
-            max_total_pages,
+            page_size,
             padding_page_id,
         )?;
 
@@ -116,17 +113,9 @@ impl BatchDecodeGraphState {
         src: &RecurrentState,
         slot_idx: usize,
     ) -> Result<()> {
-        let dst = &mut self.slot_states[slot_idx];
-        for (dst_layer, src_layer) in dst.layers.iter_mut().zip(src.layers.iter()) {
-            ctx.stream
-                .memcpy_dtod(&src_layer.state, &mut dst_layer.state)
-                .map_err(|e| anyhow::anyhow!("copy recurrent state to slot {slot_idx}: {e}"))?;
-            ctx.stream
-                .memcpy_dtod(&src_layer.conv_state.data, &mut dst_layer.conv_state.data)
-                .map_err(|e| anyhow::anyhow!("copy conv state to slot {slot_idx}: {e}"))?;
-        }
-        dst.seq_len = src.seq_len;
-        Ok(())
+        self.slot_states[slot_idx]
+            .copy_from(ctx, src)
+            .map_err(|e| anyhow::anyhow!("copy recurrent state to slot {slot_idx}: {e}"))
     }
 
     /// D2D move slot `from` into slot `to`, leaving `to` as the canonical

@@ -21,6 +21,9 @@ pub struct Qwen35Line;
 // Qwen3.5-exclusive CLI flags.
 #[derive(ClapArgs)]
 struct Qwen35Cli {
+    /// Per-rank GPU budget in MiB for joint prefix snapshots; zero disables reuse.
+    #[arg(long, default_value_t = 0)]
+    qwen35_prefix_cache_mib: usize,
     /// Decode-batch capacity, 1..=64. Qwen3.5 internally rounds allocation to
     /// the next graph bucket but admits only this many scheduler slots; defaults
     /// to 64.
@@ -92,6 +95,7 @@ impl ModelLine for Qwen35Line {
             "device_ordinal",
             "tp_size",
             "cuda_graph",
+            "no_prefix_cache",
             "max_prefill_tokens",
             "decode_overlap",
             "decode_sm_pct",
@@ -105,6 +109,11 @@ impl ModelLine for Qwen35Line {
     ) -> Result<(), CliError> {
         let cli = cli(ctx);
         let decode_overlap = resolve_decode_overlap(ctx.shared.decode_overlap)?;
+        if cli.qwen35_prefix_cache_mib > 0 && ctx.shared.no_prefix_cache {
+            return Err(CliError::rule(
+                "--qwen35-prefix-cache-mib and --no-prefix-cache are contradictory",
+            ));
+        }
         if let Some(max_batch) = cli.max_batch {
             if !(1..=crate::MAX_DECODE_BATCH).contains(&max_batch) {
                 return Err(CliError::rule(format!(
@@ -142,6 +151,7 @@ impl ModelLine for Qwen35Line {
         crate::launch_with_options_policy_and_overlap(
             ctx.model_path,
             Qwen35LaunchOptions {
+                prefix_cache_mib: cli.qwen35_prefix_cache_mib,
                 device_ordinal: ctx.shared.device_ordinal,
                 tp_size: ctx.shared.tp_size,
                 cuda_graph: ctx.shared.cuda_graph,
@@ -176,6 +186,33 @@ mod tests {
             matches: &matches,
         };
         MODEL_LINE.validate(&ctx, &provided)
+    }
+
+    #[test]
+    fn accepts_prefix_cache_on_tp1_and_tp2() {
+        validate_argv(&["pegainfer", "--qwen35-prefix-cache-mib", "128"]).unwrap();
+        validate_argv(&[
+            "pegainfer",
+            "--tp-size",
+            "2",
+            "--cuda-graph=false",
+            "--qwen35-prefix-cache-mib",
+            "128",
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_contradictory_prefix_cache_flags() {
+        let error = validate_argv(&[
+            "pegainfer",
+            "--qwen35-prefix-cache-mib",
+            "128",
+            "--no-prefix-cache",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("contradictory"), "{error}");
     }
 
     #[test]

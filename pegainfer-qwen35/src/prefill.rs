@@ -20,9 +20,10 @@ pub(crate) const SCRATCH_ESTIMATE_SEQ: usize = 20_000;
 pub(crate) const PREFILL_CHUNK_LEN: usize = SCRATCH_ESTIMATE_SEQ;
 const HEAD_DIM: usize = 256;
 
-use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kv_cache::KvBuffer;
+use pegainfer_kv_cache::KvView;
 
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
@@ -34,6 +35,13 @@ use super::weights::TransformerBlock35;
 use crate::ffi;
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
+
+struct PrefillKvAccess<'a> {
+    buffer: &'a cudarc::driver::CudaSlice<half::bf16>,
+    layout: pegainfer_core::kv_pool::KvLayout,
+    plan: &'a PrefillPagedPlan,
+    base_pos: usize,
+}
 
 fn checked_prefill_end_pos(
     base_pos: usize,
@@ -54,21 +62,28 @@ impl Qwen35Model {
     pub(super) fn prefill_last_hidden(
         &self,
         token_ids: &[u32],
-        kv_state: &mut KvState,
+        full_view: &KvView,
+        kv_buffer: &KvBuffer,
         recurrent: &mut RecurrentState,
     ) -> Result<DeviceVec> {
-        let seq_len = token_ids.len();
         anyhow::ensure!(
-            seq_len > 0,
-            "Qwen3.5 prefill_last_hidden requires at least one token"
+            !token_ids.is_empty(),
+            "Qwen3.5 prefill requires at least one token"
         );
-        let c = &self.config;
-
         // Validate the full target range up front (position overflow + RoPE cache
         // coverage) so an out-of-range prompt is rejected before any chunk mutates
         // the KV / recurrent state, rather than failing partway through.
-        let base_pos = kv_state.seq_len();
-        let end_pos = checked_prefill_end_pos(base_pos, seq_len, c.max_position_embeddings)?;
+        let base_pos = recurrent.seq_len;
+        let end_pos = checked_prefill_end_pos(
+            base_pos,
+            token_ids.len(),
+            self.config.max_position_embeddings,
+        )?;
+        anyhow::ensure!(
+            full_view.seq_len() == end_pos,
+            "Qwen3.5 prefill view ends at {}, expected {end_pos}",
+            full_view.seq_len()
+        );
         self.ensure_rope_cache_covers(end_pos)?;
 
         // Run prefill in serial chunks of at most `PREFILL_CHUNK_LEN` tokens. Each
@@ -76,15 +91,54 @@ impl Qwen35Model {
         // place, so the next chunk continues from the previous one. This caps the
         // per-pass GDR scratch (which grows with the pass length) at the budget
         // reserved at startup, so prompts longer than one chunk prefill without OOM.
-        let mut hidden_batch: Option<HiddenStates> = None;
+        let page_size = kv_buffer.layout().page_size;
+        let mut hidden_batch = None;
+        let mut offset = 0usize;
         for chunk in token_ids.chunks(PREFILL_CHUNK_LEN) {
             // Free the previous chunk's hidden states before allocating the next
             // chunk's scratch so peak memory stays within one chunk's reservation.
             drop(hidden_batch.take());
-            hidden_batch = Some(self.prefill_chunk_forward(chunk, kv_state, recurrent)?);
+            let (chunk_hidden, chunk_scratch) = self.prepare_prefill_chunk(chunk)?;
+            let chunk_end = base_pos + offset + chunk.len();
+            let page_count = chunk_end.div_ceil(page_size);
+            let chunk_view = KvView::new(
+                full_view.page_indices()[..page_count].to_vec(),
+                chunk_end,
+                page_size,
+            );
+            let page_indices = vec![chunk_view.page_indices().to_vec()];
+            let plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+                &self.ctx,
+                &page_indices,
+                &[chunk_view.last_page_len()],
+                &[base_pos + offset],
+                &[chunk.len()],
+                self.geometry.local_num_attention_heads(),
+                self.geometry.local_num_key_value_heads(),
+                self.config.head_dim,
+                0,
+            )?;
+            let access = PrefillKvAccess {
+                buffer: kv_buffer.buffer(),
+                layout: pegainfer_core::kv_pool::KvLayout::new(
+                    kv_buffer.layout().num_layers,
+                    kv_buffer.layout().num_kv_heads,
+                    kv_buffer.layout().head_dim,
+                    page_size,
+                )?,
+                plan: &plan,
+                base_pos: base_pos + offset,
+            };
+            hidden_batch = Some(self.prefill_chunk_forward(
+                chunk_hidden,
+                chunk_scratch,
+                &access,
+                recurrent,
+            )?);
+            offset += chunk.len();
         }
         // `seq_len > 0` guarantees at least one chunk produced hidden states.
-        let hidden_batch = hidden_batch.expect("prefill produced no chunk despite seq_len > 0");
+        let hidden_batch = hidden_batch.expect("non-empty prefill produced no chunk");
 
         // Last-token logic runs once, on the final chunk's output.
         ops::extract_vec(&self.ctx, &hidden_batch, hidden_batch.seq_len - 1)
@@ -129,65 +183,39 @@ impl Qwen35Model {
         Ok(logits)
     }
 
-    /// Forward one prefill chunk through all layers, advancing the paged KV state
-    /// and the linear-attention recurrent/conv state in place.
-    ///
-    /// `token_ids.len()` must be in `1..=PREFILL_CHUNK_LEN` so the per-chunk GDR
-    /// scratch stays within the startup reservation. Returns the chunk's hidden
-    /// states for every token; only the final chunk's last token feeds the LM head.
-    fn prefill_chunk_forward(
+    fn prepare_prefill_chunk(
         &self,
         token_ids: &[u32],
-        kv_state: &mut KvState,
-        recurrent: &mut RecurrentState,
-    ) -> Result<HiddenStates> {
+    ) -> Result<(HiddenStates, GdrChunkwiseScratch35)> {
         let seq_len = token_ids.len();
-        debug_assert!(
-            seq_len > 0 && seq_len <= PREFILL_CHUNK_LEN,
-            "prefill chunk length {seq_len} out of range 1..={PREFILL_CHUNK_LEN}"
-        );
         let c = &self.config;
-        let base_pos = kv_state.seq_len();
-        let end_pos = checked_prefill_end_pos(base_pos, seq_len, c.max_position_embeddings)?;
-        self.ensure_rope_cache_covers(end_pos)?;
 
         // Embeddings for this chunk.
         let token_ids_gpu = self
             .ctx
             .stream
             .clone_htod(token_ids)
-            .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
-
-        let hidden_dim = c.hidden_size;
-        let mut hidden_batch = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
+            .map_err(|e| anyhow::anyhow!("H2D copy failed: {e}"))?;
+        let mut hidden_batch = HiddenStates::zeros(&self.ctx, c.hidden_size, seq_len)?;
         ops::embedding_batch(
             &self.ctx,
             &self.embed_tokens,
             &token_ids_gpu,
             &mut hidden_batch,
         )?;
-
-        // Allocate the chunk scratch before advancing the KV state. It is the
-        // largest, most allocation-prone buffer here, so failing first leaves
-        // `kv_state` untouched and the request can be rejected cleanly.
-        let mut gdr_chunkwise_scratch =
+        let gdr_chunkwise_scratch =
             GdrChunkwiseScratch35::new(&self.ctx, c, self.geometry, seq_len)?;
+        Ok((hidden_batch, gdr_chunkwise_scratch))
+    }
 
-        // Advance paged KV state and build this chunk's prefill plan.
-        kv_state.ensure_capacity(end_pos)?;
-        kv_state.advance(seq_len);
-        let kv_desc = kv_state.desc();
-        let geom = self.geometry;
-        let prefill_plan = PrefillPagedPlan::new(
-            &self.ctx,
-            &kv_desc,
-            base_pos,
-            seq_len,
-            geom.local_num_attention_heads(),
-            geom.local_num_key_value_heads(),
-            c.head_dim,
-        )?;
-
+    fn prefill_chunk_forward(
+        &self,
+        mut hidden_batch: HiddenStates,
+        mut gdr_chunkwise_scratch: GdrChunkwiseScratch35,
+        kv: &PrefillKvAccess<'_>,
+        recurrent: &mut RecurrentState,
+    ) -> Result<HiddenStates> {
+        let seq_len = hidden_batch.seq_len;
         // Process layers
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
@@ -200,14 +228,13 @@ impl Qwen35Model {
                 &mut gdr_chunkwise_scratch,
                 &mut linear_idx,
                 &mut full_idx,
-                kv_state,
-                &prefill_plan,
+                kv,
                 recurrent,
             )?;
         }
 
         // Advance recurrent token count for the next chunk / decode step; the
-        // paged KV position is tracked by `kv_state` (advanced above).
+        // paged KV position is committed by the caller.
         recurrent.seq_len += seq_len;
 
         Ok(hidden_batch)
@@ -223,8 +250,7 @@ impl Qwen35Model {
         gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
         linear_idx: &mut usize,
         full_idx: &mut usize,
-        kv_state: &KvState,
-        prefill_plan: &PrefillPagedPlan,
+        kv: &PrefillKvAccess<'_>,
         recurrent: &mut RecurrentState,
     ) -> Result<HiddenStates> {
         let c = &self.config;
@@ -250,8 +276,7 @@ impl Qwen35Model {
                 attn,
                 &normed_batch,
                 full_idx,
-                kv_state,
-                prefill_plan,
+                kv,
                 attn_out_dim,
                 seq_len,
             )?,
@@ -289,8 +314,7 @@ impl Qwen35Model {
         attn: &FullAttentionLayer,
         normed_batch: &HiddenStates,
         full_idx: &mut usize,
-        kv_state: &KvState,
-        prefill_plan: &PrefillPagedPlan,
+        kv: &PrefillKvAccess<'_>,
         _attn_out_dim: usize,
         seq_len: usize,
     ) -> Result<HiddenStates> {
@@ -305,16 +329,14 @@ impl Qwen35Model {
         let v_batch = ops::gemm(&self.ctx, &attn.v_proj, normed_batch)?;
         let mut attn_out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
 
-        // `kv_state` was advanced by `seq_len` before the layer loop, so the
-        // base write position for this prefill is `seq_len()` minus this batch.
-        let base_pos = kv_state.seq_len() - seq_len;
+        let base_pos = kv.base_pos;
         let mut q_prepped = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
         let start_pos_cpu: CudaSlice<i32> = self
             .ctx
             .stream
             .clone_htod(&[base_pos as i32])
             .map_err(|e| anyhow::anyhow!("H2D start_pos failed: {e}"))?;
-        let layout = kv_state.layout();
+        let layout = &kv.layout;
         let layer_k_off = (*full_idx * layout.layer_stride) as i64;
         let layer_v_off = layer_k_off + layout.kv_block_len as i64;
         let stride_page = layout.page_stride as i64;
@@ -329,8 +351,8 @@ impl Qwen35Model {
             let (cos_ptr, _) = self.cos_cache.data.device_ptr(&self.ctx.stream);
             let (sin_ptr, _) = self.sin_cache.data.device_ptr(&self.ctx.stream);
             let (qp_ptr, _) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-            let (buf_ptr, _) = kv_state.buffer().device_ptr(&self.ctx.stream);
-            let (pi_ptr, _) = prefill_plan.page_indices_d().device_ptr(&self.ctx.stream);
+            let (buf_ptr, _) = kv.buffer.device_ptr(&self.ctx.stream);
+            let (pi_ptr, _) = kv.plan.page_indices_d().device_ptr(&self.ctx.stream);
             let (sp_ptr, _) = start_pos_cpu.device_ptr(&self.ctx.stream);
             ffi::prefill_attention_hd256_prep_paged_cuda(
                 qf_ptr as *const ffi::Half,
@@ -360,24 +382,18 @@ impl Qwen35Model {
         // Step 2: Batch prefill paged attention (HD=256).
         let sm_scale = 1.0f32 / f32::sqrt(HEAD_DIM as f32);
         {
-            let (buf_ptr, _gbuf) = kv_state.buffer().device_ptr(&self.ctx.stream);
+            let (buf_ptr, _gbuf) = kv.buffer.device_ptr(&self.ctx.stream);
             let (qp_ptr, _gqp) = q_prepped.data.device_ptr(&self.ctx.stream);
             let (out_ptr, _go) = attn_out_batch.data.device_ptr_mut(&self.ctx.stream);
-            let (pi_ptr, _gpi) = prefill_plan.page_indices_d().device_ptr(&self.ctx.stream);
-            let (pip_ptr, _gpip) = prefill_plan.page_indptr_d().device_ptr(&self.ctx.stream);
-            let (lpl_ptr, _glpl) = prefill_plan.last_page_len_d().device_ptr(&self.ctx.stream);
-            let (qi_ptr, _gqi) = prefill_plan.q_indptr_d().device_ptr(&self.ctx.stream);
-            let (ri_ptr, _gri) = prefill_plan
-                .request_indices_d()
-                .device_ptr(&self.ctx.stream);
-            let (qti_ptr, _gqti) = prefill_plan
-                .qo_tile_indices_d()
-                .device_ptr(&self.ctx.stream);
-            let (kti_ptr, _gkti) = prefill_plan
-                .kv_tile_indices_d()
-                .device_ptr(&self.ctx.stream);
-            let (kcs_ptr, _gkcs) = prefill_plan.kv_chunk_size_d().device_ptr(&self.ctx.stream);
-            let (tnr_ptr, _gtnr) = prefill_plan.total_num_rows_d().device_ptr(&self.ctx.stream);
+            let (pi_ptr, _gpi) = kv.plan.page_indices_d().device_ptr(&self.ctx.stream);
+            let (pip_ptr, _gpip) = kv.plan.page_indptr_d().device_ptr(&self.ctx.stream);
+            let (lpl_ptr, _glpl) = kv.plan.last_page_len_d().device_ptr(&self.ctx.stream);
+            let (qi_ptr, _gqi) = kv.plan.q_indptr_d().device_ptr(&self.ctx.stream);
+            let (ri_ptr, _gri) = kv.plan.request_indices_d().device_ptr(&self.ctx.stream);
+            let (qti_ptr, _gqti) = kv.plan.qo_tile_indices_d().device_ptr(&self.ctx.stream);
+            let (kti_ptr, _gkti) = kv.plan.kv_tile_indices_d().device_ptr(&self.ctx.stream);
+            let (kcs_ptr, _gkcs) = kv.plan.kv_chunk_size_d().device_ptr(&self.ctx.stream);
+            let (tnr_ptr, _gtnr) = kv.plan.total_num_rows_d().device_ptr(&self.ctx.stream);
             let result = unsafe {
                 ffi::batch_prefill_paged_cuda_hd256(
                     qp_ptr as *const ffi::Half,
@@ -399,8 +415,8 @@ impl Qwen35Model {
                     HEAD_DIM as i32,
                     layout.page_size as i32,
                     seq_len as i32,
-                    prefill_plan.batch_size(),
-                    prefill_plan.num_tiles(),
+                    kv.plan.batch_size(),
+                    kv.plan.num_tiles(),
                     stride_page,
                     sm_scale,
                     self.ctx.stream.cu_stream(),

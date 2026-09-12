@@ -266,6 +266,7 @@ fn closed_pending_work_is_pruned_before_admission() {
         128,
         |req| req.prompt_tokens.len(),
         |req| req.max_tokens,
+        |_| 0,
     );
     assert_eq!(admission.pending.len(), 1);
     assert!(admission.deferred.is_empty());
@@ -306,7 +307,7 @@ fn closed_resident_work_is_absent_from_post_prune_load() {
     assert_eq!(backend.retired_active, vec![RequestId::new(10)]);
     assert_eq!(
         backend.dropped_prefilling,
-        vec![(RequestId::new(12), DropExpectation::MustBeAbsent)]
+        vec![(RequestId::new(12), DropExpectation::MustExist)]
     );
 }
 
@@ -342,6 +343,7 @@ fn closed_resident_frees_capacity_for_same_tick_admission() {
         128,
         |req| req.prompt_tokens.len(),
         |req| req.max_tokens,
+        |_| 0,
     );
 
     assert!(active.is_empty());
@@ -796,6 +798,16 @@ fn collect_finished_with_timeout(
 }
 
 #[test]
+fn prefix_cache_chunking_stops_at_snapshot_boundaries() {
+    let stride = Some(crate::prefix_cache::SNAPSHOT_STRIDE_TOKENS);
+    assert_eq!(clamp_prefill_chunk(0, 900, stride), 256);
+    assert_eq!(clamp_prefill_chunk(256, 644, stride), 256);
+    assert_eq!(clamp_prefill_chunk(512, 388, stride), 256);
+    assert_eq!(clamp_prefill_chunk(768, 132, stride), 132);
+    assert_eq!(clamp_prefill_chunk(0, 900, None), 900);
+}
+
+#[test]
 fn send_rejection_reports_lifetime_kv_and_context_limits() {
     let rejection_message = |reason: RejectReason, max_tokens: usize| {
         let (token_tx, mut token_rx) = TokenSink::standalone();
@@ -814,10 +826,10 @@ fn send_rejection_reports_lifetime_kv_and_context_limits() {
         }
     };
 
-    let kv = rejection_message(RejectReason::KvBudget, 65);
+    let kv = rejection_message(RejectReason::KvBudget, 49);
     assert!(
-        kv.contains("max_request_tokens=80"),
-        "rejection should report the full lifetime KV request: {kv}"
+        kv.contains("max_request_tokens=65"),
+        "rejection should report the lifetime KV peak used by admission: {kv}"
     );
 
     let context = rejection_message(RejectReason::ContextLength { limit: 32 }, 17);
@@ -832,13 +844,18 @@ fn send_rejection_reports_lifetime_kv_and_context_limits() {
 }
 
 #[test]
-fn echo_request_is_rejected_before_backend_admission() {
-    let (echo_tx, mut echo_rx) = TokenSink::standalone();
+fn prompt_logprobs_request_is_rejected_before_backend_admission() {
+    let (unsupported_tx, mut unsupported_rx) = TokenSink::standalone();
     let (regular_tx, mut regular_rx) = TokenSink::standalone();
-    let mut echo = test_request_with_shape("unsupported-echo", echo_tx, vec![1, 2, 3], 4);
-    echo.prompt_logprobs = Some(0);
+    let mut unsupported = test_request_with_shape(
+        "unsupported-prompt-logprobs",
+        unsupported_tx,
+        vec![1, 2, 3],
+        4,
+    );
+    unsupported.prompt_logprobs = Some(0);
     let regular = test_request("regular", regular_tx);
-    let mut pending = vec![echo, regular];
+    let mut pending = vec![unsupported, regular];
 
     reject_unsupported_prompt_logprobs(&mut pending);
 
@@ -848,7 +865,7 @@ fn echo_request_is_rejected_before_backend_admission() {
         pending[0].prompt_logprobs.is_none(),
         "only requests eligible for backend admission may remain"
     );
-    match echo_rx.blocking_recv().map(|(_, event)| event) {
+    match unsupported_rx.blocking_recv().map(|(_, event)| event) {
         Some(TokenEvent::Rejected {
             message,
             prompt_tokens,
@@ -858,7 +875,7 @@ fn echo_request_is_rejected_before_backend_admission() {
             assert_eq!(prompt_tokens, 3);
             assert_eq!(completion_tokens, 0);
         }
-        event => panic!("expected unsupported echo rejection, got {event:?}"),
+        event => panic!("expected unsupported prompt-logprobs rejection, got {event:?}"),
     }
     assert!(matches!(
         regular_rx.try_recv(),
@@ -884,8 +901,8 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     else {
         return;
     };
-    let handle =
-        start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false).expect("start TP2 scheduler");
+    let handle = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0)
+        .expect("start TP2 scheduler");
     let (decode_tx, mut decode_rx) = TokenSink::standalone();
     let (prefill_tx, mut prefill_rx) = TokenSink::standalone();
 

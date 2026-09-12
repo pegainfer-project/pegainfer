@@ -17,6 +17,7 @@ pub mod model_line;
 mod ops;
 mod prefill;
 pub mod prefill_buffers;
+mod prefix_cache;
 pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
@@ -113,6 +114,7 @@ pub fn start_engine(
         max_batch,
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
+        0,
     )
 }
 
@@ -127,9 +129,29 @@ pub struct Qwen35LaunchOptions {
     cuda_graph: bool,
     max_batch: usize,
     max_prefill_tokens: usize,
+    prefix_cache_mib: usize,
 }
 
 impl Qwen35LaunchOptions {
+    /// Configure the runtime and optional per-rank snapshot budget.
+    pub fn new(
+        device_ordinal: usize,
+        tp_size: usize,
+        cuda_graph: bool,
+        max_batch: usize,
+        max_prefill_tokens: usize,
+        prefix_cache_mib: usize,
+    ) -> Self {
+        Self {
+            device_ordinal,
+            tp_size,
+            cuda_graph,
+            max_batch,
+            max_prefill_tokens,
+            prefix_cache_mib,
+        }
+    }
+
     fn device_ordinals(&self) -> Result<Vec<usize>> {
         anyhow::ensure!(self.tp_size >= 1, "Qwen3.5 tp_size must be >= 1");
         Ok(if self.tp_size == 1 {
@@ -161,6 +183,7 @@ pub fn launch_with_options_policy_and_overlap(
         options.max_prefill_tokens,
         scheduler_policy,
         decode_overlap,
+        options.prefix_cache_mib,
     )
 }
 
@@ -176,6 +199,7 @@ pub fn start_engine_with_capacity(
         max_batch,
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
+        0,
     )
 }
 
@@ -185,6 +209,7 @@ pub(crate) fn start_engine_with_capacity_and_policy(
     max_batch: usize,
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
+    prefix_cache_mib: usize,
 ) -> Result<EngineHandle> {
     start_engine_with_capacity_policy_and_overlap(
         model_path,
@@ -193,6 +218,7 @@ pub(crate) fn start_engine_with_capacity_and_policy(
         max_prefill_tokens,
         scheduler_policy,
         Qwen35DecodeOverlap::Off,
+        prefix_cache_mib,
     )
 }
 
@@ -203,6 +229,7 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
+    prefix_cache_mib: usize,
 ) -> Result<EngineHandle> {
     anyhow::ensure!(
         (1..=MAX_DECODE_BATCH).contains(&max_batch),
@@ -220,6 +247,9 @@ pub fn start_engine_with_capacity_policy_and_overlap(
             "Qwen3.5 --decode-overlap=stream currently requires --max-batch <= {MAX_SHARED_SM_DECODE_BATCH}; larger decode buckets still fall back to the prefill GEMM handle"
         );
     }
+    let prefix_snapshot_bytes = prefix_cache_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("Qwen3.5 prefix-cache MiB budget overflows usize"))?;
     if device_ordinals.len() > 1 {
         anyhow::ensure!(
             decode_overlap == Qwen35DecodeOverlap::Off,
@@ -240,6 +270,7 @@ pub fn start_engine_with_capacity_policy_and_overlap(
             max_batch,
             max_prefill_tokens,
             enable_cuda_graph,
+            prefix_snapshot_bytes,
         );
     }
 
@@ -260,7 +291,12 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+    let model = weights::Qwen35Model::from_safetensors(
+        model_path,
+        device_ordinal,
+        max_batch,
+        prefix_snapshot_bytes,
+    )?;
     scheduler::start_with_capacity_and_policy(
         model,
         seed,
@@ -293,6 +329,7 @@ mod tests {
             cuda_graph: false,
             max_batch: 1,
             max_prefill_tokens: 1,
+            prefix_cache_mib: 0,
         };
 
         let err = options.device_ordinals().unwrap_err().to_string();
@@ -318,6 +355,7 @@ mod tests {
             1,
             1,
             Qwen35SchedulerPolicy::Auto,
+            0,
         )
         .err()
         .expect("scheduler policy validation should reject TP launch")
@@ -342,6 +380,7 @@ mod tests {
             1,
             Qwen35SchedulerPolicy::Off,
             Qwen35DecodeOverlap::SharedSm,
+            0,
         )
         .err()
         .expect("decode-overlap validation should reject TP launch")
@@ -365,6 +404,7 @@ mod tests {
             1,
             Qwen35SchedulerPolicy::Off,
             Qwen35DecodeOverlap::SharedSm,
+            0,
         )
         .err()
         .expect("decode-overlap validation should reject unsafe decode bucket")

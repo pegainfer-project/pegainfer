@@ -1,7 +1,7 @@
 //! Scheduler for Qwen3.5: dedicated GPU thread that batches concurrent requests.
 //!
 //! Mirrors the Qwen3 scheduler but manages:
-//! - `RecurrentState` alongside `KvState` (linear attention layers)
+//! - `RecurrentState` alongside content-hashed `RequestKv` (hybrid attention)
 //! - `BatchDecodeGraphState` for CUDA Graph batch decode (stable-address slots)
 
 mod backend;
@@ -25,7 +25,6 @@ use cudarc::driver::sys;
 use log::debug;
 use log::info;
 use log::warn;
-use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::EngineHandle as SchedulerHandle;
 use pegainfer_frontend::engine::FinishReason;
@@ -38,6 +37,9 @@ use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::engine::panic_message;
 use pegainfer_frontend::sampler::SamplingParams;
+use pegainfer_kv_cache::KvCacheManager;
+use pegainfer_kv_cache::KvView;
+use pegainfer_kv_cache::RequestKv;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
@@ -53,7 +55,6 @@ use self::plan::RejectReason;
 use self::plan::admit_pending_requests;
 use self::plan::choose_prefill_budget;
 use self::plan::compaction_after_retire;
-use self::plan::max_kv_tokens;
 use self::plan::plan_prefill_chunks;
 use self::plan::prefilling_future_pages;
 use self::plan::slot_for_new_request;
@@ -67,6 +68,8 @@ use crate::executor::PrefillRequestResult;
 use crate::executor::PrefillResult;
 use crate::executor::RequestId;
 use crate::logprobs::snapshot_requested_logprobs;
+use crate::prefix_cache::Qwen35PrefixCache;
+use crate::prefix_cache::RecurrentStateStore;
 use crate::recurrent_state::RecurrentState;
 use crate::tp_executor::DropExpectation;
 use crate::tp_executor::Qwen35TpExecutor;
@@ -107,7 +110,7 @@ struct PrefillingRequest35 {
 
 enum ActiveBackendState {
     Single {
-        kv: KvState,
+        kv: Box<RequestKv>,
         /// Index into `BatchDecodeGraphState.slot_states`.
         graph_slot_idx: usize,
     },
@@ -120,8 +123,13 @@ enum ActiveBackendState {
 }
 
 enum PrefillBackendState {
-    Single { kv: KvState, rec: RecurrentState },
-    Tp { request_id: RequestId },
+    Single {
+        kv: Box<RequestKv>,
+        rec: RecurrentState,
+    },
+    Tp {
+        request_id: RequestId,
+    },
 }
 
 struct TerminalRequest {
@@ -360,15 +368,15 @@ pub(crate) fn start_with_capacity_and_policy(
     );
     // Static instance cap for the vLLM bridge's max_model_len. Live admission
     // still uses the current page budget inside the scheduler loop.
-    let total_blocks = model.kv_pool().capacity_pages().saturating_sub(1);
+    let backend = SingleGpuBackend::new(model, max_batch, decode_overlap)?;
+    let total_blocks = backend.capacity_pages_for_requests();
     let kv_total_blocks = total_blocks as u64;
-    let block_size = model.kv_pool().layout().page_size;
+    let block_size = backend.page_size();
     let servable = servable_len(
-        model.config().max_position_embeddings,
+        backend.model().config().max_position_embeddings,
         total_blocks,
         block_size,
     );
-    let backend = SingleGpuBackend::new(model, max_batch, decode_overlap)?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (startup_tx, startup_rx) = std_mpsc::channel();
@@ -426,6 +434,7 @@ pub(crate) fn start_tp_with_capacity(
     max_batch: usize,
     max_prefill_tokens: usize,
     enable_cuda_graph: bool,
+    prefix_snapshot_bytes: usize,
 ) -> Result<SchedulerHandle> {
     assert!(
         max_prefill_tokens > 0,
@@ -437,6 +446,7 @@ pub(crate) fn start_tp_with_capacity(
         max_batch,
         max_prefill_tokens,
         enable_cuda_graph,
+        prefix_snapshot_bytes,
     )?;
     let servable = servable_len(
         backend.max_position_embeddings(),
@@ -473,15 +483,6 @@ pub(crate) fn start_tp_with_capacity(
             .with_kv_capacity(kv_capacity)
             .with_metrics_watch(load_rx),
     )
-}
-
-fn current_active_tokens(req: &ActiveRequest35) -> usize {
-    req.prompt_len
-        .saturating_add(req.generated_count.saturating_sub(1))
-}
-
-fn pages_needed(token_count: usize, page_size: usize) -> usize {
-    token_count.div_ceil(page_size)
 }
 
 fn servable_len(max_context: usize, max_pages: usize, page_size: usize) -> u32 {
@@ -637,11 +638,8 @@ where
                 "request pruned before scheduling: request_id={:?} phase=prefill cursor={}",
                 removed.req.request_id, removed.cursor
             );
-            let expectation = if removed.cursor == 0 {
-                DropExpectation::MustBeAbsent
-            } else {
-                DropExpectation::MustExist
-            };
+            // Admission now creates rank-local recurrent state, even on a cold miss.
+            let expectation = DropExpectation::MustExist;
             if let Err(err) = backend.drop_prefill_state(&removed.backend_state, expectation) {
                 return Err(FatalSchedulerError::new(err.to_string()).with_request(removed));
             }
@@ -882,62 +880,101 @@ fn scheduler_loop(
             })
             .collect();
         let page_size = backend.page_size();
-        let prefilling_budget: Vec<PrefillKvBudget> = prefilling
-            .iter()
-            .map(|p| PrefillKvBudget {
-                current_tokens: p.cursor,
-                prompt_len: p.req.prompt_tokens.len(),
-                max_tokens: p.req.max_tokens,
-            })
-            .collect();
-        let page_budget = backend
-            .available_pages(&active, &prefilling)
-            .saturating_sub(prefilling_future_pages(&prefilling_budget, page_size));
-        let decode_batching_slot = max_batch.saturating_sub(prefilling.len());
-        let admission = admit_pending_requests(
-            pending,
-            &active_budget,
-            decode_batching_slot,
-            page_size,
-            page_budget,
-            // KvPool capacity includes the CUDA Graph padding page reserved at
-            // construction, so a real request can use at most the remaining pages.
-            backend.capacity_pages_for_requests(),
-            backend.max_position_embeddings(),
-            |req| req.prompt_tokens.len(),
-            |req| req.max_tokens,
-        );
-        for (rejected, reason) in &admission.rejected {
-            send_rejection(rejected, *reason);
-        }
-
-        // 6. Move freshly admitted prompts into the chunked-prefill queue.
-        for req in admission.pending {
-            debug!(
-                "request admitted: request_id={:?} prompt_len={} max_tokens={}",
-                req.request_id,
-                req.prompt_tokens.len(),
-                req.max_tokens
+        let mut admission_pending = pending;
+        loop {
+            let prefilling_budget: Vec<PrefillKvBudget> = prefilling
+                .iter()
+                .map(|p| PrefillKvBudget {
+                    current_tokens: p.cursor,
+                    prompt_len: p.req.prompt_tokens.len(),
+                    max_tokens: p.req.max_tokens,
+                })
+                .collect();
+            let page_budget = backend
+                .available_pages(&active, &prefilling)
+                .saturating_sub(prefilling_future_pages(&prefilling_budget, page_size));
+            let decode_batching_slot = max_batch.saturating_sub(prefilling.len());
+            let admission = admit_pending_requests(
+                admission_pending,
+                &active_budget,
+                decode_batching_slot,
+                page_size,
+                page_budget,
+                // KvPool capacity includes the CUDA Graph padding page reserved at
+                // construction, so a real request can use at most the remaining pages.
+                backend.capacity_pages_for_requests(),
+                backend.max_position_embeddings(),
+                |req| req.prompt_tokens.len(),
+                |req| req.max_tokens,
+                |req| backend.active_joint_prefix_pages(req),
             );
-            match backend.alloc_prefill_state() {
-                Ok(backend_state) => prefilling.push(PrefillingRequest35 {
-                    backend_state,
-                    cursor: 0,
-                    step_chunk: 0,
-                    req,
-                }),
-                Err(e) => {
-                    warn!("failed to allocate recurrent state for new request: {e}");
-                    let _ = req.token_tx.send(TokenEvent::Error {
-                        message: e.to_string(),
-                        prompt_tokens: req.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
+            for (rejected, reason) in &admission.rejected {
+                send_rejection(rejected, *reason);
+            }
+
+            // 6. Materialize admitted prompts. A restore can move cached KV out
+            // of the available pool, so re-run admission for FIFO followers.
+            let mut restored_prefix = false;
+            let mut admitted = admission.pending.into_iter();
+            while let Some(req) = admitted.next() {
+                debug!(
+                    "request admitted: request_id={:?} prompt_len={} max_tokens={}",
+                    req.request_id,
+                    req.prompt_tokens.len(),
+                    req.max_tokens
+                );
+                match backend.alloc_prefill_state(&req) {
+                    Ok((backend_state, cached_tokens)) => {
+                        restored_prefix |= cached_tokens > 0;
+                        let scheduled_at_unix_s = unix_now_s();
+                        let _ = req.token_tx.send(TokenEvent::Scheduled {
+                            queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at_unix_s),
+                            scheduled_at_unix_s,
+                            prompt_tokens: req.prompt_tokens.len(),
+                            cached_tokens,
+                        });
+                        prefilling.push(PrefillingRequest35 {
+                            backend_state,
+                            cursor: cached_tokens,
+                            step_chunk: 0,
+                            req,
+                        });
+                    }
+                    Err(AdmissionError::Recoverable(error)) => {
+                        warn!("failed to admit new request: {error}");
+                        let _ = req.token_tx.send(TokenEvent::Error {
+                            message: error.to_string(),
+                            prompt_tokens: req.prompt_tokens.len(),
+                            completion_tokens: 0,
+                        });
+                    }
+                    Err(AdmissionError::Fatal(error)) => {
+                        let kv_total_blocks = backend.capacity_pages_for_requests() as u64;
+                        let failure = FatalSchedulerError::new(error.to_string())
+                            .with_request(req)
+                            .with_requests(admitted);
+                        terminal_scheduler_shutdown(
+                            &mut submit_rx,
+                            &load_tx,
+                            kv_total_blocks,
+                            active,
+                            prefilling,
+                            Vec::new(),
+                            admission.deferred,
+                            inflight_prefill.take(),
+                            failure,
+                        );
+                        return;
+                    }
                 }
             }
-        }
 
-        deferred = admission.deferred;
+            if admission.deferred.is_empty() || !restored_prefix {
+                deferred = admission.deferred;
+                break;
+            }
+            admission_pending = admission.deferred;
+        }
 
         // 7. Choose this tick's prefill budget, take that chunk off the front of
         //    the queue, then dispatch by plan. Auto can return 0 for a short
@@ -963,7 +1000,11 @@ fn scheduler_loop(
             &prefill_queue,
             decode_overlap,
         );
-        let scheduled = take_prefill_chunks(&mut prefilling, step_prefill_budget);
+        let scheduled = take_prefill_chunks(
+            &mut prefilling,
+            step_prefill_budget,
+            backend.snapshot_stride(),
+        );
         // ITL diagnostics (#470): capture the *actual* prefill-chunk token count
         // and the frozen decode width for this step before the plan consumes the
         // scheduled set. Off unless PEGAINFER_ITL_DEBUG is set.
@@ -1044,7 +1085,8 @@ fn send_rejection(req: &SchedulerRequest, reason: RejectReason) {
             req.max_tokens
         ),
         RejectReason::KvBudget => {
-            let max_request_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
+            let max_request_tokens =
+                plan::request_lifetime_tokens(req.prompt_tokens.len(), req.max_tokens);
             format!(
                 "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_request_tokens={max_request_tokens}",
                 req.prompt_tokens.len()
@@ -1083,7 +1125,14 @@ fn prefill_batch(
             };
             let prefill_sample_seed = rand::RngExt::random(rng);
             match single.sample_prefill_logits(&chunk.reqs, &logits, prefill_sample_seed) {
-                Ok((tokens, logprobs)) => PrefillStepArtifacts::Single { tokens, logprobs },
+                Ok((tokens, logprobs)) => {
+                    if let Err(error) = single.apply_prefill(&mut chunk, &tokens) {
+                        return Err(
+                            FatalSchedulerError::new(error.to_string()).with_requests(chunk.reqs)
+                        );
+                    }
+                    PrefillStepArtifacts::Single { tokens, logprobs }
+                }
                 Err(e) => {
                     warn!("prefill sampling failed: {e}");
                     fail_chunk(chunk, &e.to_string());
@@ -1141,7 +1190,7 @@ fn finish_async_prefill(
     inflight: InflightPrefill,
 ) -> std::result::Result<(), FatalSchedulerError> {
     let InflightPrefill {
-        chunk,
+        mut chunk,
         output,
         sample_seed,
     } = inflight;
@@ -1157,6 +1206,9 @@ fn finish_async_prefill(
             return Ok(());
         }
     };
+    if let Err(error) = single.apply_prefill(&mut chunk, &tokens) {
+        return Err(FatalSchedulerError::new(error.to_string()).with_requests(chunk.reqs));
+    }
     let artifacts = PrefillStepArtifacts::Single { tokens, logprobs };
     promote_or_requeue(single, active, prefilling, chunk, &artifacts)
 }
@@ -1229,8 +1281,10 @@ fn unified_step_sched(
 
     // Process decode results FIRST (it may retire requests and free graph slots
     // that promotion then fills densely).
-    if output.decoded {
-        process_decode_logits(backend, active, decode_seed)?;
+    if output.decoded
+        && let Err(failure) = process_decode_logits(backend, active, decode_seed)
+    {
+        return Err(failure.with_requests(chunk.reqs));
     }
 
     let prefill_logits = output
@@ -1246,6 +1300,9 @@ fn unified_step_sched(
                 return Ok(());
             }
         };
+    if let Err(error) = backend.apply_prefill(&mut chunk, &tokens) {
+        return Err(FatalSchedulerError::new(error.to_string()).with_requests(chunk.reqs));
+    }
     let prefill = PrefillStepArtifacts::Single { tokens, logprobs };
     promote_or_requeue(backend, active, prefilling, chunk, &prefill)
 }
@@ -1313,6 +1370,11 @@ fn decode_step_with_seed(
         },
     };
 
+    if let SchedulerBackend::Single(single) = backend {
+        single
+            .apply_decode(active, &tokens)
+            .map_err(|e| FatalSchedulerError::new(e.to_string()))?;
+    }
     dispatch_decode_tokens(backend, active, &tokens, &logprobs_vec)
 }
 
@@ -1338,6 +1400,9 @@ fn process_decode_logits(
         }
     };
 
+    backend
+        .apply_decode(active, &tokens)
+        .map_err(|e| FatalSchedulerError::new(e.to_string()))?;
     dispatch_decode_tokens(backend, active, &tokens, &logprobs_vec)
 }
 
@@ -1562,7 +1627,10 @@ struct InflightPrefill {
 
 enum ScheduledChunkBackendState {
     Single {
-        kvs: Vec<KvState>,
+        // Keep request allocations stable while an async prefill owns the chunk;
+        // failure cleanup can then move each request back through one ownership path.
+        #[allow(clippy::vec_box)]
+        kvs: Vec<Box<RequestKv>>,
         recs: Vec<RecurrentState>,
     },
     Tp {
@@ -1622,6 +1690,7 @@ impl From<Vec<PrefillingRequest35>> for ScheduledChunk {
 fn take_prefill_chunks(
     prefilling: &mut Vec<PrefillingRequest35>,
     prefill_budget: usize,
+    snapshot_stride: Option<usize>,
 ) -> Vec<PrefillingRequest35> {
     let remaining: Vec<usize> = prefilling
         .iter()
@@ -1630,7 +1699,7 @@ fn take_prefill_chunks(
     let chunks = plan_prefill_chunks(&remaining, prefill_budget);
     let mut scheduled: Vec<PrefillingRequest35> = prefilling.drain(0..chunks.len()).collect();
     for (p, chunk) in scheduled.iter_mut().zip(&chunks) {
-        p.step_chunk = *chunk;
+        p.step_chunk = clamp_prefill_chunk(p.cursor, *chunk, snapshot_stride);
     }
     scheduled
 }
@@ -1917,3 +1986,31 @@ fn split_scheduled_backend_state(
 
 #[cfg(test)]
 mod tests;
+
+fn active_request_kv(request: &mut ActiveRequest35) -> Option<&mut RequestKv> {
+    match &mut request.backend_state {
+        ActiveBackendState::Single { kv, .. } => Some(kv),
+        ActiveBackendState::Tp { .. } => None,
+    }
+}
+fn revert_scheduled_requests<'a>(
+    kv_cache: &Qwen35PrefixCache,
+    requests: impl IntoIterator<Item = &'a mut RequestKv>,
+) {
+    for request in requests {
+        if let Err(error) = kv_cache.revert_schedule(request) {
+            warn!("failed to revert Qwen3.5 scheduler KV schedule: {error}");
+        }
+    }
+}
+fn unix_now_s() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64())
+}
+fn clamp_prefill_chunk(cursor: usize, chunk: usize, snapshot_stride: Option<usize>) -> usize {
+    snapshot_stride.map_or(chunk, |stride| {
+        debug_assert!(stride > 0);
+        chunk.min(stride - cursor % stride)
+    })
+}

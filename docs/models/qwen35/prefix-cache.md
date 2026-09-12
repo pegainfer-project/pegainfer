@@ -1,78 +1,76 @@
 # Qwen3.5-4B prefix cache
 
-> **TL;DR:** A Qwen3.5-4B prefix hit is valid only when full-attention KV and a complete recurrent/conv snapshot exist at the same 256-token boundary. `Qwen35PrefixCache` checks and restores both together, so the scheduler sees either one valid hit or a miss. The first version keeps snapshots on GPU and requires Qwen3.5 KV to move from `KvPool`/`KvState` to the content-hashed `BlockPool`/`RequestKv` cache.
+> **TL;DR:** Qwen3.5-4B uses a GPU-only, content-hashed joint prefix cache: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. KV stays in kvbm's reclaimable inactive pool, while `SnapshotCache` owns snapshot lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests pass, and a 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-09
 
 ## Preparation
 
 - **Read**:
   - `docs/index.md` - identified the current Qwen3.5 roadmap and the related Qwen3 cache and scheduler docs.
-  - `docs/models/qwen35/roadmap.md` - direct-paged writes and bounded chunked prefill are complete; issue #257 now needs a joint KV/recurrent/conv cache design.
+  - `docs/models/qwen35/roadmap.md` - direct-paged writes and bounded chunked prefill are complete; issue #257 needs a joint KV/recurrent/conv cache.
   - Maintainer RFC discussion for issue #257 - narrowed the first version to a GPU snapshot cache with one consistency rule for KV and recurrent state.
   - `docs/models/qwen3/prefix-cache.md` - provides the existing rules for block hashes, adapter isolation, final-token recompute, and keeping matched KV alive.
-  - `docs/subsystems/runtime/qwen3-kvbm-integration-spec.md` - describes the content-hashed `BlockPool`/`RequestKv` cache that Qwen3.5 does not yet use.
-  - `pegainfer-qwen35/src/{scheduler.rs,prefill.rs,prefill_buffers.rs,recurrent.rs,recurrent_state.rs,weights.rs}` - confirmed the current request state flow, valid prefill boundaries, snapshot layout, and GPU memory reservation.
-  - `pegainfer-core/src/kv_pool.rs` and `pegainfer-kv-cache/src/pool.rs` - confirmed that Qwen3.5 still uses anonymous RAII pages while Qwen3 can register, match, and pin content-hashed blocks.
+  - `docs/subsystems/runtime/qwen3-kvbm-integration-spec.md` - describes the content-hashed `BlockPool`/`RequestKv` cache adopted by Qwen3.5.
+  - `pegainfer-qwen35/src/{scheduler.rs,prefill.rs,recurrent_state.rs,weights.rs}` and `pegainfer-kv-cache/src/pool.rs` - confirmed request-state flow, snapshot layout, exact-boundary KV operations, and GPU memory reservation.
 - **Relevant history**:
   - The first draft focused on CPU offload but did not say clearly who keeps KV and snapshots consistent. Review narrowed the first version to GPU allocation, lookup, lifetime, and whole-model snapshot creation.
-  - The first draft also treated the 64-token GDR tile as a correctness boundary. Current resumed-prefill coverage uses 16-token scheduler chunks successfully, so a completed whole-model chunk, not an internal GDR tile, is the state boundary.
+  - The first draft also treated the 64-token GDR tile as a correctness boundary. Resumed prefill works with smaller scheduler chunks, so the safe boundary is a completed whole-model window, not an internal GDR tile.
 - **Plan**:
-  1. Replace the two-tier proposal with a GPU-only cache that restores KV and recurrent state together.
-  2. Base snapshot creation and restore on the current chunked-prefill flow and the future `BlockPool`/`RequestKv` migration.
-  3. Define snapshot contents, capacity, publication order, lookup, pinning, eviction, failure behavior, and follow-on validation.
+  1. Add exact-boundary, non-mutating KV probe and attach support.
+  2. Unify Qwen3.5 execution around `KvCacheManager`/`RequestKv` transactions before enabling reuse.
+  3. Add a fixed-budget recurrent/conv snapshot pool, joint restore/publication, TP coordination, observability, and validation.
 - **Risks / open questions**:
-  - The current `RequestKv::match_and_add_prefix` immediately changes a new request to use the longest KV-only match. Qwen3.5 instead needs the exact-boundary lookup and attach behavior described below.
-  - Snapshot copy and cold-prefill costs have not been measured for the current 32-value-head 4B configuration. The initial 256-token interval is therefore a starting policy, not a proven optimum.
+  - Snapshot copy and cold-prefill costs vary by model shape. The initial 256-token interval is a starting policy, not a proven optimum.
+  - TP must publish and restore a snapshot only when every rank reports the same token boundary.
 
 ## Decisions
 
 The first version is deliberately narrow:
 
 - GPU-only recurrent snapshot allocator with a fixed load-time byte budget.
-- One complete snapshot contains all 24 linear layers' f32 GDR state, bf16 conv state, and the token position.
-- Snapshots are published every 256 prompt tokens. Non-aligned request ends are not cached in the first version.
+- One complete snapshot contains all linear layers' f32 GDR state, bf16 conv state, and the token position.
+- Snapshots are eligible every 256 prompt tokens. Non-aligned request ends apply normally but do not create snapshots.
 - A reusable boundary must have both registered full-attention KV and a GPU-resident recurrent snapshot for the same token prefix.
-- `Qwen35PrefixCache` is the only interface used by the scheduler for prefix creation and restore.
+- `Qwen35PrefixCache` is the only interface used by the scheduler for joint prefix creation and restore.
 - Restored state is copied into the request's own `RecurrentState`; active requests never modify or directly share a cache slot.
-- Echo and prompt-logprob requests stay on cold prefill because cached positions would not produce their required logits.
+- Echo requests are rejected before cache lookup because cached positions would not produce their required logits.
 
 CPU offload, a second LRU tier, snapshot compression, request-end snapshots, and cross-process transfer are deferred. They must keep the same rule that KV and recurrent state are restored together.
 
-## Current state and prerequisite
+## Implemented state flow
 
-Qwen3.5 prefill already has a safe point at which it can create a snapshot. A `PrefillingRequest35` owns:
+The scheduler/executor now owns content-hashed request KV and recurrent state together:
 
 ```rust
-struct PrefillingRequest35 {
-    req: SchedulerRequest,
-    kv: KvState,
-    rec: RecurrentState,
-    cursor: usize,
-    step_chunk: usize,
+enum PrefillBackendState {
+    Single {
+        kv: Box<RequestKv>,
+        rec: RecurrentState,
+    },
+    // TP workers address controller-owned RequestKv by request id.
+    Tp { request_id: RequestId },
 }
 ```
 
-For each scheduled window, `prefill_chunk_forward` writes full-attention K/V directly into paged storage and advances all linear layers' recurrent and conv state. When the whole-model call returns successfully:
+`RequestKv::schedule_prefill` reserves pages and produces an immutable `KvView`. Prefill and decode kernels write through that view without changing logical KV. After the whole-model call succeeds, the scheduler applies the KV transaction and may publish a recurrent snapshot. After each successful prefill window:
 
 ```text
-kv.seq_len() == rec.seq_len == cursor + step_chunk
+kv.kv_position() == rec.seq_len == cursor + step_chunk
 ```
 
-If the prompt is incomplete, the scheduler keeps these states for the next step. If it is complete, it copies `rec` into a stable decode graph slot. Direct-paged prefill and scheduler chunking are therefore no longer blockers.
+Single-GPU serving, TP serving, and the low-level accuracy executor all use `KvCacheManager`/`RequestKv`, even when the snapshot budget is zero. With zero budget, release resets registered blocks so the disabled mode remains a true cold control.
 
-The missing prerequisite is content-based KV reuse. Qwen3.5 still uses `pegainfer_core::kv_pool::{KvPool, KvState}`: it allocates and returns pages, but it cannot identify their token content, register completed blocks, or match a new request against them. Qwen3 uses `pegainfer_kv_cache::{BlockPool, RequestKv}`, which provides those operations and keeps matched blocks alive while they are being attached to a request.
-
-Before prefix reuse can be implemented, Qwen3.5 full-attention KV must move to that cache API while preserving its current page-first memory layout and kernels. Most required operations already exist. Joint lookup adds these requirements:
+Joint lookup adds these exact-boundary operations to the shared cache:
 
 1. Probe the longest contiguous registered KV prefix without changing the new request.
-2. Keep the probed KV blocks pinned while the snapshot cache is checked.
+2. Keep the probed KV blocks pinned while `SnapshotCache` is checked.
 3. Expose complete KV-block boundaries and their canonical `SequenceHash` values in descending order.
-4. After a joint boundary is selected, transfer only the blocks through that boundary to the new request and release any longer KV-only tail.
-5. Advance the new request's KV position to the selected boundary as part of the same attach operation; a partial attach must not be visible.
+4. Attach only the boundary with a matching snapshot; ignore any longer KV-only tail.
+5. Advance the new request's KV position as part of the same attachment.
 6. Keep at least one prompt token uncached so prefill can produce the first generated token.
 
-The existing `schedule_prefill`, `apply_prefill_chunk`, and `revert_schedule` operations then handle suffix prefill and failed forwards.
+`TokenEvent::Scheduled.cached_tokens` reports the selected joint boundary. A KV-only tail is never reported as a hit.
 
 ## Valid cache hit
 
@@ -80,24 +78,24 @@ Qwen3.5 stores KV and recurrent snapshots separately, but a request may reuse a 
 
 1. Full-attention KV for `[0, N)` is registered and still on GPU.
 2. A complete recurrent snapshot for `[0, N)` is still on GPU.
-3. Both use the same `SequenceHash`, which includes the token lineage and adapter/LoRA salt.
+3. Both use the same `SequenceHash`, which includes token lineage and adapter/LoRA salt.
 4. The KV position, snapshot position, recurrent `seq_len`, and scheduler cursor all equal `N`.
 
 KV without a matching snapshot is not a Qwen3.5 prefix hit. A snapshot without matching KV is also not a hit. The scheduler never sees either one as partial reuse.
 
 ## Snapshot interval
 
-A snapshot boundary is the token position after a scheduled prefill window has completed all 32 layers. The interval for the first slice is:
+A snapshot boundary is the token position after a scheduled prefill window has completed all model layers. The current interval is:
 
 ```text
-SNAPSHOT_STRIDE = 256 tokens
+SNAPSHOT_STRIDE_TOKENS = 256
 ```
 
-The stride is a multiple of the 16-token KV block size, so every snapshot key can reference the lineage hash of a complete registered KV block. The scheduler must clamp each request's next window to the next snapshot boundary. With a 900-token prompt, the resulting positions are `256 -> 512 -> 768 -> 900`; only the first three are snapshot candidates.
+The stride is a multiple of the 16-token KV block size, so every snapshot key references the lineage hash of a complete registered KV block. The scheduler clamps each request's next window to the next snapshot boundary. With a 900-token prompt, the resulting positions are `256 -> 512 -> 768 -> 900`; only the first three are snapshot candidates.
 
-The GDR implementation internally tiles work in 64-token chunks, but this is not a snapshot correctness constraint. It handles a partial final tile and commits the final recurrent state for arbitrary positive sequence lengths. The existing scheduler-level resumed-prefill gate uses 16-token windows and exercises this behavior. The invariant is therefore "after a successful whole-model window," not `position % 64 == 0`.
+The GDR implementation internally tiles work in 64-token chunks, but this is not a snapshot correctness constraint. It handles a partial final tile and applies recurrent state for arbitrary positive sequence lengths. The invariant is “after a successful whole-model window,” not `position % 64 == 0`.
 
-The 256-token interval limits how many large snapshots one prompt creates. Prefixes shorter than 256 tokens intentionally remain cold. This is a starting policy, not a measured optimum; any later interval must still align to complete KV blocks.
+The 256-token interval limits how many large snapshots one prompt creates. Prefixes shorter than 256 tokens intentionally remain cold. Any later interval must still align to complete KV blocks.
 
 ## Snapshot contents and capacity
 
@@ -107,7 +105,7 @@ Each slot uses the same device layout as request-local `RecurrentState`:
 - for every linear layer, `conv_state: [linear_attn_qkv_dim, conv_kernel_dim - 1]` bf16;
 - host metadata recording the exact `seq_len` represented by the slot.
 
-Capacity must be derived from `recurrent_state::bytes_per_request(config)`, not a hard-coded model label. For Qwen3.5-4B (24 linear layers, 16 key heads, 32 value heads, 128x128 state, conv kernel 4), one slot is:
+Capacity is derived from `recurrent_state::bytes_per_request(config)`, not a hard-coded model label. For Qwen3.5-4B, one slot is:
 
 ```text
 per-layer GDR state = 32 * 128 * 128 * 4             = 2,097,152 bytes
@@ -123,135 +121,154 @@ let bytes_per_slot = bytes_per_request(config);
 let max_slots = snapshot_budget_bytes / bytes_per_slot;
 ```
 
-The reservation participates in the same load-time budget as prefill scratch, recurrent request/decode slots, and KV pages. The current loader reserves two recurrent states per decode capacity slot before sizing KV; snapshot bytes are additional and must also be subtracted before the KV pool is allocated. Snapshot allocation must not opportunistically consume memory that admission assumes belongs to KV.
+Snapshot bytes are reserved before KV capacity is finalized, so snapshot allocation cannot consume memory that admission assumes belongs to KV. Zero configured MiB disables prefix reuse. A positive budget smaller than one complete slot is rejected instead of silently acting disabled.
 
-If the configured budget produces zero slots, Qwen3.5 prefix reuse is disabled and serving retains its current cold behavior.
+Under TP the configured budget applies to each rank. Every rank must allocate the same number of physical slots.
 
 ## Cache ownership and pinning
 
-`Qwen35PrefixCache` owns the existing full-attention KV manager and the recurrent snapshot cache. `KvCacheManager` keeps the logical `BlockPool` and physical GPU `KvBuffer` together:
+`Qwen35PrefixCache` owns the full-attention KV manager and the joint-entry directory. Physical snapshot stores are separate so TP can use one metadata decision with identical slot numbers on every rank:
 
 ```rust
 struct Qwen35PrefixCache {
     kv: KvCacheManager,
-    snapshots: RecurrentSnapshotCache,
-    stride: usize,
+    snapshots: SnapshotCache,
+    stats: PrefixCacheStats,
 }
 
-struct RecurrentSnapshotCache {
-    slots: Vec<SnapshotSlot>,
-    index: HashMap<SnapshotKey, SlotId>,
-    free: Vec<SlotId>,
-    lru: LruList<SlotId>,
+struct SnapshotCache {
+    entries: HashMap<PrefixBoundaryKey, Arc<SnapshotEntry>>,
+    free_slots: Vec<usize>,
+    slot_count: usize,
+    clock: u64,
 }
 
-struct SnapshotSlot {
-    state: RecurrentState,
-    key: Option<SnapshotKey>,
-    pin_count: usize,
+struct SnapshotEntry {
+    recurrent_slot: usize,
+    last_used: AtomicU64,
 }
 
-#[derive(Clone, Hash, Eq, PartialEq)]
-struct SnapshotKey {
-    sequence_hash: SequenceHash,
+struct SnapshotGuard {
     boundary: usize,
+    entry: Arc<SnapshotEntry>,
+}
+
+struct SnapshotReservation {
+    key: PrefixBoundaryKey,
+    recurrent_slot: usize,
+    replaced: bool,
+}
+
+struct RecurrentStateStore {
+    slots: Vec<RecurrentState>,
+}
+
+struct PrefixBoundaryKey {
+    sequence_hash: [u8; 16],
+    boundary_tokens: usize,
 }
 ```
 
-`sequence_hash` is the canonical hash returned by the KV cache for the block ending at `boundary`. It already includes the earlier block lineage and adapter salt, so the snapshot cache does not maintain a second adapter identity. Storing `boundary` explicitly prevents a snapshot from being reused at the wrong token position.
+`sequence_hash` is the canonical hash returned by the KV cache for the block ending at `boundary_tokens`. It already includes earlier block lineage and adapter salt. Storing `boundary_tokens` explicitly prevents reuse at the wrong token position.
 
-There is no third stored copy that combines KV and snapshot data. A valid internal hit records the selected boundary and holds both a KV guard and a snapshot guard. `Qwen35PrefixCache` consumes those guards during restore, so neither resource can be evicted in the meantime. The scheduler never sees the separate guards.
+`SnapshotEntry` owns one recurrent-state slot; a `SnapshotGuard` pins it by holding another `Arc`. `BlockPool` owns KV, with `PrefixProbe` and the request-local attachment keeping matched blocks alive through lookup and attach. TP publishes only after every worker saves the same slot at the same boundary, and reports a hit only after every worker confirms the restored boundary.
 
 ## Creating a snapshot
 
-A snapshot is created after a whole-model window, not inside per-layer GDR scratch. The order is:
+A snapshot is created after a whole-model window, not inside per-layer GDR scratch:
 
-1. Clamp the request's scheduled window to the next 256-token boundary or prompt end.
-2. `RequestKv::schedule_prefill` reserves the KV blocks for that window.
+1. Clamp the scheduled window to the next 256-token boundary or prompt end.
+2. Reserve KV blocks with `RequestKv::schedule_prefill`.
 3. Run the full model, updating full-attention KV and request-local recurrent/conv state.
-4. On failure, revert the KV schedule, fail the request, and publish nothing.
-5. On success, commit the KV request state (`apply_prefill_chunk` or final `apply_prefill`) so complete blocks are registered.
-6. Assert that committed KV position and `rec.seq_len` equal the candidate boundary.
-7. If the boundary is snapshot-eligible, allocate an unpinned slot and D2D-copy the complete `RecurrentState` into it.
-8. Publish `SnapshotKey -> SlotId` only after the copy has been successfully enqueued under the scheduler stream's ordering contract.
+4. On failure, revert the KV schedule and publish nothing.
+5. On success, apply KV with `apply_prefill_chunk` or final `apply_prefill`.
+6. Verify that KV position and `rec.seq_len` equal the candidate boundary.
+7. At an eligible boundary, call `reserve_snapshot`; if it returns a reservation, copy the complete `RecurrentState` into that slot.
+8. Publish the `SnapshotEntry` after all rank-local copies succeed; abort the reservation on failure.
 
-The GDR `chunk_state` scratch is per linear-layer call and cannot represent a whole-model snapshot. Conv state is updated separately. Only request-local `RecurrentState` after all layers have finished contains the complete pair required for publication.
+The GDR `chunk_state` scratch is per linear-layer call and cannot represent a whole-model snapshot. Only request-local `RecurrentState` after all layers finish contains the complete recurrent/conv state required for publication.
 
-Running out of snapshot slots is a soft cache event: skip insertion and continue the request. A CUDA copy failure is an execution error, not a cache-capacity miss; no key is published.
-
-Insertion of an already-resident key reuses the existing immutable slot and refreshes its LRU position; it does not allocate or copy a duplicate. When replacing an unpinned victim, the cache removes the victim's old index entry before starting the copy. If that copy fails, the slot returns to the free list with no published key.
+Running out of snapshot slots is a soft cache event: skip insertion and continue the request. A CUDA copy failure is an execution error and publishes no key. A duplicate key refreshes LRU without copying another immutable snapshot. If replacement copying fails, the reserved slot returns to the free list unpublished.
 
 ## Lookup and restore
 
-The scheduler calls one operation:
+Restore is two-phase so one directory can coordinate one or many physical ranks:
 
 ```rust
-let cached_tokens = prefix_cache.restore_prefix(
-    &mut prefix_request,
-    &mut request_recurrent,
+let (request_kv, restore) = prefix_cache.begin_request(...)?;
+// Restore restore.recurrent_slot() on every physical rank.
+let cached_tokens = prefix_cache.finish_restore(
+    &request_kv,
+    restore,
+    &rank_positions,
 )?;
 ```
 
-Inside `Qwen35PrefixCache`:
+`begin_request` performs the logical lookup and KV attach:
 
-1. Ask the KV cache for the longest registered prefix while keeping the candidate KV blocks alive.
-2. Enumerate eligible 256-token boundaries in descending order, subject to the usual rule that at least one prompt token remains to run.
-3. Build `SnapshotKey` from the candidate's canonical `SequenceHash` and position.
-4. Try to pin the corresponding snapshot slot.
-5. The first boundary with both guards becomes the selected hit; if none exists, return `0` without changing request state.
+1. Probe the longest registered KV prefix while keeping candidate blocks alive.
+2. Enumerate eligible 256-token boundaries from longest to shortest, leaving at least one prompt token to run.
+3. Build `PrefixBoundaryKey` from the canonical `SequenceHash` and token position.
+4. Pin the corresponding snapshot slot.
+5. Select the first boundary with both resources; if none exists, return `0` without changing request state.
 6. Attach exactly that KV boundary to request-local `RequestKv`.
-7. D2D-copy the immutable snapshot into request-local `RecurrentState`.
-8. Verify all positions equal the selected boundary, then set the scheduler cursor and return it as `cached_tokens`.
 
-For example, a 768-token KV match with snapshots at 256 and 512 restores 512 tokens. The scheduler never receives "KV hit 768, snapshot hit 512" as separate facts.
+The single-GPU or TP executor then restores `recurrent_slot` into the request-local state. `finish_restore` verifies all positions, records the hit, and releases the pin.
 
-`Qwen35PrefixCache` must acquire both guards before changing the request. If restore then fails, it releases the request KV and snapshot guard and reports an error. It must not expose a partly restored request or treat a restore error as a normal cache miss.
+For example, a 768-token KV match with snapshots at 256 and 512 restores 512 tokens. The scheduler never receives “KV hit 768, snapshot hit 512” as separate facts.
 
-After restore, suffix prefill operates normally on `tokens[cached_tokens..]`. When prefill finishes, the existing copy from request-local recurrent state into the decode graph slot remains unchanged.
+If physical restore or position validation fails after KV attachment, request preparation fails and releases the prepared state. It is not treated as a normal cache miss.
+
+After restore, suffix prefill operates on `tokens[cached_tokens..]`. When prefill completes, recurrent state is promoted into the normal decode state. Decode continues to schedule, forward, and apply KV one token at a time; it does not perform another prefix lookup.
 
 ## Lifetime and eviction
 
-The KV and snapshot caches keep their own allocation policies, but `Qwen35PrefixCache` decides whether a boundary can be reused:
+`Qwen35PrefixCache` owns recurrent snapshots; `BlockPool` owns KV lifetime:
 
-- KV candidates are held by strong immutable-block guards from probe until exact-boundary attachment or abandonment.
-- Snapshot slots are immutable while indexed and can be evicted only when `pin_count == 0`.
-- A snapshot guard is needed only until its D2D copy into request-local state completes. It is not held for the full request lifetime.
+- With caching enabled, released KV enters kvbm's inactive pool, where it remains reusable and counts toward `available_blocks()`.
+- With caching disabled, released KV returns directly to the free pool.
+- Snapshot slots are immutable while indexed and can be evicted only when no `SnapshotGuard` exists.
+- `SnapshotGuard` protects a snapshot until D2D restore and position checks complete.
 - Restored suffix prefill and decode mutate request-owned state, never the cached slot.
 - If no free or unpinned snapshot slot exists, insertion is skipped rather than blocking or failing the request.
 
-Eviction does not require synchronized callbacks between the physical pools:
+Snapshot eviction reuses its recurrent-state slot; KV reclamation remains independent. An aborted replacement returns the unpublished slot to the free list. Lookup can continue to the next shorter published boundary.
 
-- If KV is evicted first, the snapshot remains indexed but cannot be used. Lookup cannot acquire the KV guard, so snapshot LRU may reclaim it later.
-- If the snapshot is evicted first, the KV blocks may remain reusable by the physical pool, but the boundary is KV-only and ineligible for Qwen3.5 restore.
-- If either side disappears between candidate discovery and pinning, lookup continues to the next shorter joint boundary.
+LRU selects an unpinned snapshot victim. Correctness depends on pinning and joint validation, not on LRU ordering.
 
-This cannot produce a partial hit: only `Qwen35PrefixCache` can declare a hit, and it checks both resources on every lookup.
+## TP behavior
 
-LRU is the first victim policy for unpinned snapshot slots. Correctness depends on pinning and joint validation, not on LRU itself.
+TP uses one logical cache decision and rank-local physical storage:
+
+1. The controller owns the only `KvCacheManager`, `RequestKv` map, `SnapshotCache`, and LRU state.
+2. Startup validates compatible KV geometry and snapshot-slot counts across ranks.
+3. Logical capacity is capped by the smallest rank-local physical capacity.
+4. The controller broadcasts identical `KvView` page IDs; every worker writes its local KV shard into its own `KvBuffer`.
+5. Snapshot insertion reserves one common slot, saves it on every rank, verifies all returned positions, and only then publishes the key.
+6. Restore uses the same slot on every rank and reports a hit only after every worker confirms the boundary.
+
+This keeps admission, attachment, and eviction deterministic across ranks while leaving recurrent/conv tensors local to each GPU.
 
 ## Correctness rules
 
-- `RequestKv::kv_position() == RecurrentState::seq_len == SnapshotKey::boundary` after insertion and restore.
+- `RequestKv::kv_position() == RecurrentState::seq_len == PrefixBoundaryKey::boundary_tokens` after insertion and restore.
 - A snapshot contains both state tensors for every linear layer; GDR-only or conv-only snapshots are invalid.
 - Snapshot contents are immutable after publication.
-- KV and snapshot must use the same canonical `SequenceHash`.
 - A prefix hit always leaves at least one prompt token uncached so final prefill can emit the first generated token.
-- Echo and prompt-logprob requests never use prefix matching in the first slice.
-- Allocation pressure or no evictable snapshot slot changes hit rate only, not request output.
-- Snapshot insertion failure never converts an otherwise valid cold request into a cache hit.
+- Echo requests are rejected before prefix matching.
+- Allocation pressure changes hit rate only, not request output.
+- Failed forward or snapshot insertion never publishes a cache key.
 - A KV-only or snapshot-only boundary is never reported as cached tokens.
-- Disabling the feature or configuring zero slots preserves current cold-serving behavior.
+- A snapshot may outlive its KV blocks; lookup treats missing KV as a cache miss.
+- Disabling the feature preserves cold-serving behavior.
 
 ## Implementation order
 
-Implementation is a follow-on to this design and should land in this order:
-
-1. Move Qwen3.5 KV management to `BlockPool`/`RequestKv` while keeping the existing KV memory layout, admission behavior, direct-paged kernels, and accuracy gates.
-2. Add the fixed GPU snapshot allocator, config-derived slot sizing, pin guards, and unpinned LRU eviction.
-3. Make scheduler chunk planning boundary-aware and publish snapshots after committed whole-model windows.
-4. Add exact-boundary KV lookup/attach and expose the single `Qwen35PrefixCache::restore_prefix` operation.
-5. Add metrics for joint hit length, KV-only fallback, snapshot miss, skipped insertion, eviction, and restore latency.
-6. Run correctness, pressure, and warm-TTFT gates before enabling the feature by default.
+1. Move Qwen3.5 KV management to `KvCacheManager` and `RequestKv`.
+2. Add fixed-budget recurrent snapshot storage and joint prefix entry management.
+3. Publish snapshots at committed 256-token prefill boundaries.
+4. Add joint KV/snapshot lookup, restore, pinning, and LRU eviction for TP1 and TP.
+5. Validate correctness, serving behavior, and cold/warm performance before default enablement.
 
 ## Validation
 
@@ -264,9 +281,50 @@ The implementation acceptance surface should include:
 - mixed cold and warm requests in the same prefill/unified step;
 - pool-full behavior proving insertion skip preserves cold output;
 - real GPU cold-vs-warm HF logits gates, including resumed suffix prefill and decode-slot promotion;
-- retained metrics for snapshot D2D copy time, cold insertion overhead, warm TTFT, joint hit length, and slot occupancy.
+- retained cache metrics for joint hits, hit length, misses, insertions, evictions, and slot occupancy.
 
-Those measurements determine whether 256 remains the right stride. They must not be replaced by the old RTX 4090 CPU-transfer estimates, which measured a deferred design and a different snapshot shape.
+The cold/warm measurements below guide future stride changes. They must not be replaced by the old RTX 4090 CPU-transfer estimates, which measured a deferred design and a different snapshot shape.
+
+## Performance Result (2026-08-06)
+
+- **Environment:** local Qwen3.5-4B, RTX 4090s only (GPU 1 for TP1; GPUs 1/2 for TP2). TP1 used CUDA Graphs; TP2 used `--cuda-graph=false`.
+
+Qwen3.5 reuses the largest 256-token boundary strictly below the prompt length. This table compares cold and warm TTFT p50 for single-token generation (`cache off -> cache on`).
+
+| Prompt tokens | Cached tokens | TP1 | TP1 reduction | TP2 | TP2 reduction |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 320 | 256 | 29.22 -> 15.56 | 46.7% | 46.18 -> 18.75 | 59.4% |
+| 576 | 512 | 46.85 -> 16.92 | 63.9% | 72.97 -> 18.82 | 74.2% |
+| 1,088 | 1,024 | 88.75 -> 15.93 | 82.1% | 126.14 -> 19.36 | 84.7% |
+| 2,112 | 2,048 | 161.00 -> 16.40 | 89.8% | 230.07 -> 19.82 | 91.4% |
+| 4,160 | 4,096 | 308.64 -> 17.71 | 94.3% | 439.37 -> 21.68 | 95.1% |
+
+This table shows how the same cache hit affects TTFT and end-to-end latency when generating 128 tokens; decode dominates the remaining latency.
+
+| Prompt tokens | TP1 TTFT p50 off -> on | TP1 E2E p50 off -> on | TP2 TTFT p50 off -> on | TP2 E2E p50 off -> on |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,088 | 94.58 -> 24.13 | 1,542.02 -> 1,452.78 | 127.05 -> 20.38 | 1,445.78 -> 1,324.97 |
+| 2,112 | 166.25 -> 24.23 | 1,700.09 -> 1,535.84 | 231.56 -> 21.89 | 1,640.17 -> 1,421.95 |
+| 4,160 | 313.51 -> 24.30 | 2,006.08 -> 1,696.04 | 442.01 -> 24.88 | 2,036.57 -> 1,606.08 |
+
+This table summarizes behavior under concurrency, mixed load, and decode batching:
+
+| Additional workload | Result |
+| --- | --- |
+| TP1 concurrency, 2,112 prompt + 128 output | At concurrency 1/4/8: TTFT p50 `24.67/94.41/152.25 ms`; request throughput `83.11/75.87/69.04 tok/s`; every request hit 2,048 cached tokens. |
+| TP1 mixed load | Baseline ITL p50/p99 `12.03/12.25 ms`; mixed ITL `12.03/36.12 ms`. After initial insertion, 4,096-token injections hit 3,840 tokens with `41.42--51.00 ms` prefill and no warnings. |
+| Decode TP1 vs TP2 | At context 4,096/batch 1, TP1/TP2 TPOT is `13.08/12.47 ms`; at batch 4 it is `13.74/48.76 ms`. TP2 batch decode needs a separate runtime optimization pass; this run disables CUDA Graphs. |
+
+**Conclusion**
+
+- **Core performance gains**
+  - Warm TTFT improves with prefix length: at 4,160 prompt tokens it falls by 94.3% on TP1 and 95.1% on TP2.
+  - For 128-token outputs, the same long prompt reduces E2E latency by 15.4% on TP1 and 21.1% on TP2; steady decode TPOT is effectively unchanged.
+  - The benefit remains under TP1 concurrency and mixed load; warm injections hit 3,840 tokens with 41--51 ms prefill and no warnings.
+  - TP1 HTTP warm TTFT remains about 19--29 ms for 320--4,160-token prompts with cache enabled.
+- **Follow-up**
+  - TP2 batch-4 decode has high TPOT while CUDA Graphs are disabled; profile and optimize this runtime path separately from prefix cache.
+
 
 ## Deferred work
 
@@ -275,7 +333,6 @@ Those measurements determine whether 256 remains the right stride. They must not
 - workload-adaptive or per-model snapshot stride;
 - snapshot compression or reduced-precision state;
 - cross-worker/P-D transfer of hybrid state;
-- integration with speculative rollback state;
 - sharing snapshot infrastructure across other hybrid model lines.
 
-Each of these must preserve the same logical rule: one reusable boundary restores all model state at one token position.
+Each extension must preserve the same logical rule: one reusable boundary restores all model state at one token position.

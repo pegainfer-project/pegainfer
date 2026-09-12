@@ -511,7 +511,12 @@ fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (S
     (stats, fingerprint)
 }
 
-fn run_tp(g: &Golden, ex: &Qwen35TpExecutor, seqs: &[usize], batched: bool) -> (Stats, Vec<f32>) {
+fn run_tp(
+    g: &Golden,
+    ex: &mut Qwen35TpExecutor,
+    seqs: &[usize],
+    batched: bool,
+) -> (Stats, Vec<f32>) {
     let mut stats = Stats::default();
     let mut fingerprint = Vec::new();
     let mut fold = |stats: &mut Stats, seq, pos, pega: &[(u32, f32)]| {
@@ -774,7 +779,7 @@ fn build_tp2_graph_executor(model_path: &str, label: &str) -> Option<Qwen35TpExe
 /// gap), then keep decoding the survivors in their new dense slot order.
 fn run_tp_with_slot_compaction(
     g: &Golden,
-    ex: &Qwen35TpExecutor,
+    ex: &mut Qwen35TpExecutor,
     seqs: &[usize],
 ) -> (Stats, Vec<f32>) {
     assert!(
@@ -961,17 +966,17 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let ex = build_tp2_executor(&model_path);
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let mut ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 sequential eager", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 sequential Qwen3.5 replay must reproduce identical logprobs"
     );
 
     let batched_n = all.len().min(MAX_EXECUTOR_BATCH);
-    let (batched, _) = run_tp(&golden, &ex, &all[..batched_n], true);
+    let (batched, _) = run_tp(&golden, &mut ex, &all[..batched_n], true);
     report_and_assert("TP2 batched eager", &batched);
 }
 
@@ -991,10 +996,10 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let ex = build_tp2_executor(&model_path);
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let mut ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 long sequential eager", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 long sequential Qwen3.5 replay must reproduce identical logprobs"
@@ -1020,12 +1025,12 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let Some(ex) = build_tp2_graph_executor(&model_path, "TP2 graph") else {
+    let Some(mut ex) = build_tp2_graph_executor(&model_path, "TP2 graph") else {
         return;
     };
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 sequential graph", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 sequential Qwen3.5 graph replay must reproduce identical logprobs"
@@ -1033,7 +1038,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
 
     for n in BUCKET_STRADDLES {
         if all.len() >= n {
-            let (batched, _) = run_tp(&golden, &ex, &all[..n], true);
+            let (batched, _) = run_tp(&golden, &mut ex, &all[..n], true);
             report_and_assert(&format!("TP2 batched graph ({n} padded)"), &batched);
         } else {
             eprintln!(
@@ -1045,9 +1050,9 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
 
     if golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2 {
         let (compacted, fp1) =
-            run_tp_with_slot_compaction(&golden, &ex, &all[..SLOT_COMPACTION_BATCH]);
+            run_tp_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
         report_and_assert("TP2 slot-compaction graph", &compacted);
-        let (_, fp2) = run_tp_with_slot_compaction(&golden, &ex, &all[..SLOT_COMPACTION_BATCH]);
+        let (_, fp2) = run_tp_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
         assert_eq!(
             fp1, fp2,
             "TP2 slot-compaction Qwen3.5 graph replay must reproduce identical logprobs"
