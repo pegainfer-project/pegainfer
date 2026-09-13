@@ -105,6 +105,10 @@ pub(crate) struct Config35 {
 
     /// Token-selection width: `vocab_size` bounded to the frontend-decodable vocab.
     pub(crate) selection_vocab: usize,
+    /// Tokenizer-decodable width. The selection width may be tile-aligned
+    /// past this (see [`Config35::bound_selection_vocab`]); logits rows beyond
+    /// it are suppressed to -inf before selection.
+    pub(crate) decodable_vocab: usize,
 }
 
 impl Config35 {
@@ -169,6 +173,7 @@ impl Config35 {
         // up to the tile-aligned multiple — the checkpoint's remaining rows are
         // real trained embeddings and stay inside the mapped weight.
         let aligned = effective_vocab.next_multiple_of(128);
+        self.decodable_vocab = effective_vocab;
         self.selection_vocab = aligned.min(self.vocab_size);
         Ok(())
     }
@@ -285,6 +290,7 @@ impl TryFrom<RawConfig> for Config35 {
             layer_types,
             tie_word_embeddings,
             selection_vocab: t.vocab_size,
+            decodable_vocab: t.vocab_size,
         })
     }
 }
@@ -339,13 +345,15 @@ mod tests {
             .expect("977 decodes within vocab 1000");
         // 977 -> next 128 multiple (1024) clamped to the checkpoint's rows.
         assert_eq!(config.selection_vocab, 1000);
+        assert_eq!(config.decodable_vocab, 977);
 
         config
             .bound_selection_vocab(769)
             .expect("769 decodes within vocab 1000");
         // 769 -> 896: aligned, below the checkpoint rows, pad rows ride the
-        // mapped weight.
+        // mapped weight and are suppressed to -inf before selection.
         assert_eq!(config.selection_vocab, 896);
+        assert_eq!(config.decodable_vocab, 769);
     }
 
     #[test]

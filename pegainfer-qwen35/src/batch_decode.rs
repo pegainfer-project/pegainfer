@@ -702,6 +702,7 @@ impl Qwen35Model {
             &bufs.normed,
             &mut bufs.logits,
         )?;
+        self.suppress_pad_logits(&mut bufs.logits)?;
         debug_assert_eq!(bufs.logits.seq_len, padded_bs);
 
         Ok(())
@@ -780,6 +781,7 @@ impl Qwen35Model {
             &bufs.normed,
             &mut bufs.logits,
         )?;
+        self.suppress_pad_logits(&mut bufs.logits)?;
         debug_assert_eq!(bufs.logits.seq_len, bs);
         Ok(())
     }

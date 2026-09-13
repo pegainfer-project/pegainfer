@@ -125,6 +125,7 @@ impl Qwen35Model {
             &normed,
             &mut logits,
         )?;
+        self.suppress_pad_logits(&mut logits)?;
         debug_assert_eq!(logits.seq_len, n);
         Ok(logits)
     }
