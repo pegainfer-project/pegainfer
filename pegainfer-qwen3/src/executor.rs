@@ -19,6 +19,7 @@ use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_frontend::engine::DeferredFinish;
 use pegainfer_frontend::engine::LoadLoraAdapterRequest;
 use pegainfer_frontend::engine::SpecDecodeCounters;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::engine::panic_message;
@@ -494,7 +495,9 @@ fn execute_step_on_lane(
         StepCommand::SpeculativeVerify {
             requests,
             kv_views,
+            stop_policies,
             sample_seed,
+            verify_round,
         } => {
             // One target forward over each request's K+1 draft span with a
             // speculative KV view. The fixed-buffer verify path computes all-
@@ -502,7 +505,13 @@ fn execute_step_on_lane(
             // token at each span position) and captures the target hidden states
             // (at the DFlash layers) to seed the next draft — all into reused,
             // pointer-stable scratch (`VerifyGraphBuffers`).
-            let result = lane.execute_dflash_verify(requests, kv_views, *sample_seed)?;
+            let result = lane.execute_dflash_verify(
+                requests,
+                kv_views,
+                stop_policies,
+                *sample_seed,
+                *verify_round,
+            )?;
             Ok(WorkerStepOutcome::SpeculativeVerify(result))
         }
         StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
@@ -942,6 +951,8 @@ pub struct Qwen3Executor {
     /// [`enable_decode_overlap`] to create overlap streams on the correct
     /// device (the model, KV cache, and compute stream all live here).
     device_ordinal: usize,
+    /// Monotonic ID for correlating per-round speculative verify diagnostics.
+    verify_round: u64,
 }
 
 /// One request's in-flight CPU-tier KV prefetch.
@@ -1144,6 +1155,7 @@ impl Qwen3Executor {
             spec_decode_counters: None,
             dflash_ready_requests: HashSet::new(),
             device_ordinal,
+            verify_round: 0,
         })
     }
 
@@ -1536,6 +1548,7 @@ impl Qwen3Executor {
             spec_decode_counters: None,
             dflash_ready_requests: HashSet::new(),
             device_ordinal: device_ordinals[0],
+            verify_round: 0,
         })
     }
 
@@ -3425,8 +3438,10 @@ impl LocalQwen3Lane {
         &mut self,
         requests: &[VerifyStepItem],
         kv_views: &[KvView],
+        stop_policies: &[StopPolicy],
         capture_layer_ids: &[usize],
         sample_seed: u64,
+        verify_round: u64,
         bufs: &mut VerifyGraphBuffers,
     ) -> Result<Option<VerifyResult>> {
         let page_size = self.layout.page_size;
@@ -3532,9 +3547,45 @@ impl LocalQwen3Lane {
             .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
             .collect();
         let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
-        let all_results = build_verify_results(&expanded, &target_tokens)?;
-        let (results_a, results_b) = all_results.split_at(requests.len());
-
+        let mut all_results = build_verify_results(&expanded, &target_tokens)?;
+        // A terminal token ends the request even when it appears in the middle
+        // of a speculative span. Normalize every candidate before selecting a
+        // winner; otherwise a discarded suffix can win the hedge and advance
+        // the wrong KV/hidden state and acceptance statistics.
+        let (results_a, results_b) = all_results.split_at_mut(requests.len());
+        anyhow::ensure!(
+            results_b.len() == hedge_spans.len(),
+            "hedge returned {} B results for {} hedge spans",
+            results_b.len(),
+            hedge_spans.len()
+        );
+        let trace = std::env::var_os("PEGAINFER_TEST_LOG").is_some();
+        let raw_a_lengths: Vec<usize> = if trace {
+            results_a
+                .iter()
+                .map(|result| result.accepted_tokens.len())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let raw_b_lengths: Vec<usize> = if trace {
+            results_b
+                .iter()
+                .map(|result| result.accepted_tokens.len())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (result, policy) in results_a.iter_mut().zip(stop_policies) {
+            spec::truncate_after_terminal(result, policy, &self.model.config().stop_token_ids);
+        }
+        for (slot, (idx, _)) in hedge_spans.iter().enumerate() {
+            spec::truncate_after_terminal(
+                &mut results_b[slot],
+                &stop_policies[*idx],
+                &self.model.config().stop_token_ids,
+            );
+        }
         // Per request keep the best-accepting chain; ties keep chain A (no
         // copies). A later chain of the same request only replaces the
         // running winner when strictly better, so the final page/hidden
@@ -3544,6 +3595,11 @@ impl LocalQwen3Lane {
         let elem = std::mem::size_of::<half::bf16>();
         let mut final_requests: Vec<VerifyStepItem> = requests.to_vec();
         let mut final_results: Vec<VerifyRequestResult> = results_a.to_vec();
+        let mut selected_is_b = if trace {
+            Some(vec![false; requests.len()])
+        } else {
+            None
+        };
         let mut b_wins = 0usize;
         let mut b_row_offset = a_total_rows;
         for (slot, (idx, replaced)) in hedge_spans.iter().enumerate() {
@@ -3563,12 +3619,15 @@ impl LocalQwen3Lane {
                     cudarc::driver::result::memcpy_dtod_async(
                         dst,
                         src,
-                        span_len * hidden_dim * elem,
+                        res_b.accepted_tokens.len() * hidden_dim * elem,
                         ctx.stream.cu_stream(),
                     )
                 }
                 .map_err(|e| anyhow::anyhow!("hedge hidden compaction failed: {e}"))?;
                 b_wins += 1;
+                if let Some(selected) = selected_is_b.as_mut() {
+                    selected[*idx] = true;
+                }
                 final_requests[*idx] = expanded[requests.len() + slot].clone();
                 final_results[*idx] = res_b.clone();
             }
@@ -3591,7 +3650,40 @@ impl LocalQwen3Lane {
             &final_requests,
             &final_results,
             Some(bufs.captured_hidden()),
+            verify_round,
         )?;
+        if std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
+            for idx in 0..requests.len() {
+                let has_hedge = hedge_spans
+                    .iter()
+                    .any(|(request_idx, _)| *request_idx == idx);
+                if !has_hedge {
+                    continue;
+                }
+                let selected = if selected_is_b.as_ref().is_some_and(|selected| selected[idx]) {
+                    'B'
+                } else {
+                    'A'
+                };
+                let raw_b_lens = hedge_spans
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (request_idx, _))| *request_idx == idx)
+                    .map(|(slot, _)| raw_b_lengths[slot].to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                log::debug!(
+                    "Qwen3 DFlash hedge detail round={} request={} raw_a={} raw_b_lens={} selected={} selected_len={} matched_draft={}",
+                    verify_round,
+                    requests[idx].request_id,
+                    raw_a_lengths[idx],
+                    raw_b_lens,
+                    selected,
+                    final_results[idx].accepted_tokens.len(),
+                    final_results[idx].matched_draft_tokens,
+                );
+            }
+        }
         Ok(Some(VerifyResult {
             requests: final_results,
         }))
@@ -3605,8 +3697,16 @@ impl LocalQwen3Lane {
         &mut self,
         requests: &[VerifyStepItem],
         kv_views: &[KvView],
+        stop_policies: &[StopPolicy],
         sample_seed: u64,
+        verify_round: u64,
     ) -> Result<VerifyResult> {
+        anyhow::ensure!(
+            stop_policies.len() == requests.len(),
+            "DFlash verify received {} stop policies for {} requests",
+            stop_policies.len(),
+            requests.len()
+        );
         let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
             anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
         })?;
@@ -3656,8 +3756,10 @@ impl LocalQwen3Lane {
                 if let Some(result) = self.try_execute_hedged_verify(
                     requests,
                     kv_views,
+                    stop_policies,
                     &capture_layer_ids,
                     sample_seed,
+                    verify_round,
                     &mut bufs,
                 )? {
                     return Ok(result);
@@ -3691,12 +3793,18 @@ impl LocalQwen3Lane {
                 .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
                 .collect();
             let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
-            let request_results = build_verify_results(requests, &target_tokens)?;
-
+            let mut request_results = build_verify_results(requests, &target_tokens)?;
+            // Apply the request policy before recording target hidden states;
+            // otherwise a suffix discarded by terminal handling would leak
+            // into the next DFlash draft context and acceptance counters.
+            for (policy, result) in stop_policies.iter().zip(&mut request_results) {
+                spec::truncate_after_terminal(result, policy, &self.model.config().stop_token_ids);
+            }
             self.record_verify_dflash_context(
                 requests,
                 &request_results,
                 Some(bufs.captured_hidden()),
+                verify_round,
             )?;
             Ok(VerifyResult {
                 requests: request_results,
@@ -3804,7 +3912,11 @@ enum StepCommand {
     SpeculativeVerify {
         requests: Vec<VerifyStepItem>,
         kv_views: Vec<KvView>,
+        /// Request-local stop policies used before DFlash context recording;
+        /// these are host metadata and never enter the GPU batch.
+        stop_policies: Vec<StopPolicy>,
         sample_seed: u64,
+        verify_round: u64,
     },
     /// Speculative draft: roll the DFlash draft model forward one block per
     /// request. Uses the draft's own KV — no target KV views.

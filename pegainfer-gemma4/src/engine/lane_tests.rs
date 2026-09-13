@@ -55,6 +55,7 @@ impl Harness {
                     ignore_eos: true,
                     ..pegainfer_frontend::sampler::SamplingParams::default()
                 },
+                stop_policy: pegainfer_frontend::engine::StopPolicy::default(),
                 max_tokens,
                 lora_adapter: None,
                 kv_transfer_params: None,
