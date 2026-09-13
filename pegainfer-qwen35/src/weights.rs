@@ -167,10 +167,10 @@ impl Qwen35Model {
         config
             .bound_selection_vocab(effective_vocab)
             .map_err(anyhow::Error::from)?;
-        if config.selection_vocab < config.vocab_size {
+        if config.selection_vocab != effective_vocab {
             info!(
-                "output projection: selection bounded to decodable vocab {} (checkpoint pads to {})",
-                config.selection_vocab, config.vocab_size
+                "output projection: selection width {} = decodable vocab {} + tile-alignment pad (checkpoint has {})",
+                config.selection_vocab, effective_vocab, config.vocab_size
             );
         }
 

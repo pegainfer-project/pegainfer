@@ -162,7 +162,14 @@ impl Config35 {
                 vocab_size: self.vocab_size,
             });
         }
-        self.selection_vocab = effective_vocab;
+        // The logits GEMM's M dimension and the output matrix's leading
+        // dimension both take this width; an unaligned value (Qwen3.5-4B's
+        // tokenizer decodes 248077) forces cublasLt onto an align-1 sm_75-era
+        // kernel that costs ~1.7 ms/decode-step on sm_80. Round the GEMM width
+        // up to the tile-aligned multiple — the checkpoint's remaining rows are
+        // real trained embeddings and stay inside the mapped weight.
+        let aligned = effective_vocab.next_multiple_of(128);
+        self.selection_vocab = aligned.min(self.vocab_size);
         Ok(())
     }
 }
@@ -322,6 +329,35 @@ mod tests {
         let config = config(VALID_RAW);
         assert_eq!(config.num_full_attention_layers(), 1);
         assert_eq!(config.vocab_size, 1000);
+    }
+
+    #[test]
+    fn selection_vocab_bound_aligns_to_tile_multiple() {
+        let mut config = config(VALID_RAW);
+        config
+            .bound_selection_vocab(977)
+            .expect("977 decodes within vocab 1000");
+        // 977 -> next 128 multiple (1024) clamped to the checkpoint's rows.
+        assert_eq!(config.selection_vocab, 1000);
+
+        config
+            .bound_selection_vocab(769)
+            .expect("769 decodes within vocab 1000");
+        // 769 -> 896: aligned, below the checkpoint rows, pad rows ride the
+        // mapped weight.
+        assert_eq!(config.selection_vocab, 896);
+    }
+
+    #[test]
+    fn selection_vocab_bound_still_rejects_wider_tokenizers() {
+        let mut config = config(VALID_RAW);
+        let err = config
+            .bound_selection_vocab(1001)
+            .expect_err("a tokenizer wider than the checkpoint is rejected");
+        assert!(matches!(
+            err,
+            ConfigError::EffectiveVocabExceedsCheckpoint { .. }
+        ));
     }
 
     #[test]

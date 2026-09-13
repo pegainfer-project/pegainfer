@@ -47,7 +47,7 @@ Neither kernel has had an sm_80 tuning pass (decode tuning history is sm_120/RTX
 
 `cutlass_75_tensorop_bf16_s1688gemm_bf16_128x64_tn_align1` runs **once per decode step at 1.67 ms** (280 instances ≈ 270 steps) — an sm_75-era kernel at alignment 1, ~12% of c16 TPOT for a single launch. One GEMM per step points at the output projection (`selection_vocab × hidden` over the bounded vocab): the selection width is Qwen3.5-4B's tokenizer-decodable vocab **248077 — odd — so both the GEMM M and the logits leading dimension defeat cublasLt's vectorized ampere kernels**.
 
-Follow-up: round the selection width to the 128-token tile multiple at the `bound_selection_vocab` boundary (still inside the 248,320-row checkpoint weight), so every downstream buffer and the sampler stay consistent.
+Fixed by aligning the selection width to the 128-token tile multiple (`248077 → 248192`, still inside the 248,320-row checkpoint weight) at the `bound_selection_vocab` boundary, so every downstream buffer and the sampler stay consistent. The align-1 kernel disappears; measured on A100-40GB: c16 TPOT `14.26 → 13.51 ms` (−5.3%), c8 `11.98 → 11.23`, QPS16 `23.77 → 22.68` (vLLM `23.60`); `hf_golden_gate` TP1/TP2 validate output equivalence against HF, which computes logits over the full checkpoint vocab itself.
 
 ### 5. What is NOT the problem
 
@@ -61,7 +61,6 @@ Follow-up: round the selection width to the 128-token tile multiple at the `boun
 1. Retune the decode GEMM family on sm_80 (+3.5 ms/step at c16 — cublasLt algo selection vs torch.compile's kernel choices; possible qkv/z/b/a projection fusion).
 2. Replace or retune the full-attn paged decode path (FlashInfer `BatchDecodeWithPagedKVCache` → `flash_fwd_splitkv`-class: ~1.0 ms/step at bs1, 2.4× per layer-step at c16).
 3. Retune the GDN decode kernel vs FLA `fused_recurrent` (2.2× per layer-step).
-4. Fix the output-projection align-1 kernel (1.67 ms/step at c16): round the selection width to the tile multiple or pin a cublasLt algo.
 
 ## Claim boundary
 
