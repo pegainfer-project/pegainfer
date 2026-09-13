@@ -69,6 +69,9 @@ pub struct Qwen35Model {
     /// (e.g. `--max-batch 5` allocates bucket 8 but admits at most 5). See #470.
     pub(super) decode_admission_batch: usize,
     tp_comm: Option<Comm>,
+    /// -inf suppression for the tile-alignment pad rows of the logits GEMM
+    /// (absent when the selection width needs no padding).
+    pad_logit_suppress: Option<crate::ops::SuppressIds>,
 }
 
 // SAFETY: A Qwen3.5 model instance is bound to one CUDA device and driven from
@@ -167,10 +170,10 @@ impl Qwen35Model {
         config
             .bound_selection_vocab(effective_vocab)
             .map_err(anyhow::Error::from)?;
-        if config.selection_vocab < config.vocab_size {
+        if config.selection_vocab != effective_vocab {
             info!(
-                "output projection: selection bounded to decodable vocab {} (checkpoint pads to {})",
-                config.selection_vocab, config.vocab_size
+                "output projection: selection width {} = decodable vocab {} + tile-alignment pad (checkpoint has {})",
+                config.selection_vocab, effective_vocab, config.vocab_size
             );
         }
 
@@ -308,6 +311,21 @@ impl Qwen35Model {
             page_size,
             num_pages,
         )?;
+        // Rows the selection width adds past the decodable vocab are real
+        // checkpoint embeddings but not decodable tokens; force their logits
+        // to -inf so they can never win selection.
+        let pad_logit_suppress = if config.selection_vocab > config.decodable_vocab {
+            let ids: Vec<u32> = (config.decodable_vocab..config.selection_vocab)
+                .map(|id| id as u32)
+                .collect();
+            Some(crate::ops::SuppressIds::upload(
+                &ctx,
+                &ids,
+                config.selection_vocab,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             ctx,
@@ -323,6 +341,7 @@ impl Qwen35Model {
             reserved_decode_slots: max_batch,
             decode_admission_batch,
             tp_comm: None,
+            pad_logit_suppress,
         })
     }
 
@@ -332,6 +351,18 @@ impl Qwen35Model {
 
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
+    }
+
+    /// Suppress the tile-alignment pad rows of a logits buffer: rows past the
+    /// decodable vocab are forced to -inf so they can never win greedy or
+    /// sampled selection (a no-op when the width needs no padding).
+    pub(crate) fn suppress_pad_logits(&self, logits: &mut HiddenStates) -> Result<()> {
+        match &self.pad_logit_suppress {
+            Some(suppress) => {
+                crate::ops::suppress_logits_bf16_in_place(&self.ctx, logits, suppress)
+            }
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn ensure_rope_cache_covers(&self, positions: usize) -> Result<()> {
