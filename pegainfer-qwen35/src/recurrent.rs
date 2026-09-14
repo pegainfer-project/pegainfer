@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -10,6 +11,7 @@ use crate::config::GDN_AOT_KEY_HEAD_DIM;
 use crate::config::GDN_AOT_VALUE_HEAD_DIM;
 use crate::config::LINEAR_CONV_MAX_KERNEL_DIM;
 use crate::ffi;
+use crate::prefill_buffers::GdnPrepareScratch35;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
 
 #[cfg(test)]
@@ -176,6 +178,111 @@ pub(crate) fn conv1d_prefill_batch_into(
             ctx.stream.cu_stream(),
         );
     }
+}
+
+/// Prepare native Q/K/V plus per-token alpha/beta for the FlashInfer GDN
+/// candidate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_rule_prefill_native_prepare_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    b_proj: &HiddenStates,
+    a_proj: &HiddenStates,
+    dt_bias: &DeviceVec,
+    a_log: &CudaSlice<f32>,
+    scratch: &mut GdnPrepareScratch35,
+) -> Result<()> {
+    let geometry = pegainfer_kernels::ops::Qwen35GdnGeometry::PRODUCTION;
+    anyhow::ensure!(qkv.seq_len > 0, "native GDN prepare requires T>=1");
+    let expected_qkv = (geometry.h_q + geometry.h_k + geometry.h_v) * geometry.head_dim;
+    anyhow::ensure!(
+        qkv.hidden_dim == expected_qkv,
+        "native GDN qkv hidden dim mismatch: expected {expected_qkv}, got {}",
+        qkv.hidden_dim
+    );
+    anyhow::ensure!(
+        b_proj.hidden_dim == geometry.h_v && b_proj.seq_len == qkv.seq_len,
+        "native GDN b projection must be [T,Hv]=[{},{}]",
+        qkv.seq_len,
+        geometry.h_v
+    );
+    anyhow::ensure!(
+        a_proj.hidden_dim == geometry.h_v && a_proj.seq_len == qkv.seq_len,
+        "native GDN a projection must be [T,Hv]=[{},{}]",
+        qkv.seq_len,
+        geometry.h_v
+    );
+    anyhow::ensure!(
+        dt_bias.len == geometry.h_v,
+        "native GDN dt_bias length must be {}, got {}",
+        geometry.h_v,
+        dt_bias.len
+    );
+    anyhow::ensure!(
+        a_log.len() == geometry.h_v,
+        "native GDN A_log length must be {}, got {}",
+        geometry.h_v,
+        a_log.len()
+    );
+    anyhow::ensure!(
+        scratch.q.hidden_dim == geometry.h_q * geometry.head_dim
+            && scratch.q.seq_len == qkv.seq_len,
+        "native GDN Q output shape mismatch"
+    );
+    anyhow::ensure!(
+        scratch.k.hidden_dim == geometry.h_k * geometry.head_dim
+            && scratch.k.seq_len == qkv.seq_len,
+        "native GDN K output shape mismatch"
+    );
+    anyhow::ensure!(
+        scratch.v.hidden_dim == geometry.h_v * geometry.head_dim
+            && scratch.v.seq_len == qkv.seq_len,
+        "native GDN V output shape mismatch"
+    );
+    anyhow::ensure!(
+        scratch.alpha.len() == qkv.seq_len * geometry.h_v,
+        "native GDN alpha output length mismatch"
+    );
+    anyhow::ensure!(
+        scratch.beta.len() == qkv.seq_len * geometry.h_v,
+        "native GDN beta output length mismatch"
+    );
+    let tokens: i32 = qkv
+        .seq_len
+        .try_into()
+        .context("native GDN prepare T exceeds i32")?;
+
+    {
+        let (qkv_ptr, _gqkv) = qkv.data.device_ptr(&ctx.stream);
+        let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
+        let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
+        let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
+        let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
+        let (q_out, _gqo) = scratch.q.data.device_ptr_mut(&ctx.stream);
+        let (k_out, _gko) = scratch.k.data.device_ptr_mut(&ctx.stream);
+        let (v_out, _gvo) = scratch.v.data.device_ptr_mut(&ctx.stream);
+        let (alpha_out, _gaout) = scratch.alpha.device_ptr_mut(&ctx.stream);
+        let (beta_out, _gbout) = scratch.beta.device_ptr_mut(&ctx.stream);
+
+        let result = unsafe {
+            ffi::gated_delta_rule_prefill_native_prepare_cuda(
+                qkv_ptr as *const ffi::Half,
+                b_ptr as *const ffi::Half,
+                a_ptr as *const ffi::Half,
+                dt_ptr as *const ffi::Half,
+                alog_ptr as *const f32,
+                q_out as *mut ffi::Half,
+                k_out as *mut ffi::Half,
+                v_out as *mut ffi::Half,
+                alpha_out as *mut f32,
+                beta_out as *mut f32,
+                tokens,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -980,3 +1087,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "recurrent/native_prepare_tests.rs"]
+mod native_prepare_tests;

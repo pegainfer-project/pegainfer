@@ -17,22 +17,26 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use pegainfer_frontend::engine::TokenLogprob;
-use pegainfer_qwen35::runtime::DecodePlan;
-use pegainfer_qwen35::runtime::DecodeStepItem;
-use pegainfer_qwen35::runtime::DropExpectation;
-use pegainfer_qwen35::runtime::PrefillPlan;
-use pegainfer_qwen35::runtime::PrefillStepItem;
-use pegainfer_qwen35::runtime::Qwen35Executor;
-use pegainfer_qwen35::runtime::Qwen35TpExecutor;
-use pegainfer_qwen35::runtime::RequestId;
 use safetensors::Dtype;
 use safetensors::SafeTensors;
 use sha2::Digest;
 use sha2::Sha256;
 
-mod common;
+use crate::runtime::DecodePlan;
+use crate::runtime::DecodeStepItem;
+use crate::runtime::DropExpectation;
+use crate::runtime::PrefillPlan;
+use crate::runtime::PrefillStepItem;
+use crate::runtime::Qwen35Executor;
+use crate::runtime::Qwen35TpExecutor;
+use crate::runtime::RequestId;
+use crate::test_fixture as common;
 
+const REVISION_ENV: &str = "PEGAINFER_TEST_MODEL_REVISION";
 const GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_GOLDEN";
 const LONG_GOLDEN_ENV: &str = "PEGAINFER_QWEN35_HF_LONG_GOLDEN";
 
@@ -48,31 +52,29 @@ const P99_TOL: f32 = 0.20;
 
 /// Size key from config CONTENT, not the directory name; keep in sync with
 /// `SIZE_NAMES` in `tools/accuracy/dump_qwen35_hf_golden.py`.
-fn fixture_size_name(model_path: &str) -> Option<&'static str> {
+fn fixture_size_name(model_path: &str) -> Result<Option<&'static str>> {
     let config_path = Path::new(model_path).join("config.json");
-    let raw = std::fs::read_to_string(&config_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("parse {}: {e}", config_path.display()));
-    let t = v.get("text_config").unwrap_or(&v);
-    let hidden = t.get("hidden_size").and_then(serde_json::Value::as_u64);
-    let layers = t
+    let raw =
+        std::fs::read(&config_path).with_context(|| format!("read {}", config_path.display()))?;
+    let config: serde_json::Value =
+        serde_json::from_slice(&raw).with_context(|| format!("parse {}", config_path.display()))?;
+    let text = config.get("text_config").unwrap_or(&config);
+    let hidden = text
+        .get("hidden_size")
+        .and_then(serde_json::Value::as_u64)
+        .context("model config has no hidden_size")?;
+    let layers = text
         .get("num_hidden_layers")
-        .and_then(serde_json::Value::as_u64);
-    let (Some(hidden), Some(layers)) = (hidden, layers) else {
-        panic!(
-            "{} has no hidden_size/num_hidden_layers",
-            config_path.display()
-        );
-    };
-    match (hidden, layers) {
+        .and_then(serde_json::Value::as_u64)
+        .context("model config has no num_hidden_layers")?;
+    Ok(match (hidden, layers) {
         (1024, 24) => Some("0.8b"),
         (2048, 24) => Some("2b"),
         (2560, 32) => Some("4b"),
         (4096, 32) => Some("9b"),
         (5120, 64) => Some("27b"),
         _ => None,
-    }
+    })
 }
 
 /// Sizes whose fixtures are committed in `test_data/`; a missing file for
@@ -95,47 +97,23 @@ const BUCKET_STRADDLES: [usize; 2] = [5, 3];
 const SLOT_COMPACTION_BATCH: usize = 5;
 const SLOT_COMPACTION_DROP_INDEX: usize = 1;
 
-fn sha256_file(path: impl AsRef<Path>) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+fn sha256_file(path: impl AsRef<Path>) -> Result<String> {
+    let bytes = std::fs::read(path)?;
     let mut digest = Sha256::new();
     digest.update(bytes);
-    Some(
-        digest
-            .finalize()
-            .iter()
-            .fold(String::new(), |mut hex, byte| {
-                use std::fmt::Write as _;
-                let _ = write!(hex, "{byte:02x}");
-                hex
-            }),
-    )
+    Ok(digest
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        }))
 }
 
-fn safetensors_metadata(bytes: &[u8]) -> HashMap<String, String> {
-    let header_len_bytes: [u8; 8] = bytes[..8]
-        .try_into()
-        .expect("safetensors file missing 8-byte header length");
-    let header_len = u64::from_le_bytes(header_len_bytes) as usize;
-    let header = &bytes[8..8 + header_len];
-    let value: serde_json::Value =
-        serde_json::from_slice(header).expect("parse safetensors JSON header");
-    value
-        .get("__metadata__")
-        .and_then(serde_json::Value::as_object)
-        .map(|metadata| {
-            metadata
-                .iter()
-                .filter_map(|(key, value)| {
-                    value.as_str().map(|value| (key.clone(), value.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn model_revision(model_path: &str) -> Option<String> {
-    if let Ok(value) = std::env::var("PEGAINFER_TEST_MODEL_REVISION") {
-        return Some(value);
+fn model_revision(model_path: &str, revision_override: Option<&str>) -> Option<String> {
+    if let Some(value) = revision_override {
+        return Some(value.to_owned());
     }
     let path = Path::new(model_path);
     let metadata_path = path
@@ -171,61 +149,57 @@ fn model_revision(model_path: &str) -> Option<String> {
     None
 }
 
-fn require_metadata<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a str {
+fn require_metadata<'a>(metadata: &'a HashMap<String, String>, key: &str) -> Result<&'a str> {
     metadata
         .get(key)
-        .unwrap_or_else(|| panic!("qwen35 hf_golden_gate fixture missing metadata key {key}"))
+        .map(String::as_str)
+        .with_context(|| format!("qwen35 hf_golden_gate fixture missing metadata key {key}"))
 }
 
-fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
+fn check_fixture_metadata(
+    model_path: &str,
+    golden: &Golden,
+    revision_override: Option<&str>,
+) -> Result<()> {
     let metadata = &golden.metadata;
-    assert_eq!(
-        require_metadata(metadata, "dtype"),
-        "bfloat16",
+    ensure!(
+        require_metadata(metadata, "dtype")? == "bfloat16",
         "qwen35 hf_golden_gate fixture dtype mismatch; regenerate the fixture"
     );
-    assert_eq!(
-        require_metadata(metadata, "top_k"),
-        LOGPROBS.to_string(),
+    ensure!(
+        require_metadata(metadata, "top_k")? == LOGPROBS.to_string(),
         "qwen35 hf_golden_gate fixture top_k mismatch; regenerate the fixture"
     );
-
     let config = PathBuf::from(model_path).join("config.json");
-    let actual_config_sha256 = sha256_file(&config).unwrap_or_else(|| {
-        panic!(
-            "qwen35 hf_golden_gate cannot read local config for metadata check: {}",
+    let actual_config_sha256 = sha256_file(&config).with_context(|| {
+        format!(
+            "cannot read local config for metadata check: {}",
             config.display()
         )
-    });
-    assert_eq!(
-        actual_config_sha256,
-        require_metadata(metadata, "config_sha256"),
+    })?;
+    ensure!(
+        actual_config_sha256 == require_metadata(metadata, "config_sha256")?,
         "qwen35 hf_golden_gate config.json hash mismatch; regenerate the fixture for this model/config revision"
     );
-
-    let expected_revision = require_metadata(metadata, "model_revision");
-    assert_ne!(
-        expected_revision, "unknown",
+    let expected_revision = require_metadata(metadata, "model_revision")?;
+    ensure!(
+        expected_revision != "unknown",
         "qwen35 hf_golden_gate fixture must record a pinned model_revision"
     );
-    let Some(actual_revision) = model_revision(model_path) else {
-        eprintln!(
-            "skipping qwen35 hf_golden_gate: fixture requires model_revision={expected_revision}, but local model revision is unknown"
-        );
-        return false;
-    };
-    assert_eq!(
-        actual_revision, expected_revision,
+    let actual_revision = model_revision(model_path, revision_override).with_context(|| {
+        format!("cannot verify model_revision={expected_revision}: local model revision is unknown")
+    })?;
+    ensure!(
+        actual_revision == expected_revision,
         "qwen35 hf_golden_gate model revision mismatch; set PEGAINFER_TEST_MODEL_REVISION or use the fixture's model snapshot"
     );
-
     if let Some(expected_tokenizer_revision) = metadata.get("tokenizer_revision") {
-        assert_ne!(
-            expected_tokenizer_revision, "unknown",
+        ensure!(
+            expected_tokenizer_revision != "unknown",
             "qwen35 hf_golden_gate fixture must record a pinned tokenizer_revision"
         );
     }
-    true
+    Ok(())
 }
 
 fn as_i32(st: &SafeTensors, name: &str) -> (Vec<i32>, Vec<usize>) {
@@ -321,10 +295,10 @@ struct Golden {
 impl Golden {
     /// An explicitly set env override must exist; a missing default keyed
     /// fixture is a clean skip (`None`).
-    fn load_for(model_path: &str, long: bool) -> Option<Golden> {
+    fn load_for(model_path: &str, long: bool) -> Result<Option<Golden>> {
         let env_key = if long { LONG_GOLDEN_ENV } else { GOLDEN_ENV };
-        let Some(size) = fixture_size_name(model_path) else {
-            assert!(
+        let Some(size) = fixture_size_name(model_path)? else {
+            ensure!(
                 std::env::var(env_key).is_err(),
                 "{env_key} is set but the model geometry in {model_path}/config.json \
                  has no entry in the size table"
@@ -333,14 +307,14 @@ impl Golden {
                 "skipping qwen35 hf_golden_gate: unrecognized model geometry in \
                  {model_path}/config.json; extend fixture_size_name to cover it"
             );
-            return None;
+            return Ok(None);
         };
         let path = if let Ok(path) = std::env::var(env_key) {
             path
         } else {
             let path = default_fixture_path(size, long);
             if !Path::new(&path).exists() {
-                assert!(
+                ensure!(
                     !COMMITTED_FIXTURE_SIZES.contains(&size),
                     "committed golden fixture missing at {path}"
                 );
@@ -348,18 +322,20 @@ impl Golden {
                     "skipping qwen35 hf_golden_gate: no golden fixture for this size at \
                      {path}; generate one with tools/accuracy/dump_qwen35_hf_golden.py"
                 );
-                return None;
+                return Ok(None);
             }
             path
         };
-        Some(Self::load_path(path))
+        Self::load_path(path).map(Some)
     }
 
-    fn load_path(path: impl AsRef<Path>) -> Golden {
+    fn load_path(path: impl AsRef<Path>) -> Result<Golden> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let metadata = safetensors_metadata(&bytes);
-        let st = SafeTensors::deserialize(&bytes).expect("parse golden safetensors");
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let (_, header) =
+            SafeTensors::read_metadata(&bytes).context("read golden safetensors metadata")?;
+        let metadata = header.metadata().clone().unwrap_or_default();
+        let st = SafeTensors::deserialize(&bytes).context("parse golden safetensors")?;
         let (prompt_tokens, _) = as_i32(&st, "prompt_tokens");
         let (prompt_lens, _) = as_i32(&st, "prompt_lens");
         let (decode_tokens, dshape) = as_i32(&st, "decode_tokens");
@@ -370,7 +346,7 @@ impl Golden {
         let positions = ishape[1];
         let k = ishape[2];
         assert_eq!(positions, decode_len + 1);
-        Golden {
+        Ok(Golden {
             prompt_tokens,
             prompt_lens,
             decode_tokens,
@@ -381,7 +357,7 @@ impl Golden {
             decode_len,
             positions,
             k,
-        }
+        })
     }
 
     fn prompt(&self, seq: usize) -> Vec<u32> {
@@ -734,12 +710,40 @@ fn report_and_assert(label: &str, stats: &Stats) {
         p99 <= P99_TOL,
         "[{label}] p99 head logprob delta {p99:.4} > {P99_TOL}"
     );
-    let _ = max;
 }
 
-fn build_executor(model_path: &str) -> Qwen35Executor {
-    Qwen35Executor::from_runtime(model_path, 0, MAX_EXECUTOR_BATCH)
-        .expect("build Qwen3.5 logits executor")
+fn build_executor(model_path: &str, acceptance: &common::GdnAcceptance) -> Qwen35Executor {
+    let model = acceptance
+        .load_model(
+            model_path,
+            MAX_EXECUTOR_BATCH,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            crate::Qwen35SchedulerPolicy::Off,
+            crate::Qwen35DecodeOverlap::Off,
+        )
+        .expect("load Qwen3.5 logits executor model");
+    for target in &model.candidate_decode {
+        assert!(
+            model
+                .candidate_decode_recipe(
+                    target.weights(&model).expect("real target weights"),
+                    target.batch
+                )
+                .is_err(),
+            "selected projection must reject launch before tuning"
+        );
+    }
+    model
+        .tune_decode_gemm_algos()
+        .expect("tune Qwen3.5 logits executor GEMMs");
+    let graph_state = model
+        .create_batch_decode_graph_state()
+        .expect("capture Qwen3.5 logits executor graph");
+    Qwen35Executor {
+        model,
+        graph_state,
+        active: Vec::new(),
+    }
 }
 
 fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
@@ -859,22 +863,213 @@ fn run_tp_with_slot_compaction(
     (stats, fingerprint)
 }
 
+fn check_prerequisite_rejections(model_path: &str, golden: &Golden) -> Result<()> {
+    let reject = |expected: &str, error: anyhow::Error| {
+        assert!(
+            format!("{error:#}").contains(expected),
+            "wrong prerequisite error: {error:#}"
+        );
+    };
+    reject(
+        "requires PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256",
+        common::GdnAcceptance::candidate_with_identity(None).unwrap_err(),
+    );
+    reject(
+        "64-character hexadecimal",
+        common::GdnAcceptance::candidate_with_identity(Some("not-a-sha256".into())).unwrap_err(),
+    );
+    let temporary = tempfile::tempdir()?;
+    let missing = temporary.path().join("missing-model");
+    assert!(
+        crate::test_fixture_common::model_fixture::validated_fixture_path(
+            "PEGAINFER_TEST_MODEL_PATH",
+            missing.to_string_lossy().into_owned(),
+        )
+        .is_err(),
+        "missing model must fail acceptance"
+    );
+    assert!(
+        Golden::load_path(temporary.path().join("missing-golden.safetensors")).is_err(),
+        "missing golden must fail acceptance"
+    );
+    std::fs::copy(
+        Path::new(model_path).join("config.json"),
+        temporary.path().join("config.json"),
+    )?;
+    let unversioned = temporary
+        .path()
+        .to_str()
+        .context("temporary path is not UTF-8")?;
+    ensure!(
+        !temporary
+            .path()
+            .components()
+            .any(|part| part.as_os_str() == "snapshots"),
+        "revision-negative fixture must not inherit a snapshot revision"
+    );
+    reject(
+        "local model revision is unknown",
+        check_fixture_metadata(unversioned, golden, None).unwrap_err(),
+    );
+    let wrong_revision = format!(
+        "{}-wrong",
+        require_metadata(&golden.metadata, "model_revision")?
+    );
+    reject(
+        "model revision mismatch",
+        check_fixture_metadata(model_path, golden, Some(&wrong_revision)).unwrap_err(),
+    );
+    Ok(())
+}
+
+fn check_decode_policy(model: &crate::weights::Qwen35Model) -> Result<()> {
+    use crate::weights::CandidateDecodeGemm;
+    use crate::weights::DecodeProjection;
+
+    if model.flashinfer_gdn.is_none() {
+        ensure!(
+            model.candidate_decode.is_empty(),
+            "Triton must retain its original decode policy"
+        );
+        return Ok(());
+    }
+    if model.config().hidden_size != 2560 || model.geometry.local_intermediate_size() != 9216 {
+        return Ok(());
+    }
+    let targets: Vec<_> = model
+        .candidate_decode
+        .iter()
+        .map(|target| (target.layer, target.projection, target.batch))
+        .collect();
+    ensure!(
+        targets == [(0, DecodeProjection::Down, 8), (3, DecodeProjection::V, 8)],
+        "4B HF must exercise only down0/V3 at N8: {targets:?}"
+    );
+    for (index, layer) in model.layers.iter().enumerate() {
+        for batch in [4, 8] {
+            ensure!(
+                model
+                    .candidate_decode_recipe(&layer.mlp.down_proj, batch)?
+                    .is_some()
+                    == (index == 0 && batch == 8),
+                "down target escaped its layer/bucket"
+            );
+            if let crate::weights::LayerKind::FullAttention(attn) = &layer.attn {
+                ensure!(
+                    model
+                        .candidate_decode_recipe(&attn.v_proj, batch)?
+                        .is_some()
+                        == (index == 3 && batch == 8),
+                    "V target escaped its layer/bucket"
+                );
+                ensure!(
+                    model
+                        .candidate_decode_recipe(&attn.k_proj, batch)?
+                        .is_none(),
+                    "same-shaped K must retain its original recipe"
+                );
+            }
+        }
+    }
+    for (layer, projection, batch, expected) in [
+        (
+            model.layers.len(),
+            DecodeProjection::Down,
+            8,
+            "decode target layer is out of range",
+        ),
+        (
+            0,
+            DecodeProjection::V,
+            8,
+            "V target requires a full-attention layer",
+        ),
+        (
+            0,
+            DecodeProjection::Down,
+            5,
+            "decode target must use a cuBLASLt decode bucket",
+        ),
+        (
+            0,
+            DecodeProjection::Down,
+            16,
+            "decode target exceeds allocated decode capacity",
+        ),
+    ] {
+        let invalid = CandidateDecodeGemm {
+            layer,
+            projection,
+            batch,
+            recipe: std::sync::OnceLock::new(),
+        };
+        let error = invalid
+            .prepare(model)
+            .expect_err("invalid target must fail before preparation");
+        ensure!(
+            error.to_string().contains(expected),
+            "wrong decode prerequisite error: {error:#}"
+        );
+    }
+    eprintln!("CANDIDATE_DECODE_ADMISSION_OK down_layer=0 v_layer=3 batch=8");
+    Ok(())
+}
+
 #[test]
 fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
-    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden") else {
+    run_short_golden(&common::GdnAcceptance::Triton);
+}
+
+#[test]
+#[ignore = "requires SM120, a linked FlashInfer candidate with expected object SHA, and Qwen3.5 weights"]
+fn candidate_pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
+    run_short_golden(&common::GdnAcceptance::candidate().expect("candidate prerequisites"));
+}
+
+fn run_short_golden(acceptance: &common::GdnAcceptance) {
+    let Some(model_path) = acceptance
+        .model_path("pega_logprobs_match_hf_golden")
+        .expect("model prerequisite")
+    else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
+    let Some(golden) = Golden::load_for(&model_path, false).expect("golden prerequisite") else {
+        assert!(
+            !acceptance.is_candidate(),
+            "candidate HF acceptance requires a short golden fixture"
+        );
         return;
     };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
+    check_fixture_metadata(
+        &model_path,
+        &golden,
+        std::env::var(REVISION_ENV).ok().as_deref(),
+    )
+    .expect("HF fixture provenance");
+    if acceptance.is_candidate() {
+        assert!(
+            golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2,
+            "candidate short HF acceptance requires both bucket-straddling batches and slot-compaction coverage"
+        );
+        check_prerequisite_rejections(&model_path, &golden).expect("HF prerequisite rejections");
     }
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
     {
-        let mut ex = build_executor(&model_path);
+        let mut ex = build_executor(&model_path, acceptance);
+        check_decode_policy(&ex.model).expect("decode selection and preparation boundaries");
+        if let common::GdnAcceptance::Candidate { object_sha256 } = acceptance {
+            let mut wrong_sha = object_sha256.clone();
+            wrong_sha.replace_range(..1, if wrong_sha.starts_with('0') { "1" } else { "0" });
+            let wrong = common::GdnAcceptance::candidate_with_identity(Some(wrong_sha)).unwrap();
+            let error = wrong.validate_model(&ex.model).unwrap_err();
+            assert!(
+                error.to_string().contains("artifact identity mismatch"),
+                "{error:#}"
+            );
+            eprintln!("GDN_ACCEPTANCE_REJECTIONS_OK cases=7");
+        }
 
         let (stats, fp1) = run(&golden, &mut ex, &all, false);
         report_and_assert("sequential bs=1 graph", &stats);
@@ -888,6 +1083,38 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
             if all.len() >= n {
                 let (batched, _) = run(&golden, &mut ex, &all[..n], true);
                 report_and_assert(&format!("batched graph ({n} padded)"), &batched);
+                let buffers = &mut ex.graph_state.buffers;
+                if let Some(recipe) = ex
+                    .model
+                    .candidate_decode_recipe(
+                        &ex.model.layers[0].mlp.down_proj,
+                        buffers.act_out.seq_len,
+                    )
+                    .expect("prepared decode selection")
+                {
+                    let ctx = ex.model.device_ctx();
+                    // SAFETY: the model's live stream remains valid in this scope.
+                    // Reuse real HF activations; the override must reject before launch.
+                    let stream_guard = unsafe {
+                        pegainfer_kernels::tensor::StreamOverrideGuard::activate(
+                            ctx.stream.cu_stream(),
+                        )
+                    };
+                    let result = recipe.launch(
+                        ctx,
+                        &ex.model.layers[0].mlp.down_proj,
+                        &buffers.act_out,
+                        &mut buffers.mlp_out,
+                    );
+                    drop(stream_guard);
+                    let error = result.expect_err("decode recipe must reject a stream override");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("requires the base decode stream"),
+                        "{error:#}"
+                    );
+                }
             } else {
                 eprintln!(
                     "qwen35 hf_golden_gate: skipping batched graph ({n} padded); fixture has only {} sequence(s)",
@@ -899,14 +1126,14 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
 
     if golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2 {
         let fp1 = {
-            let mut ex = build_executor(&model_path);
+            let mut ex = build_executor(&model_path, acceptance);
             let (compacted, fp) =
                 run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
             report_and_assert("slot-compaction graph", &compacted);
             fp
         };
         let fp2 = {
-            let mut ex = build_executor(&model_path);
+            let mut ex = build_executor(&model_path, acceptance);
             let (_, fp) = run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
             fp
         };
@@ -924,19 +1151,47 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
 
 #[test]
 fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
-    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_long_golden") else {
+    run_long_golden(&common::GdnAcceptance::Triton);
+}
+
+#[test]
+#[ignore = "requires SM120, a linked FlashInfer candidate with expected object SHA, and Qwen3.5 weights"]
+fn candidate_pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
+    run_long_golden(&common::GdnAcceptance::candidate().expect("candidate prerequisites"));
+}
+
+fn run_long_golden(acceptance: &common::GdnAcceptance) {
+    let Some(model_path) = acceptance
+        .model_path("pega_logprobs_match_hf_long_golden")
+        .expect("model prerequisite")
+    else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true) else {
+    let Some(golden) = Golden::load_for(&model_path, true).expect("golden prerequisite") else {
+        assert!(
+            !acceptance.is_candidate(),
+            "candidate HF acceptance requires a long golden fixture"
+        );
         return;
     };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
+    check_fixture_metadata(
+        &model_path,
+        &golden,
+        std::env::var(REVISION_ENV).ok().as_deref(),
+    )
+    .expect("HF fixture provenance");
+    if acceptance.is_candidate() {
+        assert!(
+            golden.prompt_lens.contains(&4097)
+                && golden.prompt_lens.contains(&8192)
+                && golden.decode_len > 0,
+            "candidate long HF acceptance requires 4097/8192-token prefill and decode coverage"
+        );
     }
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let mut ex = build_executor(&model_path);
+    let mut ex = build_executor(&model_path, acceptance);
     let (stats, fp1) = run(&golden, &mut ex, &all, false);
     report_and_assert("long sequential bs=1 graph", &stats);
     let (_, fp2) = run(&golden, &mut ex, &all, false);
@@ -952,12 +1207,15 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden_tp2") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
+    let Some(golden) = Golden::load_for(&model_path, false).expect("golden prerequisite") else {
         return;
     };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(
+        &model_path,
+        &golden,
+        std::env::var(REVISION_ENV).ok().as_deref(),
+    )
+    .expect("HF fixture provenance");
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -982,12 +1240,15 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true) else {
+    let Some(golden) = Golden::load_for(&model_path, true).expect("golden prerequisite") else {
         return;
     };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(
+        &model_path,
+        &golden,
+        std::env::var(REVISION_ENV).ok().as_deref(),
+    )
+    .expect("HF fixture provenance");
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -1011,12 +1272,15 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
+    let Some(golden) = Golden::load_for(&model_path, false).expect("golden prerequisite") else {
         return;
     };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(
+        &model_path,
+        &golden,
+        std::env::var(REVISION_ENV).ok().as_deref(),
+    )
+    .expect("HF fixture provenance");
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::nccl::safe::Comm;
@@ -34,6 +36,7 @@ pub(crate) struct ModelRuntimeConfig {
     pub(crate) enable_cuda_graph: bool,
     pub(crate) tensor_parallel: Option<TensorParallelConfig>,
     pub(crate) device_ordinal: usize,
+    pub(crate) gdn_backend: crate::Qwen35GdnBackend,
 }
 
 impl Default for ModelRuntimeConfig {
@@ -42,6 +45,7 @@ impl Default for ModelRuntimeConfig {
             enable_cuda_graph: true,
             tensor_parallel: None,
             device_ordinal: 0,
+            gdn_backend: crate::Qwen35GdnBackend::Triton,
         }
     }
 }
@@ -49,6 +53,9 @@ impl Default for ModelRuntimeConfig {
 /// Qwen3.5 model (text-only).
 pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
+    /// The selected, already-loaded candidate. `None` means Triton was requested.
+    pub(super) flashinfer_gdn: Option<pegainfer_kernels::ops::Qwen35GdnAot>,
+    pub(super) candidate_decode: Vec<CandidateDecodeGemm>,
     pub(super) config: Config35,
     pub(super) geometry: LocalGeometry,
     pub(super) embed_tokens: DeviceMatrix,
@@ -83,6 +90,96 @@ const STATES_PER_DECODE_SLOT: usize = 2;
 /// KV-pool floor, also the low-memory fail-fast threshold.
 const MIN_KV_PAGES: usize = 64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DecodeProjection {
+    Down,
+    V,
+}
+
+pub(super) struct CandidateDecodeGemm {
+    pub(super) layer: usize,
+    pub(super) projection: DecodeProjection,
+    pub(super) batch: usize,
+    pub(super) recipe: OnceLock<pegainfer_kernels::ops::Qwen35DecodeGemm>,
+}
+
+impl CandidateDecodeGemm {
+    pub(super) fn weights<'a>(&self, model: &'a Qwen35Model) -> Result<&'a DeviceMatrix> {
+        let layer = model
+            .layers
+            .get(self.layer)
+            .context("decode target layer is out of range")?;
+        match self.projection {
+            DecodeProjection::Down => Ok(&layer.mlp.down_proj),
+            DecodeProjection::V => Ok(&layer
+                .attn
+                .full_attention()
+                .context("V target requires a full-attention layer")?
+                .v_proj),
+        }
+    }
+
+    pub(super) fn prepare(&self, model: &Qwen35Model) -> Result<()> {
+        anyhow::ensure!(
+            model.flashinfer_gdn.is_some(),
+            "decode adjustment requires a candidate"
+        );
+        let weights = self.weights(model)?;
+        anyhow::ensure!(
+            super::batch_decode_graph::BATCH_BUCKETS.contains(&self.batch)
+                && self.batch <= crate::ops::GEMM_LT_MAX_N,
+            "decode target must use a cuBLASLt decode bucket"
+        );
+        anyhow::ensure!(
+            self.batch <= model.reserved_decode_slots,
+            "decode target exceeds allocated decode capacity"
+        );
+        if self.recipe.get().is_none() {
+            let recipe =
+                pegainfer_kernels::ops::Qwen35DecodeGemm::prepare(&model.ctx, weights, self.batch)
+                    .with_context(|| {
+                        format!(
+                            "prepare {:?} layer={} batch={}",
+                            self.projection, self.layer, self.batch
+                        )
+                    })?;
+            anyhow::ensure!(
+                self.recipe.set(recipe).is_ok(),
+                "decode recipe initialized concurrently"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn candidate_decode_targets(
+    config: &Config35,
+    geometry: LocalGeometry,
+    capacity: usize,
+    candidate: bool,
+) -> Vec<CandidateDecodeGemm> {
+    // Only the measured 4B calls use this policy. Extend targets here after
+    // validation; never publish these choices to the shared shape-keyed cache.
+    if candidate
+        && config.hidden_size == 2560
+        && geometry.local_intermediate_size() == 9216
+        && geometry.local_full_attn_kv_dim() == 1024
+        && capacity >= 8
+    {
+        [(0, DecodeProjection::Down), (3, DecodeProjection::V)]
+            .into_iter()
+            .map(|(layer, projection)| CandidateDecodeGemm {
+                layer,
+                projection,
+                batch: 8,
+                recipe: OnceLock::new(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 impl Qwen35Model {
     pub fn from_safetensors_with_options(
         model_path: &str,
@@ -96,9 +193,7 @@ impl Qwen35Model {
             },
         )
     }
-}
 
-impl Qwen35Model {
     /// `max_batch` is the requested concurrent-request cap in `1..=MAX_BATCH`.
     /// It need not be a decode bucket: the physical decode capacity is rounded
     /// up to the next `BATCH_BUCKETS` value while the scheduler still admits at
@@ -129,7 +224,7 @@ impl Qwen35Model {
         )
     }
 
-    fn from_safetensors_with_runtime_and_capacity(
+    pub(super) fn from_safetensors_with_runtime_and_capacity(
         model_path: &str,
         runtime: ModelRuntimeConfig,
         max_batch: usize,
@@ -153,6 +248,37 @@ impl Qwen35Model {
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         let geometry =
             LocalGeometry::try_new(&config, tensor_parallel).map_err(anyhow::Error::from)?;
+        // Resolve and preload exactly once, before measuring free memory or
+        // allocating KV. A linked artifact alone never changes the default.
+        let flashinfer_gdn = match runtime.gdn_backend {
+            crate::Qwen35GdnBackend::Triton => None,
+            crate::Qwen35GdnBackend::FlashInferCandidate => {
+                anyhow::ensure!(
+                    geometry.world_size() == 1,
+                    "Qwen3.5 flashinfer-candidate requires TP world_size=1"
+                );
+                anyhow::ensure!(
+                    config.linear_value_head_dim == 128,
+                    "Qwen3.5 flashinfer-candidate requires value head dimension 128"
+                );
+                Some(pegainfer_kernels::ops::Qwen35GdnAot::load_for_production(
+                    &ctx,
+                    super::flashinfer_gdn::model_geometry(&config),
+                )?)
+            }
+        };
+        if let Some(backend) = &flashinfer_gdn {
+            info!(
+                "Qwen3.5 GDN: requested={} resolved=flashinfer-candidate object_sha256={}",
+                runtime.gdn_backend,
+                backend.artifact_sha256()
+            );
+        } else {
+            info!(
+                "Qwen3.5 GDN: requested={} resolved=triton",
+                runtime.gdn_backend
+            );
+        }
         debug!(
             "Config: hidden_size={}, num_layers={}, full_attn={}, linear_attn={}, max_position_embeddings={}, tp_rank={}, tp_world_size={}",
             config.hidden_size,
@@ -269,11 +395,19 @@ impl Qwen35Model {
         // Reserve space for prefill scratch (GDR chunkwise + per-layer transients)
         // before allocating KV pool, so prefill doesn't OOM.
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
-        let scratch_reserve = super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
-            &config,
-            geometry,
-            max_prefill_len,
-        );
+        let scratch_reserve = match &flashinfer_gdn {
+            Some(backend) => super::flashinfer_gdn::FlashInferGdnChunkResources::estimate_bytes(
+                &config,
+                backend,
+                max_prefill_len,
+                page_size,
+            ),
+            None => super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
+                &config,
+                geometry,
+                max_prefill_len,
+            ),
+        };
         let recurrent_reserve = STATES_PER_DECODE_SLOT
             * max_batch
             * super::recurrent_state::bytes_per_request(&config, geometry);
@@ -296,7 +430,8 @@ impl Qwen35Model {
         let scratch_mb = scratch_reserve / (1024 * 1024);
         let recurrent_mb = recurrent_reserve / (1024 * 1024);
         info!(
-            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), prefill scratch reserve: {scratch_mb} MB, recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), {:.0}% of {:.0} MB free",
+            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), backend={}, prefill scratch reserve: {scratch_mb} MB ({scratch_reserve} bytes), recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), {:.0}% of {:.0} MB free",
+            runtime.gdn_backend,
             kv_budget as f64 / free_bytes as f64 * 100.0,
             free_bytes as f64 / 1024.0 / 1024.0
         );
@@ -309,8 +444,12 @@ impl Qwen35Model {
             num_pages,
         )?;
 
+        let candidate_decode =
+            candidate_decode_targets(&config, geometry, max_batch, flashinfer_gdn.is_some());
         Ok(Self {
             ctx,
+            flashinfer_gdn,
+            candidate_decode,
             config,
             geometry,
             embed_tokens,
@@ -460,7 +599,29 @@ impl Qwen35Model {
             crate::ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
             crate::ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
         }
+        for target in &self.candidate_decode {
+            target.prepare(self)?;
+        }
         Ok(())
+    }
+
+    pub(super) fn candidate_decode_recipe(
+        &self,
+        weights: &DeviceMatrix,
+        batch: usize,
+    ) -> Result<Option<&pegainfer_kernels::ops::Qwen35DecodeGemm>> {
+        // K/V share a tuned shape, and full-attention uses a separate KV layer
+        // index. Match the model-owned weight object, not either of those keys.
+        for target in &self.candidate_decode {
+            if target.batch == batch && std::ptr::eq(target.weights(self)?, weights) {
+                return target
+                    .recipe
+                    .get()
+                    .map(Some)
+                    .context("candidate decode recipe must be prepared before decode");
+            }
+        }
+        Ok(None)
     }
 
     /// Create the CUDA Graph batch decode state at the loaded capacity.

@@ -9,6 +9,46 @@ use pegainfer_core::tensor::HiddenStates;
 use super::config::Config35;
 use super::config::LocalGeometry;
 
+/// Outputs of the native, non-expanded GDN prepare kernel.
+///
+/// This buffer is intentionally separate from `GdrChunkwiseScratch35`: the
+/// production Triton path below still requires value-head-expanded Q/K, while
+/// the FlashInfer candidate consumes native Hq/Hk tensors directly.
+pub(crate) struct GdnPrepareScratch35 {
+    /// Normalized native Q, bf16 token-major `[T,Hq,D]`.
+    pub(crate) q: HiddenStates,
+    /// Normalized native K, bf16 token-major `[T,Hk,D]`.
+    pub(crate) k: HiddenStates,
+    /// Raw V, bf16 token-major `[T,Hv,D]`.
+    pub(crate) v: HiddenStates,
+    /// Per-token decay multiplier, fp32 `[T,Hv]` (not log/cumulative alpha).
+    pub(crate) alpha: CudaSlice<f32>,
+    /// Per-token beta, fp32 `[T,Hv]`.
+    pub(crate) beta: CudaSlice<f32>,
+}
+
+impl GdnPrepareScratch35 {
+    pub(crate) fn new(ctx: &DeviceContext, seq_len: usize) -> Result<Self> {
+        anyhow::ensure!(seq_len > 0, "native GDN prepare requires T>=1");
+
+        let geometry = pegainfer_kernels::ops::Qwen35GdnGeometry::PRODUCTION;
+
+        Ok(Self {
+            q: HiddenStates::zeros(ctx, geometry.h_q * geometry.head_dim, seq_len)?,
+            k: HiddenStates::zeros(ctx, geometry.h_k * geometry.head_dim, seq_len)?,
+            v: HiddenStates::zeros(ctx, geometry.h_v * geometry.head_dim, seq_len)?,
+            alpha: ctx
+                .stream
+                .alloc_zeros(seq_len * geometry.h_v)
+                .map_err(|e| anyhow::anyhow!("Alloc native GDN alpha failed: {e}"))?,
+            beta: ctx
+                .stream
+                .alloc_zeros(seq_len * geometry.h_v)
+                .map_err(|e| anyhow::anyhow!("Alloc native GDN beta failed: {e}"))?,
+        })
+    }
+}
+
 /// Scratch buffers for a single Qwen3.5 linear-attention chunk-wise GDR prefill call.
 ///
 /// The first implementation target is intentionally narrow:

@@ -39,6 +39,95 @@ struct FlashInferIncludes {
     cccl: Vec<PathBuf>,
 }
 
+#[cfg(feature = "qwen35")]
+const QWEN35_GDN_AOT_ENV: &str = "PEGAINFER_QWEN35_GDN_AOT_BUNDLE";
+
+/// Validate and attach the explicitly supplied Qwen3.5 GDN candidate. The generated
+/// object and its native CuTe runtime archive are linked statically; serving
+/// never reads a manifest, loads PTX, or discovers a Python wheel.
+#[cfg(feature = "qwen35")]
+fn build_qwen35_flashinfer_gdn_aot(
+    root: &Path,
+    out_dir: &Path,
+    cuda_include: &Path,
+) -> (Vec<PathBuf>, Option<PathBuf>) {
+    println!("cargo:rerun-if-env-changed={QWEN35_GDN_AOT_ENV}");
+    let shim = root.join("csrc/qwen35/flashinfer_gdn_aot.c");
+    let shim_header = root.join("csrc/qwen35/flashinfer_gdn_aot.h");
+    println!("cargo:rerun-if-changed={}", shim.display());
+    println!("cargo:rerun-if-changed={}", shim_header.display());
+
+    let config_header = out_dir.join("flashinfer_gdn_build_config.h");
+    let mut includes = vec![root.join("csrc/qwen35"), out_dir.to_path_buf()];
+    let mut linked_objects = Vec::new();
+    let mut runtime_dir = None;
+    let mut config = String::from("#pragma once\n");
+    let mut identity = String::from("const ARTIFACT_IDENTITY: Option<ArtifactIdentity> = None;\n");
+
+    if let Some(bundle) = std::env::var_os(QWEN35_GDN_AOT_ENV) {
+        let bundle = PathBuf::from(bundle);
+        let pins = root.join("tools/flashinfer_gdn");
+        for name in pegainfer_build::qwen35_gdn::PIN_FILES {
+            println!("cargo:rerun-if-changed={}", pins.join(name).display());
+        }
+        for name in ["manifest.json"]
+            .into_iter()
+            .chain(pegainfer_build::qwen35_gdn::ARTIFACT_FILES)
+        {
+            println!("cargo:rerun-if-changed={}", bundle.join(name).display());
+        }
+        let candidate = pegainfer_build::qwen35_gdn::validate_candidate(root, &bundle)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let linked_bundle = out_dir.join("qwen35-gdn-candidate");
+        fs::create_dir_all(&linked_bundle).expect("create GDN candidate link directory");
+        for (name, bytes) in &candidate.files {
+            fs::write(linked_bundle.join(name), bytes).expect("stage verified GDN candidate bytes");
+        }
+        // Validate the final inputs too, before any compiler or linker sees them.
+        let linked = pegainfer_build::qwen35_gdn::validate_candidate(root, &linked_bundle)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let object_hash = linked.object_sha256;
+        let workspace_bytes_per_sm = linked.workspace_bytes_per_sm;
+        identity = format!(
+            "const ARTIFACT_IDENTITY: Option<ArtifactIdentity> = Some(ArtifactIdentity(\"{object_hash}\"));\n"
+        );
+        config = format!(
+            "#pragma once\n#define PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM {workspace_bytes_per_sm}u\n"
+        );
+        linked_objects.push(linked_bundle.join("kernel.o"));
+        includes.push(linked_bundle.clone());
+        runtime_dir = Some(linked_bundle);
+    }
+    fs::write(&config_header, config).expect("write GDN AOT build config");
+    // OUT_DIR survives rebuilds, including removal of the candidate environment variable.
+    fs::write(out_dir.join("qwen35_gdn_identity.rs"), identity)
+        .expect("write GDN artifact identity");
+
+    let shim_obj = out_dir.join("qwen35_flashinfer_gdn_aot.o");
+    let compiler = cc::Build::new().get_compiler();
+    let mut command = compiler.to_command();
+    command
+        .arg("-c")
+        .arg(&shim)
+        .arg("-o")
+        .arg(&shim_obj)
+        .arg("-O3")
+        .arg("-std=c11")
+        .arg("-fPIC")
+        .arg("-isystem")
+        .arg(cuda_include);
+    for include in includes {
+        command.arg("-I").arg(include);
+    }
+    if runtime_dir.is_some() {
+        command.arg("-DPEGAINFER_QWEN35_GDN_AOT");
+    }
+    let status = command.status().expect("compile Qwen3.5 GDN AOT shim");
+    assert!(status.success(), "Qwen3.5 GDN AOT shim compilation failed");
+    linked_objects.push(shim_obj);
+    (linked_objects, runtime_dir)
+}
+
 const GLM52_TRTLLM_FMHA_CUBINS: &[(&str, &str)] = &[
     (
         "kGlm52FmhaSparseSeedQ8",
@@ -1904,6 +1993,11 @@ fn main() {
     // --- k3: DeepGEMM-only, no DeepEP/NCCL dependency ---
     let k3_enabled = cfg!(feature = "k3");
     let qwen35_enabled = cfg!(feature = "qwen35");
+    #[cfg(feature = "qwen35")]
+    let (qwen35_gdn_objects, qwen35_gdn_runtime_dir) =
+        build_qwen35_flashinfer_gdn_aot(&crate_root(), &out_dir, &cuda_include);
+    #[cfg(not(feature = "qwen35"))]
+    let (qwen35_gdn_objects, qwen35_gdn_runtime_dir) = (Vec::new(), None::<PathBuf>);
     if glm52_enabled {
         generate_glm52_trtllm_fmha_cubins(&crate_root(), &out_dir);
         build_glm52_cutedsl_fp8_dsl(&crate_root(), &out_dir, &cuda_include);
@@ -1970,6 +2064,9 @@ fn main() {
             if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
                 return None;
             }
+            if !qwen35_enabled && file_name == "gdn_prepare.cu" {
+                return None;
+            }
             // --- k3 ---
             if !k3_enabled && is_k3_source(&csrc_dir, path) {
                 return None;
@@ -2029,6 +2126,9 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
+        if qwen35_enabled && stem == "linear" {
+            nvcc_args.push("-DPEGAINFER_QWEN35".to_string());
+        }
         if stem == "glm52_fp8_gemm" {
             if let Some(args) = glm52_fp8_gemm_arch_args(&nvcc_sm_targets, &nvcc) {
                 nvcc_args.extend(args);
@@ -2482,11 +2582,19 @@ fn main() {
     let kernel_lab_objs = obj_files.clone();
 
     let cuda_lib = out_dir.join("libkernels_cuda.a");
-    let _ = fs::remove_file(&cuda_lib);
+    match fs::remove_file(&cuda_lib) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "cannot remove stale CUDA archive {}: {error}",
+            cuda_lib.display()
+        ),
+    }
     let mut ar_args = vec!["rcs".to_string(), cuda_lib.to_string_lossy().to_string()];
     ar_args.extend(
         obj_files
             .into_iter()
+            .chain(qwen35_gdn_objects)
             .map(|path| path.to_string_lossy().to_string()),
     );
 
@@ -2526,6 +2634,10 @@ fn main() {
         toolkit.link_search();
     }
     println!("cargo:rustc-link-lib=static=kernels_cuda");
+    if let Some(runtime_dir) = qwen35_gdn_runtime_dir {
+        println!("cargo:rustc-link-search=native={}", runtime_dir.display());
+        println!("cargo:rustc-link-lib=static=cuda_dialect_runtime_static");
+    }
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cublasLt");

@@ -2,6 +2,9 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(feature = "qwen35-gdn")]
+pub mod qwen35_gdn;
+
 /// Finds a package's install root: probes `$env_var` first, then each of
 /// `default_paths`, for any of the `check_files` — several cover layout
 /// variants like `include/` vs `targets/<arch>/include/`. Returns the

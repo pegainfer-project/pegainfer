@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -24,6 +25,7 @@ use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
+use super::flashinfer_gdn::FlashInferGdnChunkResources;
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
 use super::weights::FullAttentionLayer;
@@ -34,6 +36,11 @@ use super::weights::TransformerBlock35;
 use crate::ffi;
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
+
+enum GdnPrefillChunkScratch {
+    Triton(Box<GdrChunkwiseScratch35>),
+    FlashInfer(Box<FlashInferGdnChunkResources>),
+}
 
 fn checked_prefill_end_pos(
     base_pos: usize,
@@ -142,7 +149,7 @@ impl Qwen35Model {
         recurrent: &mut RecurrentState,
     ) -> Result<HiddenStates> {
         let seq_len = token_ids.len();
-        debug_assert!(
+        anyhow::ensure!(
             seq_len > 0 && seq_len <= PREFILL_CHUNK_LEN,
             "prefill chunk length {seq_len} out of range 1..={PREFILL_CHUNK_LEN}"
         );
@@ -170,8 +177,17 @@ impl Qwen35Model {
         // Allocate the chunk scratch before advancing the KV state. It is the
         // largest, most allocation-prone buffer here, so failing first leaves
         // `kv_state` untouched and the request can be rejected cleanly.
-        let mut gdr_chunkwise_scratch =
-            GdrChunkwiseScratch35::new(&self.ctx, c, self.geometry, seq_len)?;
+        let mut gdn_scratch = match &self.flashinfer_gdn {
+            None => GdnPrefillChunkScratch::Triton(Box::new(GdrChunkwiseScratch35::new(
+                &self.ctx,
+                c,
+                self.geometry,
+                seq_len,
+            )?)),
+            Some(backend) => GdnPrefillChunkScratch::FlashInfer(Box::new(
+                FlashInferGdnChunkResources::new(&self.ctx, backend, seq_len)?,
+            )),
+        };
 
         // Advance paged KV state and build this chunk's prefill plan.
         kv_state.ensure_capacity(end_pos)?;
@@ -197,7 +213,7 @@ impl Qwen35Model {
                 layer_idx,
                 layer,
                 &hidden_batch,
-                &mut gdr_chunkwise_scratch,
+                &mut gdn_scratch,
                 &mut linear_idx,
                 &mut full_idx,
                 kv_state,
@@ -220,7 +236,7 @@ impl Qwen35Model {
         _layer_idx: usize,
         layer: &TransformerBlock35,
         hidden_batch: &HiddenStates,
-        gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
+        gdn_scratch: &mut GdnPrefillChunkScratch,
         linear_idx: &mut usize,
         full_idx: &mut usize,
         kv_state: &KvState,
@@ -260,7 +276,7 @@ impl Qwen35Model {
                 &normed_batch,
                 linear_idx,
                 recurrent,
-                gdr_chunkwise_scratch,
+                gdn_scratch,
                 seq_len,
             )?,
         };
@@ -442,7 +458,7 @@ impl Qwen35Model {
         normed_batch: &HiddenStates,
         linear_idx: &mut usize,
         recurrent: &mut RecurrentState,
-        gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
+        gdn_scratch: &mut GdnPrefillChunkScratch,
         seq_len: usize,
     ) -> Result<HiddenStates> {
         let c = &self.config;
@@ -468,34 +484,60 @@ impl Qwen35Model {
             c.linear_conv_kernel_dim,
         );
 
-        let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-        ops::gated_delta_rule_prefill_chunkwise_into(
-            &self.ctx,
-            &qkv_conv_batch,
-            &b_batch,
-            &a_batch,
-            &attn.dt_bias,
-            &attn.a_log,
-            &mut layer_state.state,
-            gdr_chunkwise_scratch,
-            &mut gdr_out_batch,
-            geom.local_linear_num_key_heads(),
-            geom.local_linear_num_value_heads(),
-            c.linear_key_head_dim,
-            c.linear_value_head_dim,
-        )?;
-
         let mut normed_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-        ops::rms_norm_gated_batch_into(
-            &self.ctx,
-            &gdr_out_batch,
-            &attn.norm_weight,
-            &z_batch,
-            &mut normed_out_batch,
-            geom.local_linear_num_value_heads(),
-            c.linear_value_head_dim,
-            c.rms_norm_eps,
-        );
+        {
+            let mut triton_output;
+            let gdr_output = match gdn_scratch {
+                GdnPrefillChunkScratch::Triton(scratch) => {
+                    triton_output = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+                    ops::gated_delta_rule_prefill_chunkwise_into(
+                        &self.ctx,
+                        &qkv_conv_batch,
+                        &b_batch,
+                        &a_batch,
+                        &attn.dt_bias,
+                        &attn.a_log,
+                        &mut layer_state.state,
+                        scratch,
+                        &mut triton_output,
+                        geom.local_linear_num_key_heads(),
+                        geom.local_linear_num_value_heads(),
+                        c.linear_key_head_dim,
+                        c.linear_value_head_dim,
+                    )?;
+                    &triton_output
+                }
+                GdnPrefillChunkScratch::FlashInfer(resources) => {
+                    ops::gated_delta_rule_prefill_native_prepare_into(
+                        &self.ctx,
+                        &qkv_conv_batch,
+                        &b_batch,
+                        &a_batch,
+                        &attn.dt_bias,
+                        &attn.a_log,
+                        &mut resources.prepare,
+                    )?;
+                    resources.launch_in_place(
+                        &self.ctx,
+                        self.flashinfer_gdn
+                            .as_ref()
+                            .context("FlashInfer GDN was not selected when loading this model")?,
+                        &mut layer_state.state,
+                    )?;
+                    &resources.output
+                }
+            };
+            ops::rms_norm_gated_batch_into(
+                &self.ctx,
+                gdr_output,
+                &attn.norm_weight,
+                &z_batch,
+                &mut normed_out_batch,
+                geom.local_linear_num_value_heads(),
+                c.linear_value_head_dim,
+                c.rms_norm_eps,
+            );
+        }
 
         *linear_idx += 1;
 
@@ -518,35 +560,4 @@ impl Qwen35Model {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::checked_prefill_end_pos;
-
-    #[test]
-    fn checked_prefill_end_pos_accepts_config_limit() {
-        assert_eq!(
-            checked_prefill_end_pos(0, 262_144, 262_144).unwrap(),
-            262_144
-        );
-        assert_eq!(
-            checked_prefill_end_pos(262_143, 1, 262_144).unwrap(),
-            262_144
-        );
-    }
-
-    #[test]
-    fn checked_prefill_end_pos_rejects_past_config_limit() {
-        let err = checked_prefill_end_pos(0, 262_145, 262_144)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("beyond max_position_embeddings=262144"));
-        assert!(err.contains("requested end_pos=262145"));
-    }
-
-    #[test]
-    fn checked_prefill_end_pos_rejects_overflow() {
-        let err = checked_prefill_end_pos(usize::MAX, 1, 262_144)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("prefill position overflow"));
-    }
-}
+mod tests;

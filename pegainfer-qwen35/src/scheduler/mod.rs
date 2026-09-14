@@ -5,6 +5,10 @@
 //! - `BatchDecodeGraphState` for CUDA Graph batch decode (stable-address slots)
 
 mod backend;
+#[cfg(test)]
+mod chunked_prefill_tests;
+#[cfg(test)]
+mod e2e_tests;
 mod plan;
 mod tp;
 use std::collections::HashMap;
@@ -519,8 +523,9 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
     unsafe {
         crate::ffi::cublas_init();
     }
+    let guard = CublasThreadGuard;
     model.tune_decode_gemm_algos()?;
-    Ok(CublasThreadGuard)
+    Ok(guard)
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────

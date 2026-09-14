@@ -84,7 +84,10 @@ cargo run --release --features qwen35 -- --model-path models/Qwen3.5-4B
 | `CUDA_HOME` | CUDA Toolkit location; defaults to `/usr/local/cuda` |
 | `PEGAINFER_CUDA_SM` | Target GPU architecture when it cannot be detected, e.g. `120` |
 | `PEGAINFER_TRITON_PYTHON` | Python interpreter for Qwen3.5 Triton AOT compilation |
+| `PEGAINFER_QWEN35_GDN_AOT_BUNDLE` | Build-time FlashInfer GDN candidate directory; serving requires explicit backend selection |
 | `PEGAINFER_TILELANG_PYTHON` | Python interpreter for K3 TileLang kernel generation |
+
+Qwen3.5 defaults to Triton even when a FlashInfer GDN candidate is linked. Explicit `--qwen35-gdn-backend flashinfer-candidate` selection requires SM120/Hv32/TP1 and fails on unsupported or unavailable candidates. Generation and production gates are described in the [candidate README](pegainfer-kernels/tools/flashinfer_gdn/README.md).
 
 Other model lines have their own hardware and build requirements; follow the model guides below. Run `cargo run --release -- --help` for the compiled-in CLI.
 
@@ -214,7 +217,10 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
   cargo test --release -p pegainfer-qwen3 --test hf_golden_gate
 
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B \
-  cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler
+  cargo test --release -p pegainfer-qwen35 --features qwen35 --lib executor::hf_golden_gate -- --test-threads=1
+
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B \
+  cargo test --release -p pegainfer-qwen35 --features qwen35 --lib scheduler::e2e_tests -- --test-threads=1
 ```
 
 Browse the [engineering docs index](docs/index.md) for model-specific gates, [profiling](docs/playbooks/profiling-guide.md), and [benchmark methodology](docs/playbooks/bench-vs-vllm.md).

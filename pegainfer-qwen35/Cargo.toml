@@ -39,19 +39,7 @@ qwen35 = ["pegainfer-kernels/qwen35"]
 workspace = true
 
 [[test]]
-name = "hf_golden_gate"
-required-features = ["qwen35"]
-
-[[test]]
-name = "e2e_scheduler"
-required-features = ["qwen35"]
-
-[[test]]
 name = "sampling_behavior"
-required-features = ["qwen35"]
-
-[[test]]
-name = "chunked_prefill"
 required-features = ["qwen35"]
 
 [[test]]
