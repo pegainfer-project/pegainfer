@@ -7,9 +7,9 @@ Qwen3.5 defaults to Triton whether or not a candidate is linked. Building with
 `PEGAINFER_QWEN35_GDN_AOT_BUNDLE` only makes the candidate available; the
 Qwen3.5 production selector must explicitly request `flashinfer-candidate`.
 That selection fails before KV allocation if its artifact, device, geometry,
-TP configuration, runtime identity, or module load is invalid. The GDN wrapper
-validates and stores the linked object SHA during construction; serving does
-not depend on test environment variables. Local candidate hashes establish
+TP configuration, or module load is invalid. The build generates a private
+Rust identity from the validated final link inputs. The loaded GDN object retains
+it; serving does not depend on test environment variables. Local candidate hashes establish
 internal consistency and compatibility, not trusted distribution provenance.
 
 `source-lock.json` owns the frozen geometry, dtypes, dynamic-token bounds,
@@ -21,9 +21,11 @@ actual size/hash errors before the kernel build compiles or links the candidate.
 The build snapshots verified bytes into `OUT_DIR` and validates those final
 link inputs too. These Rust dependencies are enabled only by Qwen3.5.
 
-`generate.py` prepares the pinned source, applies the HKV specialization and
-packages `manifest.json`, `kernel.h`, `kernel.o`, and the native static runtime.
-Pass `--flashinfer-dir` explicitly to an independent clean checkout at the
+`compile_sm120.py` runs in the pinned interpreter, checks actual toolchain/PTX
+provenance, prepares the pinned HKV source and directly emits `manifest.json`,
+`kernel.h`, `kernel.o`, and the native static runtime. Use `--output` for a new
+destination and pass `--flashinfer-dir` explicitly to an independent clean
+checkout at the
 `source-lock.json` FlashInfer pin (`a0efa0adfe49bb836ab1a147d6572980b870f3d4`).
 Keep that generation checkout outside the serving repository. The shared
 `pegainfer-kernels/third_party/flashinfer` submodule stays at the repository's
@@ -64,11 +66,12 @@ against the real generated bundle. It shares one valid fixture across all
 metadata and file/path rejection cases; it does not manufacture a fake object
 or claim host validation proves GPU execution. One corrupted real object also
 exercises the actual build-script rejection before linking.
-The same runner checks null, invalid UTF-8, short, long and non-hexadecimal
-identities through the real runtime constructor. Linker `--wrap` applies only
-to the `gdn_identity` test executable; production and the subsequent real-layout
-positive retain the original identity query. There are no production injection
-hooks.
+There is no C-string identity query or special identity-test link mode. Every
+Qwen3.5 build overwrites the generated Rust identity, including when the bundle
+is removed. ABI version 3 retires the identity query; launch argument layout and
+in-place state semantics are unchanged. The runner also rebuilds the same target
+without a bundle and checks archive/link inputs and explicit startup rejection.
+Candidate executable snapshots are retained before that rebuild.
 
 Candidate HF, scheduler, continuation and Shared-SM entries explicitly select
 the candidate and check the actual loaded model against
@@ -77,10 +80,11 @@ the candidate and check the actual loaded model against
 run directly. These ignored GPU entries reuse the original scenario bodies in
 crate-private test modules; ordinary entries continue to select Triton.
 
-Before positive HF replay, Gate 3 invokes the same candidate short entry with
-missing/malformed expected SHA, missing model/fixture, unresolved/wrong model
-revision and a different valid SHA. Each must fail for its specific reason;
-only then does the runner report admission validation success and continue.
+Before positive HF replay, the candidate short test directly asserts errors from
+the same fixture/revision/identity prerequisite functions: missing/malformed
+expected SHA, missing model/fixture, unresolved/wrong revision and wrong actual
+model identity. The last check uses the executor's already-loaded model. There
+are no extra negative HF processes, panic-output parsers or extra model loads.
 All HF entries reject an unresolved revision. Gate 3 reuses both existing short
 and long HF golden scenarios. The long test checks
 4097/8192-token outputs against an external oracle; the production HTTP and

@@ -453,9 +453,13 @@ where
         return None;
     }
 
+    let picked_val: f32 = row[picked].into();
+    let mut rank = 0;
     let mut max = f32::NEG_INFINITY;
     for &v in row {
-        max = max.max(v.into());
+        let value = v.into();
+        max = max.max(value);
+        rank += u32::from(value >= picked_val);
     }
     let mut sum = 0f64;
     for &v in row {
@@ -482,9 +486,9 @@ where
         }
     }
 
-    let picked_val: f32 = row[picked].into();
     Some(TokenLogprob {
         logprob: picked_val - log_sum_exp,
+        rank,
         top_logprobs: top,
     })
 }
@@ -550,6 +554,10 @@ pub fn token_logprobs_batch(
         .stream
         .alloc_zeros(requests.len())
         .map_err(|e| anyhow!("token_logprobs_batch alloc failed: {e}"))?;
+    let mut ranks_gpu: CudaSlice<i32> = ctx
+        .stream
+        .alloc_zeros(requests.len())
+        .map_err(|e| anyhow!("token_logprobs_batch alloc failed: {e}"))?;
     let topk_len = requests
         .len()
         .checked_mul(k_max)
@@ -575,6 +583,7 @@ pub fn token_logprobs_batch(
             requests.len(),
             k_max,
             &mut picked_lp_gpu,
+            &mut ranks_gpu,
             &mut vals_gpu,
             &mut ids_gpu,
         )?;
@@ -583,6 +592,10 @@ pub fn token_logprobs_batch(
     let picked_lp = ctx
         .stream
         .clone_dtoh(&picked_lp_gpu)
+        .map_err(|e| anyhow!("token_logprobs_batch D2H failed: {e}"))?;
+    let ranks = ctx
+        .stream
+        .clone_dtoh(&ranks_gpu)
         .map_err(|e| anyhow!("token_logprobs_batch D2H failed: {e}"))?;
     let vals = ctx
         .stream
@@ -600,6 +613,7 @@ pub fn token_logprobs_batch(
             let base = i * k_max;
             TokenLogprob {
                 logprob: picked_lp[i],
+                rank: ranks[i] as u32,
                 top_logprobs: (0..k)
                     .map(|j| (ids[base + j] as u32, vals[base + j]))
                     .collect(),
@@ -625,6 +639,9 @@ mod tests {
 
         let out = token_logprob_from_row(&row, 2, 3).unwrap();
 
+        assert_eq!(out.rank, 3);
+        assert_eq!(token_logprob_from_row(&row, 0, 0).unwrap().rank, 4);
+        assert_eq!(token_logprob_from_row(&row, 1, 0).unwrap().rank, 2);
         assert!((out.logprob - (2.0 - lse)).abs() < 1e-6);
         // Top-3 sorted descending; tied logits keep ascending token-id order.
         let ids: Vec<u32> = out.top_logprobs.iter().map(|&(id, _)| id).collect();

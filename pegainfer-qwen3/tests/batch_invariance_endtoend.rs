@@ -40,8 +40,8 @@ fn item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
@@ -53,7 +53,6 @@ fn dist_for_first(ex: &mut Qwen3Executor, batch: &[(RequestId, Vec<u32>)]) -> Ve
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &items,
-            echo: false,
         })
         .expect("prefill");
     let out = pr.requests[0]

@@ -93,8 +93,8 @@ struct ActiveRequest35 {
     max_tokens: usize,
     prompt_len: usize,
     params: SamplingParams,
-    /// Number of top logprobs to return (0 = disabled).
-    logprobs: usize,
+    /// Optional top-logprob count; Some(0) scores only the chosen token.
+    logprobs: Option<usize>,
 }
 
 /// A request whose prompt is being prefilled across multiple scheduler steps.
@@ -523,8 +523,9 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
     unsafe {
         crate::ffi::cublas_init();
     }
+    let guard = CublasThreadGuard;
     model.tune_decode_gemm_algos()?;
-    Ok(CublasThreadGuard)
+    Ok(guard)
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────
@@ -654,15 +655,16 @@ where
     Ok(())
 }
 
-const UNSUPPORTED_ECHO_MESSAGE: &str = "echo=true is unsupported by the Qwen3.5 serving contract";
+const UNSUPPORTED_PROMPT_LOGPROBS_MESSAGE: &str =
+    "prompt_logprobs is unsupported by the Qwen3.5 serving contract";
 
-fn reject_unsupported_echo(pending: &mut Vec<SchedulerRequest>) {
+fn reject_unsupported_prompt_logprobs(pending: &mut Vec<SchedulerRequest>) {
     pending.retain(|req| {
-        if !req.echo {
+        if req.prompt_logprobs.is_none() {
             return true;
         }
         let _ = req.token_tx.send(TokenEvent::Rejected {
-            message: UNSUPPORTED_ECHO_MESSAGE.to_string(),
+            message: UNSUPPORTED_PROMPT_LOGPROBS_MESSAGE.to_string(),
             prompt_tokens: req.prompt_tokens.len(),
             completion_tokens: 0,
         });
@@ -685,6 +687,10 @@ fn scheduler_loop(
     let mut prefilling: Vec<PrefillingRequest35> = Vec::new();
     let mut inflight_prefill: Option<InflightPrefill> = None;
     let max_batch = backend.max_batch();
+    let decode_overlap = matches!(
+        &backend,
+        SchedulerBackend::Single(single) if single.overlap_enabled()
+    );
 
     info!("scheduler ready (max_batch={})", max_batch);
 
@@ -760,7 +766,7 @@ fn scheduler_loop(
             );
             return;
         }
-        reject_unsupported_echo(&mut pending);
+        reject_unsupported_prompt_logprobs(&mut pending);
 
         // 3. Publish the settled post-prune state. Requests accepted from the
         // channel are waiting until admission below; closed requests never
@@ -810,7 +816,7 @@ fn scheduler_loop(
                 );
                 return;
             }
-            reject_unsupported_echo(&mut pending);
+            reject_unsupported_prompt_logprobs(&mut pending);
             publish_load(&load_tx, &backend, &active, &prefilling, 0, pending.len());
             if pending.is_empty() {
                 continue;
@@ -960,6 +966,7 @@ fn scheduler_loop(
             prefill_budget,
             &active_decode,
             &prefill_queue,
+            decode_overlap,
         );
         let scheduled = take_prefill_chunks(&mut prefilling, step_prefill_budget);
         // ITL diagnostics (#470): capture the *actual* prefill-chunk token count
@@ -972,9 +979,7 @@ fn scheduler_loop(
         let plan = plan::build_next_plan(!active.is_empty(), scheduled);
         if let Some(plan) = plan {
             let itl_plan_kind = match &plan {
-                ExecutionPlan::Unified { .. } if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled()) => {
-                    "overlap_launch"
-                }
+                ExecutionPlan::Unified { .. } if decode_overlap => "overlap_launch",
                 ExecutionPlan::Unified { .. } => "unified",
                 ExecutionPlan::Prefill { .. } => "prefill",
                 ExecutionPlan::Decode => "decode",
@@ -982,8 +987,7 @@ fn scheduler_loop(
             let itl_step_start = itl_debug.then(Instant::now);
             let step_result = match plan {
                 ExecutionPlan::Unified { pending } => {
-                    if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled())
-                    {
+                    if decode_overlap {
                         launch_overlap_step(
                             &mut backend,
                             &mut active,

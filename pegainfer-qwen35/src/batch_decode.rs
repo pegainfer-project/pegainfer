@@ -8,6 +8,7 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::kv_pool::KvState;
+use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::sampler::SamplingParams;
 
@@ -124,7 +125,7 @@ impl Qwen35Model {
 
         ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
         ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
-        ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_attn);
+        self.batch_decode_gemm(&attn.v_proj, &bufs.normed, &mut bufs.v_attn)?;
 
         ops::qk_norm_partial_rope_batched_decode_hd256_into(
             &self.ctx,
@@ -201,7 +202,7 @@ impl Qwen35Model {
 
         ops::gemm_into(&self.ctx, &attn.q_proj, &bufs.normed, &mut bufs.q_full);
         ops::gemm_into(&self.ctx, &attn.k_proj, &bufs.normed, &mut bufs.k_attn);
-        ops::gemm_into(&self.ctx, &attn.v_proj, &bufs.normed, &mut bufs.v_attn);
+        self.batch_decode_gemm(&attn.v_proj, &bufs.normed, &mut bufs.v_attn)?;
 
         ops::qk_norm_partial_rope_batched_decode_hd256_into(
             &self.ctx,
@@ -676,12 +677,7 @@ impl Qwen35Model {
                 &mut bufs.gate_up_out,
             );
             ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
-            ops::gemm_into(
-                &self.ctx,
-                &layer.mlp.down_proj,
-                &bufs.act_out,
-                &mut bufs.mlp_out,
-            );
+            self.batch_decode_gemm(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.mlp_out)?;
             self.all_reduce_hidden(&mut bufs.mlp_out)?;
 
             ops::add_batch_into(&self.ctx, &bufs.hidden_mid, &bufs.mlp_out, &mut bufs.hidden)?;
@@ -812,14 +808,22 @@ impl Qwen35Model {
             &mut bufs.gate_up_out,
         );
         ops::silu_mul_fused_batch_into(&self.ctx, &bufs.gate_up_out, &mut bufs.act_out)?;
-        ops::gemm_into(
-            &self.ctx,
-            &layer.mlp.down_proj,
-            &bufs.act_out,
-            &mut bufs.mlp_out,
-        );
+        self.batch_decode_gemm(&layer.mlp.down_proj, &bufs.act_out, &mut bufs.mlp_out)?;
 
         ops::add_batch_into(&self.ctx, &bufs.hidden_mid, &bufs.mlp_out, &mut bufs.hidden)
+    }
+
+    fn batch_decode_gemm(
+        &self,
+        weights: &DeviceMatrix,
+        input: &HiddenStates,
+        output: &mut HiddenStates,
+    ) -> Result<()> {
+        if let Some(recipe) = self.candidate_decode_recipe(weights, input.seq_len)? {
+            return recipe.launch(&self.ctx, weights, input, output);
+        }
+        ops::gemm_into(&self.ctx, weights, input, output);
+        Ok(())
     }
 
     /// Linear attention decode over slot-indexed recurrent state.

@@ -1,12 +1,12 @@
 # Qwen3-4B Model Crate
 
 **Created**: 2026-05-03
-**Last touched**: 2026-07
+**Last touched**: 2026-09
 **TL;DR**: `crates/pegainfer-qwen3` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `pegainfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. The old `ModelForward` path has been removed; decode length-limit now emits the final token before `Finished`. Long-context `bs=1` TPOT was traced to non-partition FlashInfer paged decode under-filling the GPU; Qwen3 runtime gates FlashInfer split-K decode on `padded_bs<=32` (the `seq_len>=1024` gate was dropped in #437) with a 64-token chunk floor (`Tuned` capped at 64 chunks; opt-in `--batch-invariant` pins a fixed 160-token split), cutting 4k/64 serving steady TPOT from about `11.7ms` to `6.46ms` on RTX 5090. Qwen3 now keeps a single model-crate bench entry: `qwen3_kernel_snapshot`, a JSON snapshot runner with warm/cold-L2 latency, default-on CUPTI counters, and compare. Correctness/truth is intentionally out of this snapshot for now.
 
 ## Determinism scope
 
-`--batch-invariant` is scoped to one process, one toolchain, and one GPU. The cuBLASLt algo is re-tuned on every boot and cached per executor thread (`thread_local`), so it does not promise stability across cuBLAS or driver versions; startup logging records the pinned `splitk` and `reduction_scheme` per `(M,K)`. The builder rejects decode-overlap, DFlash speculative decoding, LoRA, and tensor parallelism.
+`--batch-invariant` is scoped to one process, one toolchain, and one GPU. The cuBLASLt algo is re-tuned on every boot and cached per executor thread (`thread_local`), so it does not promise stability across cuBLAS or driver versions; startup logging records the pinned `splitk` and `reduction_scheme` per `(M,K)`. The opt-in cross-process algo store (`PEGAINFER_GEMM_LT_CACHE`, see [serving-perf-5090.md](serving-perf-5090.md)) does not reach this path: `--batch-invariant` selects `Pin`, which takes the heuristic top without timing and never reads or writes the store. The builder rejects decode-overlap, DFlash speculative decoding, LoRA, and tensor parallelism.
 
 It also **requires `--no-prefix-cache` and rejects `--kv-offload`**. A prefix hit advances a prompt's `chunk_start` off the request-local chunk grid, re-cutting its prefill chunks according to prior traffic. `--no-prefix-cache` closes that — except under offload, where it only disables HBM retention and deliberately leaves prefix *matching* on (host-tier reuse is the point of that mode), so that pair is rejected outright.
 

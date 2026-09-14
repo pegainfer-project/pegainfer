@@ -1,10 +1,9 @@
-//! Stable Qwen3.5 GDN prefill boundary.
+//! Qwen3.5 candidate GPU operations.
 //!
 //! Generated CuTe symbols, tensor wrappers, TMA descriptors, module lifetime,
 //! and the low-level launch ABI stop below this module. Model crates see only
-//! the semantic geometry and device buffers used by Gated DeltaNet prefill.
+//! semantic geometry, validated recipes and device buffers.
 
-use std::ffi::CStr;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -19,8 +18,16 @@ use crate::ffi;
 use crate::tensor::DeviceContext;
 use crate::tensor::HiddenStates;
 
-const QWEN35_GDN_ABI_VERSION: u32 = 2;
+mod decode_gemm;
+pub use decode_gemm::Qwen35DecodeGemm;
+
+const QWEN35_GDN_ABI_VERSION: u32 = 3;
 const STATUS_OK: i32 = 0;
+
+#[derive(Clone, Copy, Debug)]
+struct ArtifactIdentity(&'static str);
+
+include!(concat!(env!("OUT_DIR"), "/qwen35_gdn_identity.rs"));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen35GdnGeometry {
@@ -44,7 +51,7 @@ pub struct Qwen35GdnAot {
     handle: NonNull<c_void>,
     device_ordinal: usize,
     workspace_bytes: usize,
-    artifact_sha256: &'static str,
+    artifact_identity: ArtifactIdentity,
 }
 
 pub struct Qwen35GdnWorkspace {
@@ -82,24 +89,8 @@ impl Qwen35GdnAot {
             unsafe { ffi::pegainfer_qwen35_gdn_aot_available() } == 1,
             "Qwen3.5 FlashInfer candidate was explicitly selected, but no AOT candidate was linked; set PEGAINFER_QWEN35_GDN_AOT_BUNDLE at build time"
         );
-        let identity = unsafe { ffi::pegainfer_qwen35_gdn_artifact_sha256() };
-        ensure!(
-            !identity.is_null(),
-            "Qwen3.5 GDN artifact identity pointer is null"
-        );
-        // The linked C shim returns a static string literal, independent of
-        // the generated module's lifetime. Reject it before allocating a handle.
-        let artifact_sha256: &'static str = unsafe { CStr::from_ptr(identity) }
-            .to_str()
-            .context("Qwen3.5 GDN artifact identity is not valid UTF-8")?;
-        ensure!(
-            artifact_sha256.len() == 64,
-            "Qwen3.5 GDN artifact identity must contain exactly 64 hexadecimal characters"
-        );
-        ensure!(
-            artifact_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "Qwen3.5 GDN artifact identity contains non-hexadecimal characters"
-        );
+        let artifact_identity =
+            ARTIFACT_IDENTITY.context("Qwen3.5 GDN artifact identity is absent")?;
         let mut raw = std::ptr::null_mut();
         let status =
             unsafe { ffi::pegainfer_qwen35_gdn_create(&raw mut raw, device_ordinal as i32) };
@@ -122,7 +113,7 @@ impl Qwen35GdnAot {
             handle,
             device_ordinal,
             workspace_bytes,
-            artifact_sha256,
+            artifact_identity,
         })
     }
 
@@ -132,7 +123,7 @@ impl Qwen35GdnAot {
     }
 
     pub fn artifact_sha256(&self) -> &'static str {
-        self.artifact_sha256
+        self.artifact_identity.0
     }
 
     pub fn allocate_workspace(

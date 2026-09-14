@@ -168,7 +168,7 @@ fn generate(
     max_tokens: usize,
 ) -> Vec<Step> {
     let mut req = request(prompt_tokens, SamplingParams::default(), max_tokens);
-    req.logprobs = logprobs;
+    req.logprobs = (logprobs > 0).then_some(logprobs);
     to_steps(engine.submit(req).expect_finished())
 }
 
@@ -199,19 +199,19 @@ fn generate_concurrent(engine: &EngineHarness, requests: Vec<(Vec<u32>, usize)>)
         .collect()
 }
 
-/// Prefill `context` (echo) and return the next-token distribution the *prefill*
+/// Prefill `context` (prompt scoring) and return the next-token distribution the *prefill*
 /// kernel produces — the kernel the speculative verify path also uses. This is
 /// the reference the spec pick should match (vs the plain-decode baseline, whose
 /// kernel resolves bifurcation ties to the other side). Returns the first
 /// generated token's `(id, top_logprobs)`.
 fn prefill_next(engine: &EngineHarness, context: Vec<u32>, logprobs: usize) -> Step {
     let mut req = request(context, SamplingParams::default(), 1);
-    req.logprobs = logprobs;
-    req.echo = true;
+    req.logprobs = (logprobs > 0).then_some(logprobs);
+    req.prompt_logprobs = Some(logprobs);
     let mut generated = to_steps(engine.submit(req).expect_finished());
     assert!(
         !generated.is_empty(),
-        "echo prefill finished without a token"
+        "prompt-scoring prefill finished without a token"
     );
     generated.swap_remove(0)
 }

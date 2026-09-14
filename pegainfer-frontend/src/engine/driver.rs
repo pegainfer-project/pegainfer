@@ -166,8 +166,8 @@ mod tests {
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
             trace_parent: None,
             client_label: None,
         }

@@ -54,10 +54,10 @@ pub struct Request {
     /// Opaque router/P-D metadata from the request's
     /// `vllm_xargs.kv_transfer_params`.
     pub kv_transfer_params: Option<serde_json::Value>,
-    /// Number of top logprobs to return per token (0 = disabled).
-    pub logprobs: usize,
-    /// Return prompt tokens (and their logprobs) ahead of the completion.
-    pub echo: bool,
+    /// Completion top-k count: None disables scoring; Some(0) scores the chosen token.
+    pub logprobs: Option<usize>,
+    /// Prompt top-k count, independent of completion scoring; Some(0) scores each prompt token.
+    pub prompt_logprobs: Option<usize>,
     /// Trace context of the caller's request span, when tracing is on. The
     /// model scheduler opens its queue/prefill/decode spans as children of
     /// this. `None` when tracing is disabled.

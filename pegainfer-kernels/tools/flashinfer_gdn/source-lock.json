@@ -39,12 +39,11 @@
       "maximum": 67108863
     },
     "abi": {
-      "version": 2,
+      "version": 3,
       "function_prefix": "pegainfer_qwen35_gdn_qwen35_4b_candidate",
       "geometry_binding": "stable_project_c_wrapper",
       "symbols": [
         "pegainfer_qwen35_gdn_abi_version",
-        "pegainfer_qwen35_gdn_artifact_sha256",
         "pegainfer_qwen35_gdn_aot_available",
         "pegainfer_qwen35_gdn_workspace_bytes",
         "pegainfer_qwen35_gdn_create",

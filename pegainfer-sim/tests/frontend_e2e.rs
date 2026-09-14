@@ -780,6 +780,9 @@ async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
     Ok(())
 }
 
+#[path = "frontend_e2e/logprobs.rs"]
+mod logprobs;
+
 async fn assert_models_endpoint(client: &Client, base_url: &str, model_name: &str) -> Result<()> {
     let models: Value = client
         .get(format!("{base_url}/v1/models"))
@@ -1023,8 +1026,9 @@ const TINY_TOKENIZER_CONFIG_JSON: &str = r#"{
   "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}"
 }"#;
 
+// Leave room for simulated alternatives (scored id + 1..k) within the vocabulary.
 const TINY_CONFIG_JSON: &str = r#"{
   "model_type": "pegainfer_sim",
   "max_position_embeddings": 128,
-  "vocab_size": 3
+  "vocab_size": 16
 }"#;

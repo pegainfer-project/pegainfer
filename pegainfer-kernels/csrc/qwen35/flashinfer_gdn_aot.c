@@ -70,10 +70,6 @@ uint32_t pegainfer_qwen35_gdn_abi_version(void) {
     return PEGAINFER_QWEN35_GDN_ABI_VERSION;
 }
 
-const char *pegainfer_qwen35_gdn_artifact_sha256(void) {
-    return PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256;
-}
-
 int32_t pegainfer_qwen35_gdn_aot_available(void) {
 #ifdef PEGAINFER_QWEN35_GDN_AOT
     return 1;

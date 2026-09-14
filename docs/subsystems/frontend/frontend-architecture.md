@@ -1,6 +1,6 @@
 # Frontend architecture: pegainfer-frontend and the engine boundary
 
-**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + `RequestLedger` lifecycle + a contract-owned polling driver — Qwen3, Gemma 4 and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite still launch through it). **Next step: migrate glm52, then delete the legacy contract.**
+**TL;DR:** `pegainfer-frontend` owns everything north of the model schedulers: the engine contract, the vLLM protocol stack, and the `ModelLine` dispatch trait. The contract now has two generations living side by side: the **step contract** (`StepOutputs` wire + `RequestLedger` lifecycle + a contract-owned polling driver — Qwen3, Gemma 4 and `pegainfer-sim` are migrated) and the **legacy handle contract** (`EngineHandle` + `TokenEvent` per-request events — glm52/qwen35/kimi-k2/deepseek-v2-lite still launch through it). The vLLM Rust dependencies are pinned to `295ac4e5`, including the DeepSeek V4/V4.1 tool-argument encoding fix. **Next step: migrate glm52, then delete the legacy contract.**
 
 Last touched: 2026-09
 
@@ -110,3 +110,20 @@ All six lines are onboarded. Adding a model line = write `model_line.rs` in the 
 ## Next step
 
 Migrate glm52 onto the step contract (the multi-scheduler pilot; brings P/D and EP requirements), then qwen35/kimi-k2/deepseek-v2-lite, then delete the legacy contract modules and `LaunchedEngine::Handle`.
+
+## September 2026 upstream dependency refresh
+
+All five direct vLLM Rust dependencies and their transitive workspace crates are
+pinned to `89dbb2644552d6e473a7e97da0ce8f0aa8e32c9d` (upstream main observed
+on 2026-09-11). Keeping one revision across these crates preserves the frontend's
+shared protocol and type contract.
+
+The only upstream commit since `295ac4e5` is vllm-project/vllm#56447, a Python-side
+GLM-OCR MTP position-masking fix. The Rust crates are unchanged, so this refresh
+does not add that model fix to PegaInfer or require a local API adaptation.
+The DeepSeek V4/V4.1 tool-argument encoding fix from #56260 remains included.
+
+Validation passed: release frontend/simulator library tests (71 + 6), simulated
+HTTP E2E (18), formatting, locked Cargo metadata, and frontend/simulator Clippy
+with warnings denied. The simulated HTTP gate covers frontend integration, not
+GPU execution or model accuracy.

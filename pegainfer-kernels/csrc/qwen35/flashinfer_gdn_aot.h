@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define PEGAINFER_QWEN35_GDN_ABI_VERSION 2u
+#define PEGAINFER_QWEN35_GDN_ABI_VERSION 3u
 
 typedef enum {
     PEGAINFER_QWEN35_GDN_OK = 0,
@@ -70,7 +70,6 @@ PEGAINFER_GDN_ASSERT_OFFSET(pegainfer_qwen35_gdn_args_t, stream, 96);
 #undef PEGAINFER_GDN_ALIGNOF
 
 uint32_t pegainfer_qwen35_gdn_abi_version(void);
-const char *pegainfer_qwen35_gdn_artifact_sha256(void);
 int32_t pegainfer_qwen35_gdn_aot_available(void);
 int32_t pegainfer_qwen35_gdn_workspace_bytes(void *handle,
                                              size_t *workspace_bytes);

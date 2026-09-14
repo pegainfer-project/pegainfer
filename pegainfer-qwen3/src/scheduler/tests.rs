@@ -23,7 +23,7 @@ fn active_state(request_id: u64, generated_count: usize, max_tokens: usize) -> A
         max_tokens,
         prompt_len: 16,
         params: SamplingParams::default(),
-        logprobs: 0,
+        logprobs: None,
     }
 }
 
@@ -257,20 +257,20 @@ fn request_local_chunks_are_independent_of_earlier_requests() {
 }
 
 #[test]
-fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
-    let mk_echo = |id: u64, prompt_len| {
+fn prompt_logprobs_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
+    let mk_prompt_logprobs = |id: u64, prompt_len| {
         let mut pending = PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
-        pending.echo = true;
+        pending.prompt_logprobs = Some(0);
         pending
     };
     let mk = |id: u64, prompt_len| {
         PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1))
     };
 
-    // Oversized echo is rejected by admission. If a caller bypasses
+    // Oversized prompt-scoring work is rejected by admission. If a caller bypasses
     // admission, the chunk picker must still keep it out of the profiled
     // prefill shape instead of running it whole.
-    let mut prefilling = vec![mk_echo(1, 64), mk(2, 16)];
+    let mut prefilling = vec![mk_prompt_logprobs(1, 64), mk(2, 16)];
     let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].request_id, RequestId::new(2));
@@ -278,13 +278,13 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
     assert_eq!(
         prefilling[0].request_id,
         RequestId::new(1),
-        "oversized echo stays queued if admission was bypassed"
+        "oversized prompt-scoring work stays queued if admission was bypassed"
     );
 
-    // An echo that doesn't fit behind earlier work is skipped, not split;
+    // A prompt-scoring request that doesn't fit behind earlier work is skipped, not split;
     // later requests may still fill the leftover budget, and the step set
     // stays sorted by request id.
-    let mut prefilling = vec![mk(3, 24), mk_echo(4, 16), mk(5, 8)];
+    let mut prefilling = vec![mk(3, 24), mk_prompt_logprobs(4, 16), mk(5, 8)];
     let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(
         taken
@@ -292,17 +292,17 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
             .map(|r| (r.request_id.raw(), r.step_chunk))
             .collect::<Vec<_>>(),
         vec![(3, 24), (5, 8)],
-        "echo skipped, leftover budget goes to the next non-echo request"
+        "prompt scoring skipped, leftover budget goes to the next ordinary request"
     );
     assert_eq!(prefilling[0].request_id, RequestId::new(4));
 }
 
 #[test]
-fn oversized_echo_request_is_rejected_at_admission() {
+fn oversized_prompt_logprobs_request_is_rejected_at_admission() {
     let active: [ActiveRequestState; 0] = [];
-    let mk_echo = |id: u64, prompt_len| {
+    let mk_prompt_logprobs = |id: u64, prompt_len| {
         let mut req = request(prompt_len, 1);
-        req.echo = true;
+        req.prompt_logprobs = Some(0);
         PendingRequest::from_request(RequestId::new(id), req)
     };
     let mk = |id: u64, prompt_len| {
@@ -310,7 +310,7 @@ fn oversized_echo_request_is_rejected_at_admission() {
     };
 
     let outcome = admit_deferred_requests(
-        vec![mk_echo(1, 33), mk(2, 64)],
+        vec![mk_prompt_logprobs(1, 33), mk(2, 64)],
         &active,
         &[],
         16,
@@ -329,7 +329,7 @@ fn oversized_echo_request_is_rejected_at_admission() {
             .map(|r| r.request_id.raw())
             .collect::<Vec<_>>(),
         vec![2],
-        "non-echo oversized prompts can still be admitted and chunked"
+        "Ordinary oversized prompts can still be admitted and chunked"
     );
     assert_eq!(outcome.rejected.len(), 1);
     assert_eq!(outcome.rejected[0].0.request_id, RequestId::new(1));
@@ -338,7 +338,7 @@ fn oversized_echo_request_is_rejected_at_admission() {
             outcome.rejected[0].1,
             RejectReason::EchoPrefillTokens { limit: 32 }
         ),
-        "oversized echo should be rejected against the profiled prefill bound"
+        "oversized prompt-scoring work should be rejected against the profiled prefill bound"
     );
 }
 
@@ -472,25 +472,28 @@ fn lifetime_blocks_never_under_reserve_kvbm_peak_draw() {
 }
 
 #[test]
-fn echo_requests_are_never_offered_to_prefetch() {
+fn prompt_logprobs_requests_are_never_offered_to_prefetch() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let mut executor = FakeExecutor::new(64, dropped);
     let offers = Arc::clone(&executor.prefetch_offers);
 
-    let mk = |id: u64, echo: bool| {
+    let mk = |id: u64, wants_prompt_logprobs: bool| {
         let mut req = request(32, 1);
-        req.echo = echo;
+        req.prompt_logprobs = wants_prompt_logprobs.then_some(0);
         PendingRequest::from_request(RequestId::new(id), req)
     };
     let mut deferred = vec![mk(1, true), mk(2, false)];
     let mut loading = Vec::new();
     offer_prefetch(&mut executor, &mut deferred, &mut loading, 0);
 
-    // The plain request is probed; the echo request is skipped entirely, so
+    // The plain request is probed; the prompt-scoring request is skipped entirely, so
     // its prefill forwards the whole prompt without parking unspendable KV.
     assert_eq!(*offers.lock().unwrap(), vec![2]);
-    let echo = deferred.iter().find(|r| r.request_id.raw() == 1).unwrap();
-    assert!(!echo.prefetch_offered, "echo request must stay un-probed");
+    let scored = deferred.iter().find(|r| r.request_id.raw() == 1).unwrap();
+    assert!(
+        !scored.prefetch_offered,
+        "prompt-scoring request must stay un-probed"
+    );
     let plain = deferred.iter().find(|r| r.request_id.raw() == 2).unwrap();
     assert!(
         plain.prefetch_offered,

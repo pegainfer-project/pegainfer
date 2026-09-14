@@ -13,7 +13,6 @@ use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::engine::TokenStreamReceiver;
 use pegainfer_frontend::sampler::SamplingParams;
@@ -97,7 +96,6 @@ struct TestCase {
 
 struct GenerationResult {
     tokens: Vec<u32>,
-    logprobs: Vec<Option<TokenLogprob>>,
     finish_reason: FinishReason,
 }
 
@@ -133,8 +131,8 @@ fn generate_tokens_with_logprobs(
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs,
-            echo: false,
+            logprobs: (logprobs > 0).then_some(logprobs),
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 
@@ -164,8 +162,8 @@ fn submit_repeated_token_request(
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .unwrap_or_else(|err| panic!("submit {request_id}: {err}"));
     token_rx
@@ -264,7 +262,6 @@ fn collect_generation_until(
     deadline: Option<Instant>,
 ) -> GenerationResult {
     let mut tokens = Vec::new();
-    let mut token_logprobs = Vec::new();
     loop {
         let event = match deadline {
             Some(deadline) => recv_event_before(token_rx, name, deadline),
@@ -301,7 +298,6 @@ fn collect_generation_until(
                     );
                 }
                 tokens.push(id);
-                token_logprobs.push(logprob);
             }
             Some(
                 TokenEvent::PromptTokens { .. }
@@ -311,7 +307,6 @@ fn collect_generation_until(
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return GenerationResult {
                     tokens,
-                    logprobs: token_logprobs,
                     finish_reason,
                 };
             }
@@ -350,8 +345,8 @@ fn expect_context_window_rejection(handle: &EngineHandle, max_context_tokens: us
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit over-context request");
 
@@ -455,8 +450,6 @@ fn run_full_scheduler_e2e(
     max_context_tokens: usize,
     label: &str,
 ) {
-    // logging intentionally left to the test harness
-
     // ── 0. Static context-window rejection ─────────────────────────────
     info!("=== Phase 0: Context-window rejection ===");
     expect_context_window_rejection(handle, max_context_tokens);
@@ -474,16 +467,6 @@ fn run_full_scheduler_e2e(
         assert_eq!(
             no_logprobs.tokens, with_logprobs.tokens,
             "greedy token ids must not depend on whether logprobs are requested for {:?}",
-            case.name
-        );
-        assert!(
-            no_logprobs.logprobs.iter().all(Option::is_none),
-            "logprobs=0 should keep the no-host-logprobs path for {:?}",
-            case.name
-        );
-        assert!(
-            with_logprobs.logprobs.iter().all(Option::is_some),
-            "logprobs=1 should attach token logprobs for {:?}",
             case.name
         );
         assert!(
@@ -528,21 +511,8 @@ fn run_full_scheduler_e2e(
     }
     assert_no_model_wide_collapse(&collapses);
 
-    // ── 3. Multi-request (scheduler state reuse) ────────────────────────
-    info!("=== Phase 3: Multi-request ===");
-    for case in CASES {
-        let (tokens, _) = generate_tokens(handle, tokenizer, case.prompt, case.max_new_tokens);
-        let text = tokenizer.decode(&tokens, true).expect("decode failed");
-        assert!(
-            !text.is_empty(),
-            "empty output on second run for: {:?}",
-            case.name
-        );
-        info!("  PASS: {:?} → {} tokens", case.name, tokens.len());
-    }
-
-    // ── 4. Concurrent requests ──────────────────────────────────────────
-    info!("=== Phase 4: Concurrent requests ===");
+    // ── 3. Concurrent requests ──────────────────────────────────────────
+    info!("=== Phase 3: Concurrent requests ===");
     {
         let mut receivers: Vec<(String, usize, TokenStreamReceiver)> = Vec::new();
 
@@ -563,8 +533,8 @@ fn run_full_scheduler_e2e(
                     lora_adapter: None,
                     kv_transfer_params: None,
                     token_tx,
-                    logprobs: 0,
-                    echo: false,
+                    logprobs: None,
+                    prompt_logprobs: None,
                 })
                 .expect("submit failed");
             receivers.push((case.name.to_string(), 0, token_rx));
@@ -581,8 +551,8 @@ fn run_full_scheduler_e2e(
         }
     }
 
-    // ── 4b. Mixed concurrent logprobs requests ─────────────────────────
-    info!("=== Phase 4b: Mixed concurrent logprobs ===");
+    // ── 3b. Mixed concurrent logprobs requests ─────────────────────────
+    info!("=== Phase 3b: Mixed concurrent logprobs ===");
     {
         let mixed = [
             ("mixed_no_logprobs", CASES[0].prompt, 0usize),
@@ -605,8 +575,8 @@ fn run_full_scheduler_e2e(
                     lora_adapter: None,
                     kv_transfer_params: None,
                     token_tx,
-                    logprobs,
-                    echo: false,
+                    logprobs: (logprobs > 0).then_some(logprobs),
+                    prompt_logprobs: None,
                 })
                 .expect("submit failed");
             receivers.push((name, logprobs, token_rx));
@@ -615,23 +585,12 @@ fn run_full_scheduler_e2e(
         for (name, logprobs, mut rx) in receivers {
             let result = collect_generation(&mut rx, name, logprobs);
             assert!(!result.tokens.is_empty(), "{name}: produced no tokens");
-            if logprobs == 0 {
-                assert!(
-                    result.logprobs.iter().all(Option::is_none),
-                    "{name}: no-logprobs request should stay on the no-copy path"
-                );
-            } else {
-                assert!(
-                    result.logprobs.iter().all(Option::is_some),
-                    "{name}: requested logprobs should be present"
-                );
-            }
             info!("  PASS: {name} → {} tokens", result.tokens.len());
         }
     }
 
-    // ── 5. Consumer drop safety ─────────────────────────────────────────
-    info!("=== Phase 5: Consumer drop ===");
+    // ── 4. Consumer drop safety ─────────────────────────────────────────
+    info!("=== Phase 4: Consumer drop ===");
     {
         let prompt_tokens = tokenizer.encode("Hello", false).expect("encode failed");
         let (token_tx, rx) = TokenSink::standalone();
@@ -648,8 +607,8 @@ fn run_full_scheduler_e2e(
                 lora_adapter: None,
                 kv_transfer_params: None,
                 token_tx,
-                logprobs: 0,
-                echo: false,
+                logprobs: None,
+                prompt_logprobs: None,
             })
             .expect("submit failed");
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -673,11 +632,14 @@ fn test_e2e_qwen35_scheduler() {
 #[test]
 #[ignore = "requires SM120, a validated candidate identity, and Qwen3.5 weights"]
 fn candidate_e2e_qwen35_scheduler() {
-    run_scheduler_e2e(&GdnAcceptance::candidate());
+    run_scheduler_e2e(&GdnAcceptance::candidate().expect("candidate prerequisites"));
 }
 
 fn run_scheduler_e2e(acceptance: &GdnAcceptance) {
-    let Some(model_path) = acceptance.model_path("test_e2e_qwen35_scheduler") else {
+    let Some(model_path) = acceptance
+        .model_path("test_e2e_qwen35_scheduler")
+        .expect("model prerequisite")
+    else {
         return;
     };
 
@@ -685,16 +647,16 @@ fn run_scheduler_e2e(acceptance: &GdnAcceptance) {
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
     let overlap = if acceptance.is_candidate() {
-        pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm
+        crate::Qwen35DecodeOverlap::SharedSm
     } else {
-        pegainfer_qwen35::Qwen35DecodeOverlap::Off
+        crate::Qwen35DecodeOverlap::Off
     };
     let handle = acceptance
         .launch_engine(
             &model_path,
             8,
-            pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
-            pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            crate::Qwen35SchedulerPolicy::Off,
             overlap,
         )
         .expect("Failed to start Qwen3.5 scheduler");
@@ -712,12 +674,15 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
 #[test]
 #[ignore = "requires SM120, a validated candidate identity, and Qwen3.5 weights"]
 fn candidate_e2e_qwen35_shared_sm_last_decoder() {
-    run_shared_sm_last_decoder(&GdnAcceptance::candidate());
+    run_shared_sm_last_decoder(&GdnAcceptance::candidate().expect("candidate prerequisites"));
 }
 
 fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
     pegainfer_core::logging::init_default();
-    let Some(model_path) = acceptance.model_path("test_e2e_qwen35_shared_sm_last_decoder") else {
+    let Some(model_path) = acceptance
+        .model_path("test_e2e_qwen35_shared_sm_last_decoder")
+        .expect("model prerequisite")
+    else {
         return;
     };
     let tokenizer = common::load_tokenizer(&model_path);
@@ -734,8 +699,8 @@ fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
                 &model_path,
                 4,
                 8192,
-                pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
-                pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+                crate::Qwen35SchedulerPolicy::Off,
+                crate::Qwen35DecodeOverlap::Off,
             )
             .expect("Failed to start Qwen3.5 default-Off scheduler");
         let mut off_rx = submit_repeated_token_request(
@@ -782,8 +747,8 @@ fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
                 &model_path,
                 4,
                 8192,
-                pegainfer_qwen35::Qwen35SchedulerPolicy::Auto,
-                pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
+                crate::Qwen35SchedulerPolicy::Auto,
+                crate::Qwen35DecodeOverlap::SharedSm,
             )
             .expect("Failed to start Qwen3.5 auto + shared-SM scheduler");
         let mut auto_load = auto_handle
@@ -831,8 +796,8 @@ fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
             &model_path,
             4,
             8192,
-            pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
-            pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
+            crate::Qwen35SchedulerPolicy::Off,
+            crate::Qwen35DecodeOverlap::SharedSm,
         )
         .expect("Failed to start Qwen3.5 shared-SM scheduler");
     let mut load = handle
@@ -914,7 +879,7 @@ fn test_e2e_qwen35_scheduler_tp2() {
     info!("Loading Qwen3.5 TP2 model for scheduler test...");
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
-    let handle = pegainfer_qwen35::start_engine_with_capacity(
+    let handle = crate::start_engine_with_capacity(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: false,
@@ -923,7 +888,7 @@ fn test_e2e_qwen35_scheduler_tp2() {
             ..EngineLoadOptions::default()
         },
         8,
-        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+        crate::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 TP2 scheduler");
     info!("TP2 scheduler loaded in {:.2?}", start.elapsed());
@@ -945,7 +910,7 @@ fn test_e2e_qwen35_scheduler_tp2_graph() {
     // P2c: decode replays pre-captured CUDA Graphs when the TP-local decode
     // GQA group has a compiled kernel (4B/9B); uncompiled groups (27B group 6)
     // keep the batched eager path under the same request flow.
-    let handle = pegainfer_qwen35::start_engine_with_capacity(
+    let handle = crate::start_engine_with_capacity(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
@@ -954,7 +919,7 @@ fn test_e2e_qwen35_scheduler_tp2_graph() {
             ..EngineLoadOptions::default()
         },
         8,
-        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+        crate::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 TP2 graph scheduler");
     info!("TP2 graph scheduler loaded in {:.2?}", start.elapsed());

@@ -116,6 +116,7 @@ fn token_and_finish_in_one_burst_coalesce() {
         TokenEvent::Token {
             id: 11,
             logprob: Some(TokenLogprob {
+                rank: 1,
                 logprob: -0.1,
                 top_logprobs: vec![(11, -0.1), (12, -0.5)],
             }),
@@ -126,6 +127,7 @@ fn token_and_finish_in_one_burst_coalesce() {
         TokenEvent::Token {
             id: 21,
             logprob: Some(TokenLogprob {
+                rank: 1,
                 logprob: -0.2,
                 top_logprobs: vec![(21, -0.2), (22, -0.6)],
             }),

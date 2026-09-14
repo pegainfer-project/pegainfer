@@ -377,13 +377,13 @@ fn prefill_item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
 fn decode_item(id: RequestId, fed: u32) -> DecodeStepItem {
-    DecodeStepItem::new(id, fed, SamplingParams::default(), LOGPROBS)
+    DecodeStepItem::new(id, fed, SamplingParams::default(), Some(LOGPROBS))
 }
 
 /// Teacher-force the golden sequences `seqs` through `ex` and fold every
@@ -414,7 +414,6 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
             .execute_prefill(PrefillPlan {
                 sample_seed: 0,
                 requests: &items,
-                echo: false,
             })
             .expect("prefill");
         for (i, &s) in seqs.iter().enumerate() {
@@ -457,7 +456,6 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
                 .execute_prefill(PrefillPlan {
                     sample_seed: 0,
                     requests: &[prefill_item(id, g.prompt(seq))],
-                    echo: false,
                 })
                 .expect("prefill");
             stats.cached_tokens += pr.requests[0].cached_tokens;

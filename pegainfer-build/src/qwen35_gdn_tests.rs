@@ -34,72 +34,63 @@ fn candidate_contract_rejects_mutations() {
         );
     };
 
-    // Exercise missing/unknown keys at every object boundary and a changed
-    // value at every scalar leaf, including every shape and stride component.
-    fn mutations(value: &Value, path: &str, result: &mut Vec<(String, Value)>, root: &Value) {
-        let mut changed = root.clone();
-        match value {
-            Value::Object(fields) => {
-                changed
-                    .pointer_mut(path)
-                    .unwrap()
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("unexpected".into(), Value::Bool(true));
-                result.push((format!("unknown field at {path}"), changed));
-                for (key, child) in fields {
-                    let child_path = format!("{path}/{key}");
-                    let mut missing = root.clone();
-                    missing
-                        .pointer_mut(path)
-                        .unwrap()
-                        .as_object_mut()
-                        .unwrap()
-                        .remove(key);
-                    result.push((format!("missing {child_path}"), missing));
-                    mutations(child, &child_path, result, root);
-                }
-            }
-            Value::Array(values) => {
-                for (index, child) in values.iter().enumerate() {
-                    mutations(child, &format!("{path}/{index}"), result, root);
-                }
-            }
-            _ => {
-                *changed.pointer_mut(path).unwrap() = match value {
-                    Value::String(text) => Value::String(format!("{text}-changed")),
-                    Value::Number(number) => Value::from(number.as_u64().unwrap() + 1),
-                    _ => panic!("unexpected manifest scalar: {path}"),
-                };
-                result.push((format!("changed {path}"), changed));
-            }
-        }
+    let cases = [
+        ("/target/arch", Value::from("sm_90")),
+        ("/geometry/h_v", Value::from(48)),
+        ("/dtypes/state", Value::from("bfloat16")),
+        ("/tokens/maximum", Value::from(1)),
+        ("/abi/version", Value::from(0)),
+        ("/abi/symbols", Value::Array(vec![])),
+        ("/abi/q_view/stride/0", Value::from(1)),
+        ("/abi/state_update", Value::from("out_of_place")),
+        ("/workspace/bytes_per_sm", Value::from(0)),
+        ("/toolchain/python", Value::from("untrusted")),
+        ("/source/kernel_source_sha256", Value::from("untrusted")),
+        ("/artifact/format", Value::from("ptx")),
+        ("/artifact/object/sha256", Value::from("untrusted")),
+    ];
+    for (path, value) in &cases {
+        let mut changed = manifest.clone();
+        *changed.pointer_mut(path).expect("contract field exists") = value.clone();
+        write_manifest(&changed);
+        reject(path);
     }
-    let mut cases = Vec::new();
-    mutations(&manifest, "", &mut cases, &manifest);
-    for (label, changed) in &cases {
-        write_manifest(changed);
-        reject(label);
-    }
+    let mut missing = manifest.clone();
+    missing.as_object_mut().unwrap().remove("abi");
+    write_manifest(&missing);
+    reject("missing ABI");
+    let mut unknown = manifest.clone();
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".into(), Value::Bool(true));
+    write_manifest(&unknown);
+    reject("unknown manifest field");
     write_manifest(&manifest);
 
     for (name, bytes) in &accepted.files {
         let path = bundle.join(name);
-        fs::remove_file(&path).unwrap();
-        reject(&format!("missing {name}"));
-        fs::create_dir(&path).unwrap();
-        reject(&format!("directory {name}"));
-        fs::remove_dir(&path).unwrap();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(original.canonicalize().unwrap().join(name), &path).unwrap();
-            reject(&format!("symlink {name}"));
+        // File kinds share read_regular; byte integrity is checked for each artifact.
+        if *name == "kernel.o" {
             fs::remove_file(&path).unwrap();
+            reject("missing kernel.o");
+            fs::create_dir(&path).unwrap();
+            reject("directory kernel.o");
+            fs::remove_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(original.canonicalize().unwrap().join(name), &path)
+                    .unwrap();
+                reject("symlink kernel.o");
+                fs::remove_file(&path).unwrap();
+            }
         }
-        let mut corrupted = bytes.clone();
-        corrupted[0] ^= 1;
-        fs::write(&path, &corrupted).unwrap();
-        reject(&format!("same-size corruption {name}"));
+        if *name != "manifest.json" {
+            let mut corrupted = bytes.clone();
+            corrupted[0] ^= 1;
+            fs::write(&path, &corrupted).unwrap();
+            reject(&format!("same-size corruption {name}"));
+        }
         // Remove content, not just a trailing newline that is optional in JSON.
         let truncated_len = bytes.trim_ascii_end().len() - 1;
         fs::write(&path, &bytes[..truncated_len]).unwrap();

@@ -319,14 +319,14 @@ fn prefill_item(id: RequestId, prompt: Vec<u32>, lora: bool) -> PrefillStepItem 
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
     .with_lora_adapter(lora.then(|| ADAPTER_NAME.to_string()))
 }
 
 fn decode_item(id: RequestId, fed: u32, lora: bool) -> DecodeStepItem {
-    DecodeStepItem::new(id, fed, SamplingParams::default(), LOGPROBS)
+    DecodeStepItem::new(id, fed, SamplingParams::default(), Some(LOGPROBS))
         .with_lora_adapter(lora.then(|| ADAPTER_NAME.to_string()))
 }
 
@@ -359,7 +359,6 @@ fn run(
             .execute_prefill(PrefillPlan {
                 sample_seed: 0,
                 requests: &items,
-                echo: false,
             })
             .expect("prefill");
         for (i, &s) in seqs.iter().enumerate() {
@@ -401,7 +400,6 @@ fn run(
                 .execute_prefill(PrefillPlan {
                     sample_seed: 0,
                     requests: &[prefill_item(id, g.prompt(seq), use_lora(seq))],
-                    echo: false,
                 })
                 .expect("prefill");
             fold(

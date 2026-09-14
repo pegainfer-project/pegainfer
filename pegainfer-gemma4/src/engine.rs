@@ -476,9 +476,9 @@ fn validate_request(request: &Request, max_context: usize) -> Result<usize, Reje
             feature: "LoRA".into(),
         });
     }
-    if request.echo {
+    if request.prompt_logprobs.is_some() {
         return Err(RejectReason::Unsupported {
-            feature: "echo".into(),
+            feature: "prompt_logprobs".into(),
         });
     }
     if request.kv_transfer_params.is_some() {
@@ -592,7 +592,7 @@ enum PreparedNewcomer {
 struct SampleRow<'a> {
     params: &'a pegainfer_frontend::sampler::SamplingParams,
     step: u64,
-    logprobs: usize,
+    logprobs: Option<usize>,
     ignore_eos: bool,
 }
 
@@ -635,11 +635,14 @@ fn sample_logits_rows(
     let requests: Vec<LogprobRequest> = rows
         .iter()
         .enumerate()
-        .filter(|(row, spec)| spec.logprobs > 0 && !stops[*row])
-        .map(|(row, spec)| LogprobRequest {
-            row,
-            picked: picked[row],
-            top_k: spec.logprobs,
+        .filter_map(|(row, spec)| {
+            spec.logprobs
+                .filter(|_| !stops[row])
+                .map(|top_k| LogprobRequest {
+                    row,
+                    picked: picked[row],
+                    top_k,
+                })
         })
         .collect();
     let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; rows.len()];
@@ -1755,7 +1758,7 @@ impl EngineState {
                     logprobs: if last {
                         walker.request.request.logprobs
                     } else {
-                        0
+                        None
                     },
                     ignore_eos: if last {
                         walker.request.request.params.ignore_eos
@@ -1895,7 +1898,7 @@ impl EngineState {
             && active.len() <= self.scratch.max_rows()
             && active.iter().all(|entry| {
                 !entry.stopping
-                    && entry.request.request.logprobs == 0
+                    && entry.request.request.logprobs.is_none()
                     && entry
                         .request
                         .request

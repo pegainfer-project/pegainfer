@@ -40,7 +40,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
         if self.workers.is_empty() {
             bail!("Kimi TP8 executor has no rank workers");
         }
-        ensure_no_logprobs_tp8(row.logprobs > 0)?;
+        ensure_no_logprobs_tp8(row.logprobs.is_some())?;
         ensure_greedy_tp8(&row.sampling)?;
         // Every rank replicates the KV pool with identical geometry, so the
         // same page assignment is broadcast to all eight workers.
@@ -108,7 +108,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
                 slots.len()
             );
         }
-        ensure_no_logprobs_tp8(rows.iter().any(|r| r.logprobs > 0))?;
+        ensure_no_logprobs_tp8(rows.iter().any(|r| r.logprobs.is_some()))?;
         for row in rows {
             ensure_greedy_tp8(&row.sampling)?;
         }

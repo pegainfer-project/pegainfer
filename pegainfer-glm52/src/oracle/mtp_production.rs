@@ -64,8 +64,8 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
         lora_adapter: None,
         kv_transfer_params: None,
         token_tx,
-        logprobs: 0,
-        echo: false,
+        logprobs: None,
+        prompt_logprobs: None,
     })?;
 
     let mut completion = Vec::new();
@@ -123,8 +123,8 @@ fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })?;
         receivers.push(token_rx);
     }

@@ -13,9 +13,10 @@ from pathlib import Path
 
 from artifact_contract import (
     ContractError,
-    prepare_flashinfer_source, read_json, sha256_file,
-    validate_compile_metadata, validate_manifest, write_json,
+    sha256_file, validate_manifest, write_json,
 )
+
+from compile_sm120 import export_kernel
 
 
 def main() -> None:
@@ -31,22 +32,13 @@ def main() -> None:
     # The runner supplies a previously generated candidate. Contract validation
     # and Rust's linked-object hash check bind the reference to those exact bytes;
     # the hash does not independently establish how the candidate was generated.
-    source_dir = root / "upstream-source"
-    source = prepare_flashinfer_source(args.flashinfer_dir, source_dir, upstream_layout=True)
-    raw = root / "upstream-aot"
-    metadata_path = raw / "compile-metadata.json"
-    subprocess.run([sys.executable, str(tools / "compile_sm120.py"),
-                    "--upstream-layout", "--flashinfer-dir", str(source_dir),
-                    "--base-flashinfer-dir", str(args.flashinfer_dir.resolve()),
-                    "--aot-out", str(raw), "--metadata-out", str(metadata_path)], check=True)
-    metadata = read_json(metadata_path)
-    validate_compile_metadata(metadata, source)
+    paths, provenance = export_kernel(args.flashinfer_dir.resolve(), root, upstream_layout=True)
     cuda = Path(os.environ.get("CUDA_HOME", os.environ.get("CUDA_PATH", "/usr/local/cuda")))
     library = root / "upstream-oracle.so"
     subprocess.run([*shlex.split(os.environ.get("CC", "cc")), "-shared", "-fPIC", "-O3",
                     "-std=c11", str(tools / "upstream_adapter.c"),
-                    str(raw / metadata["aot"]["object"]), metadata["aot"]["native_runtime"],
-                    "-I", str(raw), "-isystem", str(cuda / "include"),
+                    str(paths["object"]), str(paths["native_runtime"]),
+                    "-I", str(paths["header"].parent), "-isystem", str(cuda / "include"),
                     "-L", str(cuda / "lib64"), "-Wl,-rpath," + str(cuda / "lib64"),
                     "-lcudart", "-lcuda", "-ldl", "-lpthread", "-lstdc++", "-o", str(library)], check=True)
 
@@ -80,7 +72,7 @@ def main() -> None:
                 raise ContractError(f"upstream in-place launch failed: {rc}")
             torch.cuda.synchronize()
             outputs.append(output.cpu())
-            if first_state is None:
+            if len(chunks) > 1 and first_state is None:
                 first_state = state.transpose(-1, -2).contiguous().cpu()
             start += count
         return torch.cat(outputs), state.transpose(-1, -2).contiguous().cpu(), first_state
@@ -114,7 +106,7 @@ def main() -> None:
     write_json(root / "reference.json", {
         "seed": 691, "tokens": [1, 63, 64, 65, 128], "continuation": [64, 64],
         "comparison": {"atol": 0, "rtol": 0, "output": "full", "state": "full"},
-        "patched": candidate, "upstream": metadata,
+        "patched": candidate, "upstream": provenance,
         "adapter_sha256": sha256_file(tools / "upstream_adapter.c"),
     })
     print(f"upstream HVK reference ready for production HKV Rust gate: {root}")

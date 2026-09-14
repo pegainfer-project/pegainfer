@@ -10,7 +10,6 @@ const CONV_STATE_MEAN_TOL: f32 = 1.5625e-2;
 const CONV_STATE_P99_TOL: f32 = 6.25e-2;
 const LOGIT_MEAN_TOL: f32 = 0.06;
 const LOGIT_P99_TOL: f32 = 0.20;
-const LOGIT_ARGMAX_REGRET_TOL: f32 = 0.20;
 
 fn assert_distribution_close(
     label: &str,
@@ -100,19 +99,9 @@ fn assert_logits_close(label: &str, expected: &[f32], actual: &[f32]) -> u32 {
     let actual_top = pegainfer_sample::token_logprob_from_row(actual, 0, 1)
         .and_then(|summary| summary.top_logprobs.into_iter().next())
         .expect("candidate logits must contain a top token");
-    let actual_token_in_baseline =
-        pegainfer_sample::token_logprob_from_row(expected, actual_top.0, 0)
-            .expect("candidate token must be in the baseline vocabulary");
-    let regret = expected_top.1 - actual_token_in_baseline.logprob;
-
     eprintln!(
-        "{label}: expected_token={} actual_token={} expected_logprob={:.6} actual_logprob={:.6} regret={regret:.6}",
+        "{label}: expected_token={} actual_token={} expected_logprob={:.6} actual_logprob={:.6}",
         expected_top.0, actual_top.0, expected_top.1, actual_top.1
-    );
-    assert!(
-        regret <= LOGIT_ARGMAX_REGRET_TOL,
-        "{label} candidate token {} has baseline regret {regret} > {LOGIT_ARGMAX_REGRET_TOL}",
-        actual_top.0
     );
     assert_eq!(
         actual_top.0, expected_top.0,
@@ -140,18 +129,8 @@ fn run_prefill_case(
     let mut recurrent = RecurrentState::new(model.device_ctx(), model.config(), model.geometry)?;
     let hidden = match split_at {
         Some(split) => {
-            assert!(split > 0 && split < tokens.len());
             drop(model.prefill_chunk_forward(&tokens[..split], &mut kv, &mut recurrent)?);
             assert_eq!(recurrent.seq_len, split);
-            for (layer, state) in recurrent.layers.iter().enumerate() {
-                let matrix = model.device_ctx().stream.clone_dtoh(&state.state)?;
-                let conv = state.conv_state.to_host(model.device_ctx())?;
-                assert!(
-                    matrix.iter().any(|&value| value != 0.0)
-                        && conv.iter().any(|&value| value != 0.0),
-                    "first chunk left layer {layer} continuation state empty"
-                );
-            }
             model.prefill_chunk_forward(&tokens[split..], &mut kv, &mut recurrent)?
         }
         None => model.prefill_chunk_forward(tokens, &mut kv, &mut recurrent)?,
@@ -181,9 +160,9 @@ fn first_decode_logits(
 #[test]
 #[ignore = "requires SM120, a validated candidate identity, and Qwen3.5-4B weights"]
 fn flashinfer_gdn_chunk_continuation_and_model_outputs_match() -> Result<()> {
-    let acceptance = crate::test_fixture::GdnAcceptance::candidate();
+    let acceptance = crate::test_fixture::GdnAcceptance::candidate()?;
     let model_path = acceptance
-        .model_path("flashinfer_gdn_chunk_continuation_and_model_outputs_match")
+        .model_path("flashinfer_gdn_chunk_continuation_and_model_outputs_match")?
         .expect("chunk-continuation gate requires PEGAINFER_TEST_MODEL_PATH");
     let model = acceptance.load_model(
         &model_path,

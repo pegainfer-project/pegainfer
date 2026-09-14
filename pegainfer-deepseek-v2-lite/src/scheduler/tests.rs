@@ -30,8 +30,8 @@ fn request(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         },
         token_rx,
     )
@@ -82,7 +82,7 @@ fn admission_rejects_unsupported_shapes() {
     ));
 
     let (mut logprobs, _rx) = request("logprobs", 1, 1);
-    logprobs.logprobs = 1;
+    logprobs.logprobs = Some(1);
     assert!(matches!(
         admission_decision(&logprobs, context),
         AdmissionDecision::Reject(message) if message.contains("logprobs")
@@ -147,7 +147,7 @@ fn terminal_requests_do_not_wait_for_active_capacity() {
     let mut pending = VecDeque::new();
     pending.push_back(request("zero", 2, 0).0);
     let (mut invalid, _rx) = request("invalid", 2, 1);
-    invalid.logprobs = 1;
+    invalid.logprobs = Some(1);
     pending.push_back(invalid);
     pending.push_back(request("valid", 2, 1).0);
 
@@ -166,7 +166,7 @@ fn terminal_requests_do_not_wait_for_active_capacity() {
 fn invalid_request_does_not_block_later_admission_when_cap_has_room() {
     let mut pending = VecDeque::new();
     let (mut invalid, _rx) = request("invalid", 2, 1);
-    invalid.logprobs = 1;
+    invalid.logprobs = Some(1);
     pending.push_back(invalid);
     pending.push_back(request("valid", 2, 1).0);
 
@@ -181,10 +181,8 @@ fn invalid_request_does_not_block_later_admission_when_cap_has_room() {
 
 #[test]
 fn terminal_admission_events_keep_scheduler_contract() {
-    let (mut zero, mut zero_rx) = request("zero", 2, 0);
-    zero.echo = true;
+    let (zero, mut zero_rx) = request("zero", 2, 0);
     assert!(send_scheduled(&zero).is_ok());
-    assert!(send_prompt_echo(&zero));
     let _ = zero.token_tx.send(TokenEvent::Finished {
         finish_reason: FinishReason::Length,
         prompt_tokens: zero.prompt_tokens.len(),
@@ -194,10 +192,6 @@ fn terminal_admission_events_keep_scheduler_contract() {
     assert!(matches!(
         recv_event(&mut zero_rx),
         TokenEvent::Scheduled { .. }
-    ));
-    assert!(matches!(
-        recv_event(&mut zero_rx),
-        TokenEvent::PromptTokens { ids, .. } if ids == vec![1, 1]
     ));
     assert!(matches!(
         recv_event(&mut zero_rx),
@@ -584,7 +578,9 @@ fn terminal_reason_labels_are_machine_readable() {
         2,
         0,
         FinishReason::Error,
-        Some("DeepSeek-V2-Lite EP=2 mixed serving gate does not return logprobs yet"),
+        Some(
+            "DeepSeek-V2-Lite EP=2 mixed serving gate does not return completion or prompt logprobs yet",
+        ),
     );
     assert_eq!(rejected["terminal_reason"], "rejected");
 

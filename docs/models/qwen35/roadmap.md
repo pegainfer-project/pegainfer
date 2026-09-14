@@ -8,7 +8,7 @@
 > before changing kernels, then keep mixed-load and HTTP lifecycle evidence
 > separate.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-09
 
 Tracking issue: `[Model] Qwen3.5 dense roadmap v2: Stable single-GPU serving`
 (#654). It supersedes #249. Sibling maturity bar:
@@ -47,7 +47,7 @@ out:
 | Fault isolation | Open risk: batch-level execution errors can still fail multiple active requests | #654 |
 | Prefix reuse | Open: bounded joint KV/recurrent/conv snapshot design and implementation | #257 |
 | DFlash | In flight and opt-in: correctness-first work must stay default-off until gates pass | #434, PR #626, #654 |
-| Tensor parallel | Phase 1 complete: eager dense TP2 worker/scheduler execution; Phase 2 still needs mixed-step execution and sharded linear-attention/GDR state. | `docs/models/qwen35/tp-implementation.md`, #446 |
+| Tensor parallel | Done through P2c: eager dense TP2, mixed-step unified execution, sharded linear/GDR state (27B fits 2×48 GB), and decode CUDA Graphs for 4B/9B TP2 (27B group-6 stays eager); remaining: group-6 batch-decode kernels and TP perf gates | `docs/models/qwen35/tp-implementation.md`, #446 |
 
 ## Active Contract
 
@@ -133,8 +133,9 @@ Performance:
 
 ### Later
 
-- TP for a concrete 9B or 27B TP=2 target, then 4B TP only if same-host TP=1 vs
-  TP=2 shows value.
+- TP remaining work: group-6 batch-decode kernels so 27B TP2 can capture
+  decode CUDA Graphs, and TP perf gates (the merged-stack A/B tracked in
+  #1001); see `docs/models/qwen35/tp-implementation.md` Follow-Ups.
 - LoRA with real-adapter logprob parity.
 - Exporter-specific FP8/NVFP4/MXFP4 loading and accuracy lanes.
 - MTP/DSpark under a separate speculative path.

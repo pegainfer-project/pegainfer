@@ -186,7 +186,7 @@ pub(super) struct KimiRankWeightLoadReport {
 /// and how many logprobs to report for it.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct KimiRowOptions {
-    pub(crate) logprobs: usize,
+    pub(crate) logprobs: Option<usize>,
     pub(crate) sampling: pegainfer_frontend::sampler::SamplingParams,
 }
 
@@ -204,7 +204,7 @@ pub(super) struct KimiOneTokenForwardReport {
     pub moe_layers_executed: usize,
     /// Exact log-softmax of the picked token plus the top-K, computed on the
     /// host from the full-vocab logits row. `Some` only when the request
-    /// asked for logprobs (`GenerateRequest::logprobs > 0`); the serving
+    /// asked for logprobs (`GenerateRequest::logprobs` is `Some`); the serving
     /// path never pays for it.
     pub logprob: Option<TokenLogprob>,
 }

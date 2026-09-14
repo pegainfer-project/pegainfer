@@ -1,6 +1,6 @@
 # Qwen3.5 Tensor Parallelism Design
 
-> **TL;DR:** Qwen3.5 TP Phase 2 is two separately delivered correctness milestones: P2a adds eager `RunUnifiedStep` with a shared ordered `RequestId` plan while retaining Phase 1 replicated GDR; P2b shards the head-indexed linear-attention/GDR surface and adds only the hidden all-reduce after local `out_proj`. P2c adds decode CUDA Graphs under TP, gated on the compiled decode GQA group (4B/9B TP2 capture; 27B group-6 stays eager).
+> **TL;DR:** Qwen3.5 tensor parallelism reuses Qwen3's controller/worker TP runtime and stays degree-parametric. Phases 1, 2a, 2b, and 2c are implemented (see `tp-implementation.md` for the landing record, including the rebase onto #870): eager dense TP, TP mixed-step unified execution, sharded linear-attention/GDR state, and decode CUDA Graphs under TP gated on the compiled decode GQA group (4B/9B TP2 capture; 27B group-6 stays eager). Remaining design work: group-6 batch-decode kernels so 27B TP2 can capture, and TP perf gates.
 >
 > **Last touched:** 2026-09
 
@@ -110,7 +110,7 @@ For any candidate `tp`, require:
 - `num_attention_heads % tp == 0`
 - `num_key_value_heads % tp == 0`
 - `intermediate_size % tp == 0`
-- Phase 2 additionally requires `linear_num_key_heads % tp == 0` and `linear_num_value_heads % tp == 0`
+- Phase 2 requires `linear_num_key_heads % tp == 0`; `linear_num_value_heads % tp == 0` then follows from the checkpoint invariant `linear_num_value_heads % linear_num_key_heads == 0`, so no second runtime guard
 
 Full attention local dimensions:
 
@@ -233,7 +233,7 @@ Lifecycle observability, cancellation ordering, fail-closed cleanup, and unified
 
 ## P2b: Local-Head Linear Attention / GDR
 
-P2b converts the 24 linear-attention layers from replicated execution to true TP execution. It additionally requires `linear_num_key_heads % tp == 0` and `linear_num_value_heads % tp == 0`; unsupported degrees and unsupported local kernel shapes fail before model loading.
+P2b converts the 24 linear-attention layers from replicated execution to true TP execution. It requires `linear_num_key_heads % tp == 0` (value-head divisibility follows from the checkpoint invariant `linear_num_value_heads % linear_num_key_heads == 0`); unsupported degrees and unsupported local kernel shapes fail before model loading.
 
 Shard every head-indexed linear-attention/GDR surface by the local key/value-head ranges:
 

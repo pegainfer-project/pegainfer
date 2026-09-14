@@ -1,6 +1,4 @@
 #[cfg(feature = "qwen35")]
-use std::ffi::c_char;
-#[cfg(feature = "qwen35")]
 use std::ffi::c_void;
 
 #[cfg(feature = "qwen35")]
@@ -37,9 +35,28 @@ pub(crate) struct FlashInferGdnPrefillArgs {
 // with Gemma 4 and are declared in `shared.rs`.
 unsafe extern "C" {
     #[cfg(feature = "qwen35")]
-    pub(crate) fn pegainfer_qwen35_gdn_abi_version() -> u32;
+    pub(crate) fn pegainfer_qwen35_decode_gemm_prepare(
+        weights: *const Half,
+        rows: i32,
+        batch: i32,
+        cols: i32,
+        algorithm: *mut u64,
+        stream: CUstream,
+    ) -> i32;
     #[cfg(feature = "qwen35")]
-    pub(crate) fn pegainfer_qwen35_gdn_artifact_sha256() -> *const c_char;
+    pub(crate) fn pegainfer_qwen35_decode_gemm_launch(
+        algorithm: *const u64,
+        weights: *const Half,
+        input: *const Half,
+        output: *mut Half,
+        rows: i32,
+        batch: i32,
+        cols: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    #[cfg(feature = "qwen35")]
+    pub(crate) fn pegainfer_qwen35_gdn_abi_version() -> u32;
     #[cfg(feature = "qwen35")]
     pub(crate) fn pegainfer_qwen35_gdn_aot_available() -> i32;
     #[cfg(feature = "qwen35")]

@@ -30,7 +30,7 @@ use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
 
 /// A contract request with test defaults; adjust fields on the result for
-/// echo/logprobs/LoRA variants.
+/// prompt-logprob/completion-logprob/LoRA variants.
 pub(crate) fn request(
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
@@ -42,8 +42,8 @@ pub(crate) fn request(
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,
-        logprobs: 0,
-        echo: false,
+        logprobs: None,
+        prompt_logprobs: None,
         trace_parent: None,
         client_label: None,
     }

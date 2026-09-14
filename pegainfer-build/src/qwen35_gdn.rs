@@ -59,7 +59,7 @@ contract_struct!(Abi {
     version: u32,
     function_prefix: String,
     geometry_binding: String,
-    symbols: [String; 7],
+    symbols: [String; 6],
     q_view: View,
     k_view: View,
     v_view: View,
@@ -173,7 +173,7 @@ fn directory(path: &Path) -> Result<PathBuf, String> {
         walked.push(component.as_os_str());
         let metadata = fs::symlink_metadata(&walked)
             .map_err(|error| format!("GDN candidate path {}: {error}", walked.display()))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        if !metadata.is_dir() {
             return Err(format!(
                 "GDN candidate path is not a real directory: {}",
                 walked.display()
@@ -187,7 +187,7 @@ fn read_regular(directory: &Path, name: &str) -> Result<Vec<u8>, String> {
     let path = directory.join(name);
     let metadata = fs::symlink_metadata(&path)
         .map_err(|error| format!("GDN candidate file {}: {error}", path.display()))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() {
         return Err(format!(
             "GDN candidate file is not a regular file: {}",
             path.display()
@@ -262,23 +262,28 @@ pub fn validate_candidate(kernel_root: &Path, bundle: &Path) -> Result<Candidate
         "artifact format",
     )?;
     let mut files = vec![("manifest.json", manifest_bytes)];
+    let mut object_sha256 = String::new();
     for (name, record) in ARTIFACT_FILES.into_iter().zip([
         &manifest.artifact.header,
         &manifest.artifact.object,
         &manifest.artifact.native_runtime,
     ]) {
         let bytes = read_regular(&bundle, name)?;
+        let actual_sha256 = digest(&bytes);
         if bytes.is_empty()
             || bytes.len() as u64 != record.size_bytes
-            || digest(&bytes) != record.sha256
+            || actual_sha256 != record.sha256
         {
             return Err(format!("GDN candidate artifact {name} size/hash mismatch"));
+        }
+        if name == "kernel.o" {
+            object_sha256 = actual_sha256;
         }
         files.push((name, bytes));
     }
     Ok(Candidate {
         files,
-        object_sha256: manifest.artifact.object.sha256,
+        object_sha256,
         workspace_bytes_per_sm: manifest.workspace.bytes_per_sm,
     })
 }

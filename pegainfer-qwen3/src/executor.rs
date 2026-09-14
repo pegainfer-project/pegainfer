@@ -49,6 +49,11 @@ use crate::weights::Qwen3Model;
 mod auto_hedge;
 mod dflash_lane;
 mod dflash_prefill;
+mod logprobs;
+use logprobs::DecodeRows;
+use logprobs::PrefillRows;
+use logprobs::build_prefill_request_results;
+use logprobs::gather_decode_logprobs;
 mod remote_fetch;
 use remote_fetch::QueryView;
 use remote_fetch::RemoteFetchAction;
@@ -80,8 +85,11 @@ pub struct PrefillStepItem {
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) max_output_tokens: usize,
     pub(crate) params: SamplingParams,
-    pub(crate) logprobs: usize,
-    pub(crate) echo: bool,
+    /// Completion logprob top-k count (`None` = disabled, `Some(0)` = scored
+    /// token only).
+    pub(crate) logprobs: Option<usize>,
+    /// Prompt logprob top-k count; `Some(_)` needs all-position logits.
+    pub(crate) prompt_logprobs: Option<usize>,
     pub(crate) lora_adapter: Option<String>,
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
@@ -104,8 +112,8 @@ impl PrefillStepItem {
         prompt_tokens: Vec<u32>,
         max_output_tokens: usize,
         params: SamplingParams,
-        logprobs: usize,
-        echo: bool,
+        logprobs: Option<usize>,
+        prompt_logprobs: Option<usize>,
     ) -> Self {
         let chunk_tokens = prompt_tokens.len();
         Self {
@@ -114,7 +122,7 @@ impl PrefillStepItem {
             max_output_tokens,
             params,
             logprobs,
-            echo,
+            prompt_logprobs,
             lora_adapter: None,
             cached_tokens: 0,
             chunk_budget: usize::MAX,
@@ -154,7 +162,7 @@ pub struct DecodeStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) token_id: u32,
     pub(crate) params: SamplingParams,
-    pub(crate) logprobs: usize,
+    pub(crate) logprobs: Option<usize>,
     pub(crate) lora_adapter: Option<String>,
 }
 
@@ -163,7 +171,7 @@ impl DecodeStepItem {
         request_id: RequestId,
         token_id: u32,
         params: SamplingParams,
-        logprobs: usize,
+        logprobs: Option<usize>,
     ) -> Self {
         Self {
             request_id,
@@ -181,131 +189,6 @@ impl DecodeStepItem {
     }
 }
 
-fn gather_decode_logprobs(
-    lane: &LocalQwen3Lane,
-    requests: &[DecodeStepItem],
-    logits: &HiddenStates,
-    row_offset: usize,
-    tokens: &[u32],
-) -> Result<Vec<Option<TokenLogprob>>> {
-    let wanted: Vec<usize> = requests
-        .iter()
-        .enumerate()
-        .filter(|(_, req)| req.logprobs > 0)
-        .map(|(i, _)| i)
-        .collect();
-    let lp_requests: Vec<pegainfer_sample::LogprobRequest> = wanted
-        .iter()
-        .map(|&i| pegainfer_sample::LogprobRequest {
-            row: row_offset + i,
-            picked: tokens[row_offset + i],
-            top_k: requests[i].logprobs,
-        })
-        .collect();
-    let results =
-        pegainfer_sample::token_logprobs_batch(lane.model.device_ctx(), logits, &lp_requests)?;
-    let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; requests.len()];
-    for (i, lp) in wanted.into_iter().zip(results) {
-        logprobs[i] = Some(lp);
-    }
-    Ok(logprobs)
-}
-
-fn build_prefill_request_results(
-    lane: &LocalQwen3Lane,
-    requests: &[PrefillStepItem],
-    logits: &HiddenStates,
-    tokens: &[u32],
-    all_position_logits: Option<&HiddenStates>,
-    compute_prompt_logprobs: bool,
-) -> Result<Vec<PrefillRequestResult>> {
-    let ctx = lane.model.device_ctx();
-
-    let first_token_wanted: Vec<usize> = requests
-        .iter()
-        .enumerate()
-        .filter(|(_, req)| req.is_final_chunk() && req.logprobs > 0)
-        .map(|(i, _)| i)
-        .collect();
-    let first_token_requests: Vec<pegainfer_sample::LogprobRequest> = first_token_wanted
-        .iter()
-        .map(|&i| pegainfer_sample::LogprobRequest {
-            row: i,
-            picked: tokens[i],
-            top_k: requests[i].logprobs,
-        })
-        .collect();
-    let mut first_token_logprobs: Vec<Option<TokenLogprob>> = vec![None; requests.len()];
-    for (i, lp) in first_token_wanted
-        .into_iter()
-        .zip(pegainfer_sample::token_logprobs_batch(
-            ctx,
-            logits,
-            &first_token_requests,
-        )?)
-    {
-        first_token_logprobs[i] = Some(lp);
-    }
-
-    let mut prompt_requests: Vec<pegainfer_sample::LogprobRequest> = Vec::new();
-    if compute_prompt_logprobs && all_position_logits.is_some() {
-        let mut token_offset = 0usize;
-        for req in requests {
-            if req.echo {
-                for j in 1..req.prompt_tokens.len() {
-                    prompt_requests.push(pegainfer_sample::LogprobRequest {
-                        row: token_offset + j - 1,
-                        picked: req.prompt_tokens[j],
-                        top_k: req.logprobs,
-                    });
-                }
-            }
-            token_offset += req.chunk_tokens;
-        }
-    }
-    let mut prompt_results = match all_position_logits {
-        Some(all_logits) if !prompt_requests.is_empty() => Some(
-            pegainfer_sample::token_logprobs_batch(ctx, all_logits, &prompt_requests)?.into_iter(),
-        ),
-        _ => None,
-    };
-
-    let mut outputs = Vec::with_capacity(requests.len());
-    for (i, req) in requests.iter().enumerate() {
-        let completed = req.is_final_chunk();
-        let prompt_logprobs = if req.echo {
-            if compute_prompt_logprobs {
-                let mut echo_logprobs: Vec<Option<TokenLogprob>> =
-                    Vec::with_capacity(req.prompt_tokens.len());
-                echo_logprobs.push(None);
-                match &mut prompt_results {
-                    Some(results) => {
-                        for _ in 1..req.prompt_tokens.len() {
-                            echo_logprobs.push(results.next());
-                        }
-                    }
-                    None => echo_logprobs.resize(req.prompt_tokens.len(), None),
-                }
-                Some(echo_logprobs)
-            } else {
-                Some(vec![None; req.prompt_tokens.len()])
-            }
-        } else {
-            None
-        };
-        outputs.push(PrefillRequestResult {
-            request_id: req.request_id,
-            first_token: tokens[i],
-            first_token_logprob: first_token_logprobs[i].take(),
-            prompt_logprobs,
-            cached_tokens: req.cached_tokens,
-            completed,
-            prefill_pos: req.chunk_start + req.chunk_tokens,
-        });
-    }
-    Ok(outputs)
-}
-
 fn build_decode_request_results(
     lane: &LocalQwen3Lane,
     requests: &[DecodeStepItem],
@@ -313,7 +196,15 @@ fn build_decode_request_results(
     row_offset: usize,
     tokens: &[u32],
 ) -> Result<Vec<DecodeRequestResult>> {
-    let mut logprobs = gather_decode_logprobs(lane, requests, logits, row_offset, tokens)?;
+    let mut logprobs = gather_decode_logprobs(
+        lane.model.device_ctx(),
+        &DecodeRows {
+            requests,
+            logits,
+            tokens,
+            row_offset,
+        },
+    )?;
     Ok(requests
         .iter()
         .enumerate()
@@ -342,7 +233,15 @@ fn build_batch_decode_request_results(
         &mut lane.sample_scratch,
     )?;
 
-    let mut logprobs = gather_decode_logprobs(lane, requests, &lane.bufs.logits, 0, &tokens)?;
+    let mut logprobs = gather_decode_logprobs(
+        lane.model.device_ctx(),
+        &DecodeRows {
+            requests,
+            logits: &lane.bufs.logits,
+            row_offset: 0,
+            tokens: &tokens,
+        },
+    )?;
     Ok(requests
         .iter()
         .enumerate()
@@ -363,7 +262,6 @@ fn execute_step_on_lane(
         StepCommand::Prefill {
             requests,
             kv_views,
-            echo,
             sample_seed,
         } => {
             let prompts: Vec<&[u32]> = requests.iter().map(PrefillStepItem::as_slice).collect();
@@ -383,7 +281,7 @@ fn execute_step_on_lane(
                 &prompts,
                 kv_views,
                 &lora_adapters,
-                *echo,
+                requests.iter().any(|req| req.prompt_logprobs.is_some()),
                 capture_layer_ids.as_deref(),
             )?;
             let dflash_context_captured_requests = lane.record_prefill_dflash_context(
@@ -396,12 +294,13 @@ fn execute_step_on_lane(
                 let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
                 Ok(WorkerStepOutcome::Prefill(PrefillResult {
                     requests: build_prefill_request_results(
-                        lane,
-                        requests,
-                        &logits,
-                        &tokens,
-                        all_position_logits.as_ref(),
-                        *echo,
+                        lane.model.device_ctx(),
+                        &PrefillRows {
+                            requests,
+                            logits: &logits,
+                            tokens: &tokens,
+                            all_position_logits: all_position_logits.as_ref(),
+                        },
                     )?,
                     dflash_context_captured_requests,
                 }))
@@ -472,12 +371,13 @@ fn execute_step_on_lane(
                 let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
                 Ok(WorkerStepOutcome::Unified(UnifiedResult {
                     prefill_requests: build_prefill_request_results(
-                        lane,
-                        prefill_requests,
-                        &logits,
-                        &tokens,
-                        None,
-                        false,
+                        lane.model.device_ctx(),
+                        &PrefillRows {
+                            requests: prefill_requests,
+                            logits: &logits,
+                            tokens: &tokens,
+                            all_position_logits: None,
+                        },
                     )?,
                     decode_requests: build_decode_request_results(
                         lane,
@@ -743,7 +643,7 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
     let ceiling = max_prefill_tokens + (*BATCH_BUCKETS.last().unwrap()).saturating_sub(1);
     // lm_head (vocab×hidden) runs on the sampled-position count, not the token count: decode-only
     // pads to a bucket (≤ max_decode_batch_size) and unified gathers ≤ that many requests, while
-    // echo/all-position runs up to max_prefill_tokens — true max N = max(max_prefill, max_decode_batch).
+    // all-position scoring runs up to max_prefill_tokens — true max N = max(max_prefill, max_decode_batch).
     let lm_head_max_n = max_prefill_tokens.max(*BATCH_BUCKETS.last().unwrap());
     let shapes = crate::batch_decode_buffers::decode_projection_pin_shapes(
         hidden,
@@ -777,7 +677,6 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
 
 pub struct PrefillPlan<'a> {
     pub requests: &'a [PrefillStepItem],
-    pub echo: bool,
     pub sample_seed: u64,
 }
 
@@ -1892,9 +1791,9 @@ impl Qwen3Executor {
                 req.max_output_tokens,
                 req.lora_adapter.as_deref(),
             );
-            // Echo needs logits for every prompt position; cached positions
-            // are never forwarded, so echo requests prefill from scratch.
-            if self.prefix_cache_enabled() && !req.echo {
+            // Prompt scoring needs logits for every prompt position; cached positions
+            // are never forwarded, so prompt-logprob requests prefill from scratch.
+            if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
                 req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
             }
             self.request_kvs.insert(req.request_id, rkv);
@@ -1909,9 +1808,10 @@ impl Qwen3Executor {
             .expect("inserted above");
         req.chunk_start = rkv.kv_position();
         let remaining = req.prompt_tokens.len() - req.chunk_start;
-        // Echo must produce all-position logits in a single forward, so it is
-        // exempt from chunking (the scheduler never splits echo requests).
-        req.chunk_tokens = if req.echo {
+        // Prompt-logprobs requests must produce all-position logits in a
+        // single forward, so they are exempt from chunking (the scheduler
+        // never splits them).
+        req.chunk_tokens = if req.prompt_logprobs.is_some() {
             remaining
         } else {
             remaining.min(req.chunk_budget)
@@ -2615,7 +2515,6 @@ impl ModelExecutor for Qwen3Executor {
         let step = StepCommand::Prefill {
             requests,
             kv_views,
-            echo: plan.echo,
             sample_seed: plan.sample_seed,
         };
         let outcome = self.run_step(&step)?;
@@ -3446,12 +3345,13 @@ impl LocalQwen3Lane {
 
         // Build prefill result
         let results = build_prefill_request_results(
-            self,
-            &state.prefill_requests,
-            &state.prefill_logits,
-            &tokens,
-            None,
-            false,
+            self.model.device_ctx(),
+            &PrefillRows {
+                requests: &state.prefill_requests,
+                logits: &state.prefill_logits,
+                tokens: &tokens,
+                all_position_logits: None,
+            },
         )?;
 
         // Split-concurrent prefill never runs with DFlash (capture needs the
@@ -3495,7 +3395,7 @@ impl LocalQwen3Lane {
         prompts: &[&[u32]],
         kv_views: &[KvView],
         lora_adapters: &[Option<&str>],
-        echo: bool,
+        all_position_logits: bool,
         capture_layer_ids: Option<&[usize]>,
     ) -> Result<(HiddenStates, Option<HiddenStates>, Option<HiddenStates>)> {
         self.model.batch_prefill(
@@ -3504,7 +3404,7 @@ impl LocalQwen3Lane {
             lora_adapters,
             self.kv_buffer.buffer(),
             &self.layout,
-            echo,
+            all_position_logits,
             capture_layer_ids,
         )
     }
@@ -3700,7 +3600,7 @@ impl LocalQwen3Lane {
     /// DFlash verify forward over each request's `block_size`-token span, using
     /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation),
     /// lazily built on first use. Numerically equivalent to the
-    /// `batch_prefill(echo=true)` verify path it replaces.
+    /// `batch_prefill(all_position_logits=true)` verify path it replaces.
     fn execute_dflash_verify(
         &mut self,
         requests: &[VerifyStepItem],
@@ -3871,7 +3771,6 @@ enum StepCommand {
     Prefill {
         requests: Vec<PrefillStepItem>,
         kv_views: Vec<KvView>,
-        echo: bool,
         sample_seed: u64,
     },
     Decode {

@@ -396,7 +396,7 @@ impl KimiRankThreadState {
             picks[sampling_row.row].0 = *token;
         }
 
-        let host_logits = if rows.iter().any(|r| r.logprobs > 0) {
+        let host_logits = if rows.iter().any(|r| r.logprobs.is_some()) {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi logprobs require an unsharded vocab (TP1); a vocab shard's \
@@ -413,11 +413,11 @@ impl KimiRankThreadState {
         };
         let mut reports = Vec::with_capacity(active_len);
         for (row, (local_next, local_top_logit_f32)) in picks.into_iter().enumerate() {
-            let logprob = match &host_logits {
-                Some(host) if rows[row].logprobs > 0 => pegainfer_sample::token_logprob_from_row(
+            let logprob = match (&host_logits, rows[row].logprobs) {
+                (Some(host), Some(top_k)) => pegainfer_sample::token_logprob_from_row(
                     &host[row * cache.vocab_rows..(row + 1) * cache.vocab_rows],
                     local_next,
-                    rows[row].logprobs,
+                    top_k,
                 ),
                 _ => None,
             };
@@ -651,7 +651,7 @@ impl KimiRankThreadState {
             .with_context(|| format!("Kimi rank {rank} prefill sampling"))?;
             local_next = sampled[0];
         }
-        let logprob = if row.logprobs > 0 {
+        let logprob = if let Some(top_k) = row.logprobs {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi logprobs require an unsharded vocab (TP1); a vocab \
@@ -661,7 +661,7 @@ impl KimiRankThreadState {
                 .stream
                 .clone_dtoh(&logits.data)
                 .with_context(|| format!("Kimi rank {rank} D2H prefill logits"))?;
-            pegainfer_sample::token_logprob_from_row(&host, local_next, row.logprobs)
+            pegainfer_sample::token_logprob_from_row(&host, local_next, top_k)
         } else {
             None
         };

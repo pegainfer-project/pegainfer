@@ -116,13 +116,11 @@ fn resolve_prefill_outputs(
             continue;
         }
 
-        if req.echo {
+        if let Some(logprobs) = result.prompt_logprobs {
             effects.prompt_echoes.push(PromptEchoEffect {
                 request_id: req.request_id,
                 ids: req.prompt_tokens.clone(),
-                logprobs: result
-                    .prompt_logprobs
-                    .unwrap_or_else(|| vec![None; req.prompt_tokens.len()]),
+                logprobs,
             });
         }
 

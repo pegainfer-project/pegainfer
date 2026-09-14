@@ -1,11 +1,16 @@
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use anyhow::ensure;
+use vllm_engine_core_client::protocol::logprobs::Logprobs;
+use vllm_engine_core_client::protocol::logprobs::MaybeWireLogprobs;
 use vllm_engine_core_client::protocol::logprobs::PositionLogprobs;
 use vllm_engine_core_client::protocol::logprobs::TokenLogprob as WireTokenLogprob;
 use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
 use crate::engine::FinishReason;
+use crate::engine::PromptEcho;
 use crate::engine::TokenLogprob;
 use crate::sampler::SamplingParams;
 
@@ -17,14 +22,10 @@ pub(crate) fn to_wire_position_logprobs(
 ) -> Option<PositionLogprobs> {
     let lp = logprob?;
     let mut entries = Vec::with_capacity(1 + lp.top_logprobs.len());
-    // pegainfer-core does not currently expose the sampled token's vocab rank.
-    // rank: 1 is correct for greedy sampling, where the sampled token is top-1,
-    // and is a lossy placeholder for non-greedy sampling.
-    // See discussion on PR #96.
     entries.push(WireTokenLogprob {
         token_id,
         logprob: lp.logprob,
-        rank: 1,
+        rank: lp.rank,
     });
     for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
         if alt_id == token_id {
@@ -37,6 +38,40 @@ pub(crate) fn to_wire_position_logprobs(
         });
     }
     Some(PositionLogprobs { entries })
+}
+
+/// The engine includes the unscored leading token; vLLM restores it itself.
+/// Never drop a missing scored position: every following offset would shift.
+pub(crate) fn to_wire_prompt_logprobs(prompt: PromptEcho) -> Result<Option<MaybeWireLogprobs>> {
+    ensure!(
+        !prompt.ids.is_empty(),
+        "prompt logprobs contain an empty prompt"
+    );
+    ensure!(
+        prompt.ids.len() == prompt.logprobs.len(),
+        "prompt logprobs length mismatch: {} tokens, {} scores",
+        prompt.ids.len(),
+        prompt.logprobs.len()
+    );
+    ensure!(
+        prompt.logprobs[0].is_none(),
+        "the first prompt token must have no logprob"
+    );
+    if prompt.ids.len() == 1 {
+        return Ok(None);
+    }
+    let positions = prompt
+        .ids
+        .into_iter()
+        .zip(prompt.logprobs)
+        .enumerate()
+        .skip(1)
+        .map(|(index, (id, logprob))| {
+            to_wire_position_logprobs(id, logprob)
+                .with_context(|| format!("missing prompt logprob at position {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(MaybeWireLogprobs::Direct(Logprobs { positions })))
 }
 
 pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingParams {
@@ -84,6 +119,12 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
 /// carrying 1.0000001 wants a penalty and must be rejected, not rounded away.
 #[allow(clippy::float_cmp)]
 pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> Option<String> {
+    // Engine-core clients may bypass HTTP validation; reject before converting to usize.
+    if params.logprobs.is_some_and(|count| count < 0)
+        || params.prompt_logprobs.is_some_and(|count| count < 0)
+    {
+        return Some("negative logprob counts are not supported".into());
+    }
     if !(0.0..1.0).contains(&params.min_p) || !params.min_p.is_finite() {
         return Some(format!("min_p {} outside [0, 1)", params.min_p));
     }
@@ -131,11 +172,12 @@ pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> O
     None
 }
 
-pub(crate) fn requested_logprobs(params: &EngineCoreSamplingParams) -> usize {
-    params
-        .logprobs
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(0)
+pub(crate) fn requested_logprobs(params: &EngineCoreSamplingParams) -> Option<usize> {
+    params.logprobs.map(|count| count as usize)
+}
+
+pub(crate) fn requested_prompt_logprobs(params: &EngineCoreSamplingParams) -> Option<usize> {
+    params.prompt_logprobs.map(|count| count as usize)
 }
 
 pub(crate) fn lora_adapter_from_sampling_params(
@@ -294,6 +336,7 @@ mod tests {
     #[test]
     fn to_wire_logprobs_emits_sampled_then_alternatives() {
         let lp = TokenLogprob {
+            rank: 1,
             logprob: -0.5,
             top_logprobs: vec![(7, -0.5), (42, -1.5)],
         };
@@ -316,6 +359,7 @@ mod tests {
     #[test]
     fn to_wire_logprobs_keeps_distinct_top_k_alternatives() {
         let lp = TokenLogprob {
+            rank: 1,
             logprob: -0.5,
             top_logprobs: vec![(8, -1.0), (9, -1.5)],
         };
@@ -336,5 +380,62 @@ mod tests {
         assert_eq!(entries[2].token_id, 9);
         assert_logprob_eq(entries[2].logprob, -1.5);
         assert_eq!(entries[2].rank, 2);
+    }
+
+    fn score() -> TokenLogprob {
+        TokenLogprob {
+            rank: 1,
+            logprob: -0.5,
+            top_logprobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prompt_payload_keeps_scored_positions_and_zero_top_k() {
+        let prompt = PromptEcho {
+            ids: vec![9, 8, 7],
+            logprobs: vec![None, Some(score()), Some(score())],
+        };
+        let Some(MaybeWireLogprobs::Direct(payload)) = to_wire_prompt_logprobs(prompt).unwrap()
+        else {
+            panic!("expected direct prompt logprobs");
+        };
+        let scored: Vec<_> = payload
+            .positions
+            .iter()
+            .map(|p| {
+                assert_eq!(p.entries.len(), 1);
+                p.entries[0].token_id
+            })
+            .collect();
+        assert_eq!(scored, vec![8, 7]);
+    }
+
+    #[test]
+    fn malformed_prompt_scores_are_errors_instead_of_shorter_payloads() {
+        for prompt in [
+            PromptEcho {
+                ids: vec![],
+                logprobs: vec![],
+            },
+            PromptEcho {
+                ids: vec![9, 8],
+                logprobs: vec![None],
+            },
+            PromptEcho {
+                ids: vec![9, 8],
+                logprobs: vec![None, Some(score()), Some(score())],
+            },
+            PromptEcho {
+                ids: vec![9, 8, 7],
+                logprobs: vec![None, None, Some(score())],
+            },
+            PromptEcho {
+                ids: vec![9, 8],
+                logprobs: vec![Some(score()), Some(score())],
+            },
+        ] {
+            assert!(to_wire_prompt_logprobs(prompt).is_err());
+        }
     }
 }

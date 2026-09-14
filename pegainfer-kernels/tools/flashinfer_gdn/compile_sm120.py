@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AOT-export the production FlashInfer GDN specialization to a C header/object."""
+"""Generate the final production FlashInfer GDN SM120 AOT bundle."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ import importlib.metadata
 import json
 import re
 import sys
+import tempfile
+import subprocess
 import types
 from pathlib import Path
 
@@ -16,13 +18,17 @@ from artifact_contract import (
     FORBIDDEN_TMA_CLUSTER_LOAD,
     FROZEN_CONTRACT,
     GEOMETRY,
+    ARTIFACT_FILES,
+    PINNED_TOOLCHAIN,
+    ContractError,
+    build_manifest,
+    prepare_flashinfer_source,
+    validate_manifest,
     TARGET_ARCH,
     VARIANT,
     _COMPILER_PATH,
     _REQUIREMENTS_LOCK_PATH,
-    inspect_kernel_source,
     sha256_file,
-    verify_flashinfer_base,
     write_json,
 )
 
@@ -67,8 +73,7 @@ def find_static_cuda_dialect_runtime() -> Path:
         for entry in sys.path
         if entry and ("site-packages" in entry or "dist-packages" in entry)
     }
-    # Stay inside the installed wheel/package tree. `Path.parents` eventually
-    # reaches `/`; recursively globbing that root made generation appear hung.
+    # Restrict runtime discovery to the installed wheel/package trees.
     roots.update((cutlass_file.parent, cutlass_file.parent.parent))
     matches: list[Path] = []
     for root in roots:
@@ -193,60 +198,85 @@ def compile_kernel(flashinfer_dir: Path) -> tuple[object, str]:
     return compiled, ptx
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--upstream-layout", action="store_true", help="generation-only HVK oracle")
-    parser.add_argument("--flashinfer-dir", required=True, type=Path)
-    parser.add_argument("--base-flashinfer-dir", required=True, type=Path)
-    parser.add_argument("--aot-out", required=True, type=Path)
-    parser.add_argument("--metadata-out", required=True, type=Path)
-    args = parser.parse_args()
-
-    commit = verify_flashinfer_base(args.base_flashinfer_dir)
-    source = inspect_kernel_source(
-        args.flashinfer_dir, commit, upstream_layout=args.upstream_layout
-    )
-    compiled, ptx = compile_kernel(args.flashinfer_dir.resolve())
-    prefix = ("pegainfer_qwen35_gdn_upstream_hvk" if args.upstream_layout
+def export_kernel(
+    flashinfer_dir: Path, work: Path, *, upstream_layout: bool = False
+) -> tuple[dict[str, Path], dict]:
+    source_dir = work / "source"
+    source = prepare_flashinfer_source(flashinfer_dir, source_dir, upstream_layout=upstream_layout)
+    compiled, ptx = compile_kernel(source_dir)
+    toolchain = {
+        "python": sys.version.split()[0],
+        **ptx_metadata(ptx),
+        "cutlass_dsl": package_version("nvidia-cutlass-dsl"),
+        "cutlass_dsl_libs_base": package_version("nvidia-cutlass-dsl-libs-base"),
+        "torch": package_version("torch"),
+        "cuda_python": package_version("cuda-python"),
+        "cuda_bindings": package_version("cuda-bindings"),
+        "cuda_pathfinder": package_version("cuda-pathfinder"),
+    }
+    if toolchain != PINNED_TOOLCHAIN:
+        raise ContractError(f"generation toolchain mismatch: expected {PINNED_TOOLCHAIN}, got {toolchain}")
+    prefix = ("pegainfer_qwen35_gdn_upstream_hvk" if upstream_layout
               else FROZEN_CONTRACT["abi"]["function_prefix"])
-    args.aot_out.mkdir(parents=True, exist_ok=True)
-    compiled.export_to_c(str(args.aot_out), prefix, prefix)
-    header = args.aot_out / f"{prefix}.h"
-    object_file = args.aot_out / f"{prefix}.o"
-    if not header.is_file() or not object_file.is_file():
-        raise RuntimeError("CuTe export_to_c did not produce the expected .h/.o pair")
-    runtime_archive = find_static_cuda_dialect_runtime()
-    metadata = {
-        "flashinfer_commit": source["flashinfer_commit"],
-        "kernel_source_sha256": source["kernel_source_sha256"],
-        "source_lock_sha256": source["source_lock_sha256"],
+    raw = work / "aot"
+    raw.mkdir()
+    compiled.export_to_c(str(raw), prefix, prefix)
+    paths = {
+        "header": raw / f"{prefix}.h",
+        "object": raw / f"{prefix}.o",
+        "native_runtime": find_static_cuda_dialect_runtime(),
+    }
+    for name, path in paths.items():
+        if not path.is_file() or not path.stat().st_size:
+            raise ContractError(f"missing or empty AOT {name}: {path}")
+    provenance = {
+        **source,
         "generator_sha256": sha256_file(_COMPILER_PATH),
         "requirements_lock_sha256": sha256_file(_REQUIREMENTS_LOCK_PATH),
-        "toolchain": {
-            "python": sys.version.split()[0],
-            **ptx_metadata(ptx),
-            "cutlass_dsl": package_version("nvidia-cutlass-dsl"),
-            "cutlass_dsl_libs_base": package_version("nvidia-cutlass-dsl-libs-base"),
-            "torch": package_version("torch"),
-            "cuda_python": package_version("cuda-python"),
-            "cuda_bindings": package_version("cuda-bindings"),
-            "cuda_pathfinder": package_version("cuda-pathfinder"),
-        },
+        "toolchain": toolchain,
         "aot": {
             "function_prefix": prefix,
-            "header": header.name,
-            "header_sha256": sha256_file(header),
-            "header_size_bytes": header.stat().st_size,
-            "object": object_file.name,
-            "object_sha256": sha256_file(object_file),
-            "object_size_bytes": object_file.stat().st_size,
-            "native_runtime": str(runtime_archive),
-            "native_runtime_sha256": sha256_file(runtime_archive),
-            "native_runtime_size_bytes": runtime_archive.stat().st_size,
+            **{name: {"sha256": sha256_file(path), "size_bytes": path.stat().st_size}
+               for name, path in paths.items()},
         },
     }
-    write_json(args.metadata_out, metadata)
-    print(json.dumps({"variant": VARIANT, "aot": str(args.aot_out), "metadata": str(args.metadata_out)}, sort_keys=True))
+    return paths, provenance
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--flashinfer-dir", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    output = args.output.absolute()
+    try:
+        if output.exists() or output.is_symlink():
+            raise ContractError(f"refusing to overwrite existing output directory: {output}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".gdn-aot-", dir=output.parent) as temporary:
+            work = Path(temporary)
+            paths, observed = export_kernel(args.flashinfer_dir.resolve(), work)
+            artifacts = {name: path.read_bytes() for name, path in paths.items()}
+            manifest = build_manifest(artifacts=artifacts, source={
+                key: observed[key]
+                for key in ("flashinfer_commit", "kernel_source_sha256", "source_lock_sha256")
+            })
+            if manifest["artifact"] != {"format": "elf_relocatable_with_embedded_cubin",
+                                        **{name: observed["aot"][name] for name in ARTIFACT_FILES}}:
+                raise ContractError("exported artifacts changed before packaging")
+            staged = work / "candidate"
+            staged.mkdir()
+            for name, filename in ARTIFACT_FILES.items():
+                (staged / filename).write_bytes(artifacts[name])
+            write_json(staged / "manifest.json", manifest)
+            validate_manifest(staged / "manifest.json", flashinfer_dir=args.flashinfer_dir)
+            if output.exists() or output.is_symlink():
+                raise ContractError(f"output appeared during generation: {output}")
+            staged.rename(output)
+    except (RuntimeError, OSError, subprocess.CalledProcessError) as error:
+        print(f"error: generation failed: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps({"candidate": str(output), "variant": VARIANT}, sort_keys=True))
     return 0
 
 

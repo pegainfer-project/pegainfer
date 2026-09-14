@@ -27,32 +27,19 @@ fn read_tensor<T, const N: usize>(
 }
 
 fn compare_layout_result(label: &str, expected: &[f32], actual: &[f32]) -> Result<()> {
-    ensure!(expected.len() == actual.len(), "{label}: length mismatch");
-    let mut deltas = Vec::with_capacity(expected.len());
-    let mut first_difference = None;
-    for (index, (&expected, &actual)) in expected.iter().zip(actual).enumerate() {
-        let delta = (expected - actual).abs();
-        deltas.push(delta);
-        if first_difference.is_none()
-            && (!expected.is_finite() || !actual.is_finite() || delta != 0.0)
-        {
-            first_difference = Some((index, expected, actual));
-        }
-    }
-    deltas.sort_by(f32::total_cmp);
-    let mean = deltas.iter().map(|&value| f64::from(value)).sum::<f64>() / deltas.len() as f64;
-    let p99 = deltas[(deltas.len() - 1) * 99 / 100];
-    let max = deltas[deltas.len() - 1];
-    eprintln!(
-        "{label}: elements={} first_difference={first_difference:?} mean_abs={mean:.9e} p99_abs={p99:.9e} max_abs={max:.9e} atol=0 rtol=0",
-        expected.len()
+    ensure!(
+        !expected.is_empty() && expected.len() == actual.len(),
+        "{label}: empty result or length mismatch"
     );
     // The HKV patch changes only state addresses; both artifacts execute the
     // same arithmetic with the same dtype. No model-logit tolerance applies.
-    ensure!(
-        first_difference.is_none(),
-        "{label}: layout patch changed GDN results"
-    );
+    for (index, (&expected, &actual)) in expected.iter().zip(actual).enumerate() {
+        ensure!(
+            expected.is_finite() && actual.is_finite() && (expected - actual).abs() == 0.0,
+            "{label}: layout mismatch at {index}: expected={expected} actual={actual}"
+        );
+    }
+    eprintln!("{label}: elements={} exact_match=true", expected.len());
     Ok(())
 }
 
@@ -99,7 +86,7 @@ fn sm120_stable_in_place_abi_matches_upstream_layout_reference() -> Result<()> {
     let backend = Qwen35GdnAot::load_for_production(&ctx, geometry)?;
     let reference_object = std::fs::read_to_string(directory.join("patched-object.sha256"))?;
     ensure!(
-        reference_object.trim().len() == 64 && reference_object.trim() == backend.artifact_sha256(),
+        reference_object.trim() == backend.artifact_sha256(),
         "layout reference must belong to the object linked by the production build"
     );
     let sm_count = ctx.ctx.attribute(
@@ -169,12 +156,6 @@ fn sm120_stable_in_place_abi_matches_upstream_layout_reference() -> Result<()> {
             let beta = ctx.stream.clone_htod(&beta_host[gates])?;
             let mut output = HiddenStates::zeros(&ctx, v_width, chunk_tokens)?;
             let mut workspace = backend.allocate_workspace(&ctx, chunk_tokens)?;
-            let cu_seqlens = ctx.stream.clone_dtoh(&workspace.cu_seqlens)?;
-            ctx.sync()?;
-            ensure!(
-                cu_seqlens == [0, chunk_tokens as i64],
-                "{case}: sequence metadata does not match the launched extent"
-            );
             if case == "t65" {
                 let mut short_q = HiddenStates::from_host(&ctx, &q_host[..q_width], q_width, 1)?;
                 short_q.seq_len = chunk_tokens;

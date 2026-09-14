@@ -19,6 +19,7 @@ fn assert_f32_close_with_stats(
     rtol: f32,
 ) {
     assert_eq!(expected.len(), actual.len(), "{label} length mismatch");
+    assert!(!expected.is_empty(), "{label} must not be empty");
     let mut deltas = Vec::with_capacity(expected.len());
     let mut max_relative = 0.0_f32;
     let mut violation_count = 0usize;
@@ -39,16 +40,9 @@ fn assert_f32_close_with_stats(
         }
     }
     deltas.sort_by(f32::total_cmp);
-    let max = deltas.last().copied().unwrap_or(0.0);
-    let mean = if deltas.is_empty() {
-        0.0
-    } else {
-        deltas.iter().sum::<f32>() / deltas.len() as f32
-    };
-    let p99 = deltas
-        .get(deltas.len().saturating_sub(1) * 99 / 100)
-        .copied()
-        .unwrap_or(0.0);
+    let max = deltas[deltas.len() - 1];
+    let mean = deltas.iter().sum::<f32>() / deltas.len() as f32;
+    let p99 = deltas[(deltas.len() - 1) * 99 / 100];
     eprintln!(
         "{label}: elements={} violations={violation_count} max_abs={max:.8} mean_abs={mean:.8} p99_abs={p99:.8} max_rel={max_relative:.8} atol={atol} rtol={rtol}",
         deltas.len()
@@ -180,31 +174,20 @@ fn test_gdn_native_prepare_matches_cpu_reference_on_finite_inputs() -> Result<()
         let mut v_expected = Vec::with_capacity(tokens * h_v * d);
         for token in 0..tokens {
             let token_qkv = token * qkv_dim;
-            for head in 0..h_q {
-                let input = token_qkv + head * d;
-                let output = (token * h_q + head) * d;
-                let sum_sq = qkv_host[input..input + d]
-                    .iter()
-                    .map(|value| value.to_f32().powi(2))
-                    .sum::<f32>();
-                let inv_norm = (sum_sq + 1.0e-12).sqrt().recip();
-                for lane in 0..d {
-                    q_expected.push(qkv_host[input + lane].to_f32() * inv_norm);
+            for (first_head, heads, expected) in
+                [(0, h_q, &mut q_expected), (h_q, h_k, &mut k_expected)]
+            {
+                for head in 0..heads {
+                    let input = token_qkv + (first_head + head) * d;
+                    let sum_sq = qkv_host[input..input + d]
+                        .iter()
+                        .map(|value| value.to_f32().powi(2))
+                        .sum::<f32>();
+                    let inv_norm = (sum_sq + 1.0e-12).sqrt().recip();
+                    for lane in 0..d {
+                        expected.push(qkv_host[input + lane].to_f32() * inv_norm);
+                    }
                 }
-                debug_assert_eq!(q_expected.len(), output + d);
-            }
-            for head in 0..h_k {
-                let input = token_qkv + h_q * d + head * d;
-                let output = (token * h_k + head) * d;
-                let sum_sq = qkv_host[input..input + d]
-                    .iter()
-                    .map(|value| value.to_f32().powi(2))
-                    .sum::<f32>();
-                let inv_norm = (sum_sq + 1.0e-12).sqrt().recip();
-                for lane in 0..d {
-                    k_expected.push(qkv_host[input + lane].to_f32() * inv_norm);
-                }
-                debug_assert_eq!(k_expected.len(), output + d);
             }
             let v_input = token_qkv + (h_q + h_k) * d;
             v_expected.extend_from_slice(&qkv_host[v_input..v_input + h_v * d]);

@@ -64,6 +64,7 @@ use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
 use crate::vllm::wire::lora_adapter_from_sampling_params;
 use crate::vllm::wire::requested_logprobs;
+use crate::vllm::wire::requested_prompt_logprobs;
 use crate::vllm::wire::to_wire_position_logprobs;
 
 pub(crate) struct LocalEngineBridge {
@@ -338,7 +339,7 @@ impl LocalEngineBridge {
                 kv_transfer_params,
                 token_tx,
                 logprobs: requested_logprobs(&sampling_params),
-                echo: false,
+                prompt_logprobs: requested_prompt_logprobs(&sampling_params),
             })
             .context("failed to submit request to scheduler")?;
 
@@ -523,7 +524,7 @@ fn reduce_request(
                 }
             }
             TokenEvent::PromptTokens { .. } => {
-                // Prompt logprobs are intentionally deferred for this bridge.
+                // Legacy model lines reject prompt-logprob requests at admission.
             }
             TokenEvent::KvTransfer { params } => {
                 state.kv_transfer_params = Some(params);

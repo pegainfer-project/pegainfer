@@ -41,8 +41,8 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>, params: SamplingPara
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 

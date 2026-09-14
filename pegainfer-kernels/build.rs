@@ -61,9 +61,8 @@ fn build_qwen35_flashinfer_gdn_aot(
     let mut includes = vec![root.join("csrc/qwen35"), out_dir.to_path_buf()];
     let mut linked_objects = Vec::new();
     let mut runtime_dir = None;
-    let mut config = String::from(
-        "#pragma once\n#define PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256 \"unavailable\"\n",
-    );
+    let mut config = String::from("#pragma once\n");
+    let mut identity = String::from("const ARTIFACT_IDENTITY: Option<ArtifactIdentity> = None;\n");
 
     if let Some(bundle) = std::env::var_os(QWEN35_GDN_AOT_ENV) {
         let bundle = PathBuf::from(bundle);
@@ -85,18 +84,24 @@ fn build_qwen35_flashinfer_gdn_aot(
             fs::write(linked_bundle.join(name), bytes).expect("stage verified GDN candidate bytes");
         }
         // Validate the final inputs too, before any compiler or linker sees them.
-        pegainfer_build::qwen35_gdn::validate_candidate(root, &linked_bundle)
+        let linked = pegainfer_build::qwen35_gdn::validate_candidate(root, &linked_bundle)
             .unwrap_or_else(|error| panic!("{error}"));
-        let object_hash = candidate.object_sha256;
-        let workspace_bytes_per_sm = candidate.workspace_bytes_per_sm;
+        let object_hash = linked.object_sha256;
+        let workspace_bytes_per_sm = linked.workspace_bytes_per_sm;
+        identity = format!(
+            "const ARTIFACT_IDENTITY: Option<ArtifactIdentity> = Some(ArtifactIdentity(\"{object_hash}\"));\n"
+        );
         config = format!(
-            "#pragma once\n#define PEGAINFER_QWEN35_GDN_ARTIFACT_SHA256 \"{object_hash}\"\n#define PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM {workspace_bytes_per_sm}u\n"
+            "#pragma once\n#define PEGAINFER_QWEN35_GDN_WORKSPACE_BYTES_PER_SM {workspace_bytes_per_sm}u\n"
         );
         linked_objects.push(linked_bundle.join("kernel.o"));
         includes.push(linked_bundle.clone());
         runtime_dir = Some(linked_bundle);
     }
     fs::write(&config_header, config).expect("write GDN AOT build config");
+    // OUT_DIR survives rebuilds, including removal of the candidate environment variable.
+    fs::write(out_dir.join("qwen35_gdn_identity.rs"), identity)
+        .expect("write GDN artifact identity");
 
     let shim_obj = out_dir.join("qwen35_flashinfer_gdn_aot.o");
     let compiler = cc::Build::new().get_compiler();
@@ -2121,6 +2126,9 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
+        if qwen35_enabled && stem == "linear" {
+            nvcc_args.push("-DPEGAINFER_QWEN35".to_string());
+        }
         if stem == "glm52_fp8_gemm" {
             if let Some(args) = glm52_fp8_gemm_arch_args(&nvcc_sm_targets, &nvcc) {
                 nvcc_args.extend(args);
@@ -2574,7 +2582,14 @@ fn main() {
     let kernel_lab_objs = obj_files.clone();
 
     let cuda_lib = out_dir.join("libkernels_cuda.a");
-    let _ = fs::remove_file(&cuda_lib);
+    match fs::remove_file(&cuda_lib) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "cannot remove stale CUDA archive {}: {error}",
+            cuda_lib.display()
+        ),
+    }
     let mut ar_args = vec!["rcs".to_string(), cuda_lib.to_string_lossy().to_string()];
     ar_args.extend(
         obj_files

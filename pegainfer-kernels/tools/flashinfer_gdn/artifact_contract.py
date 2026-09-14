@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare, package, and validate the single production GDN AOT candidate."""
+"""Prepare and validate the single production GDN AOT candidate."""
 
 from __future__ import annotations
 
@@ -112,26 +112,11 @@ def verify_flashinfer_base(flashinfer_dir: Path) -> str:
     return commit
 
 
-def inspect_kernel_source(source_dir: Path, commit: str, *, upstream_layout: bool = False) -> dict[str, Any]:
-    kernel_path = source_dir / KERNEL_SOURCE
-    if not kernel_path.is_file():
-        raise ContractError(f"patched GDN kernel is missing: {kernel_path}")
-    lock, source_lock_sha256 = load_source_lock()
-    kernel_sha256 = sha256_file(kernel_path)
-    expected_hash = lock["upstream_export_kernel_sha256" if upstream_layout else "patched_kernel_sha256"]
-    _require_equal(kernel_sha256, expected_hash, "GDN kernel source hash")
-    return {
-        "flashinfer_commit": commit,
-        "kernel_source_sha256": kernel_sha256,
-        "source_lock_sha256": source_lock_sha256,
-    }
-
-
 def prepare_flashinfer_source(
     flashinfer_dir: Path, destination: Path, *, upstream_layout: bool = False
 ) -> dict[str, Any]:
     commit = verify_flashinfer_base(flashinfer_dir)
-    lock, _ = load_source_lock()
+    lock, source_lock_sha256 = load_source_lock()
     if destination.exists():
         raise ContractError(f"refusing to overwrite prepared source: {destination}")
     shutil.copytree(flashinfer_dir / "flashinfer", destination / "flashinfer")
@@ -154,49 +139,22 @@ def prepare_flashinfer_source(
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
             raise ContractError(f"failed to apply HKV patch: {detail}")
-    return inspect_kernel_source(destination, commit, upstream_layout=upstream_layout)
+    kernel_path = destination / KERNEL_SOURCE
+    if not kernel_path.is_file():
+        raise ContractError(f"patched GDN kernel is missing: {kernel_path}")
+    kernel_sha256 = sha256_file(kernel_path)
+    expected_hash = lock["upstream_export_kernel_sha256" if upstream_layout else "patched_kernel_sha256"]
+    _require_equal(kernel_sha256, expected_hash, "GDN kernel source hash")
+    return {
+        "flashinfer_commit": commit,
+        "kernel_source_sha256": kernel_sha256,
+        "source_lock_sha256": source_lock_sha256,
+    }
 
 
 def _require_equal(actual: Any, expected: Any, label: str) -> None:
     if actual != expected:
         raise ContractError(f"{label} mismatch: expected {expected!r}, got {actual!r}")
-
-
-def validate_compile_metadata(
-    metadata: dict[str, Any], source: dict[str, Any]
-) -> None:
-    _require_equal(
-        set(metadata),
-        {
-            "flashinfer_commit",
-            "kernel_source_sha256",
-            "source_lock_sha256",
-            "generator_sha256",
-            "requirements_lock_sha256",
-            "toolchain",
-            "aot",
-        },
-        "compile metadata keys",
-    )
-    for key in ("flashinfer_commit", "kernel_source_sha256", "source_lock_sha256"):
-        _require_equal(metadata.get(key), source[key], f"compile metadata {key}")
-    _require_equal(
-        metadata.get("generator_sha256"),
-        sha256_file(_COMPILER_PATH),
-        "compile metadata generator hash",
-    )
-    _require_equal(
-        metadata.get("requirements_lock_sha256"),
-        sha256_file(_REQUIREMENTS_LOCK_PATH),
-        "compile metadata requirements lock hash",
-    )
-    aot = metadata.get("aot")
-    if not isinstance(aot, dict):
-        raise ContractError("compile metadata is missing AOT export metadata")
-    toolchain = metadata.get("toolchain")
-    if not isinstance(toolchain, dict):
-        raise ContractError("compile metadata is missing toolchain")
-    _require_equal(toolchain, PINNED_TOOLCHAIN, "compile metadata toolchain")
 
 
 def build_manifest(
@@ -219,47 +177,6 @@ def build_manifest(
             },
         },
     }
-
-
-def package_candidate(
-    *,
-    raw_aot_dir: Path,
-    compile_metadata_path: Path,
-    output_dir: Path,
-    source: dict[str, Any],
-) -> None:
-    if output_dir.exists():
-        raise ContractError(f"refusing to overwrite existing output directory: {output_dir}")
-    metadata = read_json(compile_metadata_path)
-    validate_compile_metadata(metadata, source)
-
-    aot = metadata["aot"]
-    _require_equal(
-        aot["function_prefix"], FROZEN_CONTRACT["abi"]["function_prefix"],
-        "generated function prefix",
-    )
-    paths = {
-        "header": raw_aot_dir / aot["header"],
-        "object": raw_aot_dir / aot["object"],
-        "native_runtime": Path(aot["native_runtime"]),
-    }
-    artifacts = {}
-    for name, path in paths.items():
-        if not path.is_file():
-            raise ContractError(f"AOT {name} is missing: {path}")
-        artifacts[name] = path.read_bytes()
-    manifest = build_manifest(artifacts=artifacts, source=source)
-    for name in ARTIFACT_FILES:
-        for field in ("sha256", "size_bytes"):
-            _require_equal(
-                aot[f"{name}_{field}"], manifest["artifact"][name][field],
-                f"AOT {name} {field}",
-            )
-
-    output_dir.mkdir(parents=True)
-    for name, filename in ARTIFACT_FILES.items():
-        (output_dir / filename).write_bytes(artifacts[name])
-    write_json(output_dir / "manifest.json", manifest)
 
 
 def validate_manifest(

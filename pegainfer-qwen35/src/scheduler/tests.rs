@@ -29,8 +29,8 @@ fn test_request_with_shape(
         lora_adapter: None,
         kv_transfer_params: None,
         token_tx,
-        logprobs: 0,
-        echo: false,
+        logprobs: None,
+        prompt_logprobs: None,
     }
 }
 
@@ -47,7 +47,7 @@ fn active_request(request_id: u64, label: &str, token_tx: TokenSink) -> ActiveRe
         max_tokens: 8,
         prompt_len: 1,
         params: SamplingParams::default(),
-        logprobs: 0,
+        logprobs: None,
     }
 }
 
@@ -836,16 +836,16 @@ fn echo_request_is_rejected_before_backend_admission() {
     let (echo_tx, mut echo_rx) = TokenSink::standalone();
     let (regular_tx, mut regular_rx) = TokenSink::standalone();
     let mut echo = test_request_with_shape("unsupported-echo", echo_tx, vec![1, 2, 3], 4);
-    echo.echo = true;
+    echo.prompt_logprobs = Some(0);
     let regular = test_request("regular", regular_tx);
     let mut pending = vec![echo, regular];
 
-    reject_unsupported_echo(&mut pending);
+    reject_unsupported_prompt_logprobs(&mut pending);
 
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].request_id.as_deref(), Some("regular"));
     assert!(
-        !pending[0].echo,
+        pending[0].prompt_logprobs.is_none(),
         "only requests eligible for backend admission may remain"
     );
     match echo_rx.blocking_recv().map(|(_, event)| event) {
@@ -854,7 +854,7 @@ fn echo_request_is_rejected_before_backend_admission() {
             prompt_tokens,
             completion_tokens,
         }) => {
-            assert_eq!(message, UNSUPPORTED_ECHO_MESSAGE);
+            assert_eq!(message, UNSUPPORTED_PROMPT_LOGPROBS_MESSAGE);
             assert_eq!(prompt_tokens, 3);
             assert_eq!(completion_tokens, 0);
         }

@@ -3,9 +3,12 @@
 > **TL;DR:** Issue #727 now lands Qwen3.5 scheduler policy plumbing with
 > conservative defaults: `off` remains the default, `auto` is explicit opt-in,
 > `--max-prefill-tokens` remains a hard per-step cap, and TP rejects `auto`
-> instead of silently downgrading to `off`.
+> instead of silently downgrading to `off`. With `--decode-overlap stream`,
+> `auto` keeps prefill running through the finishing window (the overlapped
+> chunk no longer stalls decode), trading a redundant QPS16 TPOT win for 31%
+> TTFT and 14% throughput at an unchanged tail.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-09
 
 ## Preparation
 
@@ -37,6 +40,7 @@
   - `Off` preserves the fixed base prefill budget.
   - No active decode or no in-flight prefill keeps the fixed budget.
   - Active requests with at most 4 tokens remaining get one decode-priority tick before the FIFO-front prefill continues.
+  - With `--decode-overlap stream` the finishing-window deferral is disabled: the overlapped chunk already runs off the decode step, so deferring only delays prefill. Measured on A100-40GB, single run (1024/128 QPS16): TTFT `1828 → 1264 ms`, output throughput `873 → 992 tok/s`, ITL p99 unchanged (`41.7 ms`), TPOT back to vLLM parity (`23.8 vs 23.6 ms`); see #727.
   - `Auto` never returns more than the configured base budget; `--max-prefill-tokens` stays a hard per-step cap.
   - Final chunks may shrink below the cap when fewer prompt tokens remain.
 

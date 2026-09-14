@@ -6,9 +6,6 @@
 #![allow(clippy::wildcard_imports)]
 #![cfg(feature = "qwen35")]
 
-#[cfg(test)]
-extern crate self as pegainfer_qwen35;
-
 mod batch_decode;
 pub(crate) mod batch_decode_graph;
 pub(crate) mod config;
@@ -311,16 +308,15 @@ fn start_engine_with_backend(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors_with_launch_options(
+    let model = weights::Qwen35Model::from_safetensors_with_runtime_and_capacity(
         model_path,
-        &Qwen35LaunchOptions {
+        weights::ModelRuntimeConfig {
+            enable_cuda_graph,
             device_ordinal,
-            tp_size: 1,
-            cuda_graph: enable_cuda_graph,
-            max_batch,
-            max_prefill_tokens,
             gdn_backend,
+            tensor_parallel: None,
         },
+        max_batch,
     )?;
     scheduler::start_with_capacity_and_policy(
         model,

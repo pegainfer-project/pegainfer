@@ -419,7 +419,7 @@ impl Qwen3Model {
     ///
     /// Compute logits for ALL positions in the hidden states.
     ///
-    /// Used when `echo=true` to return prompt token log-probabilities.
+    /// Used when `all_position_logits=true` to return prompt token log-probabilities.
     /// Applies final RMS norm + lm_head projection in a single batched GEMM.
     /// Returns `HiddenStates` with shape `[vocab_size, total_tokens]`.
     fn compute_all_position_logits(&self, hidden: &HiddenStates) -> Result<HiddenStates> {
@@ -481,7 +481,7 @@ impl Qwen3Model {
     /// Returns batched last-token logits `[vocab_size, batch]`, one column
     /// per request.
     ///
-    /// If `echo` is true, also returns all-position logits as a
+    /// If `all_position_logits` is true, also returns all-position logits as a
     /// `HiddenStates [vocab_size, total_tokens]` for prompt logprobs.
     /// Batch prefill forward.
     ///
@@ -497,7 +497,7 @@ impl Qwen3Model {
         lora_adapters: &[Option<&str>],
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
-        echo: bool,
+        all_position_logits: bool,
         capture_layer_ids: Option<&[usize]>,
     ) -> Result<(HiddenStates, Option<HiddenStates>, Option<HiddenStates>)> {
         let batch_size = prompts.len();
@@ -548,7 +548,7 @@ impl Qwen3Model {
                 capture_layer_ids,
             )
             .and_then(|captured_hidden| {
-                let all_logits = if echo {
+                let all_logits = if all_position_logits {
                     Some(self.compute_all_position_logits(&hidden)?)
                 } else {
                     None

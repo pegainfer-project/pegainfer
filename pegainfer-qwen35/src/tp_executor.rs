@@ -264,7 +264,7 @@ pub struct Qwen35TpExecutor {
 pub(crate) struct TpPrefillChunkItem {
     request_id: RequestId,
     prompt_tokens: Vec<u32>,
-    logprobs: usize,
+    logprobs: Option<usize>,
     sampling_params: SamplingParams,
     finish_prefill: bool,
 }
@@ -273,7 +273,7 @@ impl TpPrefillChunkItem {
     fn new(
         request_id: RequestId,
         prompt_tokens: Vec<u32>,
-        logprobs: usize,
+        logprobs: Option<usize>,
         finish_prefill: bool,
     ) -> Self {
         Self {
@@ -288,7 +288,7 @@ impl TpPrefillChunkItem {
     pub(crate) fn new_with_sampling(
         request_id: RequestId,
         prompt_tokens: Vec<u32>,
-        logprobs: usize,
+        logprobs: Option<usize>,
         sampling_params: SamplingParams,
         finish_prefill: bool,
     ) -> Self {
@@ -306,7 +306,7 @@ impl TpPrefillChunkItem {
 pub(crate) struct TpDecodeStepItem {
     request_id: RequestId,
     token_id: u32,
-    logprobs: usize,
+    logprobs: Option<usize>,
     sampling_params: SamplingParams,
     /// Scheduler-assigned decode slot under CUDA Graph TP. Rows must arrive in
     /// dense slot order (`slot_idx == row`); on the request's first decode row
@@ -319,7 +319,7 @@ impl TpDecodeStepItem {
     pub(crate) fn new(
         request_id: RequestId,
         token_id: u32,
-        logprobs: usize,
+        logprobs: Option<usize>,
         sampling_params: SamplingParams,
     ) -> Self {
         Self {
@@ -334,7 +334,7 @@ impl TpDecodeStepItem {
     pub(crate) fn new_with_slot(
         request_id: RequestId,
         token_id: u32,
-        logprobs: usize,
+        logprobs: Option<usize>,
         sampling_params: SamplingParams,
         slot_idx: usize,
     ) -> Self {
@@ -1894,8 +1894,8 @@ impl TpWorkerState {
             &mut self.sample_scratch,
         )?;
         let first_token = tokens[0];
-        let first_token_logprob = cpu_logits[0].as_ref().and_then(|row| {
-            pegainfer_sample::token_logprob_from_row(row, first_token, chunk.logprobs)
+        let first_token_logprob = cpu_logits[0].as_ref().and_then(|(row, top_k)| {
+            pegainfer_sample::token_logprob_from_row(row, first_token, *top_k)
         });
         Ok(PrefillRequestResult {
             request_id: chunk.request_id,
@@ -2199,7 +2199,8 @@ fn sample_decode_rows(
     scratch: &mut pegainfer_sample::SampleScratch,
 ) -> Result<Vec<DecodeRequestResult>> {
     let bs = requests.len();
-    let requested_logprobs: Vec<usize> = requests.iter().map(|request| request.logprobs).collect();
+    let requested_logprobs: Vec<Option<usize>> =
+        requests.iter().map(|request| request.logprobs).collect();
     let cpu_logits = snapshot_requested_logprobs(ctx, logits, &requested_logprobs)?;
     let params_refs: Vec<&SamplingParams> = requests
         .iter()
@@ -2217,8 +2218,8 @@ fn sample_decode_rows(
         .iter()
         .enumerate()
         .map(|(row, request)| {
-            let logprob = cpu_logits[row].as_ref().and_then(|logits_row| {
-                pegainfer_sample::token_logprob_from_row(logits_row, tokens[row], request.logprobs)
+            let logprob = cpu_logits[row].as_ref().and_then(|(logits_row, top_k)| {
+                pegainfer_sample::token_logprob_from_row(logits_row, tokens[row], *top_k)
             });
             DecodeRequestResult {
                 request_id: request.request_id,
@@ -2781,7 +2782,7 @@ mod tests {
                 chunks: vec![TpPrefillChunkItem::new(
                     RequestId::new(2),
                     vec![9707],
-                    0,
+                    None,
                     true,
                 )],
                 sample_seed: 0,
@@ -2940,13 +2941,18 @@ mod tests {
 
     #[test]
     fn validates_prefill_chunk_shape() {
-        let empty = [TpPrefillChunkItem::new(RequestId::new(1), vec![], 0, false)];
+        let empty = [TpPrefillChunkItem::new(
+            RequestId::new(1),
+            vec![],
+            None,
+            false,
+        )];
         let err = validate_prefill_chunks(&empty).unwrap_err().to_string();
         assert!(err.contains("is empty"));
 
         let duplicate = [
-            TpPrefillChunkItem::new(RequestId::new(1), vec![151_646], 0, false),
-            TpPrefillChunkItem::new(RequestId::new(1), vec![9707], 0, true),
+            TpPrefillChunkItem::new(RequestId::new(1), vec![151_646], None, false),
+            TpPrefillChunkItem::new(RequestId::new(1), vec![9707], None, true),
         ];
         let err = validate_prefill_chunks(&duplicate).unwrap_err().to_string();
         assert!(err.contains("duplicate"));
@@ -2957,14 +2963,14 @@ mod tests {
         validate_decode_requests(&[TpDecodeStepItem::new(
             RequestId::new(1),
             9707,
-            0,
+            None,
             SamplingParams::default(),
         )])
         .expect("single decode request is valid");
 
         let duplicate = [
-            TpDecodeStepItem::new(RequestId::new(1), 9707, 0, SamplingParams::default()),
-            TpDecodeStepItem::new(RequestId::new(1), 560, 0, SamplingParams::default()),
+            TpDecodeStepItem::new(RequestId::new(1), 9707, None, SamplingParams::default()),
+            TpDecodeStepItem::new(RequestId::new(1), 560, None, SamplingParams::default()),
         ];
         let err = validate_decode_requests(&duplicate)
             .unwrap_err()
@@ -3010,7 +3016,7 @@ mod tests {
         let clean_id = RequestId::new(401);
         executor
             .execute_prefill(PrefillPlan {
-                requests: &[PrefillStepItem::new(clean_id, vec![151_646, 9707], 0)],
+                requests: &[PrefillStepItem::new(clean_id, vec![151_646, 9707], None)],
             })
             .expect("materialize clean request");
         executor
@@ -3021,7 +3027,11 @@ mod tests {
         let divergent_id = RequestId::new(402);
         executor
             .execute_prefill(PrefillPlan {
-                requests: &[PrefillStepItem::new(divergent_id, vec![151_646, 9707], 0)],
+                requests: &[PrefillStepItem::new(
+                    divergent_id,
+                    vec![151_646, 9707],
+                    None,
+                )],
             })
             .expect("materialize divergent request");
         assert!(
@@ -3051,7 +3061,7 @@ mod tests {
         };
         let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
             .expect("start TP2 executor");
-        let chunk = TpPrefillChunkItem::new(RequestId::new(410), vec![151_646, 9707], 0, true);
+        let chunk = TpPrefillChunkItem::new(RequestId::new(410), vec![151_646, 9707], None, true);
 
         let err = executor
             .inject_prefill_dispatch_failure_for_test(&[chunk], 1)
@@ -3084,7 +3094,7 @@ mod tests {
                 requests: &[PrefillStepItem::new(
                     RequestId::new(420),
                     vec![151_646, 9707],
-                    0,
+                    None,
                 )],
             })
             .unwrap_err()
@@ -3106,7 +3116,11 @@ mod tests {
         let decode_id = RequestId::new(30);
         let decode_prefill = executor
             .execute_prefill(PrefillPlan {
-                requests: &[PrefillStepItem::new(decode_id, vec![151_646, 9707], 1)],
+                requests: &[PrefillStepItem::new(
+                    decode_id,
+                    vec![151_646, 9707],
+                    Some(1),
+                )],
             })
             .expect("materialize TP2 decode request");
         let prefill_id = RequestId::new(31);
@@ -3115,13 +3129,13 @@ mod tests {
                 prefill: vec![TpPrefillChunkItem::new(
                     prefill_id,
                     vec![151_646, 9707],
-                    1,
+                    Some(1),
                     true,
                 )],
                 decode: vec![TpDecodeStepItem::new(
                     decode_id,
                     decode_prefill.requests[0].first_token,
-                    1,
+                    Some(1),
                     SamplingParams::default(),
                 )],
                 prefill_sample_seed: 102,
@@ -3178,7 +3192,7 @@ mod tests {
             .collect();
         let first_requests: Vec<_> = first_ids
             .iter()
-            .map(|&request_id| PrefillStepItem::new(request_id, vec![151_646, 9707], 0))
+            .map(|&request_id| PrefillStepItem::new(request_id, vec![151_646, 9707], None))
             .collect();
         let first_results = executor
             .execute_prefill(PrefillPlan {
@@ -3221,7 +3235,7 @@ mod tests {
             .collect();
         let second_requests: Vec<_> = second_ids
             .iter()
-            .map(|&request_id| PrefillStepItem::new(request_id, vec![151_646, 9707], 0))
+            .map(|&request_id| PrefillStepItem::new(request_id, vec![151_646, 9707], None))
             .collect();
         let second_prefill = executor
             .execute_prefill(PrefillPlan {
@@ -3232,7 +3246,7 @@ mod tests {
         let decode_requests: Vec<_> = second_prefill
             .requests
             .iter()
-            .map(|result| DecodeStepItem::new(result.request_id, result.first_token, 0))
+            .map(|result| DecodeStepItem::new(result.request_id, result.first_token, None))
             .collect();
         let decode = executor
             .execute_decode(DecodePlan {
@@ -3263,7 +3277,8 @@ mod tests {
         let prompt = vec![151_646, 9707];
 
         let clean_id = RequestId::new(300);
-        let clean_request = PrefillStepItem::new(clean_id, prompt.clone(), REQUESTED_LOGPROBS);
+        let clean_request =
+            PrefillStepItem::new(clean_id, prompt.clone(), Some(REQUESTED_LOGPROBS));
         let clean = executor
             .execute_prefill(PrefillPlan {
                 requests: &[clean_request],
@@ -3281,7 +3296,8 @@ mod tests {
         assert_workers_empty(&executor);
 
         let readmitted_id = RequestId::new(301);
-        let readmitted_request = PrefillStepItem::new(readmitted_id, prompt, REQUESTED_LOGPROBS);
+        let readmitted_request =
+            PrefillStepItem::new(readmitted_id, prompt, Some(REQUESTED_LOGPROBS));
         let readmitted = executor
             .execute_prefill(PrefillPlan {
                 requests: &[readmitted_request],

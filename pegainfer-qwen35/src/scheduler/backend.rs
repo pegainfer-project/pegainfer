@@ -1,6 +1,7 @@
 //! Qwen3.5 scheduler backend abstraction (single-GPU + TP).
 
 use super::*;
+use crate::logprobs::LogprobSnapshot;
 
 pub(super) struct SingleGpuBackend {
     model: Qwen35Model,
@@ -100,16 +101,16 @@ fn single_decode_views(active: &mut [ActiveRequest35]) -> (Vec<u32>, Vec<&mut Kv
 
 /// Pair each sampled token with its host logprob row, where one was requested.
 fn attached_logprobs(
-    cpu_logits: Vec<Option<Vec<f32>>>,
+    cpu_logits: Vec<Option<LogprobSnapshot>>,
     tokens: &[u32],
-    requested: &[usize],
 ) -> Vec<Option<TokenLogprob>> {
     cpu_logits
         .into_iter()
         .zip(tokens)
-        .zip(requested)
-        .map(|((row, &token), &top_k)| {
-            row.and_then(|row| pegainfer_sample::token_logprob_from_row(&row, token, top_k))
+        .map(|(row, &token)| {
+            row.and_then(|(row, top_k)| {
+                pegainfer_sample::token_logprob_from_row(&row, token, top_k)
+            })
         })
         .collect()
 }
@@ -287,7 +288,7 @@ impl SingleGpuBackend {
             pending.len(),
             "Qwen3.5 prefill logits rows must preserve pending request order"
         );
-        let requested_logprobs: Vec<usize> = pending.iter().map(|r| r.logprobs).collect();
+        let requested_logprobs: Vec<Option<usize>> = pending.iter().map(|r| r.logprobs).collect();
         let cpu_logits =
             snapshot_requested_logprobs(self.model.device_ctx(), logits, &requested_logprobs)?;
         let params_refs: Vec<&SamplingParams> = pending.iter().map(|r| &r.params).collect();
@@ -298,7 +299,7 @@ impl SingleGpuBackend {
             sample_seed,
         )?;
 
-        let logprobs = attached_logprobs(cpu_logits, &tokens, &requested_logprobs);
+        let logprobs = attached_logprobs(cpu_logits, &tokens);
         Ok((tokens, logprobs))
     }
 
@@ -307,7 +308,7 @@ impl SingleGpuBackend {
         active: &[ActiveRequest35],
         sample_seed: u64,
     ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
-        let requested_logprobs: Vec<usize> = active.iter().map(|r| r.logprobs).collect();
+        let requested_logprobs: Vec<Option<usize>> = active.iter().map(|r| r.logprobs).collect();
         let cpu_logits = snapshot_requested_logprobs(
             self.model.device_ctx(),
             &self.graph_state.buffers.logits,
@@ -320,7 +321,7 @@ impl SingleGpuBackend {
             sample_seed,
         )?;
 
-        let logprobs = attached_logprobs(cpu_logits, &tokens, &requested_logprobs);
+        let logprobs = attached_logprobs(cpu_logits, &tokens);
         Ok((tokens, logprobs))
     }
 

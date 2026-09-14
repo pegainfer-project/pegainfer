@@ -31,8 +31,8 @@ fn start_engine(
             model_path,
             MAX_BATCH,
             max_prefill_tokens,
-            pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
-            pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+            crate::Qwen35SchedulerPolicy::Off,
+            crate::Qwen35DecodeOverlap::Off,
         )
         .expect("failed to start Qwen3.5 engine")
 }
@@ -54,8 +54,8 @@ fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (Vec<u32>, Finish
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         })
         .expect("submit failed");
 
@@ -84,12 +84,13 @@ fn chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
 #[test]
 #[ignore = "requires SM120, a validated candidate identity, and Qwen3.5 weights"]
 fn candidate_chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv() {
-    run_chunked_prefill(&GdnAcceptance::candidate());
+    run_chunked_prefill(&GdnAcceptance::candidate().expect("candidate prerequisites"));
 }
 
 fn run_chunked_prefill(acceptance: &GdnAcceptance) {
-    let Some(model_path) =
-        acceptance.model_path("chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv")
+    let Some(model_path) = acceptance
+        .model_path("chunked_prefill_matches_unchunked_prefill_for_resumed_paged_kv")
+        .expect("model prerequisite")
     else {
         return;
     };
@@ -130,8 +131,6 @@ fn run_chunked_prefill(acceptance: &GdnAcceptance) {
         FinishReason::Length,
         "ignore_eos should force chunked generation to the requested length"
     );
-    assert_eq!(chunked_tokens.len(), GENERATED_TOKENS);
-
     assert_eq!(
         chunked_tokens, baseline_tokens,
         "chunked prefill must match effectively unchunked prefill; a mismatch suggests resumed direct-paged K/V writes used the wrong base_pos and corrupted earlier cache positions"

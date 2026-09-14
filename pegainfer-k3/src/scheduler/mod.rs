@@ -492,6 +492,11 @@ impl<E: StepExecutor> K3Scheduler<E> {
     /// The refusal this request earns before it ever runs, if any. Only
     /// permanent misfits are refused — a full batch is a wait, not a verdict.
     fn admission_refusal(&self, request: &Request) -> Option<RejectReason> {
+        if request.logprobs.is_some() || request.prompt_logprobs.is_some() {
+            return Some(RejectReason::Unsupported {
+                feature: "completion or prompt logprobs".into(),
+            });
+        }
         let prompt_tokens = request.prompt_tokens.len();
         let limit = self.executor.max_context_tokens();
         (prompt_tokens.saturating_add(request.max_tokens) > limit).then_some(

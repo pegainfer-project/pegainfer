@@ -54,8 +54,8 @@ struct PendingRequest {
     max_tokens: usize,
     lora_adapter: Option<String>,
     token_tx: TokenSink,
-    logprobs: usize,
-    echo: bool,
+    logprobs: Option<usize>,
+    prompt_logprobs: Option<usize>,
 }
 
 struct ActiveRequestState {
@@ -146,7 +146,6 @@ impl MixedRequestScheduler {
         for (pending, message) in batch.rejected {
             match send_scheduled(&pending) {
                 Ok(scheduled) => {
-                    let _ = send_prompt_echo(&pending);
                     log_pending_terminal_trace(
                         &pending,
                         &scheduled,
@@ -174,7 +173,6 @@ impl MixedRequestScheduler {
         for pending in batch.finished {
             match send_scheduled(&pending) {
                 Ok(scheduled) => {
-                    let _ = send_prompt_echo(&pending);
                     log_pending_terminal_trace(
                         &pending,
                         &scheduled,
@@ -224,20 +222,6 @@ impl MixedRequestScheduler {
                 return None;
             }
         };
-
-        if !send_prompt_echo(&pending) {
-            let terminal_message = terminal_send_failure_message(&pending.token_tx, "prompt echo");
-            log_pending_terminal_trace(
-                &pending,
-                &scheduled,
-                FinishReason::Error,
-                0,
-                Some(&terminal_message),
-                self.active.len(),
-                self.pending.len(),
-            );
-            return None;
-        }
 
         let prefill_start = Instant::now();
         let mut cache = DecodeCache::new(self.generator.config());
@@ -539,7 +523,7 @@ impl From<GenerateRequest> for PendingRequest {
             lora_adapter: req.lora_adapter,
             token_tx: req.token_tx,
             logprobs: req.logprobs,
-            echo: req.echo,
+            prompt_logprobs: req.prompt_logprobs,
         }
     }
 }
@@ -689,19 +673,6 @@ fn send_scheduled(pending: &PendingRequest) -> std::result::Result<ScheduledTrac
     }
 }
 
-fn send_prompt_echo(pending: &PendingRequest) -> bool {
-    if !pending.echo {
-        return true;
-    }
-    pending
-        .token_tx
-        .send(TokenEvent::PromptTokens {
-            ids: pending.prompt_tokens.clone(),
-            logprobs: vec![None; pending.prompt_tokens.len()],
-        })
-        .is_ok()
-}
-
 fn terminal_send_failure_message(token_tx: &TokenSink, stage: &str) -> String {
     if token_tx.is_disconnected() {
         format!("client disconnected before {stage}")
@@ -843,9 +814,10 @@ fn admission_decision(req: &PendingRequest, supported_context: usize) -> Admissi
             req.params.temperature, req.params.top_k, req.params.top_p
         ));
     }
-    if req.logprobs > 0 {
+    if req.logprobs.is_some() || req.prompt_logprobs.is_some() {
         return AdmissionDecision::Reject(
-            "DeepSeek-V2-Lite EP=2 mixed serving gate does not return logprobs yet".to_string(),
+            "DeepSeek-V2-Lite EP=2 mixed serving gate does not return completion or prompt logprobs yet"
+                .to_string(),
         );
     }
     if req.lora_adapter.is_some() {

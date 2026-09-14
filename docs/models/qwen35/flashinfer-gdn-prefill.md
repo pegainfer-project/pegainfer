@@ -9,8 +9,9 @@
 
 The candidate supports TP1 and Hq/Hk/Hv/D = 16/16/32/128, validated with
 Qwen3.5-4B. Linking an AOT bundle does not select it. Invalid bundles fail
-during the build; unsupported or unavailable candidates and invalid runtime
-artifact identities fail at model load without silently falling back.
+during the build; unsupported or unavailable candidates fail at model load
+without silently falling back. The build generates a private Rust artifact
+identity from the validated final link inputs, which the loaded backend retains.
 
 `pegainfer-kernels` owns pinned generation, artifact validation and the
 stable in-place C ABI. Generated symbols and TMA argument layouts stay
@@ -20,6 +21,17 @@ preserving the shared headers used by other models.
 Backend selection precedes KV budgeting and reserves the selected backend's
 peak prefill scratch. Normal prefill retains stream/event ordering without
 diagnostic host barriers.
+
+For Qwen3.5-4B's candidate, MLP down at layer 0 and full-attention V at layer 3
+use FP32 split-K partials and reduction at decode batch N=8. Inputs, weights
+and final output remain BF16. The model owns a copy of the tuned cuBLASLt recipe with only the reduction
+scheme changed; unsupported recipes fail before graph capture. This uses the
+existing decode workspace and leaves Triton, other projections and the shared
+algorithm cache unchanged. The scope follows the measured padded-decode
+regressions. One private model rule selects the projection, layer and decode
+bucket; extending that rule requires accuracy and performance evidence for the
+additional calls. Preparation and execution require the existing tuned policy
+and the base decode stream.
 
 ## Validation and Tradeoffs
 
@@ -31,7 +43,8 @@ This acceptance setup stays in private test modules.
 
 The short HF gate has exposed a configuration-dependent candidate regression
 in padded decode. Passing retries do not establish numerical stability;
-the cause and a production fix remain unconfirmed.
+the down/V combination must be checked against both retained opposing
+configurations on the final integration tree before claiming a production fix.
 
 The candidate reduces prefill scratch requirements. Retained same-context HTTP
 comparisons against seven-stage Triton, using synthetic token-ID prompts

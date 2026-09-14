@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::nccl::safe::Comm;
@@ -53,6 +55,7 @@ pub struct Qwen35Model {
     pub(super) ctx: DeviceContext,
     /// The selected, already-loaded candidate. `None` means Triton was requested.
     pub(super) flashinfer_gdn: Option<pegainfer_kernels::ops::Qwen35GdnAot>,
+    pub(super) candidate_decode: Vec<CandidateDecodeGemm>,
     pub(super) config: Config35,
     pub(super) geometry: LocalGeometry,
     pub(super) embed_tokens: DeviceMatrix,
@@ -87,6 +90,96 @@ const STATES_PER_DECODE_SLOT: usize = 2;
 /// KV-pool floor, also the low-memory fail-fast threshold.
 const MIN_KV_PAGES: usize = 64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DecodeProjection {
+    Down,
+    V,
+}
+
+pub(super) struct CandidateDecodeGemm {
+    pub(super) layer: usize,
+    pub(super) projection: DecodeProjection,
+    pub(super) batch: usize,
+    pub(super) recipe: OnceLock<pegainfer_kernels::ops::Qwen35DecodeGemm>,
+}
+
+impl CandidateDecodeGemm {
+    pub(super) fn weights<'a>(&self, model: &'a Qwen35Model) -> Result<&'a DeviceMatrix> {
+        let layer = model
+            .layers
+            .get(self.layer)
+            .context("decode target layer is out of range")?;
+        match self.projection {
+            DecodeProjection::Down => Ok(&layer.mlp.down_proj),
+            DecodeProjection::V => Ok(&layer
+                .attn
+                .full_attention()
+                .context("V target requires a full-attention layer")?
+                .v_proj),
+        }
+    }
+
+    pub(super) fn prepare(&self, model: &Qwen35Model) -> Result<()> {
+        anyhow::ensure!(
+            model.flashinfer_gdn.is_some(),
+            "decode adjustment requires a candidate"
+        );
+        let weights = self.weights(model)?;
+        anyhow::ensure!(
+            super::batch_decode_graph::BATCH_BUCKETS.contains(&self.batch)
+                && self.batch <= crate::ops::GEMM_LT_MAX_N,
+            "decode target must use a cuBLASLt decode bucket"
+        );
+        anyhow::ensure!(
+            self.batch <= model.reserved_decode_slots,
+            "decode target exceeds allocated decode capacity"
+        );
+        if self.recipe.get().is_none() {
+            let recipe =
+                pegainfer_kernels::ops::Qwen35DecodeGemm::prepare(&model.ctx, weights, self.batch)
+                    .with_context(|| {
+                        format!(
+                            "prepare {:?} layer={} batch={}",
+                            self.projection, self.layer, self.batch
+                        )
+                    })?;
+            anyhow::ensure!(
+                self.recipe.set(recipe).is_ok(),
+                "decode recipe initialized concurrently"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn candidate_decode_targets(
+    config: &Config35,
+    geometry: LocalGeometry,
+    capacity: usize,
+    candidate: bool,
+) -> Vec<CandidateDecodeGemm> {
+    // Only the measured 4B calls use this policy. Extend targets here after
+    // validation; never publish these choices to the shared shape-keyed cache.
+    if candidate
+        && config.hidden_size == 2560
+        && geometry.local_intermediate_size() == 9216
+        && geometry.local_full_attn_kv_dim() == 1024
+        && capacity >= 8
+    {
+        [(0, DecodeProjection::Down), (3, DecodeProjection::V)]
+            .into_iter()
+            .map(|(layer, projection)| CandidateDecodeGemm {
+                layer,
+                projection,
+                batch: 8,
+                recipe: OnceLock::new(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 impl Qwen35Model {
     pub fn from_safetensors_with_options(
         model_path: &str,
@@ -101,28 +194,6 @@ impl Qwen35Model {
         )
     }
 
-    pub(crate) fn from_safetensors_with_launch_options(
-        model_path: &str,
-        options: &crate::Qwen35LaunchOptions,
-    ) -> Result<Self> {
-        anyhow::ensure!(
-            options.tp_size == 1,
-            "rank-local model loading requires tp_size=1"
-        );
-        Self::from_safetensors_with_runtime_and_capacity(
-            model_path,
-            ModelRuntimeConfig {
-                enable_cuda_graph: options.cuda_graph,
-                device_ordinal: options.device_ordinal,
-                gdn_backend: options.gdn_backend,
-                ..Default::default()
-            },
-            options.max_batch,
-        )
-    }
-}
-
-impl Qwen35Model {
     /// `max_batch` is the requested concurrent-request cap in `1..=MAX_BATCH`.
     /// It need not be a decode bucket: the physical decode capacity is rounded
     /// up to the next `BATCH_BUCKETS` value while the scheduler still admits at
@@ -153,7 +224,7 @@ impl Qwen35Model {
         )
     }
 
-    fn from_safetensors_with_runtime_and_capacity(
+    pub(super) fn from_safetensors_with_runtime_and_capacity(
         model_path: &str,
         runtime: ModelRuntimeConfig,
         max_batch: usize,
@@ -373,9 +444,12 @@ impl Qwen35Model {
             num_pages,
         )?;
 
+        let candidate_decode =
+            candidate_decode_targets(&config, geometry, max_batch, flashinfer_gdn.is_some());
         Ok(Self {
             ctx,
             flashinfer_gdn,
+            candidate_decode,
             config,
             geometry,
             embed_tokens,
@@ -525,7 +599,29 @@ impl Qwen35Model {
             crate::ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
             crate::ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
         }
+        for target in &self.candidate_decode {
+            target.prepare(self)?;
+        }
         Ok(())
+    }
+
+    pub(super) fn candidate_decode_recipe(
+        &self,
+        weights: &DeviceMatrix,
+        batch: usize,
+    ) -> Result<Option<&pegainfer_kernels::ops::Qwen35DecodeGemm>> {
+        // K/V share a tuned shape, and full-attention uses a separate KV layer
+        // index. Match the model-owned weight object, not either of those keys.
+        for target in &self.candidate_decode {
+            if target.batch == batch && std::ptr::eq(target.weights(self)?, weights) {
+                return target
+                    .recipe
+                    .get()
+                    .map(Some)
+                    .context("candidate decode recipe must be prepared before decode");
+            }
+        }
+        Ok(None)
     }
 
     /// Create the CUDA Graph batch decode state at the loaded capacity.

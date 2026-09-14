@@ -67,6 +67,7 @@ pub(super) fn choose_prefill_budget(
     base_budget: usize,
     active: &[ActiveDecodeState],
     prefilling: &[PrefillQueueState],
+    decode_overlap: bool,
 ) -> usize {
     assert!(
         base_budget > 0,
@@ -76,9 +77,13 @@ pub(super) fn choose_prefill_budget(
         return base_budget;
     }
 
-    if active
-        .iter()
-        .any(|req| req.remaining_tokens() <= DECODE_FINISH_WINDOW_TOKENS)
+    // With stream overlap the finishing request's last tokens keep ticking on
+    // the decode stream while the chunk runs aside, so the full prefill
+    // deferral would only delay prefill without buying decode latency.
+    if !decode_overlap
+        && active
+            .iter()
+            .any(|req| req.remaining_tokens() <= DECODE_FINISH_WINDOW_TOKENS)
     {
         return 0;
     }
@@ -312,7 +317,13 @@ mod tests {
         }];
 
         assert_eq!(
-            choose_prefill_budget(Qwen35SchedulerPolicy::Off, 1024, &active, &prefilling),
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Off,
+                1024,
+                &active,
+                &prefilling,
+                false
+            ),
             1024,
             "off keeps the fixed chunk budget"
         );
@@ -329,7 +340,13 @@ mod tests {
         }];
 
         assert_eq!(
-            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Auto,
+                1024,
+                &active,
+                &prefilling,
+                false
+            ),
             1024,
             "auto preserves --max-prefill-tokens as a hard per-step cap"
         );
@@ -346,7 +363,13 @@ mod tests {
         }];
 
         assert_eq!(
-            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Auto,
+                1024,
+                &active,
+                &prefilling,
+                false
+            ),
             1024,
             "standard serving cells with long outputs keep the fixed chunk path"
         );
@@ -363,7 +386,13 @@ mod tests {
         }];
 
         assert_eq!(
-            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Auto,
+                1024,
+                &active,
+                &prefilling,
+                false
+            ),
             512,
             "auto may shrink the final chunk but never expands beyond the configured cap"
         );
@@ -386,16 +415,51 @@ mod tests {
         }];
 
         assert_eq!(
-            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Auto,
+                1024,
+                &active,
+                &prefilling,
+                false
+            ),
             0,
             "a near-finished active request gets a decode-priority tick before a long prefill"
         );
+    }
+
+    #[test]
+    fn adaptive_prefill_budget_keeps_prefill_running_under_stream_overlap() {
+        let active = [
+            ActiveDecodeState {
+                generated_count: 252,
+                max_tokens: 256,
+            },
+            ActiveDecodeState {
+                generated_count: 16,
+                max_tokens: 4096,
+            },
+        ];
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 4096,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Auto,
+                1024,
+                &active,
+                &prefilling,
+                true
+            ),
+            1024,
+            "with stream overlap the finishing window keeps prefill on the prefill stream instead of deferring it"
+        );
         assert!(
             matches!(
-                build_next_plan::<Pending>(true, vec![]),
-                Some(ExecutionPlan::Decode)
+                build_next_plan::<Pending>(true, vec![pending(1, 4096)]),
+                Some(ExecutionPlan::Unified { .. })
             ),
-            "zero prefill budget turns the scheduler tick into decode-only work"
+            "the kept budget keeps the tick a unified prefill+decode step instead of a decode-only tick"
         );
     }
 
@@ -410,7 +474,13 @@ mod tests {
         }];
 
         assert_eq!(
-            choose_prefill_budget(Qwen35SchedulerPolicy::Auto, 1024, &active, &prefilling),
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Auto,
+                1024,
+                &active,
+                &prefilling,
+                false
+            ),
             0,
             "decode-priority applies before even a final prefill chunk when an active request is finishing"
         );

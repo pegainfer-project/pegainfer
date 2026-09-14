@@ -13,37 +13,41 @@ use crate::Qwen35SchedulerPolicy;
 pub(crate) use crate::test_fixture_common::load_tokenizer;
 pub(crate) use crate::test_fixture_common::model_path_or_skip;
 pub(crate) use crate::test_fixture_common::tp2_device_ordinals;
+use crate::weights::ModelRuntimeConfig;
 use crate::weights::Qwen35Model;
 
+#[derive(Debug)]
 pub(crate) enum GdnAcceptance {
     Triton,
     Candidate { object_sha256: String },
 }
 
 impl GdnAcceptance {
-    /// Candidate entry points never infer selection from an optional variable.
-    pub(crate) fn candidate() -> Self {
-        const ENV: &str = "PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256";
-        let object_sha256 = std::env::var(ENV)
-            .unwrap_or_else(|error| panic!("candidate acceptance requires {ENV}: {error}"));
-        assert!(
+    pub(crate) fn candidate() -> Result<Self> {
+        Self::candidate_with_identity(std::env::var("PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256").ok())
+    }
+
+    pub(crate) fn candidate_with_identity(identity: Option<String>) -> Result<Self> {
+        let object_sha256 = identity
+            .context("candidate acceptance requires PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256")?;
+        ensure!(
             object_sha256.len() == 64 && object_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "candidate acceptance requires a 64-character hexadecimal object SHA256"
         );
-        Self::Candidate { object_sha256 }
+        Ok(Self::Candidate { object_sha256 })
     }
 
     pub(crate) fn is_candidate(&self) -> bool {
         matches!(self, Self::Candidate { .. })
     }
 
-    pub(crate) fn model_path(&self, test_name: &str) -> Option<String> {
-        let path = model_path_or_skip(test_name);
-        assert!(
-            !self.is_candidate() || path.is_some(),
-            "candidate acceptance requires a readable Qwen3.5 model fixture"
-        );
-        path
+    pub(crate) fn model_path(&self, test_name: &str) -> Result<Option<String>> {
+        const ENV: &str = "PEGAINFER_TEST_MODEL_PATH";
+        if !self.is_candidate() {
+            return Ok(model_path_or_skip(test_name));
+        }
+        let path = std::env::var(ENV).context("candidate acceptance requires a model path")?;
+        crate::test_fixture_common::model_fixture::validated_fixture_path(ENV, path).map(Some)
     }
 
     pub(crate) fn load_model(
@@ -98,10 +102,26 @@ impl GdnAcceptance {
             matches: &matches,
         };
         crate::model_line::MODEL_LINE.validate(&ctx, &provided)?;
-        let model = Qwen35Model::from_safetensors_with_launch_options(
+        let options = crate::model_line::launch_options(&ctx);
+        ensure!(
+            options.tp_size == 1,
+            "rank-local model loading requires tp_size=1"
+        );
+        let model = Qwen35Model::from_safetensors_with_runtime_and_capacity(
             model_path,
-            &crate::model_line::launch_options(&ctx),
+            ModelRuntimeConfig {
+                enable_cuda_graph: options.cuda_graph,
+                device_ordinal: options.device_ordinal,
+                gdn_backend: options.gdn_backend,
+                tensor_parallel: None,
+            },
+            options.max_batch,
         )?;
+        self.validate_model(&model)?;
+        Ok(model)
+    }
+
+    pub(crate) fn validate_model(&self, model: &Qwen35Model) -> Result<()> {
         match self {
             Self::Triton => ensure!(
                 model.flashinfer_gdn.is_none(),
@@ -123,7 +143,7 @@ impl GdnAcceptance {
                 );
             }
         }
-        Ok(model)
+        Ok(())
     }
 
     pub(crate) fn launch_engine(

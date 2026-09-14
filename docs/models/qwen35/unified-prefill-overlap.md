@@ -13,8 +13,13 @@
 > this change, vLLM 0.27.0 baseline), the combination dominates every
 > single-lever config: 1024/256 c8 ITL p99 `65.5 → 34.2 ms`, c16 p99
 > `81.4 → 36.5 ms` (vLLM `83.3`), QPS16 TPOT `36.7 → 20.8 ms` (vLLM `23.6`)
-> and QPS16 ITL p99 `101 → 42 ms` (vLLM `93.4`); the trade is open-loop TTFT
-> (QPS16 `867 → 1828 ms`, vLLM `218`) and −15% QPS16 output throughput.
+> and QPS16 ITL p99 `101 → 42 ms` (vLLM `93.4`). With the combination enabled,
+> the `auto` finishing-window deferral is disabled (the overlapped chunk no
+> longer stalls decode), which reclaims most of its open-loop cost. The
+> deferral-reclaim run is measured separately on `fb16fc15` + this change
+> (same A100-40GB host and bench): QPS16 TTFT `1828 → 1264 ms`, output
+> throughput `873 → 992 tok/s`, ITL p99 unchanged; TPOT returns to vLLM
+> parity (`23.8 vs 23.6 ms`).
 >
 > **Last touched:** 2026-09
 

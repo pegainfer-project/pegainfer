@@ -378,6 +378,9 @@ where
         chat_template: None,
         default_chat_template_kwargs: None,
         limit_mm_per_prompt: HashMap::new(),
+        // Startup adapters go through the engine-side LoRA channel
+        // (`load_startup_lora_modules`), never the upstream static loader.
+        lora_modules: Vec::new(),
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         max_logprobs: None,
         language_model_only: true,

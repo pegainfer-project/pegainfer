@@ -6,15 +6,15 @@ use anyhow::ensure;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::SpecDecodeCounters;
-use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::spawn_scheduler;
+
+mod logprobs;
 
 /// Cap on how long `step` parks while waiting for the next due token. New
 /// submissions only drain between steps, so a full TTFT/TPOT sleep would
@@ -151,7 +151,7 @@ struct RunningRequest {
     pending: Vec<u32>,
     next_token_at: Instant,
     finish_reason: FinishReason,
-    logprobs: usize,
+    logprobs: Option<usize>,
 }
 
 impl SimScheduler {
@@ -190,19 +190,13 @@ impl Scheduler for SimScheduler {
                 ledger.retire(id);
                 continue;
             }
-            if request.echo {
-                ledger.echo_prompt(
-                    id,
-                    PromptEcho {
-                        ids: request.prompt_tokens.clone(),
-                        logprobs: vec![None; request.prompt_tokens.len()],
-                    },
-                );
-            }
             let prompt_len = request.prompt_tokens.len();
             let (pending, finish_reason) =
                 planned_completion(&self.config, &request.prompt_tokens, request.max_tokens);
             ledger.admit(id);
+            if let Some(top_k) = request.prompt_logprobs {
+                ledger.echo_prompt(id, logprobs::prompt(&request.prompt_tokens, top_k));
+            }
             if pending.is_empty() {
                 ledger.finish(id, finish_reason);
                 continue;
@@ -231,10 +225,9 @@ impl Scheduler for SimScheduler {
                 ledger.finish(running.id, running.finish_reason);
                 continue;
             };
-            let logprob = (running.logprobs > 0).then_some(TokenLogprob {
-                logprob: 0.0,
-                top_logprobs: Vec::new(),
-            });
+            let logprob = running
+                .logprobs
+                .map(|top_k| logprobs::completion(token, top_k));
             let logprobs = match logprob {
                 Some(lp) => vec![Some(lp)],
                 None => Vec::new(),
@@ -323,8 +316,8 @@ mod tests {
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
-            logprobs,
-            echo: false,
+            logprobs: (logprobs > 0).then_some(logprobs),
+            prompt_logprobs: None,
             trace_parent: None,
             client_label: None,
         }
