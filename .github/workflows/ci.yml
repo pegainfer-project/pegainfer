@@ -215,66 +215,9 @@ jobs:
       - name: Run simulated frontend E2E tests
         run: cargo test --release --locked -p pegainfer-sim --test frontend_e2e
 
-  qwen3-cuda-clippy:
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
-    name: Qwen3 CUDA Clippy (sm_80)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: nightly-2026-07-10
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        with:
-          version: "v0.16.0"
-
-      - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: "13.0.2"
-          linux-local-args: '["--toolkit"]'
-          method: network
-          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
-          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libibverbs-dev
-
-      # Clippy lints only the packages named here; dependencies are compiled, not linted.
-      # pegainfer-cupti is out: building it needs CUPTI headers the toolkit above omits.
-      - name: Run Qwen3 CUDA Clippy
-        run: >-
-          cargo clippy --release --locked
-          -p pegainfer-server
-          -p pegainfer-qwen3
-          -p pegainfer-core
-          -p pegainfer-kernels
-          -p pegainfer-kv-cache
-          -p pegainfer-kv-offload
-          -p pegainfer-sample
-          -p pegainfer-bench
-          --all-targets -- -D warnings
-        env:
-          CUDA_PATH: /usr/local/cuda
-          PEGAINFER_CUDA_SM: "80"
-          PEGAINFER_NVCC_JOBS: "2"
-
   feature-model-cuda:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
-    name: ${{ matrix.model_name }} CUDA ${{ matrix.gate_name }} (sm_80)
+    name: ${{ matrix.model_name }} CUDA Clippy (sm_80)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -285,26 +228,37 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
+      # One row per model line; adding a model line is one more row.
+      # Clippy lints only the packages named here; dependencies are compiled,
+      # not linted. pegainfer-cupti is out: building it needs CUPTI headers the
+      # toolkit above omits.
+      #
+      # `feature` is empty for the default line, which is the only one that
+      # needs no `--features` flag. It is also the line that carries the shared
+      # crates, so every model line stays covered by exactly one row.
       matrix:
-        model: [gemma4, qwen35]
-        gate: [clippy]
         include:
-          - model: gemma4
-            model_name: Gemma 4
-            package: pegainfer-gemma4
-            feature: gemma4
+          - model_name: Qwen3
+            package: pegainfer-qwen3
+            feature: ""
+            extra_packages: >-
+              -p pegainfer-server -p pegainfer-core -p pegainfer-kernels
+              -p pegainfer-kv-cache -p pegainfer-kv-offload -p pegainfer-sample
+              -p pegainfer-bench
             needs_triton: false
             triton_python: ""
-          - model: qwen35
-            model_name: Qwen3.5
+          - model_name: Gemma 4
+            package: pegainfer-gemma4
+            feature: gemma4
+            extra_packages: ""
+            needs_triton: false
+            triton_python: ""
+          - model_name: Qwen3.5
             package: pegainfer-qwen35
             feature: qwen35
+            extra_packages: ""
             needs_triton: true
             triton_python: python
-          - gate: clippy
-            gate_name: Clippy
-            cargo_command: clippy
-            trailing_args: "-- -D warnings"
 
     steps:
       - name: Checkout
@@ -345,10 +299,11 @@ jobs:
         if: matrix.needs_triton
         run: python -m pip install "triton==3.7.1"
 
-      - name: Run ${{ matrix.model_name }} ${{ matrix.gate_name }}
+      - name: Run ${{ matrix.model_name }} CUDA Clippy
         run: >-
-          cargo ${{ matrix.cargo_command }} --release --locked
-          -p ${{ matrix.package }} --features ${{ matrix.feature }} --all-targets
-          ${{ matrix.trailing_args }}
+          cargo clippy --release --locked
+          -p ${{ matrix.package }} ${{ matrix.extra_packages }}
+          ${{ matrix.feature && format('--features {0}', matrix.feature) }}
+          --all-targets -- -D warnings
         env:
           PEGAINFER_TRITON_PYTHON: ${{ matrix.triton_python }}
