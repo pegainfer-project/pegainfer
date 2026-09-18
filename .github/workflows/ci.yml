@@ -84,6 +84,7 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
+          components: rustfmt, clippy
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -102,6 +103,7 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
+          components: rustfmt, clippy
 
       - name: Check locked Cargo metadata
         run: cargo metadata --locked --no-deps --format-version 1
@@ -136,6 +138,7 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
+          components: rustfmt, clippy
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -167,6 +170,7 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
+          components: rustfmt, clippy
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -203,6 +207,7 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
+          components: rustfmt, clippy
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -271,6 +276,7 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
+          components: rustfmt, clippy
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
