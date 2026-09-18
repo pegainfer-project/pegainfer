@@ -13,8 +13,11 @@ use crate::dspark::MarkovScratch;
 use crate::weights::Qwen3Model;
 use crate::weights::TransformerBlock;
 
+pub(crate) mod config;
 mod loading;
+pub(crate) mod manifest;
 mod reservation;
+pub(crate) mod selector;
 
 pub(crate) use reservation::DFlashMemoryReservation;
 

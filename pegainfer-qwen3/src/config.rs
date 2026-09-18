@@ -269,7 +269,11 @@ impl DFlashConfig {
     pub(crate) fn from_file(model_path: &str) -> Result<Self> {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
-        let raw: RawDFlashConfig = serde_json::from_str(&content)?;
+        let json: Value = serde_json::from_str(&content)?;
+        if crate::dflash::config::NativeDFlash2Config::is_native(&json) {
+            crate::dflash::config::NativeDFlash2Config::from_json(&json)?.validate_serving()?;
+        }
+        let raw: RawDFlashConfig = serde_json::from_value(json)?;
 
         // rope_theta: flat (b16) or nested under rope_parameters (DeepSpec).
         let rope_theta = raw

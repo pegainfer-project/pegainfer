@@ -1,6 +1,7 @@
 //! Safetensors weight loading.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::FileExt;
@@ -22,6 +23,7 @@ use log::warn;
 use memmap2::Mmap;
 use safetensors::Dtype;
 use safetensors::SafeTensors;
+use serde::Deserialize;
 
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
@@ -62,30 +64,84 @@ pub fn load_shard_info(model_path: &str) -> Result<(Vec<String>, HashMap<String,
 
     let index_path = format!("{}/model.safetensors.index.json", model_path);
     let index_content = fs::read_to_string(&index_path)?;
-    let index: serde_json::Value = serde_json::from_str(&index_content)?;
-
-    let weight_map_json = index["weight_map"]
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("Invalid index.json: missing weight_map"))?;
+    let index: ShardIndex = serde_json::from_str(&index_content)
+        .map_err(|e| anyhow::anyhow!("Invalid {index_path}: {e}"))?;
+    anyhow::ensure!(
+        !index.weight_map.0.is_empty(),
+        "Invalid {index_path}: empty weight_map"
+    );
 
     let mut shard_files: Vec<String> = Vec::new();
-    let mut file_to_idx: HashMap<String, usize> = HashMap::new();
+    let mut file_to_idx: HashMap<std::path::PathBuf, usize> = HashMap::new();
     let mut weight_map: HashMap<String, usize> = HashMap::new();
 
-    for (tensor_name, shard_file_val) in weight_map_json {
-        let shard_file = shard_file_val.as_str().unwrap().to_string();
-        let idx = if let Some(&idx) = file_to_idx.get(&shard_file) {
+    for (tensor_name, shard_file) in index.weight_map.0 {
+        // Mixed aliases such as a.safetensors and ./a.safetensors must share an index.
+        let shard_path: std::path::PathBuf = std::path::Path::new(&shard_file)
+            .components()
+            .filter(|part| !matches!(part, std::path::Component::CurDir))
+            .collect();
+        anyhow::ensure!(
+            !shard_path.as_os_str().is_empty()
+                && shard_path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_))),
+            "Invalid {index_path}: tensor '{tensor_name}' has unsafe shard path '{shard_file}'"
+        );
+
+        let idx = if let Some(&idx) = file_to_idx.get(&shard_path) {
             idx
         } else {
             let idx = shard_files.len();
-            shard_files.push(format!("{model_path}/{shard_file}"));
-            file_to_idx.insert(shard_file, idx);
+            shard_files.push(format!("{model_path}/{}", shard_path.display()));
+            file_to_idx.insert(shard_path, idx);
             idx
         };
-        weight_map.insert(tensor_name.clone(), idx);
+        weight_map.insert(tensor_name, idx);
     }
 
     Ok((shard_files, weight_map))
+}
+
+#[derive(Deserialize)]
+struct ShardIndex {
+    weight_map: UniqueWeightMap,
+}
+
+// serde_json::Value would silently keep only the last duplicate tensor key.
+struct UniqueWeightMap(BTreeMap<String, String>);
+
+impl<'de> Deserialize<'de> for UniqueWeightMap {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueWeightMap;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a tensor-to-shard map without duplicate names")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                let mut entries = BTreeMap::new();
+                while let Some((name, path)) = map.next_entry::<String, String>()? {
+                    if entries.insert(name.clone(), path).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate tensor '{name}' in weight_map"
+                        )));
+                    }
+                }
+
+                Ok(UniqueWeightMap(entries))
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
 }
 
 /// Advisory parallel page-cache prefetch for a whole-checkpoint load;
@@ -323,9 +379,102 @@ pub fn deserialize_shards(mmaps: &[Mmap]) -> Result<Vec<SafeTensors<'_>>> {
     mmaps
         .iter()
         .map(|m| {
-            SafeTensors::deserialize(m).map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))
+            let tensors = SafeTensors::deserialize(m)
+                .map_err(|e| anyhow::anyhow!("Deserialize error: {}", e))?;
+
+            // SafeTensors validates the length and offsets. Reject duplicate
+            // JSON names too, before serde's map semantics can hide a tensor.
+            let header_len = u64::from_le_bytes(m[..8].try_into()?) as usize;
+            let _: UniqueTensorNames = serde_json::from_slice(&m[8..8 + header_len])?;
+            Ok(tensors)
         })
         .collect()
+}
+
+struct UniqueTensorNames;
+
+impl<'de> Deserialize<'de> for UniqueTensorNames {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueTensorNames;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a safetensors header without duplicate names")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                let mut names = std::collections::HashSet::new();
+                while let Some((name, _)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
+                    if !names.insert(name.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate tensor '{name}' in safetensors header"
+                        )));
+                    }
+                }
+
+                Ok(UniqueTensorNames)
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+/// CPU-only checkpoint metadata. Reading this never uploads tensor payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorDescriptor {
+    pub dtype: Dtype,
+    pub shape: Vec<usize>,
+    pub byte_len: usize,
+}
+
+/// Enumerate a checkpoint using the same shard metadata as the staged loader.
+/// A nonempty index must cover exactly the tensors present in its named shards.
+pub fn tensor_descriptors(
+    shards: &[SafeTensors<'_>],
+    weight_map: &HashMap<String, usize>,
+) -> Result<BTreeMap<String, TensorDescriptor>> {
+    let mut descriptors = BTreeMap::new();
+    for (index, shard) in shards.iter().enumerate() {
+        for (name, tensor) in shard.tensors() {
+            anyhow::ensure!(
+                !descriptors.contains_key(&name),
+                "Duplicate tensor '{name}' in checkpoint shards"
+            );
+
+            if !weight_map.is_empty() {
+                anyhow::ensure!(
+                    weight_map.get(&name) == Some(&index),
+                    "Tensor '{name}' in shard {index} disagrees with weight_map entry {:?}",
+                    weight_map.get(&name)
+                );
+            }
+
+            descriptors.insert(
+                name,
+                TensorDescriptor {
+                    dtype: tensor.dtype(),
+                    shape: tensor.shape().to_vec(),
+                    byte_len: tensor.data().len(),
+                },
+            );
+        }
+    }
+
+    for (name, &index) in weight_map {
+        anyhow::ensure!(
+            index < shards.len() && descriptors.contains_key(name),
+            "Tensor '{name}' indexed in shard {index} is missing from checkpoint"
+        );
+    }
+
+    Ok(descriptors)
 }
 
 fn find_tensor<'a>(
@@ -334,7 +483,9 @@ fn find_tensor<'a>(
     name: &str,
 ) -> Result<safetensors::tensor::TensorView<'a>> {
     if let Some(&idx) = weight_map.get(name) {
-        shards[idx]
+        shards
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("Tensor '{name}': shard index {idx} is out of range"))?
             .tensor(name)
             .map_err(|e| anyhow::anyhow!("Failed to load tensor '{}': {}", name, e))
     } else {

@@ -3616,6 +3616,7 @@ dependencies = [
  "pegainfer-kernels",
  "rayon",
  "safetensors",
+ "serde",
  "serde_json",
  "tokio",
 ]

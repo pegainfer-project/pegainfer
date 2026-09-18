@@ -28,6 +28,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 pub(crate) use config::probe_config_json;
+pub use dflash::config::NativeDFlash2Config;
+pub use dflash::config::NativeTargetMetadata;
+pub use dflash::manifest::NativeArtifact;
+pub use dflash::selector::DFlash2Sampler;
+pub use dflash::selector::DFlash2Selection;
 use log::info;
 use log::warn;
 use pegainfer_frontend::engine::Engine;

@@ -24,6 +24,7 @@ pegainfer-kernels = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 
