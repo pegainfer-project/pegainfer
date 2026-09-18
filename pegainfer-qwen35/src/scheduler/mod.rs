@@ -379,20 +379,26 @@ pub(crate) fn start_with_capacity_and_policy(
 
     let join_handle = thread::Builder::new()
         .name("scheduler-qwen35".into())
-        .spawn(move || match bind_model_thread(backend.model()) {
-            Ok(_guard) => {
-                let _ = startup_tx.send(Ok(()));
-                scheduler_loop(
-                    SchedulerBackend::Single(backend),
-                    submit_rx,
-                    seed,
-                    max_prefill_tokens,
-                    scheduler_policy,
-                    load_tx,
-                );
-            }
-            Err(err) => {
-                let _ = startup_tx.send(Err(err));
+        .spawn(move || {
+            match crate::cublas_thread::bind_model_thread(backend.model(), "scheduler") {
+                Ok(_guard) => {
+                    if let Err(err) = backend.model().tune_decode_gemm_algos() {
+                        let _ = startup_tx.send(Err(err));
+                        return;
+                    }
+                    let _ = startup_tx.send(Ok(()));
+                    scheduler_loop(
+                        SchedulerBackend::Single(backend),
+                        submit_rx,
+                        seed,
+                        max_prefill_tokens,
+                        scheduler_policy,
+                        load_tx,
+                    );
+                }
+                Err(err) => {
+                    let _ = startup_tx.send(Err(err));
+                }
             }
         })
         .expect("failed to spawn Qwen3.5 scheduler thread");
@@ -489,38 +495,6 @@ fn servable_len(max_context: usize, max_pages: usize, page_size: usize) -> u32 {
         .min(max_pages.saturating_mul(page_size))
         .try_into()
         .unwrap_or(u32::MAX)
-}
-
-struct CublasThreadGuard;
-
-impl Drop for CublasThreadGuard {
-    fn drop(&mut self) {
-        unsafe {
-            crate::ffi::cublas_destroy();
-        }
-    }
-}
-
-fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
-    let ctx = model.device_ctx();
-    unsafe {
-        let err = crate::ffi::cuda_set_device(ctx.device_ordinal as i32);
-        if err != 0 {
-            return Err(anyhow::anyhow!(
-                "Failed to set CUDA device {} on Qwen3.5 scheduler thread: cudaError={}",
-                ctx.device_ordinal,
-                err
-            ));
-        }
-    }
-    ctx.ctx.bind_to_thread().map_err(|e| {
-        anyhow::anyhow!("Failed to bind CUDA context to Qwen3.5 scheduler thread: {e}")
-    })?;
-    unsafe {
-        crate::ffi::cublas_init();
-    }
-    model.tune_decode_gemm_algos()?;
-    Ok(CublasThreadGuard)
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────

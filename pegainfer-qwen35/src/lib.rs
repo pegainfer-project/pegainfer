@@ -9,6 +9,7 @@
 mod batch_decode;
 pub(crate) mod batch_decode_graph;
 pub(crate) mod config;
+mod cublas_thread;
 mod decode_buffers;
 mod executor;
 mod ffi;
