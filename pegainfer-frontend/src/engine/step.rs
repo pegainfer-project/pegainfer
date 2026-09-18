@@ -176,6 +176,8 @@ pub enum RejectReason {
         max_tokens: usize,
         limit: usize,
     },
+    /// Whole-prefill scheduling cannot fit the request in one scheduler step.
+    PrefillStepBudget { prompt_tokens: usize, limit: usize },
     /// Echo needs all-position logits in one forward pass, so the prompt must
     /// fit the profiled prefill bound.
     EchoPrefillTokens { prompt_tokens: usize, limit: usize },
@@ -203,6 +205,13 @@ impl fmt::Display for RejectReason {
                 "request exceeds this model's maximum context length of {limit} tokens: \
                  requested {} (prompt={prompt_tokens} + max_tokens={max_tokens})",
                 prompt_tokens.saturating_add(*max_tokens)
+            ),
+            Self::PrefillStepBudget {
+                prompt_tokens,
+                limit,
+            } => write!(
+                f,
+                "request prompt has {prompt_tokens} tokens but the whole-prefill step budget is {limit} tokens"
             ),
             Self::EchoPrefillTokens {
                 prompt_tokens,

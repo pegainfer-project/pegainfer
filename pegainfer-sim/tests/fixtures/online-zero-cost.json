@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "calibration": {
+    "manifest": "online-zero-cost.manifest.json",
+    "sha256": "ff93f08f9f81855cea5b96c99cbad188ba708d99ca340aa6a9b05282c1123926"
+  },
+  "scheduler": {
+    "policy": "vllm_v1",
+    "max_num_seqs": 2,
+    "max_num_batched_tokens": 4,
+    "max_model_len": 16,
+    "prefill": {
+      "mode": "chunked",
+      "max_chunk_tokens": 2
+    }
+  },
+  "predictor": {
+    "coverage": {
+      "decode_reqs": [0, 2],
+      "sum_decode_ctx_tokens": [0, 4],
+      "prefill_tokens_in_step": [0, 4]
+    },
+    "grid": {
+      "decode_reqs": [0, 1, 2],
+      "sum_decode_ctx_tokens": [0, 2, 4],
+      "prefill_tokens_in_step": [0, 2, 4],
+      "step_duration_us": [
+        0, 0, 0,
+        0, 0, 0,
+        0, 0, 0,
+        0, 0, 0,
+        0, 0, 0,
+        0, 0, 0,
+        0, 0, 0,
+        0, 0, 0,
+        0, 0, 0
+      ]
+    }
+  }
+}

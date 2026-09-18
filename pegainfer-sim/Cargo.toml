@@ -11,12 +11,16 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+log = { workspace = true }
+logforth = { workspace = true }
 pegainfer-frontend = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json"] }
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio-util = { workspace = true }
 

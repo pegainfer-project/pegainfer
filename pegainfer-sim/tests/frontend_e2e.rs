@@ -1,14 +1,20 @@
 use std::fs;
 use std::net::TcpListener;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use pegainfer_sim::SimulatedEngineConfig;
+use pegainfer_sim::profile::EngineProfile;
+use pegainfer_sim::profile::LoadedEngineProfile;
+use pegainfer_sim::profile::StepShape;
 use pegainfer_sim::start_engine;
 use pegainfer_sim::start_engine_with_partitions;
+use pegainfer_sim::worker::WorkerRequest;
+use pegainfer_sim::worker::WorkerState;
 use reqwest::Client;
 use serde_json::Value;
 use serde_json::json;
@@ -21,6 +27,8 @@ const MODEL_NAME: &str = "pegainfer-sim-e2e";
 const METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-metrics";
 const SLOW_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-slow-metrics";
 const SPEC_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-spec-metrics";
+const PROFILE_GATE_MODEL_NAME: &str = "pegainfer-sim-online-gate";
+const ZERO_COST_MODEL_NAME: &str = "pegainfer-sim-zero-cost";
 /// The pretend drafter the spec-metrics server runs: `K` and how many of those
 /// draft tokens each verify step accepts.
 const SPEC_K: usize = 3;
@@ -185,6 +193,106 @@ struct StartedSimServer {
     task: JoinHandle<Result<()>>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PlanTrace {
+    shape: StepShape,
+    duration_us: u64,
+    admitted: Vec<u64>,
+    prefill: Vec<(u64, u32)>,
+    decode: Vec<(u64, u32)>,
+}
+
+fn profile_fixture(name: &str) -> Result<(TempDir, LoadedEngineProfile)> {
+    let (profile_bytes, manifest_name, manifest_bytes): (&[u8], &str, &[u8]) = match name {
+        "online-step-gate.json" => (
+            include_bytes!("fixtures/online-step-gate.json"),
+            "online-step-gate.manifest.json",
+            include_bytes!("fixtures/online-step-gate.manifest.json"),
+        ),
+        "online-zero-cost.json" => (
+            include_bytes!("fixtures/online-zero-cost.json"),
+            "online-zero-cost.manifest.json",
+            include_bytes!("fixtures/online-zero-cost.manifest.json"),
+        ),
+        other => bail!("unknown profile fixture {other}"),
+    };
+    let dir = tempfile::tempdir()?;
+    fs::write(dir.path().join(name), profile_bytes)?;
+    fs::write(dir.path().join(manifest_name), manifest_bytes)?;
+    let profile = EngineProfile::load_from_path(dir.path().join(name))?;
+    Ok((dir, profile))
+}
+
+fn replay_profiled_worker(profile: &LoadedEngineProfile) -> Result<Vec<PlanTrace>> {
+    let mut worker = WorkerState::new(profile.scheduler.clone())?;
+    for request in [
+        WorkerRequest {
+            id: 1_u64,
+            prompt_tokens: 4,
+            output_tokens: 2,
+        },
+        WorkerRequest {
+            id: 2,
+            prompt_tokens: 2,
+            output_tokens: 2,
+        },
+        WorkerRequest {
+            id: 3,
+            prompt_tokens: 1,
+            output_tokens: 2,
+        },
+    ] {
+        assert!(matches!(
+            worker.submit(request)?,
+            pegainfer_sim::worker::SubmissionResult::Queued
+        ));
+    }
+
+    let mut trace = Vec::new();
+    let mut observed_waiting = false;
+    while !worker.is_idle() {
+        observed_waiting |= worker.waiting_len() > 0;
+        let plan = worker
+            .plan_step()?
+            .context("worker with active requests produced no step")?;
+        let step_id = plan.id();
+        let shape = plan.shape();
+        let estimate = profile.estimate_step(shape)?;
+        assert!(matches!(
+            estimate.source,
+            pegainfer_sim::profile::StepTimingSource::GridInterpolation
+        ));
+        assert!(
+            shape.decode_reqs <= profile.scheduler.max_num_seqs,
+            "decode request count exceeded scheduler capacity: {shape:?}"
+        );
+        assert!(
+            shape.decode_reqs + shape.prefill_tokens_in_step
+                <= profile.scheduler.max_num_batched_tokens,
+            "step token count exceeded scheduler capacity: {shape:?}"
+        );
+        let entry = PlanTrace {
+            shape,
+            duration_us: estimate.duration_us,
+            admitted: plan.admitted().to_vec(),
+            prefill: plan
+                .prefill()
+                .iter()
+                .map(|work| (work.request_id, work.tokens))
+                .collect(),
+            decode: plan
+                .decode()
+                .iter()
+                .map(|work| (work.request_id, work.context_tokens))
+                .collect(),
+        };
+        worker.complete_step(step_id)?;
+        trace.push(entry);
+    }
+    assert!(observed_waiting, "replay must exercise sequence admission");
+    Ok(trace)
+}
+
 fn empty_model_dir() -> Result<TempDir> {
     tempfile::tempdir().context("failed to create temp model dir")
 }
@@ -217,6 +325,196 @@ async fn simulated_engine_serves_openai_completions_over_http() -> Result<()> {
     assert_non_streaming_completion_has_output(&client, &server.base_url, &server.model_name)
         .await?;
     assert_streaming_completion_emits_done(&client, &server.base_url, &server.model_name).await?;
+
+    server.shutdown().await
+}
+
+#[test]
+fn profiled_worker_replay_is_deterministic_and_bounded() -> Result<()> {
+    let (_fixture_dir, profile) = profile_fixture("online-step-gate.json")?;
+    let first = replay_profiled_worker(&profile)?;
+    let second = replay_profiled_worker(&profile)?;
+
+    assert_eq!(
+        first, second,
+        "same profile and arrivals must replay identically"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|step| step.shape.prefill_tokens_in_step > 0),
+        "replay must include prefill work"
+    );
+    assert!(
+        first.iter().any(|step| step.shape.decode_reqs > 0),
+        "replay must include decode work"
+    );
+    assert!(
+        first
+            .iter()
+            .map(|step| step.duration_us)
+            .min()
+            .is_some_and(|minimum| {
+                first
+                    .iter()
+                    .map(|step| step.duration_us)
+                    .any(|duration| duration > minimum)
+            }),
+        "grid pricing must vary across the replayed step shapes"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn zero_cost_profile_fixture_is_valid() -> Result<()> {
+    let (_fixture_dir, profile) = profile_fixture("online-zero-cost.json")?;
+    assert!(
+        profile
+            .predictor
+            .grid
+            .step_duration_us
+            .iter()
+            .all(|duration| *duration == 0),
+        "zero-cost fixture must not add synthetic engine delay"
+    );
+    let estimate = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 2,
+        prefill_tokens_in_step: 0,
+    })?;
+    assert_eq!(estimate.duration_us, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profiled_online_worker_serves_multi_request_workload() -> Result<()> {
+    let (_fixture_dir, profile) = profile_fixture("online-step-gate.json")?;
+    let config = SimulatedEngineConfig::default().with_engine_profile(profile)?;
+    let server = SimServer::spawn_with_config(
+        model_dir_with_minimal_metadata()?,
+        1,
+        PROFILE_GATE_MODEL_NAME,
+        config,
+    )
+    .await?;
+    let client = test_client()?;
+
+    assert_models_endpoint(&client, &server.base_url, PROFILE_GATE_MODEL_NAME).await?;
+
+    let base_url = server.base_url.clone();
+    let post_request = move |client: Client| {
+        let url = format!("{base_url}/v1/completions");
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&json!({
+                    "model": PROFILE_GATE_MODEL_NAME,
+                    "prompt": [1, 2],
+                    "max_tokens": 2,
+                    "temperature": 0.0,
+                    "ignore_eos": true
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await
+                .context("failed to parse profiled completion")
+        })
+    };
+
+    let mut requests = vec![post_request(client.clone()), post_request(client.clone())];
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[("vllm:num_requests_running", "0", 2.0)],
+        PROFILE_GATE_MODEL_NAME,
+    )
+    .await?;
+
+    // Capacity ordering is asserted by the deterministic worker replay; the
+    // HTTP gate checks stable post-drain counters instead of a transient scrape.
+    requests.push(post_request(client.clone()));
+
+    for request in requests {
+        let response = request
+            .await
+            .context("profiled completion task panicked")??;
+        assert_eq!(
+            response["choices"][0]["finish_reason"].as_str(),
+            Some("length"),
+            "profiled completion must consume the requested output budget: {response}"
+        );
+    }
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:num_requests_running", "0", 0.0),
+            ("vllm:num_requests_waiting", "0", 0.0),
+            ("vllm:prompt_tokens_total", "0", 6.0),
+            ("vllm:generation_tokens_total", "0", 6.0),
+        ],
+        PROFILE_GATE_MODEL_NAME,
+    )
+    .await?;
+    wait_for_labeled_metrics(
+        &client,
+        &server.base_url,
+        &[(
+            "vllm:request_success_total",
+            "0",
+            &[("finished_reason", "length")][..],
+            3.0,
+        )],
+        PROFILE_GATE_MODEL_NAME,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_cost_profile_measures_frontend_baseline() -> Result<()> {
+    let (_fixture_dir, profile) = profile_fixture("online-zero-cost.json")?;
+    let config = SimulatedEngineConfig::default().with_engine_profile(profile)?;
+    let server = SimServer::spawn_with_config(
+        model_dir_with_minimal_metadata()?,
+        1,
+        ZERO_COST_MODEL_NAME,
+        config,
+    )
+    .await?;
+    let client = test_client()?;
+    let started = Instant::now();
+    let response = client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&json!({
+            "model": ZERO_COST_MODEL_NAME,
+            "prompt": [1, 2],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "ignore_eos": true
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        response["choices"][0]["finish_reason"].as_str(),
+        Some("length"),
+        "zero-cost completion must still traverse the normal frontend: {response}"
+    );
+    eprintln!(
+        "zero-cost profile frontend baseline: {:.3} ms",
+        elapsed.as_secs_f64() * 1_000.0
+    );
 
     server.shutdown().await
 }

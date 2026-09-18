@@ -1,0 +1,16 @@
+{
+  "target_engine": "vllm",
+  "engine_version": "fixture",
+  "model_id": "pegainfer-sim-online-gate",
+  "model_revision": "fixture-revision",
+  "model_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "gpu": "fixture-cpu",
+  "server_flags": [
+    "--max-num-seqs=2",
+    "--max-num-batched-tokens=4",
+    "--max-model-len=16",
+    "--enable-chunked-prefill"
+  ],
+  "collection_command": "fixture",
+  "source_artifacts": ["fixture"]
+}
