@@ -35,7 +35,9 @@ use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::output::UtilityCallOutput;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
+use vllm_engine_core_client::protocol::stats::BaseCacheStats;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::stats::PrefixCacheStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
@@ -53,6 +55,7 @@ use zeromq::util::PeerIdentity;
 use crate::engine::EngineHandle;
 use crate::engine::FinishReason;
 use crate::engine::GenerateRequest;
+use crate::engine::PrefixCacheCounters;
 use crate::engine::RequestAbortReason;
 use crate::engine::RequestTag;
 use crate::engine::SchedulerMetrics;
@@ -650,6 +653,33 @@ impl SpecDecodeTracker {
     }
 }
 
+/// One baseline per bridge: coalesced snapshots retain all increments, and
+/// repeated snapshots contribute zero to the frontend's Prometheus counters.
+#[derive(Default)]
+pub(crate) struct SchedulerStatsTracker {
+    spec: SpecDecodeTracker,
+    prefix: PrefixCacheCounters,
+}
+
+impl SchedulerStatsTracker {
+    pub(crate) fn interval(&mut self, snapshot: &SchedulerMetrics) -> SchedulerStats {
+        let cur = snapshot.prefix_cache;
+        let mut stats = scheduler_stats_from(snapshot);
+        stats.spec_decoding_stats = self.spec.interval(snapshot);
+        stats.prefix_cache_stats = PrefixCacheStats {
+            base: BaseCacheStats {
+                requests: cur.requests.saturating_sub(self.prefix.requests),
+                queries: cur.queries.saturating_sub(self.prefix.queries),
+                hits: cur.hits.saturating_sub(self.prefix.hits),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        self.prefix = cur;
+        stats
+    }
+}
+
 /// Forward every scheduler load snapshot as a stats-only output batch; the
 /// frontend records it into the shared Prometheus registry. Sends the current
 /// snapshot up front so the gauges initialize before the first step, then one
@@ -662,11 +692,10 @@ async fn publish_scheduler_stats(
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let mut spec = SpecDecodeTracker::default();
+    let mut tracker = SchedulerStatsTracker::default();
     loop {
         let snapshot = *load_rx.borrow_and_update();
-        let mut stats = scheduler_stats_from(&snapshot);
-        stats.spec_decoding_stats = spec.interval(&snapshot);
+        let stats = tracker.interval(&snapshot);
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),
