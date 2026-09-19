@@ -7,10 +7,17 @@ use pegainfer_core::tensor::DeviceVec;
 
 use crate::config::Eagle3Config;
 
+mod forward;
 mod loading;
 mod reservation;
 
-// Wired into the KV budget by the forward-pass PR; kept here as the skeleton lands.
+// Consumed by the scheduler PR that drives the drafter; exported as the forward
+// path lands.
+#[allow(unused_imports)]
+pub(crate) use forward::Eagle3RequestState;
+#[allow(unused_imports)]
+pub(crate) use forward::Eagle3Scratch;
+// Wired into the KV budget by the scheduler PR; kept here as the skeleton lands.
 #[allow(unused_imports)]
 pub(crate) use reservation::Eagle3MemoryReservation;
 
