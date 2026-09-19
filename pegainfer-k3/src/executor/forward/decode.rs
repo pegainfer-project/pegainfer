@@ -5,6 +5,7 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_kernels::ops::K3_CONV_WIDTH;
+use pegainfer_kernels::ops::k3_capsule_kda_decode_launch;
 use pegainfer_kernels::ops::k3_conv_silu_batched_launch;
 use pegainfer_kernels::ops::k3_kda_core_batched_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
@@ -184,6 +185,113 @@ pub(super) fn kda_attention(
         &w.gamma_o,
         recurrent_read,
         recurrent_write,
+        &mut s.gated,
+    )?;
+    k3_gemm_full(ctx, &w.w_o, &s.gated, b, &mut s.hidden_partial)?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_HIDDEN,
+        K3_HIDDEN,
+        0,
+        1,
+        &s.hidden_partial,
+        &mut s.attn_out,
+    )
+}
+
+/// The capsule spelling of [`kda_attention`]: one full fused projection GEMM
+/// (instead of the gate quarter plus three band GEMMs), two landings out of
+/// it (`out_gate` and the packed `q|k|v` rows), and the vendored vLLM fused
+/// decode kernel in place of the conv_silu x3 + kda_core chain. The kernel
+/// updates the packed conv slab and the recurrent state **in place**, so the
+/// caller passes the fixed parity-0 slab and no successor buffers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn kda_attention_capsule(
+    ctx: &DeviceContext,
+    b: usize,
+    layer: &K3LayerWeights,
+    w: &K3KdaWeights,
+    recurrent: &mut CudaSlice<f32>,
+    conv_packed: &mut CudaSlice<bf16>,
+    s: &mut K3Scratch,
+) -> Result<()> {
+    k3_rms_norm_rbs_batched_launch(
+        ctx,
+        b,
+        K3_HIDDEN,
+        &s.mixed,
+        &layer.gamma_in.data,
+        &mut s.normed,
+    )?;
+    k3_gemm_full(ctx, &w.wbig, &s.normed, b, &mut s.kda_gate_partial)?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_KDA_FUSED,
+        K3_ATTN_INNER,
+        3 * K3_ATTN_INNER,
+        1,
+        &s.kda_gate_partial,
+        &mut s.out_gate,
+    )?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_KDA_FUSED,
+        3 * K3_ATTN_INNER,
+        0,
+        1,
+        &s.kda_gate_partial,
+        &mut s.kda_x_packed,
+    )?;
+    k3_gemm_full(ctx, &w.wsm, &s.normed, b, &mut s.kda_wsm_partial)?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_KDA_WSM_PADDED,
+        K3_HEADS,
+        0,
+        1,
+        &s.kda_wsm_partial,
+        &mut s.beta,
+    )?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_KDA_WSM_PADDED,
+        K3_HEAD_DIM,
+        K3_HEADS,
+        1,
+        &s.kda_wsm_partial,
+        &mut s.forget_low,
+    )?;
+    k3_gemm_full(ctx, &w.w_f_b, &s.forget_low, b, &mut s.kda_forget_partial)?;
+    k3_land_batched_launch(
+        ctx,
+        b,
+        K3_ATTN_INNER,
+        K3_ATTN_INNER,
+        0,
+        1,
+        &s.kda_forget_partial,
+        &mut s.kda_g,
+    )?;
+    k3_capsule_kda_decode_launch(
+        ctx,
+        b,
+        &s.kda_x_packed,
+        &w.cw_q,
+        &w.cw_k,
+        &w.cw_v,
+        conv_packed,
+        &w.a_log,
+        &s.kda_g,
+        &w.dt_bias,
+        &s.beta,
+        &s.out_gate,
+        &w.gamma_o,
+        recurrent,
         &mut s.gated,
     )?;
     k3_gemm_full(ctx, &w.w_o, &s.gated, b, &mut s.hidden_partial)?;

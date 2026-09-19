@@ -21,6 +21,7 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 use half::bf16;
 use pegainfer_kernels::ops::K3_ATTNRES_MAX_BLOCKS;
+use pegainfer_kernels::ops::K3_CAPSULE_CONV_SLOT;
 use pegainfer_kernels::ops::K3_CONV_WIDTH;
 use pegainfer_kernels::ops::K3_KDA_HEAD_DIM;
 use pegainfer_kernels::ops::K3_KDA_HEADS;
@@ -39,6 +40,7 @@ use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 
 use super::ep::K3FabricSlab;
+use super::forward::capsule::capsule_flags;
 use super::paged_kv::K3PagedKv;
 use crate::config::K3_ATTN_INNER;
 use crate::config::K3_DENSE_INTERMEDIATE;
@@ -80,6 +82,12 @@ pub(crate) struct K3KdaState {
     pub(crate) recurrent: [CudaSlice<f32>; 2],
     /// `[2][3][rows, width - 1, inner]` bf16, one window per q/k/v stream.
     pub(crate) conv: [[CudaSlice<bf16>; 3]; 2],
+    /// Capsule-KDA conv slab, `[rows, width - 1, 3, inner]` bf16 — the
+    /// packed `q|k|v` tap layout the vendored vLLM decode kernel compiles
+    /// in. Present only under `PEGAINFER_K3_CAPSULE=kda`; updated in place
+    /// by the capsule step (no parity pair), filled by [`K3StatePool::adopt_row`]
+    /// from the native windows at the prefill handover.
+    pub(crate) conv_packed: Option<CudaSlice<bf16>>,
 }
 
 pub(crate) enum K3LayerState {
@@ -162,9 +170,18 @@ impl K3StatePool {
                     let [recurrent_even, recurrent_odd] = recurrent
                         .try_into()
                         .unwrap_or_else(|_| unreachable!("two parities were pushed"));
+                    let conv_packed = capsule_flags()
+                        .kda
+                        .then(|| {
+                            stream
+                                .alloc_zeros::<bf16>(rows * K3_CAPSULE_CONV_SLOT)
+                                .context("alloc K3 capsule conv slab")
+                        })
+                        .transpose()?;
                     K3LayerState::Kda(Box::new(K3KdaState {
                         recurrent: [recurrent_even, recurrent_odd],
                         conv: [conv_even, conv_odd],
+                        conv_packed,
                     }))
                 }
                 K3LayerKind::Mla => K3LayerState::Mla,
@@ -197,6 +214,9 @@ impl K3StatePool {
                         for stream in &mut kda.conv[parity] {
                             zero_rows(ctx, stream, row, 1, K3_CONV_STATE * K3_ATTN_INNER)?;
                         }
+                    }
+                    if let Some(packed) = kda.conv_packed.as_mut() {
+                        zero_rows(ctx, packed, row, 1, K3_CAPSULE_CONV_SLOT)?;
                     }
                 }
                 // The paged latent cache is released below; freed pages are
@@ -248,28 +268,54 @@ impl K3StatePool {
         for (target, origin) in self.layers.iter_mut().zip(&source.layers) {
             match (target, origin) {
                 (K3LayerState::Kda(target), K3LayerState::Kda(origin)) => {
+                    // The capsule step reads and updates parity slab 0 in
+                    // place, whatever the step counter says — land there.
+                    let recurrent_parity = if target.conv_packed.is_some() {
+                        0
+                    } else {
+                        target_parity
+                    };
                     copy_rows(
                         ctx,
                         &origin.recurrent[source_parity],
                         source_row,
-                        &mut target.recurrent[target_parity],
+                        &mut target.recurrent[recurrent_parity],
                         row,
                         1,
                         K3_KDA_STATE,
                     )?;
-                    for (target, origin) in target.conv[target_parity]
-                        .iter_mut()
-                        .zip(&origin.conv[source_parity])
-                    {
-                        copy_rows(
-                            ctx,
-                            origin,
-                            source_row,
-                            target,
-                            row,
-                            1,
-                            K3_CONV_STATE * K3_ATTN_INNER,
-                        )?;
+                    if let Some(packed) = target.conv_packed.as_mut() {
+                        // Repack the native per-stream `[width-1, inner]`
+                        // windows into the capsule slab's `[width-1, q|k|v,
+                        // inner]` row — the only place the two layouts meet.
+                        for (stream, origin) in origin.conv[source_parity].iter().enumerate() {
+                            copy_rows_2d(
+                                ctx,
+                                origin,
+                                source_row * K3_CONV_STATE * K3_ATTN_INNER,
+                                K3_ATTN_INNER,
+                                packed,
+                                row * K3_CAPSULE_CONV_SLOT + stream * K3_ATTN_INNER,
+                                3 * K3_ATTN_INNER,
+                                K3_CONV_STATE,
+                                K3_ATTN_INNER,
+                            )?;
+                        }
+                    } else {
+                        for (target, origin) in target.conv[target_parity]
+                            .iter_mut()
+                            .zip(&origin.conv[source_parity])
+                        {
+                            copy_rows(
+                                ctx,
+                                origin,
+                                source_row,
+                                target,
+                                row,
+                                1,
+                                K3_CONV_STATE * K3_ATTN_INNER,
+                            )?;
+                        }
                     }
                 }
                 // The paged latent cache is adopted once for the whole pool,
@@ -767,6 +813,9 @@ pub(crate) struct K3Scratch {
     pub(crate) conv_k: CudaSlice<bf16>,
     pub(crate) conv_v: CudaSlice<bf16>,
     pub(crate) gated: CudaSlice<bf16>,
+    /// Capsule KDA: the packed `q|k|v` pre-conv rows, `[rows, 3 * inner]`
+    /// bf16, landed in one span from the fused projection partial.
+    pub(crate) kda_x_packed: CudaSlice<bf16>,
     /// Chunked prefill (FlashKDA): the landed pre-activation gate projection,
     /// `[rows, inner]` — the same `bf16(Σ gp)` landing the fused core takes
     /// before adding `dt_bias`, which FlashKDA applies in-kernel.
@@ -895,6 +944,7 @@ impl K3Scratch {
             conv_k: wide(K3_ATTN_INNER)?,
             conv_v: wide(K3_ATTN_INNER)?,
             gated: wide(K3_ATTN_INNER)?,
+            kda_x_packed: wide(3 * K3_ATTN_INNER)?,
             kda_g: wide(K3_ATTN_INNER)?,
             kda_beta_t: wide(K3_KDA_HEADS)?,
             kda_attn: wide(K3_ATTN_INNER)?,
