@@ -48,7 +48,12 @@ const P99_TOL: f32 = 0.20;
 
 /// Size key from config CONTENT, not the directory name; keep in sync with
 /// `SIZE_NAMES` in `tools/accuracy/dump_qwen35_hf_golden.py`.
-fn fixture_size_name(model_path: &str) -> Option<&'static str> {
+/// `(line, size)` the committed fixture is keyed by. Qwen3.8's text tower is
+/// shape-identical to Qwen3.5's, so geometry alone cannot pick the fixture and
+/// the generation is part of the key. A wrong pairing cannot pass unnoticed:
+/// every fixture records `config_sha256` and `model_revision`, and
+/// [`check_fixture_metadata`] rejects a checkpoint that does not match them.
+fn fixture_size_name(model_path: &str) -> Option<(&'static str, &'static str)> {
     let config_path = Path::new(model_path).join("config.json");
     let raw = std::fs::read_to_string(&config_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
@@ -65,28 +70,44 @@ fn fixture_size_name(model_path: &str) -> Option<&'static str> {
             config_path.display()
         );
     };
-    match (hidden, layers) {
-        (1024, 24) => Some("0.8b"),
-        (2048, 24) => Some("2b"),
-        (2560, 32) => Some("4b"),
-        (4096, 32) => Some("9b"),
-        (5120, 64) => Some("27b"),
-        _ => None,
-    }
+    // The one `text_config` field a Qwen3.8 save carries and a Qwen3.5 save
+    // omits. Nothing in the model reads it (see docs/models/qwen35/support-qwen38.md),
+    // so it is a save-time marker only.
+    let line = if t.get("output_gate_type").is_some() {
+        "qwen38"
+    } else {
+        "qwen35"
+    };
+    let size = match (hidden, layers) {
+        (1024, 24) => "0.8b",
+        (2048, 24) => "2b",
+        (2560, 32) => "4b",
+        (4096, 32) => "9b",
+        (5120, 64) => "27b",
+        _ => return None,
+    };
+    Some((line, size))
 }
 
-/// Sizes whose fixtures are committed in `test_data/`; a missing file for
-/// these is a broken checkout, not an ungenerated fixture.
-const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.8b", "2b", "4b", "9b", "27b"];
+/// Fixtures committed in `test_data/`; a missing file for one of these is a
+/// broken checkout, not an ungenerated fixture.
+const COMMITTED_FIXTURES: &[(&str, &str)] = &[
+    ("qwen35", "0.8b"),
+    ("qwen35", "2b"),
+    ("qwen35", "4b"),
+    ("qwen35", "9b"),
+    ("qwen35", "27b"),
+    ("qwen38", "27b"),
+];
 
-fn default_fixture_path(size: &str, long: bool) -> String {
+fn default_fixture_path(line: &str, size: &str, long: bool) -> String {
     let kind = if long {
         "-hf-long-golden"
     } else {
         "-hf-golden"
     };
     format!(
-        "{}/../test_data/qwen35-{size}{kind}.safetensors",
+        "{}/../test_data/{line}-{size}{kind}.safetensors",
         env!("CARGO_MANIFEST_DIR")
     )
 }
@@ -323,7 +344,7 @@ impl Golden {
     /// fixture is a clean skip (`None`).
     fn load_for(model_path: &str, long: bool) -> Option<Golden> {
         let env_key = if long { LONG_GOLDEN_ENV } else { GOLDEN_ENV };
-        let Some(size) = fixture_size_name(model_path) else {
+        let Some((line, size)) = fixture_size_name(model_path) else {
             assert!(
                 std::env::var(env_key).is_err(),
                 "{env_key} is set but the model geometry in {model_path}/config.json \
@@ -338,10 +359,10 @@ impl Golden {
         let path = if let Ok(path) = std::env::var(env_key) {
             path
         } else {
-            let path = default_fixture_path(size, long);
+            let path = default_fixture_path(line, size, long);
             if !Path::new(&path).exists() {
                 assert!(
-                    !COMMITTED_FIXTURE_SIZES.contains(&size),
+                    !COMMITTED_FIXTURES.contains(&(line, size)),
                     "committed golden fixture missing at {path}"
                 );
                 eprintln!(

@@ -37,23 +37,45 @@ TOP_K = 64
 
 
 # Keep in sync with `fixture_size_name` in
-# pegainfer-qwen35/tests/hf_golden_gate.rs (the size-key geometry table).
+# pegainfer-qwen35/tests/hf_golden_gate.rs (the fixture key table).
+#
+# The key carries the generation as well as the geometry: Qwen3.8-27B's text
+# tower is shape-identical to Qwen3.5-27B's, so (hidden, layers) alone cannot
+# pick a fixture. A mispairing cannot pass unnoticed either -- the gate asserts
+# the fixture's recorded `config_sha256` and `model_revision` against the local
+# checkpoint before it compares a single logit.
 SIZE_NAMES = {
-    (1024, 24): "Qwen3.5-0.8B",
-    (2048, 24): "Qwen3.5-2B",
-    (2560, 32): "Qwen3.5-4B",
-    (4096, 32): "Qwen3.5-9B",
-    (5120, 64): "Qwen3.5-27B",
+    (1024, 24, "qwen35"): "Qwen3.5-0.8B",
+    (2048, 24, "qwen35"): "Qwen3.5-2B",
+    (2560, 32, "qwen35"): "Qwen3.5-4B",
+    (4096, 32, "qwen35"): "Qwen3.5-9B",
+    (5120, 64, "qwen35"): "Qwen3.5-27B",
+    (5120, 64, "qwen38"): "Qwen3.8-27B",
 }
+
+
+def generation_from_config(config: dict) -> str:
+    """Which Qwen3.5-line generation saved this config.
+
+    `text_config.output_gate_type` is the one field a Qwen3.8 save carries and a
+    Qwen3.5 save omits. No modelling code reads it for this architecture (it is
+    consumed only by `qwen4_exp`), so it is a save-time marker, nothing more.
+    """
+    text = config.get("text_config", config)
+    return "qwen38" if "output_gate_type" in text else "qwen35"
 
 
 def model_name_from_config(model_path: Path) -> str:
     config = json.loads((model_path / "config.json").read_text())
     text = config.get("text_config", config)
-    key = (text["hidden_size"], text["num_hidden_layers"])
+    key = (
+        text["hidden_size"],
+        text["num_hidden_layers"],
+        generation_from_config(config),
+    )
     if key not in SIZE_NAMES:
         raise SystemExit(
-            f"no size-name mapping for hidden/layers {key}; extend SIZE_NAMES"
+            f"no size-name mapping for hidden/layers/generation {key}; extend SIZE_NAMES"
         )
     return SIZE_NAMES[key]
 
@@ -93,11 +115,18 @@ def infer_revision(path: Path) -> str:
     return "unknown"
 
 
-def load_model(model_path: str, dtype: str, device_map: str):
+def load_model(model_path: str, dtype: str, device_map: str, max_memory_gib: int | None):
     kwargs = {"trust_remote_code": True, "torch_dtype": DTYPES[dtype]}
     if device_map == "none":
         model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs).to("cuda")
     else:
+        if max_memory_gib is not None:
+            # A shared tray already has other tenants on it, and accelerate
+            # plans against each device's *total* memory, so without a cap the
+            # placement overcommits and dies partway through loading.
+            kwargs["max_memory"] = {
+                i: f"{max_memory_gib}GiB" for i in range(torch.cuda.device_count())
+            }
         model = AutoModelForCausalLM.from_pretrained(
             model_path, device_map=device_map, **kwargs
         )
@@ -133,7 +162,7 @@ def main() -> int:
     parser.add_argument(
         "--out",
         default=None,
-        help="output path; defaults to test_data/qwen35-{size}-hf-golden.safetensors "
+        help="output path; defaults to test_data/{generation}-{size}-hf-golden.safetensors "
         "derived from the model config (the only names the gate looks up)",
     )
     parser.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
@@ -141,6 +170,13 @@ def main() -> int:
         "--device-map",
         default="auto",
         help="'none' for single-GPU, 'auto' to shard larger models",
+    )
+    parser.add_argument(
+        "--max-memory-gib",
+        type=int,
+        default=None,
+        help="cap accelerate's placement per visible GPU (GiB); needed on a shared "
+        "tray where other tenants already hold most of each card's memory",
     )
     parser.add_argument("--model-revision", default=None)
     parser.add_argument("--tokenizer-revision", default=None)
@@ -172,16 +208,17 @@ def main() -> int:
     if args.vocab_ceiling <= 1:
         parser.error("--vocab-ceiling must be greater than 1")
 
-    size_key = (
-        model_name_from_config(Path(args.model_path)).removeprefix("Qwen3.5-").lower()
-    )
+    # "Qwen3.8-27B" -> stem "qwen38-27b" (the dot drops, matching the gate's
+    # `fixture_size_name` line), which is the name the gate looks up.
+    line, _, size_key = model_name_from_config(Path(args.model_path)).partition("-")
+    stem = f"{line.lower().replace('.', '')}-{size_key.lower()}"
     gate_names = {
-        f"qwen35-{size_key}-hf-golden.safetensors",
-        f"qwen35-{size_key}-hf-long-golden.safetensors",
+        f"{stem}-hf-golden.safetensors",
+        f"{stem}-hf-long-golden.safetensors",
     }
     if args.out is None:
         kind = "-hf-long-golden" if args.prompt_lens else "-hf-golden"
-        args.out = f"test_data/qwen35-{size_key}{kind}.safetensors"
+        args.out = f"test_data/{stem}{kind}.safetensors"
     elif Path(args.out).name not in gate_names:
         raise SystemExit(
             f"--out basename {Path(args.out).name!r} will not be found by the gate; "
@@ -213,7 +250,7 @@ def main() -> int:
             ).tolist()
         )
 
-    model = load_model(args.model_path, args.dtype, args.device_map)
+    model = load_model(args.model_path, args.dtype, args.device_map, args.max_memory_gib)
     if args.vocab_ceiling > model.config.vocab_size:
         parser.error(
             f"--vocab-ceiling ({args.vocab_ceiling}) cannot exceed "
@@ -287,6 +324,22 @@ def main() -> int:
         "torch_version": torch.__version__,
         "transformers_version": __import__("transformers").__version__,
     }
+    # An all-NaN oracle is possible: transformers falls back to an eager torch
+    # gated-DeltaNet implementation when flash-linear-attention is missing, and on
+    # the 27B geometry that fallback returned nothing but NaNs while pegainfer's own
+    # side stayed sane. The gate would then report mean/p99 NaN as a fixture
+    # mismatch — refuse here, where the fix is one command away, instead of ~25
+    # minutes and two model loads later on the GPU.
+    lp = tensors["topk_logprobs"]
+    finite = torch.isfinite(lp)
+    if not bool(finite.all()):
+        raise SystemExit(
+            f"refusing to write {args.out}: {int((~finite).sum())}/{finite.numel()} "
+            "reference logprobs are not finite. Install flash-linear-attention "
+            "(and causal-conv1d) so the gated-DeltaNet fast path is used instead of "
+            "transformers' eager torch fallback, then re-dump."
+        )
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out), metadata=meta)
