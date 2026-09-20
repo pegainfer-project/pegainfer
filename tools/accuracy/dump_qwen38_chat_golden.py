@@ -1,7 +1,7 @@
 """Dump a Qwen3.8 chat-template golden from a local checkpoint.
 
     python tools/accuracy/dump_qwen38_chat_golden.py \
-        /data/models/Qwen3.8-27B test_data/qwen38-chat-golden.json \
+        models/Qwen3.8-27B test_data/qwen38-chat-golden.json \
         --source-repo Qwen/Qwen3.8-27B --revision <sha>
 
 Provenance is required rather than inferred, and a template error aborts the
