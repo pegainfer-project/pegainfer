@@ -146,7 +146,7 @@ impl Qwen35Model {
         )
     }
 
-    fn from_safetensors_with_runtime_and_capacity(
+    pub(crate) fn from_safetensors_with_runtime_and_capacity(
         model_path: &str,
         runtime: ModelRuntimeConfig,
         max_batch: usize,

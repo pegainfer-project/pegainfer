@@ -719,7 +719,13 @@ impl Qwen35TpExecutor {
         let world_size = device_ordinals.len();
         let mut models = Vec::with_capacity(world_size);
         for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
-            models.push(Qwen35Model::from_safetensors_with_runtime(
+            // Load at the capacity the caller asked for. `…_with_runtime` defaults
+            // to `MAX_BATCH` decode slots, so going through it here reserved for
+            // 64 slots no matter what `--max-batch` said — the rank-local
+            // recurrent-state pool is sized at load time, so a later admission
+            // shrink could not give that memory back and 27B TP2 could not fit on
+            // a card that could not spare 64 slots' worth of it.
+            models.push(Qwen35Model::from_safetensors_with_runtime_and_capacity(
                 model_path,
                 ModelRuntimeConfig {
                     enable_cuda_graph,
@@ -727,6 +733,7 @@ impl Qwen35TpExecutor {
                     device_ordinal,
                     prefix_snapshot_bytes,
                 },
+                max_batch,
             )?);
         }
         let first = models
