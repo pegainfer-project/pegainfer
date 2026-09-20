@@ -2,7 +2,7 @@ This file provides guidance to Coding Agent when working with code in this repos
 
 ## What is PegaInfer
 
-Pure Rust + CUDA LLM inference engine. No PyTorch, no frameworks. OpenAI-compatible `/v1/completions` API.
+Pure Rust + CUDA LLM inference engine. No PyTorch, no frameworks. OpenAI-compatible `/v1/completions` and `/v1/chat/completions`.
 
 **Supported models:**
 
@@ -11,7 +11,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 | Model | Crate | Feature flag | Architecture |
 |-------|-------|-------------|-------------|
 | Qwen3-4B / 8B | `pegainfer-qwen3` | `qwen3` (default) | Full attention, TP support |
-| Qwen3.5-4B / 9B / 27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention |
+| Qwen3.5-4B / 9B / 27B · Qwen3.8-27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention. Qwen3.8 shares the line: same `model_type`, same text geometry — see `docs/models/qwen35/support-qwen38.md` |
 | DeepSeek-V2-Lite | `pegainfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
 | Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Sliding-window + global full attention, single GPU, batched decode, opt-in chunked prefill |
 | Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
@@ -21,6 +21,8 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 ## Build & Run
 
 **Always use `--release`** — debug builds are extremely slow for GPU/CUDA and will timeout.
+
+A fresh clone checks out no submodules, and `pegainfer-kernels/build.rs` needs the `third_party/flashinfer` headers: run `git submodule update --init --recursive` first, or `scripts/setup_dev.sh` for the minimal set.
 
 When developing with Docker, use `docker/Dockerfile.dev` and `docker/dev.sh` as described in `docker/README.md`.
 
@@ -64,6 +66,9 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 # Unit tests (~9s)
 cargo test --release --workspace --lib
 
+# Engine/frontend contract with no GPU and no weights (this is what CI runs)
+cargo test --release --locked -p pegainfer-sim --test frontend_e2e
+
 # Accuracy and integration tests — require GPU + model weights
 cargo test --release -p pegainfer-qwen3 --test hf_golden_gate
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate
@@ -74,6 +79,8 @@ cargo test --release --workspace --lib prefix_cache -- --nocapture
 ```
 
 Qwen accuracy gates compare logits against stored HF golden fixtures. Qwen3.5 exact-text JSON baselines are retired; keep `e2e_scheduler` for scheduler liveness and request-flow coverage.
+
+CI has no GPU: it compiles for sm_80 and runs only the CPU/sim suites, so a green CI says nothing about numerics or performance — accuracy gates and same-context A/B benches are local, on-card work. CI builds with `--locked`, so commit `Cargo.lock` whenever dependencies change.
 
 ## Architecture
 
@@ -118,6 +125,10 @@ Canonical doc: `docs/models/glm52/free-running-dp.md` (K3's gang lane follows it
 - **The per-step collective chain is fixed** — no conditional collectives. Skipping work happens inside kernels via zero-load padding entry, never by host negotiation.
 - **The launch count is the global clock** (pairing pins all ranks within ±1 launch). Coordination means agreeing ahead of time on *what step N contains*, never "wait until everyone is ready".
 - **Padding rows are protocol surface**: their bytes reach peers, so every dummy-row input must be constructively deterministic.
+
+## Logging
+
+Log through `pegainfer-core::logging`. The text layout already prints each record's module target, so do not prefix the message with a module or model name (`kimi-k2:`, `Qwen3.5 `); `anyhow!`/`bail!` messages do keep their prefix, since they reach callers without a target. More style rules: `docs/conventions/coding-style.md`.
 
 ---
 
@@ -203,4 +214,13 @@ When a session wraps up:
 
 Commit messages use Commitizen format: `<type>(<scope>): <subject>`. Never commit directly to `main` — create a `feat/`/`fix/`/`chore/`/… branch first.
 
-CI runs `cargo fmt --check`; run `cargo fmt` before committing.
+Every commit needs a `Signed-off-by:` trailer or the `dco` CI job rejects the whole PR: use `git commit -s`. Repair an existing branch with `git rebase --signoff origin/main`.
+
+CI runs `cargo fmt --all --check` and `cargo clippy ... --all-targets -- -D warnings`, so before pushing:
+
+```bash
+cargo fmt --all          # matches CI exactly
+cargo clippy --release --locked -p <crate-you-touched> --all-targets -- -D warnings
+```
+
+Workspace lints are `clippy::pedantic` plus cherry-picked nursery/restriction lints, so a stray `dbg!` or `exit()` is a CI failure. `rust-toolchain.toml` pins nightly, which is what makes the nightly-only `rustfmt.toml` options (import grouping, doc-comment formatting) apply — don't hand-write `cargo +nightly`.
