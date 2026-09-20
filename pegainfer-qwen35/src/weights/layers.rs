@@ -2,8 +2,8 @@
 //! weights.rs. Reaches the model/config via `use super::*;`.
 
 use pegainfer_core::weight_loader::load_tensor_1d;
-use pegainfer_core::weight_loader::load_tensor_1d_f32;
-use pegainfer_core::weight_loader::load_tensor_1d_f32_shard;
+use pegainfer_core::weight_loader::load_tensor_1d_f32_shard_widened;
+use pegainfer_core::weight_loader::load_tensor_1d_f32_widened;
 use pegainfer_core::weight_loader::load_tensor_1d_stitch;
 use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::load_tensor_2d_col_shard;
@@ -43,10 +43,10 @@ pub(crate) struct LinearAttentionLayer {
     pub(crate) conv1d_weight: DeviceVec,
     /// dt_bias: [local_linear_num_value_heads] bf16
     pub(crate) dt_bias: DeviceVec,
-    /// A_log: [local_linear_num_value_heads] f32
+    /// A_log: [local_linear_num_value_heads] f32 (bf16 in a Qwen3.8 checkpoint)
     pub(crate) a_log: CudaSlice<f32>,
-    /// RMSNorm weight for output normalization: [value_head_dim] f32 —
-    /// head-shared, so replicated on every rank.
+    /// RMSNorm weight for output normalization: [value_head_dim] f32 (bf16 in a
+    /// Qwen3.8 checkpoint) — head-shared, so replicated on every rank.
     pub(crate) norm_weight: CudaSlice<f32>,
     /// Output projection: [hidden_size, local_linear_z_dim] (row-parallel;
     /// the layer all-reduces the partial hidden sum under TP).
@@ -161,11 +161,11 @@ impl LinearAttentionLayer {
             conv1d_weight: src.linear_conv1d(&format!("{prefix}.conv1d.weight"))?,
             dt_bias: src
                 .tensor_1d_shard_if_needed(&format!("{prefix}.dt_bias"), src.linear_value_heads)?,
-            a_log: src.tensor_1d_f32_shard_if_needed(
+            a_log: src.gdn_scalar_f32_shard_if_needed(
                 &format!("{prefix}.A_log"),
                 src.linear_value_heads,
             )?,
-            norm_weight: src.tensor_1d_f32(&format!("{prefix}.norm.weight"))?,
+            norm_weight: src.gdn_scalar_f32(&format!("{prefix}.norm.weight"))?,
             out_proj: src
                 .col_shard_if_needed(&format!("{prefix}.out_proj.weight"), src.linear_z)?,
         })
@@ -230,8 +230,14 @@ impl<'a> WeightSource<'a> {
         load_tensor_1d(self.ctx, self.shards, self.weight_map, name)
     }
 
-    pub(super) fn tensor_1d_f32(&self, name: &str) -> Result<CudaSlice<f32>> {
-        load_tensor_1d_f32(self.ctx, self.shards, self.weight_map, name)
+    /// A gated-DeltaNet scalar (`A_log`, `linear_attn.norm.weight`) as f32.
+    ///
+    /// Qwen3.5 stores these vectors as f32 and Qwen3.8 as bf16 — an upstream
+    /// save-time cast, not an architecture change — and the reference
+    /// implementation upcasts them where they are used. The widened loader
+    /// hands the kernels the same f32 values from either storage.
+    pub(super) fn gdn_scalar_f32(&self, name: &str) -> Result<CudaSlice<f32>> {
+        load_tensor_1d_f32_widened(self.ctx, self.shards, self.weight_map, name)
     }
 
     fn row_shard_if_needed(
@@ -290,15 +296,22 @@ impl<'a> WeightSource<'a> {
         }
     }
 
-    fn tensor_1d_f32_shard_if_needed(
+    fn gdn_scalar_f32_shard_if_needed(
         &self,
         name: &str,
         (offset, len): (usize, usize),
     ) -> Result<CudaSlice<f32>> {
         if self.geometry.is_sharded() {
-            load_tensor_1d_f32_shard(self.ctx, self.shards, self.weight_map, name, offset, len)
+            load_tensor_1d_f32_shard_widened(
+                self.ctx,
+                self.shards,
+                self.weight_map,
+                name,
+                offset,
+                len,
+            )
         } else {
-            self.tensor_1d_f32(name)
+            self.gdn_scalar_f32(name)
         }
     }
 

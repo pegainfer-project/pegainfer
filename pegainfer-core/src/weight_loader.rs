@@ -436,6 +436,30 @@ fn tensor_f32_cow<'d>(
     }
 }
 
+/// 1D f32 payload that additionally accepts a bf16-stored vector and widens it.
+///
+/// Qwen3.8 ships the gated-DeltaNet scalars (`linear_attn.A_log`,
+/// `linear_attn.norm.weight`) as bf16 where Qwen3.5 ships the same tensors as
+/// f32 — an upstream save-time cast, not an architecture change — and the
+/// reference implementation upcasts them at the point of use. bf16 → f32 is
+/// exact, so both storages reach the kernels as the same values.
+/// [`tensor_f32_cow`] stays strict for every other consumer.
+fn tensor_f32_widen_cow<'d>(
+    tensor: &safetensors::tensor::TensorView<'d>,
+    name: &str,
+) -> Result<Cow<'d, [f32]>> {
+    if tensor.dtype() == Dtype::BF16 {
+        anyhow::ensure!(
+            tensor.shape().len() == 1,
+            "Tensor '{name}': expected 1D shape, got {:?}",
+            tensor.shape()
+        );
+        let bits = tensor_bf16_cow(tensor, name)?;
+        return Ok(Cow::Owned(bits.iter().map(|&b| f32::from(b)).collect()));
+    }
+    tensor_f32_cow(tensor, name)
+}
+
 /// One row-consecutive part of a fused matrix: `rows` rows starting at
 /// `row_offset` of a source tensor that must have exactly `src_rows` rows.
 pub struct FusedPart<'a> {
@@ -934,6 +958,42 @@ pub fn load_tensor_1d_f32(
     upload_f32(ctx, name, elems.as_ref())
 }
 
+/// [`load_tensor_1d_f32`] for vectors a checkpoint may store as bf16 (see
+/// [`tensor_f32_widen_cow`]). The uploaded payload is f32 either way.
+pub fn load_tensor_1d_f32_widened(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<CudaSlice<f32>> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let elems = tensor_f32_widen_cow(&tensor, name)?;
+    upload_f32(ctx, name, elems.as_ref())
+}
+
+/// [`load_tensor_1d_f32_shard`] for vectors a checkpoint may store as bf16.
+pub fn load_tensor_1d_f32_shard_widened(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    offset: usize,
+    len: usize,
+) -> Result<CudaSlice<f32>> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let elems = tensor_f32_widen_cow(&tensor, name)?;
+    if offset + len > elems.len() {
+        return Err(anyhow::anyhow!(
+            "F32 1D shard out of bounds for '{}': offset={} len={} total_len={}",
+            name,
+            offset,
+            len,
+            elems.len()
+        ));
+    }
+    upload_f32(ctx, name, &elems[offset..offset + len])
+}
+
 fn upload_f32(ctx: &DeviceContext, name: &str, host: &[f32]) -> Result<CudaSlice<f32>> {
     ctx.stream
         .clone_htod(host)
@@ -1054,6 +1114,7 @@ mod tests {
 
     use super::tensor_bf16_cow;
     use super::tensor_f32_cow;
+    use super::tensor_f32_widen_cow;
 
     #[test]
     fn tensor_f32_cow_borrows_aligned_and_decodes_unaligned() {
@@ -1091,6 +1152,46 @@ mod tests {
         assert!(tensor_f32_cow(&bf16_view, "w").is_err());
         let f32_2d_view = TensorView::new(Dtype::F32, vec![2, 1], &bytes).unwrap();
         assert!(tensor_f32_cow(&f32_2d_view, "w").is_err());
+    }
+
+    #[test]
+    fn tensor_f32_widen_cow_widens_bf16_without_losing_the_stored_value() {
+        // 1.0, -2.0 and 0.5 are exactly representable in bf16, so the widened
+        // f32 result is pinned to those literals rather than to a tolerance.
+        let bits: [u16; 3] = [0x3f80, 0xc000, 0x3f00];
+        let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let bf16_view = TensorView::new(Dtype::BF16, vec![bits.len()], &bytes).unwrap();
+        let widened: Vec<f32> = tensor_f32_widen_cow(&bf16_view, "w")
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(widened, vec![1.0, -2.0, 0.5]);
+
+        // The f32 storage of the same values reads back identically, which is
+        // the property the GDN scalars rely on across Qwen3.5 and Qwen3.8.
+        let f32_bytes: Vec<u8> = [1.0f32, -2.0, 0.5]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let f32_view = TensorView::new(Dtype::F32, vec![3], &f32_bytes).unwrap();
+        let same: Vec<f32> = tensor_f32_widen_cow(&f32_view, "w")
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(same, widened);
+    }
+
+    #[test]
+    fn tensor_f32_widen_cow_still_rejects_other_dtypes_and_rank() {
+        let bytes = vec![0u8; 8];
+        let f16_view = TensorView::new(Dtype::F16, vec![4], &bytes).unwrap();
+        assert!(tensor_f32_widen_cow(&f16_view, "w").is_err());
+        let i64_view = TensorView::new(Dtype::I64, vec![1], &bytes).unwrap();
+        assert!(tensor_f32_widen_cow(&i64_view, "w").is_err());
+        let bf16_2d_view = TensorView::new(Dtype::BF16, vec![2, 2], &bytes).unwrap();
+        assert!(tensor_f32_widen_cow(&bf16_2d_view, "w").is_err());
     }
 
     #[test]
