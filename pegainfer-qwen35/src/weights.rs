@@ -204,6 +204,14 @@ impl Qwen35Model {
 
         debug!("Loading embeddings to GPU");
         let embed_tokens = src.tensor_2d(&format!("{}.embed_tokens.weight", wp))?;
+        anyhow::ensure!(
+            embed_tokens.rows == config.vocab_size && embed_tokens.cols == config.hidden_size,
+            "embed_tokens.weight is [{}, {}], expected [vocab {}, hidden {}]",
+            embed_tokens.rows,
+            embed_tokens.cols,
+            config.vocab_size,
+            config.hidden_size,
+        );
         debug!(
             "embed_tokens: [{}, {}]",
             embed_tokens.rows, embed_tokens.cols

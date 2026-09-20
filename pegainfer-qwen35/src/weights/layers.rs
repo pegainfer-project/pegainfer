@@ -180,6 +180,10 @@ pub(super) struct WeightSource<'a> {
     shards: &'a [SafeTensors<'a>],
     weight_map: &'a HashMap<String, usize>,
     geometry: LocalGeometry,
+    /// Model width every unsharded projection must carry, so a checkpoint whose
+    /// tensors disagree with its `config.json` stops at the loader instead of
+    /// reaching a GEMM sized from the config.
+    hidden: usize,
     /// Full-attention q_proj rows as per-head [q, gate] chunks.
     gated_q: (usize, usize),
     /// o_proj column shard over the full-attention q dim.
@@ -211,6 +215,7 @@ impl<'a> WeightSource<'a> {
             shards,
             weight_map,
             geometry,
+            hidden: config.hidden_size,
             gated_q: full_attention_gated_q_shard_range(config, geometry),
             q_cols: geometry.shard_range(config.full_attn_q_dim()),
             kv_rows: geometry.shard_range(config.full_attn_kv_dim()),
@@ -255,7 +260,9 @@ impl<'a> WeightSource<'a> {
                 rows,
             )
         } else {
-            self.tensor_2d(name)
+            let m = self.tensor_2d(name)?;
+            check_matrix(name, &m, rows, self.hidden)?;
+            Ok(m)
         }
     }
 
@@ -274,7 +281,9 @@ impl<'a> WeightSource<'a> {
                 cols,
             )
         } else {
-            self.tensor_2d(name)
+            let m = self.tensor_2d(name)?;
+            check_matrix(name, &m, self.hidden, cols)?;
+            Ok(m)
         }
     }
 
@@ -319,7 +328,10 @@ impl<'a> WeightSource<'a> {
     /// three global segments rather than cutting one flat row range.
     fn linear_in_proj_qkv(&self, name: &str) -> Result<DeviceMatrix> {
         if !self.geometry.is_sharded() {
-            return self.tensor_2d(name);
+            let rows: usize = self.linear_qkv.iter().map(|&(_, len)| len).sum();
+            let m = self.tensor_2d(name)?;
+            check_matrix(name, &m, rows, self.hidden)?;
+            return Ok(m);
         }
         load_tensor_2d_row_stitch(
             self.ctx,
@@ -349,7 +361,9 @@ impl<'a> WeightSource<'a> {
     /// (keeping each head's [q, gate] chunk adjacent), not as one flat range.
     fn gated_q_proj(&self, name: &str) -> Result<DeviceMatrix> {
         if !self.geometry.is_sharded() {
-            return self.tensor_2d(name);
+            let m = self.tensor_2d(name)?;
+            check_matrix(name, &m, self.gated_q.1, self.hidden)?;
+            return Ok(m);
         }
         let (row_offset, rows) = self.gated_q;
         load_tensor_2d_row_shard(
@@ -361,6 +375,19 @@ impl<'a> WeightSource<'a> {
             rows,
         )
     }
+}
+
+/// Reject a matrix the config-derived plan cannot use. The unsharded load path
+/// takes a tensor's own shape as truth, so this is where the loader notices a
+/// checkpoint whose tensors disagree with its `config.json`.
+fn check_matrix(name: &str, m: &DeviceMatrix, rows: usize, cols: usize) -> Result<()> {
+    anyhow::ensure!(
+        m.rows == rows && m.cols == cols,
+        "'{name}' is [{}, {}], expected [{rows}, {cols}]",
+        m.rows,
+        m.cols
+    );
+    Ok(())
 }
 
 /// Row ranges this rank owns inside the fused global linear-attention qkv
@@ -441,9 +468,12 @@ mod tests {
     }
 
     fn test_geometry(rank: usize, world_size: usize) -> LocalGeometry {
-        let config = test_config();
+        geometry_for(&test_config(), rank, world_size)
+    }
+
+    fn geometry_for(config: &Config35, rank: usize, world_size: usize) -> LocalGeometry {
         let tp = TensorParallelConfig::try_from((rank, world_size)).unwrap();
-        LocalGeometry::try_new(&config, tp).unwrap()
+        LocalGeometry::try_new(config, tp).unwrap()
     }
 
     #[test]
@@ -474,5 +504,69 @@ mod tests {
         // Rank 1 starts at its own first head's q rows, not the flat midpoint.
         let rank1 = full_attention_gated_q_shard_range(&config, test_geometry(1, 2));
         assert_eq!(rank1, (4096, 4096));
+    }
+
+    /// A 27B-class geometry: the real per-tensor shapes below are read off the
+    /// committed Qwen3.5-27B checkpoint (and identical in Qwen3.8-27B), so this
+    /// pins the unsharded assertion surface to what the checkpoints actually
+    /// carry. If a range stops covering the full extent, `check_matrix` would
+    /// reject a valid single-GPU load.
+    fn config_27b() -> Config35 {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+  "max_position_embeddings": 262144,
+  "tie_word_embeddings": false,
+  "text_config": {
+    "hidden_size": 5120,
+    "intermediate_size": 17408,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "vocab_size": 248320,
+    "rms_norm_eps": 1e-6,
+    "layer_types": ["full_attention", "linear_attention"],
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_value_head_dim": 128,
+    "rope_parameters": { "rope_theta": 10000000.0, "partial_rotary_factor": 0.25 },
+    "eos_token_id": 248044
+  }
+}"#,
+        )
+        .unwrap();
+        Config35::from_file(dir.path().to_str().unwrap()).expect("27b fixture validates")
+    }
+
+    #[test]
+    fn unsharded_ranges_cover_the_full_checkpoint_tensor_shapes() {
+        let config = config_27b();
+        let tp1 = geometry_for(&config, 0, 1);
+        assert!(!tp1.is_sharded());
+
+        // q_proj [12288, 5120] = 24 heads x 256 x 2 (q + gate), k/v [1024, 5120],
+        // o_proj [5120, 6144], gate/up [17408, 5120], down [5120, 17408].
+        assert_eq!(
+            full_attention_gated_q_shard_range(&config, tp1),
+            (0, 12_288)
+        );
+        assert_eq!(config.full_attn_q_dim(), 6_144);
+        assert_eq!(config.full_attn_kv_dim(), 1_024);
+        assert_eq!(tp1.shard_range(config.intermediate_size), (0, 17_408));
+
+        // in_proj_qkv [10240, 5120] = q 2048 + k 2048 + v 6144; in_proj_z and
+        // out_proj meet at the value dim 6144; A_log/dt_bias/in_proj_a/b carry
+        // the 48 value heads.
+        let qkv_rows: usize = linear_qkv_shard_segments(&config, tp1)
+            .iter()
+            .map(|&(_, len)| len)
+            .sum();
+        assert_eq!(qkv_rows, 10_240);
+        assert_eq!(config.linear_attn_z_dim(), 6_144);
+        assert_eq!(tp1.shard_range(config.linear_num_value_heads), (0, 48));
     }
 }
