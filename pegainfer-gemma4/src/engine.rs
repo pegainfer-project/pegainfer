@@ -52,6 +52,8 @@ const MAX_CONCURRENCY: usize = 16;
 const ASYNC_PREFILL_ENV: &str = "PEGAINFER_ASYNC_PREFILL";
 const PREFIX_CACHE_ENV: &str = "PEGAINFER_PREFIX_CACHE";
 const MIX_CHUNK_TOKENS_ENV: &str = "PEGAINFER_MIX_CHUNK_TOKENS";
+const MIX_GATHER_ROWS_ENV: &str = "PEGAINFER_MIX_GATHER_ROWS";
+const MIX_MAX_PROMPTS_ENV: &str = "PEGAINFER_MIX_MAX_PROMPTS";
 const MAX_CONTEXT_ENV: &str = "PEGAINFER_MAX_CONTEXT";
 const DECODE_SLOTS_ENV: &str = "PEGAINFER_DECODE_SLOTS";
 const KV_FP8_ENV: &str = "PEGAINFER_KV_FP8";
@@ -641,6 +643,45 @@ const MIX_MAX_PROMPTS: usize = 4;
 /// records, not here.
 const MIX_GATHER_ROWS: usize = 512;
 
+fn mix_max_prompts(slots: usize) -> Result<usize> {
+    read_env(MIX_MAX_PROMPTS_ENV)?.map_or(Ok(MIX_MAX_PROMPTS), |raw| {
+        parse_mix_max_prompts(&raw, slots)
+    })
+}
+
+fn parse_mix_max_prompts(raw: &str, slots: usize) -> Result<usize> {
+    let prompts: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{MIX_MAX_PROMPTS_ENV} must be a count: {raw:?}"))?;
+    anyhow::ensure!(
+        prompts > 0 && prompts <= slots,
+        "{MIX_MAX_PROMPTS_ENV} must be in 1..={slots}"
+    );
+    Ok(prompts)
+}
+
+fn mix_gather_rows(max_context: usize) -> Result<usize> {
+    read_env(MIX_GATHER_ROWS_ENV)?.map_or(Ok(MIX_GATHER_ROWS), |raw| {
+        parse_mix_gather_rows(&raw, max_context)
+    })
+}
+
+/// A step's rows live in metadata the ceiling sizes, so a budget past it
+/// buys a step that cannot be built; refusing at start-up beats the same
+/// refusal arriving as a failed step mid-run.
+fn parse_mix_gather_rows(raw: &str, max_context: usize) -> Result<usize> {
+    let rows: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{MIX_GATHER_ROWS_ENV} must be a row count: {raw:?}"))?;
+    anyhow::ensure!(
+        rows > 0 && rows <= max_context,
+        "{MIX_GATHER_ROWS_ENV} must be in 1..={max_context}, the serving ceiling"
+    );
+    Ok(rows)
+}
+
 /// One prompt mid-walk: its unseen suffix begins at `offset`, and `first`
 /// holds the token its final segment sampled until the walker graduates.
 struct Walker {
@@ -940,6 +981,8 @@ struct EngineState {
     /// The chunked-walk segment span; `None` unless
     /// `PEGAINFER_MIX_CHUNK_TOKENS` opted in at startup.
     mix_chunk: Option<usize>,
+    mix_gather: usize,
+    mix_max_prompts: usize,
     /// The serving ceiling this process was started with; the pools are
     /// budgeted against it.
     max_context: usize,
@@ -1155,8 +1198,10 @@ impl EngineState {
         let max_context = serving_context(config.max_position_embeddings)?;
         let lane_mode = async_prefill_mode()?;
         let mix_chunk = mix_chunk_tokens(max_context)?;
+        let mix_gather = mix_gather_rows(max_context)?;
         let admit_coalesce = admit_coalesce_ms()?;
         let slots = decode_slots()?;
+        let mix_max_prompts = mix_max_prompts(slots)?;
         let local_kv_storage = kv_fp8_storage()?;
         let global_attn = global_attn()?;
         // The stub tier links under the same name and refuses at launch, so
@@ -1221,7 +1266,7 @@ impl EngineState {
                 // A round's rows split across walkers, and every walker's
                 // reservation rounds up to its own page — so the budget
                 // carries one page of rounding per extra walker.
-                window_pages + chunk.div_ceil(LOCAL_PAGE_SIZE) + (MIX_MAX_PROMPTS - 1)
+                window_pages + chunk.div_ceil(LOCAL_PAGE_SIZE) + (mix_max_prompts - 1)
             }
             _ => local_context_pages,
         };
@@ -1331,6 +1376,8 @@ impl EngineState {
             sampler_graphs,
             lane,
             mix_chunk,
+            mix_gather,
+            mix_max_prompts,
             max_context,
             slots,
             admit_coalesce,
@@ -1458,8 +1505,8 @@ impl EngineState {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
                 };
-                while newcomers.len() < MIX_MAX_PROMPTS
-                    && (self.mix_chunk.is_some() || rows_budget < MIX_GATHER_ROWS)
+                while newcomers.len() < self.mix_max_prompts
+                    && (self.mix_chunk.is_some() || rows_budget < self.mix_gather)
                     && newcomers.len() + active.len() < self.slots
                     && *attempts < self.slots
                 {
@@ -1476,7 +1523,7 @@ impl EngineState {
                         max_new_tokens: self
                             .mix_chunk
                             .is_none()
-                            .then(|| MIX_GATHER_ROWS - rows_budget),
+                            .then(|| self.mix_gather.saturating_sub(rows_budget)),
                     };
                     match self.prepare_newcomer(candidate, options, ledger) {
                         PreparedNewcomer::Ready(newcomer, new_tokens) => {
@@ -2754,6 +2801,26 @@ mod knob_tests {
         assert!(door.opens(2, 6, 8, now));
         assert!(!door.opens(2, 5, 8, now));
         assert_eq!(door.since, Some(now));
+    }
+
+    #[test]
+    fn gather_bounds_parse_or_refuse() {
+        assert_eq!(parse_mix_gather_rows("8192", 8192).unwrap(), 8192);
+        assert_eq!(parse_mix_gather_rows(" 512 ", 8192).unwrap(), 512);
+        for bad in ["0", "8193", "off", "-1", "4k"] {
+            assert!(
+                parse_mix_gather_rows(bad, 8192).is_err(),
+                "{bad:?} must refuse: a step past the ceiling fails mid-run, where a \
+                 client reads the error-finished stream as served"
+            );
+        }
+        assert_eq!(parse_mix_max_prompts("16", 16).unwrap(), 16);
+        for bad in ["0", "17", "all"] {
+            assert!(
+                parse_mix_max_prompts(bad, 16).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
     }
 
     #[test]
