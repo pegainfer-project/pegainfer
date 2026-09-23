@@ -2419,6 +2419,7 @@ fn main() {
             }
             nvcc_args.extend([
                 "--std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
                 "-I".to_string(),
                 flashinfer.include.to_string_lossy().to_string(),
                 "-I".to_string(),

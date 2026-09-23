@@ -1,6 +1,6 @@
 // GLM5.2 FlashInfer deterministic top-k K=2048 wrapper.
 //
-// Calls vendored FlashInfer `FilteredTopK` + `LaunchSortTopKByIndex` directly
+// Calls vendored FlashInfer `FilteredTopK` + `LaunchFinalizeTopKIndices` directly
 // (bypassing `TopKDispatch`, which hardcodes lengths=nullptr) so per-row
 // `lengths` filter padded/stale logits before slot conversion. Matches
 // TokenSpeed's `deterministic_decode_topk` contract: deterministic=true,
@@ -48,14 +48,14 @@ extern "C" int glm52_flashinfer_topk_2048_cuda(
             cudaGetErrorString(err));
     return static_cast<int>(CUDA_ERROR_LAUNCH_FAILED);
   }
-  err = flashinfer::sampling::LaunchSortTopKByIndex<
-      flashinfer::sampling::FilteredTopKMode::Plain, float, int>(
+  err = flashinfer::sampling::LaunchFinalizeTopKIndices<
+      /*SORT_LOCAL_INDICES=*/true, flashinfer::sampling::FilteredTopKMode::Plain, float, int>(
       output_indices, output_values, nullptr, 0, nullptr, nullptr,
       static_cast<uint32_t>(num_rows), static_cast<uint32_t>(top_k),
       static_cast<uint32_t>(max_len), stream);
   if (err != cudaSuccess) {
     fprintf(stderr,
-            "glm52_flashinfer_topk_2048_cuda: LaunchSortTopKByIndex failed: %s\n",
+            "glm52_flashinfer_topk_2048_cuda: LaunchFinalizeTopKIndices failed: %s\n",
             cudaGetErrorString(err));
     return static_cast<int>(CUDA_ERROR_LAUNCH_FAILED);
   }

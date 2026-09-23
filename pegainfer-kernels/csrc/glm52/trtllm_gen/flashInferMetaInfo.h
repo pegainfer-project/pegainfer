@@ -21,7 +21,7 @@
 namespace tensorrt_llm {
 namespace kernels {
 
-// Minimal subset of FlashInfer 0.6.12's generated metadata needed by
+// Minimal subset of FlashInfer 0.7.0's generated metadata needed by
 // GLM5.2 TP4 decode. The checked-in cubins carry the matching SHA-256 names.
 struct TllmGenFmhaKernelMetaInfo {
   Data_type mDataTypeQ;
@@ -58,8 +58,12 @@ struct TllmGenFmhaKernelMetaInfo {
   bool m2CtaMma;
   int mSparseAttn;
   bool mSkipsSoftmaxWhenPossible;
-  bool mReserved1;
-  bool mReserved2;
+  bool mFp16Softmax;
+  bool mUsesSpcompress;
+  bool mEnablesBf16QFp8KvKOnlyTransform;
+  bool mSeparateTransformedKv;
+  bool mFusesDsv4InvRopeFp8Quant;
+  bool mUsesDsv4Ue8m0ScaleO;
   const char* sha256;
 };
 
@@ -69,45 +73,45 @@ static const TllmGenFmhaKernelMetaInfo sTllmGenFmhaKernelMetaInfos[] = {
     {DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3,
      DATA_TYPE_BF16, 8, 128, 8, 128, 512, 576, 512, kSM_100f, nullptr, 0,
      "fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512PagedKvDenseStaticTokenSparseP1MultiCtasKvVarSeqQ8Kv128StaticSwapsAbForGen",
-     166688, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
-     false, 1, false, false, false,
-     "54ef64241e7f37e69b56cea37d4de5a79468cfbf62ac4bf87fd2b5c06fb6266a"},
+     166800, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
+     false, 1, false, false, false, false, false, false, false,
+     "97b3d2de9c2025e967e54ce3986aa3c88954b13e7dde4927c4a672e54f4b68a0"},
     {DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3,
      DATA_TYPE_BF16, 8, 128, 8, 128, 512, 576, 512, kSM_100f, nullptr, 0,
      "fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512PagedKvDenseStaticTokenSparseP1VarSeqQ8Kv128PersistentSwapsAbForGen",
-     168912, 512, 2, 1, 0, 2, 1, 0, 0, 0, 0, 0, true, false, false,
-     false, 1, false, false, false,
-     "b1cbd799fff0c586eac597d7dd2385ec6a76e2ce6dbf86eba0e691b43ebce67b"},
+     168960, 512, 2, 1, 0, 2, 1, 0, 0, 0, 0, 0, true, false, false,
+     false, 1, false, false, false, false, false, false, false,
+     "6544178cddeffe987d4d7774549a7e0d8823815afa66e1fdc2131381c050ed41"},
     {DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3,
      DATA_TYPE_BF16, 8, 128, 8, 128, 128, 576, 512, kSM_100f, nullptr, 0,
      "fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta128PagedKvDenseStaticTokenSparseP1VarSeqQ8Kv128PersistentSwapsAbForGen",
-     168912, 512, 2, 1, 0, 2, 1, 0, 0, 0, 0, 0, true, false, false,
-     false, 1, false, false, false,
-     "77a6891a9c3837dee87d2cad5fb8d543271e063582ca78ad504b43851ba55109"},
+     168960, 512, 2, 1, 0, 2, 1, 0, 0, 0, 0, 0, true, false, false,
+     false, 1, false, false, false, false, false, false, false,
+     "b1640b8068bc12de38d3f2950b7af7b53e818d9fb6d9a07b2e630bb968007df3"},
     {DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3,
      DATA_TYPE_BF16, 8, 128, 8, 128, 128, 576, 512, kSM_100f, nullptr, 0,
      "fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta128PagedKvDenseStaticTokenSparseP1MultiCtasKvVarSeqQ8Kv128StaticSwapsAbForGen",
-     166688, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
-     false, 1, false, false, false,
-     "611bdd79d0deeeb35b5600318a7591d95ae24041ad39fda04e9750b99b8854ed"},
+     166800, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
+     false, 1, false, false, false, false, false, false, false,
+     "eddd15b3ae26ac40468a61f1947a64f189c7aca0120ceb385f8ff1e1c634f08f"},
     {DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3,
      DATA_TYPE_BF16, 16, 128, 16, 128, 128, 576, 512, kSM_100f, nullptr, 0,
      "fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta128PagedKvDenseStaticTokenSparseP1MultiCtasKvVarSeqQ16Kv128StaticSwapsAbForGen",
-     179360, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
-     false, 1, false, false, false,
-     "e62c5ec93d14d10d780a5147da6982b183c7e267d65b6ee99bf057fa81c90376"},
+     179472, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
+     false, 1, false, false, false, false, false, false, false,
+     "ca45c6611280408f82bd613411b0e25075833348ddac5dd0af24937cca2dd509"},
     {DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3,
      DATA_TYPE_BF16, 16, 128, 16, 128, 256, 576, 512, kSM_100f, nullptr, 0,
      "fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256PagedKvDenseStaticTokenSparseP1MultiCtasKvVarSeqQ16Kv128StaticSwapsAbForGen",
-     179360, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
-     false, 1, false, false, false,
-     "97b699c634f7f56b72cedfa99214c89b955edcce2577cf830958e953d4f8d4e7"},
+     179472, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
+     false, 1, false, false, false, false, false, false, false,
+     "3e39ced03725e3a8d03f79a22ddc704d2d059cf3256692affae23759264c3db7"},
     {DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3, DATA_TYPE_E4M3,
      DATA_TYPE_BF16, 16, 128, 16, 128, 512, 576, 512, kSM_100f, nullptr, 0,
      "fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512PagedKvDenseStaticTokenSparseP1MultiCtasKvVarSeqQ16Kv128StaticSwapsAbForGen",
-     179360, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
-     false, 1, false, false, false,
-     "c567e388756b51b7f732e8ce4c9627f46496fb75bee8393ee6adfd9eb57ae312"},
+     179472, 512, 2, 1, 0, 2, 0, 1, 0, 0, 0, 0, true, false, false,
+     false, 1, false, false, false, false, false, false, false,
+     "2166c91e4c23c51222af9dfd30372daedf1a74c8727289168ffa8c21c552adeb"},
 };
 
 }  // namespace kernels

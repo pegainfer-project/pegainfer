@@ -327,6 +327,7 @@ static int prefill_paged_launch(
     DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
         result = static_cast<int>(
             BatchPrefillWithPagedKVCacheDispatched<
+                /*SAME_KV_STRIDES=*/false,
                 CTA_TILE_Q,
                 /*HEAD_DIM_QK=*/HEAD_DIM,
                 /*HEAD_DIM_VO=*/HEAD_DIM,
