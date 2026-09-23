@@ -112,19 +112,32 @@ All six lines are onboarded. Adding a model line = write `model_line.rs` in the 
 
 Migrate glm52 onto the step contract (the multi-scheduler pilot; brings P/D and EP requirements), then qwen35/kimi-k2/deepseek-v2-lite, then delete the legacy contract modules and `LaunchedEngine::Handle`.
 
-## September 2026 upstream dependency refresh
+## Upstream vLLM dependency pin
 
 All five direct vLLM Rust dependencies and their transitive workspace crates are
-pinned to `89dbb2644552d6e473a7e97da0ce8f0aa8e32c9d` (upstream main observed
-on 2026-09-11). Keeping one revision across these crates preserves the frontend's
+pinned to `15ed1262e70873a65582d82f7973784a0f11e5a2` (upstream main observed on
+2026-09-23). Keeping one revision across these crates preserves the frontend's
 shared protocol and type contract.
 
-The only upstream commit since `295ac4e5` is vllm-project/vllm#56447, a Python-side
-GLM-OCR MTP position-masking fix. The Rust crates are unchanged, so this refresh
-does not add that model fix to PegaInfer or require a local API adaptation.
-The DeepSeek V4/V4.1 tool-argument encoding fix from #56260 remains included.
+The `89dbb264..15ed1262` refresh spans 40 Rust-side commits. The ones that touch
+our boundary add fields to structs we build literally, so each bump surfaces as
+compile errors in `vllm/mod.rs` / `vllm/bridge.rs`. Every new knob is pinned to
+its upstream default so serving behavior stays unchanged: `revision: None`
+(local model paths only), empty `hf_overrides`, `ToolStrictLevel::Auto`,
+`enable_scale_out: false` (previously the default-off
+`VLLM_ENABLE_SCALE_OUT_ENDPOINTS`). `effective_attention_block_size` reports the
+KV block size when the engine exposes capacity. `ResolvedModelFiles::new` now
+takes a revision (`None` in Qwen test helpers). Picked up for free: the DeepSeek
+V3.2/V4/V4.1 `add_generation_prompt` and DSML `string=` fixes, Kimi K3 media
+placeholder alignment, and NaN-tolerant logprob decoding.
 
-Validation passed: release frontend/simulator library tests (71 + 6), simulated
-HTTP E2E (18), formatting, locked Cargo metadata, and frontend/simulator Clippy
-with warnings denied. The simulated HTTP gate covers frontend integration, not
-GPU execution or model accuracy.
+Auto parser selection matches concrete family names (`qwen3`, `qwen3.5`,
+`qwen2.5`, ...) against the model path, so there is no bare `qwen` fallback.
+`pegainfer-sim --test tool_call_roundtrip` is not in CI and had rotted on this.
+Run it by hand on every bump.
+
+Validation: release frontend/simulator library tests (80 + 18), simulated HTTP
+E2E (22), tool-call round trip (3), formatting, locked Cargo metadata,
+frontend/simulator Clippy with warnings denied, and `cargo check --all-targets`
+for qwen3, qwen35 and deepseek-v2-lite. The simulated HTTP gate covers frontend
+integration, not GPU execution or model accuracy.

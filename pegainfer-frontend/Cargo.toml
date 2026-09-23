@@ -20,15 +20,15 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true, features = ["v4"] }
+vllm-chat = { workspace = true }
 vllm-engine-core-client = { workspace = true }
 vllm-server = { workspace = true }
+vllm-text = { workspace = true }
 zeromq = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
-vllm-chat = { workspace = true }
-vllm-text = { workspace = true }
 
 [lints]
 workspace = true

@@ -12,6 +12,7 @@ use log::warn;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use vllm_chat::ToolStrictLevel;
 use vllm_engine_core_client::TransportMode;
 use vllm_server::ApiServerOptions;
 use vllm_server::ChatTemplateContentFormatOption;
@@ -23,6 +24,7 @@ use vllm_server::GenerationConfigMode;
 use vllm_server::HttpListenerMode;
 use vllm_server::ParserSelection;
 use vllm_server::RendererSelection;
+use vllm_text::backend::hf::HfOverrides;
 
 use crate::engine::LaunchedEngine;
 
@@ -369,11 +371,14 @@ where
         },
         coordinator_mode: CoordinatorMode::None,
         model: model_id,
+        revision: None,
+        hf_overrides: HfOverrides::default(),
         generation_config: GenerationConfigMode::Auto,
         served_model_name,
         listener_mode: HttpListenerMode::BindTcp { host, port },
         tool_call_parser: ParserSelection::default(),
         reasoning_parser: ParserSelection::default(),
+        tool_strict_level: ToolStrictLevel::default(),
         renderer: RendererSelection::default(),
         chat_template: None,
         default_chat_template_kwargs: None,
@@ -390,6 +395,7 @@ where
             enable_log_requests: true,
             enable_prompt_tokens_details: true,
             enable_request_id_headers: false,
+            enable_scale_out: false,
         },
         disable_log_stats: true,
         grpc_port: None,

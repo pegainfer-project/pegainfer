@@ -757,6 +757,7 @@ async fn connect_link(
         max_loras: 0,
         kv_cache_size_tokens,
         kv_cache_max_concurrency,
+        effective_attention_block_size: kv_capacity.map(|c| c.block_size as u64),
         kv_events_config: None,
         weight_transfer_backend: None,
         enable_sleep_mode: false,
