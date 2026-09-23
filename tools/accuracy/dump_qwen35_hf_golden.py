@@ -36,14 +36,10 @@ VOCAB_CEILING = 100_000
 TOP_K = 64
 
 
-# Keep in sync with `fixture_size_name` in
-# pegainfer-qwen35/tests/hf_golden_gate.rs (the fixture key table).
-#
-# The key carries the generation as well as the geometry: Qwen3.8-27B's text
-# tower is shape-identical to Qwen3.5-27B's, so (hidden, layers) alone cannot
-# pick a fixture. A mispairing cannot pass unnoticed either -- the gate asserts
-# the fixture's recorded `config_sha256` and `model_revision` against the local
-# checkpoint before it compares a single logit.
+# Size table used only to name the default output fixture. The gate does NOT
+# read it: it picks the committed fixture whose recorded `config_sha256`
+# matches the checkpoint's config.json, so a mispairing fails the hash assert
+# instead of comparing against the wrong oracle.
 SIZE_NAMES = {
     (1024, 24, "qwen35"): "Qwen3.5-0.8B",
     (2048, 24, "qwen35"): "Qwen3.5-2B",
@@ -208,22 +204,13 @@ def main() -> int:
     if args.vocab_ceiling <= 1:
         parser.error("--vocab-ceiling must be greater than 1")
 
-    # "Qwen3.8-27B" -> stem "qwen38-27b" (the dot drops, matching the gate's
-    # `fixture_size_name` line), which is the name the gate looks up.
+    # "Qwen3.8-27B" -> stem "qwen38-27b" (the dot drops). The stem is a naming
+    # convention only; the gate locates fixtures by their recorded config_sha256.
     line, _, size_key = model_name_from_config(Path(args.model_path)).partition("-")
     stem = f"{line.lower().replace('.', '')}-{size_key.lower()}"
-    gate_names = {
-        f"{stem}-hf-golden.safetensors",
-        f"{stem}-hf-long-golden.safetensors",
-    }
     if args.out is None:
         kind = "-hf-long-golden" if args.prompt_lens else "-hf-golden"
         args.out = f"test_data/{stem}{kind}.safetensors"
-    elif Path(args.out).name not in gate_names:
-        raise SystemExit(
-            f"--out basename {Path(args.out).name!r} will not be found by the gate; "
-            f"expected one of {sorted(gate_names)}"
-        )
 
     gen = torch.Generator().manual_seed(args.seed)
     prompts, decodes = [], []

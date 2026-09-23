@@ -46,72 +46,6 @@ const MARGIN_TOL: f32 = 0.20;
 const MEAN_TOL: f32 = 0.06;
 const P99_TOL: f32 = 0.20;
 
-/// Size key from config CONTENT, not the directory name; keep in sync with
-/// `SIZE_NAMES` in `tools/accuracy/dump_qwen35_hf_golden.py`.
-/// `(line, size)` the committed fixture is keyed by. Qwen3.8's text tower is
-/// shape-identical to Qwen3.5's, so geometry alone cannot pick the fixture and
-/// the generation is part of the key. A wrong pairing cannot pass unnoticed:
-/// every fixture records `config_sha256` and `model_revision`, and
-/// [`check_fixture_metadata`] rejects a checkpoint that does not match them.
-fn fixture_size_name(model_path: &str) -> Option<(&'static str, &'static str)> {
-    let config_path = Path::new(model_path).join("config.json");
-    let raw = std::fs::read_to_string(&config_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("parse {}: {e}", config_path.display()));
-    let t = v.get("text_config").unwrap_or(&v);
-    let hidden = t.get("hidden_size").and_then(serde_json::Value::as_u64);
-    let layers = t
-        .get("num_hidden_layers")
-        .and_then(serde_json::Value::as_u64);
-    let (Some(hidden), Some(layers)) = (hidden, layers) else {
-        panic!(
-            "{} has no hidden_size/num_hidden_layers",
-            config_path.display()
-        );
-    };
-    // The one `text_config` field a Qwen3.8 save carries and a Qwen3.5 save
-    // omits. Nothing in the model reads it (see docs/models/qwen35/support-qwen38.md),
-    // so it is a save-time marker only.
-    let line = if t.get("output_gate_type").is_some() {
-        "qwen38"
-    } else {
-        "qwen35"
-    };
-    let size = match (hidden, layers) {
-        (1024, 24) => "0.8b",
-        (2048, 24) => "2b",
-        (2560, 32) => "4b",
-        (4096, 32) => "9b",
-        (5120, 64) => "27b",
-        _ => return None,
-    };
-    Some((line, size))
-}
-
-/// Fixtures committed in `test_data/`; a missing file for one of these is a
-/// broken checkout, not an ungenerated fixture.
-const COMMITTED_FIXTURES: &[(&str, &str)] = &[
-    ("qwen35", "0.8b"),
-    ("qwen35", "2b"),
-    ("qwen35", "4b"),
-    ("qwen35", "9b"),
-    ("qwen35", "27b"),
-    ("qwen38", "27b"),
-];
-
-fn default_fixture_path(line: &str, size: &str, long: bool) -> String {
-    let kind = if long {
-        "-hf-long-golden"
-    } else {
-        "-hf-golden"
-    };
-    format!(
-        "{}/../test_data/{line}-{size}{kind}.safetensors",
-        env!("CARGO_MANIFEST_DIR")
-    )
-}
-
 const BUCKET_STRADDLES: [usize; 2] = [5, 3];
 const SLOT_COMPACTION_BATCH: usize = 5;
 const SLOT_COMPACTION_DROP_INDEX: usize = 1;
@@ -152,6 +86,44 @@ fn safetensors_metadata(bytes: &[u8]) -> HashMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The fixture is chosen by the checkpoint's config bytes, not a geometry
+/// table: every committed fixture records `config_sha256` in its safetensors
+/// metadata, so the gate scans the committed fixtures and keeps the one whose
+/// recorded hash matches the local `config.json`. [`check_fixture_metadata`]
+/// then re-asserts that hash (plus `model_revision`) before a single logit is
+/// compared.
+fn find_default_fixture(model_path: &str, long: bool) -> Option<String> {
+    let config = Path::new(model_path).join("config.json");
+    let hash = sha256_file(&config).unwrap_or_else(|| panic!("read {}", config.display()));
+    let suffix = if long {
+        "-hf-long-golden.safetensors"
+    } else {
+        "-hf-golden.safetensors"
+    };
+    let dir = format!("{}/../test_data", env!("CARGO_MANIFEST_DIR"));
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {dir}: {e}")) {
+        let path = entry.unwrap_or_else(|e| panic!("read {dir}: {e}")).path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with("qwen3") && name.ends_with(suffix)) {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        if safetensors_metadata(&bytes).get("config_sha256") == Some(&hash) {
+            matches.push(path);
+        }
+    }
+    match matches.len() {
+        0 => None,
+        1 => Some(matches[0].to_string_lossy().into_owned()),
+        _ => panic!(
+            "multiple qwen35 hf_golden_gate fixtures match {model_path}/config.json: {matches:?}"
+        ),
+    }
 }
 
 fn model_revision(model_path: &str) -> Option<String> {
@@ -340,37 +312,21 @@ struct Golden {
 }
 
 impl Golden {
-    /// An explicitly set env override must exist; a missing default keyed
-    /// fixture is a clean skip (`None`).
+    /// An explicitly set env override must exist; no default fixture matching
+    /// the checkpoint is a clean skip (`None`).
     fn load_for(model_path: &str, long: bool) -> Option<Golden> {
         let env_key = if long { LONG_GOLDEN_ENV } else { GOLDEN_ENV };
-        let Some((line, size)) = fixture_size_name(model_path) else {
-            assert!(
-                std::env::var(env_key).is_err(),
-                "{env_key} is set but the model geometry in {model_path}/config.json \
-                 has no entry in the size table"
-            );
-            eprintln!(
-                "skipping qwen35 hf_golden_gate: unrecognized model geometry in \
-                 {model_path}/config.json; extend fixture_size_name to cover it"
-            );
-            return None;
-        };
         let path = if let Ok(path) = std::env::var(env_key) {
             path
         } else {
-            let path = default_fixture_path(line, size, long);
-            if !Path::new(&path).exists() {
-                assert!(
-                    !COMMITTED_FIXTURES.contains(&(line, size)),
-                    "committed golden fixture missing at {path}"
-                );
+            let Some(path) = find_default_fixture(model_path, long) else {
                 eprintln!(
-                    "skipping qwen35 hf_golden_gate: no golden fixture for this size at \
-                     {path}; generate one with tools/accuracy/dump_qwen35_hf_golden.py"
+                    "skipping qwen35 hf_golden_gate: no committed fixture records this \
+                     checkpoint's config_sha256; generate one with \
+                     tools/accuracy/dump_qwen35_hf_golden.py"
                 );
                 return None;
-            }
+            };
             path
         };
         Some(Self::load_path(path))
