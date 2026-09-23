@@ -40,6 +40,10 @@ impl DFlashDraftModel {
         let shards = deserialize_shards(&mmaps)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        let hidden = config.hidden_size;
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let kv_dim = config.num_key_value_heads * config.head_dim;
+        let inter = config.intermediate_size;
         for layer_idx in 0..config.num_hidden_layers {
             let prefix = format!("layers.{layer_idx}");
 
@@ -48,21 +52,25 @@ impl DFlashDraftModel {
                 &shards,
                 &weight_map,
                 &format!("{prefix}.self_attn.q_proj.weight"),
+                q_dim,
+                hidden,
             )?;
             let k_proj = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{prefix}.self_attn.k_proj.weight"),
+                kv_dim,
+                hidden,
             )?;
             let v_proj = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{prefix}.self_attn.v_proj.weight"),
+                kv_dim,
+                hidden,
             )?;
-            let q_dim = q_proj.rows;
-            let kv_dim = k_proj.rows;
             let qkv_proj = DeviceMatrix::vstack(ctx, &[&q_proj, &k_proj, &v_proj])?;
             drop(q_proj);
             drop(k_proj);
@@ -73,12 +81,16 @@ impl DFlashDraftModel {
                 &shards,
                 &weight_map,
                 &format!("{prefix}.mlp.gate_proj.weight"),
+                inter,
+                hidden,
             )?;
             let up_proj = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{prefix}.mlp.up_proj.weight"),
+                inter,
+                hidden,
             )?;
             let gate_up_proj = DeviceMatrix::vstack(ctx, &[&gate_proj, &up_proj])?;
             drop(gate_proj);
@@ -98,6 +110,8 @@ impl DFlashDraftModel {
                         &shards,
                         &weight_map,
                         &format!("{prefix}.self_attn.o_proj.weight"),
+                        hidden,
+                        q_dim,
                     )?,
                     q_norm: load_tensor_1d(
                         ctx,
@@ -127,6 +141,8 @@ impl DFlashDraftModel {
                         &shards,
                         &weight_map,
                         &format!("{prefix}.mlp.down_proj.weight"),
+                        hidden,
+                        inter,
                     )?,
                 },
             });
@@ -134,14 +150,35 @@ impl DFlashDraftModel {
 
         let norm = load_tensor_1d(ctx, &shards, &weight_map, "norm.weight")?;
         let hidden_norm = load_tensor_1d(ctx, &shards, &weight_map, "hidden_norm.weight")?;
-        let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
+        let fc = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "fc.weight",
+            hidden,
+            hidden * config.target_layer_ids.len(),
+        )?;
 
         // DSpark Markov head (Phase 1). The confidence head and the tied
         // embed_tokens/lm_head are intentionally skipped: the head is byte-identical
         // to the target's, which we reuse for the verify-equivalent logits.
         let markov = if config.uses_markov_head() {
-            let w1 = load_tensor_2d(ctx, &shards, &weight_map, MARKOV_W1_TENSOR)?;
-            let w2 = load_tensor_2d(ctx, &shards, &weight_map, MARKOV_W2_TENSOR)?;
+            let w1 = load_tensor_2d(
+                ctx,
+                &shards,
+                &weight_map,
+                MARKOV_W1_TENSOR,
+                config.vocab_size,
+                config.markov_rank,
+            )?;
+            let w2 = load_tensor_2d(
+                ctx,
+                &shards,
+                &weight_map,
+                MARKOV_W2_TENSOR,
+                config.vocab_size,
+                config.markov_rank,
+            )?;
             if config.enable_confidence_head {
                 log::info!(
                     "DSpark confidence head present in {model_path} but unused in Phase 1 \
