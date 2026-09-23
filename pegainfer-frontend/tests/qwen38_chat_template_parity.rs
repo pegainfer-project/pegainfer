@@ -1,5 +1,5 @@
 //! Chat-render parity for the Qwen3.8 line against the Hugging Face reference
-//! dumped by `tools/accuracy/dump_qwen38_chat_golden.py`.
+//! dumped by `tools/accuracy/dump_chat_template_golden.py qwen38`.
 //!
 //! Qwen3.8's text tower is shape-identical to Qwen3.5's
 //! (`docs/models/qwen35/support-qwen38.md`), so the model side needs no new
