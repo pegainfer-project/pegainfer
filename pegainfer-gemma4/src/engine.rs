@@ -1487,7 +1487,6 @@ impl EngineState {
         // weight scan — one step prefills every gathered newcomer and
         // advances every active row.
         if !active.is_empty() {
-            self.arena.invalidate_decode_fingerprint();
             self.drain_pipeline(active, ledger)?;
             self.ready_decode_rows(active, ledger);
             if !active.is_empty() {
@@ -1541,11 +1540,6 @@ impl EngineState {
             }
         }
 
-        // A solo admission starts a new roster: the fingerprint the retired
-        // one left would otherwise pass a new request whose frontier and
-        // page structure happen to line up, and its first step would keep
-        // the old page tables. Nothing is in flight, so no drain is needed.
-        self.arena.invalidate_decode_fingerprint();
         // Under the chunk knob a solo prompt walks its own segments too:
         // residency stays window plus segment whatever the prompt length.
         let stepped = if let Some(chunk) = self.mix_chunk {
@@ -1690,7 +1684,6 @@ impl EngineState {
             .as_ref()
             .is_some_and(|lane| lane.inflight.is_some())
         {
-            self.arena.invalidate_decode_fingerprint();
             self.drain_pipeline(active, ledger)?;
         }
         let Some(lane) = self.lane.as_mut() else {

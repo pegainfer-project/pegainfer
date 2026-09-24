@@ -605,6 +605,7 @@ struct SteadyDecode {
 
 #[derive(Eq, PartialEq)]
 struct SteadyRow {
+    kv: u64,
     kv_len: usize,
     local_origin: usize,
     local_pages: usize,
@@ -617,7 +618,8 @@ impl SteadyDecode {
         self.padded == next.padded
             && self.rows.len() == next.rows.len()
             && self.rows.iter().zip(&next.rows).all(|(current, next)| {
-                next.kv_len == current.kv_len + 1
+                next.kv == current.kv
+                    && next.kv_len == current.kv_len + 1
                     && next.local_origin == current.local_origin
                     && next.local_pages == current.local_pages
                     && next.global_pages == current.global_pages
@@ -819,10 +821,6 @@ impl StepArena {
     /// Logits and the id buffer consumed by the next decode embedding.
     pub(crate) fn logits_and_ids(&mut self) -> (&mut HiddenStates, &mut CudaSlice<u32>) {
         (&mut self.logits, &mut self.ids)
-    }
-
-    pub(crate) fn invalidate_decode_fingerprint(&mut self) {
-        self.steady = None;
     }
 }
 
@@ -1301,10 +1299,10 @@ impl GemmaServe {
     }
 
     pub(crate) fn alloc_kv(&self) -> GemmaKv {
-        GemmaKv {
-            local: SlidingLocalKv::new(self.local_pool.clone()),
-            global: self.global_pool.alloc(),
-        }
+        GemmaKv::new(
+            SlidingLocalKv::new(self.local_pool.clone()),
+            self.global_pool.alloc(),
+        )
     }
 
     /// Copy a request's post-prefill KV into cache-owned pages — the
@@ -1460,10 +1458,10 @@ impl GemmaServe {
             &local_dst,
         )?;
         global.advance(t);
-        Ok(GemmaKv {
-            local: SlidingLocalKv::restore(self.local_pool.clone(), resident, origin_t, t),
+        Ok(GemmaKv::new(
+            SlidingLocalKv::restore(self.local_pool.clone(), resident, origin_t, t),
             global,
-        })
+        ))
     }
 
     fn advance_local(&self, kv: &mut GemmaKv, tokens: usize) -> Result<()> {
@@ -2040,6 +2038,7 @@ impl GemmaServe {
                     return None;
                 }
                 Some(SteadyRow {
+                    kv: kv.id(),
                     kv_len,
                     local_origin: origin,
                     local_pages,

@@ -167,6 +167,23 @@ impl SlidingLocalKv {
 pub(crate) struct GemmaKv {
     pub(crate) local: SlidingLocalKv,
     pub(crate) global: KvState,
+    /// Distinct for every state built in this process.
+    id: u64,
+}
+
+impl GemmaKv {
+    pub(crate) fn new(local: SlidingLocalKv, global: KvState) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            local,
+            global,
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// Pages a family still has to reserve to cover `kv_len` tokens, given what
@@ -300,10 +317,7 @@ mod tests {
     }
 
     fn kv_from(local: &KvPool, global: &KvPool) -> GemmaKv {
-        GemmaKv {
-            local: SlidingLocalKv::new(local.clone()),
-            global: global.alloc(),
-        }
+        GemmaKv::new(SlidingLocalKv::new(local.clone()), global.alloc())
     }
 
     #[test]
