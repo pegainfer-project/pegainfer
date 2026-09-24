@@ -1041,9 +1041,8 @@ fn missing_default_fixture_panics_for_short_and_long() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             find_default_fixture(model_path, long)
         }));
-        let err = match result {
-            Err(err) => err,
-            Ok(_) => panic!("find_default_fixture({kind}) must panic on zero matches"),
+        let Err(err) = result else {
+            panic!("find_default_fixture({kind}) must panic on zero matches")
         };
         let msg = err.downcast::<String>().unwrap_or_default();
         assert!(
