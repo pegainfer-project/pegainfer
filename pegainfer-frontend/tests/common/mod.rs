@@ -2,10 +2,6 @@
 //! thin `tests/<line>_chat_template_parity.rs` that names its golden and its
 //! content format; what is common is how a case from the reference JSON becomes
 //! a `ChatRequest` and how the renderer's output is compared.
-//!
-//! `#![allow(dead_code)]`: this module is compiled into every integration
-//! binary that includes it, and each uses a subset.
-#![allow(dead_code)]
 
 use serde_json::Value;
 use sha2::Digest;

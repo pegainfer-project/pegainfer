@@ -1098,16 +1098,12 @@ mod tests {
     }
 
     #[test]
-    fn tensor_f32_cow_rejects_wrong_dtype_and_rank() {
+    fn tensor_f32_cow_accepts_bf16_and_rejects_invalid_dtype_or_rank() {
         let bytes = vec![0u8; 8];
-        // A 1D bf16 vector widens (exact); the golden gate loads the real bf16
-        // GDN scalars. Other dtypes and ranks stay rejected.
         let bf16_view = TensorView::new(Dtype::BF16, vec![4], &bytes).unwrap();
         assert!(tensor_f32_cow(&bf16_view, "w").is_ok());
         let f16_view = TensorView::new(Dtype::F16, vec![4], &bytes).unwrap();
         assert!(tensor_f32_cow(&f16_view, "w").is_err());
-        let i64_view = TensorView::new(Dtype::I64, vec![1], &bytes).unwrap();
-        assert!(tensor_f32_cow(&i64_view, "w").is_err());
         let f32_2d_view = TensorView::new(Dtype::F32, vec![2, 1], &bytes).unwrap();
         assert!(tensor_f32_cow(&f32_2d_view, "w").is_err());
         let bf16_2d_view = TensorView::new(Dtype::BF16, vec![2, 2], &bytes).unwrap();

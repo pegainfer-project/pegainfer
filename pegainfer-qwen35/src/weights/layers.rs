@@ -435,12 +435,8 @@ mod tests {
     }
 
     fn test_geometry(rank: usize, world_size: usize) -> LocalGeometry {
-        geometry_for(&test_config(), rank, world_size)
-    }
-
-    fn geometry_for(config: &Config35, rank: usize, world_size: usize) -> LocalGeometry {
         let tp = TensorParallelConfig::try_from((rank, world_size)).unwrap();
-        LocalGeometry::try_new(config, tp).unwrap()
+        LocalGeometry::try_new(&test_config(), tp).unwrap()
     }
 
     #[test]

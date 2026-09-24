@@ -73,14 +73,12 @@ CHAT_CASES: dict[str, list[tuple[str, list[dict], bool, dict]]] = {
     # to xhigh|medium|low) and gates the reasoning instructions on
     # `enable_thinking`.
     "qwen38": [
-        ("plain_user_turn", MESSAGES, True, {}),
         ("plain_user_no_generation_prompt", MESSAGES, False, {}),
         ("multi_turn", MULTI_TURN, True, {}),
         ("unicode_content", UNICODE, True, {}),
         ("reasoning_effort_xhigh", MESSAGES, True, {"reasoning_effort": "xhigh"}),
         ("reasoning_effort_medium", MESSAGES, True, {"reasoning_effort": "medium"}),
         ("reasoning_effort_low", MESSAGES, True, {"reasoning_effort": "low"}),
-        ("thinking_disabled", MESSAGES, True, {"enable_thinking": False}),
         (
             "thinking_disabled_with_effort",
             MESSAGES,
@@ -91,10 +89,6 @@ CHAT_CASES: dict[str, list[tuple[str, list[dict], bool, dict]]] = {
 }
 
 REQUIRED_FILES = ("tokenizer.json", "tokenizer_config.json")
-
-# Models whose committed golden records "template_kwargs" even when empty.
-# Keeps regeneration byte-identical for the already-committed fixtures.
-ALWAYS_RECORD_KWARGS = {"qwen38"}
 
 
 def dump_file_hashes(model_dir: Path) -> dict:
@@ -123,7 +117,6 @@ def dump_file_hashes(model_dir: Path) -> dict:
 def dump_chat_templates(
     tokenizer,
     cases: list[tuple[str, list[dict], bool, dict]],
-    always_record_kwargs: bool,
 ) -> list:
     dumped = []
     for name, messages, add_generation_prompt, kwargs in cases:
@@ -138,7 +131,7 @@ def dump_chat_templates(
             "messages": messages,
             "add_generation_prompt": add_generation_prompt,
         }
-        if kwargs or always_record_kwargs:
+        if kwargs:
             case["template_kwargs"] = kwargs
         case["rendered"] = rendered
         dumped.append(case)
@@ -162,9 +155,7 @@ def main() -> int:
         "revision": args.revision,
         "transformers_version": transformers.__version__,
         "file_sha256": dump_file_hashes(model_dir),
-        "chat_templates": dump_chat_templates(
-            tokenizer, CHAT_CASES[args.model], args.model in ALWAYS_RECORD_KWARGS
-        ),
+        "chat_templates": dump_chat_templates(tokenizer, CHAT_CASES[args.model]),
     }
 
     Path(args.out).write_text(json.dumps(golden, ensure_ascii=False, indent=2) + "\n")

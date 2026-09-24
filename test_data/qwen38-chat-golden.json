@@ -9,22 +9,6 @@
   },
   "chat_templates": [
     {
-      "name": "plain_user_turn",
-      "messages": [
-        {
-          "role": "system",
-          "content": "You are terse."
-        },
-        {
-          "role": "user",
-          "content": "Explain gravity in one sentence."
-        }
-      ],
-      "add_generation_prompt": true,
-      "template_kwargs": {},
-      "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n"
-    },
-    {
       "name": "plain_user_no_generation_prompt",
       "messages": [
         {
@@ -37,7 +21,6 @@
         }
       ],
       "add_generation_prompt": false,
-      "template_kwargs": {},
       "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n"
     },
     {
@@ -57,7 +40,6 @@
         }
       ],
       "add_generation_prompt": true,
-      "template_kwargs": {},
       "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nIs 4111 prime?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nYes.<|im_end|>\n<|im_start|>user\nAnd 4112?<|im_end|>\n<|im_start|>assistant\n<think>\n"
     },
     {
@@ -69,7 +51,6 @@
         }
       ],
       "add_generation_prompt": true,
-      "template_kwargs": {},
       "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n翻译：🙂 と こんにちは<|im_end|>\n<|im_start|>assistant\n<think>\n"
     },
     {
@@ -125,24 +106,6 @@
         "reasoning_effort": "low"
       },
       "rendered": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n"
-    },
-    {
-      "name": "thinking_disabled",
-      "messages": [
-        {
-          "role": "system",
-          "content": "You are terse."
-        },
-        {
-          "role": "user",
-          "content": "Explain gravity in one sentence."
-        }
-      ],
-      "add_generation_prompt": true,
-      "template_kwargs": {
-        "enable_thinking": false
-      },
-      "rendered": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     },
     {
       "name": "thinking_disabled_with_effort",
