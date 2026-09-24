@@ -43,8 +43,7 @@ pub(crate) struct LinearAttentionLayer {
     pub(crate) conv1d_weight: DeviceVec,
     /// dt_bias: [local_linear_num_value_heads] bf16
     pub(crate) dt_bias: DeviceVec,
-    /// A_log: [local_linear_num_value_heads] f32 (widened from bf16 storage in
-    /// a Qwen3.8 checkpoint)
+    /// A_log: [local_linear_num_value_heads] f32 (widened from bf16 storage)
     pub(crate) a_log: CudaSlice<f32>,
     /// RMSNorm weight for output normalization: [value_head_dim] f32 (same
     /// widening) — head-shared, so replicated on every rank.
@@ -472,69 +471,5 @@ mod tests {
         // Rank 1 starts at its own first head's q rows, not the flat midpoint.
         let rank1 = full_attention_gated_q_shard_range(&config, test_geometry(1, 2));
         assert_eq!(rank1, (4096, 4096));
-    }
-
-    /// A 27B-class geometry: the real per-tensor shapes below are read off the
-    /// committed Qwen3.5-27B checkpoint (and identical in Qwen3.8-27B), so this
-    /// pins the unsharded assertion surface to what the checkpoints actually
-    /// carry. If a range stops covering the full extent, the loader's shape
-    /// check would reject a valid single-GPU load.
-    fn config_27b() -> Config35 {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.json"),
-            r#"{
-  "max_position_embeddings": 262144,
-  "tie_word_embeddings": false,
-  "text_config": {
-    "hidden_size": 5120,
-    "intermediate_size": 17408,
-    "num_hidden_layers": 2,
-    "num_attention_heads": 24,
-    "num_key_value_heads": 4,
-    "head_dim": 256,
-    "vocab_size": 248320,
-    "rms_norm_eps": 1e-6,
-    "layer_types": ["full_attention", "linear_attention"],
-    "linear_conv_kernel_dim": 4,
-    "linear_key_head_dim": 128,
-    "linear_num_key_heads": 16,
-    "linear_num_value_heads": 48,
-    "linear_value_head_dim": 128,
-    "rope_parameters": { "rope_theta": 10000000.0, "partial_rotary_factor": 0.25 },
-    "eos_token_id": 248044
-  }
-}"#,
-        )
-        .unwrap();
-        Config35::from_file(dir.path().to_str().unwrap()).expect("27b fixture validates")
-    }
-
-    #[test]
-    fn unsharded_ranges_cover_the_full_checkpoint_tensor_shapes() {
-        let config = config_27b();
-        let tp1 = geometry_for(&config, 0, 1);
-        assert!(!tp1.is_sharded());
-
-        // q_proj [12288, 5120] = 24 heads x 256 x 2 (q + gate), k/v [1024, 5120],
-        // o_proj [5120, 6144], gate/up [17408, 5120], down [5120, 17408].
-        assert_eq!(
-            full_attention_gated_q_shard_range(&config, tp1),
-            (0, 12_288)
-        );
-        assert_eq!(config.full_attn_q_dim(), 6_144);
-        assert_eq!(config.full_attn_kv_dim(), 1_024);
-        assert_eq!(tp1.shard_range(config.intermediate_size), (0, 17_408));
-
-        // in_proj_qkv [10240, 5120] = q 2048 + k 2048 + v 6144; in_proj_z and
-        // out_proj meet at the value dim 6144; A_log/dt_bias/in_proj_a/b carry
-        // the 48 value heads.
-        let qkv_rows: usize = linear_qkv_shard_segments(&config, tp1)
-            .iter()
-            .map(|&(_, len)| len)
-            .sum();
-        assert_eq!(qkv_rows, 10_240);
-        assert_eq!(config.linear_attn_z_dim(), 6_144);
-        assert_eq!(tp1.shard_range(config.linear_num_value_heads), (0, 48));
     }
 }

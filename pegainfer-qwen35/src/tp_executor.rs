@@ -719,9 +719,6 @@ impl Qwen35TpExecutor {
         let world_size = device_ordinals.len();
         let mut models = Vec::with_capacity(world_size);
         for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
-            // Load at the capacity the caller asked for: the rank-local
-            // recurrent-state pool is sized at load time, so a later admission
-            // shrink could not give that memory back.
             models.push(Qwen35Model::from_safetensors_with_runtime_and_capacity(
                 model_path,
                 ModelRuntimeConfig {

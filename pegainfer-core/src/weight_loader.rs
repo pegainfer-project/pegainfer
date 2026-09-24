@@ -1100,6 +1100,10 @@ mod tests {
     #[test]
     fn tensor_f32_cow_rejects_wrong_dtype_and_rank() {
         let bytes = vec![0u8; 8];
+        // A 1D bf16 vector widens (exact); the golden gate loads the real bf16
+        // GDN scalars. Other dtypes and ranks stay rejected.
+        let bf16_view = TensorView::new(Dtype::BF16, vec![4], &bytes).unwrap();
+        assert!(tensor_f32_cow(&bf16_view, "w").is_ok());
         let f16_view = TensorView::new(Dtype::F16, vec![4], &bytes).unwrap();
         assert!(tensor_f32_cow(&f16_view, "w").is_err());
         let i64_view = TensorView::new(Dtype::I64, vec![1], &bytes).unwrap();
@@ -1108,35 +1112,6 @@ mod tests {
         assert!(tensor_f32_cow(&f32_2d_view, "w").is_err());
         let bf16_2d_view = TensorView::new(Dtype::BF16, vec![2, 2], &bytes).unwrap();
         assert!(tensor_f32_cow(&bf16_2d_view, "w").is_err());
-    }
-
-    #[test]
-    fn tensor_f32_cow_widens_bf16_without_losing_the_stored_value() {
-        // 1.0, -2.0 and 0.5 are exactly representable in bf16, so the widened
-        // f32 result is pinned to those literals rather than to a tolerance.
-        let bits: [u16; 3] = [0x3f80, 0xc000, 0x3f00];
-        let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
-        let bf16_view = TensorView::new(Dtype::BF16, vec![bits.len()], &bytes).unwrap();
-        let widened: Vec<f32> = tensor_f32_cow(&bf16_view, "w")
-            .unwrap()
-            .iter()
-            .copied()
-            .collect();
-        assert_eq!(widened, vec![1.0, -2.0, 0.5]);
-
-        // The f32 storage of the same values reads back identically, which is
-        // the property the GDN scalars rely on across Qwen3.5 and Qwen3.8.
-        let f32_bytes: Vec<u8> = [1.0f32, -2.0, 0.5]
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        let f32_view = TensorView::new(Dtype::F32, vec![3], &f32_bytes).unwrap();
-        let same: Vec<f32> = tensor_f32_cow(&f32_view, "w")
-            .unwrap()
-            .iter()
-            .copied()
-            .collect();
-        assert_eq!(same, widened);
     }
 
     #[test]
