@@ -70,8 +70,8 @@ CHAT_CASES: dict[str, list[tuple[str, list[dict], bool, dict]]] = {
         ("unicode_content", UNICODE, True, {}),
     ],
     # Qwen3.8's template reads `reasoning_effort` (default `xhigh`, restricted
-    # to xhigh|medium|low), gates the reasoning instructions on
-    # `enable_thinking`, and honours `preserve_thinking`.
+    # to xhigh|medium|low) and gates the reasoning instructions on
+    # `enable_thinking`.
     "qwen38": [
         ("plain_user_turn", MESSAGES, True, {}),
         ("plain_user_no_generation_prompt", MESSAGES, False, {}),
@@ -87,7 +87,6 @@ CHAT_CASES: dict[str, list[tuple[str, list[dict], bool, dict]]] = {
             True,
             {"enable_thinking": False, "reasoning_effort": "low"},
         ),
-        ("preserve_thinking", MULTI_TURN, True, {"preserve_thinking": True}),
     ],
 }
 

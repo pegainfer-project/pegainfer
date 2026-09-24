@@ -66,13 +66,9 @@ fn chat_role(name: &str) -> ChatRole {
 
 fn reasoning_effort(name: &str) -> ReasoningEffort {
     match name {
-        "none" => ReasoningEffort::None,
-        "minimal" => ReasoningEffort::Minimal,
         "low" => ReasoningEffort::Low,
         "medium" => ReasoningEffort::Medium,
-        "high" => ReasoningEffort::High,
         "xhigh" => ReasoningEffort::XHigh,
-        "max" => ReasoningEffort::Max,
         other => panic!(
             "the golden asks for reasoning_effort {other:?}, which the renderer cannot \
              express; extend this match arm"
@@ -129,33 +125,15 @@ pub(crate) fn chat_request(case: &Value) -> ChatRequest {
     }
 }
 
-/// Render every case in `golden["chat_templates"]` and collect the disagreements
-/// so one run reports every divergence, not just the first.
-pub(crate) fn render_mismatches<R>(golden: &Value, render: R) -> Vec<String>
-where
-    R: Fn(&ChatRequest) -> Result<Prompt, String>,
-{
-    let mut mismatches = Vec::new();
-    let Value::Array(cases) = &golden["chat_templates"] else {
-        panic!("golden chat_templates must be an array");
-    };
-    for case in cases {
-        let name = case["name"].as_str().expect("chat case name");
-        let expected = case["rendered"].as_str().expect("chat case rendered");
-        match render(&chat_request(case)) {
-            Ok(Prompt::Text(actual)) if actual == expected => {}
-            Ok(Prompt::Text(actual)) => {
-                mismatches.push(format!(
-                    "{name}:\n  expected {expected:?}\n  got      {actual:?}"
-                ));
-            }
-            Ok(Prompt::TokenIds(ids)) => {
-                mismatches.push(format!("{name}: renderer returned token ids {ids:?}"));
-            }
-            Err(err) => mismatches.push(format!("{name}: render failed: {err}")),
-        }
-    }
-    mismatches
+/// `PEGAINFER_TEST_MODEL_PATH`, with the checkpoint family in the panic so the
+/// failure says which pinned checkpoint the golden was dumped from.
+pub(crate) fn model_path(model: &str) -> String {
+    std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| {
+        panic!(
+            "PEGAINFER_TEST_MODEL_PATH must point at the {model} checkpoint the \
+             reference was dumped from"
+        )
+    })
 }
 
 pub(crate) fn assert_no_mismatches(mismatches: &[String], golden: &Value) {
@@ -172,8 +150,10 @@ pub(crate) fn assert_no_mismatches(mismatches: &[String], golden: &Value) {
 }
 
 /// Render every golden case through the checkpoint's own template in the string
-/// content form. `Auto` can resolve a template to the parts form, whose system
-/// turns render differently, so the comparison pins the string form.
+/// content form and collect the disagreements, so one run reports every
+/// divergence, not just the first. `Auto` can resolve a template to the parts
+/// form, whose system turns render differently, so the comparison pins the
+/// string form.
 pub(crate) fn string_form_mismatches(model_path: &str, golden: &Value) -> Vec<String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -190,10 +170,27 @@ pub(crate) fn string_form_mismatches(model_path: &str, golden: &Value) -> Vec<St
         ))
         .expect("failed to load chat backends");
     let renderer = backends.chat_backend.chat_renderer();
-    render_mismatches(golden, |request| {
-        renderer
-            .render(request)
-            .map(|rendered| rendered.prompt)
-            .map_err(|err| err.to_string())
-    })
+    let mut mismatches = Vec::new();
+    let Value::Array(cases) = &golden["chat_templates"] else {
+        panic!("golden chat_templates must be an array");
+    };
+    for case in cases {
+        let name = case["name"].as_str().expect("chat case name");
+        let expected = case["rendered"].as_str().expect("chat case rendered");
+        match renderer.render(&chat_request(case)) {
+            Ok(rendered) => match rendered.prompt {
+                Prompt::Text(actual) if actual == expected => {}
+                Prompt::Text(actual) => {
+                    mismatches.push(format!(
+                        "{name}:\n  expected {expected:?}\n  got      {actual:?}"
+                    ));
+                }
+                Prompt::TokenIds(ids) => {
+                    mismatches.push(format!("{name}: renderer returned token ids {ids:?}"));
+                }
+            },
+            Err(err) => mismatches.push(format!("{name}: render failed: {err}")),
+        }
+    }
+    mismatches
 }

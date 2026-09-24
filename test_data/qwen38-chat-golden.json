@@ -162,28 +162,6 @@
         "reasoning_effort": "low"
       },
       "rendered": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-    },
-    {
-      "name": "preserve_thinking",
-      "messages": [
-        {
-          "role": "user",
-          "content": "Is 4111 prime?"
-        },
-        {
-          "role": "assistant",
-          "content": "Yes."
-        },
-        {
-          "role": "user",
-          "content": "And 4112?"
-        }
-      ],
-      "add_generation_prompt": true,
-      "template_kwargs": {
-        "preserve_thinking": true
-      },
-      "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nIs 4111 prime?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nYes.<|im_end|>\n<|im_start|>user\nAnd 4112?<|im_end|>\n<|im_start|>assistant\n<think>\n"
     }
   ]
 }

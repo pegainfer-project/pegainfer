@@ -32,18 +32,11 @@ fn golden() -> Value {
     )
 }
 
-fn model_path() -> String {
-    std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
-        "PEGAINFER_TEST_MODEL_PATH must point at the Qwen3.8 checkpoint the \
-         reference was dumped from",
-    )
-}
-
 #[test]
 #[ignore = "requires the pinned Qwen3.8-27B checkpoint"]
 fn chat_renders_match_hf_reference() {
     let golden = golden();
-    let dir = model_path();
+    let dir = common::model_path("Qwen3.8");
     common::assert_checkpoint_matches_reference(&golden, &dir);
     let mismatches = common::string_form_mismatches(&dir, &golden);
     common::assert_no_mismatches(&mismatches, &golden);

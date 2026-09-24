@@ -30,13 +30,6 @@ fn golden() -> Value {
     )
 }
 
-fn model_path() -> String {
-    std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
-        "PEGAINFER_TEST_MODEL_PATH must point at the Gemma 4 checkpoint the \
-         reference was dumped from",
-    )
-}
-
 /// Covers the string content form only. The frontend's default `Auto` format
 /// selects the parts form for this template, which renders system turns
 /// differently — see docs/models/gemma4/tokenizer.md.
@@ -44,7 +37,7 @@ fn model_path() -> String {
 #[ignore = "requires the pinned 12B checkpoint"]
 fn string_form_chat_renders_match_hf_reference() {
     let golden = golden();
-    let dir = model_path();
+    let dir = common::model_path("Gemma 4");
     common::assert_checkpoint_matches_reference(&golden, &dir);
     let mismatches = common::string_form_mismatches(&dir, &golden);
     common::assert_no_mismatches(&mismatches, &golden);
