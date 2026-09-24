@@ -103,11 +103,14 @@ all of it — `ChatOptions.reasoning_effort` (the vendored enum already has
 which HF leaves undefined; the template treats both the same, which is
 precisely the kind of equivalence this gate exists to confirm.
 
-`pegainfer-frontend/tests/qwen38_chat_template_parity.rs` covers ten cases
+`pegainfer-frontend/tests/qwen38_chat_template_parity.rs` covers nine cases
 against `qwen38-chat-golden.json`, bound to the checkpoint by file digests,
 with the shared render/compare machinery in
 `pegainfer-frontend/tests/common/mod.rs` and the reference dumped by the
-generic `tools/accuracy/dump_chat_template_golden.py qwen38`.
+generic `tools/accuracy/dump_chat_template_golden.py qwen38`. A
+`preserve_thinking` case is deliberately absent: against `MULTI_TURN` (whose
+assistant turn carries no reasoning) it renders byte-identical to
+`multi_turn`, so it tests nothing.
 
 ## Serving budget (unchanged from Qwen3.5-27B)
 
@@ -125,20 +128,30 @@ generic `tools/accuracy/dump_chat_template_golden.py qwen38`.
 
 ## Verification
 
-All on two 46 GB `sm_89` devices, `--features qwen35`, against
-`Qwen/Qwen3.8-27B` @ `1d4bf0f2`, TP2 (the text tower does not fit one card):
+Each row names the head it ran at. TP2 rows are against `Qwen/Qwen3.8-27B` @
+`1d4bf0f2` (the text tower does not fit one card); single-GPU rows are the
+Qwen3.5 sizes the shape-checked `load_tensor_2d` path actually meets on a real
+checkpoint — those loads now assert every tensor's shape against the config,
+and they are what "Qwen3.5 behaviour is unchanged" points to.
 
-| Gate | Result |
-| --- | --- |
-| `hf_golden_gate` short, TP2 | 2 passed / 0 failed. Sequential eager: 108 positions, mean 0.0238 / p99 0.0862 / max 0.1593. Batched eager: 72 positions, mean 0.0231 / p99 0.0823. No argmax violation. |
-| `hf_golden_gate` long, TP2 | 1 passed / 0 failed. 4097 + 8192-token prompts, 18 positions, mean 0.0226 / p99 0.0860 / max 0.0882. |
-| `qwen38_chat_template_parity` | 1 passed / 0 failed, 10 cases byte-identical to the HF render. |
-| `pegainfer-core --lib` | f32-cow tests pass (bf16 widening exact; f16/i64/wrong-rank still rejected). |
-| `pegainfer-qwen35 --lib` | 103 passed / 0 failed, incl. `unsharded_ranges_cover_the_full_checkpoint_tensor_shapes`. |
-| `clippy --all-targets -D warnings` + `cargo fmt --all --check` | clean. |
+| Gate | Head / device | Result |
+| --- | --- | --- |
+| `hf_golden_gate` short, Qwen3.8-27B TP2 | pre-review head, 2×L20 (sm_89) | 2 passed / 0 failed. Sequential eager: 108 positions, mean 0.0238 / p99 0.0862 / max 0.1593. Batched eager: 72 positions, mean 0.0231 / p99 0.0823. No argmax violation. |
+| `hf_golden_gate` long, Qwen3.8-27B TP2 | pre-review head, 2×L20 (sm_89) | 1 passed / 0 failed. 4097 + 8192-token prompts, 18 positions, mean 0.0226 / p99 0.0860 / max 0.0882. |
+| `hf_golden_gate` Qwen3.5-0.8B, single GPU (tied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0298 / p99 0.1137. Long: 18 positions, mean 0.0286 / p99 0.0926. |
+| `hf_golden_gate` Qwen3.5-2B, single GPU (tied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0301 / p99 0.1172. Long: 18 positions, mean 0.0238 / p99 0.0778. |
+| `hf_golden_gate` Qwen3.5-4B, single GPU (untied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0238 / p99 0.0813. Long: 18 positions, mean 0.0223 / p99 0.0705. |
+| `qwen38_chat_template_parity` | merged tree | 1 passed / 0 failed, 9 cases byte-identical to the HF render. |
+| `pegainfer-qwen35 --lib` (feature build, Triton AOT) | review-fix head, 1×L20 | 102 passed / 0 failed, the GPU recurrent tests included. |
+| `pegainfer-core --lib` | review-fix head | 38 passed / 0 failed (f32-cow: 1D bf16 accepted, other dtypes/ranks rejected). |
+| clippy `-D warnings` (core/qwen35/qwen3/frontend) + `cargo fmt --all --check` | merged tree | clean. |
 
 Tolerances are the line's existing 4B calibration (`MEAN_TOL 0.06`,
-`P99_TOL 0.20`) — no new constants.
+`P99_TOL 0.20`) — no new constants, and every single-GPU size sits inside
+them. The TP2 rows predate the review rework and the merge; the numerics
+paths they cover are unchanged by either (the loader asserts the same values
+earlier, widening is the same exact upcast, and the gate compares against the
+same fixtures, now selected by `config_sha256`).
 
 ## How to run
 
@@ -153,10 +166,9 @@ python3 -m pip install flash-linear-attention einops
 # 1. reference fixtures (short and long), pinned to the revision the gate asserts
 python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path $D \
   --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
-  --tokenizer-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
-  --max-memory-gib 21                       # shared tray: accelerate plans against TOTAL memory
+  --tokenizer-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
 python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path $D \
-  --model-revision … --tokenizer-revision … --max-memory-gib 21 \
+  --model-revision … --tokenizer-revision … \
   --prompt-lens 4097,8192 --decode-tokens 8
 python3 tools/accuracy/dump_chat_template_golden.py qwen38 \
   $D test_data/qwen38-chat-golden.json \
@@ -169,6 +181,13 @@ PEGAINFER_TEST_MODEL_PATH=$D PEGAINFER_TEST_MODEL_REVISION=1d4bf0f2… \
   -- --ignored --test-threads 1 _tp2
 PEGAINFER_TEST_MODEL_PATH=$D \
   cargo test -r -p pegainfer-frontend --test qwen38_chat_template_parity -- --ignored
+
+# 3. the single-GPU Qwen3.5 rows (any one size; the fixture is picked by
+#    config_sha256, so point the path at whichever size's checkpoint)
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B \
+  PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
+  cargo test -r --locked -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate \
+  -- --nocapture
 ```
 
 Two oracle traps, both now guarded:
