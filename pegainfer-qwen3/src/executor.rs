@@ -1228,13 +1228,6 @@ impl Qwen3Executor {
         ensure_pertoken_single_gpu(policy, device_ordinals.len())?;
         ensure_pertoken_overlap_disabled(policy, decode_overlap)?;
 
-        // Validate draft capabilities before constructing a CUDA context or
-        // uploading the target. Native DFlash2 inspection is not serving support.
-        let max_verify_batch = *BATCH_BUCKETS.last().unwrap();
-        let dflash_reservation = dflash_draft_path
-            .map(|path| crate::dflash::DFlashMemoryReservation::from_path(path, max_verify_batch))
-            .transpose()?;
-
         if policy == NumericPolicy::PerToken {
             if enable_cuda_graph {
                 let max_graph_bucket = crate::batch_decode::DecodeGraphPlan::new(policy)
@@ -1270,8 +1263,14 @@ impl Qwen3Executor {
             // paged KV pool, so reserve its footprint up front from the draft
             // config: fixed bytes (weights + block scratch) via the margin, and
             // pool-scaling per-token bytes folded into the block budget.
-            let (dflash_kv_bytes_per_token, hedge_scratch_pages) = match dflash_reservation {
-                Some(reservation) => {
+            let max_verify_batch = *BATCH_BUCKETS.last().unwrap();
+            let (dflash_kv_bytes_per_token, hedge_scratch_pages) = match dflash_draft_path {
+                Some(path) => {
+                    let reservation = crate::dflash::DFlashMemoryReservation::from_path(
+                        model.device_ctx(),
+                        path,
+                        max_verify_batch,
+                    )?;
                     memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
                         memory_options.kv_cache_memory_margin_bytes,
                         reservation.fixed_bytes,

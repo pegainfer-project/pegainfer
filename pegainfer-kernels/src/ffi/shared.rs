@@ -5,6 +5,20 @@ use super::Half;
 
 // Shared kernels used across all models (CUDA / cuBLAS / FlashInfer).
 unsafe extern "C" {
+    pub fn dflash2_grouped_conv_cuda(
+        input: *const Half,
+        dynamic: *const Half,
+        base: *const Half,
+        output: *mut Half,
+        rows: i32,
+        hidden: i32,
+        block: i32,
+        group_size: i32,
+        taps: i32,
+        side: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn rms_norm_cuda(
         x: *const Half,
         weight: *const Half,

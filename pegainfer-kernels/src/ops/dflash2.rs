@@ -45,8 +45,6 @@ pub struct DFlash2Scratch {
     edge_scores: CudaSlice<f32>,
     selected_ids: CudaSlice<u32>,
     error_flag: CudaSlice<u32>,
-
-    total_bytes: usize,
 }
 
 fn product(values: &[usize]) -> Result<usize> {
@@ -77,6 +75,49 @@ fn check_ffi(status: i32, stage: &str) -> Result<()> {
 }
 
 impl DFlash2Scratch {
+    fn workspace_bytes(ctx: &DeviceContext, vocab: usize) -> Result<usize> {
+        ensure!(
+            vocab >= DFLASH2_CANDIDATE_K && i32::try_from(vocab).is_ok(),
+            "DFlash2 vocab must be in 16..=i32::MAX, got {vocab}"
+        );
+        let mut bytes = 0;
+        let status = unsafe {
+            ffi::dflash2_topk_workspace_bytes_cuda(
+                vocab as i32,
+                &raw mut bytes,
+                active_cu_stream(ctx),
+            )
+        };
+        check_ffi(status, "CUB workspace query")?;
+        Ok(bytes)
+    }
+
+    pub fn reservation_bytes(
+        ctx: &DeviceContext,
+        batch: usize,
+        block: usize,
+        vocab: usize,
+        rank: usize,
+        chunk: usize,
+    ) -> Result<usize> {
+        ensure!(block >= 2, "DFlash2 block must contain a draft position");
+        let rows = product(&[batch, block - 1])?;
+        let sizes = [
+            product(&[chunk, vocab, 8])?,
+            product(&[chunk, DFLASH2_CANDIDATE_K, 8])?,
+            Self::workspace_bytes(ctx, vocab)?,
+            product(&[rows, DFLASH2_CANDIDATE_K, 8])?,
+            product(&[rows, DFLASH2_CANDIDATE_K, rank, 8])?,
+            product(&[rows, DFLASH2_CANDIDATE_K, DFLASH2_CANDIDATE_K, 4])?,
+            product(&[rows, 4])?,
+            4,
+        ];
+        sizes.iter().try_fold(0usize, |sum, &size| {
+            sum.checked_add(size)
+                .ok_or_else(|| anyhow!("DFlash2 reservation overflow"))
+        })
+    }
+
     pub fn new(
         ctx: &DeviceContext,
         max_batch: usize,
@@ -92,10 +133,6 @@ impl DFlash2Scratch {
         ensure!(
             max_batch > 0 && block_size >= 2 && rank > 0,
             "DFlash2 requires max_batch > 0, block_size >= 2, rank > 0"
-        );
-        ensure!(
-            vocab >= DFLASH2_CANDIDATE_K && i32::try_from(vocab).is_ok(),
-            "DFlash2 vocab must be in 16..=i32::MAX, got {vocab}"
         );
         ensure!(
             i32::try_from(rank).is_ok(),
@@ -120,34 +157,10 @@ impl DFlash2Scratch {
         let gathered = product(&[candidates, rank])?;
         let edges = product(&[candidates, DFLASH2_CANDIDATE_K])?;
 
-        let mut workspace_bytes = 0;
-        let status = unsafe {
-            ffi::dflash2_topk_workspace_bytes_cuda(
-                vocab as i32,
-                &raw mut workspace_bytes,
-                active_cu_stream(ctx),
-            )
-        };
-        check_ffi(status, "CUB workspace query")?;
+        let workspace_bytes = Self::workspace_bytes(ctx, vocab)?;
 
         // TopK reuses one row's library scratch; only the packed input retains
         // full vocabulary width. Caller separately owns H/W/A/B.
-        let sizes = [
-            product(&[keys, 8])?,
-            product(&[chunk_candidates, 8])?,
-            workspace_bytes.max(1),
-            product(&[candidates, 8])?,
-            product(&[gathered, 8])?,
-            product(&[edges, 4])?,
-            product(&[rows, 4])?,
-            4,
-        ];
-        let total_bytes = sizes.iter().try_fold(0usize, |sum, &bytes| {
-            sum.checked_add(bytes)
-                .filter(|&size| isize::try_from(size).is_ok())
-                .ok_or_else(|| anyhow!("DFlash2 scratch byte total overflow"))
-        })?;
-
         Ok(Self {
             max_batch,
             block_size,
@@ -156,7 +169,7 @@ impl DFlash2Scratch {
             rows_per_chunk,
             keys_in: ctx.stream.alloc_zeros(keys)?,
             keys_out: ctx.stream.alloc_zeros(chunk_candidates)?,
-            topk_workspace: ctx.stream.alloc_zeros(workspace_bytes.max(1))?,
+            topk_workspace: ctx.stream.alloc_zeros(workspace_bytes)?,
             candidate_ids: ctx.stream.alloc_zeros(candidates)?,
             unary_scores: ctx.stream.alloc_zeros(candidates)?,
             gated_predecessors: ctx.stream.alloc_zeros(gathered)?,
@@ -164,7 +177,6 @@ impl DFlash2Scratch {
             edge_scores: ctx.stream.alloc_zeros(edges)?,
             selected_ids: ctx.stream.alloc_zeros(rows)?,
             error_flag: ctx.stream.alloc_zeros(1)?,
-            total_bytes,
         })
     }
 
@@ -190,10 +202,6 @@ impl DFlash2Scratch {
     pub fn error_flag(&self) -> &CudaSlice<u32> {
         &self.error_flag
     }
-
-    pub fn total_bytes(&self) -> usize {
-        self.total_bytes
-    }
 }
 
 fn check_stream<T>(ctx: &DeviceContext, buffer: &CudaSlice<T>, name: &str) -> Result<()> {
@@ -205,7 +213,7 @@ fn check_stream<T>(ctx: &DeviceContext, buffer: &CudaSlice<T>, name: &str) -> Re
     Ok(())
 }
 
-/// Enqueue native anchor-drop selection using BF16 unary logits, BF16 projected
+/// Enqueue anchor-drop selection using BF16 unary logits, BF16 projected
 /// hidden states and BF16 codebooks. No allocation, host transfer or sync occurs
 /// here. Warm up shared cuBLAS before graph capture, as for existing GEMM ops.
 ///

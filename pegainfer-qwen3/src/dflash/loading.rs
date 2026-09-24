@@ -5,6 +5,7 @@ use pegainfer_core::rope::RopeTableSpec;
 use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
+use pegainfer_core::weight_loader::StagedWeightLoader;
 use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::load_tensor_1d;
@@ -12,6 +13,9 @@ use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::mmap_shards;
 
 use super::DFlashDraftModel;
+use super::conv::GroupedConv;
+use super::conv::LayerConvs;
+use super::selector::SelectorHead;
 use crate::config::DFlashConfig;
 use crate::dspark::MARKOV_W1_TENSOR;
 use crate::dspark::MARKOV_W2_TENSOR;
@@ -132,6 +136,56 @@ impl DFlashDraftModel {
             });
         }
 
+        let convs = config
+            .conv
+            .as_ref()
+            .map(|conv| -> Result<Vec<LayerConvs>> {
+                let load = |layer: usize, name: &str| -> Result<GroupedConv> {
+                    let prefix = format!("layers.{layer}.{name}");
+                    Ok(GroupedConv {
+                        projection: load_tensor_2d(
+                            ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{prefix}.kernel_projection.weight"),
+                        )?,
+                        // The kernel views the flat buffer as [2, taps, hidden].
+                        base: load_tensor_1d(
+                            ctx,
+                            &shards,
+                            &weight_map,
+                            &format!("{prefix}.base_kernel"),
+                        )?,
+                        block_size: config.block_size,
+                        group_size: conv.group_size,
+                    })
+                };
+                (0..config.num_hidden_layers)
+                    .map(|layer| {
+                        Ok(LayerConvs {
+                            attention: load(layer, "attention_conv")?,
+                            mlp: load(layer, "mlp_conv")?,
+                        })
+                    })
+                    .collect()
+            })
+            .transpose()?;
+        // Published Speculators DFlash2 checkpoints train their own untied
+        // embedding and output head; reusing the target's changes the model.
+        let (embed_tokens, lm_head) = if config.conv.is_some() {
+            (
+                Some(load_tensor_2d(
+                    ctx,
+                    &shards,
+                    &weight_map,
+                    "embed_tokens.weight",
+                )?),
+                Some(load_tensor_2d(ctx, &shards, &weight_map, "lm_head.weight")?),
+            )
+        } else {
+            (None, None)
+        };
+
         let norm = load_tensor_1d(ctx, &shards, &weight_map, "norm.weight")?;
         let hidden_norm = load_tensor_1d(ctx, &shards, &weight_map, "hidden_norm.weight")?;
         let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
@@ -153,6 +207,38 @@ impl DFlashDraftModel {
             None
         };
 
+        let selector = if config.selector_rank > 0 {
+            let rank = config.selector_rank;
+            let mut loader = StagedWeightLoader::new(ctx, &shards, &weight_map)?;
+            let w = loader.matrix(
+                "candidate_selector.hidden_projection.weight",
+                rank,
+                config.hidden_size,
+            )?;
+            let a = loader.matrix(
+                "candidate_selector.predecessor_codebook",
+                config.vocab_size,
+                rank,
+            )?;
+            let b = loader.matrix(
+                "candidate_selector.successor_codebook",
+                config.vocab_size,
+                rank,
+            )?;
+            loader.finish()?;
+            // Keep weights and reservation identical for selector-on/off A/B.
+            let enabled = std::env::var_os("DFLASH2_NO_SELECTOR").is_none();
+            log::info!("selector: enabled={enabled}, rank={rank}, top_k=16");
+            Some(SelectorHead {
+                projection: loader.take(w),
+                predecessor: loader.take(a),
+                successor: loader.take(b),
+                enabled,
+            })
+        } else {
+            None
+        };
+
         let (cos_cache, sin_cache) = precompute_rope(
             ctx,
             &RopeTableSpec {
@@ -167,12 +253,16 @@ impl DFlashDraftModel {
         Ok(Self {
             config,
             layers,
+            convs,
+            embed_tokens,
+            lm_head,
             norm,
             hidden_norm,
             fc,
             cos_cache,
             sin_cache,
             markov,
+            selector,
         })
     }
 }

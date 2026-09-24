@@ -6,6 +6,7 @@ mod deepep;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
 mod dflash2;
+mod dflash2_conv;
 mod elementwise;
 mod embedding;
 #[cfg(feature = "gemma4")]
@@ -54,6 +55,7 @@ pub use attention::single_prefill_hd256_into;
 pub use attention::single_prefill_hd512_into;
 pub use attention::single_prefill_nhd_causal_into;
 pub use attention::single_prefill_nhd_noncausal_into;
+pub use attention::single_prefill_nhd_noncausal_range_into;
 #[cfg(feature = "moe")]
 pub use deepep::DeepEp;
 #[cfg(feature = "moe")]
@@ -89,6 +91,7 @@ pub use deepseek_v2_lite::*;
 pub use dflash2::DFLASH2_CANDIDATE_K;
 pub use dflash2::DFlash2Scratch;
 pub use dflash2::dflash2_select_into;
+pub use dflash2_conv::dflash2_grouped_conv_into;
 pub use elementwise::SuppressIds;
 pub use elementwise::accumulate_bf16_token_scaled_to_f32_into;
 pub use elementwise::add_batch;

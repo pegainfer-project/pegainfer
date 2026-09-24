@@ -45,11 +45,12 @@ pub(crate) struct Config {
 
 /// Resolved drafter config shared by DFlash and DSpark. DSpark extends the
 /// DFlash backbone with a Markov head and an optional confidence head;
-/// `markov_rank == 0` is plain DFlash. Two on-disk schemas are normalized into
-/// this in `from_file`: our `Qwen3-4B-DFlash-b16` nests
+/// zero Markov and selector ranks select independent per-position argmax. Supported
+/// schemas are normalized in `from_file`: our `Qwen3-4B-DFlash-b16` nests
 /// `dflash_config: {mask_token_id, target_layer_ids}` and puts `rope_theta` at
 /// the top level, while DeepSpec's `dflash_/dspark_*_block7` put those fields
-/// flat and nest `rope_theta` under `rope_parameters`.
+/// flat and nest `rope_theta` under `rope_parameters`. Published Speculators
+/// DFlash2 checkpoints nest backbone geometry in `transformer_layer_config`.
 #[derive(Clone, Debug)]
 pub(crate) struct DFlashConfig {
     pub(crate) hidden_size: usize,
@@ -57,7 +58,7 @@ pub(crate) struct DFlashConfig {
     pub(crate) num_hidden_layers: usize,
     pub(crate) num_attention_heads: usize,
     pub(crate) num_key_value_heads: usize,
-    num_target_layers: usize,
+    num_target_layers: Option<usize>,
     pub(crate) head_dim: usize,
     pub(crate) vocab_size: usize,
     pub(crate) rms_norm_eps: f32,
@@ -66,8 +67,12 @@ pub(crate) struct DFlashConfig {
     pub(crate) block_size: usize,
     pub(crate) mask_token_id: u32,
     pub(crate) target_layer_ids: Vec<usize>,
-    /// DSpark Markov head low-rank size; 0 disables the head (= plain DFlash).
+    /// DSpark Markov head low-rank size; 0 disables the Markov head.
     pub(crate) markov_rank: usize,
+    /// Path-selector rank; 0 disables this head.
+    pub(crate) selector_rank: usize,
+    pub(crate) conv: Option<DFlashConvConfig>,
+    pub(crate) sliding_window: Option<usize>,
     markov_head_type: String,
     /// Block draft layout. DeepSpec `Qwen3DSparkModel` checkpoints (both the
     /// markov and the `markov_rank == 0` ones) are *anchor-first*: block position
@@ -89,11 +94,26 @@ pub(crate) struct DFlashConfig {
 struct DFlashInnerConfig {
     mask_token_id: u32,
     target_layer_ids: Vec<usize>,
+    block_size: Option<usize>,
+    selector_rank: Option<usize>,
+    selector_top_k: Option<usize>,
+    conv_kernel_size: Option<usize>,
+    conv_group_size: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DFlashConvConfig {
+    pub(crate) taps: usize,
+    pub(crate) group_size: usize,
 }
 
 #[derive(Debug, Deserialize)]
 struct RopeParameters {
     rope_theta: f32,
+}
+
+fn default_selector_top_k() -> usize {
+    pegainfer_kernels::ops::DFLASH2_CANDIDATE_K
 }
 
 fn default_markov_head_type() -> String {
@@ -103,31 +123,55 @@ fn default_markov_head_type() -> String {
 /// On-disk drafter config tolerant of both the nested (`b16`) and flat
 /// (DeepSpec) schemas; `from_file` resolves it into `DFlashConfig`.
 #[derive(Deserialize)]
-struct RawDFlashConfig {
+struct DFlashGeometry {
     hidden_size: usize,
     intermediate_size: usize,
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
-    num_target_layers: usize,
     head_dim: usize,
     vocab_size: usize,
     rms_norm_eps: f32,
-    #[serde(default)]
     rope_theta: Option<f32>,
-    #[serde(default)]
     rope_parameters: Option<RopeParameters>,
     #[serde(default = "default_max_position_embeddings")]
     max_position_embeddings: usize,
-    block_size: usize,
+    sliding_window: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DFlashGeometrySource {
+    Speculators {
+        transformer_layer_config: DFlashGeometry,
+    },
+    Flat(DFlashGeometry),
+}
+
+#[derive(Deserialize)]
+struct RawDFlashConfig {
+    #[serde(flatten)]
+    geometry: DFlashGeometrySource,
+    num_target_layers: Option<usize>,
+    block_size: Option<usize>,
     #[serde(default)]
     dflash_config: Option<DFlashInnerConfig>,
     #[serde(default)]
     mask_token_id: Option<u32>,
     #[serde(default)]
     target_layer_ids: Option<Vec<usize>>,
+    aux_hidden_state_layer_ids: Option<Vec<usize>>,
+    conv_kernel_size: Option<usize>,
+    conv_group_size: Option<usize>,
+    sliding_window_non_causal: Option<bool>,
+    #[serde(default)]
+    sample_from_anchor: bool,
     #[serde(default)]
     markov_rank: usize,
+    #[serde(default)]
+    selector_rank: usize,
+    #[serde(default = "default_selector_top_k")]
+    selector_top_k: usize,
     #[serde(default = "default_markov_head_type")]
     markov_head_type: String,
     #[serde(default)]
@@ -269,45 +313,109 @@ impl DFlashConfig {
     pub(crate) fn from_file(model_path: &str) -> Result<Self> {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
-        let json: Value = serde_json::from_str(&content)?;
-        if crate::dflash::config::NativeDFlash2Config::is_native(&json) {
-            crate::dflash::config::NativeDFlash2Config::from_json(&json)?.validate_serving()?;
+        let raw: RawDFlashConfig = serde_json::from_str(&content)?;
+        let geometry = match raw.geometry {
+            DFlashGeometrySource::Speculators {
+                transformer_layer_config,
+            } => transformer_layer_config,
+            DFlashGeometrySource::Flat(geometry) => geometry,
+        };
+        let inner = raw.dflash_config.as_ref();
+        let block_size = inner
+            .and_then(|config| config.block_size)
+            .or(raw.block_size)
+            .context("drafter config missing block_size")?;
+        let selector_rank = inner
+            .and_then(|config| config.selector_rank)
+            .unwrap_or(raw.selector_rank);
+        let selector_top_k = inner
+            .and_then(|config| config.selector_top_k)
+            .unwrap_or(raw.selector_top_k);
+        if selector_rank > 0 {
+            ensure!(
+                selector_top_k == default_selector_top_k(),
+                "DFlash2 requires top-16 candidates"
+            );
+            ensure!(
+                raw.markov_rank == 0 && raw.num_anchors.is_none() && !raw.sample_from_anchor,
+                "DFlash2 selector requires an anchor-drop DFlash backbone"
+            );
         }
-        let raw: RawDFlashConfig = serde_json::from_value(json)?;
+
+        let conv = match (
+            inner
+                .and_then(|config| config.conv_kernel_size)
+                .or(raw.conv_kernel_size),
+            inner
+                .and_then(|config| config.conv_group_size)
+                .or(raw.conv_group_size),
+        ) {
+            (None, None) => None,
+            (Some(taps), Some(group_size)) => {
+                ensure!(
+                    raw.sliding_window_non_causal != Some(false) && !raw.sample_from_anchor,
+                    "DFlash2 supports noncausal anchor-drop blocks"
+                );
+                ensure!(
+                    taps > 0 && group_size > 0 && geometry.hidden_size.is_multiple_of(group_size),
+                    "DFlash2 convolution requires positive taps and groups dividing hidden_size"
+                );
+                Some(DFlashConvConfig { taps, group_size })
+            }
+            _ => bail!("DFlash2 convolution requires both kernel_size and group_size"),
+        };
 
         // rope_theta: flat (b16) or nested under rope_parameters (DeepSpec).
-        let rope_theta = raw
+        let rope_theta = geometry
             .rope_theta
-            .or(raw.rope_parameters.map(|r| r.rope_theta))
+            .or(geometry.rope_parameters.map(|r| r.rope_theta))
             .context("drafter config missing rope_theta / rope_parameters.rope_theta")?;
 
         // mask_token_id + target_layer_ids: nested dflash_config (b16) or flat (DeepSpec).
-        let (mask_token_id, target_layer_ids) = match raw.dflash_config {
-            Some(inner) => (inner.mask_token_id, inner.target_layer_ids),
-            None => (
+        let (mask_token_id, target_layer_ids) = if let Some(inner) = raw.dflash_config {
+            (inner.mask_token_id, inner.target_layer_ids)
+        } else {
+            let layers = match (raw.target_layer_ids, raw.aux_hidden_state_layer_ids) {
+                (Some(layers), _) => layers,
+                (_, Some(layers)) => layers
+                    .into_iter()
+                    .map(|layer| {
+                        // Speculators indexes HF hidden_states (0 is embedding);
+                        // our capture points are zero-based decoder outputs.
+                        layer
+                            .checked_sub(1)
+                            .context("DFlash capture must refer to a decoder output")
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                _ => bail!("drafter config missing target hidden-state layers"),
+            };
+            (
                 raw.mask_token_id
-                    .context("drafter config missing mask_token_id (no dflash_config block)")?,
-                raw.target_layer_ids
-                    .context("drafter config missing target_layer_ids (no dflash_config block)")?,
-            ),
+                    .context("drafter config missing mask_token_id")?,
+                layers,
+            )
         };
 
+        let sliding_window = conv.as_ref().and(geometry.sliding_window);
         Ok(Self {
-            hidden_size: raw.hidden_size,
-            intermediate_size: raw.intermediate_size,
-            num_hidden_layers: raw.num_hidden_layers,
-            num_attention_heads: raw.num_attention_heads,
-            num_key_value_heads: raw.num_key_value_heads,
+            hidden_size: geometry.hidden_size,
+            intermediate_size: geometry.intermediate_size,
+            num_hidden_layers: geometry.num_hidden_layers,
+            num_attention_heads: geometry.num_attention_heads,
+            num_key_value_heads: geometry.num_key_value_heads,
             num_target_layers: raw.num_target_layers,
-            head_dim: raw.head_dim,
-            vocab_size: raw.vocab_size,
-            rms_norm_eps: raw.rms_norm_eps,
+            head_dim: geometry.head_dim,
+            vocab_size: geometry.vocab_size,
+            rms_norm_eps: geometry.rms_norm_eps,
             rope_theta,
-            max_position_embeddings: raw.max_position_embeddings,
-            block_size: raw.block_size,
+            max_position_embeddings: geometry.max_position_embeddings,
+            block_size,
             mask_token_id,
             target_layer_ids,
             markov_rank: raw.markov_rank,
+            selector_rank,
+            conv,
+            sliding_window,
             markov_head_type: raw.markov_head_type,
             enable_confidence_head: raw.enable_confidence_head,
             // A markov head only ever ships on a DeepSpec (anchor-first)
@@ -338,8 +446,9 @@ impl DFlashConfig {
             target.hidden_size
         );
         anyhow::ensure!(
-            self.num_target_layers == target.num_hidden_layers,
-            "DFlash num_target_layers {} does not match target layers {}",
+            self.num_target_layers
+                .is_none_or(|layers| layers == target.num_hidden_layers),
+            "DFlash num_target_layers {:?} does not match target layers {}",
             self.num_target_layers,
             target.num_hidden_layers
         );

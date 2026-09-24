@@ -50,7 +50,7 @@ impl Inputs {
 
     fn poison_inactive(&mut self, active: usize) {
         for request in 0..N {
-            // The native discarded anchor slot is poisoned even for active
+            // The discarded anchor slot is poisoned even for active
             // requests. It must never become a candidate or a gated hidden row.
             let row = request * BLOCK;
             self.logits[row * VOCAB..(row + 1) * VOCAB].fill(bf16::NAN);
