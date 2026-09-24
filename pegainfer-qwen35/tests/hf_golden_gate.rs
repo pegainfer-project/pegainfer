@@ -94,7 +94,7 @@ fn safetensors_metadata(bytes: &[u8]) -> HashMap<String, String> {
 /// recorded hash matches the local `config.json`. [`check_fixture_metadata`]
 /// then re-asserts that hash (plus `model_revision`) before a single logit is
 /// compared.
-fn find_default_fixture(model_path: &str, long: bool) -> Option<String> {
+fn find_default_fixture(model_path: &str, long: bool) -> String {
     let config = Path::new(model_path).join("config.json");
     let hash = sha256_file(&config).unwrap_or_else(|| panic!("read {}", config.display()));
     let suffix = if long {
@@ -118,8 +118,14 @@ fn find_default_fixture(model_path: &str, long: bool) -> Option<String> {
         }
     }
     match matches.len() {
-        0 => None,
-        1 => Some(matches[0].to_string_lossy().into_owned()),
+        0 => panic!(
+            "no committed qwen35 hf_golden_gate fixture records config_sha256={hash} \
+             (config: {}, kind: {}); generate one with \
+             tools/accuracy/dump_qwen35_hf_golden.py --model-path {model_path}",
+            config.display(),
+            if long { "long" } else { "short" },
+        ),
+        1 => matches[0].to_string_lossy().into_owned(),
         _ => panic!(
             "multiple qwen35 hf_golden_gate fixtures match {model_path}/config.json: {matches:?}"
         ),
@@ -312,24 +318,11 @@ struct Golden {
 }
 
 impl Golden {
-    /// An explicitly set env override must exist; no default fixture matching
-    /// the checkpoint is a clean skip (`None`).
-    fn load_for(model_path: &str, long: bool) -> Option<Golden> {
+    fn load_for(model_path: &str, long: bool) -> Golden {
         let env_key = if long { LONG_GOLDEN_ENV } else { GOLDEN_ENV };
-        let path = if let Ok(path) = std::env::var(env_key) {
-            path
-        } else {
-            let Some(path) = find_default_fixture(model_path, long) else {
-                eprintln!(
-                    "skipping qwen35 hf_golden_gate: no committed fixture records this \
-                     checkpoint's config_sha256; generate one with \
-                     tools/accuracy/dump_qwen35_hf_golden.py"
-                );
-                return None;
-            };
-            path
-        };
-        Some(Self::load_path(path))
+        let path =
+            std::env::var(env_key).unwrap_or_else(|_| find_default_fixture(model_path, long));
+        Self::load_path(path)
     }
 
     fn load_path(path: impl AsRef<Path>) -> Golden {
@@ -846,9 +839,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
-        return;
-    };
+    let golden = Golden::load_for(&model_path, false);
     if !check_fixture_metadata(&model_path, &golden) {
         return;
     }
@@ -909,9 +900,7 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_long_golden") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true) else {
-        return;
-    };
+    let golden = Golden::load_for(&model_path, true);
     if !check_fixture_metadata(&model_path, &golden) {
         return;
     }
@@ -934,9 +923,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden_tp2") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
-        return;
-    };
+    let golden = Golden::load_for(&model_path, false);
     if !check_fixture_metadata(&model_path, &golden) {
         return;
     }
@@ -964,9 +951,7 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true) else {
-        return;
-    };
+    let golden = Golden::load_for(&model_path, true);
     if !check_fixture_metadata(&model_path, &golden) {
         return;
     }
@@ -993,9 +978,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
-        return;
-    };
+    let golden = Golden::load_for(&model_path, false);
     if !check_fixture_metadata(&model_path, &golden) {
         return;
     }
@@ -1038,6 +1021,38 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
         eprintln!(
             "qwen35 hf_golden_gate: skipping TP2 slot-compaction graph; fixture has {} sequence(s), decode_len {}",
             golden.num_seqs, golden.decode_len
+        );
+    }
+}
+
+#[test]
+fn missing_default_fixture_panics_for_short_and_long() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"model_type":"qwen3_5","text_config":{"hidden_size":1}}"#,
+    )
+    .unwrap();
+    let model_path = dir.path().to_str().unwrap();
+
+    for long in [false, true] {
+        let kind = if long { "long" } else { "short" };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            find_default_fixture(model_path, long)
+        }));
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("find_default_fixture({kind}) must panic on zero matches"),
+        };
+        let msg = err.downcast::<String>().unwrap_or_default();
+        assert!(
+            msg.contains("no committed qwen35 hf_golden_gate fixture"),
+            "{kind}: unexpected panic message: {msg}"
+        );
+        assert!(
+            msg.contains(kind),
+            "{kind}: panic should name the fixture kind: {msg}"
         );
     }
 }
