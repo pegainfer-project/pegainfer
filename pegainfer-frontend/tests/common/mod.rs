@@ -14,8 +14,8 @@ use vllm_chat::ChatMessage;
 use vllm_chat::ChatOptions;
 use vllm_chat::ChatRequest;
 use vllm_chat::ChatRole;
+use vllm_chat::EffortValue;
 use vllm_chat::GenerationPromptMode;
-use vllm_chat::ReasoningEffort;
 use vllm_text::Prompt;
 
 /// The committed golden named by `env_key`, or `default_rel_path` under
@@ -64,11 +64,9 @@ fn chat_role(name: &str) -> ChatRole {
     }
 }
 
-fn reasoning_effort(name: &str) -> ReasoningEffort {
+fn reasoning_effort(name: &str) -> EffortValue {
     match name {
-        "low" => ReasoningEffort::Low,
-        "medium" => ReasoningEffort::Medium,
-        "xhigh" => ReasoningEffort::XHigh,
+        "low" | "medium" | "xhigh" => EffortValue::String(name.to_string()),
         other => panic!(
             "the golden asks for reasoning_effort {other:?}, which the renderer cannot \
              express; extend this match arm"
