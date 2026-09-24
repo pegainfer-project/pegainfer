@@ -5,10 +5,8 @@ Emits one `.cu` per kernel family under `--out-dir`, covering the batched
 decode kernel set:
 
     k3_rms_norm_rbs_batched.cu      k3_conv_silu_batched.cu
-    k3_land_batched.cu              k3_kda_core_batched.cu
-    k3_land_rms_norm_rbs_batched.cu k3_attnres_scores_batched.cu
-    k3_add2_batched.cu              k3_attnres_mix_batched.cu
-    k3_mul_sigmoid_batched.cu       k3_situ_batched.cu
+    k3_land_rms_norm_rbs_batched.cu k3_kda_core_batched.cu
+    k3_attnres_scores_batched.cu    k3_attnres_mix_batched.cu
 
 The batch size is a static compile-time dimension, so a single-stream step is
 served by the `B = 1` instantiation of the same family — its per-row spelling
@@ -106,7 +104,7 @@ ATTNRES_BLOCK_SIZE = 12     # attn_res_block_size             -> engine BS
 # the same artifact serves a single-GPU and a 4-way-EP deployment.
 EXPERTS = [896, 896 // 4]   # engine E, and engine Es under 4-way EP
 
-# Segment counts of the partials `land`/`conv_silu` merge. The engine's
+# Segment counts of the partials `conv_silu` (and the hand-written landing) merge. The engine's
 # producers are framework GEMMs (cuBLASLt, DeepGEMM), which emit a single
 # segment, so only SK=1 is instantiated; the reference engine's SK=8 GEMV
 # shapes have no launch site here and are not generated.
@@ -150,40 +148,16 @@ B_CHUNK_BUCKETS = B_BUCKETS + B_PREFILL_BUCKETS
 # the routed-latent norm (LAT).
 RMS_NORM_N = [HIDDEN, KV_LORA, LATENT]
 
-# land(NT, N, OFF, SK): merge one column span of a (SK, NT) partial and land
-# bf16 once. The engine's `lands` list, verbatim, plus the chunked-prefill
-# conv-input landing (the sequential engine never lands that projection alone —
-# its conv kernel casts in place; the chunk builds windows from the landed rows
-# before the conv runs, so it needs the standalone cast).
-LAND_CONFIGS = [
-    #  NT                N                   OFF               engine call site
-    (4 * KDA_DIM, KDA_DIM, 3 * KDA_DIM),              # KDA output gate
-    (KDA_DIM, KDA_DIM, 0),                            # chunked-prefill conv inputs
-    (WSM_N, KDA_HEADS, 0),                            # KDA beta
-    (WSM_N, KDA_HEAD_DIM, KDA_HEADS),                 # KDA low-rank gate input
-    (MLA_FUSED, KV_LORA + ROPE_DIM, Q_LORA),          # MLA kv_a|k_rope
-    (MLA_FUSED, KDA_DIM, Q_LORA + KV_LORA + ROPE_DIM),  # MLA output gate
-    (MLA_HEADS * QK_DIM, MLA_HEADS * QK_DIM, 0),      # MLA q_b
-    (MLA_HEADS * 256, MLA_HEADS * 256, 0),            # MLA kv_b
-    (HIDDEN, HIDDEN, 0),                              # o_proj / routed / shared
-    (LATENT, LATENT, 0),                              # routed latent
-    (2 * SHARED_INTER, SHARED_INTER, 0),              # shared gate
-    (2 * SHARED_INTER, SHARED_INTER, SHARED_INTER),   # shared up
-    (2 * DENSE_INTER, DENSE_INTER, 0),                # dense gate
-    (2 * DENSE_INTER, DENSE_INTER, DENSE_INTER),      # dense up
-    (VOCAB, VOCAB, 0),                                # logits
-]
+# land(NT, N, OFF, SK) is no longer generated: the matmul landing is the
+# hand-written `csrc/k3/k3_land.cu` (batch a runtime value).
 
 # land_rms_norm_rbs(NT, N, OFF, SK, eps): MLA's q_a, the one place a merge and
 # a round-before-scale norm are fused.
 LAND_RMS_NORM_CONFIGS = [(MLA_FUSED, Q_LORA, 0)]
 
-# add2 / mul_sigmoid / situ / conv_silu / kda_core take a single width each;
-# situ has two (shared, dense) — the routed-expert situ is fused into the
-# masked-GEMM chain and the mega kernel.
-ADD2_N = [HIDDEN]
-MUL_SIGMOID_N = [KDA_DIM]
-SITU_N = [SHARED_INTER, DENSE_INTER]
+# conv_silu / kda_core take a single width each. The bf16 elementwise family
+# (add2, mul_sigmoid, situ, o_norm_gate) is hand-written CUDA now
+# (`csrc/k3/k3_elementwise.cu`), shape-agnostic.
 
 
 # --------------------------------------------------------------------------- #
@@ -199,18 +173,9 @@ RMS_NORM_PARAMS = (
     f"(const {BF16}* __restrict__ G, {BF16}* __restrict__ O, "
     f"const {BF16}* __restrict__ X)"
 )
-LAND_PARAMS = f"({BF16}* __restrict__ O, const float* __restrict__ P)"
 LAND_RMS_NORM_PARAMS = (
     f"(const {BF16}* __restrict__ G, {BF16}* __restrict__ O, "
     "const float* __restrict__ P)"
-)
-BINARY_ABO_PARAMS = (
-    f"(const {BF16}* __restrict__ A, const {BF16}* __restrict__ Bt, "
-    f"{BF16}* __restrict__ O)"
-)
-SITU_PARAMS = (
-    f"(const {BF16}* __restrict__ G, {BF16}* __restrict__ O, "
-    f"const {BF16}* __restrict__ U)"
 )
 CONV_SILU_PARAMS = (
     f"(const {BF16}* __restrict__ Cs, const float* __restrict__ Cw, "
@@ -224,10 +189,6 @@ KDA_CORE_PARAMS = (
     f"const {BF16}* __restrict__ K, {BF16}* __restrict__ Out, "
     f"const {BF16}* __restrict__ Q, const float* __restrict__ State, "
     f"float* __restrict__ StateN, const {BF16}* __restrict__ V)"
-)
-O_NORM_GATE_PARAMS = (
-    f"(const {BF16}* __restrict__ G2, const float* __restrict__ Go, "
-    f"{BF16}* __restrict__ Out, const {BF16}* __restrict__ X)"
 )
 SCORES_PARAMS = (
     f"(const {BF16}* __restrict__ Bl, const {BF16}* __restrict__ Ps, "
@@ -570,52 +531,6 @@ def plan_rms_norm_rbs() -> Plan:
     )
 
 
-def plan_land() -> Plan:
-    insts = []
-    for nt, n, off in LAND_CONFIGS:
-        for split_k in SPLIT_K:
-            for batch in B_CHUNK_BUCKETS:
-                npad = ceildiv(n, THREADS) * THREADS
-                insts.append(Inst(
-                    family="land",
-                    order=len(insts),
-                    label=f"land_batched NT={nt} N={n} OFF={off} SK={split_k} B={batch}",
-                    factory="land_batched",
-                    args=(nt, n, off, split_k, batch, THREADS),
-                    num_params=2,
-                    params=LAND_PARAMS,
-                    symbol=f"k3_land_b{batch}_nt{nt}_n{n}_off{off}_sk{split_k}_kernel",
-                    grid=(batch, npad // THREADS),
-                    threads=THREADS,
-                    guard=(
-                        f"b == {batch} && nt == {nt} && n == {n} && "
-                        f"off == {off} && split_k == {split_k}"
-                    ),
-                    call_args=(_bf16("O", False), "P"),
-                ))
-    return Plan(
-        stem=_STEM.format("land"),
-        signature=(
-            "k3_land_batched(\n"
-            "    const float* P,\n"
-            "    void* O,\n"
-            "    int b,\n"
-            "    int nt,\n"
-            "    int n,\n"
-            "    int off,\n"
-            "    int split_k,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=(
-            "// Merge the column span [off, off+n) of each row's (split_k, nt) f32\n"
-            "// partial and land bf16 once -- the landing of every matmul. split_k = 1\n"
-            "// is the single-partial case a framework GEMM produces, where the merge\n"
-            "// degenerates to the slice and the cast."
-        ),
-        insts=tuple(insts),
-    )
-
-
 def plan_land_rms_norm_rbs() -> Plan:
     insts = []
     for nt, n, off in LAND_RMS_NORM_CONFIGS:
@@ -659,97 +574,8 @@ def plan_land_rms_norm_rbs() -> Plan:
             "    cudaStream_t stream)"
         ),
         doc=(
-            "// k3_land_batched fused with the round-before-scale norm: MLA's q_a,\n"
+            "// The matmul landing fused with the round-before-scale norm: MLA's q_a,\n"
             "// the one place the engine fuses a merge and a norm."
-        ),
-        insts=tuple(insts),
-    )
-
-
-def _plan_binary(family: str, widths: list[int], doc: str) -> Plan:
-    insts = []
-    for width in widths:
-        for batch in B_CHUNK_BUCKETS:
-            insts.append(Inst(
-                family=family,
-                order=len(insts),
-                label=f"{family}_batched N={width} B={batch}",
-                factory=f"{family}_batched",
-                args=(width, batch, THREADS),
-                num_params=3,
-                params=BINARY_ABO_PARAMS,
-                symbol=f"k3_{family}_b{batch}_n{width}_kernel",
-                grid=(batch, width // THREADS),
-                threads=THREADS,
-                guard=f"b == {batch} && n == {width}",
-                call_args=(_bf16("A"), _bf16("Bt"), _bf16("O", False)),
-            ))
-    return Plan(
-        stem=_STEM.format(family),
-        signature=(
-            f"k3_{family}_batched(\n"
-            "    const void* A,\n"
-            "    const void* Bt,\n"
-            "    void* O,\n"
-            "    int b,\n"
-            "    int n,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=doc,
-        insts=tuple(insts),
-    )
-
-
-def plan_add2() -> Plan:
-    return _plan_binary(
-        "add2",
-        ADD2_N,
-        "// O = A + B in bf16 addition (the residual adds, and routed + shared).\n"
-        "// One block per (row, column segment).",
-    )
-
-
-def plan_mul_sigmoid() -> Plan:
-    return _plan_binary(
-        "mul_sigmoid",
-        MUL_SIGMOID_N,
-        "// O = A * bf16(sigmoid(B)), the MLA sigmoid output gate. The sigmoid is\n"
-        "// taken in f32 and lands in bf16 before the product.",
-    )
-
-
-def plan_situ() -> Plan:
-    insts = []
-    for width in SITU_N:
-        for batch in B_CHUNK_BUCKETS:
-            insts.append(Inst(
-                family="situ",
-                order=len(insts),
-                label=f"situ_batched N={width} B={batch}",
-                factory="situ_batched",
-                args=(width, batch, THREADS),
-                num_params=3,
-                params=SITU_PARAMS,
-                symbol=f"k3_situ_b{batch}_n{width}_kernel",
-                grid=(batch, width // THREADS),
-                threads=THREADS,
-                guard=f"b == {batch} && n == {width}",
-                call_args=(_bf16("G"), _bf16("O", False), _bf16("U")),
-            ))
-    return Plan(
-        stem=_STEM.format("situ"),
-        signature=(
-            "k3_situ_batched(\n"
-            "    const void* G,\n"
-            "    const void* U,\n"
-            "    void* O,\n"
-            "    int b,\n"
-            "    int n,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=(
-            "// 4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25), computed in f32 and landed in\n"
-            "// bf16 once; the two betas are compiled in."
         ),
         insts=tuple(insts),
     )
@@ -872,51 +698,6 @@ def plan_kda_core() -> Plan:
     )
 
 
-def plan_o_norm_gate() -> Plan:
-    insts = []
-    for batch in B_CHUNK_BUCKETS:
-        insts.append(Inst(
-            family="o_norm_gate",
-            order=len(insts),
-            label=f"o_norm_gate_batched KH={KDA_HEADS} KD={KDA_HEAD_DIM} B={batch}",
-            factory="o_norm_gate_batched",
-            args=(KDA_HEADS, KDA_HEAD_DIM, batch, RMS_EPS),
-            num_params=4,
-            params=O_NORM_GATE_PARAMS,
-            symbol=f"k3_o_norm_gate_b{batch}_kh{KDA_HEADS}_kd{KDA_HEAD_DIM}_kernel",
-            grid=(batch, KDA_HEADS),
-            threads=KDA_HEAD_DIM,
-            guard=(
-                f"b == {batch} && num_heads == {KDA_HEADS} && "
-                f"head_dim == {KDA_HEAD_DIM}"
-            ),
-            call_args=(
-                _bf16("G2"), "Go", _bf16("Out", False), _bf16("X"),
-            ),
-        ))
-    return Plan(
-        stem=_STEM.format("o_norm_gate"),
-        signature=(
-            "k3_o_norm_gate_batched(\n"
-            "    const void* X,\n"
-            "    const void* G2,\n"
-            "    const float* Go,\n"
-            "    void* Out,\n"
-            "    int b,\n"
-            "    int num_heads,\n"
-            "    int head_dim,\n"
-            "    cudaStream_t stream)"
-        ),
-        doc=(
-            "// kda_core's tail on its own: per (row, head) the f32 rms_norm of the\n"
-            "// bf16 attention landing times the o_norm gamma, landed once, times the\n"
-            "// bf16 sigmoid of the output gate. Chunked prefill computes attention\n"
-            "// through FlashKDA and finishes rows here; eps is compiled in."
-        ),
-        insts=tuple(insts),
-    )
-
-
 def plan_attnres_scores() -> Plan:
     insts = []
     for blocks in ATTNRES_NB:
@@ -1000,14 +781,9 @@ def plan_attnres_mix() -> Plan:
 
 PLANNERS = [
     plan_rms_norm_rbs,
-    plan_land,
     plan_land_rms_norm_rbs,
-    plan_add2,
-    plan_mul_sigmoid,
-    plan_situ,
     plan_conv_silu,
     plan_kda_core,
-    plan_o_norm_gate,
     plan_attnres_scores,
     plan_attnres_mix,
 ]
