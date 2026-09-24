@@ -111,18 +111,11 @@ def infer_revision(path: Path) -> str:
     return "unknown"
 
 
-def load_model(model_path: str, dtype: str, device_map: str, max_memory_gib: int | None):
+def load_model(model_path: str, dtype: str, device_map: str):
     kwargs = {"trust_remote_code": True, "torch_dtype": DTYPES[dtype]}
     if device_map == "none":
         model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs).to("cuda")
     else:
-        if max_memory_gib is not None:
-            # A shared tray already has other tenants on it, and accelerate
-            # plans against each device's *total* memory, so without a cap the
-            # placement overcommits and dies partway through loading.
-            kwargs["max_memory"] = {
-                i: f"{max_memory_gib}GiB" for i in range(torch.cuda.device_count())
-            }
         model = AutoModelForCausalLM.from_pretrained(
             model_path, device_map=device_map, **kwargs
         )
@@ -166,13 +159,6 @@ def main() -> int:
         "--device-map",
         default="auto",
         help="'none' for single-GPU, 'auto' to shard larger models",
-    )
-    parser.add_argument(
-        "--max-memory-gib",
-        type=int,
-        default=None,
-        help="cap accelerate's placement per visible GPU (GiB); needed on a shared "
-        "tray where other tenants already hold most of each card's memory",
     )
     parser.add_argument("--model-revision", default=None)
     parser.add_argument("--tokenizer-revision", default=None)
@@ -237,7 +223,7 @@ def main() -> int:
             ).tolist()
         )
 
-    model = load_model(args.model_path, args.dtype, args.device_map, args.max_memory_gib)
+    model = load_model(args.model_path, args.dtype, args.device_map)
     if args.vocab_ceiling > model.config.vocab_size:
         parser.error(
             f"--vocab-ceiling ({args.vocab_ceiling}) cannot exceed "
