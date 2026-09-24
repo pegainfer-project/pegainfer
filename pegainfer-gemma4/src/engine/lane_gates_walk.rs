@@ -3,17 +3,14 @@ use std::time::Duration;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::RequestControl;
 
-use super::lane_test_env::scoped_engine_env;
 use super::lane_tests::Harness;
 use super::lane_tests::launch;
+use super::lane_tests::load_state;
 use super::lane_tests::pin_live_stream;
 use super::lane_tests::wait_until;
 
 fn load_chunk_state(chunk: &str) -> super::EngineState {
-    let dir = crate::testkit::model_path();
-    let policy = super::generation_policy(&dir).expect("policy");
-    let _env = scoped_engine_env(&[(super::MIX_CHUNK_TOKENS_ENV, chunk)]);
-    super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state")
+    load_state(&[(super::MIX_CHUNK_TOKENS_ENV, chunk)]).expect("engine state")
 }
 
 #[test]
@@ -189,15 +186,12 @@ fn the_gathered_walk_does_not_depend_on_its_batching() {
 #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
 fn the_served_bounds_provision_a_split_walk() {
     let dir = crate::testkit::model_path();
-    let state = {
-        let _env = scoped_engine_env(&[
-            (super::MIX_CHUNK_TOKENS_ENV, "6144"),
-            (super::MIX_MAX_PROMPTS_ENV, "8"),
-            (super::MIX_GATHER_ROWS_ENV, "8192"),
-        ]);
-        let policy = super::generation_policy(&dir).expect("policy");
-        super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state")
-    };
+    let state = load_state(&[
+        (super::MIX_CHUNK_TOKENS_ENV, "6144"),
+        (super::MIX_MAX_PROMPTS_ENV, "8"),
+        (super::MIX_GATHER_ROWS_ENV, "8192"),
+    ])
+    .expect("engine state");
     assert_eq!(state.mix_chunk, Some(6144));
     assert_eq!(state.mix_max_prompts, 8);
     assert_eq!(state.mix_gather, 8192);

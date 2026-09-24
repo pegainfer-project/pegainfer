@@ -14,7 +14,6 @@ use pegainfer_frontend::engine::spawn_scheduler;
 
 pub(super) use super::lane_step_collector::Drained;
 use super::lane_step_collector::StepCollector;
-use super::lane_test_env::scoped_engine_env;
 
 pub(super) struct Harness {
     scheduler: Option<LiveScheduler>,
@@ -106,12 +105,35 @@ impl Harness {
     }
 }
 
+/// The serving knobs a test names, and nothing from the process environment.
+pub(super) fn knob_table<'a>(
+    overrides: &'a [(&'a str, &'a str)],
+) -> impl Fn(&str) -> anyhow::Result<Option<String>> + 'a {
+    move |name: &str| {
+        Ok(overrides
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_string()))
+    }
+}
+
 pub(super) fn launch(overrides: &[(&str, &str)]) -> Harness {
     let dir = crate::testkit::model_path();
-    let _env = scoped_engine_env(overrides);
-    let engine =
-        super::start(Path::new(&dir), &EngineLoadOptions::default()).expect("engine start");
+    let engine = super::start_with_knobs(
+        Path::new(&dir),
+        &EngineLoadOptions::default(),
+        &knob_table(overrides),
+    )
+    .expect("engine start");
     Harness::from_engine(engine)
+}
+
+pub(super) fn load_state(overrides: &[(&str, &str)]) -> anyhow::Result<super::EngineState> {
+    let dir = crate::testkit::model_path();
+    let config = crate::config::Gemma4Config::from_file(&dir)?;
+    let knobs = super::ServingKnobs::resolve(&knob_table(overrides), &config)?;
+    let policy = super::generation_policy(&dir)?;
+    super::EngineState::load(&dir, config, knobs, 0, policy, 0x5EED, true)
 }
 
 pub(super) fn ids(len: usize, salt: u32) -> Vec<u32> {

@@ -1,9 +1,9 @@
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::Terminal;
 
-use super::lane_test_env::scoped_engine_env;
 use super::lane_tests::assert_warm_result;
 use super::lane_tests::ids;
+use super::lane_tests::knob_table;
 use super::lane_tests::launch;
 use super::lane_tests::pin_live_stream;
 use super::lane_tests::warm_prompt;
@@ -24,17 +24,14 @@ fn the_raise_reaches_the_frontend() {
 }
 
 #[test]
-#[ignore = "requires the pinned 12B checkpoint and --test-threads=1"]
+#[ignore = "requires the pinned 12B checkpoint's config"]
 fn the_raise_refuses_without_its_prerequisites() {
     let dir = crate::testkit::model_path();
-    let load = |overrides: &[(&str, &str)]| {
-        let policy = super::generation_policy(&dir).expect("policy");
-        let _env = scoped_engine_env(overrides);
-        super::EngineState::load(&dir, 0, policy, 0x5EED, true)
-    };
+    let config = crate::config::Gemma4Config::from_file(&dir).expect("config");
+    let load =
+        |overrides: &[(&str, &str)]| super::ServingKnobs::resolve(&knob_table(overrides), &config);
     let error = load(&[(super::MAX_CONTEXT_ENV, "32768")])
-        .err()
-        .expect("a raise without chunking must refuse");
+        .expect_err("a raise without chunking must refuse");
     assert!(
         format!("{error:#}").contains("needs PEGAINFER_MIX_CHUNK_TOKENS"),
         "unexpected refusal: {error:#}"
@@ -44,15 +41,13 @@ fn the_raise_refuses_without_its_prerequisites() {
         (super::MIX_CHUNK_TOKENS_ENV, "2048"),
         (super::ASYNC_PREFILL_ENV, "green:35"),
     ])
-    .err()
-    .expect("the lane over the default ceiling must refuse");
+    .expect_err("the lane over the default ceiling must refuse");
     assert!(format!("{error:#}").contains("unsupported over"));
     let error = load(&[
         (super::ADMIT_COALESCE_ENV, "300"),
         (super::ASYNC_PREFILL_ENV, "green:35"),
     ])
-    .err()
-    .expect("the coalesce door and async lane must refuse");
+    .expect_err("the coalesce door and async lane must refuse");
     assert!(format!("{error:#}").contains("the door could only delay it"));
 }
 

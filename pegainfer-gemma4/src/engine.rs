@@ -42,7 +42,7 @@ use crate::serve::GlobalAttn;
 use crate::serve::StepArena;
 use crate::weights::Gemma4Weights;
 
-/// The default serving ceiling; `serving_context` tells the raising story.
+/// The default serving ceiling.
 const MAX_CONTEXT: usize = 8192;
 
 /// Decode-batch ceiling: bounds the step buffers, the sampling scratch and
@@ -71,7 +71,7 @@ enum LaneMode {
     Green(u32),
 }
 
-fn read_env(name: &str) -> Result<Option<String>> {
+pub(crate) fn read_env(name: &str) -> Result<Option<String>> {
     normalize_env(name, std::env::var(name))
 }
 
@@ -84,10 +84,6 @@ fn normalize_env(
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} is not valid UTF-8"),
     }
-}
-
-fn async_prefill_mode() -> Result<Option<LaneMode>> {
-    read_env(ASYNC_PREFILL_ENV)?.map_or(Ok(None), |raw| parse_async_prefill_mode(&raw))
 }
 
 fn parse_async_prefill_mode(raw: &str) -> Result<Option<LaneMode>> {
@@ -107,14 +103,6 @@ fn parse_async_prefill_mode(raw: &str) -> Result<Option<LaneMode>> {
     }
 }
 
-/// The serving ceiling — prompt plus output per request, the pool budget
-/// axis, and the published servable length.
-fn serving_context(checkpoint_limit: usize) -> Result<usize> {
-    read_env(MAX_CONTEXT_ENV)?.map_or(Ok(MAX_CONTEXT.min(checkpoint_limit)), |raw| {
-        parse_serving_context(&raw, checkpoint_limit)
-    })
-}
-
 fn parse_serving_context(raw: &str, checkpoint_limit: usize) -> Result<usize> {
     let limit = checkpoint_limit.min(CEILING_DOMAIN);
     match raw.trim().parse::<usize>() {
@@ -126,11 +114,6 @@ fn parse_serving_context(raw: &str, checkpoint_limit: usize) -> Result<usize> {
     }
 }
 
-/// The decode-slot count the pools are budgeted for.
-fn decode_slots() -> Result<usize> {
-    read_env(DECODE_SLOTS_ENV)?.map_or(Ok(MAX_CONCURRENCY), |raw| parse_decode_slots(&raw))
-}
-
 fn parse_decode_slots(raw: &str) -> Result<usize> {
     match raw.trim().parse::<usize>() {
         Ok(value) if (1..=MAX_CONCURRENCY).contains(&value) => Ok(value),
@@ -138,13 +121,6 @@ fn parse_decode_slots(raw: &str) -> Result<usize> {
             "{DECODE_SLOTS_ENV}={raw:?} not recognized (N, 1 <= N <= {MAX_CONCURRENCY})"
         ),
     }
-}
-
-/// Bounds the prompt rows computed by one chunked-walk step. The effective
-/// step rounds down to whole 128-row tiles.
-fn mix_chunk_tokens(max_context: usize) -> Result<Option<usize>> {
-    read_env(MIX_CHUNK_TOKENS_ENV)?
-        .map_or(Ok(None), |raw| parse_mix_chunk_tokens(&raw, max_context))
 }
 
 /// GEMM and attention tiles consume whole 128-row blocks, so a width that is
@@ -167,13 +143,6 @@ fn parse_mix_chunk_tokens(raw: &str, max_context: usize) -> Result<Option<usize>
             ),
         },
     }
-}
-
-/// The knob's value, or the incumbent when it is unset. The generated states
-/// need a build that had TileLang or a pre-generated directory; what each
-/// one serves and over which pool is [`GlobalAttn`]'s.
-fn global_attn() -> Result<GlobalAttn> {
-    read_env(GLOBAL_ATTN_ENV)?.map_or(Ok(GlobalAttn::Incumbent), |raw| parse_global_attn(&raw))
 }
 
 /// Refuse a checkpoint the generated bodies have no kernel for: the launcher
@@ -269,10 +238,6 @@ fn parse_global_attn(raw: &str) -> Result<GlobalAttn> {
     }
 }
 
-pub(crate) fn prefix_cache_cap() -> Result<Option<usize>> {
-    read_env(PREFIX_CACHE_ENV)?.map_or(Ok(None), |raw| parse_prefix_cache_cap(&raw))
-}
-
 fn parse_prefix_cache_cap(raw: &str) -> Result<Option<usize>> {
     let value = raw.trim().to_ascii_lowercase();
     match value.as_str() {
@@ -284,31 +249,19 @@ fn parse_prefix_cache_cap(raw: &str) -> Result<Option<usize>> {
     }
 }
 
-pub(crate) fn kv_fp8_storage() -> Result<KvStorage> {
-    let storage = match std::env::var(KV_FP8_ENV) {
-        Err(std::env::VarError::NotPresent) => parse_kv_fp8(None),
-        Ok(raw) => parse_kv_fp8(Some(&raw)),
-        Err(err) => anyhow::bail!("PEGAINFER_KV_FP8 is not unicode: {err}"),
-    }?;
-    if storage == KvStorage::E4m3 {
-        anyhow::ensure!(
-            prefix_cache_cap()?.is_none(),
-            "PEGAINFER_KV_FP8 and PEGAINFER_PREFIX_CACHE cannot combine: the prefix cache \
-             copies pool pages in bf16 element units"
-        );
-    }
-    Ok(storage)
+pub(crate) fn local_kv_storage(
+    lookup: &dyn Fn(&str) -> Result<Option<String>>,
+) -> Result<KvStorage> {
+    lookup(KV_FP8_ENV)?.map_or(Ok(KvStorage::Bf16), |raw| parse_kv_fp8(&raw))
 }
 
-fn parse_kv_fp8(raw: Option<&str>) -> Result<KvStorage> {
-    match raw {
-        None => Ok(KvStorage::Bf16),
-        Some("local") => Ok(KvStorage::E4m3),
-        Some(value) => anyhow::bail!("PEGAINFER_KV_FP8 supports only \"local\", got {value:?}"),
+fn parse_kv_fp8(raw: &str) -> Result<KvStorage> {
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "off" => Ok(KvStorage::Bf16),
+        "local" => Ok(KvStorage::E4m3),
+        _ => anyhow::bail!("{KV_FP8_ENV}={raw:?} not recognized (off | local)"),
     }
-}
-fn admit_coalesce_ms() -> Result<Option<std::time::Duration>> {
-    read_env(ADMIT_COALESCE_ENV)?.map_or(Ok(None), |raw| parse_admit_coalesce_ms(&raw))
 }
 
 fn parse_admit_coalesce_ms(raw: &str) -> Result<Option<std::time::Duration>> {
@@ -327,18 +280,21 @@ fn parse_admit_coalesce_ms(raw: &str) -> Result<Option<std::time::Duration>> {
 /// Holds arrivals that would invade a live decode batch so one window's
 /// arrivals land as a back-to-back burst of admissions: the stream's tail
 /// gap prices the number of interruptions. One mixed step merges extra
-/// prompts only with chunking or while the gathered rows stay under
-/// `MIX_GATHER_ROWS`. The cohort bounds free-slot capacity, not a batch
-/// across completions; idle engines admit on sight and shallow batches skip.
+/// prompts only with chunking or while the gathered rows stay under the
+/// gather bound. The cohort is the prompt bound capped by free slots, not a
+/// batch across completions; idle engines admit on sight and shallow batches
+/// skip.
 struct CoalesceDoor {
     window: std::time::Duration,
+    max_prompts: usize,
     since: Option<std::time::Instant>,
 }
 
 impl CoalesceDoor {
-    fn new(window: std::time::Duration) -> Self {
+    fn new(window: std::time::Duration, max_prompts: usize) -> Self {
         Self {
             window,
+            max_prompts,
             since: None,
         }
     }
@@ -354,7 +310,7 @@ impl CoalesceDoor {
             self.since = None;
             return true;
         }
-        let cohort = MIX_MAX_PROMPTS.min(slots.saturating_sub(active)).max(1);
+        let cohort = self.max_prompts.min(slots.saturating_sub(active)).max(1);
         let since = *self.since.get_or_insert(now);
         let open = pending >= cohort || now.duration_since(since) >= self.window;
         if open {
@@ -365,6 +321,14 @@ impl CoalesceDoor {
 }
 
 pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<Engine> {
+    start_with_knobs(model_path, options, &read_env)
+}
+
+fn start_with_knobs(
+    model_path: &Path,
+    options: &EngineLoadOptions,
+    lookup: &dyn Fn(&str) -> Result<Option<String>>,
+) -> Result<Engine> {
     let dir = model_path
         .to_str()
         .context("model path is not valid UTF-8")?
@@ -382,9 +346,19 @@ pub(crate) fn start(model_path: &Path, options: &EngineLoadOptions) -> Result<En
     let base_seed = options.seed;
     let graph_enabled = options.enable_cuda_graph;
 
+    let config = crate::config::Gemma4Config::from_file(&dir)?;
+    let knobs = ServingKnobs::resolve(lookup, &config)?;
     let policy = generation_policy(&dir)?;
 
-    let state = EngineState::load(&dir, device, policy, base_seed, graph_enabled)?;
+    let state = EngineState::load(
+        &dir,
+        config,
+        knobs,
+        device,
+        policy,
+        base_seed,
+        graph_enabled,
+    )?;
     let servable = state.max_context;
     // Publishing the real ceiling is what lets the frontend refuse an
     // over-length request with its own message instead of forwarding one the
@@ -643,12 +617,6 @@ const MIX_MAX_PROMPTS: usize = 4;
 /// records, not here.
 const MIX_GATHER_ROWS: usize = 512;
 
-fn mix_max_prompts(slots: usize) -> Result<usize> {
-    read_env(MIX_MAX_PROMPTS_ENV)?.map_or(Ok(MIX_MAX_PROMPTS), |raw| {
-        parse_mix_max_prompts(&raw, slots)
-    })
-}
-
 fn parse_mix_max_prompts(raw: &str, slots: usize) -> Result<usize> {
     let prompts: usize = raw
         .trim()
@@ -659,12 +627,6 @@ fn parse_mix_max_prompts(raw: &str, slots: usize) -> Result<usize> {
         "{MIX_MAX_PROMPTS_ENV} must be in 1..={slots}"
     );
     Ok(prompts)
-}
-
-fn mix_gather_rows(max_context: usize) -> Result<usize> {
-    read_env(MIX_GATHER_ROWS_ENV)?.map_or(Ok(MIX_GATHER_ROWS), |raw| {
-        parse_mix_gather_rows(&raw, max_context)
-    })
 }
 
 /// A step's rows live in metadata the ceiling sizes, so a budget past it
@@ -680,6 +642,105 @@ fn parse_mix_gather_rows(raw: &str, max_context: usize) -> Result<usize> {
         "{MIX_GATHER_ROWS_ENV} must be in 1..={max_context}, the serving ceiling"
     );
     Ok(rows)
+}
+
+/// Every serving knob, read through one lookup and held against the others
+/// before the weights load.
+#[derive(Clone, Copy, Debug)]
+struct ServingKnobs {
+    /// The serving ceiling: prompt plus output per request, the pool budget
+    /// axis, and the published servable length.
+    max_context: usize,
+    lane_mode: Option<LaneMode>,
+    /// The chunked-walk segment span. The effective step rounds down to whole
+    /// 128-row tiles.
+    mix_chunk: Option<usize>,
+    mix_gather: usize,
+    mix_max_prompts: usize,
+    admit_coalesce: Option<std::time::Duration>,
+    slots: usize,
+    local_kv_storage: KvStorage,
+    global_attn: GlobalAttn,
+    prefix_cache: Option<usize>,
+}
+
+impl ServingKnobs {
+    fn resolve(
+        lookup: &dyn Fn(&str) -> Result<Option<String>>,
+        config: &crate::config::Gemma4Config,
+    ) -> Result<Self> {
+        let checkpoint_limit = config.max_position_embeddings;
+        let max_context = lookup(MAX_CONTEXT_ENV)?
+            .map_or(Ok(MAX_CONTEXT.min(checkpoint_limit)), |raw| {
+                parse_serving_context(&raw, checkpoint_limit)
+            })?;
+        let lane_mode =
+            lookup(ASYNC_PREFILL_ENV)?.map_or(Ok(None), |raw| parse_async_prefill_mode(&raw))?;
+        let mix_chunk = lookup(MIX_CHUNK_TOKENS_ENV)?
+            .map_or(Ok(None), |raw| parse_mix_chunk_tokens(&raw, max_context))?;
+        let mix_gather = lookup(MIX_GATHER_ROWS_ENV)?.map_or(Ok(MIX_GATHER_ROWS), |raw| {
+            parse_mix_gather_rows(&raw, max_context)
+        })?;
+        let admit_coalesce =
+            lookup(ADMIT_COALESCE_ENV)?.map_or(Ok(None), |raw| parse_admit_coalesce_ms(&raw))?;
+        let slots = lookup(DECODE_SLOTS_ENV)?
+            .map_or(Ok(MAX_CONCURRENCY), |raw| parse_decode_slots(&raw))?;
+        let mix_max_prompts = lookup(MIX_MAX_PROMPTS_ENV)?.map_or(Ok(MIX_MAX_PROMPTS), |raw| {
+            parse_mix_max_prompts(&raw, slots)
+        })?;
+        let local_kv_storage = local_kv_storage(lookup)?;
+        let global_attn = lookup(GLOBAL_ATTN_ENV)?
+            .map_or(Ok(GlobalAttn::Incumbent), |raw| parse_global_attn(&raw))?;
+        let prefix_cache =
+            lookup(PREFIX_CACHE_ENV)?.map_or(Ok(None), |raw| parse_prefix_cache_cap(&raw))?;
+
+        // The stub tier links under the same name and refuses at launch, so
+        // without this the answer would arrive after the weights are loaded
+        // and on the first prompt rather than here.
+        anyhow::ensure!(
+            !global_attn.tilelang() || pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
+            "{GLOBAL_ATTN_ENV} asks for the generated kernel, which needs a build that \
+             carries it; this one fell back to the stub tier, so pegainfer-kernels was \
+             compiled without TileLang and without a pre-generated directory"
+        );
+        if global_attn.tilelang() {
+            tilelang_geometry_refusal(config)?;
+        }
+        anyhow::ensure!(
+            admit_coalesce.is_none() || lane_mode.is_none(),
+            "{ADMIT_COALESCE_ENV} and {ASYNC_PREFILL_ENV} cannot combine: the lane flies one \
+             prefill at a time, so the door could only delay it"
+        );
+        if max_context > MAX_CONTEXT {
+            anyhow::ensure!(
+                mix_chunk.is_some(),
+                "PEGAINFER_MAX_CONTEXT={max_context} needs PEGAINFER_MIX_CHUNK_TOKENS: a whole \
+                 scan would hold the full context in sliding pages"
+            );
+            anyhow::ensure!(
+                lane_mode.is_none(),
+                "the overlap lane prefills whole; PEGAINFER_ASYNC_PREFILL is unsupported over \
+                 the default {MAX_CONTEXT} ceiling"
+            );
+        }
+        anyhow::ensure!(
+            local_kv_storage != KvStorage::E4m3 || prefix_cache.is_none(),
+            "{KV_FP8_ENV} and {PREFIX_CACHE_ENV} cannot combine: the prefix cache copies pool \
+             pages in bf16 element units"
+        );
+        Ok(Self {
+            max_context,
+            lane_mode,
+            mix_chunk,
+            mix_gather,
+            mix_max_prompts,
+            admit_coalesce,
+            slots,
+            local_kv_storage,
+            global_attn,
+            prefix_cache,
+        })
+    }
 }
 
 /// One prompt mid-walk: its unseen suffix begins at `offset`, and `first`
@@ -1051,7 +1112,8 @@ impl Gemma4Scheduler {
 
 impl EngineState {
     fn coalesce_door(&self) -> Option<CoalesceDoor> {
-        self.admit_coalesce.map(CoalesceDoor::new)
+        self.admit_coalesce
+            .map(|window| CoalesceDoor::new(window, self.mix_max_prompts))
     }
 
     fn intake_turn(
@@ -1186,53 +1248,30 @@ impl EngineState {
 
     fn load(
         dir: &str,
+        config: crate::config::Gemma4Config,
+        knobs: ServingKnobs,
         device: usize,
         policy: GenerationPolicy,
         base_seed: u64,
         graph_enabled: bool,
     ) -> Result<Self> {
-        // Refuse an unservable global GQA shape, a bad lane mode or a bad
-        // ceiling before the multi-GiB load.
-        let config = crate::config::Gemma4Config::from_file(dir)?;
+        // Refuse an unservable global GQA shape or device before the
+        // multi-GiB load.
         let global_split = crate::serve::global_split_factor(&config)?;
-        let max_context = serving_context(config.max_position_embeddings)?;
-        let lane_mode = async_prefill_mode()?;
-        let mix_chunk = mix_chunk_tokens(max_context)?;
-        let mix_gather = mix_gather_rows(max_context)?;
-        let admit_coalesce = admit_coalesce_ms()?;
-        let slots = decode_slots()?;
-        let mix_max_prompts = mix_max_prompts(slots)?;
-        let local_kv_storage = kv_fp8_storage()?;
-        let global_attn = global_attn()?;
-        // The stub tier links under the same name and refuses at launch, so
-        // without this the answer would arrive after the weights are loaded
-        // and on the first prompt rather than here.
-        anyhow::ensure!(
-            !global_attn.tilelang() || pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
-            "{GLOBAL_ATTN_ENV} asks for the generated kernel, which needs a build that \
-             carries it; this one fell back to the stub tier, so pegainfer-kernels was \
-             compiled without TileLang and without a pre-generated directory"
-        );
+        let ServingKnobs {
+            max_context,
+            lane_mode,
+            mix_chunk,
+            mix_gather,
+            mix_max_prompts,
+            admit_coalesce,
+            slots,
+            local_kv_storage,
+            global_attn,
+            prefix_cache: cache_cap,
+        } = knobs;
         if global_attn.tilelang() {
-            tilelang_geometry_refusal(&config)?;
             ensure_tilelang_device(device)?;
-        }
-        anyhow::ensure!(
-            admit_coalesce.is_none() || lane_mode.is_none(),
-            "{ADMIT_COALESCE_ENV} and {ASYNC_PREFILL_ENV} cannot combine: the lane flies one \
-             prefill at a time, so the door could only delay it"
-        );
-        if max_context > MAX_CONTEXT {
-            anyhow::ensure!(
-                mix_chunk.is_some(),
-                "PEGAINFER_MAX_CONTEXT={max_context} needs PEGAINFER_MIX_CHUNK_TOKENS: a whole \
-                 scan would hold the full context in sliding pages"
-            );
-            anyhow::ensure!(
-                lane_mode.is_none(),
-                "the overlap lane prefills whole; PEGAINFER_ASYNC_PREFILL is unsupported over \
-                 the default {MAX_CONTEXT} ceiling"
-            );
         }
         let weights = Gemma4Weights::from_safetensors(dir, device, config)?;
         let ctx = DeviceContext::new_with_device(device)?;
@@ -1255,7 +1294,6 @@ impl EngineState {
         let window_pages = weights.config.sliding_window.div_ceil(LOCAL_PAGE_SIZE) + 1;
         // The cache brings its own page budget so cached entries never eat
         // serving headroom.
-        let cache_cap = prefix_cache_cap()?;
         let cache_entries = cache_cap.unwrap_or(0);
         let sliding_window = weights.config.sliding_window;
         // With the chunk knob set every scan is bounded by window plus
@@ -2672,9 +2710,11 @@ mod knob_tests {
 
     #[test]
     fn fp8_knob_parses_or_refuses() {
-        assert_eq!(parse_kv_fp8(None).unwrap(), KvStorage::Bf16);
-        assert_eq!(parse_kv_fp8(Some("local")).unwrap(), KvStorage::E4m3);
-        assert!(parse_kv_fp8(Some("global")).is_err());
+        for off in ["off", "", "0"] {
+            assert_eq!(parse_kv_fp8(off).unwrap(), KvStorage::Bf16);
+        }
+        assert_eq!(parse_kv_fp8(" LOCAL ").unwrap(), KvStorage::E4m3);
+        assert!(parse_kv_fp8("global").is_err());
     }
 
     #[test]
@@ -2729,7 +2769,7 @@ mod knob_tests {
     }
 
     fn test_door() -> CoalesceDoor {
-        CoalesceDoor::new(std::time::Duration::from_millis(100))
+        CoalesceDoor::new(std::time::Duration::from_millis(100), MIX_MAX_PROMPTS)
     }
 
     #[test]
@@ -2804,6 +2844,14 @@ mod knob_tests {
     }
 
     #[test]
+    fn coalesce_door_cohort_follows_the_prompt_bound() {
+        let now = std::time::Instant::now();
+        let mut door = CoalesceDoor::new(std::time::Duration::from_millis(100), 8);
+        assert!(!door.opens(4, 8, 16, now));
+        assert!(door.opens(8, 8, 16, now));
+    }
+
+    #[test]
     fn gather_bounds_parse_or_refuse() {
         assert_eq!(parse_mix_gather_rows("8192", 8192).unwrap(), 8192);
         assert_eq!(parse_mix_gather_rows(" 512 ", 8192).unwrap(), 512);
@@ -2870,10 +2918,6 @@ mod gate {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "engine/lane_test_env.rs"]
-mod lane_test_env;
 
 #[cfg(test)]
 #[path = "engine/lane_step_collector.rs"]

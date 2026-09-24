@@ -21,7 +21,7 @@ fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, S
     stack_with_storage(
         max_context,
         pages,
-        crate::engine::kv_fp8_storage().expect("PEGAINFER_KV_FP8"),
+        crate::engine::local_kv_storage(&crate::engine::read_env).expect("PEGAINFER_KV_FP8"),
     )
 }
 
