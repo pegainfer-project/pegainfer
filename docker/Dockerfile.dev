@@ -25,6 +25,7 @@ RUN apt-get update \
         cmake \
         curl \
         git \
+        graphviz \
         libclang-dev \
         libibverbs-dev \
         libnccl-dev \
