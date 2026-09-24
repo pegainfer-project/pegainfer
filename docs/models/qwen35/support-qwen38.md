@@ -71,14 +71,12 @@ The fix: `tensor_f32_cow` (`pegainfer-core/src/weight_loader.rs`) accepts 1D
 bf16 and widens it — bf16 → f32 is exact, and HF itself upcasts at the point
 of use (`g = -self.A_log.float().exp() * …`), so both storages reach the
 kernels as the same values. Other dtypes and ranks stay rejected, pinned by
-`tensor_f32_cow_rejects_wrong_dtype_and_rank`.
+`tensor_f32_cow_accepts_bf16_and_rejects_invalid_dtype_or_rank`.
 
 The same audit closed a second silent-trust hole: the unsharded load path
 took each tensor's own shape as truth, so a checkpoint whose tensors disagreed
 with its `config.json` reached a config-sized GEMM. `load_tensor_2d` now takes
-the config-derived `(rows, cols)` and checks the header before upload; the
-27B-class extents are pinned by
-`unsharded_ranges_cover_the_full_checkpoint_tensor_shapes`.
+the config-derived `(rows, cols)` and checks the header before upload.
 
 ## Fixtures are matched by `config_sha256`
 
@@ -95,21 +93,20 @@ output; the gate never reads it.
 
 Qwen3.8's template is where the generations genuinely differ for serving: it
 reads `reasoning_effort` (default `xhigh`, restricted to `xhigh|medium|low`,
-`raise_exception` otherwise), gates the reasoning instructions on
-`enable_thinking`, and honours `preserve_thinking`. The renderer can express
-all of it — `ChatOptions.reasoning_effort` (the vendored enum already has
-`XHigh`) and `ChatOptions.template_kwargs` — but note that when
-`reasoning_effort` is set the renderer *also* injects `enable_thinking`,
-which HF leaves undefined; the template treats both the same, which is
-precisely the kind of equivalence this gate exists to confirm.
+`raise_exception` otherwise) and gates the reasoning instructions on
+`enable_thinking`. The renderer can express both — `ChatOptions.reasoning_effort`
+(the vendored enum already has `XHigh`) and `ChatOptions.template_kwargs` — but
+note that when `reasoning_effort` is set the renderer *also* injects
+`enable_thinking`, which HF leaves undefined; the template treats both the same,
+which is precisely the kind of equivalence this gate exists to confirm.
 
-`pegainfer-frontend/tests/qwen38_chat_template_parity.rs` covers nine cases
+`pegainfer-frontend/tests/qwen38_chat_template_parity.rs` covers seven cases
 against `qwen38-chat-golden.json`, bound to the checkpoint by file digests,
 with the shared render/compare machinery in
 `pegainfer-frontend/tests/common/mod.rs` and the reference dumped by the
-generic `tools/accuracy/dump_chat_template_golden.py qwen38`. A
-`preserve_thinking` case is deliberately absent: against `MULTI_TURN` (whose
-assistant turn carries no reasoning) it renders byte-identical to
+generic `tools/accuracy/dump_chat_template_golden.py qwen38`. The template also
+honours `preserve_thinking`, but no case exercises it: against `MULTI_TURN`
+(whose assistant turn carries no reasoning) it renders byte-identical to
 `multi_turn`, so it tests nothing.
 
 ## Serving budget (unchanged from Qwen3.5-27B)
@@ -141,7 +138,7 @@ and they are what "Qwen3.5 behaviour is unchanged" points to.
 | `hf_golden_gate` Qwen3.5-0.8B, single GPU (tied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0298 / p99 0.1137. Long: 18 positions, mean 0.0286 / p99 0.0926. |
 | `hf_golden_gate` Qwen3.5-2B, single GPU (tied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0301 / p99 0.1172. Long: 18 positions, mean 0.0238 / p99 0.0778. |
 | `hf_golden_gate` Qwen3.5-4B, single GPU (untied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0238 / p99 0.0813. Long: 18 positions, mean 0.0223 / p99 0.0705. |
-| `qwen38_chat_template_parity` | merged tree | 1 passed / 0 failed, 9 cases byte-identical to the HF render. |
+| `qwen38_chat_template_parity` | merged tree | 1 passed / 0 failed, 9 cases byte-identical to the HF render. *(Trimmed to 7 cases in the review-fix head; re-verification pending.)* |
 | `pegainfer-qwen35 --lib` (feature build, Triton AOT) | review-fix head, 1×L20 | 102 passed / 0 failed, the GPU recurrent tests included. |
 | `pegainfer-core --lib` | review-fix head | 38 passed / 0 failed (f32-cow: 1D bf16 accepted, other dtypes/ranks rejected). |
 | clippy `-D warnings` (core/qwen35/qwen3/frontend) + `cargo fmt --all --check` | merged tree | clean. |
