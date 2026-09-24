@@ -543,6 +543,12 @@ fn publish_load(
         num_running_reqs,
         num_waiting_reqs,
         spec_decode: None,
+        // Hybrid Gated DeltaNet state is linear and not prefix-reusable, so
+        // this line has no prefix cache to count.
+        prefix_cache_queries: 0,
+        prefix_cache_hits: 0,
+        prefix_cache_external_queries: 0,
+        prefix_cache_external_hits: 0,
     });
 }
 
@@ -603,6 +609,10 @@ fn terminal_scheduler_shutdown(
         num_running_reqs: 0,
         num_waiting_reqs: 0,
         spec_decode: None,
+        prefix_cache_queries: 0,
+        prefix_cache_hits: 0,
+        prefix_cache_external_queries: 0,
+        prefix_cache_external_hits: 0,
     });
 }
 

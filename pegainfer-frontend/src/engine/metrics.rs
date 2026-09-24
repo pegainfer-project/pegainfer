@@ -26,6 +26,26 @@ pub struct SchedulerMetrics {
     pub num_waiting_reqs: u64,
     /// Cumulative spec-decode counters, or `None` when no draft model is loaded.
     pub spec_decode: Option<SpecDecodeCounters>,
+    /// Cumulative prefix-cache queries, in tokens: how many prompt tokens were
+    /// looked up. Monotonic; mapped to vLLM `PrefixCacheStats.queries`.
+    pub prefix_cache_queries: u64,
+    /// Cumulative prefix-cache hits, in tokens: how many of the queried tokens
+    /// were already cached locally. Same unit as `prefix_cache_queries`, so
+    /// `hit_rate = hits/queries` stays in [0, 1].
+    pub prefix_cache_hits: u64,
+    /// Cumulative queries against the external/connector side (CPU-offload and
+    /// P2P restore), in tokens. These are looked up alongside the local cache,
+    /// so the count tracks `prefix_cache_queries`.
+    pub prefix_cache_external_queries: u64,
+    /// Cumulative hits served from the external/connector side rather than from
+    /// local KV, in tokens. Mapped to
+    /// `vllm:external_prefix_cache_queries/hits` via
+    /// `SchedulerStats.connector_prefix_cache_stats`.
+    ///
+    /// Note for both pairs: these are running totals because the load cell only
+    /// ever exposes the latest snapshot. The wire carries per-send deltas —
+    /// see [`PrefixCacheTracker`](crate::vllm::bridge::PrefixCacheTracker).
+    pub prefix_cache_external_hits: u64,
 }
 
 /// Upper bound on a drafter's `K`, fixing the width of

@@ -78,6 +78,9 @@ pub(super) fn build_prefill_request_results(
                 first_token_logprob,
                 prompt_logprobs,
                 cached_tokens: req.cached_tokens,
+                // Carried through from the lookup so the metrics path can
+                // split the local and externally restored shares.
+                external_hit_tokens: req.external_hit_tokens,
                 completed: req.is_final_chunk(),
                 prefill_pos: req.chunk_start + req.chunk_tokens,
             },
@@ -128,7 +131,9 @@ fn prompt_rows(requests: &[PrefillStepItem]) -> Result<Vec<LogprobRequest>> {
                 !req.prompt_tokens.is_empty()
                     && req.chunk_start == 0
                     && req.chunk_tokens == req.prompt_tokens.len()
-                    && req.cached_tokens == 0,
+                    // `None` is a request that never ran a lookup at all,
+                    // which is as uncached as it gets.
+                    && req.cached_tokens.unwrap_or(0) == 0,
                 "prompt logprobs require a whole uncached prompt"
             );
             rows.extend(

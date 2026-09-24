@@ -93,8 +93,12 @@ pub struct PrefillStepItem {
     pub(crate) lora_adapter: Option<String>,
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
-    /// the remaining suffix.
-    pub(crate) cached_tokens: usize,
+    /// the remaining suffix. `None` means no lookup ran (prefix caching off,
+    /// or an echo request), which the metrics path must not count.
+    pub(crate) cached_tokens: Option<usize>,
+    /// How many of those cached tokens came from the external side (CPU
+    /// offload / P2P restore) rather than from local KV.
+    pub(crate) external_hit_tokens: usize,
     /// Scheduler-set cap on prompt tokens forwarded this step (chunked
     /// prefill). The executor clamps it to the tokens actually remaining.
     pub(crate) chunk_budget: usize,
@@ -124,7 +128,8 @@ impl PrefillStepItem {
             logprobs,
             prompt_logprobs,
             lora_adapter: None,
-            cached_tokens: 0,
+            cached_tokens: None,
+            external_hit_tokens: 0,
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
@@ -700,7 +705,12 @@ pub struct PrefillRequestResult {
     pub first_token_logprob: Option<TokenLogprob>,
     pub(crate) prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
-    pub cached_tokens: usize,
+    /// `None` when no lookup ran at all, which is the fact the /metrics
+    /// counters need: a disabled cache or an echo request counts nothing.
+    pub cached_tokens: Option<usize>,
+    /// How many of `cached_tokens` were restored from the external side (CPU
+    /// offload / P2P) rather than found in local KV.
+    pub external_hit_tokens: usize,
     /// Whether the prompt is fully prefilled. When false this step ran a
     /// non-final chunk and `first_token` is meaningless.
     pub completed: bool,
@@ -1800,7 +1810,16 @@ impl Qwen3Executor {
             // Prompt scoring needs logits for every prompt position; cached positions
             // are never forwarded, so prompt-logprob requests prefill from scratch.
             if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+                let matched = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+                // Split the match by origin: blocks the probe found in local
+                // GPU KV versus blocks it restored from CPU offload / P2P.
+                // With no probe for this request the whole match is local.
+                let block_size = self.metadata.block_size;
+                let local = self.prefetch.get(&req.request_id).map_or(matched, |state| {
+                    (state.probe.gpu_hit_blocks() * block_size).min(matched)
+                });
+                req.cached_tokens = Some(matched);
+                req.external_hit_tokens = matched.saturating_sub(local);
             }
             self.request_kvs.insert(req.request_id, rkv);
             // match_and_add_prefix above already absorbed any CPU-prefetched
@@ -2221,6 +2240,10 @@ impl ModelExecutor for Qwen3Executor {
     fn block_size(&self) -> usize {
         self.metadata.block_size
     }
+
+    // No prefix-cache capability query here on purpose: whether a lookup ran
+    // is reported per request through `PrefillRequestResult::cached_tokens`
+    // rather than re-derived from a capability flag in the resolver.
 
     fn max_request_blocks(&self) -> usize {
         self.kv_mgr.pool().max_request_blocks()

@@ -13,7 +13,7 @@ use super::RequestId;
 /// Whether a prefill request is eligible to capture DFlash target context.
 fn dflash_prefill_supported(req: &PrefillStepItem) -> bool {
     req.lora_adapter.is_none()
-        && req.cached_tokens == 0
+        && req.cached_tokens.unwrap_or(0) == 0
         && req.logprobs.is_none()
         && req.prompt_logprobs.is_none()
 }
