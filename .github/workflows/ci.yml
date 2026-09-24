@@ -33,7 +33,8 @@ jobs:
       # the full commit *comparison*, whose file entries carry
       # `blob_url: null` for submodule bumps, and its strict decoder rejects
       # the whole payload — so any PR touching a submodule can never pass.
-      # A DCO check only needs the commit list.
+      # A DCO check only needs the commit list. Merge commits are skipped, as
+      # the DCO app does: GitHub's Update branch button creates them unsigned.
       - name: Check commit sign-offs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -43,6 +44,7 @@ jobs:
           unsigned=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/pulls/${PR}/commits?per_page=100" \
             --jq '.[]
+                  | select(.parents | length == 1)
                   | select(.commit.message | test("(?m)^Signed-off-by: .+ <.+@.+>") | not)
                   | .sha[0:10] + " " + (.commit.message | split("\n")[0])')
           if [ -n "$unsigned" ]; then
