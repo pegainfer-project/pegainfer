@@ -44,6 +44,7 @@ GATES_ADMISSION=(
   "gpu,ckpt,prompts serve::oracle::fp8_mixed_walk_holds_its_structure"
   "gpu,ckpt,prompts engine::lane_gates_walk::the_gathered_walk_does_not_depend_on_its_batching"
   "gpu,ckpt,prompts engine::lane_gates_walk::the_gathered_transient_leaves_headroom"
+  "gpu,ckpt,prompts engine::lane_gates_walk::the_served_bounds_provision_a_split_walk"
 )
 # These production contracts apply to both checkpoint geometries. They stay
 # unique in the ignored-test manifest and expand into two execution profiles.
