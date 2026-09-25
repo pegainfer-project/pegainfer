@@ -79,12 +79,17 @@ __global__ void conv1d_prefill_kernel(
     }
 }
 
+// `x_batch` may be a band of a fused projection: the caller says how many
+// channels the band holds and how far apart two slots sit in the tensor it is a
+// band of. The output is always this operator's own buffer, so it keeps the
+// band's own width as its slot stride.
 __global__ void conv1d_decode_batch_kernel(
     const __nv_bfloat16* __restrict__ x_batch,
     const __nv_bfloat16* __restrict__ conv_weight,
     const uint64_t* __restrict__ conv_state_ptrs,
     __nv_bfloat16* __restrict__ out_batch,
     int num_channels,
+    int x_stride,
     int batch_size,
     int kernel_size
 ) {
@@ -95,7 +100,7 @@ __global__ void conv1d_decode_batch_kernel(
     int c = idx % num_channels;
     int slot = idx / num_channels;
     int state_width = kernel_size - 1;
-    const __nv_bfloat16* x = x_batch + (size_t)slot * num_channels;
+    const __nv_bfloat16* x = x_batch + (size_t)slot * x_stride;
     __nv_bfloat16* conv_state =
         reinterpret_cast<__nv_bfloat16*>(static_cast<uintptr_t>(conv_state_ptrs[slot]));
 
@@ -152,6 +157,7 @@ void conv1d_decode_batch_cuda(
     const uint64_t* conv_state_ptrs,
     __nv_bfloat16* out_batch,
     int num_channels,
+    int x_stride,
     int batch_size,
     int kernel_size,
     cudaStream_t stream
@@ -160,7 +166,7 @@ void conv1d_decode_batch_cuda(
     int blocks = (total + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
     conv1d_decode_batch_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
         x_batch, conv_weight, conv_state_ptrs, out_batch,
-        num_channels, batch_size, kernel_size
+        num_channels, x_stride, batch_size, kernel_size
     );
 }
 

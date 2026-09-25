@@ -174,6 +174,9 @@ __global__ void gated_delta_rule_decode_kernel(
     }
 }
 
+// `b_proj_batch` and `a_proj_batch` may be bands of one fused beta/alpha
+// projection: the caller says how far apart two slots sit in the tensor each is
+// a band of, and the band's own width is `num_value_heads`.
 __global__ void gated_delta_rule_decode_batch_kernel(
     const __nv_bfloat16* __restrict__ qkv_batch,   // [batch, qkv_dim]
     const __nv_bfloat16* __restrict__ b_proj_batch, // [batch, num_value_heads]
@@ -185,7 +188,9 @@ __global__ void gated_delta_rule_decode_batch_kernel(
     int num_key_heads,
     int num_value_heads,
     int key_dim,
-    int val_dim
+    int val_dim,
+    int b_stride,
+    int a_stride
 ) {
     int slot = blockIdx.y;
     int v_head = blockIdx.x;
@@ -200,8 +205,8 @@ __global__ void gated_delta_rule_decode_batch_kernel(
     int qkv_dim = q_dim_total + k_dim_total + num_value_heads * val_dim;
 
     const __nv_bfloat16* qkv = qkv_batch + (size_t)slot * qkv_dim;
-    const __nv_bfloat16* b_proj = b_proj_batch + (size_t)slot * num_value_heads;
-    const __nv_bfloat16* a_proj = a_proj_batch + (size_t)slot * num_value_heads;
+    const __nv_bfloat16* b_proj = b_proj_batch + (size_t)slot * b_stride;
+    const __nv_bfloat16* a_proj = a_proj_batch + (size_t)slot * a_stride;
 
     __shared__ float smem_q[GDR_KEY_DIM];
     __shared__ float smem_k[GDR_KEY_DIM];
@@ -344,12 +349,15 @@ void gated_delta_rule_decode_batch_cuda(
     int num_value_heads,
     int key_dim,
     int val_dim,
+    int b_stride,
+    int a_stride,
     cudaStream_t stream
 ) {
     dim3 grid(num_value_heads, batch_size);
     gated_delta_rule_decode_batch_kernel<<<grid, GDR_BLOCK_DIM, 0, stream>>>(
         qkv_batch, b_proj_batch, a_proj_batch, dt_bias, A_log, state_ptrs,
-        output_batch, num_key_heads, num_value_heads, key_dim, val_dim
+        output_batch, num_key_heads, num_value_heads, key_dim, val_dim,
+        b_stride, a_stride
     );
 }
 

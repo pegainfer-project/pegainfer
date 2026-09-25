@@ -457,14 +457,50 @@ impl Qwen35Model {
         let c = &self.config;
         let geom = self.geometry;
 
-        // Batch projections
-        let qkv_batch = ops::gemm(&self.ctx, &attn.in_proj_qkv, normed_batch)?;
-        let z_batch = ops::gemm(&self.ctx, &attn.in_proj_z, normed_batch)?;
-        let b_batch = ops::gemm(&self.ctx, &attn.in_proj_b, normed_batch)?;
-        let a_batch = ops::gemm(&self.ctx, &attn.in_proj_a, normed_batch)?;
-
+        // Batch projections. The weights are the fused ones the decode path
+        // issues a single GEMM against; a prefill step reads the row range it
+        // wants into its own buffer, so every kernel downstream is unchanged.
         let qkv_dim = geom.local_linear_qkv_dim();
         let z_dim = geom.local_linear_z_dim();
+        let value_heads = geom.local_linear_num_value_heads();
+
+        let mut qkv_batch = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;
+        ops::gemm_rows_into(
+            &self.ctx,
+            &attn.in_proj_qkvz,
+            0,
+            qkv_dim,
+            normed_batch,
+            &mut qkv_batch,
+        );
+        let mut z_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+        ops::gemm_rows_into(
+            &self.ctx,
+            &attn.in_proj_qkvz,
+            qkv_dim,
+            z_dim,
+            normed_batch,
+            &mut z_batch,
+        );
+        let mut b_batch = HiddenStates::zeros(&self.ctx, value_heads, seq_len)?;
+        ops::gemm_rows_into(
+            &self.ctx,
+            &attn.in_proj_ba,
+            0,
+            value_heads,
+            normed_batch,
+            &mut b_batch,
+        );
+        let mut a_batch = HiddenStates::zeros(&self.ctx, value_heads, seq_len)?;
+        ops::gemm_rows_into(
+            &self.ctx,
+            &attn.in_proj_ba,
+            value_heads,
+            value_heads,
+            normed_batch,
+            &mut a_batch,
+        );
+
         let layer_state = &mut recurrent.layers[*linear_idx];
 
         let mut qkv_conv_batch = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;

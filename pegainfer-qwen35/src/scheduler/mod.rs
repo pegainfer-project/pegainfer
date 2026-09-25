@@ -288,7 +288,29 @@ impl FatalSchedulerError {
     }
 }
 
-pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
+/// How many prompt tokens one step may prefill.
+///
+/// The budget is what packs several admitted prompts into a single step, and how
+/// finely prefill is chopped is the structural difference between this engine
+/// and vLLM on these cells: at 1024 a 1024-token prompt consumes the whole
+/// budget, a ramp costs one step per request, and c16 spends sixteen steps
+/// admitting sixteen requests where vLLM spends a handful. Per layer-step our
+/// GDN prefill is already the faster of the two (247 µs against FLA's 433) — the
+/// cost is entirely in how many steps the same work is spread over.
+///
+/// Measured on one tree, two runs a side, zero failed requests, against 1024:
+/// c8 mean TPOT 10.42/10.47 → 10.14/10.11 ms with output 665/661 → 679/683 tok/s
+/// and ITL p99 64.9/65.8 → 10.2/10.2 ms; c16 12.55/12.55 → 12.09/12.09 ms with
+/// 1038/1033 → 1089/1082 tok/s and p99 79.7/79.1 → 13.0/13.2 ms; qps16 mean TPOT
+/// 31.99/32.00 → 29.89/29.97 ms, TTFT 764/759 → 418/419 ms and output
+/// 1140/1140 → 1289/1287 tok/s.
+///
+/// The cost is the tail under a steady arrival: qps16's ITL p99 goes 95.9/97.0 →
+/// 260.7/261.5 ms, because that cell does queue several prompts and a step
+/// carrying five of them is longer than one carrying two. `--max-prefill-tokens
+/// 1024` restores the old behaviour for a workload where that tail matters more
+/// than the throughput.
+pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 4096;
 
 /// Env-gated per-step ITL diagnostics (issue #470). When `PEGAINFER_ITL_DEBUG`
 /// is set, the scheduler emits one `ITL_STEP` line per executed step, tagging

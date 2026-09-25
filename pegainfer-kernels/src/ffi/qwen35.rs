@@ -88,6 +88,8 @@ unsafe extern "C" {
         num_value_heads: i32,
         key_dim: i32,
         val_dim: i32,
+        b_stride: i32,
+        a_stride: i32,
         stream: CUstream,
     );
 
@@ -109,6 +111,7 @@ unsafe extern "C" {
         conv_state_ptrs: *const u64,
         out_batch: *mut Half,
         num_channels: i32,
+        x_stride: i32,
         batch_size: i32,
         kernel_size: i32,
         stream: CUstream,

@@ -478,14 +478,19 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Per-head RMSNorm with F32 weight + SiLU gate
+    // Per-head RMSNorm with F32 weight + SiLU gate. `num_heads` counts every
+    // head of every slot; `heads_per_slot` splits that back into (slot, head)
+    // so `x` and `gate` can each carry their own tensor's slot stride.
     pub fn rms_norm_gated_cuda(
         x: *const Half,
         weight: *const f32,
         gate: *const Half,
         out: *mut Half,
         num_heads: i32,
+        heads_per_slot: i32,
         head_dim: i32,
+        x_stride: i32,
+        gate_stride: i32,
         eps: f32,
         stream: CUstream,
     );
@@ -810,6 +815,34 @@ unsafe extern "C" {
         head_dim: i32,
         page_size: i32,
         batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    /// Split-KV hd256 decode: one CTA per (KV split, kv head, request) plus a
+    /// merge CTA per (request, query head). Same paged NHD layout as the
+    /// FlashInfer entry above. `partial_*` are caller-owned scratch buffers of
+    /// `[splits, batch, num_qo_heads, head_dim]`, `[splits, batch, num_qo_heads]`
+    /// and the same shape again, all f32; they must outlive the stream.
+    pub fn paged_attention_decode_split_hd256_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        partial_o: *mut f32,
+        partial_m: *mut f32,
+        partial_l: *mut f32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        num_splits: i32,
         stride_page: i64,
         sm_scale: f32,
         stream: CUstream,

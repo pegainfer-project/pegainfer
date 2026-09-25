@@ -29,17 +29,17 @@ pub(crate) struct FullAttentionLayer {
 
 /// Linear attention layer weights (24 layers in Qwen3.5-4B).
 pub(crate) struct LinearAttentionLayer {
-    /// Fused QKV projection: [local_linear_qkv_dim, hidden_size]; row layout
-    /// in `linear_qkv_shard_segments`.
-    pub(crate) in_proj_qkv: DeviceMatrix,
-    /// Z projection (for output gating): [local_linear_z_dim, hidden_size]
-    pub(crate) in_proj_z: DeviceMatrix,
-    /// Beta projection: [local_linear_num_value_heads, hidden_size]
-    pub(crate) in_proj_b: DeviceMatrix,
-    /// Alpha projection: [local_linear_num_value_heads, hidden_size]
-    pub(crate) in_proj_a: DeviceMatrix,
+    /// Fused qkv+z projection: [local_linear_qkv_dim + local_linear_z_dim,
+    /// hidden_size]; rows [0, local_linear_qkv_dim) follow
+    /// `linear_qkv_shard_segments`, the rows above them are z.
+    pub(crate) in_proj_qkvz: DeviceMatrix,
+    /// Fused beta+alpha projection: [2 * local_linear_num_value_heads,
+    /// hidden_size]; beta occupies rows [0, local_linear_num_value_heads) and
+    /// alpha the rows above them.
+    pub(crate) in_proj_ba: DeviceMatrix,
     /// Depthwise conv1d weight: [local_linear_qkv_dim * conv_kernel_dim]
-    /// (flattened from [qkv_dim, 1, 4]); channel layout mirrors in_proj_qkv.
+    /// (flattened from [qkv_dim, 1, 4]); channel layout mirrors the qkv band of
+    /// `in_proj_qkvz`.
     pub(crate) conv1d_weight: DeviceVec,
     /// dt_bias: [local_linear_num_value_heads] bf16
     pub(crate) dt_bias: DeviceVec,
@@ -146,18 +146,28 @@ impl FullAttentionLayer {
 
 impl LinearAttentionLayer {
     fn load(src: &WeightSource, prefix: &str) -> Result<Self> {
+        // Qwen3.5 ships the four projections separately and vLLM fuses them at
+        // load time into `in_proj_qkvz` and `in_proj_ba`; the same fusion here
+        // means one GEMM per group instead of four launches.
+        let qkv = src.linear_in_proj_qkv(&format!("{prefix}.in_proj_qkv.weight"))?;
+        let z = src.row_shard_if_needed(&format!("{prefix}.in_proj_z.weight"), src.linear_z)?;
+        let in_proj_qkvz = DeviceMatrix::vstack(src.ctx, &[&qkv, &z])?;
+        drop(qkv);
+        drop(z);
+        let beta = src.row_shard_if_needed(
+            &format!("{prefix}.in_proj_b.weight"),
+            src.linear_value_heads,
+        )?;
+        let alpha = src.row_shard_if_needed(
+            &format!("{prefix}.in_proj_a.weight"),
+            src.linear_value_heads,
+        )?;
+        let in_proj_ba = DeviceMatrix::vstack(src.ctx, &[&beta, &alpha])?;
+        drop(beta);
+        drop(alpha);
         Ok(Self {
-            in_proj_qkv: src.linear_in_proj_qkv(&format!("{prefix}.in_proj_qkv.weight"))?,
-            in_proj_z: src
-                .row_shard_if_needed(&format!("{prefix}.in_proj_z.weight"), src.linear_z)?,
-            in_proj_b: src.row_shard_if_needed(
-                &format!("{prefix}.in_proj_b.weight"),
-                src.linear_value_heads,
-            )?,
-            in_proj_a: src.row_shard_if_needed(
-                &format!("{prefix}.in_proj_a.weight"),
-                src.linear_value_heads,
-            )?,
+            in_proj_qkvz,
+            in_proj_ba,
             conv1d_weight: src.linear_conv1d(&format!("{prefix}.conv1d.weight"))?,
             dt_bias: src
                 .tensor_1d_shard_if_needed(&format!("{prefix}.dt_bias"), src.linear_value_heads)?,

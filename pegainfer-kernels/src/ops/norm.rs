@@ -6,6 +6,7 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::tensor::Columns;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
@@ -629,26 +630,30 @@ pub fn rms_norm_offset_into(
 
 /// Batched per-head RMSNorm with F32 weight + SiLU gate multiplication.
 /// HiddenStates are flattened as (seq_len * num_heads) contiguous head slices.
+/// The gate may be one band of a fused projection, in which case its slot stride
+/// is the tensor it is a band of rather than the band's own width.
 #[allow(clippy::too_many_arguments)]
-pub fn rms_norm_gated_batch_into(
+pub fn rms_norm_gated_batch_into<'a>(
     ctx: &DeviceContext,
     x: &HiddenStates,
     weight: &CudaSlice<f32>,
-    gate: &HiddenStates,
+    gate: impl Into<Columns<'a>>,
     out: &mut HiddenStates,
     num_heads: usize,
     head_dim: usize,
     eps: f32,
 ) {
+    let gate = gate.into();
     let total_heads = x.seq_len * num_heads;
     assert_eq!(x.hidden_dim, num_heads * head_dim);
-    assert_eq!(gate.hidden_dim, x.hidden_dim);
-    assert_eq!(gate.seq_len, x.seq_len);
+    assert_eq!(gate.width, x.hidden_dim);
+    assert_eq!(gate.states.seq_len, x.seq_len);
     assert_eq!(out.hidden_dim, x.hidden_dim);
     assert_eq!(out.seq_len, x.seq_len);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (w_ptr, _gw) = weight.device_ptr(&ctx.stream);
-    let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = gate.states.data.device_ptr(&ctx.stream);
+    let g_ptr = g_ptr + (gate.col * std::mem::size_of::<bf16>()) as u64;
     let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     unsafe {
         ffi::rms_norm_gated_cuda(
@@ -657,7 +662,10 @@ pub fn rms_norm_gated_batch_into(
             g_ptr as *const ffi::Half,
             o_ptr as *mut ffi::Half,
             total_heads as i32,
+            num_heads as i32,
             head_dim as i32,
+            x.hidden_dim as i32,
+            gate.states.hidden_dim as i32,
             eps,
             crate::tensor::active_cu_stream(ctx),
         );
