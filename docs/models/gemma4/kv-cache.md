@@ -441,8 +441,8 @@ is not the contract, the per-rank mapping is.
    releases page by page, so a resident window carries at most 63 tokens past 1024.
 3. ~~A windowed split-KV decode~~ — landed behind `PEGAINFER_GLOBAL_ATTN=tilelang*`: the sliding
    family's pure-decode rows read their window through a generated split-KV kernel over 64-token
-   chunks of 32-key tiles (two 16-row pages a tile, since the gemm wants eight key columns a warp),
-   with the keys a page-aligned window still holds masked by distance. 13.4 µs a layer on GH200
+   chunks, one 64-row page a tile, with the keys a page-aligned window still holds masked by
+   distance. 13.4 µs a layer on GH200
    against the windowed prefill read's 27; mixed steps keep the prefill read.
 4. ~~A native group-16 decode for TP1's full-attention group~~ — overtaken: the group is split
    into two dispatchable pseudo-requests instead, so decode already runs a decode kernel. A native
