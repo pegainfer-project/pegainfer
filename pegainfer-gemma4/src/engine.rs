@@ -23,6 +23,7 @@ use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
@@ -833,9 +834,23 @@ fn fail_active_batch(
     ledger: &mut RequestLedger,
 ) {
     log::error!("{what} failed: {err:#}");
-    for entry in active.drain(..) {
-        if ledger.is_active(entry.request.id) {
-            ledger.fail(entry.request.id, format!("{what} failed: {err:#}"));
+    fail_requests(
+        active.drain(..).map(|entry| entry.request.id),
+        what,
+        err,
+        ledger,
+    );
+}
+
+fn fail_requests(
+    ids: impl IntoIterator<Item = RequestId>,
+    what: &str,
+    err: &anyhow::Error,
+    ledger: &mut RequestLedger,
+) {
+    for id in ids {
+        if ledger.is_active(id) {
+            ledger.fail(id, format!("{what} failed: {err:#}"));
         }
     }
 }
@@ -1904,72 +1919,36 @@ impl EngineState {
             budget -= take;
         }
 
-        let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
-        let stepped = {
-            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
+        let sampled = {
             let mut prefills: Vec<(&mut GemmaKv, &[u32])> = Vec::new();
+            let mut head: Vec<SampleRow<'_>> = Vec::new();
             for (walker, take) in walk.walkers.iter_mut().zip(&takes) {
-                if let Some((take, _)) = *take {
-                    let segment =
-                        &walker.request.request.prompt_tokens[walker.offset..walker.offset + take];
-                    prefills.push((&mut walker.kv, segment));
-                }
-            }
-            self.serve.mixed_prefill_decode_step(
-                &self.ctx,
-                &mut self.arena,
-                &mut prefills,
-                &mut kvs,
-                &decode_tokens,
-            )
-        };
-        let logits = match stepped {
-            Ok(logits) => logits,
-            Err(err) => {
-                fail_active_batch(active, "walk step", &err, ledger);
-                Self::fail_walkers(&mut walk.walkers, "walk step", &err, ledger);
-                return Err(err.context("gemma4 walk step"));
-            }
-        };
-
-        let head: Vec<SampleRow<'_>> = walk
-            .walkers
-            .iter()
-            .zip(&takes)
-            .filter(|(_, take)| take.is_some())
-            .map(|(walker, take)| {
-                let (_, last) = take.expect("filtered");
-                SampleRow {
-                    params: &walker.request.request.params,
+                let Some((take, last)) = *take else {
+                    continue;
+                };
+                let request = &walker.request.request;
+                prefills.push((
+                    &mut walker.kv,
+                    &request.prompt_tokens[walker.offset..walker.offset + take],
+                ));
+                head.push(SampleRow {
+                    params: &request.params,
                     step: 0,
-                    logprobs: if last {
-                        walker.request.request.logprobs
-                    } else {
-                        None
-                    },
+                    logprobs: if last { request.logprobs } else { None },
                     ignore_eos: if last {
-                        walker.request.request.params.ignore_eos
+                        request.params.ignore_eos
                     } else {
                         true
                     },
-                }
-            })
-            .collect();
-        let mut sampled = match mixed_head_flow(
-            &self.ctx,
-            &self.suppress_ids,
-            &self.policy,
-            &mut self.scratch,
-            self.base_seed,
-            &mut self.sample_nonce,
-            &head,
-            active,
-            logits,
-            ledger,
-        ) {
+                });
+            }
+            self.mixed_step(&mut prefills, &head, active, ledger)
+        };
+        let mut sampled = match sampled {
             Ok(sampled) => sampled,
             Err(err) => {
-                Self::fail_walkers(&mut walk.walkers, "walk step", &err, ledger);
+                let walkers = walk.walkers.drain(..).map(|walker| walker.request.id);
+                fail_requests(walkers, "walk step", &err, ledger);
                 return Err(err);
             }
         };
@@ -1991,19 +1970,6 @@ impl EngineState {
             .walkers
             .iter()
             .any(|walker| !walker.failed && walker.first.is_none()))
-    }
-
-    fn fail_walkers(
-        walkers: &mut Vec<Walker>,
-        what: &str,
-        error: &anyhow::Error,
-        ledger: &mut RequestLedger,
-    ) {
-        for walker in walkers.drain(..) {
-            if ledger.is_active(walker.request.id) {
-                ledger.fail(walker.request.id, format!("{what} failed: {error:#}"));
-            }
-        }
     }
 
     fn graduate_ready_walkers(
@@ -2210,6 +2176,48 @@ impl EngineState {
         Ok(())
     }
 
+    /// One step that prefills `prefills` alongside every active row's next
+    /// token. `head` samples the prefill rows; the active rows follow and get
+    /// their events here. On `Err` the active batch has been failed.
+    fn mixed_step(
+        &mut self,
+        prefills: &mut [(&mut GemmaKv, &[u32])],
+        head: &[SampleRow<'_>],
+        active: &mut Vec<Active>,
+        ledger: &mut RequestLedger,
+    ) -> Result<SampledRows> {
+        let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
+        let stepped = {
+            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
+            self.serve.mixed_prefill_decode_step(
+                &self.ctx,
+                &mut self.arena,
+                prefills,
+                &mut kvs,
+                &decode_tokens,
+            )
+        };
+        let logits = match stepped {
+            Ok(logits) => logits,
+            Err(err) => {
+                fail_active_batch(active, "mixed step", &err, ledger);
+                return Err(err.context("gemma4 mixed step"));
+            }
+        };
+        mixed_head_flow(
+            &self.ctx,
+            &self.suppress_ids,
+            &self.policy,
+            &mut self.scratch,
+            self.base_seed,
+            &mut self.sample_nonce,
+            head,
+            active,
+            logits,
+            ledger,
+        )
+    }
+
     /// The mixed-admission tail of [`Self::admit_and_prefill`]: every
     /// gathered prompt and the live decode batch share one step, then one
     /// sampler call covers the newcomers' first tokens (logits rows `0..k`)
@@ -2229,29 +2237,28 @@ impl EngineState {
             return Ok(Admitted::Done);
         }
 
-        let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
-        let logits = {
-            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
-            let mut prefills: Vec<(&mut GemmaKv, &[u32])> = newcomers
-                .iter_mut()
-                .map(|(request, kv, _)| {
-                    let resume = kv.local.seq_len();
-                    (kv, &request.request.prompt_tokens[resume..])
-                })
-                .collect();
-            match self.serve.mixed_prefill_decode_step(
-                &self.ctx,
-                &mut self.arena,
-                &mut prefills,
-                &mut kvs,
-                &decode_tokens,
-            ) {
-                Ok(logits) => logits,
-                Err(err) => {
-                    fail_active_batch(active, "mixed step", &err, ledger);
-                    Self::fail_newcomers(&mut newcomers, "mixed step", &err, ledger);
-                    return Err(err.context("gemma4 mixed step"));
-                }
+        let sampled = {
+            let mut prefills: Vec<(&mut GemmaKv, &[u32])> = Vec::with_capacity(newcomers.len());
+            let mut head: Vec<SampleRow<'_>> = Vec::with_capacity(newcomers.len());
+            for (request, kv, _) in &mut newcomers {
+                let resume = kv.local.seq_len();
+                let request = &request.request;
+                prefills.push((kv, &request.prompt_tokens[resume..]));
+                head.push(SampleRow {
+                    params: &request.params,
+                    step: 0,
+                    logprobs: request.logprobs,
+                    ignore_eos: request.params.ignore_eos,
+                });
+            }
+            self.mixed_step(&mut prefills, &head, active, ledger)
+        };
+        let mut sampled = match sampled {
+            Ok(sampled) => sampled,
+            Err(err) => {
+                let newcomers = newcomers.drain(..).map(|(request, _, _)| request.id);
+                fail_requests(newcomers, "mixed step", &err, ledger);
+                return Err(err);
             }
         };
         for (request, kv, resumed) in &newcomers {
@@ -2264,35 +2271,6 @@ impl EngineState {
                 *resumed,
             );
         }
-        let mut sampled = {
-            let head: Vec<SampleRow<'_>> = newcomers
-                .iter()
-                .map(|(request, _, _)| SampleRow {
-                    params: &request.request.params,
-                    step: 0,
-                    logprobs: request.request.logprobs,
-                    ignore_eos: request.request.params.ignore_eos,
-                })
-                .collect();
-            match mixed_head_flow(
-                &self.ctx,
-                &self.suppress_ids,
-                &self.policy,
-                &mut self.scratch,
-                self.base_seed,
-                &mut self.sample_nonce,
-                &head,
-                active,
-                logits,
-                ledger,
-            ) {
-                Ok(sampled) => sampled,
-                Err(err) => {
-                    Self::fail_newcomers(&mut newcomers, "mixed step", &err, ledger);
-                    return Err(err);
-                }
-            }
-        };
 
         // The newcomers: their first tokens are logits rows `0..k`.
         for (j, (request, kv, _)) in newcomers.into_iter().enumerate() {
@@ -2308,19 +2286,6 @@ impl EngineState {
             }
         }
         Ok(Admitted::Done)
-    }
-
-    fn fail_newcomers(
-        newcomers: &mut Vec<Newcomer>,
-        what: &str,
-        error: &anyhow::Error,
-        ledger: &mut RequestLedger,
-    ) {
-        for (request, _, _) in newcomers.drain(..) {
-            if ledger.is_active(request.id) {
-                ledger.fail(request.id, format!("{what} failed: {error:#}"));
-            }
-        }
     }
 
     fn decode_round_collect(
