@@ -342,9 +342,9 @@ pub(crate) fn admit_tokens(
 pub(crate) const LOCAL_PAGE_SIZE: usize = 64;
 
 /// The global family's page, sized so one key block is one tile load: at this
-/// head dim a 64-row page keeps 0.93-0.96x of a contiguous tensor's throughput
-/// where four 16-row pages keep 0.52-0.54x. The pool never releases a global
-/// page, so the coarser granularity costs at most 63 tokens per request.
+/// head dim a 64-row page keeps nearly a contiguous tensor's throughput where
+/// four 16-row pages keep about half. The pool never releases a global page,
+/// so the coarser granularity costs at most 63 tokens per request.
 pub(crate) const GLOBAL_PAGE_SIZE: usize = 64;
 
 #[cfg(test)]

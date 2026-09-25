@@ -36,9 +36,9 @@ pub(crate) struct Gemma4Layer {
 /// owns rows `[e * rows, (e + 1) * rows)`.
 ///
 /// Stored packed, as the checkpoint ships it. Widening the experts to bf16
-/// here would cost 45.7 GB against the 11.4 GB they occupy packed, which does
-/// not fit the card this line serves on, and the FP4 kernel this is heading
-/// for wants them packed regardless. Stacking is what lets one batched call
+/// here would take about four times what they occupy packed, which does not
+/// fit the card this line serves on, and the Marlin FP4 kernel reads them
+/// packed. Stacking is what lets one batched call
 /// address all of them, and it turns 128 allocations per projection into one.
 pub(crate) struct StackedProjection {
     /// Marlin's B order, which the checkpoint's is not: the loader rewrites it

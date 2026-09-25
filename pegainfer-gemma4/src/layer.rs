@@ -319,7 +319,7 @@ pub(crate) fn attention_epilogue_into(
                 &scratch.down,
                 moe_scratch,
                 // The attention projection is dead after `residual` is formed
-                // and has the same shape, so the routed-only result reuses it.
+                // and has the same shape, so the routed block's result reuses it.
                 &mut scratch.attn_proj,
             )?;
             &scratch.attn_proj

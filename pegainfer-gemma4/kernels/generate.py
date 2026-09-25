@@ -1,15 +1,16 @@
-"""AOT-compile the Gemma 4 hd512 global-attention kernels into one CUDA file.
+"""AOT-compile the Gemma 4 TileLang attention kernels into one CUDA file.
 
 `pegainfer-kernels/build.rs` runs this under the `gemma4` feature and hands
 the result to nvcc. It prints the same `KEY=VALUE` manifest every TileLang
 family prints, and mirrors it into `manifest.txt` so a build host can consume
 a pre-generated directory without TileLang installed.
 
-Two launchers come out: the prefill over one lowered kernel, and the split-KV
-decode over two (a partial pass and a merge) behind one call. Each launcher is
-a spec -- its C parameters, its refusals, and for each kernel it launches how
-the lowered entry's parameters bind to those C arguments -- and the rendering
-is one routine over the specs, so a third kernel is a spec and not a copy.
+Four launchers come out: the global family's prefill over one lowered kernel
+and its split-KV decode over two (a partial pass and a merge) behind one call,
+and the sliding family's windowed prefill and decode. Each launcher is a spec
+-- its C parameters, its refusals, and for each kernel it launches how the
+lowered entry's parameters bind to those C arguments -- and the rendering is
+one routine over the specs, so another kernel is a spec and not a copy.
 
 What makes this family different from the K3 one is the lowering: the key and
 query loads become bulk copies, so TileLang passes those two tensors as TMA

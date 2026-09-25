@@ -52,7 +52,7 @@ pub(crate) fn generate_fixture_prompts() -> Vec<Vec<u32>> {
         "PEGAINFER_GEMMA4_GENERATE",
         "gemma4-12b-generate.safetensors",
     );
-    let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
+    let bytes = std::fs::read(path).expect("read generate fixture (dump it first)");
     let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
     ["a", "b", "c"]
         .iter()

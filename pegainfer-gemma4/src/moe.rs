@@ -33,7 +33,7 @@ const DECODE_BLOCK: usize = 16;
 // The `thread_m_blocks = 4` tile: one weight stripe serves four times the rows.
 const PREFILL_BLOCK: usize = 64;
 // A 1024-row step's routes: below it the coarse block loses first-token
-// time (measured down to 256 slots), at it the two blocks tie on a lone
+// time, at it the two blocks tie on a lone
 // prompt, and the mixed steps a busy server prefills through gain.
 const PREFILL_MIN_SLOTS: usize = 1024 * 8;
 

@@ -35,8 +35,8 @@ fn stack_with_storage(
     let weights =
         Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
-    // The oracle measures the kernel the line has always used; the opt-in one
-    // has its own gate.
+    // The oracle measures the incumbent kernel; the opt-in one has its own
+    // gate.
     let serve = GemmaServe::new(
         &ctx,
         weights,
@@ -1013,7 +1013,7 @@ fn incremental_serving_matches_recompute() {
     // The golden fixture's short prompt: real text, and the tokens the
     // ceiling below was calibrated on. Read for its prompt only.
     let path = crate::testkit::golden_path();
-    let bytes = std::fs::read(path).expect("read golden fixture (dump on the box first)");
+    let bytes = std::fs::read(path).expect("read golden fixture (dump it first)");
     let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
     let (_, tokens_i32) = i32_tensor(&fixture, "short_tokens");
     let mut tokens: Vec<u32> = tokens_i32
@@ -1069,10 +1069,9 @@ fn incremental_serving_matches_recompute() {
     }
 }
 
-/// DoD gate: greedy continuation matches HF `generate()` token for
-/// token on three prompts. The fixture is dumped on the box by
-/// tools/accuracy/dump_gemma4_generate.py (prompt + up to 50 greedy
-/// tokens per case).
+/// Greedy continuation matches HF `generate()` token for token on three
+/// prompts. The fixture is dumped by tools/accuracy/dump_gemma4_generate.py
+/// (prompt + up to 50 greedy tokens per case).
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
 fn greedy_matches_hf_generate() {
@@ -1081,7 +1080,7 @@ fn greedy_matches_hf_generate() {
         "PEGAINFER_GEMMA4_GENERATE",
         "gemma4-12b-generate.safetensors",
     );
-    let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
+    let bytes = std::fs::read(path).expect("read generate fixture (dump it first)");
     // Provenance: the golden fixture fingerprints the checkpoint files, so
     // it pins what is loaded here; the generate fixture then has to name
     // that same revision, or these tokens came from another model.
@@ -1335,7 +1334,7 @@ fn assert_mixed_admissions_match_serial(ctx: &DeviceContext, serve: &GemmaServe)
 /// composition everywhere else: both arms share the opening rounds and the
 /// batch-2 rounds after admission, and differ only in the admission itself
 /// (one mixed step versus a plain prefill plus one live decode round).
-/// Synthetic ids suffice: the gate is a self-A/B over window arithmetic.
+/// Synthetic ids suffice: both sides run the same window arithmetic.
 fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &GemmaServe) {
     let partner: Vec<u32> = (0..40u32).map(|i| 1000 + i * 31).collect();
     let long_prompt: Vec<u32> = (0..1500u32).map(|i| 1000 + (i * 37) % 50000).collect();

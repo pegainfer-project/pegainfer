@@ -445,12 +445,6 @@ fn token_ids(value: &serde_json::Value) -> Result<Vec<u32>> {
     }
 }
 
-/// Overlapped admission: with the lane on, a prompt arriving into a live
-/// decode batch prefills on its own stream while decode steps keep
-/// replaying on `ctx.stream` — the admission costs the streams a slowdown
-/// instead of a mixed step per prompt. `shared` lets the prefill grids
-/// compete for every SM; `green:NN` pins the lane to NN% of them, which is
-/// what actually protects decode ITL.
 /// One in-flight overlapped prefill, parked until the lane's completion
 /// event fires: the request, its KV, and the pass owning every device
 /// buffer the in-flight kernels still read.
@@ -463,7 +457,14 @@ struct InflightPrefill {
     resumed: Option<u64>,
 }
 
-/// The overlap lane: a dedicated prefill stream and a reusable completion
+/// Overlapped admission: with the lane on, a prompt arriving into a live
+/// decode batch prefills on its own stream while decode steps keep
+/// replaying on `ctx.stream` — the admission costs the streams a slowdown
+/// instead of a mixed step per prompt. `shared` lets the prefill grids
+/// compete for every SM; `green:NN` pins the lane to NN% of them, which is
+/// what actually protects decode ITL.
+///
+/// The lane itself: a dedicated prefill stream and a reusable completion
 /// event. At most one prefill is in flight; while it runs, later arrivals
 /// wait in the queue and decode keeps stepping — which is the point.
 struct AsyncPrefillLane {
@@ -527,8 +528,7 @@ impl Drop for AsyncPrefillLane {
 /// The fail-closed request validation every admission path shares; `Err`
 /// carries the typed refusal. Refuse every unsupported capability carried by
 /// the stepped `Request` (echo, LoRA and P/D transfer metadata) rather than
-/// silently ignoring it. Legacy frontend-resolved prefixes and DP ranks are
-/// not fields on this contract; scheduler placement consumes the latter.
+/// silently ignoring it.
 fn validate_request(request: &Request, max_context: usize) -> Result<usize, RejectReason> {
     let prompt_tokens = request.prompt_tokens.len();
     if prompt_tokens == 0 {
@@ -755,7 +755,17 @@ struct Walker {
     failed: bool,
 }
 
-/// Persistent chunked-admission state. One scheduler step advances one round:
+/// The chunked walk behind `PEGAINFER_MIX_CHUNK_TOKENS`: every gathered
+/// prompt walks the same segment schedule, one shared mixed step per round,
+/// packing up to `chunk` unseen prompt rows across walkers in admission order
+/// on top of the live decode batch — the streams advance one token per round
+/// instead of waiting out whole prompts. Each round samples every segment's
+/// last row; only a walker's final segment's row is kept as its first token,
+/// and that walker graduates into the decode batch at the round boundary. A
+/// drained roster finishes the remaining tails on the plain path, segment by
+/// segment.
+///
+/// One scheduler step advances one round:
 /// the contract driver commits the ledger once per step, so running the whole
 /// walk inside one call would withhold every live stream's tokens until all
 /// prompt suffixes had completed.
@@ -1788,16 +1798,8 @@ impl EngineState {
         Ok(())
     }
 
-    /// The chunked walk behind `PEGAINFER_MIX_CHUNK_TOKENS`: every
-    /// gathered prompt walks the same segment schedule, one shared mixed
-    /// step per round, packing up to `chunk` unseen prompt rows across
-    /// walkers in admission order on top of the live decode batch — the
-    /// streams advance one token per round instead of waiting out whole
-    /// prompts. Each round samples every segment's last row; only a
-    /// walker's final segment's row is kept as its first token, and that
-    /// walker graduates into the decode batch at the round boundary. A
-    /// drained roster finishes the remaining tails on the plain path,
-    /// segment by segment.
+    /// A prompt's unseen suffix on the plain path, one `chunk` segment at a
+    /// time.
     fn walk_plain_prompt(
         &self,
         kv: &mut GemmaKv,
@@ -2534,8 +2536,8 @@ fn deliver_decode_row(entry: &mut Active, token: DecodeToken, ledger: &mut Reque
 /// finished ones — the event flow both the pure decode round and the mixed
 /// admission share; `row_base` is the row's offset into the step's logits
 /// (a mixed step's first `row_base` rows are its newcomers). A stop token
-/// retires the request without being emitted; a send failure retires a
-/// frontend-aborted one.
+/// retires the request without being emitted; an aborted request retires
+/// with no event.
 fn emit_decode_rows(
     active: &mut Vec<Active>,
     sampled: &mut SampledRows,

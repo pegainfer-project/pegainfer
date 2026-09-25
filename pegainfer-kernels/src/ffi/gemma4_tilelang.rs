@@ -1,10 +1,11 @@
-//! Gemma 4 TileLang-generated global-attention prefill (AOT), built by the
-//! `tilelang` section of `build.rs` from `pegainfer-gemma4/kernels/generate.py`.
+//! Gemma 4 TileLang-generated attention (AOT), built by the `tilelang` section
+//! of `build.rs` from `pegainfer-gemma4/kernels/generate.py`.
 //!
-//! The symbol is a hand-written launcher returning `cudaError_t` as `int`:
+//! Each symbol is a hand-written launcher returning `cudaError_t` as `int`:
 //! `cudaErrorInvalidValue` outside what the body was built for,
-//! `cudaErrorNotSupported` from the stub tier. It owns its own grid, which is
-//! why the query boundaries arrive twice, on the device and on the host.
+//! `cudaErrorNotSupported` from the stub tier. A launcher owns its own grid,
+//! which is why the prefill's query boundaries arrive twice, on the device and
+//! on the host.
 
 use core::ffi::c_void;
 
@@ -15,8 +16,8 @@ unsafe extern "C" {
     /// step's prompt segments. `q` and `out` are bf16 rows of
     /// `[num_qo_heads, head_dim]`, `kv` the pool in rows of
     /// `[num_kv_heads, head_dim]`, and the indptrs the prefill plan's own,
-    /// `host_q_indptr` its host copy. `sm_scale` multiplies the scores; the
-    /// serving path folds `1/sqrt(head_dim)` upstream and passes one.
+    /// `host_q_indptr` its host copy. `sm_scale` multiplies the scores; Gemma
+    /// 4 attends unscaled and passes one.
     /// `fold_rotary` is the pool's row format, zero for split K|V rows. The
     /// extents, `batch`, `page_size` and the head counts are refused rather
     /// than truncated when they exceed what the bodies were built for.

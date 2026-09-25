@@ -9,8 +9,7 @@
 //! re-rendering), which is exactly where the window lives.
 //!
 //! Fail-closed gate: without `PEGAINFER_PREFIX_CACHE=K` in the environment
-//! the cache holds nothing and resolves nothing, and the engine behaves as
-//! before.
+//! the cache holds nothing and resolves nothing.
 
 use pegainfer_core::kv_pool::KvReservation;
 

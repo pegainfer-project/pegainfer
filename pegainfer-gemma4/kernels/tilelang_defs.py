@@ -1,7 +1,8 @@
-"""TileLang definitions of Gemma 4's global attention at head dim 512.
+"""TileLang definitions of Gemma 4's attention: the global family's at head
+dim 512, and the sliding family's windowed reads at 256 further down.
 
-Two kernels for the prefill's causal read over a prompt, and two for the
-decode's split-KV read over a request's whole context. The decode is a
+Two kernels for the global prefill's causal read over a prompt, and two for
+the decode's split-KV read over a request's whole context. The decode is a
 different problem: its compute is trivial and only the bytes in flight
 matter, so what makes it fast is different too, and is written at its own
 definition below.
@@ -147,10 +148,9 @@ def prefill_varlen(
     ):
         with T.Kernel(total_ctas, threads=threads) as pid:
             # The softmax runs on exp2, so the caller's scale carries log2(e)
-            # into the exponent. It is the caller's because the serving path
-            # folds 1/sqrt(head_dim) into the query rows upstream and hands
-            # this kernel a scale of one; baking the usual factor in here
-            # would apply it twice and quietly flatten every distribution.
+            # into the exponent. Gemma 4 attends unscaled and passes one;
+            # baking the usual 1/sqrt(head_dim) in here would flatten every
+            # distribution.
             scale = sm_scale * 1.44269504
             Q_shared = T.alloc_shared([block_M, dim], DTYPE)
             K_shared = T.alloc_shared([block_N, dim], DTYPE)
@@ -693,20 +693,13 @@ def decode_partial(
 
 # ---------------------------------------------------------------------------
 # The sliding family's decode: the same split-KV partial over the local
-# pool's 16-row pages, with the window as a mask on the resident keys.
-#
-# The serving path read a decode row's window through the windowed prefill
-# kernel: 27 us a launch for 16.8 MB, fifty launches a step. Two things
-# differ from the global family's partial. The gemm wants at least eight key
-# columns per warp, and a 16-row page gives a 128-thread block only four, so
-# a key tile is `tile_pages` pages copied side by side into one shared tile;
-# a page past the request's is read as its last page and masked by its
-# virtual position, so the copy never follows a page id the request does not
-# own. And the query is the last resident key while the pages hold up to a
-# page more than the window, so keys older than `window_left` are masked out
-# rather than released. Measured at 13.4 us a layer over the full window
-# against the 27 of the windowed prefill read, at 64-token chunks, 32-key
-# tiles, two stages and 128 threads.
+# pool's pages, with the window as a mask on the resident keys. A key tile
+# is `tile_pages` pages copied side by side into one shared tile; a page
+# past the request's is read as its last page and masked by its virtual
+# position, so the copy never follows a page id the request does not own.
+# The query is the last resident key while the pages hold up to a page more
+# than the window, so keys older than `window_left` are masked out rather
+# than released.
 
 LOCAL_DECODE_THREADS = 128
 LOCAL_DECODE_STAGES = 2

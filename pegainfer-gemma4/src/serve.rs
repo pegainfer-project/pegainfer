@@ -500,9 +500,6 @@ impl Projections {
     }
 }
 
-/// The tower's whole working set for one step: attention buffers, epilogue
-/// buffers, and the hidden pair the layers alternate between so no layer
-/// writes the buffer it is reading.
 /// Order `ctx.stream` producers (plan uploads, token-id H2D, buffer
 /// allocations) before the override stream consumes them. No-op without an
 /// override.
@@ -546,6 +543,9 @@ fn fence_producers_before_override(ctx: &DeviceContext) -> Result<()> {
     Ok(())
 }
 
+/// The tower's whole working set for one step: attention buffers, epilogue
+/// buffers, and the hidden pair the layers alternate between so no layer
+/// writes the buffer it is reading.
 struct TowerScratch {
     attn: AttnScratch,
     epilogue: EpilogueScratch,
@@ -594,8 +594,7 @@ fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &m
 
 const GLOBAL_SPLIT_CHUNK_TOKENS: usize = 256;
 /// The sliding family's decode chunk: a resident window of a thousand keys
-/// over sixteen-row pages wants many small CTAs rather than the global
-/// family's long streams, and 64 tokens measured fastest.
+/// wants many small CTAs rather than the global family's long streams.
 const LOCAL_SPLIT_CHUNK_TOKENS: usize = 64;
 
 struct SteadyDecode {
@@ -824,12 +823,6 @@ impl StepArena {
     }
 }
 
-/// How many pseudo-requests the global decode read presents each request
-/// as. FlashInfer's decode dispatcher compiles GQA groups {1,2,3,4,8}: a
-/// dispatchable group passes through whole, and a non-dispatchable group
-/// over one KV head halves into pseudo-requests — an exact memory identity
-/// only because MQA gives every query head the same KV head (the 12B
-/// global family's 16 over 1). Anything else fails loud.
 /// The allocators wrap the driver error in a message rather than keeping the
 /// code, so this reads the driver's own string. Deliberately narrow: anything
 /// it does not recognise stays an error, so a new failure mode surfaces as
@@ -923,6 +916,12 @@ impl GlobalAttn {
     }
 }
 
+/// How many pseudo-requests the global decode read presents each request
+/// as. FlashInfer's decode dispatcher compiles GQA groups {1,2,3,4,8}: a
+/// dispatchable group passes through whole, and a non-dispatchable group
+/// over one KV head halves into pseudo-requests — an exact memory identity
+/// only because MQA gives every query head the same KV head (the 12B
+/// global family's 16 over 1). Anything else fails loud.
 pub(crate) fn global_split_factor(config: &Gemma4Config) -> Result<usize> {
     const DISPATCHABLE: [usize; 5] = [1, 2, 3, 4, 8];
     let q = config.num_attention_heads;
@@ -1115,7 +1114,6 @@ impl GemmaServe {
             plan,
             out,
             num_q_heads,
-            // The prep folds 1/sqrt(head_dim) into the query rows upstream.
             1.0,
         )
     }

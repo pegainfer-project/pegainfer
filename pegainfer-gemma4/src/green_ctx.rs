@@ -63,7 +63,8 @@ impl PrefillLaneStream {
 
     /// A Green Context stream pinned to roughly `prefill_pct`% of the SMs
     /// (rounded down to the split granularity). Fails loudly rather than
-    /// falling back to shared SMs, so benchmarks stay honest.
+    /// falling back to shared SMs, so a pinned lane is never silently
+    /// unpinned.
     pub(crate) fn green(device_ordinal: usize, prefill_pct: u32) -> Result<Self> {
         let device: CUdevice = device_ordinal as i32;
         let mut sm_res: sys::CUdevResource = unsafe { std::mem::zeroed() };
