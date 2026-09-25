@@ -15,7 +15,7 @@ impl ModelLine for Gemma4Line {
     }
 
     fn probe(&self, config: &serde_json::Value) -> Result<(), String> {
-        crate::probe_config_json(config).map_err(|error| error.to_string())
+        crate::probe::probe_config_json(config).map_err(|error| error.to_string())
     }
 
     fn consumed_shared_args(&self) -> &'static [&'static str] {

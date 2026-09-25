@@ -1876,7 +1876,7 @@ fn argmax(row: &[f32]) -> usize {
 /// Greedy continuation: prefill the prompt, then decode `max_new`
 /// tokens one at a time. Host argmax over the last position — the
 /// correctness path; sampling belongs to the serving frontend.
-pub(crate) fn generate_greedy(
+fn generate_greedy(
     serve: &GemmaServe,
     ctx: &DeviceContext,
     kv: &mut GemmaKv,

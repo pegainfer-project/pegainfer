@@ -1033,10 +1033,6 @@ fn send_scheduled(request: &QueuedRequest, cached_tokens: usize, ledger: &mut Re
     }
 }
 
-fn reject_newcomer(request: &QueuedRequest, reason: RejectReason, ledger: &mut RequestLedger) {
-    ledger.reject(request.id, reason);
-}
-
 /// Everything the contract-owned scheduler thread owns for the life of the
 /// engine. Loading completes before the driver thread is spawned, so launch
 /// failures return synchronously to the caller.
@@ -1232,7 +1228,7 @@ impl EngineState {
         let context_len = match validate_request(&request.request, self.max_context) {
             Ok(len) => len,
             Err(reason) => {
-                reject_newcomer(&request, reason, ledger);
+                ledger.reject(request.id, reason);
                 return PreparedNewcomer::Done;
             }
         };
@@ -1256,13 +1252,12 @@ impl EngineState {
             }
             ReservationDecision::Refused(message) => {
                 log::warn!("gemma4 KV admission refused {}: {message}", request.id);
-                reject_newcomer(
-                    &request,
+                ledger.reject(
+                    request.id,
                     RejectReason::KvBudget {
                         prompt_tokens: request.request.prompt_tokens.len(),
                         worst_case_tokens: context_len,
                     },
-                    ledger,
                 );
                 return PreparedNewcomer::Done;
             }

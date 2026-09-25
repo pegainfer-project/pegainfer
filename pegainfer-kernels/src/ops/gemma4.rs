@@ -283,9 +283,6 @@ pub struct MoeAlignScratch<'a> {
     pub expert_ids: &'a mut CudaSlice<i32>,
     pub num_tokens_post_padded: &'a mut CudaSlice<i32>,
     pub expert_offsets: &'a mut CudaSlice<u32>,
-    /// Ignored: the alignment pass no longer writes a cursor. The field stays
-    /// so struct literals written against the earlier shape keep compiling.
-    pub expert_cursor: &'a mut CudaSlice<u32>,
 }
 
 /// Group the routed slots into the kernel's fixed-width blocks, on the device.

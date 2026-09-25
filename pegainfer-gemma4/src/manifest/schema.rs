@@ -10,11 +10,8 @@ use super::EXPECTED_DTYPE;
 use crate::config::Gemma4Config;
 use crate::config::LayerKind;
 use crate::config::MoeConfig;
-
-/// Two NVFP4 values share a byte.
-const FP4_PER_BYTE: usize = 2;
-/// One block scale per this many values along the reduction axis.
-const FP4_GROUP: usize = 16;
+use crate::nvfp4::GROUP as FP4_GROUP;
+use crate::nvfp4::PER_BYTE as FP4_PER_BYTE;
 
 /// Every text tensor lives here, which is what keeps the modality skip list
 /// from shadowing a required one.
@@ -51,7 +48,7 @@ pub(crate) struct TypedTensor {
 }
 
 /// One projection of one expert, stored as NVFP4: packed values, an e4m3
-/// block scale per [`FP4_GROUP`] of them along the reduction axis, a
+/// block scale per [`crate::nvfp4::GROUP`] of them along the reduction axis, a
 /// tensor-level scale, and the activation scale a W4A4 kernel would consume.
 pub(crate) struct QuantMatrix {
     pub(crate) weight: TypedTensor,

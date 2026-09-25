@@ -173,7 +173,7 @@ impl SlidingLocalKv {
         std::ptr::eq(self.pool.buffer(), pool.buffer())
     }
 
-    pub(crate) fn extend_resident(&mut self, pages: Vec<KvReservation>) {
+    fn extend_resident(&mut self, pages: Vec<KvReservation>) {
         self.resident.extend(pages);
     }
 
@@ -236,7 +236,7 @@ impl GemmaKv {
 /// its account already holds — the exact frontier account, a ceiling over
 /// the post-step kv_len. `None` means the account is already past the
 /// frontier: a bookkeeping error, not a surplus to spend.
-pub(crate) fn pages_to_reserve(kv_len: usize, accounted: usize, page_size: usize) -> Option<usize> {
+fn pages_to_reserve(kv_len: usize, accounted: usize, page_size: usize) -> Option<usize> {
     kv_len.div_ceil(page_size).checked_sub(accounted)
 }
 
