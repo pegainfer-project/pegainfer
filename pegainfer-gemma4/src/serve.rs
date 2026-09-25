@@ -605,6 +605,7 @@ struct SteadyDecode {
 
 #[derive(Eq, PartialEq)]
 struct SteadyRow {
+    kv: u64,
     kv_len: usize,
     local_origin: usize,
     local_pages: usize,
@@ -617,7 +618,8 @@ impl SteadyDecode {
         self.padded == next.padded
             && self.rows.len() == next.rows.len()
             && self.rows.iter().zip(&next.rows).all(|(current, next)| {
-                next.kv_len == current.kv_len + 1
+                next.kv == current.kv
+                    && next.kv_len == current.kv_len + 1
                     && next.local_origin == current.local_origin
                     && next.local_pages == current.local_pages
                     && next.global_pages == current.global_pages
@@ -820,10 +822,6 @@ impl StepArena {
     pub(crate) fn logits_and_ids(&mut self) -> (&mut HiddenStates, &mut CudaSlice<u32>) {
         (&mut self.logits, &mut self.ids)
     }
-
-    pub(crate) fn invalidate_decode_fingerprint(&mut self) {
-        self.steady = None;
-    }
 }
 
 /// How many pseudo-requests the global decode read presents each request
@@ -984,30 +982,15 @@ impl GemmaServe {
         let position = kv.local.seq_len();
         let kv_len = position + 1;
         self.check_step_bounds(kv, kv_len)?;
-        let page = self.local_pool.layout().page_size;
-        let local_origin = kv.local.origin_pages();
-        let origin_tokens = local_origin * page;
-        let relative_len = kv_len
-            .checked_sub(origin_tokens)
-            .context("the resident window starts past the step's frontier")?;
-        let local_start = position
-            .checked_sub(origin_tokens)
-            .context("the step starts before the resident window")?;
+        let span = kv.local.resident_span(position, kv_len)?;
         kv.local.extend_page_row(local_pages);
-        anyhow::ensure!(
-            local_pages.len() == relative_len.div_ceil(page),
-            "local resident row of {} pages against {relative_len} tokens",
-            local_pages.len()
-        );
-        let remainder = relative_len % page;
-        let local_last = if remainder == 0 { page } else { remainder };
         let global = kv.global.desc_for_len(kv_len)?;
         kv.global.extend_page_indices_i32(global_pages);
         Ok(DecodeRow {
             position,
-            local_last,
-            local_start,
-            local_origin,
+            local_last: span.last_page_len,
+            local_start: span.start,
+            local_origin: kv.local.origin_pages(),
             global_last: global.last_page_len(),
         })
     }
@@ -1301,10 +1284,10 @@ impl GemmaServe {
     }
 
     pub(crate) fn alloc_kv(&self) -> GemmaKv {
-        GemmaKv {
-            local: SlidingLocalKv::new(self.local_pool.clone()),
-            global: self.global_pool.alloc(),
-        }
+        GemmaKv::new(
+            SlidingLocalKv::new(self.local_pool.clone()),
+            self.global_pool.alloc(),
+        )
     }
 
     /// Copy a request's post-prefill KV into cache-owned pages — the
@@ -1395,13 +1378,9 @@ impl GemmaServe {
             entry.token_ids.len()
         );
         let page = self.local_pool.layout().page_size;
-        // The release law's origin at frontier `t`; resolve guaranteed it
-        // does not precede the captured window's origin.
-        let origin_t = if t > self.sliding_window {
-            (t - self.sliding_window) / page
-        } else {
-            0
-        };
+        // Resolve guaranteed the origin at `t` does not precede the captured
+        // window's.
+        let origin_t = crate::kv::origin_pages_at(t, self.sliding_window, page);
         anyhow::ensure!(
             origin_t >= entry.local_origin,
             "restore point {t} precedes the captured window (origin {origin_t} vs {})",
@@ -1460,10 +1439,10 @@ impl GemmaServe {
             &local_dst,
         )?;
         global.advance(t);
-        Ok(GemmaKv {
-            local: SlidingLocalKv::restore(self.local_pool.clone(), resident, origin_t, t),
+        Ok(GemmaKv::new(
+            SlidingLocalKv::restore(self.local_pool.clone(), resident, origin_t, t),
             global,
-        })
+        ))
     }
 
     fn advance_local(&self, kv: &mut GemmaKv, tokens: usize) -> Result<()> {
@@ -1503,30 +1482,12 @@ impl GemmaServe {
         // starts `origin_pages` pages into the sequence, and window_left masks
         // whatever sub-window prefix the first page still carries, so a
         // resident start that is not window-aligned loses nothing.
-        let page = kv.local.layout().page_size;
-        let origin_tokens = kv.local.origin_pages() * page;
-        let rel_kv_len = kv_len
-            .checked_sub(origin_tokens)
-            .context("the resident window starts past the step's frontier")?;
-        let rel_start = start_pos
-            .checked_sub(origin_tokens)
-            .context("the step starts before the resident window")?;
-        let row = kv.local.page_row();
-        anyhow::ensure!(
-            row.len() == rel_kv_len.div_ceil(page),
-            "local resident row of {} pages against {rel_kv_len} tokens",
-            row.len()
-        );
-        let rel_last_page = if rel_kv_len.is_multiple_of(page) {
-            page
-        } else {
-            rel_kv_len % page
-        };
+        let span = kv.local.resident_span(start_pos, kv_len)?;
         let local_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             ctx,
-            &[row],
-            &[rel_last_page],
-            &[rel_start],
+            &[kv.local.page_row()],
+            &[span.last_page_len],
+            &[span.start],
             &[seq_len],
             self.local_geom.num_q_heads,
             self.local_geom.num_kv_heads,
@@ -2019,31 +1980,20 @@ impl GemmaServe {
         global_split.upload_csr(ctx, &csr)
     }
 
-    fn decode_fingerprint(&self, kvs: &[&mut GemmaKv], padded: usize) -> Option<SteadyDecode> {
-        let local_page = self.local_pool.layout().page_size;
-        let global_page = self.global_pool.layout().page_size;
+    fn decode_fingerprint(kvs: &[&mut GemmaKv], padded: usize) -> Option<SteadyDecode> {
         let rows = kvs
             .iter()
             .map(|kv| {
-                let kv = &**kv;
-                let kv_len = kv.local.seq_len().checked_add(1)?;
-                let origin = kv.local.origin_pages();
-                let resident_len = kv_len.checked_sub(origin.checked_mul(local_page)?)?;
-                if resident_len == 0 {
-                    return None;
-                }
-                let local_pages = kv.local.held_pages();
-                let global_pages = kv.global.held_pages();
-                if local_pages != resident_len.div_ceil(local_page)
-                    || global_pages != kv_len.div_ceil(global_page)
-                {
-                    return None;
-                }
+                let position = kv.local.seq_len();
+                let kv_len = position.checked_add(1)?;
+                let span = kv.local.resident_span(position, kv_len).ok()?;
+                kv.global.desc_for_len(kv_len).ok()?;
                 Some(SteadyRow {
+                    kv: kv.id(),
                     kv_len,
-                    local_origin: origin,
-                    local_pages,
-                    global_pages,
+                    local_origin: kv.local.origin_pages(),
+                    local_pages: span.pages,
+                    global_pages: kv.global.held_pages(),
                     global_chunks: kv_len.div_ceil(GLOBAL_SPLIT_CHUNK_TOKENS),
                 })
             })
@@ -2059,7 +2009,7 @@ impl GemmaServe {
         padded: usize,
     ) -> Result<()> {
         let batch = kvs.len();
-        let fresh = self.decode_fingerprint(kvs, padded);
+        let fresh = Self::decode_fingerprint(kvs, padded);
         let regular = arena
             .steady
             .as_ref()
@@ -2417,8 +2367,6 @@ impl GemmaServe {
         }
         validate_tokens(&self.weights, self.local_geom.hidden_size, decode_tokens)?;
         let rows = prefill_len + batch;
-        let page = self.local_pool.layout().page_size;
-        let global_page = self.global_pool.layout().page_size;
         let StepArena {
             host,
             global_tables,
@@ -2462,44 +2410,12 @@ impl GemmaServe {
             let start = kv.local.seq_len();
             let kv_len = start + prompt.len();
             self.check_step_bounds(kv, kv_len)?;
-            let origin_tokens = kv.local.origin_pages() * page;
-            let rel_kv_len = kv_len
-                .checked_sub(origin_tokens)
-                .context("the resident window starts past the step's frontier")?;
-            let rel_start = start
-                .checked_sub(origin_tokens)
-                .context("the step starts before the resident window")?;
-            // A walking prompt parks every page up front, so its resident
-            // row over-covers a mid-walk entry; the attention derives its
-            // kv length from the row, so each entry's row is truncated to
-            // exactly its coverage — an identity for whole-prompt steps —
-            // after asserting the row reaches that far.
+            let span = kv.local.resident_span(start, kv_len)?;
             let row = &mut local_rows[r];
             kv.local.extend_page_row(row);
-            anyhow::ensure!(
-                row.len() >= rel_kv_len.div_ceil(page),
-                "local resident row of {} pages cannot cover {rel_kv_len} tokens",
-                row.len()
-            );
-            row.truncate(rel_kv_len.div_ceil(page));
-            let rel_last = if rel_kv_len.is_multiple_of(page) {
-                page
-            } else {
-                rel_kv_len % page
-            };
+            let global_last = kv.global.desc_for_len(kv_len)?.last_page_len();
             let global_row = &mut prefill_global_rows[r];
             kv.global.extend_page_indices_i32(global_row);
-            anyhow::ensure!(
-                global_row.len() >= kv_len.div_ceil(global_page),
-                "global resident row of {} pages cannot cover {kv_len} tokens",
-                global_row.len()
-            );
-            global_row.truncate(kv_len.div_ceil(global_page));
-            let global_last = if kv_len.is_multiple_of(global_page) {
-                global_page
-            } else {
-                kv_len % global_page
-            };
             for i in 0..prompt.len() {
                 mix_rows.push(start + i, row, kv.local.origin_pages(), global_row)?;
             }
@@ -2510,8 +2426,8 @@ impl GemmaServe {
             row_cursor += prompt.len();
             prefill_global_last.push(global_last);
             prefill_global_start.push(start);
-            local_last.push(rel_last);
-            local_start.push(rel_start);
+            local_last.push(span.last_page_len);
+            local_start.push(span.start);
             seq_lens.push(prompt.len());
         }
         for (r, kv) in decode_kvs.iter().enumerate() {

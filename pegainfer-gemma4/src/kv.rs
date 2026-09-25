@@ -3,8 +3,8 @@
 
 use std::collections::VecDeque;
 
+use anyhow::Context as _;
 use anyhow::Result;
-use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::kv_pool::KvReservation;
 use pegainfer_core::kv_pool::KvState;
@@ -30,12 +30,27 @@ struct ReleasePlan {
     release_pages: usize,
 }
 
+/// The release law: the sliding family's first resident page at `frontier`.
+pub(crate) fn origin_pages_at(frontier: usize, window: usize, page_size: usize) -> usize {
+    frontier.saturating_sub(window) / page_size
+}
+
+/// The least frontier whose origin reaches `origin_pages`, the inverse of
+/// [`origin_pages_at`].
+pub(crate) fn frontier_reaching(origin_pages: usize, window: usize, page_size: usize) -> usize {
+    if origin_pages == 0 {
+        0
+    } else {
+        origin_pages * page_size + window
+    }
+}
+
 fn plan_release(state: ReleaseState, step: ReleaseStep) -> Result<ReleasePlan> {
     let frontier = state
         .frontier
         .checked_add(step.tokens)
         .ok_or_else(|| anyhow::anyhow!("the KV frontier overflows while advancing"))?;
-    let origin_pages = frontier.saturating_sub(step.window) / step.page_size;
+    let origin_pages = origin_pages_at(frontier, step.window, step.page_size);
     let release_pages = origin_pages.checked_sub(state.origin_pages).ok_or_else(|| {
         anyhow::anyhow!(
             "the origin is already {} pages in where a frontier of {frontier} allows {origin_pages}",
@@ -53,6 +68,14 @@ fn plan_release(state: ReleaseState, step: ReleaseStep) -> Result<ReleasePlan> {
         origin_pages,
         release_pages,
     })
+}
+
+/// A step over `[start, kv_len)` seen from the resident row, whose first page
+/// is position zero.
+pub(crate) struct ResidentSpan {
+    pub(crate) start: usize,
+    pub(crate) pages: usize,
+    pub(crate) last_page_len: usize,
 }
 
 /// The local family's state once the window can move: pages are held as
@@ -119,8 +142,31 @@ impl SlidingLocalKv {
         }
     }
 
-    pub(crate) fn layout(&self) -> &KvLayout {
-        self.pool.layout()
+    /// The step writing `[start, kv_len)`, whose admission left the row
+    /// holding exactly the pages that cover it.
+    pub(crate) fn resident_span(&self, start: usize, kv_len: usize) -> Result<ResidentSpan> {
+        let page = self.pool.layout().page_size;
+        let origin_tokens = self.origin_pages * page;
+        let rel_kv_len = kv_len
+            .checked_sub(origin_tokens)
+            .context("the resident window starts past the step's frontier")?;
+        let rel_start = start
+            .checked_sub(origin_tokens)
+            .context("the step starts before the resident window")?;
+        let pages = rel_kv_len.div_ceil(page);
+        anyhow::ensure!(
+            self.resident.len() == pages,
+            "local resident row of {} pages against {rel_kv_len} tokens",
+            self.resident.len()
+        );
+        Ok(ResidentSpan {
+            start: rel_start,
+            pages,
+            last_page_len: match rel_kv_len % page {
+                0 => page,
+                remainder => remainder,
+            },
+        })
     }
 
     pub(crate) fn belongs_to(&self, pool: &KvPool) -> bool {
@@ -167,6 +213,23 @@ impl SlidingLocalKv {
 pub(crate) struct GemmaKv {
     pub(crate) local: SlidingLocalKv,
     pub(crate) global: KvState,
+    /// Distinct for every state built in this process.
+    id: u64,
+}
+
+impl GemmaKv {
+    pub(crate) fn new(local: SlidingLocalKv, global: KvState) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            local,
+            global,
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// Pages a family still has to reserve to cover `kv_len` tokens, given what
@@ -300,10 +363,7 @@ mod tests {
     }
 
     fn kv_from(local: &KvPool, global: &KvPool) -> GemmaKv {
-        GemmaKv {
-            local: SlidingLocalKv::new(local.clone()),
-            global: global.alloc(),
-        }
+        GemmaKv::new(SlidingLocalKv::new(local.clone()), global.alloc())
     }
 
     #[test]

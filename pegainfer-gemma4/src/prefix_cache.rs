@@ -34,11 +34,8 @@ fn resume_point(candidate: ResumeCandidate<'_>, window: usize, prompt: &[u32]) -
         .take_while(|(cached, requested)| cached == requested)
         .count();
     let resume = lcp.min(prompt.len().checked_sub(1)?);
-    let floor = if candidate.local_origin == 0 {
-        MIN_RESUME_TOKENS
-    } else {
-        (candidate.local_origin * LOCAL_PAGE_SIZE + window).max(MIN_RESUME_TOKENS)
-    };
+    let floor = crate::kv::frontier_reaching(candidate.local_origin, window, LOCAL_PAGE_SIZE)
+        .max(MIN_RESUME_TOKENS);
     (resume >= floor).then_some(resume)
 }
 
