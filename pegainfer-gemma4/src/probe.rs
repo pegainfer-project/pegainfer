@@ -238,6 +238,17 @@ mod tests {
     }
 
     #[test]
+    fn previous_generation_gemma3_bails() {
+        let config = serde_json::json!({
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "text_config": {"model_type": "gemma3_text"}
+        });
+        let err = probe_config_json(&config).unwrap_err().to_string();
+        assert!(err.contains("gemma3"), "{err}");
+    }
+
+    #[test]
     fn good_12b_passes() {
         probe_config_json(&good_12b_config()).unwrap();
     }

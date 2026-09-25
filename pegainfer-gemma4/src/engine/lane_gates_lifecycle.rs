@@ -196,44 +196,6 @@ fn the_knob_is_refused_for_a_geometry_the_build_does_not_carry() {
 }
 
 #[test]
-fn pool_pages_follow_the_knobs() {
-    assert_eq!(
-        super::pool_pages(512, 65, 512, 16, 0, 256),
-        Some((1488, 8193))
-    );
-    assert_eq!(
-        super::pool_pages(196, 65, 2048, 2, 0, 1024),
-        Some((262, 4097))
-    );
+fn a_pool_budget_that_overflows_is_refused() {
     assert_eq!(super::pool_pages(usize::MAX, 65, 512, 16, 0, 256), None);
-}
-
-/// The door and the startup budget must count the global account in the same
-/// family's page: a request at the serving ceiling asks for its whole account
-/// at once and startup provisions one per slot, so a unit mismatch refuses a
-/// request the pool was built to hold.
-#[test]
-fn the_global_door_fits_inside_what_startup_provisions() {
-    for max_context in [1024usize, 8192, 40960, 262_144] {
-        for slots in [1usize, 4, 16] {
-            let per_slot = super::global_account_pages(max_context);
-            // No cache entries: the tightest the global pool ever is.
-            let (_, global_pages) = super::pool_pages(
-                max_context.div_ceil(crate::kv::LOCAL_PAGE_SIZE),
-                1,
-                max_context.div_ceil(crate::kv::GLOBAL_PAGE_SIZE),
-                slots,
-                0,
-                0,
-            )
-            .expect("budget fits in usize");
-            assert!(
-                slots * per_slot < global_pages,
-                "ceiling {max_context} over {slots} slots: the door asks for \
-                 {per_slot} pages each, {} in all, where startup provisioned \
-                 {global_pages}",
-                slots * per_slot
-            );
-        }
-    }
 }

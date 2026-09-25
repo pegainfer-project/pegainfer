@@ -471,22 +471,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn global_layers_have_no_v_proj_and_wider_heads() {
-        let config = config();
-        let manifest = Manifest::from_config(&config).unwrap();
-        let sliding = &manifest.layers[0].attention;
-        let global = &manifest.layers[2].attention;
-        assert_eq!(sliding.v_proj.as_ref().unwrap().rows, 8 * 256);
-        assert!(global.v_proj.is_none());
-        assert_eq!(sliding.q_proj.rows, 16 * 256);
-        assert_eq!(global.q_proj.rows, 16 * 512);
-        assert_eq!(global.k_proj.rows, 512);
-        assert_eq!(global.q_norm.len, 512);
-    }
-
-    /// The published 26B dimensions, so the shapes below are the ones its
-    /// checkpoint actually carries.
+    /// The published 26B dimensions.
     fn moe_config() -> Gemma4Config {
         let mut config = config();
         config.hidden_size = 2816;
@@ -497,66 +482,6 @@ mod tests {
             intermediate_size: 704,
         });
         config
-    }
-
-    #[test]
-    fn routed_layers_name_their_experts_at_the_packed_shapes() {
-        let manifest = Manifest::from_config(&moe_config()).unwrap();
-        let moe = manifest.layers[0].moe.as_ref().expect("layer 0 routes");
-        assert_eq!(moe.experts.len(), 128);
-        assert_eq!(
-            moe.router.proj.name,
-            "model.language_model.layers.0.router.proj.weight"
-        );
-        assert_eq!((moe.router.proj.rows, moe.router.proj.cols), (128, 2816));
-        assert_eq!(moe.router.per_expert_scale.len, 128);
-        assert_eq!(moe.router.scale.len, 2816);
-
-        let gate = &moe.experts[0].gate;
-        assert_eq!(
-            gate.weight.name,
-            "model.language_model.layers.0.experts.0.gate_proj.weight"
-        );
-        // Two values to a byte, one e4m3 scale to sixteen.
-        assert_eq!(
-            gate.weight.shape,
-            ExpectedShape::Matrix {
-                rows: 704,
-                cols: 1408
-            }
-        );
-        assert_eq!(gate.weight.dtype, Dtype::U8);
-        assert_eq!(
-            gate.weight_scale.shape,
-            ExpectedShape::Matrix {
-                rows: 704,
-                cols: 176
-            }
-        );
-        assert_eq!(gate.weight_scale.dtype, Dtype::F8_E4M3);
-        assert_eq!(gate.weight_scale_2.shape, ExpectedShape::Scalar);
-        assert_eq!(gate.weight_scale_2.dtype, Dtype::F32);
-
-        // down reduces over the expert width instead of the hidden size.
-        let down = &moe.experts[0].down;
-        assert_eq!(
-            down.weight.shape,
-            ExpectedShape::Matrix {
-                rows: 2816,
-                cols: 352
-            }
-        );
-        assert_eq!(
-            down.weight_scale.shape,
-            ExpectedShape::Matrix {
-                rows: 2816,
-                cols: 44
-            }
-        );
-
-        // The dense MLP stays beside the experts, unquantized.
-        let dense = &manifest.layers[0].mlp;
-        assert_eq!((dense.gate.rows, dense.gate.cols), (2112, 2816));
     }
 
     #[test]

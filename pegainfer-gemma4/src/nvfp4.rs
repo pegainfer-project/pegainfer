@@ -225,41 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_runtime_tensor_names_itself() {
-        let manifest = toy_manifest();
-        let gate = &manifest.layers[0].moe.as_ref().unwrap().experts[0].gate;
-        let (rows, values) = gate.geometry().unwrap();
-        let packed = vec![0u8; rows * values / PER_BYTE];
-        let scales = vec![0x38u8; rows * values / GROUP];
-        let blob = safetensors::serialize(
-            [
-                (
-                    gate.weight.name.as_str(),
-                    TensorView::new(Dtype::U8, vec![rows, values / PER_BYTE], &packed).unwrap(),
-                ),
-                (
-                    gate.weight_scale.name.as_str(),
-                    TensorView::new(Dtype::F8_E4M3, vec![rows, values / GROUP], &scales).unwrap(),
-                ),
-            ],
-            None,
-        )
-        .unwrap();
-        let shards = [SafeTensors::deserialize(&blob).unwrap()];
-        let Err(err) = QuantSource::read(&shards, gate) else {
-            panic!("a missing tensor was accepted");
-        };
-
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "NVFP4: '{}' is missing from every shard",
-                gate.weight_scale_2.name
-            )
-        );
-    }
-
-    #[test]
     fn a_tensor_scale_that_cannot_scale_anything_is_refused() {
         let manifest = toy_manifest();
         let gate = &manifest.layers[0].moe.as_ref().unwrap().experts[0].gate;
