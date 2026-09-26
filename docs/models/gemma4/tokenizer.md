@@ -41,7 +41,7 @@ their revisions and hash sets and running each; that is not what this suite does
 `test_data/gemma4-tokenizer-golden.json` is dumped by
 
 ```bash
-python tools/accuracy/dump_gemma4_tokenizer_golden.py <model-dir> <out.json> \
+python tools/accuracy/dump_chat_template_golden.py gemma4 <model-dir> <out.json> \
   --source-repo google/gemma-4-12B-it --revision <sha>
 ```
 
@@ -50,7 +50,7 @@ selects it. `PEGAINFER_GEMMA4_FIXTURE_TAG=12b` (the default) keeps the committed
 and any other tag reads `test_data/gemma4-<tag>-tokenizer-golden.json`:
 
 ```bash
-python tools/accuracy/dump_gemma4_tokenizer_golden.py <31b-checkpoint-dir> \
+python tools/accuracy/dump_chat_template_golden.py gemma4 <31b-checkpoint-dir> \
   test_data/gemma4-31b-tokenizer-golden.json \
   --source-repo google/gemma-4-31B-it --revision <sha>
 

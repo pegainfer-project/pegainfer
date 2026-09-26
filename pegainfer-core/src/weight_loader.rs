@@ -393,23 +393,29 @@ fn tensor_bf16_cow<'d>(
     }
 }
 
-/// Typed F32 payload with dtype and 1D-shape validation. Aligned payloads
-/// borrow zero-copy; misaligned ones (legal in safetensors) decode
-/// little-endian into an owned buffer, since a misaligned f32 view is UB.
+/// Typed F32 payload with 1D-shape validation. A BF16 vector is widened
+/// (bf16 → f32 is exact, and the reference implementations upcast these
+/// vectors at the point of use). Aligned f32 payloads borrow zero-copy;
+/// misaligned ones (legal in safetensors) decode little-endian into an owned
+/// buffer, since a misaligned f32 view is UB.
 #[allow(clippy::cast_ptr_alignment)]
 fn tensor_f32_cow<'d>(
     tensor: &safetensors::tensor::TensorView<'d>,
     name: &str,
 ) -> Result<Cow<'d, [f32]>> {
     anyhow::ensure!(
-        tensor.dtype() == Dtype::F32,
-        "Tensor '{name}': expected dtype F32, got {:?}",
-        tensor.dtype()
-    );
-    anyhow::ensure!(
         tensor.shape().len() == 1,
         "Tensor '{name}': expected 1D shape, got {:?}",
         tensor.shape()
+    );
+    if tensor.dtype() == Dtype::BF16 {
+        let bits = tensor_bf16_cow(tensor, name)?;
+        return Ok(Cow::Owned(bits.iter().map(|&b| f32::from(b)).collect()));
+    }
+    anyhow::ensure!(
+        tensor.dtype() == Dtype::F32,
+        "Tensor '{name}': expected dtype F32 or BF16, got {:?}",
+        tensor.dtype()
     );
     let data = tensor.data();
     anyhow::ensure!(
@@ -759,10 +765,16 @@ pub fn load_tensor_2d(
     shards: &[SafeTensors],
     weight_map: &HashMap<String, usize>,
     name: &str,
+    rows: usize,
+    cols: usize,
 ) -> Result<DeviceMatrix> {
     let tensor = find_tensor(shards, weight_map, name)?;
     let shape = tensor.shape();
-    DeviceMatrix::from_safetensors(ctx, tensor.data(), shape[0], shape[1])
+    anyhow::ensure!(
+        shape.len() == 2 && shape[0] == rows && shape[1] == cols,
+        "Tensor '{name}' has shape {shape:?}, expected [{rows}, {cols}]"
+    );
+    DeviceMatrix::from_safetensors(ctx, tensor.data(), rows, cols)
 }
 
 fn tensor_2d_dims(
@@ -921,8 +933,9 @@ pub fn load_tensor_1d_f32_shard(
     upload_f32(ctx, name, &elems[offset..offset + len])
 }
 
-/// Load a 1D F32 tensor to GPU as CudaSlice<f32>.
-/// For weights stored in float32 (e.g., A_log, norm.weight in linear attention).
+/// Load a 1D F32 tensor to GPU as CudaSlice<f32>; a BF16 vector is widened
+/// (see [`tensor_f32_cow`]). For weights stored in float32 (e.g., A_log,
+/// norm.weight in linear attention).
 pub fn load_tensor_1d_f32(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -1085,12 +1098,16 @@ mod tests {
     }
 
     #[test]
-    fn tensor_f32_cow_rejects_wrong_dtype_and_rank() {
+    fn tensor_f32_cow_accepts_bf16_and_rejects_invalid_dtype_or_rank() {
         let bytes = vec![0u8; 8];
         let bf16_view = TensorView::new(Dtype::BF16, vec![4], &bytes).unwrap();
-        assert!(tensor_f32_cow(&bf16_view, "w").is_err());
+        assert!(tensor_f32_cow(&bf16_view, "w").is_ok());
+        let f16_view = TensorView::new(Dtype::F16, vec![4], &bytes).unwrap();
+        assert!(tensor_f32_cow(&f16_view, "w").is_err());
         let f32_2d_view = TensorView::new(Dtype::F32, vec![2, 1], &bytes).unwrap();
         assert!(tensor_f32_cow(&f32_2d_view, "w").is_err());
+        let bf16_2d_view = TensorView::new(Dtype::BF16, vec![2, 2], &bytes).unwrap();
+        assert!(tensor_f32_cow(&bf16_2d_view, "w").is_err());
     }
 
     #[test]

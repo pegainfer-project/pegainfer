@@ -719,7 +719,7 @@ impl Qwen35TpExecutor {
         let world_size = device_ordinals.len();
         let mut models = Vec::with_capacity(world_size);
         for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
-            models.push(Qwen35Model::from_safetensors_with_runtime(
+            models.push(Qwen35Model::from_safetensors_with_runtime_and_capacity(
                 model_path,
                 ModelRuntimeConfig {
                     enable_cuda_graph,
@@ -727,6 +727,7 @@ impl Qwen35TpExecutor {
                     device_ordinal,
                     prefix_snapshot_bytes,
                 },
+                max_batch,
             )?);
         }
         let first = models

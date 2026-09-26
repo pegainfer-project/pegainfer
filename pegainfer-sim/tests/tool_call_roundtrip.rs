@@ -24,6 +24,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use pegainfer_frontend::vllm::ParserSelection;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::start_engine;
 use reqwest::Client;
@@ -152,6 +153,65 @@ async fn streaming_tool_call_reassembles_across_chunks() -> Result<()> {
     server.shutdown().await
 }
 
+/// The `Auto` selection reads the model *path*: with no family name in it, the
+/// registry finds nothing and a tools-bearing request fails instead of parsing.
+/// This is the failure mode an explicit `--tool-call-parser` exists to avoid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_tool_parser_fails_on_a_path_without_a_family_name() -> Result<()> {
+    let server = ToolCallSimServer::spawn_with(ParserSelection::Auto, "sim-toolcall-").await?;
+    let client = test_client()?;
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&chat_request(false))
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if status.is_success() {
+        bail!("a tools-bearing request must not succeed when no parser resolves: {text}");
+    }
+
+    server.shutdown().await
+}
+
+/// The same neutral path with `--tool-call-parser qwen3_xml`: the explicit name
+/// decides, so the directory naming no longer gates tool-call parsing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_tool_parser_parses_on_a_path_without_a_family_name() -> Result<()> {
+    let server = ToolCallSimServer::spawn_with(
+        ParserSelection::Explicit("qwen3_xml".to_string()),
+        "sim-toolcall-",
+    )
+    .await?;
+    let client = test_client()?;
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&chat_request(false))
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        bail!("explicit parser selection returned {status}: {text}");
+    }
+    let body: Value =
+        serde_json::from_str(&text).context("failed to parse non-streaming chat response")?;
+    let tool_calls = body["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .ok_or_else(|| anyhow!("response has no message.tool_calls array: {body}"))?;
+    if tool_calls.len() != 1 {
+        bail!(
+            "expected exactly one tool call, got {}: {body}",
+            tool_calls.len()
+        );
+    }
+    assert_tool_call_is_get_weather_sf(&tool_calls[0], &body)?;
+
+    server.shutdown().await
+}
+
 fn assert_tool_call_is_get_weather_sf(tool_call: &Value, body: &Value) -> Result<()> {
     if tool_call["type"] != json!("function") {
         bail!("tool call is not type=function: {body}");
@@ -204,6 +264,13 @@ struct ToolCallSimServer {
 
 impl ToolCallSimServer {
     async fn spawn() -> Result<Self> {
+        Self::spawn_with(ParserSelection::Auto, "qwen3-sim-toolcall-").await
+    }
+
+    /// `family` becomes the temp model-directory prefix, which is exactly the
+    /// string `Auto` parser selection matches against — a neutral prefix proves
+    /// the explicit selection is what decides, not the directory name.
+    async fn spawn_with(parser: ParserSelection, family: &str) -> Result<Self> {
         // Script = the three tool-call chunks (ids 1/2/3, see fuse_tokenizer_json)
         // plus 6 (EOS). The trailing EOS is *not* incremental-detokenizer buffering:
         // the upstream frontend's terminal-stop-token suppression drops the last
@@ -213,7 +280,7 @@ impl ToolCallSimServer {
         // token and truncate the JSON to `{"location": "S`. The throwaway EOS
         // absorbs the suppression instead. Engine-side contract alignment: #584.
         let script = vec![1u32, 2, 3, 6];
-        let model_dir = qwen_model_dir()?;
+        let model_dir = sim_model_dir(family)?;
         let port = reserve_loopback_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
 
@@ -228,6 +295,7 @@ impl ToolCallSimServer {
                 std::future::ready(Ok(engine.into())),
                 &model_path,
                 vec![MODEL_NAME.to_string()],
+                parser,
                 port,
                 Some(128),
                 server_shutdown,
@@ -273,13 +341,13 @@ impl ToolCallSimServer {
 /// parser from the *model path string* (`config.model`) by case-insensitive
 /// substring match against a registry (`qwen3` -> `qwen3_xml`) — a random temp
 /// dir has no model-family name and would fail with `ParserUnavailableForModel`.
-/// The `qwen3-` prefix makes `Auto` select the qwen3 XML parser exactly as it
-/// would for `models/Qwen3-4B` in production.
-fn qwen_model_dir() -> Result<TempDir> {
+/// The `family` prefix decides that match: pass `qwen3-…` to exercise `Auto`, or
+/// a neutral prefix to prove an explicit selection does not need the name.
+fn sim_model_dir(family: &str) -> Result<TempDir> {
     let dir = tempfile::Builder::new()
-        .prefix("qwen3-sim-toolcall-")
+        .prefix(family)
         .tempdir()
-        .context("failed to create qwen-prefixed temp model dir")?;
+        .with_context(|| format!("failed to create {family} temp model dir"))?;
 
     fs::write(dir.path().join("tokenizer.json"), fuse_tokenizer_json()?)
         .context("failed to write tool-call tokenizer.json")?;

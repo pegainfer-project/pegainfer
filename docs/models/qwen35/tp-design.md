@@ -289,7 +289,9 @@ under TP".
 
 **Capture/replay**: startup pre-capture sweep ported from qwen3 (`executor.rs:1424`): `Warmup` (port `warmup_tp_collective`, one all-reduce per bucket message size — lazy NCCL connect inside capture wedges), `Capture`/`Launch` per bucket `[1,2,4,8,16,32,64]` with synthetic rows, `Finalize` asserts all captured; dedicated 600 s abort watchdog (60 s startup timeout too small). New `TpWorkerCommand::Precapture { phase }` via existing exact-rank dispatch. Serve time: replay-only (`ensure is_captured` + `launch_captured`), never capture mid-serving. Sampling/logprobs stay rank-0 host-side outside the graph. Mixed ticks: prefill eager + decode replay; collective order canonical per plan. `TpWorkerState` declares graph state before `model` so graphs drop before the NCCL comm (teardown hang precedent qwen3 `executor.rs:3076`).
 
-**Memory** (27B TP2/rank): weights ~17.5 GB + KV pool ~5.9 GiB + slot state reserve ~6.1 GiB + buffers/graphs ~0.3 + scratch/NCCL ~2.5 ≈ 32 GiB → fits 48 GB. 9B TP2 slot state ~1.6 GiB. Loader already reserves `2 × max_batch × bytes_per_request` before sizing KV.
+**Memory** (27B TP2/rank): weights ~26.9 GB + KV pool ~5.9 GiB + slot state reserve ~6.1 GiB + buffers/graphs ~0.3 + scratch/NCCL ~2.5 ≈ 41.7 GiB → fits 48 GB, but with little room to grow the KV pool. 9B TP2 slot state ~1.6 GiB. Loader already reserves `2 × max_batch × bytes_per_request` before sizing KV.
+
+(The weights figure was corrected from ~17.5 GB in 2026-09: reading the tensor headers of `Qwen3.5-27B` / `Qwen3.8-27B` gives a text tower of 53.79 GB bf16 (decoder 48.71 + embed_tokens 2.54 + lm_head 2.54) — 64 layers plus the untied `embed_tokens`/`lm_head` pair at 248,320 × 5120 — so TP2 is ~26.9 GB per rank. Observed on 2× L20 at gate startup: 28.3 GB placed on rank 0's device before decode traffic.)
 
 **Validation ladder**: CPU lib suite → TP2 graph HF gate (9B: sequential + bucket-straddling + post-compaction replay vs eager stats) → e2e scheduler graph variant → serving_tp2 graph smoke → 27B TP2 regression unchanged (group-6 stays eager) → per-bucket eager-vs-graph decode benchmark recorded in `bench_snapshots/`.
 

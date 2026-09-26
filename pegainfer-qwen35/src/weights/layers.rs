@@ -43,10 +43,11 @@ pub(crate) struct LinearAttentionLayer {
     pub(crate) conv1d_weight: DeviceVec,
     /// dt_bias: [local_linear_num_value_heads] bf16
     pub(crate) dt_bias: DeviceVec,
-    /// A_log: [local_linear_num_value_heads] f32
+    /// A_log: [local_linear_num_value_heads] f32 (f32 storage, or bf16 storage
+    /// widened exactly at load — Qwen3.5 stores f32, Qwen3.8 bf16)
     pub(crate) a_log: CudaSlice<f32>,
-    /// RMSNorm weight for output normalization: [value_head_dim] f32 —
-    /// head-shared, so replicated on every rank.
+    /// RMSNorm weight for output normalization: [value_head_dim] f32 (same
+    /// storage/widening as `a_log`) — head-shared, so replicated on every rank.
     pub(crate) norm_weight: CudaSlice<f32>,
     /// Output projection: [hidden_size, local_linear_z_dim] (row-parallel;
     /// the layer all-reduces the partial hidden sum under TP).
@@ -165,7 +166,12 @@ impl LinearAttentionLayer {
                 &format!("{prefix}.A_log"),
                 src.linear_value_heads,
             )?,
-            norm_weight: src.tensor_1d_f32(&format!("{prefix}.norm.weight"))?,
+            norm_weight: load_tensor_1d_f32(
+                src.ctx,
+                src.shards,
+                src.weight_map,
+                &format!("{prefix}.norm.weight"),
+            )?,
             out_proj: src
                 .col_shard_if_needed(&format!("{prefix}.out_proj.weight"), src.linear_z)?,
         })
@@ -180,6 +186,10 @@ pub(super) struct WeightSource<'a> {
     shards: &'a [SafeTensors<'a>],
     weight_map: &'a HashMap<String, usize>,
     geometry: LocalGeometry,
+    /// Model width every unsharded projection must carry, so a checkpoint whose
+    /// tensors disagree with its `config.json` stops at the loader instead of
+    /// reaching a GEMM sized from the config.
+    hidden: usize,
     /// Full-attention q_proj rows as per-head [q, gate] chunks.
     gated_q: (usize, usize),
     /// o_proj column shard over the full-attention q dim.
@@ -211,6 +221,7 @@ impl<'a> WeightSource<'a> {
             shards,
             weight_map,
             geometry,
+            hidden: config.hidden_size,
             gated_q: full_attention_gated_q_shard_range(config, geometry),
             q_cols: geometry.shard_range(config.full_attn_q_dim()),
             kv_rows: geometry.shard_range(config.full_attn_kv_dim()),
@@ -222,16 +233,12 @@ impl<'a> WeightSource<'a> {
         }
     }
 
-    pub(super) fn tensor_2d(&self, name: &str) -> Result<DeviceMatrix> {
-        load_tensor_2d(self.ctx, self.shards, self.weight_map, name)
+    pub(super) fn tensor_2d(&self, name: &str, rows: usize, cols: usize) -> Result<DeviceMatrix> {
+        load_tensor_2d(self.ctx, self.shards, self.weight_map, name, rows, cols)
     }
 
     pub(super) fn tensor_1d(&self, name: &str) -> Result<DeviceVec> {
         load_tensor_1d(self.ctx, self.shards, self.weight_map, name)
-    }
-
-    pub(super) fn tensor_1d_f32(&self, name: &str) -> Result<CudaSlice<f32>> {
-        load_tensor_1d_f32(self.ctx, self.shards, self.weight_map, name)
     }
 
     fn row_shard_if_needed(
@@ -249,7 +256,7 @@ impl<'a> WeightSource<'a> {
                 rows,
             )
         } else {
-            self.tensor_2d(name)
+            self.tensor_2d(name, rows, self.hidden)
         }
     }
 
@@ -268,7 +275,7 @@ impl<'a> WeightSource<'a> {
                 cols,
             )
         } else {
-            self.tensor_2d(name)
+            self.tensor_2d(name, self.hidden, cols)
         }
     }
 
@@ -298,7 +305,7 @@ impl<'a> WeightSource<'a> {
         if self.geometry.is_sharded() {
             load_tensor_1d_f32_shard(self.ctx, self.shards, self.weight_map, name, offset, len)
         } else {
-            self.tensor_1d_f32(name)
+            load_tensor_1d_f32(self.ctx, self.shards, self.weight_map, name)
         }
     }
 
@@ -306,7 +313,8 @@ impl<'a> WeightSource<'a> {
     /// three global segments rather than cutting one flat row range.
     fn linear_in_proj_qkv(&self, name: &str) -> Result<DeviceMatrix> {
         if !self.geometry.is_sharded() {
-            return self.tensor_2d(name);
+            let rows: usize = self.linear_qkv.iter().map(|&(_, len)| len).sum();
+            return self.tensor_2d(name, rows, self.hidden);
         }
         load_tensor_2d_row_stitch(
             self.ctx,
@@ -336,7 +344,7 @@ impl<'a> WeightSource<'a> {
     /// (keeping each head's [q, gate] chunk adjacent), not as one flat range.
     fn gated_q_proj(&self, name: &str) -> Result<DeviceMatrix> {
         if !self.geometry.is_sharded() {
-            return self.tensor_2d(name);
+            return self.tensor_2d(name, self.gated_q.1, self.hidden);
         }
         let (row_offset, rows) = self.gated_q;
         load_tensor_2d_row_shard(
@@ -428,9 +436,8 @@ mod tests {
     }
 
     fn test_geometry(rank: usize, world_size: usize) -> LocalGeometry {
-        let config = test_config();
         let tp = TensorParallelConfig::try_from((rank, world_size)).unwrap();
-        LocalGeometry::try_new(&config, tp).unwrap()
+        LocalGeometry::try_new(&test_config(), tp).unwrap()
     }
 
     #[test]

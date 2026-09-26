@@ -146,7 +146,7 @@ Only **`qwen3`** is enabled by default, including in the prebuilt binary. Build 
 | Model line | Attention / experts | Cargo feature | Serving scope and guide |
 | --- | --- | --- | --- |
 | **Qwen3 · dense 0.6B to 32B** | Full attention, GQA | `qwen3` · default | Greedy + sampling, tensor parallel, prefix cache, KV offload; DFlash / DSpark on 4B. [Model page](https://pegainfer.org/models/qwen3-4b/) |
-| **Qwen3.5 · dense 0.8B to 27B** | Gated DeltaNet + full attention | `qwen35` | Text-only BF16; build-time Triton. [Model page](https://pegainfer.org/models/qwen35/) |
+| **Qwen3.5 · dense 0.8B to 27B** | Gated DeltaNet + full attention | `qwen35` | Text-only BF16; build-time Triton. Qwen3.8-27B rides the same feature. [Model page](https://pegainfer.org/models/qwen35/) · [Qwen3.8 support record](docs/models/qwen35/support-qwen38.md) |
 | **Gemma 4 · 12B and 26B-A4B** | Sliding-window + global attention; NVFP4 routed experts on 26B | `gemma4` | Text-only, single GPU, batched decode and optional chunked prefill. [Model page](https://pegainfer.org/models/gemma4/) |
 | **DeepSeek-V2-Lite** | MLA + MoE | `deepseek-v2-lite` | 2-GPU EP2 correctness path. [Status and limits](docs/models/deepseek-v2-lite/status.md) |
 | **Kimi-K2 / K2.5** | MLA + MoE, Marlin INT4 | `kimi-k2` | 8-GPU expert parallelism. [Model roadmap](docs/models/kimi-k2/roadmap.md) |

@@ -99,16 +99,19 @@ const STATES_PER_DECODE_SLOT: usize = 2;
 const MIN_KV_PAGES: usize = 64;
 
 impl Qwen35Model {
+    /// `max_batch` is the requested concurrent-request cap in `1..=MAX_BATCH`.
     pub fn from_safetensors_with_options(
         model_path: &str,
         enable_cuda_graph: bool,
+        max_batch: usize,
     ) -> Result<Self> {
-        Self::from_safetensors_with_runtime(
+        Self::from_safetensors_with_runtime_and_capacity(
             model_path,
             ModelRuntimeConfig {
                 enable_cuda_graph,
                 ..Default::default()
             },
+            max_batch,
         )
     }
 }
@@ -135,18 +138,7 @@ impl Qwen35Model {
         )
     }
 
-    pub(crate) fn from_safetensors_with_runtime(
-        model_path: &str,
-        runtime: ModelRuntimeConfig,
-    ) -> Result<Self> {
-        Self::from_safetensors_with_runtime_and_capacity(
-            model_path,
-            runtime,
-            super::batch_decode_graph::MAX_BATCH,
-        )
-    }
-
-    fn from_safetensors_with_runtime_and_capacity(
+    pub(crate) fn from_safetensors_with_runtime_and_capacity(
         model_path: &str,
         runtime: ModelRuntimeConfig,
         max_batch: usize,
@@ -203,7 +195,11 @@ impl Qwen35Model {
         let src = layers::WeightSource::new(&ctx, &shards, &weight_map, &config, geometry);
 
         debug!("Loading embeddings to GPU");
-        let embed_tokens = src.tensor_2d(&format!("{}.embed_tokens.weight", wp))?;
+        let embed_tokens = src.tensor_2d(
+            &format!("{}.embed_tokens.weight", wp),
+            config.vocab_size,
+            config.hidden_size,
+        )?;
         debug!(
             "embed_tokens: [{}, {}]",
             embed_tokens.rows, embed_tokens.cols
@@ -213,15 +209,7 @@ impl Qwen35Model {
             info!("output projection: tied embed_tokens");
             None
         } else {
-            let m = src.tensor_2d("lm_head.weight")?;
-            anyhow::ensure!(
-                m.rows == config.vocab_size && m.cols == config.hidden_size,
-                "lm_head.weight is [{}, {}], expected [vocab {}, hidden {}]",
-                m.rows,
-                m.cols,
-                config.vocab_size,
-                config.hidden_size,
-            );
+            let m = src.tensor_2d("lm_head.weight", config.vocab_size, config.hidden_size)?;
             info!("output projection: untied lm_head [{}, {}]", m.rows, m.cols);
             Some(m)
         };

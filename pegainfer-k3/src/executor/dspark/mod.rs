@@ -259,16 +259,6 @@ fn build_yarn_rope_tables(seq_len: usize) -> (Vec<bf16>, Vec<bf16>) {
     (cos, sin)
 }
 
-fn ensure_matrix(m: &DeviceMatrix, name: &str, rows: usize, cols: usize) -> Result<()> {
-    ensure!(
-        m.rows == rows && m.cols == cols,
-        "dspark tensor {name} is [{}, {}], expected [{rows}, {cols}]",
-        m.rows,
-        m.cols
-    );
-    Ok(())
-}
-
 impl K3DsparkModel {
     pub(crate) fn load(ctx: &DeviceContext, path: &Path, max_model_len: usize) -> Result<Self> {
         validate_config(path)?;
@@ -288,22 +278,25 @@ impl K3DsparkModel {
                 &shards,
                 &weight_map,
                 &format!("{p}.self_attn.q_proj.weight"),
+                DSPARK_Q_DIM,
+                K3_HIDDEN,
             )?;
             let k = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{p}.self_attn.k_proj.weight"),
+                DSPARK_KV_DIM,
+                K3_HIDDEN,
             )?;
             let v = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{p}.self_attn.v_proj.weight"),
+                DSPARK_KV_DIM,
+                K3_HIDDEN,
             )?;
-            ensure_matrix(&q, "q_proj", DSPARK_Q_DIM, K3_HIDDEN)?;
-            ensure_matrix(&k, "k_proj", DSPARK_KV_DIM, K3_HIDDEN)?;
-            ensure_matrix(&v, "v_proj", DSPARK_KV_DIM, K3_HIDDEN)?;
             let qkv = DeviceMatrix::vstack(ctx, &[&q, &k, &v])?;
             drop((q, k, v));
             let gate = load_tensor_2d(
@@ -311,15 +304,17 @@ impl K3DsparkModel {
                 &shards,
                 &weight_map,
                 &format!("{p}.mlp.gate_proj.weight"),
+                DSPARK_INTER,
+                K3_HIDDEN,
             )?;
             let up = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{p}.mlp.up_proj.weight"),
+                DSPARK_INTER,
+                K3_HIDDEN,
             )?;
-            ensure_matrix(&gate, "gate_proj", DSPARK_INTER, K3_HIDDEN)?;
-            ensure_matrix(&up, "up_proj", DSPARK_INTER, K3_HIDDEN)?;
             let gate_up = DeviceMatrix::vstack(ctx, &[&gate, &up])?;
             drop((gate, up));
             let o_proj = load_tensor_2d(
@@ -327,15 +322,17 @@ impl K3DsparkModel {
                 &shards,
                 &weight_map,
                 &format!("{p}.self_attn.o_proj.weight"),
+                K3_HIDDEN,
+                DSPARK_Q_DIM,
             )?;
-            ensure_matrix(&o_proj, "o_proj", K3_HIDDEN, DSPARK_Q_DIM)?;
             let down = load_tensor_2d(
                 ctx,
                 &shards,
                 &weight_map,
                 &format!("{p}.mlp.down_proj.weight"),
+                K3_HIDDEN,
+                DSPARK_INTER,
             )?;
-            ensure_matrix(&down, "down_proj", K3_HIDDEN, DSPARK_INTER)?;
             layers.push(DsparkLayer {
                 input_ln: load_tensor_1d(
                     ctx,
@@ -368,12 +365,30 @@ impl K3DsparkModel {
             });
         }
 
-        let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
-        ensure_matrix(&fc, "fc", K3_HIDDEN, K3_DSPARK_CONTEXT_DIM)?;
-        let markov_w1 = load_tensor_2d(ctx, &shards, &weight_map, "markov_head.markov_w1.weight")?;
-        let markov_w2 = load_tensor_2d(ctx, &shards, &weight_map, "markov_head.markov_w2.weight")?;
-        ensure_matrix(&markov_w1, "markov_w1", K3_VOCAB, DSPARK_MARKOV_RANK)?;
-        ensure_matrix(&markov_w2, "markov_w2", K3_VOCAB, DSPARK_MARKOV_RANK)?;
+        let fc = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "fc.weight",
+            K3_HIDDEN,
+            K3_DSPARK_CONTEXT_DIM,
+        )?;
+        let markov_w1 = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "markov_head.markov_w1.weight",
+            K3_VOCAB,
+            DSPARK_MARKOV_RANK,
+        )?;
+        let markov_w2 = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "markov_head.markov_w2.weight",
+            K3_VOCAB,
+            DSPARK_MARKOV_RANK,
+        )?;
 
         let (cos_host, sin_host) = build_yarn_rope_tables(cache_len);
         let cos_cache = DeviceVec::from_host(ctx, &cos_host)?;

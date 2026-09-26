@@ -22,7 +22,7 @@ use vllm_server::CorsConfig;
 use vllm_server::DEFAULT_KEEP_ALIVE_TIMEOUT;
 use vllm_server::GenerationConfigMode;
 use vllm_server::HttpListenerMode;
-use vllm_server::ParserSelection;
+pub use vllm_server::ParserSelection;
 use vllm_server::RendererSelection;
 use vllm_text::backend::hf::HfOverrides;
 
@@ -30,6 +30,7 @@ use crate::engine::LaunchedEngine;
 
 mod bridge;
 mod lora;
+mod reasoning_effort;
 mod request_contract;
 mod wire;
 
@@ -63,10 +64,15 @@ impl ModelLenConfig {
 /// Pass `max_model_len: None` to read `max_position_embeddings` from
 /// `model_path/config.json`; pass `Some(n)` when the path has no config
 /// (e.g. a HuggingFace model id for the sim frontend).
+/// `tool_call_parser` selects the output tool-call parser: `Auto` matches the
+/// model *path* by substring, which resolves a Qwen3.8 directory to the generic
+/// `qwen3` pattern rather than `qwen3.5`; name the parser explicitly when the
+/// checkpoint's tool format differs (e.g. `qwen3_coder`).
 pub async fn serve(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     port: u16,
     max_model_len: Option<u32>,
     shutdown: CancellationToken,
@@ -75,6 +81,7 @@ pub async fn serve(
         engine,
         model_path,
         served_model_name,
+        tool_call_parser,
         port,
         max_model_len,
         1,
@@ -91,6 +98,7 @@ pub async fn serve_with_engine_count(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     port: u16,
     max_model_len: Option<u32>,
     engine_count: usize,
@@ -100,6 +108,7 @@ pub async fn serve_with_engine_count(
         engine,
         model_path.to_string_lossy().into_owned(),
         served_model_name,
+        tool_call_parser,
         "0.0.0.0".to_string(),
         port,
         resolve_max_model_len(model_path, max_model_len),
@@ -115,6 +124,7 @@ pub async fn serve_prefill_only_with_engine_count(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     port: u16,
     max_model_len: Option<u32>,
     engine_count: usize,
@@ -124,6 +134,7 @@ pub async fn serve_prefill_only_with_engine_count(
         engine,
         model_path.to_string_lossy().into_owned(),
         served_model_name,
+        tool_call_parser,
         "0.0.0.0".to_string(),
         port,
         resolve_max_model_len(model_path, max_model_len),
@@ -138,6 +149,7 @@ pub async fn serve_model_with_lora_routes(
     engine: crate::engine::Engine,
     model_id: impl Into<String>,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     lora_modules: Vec<LoraModule>,
     port: u16,
     max_model_len: u32,
@@ -160,6 +172,7 @@ pub async fn serve_model_with_lora_routes(
         std::future::ready(Ok(LaunchedEngine::Stepped(engine))),
         model_id,
         served_model_name.clone(),
+        tool_call_parser,
         "0.0.0.0".to_string(),
         port,
         max_model_len,
@@ -183,6 +196,7 @@ async fn serve_model_on_host(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_id: String,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     host: String,
     port: u16,
     max_model_len: u32,
@@ -193,6 +207,7 @@ async fn serve_model_on_host(
         engine,
         model_id,
         served_model_name,
+        tool_call_parser,
         host,
         port,
         max_model_len,
@@ -207,6 +222,7 @@ async fn serve_model_on_host_with_router_extension<F>(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_id: String,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     host: String,
     port: u16,
     max_model_len: u32,
@@ -376,7 +392,7 @@ where
         generation_config: GenerationConfigMode::Auto,
         served_model_name,
         listener_mode: HttpListenerMode::BindTcp { host, port },
-        tool_call_parser: ParserSelection::default(),
+        tool_call_parser,
         reasoning_parser: ParserSelection::default(),
         tool_strict_level: ToolStrictLevel::default(),
         renderer: RendererSelection::default(),
@@ -405,8 +421,10 @@ where
         tls: None,
     };
 
-    let result =
-        vllm_server::serve_with_router_extension(config, server_shutdown, extend_router).await;
+    let result = vllm_server::serve_with_router_extension(config, server_shutdown, move |router| {
+        reasoning_effort::normalize_chat_requests(extend_router(router))
+    })
+    .await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),
     // then collect the engine task. If the server failed while the engine is
     // still loading, the uncancellable blocking load must finish first.

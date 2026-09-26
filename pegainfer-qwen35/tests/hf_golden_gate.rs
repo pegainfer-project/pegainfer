@@ -46,51 +46,6 @@ const MARGIN_TOL: f32 = 0.20;
 const MEAN_TOL: f32 = 0.06;
 const P99_TOL: f32 = 0.20;
 
-/// Size key from config CONTENT, not the directory name; keep in sync with
-/// `SIZE_NAMES` in `tools/accuracy/dump_qwen35_hf_golden.py`.
-fn fixture_size_name(model_path: &str) -> Option<&'static str> {
-    let config_path = Path::new(model_path).join("config.json");
-    let raw = std::fs::read_to_string(&config_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("parse {}: {e}", config_path.display()));
-    let t = v.get("text_config").unwrap_or(&v);
-    let hidden = t.get("hidden_size").and_then(serde_json::Value::as_u64);
-    let layers = t
-        .get("num_hidden_layers")
-        .and_then(serde_json::Value::as_u64);
-    let (Some(hidden), Some(layers)) = (hidden, layers) else {
-        panic!(
-            "{} has no hidden_size/num_hidden_layers",
-            config_path.display()
-        );
-    };
-    match (hidden, layers) {
-        (1024, 24) => Some("0.8b"),
-        (2048, 24) => Some("2b"),
-        (2560, 32) => Some("4b"),
-        (4096, 32) => Some("9b"),
-        (5120, 64) => Some("27b"),
-        _ => None,
-    }
-}
-
-/// Sizes whose fixtures are committed in `test_data/`; a missing file for
-/// these is a broken checkout, not an ungenerated fixture.
-const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.8b", "2b", "4b", "9b", "27b"];
-
-fn default_fixture_path(size: &str, long: bool) -> String {
-    let kind = if long {
-        "-hf-long-golden"
-    } else {
-        "-hf-golden"
-    };
-    format!(
-        "{}/../test_data/qwen35-{size}{kind}.safetensors",
-        env!("CARGO_MANIFEST_DIR")
-    )
-}
-
 const BUCKET_STRADDLES: [usize; 2] = [5, 3];
 const SLOT_COMPACTION_BATCH: usize = 5;
 const SLOT_COMPACTION_DROP_INDEX: usize = 1;
@@ -131,6 +86,50 @@ fn safetensors_metadata(bytes: &[u8]) -> HashMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The fixture is chosen by the checkpoint's config bytes, not a geometry
+/// table: every committed fixture records `config_sha256` in its safetensors
+/// metadata, so the gate scans the committed fixtures and keeps the one whose
+/// recorded hash matches the local `config.json`. [`check_fixture_metadata`]
+/// then re-asserts that hash (plus `model_revision`) before a single logit is
+/// compared.
+fn find_default_fixture(model_path: &str, long: bool) -> String {
+    let config = Path::new(model_path).join("config.json");
+    let hash = sha256_file(&config).unwrap_or_else(|| panic!("read {}", config.display()));
+    let suffix = if long {
+        "-hf-long-golden.safetensors"
+    } else {
+        "-hf-golden.safetensors"
+    };
+    let dir = format!("{}/../test_data", env!("CARGO_MANIFEST_DIR"));
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {dir}: {e}")) {
+        let path = entry.unwrap_or_else(|e| panic!("read {dir}: {e}")).path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with("qwen3") && name.ends_with(suffix)) {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        if safetensors_metadata(&bytes).get("config_sha256") == Some(&hash) {
+            matches.push(path);
+        }
+    }
+    match matches.len() {
+        0 => panic!(
+            "no committed qwen35 hf_golden_gate fixture records config_sha256={hash} \
+             (config: {}, kind: {}); generate one with \
+             tools/accuracy/dump_qwen35_hf_golden.py --model-path {model_path}",
+            config.display(),
+            if long { "long" } else { "short" },
+        ),
+        1 => matches[0].to_string_lossy().into_owned(),
+        _ => panic!(
+            "multiple qwen35 hf_golden_gate fixtures match {model_path}/config.json: {matches:?}"
+        ),
+    }
 }
 
 fn model_revision(model_path: &str) -> Option<String> {
@@ -177,7 +176,26 @@ fn require_metadata<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a
         .unwrap_or_else(|| panic!("qwen35 hf_golden_gate fixture missing metadata key {key}"))
 }
 
-fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
+/// The fixture's `model_revision` is the only field that pins the *weights*;
+/// `config_sha256` pins the geometry, which two 27B checkpoints share. An
+/// unresolvable local revision therefore fails here instead of skipping: a
+/// skip reports `ok` without comparing a single logit.
+fn require_model_revision(model_path: &str, expected: &str, resolved: Option<String>) {
+    let Some(actual) = resolved else {
+        panic!(
+            "qwen35 hf_golden_gate cannot resolve the local model revision of {model_path}, \
+             but this fixture requires model_revision={expected}; set \
+             PEGAINFER_TEST_MODEL_REVISION to the revision the checkpoint was downloaded at \
+             (the config hash pins the geometry, not the weights)"
+        );
+    };
+    assert_eq!(
+        actual, expected,
+        "qwen35 hf_golden_gate model revision mismatch; set PEGAINFER_TEST_MODEL_REVISION or use the fixture's model snapshot"
+    );
+}
+
+fn check_fixture_metadata(model_path: &str, golden: &Golden) {
     let metadata = &golden.metadata;
     assert_eq!(
         require_metadata(metadata, "dtype"),
@@ -208,16 +226,7 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
         expected_revision, "unknown",
         "qwen35 hf_golden_gate fixture must record a pinned model_revision"
     );
-    let Some(actual_revision) = model_revision(model_path) else {
-        eprintln!(
-            "skipping qwen35 hf_golden_gate: fixture requires model_revision={expected_revision}, but local model revision is unknown"
-        );
-        return false;
-    };
-    assert_eq!(
-        actual_revision, expected_revision,
-        "qwen35 hf_golden_gate model revision mismatch; set PEGAINFER_TEST_MODEL_REVISION or use the fixture's model snapshot"
-    );
+    require_model_revision(model_path, expected_revision, model_revision(model_path));
 
     if let Some(expected_tokenizer_revision) = metadata.get("tokenizer_revision") {
         assert_ne!(
@@ -225,7 +234,6 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
             "qwen35 hf_golden_gate fixture must record a pinned tokenizer_revision"
         );
     }
-    true
 }
 
 fn as_i32(st: &SafeTensors, name: &str) -> (Vec<i32>, Vec<usize>) {
@@ -319,40 +327,11 @@ struct Golden {
 }
 
 impl Golden {
-    /// An explicitly set env override must exist; a missing default keyed
-    /// fixture is a clean skip (`None`).
-    fn load_for(model_path: &str, long: bool) -> Option<Golden> {
+    fn load_for(model_path: &str, long: bool) -> Golden {
         let env_key = if long { LONG_GOLDEN_ENV } else { GOLDEN_ENV };
-        let Some(size) = fixture_size_name(model_path) else {
-            assert!(
-                std::env::var(env_key).is_err(),
-                "{env_key} is set but the model geometry in {model_path}/config.json \
-                 has no entry in the size table"
-            );
-            eprintln!(
-                "skipping qwen35 hf_golden_gate: unrecognized model geometry in \
-                 {model_path}/config.json; extend fixture_size_name to cover it"
-            );
-            return None;
-        };
-        let path = if let Ok(path) = std::env::var(env_key) {
-            path
-        } else {
-            let path = default_fixture_path(size, long);
-            if !Path::new(&path).exists() {
-                assert!(
-                    !COMMITTED_FIXTURE_SIZES.contains(&size),
-                    "committed golden fixture missing at {path}"
-                );
-                eprintln!(
-                    "skipping qwen35 hf_golden_gate: no golden fixture for this size at \
-                     {path}; generate one with tools/accuracy/dump_qwen35_hf_golden.py"
-                );
-                return None;
-            }
-            path
-        };
-        Some(Self::load_path(path))
+        let path =
+            std::env::var(env_key).unwrap_or_else(|_| find_default_fixture(model_path, long));
+        Self::load_path(path)
     }
 
     fn load_path(path: impl AsRef<Path>) -> Golden {
@@ -869,12 +848,8 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    let golden = Golden::load_for(&model_path, false);
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -932,12 +907,8 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_long_golden") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    let golden = Golden::load_for(&model_path, true);
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -957,12 +928,8 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden_tp2") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    let golden = Golden::load_for(&model_path, false);
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -987,12 +954,8 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    let golden = Golden::load_for(&model_path, true);
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -1016,12 +979,8 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    let golden = Golden::load_for(&model_path, false);
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -1063,4 +1022,42 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
             golden.num_seqs, golden.decode_len
         );
     }
+}
+
+#[test]
+#[should_panic(expected = "no committed qwen35 hf_golden_gate fixture")]
+fn missing_default_fixture_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"model_type":"qwen3_5","text_config":{"hidden_size":1}}"#,
+    )
+    .unwrap();
+    find_default_fixture(dir.path().to_str().unwrap(), false);
+}
+
+#[test]
+#[should_panic(expected = "PEGAINFER_TEST_MODEL_REVISION")]
+fn unresolved_model_revision_panics_naming_the_env_var() {
+    require_model_revision("/models/Qwen3.8-27B", "1d4bf0f2", None);
+}
+
+#[test]
+#[should_panic(expected = "model revision mismatch")]
+fn mismatched_model_revision_panics() {
+    require_model_revision(
+        "/models/Qwen3.8-27B",
+        "1d4bf0f2",
+        Some("deadbeef".to_string()),
+    );
+}
+
+#[test]
+fn matching_model_revision_is_accepted() {
+    require_model_revision(
+        "/models/Qwen3.8-27B",
+        "1d4bf0f2",
+        Some("1d4bf0f2".to_string()),
+    );
 }

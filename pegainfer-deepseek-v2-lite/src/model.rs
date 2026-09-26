@@ -111,13 +111,27 @@ impl DriverRankModel {
 
         with_weight_shards(model_path, layout.rank(), "driver", |shards, weight_map| {
             let gpu_started = Instant::now();
-            let embed_tokens =
-                load_tensor_2d(&ctx, shards, weight_map, "model.embed_tokens.weight")?;
+            let hidden = config.hidden_size;
+            let embed_tokens = load_tensor_2d(
+                &ctx,
+                shards,
+                weight_map,
+                "model.embed_tokens.weight",
+                config.vocab_size,
+                hidden,
+            )?;
             ensure!(
                 !config.tie_word_embeddings,
                 "DeepSeek-V2-Lite first gate expects untied lm_head"
             );
-            let lm_head = load_tensor_2d(&ctx, shards, weight_map, "lm_head.weight")?;
+            let lm_head = load_tensor_2d(
+                &ctx,
+                shards,
+                weight_map,
+                "lm_head.weight",
+                config.vocab_size,
+                hidden,
+            )?;
             let norm_host = load_tensor_1d_host(shards, weight_map, "model.norm.weight")?;
             let norm_device = load_tensor_1d(&ctx, shards, weight_map, "model.norm.weight")?;
 
@@ -145,12 +159,16 @@ impl DriverRankModel {
                         shards,
                         weight_map,
                         &format!("{attn}.q_proj.weight"),
+                        config.q_proj_rows(),
+                        hidden,
                     )?,
                     kv_a_proj: load_tensor_2d(
                         &ctx,
                         shards,
                         weight_map,
                         &format!("{attn}.kv_a_proj_with_mqa.weight"),
+                        config.kv_a_proj_rows(),
+                        hidden,
                     )?,
                     kv_a_norm_host,
                     kv_a_norm_device,
@@ -159,12 +177,16 @@ impl DriverRankModel {
                         shards,
                         weight_map,
                         &format!("{attn}.kv_b_proj.weight"),
+                        config.kv_b_proj_rows(),
+                        config.kv_lora_rank,
                     )?,
                     o_proj: load_tensor_2d(
                         &ctx,
                         shards,
                         weight_map,
                         &format!("{attn}.o_proj.weight"),
+                        hidden,
+                        config.o_proj_cols(),
                     )?,
                 };
                 let mlp_prefix = format!("{prefix}.mlp");
@@ -178,7 +200,14 @@ impl DriverRankModel {
                         &mlp_prefix,
                     )?)
                 } else {
-                    MlpWeights::Dense(load_dense_mlp(&ctx, shards, weight_map, &mlp_prefix)?)
+                    MlpWeights::Dense(load_dense_mlp(
+                        &ctx,
+                        shards,
+                        weight_map,
+                        &mlp_prefix,
+                        hidden,
+                        config.intermediate_size,
+                    )?)
                 };
                 layers.push(LayerWeights {
                     input_layernorm_host,
@@ -247,6 +276,8 @@ impl ExpertRankModel {
                         shards,
                         weight_map,
                         &format!("{prefix}.gate.weight"),
+                        config.n_routed_experts,
+                        config.hidden_size,
                     )?));
                     layers.push(Some(load_owned_experts(
                         &ctx, shards, weight_map, config, &layout, &prefix,
@@ -351,20 +382,33 @@ fn load_dense_mlp(
     shards: &[safetensors::SafeTensors<'_>],
     weight_map: &HashMap<String, usize>,
     prefix: &str,
+    hidden: usize,
+    intermediate: usize,
 ) -> Result<DenseMlp> {
     let gate_proj = load_tensor_2d(
         ctx,
         shards,
         weight_map,
         &format!("{prefix}.gate_proj.weight"),
+        intermediate,
+        hidden,
     )?;
-    let up_proj = load_tensor_2d(ctx, shards, weight_map, &format!("{prefix}.up_proj.weight"))?;
+    let up_proj = load_tensor_2d(
+        ctx,
+        shards,
+        weight_map,
+        &format!("{prefix}.up_proj.weight"),
+        intermediate,
+        hidden,
+    )?;
     let gate_up_proj = DeviceMatrix::vstack(ctx, &[&gate_proj, &up_proj])?;
     let down_proj = load_tensor_2d(
         ctx,
         shards,
         weight_map,
         &format!("{prefix}.down_proj.weight"),
+        hidden,
+        intermediate,
     )?;
     Ok(DenseMlp {
         gate_up_proj,
@@ -382,8 +426,22 @@ fn load_moe_mlp(
 ) -> Result<MoeMlp> {
     let gate_name = format!("{prefix}.gate.weight");
     let gate_host = load_tensor_2d_host(shards, weight_map, &gate_name)?;
-    let gate_device = load_tensor_2d(ctx, shards, weight_map, &gate_name)?;
-    let shared = load_dense_mlp(ctx, shards, weight_map, &format!("{prefix}.shared_experts"))?;
+    let gate_device = load_tensor_2d(
+        ctx,
+        shards,
+        weight_map,
+        &gate_name,
+        config.n_routed_experts,
+        config.hidden_size,
+    )?;
+    let shared = load_dense_mlp(
+        ctx,
+        shards,
+        weight_map,
+        &format!("{prefix}.shared_experts"),
+        config.hidden_size,
+        config.shared_moe_intermediate(),
+    )?;
     let experts = load_owned_experts(ctx, shards, weight_map, config, layout, prefix)?;
     Ok(MoeMlp {
         gate_host,
@@ -475,6 +533,8 @@ fn load_owned_experts(
             shards,
             weight_map,
             &format!("{prefix}.experts.{global_expert}"),
+            config.hidden_size,
+            config.moe_intermediate_size,
         )?;
         experts.push(ExpertMlp {
             global_expert,

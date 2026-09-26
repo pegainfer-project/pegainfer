@@ -1,0 +1,130 @@
+{
+  "source_repo": "Qwen/Qwen3.8-27B",
+  "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "transformers_version": "5.2.0",
+  "file_sha256": {
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+  },
+  "chat_templates": [
+    {
+      "name": "plain_user_no_generation_prompt",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Explain gravity in one sentence."
+        }
+      ],
+      "add_generation_prompt": false,
+      "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n"
+    },
+    {
+      "name": "multi_turn",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Is 4111 prime?"
+        },
+        {
+          "role": "assistant",
+          "content": "Yes."
+        },
+        {
+          "role": "user",
+          "content": "And 4112?"
+        }
+      ],
+      "add_generation_prompt": true,
+      "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nIs 4111 prime?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nYes.<|im_end|>\n<|im_start|>user\nAnd 4112?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "unicode_content",
+      "messages": [
+        {
+          "role": "user",
+          "content": "翻译：🙂 と こんにちは"
+        }
+      ],
+      "add_generation_prompt": true,
+      "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\n翻译：🙂 と こんにちは<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "reasoning_effort_xhigh",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Explain gravity in one sentence."
+        }
+      ],
+      "add_generation_prompt": true,
+      "template_kwargs": {
+        "reasoning_effort": "xhigh"
+      },
+      "rendered": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "reasoning_effort_medium",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Explain gravity in one sentence."
+        }
+      ],
+      "add_generation_prompt": true,
+      "template_kwargs": {
+        "reasoning_effort": "medium"
+      },
+      "rendered": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "reasoning_effort_low",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Explain gravity in one sentence."
+        }
+      ],
+      "add_generation_prompt": true,
+      "template_kwargs": {
+        "reasoning_effort": "low"
+      },
+      "rendered": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "thinking_disabled_with_effort",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Explain gravity in one sentence."
+        }
+      ],
+      "add_generation_prompt": true,
+      "template_kwargs": {
+        "enable_thinking": false,
+        "reasoning_effort": "low"
+      },
+      "rendered": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nExplain gravity in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    }
+  ]
+}

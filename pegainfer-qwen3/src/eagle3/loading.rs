@@ -44,15 +44,6 @@ impl Eagle3DraftModel {
         let q_dim = config.num_attention_heads * config.head_dim;
         let kv_dim = config.num_key_value_heads * config.head_dim;
         let inter = config.intermediate_size;
-        let check2d = |m: &DeviceMatrix, name: &str, rows: usize, cols: usize| -> Result<()> {
-            anyhow::ensure!(
-                m.rows == rows && m.cols == cols,
-                "EAGLE-3 {name} must be [{rows}, {cols}], got [{}, {}]",
-                m.rows,
-                m.cols
-            );
-            Ok(())
-        };
         let check1d = |v: &DeviceVec, name: &str, len: usize| -> Result<()> {
             anyhow::ensure!(
                 v.len == len,
@@ -69,31 +60,46 @@ impl Eagle3DraftModel {
             &shards,
             &weight_map,
             "midlayer.self_attn.q_proj.weight",
+            q_dim,
+            attn_in,
         )?;
-        check2d(&q_proj, "q_proj", q_dim, attn_in)?;
         let k_proj = load_tensor_2d(
             ctx,
             &shards,
             &weight_map,
             "midlayer.self_attn.k_proj.weight",
+            kv_dim,
+            attn_in,
         )?;
-        check2d(&k_proj, "k_proj", kv_dim, attn_in)?;
         let v_proj = load_tensor_2d(
             ctx,
             &shards,
             &weight_map,
             "midlayer.self_attn.v_proj.weight",
+            kv_dim,
+            attn_in,
         )?;
-        check2d(&v_proj, "v_proj", kv_dim, attn_in)?;
         let qkv_proj = DeviceMatrix::vstack(ctx, &[&q_proj, &k_proj, &v_proj])?;
         drop(q_proj);
         drop(k_proj);
         drop(v_proj);
 
-        let gate_proj = load_tensor_2d(ctx, &shards, &weight_map, "midlayer.mlp.gate_proj.weight")?;
-        check2d(&gate_proj, "gate_proj", inter, hidden)?;
-        let up_proj = load_tensor_2d(ctx, &shards, &weight_map, "midlayer.mlp.up_proj.weight")?;
-        check2d(&up_proj, "up_proj", inter, hidden)?;
+        let gate_proj = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "midlayer.mlp.gate_proj.weight",
+            inter,
+            hidden,
+        )?;
+        let up_proj = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "midlayer.mlp.up_proj.weight",
+            inter,
+            hidden,
+        )?;
         let gate_up_proj = DeviceMatrix::vstack(ctx, &[&gate_proj, &up_proj])?;
         drop(gate_proj);
         drop(up_proj);
@@ -103,10 +109,17 @@ impl Eagle3DraftModel {
             &shards,
             &weight_map,
             "midlayer.self_attn.o_proj.weight",
+            hidden,
+            q_dim,
         )?;
-        check2d(&o_proj, "o_proj", hidden, q_dim)?;
-        let down_proj = load_tensor_2d(ctx, &shards, &weight_map, "midlayer.mlp.down_proj.weight")?;
-        check2d(&down_proj, "down_proj", hidden, inter)?;
+        let down_proj = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "midlayer.mlp.down_proj.weight",
+            hidden,
+            inter,
+        )?;
 
         let input_layernorm =
             load_tensor_1d(ctx, &shards, &weight_map, "midlayer.input_layernorm.weight")?;
@@ -138,14 +151,19 @@ impl Eagle3DraftModel {
         };
 
         // ---- fusion, final norm, draft head, vocab-remap tables ----
-        let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
         // Capture-compatibility invariant: EAGLE-3 fuses exactly THREE captured
         // target layers (low/mid/high) — `fc` maps `[3 * hidden] -> [hidden]`.
-        check2d(&fc, "fc", hidden, 3 * hidden)?;
+        let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight", hidden, 3 * hidden)?;
         let norm = load_tensor_1d(ctx, &shards, &weight_map, "norm.weight")?;
         check1d(&norm, "norm", hidden)?;
-        let lm_head = load_tensor_2d(ctx, &shards, &weight_map, "lm_head.weight")?;
-        check2d(&lm_head, "lm_head", config.draft_vocab_size, hidden)?;
+        let lm_head = load_tensor_2d(
+            ctx,
+            &shards,
+            &weight_map,
+            "lm_head.weight",
+            config.draft_vocab_size,
+            hidden,
+        )?;
 
         let d2t = load_tensor_i64_host(&shards, &weight_map, "d2t")?;
         let t2d = load_tensor_bool_host(&shards, &weight_map, "t2d")?;

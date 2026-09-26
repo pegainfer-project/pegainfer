@@ -11,7 +11,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 | Model | Crate | Feature flag | Architecture |
 |-------|-------|-------------|-------------|
 | Qwen3-4B / 8B | `pegainfer-qwen3` | `qwen3` (default) | Full attention, TP support |
-| Qwen3.5-4B / 9B / 27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention |
+| Qwen3.5-4B / 9B / 27B · Qwen3.8-27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention. Qwen3.8 shares the line: same `model_type`, same text geometry — see `docs/models/qwen35/support-qwen38.md` |
 | DeepSeek-V2-Lite | `pegainfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
 | Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Sliding-window + global full attention, single GPU, batched decode, opt-in chunked prefill |
 | Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |

@@ -36,24 +36,42 @@ VOCAB_CEILING = 100_000
 TOP_K = 64
 
 
-# Keep in sync with `fixture_size_name` in
-# pegainfer-qwen35/tests/hf_golden_gate.rs (the size-key geometry table).
+# Size table used only to name the default output fixture. The gate does NOT
+# read it: it picks the committed fixture whose recorded `config_sha256`
+# matches the checkpoint's config.json, so a mispairing fails the hash assert
+# instead of comparing against the wrong oracle.
 SIZE_NAMES = {
-    (1024, 24): "Qwen3.5-0.8B",
-    (2048, 24): "Qwen3.5-2B",
-    (2560, 32): "Qwen3.5-4B",
-    (4096, 32): "Qwen3.5-9B",
-    (5120, 64): "Qwen3.5-27B",
+    (1024, 24, "qwen35"): "Qwen3.5-0.8B",
+    (2048, 24, "qwen35"): "Qwen3.5-2B",
+    (2560, 32, "qwen35"): "Qwen3.5-4B",
+    (4096, 32, "qwen35"): "Qwen3.5-9B",
+    (5120, 64, "qwen35"): "Qwen3.5-27B",
+    (5120, 64, "qwen38"): "Qwen3.8-27B",
 }
+
+
+def generation_from_config(config: dict) -> str:
+    """Which Qwen3.5-line generation saved this config.
+
+    `text_config.output_gate_type` is the one field a Qwen3.8 save carries and a
+    Qwen3.5 save omits. No modelling code reads it for this architecture (it is
+    consumed only by `qwen4_exp`), so it is a save-time marker, nothing more.
+    """
+    text = config.get("text_config", config)
+    return "qwen38" if "output_gate_type" in text else "qwen35"
 
 
 def model_name_from_config(model_path: Path) -> str:
     config = json.loads((model_path / "config.json").read_text())
     text = config.get("text_config", config)
-    key = (text["hidden_size"], text["num_hidden_layers"])
+    key = (
+        text["hidden_size"],
+        text["num_hidden_layers"],
+        generation_from_config(config),
+    )
     if key not in SIZE_NAMES:
         raise SystemExit(
-            f"no size-name mapping for hidden/layers {key}; extend SIZE_NAMES"
+            f"no size-name mapping for hidden/layers/generation {key}; extend SIZE_NAMES"
         )
     return SIZE_NAMES[key]
 
@@ -133,8 +151,12 @@ def main() -> int:
     parser.add_argument(
         "--out",
         default=None,
-        help="output path; defaults to test_data/qwen35-{size}-hf-golden.safetensors "
-        "derived from the model config (the only names the gate looks up)",
+        help="output path; defaults to test_data/{generation}-{size}-hf"
+        "[-long]-golden.safetensors derived from the model config and "
+        "--prompt-lens. These names are the dumper's convention, not a gate key: "
+        "the gate scans candidates matching that pattern and selects by "
+        "config_sha256. Override the fixture with PEGAINFER_QWEN35_HF_GOLDEN / "
+        "PEGAINFER_QWEN35_HF_LONG_GOLDEN.",
     )
     parser.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
     parser.add_argument(
@@ -172,21 +194,13 @@ def main() -> int:
     if args.vocab_ceiling <= 1:
         parser.error("--vocab-ceiling must be greater than 1")
 
-    size_key = (
-        model_name_from_config(Path(args.model_path)).removeprefix("Qwen3.5-").lower()
-    )
-    gate_names = {
-        f"qwen35-{size_key}-hf-golden.safetensors",
-        f"qwen35-{size_key}-hf-long-golden.safetensors",
-    }
+    # "Qwen3.8-27B" -> stem "qwen38-27b" (the dot drops). The stem is a naming
+    # convention only; the gate locates fixtures by their recorded config_sha256.
+    line, _, size_key = model_name_from_config(Path(args.model_path)).partition("-")
+    stem = f"{line.lower().replace('.', '')}-{size_key.lower()}"
     if args.out is None:
         kind = "-hf-long-golden" if args.prompt_lens else "-hf-golden"
-        args.out = f"test_data/qwen35-{size_key}{kind}.safetensors"
-    elif Path(args.out).name not in gate_names:
-        raise SystemExit(
-            f"--out basename {Path(args.out).name!r} will not be found by the gate; "
-            f"expected one of {sorted(gate_names)}"
-        )
+        args.out = f"test_data/{stem}{kind}.safetensors"
 
     gen = torch.Generator().manual_seed(args.seed)
     prompts, decodes = [], []
@@ -287,6 +301,17 @@ def main() -> int:
         "torch_version": torch.__version__,
         "transformers_version": __import__("transformers").__version__,
     }
+    # A non-finite oracle is not a golden (an eager GDN fallback produced all-NaN); refuse before writing.
+    lp = tensors["topk_logprobs"]
+    finite = torch.isfinite(lp)
+    if not bool(finite.all()):
+        raise SystemExit(
+            f"refusing to write {args.out}: {int((~finite).sum())}/{finite.numel()} "
+            "reference logprobs are not finite. Install flash-linear-attention "
+            "(and causal-conv1d) so the gated-DeltaNet fast path is used instead of "
+            "transformers' eager torch fallback, then re-dump."
+        )
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out), metadata=meta)
