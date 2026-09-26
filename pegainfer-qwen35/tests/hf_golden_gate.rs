@@ -176,7 +176,26 @@ fn require_metadata<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a
         .unwrap_or_else(|| panic!("qwen35 hf_golden_gate fixture missing metadata key {key}"))
 }
 
-fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
+/// The fixture's `model_revision` is the only field that pins the *weights*;
+/// `config_sha256` pins the geometry, which two 27B checkpoints share. An
+/// unresolvable local revision therefore fails here instead of skipping: a
+/// skip reports `ok` without comparing a single logit.
+fn require_model_revision(model_path: &str, expected: &str, resolved: Option<String>) {
+    let Some(actual) = resolved else {
+        panic!(
+            "qwen35 hf_golden_gate cannot resolve the local model revision of {model_path}, \
+             but this fixture requires model_revision={expected}; set \
+             PEGAINFER_TEST_MODEL_REVISION to the revision the checkpoint was downloaded at \
+             (the config hash pins the geometry, not the weights)"
+        );
+    };
+    assert_eq!(
+        actual, expected,
+        "qwen35 hf_golden_gate model revision mismatch; set PEGAINFER_TEST_MODEL_REVISION or use the fixture's model snapshot"
+    );
+}
+
+fn check_fixture_metadata(model_path: &str, golden: &Golden) {
     let metadata = &golden.metadata;
     assert_eq!(
         require_metadata(metadata, "dtype"),
@@ -207,16 +226,7 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
         expected_revision, "unknown",
         "qwen35 hf_golden_gate fixture must record a pinned model_revision"
     );
-    let Some(actual_revision) = model_revision(model_path) else {
-        eprintln!(
-            "skipping qwen35 hf_golden_gate: fixture requires model_revision={expected_revision}, but local model revision is unknown"
-        );
-        return false;
-    };
-    assert_eq!(
-        actual_revision, expected_revision,
-        "qwen35 hf_golden_gate model revision mismatch; set PEGAINFER_TEST_MODEL_REVISION or use the fixture's model snapshot"
-    );
+    require_model_revision(model_path, expected_revision, model_revision(model_path));
 
     if let Some(expected_tokenizer_revision) = metadata.get("tokenizer_revision") {
         assert_ne!(
@@ -224,7 +234,6 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
             "qwen35 hf_golden_gate fixture must record a pinned tokenizer_revision"
         );
     }
-    true
 }
 
 fn as_i32(st: &SafeTensors, name: &str) -> (Vec<i32>, Vec<usize>) {
@@ -840,9 +849,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
         return;
     };
     let golden = Golden::load_for(&model_path, false);
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -901,9 +908,7 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
         return;
     };
     let golden = Golden::load_for(&model_path, true);
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -924,9 +929,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
         return;
     };
     let golden = Golden::load_for(&model_path, false);
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -952,9 +955,7 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
         return;
     };
     let golden = Golden::load_for(&model_path, true);
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -979,9 +980,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
         return;
     };
     let golden = Golden::load_for(&model_path, false);
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -1026,7 +1025,8 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
 }
 
 #[test]
-fn missing_default_fixture_panics_for_short_and_long() {
+#[should_panic(expected = "no committed qwen35 hf_golden_gate fixture")]
+fn missing_default_fixture_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.json");
     std::fs::write(
@@ -1034,24 +1034,30 @@ fn missing_default_fixture_panics_for_short_and_long() {
         r#"{"model_type":"qwen3_5","text_config":{"hidden_size":1}}"#,
     )
     .unwrap();
-    let model_path = dir.path().to_str().unwrap();
+    find_default_fixture(dir.path().to_str().unwrap(), false);
+}
 
-    for long in [false, true] {
-        let kind = if long { "long" } else { "short" };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            find_default_fixture(model_path, long)
-        }));
-        let Err(err) = result else {
-            panic!("find_default_fixture({kind}) must panic on zero matches")
-        };
-        let msg = err.downcast::<String>().unwrap_or_default();
-        assert!(
-            msg.contains("no committed qwen35 hf_golden_gate fixture"),
-            "{kind}: unexpected panic message: {msg}"
-        );
-        assert!(
-            msg.contains(kind),
-            "{kind}: panic should name the fixture kind: {msg}"
-        );
-    }
+#[test]
+#[should_panic(expected = "PEGAINFER_TEST_MODEL_REVISION")]
+fn unresolved_model_revision_panics_naming_the_env_var() {
+    require_model_revision("/models/Qwen3.8-27B", "1d4bf0f2", None);
+}
+
+#[test]
+#[should_panic(expected = "model revision mismatch")]
+fn mismatched_model_revision_panics() {
+    require_model_revision(
+        "/models/Qwen3.8-27B",
+        "1d4bf0f2",
+        Some("deadbeef".to_string()),
+    );
+}
+
+#[test]
+fn matching_model_revision_is_accepted() {
+    require_model_revision(
+        "/models/Qwen3.8-27B",
+        "1d4bf0f2",
+        Some("1d4bf0f2".to_string()),
+    );
 }
