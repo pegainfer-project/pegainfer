@@ -16,6 +16,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 
+use vllm_chat::ParserSelection;
+
 use crate::engine::LaunchedEngine;
 use crate::vllm::LoraModule;
 
@@ -64,7 +66,12 @@ impl CliError {
 }
 
 /// Flags accepted for every model line regardless of detected type.
-const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
+const CORE_ARGS: &[&str] = &[
+    "model_path",
+    "served_model_name",
+    "port",
+    "tool_call_parser",
+];
 
 /// A source argument id and the argument ids it requires.
 pub type ArgRequirement = (&'static str, &'static [&'static str]);
@@ -103,6 +110,14 @@ pub struct SharedArgs {
     /// Port to listen on
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
+
+    /// Tool-call output parser: `auto` (match the model), `none`, or an explicit
+    /// registered parser name such as `qwen3_coder`. `auto` matches the model
+    /// *path* by substring, so a `Qwen3.8-27B` directory resolves to the generic
+    /// `qwen3` pattern — name the parser explicitly when the checkpoint emits a
+    /// different tool format than that pattern expects.
+    #[arg(long, default_value_t = ParserSelection::Auto)]
+    pub tool_call_parser: ParserSelection,
 
     /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to
     /// disable). Rejected for GLM5.2; forced off in Qwen3 LoRA mode; Qwen3.5
@@ -235,6 +250,11 @@ impl SharedArgs {
                 "--decode-sm-pct only applies with --decode-overlap=green-ctx",
             ));
         }
+        // An explicit parser name is taken verbatim by `FromStr`, so only the
+        // registry can tell a typo from a real parser. Check it here, before an
+        // engine load is spent on a request that could never be parsed.
+        vllm_chat::validate_parser_overrides(&self.tool_call_parser, &ParserSelection::Auto)
+            .map_err(|error| CliError::rule(format!("invalid --tool-call-parser: {error}")))?;
         Ok(())
     }
 }

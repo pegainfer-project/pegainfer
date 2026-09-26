@@ -216,6 +216,7 @@ async fn main() -> Result<()> {
         std::future::ready(Ok(engine.into())),
         &runtime.model_path,
         runtime.served_model_name,
+        pegainfer_frontend::vllm::ParserSelection::Auto,
         args.port,
         Some(runtime.max_model_len),
         pegainfer_frontend::vllm::shutdown_token_from_ctrl_c(),

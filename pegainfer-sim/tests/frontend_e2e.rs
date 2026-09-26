@@ -143,6 +143,7 @@ impl SimServer {
                 std::future::ready(Ok(engine.into())),
                 &model_path_buf,
                 vec![served_model_name],
+                pegainfer_frontend::vllm::ParserSelection::Auto,
                 port,
                 Some(128),
                 engine_count,
@@ -768,6 +769,7 @@ async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
             std::future::ready(Ok(engine.into())),
             model_dir.path(),
             vec![MODEL_NAME.to_string()],
+            pegainfer_frontend::vllm::ParserSelection::Auto,
             port,
             Some(128),
             2,
@@ -903,6 +905,96 @@ async fn chat_completions_returns_correct_format() -> Result<()> {
         prompt_tokens + completion_tokens,
         "total_tokens must equal prompt + completion: {response}"
     );
+
+    server.shutdown().await
+}
+
+/// The every-chat-route fixture with a `reasoning_effort` guard shaped like
+/// Qwen3.8's template (`docs/models/qwen35/support-qwen38.md`): the check is
+/// *inside* the thinking branch, so `enable_thinking=false` — which the renderer
+/// derives from `reasoning_effort=none` — skips it entirely. `raise_exception`
+/// is deliberately not registered by the pinned frontend, so a rejected value is
+/// a hard render failure exactly as in production, not a friendly message.
+fn model_dir_with_effort_guard() -> Result<TempDir> {
+    let dir = model_dir_with_minimal_metadata()?;
+    fs::write(
+        dir.path().join("tokenizer_config.json"),
+        TINY_TOKENIZER_CONFIG_EFFORT_GUARD_JSON,
+    )
+    .context("failed to write effort-guard tokenizer_config.json")?;
+    Ok(dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_effort_extremes_are_mapped_onto_the_templates_vocabulary() -> Result<()> {
+    let server = SimServer::spawn_with_model_dir(model_dir_with_effort_guard()?).await?;
+    let client = test_client()?;
+
+    let chat = |body: Value| {
+        let client = &client;
+        let base_url = server.base_url.clone();
+        async move {
+            let response = client
+                .post(format!("{base_url}/v1/chat/completions"))
+                .json(&body)
+                .send()
+                .await?;
+            let status = response.status();
+            let text = response.text().await?;
+            anyhow::Ok((status, text))
+        }
+    };
+
+    // Without the rewrite each of these hits the template's reject branch; the
+    // middleware maps them onto `xhigh` / `low` before the renderer sees them.
+    for effort in ["high", "max", "minimal"] {
+        let (status, text) = chat(json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha beta"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "reasoning_effort": effort
+        }))
+        .await?;
+        if !status.is_success() {
+            bail!(
+                "reasoning_effort={effort} must be mapped onto the template's vocabulary, got {status}: {text}"
+            );
+        }
+    }
+
+    // Values the template already accepts, and `none`, which the renderer turns
+    // into enable_thinking=false so the guard never runs.
+    for effort in ["xhigh", "medium", "low", "none"] {
+        let (status, text) = chat(json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha beta"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "reasoning_effort": effort
+        }))
+        .await?;
+        if !status.is_success() {
+            bail!("reasoning_effort={effort} is valid and must pass through, got {status}: {text}");
+        }
+    }
+
+    // Control: the guard is live, and only the *top-level* field is rewritten.
+    // Addressed through template kwargs the caller keeps full control, so a
+    // rejected value still fails the render.
+    let (status, text) = chat(json!({
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "alpha beta"}],
+        "max_tokens": 2,
+        "temperature": 0.0,
+        "chat_template_kwargs": {"reasoning_effort": "high", "enable_thinking": true}
+    }))
+    .await?;
+    if status.is_success() {
+        bail!(
+            "a template-kwargs reasoning_effort outside the vocabulary must still be rejected: {text}"
+        );
+    }
 
     server.shutdown().await
 }
@@ -1322,6 +1414,14 @@ const TINY_TOKENIZER_CONFIG_JSON: &str = r#"{
   "unk_token": "<unk>",
   "tokenizer_class": "PreTrainedTokenizerFast",
   "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}"
+}"#;
+
+/// Qwen3.8's guard shape: the vocabulary check lives inside the thinking branch,
+/// so it only runs when `enable_thinking` is not disabled.
+const TINY_TOKENIZER_CONFIG_EFFORT_GUARD_JSON: &str = r#"{
+  "unk_token": "<unk>",
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "chat_template": "{%- if enable_thinking is undefined or enable_thinking is true %}{%- set resolved = reasoning_effort|default('xhigh') %}{%- if resolved not in ('xhigh', 'medium', 'low') %}{{ raise_exception('Unexpected reasoning effort ' ~ reasoning_effort) }}{%- endif %}{%- endif %}{% for message in messages %}{{ message.content }}{% endfor %}"
 }"#;
 
 // Leave room for simulated alternatives (scored id + 1..k) within the vocabulary.

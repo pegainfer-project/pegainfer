@@ -98,6 +98,7 @@ async fn spawn_ready_server(
             ))),
             &frontend_model_path,
             vec![MODEL_NAME.to_string()],
+            pegainfer_frontend::vllm::ParserSelection::Auto,
             port,
             None,
             server_shutdown,
