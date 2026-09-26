@@ -346,8 +346,21 @@ fn parse_sm_token(raw: &str) -> Option<String> {
     None
 }
 
+/// `nvcc`, prefixed by `PEGAINFER_NVCC_LAUNCHER` when that is set and non-empty.
+fn nvcc_command(nvcc: &str) -> Command {
+    println!("cargo:rerun-if-env-changed=PEGAINFER_NVCC_LAUNCHER");
+    match std::env::var_os("PEGAINFER_NVCC_LAUNCHER").filter(|value| !value.is_empty()) {
+        Some(launcher) => {
+            let mut command = Command::new(launcher);
+            command.arg(nvcc);
+            command
+        }
+        None => Command::new(nvcc),
+    }
+}
+
 fn nvcc_supported_arches(nvcc: &str) -> Option<BTreeSet<String>> {
-    let output = Command::new(nvcc).arg("--list-gpu-arch").output().ok()?;
+    let output = nvcc_command(nvcc).arg("--list-gpu-arch").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -482,7 +495,7 @@ fn nvcc_accepts_gencode(nvcc: &str, compute: &str, sm: &str) -> bool {
         return false;
     }
 
-    let output = Command::new(nvcc)
+    let output = nvcc_command(nvcc)
         .args(["-c"])
         .arg(&cu_path)
         .arg("-o")
@@ -910,7 +923,7 @@ fn link_kernel_lab_shared(
         "-lstdc++".to_string(),
     ]);
     let status = time_phase("nvcc -shared libglm52_kernel_lab.so", || {
-        Command::new(nvcc)
+        nvcc_command(nvcc)
             .args(&args)
             .status()
             .expect("Failed to run nvcc for libglm52_kernel_lab.so")
@@ -2707,11 +2720,14 @@ fn main() {
                         };
 
                         let status = time_phase(format!("nvcc {}", task.cu_file.display()), || {
-                            Command::new(&nvcc)
+                            nvcc_command(&nvcc)
                                 .args(&task.args)
                                 .status()
-                                .unwrap_or_else(|_| {
-                                    panic!("Failed to run nvcc for {}", task.cu_file.display())
+                                .unwrap_or_else(|err| {
+                                    panic!(
+                                        "Failed to run nvcc for {}: {err}",
+                                        task.cu_file.display()
+                                    )
                                 })
                         });
                         completed.push((task.cu_file, task.obj_file, status));

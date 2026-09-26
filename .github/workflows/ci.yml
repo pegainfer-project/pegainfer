@@ -231,6 +231,7 @@ jobs:
       CUDA_PATH: /usr/local/cuda
       PEGAINFER_CUDA_SM: "80"
       PEGAINFER_NVCC_JOBS: "2"
+      PEGAINFER_NVCC_LAUNCHER: sccache
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     strategy:
