@@ -17,6 +17,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -103,7 +104,10 @@ fn timed_generate(engine: &EngineHarness, prompt_tokens: Vec<u32>) -> (usize, Du
             .expect("engine closed the stream without a terminal");
         count += update.tokens.len();
         match update.terminal {
-            Some(Terminal::Finished { .. }) => return (count, start.elapsed()),
+            Some(Terminal::Finished { .. }) => {
+                assert_eq!(count, GENERATED_TOKENS, "fixed-length request ended early");
+                return (count, start.elapsed());
+            }
             Some(Terminal::Failed { message, .. }) => panic!("generation failed: {message}"),
             Some(Terminal::Rejected { reason, .. }) => panic!("generation rejected: {reason}"),
             None => {}
@@ -111,10 +115,18 @@ fn timed_generate(engine: &EngineHarness, prompt_tokens: Vec<u32>) -> (usize, Du
     }
 }
 
-/// Decode tok/s averaged over the prompts (one warm-up run discarded).
-fn measure(engine: &EngineHarness, prompts: &[Vec<u32>]) -> f64 {
-    // Warm up CUDA-graph capture / allocator on the first prompt.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Measurement {
+    tokens_per_second: f64,
+    drafts: u64,
+    draft_tokens: u64,
+    accepted_tokens: u64,
+}
+
+/// End-to-end tok/s and acceptance counters, excluding the warm-up request.
+fn measure(engine: &EngineHarness, prompts: &[Vec<u32>]) -> Measurement {
     let _ = timed_generate(engine, prompts[0].clone());
+    let before = engine.metrics().spec_decode.unwrap_or_default();
     let mut tokens = 0usize;
     let mut elapsed = Duration::ZERO;
     for p in prompts {
@@ -122,7 +134,13 @@ fn measure(engine: &EngineHarness, prompts: &[Vec<u32>]) -> f64 {
         tokens += n;
         elapsed += dt;
     }
-    tokens as f64 / elapsed.as_secs_f64()
+    let after = engine.metrics().spec_decode.unwrap_or_default();
+    Measurement {
+        tokens_per_second: tokens as f64 / elapsed.as_secs_f64(),
+        drafts: after.num_drafts - before.num_drafts,
+        draft_tokens: after.num_draft_tokens - before.num_draft_tokens,
+        accepted_tokens: after.num_accepted_tokens - before.num_accepted_tokens,
+    }
 }
 
 #[test]
@@ -149,7 +167,7 @@ fn dflash_speculative_single_stream_speedup() {
             pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
                 .expect("baseline engine"),
         );
-        let tps = measure(&engine, &prompts);
+        let tps = measure(&engine, &prompts).tokens_per_second;
         drop(engine);
         std::thread::sleep(Duration::from_secs(2));
         tps
@@ -163,7 +181,7 @@ fn dflash_speculative_single_stream_speedup() {
             )
             .expect("speculative engine"),
         );
-        measure(&engine, &prompts)
+        measure(&engine, &prompts).tokens_per_second
     };
 
     let speedup = spec_tps / baseline_tps;
@@ -176,5 +194,107 @@ fn dflash_speculative_single_stream_speedup() {
     assert!(
         speedup > 0.8,
         "speculative decode is catastrophically slower ({speedup:.2}×) — draft likely mispredicting"
+    );
+}
+
+/// Run explicitly with a published selector checkpoint paired to the target.
+/// Both arms load the same weights; only selector dispatch changes. Separate
+/// processes isolate the environment switch and CUDA state between arms.
+#[test]
+#[ignore = "requires GPU and PEGAINFER_TEST_MODEL_PATH + PEGAINFER_DFLASH2_TEST_MODEL_PATH"]
+fn dflash_selector_same_checkpoint_ab() {
+    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH").expect("target checkpoint path");
+    let draft_path = std::env::var("PEGAINFER_DFLASH2_TEST_MODEL_PATH")
+        .expect("published selector checkpoint path");
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&draft_path).join("config.json"))
+            .expect("read selector checkpoint config"),
+    )
+    .expect("parse selector checkpoint config");
+    let rank = config["dflash_config"]["selector_rank"]
+        .as_u64()
+        .or_else(|| config["selector_rank"].as_u64())
+        .unwrap_or(0);
+    assert!(
+        rank > 0,
+        "A/B requires a checkpoint with a trained selector"
+    );
+
+    if std::env::var_os("PEGAINFER_SELECTOR_AB_CHILD").is_some() {
+        common::harness::init_capture_logging();
+        // Keep load diagnostics, but exclude per-round debug I/O from timing.
+        log::set_max_level(log::LevelFilter::Info);
+        let tokenizer = common::load_tokenizer(&model_path);
+        let prompts: Vec<Vec<u32>> = [
+            "Write a short essay about the history of the Roman Empire.",
+            "Explain how a transformer neural network works, step by step.",
+            "Write a Python function that merges two sorted lists and explain its complexity.",
+        ]
+        .iter()
+        .map(|prompt| tokenizer.encode(prompt, false).expect("encode prompt"))
+        .collect();
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(
+                Path::new(&model_path),
+                launch_options(Some(PathBuf::from(&draft_path))),
+            )
+            .expect("selector A/B engine"),
+        );
+        let result = measure(&engine, &prompts);
+        assert!(result.drafts > 0, "workload bypassed speculative decoding");
+        assert!(result.accepted_tokens > 0, "no draft token was accepted");
+        println!("selector_ab={}", serde_json::to_string(&result).unwrap());
+        return;
+    }
+
+    let mut results = Vec::new();
+    for enabled in [false, true] {
+        let mut child = Command::new(std::env::current_exe().expect("test executable"));
+        child
+            .args([
+                "--exact",
+                "dflash_selector_same_checkpoint_ab",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PEGAINFER_SELECTOR_AB_CHILD", "1")
+            .env("PEGAINFER_TEST_LOG", "1");
+        if enabled {
+            child.env_remove("DFLASH2_NO_SELECTOR");
+        } else {
+            child.env("DFLASH2_NO_SELECTOR", "1");
+        }
+        let output = child.output().expect("run selector A/B child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "selector={enabled}:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("selector: enabled={enabled}, rank={rank},")),
+            "selector={enabled} did not load the requested head:\n{stderr}"
+        );
+        let result: Measurement = serde_json::from_str(
+            stdout
+                .lines()
+                .find_map(|line| line.split_once("selector_ab=").map(|(_, value)| value))
+                .expect("child measurement"),
+        )
+        .expect("parse child measurement");
+        eprintln!(
+            "selector={enabled}: {:.1} tok/s, {:.3} accepted drafts/round, {:.3} committed tokens/round, {:.2}% draft acceptance ({} rounds)",
+            result.tokens_per_second,
+            result.accepted_tokens as f64 / result.drafts as f64,
+            1.0 + result.accepted_tokens as f64 / result.drafts as f64,
+            100.0 * result.accepted_tokens as f64 / result.draft_tokens as f64,
+            result.drafts,
+        );
+        results.push(result);
+    }
+    eprintln!(
+        "selector throughput ratio: {:.3}x (ON/OFF)",
+        results[1].tokens_per_second / results[0].tokens_per_second,
     );
 }

@@ -5,6 +5,20 @@ use super::Half;
 
 // Shared kernels used across all models (CUDA / cuBLAS / FlashInfer).
 unsafe extern "C" {
+    pub fn dflash2_grouped_conv_cuda(
+        input: *const Half,
+        dynamic: *const Half,
+        base: *const Half,
+        output: *mut Half,
+        rows: i32,
+        hidden: i32,
+        block: i32,
+        group_size: i32,
+        taps: i32,
+        side: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn rms_norm_cuda(
         x: *const Half,
         weight: *const Half,
@@ -1440,4 +1454,48 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     pub fn pegainfer_kernels_last_error() -> *const std::os::raw::c_char;
+}
+
+// Native DFlash2 strict candidate selection. All entries guard C++ exceptions;
+// nonfinite device inputs are reported separately through the error flag.
+unsafe extern "C" {
+    pub fn dflash2_topk_workspace_bytes_cuda(
+        vocab: i32,
+        bytes: *mut usize,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn dflash2_prepare_cuda(
+        logits: *const Half,
+        hidden: *const Half,
+        predecessor: *const Half,
+        successor: *const Half,
+        anchors: *const u32,
+        ids: *mut u32,
+        unary: *mut f32,
+        gated: *mut f32,
+        successors: *mut f32,
+        error: *mut u32,
+        keys_in: *mut u64,
+        keys_out: *mut u64,
+        workspace: *mut std::ffi::c_void,
+        workspace_bytes: usize,
+        batch: i32,
+        block_size: i32,
+        vocab: i32,
+        rank: i32,
+        chunk_rows: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn dflash2_finish_cuda(
+        edges: *mut f32,
+        unary: *const f32,
+        ids: *const u32,
+        selected: *mut u32,
+        error: *mut u32,
+        batch: i32,
+        length: i32,
+        stream: CUstream,
+    ) -> i32;
 }

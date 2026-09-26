@@ -1266,8 +1266,11 @@ impl Qwen3Executor {
             let max_verify_batch = *BATCH_BUCKETS.last().unwrap();
             let (dflash_kv_bytes_per_token, hedge_scratch_pages) = match dflash_draft_path {
                 Some(path) => {
-                    let reservation =
-                        crate::dflash::DFlashMemoryReservation::from_path(path, max_verify_batch)?;
+                    let reservation = crate::dflash::DFlashMemoryReservation::from_path(
+                        model.device_ctx(),
+                        path,
+                        max_verify_batch,
+                    )?;
                     memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
                         memory_options.kv_cache_memory_margin_bytes,
                         reservation.fixed_bytes,

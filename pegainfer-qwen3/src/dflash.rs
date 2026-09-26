@@ -13,14 +13,23 @@ use crate::dspark::MarkovScratch;
 use crate::weights::Qwen3Model;
 use crate::weights::TransformerBlock;
 
+mod conv;
 mod loading;
 mod reservation;
+mod selector;
 
+use conv::ConvScratch;
+use conv::LayerConvs;
 pub(crate) use reservation::DFlashMemoryReservation;
+use selector::SelectorHead;
+use selector::SelectorScratch;
 
 pub(crate) struct DFlashDraftModel {
     config: DFlashConfig,
     layers: Vec<TransformerBlock>,
+    convs: Option<Vec<LayerConvs>>,
+    embed_tokens: Option<DeviceMatrix>,
+    lm_head: Option<DeviceMatrix>,
     norm: DeviceVec,
     hidden_norm: DeviceVec,
     fc: DeviceMatrix,
@@ -30,6 +39,7 @@ pub(crate) struct DFlashDraftModel {
     /// draft proposes via [`MarkovHead::sample_block`] (anchor-first, all
     /// `block_size` positions) instead of an independent per-position argmax.
     markov: Option<MarkovHead>,
+    selector: Option<SelectorHead>,
 }
 
 pub(crate) struct DFlashRequestState {
@@ -95,6 +105,8 @@ pub(crate) struct DFlashBatchScratch {
     v_tail: HiddenStates,
     // DSpark Markov sample-loop scratch; `None` for plain DFlash drafters.
     markov: Option<MarkovScratch>,
+    selector: Option<SelectorScratch>,
+    conv: Option<ConvScratch>,
 }
 
 impl DFlashRequestState {
@@ -256,6 +268,14 @@ impl DFlashBatchScratch {
             tail_input: HiddenStates::zeros(ctx, hidden_size, tail_capacity)?,
             k_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
             v_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
+            conv: config
+                .conv
+                .as_ref()
+                .map(|_| ConvScratch::new(ctx, config, batch_rows))
+                .transpose()?,
+            selector: (config.selector_rank > 0)
+                .then(|| SelectorScratch::new(ctx, config, max_decode_batch_size))
+                .transpose()?,
             markov: config
                 .uses_markov_head()
                 .then(|| MarkovScratch::new(ctx, config, max_decode_batch_size))
@@ -570,7 +590,11 @@ impl DFlashDraftModel {
             &scratch.block_token_ids_h[..batch_block_rows],
             &mut token_ids_dst,
         )?;
-        target.get_embeddings_batch_into(&scratch.token_ids_d, &mut scratch.hidden)?;
+        if let Some(embedding) = &self.embed_tokens {
+            ops::embedding_batch(ctx, embedding, &scratch.token_ids_d, &mut scratch.hidden)?;
+        } else {
+            target.get_embeddings_batch_into(&scratch.token_ids_d, &mut scratch.hidden)?;
+        }
 
         // Per-request context projection: varlen (each request's committed
         // prefix differs), persisted in the request so every layer can read it.
@@ -602,6 +626,12 @@ impl DFlashDraftModel {
                 self.config.rms_norm_eps,
                 &mut scratch.normed,
             );
+
+            if let (Some(convs), Some(conv_scratch)) = (&self.convs, scratch.conv.as_mut()) {
+                convs[layer_idx]
+                    .attention
+                    .prepare(ctx, &mut scratch.normed, conv_scratch)?;
+            }
 
             // Dense: Q projection over the whole batch (per-token, no cross-request
             // mixing). Computed before the per-request loop reads `normed`, and
@@ -694,7 +724,14 @@ impl DFlashDraftModel {
                     state.committed_len,
                     tail_len,
                 )?;
-                ops::single_prefill_nhd_noncausal_into(
+                // The trained mask keeps W target-context tokens before the
+                // anchor and the entire noncausal draft block for every query.
+                let prefix = state.committed_len + context_len;
+                let kv_start = self
+                    .config
+                    .sliding_window
+                    .map_or(0, |window| prefix.saturating_sub(window));
+                pegainfer_kernels::ops::single_prefill_nhd_noncausal_range_into(
                     ctx,
                     &scratch.q_batch,
                     row_offset,
@@ -705,7 +742,7 @@ impl DFlashDraftModel {
                     self.config.num_attention_heads,
                     self.config.num_key_value_heads,
                     self.config.head_dim,
-                    state.committed_len + tail_len,
+                    kv_start..state.committed_len + tail_len,
                 )?;
             }
 
@@ -716,6 +753,11 @@ impl DFlashDraftModel {
                 &scratch.attn_output,
                 &mut scratch.o_buf,
             );
+            if let (Some(convs), Some(conv_scratch)) = (&self.convs, scratch.conv.as_mut()) {
+                convs[layer_idx]
+                    .attention
+                    .finish(ctx, &mut scratch.o_buf, conv_scratch)?;
+            }
             pegainfer_kernels::ops::fused_add_rms_norm_round_batch_into(
                 ctx,
                 &mut scratch.hidden,
@@ -724,6 +766,12 @@ impl DFlashDraftModel {
                 self.config.rms_norm_eps,
                 &mut scratch.normed,
             )?;
+
+            if let (Some(convs), Some(conv_scratch)) = (&self.convs, scratch.conv.as_mut()) {
+                convs[layer_idx]
+                    .mlp
+                    .prepare(ctx, &mut scratch.normed, conv_scratch)?;
+            }
 
             ops::gemm_rows_into(
                 ctx,
@@ -753,6 +801,11 @@ impl DFlashDraftModel {
                 &scratch.act_out,
                 &mut scratch.o_buf,
             );
+            if let (Some(convs), Some(conv_scratch)) = (&self.convs, scratch.conv.as_mut()) {
+                convs[layer_idx]
+                    .mlp
+                    .finish(ctx, &mut scratch.o_buf, conv_scratch)?;
+            }
             ops::add_batch_into(
                 ctx,
                 &scratch.hidden,
@@ -765,7 +818,7 @@ impl DFlashDraftModel {
         for (i, state) in states.iter_mut().enumerate() {
             state.committed_len += context_lens[i];
         }
-        self.compute_logits_with_target_head_into(target, scratch);
+        self.compute_logits_into(target, scratch);
         Ok(&scratch.logits)
     }
 
@@ -866,6 +919,34 @@ impl DFlashDraftModel {
         )
     }
 
+    pub(crate) fn uses_selector(&self) -> bool {
+        self.selector.as_ref().is_some_and(|head| head.enabled)
+    }
+
+    pub(crate) fn selected_draft_tokens(
+        &self,
+        ctx: &DeviceContext,
+        anchors: &[u32],
+        scratch: &mut DFlashBatchScratch,
+    ) -> Result<Vec<u32>> {
+        let head = self
+            .selector
+            .as_ref()
+            .context("DFlash2 selector was not loaded")?;
+        let selector = scratch
+            .selector
+            .as_mut()
+            .context("DFlash2 scratch was not allocated")?;
+        head.select(
+            ctx,
+            &scratch.logits_normed,
+            &scratch.logits,
+            anchors,
+            self.block_size(),
+            selector,
+        )
+    }
+
     fn context_feature_dim(&self) -> usize {
         self.config.hidden_size * self.target_layer_ids().len()
     }
@@ -891,11 +972,7 @@ impl DFlashDraftModel {
         );
     }
 
-    fn compute_logits_with_target_head_into(
-        &self,
-        target: &Qwen3Model,
-        scratch: &mut DFlashBatchScratch,
-    ) {
+    fn compute_logits_into(&self, target: &Qwen3Model, scratch: &mut DFlashBatchScratch) {
         let ctx = target.device_ctx();
         ops::rms_norm_batch_into(
             ctx,
@@ -906,7 +983,9 @@ impl DFlashDraftModel {
         );
         ops::gemm_into(
             ctx,
-            target.output_projection(),
+            self.lm_head
+                .as_ref()
+                .unwrap_or_else(|| target.output_projection()),
             &scratch.logits_normed,
             &mut scratch.logits,
         );
@@ -957,9 +1036,10 @@ mod tests {
         // term (draft KV 5*2*1024*2 + scratch-context (3*2560+2*1024)*2 + pending
         // 2560*5*2) drives the ~12% block haircut; a layer-count or geometry
         // regression here would silently over/under-reserve and risk OOM.
-        let reservation =
-            super::DFlashMemoryReservation::from_config(&dflash, /*max_decode_batch*/ 256)
-                .expect("reservation sizing");
+        let reservation = super::DFlashMemoryReservation::backbone_from_config(
+            &dflash, /*max_decode_batch*/ 256,
+        )
+        .expect("reservation sizing");
         assert_eq!(
             reservation.kv_bytes_per_token, 65_536,
             "draft KV(20480) + scratch-ctx(19456) + pending(25600) per token"
@@ -967,7 +1047,7 @@ mod tests {
         // Weights (~1.1 GiB) dominate the fixed term at batch=1; the block-sized
         // per-request scratch (~6.5 MiB, logits-heavy) plus the one-block KV/tail
         // headroom (~0.5 MiB) add across the decode batch.
-        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1)
+        let fixed_batch1 = super::DFlashMemoryReservation::backbone_from_config(&dflash, 1)
             .expect("reservation sizing")
             .fixed_bytes;
         assert!(

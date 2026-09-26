@@ -26,6 +26,7 @@ use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::SchedulerHandle;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
@@ -124,6 +125,13 @@ impl EngineHarness {
             inbox,
             info: engine.info,
         }
+    }
+
+    pub(crate) fn metrics(&self) -> SchedulerMetrics {
+        self.handle
+            .as_ref()
+            .expect("harness handle lives until drop")
+            .metrics()
     }
 
     pub(crate) fn submit(&self, request: Request) -> RequestStream {
