@@ -14,8 +14,9 @@ use vllm_chat::EffortValue;
 use vllm_chat::GenerationPromptMode;
 use vllm_text::Prompt;
 
-/// The committed golden named by `env_key`, or `default_rel_path` under
-/// `test_data/` when the variable is unset.
+/// The committed golden named by `env_key`, or `default_path` when the variable
+/// is unset. The path is used exactly as given — callers pass a manifest-rooted
+/// path, not a name relative to `test_data/`.
 pub(crate) fn golden(env_key: &str, default_path: &str) -> Value {
     let path = std::env::var(env_key).unwrap_or_else(|_| default_path.to_string());
     let raw =

@@ -171,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
 
     let model_path = shared.model_path.clone();
     let served_model_name = shared.served_model_name.clone();
+    let tool_call_parser = shared.tool_call_parser.clone();
     let port = shared.port;
 
     // Engine load (weights → GPU) runs on a blocking thread so the HTTP
@@ -203,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
             engine,
             model_path.to_string_lossy().into_owned(),
             served_model_name.into_iter().collect(),
+            tool_call_parser,
             lora_modules,
             port,
             max_model_len,
@@ -230,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
                 engine,
                 &model_path,
                 served_model_name.into_iter().collect(),
+                tool_call_parser.clone(),
                 port,
                 None,
                 plan.scheduler_partition_count,
@@ -241,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 engine,
                 &model_path,
                 served_model_name.into_iter().collect(),
+                tool_call_parser,
                 port,
                 None,
                 plan.scheduler_partition_count,
