@@ -143,25 +143,50 @@ impl Qwen35Model {
             eps,
         );
 
-        ops::paged_attention_batch_decode_hd256_into(
-            &self.ctx,
-            &bufs.q_attn,
-            &bufs.k_attn,
-            &bufs.v_attn,
-            kv_buffer,
-            layout,
-            layer_idx,
-            &bufs.page_indices_d,
-            &bufs.page_indptr_d,
-            &bufs.last_page_len_d,
-            &bufs.positions_d,
-            &bufs.request_indices_d,
-            &bufs.kv_tile_indices_d,
-            &bufs.kv_chunk_size_d,
-            &mut bufs.attn_out_full,
-            num_attention_heads,
-            bs,
-        )?;
+        if bs <= super::decode_buffers::SPLIT_DECODE_MAX_BATCH {
+            ops::paged_attention_batch_decode_split_hd256_into(
+                &self.ctx,
+                &bufs.q_attn,
+                &bufs.k_attn,
+                &bufs.v_attn,
+                kv_buffer,
+                layout,
+                layer_idx,
+                &bufs.page_indices_d,
+                &bufs.page_indptr_d,
+                &bufs.last_page_len_d,
+                &bufs.positions_d,
+                &bufs.request_indices_d,
+                &bufs.kv_chunk_size_d,
+                &mut bufs.split_partial_o,
+                &mut bufs.split_partial_m,
+                &mut bufs.split_partial_l,
+                &mut bufs.attn_out_full,
+                num_attention_heads,
+                bs,
+                super::decode_buffers::split_decode_splits(bs),
+            )?;
+        } else {
+            ops::paged_attention_batch_decode_hd256_into(
+                &self.ctx,
+                &bufs.q_attn,
+                &bufs.k_attn,
+                &bufs.v_attn,
+                kv_buffer,
+                layout,
+                layer_idx,
+                &bufs.page_indices_d,
+                &bufs.page_indptr_d,
+                &bufs.last_page_len_d,
+                &bufs.positions_d,
+                &bufs.request_indices_d,
+                &bufs.kv_tile_indices_d,
+                &bufs.kv_chunk_size_d,
+                &mut bufs.attn_out_full,
+                num_attention_heads,
+                bs,
+            )?;
+        }
 
         unsafe {
             let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);

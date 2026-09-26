@@ -35,6 +35,7 @@ pub use attention::dflash_qk_norm_rope_into;
 pub use attention::eagle3_rope_into;
 pub use attention::paged_attention_batch_decode_hd256_into;
 pub use attention::paged_attention_batch_decode_into;
+pub use attention::paged_attention_batch_decode_split_hd256_into;
 pub use attention::paged_attention_batch_decode_split_kv_hd512_into;
 pub use attention::paged_attention_batch_decode_split_kv_into;
 pub use attention::paged_attention_batch_decode_via_prefill_hd256_into;
