@@ -38,11 +38,10 @@ use zeromq::ZmqMessage;
 use zeromq::prelude::SocketRecv;
 
 use super::BridgeLink;
-use super::SpecDecodeTracker;
+use super::SchedulerStatsTracker;
 use super::connect_link;
 use super::engine_output;
 use super::now_secs_f64;
-use super::scheduler_stats_from;
 use super::send_outputs;
 use super::send_terminal_output;
 use super::send_utility_response;
@@ -82,7 +81,7 @@ impl SteppedEngineBridge {
             .scheduler
             .take_steps()
             .context("partition step stream already taken")?;
-        let mut spec = SpecDecodeTracker::default();
+        let mut tracker = SchedulerStatsTracker::default();
         // Stats are pull-at-send: no push task, the load cell is read when a
         // batch goes out (and once here, so the frontend's gauges initialize
         // before any traffic). An idle engine publishes nothing.
@@ -105,7 +104,7 @@ impl SteppedEngineBridge {
             &output_tx,
             RequestBatchOutputs {
                 engine_index: self.engine_index,
-                scheduler_stats: Some(Box::new(self.stats(&mut spec))),
+                scheduler_stats: Some(Box::new(self.stats(&mut tracker))),
                 timestamp: now_secs_f64(),
                 ..Default::default()
             }
@@ -148,7 +147,7 @@ impl SteppedEngineBridge {
                         &anchor,
                         &mut streams,
                         &mut names,
-                        &mut spec,
+                        &mut tracker,
                         &output_tx,
                     ) {
                         break Err(error).context("failed to dispatch local engine step");
@@ -184,13 +183,10 @@ impl SteppedEngineBridge {
         run_result
     }
 
-    /// Stats for an outgoing batch; the spec delta runs from the last batch
+    /// Stats for an outgoing batch; counter deltas run from the last batch
     /// stamped, not the last step run.
-    fn stats(&self, spec: &mut SpecDecodeTracker) -> SchedulerStats {
-        let snapshot = self.scheduler.metrics();
-        let mut stats = scheduler_stats_from(&snapshot);
-        stats.spec_decoding_stats = spec.interval(&snapshot);
-        stats
+    fn stats(&self, tracker: &mut SchedulerStatsTracker) -> SchedulerStats {
+        tracker.interval(&self.scheduler.metrics())
     }
 
     fn dispatch_step(
@@ -199,7 +195,7 @@ impl SteppedEngineBridge {
         anchor: &UnixAnchor,
         streams: &mut HashMap<RequestId, SteppedStream>,
         names: &mut HashMap<String, RequestId>,
-        spec: &mut SpecDecodeTracker,
+        tracker: &mut SchedulerStatsTracker,
         output_tx: &tokio::sync::mpsc::UnboundedSender<
             vllm_engine_core_client::protocol::output::EngineCoreOutputs,
         >,
@@ -227,10 +223,10 @@ impl SteppedEngineBridge {
         }
 
         if outputs.is_empty() {
-            // A drafted step with no batch to ride would strand its increment
+            // A cache lookup or draft with no batch to ride would strand its increment
             // until the next batch, which may never come.
-            let stats = self.stats(spec);
-            if stats.spec_decoding_stats.is_some() {
+            let stats = self.stats(tracker);
+            if stats.spec_decoding_stats.is_some() || stats.prefix_cache_stats.base.requests > 0 {
                 send_outputs(
                     output_tx,
                     RequestBatchOutputs {
@@ -254,7 +250,7 @@ impl SteppedEngineBridge {
                 engine_index: self.engine_index,
                 outputs,
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
-                scheduler_stats: Some(Box::new(self.stats(spec))),
+                scheduler_stats: Some(Box::new(self.stats(tracker))),
                 timestamp: now_secs_f64(),
             }
             .into(),
@@ -717,6 +713,56 @@ mod tests {
             engine_index: 0,
             data_parallel_size: 1,
         }
+    }
+
+    #[test]
+    fn prefix_only_step_is_sent_once_without_output_tokens() {
+        use vllm_engine_core_client::protocol::output::EngineCoreOutputs;
+
+        use crate::engine::PrefixCacheCounters;
+        use crate::engine::SchedulerMetrics;
+
+        let (handle, backend) = scheduler_pair();
+        let bridge = bridge(handle);
+        backend.metrics.publish(&SchedulerMetrics {
+            prefix_cache: PrefixCacheCounters {
+                requests: 1,
+                queries: 100,
+                hits: 60,
+            },
+            ..Default::default()
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tracker = SchedulerStatsTracker::default();
+        let mut streams = HashMap::new();
+        let mut names = HashMap::new();
+        let anchor = UnixAnchor::now();
+        for _ in 0..2 {
+            bridge
+                .dispatch_step(
+                    StepOutputs::default(),
+                    &anchor,
+                    &mut streams,
+                    &mut names,
+                    &mut tracker,
+                    &tx,
+                )
+                .unwrap();
+        }
+        let EngineCoreOutputs::RequestBatch(batch) = rx.try_recv().unwrap() else {
+            panic!("expected stats batch");
+        };
+        let stats = batch
+            .scheduler_stats
+            .unwrap()
+            .prefix_cache_stats
+            .base
+            .clone();
+        assert_eq!((stats.requests, stats.queries, stats.hits), (1, 100, 60));
+        assert!(
+            rx.try_recv().is_err(),
+            "unchanged totals must not send another batch"
+        );
     }
 
     fn wire_request(completion: Option<i32>, prompt: Option<i32>) -> EngineCoreRequest {
