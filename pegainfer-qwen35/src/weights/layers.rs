@@ -43,10 +43,11 @@ pub(crate) struct LinearAttentionLayer {
     pub(crate) conv1d_weight: DeviceVec,
     /// dt_bias: [local_linear_num_value_heads] bf16
     pub(crate) dt_bias: DeviceVec,
-    /// A_log: [local_linear_num_value_heads] f32 (widened from bf16 storage)
+    /// A_log: [local_linear_num_value_heads] f32 (f32 storage, or bf16 storage
+    /// widened exactly at load — Qwen3.5 stores f32, Qwen3.8 bf16)
     pub(crate) a_log: CudaSlice<f32>,
     /// RMSNorm weight for output normalization: [value_head_dim] f32 (same
-    /// widening) — head-shared, so replicated on every rank.
+    /// storage/widening as `a_log`) — head-shared, so replicated on every rank.
     pub(crate) norm_weight: CudaSlice<f32>,
     /// Output projection: [hidden_size, local_linear_z_dim] (row-parallel;
     /// the layer all-reduces the partial hidden sum under TP).

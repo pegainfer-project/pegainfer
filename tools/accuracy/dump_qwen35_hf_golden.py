@@ -151,8 +151,12 @@ def main() -> int:
     parser.add_argument(
         "--out",
         default=None,
-        help="output path; defaults to test_data/{generation}-{size}-hf-golden.safetensors "
-        "derived from the model config (the only names the gate looks up)",
+        help="output path; defaults to test_data/{generation}-{size}-hf"
+        "[-long]-golden.safetensors derived from the model config and "
+        "--prompt-lens. These names are the dumper's convention, not a gate key: "
+        "the gate scans candidates matching that pattern and selects by "
+        "config_sha256. Override the fixture with PEGAINFER_QWEN35_HF_GOLDEN / "
+        "PEGAINFER_QWEN35_HF_LONG_GOLDEN.",
     )
     parser.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
     parser.add_argument(
@@ -297,12 +301,7 @@ def main() -> int:
         "torch_version": torch.__version__,
         "transformers_version": __import__("transformers").__version__,
     }
-    # An all-NaN oracle is possible: transformers falls back to an eager torch
-    # gated-DeltaNet implementation when flash-linear-attention is missing, and on
-    # the 27B geometry that fallback returned nothing but NaNs while pegainfer's own
-    # side stayed sane. The gate would then report mean/p99 NaN as a fixture
-    # mismatch — refuse here, where the fix is one command away, instead of ~25
-    # minutes and two model loads later on the GPU.
+    # A non-finite oracle is not a golden (an eager GDN fallback produced all-NaN); refuse before writing.
     lp = tensors["topk_logprobs"]
     finite = torch.isfinite(lp)
     if not bool(finite.all()):
