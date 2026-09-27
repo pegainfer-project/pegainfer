@@ -959,4 +959,35 @@ mod tests {
         assert!(provided.contains("line_a_flag"));
         assert!(!provided.contains("port"));
     }
+
+    #[test]
+    fn tool_call_parser_defaults_to_auto() {
+        let (shared, _, _) = parse_for_line(&LINE_A, &["pegainfer"]).expect("defaults parse");
+        assert_eq!(shared.tool_call_parser, ParserSelection::Auto);
+    }
+
+    #[test]
+    fn tool_call_parser_accepts_a_registered_name() {
+        let (shared, _, _) =
+            parse_for_line(&LINE_A, &["pegainfer", "--tool-call-parser", "qwen3_coder"])
+                .expect("a registered parser parses and validates");
+        assert_eq!(
+            shared.tool_call_parser,
+            ParserSelection::Explicit("qwen3_coder".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_call_parser_rejects_an_unregistered_name_before_engine_load() {
+        let error = parse_for_line(
+            &LINE_A,
+            &["pegainfer", "--tool-call-parser", "no-such-parser"],
+        )
+        .expect_err("an unregistered parser must be refused at validation");
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid --tool-call-parser") && message.contains("not registered"),
+            "{message}"
+        );
+    }
 }
