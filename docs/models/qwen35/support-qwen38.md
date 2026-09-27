@@ -14,11 +14,13 @@
 > two real serving deltas are both in the chat template, not the tower:
 > `reasoning_effort` accepts only `xhigh|medium|low`, so the frontend maps the
 > OpenAI-only `high`/`max` onto `xhigh` and `minimal` onto `low` before the
-> template sees them, and its tool format is the Qwen Coder one that `Auto`
+> template sees them — gated on the `output_gate_type` marker, because other
+> lines accept those values natively (Kimi K3 breaks under a global rewrite) —
+> and its tool format is the Qwen Coder one that `Auto`
 > parser selection cannot reach from a `Qwen3.8-27B` directory — name the
 > parser with `--tool-call-parser`. Both serving notes are measured against the
-> checkpoint's own template, and the TP2 short/long logits rows plus the seven
-> chat cases have been re-run at the current head. Tracked in #1067.
+> checkpoint's own template, and the TP2 short/long logits rows have been
+> re-run at the current head. Tracked in #1067.
 >
 > **Last touched:** 2026-09
 
@@ -124,7 +126,14 @@ rejected render arrives as an unknown-function error and is mapped to
 
 `pegainfer-frontend/src/vllm/reasoning_effort.rs` closes that: a route layer over
 `/v1/chat/completions` rewrites the *top-level* field before the upstream
-renderer converts it, `high`/`max` → `xhigh` and `minimal` → `low`.
+renderer converts it, `high`/`max` → `xhigh` and `minimal` → `low`. The layer
+is **gated on the model**: it activates only when the served checkpoint's
+`config.json` records the save-time `output_gate_type` marker — the field a
+Qwen3.8 save carries and a Qwen3.5 save omits. Every other line keeps
+receiving the caller's value verbatim, because rewriting it breaks them:
+Kimi K3's renderer, for one, accepts `high` and `max` natively
+(`VALID_THINKING_EFFORTS = ["low", "high", "max"]`) and rejects the `xhigh`
+rewrite — reproduced before the gate landed.
 
 | `reasoning_effort` | before | after |
 | --- | --- | --- |
@@ -138,6 +147,19 @@ explicit `chat_template_kwargs.reasoning_effort` is deliberately **not**
 rewritten: that is the caller addressing the template directly, and a value
 outside its vocabulary still fails the render there — the layer rewrites the API
 field, not the template contract.
+
+The renders were also once checked case-by-case against the checkpoint's HF
+reference (a committed golden + a render-parity test, seven cases
+byte-identical). That suite was removed in review: it constructed an upstream
+`vllm_chat::ChatRequest` and called the vendored renderer directly, so it
+measured the pinned `vllm-chat` rev rather than anything this repository
+decides. What remains is the HTTP-path coverage — the sim e2e
+`reasoning_effort_extremes_are_mapped_onto_the_templates_vocabulary` drives the
+mapping through the real stack against a guarded template, the unit tests pin
+the rewrite and the gate, and the byte-identical render record above stands as
+a one-shot measurement against revision `1d4bf0f2`. Re-verifying after a
+`vllm-chat` rev bump means re-dumping the reference and diffing renders by
+hand; the record documents the procedure's inputs.
 
 ## Tool-call parsing
 
@@ -162,24 +184,23 @@ mismatch the flag exists to fix. The flag appears in `--help` with
 Error: invalid --tool-call-parser: tool parser `this-parser-does-not-exist` is not registered (choose from: … qwen3_coder, qwen3_xml, …)
 ```
 
-`pegainfer-sim/tests/tool_call_roundtrip.rs` covers the HTTP path: an `Auto`
-request on a family-less model directory fails, the same request with an
-explicit parser parses into `tool_calls`, and the streaming / non-streaming
-cases still pass. What this does **not** establish is which grammar *this*
-checkpoint emits — that needs a GPU run with the real weights; `qwen3_coder` is
-the name to try first if its calls are the `<function=…>` form.
+The flag's wiring is pinned by unit tests
+(`pegainfer-frontend/src/model_line.rs`): `--tool-call-parser` defaults to
+`Auto`, a registered name parses through to the server, and an unregistered
+name is refused by `validate_parser_overrides` before an engine load is spent:
+
+```text
+Error: invalid --tool-call-parser: tool parser `this-parser-does-not-exist` is not registered (choose from: … qwen3_coder, qwen3_xml, …)
+```
+
+What the tests deliberately do not cover is the upstream `Auto` match itself or
+which grammar *this* checkpoint emits — the `qwen3_xml` log line above is a
+manual measurement, and the emitted grammar needs a GPU run with the real
+weights; `qwen3_coder` is the name to try first if its calls are the
+`<function=…>` form.
 
 Parser selection is per-deployment, not per-request, and `--served-model-name`
 does not influence it.
-
-`pegainfer-frontend/tests/qwen38_chat_template_parity.rs` covers seven cases
-against `qwen38-chat-golden.json`, bound to the checkpoint by file digests,
-with the shared render/compare machinery in
-`pegainfer-frontend/tests/common/mod.rs` and the reference dumped by the
-generic `tools/accuracy/dump_chat_template_golden.py qwen38`. The template also
-honours `preserve_thinking`, but no case exercises it: against `MULTI_TURN`
-(whose assistant turn carries no reasoning) it renders byte-identical to
-`multi_turn`, so it tests nothing.
 
 ## Serving budget (unchanged from Qwen3.5-27B)
 
@@ -205,29 +226,28 @@ Qwen3.5 sizes the unsharded `load_tensor_2d` path actually meets on a real
 checkpoint — those loads assert every 2D tensor's shape against the config, and
 they are what "Qwen3.5 behaviour is unchanged" points to.
 
-The TP2 and chat rows were re-run at the current head after the fixture-lookup
-and fail-closed-revision changes (the revision check decides whether the gate
+The TP2 rows were re-run at the current head after the fixture-lookup and
+fail-closed-revision changes (the revision check decides whether the gate
 compares at all), and they reproduce the earlier numbers exactly. The
 `reasoning_effort` layer and the formatting pass landed after those runs: the
-logits gate and the chat-parity test both drive the engine and the renderer
-directly and never issue an HTTP request, so neither can see that layer, and the
-rows that do exercise it were re-run on the final bytes.
+logits gate drives the engine directly and never issues an HTTP request, so it
+cannot see that layer, and the rows that do exercise it were re-run on the
+final bytes.
 
 | Gate | Head / device | Result |
 | --- | --- | --- |
 | `hf_golden_gate` short, Qwen3.8-27B TP2 | current head, 2×L20 (sm_89) | 1 passed / 0 failed. Sequential eager: 108 positions, mean 0.0238 / p50 0.0199 / p99 0.0862 / max 0.1593. Batched eager: 72 positions, mean 0.0231 / p99 0.0823 / max 0.1274. No argmax violation. |
 | `hf_golden_gate` long, Qwen3.8-27B TP2 | current head, 2×L20 (sm_89) | 1 passed / 0 failed. 4097 + 8192-token prompts, 18 positions, mean 0.0226 / p50 0.0206 / p99 0.0860 / max 0.0882. |
-| `qwen38_chat_template_parity` (7 cases) | current head | 1 passed / 0 failed, every case byte-identical to the HF render. |
-| `hf_golden_gate` fail-closed unit tests | current head | 4 passed / 0 failed: unresolved revision panics naming `PEGAINFER_TEST_MODEL_REVISION`, a mismatched revision panics, a matching one is accepted, and zero fixture matches panic. |
+| `hf_golden_gate` zero-fixture-match panic | current head | 1 passed / 0 failed: a config no committed fixture records panics instead of skipping. (The revision-helper unit tests were dropped in review — the fail-closed contract lives in `check_fixture_metadata`'s call path, not a fixed-value wrapper.) |
 | `hf_golden_gate` Qwen3.5-0.8B, single GPU (tied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0298 / p99 0.1137. Long: 18 positions, mean 0.0286 / p99 0.0926. |
 | `hf_golden_gate` Qwen3.5-2B, single GPU (tied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0301 / p99 0.1172. Long: 18 positions, mean 0.0238 / p99 0.0778. |
 | `hf_golden_gate` Qwen3.5-4B, single GPU (untied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0238 / p99 0.0813. Long: 18 positions, mean 0.0223 / p99 0.0705. |
 | serving probe (sim + real 27B template, CPU) | current head | Auto selects `qwen3_xml` on the 27B path; `reasoning_effort` maps `high`/`max`→`xhigh` and `minimal`→`low` (measured 200 where they were 500), pass-through values unchanged, kwargs-only effort still rendered raw; `--tool-call-parser` exposed and its invalid-name rejection fires before engine load. |
-| `reasoning_effort` normalization (unit) | current head | 4 passed / 0 failed: the aliases map, `none`/`low`/`medium`/`xhigh` pass through, an absent/non-string/non-JSON body is untouched, and a kwargs-only effort is never rewritten. |
+| `reasoning_effort` normalization + gate (unit) | current head | 5 passed / 0 failed: the aliases map, `none`/`low`/`medium`/`xhigh` pass through, bodies without a rewritable top-level field come back verbatim, the mapping gates on the `output_gate_type` config marker, and a kwargs-only effort is never rewritten. |
 | `pegainfer-qwen35 --lib` (feature build, Triton AOT) | review-fix head, 1×L20 | 102 passed / 0 failed, the GPU recurrent tests included. |
 | `pegainfer-core --lib` | review-fix head | 38 passed / 0 failed (f32-cow: 1D bf16 accepted, other dtypes/ranks rejected). |
-| `pegainfer-frontend --lib` | current head | 84 passed / 0 failed, the CLI consume-or-reject schema tests included. |
-| `frontend_e2e` + `tool_call_roundtrip` (CPU, `pegainfer-sim`) | current head | 23 passed / 0 failed and 5 passed / 0 failed; `frontend_e2e` carries the guarded-template `reasoning_effort` case (and still fails a kwargs-only effort, which is the deliberate boundary), `tool_call_roundtrip` carries the `Auto`-vs-explicit parser contrast. |
+| `pegainfer-frontend --lib` | current head | 88 passed / 0 failed, the CLI consume-or-reject schema tests and the `--tool-call-parser` parse/validate tests included. |
+| `frontend_e2e` + `tool_call_roundtrip` (CPU, `pegainfer-sim`) | current head | 23 passed / 0 failed and 3 passed / 0 failed; `frontend_e2e` carries the guarded-template `reasoning_effort` case (and still fails a kwargs-only effort, which is the deliberate boundary). The roundtrip suite keeps the streaming / non-streaming cases; the `Auto`-vs-explicit contrast moved to the CLI unit tests per review. |
 | clippy `-D warnings` | current head | `pegainfer-qwen35 --features qwen35 --all-targets`, `pegainfer-frontend` and `pegainfer-sim` (all targets) clean; `cargo fmt --all --check` clean. core/qwen3 as recorded earlier. |
 
 Tolerances are the line's existing 4B calibration (`MEAN_TOL 0.06`,
@@ -252,9 +272,6 @@ python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path $D \
 python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path $D \
   --model-revision … --tokenizer-revision … \
   --prompt-lens 4097,8192 --decode-tokens 8
-python3 tools/accuracy/dump_chat_template_golden.py qwen38 \
-  $D test_data/qwen38-chat-golden.json \
-  --source-repo Qwen/Qwen3.8-27B --revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
 
 # 2. the gates. Run each TP2 test by exact name: a `_tp2` substring filter also
 #    selects the graph test, whose group-6 skip is not an eager pass.
@@ -268,9 +285,6 @@ PEGAINFER_TEST_MODEL_PATH=$D PEGAINFER_TEST_MODEL_REVISION=1d4bf0f2… \
   cargo test -r --locked -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate \
   -- --ignored --exact --nocapture --test-threads 1 \
   pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2
-PEGAINFER_TEST_MODEL_PATH=$D \
-  cargo test -r --locked -p pegainfer-frontend --test qwen38_chat_template_parity \
-  -- --ignored --exact --nocapture chat_renders_match_hf_reference
 
 # 3. the single-GPU Qwen3.5 rows (any one size; the fixture is picked by
 #    config_sha256, so point the path at whichever size's checkpoint)
