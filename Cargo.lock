@@ -3661,6 +3661,8 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "fastrace",
+ "futures",
+ "http-body-util",
  "log",
  "rmp-serde",
  "rmpv",

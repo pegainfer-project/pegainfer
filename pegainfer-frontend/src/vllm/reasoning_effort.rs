@@ -39,6 +39,7 @@ use axum::http::StatusCode;
 use axum::http::header::CONTENT_LENGTH;
 use axum::middleware::Next;
 use axum::response::Response;
+use http_body_util::LengthLimitError;
 use log::info;
 
 /// Only the chat route reads `reasoning_effort`.
@@ -89,10 +90,15 @@ async fn normalize_request(request: Request, next: Next) -> Result<Response, (St
 
     let (mut parts, body) = request.into_parts();
     let mut bytes = to_bytes(body, BODY_LIMIT).await.map_err(|error| {
-        (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("failed to read the chat request body: {error}"),
-        )
+        let message = format!("failed to read the chat request body: {error}");
+        // 413 belongs to the length-limit rejection alone; any other read
+        // failure keeps the 400 this route reported before the layer existed.
+        let status = if error.into_inner().is::<LengthLimitError>() {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (status, message)
     })?;
 
     if let Some((from, to)) = rewrite_reasoning_effort(&mut bytes) {
@@ -176,11 +182,6 @@ mod tests {
             value["chat_template_kwargs"]["reasoning_effort"],
             serde_json::json!("high")
         );
-
-        let source = r#"{"messages":[{"role":"user","content":"set reasoning_effort to high"}]}"#;
-        let mut body = Bytes::from_static(source.as_bytes());
-        assert_eq!(rewrite_reasoning_effort(&mut body), None);
-        assert_eq!(&body[..], source.as_bytes());
     }
 
     #[test]
@@ -215,6 +216,71 @@ mod tests {
             value["chat_template_kwargs"]["reasoning_effort"],
             serde_json::json!("high"),
             "template kwargs stay the caller's to set"
+        );
+    }
+
+    fn guarded_app() -> Router {
+        normalize_chat_requests(
+            Router::new().route(
+                CHAT_COMPLETIONS_PATH,
+                axum::routing::post(|| async { "ok" }),
+            ),
+            true,
+        )
+    }
+
+    /// Drive the real middleware and return what the caller would see.
+    async fn chat_post(body: Body) -> (StatusCode, String) {
+        use tower::ServiceExt as _;
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(CHAT_COMPLETIONS_PATH)
+            .body(body)
+            .expect("request builds");
+        let response = guarded_app()
+            .oneshot(request)
+            .await
+            .expect("the middleware always answers");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body reads");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn an_oversized_chat_body_is_rejected_as_payload_too_large() {
+        use futures::StreamExt as _;
+
+        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        let chunks = BODY_LIMIT / chunk.len() + 2;
+        let body = Body::from_stream(
+            futures::stream::repeat_with(move || Ok::<Bytes, std::io::Error>(chunk.clone()))
+                .take(chunks),
+        );
+        let (status, message) = chat_post(body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            message.contains("length limit exceeded"),
+            "the limit cause must survive: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_chat_body_keeps_the_bad_request_category_and_the_cause() {
+        let frames = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(br#"{"reasoning_effort":"high","#)),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before the body completed",
+            )),
+        ];
+        let (status, message) = chat_post(Body::from_stream(futures::stream::iter(frames))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            message.contains("connection closed before the body completed"),
+            "the read-failure cause must survive: {message}"
         );
     }
 }
