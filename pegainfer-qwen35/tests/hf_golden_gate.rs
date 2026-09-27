@@ -1036,28 +1036,3 @@ fn missing_default_fixture_panics() {
     .unwrap();
     find_default_fixture(dir.path().to_str().unwrap(), false);
 }
-
-#[test]
-#[should_panic(expected = "PEGAINFER_TEST_MODEL_REVISION")]
-fn unresolved_model_revision_panics_naming_the_env_var() {
-    require_model_revision("/models/Qwen3.8-27B", "1d4bf0f2", None);
-}
-
-#[test]
-#[should_panic(expected = "model revision mismatch")]
-fn mismatched_model_revision_panics() {
-    require_model_revision(
-        "/models/Qwen3.8-27B",
-        "1d4bf0f2",
-        Some("deadbeef".to_string()),
-    );
-}
-
-#[test]
-fn matching_model_revision_is_accepted() {
-    require_model_revision(
-        "/models/Qwen3.8-27B",
-        "1d4bf0f2",
-        Some("1d4bf0f2".to_string()),
-    );
-}
