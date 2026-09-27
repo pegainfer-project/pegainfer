@@ -184,14 +184,13 @@ mismatch the flag exists to fix. The flag appears in `--help` with
 Error: invalid --tool-call-parser: tool parser `this-parser-does-not-exist` is not registered (choose from: … qwen3_coder, qwen3_xml, …)
 ```
 
-The flag's wiring is pinned by unit tests
-(`pegainfer-frontend/src/model_line.rs`): `--tool-call-parser` defaults to
-`Auto`, a registered name parses through to the server, and an unregistered
-name is refused by `validate_parser_overrides` before an engine load is spent:
-
-```text
-Error: invalid --tool-call-parser: tool parser `this-parser-does-not-exist` is not registered (choose from: … qwen3_coder, qwen3_xml, …)
-```
+What a unit test does pin
+(`pegainfer-frontend/src/model_line.rs`) is the repo-side validation hook: an
+unregistered name is refused by `validate_parser_overrides` before an engine
+load is spent. How `auto`/`none`/a registered name parse is upstream
+clap/`ParserSelection` behaviour and is not re-tested here — such cases stop
+at `SharedArgs` and would stay green even if the server stopped forwarding
+the flag.
 
 What the tests deliberately do not cover is the upstream `Auto` match itself or
 which grammar *this* checkpoint emits — the `qwen3_xml` log line above is a
@@ -243,10 +242,10 @@ final bytes.
 | `hf_golden_gate` Qwen3.5-2B, single GPU (tied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0301 / p99 0.1172. Long: 18 positions, mean 0.0238 / p99 0.0778. |
 | `hf_golden_gate` Qwen3.5-4B, single GPU (untied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0238 / p99 0.0813. Long: 18 positions, mean 0.0223 / p99 0.0705. |
 | serving probe (sim + real 27B template, CPU) | current head | Auto selects `qwen3_xml` on the 27B path; `reasoning_effort` maps `high`/`max`→`xhigh` and `minimal`→`low` (measured 200 where they were 500), pass-through values unchanged, kwargs-only effort still rendered raw; `--tool-call-parser` exposed and its invalid-name rejection fires before engine load. |
-| `reasoning_effort` normalization + gate (unit) | current head | 5 passed / 0 failed: the aliases map, `none`/`low`/`medium`/`xhigh` pass through, bodies without a rewritable top-level field come back verbatim, the mapping gates on the `output_gate_type` config marker, and a kwargs-only effort is never rewritten. |
+| `reasoning_effort` normalization + gate (unit) | current head | 7 passed / 0 failed: the aliases map, `none`/`low`/`medium`/`xhigh` pass through, bodies without a rewritable top-level field come back verbatim, the mapping gates on the `output_gate_type` config marker, a kwargs-only effort is never rewritten, and the body-read failure categories are pinned through the live middleware — an oversized body is a 413 naming the length limit, a truncated stream keeps its 400 category and its cause text. |
 | `pegainfer-qwen35 --lib` (feature build, Triton AOT) | review-fix head, 1×L20 | 102 passed / 0 failed, the GPU recurrent tests included. |
 | `pegainfer-core --lib` | review-fix head | 38 passed / 0 failed (f32-cow: 1D bf16 accepted, other dtypes/ranks rejected). |
-| `pegainfer-frontend --lib` | current head | 88 passed / 0 failed, the CLI consume-or-reject schema tests and the `--tool-call-parser` parse/validate tests included. |
+| `pegainfer-frontend --lib` | current head | 88 passed / 0 failed, the CLI consume-or-reject schema tests, the `--tool-call-parser` rejection test and the two middleware body-read category tests included. |
 | `frontend_e2e` + `tool_call_roundtrip` (CPU, `pegainfer-sim`) | current head | 23 passed / 0 failed and 3 passed / 0 failed; `frontend_e2e` carries the guarded-template `reasoning_effort` case (and still fails a kwargs-only effort, which is the deliberate boundary). The roundtrip suite keeps the streaming / non-streaming cases; the `Auto`-vs-explicit contrast moved to the CLI unit tests per review. |
 | clippy `-D warnings` | current head | `pegainfer-qwen35 --features qwen35 --all-targets`, `pegainfer-frontend` and `pegainfer-sim` (all targets) clean; `cargo fmt --all --check` clean. core/qwen3 as recorded earlier. |
 
