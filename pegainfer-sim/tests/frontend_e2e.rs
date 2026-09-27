@@ -914,7 +914,9 @@ async fn chat_completions_returns_correct_format() -> Result<()> {
 /// *inside* the thinking branch, so `enable_thinking=false` — which the renderer
 /// derives from `reasoning_effort=none` — skips it entirely. `raise_exception`
 /// is deliberately not registered by the pinned frontend, so a rejected value is
-/// a hard render failure exactly as in production, not a friendly message.
+/// a hard render failure exactly as in production, not a friendly message. The
+/// config carries the save-time `output_gate_type` marker so the serving-side
+/// effort mapping — gated on exactly that marker — is active for this fixture.
 fn model_dir_with_effort_guard() -> Result<TempDir> {
     let dir = model_dir_with_minimal_metadata()?;
     fs::write(
@@ -922,6 +924,11 @@ fn model_dir_with_effort_guard() -> Result<TempDir> {
         TINY_TOKENIZER_CONFIG_EFFORT_GUARD_JSON,
     )
     .context("failed to write effort-guard tokenizer_config.json")?;
+    fs::write(
+        dir.path().join("config.json"),
+        TINY_CONFIG_JSON_EFFORT_GUARD,
+    )
+    .context("failed to write effort-guard config.json")?;
     Ok(dir)
 }
 
@@ -1429,4 +1436,14 @@ const TINY_CONFIG_JSON: &str = r#"{
   "model_type": "pegainfer_sim",
   "max_position_embeddings": 128,
   "vocab_size": 16
+}"#;
+
+/// The tiny config plus the save-time `output_gate_type` marker a Qwen3.8
+/// checkpoint carries — the field the serving-side `reasoning_effort` mapping
+/// gates on (`pegainfer-frontend/src/vllm/reasoning_effort.rs`).
+const TINY_CONFIG_JSON_EFFORT_GUARD: &str = r#"{
+  "model_type": "pegainfer_sim",
+  "max_position_embeddings": 128,
+  "vocab_size": 16,
+  "text_config": {"output_gate_type": "swish"}
 }"#;

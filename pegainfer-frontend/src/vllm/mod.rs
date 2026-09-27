@@ -372,6 +372,10 @@ where
         }
     });
 
+    // The effort mapping only applies to checkpoints whose template rejects
+    // the OpenAI-only values; decide once, from the served model's config.
+    let effort_mapping_enabled = reasoning_effort::mapping_enabled(&model_id);
+
     let config = Config {
         transport_mode: TransportMode::Bootstrapped {
             input_address,
@@ -422,7 +426,7 @@ where
     };
 
     let result = vllm_server::serve_with_router_extension(config, server_shutdown, move |router| {
-        reasoning_effort::normalize_chat_requests(extend_router(router))
+        reasoning_effort::normalize_chat_requests(extend_router(router), effort_mapping_enabled)
     })
     .await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),
