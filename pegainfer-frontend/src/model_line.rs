@@ -112,10 +112,10 @@ pub struct SharedArgs {
     pub port: u16,
 
     /// Tool-call output parser: `auto` (match the model), `none`, or an explicit
-    /// registered parser name such as `qwen3_coder`. `auto` matches the model
-    /// *path* by substring, so a `Qwen3.8-27B` directory resolves to the generic
-    /// `qwen3` pattern — name the parser explicitly when the checkpoint emits a
-    /// different tool format than that pattern expects.
+    /// registered parser name such as `qwen3_coder`. Upstream `auto` matches the
+    /// model *path* by substring; a line whose checkpoints share one tool format
+    /// (Qwen3.5/Qwen3.8 → `qwen3_coder`) resolves `auto` to that parser itself,
+    /// so the directory name no longer decides.
     #[arg(long, default_value_t = ParserSelection::Auto)]
     pub tool_call_parser: ParserSelection,
 
@@ -296,6 +296,25 @@ pub struct ServePlan {
     pub prefill_only: bool,
     /// `Some` enables the LoRA routes, preloading the listed adapters.
     pub lora_modules: Option<Vec<LoraModule>>,
+    /// The parser this line's tool syntax feeds, used when the caller leaves
+    /// `--tool-call-parser` at `auto`. Upstream `Auto` matches the model
+    /// *path* by substring, so it depends on the directory name; a line whose
+    /// checkpoints share one tool format resolves `auto` itself instead.
+    pub auto_tool_call_parser: Option<ParserSelection>,
+}
+
+impl ServePlan {
+    /// The parser the server should run with: an explicit user selection wins;
+    /// `auto` falls back to the line's own default when it declares one.
+    pub fn resolve_tool_call_parser(&self, requested: ParserSelection) -> ParserSelection {
+        match requested {
+            ParserSelection::Auto => self
+                .auto_tool_call_parser
+                .clone()
+                .unwrap_or(ParserSelection::Auto),
+            explicit => explicit,
+        }
+    }
 }
 
 impl Default for ServePlan {
@@ -304,6 +323,7 @@ impl Default for ServePlan {
             scheduler_partition_count: 1,
             prefill_only: false,
             lora_modules: None,
+            auto_tool_call_parser: None,
         }
     }
 }
@@ -971,6 +991,37 @@ mod tests {
         assert!(
             message.contains("invalid --tool-call-parser") && message.contains("not registered"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn a_line_default_resolves_auto_and_never_overrides_an_explicit_choice() {
+        let coder = ParserSelection::Explicit("qwen3_coder".to_string());
+        let plan = ServePlan {
+            auto_tool_call_parser: Some(coder.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan.resolve_tool_call_parser(ParserSelection::Auto),
+            coder,
+            "auto takes the line's own default"
+        );
+        assert_eq!(
+            plan.resolve_tool_call_parser(ParserSelection::None),
+            ParserSelection::None,
+            "an explicit none is the caller's to make"
+        );
+        let explicit = ParserSelection::Explicit("qwen3_xml".to_string());
+        assert_eq!(
+            plan.resolve_tool_call_parser(explicit.clone()),
+            explicit,
+            "an explicit name wins over the line default"
+        );
+        let plain = ServePlan::default();
+        assert_eq!(
+            plain.resolve_tool_call_parser(ParserSelection::Auto),
+            ParserSelection::Auto,
+            "a line without a default keeps upstream Auto"
         );
     }
 }

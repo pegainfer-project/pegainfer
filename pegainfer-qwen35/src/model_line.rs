@@ -9,6 +9,8 @@ use pegainfer_frontend::model_line::CliDecodeOverlap;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
+use pegainfer_frontend::model_line::ServePlan;
+use pegainfer_frontend::vllm::ParserSelection;
 
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35LaunchOptions;
@@ -144,6 +146,18 @@ impl ModelLine for Qwen35Line {
             ));
         }
         Ok(())
+    }
+
+    fn serve_plan(&self, _ctx: &LaunchContext<'_>) -> Result<ServePlan, CliError> {
+        Ok(ServePlan {
+            // Both generations' templates request the Qwen Coder tool syntax,
+            // but upstream `Auto` matches the model *path* by substring: a
+            // `Qwen3.8-27B` directory resolves to the JSON `qwen3_xml` parser
+            // (`docs/models/qwen35/support-qwen38.md`). The line knows better
+            // than the directory name.
+            auto_tool_call_parser: Some(ParserSelection::Explicit("qwen3_coder".to_string())),
+            ..Default::default()
+        })
     }
 
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {

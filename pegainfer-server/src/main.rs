@@ -171,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
 
     let model_path = shared.model_path.clone();
     let served_model_name = shared.served_model_name.clone();
-    let tool_call_parser = shared.tool_call_parser.clone();
+    let tool_call_parser = plan.resolve_tool_call_parser(shared.tool_call_parser.clone());
     let port = shared.port;
 
     // Engine load (weights → GPU) runs on a blocking thread so the HTTP
