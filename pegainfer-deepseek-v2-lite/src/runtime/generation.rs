@@ -16,6 +16,7 @@ use super::helpers::append_generated_token;
 use super::helpers::duration_micros;
 use super::helpers::ensure_same_prompt_batch_rows_match;
 use super::helpers::token_sha256;
+use super::moe::DeviceRoutedMoeRuntime;
 use super::types::BatchedGenerationResult;
 use super::types::GenerationResult;
 use super::types::GenerationStats;
@@ -136,13 +137,21 @@ impl DeepSeekV2LiteEp2Generator {
             started.elapsed().as_secs_f64()
         );
 
-        Ok(Self {
+        let mut generator = Self {
             device_ordinals: options.device_ordinals,
             config,
             rank0,
             rank1,
             backend,
-        })
+            device_routed_moe: None,
+        };
+        if generator.backend.kind() == super::backend::EpBackendKind::Nccl {
+            generator.device_routed_moe = Some(std::sync::Mutex::new(
+                DeviceRoutedMoeRuntime::new(&generator)
+                    .context("initialize DeepSeek-V2-Lite device-routed MoE")?,
+            ));
+        }
+        Ok(generator)
     }
 
     pub fn generate_greedy(

@@ -223,6 +223,20 @@ impl DriverRankModel {
         };
         routed_expert_from_slice(&self.layout, &moe.experts, global_expert)
     }
+
+    /// Gets the gate up and down projection matrices for at the given MoE layer.
+    pub(crate) fn routed_expert_projections(
+        &self,
+        layer_idx: usize,
+    ) -> Result<Vec<(&DeviceMatrix, &DeviceMatrix)>> {
+        self.layout
+            .owned_experts()
+            .map(|global_expert| {
+                let expert = self.routed_expert(layer_idx, global_expert)?;
+                Ok((&expert.dense.gate_up_proj, &expert.dense.down_proj))
+            })
+            .collect()
+    }
 }
 
 impl ExpertRankModel {
@@ -293,6 +307,20 @@ impl ExpertRankModel {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} is not a MoE layer"))?;
         routed_expert_from_slice(&self.layout, experts, global_expert)
+    }
+
+    /// Gets the gate up and down projection matrices for at the given MoE layer.
+    pub(crate) fn routed_expert_projections(
+        &self,
+        layer_idx: usize,
+    ) -> Result<Vec<(&DeviceMatrix, &DeviceMatrix)>> {
+        self.layout
+            .owned_experts()
+            .map(|global_expert| {
+                let expert = self.routed_expert(layer_idx, global_expert)?;
+                Ok((&expert.dense.gate_up_proj, &expert.dense.down_proj))
+            })
+            .collect()
     }
 }
 

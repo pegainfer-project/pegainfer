@@ -110,7 +110,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `models/deepseek-v2-lite/status.md` | DeepSeek-V2-Lite EP2 status ledger: correctness, direct attribution, lifecycle reliability, and the #466 six-child host-staged/NCCL HTTP SLO report remain separate evidence buckets; no soak, parity, or production claim. |
+| `models/deepseek-v2-lite/device-routed-moe.md` | NCCL MoE forwards with rows 1..8 keep routing and routed-expert execution on device through fixed route slots and pointer-batched N=1 GEMMs; decode performance improves while larger forwards retain the eager fallback. |
 | `models/deepseek-v2-lite/benchmarking.md` | Verification ladder and commands for DSV2-Lite correctness, direct decode diagnostics, retained host-staged/NCCL HTTP SLO profiles, and the separate soak/production boundary. |
 | `models/deepseek-v2-lite/roadmap.md` | Single-node EP2 roadmap: #466 retained SLO reporting is an evidence layer; soak, device KV/attention, long-prefill scheduling, and Stable promotion remain separate gates. |
 | `models/deepseek-v2-lite/benchmark-artifact-manifest.md` | Issue #467 implemented: the retained DeepSeek-V2-Lite benchmark matrix emits `artifact_manifest.json` and `regression_summary.json`, with CPU-only summarize-only tests. |

@@ -120,7 +120,7 @@ fn device_router_logits_match_host_accumulation_bitwise() {
         .alloc_zeros::<f32>(hidden.seq_len * config.n_routed_experts)
         .expect("router logits");
 
-    dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits).expect("device logits");
+    dsv2_lite_router_logits_into(&ctx, hidden.as_ref(), &gate, &mut logits).expect("device logits");
     let got = ctx.stream.clone_dtoh(&logits).expect("logits D2H");
     ctx.sync().expect("sync logits");
 
@@ -174,7 +174,7 @@ fn router_logits_rejects_inflated_hidden_metadata() {
         .alloc_zeros::<f32>(hidden.seq_len * gate.rows)
         .expect("logits");
 
-    let err = dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits)
+    let err = dsv2_lite_router_logits_into(&ctx, hidden.as_ref(), &gate, &mut logits)
         .expect_err("inflated hidden metadata must fail before CUDA launch");
     assert_error_contains(&err, "router hidden backing buffer too small");
 }
@@ -203,7 +203,7 @@ fn router_logits_rejects_inflated_gate_metadata() {
         .alloc_zeros::<f32>(hidden.seq_len * gate.rows)
         .expect("logits");
 
-    let err = dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits)
+    let err = dsv2_lite_router_logits_into(&ctx, hidden.as_ref(), &gate, &mut logits)
         .expect_err("inflated gate metadata must fail before CUDA launch");
     assert_error_contains(&err, "router gate backing buffer too small");
 }

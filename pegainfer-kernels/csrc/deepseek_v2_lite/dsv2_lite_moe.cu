@@ -10,6 +10,106 @@ constexpr int kMaxTopk = 8;
 constexpr int kRouterThreads = 128;
 constexpr int kAccumThreads = 256;
 
+// One thread per row deliberately retains the host softmax summation order.
+__global__ void route_from_logits_kernel(const float *logits, float *weights,
+                                        int *ids, int *errors,
+                                        unsigned long long *summary,
+                                        int layer_idx) {
+  const int token = blockIdx.x;
+  float probs[64];
+  bool selected[64] = {};
+  float maximum = -CUDART_INF_F;
+  bool valid = true;
+  for (int e = 0; e < 64; ++e) {
+    float x = logits[token * 64 + e];
+    valid = valid && isfinite(x);
+    maximum = fmaxf(maximum, x);
+  }
+  errors[token] = valid ? 0 : 1;
+  if (!valid) {
+    atomicAdd(summary + 2, 1ULL);
+    for (int r = 0; r < 6; ++r) {
+      ids[token * 6 + r] = -1;
+      weights[token * 6 + r] = 0.0f;
+    }
+    return;
+  }
+  float sum = 0.0f;
+  for (int e = 0; e < 64; ++e) {
+    probs[e] = expf(logits[token * 64 + e] - maximum);
+    sum = __fadd_rn(sum, probs[e]);
+  }
+  for (int e = 0; e < 64; ++e) probs[e] = __fdiv_rn(probs[e], sum);
+  int chosen[6];
+  for (int r = 0; r < 6; ++r) {
+    int best = -1;
+    for (int e = 0; e < 64; ++e) {
+      if (!selected[e] && (best < 0 || probs[e] > probs[best])) best = e;
+    }
+    chosen[r] = best;
+    selected[best] = true;
+  }
+  for (int i = 1; i < 6; ++i) {
+    int key = chosen[i], j = i - 1;
+    while (j >= 0 && chosen[j] > key) {
+      chosen[j + 1] = chosen[j];
+      --j;
+    }
+    chosen[j + 1] = key;
+  }
+  for (int r = 0; r < 6; ++r) {
+    ids[token * 6 + r] = chosen[r];
+    weights[token * 6 + r] = probs[chosen[r]];
+  }
+  unsigned long long route_hash = 1469598103934665603ULL;
+  for (int r = 0; r < 6; ++r) {
+    route_hash ^= static_cast<unsigned long long>(chosen[r] + 1 + 67 * r + 4099 * token);
+    route_hash *= 1099511628211ULL;
+  }
+  atomicAdd(summary + 3 + layer_idx, route_hash);
+}
+
+__global__ void route_pointers_kernel(
+    const int *ids, const __nv_bfloat16 *hidden, const __nv_bfloat16 *zero,
+    const __nv_bfloat16 *const *w13, const __nv_bfloat16 *const *w2,
+    __nv_bfloat16 *gate, __nv_bfloat16 *act, __nv_bfloat16 *rows,
+    const __nv_bfloat16 **a13, const __nv_bfloat16 **x13, __nv_bfloat16 **y13,
+    const __nv_bfloat16 **a2, const __nv_bfloat16 **x2, __nv_bfloat16 **y2,
+    unsigned long long *summary, int routes, int first_expert, int hidden_dim,
+    int intermediate) {
+  int r = threadIdx.x;
+  if (r >= routes) return;
+  // The same-stream private router produces six in-range, distinct, sorted IDs.
+  int global_expert = ids[r];
+  bool local = global_expert >= first_expert && global_expert < first_expert + 32;
+  int expert = local ? global_expert - first_expert : 0;
+  atomicAdd(summary + 1, 1ULL);
+  if (local) atomicAdd(summary, 1ULL);
+  // Dummy reads use a valid weight and zero input; every output has its own slot.
+  a13[r] = w13[local ? expert : 0];
+  x13[r] = local ? hidden + (r / 6) * hidden_dim : zero;
+  y13[r] = gate + r * 2 * intermediate;
+  a2[r] = w2[local ? expert : 0];
+  x2[r] = act + r * intermediate;
+  y2[r] = rows + r * hidden_dim;
+}
+
+__global__ void route_reduce_kernel(const __nv_bfloat16 *rows, const int *ids,
+                                     const float *weights, const int *errors,
+                                     float *out, int first_expert, int hidden_dim) {
+  int token = blockIdx.x;
+  for (int d = threadIdx.x; d < hidden_dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int r = 0; r < 6; ++r) {
+      int slot = token * 6 + r;
+      int e = ids[slot] - first_expert;
+      if (e >= 0 && e < 32)
+        acc += __bfloat162float(rows[slot * hidden_dim + d]) * weights[slot];
+    }
+    out[token * hidden_dim + d] = errors[token] ? CUDART_NAN_F : acc;
+  }
+}
+
 __global__ void router_logits_kernel(
     const __nv_bfloat16 *__restrict__ hidden,
     const __nv_bfloat16 *__restrict__ gate_weight,
@@ -200,6 +300,49 @@ CUresult consume_last_cuda_error() {
 }  // namespace
 
 extern "C" {
+
+CUresult dsv2_lite_route_logits_cuda(const float *logits, float *weights,
+                                    int *ids, int *errors,
+                                    unsigned long long *summary, int batch,
+                                    int layer_idx, cudaStream_t stream) {
+  if (!logits || !weights || !ids || !errors || !summary || batch < 1 || batch > 8 ||
+      layer_idx < 0)
+    return CUDA_ERROR_INVALID_VALUE;
+  route_from_logits_kernel<<<batch, 1, 0, stream>>>(
+      logits, weights, ids, errors, summary, layer_idx);
+  return map_cuda_error(cudaPeekAtLastError());
+}
+
+CUresult dsv2_lite_route_pointers_cuda(
+    const int *ids, const __nv_bfloat16 *hidden, const __nv_bfloat16 *zero,
+    const __nv_bfloat16 *const *w13, const __nv_bfloat16 *const *w2,
+    __nv_bfloat16 *gate, __nv_bfloat16 *act, __nv_bfloat16 *rows,
+    const __nv_bfloat16 **a13, const __nv_bfloat16 **x13, __nv_bfloat16 **y13,
+    const __nv_bfloat16 **a2, const __nv_bfloat16 **x2, __nv_bfloat16 **y2,
+    unsigned long long *summary, int batch, int first_expert, int hidden_dim,
+    int intermediate, cudaStream_t stream) {
+  if (!ids || !hidden || !zero || !w13 || !w2 || !gate || !act || !rows ||
+      !a13 || !x13 || !y13 || !a2 || !x2 || !y2 || !summary ||
+      batch < 1 || batch > 8 ||
+      (first_expert != 0 && first_expert != 32) || hidden_dim <= 0 || intermediate <= 0)
+    return CUDA_ERROR_INVALID_VALUE;
+  route_pointers_kernel<<<1, 64, 0, stream>>>(
+      ids, hidden, zero, w13, w2, gate, act, rows, a13, x13, y13, a2, x2, y2,
+      summary, batch * 6, first_expert, hidden_dim, intermediate);
+  return map_cuda_error(cudaPeekAtLastError());
+}
+
+CUresult dsv2_lite_route_reduce_cuda(const __nv_bfloat16 *rows, const int *ids,
+                                    const float *weights, const int *errors,
+                                    float *out, int batch, int first_expert,
+                                    int hidden_dim, cudaStream_t stream) {
+  if (!rows || !ids || !weights || !errors || !out || batch < 1 || batch > 8 ||
+      (first_expert != 0 && first_expert != 32) || hidden_dim <= 0)
+    return CUDA_ERROR_INVALID_VALUE;
+  route_reduce_kernel<<<batch, 256, 0, stream>>>(
+      rows, ids, weights, errors, out, first_expert, hidden_dim);
+  return map_cuda_error(cudaPeekAtLastError());
+}
 
 CUresult dsv2_lite_router_logits_cuda(
     const __nv_bfloat16 *hidden,

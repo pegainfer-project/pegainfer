@@ -5,6 +5,16 @@ mod attention;
 mod deepep;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
+#[cfg(feature = "deepseek-v2-lite")]
+mod dsv2_routed_moe;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::DSV2_ROUTED_MOE_MAX_ROWS;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::Dsv2ExpertPointerTable;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::Dsv2RouteSummary;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::Dsv2RoutedMoeScratch;
 mod elementwise;
 mod embedding;
 #[cfg(feature = "gemma4")]
