@@ -40,7 +40,7 @@
 
 ### Step 3: Verify
 - `cargo clippy --release -p pegainfer-sim --all-targets -- -D warnings` clean.
-- `cargo test --release -p pegainfer-sim`: lib 18, frontend_e2e 23, tool_call_roundtrip 3.
+- `cargo test --release -p pegainfer-sim`: lib 6, frontend_e2e 12, tool_call_roundtrip 3.
 
 ### Unexpected
 - `pegainfer-sim/Cargo.toml` already had `pegainfer-frontend = { workspace = true }` before this cut. The missing piece was the engine contract, not the Cargo edge.

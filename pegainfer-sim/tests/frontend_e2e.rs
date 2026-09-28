@@ -915,8 +915,8 @@ async fn chat_completions_returns_correct_format() -> Result<()> {
 /// derives from `reasoning_effort=none` — skips it entirely. `raise_exception`
 /// is deliberately not registered by the pinned frontend, so a rejected value is
 /// a hard render failure exactly as in production, not a friendly message. The
-/// config carries the save-time `output_gate_type` marker so the serving-side
-/// effort mapping — gated on exactly that marker — is active for this fixture.
+/// config carries the save-time `output_gate_type` marker, which triggers the
+/// serving-side startup probe; the guarded template then arms the mapping.
 fn model_dir_with_effort_guard() -> Result<TempDir> {
     let dir = model_dir_with_minimal_metadata()?;
     fs::write(
@@ -1439,8 +1439,9 @@ const TINY_CONFIG_JSON: &str = r#"{
 }"#;
 
 /// The tiny config plus the save-time `output_gate_type` marker a Qwen3.8
-/// checkpoint carries — the field the serving-side `reasoning_effort` mapping
-/// gates on (`pegainfer-frontend/src/vllm/reasoning_effort.rs`).
+/// checkpoint carries — the field that triggers the serving-side
+/// `reasoning_effort` startup probe
+/// (`pegainfer-frontend/src/vllm/reasoning_effort.rs`).
 const TINY_CONFIG_JSON_EFFORT_GUARD: &str = r#"{
   "model_type": "pegainfer_sim",
   "max_position_embeddings": 128,

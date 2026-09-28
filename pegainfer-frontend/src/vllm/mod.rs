@@ -64,10 +64,8 @@ impl ModelLenConfig {
 /// Pass `max_model_len: None` to read `max_position_embeddings` from
 /// `model_path/config.json`; pass `Some(n)` when the path has no config
 /// (e.g. a HuggingFace model id for the sim frontend).
-/// `tool_call_parser` selects the output tool-call parser: `Auto` matches the
-/// model *path* by substring, which resolves a Qwen3.8 directory to the generic
-/// `qwen3` pattern rather than `qwen3.5`; name the parser explicitly when the
-/// checkpoint's tool format differs (e.g. `qwen3_coder`).
+/// `tool_call_parser` selects the output tool-call parser (see the
+/// `--tool-call-parser` CLI flag for the `Auto` matching caveat).
 pub async fn serve(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
@@ -372,9 +370,9 @@ where
         }
     });
 
-    // The effort mapping only applies to checkpoints whose template rejects
-    // the OpenAI-only values; decide once, from the served model's config.
-    let effort_mapping_enabled = reasoning_effort::mapping_enabled(&model_id);
+    // The effort mapping is derived once at startup from the served checkpoint's
+    // loaded template; checkpoints without the save-time marker skip the probe.
+    let effort_aliases = reasoning_effort::probe_effort_aliases(&model_id).await;
 
     let config = Config {
         transport_mode: TransportMode::Bootstrapped {
@@ -426,7 +424,7 @@ where
     };
 
     let result = vllm_server::serve_with_router_extension(config, server_shutdown, move |router| {
-        reasoning_effort::normalize_chat_requests(extend_router(router), effort_mapping_enabled)
+        reasoning_effort::normalize_chat_requests(extend_router(router), effort_aliases)
     })
     .await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),
