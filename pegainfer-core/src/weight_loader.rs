@@ -797,6 +797,23 @@ fn check_row_range(name: &str, row_offset: usize, rows: usize, total_rows: usize
     Ok(())
 }
 
+/// Reject a checkpoint whose full tensor shape disagrees with the config the
+/// shard ranges were derived from, before any slice of it is trusted.
+fn ensure_global_shape(name: &str, actual: (usize, usize), expected: (usize, usize)) -> Result<()> {
+    anyhow::ensure!(
+        actual == expected,
+        "Tensor '{name}' has shape [{}, {}], expected [{}, {}]",
+        actual.0,
+        actual.1,
+        expected.0,
+        expected.1
+    );
+    Ok(())
+}
+
+/// Load one row range of a row-parallel 2D tensor. `global` is the
+/// config-derived `(rows, cols)` of the full unsharded tensor; the header must
+/// match it before the slice is taken.
 pub fn load_tensor_2d_row_shard(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -804,9 +821,11 @@ pub fn load_tensor_2d_row_shard(
     name: &str,
     row_offset: usize,
     rows: usize,
+    global: (usize, usize),
 ) -> Result<DeviceMatrix> {
     let tensor = find_tensor(shards, weight_map, name)?;
     let (total_rows, cols) = tensor_2d_dims(&tensor, name)?;
+    ensure_global_shape(name, (total_rows, cols), global)?;
     check_row_range(name, row_offset, rows, total_rows)?;
     let elems = tensor_bf16_cow(&tensor, name)?;
     let start = row_offset * cols;
@@ -830,6 +849,9 @@ fn gather_cols(
     host
 }
 
+/// Load one column range of a column-parallel 2D tensor. `global` is the
+/// config-derived `(rows, cols)` of the full unsharded tensor; the header must
+/// match it before the slice is taken.
 pub fn load_tensor_2d_col_shard(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -837,9 +859,11 @@ pub fn load_tensor_2d_col_shard(
     name: &str,
     col_offset: usize,
     cols: usize,
+    global: (usize, usize),
 ) -> Result<DeviceMatrix> {
     let tensor = find_tensor(shards, weight_map, name)?;
     let (rows, total_cols) = tensor_2d_dims(&tensor, name)?;
+    ensure_global_shape(name, (rows, total_cols), global)?;
     if col_offset + cols > total_cols {
         return Err(anyhow::anyhow!(
             "2D col shard out of bounds for '{}': col_offset={} cols={} total_cols={}",
@@ -855,16 +879,20 @@ pub fn load_tensor_2d_col_shard(
 }
 
 /// Load a 2D tensor assembled from multiple row ranges of one source tensor,
-/// stitched in `ranges` order: each entry is (row_offset, rows).
+/// stitched in `ranges` order: each entry is (row_offset, rows). `global` is
+/// the config-derived `(rows, cols)` of the full source tensor; the header
+/// must match it before any slice is taken.
 pub fn load_tensor_2d_row_stitch(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
     weight_map: &HashMap<String, usize>,
     name: &str,
     ranges: &[(usize, usize)],
+    global: (usize, usize),
 ) -> Result<DeviceMatrix> {
     let tensor = find_tensor(shards, weight_map, name)?;
     let (total_rows, cols) = tensor_2d_dims(&tensor, name)?;
+    ensure_global_shape(name, (total_rows, cols), global)?;
     let mut total = 0usize;
     for &(row_offset, rows) in ranges {
         check_row_range(name, row_offset, rows, total_rows)?;

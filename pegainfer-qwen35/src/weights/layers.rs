@@ -43,11 +43,11 @@ pub(crate) struct LinearAttentionLayer {
     pub(crate) conv1d_weight: DeviceVec,
     /// dt_bias: [local_linear_num_value_heads] bf16
     pub(crate) dt_bias: DeviceVec,
-    /// A_log: [local_linear_num_value_heads] f32 (f32 storage, or bf16 storage
-    /// widened exactly at load — Qwen3.5 stores f32, Qwen3.8 bf16)
+    /// A_log: [local_linear_num_value_heads] f32 (a bf16-stored vector is
+    /// widened exactly at load — see `tensor_f32_cow`)
     pub(crate) a_log: CudaSlice<f32>,
     /// RMSNorm weight for output normalization: [value_head_dim] f32 (same
-    /// storage/widening as `a_log`) — head-shared, so replicated on every rank.
+    /// loader as `a_log`) — head-shared, so replicated on every rank.
     pub(crate) norm_weight: CudaSlice<f32>,
     /// Output projection: [hidden_size, local_linear_z_dim] (row-parallel;
     /// the layer all-reduces the partial hidden sum under TP).
@@ -85,17 +85,26 @@ pub(crate) struct MLP35 {
 
 impl MLP35 {
     fn load(src: &WeightSource, prefix: &str) -> Result<Self> {
-        let gate_proj =
-            src.row_shard_if_needed(&format!("{prefix}.mlp.gate_proj.weight"), src.intermediate)?;
-        let up_proj =
-            src.row_shard_if_needed(&format!("{prefix}.mlp.up_proj.weight"), src.intermediate)?;
+        let gate_proj = src.row_shard_if_needed(
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            src.intermediate,
+            src.intermediate_global,
+        )?;
+        let up_proj = src.row_shard_if_needed(
+            &format!("{prefix}.mlp.up_proj.weight"),
+            src.intermediate,
+            src.intermediate_global,
+        )?;
         let gate_up_proj = DeviceMatrix::vstack(src.ctx, &[&gate_proj, &up_proj])?;
         drop(gate_proj);
         drop(up_proj);
         Ok(Self {
             gate_up_proj,
-            down_proj: src
-                .col_shard_if_needed(&format!("{prefix}.mlp.down_proj.weight"), src.intermediate)?,
+            down_proj: src.col_shard_if_needed(
+                &format!("{prefix}.mlp.down_proj.weight"),
+                src.intermediate,
+                src.intermediate_global,
+            )?,
         })
     }
 }
@@ -136,9 +145,21 @@ impl FullAttentionLayer {
     fn load(src: &WeightSource, prefix: &str) -> Result<Self> {
         Ok(Self {
             q_proj: src.gated_q_proj(&format!("{prefix}.q_proj.weight"))?,
-            k_proj: src.row_shard_if_needed(&format!("{prefix}.k_proj.weight"), src.kv_rows)?,
-            v_proj: src.row_shard_if_needed(&format!("{prefix}.v_proj.weight"), src.kv_rows)?,
-            o_proj: src.col_shard_if_needed(&format!("{prefix}.o_proj.weight"), src.q_cols)?,
+            k_proj: src.row_shard_if_needed(
+                &format!("{prefix}.k_proj.weight"),
+                src.kv_rows,
+                src.kv_global,
+            )?,
+            v_proj: src.row_shard_if_needed(
+                &format!("{prefix}.v_proj.weight"),
+                src.kv_rows,
+                src.kv_global,
+            )?,
+            o_proj: src.col_shard_if_needed(
+                &format!("{prefix}.o_proj.weight"),
+                src.q_cols,
+                src.q_global,
+            )?,
             q_norm: src.tensor_1d(&format!("{prefix}.q_norm.weight"))?,
             k_norm: src.tensor_1d(&format!("{prefix}.k_norm.weight"))?,
         })
@@ -149,15 +170,20 @@ impl LinearAttentionLayer {
     fn load(src: &WeightSource, prefix: &str) -> Result<Self> {
         Ok(Self {
             in_proj_qkv: src.linear_in_proj_qkv(&format!("{prefix}.in_proj_qkv.weight"))?,
-            in_proj_z: src
-                .row_shard_if_needed(&format!("{prefix}.in_proj_z.weight"), src.linear_z)?,
+            in_proj_z: src.row_shard_if_needed(
+                &format!("{prefix}.in_proj_z.weight"),
+                src.linear_z,
+                src.linear_z_global,
+            )?,
             in_proj_b: src.row_shard_if_needed(
                 &format!("{prefix}.in_proj_b.weight"),
                 src.linear_value_heads,
+                src.value_heads_global,
             )?,
             in_proj_a: src.row_shard_if_needed(
                 &format!("{prefix}.in_proj_a.weight"),
                 src.linear_value_heads,
+                src.value_heads_global,
             )?,
             conv1d_weight: src.linear_conv1d(&format!("{prefix}.conv1d.weight"))?,
             dt_bias: src
@@ -172,8 +198,11 @@ impl LinearAttentionLayer {
                 src.weight_map,
                 &format!("{prefix}.norm.weight"),
             )?,
-            out_proj: src
-                .col_shard_if_needed(&format!("{prefix}.out_proj.weight"), src.linear_z)?,
+            out_proj: src.col_shard_if_needed(
+                &format!("{prefix}.out_proj.weight"),
+                src.linear_z,
+                src.linear_z_global,
+            )?,
         })
     }
 }
@@ -190,6 +219,15 @@ pub(super) struct WeightSource<'a> {
     /// tensors disagree with its `config.json` stops at the loader instead of
     /// reaching a GEMM sized from the config.
     hidden: usize,
+    /// Global (pre-shard) config-derived extents, so the sharded loads assert
+    /// the checkpoint's full shape exactly like the unsharded ones do.
+    gated_q_global: usize,
+    q_global: usize,
+    kv_global: usize,
+    intermediate_global: usize,
+    linear_z_global: usize,
+    value_heads_global: usize,
+    linear_qkv_global: usize,
     /// Full-attention q_proj rows as per-head [q, gate] chunks.
     gated_q: (usize, usize),
     /// o_proj column shard over the full-attention q dim.
@@ -222,6 +260,14 @@ impl<'a> WeightSource<'a> {
             weight_map,
             geometry,
             hidden: config.hidden_size,
+            gated_q_global: config.full_attn_q_dim() * 2,
+            q_global: config.full_attn_q_dim(),
+            kv_global: config.full_attn_kv_dim(),
+            intermediate_global: config.intermediate_size,
+            linear_z_global: config.linear_attn_z_dim(),
+            value_heads_global: config.linear_num_value_heads,
+            linear_qkv_global: 2 * config.linear_num_key_heads * config.linear_key_head_dim
+                + config.linear_attn_z_dim(),
             gated_q: full_attention_gated_q_shard_range(config, geometry),
             q_cols: geometry.shard_range(config.full_attn_q_dim()),
             kv_rows: geometry.shard_range(config.full_attn_kv_dim()),
@@ -245,6 +291,7 @@ impl<'a> WeightSource<'a> {
         &self,
         name: &str,
         (row_offset, rows): (usize, usize),
+        global_rows: usize,
     ) -> Result<DeviceMatrix> {
         if self.geometry.is_sharded() {
             load_tensor_2d_row_shard(
@@ -254,9 +301,10 @@ impl<'a> WeightSource<'a> {
                 name,
                 row_offset,
                 rows,
+                (global_rows, self.hidden),
             )
         } else {
-            self.tensor_2d(name, rows, self.hidden)
+            self.tensor_2d(name, global_rows, self.hidden)
         }
     }
 
@@ -264,6 +312,7 @@ impl<'a> WeightSource<'a> {
         &self,
         name: &str,
         (col_offset, cols): (usize, usize),
+        global_cols: usize,
     ) -> Result<DeviceMatrix> {
         if self.geometry.is_sharded() {
             load_tensor_2d_col_shard(
@@ -273,9 +322,10 @@ impl<'a> WeightSource<'a> {
                 name,
                 col_offset,
                 cols,
+                (self.hidden, global_cols),
             )
         } else {
-            self.tensor_2d(name, self.hidden, cols)
+            self.tensor_2d(name, self.hidden, global_cols)
         }
     }
 
@@ -313,8 +363,7 @@ impl<'a> WeightSource<'a> {
     /// three global segments rather than cutting one flat row range.
     fn linear_in_proj_qkv(&self, name: &str) -> Result<DeviceMatrix> {
         if !self.geometry.is_sharded() {
-            let rows: usize = self.linear_qkv.iter().map(|&(_, len)| len).sum();
-            return self.tensor_2d(name, rows, self.hidden);
+            return self.tensor_2d(name, self.linear_qkv_global, self.hidden);
         }
         load_tensor_2d_row_stitch(
             self.ctx,
@@ -322,6 +371,7 @@ impl<'a> WeightSource<'a> {
             self.weight_map,
             name,
             &self.linear_qkv,
+            (self.linear_qkv_global, self.hidden),
         )
     }
 
@@ -344,7 +394,7 @@ impl<'a> WeightSource<'a> {
     /// (keeping each head's [q, gate] chunk adjacent), not as one flat range.
     fn gated_q_proj(&self, name: &str) -> Result<DeviceMatrix> {
         if !self.geometry.is_sharded() {
-            return self.tensor_2d(name, self.gated_q.1, self.hidden);
+            return self.tensor_2d(name, self.gated_q_global, self.hidden);
         }
         let (row_offset, rows) = self.gated_q;
         load_tensor_2d_row_shard(
@@ -354,6 +404,7 @@ impl<'a> WeightSource<'a> {
             name,
             row_offset,
             rows,
+            (self.gated_q_global, self.hidden),
         )
     }
 }
