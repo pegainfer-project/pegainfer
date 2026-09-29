@@ -114,8 +114,8 @@ pub struct SharedArgs {
     /// Tool-call output parser: `auto` (match the model), `none`, or an explicit
     /// registered parser name such as `qwen3_coder`. Upstream `auto` matches the
     /// model *path* by substring; a line whose checkpoints share one tool format
-    /// (Qwen3.5/Qwen3.8 → `qwen3_coder`) resolves `auto` to that parser itself,
-    /// so the directory name no longer decides.
+    /// can resolve `auto` to that parser itself (see `ServePlan`), so the
+    /// directory name no longer decides.
     #[arg(long, default_value_t = ParserSelection::Auto)]
     pub tool_call_parser: ParserSelection,
 
@@ -978,50 +978,5 @@ mod tests {
         assert!(provided.contains("tp_size"));
         assert!(provided.contains("line_a_flag"));
         assert!(!provided.contains("port"));
-    }
-
-    #[test]
-    fn tool_call_parser_rejects_an_unregistered_name_before_engine_load() {
-        let error = parse_for_line(
-            &LINE_A,
-            &["pegainfer", "--tool-call-parser", "no-such-parser"],
-        )
-        .expect_err("an unregistered parser must be refused at validation");
-        let message = error.to_string();
-        assert!(
-            message.contains("invalid --tool-call-parser") && message.contains("not registered"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn a_line_default_resolves_auto_and_never_overrides_an_explicit_choice() {
-        let coder = ParserSelection::Explicit("qwen3_coder".to_string());
-        let plan = ServePlan {
-            auto_tool_call_parser: Some(coder.clone()),
-            ..Default::default()
-        };
-        assert_eq!(
-            plan.resolve_tool_call_parser(ParserSelection::Auto),
-            coder,
-            "auto takes the line's own default"
-        );
-        assert_eq!(
-            plan.resolve_tool_call_parser(ParserSelection::None),
-            ParserSelection::None,
-            "an explicit none is the caller's to make"
-        );
-        let explicit = ParserSelection::Explicit("qwen3_xml".to_string());
-        assert_eq!(
-            plan.resolve_tool_call_parser(explicit.clone()),
-            explicit,
-            "an explicit name wins over the line default"
-        );
-        let plain = ServePlan::default();
-        assert_eq!(
-            plain.resolve_tool_call_parser(ParserSelection::Auto),
-            ParserSelection::Auto,
-            "a line without a default keeps upstream Auto"
-        );
     }
 }

@@ -321,4 +321,33 @@ mod tests {
             "unexpected error: {error}"
         );
     }
+
+    /// The server resolves `--tool-call-parser` through this plan, so the
+    /// line's answer is the parser the served grammar gets: `auto` must become
+    /// the Coder parser both generations' templates emit, and an explicit
+    /// choice must survive untouched.
+    #[test]
+    fn auto_tool_call_parser_resolves_to_the_coder_parser() {
+        let (shared, matches, _) =
+            parse_for_line(&MODEL_LINE, &["pegainfer"]).expect("the shared flags parse");
+        let config = serde_json::json!({});
+        let ctx = LaunchContext {
+            model_path: std::path::Path::new("unused"),
+            config: &config,
+            shared: &shared,
+            matches: &matches,
+        };
+        let plan = MODEL_LINE.serve_plan(&ctx).expect("the plan builds");
+
+        assert_eq!(
+            plan.resolve_tool_call_parser(ParserSelection::Auto),
+            ParserSelection::Explicit("qwen3_coder".to_string())
+        );
+        let explicit = ParserSelection::Explicit("qwen3_xml".to_string());
+        assert_eq!(
+            plan.resolve_tool_call_parser(explicit.clone()),
+            explicit,
+            "an explicit name is the caller's to make"
+        );
+    }
 }
