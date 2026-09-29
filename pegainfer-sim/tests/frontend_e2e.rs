@@ -1006,6 +1006,58 @@ async fn reasoning_effort_extremes_are_mapped_onto_the_templates_vocabulary() ->
     server.shutdown().await
 }
 
+/// A per-request template whose effort vocabulary is the *inverse* of the
+/// served default's: it accepts `low|high|max` and raises on anything else,
+/// so `xhigh` — what the default-template mapping produces — is rejected here.
+const ACCEPTING_EFFORT_TEMPLATE: &str = r"{%- set resolved = reasoning_effort|default('high') %}{%- if resolved not in ('low', 'high', 'max') %}{{ raise_exception('Unexpected reasoning effort ' ~ reasoning_effort) }}{%- endif %}{% for message in messages %}{{ message.content }}{% endfor %}";
+
+/// The startup probe measures the checkpoint's default template, so its verdict
+/// has no authority over a request that overrides it. `reasoning_effort:"high"`
+/// with the override above must reach the renderer verbatim: rewriting it to
+/// `xhigh` on the default's authority would turn a working request into a
+/// render failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_per_request_chat_template_override_keeps_its_own_effort_vocabulary() -> Result<()> {
+    let server = SimServer::spawn_with_model_dir(model_dir_with_effort_guard()?).await?;
+    let client = test_client()?;
+
+    let chat = |effort: String| {
+        let client = &client;
+        let base_url = server.base_url.clone();
+        async move {
+            let response = client
+                .post(format!("{base_url}/v1/chat/completions"))
+                .json(&json!({
+                    "model": MODEL_NAME,
+                    "messages": [{"role": "user", "content": "alpha beta"}],
+                    "max_tokens": 2,
+                    "temperature": 0.0,
+                    "reasoning_effort": effort,
+                    "chat_template": ACCEPTING_EFFORT_TEMPLATE
+                }))
+                .send()
+                .await?;
+            let status = response.status();
+            let text = response.text().await?;
+            anyhow::Ok((status, text))
+        }
+    };
+
+    let (status, text) = chat("high".to_string()).await?;
+    if !status.is_success() {
+        bail!("an override that accepts `high` must receive it verbatim, got {status}: {text}");
+    }
+
+    // Control: the override's guard is live and its vocabulary really is the
+    // inverse one, so the request above passed because the layer stayed out.
+    let (status, text) = chat("xhigh".to_string()).await?;
+    if status.is_success() {
+        bail!("the override rejects `xhigh`, so its guard must fail this render: {text}");
+    }
+
+    server.shutdown().await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_completions_streaming_emits_role_content_and_done() -> Result<()> {
     let server = SimServer::spawn().await?;

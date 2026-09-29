@@ -17,11 +17,13 @@
 //! marker, so other lines pay no startup cost.
 //!
 //! `none`, `low`, `medium` and `xhigh` pass through untouched, as does a
-//! request that carries no top-level field. An explicit
-//! `chat_template_kwargs.reasoning_effort` is deliberately **not** rewritten:
-//! that is the caller addressing the template directly, and it keeps full
-//! control (at the cost of the template's own rejection if the value is
-//! outside its vocabulary).
+//! request that carries no top-level field. Two caller-supplied template
+//! controls are deliberately **not** rewritten: an explicit
+//! `chat_template_kwargs.reasoning_effort`, which is the caller addressing the
+//! template directly, and a per-request `chat_template` override, whose
+//! vocabulary the startup probe never measured. Both keep full control, at the
+//! cost of their own rejection if the value is outside the template they
+//! address.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -265,12 +267,23 @@ fn body_read_error(error: AxumError) -> Response {
 /// Rewrite the top-level `reasoning_effort` value in place, returning the
 /// `(from, to)` pair when it changed. A body that is not JSON, or whose field
 /// is absent, not a string, or outside the deployment's active aliases, is
-/// left exactly as it arrived.
+/// left exactly as it arrived — as is any request carrying its own
+/// `chat_template`, which renders with a template the startup probe never saw.
 pub(crate) fn rewrite_reasoning_effort(
     body: &mut Bytes,
     aliases: &[(&'static str, &'static str)],
 ) -> Option<(String, &'static str)> {
     let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    // The aliases are the *default* template's verdict. A per-request override
+    // is a different template with its own vocabulary, so rewriting on the
+    // default's authority can turn a value the override accepts into one it
+    // rejects. Leave the caller's value for the override to judge.
+    if value
+        .get("chat_template")
+        .is_some_and(serde_json::Value::is_string)
+    {
+        return None;
+    }
     let effort = value.get("reasoning_effort")?.as_str()?.to_string();
     let to = aliases
         .iter()
@@ -316,6 +329,24 @@ mod tests {
             value["chat_template_kwargs"]["reasoning_effort"],
             serde_json::json!("high")
         );
+    }
+
+    #[test]
+    fn a_per_request_template_override_keeps_the_callers_effort_value() {
+        // The alias table is the *default* template's verdict. An override can
+        // accept what the default rejects, so guessing for it can break a
+        // request that would otherwise render.
+        let (changed, value) = rewrite(r#"{"reasoning_effort":"high","chat_template":"{{ '' }}"}"#);
+        assert_eq!(
+            changed, None,
+            "the override's vocabulary is not ours to know"
+        );
+        assert_eq!(value["reasoning_effort"], serde_json::json!("high"));
+
+        // No override — an absent or null field renders the default template the
+        // probe measured, so the mapping applies.
+        let (changed, _) = rewrite(r#"{"reasoning_effort":"high","chat_template":null}"#);
+        assert_eq!(changed, Some(("high".to_string(), "xhigh")));
     }
 
     // ---- startup probe -------------------------------------------------
