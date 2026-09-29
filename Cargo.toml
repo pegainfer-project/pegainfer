@@ -99,8 +99,8 @@ fastrace-opentelemetry = "0.17"
 futures = "0.3"
 half = { version = "2.7", features = ["num-traits"] }
 hex = "0.4"
-# 0.1.3 is the version axum 0.8 already carries; pinning the same one keeps
-# `LengthLimitError` downcasts type-identical to what `axum::body::to_bytes` raises.
+# The version axum 0.8 already carries; sharing one copy keeps the
+# `LengthLimitError` downcast type-identical to what `axum::body::to_bytes` raises.
 http-body-util = "0.1.3"
 humantime = "2.2.0"
 indexmap = "2"

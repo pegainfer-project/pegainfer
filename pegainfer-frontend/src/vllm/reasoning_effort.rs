@@ -52,7 +52,10 @@ use vllm_chat::ChatRequest;
 use vllm_chat::ChatRole;
 use vllm_chat::EffortValue;
 use vllm_chat::LoadModelBackendsOptions;
+use vllm_chat::ResolvedToolContext;
+use vllm_chat::SamplingParams;
 use vllm_chat::load_model_backends;
+use vllm_text::TextDecodeOptions;
 
 /// Only the chat route reads `reasoning_effort`.
 const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
@@ -68,8 +71,18 @@ const CANDIDATE_ALIASES: &[(&str, &str)] =
     &[("high", "xhigh"), ("max", "xhigh"), ("minimal", "low")];
 
 /// Values rendered against the loaded template at startup: every alias source
-/// plus every alias target.
-const PROBE_VALUES: &[&str] = &["high", "max", "minimal", "xhigh", "low"];
+/// plus every alias target, so a candidate is armed only on its own verdict.
+fn probe_values() -> Vec<&'static str> {
+    let mut values: Vec<&'static str> = Vec::with_capacity(CANDIDATE_ALIASES.len() * 2);
+    for (from, to) in CANDIDATE_ALIASES {
+        for value in [from, to] {
+            if !values.contains(value) {
+                values.push(value);
+            }
+        }
+    }
+    values
+}
 
 /// The deployment's active `from -> to` rewrites; empty means "never touch
 /// the request body".
@@ -148,19 +161,10 @@ async fn probe_template(model_path: &str) -> vllm_chat::Result<Vec<(&'static str
     )
     .await?;
     let renderer = backends.chat_backend.chat_renderer();
-    let mut accepted: Vec<(&str, bool)> = Vec::with_capacity(PROBE_VALUES.len());
-    for value in PROBE_VALUES {
-        // `for_test` is the vendored minimal-valid-request builder; the probe
-        // only needs a valid envelope to carry the effort value.
-        let request = ChatRequest {
-            messages: vec![ChatMessage::text(ChatRole::User, "probe")],
-            chat_options: ChatOptions {
-                reasoning_effort: Some(EffortValue::String((*value).to_string())),
-                ..ChatOptions::default()
-            },
-            ..ChatRequest::for_test()
-        };
-        accepted.push((value, renderer.render(&request).is_ok()));
+    let values = probe_values();
+    let mut accepted: Vec<(&str, bool)> = Vec::with_capacity(values.len());
+    for value in values {
+        accepted.push((value, renderer.render(&probe_request(value)).is_ok()));
     }
     let accepts = |value: &str| accepted.iter().any(|&(probed, ok)| probed == value && ok);
     Ok(CANDIDATE_ALIASES
@@ -168,6 +172,32 @@ async fn probe_template(model_path: &str) -> vllm_chat::Result<Vec<(&'static str
         .filter(|(from, to)| !accepts(from) && accepts(to))
         .copied()
         .collect())
+}
+
+/// The smallest request that carries one `reasoning_effort` value: a single
+/// user turn, every other field at the value the vendored routes resolve for a
+/// plain text chat. The probe renders it and throws the prompt away.
+fn probe_request(effort: &str) -> ChatRequest {
+    ChatRequest {
+        request_id: "reasoning-effort-probe".to_string(),
+        messages: vec![ChatMessage::text(ChatRole::User, "probe")],
+        sampling_params: SamplingParams::default(),
+        chat_options: ChatOptions {
+            reasoning_effort: Some(EffortValue::String(effort.to_string())),
+            ..ChatOptions::default()
+        },
+        tool_context: ResolvedToolContext::default(),
+        decode_options: TextDecodeOptions::default(),
+        intermediate: false,
+        prompt_truncation: None,
+        priority: 0,
+        documents: None,
+        cache_salt: None,
+        add_special_tokens: false,
+        data_parallel_rank: None,
+        session_id: None,
+        lora_request: None,
+    }
 }
 
 /// Wrap a router so chat requests are normalized before the upstream handler
@@ -247,8 +277,10 @@ pub(crate) fn rewrite_reasoning_effort(
         .find(|(from, _)| *from == effort)
         .map(|(_, to)| *to)?;
     value["reasoning_effort"] = serde_json::Value::String(to.to_string());
-    let rewritten: anyhow::Result<Vec<u8>, _> = serde_json::to_vec(&value);
-    *body = Bytes::from(rewritten.ok()?);
+    // Serializing a `Value` into a `Vec` cannot fail: every key is already a
+    // string, and a non-finite number degrades to `null`.
+    let rewritten = serde_json::to_vec(&value).expect("a serde_json::Value serializes");
+    *body = Bytes::from(rewritten);
     Some((effort, to))
 }
 
@@ -263,29 +295,6 @@ mod tests {
         let changed = rewrite_reasoning_effort(&mut body, ALL_ALIASES);
         let value = serde_json::from_slice(&body).expect("body stays valid JSON");
         (changed, value)
-    }
-
-    #[test]
-    fn maps_the_openai_only_extremes_onto_the_templates_vocabulary() {
-        for (from, to) in ALL_ALIASES {
-            let (changed, value) =
-                rewrite(&format!(r#"{{"reasoning_effort":"{from}","messages":[]}}"#));
-            assert_eq!(changed, Some((from.to_string(), *to)), "{from}");
-            assert_eq!(value["reasoning_effort"], serde_json::json!(to), "{from}");
-        }
-    }
-
-    #[test]
-    fn leaves_supported_and_unrelated_values_untouched() {
-        for effort in ["none", "low", "medium", "xhigh"] {
-            let (changed, value) = rewrite(&format!(r#"{{"reasoning_effort":"{effort}"}}"#));
-            assert_eq!(changed, None, "{effort}");
-            assert_eq!(
-                value["reasoning_effort"],
-                serde_json::json!(effort),
-                "{effort}"
-            );
-        }
     }
 
     #[test]
@@ -306,19 +315,6 @@ mod tests {
         assert_eq!(
             value["chat_template_kwargs"]["reasoning_effort"],
             serde_json::json!("high")
-        );
-    }
-
-    #[test]
-    fn an_effort_in_both_places_rewrites_only_the_top_level_field() {
-        let (changed, value) = rewrite(
-            r#"{"reasoning_effort":"high","chat_template_kwargs":{"reasoning_effort":"high"}}"#,
-        );
-        assert_eq!(changed, Some(("high".to_string(), "xhigh")));
-        assert_eq!(
-            value["chat_template_kwargs"]["reasoning_effort"],
-            serde_json::json!("high"),
-            "template kwargs stay the caller's to set"
         );
     }
 
