@@ -209,18 +209,19 @@ test.
 The TP2 rows are `Qwen/Qwen3.8-27B` @ `1d4bf0f2` on 2×L20, built with
 `--features qwen35` at `PEGAINFER_CUDA_SM=89` (CUDA 12.9, NCCL 2.32.3) — the
 text tower does not fit one card. They re-run at every change to the shared
-load path, and reproduced the pre-change numbers exactly when the shard
-loaders started asserting config-derived shapes. The Qwen3.5 rows are what
-"Qwen3.5 behaviour is unchanged" points to: 0.8B re-runs alongside the 27B on
-the L20, single GPU and TP2, while the A40 rows add the 2B (tied) and 4B
-(untied) sizes on an sm_80 build. The logits gates drive the engine directly
-and never issue an HTTP request; the serving row covers the frontend layers.
+load path; both changes since (the shard loaders asserting config-derived
+shapes, then each range being re-paired with its global extent) reproduced
+these numbers exactly. The Qwen3.5 rows are what "Qwen3.5 behaviour is
+unchanged" points to: 0.8B re-runs alongside the 27B on the L20, single GPU
+and TP2, while the A40 rows add the 2B (tied) and 4B (untied) sizes on an
+sm_80 build. The logits gates drive the engine directly and never issue an
+HTTP request; the serving row covers the frontend layers.
 
 | Gate | Device / build | Result |
 | --- | --- | --- |
 | `hf_golden_gate` short, Qwen3.8-27B TP2 | 2×L20 (sm_89) | sequential eager, 108 positions: mean 0.0238 / p50 0.0199 / p99 0.0862 / max 0.1593. Batched eager, 72 positions: mean 0.0231 / p99 0.0823 / max 0.1274. No argmax violation. |
 | `hf_golden_gate` long, Qwen3.8-27B TP2 | 2×L20 (sm_89) | 4097 + 8192-token prompts, 18 positions: mean 0.0226 / p50 0.0206 / p99 0.0860 / max 0.0882. |
-| `hf_golden_gate` Qwen3.5-0.8B, single GPU + TP2 (tied head) | L20 | single GPU: sequential graph mean 0.0299 / p99 0.0954, long graph mean 0.0279 / p99 0.1166, batched and slot-compaction within tolerance. TP2 short: batched eager mean 0.0300 / p99 0.1127 — the sharded load path on a second geometry. |
+| `hf_golden_gate` Qwen3.5-0.8B, single GPU + TP2 (tied head) | L20 | single GPU: short and long both pass. The captured-graph path is not bit-reproducible between runs — sequential graph mean 0.0293–0.0299 / p99 0.0954–0.1097 across two runs, batched and slot-compaction inside tolerance. TP2 short: batched eager mean 0.0300 / p99 0.1127, identical in both — the sharded load path on a second geometry. |
 | `hf_golden_gate` Qwen3.5-2B, single GPU (tied head) | 1×A40 (sm_80 build) | short sequential, 108 positions: mean 0.0301 / p99 0.1172. Long, 18 positions: mean 0.0238 / p99 0.0778. |
 | `hf_golden_gate` Qwen3.5-4B, single GPU (untied head) | 1×A40 (sm_80 build) | short sequential, 108 positions: mean 0.0238 / p99 0.0813. Long, 18 positions: mean 0.0223 / p99 0.0705. |
 | serving, real Qwen3.8-27B TP2 | 2×L20 (sm_89) | the startup probe arms `[("high","xhigh"),("max","xhigh"),("minimal","low")]` from the checkpoint's own template ~2 s into boot; a `reasoning_effort:"high"` chat request returns 200 with reasoning; tool calls round-trip under `qwen3_coder` (non-streaming `tool_calls` + SSE deltas) and come back raw under `qwen3_xml`; with no flag at all the line default logs `using tool parser parser_name="qwen3_coder"` and parses the same request. |
