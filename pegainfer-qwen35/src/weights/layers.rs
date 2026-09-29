@@ -85,26 +85,17 @@ pub(crate) struct MLP35 {
 
 impl MLP35 {
     fn load(src: &WeightSource, prefix: &str) -> Result<Self> {
-        let gate_proj = src.row_shard_if_needed(
-            &format!("{prefix}.mlp.gate_proj.weight"),
-            src.intermediate,
-            src.intermediate_global,
-        )?;
-        let up_proj = src.row_shard_if_needed(
-            &format!("{prefix}.mlp.up_proj.weight"),
-            src.intermediate,
-            src.intermediate_global,
-        )?;
+        let gate_proj =
+            src.row_shard_if_needed(&format!("{prefix}.mlp.gate_proj.weight"), src.intermediate)?;
+        let up_proj =
+            src.row_shard_if_needed(&format!("{prefix}.mlp.up_proj.weight"), src.intermediate)?;
         let gate_up_proj = DeviceMatrix::vstack(src.ctx, &[&gate_proj, &up_proj])?;
         drop(gate_proj);
         drop(up_proj);
         Ok(Self {
             gate_up_proj,
-            down_proj: src.col_shard_if_needed(
-                &format!("{prefix}.mlp.down_proj.weight"),
-                src.intermediate,
-                src.intermediate_global,
-            )?,
+            down_proj: src
+                .col_shard_if_needed(&format!("{prefix}.mlp.down_proj.weight"), src.intermediate)?,
         })
     }
 }
@@ -145,21 +136,9 @@ impl FullAttentionLayer {
     fn load(src: &WeightSource, prefix: &str) -> Result<Self> {
         Ok(Self {
             q_proj: src.gated_q_proj(&format!("{prefix}.q_proj.weight"))?,
-            k_proj: src.row_shard_if_needed(
-                &format!("{prefix}.k_proj.weight"),
-                src.kv_rows,
-                src.kv_global,
-            )?,
-            v_proj: src.row_shard_if_needed(
-                &format!("{prefix}.v_proj.weight"),
-                src.kv_rows,
-                src.kv_global,
-            )?,
-            o_proj: src.col_shard_if_needed(
-                &format!("{prefix}.o_proj.weight"),
-                src.q_cols,
-                src.q_global,
-            )?,
+            k_proj: src.row_shard_if_needed(&format!("{prefix}.k_proj.weight"), src.kv_rows)?,
+            v_proj: src.row_shard_if_needed(&format!("{prefix}.v_proj.weight"), src.kv_rows)?,
+            o_proj: src.col_shard_if_needed(&format!("{prefix}.o_proj.weight"), src.q_cols)?,
             q_norm: src.tensor_1d(&format!("{prefix}.q_norm.weight"))?,
             k_norm: src.tensor_1d(&format!("{prefix}.k_norm.weight"))?,
         })
@@ -170,20 +149,15 @@ impl LinearAttentionLayer {
     fn load(src: &WeightSource, prefix: &str) -> Result<Self> {
         Ok(Self {
             in_proj_qkv: src.linear_in_proj_qkv(&format!("{prefix}.in_proj_qkv.weight"))?,
-            in_proj_z: src.row_shard_if_needed(
-                &format!("{prefix}.in_proj_z.weight"),
-                src.linear_z,
-                src.linear_z_global,
-            )?,
+            in_proj_z: src
+                .row_shard_if_needed(&format!("{prefix}.in_proj_z.weight"), src.linear_z)?,
             in_proj_b: src.row_shard_if_needed(
                 &format!("{prefix}.in_proj_b.weight"),
                 src.linear_value_heads,
-                src.value_heads_global,
             )?,
             in_proj_a: src.row_shard_if_needed(
                 &format!("{prefix}.in_proj_a.weight"),
                 src.linear_value_heads,
-                src.value_heads_global,
             )?,
             conv1d_weight: src.linear_conv1d(&format!("{prefix}.conv1d.weight"))?,
             dt_bias: src
@@ -198,13 +172,40 @@ impl LinearAttentionLayer {
                 src.weight_map,
                 &format!("{prefix}.norm.weight"),
             )?,
-            out_proj: src.col_shard_if_needed(
-                &format!("{prefix}.out_proj.weight"),
-                src.linear_z,
-                src.linear_z_global,
-            )?,
+            out_proj: src
+                .col_shard_if_needed(&format!("{prefix}.out_proj.weight"), src.linear_z)?,
         })
     }
+}
+
+/// One config-derived extent this rank owns, paired with the full extent it was
+/// cut from. The sharded loads assert the checkpoint's global shape before
+/// slicing, so range and global are built together and a call site cannot pair
+/// one extent's range with another's global.
+#[derive(Clone, Copy)]
+struct Shard {
+    /// `(offset, len)` this rank owns.
+    range: (usize, usize),
+    /// The pre-shard extent from `config.json`.
+    global: usize,
+}
+
+impl Shard {
+    /// A flat shard of `global` rows (or columns) across the TP ranks.
+    fn flat(global: usize, geometry: LocalGeometry) -> Self {
+        Self {
+            range: geometry.shard_range(global),
+            global,
+        }
+    }
+}
+
+/// The fused linear-attention qkv projection shard: this rank's row slice
+/// inside each of the three global segments, plus the fused global row count.
+#[derive(Clone, Copy)]
+struct LinearQkvShard {
+    segments: [(usize, usize); 3],
+    global: usize,
 }
 
 /// One model load's tensor source plus the loop-invariant TP shard ranges the
@@ -219,29 +220,20 @@ pub(super) struct WeightSource<'a> {
     /// tensors disagree with its `config.json` stops at the loader instead of
     /// reaching a GEMM sized from the config.
     hidden: usize,
-    /// Global (pre-shard) config-derived extents, so the sharded loads assert
-    /// the checkpoint's full shape exactly like the unsharded ones do.
-    gated_q_global: usize,
-    q_global: usize,
-    kv_global: usize,
-    intermediate_global: usize,
-    linear_z_global: usize,
-    value_heads_global: usize,
-    linear_qkv_global: usize,
     /// Full-attention q_proj rows as per-head [q, gate] chunks.
-    gated_q: (usize, usize),
+    gated_q: Shard,
     /// o_proj column shard over the full-attention q dim.
-    q_cols: (usize, usize),
+    q_cols: Shard,
     /// k/v_proj row shard.
-    kv_rows: (usize, usize),
+    kv_rows: Shard,
     /// MLP intermediate row (gate/up) and column (down) shard.
-    intermediate: (usize, usize),
+    intermediate: Shard,
     /// Linear-attention value-head unit: in_proj_b/a rows, dt_bias, A_log.
-    linear_value_heads: (usize, usize),
+    linear_value_heads: Shard,
     /// Linear-attention z dim: in_proj_z rows and out_proj columns.
-    linear_z: (usize, usize),
+    linear_z: Shard,
     /// Per-segment row slices inside the fused linear qkv projection.
-    linear_qkv: [(usize, usize); 3],
+    linear_qkv: LinearQkvShard,
     /// The same slices in conv1d channel-tap units.
     linear_conv1d: [(usize, usize); 3],
 }
@@ -254,28 +246,21 @@ impl<'a> WeightSource<'a> {
         config: &Config35,
         geometry: LocalGeometry,
     ) -> Self {
+        let linear_qkv = linear_qkv_shard(config, geometry);
         Self {
             ctx,
             shards,
             weight_map,
             geometry,
             hidden: config.hidden_size,
-            gated_q_global: config.full_attn_q_dim() * 2,
-            q_global: config.full_attn_q_dim(),
-            kv_global: config.full_attn_kv_dim(),
-            intermediate_global: config.intermediate_size,
-            linear_z_global: config.linear_attn_z_dim(),
-            value_heads_global: config.linear_num_value_heads,
-            linear_qkv_global: 2 * config.linear_num_key_heads * config.linear_key_head_dim
-                + config.linear_attn_z_dim(),
-            gated_q: full_attention_gated_q_shard_range(config, geometry),
-            q_cols: geometry.shard_range(config.full_attn_q_dim()),
-            kv_rows: geometry.shard_range(config.full_attn_kv_dim()),
-            intermediate: geometry.shard_range(config.intermediate_size),
-            linear_value_heads: geometry.shard_range(config.linear_num_value_heads),
-            linear_z: geometry.shard_range(config.linear_attn_z_dim()),
-            linear_qkv: linear_qkv_shard_segments(config, geometry),
-            linear_conv1d: linear_conv1d_shard_segments(config, geometry),
+            gated_q: full_attention_gated_q_shard(config, geometry),
+            q_cols: Shard::flat(config.full_attn_q_dim(), geometry),
+            kv_rows: Shard::flat(config.full_attn_kv_dim(), geometry),
+            intermediate: Shard::flat(config.intermediate_size, geometry),
+            linear_value_heads: Shard::flat(config.linear_num_value_heads, geometry),
+            linear_z: Shard::flat(config.linear_attn_z_dim(), geometry),
+            linear_qkv,
+            linear_conv1d: conv1d_shard_segments(linear_qkv, config.linear_conv_kernel_dim),
         }
     }
 
@@ -287,13 +272,9 @@ impl<'a> WeightSource<'a> {
         load_tensor_1d(self.ctx, self.shards, self.weight_map, name)
     }
 
-    fn row_shard_if_needed(
-        &self,
-        name: &str,
-        (row_offset, rows): (usize, usize),
-        global_rows: usize,
-    ) -> Result<DeviceMatrix> {
+    fn row_shard_if_needed(&self, name: &str, shard: Shard) -> Result<DeviceMatrix> {
         if self.geometry.is_sharded() {
+            let (row_offset, rows) = shard.range;
             load_tensor_2d_row_shard(
                 self.ctx,
                 self.shards,
@@ -301,20 +282,16 @@ impl<'a> WeightSource<'a> {
                 name,
                 row_offset,
                 rows,
-                (global_rows, self.hidden),
+                (shard.global, self.hidden),
             )
         } else {
-            self.tensor_2d(name, global_rows, self.hidden)
+            self.tensor_2d(name, shard.global, self.hidden)
         }
     }
 
-    fn col_shard_if_needed(
-        &self,
-        name: &str,
-        (col_offset, cols): (usize, usize),
-        global_cols: usize,
-    ) -> Result<DeviceMatrix> {
+    fn col_shard_if_needed(&self, name: &str, shard: Shard) -> Result<DeviceMatrix> {
         if self.geometry.is_sharded() {
+            let (col_offset, cols) = shard.range;
             load_tensor_2d_col_shard(
                 self.ctx,
                 self.shards,
@@ -322,36 +299,23 @@ impl<'a> WeightSource<'a> {
                 name,
                 col_offset,
                 cols,
-                (self.hidden, global_cols),
+                (self.hidden, shard.global),
             )
         } else {
-            self.tensor_2d(name, self.hidden, global_cols)
+            self.tensor_2d(name, self.hidden, shard.global)
         }
     }
 
-    fn tensor_1d_shard_if_needed(
-        &self,
-        name: &str,
-        (offset, len): (usize, usize),
-    ) -> Result<DeviceVec> {
+    fn tensor_1d_shard_if_needed(&self, name: &str, shard: Shard) -> Result<DeviceVec> {
         if self.geometry.is_sharded() {
-            load_tensor_1d_stitch(
-                self.ctx,
-                self.shards,
-                self.weight_map,
-                name,
-                &[(offset, len)],
-            )
+            load_tensor_1d_stitch(self.ctx, self.shards, self.weight_map, name, &[shard.range])
         } else {
             self.tensor_1d(name)
         }
     }
 
-    fn tensor_1d_f32_shard_if_needed(
-        &self,
-        name: &str,
-        (offset, len): (usize, usize),
-    ) -> Result<CudaSlice<f32>> {
+    fn tensor_1d_f32_shard_if_needed(&self, name: &str, shard: Shard) -> Result<CudaSlice<f32>> {
+        let (offset, len) = shard.range;
         if self.geometry.is_sharded() {
             load_tensor_1d_f32_shard(self.ctx, self.shards, self.weight_map, name, offset, len)
         } else {
@@ -363,15 +327,15 @@ impl<'a> WeightSource<'a> {
     /// three global segments rather than cutting one flat row range.
     fn linear_in_proj_qkv(&self, name: &str) -> Result<DeviceMatrix> {
         if !self.geometry.is_sharded() {
-            return self.tensor_2d(name, self.linear_qkv_global, self.hidden);
+            return self.tensor_2d(name, self.linear_qkv.global, self.hidden);
         }
         load_tensor_2d_row_stitch(
             self.ctx,
             self.shards,
             self.weight_map,
             name,
-            &self.linear_qkv,
-            (self.linear_qkv_global, self.hidden),
+            &self.linear_qkv.segments,
+            (self.linear_qkv.global, self.hidden),
         )
     }
 
@@ -394,9 +358,9 @@ impl<'a> WeightSource<'a> {
     /// (keeping each head's [q, gate] chunk adjacent), not as one flat range.
     fn gated_q_proj(&self, name: &str) -> Result<DeviceMatrix> {
         if !self.geometry.is_sharded() {
-            return self.tensor_2d(name, self.gated_q_global, self.hidden);
+            return self.tensor_2d(name, self.gated_q.global, self.hidden);
         }
-        let (row_offset, rows) = self.gated_q;
+        let (row_offset, rows) = self.gated_q.range;
         load_tensor_2d_row_shard(
             self.ctx,
             self.shards,
@@ -404,51 +368,56 @@ impl<'a> WeightSource<'a> {
             name,
             row_offset,
             rows,
-            (self.gated_q_global, self.hidden),
+            (self.gated_q.global, self.hidden),
         )
     }
 }
 
 /// Row ranges this rank owns inside the fused global linear-attention qkv
-/// projection. The checkpoint stores [all q rows | all k rows | all v rows];
-/// each segment contributes its head-local slice so the rank's stitched rows
-/// stay [q_local | k_local | v_local]. Never reblock across segments — q rows
-/// key on key heads, v rows on value heads (the gated-q lesson).
-fn linear_qkv_shard_segments(config: &Config35, geometry: LocalGeometry) -> [(usize, usize); 3] {
+/// projection, with the fused global row count the load asserts against. The
+/// checkpoint stores [all q rows | all k rows | all v rows]; each segment
+/// contributes its head-local slice so the rank's stitched rows stay
+/// [q_local | k_local | v_local]. Never reblock across segments — q rows key on
+/// key heads, v rows on value heads (the gated-q lesson).
+fn linear_qkv_shard(config: &Config35, geometry: LocalGeometry) -> LinearQkvShard {
     let global_q = config.linear_num_key_heads * config.linear_key_head_dim;
     let global_k = global_q;
     let global_v = config.linear_attn_z_dim();
     let (q_rel, q_rows) = geometry.shard_range(global_q);
     let (k_rel, k_rows) = geometry.shard_range(global_k);
     let (v_rel, v_rows) = geometry.shard_range(global_v);
-    [
-        (q_rel, q_rows),
-        (global_q + k_rel, k_rows),
-        (global_q + global_k + v_rel, v_rows),
-    ]
+    LinearQkvShard {
+        segments: [
+            (q_rel, q_rows),
+            (global_q + k_rel, k_rows),
+            (global_q + global_k + v_rel, v_rows),
+        ],
+        global: global_q + global_k + global_v,
+    }
 }
 
 /// The flattened conv1d weight keeps each channel's kernel taps contiguous
 /// ([channel, 1, kernel_dim]); its channel layout mirrors the fused qkv rows,
 /// so shard it with the same per-segment ranges scaled by the kernel dim.
-fn linear_conv1d_shard_segments(config: &Config35, geometry: LocalGeometry) -> [(usize, usize); 3] {
-    let kernel_dim = config.linear_conv_kernel_dim;
-    linear_qkv_shard_segments(config, geometry)
+fn conv1d_shard_segments(qkv: LinearQkvShard, kernel_dim: usize) -> [(usize, usize); 3] {
+    qkv.segments
         .map(|(offset, len)| (offset * kernel_dim, len * kernel_dim))
 }
 
-/// HF/PegaInfer kernels interpret q_proj rows as per-head [q, gate] chunks.
-/// Keep each local head's q rows adjacent to its gate rows.
-fn full_attention_gated_q_shard_range(
-    config: &Config35,
-    geometry: LocalGeometry,
-) -> (usize, usize) {
+/// HF/PegaInfer kernels interpret q_proj rows as per-head [q, gate] chunks:
+/// every head contributes `head_dim` q rows followed by `head_dim` gate rows.
+/// Keep each local head's q rows adjacent to its gate rows, so the shard is a
+/// per-head range rather than a flat cut of the fused rows.
+fn full_attention_gated_q_shard(config: &Config35, geometry: LocalGeometry) -> Shard {
+    let gated_rows = |heads: usize| heads * config.head_dim * 2;
     let local_heads = geometry.local_num_attention_heads();
-    let head_start = geometry.rank() * local_heads;
-    (
-        head_start * config.head_dim * 2,
-        local_heads * config.head_dim * 2,
-    )
+    Shard {
+        range: (
+            gated_rows(geometry.rank() * local_heads),
+            gated_rows(local_heads),
+        ),
+        global: gated_rows(config.num_attention_heads),
+    }
 }
 
 #[cfg(test)]
@@ -495,29 +464,36 @@ mod tests {
     fn linear_qkv_shard_segments_stitch_head_local_slices() {
         // test_config: k heads 16, v heads 32, head dim 128 → q=k=2048, v=4096.
         let config = test_config();
-        let rank0 = linear_qkv_shard_segments(&config, test_geometry(0, 2));
-        assert_eq!(rank0, [(0, 1024), (2048, 1024), (4096, 2048)]);
+        let rank0 = linear_qkv_shard(&config, test_geometry(0, 2));
+        assert_eq!(rank0.segments, [(0, 1024), (2048, 1024), (4096, 2048)]);
+        assert_eq!(rank0.global, 8192, "q + k + v rows of the fused tensor");
 
-        let rank1 = linear_qkv_shard_segments(&config, test_geometry(1, 2));
-        assert_eq!(rank1, [(1024, 1024), (3072, 1024), (6144, 2048)]);
+        let rank1 = linear_qkv_shard(&config, test_geometry(1, 2));
+        assert_eq!(rank1.segments, [(1024, 1024), (3072, 1024), (6144, 2048)]);
+        assert_eq!(rank1.global, rank0.global);
 
         // Every rank's stitched rows tile [0, qkv) with no overlap: each
         // segment's local slices across ranks are contiguous and complete.
-        for (r0, r1) in rank0.iter().zip(rank1.iter()) {
+        for (r0, r1) in rank0.segments.iter().zip(rank1.segments.iter()) {
             assert_eq!(r0.1, r1.1);
             assert_eq!(r1.0, r0.0 + r0.1);
         }
     }
 
     #[test]
-    fn gated_q_shard_range_keeps_matching_q_and_gate_rows() {
+    fn gated_q_shard_keeps_matching_q_and_gate_rows() {
         let config = test_config();
 
-        let rank0 = full_attention_gated_q_shard_range(&config, test_geometry(0, 2));
-        assert_eq!(rank0, (0, 4096));
+        let rank0 = full_attention_gated_q_shard(&config, test_geometry(0, 2));
+        assert_eq!(rank0.range, (0, 4096));
+        assert_eq!(
+            rank0.global, 8192,
+            "16 heads x 256 head_dim, each head carrying q then gate"
+        );
 
         // Rank 1 starts at its own first head's q rows, not the flat midpoint.
-        let rank1 = full_attention_gated_q_shard_range(&config, test_geometry(1, 2));
-        assert_eq!(rank1, (4096, 4096));
+        let rank1 = full_attention_gated_q_shard(&config, test_geometry(1, 2));
+        assert_eq!(rank1.range, (4096, 4096));
+        assert_eq!(rank1.global, rank0.global);
     }
 }
