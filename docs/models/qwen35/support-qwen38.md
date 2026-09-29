@@ -16,10 +16,11 @@
 > OpenAI-only `high`/`max` onto `xhigh` and `minimal` onto `low` — with the
 > active rewrite set probed from the loaded template at startup, so a template
 > that accepts the caller's value is never rewritten — and the template's tool
-> syntax is the Qwen Coder one that `Auto` parser selection cannot reach from
-> a `Qwen3.8-27B` directory: name the parser with `--tool-call-parser`. Both
-> serving notes are measured against the checkpoint's own template; the TP2
-> short/long logits rows are recorded below. Tracked in #1067.
+> syntax is the Qwen Coder one that upstream `Auto` path matching cannot reach
+> from a `Qwen3.8-27B` directory: the line resolves `auto` to `qwen3_coder`
+> itself. Both serving notes are verified against the real checkpoint (tool
+> calls round-trip streaming and non-streaming), and the TP2 short/long
+> logits rows are recorded below. Tracked in #1067.
 >
 > **Last touched:** 2026-09
 
@@ -154,34 +155,37 @@ body-read error categories).
 
 ## Tool-call parsing
 
-`tool_call_parser` defaults to `Auto`, which resolves the parser by
-case-insensitive substring match against the **model path** — `qwen3.5` maps
-to `qwen3_coder` and bare `qwen3` to `qwen3_xml`. A directory named
-`Qwen3.8-27B` contains `qwen3` but not `qwen3.5`, so `Auto` selects the JSON
-`qwen3_xml` parser; `--served-model-name` does not enter the match, and the
-selection is per-deployment, not per-request. The checkpoint's template
-requests the Qwen Coder function/parameter syntax, so name the parser
-explicitly:
+Both generations' templates request the Qwen Coder function/parameter
+syntax, verified against the real checkpoint (Qwen3.8-27B served TP2 on
+2×L20): a tools-bearing request emits
 
-```bash
---tool-call-parser qwen3_coder
+```text
+<function=get_weather>
+<parameter=city>
+Guangzhou
+</parameter>
+</function>
 ```
 
-Measured (`pegainfer-sim` on the checkpoint's directory, CPU only): a
-tools-bearing request against a server whose model path is
-`/…/models/Qwen3.8-27B` logs `using tool parser parser_name="qwen3_xml"` —
-the mismatch the flag exists to fix. An unregistered parser name is refused
-by `validate_parser_overrides` before an engine load is spent (pinned by a
+Under `Auto` the upstream matcher resolves the parser by case-insensitive
+substring match against the model *path* (`qwen3.5` → `qwen3_coder`, bare
+`qwen3` → `qwen3_xml`), so a `Qwen3.8-27B` directory picks `qwen3_xml` and
+that block lands in `content` unparsed (observed). The Qwen3.5 line
+therefore resolves `auto` itself: `ServePlan::auto_tool_call_parser` maps
+it to `qwen3_coder` regardless of the directory name, and an explicit
+`--tool-call-parser` choice — `none` included — still wins. Selection is
+per-deployment, not per-request; `--served-model-name` does not enter it.
+
+Under `qwen3_coder` the same generation round-trips: non-streaming returns
+a parsed `tool_calls` entry (`get_weather`, `{"city":"Guangzhou"}`), and
+streaming returns OpenAI-conformant tool-call deltas over SSE (127 `data:`
+lines, `[DONE]` terminator). An unregistered parser name is refused by
+`validate_parser_overrides` before an engine load is spent (pinned by a
 `model_line.rs` unit test):
 
 ```text
 Error: invalid --tool-call-parser: tool parser `this-parser-does-not-exist` is not registered (choose from: … qwen3_coder, qwen3_xml, …)
 ```
-
-**Limitation:** the grammar the checkpoint actually emits at generation time
-still needs a GPU verification pass (streaming and non-streaming); the
-template-level claim above is static evidence, and the `qwen3_xml` log line
-is a manual measurement.
 
 ## Serving budget (unchanged from Qwen3.5-27B)
 
@@ -201,10 +205,12 @@ is a manual measurement.
 
 Every row names the head and device it ran at; `current head` is the head
 this doc last changed with, built with `--features qwen35` at
-`PEGAINFER_CUDA_SM=89`. The TP2 rows are `Qwen/Qwen3.8-27B` @ `1d4bf0f2` on
-2×L20 (the text tower does not fit one card); the single-GPU rows are the
-Qwen3.5 sizes the shared 2D load path meets on a real checkpoint — every 2D
-load asserts the config-derived shape, and those runs are what "Qwen3.5
+`PEGAINFER_CUDA_SM=89` (CUDA 12.9, NCCL 2.32.3). The TP2 rows are
+`Qwen/Qwen3.8-27B` @ `1d4bf0f2` on 2×L20 (the text tower does not fit one
+card), re-run after the shard-loader shape validation landed — the numbers
+reproduce the pre-change runs exactly; the single-GPU rows are the Qwen3.5
+sizes the shared 2D load path meets on a real checkpoint — every 2D load
+asserts the config-derived shape, and those runs are what "Qwen3.5
 behaviour is unchanged" points to. The logits gates drive the engine directly
 and never issue an HTTP request; the serving rows cover the frontend layers.
 
@@ -216,11 +222,13 @@ and never issue an HTTP request; the serving rows cover the frontend layers.
 | `hf_golden_gate` Qwen3.5-0.8B, single GPU (tied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0298 / p99 0.1137. Long: 18 positions, mean 0.0286 / p99 0.0926. |
 | `hf_golden_gate` Qwen3.5-2B, single GPU (tied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0301 / p99 0.1172. Long: 18 positions, mean 0.0238 / p99 0.0778. |
 | `hf_golden_gate` Qwen3.5-4B, single GPU (untied head) | merged tree, 1×A40 (sm_80 build) | 2 passed / 0 failed. Short sequential: 108 positions, mean 0.0238 / p99 0.0813. Long: 18 positions, mean 0.0223 / p99 0.0705. |
-| serving probe (sim + real 27B template, CPU) | current head | Auto selects `qwen3_xml` on the 27B path; the startup probe arms `high`/`max`→`xhigh` and `minimal`→`low` from the loaded template (measured 200 where they were 500), pass-through values unchanged, kwargs-only effort still rendered raw; `--tool-call-parser` exposed and its invalid-name rejection fires before engine load. |
+| serving probe (sim, CPU) | current head | the startup probe arms `high`/`max`→`xhigh` and `minimal`→`low` from the guarded fixture template, pass-through values unchanged, kwargs-only effort still rendered raw; `--tool-call-parser` exposed and its invalid-name rejection fires before engine load. |
+| serving evidence (real Qwen3.8-27B, TP2, 2×L20) | current head | the startup probe arms `[("high","xhigh"),("max","xhigh"),("minimal","low")]` from the checkpoint's own template ~2 s into boot; a `reasoning_effort:"high"` chat request returns 200 with reasoning; tool calls round-trip under `qwen3_coder` (non-streaming `tool_calls` + SSE deltas) and come back raw under `qwen3_xml`; with no flag at all the line default logs `using tool parser parser_name="qwen3_coder"` and parses the same request. |
 | `reasoning_effort` normalization + probe (unit) | current head | 9 passed / 0 failed: the aliases map, `none`/`low`/`medium`/`xhigh` pass through, bodies without a rewritable top-level field come back verbatim, a kwargs-only effort is never rewritten, the probe arms every alias for the stock guarded template, arms none for a marked config whose template accepts the caller's values, skips without the marker or a local config, and the body-read failure categories come back as the OpenAI JSON envelope through the live middleware — an oversized body is a 413 naming the length limit, a truncated stream keeps its 400 and its cause. |
-| `pegainfer-qwen35 --lib` (feature build, Triton AOT) | review-fix head, 1×L20 | 102 passed / 0 failed, the GPU recurrent tests included. |
-| `pegainfer-core --lib` | review-fix head | 38 passed / 0 failed (f32-cow: 1D bf16 accepted, other dtypes/ranks rejected). |
-| `pegainfer-frontend --lib` | current head | 90 passed / 0 failed, the CLI consume-or-reject schema tests, the `--tool-call-parser` rejection test, the probe tests and the two middleware body-read category tests included. |
+| `pegainfer-qwen35 --lib` (feature build, Triton AOT) | current head, 2×L20 | 114 passed / 0 failed / 8 ignored, the GPU recurrent tests included. |
+| `pegainfer-core --lib` | current head | 37 passed / 0 failed (f32-cow: 1D bf16 accepted, other dtypes/ranks rejected). |
+| `hf_golden_gate` Qwen3.5-0.8B single GPU + TP2 | current head, L20 | single: 3 passed (sequential graph mean 0.0299 / p99 0.0954; long graph mean 0.0279 / p99 0.1166; batched and slot-compaction within tolerance). TP2 short: 1 passed (batched eager mean 0.0300 / p99 0.1127) — the sharded load path on a second geometry. |
+| `pegainfer-frontend --lib` | current head | 91 passed / 0 failed, the CLI consume-or-reject schema tests, the `--tool-call-parser` rejection and line-default resolution tests, the probe tests and the two middleware body-read category tests included. |
 | `frontend_e2e` + `tool_call_roundtrip` (CPU, `pegainfer-sim`) | current head | 23 passed / 0 failed and 3 passed / 0 failed; `frontend_e2e` carries the guarded-template `reasoning_effort` case (and still fails a kwargs-only effort, which is the deliberate boundary); the roundtrip suite keeps the streaming / non-streaming cases. |
 | clippy `-D warnings` | current head | `pegainfer-qwen35 --features qwen35 --all-targets`, `pegainfer-frontend` and `pegainfer-sim` (all targets) clean; `cargo fmt --all --check` clean. core/qwen3 as recorded earlier. |
 
@@ -280,6 +288,15 @@ Two oracle traps, both now guarded:
   this geometry without `flash-linear-attention` (only at the 48 v / 16 k head
   expansion ratio), which previously read as a passing gate. The dumper
   refuses to write a golden with any non-finite reference logprob.
+
+One environment trap, not guarded in code:
+
+- **TP2 inside a container may need `NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1`.**
+  On a k8s L20 pod the stock P2P/IB paths poison the CUDA context during the
+  first prefill all-reduce; with async error reporting the failure surfaces
+  later as a bewildering `silu_mul_fused ... cuda_status=700` (an illegal
+  access sticky from NCCL, not from the kernel named). `NCCL_DEBUG=INFO` plus
+  a small-model TP2 run (Qwen3.5-0.8B, seconds) is the fast triage loop.
 
 ## Follow-ups
 
