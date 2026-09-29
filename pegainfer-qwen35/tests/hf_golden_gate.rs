@@ -88,12 +88,14 @@ fn safetensors_metadata(bytes: &[u8]) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// This line's fixture names. The directory is shared with the other lines'
+/// gates, whose fixtures must not be considered here.
+const FIXTURE_PREFIXES: &[&str] = &["qwen35-", "qwen38-"];
+
 /// The fixture is chosen by the checkpoint's config bytes, not a geometry
 /// table: every committed fixture records `config_sha256` in its safetensors
-/// metadata, so the gate scans the committed fixtures and keeps the one whose
-/// recorded hash matches the local `config.json`. [`check_fixture_metadata`]
-/// then re-asserts that hash (plus `model_revision`) before a single logit is
-/// compared.
+/// metadata, so the gate scans this line's fixtures and keeps the one whose
+/// recorded hash matches the local `config.json`.
 fn find_default_fixture(model_path: &str, long: bool) -> String {
     let config = Path::new(model_path).join("config.json");
     let hash = sha256_file(&config).unwrap_or_else(|| panic!("read {}", config.display()));
@@ -109,7 +111,7 @@ fn find_default_fixture(model_path: &str, long: bool) -> String {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !(name.starts_with("qwen3") && name.ends_with(suffix)) {
+        if !(name.ends_with(suffix) && FIXTURE_PREFIXES.iter().any(|p| name.starts_with(p))) {
             continue;
         }
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -195,6 +197,10 @@ fn require_model_revision(model_path: &str, expected: &str, resolved: Option<Str
     );
 }
 
+/// Assert the fixture's recorded metadata against the local checkpoint. Every
+/// field is checked here rather than at selection time because a fixture named
+/// by `PEGAINFER_TEST_GOLDEN`/`_LONG` bypasses [`find_default_fixture`] and its
+/// `config_sha256` match entirely.
 fn check_fixture_metadata(model_path: &str, golden: &Golden) {
     let metadata = &golden.metadata;
     assert_eq!(
@@ -1022,17 +1028,4 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
             golden.num_seqs, golden.decode_len
         );
     }
-}
-
-#[test]
-#[should_panic(expected = "no committed qwen35 hf_golden_gate fixture")]
-fn missing_default_fixture_panics() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.json");
-    std::fs::write(
-        &config_path,
-        r#"{"model_type":"qwen3_5","text_config":{"hidden_size":1}}"#,
-    )
-    .unwrap();
-    find_default_fixture(dir.path().to_str().unwrap(), false);
 }

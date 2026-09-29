@@ -672,15 +672,21 @@ fn test_e2e_qwen35_scheduler() {
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
-    // Use reduced batch capacity (8) to fit on 16GB GPUs alongside the model.
-    let model =
-        pegainfer_qwen35::runtime::Qwen35Model::from_safetensors_with_options(&model_path, true, 8)
-            .expect("Failed to load model");
+    // Reduced batch capacity to fit on 16GB GPUs alongside the model. The model
+    // sizes its buffers with it and the scheduler admits against it, so both
+    // take the same binding.
+    let max_batch = 8;
+    let model = pegainfer_qwen35::runtime::Qwen35Model::from_safetensors_with_options(
+        &model_path,
+        true,
+        max_batch,
+    )
+    .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
     let handle = pegainfer_qwen35::runtime::start_with_capacity(
         model,
         42,
-        8,
+        max_batch,
         pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 scheduler");
