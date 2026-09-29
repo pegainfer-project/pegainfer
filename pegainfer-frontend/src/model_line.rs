@@ -285,6 +285,11 @@ pub struct LaunchContext<'a> {
 
 /// What the frontend must know before (and independently of) the engine
 /// finishing its load.
+///
+/// Lines should build their plan with `..ServePlan::default()` and spell only
+/// what they set: CI compiles three model lines, so an exhaustive literal in
+/// any other crate breaks on the next field added here and nothing catches it
+/// until that crate is checked by hand.
 pub struct ServePlan {
     /// Scheduler partitions (logical DP ranks) the launched engine will
     /// expose. The HTTP frontend registers one engine identity per partition
