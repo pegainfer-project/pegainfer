@@ -258,8 +258,7 @@ impl ModelLine for K3Line {
             // the frontend registers engine identities before the weights are
             // loaded.
             scheduler_partition_count: local_ranks(&cli, ep_size)?.len(),
-            prefill_only: false,
-            lora_modules: None,
+            ..ServePlan::default()
         })
     }
 
