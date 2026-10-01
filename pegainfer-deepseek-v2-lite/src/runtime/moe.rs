@@ -39,6 +39,7 @@ use crate::model::dense_mlp_forward;
 use crate::model::dense_mlp_forward_per_token;
 use crate::model::dense_mlp_forward_preallocated_into;
 use crate::model::dense_mlp_forward_preallocated_ref_into;
+use crate::model::routed_expert_projections;
 use crate::nccl_backend::NaiveNcclEp2Backend;
 
 fn parse_rollback_value(
@@ -119,13 +120,17 @@ impl DeviceRoutedMoeRuntime {
                 activate(&generator.rank0.ctx)?;
                 rank0_tables.push(Some(Dsv2ExpertPointerTable::new(
                     &generator.rank0.ctx,
-                    generator.rank0.routed_expert_projections(layer_idx)?,
+                    routed_expert_projections(&generator.rank0.layout, |expert| {
+                        generator.rank0.routed_expert(layer_idx, expert)
+                    })?,
                     generator.rank0.layout.owned_experts().start,
                 )?));
                 activate(&generator.rank1.ctx)?;
                 rank1_tables.push(Some(Dsv2ExpertPointerTable::new(
                     &generator.rank1.ctx,
-                    generator.rank1.routed_expert_projections(layer_idx)?,
+                    routed_expert_projections(&generator.rank1.layout, |expert| {
+                        generator.rank1.routed_expert(layer_idx, expert)
+                    })?,
                     generator.rank1.layout.owned_experts().start,
                 )?));
             } else {
@@ -157,7 +162,6 @@ impl DeviceRoutedMoeRuntime {
         })
     }
 
-    /// Clears both ranks' route summaries before all MoE layers in one forward.
     fn begin_forward(&mut self, generator: &DeepSeekV2LiteEp2Generator) -> Result<()> {
         activate(&generator.rank0.ctx)?;
         self.rank0_scratch.begin_forward(&generator.rank0.ctx)?;
@@ -165,7 +169,6 @@ impl DeviceRoutedMoeRuntime {
         self.rank1_scratch.begin_forward(&generator.rank1.ctx)
     }
 
-    /// Reads and validates both ranks' accumulated route summaries after all MoE layers.
     fn finish_forward(&self, generator: &DeepSeekV2LiteEp2Generator) -> Result<(usize, usize)> {
         activate(&generator.rank0.ctx)?;
         let rank0 = self.rank0_scratch.finish_forward(&generator.rank0.ctx)?;

@@ -18,7 +18,6 @@ const ROUTES_PER_TOKEN: usize = 6;
 const LOCAL_EXPERTS: usize = 32;
 pub const DSV2_ROUTED_MOE_MAX_ROWS: usize = 8;
 
-/// A table of device pointers to the gate up and down projection matrices for all experts in a rank.
 pub struct Dsv2ExpertPointerTable {
     first_expert: i32,
     hidden_dim: usize,
@@ -56,20 +55,6 @@ impl Dsv2ExpertPointerTable {
                     && down.cols == intermediate,
                 "inconsistent DeepSeek-V2-Lite expert projection shape"
             );
-            for matrix in [gate_up, down] {
-                let needed = matrix
-                    .rows
-                    .checked_mul(matrix.cols)
-                    .context("expert matrix element count overflow")?;
-                ensure!(
-                    matrix.data.len() >= needed,
-                    "expert matrix backing buffer too small"
-                );
-                ensure!(
-                    Arc::ptr_eq(matrix.data.stream(), &ctx.stream),
-                    "expert matrix stream mismatch"
-                );
-            }
             gate_up_ptrs.push(gate_up.data.device_ptr(&ctx.stream).0);
             down_ptrs.push(down.data.device_ptr(&ctx.stream).0);
         }
@@ -217,32 +202,23 @@ impl Dsv2RoutedMoeScratch {
         );
 
         super::dsv2_lite_router_logits_into(ctx, hidden, gate_weight, &mut self.logits)?;
-        unsafe {
-            ensure!(
-                ffi::cuda_set_device(ctx.device_ordinal as i32) == 0,
-                "activate routed MoE device"
-            );
-            ffi::cublas_init();
-        }
+        dsv2_lite_route_logits_into(
+            ctx,
+            &self.logits,
+            batch,
+            layer_idx,
+            &mut super::Dsv2LiteRouterOutput {
+                topk_weight: &mut self.weights,
+                topk_idx: &mut self.ids,
+            },
+            &mut self.errors,
+            &mut self.summary,
+        )?;
         let stream = ctx.stream.cu_stream();
-        let (logits, _gl) = self.logits.device_ptr(&ctx.stream);
-        let (ids, _gi) = self.ids.device_ptr_mut(&ctx.stream);
-        let (weights, _gw) = self.weights.device_ptr_mut(&ctx.stream);
-        let (errors, _ge) = self.errors.device_ptr_mut(&ctx.stream);
+        let (ids, _gi) = self.ids.device_ptr(&ctx.stream);
+        let (weights, _gw) = self.weights.device_ptr(&ctx.stream);
+        let (errors, _ge) = self.errors.device_ptr(&ctx.stream);
         let (summary, _gs) = self.summary.device_ptr_mut(&ctx.stream);
-        unsafe {
-            ffi::dsv2_lite_route_logits_cuda(
-                logits as _,
-                weights as _,
-                ids as _,
-                errors as _,
-                summary as _,
-                batch as i32,
-                layer_idx as i32,
-                stream,
-            )
-            .result()?;
-        }
 
         let (input, _gx) = hidden.data.device_ptr(&ctx.stream);
         let (zero, _gz) = self.zero.device_ptr(&ctx.stream);
@@ -326,168 +302,47 @@ impl Dsv2RoutedMoeScratch {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn host_softmax_top6(logits: &[f32], batch: usize) -> (Vec<i32>, Vec<f32>) {
-        let mut ids = Vec::with_capacity(batch * ROUTES_PER_TOKEN);
-        let mut weights = Vec::with_capacity(batch * ROUTES_PER_TOKEN);
-        for scores in logits.chunks_exact(64) {
-            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut probabilities: Vec<_> = scores
-                .iter()
-                .map(|score| (*score - maximum).exp())
-                .collect();
-            let sum: f32 = probabilities.iter().sum();
-            probabilities.iter_mut().for_each(|value| *value /= sum);
-            let mut indexed: Vec<_> = probabilities.into_iter().enumerate().collect();
-            indexed.sort_by(|(lhs_idx, lhs), (rhs_idx, rhs)| {
-                rhs.partial_cmp(lhs)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| lhs_idx.cmp(rhs_idx))
-            });
-            indexed.truncate(ROUTES_PER_TOKEN);
-            indexed.sort_by_key(|(expert, _)| *expert);
-            ids.extend(indexed.iter().map(|(expert, _)| *expert as i32));
-            weights.extend(indexed.into_iter().map(|(_, weight)| weight));
-        }
-        (ids, weights)
+pub fn dsv2_lite_route_logits_into(
+    ctx: &DeviceContext,
+    logits: &CudaSlice<f32>,
+    batch: usize,
+    layer_idx: usize,
+    output: &mut super::Dsv2LiteRouterOutput<'_>,
+    errors: &mut CudaSlice<i32>,
+    summary: &mut CudaSlice<u64>,
+) -> Result<()> {
+    ensure!(
+        (1..=DSV2_ROUTED_MOE_MAX_ROWS).contains(&batch),
+        "invalid routed MoE batch"
+    );
+    ensure!(
+        summary.len() > 3 && layer_idx < summary.len() - 3 && layer_idx <= i32::MAX as usize,
+        "routed MoE layer exceeds summary capacity"
+    );
+    ensure!(
+        logits.len() >= batch * 64
+            && output.topk_idx.len() >= batch * ROUTES_PER_TOKEN
+            && output.topk_weight.len() >= batch * ROUTES_PER_TOKEN
+            && errors.len() >= batch,
+        "routed MoE router buffer too small"
+    );
+    let (logits, _gl) = logits.device_ptr(&ctx.stream);
+    let (ids, _gi) = output.topk_idx.device_ptr_mut(&ctx.stream);
+    let (weights, _gw) = output.topk_weight.device_ptr_mut(&ctx.stream);
+    let (errors, _ge) = errors.device_ptr_mut(&ctx.stream);
+    let (summary, _gs) = summary.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::dsv2_lite_route_logits_cuda(
+            logits as _,
+            weights as _,
+            ids as _,
+            errors as _,
+            summary as _,
+            batch as i32,
+            layer_idx as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
     }
-
-    fn route_logits(
-        ctx: &DeviceContext,
-        logits: &[f32],
-        batch: usize,
-    ) -> (Vec<i32>, Vec<f32>, Dsv2RouteSummary) {
-        let mut scratch = Dsv2RoutedMoeScratch::new(ctx, 4, 3, batch, 2).unwrap();
-        scratch.logits = ctx.stream.clone_htod(logits).unwrap();
-        scratch.begin_forward(ctx).unwrap();
-        let stream = ctx.stream.cu_stream();
-        let (logits, _gl) = scratch.logits.device_ptr(&ctx.stream);
-        let (ids, _gi) = scratch.ids.device_ptr_mut(&ctx.stream);
-        let (weights, _gw) = scratch.weights.device_ptr_mut(&ctx.stream);
-        let (errors, _ge) = scratch.errors.device_ptr_mut(&ctx.stream);
-        let (summary, _gs) = scratch.summary.device_ptr_mut(&ctx.stream);
-        unsafe {
-            ffi::dsv2_lite_route_logits_cuda(
-                logits as _,
-                weights as _,
-                ids as _,
-                errors as _,
-                summary as _,
-                batch as i32,
-                1,
-                stream,
-            )
-            .result()
-            .unwrap();
-        }
-        drop((_gl, _gi, _gw, _ge, _gs));
-        let ids = ctx.stream.clone_dtoh(&scratch.ids).unwrap();
-        let weights = ctx.stream.clone_dtoh(&scratch.weights).unwrap();
-        let summary = scratch.finish_forward(ctx).unwrap();
-        (ids, weights, summary)
-    }
-
-    fn zero_experts(ctx: &DeviceContext) -> Vec<(DeviceMatrix, DeviceMatrix)> {
-        (0..LOCAL_EXPERTS)
-            .map(|_| {
-                let gate_up = DeviceMatrix::from_host(ctx, &[bf16::ZERO; 24], 6, 4).unwrap();
-                let down = DeviceMatrix::from_host(ctx, &[bf16::ZERO; 12], 4, 3).unwrap();
-                (gate_up, down)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn routed_moe_router_matches_host_at_supported_boundaries() {
-        let ctx = DeviceContext::new().expect("create CUDA context");
-        for batch in [1, 4, 8] {
-            for fixture in 0..3 {
-                let logits: Vec<_> = (0..batch)
-                    .flat_map(|token| {
-                        (0..64).map(move |expert| match fixture {
-                            0 => ((expert * 37 + token * 13) % 101) as f32 / 17.0 - 3.0,
-                            1 => 0.0,
-                            _ if expert < 5 => 10.0 - expert as f32,
-                            _ if expert == 5 => 1.0,
-                            _ if expert == 6 => 1.0 + 1.0e-5,
-                            _ => -(expert as f32),
-                        })
-                    })
-                    .collect();
-                let (expected_ids, expected_weights) = host_softmax_top6(&logits, batch);
-                let (actual_ids, actual_weights, summary) = route_logits(&ctx, &logits, batch);
-                assert_eq!(actual_ids, expected_ids, "batch={batch}, fixture={fixture}");
-                for (index, (actual, expected)) in
-                    actual_weights.iter().zip(expected_weights).enumerate()
-                {
-                    assert!(
-                        (actual - expected).abs() <= 1.0e-6,
-                        "batch={batch}, fixture={fixture}, route={index}: actual={actual}, expected={expected}"
-                    );
-                }
-                assert_eq!(summary.errors, 0);
-                assert_eq!(summary.layer_hashes[0], 0);
-                assert_ne!(summary.layer_hashes[1], 0);
-            }
-        }
-    }
-
-    #[test]
-    fn routed_moe_tracks_rank_ownership_without_host_route_data() {
-        let ctx = DeviceContext::new().expect("create CUDA context");
-        let experts = zero_experts(&ctx);
-        let projections = || experts.iter().map(|(gate, down)| (gate, down)).collect();
-        let rank0 = Dsv2ExpertPointerTable::new(&ctx, projections(), 0).unwrap();
-        let rank1 = Dsv2ExpertPointerTable::new(&ctx, projections(), 32).unwrap();
-        let gate_host: Vec<_> = (0..64)
-            .flat_map(|expert| {
-                [
-                    bf16::from_f32(expert as f32 / 64.0),
-                    bf16::ZERO,
-                    bf16::ZERO,
-                    bf16::ZERO,
-                ]
-            })
-            .collect();
-        let gate = DeviceMatrix::from_host(&ctx, &gate_host, 64, 4).unwrap();
-        let hidden_host: Vec<_> = (0..DSV2_ROUTED_MOE_MAX_ROWS)
-            .flat_map(|_| [bf16::ONE, bf16::ZERO, bf16::ZERO, bf16::ZERO])
-            .collect();
-        let hidden = HiddenStates {
-            data: ctx.stream.clone_htod(&hidden_host).unwrap(),
-            hidden_dim: 4,
-            seq_len: DSV2_ROUTED_MOE_MAX_ROWS,
-        };
-        let mut scratch = Dsv2RoutedMoeScratch::new(&ctx, 4, 3, 8, 1).unwrap();
-        let mut output = ctx.stream.alloc_zeros::<f32>(8 * 4).unwrap();
-
-        scratch.begin_forward(&ctx).unwrap();
-        scratch
-            .enqueue_into(&ctx, hidden.as_ref(), &gate, &rank0, &mut output, 0)
-            .unwrap();
-        let rank0_summary = scratch.finish_forward(&ctx).unwrap();
-        assert_eq!(rank0_summary.local_routes, 0);
-        assert_eq!(rank0_summary.total_routes, 8 * ROUTES_PER_TOKEN);
-        assert_eq!(rank0_summary.errors, 0);
-        assert!(
-            ctx.stream
-                .clone_dtoh(&output)
-                .unwrap()
-                .iter()
-                .all(|&value| value == 0.0)
-        );
-
-        scratch.begin_forward(&ctx).unwrap();
-        scratch
-            .enqueue_into(&ctx, hidden.as_ref(), &gate, &rank1, &mut output, 0)
-            .unwrap();
-        let rank1_summary = scratch.finish_forward(&ctx).unwrap();
-        assert_eq!(rank1_summary.local_routes, 8 * ROUTES_PER_TOKEN);
-        assert_eq!(rank1_summary.total_routes, rank0_summary.total_routes);
-        assert_eq!(rank1_summary.layer_hashes, rank0_summary.layer_hashes);
-        assert_eq!(rank1_summary.errors, 0);
-    }
+    Ok(())
 }

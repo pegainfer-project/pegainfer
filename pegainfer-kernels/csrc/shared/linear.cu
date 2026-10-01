@@ -974,25 +974,4 @@ int gemm_per_token_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
   return static_cast<int>(cudaPeekAtLastError());
 }
 
-// DSV2-Lite route consumer. Pointer arrays reside on device; each entry is an
-// independent N=1 problem, not a multi-row expert GEMM.
-// Numerical identity with gemm_per_token_cuda is NOT guaranteed by cuBLAS.
-int dsv2_lite_pointer_gemm_cuda(const void *const *weights,
-                               const void *const *inputs, void *const *outputs,
-                               int m, int k, int routes, cudaStream_t stream) {
-  if (!g_cublas_handle) return static_cast<int>(cudaErrorInvalidResourceHandle);
-  if (!weights || !inputs || !outputs || m <= 0 || k <= 0 || routes <= 0 || routes > 48)
-    return static_cast<int>(cudaErrorInvalidValue);
-  cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) return cublas_status_to_error(status);
-  const float alpha = 1.0f, beta = 0.0f;
-  status = cublasGemmBatchedEx(
-      g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, m, 1, k,
-      &alpha, weights, CUDA_R_16BF, k, inputs, CUDA_R_16BF, k,
-      &beta, outputs, CUDA_R_16BF, m, routes,
-      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  return status == CUBLAS_STATUS_SUCCESS ? static_cast<int>(cudaPeekAtLastError())
-                                       : cublas_status_to_error(status);
-}
-
 } // extern "C"

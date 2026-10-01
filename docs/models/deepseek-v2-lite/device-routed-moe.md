@@ -2,7 +2,7 @@
 
 > **TL;DR:** NCCL MoE forwards with at most eight rows keep routing, routed-expert projection, weighted reduction, and EP combine inputs on device. Each rank executes fixed route slots through pointer-batched `N=1` GEMMs; this removes the host route plan but is not an expert-sorted grouped GEMM.
 
-Last touched: 2026-09
+Last touched: 2026-10
 
 ## Scope
 
@@ -32,7 +32,7 @@ The shared expert remains on rank 0 and is added after the routed result is comb
 
 `DeviceRoutedMoeRuntime` owns per-layer expert pointer tables and reusable capacity-eight scratch for both ranks. The pointer tables reference model weights, so the runtime is destroyed before the two rank models. Mutex guards serialize scratch reuse and protect the NCCL send buffers while both rank-local reductions write them.
 
-`begin_forward` clears route summaries once before the MoE layers; `finish_forward` reads them once afterward. The summaries check nonfinite values, route totals, ownership counts, and matching per-layer route hashes across ranks without adding a host synchronization to every layer. The private router producer constructs six in-range, distinct IDs in ascending order; the parity fixtures check that invariant before the consumer relies on it.
+`begin_forward` clears route summaries once before the MoE layers; `finish_forward` reads them once afterward. The summaries check nonfinite values, route totals, ownership counts, and matching per-layer route hashes across ranks without adding a host synchronization to every layer. For finite logits, the private router producer constructs six in-range, distinct IDs in ascending order; the parity fixtures check that invariant before the consumer relies on it.
 
 ## Numerical Contract And Fallback
 
@@ -46,20 +46,21 @@ Validation was run on two A100 40 GB GPUs with release builds.
 
 | Check | Result |
 | --- | --- |
-| DeepSeek-V2-Lite library tests | `79 passed; 0 failed` |
-| Routed-MoE CUDA ownership test | Passed |
+| DeepSeek-V2-Lite library tests | Passed |
 | Router randomized / tie / near-tie fixtures | Exact route IDs and ordering at rows 1 / 4 / 8 |
 | Compute Sanitizer memcheck | Passed with `0 errors` |
-| HF / host-staged / NCCL case set | All 5 cases and 13 PegaInfer rows were token- and text-exact |
+| HF / host-staged / NCCL case set | Token- and text-exact |
 | Mixed-request NCCL E2E | Passed |
 | Host-router + serial-expert fallback | Passed |
-| HTTP lifecycle scenarios | All four scenarios passed with healthy follow-up requests |
+| HTTP lifecycle scenarios | Passed with healthy follow-up requests |
 
-The direct A/B runs also produced the same token hash in all 18 artifacts. Batched cuBLAS projections are not bitwise-equal to the serial intermediate tensors, but the retained route checks and generated outputs passed.
+The direct A/B runs also produced matching token hashes. Batched cuBLAS projections are not bitwise-equal to the serial intermediate tensors, but the retained route checks and generated outputs passed.
 
 ## Performance Validation
 
-The comparison alternated the baseline and optimized binaries in the same environment. Each cell below is the median of three per-run decode-step means.
+The baseline uses GPU router logits followed by CPU softmax/top-k and a host route plan. Baseline and device-routed binaries were alternated on two A100 40 GB GPUs in the same environment. Each cell below is the median of three per-run decode-step means.
+
+Measurements used `dsv2_lite_ep2_decode_attribution` with the same `Hello` prompt in each batch row, 16 output tokens, attribution enabled, and CUDA Graph disabled. See [Verification And Benchmarking](benchmarking.md#direct-diagnostic-benchmark) for the run command.
 
 | Decode batch | Baseline | Device-routed | Improvement |
 | ---: | ---: | ---: | ---: |
@@ -69,7 +70,7 @@ The comparison alternated the baseline and optimized binaries in the same enviro
 
 This path covers the current decode scheduler limit of eight live requests and short prefill with at most eight rows. The performance numbers above measure decode only. Any forward with more than eight rows continues through the eager route-plan path.
 
-One same-binary HTTP A/B used 32 requests with exactly 64 input and 64 output tokens at each client concurrency. The baseline set `PEGAINFER_DSV2_LITE_NCCL_ROUTER=host`; the device-routed run removed only that rollback setting. This was one diagnostic run per cell without warmup or repeats, so it establishes direction rather than stability.
+One same-binary HTTP A/B used 32 requests with exactly 64 input and 64 output tokens at each client concurrency. The baseline enabled the host-router rollback (`PEGAINFER_DSV2_LITE_NCCL_ROUTER=host`); the device-routed run removed only that setting. Each cell was measured once without warmup.
 
 | Client concurrency | Baseline TPOT p50 | Device-routed TPOT p50 | TPOT change | Output tok/s change |
 | ---: | ---: | ---: | ---: | ---: |
@@ -77,7 +78,7 @@ One same-binary HTTP A/B used 32 requests with exactly 64 input and 64 output to
 | 4 | 235.396 ms | 207.178 ms | -12.0% | +18.8% |
 | 8 | 448.599 ms | 362.379 ms | -19.2% | +26.8% |
 
-All six cells completed 32/32 requests without failures or timeouts, had complete server-trace coverage, and produced the same combined output hash (`b80516972eb65fb2`). The artifacts are under `target/benchmarks/dsv2-device-routed-once/`.
+All HTTP cells completed without failures or timeouts, had complete server-trace coverage, and produced matching output hashes.
 
 ## Follow-Up Work
 

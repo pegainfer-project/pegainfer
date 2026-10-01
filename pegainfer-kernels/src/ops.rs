@@ -15,6 +15,8 @@ pub use dsv2_routed_moe::Dsv2ExpertPointerTable;
 pub use dsv2_routed_moe::Dsv2RouteSummary;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use dsv2_routed_moe::Dsv2RoutedMoeScratch;
+#[cfg(feature = "deepseek-v2-lite")]
+pub use dsv2_routed_moe::dsv2_lite_route_logits_into;
 mod elementwise;
 mod embedding;
 #[cfg(feature = "gemma4")]

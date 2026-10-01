@@ -670,3 +670,70 @@ fn assert_error_contains(err: &anyhow::Error, needle: &str) {
         "expected error containing {needle:?}, got {message:?}"
     );
 }
+
+#[test]
+fn device_routed_router_matches_host_at_supported_boundaries() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let mut config = test_lite_config();
+    config.n_routed_experts = 64;
+    config.num_experts_per_token = 6;
+    for batch in [1, 4, 8] {
+        for fixture in 0..3 {
+            let logits: Vec<_> = (0..batch)
+                .flat_map(|token| {
+                    (0..config.n_routed_experts).map(move |expert| match fixture {
+                        0 => ((expert * 37 + token * 13) % 101) as f32 / 17.0 - 3.0,
+                        1 => 0.0,
+                        _ if expert < 5 => 10.0 - expert as f32,
+                        _ if expert == 5 => 1.0,
+                        _ if expert == 6 => 1.0 + 1.0e-5,
+                        _ => -(expert as f32),
+                    })
+                })
+                .collect();
+            let expected = topk_softmax_routes(&config, &logits, batch);
+            let logits = ctx.stream.clone_htod(&logits).expect("logits H2D");
+            let mut ids = ctx
+                .stream
+                .alloc_zeros::<i32>(batch * config.num_experts_per_token)
+                .unwrap();
+            let mut weights = ctx
+                .stream
+                .alloc_zeros::<f32>(batch * config.num_experts_per_token)
+                .unwrap();
+            let mut errors = ctx.stream.alloc_zeros::<i32>(batch).unwrap();
+            let mut summary = ctx.stream.alloc_zeros::<u64>(5).unwrap();
+            pegainfer_kernels::ops::dsv2_lite_route_logits_into(
+                &ctx,
+                &logits,
+                batch,
+                1,
+                &mut Dsv2LiteRouterOutput {
+                    topk_idx: &mut ids,
+                    topk_weight: &mut weights,
+                },
+                &mut errors,
+                &mut summary,
+            )
+            .expect("device routed router");
+            let ids = ctx.stream.clone_dtoh(&ids).unwrap();
+            let weights = ctx.stream.clone_dtoh(&weights).unwrap();
+            let errors = ctx.stream.clone_dtoh(&errors).unwrap();
+            let summary = ctx.stream.clone_dtoh(&summary).unwrap();
+            ctx.sync().unwrap();
+            for (token, routes) in expected.iter().enumerate() {
+                for (route, &(expert, weight)) in routes.iter().enumerate() {
+                    let slot = token * config.num_experts_per_token + route;
+                    assert_eq!(
+                        ids[slot], expert as i32,
+                        "batch={batch}, fixture={fixture}, slot={slot}"
+                    );
+                    assert_close(weights[slot], weight, 1.0e-6);
+                }
+            }
+            assert!(errors.iter().all(|&error| error == 0));
+            assert_eq!(summary[3], 0);
+            assert_ne!(summary[4], 0);
+        }
+    }
+}
