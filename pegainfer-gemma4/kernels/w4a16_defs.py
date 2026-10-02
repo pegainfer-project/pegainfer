@@ -10,12 +10,14 @@ locals [0, 2, 4, 6, 1, 3, 5, 7]. Four consecutive k16 tiles are one 16-byte
 run per lane. Each lane's two row scales travel as one bf16x2 word.
 
 Both kernels are stream-K over (64-column tile, 256-deep K stage) units on P
-persistent CTAs whose four warps split each stage's K, so x is read from
-shared memory once per CTA. A tile split across CTAs is finished in-kernel by
+persistent CTAs whose warps split each stage's K, so x is read from shared
+memory once per CTA. A tile split across CTAs is finished in-kernel by
 the CTA holding its first units: the later parts are the other CTAs' first
 tiles, written early, and are added in k order once their flags are set. The
 split depends on the shape and P alone, so a row's bits do not depend on how
-many rows ride with it, and every CTA must be resident at once.
+many rows ride with it, and every CTA must be resident at once. That residency
+is what ties the warp count and pipeline depth to the target's shared memory
+per SM; `pick_tiling` owns the choice.
 
 Up to eight rows run with the operands swapped (weights as the MMA A operand,
 x as the n8 B operand, one MMA per weight tile); sixteen rows take x as the
@@ -38,9 +40,48 @@ from tilelang.cuda.intrinsics.macro.mma_macro_generator import TensorCoreIntrinE
 GROUP = 32
 BLOCK_N = 64
 BLOCK_K = 256
-WARPS = 4
-STAGES = 3
 BUCKETS = (1, 2, 4, 8, 16)
+
+# The stream-K fix-up keeps two CTAs resident per SM, so one CTA's dynamic
+# shared memory has to fit half the device's per-SM budget. More warps split a
+# stage's K wider and more stages hide the load latency deeper, so the
+# candidates are ordered most capable first and `pick_tiling` takes the first
+# that fits: (4, 3) is the Hopper default, (2, 2) is what Ada's 100 KB admits.
+TILINGS = ((4, 3), (4, 2), (2, 3), (2, 2))
+# The driver reserves this much shared memory per block on top of the dynamic
+# size the kernel asks for.
+SMEM_PER_BLOCK_RESERVED = 1024
+# The widest row bucket: `rows = 16` runs unswapped with `xr = 16`, so it is
+# the one the budget has to satisfy.
+SMEM_XR = 16
+
+
+def smem_bytes(warps, stages):
+    """Dynamic shared bytes one CTA asks for at the widest row bucket: the
+    `stages`-deep pipeline over the A, weight and scale tiles, the per-warp
+    accumulator tile and the cross-warp reduction tile."""
+    cols = BLOCK_N // 16
+    slices = BLOCK_K // 64
+    staged = (
+        SMEM_XR * BLOCK_K * 2  # x_sh
+        + cols * slices * 32 * 4 * 4  # w_sh
+        + cols * (BLOCK_K // GROUP) * 8 * 4  # s_sh
+    )
+    return stages * staged + warps * SMEM_XR * BLOCK_N * 4 + SMEM_XR * BLOCK_N * 4
+
+
+def pick_tiling(smem_per_sm):
+    """The most capable tiling whose two resident CTAs fit `smem_per_sm`."""
+    for warps, stages in TILINGS:
+        if 2 * (smem_bytes(warps, stages) + SMEM_PER_BLOCK_RESERVED) <= smem_per_sm:
+            return warps, stages
+    raise ValueError(
+        f"no W4A16 tiling fits {smem_per_sm} B of shared memory per SM: the "
+        f"cheapest needs "
+        f"{2 * (smem_bytes(*TILINGS[-1]) + SMEM_PER_BLOCK_RESERVED)} B for its "
+        f"two resident CTAs"
+    )
+
 
 # One prelude for every kernel in the unit, so their preambles agree.
 PRELUDE = r"""
@@ -112,16 +153,20 @@ def plan(nb, kb, P):
     return offsets, flat
 
 
-def gemm(N, K, rows, P, gelu_mul=False):
+def gemm(N, K, rows, P, gelu_mul=False, tiling=TILINGS[0]):
     """The prim_func for one (shape, bucket); `plan(N // BLOCK_N, K // BLOCK_K, P)`
     gives its `fin_off` / `fin_list` arguments. With `gelu_mul` the weight is
-    an interleaved gate|up stack and `y` is `N // 2` wide."""
+    an interleaved gate|up stack and `y` is `N // 2` wide. `tiling` is a
+    `(warps, stages)` pair, chosen against the target's shared memory budget
+    (`pick_tiling`)."""
+    warps, stages = tiling
     assert rows in BUCKETS and N % BLOCK_N == 0 and K % BLOCK_K == 0
     swapped = rows <= 8
     xr = 8 if swapped else 16
     cols = BLOCK_N // 16
     slices = BLOCK_K // 64
-    per_warp = slices // WARPS
+    assert 1 <= warps <= slices, f"{warps} warps cannot split {slices} K slices"
+    per_warp = slices // warps
     nb, kb = N // BLOCK_N, K // BLOCK_K
     U = nb * kb
     steps = -(-U // P)
@@ -168,11 +213,11 @@ def gemm(N, K, rows, P, gelu_mul=False):
         fin_off: T.Tensor((P + 1,), "int32"),
         fin_list: T.Tensor((n_flat,), "int32"),
     ):
-        with T.Kernel(P, threads=32 * WARPS, prelude=PRELUDE) as c:
+        with T.Kernel(P, threads=32 * warps, prelude=PRELUDE) as c:
             x_sh = T.alloc_shared((xr, BLOCK_K), "bfloat16")
             w_sh = T.alloc_shared((cols, slices, 32, 4), "int32")
             s_sh = T.alloc_shared((cols, BLOCK_K // GROUP, 8), "int32")
-            c_sh = T.alloc_shared((WARPS, xr, BLOCK_N), "float")
+            c_sh = T.alloc_shared((warps, xr, BLOCK_N), "float")
             tot = T.alloc_shared((xr, BLOCK_N), "float")
             if not swapped:
                 T.annotate_layout({x_sh: make_mma_swizzle_layout(x_sh)})
@@ -189,7 +234,7 @@ def gemm(N, K, rows, P, gelu_mul=False):
             lo_u = c * U // P
             hi_u = (c + 1) * U // P
             T.clear(acc)
-            for it in T.Pipelined(steps, num_stages=STAGES):
+            for it in T.Pipelined(steps, num_stages=stages):
                 u = T.min(lo_u + it, hi_u - 1)
                 t = u // kb
                 kt = u % kb
@@ -276,7 +321,7 @@ def gemm(N, K, rows, P, gelu_mul=False):
                         for i, j in T.Parallel(rows, BLOCK_N):
                             total = T.alloc_var("float")
                             total = c_sh[0, i, j]
-                            for w in T.serial(1, WARPS):
+                            for w in T.serial(1, warps):
                                 total = total + c_sh[w, i, j]
                             tot[i, j] = total
                         T.sync_threads()

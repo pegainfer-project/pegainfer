@@ -9,7 +9,9 @@ launcher that dispatches on (n, k, rows) and refuses any other.
 The CTA count is part of the kernels (stream-K splits over it, and the split
 decides the summation order), so it is fixed here: twice the build device's
 SM count, or twice `PEGAINFER_GEMMA4_W4A16_SMS`. `GEOMETRY` carries it to the
-crate, which refuses a device with another SM count.
+crate, which refuses a device with another SM count. The warp count and
+pipeline depth are not fixed: the in-kernel fix-up needs two CTAs resident, so
+they are picked against the target's shared memory per SM (`defs.pick_tiling`).
 """
 
 from __future__ import annotations
@@ -95,6 +97,19 @@ def sm_count() -> int | None:
     return torch.cuda.get_device_properties(0).multi_processor_count
 
 
+def smem_per_sm() -> int | None:
+    """The serving device's shared memory per SM, `None` when neither the
+    variable nor a visible device says it."""
+    stated = os.environ.get("PEGAINFER_GEMMA4_W4A16_SMEM_PER_SM")
+    if stated:
+        return int(stated)
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_properties(0).shared_memory_per_multiprocessor
+
+
 def symbol(n: int, k: int, rows: int) -> str:
     return f"{CU_STEM}_{n}x{k}_m{rows}_kernel"
 
@@ -102,13 +117,13 @@ def symbol(n: int, k: int, rows: int) -> str:
 CASES = [(n, k, rows) for n, k in SHAPES for rows in defs.BUCKETS]
 
 
-def kernels(ctas: int) -> list[Kernel]:
+def kernels(ctas: int, tiling: tuple[int, int]) -> list[Kernel]:
     out = []
     for n, k, rows in CASES:
 
         def build(arch: str, n=n, k=k, rows=rows):
             return tilelang.compile(
-                defs.gemm(n, k, rows, ctas, gelu_mul=(n, k) == GELU_MUL),
+                defs.gemm(n, k, rows, ctas, gelu_mul=(n, k) == GELU_MUL, tiling=tiling),
                 target={"kind": "cuda", "arch": arch},
                 pass_configs=PASS_CONFIGS,
             )
@@ -186,7 +201,14 @@ def main() -> None:
         )
         return
     ctas = 2 * sms
-    specs = kernels(ctas)
+    smem = smem_per_sm()
+    if smem is None:
+        # No budget to size against: keep the upstream tiling. A device it does
+        # not fit is caught by the crate's occupancy check at load, not here.
+        tiling = defs.TILINGS[0]
+    else:
+        tiling = defs.pick_tiling(smem)
+    specs = kernels(ctas, tiling)
     launcher = Launcher(
         name=LAUNCHER,
         params=LAUNCHER_PARAMS,
@@ -226,7 +248,8 @@ def main() -> None:
     lines = [f"CU_PATH={named(cu_path)}"]
     lines.append(f"TILELANG_TEMPLATE_PATH={named(template_include)}")
     lines.append(f"CUTLASS_INCLUDE_DIR={named(cutlass_include)}")
-    lines.append(f"GEOMETRY={ctas},{defs.BLOCK_N},{defs.BLOCK_K},{defs.WARPS}")
+    lines.append(f"GEOMETRY={ctas},{defs.BLOCK_N},{defs.BLOCK_K},{tiling[0]}")
+    lines.append(f"TILING={tiling[0]},{tiling[1]}")
     lines.append(f"SMEM={max(low.smem for low in lowered)}")
     lines.extend(
         f"NVCC_FLAG={PASS_CONFIG_NVCC_FLAG[key]}"

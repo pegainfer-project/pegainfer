@@ -2708,6 +2708,7 @@ fn main() {
             &nvcc,
         ));
         println!("cargo:rerun-if-env-changed=PEGAINFER_GEMMA4_W4A16_SMS");
+        println!("cargo:rerun-if-env-changed=PEGAINFER_GEMMA4_W4A16_SMEM_PER_SM");
         nvcc_tasks.extend(tilelang_nvcc_tasks(
             &GEMMA4_W4A16_TILELANG,
             &out_dir,
