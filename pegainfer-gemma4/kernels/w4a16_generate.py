@@ -10,8 +10,8 @@ The CTA count is part of the kernels (stream-K splits over it, and the split
 decides the summation order), so it is fixed here: twice the build device's
 SM count, or twice `PEGAINFER_GEMMA4_W4A16_SMS`. `GEOMETRY` carries it to the
 crate, which refuses a device with another SM count. The warp count and
-pipeline depth are not fixed: the in-kernel fix-up needs two CTAs resident, so
-they are picked against the target's shared memory per SM (`defs.pick_tiling`).
+pipeline depth are not fixed either: `pick_tiling` widens them until the two
+CTAs the fix-up needs stop fitting the arch's shared memory.
 """
 
 from __future__ import annotations
@@ -97,17 +97,39 @@ def sm_count() -> int | None:
     return torch.cuda.get_device_properties(0).multi_processor_count
 
 
-def smem_per_sm() -> int | None:
-    """The serving device's shared memory per SM, `None` when neither the
-    variable nor a visible device says it."""
-    stated = os.environ.get("PEGAINFER_GEMMA4_W4A16_SMEM_PER_SM")
-    if stated:
-        return int(stated)
-    import torch
+def sm_of(arch: str) -> int:
+    """The compute capability an `--arch` names: `sm_89` and `sm_90a` are 89
+    and 90."""
+    digits = ""
+    for ch in arch.removeprefix("sm_"):
+        if not ch.isdigit():
+            break
+        digits += ch
+    return int(digits)
 
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_properties(0).shared_memory_per_multiprocessor
+
+def probe_smem(arch: str, ctas: int, tiling: tuple[int, int]) -> int:
+    """Dynamic shared bytes of a rows=16 kernel, the widest bucket, so the one
+    the two-resident-CTA budget has to clear. One shape answers for all six:
+    the tiles are sized by the bucket and the tiling, not by N or K. `main`
+    holds the whole lowering to the same budget anyway."""
+    spec, *_ = kernels(ctas, tiling, rows_only=16)
+    return lower(spec, arch).smem
+
+
+def smem_budget(arch: str) -> int:
+    """The shared memory per SM of the device `--arch` names. An arch with no
+    stated budget takes the smallest one, which keeps the tiling loadable."""
+    return defs.SMEM_PER_SM.get(sm_of(arch), min(defs.SMEM_PER_SM.values()))
+
+
+def pick_tiling(arch: str, ctas: int, budget: int) -> tuple[int, int]:
+    """The widest tiling whose two resident CTAs fit `budget` bytes of shared
+    memory per SM."""
+    for tiling in defs.TILINGS:
+        if 2 * (probe_smem(arch, ctas, tiling) + defs.SMEM_PER_BLOCK_RESERVED) <= budget:
+            return tiling
+    raise RuntimeError(f"no W4A16 tiling fits {budget} B of shared memory per SM")
 
 
 def symbol(n: int, k: int, rows: int) -> str:
@@ -117,9 +139,13 @@ def symbol(n: int, k: int, rows: int) -> str:
 CASES = [(n, k, rows) for n, k in SHAPES for rows in defs.BUCKETS]
 
 
-def kernels(ctas: int, tiling: tuple[int, int]) -> list[Kernel]:
+def kernels(
+    ctas: int, tiling: tuple[int, int], rows_only: int | None = None
+) -> list[Kernel]:
     out = []
     for n, k, rows in CASES:
+        if rows_only is not None and rows != rows_only:
+            continue
 
         def build(arch: str, n=n, k=k, rows=rows):
             return tilelang.compile(
@@ -201,13 +227,8 @@ def main() -> None:
         )
         return
     ctas = 2 * sms
-    smem = smem_per_sm()
-    if smem is None:
-        # No budget to size against: keep the upstream tiling. A device it does
-        # not fit is caught by the crate's occupancy check at load, not here.
-        tiling = defs.TILINGS[0]
-    else:
-        tiling = defs.pick_tiling(smem)
+    budget = smem_budget(args.arch)
+    tiling = pick_tiling(args.arch, ctas, budget)
     specs = kernels(ctas, tiling)
     launcher = Launcher(
         name=LAUNCHER,
@@ -249,8 +270,15 @@ def main() -> None:
     lines.append(f"TILELANG_TEMPLATE_PATH={named(template_include)}")
     lines.append(f"CUTLASS_INCLUDE_DIR={named(cutlass_include)}")
     lines.append(f"GEOMETRY={ctas},{defs.BLOCK_N},{defs.BLOCK_K},{tiling[0]}")
-    lines.append(f"TILING={tiling[0]},{tiling[1]}")
-    lines.append(f"SMEM={max(low.smem for low in lowered)}")
+    smem = max(low.smem for low in lowered)
+    # The probe answered with one rows=16 kernel; the whole lowering has to
+    # clear the same budget, or the crate's occupancy check refuses it at load.
+    if 2 * (smem + defs.SMEM_PER_BLOCK_RESERVED) > budget:
+        raise RuntimeError(
+            f"the {args.arch} lowering asks for {smem} B per CTA, past the two "
+            f"resident CTAs a {budget} B budget holds"
+        )
+    lines.append(f"SMEM={smem}")
     lines.extend(
         f"NVCC_FLAG={PASS_CONFIG_NVCC_FLAG[key]}"
         for key, on in PASS_CONFIGS.items()
