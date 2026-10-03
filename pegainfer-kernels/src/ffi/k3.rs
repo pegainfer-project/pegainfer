@@ -173,6 +173,90 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Matmul landing (`csrc/k3/k3_land.cu`): merge the column span
+    /// `[off, off + n)` of each row's `p [b, split_k, nt]` f32 partial and
+    /// land `o [b, n]` bf16 once — ascending-segment f32 sum, one
+    /// round-to-nearest-even cast, bit-identical to the retired TileLang
+    /// kernel. Shapes are runtime values (no per-bucket instantiation).
+    pub fn k3_land_cuda(
+        p: *const f32,
+        o: *mut c_void,
+        b: i32,
+        nt: i32,
+        n: i32,
+        off: i32,
+        split_k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// bf16 elementwise family (`csrc/k3/k3_elementwise.cu`), eight columns
+    /// per thread, bit-identical to the retired TileLang batched kernels.
+    /// `O = A + Bt` in bf16 addition, all `[b, n]`; n a multiple of 8.
+    pub fn k3_add2_cuda(
+        a: *const c_void,
+        bt: *const c_void,
+        o: *mut c_void,
+        b: i32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// `O = A * bf16(sigmoid(Bt))`, the MLA sigmoid output gate. All `[b, n]`.
+    pub fn k3_mul_sigmoid_cuda(
+        a: *const c_void,
+        bt: *const c_void,
+        o: *mut c_void,
+        b: i32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// K3's situ activation `4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)`, computed
+    /// in f32 and landed bf16 once. All `[b, n]`.
+    pub fn k3_situ_cuda(
+        g: *const c_void,
+        u: *const c_void,
+        o: *mut c_void,
+        b: i32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// `kda_core`'s tail on its own: per (row, head) f32 rms_norm of the bf16
+    /// attention landing `X` times the o_norm gamma `Go [128]`, landed once,
+    /// times the bf16 sigmoid of the output gate `G2`. head_dim must be 128.
+    pub fn k3_o_norm_gate_cuda(
+        x: *const c_void,
+        g2: *const c_void,
+        go: *const f32,
+        out: *mut c_void,
+        b: i32,
+        num_heads: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Chunked-prefill conv + silu over one q/k/v stream of one segment
+    /// (`csrc/k3/k3_conv_silu_chunk.cu`): `p [tokens, inner]` f32 partial,
+    /// `cw [4, inner]` f32 taps, `carry [3, inner]` bf16 window preceding
+    /// the segment, `y [tokens, inner]` bf16 output; `next [3, inner]` bf16
+    /// receives the window after row `commit_rows - 1` and is null exactly
+    /// when `commit_rows == 0`. Reads the partial rows in place — no window
+    /// is materialized — with the batched conv kernel's arithmetic term for
+    /// term. Shapes are runtime values.
+    pub fn k3_conv_silu_chunk_cuda(
+        p: *const f32,
+        cw: *const f32,
+        carry: *const c_void,
+        y: *mut c_void,
+        next: *mut c_void,
+        tokens: i32,
+        commit_rows: i32,
+        inner: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // --- fused MegaMoE (see `csrc/k3/k3_mega_moe_sm100.cu`) ---
 
     /// Token-count alignment the MegaMoE API enforces on

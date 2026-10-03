@@ -26,7 +26,7 @@ CP1 13.9s，CP8/CP16 只差 gang 侧**）→ M1 full@EP16
 交叉矩阵 + lane-vs-独占步系统 A/B
 → M2 agent cache 闭环 → M3 弹性调度。
 
-Last touched: 2026-08
+Last touched: 2026-09
 
 ## 0. 与 mix-engine-design 的关系
 
@@ -686,9 +686,51 @@ vLLM 13,155 = **1.49×**，快过 pruned CP16 的 9,316）；64k/128k 与 W-chun
 逐 ms 持平（1,717/3,618 vs 1,734/3,615，零回归）；249,891 tok + 48 greedy
 生成连贯。验收表 256k 行补齐——**64k 及以上全档反超 vLLM TP16-MNNVL**。
 
+## CP8 128k 三刀（2026-09-01，`feat/k3-cp8-anatomy-cuts`，账在
+`~/code/bench_results/2026-09-01-k3-cp8-128k-gap-anatomy/`）
+
+nsys 单 rank 剖析（tray14 深位 rank，128k superstep 6,130 ms）推翻了两个旧假设：间隙不是 host
+走时（host-starved 0 ms，全是 launch queue 反压与 doorbell 等待），FMHA kernel 本身在峰
+（1.47–1.53 PF/s），2,132 ms 里 ~1,090 ms 纯粹是深位不均衡。按确定性下刀，每刀一个 commit，
+门禁全绿（golden 13/13 逐步精确、paged 3/3、spec 6/6、cp_prefill 2/2）：
+
+1. **land 向量化**（`e1fdd881`）：TileLang `land_batched` 每线程 1 元素、2 字节存，12288 宽落地
+   只跑 2.3 TB/s；换成 8 列/线程的 CUDA 核（同 cast、同顺序，逐位相同）→ 550→190 µs @16896。
+   **GEMM bf16 epilogue 方案被数值否决**：cuBLAS 对 bf16 输出选不同 kernel，累加顺序变，
+   4 层 golden 在 3-ULP margin 的步翻转（对 reference 的偏差分布与 main 完全一致——median 1 /
+   p90 3 / max 12 ULP——但门禁的"margin>2 ULP 逐 token 精确"契约绑定 kernel 选择）。
+2. **conv 原地窗口**（`dad55e4b`）：chunk 路径原本 land → 3 个 tap 的 `cuMemcpy2DAsync` 窗口
+   物化 → 批 conv → carry 拷贝；新核直接读 f32 partial 的 t-3..t 行（段首取 carry），16 行/block
+   寄存器滑窗、taps 常驻寄存器；算式逐项复刻（同 -O3 无 fast-math）。CP4 64k：DtoD 拷贝 25,466
+   次/2,593 ms → 4,766/102，conv 877→476 µs。
+3. **FMHA 条带化**（`80f12bb8`）：off-diagonal 段对 (q,k) 奇差由 owner 算、偶差由 key 持有者算
+   （它本就为自己的对角展开了 K）；每层 owner 发布一次 Q（搭 latent 窗口），helper 的 FMHA 经
+   fabric TMA 直读 Q、结果写双缓冲回传 slab，owner 的 lse_merge 原地读 peer slab；每层
+   1 + ⌊(R−1)/2⌋ 个固定窗口（Stripe kind 带显式 rank 位掩码）。负载 r+½ → ≤(r+3)/2（8 rank：
+   深位 7.5→4.5，理想 4）。CP4 64k：深位 FMHA 2,408→1,733（精确等于 2.5/3.5），墙钟
+   4,171→3,888。**fleet CP8 128k：TTFT 6,387 → 5,328 ms（−16.6%），65k 2,810 → 2,394**；
+   superstep 6,130 → 5,071。slab 每 rank +1.47 GB（Q 623 MB + 2 × 回传 421 MB @seg_cap 16896）。
+
+after anatomy（dev2）：fmha 1,516 / mega 1,293 / nvjet 920 / lse_merge 220 / attnres 181 / kda 277 /
+gaps 144（全 doorbell）。
+
+4. **lse_merge 向量化**（`003b5b5b`）：一 (q,h) 一个 128 线程 block、1 元素/线程 → 16 lane 一行、
+   8 列/线程；逐元素算式不动。CP4 64k 3,888→3,785。
+5. **bf16 逐元素家族向量化**（`e82f072d`）：add2/mul_sigmoid/situ/o_norm_gate 从 TileLang（1 元素/
+   线程，1–2 TB/s）换成 CUDA；TileLang 的 `bfloat16_t` 是 cutlass 的（`+`=`__hadd`、`*`=`__hmul`、
+   cast=`cvt.rn`），o_norm_gate 的 128 宽 xor butterfly（64/32 走 smem、16..1 走 shuffle）用 lane
+   xor 8/4/2/1 + 槽位 j^4/j^2/j^1 逐对复刻——golden 13/13 逐步精确证明 decode 路径也逐位相同。
+   退休 40 个实例化。CP4 64k 3,785→3,639。
+
+**fleet CP8 五刀累计：128k 6,387 → 5,021 ms（−21.4%），65k 2,810 → 2,231，16k 1,150 → 946**；
+128k 后生成逐字接续原文。剩余（按三刀后 anatomy 推算）：attnres 181（向量化 ~80）、doorbell 144、
+mega 拆账、fmha 残余不均衡（helped 段 dense FMHA 比 causal 慢，4.5 vs 理想 4）。
+
 ## Next action
 
-PR #970 CI 17/17 全绿（`05da7961`），待 susun review。
-性能杠杆按 ⑥ 实测定序不变：FMHA 条带化（merge 原语已在）→ superstep
-图化/融合 → **bucket 细化（8k/16k 档翻盘的主杠杆，验收表的 0.39×/0.78× 就是
-它）** → 协调压缩。KDA 包 prefix-scan 排后。
+#970 已合入 main（`1e3b6f23`）。五刀分支 `feat/k3-cp8-anatomy-cuts`（land 向量化 / conv
+原地窗口 / FMHA 条带化 / lse_merge 向量化 / 逐元素家族向量化）待 PR：128k 6,387 → 5,021 ms。
+未决：同进程 `cp_prefill` 两测试连跑的 DeepGEMM grid-sync 超时 flake（分进程必过；main 的
+worktree `~/agent_code/wt-main-k3` 已构建，待跑 3 次定归属）。杠杆顺序：attnres 向量化（~80 ms）
+→ mega 拆账（solo 微基准）→ **bucket 细化（8k/16k 档翻盘的主杠杆，验收表
+的 0.39×/0.78× 就是它）** → 协调压缩。KDA 包 prefix-scan 排后。

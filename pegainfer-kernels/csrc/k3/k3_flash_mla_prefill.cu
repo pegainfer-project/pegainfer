@@ -43,6 +43,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <cstdint>
 
 #ifdef K3_FLASH_MLA_SM100F
 #include "collective/fmha_fusion.hpp"
@@ -172,55 +173,107 @@ extern "C" CUresult k3_mla_prefill_gather(
 }
 
 // Fold one window's FMHA output into the running f32 accumulator via the
-// log-sum-exp identity. One block per (q, head) row: only this block touches
-// its lse entry, so the read-old/write-new sequence needs no cross-block
-// coordination. `reset` starts a fresh accumulation (no -inf seeding).
+// log-sum-exp identity. The row walk is bandwidth work (2.1 GB per merge at
+// 16896 x 96 x 128), so a thread carries 8 nope columns as one 16-byte bf16
+// load and two float4 accumulator loads/stores: 16 lanes cover one (q, head)
+// row and a 256-thread block walks 16 rows. Every lane of a row recomputes
+// the two weights from the same lse pair (a broadcast load, identical
+// arithmetic), and lane 0 alone writes the merged lse — only this row's
+// lanes touch its entry, and the reads precede the divergent store in
+// program order, so no cross-lane coordination is needed. `reset` starts a
+// fresh accumulation (no -inf seeding). The per-element update keeps the
+// exact expression of the scalar original.
+static constexpr int K3_FMP_MERGE_LANES = K3_FMP_NOPE / 8;
+static constexpr int K3_FMP_MERGE_ROWS = 256 / K3_FMP_MERGE_LANES;
+
+static __device__ __forceinline__ void k3_fmp_merge8(
+    float4& a0, float4& a1, uint4 w, float w_acc, float w_win
+) {
+    const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&w);
+    float2 f0 = __bfloat1622float2(wp[0]);
+    float2 f1 = __bfloat1622float2(wp[1]);
+    float2 f2 = __bfloat1622float2(wp[2]);
+    float2 f3 = __bfloat1622float2(wp[3]);
+    a0.x = a0.x * w_acc + f0.x * w_win;
+    a0.y = a0.y * w_acc + f0.y * w_win;
+    a0.z = a0.z * w_acc + f1.x * w_win;
+    a0.w = a0.w * w_acc + f1.y * w_win;
+    a1.x = a1.x * w_acc + f2.x * w_win;
+    a1.y = a1.y * w_acc + f2.y * w_win;
+    a1.z = a1.z * w_acc + f3.x * w_win;
+    a1.w = a1.w * w_acc + f3.y * w_win;
+}
+
 static __global__ void k3_mla_prefill_lse_merge_kernel(
-    const __nv_bfloat16* __restrict__ o_win,
+    const uint4* __restrict__ o_win,
     const float* __restrict__ lse_win,
-    float* __restrict__ o_acc,
+    float4* __restrict__ o_acc,
     float* __restrict__ lse_acc,
     int t_q,
     int heads,
     int reset
 ) {
-    int q = blockIdx.x;
-    int h = blockIdx.y;
-    int d = threadIdx.x;
+    long long rows = (long long)t_q * heads;
+    long long row = (long long)blockIdx.x * K3_FMP_MERGE_ROWS + threadIdx.x / K3_FMP_MERGE_LANES;
+    int lane = threadIdx.x % K3_FMP_MERGE_LANES;
+    if (row >= rows) {
+        return;
+    }
+    int q = (int)(row / heads);
+    int h = (int)(row % heads);
     long long lse_idx = (long long)h * t_q + q;
-    __shared__ float w_acc, w_win;
-    if (d == 0) {
-        float lw = lse_win[lse_idx];
-        if (reset) {
-            w_acc = 0.0f;
-            w_win = 1.0f;
+    float w_acc, w_win;
+    float lw = lse_win[lse_idx];
+    if (reset) {
+        w_acc = 0.0f;
+        w_win = 1.0f;
+        if (lane == 0) {
             lse_acc[lse_idx] = lw;
-        } else {
-            float la = lse_acc[lse_idx];
-            float m = fmaxf(la, lw);
-            float merged = m + logf(expf(la - m) + expf(lw - m));
-            w_acc = expf(la - merged);
-            w_win = expf(lw - merged);
+        }
+    } else {
+        float la = lse_acc[lse_idx];
+        float m = fmaxf(la, lw);
+        float merged = m + logf(expf(la - m) + expf(lw - m));
+        w_acc = expf(la - merged);
+        w_win = expf(lw - merged);
+        if (lane == 0) {
             lse_acc[lse_idx] = merged;
         }
     }
-    __syncthreads();
-    long long o_idx = ((long long)q * heads + h) * K3_FMP_NOPE + d;
-    float prev = reset ? 0.0f : o_acc[o_idx];
-    o_acc[o_idx] = prev * w_acc + __bfloat162float(o_win[o_idx]) * w_win;
+    long long vec = row * K3_FMP_MERGE_LANES + lane;
+    uint4 w = o_win[vec];
+    float4 a0, a1;
+    if (reset) {
+        a0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        a1 = a0;
+    } else {
+        a0 = o_acc[vec * 2];
+        a1 = o_acc[vec * 2 + 1];
+    }
+    k3_fmp_merge8(a0, a1, w, w_acc, w_win);
+    o_acc[vec * 2] = a0;
+    o_acc[vec * 2 + 1] = a1;
 }
 
-// Leave the f32 accumulator: out[t_q, h, 128] bf16.
+// Leave the f32 accumulator: out[t_q, h, 128] bf16, 8 columns per thread.
 static __global__ void k3_mla_prefill_o_finalize_kernel(
-    const float* __restrict__ o_acc,
-    __nv_bfloat16* __restrict__ out,
-    long long total
+    const float4* __restrict__ o_acc,
+    uint4* __restrict__ out,
+    long long total_vec
 ) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) {
+    if (idx >= total_vec) {
         return;
     }
-    out[idx] = __float2bfloat16(o_acc[idx]);
+    float4 a0 = o_acc[idx * 2];
+    float4 a1 = o_acc[idx * 2 + 1];
+    uint4 packed;
+    __nv_bfloat162* p = reinterpret_cast<__nv_bfloat162*>(&packed);
+    p[0] = __floats2bfloat162_rn(a0.x, a0.y);
+    p[1] = __floats2bfloat162_rn(a0.z, a0.w);
+    p[2] = __floats2bfloat162_rn(a1.x, a1.y);
+    p[3] = __floats2bfloat162_rn(a1.z, a1.w);
+    out[idx] = packed;
 }
 
 extern "C" CUresult k3_mla_prefill_lse_merge(
@@ -237,9 +290,13 @@ extern "C" CUresult k3_mla_prefill_lse_merge(
         || t_q <= 0 || heads <= 0) {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    dim3 grid((unsigned)t_q, (unsigned)heads);
-    k3_mla_prefill_lse_merge_kernel<<<grid, K3_FMP_NOPE, 0, (cudaStream_t)stream>>>(
-        (const __nv_bfloat16*)o_win, (const float*)lse_win, (float*)o_acc, (float*)lse_acc,
+    if (((uintptr_t)o_win & 15) != 0 || ((uintptr_t)o_acc & 15) != 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    long long rows = (long long)t_q * heads;
+    long long blocks = (rows + K3_FMP_MERGE_ROWS - 1) / K3_FMP_MERGE_ROWS;
+    k3_mla_prefill_lse_merge_kernel<<<(unsigned)blocks, 256, 0, (cudaStream_t)stream>>>(
+        (const uint4*)o_win, (const float*)lse_win, (float4*)o_acc, (float*)lse_acc,
         t_q, heads, reset);
     return k3_flash_mla_consume_last_cuda_error();
 }
@@ -254,11 +311,14 @@ extern "C" CUresult k3_mla_prefill_o_finalize(
     if (o_acc == nullptr || out == nullptr || t_q <= 0 || heads <= 0) {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    long long total = (long long)t_q * heads * K3_FMP_NOPE;
+    if (((uintptr_t)o_acc & 15) != 0 || ((uintptr_t)out & 15) != 0) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    long long total_vec = (long long)t_q * heads * (K3_FMP_NOPE / 8);
     int threads = 256;
-    long long blocks = (total + threads - 1) / threads;
+    long long blocks = (total_vec + threads - 1) / threads;
     k3_mla_prefill_o_finalize_kernel<<<(unsigned)blocks, threads, 0, (cudaStream_t)stream>>>(
-        (const float*)o_acc, (__nv_bfloat16*)out, total);
+        (const float4*)o_acc, (uint4*)out, total_vec);
     return k3_flash_mla_consume_last_cuda_error();
 }
 
