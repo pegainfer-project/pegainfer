@@ -220,8 +220,15 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
     }
 }
 
+/// Two ranks must agree with one rank on the same checkpoint. Which
+/// tensor-parallel branch it exercises is the checkpoint's business: the shipped
+/// 12B (a single global KV head) takes the **replicate** branch, a
+/// 31B-geometry checkpoint (`G % P == 0`) takes the **shard** branch that
+/// production serves. Point `PEGAINFER_TEST_MODEL_PATH` at whichever is under
+/// test, and note that a full-depth 31B cannot be gated here at all: the
+/// single-rank control has to fit one card, which 57 GiB of weights do not.
 #[test]
-#[ignore = "requires the pinned 12B checkpoint, two GPUs, and --test-threads=1"]
+#[ignore = "needs two GPUs and --test-threads=1; checkpoint from PEGAINFER_TEST_MODEL_PATH"]
 fn the_two_rank_engine_matches_one_rank() {
     let (device, peer) = devices();
     assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
