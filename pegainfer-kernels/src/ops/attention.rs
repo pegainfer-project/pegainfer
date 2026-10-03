@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -1737,6 +1738,139 @@ pub fn paged_attention_batch_decode_hd256_into(
     if result != 0 {
         anyhow::bail!(
             "paged_attention_decode_cuda_hd256 (batch) failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+
+    Ok(())
+}
+
+/// Split-KV variant of [`paged_attention_batch_decode_hd256_into`]: the KV range
+/// is divided across `split_kv` CTAs per (kv head, request) and the partial
+/// softmax states are merged by a second kernel. The caller owns the scratch
+/// buffers and must size them for `[split_kv, batch_size, num_qo_heads, 256]`
+/// (f32) and `[split_kv, batch_size, num_qo_heads]` (f32, twice).
+///
+/// It wins where the FlashInfer path starves the device: the split grid turns a
+/// single-request decode from 4 CTAs into `4 * split_kv`. The kernel is shaped
+/// for Qwen3.5-4B's GQA group (16 query heads over 4 kv heads at head_dim 256)
+/// and refuses other geometries rather than serving a wrong answer.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_batch_decode_split_hd256_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    page_indices_d: &CudaSlice<i32>,
+    page_indptr_d: &CudaSlice<i32>,
+    last_page_len_d: &CudaSlice<i32>,
+    positions_d: &CudaSlice<i32>,
+    request_indices_d: &CudaSlice<i32>,
+    kv_chunk_size_d: &CudaSlice<i32>,
+    partial_o: &mut CudaSlice<f32>,
+    partial_m: &mut CudaSlice<f32>,
+    partial_l: &mut CudaSlice<f32>,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    batch_size: usize,
+    split_kv: usize,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    let page_size = layout.page_size;
+
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd256 split decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
+
+    let partial_elems = split_kv
+        .checked_mul(batch_size)
+        .and_then(|n| n.checked_mul(num_qo_heads))
+        .context("split decode partial buffer shape overflow")?;
+    anyhow::ensure!(
+        split_kv >= 1
+            && partial_o.len() >= partial_elems * head_dim
+            && partial_m.len() >= partial_elems
+            && partial_l.len() >= partial_elems,
+        "split decode scratch too small: splits={split_kv}, bs={batch_size}, heads={num_qo_heads}, \
+         dim={head_dim}, o={}, m={}, l={}",
+        partial_o.len(),
+        partial_m.len(),
+        partial_l.len()
+    );
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = page_indptr_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (po_ptr, _gpo) = partial_o.device_ptr_mut(&ctx.stream);
+    let (pm_ptr, _gpm) = partial_m.device_ptr_mut(&ctx.stream);
+    let (pl_ptr, _gpl) = partial_l.device_ptr_mut(&ctx.stream);
+
+    let stream = crate::tensor::active_cu_stream(ctx);
+
+    // The current token's K/V has to be in the pool before the read, exactly as
+    // the non-split path orders it.
+    scatter_decode_kv_into_paged(
+        ctx,
+        k,
+        v,
+        kv_buffer,
+        layout,
+        layer,
+        page_indices_d,
+        page_indptr_d,
+        last_page_len_d,
+        positions_d,
+        request_indices_d,
+        batch_size,
+        "batch hd256 split decode",
+    )?;
+
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let result = unsafe {
+        ffi::paged_attention_decode_split_hd256_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            kcs_ptr as *const i32,
+            po_ptr as *mut f32,
+            pm_ptr as *mut f32,
+            pl_ptr as *mut f32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            batch_size as i32,
+            split_kv as i32,
+            stride_page,
+            sm_scale,
+            stream,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "paged_attention_decode_split_hd256_cuda failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
     }

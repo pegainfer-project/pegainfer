@@ -186,6 +186,56 @@ pub fn paged_attention_batch_decode_hd256_into(
     )
 }
 
+/// Split-KV hd256 decode. See
+/// [`pegainfer_kernels::ops::paged_attention_batch_decode_split_hd256_into`] for
+/// the scratch-buffer contract and the geometry the kernel accepts.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_batch_decode_split_hd256_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &KvLayout,
+    layer: usize,
+    page_indices_d: &CudaSlice<i32>,
+    page_indptr_d: &CudaSlice<i32>,
+    last_page_len_d: &CudaSlice<i32>,
+    positions_d: &CudaSlice<i32>,
+    request_indices_d: &CudaSlice<i32>,
+    kv_chunk_size_d: &CudaSlice<i32>,
+    partial_o: &mut CudaSlice<f32>,
+    partial_m: &mut CudaSlice<f32>,
+    partial_l: &mut CudaSlice<f32>,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    batch_size: usize,
+    split_kv: usize,
+) -> Result<()> {
+    pegainfer_kernels::ops::paged_attention_batch_decode_split_hd256_into(
+        ctx,
+        q,
+        k,
+        v,
+        kv_buffer,
+        &layout.kernel_layout(),
+        layer,
+        page_indices_d,
+        page_indptr_d,
+        last_page_len_d,
+        positions_d,
+        request_indices_d,
+        kv_chunk_size_d,
+        partial_o,
+        partial_m,
+        partial_l,
+        output,
+        num_qo_heads,
+        batch_size,
+        split_kv,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     ctx: &DeviceContext,

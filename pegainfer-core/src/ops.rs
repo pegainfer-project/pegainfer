@@ -10,6 +10,7 @@ mod traced;
 
 pub use attention::paged_attention_batch_decode_hd256_into;
 pub use attention::paged_attention_batch_decode_into;
+pub use attention::paged_attention_batch_decode_split_hd256_into;
 pub use attention::paged_attention_batch_decode_split_kv_into;
 pub use attention::paged_attention_batch_decode_via_prefill_hd256_into;
 pub use attention::prefill_attention_paged_into;
