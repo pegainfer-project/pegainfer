@@ -62,21 +62,32 @@ fn tp2_options(a: usize, b: usize) -> EngineLoadOptions {
     }
 }
 
-/// Serve every prompt as one concurrent batch, then shut the engine down once.
+/// Serve the first prompt on its own, then the rest as one concurrent batch,
+/// and shut the engine down once.
+///
+/// A single prompt in flight is the **solo** admission path (`step` plus
+/// `prefill_extra_ranks`), which a batch never takes; draining it before the
+/// others are submitted is what makes it a lone arrival. Both runs drive this
+/// same sequence, so the per-prompt comparison stays index-aligned.
 fn serve_batch(
     harness: &mut Harness,
     prompts: &[Vec<u32>],
     max_tokens: usize,
     logprobs: usize,
 ) -> Vec<Drained> {
-    let controls: Vec<_> = prompts
-        .iter()
-        .map(|prompt| harness.submit_scored(prompt.clone(), max_tokens, Some(logprobs), None))
-        .collect();
-    let drained: Vec<Drained> = controls
-        .iter()
-        .map(|control| harness.steps.drain(control.id(), "greedy"))
-        .collect();
+    let mut controls = Vec::with_capacity(prompts.len());
+    let mut drained = Vec::with_capacity(prompts.len());
+    if let Some(first) = prompts.first() {
+        let control = harness.submit_scored(first.clone(), max_tokens, Some(logprobs), None);
+        drained.push(harness.steps.drain(control.id(), "greedy solo"));
+        controls.push(control);
+    }
+    for prompt in &prompts[1..] {
+        controls.push(harness.submit_scored(prompt.clone(), max_tokens, Some(logprobs), None));
+    }
+    for control in &controls[1..] {
+        drained.push(harness.steps.drain(control.id(), "greedy"));
+    }
     let controls: Vec<&_> = controls.iter().collect();
     harness.shutdown(&controls);
     drained

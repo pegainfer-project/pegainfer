@@ -1,6 +1,6 @@
 # Gemma 4 31B bf16 tensor-parallel-2 on two L20s
 
-TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as a two-rank eager engine — 29.91 GiB of weights per rank, an 8192-token ceiling at 8 decode slots, cold load 31.4 s, first token 57 ms, 49.4 ms per decode step, and 143 tok/s aggregate at 8 concurrent. The checkpoint does not fit one card (57 GiB), so there is no in-box single-rank baseline for it; numerical parity rests on the 31B-geometry synthetic gate (`models/gemma4/tp.md`).
+TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as a two-rank eager engine — 29.91 GiB of weights per rank, an 8192-token ceiling at 8 decode slots, cold load 30 s, first token 57 ms, 49.4 ms per decode step, and 143 tok/s aggregate at 8 concurrent. The checkpoint does not fit one card (57 GiB), so there is no in-box single-rank baseline for it; numerical parity rests on the 31B-geometry synthetic gate (`models/gemma4/tp.md`).
 
 ## Rig
 
@@ -20,7 +20,7 @@ TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as 
 | weights (device) | 29.91 GiB |
 | global KV pool | 2.50 GiB (1025 pages x 2.50 MiB) |
 | resident after weights | 14.18 GiB free |
-| load wall (cold) | 31.4 s |
+| load wall (cold) | 30 s (31.4 s in a second cold run) |
 
 The 8192 x 16-slot default point (≈45.4 GiB) is over the card; 8 slots is the point that fits. `PEGAINFER_MAX_CONTEXT`/`PEGAINFER_DECODE_SLOTS` trade context against concurrency — see `models/gemma4/tp.md` for the other measured envelopes.
 
@@ -66,3 +66,4 @@ The distribution gate at 31B geometry is exact (`models/gemma4/tp.md`): the synt
 
 - Raw completions without `<bos>` degenerate, as the tokenizer contract states; the chat endpoint (which carries the template's BOS) is the coherent path.
 - The first GEMM of a cold two-rank process would hang on this environment's NCCL before the module-loading warm was added — see "Cold start" in `models/gemma4/tp.md`. The load figure above is with that warm in place.
+- Every rank holds the whole 262144-entry vocabulary projection (~2.8 GiB at 31B), and the extra ranks compute a full batch of logits per decode step that is then discarded. The step numbers above include that waste; see "Known bounds" in `models/gemma4/tp.md`.

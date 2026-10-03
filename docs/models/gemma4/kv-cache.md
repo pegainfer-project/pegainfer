@@ -369,6 +369,12 @@ per-rank KV bound to that rank's own pools and the world-size rule enforced at l
 invariants and the measured 12B comparison live in [`tp.md`](tp.md); what follows is the
 constraint a legal world size satisfies, plus the capacity accounting it drives.
 
+The pools are laid out **per rank**: each rank sizes its two families from its own head counts (the
+query heads shard, and the global family's KV heads shard or replicate), so a page holds
+`local_kv_heads × head_dim` columns of K and V rather than the whole model's. Page *counts* stay
+identical across ranks, which is what keeps the page ids in step; the rest of the KV contract is
+unchanged.
+
 The qwen3 sharding policy — refuse a world size that does not divide `num_key_value_heads`, shard
 by integer division — cannot be reused: the full-attention group has fewer KV heads than a
 plausible world size (1 at 12B, 2 at 26B, 4 at 31B), and integer division alone silently drops

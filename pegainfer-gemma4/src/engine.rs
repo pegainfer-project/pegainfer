@@ -378,6 +378,35 @@ fn start_with_knobs(
             knobs.prefix_cache.is_none(),
             "{PREFIX_CACHE_ENV} is unsupported under tensor parallelism"
         );
+        // The ranks take ordinals `0..world` of what this process can see, so a
+        // world size past the visible devices can only fail later, less clearly.
+        let visible = cudarc::driver::result::device::get_count().map_err(|e| {
+            anyhow::anyhow!("a {world}-rank launch needs to count CUDA devices: {e:?}")
+        })?;
+        anyhow::ensure!(
+            visible as usize >= world,
+            "a {world}-rank launch needs {world} CUDA devices, this process sees {visible}"
+        );
+        // `docs/models/gemma4/tp.md` records that this container's stock NCCL
+        // corrupts memory under the default `LL`/`SIMPLE` protocols: the
+        // all-reduce kernel writes far past its buffer, and the symptom is the
+        // primary's collective stalling forever rather than an error. Nothing in
+        // the stack can detect that, so the configuration in force is said out
+        // loud rather than assumed.
+        let proto = std::env::var("NCCL_PROTO").unwrap_or_else(|_| "unset".to_string());
+        let version = cudarc::nccl::result::get_nccl_version().map_or_else(
+            |_| "unknown".to_string(),
+            |v| format!("{}.{}.{}", v / 10000, (v / 100) % 100, v % 100),
+        );
+        if proto.to_ascii_uppercase().contains("LL128") {
+            log::info!("tensor parallel: {world} ranks, NCCL {version}, NCCL_PROTO={proto}");
+        } else {
+            log::warn!(
+                "tensor parallel: {world} ranks, NCCL {version}, NCCL_PROTO={proto} — this \
+                 environment's stock NCCL corrupts the all-reduce buffer unless the protocol \
+                 is LL128 (see docs/models/gemma4/tp.md)"
+            );
+        }
     }
 
     let state = EngineState::load(
@@ -1232,6 +1261,79 @@ impl EngineState {
         )
     }
 
+    /// Every rank must stand on rank 0's frontier. The page-id contract —
+    /// identical budgets and an identical admission sequence keep the ranks'
+    /// page ids in step — is checked nowhere else, so a divergence caught here
+    /// is the last chance before it becomes a silent read of another rank's
+    /// page. The free-page counts carry the same signal but take the pool locks,
+    /// so they are compared in a debug build only.
+    fn assert_ranks_in_step(&self, kv: &GemmaKv) -> Result<()> {
+        let local = kv.local.seq_len();
+        let global = kv.global.seq_len();
+        for rank in 1..=self.more.len() {
+            let theirs = kv.core(rank);
+            anyhow::ensure!(
+                theirs.local.seq_len() == local && theirs.global.seq_len() == global,
+                "rank {rank} stands on frontier {}/{} where rank 0 stands on {local}/{global}",
+                theirs.local.seq_len(),
+                theirs.global.seq_len()
+            );
+        }
+        #[cfg(debug_assertions)]
+        for (index, state) in self.more.iter().enumerate() {
+            let rank = index + 1;
+            anyhow::ensure!(
+                state.serve.local_pool.available_pages() == self.serve.local_pool.available_pages(),
+                "rank {rank}'s local pool holds different free pages than rank 0's"
+            );
+            anyhow::ensure!(
+                state.serve.global_pool.available_pages()
+                    == self.serve.global_pool.available_pages(),
+                "rank {rank}'s global pool holds different free pages than rank 0's"
+            );
+        }
+        Ok(())
+    }
+
+    /// Run `per_rank` on every extra rank, drain each stream, and require that
+    /// they all end on rank 0's frontier.
+    ///
+    /// Call this *after* rank 0's own step has been started, unconditionally:
+    /// the ranks share one collective sequence, so a rank-0 failure that skipped
+    /// the peer would leave the peer's matching calls unpaired, and the pairing
+    /// then shifts for every later step — reducing one layer's partials against
+    /// another's — or wedges the peer at its drain. A failure on an extra rank
+    /// is fatal here, because the ranks' frontiers must not drift apart, while
+    /// rank 0's own failure stays the caller's to report. The drain is what
+    /// turns a device fault on a non-primary rank into a named error instead of
+    /// the primary's collective stalling forever.
+    fn step_extra_ranks<F>(&self, kv: &mut GemmaKv, per_rank: F) -> Result<()>
+    where
+        F: Fn(&RankState, &mut RankKv) -> Result<()>,
+    {
+        for (rank, state) in self.more.iter().enumerate() {
+            activate_rank(&state.ctx)?;
+            log::debug!("tp: rank {} prefill entering", rank + 1);
+            per_rank(state, kv.core_mut(rank + 1)).context("tensor-parallel prefill")?;
+            log::debug!("tp: rank {} prefill launched", rank + 1);
+            state
+                .ctx
+                .sync()
+                .with_context(|| format!("drain rank {}", rank + 1))?;
+            log::debug!("tp: rank {} drained", rank + 1);
+        }
+        self.assert_ranks_in_step(kv)?;
+        // The caller's next device work is rank 0's.
+        activate_rank(&self.ctx)
+    }
+
+    /// One plain prefill step on every extra rank; their logits are discarded.
+    fn prefill_extra_ranks(&self, kv: &mut GemmaKv, tokens: &[u32]) -> Result<()> {
+        self.step_extra_ranks(kv, |state, rank_kv| {
+            state.serve.step(&state.ctx, rank_kv, tokens).map(|_| ())
+        })
+    }
+
     /// Reserve on every extra rank's pools, so their fronts stay in step with
     /// rank 0's. Purely host-side, so no activation is needed.
     fn admit_extra_ranks(&self, kv: &mut GemmaKv, tokens: usize) -> Result<()> {
@@ -1243,34 +1345,27 @@ impl EngineState {
                 tokens,
             )?;
         }
-        Ok(())
-    }
-
-    /// Run one plain prefill step on every extra rank. Their logits are
-    /// discarded; a failure here is fatal, because the ranks' frontiers must
-    /// not drift apart.
-    fn prefill_extra_ranks(&self, kv: &mut GemmaKv, tokens: &[u32]) -> Result<()> {
-        for (rank, state) in self.more.iter().enumerate() {
-            activate_rank(&state.ctx)?;
-            log::debug!("tp: rank {} prefill entering", rank + 1);
-            state
-                .serve
-                .step(&state.ctx, kv.core_mut(rank + 1), tokens)
-                .map(|_| ())
-                .context("tensor-parallel prefill")?;
-            log::debug!("tp: rank {} prefill launched", rank + 1);
-            // Drain this rank's stream here. A prefill is once per prompt, so
-            // the cost is small, and a device fault on a non-primary rank
-            // otherwise surfaces only as the primary's collective stalling
-            // forever.
-            state
-                .ctx
-                .sync()
-                .with_context(|| format!("drain rank {}", rank + 1))?;
-            log::debug!("tp: rank {} drained", rank + 1);
+        // A rank that reserved different pages here has already lost the page-id
+        // race, and nothing after this can repair it.
+        #[cfg(debug_assertions)]
+        {
+            let free = (
+                self.serve.local_pool.available_pages(),
+                self.serve.global_pool.available_pages(),
+            );
+            for (rank, state) in self.more.iter().enumerate() {
+                debug_assert_eq!(
+                    free,
+                    (
+                        state.serve.local_pool.available_pages(),
+                        state.serve.global_pool.available_pages()
+                    ),
+                    "rank {}'s pools reserved different pages than rank 0's",
+                    rank + 1
+                );
+            }
         }
-        // The caller's next device work is rank 0's.
-        activate_rank(&self.ctx)
+        Ok(())
     }
 }
 
@@ -1985,14 +2080,14 @@ impl EngineState {
                 .serve
                 .step_scoring(ctx, &mut kv, prompt, Some(&mut score));
             // The other ranks run the same prefill to write their KV shards;
-            // scoring is rank 0's alone.
-            for (rank, state) in self.more.iter().enumerate() {
-                activate_rank(&state.ctx)?;
+            // scoring is rank 0's alone. They are driven after rank 0 and
+            // unconditionally, and a failure on them is fatal.
+            self.step_extra_ranks(&mut kv, |state, rank_kv| {
                 state
                     .serve
-                    .step_scoring(&state.ctx, kv.core_mut(rank + 1), prompt, None)?;
-            }
-            activate_rank(&self.ctx)?;
+                    .step_scoring(&state.ctx, rank_kv, prompt, None)
+                    .map(|_| ())
+            })?;
             echo = Some(PromptEcho {
                 ids: prompt.clone(),
                 logprobs: scores,
@@ -2008,6 +2103,8 @@ impl EngineState {
             let result =
                 self.serve
                     .step(&self.ctx, &mut kv, &request.request.prompt_tokens[resume..]);
+            // Started after rank 0 and unconditionally: a rank-0 failure here
+            // must not skip the peer (see `step_extra_ranks`).
             self.prefill_extra_ranks(&mut kv, &request.request.prompt_tokens[resume..])?;
             result
         };
@@ -2207,9 +2304,12 @@ impl EngineState {
         )?;
         self.admit_extra_ranks(kv, tokens.len())?;
         activate_rank(&self.ctx)?;
-        let logits = self.serve.step(&self.ctx, kv, tokens)?;
+        // Rank 0's verdict is held rather than propagated: the extra ranks have
+        // to be driven either way (see `step_extra_ranks`), and their failure
+        // wins.
+        let logits = self.serve.step(&self.ctx, kv, tokens);
         self.prefill_extra_ranks(kv, tokens)?;
-        Ok(logits)
+        logits
     }
 
     fn finish_plain_walker(
@@ -2516,15 +2616,20 @@ impl EngineState {
         {
             activate_rank(&self.ctx)?;
             let mut kvs = rank_kvs(active, 0);
-            if let Some(tokens) = tokens.as_deref() {
+            // Rank 0's verdict is held, not propagated: the other ranks must be
+            // driven either way (see `step_extra_ranks`).
+            let rank0 = if let Some(tokens) = tokens.as_deref() {
                 self.serve
-                    .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)?;
+                    .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)
+                    .map(|_| ())
             } else {
                 self.serve
-                    .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)?;
-            }
+                    .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)
+                    .map(|_| ())
+            };
             // The other ranks carry the same tokens and page ids; only rank 0
-            // samples, so their logits are discarded.
+            // samples, so their logits are discarded. A failure on them is fatal
+            // — the ranks' frontiers must not drift apart.
             if let Some(tokens) = tokens.as_deref() {
                 for (rank, state) in self.more.iter_mut().enumerate() {
                     activate_rank(&state.ctx)?;
@@ -2539,6 +2644,7 @@ impl EngineState {
                 // The sampler below reads rank 0's arena.
                 activate_rank(&self.ctx)?;
             }
+            rank0?;
         }
         let graph_slot = crate::serve::decode_bucket_slot(rows);
         if let Some(graph) = self.sampler_graphs.get_mut(graph_slot) {

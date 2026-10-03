@@ -219,12 +219,18 @@ pub(crate) struct RankKv {
     id: u64,
 }
 
+/// The id a [`RankKv`] carries until [`GemmaKv::multi`] hands every rank of one
+/// request the same one. It is distinct from every id `multi` issues, so a state
+/// built outside `multi` can neither collide with — nor fool the steady-decode
+/// fingerprint of — a real request.
+const NO_REQUEST_ID: u64 = u64::MAX;
+
 impl RankKv {
     pub(crate) fn new(local: SlidingLocalKv, global: KvState) -> Self {
         Self {
             local,
             global,
-            id: 0,
+            id: NO_REQUEST_ID,
         }
     }
 
@@ -272,6 +278,15 @@ impl GemmaKv {
             twin.id = id;
         }
         Self { core, twins }
+    }
+
+    /// The family pair `rank` owns, for reading (0 is `core`).
+    pub(crate) fn core(&self, rank: usize) -> &RankKv {
+        if rank == 0 {
+            &self.core
+        } else {
+            &self.twins[rank - 1]
+        }
     }
 
     /// The family pair `rank` owns (0 is `core`).

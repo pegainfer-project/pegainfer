@@ -1041,15 +1041,14 @@ pub(crate) struct GemmaServe {
     tp_comm: Option<TpComm>,
 }
 
-// SAFETY: A serve object is pinned to a single CUDA device and driven from one
-// thread at a time — the engine's scheduler thread. The TP path builds one
-// serve per rank and never drives a rank-local serve from two threads
-// concurrently, so the raw NCCL communicator it may hold never crosses a
-// thread while in use. The one place several threads hold a serve at once is
-// the decode-graph capture sweep, and there each thread owns a *different*
-// rank's serve. (Same assertions `Qwen3Model` makes.)
+// SAFETY: A serve is pinned to one CUDA device and driven by one thread at a
+// time — the thread that loads it (the load-time warm and the decode-graph
+// sweep walk the ranks one after another, never in parallel) and afterwards the
+// engine's scheduler thread, which owns the whole `EngineState` and touches a
+// rank's serve only while that rank's device is current. Nothing shares a serve
+// between threads, so the raw NCCL communicator it may hold never crosses a
+// thread while in use. (Same assertions `Qwen3Model` makes.)
 unsafe impl Send for GemmaServe {}
-unsafe impl Sync for GemmaServe {}
 
 impl GemmaServe {
     fn decode_row(
@@ -1397,6 +1396,10 @@ impl GemmaServe {
     /// the copies safe — the prompt's KV writes were enqueued on
     /// `ctx.stream` before this call, and the copies enqueue after them on
     /// the same stream.
+    ///
+    /// Rank 0's families only: `PEGAINFER_PREFIX_CACHE` is refused under tensor
+    /// parallelism, so this never runs beside `twins`, and a multi-rank capture
+    /// would have to take every rank's shard to be resumable.
     pub(crate) fn capture_checkpoint(
         &self,
         ctx: &DeviceContext,
