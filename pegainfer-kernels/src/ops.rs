@@ -276,3 +276,17 @@ pub fn ffi_exception_message(result: i32) -> String {
         format!(": {text}")
     }
 }
+
+/// `PEGAINFER_CUBLAS_STATUS_BASE` in `csrc/shared/ffi_guard.cuh`: an entry
+/// point that calls cuBLAS returns it plus the `cublasStatus_t` on a cuBLAS
+/// failure, and the `cudaError_t` otherwise.
+pub const CUBLAS_STATUS_BASE: i32 = 100_000;
+
+/// Name a nonzero status from such an entry point, for an error message.
+pub fn ffi_status_detail(status: i32) -> String {
+    if status >= CUBLAS_STATUS_BASE {
+        format!("cublas_status={}", status - CUBLAS_STATUS_BASE)
+    } else {
+        format!("cuda_status={status}")
+    }
+}

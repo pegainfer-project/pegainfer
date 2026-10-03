@@ -1,5 +1,6 @@
 #include "../common.cuh"
 #include "../marlin/ffi.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <stdint.h>
@@ -75,7 +76,7 @@ CUresult kimi_add_f32_bf16_to_bf16_cuda(
   int blocks = (n + threads - 1) / threads;
   kimi_add_f32_bf16_to_bf16_kernel<<<blocks, threads, 0, stream>>>(a, b, out, n);
   cudaError_t err = cudaGetLastError();
-  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+  return map_cuda_error(err);
 }
 
 CUresult kimi_residual_add_scaled_f32_cuda(
@@ -96,7 +97,7 @@ CUresult kimi_residual_add_scaled_f32_cuda(
   kimi_residual_add_scaled_f32_kernel<<<blocks, threads, 0, stream>>>(
       hidden, projected, routed_f32, scale, out, n);
   cudaError_t err = cudaGetLastError();
-  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+  return map_cuda_error(err);
 }
 
 __global__ void kimi_residual_add_scaled_bf16_kernel(
@@ -136,7 +137,7 @@ CUresult kimi_residual_add_scaled_bf16_cuda(
   kimi_residual_add_scaled_bf16_kernel<<<blocks, threads, 0, stream>>>(
       hidden, projected, routed, scale, out, n);
   cudaError_t err = cudaGetLastError();
-  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+  return map_cuda_error(err);
 }
 
 // Marlin routing metadata from a DeepEP post-epilogue expert prefix sum.
@@ -249,7 +250,7 @@ CUresult kimi_deepep_build_marlin_routing_on_stream(
       max_padded_tokens,
       max_m_blocks);
   cudaError_t err = cudaGetLastError();
-  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+  return map_cuda_error(err);
 }
 
 }  // extern "C"

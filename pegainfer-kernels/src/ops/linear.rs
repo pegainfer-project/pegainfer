@@ -10,6 +10,7 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::ops::ffi_status_detail;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
@@ -382,16 +383,9 @@ pub fn gemm_lt_pin_into_checked(
             weight.rows,
             weight.cols
         ),
-        s if s >= 100_000 => bail!(
-            "cublasLt pin GEMM failed: cublas_status={}, m={}, n={}, k={}",
-            s - 100_000,
-            weight.rows,
-            x.seq_len,
-            weight.cols
-        ),
         s => bail!(
-            "cublasLt pin GEMM launch failed: cuda_status={}, m={}, n={}, k={}",
-            s,
+            "cublasLt pin GEMM failed: {}, m={}, n={}, k={}",
+            ffi_status_detail(s),
             weight.rows,
             x.seq_len,
             weight.cols
@@ -676,18 +670,9 @@ fn gemm_per_token_into_checked(
             crate::tensor::active_cu_stream(ctx),
         );
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "cuBLAS per-token GEMM failed: cublas_status={}, m={}, batch={}, k={}",
-                    status - 100_000,
-                    weight.rows,
-                    x.seq_len,
-                    weight.cols
-                );
-            }
             bail!(
-                "CUDA per-token GEMM launch failed: cuda_status={}, m={}, batch={}, k={}",
-                status,
+                "per-token GEMM failed: {}, m={}, batch={}, k={}",
+                ffi_status_detail(status),
                 weight.rows,
                 x.seq_len,
                 weight.cols
@@ -860,13 +845,10 @@ fn launch_gemm_pin(
                  LoRA prefill-delta shape), or the numeric policy was set after executor \
                  construction. Run without --batch-invariant or report this shape"
             ),
-            s if s >= 100_000 => {
-                bail!(
-                    "cuBLAS pin GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",
-                    s - 100_000
-                )
-            }
-            s => bail!("CUDA pin GEMM launch failed: cuda_status={s}, m={m}, n={n}, k={k}"),
+            s => bail!(
+                "pin GEMM failed: {}, m={m}, n={n}, k={k}",
+                ffi_status_detail(s)
+            ),
         }
     }
 }
@@ -892,13 +874,10 @@ fn launch_gemm_pertoken(
             crate::tensor::active_cu_stream(ctx),
         );
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "cuBLAS per-token GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",
-                    status - 100_000
-                );
-            }
-            bail!("CUDA per-token GEMM launch failed: cuda_status={status}, m={m}, n={n}, k={k}");
+            bail!(
+                "per-token GEMM failed: {}, m={m}, n={n}, k={k}",
+                ffi_status_detail(status)
+            );
         }
     }
     PER_TOKEN_SERVED.fetch_add(1, Ordering::Relaxed);
@@ -969,19 +948,9 @@ fn launch_gemm(
             };
         }
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "cuBLAS GEMM failed: cublas_status={}, m={}, n={}, k={}, graphsafe={}",
-                    status - 100_000,
-                    m,
-                    n,
-                    k,
-                    graphsafe
-                );
-            }
             bail!(
-                "CUDA GEMM launch failed: cuda_status={}, m={}, n={}, k={}, graphsafe={}",
-                status,
+                "GEMM failed: {}, m={}, n={}, k={}, graphsafe={}",
+                ffi_status_detail(status),
                 m,
                 n,
                 k,

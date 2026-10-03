@@ -1,4 +1,5 @@
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 #include "glm52_min_gemv.cuh"
 
 #include <cuda.h>
@@ -76,16 +77,6 @@ __global__ void router_scores_topk_normalize_kernel(
       topk_weight[token * topk + route] = selected_scores[route] * scale;
     }
   }
-}
-
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
 }
 
 CUresult consume_last_cuda_error() {

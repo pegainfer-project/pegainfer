@@ -212,7 +212,7 @@ CUresult kimi_marlin_w13_swiglu_cuda(
   int blocks = (total + threads - 1) / threads;
   pegainfer_kimi_marlin_moe_wna16::swiglu_w13_kernel<<<blocks, threads, 0, stream>>>(
       w13, out, rows, intermediate_dim);
-  return pegainfer_kimi_marlin_moe_wna16::last_error_to_cu(cudaPeekAtLastError());
+  return map_cuda_error(cudaPeekAtLastError());
 }
 
 CUresult kimi_marlin_w13_swiglu_expanded_cuda(
@@ -233,9 +233,10 @@ CUresult kimi_marlin_w13_swiglu_expanded_cuda(
   if (sm_count <= 0) {
     int dev = 0;
     cudaError_t err = cudaGetDevice(&dev);
-    if (err != cudaSuccess) return CUDA_ERROR_INVALID_VALUE;
+    if (err != cudaSuccess) return map_cuda_error(err);
     err = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
-    if (err != cudaSuccess || sm_count <= 0) return CUDA_ERROR_INVALID_VALUE;
+    if (err != cudaSuccess) return map_cuda_error(err);
+    if (sm_count <= 0) return CUDA_ERROR_INVALID_VALUE;
   }
   constexpr int threads = 256;
   // Fixed occupancy-sized grid; the kernel grid-strides up to the actual
@@ -245,7 +246,7 @@ CUresult kimi_marlin_w13_swiglu_expanded_cuda(
   if (blocks > max_blocks) blocks = max_blocks;
   pegainfer_kimi_marlin_moe_wna16::swiglu_w13_expanded_kernel<<<blocks, threads, 0, stream>>>(
       w13, out, num_tokens_post_padded, max_rows, intermediate_dim);
-  return pegainfer_kimi_marlin_moe_wna16::last_error_to_cu(cudaPeekAtLastError());
+  return map_cuda_error(cudaPeekAtLastError());
 }
 
 CUresult kimi_marlin_sum_topk_rows_f32_cuda(
@@ -265,7 +266,7 @@ CUresult kimi_marlin_sum_topk_rows_f32_cuda(
   int blocks = (total + threads - 1) / threads;
   pegainfer_kimi_marlin_moe_wna16::sum_topk_rows_kernel<<<blocks, threads, 0, stream>>>(
       route_output, out, active_tokens, topk, hidden_dim);
-  return pegainfer_kimi_marlin_moe_wna16::last_error_to_cu(cudaPeekAtLastError());
+  return map_cuda_error(cudaPeekAtLastError());
 }
 
 }  // extern "C"

@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "../shared/ffi_guard.cuh"
+
 namespace {
 
 using DType = __nv_bfloat16;
@@ -13,7 +15,6 @@ constexpr int kKvLoraRank = 512;
 constexpr int kNopeDim = 128;
 constexpr int kVHeadDim = 128;
 constexpr int kKvBHeadDim = kNopeDim + kVHeadDim;
-constexpr int kCublasStatusErrorOffset = 100000;
 constexpr int kMlaLtLocalHeads = 64;
 constexpr int kMlaLtMaxBatch = 8;
 
@@ -37,7 +38,7 @@ int cublas_status_to_error(cublasStatus_t status) {
   if (status == CUBLAS_STATUS_SUCCESS) {
     return static_cast<int>(cudaSuccess);
   }
-  return kCublasStatusErrorOffset + static_cast<int>(status);
+  return PEGAINFER_CUBLAS_STATUS_BASE + static_cast<int>(status);
 }
 
 void destroy_mla_lt_plan(MlaLtPlan& plan) {

@@ -23,13 +23,7 @@ constexpr int kHeadDimV = 512;
 constexpr int kPageSize = 64;
 constexpr size_t kCounterBytes = 8192ull * 256 * sizeof(uint32_t);
 
-CUresult consume_last_cuda_error() {
-  cudaError_t err = cudaGetLastError();
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue) return CUDA_ERROR_INVALID_VALUE;
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
+CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
 }  // namespace
 

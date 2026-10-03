@@ -1,4 +1,5 @@
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cublas_v2.h>
@@ -15,7 +16,6 @@ constexpr int kLocalExperts = kMaxExperts / 2;
 constexpr int kMaxRows = 8;
 constexpr int kRouterThreads = 128;
 constexpr int kAccumThreads = 256;
-constexpr int kCublasErrorOffset = 100000;
 
 __device__ __forceinline__ bool better_prob_choice(float value, int expert, float best_value,
                                                    int best_expert) {
@@ -247,44 +247,6 @@ __global__ void accumulate_fixed_expert_kernel(
   }
 }
 
-CUresult map_cuda_error(cudaError_t err) {
-  switch (err) {
-    case cudaSuccess:
-      return CUDA_SUCCESS;
-    case cudaErrorInvalidValue:
-    case cudaErrorInvalidDevicePointer:
-      return CUDA_ERROR_INVALID_VALUE;
-    case cudaErrorInvalidDevice:
-      return CUDA_ERROR_INVALID_DEVICE;
-    case cudaErrorInvalidResourceHandle:
-      return CUDA_ERROR_INVALID_HANDLE;
-    case cudaErrorMemoryAllocation:
-      return CUDA_ERROR_OUT_OF_MEMORY;
-    case cudaErrorNotSupported:
-      return CUDA_ERROR_NOT_SUPPORTED;
-    case cudaErrorIllegalAddress:
-      return CUDA_ERROR_ILLEGAL_ADDRESS;
-    case cudaErrorLaunchOutOfResources:
-      return CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES;
-    case cudaErrorLaunchTimeout:
-      return CUDA_ERROR_LAUNCH_TIMEOUT;
-    case cudaErrorLaunchFailure:
-      return CUDA_ERROR_LAUNCH_FAILED;
-    case cudaErrorAssert:
-      return CUDA_ERROR_ASSERT;
-    case cudaErrorIllegalInstruction:
-      return CUDA_ERROR_ILLEGAL_INSTRUCTION;
-    case cudaErrorMisalignedAddress:
-      return CUDA_ERROR_MISALIGNED_ADDRESS;
-    case cudaErrorInvalidAddressSpace:
-      return CUDA_ERROR_INVALID_ADDRESS_SPACE;
-    case cudaErrorInvalidPc:
-      return CUDA_ERROR_INVALID_PC;
-    default:
-      return CUDA_ERROR_UNKNOWN;
-  }
-}
-
 CUresult consume_last_cuda_error() {
   cudaError_t err = cudaGetLastError();
   return map_cuda_error(err);
@@ -303,7 +265,9 @@ int dsv2_lite_pointer_gemm_cuda(const void *const *weights,
   if (!weights || !inputs || !outputs || m <= 0 || k <= 0 || routes <= 0 || routes > kMaxRows * kRoutesPerToken)
     return static_cast<int>(cudaErrorInvalidValue);
   cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) return kCublasErrorOffset + static_cast<int>(status);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return PEGAINFER_CUBLAS_STATUS_BASE + static_cast<int>(status);
+  }
   const float alpha = 1.0f, beta = 0.0f;
   status = cublasGemmBatchedEx(
       g_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, m, 1, k,
@@ -311,7 +275,7 @@ int dsv2_lite_pointer_gemm_cuda(const void *const *weights,
       &beta, outputs, CUDA_R_16BF, m, routes,
       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   return status == CUBLAS_STATUS_SUCCESS ? static_cast<int>(cudaPeekAtLastError())
-                                       : kCublasErrorOffset + static_cast<int>(status);
+                                       : PEGAINFER_CUBLAS_STATUS_BASE + static_cast<int>(status);
 }
 
 CUresult dsv2_lite_route_logits_cuda(const float *logits, float *weights,

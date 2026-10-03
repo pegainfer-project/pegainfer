@@ -1,4 +1,5 @@
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cfloat>
@@ -291,44 +292,6 @@ __global__ void decode_attention_kernel(
   (void)kv_a_rows;
   (void)kv_b_rows;
   (void)max_seq_len;
-}
-
-CUresult map_cuda_error(cudaError_t err) {
-  switch (err) {
-    case cudaSuccess:
-      return CUDA_SUCCESS;
-    case cudaErrorInvalidValue:
-    case cudaErrorInvalidDevicePointer:
-      return CUDA_ERROR_INVALID_VALUE;
-    case cudaErrorInvalidDevice:
-      return CUDA_ERROR_INVALID_DEVICE;
-    case cudaErrorInvalidResourceHandle:
-      return CUDA_ERROR_INVALID_HANDLE;
-    case cudaErrorMemoryAllocation:
-      return CUDA_ERROR_OUT_OF_MEMORY;
-    case cudaErrorNotSupported:
-      return CUDA_ERROR_NOT_SUPPORTED;
-    case cudaErrorIllegalAddress:
-      return CUDA_ERROR_ILLEGAL_ADDRESS;
-    case cudaErrorLaunchOutOfResources:
-      return CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES;
-    case cudaErrorLaunchTimeout:
-      return CUDA_ERROR_LAUNCH_TIMEOUT;
-    case cudaErrorLaunchFailure:
-      return CUDA_ERROR_LAUNCH_FAILED;
-    case cudaErrorAssert:
-      return CUDA_ERROR_ASSERT;
-    case cudaErrorIllegalInstruction:
-      return CUDA_ERROR_ILLEGAL_INSTRUCTION;
-    case cudaErrorMisalignedAddress:
-      return CUDA_ERROR_MISALIGNED_ADDRESS;
-    case cudaErrorInvalidAddressSpace:
-      return CUDA_ERROR_INVALID_ADDRESS_SPACE;
-    case cudaErrorInvalidPc:
-      return CUDA_ERROR_INVALID_PC;
-    default:
-      return CUDA_ERROR_UNKNOWN;
-  }
 }
 
 CUresult consume_last_cuda_error() {

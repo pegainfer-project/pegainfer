@@ -20,6 +20,8 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+#include "../shared/ffi_guard.cuh"
+
 namespace pegainfer_gemma4_w4a16 {
 
 constexpr int kGroup = 32;
@@ -120,7 +122,7 @@ CUresult gemma4_w4a16_pack_cuda(const uint32_t* packed, const uint16_t* scales, 
     return CUDA_ERROR_INVALID_VALUE;
   }
   pack_kernel<<<1024, 256, 0, stream>>>(packed, scales, wq, sq, n, k, split);
-  return cudaGetLastError() == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult gemma4_w4a16_dequant_cuda(const uint32_t* wq, const uint32_t* sq, __nv_bfloat16* out, int n, int k,
@@ -129,7 +131,7 @@ CUresult gemma4_w4a16_dequant_cuda(const uint32_t* wq, const uint32_t* sq, __nv_
     return CUDA_ERROR_INVALID_VALUE;
   }
   dequant_kernel<<<1024, 256, 0, stream>>>(wq, sq, out, n, k, split);
-  return cudaGetLastError() == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+  return map_cuda_error(cudaGetLastError());
 }
 
 }  // extern "C"

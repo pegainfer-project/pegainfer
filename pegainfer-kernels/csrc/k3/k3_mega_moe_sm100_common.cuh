@@ -17,6 +17,8 @@
 #include <cuda_fp8.h>
 #include <cstdint>
 
+#include "../shared/ffi_guard.cuh"
+
 // `layout::Data`'s constructor uses DG_UNIFIED_ASSERT, which expands to a raw
 // `asm("trap;")`. That is device-only asm, but `MegaMoEBuffer` is also built on
 // the host here (and inside `CUTLASS_HOST_DEVICE` constexpr code), so give the
@@ -89,16 +91,6 @@ constexpr int kNumNonEpilogueThreads = 128;
 
 constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 constexpr int alignup(int a, int b) { return cdiv(a, b) * b; }
-
-inline CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
 
 // `get_symm_buffer_size_for_mega_moe`'s ring-capacity loop.
 constexpr int mega_ring_tokens(int num_ranks, int num_experts, int num_max_tokens_per_rank,

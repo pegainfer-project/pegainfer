@@ -35,6 +35,7 @@
 // baked into the kernel template, so each width gets its own instantiation.
 
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -126,16 +127,6 @@ __global__ void deepgemm_sm100_masked_out_to_aligned_kernel(
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     dst[i] = __float2bfloat16_rn(__bfloat162float(src[i]) * weight);
   }
-}
-
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
 }
 
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }

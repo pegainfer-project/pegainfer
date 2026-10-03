@@ -101,16 +101,6 @@ constexpr int kFp4SfGroupK = 32;
 constexpr int kFp4SfPerWord = 4;
 constexpr int kFp4SfWordK = kFp4SfGroupK * kFp4SfPerWord;  // 128
 
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
 // Checkpoint MXFP4 weight scales -> the runtime SFB tensor.

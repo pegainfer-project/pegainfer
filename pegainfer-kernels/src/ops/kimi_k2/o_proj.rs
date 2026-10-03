@@ -7,6 +7,7 @@ use cudarc::driver::DevicePtrMut;
 use super::experts::KIMI_K2_HIDDEN;
 use super::mla::KIMI_K2_MLA_V_HEAD_DIM;
 use crate::ffi;
+use crate::ops::ffi_status_detail;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::GpuTensor;
@@ -67,17 +68,9 @@ pub fn kimi_o_proj_cublaslt_into(
             ctx.stream.cu_stream(),
         );
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "Kimi o_proj cuBLASLt failed: cublas_status={}, batch_size={}",
-                    status - 100_000,
-                    batch_size
-                );
-            }
             bail!(
-                "Kimi o_proj cuBLASLt launch failed: cuda_status={}, batch_size={}",
-                status,
-                batch_size
+                "Kimi o_proj cuBLASLt failed: {}, batch_size={batch_size}",
+                ffi_status_detail(status)
             );
         }
     }

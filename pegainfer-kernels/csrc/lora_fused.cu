@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "shared/ffi_guard.cuh"
 #include <cuda.h>
 #include <cstdint>
 
@@ -465,7 +466,7 @@ static CUresult launch_lora_decode_fused_delta_rank(
   lora_decode_fused_delta_rank_kernel<RANK><<<grid, block, smem_bytes, stream>>>(
       a_packed, b_packed, scales, token_slots, input, out, batch, max_loras,
       max_rank, in_dim, out_dim, out_hidden_dim, row_offset);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 static CUresult launch_lora_decode_fused_delta(
@@ -528,7 +529,7 @@ static CUresult launch_lora_decode_fused_delta(
     lora_decode_fused_delta_kernel<<<grid, block, smem_bytes, stream>>>(
         a_packed, b_packed, scales, token_slots, input, out, batch, max_loras,
         max_rank, rank, in_dim, out_dim, out_hidden_dim, row_offset);
-    return (CUresult)cudaGetLastError();
+    return map_cuda_error(cudaGetLastError());
   }
 }
 
@@ -571,7 +572,7 @@ static CUresult launch_lora_decode_fused_delta_group3_rank(
           scales1, out1, rank1, out_dim1, out_hidden_dim1, a2, b2, scales2,
           out2, rank2, out_dim2, out_hidden_dim2, token_slots, input, batch,
           max_loras, max_rank, in_dim);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 static CUresult launch_lora_decode_fused_delta_group3(
@@ -668,7 +669,7 @@ static CUresult launch_lora_decode_fused_delta_group3(
         scales1, out1, rank1, out_dim1, out_hidden_dim1, a2, b2, scales2,
         out2, rank2, out_dim2, out_hidden_dim2, token_slots, input, batch,
         max_loras, max_rank, in_dim);
-    return (CUresult)cudaGetLastError();
+    return map_cuda_error(cudaGetLastError());
   }
 }
 
@@ -691,7 +692,7 @@ CUresult lora_pack_b_rows_cuda(
   dim3 grid((total + block.x - 1) / block.x);
   lora_pack_b_rows_kernel<<<grid, block, 0, stream>>>(
       src, dst, rank, max_rank, out_dim);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 CUresult lora_decode_fused_delta_cuda(

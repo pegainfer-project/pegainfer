@@ -113,18 +113,8 @@ constexpr int kTransformSfWordK = kTransformSfGroupK * kTransformSfPerWord;  // 
 // Weight-row interleave granularity for the fused gate|up projection.
 constexpr int kInterleaveGran = 8;
 
-CUresult transform_map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 CUresult consume_last_cuda_error() {
-  return transform_map_cuda_error(cudaGetLastError());
+  return map_cuda_error(cudaGetLastError());
 }
 
 // ---------------------------------------------------------------------------
@@ -417,26 +407,26 @@ CUresult k3_mega_open_peer_access(int self_ordinal, int peer_ordinal) {
   if (self_ordinal == peer_ordinal) return CUDA_SUCCESS;
   int reachable = 0;
   const cudaError_t query = cudaDeviceCanAccessPeer(&reachable, self_ordinal, peer_ordinal);
-  if (query != cudaSuccess) return transform_map_cuda_error(query);
+  if (query != cudaSuccess) return map_cuda_error(query);
   if (reachable == 0) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
 
   const cudaError_t bind = cudaSetDevice(self_ordinal);
-  if (bind != cudaSuccess) return transform_map_cuda_error(bind);
+  if (bind != cudaSuccess) return map_cuda_error(bind);
   const cudaError_t enable = cudaDeviceEnablePeerAccess(peer_ordinal, 0);
   if (enable == cudaErrorPeerAccessAlreadyEnabled) {
     (void)cudaGetLastError();
   } else if (enable != cudaSuccess) {
-    return transform_map_cuda_error(enable);
+    return map_cuda_error(enable);
   }
 
   cudaMemPool_t pool = nullptr;
   const cudaError_t pool_err = cudaDeviceGetDefaultMemPool(&pool, self_ordinal);
-  if (pool_err != cudaSuccess) return transform_map_cuda_error(pool_err);
+  if (pool_err != cudaSuccess) return map_cuda_error(pool_err);
   cudaMemAccessDesc desc{};
   desc.location.type = cudaMemLocationTypeDevice;
   desc.location.id = peer_ordinal;
   desc.flags = cudaMemAccessFlagsProtReadWrite;
-  return transform_map_cuda_error(cudaMemPoolSetAccess(pool, &desc, 1));
+  return map_cuda_error(cudaMemPoolSetAccess(pool, &desc, 1));
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }
 

@@ -341,16 +341,6 @@ __global__ void moe_weighted_combine_kernel(
   out[(size_t)token * hidden + col] = __float2bfloat16_rn(acc);
 }
 
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
 int entry_grid(int entries) {

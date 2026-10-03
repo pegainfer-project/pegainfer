@@ -2,6 +2,8 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+#include "ffi_guard.cuh"
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -16,13 +18,11 @@
 #include <map>
 #include <mutex>
 
-static constexpr int CUBLAS_STATUS_ERROR_OFFSET = 100000;
-
 static int cublas_status_to_error(cublasStatus_t status) {
   if (status == CUBLAS_STATUS_SUCCESS) {
     return static_cast<int>(cudaSuccess);
   }
-  return CUBLAS_STATUS_ERROR_OFFSET + static_cast<int>(status);
+  return PEGAINFER_CUBLAS_STATUS_BASE + static_cast<int>(status);
 }
 
 // cuBLAS handle management.

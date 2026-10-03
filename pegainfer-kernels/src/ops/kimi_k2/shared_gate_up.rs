@@ -7,6 +7,7 @@ use cudarc::driver::DevicePtrMut;
 use super::experts::KIMI_K2_HIDDEN;
 use super::experts::KIMI_K2_SHARED_GATE_UP;
 use crate::ffi;
+use crate::ops::ffi_status_detail;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::GpuTensor;
@@ -61,17 +62,9 @@ pub fn kimi_shared_gate_up_cublaslt_into(
             ctx.stream.cu_stream(),
         );
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "Kimi shared_gate_up cuBLASLt failed: cublas_status={}, batch_size={}",
-                    status - 100_000,
-                    batch_size
-                );
-            }
             bail!(
-                "Kimi shared_gate_up cuBLASLt launch failed: cuda_status={}, batch_size={}",
-                status,
-                batch_size
+                "Kimi shared_gate_up cuBLASLt failed: {}, batch_size={batch_size}",
+                ffi_status_detail(status)
             );
         }
     }
