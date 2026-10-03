@@ -130,13 +130,15 @@ pub(super) fn knob_table<'a>(
 }
 
 pub(super) fn launch(overrides: &[(&str, &str)]) -> Harness {
+    launch_with(&EngineLoadOptions::default(), overrides)
+}
+
+/// Start a real engine from explicit load options — the seam a tensor-parallel
+/// gate uses to ask for two device ordinals and a topology.
+pub(super) fn launch_with(options: &EngineLoadOptions, overrides: &[(&str, &str)]) -> Harness {
     let dir = crate::testkit::model_path();
-    let engine = super::start_with_knobs(
-        Path::new(&dir),
-        &EngineLoadOptions::default(),
-        &knob_table(overrides),
-    )
-    .expect("engine start");
+    let engine = super::start_with_knobs(Path::new(&dir), options, &knob_table(overrides))
+        .expect("engine start");
     Harness::from_engine(engine)
 }
 
@@ -145,7 +147,7 @@ pub(super) fn load_state(overrides: &[(&str, &str)]) -> anyhow::Result<super::En
     let config = crate::config::Gemma4Config::from_file(&dir)?;
     let knobs = super::ServingKnobs::resolve(&knob_table(overrides), &config)?;
     let policy = super::generation_policy(&dir)?;
-    super::EngineState::load(&dir, config, knobs, 0, policy, 0x5EED, true)
+    super::EngineState::load(&dir, &config, knobs, &[0], policy, 0x5EED, true)
 }
 
 pub(super) fn ids(len: usize, salt: u32) -> Vec<u32> {

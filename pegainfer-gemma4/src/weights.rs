@@ -15,11 +15,16 @@ use pegainfer_kernels::ops::W4a16Matrix;
 use pegainfer_kernels::ops::W4a16Scratch;
 
 use crate::config::Gemma4Config;
+use crate::config::TensorParallelConfig;
 
 mod load;
 
 pub(crate) struct Gemma4Weights {
     pub(crate) config: Gemma4Config,
+    /// The shard these weights are, and the only source of the tensor-parallel
+    /// geometry: a serve built around them reads its rank and world size here
+    /// instead of taking them as a second argument, so the two cannot disagree.
+    pub(crate) tp: TensorParallelConfig,
     pub(crate) embed_tokens: DeviceMatrix,
     pub(crate) norm: DeviceVec,
     pub(crate) layers: Vec<Gemma4Layer>,

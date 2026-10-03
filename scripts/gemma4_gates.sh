@@ -12,7 +12,7 @@
 #
 #   PEGAINFER_TEST_MODEL_PATH=<dense-checkpoint> \
 #     PEGAINFER_NVFP4_MODEL=<routed-checkpoint> \
-#     [PEGAINFER_GATE_GPU=<index-or-UUID>] scripts/gemma4_gates.sh [filter]
+#     [PEGAINFER_GATE_GPU=<index-or-UUID-or-pair>] scripts/gemma4_gates.sh [filter]
 #
 # A filter runs the subset of manifest gates whose names contain it; the
 # membership check still covers the whole manifest.
@@ -111,6 +111,9 @@ GATES_KERNELS_HD256_FP8_POOL=(
   "gpu decode_wrapper_without_fp8_twin_refuses_e4m3"
   "gpu the_generated_windowed_prefill_refuses_e4m3"
 )
+GATES_TENSOR_PARALLEL=(
+  "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_matches_one_rank"
+)
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
   "${GATES_ADMISSION[@]}"
@@ -121,6 +124,7 @@ MANIFEST_LIB=(
   "${GATES_DEVICE[@]}"
   "${GATES_ROUTED[@]}"
   "${GATES_TILELANG_GLOBAL[@]}"
+  "${GATES_TENSOR_PARALLEL[@]}"
 )
 GATES_FP8_PROFILE=(
   "serve::oracle::context_waypoints_match_hf"
@@ -212,48 +216,71 @@ moe_ckpt=
 gpu_uuid=
 gpu_lock_fd=
 
-require_gpu() {
-  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable, so no device can be claimed"
+# Claim `count` devices for this run and export them as one
+# `CUDA_VISIBLE_DEVICES` list. The single-device gates and the two-rank gate
+# draw from the same reservation, so a full-suite run never tries to lock a
+# device it already holds, and a pair may be named in `PEGAINFER_GATE_GPU`.
+# `PEGAINFER_GATE_GPU` names the devices ("a" or "a,b"); otherwise they come
+# from `CUDA_VISIBLE_DEVICES`, else the first `count` visible devices.
+require_devices() {
+  local count=$1
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable, so no devices can be claimed"
   command -v flock >/dev/null 2>&1 || die "flock is unavailable, so device ownership cannot be enforced"
 
   local selector=${PEGAINFER_GATE_GPU:-}
   if [ -z "$selector" ] && [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
     [ -n "$CUDA_VISIBLE_DEVICES" ] || die \
       "CUDA_VISIBLE_DEVICES is empty; set PEGAINFER_GATE_GPU to claim a device"
-    [[ $CUDA_VISIBLE_DEVICES != *,* ]] || die \
-      "CUDA_VISIBLE_DEVICES must name one device; set PEGAINFER_GATE_GPU explicitly"
     selector=$CUDA_VISIBLE_DEVICES
   fi
-  selector=${selector:-0}
-  [[ $selector != *,* ]] || die "PEGAINFER_GATE_GPU must name exactly one device"
-
-  local rows=() row compute_mode lock_key lock_path
-  mapfile -t rows < <(
-    nvidia-smi -i "$selector" --query-gpu=uuid,compute_mode --format=csv,noheader 2>/dev/null
-  )
-  [ ${#rows[@]} -eq 1 ] || die "device selector $selector does not resolve to one GPU"
-  row=${rows[0]}
-  gpu_uuid=${row%%,*}
-  gpu_uuid=${gpu_uuid//[[:space:]]/}
-  compute_mode=${row#*,}
-  compute_mode=${compute_mode#"${compute_mode%%[![:space:]]*}"}
-  compute_mode=${compute_mode%"${compute_mode##*[![:space:]]}"}
-  [ "$compute_mode" != Prohibited ] || die "GPU $gpu_uuid prohibits compute contexts"
-  [[ $gpu_uuid =~ ^[A-Za-z0-9._:/-]+$ ]] || die "nvidia-smi returned an unsafe GPU identity"
-
-  export CUDA_VISIBLE_DEVICES=$gpu_uuid
-  lock_key=${gpu_uuid//\//_}
-  lock_key=${lock_key//:/_}
-  lock_path=$GPU_LOCK_ROOT/pegainfer-gemma4-gates-$lock_key.lock
-  if (umask 022; set -o noclobber; : >"$lock_path") 2>/dev/null; then
-    :
-  elif [ ! -e "$lock_path" ]; then
-    die "cannot create device lock $lock_path"
+  local picks=()
+  [ -z "$selector" ] || IFS=',' read -r -a picks <<<"$selector"
+  if [ ${#picks[@]} -lt "$count" ]; then
+    picks=()
+    mapfile -t picks < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
   fi
-  # A read-only descriptor lets separate Unix accounts lock the same inode.
-  exec {gpu_lock_fd}<"$lock_path" || die "cannot open device lock $lock_path"
-  flock -n "$gpu_lock_fd" || die "GPU $gpu_uuid is already owned by another Gemma 4 gate runner"
-  echo "gemma4 gates: claimed GPU $gpu_uuid (selector $selector)"
+  [ ${#picks[@]} -ge "$count" ] || die \
+    "this run needs $count devices; set PEGAINFER_GATE_GPU to name them"
+
+  local uuids=() rows=() row compute_mode sel uuid seen
+  for sel in "${picks[@]:0:$count}"; do
+    mapfile -t rows < <(
+      nvidia-smi -i "$sel" --query-gpu=uuid,compute_mode --format=csv,noheader 2>/dev/null
+    )
+    [ ${#rows[@]} -eq 1 ] || die "device selector $sel does not resolve to one GPU"
+    row=${rows[0]}
+    uuid=${row%%,*}
+    uuid=${uuid//[[:space:]]/}
+    compute_mode=${row#*,}
+    compute_mode=${compute_mode#"${compute_mode%%[![:space:]]*}"}
+    compute_mode=${compute_mode%"${compute_mode##*[![:space:]]}"}
+    [ "$compute_mode" != Prohibited ] || die "GPU $uuid prohibits compute contexts"
+    [[ $uuid =~ ^[A-Za-z0-9._:/-]+$ ]] || die "nvidia-smi returned an unsafe GPU identity"
+    for seen in "${uuids[@]:-}"; do
+      [ "$seen" != "$uuid" ] || die "device selector names $uuid twice"
+    done
+    uuids+=("$uuid")
+  done
+
+  gpu_uuid=$(IFS=,; printf '%s' "${uuids[*]}")
+  export CUDA_VISIBLE_DEVICES=$gpu_uuid
+  local lock_fds=() fd uuid2 lock_key lock_path
+  for uuid2 in "${uuids[@]}"; do
+    lock_key=${uuid2//\//_}
+    lock_key=${lock_key//:/_}
+    lock_path=$GPU_LOCK_ROOT/pegainfer-gemma4-gates-$lock_key.lock
+    if (umask 022; set -o noclobber; : >"$lock_path") 2>/dev/null; then
+      :
+    elif [ ! -e "$lock_path" ]; then
+      die "cannot create device lock $lock_path"
+    fi
+    # A read-only descriptor lets separate Unix accounts lock the same inode.
+    exec {fd}<"$lock_path" || die "cannot open device lock $lock_path"
+    flock -n "$fd" || die "GPU $uuid2 is already owned by another Gemma 4 gate runner"
+    lock_fds+=("$fd")
+  done
+  gpu_lock_fd=${lock_fds[0]}
+  echo "gemma4 gates: claimed $count GPU(s) $gpu_uuid"
   echo "gemma4 gates: storage profile $gate_storage"
   if [ -n "${PEGAINFER_KV_FP8:-}" ]; then
     echo "gemma4 gates: PEGAINFER_KV_FP8=$PEGAINFER_KV_FP8"
@@ -557,8 +584,25 @@ needs=" "
 for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
 needs=" ${needs//,/ } "
 demanded=""
-for want in gpu ckpt moeckpt prompts fixtures routedfixtures chatgolden tlgeom; do
-  case "$needs" in *" $want "*) "require_$want"; demanded="$demanded $want" ;; esac
+# One reservation covers both the single-device gates and the two-rank gate:
+# claim two devices when a tp2 gate is selected, one otherwise. Claiming per
+# gate type would try to lock a device this same process already holds.
+device_count=0
+case "$needs" in
+  *" tp2 "*) device_count=2 ;;
+  *" gpu "*) device_count=1 ;;
+esac
+[ "$device_count" -eq 0 ] || require_devices "$device_count"
+for want in gpu tp2 ckpt moeckpt prompts fixtures routedfixtures chatgolden tlgeom; do
+  case "$needs" in
+    *" $want "*)
+      case "$want" in
+        gpu|tp2) : ;;
+        *) "require_$want" ;;
+      esac
+      demanded="$demanded $want"
+      ;;
+  esac
 done
 echo "gemma4 gates: prerequisites$demanded"
 

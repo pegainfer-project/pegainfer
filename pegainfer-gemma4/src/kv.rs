@@ -210,25 +210,105 @@ impl SlidingLocalKv {
     }
 }
 
-pub(crate) struct GemmaKv {
+/// One rank's KV families. The per-rank entry points take this, so a step
+/// drives exactly the families of the rank it was activated on.
+pub(crate) struct RankKv {
     pub(crate) local: SlidingLocalKv,
     pub(crate) global: KvState,
-    /// Distinct for every state built in this process.
+    /// The request's id, shared by every rank of one multi-rank state.
     id: u64,
 }
 
-impl GemmaKv {
+/// The id a [`RankKv`] carries until [`GemmaKv::multi`] hands every rank of one
+/// request the same one. It is distinct from every id `multi` issues, so a state
+/// built outside `multi` can neither collide with — nor fool the steady-decode
+/// fingerprint of — a real request.
+const NO_REQUEST_ID: u64 = u64::MAX;
+
+impl RankKv {
     pub(crate) fn new(local: SlidingLocalKv, global: KvState) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
             local,
             global,
-            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: NO_REQUEST_ID,
         }
     }
 
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+}
+
+/// A request's KV across the tensor-parallel group: rank 0's families in
+/// `core`, the other ranks' in `twins`. [`Deref`](std::ops::Deref) exposes
+/// `core`, so single-rank code and rank-0 steps read `kv.local` / `kv.global`
+/// unchanged; the engine drives a rank-`r` step through
+/// [`GemmaKv::core_mut`] with that rank's own serve.
+pub(crate) struct GemmaKv {
+    core: RankKv,
+    twins: Vec<RankKv>,
+}
+
+impl std::ops::Deref for GemmaKv {
+    type Target = RankKv;
+
+    fn deref(&self) -> &RankKv {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for GemmaKv {
+    fn deref_mut(&mut self) -> &mut RankKv {
+        &mut self.core
+    }
+}
+
+impl GemmaKv {
+    pub(crate) fn new(local: SlidingLocalKv, global: KvState) -> Self {
+        Self::multi(RankKv::new(local, global), Vec::new())
+    }
+
+    /// One `RankKv` per rank: `core` is rank 0's, `twins` the rest. Every rank
+    /// carries the same request id. The caller hands in exactly one twin per
+    /// extra rank, in rank order — the same world the geometry was built for.
+    pub(crate) fn multi(mut core: RankKv, mut twins: Vec<RankKv>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        core.id = id;
+        for twin in &mut twins {
+            twin.id = id;
+        }
+        Self { core, twins }
+    }
+
+    /// The family pair `rank` owns, for reading (0 is `core`). A rank past the
+    /// twins is a caller bug rather than a runtime condition, so say which rank
+    /// was asked for instead of an index panic.
+    pub(crate) fn core(&self, rank: usize) -> &RankKv {
+        if rank == 0 {
+            &self.core
+        } else {
+            match self.twins.get(rank - 1) {
+                Some(twin) => twin,
+                None => panic!(
+                    "rank {rank} is outside the {}-rank KV",
+                    self.twins.len() + 1
+                ),
+            }
+        }
+    }
+
+    /// The family pair `rank` owns (0 is `core`).
+    pub(crate) fn core_mut(&mut self, rank: usize) -> &mut RankKv {
+        if rank == 0 {
+            &mut self.core
+        } else {
+            let twins = self.twins.len() + 1;
+            match self.twins.get_mut(rank - 1) {
+                Some(twin) => twin,
+                None => panic!("rank {rank} is outside the {twins}-rank KV"),
+            }
+        }
     }
 }
 
@@ -245,7 +325,7 @@ fn pages_to_reserve(kv_len: usize, accounted: usize, page_size: usize) -> Option
 pub(crate) fn admit_tokens(
     local_pool: &KvPool,
     global_pool: &KvPool,
-    kv: &mut GemmaKv,
+    kv: &mut RankKv,
     new_tokens: usize,
 ) -> Result<()> {
     anyhow::ensure!(

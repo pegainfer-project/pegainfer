@@ -33,14 +33,18 @@ use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_sample::LogprobRequest;
 use pegainfer_sample::SampleScratch;
 
+use crate::config::TensorParallelConfig;
 use crate::forward::MULTIMODAL_PLACEHOLDER_IDS;
 use crate::kv::GLOBAL_PAGE_SIZE;
 use crate::kv::GemmaKv;
 use crate::kv::LOCAL_PAGE_SIZE;
+use crate::kv::RankKv;
 use crate::kv::admit_tokens;
+use crate::layer::LayerGeometry;
 use crate::prefix_cache::PrefixCache;
 use crate::serve::GemmaServe;
 use crate::serve::GlobalAttn;
+use crate::serve::PrecapturePhase;
 use crate::serve::StepArena;
 use crate::weights::Gemma4Weights;
 
@@ -335,28 +339,86 @@ fn start_with_knobs(
         .to_str()
         .context("model path is not valid UTF-8")?
         .to_string();
+    let ordinals = options.device_ordinals.clone();
     anyhow::ensure!(
-        options.device_ordinals.len() == 1,
-        "gemma4 is single-device; got device_ordinals {:?}",
-        options.device_ordinals
+        !ordinals.is_empty(),
+        "gemma4 needs at least one device ordinal"
     );
-    anyhow::ensure!(
-        options.parallel_config.is_none(),
-        "gemma4 has no parallel topology support yet"
-    );
-    let device = options.device_ordinals[0];
+    let world = ordinals.len();
+    if let Some(parallel) = options.parallel_config.as_ref() {
+        anyhow::ensure!(
+            parallel.tp_world() == world
+                && parallel.dp_world() == 1
+                && parallel.ep_world() == world,
+            "gemma4 tensor parallelism takes one rank per device (tp_size = ep_size = {world}, \
+             dp_size = 1); got tp {} dp {} ep {}",
+            parallel.tp_world(),
+            parallel.dp_world(),
+            parallel.ep_world()
+        );
+    }
     let base_seed = options.seed;
     let graph_enabled = options.enable_cuda_graph;
 
     let config = crate::config::Gemma4Config::from_file(&dir)?;
     let knobs = ServingKnobs::resolve(lookup, &config)?;
     let policy = generation_policy(&dir)?;
+    if world > 1 {
+        anyhow::ensure!(
+            knobs.lane_mode.is_none(),
+            "{ASYNC_PREFILL_ENV} is unsupported under tensor parallelism: its lane stream cannot \
+             be lock-stepped across ranks"
+        );
+        anyhow::ensure!(
+            !knobs.global_attn.tilelang(),
+            "{GLOBAL_ATTN_ENV} is unsupported under tensor parallelism: the generated kernels are \
+             compiled for the whole global family"
+        );
+        anyhow::ensure!(
+            knobs.prefix_cache.is_none(),
+            "{PREFIX_CACHE_ENV} is unsupported under tensor parallelism"
+        );
+        // The ranks take ordinals `0..world` of what this process can see, so a
+        // world size past the visible devices can only fail later, less clearly.
+        // `cuDeviceGetCount` needs the driver up and on a fresh process this is
+        // the first CUDA call; `init` is idempotent and process-wide.
+        cudarc::driver::result::init().map_err(|e| {
+            anyhow::anyhow!("CUDA driver init for a {world}-rank launch failed: {e:?}")
+        })?;
+        let visible = cudarc::driver::result::device::get_count().map_err(|e| {
+            anyhow::anyhow!("a {world}-rank launch needs to count CUDA devices: {e:?}")
+        })?;
+        anyhow::ensure!(
+            visible as usize >= world,
+            "a {world}-rank launch needs {world} CUDA devices, this process sees {visible}"
+        );
+        // `docs/models/gemma4/tp.md` records that this container's stock NCCL
+        // corrupts memory under the default `LL`/`SIMPLE` protocols: the
+        // all-reduce kernel writes far past its buffer, and the symptom is the
+        // primary's collective stalling forever rather than an error. Nothing in
+        // the stack can detect that, so the configuration in force is said out
+        // loud rather than assumed.
+        let proto = std::env::var("NCCL_PROTO").unwrap_or_else(|_| "unset".to_string());
+        let version = cudarc::nccl::result::get_nccl_version().map_or_else(
+            |_| "unknown".to_string(),
+            |v| format!("{}.{}.{}", v / 10000, (v / 100) % 100, v % 100),
+        );
+        if proto.to_ascii_uppercase().contains("LL128") {
+            log::info!("tensor parallel: {world} ranks, NCCL {version}, NCCL_PROTO={proto}");
+        } else {
+            log::warn!(
+                "tensor parallel: {world} ranks, NCCL {version}, NCCL_PROTO={proto} — this \
+                 environment's stock NCCL corrupts the all-reduce buffer unless the protocol \
+                 is LL128 (see docs/models/gemma4/tp.md)"
+            );
+        }
+    }
 
     let state = EngineState::load(
         &dir,
-        config,
+        &config,
         knobs,
-        device,
+        &ordinals,
         policy,
         base_seed,
         graph_enabled,
@@ -1082,10 +1144,87 @@ fn send_scheduled(request: &QueuedRequest, cached_tokens: usize, ledger: &mut Re
 /// Everything the contract-owned scheduler thread owns for the life of the
 /// engine. Loading completes before the driver thread is spawned, so launch
 /// failures return synchronously to the caller.
+/// One tensor-parallel rank's device state. Rank 0's lives in `EngineState`'s
+/// own fields; ranks 1.. world size ride in `EngineState::more`.
+struct RankState {
+    ctx: DeviceContext,
+    serve: GemmaServe,
+    arena: StepArena,
+}
+
+/// The graph-before-comm release [`Drop for EngineState`] gives the success
+/// path, for a `load` that fails after the capture sweep and so never builds an
+/// `EngineState`: this rank's captured graphs must go before its own
+/// communicator (a field of `serve`) drops.
+impl Drop for RankState {
+    fn drop(&mut self) {
+        let _ = select_device(&self.ctx);
+        self.arena.release_graphs();
+    }
+}
+
+/// Make `ctx`'s device current on this thread. The thread-local cuBLAS handles
+/// are keyed by device, so switching the current device is enough once every
+/// rank has been bound at the start of a step.
+fn activate_rank(ctx: &DeviceContext) -> Result<()> {
+    select_device(ctx)?;
+    // `cublas_init` is the only call that can create a device's handle pair on
+    // this thread, and it also selects them, so it both covers the first use
+    // of a device and the switch back to one already used.
+    unsafe { pegainfer_core::ffi::cublas_init() };
+    let err = unsafe { pegainfer_core::ffi::cublas_activate_device_handles() };
+    anyhow::ensure!(
+        err == 0,
+        "cuBLAS handle activation on device {} failed: cudaError={err}",
+        ctx.device_ordinal
+    );
+    Ok(())
+}
+
+/// Set `ctx`'s device current and bind its primary context to this thread.
+fn select_device(ctx: &DeviceContext) -> Result<()> {
+    let err = unsafe { pegainfer_core::ffi::cuda_set_device(ctx.device_ordinal as i32) };
+    anyhow::ensure!(
+        err == 0,
+        "cudaSetDevice({}) on the scheduler thread failed: cudaError={err}",
+        ctx.device_ordinal
+    );
+    ctx.ctx.bind_to_thread().map_err(|e| {
+        anyhow::anyhow!(
+            "bind device {} to the scheduler thread: {e}",
+            ctx.device_ordinal
+        )
+    })?;
+    Ok(())
+}
+
+/// The rank-`rank` KV of every row, in row order.
+fn rank_kvs(rows: &mut [Active], rank: usize) -> Vec<&mut RankKv> {
+    rows.iter_mut()
+        .map(|entry| entry.kv.core_mut(rank))
+        .collect()
+}
+
+/// Abort every rank's communicator after a rank-0 step has failed. Rank 0 may
+/// have stopped between two collectives, in which case a peer's matching call
+/// will never arrive; aborting the comms unblocks any peer already waiting
+/// instead of letting it hang, and stops the engine — a comm-less step would
+/// otherwise silently reduce to a no-op. A free function over the two fields so
+/// a caller holding a `&self.ctx` borrow (the scored path) can still abort.
+fn abort_comms(serve: &mut GemmaServe, more: &mut [RankState]) {
+    serve.detach_tp_comm();
+    for state in more {
+        state.serve.detach_tp_comm();
+    }
+}
+
 struct EngineState {
     ctx: DeviceContext,
     serve: GemmaServe,
     arena: StepArena,
+    /// Ranks 1.. world size, empty at world size 1. Same shape as rank 0's
+    /// fields above.
+    more: Vec<RankState>,
     scratch: SampleScratch,
     /// Conversation-tail prefix cache; `None` unless
     /// `PEGAINFER_PREFIX_CACHE=K` opted in at startup.
@@ -1120,6 +1259,148 @@ struct EngineState {
     /// The admission coalesce window; `None` unless
     /// `PEGAINFER_ADMIT_COALESCE_MS` opted in at startup.
     admit_coalesce: Option<std::time::Duration>,
+}
+
+/// Captured collective graphs bake in NCCL kernel launches, and NCCL's
+/// communicator abort wedges while a graph that references them is still
+/// alive — so every rank releases its graphs here, on its own device, before
+/// the fields (and with them the communicators) drop.
+impl Drop for EngineState {
+    fn drop(&mut self) {
+        let _ = select_device(&self.ctx);
+        self.arena.release_graphs();
+        for state in &mut self.more {
+            let _ = select_device(&state.ctx);
+            state.arena.release_graphs();
+        }
+    }
+}
+
+impl EngineState {
+    /// A fresh per-request KV across every rank: rank 0 from the primary
+    /// serve, each other rank from its own serve. Each entry is bound to its
+    /// rank's pools, which is what `admit_tokens`' `belongs_to` check needs.
+    fn alloc_kv(&self) -> GemmaKv {
+        GemmaKv::multi(
+            self.serve.alloc_rank_kv(),
+            self.more
+                .iter()
+                .map(|rank| rank.serve.alloc_rank_kv())
+                .collect(),
+        )
+    }
+
+    /// Every rank must stand on rank 0's frontier. The page-id contract —
+    /// identical budgets and an identical admission sequence keep the ranks'
+    /// page ids in step — is checked nowhere else, so a divergence caught here
+    /// is the last chance before it becomes a silent read of another rank's
+    /// page. The free-page counts carry the same signal but take the pool locks,
+    /// so they are compared in a debug build only.
+    fn assert_ranks_in_step(&self, kv: &GemmaKv) -> Result<()> {
+        let local = kv.local.seq_len();
+        let global = kv.global.seq_len();
+        for rank in 1..=self.more.len() {
+            let theirs = kv.core(rank);
+            anyhow::ensure!(
+                theirs.local.seq_len() == local && theirs.global.seq_len() == global,
+                "rank {rank} stands on frontier {}/{} where rank 0 stands on {local}/{global}",
+                theirs.local.seq_len(),
+                theirs.global.seq_len()
+            );
+        }
+        #[cfg(debug_assertions)]
+        for (index, state) in self.more.iter().enumerate() {
+            let rank = index + 1;
+            anyhow::ensure!(
+                state.serve.local_pool.available_pages() == self.serve.local_pool.available_pages(),
+                "rank {rank}'s local pool holds different free pages than rank 0's"
+            );
+            anyhow::ensure!(
+                state.serve.global_pool.available_pages()
+                    == self.serve.global_pool.available_pages(),
+                "rank {rank}'s global pool holds different free pages than rank 0's"
+            );
+        }
+        Ok(())
+    }
+
+    /// Run `per_rank` on every extra rank, drain each stream, and require that
+    /// they all end on rank 0's frontier.
+    ///
+    /// Call this *after* rank 0's own step has been started, unconditionally:
+    /// the ranks share one collective sequence, so a rank-0 failure that skipped
+    /// the peer would leave the peer's matching calls unpaired, and the pairing
+    /// then shifts for every later step — reducing one layer's partials against
+    /// another's — or wedges the peer at its drain. A failure on an extra rank
+    /// is fatal here, because the ranks' frontiers must not drift apart, while
+    /// rank 0's own failure stays the caller's to report. The drain is what
+    /// turns a device fault on a non-primary rank into a named error instead of
+    /// the primary's collective stalling forever.
+    fn step_extra_ranks<F>(&self, kv: &mut GemmaKv, per_rank: F) -> Result<()>
+    where
+        F: Fn(&RankState, &mut RankKv) -> Result<()>,
+    {
+        // Launch every extra rank before draining any of them. A rank's work is
+        // enqueued asynchronously, but its drain is not: waiting on rank 1 here
+        // would reach its collective before ranks 2..'s matching calls are in
+        // flight, and one thread cannot both wait and issue the next launch, so
+        // the step would deadlock. Once every call is in flight the drains can
+        // run in any order.
+        for (rank, state) in self.more.iter().enumerate() {
+            activate_rank(&state.ctx)?;
+            per_rank(state, kv.core_mut(rank + 1)).context("tensor-parallel prefill")?;
+        }
+        for (rank, state) in self.more.iter().enumerate() {
+            state
+                .ctx
+                .sync()
+                .with_context(|| format!("drain rank {}", rank + 1))?;
+        }
+        self.assert_ranks_in_step(kv)?;
+        // The caller's next device work is rank 0's.
+        activate_rank(&self.ctx)
+    }
+
+    /// One plain prefill step on every extra rank; their logits are discarded.
+    fn prefill_extra_ranks(&self, kv: &mut GemmaKv, tokens: &[u32]) -> Result<()> {
+        self.step_extra_ranks(kv, |state, rank_kv| {
+            state.serve.step(&state.ctx, rank_kv, tokens).map(|_| ())
+        })
+    }
+
+    /// Reserve on every extra rank's pools, so their fronts stay in step with
+    /// rank 0's. Purely host-side, so no activation is needed.
+    fn admit_extra_ranks(&self, kv: &mut GemmaKv, tokens: usize) -> Result<()> {
+        for (rank, state) in self.more.iter().enumerate() {
+            admit_tokens(
+                &state.serve.local_pool,
+                &state.serve.global_pool,
+                kv.core_mut(rank + 1),
+                tokens,
+            )?;
+        }
+        // A rank that reserved different pages here has already lost the page-id
+        // race, and nothing after this can repair it.
+        #[cfg(debug_assertions)]
+        {
+            let free = (
+                self.serve.local_pool.available_pages(),
+                self.serve.global_pool.available_pages(),
+            );
+            for (rank, state) in self.more.iter().enumerate() {
+                debug_assert_eq!(
+                    free,
+                    (
+                        state.serve.local_pool.available_pages(),
+                        state.serve.global_pool.available_pages()
+                    ),
+                    "rank {}'s pools reserved different pages than rank 0's",
+                    rank + 1
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The scheduler thread is not the thread that loaded the engine: the
@@ -1211,7 +1492,10 @@ impl EngineState {
         loop {
             let refusal = match need {
                 AdmissionNeed::Tokens(tokens) => {
+                    // Every rank's pools reserve the same pages, so the fronts
+                    // stay in step; only then does the admission succeed.
                     admit_tokens(&self.serve.local_pool, &self.serve.global_pool, kv, tokens)
+                        .and_then(|()| self.admit_extra_ranks(kv, tokens))
                         .err()
                         .map(|err| format!("admission refused: {err:#}"))
                 }
@@ -1257,10 +1541,10 @@ impl EngineState {
                 Ok(kv) => (kv, Some(entry.id)),
                 Err(err) => {
                     log::warn!("prefix-cache restore failed (falling back): {err:#}");
-                    (self.serve.alloc_kv(), None)
+                    (self.alloc_kv(), None)
                 }
             },
-            None => (self.serve.alloc_kv(), None),
+            None => (self.alloc_kv(), None),
         }
     }
 
@@ -1318,16 +1602,25 @@ impl EngineState {
 
     fn load(
         dir: &str,
-        config: crate::config::Gemma4Config,
+        config: &crate::config::Gemma4Config,
         knobs: ServingKnobs,
-        device: usize,
+        ordinals: &[usize],
         policy: GenerationPolicy,
         base_seed: u64,
         graph_enabled: bool,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            !ordinals.is_empty(),
+            "a gemma4 engine needs at least one device ordinal"
+        );
+        let world = ordinals.len();
+        let device = ordinals[0];
+        let tp = TensorParallelConfig::new(0, world);
         // Refuse an unservable global GQA shape or device before the
         // multi-GiB load.
-        let global_split = crate::serve::global_split_factor(&config)?;
+        tp.validate_for(config)?;
+        let global_split =
+            crate::serve::global_split_factor(&LayerGeometry::global_of(config, tp)?)?;
         let ServingKnobs {
             max_context,
             lane_mode,
@@ -1343,7 +1636,7 @@ impl EngineState {
         if global_attn.tilelang() {
             ensure_tilelang_device(device)?;
         }
-        let weights = Gemma4Weights::from_safetensors(dir, device, config)?;
+        let weights = Gemma4Weights::from_safetensors(dir, device, config.clone(), tp)?;
         let ctx = DeviceContext::new_with_device(device)?;
         let vocab = weights.embed_tokens.rows;
         policy.check_against_vocab(vocab)?;
@@ -1412,7 +1705,7 @@ impl EngineState {
              derives page or row counts past the i32 metadata domain (the global family's pseudo \
              tables carry {global_split} copies of every page)"
         );
-        let serve = GemmaServe::new(
+        let mut serve = GemmaServe::new(
             &ctx,
             weights,
             max_context,
@@ -1446,7 +1739,11 @@ impl EngineState {
         let prefix_cache = cache_cap.map(|k| PrefixCache::new(k, sliding_window));
         let mut scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
         let mut arena = serve.alloc_step_arena(&ctx, arena_rows, graph_enabled)?;
-        serve.precapture_decode_graphs(&ctx, &mut arena)?;
+        // One rank sweeps here; more than one sweeps in the interleaved driver
+        // below, which owns the buckets for every rank.
+        if world == 1 {
+            serve.precapture_decode_graphs(&ctx, &mut arena)?;
+        }
         let suppress_ids = ops::SuppressIds::upload(&ctx, &policy.suppress, vocab)?;
         let mut sampler_graphs = Vec::new();
         if graph_enabled {
@@ -1473,10 +1770,141 @@ impl EngineState {
         let lane = lane_mode
             .map(|mode| AsyncPrefillLane::new(&ctx, mode))
             .transpose()?;
+        // The other ranks: their own sharded weights, context, pools and
+        // arena. The pool budget is rank-independent (identical pools with
+        // identical counts), so it is computed once above and handed to each.
+        let mut more = Vec::with_capacity(world - 1);
+        for (rank, ordinal) in ordinals.iter().copied().enumerate().skip(1) {
+            let rank_tp = TensorParallelConfig::new(rank, world);
+            let weights = Gemma4Weights::from_safetensors(dir, ordinal, config.clone(), rank_tp)?;
+            let rank_ctx = DeviceContext::new_with_device(ordinal)?;
+            let rank_serve = GemmaServe::new(
+                &rank_ctx,
+                weights,
+                max_context,
+                local_kv_storage,
+                local_pages,
+                global_pages,
+                global_attn,
+            )
+            .map_err(|err| {
+                err.context(format!(
+                    "rank {rank} (device {ordinal}) sized its pools to {local_pages} local / \
+                     {global_pages} global pages"
+                ))
+            })?;
+            let rank_arena = rank_serve.alloc_step_arena(&rank_ctx, arena_rows, graph_enabled)?;
+            more.push(RankState {
+                ctx: rank_ctx,
+                serve: rank_serve,
+                arena: rank_arena,
+            });
+        }
+        // Materialize every rank's lazily-loaded cuBLAS/cublasLt kernels before
+        // the communicator exists. Under the default CUDA_MODULE_LOADING=LAZY
+        // a fresh process enters the driver's module loader on the first GEMM
+        // of each shape; NCCL's proxy threads enter that same loader while the
+        // communicator comes up, and the two deadlock — the eager prefill then
+        // never returns while the engine spin-waits. One tower pass per rank
+        // here, with no comm live, pays those loads single-threaded. The row
+        // counts span cublasLt's kernel-selection regions: a single row takes
+        // a GEMV-like kernel, the rest tile GEMMs whose choice shifts at small
+        // row counts. It also warms the decode capture sweep that used to run
+        // below under graphs.
+        if world > 1 {
+            let warm_rows = [1usize, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+                .into_iter()
+                .filter(|rows| *rows <= max_context);
+            let warm = |serve: &GemmaServe, ctx: &DeviceContext, rows: usize| -> Result<()> {
+                let mut kv = serve.alloc_kv();
+                admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, rows)?;
+                activate_rank(ctx)?;
+                serve.step(ctx, &mut kv, &vec![0u32; rows])?;
+                Ok(())
+            };
+            for rows in warm_rows.clone() {
+                warm(&serve, &ctx, rows)?;
+            }
+            for state in &more {
+                for rows in warm_rows.clone() {
+                    warm(&state.serve, &state.ctx, rows)?;
+                }
+            }
+            activate_rank(&ctx)?;
+        }
+        // One communicator per rank, built on the stream the decode graph would
+        // run on, so an all-reduce lands inside that graph.
+        if world > 1 {
+            let mut streams = Vec::with_capacity(world);
+            streams.push(ctx.stream.clone());
+            for state in &more {
+                streams.push(state.ctx.stream.clone());
+            }
+            let mut comms = cudarc::nccl::safe::Comm::from_devices(streams)
+                .map_err(|e| anyhow::anyhow!("failed to initialize NCCL comms: {e:?}"))?
+                .into_iter();
+            serve.attach_tp_comm(comms.next().expect("one comm per rank"));
+            for state in &mut more {
+                state
+                    .serve
+                    .attach_tp_comm(comms.next().expect("one comm per rank"));
+            }
+        }
+        // With graphs on, every rank captures its decode graphs, phase by phase:
+        // `Warm` and `Launch` execute and enqueue the all-reduce, whose peer
+        // call must be in flight, so the phases interleave across ranks instead
+        // of one rank finishing its whole sweep. `Capture` only records, and a
+        // recorded collective replays when its peer replays. Each rank sweeps
+        // its own arena and its own single-rank dummy.
+        if graph_enabled && world > 1 {
+            let mut dummies: Vec<GemmaKv> = Vec::with_capacity(world);
+            let mut primary = serve.alloc_kv();
+            admit_tokens(&serve.local_pool, &serve.global_pool, &mut primary, 1)?;
+            dummies.push(primary);
+            for state in &more {
+                let mut dummy = state.serve.alloc_kv();
+                admit_tokens(
+                    &state.serve.local_pool,
+                    &state.serve.global_pool,
+                    &mut dummy,
+                    1,
+                )?;
+                dummies.push(dummy);
+            }
+            let mut bucket = 1usize;
+            while bucket <= arena.bucket_ceiling() {
+                for phase in PrecapturePhase::ALL {
+                    activate_rank(&ctx)?;
+                    serve.precapture_bucket(&ctx, &mut arena, &mut dummies[0], bucket, phase)?;
+                    for (rank, state) in more.iter_mut().enumerate() {
+                        activate_rank(&state.ctx)?;
+                        state.serve.precapture_bucket(
+                            &state.ctx,
+                            &mut state.arena,
+                            &mut dummies[rank + 1],
+                            bucket,
+                            phase,
+                        )?;
+                    }
+                }
+                bucket *= 2;
+            }
+            // Every rank's floor goes back to 1: the sweep left each arena's
+            // `min_bucket` at the ceiling, and a rank that kept it would pad a
+            // decode step to a different bucket than rank 0 — different graphs
+            // on different ranks for the same step.
+            arena.reset_min_bucket();
+            for state in &mut more {
+                state.arena.reset_min_bucket();
+            }
+            activate_rank(&ctx)?;
+            ctx.sync()?;
+        }
         Ok(Self {
             ctx,
             serve,
             arena,
+            more,
             scratch,
             prefix_cache,
             policy,
@@ -1686,22 +2114,61 @@ impl EngineState {
                 scores.extend(scored.into_iter().map(Some));
                 Ok(())
             };
-            let stepped = self
-                .serve
-                .step_scoring(ctx, &mut kv, prompt, Some(&mut score));
+            activate_rank(&self.ctx)?;
+            // Rank 0's tower is launched first, but its per-row readback blocks
+            // on its own collective, so it runs only after every rank has
+            // launched its tower — the peer's matching call must already be in
+            // flight or the one driving thread deadlocks.
+            let mut tower = match self.serve.launch_prompt_tower(ctx, &mut kv, prompt) {
+                Ok(tower) => tower,
+                Err(err) => {
+                    abort_comms(&mut self.serve, &mut self.more);
+                    return Err(err.context("scored prompt tower"));
+                }
+            };
+            // The other ranks run the same prefill to write their KV shards;
+            // scoring is rank 0's alone.
+            if let Err(err) = self.step_extra_ranks(&mut kv, |state, rank_kv| {
+                state
+                    .serve
+                    .step_scoring(&state.ctx, rank_kv, prompt, None)
+                    .map(|_| ())
+            }) {
+                abort_comms(&mut self.serve, &mut self.more);
+                return Err(err);
+            }
+            self.serve
+                .score_prompt_tower(ctx, &mut tower, &mut score)
+                .context("prompt logprobs")?;
             echo = Some(PromptEcho {
                 ids: prompt.clone(),
                 logprobs: scores,
             });
-            stepped
+            Ok(tower.into_logits())
         } else if let Some(chunk) = self.mix_chunk {
             // Under the chunk knob a solo prompt walks its own segments too:
             // residency stays window plus segment whatever the prompt length.
             self.walk_plain_prompt(&mut kv, &request.request.prompt_tokens, chunk)
         } else {
             let resume = kv.local.seq_len();
-            self.serve
-                .step(&self.ctx, &mut kv, &request.request.prompt_tokens[resume..])
+            activate_rank(&self.ctx)?;
+            let result =
+                self.serve
+                    .step(&self.ctx, &mut kv, &request.request.prompt_tokens[resume..]);
+            match result {
+                Ok(logits) => {
+                    // Rank 0's tower is in flight, so the peer's collectives
+                    // have their match. A rank-0 failure instead means its
+                    // sequence stopped short, and driving the peer's whole
+                    // tower would leave it waiting on a call that never comes.
+                    self.prefill_extra_ranks(&mut kv, &request.request.prompt_tokens[resume..])?;
+                    Ok(logits)
+                }
+                Err(err) => {
+                    abort_comms(&mut self.serve, &mut self.more);
+                    Err(err.context("solo prefill tower"))
+                }
+            }
         };
         let mut logits = match stepped {
             Ok(logits) => logits,
@@ -1877,7 +2344,7 @@ impl EngineState {
     /// A prompt's unseen suffix on the plain path, one `chunk` segment at a
     /// time.
     fn walk_plain_prompt(
-        &self,
+        &mut self,
         kv: &mut GemmaKv,
         prompt: &[u32],
         chunk: usize,
@@ -1890,14 +2357,28 @@ impl EngineState {
         self.step_plain_segment(kv, &prompt[offset..])
     }
 
-    fn step_plain_segment(&self, kv: &mut GemmaKv, tokens: &[u32]) -> Result<HiddenStates> {
+    fn step_plain_segment(&mut self, kv: &mut GemmaKv, tokens: &[u32]) -> Result<HiddenStates> {
         admit_tokens(
             &self.serve.local_pool,
             &self.serve.global_pool,
             kv,
             tokens.len(),
         )?;
-        self.serve.step(&self.ctx, kv, tokens)
+        self.admit_extra_ranks(kv, tokens.len())?;
+        activate_rank(&self.ctx)?;
+        // Rank 0's tower is in flight, so the peer's collectives have their
+        // match; a rank-0 failure instead breaks the sequence, so abort rather
+        // than drive a peer that would wait forever on a missing call.
+        match self.serve.step(&self.ctx, kv, tokens) {
+            Ok(logits) => {
+                self.prefill_extra_ranks(kv, tokens)?;
+                Ok(logits)
+            }
+            Err(err) => {
+                abort_comms(&mut self.serve, &mut self.more);
+                Err(err.context("chunked prefill tower"))
+            }
+        }
     }
 
     fn finish_plain_walker(
@@ -2009,7 +2490,9 @@ impl EngineState {
                 &self.serve.global_pool,
                 &mut walker.kv,
                 take,
-            ) {
+            )
+            .and_then(|()| self.admit_extra_ranks(&mut walker.kv, take))
+            {
                 ledger.fail(
                     walker.request.id,
                     format!("walk segment admission failed: {err:#}"),
@@ -2128,7 +2611,9 @@ impl EngineState {
                 &self.serve.global_pool,
                 &mut entry.kv,
                 1,
-            ) {
+            )
+            .and_then(|()| self.admit_extra_ranks(&mut entry.kv, 1))
+            {
                 ledger.fail(
                     entry.request.id,
                     format!("decode KV admission failed: {err:#}"),
@@ -2169,6 +2654,7 @@ impl EngineState {
                     &mut entry.kv,
                     1,
                 )
+                .and_then(|()| self.admit_extra_ranks(&mut entry.kv, 1))
                 .is_ok()
         })
     }
@@ -2191,15 +2677,47 @@ impl EngineState {
         slot: usize,
     ) -> Result<usize> {
         let rows = active.len();
+        // The staged pipeline hands rank 1 no ids of its own (it has no
+        // sampler), so under tensor parallelism every rank takes the
+        // explicit-token path.
+        let resident = resident && self.more.is_empty();
         let tokens = (!resident).then(|| active.iter().map(|entry| entry.next).collect::<Vec<_>>());
         {
-            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
-            if let Some(tokens) = tokens.as_deref() {
+            activate_rank(&self.ctx)?;
+            let mut kvs = rank_kvs(active, 0);
+            // Rank 0's verdict is held, not propagated: the other ranks must be
+            // driven either way (see `step_extra_ranks`).
+            let rank0 = if let Some(tokens) = tokens.as_deref() {
                 self.serve
-                    .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)?;
+                    .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)
+                    .map(|_| ())
             } else {
                 self.serve
-                    .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)?;
+                    .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)
+                    .map(|_| ())
+            };
+            if let Err(err) = rank0 {
+                // Rank 0's sequence stopped short; abort before any peer waits
+                // on a collective that will never be issued.
+                abort_comms(&mut self.serve, &mut self.more);
+                return Err(err.context("batched decode launch"));
+            }
+            // The other ranks carry the same tokens and page ids; only rank 0
+            // samples, so their logits are discarded. A failure on them is fatal
+            // — the ranks' frontiers must not drift apart.
+            if let Some(tokens) = tokens.as_deref() {
+                for (rank, state) in self.more.iter_mut().enumerate() {
+                    activate_rank(&state.ctx)?;
+                    let mut kvs = rank_kvs(active, rank + 1);
+                    state.serve.decode_batch_step(
+                        &state.ctx,
+                        &mut state.arena,
+                        &mut kvs,
+                        tokens,
+                    )?;
+                }
+                // The sampler below reads rank 0's arena.
+                activate_rank(&self.ctx)?;
             }
         }
         let graph_slot = crate::serve::decode_bucket_slot(rows);
@@ -2282,18 +2800,44 @@ impl EngineState {
     ) -> Result<SampledRows> {
         let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         let stepped = {
-            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
+            activate_rank(&self.ctx)?;
+            let mut kvs = rank_kvs(active, 0);
+            let mut rank0_prefills: Vec<(&mut RankKv, &[u32])> = prefills
+                .iter_mut()
+                .map(|(kv, tokens)| (&mut ***kv, *tokens))
+                .collect();
             self.serve.mixed_prefill_decode_step(
                 &self.ctx,
                 &mut self.arena,
-                prefills,
+                &mut rank0_prefills,
                 &mut kvs,
                 &decode_tokens,
             )
         };
+        // The other ranks run the same mixed step on their own families and
+        // arena; their logits are discarded.
+        for (rank, state) in self.more.iter_mut().enumerate() {
+            activate_rank(&state.ctx)?;
+            let mut extra_prefills: Vec<(&mut RankKv, &[u32])> = prefills
+                .iter_mut()
+                .map(|(kv, tokens)| (kv.core_mut(rank + 1), *tokens))
+                .collect();
+            let mut kvs = rank_kvs(active, rank + 1);
+            state.serve.mixed_prefill_decode_step(
+                &state.ctx,
+                &mut state.arena,
+                &mut extra_prefills,
+                &mut kvs,
+                &decode_tokens,
+            )?;
+        }
+        activate_rank(&self.ctx)?;
         let logits = match stepped {
             Ok(logits) => logits,
             Err(err) => {
+                // Rank 0's mixed step broke mid-sequence; abort so the peers
+                // cannot hang on the collective it never issued.
+                abort_comms(&mut self.serve, &mut self.more);
                 fail_active_batch(active, "mixed step", &err, ledger);
                 return Err(err.context("gemma4 mixed step"));
             }
@@ -2375,20 +2919,36 @@ impl EngineState {
         ledger: &mut RequestLedger,
     ) -> Result<()> {
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
-        let logits = {
-            let mut kvs: Vec<&mut GemmaKv> = active.iter_mut().map(|entry| &mut entry.kv).collect();
-            match self
-                .serve
+        activate_rank(&self.ctx)?;
+        // Rank 0's verdict is held rather than propagated: the extra ranks have
+        // to be driven either way (see `step_extra_ranks`).
+        let rank0 = {
+            let mut kvs = rank_kvs(active, 0);
+            self.serve
                 .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, &tokens)
-            {
-                Ok(logits) => logits,
-                Err(err) => {
-                    self.fence()?;
-                    fail_active_batch(active, "batched decode", &err, ledger);
-                    return Err(err.context("batched decode"));
-                }
-            }
+                .map(|_| ())
         };
+        if let Err(err) = rank0 {
+            // Rank 0's sequence stopped short; abort so no peer waits on a
+            // collective that will never be issued.
+            abort_comms(&mut self.serve, &mut self.more);
+            let _ = self.fence();
+            fail_active_batch(active, "batched decode", &err, ledger);
+            return Err(err.context("batched decode"));
+        }
+        // Rank 0's tower is in flight; now every other rank's. They carry the
+        // same tokens and page ids, and only rank 0 samples, so their logits
+        // are discarded. A failure on them is fatal — the ranks' frontiers must
+        // not drift apart.
+        for (rank, state) in self.more.iter_mut().enumerate() {
+            activate_rank(&state.ctx)?;
+            let mut kvs = rank_kvs(active, rank + 1);
+            state
+                .serve
+                .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, &tokens)?;
+        }
+        activate_rank(&self.ctx)?;
+        let (logits, _) = self.arena.logits_and_ids();
         let sampled = {
             let rows: Vec<SampleRow<'_>> = active
                 .iter()
@@ -2492,7 +3052,11 @@ impl Scheduler for Gemma4Scheduler {
 
     fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
         if self.cublas.is_none() {
+            // Rank 0's handles, and the guard that tears every device's handles
+            // down on this thread. Each other rank's handles are created the
+            // first time `activate_rank` reaches it.
             self.cublas = Some(bind_engine_thread(&self.state.ctx)?);
+            activate_rank(&self.state.ctx)?;
         }
         if self.walk.is_some() {
             return self.advance_walk(ledger);
@@ -2931,3 +3495,7 @@ mod lane_gates_walk;
 #[cfg(test)]
 #[path = "engine/lane_gates_logprobs.rs"]
 mod lane_gates_logprobs;
+
+#[cfg(test)]
+#[path = "engine/lane_gates_tp.rs"]
+mod lane_gates_tp;

@@ -364,9 +364,16 @@ resident origin) from day one — swapping the storage underneath later must not
 
 ## Tensor parallelism
 
-Still unbuilt as of 2026-09: `pegainfer-gemma4` carries no TP path — no NCCL, no world size — so
-one Gemma 4 model is one GPU whatever a node holds. The constraint below is what a legal world
-size would have to satisfy, not something the engine enforces today.
+Built as of 2026-10: `pegainfer-gemma4` shards the dense sizes across a world size, with a
+per-rank KV bound to that rank's own pools and the world-size rule enforced at launch. The
+invariants and the measured 12B comparison live in [`tp.md`](tp.md); what follows is the
+constraint a legal world size satisfies, plus the capacity accounting it drives.
+
+The pools are laid out **per rank**: each rank sizes its two families from its own head counts (the
+query heads shard, and the global family's KV heads shard or replicate), so a page holds
+`local_kv_heads × head_dim` columns of K and V rather than the whole model's. Page *counts* stay
+identical across ranks, which is what keeps the page ids in step; the rest of the KV contract is
+unchanged.
 
 The qwen3 sharding policy — refuse a world size that does not divide `num_key_value_heads`, shard
 by integer division — cannot be reused: the full-attention group has fewer KV heads than a
