@@ -143,25 +143,50 @@ impl Qwen35Model {
             eps,
         );
 
-        ops::paged_attention_batch_decode_hd256_into(
-            &self.ctx,
-            &bufs.q_attn,
-            &bufs.k_attn,
-            &bufs.v_attn,
-            kv_buffer,
-            layout,
-            layer_idx,
-            &bufs.page_indices_d,
-            &bufs.page_indptr_d,
-            &bufs.last_page_len_d,
-            &bufs.positions_d,
-            &bufs.request_indices_d,
-            &bufs.kv_tile_indices_d,
-            &bufs.kv_chunk_size_d,
-            &mut bufs.attn_out_full,
-            num_attention_heads,
-            bs,
-        )?;
+        if bs <= super::decode_buffers::SPLIT_DECODE_MAX_BATCH {
+            ops::paged_attention_batch_decode_split_hd256_into(
+                &self.ctx,
+                &bufs.q_attn,
+                &bufs.k_attn,
+                &bufs.v_attn,
+                kv_buffer,
+                layout,
+                layer_idx,
+                &bufs.page_indices_d,
+                &bufs.page_indptr_d,
+                &bufs.last_page_len_d,
+                &bufs.positions_d,
+                &bufs.request_indices_d,
+                &bufs.kv_chunk_size_d,
+                &mut bufs.split_partial_o,
+                &mut bufs.split_partial_m,
+                &mut bufs.split_partial_l,
+                &mut bufs.attn_out_full,
+                num_attention_heads,
+                bs,
+                super::decode_buffers::split_decode_splits(bs),
+            )?;
+        } else {
+            ops::paged_attention_batch_decode_hd256_into(
+                &self.ctx,
+                &bufs.q_attn,
+                &bufs.k_attn,
+                &bufs.v_attn,
+                kv_buffer,
+                layout,
+                layer_idx,
+                &bufs.page_indices_d,
+                &bufs.page_indptr_d,
+                &bufs.last_page_len_d,
+                &bufs.positions_d,
+                &bufs.request_indices_d,
+                &bufs.kv_tile_indices_d,
+                &bufs.kv_chunk_size_d,
+                &mut bufs.attn_out_full,
+                num_attention_heads,
+                bs,
+            )?;
+        }
 
         unsafe {
             let (qf_ptr, _gqf) = bufs.q_full.data.device_ptr(&self.ctx.stream);
@@ -823,15 +848,18 @@ impl Qwen35Model {
         bufs: &mut BatchDecodeBuffers35,
     ) -> Result<()> {
         let geom = self.geometry;
+        let qkv_dim = geom.local_linear_qkv_dim();
+        let z_dim = geom.local_linear_z_dim();
+        let value_heads = geom.local_linear_num_value_heads();
 
-        ops::gemm_into(&self.ctx, &attn.in_proj_qkv, &bufs.normed, &mut bufs.qkv);
-        ops::gemm_into(&self.ctx, &attn.in_proj_z, &bufs.normed, &mut bufs.z);
-        ops::gemm_into(&self.ctx, &attn.in_proj_b, &bufs.normed, &mut bufs.b_proj);
-        ops::gemm_into(&self.ctx, &attn.in_proj_a, &bufs.normed, &mut bufs.a_proj);
+        // One GEMM per fused group, then each consumer reads its own band. The
+        // row order is the one the loader stacked the weights in.
+        ops::gemm_into(&self.ctx, &attn.in_proj_qkvz, &bufs.normed, &mut bufs.qkvz);
+        ops::gemm_into(&self.ctx, &attn.in_proj_ba, &bufs.normed, &mut bufs.ba);
 
         ops::conv1d_decode_batch_into(
             &self.ctx,
-            &bufs.qkv,
+            bufs.qkvz.columns(0, qkv_dim),
             &attn.conv1d_weight,
             conv_state_ptrs,
             &mut bufs.qkv_conv,
@@ -840,15 +868,15 @@ impl Qwen35Model {
         ops::gated_delta_rule_decode_batch_into(
             &self.ctx,
             &bufs.qkv_conv,
-            &bufs.b_proj,
-            &bufs.a_proj,
+            bufs.ba.columns(0, value_heads),
+            bufs.ba.columns(value_heads, value_heads),
             &attn.dt_bias,
             &attn.a_log,
             state_ptrs,
             &mut bufs.gdr_out,
             padded_bs,
             geom.local_linear_num_key_heads(),
-            geom.local_linear_num_value_heads(),
+            value_heads,
             self.config.linear_key_head_dim,
             self.config.linear_value_head_dim,
         );
@@ -857,9 +885,9 @@ impl Qwen35Model {
             &self.ctx,
             &bufs.gdr_out,
             &attn.norm_weight,
-            &bufs.z,
+            bufs.qkvz.columns(qkv_dim, z_dim),
             &mut bufs.normed_gated,
-            geom.local_linear_num_value_heads(),
+            value_heads,
             self.config.linear_value_head_dim,
             self.config.rms_norm_eps,
         );
