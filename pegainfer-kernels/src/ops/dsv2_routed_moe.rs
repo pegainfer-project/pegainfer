@@ -15,7 +15,8 @@ use crate::tensor::HiddenStates;
 use crate::tensor::HiddenStatesRef;
 
 const ROUTES_PER_TOKEN: usize = 6;
-const LOCAL_EXPERTS: usize = 32;
+const ROUTED_EXPERTS: usize = 64;
+const LOCAL_EXPERTS: usize = ROUTED_EXPERTS / 2;
 pub const DSV2_ROUTED_MOE_MAX_ROWS: usize = 8;
 
 pub struct Dsv2ExpertPointerTable {
@@ -118,7 +119,7 @@ impl Dsv2RoutedMoeScratch {
             capacity,
             hidden_dim,
             intermediate,
-            logits: ctx.stream.alloc_zeros(capacity * 64)?,
+            logits: ctx.stream.alloc_zeros(capacity * ROUTED_EXPERTS)?,
             ids: ctx.stream.alloc_zeros(routes)?,
             weights: ctx.stream.alloc_zeros(routes)?,
             errors: ctx.stream.alloc_zeros(capacity)?,
@@ -150,7 +151,6 @@ impl Dsv2RoutedMoeScratch {
     pub fn finish_forward(&self, ctx: &DeviceContext) -> Result<Dsv2RouteSummary> {
         let summary = ctx.stream.clone_dtoh(&self.summary)?;
         ctx.sync()?;
-        ensure!(summary.len() > 3, "routed MoE summary shape drift");
         Ok(Dsv2RouteSummary {
             local_routes: usize::try_from(summary[0]).context("local route count overflow")?,
             total_routes: usize::try_from(summary[1]).context("total route count overflow")?,
@@ -175,18 +175,13 @@ impl Dsv2RoutedMoeScratch {
             self.capacity
         );
         ensure!(
-            layer_idx < self.summary.len() - 3,
-            "routed MoE layer {layer_idx} exceeds summary capacity {}",
-            self.summary.len() - 3
-        );
-        ensure!(
             hidden.hidden_dim == self.hidden_dim
                 && experts.hidden_dim == self.hidden_dim
                 && experts.intermediate == self.intermediate,
             "routed MoE hidden or expert shape mismatch"
         );
         ensure!(
-            gate_weight.rows == 64 && gate_weight.cols == self.hidden_dim,
+            gate_weight.rows == ROUTED_EXPERTS && gate_weight.cols == self.hidden_dim,
             "routed MoE gate shape mismatch"
         );
         ensure!(
@@ -320,7 +315,7 @@ pub fn dsv2_lite_route_logits_into(
         "routed MoE layer exceeds summary capacity"
     );
     ensure!(
-        logits.len() >= batch * 64
+        logits.len() >= batch * ROUTED_EXPERTS
             && output.topk_idx.len() >= batch * ROUTES_PER_TOKEN
             && output.topk_weight.len() >= batch * ROUTES_PER_TOKEN
             && errors.len() >= batch,

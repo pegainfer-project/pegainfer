@@ -339,7 +339,7 @@ CUresult dsv2_lite_route_pointers_cuda(
       batch < 1 || batch > kMaxRows ||
       (first_expert != 0 && first_expert != kLocalExperts) || hidden_dim <= 0 || intermediate <= 0)
     return CUDA_ERROR_INVALID_VALUE;
-  route_pointers_kernel<<<1, kMaxExperts, 0, stream>>>(
+  route_pointers_kernel<<<1, kMaxRows * kRoutesPerToken, 0, stream>>>(
       ids, hidden, zero, w13, w2, gate, act, rows, a13, x13, y13, a2, x2, y2,
       summary, batch * kRoutesPerToken, first_expert, hidden_dim, intermediate);
   return map_cuda_error(cudaPeekAtLastError());
