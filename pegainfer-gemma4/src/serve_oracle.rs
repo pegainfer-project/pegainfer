@@ -31,15 +31,21 @@ fn stack_with_storage(
     storage: KvStorage,
 ) -> (DeviceContext, GemmaServe, String) {
     let dir = model_path();
-    let config = Gemma4Config::from_file(&dir).expect("config");
-    let weights =
-        Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
+    let config = crate::config::Gemma4Config::from_file(&dir).expect("config");
+    let weights = Gemma4Weights::from_safetensors(
+        &dir,
+        0,
+        config,
+        crate::config::TensorParallelConfig::SINGLE,
+    )
+    .expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
     // The oracle measures the incumbent kernel; the opt-in one has its own
     // gate.
     let serve = GemmaServe::new(
         &ctx,
         weights,
+        crate::config::TensorParallelConfig::SINGLE,
         max_context,
         storage,
         pages,
@@ -1208,7 +1214,7 @@ fn mixed_gate_decode_rounds(
         }
         let tokens = gate_step_tokens(serve, lanes);
         let (vocab, host) = {
-            let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+            let mut kvs: Vec<&mut RankKv> = lanes.iter_mut().map(|(_, kv, _)| &mut **kv).collect();
             let logits = serve
                 .decode_batch_step(ctx, arena, &mut kvs, &tokens)
                 .expect("batched decode");
@@ -1272,10 +1278,10 @@ fn assert_mixed_admissions_match_serial(ctx: &DeviceContext, serve: &GemmaServe)
         let mut kv_c = gate_admit_kv(serve, &prompts[2], "prompt c");
         let tokens = gate_step_tokens(serve, &mut lanes);
         let (vocab, host) = {
-            let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+            let mut kvs: Vec<&mut RankKv> = lanes.iter_mut().map(|(_, kv, _)| &mut **kv).collect();
             let mut prefills = [
-                (&mut kv_b, prompts[1].as_slice()),
-                (&mut kv_c, prompts[2].as_slice()),
+                (&mut *kv_b, prompts[1].as_slice()),
+                (&mut *kv_c, prompts[2].as_slice()),
             ];
             let logits = serve
                 .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
@@ -1363,8 +1369,9 @@ fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &Gemm
             // window inside the mixed step.
             let tokens = gate_step_tokens(serve, &mut lanes);
             let (vocab, host) = {
-                let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
-                let mut prefills = [(&mut kv, long_prompt.as_slice())];
+                let mut kvs: Vec<&mut RankKv> =
+                    lanes.iter_mut().map(|(_, kv, _)| &mut **kv).collect();
+                let mut prefills = [(&mut *kv, long_prompt.as_slice())];
                 let logits = serve
                     .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
                     .expect("mixed step");
@@ -1487,10 +1494,10 @@ fn fp8_plain_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
     let mut kv_c = gate_admit_kv(serve, &prompts[2], "prompt c");
     let tokens = gate_step_tokens(serve, &mut lanes);
     let (vocab, host) = {
-        let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
+        let mut kvs: Vec<&mut RankKv> = lanes.iter_mut().map(|(_, kv, _)| &mut **kv).collect();
         let mut prefills = [
-            (&mut kv_b, prompts[1].as_slice()),
-            (&mut kv_c, prompts[2].as_slice()),
+            (&mut *kv_b, prompts[1].as_slice()),
+            (&mut *kv_c, prompts[2].as_slice()),
         ];
         let logits = serve
             .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
@@ -1556,8 +1563,8 @@ fn fp8_window_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
     let mut kv_long = gate_admit_kv(serve, &long_prompt, "long prompt");
     let tokens = gate_step_tokens(serve, &mut lanes);
     let (vocab, host) = {
-        let mut kvs: Vec<&mut GemmaKv> = lanes.iter_mut().map(|(_, kv, _)| kv).collect();
-        let mut prefills = [(&mut kv_long, long_prompt.as_slice())];
+        let mut kvs: Vec<&mut RankKv> = lanes.iter_mut().map(|(_, kv, _)| &mut **kv).collect();
+        let mut prefills = [(&mut *kv_long, long_prompt.as_slice())];
         let logits = serve
             .mixed_prefill_decode_step(ctx, &mut arena, &mut prefills, &mut kvs, &tokens)
             .expect("window-crossing mixed step");
@@ -1855,7 +1862,7 @@ fn decode_serving(
     token: u32,
 ) -> Result<Vec<f32>> {
     admit_tokens(&serve.local_pool, &serve.global_pool, kv, 1)?;
-    let mut borrowed: [&mut GemmaKv; 1] = [kv];
+    let mut borrowed: [&mut RankKv; 1] = [&mut **kv];
     let logits = serve.decode_batch_step(ctx, arena, &mut borrowed, &[token])?;
     logits.to_host(ctx)
 }
@@ -1965,7 +1972,8 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
             for kv in &mut kvs {
                 admit_tokens(&serve.local_pool, &serve.global_pool, kv, 1).expect("admit token");
             }
-            let mut slots: Vec<Option<&mut GemmaKv>> = kvs.iter_mut().map(Some).collect();
+            let mut slots: Vec<Option<&mut RankKv>> =
+                kvs.iter_mut().map(|kv| Some(&mut **kv)).collect();
             let mut borrowed = Vec::with_capacity(order.len());
             let mut tokens = Vec::with_capacity(order.len());
             for &request in order {
