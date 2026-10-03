@@ -47,6 +47,7 @@ use pegainfer_kernels::ops::extract_hidden_rows_raw_into;
 use pegainfer_kernels::ops::k3_add2_batched_launch;
 use pegainfer_kernels::ops::k3_attnres_mix_batched_launch;
 use pegainfer_kernels::ops::k3_attnres_scores_batched_launch;
+use pegainfer_kernels::ops::k3_capsule_router_topk_launch;
 use pegainfer_kernels::ops::k3_deepgemm_sm100_masked_grouped_fp8_fp4_launch;
 use pegainfer_kernels::ops::k3_fp8_scale_pack_ue8m0_launch;
 use pegainfer_kernels::ops::k3_land_batched_launch;
@@ -73,7 +74,9 @@ use super::super::cp::K3CpScratch;
 use super::super::paged_kv::K3_KV_PAGE_TOKENS;
 use super::super::paged_kv::K3_MLA_LATENT_ROW;
 use super::super::paged_kv::K3PagedKv;
+use super::capsule::capsule_flags;
 use super::decode::kda_attention;
+use super::decode::kda_attention_capsule;
 use super::gemm::k3_gemm_full;
 use super::prefill::kda_attention_chunk;
 use super::prefill::mla_attention_chunk_cp;
@@ -276,6 +279,24 @@ pub(super) fn k3_step(
 
         match (&layer.attn, layer_state) {
             (K3LayerAttention::Kda(kda), K3LayerState::Kda(kda_state)) => match mode {
+                K3StepMode::Decode if capsule_flags().kda => {
+                    // The capsule kernel shifts the packed conv slab and
+                    // updates the recurrent state in place; parity slab 0 is
+                    // the fixed home (`adopt_row` lands there in this mode).
+                    let conv_packed = kda_state
+                        .conv_packed
+                        .as_mut()
+                        .expect("capsule mode allocates the packed conv slab");
+                    kda_attention_capsule(
+                        ctx,
+                        b,
+                        layer,
+                        kda,
+                        &mut kda_state.recurrent[0],
+                        conv_packed,
+                        scratch,
+                    )?;
+                }
                 K3StepMode::Decode => {
                     let (recurrent_read, recurrent_write) =
                         parity_pair(&mut kda_state.recurrent, shape.parity);
@@ -700,17 +721,31 @@ fn moe_mlp(
     )?;
     // Routing reads the pre-down hidden, as in the reference.
     k3_gemm_full(ctx, &w.w_router, &s.normed, b, &mut s.router_partial)?;
-    k3_router_topk_batched_launch(
-        ctx,
-        b,
-        experts,
-        K3_ROUTER_TOPK,
-        &s.router_partial,
-        &w.bias,
-        &w.rs.data,
-        &mut s.topk_idx,
-        &mut s.topk_weight,
-    )?;
+    if capsule_flags().topk {
+        k3_capsule_router_topk_launch(
+            ctx,
+            b,
+            experts,
+            K3_ROUTER_TOPK,
+            &s.router_partial,
+            &w.bias,
+            w.rs_host,
+            &mut s.topk_idx,
+            &mut s.topk_weight,
+        )?;
+    } else {
+        k3_router_topk_batched_launch(
+            ctx,
+            b,
+            experts,
+            K3_ROUTER_TOPK,
+            &s.router_partial,
+            &w.bias,
+            &w.rs.data,
+            &mut s.topk_idx,
+            &mut s.topk_weight,
+        )?;
+    }
     k3_gemm_full(ctx, &w.w_lat_down, &s.normed, b, &mut s.latent_partial)?;
     k3_land_batched_launch(
         ctx,

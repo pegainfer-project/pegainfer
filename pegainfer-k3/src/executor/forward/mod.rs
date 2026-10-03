@@ -37,6 +37,7 @@
 //!   drafts). Full epilogue; the caller reads the span argmaxes back and
 //!   decides acceptance.
 
+pub(crate) mod capsule;
 mod decode;
 mod gemm;
 mod prefill;
