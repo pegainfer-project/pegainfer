@@ -1,9 +1,11 @@
-//! Device gate for csrc/shared/prefill_attention_hd512.cu.
+//! Device gate for csrc/gemma4/prefill_attention_hd512.cu.
 //!
 //! Manual gate: CI compiles this but never runs it. Run on a GPU box with
 //! PEGAINFER_REQUIRE_GPU=1, which turns a missing device into a failure
 //! rather than a skip. Traps are in their own binaries — __trap() poisons
 //! the context for whatever runs next.
+
+#![cfg(feature = "gemma4")]
 
 mod common;
 
@@ -11,7 +13,6 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_kernels::ops::Hd512DecodeMetadata;
 use pegainfer_kernels::ops::paged_attention_batch_decode_split_kv_hd512_into;
-use pegainfer_kernels::ops::qk_norm_partial_rope_batched_decode_hd512_into;
 use pegainfer_kernels::ops::qk_norm_partial_rope_paged_decode_hd512_into;
 use pegainfer_kernels::ops::qk_norm_partial_rope_paged_prefill_hd512_into;
 use pegainfer_kernels::paged_kv::KvFormat;
@@ -38,8 +39,6 @@ const PAGE_SIZE: usize = 2;
 const START_POS: usize = 1;
 // Positions 1..=4 map to pages 3, 7, 7, 5; page 9 is unreferenced.
 const PAGE_INDICES: [i32; 4] = [3, 7, 5, 9];
-// Non-monotonic rows distinguish request positions from token indices.
-const POSITIONS: [i32; 4] = [0, 1, 3, 1];
 // Two layers make a wrong K-layer offset observable.
 const NUM_LAYERS: usize = 2;
 const PAGE_STRIDE: i64 = 8 * HD as i64;
@@ -382,52 +381,6 @@ fn prefill_prep_folded_row_matches_closed_form() {
     let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
     let pool_f: Vec<f32> = pool_host.iter().map(|x| x.to_f32()).collect();
     assert_pool(&pool_f, &pool_exp);
-}
-
-#[test]
-fn rejects_bad_rotary_dim() {
-    let Some(ctx) = common::device_or_skip() else {
-        return;
-    };
-    let ctx = &ctx;
-    // Zeroed buffers suffice: the launcher must reject before touching any
-    // device memory. Tables are sized for the worst case checked here
-    // (8 x 1024), so the wrapper's table checks pass and both values
-    // actually reach the launcher.
-    let q = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("q alloc");
-    let mut q_out = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("q_out alloc");
-    let mut k_mut = HiddenStates::zeros(ctx, KV_DIM, SEQ_LEN).expect("k_mut alloc");
-    let cos_dev = DeviceVec::zeros(ctx, 8 * 1024).expect("cos alloc");
-    let sin_dev = DeviceVec::zeros(ctx, 8 * 1024).expect("sin alloc");
-    let qn = DeviceVec::zeros(ctx, HD).expect("qn alloc");
-    let kn = DeviceVec::zeros(ctx, HD).expect("kn alloc");
-    let positions: CudaSlice<i32> = ctx.stream.clone_htod(&POSITIONS).expect("positions H2D");
-
-    // 127: odd — index 126 would never be written. 1024: wider than the
-    // head — smem and the output slices would walk past 512. Both must be
-    // rejected, not silently accepted.
-    for bad in [127, 1024] {
-        let decode_err = qk_norm_partial_rope_batched_decode_hd512_into(
-            ctx,
-            &q,
-            &mut q_out,
-            &mut k_mut,
-            &qn,
-            &kn,
-            &cos_dev,
-            &sin_dev,
-            &positions,
-            8, // cos_max_pos
-            NUM_Q_HEADS,
-            NUM_KV_HEADS,
-            bad,
-            EPS,
-        );
-        assert!(
-            decode_err.is_err(),
-            "decode: rotary_dim={bad} must be rejected"
-        );
-    }
 }
 
 #[test]

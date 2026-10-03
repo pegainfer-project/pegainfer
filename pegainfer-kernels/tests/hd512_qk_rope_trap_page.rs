@@ -1,7 +1,10 @@
-//! The hd512 paged-KV page-id trap. One trap per binary, for the reason
-//! given in hd512_qk_rope_trap.rs.
+//! The hd512 paged-KV page-id trap. One trap per binary: `__trap()` leaves
+//! the context in a sticky error state, so anything sharing the process
+//! afterwards would fail for the wrong reason.
 //!
 //! Manual gate — CI compiles this but never runs it.
+
+#![cfg(feature = "gemma4")]
 
 mod common;
 

@@ -22,6 +22,8 @@ mod embedding;
 #[cfg(feature = "gemma4")]
 mod gemma4;
 #[cfg(feature = "gemma4")]
+mod gemma4_attention;
+#[cfg(feature = "gemma4")]
 mod gemma4_tilelang;
 #[cfg(feature = "gemma4")]
 mod gemma4_w4a16;
@@ -38,33 +40,19 @@ mod lora;
 #[cfg(any(feature = "gemma4", feature = "kimi-k2"))]
 mod marlin_face;
 mod norm;
+#[cfg(feature = "qwen35")]
+mod qwen35;
 mod sampling;
 
-pub use attention::Hd512DecodeMetadata;
 pub use attention::PrefillPagedPlan;
 pub use attention::SUPPORTED_GQA_GROUP_SIZES;
-pub use attention::batch_prefill_paged_hd512_into;
-pub use attention::batch_prefill_paged_window_hd256_into;
 pub use attention::dflash_qk_norm_rope_into;
 pub use attention::eagle3_rope_into;
-pub use attention::paged_attention_batch_decode_hd256_into;
 pub use attention::paged_attention_batch_decode_into;
-pub use attention::paged_attention_batch_decode_split_kv_hd512_into;
 pub use attention::paged_attention_batch_decode_split_kv_into;
-pub use attention::paged_attention_batch_decode_via_prefill_hd256_into;
-pub use attention::paged_attention_batch_decode_via_prefill_hd512_into;
 pub use attention::prefill_attention_paged_into;
-pub use attention::qk_norm_partial_rope_batched_decode_hd256_into;
-pub use attention::qk_norm_partial_rope_batched_decode_hd512_into;
-pub use attention::qk_norm_partial_rope_paged_decode_hd512_into;
-pub use attention::qk_norm_partial_rope_paged_prefill_hd512_into;
 pub use attention::qk_norm_rope_batch_decode_into;
-pub use attention::qk_norm_rope_prefill_hd256_plain_into;
-pub use attention::qkv_norm_rope_paged_decode_hd256_plain_into;
-pub use attention::qkv_norm_rope_paged_prefill_hd256_plain_into;
 pub use attention::single_decode_nhd_into;
-pub use attention::single_prefill_hd256_into;
-pub use attention::single_prefill_hd512_into;
 pub use attention::single_prefill_nhd_causal_into;
 pub use attention::single_prefill_nhd_noncausal_into;
 #[cfg(feature = "moe")]
@@ -140,6 +128,22 @@ pub use embedding::embedding_decode_into;
 pub use embedding::embedding_rows_into;
 #[cfg(feature = "gemma4")]
 pub use gemma4::*;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::Hd512DecodeMetadata;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::batch_prefill_paged_hd512_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::batch_prefill_paged_window_hd256_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::paged_attention_batch_decode_split_kv_hd512_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::qk_norm_partial_rope_paged_decode_hd512_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::qk_norm_partial_rope_paged_prefill_hd512_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::qkv_norm_rope_paged_decode_hd256_plain_into;
+#[cfg(feature = "gemma4")]
+pub use gemma4_attention::qkv_norm_rope_paged_prefill_hd256_plain_into;
 #[cfg(feature = "gemma4")]
 pub use gemma4_tilelang::GlobalDecodeAttend;
 #[cfg(feature = "gemma4")]
@@ -223,6 +227,12 @@ pub use norm::rms_norm_gated_batch_into;
 pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::paged_attention_batch_decode_hd256_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::paged_attention_batch_decode_via_prefill_hd256_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::qk_norm_partial_rope_batched_decode_hd256_into;
 pub use sampling::BatchSamplingRow;
 pub use sampling::BatchSamplingScratch;
 pub use sampling::argmax;

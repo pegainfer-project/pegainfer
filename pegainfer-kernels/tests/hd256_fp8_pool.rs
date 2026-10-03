@@ -8,7 +8,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_kernels::ops::PrefillPagedPlan;
 use pegainfer_kernels::ops::batch_prefill_paged_window_hd256_into;
-use pegainfer_kernels::ops::paged_attention_batch_decode_hd256_into;
+use pegainfer_kernels::ops::paged_attention_batch_decode_into;
 use pegainfer_kernels::ops::qkv_norm_rope_paged_decode_hd256_plain_into;
 use pegainfer_kernels::ops::qkv_norm_rope_paged_prefill_hd256_plain_into;
 use pegainfer_kernels::paged_kv::KvStorage;
@@ -349,7 +349,7 @@ fn decode_wrapper_without_fp8_twin_refuses_e4m3() {
     let mut output = HiddenStates::zeros(&ctx, HD, 1).expect("output");
     let meta = ctx.stream.clone_htod(&[0i32]).expect("metadata");
     let indptr = ctx.stream.clone_htod(&[0i32, 1]).expect("indptr");
-    let err = paged_attention_batch_decode_hd256_into(
+    let err = paged_attention_batch_decode_into(
         &ctx,
         &state,
         &state,

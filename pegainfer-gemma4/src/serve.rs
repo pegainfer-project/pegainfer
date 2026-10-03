@@ -695,7 +695,7 @@ struct SplitKvSpec {
 }
 
 struct SplitKvLaunch<'a> {
-    metadata: ops::Hd512DecodeMetadata<'a>,
+    metadata: pegainfer_kernels::ops::Hd512DecodeMetadata<'a>,
     o_indptr_d: &'a CudaSlice<i32>,
     valid_mask_d: &'a CudaSlice<u8>,
     tmp_v: &'a mut CudaSlice<bf16>,
@@ -754,7 +754,7 @@ impl SplitKvState {
         last_page_len: &'a CudaSlice<i32>,
     ) -> SplitKvLaunch<'a> {
         SplitKvLaunch {
-            metadata: ops::Hd512DecodeMetadata::new(
+            metadata: pegainfer_kernels::ops::Hd512DecodeMetadata::new(
                 page_indices,
                 page_indptr,
                 last_page_len,
@@ -905,7 +905,7 @@ impl GemmaServe {
         if self.tilelang_global_attn {
             pegainfer_kernels::ops::gemma4_hd512_decode_split_kv_into
         } else {
-            ops::paged_attention_batch_decode_split_kv_hd512_into
+            pegainfer_kernels::ops::paged_attention_batch_decode_split_kv_hd512_into
         }
     }
 }
@@ -1130,7 +1130,7 @@ impl GemmaServe {
         let attend = if self.tilelang_global_attn {
             pegainfer_kernels::ops::gemma4_hd512_prefill_varlen_into
         } else {
-            ops::batch_prefill_paged_hd512_into
+            pegainfer_kernels::ops::batch_prefill_paged_hd512_into
         };
         attend(
             ctx,
@@ -1587,7 +1587,7 @@ impl GemmaServe {
                 local_page_origin,
                 ..
             } => {
-                ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
+                pegainfer_kernels::ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
                     ctx,
                     projected.q,
                     projected.k,
@@ -1616,7 +1616,7 @@ impl GemmaServe {
                 local_origins,
                 global_tables,
             } => {
-                ops::qkv_norm_rope_paged_decode_hd256_plain_into(
+                pegainfer_kernels::ops::qkv_norm_rope_paged_decode_hd256_plain_into(
                     ctx,
                     projected.q,
                     projected.k,
@@ -1681,7 +1681,7 @@ impl GemmaServe {
             } => {
                 // One per-token launch covers every row — each row writes
                 // its position's slot in its own one-page window.
-                ops::qkv_norm_rope_paged_decode_hd256_plain_into(
+                pegainfer_kernels::ops::qkv_norm_rope_paged_decode_hd256_plain_into(
                     ctx,
                     projected.q,
                     projected.k,
@@ -1727,7 +1727,7 @@ impl GemmaServe {
                     window_left,
                 )?;
             } else {
-                ops::batch_prefill_paged_window_hd256_into(
+                pegainfer_kernels::ops::batch_prefill_paged_window_hd256_into(
                     ctx,
                     &scratch.q_prep,
                     self.local_pool.buffer(),
@@ -1795,7 +1795,7 @@ impl GemmaServe {
                 global_plan,
                 ..
             } => {
-                ops::qk_norm_partial_rope_paged_prefill_hd512_into(
+                pegainfer_kernels::ops::qk_norm_partial_rope_paged_prefill_hd512_into(
                     ctx,
                     projected.q,
                     projected.k,
@@ -1827,7 +1827,7 @@ impl GemmaServe {
             }
             PrepRef::Batched { global_tables, .. } => {
                 let split = split.context("batched global decode needs the split-KV state")?;
-                ops::qk_norm_partial_rope_paged_decode_hd512_into(
+                pegainfer_kernels::ops::qk_norm_partial_rope_paged_decode_hd512_into(
                     ctx,
                     projected.q,
                     projected.k,
@@ -1897,7 +1897,7 @@ impl GemmaServe {
                 let split = split.context("mixed global decode needs the split-KV state")?;
                 // One per-token launch covers every row — each row writes
                 // its position's slot in its own one-page window.
-                ops::qk_norm_partial_rope_paged_decode_hd512_into(
+                pegainfer_kernels::ops::qk_norm_partial_rope_paged_decode_hd512_into(
                     ctx,
                     projected.q,
                     projected.k,

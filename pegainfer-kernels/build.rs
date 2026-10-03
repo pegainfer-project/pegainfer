@@ -304,7 +304,12 @@ fn nvcc_job_count() -> usize {
 fn nvcc_task_priority(cu_file: &Path) -> usize {
     match cu_file.file_stem().and_then(|stem| stem.to_str()) {
         Some("paged_attention") => 0,
-        Some("paged_attention_hd512" | "flashinfer_sampling") => 1,
+        Some(
+            "paged_attention_hd512"
+            | "paged_attention_hd256"
+            | "paged_attention_window_hd256"
+            | "flashinfer_sampling",
+        ) => 1,
         Some("flashinfer_top1") => 2,
         Some("flashinfer_norm") => 3,
         _ => 10,
@@ -748,6 +753,17 @@ fn is_gemma4_source(csrc_dir: &Path, path: &Path) -> bool {
         Ok(relative) => relative
             .components()
             .any(|part| part.as_os_str() == "gemma4"),
+        Err(_) => false,
+    }
+}
+
+/// Qwen3.5 model-local CUDA: the linear-attention recurrence and the
+/// head_dim 256 full-attention path.
+fn is_qwen35_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "qwen35"),
         Err(_) => false,
     }
 }
@@ -2262,6 +2278,9 @@ fn main() {
             if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
                 return None;
             }
+            if !qwen35_enabled && is_qwen35_source(&csrc_dir, path) {
+                return None;
+            }
             // --- k3 ---
             if !k3_enabled && is_k3_source(&csrc_dir, path) {
                 return None;
@@ -2459,6 +2478,8 @@ fn main() {
         // Files that include FlashInfer headers (C++17, header-only)
         if stem == "paged_attention"
             || stem == "paged_attention_hd512"
+            || stem == "paged_attention_hd256"
+            || stem == "paged_attention_window_hd256"
             || stem == "flashinfer_norm"
             || stem == "flashinfer_sampling"
             || stem == "flashinfer_top1"

@@ -1,13 +1,60 @@
-#[cfg(feature = "qwen35")]
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
 
 use super::Half;
 
-// Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
-// Sources: csrc/qwen35/*.cu. The paged HD256 attention entry points are shared
-// with Gemma 4 and are declared in `shared.rs`.
+// Qwen3.5 private kernels (hybrid linear + HD256 full attention).
+// Sources: csrc/qwen35/*.cu.
 unsafe extern "C" {
+    pub fn paged_attention_decode_cuda_hd256(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn batch_prefill_paged_cuda_hd256(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        q_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        seq_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
     // Qwen3.5 full-attention prefill prep that writes K/V directly into paged KV.
     pub fn prefill_attention_hd256_prep_paged_cuda(
         q_full_batch: *const Half,
@@ -115,10 +162,7 @@ unsafe extern "C" {
     );
 }
 
-// Chunk-wise GDR prefill kernels, Triton AOT-generated at build time. The
-// `qwen35` feature is what pulls Python + Triton into the build; without it
-// these symbols don't exist.
-#[cfg(feature = "qwen35")]
+// Chunk-wise GDR prefill kernels, Triton AOT-generated at build time.
 unsafe extern "C" {
     pub fn gated_delta_rule_prefill_chunk_prepare_cuda(
         qkv: *const Half,
