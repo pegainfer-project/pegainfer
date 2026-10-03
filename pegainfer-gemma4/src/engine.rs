@@ -2842,6 +2842,18 @@ impl EngineState {
         ledger: &mut RequestLedger,
     ) -> Result<()> {
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
+        activate_rank(&self.ctx)?;
+        // Rank 0's verdict is held rather than propagated: the extra ranks have
+        // to be driven either way (see `step_extra_ranks`).
+        let rank0 = {
+            let mut kvs = rank_kvs(active, 0);
+            self.serve
+                .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, &tokens)
+                .map(|_| ())
+        };
+        // The other ranks carry the same tokens and page ids; only rank 0
+        // samples. A failure on them is fatal — the ranks' frontiers must not
+        // drift apart.
         for (rank, state) in self.more.iter_mut().enumerate() {
             activate_rank(&state.ctx)?;
             let mut kvs = rank_kvs(active, rank + 1);
@@ -2849,21 +2861,13 @@ impl EngineState {
                 .serve
                 .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, &tokens)?;
         }
-        let logits = {
-            activate_rank(&self.ctx)?;
-            let mut kvs = rank_kvs(active, 0);
-            match self
-                .serve
-                .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, &tokens)
-            {
-                Ok(logits) => logits,
-                Err(err) => {
-                    self.fence()?;
-                    fail_active_batch(active, "batched decode", &err, ledger);
-                    return Err(err.context("batched decode"));
-                }
-            }
-        };
+        activate_rank(&self.ctx)?;
+        if let Err(err) = rank0 {
+            self.fence()?;
+            fail_active_batch(active, "batched decode", &err, ledger);
+            return Err(err.context("batched decode"));
+        }
+        let (logits, _) = self.arena.logits_and_ids();
         let sampled = {
             let rows: Vec<SampleRow<'_>> = active
                 .iter()
