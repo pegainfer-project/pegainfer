@@ -237,6 +237,9 @@ fn tensor_bytes<'a>(shards: &'a [SafeTensors<'a>], name: &str) -> Result<&'a [u8
 
 /// Upload every layer's W4A16 linears in the GEMMs' layout: one entry per
 /// layer, empty on a bf16 checkpoint.
+///
+/// Reached only at world size 1: `validate_for` refuses a W4A16 checkpoint under
+/// tensor parallelism precisely because these linears are staged whole.
 fn upload_w4a16(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -352,6 +355,9 @@ struct StackedExperts {
 
 /// Upload every routed layer's experts. Returns one entry per layer, empty on
 /// the sizes that do not route.
+///
+/// Reached only at world size 1: a routed checkpoint is refused under tensor
+/// parallelism, which shards neither the experts nor these whole-tensor tiles.
 fn upload_experts(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -619,6 +625,7 @@ fn materialize(
     loader: &mut StagedWeightLoader,
     plan: RecordedPlan,
     config: Gemma4Config,
+    tp: TensorParallelConfig,
     experts: Vec<Option<StackedExperts>>,
     w4a16: Vec<Option<W4a16Linears>>,
 ) -> Result<Gemma4Weights> {
@@ -698,6 +705,7 @@ fn materialize(
             })
             .collect::<Result<Vec<_>>>()?,
         config,
+        tp,
     })
 }
 
@@ -753,7 +761,7 @@ impl Gemma4Weights {
 
         let experts = upload_experts(&ctx, &shards, &manifest)?;
         let w4a16 = upload_w4a16(&ctx, &shards, &manifest)?;
-        let weights = materialize(&mut loader, plan, config, experts, w4a16)?;
+        let weights = materialize(&mut loader, plan, config, tp, experts, w4a16)?;
         drop(loader);
         drop(prefetch);
         let device_free_bytes = free_device_bytes()?;

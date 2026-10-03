@@ -31,7 +31,6 @@ use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
 use crate::config::LayerKind;
-use crate::config::TensorParallelConfig;
 use crate::forward::embed_scale_bf16;
 use crate::forward::logits_tail;
 use crate::forward::logits_tail_into;
@@ -1076,7 +1075,6 @@ impl GemmaServe {
     pub(crate) fn new(
         ctx: &DeviceContext,
         weights: Gemma4Weights,
-        tp: TensorParallelConfig,
         max_context: usize,
         local_kv_storage: KvStorage,
         local_pages: usize,
@@ -1085,6 +1083,9 @@ impl GemmaServe {
     ) -> Result<Self> {
         // One source of truth for geometry, rope tables and layer numbering.
         let config = &weights.config;
+        // The weights carry the shard they were cut as, so the geometry and the
+        // pools sized below cannot belong to a different rank than they hold.
+        let tp = weights.tp;
         let device_ordinal = ctx.device_ordinal;
         // One tensor answers for the set: the loader materializes every
         // weight through a single context.

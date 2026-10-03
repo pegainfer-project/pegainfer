@@ -45,7 +45,6 @@ fn stack_with_storage(
     let serve = GemmaServe::new(
         &ctx,
         weights,
-        crate::config::TensorParallelConfig::SINGLE,
         max_context,
         storage,
         pages,

@@ -269,7 +269,8 @@ impl GemmaKv {
     }
 
     /// One `RankKv` per rank: `core` is rank 0's, `twins` the rest. Every rank
-    /// carries the same request id.
+    /// carries the same request id. The caller hands in exactly one twin per
+    /// extra rank, in rank order — the same world the geometry was built for.
     pub(crate) fn multi(mut core: RankKv, mut twins: Vec<RankKv>) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -280,12 +281,20 @@ impl GemmaKv {
         Self { core, twins }
     }
 
-    /// The family pair `rank` owns, for reading (0 is `core`).
+    /// The family pair `rank` owns, for reading (0 is `core`). A rank past the
+    /// twins is a caller bug rather than a runtime condition, so say which rank
+    /// was asked for instead of an index panic.
     pub(crate) fn core(&self, rank: usize) -> &RankKv {
         if rank == 0 {
             &self.core
         } else {
-            &self.twins[rank - 1]
+            match self.twins.get(rank - 1) {
+                Some(twin) => twin,
+                None => panic!(
+                    "rank {rank} is outside the {}-rank KV",
+                    self.twins.len() + 1
+                ),
+            }
         }
     }
 
@@ -294,7 +303,11 @@ impl GemmaKv {
         if rank == 0 {
             &mut self.core
         } else {
-            &mut self.twins[rank - 1]
+            let twins = self.twins.len() + 1;
+            match self.twins.get_mut(rank - 1) {
+                Some(twin) => twin,
+                None => panic!("rank {rank} is outside the {twins}-rank KV"),
+            }
         }
     }
 }

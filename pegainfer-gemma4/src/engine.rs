@@ -1674,7 +1674,6 @@ impl EngineState {
         let mut serve = GemmaServe::new(
             &ctx,
             weights,
-            tp,
             max_context,
             local_kv_storage,
             local_pages,
@@ -1748,7 +1747,6 @@ impl EngineState {
             let rank_serve = GemmaServe::new(
                 &rank_ctx,
                 weights,
-                rank_tp,
                 max_context,
                 local_kv_storage,
                 local_pages,
