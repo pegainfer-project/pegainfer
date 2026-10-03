@@ -542,6 +542,7 @@ fn publish_load(
         kv_total_blocks,
         num_running_reqs,
         num_waiting_reqs,
+        prefix_cache: pegainfer_frontend::engine::PrefixCacheCounters::default(),
         spec_decode: None,
     });
 }
@@ -602,6 +603,7 @@ fn terminal_scheduler_shutdown(
         kv_total_blocks,
         num_running_reqs: 0,
         num_waiting_reqs: 0,
+        prefix_cache: pegainfer_frontend::engine::PrefixCacheCounters::default(),
         spec_decode: None,
     });
 }
