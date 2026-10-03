@@ -109,11 +109,23 @@ It holds the *distributions*, not the greedy tokens: a two-rank reduction sums t
 
 The **shard branch** (`G % P == 0`, which the published 12B never takes — its single global KV head is replicated) is gated with a synthetic checkpoint carrying the real 31B shapes (`Q` 32, `G` 4, head dims 256/512, hidden 5376, intermediate 21504) cut down to six layers, so the whole run is ~8 GiB and takes seconds on any pair. It is **bit-identical**: 48/48 picks, worst picked-token gap `0.0000`. Both numbers above are with `NCCL_PROTO=LL128` (see the notes below).
 
-The gate serves its first prompt on its own and only then the rest as one batch, so the **solo** admission path (`step` + `prefill_extra_ranks`) — where the cold-start hazard above first surfaced, and the only path a lone short request takes — is compared on every run; `PEGAINFER_TP_PROMPTS` / `PEGAINFER_TP_PROMPT_TOKENS` still widen the set. Which branch the gate covers is the checkpoint's: point `PEGAINFER_TEST_MODEL_PATH` at the 12B for the replicate branch, at a 31B-geometry checkpoint for the shard one. **A full-depth 31B cannot be gated at all here**, not for want of a fixture but because the gate needs a *single-rank* baseline and 57 GiB of weights do not fit one card — the six-layer synthetic is exactly that shape at a depth that fits. So the numbers above are the 12B (replicate) and the synthetic (shard), and the 60-layer real checkpoint is served by hand (or gated on a card that holds it, as #986's GH200 does at TP1).
+The gate serves its first prompt on its own and only then the rest as one batch, so the **solo** admission path (`step` + `prefill_extra_ranks`) — where the cold-start hazard above first surfaced, and the only path a lone short request takes — is compared on every run; `PEGAINFER_TP_PROMPTS` / `PEGAINFER_TP_PROMPT_TOKENS` still widen the set. Which branch the gate covers is the checkpoint's: point `PEGAINFER_TEST_MODEL_PATH` at the 12B for the replicate branch, at a 31B-geometry checkpoint for the shard one. **A full-depth 31B cannot be gated against a *single-rank* baseline here**, not for want of a fixture but because the gate needs a single-rank control and 57 GiB of weights do not fit one card — the six-layer synthetic is exactly that shape at a depth that fits. So the numbers above are the 12B (replicate) and the synthetic (shard); the 60-layer real checkpoint is gated instead against its own Hugging Face dump (below) and served end to end on two L20s.
 
 The single-rank suite is unchanged by the TP path (`cargo test --release -p pegainfer-gemma4 --features gemma4 --lib`).
 
 The **real 31B checkpoint**, which no single card holds, is served end to end on two L20s; its load, envelope and serving numbers are in `benchmarks/gemma4-31b-tp2-l20.md`.
+
+### The real 31B against its own Hugging Face dump
+
+`engine::lane_gates_tp::the_two_rank_engine_matches_the_hf_reference` compares the two-rank engine directly against a Hugging Face reference for the **60-layer 31B** — the checkpoint whose single-rank baseline one card cannot hold. The fixture is that checkpoint's own dump (`tools/accuracy/dump_gemma4_hf_golden.py`, pinned by file digests), compared over the teacher-forced prompt rows' top-64 logprobs. Measured on two L20s, nine-token prompt:
+
+| claim | result |
+| --- | --- |
+| reference rows keeping the engine's pick | 7 / 8 |
+| worst shared-token logprob gap | 0.6753 |
+| the one differing row | a near-tie: the engine's pick sits inside the reference's top-64 |
+
+So the real geometry (hidden 5376, `Q` 32 / `Kv` 16 / `G` 4, head dims 256/512, the 50 sliding + 10 global split) matches the reference to the same bf16 reduction-order tolerance as the synthetic shard gate, over all 60 layers — with the same `NCCL_PROTO=LL128` requirement.
 
 ## Known bounds
 
@@ -121,10 +133,11 @@ The **real 31B checkpoint**, which no single card holds, is served end to end on
 - **Page-id agreement is inspected, not enforced.** Every rank's pools must stay identical in free-page order — that is the whole basis for "identical page ids". A debug build compares free-page counts after every admission, and every prefill compares the ranks' frontiers; a release build only does the frontiers, and nothing repairs a divergence.
 - **The vocabulary projection is replicated.** `embed_tokens` and the tied head are `Whole` on each rank (31B: 262144 × 5376 bf16, ~2.8 GiB per rank), and every extra rank computes a whole batch of `vocab × rows` logits per decode step that is then discarded. Dropping it needs a head-free tower for the extra ranks — in graph mode that means a second per-bucket capture, because the head sits inside `decode_gpu_body`. Not implemented, not measured.
 - **`NCCL_PROTO=LL128` is a requirement the code reports rather than enforces.** Startup logs the NCCL version and the effective protocol and warns when it is not LL128; it does not refuse. On this container's stock NCCL the default protocol corrupts the all-reduce buffer (see the operational notes).
+- **A long prompt stalls the prefill.** With a prompt of a few hundred tokens or more, a prefill's tower reaches a host-side device sync on rank 0 — inside a global layer's MLP — before the extra ranks have launched their collectives. The one driving thread then waits on rank 0's reduction, which needs a peer call that will never be issued, and the scheduler hangs. Short prompts (tens of tokens — every gate here) never reach it; a full-depth 31B with a 256-token prompt does, deterministically. The cause is the **single-threaded, whole-tower-per-rank** driver: a host sync mid-tower only deadlocks when the peer has not yet started. Fixing it means driving the ranks **concurrently** (one thread per rank) or interleaving the tower layer-by-layer so a peer call is always in flight before any host sync — the same shape as the `prompt_logprobs` scoring deadlock this PR fixes, one level deeper. The 31B HF gate therefore runs its nine-token case; its 1024-token `edge` case joins the gate once this lands.
 
 ## Operational notes
 
-- **A pair, not a card.** Two ranks are two devices; the gate runner claims both (`require_tp2`, `PEGAINFER_GATE_GPU=a,b`) and exports them as `CUDA_VISIBLE_DEVICES=a,b`, so the ranks inside the process are devices 0 and 1.
+- **A pair, not a card.** Two ranks are two devices; the gate runner claims both (`require_devices 2`, `PEGAINFER_GATE_GPU=a,b`) and exports them as `CUDA_VISIBLE_DEVICES=a,b`, so the ranks inside the process are devices 0 and 1.
 - **Set `NCCL_PROTO=LL128` in this container.** With the pod's stock NCCL 2.18.3 (2023, CUDA 12.2 vintage) on CUDA 12.9 and sm_89, the default `LL` protocol — and `SIMPLE` — make the all-reduce kernel write far outside its buffer (`compute-sanitizer` names `ncclKernel_AllReduce_RING_LL_Sum`, ~95 GB past the allocation). A non-primary rank faults asynchronously, so the visible symptom is the primary's collective stalling forever rather than an error. `LL128` is sound, and the repo's own L20 precedent ran NCCL 2.32.3. Prefer a newer NCCL over the variable where the environment allows it.
 - **The checkpoint is read once per rank.** 62 GB does not stay in a 32 GB page cache, so a 31B load is ~3.5 min per rank from the PVC and ~15 s from node-local disk — copy it local for iteration.
 - **In a container, disable the fabrics NCCL cannot reach** (`NCCL_IB_DISABLE=1`, and `NCCL_P2P_DISABLE=1` if P2P is unavailable). The log otherwise shows `Unable to open device mlx5_*` warnings.

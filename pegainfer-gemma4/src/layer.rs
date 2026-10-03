@@ -263,11 +263,12 @@ impl EpilogueScratch {
 }
 
 /// Sum this rank's partial projection across the tensor-parallel group, in
-/// place. The whole buffer is handed to NCCL rather than a view of the live
-/// extent: a view's pointer has been observed to reach the collective as a
-/// wild address, and the arena's rows past `seq_len` are zero padding, so
-/// reducing them costs nothing and keeps the captured shape constant.
-/// At world size 1 `comm` is `None` and this is free.
+/// place. Only the live rows are handed to NCCL: a decode arena is padded to
+/// its power-of-two bucket and the rows past `seq_len` are zero padding no
+/// rank reads back, so reducing them would move bytes for nothing. The extent
+/// is `hidden_size * seq_len`, the same on every rank of the step; inside a
+/// captured graph `seq_len` is the bucket, so the recorded shape stays
+/// constant across replays. At world size 1 `comm` is `None` and this is free.
 fn all_reduce_rows(
     comm: Option<&TpComm>,
     geom: &LayerGeometry,
@@ -286,8 +287,11 @@ fn all_reduce_rows(
         "a tensor-parallel reduction needs {elems} elements, the buffer holds {}",
         buf.data.len()
     );
-    comm.all_reduce_in_place(&mut buf.data, &cudarc::nccl::safe::ReduceOp::Sum)
-        .map_err(|e| anyhow::anyhow!("gemma4 tensor-parallel all-reduce failed: {e:?}"))?;
+    comm.all_reduce_in_place(
+        &mut buf.data.slice_mut(..elems),
+        &cudarc::nccl::safe::ReduceOp::Sum,
+    )
+    .map_err(|e| anyhow::anyhow!("gemma4 tensor-parallel all-reduce failed: {e:?}"))?;
     Ok(())
 }
 

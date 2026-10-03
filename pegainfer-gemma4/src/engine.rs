@@ -380,6 +380,11 @@ fn start_with_knobs(
         );
         // The ranks take ordinals `0..world` of what this process can see, so a
         // world size past the visible devices can only fail later, less clearly.
+        // `cuDeviceGetCount` needs the driver up and on a fresh process this is
+        // the first CUDA call; `init` is idempotent and process-wide.
+        cudarc::driver::result::init().map_err(|e| {
+            anyhow::anyhow!("CUDA driver init for a {world}-rank launch failed: {e:?}")
+        })?;
         let visible = cudarc::driver::result::device::get_count().map_err(|e| {
             anyhow::anyhow!("a {world}-rank launch needs to count CUDA devices: {e:?}")
         })?;
@@ -1147,6 +1152,17 @@ struct RankState {
     arena: StepArena,
 }
 
+/// The graph-before-comm release [`Drop for EngineState`] gives the success
+/// path, for a `load` that fails after the capture sweep and so never builds an
+/// `EngineState`: this rank's captured graphs must go before its own
+/// communicator (a field of `serve`) drops.
+impl Drop for RankState {
+    fn drop(&mut self) {
+        let _ = select_device(&self.ctx);
+        self.arena.release_graphs();
+    }
+}
+
 /// Make `ctx`'s device current on this thread. The thread-local cuBLAS handles
 /// are keyed by device, so switching the current device is enough once every
 /// rank has been bound at the start of a step.
@@ -1187,6 +1203,19 @@ fn rank_kvs(rows: &mut [Active], rank: usize) -> Vec<&mut RankKv> {
     rows.iter_mut()
         .map(|entry| entry.kv.core_mut(rank))
         .collect()
+}
+
+/// Abort every rank's communicator after a rank-0 step has failed. Rank 0 may
+/// have stopped between two collectives, in which case a peer's matching call
+/// will never arrive; aborting the comms unblocks any peer already waiting
+/// instead of letting it hang, and stops the engine — a comm-less step would
+/// otherwise silently reduce to a no-op. A free function over the two fields so
+/// a caller holding a `&self.ctx` borrow (the scored path) can still abort.
+fn abort_comms(serve: &mut GemmaServe, more: &mut [RankState]) {
+    serve.detach_tp_comm();
+    for state in more {
+        state.serve.detach_tp_comm();
+    }
 }
 
 struct EngineState {
@@ -1311,16 +1340,21 @@ impl EngineState {
     where
         F: Fn(&RankState, &mut RankKv) -> Result<()>,
     {
+        // Launch every extra rank before draining any of them. A rank's work is
+        // enqueued asynchronously, but its drain is not: waiting on rank 1 here
+        // would reach its collective before ranks 2..'s matching calls are in
+        // flight, and one thread cannot both wait and issue the next launch, so
+        // the step would deadlock. Once every call is in flight the drains can
+        // run in any order.
         for (rank, state) in self.more.iter().enumerate() {
             activate_rank(&state.ctx)?;
-            log::debug!("tp: rank {} prefill entering", rank + 1);
             per_rank(state, kv.core_mut(rank + 1)).context("tensor-parallel prefill")?;
-            log::debug!("tp: rank {} prefill launched", rank + 1);
+        }
+        for (rank, state) in self.more.iter().enumerate() {
             state
                 .ctx
                 .sync()
                 .with_context(|| format!("drain rank {}", rank + 1))?;
-            log::debug!("tp: rank {} drained", rank + 1);
         }
         self.assert_ranks_in_step(kv)?;
         // The caller's next device work is rank 0's.
@@ -1855,7 +1889,14 @@ impl EngineState {
                 }
                 bucket *= 2;
             }
+            // Every rank's floor goes back to 1: the sweep left each arena's
+            // `min_bucket` at the ceiling, and a rank that kept it would pad a
+            // decode step to a different bucket than rank 0 — different graphs
+            // on different ranks for the same step.
             arena.reset_min_bucket();
+            for state in &mut more {
+                state.arena.reset_min_bucket();
+            }
             activate_rank(&ctx)?;
             ctx.sync()?;
         }
@@ -2074,23 +2115,36 @@ impl EngineState {
                 Ok(())
             };
             activate_rank(&self.ctx)?;
-            let stepped = self
-                .serve
-                .step_scoring(ctx, &mut kv, prompt, Some(&mut score));
+            // Rank 0's tower is launched first, but its per-row readback blocks
+            // on its own collective, so it runs only after every rank has
+            // launched its tower — the peer's matching call must already be in
+            // flight or the one driving thread deadlocks.
+            let mut tower = match self.serve.launch_prompt_tower(ctx, &mut kv, prompt) {
+                Ok(tower) => tower,
+                Err(err) => {
+                    abort_comms(&mut self.serve, &mut self.more);
+                    return Err(err.context("scored prompt tower"));
+                }
+            };
             // The other ranks run the same prefill to write their KV shards;
-            // scoring is rank 0's alone. They are driven after rank 0 and
-            // unconditionally, and a failure on them is fatal.
-            self.step_extra_ranks(&mut kv, |state, rank_kv| {
+            // scoring is rank 0's alone.
+            if let Err(err) = self.step_extra_ranks(&mut kv, |state, rank_kv| {
                 state
                     .serve
                     .step_scoring(&state.ctx, rank_kv, prompt, None)
                     .map(|_| ())
-            })?;
+            }) {
+                abort_comms(&mut self.serve, &mut self.more);
+                return Err(err);
+            }
+            self.serve
+                .score_prompt_tower(ctx, &mut tower, &mut score)
+                .context("prompt logprobs")?;
             echo = Some(PromptEcho {
                 ids: prompt.clone(),
                 logprobs: scores,
             });
-            stepped
+            Ok(tower.into_logits())
         } else if let Some(chunk) = self.mix_chunk {
             // Under the chunk knob a solo prompt walks its own segments too:
             // residency stays window plus segment whatever the prompt length.
@@ -2101,10 +2155,20 @@ impl EngineState {
             let result =
                 self.serve
                     .step(&self.ctx, &mut kv, &request.request.prompt_tokens[resume..]);
-            // Started after rank 0 and unconditionally: a rank-0 failure here
-            // must not skip the peer (see `step_extra_ranks`).
-            self.prefill_extra_ranks(&mut kv, &request.request.prompt_tokens[resume..])?;
-            result
+            match result {
+                Ok(logits) => {
+                    // Rank 0's tower is in flight, so the peer's collectives
+                    // have their match. A rank-0 failure instead means its
+                    // sequence stopped short, and driving the peer's whole
+                    // tower would leave it waiting on a call that never comes.
+                    self.prefill_extra_ranks(&mut kv, &request.request.prompt_tokens[resume..])?;
+                    Ok(logits)
+                }
+                Err(err) => {
+                    abort_comms(&mut self.serve, &mut self.more);
+                    Err(err.context("solo prefill tower"))
+                }
+            }
         };
         let mut logits = match stepped {
             Ok(logits) => logits,
@@ -2280,7 +2344,7 @@ impl EngineState {
     /// A prompt's unseen suffix on the plain path, one `chunk` segment at a
     /// time.
     fn walk_plain_prompt(
-        &self,
+        &mut self,
         kv: &mut GemmaKv,
         prompt: &[u32],
         chunk: usize,
@@ -2293,7 +2357,7 @@ impl EngineState {
         self.step_plain_segment(kv, &prompt[offset..])
     }
 
-    fn step_plain_segment(&self, kv: &mut GemmaKv, tokens: &[u32]) -> Result<HiddenStates> {
+    fn step_plain_segment(&mut self, kv: &mut GemmaKv, tokens: &[u32]) -> Result<HiddenStates> {
         admit_tokens(
             &self.serve.local_pool,
             &self.serve.global_pool,
@@ -2302,12 +2366,19 @@ impl EngineState {
         )?;
         self.admit_extra_ranks(kv, tokens.len())?;
         activate_rank(&self.ctx)?;
-        // Rank 0's verdict is held rather than propagated: the extra ranks have
-        // to be driven either way (see `step_extra_ranks`), and their failure
-        // wins.
-        let logits = self.serve.step(&self.ctx, kv, tokens);
-        self.prefill_extra_ranks(kv, tokens)?;
-        logits
+        // Rank 0's tower is in flight, so the peer's collectives have their
+        // match; a rank-0 failure instead breaks the sequence, so abort rather
+        // than drive a peer that would wait forever on a missing call.
+        match self.serve.step(&self.ctx, kv, tokens) {
+            Ok(logits) => {
+                self.prefill_extra_ranks(kv, tokens)?;
+                Ok(logits)
+            }
+            Err(err) => {
+                abort_comms(&mut self.serve, &mut self.more);
+                Err(err.context("chunked prefill tower"))
+            }
+        }
     }
 
     fn finish_plain_walker(
@@ -2625,6 +2696,12 @@ impl EngineState {
                     .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)
                     .map(|_| ())
             };
+            if let Err(err) = rank0 {
+                // Rank 0's sequence stopped short; abort before any peer waits
+                // on a collective that will never be issued.
+                abort_comms(&mut self.serve, &mut self.more);
+                return Err(err.context("batched decode launch"));
+            }
             // The other ranks carry the same tokens and page ids; only rank 0
             // samples, so their logits are discarded. A failure on them is fatal
             // — the ranks' frontiers must not drift apart.
@@ -2642,7 +2719,6 @@ impl EngineState {
                 // The sampler below reads rank 0's arena.
                 activate_rank(&self.ctx)?;
             }
-            rank0?;
         }
         let graph_slot = crate::serve::decode_bucket_slot(rows);
         if let Some(graph) = self.sampler_graphs.get_mut(graph_slot) {
@@ -2759,6 +2835,9 @@ impl EngineState {
         let logits = match stepped {
             Ok(logits) => logits,
             Err(err) => {
+                // Rank 0's mixed step broke mid-sequence; abort so the peers
+                // cannot hang on the collective it never issued.
+                abort_comms(&mut self.serve, &mut self.more);
                 fail_active_batch(active, "mixed step", &err, ledger);
                 return Err(err.context("gemma4 mixed step"));
             }
@@ -2849,9 +2928,18 @@ impl EngineState {
                 .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, &tokens)
                 .map(|_| ())
         };
-        // The other ranks carry the same tokens and page ids; only rank 0
-        // samples. A failure on them is fatal — the ranks' frontiers must not
-        // drift apart.
+        if let Err(err) = rank0 {
+            // Rank 0's sequence stopped short; abort so no peer waits on a
+            // collective that will never be issued.
+            abort_comms(&mut self.serve, &mut self.more);
+            let _ = self.fence();
+            fail_active_batch(active, "batched decode", &err, ledger);
+            return Err(err.context("batched decode"));
+        }
+        // Rank 0's tower is in flight; now every other rank's. They carry the
+        // same tokens and page ids, and only rank 0 samples, so their logits
+        // are discarded. A failure on them is fatal — the ranks' frontiers must
+        // not drift apart.
         for (rank, state) in self.more.iter_mut().enumerate() {
             activate_rank(&state.ctx)?;
             let mut kvs = rank_kvs(active, rank + 1);
@@ -2860,11 +2948,6 @@ impl EngineState {
                 .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, &tokens)?;
         }
         activate_rank(&self.ctx)?;
-        if let Err(err) = rank0 {
-            self.fence()?;
-            fail_active_batch(active, "batched decode", &err, ledger);
-            return Err(err.context("batched decode"));
-        }
         let (logits, _) = self.arena.logits_and_ids();
         let sampled = {
             let rows: Vec<SampleRow<'_>> = active

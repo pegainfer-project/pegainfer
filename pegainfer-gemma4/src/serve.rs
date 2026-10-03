@@ -1181,6 +1181,15 @@ impl GemmaServe {
         self.tp_comm = Some(comm);
     }
 
+    /// Take the communicator out, dropping — and so aborting — it. A cudarc
+    /// NCCL comm aborts on drop, which unblocks a peer already waiting on a
+    /// call this rank will never issue. Call it once the pair's collective
+    /// sequence is broken beyond repair; a comm-less step would otherwise
+    /// reduce to a no-op, so the engine must stop afterwards.
+    pub(crate) fn detach_tp_comm(&mut self) -> Option<TpComm> {
+        self.tp_comm.take()
+    }
+
     /// The global family's prefill, through whichever kernel this engine was
     /// started with. Both are the same fn type, so a drift between them stops
     /// compiling rather than computing something else.
@@ -2927,7 +2936,9 @@ impl GemmaServe {
 
     /// [`GemmaServe::step`] that also hands `score` the head's logits for
     /// every row but the last, `PROMPT_SCORE_ROWS` rows at a time with the
-    /// first row's index: row `r` predicts token `r + 1`.
+    /// first row's index: row `r` predicts token `r + 1`. The readback and the
+    /// tower are split so a driver sharing one thread across ranks can launch
+    /// every rank's tower before rank 0's readback waits on its collective.
     pub(crate) fn step_scoring(
         &self,
         ctx: &DeviceContext,
@@ -2935,6 +2946,22 @@ impl GemmaServe {
         tokens: &[u32],
         score: Option<PromptScorer<'_>>,
     ) -> Result<HiddenStates> {
+        let mut tower = self.launch_prompt_tower(ctx, kv, tokens)?;
+        if let Some(score) = score {
+            self.score_prompt_tower(ctx, &mut tower, score)?;
+        }
+        Ok(tower.into_logits())
+    }
+
+    /// Run the prompt's tower and head, and hold the rows a later
+    /// [`GemmaServe::score_prompt_tower`] reads. Nothing is read back to the
+    /// host here, so the launch never waits on the rank's collective.
+    pub(crate) fn launch_prompt_tower(
+        &self,
+        ctx: &DeviceContext,
+        kv: &mut RankKv,
+        tokens: &[u32],
+    ) -> Result<PromptTower> {
         let seq_len = tokens.len();
         let mut pass = self.prepare_single(ctx, kv, tokens, "step")?;
         log::debug!(
@@ -2944,36 +2971,6 @@ impl GemmaServe {
             kv.global.held_pages()
         );
         let src = self.run_single_tower(ctx, &mut pass, seq_len)?;
-        if let Some(score) = score
-            && seq_len > 1
-        {
-            let rows = PROMPT_SCORE_ROWS.min(seq_len - 1);
-            let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
-            let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
-            let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, rows)?;
-            for start in (0..seq_len - 1).step_by(rows) {
-                let n = rows.min(seq_len - 1 - start);
-                hidden.seq_len = n;
-                ops::copy_hidden_token_range_into(
-                    ctx,
-                    &pass.tower.hidden[src],
-                    start,
-                    &mut hidden,
-                    0,
-                    n,
-                )?;
-                logits_tail_into(
-                    ctx,
-                    &self.weights,
-                    &hidden,
-                    self.local_geom.rms_norm_eps,
-                    self.final_logit_softcapping,
-                    &mut normed,
-                    &mut logits,
-                )?;
-                score(&mut logits, start)?;
-            }
-        }
         let logits = logits_tail(
             ctx,
             &self.weights,
@@ -2988,7 +2985,53 @@ impl GemmaServe {
         // leave one family ahead of the other.
         self.advance_local(kv, seq_len)?;
         kv.global.advance(seq_len);
-        Ok(logits)
+        Ok(PromptTower {
+            pass,
+            src,
+            seq_len,
+            logits,
+        })
+    }
+
+    /// The per-row readback a scored prompt owes rank 0. It blocks on this
+    /// rank's collectives, so call it only once every rank's tower is launched.
+    pub(crate) fn score_prompt_tower(
+        &self,
+        ctx: &DeviceContext,
+        tower: &mut PromptTower,
+        score: PromptScorer<'_>,
+    ) -> Result<()> {
+        let seq_len = tower.seq_len;
+        if seq_len <= 1 {
+            return Ok(());
+        }
+        let rows = PROMPT_SCORE_ROWS.min(seq_len - 1);
+        let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
+        let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
+        let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, rows)?;
+        for start in (0..seq_len - 1).step_by(rows) {
+            let n = rows.min(seq_len - 1 - start);
+            hidden.seq_len = n;
+            ops::copy_hidden_token_range_into(
+                ctx,
+                &tower.pass.tower.hidden[tower.src],
+                start,
+                &mut hidden,
+                0,
+                n,
+            )?;
+            logits_tail_into(
+                ctx,
+                &self.weights,
+                &hidden,
+                self.local_geom.rms_norm_eps,
+                self.final_logit_softcapping,
+                &mut normed,
+                &mut logits,
+            )?;
+            score(&mut logits, start)?;
+        }
+        Ok(())
     }
 
     /// Whole-prompt prefill left in flight on the active stream — the
@@ -3038,6 +3081,22 @@ impl GemmaServe {
     /// the decode batch.
     pub(crate) fn release_prefill_window(&self, kv: &mut RankKv) -> Result<()> {
         self.advance_local(kv, 0)
+    }
+}
+
+/// A launched prompt tower and the head rows a later scored pass reads. Kept
+/// alive across the peer ranks' tower launches so rank 0's own readback — the
+/// only part that waits on its collective — runs after every rank is in flight.
+pub(crate) struct PromptTower {
+    pass: SinglePass,
+    src: usize,
+    seq_len: usize,
+    logits: HiddenStates,
+}
+
+impl PromptTower {
+    pub(crate) fn into_logits(self) -> HiddenStates {
+        self.logits
     }
 }
 
