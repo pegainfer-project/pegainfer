@@ -166,7 +166,8 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         })
         .expect("cold prefill");
     assert_eq!(
-        cold.requests[0].cached_tokens, 0,
+        cold.requests[0].cached_tokens.unwrap_or(0),
+        0,
         "first sight of P is cold"
     );
     let cold_first = first_token_top(&cold);
@@ -195,7 +196,7 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         })
         .expect("warm prefill");
     assert_eq!(
-        warm.requests[0].cached_tokens,
+        warm.requests[0].cached_tokens.unwrap_or(0),
         3 * BLOCK,
         "CPU-restored prefix: 3 blocks matched, tail recomputed"
     );
@@ -222,7 +223,8 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         })
         .expect("cold full prefill");
     assert_eq!(
-        cold.requests[0].cached_tokens, 0,
+        cold.requests[0].cached_tokens.unwrap_or(0),
+        0,
         "first sight of full is cold"
     );
     let cold_first = first_token_top(&cold);
@@ -240,7 +242,8 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         })
         .expect("short prefill");
     assert_eq!(
-        s.requests[0].cached_tokens, 0,
+        s.requests[0].cached_tokens.unwrap_or(0),
+        0,
         "short re-warms blocks 0..3 cold"
     );
     ex.drop_request(RequestId::new(2)).expect("drop req2");
@@ -267,7 +270,7 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         })
         .expect("warm full prefill");
     assert_eq!(
-        warm.requests[0].cached_tokens,
+        warm.requests[0].cached_tokens.unwrap_or(0),
         6 * BLOCK,
         "combined hit: 3 GPU-resident + 3 CPU-restored blocks match as one prefix"
     );

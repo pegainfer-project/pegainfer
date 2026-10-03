@@ -417,7 +417,7 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
             })
             .expect("prefill");
         for (i, &s) in seqs.iter().enumerate() {
-            stats.cached_tokens += pr.requests[i].cached_tokens;
+            stats.cached_tokens += pr.requests[i].cached_tokens.unwrap_or(0);
             fold(
                 &mut stats,
                 s,
@@ -458,7 +458,7 @@ fn run(g: &Golden, ex: &mut Qwen3Executor, seqs: &[usize], batched: bool) -> (St
                     requests: &[prefill_item(id, g.prompt(seq))],
                 })
                 .expect("prefill");
-            stats.cached_tokens += pr.requests[0].cached_tokens;
+            stats.cached_tokens += pr.requests[0].cached_tokens.unwrap_or(0);
             fold(
                 &mut stats,
                 seq,

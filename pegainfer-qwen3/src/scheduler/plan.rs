@@ -222,7 +222,10 @@ fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<Pre
                 logprobs: r.logprobs,
                 prompt_logprobs: r.prompt_logprobs,
                 lora_adapter: r.lora_adapter.clone(),
-                cached_tokens: r.cached_tokens,
+                // No lookup has run yet for this chunk; the executor fills it
+                // in (`None` stays `None` when it never runs one).
+                cached_tokens: None,
+                external_hit_tokens: 0,
                 chunk_budget: r.step_chunk,
                 chunk_start: 0,
                 chunk_tokens: 0,
@@ -276,7 +279,8 @@ mod tests {
             prefetch_offered: false,
             prefill_pos: 0,
             step_chunk: 3,
-            cached_tokens: 0,
+            cached_tokens: None,
+            external_hit_tokens: 0,
         }
     }
 
