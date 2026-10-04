@@ -409,6 +409,17 @@ fn start_with_knobs(
             "{MIX_CHUNK_TOKENS_ENV} is unsupported under tensor parallelism: a chunked walk's \
              rounds gather across prompts and are not covered by the TP gates"
         );
+        // Lifting the ceiling is lifting the guard on a hang this build cannot
+        // recover from, so it is said out loud rather than left to the notes.
+        if knobs.tp_max_prompt.is_none() {
+            log::warn!(
+                "{TP_MAX_PROMPT_ENV} lifts the tensor-parallel prompt ceiling: a prefill long \
+                 enough reaches a host-side device sync on rank 0 before the extra ranks have \
+                 launched, and the single-threaded driver then hangs instead of failing the \
+                 request (docs/models/gemma4/tp.md, \"Known bounds\"). Lift it only on a build \
+                 whose rank driver is concurrent."
+            );
+        }
         // The ranks take ordinals `0..world` of what this process can see, so a
         // world size past the visible devices can only fail later, less clearly.
         // `cuDeviceGetCount` needs the driver up and on a fresh process this is
@@ -2226,9 +2237,35 @@ impl EngineState {
             // on its own collective, so it runs only after every rank has
             // launched its tower — the peer's matching call must already be in
             // flight or the one driving thread deadlocks.
-            let mut tower = match self.serve.launch_prompt_tower(ctx, &mut kv, prompt) {
-                Ok(tower) => tower,
-                Err(err) => {
+            //
+            // A rank-0 failure lands in `stepped` rather than returning from
+            // here, so the `tp_broken` gate below is what prices it: a broken
+            // pair stops the engine, while a single rank — where `abort_comms`
+            // has nothing to abort and leaves `tp_broken` clear — keeps the
+            // request-scoped failure this path has always had.
+            'scored: {
+                let mut tower = match self.serve.launch_prompt_tower(ctx, &mut kv, prompt) {
+                    Ok(tower) => tower,
+                    Err(err) => {
+                        abort_comms(
+                            &self.tp_broken,
+                            &self.ctx,
+                            &mut self.serve,
+                            &mut self.arena,
+                            &mut self.more,
+                        );
+                        break 'scored Err(err.context("scored prompt tower"));
+                    }
+                };
+                // The other ranks run the same prefill to write their KV
+                // shards; scoring is rank 0's alone. A failure on them is fatal
+                // at any world size: the ranks' frontiers must not drift apart.
+                if let Err(err) = self.step_extra_ranks(&mut kv, |state, rank_kv| {
+                    state
+                        .serve
+                        .step_scoring(&state.ctx, rank_kv, prompt, None)
+                        .map(|_| ())
+                }) {
                     abort_comms(
                         &self.tp_broken,
                         &self.ctx,
@@ -2236,34 +2273,26 @@ impl EngineState {
                         &mut self.arena,
                         &mut self.more,
                     );
-                    return Err(err.context("scored prompt tower"));
+                    break 'scored Err(err);
                 }
-            };
-            // The other ranks run the same prefill to write their KV shards;
-            // scoring is rank 0's alone.
-            if let Err(err) = self.step_extra_ranks(&mut kv, |state, rank_kv| {
-                state
+                // Every rank's tower has now completed and its collectives are
+                // paired, so a failure in rank 0's readback costs this request
+                // alone at any world size: the next step's collective sequence
+                // is intact, and the request's pages return with `kv` on every
+                // rank.
+                if let Err(err) = self
                     .serve
-                    .step_scoring(&state.ctx, rank_kv, prompt, None)
-                    .map(|_| ())
-            }) {
-                abort_comms(
-                    &self.tp_broken,
-                    &self.ctx,
-                    &mut self.serve,
-                    &mut self.arena,
-                    &mut self.more,
-                );
-                return Err(err);
+                    .score_prompt_tower(ctx, &mut tower, &mut score)
+                    .context("prompt logprobs")
+                {
+                    break 'scored Err(err);
+                }
+                echo = Some(PromptEcho {
+                    ids: prompt.clone(),
+                    logprobs: scores,
+                });
+                Ok(tower.into_logits())
             }
-            self.serve
-                .score_prompt_tower(ctx, &mut tower, &mut score)
-                .context("prompt logprobs")?;
-            echo = Some(PromptEcho {
-                ids: prompt.clone(),
-                logprobs: scores,
-            });
-            Ok(tower.into_logits())
         } else if let Some(chunk) = self.mix_chunk {
             // Under the chunk knob a solo prompt walks its own segments too:
             // residency stays window plus segment whatever the prompt length.
@@ -2304,8 +2333,8 @@ impl EngineState {
                 if self.tp_broken.get() {
                     return Err(err.context("tensor-parallel ranks diverged; engine stopped"));
                 }
-                // This prompt's prefill failed; its pages return with `kv`
-                // and the engine keeps serving.
+                // This prompt's prefill failed on its own; its pages return with
+                // `kv` and the engine keeps serving.
                 log::error!("solo prefill failed: {err:#}");
                 ledger.fail(request.id, format!("prefill failed: {err:#}"));
                 return Ok(Admitted::Done);
@@ -2787,18 +2816,33 @@ impl EngineState {
     }
 
     /// Reserve the next token without retiring or reordering a row.
-    fn ready_rows_pinned(&self, active: &mut [Active], ledger: &RequestLedger) -> bool {
-        active.iter_mut().all(|entry| {
-            !ledger.is_aborted(entry.request.id)
-                && admit_tokens(
-                    &self.serve.local_pool,
-                    &self.serve.global_pool,
-                    &mut entry.kv,
-                    1,
-                )
-                .and_then(|()| self.admit_extra_ranks(&mut entry.kv, 1))
-                .is_ok()
-        })
+    ///
+    /// `Ok(false)` is rank 0's own shortfall, which the caller answers by
+    /// falling back to [`Self::ready_decode_rows`] — that path fails the row and
+    /// drops it, so its pages come back. `Err` is only reachable with extra
+    /// ranks: a rank that cannot reserve what rank 0 just reserved has lost the
+    /// page-id race, and nothing here drops the row, so the divergence would
+    /// ride into the step and read one rank's KV at another's frontier. By
+    /// `admit_extra_ranks`' own contract nothing after that can repair it, so
+    /// the engine stops instead.
+    fn ready_rows_pinned(&self, active: &mut [Active], ledger: &RequestLedger) -> Result<bool> {
+        for entry in active.iter_mut() {
+            if ledger.is_aborted(entry.request.id) {
+                return Ok(false);
+            }
+            if admit_tokens(
+                &self.serve.local_pool,
+                &self.serve.global_pool,
+                &mut entry.kv,
+                1,
+            )
+            .is_err()
+            {
+                return Ok(false);
+            }
+            self.admit_extra_ranks(&mut entry.kv, 1)?;
+        }
+        Ok(true)
     }
 
     fn fence(&self) -> Result<()> {
@@ -3141,7 +3185,7 @@ impl EngineState {
     /// successor in flight and drain before any row-order change.
     fn decode_round(&mut self, active: &mut Vec<Active>, ledger: &mut RequestLedger) -> Result<()> {
         if let Some(pending) = self.pipeline.take() {
-            if self.pipeline_eligible(active, ledger) && self.ready_rows_pinned(active, ledger) {
+            if self.pipeline_eligible(active, ledger) && self.ready_rows_pinned(active, ledger)? {
                 let next_slot = (pending.slot + 1) % DECODE_PIPELINE_DEPTH;
                 match self.launch_staged(active, true, next_slot) {
                     Ok(rows) => {

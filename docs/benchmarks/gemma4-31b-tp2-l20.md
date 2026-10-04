@@ -22,7 +22,7 @@ TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as 
 | resident after weights | 14.18 GiB free |
 | load wall (cold) | 30 s (31.4 s in a second cold run) |
 
-The 8192 x 16-slot default point (≈45.4 GiB) is over the card; 8 slots is the point that fits. `PEGAINFER_MAX_CONTEXT`/`PEGAINFER_DECODE_SLOTS` trade context against concurrency — see `models/gemma4/tp.md` for the other measured envelopes.
+The 8192 x 16-slot default point does not quite fit: 29.91 GiB of weights plus 14.38 GiB of pools (9.38 local + 5.00 global, all binary GiB) is 44.29 GiB, and the ~0.90 GiB implied by the "14.18 GiB free" row above — CUDA context, step arena, cuBLAS workspace, NCCL buffers — puts it at ≈45.2 GiB against the 44.99 GiB usable. It misses by ~0.2 GiB, not by a wide margin. 8 slots is the point that fits. `PEGAINFER_MAX_CONTEXT`/`PEGAINFER_DECODE_SLOTS` trade context against concurrency — see `models/gemma4/tp.md` for the other measured envelopes and the page arithmetic.
 
 ## Method
 
@@ -60,7 +60,7 @@ A wash: the collective, not launch count, dominates the step, so capture buys li
 
 ## Correctness
 
-The distribution gate at 31B geometry is exact (`models/gemma4/tp.md`): the synthetic checkpoint carrying this checkpoint's shapes is bit-identical between one rank and two (48/48 picks, worst picked-token gap `0.0000`). On the real checkpoint the sane answers come out through the chat template — `What is the capital of France?` → `Paris`; `Name three primary colors.` → `The three primary colors are red, yellow, and blue.` (the sampled defaults; greedy repeats, which is the model's published non-default behavior, not a TP artifact).
+The distribution gate at 31B geometry measured exact (`models/gemma4/tp.md`): the synthetic checkpoint carrying this checkpoint's shapes came out bit-identical between one rank and two (48/48 picks, worst picked-token gap `0.0000`) — a measurement, since the gate asserts against a 0.5 line rather than against exactness. On the real checkpoint the sane answers come out through the chat template — `What is the capital of France?` → `Paris`; `Name three primary colors.` → `The three primary colors are red, yellow, and blue.` (the sampled defaults; greedy repeats, which is the model's published non-default behavior, not a TP artifact).
 
 ## Notes
 

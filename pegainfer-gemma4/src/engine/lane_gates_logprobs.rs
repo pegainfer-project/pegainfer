@@ -184,3 +184,42 @@ fn the_tp_prompt_ceiling_refuses_one_token_past_it() {
         Err(RejectReason::Unsupported { .. })
     ));
 }
+
+/// A token id outside the embedding fails in `prepare_single`'s
+/// `validate_tokens`, before the tower allocates anything or — under tensor
+/// parallelism — before rank 0 issues a single collective. So a prompt carrying
+/// one is a deterministic prefill fault that needs no injection hook, and the
+/// property under test is its **scope**: the driver contract makes `Err` from
+/// `Scheduler::step` mean "the engine is beyond use", so a request-local fault
+/// that escaped as `Err` would close the step stream and write off every open
+/// account. Both prefill paths have to answer it by failing that one request.
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
+fn a_failed_prefill_costs_that_request_not_the_engine() {
+    let mut harness = launch(&[]);
+    for (name, salt, prompt_logprobs) in [("scored", 1u32, Some(8)), ("plain", 2, None)] {
+        // `u32::MAX` is outside any vocabulary this line ships.
+        let bad = harness.submit_scored(vec![9, u32::MAX, 11 + salt], 4, None, prompt_logprobs);
+        match harness.steps.terminal(bad.id()) {
+            Terminal::Failed { message, .. } => assert!(
+                message.contains("prefill failed"),
+                "{name}: the request should fail as a prefill failure, got: {message}"
+            ),
+            other => panic!("{name}: an unusable prompt must fail that request, not {other:?}"),
+        }
+        // The engine is still serving, and the failed request's pages came back
+        // with its KV: a good request is admitted and completes afterwards.
+        let good = harness.submit_scored(ids(12, 7 + salt), 4, None, prompt_logprobs);
+        let drained = harness.steps.drain(good.id(), name);
+        assert_eq!(
+            drained.tokens, 4,
+            "{name}: the request after a failed prefill still decodes to its budget"
+        );
+        assert_eq!(
+            drained.finish,
+            FinishReason::Length,
+            "{name}: and finishes on its budget"
+        );
+    }
+    harness.shutdown(&[]);
+}

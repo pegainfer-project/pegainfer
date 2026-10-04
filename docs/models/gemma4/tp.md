@@ -27,13 +27,17 @@ Replicated on every rank: the token embedding (and the tied head), all four laye
 `TensorParallelConfig::validate_for` refuses a launch that would silently drop or misalign heads. The three counts the kv-cache design doc states are necessary but not sufficient — they do not keep the **per-rank GQA group** integral (`Q = 8`, `Kv = 6`, `P = 2` clears them and yields group `4/3`), so that is checked as well:
 
 ```
+P  > 0
+rank < P
 Q  % P == 0
 Kv % P == 0
 G  % P == 0  ||  P % G == 0
 (Q/P) % (Kv/P) == 0          # per-rank sliding group
-(Q/P) % G_local == 0         # per-rank global group
+(Q/P) % G_local == 0         # per-rank global group, sharding branch only
 intermediate % P == 0
 ```
+
+The global check carries a branch condition because only the **sharding** branch can split a group: `G % P == 0` hands a rank `G / P` KV heads, so `(Q/P) / (G/P)` has to be integral. The replicate branch (`P % G == 0`) gives a rank one whole KV head, and `P % G == 0` already keeps its `Q / P` query heads inside that head's group — `Q / P` is `P / G` copies of `Q / G` — so there is nothing left to police, and the check would only compare against a group of one.
 
 A routed (MoE) checkpoint and a W4A16 one are refused under TP > 1: the first needs an expert-sharding design, the second projects whole matrices.
 
@@ -43,7 +47,11 @@ One scheduler thread drives every rank. Each rank owns its `DeviceContext`, `Gem
 
 That per-rank KV is why no host/device split was needed: each rank's entry point advances its own frontier, and because the pools have identical budgets and the admission sequence is identical, the page ids stay in step across ranks.
 
-Per step, rank 0's segment runs first and its verdict is checked before the extra ranks are driven: a rank-0 failure aborts the comms and stops the engine (see "Known bounds"), while a success means the peers' collectives have their match. For every rank `r` the segment calls `activate_rank` (set the device, bind its context, make its thread-local cuBLAS handles current — creating them on first use) and runs that rank's segment; the sampler then runs on rank 0 alone. A prefill drains every non-primary rank's stream, so a device fault on that rank surfaces by name instead of stalling the primary's collective forever.
+Per step, rank 0's segment runs first and its verdict is checked before the extra ranks are driven: a rank-0 failure aborts the comms and stops the engine (see "Known bounds"), while a success means the peers' collectives have their match. For every rank `r` the segment calls `activate_rank` (set the device, bind its context, make its thread-local cuBLAS handles current — creating them on first use) and runs that rank's segment; the sampler then runs on rank 0 alone.
+
+Only the paths that prefill a prompt **on its own** — the solo whole-prompt step, the scored step and a walker's segment, all through `step_extra_ranks` — drain every non-primary rank's stream afterwards, so a device fault on that rank surfaces by name instead of stalling the primary's collective forever. The decode-shaped steps (a staged decode, a decode round and the mixed step) launch the extra ranks and leave them in flight: their only host blocking point is rank 0's sampler readback, which comes after every rank has launched, so nothing waits on a peer that has not been driven yet. A mixed step carries prompt rows and still takes the no-drain path — its rows ride the decode step's shape, not a prefill of their own.
+
+The invariant both shapes rely on is worth stating once, because nothing in the collective layer checks it: **with one thread driving every rank, every host blocking point must come after every rank's launch.** `all_reduce_rows` enqueues and returns; the thread may only wait once all the matching calls are in flight, or it waits on a collective whose peer call it has not issued yet.
 
 The staged decode pipeline (ids written by the previous step's sampler) is disabled under TP: a non-primary rank has no sampler and no ids of its own, so every rank takes the explicit-token path.
 
@@ -66,9 +74,11 @@ Each family's pool is `layers × pages × bytes-per-page`, which is the number t
 | bytes per token | `kv_heads × head_dim × 2 (K,V) × 2` | same |
 | 31B TP2 per token | `8 × 256 × 4` = 8 KiB | `2 × 512 × 4` = 4 KiB |
 | pages at ceiling 8192 / 16 slots | `15 × 17 + 128 + 1` = 384 | `16 × 128 + 1` = 2049 |
-| pool bytes | 50 × 384 × 0.5 MiB ≈ 10.1 GiB | 10 × 2049 × 0.25 MiB ≈ 5.4 GiB |
+| pool bytes | 50 × 384 × 0.5 MiB = 9600 MiB = 9.38 GiB | 10 × 2049 × 0.25 MiB = 5122.5 MiB = 5.00 GiB |
 
-31B TP2 therefore needs **29.91 GiB of weights plus ~15.4 GiB of pools ≈ 45.4 GiB per rank at the default point** — over a 48 GiB L20. The working envelopes measured on L20:
+Every figure here and below is binary (1 GiB = 1024 MiB); the MiB columns are what the start-up log prints, so the two are directly comparable.
+
+31B TP2 therefore needs **29.91 GiB of weights plus 14.38 GiB of pools = 44.29 GiB per rank at the default point**, before the ~0.90 GiB of CUDA context, step arena, cuBLAS workspace and NCCL buffers that the same run reports as the gap between 29.91 GiB of weights and the 14.18 GiB it leaves free on a 44.99 GiB L20. That is **≈45.2 GiB against 44.99 GiB usable**, so the default point does not quite fit — by ~0.2 GiB, not by a wide margin, which is why the reduced envelopes below are the ones that were served. The working envelopes measured on L20:
 
 | ceiling | slots | pools | ≈ resident per rank |
 | --- | ---: | ---: | ---: |
@@ -102,16 +112,16 @@ It holds the *distributions*, not the greedy tokens: a two-rank reduction sums t
 
 | claim | result |
 | --- | --- |
-| one-rank run twice (control) | bit-identical, so the comparison is not measuring harness noise |
+| one-rank run twice (control) | bit-identical, **asserted** token for token and logprob for logprob, so the comparison is not measuring harness noise |
 | steps keeping the one-rank pick | 46 / 48 |
-| worst picked-token logprob gap | 0.379 |
-| a differing pick | always a genuine near-tie: each pick inside the other run's top-8 |
+| worst picked-token logprob gap | 0.379 (the asserted line is 0.5) |
+| a differing pick | always a genuine near-tie: each pick inside the other run's top-8, and both picks' own gaps folded into the bound above before the comparison stops |
 
-The **shard branch** (`G % P == 0`, which the published 12B never takes — its single global KV head is replicated) is gated with a synthetic checkpoint carrying the real 31B shapes (`Q` 32, `G` 4, head dims 256/512, hidden 5376, intermediate 21504) cut down to six layers, so the whole run is ~8 GiB and takes seconds on any pair. It is **bit-identical**: 48/48 picks, worst picked-token gap `0.0000`. Both numbers above are with `NCCL_PROTO=LL128` (see the notes below).
+The **shard branch** (`G % P == 0`, which the published 12B never takes — its single global KV head is replicated) is gated with a synthetic checkpoint carrying the real 31B shapes (`Q` 32, `G` 4, head dims 256/512, hidden 5376, intermediate 21504) cut down to six layers, so the whole run is ~8 GiB and takes seconds on any pair. It **measured bit-identical**: 48/48 picks, worst picked-token gap `0.0000`. That is a measurement, not an assertion — the two-rank comparison asserts against `LOGBROB_LINE = 0.5`, the same line for both branches, so a future run that drifts within 0.5 passes while this sentence's `0.0000` no longer holds. `LOGBROB_LINE` is a first cut from the single 12B measurement above (0.379, i.e. ~1.3× of margin); calibrating it the way `DRIFT_LINE` below needs calibrating is the same follow-up. Both numbers are with `NCCL_PROTO=LL128` (see the notes below).
 
 The gate serves its first prompt on its own and only then the rest as one batch, so the **solo** admission path (`step` + `prefill_extra_ranks`) — where the cold-start hazard above first surfaced, and the only path a lone short request takes — is compared on every run; `PEGAINFER_TP_PROMPTS` / `PEGAINFER_TP_PROMPT_TOKENS` still widen the set. Which branch the gate covers is the checkpoint's: point `PEGAINFER_TEST_MODEL_PATH` at the 12B for the replicate branch, at a 31B-geometry checkpoint for the shard one. **A full-depth 31B cannot be gated against a *single-rank* baseline here**, not for want of a fixture but because the gate needs a single-rank control and 57 GiB of weights do not fit one card — the six-layer synthetic is exactly that shape at a depth that fits. So the numbers above are the 12B (replicate) and the synthetic (shard); the 60-layer real checkpoint is gated instead against its own Hugging Face dump (below) and served end to end on two L20s.
 
-The single-rank suite is unchanged by the TP path (`cargo test --release -p pegainfer-gemma4 --features gemma4 --lib`).
+The single-rank suite is unchanged by the TP path (`cargo test --release -p pegainfer-gemma4 --features gemma4 --lib`), and now also carries the prefill-fault gate named above, which runs on one GPU.
 
 The **real 31B checkpoint**, which no single card holds, is served end to end on two L20s; its load, envelope and serving numbers are in `benchmarks/gemma4-31b-tp2-l20.md`.
 
@@ -129,9 +139,10 @@ So the real geometry (hidden 5376, `Q` 32 / `Kv` 16 / `G` 4, head dims 256/512, 
 
 ## Known bounds
 
-- **A rank-0 step failure stops the engine.** Rank 0's tower is launched first and its verdict checked before the peers are driven (see "How a step runs"): on failure the comms are aborted — releasing each rank's graphs first, as teardown does — and every later step refuses, so the engine cannot serve a comm-less reduction that would return partial sums. A failure on an extra rank is fatal. No test injects either; the triggers are host-side (`prepare_single`'s checks, a per-request scratch allocation) and device faults.
-- **A long prompt stalls the prefill — refused above `PEGAINFER_TP_MAX_PROMPT`.** With a prompt of a few hundred tokens or more, a prefill's tower reaches a host-side device sync on rank 0 — inside a global layer's MLP — before the extra ranks have launched their collectives. The one driving thread then waits on rank 0's reduction, which needs a peer call that will never be issued, and the scheduler hangs. Short prompts (tens of tokens — every gate here) never reach it; a full-depth 31B with a 256-token prompt does, deterministically. The cause is the **single-threaded, whole-tower-per-rank** driver: a host sync mid-tower only deadlocks when the peer has not yet started. Admission therefore **refuses a TP prompt longer than the ceiling** (`PEGAINFER_TP_MAX_PROMPT`; default is the `TP_MAX_PROMPT` constant in `engine.rs`, the longest length the TP gates pass, and `off` lifts it) rather than hang, and the scored probe's prompt length is that same ceiling, so guard and gate agree. Fixing it means driving the ranks **concurrently** (one thread per rank) or interleaving the tower layer-by-layer so a peer call is always in flight before any host sync — the same shape as the `prompt_logprobs` scoring deadlock this PR fixes, one level deeper; then the ceiling lifts and the 31B HF gate's 1024-token `edge` case joins it.
-- **Page-id agreement is inspected, not enforced.** Every rank's pools must stay identical in free-page order — that is the whole basis for "identical page ids". A debug build compares free-page counts after every admission, and every prefill compares the ranks' frontiers; a release build only does the frontiers, and nothing repairs a divergence.
+- **A rank-0 step failure stops the engine — but only with extra ranks.** Rank 0's tower is launched first and its verdict checked before the peers are driven (see "How a step runs"): on failure the comms are aborted — releasing each rank's graphs first, as teardown does — and every later step refuses, so the engine cannot serve a comm-less reduction that would return partial sums. A failure on an extra rank is fatal too. At **world size 1** `abort_comms` has nothing to abort and leaves the engine marked healthy, so the same failure stays what it has always been: that one request fails and the driver keeps serving. `engine::lane_gates_logprobs::a_failed_prefill_costs_that_request_not_the_engine` pins the single-rank half on both prefill paths, using a token id outside the embedding — `prepare_single`'s `validate_tokens` refuses it before the tower allocates anything, so the fault needs no injection hook. **The multi-rank half is still untested**: no gate injects a rank-0 or extra-rank failure at TP2, so the abort itself — destroying every rank's captured graph execs and dropping its communicator, with no stream drained first — is argued from the teardown order rather than exercised.
+- **A long prompt stalls the prefill — refused above `PEGAINFER_TP_MAX_PROMPT`.** With a prompt of a few hundred tokens or more, a prefill's tower reaches a host-side device sync on rank 0 — inside a global layer's MLP — before the extra ranks have launched their collectives. The one driving thread then waits on rank 0's reduction, which needs a peer call that will never be issued, and the scheduler hangs. Short prompts (tens of tokens — every gate here) never reach it; a full-depth 31B with a 256-token prompt does, deterministically. The cause is the **single-threaded, whole-tower-per-rank** driver: a host sync mid-tower only deadlocks when the peer has not yet started. Admission therefore **refuses a TP prompt longer than the ceiling** (`PEGAINFER_TP_MAX_PROMPT`; default is the `TP_MAX_PROMPT` constant in `engine.rs`, the longest length the TP gates pass) rather than hang, and the scored probe's prompt length is that same ceiling, so guard and gate agree. **`off`/`0` lifts the guard and with it the hang**: start-up logs a warning naming it, but nothing refuses, so lifting the ceiling on this build buys a deterministic scheduler wedge on the first long prompt — lift it only on a build whose rank driver is concurrent. Fixing it means driving the ranks **concurrently** (one thread per rank) or interleaving the tower layer-by-layer so a peer call is always in flight before any host sync — the same shape as the `prompt_logprobs` scoring deadlock this PR fixes, one level deeper; then the ceiling goes away and the 31B HF gate's 1024-token `edge` case joins it.
+- **Page-id agreement is inspected, not enforced.** Every rank's pools must stay identical in free-page order — that is the whole basis for "identical page ids". A debug build compares free-page counts after every admission, and every prefill compares the ranks' frontiers; a release build only does the frontiers, and nothing repairs a divergence. Three of the four admission sites self-heal, because the request's `GemmaKv` is dropped and both ranks' pages come back with it; the fourth (`ready_rows_pinned`, which keeps the row in the batch) cannot, so an extra rank that refuses there stops the engine instead of carrying the divergence into a step.
+- **The chunked walk's TP code has no runtime.** `PEGAINFER_MIX_CHUNK_TOKENS` is refused under TP, so the walker's extra-rank admission, its `prefill_extra_ranks` and its `tp_broken` check are unreachable with a non-empty `more` — kept because the concurrent-driver follow-up re-enables the knob, untested until then.
 - **The vocabulary projection is replicated.** `embed_tokens` and the tied head are `Whole` on each rank (31B: 262144 × 5376 bf16, ~2.8 GiB per rank), and every extra rank computes a whole batch of `vocab × rows` logits per decode step that is then discarded. Dropping it needs a head-free tower for the extra ranks — in graph mode that means a second per-bucket capture, because the head sits inside `decode_gpu_body`. Not implemented, not measured.
 - **`NCCL_PROTO=LL128` is a requirement the code reports rather than enforces.** Startup logs the NCCL version and the effective protocol and warns when it is not LL128; it does not refuse. On this container's stock NCCL the default protocol corrupts the all-reduce buffer (see the operational notes).
 

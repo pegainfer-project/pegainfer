@@ -31,6 +31,13 @@ use crate::testkit::u32_tensor;
 /// How many top logprobs each run keeps, and the largest absolute logprob gap
 /// two runs may show on a token they both kept. The gap is the bf16
 /// reduction-order drift accumulated over the tower, not a shape difference.
+///
+/// The line is a first cut from one measurement — the 12B replicate branch at
+/// 0.379, so ~1.3x of margin — and the shard branch measured 0.0000 against the
+/// same line. It is not calibrated the way `serve_oracle`'s `neutral_scale` is
+/// (two algorithms over one context, 0.31..5.75 observed, line 12.0); widening
+/// the prompt set or the checkpoint could move 0.379 without anything being
+/// wrong, so treat a failure near the line as "re-measure" before "regression".
 const TOP_K: usize = 8;
 const LOGBROB_LINE: f32 = 0.5;
 

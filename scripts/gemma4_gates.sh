@@ -68,6 +68,7 @@ GATES_SERVING_CONTRACT=(
   "gpu,ckpt engine::lane_gates_logprobs::prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode"
   "gpu,ckpt engine::lane_gates_logprobs::a_scored_prompt_beside_a_live_batch_is_prefilled_whole"
   "gpu,ckpt engine::lane_gates_logprobs::a_low_slot_chunked_pool_scores_up_to_what_it_holds"
+  "gpu,ckpt engine::lane_gates_logprobs::a_failed_prefill_costs_that_request_not_the_engine"
 )
 GATES_KV_AND_LANES=(
   "gpu,ckpt,fixtures serve::oracle::incremental_serving_matches_recompute"

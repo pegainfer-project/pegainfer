@@ -13,7 +13,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 | Qwen3-4B / 8B | `pegainfer-qwen3` | `qwen3` (default) | Full attention, TP support |
 | Qwen3.5-4B / 9B / 27B · Qwen3.8-27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention. Qwen3.8 shares the line: same `model_type`, same text geometry — see `docs/models/qwen35/support-qwen38.md` |
 | DeepSeek-V2-Lite | `pegainfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
-| Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Sliding-window + global full attention, single GPU, batched decode, opt-in chunked prefill |
+| Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Sliding-window + global full attention, dense sizes at TP2 (one rank per device), batched decode, opt-in chunked prefill (single rank only) |
 | Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
 | GLM5.2 | `pegainfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
 | Kimi-K3 | `pegainfer-k3` | `--features k3` | Hybrid KDA + MLA, latent MoE + MXFP4, EP (bring-up — single-rank decode wired) |
@@ -54,7 +54,7 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 - `PEGAINFER_MIX_GATHER_ROWS` / `PEGAINFER_MIX_MAX_PROMPTS` — gemma4 admission gather: how many prompt rows and how many prompts one mixed step may absorb (`1..=` the serving ceiling and `1..=` the decode slots; defaults gather only short bursts). Raising them lets a burst ride one step, which trades the median time to first token for the p99 tail and the wide-batch decode step; bad values refuse to start
 - `PEGAINFER_MAX_CONTEXT` — gemma4 serving ceiling raise (default 8192, up to the checkpoint's 262144; a raise past the default needs `PEGAINFER_MIX_CHUNK_TOKENS` and refuses the async lane)
 - `PEGAINFER_DECODE_SLOTS` — gemma4 decode slots (1..16, default 16): global KV budget = slots x ceiling, trade concurrency for context
-- `PEGAINFER_TP_MAX_PROMPT` — gemma4 tensor-parallel prompt limit in tokens (default 64, `off`/`0` to lift): the single-threaded rank driver stalls on a longer prefill, so admission refuses one; the concurrent-driver follow-up removes it
+- `PEGAINFER_TP_MAX_PROMPT` — gemma4 tensor-parallel prompt limit in tokens (default 64, `off`/`0` to lift): the single-threaded rank driver stalls on a longer prefill, so admission refuses one. Lifting it re-opens that stall as a hang — startup warns — and the concurrent-driver follow-up removes the knob
 - `GLM52_DECODE_SLOTS` / `GLM52_MTP_DRAFTS` — glm52 runtime profile: decode slots per rank (default 8, ceiling 32) and MTP draft span (default 5); `slots x (1+drafts)` must fit the 96-row step (validated at launch; MTP only). Throughput ceiling profile: `32` / `2`.
 - `PEGAINFER_K3_CP` — k3 opt-in context-parallel prefill lane: CP width, must equal the process's local rank count (on a fleet each process runs its own gang; remote ranks pad). Mutually exclusive with the dspark draft lane.
 - `PEGAINFER_K3_CP_MIN` — k3 CP admission floor in prompt tokens (default 2048; measured crossover ~1k). Prompts below it, or too long for one chunk step per rank (M0), prefill locally.
