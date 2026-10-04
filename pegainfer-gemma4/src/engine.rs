@@ -1261,6 +1261,11 @@ fn rank_kvs(rows: &mut [Active], rank: usize) -> Vec<&mut RankKv> {
 /// exactly as `Drop` orders it — aborting a comm while a graph that references
 /// its NCCL launches is alive wedges. `broken` is set first so no later step runs
 /// a comm-less reduction, which would return partial sums.
+///
+/// With no extra ranks there is no collective to abort and no peer frontier to
+/// keep in step, so this is the ordinary single-rank prefill failure the caller
+/// answers by failing that one request: return before `broken` is set, or a
+/// request-local error (a per-request scratch allocation) would stop the engine.
 fn abort_comms(
     broken: &Cell<bool>,
     ctx: &DeviceContext,
@@ -1268,6 +1273,9 @@ fn abort_comms(
     arena: &mut StepArena,
     more: &mut [RankState],
 ) {
+    if more.is_empty() {
+        return;
+    }
     broken.set(true);
     if select_device(ctx).is_ok() {
         arena.release_graphs();

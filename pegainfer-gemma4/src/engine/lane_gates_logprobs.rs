@@ -118,10 +118,11 @@ fn a_low_slot_chunked_pool_scores_up_to_what_it_holds() {
     harness.shutdown(&[]);
 }
 
-#[test]
-fn only_a_scored_prompt_is_bound_to_the_whole_prompt_ceiling() {
-    let request = |prompt_logprobs| Request {
-        prompt_tokens: ids(super::MAX_CONTEXT + 1, 9),
+/// A probe whose prompt is exactly `prompt_len` tokens, so a ceiling can be
+/// tested against a length known without reading the prompt back.
+fn ceiling_probe(prompt_len: usize, prompt_logprobs: Option<usize>) -> Request {
+    Request {
+        prompt_tokens: ids(prompt_len, 9),
         params: pegainfer_frontend::sampler::SamplingParams::default(),
         stop_policy: pegainfer_frontend::engine::StopPolicy::default(),
         max_tokens: 4,
@@ -131,23 +132,51 @@ fn only_a_scored_prompt_is_bound_to_the_whole_prompt_ceiling() {
         prompt_logprobs,
         trace_parent: None,
         client_label: None,
-    };
+    }
+}
+
+#[test]
+fn only_a_scored_prompt_is_bound_to_the_whole_prompt_ceiling() {
     let raised = 4 * super::MAX_CONTEXT;
-    assert!(super::validate_request(&request(None), raised, super::MAX_CONTEXT, None).is_ok());
-    assert!(matches!(
-        super::validate_request(&request(Some(0)), raised, super::MAX_CONTEXT, None),
-        Err(RejectReason::EchoPrefillTokens { .. })
-    ));
-    // Under tensor parallelism the ceiling is the boundary: a prompt equal to it
-    // passes, and one token past it is refused.
     let prompt_len = super::MAX_CONTEXT + 1;
     assert!(
-        super::validate_request(&request(None), raised, super::MAX_CONTEXT, Some(prompt_len))
-            .is_ok()
+        super::validate_request(
+            &ceiling_probe(prompt_len, None),
+            raised,
+            super::MAX_CONTEXT,
+            None
+        )
+        .is_ok()
     );
     assert!(matches!(
         super::validate_request(
-            &request(None),
+            &ceiling_probe(prompt_len, Some(0)),
+            raised,
+            super::MAX_CONTEXT,
+            None
+        ),
+        Err(RejectReason::EchoPrefillTokens { .. })
+    ));
+}
+
+#[test]
+fn the_tp_prompt_ceiling_refuses_one_token_past_it() {
+    let raised = 4 * super::MAX_CONTEXT;
+    let prompt_len = super::MAX_CONTEXT + 1;
+    // The ceiling is the boundary: a prompt equal to it passes, one token past
+    // it is refused.
+    assert!(
+        super::validate_request(
+            &ceiling_probe(prompt_len, None),
+            raised,
+            super::MAX_CONTEXT,
+            Some(prompt_len)
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        super::validate_request(
+            &ceiling_probe(prompt_len, None),
             raised,
             super::MAX_CONTEXT,
             Some(prompt_len - 1)

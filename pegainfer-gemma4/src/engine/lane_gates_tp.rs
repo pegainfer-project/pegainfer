@@ -121,6 +121,31 @@ fn top_of(lp: &TokenLogprob) -> HashMap<u32, f32> {
         .collect()
 }
 
+/// Two runs of the same one-rank workload must come out the same token for token
+/// and bit for bit. This is the control's bar: a gap metric that only bounds a
+/// tolerance can pass while two tokens trade places, so the control compares the
+/// runs themselves and the two-rank comparison below is left measuring tensor
+/// parallelism rather than harness noise.
+fn assert_identical(one: &[Drained], two: &[Drained], what: &str) {
+    assert_eq!(
+        one.len(),
+        two.len(),
+        "{what}: {} vs {} requests",
+        one.len(),
+        two.len()
+    );
+    for (index, (a, b)) in one.iter().zip(two).enumerate() {
+        assert_eq!(
+            a.ids, b.ids,
+            "{what}: request {index} decoded a different token"
+        );
+        assert_eq!(
+            a.logprobs, b.logprobs,
+            "{what}: request {index} scored different logprobs"
+        );
+    }
+}
+
 /// The worst shared top-k logprob gap over the run, and how many steps kept
 /// the same pick. `Detail` names the step that produced the gap so a failure
 /// can be read without a re-run.
@@ -139,13 +164,14 @@ struct Gaps {
     /// flattened distribution, where a shared token can sit at very different
     /// ranks in the two lists — read it beside `worst_pick`.
     worst_shared: f32,
-    /// Largest gap on a token *both* runs picked: the like-for-like measure of
-    /// how far the two distributions moved.
+    /// Largest gap on a token *both* runs picked, and on either token when the
+    /// picks differ: the like-for-like measure of how far the two distributions
+    /// moved. A flip is where a large move hides — the two tops can still read
+    /// equal — so the flipped picks are measured too, not skipped.
     worst_pick: f32,
     /// Largest gap between the two runs' *top* logprobs, whichever token holds
-    /// the top. This is what catches a step whose pick flipped: the picks then
-    /// differ, `worst_pick` stays zero, but the mass under the pick still has
-    /// to have moved little.
+    /// the top. A flip keeps this at zero, so it is a bound beside `worst_pick`,
+    /// not what catches one.
     worst_top: f32,
     same_pick: usize,
     compared: usize,
@@ -219,6 +245,16 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
                     left.contains_key(&pb),
                     "{what}: request {index} step {step}: two-rank pick is outside the one-rank top-{TOP_K}"
                 );
+                // Both picks now sit in both lists, so each one's own gap is
+                // measurable, and a flip is exactly where a large move hides:
+                // the two tops can read equal while the same token moved far.
+                // Fold both in before the break, or the flip is the one step
+                // that leaves the run with no bound at all.
+                for token in [pa, pb] {
+                    if let (Some(va), Some(vb)) = (left.get(&token), right.get(&token)) {
+                        worst_pick = worst_pick.max((va - vb).abs());
+                    }
+                }
                 // The two runs now decode from different prefixes, so every later
                 // step of this request compares different text; stop here.
                 break;
@@ -259,27 +295,20 @@ fn the_two_rank_engine_matches_one_rank() {
     let mut one = launch_with(&single_options(device), &overrides);
     let single = serve_batch(&mut one, &prompts, 16, TOP_K);
     drop(one);
-    // The control: the same one-rank run again. If this is not bit-identical
-    // the comparison below measures harness noise, not tensor parallelism.
+    // The control: the same one-rank run again, and it must come out
+    // **bit-identical**. A metric that only holds a tolerance can pass while a
+    // token trades places with another, so compare the runs themselves.
     let mut one_again = launch_with(&single_options(device), &overrides);
     let repeat = serve_batch(&mut one_again, &prompts, 16, TOP_K);
     drop(one_again);
-    let control = distribution_gap(&single, &repeat, "tp1-repeat");
-    assert!(
-        control.worst_pick.to_bits() == 0.0f32.to_bits()
-            && control.worst_top.to_bits() == 0.0f32.to_bits(),
-        "two one-rank runs disagree ({:.4} on a picked token, {:.4} at the top), so the \
-         two-rank comparison is measuring nondeterminism",
-        control.worst_pick,
-        control.worst_top
-    );
+    assert_identical(&single, &repeat, "tp1-repeat");
 
     let mut two = launch_with(&tp2_options(device, peer), &overrides);
     let tp2 = serve_batch(&mut two, &prompts, 16, TOP_K);
     drop(two);
 
-    // The control pins `single == repeat` bit for bit, so comparing tp2 against
-    // the repeat run would repeat this comparison; one of them is enough.
+    // `single == repeat` bit for bit, so comparing tp2 against the repeat run
+    // would repeat this comparison; one of them is enough.
     let gaps = distribution_gap(&single, &tp2, "tp2");
     eprintln!(
         "tp2: {}/{} steps keep the one-rank pick; worst picked-token logprob gap {:.4} (top {:.4})",

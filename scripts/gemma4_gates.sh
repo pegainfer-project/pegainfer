@@ -593,18 +593,14 @@ fi
 
 # The 31B Hugging Face fixture is a separate artifact from its checkpoint, so a
 # gate that compares against it leaves the run by name when it is not selected.
+# Only that the variable is set is checked here: the fixture's own manifest is
+# held against the checkpoint under test by `golden_bytes`, so checking the file
+# name on top of that could not catch a mismatched dump — only refuse a valid one
+# that happens to be named otherwise.
 hf31_mismatch=
 require_hf31() {
   if [ -z "${PEGAINFER_GEMMA4_GOLDEN:-}" ]; then
     hf31_mismatch="PEGAINFER_GEMMA4_GOLDEN is unset (point it at the 31B HF fixture)"
-  else
-    # The committed artifact's own name, not a substring: a `*31b*` match would
-    # also take a fixture dumped for a different 31B.
-    case "${PEGAINFER_GEMMA4_GOLDEN##*/}" in
-      gemma4-31b-hf-golden.safetensors) ;;
-      *) hf31_mismatch="PEGAINFER_GEMMA4_GOLDEN is not the 31B fixture \
-(gemma4-31b-hf-golden.safetensors)" ;;
-    esac
   fi
 }
 
