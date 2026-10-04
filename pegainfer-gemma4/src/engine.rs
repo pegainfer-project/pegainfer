@@ -1302,6 +1302,35 @@ fn abort_comms(
     }
 }
 
+/// Drive every extra rank for a decode-shaped step and leave them all in
+/// flight — the decode counterpart of `EngineState::step_extra_ranks`, and the
+/// one place the two shapes' difference is written down. A free function for
+/// the same reason `abort_comms` is: a mixed step still holds rank 0's logits
+/// out of its arena, so this may only borrow the fields it uses.
+///
+/// No drain here. A decode-shaped step's only host blocking point is rank 0's
+/// sampler readback, which the caller reaches after this returns, so every
+/// rank's collectives are in flight before anything waits; draining per rank
+/// instead would deadlock at three ranks or more, exactly as the comment in
+/// `step_extra_ranks` explains. A mixed step carries prompt rows and still
+/// takes this shape — its rows ride the decode step, not a prefill of their
+/// own.
+///
+/// A failure on an extra rank is fatal, because the ranks' frontiers must not
+/// drift apart. It reaches the driver as `Err` from `Scheduler::step`, which
+/// writes off every open account and winds the engine down.
+fn drive_extra_ranks<F>(more: &mut [RankState], ctx: &DeviceContext, mut per_rank: F) -> Result<()>
+where
+    F: FnMut(&mut RankState, usize) -> Result<()>,
+{
+    for (rank, state) in more.iter_mut().enumerate() {
+        activate_rank(&state.ctx)?;
+        per_rank(state, rank + 1)?;
+    }
+    // The caller's next device work is rank 0's.
+    activate_rank(ctx)
+}
+
 /// Everything the contract-owned scheduler thread owns for the life of the
 /// engine. Loading completes before the driver thread is spawned, so launch
 /// failures return synchronously to the caller.
@@ -2895,21 +2924,15 @@ impl EngineState {
                 return Err(err.context("batched decode launch"));
             }
             // The other ranks carry the same tokens and page ids; only rank 0
-            // samples, so their logits are discarded. A failure on them is fatal
-            // — the ranks' frontiers must not drift apart.
+            // samples, so their logits are discarded.
             if let Some(tokens) = tokens.as_deref() {
-                for (rank, state) in self.more.iter_mut().enumerate() {
-                    activate_rank(&state.ctx)?;
-                    let mut kvs = rank_kvs(active, rank + 1);
-                    state.serve.decode_batch_step(
-                        &state.ctx,
-                        &mut state.arena,
-                        &mut kvs,
-                        tokens,
-                    )?;
-                }
-                // The sampler below reads rank 0's arena.
-                activate_rank(&self.ctx)?;
+                drive_extra_ranks(&mut self.more, &self.ctx, |state, rank| {
+                    let mut kvs = rank_kvs(active, rank);
+                    state
+                        .serve
+                        .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, tokens)
+                        .map(|_| ())
+                })?;
             }
         }
         let graph_slot = crate::serve::decode_bucket_slot(rows);
@@ -3025,23 +3048,24 @@ impl EngineState {
             }
         };
         // The other ranks run the same mixed step on their own families and
-        // arena; their logits are discarded. A failure on them is fatal.
-        for (rank, state) in self.more.iter_mut().enumerate() {
-            activate_rank(&state.ctx)?;
+        // arena; their logits are discarded.
+        drive_extra_ranks(&mut self.more, &self.ctx, |state, rank| {
             let mut extra_prefills: Vec<(&mut RankKv, &[u32])> = prefills
                 .iter_mut()
-                .map(|(kv, tokens)| (kv.core_mut(rank + 1), *tokens))
+                .map(|(kv, tokens)| (kv.core_mut(rank), *tokens))
                 .collect();
-            let mut kvs = rank_kvs(active, rank + 1);
-            state.serve.mixed_prefill_decode_step(
-                &state.ctx,
-                &mut state.arena,
-                &mut extra_prefills,
-                &mut kvs,
-                &decode_tokens,
-            )?;
-        }
-        activate_rank(&self.ctx)?;
+            let mut kvs = rank_kvs(active, rank);
+            state
+                .serve
+                .mixed_prefill_decode_step(
+                    &state.ctx,
+                    &mut state.arena,
+                    &mut extra_prefills,
+                    &mut kvs,
+                    &decode_tokens,
+                )
+                .map(|_| ())
+        })?;
         mixed_head_flow(
             &self.ctx,
             &self.suppress_ids,
@@ -3144,16 +3168,14 @@ impl EngineState {
         }
         // Rank 0's tower is in flight; now every other rank's. They carry the
         // same tokens and page ids, and only rank 0 samples, so their logits
-        // are discarded. A failure on them is fatal — the ranks' frontiers must
-        // not drift apart.
-        for (rank, state) in self.more.iter_mut().enumerate() {
-            activate_rank(&state.ctx)?;
-            let mut kvs = rank_kvs(active, rank + 1);
+        // are discarded.
+        drive_extra_ranks(&mut self.more, &self.ctx, |state, rank| {
+            let mut kvs = rank_kvs(active, rank);
             state
                 .serve
-                .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, &tokens)?;
-        }
-        activate_rank(&self.ctx)?;
+                .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, &tokens)
+                .map(|_| ())
+        })?;
         let (logits, _) = self.arena.logits_and_ids();
         let sampled = {
             let rows: Vec<SampleRow<'_>> = active
