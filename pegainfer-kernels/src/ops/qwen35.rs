@@ -1,10 +1,15 @@
-//! Qwen3.5 full-attention wrappers at head dim 256: the decode prep and the
-//! paged attention reads.
+//! Qwen3.5 HD256 attention and explicit FlashInfer GDN candidate operations.
 
+mod decode_gemm;
+mod gdn;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
+pub use decode_gemm::Qwen35DecodeGemm;
+pub use gdn::Qwen35GdnAot;
+pub use gdn::Qwen35GdnGeometry;
+pub use gdn::Qwen35GdnWorkspace;
 use half::bf16;
 
 use super::PrefillPagedPlan;
@@ -358,3 +363,6 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

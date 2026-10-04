@@ -228,6 +228,14 @@ pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
 #[cfg(feature = "qwen35")]
+pub use qwen35::Qwen35DecodeGemm;
+#[cfg(feature = "qwen35")]
+pub use qwen35::Qwen35GdnAot;
+#[cfg(feature = "qwen35")]
+pub use qwen35::Qwen35GdnGeometry;
+#[cfg(feature = "qwen35")]
+pub use qwen35::Qwen35GdnWorkspace;
+#[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_hd256_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_via_prefill_hd256_into;

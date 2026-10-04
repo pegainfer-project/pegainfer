@@ -1,8 +1,8 @@
 # Qwen3.5 Accuracy
 
-> **TL;DR:** Qwen3.5 accuracy now has short and long HF-backed logits goldens (`tests/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, and `test_data/qwen35-4b-hf-long-golden.safetensors`). The HF fixtures use `AutoModelForCausalLM` with `use_cache=True` / `past_key_values`, so they match pegainfer's prefill + decode shape. The long fixture crosses the old 4096-position RoPE cache boundary with 4097- and 8192-token prompts, and the #250 fix recovers full GSM8K 8-shot at `batch_size=1` to `strict-match` 79.38% / `flexible-extract` 79.30% vs the HF 79.45% baseline. The gate is size-portable: it picks the committed fixture whose recorded `config_sha256` matches the pointed model's config; all five sizes plus Qwen3.8-27B ship committed short + long fixtures and run the same logits gate (see "Fixture selection" and [support-qwen38.md](support-qwen38.md)) — 9B confirms the #516 untied-lm_head fix, 27B covers the #564 group-6 decode reroute, and 0.8B/2B are the first checkpoints with GDN expansion factor 1 (`linear_num_value_heads == linear_num_key_heads`), validated on GH200 sm_90. The older exact-text `test_data/Qwen3.5-4B.json` and its regeneration test are retired; `e2e_scheduler` stays a scheduler liveness/integration check that now also gates model-wide collapse (free-running output must not degenerate into token loops). A broader PegaInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
+> **TL;DR:** Qwen3.5 accuracy now has short and long HF-backed logits goldens (`src/executor/hf_golden_gate.rs`, `test_data/qwen35-4b-hf-golden.safetensors`, and `test_data/qwen35-4b-hf-long-golden.safetensors`). The HF fixtures use `AutoModelForCausalLM` with `use_cache=True` / `past_key_values`, so they match pegainfer's prefill + decode shape. The long fixture crosses the old 4096-position RoPE cache boundary with 4097- and 8192-token prompts, and the #250 fix recovers full GSM8K 8-shot at `batch_size=1` to `strict-match` 79.38% / `flexible-extract` 79.30% vs the HF 79.45% baseline. The gate is size-portable: it picks the committed fixture whose recorded `config_sha256` matches the pointed model's config; all five sizes plus Qwen3.8-27B ship committed short + long fixtures and run the same logits gate (see "Fixture selection" and [support-qwen38.md](support-qwen38.md)) — 9B confirms the #516 untied-lm_head fix, 27B covers the #564 group-6 decode reroute, and 0.8B/2B are the first checkpoints with GDN expansion factor 1 (`linear_num_value_heads == linear_num_key_heads`), validated on GH200 sm_90. The older exact-text `test_data/Qwen3.5-4B.json` and its regeneration test are retired; `scheduler::e2e_tests` stays a scheduler liveness/integration check that now also gates model-wide collapse (free-running output must not degenerate into token loops). A broader PegaInfer-owned rand/hash corpus is deferred until the project decides how to handle cross-architecture exact-token drift.
 >
-> **Last touched:** 2026-09. The HF logits gate passes on RTX 5090 `sm_120` (4B/9B/27B) and on GH200 `sm_90` (0.8B/2B) and covers the qwen35-owned replay surfaces: sequential graph decode, bucket-straddling batched graph decode, slot-compaction replay after a mid-batch request drop, and a long-prompt sequential replay at 4097/8192 tokens. A full GSM8K 8-shot `lm_eval` run against `/v1/completions` also passes at HF-baseline accuracy. Current accuracy command is crate-local and needs an absolute `PEGAINFER_TEST_MODEL_PATH`: `cargo test --release -p pegainfer-qwen35 --test hf_golden_gate -- --nocapture`. Run `e2e_scheduler` only when scheduler request-flow behavior changes.
+> **Last touched:** 2026-09. The HF logits gate passes on RTX 5090 `sm_120` (4B/9B/27B) and on GH200 `sm_90` (0.8B/2B) and covers the qwen35-owned replay surfaces: sequential graph decode, bucket-straddling batched graph decode, slot-compaction replay after a mid-batch request drop, and a long-prompt sequential replay at 4097/8192 tokens. A full GSM8K 8-shot `lm_eval` run against `/v1/completions` also passes at HF-baseline accuracy. Current accuracy command is crate-local and needs an absolute `PEGAINFER_TEST_MODEL_PATH`: `cargo test --release -p pegainfer-qwen35 --features qwen35 --lib executor::hf_golden_gate -- --nocapture --test-threads=1`. Run `scheduler::e2e_tests` only when scheduler request-flow behavior changes.
 
 ## Goal
 
@@ -13,7 +13,7 @@
 ## Current State
 
 - Reusable debugging method now lives in [../../playbooks/accuracy-parity-playbook.md](../../playbooks/accuracy-parity-playbook.md).
-- `pegainfer-qwen35/tests/hf_golden_gate.rs` checks pegainfer logits against pinned HF bf16 `past_key_values` oracles, a short + long pair per committed checkpoint (`qwen35` 0.8b/2b/4b/9b/27b, `qwen38` 27b):
+- `pegainfer-qwen35/src/executor/hf_golden_gate.rs` checks pegainfer logits against pinned HF bf16 `past_key_values` oracles, a short + long pair per committed checkpoint (`qwen35` 0.8b/2b/4b/9b/27b, `qwen38` 27b):
   - `test_data/qwen35-0.8b-hf-golden.safetensors` / `qwen35-0.8b-hf-long-golden.safetensors` — 0.8B short + long; first GDN expansion-factor-1 checkpoint (16/16 linear heads vs the 2× of 4B/9B/27B); GH200 sm_90 floors mean 0.027–0.030 / p99 ≤ 0.115 across all five graph passes.
   - `test_data/qwen35-2b-hf-golden.safetensors` / `qwen35-2b-hf-long-golden.safetensors` — 2B short + long, same expansion-factor-1 path; GH200 sm_90 floors mean 0.023–0.029 / p99 ≤ 0.110.
   - `test_data/qwen35-4b-hf-golden.safetensors` / `qwen35-4b-hf-long-golden.safetensors` — 4B short mixed-shape + long 4097/8192-token replay surfaces.
@@ -21,7 +21,7 @@
   - `test_data/qwen35-27b-hf-golden.safetensors` / `qwen35-27b-hf-long-golden.safetensors` — 27B (group-6 full attention, decodes via the #564 reroute) short + long, within the 4B tolerances.
   - `test_data/qwen38-27b-hf-golden.safetensors` / `qwen38-27b-hf-long-golden.safetensors` — Qwen3.8-27B short + long (`Qwen/Qwen3.8-27B` revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`). Its text tower is shape-identical to Qwen3.5-27B's, so geometry alone cannot name the fixture; see "Fixture selection" and [support-qwen38.md](support-qwen38.md).
 - `pegainfer-qwen35/tests/e2e.rs`, `pegainfer-qwen35/tests/regen_test_data.rs`, and `test_data/Qwen3.5-4B.json` are retired. They were exact-text PegaInfer self-baselines, not HF accuracy gates.
-- `pegainfer-qwen35/tests/e2e_scheduler.rs` still loads the model and exercises sequential, repeated, concurrent, and consumer-drop scheduler paths, but it no longer reads an exact-text JSON fixture.
+- `pegainfer-qwen35/src/scheduler/e2e_tests.rs` still loads the model and exercises sequential, repeated, concurrent, and consumer-drop scheduler paths, but it no longer reads an exact-text JSON fixture.
 - A broader PegaInfer-owned rand/hash corpus was considered for issue #186, but checked-in exact token/hash data may drift across GPU architectures (`sm_80`, `sm_90`, `sm_120`). Keep that as follow-up design work until the cross-architecture stability policy is explicit.
 - `docs/models/qwen35/optimization.md` records historical exact-text baseline churn. New accuracy work should use the HF logits gate before interpreting prompt-level text drift.
 - The #250 GSM8K 8-shot recovery run now closes the task-score side of the old long-prompt divergence: pegainfer scored `strict-match` 79.38% and `flexible-extract` 79.30% vs the HF 79.45% baseline.
@@ -44,7 +44,7 @@
 - Default fixtures live in `test_data/` (names like `qwen35-4b-hf-golden.safetensors` are conventions from the dumper, not keys); `PEGAINFER_QWEN35_HF_GOLDEN` / `PEGAINFER_QWEN35_HF_LONG_GOLDEN` override them.
 - Failure semantics: the shared `model_path_or_skip` prerequisite skips when `PEGAINFER_TEST_MODEL_PATH` is unset, empty, unreadable, or not a Qwen3.5 config — those are environment-absent skips, not validation. Once a valid model path passes that prerequisite, a missing default fixture panics; an env override pointing at a missing file panics; and a checkpoint whose HF revision cannot be resolved **panics** naming `PEGAINFER_TEST_MODEL_REVISION` — the revision is the only field pinning the weights, so an unresolvable one must not read as `ok`.
 - Tolerances are shared across sizes from the 4B calibration until a new size has a green baseline to calibrate against (the `MARGIN_TOL`/`MEAN_TOL`/`P99_TOL` consts); the 0.8B, 2B, 9B, and 27B floors all sit well inside them.
-- The model-wide collapse net folds into `tests/e2e_scheduler.rs` (Phase 2): its free-running completions fail when at least half collapse into token loops (distinct-token ratio, same-token run, or exact repeated tail period), reusing the scheduler test's model load — the size-independent net under the fixture gate.
+- The model-wide collapse net folds into `src/scheduler/e2e_tests.rs` (Phase 2): its free-running completions fail when at least half collapse into token loops (distinct-token ratio, same-token run, or exact repeated tail period), reusing the scheduler test's model load — the size-independent net under the fixture gate.
 
 ### HF logits golden
 
@@ -67,7 +67,9 @@ PEGAINFER_CUDA_SM=120 \
 PEGAINFER_TRITON_PYTHON=$TRITON_PYTHON \
 PEGAINFER_TEST_MODEL_PATH=$MODEL_PATH \
 PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
-cargo test --release -p pegainfer-qwen35 --test hf_golden_gate -- --nocapture
+cargo test --release -p pegainfer-qwen35 --features qwen35 --lib \
+  executor::hf_golden_gate::pega_logprobs_match_hf_golden_within_qwen35_tolerance \
+  -- --exact --test-threads=1 --nocapture
 ```
 
 Observed floor from that run:
@@ -104,7 +106,9 @@ PEGAINFER_CUDA_SM=120 \
 PEGAINFER_TRITON_PYTHON=$TRITON_PYTHON \
 PEGAINFER_TEST_MODEL_PATH=$MODEL_PATH \
 PEGAINFER_TEST_MODEL_REVISION=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
-cargo test --release -p pegainfer-qwen35 --test hf_golden_gate -- --nocapture
+cargo test --release -p pegainfer-qwen35 --features qwen35 --lib \
+  executor::hf_golden_gate::pega_logprobs_match_hf_long_golden_within_qwen35_tolerance \
+  -- --exact --test-threads=1 --nocapture
 ```
 
 Observed long-prompt floor from that run:

@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
+use common::EngineHarness;
+use common::RequestGuard;
 use log::info;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
@@ -16,10 +18,8 @@ use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
-mod common;
-
-use common::EngineHarness;
-use common::RequestGuard;
+use crate::test_fixture as common;
+use crate::test_fixture::GdnAcceptance;
 
 const CASES: &[TestCase] = &[
     TestCase {
@@ -143,7 +143,11 @@ fn submit_repeated_token_request(
     handle.submit(request)
 }
 
-fn wait_for_first_token(handle: &mut EngineHarness, control: &RequestGuard, request_id: &str) {
+fn wait_for_first_token(
+    handle: &mut EngineHarness,
+    control: &RequestGuard,
+    request_id: &str,
+) -> Vec<u32> {
     let deadline = Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let update = recv_event_before(handle, control, request_id, deadline);
@@ -152,7 +156,7 @@ fn wait_for_first_token(handle: &mut EngineHarness, control: &RequestGuard, requ
             "{request_id} ended before its first token"
         );
         if !update.tokens.is_empty() {
-            return;
+            return update.tokens;
         }
     }
 }
@@ -184,14 +188,14 @@ fn assert_no_generated_event(handle: &mut EngineHarness, control: &RequestGuard,
     }
 }
 
-fn drain_tokens(handle: &mut EngineHarness, control: &RequestGuard, request_id: &str) -> usize {
-    let mut tokens = 0;
+fn drain_tokens(handle: &mut EngineHarness, control: &RequestGuard, request_id: &str) -> Vec<u32> {
+    let mut tokens = Vec::new();
     while let Some(update) = handle.try_next(control.id()) {
         assert!(
             update.terminal.is_none(),
             "{request_id} ended while it must remain active"
         );
-        tokens += update.tokens.len();
+        tokens.extend(update.tokens);
     }
     tokens
 }
@@ -574,30 +578,40 @@ fn run_full_scheduler_e2e(
 
 #[test]
 fn test_e2e_qwen35_scheduler() {
-    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_scheduler") else {
+    run_scheduler_e2e(&GdnAcceptance::Triton);
+}
+
+#[test]
+#[ignore = "requires SM120, a validated candidate identity, and Qwen3.5 weights"]
+fn candidate_e2e_qwen35_scheduler() {
+    run_scheduler_e2e(&GdnAcceptance::candidate().expect("candidate prerequisites"));
+}
+
+fn run_scheduler_e2e(acceptance: &GdnAcceptance) {
+    let Some(model_path) = acceptance
+        .model_path("test_e2e_qwen35_scheduler")
+        .expect("model prerequisite")
+    else {
         return;
     };
 
     info!("Loading Qwen3.5 model for scheduler test...");
     let start = Instant::now();
-    // Reduced batch capacity to fit on 16GB GPUs alongside the model. The model
-    // sizes its buffers with it and the scheduler admits against it, so both
-    // take the same binding.
-    let max_batch = 8;
-    let model = pegainfer_qwen35::runtime::Qwen35Model::from_safetensors_with_options(
-        &model_path,
-        true,
-        max_batch,
-    )
-    .expect("Failed to load model");
     let tokenizer = common::load_tokenizer(&model_path);
-    let handle = pegainfer_qwen35::runtime::start_with_capacity(
-        model,
-        42,
-        max_batch,
-        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
-    )
-    .expect("Failed to start Qwen3.5 scheduler");
+    let overlap = if acceptance.is_candidate() {
+        crate::Qwen35DecodeOverlap::SharedSm
+    } else {
+        crate::Qwen35DecodeOverlap::Off
+    };
+    let handle = acceptance
+        .launch_engine(
+            &model_path,
+            8,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            crate::Qwen35SchedulerPolicy::Off,
+            overlap,
+        )
+        .expect("Failed to start Qwen3.5 scheduler");
     let mut handle = EngineHarness::new(handle);
     info!("scheduler loaded in {:.2?}", start.elapsed());
 
@@ -607,8 +621,20 @@ fn test_e2e_qwen35_scheduler() {
 
 #[test]
 fn test_e2e_qwen35_shared_sm_last_decoder() {
+    run_shared_sm_last_decoder(&GdnAcceptance::Triton);
+}
+
+#[test]
+#[ignore = "requires SM120, a validated candidate identity, and Qwen3.5 weights"]
+fn candidate_e2e_qwen35_shared_sm_last_decoder() {
+    run_shared_sm_last_decoder(&GdnAcceptance::candidate().expect("candidate prerequisites"));
+}
+
+fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
     pegainfer_core::logging::init_default();
-    let Some(model_path) = common::model_path_or_skip("test_e2e_qwen35_shared_sm_last_decoder")
+    let Some(model_path) = acceptance
+        .model_path("test_e2e_qwen35_shared_sm_last_decoder")
+        .expect("model prerequisite")
     else {
         return;
     };
@@ -620,22 +646,16 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         .next()
         .expect("test prompt must contain a token");
 
-    let off_reference_tokens = {
-        let off_handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
-            Path::new(&model_path),
-            EngineLoadOptions {
-                enable_cuda_graph: true,
-                device_ordinals: vec![0],
-                seed: 42,
-                ..EngineLoadOptions::default()
-            },
-            4,
-            8192,
-            pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
-            pegainfer_qwen35::Qwen35DecodeOverlap::Off,
-            0,
-        )
-        .expect("Failed to start Qwen3.5 default-Off scheduler");
+    let (off_reference_tokens, off_decoder_tokens) = {
+        let off_handle = acceptance
+            .launch_engine(
+                &model_path,
+                4,
+                8192,
+                crate::Qwen35SchedulerPolicy::Off,
+                crate::Qwen35DecodeOverlap::Off,
+            )
+            .expect("Failed to start Qwen3.5 default-Off scheduler");
         let mut off_handle = EngineHarness::new(off_handle);
         let off_request = submit_repeated_token_request(
             &off_handle,
@@ -656,28 +676,37 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
             2,
             "default-Off reference request must finish before Shared-SM parity"
         );
-        off.tokens
+        let decoder_request = submit_repeated_token_request(
+            &off_handle,
+            "overlap-off-decoder-reference",
+            seed_token,
+            512,
+            128,
+        );
+        let decoder = collect_generation_with_timeout(
+            &mut off_handle,
+            &decoder_request,
+            "overlap-off-decoder-reference",
+            None,
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(decoder.tokens.len(), 128);
+        (off.tokens, decoder.tokens)
     };
 
     // The auto policy may now combine with Shared-SM overlap: it only reshapes
     // per-step prefill chunk budgets, so chunk boundaries change while greedy
     // tokens must not.
     {
-        let auto_handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
-            Path::new(&model_path),
-            EngineLoadOptions {
-                enable_cuda_graph: true,
-                device_ordinals: vec![0],
-                seed: 42,
-                ..EngineLoadOptions::default()
-            },
-            4,
-            8192,
-            pegainfer_qwen35::Qwen35SchedulerPolicy::Auto,
-            pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
-            0,
-        )
-        .expect("Failed to start Qwen3.5 auto + shared-SM scheduler");
+        let auto_handle = acceptance
+            .launch_engine(
+                &model_path,
+                4,
+                8192,
+                crate::Qwen35SchedulerPolicy::Auto,
+                crate::Qwen35DecodeOverlap::SharedSm,
+            )
+            .expect("Failed to start Qwen3.5 auto + shared-SM scheduler");
         let mut auto_handle = EngineHarness::new(auto_handle);
 
         let auto_active_request = submit_repeated_token_request(
@@ -729,36 +758,48 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
         );
     }
 
-    let handle = pegainfer_qwen35::start_engine_with_capacity_policy_and_overlap(
-        Path::new(&model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: true,
-            device_ordinals: vec![0],
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-        4,
-        8192,
-        pegainfer_qwen35::Qwen35SchedulerPolicy::Off,
-        pegainfer_qwen35::Qwen35DecodeOverlap::SharedSm,
-        0,
-    )
-    .expect("Failed to start Qwen3.5 shared-SM scheduler");
+    let handle = acceptance
+        .launch_engine(
+            &model_path,
+            4,
+            8192,
+            crate::Qwen35SchedulerPolicy::Off,
+            crate::Qwen35DecodeOverlap::SharedSm,
+        )
+        .expect("Failed to start Qwen3.5 shared-SM scheduler");
     let mut handle = EngineHarness::new(handle);
 
     let active_request =
         submit_repeated_token_request(&handle, "overlap-last-decoder", seed_token, 512, 128);
-    wait_for_first_token(&mut handle, &active_request, "overlap-last-decoder");
-    let _ = drain_tokens(&mut handle, &active_request, "overlap-last-decoder");
+    let mut active_tokens =
+        wait_for_first_token(&mut handle, &active_request, "overlap-last-decoder");
+    active_tokens.extend(drain_tokens(
+        &mut handle,
+        &active_request,
+        "overlap-last-decoder",
+    ));
     let prefill_request =
         submit_repeated_token_request(&handle, "overlap-inflight-prefill", seed_token, 8192, 2);
 
     wait_for_running_requests(&handle, 2, std::time::Duration::from_secs(10));
-    let _ = drain_tokens(&mut handle, &active_request, "overlap-last-decoder");
+    active_tokens.extend(drain_tokens(
+        &mut handle,
+        &active_request,
+        "overlap-last-decoder",
+    ));
     for _ in 0..2 {
-        wait_for_first_token(&mut handle, &active_request, "overlap-last-decoder");
+        active_tokens.extend(wait_for_first_token(
+            &mut handle,
+            &active_request,
+            "overlap-last-decoder",
+        ));
         assert_no_generated_event(&mut handle, &prefill_request, "overlap-inflight-prefill");
     }
+    assert_eq!(
+        active_tokens,
+        off_decoder_tokens[..active_tokens.len()],
+        "Shared-SM active decoder must match the greedy default-Off reference"
+    );
     active_request.abort();
     let prefill = collect_generation_with_timeout(
         &mut handle,
@@ -804,7 +845,7 @@ fn test_e2e_qwen35_shared_sm_last_decoder() {
     );
     assert!(first.terminal.is_none());
     assert!(
-        decoder_tokens > 0,
+        !decoder_tokens.is_empty(),
         "the existing decoder must remain active"
     );
     let remaining = collect_generation_with_timeout(
@@ -871,7 +912,7 @@ fn test_e2e_qwen35_scheduler_tp2() {
     info!("Loading Qwen3.5 TP2 model for scheduler test...");
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
-    let handle = pegainfer_qwen35::start_engine_with_capacity(
+    let handle = crate::start_engine_with_capacity(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: false,
@@ -880,7 +921,7 @@ fn test_e2e_qwen35_scheduler_tp2() {
             ..EngineLoadOptions::default()
         },
         8,
-        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+        crate::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 TP2 scheduler");
     let mut handle = EngineHarness::new(handle);
@@ -903,7 +944,7 @@ fn test_e2e_qwen35_scheduler_tp2_graph() {
     // P2c: decode replays pre-captured CUDA Graphs when the TP-local decode
     // GQA group has a compiled kernel (4B/9B); uncompiled groups (27B group 6)
     // keep the batched eager path under the same request flow.
-    let handle = pegainfer_qwen35::start_engine_with_capacity(
+    let handle = crate::start_engine_with_capacity(
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
@@ -912,7 +953,7 @@ fn test_e2e_qwen35_scheduler_tp2_graph() {
             ..EngineLoadOptions::default()
         },
         8,
-        pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
+        crate::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 TP2 graph scheduler");
     let mut handle = EngineHarness::new(handle);

@@ -4,5 +4,13 @@ license = "Apache-2.0"
 name = "pegainfer-build"
 publish = false
 
+[dependencies]
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[features]
+qwen35-gdn = ["dep:serde", "dep:serde_json", "dep:sha2"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
