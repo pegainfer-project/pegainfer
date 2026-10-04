@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::sampler::SamplingParams;
 
@@ -39,6 +40,7 @@ pub(crate) struct FakeExecutor {
     pub(crate) dropped: Arc<Mutex<Vec<u64>>>,
     pub(crate) prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
+    emit_logprobs: bool,
 }
 
 impl FakeExecutor {
@@ -56,11 +58,17 @@ impl FakeExecutor {
             dropped,
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
+            emit_logprobs: false,
         }
     }
 
     pub(crate) fn with_stop_token(mut self, token: u32) -> Self {
         self.stop_token = Some(token);
+        self
+    }
+
+    pub(crate) fn with_logprobs(mut self) -> Self {
+        self.emit_logprobs = true;
         self
     }
 
@@ -99,7 +107,14 @@ impl FakeExecutor {
         PrefillRequestResult {
             request_id: req.request_id,
             first_token: 100 + req.request_id.raw() as u32,
-            first_token_logprob: None,
+            first_token_logprob: self.emit_logprobs.then(|| {
+                let token = 100 + req.request_id.raw() as u32;
+                pegainfer_frontend::engine::TokenLogprob {
+                    logprob: -0.1,
+                    rank: 0,
+                    top_logprobs: vec![(token, -0.1)],
+                }
+            }),
             prompt_logprobs: None,
             cached_tokens: 0,
             completed,
@@ -224,7 +239,14 @@ impl ModelExecutor for FakeExecutor {
                 .map(|req| DecodeRequestResult {
                     request_id: req.request_id,
                     token: 200 + req.request_id.raw() as u32,
-                    logprob: None,
+                    logprob: self.emit_logprobs.then(|| {
+                        let token = 200 + req.request_id.raw() as u32;
+                        pegainfer_frontend::engine::TokenLogprob {
+                            logprob: -0.2,
+                            rank: 0,
+                            top_logprobs: vec![(token, -0.2)],
+                        }
+                    }),
                 })
                 .collect(),
         })
@@ -267,6 +289,7 @@ pub(crate) fn request(prompt_len: usize, max_tokens: usize) -> Request {
     Request {
         prompt_tokens: vec![1; prompt_len],
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,

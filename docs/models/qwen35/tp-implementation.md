@@ -1,671 +1,166 @@
-# Qwen3.5 TP Implementation Record
+# Qwen3.5 TP Implementation
 
-> **TL;DR:** Qwen3.5 TP is complete through Phase 2b plus batched eager TP decode and P2c CUDA Graph under TP: TP2 supports start-gated eager unified prefill+decode with strict ID-aligned artifacts, fail-closed lifecycle recovery, and pre-load CUDA ordinal validation (#870); linear-attention/GDR state is sharded per rank (27B TP2 fits on 2×48 GB); TP decode rows run as one batched forward per step; and 4B/9B TP2 decode replays pre-captured CUDA Graphs (27B group-6 stays eager by gate). Remaining TP work: group-6 batch-decode kernels for 27B graphs, perf gates.
+> **TL;DR:** Qwen3.5 TP uses rank-local model state behind one step-contract scheduler, with start-gated mixed execution, ID-aligned results and acknowledged retirement. Decode is batched eager or pre-captured CUDA Graph replay when the decode GQA group is compiled. Remaining TP work: group-6 batch-decode kernels for 27B graphs, perf gates.
 >
-> **Last touched:** 2026-09
-
-## Scope
-
-This is the implementation record for Qwen3.5 tensor parallelism. The stable architecture contract lives in `docs/models/qwen35/tp-design.md`; this file records what actually landed, what was verified, and what should carry into later phases.
-
-Keep Phase 1 and Phase 2 in this file until the Phase 2 implementation becomes large enough to split. The same state ownership risks continue across phases, so keeping the history together is useful: Phase 1 proves dense TP and worker-owned request state, while Phase 2 builds on that boundary for mixed prefill/decode and sharded recurrent state.
-
-Out of scope for this file:
-
-- local machine paths, NCCL symlink details, and temporary environment setup
-- raw command transcripts unless they are part of retained evidence
-- benchmark/performance claims
-- prompt echo support; Qwen3.5 accepts completion-only requests
-
-## Phase 1 Outcome
-
-Phase 1 is complete as a correctness/runtime milestone.
-
-Implemented:
-
-- TP config validation for rank/world size, dense divisibility, and `TP > 1 && CUDA Graph` fail-closed startup.
-- Dense TP weight loading for full-attention projections, full-attention KV heads, and MLP projections.
-- Rank-local worker executor with worker-owned model shards, KV state, recurrent/conv state, CUDA context, cuBLAS, and NCCL comms.
-- Eager TP prefill, chunked prefill, and eager decode.
-- Scheduler TP backend that routes chunked prefill and eager decode through TP workers while keeping logical request/page accounting in the scheduler.
-- Public multi-device Qwen3.5 engine path and server launch path for `tp_size > 1` with CUDA Graph disabled.
-- Real HTTP TP2 serving smoke through the vLLM/OpenAI-compatible frontend.
-
-Not implemented in Phase 1:
-
-- TP CUDA Graph capture/replay.
-- TP `RunUnifiedStep` mixed prefill+decode execution.
-- Sharded linear-attention/GDR weights, kernels, conv state, or recurrent state.
-- Vocab-parallel embedding or `lm_head`.
-- Prefix-cache or recurrent-state snapshot support.
-- Performance claims.
-
-## Important Fixes
-
-### Gated q projection layout
-
-The major numeric blocker was the full-attention gated `q_proj` TP shard layout.
-
-The wrong assumption was that `q_proj.weight` rows were physically arranged as:
-
-```text
-[all q rows][all gate rows]
-```
-
-The actual Qwen3.5 kernel contract is per-head interleaved:
-
-```text
-[head0 q][head0 gate][head1 q][head1 gate]...
-```
-
-For TP2, the fixed loader preserves contiguous head-interleaved ranges:
-
-- rank 0 loads rows `0..4096`
-- rank 1 loads rows `4096..8192`
-
-The old loader gathered local q rows and local gate rows separately, then rebuilt a `[q][gate]` fused matrix. That corrupted the first full-attention contribution and failed the TP2 HF gate from prefill position `0`.
-
-### Per-device Triton AOT handles
-
-Real TP2 prefill exposed that Qwen3.5 GDR Triton AOT C stubs could not cache `CUmodule` / `CUfunction` in process-global state. With two CUDA devices, the rank that loaded a GDR kernel first could leave the other rank with an invalid function handle.
-
-The generated stubs now cache module/function handles per CUDA device ordinal. This is an implementation constraint worth remembering for future multi-GPU users of generated Triton C stubs.
-
-Follow-up review tightened this path: the generated stubs now fail closed before indexing the fixed per-device handle tables if `cuCtxGetDevice` returns an ordinal outside the table size. This preserves the Phase 1 static-table implementation while avoiding out-of-bounds writes on high CUDA ordinals.
-
-### Worker-local NCCL setup
-
-NCCL comms are initialized inside rank worker threads after each worker binds its CUDA context and initializes thread-local cuBLAS. Creating comms on the controller thread and moving them into workers led to invalid-handle symptoms and hangs.
-
-This matches the design contract: TP workers own rank-local CUDA/NCCL execution resources.
-
-### Current-main API compatibility
-
-Rebasing Phase 1 onto current `main` required preserving the TP execution boundary while adopting newer shared contracts:
-
-- Hybrid batch decode now builds `Vec<&mut RecurrentState>` from graph-owned slots before entering the common linear-attention helper. This keeps request state in place while satisfying the helper's mutable-reference slice contract.
-- `pegainfer_sample::select_batch` now requires request-local sampling steps. Phase 1 TP still samples one row at a time and has no request-local sampling counter, so it passes step `0` and retains its existing per-row `sample_seed` offset. Do not substitute batch row indices for request-local steps: that would make seeded output depend on batch composition.
-- Qwen3.5 launch and tests use the current `EngineLoadOptions` surface; the removed `enable_prefill_profile` field is no longer supplied.
-- TP scheduler tests explicitly set the newer `GenerateRequest::data_parallel_rank` field to `None` because Phase 1 is TP-only, not DP.
-- Synthetic TP config/loader fixtures include `tie_word_embeddings`, matching the current `Config35` contract without changing production config loading.
-- TP2 short/long HF gates use `Golden::load_for(model_path, long)` and pass the complete `Golden` to metadata validation, matching the model-selected fixture flow used by TP1.
-
-These are compatibility changes, not extensions of Phase 1 scope. In particular, full seeded-sampling replay under TP should add a request-local completion counter rather than overloading batch position.
-
-## Validation Evidence
-
-Phase 1 acceptance coverage:
-
-- TP2 short HF logits gate passes:
-  - sequential eager: `108` positions, mean `0.0258`, p99 `0.0801`, max `0.1298`
-  - batched eager: `72` positions, mean `0.0257`, p99 `0.0809`, max `0.1298`
-- TP2 long HF logits gate passes:
-  - prompts `4097` and `8192`, sequential eager: `18` positions, mean `0.0232`, p99 `0.0792`, max `0.1035`
-- TP2 scheduler e2e passes and covers:
-  - context-window rejection
-  - greedy/logprobs paths
-  - sequential requests
-  - repeated request reuse
-  - concurrent mixed greedy/sampling requests
-  - consumer drop
-  - post-drop scheduler health
-- TP2 HTTP serving smoke passes through `pegainfer_vllm_frontend::serve`:
-  - `/v1/models`
-  - non-streaming `/v1/completions`
-  - streaming `/v1/completions`
-  - concurrent completions
-  - finite logprobs
-  - chunked prefill forced with `max_prefill_tokens=1`
-  - `TP2 + CUDA Graph` fail-closed startup
-- TP1 regression gates pass after the TP2 additions:
-  - TP1 short/long HF logits gates
-  - TP1 scheduler e2e
-- Current-main rebase verification passes:
-  - formatting check
-  - Qwen3.5 release compilation for all test targets
-  - `pegainfer-server` release compilation with only the `qwen35` model feature
-
-Known validation constraints:
-
-- TP2 tests remain ignored by default because they require two CUDA devices, NCCL, and real Qwen3.5 weights.
-- Long TP2 HF replay is GPU-memory-sensitive; choose a sufficiently free device pair.
-- Qwen3.5 HF golden integration tests should run serially on memory-constrained hosts to avoid unrelated KV-capacity failures from concurrent model loads.
-
-Stable test knobs:
-
-- `PEGAINFER_TEST_MODEL_PATH`: real Qwen3.5 weights path for HF, scheduler, and serving tests.
-- `PEGAINFER_TEST_TP_DEVICES`: comma-separated TP2 CUDA ordinals. Defaults to `0,1`; examples: `1,2`, `2,3`. TP2 tests require exactly two distinct ordinals.
-- `PEGAINFER_TEST_FRONTEND_MODEL_PATH`: optional tokenizer/config metadata path for HTTP serving tests. Defaults to `PEGAINFER_TEST_MODEL_PATH` when unset.
-
-## Phase 2 Progress
-
-Phase 2 is locked in `docs/models/qwen35/tp-design.md` as two separate implementation series: P2a is eager mixed unified execution on the replicated Phase 1 GDR path; P2b shards the head-indexed linear-attention/GDR weight and state surface. P2a protocol/lifecycle gates are complete, and P2b's core sharding has landed on top of them without weakening the P2A lifecycle and ID contracts (see below). Batched eager TP decode (#1004) and P2c TP decode CUDA Graphs (#1005, compiled decode GQA groups only — 4B/9B TP2 capture, 27B group-6 stays eager) have landed on top of P2b (see below); the remaining Phase 2 work is group-6 batch-decode kernels so 27B TP2 can capture, plus TP perf gates.
-
-### P2a: TP mixed-step unified execution
-
-P2A implements eager `RunUnifiedStep` under TP while retaining Phase 1's replicated linear-attention/GDR weights, kernels, conv state, recurrent state, and scratch shapes.
-
-#### Step 1: lifecycle cleanup gates
-
-Completed as test and fault-observation infrastructure before changing production lifecycle semantics.
-
-Why it exists:
-
-- A successful controller-side `DropRequest` return did not directly prove that every rank removed the same `RequestId` or released its KV/recurrent/conv ownership.
-- Later cancellation, partial-dispatch, drop-acknowledgement, and unified-step work needs direct evidence of rank-local state before and after each transition.
-- Cleanup must prove both capacity recovery and fresh numeric state; scheduler bookkeeping alone cannot detect a stale rank-local recurrent or KV allocation.
-
-Implemented in `tp_executor.rs` under `#[cfg(test)]` only:
-
-- `WorkerStateSnapshot { rank, request_count, requests }`, where each request entry carries its `RequestId` and `Prefilling`/`Decoding` phase.
-- A healthy snapshot API that requires an unpoisoned executor and an unchecked test-only API that bypasses only the controller poison guard. The latter is reserved for later synthetic failure tests while every worker channel remains connected.
-- Exact-rank collection that rejects duplicate or out-of-range ranks, payload/response rank disagreement, missing responses, wrong reply variants, and inconsistent request counts. Valid snapshots are returned in rank order.
-- An ignored TP2 capacity gate that fills configured `max_batch=2`, observes every ID in `Decoding` on both ranks, drops every ID, requires zero requests on every rank, refills the complete capacity, executes decode, and proves the second cleanup is also empty.
-- An ignored TP2 numeric gate that records a prompt's deterministic first token and five requested logprobs, drops the request, verifies every rank is empty, re-admits the same prompt under a new `RequestId`, and requires an exact artifact match.
-
-Verification:
-
-- Qwen3.5 release all-target check and clippy with `-D warnings` pass.
-- The regular library suite passes: `71 passed`, `0 failed`, `8 ignored`.
-- Both new TP2 GPU gates pass independently.
-- Formatting and `git diff --check` pass.
-
-This step deliberately adds no production command, scheduler state transition, drop semantics, or serving claim. It supplies the observability needed to prove the later P2A changes rather than trusting controller-visible acknowledgements alone.
-
-#### Step 2: cancellation pruning before admission
-
-Completed as the first production scheduler lifecycle change in P2A.
-
-The shared TP1/TP scheduler tick now follows the fixed order `drain -> prune -> publish load -> admission -> plan`. It merges deferred and newly submitted work, removes requests whose `TokenSink` is already closed, publishes the resulting state, and only then computes slot/KV budgets and admits work. The idle wakeup path repeats drain/prune/publication after `blocking_recv()` because the waking request can close before admission and other submissions can race with the receive.
-
-Change to the existing scheduler skeleton:
-
-- Previously, the loop published the state left by the prior tick before draining `submit_rx`; `num_waiting_reqs` therefore represented only `deferred.len()`. It then drained submissions and entered admission.
-- The loop now first takes `deferred`, drains every currently available submission into the same `pending` vector, and calls one backend-neutral `prune_closed_requests` helper across pending, active, and prefilling ownership.
-- `publish_load` remains the same internal watch publication surface and `LoadSnapshot` retains the same public fields and types. A small `logical_load_counts` helper makes the post-prune running/waiting calculation directly testable; waiting is now `pending.len()` at the admission boundary.
-- The empty-loop blocking skeleton is retained, but wakeup now has a second drain/prune/publish boundary before admission. If every received request is already closed, the loop returns to blocking without entering admission or planning.
-- The admission and plan implementations are otherwise unchanged. This commit changes which settled state they consume, not their policies or the public `EngineHandle::load_watch()` API.
-
-Effect on the pre-existing TP1 (`SchedulerBackend::Single`) path:
-
-- A closed pending request is removed before `alloc_prefill_state`, so TP1 no longer allocates its KV/recurrent state and then discovers the disconnected consumer during token delivery.
-- A closed prefilling request is removed before plan construction. Consuming its existing `PrefillBackendState::Single` drops the owned `KvState` and `RecurrentState` through their existing RAII path; no TP1 release routine or allocator rule was added.
-- A closed active request is retired before the next model step through the existing `compact_single_slot` path. The same `swap_remove` and graph-slot copy used by EOS, length, and token-send failure are reused; only the retirement timing moves earlier, so the cancelled row no longer executes and samples one unnecessary decode step.
-- TP1 page availability, slot budgets, and plan construction now observe that cleanup in the same tick. Consequently, the executed batch width and load samples can differ under cancellation, but KV accounting formulas, slot-compaction mechanics, admission policy, plan builders, kernels, and sampling implementation are unchanged.
-
-Cleanup deliberately reuses existing backend ownership paths:
-
-- pending cancellation uses stable `retain`, preserving FIFO order among live requests;
-- active cancellation uses normal request retirement, including TP drop and single-GPU slot compaction;
-- prefilling cancellation removes the entry and drops its backend state through the existing adapter.
-
-This ordering makes cancellation visible to admission in the same tick. A closed resident is absent from the post-prune running/KV state, a live replacement is present in waiting, and the capacity released by the resident can admit that replacement immediately.
-
-Verification:
-
-- Three focused CPU tests pass for pending FIFO pruning, post-prune logical load, and same-tick capacity reuse.
-- The ignored real TP1 `max_batch=1` cancellation/replacement gate passes on an RTX 3090. It observes the post-prune `running=0, waiting=1` boundary, completes the replacement, and returns running, waiting, and KV usage to zero.
-- The existing real TP1 scheduler integration E2E passes (`1 passed`, 29.06 seconds).
-- Release all-target clippy with `-D warnings` passes.
-- The regular library suite passes: `74 passed`, `0 failed`, `9 ignored`.
-
-This step does not strengthen the TP drop reply protocol or add scheduler-wide fail-closed propagation. It uses the Phase 1 cleanup calls as they exist; exact-rank `DropExpectation` acknowledgement belongs to step 3, and mandatory replica-fatal propagation belongs to step 4.
-
-#### Step 3: TP worker protocol hardening
-
-Completed as the distributed command/reply foundation for later scheduler fail-closed handling and unified execution.
-
-State-mutating prefill, decode, drop, and future unified envelopes now share one `Pending -> Execute | Cancel` start gate. The controller enqueues an envelope for every rank before resolving `Execute`; if any enqueue fails, it resolves `Cancel` for the delivered prefix and poisons the executor. Workers wait on the gate before request-state mutation, kernel launch, or NCCL entry. Ping and test-only snapshots remain ungated because they do not mutate request state or enter collectives.
-
-Response handling now separates timed transport collection from pure response-set validation. Ping, prefill, decode, and drop all require exactly one in-range response from every rank:
-
-- ping requires `Ack` from every rank;
-- prefill requires one `Prefill` result from rank 0 and `Ack` from every non-primary rank;
-- decode requires one `Decode` result from rank 0 and `Ack` from every non-primary rank;
-- drop requires `DropAck { existed }` from every rank and validates the complete existence vector against the scheduler's `DropExpectation`.
-
-Duplicate, missing, out-of-range, wrong-variant, non-primary typed, or missing-primary responses poison the executor after dispatch. Drop accepts only exact-rank all-false for `MustBeAbsent` and exact-rank all-true for `MustExist`; mixed values and uniformly unexpected values are lifecycle divergence even though every rank is absent after the command.
-
-The low-level `Qwen35TpExecutor::drop_request` API now requires `DropExpectation` and returns `Result<()>`; `DropExpectation` is re-exported through the model-local `runtime` module for tests and debugging. The server-facing `EngineHandle` API is unchanged. Scheduler callers derive expectations from owned lifecycle state:
-
-- active and successfully dispatched/final-prefill state use `MustExist`;
-- prefilling cancellation at `cursor == 0` uses `MustBeAbsent`;
-- prefilling cancellation after progress uses `MustExist`;
-- execution failure performs no healthy-path drop because the executor is already poisoned.
-
-This commit intentionally retains the temporary scheduler adapter that logs a returned healthy-drop failure. Executor poison prevents subsequent normal commands, but step 4 still owns mandatory propagation into one scheduler-wide terminal path, fail-closed completion publication, and exactly-once unresolved-request error fan-out.
-
-Verification:
-
-- Release all-target check and clippy with `-D warnings` pass.
-- Pure protocol/gate tests cover exact-rank reply matrices, lifecycle-expectation mismatch, controller structural rejection with zero dispatch, all-enqueued `Execute`, prefix-only `Cancel`, and poison preservation.
-- The complete regular library suite passes on SM86: `82 passed`, `0 failed`, `12 ignored`.
-- Three new real TP2 gates pass: prefix-only dispatch failure leaves every rank empty (214.38 seconds under unrelated four-GPU training contention), lifecycle expectations plus mixed-rank divergence pass (8.05 seconds), and a real receiver disconnect poisons without claiming an unavailable all-rank snapshot (6.96 seconds).
-- Existing healthy TP2 prefill/decode/drop and scheduler chunked-prefill/decode smoke tests pass (6.45 and 6.54 seconds).
-
-Implementation pitfall: the first release-only gate test hung because `start.execute()` was placed inside `debug_assert!`; release builds remove the complete assertion expression, including side effects. The state transition now executes unconditionally and only its boolean result is debug-asserted. Protocol state transitions must never live inside debug-only assertions.
-
-#### Step 4: fail-closed TP scheduler lifecycle
-
-Completed as the scheduler recovery and user-visible completion boundary required before TP unified execution.
-
-The temporary step-3 logging adapter is gone. TP active retirement and prefill-state cleanup now return `Result`, and cancellation pruning, standalone prefill/decode execution, token dispatch, and final-prefill promotion propagate any returned TP lifecycle failure to the scheduler loop. A returned TP prefill/decode or post-execution artifact-alignment error follows the same fatal path. The scheduler does not retry per-request cleanup after poison.
-
-Successful TP completion is now prepared and committed explicitly:
-
-- decode EOS buffers only `Finished(Stop)`;
-- decode length buffers the final `Token` followed by `Finished(Length)`;
-- immediate final-prefill EOS/length uses the same buffering rule, so its first token is not exposed before cleanup;
-- the candidate keeps logical request ownership while `DropRequest(MustExist)` runs, and publishes the buffered events only after exact-rank all-true `DropAck` succeeds;
-- drop failure discards the buffered success events and transfers the unresolved candidate to terminal error fan-out.
-
-Fatal errors carry any tick-local request ownership back to the scheduler loop instead of consuming it in a step helper. The single terminal helper closes `submit_rx`, drains every request whose send completed before close, consumes transient candidates/scheduled work plus active, prefilling, current pending, and deferred owners exactly once, attempts one `TokenEvent::Error` per request, publishes a zero-running/zero-waiting/zero-KV load snapshot, and exits. It does not deduplicate by TP or external request ID; exclusivity comes from moving each request out of its prior owner.
-
-The existing single-GPU boundary remains explicit. TP completion requires cleanup acknowledgement before publication, while the non-TP decode path retains its original `Token`/`Finished` publication before slot retirement. Single-GPU prefill state still drops through its existing RAII ownership, and `EngineHandle` plus `TokenEvent` public types are unchanged.
-
-Verification:
-
-- Focused scheduler lifecycle coverage passes: `16 passed`, `0 failed`, `2 ignored`. It covers TP EOS/length and immediate-prefill event buffering, active/prefill drop failure with no leaked success event, remaining scheduled ownership preservation, prune failure propagation, non-TP publication order, and barrier-controlled submit close/drain fan-out across every owner class.
-- Release all-target check and clippy with `-D warnings` pass; formatting and `git diff --check` pass.
-- The complete regular library suite passes on SM86 outside the GPU-isolated sandbox: `90 passed`, `0 failed`, `12 ignored`.
-- The real-weight TP2 scheduler chunked-prefill/decode smoke and the complete TP2 scheduler E2E pass on physical GPUs 1/2. The complete E2E covers context rejection, greedy/logprobs, sequential/repeated/concurrent requests, consumer drop, and post-drop health.
-- A same-session TP1 scheduler E2E attempt could not pass model startup because an unrelated training process left insufficient memory for the loader's default 64-slot graph allocation. No training process was stopped. The non-TP ordering CPU gate and complete regular suite are green; the previously established real TP1 E2E evidence remains unchanged.
-
-Step 4 does not add unified plans, change worker command payloads, alter TP1 sampling, or modify GDR weights/state/kernel shapes. Step 5 owns `RunUnifiedStep`, strict ID-aligned unified artifacts, ordinal validation, and the final TP1/TP2 regression ladder.
-
-#### Step 5: TP unified execution
-
-Completed as the final P2A execution-protocol milestone. When active decode and scheduled prefill coexist, TP now uses the same `plan::build_next_plan` decision as the single-GPU scheduler and emits one start-gated `RunUnifiedStep` to every rank. The canonical plan carries ordered prefill/decode items plus separate seeds. The scheduler selects the decode seed first and the prefill seed second to preserve its prior RNG order; workers execute prefill first and decode second on every rank. Rank 0 returns `TpUnifiedResult`, while every non-primary rank must return `Ack`.
-
-Internal protocol/API changes:
-
-- Added crate-private `TpUnifiedPlan`, `TpUnifiedResult`, the complete `RunUnifiedStep` payload, and `TpWorkerReply::Unified`. These are not re-exported through `runtime`; the public server `EngineHandle`, `TokenEvent`, and request contract are unchanged.
-- Refactored worker prefill/decode into typed inner row operations so standalone and unified commands share the same eager kernels and sampling behavior. Existing public low-level `execute_prefill`/`execute_decode` results retain their shapes.
-- Added controller structural validation before enqueue: both halves must be non-empty, row counts must fit scheduler capacity, prefill/decode IDs must be internally unique and mutually disjoint, and prefill chunks must be non-empty. Worker-local request existence, phase, and actual capacity are revalidated after gate release and remain replica-fatal rather than adding a two-phase validation protocol.
-- Extended exact-rank reply validation so unified accepts exactly one rank-0 `Unified` result plus non-primary acknowledgements. Returned worker or reply-set failure continues through the step-4 poison and terminal scheduler path.
-
-Change to the existing scheduler skeleton:
-
-- Removed the TP-only `build_eager_only_plan` branch. Both backends now use the normal planner, so active decode plus scheduled prefill becomes `ExecutionPlan::Unified` instead of two serialized scheduler ticks.
-- Added a TP-only execution adapter that builds the canonical plan, aligns returned artifacts by `RequestId`, processes decode results first, and only then promotes or requeues prefill. Decode completion can therefore release capacity through `DropRequest(MustExist)` before final-prefill promotion.
-- Replaced TP prefill token-`0` placeholders and positional decode matching with explicit artifacts. Prefill alignment is a chunk-length `Vec<Option<PrefillArtifact>>`: outer `None` means non-final, while `Some { logprob: None, .. }` is a valid final artifact. Decode requires one artifact for every active ID. Shuffled valid results are accepted; unknown, duplicate, non-final, or missing IDs poison the replica after execution.
-- The shared `promote_or_requeue` skeleton now accepts a backend-specific artifact wrapper. The single-GPU branch still consumes its original dense sampled tokens/logprobs, uses the same logits path and RNG calls, and retains its step-4 publish/retire semantics.
-
-Startup now validates TP CUDA ordinals against the generated Triton AOT handle-table contract before model/filesystem/CUDA access. Ordinals must be distinct and below the named table length `16`; the generated wrapper's runtime bounds check remains defense in depth.
-
-Verification:
-
-- Release all-target check and clippy with `-D warnings`, formatting, and `git diff --check` pass.
-- Complete non-ignored library suite passes on SM86: `96 passed`, `0 failed`, `14 ignored`.
-- Pure tests cover ordinal bounds/duplicates, unified structural rejection plus subsequent healthy dispatch, worker-local missing/phase/capacity failures, exact-rank unified replies, shuffled artifact alignment, unknown/duplicate/missing IDs, and final-without-logprobs versus non-final absence.
-- The real-weight TP2 executor mixed-step gate passes (`1 passed`, 7.27 seconds), confirms both ranks retain two decoding requests after the combined operation, and returns both ranks to empty after lifecycle cleanup.
-- The deterministic real-weight TP2 scheduler case with `max_batch=2` and `max_prefill_tokens=1` passes (`1 passed`, 7.15 seconds).
-- All `13` TP2/lifecycle ignored library gates pass together. The fourteenth ignored test is TP1-only and could not load under the unrelated training process: the loader reported `8101 MB` free versus `3248 MB` prefill scratch plus `6288 MB` recurrent state and minimal KV needs. No training process was stopped.
-- Complete TP2 scheduler E2E passes (`1 passed`, 35.89 seconds).
-- TP2 short/long HF golden gates pass (`2 passed`): short sequential mean `0.0260`, p99 `0.1081`; short batched mean `0.0267`, p99 `0.1167`; long sequential mean `0.0228`, p99 `0.0689`.
-- TP2 OpenAI-compatible HTTP serving smoke passes (`1 passed`, 10.41 seconds), including streaming, non-streaming, concurrent completions, logprobs, and TP+CUDA Graph rejection.
-
-P2A does not shard GDR weights/state/scratch, add a post-GDR all-reduce, enable TP CUDA Graph, or claim a performance improvement. TP1's earlier real-weight evidence remains applicable, but a same-session full TP1 model E2E rerun is still resource-blocked by external GPU occupancy.
-
-#### Merge-gate test surface
-
-The pre-merge review reduced P2A coverage to distributed behavior that cannot be
-established by restating local helpers. Removed tests enumerated start-gate
-booleans, planner choices, CUDA-ordinal bounds, unified-plan shapes, reply
-variants, artifact-alignment variants, snapshot-collector variants, and basic
-TP2 startup/prefill/chunk/decode smoke already exercised by higher-level gates.
-
-The retained P2A library surface is seven real TP2 gates:
-
-- partial dispatch cancels the delivered prefix before rank-local mutation;
-- rank-local lifecycle divergence is detected and poisons the replica;
-- a disconnected worker receiver fails closed;
-- executor and scheduler mixed prefill/decode both complete;
-- drop-all restores complete request capacity;
-- re-admission under a fresh `RequestId` reproduces the clean first-token artifact.
-
-Completion cleanup and terminal error fan-out remain covered by the focused
-scheduler lifecycle tests. The production-facing regression ladder remains the
-TP2 scheduler E2E, short/long HF logits gates, and OpenAI-compatible HTTP
-serving lifecycle test.
-
-On the local 2x RTX 3090 SM86 fixture, the complete explicit ignored run passed
-`11/11`: seven library gates, one scheduler E2E, two HF gates, and one HTTP gate.
-The regular release library suite passed `94` tests with those seven real TP2
-tests ignored by default. The HF results remained within the established
-tolerances: short sequential/batched mean deltas `0.0260`/`0.0267`, and long
-sequential mean delta `0.0228`.
-
-#### Qwen3.5 feature CI gate
-
-The CUDA workflow now has separate matrix results for Qwen3.5 compile and
-Clippy. Both install the repository's CUDA 13.0.2 toolchain, Python 3.10, and
-pinned Triton 3.7.1, then build `pegainfer-qwen35` with the actual `qwen35`
-feature enabled for all targets on `sm_80`:
-
-```text
-cargo check --release --locked -p pegainfer-qwen35 --features qwen35 --all-targets
-cargo clippy --release --locked -p pegainfer-qwen35 --features qwen35 --all-targets -- -D warnings
-```
-
-This is a compile/lint merge gate, not a substitute for the ignored real-GPU
-TP2 tests above. The same target surface passed locally on SM86 with nightly
-2026-07-10 and Triton 3.4.0; both commands compiled the Qwen3.5 Triton AOT path.
-The GitHub jobs provide the independent Ubuntu, SM80, and pinned Triton 3.7.1
-verification.
-
-#### Real TP2 multi-turn serving gate
-
-The Phase 2A production-path gate starts the real OpenAI-compatible Qwen3.5
-server on two RTX 3090 GPUs with TP=2, eager execution, `max_batch=2`, and
-`max_prefill_tokens=64`. A pinned upstream Rust `vllm-bench` client runs
-dependent `openai-chat` conversations at concurrency 4, so the workload exceeds
-resident capacity and forces cleanup followed by fresh admission.
-
-The primary workload completed 12/12 conversations and 44/44 measured turns
-with zero failures. Conversation lengths varied from 2-5 turns, later prompts
-carried accumulated history, and every turn returned its configured 24 tokens.
-Without restarting the server, a second 4-conversation, 8-turn probe also
-completed with zero failures. Graceful shutdown released both TP devices.
-
-The exact client/server revisions, build and run commands, request counts,
-concurrency, prompt/output lengths, per-turn history evidence, pass criteria,
-limitations, and raw JSON results are published in
-[`docs/benchmarks/qwen35-tp2-phase2a-multiturn.md`](../../benchmarks/qwen35-tp2-phase2a-multiturn.md).
-
-#### Serving scope: prompt echo is unsupported
-
-Qwen3.5 serving does not support `echo=true`. Both the legacy and stepped vLLM
-bridges submit `echo: false`, so prompt echo has never been part of the current
-HTTP serving contract. Direct engine callers can still construct the shared
-request type with `echo=true`; the Qwen3.5 scheduler now rejects those requests
-immediately after queue drain and cancellation pruning, before load accounting,
-capacity admission, backend-state allocation, or TP command dispatch.
-
-Qwen3.5 no longer emits `TokenEvent::PromptTokens` after prefill. The shared
-event variant remains in `pegainfer-frontend` because other model lines still
-use it, but it is sealed off from the Qwen3.5 scheduler path. A focused release
-test requires a `Rejected` event with the original prompt length and proves the
-request is absent from the vector eligible for backend admission.
-
-Verification on the local SM86 environment passed:
-
-- focused unsupported-echo release test: `1 passed`;
-- complete Qwen3.5 release library suite: `95 passed`, `0 failed`, `7 ignored`;
-- all retained real TP2 executor/scheduler gates on two RTX 3090 GPUs:
-  `7 passed`, `0 failed`;
-- release Clippy with `-D warnings` and formatting checks passed.
-
-#### Model-backed test fixtures are explicit
-
-Qwen3.5 model-backed tests no longer embed a developer-local absolute weights
-path or fall back to a repository-relative model directory. The shared test
-fixture resolver requires `PEGAINFER_TEST_MODEL_PATH`, reads and parses its
-`config.json`, and confirms the Qwen3.5 model identity before any model or CUDA
-initialization. A missing, non-UTF-8, empty, unreadable, malformed, or non-Qwen3.5
-fixture prints one test-specific `SKIP` diagnostic and returns without GPU work.
-The optional `PEGAINFER_TEST_FRONTEND_MODEL_PATH` uses the same validation when
-set and otherwise reuses the validated engine fixture.
-
-The resolver source lives under `tests/common` and is also included only for
-crate unit-test builds, so the six retained TP executor gates, the mixed-step
-scheduler gate, and the integration targets share the same contract without
-adding a production API. Static review confirms that no Qwen3.5 test retains a
-private model path or implicit `DEFAULT_MODEL_PATH` fallback.
-
-Verification on the explicit public-compatible SM86 fixture passed:
-
-- missing fixture, missing `config.json`, and malformed JSON probes emitted the
-  expected diagnostics without GPU initialization;
-- release all-target compile and Clippy with `-D warnings` passed;
-- regular release library suite: `95 passed`, `0 failed`, `7 ignored`;
-- retained real TP2 library gates: `7 passed`, `0 failed`;
-- TP2 scheduler E2E, short/long HF gates, and HTTP serving gate passed; HF
-  mean/p99 deltas remained `0.0260/0.1081` sequential, `0.0267/0.1167`
-  batched, and `0.0228/0.0689` long;
-- the pinned multi-turn gate rerun completed `12/12` conversations and `44/44`
-  turns, followed without restart by `4/4` conversations and `8/8` turns, all
-  with zero failures; graceful shutdown returned both TP GPUs to idle.
-
-Delivered constraints:
-
-- Support mixed prefill+decode scheduler steps under TP.
-- Preserve deterministic collective ordering across ranks.
-- Return mixed prefill/decode artifacts from the primary rank.
-- Use the `RequestId`-keyed `UnifiedPlan` and artifact contract in `tp-design.md`; P2a does not introduce CUDA Graph padded-slot or compaction semantics.
-- Validate finish/drop/client-disconnect cleanup under mixed-step execution.
-- Keep TP CUDA Graph disabled unless a separate graph design is completed.
-- Keep the fixed 16-device Triton AOT handle table and add startup-time validation for unsupported logical CUDA ordinals.
-
-Why this should be separated from GDR sharding:
-
-- Mixed-step scheduling is an execution-protocol problem.
-- Sharded linear-attention/GDR is a model-state-shape problem.
-- Combining them would make failures hard to attribute.
-
-### P2b: sharded linear-attention/GDR state
-
-Landed as #946 split 1/4 (#1003), after P2a had established the mixed-step and state-lifecycle contract. Each TP rank now owns a rank-local slice of the linear-attention/GDR surface instead of replicating it:
-
-- `LocalGeometry` computes rank-local linear dims (`local_linear_num_key_heads`, `local_linear_num_value_heads`, `local_linear_v_dim`, `local_linear_qkv_dim`, `local_linear_z_dim`) and fails closed with `ConfigError::TpIndivisible` when `linear_num_key_heads` does not divide by `world_size`; there is no silent replication fallback. Value-head divisibility needs no second guard: `Config35` already validates `linear_num_value_heads % linear_num_key_heads == 0`.
-- Weight loading shards the head-indexed tensors: the fused QKV projection and the depthwise conv1d are stitched head-locally per segment (`load_linear_in_proj_qkv_shard` / `load_linear_conv1d_shard`; Q/K segments follow key-head ranges, V/conv follow value-head ranges), z/beta/alpha are row shards, `dt_bias`/`A_log` are 1-D shards (A_log stays f32), and linear `out_proj` is column sharded as a row-parallel `[hidden, local_z]` matrix.
-- `RecurrentState` (`[local_value_heads, K, V]` f32), conv state (`[local_qkv x (kernel_dim - 1)]` bf16), and all prefill/decode scratch (`GdrChunkwiseScratch35`, prefill/decode buffers) size themselves from the local geometry; worker capacity math uses the same locals.
-- The hidden-residual all-reduce happens once after the local linear-attention `out_proj` (`all_reduce_hidden`), on prefill and decode alike; the column-sharded `out_proj` is what makes that reduction point sufficient.
-- Full-attention decode-group supportability uses the config-level GQA group (`Config35::decode_group_is_compiled`): head sharding leaves the q-per-kv group size unchanged, so the predicate is identical on every rank and the reroute adds no collectives. The 27B case leaves `q/kv = 6`, which has no compiled FlashInfer batch-decode kernel, so those layers reroute decode through the eager/paged fallback.
-- TP1 contract is unchanged: at `world_size == 1` every local dim equals the global dim, so kernels, buffers, and fixture behavior are byte-identical to pre-P2b.
-
-Non-negotiable invariant (still held):
-
-- Never all-reduce GDR recurrent state or conv state. These states are owned by rank-local request state.
-
-Acceptance on the #1003 branch before its final rebase (27B TP2 on 2x RTX 4090 48GB, sm_89; fixture-pinned 27B revision `fc05daec`):
-
-- TP2 short HF logits gate passes:
-  - sequential eager: `108` positions, mean `0.0210`, p99 `0.0749`, max `0.1240`
-  - batched eager: `72` positions, mean `0.0201`, p99 `0.0749`, max `0.0803`; the batched leg includes drop -> re-prefill slot cycles
-- TP2 long HF logits gate passes with prompts `4097` and `8192`: sequential eager, `18` positions, mean `0.0177`, p99 `0.0660`
-- TP2 scheduler E2E and TP2 HTTP serving gate pass.
-- Peak per-rank HBM is `35,988` / `36,822` MiB of `49,140` MiB: 27B TP2 now fits the 2x48GB pair that Phase-1 replicated state OOMed, and memory fully releases between test processes.
-
-Not in this step: batching the TP decode loop across rows, TP CUDA Graph capture, and the matched Phase-1-vs-P2b HBM/latency/throughput A/B promised in #1001; no performance claim is made until that rerun lands on the merged stack.
-
-### Batched eager TP decode (#1004)
-
-Landed as #946 split 2/4 (#1004). #870's `execute_decode_rows` looped per
-request with bs=1 forwards and capacity-1 per-request pointer tables.
-`run_decode_batch` now runs one `batch_decode_eager_logits` over every decode
-row in command order on each rank, then one batched rank-0 `select_batch` with
-per-row fan-out; #870's validation and response contracts are unchanged and
-`TpRequestState.linear_pointer_tables` is gone. Seeded rows keep per-row
-semantics (`select_batch` isolates each seeded row into its own philox call
-keyed on request seed and step), so seeded output is independent of batch
-composition; unseeded rows decorrelate through the per-step command seed, as on
-the single-GPU batched path.
-
-GDR pointer tables honour `LinearStatePointerTables`' build-once contract: each
-worker allocates one table set at `max_batch` capacity (`with_capacity`) and
-refills rows `0..bs` from the live decode rows every step
-(`refill_from_recurrent_refs`: H2D copies into the existing allocations).
-Refilling every step means swap_remove retirement between steps can never leave
-a stale row addressed; allocating once removes the `2 x linear_layers` device
-allocations per token per rank that a per-step `from_recurrent_refs` cost
-(review follow-up on #1004). The 27B TP2 group-6 full-attention layers still
-route decode through the one-token paged plan.
-
-Acceptance (27B TP2 on 2x RTX 4090 48GB, sm_89; revision `fc05daec`):
-
-- TP2 short HF logits gate passes: sequential eager `108` positions, mean `0.0210`, p99 `0.0749`, max `0.1240` (identical to the P2b acceptance run above); batched eager `72` positions, mean `0.0199`, p99 `0.0692`, max `0.0887`, the batched leg including drop -> re-prefill slot cycles.
-- TP2 long HF logits gate passes with prompts `4097` and `8192`: sequential eager `18` positions, mean `0.0177`, p99 `0.0660`, max `0.0660`.
-- Both run with the persistent, per-step refilled pointer tables (`2 passed`, 65 s).
-
-Not in this step: TP CUDA Graph capture (#1005) and the same-context
-per-request-vs-batched throughput A/B tracked in #1001; no performance claim is
-made before that rerun lands.
-
-## Rebase onto #870 (2026-08-20)
-
-#870 landed its own Phase 1/2a upstream while the parallel line on
-`feat/qwen35-tp2-batched-decode` had implemented its own Phase 1/2a/2b
-plus a batched-decode fix on the old main. The rebase onto #870
-ported only the two deltas #870 lacks, with #870's code as the base:
-
-1. **Phase 2b — sharded linear-attention/GDR state** (commit
-   `feat(qwen35): shard linear-attention/GDR state per TP rank`). #870's
-   `recurrent_state.rs` had no rank sharding and its linear-attention
-   weights loaded replicated; the port adds rank-local slices end to end
-   (`weight_loader` stitch/shard loaders, `config/tp.rs` `local_linear_*`
-   accessors, `weights/layers.rs` per-rank stitched qkv/conv1d + row/col
-   shards carried on `WeightSource`,
-   `recurrent_state`/`decode_buffers`/`prefill_buffers` at local sizes,
-   `batch_decode`/`prefill` local head counts + all-reduce after linear
-   `out_proj`, TP-local `batch_decode_full_attention_via_prefill` so 27B
-   TP2 group-6 eager decode routes through prefill). `tp_executor.rs`
-   only took the capacity-math and `RecurrentState::new` signature
-   changes; #870's worker protocol untouched.
-2. **Step 3 — batched eager TP decode** (commit
-   `perf(qwen35): batch eager decode rows under TP`). #870's
-   `execute_decode_rows` looped per request with bs=1 forwards and
-   capacity-1 per-request pointer tables. The port adds `run_decode_batch`
-   (one `batch_decode_eager_logits` over all decode rows, one persistent
-   `LinearStatePointerTables` per worker refilled each step — see the
-   batched eager TP decode (#1004) section above — one batched rank-0
-   `select_batch`, per-row fan-out in command order) inside
-   #870's `execute_decode_rows`, keeping its validation and response
-   contracts; `TpRequestState.linear_pointer_tables` removed.
-
-What #870 already covered (not ported): Phase 1 dense TP, the Phase 2a
-unified command/scheduler surface (`TpUnifiedPlan`, command start gates,
-dispatch/response validators, drop-expectation lifecycle proofs), and the
-scheduler planner-gate/test updates — ours' scheduler,
-`scheduler/tests.rs`, and `e2e_scheduler.rs` deltas were subsumed
-upstream, so those files resolved to #870's versions except the
-`alloc_recurrent` signature change. #967/#968 have since split the
-scheduler into `scheduler/{mod,backend,plan,tp}.rs`, so this branch's
-slot-tracking deltas land there: the `ActiveBackendState::Tp` slot field
-and dispatch arms in `mod.rs`, `TpSchedulerBackend` slot compaction in
-`backend.rs`, and the decode-item/alignment helpers in `tp.rs`.
-
-Validation on 2× RTX 4090 (venv NCCL on `LD_LIBRARY_PATH`):
-
-- `cargo check --release -p pegainfer-qwen35 --features qwen35` clean;
-  `cargo fmt --check -p pegainfer-qwen35` clean.
-- Lib unit suite 101/101 (includes the four sharding layout tests:
-  segment tables, conv kernel-dim scaling, TP1 identity, synthetic
-  safetensors stitch contract).
-- 9B TP2 HF short+long gates PASS (24.7 s); 9B TP2 scheduler e2e
-  (`test_e2e_qwen35_scheduler_tp2`) PASS (27.1 s).
-- 27B TP2 HF short+long gates PASS (64.7 s) — 27B TP2 fits on 2×48 GB
-  only because of the Phase-2b sharding (the acceptance criterion for the
-  port). 27B TP2 scheduler e2e PASS (68.8 s).
-
-## P2c — CUDA Graph under TP (2026-08-20)
-
-Implemented the locked P2c design from `tp-design.md`: decode CUDA Graphs
-under TP, gated on the TP-local decode GQA group.
-
-**Gate.** Graph mode is active iff `enable_cuda_graph &&
-config.decode_group_is_compiled()`. The group ratio is TP-invariant,
-so 27B TP2 (group 6, not in `SUPPORTED_GQA_GROUP_SIZES`) keeps the batched
-eager path byte-for-byte while 4B/9B TP2 capture. The old fail-closed
-rejections (`config.rs` `validate_for`, `tp_executor.rs` startup ensure,
-`lib.rs` TP branch) were replaced by the gate; startup logs once when graph
-was requested but the group gate keeps decode eager.
-
-**State model.** Scheduler owns slots, workers execute:
-
-- `ActiveBackendState::Tp` gains `slot_idx` (dense `active` position, assigned
-  at promote via `slot_for_new_request`, updated on compaction);
-  `tp_decode_items` emits rows with explicit `slot_idx` and workers assert
-  `slot_idx == row`.
-- Graph workers hold a `BatchDecodeGraphState` at
-  `bucket_for(effective_max_batch)` fixed-address slots plus a
-  `slot_map: Vec<Option<RequestId>>`. On a request's first decode row the
-  worker D2D-copies its prefill recurrent state into the slot
-  (`copy_state_to_slot`) and drops the per-request allocation.
-- `DropRequest` carries `compaction: Option<TpSlotCompaction>`; the worker
-  validates occupancy against `slot_map` (`slot_compact`), applies the D2D
-  move (`BatchDecodeGraphState::move_slot_within`), and poisons on mismatch.
-  Requests retired between promotion and their first decode row legitimately
-  have no materialized slot; `slot_compact` tolerates exactly that case and
-  skips the GPU move.
-- Convenience `execute_prefill`/`execute_decode`/`drop_request` (model-local
-  tests) keep a Mutex-guarded slot tracker mirroring the single-GPU
-  `Qwen35Executor`; scheduler flows pass explicit slots via
-  `execute_decode_items`/`drop_request_with_compaction` and never touch the
-  tracker.
-
-**Capture/replay.** Startup pre-capture sweep ported from qwen3:
-`TpWorkerCommand::Precapture { phase }` over Warmup (new
-`Qwen35Model::warmup_tp_collective` — one all-reduce per bucket message size;
-without it the lazy NCCL connect wedges inside capture), Capture + Launch per
-bucket `[1,2,4,8,16,32,64]` up to `bucket_for(max_batch)` with synthetic rows,
-Finalize asserting all buckets captured. Dedicated 600 s abort watchdog (the
-60 s NCCL startup timeout is too small for the sweep).
-`batch_decode_graph` gained `DecodeGraphUse` (Serve lazy / CaptureOnly /
-Replay); TP serve time is Replay-only. Workers tune decode GEMM algos on the
-worker thread before capture (cuBLASLt plans are thread-local). Graph state
-is declared before `model` in `TpWorkerState` so graphs drop before the NCCL
-comm. Sampling/logprobs stay rank-0 host-side outside the graph. Eager
-workers ignore `slot_idx`/`compaction`, keeping 27B TP2 byte-identical.
-
-**Gotcha fixed during validation:** `track_retired_slot` used
-`bool::then_some`, which evaluates eagerly and indexed past the tail when the
-retired request was the last slot — use `then` for the lazy closure.
-
-**Validation (2× RTX 4090):**
-
-- `cargo check --release -p pegainfer-qwen35 --features qwen35` clean; lib
-  suite 105/105 (new: slot map admit/compact/mismatch CPU tests);
-  `cargo fmt --check` clean.
-- 9B TP2 HF gates (`--test-threads=1`): eager sequential+batched PASS;
-  graph sequential replay (identical fingerprints across reruns),
-  bucket-straddling batched replay (5→bucket 8, 3→bucket 4), and
-  post-compaction replay after a mid-batch drop all within the existing TP2
-  tolerances (worst graph arm: mean 0.0228, p99 0.1002 against MEAN_TOL 0.06
-  / P99_TOL 0.20; eager arm mean 0.0227/0.0230).
-- 9B TP2 scheduler e2e eager + graph variants PASS; 9B TP2 serving smoke now
-  launches with `--cuda-graph true` (graph acceptance replaced the old
-  rejection assertion).
-- 27B TP2 HF short+long and scheduler e2e PASS unchanged — the gate log
-  confirms group 6 keeps decode eager (the graph test variant skips itself
-  via `graph_enabled()`).
-- **Historical, not re-measured on this stack:** 9B TP2 serving benchmark
-  from the pre-rebase #946 branch (2026-08-20; `pegainfer-server --tp-size 2 --port 18093`,
-  vllm-bench `openai` backend, random 128-in/256-out, 64 prompts at
-  concurrency 16, greedy, ignore_eos, seed 42):
-
-  | arm | steady output tok/s | mean TPOT (ms) | total tok/s |
-  |-----|--------------------:|---------------:|------------:|
-  | CUDA Graph on  | 767.15 | 20.04 | 1146.65 |
-  | CUDA Graph off | 705.86 | 21.99 | 1054.56 |
-
-  On that branch graph decode measured +8.7% steady output tok/s (-8.8% TPOT)
-  at 16 concurrent. No performance claim is made for this stack until the
-  same-context A/B is rerun on it (tracked in #1001).
-  The design's "record in `bench_snapshots/`" step was skipped: the
-  in-process snapshot gate is retired (`docs/conventions/bench-regression.md`),
-  so the HTTP bench numbers live here instead.
-
-**Test-isolation note:** TP2 GPU tests must run with `--test-threads=1`. Two
-TP executors sharing the GPUs perturb cuBLASLt algorithm selection (workspace
-pressure), which once flipped a sequential-replay fingerprint comparison in
-the *eager* test while the graph test ran concurrently.
-
-## Follow-Ups
-
-- P2c CUDA Graph under TP landed for compiled decode GQA groups (4B/9B); 27B
-  TP2 graphs stay gated off until group-6 batch-decode kernels are compiled
-  (`SUPPORTED_GQA_GROUP_SIZES`). The eager path is the 27B fallback and must
-  not regress.
-- 27B TP2 knowledge-benchmark parity (2026-08-20, validated pre-rebase on
-  the f4c66780 line; `docs/benchmarks/qwen35-27b-tp2-knowledge-eval.md`):
-  C-Eval 88.11 vs official 90.5 (full 1346, thinking-cap truncation
-  rerun-merged) is inside the cross-harness band and is the current
-  evidence; the MMLU-Redux 94.09 figure was scored with the pre-fix
-  first-capital extractor — rerun-pending, do not cite. MMLU-Pro /
-  SuperGPQA sampled runs remain outstanding; rerun on this rebased branch
-  before citing parity.
-- P2B sharded linear-attention/GDR state landed (see "Rebase onto #870"); keep the completed P2A lifecycle and ID contracts unweakened.
-- Promote any stable contract changes discovered here back into `tp-design.md` through the design-doc branch.
-- Decide whether Qwen3.5 server CLI should accept arbitrary TP device ordinals instead of only `0..tp_size`.
-- Consider lifting the per-device Triton AOT handle lesson into a kernels or runtime subsystem doc if another model hits the same issue.
+> **Last touched:** 2026-10
+
+## Runtime ownership
+
+The architecture contract is in [TP design](tp-design.md). The implementation
+is split between `scheduler/{mod,backend,tp}.rs` and `tp_executor.rs`:
+
+- `Qwen35Scheduler` owns logical admission, prefill/decode planning and dense
+  decode-slot order. It writes request updates through `RequestLedger`; the
+  shared driver publishes metrics and commits those updates.
+- `TpSchedulerBackend` maps frontend request ownership to model-local
+  `RequestId`s and builds commands for `Qwen35TpExecutor`. The two ID types
+  serve different boundaries; client labels are not lifecycle keys.
+- Rank workers own model shards, CUDA contexts, thread-local cuBLAS, NCCL
+  comms, KV buffers and recurrent/conv tensors. They bind their contexts and
+  initialize CUDA/NCCL resources on their own threads. The controller starts
+  its scheduler after worker startup completes, without a second handshake.
+- The controller's `KvCacheManager` owns logical request pages. Immutable
+  `KvView`s describe the same page IDs on every rank; each worker writes its
+  own KV shard. Capacity is capped by the smallest rank-local pool after
+  validating consistent geometry and snapshot slots.
+
+TP ordinal validation precedes model loading. Ordinals must be distinct and
+fit the generated Triton AOT handle table. The generated stubs cache module
+and function handles per device and check the device index before accessing
+the table; process-global CUDA function handles are invalid across devices.
+
+## Shards and execution
+
+Full-attention and MLP projections use dense TP sharding. Gated `q_proj`
+weights are interleaved by head (`[head0 q][head0 gate][head1 q][head1 gate]`),
+so loaders preserve head ranges rather than rebuilding separate q/gate
+halves. Embeddings and `lm_head` remain replicated.
+
+Linear-attention/GDR weights, recurrent/conv state and scratch shapes are
+rank-local. The local linear output is followed by an all-reduce. Recurrent
+state and KV memory sizing use the configured `max_batch`, rather than
+reserving an unrelated default number of slots.
+
+Decode rows run as one batched forward on each rank, with sampling and
+logprobs returned by rank 0. Eager GDR pointer tables are allocated once at
+scheduler capacity and refilled from live rows each step: slot compaction
+must not leave stale row addresses. Request-local sampling steps must remain
+independent of a request's position in the batch.
+
+When prefill and decode coexist, the common planner produces one
+`RunUnifiedStep`. Every rank executes prefill before decode in the same
+collective order. The scheduler consumes decode results before promoting
+prefill results, allowing acknowledged retirement to free slots first.
+TP does not support the single-GPU stream-overlap or adaptive `auto` policies.
+
+## Dispatch and result contracts
+
+State-mutating commands share a `Pending -> Execute | Cancel` start gate.
+The controller enqueues to every rank before choosing `Execute`; a partial
+enqueue failure cancels the delivered prefix and poisons the executor.
+Workers cannot mutate request state or enter kernels/collectives before the
+gate opens. Gate transitions execute unconditionally, never only inside a
+`debug_assert!`.
+
+Structural plan validation runs before dispatch. Unified plans require both
+halves, fit the configured capacity and contain unique, mutually disjoint
+prefill/decode IDs and non-empty chunks. Workers revalidate local existence,
+phase and capacity after the gate opens. A post-dispatch inconsistency is
+replica-fatal; it is not retried as an individual request failure.
+
+Replies must cover every rank exactly once with the expected variant. Rank
+0 supplies sampled prefill/decode/unified artifacts; other ranks acknowledge.
+Drop uses `DropAck { existed }` from every rank. Duplicated or missing ranks,
+out-of-range ranks, unexpected variants and inconsistent existence results
+poison the executor.
+
+The scheduler aligns returned artifacts by model-local `RequestId`, not row
+position. Decode needs one result per active ID. Prefill needs a result only
+for final chunks: a non-final chunk has no artifact, while a final artifact
+may legitimately have no requested logprobs. Unknown, duplicated, non-final
+or missing result IDs after execution poison the replica.
+
+## Cancellation, completion and failure
+
+Cancellation is the frontend abort flag observed through the ledger. Pending
+requests retire before allocation; resident requests use normal backend
+cleanup before planning, so released capacity is available to admission in
+the same step.
+
+Admission creates rank-local recurrent state even on a cold prefix miss.
+Consequently, cancelling an admitted prefill at cursor zero still requires
+`DropExpectation::MustExist`, as do active retirement and final-prefill
+cleanup.
+The exact-rank drop contract accepts all-true for `MustExist` and all-false
+for `MustBeAbsent`; mixed or unexpected answers are lifecycle divergence.
+
+Successful completion is recorded in the ledger only after backend
+retirement succeeds. In TP this requires all-rank drop acknowledgement, so a
+cleanup failure cannot leak a successful terminal or its final token.
+Remaining open accounts are failed by the shared driver when the scheduler
+returns an engine-fatal error. Poisoned workers are not retried through
+healthy cleanup; backend teardown owns their remaining resources.
+
+## Joint prefix cache
+
+Prefix reuse requires full-attention KV and a complete recurrent/conv
+snapshot at the same boundary. Key, pin and LRU metadata is centralized;
+snapshot tensors remain rank-local. Publication reserves a common slot,
+saves it on every rank and verifies the boundary before publishing the key.
+Restore reports a hit only after every rank confirms that boundary.
+
+The snapshot budget is reserved independently on each rank through
+`qwen35-prefix-cache-mib`; zero keeps cold serving. See
+[prefix-cache design](prefix-cache.md) for boundary and eviction rules.
+
+## P2c — CUDA Graph under TP
+
+Graph mode requires both the launch option and a compiled decode GQA group.
+4B/9B TP2 can capture; group-6 27B execution stays eager until that kernel is
+available. A graph request falling back to eager is logged at startup.
+
+The scheduler assigns dense `slot_idx` values and supplies compaction moves;
+workers do not infer slot ownership. Each graph worker owns fixed-address
+state for the rounded batch capacity. A request's first decode row copies
+its prefill recurrent state into its assigned slot. Retirement validates
+occupancy and applies the explicit D2D compaction; a request retired before
+its first decode legitimately has no materialized slot.
+
+Startup warms NCCL collectives, captures and launches each required bucket,
+then verifies all buckets are captured. Lazy NCCL connection inside capture
+can hang, so warmup and the capture watchdog are required. Serving replays
+existing graphs; it never captures during a live request. Sampling and
+logprobs stay outside capture. Graph state is destroyed before the model's
+NCCL resources during worker teardown.
+
+Low-level convenience executor calls maintain their own guarded slot
+tracker. The scheduler uses explicit-slot commands and must not also update
+that tracker.
+
+## Validation surface
+
+The tests exercise different ownership boundaries:
+
+- TP executor gates observe rank-local state to prove partial-dispatch
+  cancellation, lifecycle divergence, disconnected-worker failure, mixed
+  execution, full capacity recovery and clean readmission under a fresh ID.
+- Scheduler lifecycle tests cover acknowledged completion, cancellation,
+  request rejection and cleanup failures.
+- `e2e_scheduler` covers eager and Graph request flow, mixed sampling and
+  post-cancellation health. `prefix_cache` covers joint restore and eviction.
+- `hf_golden_gate` checks short/long numeric replay, batched buckets and
+  post-compaction replay. Fixtures match `config_sha256` and the checkpoint
+  revision, including Qwen3.8; see [accuracy](accuracy.md).
+- `serving_tp2` covers real HTTP model discovery, JSON/SSE completions,
+  concurrency and logprobs. Historical dependent multi-turn evidence is
+  retained in the [TP2 serving benchmark](../../benchmarks/qwen35-tp2-phase2a-multiturn.md).
+
+The shared model-fixture resolver uses `PEGAINFER_TEST_MODEL_PATH`; an absent or invalid
+fixture emits `SKIP`, which is not a GPU pass. TP2 tests are ignored by
+default and use `PEGAINFER_TEST_TP_DEVICES` (two distinct ordinals, default
+`0,1`). `PEGAINFER_TEST_FRONTEND_MODEL_PATH` optionally selects frontend
+metadata; otherwise it uses the engine fixture. Hand-downloaded HF fixtures
+need a resolvable revision or `PEGAINFER_TEST_MODEL_REVISION`.
+
+Run GPU gates serially to avoid capacity pressure and cuBLASLt tuning
+interference between independent executors.

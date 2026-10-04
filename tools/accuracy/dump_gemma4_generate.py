@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-repo", required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--prompts",
+        type=Path,
+        help="JSON object of case name to prompt text, replacing the default set",
+    )
     return parser.parse_args()
 
 
@@ -75,6 +80,15 @@ def greedy_with_margins(model, input_ids: torch.Tensor) -> tuple[list[int], list
 
 def main() -> None:
     args = parse_args()
+    prompts = json.loads(args.prompts.read_text()) if args.prompts else PROMPTS
+    if not (
+        isinstance(prompts, dict)
+        and sorted(prompts) == sorted(PROMPTS)
+        and all(isinstance(text, str) for text in prompts.values())
+    ):
+        raise SystemExit(
+            f"--prompts must map exactly the cases {sorted(PROMPTS)} to strings"
+        )
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
 
     outs: dict[tuple[str, str], list[int]] = {}
@@ -85,8 +99,8 @@ def main() -> None:
             args.model_dir, dtype=torch.bfloat16, device_map=args.device, attn_implementation=impl
         )
         model.eval()
-        for case, text in PROMPTS.items():
-            input_ids = tokenizer(text, return_tensors="pt").input_ids.to(args.device)
+        for case, text in prompts.items():
+            input_ids = tokenizer(text, return_tensors="pt").input_ids.to(model.device if args.device == "auto" else args.device)
             prompt_ids[case] = input_ids[0].tolist()
             generated, step_margins = greedy_with_margins(model, input_ids)
             if impl == "sdpa" and (generated, step_margins) != greedy_with_margins(
@@ -104,12 +118,12 @@ def main() -> None:
         "revision": args.revision,
         "transformers": __import__("transformers").__version__,
         "max_new_tokens": MAX_NEW_TOKENS,
-        "prompts": PROMPTS,
+        "prompts": prompts,
         "backend_agreement": "sdpa == eager, verified at dump time",
         "min_margin_gate": MIN_MARGIN,
         "decisive_prefix": f"generation truncated at the first step with margin <= {MIN_MARGIN}",
     }
-    for case in PROMPTS:
+    for case in prompts:
         sdpa_tokens = outs[("sdpa", case)]
         eager_tokens = outs[("eager", case)]
         both = [

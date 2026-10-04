@@ -6,11 +6,9 @@
 //! also run with an effectively unchunked budget and the generated greedy token
 //! ids must match.
 
-use pegainfer_frontend::engine::EngineHandle;
+use common::EngineHarness;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
-use pegainfer_frontend::engine::TokenSink;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::test_fixture as common;
@@ -25,7 +23,7 @@ fn start_engine(
     acceptance: &GdnAcceptance,
     model_path: &str,
     max_prefill_tokens: usize,
-) -> EngineHandle {
+) -> EngineHarness {
     acceptance
         .launch_engine(
             model_path,
@@ -34,44 +32,35 @@ fn start_engine(
             crate::Qwen35SchedulerPolicy::Off,
             crate::Qwen35DecodeOverlap::Off,
         )
+        .map(EngineHarness::new)
         .expect("failed to start Qwen3.5 engine")
 }
 
-fn generate(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (Vec<u32>, FinishReason) {
-    let (token_tx, mut rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params: SamplingParams {
-                ignore_eos: true,
-                ..SamplingParams::default()
-            },
-            max_tokens: GENERATED_TOKENS,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: None,
-            prompt_logprobs: None,
-        })
-        .expect("submit failed");
-
+fn generate(handle: &mut EngineHarness, prompt_tokens: Vec<u32>) -> (Vec<u32>, FinishReason) {
+    let control = handle.submit(common::request(
+        prompt_tokens,
+        SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        },
+        GENERATED_TOKENS,
+    ));
     let mut tokens = Vec::new();
     loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { id, .. }) => tokens.push(id),
-            Some(
-                TokenEvent::Scheduled { .. }
-                | TokenEvent::PromptTokens { .. }
-                | TokenEvent::KvTransfer { .. },
-            ) => {}
-            Some(TokenEvent::Finished { finish_reason, .. }) => return (tokens, finish_reason),
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
+        let update = handle.next(control.id());
+        tokens.extend(update.tokens);
+        if let Some(terminal) = update.terminal {
+            match terminal {
+                Terminal::Finished {
+                    reason,
+                    completion_tokens,
+                    ..
+                } => {
+                    assert_eq!(completion_tokens, GENERATED_TOKENS);
+                    return (tokens, reason);
+                }
+                terminal => panic!("generation did not finish: {terminal:?}"),
+            }
         }
     }
 }
@@ -112,8 +101,8 @@ fn run_chunked_prefill(acceptance: &GdnAcceptance) {
     );
 
     let (baseline_tokens, baseline_finish) = {
-        let handle = start_engine(acceptance, &model_path, BASELINE_PREFILL_BUDGET);
-        generate(&handle, prompt_tokens.clone())
+        let mut handle = start_engine(acceptance, &model_path, BASELINE_PREFILL_BUDGET);
+        generate(&mut handle, prompt_tokens.clone())
     };
     assert_eq!(
         baseline_finish,
@@ -123,8 +112,8 @@ fn run_chunked_prefill(acceptance: &GdnAcceptance) {
     assert_eq!(baseline_tokens.len(), GENERATED_TOKENS);
 
     let (chunked_tokens, chunked_finish) = {
-        let handle = start_engine(acceptance, &model_path, CHUNK_BUDGET);
-        generate(&handle, prompt_tokens)
+        let mut handle = start_engine(acceptance, &model_path, CHUNK_BUDGET);
+        generate(&mut handle, prompt_tokens)
     };
     assert_eq!(
         chunked_finish,

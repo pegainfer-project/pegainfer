@@ -1,5 +1,8 @@
 use anyhow::Result;
+use pegainfer_kv_cache::KvCacheManager;
+use pegainfer_kv_cache::RequestKv;
 
+use crate::prefix_cache::Qwen35PrefixCache;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 
@@ -110,51 +113,67 @@ fn assert_logits_close(label: &str, expected: &[f32], actual: &[f32]) -> u32 {
     expected_top.0
 }
 
-fn last_token_logits(
-    model: &Qwen35Model,
-    hidden: &pegainfer_core::tensor::HiddenStates,
-) -> Result<Vec<f32>> {
-    let last = crate::ops::extract_vec(model.device_ctx(), hidden, hidden.seq_len - 1)?;
-    model
-        .batch_last_hidden_logits(&[last])?
-        .to_host(model.device_ctx())
-}
-
 fn run_prefill_case(
     model: &Qwen35Model,
+    cache: &Qwen35PrefixCache,
     tokens: &[u32],
     split_at: Option<usize>,
-) -> Result<(pegainfer_core::kv_pool::KvState, RecurrentState, Vec<f32>)> {
-    let mut kv = model.alloc_kv();
+) -> Result<(RequestKv, RecurrentState, Vec<f32>)> {
+    let mut kv = cache.pool().new_request(tokens.to_vec(), 2, None);
     let mut recurrent = RecurrentState::new(model.device_ctx(), model.config(), model.geometry)?;
-    let hidden = match split_at {
-        Some(split) => {
-            drop(model.prefill_chunk_forward(&tokens[..split], &mut kv, &mut recurrent)?);
-            assert_eq!(recurrent.seq_len, split);
-            model.prefill_chunk_forward(&tokens[split..], &mut kv, &mut recurrent)?
-        }
-        None => model.prefill_chunk_forward(tokens, &mut kv, &mut recurrent)?,
+    let remaining = if let Some(split) = split_at {
+        cache.schedule_prefill(&mut kv, split)?;
+        drop(model.prefill_last_hidden(
+            &tokens[..split],
+            &cache.prefill_view(&kv, split),
+            cache.buffer(),
+            &mut recurrent,
+        )?);
+        cache.apply_prefill(&mut kv, None)?;
+        assert_eq!(recurrent.seq_len, split);
+        &tokens[split..]
+    } else {
+        tokens
     };
-    let logits = last_token_logits(model, &hidden)?;
+    cache.schedule_prefill(&mut kv, remaining.len())?;
+    let last = model.prefill_last_hidden(
+        remaining,
+        &cache.prefill_view(&kv, remaining.len()),
+        cache.buffer(),
+        &mut recurrent,
+    )?;
+    let mut logits = model
+        .batch_last_hidden_logits(&[last])?
+        .to_host(model.device_ctx())?;
+    // Alignment-only output rows are masked to -inf and are not vocabulary tokens.
+    logits.truncate(model.config().decodable_vocab);
     Ok((kv, recurrent, logits))
 }
 
 fn first_decode_logits(
     model: &Qwen35Model,
+    cache: &Qwen35PrefixCache,
     token: u32,
-    kv: &mut pegainfer_core::kv_pool::KvState,
+    kv: &mut RequestKv,
     recurrent: &RecurrentState,
 ) -> Result<Vec<f32>> {
-    let mut graph = model.create_batch_decode_graph_state_with_capacity(1)?;
+    cache.apply_prefill(kv, Some(token))?;
+    let mut graph =
+        model.create_batch_decode_graph_state_with_capacity(1, cache.pool().padding_block_id())?;
     graph.copy_state_to_slot(model.device_ctx(), recurrent, 0)?;
-    let mut kv_refs = vec![kv];
+    cache.schedule_decode(kv)?;
     model.batch_decode_graph(
         &[token],
-        &mut kv_refs,
+        &[cache.decode_view(kv)],
+        cache.buffer(),
         &mut graph,
         crate::batch_decode::DecodeGraphUse::Serve,
     )?;
-    graph.buffers.logits.to_host(model.device_ctx())
+    let mut logits = graph.buffers.logits.to_host(model.device_ctx())?;
+    logits.truncate(model.config().decodable_vocab);
+    cache.revert_schedule(kv)?;
+    cache.release_request(kv)?;
+    Ok(logits)
 }
 
 #[test]
@@ -172,15 +191,19 @@ fn flashinfer_gdn_chunk_continuation_and_model_outputs_match() -> Result<()> {
         crate::Qwen35DecodeOverlap::Off,
     )?;
 
+    let manager =
+        KvCacheManager::from_buffer(model.kv_buffer().clone(), model.kv_buffer().num_blocks())?;
+    let cache = Qwen35PrefixCache::new(manager, 0)?;
+
     // These deterministic token ids are only model inputs. All hidden values,
     // Q/K/V/gates, recurrent state, and logits come from the real 4B weights.
     let tokens = (0..128)
         .map(|index| 100 + (index * 17 % 1000) as u32)
         .collect::<Vec<_>>();
     let (mut unchunked_kv, unchunked_state, unchunked_prefill_logits) =
-        run_prefill_case(&model, &tokens, None)?;
+        run_prefill_case(&model, &cache, &tokens, None)?;
     let (mut chunked_kv, chunked_state, chunked_prefill_logits) =
-        run_prefill_case(&model, &tokens, Some(64))?;
+        run_prefill_case(&model, &cache, &tokens, Some(64))?;
 
     assert_recurrent_continuation(&model, &unchunked_state, &chunked_state)?;
     let decode_token = assert_logits_close(
@@ -189,10 +212,20 @@ fn flashinfer_gdn_chunk_continuation_and_model_outputs_match() -> Result<()> {
         &chunked_prefill_logits,
     );
 
-    let unchunked_decode =
-        first_decode_logits(&model, decode_token, &mut unchunked_kv, &unchunked_state)?;
-    let chunked_decode =
-        first_decode_logits(&model, decode_token, &mut chunked_kv, &chunked_state)?;
+    let unchunked_decode = first_decode_logits(
+        &model,
+        &cache,
+        decode_token,
+        &mut unchunked_kv,
+        &unchunked_state,
+    )?;
+    let chunked_decode = first_decode_logits(
+        &model,
+        &cache,
+        decode_token,
+        &mut chunked_kv,
+        &chunked_state,
+    )?;
     assert_logits_close(
         "real-model first-decode logits",
         &unchunked_decode,

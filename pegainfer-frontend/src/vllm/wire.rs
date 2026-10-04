@@ -9,18 +9,30 @@ use vllm_engine_core_client::protocol::logprobs::TokenLogprob as WireTokenLogpro
 use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
+use crate::engine::EosPolicy;
 use crate::engine::FinishReason;
 use crate::engine::PromptEcho;
+use crate::engine::StopPolicy;
 use crate::engine::TokenLogprob;
 use crate::sampler::SamplingParams;
 
 pub(crate) const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
 
+/// A sampled position: the chosen token, then its top-k without repeating it.
+/// The chat renderer takes the first `k` entries as the alternatives, so a
+/// repeat would push out a real candidate.
 pub(crate) fn to_wire_position_logprobs(
     token_id: u32,
     logprob: Option<TokenLogprob>,
 ) -> Option<PositionLogprobs> {
-    let lp = logprob?;
+    Some(position_logprobs(token_id, logprob?, false))
+}
+
+/// The scored token, then its top-k. A prompt position keeps a repeat of the
+/// scored token (`keep_repeat`): the encoder needs every row of one payload
+/// equally wide, and prompt positions render as per-token maps, where the
+/// repeat collapses.
+fn position_logprobs(token_id: u32, lp: TokenLogprob, keep_repeat: bool) -> PositionLogprobs {
     let mut entries = Vec::with_capacity(1 + lp.top_logprobs.len());
     entries.push(WireTokenLogprob {
         token_id,
@@ -28,7 +40,7 @@ pub(crate) fn to_wire_position_logprobs(
         rank: lp.rank,
     });
     for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
-        if alt_id == token_id {
+        if !keep_repeat && alt_id == token_id {
             continue;
         }
         entries.push(WireTokenLogprob {
@@ -37,7 +49,7 @@ pub(crate) fn to_wire_position_logprobs(
             rank: (index + 1) as u32,
         });
     }
-    Some(PositionLogprobs { entries })
+    PositionLogprobs { entries }
 }
 
 /// The engine includes the unscored leading token; vLLM restores it itself.
@@ -67,7 +79,8 @@ pub(crate) fn to_wire_prompt_logprobs(prompt: PromptEcho) -> Result<Option<Maybe
         .enumerate()
         .skip(1)
         .map(|(index, (id, logprob))| {
-            to_wire_position_logprobs(id, logprob)
+            logprob
+                .map(|lp| position_logprobs(id, lp, true))
                 .with_context(|| format!("missing prompt logprob at position {index}"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -77,10 +90,10 @@ pub(crate) fn to_wire_prompt_logprobs(prompt: PromptEcho) -> Result<Option<Maybe
 pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingParams {
     // The vLLM frontend lowers a client `ignore_eos=true` to `_eos_token_id:
     // None`, but `_all_stop_token_ids` always carries the model EOS set (it
-    // exists for min_tokens masking, not stop detection). Deriving ignore_eos
-    // from all_stop_token_ids would therefore void every ignore_eos request on
-    // models with a real EOS. Only `_eos_token_id` and the client's explicit
-    // `stop_token_ids` express a stop intent.
+    // exists for min_tokens masking, not stop detection). This conversion feeds
+    // the legacy SamplingParams contract, which has no field for explicit
+    // request stop IDs; keep its historical lowering until each producer is
+    // migrated to StopPolicy. Qwen3 receives the independent policy below.
     let ignore_eos = params.eos_token_id.is_none() && params.stop_token_ids.is_empty();
     if params.temperature <= 0.0 {
         return SamplingParams {
@@ -111,7 +124,23 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
     }
 }
 
-/// Reject request parameters the engine would otherwise silently ignore.
+pub(crate) fn convert_stop_policy(params: &EngineCoreSamplingParams) -> StopPolicy {
+    StopPolicy::new(
+        // vLLM lowers secondary model EOS IDs into stop_token_ids. Keep its
+        // primary EOS separate so secondary stops retain their wire reason;
+        // all_stop_token_ids is only for min_tokens masking.
+        params
+            .eos_token_id
+            .map_or(EosPolicy::Ignore, EosPolicy::Token),
+        params.stop_token_ids.clone(),
+    )
+}
+
+/// Reject request parameters the frontend cannot represent faithfully.
+///
+/// The stepped contract carries explicit request stop IDs independently in
+/// [`StopPolicy`]; this helper only validates unrelated sampling/transfer
+/// fields that would otherwise be silently ignored.
 /// Returns the offending description; `None` means the request is servable.
 ///
 /// The float comparisons are exact on purpose: they detect "the client sent
@@ -124,6 +153,12 @@ pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> O
         || params.prompt_logprobs.is_some_and(|count| count < 0)
     {
         return Some("negative logprob counts are not supported".into());
+    }
+    if params.min_tokens != 0 {
+        return Some(format!(
+            "min_tokens={} is not supported by current engine contracts",
+            params.min_tokens
+        ));
     }
     if !(0.0..1.0).contains(&params.min_p) || !params.min_p.is_finite() {
         return Some(format!("min_p {} outside [0, 1)", params.min_p));
@@ -233,11 +268,43 @@ mod tests {
         params.eos_token_id = Some(163_586);
         assert!(!convert_sampling(&params).ignore_eos);
 
-        // Explicit client stop tokens keep EOS detection on even when the
-        // frontend dropped _eos_token_id.
+        // The legacy SamplingParams contract keeps EOS active when explicit
+        // stop IDs are present; the stepped Qwen3 path carries those IDs in
+        // StopPolicy instead.
         params.eos_token_id = None;
         params.stop_token_ids = vec![42];
         assert!(!convert_sampling(&params).ignore_eos);
+    }
+
+    #[test]
+    fn convert_stop_policy_keeps_primary_and_secondary_eos_distinct() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.eos_token_id = Some(99);
+        params.stop_token_ids = vec![100];
+
+        let policy = convert_stop_policy(&params);
+        // The primary protocol EOS is carried as `EosPolicy::Token`, so it is
+        // still an EOS stop even when the model predicate is unavailable.
+        assert_eq!(
+            policy.classify(99, |_| false),
+            Some(crate::engine::StopCause::Eos(99))
+        );
+        // Secondary model EOS IDs must keep their token stop reason.
+        assert_eq!(
+            policy.classify(100, |_| true),
+            Some(crate::engine::StopCause::Token(100))
+        );
+
+        params.eos_token_id = None;
+        params.stop_token_ids = vec![99];
+        params.all_stop_token_ids = BTreeSet::from([99, 100]);
+        let policy = convert_stop_policy(&params);
+        // EOS disabled: the primary ID stops only when explicitly requested.
+        assert_eq!(
+            policy.classify(99, |_| true),
+            Some(crate::engine::StopCause::Token(99))
+        );
+        assert_eq!(policy.classify(100, |_| true), None);
     }
 
     #[test]
@@ -263,6 +330,13 @@ mod tests {
         let mut params = EngineCoreSamplingParams::for_test();
         params.repetition_penalty = 1.0;
         assert_eq!(unsupported_request_params(&params), None);
+
+        params.min_tokens = 1;
+        assert_eq!(
+            unsupported_request_params(&params).as_deref(),
+            Some("min_tokens=1 is not supported by current engine contracts")
+        );
+        params.min_tokens = 0;
 
         params.min_p = 0.2;
         assert_eq!(unsupported_request_params(&params), None);
@@ -409,6 +483,29 @@ mod tests {
             })
             .collect();
         assert_eq!(scored, vec![8, 7]);
+    }
+
+    #[test]
+    fn prompt_rows_keep_one_width_whether_or_not_the_token_is_in_the_top_k() {
+        let scored = |top: Vec<(u32, f32)>| TokenLogprob {
+            rank: 1,
+            logprob: -0.5,
+            top_logprobs: top,
+        };
+        let prompt = PromptEcho {
+            ids: vec![9, 8, 7],
+            logprobs: vec![
+                None,
+                Some(scored(vec![(8, -0.5), (3, -2.0)])),
+                Some(scored(vec![(4, -0.1), (5, -2.0)])),
+            ],
+        };
+        let Some(MaybeWireLogprobs::Direct(payload)) = to_wire_prompt_logprobs(prompt).unwrap()
+        else {
+            panic!("expected direct prompt logprobs");
+        };
+        let widths: Vec<_> = payload.positions.iter().map(|p| p.entries.len()).collect();
+        assert_eq!(widths, vec![3, 3]);
     }
 
     #[test]

@@ -79,12 +79,28 @@ impl StepCollector {
     /// Fold this request's stream to its end: all tokens in order plus the
     /// terminal. Panics if the stream closes without a terminal.
     fn collect_terminal(&mut self, id: RequestId) -> (Vec<u32>, Terminal) {
+        let (tokens, _, terminal) = self.collect_terminal_with_logprobs(id);
+        (tokens, terminal)
+    }
+
+    fn collect_terminal_with_logprobs(
+        &mut self,
+        id: RequestId,
+    ) -> (
+        Vec<u32>,
+        Vec<Option<pegainfer_frontend::engine::TokenLogprob>>,
+        Terminal,
+    ) {
         let mut tokens = Vec::new();
+        let mut logprobs = Vec::new();
+
         loop {
             let update = self.next_for(id);
             tokens.extend_from_slice(&update.tokens);
+            logprobs.extend(update.logprobs);
+
             if let Some(terminal) = update.terminal {
-                return (tokens, terminal);
+                return (tokens, logprobs, terminal);
             }
         }
     }
@@ -121,6 +137,62 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+#[test]
+fn request_stop_token_beats_length_during_prefill_when_eos_is_ignored() {
+    let executor = FakeExecutor::new(4, Arc::new(Mutex::new(Vec::new()))).with_logprobs();
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let mut req = request(16, 1);
+    req.stop_policy = pegainfer_frontend::engine::StopPolicy::new(
+        pegainfer_frontend::engine::EosPolicy::Ignore,
+        vec![100],
+    );
+
+    let control = partition.handle.submit(req);
+    let (tokens, logprobs, terminal) = steps.collect_terminal_with_logprobs(control.id());
+
+    assert_eq!(tokens, vec![100]);
+    assert_eq!(logprobs.len(), 1);
+    assert!((logprobs[0].as_ref().expect("stop-token logprob").logprob + 0.1).abs() < f32::EPSILON);
+    assert!(matches!(
+        terminal,
+        Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(pegainfer_frontend::engine::StopCause::Token(100)),
+            completion_tokens: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn request_stop_token_beats_length_during_decode_when_eos_is_ignored() {
+    let executor = FakeExecutor::new(4, Arc::new(Mutex::new(Vec::new()))).with_logprobs();
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let mut req = request(16, 2);
+    req.stop_policy = pegainfer_frontend::engine::StopPolicy::new(
+        pegainfer_frontend::engine::EosPolicy::Ignore,
+        vec![200],
+    );
+
+    let control = partition.handle.submit(req);
+    let (tokens, logprobs, terminal) = steps.collect_terminal_with_logprobs(control.id());
+
+    assert_eq!(tokens, vec![100, 200]);
+    assert_eq!(logprobs.len(), 2);
+    assert!((logprobs[1].as_ref().expect("stop-token logprob").logprob + 0.2).abs() < f32::EPSILON);
+    assert!(matches!(
+        terminal,
+        Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(pegainfer_frontend::engine::StopCause::Token(200)),
+            completion_tokens: 2,
+            ..
+        }
+    ));
 }
 
 #[test]

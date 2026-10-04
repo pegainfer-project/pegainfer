@@ -61,6 +61,7 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
         submissions,
         mut ledger,
         metrics,
+        exit_guard: _exit_guard,
     } = backend;
     let mut submissions_open = true;
     loop {
@@ -79,15 +80,15 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
         }
         let step = scheduler.step(&mut ledger);
         let snapshot = scheduler.metrics();
-        metrics.publish(&snapshot);
-        ledger.commit_step();
+        let metrics_changed = metrics.publish(&snapshot);
+        ledger.commit_step(metrics_changed);
         if let Err(error) = step {
             // The ledger holds an account for every unanswered request, so
             // the write-off reaches them all — including any the scheduler
             // lost track of — with the real error attached.
             log::error!("scheduler fatal, engine winding down: {error:#}");
             ledger.fail_all(&format!("engine fatal: {error:#}"));
-            ledger.commit_step();
+            ledger.commit_step(false);
             return;
         }
         if snapshot.num_running_reqs == 0 && snapshot.num_waiting_reqs == 0 {
@@ -108,6 +109,7 @@ mod tests {
     use super::super::step::Request;
     use super::super::step::RequestId;
     use super::super::step::Terminal;
+    use super::super::stop::StopPolicy;
     use super::*;
     use crate::engine::FinishReason;
 
@@ -163,6 +165,7 @@ mod tests {
         Request {
             prompt_tokens: vec![1, 2],
             params: crate::sampler::SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -197,6 +200,7 @@ mod tests {
             terminal,
             Some(Terminal::Finished {
                 reason: FinishReason::Length,
+                stop_cause: None,
                 prompt_tokens: 2,
                 completion_tokens: 3,
             })
@@ -206,6 +210,96 @@ mod tests {
         // scheduler exits.
         drop(handle);
         partition.join.join().expect("driver thread exits cleanly");
+    }
+
+    #[test]
+    fn cancellation_notifies_metrics_once_without_request_output() {
+        struct PausedScheduler {
+            queued: Vec<RequestId>,
+            running: Vec<RequestId>,
+            entered: std::sync::mpsc::Sender<()>,
+            resume: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl Scheduler for PausedScheduler {
+            fn submit(&mut self, request: QueuedRequest) {
+                self.queued.push(request.id);
+            }
+
+            fn step(&mut self, ledger: &mut RequestLedger) -> anyhow::Result<()> {
+                let _ = self.entered.send(());
+                let _ = self.resume.recv();
+                for id in self.queued.drain(..) {
+                    ledger.admit(id);
+                    self.running.push(id);
+                }
+                self.running.retain(|&id| {
+                    if ledger.is_aborted(id) {
+                        ledger.retire(id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                Ok(())
+            }
+
+            fn metrics(&self) -> SchedulerMetrics {
+                SchedulerMetrics {
+                    num_running_reqs: self.running.len() as u64,
+                    ..SchedulerMetrics::default()
+                }
+            }
+        }
+
+        let (mut handle, backend) = scheduler_pair();
+        let mut steps = handle.take_steps().unwrap();
+        let control = handle.submit(request(8));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            drive(
+                PausedScheduler {
+                    queued: Vec::new(),
+                    running: Vec::new(),
+                    entered: entered_tx,
+                    resume: resume_rx,
+                },
+                backend,
+            );
+        });
+        let next_step = || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("driver advanced to its next step");
+        };
+
+        next_step();
+        resume_tx.send(()).unwrap();
+        next_step();
+        steps.try_recv().expect("admission step");
+
+        control.abort();
+        resume_tx.send(()).unwrap();
+        next_step();
+        assert!(
+            steps
+                .try_recv()
+                .expect("cancellation load change")
+                .updates
+                .is_empty()
+        );
+        assert_eq!(handle.metrics().num_running_reqs, 0);
+
+        resume_tx.send(()).unwrap();
+        next_step();
+        assert!(matches!(
+            steps.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(handle);
+        drop(resume_tx);
+        join.join().expect("driver drains after cancellation");
     }
 
     #[test]

@@ -66,7 +66,7 @@ pub struct Dsv2LiteRouterOutput<'a> {
 
 pub fn dsv2_lite_router_logits_into(
     ctx: &DeviceContext,
-    hidden: &HiddenStates,
+    hidden: HiddenStatesRef<'_>,
     gate_weight: &DeviceMatrix,
     logits: &mut CudaSlice<f32>,
 ) -> Result<()> {

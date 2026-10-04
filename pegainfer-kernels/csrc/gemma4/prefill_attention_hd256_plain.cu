@@ -3,9 +3,6 @@
 // computes the 1+w offset norm, assumes a gated Q layout twice as wide, and
 // ships no v_norm.
 //
-// Two entry points share the math: the contiguous oracle form and the
-// paged serving form.
-//
 // rotary_dim is a runtime argument, checked at the launcher for positive,
 // even and <= HD256. Gemma 4 local layers rotate the full head (256); at
 // that width the pass-through tail is empty. Evenness is load-bearing: with
@@ -15,16 +12,22 @@
 // Positions derive from host-known start_pos, so the launcher rejects any
 // out-of-range window before launch; the device trap before the cos read is
 // a second layer, not the contract. Page ids are device data, so for them
-// the paged form's trap is the only check.
+// the kernel's trap is the only check.
 
 #include "common.cuh"
-#include "ffi_guard.cuh"
-#include "qk_prep.cuh"
+#include "../shared/ffi_guard.cuh"
+#include "../shared/qk_prep.cuh"
 #include <cuda_fp8.h>
 
 #define HD256_PLAIN 256
 #define THREADS_HD256_PLAIN 256
 #define NUM_WARPS_HD256_PLAIN (THREADS_HD256_PLAIN / WARP_SIZE)
+// Tokens one paged-prep block carries. A block that held one token spent its
+// life waiting on one load and three barriers; eight tokens a block keep
+// eight loads in flight per thread and cut the block count eightfold, while
+// thread d still holds element d of every token, so each token's squares
+// reduce through the very tree they did before.
+#define HD256_PREP_TOKENS 8
 
 __device__ __forceinline__ __nv_bfloat16 rms_norm_elem_hd256_plain(
     __nv_bfloat16 x, float rms_inv, __nv_bfloat16 weight) {
@@ -32,100 +35,7 @@ __device__ __forceinline__ __nv_bfloat16 rms_norm_elem_hd256_plain(
     return __float2bfloat16(__bfloat162float(x) * rms_inv * w);
 }
 
-__global__ void qk_norm_rope_prefill_hd256_plain_kernel(
-    const __nv_bfloat16* __restrict__ q_batch,      // [q_dim, seq_len]
-    const __nv_bfloat16* __restrict__ k_batch,      // [kv_dim, seq_len]
-    const __nv_bfloat16* __restrict__ q_norm_weight, // [HD256_PLAIN]
-    const __nv_bfloat16* __restrict__ k_norm_weight, // [HD256_PLAIN]
-    const __nv_bfloat16* __restrict__ cos_cache,    // [max_seq * rotary_dim]
-    const __nv_bfloat16* __restrict__ sin_cache,
-    __nv_bfloat16* __restrict__ q_batch_out,        // [q_dim, seq_len]
-    __nv_bfloat16* __restrict__ k_batch_out,        // [kv_dim, seq_len]
-    int num_q_heads,
-    int num_kv_heads,
-    int start_pos,                                  // host base position
-    int cos_max_pos,                                // rows in cos/sin tables
-    int rotary_dim,
-    float rms_eps
-) {
-    // seq_len is mapped onto grid.x (limit ~2^31) and the head index onto
-    // grid.y so prompts longer than the 65535 grid.y limit still launch.
-    int token = blockIdx.x;
-    int head_global = blockIdx.y;
-    int d = threadIdx.x;
-
-    bool is_q = head_global < num_q_heads;
-    int head_local = is_q ? head_global : (head_global - num_q_heads);
-    int q_dim = num_q_heads * HD256_PLAIN;
-    int kv_dim = num_kv_heads * HD256_PLAIN;
-
-    int src_offset = is_q
-        ? token * q_dim + head_local * HD256_PLAIN + d
-        : token * kv_dim + head_local * HD256_PLAIN + d;
-    __nv_bfloat16 x = is_q ? q_batch[src_offset] : k_batch[src_offset];
-    const __nv_bfloat16* norm_w = is_q ? q_norm_weight : k_norm_weight;
-
-    float sq = __bfloat162float(x);
-    sq *= sq;
-    float sq_sum = warp_reduce_sum(sq);
-
-    int warp_id = d / WARP_SIZE;
-    int lane_id = d % WARP_SIZE;
-    __shared__ float warp_sums[NUM_WARPS_HD256_PLAIN];
-    __shared__ float inv_rms;
-    __shared__ __nv_bfloat16 smem[HD256_PLAIN];
-
-    if (lane_id == 0) warp_sums[warp_id] = sq_sum;
-    __syncthreads();
-
-    if (d == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < NUM_WARPS_HD256_PLAIN; i++) total += warp_sums[i];
-        inv_rms = 1.0f / sqrtf(total / HD256_PLAIN + rms_eps);
-    }
-    __syncthreads();
-
-    smem[d] = rms_norm_elem_hd256_plain(x, inv_rms, norm_w[d]);
-    __syncthreads();
-
-    int pos = start_pos + token;
-    // Reject before reading the cos/sin tables.
-    if (pos < 0 || pos >= cos_max_pos) __trap();
-    int half_rotary = rotary_dim / 2;
-
-    if (d < half_rotary) {
-        __nv_bfloat16 lo = smem[d];
-        __nv_bfloat16 hi = smem[d + half_rotary];
-        apply_rope_pair(
-            lo,
-            hi,
-            cos_cache[pos * rotary_dim + d],
-            sin_cache[pos * rotary_dim + d]
-        );
-
-        if (is_q) {
-            int dst = token * q_dim + head_local * HD256_PLAIN;
-            q_batch_out[dst + d] = lo;
-            q_batch_out[dst + d + half_rotary] = hi;
-        } else {
-            int dst = token * kv_dim + head_local * HD256_PLAIN;
-            k_batch_out[dst + d] = lo;
-            k_batch_out[dst + d + half_rotary] = hi;
-        }
-    }
-
-    if (d >= rotary_dim) {
-        if (is_q) {
-            int dst = token * q_dim + head_local * HD256_PLAIN;
-            q_batch_out[dst + d] = smem[d];
-        } else {
-            int dst = token * kv_dim + head_local * HD256_PLAIN;
-            k_batch_out[dst + d] = smem[d];
-        }
-    }
-}
-
-// Paged serving prep. grid.y carries three bands: [0, num_q_heads) Q,
+// Paged prep. grid.y carries three bands: [0, num_q_heads) Q,
 // then num_kv_heads K, then num_kv_heads V. Q and K are plain-w normed
 // and rotated; V is weightless-normed over its own head vector (v_proj
 // output — a separate reduction, unlike the hd512 K=V fork) and never
@@ -147,9 +57,12 @@ __device__ __forceinline__ __nv_fp8_e4m3 kv_store_cast(__nv_bfloat16 x) {
 // the scalar start_pos/page_origin are ignored.
 template <bool PER_TOKEN_META, typename KvT>
 __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
-    const __nv_bfloat16* __restrict__ q_batch,      // [q_dim, seq_len]
-    const __nv_bfloat16* __restrict__ k_batch,      // [kv_dim, seq_len]
-    const __nv_bfloat16* __restrict__ v_batch,      // [kv_dim, seq_len]
+    const __nv_bfloat16* __restrict__ q_batch,      // [seq_len, q_stride], Q in the first q_dim
+    const __nv_bfloat16* __restrict__ k_batch,      // [seq_len, k_stride], K in the first kv_dim
+    const __nv_bfloat16* __restrict__ v_batch,      // [seq_len, v_stride], V in the first kv_dim
+    int q_stride,                                   // row strides: the projection's own width,
+    int k_stride,                                   // or the fused row's when they share one
+    int v_stride,
     const __nv_bfloat16* __restrict__ q_norm_weight, // [HD256_PLAIN]
     const __nv_bfloat16* __restrict__ k_norm_weight, // [HD256_PLAIN]
     const __nv_bfloat16* __restrict__ cos_cache,    // [max_seq * rotary_dim]
@@ -163,6 +76,7 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
     int page_origin,                                // absolute page of row[0]
     int num_q_heads,
     int num_kv_heads,
+    int n_tokens,                                   // rows of the batch
     int start_pos,                                  // host base position
     int cos_max_pos,                                // rows in cos/sin tables
     int rotary_dim,
@@ -174,9 +88,10 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
     const int* __restrict__ page_indptr,            // [seq_len + 1] into page_indices
     const int* __restrict__ page_origins            // [seq_len] released-front pages
 ) {
-    int token = blockIdx.x;
+    int token0 = blockIdx.x * HD256_PREP_TOKENS;
     int band = blockIdx.y;
     int d = threadIdx.x;
+    int n = min(HD256_PREP_TOKENS, n_tokens - token0);
 
     bool is_q = band < num_q_heads;
     bool is_k = !is_q && band < num_q_heads + num_kv_heads;
@@ -184,188 +99,139 @@ __global__ void qkv_norm_rope_paged_prefill_hd256_plain_kernel(
         : is_k ? band - num_q_heads
                : band - num_q_heads - num_kv_heads;
     int q_dim = num_q_heads * HD256_PLAIN;
-    int kv_dim = num_kv_heads * HD256_PLAIN;
 
-    int src_offset = is_q
-        ? token * q_dim + head_local * HD256_PLAIN + d
-        : token * kv_dim + head_local * HD256_PLAIN + d;
-    __nv_bfloat16 x = is_q ? q_batch[src_offset]
-        : is_k ? k_batch[src_offset]
-               : v_batch[src_offset];
-
-    float sq = __bfloat162float(x);
-    sq *= sq;
-    float sq_sum = warp_reduce_sum(sq);
+    const __nv_bfloat16* src = is_q ? q_batch : is_k ? k_batch : v_batch;
+    int src_stride = is_q ? q_stride : is_k ? k_stride : v_stride;
+    __nv_bfloat16 x[HD256_PREP_TOKENS];
+    #pragma unroll
+    for (int t = 0; t < HD256_PREP_TOKENS; t++) {
+        x[t] = t < n
+            ? src[(int64_t)(token0 + t) * src_stride + head_local * HD256_PLAIN + d]
+            : __float2bfloat16(0.0f);
+    }
 
     int warp_id = d / WARP_SIZE;
     int lane_id = d % WARP_SIZE;
-    __shared__ float warp_sums[NUM_WARPS_HD256_PLAIN];
-    __shared__ float inv_rms;
-    __shared__ __nv_bfloat16 smem[HD256_PLAIN];
+    __shared__ float warp_sums[HD256_PREP_TOKENS][NUM_WARPS_HD256_PLAIN];
+    __shared__ float inv_rms[HD256_PREP_TOKENS];
+    __shared__ int pos_s[HD256_PREP_TOKENS];
+    __shared__ int page_s[HD256_PREP_TOKENS];
+    __shared__ __nv_bfloat16 smem[HD256_PREP_TOKENS][HD256_PLAIN];
 
-    if (lane_id == 0) warp_sums[warp_id] = sq_sum;
-    __syncthreads();
-
-    if (d == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < NUM_WARPS_HD256_PLAIN; i++) total += warp_sums[i];
-        inv_rms = 1.0f / sqrtf(total / HD256_PLAIN + rms_eps);
+    #pragma unroll
+    for (int t = 0; t < HD256_PREP_TOKENS; t++) {
+        float sq = __bfloat162float(x[t]);
+        sq *= sq;
+        float sq_sum = warp_reduce_sum(sq);
+        if (lane_id == 0) warp_sums[t][warp_id] = sq_sum;
     }
     __syncthreads();
 
-    int pos = PER_TOKEN_META ? positions[token] : start_pos + token;
-    // Reject before reading the cos/sin tables or the page list.
-    if (pos < 0 || pos >= cos_max_pos) __trap();
-    // Check the device-resident page id before the first pool write. Q
-    // blocks never touch the pool.
     // The resident window starts page-aligned, so the in-page offset is
     // position-invariant and only the row index shifts.
-    int page_id = -1;
-    if (!is_q) {
-        int row_len = page_indices_len;
-        const int* pages = page_indices;
-        if (PER_TOKEN_META) {
-            pages = csr_page_row_checked(
-                page_indices, page_indices_len, page_indptr, token, &row_len);
+    if (d < n) {
+        float total = 0.0f;
+        for (int i = 0; i < NUM_WARPS_HD256_PLAIN; i++) total += warp_sums[d][i];
+        inv_rms[d] = 1.0f / sqrtf(total / HD256_PLAIN + rms_eps);
+        int token = token0 + d;
+        int pos = PER_TOKEN_META ? positions[token] : start_pos + token;
+        if (pos < 0 || pos >= cos_max_pos) __trap();
+        int page_id = -1;
+        if (!is_q) {
+            int row_len = page_indices_len;
+            const int* pages = page_indices;
+            if (PER_TOKEN_META) {
+                pages = csr_page_row_checked(
+                    page_indices, page_indices_len, page_indptr, token, &row_len);
+            }
+            int origin = PER_TOKEN_META ? page_origins[token] : page_origin;
+            int row = resident_row_checked(pos, page_size, origin);
+            if (row >= row_len) __trap();
+            page_id = pages[row];
+            if (page_id < 0 || page_id >= num_pages) __trap();
         }
-        int origin = PER_TOKEN_META ? page_origins[token] : page_origin;
-        int row = resident_row_checked(pos, page_size, origin);
-        if (row >= row_len) __trap();
-        page_id = pages[row];
-        if (page_id < 0 || page_id >= num_pages) __trap();
+        pos_s[d] = pos;
+        page_s[d] = page_id;
     }
+    __syncthreads();
 
     if (!is_q && !is_k) {
         // V band: weightless norm, no RoPE — the whole block exits here.
-        int64_t dst = paged_kv_offset<HD256_PLAIN>(
-            page_id, v_offset_elems, stride_page, page_size,
-            num_kv_heads, pos, head_local, d);
-        kv_data[dst] = kv_store_cast<KvT>(
-            __float2bfloat16(__bfloat162float(x) * inv_rms));
+        #pragma unroll
+        for (int t = 0; t < HD256_PREP_TOKENS; t++) {
+            if (t < n) {
+                int64_t dst = paged_kv_offset<HD256_PLAIN>(
+                    page_s[t], v_offset_elems, stride_page, page_size,
+                    num_kv_heads, pos_s[t], head_local, d);
+                kv_data[dst] = kv_store_cast<KvT>(
+                    __float2bfloat16(__bfloat162float(x[t]) * inv_rms[t]));
+            }
+        }
         return;
     }
 
-    smem[d] = rms_norm_elem_hd256_plain(
-        x, inv_rms, is_q ? q_norm_weight[d] : k_norm_weight[d]);
+    __nv_bfloat16 w = is_q ? q_norm_weight[d] : k_norm_weight[d];
+    #pragma unroll
+    for (int t = 0; t < HD256_PREP_TOKENS; t++) {
+        if (t < n) smem[t][d] = rms_norm_elem_hd256_plain(x[t], inv_rms[t], w);
+    }
     __syncthreads();
 
     int half_rotary = rotary_dim / 2;
 
     if (d < half_rotary) {
-        __nv_bfloat16 lo = smem[d];
-        __nv_bfloat16 hi = smem[d + half_rotary];
-        apply_rope_pair(
-            lo,
-            hi,
-            cos_cache[pos * rotary_dim + d],
-            sin_cache[pos * rotary_dim + d]
-        );
+        #pragma unroll
+        for (int t = 0; t < HD256_PREP_TOKENS; t++) {
+            if (t >= n) break;
+            int pos = pos_s[t];
+            __nv_bfloat16 lo = smem[t][d];
+            __nv_bfloat16 hi = smem[t][d + half_rotary];
+            apply_rope_pair(
+                lo,
+                hi,
+                cos_cache[pos * rotary_dim + d],
+                sin_cache[pos * rotary_dim + d]
+            );
 
-        if (is_q) {
-            int dst = token * q_dim + head_local * HD256_PLAIN;
-            q_batch_out[dst + d] = lo;
-            q_batch_out[dst + d + half_rotary] = hi;
-        } else {
-            int64_t dst = paged_kv_offset<HD256_PLAIN>(
-                page_id, k_offset_elems, stride_page, page_size,
-                num_kv_heads, pos, head_local, d);
-            kv_data[dst] = kv_store_cast<KvT>(lo);
-            kv_data[dst + half_rotary] = kv_store_cast<KvT>(hi);
+            if (is_q) {
+                int64_t dst = (int64_t)(token0 + t) * q_dim + head_local * HD256_PLAIN;
+                q_batch_out[dst + d] = lo;
+                q_batch_out[dst + d + half_rotary] = hi;
+            } else {
+                int64_t dst = paged_kv_offset<HD256_PLAIN>(
+                    page_s[t], k_offset_elems, stride_page, page_size,
+                    num_kv_heads, pos, head_local, d);
+                kv_data[dst] = kv_store_cast<KvT>(lo);
+                kv_data[dst + half_rotary] = kv_store_cast<KvT>(hi);
+            }
         }
     }
 
     if (d >= rotary_dim) {
-        if (is_q) {
-            int dst = token * q_dim + head_local * HD256_PLAIN;
-            q_batch_out[dst + d] = smem[d];
-        } else {
-            int64_t dst = paged_kv_offset<HD256_PLAIN>(
-                page_id, k_offset_elems, stride_page, page_size,
-                num_kv_heads, pos, head_local, d);
-            kv_data[dst] = kv_store_cast<KvT>(smem[d]);
+        #pragma unroll
+        for (int t = 0; t < HD256_PREP_TOKENS; t++) {
+            if (t >= n) break;
+            if (is_q) {
+                int64_t dst = (int64_t)(token0 + t) * q_dim + head_local * HD256_PLAIN;
+                q_batch_out[dst + d] = smem[t][d];
+            } else {
+                int64_t dst = paged_kv_offset<HD256_PLAIN>(
+                    page_s[t], k_offset_elems, stride_page, page_size,
+                    num_kv_heads, pos_s[t], head_local, d);
+                kv_data[dst] = kv_store_cast<KvT>(smem[t][d]);
+            }
         }
     }
 }
-
-extern "C" {
-
-int qk_norm_rope_prefill_hd256_plain_cuda(
-    const __nv_bfloat16* q_batch,
-    const __nv_bfloat16* k_batch,
-    const __nv_bfloat16* q_norm_weight,
-    const __nv_bfloat16* k_norm_weight,
-    const __nv_bfloat16* cos_cache,
-    const __nv_bfloat16* sin_cache,
-    __nv_bfloat16* q_batch_out,
-    __nv_bfloat16* k_batch_out,
-    int num_q_heads,
-    int num_kv_heads,
-    int seq_len,
-    int start_pos,
-    int cos_max_pos,
-    int rotary_dim,
-    float rms_eps,
-    cudaStream_t stream
-) {
-    PEGAINFER_FFI_GUARD_BEGIN
-    if (rotary_dim <= 0 || (rotary_dim & 1) != 0 || rotary_dim > HD256_PLAIN) {
-        pegainfer_ffi_set_last_error(
-            "qk_norm_rope_prefill_hd256_plain_cuda: rotary_dim must be "
-            "positive, even and <= 256");
-        return -1;
-    }
-    if (q_batch == nullptr || k_batch == nullptr || q_norm_weight == nullptr ||
-        k_norm_weight == nullptr || cos_cache == nullptr || sin_cache == nullptr ||
-        q_batch_out == nullptr || k_batch_out == nullptr) {
-        pegainfer_ffi_set_last_error(
-            "qk_norm_rope_prefill_hd256_plain_cuda: null pointer argument");
-        return -1;
-    }
-    if (num_q_heads <= 0 || num_kv_heads <= 0 || seq_len <= 0) {
-        pegainfer_ffi_set_last_error(
-            "qk_norm_rope_prefill_hd256_plain_cuda: num_q_heads, num_kv_heads "
-            "and seq_len must be positive");
-        return -1;
-    }
-    if (start_pos < 0 || start_pos + seq_len > cos_max_pos) {
-        pegainfer_ffi_set_last_error(
-            "qk_norm_rope_prefill_hd256_plain_cuda: start_pos + seq_len must "
-            "be <= cos_max_pos");
-        return -1;
-    }
-    dim3 prep_grid(seq_len, num_q_heads + num_kv_heads);
-    qk_norm_rope_prefill_hd256_plain_kernel<<<prep_grid, THREADS_HD256_PLAIN, 0, stream>>>(
-        q_batch,
-        k_batch,
-        q_norm_weight,
-        k_norm_weight,
-        cos_cache,
-        sin_cache,
-        q_batch_out,
-        k_batch_out,
-        num_q_heads,
-        num_kv_heads,
-        start_pos,
-        cos_max_pos,
-        rotary_dim,
-        rms_eps
-    );
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        pegainfer_ffi_set_last_error(cudaGetErrorString(err));
-        return -1;
-    }
-    return 0;
-    PEGAINFER_FFI_GUARD_END(-1)
-}
-
-} // extern "C"
 
 template <typename KvT>
 static int qkv_prep_paged_prefill_launch(
     const __nv_bfloat16* q_batch,
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
+    int q_stride,
+    int k_stride,
+    int v_stride,
     const __nv_bfloat16* q_norm_weight,
     const __nv_bfloat16* k_norm_weight,
     const __nv_bfloat16* cos_cache,
@@ -402,6 +268,14 @@ static int qkv_prep_paged_prefill_launch(
             ">= 0 and at or before start_pos");
         return -1;
     }
+    if (q_stride < num_q_heads * HD256_PLAIN ||
+        k_stride < num_kv_heads * HD256_PLAIN ||
+        v_stride < num_kv_heads * HD256_PLAIN) {
+        pegainfer_ffi_set_last_error(
+            "qkv_norm_rope_paged_prefill_hd256_plain_cuda: a source row stride is "
+            "narrower than its projection");
+        return -1;
+    }
     if (q_batch == nullptr || k_batch == nullptr || v_batch == nullptr ||
         q_norm_weight == nullptr || k_norm_weight == nullptr ||
         cos_cache == nullptr || sin_cache == nullptr ||
@@ -424,12 +298,17 @@ static int qkv_prep_paged_prefill_launch(
             "must be <= cos_max_pos");
         return -1;
     }
-    dim3 prep_grid(seq_len, num_q_heads + 2 * num_kv_heads);
+    dim3 prep_grid(
+        (seq_len + HD256_PREP_TOKENS - 1) / HD256_PREP_TOKENS,
+        num_q_heads + 2 * num_kv_heads);
     qkv_norm_rope_paged_prefill_hd256_plain_kernel<false, KvT>
         <<<prep_grid, THREADS_HD256_PLAIN, 0, stream>>>(
         q_batch,
         k_batch,
         v_batch,
+        q_stride,
+        k_stride,
+        v_stride,
         q_norm_weight,
         k_norm_weight,
         cos_cache,
@@ -443,6 +322,7 @@ static int qkv_prep_paged_prefill_launch(
         page_origin,
         num_q_heads,
         num_kv_heads,
+        seq_len,
         start_pos,
         cos_max_pos,
         rotary_dim,
@@ -468,6 +348,9 @@ static int qkv_prep_paged_decode_launch(
     const __nv_bfloat16* q_batch,
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
+    int q_stride,
+    int k_stride,
+    int v_stride,
     const __nv_bfloat16* q_norm_weight,
     const __nv_bfloat16* k_norm_weight,
     const __nv_bfloat16* cos_cache,
@@ -499,6 +382,14 @@ static int qkv_prep_paged_decode_launch(
             "positive, even and <= 256");
         return -1;
     }
+    if (q_stride < num_q_heads * HD256_PLAIN ||
+        k_stride < num_kv_heads * HD256_PLAIN ||
+        v_stride < num_kv_heads * HD256_PLAIN) {
+        pegainfer_ffi_set_last_error(
+            "qkv_norm_rope_paged_decode_hd256_plain_cuda: a source row stride is "
+            "narrower than its projection");
+        return -1;
+    }
     if (q_batch == nullptr || k_batch == nullptr || v_batch == nullptr ||
         q_norm_weight == nullptr || k_norm_weight == nullptr ||
         cos_cache == nullptr || sin_cache == nullptr ||
@@ -517,12 +408,17 @@ static int qkv_prep_paged_decode_launch(
             "be positive");
         return -1;
     }
-    dim3 prep_grid(batch, num_q_heads + 2 * num_kv_heads);
+    dim3 prep_grid(
+        (batch + HD256_PREP_TOKENS - 1) / HD256_PREP_TOKENS,
+        num_q_heads + 2 * num_kv_heads);
     qkv_norm_rope_paged_prefill_hd256_plain_kernel<true, KvT>
         <<<prep_grid, THREADS_HD256_PLAIN, 0, stream>>>(
         q_batch,
         k_batch,
         v_batch,
+        q_stride,
+        k_stride,
+        v_stride,
         q_norm_weight,
         k_norm_weight,
         cos_cache,
@@ -536,6 +432,7 @@ static int qkv_prep_paged_decode_launch(
         0,
         num_q_heads,
         num_kv_heads,
+        batch,
         0,
         cos_max_pos,
         rotary_dim,
@@ -560,7 +457,7 @@ extern "C" {
 
 int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
     const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
-    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* v_batch, int q_stride, int k_stride, int v_stride,
     const __nv_bfloat16* q_norm_weight, const __nv_bfloat16* k_norm_weight,
     const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
     __nv_bfloat16* q_batch_out, __nv_bfloat16* kv_data,
@@ -571,7 +468,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
     int page_size, int num_pages, int64_t stride_page, cudaStream_t stream)
 {
     return qkv_prep_paged_prefill_launch<__nv_bfloat16>(
-        q_batch, k_batch, v_batch,
+        q_batch, k_batch, v_batch, q_stride, k_stride, v_stride,
         q_norm_weight, k_norm_weight, cos_cache, sin_cache,
         q_batch_out, kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indices_len, page_origin,
@@ -583,7 +480,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_cuda(
 // E4m3 KV twin.
 int qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
     const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
-    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* v_batch, int q_stride, int k_stride, int v_stride,
     const __nv_bfloat16* q_norm_weight, const __nv_bfloat16* k_norm_weight,
     const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
     __nv_bfloat16* q_batch_out, void* kv_data,
@@ -594,7 +491,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
     int page_size, int num_pages, int64_t stride_page, cudaStream_t stream)
 {
     return qkv_prep_paged_prefill_launch<__nv_fp8_e4m3>(
-        q_batch, k_batch, v_batch,
+        q_batch, k_batch, v_batch, q_stride, k_stride, v_stride,
         q_norm_weight, k_norm_weight, cos_cache, sin_cache,
         q_batch_out, kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indices_len, page_origin,
@@ -605,7 +502,7 @@ int qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
 
 int qkv_norm_rope_paged_decode_hd256_plain_cuda(
     const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
-    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* v_batch, int q_stride, int k_stride, int v_stride,
     const __nv_bfloat16* q_norm_weight, const __nv_bfloat16* k_norm_weight,
     const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
     __nv_bfloat16* q_batch_out, __nv_bfloat16* kv_data,
@@ -617,7 +514,7 @@ int qkv_norm_rope_paged_decode_hd256_plain_cuda(
     int page_size, int num_pages, int64_t stride_page, cudaStream_t stream)
 {
     return qkv_prep_paged_decode_launch<__nv_bfloat16>(
-        q_batch, k_batch, v_batch,
+        q_batch, k_batch, v_batch, q_stride, k_stride, v_stride,
         q_norm_weight, k_norm_weight, cos_cache, sin_cache,
         q_batch_out, kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indices_len, page_indptr, page_origins,
@@ -629,7 +526,7 @@ int qkv_norm_rope_paged_decode_hd256_plain_cuda(
 // E4m3 KV twin.
 int qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda(
     const __nv_bfloat16* q_batch, const __nv_bfloat16* k_batch,
-    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* v_batch, int q_stride, int k_stride, int v_stride,
     const __nv_bfloat16* q_norm_weight, const __nv_bfloat16* k_norm_weight,
     const __nv_bfloat16* cos_cache, const __nv_bfloat16* sin_cache,
     __nv_bfloat16* q_batch_out, void* kv_data,
@@ -641,7 +538,7 @@ int qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda(
     int page_size, int num_pages, int64_t stride_page, cudaStream_t stream)
 {
     return qkv_prep_paged_decode_launch<__nv_fp8_e4m3>(
-        q_batch, k_batch, v_batch,
+        q_batch, k_batch, v_batch, q_stride, k_stride, v_stride,
         q_norm_weight, k_norm_weight, cos_cache, sin_cache,
         q_batch_out, kv_data, k_offset_elems, v_offset_elems,
         page_indices, page_indices_len, page_indptr, page_origins,

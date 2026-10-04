@@ -16,6 +16,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 
+use vllm_chat::ParserSelection;
+
 use crate::engine::LaunchedEngine;
 use crate::vllm::LoraModule;
 
@@ -64,7 +66,12 @@ impl CliError {
 }
 
 /// Flags accepted for every model line regardless of detected type.
-const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
+const CORE_ARGS: &[&str] = &[
+    "model_path",
+    "served_model_name",
+    "port",
+    "tool_call_parser",
+];
 
 /// A source argument id and the argument ids it requires.
 pub type ArgRequirement = (&'static str, &'static [&'static str]);
@@ -103,6 +110,14 @@ pub struct SharedArgs {
     /// Port to listen on
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
+
+    /// Tool-call output parser: `auto` (match the model), `none`, or an explicit
+    /// registered parser name such as `qwen3_coder`. Upstream `auto` matches the
+    /// model *path* by substring; a line whose checkpoints share one tool format
+    /// can resolve `auto` to that parser itself (see `ServePlan`), so the
+    /// directory name no longer decides.
+    #[arg(long, default_value_t = ParserSelection::Auto)]
+    pub tool_call_parser: ParserSelection,
 
     /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to
     /// disable). Rejected for GLM5.2; forced off in Qwen3 LoRA mode; Qwen3.5
@@ -235,6 +250,11 @@ impl SharedArgs {
                 "--decode-sm-pct only applies with --decode-overlap=green-ctx",
             ));
         }
+        // An explicit parser name is taken verbatim by `FromStr`, so only the
+        // registry can tell a typo from a real parser. Check it here, before an
+        // engine load is spent on a request that could never be parsed.
+        vllm_chat::validate_parser_overrides(&self.tool_call_parser, &ParserSelection::Auto)
+            .map_err(|error| CliError::rule(format!("invalid --tool-call-parser: {error}")))?;
         Ok(())
     }
 }
@@ -265,6 +285,11 @@ pub struct LaunchContext<'a> {
 
 /// What the frontend must know before (and independently of) the engine
 /// finishing its load.
+///
+/// Lines should build their plan with `..ServePlan::default()` and spell only
+/// what they set: CI compiles three model lines, so an exhaustive literal in
+/// any other crate breaks on the next field added here and nothing catches it
+/// until that crate is checked by hand.
 pub struct ServePlan {
     /// Scheduler partitions (logical DP ranks) the launched engine will
     /// expose. The HTTP frontend registers one engine identity per partition
@@ -276,6 +301,25 @@ pub struct ServePlan {
     pub prefill_only: bool,
     /// `Some` enables the LoRA routes, preloading the listed adapters.
     pub lora_modules: Option<Vec<LoraModule>>,
+    /// The parser this line's tool syntax feeds, used when the caller leaves
+    /// `--tool-call-parser` at `auto`. Upstream `Auto` matches the model
+    /// *path* by substring, so it depends on the directory name; a line whose
+    /// checkpoints share one tool format resolves `auto` itself instead.
+    pub auto_tool_call_parser: Option<ParserSelection>,
+}
+
+impl ServePlan {
+    /// The parser the server should run with: an explicit user selection wins;
+    /// `auto` falls back to the line's own default when it declares one.
+    pub fn resolve_tool_call_parser(&self, requested: ParserSelection) -> ParserSelection {
+        match requested {
+            ParserSelection::Auto => self
+                .auto_tool_call_parser
+                .clone()
+                .unwrap_or(ParserSelection::Auto),
+            explicit => explicit,
+        }
+    }
 }
 
 impl Default for ServePlan {
@@ -284,6 +328,7 @@ impl Default for ServePlan {
             scheduler_partition_count: 1,
             prefill_only: false,
             lora_modules: None,
+            auto_tool_call_parser: None,
         }
     }
 }

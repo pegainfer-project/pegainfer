@@ -1,0 +1,49 @@
+documentation:
+  - changed-files:
+      - any-glob-to-all-files: '{docs/**,*.md}'
+
+qwen3:
+  - changed-files:
+      - any-glob-to-any-file: ['pegainfer-qwen3/**', 'docs/models/qwen3/**']
+
+qwen35:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'pegainfer-qwen35/**'
+          - 'pegainfer-kernels/**/*qwen35*'
+          - 'pegainfer-kernels/**/*qwen35*/**'
+          - 'pegainfer-kernels/tools/triton/**'
+          - 'docs/models/qwen35/**'
+
+gemma4:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'pegainfer-gemma4/**'
+          - 'pegainfer-kernels/**/*gemma4*'
+          - 'pegainfer-kernels/**/*gemma4*/**'
+          - 'docs/models/gemma4/**'
+
+glm52:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'pegainfer-glm52/**'
+          - 'pegainfer-kernels/**/*glm52*'
+          - 'pegainfer-kernels/**/*glm52*/**'
+          - 'docs/models/glm52/**'
+
+kimi-k2:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'pegainfer-kimi-k2/**'
+          - 'pegainfer-kernels/**/*kimi*'
+          - 'pegainfer-kernels/**/*kimi*/**'
+          - 'docs/models/kimi-k2/**'
+
+dsv2lite:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'pegainfer-deepseek-v2-lite/**'
+          - 'pegainfer-kernels/**/*deepseek_v2_lite*'
+          - 'pegainfer-kernels/**/*deepseek_v2_lite*/**'
+          - 'pegainfer-kernels/**/*dsv2*'
+          - 'docs/models/deepseek-v2-lite/**'

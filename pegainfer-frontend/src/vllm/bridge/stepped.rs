@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -55,14 +56,18 @@ use crate::engine::RequestId;
 use crate::engine::RequestUpdate;
 use crate::engine::SchedulerHandle;
 use crate::engine::StepOutputs;
+use crate::engine::StopCause;
 use crate::engine::Terminal;
 use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
+use crate::vllm::wire::convert_stop_policy;
 use crate::vllm::wire::lora_adapter_from_sampling_params;
 use crate::vllm::wire::requested_logprobs;
 use crate::vllm::wire::requested_prompt_logprobs;
 use crate::vllm::wire::to_wire_position_logprobs;
 use crate::vllm::wire::to_wire_prompt_logprobs;
+
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) struct SteppedEngineBridge {
     pub(crate) input_address: String,
@@ -76,14 +81,12 @@ pub(crate) struct SteppedEngineBridge {
 
 impl SteppedEngineBridge {
     pub(crate) async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
+        let engine_dead = CancellationToken::new();
         let mut steps = self
             .scheduler
             .take_steps()
             .context("partition step stream already taken")?;
         let mut spec = SpecDecodeTracker::default();
-        // Stats are pull-at-send: no push task, the load cell is read when a
-        // batch goes out (and once here, so the frontend's gauges initialize
-        // before any traffic). An idle engine publishes nothing.
         let BridgeLink {
             mut input,
             output_tx,
@@ -96,6 +99,7 @@ impl SteppedEngineBridge {
             self.max_model_len,
             self.kv_capacity,
             None,
+            Some(engine_dead.clone()),
             &shutdown,
         )
         .await?;
@@ -152,6 +156,13 @@ impl SteppedEngineBridge {
                         break Err(error).context("failed to dispatch local engine step");
                     }
                 }
+                () = self.scheduler.exited() => {
+                    // Dispatch what the driver committed before it exited first.
+                    if !steps.is_empty() {
+                        continue;
+                    }
+                    break Err(anyhow::anyhow!("scheduler exited"));
+                }
                 recv = input.recv() => {
                     let message = match recv.context("failed to receive local engine request") {
                         Ok(message) => message,
@@ -175,7 +186,23 @@ impl SteppedEngineBridge {
         for state in streams.values() {
             state.control.abort();
         }
+        if run_result.is_err() {
+            engine_dead.cancel();
+        }
         drop(output_tx);
+        // Deliver what is already queued, and after a failure the dead engine
+        // notice, before stopping the link.
+        if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
+            while child_tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            warn!(
+                "local engine {} output did not drain in time",
+                self.engine_index
+            );
+        }
         child_tasks.abort_all();
         while child_tasks.join_next().await.is_some() {}
 
@@ -224,28 +251,6 @@ impl SteppedEngineBridge {
             }
         }
 
-        if outputs.is_empty() {
-            // A drafted step with no batch to ride would strand its increment
-            // until the next batch, which may never come.
-            let stats = self.stats(spec);
-            if stats.spec_decoding_stats.is_some() {
-                send_outputs(
-                    output_tx,
-                    RequestBatchOutputs {
-                        engine_index: self.engine_index,
-                        scheduler_stats: Some(Box::new(stats)),
-                        timestamp: now_secs_f64(),
-                        ..Default::default()
-                    }
-                    .into(),
-                )?;
-            }
-            return Ok(());
-        }
-        // The cell already holds this step's snapshot (the driver publishes
-        // load before committing the step), so the batch carries stats that
-        // match its own tokens — a finishing batch reports the drained state
-        // and the gauges settle instead of freezing at the last busy value.
         send_outputs(
             output_tx,
             RequestBatchOutputs {
@@ -364,6 +369,7 @@ impl SteppedEngineBridge {
                 None,
             );
         }
+
         let lora_adapter = match lora_adapter_from_sampling_params(&sampling_params) {
             Ok(adapter) => adapter,
             Err(error) => {
@@ -385,6 +391,10 @@ impl SteppedEngineBridge {
             .as_ref()
             .and_then(|args| args.get("kv_transfer_params"))
             .cloned();
+        // Older stepped model producers still suppress their terminal token
+        // and report only `FinishReason::Stop`. Keep the legacy sentinel for
+        // that producer shape; typed stop causes carry the real token and do
+        // not need a synthetic suffix.
         let stop_sentinel_id = stop_sentinel_id(
             sampling_params.eos_token_id,
             &sampling_params.stop_token_ids,
@@ -400,9 +410,14 @@ impl SteppedEngineBridge {
             Span::noop()
         };
         let trace_parent = SpanContext::from_span(&trace_root);
+
         let control = self.scheduler.submit(Request {
             prompt_tokens,
+            // Keep the legacy SamplingParams lowering unchanged for stepped
+            // producers that have not migrated to StopPolicy. Qwen3 uses the
+            // independent policy below for stop classification.
             params: convert_sampling(&sampling_params),
+            stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
             lora_adapter,
             kv_transfer_params,
@@ -427,7 +442,7 @@ struct SteppedStream {
     request_id: String,
     control: RequestControl,
     /// Queued/Scheduled wire events, held until the request's first shipped
-    /// output (a scheduled-only update ships nothing on its own).
+    /// output (a scheduled-only update produces no request output).
     first_token_events: Option<Vec<EngineCoreEvent>>,
     /// Set by `Scheduled`; a request refused or failed while still queued
     /// never prefilled and reports no prefill stats.
@@ -437,8 +452,9 @@ struct SteppedStream {
     /// P/D handoff metadata can arrive in an update with no token or
     /// terminal, so retain it until the next output carries it to the router.
     kv_transfer_params: Option<serde_json::Value>,
-    /// The vLLM text decoder removes the final token from a stop-finished
-    /// output. Keep an EOS or explicit stop token as that removable sentinel.
+    /// Compatibility sentinel for stepped producers that predate typed
+    /// [`StopCause`]. New producers must include their triggering token in the
+    /// update and therefore bypass this fallback.
     stop_sentinel_id: Option<u32>,
     /// Request-lifetime root span; held only for its `Drop`, which closes the
     /// trace when the stream state is removed.
@@ -556,11 +572,11 @@ fn reduce_update(
     let mut terminated = false;
     match update.terminal {
         None => {}
-        Some(Terminal::Finished { reason, .. }) => {
-            // PegaInfer suppresses EOS before emitting tokens, while vLLM's
-            // text decoder expects the terminal Stop output to contain EOS
-            // and unconditionally removes its final token.
+        Some(Terminal::Finished {
+            reason, stop_cause, ..
+        }) => {
             if reason == FinishReason::Stop
+                && stop_cause.is_none()
                 && let Some(stop_sentinel_id) = state.stop_sentinel_id
             {
                 token_ids.push(stop_sentinel_id);
@@ -568,6 +584,10 @@ fn reduce_update(
                     entries: Vec::new(),
                 });
             }
+            if let Some(StopCause::Token(token_id)) = stop_cause {
+                stop_reason = Some(StopReason::TokenId(token_id));
+            }
+
             finish_reason = Some(convert_finish_reason(reason));
             terminated = true;
         }
@@ -634,12 +654,16 @@ impl UnixAnchor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use vllm_engine_core_client::protocol::output::EngineCoreOutputs;
     use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
     use super::*;
     use crate::engine::PromptEcho;
     use crate::engine::RejectReason;
+    use crate::engine::ScheduledInfo;
+    use crate::engine::StopPolicy;
     use crate::engine::TokenLogprob;
     use crate::engine::scheduler_pair;
 
@@ -647,6 +671,7 @@ mod tests {
         Request {
             prompt_tokens: vec![1, 2],
             params: crate::sampler::SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens: 1,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -696,6 +721,49 @@ mod tests {
             engine_index: 0,
             data_parallel_size: 1,
         }
+    }
+
+    #[test]
+    fn scheduled_and_metrics_only_steps_publish_load_without_request_outputs() {
+        let (handle, backend) = scheduler_pair();
+        let control = handle.submit(request());
+        let mut scheduled = RequestUpdate::empty(control.id());
+        let now = Instant::now();
+        scheduled.scheduled = Some(ScheduledInfo {
+            queued_at: now,
+            scheduled_at: now,
+            prompt_tokens: 2,
+        });
+        let mut streams = HashMap::from([(
+            control.id(),
+            SteppedStream::new("scheduled".into(), control, Span::noop(), None),
+        )]);
+        let bridge = bridge(handle);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut spec = SpecDecodeTracker::default();
+        for (running, updates) in [(1, vec![scheduled]), (0, Vec::new())] {
+            backend.metrics.publish(&crate::engine::SchedulerMetrics {
+                num_running_reqs: running,
+                ..Default::default()
+            });
+            bridge
+                .dispatch_step(
+                    StepOutputs { updates },
+                    &UnixAnchor::now(),
+                    &mut streams,
+                    &mut HashMap::new(),
+                    &mut spec,
+                    &tx,
+                )
+                .unwrap();
+            let EngineCoreOutputs::RequestBatch(batch) = rx.try_recv().expect("load batch") else {
+                panic!("expected scheduler stats");
+            };
+            assert!(batch.outputs.is_empty());
+            let stats = batch.scheduler_stats.expect("scheduler stats");
+            assert_eq!(stats.num_running_reqs, running);
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     fn wire_request(completion: Option<i32>, prompt: Option<i32>) -> EngineCoreRequest {
@@ -789,5 +857,95 @@ mod tests {
             Some(EngineCoreFinishReason::Error)
         );
         assert!(backend.ledger.is_aborted(queued.id));
+    }
+
+    #[test]
+    fn request_stop_maps_the_actual_token_and_preserves_its_logprob() {
+        let id = RequestId::new(7);
+        let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
+        let mut state = SteppedStream::new("request-7".to_string(), control, Span::noop(), None);
+
+        let mut update = RequestUpdate::empty(id);
+        update.tokens = vec![11, 43];
+        update.logprobs = vec![
+            None,
+            Some(TokenLogprob {
+                rank: 1,
+                logprob: -0.25,
+                top_logprobs: vec![(43, -0.25), (44, -1.0)],
+            }),
+        ];
+        update.terminal = Some(Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Token(43)),
+            prompt_tokens: 16,
+            completion_tokens: 2,
+        });
+
+        let (output, terminated) = reduce_update(&mut state, update, &UnixAnchor::now());
+        let output = output.expect("terminal output");
+
+        assert!(terminated);
+        assert_eq!(output.new_token_ids, vec![11, 43]);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+        assert_eq!(output.stop_reason, Some(StopReason::TokenId(43)));
+
+        let direct = match output.new_logprobs.expect("stop-token logprob") {
+            MaybeWireLogprobs::Direct(direct) => direct,
+            MaybeWireLogprobs::Wire(_) => panic!("expected direct logprobs"),
+        };
+
+        assert_eq!(direct.positions.len(), 2);
+        assert_eq!(direct.positions[1].entries[0].token_id, 43);
+        assert!((direct.positions[1].entries[0].logprob + 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn model_eos_has_no_wire_stop_reason() {
+        let id = RequestId::new(8);
+        let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
+        let mut state = SteppedStream::new("request-8".to_string(), control, Span::noop(), None);
+
+        let mut update = RequestUpdate::empty(id);
+        update.tokens = vec![2];
+        update.logprobs = vec![None];
+        update.terminal = Some(Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Eos(2)),
+            prompt_tokens: 16,
+            completion_tokens: 1,
+        });
+
+        let (output, terminated) = reduce_update(&mut state, update, &UnixAnchor::now());
+        let output = output.expect("terminal output");
+
+        assert!(terminated);
+        assert_eq!(output.new_token_ids, vec![2]);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Stop));
+        assert_eq!(output.stop_reason, None);
+    }
+
+    #[test]
+    fn legacy_stop_without_typed_cause_keeps_the_wire_sentinel() {
+        let id = RequestId::new(9);
+        let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
+        let mut state =
+            SteppedStream::new("request-9".to_string(), control, Span::noop(), Some(99));
+
+        let mut update = RequestUpdate::empty(id);
+        update.tokens = vec![11];
+        update.terminal = Some(Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: None,
+            prompt_tokens: 16,
+            completion_tokens: 1,
+        });
+
+        let (output, terminated) = reduce_update(&mut state, update, &UnixAnchor::now());
+        let output = output.expect("terminal output");
+
+        assert!(terminated);
+        assert_eq!(output.new_token_ids, vec![11, 99]);
+        assert_eq!(output.stop_reason, None);
     }
 }

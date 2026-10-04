@@ -40,6 +40,10 @@ pub(crate) struct Gemma4Config {
     /// experts alongside it. The dimensions travel with the flag so that
     /// "routing, but we do not know how wide" is not a state.
     pub(crate) moe: Option<MoeConfig>,
+    /// Every text-tower linear ships as compressed-tensors W4A16: symmetric
+    /// four-bit integers, one bf16 scale per 32 inputs. The embedding, and
+    /// the LM head tied to it, stay bf16.
+    pub(crate) w4a16: bool,
     pub(crate) rms_norm_eps: f32,
     /// The sliding-attention rope theta; the global family reads its own.
     pub(crate) sliding_rope_theta: f32,
@@ -161,6 +165,12 @@ impl Gemma4Config {
             "Gemma 4: max_position_embeddings {max_position_embeddings} sits below the \
              sliding_window {sliding_window}"
         );
+        let moe = MoeConfig::from_text_config(tc)?;
+        let w4a16 = w4a16_from_json(json)?;
+        anyhow::ensure!(
+            !(w4a16 && moe.is_some()),
+            "Gemma 4: a W4A16 checkpoint that also routes is not one this loader has a layout for"
+        );
         let final_logit_softcapping = f32_field(tc, "text_config", "final_logit_softcapping")?;
         anyhow::ensure!(
             final_logit_softcapping > 0.0,
@@ -177,7 +187,8 @@ impl Gemma4Config {
             global_head_dim,
             layer_types,
             tie_word_embeddings: bool_field(tc, "tie_word_embeddings")?,
-            moe: MoeConfig::from_text_config(tc)?,
+            moe,
+            w4a16,
             rms_norm_eps: f32_field(tc, "text_config", "rms_norm_eps")?,
             sliding_rope_theta,
             sliding_window,
@@ -187,6 +198,76 @@ impl Gemma4Config {
             final_logit_softcapping,
         })
     }
+}
+
+/// Whether the checkpoint is compressed-tensors W4A16 over the text tower.
+/// Any other compressed-tensors scheme is refused rather than read as bf16;
+/// other quantization methods (the routed size's ModelOpt NVFP4) are the
+/// manifest's to check.
+#[cfg(feature = "gemma4")]
+fn w4a16_from_json(json: &serde_json::Value) -> Result<bool> {
+    use serde_json::Value;
+    let Some(quant) = json.get("quantization_config") else {
+        return Ok(false);
+    };
+    if quant.get("quant_method").and_then(Value::as_str) != Some("compressed-tensors") {
+        return Ok(false);
+    }
+    let refuse = |what: &str| {
+        anyhow::anyhow!(
+            "Gemma 4: compressed-tensors {what}; only W4A16 \
+         (pack-quantized symmetric int4, group 32, over every Linear) is served"
+        )
+    };
+    if quant.get("format").and_then(Value::as_str) != Some("pack-quantized") {
+        return Err(refuse("format is not pack-quantized"));
+    }
+    let groups = quant
+        .get("config_groups")
+        .and_then(Value::as_object)
+        .filter(|groups| groups.len() == 1)
+        .ok_or_else(|| refuse("config_groups is not a single group"))?;
+    let group = groups.values().next().expect("one group");
+    if group.get("targets") != Some(&serde_json::json!(["Linear"])) {
+        return Err(refuse("targets are not [\"Linear\"]"));
+    }
+    for activations in ["input_activations", "output_activations"] {
+        if !group.get(activations).is_none_or(Value::is_null) {
+            return Err(refuse(&format!("quantizes {activations}")));
+        }
+    }
+    let weights = group
+        .get("weights")
+        .ok_or_else(|| refuse("group carries no weights scheme"))?;
+    let expected = [
+        ("type", serde_json::json!("int")),
+        ("num_bits", serde_json::json!(4)),
+        ("group_size", serde_json::json!(32)),
+        ("strategy", serde_json::json!("group")),
+        ("symmetric", serde_json::json!(true)),
+        ("dynamic", serde_json::json!(false)),
+    ];
+    for (field, value) in expected {
+        if weights.get(field) != Some(&value) {
+            return Err(refuse(&format!("weights.{field} is not {value}")));
+        }
+    }
+    if !weights.get("actorder").is_none_or(Value::is_null) {
+        return Err(refuse("weights reorder their groups (actorder)"));
+    }
+    let ignore = quant
+        .get("ignore")
+        .and_then(Value::as_array)
+        .ok_or_else(|| refuse("ignore is not a list"))?;
+    for entry in ignore {
+        let name = entry
+            .as_str()
+            .ok_or_else(|| refuse("ignore holds a non-string"))?;
+        if name.starts_with("re:") || name.starts_with("model.language_model.") {
+            return Err(refuse(&format!("ignore keeps {name:?} unquantized")));
+        }
+    }
+    Ok(true)
 }
 
 /// Numeric config values land in f32 compute; the checked cast rejects

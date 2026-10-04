@@ -1,0 +1,28 @@
+# SECURITY: pull_request_target gives fork PRs a write token, so never check out or run PR code.
+
+name: Needs rebase
+
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    name: Label conflicting PRs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Add or remove the needs-rebase label
+        uses: eps1lon/actions-label-merge-conflict@v3.1.0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          dirtyLabel: needs-rebase
+          commentOnDirty: >-
+            This pull request has merge conflicts with main. Please rebase it so
+            it can be reviewed and merged.

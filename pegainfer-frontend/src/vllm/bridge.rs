@@ -18,6 +18,7 @@ use log::warn;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use vllm_engine_core_client::ENGINE_CORE_DEAD_SENTINEL;
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::encode_msgpack;
@@ -91,6 +92,7 @@ impl LocalEngineBridge {
             self.max_model_len,
             self.handle.kv_capacity(),
             self.metrics_watch.clone(),
+            None,
             &shutdown,
         )
         .await?;
@@ -704,6 +706,7 @@ async fn connect_link(
     max_model_len: u32,
     kv_capacity: Option<crate::engine::KvCapacity>,
     metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
+    engine_dead: Option<CancellationToken>,
     shutdown: &CancellationToken,
 ) -> Result<BridgeLink> {
     wait_for_ipc_endpoint(input_address, shutdown).await?;
@@ -757,6 +760,7 @@ async fn connect_link(
         max_loras: 0,
         kv_cache_size_tokens,
         kv_cache_max_concurrency,
+        effective_attention_block_size: kv_capacity.map(|c| c.block_size as u64),
         kv_events_config: None,
         weight_transfer_backend: None,
         enable_sleep_mode: false,
@@ -780,7 +784,12 @@ async fn connect_link(
 
     let (output_tx, output_rx) = mpsc::unbounded_channel();
     let mut child_tasks = tokio::task::JoinSet::new();
-    child_tasks.spawn(async move { ("output sender", output_loop(output, output_rx).await) });
+    child_tasks.spawn(async move {
+        (
+            "output sender",
+            output_loop(output, output_rx, engine_dead).await,
+        )
+    });
 
     // Legacy handle engines republish load snapshots as stats-only output
     // batches: their scheduler loops park when idle, so the watch cadence is
@@ -809,12 +818,24 @@ async fn connect_link(
 async fn output_loop(
     mut output: PushSocket,
     mut output_rx: mpsc::UnboundedReceiver<EngineCoreOutputs>,
+    engine_dead: Option<CancellationToken>,
 ) -> Result<()> {
     while let Some(outputs) = output_rx.recv().await {
         output
             .send(ZmqMessage::from(encode_msgpack(&outputs)?))
             .await
             .context("failed to send local engine output")?;
+    }
+    // Sent after the queued outputs: the client then fails every request it
+    // still tracks, including ones the bridge never read.
+    if engine_dead
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        output
+            .send(ZmqMessage::from(ENGINE_CORE_DEAD_SENTINEL.to_vec()))
+            .await
+            .context("failed to send the engine dead sentinel")?;
     }
     Ok(())
 }

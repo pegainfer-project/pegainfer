@@ -1,8 +1,8 @@
 # Qwen3.5 Batched Step Tail
 
-> **TL;DR:** Qwen3.5 issue #353 is implemented in the local branch: prefill gathers per-request last hidden rows, runs batched offset RMSNorm + one lm_head GEMM, and scheduler/executor decode sample from batched logits. Full-vocab host copies now happen only for `logprobs > 0`. HF logits + scheduler e2e pass; benchmark evidence supports a first-token/short-output TTFT claim only.
+> **TL;DR:** Implementation record for Qwen3.5 issue #353: prefill gathers per-request last hidden rows, runs batched offset RMSNorm + one lm_head GEMM, and scheduler/executor decode sample from batched logits. Full-vocab host copies happen only for `logprobs > 0`. HF logits + scheduler e2e passed; benchmark evidence supports a first-token/short-output TTFT claim only.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-10
 
 ## Scope
 
@@ -72,4 +72,4 @@ Long-output diagnostic:
 - Read-only DeepSeek diff review found no blocker.
 - Follow-up review cleaned duplicate logprobs helpers into `src/logprobs.rs` and kept docs public-facing with placeholders rather than machine paths.
 - Fail-fast logprobs snapshot errors are intentional; silent logprobs loss is worse than an explicit request error in this correctness-sensitive path.
-- Final review flagged a `concurrency=64` shutdown SIGSEGV in `cublas_destroy`; qwen35 now returns an `EngineHandle` that joins the scheduler thread before process teardown.
+- Final review flagged a `concurrency=64` shutdown SIGSEGV in `cublas_destroy`. The server must join the scheduler thread before process teardown; the current `Engine` carries that join handle in `LiveScheduler`.

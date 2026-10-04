@@ -11,12 +11,16 @@ use half::bf16;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_core::tensor::HiddenStatesRef;
+use pegainfer_kernels::ops::DSV2_ROUTED_MOE_MAX_ROWS;
+use pegainfer_kernels::ops::Dsv2ExpertPointerTable;
 use pegainfer_kernels::ops::Dsv2LiteRouterOutput;
+use pegainfer_kernels::ops::Dsv2RoutedMoeScratch;
 use pegainfer_kernels::ops::dsv2_lite_router_logits_into;
 use pegainfer_kernels::ops::dsv2_lite_router_softmax_topk_into;
 use pegainfer_kernels::ops::dsv2_lite_router_softmax_topk_ref_into;
 
 use super::DeepSeekV2LiteEp2Generator;
+use super::backend::EpBackendKind;
 use super::backend::EpBackendRuntime;
 use super::routing::MoeRouteEntry;
 use super::routing::MoeRoutePlan;
@@ -35,6 +39,7 @@ use crate::model::dense_mlp_forward;
 use crate::model::dense_mlp_forward_per_token;
 use crate::model::dense_mlp_forward_preallocated_into;
 use crate::model::dense_mlp_forward_preallocated_ref_into;
+use crate::model::routed_expert_projections;
 use crate::nccl_backend::NaiveNcclEp2Backend;
 
 fn parse_rollback_value(
@@ -84,7 +89,6 @@ static NCCL_SERIAL: LazyLock<std::result::Result<bool, String>> = LazyLock::new(
 });
 static NCCL_HOST_ROUTER: LazyLock<std::result::Result<bool, String>> =
     LazyLock::new(|| load_rollback_value("PEGAINFER_DSV2_LITE_NCCL_ROUTER", "device", "host"));
-
 fn group_route_indices(
     keys: impl IntoIterator<Item = (usize, usize)>,
 ) -> BTreeMap<(usize, usize), Vec<usize>> {
@@ -98,6 +102,105 @@ fn group_route_indices(
 struct NcclRouteReplayBuffers {
     _inputs: Vec<HiddenStates>,
     _outputs: Vec<HiddenStates>,
+}
+
+pub(super) struct DeviceRoutedMoeRuntime {
+    rank0_tables: Vec<Option<Dsv2ExpertPointerTable>>,
+    rank1_tables: Vec<Option<Dsv2ExpertPointerTable>>,
+    rank0_scratch: Dsv2RoutedMoeScratch,
+    rank1_scratch: Dsv2RoutedMoeScratch,
+}
+
+impl DeviceRoutedMoeRuntime {
+    pub(super) fn new(generator: &DeepSeekV2LiteEp2Generator) -> Result<Self> {
+        let mut rank0_tables = Vec::with_capacity(generator.config.num_hidden_layers);
+        let mut rank1_tables = Vec::with_capacity(generator.config.num_hidden_layers);
+        for layer_idx in 0..generator.config.num_hidden_layers {
+            if generator.config.is_moe_layer(layer_idx) {
+                activate(&generator.rank0.ctx)?;
+                rank0_tables.push(Some(Dsv2ExpertPointerTable::new(
+                    &generator.rank0.ctx,
+                    routed_expert_projections(&generator.rank0.layout, |expert| {
+                        generator.rank0.routed_expert(layer_idx, expert)
+                    })?,
+                    generator.rank0.layout.owned_experts().start,
+                )?));
+                activate(&generator.rank1.ctx)?;
+                rank1_tables.push(Some(Dsv2ExpertPointerTable::new(
+                    &generator.rank1.ctx,
+                    routed_expert_projections(&generator.rank1.layout, |expert| {
+                        generator.rank1.routed_expert(layer_idx, expert)
+                    })?,
+                    generator.rank1.layout.owned_experts().start,
+                )?));
+            } else {
+                rank0_tables.push(None);
+                rank1_tables.push(None);
+            }
+        }
+        activate(&generator.rank0.ctx)?;
+        let rank0_scratch = Dsv2RoutedMoeScratch::new(
+            &generator.rank0.ctx,
+            generator.config.hidden_size,
+            generator.config.moe_intermediate_size,
+            DSV2_ROUTED_MOE_MAX_ROWS,
+            generator.config.num_hidden_layers,
+        )?;
+        activate(&generator.rank1.ctx)?;
+        let rank1_scratch = Dsv2RoutedMoeScratch::new(
+            &generator.rank1.ctx,
+            generator.config.hidden_size,
+            generator.config.moe_intermediate_size,
+            DSV2_ROUTED_MOE_MAX_ROWS,
+            generator.config.num_hidden_layers,
+        )?;
+        Ok(Self {
+            rank0_tables,
+            rank1_tables,
+            rank0_scratch,
+            rank1_scratch,
+        })
+    }
+
+    fn begin_forward(&mut self, generator: &DeepSeekV2LiteEp2Generator) -> Result<()> {
+        activate(&generator.rank0.ctx)?;
+        self.rank0_scratch.begin_forward(&generator.rank0.ctx)?;
+        activate(&generator.rank1.ctx)?;
+        self.rank1_scratch.begin_forward(&generator.rank1.ctx)
+    }
+
+    fn finish_forward(&self, generator: &DeepSeekV2LiteEp2Generator) -> Result<(usize, usize)> {
+        activate(&generator.rank0.ctx)?;
+        let rank0 = self.rank0_scratch.finish_forward(&generator.rank0.ctx)?;
+        activate(&generator.rank1.ctx)?;
+        let rank1 = self.rank1_scratch.finish_forward(&generator.rank1.ctx)?;
+        ensure!(
+            rank0.errors == 0 && rank1.errors == 0,
+            "device-routed MoE reported nonfinite router input: rank0={}, rank1={}",
+            rank0.errors,
+            rank1.errors
+        );
+        ensure!(
+            rank0.total_routes == rank1.total_routes,
+            "device-routed MoE route totals differ across ranks: rank0={}, rank1={}",
+            rank0.total_routes,
+            rank1.total_routes
+        );
+        ensure!(
+            rank0.layer_hashes == rank1.layer_hashes,
+            "device-routed MoE route IDs differ across ranks by layer: rank0={:?}, rank1={:?}",
+            rank0.layer_hashes,
+            rank1.layer_hashes
+        );
+        ensure!(
+            rank0.local_routes + rank1.local_routes == rank0.total_routes,
+            "device-routed MoE ownership accounting drift: rank0_local={}, rank1_local={}, total={}",
+            rank0.local_routes,
+            rank1.local_routes,
+            rank0.total_routes
+        );
+        Ok((rank0.local_routes, rank1.local_routes))
+    }
 }
 
 fn accumulate_host_staged_route_output(
@@ -424,30 +527,35 @@ impl DeepSeekV2LiteEp2Generator {
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
         let host_router = rollback_enabled(&NCCL_HOST_ROUTER)?;
-        let route_section = if host_router {
-            "ep_route_host"
+        let device_routed = self.device_routed_moe_enabled(input.seq_len)?;
+        let route_plan = if device_routed {
+            None
         } else {
-            "ep_route_device"
+            let route_section = if host_router {
+                "ep_route_host"
+            } else {
+                "ep_route_device"
+            };
+            Some(attribution.record_result(
+                phase,
+                route_section,
+                || format!("layer.{layer_idx}.nccl.route"),
+                Some(layer_idx),
+                token_index,
+                || {
+                    if host_router {
+                        let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
+                        let route_logits_host =
+                            gate_logits_host(&self.config, &input_host, &moe.gate_host);
+                        let routes =
+                            topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
+                        MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
+                    } else {
+                        self.build_nccl_route_plan_device(input, &moe.gate_device)
+                    }
+                },
+            )?)
         };
-        let route_plan = attribution.record_result(
-            phase,
-            route_section,
-            || format!("layer.{layer_idx}.nccl.route"),
-            Some(layer_idx),
-            token_index,
-            || {
-                if host_router {
-                    let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
-                    let route_logits_host =
-                        gate_logits_host(&self.config, &input_host, &moe.gate_host);
-                    let routes =
-                        topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
-                    MoeRoutePlan::from_topk_routes(&routes, &self.rank0.layout)
-                } else {
-                    self.build_nccl_route_plan_device(input, &moe.gate_device)
-                }
-            },
-        )?;
 
         let shared = attribution.record_gpu_result(
             &self.rank0.ctx,
@@ -475,52 +583,126 @@ impl DeepSeekV2LiteEp2Generator {
             || nccl.dense_all_reduce_rank0_hidden_to_rank1(&self.rank0.ctx, &self.rank1.ctx, input),
         )?;
         let rank1_hidden = rank1_input.rank1_hidden()?;
-        attribution.record_gpu_pair_result(
-            &self.rank0.ctx,
-            &self.rank1.ctx,
-            phase,
-            "nccl_combine_clear",
-            || format!("layer.{layer_idx}.nccl.combine_clear"),
-            Some(layer_idx),
-            token_index,
-            || {
-                nccl.clear_device_combine(
-                    &self.rank0.ctx,
-                    &self.rank1.ctx,
-                    input.hidden_dim,
-                    input.seq_len,
-                )
-            },
-        )?;
-        let live_expert_outputs = self.replay_nccl_route_plan(
-            nccl,
-            layer_idx,
-            input,
-            rank1_hidden,
-            &route_plan,
-            attribution,
-            phase,
-            token_index,
-        )?;
-
-        let routed = attribution.record_gpu_pair_result(
-            &self.rank0.ctx,
-            &self.rank1.ctx,
-            phase,
-            "nccl_combine",
-            || format!("layer.{layer_idx}.nccl.combine"),
-            Some(layer_idx),
-            token_index,
-            || {
-                nccl.combine_device_contributions_to_rank0(
-                    &self.rank0.ctx,
-                    &self.rank1.ctx,
-                    input.hidden_dim,
-                    input.seq_len,
-                )
-            },
-        )?;
-        drop(live_expert_outputs);
+        let (routed, local_routes, remote_routes) = if device_routed {
+            attribution.record_gpu_pair_result(
+                &self.rank0.ctx,
+                &self.rank1.ctx,
+                phase,
+                "nccl_device_routed_experts",
+                || format!("layer.{layer_idx}.nccl.device_routed_experts"),
+                Some(layer_idx),
+                token_index,
+                || {
+                    let runtime = self
+                        .device_routed_moe
+                        .as_ref()
+                        .context("NCCL device-routed MoE runtime is not initialized")?;
+                    let mut runtime = runtime
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("device-routed MoE mutex poisoned"))?;
+                    let DeviceRoutedMoeRuntime {
+                        rank0_tables,
+                        rank1_tables,
+                        rank0_scratch,
+                        rank1_scratch,
+                    } = &mut *runtime;
+                    let rank0_table = rank0_tables
+                        .get(layer_idx)
+                        .and_then(Option::as_ref)
+                        .context("rank0 device-routed MoE pointer table missing")?;
+                    let rank1_table = rank1_tables
+                        .get(layer_idx)
+                        .and_then(Option::as_ref)
+                        .context("rank1 device-routed MoE pointer table missing")?;
+                    let mut contributions = nccl.prepare_device_combine_output(
+                        &self.rank0.ctx,
+                        &self.rank1.ctx,
+                        input.hidden_dim,
+                        input.seq_len,
+                    )?;
+                    activate(&self.rank0.ctx)?;
+                    rank0_scratch.enqueue_into(
+                        &self.rank0.ctx,
+                        input.as_ref(),
+                        &moe.gate_device,
+                        rank0_table,
+                        contributions.rank_send_mut(0)?,
+                        layer_idx,
+                    )?;
+                    activate(&self.rank1.ctx)?;
+                    rank1_scratch.enqueue_into(
+                        &self.rank1.ctx,
+                        rank1_hidden,
+                        self.rank1.gate_device(layer_idx)?,
+                        rank1_table,
+                        contributions.rank_send_mut(1)?,
+                        layer_idx,
+                    )?;
+                    drop(contributions);
+                    let routed = nccl.combine_device_contributions_to_rank0(
+                        &self.rank0.ctx,
+                        &self.rank1.ctx,
+                        input.hidden_dim,
+                        input.seq_len,
+                    )?;
+                    Ok((routed, 0, 0))
+                },
+            )?
+        } else {
+            let route_plan = route_plan
+                .as_ref()
+                .context("NCCL fallback route plan is missing")?;
+            attribution.record_gpu_pair_result(
+                &self.rank0.ctx,
+                &self.rank1.ctx,
+                phase,
+                "nccl_combine_clear",
+                || format!("layer.{layer_idx}.nccl.combine_clear"),
+                Some(layer_idx),
+                token_index,
+                || {
+                    nccl.clear_device_combine(
+                        &self.rank0.ctx,
+                        &self.rank1.ctx,
+                        input.hidden_dim,
+                        input.seq_len,
+                    )
+                },
+            )?;
+            let live_expert_outputs = self.replay_nccl_route_plan(
+                nccl,
+                layer_idx,
+                input,
+                rank1_hidden,
+                route_plan,
+                attribution,
+                phase,
+                token_index,
+            )?;
+            let routed = attribution.record_gpu_pair_result(
+                &self.rank0.ctx,
+                &self.rank1.ctx,
+                phase,
+                "nccl_combine",
+                || format!("layer.{layer_idx}.nccl.combine"),
+                Some(layer_idx),
+                token_index,
+                || {
+                    nccl.combine_device_contributions_to_rank0(
+                        &self.rank0.ctx,
+                        &self.rank1.ctx,
+                        input.hidden_dim,
+                        input.seq_len,
+                    )
+                },
+            )?;
+            drop(live_expert_outputs);
+            (
+                routed,
+                route_plan.local_routes(),
+                route_plan.remote_routes(),
+            )
+        };
         activate(&self.rank0.ctx)?;
         let hidden = attribution.record_gpu_result(
             &self.rank0.ctx,
@@ -531,11 +713,7 @@ impl DeepSeekV2LiteEp2Generator {
             token_index,
             || ops::add_batch(&self.rank0.ctx, &routed, &shared),
         )?;
-        Ok((
-            hidden,
-            route_plan.local_routes(),
-            route_plan.remote_routes(),
-        ))
+        Ok((hidden, local_routes, remote_routes))
     }
 
     fn build_nccl_route_plan_device(
@@ -549,7 +727,12 @@ impl DeepSeekV2LiteEp2Generator {
             .checked_mul(self.config.n_routed_experts)
             .context("NCCL device router logits element count overflow")?;
         let mut route_logits = self.rank0.ctx.stream.alloc_zeros::<f32>(logits_elems)?;
-        dsv2_lite_router_logits_into(&self.rank0.ctx, input, gate_device, &mut route_logits)?;
+        dsv2_lite_router_logits_into(
+            &self.rank0.ctx,
+            input.as_ref(),
+            gate_device,
+            &mut route_logits,
+        )?;
         let route_logits = self.rank0.ctx.stream.clone_dtoh(&route_logits)?;
         self.rank0.ctx.sync()?;
         let routes = topk_softmax_routes(&self.config, &route_logits, input.seq_len);
@@ -965,6 +1148,39 @@ impl DeepSeekV2LiteEp2Generator {
                 route.global_expert
             ),
         }
+    }
+
+    fn device_routed_moe_enabled(&self, rows: usize) -> Result<bool> {
+        Ok(self.backend.kind() == EpBackendKind::Nccl
+            && rows <= DSV2_ROUTED_MOE_MAX_ROWS
+            && !rollback_enabled(&NCCL_HOST_ROUTER)?
+            && !rollback_enabled(&NCCL_SERIAL)?)
+    }
+
+    pub(super) fn begin_device_routed_forward(&self, rows: usize) -> Result<bool> {
+        if !self.device_routed_moe_enabled(rows)? {
+            return Ok(false);
+        }
+        let runtime = self
+            .device_routed_moe
+            .as_ref()
+            .context("NCCL device-routed MoE runtime is not initialized")?;
+        runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("device-routed MoE mutex poisoned"))?
+            .begin_forward(self)?;
+        Ok(true)
+    }
+
+    pub(super) fn finish_device_routed_forward(&self) -> Result<(usize, usize)> {
+        let runtime = self
+            .device_routed_moe
+            .as_ref()
+            .context("NCCL device-routed MoE runtime is not initialized")?;
+        runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("device-routed MoE mutex poisoned"))?
+            .finish_forward(self)
     }
 }
 

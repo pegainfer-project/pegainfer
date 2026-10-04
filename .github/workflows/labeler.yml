@@ -1,0 +1,46 @@
+# SECURITY: pull_request_target gives fork PRs a write token, so never check out or run PR code.
+
+name: Labeler
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    name: Label by path and title
+    if: >-
+      ${{ !contains(github.event.pull_request.labels.*.name, 'stale')
+      && (github.event.action != 'edited' || github.event.changes.title) }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Label by changed paths
+        uses: actions/labeler@v7.0.0
+
+      - name: Label by Commitizen type
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          title=$(gh pr view "$PR_NUMBER" -R "$REPO" --json title --jq .title)
+          labels=$(gh pr view "$PR_NUMBER" -R "$REPO" --json labels --jq '.labels[].name')
+          case "$title" in
+            fix\(*|fix:*|fix!*) add=bug remove=enhancement ;;
+            feat\(*|feat:*|feat!*) add=enhancement remove=bug ;;
+            *) exit 0 ;;
+          esac
+          args=(--add-label "$add")
+          if grep -qx "$remove" <<<"$labels"; then
+            args+=(--remove-label "$remove")
+          fi
+          gh pr edit "$PR_NUMBER" -R "$REPO" "${args[@]}"

@@ -36,7 +36,6 @@ use std::path::Path;
 use anyhow::Result;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
-pub(crate) use probe::probe_config_json;
 
 #[cfg(feature = "gemma4")]
 fn start_engine(model_path: &Path, options: &EngineLoadOptions) -> Result<Engine> {

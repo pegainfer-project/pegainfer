@@ -62,7 +62,7 @@ def main() -> None:
         )
         model.eval()
         for case, length in CASES.items():
-            seq = torch.tensor([ids[: length + TEACHER_STEPS]], device=args.device)
+            seq = torch.tensor([ids[: length + TEACHER_STEPS]], device=model.device if args.device == "auto" else args.device)
 
             def rows_of() -> torch.Tensor:
                 # Slice to the recorded positions before the fp32 upcast:

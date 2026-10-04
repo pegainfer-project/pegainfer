@@ -315,18 +315,26 @@ __global__ void silu_mul_kernel(
 // rounded once more.
 // ============================================================================
 
+// `gate` and `up` are column bands of row-major activations, `cols` wide and
+// each at its own row stride, so both may sit in one fused gate|up row; the
+// output is contiguous and `n = rows * cols`.
 __global__ void gelu_tanh_mul_kernel(
     const __nv_bfloat16 *__restrict__ gate,
     const __nv_bfloat16 *__restrict__ up,
     __nv_bfloat16 *__restrict__ out,
+    int cols,
+    int gate_stride,
+    int up_stride,
     int n) {
   // sqrt(2/pi), the gelu_pytorch_tanh constant.
   const float kSqrt2OverPi = 0.7978845608028654f;
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
        idx < n;
        idx += gridDim.x * blockDim.x) {
-    float g = __bfloat162float(gate[idx]);
-    float u = __bfloat162float(up[idx]);
+    int row = idx / cols;
+    int col = idx - row * cols;
+    float g = __bfloat162float(gate[(int64_t)row * gate_stride + col]);
+    float u = __bfloat162float(up[(int64_t)row * up_stride + col]);
     float inner = kSqrt2OverPi * (g + 0.044715f * g * g * g);
     float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
     out[idx] = __float2bfloat16(__bfloat162float(__float2bfloat16(gelu_g)) * u);
@@ -817,12 +825,64 @@ CUresult silu_mul_triton_aot_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+// Eight elements a thread through 16-byte loads and stores, the same
+// per-element arithmetic as the scalar form, so the two round alike; the
+// launcher picks it whenever every band and row is eight elements aligned.
+__global__ void gelu_tanh_mul_vec8_kernel(
+    const __nv_bfloat16 *__restrict__ gate,
+    const __nv_bfloat16 *__restrict__ up,
+    __nv_bfloat16 *__restrict__ out,
+    int cols8,
+    int gate_stride,
+    int up_stride,
+    int n8) {
+  const float kSqrt2OverPi = 0.7978845608028654f;
+  union Pack8 {
+    uint4 u;
+    __nv_bfloat16 h[8];
+  };
+  for (int v = blockIdx.x * blockDim.x + threadIdx.x;
+       v < n8;
+       v += gridDim.x * blockDim.x) {
+    int row = v / cols8;
+    int col = (v - row * cols8) * 8;
+    Pack8 g, u, o;
+    g.u = *reinterpret_cast<const uint4 *>(gate + (int64_t)row * gate_stride + col);
+    u.u = *reinterpret_cast<const uint4 *>(up + (int64_t)row * up_stride + col);
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      float gv = __bfloat162float(g.h[i]);
+      float uv = __bfloat162float(u.h[i]);
+      float inner = kSqrt2OverPi * (gv + 0.044715f * gv * gv * gv);
+      float gelu_g = 0.5f * gv * (1.0f + tanhf(inner));
+      o.h[i] = __float2bfloat16(__bfloat162float(__float2bfloat16(gelu_g)) * uv);
+    }
+    *reinterpret_cast<uint4 *>(out + (int64_t)v * 8) = o.u;
+  }
+}
+
 CUresult gelu_tanh_mul_cuda(
     const __nv_bfloat16 *gate, const __nv_bfloat16 *up,
-    __nv_bfloat16 *out, int n, cudaStream_t stream) {
+    __nv_bfloat16 *out, int cols, int gate_stride, int up_stride, int n,
+    cudaStream_t stream) {
+  if (cols <= 0 || gate_stride < cols || up_stride < cols || n % cols != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
   int block = 256;
-  int grid = n / block + (n % block != 0);
-  gelu_tanh_mul_kernel<<<grid, block, 0, stream>>>(gate, up, out, n);
+  bool vec8 = cols % 8 == 0 && gate_stride % 8 == 0 && up_stride % 8 == 0 &&
+              (reinterpret_cast<uintptr_t>(gate) & 15) == 0 &&
+              (reinterpret_cast<uintptr_t>(up) & 15) == 0 &&
+              (reinterpret_cast<uintptr_t>(out) & 15) == 0;
+  if (vec8) {
+    int n8 = n / 8;
+    int grid = n8 / block + (n8 % block != 0);
+    gelu_tanh_mul_vec8_kernel<<<grid, block, 0, stream>>>(
+        gate, up, out, cols / 8, gate_stride, up_stride, n8);
+  } else {
+    int grid = n / block + (n % block != 0);
+    gelu_tanh_mul_kernel<<<grid, block, 0, stream>>>(
+        gate, up, out, cols, gate_stride, up_stride, n);
+  }
   return (CUresult)cudaGetLastError();
 }
 

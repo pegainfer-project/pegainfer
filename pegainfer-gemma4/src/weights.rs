@@ -1,8 +1,18 @@
 //! Resident Gemma 4 text-tower weights.
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+
+use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use pegainfer_core::ops;
+use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
+use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kernels::ops::W4a16Matrix;
+use pegainfer_kernels::ops::W4a16Scratch;
 
 use crate::config::Gemma4Config;
 
@@ -13,6 +23,28 @@ pub(crate) struct Gemma4Weights {
     pub(crate) embed_tokens: DeviceMatrix,
     pub(crate) norm: DeviceVec,
     pub(crate) layers: Vec<Gemma4Layer>,
+}
+
+impl Gemma4Weights {
+    /// The largest W4A16 linear's `rows * cols`, zero for a bf16 checkpoint.
+    pub(crate) fn w4a16_values(&self) -> usize {
+        self.layers
+            .iter()
+            .flat_map(|layer| {
+                [
+                    &layer.attention.qkv,
+                    &layer.attention.o_proj,
+                    &layer.mlp.gate_up,
+                    &layer.mlp.down,
+                ]
+            })
+            .map(|linear| match linear {
+                Linear::Bf16(_) => 0,
+                Linear::W4a16(m) => m.rows * m.cols,
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 pub(crate) struct Gemma4Layer {
@@ -36,9 +68,9 @@ pub(crate) struct Gemma4Layer {
 /// owns rows `[e * rows, (e + 1) * rows)`.
 ///
 /// Stored packed, as the checkpoint ships it. Widening the experts to bf16
-/// here would cost 45.7 GB against the 11.4 GB they occupy packed, which does
-/// not fit the card this line serves on, and the FP4 kernel this is heading
-/// for wants them packed regardless. Stacking is what lets one batched call
+/// here would take about four times what they occupy packed, which does not
+/// fit the card this line serves on, and the Marlin FP4 kernel reads them
+/// packed. Stacking is what lets one batched call
 /// address all of them, and it turns 128 allocations per projection into one.
 pub(crate) struct StackedProjection {
     /// Marlin's B order, which the checkpoint's is not: the loader rewrites it
@@ -67,18 +99,113 @@ pub(crate) struct Gemma4Moe {
     pub(crate) down: StackedProjection,
 }
 
+/// A text-tower linear as the checkpoint ships it.
+pub(crate) enum Linear {
+    Bf16(DeviceMatrix),
+    /// In the TileLang GEMMs' fragment layout; only whole-matrix products
+    /// read it.
+    W4a16(W4a16Matrix),
+}
+
+impl Linear {
+    pub(crate) fn rows(&self) -> usize {
+        match self {
+            Self::Bf16(m) => m.rows,
+            Self::W4a16(m) => m.rows,
+        }
+    }
+
+    /// The bf16 matrix a row-range product reads.
+    pub(crate) fn bf16(&self) -> Result<&DeviceMatrix> {
+        match self {
+            Self::Bf16(m) => Ok(m),
+            Self::W4a16(_) => {
+                anyhow::bail!("a W4A16 linear projects whole, never through a row range")
+            }
+        }
+    }
+
+    /// `out = gelu(x @ gate^T) * (x @ up^T)` from this gate|up stack in one
+    /// GEMM, where its kernels fuse the two (W4A16, a step the TileLang GEMMs
+    /// run). False leaves `out` untouched for the caller's two-step path.
+    pub(crate) fn gelu_mul_into(
+        &self,
+        ctx: &DeviceContext,
+        x: &HiddenStates,
+        scratch: &LinearScratch,
+        out: &mut HiddenStates,
+    ) -> Result<bool> {
+        match (self, &scratch.0) {
+            (Self::W4a16(m), Some(w4)) if m.gelu_mul && W4a16Matrix::runs_tilelang(x.seq_len) => {
+                pegainfer_kernels::ops::gemma4_w4a16_gemm_into(ctx, m, x, &mut *lock(w4)?, out)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// `out = x @ self^T` over every row.
+    pub(crate) fn project_into(
+        &self,
+        ctx: &DeviceContext,
+        x: &HiddenStates,
+        scratch: &LinearScratch,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        match (self, &scratch.0) {
+            (Self::Bf16(m), _) => ops::gemm_rows_into_checked(ctx, m, 0, m.rows, x, out),
+            (Self::W4a16(m), Some(w4)) => {
+                pegainfer_kernels::ops::gemma4_w4a16_gemm_into(ctx, m, x, &mut *lock(w4)?, out)
+            }
+            (Self::W4a16(_), None) => {
+                anyhow::bail!("a W4A16 linear needs the scratch built for W4A16 weights")
+            }
+        }
+    }
+}
+
+/// The W4A16 GEMMs' stream-K scratch and dequantization matrix, held only
+/// when the weights are W4A16. One per engine, shared by every step's tower:
+/// the matrix is as large as the largest linear, and every W4A16 step runs on
+/// the stream that built the pools (the async lane, the one step on another
+/// stream, refuses W4A16 checkpoints), so the calls are in stream order.
+#[derive(Clone)]
+pub(crate) struct LinearScratch(Option<Arc<Mutex<W4a16Scratch>>>);
+
+impl LinearScratch {
+    /// `w4a16_values` is the largest W4A16 linear's `rows * cols`, zero for a
+    /// bf16 checkpoint.
+    pub(crate) fn new(ctx: &DeviceContext, w4a16_values: usize) -> Result<Self> {
+        Ok(Self(if w4a16_values > 0 {
+            Some(Arc::new(Mutex::new(W4a16Scratch::new(ctx, w4a16_values)?)))
+        } else {
+            None
+        }))
+    }
+
+    pub(crate) fn is_w4a16(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+fn lock(scratch: &Mutex<W4a16Scratch>) -> Result<MutexGuard<'_, W4a16Scratch>> {
+    scratch
+        .lock()
+        .map_err(|_| anyhow::anyhow!("a W4A16 GEMM panicked while holding the scratch"))
+}
+
 pub(crate) struct Gemma4Attention {
-    pub(crate) q_proj: DeviceMatrix,
-    pub(crate) k_proj: DeviceMatrix,
-    /// Absent on global layers, which the checkpoint ships without one.
-    pub(crate) v_proj: Option<DeviceMatrix>,
-    pub(crate) o_proj: DeviceMatrix,
+    /// Q, K and, on sliding layers, V stacked along rows in that order, so a
+    /// step projects them all with one GEMM or each through its row range.
+    /// Global layers ship no V: it is the K fork.
+    pub(crate) qkv: Linear,
+    pub(crate) o_proj: Linear,
     pub(crate) q_norm: DeviceVec,
     pub(crate) k_norm: DeviceVec,
 }
 
 pub(crate) struct Gemma4Mlp {
-    pub(crate) gate: DeviceMatrix,
-    pub(crate) up: DeviceMatrix,
-    pub(crate) down: DeviceMatrix,
+    /// gate then up, stacked along rows.
+    pub(crate) gate_up: Linear,
+    pub(crate) down: Linear,
 }

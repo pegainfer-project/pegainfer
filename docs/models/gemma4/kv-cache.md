@@ -304,8 +304,21 @@ because RoPE is the identity there.
 The wrong version is one line away: the paged-KV assembly takes `k_offset_elems` and
 `v_offset_elems` as separate offsets into one buffer, and passing the same offset twice aliases
 them — wrong output rather than a crash. The Gemma entries close this by deriving both offsets from
-one checked layout derivation; other callers still own it. So the cache stores both and
-`layer_stride = 2 × kv_block_len` stays.
+one checked layout derivation; other callers still own it. So under the incumbent kernel the cache
+stores both and `layer_stride = 2 × kv_block_len` stays: FlashInfer's paged view is two base
+pointers and a stride, and cannot express anything else.
+
+The generated kernel is not so bound, and `PEGAINFER_GLOBAL_ATTN=tilelang640` allocates the global
+pool in the folded format (`KvFormat::Folded`): one row of 640 columns per token per head, laid out
+`[K_rot | V_identity | V_rot]`. The proportional RoPE rotates 128 of the 512 columns, and outside
+them `K = V × w_k` exactly, so K is stored only at its rotated columns, V in full with its rotated
+columns moved last, and `w_k` rides the query's identity columns instead. The score operand is the
+row's first 512 columns and the value operand its last 512; the store undoes the permutation. The
+writer is told the row as bands (`row_width`, `fold_rotary`), the readers are lowered per format
+behind one launcher, and `layer_stride` is one block of `page × heads × 640`. The saving is real
+bytes per token — 37.5% of the global family's cache and of every decode step's traffic — at the
+cost of one bf16 rounding on the folded weight, which the format parity and the serving oracle
+hold to the same lines as the kernel swap itself.
 
 One tempting derivative is explicitly **not promised**: storing the pre-fork `k_proj` output
 (8 KiB/token) on offload boundaries to halve the global family's checkpoint growth. The raw
@@ -422,11 +435,15 @@ is not the contract, the per-rank mapping is.
 
 1. ~~Fused prep + KV write~~ — landed: the preps write normalised/rotated K and weightless V
    straight into the pool, one raw-K read, no fork copy.
-2. Per-family page size: local page 16 = 5 MiB; page 8 halves frontier waste and checkpoint
-   granularity at the cost of table and offload op counts. Keep it configurable; measure before
-   choosing.
-3. A windowed split-KV decode: the landed windowed decode is non-partitioned, and at bs=1 the
-   sliding group's CTA count is small enough that split-KV may still pay.
+2. ~~Per-family page size~~ — settled by the kernels: the global page is the hd512 prefill's key
+   block (64) and the local page is the hd256 windowed prefill's (64, from 16). A key tile has to be
+   one copy; four 16-row pages a tile cost more than the generic kernel. The local front still
+   releases page by page, so a resident window carries at most 63 tokens past 1024.
+3. ~~A windowed split-KV decode~~ — landed behind `PEGAINFER_GLOBAL_ATTN=tilelang*`: the sliding
+   family's pure-decode rows read their window through a generated split-KV kernel over 64-token
+   chunks, one 64-row page a tile, with the keys a page-aligned window still holds masked by
+   distance. 13.4 µs a layer on GH200
+   against the windowed prefill read's 27; mixed steps keep the prefill read.
 4. ~~A native group-16 decode for TP1's full-attention group~~ — overtaken: the group is split
    into two dispatchable pseudo-requests instead, so decode already runs a decode kernel. A native
    group-16 instantiation would remove the split's bookkeeping, not a fallback.
@@ -441,6 +458,26 @@ is not the contract, the per-rank mapping is.
    the wrong objective: the local pool is what the transient term inflates, so halving it is what
    buys admission headroom at a raised ceiling. Global-family FP8 remains unbuilt and is still
    worth doing for capacity — it is simply not the first step it was ranked as.
+7. ~~Fused projections~~ — landed behind `PEGAINFER_GLOBAL_ATTN=tilelang*`: every state loads
+   Q|K|V and gate|up row-stacked; the split state projects through row ranges of the stack, the
+   same shapes it issued before, and the generated states through one GEMM each, with the preps and
+   the activation reading their operands as column bands of the fused row. A decode step's seven
+   projections a sliding layer and six a global one become four; the paired GEMM bench at 31B
+   shapes puts the saving at 1.78 ms a step on GH200, and the fused shapes draw a different cuBLAS
+   algorithm, so they are not bit-identical to the split ones — which is why the split state keeps
+   its own.
+8. ~~Latency-bound preps and activation~~ — landed for every state, bit for bit: the hd256 and
+   hd512 preps carried one token and one head per block, a single load and three barriers of latency
+   for a kilobyte of work, and ran at a tenth of the card's bandwidth in a 10.6K prefill (84 and 20 ms
+   of 1418); each block now carries eight tokens with thread `d` still holding element `d` of every
+   token, so a token's squares reduce through the same tree and the output does not move (34 and 9 ms).
+   The activation reads eight elements a thread through 16-byte loads (81 → 28 ms).
+9. ~~Sliding-family prefill attention~~ — landed behind `PEGAINFER_GLOBAL_ATTN=tilelang*`: the
+   prompt rows' windowed read was the one non-GEMM family still behind vLLM's Hopper kernel (87 vs
+   46 ms of a 10.6K prefill). FlashInfer's own Hopper prefill is only 1.17x its generic one at
+   hd256, so the generated global prefill's structure was taken instead, with the key walk narrowed
+   to the window: on an 8192-token chunk 1.06 ms (generic) → 0.63 ms, from a 128-row query tile, the
+   row warp partition and one 64-row page a key tile — which is why the local page moved to 64.
 
 ## What the ladder did not anticipate
 

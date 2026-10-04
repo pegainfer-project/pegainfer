@@ -6,6 +6,7 @@
 //! module owns only the KV bookkeeping the executor thread is responsible for.
 
 use anyhow::Result;
+use pegainfer_frontend::engine::StopPolicy;
 
 use super::Qwen3Executor;
 use super::RequestId;
@@ -14,13 +15,39 @@ use super::WorkerStepOutcome;
 use crate::speculative::DraftPlan;
 use crate::speculative::DraftResult;
 use crate::speculative::VerifyPlan;
+use crate::speculative::VerifyRequestResult;
 use crate::speculative::VerifyResult;
+
+/// Remove accepted tokens after the first request-terminal token before the
+/// speculative KV transaction commits. The scheduler classifies the same
+/// retained trigger later to produce the typed protocol stop cause.
+pub(super) fn truncate_after_terminal(
+    result: &mut VerifyRequestResult,
+    policy: &StopPolicy,
+    model_eos: &[u32],
+) {
+    let Some(keep) = result.accepted_tokens.iter().position(|&token| {
+        policy
+            .classify(token, |id| model_eos.contains(&id))
+            .is_some()
+    }) else {
+        return;
+    };
+    let keep = keep + 1;
+    result.accepted_tokens.truncate(keep);
+    // A trigger in the accepted draft prefix is itself a matched draft. If the
+    // trigger is the posterior token, the original count is already `keep - 1`;
+    // clamping to the retained prefix handles both cases.
+    result.matched_draft_tokens = result.matched_draft_tokens.min(keep);
+}
 
 impl Qwen3Executor {
     pub(super) fn execute_speculative_verify_impl(
         &mut self,
         plan: VerifyPlan<'_>,
     ) -> Result<VerifyResult> {
+        let verify_round = self.verify_round;
+        self.verify_round = self.verify_round.wrapping_add(1);
         anyhow::ensure!(
             self.speculative.is_some(),
             "speculative verification requested but no draft model is loaded"
@@ -72,6 +99,7 @@ impl Qwen3Executor {
             requests: plan.requests.to_vec(),
             kv_views,
             sample_seed: plan.sample_seed,
+            verify_round,
         };
         let outcome = match self.run_step(&step) {
             Ok(outcome) => outcome,
@@ -107,6 +135,25 @@ impl Qwen3Executor {
                     req.request_id
                 ));
             }
+            // Workers normalize before recording context. Reject a broken span
+            // before any KV commit instead of silently repairing it here.
+            let terminal_position = req_result.accepted_tokens.iter().position(|&token| {
+                req.stop_policy
+                    .classify(token, |id| self.metadata.stop_token_ids.contains(&id))
+                    .is_some()
+            });
+            if let Some(position) = terminal_position
+                && position + 1 != req_result.accepted_tokens.len()
+            {
+                self.revert_speculative_schedules(&scheduled);
+                return Err(anyhow::anyhow!(
+                    "speculative worker returned an untruncated span for {:?}: \
+                     terminal token at position {} of {}",
+                    req_result.request_id,
+                    position,
+                    req_result.accepted_tokens.len()
+                ));
+            }
         }
 
         // Commit the accepted prefix of each request's KV and free the rest.
@@ -129,6 +176,14 @@ impl Qwen3Executor {
                     "apply_speculative failed for {:?}: {e}",
                     req_result.request_id
                 ));
+            }
+            if std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
+                log::debug!(
+                    "Qwen3 DFlash commit round={} request={} accepted_len={}",
+                    verify_round,
+                    req_result.request_id,
+                    req_result.accepted_tokens.len(),
+                );
             }
             applied.push(req_result.request_id);
         }
@@ -189,5 +244,27 @@ impl Qwen3Executor {
                 log::warn!("failed to revert speculative schedule for {request_id:?}: {error}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pegainfer_frontend::engine::EosPolicy;
+
+    use super::*;
+
+    #[test]
+    fn explicit_stop_truncates_the_kv_commit_after_the_trigger() {
+        let policy = StopPolicy::new(EosPolicy::Ignore, vec![7]);
+        let mut result = VerifyRequestResult {
+            request_id: RequestId::new(1),
+            matched_draft_tokens: 3,
+            accepted_tokens: vec![5, 7, 8, 9],
+        };
+
+        truncate_after_terminal(&mut result, &policy, &[99]);
+
+        assert_eq!(result.accepted_tokens, vec![5, 7]);
+        assert_eq!(result.matched_draft_tokens, 2);
     }
 }

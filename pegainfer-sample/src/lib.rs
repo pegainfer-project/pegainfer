@@ -83,14 +83,35 @@ pub struct SampleScratch {
     /// Vocab width every buffer above was sized for; `select_batch` rejects a
     /// logits arena whose `hidden_dim` differs, since the sizes are baked in.
     vocab: usize,
+    /// Width the argmax-vs-sample routing decision is measured against: the
+    /// emittable tokens, not the arena a model may have tile-aligned wider.
+    selection_width: usize,
     max_rows: usize,
 }
 
 impl SampleScratch {
     pub fn new(ctx: &DeviceContext, vocab: usize, max_rows: usize) -> Result<Self> {
+        Self::with_selection_width(ctx, vocab, vocab, max_rows)
+    }
+
+    /// For an arena spanning `vocab` columns whose last `vocab - selection_width`
+    /// columns the model cannot emit (it widened them to reach a GEMM tile
+    /// multiple). Those pad columns must not widen the `top_p <= 1/vocab`
+    /// nucleus [`effectively_greedy`] keys off, or a request that is effectively
+    /// greedy would drop to the rejection sampler over bf16-tied maxima.
+    pub fn with_selection_width(
+        ctx: &DeviceContext,
+        vocab: usize,
+        selection_width: usize,
+        max_rows: usize,
+    ) -> Result<Self> {
         ensure!(
             vocab > 0 && max_rows > 0,
             "SampleScratch requires vocab > 0 and max_rows > 0"
+        );
+        ensure!(
+            selection_width > 0 && selection_width <= vocab,
+            "SampleScratch selection width {selection_width} must be in 1..={vocab}"
         );
         let partials = argmax_batch_bf16_split_partials_len(max_rows, vocab);
         let alloc_i32 = |n: usize| -> Result<CudaSlice<i32>> {
@@ -124,6 +145,7 @@ impl SampleScratch {
                 .map_err(|e| anyhow!("SampleScratch identity upload failed: {e}"))?,
             sampling: BatchSamplingScratch::new(ctx, max_rows, vocab)?,
             vocab,
+            selection_width,
             max_rows,
         })
     }
@@ -151,6 +173,8 @@ impl SampleScratch {
 /// argmax survives. Routing those through argmax keeps an effectively-greedy
 /// request deterministic — the rejection sampler would otherwise pick an
 /// arbitrary member of a bf16-tied top — and skips a softmax it does not need.
+/// `vocab` here is `scratch`'s selection width, narrower than the arena when a
+/// model aligned its logits GEMM.
 ///
 /// `seed` must be fresh per decode step (one engine seed at startup, advanced
 /// per step); unseeded rows decorrelate through the philox subsequence.
@@ -196,7 +220,9 @@ pub fn select_batch(
         "select_batch: logits vocab {vocab} != scratch vocab {}",
         scratch.vocab
     );
-    let is_argmax = |p: &&SamplingParams| effectively_greedy(p, vocab);
+    // Pad columns a model aligned its GEMM to are not emittable tokens, so they
+    // must not move the `top_p <= 1/vocab` nucleus.
+    let is_argmax = |p: &&SamplingParams| effectively_greedy(p, scratch.selection_width);
     let mut tokens = vec![0u32; n];
 
     // Argmax rows -> one batched indexed argmax.

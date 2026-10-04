@@ -23,6 +23,7 @@ use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::StepReceiver;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 
@@ -175,6 +176,7 @@ fn request(prompt_len: usize, max_tokens: usize) -> Request {
     Request {
         prompt_tokens: vec![7; prompt_len],
         params: SamplingParams::default(),
+        stop_policy: StopPolicy::default(),
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,
@@ -313,6 +315,7 @@ fn admitted_request_streams_its_tokens_and_finishes_at_max_tokens() {
                 reason: FinishReason::Length,
                 prompt_tokens: 4,
                 completion_tokens: 3,
+                ..
             }
         ),
         "{terminal:?}"

@@ -183,26 +183,30 @@ fn build_speculative_verify_items(
     active: &[ActiveRequestState],
     draft_results: &[DraftRequestResult],
 ) -> Vec<VerifyStepItem> {
-    draft_results
-        .iter()
-        .map(|draft| {
-            let active = active
-                .iter()
-                .find(|req| req.request_id == draft.request_id)
-                .expect("draft request_id must exist in active set");
-            // Clamp the verify span to the request's remaining output budget so
-            // a long accepted run can't overshoot max_tokens.
-            let remaining = active.max_tokens.saturating_sub(active.generated_count);
-            // A continuing active request always has budget left (resolve emits
-            // EmitManyAndFinish the moment generated_count hits max_tokens), so
-            // this is a true invariant, not a runtime condition — don't crash the
-            // scheduler thread in release on a state we've proven unreachable.
-            debug_assert!(remaining > 0, "active request must have output budget");
-            let mut token_ids = draft.token_ids.clone();
-            token_ids.truncate(remaining);
-            VerifyStepItem::new(draft.request_id, token_ids, active.params)
-        })
-        .collect()
+    let mut requests = Vec::with_capacity(draft_results.len());
+    for draft in draft_results {
+        let active = active
+            .iter()
+            .find(|req| req.request_id == draft.request_id)
+            .expect("draft request_id must exist in active set");
+        // Clamp the verify span to the request's remaining output budget so
+        // a long accepted run can't overshoot max_tokens.
+        let remaining = active.max_tokens.saturating_sub(active.generated_count);
+        // A continuing active request always has budget left (resolve emits
+        // FinishMany the moment generated_count hits max_tokens), so
+        // this is a true invariant, not a runtime condition — don't crash the
+        // scheduler thread in release on a state we've proven unreachable.
+        debug_assert!(remaining > 0, "active request must have output budget");
+        let mut token_ids = draft.token_ids.clone();
+        token_ids.truncate(remaining);
+        requests.push(VerifyStepItem::new(
+            draft.request_id,
+            token_ids,
+            active.params,
+            active.stop_policy.clone(),
+        ));
+    }
+    requests
 }
 
 fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<PrefillStepItem> {
@@ -253,6 +257,7 @@ fn sort_decode_results(results: &mut [crate::executor::DecodeRequestResult]) {
 
 #[cfg(test)]
 mod tests {
+    use pegainfer_frontend::engine::StopPolicy;
     use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
@@ -264,6 +269,7 @@ mod tests {
             lora_adapter: None,
             prompt_tokens: vec![1, 2, 3],
             params: SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens: 8,
             logprobs: None,
             prompt_logprobs: None,
@@ -283,6 +289,7 @@ mod tests {
             max_tokens,
             prompt_len: 10,
             params: SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             logprobs: None,
         }
     }
@@ -313,6 +320,7 @@ mod tests {
         // 32 - 24 = 8 remaining → the 16-token span truncates to 8.
         assert_eq!(verify[0].as_slice().len(), 8);
         assert_eq!(verify[0].as_slice(), (0..8).collect::<Vec<_>>());
+        assert_eq!(verify[0].stop_policy, StopPolicy::default());
     }
 
     // The plan selector is the whole batch-formation policy: what the scheduler

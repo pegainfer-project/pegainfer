@@ -173,9 +173,6 @@ fn assert_cross_policy_bytes(
     width: usize,
     hidden: usize,
 ) {
-    let mut gate_routes = 0usize;
-    let mut down_routes = 0usize;
-    let mut block_rows = 0usize;
     for row in &narrow.rows {
         assert!(
             coarse.rows.contains(row),
@@ -230,7 +227,6 @@ fn assert_cross_policy_bytes(
                 ),
                 "{label}: row {row} expert {expert} gate bytes differ across the block policy"
             );
-            gate_routes += 1;
             let narrow_down = pick * hidden..(pick + 1) * hidden;
             let coarse_down = coarse_pick * hidden..(coarse_pick + 1) * hidden;
             assert!(
@@ -240,22 +236,12 @@ fn assert_cross_policy_bytes(
                 ),
                 "{label}: row {row} expert {expert} down bytes differ across the block policy"
             );
-            down_routes += 1;
         }
         assert!(
             same_bits_bf16(&narrow.block[row], &coarse.block[row]),
             "{label}: row {row} block bytes differ across the block policy"
         );
-        block_rows += 1;
     }
-    let expected_routes = narrow.rows.len() * top_k;
-    assert_eq!(gate_routes, expected_routes);
-    assert_eq!(down_routes, expected_routes);
-    assert_eq!(block_rows, narrow.rows.len());
-    eprintln!(
-        "{label}: {gate_routes} gate routes, {down_routes} down routes, {block_rows} block rows over {} rows",
-        narrow.rows.len()
-    );
 }
 
 /// The host side of the block: checkpoint weights widened on the host, the

@@ -1,8 +1,8 @@
 # Simulated Inference Engine
 
-> **TL;DR:** `pegainfer-sim` is a CPU-only `Scheduler` that serves through the vLLM/OpenAI frontend with configurable TTFT/TPOT. It launches as `LaunchedEngine::Stepped`. It is a frontend/bench harness, not a real-model performance path.
+> **TL;DR:** `pegainfer-sim` is a CPU-only `Scheduler` that serves through the vLLM/OpenAI frontend with profile-priced engine steps or legacy-compatible timing flags. It launches as `LaunchedEngine::Stepped`. It is a frontend/bench harness, not a real-model performance path.
 >
-> **Last touched:** 2026-08
+> **Last touched:** 2026-09
 
 ## Scope
 
@@ -16,9 +16,24 @@ Out of scope:
 
 ## Behavior
 
-CLI knobs: model id, port, max model length, base TTFT, prefill throughput, TPOT, fallback token id.
+CLI knobs: model identity, optional local metadata path, port, max model length,
+legacy base TTFT/prefill throughput/TPOT, fallback token id, and profile path.
+`--profile <file>` loads a versioned engine profile; its scheduler limits,
+model context, and declared predictor coverage are authoritative. A profiled
+step outside that coverage fails with an error; there is no parametric timing
+fallback. `--model-path <path>` selects the local tokenizer/config directory
+used by the frontend when the profile's target model identity is not itself a
+local path. Legacy timing flags cannot be combined with an explicit profile.
 
-Timing: TTFT is `base_ttft_ms + prompt_len / prefill_tokens_per_ms`; TPOT is a fixed delay between generated tokens. `SimScheduler::step` emits at most one token per request per step and parks up to 1ms while waiting, so a CPU-only sim does not spin a core the way a GPU scheduler can.
+Timing: with a profile, `SimScheduler::step` prices one worker step from its
+decode/prefill shape and commits progress only after that step duration. The
+shape must be inside the profile's predictor coverage; unsupported shapes are
+rejected before timing is returned. Without an explicit profile, the CLI keeps
+the legacy per-request scheduler, preserving `base_ttft_ms + prompt_len /
+prefill_tokens_per_ms` for prefill and fixed `tpot_ms` for subsequent decode
+independently of batch width. The Rust API has the same legacy behavior when
+callers do not attach a profile. The standalone CLI initializes stderr logging
+so profile loading and coverage errors remain visible.
 
 Output token ids cycle through the prompt tokens, or replay a scripted sequence (tool-call tests). Empty prompts use the fallback id.
 

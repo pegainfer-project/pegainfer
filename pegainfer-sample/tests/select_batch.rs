@@ -178,6 +178,47 @@ fn tiny_top_p_routes_to_argmax_even_under_bf16_ties() {
 }
 
 #[test]
+fn padded_arena_width_does_not_suppress_the_argmax_routing() {
+    // qwen35 tile-aligns its logits width past the decodable vocab (#1046). A
+    // top_p at exactly 1/decodable collapses to the argmax on the unpadded
+    // arena, so it must still do so at twice the arena width.
+    let ctx = DeviceContext::new().unwrap();
+    let decodable = 256usize;
+    let vocab = 2 * decodable;
+    let lo = 128usize;
+    let hi = 200usize;
+    let mut row = vec![-1.0f32; vocab];
+    row[lo] = 8.0; // bf16-exact, identical to `hi` -> a true top tie
+    row[hi] = 8.0;
+    let arena = make_arena(&ctx, &[row]);
+
+    let tiny = sampling(1.0, -1, 1.0 / decodable as f32);
+
+    // Control: at the arena width 1/256 is no longer a single-token nucleus,
+    // and the sampler may return the tied peer.
+    let mut wide = SampleScratch::new(&ctx, vocab, 1).unwrap();
+    let mut sampled_the_peer = false;
+    for s in 0..64u64 {
+        let picked = select_batch(&ctx, &arena, &[&tiny], &[0], s, &mut wide).unwrap()[0];
+        assert!(picked == lo as u32 || picked == hi as u32);
+        sampled_the_peer |= picked == hi as u32;
+    }
+    assert!(
+        sampled_the_peer,
+        "control: an arena-width routing decision puts this row on the sampler"
+    );
+
+    let mut bounded = SampleScratch::with_selection_width(&ctx, vocab, decodable, 1).unwrap();
+    for s in 0..64u64 {
+        assert_eq!(
+            select_batch(&ctx, &arena, &[&tiny], &[0], s, &mut bounded).unwrap(),
+            vec![lo as u32],
+            "seed {s}: the decodable vocab must keep this row on the argmax path"
+        );
+    }
+}
+
+#[test]
 fn batch_larger_than_scratch_is_rejected() {
     let ctx = DeviceContext::new().unwrap();
     let vocab = 8;

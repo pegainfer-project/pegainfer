@@ -254,10 +254,12 @@ Trace note: the `nsys` capture includes one warmup run plus one measured run, so
 
 The GEMV family can be split further by launch shape (`gridX`) because each output width maps to a distinct projection class in the current Qwen3.5 decode path:
 
+The LM-head rows below were measured while selection still spanned the full 248,320-row checkpoint. The output projection now runs at the tile-aligned selection width (248,192 on 4B) — see [decode-kernel-attribution](decode-kernel-attribution.md) — so read those rows as a shape class, not the current cost.
+
 | GEMV subfamily | Time/step | % | Count/step | Avg each | Mapping |
 |----------------|-----------|---|------------|----------|---------|
 | Q / QKV (8192-dim) | 1.65ms | 13.1% | 32 | 51.5μs | 8 full-attn `q_proj` + 24 linear-attn `in_proj_qkv` |
-| LM head (248320-dim) | 1.50ms | 12.0% | 1 | 1.50ms | final logits projection |
+| LM head (248320-dim, pre-alignment) | 1.50ms | 12.0% | 1 | 1.50ms | final logits projection |
 | O projection (2560-dim) | 0.84ms | 6.7% | 32 | 26.2μs | 8 full-attn `o_proj` + 24 linear-attn `out_proj` |
 | Z projection (4096-dim) | 0.65ms | 5.2% | 24 | 27.1μs | 24 linear-attn `in_proj_z` |
 | B / A projection (32-dim) | 0.20ms | 1.6% | 48 | 4.2μs | 24 linear-attn `in_proj_b` + 24 `in_proj_a` |

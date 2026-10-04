@@ -224,6 +224,16 @@ impl DenseExchangeOutput<'_> {
     }
 }
 
+pub(crate) struct DeviceCombineOutput<'a> {
+    scratch: MutexGuard<'a, DeviceCombineScratch>,
+}
+
+impl DeviceCombineOutput<'_> {
+    pub(crate) fn rank_send_mut(&mut self, rank: usize) -> Result<&mut CudaSlice<f32>> {
+        self.scratch.send_mut(rank)
+    }
+}
+
 #[derive(Default)]
 struct DeviceCombineScratch {
     hidden_dim: usize,
@@ -1095,6 +1105,19 @@ impl NaiveNcclEp2Backend {
         let end_result = self.lib.check(end, &format!("{context}: group_end"));
         op_result?;
         end_result
+    }
+
+    pub(crate) fn prepare_device_combine_output(
+        &self,
+        rank0: &DeviceContext,
+        rank1: &DeviceContext,
+        hidden_dim: usize,
+        seq_len: usize,
+    ) -> Result<DeviceCombineOutput<'_>> {
+        let mut scratch = self.combine_scratch()?;
+        scratch.ensure(rank0, rank1, hidden_dim, seq_len)?;
+        scratch.ensure_shape(hidden_dim, seq_len)?;
+        Ok(DeviceCombineOutput { scratch })
     }
 }
 

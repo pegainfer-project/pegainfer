@@ -1,7 +1,5 @@
-#[cfg(feature = "qwen35")]
 use std::ffi::c_void;
 
-#[cfg(feature = "qwen35")]
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
 
@@ -10,7 +8,6 @@ use super::Half;
 /// Kernels-private Rust mirror of the stable C ABI. Model crates never import
 /// this struct: the safe `ops::Qwen35GdnAot` wrapper owns validation, workspace,
 /// handle lifetime, and conversion from semantic tensors to device addresses.
-#[cfg(feature = "qwen35")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FlashInferGdnPrefillArgs {
@@ -30,11 +27,9 @@ pub(crate) struct FlashInferGdnPrefillArgs {
     pub stream: CUstream,
 }
 
-// Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
-// Sources: csrc/qwen35/*.cu. The paged HD256 attention entry points are shared
-// with Gemma 4 and are declared in `shared.rs`.
+// Qwen3.5 private kernels (hybrid linear + HD256 full attention).
+// Sources: csrc/qwen35/*.cu.
 unsafe extern "C" {
-    #[cfg(feature = "qwen35")]
     pub(crate) fn pegainfer_qwen35_decode_gemm_prepare(
         weights: *const Half,
         rows: i32,
@@ -43,7 +38,6 @@ unsafe extern "C" {
         algorithm: *mut u64,
         stream: CUstream,
     ) -> i32;
-    #[cfg(feature = "qwen35")]
     pub(crate) fn pegainfer_qwen35_decode_gemm_launch(
         algorithm: *const u64,
         weights: *const Half,
@@ -55,30 +49,23 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    #[cfg(feature = "qwen35")]
     pub(crate) fn pegainfer_qwen35_gdn_abi_version() -> u32;
-    #[cfg(feature = "qwen35")]
     pub(crate) fn pegainfer_qwen35_gdn_aot_available() -> i32;
-    #[cfg(feature = "qwen35")]
     pub(crate) fn pegainfer_qwen35_gdn_create(handle: *mut *mut c_void, device: i32) -> i32;
-    #[cfg(feature = "qwen35")]
     pub(crate) fn pegainfer_qwen35_gdn_workspace_bytes(
         handle: *mut c_void,
         workspace_bytes: *mut usize,
     ) -> i32;
-    #[cfg(feature = "qwen35")]
     pub(crate) fn pegainfer_qwen35_gdn_launch(
         handle: *mut c_void,
         args: *const FlashInferGdnPrefillArgs,
     ) -> i32;
-    #[cfg(feature = "qwen35")]
     pub(crate) fn pegainfer_qwen35_gdn_destroy(handle: *mut c_void);
 
     /// Native, non-expanded FlashInfer-GDN input preparation.
     ///
     /// `q_out`, `k_out`, and `v_out` are token-major `[T,H,D]`; alpha/beta are
     /// FP32 `[T,Hv]`.
-    #[cfg(feature = "qwen35")]
     pub fn gated_delta_rule_prefill_native_prepare_cuda(
         qkv: *const Half,
         b_proj: *const Half,
@@ -93,6 +80,54 @@ unsafe extern "C" {
         tokens: i32,
         stream: CUstream,
     ) -> CUresult;
+    pub fn paged_attention_decode_cuda_hd256(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn batch_prefill_paged_cuda_hd256(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        q_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        seq_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
 
     // Qwen3.5 full-attention prefill prep that writes K/V directly into paged KV.
     pub fn prefill_attention_hd256_prep_paged_cuda(
@@ -201,10 +236,7 @@ unsafe extern "C" {
     );
 }
 
-// Chunk-wise GDR prefill kernels, Triton AOT-generated at build time. The
-// `qwen35` feature is what pulls Python + Triton into the build; without it
-// these symbols don't exist.
-#[cfg(feature = "qwen35")]
+// Chunk-wise GDR prefill kernels, Triton AOT-generated at build time.
 unsafe extern "C" {
     pub fn gated_delta_rule_prefill_chunk_prepare_cuda(
         qkv: *const Half,

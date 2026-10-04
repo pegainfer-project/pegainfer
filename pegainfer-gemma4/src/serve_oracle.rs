@@ -3,6 +3,8 @@
 //! different admission shape.
 
 use anyhow::Result;
+use pegainfer_core::kv_pool::KvFormat;
+use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::kv_pool::KvStorage;
 
 use super::*;
@@ -19,7 +21,7 @@ fn stack_with(max_context: usize, pages: usize) -> (DeviceContext, GemmaServe, S
     stack_with_storage(
         max_context,
         pages,
-        crate::engine::kv_fp8_storage().expect("PEGAINFER_KV_FP8"),
+        crate::engine::local_kv_storage(&crate::engine::read_env).expect("PEGAINFER_KV_FP8"),
     )
 }
 
@@ -33,7 +35,18 @@ fn stack_with_storage(
     let weights =
         Gemma4Weights::from_safetensors(&dir, 0, config).expect("load checkpoint weights");
     let ctx = DeviceContext::new_with_device(0).expect("device context");
-    let serve = GemmaServe::new(&ctx, weights, max_context, storage, pages, pages).expect("serve");
+    // The oracle measures the incumbent kernel; the opt-in one has its own
+    // gate.
+    let serve = GemmaServe::new(
+        &ctx,
+        weights,
+        max_context,
+        storage,
+        pages,
+        pages,
+        GlobalAttn::Incumbent,
+    )
+    .expect("serve");
     eprintln!("oracle stack storage: {storage:?}");
     (ctx, serve, dir)
 }
@@ -74,10 +87,12 @@ fn backend_floor(
     (floor, top1)
 }
 
-const WINDOW_FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../test_data/gemma4-12b-hf-window-golden.safetensors"
-);
+fn window_fixture() -> String {
+    crate::testkit::fixture_path(
+        "PEGAINFER_GEMMA4_WINDOW_GOLDEN",
+        "gemma4-12b-hf-window-golden.safetensors",
+    )
+}
 
 /// One case's run through the serving path: the prompt prefilled in steps of
 /// `chunk` tokens (the whole prompt when zero), then its teacher-forced
@@ -181,10 +196,12 @@ fn score_rows(
     (max_abs, top1)
 }
 
-const LONGCTX_FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../test_data/gemma4-12b-hf-longctx-golden.safetensors"
-);
+fn longctx_fixture() -> String {
+    crate::testkit::fixture_path(
+        "PEGAINFER_GEMMA4_LONGCTX_GOLDEN",
+        "gemma4-12b-hf-longctx-golden.safetensors",
+    )
+}
 
 /// A case's sdpa rows with a borrowed tolerance: where eager could not fit
 /// next to the tower, the widest dual-backend case lends its floor — the
@@ -226,16 +243,57 @@ fn waypoint_reference(
     }
 }
 
+fn waypoint_label(point: Waypoint<'_>) -> String {
+    match point.chunk {
+        0 => point.case.to_string(),
+        _ => format!("{}-chunked", point.case),
+    }
+}
+
+/// What one waypoint left behind: its failures, or nothing because the card
+/// could not hold the pass.
+enum WaypointOutcome {
+    Ran(Vec<String>),
+    Skipped,
+}
+
+#[derive(Default)]
+struct WaypointReport {
+    ran: Vec<String>,
+    failures: Vec<String>,
+    skipped: Vec<String>,
+}
+
 fn gate_waypoint(
     ctx: &DeviceContext,
     serve: &GemmaServe,
     fixture: &safetensors::SafeTensors<'_>,
     point: Waypoint<'_>,
-) -> Vec<String> {
-    let label = match point.chunk {
-        0 => point.case.to_string(),
-        _ => format!("{}-chunked", point.case),
-    };
+) -> WaypointOutcome {
+    let label = waypoint_label(point);
+    // Chunk 0 is the whole-prompt pass.
+    if point.chunk == 0 {
+        let (_, prompt) = u32_tensor(fixture, &format!("{}_prompt", point.case));
+        // Before the probe: afterwards the allocator still holds what it
+        // touched, so the same call would report the probe's own state.
+        let (free, total) = cudarc::driver::result::mem_get_info().expect("cuMemGetInfo");
+        let fits = serve
+            .single_pass_scratch_fits(ctx, prompt.len())
+            .unwrap_or_else(|e| {
+                panic!("{label}: the scratch probe failed for its own reason: {e:#}")
+            });
+        if !fits {
+            let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+            eprintln!(
+                "{label}: skipped -- a whole-prompt pass over {} rows cannot take its scratch \
+                 with {:.1} of {:.1} GiB free; the chunked pass carries this length",
+                prompt.len(),
+                gib(free),
+                gib(total),
+            );
+            return WaypointOutcome::Skipped;
+        }
+    }
     let (ids, lps, positions, top_k, tolerance, backend_top1) = waypoint_reference(fixture, point);
     let run = run_case(ctx, serve, fixture, point.case, point.chunk);
     assert_eq!(run.rows.len(), positions, "{label}: fixture positions");
@@ -263,7 +321,7 @@ fn gate_waypoint(
     if max_abs > tolerance {
         failures.push(format!("{label} ({max_abs} > {tolerance})"));
     }
-    failures
+    WaypointOutcome::Ran(failures)
 }
 
 fn gate_waypoints(
@@ -271,11 +329,18 @@ fn gate_waypoints(
     serve: &GemmaServe,
     fixture: &safetensors::SafeTensors<'_>,
     points: &[Waypoint<'_>],
-) -> Vec<String> {
-    points
-        .iter()
-        .flat_map(|&point| gate_waypoint(ctx, serve, fixture, point))
-        .collect()
+    report: &mut WaypointReport,
+) {
+    for &point in points {
+        let label = waypoint_label(point);
+        match gate_waypoint(ctx, serve, fixture, point) {
+            WaypointOutcome::Ran(failures) => {
+                report.ran.push(label);
+                report.failures.extend(failures);
+            }
+            WaypointOutcome::Skipped => report.skipped.push(label),
+        }
+    }
 }
 
 fn validate_waypoint_provenance(dir: &str, window_bytes: &[u8], long_bytes: &[u8]) {
@@ -303,9 +368,16 @@ fn validate_waypoint_provenance(dir: &str, window_bytes: &[u8], long_bytes: &[u8
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
 fn context_waypoints_match_hf() {
-    let (ctx, serve, dir) = stack_with(32900, 2200);
-    let window_bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
-    let long_bytes = std::fs::read(LONGCTX_FIXTURE).expect("read longctx fixture");
+    // The deepest waypoint's prompt and its teacher tokens, whole in the
+    // pools: the pages a raised ceiling would hold, plus each pool's padding
+    // page and one more.
+    let max_context = 32900;
+    let (ctx, serve, dir) = stack_with(
+        max_context,
+        max_context.div_ceil(crate::kv::LOCAL_PAGE_SIZE) + 2,
+    );
+    let window_bytes = std::fs::read(window_fixture()).expect("read window fixture");
+    let long_bytes = std::fs::read(longctx_fixture()).expect("read longctx fixture");
     validate_waypoint_provenance(&dir, &window_bytes, &long_bytes);
     let window = safetensors::SafeTensors::deserialize(&window_bytes).expect("window fixture");
     let long = safetensors::SafeTensors::deserialize(&long_bytes).expect("longctx fixture");
@@ -342,6 +414,9 @@ fn context_waypoints_match_hf() {
             floor: None,
         },
     ];
+    // The chunked 32K pass runs before the whole-prompt one: the chunked
+    // walk is what a raised ceiling serves through, and it is the pass a
+    // card too small for the whole-prompt scratch still has to carry.
     let long_points = [
         Waypoint {
             case: "w16384",
@@ -350,20 +425,37 @@ fn context_waypoints_match_hf() {
         },
         Waypoint {
             case: "w32768",
-            chunk: 0,
+            chunk: 2048,
             floor: Some(floor),
         },
         Waypoint {
             case: "w32768",
-            chunk: 2048,
+            chunk: 0,
             floor: Some(floor),
         },
     ];
-    let mut failures = gate_waypoints(&ctx, &serve, &window, &window_points);
-    failures.extend(gate_waypoints(&ctx, &serve, &long, &long_points));
+    let mut report = WaypointReport::default();
+    gate_waypoints(&ctx, &serve, &window, &window_points, &mut report);
+    gate_waypoints(&ctx, &serve, &long, &long_points, &mut report);
+    // A skipped whole-prompt case is only evidence of memory, never of
+    // numerics: its length has to have passed through the chunked pass.
+    for skipped in &report.skipped {
+        let twin = format!("{skipped}-chunked");
+        assert!(
+            report.ran.contains(&twin) && !report.failures.iter().any(|f| f.starts_with(&twin)),
+            "{skipped} was skipped for memory and {twin} did not pass in its place"
+        );
+    }
     assert!(
-        failures.is_empty(),
-        "cases over their calibrated floor: {failures:?}"
+        report.failures.is_empty(),
+        "cases over their calibrated floor: {:?}",
+        report.failures
+    );
+    eprintln!(
+        "waypoints: {} ran, {} skipped for memory {:?}",
+        report.ran.len(),
+        report.skipped.len(),
+        report.skipped
     );
 }
 
@@ -478,16 +570,18 @@ fn judge_agreement(case: &AgreementCase, floor: usize, fp8: usize) {
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
 fn fp8_argmax_agreement_meets_the_bf16_floor() {
-    let bytes = std::fs::read(WINDOW_FIXTURE).expect("read window fixture");
+    let bytes = std::fs::read(window_fixture()).expect("read window fixture");
     let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("window fixture");
     let cases = [("w1023_prompt", usize::MAX, 2), ("w4096_prompt", 2048, 8)]
         .map(|(name, cut, stride)| agreement_case(&fixture, name, cut, stride));
     let max_context = cases
         .iter()
-        .map(|case| case.prompt.len().div_ceil(crate::kv::PAGE_SIZE) * crate::kv::PAGE_SIZE)
+        .map(|case| {
+            case.prompt.len().div_ceil(crate::kv::LOCAL_PAGE_SIZE) * crate::kv::LOCAL_PAGE_SIZE
+        })
         .max()
         .expect("agreement cases");
-    let pages = max_context.div_ceil(crate::kv::PAGE_SIZE) + 2;
+    let pages = max_context.div_ceil(crate::kv::LOCAL_PAGE_SIZE) + 2;
 
     let (ctx, bf16, _) = stack_with_storage(max_context, pages, KvStorage::Bf16);
     let bf16_results = cases
@@ -516,6 +610,21 @@ fn fp8_argmax_agreement_meets_the_bf16_floor() {
     for ((case, (_, floor)), fp8) in cases.iter().zip(bf16_results).zip(fp8_results) {
         judge_agreement(case, floor, fp8);
     }
+}
+
+/// The shape of one logit row, for when two of them disagree: the top few ids
+/// and the range say whether a row is a distribution or garbage.
+fn describe_row(what: &str, row: &[f32]) {
+    let mut ranked: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let lo = row.iter().copied().fold(f32::INFINITY, f32::min);
+    let hi = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let finite = row.iter().filter(|v| v.is_finite()).count();
+    eprintln!(
+        "{what}: range [{lo}, {hi}], finite {finite}/{}, top5 {:?}",
+        row.len(),
+        &ranked[..5.min(ranked.len())]
+    );
 }
 
 /// The two arms run different launch shapes (one-token decode against a
@@ -547,6 +656,348 @@ fn serving_recompute(ctx: &DeviceContext, serve: &GemmaServe, tokens: &[u32]) ->
     host[(logits.seq_len - 1) * vocab..].to_vec()
 }
 
+/// Greedy continuation through the serving path: the prompt in one prefill
+/// step, then `steps` decode steps each fed the previous row's argmax. Every
+/// row is returned, so a divergence is placed at the step it appears, and so
+/// is the context it walked, which a recompute of the same tokens needs.
+fn continue_greedy(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    tokens: &[u32],
+    steps: usize,
+) -> (Vec<Vec<f32>>, Vec<u32>) {
+    let mut kv = serve.alloc_kv();
+    let mut arena = serve
+        .alloc_step_arena(ctx, 1, false)
+        .expect("oracle step arena");
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, tokens.len())
+        .expect("admit prompt");
+    let logits = serve.step(ctx, &mut kv, tokens).expect("prefill");
+    let host = logits.to_host(ctx).expect("prefill D2H");
+    let vocab = logits.hidden_dim;
+    let mut rows = vec![host[(logits.seq_len - 1) * vocab..].to_vec()];
+    let mut walked = tokens.to_vec();
+    for _ in 0..steps {
+        let token = u32::try_from(argmax(rows.last().unwrap())).expect("token id");
+        walked.push(token);
+        rows.push(decode_serving(serve, ctx, &mut arena, &mut kv, token).expect("decode"));
+    }
+    (rows, walked)
+}
+
+/// The decode gates' raw-logit line. Correctness at this depth is carried by
+/// the argmax, which [`compare_row`] holds on every row of every cell; this
+/// catches a drift the argmax would not, and is set above the spread a
+/// sixteen-cell sweep measured (worst 7.91) rather than at the edge of it,
+/// because the quantity is chaotic and a tighter line would only flake. What
+/// bounds the kernel's own error is the AOT gate, at 0.002 against fp32.
+const DRIFT_LINE: f32 = 12.0;
+
+/// What a decode row's logits move by when nothing about the maths changes:
+/// every row of a greedy walk against a single prefill of the context that
+/// row saw, one arm two ways, reduced the way the arms are compared.
+///
+/// Printed beside each cell so the reader has the magnitude an already
+/// accepted implementation difference reaches here. It is not the line: a
+/// sweep of sixteen cells put this at 0.31 to 5.75 and the replacement at
+/// 0.56 to 7.91, with neither tracking prompt or length -- lengths a page
+/// apart differ sevenfold and the worst row lands anywhere from the prompt
+/// row to the last. A maximum over a walk of these is a draw from a heavy
+/// tail, so a line derived from it in-run would move with the draw.
+fn neutral_scale(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    rows: &[Vec<f32>],
+    prompt_len: usize,
+    walked: &[u32],
+) -> f32 {
+    let mut worst = 0.0f32;
+    for (i, row) in rows.iter().enumerate() {
+        let recomputed = serving_recompute(ctx, serve, &walked[..prompt_len + i]);
+        worst = worst.max(compare_row(
+            row,
+            &recomputed,
+            &format!("neutral scale row {i}"),
+        ));
+    }
+    worst
+}
+
+/// The contexts the decode gates sweep: every fixture prompt at three
+/// lengths, so a line comes from a spread rather than from one cell.
+fn decode_sweep_cells() -> Vec<(usize, usize)> {
+    let mut cells = Vec::new();
+    for prompt in 0..3 {
+        for len in [512usize, 1500, 3000] {
+            cells.push((prompt, len));
+        }
+    }
+    cells
+}
+
+/// The replacement global-attention decode against the one it stands in for,
+/// over every fixture prompt at three lengths. Each step is compared on its
+/// own row, argmax first, since the arms pick their own next token: that
+/// equality is the correctness the gate carries, and it holds on every row.
+/// The raw-logit line is [`DRIFT_LINE`], and every cell prints its own gap
+/// beside [`neutral_scale`], so the spread is on the record.
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
+fn the_replacement_global_decode_matches_the_incumbent() {
+    const STEPS: usize = 16;
+    let (ctx, mut serve, _dir) = stack_with(4096, 300);
+    assert!(
+        pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
+        "this build has no TileLang kernel to compare; the gate needs one that does"
+    );
+    let prompts = crate::testkit::generate_fixture_prompts();
+
+    let mut cells = Vec::new();
+    for (prompt, len) in decode_sweep_cells() {
+        let tokens: Vec<u32> = prompts[prompt].iter().cycle().copied().take(len).collect();
+
+        serve.tilelang_global_attn = false;
+        let (incumbent, walked) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        for (i, row) in incumbent.iter().enumerate() {
+            eprintln!(
+                "prompt {prompt} at {len}: incumbent step {i} fingerprint {:016x}",
+                fingerprint(row)
+            );
+        }
+        let (again, _) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        for (i, (a, b)) in incumbent.iter().zip(&again).enumerate() {
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "prompt {prompt} at {len}: the incumbent is not bit-identical run to \
+                 run at step {i}, so there is no floor to measure the replacement against"
+            );
+        }
+        let scale = neutral_scale(&ctx, &serve, &incumbent, tokens.len(), &walked);
+
+        serve.tilelang_global_attn = true;
+        let (replacement, _) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        let mut worst = (0.0f32, 0usize);
+        for (i, (a, b)) in incumbent.iter().zip(&replacement).enumerate() {
+            let gap = compare_row(a, b, &format!("prompt {prompt} at {len}, decode step {i}"));
+            if gap > worst.0 {
+                worst = (gap, i);
+            }
+        }
+        eprintln!(
+            "prompt {prompt} at {len} tokens: floor 0, neutral scale {scale}, \
+             replacement |dlogit| {} at step {}",
+            worst.0, worst.1
+        );
+        cells.push((prompt, len, scale, worst));
+    }
+
+    let widest_scale = cells.iter().fold(0.0f32, |m, c| m.max(c.2));
+    let worst_cell = cells
+        .iter()
+        .max_by(|a, b| a.3.0.total_cmp(&b.3.0))
+        .expect("the sweep ran");
+    let line = DRIFT_LINE;
+    eprintln!(
+        "global decode over {} cells: neutral scale at most {widest_scale}, line {line}, \
+         worst replacement |dlogit| {} at prompt {} length {} step {}",
+        cells.len(),
+        worst_cell.3.0,
+        worst_cell.0,
+        worst_cell.1,
+        worst_cell.3.1
+    );
+    for (prompt, len, _, (gap, step)) in &cells {
+        assert!(
+            *gap <= line,
+            "prompt {prompt} at {len}: replacement |dlogit| {gap} at step {step} above \
+             the drift line of {line}"
+        );
+    }
+}
+
+/// The folded global pool against the split one, both read by the generated
+/// kernels: the rows differ in where K's norm weight is applied, one bf16
+/// rounding apart per element. Every fixture prompt at three lengths. The
+/// split arms run and are kept first, so one pool swap covers the sweep. The
+/// decode rows take [`DRIFT_LINE`]; the prompt row keeps the prefill gate's
+/// 2.0, which one row of one kernel pass can hold.
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
+fn the_folded_pool_matches_the_split_one() {
+    const STEPS: usize = 16;
+    let (ctx, mut serve, _dir) = stack_with(4096, 300);
+    assert!(
+        pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
+        "this build has no TileLang kernel to compare; the gate needs one that does"
+    );
+    let prompts = crate::testkit::generate_fixture_prompts();
+    serve.tilelang_global_attn = true;
+
+    let cells = decode_sweep_cells();
+    let mut split_arms = Vec::new();
+    for &(prompt, len) in &cells {
+        let tokens: Vec<u32> = prompts[prompt].iter().cycle().copied().take(len).collect();
+        let (split, walked) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        let (again, _) = continue_greedy(&ctx, &serve, &tokens, STEPS);
+        for (i, (a, b)) in split.iter().zip(&again).enumerate() {
+            assert!(
+                a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "prompt {prompt} at {len}: the split arm is not bit-identical run to \
+                 run at step {i}, so there is no floor to measure the folded one against"
+            );
+        }
+        let scale = neutral_scale(&ctx, &serve, &split, tokens.len(), &walked);
+        split_arms.push((tokens, split, scale));
+    }
+
+    // The same budget of pages, in the other format; the serving path
+    // allocates the pool once in whichever format the knob names.
+    let (layers, heads, head_dim, page_size, pages) = {
+        let layout = serve.global_pool.layout();
+        (
+            layout.num_layers,
+            layout.num_kv_heads,
+            layout.head_dim,
+            layout.page_size,
+            serve.global_pool.capacity_pages(),
+        )
+    };
+    let rotary = serve.weights.config.global_rotary_dim;
+    serve.global_pool = KvPool::with_storage_and_format(
+        &ctx,
+        layers,
+        heads,
+        head_dim,
+        page_size,
+        pages,
+        KvStorage::Bf16,
+        KvFormat::Folded { rotary },
+    )
+    .expect("folded global pool");
+    eprintln!(
+        "global pool re-allocated as {:?}: {} elements per page against the split's",
+        serve.global_pool.layout().format,
+        serve.global_pool.layout().page_stride
+    );
+
+    let widest_scale = split_arms.iter().fold(0.0f32, |m, c| m.max(c.2));
+    let line = DRIFT_LINE;
+    let mut worst_overall = (0.0f32, 0usize, 0usize, 0usize);
+    for ((prompt, len), (tokens, split, scale)) in cells.iter().zip(&split_arms) {
+        let (folded, _) = continue_greedy(&ctx, &serve, tokens, STEPS);
+        let mut worst = (0.0f32, 0usize);
+        for (i, (a, b)) in split.iter().zip(&folded).enumerate() {
+            let gap = compare_row(a, b, &format!("prompt {prompt} at {len}, row {i}"));
+            if i == 0 {
+                assert!(
+                    gap <= 2.0,
+                    "prompt {prompt} at {len}: folded prefill |dlogit| {gap} above the \
+                     prefill line of 2.0"
+                );
+            } else if gap > worst.0 {
+                worst = (gap, i);
+            }
+        }
+        eprintln!(
+            "prompt {prompt} at {len} tokens: floor 0, neutral scale {scale}, \
+             folded decode |dlogit| {} at row {}",
+            worst.0, worst.1
+        );
+        assert!(
+            worst.0 <= line,
+            "prompt {prompt} at {len}: folded decode |dlogit| {} at row {} above the \
+             drift line of {line}",
+            worst.0,
+            worst.1
+        );
+        if worst.0 > worst_overall.0 {
+            worst_overall = (worst.0, worst.1, *prompt, *len);
+        }
+    }
+    eprintln!(
+        "folded against split over {} cells: neutral scale at most {widest_scale}, line \
+         {line}, worst decode |dlogit| {} at prompt {} length {} row {}",
+        cells.len(),
+        worst_overall.0,
+        worst_overall.2,
+        worst_overall.3,
+        worst_overall.1
+    );
+}
+
+/// FNV-1a over the row's bits.
+fn fingerprint(row: &[f32]) -> u64 {
+    row.iter().fold(0xcbf2_9ce4_8422_2325, |h, x| {
+        (h ^ u64::from(x.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The replacement global-attention kernel against the one it stands in for,
+/// both through the production serving path. The incumbent is asked twice
+/// first, so the tolerance is a measured floor rather than a chosen number.
+/// The prompt leaves the last page partial, where tail handling could differ.
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
+fn the_replacement_global_kernel_matches_the_incumbent() {
+    let (ctx, mut serve, dir) = stack_with(4096, 300);
+    assert!(
+        pegainfer_kernels::ops::gemma4_hd512_prefill_is_built(),
+        "this build has no TileLang kernel to compare; the gate needs one that does"
+    );
+    // The runner selects this gate only where the geometry matches.
+    let config = crate::config::Gemma4Config::from_file(&dir).expect("config");
+    crate::engine::tilelang_geometry_refusal(&config).expect(
+        "this gate compares the generated kernel against the incumbent, so it needs a \
+         checkpoint whose global geometry the build was compiled for",
+    );
+    let prompts = crate::testkit::generate_fixture_prompts();
+    let tokens: Vec<u32> = prompts[0].iter().cycle().copied().take(1500).collect();
+    let page = serve.global_pool.layout().page_size;
+    assert!(
+        !tokens.len().is_multiple_of(page),
+        "the prompt has to leave the final global page partial, and {} tokens \
+         divides the pool's {page}-row page",
+        tokens.len()
+    );
+
+    assert!(!serve.tilelang_global_attn);
+    let incumbent = serving_recompute(&ctx, &serve, &tokens);
+    // The incumbent's bits on this checkpoint, to compare across trees.
+    eprintln!("incumbent fingerprint {:016x}", fingerprint(&incumbent));
+    let again = serving_recompute(&ctx, &serve, &tokens);
+    assert!(
+        incumbent
+            .iter()
+            .zip(&again)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the incumbent is not bit-identical run to run, so there is no floor \
+         to measure the replacement against"
+    );
+
+    serve.tilelang_global_attn = true;
+    let replacement = serving_recompute(&ctx, &serve, &tokens);
+    // Report before asserting: when the two disagree, the magnitude and the
+    // shape of each row say which kind of wrong it is, and `compare_row`
+    // stops at the first divergence it finds.
+    describe_row("incumbent", &incumbent);
+    describe_row("replacement", &replacement);
+    let spread = incumbent
+        .iter()
+        .zip(&replacement)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("max |dlogit| between the two kernels: {spread}");
+    let gap = compare_row(&incumbent, &replacement, "replacement against incumbent");
+    eprintln!(
+        "global prefill over {} tokens: replacement |dlogit| {gap}",
+        tokens.len()
+    );
+    assert!(
+        gap <= 2.0,
+        "replacement |dlogit| {gap} above the line's calibrated 2.0"
+    );
+}
+
 /// One forward path answers for itself: every prompt position's incremental
 /// logits (one token at a time through the decode arena) match a whole-prompt
 /// recompute of the same serving path, and four decode steps fed the
@@ -560,11 +1011,8 @@ fn incremental_serving_matches_recompute() {
     let (ctx, serve, _dir) = load_stack();
     // The golden fixture's short prompt: real text, and the tokens the
     // ceiling below was calibrated on. Read for its prompt only.
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../test_data/gemma4-12b-hf-golden.safetensors"
-    );
-    let bytes = std::fs::read(path).expect("read golden fixture (dump on the box first)");
+    let path = crate::testkit::golden_path();
+    let bytes = std::fs::read(path).expect("read golden fixture (dump it first)");
     let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
     let (_, tokens_i32) = i32_tensor(&fixture, "short_tokens");
     let mut tokens: Vec<u32> = tokens_i32
@@ -620,19 +1068,18 @@ fn incremental_serving_matches_recompute() {
     }
 }
 
-/// DoD gate: greedy continuation matches HF `generate()` token for
-/// token on three prompts. The fixture is dumped on the box by
-/// tools/accuracy/dump_gemma4_generate.py (prompt + up to 50 greedy
-/// tokens per case).
+/// Greedy continuation matches HF `generate()` token for token on three
+/// prompts. The fixture is dumped by tools/accuracy/dump_gemma4_generate.py
+/// (prompt + up to 50 greedy tokens per case).
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]
 fn greedy_matches_hf_generate() {
     let (ctx, serve, dir) = load_stack();
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../test_data/gemma4-12b-generate.safetensors"
+    let path = crate::testkit::fixture_path(
+        "PEGAINFER_GEMMA4_GENERATE",
+        "gemma4-12b-generate.safetensors",
     );
-    let bytes = std::fs::read(path).expect("read generate fixture (dump on the box first)");
+    let bytes = std::fs::read(path).expect("read generate fixture (dump it first)");
     // Provenance: the golden fixture fingerprints the checkpoint files, so
     // it pins what is loaded here; the generate fixture then has to name
     // that same revision, or these tokens came from another model.
@@ -886,7 +1333,7 @@ fn assert_mixed_admissions_match_serial(ctx: &DeviceContext, serve: &GemmaServe)
 /// composition everywhere else: both arms share the opening rounds and the
 /// batch-2 rounds after admission, and differ only in the admission itself
 /// (one mixed step versus a plain prefill plus one live decode round).
-/// Synthetic ids suffice: the gate is a self-A/B over window arithmetic.
+/// Synthetic ids suffice: both sides run the same window arithmetic.
 fn assert_mixed_window_crossing_matches_serial(ctx: &DeviceContext, serve: &GemmaServe) {
     let partner: Vec<u32> = (0..40u32).map(|i| 1000 + i * 31).collect();
     let long_prompt: Vec<u32> = (0..1500u32).map(|i| 1000 + (i * 37) % 50000).collect();
@@ -1051,6 +1498,8 @@ fn fp8_plain_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
         gate_host_logits(ctx, logits)
     };
     assert_finite_gate_logits(&host, "plain fp8 walk");
+    assert_gate_page_accounting(serve, &kv_b, "prompt b mixed step");
+    assert_gate_page_accounting(serve, &kv_c, "prompt c mixed step");
     settle_gate_lanes(
         &host,
         vocab,
@@ -1083,9 +1532,6 @@ fn fp8_plain_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
         &budgets,
         usize::MAX,
     );
-    for (tokens, budget) in produced.iter().zip(budgets) {
-        assert_eq!(tokens.len(), budget, "fp8 mixed lane token budget");
-    }
 }
 
 fn fp8_window_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
@@ -1140,9 +1586,6 @@ fn fp8_window_mixed_walk(ctx: &DeviceContext, serve: &GemmaServe) {
             produced[req].push(next);
         }
         assert_gate_page_accounting(serve, &kv, ["partner", "long prompt"][req]);
-    }
-    for (tokens, budget) in produced.iter().zip(budgets) {
-        assert_eq!(tokens.len(), budget, "fp8 window lane token budget");
     }
 }
 
@@ -1428,7 +1871,7 @@ fn argmax(row: &[f32]) -> usize {
 /// Greedy continuation: prefill the prompt, then decode `max_new`
 /// tokens one at a time. Host argmax over the last position — the
 /// correctness path; sampling belongs to the serving frontend.
-pub(crate) fn generate_greedy(
+fn generate_greedy(
     serve: &GemmaServe,
     ctx: &DeviceContext,
     kv: &mut GemmaKv,
@@ -1474,7 +1917,7 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
     // pool's padding page.
     let pages = lengths
         .iter()
-        .map(|len| (len + STEPS).div_ceil(PAGE_SIZE))
+        .map(|len| (len + STEPS).div_ceil(LOCAL_PAGE_SIZE))
         .sum::<usize>()
         + 1;
     let (ctx, serve, _dir) = stack_with(2048, pages);

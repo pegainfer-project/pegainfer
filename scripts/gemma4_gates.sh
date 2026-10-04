@@ -37,28 +37,27 @@ GPU_LOCK_ROOT=/tmp
 # and a run demands only the union over the gates it selects, so a filter can
 # run a gate without producing the whole suite's prerequisites.
 GATES_NUMERIC_PARITY=(
-  "gpu,ckpt,fixtures serve::oracle::context_waypoints_match_hf"
   "gpu,ckpt,fixtures serve::oracle::fp8_argmax_agreement_meets_the_bf16_floor"
-  "gpu,ckpt,fixtures serve::oracle::greedy_matches_hf_generate"
 )
 GATES_ADMISSION=(
   "gpu,ckpt,prompts serve::oracle::mixed_step_matches_serial"
   "gpu,ckpt,prompts serve::oracle::fp8_mixed_walk_holds_its_structure"
   "gpu,ckpt,prompts engine::lane_gates_walk::the_gathered_walk_does_not_depend_on_its_batching"
   "gpu,ckpt,prompts engine::lane_gates_walk::the_gathered_transient_leaves_headroom"
+  "gpu,ckpt,prompts engine::lane_gates_walk::the_served_bounds_provision_a_split_walk"
 )
 # These production contracts apply to both checkpoint geometries. They stay
 # unique in the ignored-test manifest and expand into two execution profiles.
 GATES_DENSE_AND_ROUTED=(
+  "gpu,ckpt,fixtures serve::oracle::context_waypoints_match_hf"
+  "gpu,ckpt,fixtures serve::oracle::greedy_matches_hf_generate"
   "gpu,ckpt engine::lane_gates_lifecycle::the_shared_lane_lifecycle_completes"
   "gpu,ckpt engine::lane_gates_lifecycle::the_green_lane_lifecycle_completes"
   "gpu,ckpt serve::oracle::overlapped_prefill_matches_the_sync_step"
   "gpu,ckpt serve::oracle::a_ragged_batch_does_not_depend_on_row_order"
 )
 # The idle-refill gate borrows the generate fixture's prompts; the roster-edge
-# gates build their own. The raise refusals are settled by `EngineState::load`
-# before it opens a device or reads a weight, so that one needs the config and
-# nothing else.
+# gates build their own.
 GATES_SERVING_CONTRACT=(
   "gpu,ckpt engine::lane_gates_lifecycle::the_gathered_lifecycle_completes"
   "gpu,ckpt engine::lane_gates_roster::the_coalesce_door_releases_one_admission_burst"
@@ -66,11 +65,23 @@ GATES_SERVING_CONTRACT=(
   "gpu,ckpt engine::lane_gates_roster::the_full_roster_keeps_its_pipeline_under_a_queue"
   "gpu,ckpt,prompts engine::lane_gates_roster::an_idle_refill_matches_a_fresh_engine"
   "gpu,ckpt engine::lane_gates_lifecycle::the_raise_reaches_the_frontend"
-  "ckpt engine::lane_gates_lifecycle::the_raise_refuses_without_its_prerequisites"
+  "gpu,ckpt engine::lane_gates_logprobs::prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode"
+  "gpu,ckpt engine::lane_gates_logprobs::a_scored_prompt_beside_a_live_batch_is_prefilled_whole"
+  "gpu,ckpt engine::lane_gates_logprobs::a_low_slot_chunked_pool_scores_up_to_what_it_holds"
 )
 GATES_KV_AND_LANES=(
   "gpu,ckpt,fixtures serve::oracle::incremental_serving_matches_recompute"
   "gpu,ckpt serve::oracle::prefix_restore_matches_cold_path"
+)
+# The replacement global-attention kernel only exists in a build that had
+# TileLang or a pre-generated directory, and the gate says so rather than
+# passing quietly; it is listed apart because that is a build property, not a
+# prerequisite this script can arrange.
+GATES_TILELANG_GLOBAL=(
+  "gpu,ckpt,prompts,tlgeom serve::oracle::the_replacement_global_kernel_matches_the_incumbent"
+  "gpu,ckpt,prompts,tlgeom serve::oracle::the_replacement_global_decode_matches_the_incumbent"
+  "gpu,ckpt,prompts,tlgeom serve::oracle::the_folded_pool_matches_the_split_one"
+  "gpu,ckpt,tlgeom engine::lane_gates_roster::the_full_roster_serves_through_the_generated_kernels"
 )
 # The disagreeing-config gate deliberately fails before any device is opened.
 GATES_LOADER=(
@@ -98,6 +109,7 @@ GATES_KERNELS_HD256_FP8_POOL=(
   "gpu fp8_finite_window_read_matches_bf16_and_changes_the_result"
   "gpu varied_fp8_window_read_is_geometry_invariant_for_the_probed_row"
   "gpu decode_wrapper_without_fp8_twin_refuses_e4m3"
+  "gpu the_generated_windowed_prefill_refuses_e4m3"
 )
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
@@ -108,6 +120,7 @@ MANIFEST_LIB=(
   "${GATES_LOADER[@]}"
   "${GATES_DEVICE[@]}"
   "${GATES_ROUTED[@]}"
+  "${GATES_TILELANG_GLOBAL[@]}"
 )
 GATES_FP8_PROFILE=(
   "serve::oracle::context_waypoints_match_hf"
@@ -132,14 +145,35 @@ GATES_GEMMA4_TOKENIZER_PARITY=(
   "ckpt,chatgolden string_form_chat_renders_match_hf_reference"
 )
 
-CHAT_GOLDEN=test_data/gemma4-tokenizer-golden.json
-FIXTURES=(
-  test_data/gemma4-12b-hf-golden.safetensors
-  test_data/gemma4-12b-hf-window-golden.safetensors
-  test_data/gemma4-12b-hf-longctx-golden.safetensors
-  test_data/gemma4-12b-generate.safetensors
-)
-PROMPT_FIXTURE=test_data/gemma4-12b-generate.safetensors
+# The fixture set is named by the checkpoint it was dumped from; the
+# committed set is 12b. Another tag selects fixtures dumped for another
+# checkpoint under the same names, and the gates are told where they are.
+FIXTURE_TAG=${PEGAINFER_GEMMA4_FIXTURE_TAG:-12b}
+[[ $FIXTURE_TAG =~ ^[a-z0-9]+$ ]] || { echo "gemma4 gates: PEGAINFER_GEMMA4_FIXTURE_TAG must be alphanumeric" >&2; exit 1; }
+# The committed chat reference predates the tag, so 12b keeps its own name.
+chat_golden_for() {
+  if [ "$1" = 12b ]; then
+    echo "test_data/gemma4-tokenizer-golden.json"
+  else
+    echo "test_data/gemma4-$1-tokenizer-golden.json"
+  fi
+}
+fixtures_for() {
+  printf '%s\n' \
+    "test_data/gemma4-$1-hf-golden.safetensors" \
+    "test_data/gemma4-$1-hf-window-golden.safetensors" \
+    "test_data/gemma4-$1-hf-longctx-golden.safetensors" \
+    "test_data/gemma4-$1-generate.safetensors"
+}
+CHAT_GOLDEN=$(chat_golden_for "$FIXTURE_TAG")
+mapfile -t FIXTURES < <(fixtures_for "$FIXTURE_TAG")
+PROMPT_FIXTURE=${FIXTURES[3]}
+
+# The routed profile compares a different checkpoint against its own
+# references, so it needs a set of its own; the tag above names the dense
+# one. Unset means the routed profile runs only the gates that need no
+# fixture, which is what it did before this existed.
+ROUTED_FIXTURE_TAG=${PEGAINFER_GEMMA4_ROUTED_FIXTURE_TAG:-}
 
 die() { echo "gemma4 gates: $*" >&2; exit 1; }
 
@@ -154,6 +188,11 @@ gate_is_in() {
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || die "cannot enter the repository root"
+export PEGAINFER_GEMMA4_GOLDEN=$root/${FIXTURES[0]}
+export PEGAINFER_GEMMA4_WINDOW_GOLDEN=$root/${FIXTURES[1]}
+export PEGAINFER_GEMMA4_LONGCTX_GOLDEN=$root/${FIXTURES[2]}
+export PEGAINFER_GEMMA4_GENERATE=$root/${FIXTURES[3]}
+export PEGAINFER_GEMMA4_CHAT_GOLDEN=$root/$CHAT_GOLDEN
 
 [ -z "${PEGAINFER_KV_FP8+x}" ] || die \
   "PEGAINFER_KV_FP8 is ambient; PEGAINFER_GATE_STORAGE is the only storage switch"
@@ -263,15 +302,17 @@ require_prompts() {
 }
 
 
-require_fixtures() {
-  require_ckpt
+# A checkpoint and the fixture set dumped from it, held together. The
+# fixtures pin the checkpoint they came from; the gates assert it per-run, but
+# a mismatch should stop the suite before the first load.
+check_fixture_set() {
+  local what=$1 against=$2
+  shift 2
   local fixture
-  for fixture in "${FIXTURES[@]}"; do
-    [ -f "$fixture" ] || die "fixture $fixture is missing (dump it on the test box first)"
+  for fixture in "$@"; do
+    [ -f "$fixture" ] || die "$what fixture $fixture is missing (dump it on the test box first)"
   done
-  # The fixtures pin the checkpoint they were dumped from; the gates assert it
-  # per-run, but a mismatch should stop the suite before the first 12B load.
-  python3 - "$ckpt" "${FIXTURES[@]}" <<'PY' || die "fixture metadata preflight failed"
+  python3 - "$against" "$@" <<'PY' || die "$what fixture metadata preflight failed"
 import hashlib, json, os, struct, sys
 
 ckpt, fixtures = sys.argv[1], sys.argv[2:]
@@ -315,6 +356,57 @@ for name, want in digests.items():
         raise SystemExit(f"{name}: checkpoint digest does not match the fixture's")
 print(f"preflight: {len(fixtures)} fixtures agree on revision {revision[:12]}")
 PY
+}
+
+require_fixtures() {
+  require_ckpt
+  check_fixture_set dense "$ckpt" "${FIXTURES[@]}"
+}
+
+# The routed profile's own set, named by its own tag.
+routed_fixtures=()
+require_routedfixtures() {
+  require_moeckpt
+  [ -n "$ROUTED_FIXTURE_TAG" ] || die \
+    "a routed fixture gate was selected but PEGAINFER_GEMMA4_ROUTED_FIXTURE_TAG is unset"
+  mapfile -t routed_fixtures < <(fixtures_for "$ROUTED_FIXTURE_TAG")
+  check_fixture_set routed "$moe_ckpt" "${routed_fixtures[@]}"
+}
+
+# The generated kernels are compiled for one attention geometry; a gate that
+# declares `tlgeom` is dropped by name where the checkpoint has another.
+tlgeom_mismatch=""
+require_tlgeom() {
+  require_ckpt
+  local generator=pegainfer-gemma4/kernels/generate.py
+  tlgeom_mismatch=$(python3 - "$generator" "$ckpt" <<'PY'
+import json, os, re, sys
+
+generator, ckpt = sys.argv[1], sys.argv[2]
+source = open(generator).read()
+def const(name):
+    match = re.search(rf"^{name} = (\d+)$", source, re.M)
+    if not match:
+        raise SystemExit(f"{generator} no longer states {name}")
+    return int(match.group(1))
+
+heads, groups, head_dim = const("HEADS"), const("GROUPS"), const("HEAD_DIM")
+with open(os.path.join(ckpt, "config.json")) as fh:
+    config = json.load(fh)
+text = config.get("text_config", config)
+theirs = (
+    text["num_attention_heads"],
+    text["num_global_key_value_heads"],
+    text["global_head_dim"],
+)
+if theirs != (heads, groups and heads // groups, head_dim):
+    print(
+        f"the kernels are compiled for {heads} query heads over {heads // groups} "
+        f"at head dim {head_dim}; this checkpoint's global family is "
+        f"{theirs[0]} over {theirs[1]} at {theirs[2]}"
+    )
+PY
+  ) || die "the TileLang geometry preflight failed"
 }
 
 require_chatgolden() {
@@ -429,6 +521,7 @@ manifest_gate_count=${#all_gates[@]}
 for entry in "${GATES_DENSE_AND_ROUTED[@]}"; do
   routed_needs=${entry%% *}
   routed_needs=${routed_needs/ckpt/moeckpt}
+  routed_needs=${routed_needs/fixtures/routedfixtures}
   append_gate "$routed_needs" lib "${entry##* }" routed
 done
 
@@ -444,15 +537,44 @@ for entry in "${all_gates[@]}"; do
 done
 [ ${#selected[@]} -gt 0 ] || die "filter ${filter:-<none>} selected no gate"
 
+# Without a routed set those gates leave the run by name, the way a geometry
+# mismatch does, so the rest of the suite still runs whole.
+if [ -z "$ROUTED_FIXTURE_TAG" ]; then
+  kept=()
+  for entry in "${selected[@]}"; do
+    case ",${entry%%|*}," in
+      *,routedfixtures,*)
+        echo "gemma4 gates: not selected, PEGAINFER_GEMMA4_ROUTED_FIXTURE_TAG is unset: ${entry##*|}" ;;
+      *) kept+=("$entry") ;;
+    esac
+  done
+  selected=("${kept[@]}")
+  [ ${#selected[@]} -gt 0 ] || die "every selected gate needed the routed fixture set"
+fi
+
 # --- prerequisites: the union over what this run selected, and no more -----
 needs=" "
 for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
 needs=" ${needs//,/ } "
 demanded=""
-for want in gpu ckpt moeckpt prompts fixtures chatgolden; do
+for want in gpu ckpt moeckpt prompts fixtures routedfixtures chatgolden tlgeom; do
   case "$needs" in *" $want "*) "require_$want"; demanded="$demanded $want" ;; esac
 done
 echo "gemma4 gates: prerequisites$demanded"
+
+# A gate that declares `tlgeom` has nothing to compare on a checkpoint the
+# kernels were not compiled for, so it leaves the run by name.
+if [ -n "$tlgeom_mismatch" ]; then
+  kept=()
+  for entry in "${selected[@]}"; do
+    case ",${entry%%|*}," in
+      *,tlgeom,*) echo "gemma4 gates: not selected, $tlgeom_mismatch: ${entry##*|}" ;;
+      *) kept+=("$entry") ;;
+    esac
+  done
+  selected=("${kept[@]}")
+  [ ${#selected[@]} -gt 0 ] || die "every selected gate needed the kernels' own geometry"
+fi
 
 echo "gemma4 gates: source $(git rev-parse HEAD)$([ -n "$(git status --porcelain)" ] && echo ' (dirty)')"
 [ -z "$ckpt" ] || echo "gemma4 gates: checkpoint $ckpt"
@@ -492,17 +614,33 @@ for entry in "${selected[@]}"; do
   model_env=()
   case "$profile" in
     dense) model_env=(env "PEGAINFER_TEST_MODEL_PATH=$ckpt") ;;
-    routed) model_env=(env "PEGAINFER_TEST_MODEL_PATH=$moe_ckpt") ;;
+    routed)
+      model_env=(env "PEGAINFER_TEST_MODEL_PATH=$moe_ckpt")
+      # The exported paths name the dense set.
+      if [ -n "$ROUTED_FIXTURE_TAG" ]; then
+        mapfile -t routed_fixtures < <(fixtures_for "$ROUTED_FIXTURE_TAG")
+        model_env+=(
+          "PEGAINFER_GEMMA4_GOLDEN=$root/${routed_fixtures[0]}"
+          "PEGAINFER_GEMMA4_WINDOW_GOLDEN=$root/${routed_fixtures[1]}"
+          "PEGAINFER_GEMMA4_LONGCTX_GOLDEN=$root/${routed_fixtures[2]}"
+          "PEGAINFER_GEMMA4_GENERATE=$root/${routed_fixtures[3]}"
+          "PEGAINFER_GEMMA4_CHAT_GOLDEN=$root/$(chat_golden_for "$ROUTED_FIXTURE_TAG")"
+        )
+      fi
+      ;;
     device) ;;
     *) die "unknown execution profile $profile" ;;
   esac
   if [ "$require_gpu_env" -eq 1 ]; then
     model_env=(env PEGAINFER_REQUIRE_GPU=1)
   fi
+  # A gate that sweeps prints a row per cell, and the build chatter ahead of
+  # it is longer than it looks; at twenty lines the first cells of a nine-cell
+  # sweep fell off and the table reaching the log was missing its worst rows.
   echo "--- [$profile] $gate"
   if "${model_env[@]}" cargo test --release -p "$test_crate" "${feature_args[@]}" \
       "${target_args[@]}" -- \
-      "${ignored_args[@]}" --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -20; then
+      "${ignored_args[@]}" --exact "$gate" --test-threads=1 --nocapture 2>&1 | tail -40; then
     completed=$((completed + 1))
   else
     failed+=("[$profile] $gate")

@@ -1,9 +1,11 @@
-//! Device gate for csrc/shared/prefill_attention_hd512.cu.
+//! Device gate for csrc/gemma4/prefill_attention_hd512.cu.
 //!
 //! Manual gate: CI compiles this but never runs it. Run on a GPU box with
 //! PEGAINFER_REQUIRE_GPU=1, which turns a missing device into a failure
 //! rather than a skip. Traps are in their own binaries — __trap() poisons
 //! the context for whatever runs next.
+
+#![cfg(feature = "gemma4")]
 
 mod common;
 
@@ -11,9 +13,10 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_kernels::ops::Hd512DecodeMetadata;
 use pegainfer_kernels::ops::paged_attention_batch_decode_split_kv_hd512_into;
-use pegainfer_kernels::ops::qk_norm_partial_rope_batched_decode_hd512_into;
 use pegainfer_kernels::ops::qk_norm_partial_rope_paged_decode_hd512_into;
 use pegainfer_kernels::ops::qk_norm_partial_rope_paged_prefill_hd512_into;
+use pegainfer_kernels::paged_kv::KvFormat;
+use pegainfer_kernels::paged_kv::KvStorage;
 use pegainfer_kernels::paged_kv::PagedKvLayout;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceVec;
@@ -36,8 +39,6 @@ const PAGE_SIZE: usize = 2;
 const START_POS: usize = 1;
 // Positions 1..=4 map to pages 3, 7, 7, 5; page 9 is unreferenced.
 const PAGE_INDICES: [i32; 4] = [3, 7, 5, 9];
-// Non-monotonic rows distinguish request positions from token indices.
-const POSITIONS: [i32; 4] = [0, 1, 3, 1];
 // Two layers make a wrong K-layer offset observable.
 const NUM_LAYERS: usize = 2;
 const PAGE_STRIDE: i64 = 8 * HD as i64;
@@ -65,14 +66,19 @@ fn rope_row(row: usize) -> (f32, f32) {
     }
 }
 
-/// Laid out as the kernel indexes them: [pos * rotary_dim + d].
+/// Laid out as the kernel indexes them, `[pos * 512 + d]`: the engine's
+/// proportional tables, with the row's angle in the first ROTARY_DIM / 2
+/// entries and the identity past them.
 fn cos_sin_tables(ctx: &DeviceContext, rows: usize) -> (DeviceVec, DeviceVec) {
-    let mut cos = Vec::with_capacity(rows * ROTARY_DIM);
-    let mut sin = Vec::with_capacity(rows * ROTARY_DIM);
+    let mut cos = Vec::with_capacity(rows * HD);
+    let mut sin = Vec::with_capacity(rows * HD);
     for row in 0..rows {
         let (c, s) = rope_row(row);
-        cos.extend(vec![bf16::from_f32(c); ROTARY_DIM]);
-        sin.extend(vec![bf16::from_f32(s); ROTARY_DIM]);
+        for d in 0..HD {
+            let live = d < HALF_ROTARY;
+            cos.push(bf16::from_f32(if live { c } else { 1.0 }));
+            sin.push(bf16::from_f32(if live { s } else { 0.0 }));
+        }
     }
     (
         DeviceVec::from_host(ctx, &cos).expect("cos H2D"),
@@ -80,17 +86,24 @@ fn cos_sin_tables(ctx: &DeviceContext, rows: usize) -> (DeviceVec, DeviceVec) {
     )
 }
 
+/// The rotated set: `rotate_half` pairs `(d, d + 256)` across the whole
+/// head, and only the first HALF_ROTARY pairs see a live angle.
+fn rotated(d: usize) -> bool {
+    d < HALF_ROTARY || (HD / 2..HD / 2 + HALF_ROTARY).contains(&d)
+}
+
 fn expected_prep(x: f32, w: &[bf16], inv: f32, d: usize, row: usize) -> f32 {
+    const HALF: usize = HD / 2;
     if d < HALF_ROTARY {
         let lo = normed(x, w, inv, d);
-        let hi = normed(x, w, inv, d + HALF_ROTARY);
+        let hi = normed(x, w, inv, d + HALF);
         match row % 3 {
             0 => lo,
             1 => -hi,
             _ => -lo,
         }
-    } else if d < ROTARY_DIM {
-        let lo = normed(x, w, inv, d - HALF_ROTARY);
+    } else if rotated(d) {
+        let lo = normed(x, w, inv, d - HALF);
         let hi = normed(x, w, inv, d);
         match row % 3 {
             0 => hi,
@@ -233,7 +246,6 @@ fn prefill_prep_matches_closed_form() {
         8, // cos_max_pos
         NUM_Q_HEADS,
         NUM_KV_HEADS,
-        ROTARY_DIM,
         EPS,
     )
     .expect("prefill prep launch");
@@ -252,83 +264,123 @@ fn prefill_prep_matches_closed_form() {
     );
 }
 
+/// Relative, for values the query's folded norm weights take past bf16's
+/// integer range: a one-ulp difference in the device's inverse RMS may round
+/// the product to the neighbouring bf16, which at these magnitudes is far
+/// wider than the absolute tolerance the other checks use.
+fn assert_close_rel(got: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(got.len(), expected.len());
+    for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
+        assert!(
+            (g - e).abs() <= 0.02 + 0.01 * e.abs(),
+            "{what}[{i}]: got {g}, expected {e}"
+        );
+    }
+}
+
+/// The folded row from the same inputs: K only at its rotated columns and V
+/// at every column with the rotated ones past the head, both in the
+/// format's permutation, and the query permuted the same way with K's norm
+/// weight folded into its identity columns.
 #[test]
-fn rejects_bad_rotary_dim() {
+fn prefill_prep_folded_row_matches_closed_form() {
     let Some(ctx) = common::device_or_skip() else {
         return;
     };
     let ctx = &ctx;
-    // Zeroed buffers suffice: the launcher must reject before touching any
-    // device memory. Tables are sized for the worst case checked here
-    // (8 x 1024), so the wrapper's table checks pass and both values
-    // actually reach the launcher.
-    let q = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("q alloc");
-    let k = HiddenStates::zeros(ctx, KV_DIM, SEQ_LEN).expect("k alloc");
+    let qw = q_norm_weights();
+    let kw = k_norm_weights();
+    let layer = 1;
+    let format = KvFormat::Folded { rotary: ROTARY_DIM };
+    let layout = PagedKvLayout::with_storage_and_format(
+        NUM_LAYERS,
+        NUM_KV_HEADS,
+        HD,
+        PAGE_SIZE,
+        KvStorage::Bf16,
+        format,
+    );
+    let row_width = format.row_width(HD);
+    let pool_len = 8 * layout.page_stride;
+    let ones_q = vec![bf16::from_f32(Q_INPUT); Q_DIM * SEQ_LEN];
+    let q = HiddenStates::from_host(ctx, &ones_q, Q_DIM, SEQ_LEN).expect("q H2D");
+    let ones_k = vec![bf16::from_f32(K_INPUT); KV_DIM * SEQ_LEN];
+    let k = HiddenStates::from_host(ctx, &ones_k, KV_DIM, SEQ_LEN).expect("k H2D");
     let mut q_out = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("q_out alloc");
-    let mut k_mut = HiddenStates::zeros(ctx, KV_DIM, SEQ_LEN).expect("k_mut alloc");
-    let pool: CudaSlice<bf16> = ctx.stream.alloc_zeros(POOL_LEN).expect("pool alloc");
-    let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
-    let cos_dev = DeviceVec::zeros(ctx, 8 * 1024).expect("cos alloc");
-    let sin_dev = DeviceVec::zeros(ctx, 8 * 1024).expect("sin alloc");
-    let qn = DeviceVec::zeros(ctx, HD).expect("qn alloc");
-    let kn = DeviceVec::zeros(ctx, HD).expect("kn alloc");
+    let (cos_dev, sin_dev) = cos_sin_tables(ctx, 8);
+    let qn = DeviceVec::from_host(ctx, &qw).expect("q_norm_weight H2D");
+    let kn = DeviceVec::from_host(ctx, &kw).expect("k_norm_weight H2D");
+    let pool: CudaSlice<bf16> = ctx.stream.alloc_zeros(pool_len).expect("pool alloc");
     let page_indices: CudaSlice<i32> = ctx
         .stream
         .clone_htod(&PAGE_INDICES)
         .expect("page_indices H2D");
-    let positions: CudaSlice<i32> = ctx.stream.clone_htod(&POSITIONS).expect("positions H2D");
 
-    // 127: odd — index 126 would never be written. 1024: wider than the
-    // head — smem and the output slices would walk past 512. Both must be
-    // rejected, not silently accepted.
-    for bad in [127, 1024] {
-        let prefill_err = qk_norm_partial_rope_paged_prefill_hd512_into(
-            ctx,
-            &q,
-            &k,
-            &mut q_out,
-            0,
-            &pool,
-            &layout,
-            &qn,
-            &kn,
-            &cos_dev,
-            &sin_dev,
-            0, // layer
-            &page_indices,
-            0,
-            0, // start_pos
-            8, // cos_max_pos
-            NUM_Q_HEADS,
-            NUM_KV_HEADS,
-            bad,
-            EPS,
-        );
-        assert!(
-            prefill_err.is_err(),
-            "prefill: rotary_dim={bad} must be rejected"
-        );
-        let decode_err = qk_norm_partial_rope_batched_decode_hd512_into(
-            ctx,
-            &q,
-            &mut q_out,
-            &mut k_mut,
-            &qn,
-            &kn,
-            &cos_dev,
-            &sin_dev,
-            &positions,
-            8, // cos_max_pos
-            NUM_Q_HEADS,
-            NUM_KV_HEADS,
-            bad,
-            EPS,
-        );
-        assert!(
-            decode_err.is_err(),
-            "decode: rotary_dim={bad} must be rejected"
-        );
+    qk_norm_partial_rope_paged_prefill_hd512_into(
+        ctx,
+        &q,
+        &k,
+        &mut q_out,
+        0,
+        &pool,
+        &layout,
+        &qn,
+        &kn,
+        &cos_dev,
+        &sin_dev,
+        layer,
+        &page_indices,
+        0,
+        START_POS,
+        8, // cos_max_pos
+        NUM_Q_HEADS,
+        NUM_KV_HEADS,
+        EPS,
+    )
+    .expect("folded prefill prep launch");
+
+    let inv_q = inv_rms(Q_INPUT);
+    let mut q_exp = vec![0.0f32; Q_DIM * SEQ_LEN];
+    for t in 0..SEQ_LEN {
+        for h in 0..NUM_Q_HEADS {
+            for d in 0..HD {
+                let col = format.permute(HD, d);
+                q_exp[t * Q_DIM + h * HD + col] = if rotated(d) {
+                    expected_prep(Q_INPUT, &qw, inv_q, d, START_POS + t)
+                } else {
+                    bf16::from_f32(Q_INPUT * inv_q * qw[d].to_f32() * kw[d].to_f32()).to_f32()
+                };
+            }
+        }
     }
+    let qo = q_out.to_host(ctx).expect("q_out D2H");
+    assert_close_rel(&qo, &q_exp, "folded query");
+
+    let inv_k = inv_rms(K_INPUT);
+    let v_val = bf16::from_f32(K_INPUT * inv_k).to_f32();
+    let mut pool_exp = vec![0.0f32; pool_len];
+    for t in 0..SEQ_LEN {
+        let pos = START_POS + t;
+        let page = PAGE_INDICES[pos / PAGE_SIZE] as usize;
+        for h in 0..NUM_KV_HEADS {
+            let base = page * layout.page_stride
+                + layer * layout.layer_stride
+                + (pos % PAGE_SIZE) * NUM_KV_HEADS * row_width
+                + h * row_width;
+            for d in 0..HD {
+                let col = format.permute(HD, d);
+                if rotated(d) {
+                    pool_exp[base + col] = expected_prep(K_INPUT, &kw, inv_k, d, pos);
+                    pool_exp[base + HD + col] = v_val;
+                } else {
+                    pool_exp[base + col] = v_val;
+                }
+            }
+        }
+    }
+    let pool_host: Vec<bf16> = ctx.stream.clone_dtoh(&pool).expect("pool D2H");
+    let pool_f: Vec<f32> = pool_host.iter().map(|x| x.to_f32()).collect();
+    assert_pool(&pool_f, &pool_exp);
 }
 
 #[test]
@@ -346,8 +398,8 @@ fn prefill_rejects_position_beyond_cos_table() {
     let mut q_out = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("q_out alloc");
     let pool: CudaSlice<bf16> = ctx.stream.alloc_zeros(POOL_LEN).expect("pool alloc");
     let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
-    let cos_dev = DeviceVec::zeros(ctx, 4 * ROTARY_DIM).expect("cos alloc");
-    let sin_dev = DeviceVec::zeros(ctx, 4 * ROTARY_DIM).expect("sin alloc");
+    let cos_dev = DeviceVec::zeros(ctx, 4 * HD).expect("cos alloc");
+    let sin_dev = DeviceVec::zeros(ctx, 4 * HD).expect("sin alloc");
     let qn = DeviceVec::zeros(ctx, HD).expect("qn alloc");
     let kn = DeviceVec::zeros(ctx, HD).expect("kn alloc");
     let page_indices: CudaSlice<i32> = ctx
@@ -374,7 +426,6 @@ fn prefill_rejects_position_beyond_cos_table() {
         4, // cos_max_pos
         NUM_Q_HEADS,
         NUM_KV_HEADS,
-        ROTARY_DIM,
         EPS,
     );
     assert!(
@@ -401,8 +452,8 @@ fn prefill_rejects_undersized_kv_pool() {
     let k = HiddenStates::zeros(ctx, KV_DIM, SEQ_LEN).expect("k alloc");
     let mut q_out = HiddenStates::zeros(ctx, Q_DIM, SEQ_LEN).expect("q_out alloc");
     let layout = PagedKvLayout::new(NUM_LAYERS, NUM_KV_HEADS, HD, PAGE_SIZE);
-    let cos_dev = DeviceVec::zeros(ctx, 8 * ROTARY_DIM).expect("cos alloc");
-    let sin_dev = DeviceVec::zeros(ctx, 8 * ROTARY_DIM).expect("sin alloc");
+    let cos_dev = DeviceVec::zeros(ctx, 8 * HD).expect("cos alloc");
+    let sin_dev = DeviceVec::zeros(ctx, 8 * HD).expect("sin alloc");
     let qn = DeviceVec::zeros(ctx, HD).expect("qn alloc");
     let kn = DeviceVec::zeros(ctx, HD).expect("kn alloc");
     let page_indices: CudaSlice<i32> = ctx
@@ -431,7 +482,6 @@ fn prefill_rejects_undersized_kv_pool() {
             8, // cos_max_pos
             NUM_Q_HEADS,
             NUM_KV_HEADS,
-            ROTARY_DIM,
             EPS,
         );
         let Err(e) = err else {
@@ -519,7 +569,6 @@ fn decode_prep_row_offset_serves_only_the_suffix() {
             8,
             NUM_Q_HEADS,
             NUM_KV_HEADS,
-            ROTARY_DIM,
             EPS,
         )
         .expect("decode prep launch");
@@ -621,7 +670,6 @@ fn split_read_row_offset_serves_only_the_suffix() {
         8,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
-        ROTARY_DIM,
         EPS,
     )
     .expect("pool populate");
@@ -652,8 +700,15 @@ fn split_read_row_offset_serves_only_the_suffix() {
         let mut tmp_v: CudaSlice<bf16> = ctx.stream.alloc_zeros(2 * read_dim).expect("tmp_v alloc");
         let mut tmp_s: CudaSlice<f32> =
             ctx.stream.alloc_zeros(2 * read_heads).expect("tmp_s alloc");
-        let meta =
-            Hd512DecodeMetadata::new(&pages_d, &indptr_d, &last_d, &req_d, &tile_d, &chunk_d);
+        let meta = Hd512DecodeMetadata::new(
+            &pages_d,
+            &indptr_d,
+            &last_d,
+            &req_d,
+            &tile_d,
+            &chunk_d,
+            chunk[0] as usize,
+        );
         paged_attention_batch_decode_split_kv_hd512_into(
             ctx,
             &q,
@@ -761,7 +816,6 @@ fn prefill_prep_row_offset_serves_only_the_suffix() {
                 8,
                 NUM_Q_HEADS,
                 NUM_KV_HEADS,
-                ROTARY_DIM,
                 EPS,
             )
             .expect("prefill prep launch");

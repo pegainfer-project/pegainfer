@@ -367,6 +367,22 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         inner.free.len() + inner.inactive.len()
     }
 
+    pub(crate) fn active_prefix_len(&self, hashes: &[SequenceHash]) -> usize {
+        let inner = self.inner.lock();
+        hashes
+            .iter()
+            .take_while(|hash| {
+                let Some(&block_id) = inner.active_by_hash.get(hash) else {
+                    return false;
+                };
+                match &inner.slots[block_id].state {
+                    SlotState::Primary { inner, .. } => inner.strong_count() > 0,
+                    other => panic!("active_by_hash[{hash:?}] = {block_id} but slot is {other:?}"),
+                }
+            })
+            .count()
+    }
+
     pub(crate) fn has_inactive(&self, seq_hash: SequenceHash) -> bool {
         self.inner.lock().inactive.has(seq_hash)
     }

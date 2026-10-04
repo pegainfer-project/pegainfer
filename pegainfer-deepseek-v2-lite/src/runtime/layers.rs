@@ -57,6 +57,7 @@ impl DeepSeekV2LiteEp2Generator {
             cache.layers.len() == self.rank0.layers.len(),
             "decode cache layer count mismatch"
         );
+        let deferred_device_routes = self.begin_device_routed_forward(hidden.seq_len)?;
         for layer_idx in 0..self.rank0.layers.len() {
             hidden = self
                 .forward_layer(
@@ -70,6 +71,10 @@ impl DeepSeekV2LiteEp2Generator {
                     token_index,
                 )
                 .with_context(|| format!("DeepSeek-V2-Lite layer {layer_idx}"))?;
+        }
+        if deferred_device_routes {
+            let (local_routes, remote_routes) = self.finish_device_routed_forward()?;
+            stats.record_routes(EpBackendKind::Nccl, local_routes, remote_routes);
         }
         Ok(hidden)
     }
@@ -95,6 +100,7 @@ impl DeepSeekV2LiteEp2Generator {
                 .all(|cache| cache.layers.len() == self.rank0.layers.len()),
             "batched decode cache layer count mismatch"
         );
+        let deferred_device_routes = self.begin_device_routed_forward(hidden.seq_len)?;
         for layer_idx in 0..self.rank0.layers.len() {
             let mut layer_caches: Vec<_> = caches
                 .iter_mut()
@@ -111,6 +117,10 @@ impl DeepSeekV2LiteEp2Generator {
                     token_index,
                 )
                 .with_context(|| format!("DeepSeek-V2-Lite batched layer {layer_idx}"))?;
+        }
+        if deferred_device_routes {
+            let (local_routes, remote_routes) = self.finish_device_routed_forward()?;
+            stats.record_routes(EpBackendKind::Nccl, local_routes, remote_routes);
         }
         Ok(hidden)
     }

@@ -555,6 +555,15 @@ pub struct HiddenStates {
 }
 
 impl HiddenStates {
+    /// The band `[col, col + width)` of every row.
+    pub fn columns(&self, col: usize, width: usize) -> Columns<'_> {
+        Columns {
+            states: self,
+            col,
+            width,
+        }
+    }
+
     pub fn as_ref(&self) -> HiddenStatesRef<'_> {
         HiddenStatesRef {
             data: &self.data,
@@ -742,6 +751,26 @@ pub struct HiddenStatesRef<'a> {
     pub data: &'a CudaSlice<bf16>,
     pub hidden_dim: usize,
     pub seq_len: usize,
+}
+
+/// The columns `[col, col + width)` of every row of a `HiddenStates`: the
+/// band one projection occupies when a row holds several, read at the row's
+/// full stride. A whole tensor is its own band from column 0.
+#[derive(Clone, Copy)]
+pub struct Columns<'a> {
+    pub states: &'a HiddenStates,
+    pub col: usize,
+    pub width: usize,
+}
+
+impl<'a> From<&'a HiddenStates> for Columns<'a> {
+    fn from(states: &'a HiddenStates) -> Self {
+        Self {
+            states,
+            col: 0,
+            width: states.hidden_dim,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -38,6 +38,7 @@ use super::step::RequestUpdate;
 use super::step::ScheduledInfo;
 use super::step::StepOutputs;
 use super::step::Terminal;
+use super::stop::StopCause;
 
 /// One open account: the request's admission facts and running tally. The
 /// payload is not here — it went to the scheduler at `submit`; the account is
@@ -239,12 +240,23 @@ impl RequestLedger {
 
     /// Finish the request. Token counts come from the ledger's tally.
     pub fn finish(&mut self, id: RequestId, reason: FinishReason) {
+        self.finish_with_cause(id, reason, None);
+    }
+
+    /// Finish a request while preserving a typed token-level stop cause.
+    pub fn finish_with_cause(
+        &mut self,
+        id: RequestId,
+        reason: FinishReason,
+        stop_cause: Option<StopCause>,
+    ) {
         let account = self.close(id);
         let AccountState::Active { completion_tokens } = account.state else {
             panic!("finish on {id} before admission");
         };
         self.statement.entry(id).terminal = Some(Terminal::Finished {
             reason,
+            stop_cause,
             prompt_tokens: account.prompt_len,
             completion_tokens,
         });
@@ -279,6 +291,16 @@ impl RequestLedger {
     /// this step — tokens included — folds into the returned message, so late
     /// delivery cannot reorder against the step stream.
     pub fn defer_finish(&mut self, id: RequestId, reason: FinishReason) -> DeferredFinish {
+        self.defer_finish_with_cause(id, reason, None)
+    }
+
+    /// Defer a finish while preserving a typed token-level stop cause.
+    pub fn defer_finish_with_cause(
+        &mut self,
+        id: RequestId,
+        reason: FinishReason,
+        stop_cause: Option<StopCause>,
+    ) -> DeferredFinish {
         let account = self.close(id);
         let AccountState::Active { completion_tokens } = account.state else {
             panic!("defer_finish on {id} before admission");
@@ -289,6 +311,7 @@ impl RequestLedger {
             .unwrap_or_else(|| RequestUpdate::empty(id));
         update.terminal = Some(Terminal::Finished {
             reason,
+            stop_cause,
             prompt_tokens: account.prompt_len,
             completion_tokens,
         });
@@ -316,12 +339,10 @@ impl RequestLedger {
         }
     }
 
-    /// Ship the step's statement as one message; a step that touched nothing
-    /// ships nothing. Called once per driver iteration — model code never
-    /// calls this (the driver owns the cadence).
-    pub(crate) fn commit_step(&mut self) {
+    /// Commit the buffered updates as described by [`StepOutputs`].
+    pub(crate) fn commit_step(&mut self, metrics_changed: bool) {
         let updates = self.statement.take_updates();
-        if updates.is_empty() {
+        if updates.is_empty() && !metrics_changed {
             return;
         }
         // A closed receiver means the frontend is gone; the driver notices
@@ -374,6 +395,7 @@ mod tests {
     use super::super::request_lifecycle::StepReceiver;
     use super::super::step::Request;
     use super::super::step::Terminal;
+    use super::super::stop::StopPolicy;
     use super::super::wiring::SchedulerHandle;
     use super::super::wiring::scheduler_pair;
     use super::*;
@@ -382,6 +404,7 @@ mod tests {
         Request {
             prompt_tokens: prompt,
             params: crate::sampler::SamplingParams::default(),
+            stop_policy: StopPolicy::default(),
             max_tokens: 8,
             lora_adapter: None,
             kv_transfer_params: None,
@@ -402,8 +425,10 @@ mod tests {
         backend.ledger.admit(id);
         backend.ledger.push_tokens(id, &[10, 11], &[]);
         backend.ledger.set_cached_tokens(id, 2);
-        backend.ledger.finish(id, FinishReason::Stop);
-        backend.ledger.commit_step();
+        backend
+            .ledger
+            .finish_with_cause(id, FinishReason::Stop, Some(StopCause::Token(11)));
+        backend.ledger.commit_step(false);
 
         let mut steps = handle_steps(handle);
         let step = steps.try_recv().expect("one step message");
@@ -419,6 +444,7 @@ mod tests {
             update.terminal,
             Some(Terminal::Finished {
                 reason: FinishReason::Stop,
+                stop_cause: Some(StopCause::Token(11)),
                 prompt_tokens: 3,
                 completion_tokens: 2,
             })
@@ -440,7 +466,7 @@ mod tests {
                 limit: 4,
             },
         );
-        backend.ledger.commit_step();
+        backend.ledger.commit_step(false);
 
         let step = handle_steps(handle).try_recv().expect("step");
         let update = &step.updates[0];
@@ -464,7 +490,7 @@ mod tests {
         backend.ledger.admit(id);
         backend.ledger.push_tokens(id, &[9], &[]);
         backend.ledger.retire(id);
-        backend.ledger.commit_step();
+        backend.ledger.commit_step(false);
 
         // Scheduled was buffered before the retire extracted the entry, so
         // nothing observable remains this step.
@@ -479,8 +505,10 @@ mod tests {
         let id = backend.ledger.register(envelope).id;
         backend.ledger.admit(id);
         backend.ledger.push_tokens(id, &[7], &[]);
-        let deferred = backend.ledger.defer_finish(id, FinishReason::Length);
-        backend.ledger.commit_step();
+        let deferred = backend
+            .ledger
+            .defer_finish_with_cause(id, FinishReason::Length, None);
+        backend.ledger.commit_step(false);
 
         let mut steps = handle_steps(handle);
         // The request's whole record rode into the deferred finish; the step
@@ -498,6 +526,7 @@ mod tests {
             update.terminal,
             Some(Terminal::Finished {
                 reason: FinishReason::Length,
+                stop_cause: None,
                 prompt_tokens: 2,
                 completion_tokens: 1,
             })

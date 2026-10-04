@@ -20,7 +20,6 @@ fn check_cu(result: sys::CUresult, msg: &str) -> Result<()> {
 
 struct GreenContexts {
     gctx_prefill: sys::CUgreenCtx,
-    _ctx_prefill: sys::CUcontext,
 }
 
 fn sm_for_prefill(total_sm: u32, min_sm: u32, prefill_pct: u32) -> Option<u32> {
@@ -54,7 +53,7 @@ impl PrefillLaneStream {
             },
             "cuStreamCreate (prefill lane)",
         )?;
-        log::info!("gemma4 async prefill: shared-SM lane stream");
+        log::info!("async prefill: shared-SM lane stream");
         Ok(Self {
             stream,
             green: None,
@@ -63,7 +62,8 @@ impl PrefillLaneStream {
 
     /// A Green Context stream pinned to roughly `prefill_pct`% of the SMs
     /// (rounded down to the split granularity). Fails loudly rather than
-    /// falling back to shared SMs, so benchmarks stay honest.
+    /// falling back to shared SMs, so a pinned lane is never silently
+    /// unpinned.
     pub(crate) fn green(device_ordinal: usize, prefill_pct: u32) -> Result<Self> {
         let device: CUdevice = device_ordinal as i32;
         let mut sm_res: sys::CUdevResource = unsafe { std::mem::zeroed() };
@@ -141,12 +141,6 @@ impl PrefillLaneStream {
             },
             "cuGreenCtxCreate (prefill)",
         )?;
-        let mut ctx_prefill: sys::CUcontext = std::ptr::null_mut();
-        check_cu(
-            unsafe { sys::cuCtxFromGreenCtx(&raw mut ctx_prefill, gctx_prefill) },
-            "cuCtxFromGreenCtx (prefill)",
-        )?;
-
         let mut stream: CUstream = std::ptr::null_mut();
         let create = unsafe {
             sys::cuGreenCtxStreamCreate(
@@ -164,15 +158,12 @@ impl PrefillLaneStream {
         }
 
         log::info!(
-            "gemma4 async prefill: green-ctx lane pinned to {sm_prefill}/{total_sm} SMs \
+            "async prefill: green-ctx lane pinned to {sm_prefill}/{total_sm} SMs \
              (decode keeps the primary context)"
         );
         Ok(Self {
             stream,
-            green: Some(GreenContexts {
-                gctx_prefill,
-                _ctx_prefill: ctx_prefill,
-            }),
+            green: Some(GreenContexts { gctx_prefill }),
         })
     }
 

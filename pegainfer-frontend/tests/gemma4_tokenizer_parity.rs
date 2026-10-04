@@ -27,26 +27,34 @@ use vllm_chat::LoadModelBackendsOptions;
 use vllm_chat::load_model_backends;
 use vllm_text::Prompt;
 
-const GOLDEN_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../test_data/gemma4-tokenizer-golden.json"
-);
+/// The committed reference, unless the variable points at one dumped from
+/// another checkpoint.
+fn golden_path() -> String {
+    std::env::var("PEGAINFER_GEMMA4_CHAT_GOLDEN").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_data/gemma4-tokenizer-golden.json"
+        )
+        .to_string()
+    })
+}
 
 fn golden() -> Value {
-    let raw = std::fs::read_to_string(GOLDEN_PATH)
-        .unwrap_or_else(|err| panic!("failed to read {GOLDEN_PATH}: {err}"));
-    serde_json::from_str(&raw).unwrap_or_else(|err| panic!("failed to parse {GOLDEN_PATH}: {err}"))
+    let path = golden_path();
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {path}: {err}"));
+    serde_json::from_str(&raw).unwrap_or_else(|err| panic!("failed to parse {path}: {err}"))
 }
 
 fn model_path() -> String {
     std::env::var("PEGAINFER_TEST_MODEL_PATH").expect(
-        "PEGAINFER_TEST_MODEL_PATH must point at the pinned 12B Gemma 4 checkpoint \
-         the reference was dumped from",
+        "PEGAINFER_TEST_MODEL_PATH must point at the Gemma 4 checkpoint the \
+         reference was dumped from",
     )
 }
 
 /// Guards every parity test: the fixture only means something against the exact
-/// checkpoint it was dumped from, which is the pinned 12B one.
+/// checkpoint it was dumped from.
 fn assert_checkpoint_matches_reference(golden: &Value) {
     let dir = model_path();
     let expected = golden["file_sha256"]

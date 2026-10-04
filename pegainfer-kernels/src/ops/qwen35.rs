@@ -1,269 +1,367 @@
-//! Qwen3.5 candidate GPU operations.
-//!
-//! Generated CuTe symbols, tensor wrappers, TMA descriptors, module lifetime,
-//! and the low-level launch ABI stop below this module. Model crates see only
-//! semantic geometry, validated recipes and device buffers.
+//! Qwen3.5 HD256 attention and explicit FlashInfer GDN candidate operations.
 
-use std::ffi::c_void;
-use std::ptr::NonNull;
-
-use anyhow::Context;
+mod decode_gemm;
+mod gdn;
 use anyhow::Result;
-use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
+pub use decode_gemm::Qwen35DecodeGemm;
+pub use gdn::Qwen35GdnAot;
+pub use gdn::Qwen35GdnGeometry;
+pub use gdn::Qwen35GdnWorkspace;
+use half::bf16;
 
+use super::PrefillPagedPlan;
+use super::attention::PagedGeometry;
+use super::attention::checked_paged_geometry;
 use crate::ffi;
+use crate::paged_kv::PagedKvLayout;
 use crate::tensor::DeviceContext;
+use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
 
-mod decode_gemm;
-pub use decode_gemm::Qwen35DecodeGemm;
+/// Batched QK RMSNorm + partial RoPE for Qwen3.5 HD256 decode.
+///
+/// Reads Q from interleaved `q_full` ([q, gate] per head), writes prepared Q into `q`,
+/// and normalizes/applies partial RoPE to `k` in-place using per-request positions.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_partial_rope_batched_decode_hd256_into(
+    ctx: &DeviceContext,
+    q_full: &HiddenStates,
+    q: &mut HiddenStates,
+    k: &mut HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    positions_d: &CudaSlice<i32>,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+) {
+    let batch_size = q.seq_len;
+    debug_assert_eq!(q_full.seq_len, batch_size);
+    debug_assert_eq!(k.seq_len, batch_size);
 
-const QWEN35_GDN_ABI_VERSION: u32 = 3;
-const STATUS_OK: i32 = 0;
+    let (qf_ptr, _gqf) = q_full.data.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (pos_ptr, _gp) = positions_d.device_ptr(&ctx.stream);
 
-#[derive(Clone, Copy, Debug)]
-struct ArtifactIdentity(&'static str);
-
-include!(concat!(env!("OUT_DIR"), "/qwen35_gdn_identity.rs"));
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Qwen35GdnGeometry {
-    pub h_q: usize,
-    pub h_k: usize,
-    pub h_v: usize,
-    pub head_dim: usize,
+    unsafe {
+        ffi::qk_norm_partial_rope_batched_decode_hd256_cuda(
+            qf_ptr as *const ffi::Half,
+            k_ptr as *mut ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            pos_ptr as *const i32,
+            q_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            batch_size as i32,
+            rotary_dim as i32,
+            rms_eps,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
 }
 
-impl Qwen35GdnGeometry {
-    pub const PRODUCTION: Self = Self {
-        h_q: 16,
-        h_k: 16,
-        h_v: 32,
-        head_dim: 128,
+#[allow(clippy::too_many_arguments)]
+fn scatter_decode_kv_into_paged(
+    ctx: &DeviceContext,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    page_indices_d: &CudaSlice<i32>,
+    page_indptr_d: &CudaSlice<i32>,
+    last_page_len_d: &CudaSlice<i32>,
+    positions_d: &CudaSlice<i32>,
+    request_indices_d: &CudaSlice<i32>,
+    batch_size: usize,
+    op_name: &str,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    let page_size = layout.page_size;
+
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        op_name,
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = last_page_len_d.device_ptr(&ctx.stream);
+    let (pos_ptr, _gpos) = positions_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = request_indices_d.device_ptr(&ctx.stream);
+
+    let src_stride_n = (num_kv_heads * head_dim) as i64;
+    let src_stride_h = head_dim as i64;
+    let result = unsafe {
+        ffi::paged_kv_scatter_cuda(
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            ri_ptr as *const i32,
+            pos_ptr as *const i32,
+            batch_size as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            stride_page,
+            src_stride_n,
+            src_stride_h,
+            crate::tensor::active_cu_stream(ctx),
+        )
     };
+    if result != 0 {
+        anyhow::bail!(
+            "paged_kv_scatter_cuda ({op_name}) failed for layer {layer}, bs={batch_size}, \
+             kv_heads={num_kv_heads}, head_dim={head_dim}, page_size={page_size}: {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    Ok(())
 }
 
-#[derive(Debug)]
-pub struct Qwen35GdnAot {
-    handle: NonNull<c_void>,
-    device_ordinal: usize,
-    workspace_bytes: usize,
-    artifact_identity: ArtifactIdentity,
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_batch_decode_hd256_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    page_indices_d: &CudaSlice<i32>,
+    page_indptr_d: &CudaSlice<i32>,
+    last_page_len_d: &CudaSlice<i32>,
+    positions_d: &CudaSlice<i32>,
+    request_indices_d: &CudaSlice<i32>,
+    kv_tile_indices_d: &CudaSlice<i32>,
+    kv_chunk_size_d: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    batch_size: usize,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    debug_assert_eq!(head_dim, 256);
+    let page_size = layout.page_size;
+
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd256 decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = last_page_len_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = request_indices_d.device_ptr(&ctx.stream);
+    let (kti_ptr, _gkti) = kv_tile_indices_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = kv_chunk_size_d.device_ptr(&ctx.stream);
+
+    let stream = crate::tensor::active_cu_stream(ctx);
+
+    scatter_decode_kv_into_paged(
+        ctx,
+        k,
+        v,
+        kv_buffer,
+        layout,
+        layer,
+        page_indices_d,
+        page_indptr_d,
+        last_page_len_d,
+        positions_d,
+        request_indices_d,
+        batch_size,
+        "batch hd256 decode",
+    )?;
+
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let result = unsafe {
+        ffi::paged_attention_decode_cuda_hd256(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            ri_ptr as *const i32,
+            kti_ptr as *const i32,
+            kcs_ptr as *const i32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            batch_size as i32,
+            stride_page,
+            sm_scale,
+            stream,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "paged_attention_decode_cuda_hd256 (batch) failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+
+    Ok(())
 }
 
-pub struct Qwen35GdnWorkspace {
-    workspace: CudaSlice<u8>,
-    cu_seqlens: CudaSlice<i64>,
-    tokens: usize,
-}
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_batch_decode_via_prefill_hd256_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    plan: &PrefillPagedPlan,
+    positions_d: &CudaSlice<i32>,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    batch_size: usize,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    debug_assert_eq!(head_dim, 256);
+    anyhow::ensure!(
+        batch_size == plan.total_tokens && batch_size == plan.batch_size() as usize,
+        "decode-via-prefill plan shape mismatch: bs={batch_size}, total_tokens={}, plan_batch={}",
+        plan.total_tokens,
+        plan.batch_size()
+    );
 
-// The handle is bound to one CUDA device and all launches are issued by the
-// owning model thread on its DeviceContext stream.
-unsafe impl Send for Qwen35GdnAot {}
+    scatter_decode_kv_into_paged(
+        ctx,
+        k,
+        v,
+        kv_buffer,
+        layout,
+        layer,
+        &plan.page_indices_d,
+        &plan.page_indptr_d,
+        &plan.last_page_len_d,
+        positions_d,
+        &plan.batch_indices_d,
+        batch_size,
+        "batch hd256 decode via prefill",
+    )?;
 
-impl Qwen35GdnAot {
-    pub fn load_for_production(ctx: &DeviceContext, geometry: Qwen35GdnGeometry) -> Result<Self> {
-        ensure!(
-            ctx.stream.context() == &ctx.ctx,
-            "Qwen3.5 GDN stream/context mismatch"
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd256 decode via prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = plan.page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = plan.page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = plan.last_page_len_d.device_ptr(&ctx.stream);
+    let (qi_ptr, _gqi) = plan.q_indptr_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = plan.request_indices_d.device_ptr(&ctx.stream);
+    let (qti_ptr, _gqti) = plan.qo_tile_indices_d.device_ptr(&ctx.stream);
+    let (kti_ptr, _gkti) = plan.kv_tile_indices_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (tnr_ptr, _gtnr) = plan.total_num_rows_d.device_ptr(&ctx.stream);
+
+    let result = unsafe {
+        ffi::batch_prefill_paged_cuda_hd256(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            qi_ptr as *const i32,
+            ri_ptr as *const i32,
+            qti_ptr as *const i32,
+            kti_ptr as *const i32,
+            kcs_ptr as *const i32,
+            tnr_ptr as *const u32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            layout.page_size as i32,
+            batch_size as i32,
+            plan.batch_size(),
+            plan.num_tiles,
+            stride_page,
+            sm_scale,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "batch_prefill_paged_cuda_hd256 (decode via prefill) failed for layer {layer}, \
+             bs={batch_size}, tiles={}, qo_heads={num_qo_heads}, kv_heads={num_kv_heads}: {result}{}",
+            plan.num_tiles,
+            crate::ops::ffi_exception_message(result)
         );
-        let device_ordinal = ctx.ctx.ordinal();
-        let (major, minor) = ctx.ctx.compute_capability()?;
-        let sm = major * 10 + minor;
-        ensure!(
-            sm == 120,
-            "Qwen3.5 FlashInfer candidate requires SM120, got SM{sm}"
-        );
-        ensure!(
-            geometry == Qwen35GdnGeometry::PRODUCTION,
-            "Qwen3.5 FlashInfer candidate requires Hq=16/Hk=16/Hv=32/D=128, got {geometry:?}"
-        );
-        ensure!(
-            unsafe { ffi::pegainfer_qwen35_gdn_abi_version() } == QWEN35_GDN_ABI_VERSION,
-            "Qwen3.5 GDN stable C ABI version mismatch"
-        );
-        ensure!(
-            unsafe { ffi::pegainfer_qwen35_gdn_aot_available() } == 1,
-            "Qwen3.5 FlashInfer candidate was explicitly selected, but no AOT candidate was linked; set PEGAINFER_QWEN35_GDN_AOT_BUNDLE at build time"
-        );
-        let artifact_identity =
-            ARTIFACT_IDENTITY.context("Qwen3.5 GDN artifact identity is absent")?;
-        let mut raw = std::ptr::null_mut();
-        let status =
-            unsafe { ffi::pegainfer_qwen35_gdn_create(&raw mut raw, device_ordinal as i32) };
-        ensure!(
-            status == STATUS_OK,
-            "Qwen3.5 GDN preload failed with stable ABI status {status}"
-        );
-        let handle = NonNull::new(raw).context("Qwen3.5 GDN preload returned a null handle")?;
-        let mut workspace_bytes = 0;
-        let status = unsafe {
-            ffi::pegainfer_qwen35_gdn_workspace_bytes(handle.as_ptr(), &raw mut workspace_bytes)
-        };
-        if status != STATUS_OK || workspace_bytes == 0 || workspace_bytes > i32::MAX as usize {
-            unsafe { ffi::pegainfer_qwen35_gdn_destroy(handle.as_ptr()) };
-            anyhow::bail!(
-                "Qwen3.5 GDN workspace query failed: stable ABI status {status}, bytes={workspace_bytes}"
-            );
-        }
-        Ok(Self {
-            handle,
-            device_ordinal,
-            workspace_bytes,
-            artifact_identity,
-        })
     }
 
-    /// Device workspace reserved alongside native prefill buffers in KV budgeting.
-    pub fn workspace_bytes(&self) -> usize {
-        self.workspace_bytes
-    }
-
-    pub fn artifact_sha256(&self) -> &'static str {
-        self.artifact_identity.0
-    }
-
-    pub fn allocate_workspace(
-        &self,
-        ctx: &DeviceContext,
-        tokens: usize,
-    ) -> Result<Qwen35GdnWorkspace> {
-        ensure!(
-            ctx.stream.context() == &ctx.ctx && ctx.ctx.ordinal() == self.device_ordinal,
-            "Qwen3.5 GDN workspace context mismatch"
-        );
-        ensure!(
-            tokens > 0 && tokens <= (i32::MAX as usize / Qwen35GdnGeometry::PRODUCTION.h_v),
-            "Qwen3.5 GDN T must fit the generated i32 gate extent"
-        );
-        let workspace = ctx
-            .stream
-            .alloc_zeros(self.workspace_bytes)
-            .map_err(|error| anyhow::anyhow!("allocate Qwen3.5 GDN workspace: {error}"))?;
-        let end = i64::try_from(tokens).context("Qwen3.5 GDN T exceeds i64")?;
-        let cu_seqlens = ctx
-            .stream
-            .clone_htod(&[0_i64, end])
-            .map_err(|error| anyhow::anyhow!("upload Qwen3.5 GDN sequence metadata: {error}"))?;
-        Ok(Qwen35GdnWorkspace {
-            workspace,
-            cu_seqlens,
-            tokens,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_in_place(
-        &self,
-        ctx: &DeviceContext,
-        q: &HiddenStates,
-        k: &HiddenStates,
-        v: &HiddenStates,
-        alpha: &CudaSlice<f32>,
-        beta: &CudaSlice<f32>,
-        state: &mut CudaSlice<f32>,
-        output: &mut HiddenStates,
-        launch_workspace: &mut Qwen35GdnWorkspace,
-    ) -> Result<()> {
-        let geometry = Qwen35GdnGeometry::PRODUCTION;
-        let state_elements = geometry.h_v * geometry.head_dim * geometry.head_dim;
-        ensure!(
-            state.len() == state_elements,
-            "Qwen3.5 GDN state length mismatch"
-        );
-        let t = q.seq_len;
-        ensure!(
-            ctx.stream.context().ordinal() == self.device_ordinal,
-            "Qwen3.5 GDN device mismatch"
-        );
-        ensure!(
-            [
-                &ctx.ctx,
-                q.data.context(),
-                k.data.context(),
-                v.data.context(),
-                output.data.context(),
-                alpha.context(),
-                beta.context(),
-                state.context(),
-                launch_workspace.workspace.context(),
-                launch_workspace.cu_seqlens.context(),
-            ]
-            .into_iter()
-            .all(|context| context == ctx.stream.context()),
-            "Qwen3.5 GDN buffer/stream context mismatch"
-        );
-        ensure!(
-            t > 0
-                && t <= (i32::MAX as usize / geometry.h_v)
-                && k.seq_len == t
-                && v.seq_len == t
-                && output.seq_len == t,
-            "Qwen3.5 GDN token extents do not match"
-        );
-        ensure!(
-            q.hidden_dim == geometry.h_q * geometry.head_dim
-                && k.hidden_dim == geometry.h_k * geometry.head_dim
-                && v.hidden_dim == geometry.h_v * geometry.head_dim
-                && output.hidden_dim == geometry.h_v * geometry.head_dim,
-            "Qwen3.5 GDN tensor geometry mismatch"
-        );
-        ensure!(
-            alpha.len() == t * geometry.h_v
-                && beta.len() == t * geometry.h_v
-                && launch_workspace.workspace.len() >= self.workspace_bytes
-                && launch_workspace.cu_seqlens.len() == 2
-                && launch_workspace.tokens == t,
-            "Qwen3.5 GDN buffer contract mismatch"
-        );
-        q.checked_extent("Qwen3.5 GDN Q")?;
-        k.checked_extent("Qwen3.5 GDN K")?;
-        v.checked_extent("Qwen3.5 GDN V")?;
-        output.checked_extent("Qwen3.5 GDN output")?;
-
-        let (q_ptr, _q) = q.data.device_ptr(&ctx.stream);
-        let (k_ptr, _k) = k.data.device_ptr(&ctx.stream);
-        let (v_ptr, _v) = v.data.device_ptr(&ctx.stream);
-        let (alpha_ptr, _alpha) = alpha.device_ptr(&ctx.stream);
-        let (beta_ptr, _beta) = beta.device_ptr(&ctx.stream);
-        let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
-        let (output_ptr, _output) = output.data.device_ptr_mut(&ctx.stream);
-        let workspace_bytes = launch_workspace.workspace.len() as u64;
-        let (workspace_ptr, _workspace) = launch_workspace.workspace.device_ptr_mut(&ctx.stream);
-        let (cu_ptr, _cu) = launch_workspace.cu_seqlens.device_ptr(&ctx.stream);
-        let args = ffi::FlashInferGdnPrefillArgs {
-            abi_version: QWEN35_GDN_ABI_VERSION,
-            struct_size: size_of::<ffi::FlashInferGdnPrefillArgs>() as u32,
-            q: q_ptr,
-            k: k_ptr,
-            v: v_ptr,
-            output: output_ptr,
-            alpha: alpha_ptr,
-            beta: beta_ptr,
-            state: state_ptr,
-            workspace: workspace_ptr,
-            workspace_bytes,
-            cu_seqlens: cu_ptr,
-            tokens: t.try_into().context("Qwen3.5 GDN T exceeds u32")?,
-            stream: ctx.stream.cu_stream(),
-        };
-        let status =
-            unsafe { ffi::pegainfer_qwen35_gdn_launch(self.handle.as_ptr(), &raw const args) };
-        ensure!(
-            status == STATUS_OK,
-            "Qwen3.5 GDN launch failed with stable ABI status {status}"
-        );
-        Ok(())
-    }
-}
-
-impl Drop for Qwen35GdnAot {
-    fn drop(&mut self) {
-        unsafe { ffi::pegainfer_qwen35_gdn_destroy(self.handle.as_ptr()) };
-    }
+    Ok(())
 }
 
 #[cfg(test)]

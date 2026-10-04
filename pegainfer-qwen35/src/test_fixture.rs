@@ -3,15 +3,18 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
 use pegainfer_frontend::model_line::parse_for_line;
 
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35SchedulerPolicy;
+pub(crate) use crate::test_fixture_common::EngineHarness;
+pub(crate) use crate::test_fixture_common::RequestGuard;
 pub(crate) use crate::test_fixture_common::load_tokenizer;
 pub(crate) use crate::test_fixture_common::model_path_or_skip;
+pub(crate) use crate::test_fixture_common::request;
 pub(crate) use crate::test_fixture_common::tp2_device_ordinals;
 use crate::weights::ModelRuntimeConfig;
 use crate::weights::Qwen35Model;
@@ -114,6 +117,7 @@ impl GdnAcceptance {
                 device_ordinal: options.device_ordinal,
                 gdn_backend: options.gdn_backend,
                 tensor_parallel: None,
+                prefix_snapshot_bytes: 0,
             },
             options.max_batch,
         )?;
@@ -153,7 +157,7 @@ impl GdnAcceptance {
         max_prefill_tokens: usize,
         policy: Qwen35SchedulerPolicy,
         overlap: Qwen35DecodeOverlap,
-    ) -> Result<EngineHandle> {
+    ) -> Result<Engine> {
         // The identity-checked model is the one moved into the real scheduler.
         let model = self.load_model(model_path, max_batch, max_prefill_tokens, policy, overlap)?;
         crate::scheduler::start_with_capacity_and_policy(

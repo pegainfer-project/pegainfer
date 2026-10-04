@@ -84,6 +84,26 @@ impl RecurrentState {
 
         Ok(Self { layers, seq_len: 0 })
     }
+
+    /// Copy one complete target-model recurrent state into this allocation.
+    pub(crate) fn copy_from(&mut self, ctx: &DeviceContext, src: &Self) -> Result<()> {
+        anyhow::ensure!(
+            self.layers.len() == src.layers.len(),
+            "Qwen3.5 recurrent copy layer mismatch: dst={}, src={}",
+            self.layers.len(),
+            src.layers.len()
+        );
+        for (layer_idx, (dst, src)) in self.layers.iter_mut().zip(&src.layers).enumerate() {
+            ctx.stream
+                .memcpy_dtod(&src.state, &mut dst.state)
+                .map_err(|e| anyhow::anyhow!("copy recurrent layer {layer_idx}: {e}"))?;
+            ctx.stream
+                .memcpy_dtod(&src.conv_state.data, &mut dst.conv_state.data)
+                .map_err(|e| anyhow::anyhow!("copy conv state layer {layer_idx}: {e}"))?;
+        }
+        self.seq_len = src.seq_len;
+        Ok(())
+    }
 }
 
 impl LinearStatePointerTables {

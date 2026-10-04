@@ -7,10 +7,11 @@ use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 use pegainfer_core::kv_pool::KvLayout;
-use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::sampler::SamplingParams;
+use pegainfer_kv_cache::KvBuffer;
+use pegainfer_kv_cache::KvView;
 
 use super::batch_decode_graph::BATCH_BUCKETS;
 use super::batch_decode_graph::BatchDecodeGraphState;
@@ -149,7 +150,7 @@ impl Qwen35Model {
             &bufs.k_attn,
             &bufs.v_attn,
             kv_buffer,
-            layout,
+            &layout.kernel_layout(),
             layer_idx,
             &bufs.page_indices_d,
             &bufs.page_indptr_d,
@@ -226,7 +227,7 @@ impl Qwen35Model {
             &bufs.k_attn,
             &bufs.v_attn,
             kv_buffer,
-            layout,
+            &layout.kernel_layout(),
             layer_idx,
             plan,
             &bufs.positions_d,
@@ -265,7 +266,8 @@ impl Qwen35Model {
     pub(crate) fn batch_decode_eager_logits(
         &self,
         token_ids: &[u32],
-        kv_states: &mut [&mut KvState],
+        views: &[KvView],
+        kv_buffer: &KvBuffer,
         recurrent_states: &mut [&mut RecurrentState],
         linear_pointer_tables: &LinearStatePointerTables,
         bufs: &mut BatchDecodeBuffers35,
@@ -275,7 +277,7 @@ impl Qwen35Model {
             bs > 0,
             "batch_decode_eager_logits requires at least one request"
         );
-        anyhow::ensure!(bs == kv_states.len(), "token_ids / kv_states len mismatch");
+        anyhow::ensure!(bs == views.len(), "token_ids / KV views len mismatch");
         anyhow::ensure!(
             bs == recurrent_states.len(),
             "token_ids / recurrent_states len mismatch"
@@ -287,12 +289,17 @@ impl Qwen35Model {
         );
         linear_pointer_tables.validate_for(&self.config, bs, "Qwen3.5 eager decode")?;
 
+        // KvView describes the post-step KV extent, so this decode token is
+        // written at seq_len - 1. Recurrent state must start at that position.
         let mut positions = Vec::with_capacity(bs);
-        for (i, kv) in kv_states.iter_mut().enumerate() {
-            let pos = kv.seq_len();
+        for (i, view) in views.iter().enumerate() {
+            let pos = view.seq_len().saturating_sub(1);
+            anyhow::ensure!(
+                recurrent_states[i].seq_len == pos,
+                "Qwen3.5 eager decode position mismatch at row {i}: recurrent={}, view_pos={pos}",
+                recurrent_states[i].seq_len
+            );
             self.ensure_rope_cache_covers(pos + 1)?;
-            kv.ensure_capacity(pos + 1)?;
-            kv.advance(1);
             recurrent_states[i].seq_len += 1;
             positions.push(pos as i32);
         }
@@ -305,8 +312,7 @@ impl Qwen35Model {
             .stream
             .memcpy_htod(&positions, &mut bufs.positions_d)?;
 
-        let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
-        bufs.sync_paged_meta(&self.ctx, &kv_refs, bs)?;
+        bufs.sync_paged_views(&self.ctx, views, bs)?;
 
         // When this GQA group has no compiled batch-decode kernel, run full
         // attention through the paged-prefill kernel with a per-step plan.
@@ -318,7 +324,7 @@ impl Qwen35Model {
         } else {
             let start_positions: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
             Some(self.one_token_paged_plan(
-                &kv_refs,
+                views,
                 &start_positions,
                 self.geometry.local_num_attention_heads(),
                 self.geometry.local_num_key_value_heads(),
@@ -326,11 +332,9 @@ impl Qwen35Model {
             )?)
         };
 
-        let kv_buffer = kv_states[0].buffer();
-        let layout = *kv_states[0].layout();
         self.batch_decode_kernels_graph(
-            kv_buffer,
-            &layout,
+            kv_buffer.buffer(),
+            &self.decode_kv_layout,
             bs,
             prefill_attn_plan.as_ref(),
             &linear_pointer_tables.state_ptrs,
@@ -355,12 +359,20 @@ impl Qwen35Model {
     pub(crate) fn batch_decode_graph(
         &self,
         token_ids: &[u32],
-        kv_states: &mut [&mut KvState],
+        views: &[KvView],
+        kv_buffer: &KvBuffer,
         graph_state: &mut BatchDecodeGraphState,
         graph_use: DecodeGraphUse,
     ) -> Result<()> {
         let padded_bs = bucket_for(token_ids.len());
-        self.batch_decode_graph_padded(token_ids, kv_states, graph_state, graph_use, padded_bs)
+        self.batch_decode_graph_padded(
+            token_ids,
+            views,
+            kv_buffer,
+            graph_state,
+            graph_use,
+            padded_bs,
+        )
     }
 
     /// `batch_decode_graph` with the bucket chosen by the caller instead of
@@ -372,14 +384,15 @@ impl Qwen35Model {
     pub(crate) fn batch_decode_graph_padded(
         &self,
         token_ids: &[u32],
-        kv_states: &mut [&mut KvState],
+        views: &[KvView],
+        kv_buffer: &KvBuffer,
         graph_state: &mut BatchDecodeGraphState,
         graph_use: DecodeGraphUse,
         padded_bs: usize,
     ) -> Result<()> {
         let bs = token_ids.len();
-        anyhow::ensure!(bs > 0, "batch_decode_graph requires at least one request");
-        anyhow::ensure!(bs == kv_states.len(), "token_ids / kv_states len mismatch");
+        anyhow::ensure!(bs > 0, "batch_decode_graph requires requests");
+        anyhow::ensure!(bs == views.len(), "token_ids / KV views len mismatch");
         anyhow::ensure!(
             bs <= graph_state.slot_states.len(),
             "batch size {bs} exceeds decode capacity {}",
@@ -398,15 +411,12 @@ impl Qwen35Model {
             LOG_UNCOMPILED_DECODE_ROUTE.call_once(|| {
                 let group = self.config.num_attention_heads / self.config.num_key_value_heads;
                 log::info!(
-                    "Qwen3.5 decode GQA group {group} ({} q heads / {} kv heads) has no compiled BatchDecode kernel; batched hybrid eager fallback active, bs_capacity={}",
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads,
-                    graph_state.buffers.max_batch_size,
+                    "Qwen3.5 decode GQA group {group} has no compiled BatchDecode kernel; batched hybrid eager fallback active"
                 );
             });
             // Paged-prefill attention stays eager; verify_graph records that
             // captured prefill attention under-reads growing decode KV.
-            return self.batch_decode_batched_hybrid(token_ids, kv_states, graph_state);
+            return self.batch_decode_batched_hybrid(token_ids, views, kv_buffer, graph_state);
         }
 
         graph_state.linear_pointer_tables.validate_for(
@@ -415,14 +425,17 @@ impl Qwen35Model {
             "Qwen3.5 graph decode",
         )?;
 
-        // Advance KV states and collect positions. Slot seq_len is incremented
-        // on the CPU outside the graph so it never appears inside the capture.
+        // KvView already includes the page reserved by schedule_decode; model
+        // execution advances recurrent state but never logical RequestKv state.
         let mut positions = Vec::with_capacity(bs);
-        for (i, kv) in kv_states.iter_mut().enumerate() {
-            let pos = kv.seq_len();
+        for (i, view) in views.iter().enumerate() {
+            let pos = view.seq_len().saturating_sub(1);
+            anyhow::ensure!(
+                graph_state.slot_states[i].seq_len == pos,
+                "Qwen3.5 decode position mismatch at slot {i}: recurrent={}, view_pos={pos}",
+                graph_state.slot_states[i].seq_len
+            );
             self.ensure_rope_cache_covers(pos + 1)?;
-            kv.ensure_capacity(pos + 1)?;
-            kv.advance(1);
             graph_state.slot_states[i].seq_len += 1;
             positions.push(pos as i32);
         }
@@ -441,13 +454,10 @@ impl Qwen35Model {
             .memcpy_htod(&positions, &mut graph_state.buffers.positions_d)?;
 
         // H2D: paged KV metadata with padding slots pointing to padding_page_id.
-        let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
         graph_state
             .buffers
-            .sync_paged_meta(&self.ctx, &kv_refs, padded_bs)?;
+            .sync_paged_views(&self.ctx, views, padded_bs)?;
 
-        let kv_buffer = kv_states[0].buffer();
-        let layout = *kv_states[0].layout();
         let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
 
         // Take graphs out of graph_state to avoid split-borrow in the closure.
@@ -457,8 +467,8 @@ impl Qwen35Model {
         let result = match graph_use {
             DecodeGraphUse::Serve => graphs[bucket_idx].run_or_capture(&self.ctx, || {
                 self.batch_decode_kernels_graph(
-                    kv_buffer,
-                    &layout,
+                    kv_buffer.buffer(),
+                    &self.decode_kv_layout,
                     padded_bs,
                     None,
                     linear_state_ptrs,
@@ -468,8 +478,8 @@ impl Qwen35Model {
             }),
             DecodeGraphUse::CaptureOnly => graphs[bucket_idx].capture_only(&self.ctx, || {
                 self.batch_decode_kernels_graph(
-                    kv_buffer,
-                    &layout,
+                    kv_buffer.buffer(),
+                    &self.decode_kv_layout,
                     padded_bs,
                     None,
                     linear_state_ptrs,
@@ -490,7 +500,8 @@ impl Qwen35Model {
     fn batch_decode_batched_hybrid(
         &self,
         token_ids: &[u32],
-        kv_states: &mut [&mut KvState],
+        views: &[KvView],
+        kv_buffer: &KvBuffer,
         graph_state: &mut BatchDecodeGraphState,
     ) -> Result<()> {
         let bs = token_ids.len();
@@ -501,13 +512,15 @@ impl Qwen35Model {
         )?;
         let mut positions_i32 = Vec::with_capacity(bs);
         let mut start_positions = Vec::with_capacity(bs);
-        for (i, kv) in kv_states.iter_mut().enumerate() {
-            let pos = kv.seq_len();
+        for (i, view) in views.iter().enumerate() {
+            let pos = view.seq_len().saturating_sub(1);
+            anyhow::ensure!(
+                graph_state.slot_states[i].seq_len == pos,
+                "Qwen3.5 hybrid position mismatch at slot {i}: recurrent={}, view_pos={pos}",
+                graph_state.slot_states[i].seq_len
+            );
             self.ensure_rope_cache_covers(pos + 1)
-                .with_context(|| format!("hybrid decode rope cache pos={} slot={i}", pos + 1))?;
-            kv.ensure_capacity(pos + 1)
-                .with_context(|| format!("hybrid decode KV capacity pos={} slot={i}", pos + 1))?;
-            kv.advance(1);
+                .with_context(|| format!("hybrid decode rope pos={} slot={i}", pos + 1))?;
             graph_state.slot_states[i].seq_len += 1;
             positions_i32.push(pos as i32);
             start_positions.push(pos);
@@ -517,46 +530,31 @@ impl Qwen35Model {
         bufs.set_batch_size(bs);
         self.ctx
             .stream
-            .memcpy_htod(token_ids, &mut bufs.token_ids_d)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "hybrid decode H2D token_ids bs={bs}, cap={}: {e}",
-                    bufs.max_batch_size
-                )
-            })?;
+            .memcpy_htod(token_ids, &mut bufs.token_ids_d)?;
         self.ctx
             .stream
-            .memcpy_htod(&positions_i32, &mut bufs.positions_d)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "hybrid decode H2D positions bs={bs}, cap={}: {e}",
-                    bufs.max_batch_size
-                )
-            })?;
+            .memcpy_htod(&positions_i32, &mut bufs.positions_d)?;
 
-        let kv_refs: Vec<&KvState> = kv_states.iter().map(|s| &**s).collect();
         let plan = self.one_token_paged_plan(
-            &kv_refs,
+            views,
             &start_positions,
             self.geometry.local_num_attention_heads(),
             self.geometry.local_num_key_value_heads(),
             "hybrid decode",
         )?;
 
-        let kv_buffer = kv_states[0].buffer();
-        let layout = *kv_states[0].layout();
         anyhow::ensure!(
-            layout.num_kv_heads == self.config.num_key_value_heads
-                && layout.head_dim == self.config.head_dim,
-            "hybrid decode KV layout mismatch bs={bs}: layout kv_heads={}, head_dim={}; config kv_heads={}, head_dim={}",
-            layout.num_kv_heads,
-            layout.head_dim,
-            self.config.num_key_value_heads,
+            self.decode_kv_layout.num_kv_heads == self.geometry.local_num_key_value_heads()
+                && self.decode_kv_layout.head_dim == self.config.head_dim,
+            "hybrid decode KV layout mismatch bs={bs}: layout kv_heads={}, head_dim={}; local kv_heads={}, config head_dim={}",
+            self.decode_kv_layout.num_kv_heads,
+            self.decode_kv_layout.head_dim,
+            self.geometry.local_num_key_value_heads(),
             self.config.head_dim
         );
         self.batch_decode_batched_hybrid_kernels(
-            kv_buffer,
-            &layout,
+            kv_buffer.buffer(),
+            &self.decode_kv_layout,
             &plan,
             bs,
             &graph_state.linear_pointer_tables.state_ptrs,
@@ -571,15 +569,18 @@ impl Qwen35Model {
     /// the hd256 FFI takes no override.
     fn one_token_paged_plan(
         &self,
-        kv_refs: &[&KvState],
+        views: &[KvView],
         start_positions: &[usize],
         num_q_heads: usize,
         num_kv_heads: usize,
         label: &str,
     ) -> Result<ops::PrefillPagedPlan> {
-        let bs = kv_refs.len();
-        let page_indices: Vec<Vec<i32>> = kv_refs.iter().map(|kv| kv.page_indices_i32()).collect();
-        let last_page_lens: Vec<usize> = kv_refs.iter().map(|kv| kv.last_page_len()).collect();
+        let bs = views.len();
+        let page_indices = views
+            .iter()
+            .map(|view| view.page_indices().to_vec())
+            .collect::<Vec<_>>();
+        let last_page_lens = views.iter().map(KvView::last_page_len).collect::<Vec<_>>();
         let seq_lens = vec![1usize; bs];
         ops::PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
             &self.ctx,
@@ -690,14 +691,7 @@ impl Qwen35Model {
             eps,
             &mut bufs.normed,
         )?;
-        ops::gemm_rows_into_checked(
-            &self.ctx,
-            self.output_projection(),
-            0,
-            self.config.selection_vocab,
-            &bufs.normed,
-            &mut bufs.logits,
-        )?;
+        self.output_logits_into(&bufs.normed, &mut bufs.logits)?;
         debug_assert_eq!(bufs.logits.seq_len, padded_bs);
 
         Ok(())
@@ -768,14 +762,7 @@ impl Qwen35Model {
             eps,
             &mut bufs.normed,
         )?;
-        ops::gemm_rows_into_checked(
-            &self.ctx,
-            self.output_projection(),
-            0,
-            self.config.selection_vocab,
-            &bufs.normed,
-            &mut bufs.logits,
-        )?;
+        self.output_logits_into(&bufs.normed, &mut bufs.logits)?;
         debug_assert_eq!(bufs.logits.seq_len, bs);
         Ok(())
     }

@@ -6,6 +6,7 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
+use crate::tensor::Columns;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
@@ -1012,35 +1013,54 @@ pub fn write_vec_into(
 /// Batched GELU-tanh+mul into a pre-allocated output buffer:
 /// `out = gelu_tanh(gate) * up` (Gemma 4 MLP, `gelu_pytorch_tanh`). The
 /// kernel matches HF's op-sequence rounding: activation in f32, cast to
-/// bf16, then multiplied in f32 and rounded once more.
-pub fn gelu_tanh_mul_batch_into(
+/// bf16, then multiplied in f32 and rounded once more. `gate` and `up` are
+/// column bands read at their own row strides, so both may come from one
+/// fused gate|up projection row.
+pub fn gelu_tanh_mul_batch_into<'a>(
     ctx: &DeviceContext,
-    gate: &HiddenStates,
-    up: &HiddenStates,
+    gate: impl Into<Columns<'a>>,
+    up: impl Into<Columns<'a>>,
     out: &mut HiddenStates,
 ) -> Result<()> {
+    let (gate, up) = (gate.into(), up.into());
     anyhow::ensure!(
-        gate.hidden_dim == up.hidden_dim && gate.seq_len == up.seq_len,
+        gate.width == up.width && gate.states.seq_len == up.states.seq_len,
         "gelu_tanh_mul gate {}x{} != up {}x{}",
-        gate.hidden_dim,
-        gate.seq_len,
-        up.hidden_dim,
-        up.seq_len
+        gate.width,
+        gate.states.seq_len,
+        up.width,
+        up.states.seq_len
     );
     anyhow::ensure!(
-        out.hidden_dim == gate.hidden_dim && out.seq_len == gate.seq_len,
+        out.hidden_dim == gate.width && out.seq_len == gate.states.seq_len,
         "gelu_tanh_mul out {}x{} != gate {}x{}",
         out.hidden_dim,
         out.seq_len,
-        gate.hidden_dim,
-        gate.seq_len
+        gate.width,
+        gate.states.seq_len
     );
-    let n = gate.checked_extent("gelu_tanh_mul gate")?;
-    up.checked_extent("gelu_tanh_mul up")?;
-    out.checked_extent("gelu_tanh_mul out")?;
+    for (band, what) in [(gate, "gelu_tanh_mul gate"), (up, "gelu_tanh_mul up")] {
+        anyhow::ensure!(
+            band.col
+                .checked_add(band.width)
+                .is_some_and(|end| end <= band.states.hidden_dim),
+            "{what} columns [{}..+{}) exceed the row's {}",
+            band.col,
+            band.width,
+            band.states.hidden_dim
+        );
+        band.states.checked_extent(what)?;
+    }
+    let n = out.checked_extent("gelu_tanh_mul out")?;
     let n = super::checked_i32(n, "gelu_tanh_mul extent")?;
-    let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
-    let (u_ptr, _gu) = up.data.device_ptr(&ctx.stream);
+    let cols = super::checked_i32(gate.width, "gelu_tanh_mul width")?;
+    let gate_stride = super::checked_i32(gate.states.hidden_dim, "gelu_tanh_mul gate stride")?;
+    let up_stride = super::checked_i32(up.states.hidden_dim, "gelu_tanh_mul up stride")?;
+    let band_bytes = |band: &Columns<'_>| (band.col * std::mem::size_of::<half::bf16>()) as u64;
+    let (g_ptr, _gg) = gate.states.data.device_ptr(&ctx.stream);
+    let g_ptr = g_ptr + band_bytes(&gate);
+    let (u_ptr, _gu) = up.states.data.device_ptr(&ctx.stream);
+    let u_ptr = u_ptr + band_bytes(&up);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
 
     let result = unsafe {
@@ -1048,6 +1068,9 @@ pub fn gelu_tanh_mul_batch_into(
             g_ptr as *const ffi::Half,
             u_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
+            cols,
+            gate_stride,
+            up_stride,
             n,
             crate::tensor::active_cu_stream(ctx),
         )

@@ -2,6 +2,8 @@
 //! length with no device-side bounds check, so a plan's host-side bounds are
 //! the only bounds. This drives them through the public wrapper.
 
+#![cfg(feature = "gemma4")]
+
 mod common;
 
 use cudarc::driver::CudaSlice;

@@ -437,10 +437,23 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         &mut self,
         manager: &BlockManager<T>,
     ) -> Result<usize, ScheduleError> {
+        self.match_and_add_prefix_up_to(manager, usize::MAX)
+    }
+
+    /// Match and add at most `requested_max_blocks` prefix blocks.
+    ///
+    /// This is useful for hybrid models whose auxiliary state
+    /// may only be restorable at a boundary shorter than the longest KV hit.
+    pub fn match_and_add_prefix_up_to(
+        &mut self,
+        manager: &BlockManager<T>,
+        requested_max_blocks: usize,
+    ) -> Result<usize, ScheduleError> {
         self.require_idle()?;
 
         let bs = self.inner.block_size();
-        let max_blocks = self.inner.num_input_tokens().saturating_sub(1) / bs;
+        let max_blocks =
+            (self.inner.num_input_tokens().saturating_sub(1) / bs).min(requested_max_blocks);
         let count = self
             .inner
             .match_and_add_prefix(manager, max_blocks)
@@ -636,13 +649,12 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
             }
         };
 
+        // The forward computed KV for the existing dangling token. Register
+        // that token before appending the newly sampled, still-dangling token.
+        self.inner.complete_and_register_pending(manager);
+
         let crossed = self.inner.append_token(token);
         let block_completed = crossed.is_some();
-
-        // Always stage pending completions — handles both:
-        // 1. Blocks completed during prefill's token append (deferred staging)
-        // 2. Block just completed by this decode token
-        self.inner.complete_and_register_pending(manager);
 
         self.kv_position += 1;
         self.state = SequenceState::Idle;
@@ -1545,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_block_completed() {
+    fn test_decode_defers_dangling_boundary_registration() {
         let manager = create_test_manager::<TestMeta>(20);
         let mut seq = prefilled_seq(4, 10, &manager);
         // After prefill: total=5, kv=4, assigned=1, unassigned=0
@@ -1559,6 +1571,10 @@ mod tests {
         seq.schedule_decode(&manager).unwrap();
         let outcome = seq.apply_decode(100, &manager).unwrap();
         assert_eq!(outcome, DecodeOutcome::BlockCompleted);
+        assert_eq!(seq.assigned_blocks(), 1);
+
+        seq.schedule_decode(&manager).unwrap();
+        seq.apply_decode(100, &manager).unwrap();
         assert_eq!(seq.assigned_blocks(), 2);
     }
 
@@ -1613,7 +1629,7 @@ mod tests {
         seq.schedule_decode(&manager).unwrap();
         let outcome = seq.apply_decode(102, &manager).unwrap(); // total=8, crosses boundary
         assert_eq!(outcome, DecodeOutcome::BlockCompleted);
-        assert_eq!(seq.unassigned_blocks(), 0);
+        assert_eq!(seq.unassigned_blocks(), 1);
 
         // Next schedule_decode should allocate 1 gen block
         seq.schedule_decode(&manager).unwrap();
@@ -1623,7 +1639,7 @@ mod tests {
                 blocks_allocated: 1
             }
         );
-        assert_eq!(seq.unassigned_blocks(), 1);
+        assert_eq!(seq.unassigned_blocks(), 2);
     }
 
     #[test]
@@ -1797,12 +1813,12 @@ mod tests {
         let mut seq = prefilled_seq(4, 10, &manager);
         // After prefill: total=5, assigned=1, unassigned=0
 
-        // Decode until boundary at total=8 → unassigned drops to 0
+        // Decode until boundary at total=8
         for _ in 0..3 {
             seq.schedule_decode(&manager).unwrap();
             seq.apply_decode(100, &manager).unwrap();
         }
-        assert_eq!(seq.unassigned_blocks(), 0);
+        assert_eq!(seq.unassigned_blocks(), 1);
 
         let avail_before = manager.available_blocks();
         seq.schedule_decode(&manager).unwrap();

@@ -50,49 +50,6 @@ const MARGIN_TOL: f32 = 0.20;
 const MEAN_TOL: f32 = 0.06;
 const P99_TOL: f32 = 0.20;
 
-/// Size key from config CONTENT, not the directory name; keep in sync with
-/// `SIZE_NAMES` in `tools/accuracy/dump_qwen35_hf_golden.py`.
-fn fixture_size_name(model_path: &str) -> Result<Option<&'static str>> {
-    let config_path = Path::new(model_path).join("config.json");
-    let raw =
-        std::fs::read(&config_path).with_context(|| format!("read {}", config_path.display()))?;
-    let config: serde_json::Value =
-        serde_json::from_slice(&raw).with_context(|| format!("parse {}", config_path.display()))?;
-    let text = config.get("text_config").unwrap_or(&config);
-    let hidden = text
-        .get("hidden_size")
-        .and_then(serde_json::Value::as_u64)
-        .context("model config has no hidden_size")?;
-    let layers = text
-        .get("num_hidden_layers")
-        .and_then(serde_json::Value::as_u64)
-        .context("model config has no num_hidden_layers")?;
-    Ok(match (hidden, layers) {
-        (1024, 24) => Some("0.8b"),
-        (2048, 24) => Some("2b"),
-        (2560, 32) => Some("4b"),
-        (4096, 32) => Some("9b"),
-        (5120, 64) => Some("27b"),
-        _ => None,
-    })
-}
-
-/// Sizes whose fixtures are committed in `test_data/`; a missing file for
-/// these is a broken checkout, not an ungenerated fixture.
-const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.8b", "2b", "4b", "9b", "27b"];
-
-fn default_fixture_path(size: &str, long: bool) -> String {
-    let kind = if long {
-        "-hf-long-golden"
-    } else {
-        "-hf-golden"
-    };
-    format!(
-        "{}/../test_data/qwen35-{size}{kind}.safetensors",
-        env!("CARGO_MANIFEST_DIR")
-    )
-}
-
 const BUCKET_STRADDLES: [usize; 2] = [5, 3];
 const SLOT_COMPACTION_BATCH: usize = 5;
 const SLOT_COMPACTION_DROP_INDEX: usize = 1;
@@ -109,6 +66,43 @@ fn sha256_file(path: impl AsRef<Path>) -> Result<String> {
             let _ = write!(hex, "{byte:02x}");
             hex
         }))
+}
+
+// Qwen3.5 and Qwen3.8 can share geometry but require different pinned goldens.
+fn find_default_fixture(model_path: &str, long: bool) -> Result<String> {
+    let hash = sha256_file(Path::new(model_path).join("config.json"))?;
+    let suffix = if long {
+        "-hf-long-golden.safetensors"
+    } else {
+        "-hf-golden.safetensors"
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../test_data");
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(suffix) || !(name.starts_with("qwen35-") || name.starts_with("qwen38-"))
+        {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let (_, header) = SafeTensors::read_metadata(&bytes)?;
+        if header
+            .metadata()
+            .as_ref()
+            .and_then(|meta| meta.get("config_sha256"))
+            == Some(&hash)
+        {
+            matches.push(path);
+        }
+    }
+    ensure!(
+        matches.len() == 1,
+        "expected one committed HF fixture for config_sha256={hash}, kind={suffix}; found {matches:?}"
+    );
+    Ok(matches[0].to_string_lossy().into_owned())
 }
 
 fn model_revision(model_path: &str, revision_override: Option<&str>) -> Option<String> {
@@ -293,40 +287,13 @@ struct Golden {
 }
 
 impl Golden {
-    /// An explicitly set env override must exist; a missing default keyed
-    /// fixture is a clean skip (`None`).
-    fn load_for(model_path: &str, long: bool) -> Result<Option<Golden>> {
+    fn load_for(model_path: &str, long: bool) -> Result<Golden> {
         let env_key = if long { LONG_GOLDEN_ENV } else { GOLDEN_ENV };
-        let Some(size) = fixture_size_name(model_path)? else {
-            ensure!(
-                std::env::var(env_key).is_err(),
-                "{env_key} is set but the model geometry in {model_path}/config.json \
-                 has no entry in the size table"
-            );
-            eprintln!(
-                "skipping qwen35 hf_golden_gate: unrecognized model geometry in \
-                 {model_path}/config.json; extend fixture_size_name to cover it"
-            );
-            return Ok(None);
+        let path = match std::env::var(env_key) {
+            Ok(path) => path,
+            Err(_) => find_default_fixture(model_path, long)?,
         };
-        let path = if let Ok(path) = std::env::var(env_key) {
-            path
-        } else {
-            let path = default_fixture_path(size, long);
-            if !Path::new(&path).exists() {
-                ensure!(
-                    !COMMITTED_FIXTURE_SIZES.contains(&size),
-                    "committed golden fixture missing at {path}"
-                );
-                eprintln!(
-                    "skipping qwen35 hf_golden_gate: no golden fixture for this size at \
-                     {path}; generate one with tools/accuracy/dump_qwen35_hf_golden.py"
-                );
-                return Ok(None);
-            }
-            path
-        };
-        Self::load_path(path).map(Some)
+        Self::load_path(path)
     }
 
     fn load_path(path: impl AsRef<Path>) -> Result<Golden> {
@@ -487,7 +454,12 @@ fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (S
     (stats, fingerprint)
 }
 
-fn run_tp(g: &Golden, ex: &Qwen35TpExecutor, seqs: &[usize], batched: bool) -> (Stats, Vec<f32>) {
+fn run_tp(
+    g: &Golden,
+    ex: &mut Qwen35TpExecutor,
+    seqs: &[usize],
+    batched: bool,
+) -> (Stats, Vec<f32>) {
     let mut stats = Stats::default();
     let mut fingerprint = Vec::new();
     let mut fold = |stats: &mut Stats, seq, pos, pega: &[(u32, f32)]| {
@@ -736,11 +708,19 @@ fn build_executor(model_path: &str, acceptance: &common::GdnAcceptance) -> Qwen3
     model
         .tune_decode_gemm_algos()
         .expect("tune Qwen3.5 logits executor GEMMs");
+    let manager = pegainfer_kv_cache::KvCacheManager::from_buffer(
+        model.kv_buffer().clone(),
+        model.kv_buffer().num_blocks(),
+    )
+    .expect("create Qwen3.5 logits executor KV pool");
+    let kv_cache = crate::prefix_cache::Qwen35PrefixCache::new(manager, 0)
+        .expect("create Qwen3.5 logits executor KV cache");
     let graph_state = model
-        .create_batch_decode_graph_state()
+        .create_batch_decode_graph_state(kv_cache.pool().padding_block_id())
         .expect("capture Qwen3.5 logits executor graph");
     Qwen35Executor {
         model,
+        kv_cache,
         graph_state,
         active: Vec::new(),
     }
@@ -778,7 +758,7 @@ fn build_tp2_graph_executor(model_path: &str, label: &str) -> Option<Qwen35TpExe
 /// gap), then keep decoding the survivors in their new dense slot order.
 fn run_tp_with_slot_compaction(
     g: &Golden,
-    ex: &Qwen35TpExecutor,
+    ex: &mut Qwen35TpExecutor,
     seqs: &[usize],
 ) -> (Stats, Vec<f32>) {
     assert!(
@@ -1033,13 +1013,7 @@ fn run_short_golden(acceptance: &common::GdnAcceptance) {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false).expect("golden prerequisite") else {
-        assert!(
-            !acceptance.is_candidate(),
-            "candidate HF acceptance requires a short golden fixture"
-        );
-        return;
-    };
+    let golden = Golden::load_for(&model_path, false).expect("golden prerequisite");
     check_fixture_metadata(
         &model_path,
         &golden,
@@ -1167,13 +1141,7 @@ fn run_long_golden(acceptance: &common::GdnAcceptance) {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true).expect("golden prerequisite") else {
-        assert!(
-            !acceptance.is_candidate(),
-            "candidate HF acceptance requires a long golden fixture"
-        );
-        return;
-    };
+    let golden = Golden::load_for(&model_path, true).expect("golden prerequisite");
     check_fixture_metadata(
         &model_path,
         &golden,
@@ -1207,9 +1175,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden_tp2") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false).expect("golden prerequisite") else {
-        return;
-    };
+    let golden = Golden::load_for(&model_path, false).expect("golden prerequisite");
     check_fixture_metadata(
         &model_path,
         &golden,
@@ -1219,17 +1185,17 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let ex = build_tp2_executor(&model_path);
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let mut ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 sequential eager", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 sequential Qwen3.5 replay must reproduce identical logprobs"
     );
 
     let batched_n = all.len().min(MAX_EXECUTOR_BATCH);
-    let (batched, _) = run_tp(&golden, &ex, &all[..batched_n], true);
+    let (batched, _) = run_tp(&golden, &mut ex, &all[..batched_n], true);
     report_and_assert("TP2 batched eager", &batched);
 }
 
@@ -1240,9 +1206,7 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true).expect("golden prerequisite") else {
-        return;
-    };
+    let golden = Golden::load_for(&model_path, true).expect("golden prerequisite");
     check_fixture_metadata(
         &model_path,
         &golden,
@@ -1252,10 +1216,10 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let ex = build_tp2_executor(&model_path);
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let mut ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 long sequential eager", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 long sequential Qwen3.5 replay must reproduce identical logprobs"
@@ -1272,9 +1236,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false).expect("golden prerequisite") else {
-        return;
-    };
+    let golden = Golden::load_for(&model_path, false).expect("golden prerequisite");
     check_fixture_metadata(
         &model_path,
         &golden,
@@ -1284,12 +1246,12 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let Some(ex) = build_tp2_graph_executor(&model_path, "TP2 graph") else {
+    let Some(mut ex) = build_tp2_graph_executor(&model_path, "TP2 graph") else {
         return;
     };
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 sequential graph", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 sequential Qwen3.5 graph replay must reproduce identical logprobs"
@@ -1297,7 +1259,7 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
 
     for n in BUCKET_STRADDLES {
         if all.len() >= n {
-            let (batched, _) = run_tp(&golden, &ex, &all[..n], true);
+            let (batched, _) = run_tp(&golden, &mut ex, &all[..n], true);
             report_and_assert(&format!("TP2 batched graph ({n} padded)"), &batched);
         } else {
             eprintln!(
@@ -1309,9 +1271,9 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
 
     if golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2 {
         let (compacted, fp1) =
-            run_tp_with_slot_compaction(&golden, &ex, &all[..SLOT_COMPACTION_BATCH]);
+            run_tp_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
         report_and_assert("TP2 slot-compaction graph", &compacted);
-        let (_, fp2) = run_tp_with_slot_compaction(&golden, &ex, &all[..SLOT_COMPACTION_BATCH]);
+        let (_, fp2) = run_tp_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
         assert_eq!(
             fp1, fp2,
             "TP2 slot-compaction Qwen3.5 graph replay must reproduce identical logprobs"

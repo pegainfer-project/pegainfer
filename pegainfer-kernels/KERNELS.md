@@ -227,13 +227,13 @@ reference implementation.
 
 ## Non-Qwen3 Compatibility
 
-The crate still builds CUDA/Triton symbols needed by the current root binary:
+The `qwen35` feature builds the Qwen3.5 CUDA/Triton symbols:
 
-- Qwen3.5 HD256 full-attention kernels: `csrc/qwen35/prefill_attention_hd256.cu`, `csrc/shared/paged_attention.cu`.
+- Qwen3.5 HD256 full-attention kernels: `csrc/qwen35/prefill_attention_hd256.cu`, `csrc/qwen35/paged_attention_hd256.cu`.
 - Qwen3.5 linear-attention decode kernels: `csrc/qwen35/conv1d.cu`, `csrc/qwen35/gated_delta_rule.cu`.
 - Qwen3.5 GDR prefill defaults to `tools/triton/gated_delta_rule_chunkwise_kernels.py`. Explicit `flashinfer-candidate` selection uses `csrc/qwen35/flashinfer_gdn_aot.c` on SM120/Hv32/TP1 and rejects unavailable or unsupported candidates.
 
-These are preserved for build compatibility. They are not part of the Qwen3-4B Phase 1 API surface.
+They are not part of the Qwen3-4B Phase 1 API surface.
 
 ## Editing Rule
 
