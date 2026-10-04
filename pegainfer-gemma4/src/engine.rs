@@ -1247,12 +1247,6 @@ fn rank_kvs(rows: &mut [Active], rank: usize) -> Vec<&mut RankKv> {
         .collect()
 }
 
-/// Abort every rank's communicator after a rank-0 step has failed. Rank 0 may
-/// have stopped between two collectives, in which case a peer's matching call
-/// will never arrive; aborting the comms unblocks any peer already waiting
-/// instead of letting it hang, and stops the engine — a comm-less step would
-/// otherwise silently reduce to a no-op. A free function over the two fields so
-/// a caller holding a `&self.ctx` borrow (the scored path) can still abort.
 /// Break the tensor-parallel engine after a rank-0 step has failed: release
 /// every rank's captured graphs, then abort every communicator.
 ///
@@ -1260,7 +1254,7 @@ fn rank_kvs(rows: &mut [Active], rank: usize) -> Vec<&mut RankKv> {
 /// will never arrive; aborting the comms unblocks any peer already waiting
 /// instead of letting it hang. The graphs go first, on their own device,
 /// exactly as `Drop` orders it — aborting a comm while a graph that references
-/// its NCCL launches is alive wedges. `broken` is then set so no later step runs
+/// its NCCL launches is alive wedges. `broken` is set first so no later step runs
 /// a comm-less reduction, which would return partial sums.
 fn abort_comms(
     broken: &Cell<bool>,
@@ -2138,8 +2132,14 @@ impl EngineState {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
                 };
+                // A mixed step's gathered rows are a prefill, so under TP the
+                // ceiling bounds their sum too — four 64-token prompts beside the
+                // decode rows were never measured complete.
+                let gather_budget = self
+                    .tp_max_prompt
+                    .map_or(self.mix_gather, |limit| self.mix_gather.min(limit));
                 while newcomers.len() < self.mix_max_prompts
-                    && (self.mix_chunk.is_some() || rows_budget < self.mix_gather)
+                    && (self.mix_chunk.is_some() || rows_budget < gather_budget)
                     && newcomers.len() + active.len() < self.slots
                     && *attempts < self.slots
                 {
@@ -2160,7 +2160,7 @@ impl EngineState {
                         max_new_tokens: self
                             .mix_chunk
                             .is_none()
-                            .then(|| self.mix_gather.saturating_sub(rows_budget)),
+                            .then(|| gather_budget.saturating_sub(rows_budget)),
                     };
                     match self.prepare_newcomer(candidate, options, ledger) {
                         PreparedNewcomer::Ready(newcomer, new_tokens) => {
@@ -2511,6 +2511,11 @@ impl EngineState {
         ) {
             Ok(logits) => logits,
             Err(err) => {
+                // A walk tail after a broken pair would score its first token
+                // from partial sums; stop the engine instead (see `abort_comms`).
+                if self.tp_broken.get() {
+                    return Err(err.context("tensor-parallel ranks diverged; engine stopped"));
+                }
                 ledger.fail(walker.request.id, format!("walk tail failed: {err:#}"));
                 walker.failed = true;
                 return Ok(());

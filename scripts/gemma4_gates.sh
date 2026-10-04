@@ -240,11 +240,13 @@ require_devices() {
   local picks=()
   [ -z "$selector" ] || IFS=',' read -r -a picks <<<"$selector"
   if [ ${#picks[@]} -lt "$count" ]; then
-    # An explicit selector that names too few devices is a mistake, not a reason
-    # to silently substitute different devices.
-    [ "$explicit" -eq 0 ] || die \
-      "$count device(s) are needed but the selector names ${#picks[@]}; name them in \
-PEGAINFER_GATE_GPU or CUDA_VISIBLE_DEVICES"
+    # An explicit selector is never substituted: naming one device (as a SLURM
+    # job does) means "use this one", so a two-rank run drops its two-rank gates
+    # rather than take a different device; naming none at all is a mistake.
+    if [ "$explicit" -eq 1 ]; then
+      [ ${#picks[@]} -gt 0 ] || die "the device selector names no device"
+      return 1
+    fi
     picks=()
     mapfile -t picks < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
   fi

@@ -351,7 +351,13 @@ fn the_two_rank_engine_scores_prompt_logprobs() {
     let prompts: Vec<Vec<u32>> = [11u32, 26].into_iter().map(|seed| ids(len, seed)).collect();
     let controls: Vec<_> = prompts
         .iter()
-        .map(|prompt| harness.submit_scored(prompt.clone(), 1, Some(TOP_K), Some(TOP_K)))
+        .enumerate()
+        .map(|(index, prompt)| {
+            // The first request asks for more than one token, so it is still
+            // decoding — a live batch — when the second is admitted.
+            let max_tokens = if index == 0 { 4 } else { 1 };
+            harness.submit_scored(prompt.clone(), max_tokens, Some(TOP_K), Some(TOP_K))
+        })
         .collect();
     for (control, prompt) in controls.iter().zip(&prompts) {
         let drained = harness.steps.drain(control.id(), "scored prompt");
