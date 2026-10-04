@@ -404,6 +404,11 @@ fn start_with_knobs(
             knobs.prefix_cache.is_none(),
             "{PREFIX_CACHE_ENV} is unsupported under tensor parallelism"
         );
+        anyhow::ensure!(
+            knobs.mix_chunk.is_none(),
+            "{MIX_CHUNK_TOKENS_ENV} is unsupported under tensor parallelism: a chunked walk's \
+             rounds gather across prompts and are not covered by the TP gates"
+        );
         // The ranks take ordinals `0..world` of what this process can see, so a
         // world size past the visible devices can only fail later, less clearly.
         // `cuDeviceGetCount` needs the driver up and on a fresh process this is
@@ -2115,7 +2120,15 @@ impl EngineState {
         if !active.is_empty() {
             self.drain_pipeline(active, ledger)?;
         }
-        if !active.is_empty() && !scored {
+        // Under TP the ceiling bounds a whole step, so a prompt rides beside the
+        // live decode rows only while the sum fits; a longer one prefills alone,
+        // and the decode rows advance in the round after it.
+        let first_rows = prompt_tokens.saturating_sub(kv.local.seq_len());
+        let mixed_fits = match self.tp_max_prompt {
+            Some(limit) => first_rows + active.len() <= limit,
+            None => true,
+        };
+        if !active.is_empty() && !scored && mixed_fits {
             self.ready_decode_rows(active, ledger);
             if !active.is_empty() {
                 // Gather more admissible prompts into the same step. A
@@ -2133,11 +2146,11 @@ impl EngineState {
                     prompt_tokens - kv.local.seq_len()
                 };
                 // A mixed step's gathered rows are a prefill, so under TP the
-                // ceiling bounds their sum too — four 64-token prompts beside the
-                // decode rows were never measured complete.
-                let gather_budget = self
-                    .tp_max_prompt
-                    .map_or(self.mix_gather, |limit| self.mix_gather.min(limit));
+                // ceiling bounds their sum too — and the live decode rows ride in
+                // the same step, so the gather leaves room for them.
+                let gather_budget = self.tp_max_prompt.map_or(self.mix_gather, |limit| {
+                    self.mix_gather.min(limit.saturating_sub(active.len()))
+                });
                 while newcomers.len() < self.mix_max_prompts
                     && (self.mix_chunk.is_some() || rows_budget < gather_budget)
                     && newcomers.len() + active.len() < self.slots

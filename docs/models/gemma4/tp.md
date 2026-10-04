@@ -43,7 +43,7 @@ One scheduler thread drives every rank. Each rank owns its `DeviceContext`, `Gem
 
 That per-rank KV is why no host/device split was needed: each rank's entry point advances its own frontier, and because the pools have identical budgets and the admission sequence is identical, the page ids stay in step across ranks.
 
-Per step, for every rank `r`: `activate_rank` (set the device, bind its context, make its thread-local cuBLAS handles current — creating them on first use), run that rank's segment, then restore rank 0 before the sampler, which runs on rank 0 alone. A prefill additionally drains each non-primary rank's stream, so a device fault on that rank surfaces by name instead of stalling the primary's collective forever.
+Per step, rank 0's segment runs first and its verdict is checked before the extra ranks are driven: a rank-0 failure aborts the comms and stops the engine (see "Known bounds"), while a success means the peers' collectives have their match. For every rank `r` the segment calls `activate_rank` (set the device, bind its context, make its thread-local cuBLAS handles current — creating them on first use), runs that rank's segment, and drains it; the sampler then runs on rank 0 alone. A prefill drains every non-primary rank's stream, so a device fault on that rank surfaces by name instead of stalling the primary's collective forever.
 
 The staged decode pipeline (ids written by the previous step's sampler) is disabled under TP: a non-primary rank has no sampler and no ids of its own, so every rank takes the explicit-token path.
 
@@ -82,7 +82,7 @@ The 8192 x 8 row is the one that has been served: 2.50 GiB global pool, 14.18 Gi
 
 ## What is refused under TP today
 
-`PEGAINFER_ASYNC_PREFILL` (its lane stream cannot be lock-stepped across ranks), `PEGAINFER_GLOBAL_ATTN=tilelang*` (the generated kernels are compiled for the whole global family), and `PEGAINFER_PREFIX_CACHE`. A prompt past the TP prefill ceiling is refused too (`PEGAINFER_TP_MAX_PROMPT`, default the `TP_MAX_PROMPT` constant in `engine.rs`, `off` to lift) — see "Known bounds" for why.
+`PEGAINFER_ASYNC_PREFILL` (its lane stream cannot be lock-stepped across ranks), `PEGAINFER_GLOBAL_ATTN=tilelang*` (the generated kernels are compiled for the whole global family), `PEGAINFER_PREFIX_CACHE`, and `PEGAINFER_MIX_CHUNK_TOKENS` (a chunked walk's rounds gather across prompts, which the TP gates do not cover). A prompt past the TP prefill ceiling is refused too (`PEGAINFER_TP_MAX_PROMPT`, default the `TP_MAX_PROMPT` constant in `engine.rs`, `off` to lift) — see "Known bounds" for why.
 
 ## Decode graphs under TP
 

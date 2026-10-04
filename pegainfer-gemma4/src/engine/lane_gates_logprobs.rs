@@ -138,15 +138,20 @@ fn only_a_scored_prompt_is_bound_to_the_whole_prompt_ceiling() {
         super::validate_request(&request(Some(0)), raised, super::MAX_CONTEXT, None),
         Err(RejectReason::EchoPrefillTokens { .. })
     ));
-    // Under tensor parallelism the ceiling refuses a prompt past it, and a
-    // ceiling above the prompt leaves it alone. `Some(0)`/`Some(usize::MAX)`
-    // keep the expectation independent of the probe prompt's own length.
+    // Under tensor parallelism the ceiling is the boundary: a prompt equal to it
+    // passes, and one token past it is refused.
+    let prompt_len = super::MAX_CONTEXT + 1;
     assert!(
-        super::validate_request(&request(None), raised, super::MAX_CONTEXT, Some(usize::MAX))
+        super::validate_request(&request(None), raised, super::MAX_CONTEXT, Some(prompt_len))
             .is_ok()
     );
     assert!(matches!(
-        super::validate_request(&request(None), raised, super::MAX_CONTEXT, Some(0)),
+        super::validate_request(
+            &request(None),
+            raised,
+            super::MAX_CONTEXT,
+            Some(prompt_len - 1)
+        ),
         Err(RejectReason::Unsupported { .. })
     ));
 }

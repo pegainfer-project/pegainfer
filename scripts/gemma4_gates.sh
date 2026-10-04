@@ -598,9 +598,12 @@ require_hf31() {
   if [ -z "${PEGAINFER_GEMMA4_GOLDEN:-}" ]; then
     hf31_mismatch="PEGAINFER_GEMMA4_GOLDEN is unset (point it at the 31B HF fixture)"
   else
+    # The committed artifact's own name, not a substring: a `*31b*` match would
+    # also take a fixture dumped for a different 31B.
     case "${PEGAINFER_GEMMA4_GOLDEN##*/}" in
-      *31b*|*31B*) ;;
-      *) hf31_mismatch="PEGAINFER_GEMMA4_GOLDEN is not a 31B fixture (${PEGAINFER_GEMMA4_GOLDEN##*/})" ;;
+      gemma4-31b-hf-golden.safetensors) ;;
+      *) hf31_mismatch="PEGAINFER_GEMMA4_GOLDEN is not the 31B fixture \
+(gemma4-31b-hf-golden.safetensors)" ;;
     esac
   fi
 }
