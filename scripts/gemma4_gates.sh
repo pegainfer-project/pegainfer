@@ -113,6 +113,8 @@ GATES_KERNELS_HD256_FP8_POOL=(
 )
 GATES_TENSOR_PARALLEL=(
   "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_matches_one_rank"
+  "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_scores_prompt_logprobs"
+  "tp2,ckpt,hf31 engine::lane_gates_tp::the_two_rank_engine_matches_the_hf_reference"
 )
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
@@ -228,19 +230,27 @@ require_devices() {
   command -v flock >/dev/null 2>&1 || die "flock is unavailable, so device ownership cannot be enforced"
 
   local selector=${PEGAINFER_GATE_GPU:-}
+  local explicit=0
   if [ -z "$selector" ] && [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
     [ -n "$CUDA_VISIBLE_DEVICES" ] || die \
       "CUDA_VISIBLE_DEVICES is empty; set PEGAINFER_GATE_GPU to claim a device"
     selector=$CUDA_VISIBLE_DEVICES
   fi
+  [ -n "$selector" ] && explicit=1
   local picks=()
   [ -z "$selector" ] || IFS=',' read -r -a picks <<<"$selector"
   if [ ${#picks[@]} -lt "$count" ]; then
+    # An explicit selector that names too few devices is a mistake, not a reason
+    # to silently substitute different devices.
+    [ "$explicit" -eq 0 ] || die \
+      "$count device(s) are needed but the selector names ${#picks[@]}; name them in \
+PEGAINFER_GATE_GPU or CUDA_VISIBLE_DEVICES"
     picks=()
     mapfile -t picks < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
   fi
-  [ ${#picks[@]} -ge "$count" ] || die \
-    "this run needs $count devices; set PEGAINFER_GATE_GPU to name them"
+  # Not enough devices and nobody named them: `return 1` lets a run that can drop
+  # its two-rank gates carry on rather than fail.
+  [ ${#picks[@]} -ge "$count" ] || return 1
 
   local uuids=() rows=() row compute_mode sel uuid seen
   for sel in "${picks[@]:0:$count}"; do
@@ -579,6 +589,20 @@ if [ -z "$ROUTED_FIXTURE_TAG" ]; then
   [ ${#selected[@]} -gt 0 ] || die "every selected gate needed the routed fixture set"
 fi
 
+# The 31B Hugging Face fixture is a separate artifact from its checkpoint, so a
+# gate that compares against it leaves the run by name when it is not selected.
+hf31_mismatch=
+require_hf31() {
+  if [ -z "${PEGAINFER_GEMMA4_GOLDEN:-}" ]; then
+    hf31_mismatch="PEGAINFER_GEMMA4_GOLDEN is unset (point it at the 31B HF fixture)"
+  else
+    case "${PEGAINFER_GEMMA4_GOLDEN##*/}" in
+      *31b*|*31B*) ;;
+      *) hf31_mismatch="PEGAINFER_GEMMA4_GOLDEN is not a 31B fixture (${PEGAINFER_GEMMA4_GOLDEN##*/})" ;;
+    esac
+  fi
+}
+
 # --- prerequisites: the union over what this run selected, and no more -----
 needs=" "
 for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
@@ -592,8 +616,27 @@ case "$needs" in
   *" tp2 "*) device_count=2 ;;
   *" gpu "*) device_count=1 ;;
 esac
-[ "$device_count" -eq 0 ] || require_devices "$device_count"
-for want in gpu tp2 ckpt moeckpt prompts fixtures routedfixtures chatgolden tlgeom; do
+if [ "$device_count" -gt 0 ] && ! require_devices "$device_count"; then
+  # Two devices were wanted and only one is visible; a one-GPU host should still
+  # run the rest, so drop the two-rank gates by name and claim the single one.
+  [ "$device_count" -eq 2 ] || die "a device is required but none could be claimed"
+  kept=(); dropped=0
+  for entry in "${selected[@]}"; do
+    case ",${entry%%|*}," in
+      *,tp2,*) dropped=$((dropped + 1)) ;;
+      *) kept+=("$entry") ;;
+    esac
+  done
+  selected=("${kept[@]}")
+  [ ${#selected[@]} -gt 0 ] || die \
+    "only two-rank gates were selected and a second device is unavailable"
+  echo "gemma4 gates: not selected, a second device is unavailable: $dropped two-rank gate(s)"
+  needs=" "
+  for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
+  needs=" ${needs//,/ } "
+  require_devices 1 || die "a device is required but none could be claimed"
+fi
+for want in gpu tp2 ckpt moeckpt prompts fixtures routedfixtures chatgolden tlgeom hf31; do
   case "$needs" in
     *" $want "*)
       case "$want" in
@@ -618,6 +661,19 @@ if [ -n "$tlgeom_mismatch" ]; then
   done
   selected=("${kept[@]}")
   [ ${#selected[@]} -gt 0 ] || die "every selected gate needed the kernels' own geometry"
+fi
+
+# And the same for a gate that needs the 31B Hugging Face fixture.
+if [ -n "$hf31_mismatch" ]; then
+  kept=()
+  for entry in "${selected[@]}"; do
+    case ",${entry%%|*}," in
+      *,hf31,*) echo "gemma4 gates: not selected, $hf31_mismatch: ${entry##*|}" ;;
+      *) kept+=("$entry") ;;
+    esac
+  done
+  selected=("${kept[@]}")
+  [ ${#selected[@]} -gt 0 ] || die "every selected gate needed the 31B HF fixture"
 fi
 
 echo "gemma4 gates: source $(git rev-parse HEAD)$([ -n "$(git status --porcelain)" ] && echo ' (dirty)')"

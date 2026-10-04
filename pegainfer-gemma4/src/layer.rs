@@ -333,7 +333,7 @@ pub(crate) fn attention_epilogue_into(
         .attention
         .o_proj
         .project_into(ctx, attn, &scratch.linear, &mut scratch.attn_proj)?;
-    // o_proj is column-parallel: its output is this rank's partial sum over
+    // o_proj is row-parallel: its output is this rank's partial sum over
     // the whole hidden width, so it is summed across the group before the
     // residual add reads it.
     all_reduce_rows(comm, geom, &mut scratch.attn_proj, seq_len)?;
@@ -385,7 +385,7 @@ pub(crate) fn attention_epilogue_into(
         (None, _) => &mut scratch.down,
         (Some(_), None) => anyhow::bail!("Gemma 4: a routed layer met a dense epilogue scratch"),
     };
-    // `down` is column-parallel as well, and a routed block's output is summed
+    // `down` is row-parallel as well, and a routed block's output is summed
     // the same way.
     all_reduce_rows(comm, geom, feed_forward, seq_len)?;
     ops::rms_norm_add_scale_batch_into(

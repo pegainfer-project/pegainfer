@@ -6,6 +6,7 @@
 //! advances one token per batched decode step, sharing each layer's weight
 //! pass.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::Path;
 
@@ -62,6 +63,7 @@ const MIX_GATHER_ROWS_ENV: &str = "PEGAINFER_MIX_GATHER_ROWS";
 const MIX_MAX_PROMPTS_ENV: &str = "PEGAINFER_MIX_MAX_PROMPTS";
 const MAX_CONTEXT_ENV: &str = "PEGAINFER_MAX_CONTEXT";
 const DECODE_SLOTS_ENV: &str = "PEGAINFER_DECODE_SLOTS";
+const TP_MAX_PROMPT_ENV: &str = "PEGAINFER_TP_MAX_PROMPT";
 const KV_FP8_ENV: &str = "PEGAINFER_KV_FP8";
 const ADMIT_COALESCE_ENV: &str = "PEGAINFER_ADMIT_COALESCE_MS";
 const GLOBAL_ATTN_ENV: &str = "PEGAINFER_GLOBAL_ATTN";
@@ -125,6 +127,30 @@ fn parse_decode_slots(raw: &str) -> Result<usize> {
         Ok(value) if (1..=MAX_CONCURRENCY).contains(&value) => Ok(value),
         _ => anyhow::bail!(
             "{DECODE_SLOTS_ENV}={raw:?} not recognized (N, 1 <= N <= {MAX_CONCURRENCY})"
+        ),
+    }
+}
+
+/// The longest prompt tensor parallelism serves, in tokens. A prefill at least
+/// this long reaches a host-side device sync on rank 0 inside a global layer's
+/// MLP before the peer ranks have launched — a stall the single-threaded driver
+/// cannot recover from (docs/models/gemma4/tp.md "Known bounds"). Measured on the
+/// 60-layer 31B at TP2: 64 tokens completes, 128 stalls. Raising it needs the
+/// concurrent driver.
+const TP_MAX_PROMPT: usize = 64;
+const TP_MAX_PROMPT_OFF: &str = "off";
+
+/// `PEGAINFER_TP_MAX_PROMPT`: a positive token count, or `off`/`0` to lift the
+/// ceiling. Only consulted at world size > 1.
+fn parse_tp_max_prompt(raw: &str) -> Result<Option<usize>> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case(TP_MAX_PROMPT_OFF) || raw == "0" {
+        return Ok(None);
+    }
+    match raw.parse::<usize>() {
+        Ok(value) if value > 0 => Ok(Some(value)),
+        _ => anyhow::bail!(
+            "{TP_MAX_PROMPT_ENV}={raw:?} not recognized (N, N >= 1, or {TP_MAX_PROMPT_OFF})"
         ),
     }
 }
@@ -407,9 +433,9 @@ fn start_with_knobs(
             log::info!("tensor parallel: {world} ranks, NCCL {version}, NCCL_PROTO={proto}");
         } else {
             log::warn!(
-                "tensor parallel: {world} ranks, NCCL {version}, NCCL_PROTO={proto} — this \
-                 environment's stock NCCL corrupts the all-reduce buffer unless the protocol \
-                 is LL128 (see docs/models/gemma4/tp.md)"
+                "tensor parallel: {world} ranks, NCCL {version}, NCCL_PROTO={proto} — with the \
+                 LL and SIMPLE protocols the all-reduce kernel writes past its buffer on the \
+                 NCCL 2.18.3 this container ships; use LL128 (see docs/models/gemma4/tp.md)"
             );
         }
     }
@@ -591,11 +617,13 @@ impl Drop for AsyncPrefillLane {
 /// The fail-closed request validation every admission path shares; `Err`
 /// carries the typed refusal. Refuse every unsupported capability carried by
 /// the stepped `Request` (LoRA and P/D transfer metadata) rather than
-/// silently ignoring it, and a scored prompt longer than `score_ceiling`.
+/// silently ignoring it, a scored prompt longer than `score_ceiling`, and under
+/// tensor parallelism a prompt past the ceiling the prefill stall bounds.
 fn validate_request(
     request: &Request,
     max_context: usize,
     score_ceiling: usize,
+    tp_max_prompt: Option<usize>,
 ) -> Result<usize, RejectReason> {
     let prompt_tokens = request.prompt_tokens.len();
     if prompt_tokens == 0 {
@@ -627,6 +655,17 @@ fn validate_request(
         return Err(RejectReason::EchoPrefillTokens {
             prompt_tokens,
             limit: score_ceiling,
+        });
+    }
+    if let Some(limit) = tp_max_prompt
+        && prompt_tokens > limit
+    {
+        return Err(RejectReason::Unsupported {
+            feature: format!(
+                "prompts longer than {limit} tokens under tensor parallelism: a longer prefill \
+                 stalls the multi-rank driver (see {TP_MAX_PROMPT_ENV} and the tensor-parallel \
+                 notes)"
+            ),
         });
     }
     if request.kv_transfer_params.is_some() {
@@ -731,6 +770,9 @@ struct ServingKnobs {
     local_kv_storage: KvStorage,
     global_attn: GlobalAttn,
     prefix_cache: Option<usize>,
+    /// The resolved `TP_MAX_PROMPT_ENV` ceiling (`None` = lifted). Applied only
+    /// at world size > 1, where it is what the prefill stall bounds.
+    tp_max_prompt: Option<usize>,
 }
 
 impl ServingKnobs {
@@ -762,6 +804,8 @@ impl ServingKnobs {
             .map_or(Ok(GlobalAttn::Incumbent), |raw| parse_global_attn(&raw))?;
         let prefix_cache =
             lookup(PREFIX_CACHE_ENV)?.map_or(Ok(None), |raw| parse_prefix_cache_cap(&raw))?;
+        let tp_max_prompt = lookup(TP_MAX_PROMPT_ENV)?
+            .map_or(Ok(Some(TP_MAX_PROMPT)), |raw| parse_tp_max_prompt(&raw))?;
 
         // The stub tier links under the same name and refuses at launch, so
         // without this the answer would arrive after the weights are loaded
@@ -814,6 +858,7 @@ impl ServingKnobs {
             local_kv_storage,
             global_attn,
             prefix_cache,
+            tp_max_prompt,
         })
     }
 }
@@ -1141,9 +1186,6 @@ fn send_scheduled(request: &QueuedRequest, cached_tokens: usize, ledger: &mut Re
     }
 }
 
-/// Everything the contract-owned scheduler thread owns for the life of the
-/// engine. Loading completes before the driver thread is spawned, so launch
-/// failures return synchronously to the caller.
 /// One tensor-parallel rank's device state. Rank 0's lives in `EngineState`'s
 /// own fields; ranks 1.. world size ride in `EngineState::more`.
 struct RankState {
@@ -1211,13 +1253,40 @@ fn rank_kvs(rows: &mut [Active], rank: usize) -> Vec<&mut RankKv> {
 /// instead of letting it hang, and stops the engine — a comm-less step would
 /// otherwise silently reduce to a no-op. A free function over the two fields so
 /// a caller holding a `&self.ctx` borrow (the scored path) can still abort.
-fn abort_comms(serve: &mut GemmaServe, more: &mut [RankState]) {
+/// Break the tensor-parallel engine after a rank-0 step has failed: release
+/// every rank's captured graphs, then abort every communicator.
+///
+/// Rank 0 may have stopped between two collectives, so a peer's matching call
+/// will never arrive; aborting the comms unblocks any peer already waiting
+/// instead of letting it hang. The graphs go first, on their own device,
+/// exactly as `Drop` orders it — aborting a comm while a graph that references
+/// its NCCL launches is alive wedges. `broken` is then set so no later step runs
+/// a comm-less reduction, which would return partial sums.
+fn abort_comms(
+    broken: &Cell<bool>,
+    ctx: &DeviceContext,
+    serve: &mut GemmaServe,
+    arena: &mut StepArena,
+    more: &mut [RankState],
+) {
+    broken.set(true);
+    if select_device(ctx).is_ok() {
+        arena.release_graphs();
+    }
+    for state in more.iter_mut() {
+        if select_device(&state.ctx).is_ok() {
+            state.arena.release_graphs();
+        }
+    }
     serve.detach_tp_comm();
     for state in more {
         state.serve.detach_tp_comm();
     }
 }
 
+/// Everything the contract-owned scheduler thread owns for the life of the
+/// engine. Loading completes before the driver thread is spawned, so launch
+/// failures return synchronously to the caller.
 struct EngineState {
     ctx: DeviceContext,
     serve: GemmaServe,
@@ -1256,6 +1325,13 @@ struct EngineState {
     /// The decode-slot count the pools are budgeted for; requests past it
     /// queue.
     slots: usize,
+    /// Set once the tensor-parallel comms are aborted; every later step then
+    /// refuses rather than run a comm-less reduction that would return partial
+    /// sums. `Cell` so the abort path can set it while holding `&self.ctx`.
+    tp_broken: Cell<bool>,
+    /// The longest prompt tensor parallelism serves (`None` = no ceiling). The
+    /// known long-prompt prefill stall bounds it (see `TP_MAX_PROMPT`).
+    tp_max_prompt: Option<usize>,
     /// The admission coalesce window; `None` unless
     /// `PEGAINFER_ADMIT_COALESCE_MS` opted in at startup.
     admit_coalesce: Option<std::time::Duration>,
@@ -1327,13 +1403,13 @@ impl EngineState {
     /// Run `per_rank` on every extra rank, drain each stream, and require that
     /// they all end on rank 0's frontier.
     ///
-    /// Call this *after* rank 0's own step has been started, unconditionally:
-    /// the ranks share one collective sequence, so a rank-0 failure that skipped
-    /// the peer would leave the peer's matching calls unpaired, and the pairing
-    /// then shifts for every later step — reducing one layer's partials against
-    /// another's — or wedges the peer at its drain. A failure on an extra rank
-    /// is fatal here, because the ranks' frontiers must not drift apart, while
-    /// rank 0's own failure stays the caller's to report. The drain is what
+    /// Call this only once rank 0's own step has **succeeded** and is in flight:
+    /// a rank-0 failure means its collective sequence stopped short, and driving
+    /// the peer's whole tower would leave it waiting on a call that never comes,
+    /// so the caller aborts the comms instead (see `abort_comms`). With rank 0
+    /// launched, every rank's work is in flight before any drain, so the shared
+    /// collective sequence stays paired. A failure on an extra rank is fatal
+    /// here, because the ranks' frontiers must not drift apart. The drain is what
     /// turns a device fault on a non-primary rank into a named error instead of
     /// the primary's collective stalling forever.
     fn step_extra_ranks<F>(&self, kv: &mut GemmaKv, per_rank: F) -> Result<()>
@@ -1558,14 +1634,18 @@ impl EngineState {
             ledger.retire(request.id);
             return PreparedNewcomer::Done;
         }
-        let context_len =
-            match validate_request(&request.request, self.max_context, self.score_ceiling) {
-                Ok(len) => len,
-                Err(reason) => {
-                    ledger.reject(request.id, reason);
-                    return PreparedNewcomer::Done;
-                }
-            };
+        let context_len = match validate_request(
+            &request.request,
+            self.max_context,
+            self.score_ceiling,
+            self.tp_max_prompt,
+        ) {
+            Ok(len) => len,
+            Err(reason) => {
+                ledger.reject(request.id, reason);
+                return PreparedNewcomer::Done;
+            }
+        };
         let (mut kv, resumed) = self.resolve_newcomer_kv(&request.request);
         let new_tokens = request.request.prompt_tokens.len() - kv.local.seq_len();
         if options
@@ -1632,7 +1712,11 @@ impl EngineState {
             local_kv_storage,
             global_attn,
             prefix_cache: cache_cap,
+            tp_max_prompt,
         } = knobs;
+        // The ceiling only bounds a tensor-parallel prefill; at world size 1
+        // there is no peer to stall waiting for.
+        let tp_max_prompt = (world > 1).then_some(tp_max_prompt).flatten();
         if global_attn.tilelang() {
             ensure_tilelang_device(device)?;
         }
@@ -1922,6 +2006,8 @@ impl EngineState {
             max_context,
             score_ceiling,
             slots,
+            tp_broken: Cell::new(false),
+            tp_max_prompt,
             admit_coalesce,
         })
     }
@@ -2122,7 +2208,13 @@ impl EngineState {
             let mut tower = match self.serve.launch_prompt_tower(ctx, &mut kv, prompt) {
                 Ok(tower) => tower,
                 Err(err) => {
-                    abort_comms(&mut self.serve, &mut self.more);
+                    abort_comms(
+                        &self.tp_broken,
+                        &self.ctx,
+                        &mut self.serve,
+                        &mut self.arena,
+                        &mut self.more,
+                    );
                     return Err(err.context("scored prompt tower"));
                 }
             };
@@ -2134,7 +2226,13 @@ impl EngineState {
                     .step_scoring(&state.ctx, rank_kv, prompt, None)
                     .map(|_| ())
             }) {
-                abort_comms(&mut self.serve, &mut self.more);
+                abort_comms(
+                    &self.tp_broken,
+                    &self.ctx,
+                    &mut self.serve,
+                    &mut self.arena,
+                    &mut self.more,
+                );
                 return Err(err);
             }
             self.serve
@@ -2165,7 +2263,13 @@ impl EngineState {
                     Ok(logits)
                 }
                 Err(err) => {
-                    abort_comms(&mut self.serve, &mut self.more);
+                    abort_comms(
+                        &self.tp_broken,
+                        &self.ctx,
+                        &mut self.serve,
+                        &mut self.arena,
+                        &mut self.more,
+                    );
                     Err(err.context("solo prefill tower"))
                 }
             }
@@ -2173,6 +2277,12 @@ impl EngineState {
         let mut logits = match stepped {
             Ok(logits) => logits,
             Err(err) => {
+                // A broken tensor-parallel engine cannot serve: the comms are
+                // gone, so every later step would skip its reduction and return
+                // partial sums. Stop rather than fail this request and continue.
+                if self.tp_broken.get() {
+                    return Err(err.context("tensor-parallel ranks diverged; engine stopped"));
+                }
                 // This prompt's prefill failed; its pages return with `kv`
                 // and the engine keeps serving.
                 log::error!("solo prefill failed: {err:#}");
@@ -2375,7 +2485,13 @@ impl EngineState {
                 Ok(logits)
             }
             Err(err) => {
-                abort_comms(&mut self.serve, &mut self.more);
+                abort_comms(
+                    &self.tp_broken,
+                    &self.ctx,
+                    &mut self.serve,
+                    &mut self.arena,
+                    &mut self.more,
+                );
                 Err(err.context("chunked prefill tower"))
             }
         }
@@ -2685,8 +2801,8 @@ impl EngineState {
         {
             activate_rank(&self.ctx)?;
             let mut kvs = rank_kvs(active, 0);
-            // Rank 0's verdict is held, not propagated: the other ranks must be
-            // driven either way (see `step_extra_ranks`).
+            // Rank 0's verdict is checked before the peers are driven: a failure
+            // aborts the comms and stops the engine (see `abort_comms`).
             let rank0 = if let Some(tokens) = tokens.as_deref() {
                 self.serve
                     .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)
@@ -2699,7 +2815,13 @@ impl EngineState {
             if let Err(err) = rank0 {
                 // Rank 0's sequence stopped short; abort before any peer waits
                 // on a collective that will never be issued.
-                abort_comms(&mut self.serve, &mut self.more);
+                abort_comms(
+                    &self.tp_broken,
+                    &self.ctx,
+                    &mut self.serve,
+                    &mut self.arena,
+                    &mut self.more,
+                );
                 return Err(err.context("batched decode launch"));
             }
             // The other ranks carry the same tokens and page ids; only rank 0
@@ -2814,8 +2936,26 @@ impl EngineState {
                 &decode_tokens,
             )
         };
+        // Rank 0's mixed step is in flight, so the peers' collectives have their
+        // match. Check its verdict before driving them: a rank-0 failure means
+        // its sequence stopped short, and a peer's whole mixed step would wait on
+        // a call that never comes.
+        let logits = match stepped {
+            Ok(logits) => logits,
+            Err(err) => {
+                abort_comms(
+                    &self.tp_broken,
+                    &self.ctx,
+                    &mut self.serve,
+                    &mut self.arena,
+                    &mut self.more,
+                );
+                fail_active_batch(active, "mixed step", &err, ledger);
+                return Err(err.context("gemma4 mixed step"));
+            }
+        };
         // The other ranks run the same mixed step on their own families and
-        // arena; their logits are discarded.
+        // arena; their logits are discarded. A failure on them is fatal.
         for (rank, state) in self.more.iter_mut().enumerate() {
             activate_rank(&state.ctx)?;
             let mut extra_prefills: Vec<(&mut RankKv, &[u32])> = prefills
@@ -2832,16 +2972,6 @@ impl EngineState {
             )?;
         }
         activate_rank(&self.ctx)?;
-        let logits = match stepped {
-            Ok(logits) => logits,
-            Err(err) => {
-                // Rank 0's mixed step broke mid-sequence; abort so the peers
-                // cannot hang on the collective it never issued.
-                abort_comms(&mut self.serve, &mut self.more);
-                fail_active_batch(active, "mixed step", &err, ledger);
-                return Err(err.context("gemma4 mixed step"));
-            }
-        };
         mixed_head_flow(
             &self.ctx,
             &self.suppress_ids,
@@ -2920,8 +3050,8 @@ impl EngineState {
     ) -> Result<()> {
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
         activate_rank(&self.ctx)?;
-        // Rank 0's verdict is held rather than propagated: the extra ranks have
-        // to be driven either way (see `step_extra_ranks`).
+        // Rank 0's verdict is checked before the peers are driven: a failure
+        // aborts the comms and stops the engine (see `abort_comms`).
         let rank0 = {
             let mut kvs = rank_kvs(active, 0);
             self.serve
@@ -2931,7 +3061,13 @@ impl EngineState {
         if let Err(err) = rank0 {
             // Rank 0's sequence stopped short; abort so no peer waits on a
             // collective that will never be issued.
-            abort_comms(&mut self.serve, &mut self.more);
+            abort_comms(
+                &self.tp_broken,
+                &self.ctx,
+                &mut self.serve,
+                &mut self.arena,
+                &mut self.more,
+            );
             let _ = self.fence();
             fail_active_batch(active, "batched decode", &err, ledger);
             return Err(err.context("batched decode"));
@@ -3051,6 +3187,12 @@ impl Scheduler for Gemma4Scheduler {
     }
 
     fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        if self.state.tp_broken.get() {
+            anyhow::bail!(
+                "tensor-parallel ranks diverged; the communicators are aborted and the engine \
+                 cannot serve"
+            );
+        }
         if self.cublas.is_none() {
             // Rank 0's handles, and the guard that tears every device's handles
             // down on this thread. Each other rank's handles are created the

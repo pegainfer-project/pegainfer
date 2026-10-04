@@ -219,6 +219,9 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
                     left.contains_key(&pb),
                     "{what}: request {index} step {step}: two-rank pick is outside the one-rank top-{TOP_K}"
                 );
+                // The two runs now decode from different prefixes, so every later
+                // step of this request compares different text; stop here.
+                break;
             }
         }
     }
@@ -275,19 +278,12 @@ fn the_two_rank_engine_matches_one_rank() {
     let tp2 = serve_batch(&mut two, &prompts, 16, TOP_K);
     drop(two);
 
-    // Against both one-rank runs: agreement with one run is not enough when the
-    // two runs could differ in a way the control above does not exercise.
+    // The control pins `single == repeat` bit for bit, so comparing tp2 against
+    // the repeat run would repeat this comparison; one of them is enough.
     let gaps = distribution_gap(&single, &tp2, "tp2");
-    let against_repeat = distribution_gap(&repeat, &tp2, "tp2-vs-repeat");
     eprintln!(
-        "tp2: {}/{} steps keep the one-rank pick; worst picked-token logprob gap {:.4} \
-         (top {:.4}); against the repeat run {:.4} (top {:.4})",
-        gaps.same_pick,
-        gaps.compared,
-        gaps.worst_pick,
-        gaps.worst_top,
-        against_repeat.worst_pick,
-        against_repeat.worst_top
+        "tp2: {}/{} steps keep the one-rank pick; worst picked-token logprob gap {:.4} (top {:.4})",
+        gaps.same_pick, gaps.compared, gaps.worst_pick, gaps.worst_top
     );
     eprintln!(
         "tp2: worst shared-token {:.4} at request {} step {} token {} ({:.4} vs {:.4})",
@@ -307,13 +303,6 @@ fn the_two_rank_engine_matches_one_rank() {
         gaps.worst_pick,
         gaps.worst_top
     );
-    assert!(
-        against_repeat.worst_pick < LOGBROB_LINE && against_repeat.worst_top < LOGBROB_LINE,
-        "two-rank disagrees with the second one-rank run by {} on a picked token / {} at \
-         the top (line {LOGBROB_LINE})",
-        against_repeat.worst_pick,
-        against_repeat.worst_top
-    );
 }
 
 /// The serving knobs a gate may force from the environment, so the same gate
@@ -324,6 +313,7 @@ fn envelope_overrides() -> Vec<(&'static str, String)> {
     for (var, knob) in [
         ("PEGAINFER_TP_SLOTS", super::DECODE_SLOTS_ENV),
         ("PEGAINFER_TP_CTX", super::MAX_CONTEXT_ENV),
+        ("PEGAINFER_TP_MAX_PROMPT", super::TP_MAX_PROMPT_ENV),
     ] {
         if let Ok(value) = std::env::var(var) {
             overrides.push((knob, value));
@@ -346,25 +336,31 @@ fn as_refs<'a>(overrides: &'a [(&'static str, String)]) -> Vec<(&'static str, &'
 #[ignore = "needs two GPUs and --test-threads=1"]
 fn the_two_rank_engine_scores_prompt_logprobs() {
     const TOP_K: usize = 8;
+    // The gate's prompt is the TP ceiling itself, so the length the guard
+    // refuses past is the length this passes. `PEGAINFER_TP_PROMPT_TOKENS`
+    // overrides it to probe another point.
+    let len: usize = std::env::var("PEGAINFER_TP_PROMPT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(super::TP_MAX_PROMPT);
     let (device, peer) = devices();
     assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
     let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
-    let mut controls = Vec::new();
-    // Two requests, not one: the second scored admission arrives while the
-    // first request still holds KV, which is the path a single submit misses.
-    for (label, len) in [("first", 9usize), ("second", 9usize)] {
-        let prompt = ids(len, 11);
-        eprintln!("probe: {label}: {len} tokens: submitting");
-        let control = harness.submit_scored(prompt.clone(), 1, Some(TOP_K), Some(TOP_K));
-        let drained = harness.steps.drain(control.id(), label);
-        eprintln!("probe: {label}: drained");
+    // Both submitted before either is drained, so the second scored admission
+    // arrives while the first still holds KV — the path a single submit misses.
+    let prompts: Vec<Vec<u32>> = [11u32, 26].into_iter().map(|seed| ids(len, seed)).collect();
+    let controls: Vec<_> = prompts
+        .iter()
+        .map(|prompt| harness.submit_scored(prompt.clone(), 1, Some(TOP_K), Some(TOP_K)))
+        .collect();
+    for (control, prompt) in controls.iter().zip(&prompts) {
+        let drained = harness.steps.drain(control.id(), "scored prompt");
         let echo = drained.prompt_echo.expect("the engine echoes the prompt");
         assert_eq!(
             echo.logprobs.len(),
             prompt.len(),
-            "one scored row per prompt token"
+            "one scored prompt row per prompt token"
         );
-        controls.push(control);
     }
     let refs: Vec<&_> = controls.iter().collect();
     harness.shutdown(&refs);
@@ -388,11 +384,11 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     /// logits. A shared token may sit this far apart: bf16 reduction order and a
     /// different attention backend, nothing structural.
     const DRIFT_LINE: f32 = 1.0;
-    // The fixture also carries "edge" (1024 tokens), but a long prompt's prefill
-    // reaches a host-side device sync on rank 0 — inside a global layer's MLP —
-    // before the peer ranks have launched their collectives, and the one driving
-    // thread then stalls. `docs/models/gemma4/tp.md` records it; the case joins
-    // the gate once the ranks are driven concurrently.
+    // The fixture also carries "edge" (1024 tokens), but that is past the TP
+    // prompt ceiling: a prefill that long stalls the single-threaded multi-rank
+    // driver before the peer ranks launch (docs/models/gemma4/tp.md "Known
+    // bounds"), so admission refuses it (`TP_MAX_PROMPT`). The case joins the
+    // gate once the ranks are driven concurrently.
     const CASES: [&str; 1] = ["short"];
 
     let (device, peer) = devices();
