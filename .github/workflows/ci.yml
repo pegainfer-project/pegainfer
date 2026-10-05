@@ -155,6 +155,12 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: cargo test --release --locked -p kvbm-logical --lib
 
+      # Foundation-only slice: no CUDA dependency at all, so its probe and config
+      # tests belong on a CPU runner rather than in the per-model CUDA matrix.
+      - name: Run pegainfer-qwen38-flash-next unit tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: cargo test --release --locked -p pegainfer-qwen38-flash-next --lib
+
   cpu-clippy:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
     name: CPU Clippy
@@ -189,6 +195,7 @@ jobs:
           -p pegainfer-build
           -p pegainfer-frontend
           -p pegainfer-sim
+          -p pegainfer-qwen38-flash-next
           -p kvbm-logical
           --all-targets -- -D warnings
 
