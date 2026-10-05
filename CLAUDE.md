@@ -12,6 +12,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 |-------|-------|-------------|-------------|
 | Qwen3-4B / 8B | `pegainfer-qwen3` | `qwen3` (default) | Full attention, TP support |
 | Qwen3.5-4B / 9B / 27B · Qwen3.8-27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention. Qwen3.8 shares the line: same `model_type`, same text geometry — see `docs/models/qwen35/support-qwen38.md` |
+| Qwen3.8-Flash-Next | `pegainfer-qwen38-flash-next` | `--features qwen38-flash-next` | `qwen4_exp`, a separate line from `qwen35`: Gated DeltaNet + Qwen Sparse Attention, 512-expert MoE, hyper-connections, host-resident n-gram table. **Foundation only** (probe, config, tensor contract) — detection succeeds and launch refuses until the text graph lands |
 | DeepSeek-V2-Lite | `pegainfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
 | Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Sliding-window + global full attention, dense sizes at TP2 (one rank per device), batched decode, opt-in chunked prefill (single rank only) |
 | Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |

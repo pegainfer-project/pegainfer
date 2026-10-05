@@ -37,6 +37,8 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
         &pegainfer_qwen3::model_line::MODEL_LINE,
         #[cfg(feature = "qwen35")]
         &pegainfer_qwen35::model_line::MODEL_LINE,
+        #[cfg(feature = "qwen38-flash-next")]
+        &pegainfer_qwen38_flash_next::model_line::MODEL_LINE,
     ]
 }
 
@@ -104,6 +106,12 @@ fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
             model_types: &["qwen3_5"],
             text_model_types: &["qwen3_5_text"],
             compiled: cfg!(feature = "qwen35"),
+        },
+        Family {
+            feature: "qwen38-flash-next",
+            model_types: &["qwen4_exp"],
+            text_model_types: &["qwen4_exp_text"],
+            compiled: cfg!(feature = "qwen38-flash-next"),
         },
     ];
     families.iter().find_map(|family| {
@@ -289,6 +297,39 @@ mod tests {
     fn hint_is_silent_for_a_compiled_family() {
         let config = serde_json::json!({"model_type": "qwen3"});
         assert!(feature_gate_hint(&config).is_none());
+    }
+
+    #[cfg(not(feature = "qwen38-flash-next"))]
+    #[test]
+    fn hint_names_the_flash_next_feature_for_its_own_identity() {
+        let config = serde_json::json!({
+            "model_type": "qwen4_exp",
+            "text_config": {"model_type": "qwen4_exp_text"}
+        });
+        let hint = feature_gate_hint(&config).expect("qwen4_exp identity should hint");
+        assert!(hint.contains("--features qwen38-flash-next"), "{hint}");
+    }
+
+    /// The Qwen3.5 probe hard-requires `qwen3_5`, so without this family entry a
+    /// Flash-Next checkpoint would fall through to "unknown model" instead of
+    /// naming the feature to rebuild with — and with the entry present it must
+    /// still not claim the Qwen3.5 identity.
+    #[cfg(not(feature = "qwen38-flash-next"))]
+    #[test]
+    fn flash_next_and_qwen35_identities_do_not_cross_hint() {
+        let qwen35 = serde_json::json!({
+            "model_type": "qwen3_5",
+            "text_config": {"model_type": "qwen3_5_text"}
+        });
+        let hint = feature_gate_hint(&qwen35).unwrap_or_default();
+        assert!(!hint.contains("qwen38-flash-next"), "{hint}");
+
+        let flash_next = serde_json::json!({
+            "model_type": "qwen4_exp",
+            "text_config": {"model_type": "qwen4_exp_text"}
+        });
+        let hint = feature_gate_hint(&flash_next).expect("should hint");
+        assert!(!hint.contains("--features qwen35"), "{hint}");
     }
 
     #[test]

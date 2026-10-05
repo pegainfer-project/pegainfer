@@ -129,6 +129,11 @@ jobs:
             needs_protobuf: true
           - package: kvbm-logical
             needs_protobuf: false
+          # Foundation-only slice: no CUDA dependency at all, so its probe and
+          # config tests belong on a CPU runner rather than in the per-model CUDA
+          # matrix.
+          - package: pegainfer-qwen38-flash-next
+            needs_protobuf: false
 
     steps:
       - name: Checkout
@@ -188,6 +193,7 @@ jobs:
           -p pegainfer-build
           -p pegainfer-frontend
           -p pegainfer-sim
+          -p pegainfer-qwen38-flash-next
           -p kvbm-logical
           --all-targets -- -D warnings
 
