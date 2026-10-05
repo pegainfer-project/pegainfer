@@ -490,6 +490,19 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // The same kernel with a sigmoid gate, for the lines whose
+    // `output_gate_type` selects it.
+    pub fn rms_norm_gated_sigmoid_cuda(
+        x: *const Half,
+        weight: *const f32,
+        gate: *const Half,
+        out: *mut Half,
+        num_heads: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
     // ========================================================================
     // Paged attention (FlashInfer)
     // ========================================================================

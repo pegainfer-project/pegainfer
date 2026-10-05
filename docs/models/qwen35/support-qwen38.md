@@ -53,8 +53,10 @@ like a numerics break. It is not, on three independent grounds:
    only consumer in the whole wheel is `qwen4_exp`, a different architecture.
 2. **Reading it would change nothing.** swish ≡ silu, and the gated RMSNorm
    silu is exactly what PegaInfer already applies
-   (`pegainfer-kernels/csrc/shared/norm.cu:58`), matching HF's
-   `Qwen3_5RMSNormGated`.
+   (`pegainfer-kernels/csrc/shared/norm.cu:70`), matching HF's
+   `Qwen3_5RMSNormGated`. Scoped to `qwen3_5`: that kernel now also carries a
+   sigmoid entry point for the `qwen4_exp` architecture of item 1, and
+   Qwen3.8-27B never reaches it.
 3. **The weights say so.** Swap `torch.sigmoid` for `x·sigmoid(x)` at the
    module's single call site and teacher-force both hypotheses: Qwen3.8-27B
    NLL **1.82** (sigmoid, coherent prose) vs 14.27 (silu, token soup); a

@@ -627,9 +627,21 @@ pub fn rms_norm_offset_into(
     Ok(())
 }
 
+/// Which activation multiplies a gated RMSNorm's output.
+///
+/// Qwen3.5's Gated DeltaNet uses [`GatedNormActivation::Silu`].
+/// Qwen3.8-Flash-Next declares `output_gate_type: "sigmoid"`, and its reference
+/// implementation passes that field straight to the gated norm, so the same
+/// kernel has to serve both. Note the *attention* output gate is a hardcoded
+/// sigmoid on both lines; this enum is only about the gated norm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedNormActivation {
+    Silu,
+    Sigmoid,
+}
+
 /// Batched per-head RMSNorm with F32 weight + SiLU gate multiplication.
 /// HiddenStates are flattened as (seq_len * num_heads) contiguous head slices.
-#[allow(clippy::too_many_arguments)]
 pub fn rms_norm_gated_batch_into(
     ctx: &DeviceContext,
     x: &HiddenStates,
@@ -639,6 +651,31 @@ pub fn rms_norm_gated_batch_into(
     num_heads: usize,
     head_dim: usize,
     eps: f32,
+) {
+    rms_norm_gated_activation_batch_into(
+        ctx,
+        x,
+        weight,
+        gate,
+        out,
+        num_heads,
+        head_dim,
+        eps,
+        GatedNormActivation::Silu,
+    );
+}
+
+/// [`rms_norm_gated_batch_into`] with the gate activation chosen by the caller.
+pub fn rms_norm_gated_activation_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &CudaSlice<f32>,
+    gate: &HiddenStates,
+    out: &mut HiddenStates,
+    num_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    activation: GatedNormActivation,
 ) {
     let total_heads = x.seq_len * num_heads;
     assert_eq!(x.hidden_dim, num_heads * head_dim);
@@ -650,17 +687,30 @@ pub fn rms_norm_gated_batch_into(
     let (w_ptr, _gw) = weight.device_ptr(&ctx.stream);
     let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
     let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let stream = crate::tensor::active_cu_stream(ctx);
     unsafe {
-        ffi::rms_norm_gated_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const f32,
-            g_ptr as *const ffi::Half,
-            o_ptr as *mut ffi::Half,
-            total_heads as i32,
-            head_dim as i32,
-            eps,
-            crate::tensor::active_cu_stream(ctx),
-        );
+        match activation {
+            GatedNormActivation::Silu => ffi::rms_norm_gated_cuda(
+                x_ptr as *const ffi::Half,
+                w_ptr as *const f32,
+                g_ptr as *const ffi::Half,
+                o_ptr as *mut ffi::Half,
+                total_heads as i32,
+                head_dim as i32,
+                eps,
+                stream,
+            ),
+            GatedNormActivation::Sigmoid => ffi::rms_norm_gated_sigmoid_cuda(
+                x_ptr as *const ffi::Half,
+                w_ptr as *const f32,
+                g_ptr as *const ffi::Half,
+                o_ptr as *mut ffi::Half,
+                total_heads as i32,
+                head_dim as i32,
+                eps,
+                stream,
+            ),
+        }
     }
 }
 
@@ -804,5 +854,156 @@ mod parity {
         dual_rms_norm_add_batch_into(&ctx, &a, &wa, &b, &wb, eps, &mut fused)
             .expect("fused combine");
         assert_bitwise(&ctx, &split, &fused, "fused MoE combine");
+    }
+
+    /// CPU reference for the per-head gated RMSNorm, in f64 then rounded to bf16.
+    /// The kernel reduces in f32 with a warp tree, so this is an oracle with a
+    /// bf16-sized tolerance, not a bit-exact model.
+    fn gated_norm_reference(
+        x: &[bf16],
+        weight: &[f32],
+        gate: &[bf16],
+        head_dim: usize,
+        eps: f32,
+        sigmoid: bool,
+    ) -> Vec<bf16> {
+        let mut out = vec![bf16::from_f32(0.0); x.len()];
+        for head in 0..(x.len() / head_dim) {
+            let base = head * head_dim;
+            let mut sumsq = 0.0f64;
+            for t in 0..head_dim {
+                let v = f64::from(x[base + t].to_f32());
+                sumsq += v * v;
+            }
+            let inv_rms = 1.0 / (sumsq / head_dim as f64 + f64::from(eps)).sqrt();
+            for t in 0..head_dim {
+                let normed = f64::from(x[base + t].to_f32()) * inv_rms * f64::from(weight[t]);
+                let g = f64::from(gate[base + t].to_f32());
+                let sigma = 1.0 / (1.0 + (-g).exp());
+                let activated = if sigmoid { sigma } else { g * sigma };
+                out[base + t] = bf16::from_f32((normed * activated) as f32);
+            }
+        }
+        out
+    }
+
+    fn assert_close(got: &[bf16], want: &[bf16], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what} length");
+        assert!(!got.is_empty(), "{what}: nothing to compare");
+        let tolerance = |magnitude: f64| 0.02 + 0.03 * magnitude;
+        let mut worst = (0usize, 0.0f64, 0.0f64);
+        let mut worst_excess = f64::NEG_INFINITY;
+        for (index, (got_value, want_value)) in got.iter().zip(want).enumerate() {
+            let (got_value, want_value) = (
+                f64::from(got_value.to_f32()),
+                f64::from(want_value.to_f32()),
+            );
+            let (abs_diff, magnitude) = ((got_value - want_value).abs(), want_value.abs());
+            // Rank by the margin against the actual bound, not by the raw
+            // deviation: the bound is affine in `magnitude`, so the two orderings
+            // differ, and ranking by deviation can let a large-magnitude element
+            // past its own bound while a small-magnitude element, ranked higher,
+            // passes. Every element is checked for that reason.
+            let excess = abs_diff - tolerance(magnitude);
+            if excess > worst_excess {
+                worst_excess = excess;
+                worst = (index, abs_diff, magnitude);
+            }
+        }
+        let (index, abs_diff, magnitude) = worst;
+        assert!(
+            worst_excess <= 0.0,
+            "{what}: element {index} differs by {abs_diff} (reference {magnitude}), over the \
+             tolerance by {worst_excess}"
+        );
+    }
+
+    /// The gated norm now has two activations, because Qwen3.8-Flash-Next's
+    /// `output_gate_type` selects sigmoid where Qwen3.5 uses silu. Run at the
+    /// Flash-Next GDN geometry (48 value heads at head_dim 128). Both are checked
+    /// against a CPU reference, and the two must actually differ — a template
+    /// parameter that collapsed would otherwise pass every pre-existing gate.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_gated_norm_activations_match_their_references() {
+        let ctx = DeviceContext::new_with_device(0).expect("device");
+        let (num_heads, head_dim, seq_len, eps) = (48usize, 128usize, 4usize, 1e-6f32);
+        let d = num_heads * head_dim;
+        let x = seeded(&ctx, d, seq_len, 11);
+        let gate = seeded(&ctx, d, seq_len, 12);
+        let weight_host: Vec<f32> = (0..head_dim)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.25 + 1.0)
+            .collect();
+        let weight = ctx.stream.clone_htod(&weight_host).expect("weight up");
+
+        let mut silu_out = HiddenStates::zeros(&ctx, d, seq_len).expect("silu buf");
+        rms_norm_gated_batch_into(
+            &ctx,
+            &x,
+            &weight,
+            &gate,
+            &mut silu_out,
+            num_heads,
+            head_dim,
+            eps,
+        );
+        let mut sigmoid_out = HiddenStates::zeros(&ctx, d, seq_len).expect("sigmoid buf");
+        rms_norm_gated_activation_batch_into(
+            &ctx,
+            &x,
+            &weight,
+            &gate,
+            &mut sigmoid_out,
+            num_heads,
+            head_dim,
+            eps,
+            GatedNormActivation::Sigmoid,
+        );
+
+        let x_host = ctx.stream.clone_dtoh(&x.data).expect("x down");
+        let gate_host = ctx.stream.clone_dtoh(&gate.data).expect("gate down");
+        let silu_host = ctx.stream.clone_dtoh(&silu_out.data).expect("silu down");
+        let sigmoid_host = ctx
+            .stream
+            .clone_dtoh(&sigmoid_out.data)
+            .expect("sigmoid down");
+
+        assert_close(
+            &silu_host,
+            &gated_norm_reference(&x_host, &weight_host, &gate_host, head_dim, eps, false),
+            "silu gated norm",
+        );
+        assert_close(
+            &sigmoid_host,
+            &gated_norm_reference(&x_host, &weight_host, &gate_host, head_dim, eps, true),
+            "sigmoid gated norm",
+        );
+
+        // silu(g) == g * sigmoid(g), and both paths share the same normalized
+        // value, so the outputs must be related by exactly the gate. This is what
+        // pins the two instantiations apart independently of the reference.
+        let differing = silu_host
+            .iter()
+            .zip(&sigmoid_host)
+            .zip(&gate_host)
+            .filter(|((s, g), gate)| {
+                let (s, g, gate) = (s.to_f32(), g.to_f32(), gate.to_f32());
+                (s - g * gate).abs() > 0.02 + 0.03 * (g * gate).abs()
+            })
+            .count();
+        assert_eq!(differing, 0, "silu output is not gate * sigmoid output");
+        // The two instantiations must actually diverge, or the template parameter
+        // collapsed. Counting non-zeros would not show it: silu(g) and sigmoid(g)
+        // vanish on the same inputs, so the counts coincide. Compare the buffers.
+        let diverging = silu_host
+            .iter()
+            .zip(&sigmoid_host)
+            .filter(|(s, g)| s.to_bits() != g.to_bits())
+            .count();
+        assert!(
+            diverging * 2 > silu_host.len(),
+            "only {diverging} of {} elements differ between the two activations",
+            silu_host.len()
+        );
     }
 }

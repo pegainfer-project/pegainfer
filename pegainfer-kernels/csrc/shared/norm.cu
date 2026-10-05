@@ -3,17 +3,25 @@
 // The standard RMSNorm / FusedAddRMSNorm / Gemma variants have been migrated
 // to flashinfer_norm.cu which delegates to FlashInfer's header-only templates.
 //
-// This file retains only:
-//   rms_norm_gated_cuda — per-head RMSNorm with SiLU gate (Qwen3.5 linear attention output).
+// This file retains only the per-head gated RMSNorm used on a linear-attention
+// output, in two activations:
+//   rms_norm_gated_cuda         — SiLU gate    (Qwen3.5 Gated DeltaNet)
+//   rms_norm_gated_sigmoid_cuda — sigmoid gate (Qwen3.8-Flash-Next, whose
+//                                 `output_gate_type` selects this)
+// Both are the same kernel; the activation is a template parameter so each
+// instantiation compiles to exactly the arithmetic it had before.
 
 #include "common.cuh"
 
 // ============================================================================
 // Gated RMSNorm for linear attention output:
-//   out = rms_norm(x, f32_weight) * silu(gate)
+//   out = rms_norm(x, f32_weight) * activation(gate)
 // Per-head normalization: x is [num_heads * head_dim], weight is [head_dim] (broadcast).
 // Grid: num_heads blocks, head_dim threads.
 // ============================================================================
+enum class GatedNormActivation { kSilu, kSigmoid };
+
+template <GatedNormActivation kActivation>
 __global__ void rms_norm_gated_kernel(
     const __nv_bfloat16 *__restrict__ x,
     const float *__restrict__ weight,
@@ -55,9 +63,14 @@ __global__ void rms_norm_gated_kernel(
   float normed = x_val * s_inv_rms * weight[tid];
 
   float g = __bfloat162float(gate[offset]);
-  float silu_g = g / (1.0f + expf(-g));
+  // The SiLU branch keeps its original `g / (1 + exp(-g))` form rather than
+  // `g * sigmoid(g)`: the two are mathematically equal but not bit-identical in
+  // fp32, and Qwen3.5's golden gates are bit-exact against this expression.
+  float activated = (kActivation == GatedNormActivation::kSilu)
+                        ? g / (1.0f + expf(-g))
+                        : 1.0f / (1.0f + expf(-g));
 
-  out[offset] = __float2bfloat16(normed * silu_g);
+  out[offset] = __float2bfloat16(normed * activated);
 }
 
 extern "C" {
@@ -65,7 +78,13 @@ extern "C" {
 void rms_norm_gated_cuda(const __nv_bfloat16 *x, const float *weight,
                           const __nv_bfloat16 *gate, __nv_bfloat16 *out,
                           int num_heads, int head_dim, float eps, cudaStream_t stream) {
-  rms_norm_gated_kernel<<<num_heads, head_dim, 0, stream>>>(x, weight, gate, out, head_dim, eps);
+  rms_norm_gated_kernel<GatedNormActivation::kSilu><<<num_heads, head_dim, 0, stream>>>(x, weight, gate, out, head_dim, eps);
+}
+
+void rms_norm_gated_sigmoid_cuda(const __nv_bfloat16 *x, const float *weight,
+                                  const __nv_bfloat16 *gate, __nv_bfloat16 *out,
+                                  int num_heads, int head_dim, float eps, cudaStream_t stream) {
+  rms_norm_gated_kernel<GatedNormActivation::kSigmoid><<<num_heads, head_dim, 0, stream>>>(x, weight, gate, out, head_dim, eps);
 }
 
 } // extern "C"
