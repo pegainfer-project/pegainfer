@@ -155,6 +155,17 @@ fn parse_tp_max_prompt(raw: &str) -> Result<Option<usize>> {
     }
 }
 
+/// The NCCL build this process linked, as `major.minor.patch`. Start-up logs it
+/// and the tensor-parallel gates print it, because NCCL picks the reduction
+/// order and so a measured drift has to be attributed to the build it ran on
+/// before it can be compared against another run's.
+pub(crate) fn nccl_version() -> String {
+    cudarc::nccl::result::get_nccl_version().map_or_else(
+        |_| "unknown".to_string(),
+        |v| format!("{}.{}.{}", v / 10000, (v / 100) % 100, v % 100),
+    )
+}
+
 /// GEMM and attention tiles consume whole 128-row blocks, so a width that is
 /// not a multiple of 128 pays for a tile it does not fill.
 fn parse_mix_chunk_tokens(raw: &str, max_context: usize) -> Result<Option<usize>> {
@@ -441,10 +452,7 @@ fn start_with_knobs(
         // the stack can detect that, so the configuration in force is said out
         // loud rather than assumed.
         let proto = std::env::var("NCCL_PROTO").unwrap_or_else(|_| "unset".to_string());
-        let version = cudarc::nccl::result::get_nccl_version().map_or_else(
-            |_| "unknown".to_string(),
-            |v| format!("{}.{}.{}", v / 10000, (v / 100) % 100, v % 100),
-        );
+        let version = nccl_version();
         if proto.to_ascii_uppercase().contains("LL128") {
             log::info!("tensor parallel: {world} ranks, NCCL {version}, NCCL_PROTO={proto}");
         } else {

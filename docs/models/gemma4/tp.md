@@ -108,16 +108,18 @@ Captured against eager is a wash on two L20s at 31B (8192 x 8), back to back on 
 
 `engine::lane_gates_tp::the_two_rank_engine_matches_one_rank` starts a real engine twice — once with one rank, once with two — over the same 12B checkpoint, three prompts and one batch, and compares the requested top-8 logprobs.
 
-It holds the *distributions*, not the greedy tokens: a two-rank reduction sums the same products in a different order and NCCL writes bf16 back, so the logits differ in their last bits and a near-tie can flip the pick. Measured at 12B on two L20s:
+It holds the *distributions*, not the greedy tokens: a two-rank reduction sums the same products in a different order and NCCL writes bf16 back, so the logits differ in their last bits and a near-tie can flip the pick. **How far they differ is a property of the NCCL build**, because NCCL chooses the reduction order — so each measurement below names the build it ran on, and the gate prints its own:
 
-| claim | result |
-| --- | --- |
-| one-rank run twice (control) | bit-identical, **asserted** token for token and logprob for logprob, so the comparison is not measuring harness noise |
-| steps keeping the one-rank pick | 46 / 48 |
-| worst picked-token logprob gap | 0.379 (the asserted line is 0.5) |
-| a differing pick | always a genuine near-tie: each pick inside the other run's top-8, and both picks' own gaps folded into the bound above before the comparison stops |
+| claim | NCCL 2.32.3 | NCCL 2.18.3 |
+| --- | --- | --- |
+| one-rank run twice (control) | bit-identical, **asserted** token for token and logprob for logprob, so the comparison is not measuring harness noise | same |
+| steps keeping the one-rank pick | 46 / 48 | 22 / 24 |
+| worst picked-token logprob gap | 0.379 | 0.5738 |
+| a differing pick | always a genuine near-tie: each pick inside the other run's top-8, and both picks' own gaps folded into the bound above before the comparison stops | same |
 
-The **shard branch** (`G % P == 0`, which the published 12B never takes — its single global KV head is replicated) is gated with a synthetic checkpoint carrying the real 31B shapes (`Q` 32, `G` 4, head dims 256/512, hidden 5376, intermediate 21504) cut down to six layers, so the whole run is ~8 GiB and takes seconds on any pair. It **measured bit-identical**: 48/48 picks, worst picked-token gap `0.0000`. That is a measurement, not an assertion — the two-rank comparison asserts against `LOGBROB_LINE = 0.5`, the same line for both branches, so a future run that drifts within 0.5 passes while this sentence's `0.0000` no longer holds. `LOGBROB_LINE` is a first cut from the single 12B measurement above (0.379, i.e. ~1.3× of margin); calibrating it the way `DRIFT_LINE` below needs calibrating is the same follow-up. Both numbers are with `NCCL_PROTO=LL128` (see the notes below).
+Both columns are the 12B on two L20s with `NCCL_PROTO=LL128`; the 2.18.3 column is this container's stock NCCL (see the operational notes) and reproduced bit-identically across every commit of this branch, so the spread between the columns is the environment's and not the code's. `LOGBROB_LINE` is `1.0` — it was `0.5`, which sat inside that spread and failed a correct run. 1.0 leaves ~1.7× over the worst measurement and matches `DRIFT_LINE` below; the repo's one precedent for calibrating a quantity of this kind is `serve_oracle`'s `neutral_scale` (two algorithms over one context, 0.31..5.75 observed, line 12.0), i.e. roughly 2× the worst observed drift. What the line is for is a structural error — a wrong shard, a missing reduction, a rank out of step — which moves a logprob by many nats and flips most picks, not 2 of 48; reduction noise is policed by the near-tie rule beside it.
+
+The **shard branch** (`G % P == 0`, which the published 12B never takes — its single global KV head is replicated) is gated with a synthetic checkpoint carrying the real 31B shapes (`Q` 32, `G` 4, head dims 256/512, hidden 5376, intermediate 21504) cut down to six layers, so the whole run is ~8 GiB and takes seconds on any pair. It **measured bit-identical**: 48/48 picks, worst picked-token gap `0.0000`. That is a measurement, not an assertion — the two-rank comparison asserts against `LOGBROB_LINE`, the same line for both branches, so a future run that drifts within the line passes while this sentence's `0.0000` no longer holds.
 
 The gate serves its first prompt on its own and only then the rest as one batch, so the **solo** admission path (`step` + `prefill_extra_ranks`) — where the cold-start hazard above first surfaced, and the only path a lone short request takes — is compared on every run; `PEGAINFER_TP_PROMPTS` / `PEGAINFER_TP_PROMPT_TOKENS` still widen the set. Which branch the gate covers is the checkpoint's: point `PEGAINFER_TEST_MODEL_PATH` at the 12B for the replicate branch, at a 31B-geometry checkpoint for the shard one. **A full-depth 31B cannot be gated against a *single-rank* baseline here**, not for want of a fixture but because the gate needs a single-rank control and 57 GiB of weights do not fit one card — the six-layer synthetic is exactly that shape at a depth that fits. So the numbers above are the 12B (replicate) and the synthetic (shard); the 60-layer real checkpoint is gated instead against its own Hugging Face dump (below) and served end to end on two L20s.
 
