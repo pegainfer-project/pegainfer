@@ -37,7 +37,7 @@ G  % P == 0  ||  P % G == 0
 intermediate % P == 0
 ```
 
-The global check carries a branch condition because only the **sharding** branch can split a group: `G % P == 0` hands a rank `G / P` KV heads, so `(Q/P) / (G/P)` has to be integral. The replicate branch (`P % G == 0`) gives a rank one whole KV head, and `P % G == 0` already keeps its `Q / P` query heads inside that head's group — `Q / P` is `P / G` copies of `Q / G` — so there is nothing left to police, and the check would only compare against a group of one.
+The global check carries a branch condition because only the **sharding** branch can split a group: `G % P == 0` hands a rank `G / P` KV heads, so `(Q/P) / (G/P)` has to be integral. The replicate branch (`P % G == 0`) gives a rank one whole KV head, and `P % G == 0` already keeps its `Q / P` query heads inside that head's group — the `P / G` ranks holding that head split its `Q / G` query heads evenly, so `Q / P` is `(Q / G) / (P / G)`, not a multiple of `Q / G` — so there is nothing left to police, and the check would only compare against a group of one.
 
 A routed (MoE) checkpoint and a W4A16 one are refused under TP > 1: the first needs an expert-sharding design, the second projects whole matrices.
 
@@ -108,16 +108,17 @@ Captured against eager is a wash on two L20s at 31B (8192 x 8), back to back on 
 
 `engine::lane_gates_tp::the_two_rank_engine_matches_one_rank` starts a real engine twice — once with one rank, once with two — over the same 12B checkpoint, three prompts and one batch, and compares the requested top-8 logprobs.
 
-It holds the *distributions*, not the greedy tokens: a two-rank reduction sums the same products in a different order and NCCL writes bf16 back, so the logits differ in their last bits and a near-tie can flip the pick. **How far they differ is a property of the NCCL build**, because NCCL chooses the reduction order — so each measurement below names the build it ran on, and the gate prints its own:
+It holds the *distributions*, not the greedy tokens: a two-rank reduction sums the same products in a different order and NCCL writes bf16 back, so the logits differ in their last bits and a near-tie can flip the pick. The gate prints the build and the device pair it ran on (`tp2: NCCL 2.18.3, devices 1,2`), because a reading is only comparable with the environment it came from — but nothing here claims *why* two readings from different environments differ. The line comes from this gate's own readings, one procedure, one head (`45eb4a68`, four runs of the 12B on two L20s, `NCCL_PROTO=LL128`):
 
-| claim | NCCL 2.32.3 | NCCL 2.18.3 |
-| --- | --- | --- |
-| one-rank run twice (control) | bit-identical, **asserted** token for token and logprob for logprob, so the comparison is not measuring harness noise | same |
-| steps keeping the one-rank pick | 46 / 48 | 22 / 24 |
-| worst picked-token logprob gap | 0.379 | 0.5738 |
-| a differing pick | always a genuine near-tie: each pick inside the other run's top-8, and both picks' own gaps folded into the bound above before the comparison stops | same |
+| claim | result |
+| --- | --- |
+| one-rank run twice (control) | bit-identical, **asserted** token for token and logprob for logprob, so the comparison is not measuring harness noise |
+| steps keeping the one-rank pick | 22 / 24, the same in all four runs |
+| worst picked-token logprob gap | 0.5738 (top 0.2362), the same to four decimals in all four runs |
+| a differing pick | always a genuine near-tie: each pick inside the other run's top-8, and both picks' own gaps folded into the bound above before the comparison stops |
+| **one `all_reduce` skipped** — the fault the line is for | the gate fails: at request 0 step 0 the one-rank pick leaves the two-rank top-8 (the near-tie rule), and with that rule relaxed the top-token gap reads 2.1895 |
 
-Both columns are the 12B on two L20s with `NCCL_PROTO=LL128`; the 2.18.3 column is this container's stock NCCL (see the operational notes) and reproduced bit-identically across every commit of this branch, so the spread between the columns is the environment's and not the code's. `LOGBROB_LINE` is `1.0` — it was `0.5`, which sat inside that spread and failed a correct run. 1.0 leaves ~1.7× over the worst measurement and matches `DRIFT_LINE` below; the repo's one precedent for calibrating a quantity of this kind is `serve_oracle`'s `neutral_scale` (two algorithms over one context, 0.31..5.75 observed, line 12.0), i.e. roughly 2× the worst observed drift. What the line is for is a structural error — a wrong shard, a missing reduction, a rank out of step — which moves a logprob by many nats and flips most picks, not 2 of 48; reduction noise is policed by the near-tie rule beside it.
+The fault is the `o_proj` reduction commented out in `layer.rs`: both ranks skip it, so the run still completes, and the single-rank control is untouched (at world size 1 the call is a no-op). `worst_pick` reads `0.0000` on that run — the two top-8 lists share no token, so the picked-token bound has nothing left to measure, which is the case the near-tie rule exists to catch — so the rule and the top-token bound are what catch a fault this size, and `LOGBROB_LINE` sits between the two readings instead of under the noise. `LOGBROB_LINE` is `1.0` — it was `0.5`, which sits below this floor and so fails a correct run; 1.0 is ~1.7x over the floor and ~2.2x under the fault, and it is the value `DRIFT_LINE` below already uses. The repo's one precedent for calibrating a quantity of this kind is `serve_oracle`'s `neutral_scale` (two algorithms over one context, 0.31..5.75 observed, line 12.0), i.e. roughly 2x the worst observed drift. What the line is for is a structural error — a wrong shard, a missing reduction, a rank out of step — which moves a logprob by many nats and flips most picks, not 2 of 24; reduction noise is policed by the near-tie rule beside it.
 
 The **shard branch** (`G % P == 0`, which the published 12B never takes — its single global KV head is replicated) is gated with a synthetic checkpoint carrying the real 31B shapes (`Q` 32, `G` 4, head dims 256/512, hidden 5376, intermediate 21504) cut down to six layers, so the whole run is ~8 GiB and takes seconds on any pair. It **measured bit-identical**: 48/48 picks, worst picked-token gap `0.0000`. That is a measurement, not an assertion — the two-rank comparison asserts against `LOGBROB_LINE`, the same line for both branches, so a future run that drifts within the line passes while this sentence's `0.0000` no longer holds.
 
@@ -137,7 +138,7 @@ The **real 31B checkpoint**, which no single card holds, is served end to end on
 | worst shared-token logprob gap | 0.6753 |
 | the one differing row | a near-tie: the engine's pick sits inside the reference's top-64 |
 
-So the real geometry (hidden 5376, `Q` 32 / `Kv` 16 / `G` 4, head dims 256/512, the 50 sliding + 10 global split) matches the reference over all 60 layers — with the same `NCCL_PROTO=LL128` requirement. The tolerance here is **not** the synthetic gate's: that one is bit-identical (`0.0000` against a `0.5` line), this one is `0.6753` against a `1.0` line. `DRIFT_LINE` is a first cut — calibrating it from this comparison on the 12B at one rank is a follow-up.
+So the real geometry (hidden 5376, `Q` 32 / `Kv` 16 / `G` 4, head dims 256/512, the 50 sliding + 10 global split) matches the reference over all 60 layers — with the same `NCCL_PROTO=LL128` requirement. The tolerance here is **not** the synthetic gate's: that one is bit-identical (`0.0000` against `LOGBROB_LINE`), this one is `0.6753` against a `1.0` line. `DRIFT_LINE` is a first cut — calibrating it from this comparison on the 12B at one rank is a follow-up.
 
 ## Known bounds
 

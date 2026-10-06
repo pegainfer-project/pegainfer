@@ -60,7 +60,7 @@ A wash: the collective, not launch count, dominates the step, so capture buys li
 
 ## Correctness
 
-The distribution gate at 31B geometry measured exact (`models/gemma4/tp.md`): the synthetic checkpoint carrying this checkpoint's shapes came out bit-identical between one rank and two (48/48 picks, worst picked-token gap `0.0000`) — a measurement, since the gate asserts against a 0.5 line rather than against exactness. On the real checkpoint the sane answers come out through the chat template — `What is the capital of France?` → `Paris`; `Name three primary colors.` → `The three primary colors are red, yellow, and blue.` (the sampled defaults; greedy repeats, which is the model's published non-default behavior, not a TP artifact).
+The distribution gate at 31B geometry measured exact (`models/gemma4/tp.md`): the synthetic checkpoint carrying this checkpoint's shapes came out bit-identical between one rank and two (48/48 picks, worst picked-token gap `0.0000`) — a measurement, since the gate asserts against `LOGBROB_LINE` rather than against exactness. On the real checkpoint the sane answers come out through the chat template — `What is the capital of France?` → `Paris`; `Name three primary colors.` → `The three primary colors are red, yellow, and blue.` (the sampled defaults; greedy repeats, which is the model's published non-default behavior, not a TP artifact).
 
 ## Notes
 

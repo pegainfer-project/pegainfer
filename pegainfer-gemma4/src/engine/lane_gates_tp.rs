@@ -32,21 +32,22 @@ use crate::testkit::u32_tensor;
 /// two runs may show on a token they both kept. The gap is the bf16
 /// reduction-order drift accumulated over the tower, not a shape difference.
 ///
-/// The line is calibrated from that drift as measured, and the drift moves with
-/// the NCCL build because NCCL chooses the reduction order: the 12B replicate
-/// branch measured 0.379 on NCCL 2.32.3 and 0.5738 on 2.18.3 — same checkpoint,
-/// same L20 pair, same `NCCL_PROTO=LL128`, and bit-identical across every commit
-/// in between, so the spread is the environment's and not the code's. A 0.5 line
-/// sat inside that spread and failed a correct run. 1.0 matches `DRIFT_LINE`
-/// below and leaves ~1.7x over the worst measurement, which is the shape of the
-/// repo's one calibration precedent for a quantity of this kind —
-/// `serve_oracle`'s `neutral_scale`, two algorithms over one context, 0.31..5.75
-/// observed and a line at 12.0. The gate prints the NCCL version it ran on so
-/// the next measurement can be attributed instead of compared blind.
+/// The line is set from this gate's own readings — one procedure, one head:
+/// four runs of the 12B on two L20s (`NCCL_PROTO=LL128`) each held
+/// `worst_pick` to 0.5738, the same to four decimals every run, and one run
+/// with the `o_proj` reduction skipped — the structural error this line is for
+/// — drove the one-rank pick out of the two-rank top-8 (the near-tie rule fires
+/// before the line is reached) and read `worst_top` 2.1895 with that rule
+/// relaxed; `worst_pick` read 0 there, the two lists sharing no token, which is
+/// the case the near-tie rule exists for. 1.0 is ~1.7x over the floor and ~2.2x
+/// under the fault, and is the value `DRIFT_LINE` below already uses. The shape
+/// follows the repo's one precedent for calibrating a quantity of this kind,
+/// `serve_oracle`'s `neutral_scale`: two algorithms over one context, 0.31..5.75
+/// observed and a line at 12.0.
 ///
 /// What the line is for: a structural tensor-parallel error — a wrong shard, a
 /// missing reduction, a rank out of step — moves a logprob by many nats and
-/// flips most picks, not 2 of 48. Reduction noise is what the near-tie rule
+/// flips most picks, not 2 of 24. Reduction noise is what the near-tie rule
 /// beside it polices.
 const TOP_K: usize = 8;
 const LOGBROB_LINE: f32 = 1.0;
@@ -327,8 +328,8 @@ fn the_two_rank_engine_matches_one_rank() {
     // `single == repeat` bit for bit, so comparing tp2 against the repeat run
     // would repeat this comparison; one of them is enough.
     let gaps = distribution_gap(&single, &tp2, "tp2");
-    // The drift this measures is a property of the reduction order NCCL picked,
-    // so the build it ran on is part of the result.
+    // A reading is only comparable with the build and pair it came from, so
+    // name both.
     eprintln!(
         "tp2: NCCL {}, devices {device},{peer}",
         super::nccl_version()

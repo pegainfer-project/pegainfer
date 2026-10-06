@@ -239,11 +239,11 @@ impl TensorParallelConfig {
         let (_, local_global_kv) = self.global_kv_head_range(config)?;
         // Only the sharding branch can split a GQA group: it hands a rank
         // `g / p` KV heads, so the per-rank group `(q / p) / (g / p)` has to be
-        // integral. The replicate branch gives a rank one whole KV head, and
-        // `p % g == 0` already keeps its `q / p` query heads inside that one
-        // head's group (`q / p` is `p / g` copies of `q / g`), so there is
-        // nothing left to police there — the check below would only be comparing
-        // against a group of one.
+        // integral. The replicate branch gives a rank one whole KV head, shared
+        // with the `p / g` ranks holding that same head, and those ranks split
+        // its `q / g` query heads evenly (`q / p` is `(q / g) / (p / g)`), so
+        // there is nothing left to police there — `local_global_kv` is 1 on that
+        // branch, and the check below would divide by one.
         if config.num_global_key_value_heads.is_multiple_of(p) {
             ensure!(
                 local_q.is_multiple_of(local_global_kv),
