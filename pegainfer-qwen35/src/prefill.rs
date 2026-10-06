@@ -504,6 +504,7 @@ impl Qwen35Model {
             geom.local_linear_num_value_heads(),
             c.linear_value_head_dim,
             c.rms_norm_eps,
+            ops::GatedNormActivation::Silu,
         );
 
         *linear_idx += 1;

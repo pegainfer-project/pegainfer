@@ -8,8 +8,6 @@
 //   rms_norm_gated_cuda         — SiLU gate    (Qwen3.5 Gated DeltaNet)
 //   rms_norm_gated_sigmoid_cuda — sigmoid gate (Qwen3.8-Flash-Next, whose
 //                                 `output_gate_type` selects this)
-// Both are the same kernel; the activation is a template parameter so each
-// instantiation compiles to exactly the arithmetic it had before.
 
 #include "common.cuh"
 
@@ -63,9 +61,10 @@ __global__ void rms_norm_gated_kernel(
   float normed = x_val * s_inv_rms * weight[tid];
 
   float g = __bfloat162float(gate[offset]);
-  // The SiLU branch keeps its original `g / (1 + exp(-g))` form rather than
-  // `g * sigmoid(g)`: the two are mathematically equal but not bit-identical in
-  // fp32, and Qwen3.5's golden gates are bit-exact against this expression.
+  // SiLU keeps its original `g / (1 + exp(-g))` form rather than the equal
+  // `g * sigmoid(g)`: the two are not bit-identical in fp32, and Qwen3.5's gated
+  // path must stay bit-for-bit unchanged. Its golden gates would not catch the
+  // swap — they bound logprob drift, not this expression.
   float activated = (kActivation == GatedNormActivation::kSilu)
                         ? g / (1.0f + expf(-g))
                         : 1.0f / (1.0f + expf(-g));

@@ -15,6 +15,7 @@ pub use paged_plan::PrefillPagedPlan;
 pub use paged_plan::SplitKvCsr;
 pub use paged_plan::build_split_kv_csr;
 pub use pegainfer_kernels::ops::GEMM_LT_MAX_N;
+pub use pegainfer_kernels::ops::GatedNormActivation;
 pub use pegainfer_kernels::ops::LoraDecodeGroupedProjection;
 pub use pegainfer_kernels::ops::SUPPORTED_GQA_GROUP_SIZES;
 pub use pegainfer_kernels::ops::SuppressIds;

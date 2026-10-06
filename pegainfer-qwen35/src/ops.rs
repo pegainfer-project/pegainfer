@@ -1,6 +1,7 @@
 //! Qwen3.5 GPU operation wrappers.
 
 pub(crate) use pegainfer_core::ops::GEMM_LT_MAX_N;
+pub(crate) use pegainfer_core::ops::GatedNormActivation;
 pub(crate) use pegainfer_core::ops::PrefillPagedPlan;
 pub(crate) use pegainfer_core::ops::SuppressIds;
 pub(crate) use pegainfer_core::ops::add_batch;

@@ -862,6 +862,7 @@ impl Qwen35Model {
             geom.local_linear_num_value_heads(),
             self.config.linear_value_head_dim,
             self.config.rms_norm_eps,
+            ops::GatedNormActivation::Silu,
         );
         ops::gemm_into(
             &self.ctx,

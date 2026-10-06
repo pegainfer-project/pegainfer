@@ -640,33 +640,11 @@ pub enum GatedNormActivation {
     Sigmoid,
 }
 
-/// Batched per-head RMSNorm with F32 weight + SiLU gate multiplication.
+/// Batched per-head RMSNorm with F32 weight + a gated activation multiplies.
 /// HiddenStates are flattened as (seq_len * num_heads) contiguous head slices.
+/// `activation` chooses the gate: Qwen3.5's Gated DeltaNet passes
+/// [`GatedNormActivation::Silu`], Qwen3.8-Flash-Next's passes `Sigmoid`.
 pub fn rms_norm_gated_batch_into(
-    ctx: &DeviceContext,
-    x: &HiddenStates,
-    weight: &CudaSlice<f32>,
-    gate: &HiddenStates,
-    out: &mut HiddenStates,
-    num_heads: usize,
-    head_dim: usize,
-    eps: f32,
-) {
-    rms_norm_gated_activation_batch_into(
-        ctx,
-        x,
-        weight,
-        gate,
-        out,
-        num_heads,
-        head_dim,
-        eps,
-        GatedNormActivation::Silu,
-    );
-}
-
-/// [`rms_norm_gated_batch_into`] with the gate activation chosen by the caller.
-pub fn rms_norm_gated_activation_batch_into(
     ctx: &DeviceContext,
     x: &HiddenStates,
     weight: &CudaSlice<f32>,
@@ -899,6 +877,13 @@ mod parity {
                 f64::from(want_value.to_f32()),
             );
             let (abs_diff, magnitude) = ((got_value - want_value).abs(), want_value.abs());
+            // A NaN never satisfies the comparison below, so it would be skipped
+            // rather than reported and an all-NaN output would pass. Non-finite
+            // values are rejected here instead of being ranked.
+            assert!(
+                got_value.is_finite() && want_value.is_finite(),
+                "{what}: element {index} is not finite (got {got_value}, reference {want_value})"
+            );
             // Rank by the margin against the actual bound, not by the raw
             // deviation: the bound is affine in `magnitude`, so the two orderings
             // differ, and ranking by deviation can let a large-magnitude element
@@ -918,11 +903,13 @@ mod parity {
         );
     }
 
-    /// The gated norm now has two activations, because Qwen3.8-Flash-Next's
+    /// The gated norm has two activations, because Qwen3.8-Flash-Next's
     /// `output_gate_type` selects sigmoid where Qwen3.5 uses silu. Run at the
-    /// Flash-Next GDN geometry (48 value heads at head_dim 128). Both are checked
-    /// against a CPU reference, and the two must actually differ — a template
-    /// parameter that collapsed would otherwise pass every pre-existing gate.
+    /// Flash-Next GDN geometry (48 value heads at head_dim 128), each activation
+    /// against its own CPU reference. The two distinct references are what pin the
+    /// template parameter: were both entry points instantiated with one activation,
+    /// the mismatched comparison would fail on nearly every element (silu is
+    /// `g * sigmoid(g)`, so the two differ wherever `g` is not zero).
     #[test]
     #[ignore = "requires a GPU"]
     fn the_gated_norm_activations_match_their_references() {
@@ -946,9 +933,10 @@ mod parity {
             num_heads,
             head_dim,
             eps,
+            GatedNormActivation::Silu,
         );
         let mut sigmoid_out = HiddenStates::zeros(&ctx, d, seq_len).expect("sigmoid buf");
-        rms_norm_gated_activation_batch_into(
+        rms_norm_gated_batch_into(
             &ctx,
             &x,
             &weight,
@@ -978,32 +966,18 @@ mod parity {
             &gated_norm_reference(&x_host, &weight_host, &gate_host, head_dim, eps, true),
             "sigmoid gated norm",
         );
+    }
 
-        // silu(g) == g * sigmoid(g), and both paths share the same normalized
-        // value, so the outputs must be related by exactly the gate. This is what
-        // pins the two instantiations apart independently of the reference.
-        let differing = silu_host
-            .iter()
-            .zip(&sigmoid_host)
-            .zip(&gate_host)
-            .filter(|((s, g), gate)| {
-                let (s, g, gate) = (s.to_f32(), g.to_f32(), gate.to_f32());
-                (s - g * gate).abs() > 0.02 + 0.03 * (g * gate).abs()
-            })
-            .count();
-        assert_eq!(differing, 0, "silu output is not gate * sigmoid output");
-        // The two instantiations must actually diverge, or the template parameter
-        // collapsed. Counting non-zeros would not show it: silu(g) and sigmoid(g)
-        // vanish on the same inputs, so the counts coincide. Compare the buffers.
-        let diverging = silu_host
-            .iter()
-            .zip(&sigmoid_host)
-            .filter(|(s, g)| s.to_bits() != g.to_bits())
-            .count();
-        assert!(
-            diverging * 2 > silu_host.len(),
-            "only {diverging} of {} elements differ between the two activations",
-            silu_host.len()
+    /// `assert_close` must not treat a non-finite value as "close": a NaN never
+    /// wins the margin comparison, so without the finiteness check an all-NaN
+    /// output would leave `worst_excess` at negative infinity and pass.
+    #[test]
+    #[should_panic(expected = "not finite")]
+    fn assert_close_rejects_non_finite_values() {
+        assert_close(
+            &[bf16::from_f32(f32::NAN)],
+            &[bf16::from_f32(1.0)],
+            "nan output",
         );
     }
 }
