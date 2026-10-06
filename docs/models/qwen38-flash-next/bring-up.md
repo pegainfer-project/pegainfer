@@ -26,7 +26,7 @@ bricks #1105 (QSA), #1106 (n-gram), #1107 (MoE), #1108 (hyper-connections).
 | Weight licence | **`license: other`** — not Apache-2.0, unlike the code this line ports from |
 | Size | 131 shards, 360.0 GB, 1658 tensor keys |
 | Identity | `model_type: qwen4_exp`, `architectures: [Qwen4ExpForConditionalGeneration]`, `text_config.model_type: qwen4_exp_text` |
-| Reference impl | `transformers/models/qwen4_exp/modeling_qwen4_exp.py`; config declares `5.8.0.dev0`, so pin **transformers 5.8.0** |
+| Reference impl | `transformers/models/qwen4_exp/modeling_qwen4_exp.py`; the reference first ships in **transformers 5.16.0** — the `5.8.0.dev0` in `config.json` is the checkpoint's own declared version, not a release that carries it (absent through 5.15.0) |
 
 File hashes at that revision (HF blob sha1; `tokenizer.json` is LFS, so its sha256 is
 given too):
@@ -126,7 +126,7 @@ search against the reference's `_find_nth_prime_after`.
 | GDN reuse proof, executed | 1 GPU. Answered as far as tensors go — geometry equals the Triton AOT constants, conv width equals the in-tree cap, names match down to the `model.language_model.layers.N.` prefix — but `conv1d_decode_batch_cuda` / `gated_delta_rule_decode_batch_cuda` are wrapped only inside `pegainfer-qwen35/src/recurrent.rs`, so slice B has to decide whether to lift them into shared `ops` or re-wrap them. |
 | Bookend gate (embedding → mixer → lm_head → argmax) | 1 GPU, three shards (1 + 130 + 131, 5.29 GB, ~2.6 GB of weights on device) and a CPU f64 reference for the mixer. No layer weights needed. |
 | HF golden fixtures (logits + intermediate probes) | the fleet — 360 GB, plus ≥102.4 GB host RAM if the n-gram table is materialized |
-| Tokenizer / chat-template ID fixtures | transformers 5.8.0; nothing in the tree commits token-ID fixtures today |
+| Tokenizer / chat-template ID fixtures | transformers **5.16.0+** — the checkpoint's own tokenizer is `Qwen2Tokenizer`, which is older, but fixtures are compared against the reference implementation; nothing in the tree commits token-ID fixtures today |
 
 Note that `pegainfer-server` cannot be compiled on a CPU-only box, so the registration
 above is verifiable only where a CUDA build works.
