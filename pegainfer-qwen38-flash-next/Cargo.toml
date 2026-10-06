@@ -8,6 +8,9 @@ version = "0.1.0"
 
 [features]
 default = []
+# Empty on purpose: this crate is CPU-only and compiles whole, so there is nothing
+# to gate. It exists so `pegainfer-server` can hold the line behind the same
+# per-line switch as every other model crate.
 qwen38-flash-next = []
 
 [dependencies]

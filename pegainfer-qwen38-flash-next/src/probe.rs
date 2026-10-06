@@ -26,6 +26,7 @@ const FULL_ATTN_HEAD_DIM: u64 = 256;
 pub(crate) fn probe_config_json(json: &serde_json::Value) -> Result<()> {
     let text_config = probe_identity(json)?;
     probe_precision(text_config)?;
+    probe_widths(text_config)?;
     probe_layer_types(text_config)?;
     probe_attention(text_config)?;
     probe_moe(text_config)?;
@@ -110,6 +111,19 @@ fn probe_precision(text_config: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Widths a smaller `qwen4_exp` checkpoint may change but that cannot be zero:
+/// the stack depth, the residual width (`hc_count` times over) and the
+/// vocabulary the two bookends read.
+fn probe_widths(text_config: &serde_json::Value) -> Result<()> {
+    for field in ["num_hidden_layers", "hidden_size", "vocab_size"] {
+        let v = text_config.get(field).and_then(serde_json::Value::as_u64);
+        if v.is_none_or(|v| v == 0) {
+            bail!("qwen4_exp: {field} must be a positive integer, got {v:?}");
+        }
+    }
+    Ok(())
+}
+
 fn probe_layer_types(text_config: &serde_json::Value) -> Result<()> {
     let interval = text_config
         .get("full_attention_interval")
@@ -128,6 +142,19 @@ fn probe_layer_types(text_config: &serde_json::Value) -> Result<()> {
     if layer_types.len() % interval as usize != 0 {
         bail!(
             "qwen4_exp: layer_types has {} entries, not a multiple of full_attention_interval {interval}",
+            layer_types.len()
+        );
+    }
+    // `num_hidden_layers` is what the geometry and (later) the per-layer tensor
+    // names count by, while `layer_types` is what says which kinds they are. A
+    // config whose two stacks disagree is unservable, and the disagreement would
+    // otherwise surface much later as a shape mismatch.
+    let declared = text_config
+        .get("num_hidden_layers")
+        .and_then(serde_json::Value::as_u64);
+    if declared != Some(layer_types.len() as u64) {
+        bail!(
+            "qwen4_exp: num_hidden_layers is {declared:?} but layer_types has {} entries",
             layer_types.len()
         );
     }
@@ -310,6 +337,18 @@ fn probe_ple(text_config: &serde_json::Value) -> Result<()> {
             "qwen4_exp: ngram_size must be at least 2 (an n-gram needs a context token), got {ngram_size}"
         );
     }
+    // Head `i` gets the (i+1)-th prime after `base - 1`, so a base of 1 asks for
+    // primes after zero — a window where the search's own trial division accepts
+    // 1, and the table's first vocabulary would be wrong rather than refused.
+    let base = text_config
+        .get("ngram_vocab_size_base")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if base < 2 {
+        bail!(
+            "qwen4_exp: ngram_vocab_size_base must be at least 2 (primes are searched after base - 1), got {base}"
+        );
+    }
     let ple_conv = text_config
         .get("ple_conv_kernel_size")
         .and_then(serde_json::Value::as_u64);
@@ -336,12 +375,45 @@ fn probe_rope(text_config: &serde_json::Value) -> Result<()> {
             "qwen4_exp: rope_parameters.rope_type must be default, got {rope_type:?} — a YaRN variant is not served by this line"
         );
     }
+    // Every rope value the reference uses comes from this nested object
+    // (`modeling_qwen4_exp.py` reads `config.rope_parameters["rope_theta"]` and
+    // `[..., "partial_rotary_factor"]`), and `Config` models it from here, so
+    // this is the canonical copy. The checkpoint also carries a legacy
+    // top-level one that nothing upstream reads; when the two disagree the
+    // checkpoint is self-inconsistent, and picking one would silently rotate at
+    // the wrong frequency — the same both-levels rule this file applies to
+    // `tie_word_embeddings`.
     let partial = rope
         .get("partial_rotary_factor")
         .and_then(serde_json::Value::as_f64);
     let Some(partial) = partial.filter(|p| *p > 0.0 && *p <= 1.0) else {
         bail!("qwen4_exp: rope_parameters.partial_rotary_factor must be in (0, 1]");
     };
+    if let Some(legacy) = text_config
+        .get("partial_rotary_factor")
+        .and_then(serde_json::Value::as_f64)
+    {
+        // Exact equality is the intent: both are JSON literals, and a tolerance
+        // would hide a checkpoint that writes `0.3` in one place and `0.25` in the
+        // other — which is the case this check exists to catch.
+        #[allow(clippy::float_cmp)]
+        let disagrees = legacy != partial;
+        if disagrees {
+            bail!(
+                "qwen4_exp: partial_rotary_factor is ambiguous: text_config says {legacy}, \
+                 text_config.rope_parameters says {partial}, and only the nested copy is read"
+            );
+        }
+    }
+
+    // `mrope_interleaved` and `mrope_section` are accepted rather than refused,
+    // because a text-only sequence is their degenerate case in the reference
+    // itself: it expands a 1-D `position_ids` across all three axes and then
+    // interleaves (`modeling_qwen4_exp.py`), so every rotary pair takes the same
+    // position with its own frequency and the three sections collapse onto the
+    // 1-D layout. This line serves text only, so it needs no mrope path of its
+    // own; the decision, and the fixtures that would tell it apart, are tracked
+    // in #1105.
     let head_dim = text_config
         .get("head_dim")
         .and_then(serde_json::Value::as_u64)
@@ -597,5 +669,40 @@ mod tests {
         text(&mut cfg, "linear_num_value_heads", serde_json::json!(24));
         text(&mut cfg, "num_attention_heads", serde_json::json!(12));
         probe_config_json(&cfg).unwrap();
+    }
+
+    /// The reference reads `partial_rotary_factor` from `rope_parameters`; the
+    /// legacy top-level copy the checkpoint also carries is read by nothing
+    /// upstream. A checkpoint where the two disagree is ambiguous, and this line
+    /// refuses rather than guessing which frequency to rotate at.
+    #[test]
+    fn an_ambiguous_partial_rotary_factor_bails() {
+        let err = err(|c| text(c, "partial_rotary_factor", serde_json::json!(0.5)));
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn a_layer_count_that_disagrees_with_layer_types_bails() {
+        let err = err(|c| text(c, "num_hidden_layers", serde_json::json!(47)));
+        assert!(err.contains("num_hidden_layers"), "{err}");
+        assert!(err.contains("layer_types"), "{err}");
+    }
+
+    #[test]
+    fn an_ngram_base_below_two_bails() {
+        let err = err(|c| text(c, "ngram_vocab_size_base", serde_json::json!(1)));
+        assert!(err.contains("ngram_vocab_size_base"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_residual_width_bails() {
+        let err = err(|c| text(c, "hidden_size", serde_json::json!(0)));
+        assert!(err.contains("hidden_size"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_vocabulary_bails() {
+        let err = err(|c| text(c, "vocab_size", serde_json::json!(0)));
+        assert!(err.contains("vocab_size"), "{err}");
     }
 }

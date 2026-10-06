@@ -332,6 +332,31 @@ mod tests {
         assert!(!hint.contains("--features qwen35"), "{hint}");
     }
 
+    /// The inner identity alone must hint as well. The outer `model_type` is
+    /// what a served config carries, but the family declares two identity lists
+    /// and the other families test the text one separately
+    /// (`hint_matches_text_config_identities` above).
+    #[cfg(not(feature = "qwen38-flash-next"))]
+    #[test]
+    fn hint_matches_the_flash_next_text_identity() {
+        let config = serde_json::json!({"text_config": {"model_type": "qwen4_exp_text"}});
+        let hint = feature_gate_hint(&config).expect("qwen4_exp_text identity should hint");
+        assert!(hint.contains("--features qwen38-flash-next"), "{hint}");
+    }
+
+    /// The other half of the same claim, taken under the feature that makes it
+    /// true: once the line is compiled in, its own identity must fall through to
+    /// the registry instead of being told to rebuild.
+    #[cfg(feature = "qwen38-flash-next")]
+    #[test]
+    fn hint_is_silent_for_a_compiled_flash_next_family() {
+        let config = serde_json::json!({
+            "model_type": "qwen4_exp",
+            "text_config": {"model_type": "qwen4_exp_text"}
+        });
+        assert!(feature_gate_hint(&config).is_none());
+    }
+
     #[test]
     fn hint_is_silent_for_an_unknown_family() {
         let config = serde_json::json!({"model_type": "frobnicate_lm"});

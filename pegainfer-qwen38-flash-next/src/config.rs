@@ -18,8 +18,14 @@ pub const FROZEN_REVISION: &str = "de4b8e4d43b917e7706784d8bb445c9af86a3540";
 pub const FROZEN_CONFIG_SHA256: &str =
     "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b";
 
-/// Transformers release matching the checkpoint's declared `5.8.0.dev0`.
-pub const PINNED_TRANSFORMERS: &str = "5.8.0";
+/// The transformers release the reference implementation is read from.
+///
+/// `qwen4_exp` first ships in **5.16.0**: the `v5.8.0`…`v5.15.0` tags carry no
+/// `src/transformers/models/qwen4_exp/`, and `v5.16.0` does. The checkpoint's own
+/// declared `5.8.0.dev0` is a different fact — the version it was authored
+/// against, not one that carries the reference — and conflating the two is what
+/// put `5.8.0` here originally.
+pub const PINNED_TRANSFORMERS: &str = "5.16.0";
 
 /// `norm_topk_prob` is **absent** from the frozen checkpoint's `config.json` and
 /// comes from the upstream default. It decides whether the router renormalizes
@@ -32,6 +38,19 @@ const UPSTREAM_DEFAULT_NORM_TOPK_PROB: bool = true;
 /// hash multipliers are recomputed rather than read from the checkpoint; this
 /// line reads the stored tensor, so the value is recorded, not relied on.
 const UPSTREAM_DEFAULT_SEED: i64 = 1234;
+
+/// The nested rope object, which is where the reference reads every rope value
+/// from (`modeling_qwen4_exp.py` takes `config.rope_parameters["rope_theta"]`
+/// and `[..., "partial_rotary_factor"]`) and therefore the only canonical copy.
+///
+/// The checkpoint *also* carries a legacy top-level `partial_rotary_factor` that
+/// nothing upstream reads. Modelling the nested one is what keeps this layer and
+/// the probe on the same value; the probe refuses a checkpoint where the two
+/// copies disagree rather than letting readers pick differently.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RopeParameters {
+    pub(crate) partial_rotary_factor: f64,
+}
 
 /// Everything the engine reads lives in `text_config`; the outer config carries
 /// only `architectures`, the token ids, `tie_word_embeddings` and `vision_config`.
@@ -46,7 +65,7 @@ pub(crate) struct TextConfig {
     pub(crate) head_dim: usize,
     pub(crate) num_attention_heads: usize,
     pub(crate) num_key_value_heads: usize,
-    pub(crate) partial_rotary_factor: f64,
+    pub(crate) rope_parameters: RopeParameters,
 
     pub(crate) linear_key_head_dim: usize,
     pub(crate) linear_value_head_dim: usize,
@@ -59,6 +78,11 @@ pub(crate) struct TextConfig {
     pub(crate) indexer_head_dim: usize,
 
     pub(crate) num_experts: usize,
+    /// Top-k the router keeps. The reference validates `0 < k <= num_experts`
+    /// (`configuration_qwen4_exp.py`, `:200`) and the probe mirrors that rule —
+    /// carrying the field here is what gives that check a consumer, since a
+    /// router that re-read `config.json` on its own would be a second source.
+    pub(crate) num_experts_per_tok: usize,
     pub(crate) moe_intermediate_size: usize,
     pub(crate) shared_expert_intermediate_size: usize,
     #[serde(default = "default_norm_topk_prob")]
@@ -171,7 +195,7 @@ impl Config {
 
     /// Rotary dimensions actually applied, out of `head_dim`.
     pub(crate) fn rotary_dim(&self) -> Result<usize> {
-        let exact = self.text.head_dim as f64 * self.text.partial_rotary_factor;
+        let exact = self.text.head_dim as f64 * self.text.rope_parameters.partial_rotary_factor;
         if exact.fract() != 0.0 || exact as usize == 0 {
             bail!(
                 "qwen4_exp: partial_rotary_factor does not give a whole number of rotary dimensions"
@@ -317,7 +341,10 @@ fn nth_prime_after(start: usize, count: usize) -> usize {
     }
 
     let mut found = 0usize;
-    let mut candidate = start;
+    // Starts at 1 so the first candidate the loop tests is 2: from 0 it would
+    // test 1, and the trial division below accepts it (no prime exceeds its
+    // square root, so the prefix is empty and `all` is vacuously true).
+    let mut candidate = start.max(1);
     // Re-sieved lazily as the candidate climbs; one sieve covers the whole window
     // in practice because prime gaps near 2e7 are far below the base itself.
     let mut small_primes = sieve(integer_sqrt(start + 1) + 1);
@@ -414,6 +441,7 @@ mod tests {
         assert_eq!(text.indexer_kv_heads, 1);
         assert_eq!(text.indexer_head_dim, 128);
         assert_eq!(text.num_experts, 512);
+        assert_eq!(text.num_experts_per_tok, 10);
         assert_eq!(text.moe_intermediate_size, 640);
         assert_eq!(text.shared_expert_intermediate_size, 640);
         assert_eq!(text.hc_lowrank, 320);
@@ -529,5 +557,17 @@ mod tests {
         assert_eq!(nth_prime_after(19_999_999, 16), 20_000_171);
         assert_eq!(nth_prime_after(1, 1), 2);
         assert_eq!(nth_prime_after(2, 3), 7);
+        // The search window starts below the smallest prime; 1 is not one.
+        assert_eq!(nth_prime_after(0, 1), 2);
+        assert_eq!(nth_prime_after(0, 2), 3);
+    }
+
+    /// The checkpoint declares `5.8.0.dev0`; the release that carries the
+    /// reference is a later one. Pinning both facts is what stops the two from
+    /// being conflated again — which is how `5.8.0` got in here originally.
+    #[test]
+    fn the_pinned_reference_is_not_the_declared_version() {
+        assert_eq!(frozen()["transformers_version"], "5.8.0.dev0");
+        assert_eq!(PINNED_TRANSFORMERS, "5.16.0");
     }
 }
