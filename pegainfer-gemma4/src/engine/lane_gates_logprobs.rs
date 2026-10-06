@@ -92,6 +92,16 @@ fn teacher_forced_worst(harness: &mut Harness, head: &[u32]) -> (f32, usize) {
         let whole = echo.logprobs[head.len() + i]
             .as_ref()
             .expect("prompt position scored");
+        // A NaN row is invisible to the comparisons below: `f32::max` steps over
+        // a NaN without moving the bound, so a NaN logsumexp — every logprob on
+        // the row NaN while the ids stay right — would pass this gate.
+        for row in [decoded, whole] {
+            assert!(
+                row.logprob.is_finite()
+                    && row.top_logprobs.iter().all(|(_, value)| value.is_finite()),
+                "position {i}: a non-finite logprob reached the comparison"
+            );
+        }
         let ours = sampled.ids[i];
         let theirs = whole.top_logprobs[0].0;
         if ours == theirs {
