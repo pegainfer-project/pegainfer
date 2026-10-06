@@ -47,7 +47,7 @@ Every probe and config test runs against it.
 ## What landed
 
 `pegainfer-qwen38-flash-next`, feature `qwen38-flash-next`, **with no CUDA dependency
-at all** — so its 38 tests need no device, no weights and no Triton-equipped build.
+at all** — so its 44 tests need no device, no weights and no Triton-equipped build.
 Preserving that is the point of the crate's shape: when slice B adds the device side,
 `config` and `probe` must move behind `#[cfg(any(feature, test))]` the way
 `pegainfer-gemma4/src/lib.rs` does.
@@ -62,6 +62,10 @@ Preserving that is the point of the crate's shape: when slice B adds the device 
   expert count, hidden size, layer count, head counts, `hc_count` — so a smaller
   `qwen4_exp` checkpoint reuses this probe, which is what the L20 small-model
   deployment case needs. `smaller_widths_still_pass` is what keeps that promise honest.
+  The same list carries `mrope_interleaved` and `mrope_section`, which are accepted
+  rather than refused: a text-only sequence is their degenerate case in the reference
+  itself, which expands one position per token across all three axes before
+  interleaving. The decision is tracked in #1105.
 - **Config** (`src/config.rs`) — validated geometry plus the derivations the rest of the
   line needs. Two fields the reference reads are **absent from `config.json`** and
   come from upstream defaults: `norm_topk_prob` (`true`, and it decides whether the
@@ -104,8 +108,9 @@ search against the reference's `_find_nth_prime_after`.
   must *not* be implemented (`docs/models/qwen35/support-qwen38.md`). Here it is live and
   selects the GDN gated-norm activation, so the shared `csrc/shared/norm.cu` gated norm —
   which is written for Qwen3.5's SiLU — has to become selectable before this line can
-  serve. It is *also* the marker the frontend's `reasoning_effort` layer arms on. Read
-  the field's consumer, never its name.
+  serve; that change is a separate PR (#1129) and this line's call site lands with the
+  text graph. It is *also* the marker the frontend's `reasoning_effort` layer arms on.
+  Read the field's consumer, never its name.
 - **Two RMSNorm conventions in one layer.** `(1+w)` for `q_norm`/`k_norm`, the indexer
   layernorms, `hc_norm` and the PLE norms; plain `w` only for the GDN gated norm. The
   four 10240-wide ones are additionally **grouped by 2560** — likely a reshape of the

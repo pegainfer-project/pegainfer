@@ -16,6 +16,9 @@
 // arrive next. Until then the non-test build has no runtime caller, so
 // `dead_code` would fire on the entire crate. Test builds keep the lint, so
 // genuinely unused items still surface.
+//
+// Remove this the moment the first runtime caller lands: it is a consequence of
+// having no consumer yet, not a property of the crate.
 #![cfg_attr(not(test), allow(dead_code))]
 
 mod config;

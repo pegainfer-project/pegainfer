@@ -45,8 +45,8 @@ glm52 = ["dep:pegainfer-glm52"]
 k3 = ["dep:pegainfer-k3"]
 kimi-k2 = ["dep:pegainfer-kimi-k2", "pegainfer-kimi-k2/kimi-k2"]
 qwen35 = ["dep:pegainfer-qwen35", "pegainfer-qwen35/qwen35"]
-# Foundation only (probe, config, tensor contract): no CUDA kernels yet, so this
-# feature pulls in no build-time Python or Triton.
+# Foundation only (probe, config): no CUDA kernels yet, so this feature pulls in
+# no build-time Python or Triton.
 qwen38-flash-next = [
   "dep:pegainfer-qwen38-flash-next",
   "pegainfer-qwen38-flash-next/qwen38-flash-next",

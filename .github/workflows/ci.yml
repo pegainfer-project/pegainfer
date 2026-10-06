@@ -280,6 +280,16 @@ jobs:
             extra_packages: "-p pegainfer-kernels"
             needs_triton: false
             triton_python: ""
+          # Foundation only: no CUDA kernels yet, hence no Triton. This row is
+          # what compiles the line's registration — `pegainfer-server` gates its
+          # registry entry and its hint family on `qwen38-flash-next`, and no
+          # other row enables that feature.
+          - model_name: Qwen3.8-Flash-Next
+            package: pegainfer-qwen38-flash-next
+            feature: qwen38-flash-next
+            extra_packages: "-p pegainfer-server"
+            needs_triton: false
+            triton_python: ""
 
     steps:
       - name: Checkout
@@ -329,3 +339,14 @@ jobs:
           --all-targets -- -D warnings
         env:
           PEGAINFER_TRITON_PYTHON: ${{ matrix.triton_python }}
+
+      # Clippy only type-checks the server's tests; the registry mirror is the
+      # one part of this line that lives in `pegainfer-server`, so run those
+      # assertions both with the feature on and off. The `hint` filter selects
+      # every test in that module — they are pure and need no device.
+      - name: Run the registration tests both ways
+        if: matrix.feature == 'qwen38-flash-next'
+        run: |
+          cargo test --release --locked -p pegainfer-server \
+            --features qwen38-flash-next --bin pegainfer hint
+          cargo test --release --locked -p pegainfer-server --bin pegainfer hint
