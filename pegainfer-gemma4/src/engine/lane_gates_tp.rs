@@ -139,6 +139,20 @@ fn top_of(lp: &TokenLogprob) -> HashMap<u32, f32> {
         .collect()
 }
 
+/// Every value a gap is taken from has to be finite. One NaN logit folds the
+/// row's logsumexp — and with it every logprob on that row — into NaN while the
+/// top-k *ids* stay right, and both `f32::max` and `gap > worst` step over a NaN
+/// without moving the running bound, so a gate would pass on a row it exists to
+/// fail. `serve_oracle::compare_row` asserts the same over both arms.
+fn assert_finite(lp: &TokenLogprob, at: &str) {
+    assert!(
+        lp.logprob.is_finite() && lp.top_logprobs.iter().all(|(_, value)| value.is_finite()),
+        "{at} scored a non-finite logprob: {} with top {:?}",
+        lp.logprob,
+        lp.top_logprobs
+    );
+}
+
 /// Two runs of the same one-rank workload must come out the same token for token
 /// and bit for bit. This is the control's bar: a gap metric that only bounds a
 /// tolerance can pass while two tokens trade places, so the control compares the
@@ -224,6 +238,14 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
                 continue;
             };
             compared += 1;
+            assert_finite(
+                a,
+                &format!("{what}: request {index} step {step} (one rank)"),
+            );
+            assert_finite(
+                b,
+                &format!("{what}: request {index} step {step} (two rank)"),
+            );
             let (left, right) = (top_of(a), top_of(b));
             worst_top = worst_top.max((a.top_logprobs[0].1 - b.top_logprobs[0].1).abs());
             for (token, value) in &left {
@@ -497,6 +519,11 @@ fn the_two_rank_engine_matches_the_hf_reference() {
             let theirs: Vec<(u32, f32)> = (0..top_k)
                 .map(|k| (ids[row * top_k + k] as u32, lps[row * top_k + k]))
                 .collect();
+            assert!(
+                theirs.iter().all(|(_, value)| value.is_finite()),
+                "{case} row {row}: the reference fixture carries a non-finite logprob"
+            );
+            assert_finite(ours, &format!("{case} row {row} (engine)"));
             let ours_top = top_of(ours);
             let (pa, pb) = (ours.top_logprobs[0].0, theirs[0].0);
             compared += 1;
