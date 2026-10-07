@@ -1378,10 +1378,15 @@ impl EngineState {
         R: FnOnce(&DeviceContext, &GemmaServe, &mut StepArena, P) -> Result<T>,
         E: Fn(&mut RankState, P) -> Result<()> + Sync,
     {
-        debug_assert_eq!(
+        // Fail-closed, not a debug assert: a payload that does not cover every
+        // rank leaves a peer's collective unissued, which is a hang rather than
+        // an error. This runs before any launch, so refusing here costs the step
+        // nothing.
+        anyhow::ensure!(
+            payload.len() == self.more.len() + 1,
+            "a step's payload carries {} items for {} ranks",
             payload.len(),
-            self.more.len() + 1,
-            "one payload item per rank"
+            self.more.len() + 1
         );
         let EngineState {
             ctx,
@@ -1427,6 +1432,16 @@ impl EngineState {
                 tp_broken.set(true);
                 if select_device(ctx).is_ok() {
                     arena.release_graphs();
+                } else {
+                    // A device that will not come current is the one case where
+                    // the release cannot run — and it is exactly the case a
+                    // sticky fault produces, so name the order we are about to
+                    // break: the abort below then runs against a live graph.
+                    log::error!(
+                        "rank 0's device {} will not come current, so its graphs stay alive \
+                         across the communicator abort; that abort may wedge",
+                        ctx.device_ordinal
+                    );
                 }
                 serve.detach_tp_comm();
             }
@@ -1469,9 +1484,16 @@ impl EngineState {
     /// Abort every extra rank's communicator and release its graphs, after a
     /// failed step has already stopped the engine.
     fn break_extras(&mut self) {
-        for state in &mut self.more {
+        for (index, state) in self.more.iter_mut().enumerate() {
             if select_device(&state.ctx).is_ok() {
                 state.arena.release_graphs();
+            } else {
+                log::error!(
+                    "rank {}'s device {} will not come current, so its graphs stay alive across \
+                     the communicator abort; that abort may wedge",
+                    index + 1,
+                    state.ctx.device_ordinal
+                );
             }
             state.serve.detach_tp_comm();
         }

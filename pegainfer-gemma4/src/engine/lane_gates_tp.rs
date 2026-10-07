@@ -465,6 +465,12 @@ fn the_two_rank_engine_is_prefix_consistent() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(1024);
     let short = long / 2;
+    // `short == 0` would make `0..short - 1` wrap in release and spin instead of
+    // reaching the `compared > 0` assert below.
+    assert!(
+        long >= 4,
+        "the prefix gate needs a prompt of at least 4 tokens"
+    );
     let (device, peer) = devices();
     assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
     let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
@@ -480,6 +486,7 @@ fn the_two_rank_engine_is_prefix_consistent() {
     }
     let (short_echo, long_echo) = (&echoes[0], &echoes[1]);
     let mut compared = 0usize;
+    let mut overlapped = 0usize;
     let mut worst = 0.0f32;
     let mut worst_at = String::new();
     let mut flipped = 0usize;
@@ -498,15 +505,22 @@ fn the_two_rank_engine_is_prefix_consistent() {
             continue;
         };
         compared += 1;
+        assert_finite(a, &format!("{short}-token run row {row} (engine)"));
+        assert_finite(b, &format!("{long}-token run row {row} (engine)"));
         let (left, right) = (top_of(a), top_of(b));
+        let mut shared = 0usize;
         for (token, value) in &left {
             if let Some(other) = right.get(token) {
+                shared += 1;
                 let gap = (value - other).abs();
                 if gap > worst {
                     worst = gap;
                     worst_at = format!("row {row} token {token}");
                 }
             }
+        }
+        if shared > 0 {
+            overlapped += 1;
         }
         let (pa, pb) = (a.top_logprobs[0].0, b.top_logprobs[0].0);
         if pa != pb {
@@ -518,12 +532,20 @@ fn the_two_rank_engine_is_prefix_consistent() {
         }
     }
     eprintln!(
-        "prefix: {compared} shared rows; worst shared-token gap {worst:.4} at {worst_at}; \
-         {flipped} argmax flips (first {first_flip})"
+        "prefix: {compared} rows, {overlapped} with a shared token; worst shared-token gap \
+         {worst:.4} at {worst_at}; {flipped} argmax flips (first {first_flip})"
     );
     let refs: Vec<&_> = controls.iter().collect();
     harness.shutdown(&refs);
     assert!(compared > 0, "no shared rows were scored");
+    // The gap is only computed where the two runs' top-k overlap, so a row that
+    // shares nothing contributes no evidence at all: without this, an engine that
+    // replaced every row's distribution would leave `worst` at 0 and pass.
+    assert!(
+        overlapped > 0,
+        "no row's top-{TOP_K} was shared between the {short}- and {long}-token runs, so the gap \
+         above measured nothing"
+    );
     // The line is `serve_oracle`'s calibration, not a tight one: scoring the same
     // context two ways (there a greedy walk against a single prefill, here a
     // 512-row prefill against a 1024-row one) moves the logits by a chaotically

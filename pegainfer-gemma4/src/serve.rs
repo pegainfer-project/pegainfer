@@ -1041,11 +1041,12 @@ pub(crate) struct GemmaServe {
 }
 
 // SAFETY: A serve is pinned to one CUDA device and driven by one thread at a
-// time — the thread that loads it (the load-time warm and the decode-graph
-// sweep walk the ranks one after another, never in parallel) and afterwards the
-// engine's scheduler thread, which owns the whole `EngineState` and touches a
-// rank's serve only while that rank's device is current. Nothing shares a serve
-// between threads, so the raw NCCL communicator it may hold never crosses a
+// time: the thread that loads it (the load-time warm and the decode-graph sweep
+// walk the ranks one after another, never in parallel), and afterwards exactly
+// one thread per step — the scheduler's for rank 0, and one scoped thread per
+// extra rank, which hands its `&mut` back at the join before the scheduler
+// touches that rank again (`EngineState::drive_ranks`). No two threads hold a
+// serve at once, so the raw NCCL communicator it may hold never crosses a
 // thread while in use. (Same assertions `Qwen3Model` makes.)
 unsafe impl Send for GemmaServe {}
 
