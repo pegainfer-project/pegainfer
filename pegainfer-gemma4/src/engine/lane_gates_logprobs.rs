@@ -6,38 +6,28 @@ use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::Terminal;
 
+use super::lane_gates_tp::assert_finite;
 use super::lane_tests::Harness;
 use super::lane_tests::ids;
 use super::lane_tests::launch;
 use super::lane_tests::pin_live_stream;
 
-/// How many top logprobs each side keeps. A failed pick carries both lists into
-/// its message, so a disagreement reads without a re-run.
 const TOP_K: usize = 8;
 
-/// The window fixture's real-text prompt, four times the sliding window, so a
-/// resume runs through a cached *local* family that the window has already
-/// truncated. `serve::oracle`'s waypoint gate reads the same case.
+/// Four times the sliding window, so the resume runs through a truncated local family.
 const RESUME_TOKENS: usize = 4096;
-/// Where the cache is seeded, short of the resume, so the resume has to prefill
-/// a suffix through the cache rather than only decode from it.
+/// Short of the resume, so the resume prefills a suffix through the cache.
 const SEED_TOKENS: usize = 4000;
-/// How many tokens the decode runs; each is scored on both sides.
 const DECODE_TOKENS: usize = 6;
 
-/// The cache-resumed comparison may not come out worse than this many times the
-/// same comparison run cold. Both legs are bf16 forwards of one arithmetic in two
-/// shapes — six decode steps against a whole-prompt readback — so the cold leg
-/// measures what that shape difference is worth on this prompt, and the cache is
-/// what this gate is about: it may not multiply it. A fixed line cannot express
-/// that; measured here on the pinned 12B at 4096 tokens, the cold leg is 0.278
-/// nat and the resumed one 0.323, so a line anywhere near the old 0.10 would have
-/// failed the *control*. The ratio is `serve::oracle`'s own shape for a line it
-/// has to derive rather than choose — `(2.0 * floor).max(1.0)`.
+/// The resumed leg against the cold leg on the same prompt. Measured on the
+/// pinned 12B on sm_89 at 4096 tokens: cold 0.278 nat, resumed 0.323.
 const LOGPROB_RATIO: f32 = 2.0;
-/// The same line's floor, for a prompt whose cold legs happen to agree exactly:
-/// without it the ratio would tighten to nothing.
 const LOGPROB_FLOOR: f32 = 0.10;
+/// The ratio alone passes a fault both legs share, so the cold leg has its own
+/// line. At this prompt's first scored position the window fixture's sdpa and
+/// eager rows differ by 0.315 nat on the same token; the cold leg measured 0.278.
+const COLD_LOGPROB_LINE: f32 = 0.5;
 
 fn assert_echo_covers(echo: &PromptEcho, prompt: &[u32], top_k: usize) {
     assert_eq!(echo.ids, prompt, "the echo names the prompt");
@@ -54,11 +44,8 @@ fn assert_echo_covers(echo: &PromptEcho, prompt: &[u32], top_k: usize) {
     }
 }
 
-/// Decode [`DECODE_TOKENS`] from `head`, read the same positions back through one
-/// whole-prompt scored pass, and hold the two against each other: the worst
-/// logprob gap on a token both sides kept, with every disagreement required to
-/// be a near-tie. Returns that worst and the resume frontier the decode reported,
-/// so a caller can tell whether a cache was involved.
+/// Decodes from `head`, scores the replayed prompt whole, and returns the worst
+/// logprob gap and the decode's resume frontier.
 fn teacher_forced_worst(harness: &mut Harness, head: &[u32]) -> (f32, usize) {
     let sampled = harness.steps.drain(
         harness
@@ -77,35 +64,19 @@ fn teacher_forced_worst(harness: &mut Harness, head: &[u32]) -> (f32, usize) {
     let echo = replay.prompt_echo.expect("the replay echoes its prompt");
     assert_echo_covers(&echo, &replayed, TOP_K);
 
-    // Every position conditions on the same tokens on both sides, so a pick that
-    // moved is worth failing on — but only past the near-tie rule that
-    // `lane_gates_tp`'s `distribution_gap` applies to the same situation: two
-    // independently sampling shapes of one arithmetic disagree about the argmax
-    // exactly where its two candidates sit inside reduction-order noise, and
-    // refusing that fails a correct build (it does, on this prompt, at position
-    // 4, where 236761 and 236770 trade places across a ~0.25 nat gap). A pick
-    // neither side kept is a real failure, and the flipped picks' own gaps are
-    // folded into the bound so a flip cannot hide one.
+    // A flipped argmax must stay a near tie: each pick inside the other side's top-k.
     let mut worst = 0.0_f32;
     for (i, decoded) in sampled.logprobs.iter().enumerate() {
         let decoded = decoded.as_ref().expect("sampled token scored");
         let whole = echo.logprobs[head.len() + i]
             .as_ref()
             .expect("prompt position scored");
-        // A NaN row is invisible to the comparisons below: `f32::max` steps over
-        // a NaN without moving the bound, so a NaN logsumexp — every logprob on
-        // the row NaN while the ids stay right — would pass this gate.
-        for row in [decoded, whole] {
-            assert!(
-                row.logprob.is_finite()
-                    && row.top_logprobs.iter().all(|(_, value)| value.is_finite()),
-                "position {i}: a non-finite logprob reached the comparison"
-            );
-        }
+        assert_finite(decoded, &format!("position {i} (decode)"));
+        assert_finite(whole, &format!("position {i} (readback)"));
+        worst = worst.max((decoded.logprob - whole.logprob).abs());
         let ours = sampled.ids[i];
         let theirs = whole.top_logprobs[0].0;
         if ours == theirs {
-            worst = worst.max((decoded.logprob - whole.logprob).abs());
             continue;
         }
         let ours_top: HashMap<u32, f32> = decoded.top_logprobs.iter().copied().collect();
@@ -124,11 +95,8 @@ fn teacher_forced_worst(harness: &mut Harness, head: &[u32]) -> (f32, usize) {
             whole.top_logprobs,
             decoded.top_logprobs
         );
-        for token in [ours, theirs] {
-            if let (Some(a), Some(b)) = (ours_top.get(&token), theirs_top.get(&token)) {
-                worst = worst.max((a - b).abs());
-            }
-        }
+        // `ours` is the replayed token, already compared above.
+        worst = worst.max((ours_top[&theirs] - theirs_top[&theirs]).abs());
     }
     (worst, sampled.cached)
 }
@@ -136,20 +104,6 @@ fn teacher_forced_worst(harness: &mut Harness, head: &[u32]) -> (f32, usize) {
 #[test]
 #[ignore = "requires a Gemma 4 checkpoint, a GPU, fixtures, and --test-threads=1"]
 fn prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode() {
-    // Real text, and past the sliding window, both on purpose.
-    //
-    // Real text because this gate compares two runs that sample independently.
-    // Synthetic id arithmetic drives the tower into a degenerate distribution
-    // whose top two candidates sit inside reduction-order noise — `testkit.rs`
-    // records exactly that about it — and with such a prompt the two sides picked
-    // different tokens from the second position on, so the comparison below was
-    // subtracting two different tokens' logprobs, by up to 0.76 nat. This prompt
-    // is tokenized text from `dump_gemma4_window_golden.py`'s corpus.
-    //
-    // Past the window because four times the window is what makes the resume run
-    // through a cached local family the window has already truncated — the case
-    // `kv-cache.md`'s frozen checkpoint query is about, and one a prompt that
-    // stops at the window cannot reach.
     let dir = crate::testkit::model_path();
     let (_, golden) = crate::testkit::golden_bytes(&dir);
     let window_path = crate::testkit::fixture_path(
@@ -158,9 +112,6 @@ fn prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode() {
     );
     let window_bytes = std::fs::read(&window_path).expect("read the window fixture");
     let window = safetensors::SafeTensors::deserialize(&window_bytes).expect("window fixture");
-    // The window fixture is a separate artifact from the checkpoint, so hold it
-    // to the revision the golden was already validated against — the way
-    // `serve::oracle`'s waypoint gate does, and not by its file name.
     let window_manifest = crate::testkit::fixture_manifest(&window_bytes, "gemma4_window_golden");
     assert_eq!(
         window_manifest["revision"], golden["revision"],
@@ -175,11 +126,13 @@ fn prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode() {
     let head = prose[..RESUME_TOKENS].to_vec();
     let seed_prompt = prose[..SEED_TOKENS].to_vec();
 
-    // The control: the same comparison with no cache anywhere near it. It is what
-    // makes the assertion below a property rather than a constant.
     let mut cold = launch(&[]);
     let (cold_worst, _) = teacher_forced_worst(&mut cold, &head);
     cold.shutdown(&[]);
+    assert!(
+        cold_worst <= COLD_LOGPROB_LINE,
+        "the cold readback and decode differ by {cold_worst} nat (line {COLD_LOGPROB_LINE})"
+    );
 
     let mut harness = launch(&[(super::PREFIX_CACHE_ENV, "4")]);
     let seed = harness.submit(seed_prompt, 4);

@@ -144,7 +144,7 @@ fn top_of(lp: &TokenLogprob) -> HashMap<u32, f32> {
 /// top-k *ids* stay right, and both `f32::max` and `gap > worst` step over a NaN
 /// without moving the running bound, so a gate would pass on a row it exists to
 /// fail. `serve_oracle::compare_row` asserts the same over both arms.
-fn assert_finite(lp: &TokenLogprob, at: &str) {
+pub(super) fn assert_finite(lp: &TokenLogprob, at: &str) {
     assert!(
         lp.logprob.is_finite() && lp.top_logprobs.iter().all(|(_, value)| value.is_finite()),
         "{at} scored a non-finite logprob: {} with top {:?}",
