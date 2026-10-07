@@ -388,7 +388,6 @@ fn envelope_overrides() -> Vec<(&'static str, String)> {
     for (var, knob) in [
         ("PEGAINFER_TP_SLOTS", super::DECODE_SLOTS_ENV),
         ("PEGAINFER_TP_CTX", super::MAX_CONTEXT_ENV),
-        ("PEGAINFER_TP_MAX_PROMPT", super::TP_MAX_PROMPT_ENV),
     ] {
         if let Ok(value) = std::env::var(var) {
             overrides.push((knob, value));
@@ -411,13 +410,12 @@ fn as_refs<'a>(overrides: &'a [(&'static str, String)]) -> Vec<(&'static str, &'
 #[ignore = "needs two GPUs and --test-threads=1"]
 fn the_two_rank_engine_scores_prompt_logprobs() {
     const TOP_K: usize = 8;
-    // The gate's prompt is the TP ceiling itself, so the length the guard
-    // refuses past is the length this passes. `PEGAINFER_TP_PROMPT_TOKENS`
-    // overrides it to probe another point.
+    // A mid-length prompt, so the scored path runs a real prefill per rank rather
+    // than a single-token one. `PEGAINFER_TP_PROMPT_TOKENS` probes another point.
     let len: usize = std::env::var("PEGAINFER_TP_PROMPT_TOKENS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(super::TP_MAX_PROMPT);
+        .unwrap_or(64);
     let (device, peer) = devices();
     assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
     let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
@@ -440,12 +438,110 @@ fn the_two_rank_engine_scores_prompt_logprobs() {
         assert_eq!(
             echo.logprobs.len(),
             prompt.len(),
-            "one scored prompt row per prompt token"
+            "one scored row per prompt token"
         );
     }
     let refs: Vec<&_> = controls.iter().collect();
     harness.shutdown(&refs);
 }
+
+/// A causal model's row `r` depends only on tokens `..= r`, so the same prompt's
+/// early rows must score the same whether the prompt is run whole or cut short.
+/// They will not be bit-identical — the prefill GEMM's tiling, and so its
+/// accumulation order, depends on the row count — so the gate bounds the shared
+/// rows by the same chaotic-shape line `serve_oracle` calibrates (`PREFIX_LINE`),
+/// not by the one-rank comparison's tighter one. A **large** gap here is the
+/// engine's own long-context bug (a page, position or rope error), with no
+/// reference implementation involved.
+///
+/// `PEGAINFER_TP_PROMPT_TOKENS` sets the long length (default 1024, the window
+/// width); the short run is its first half.
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1; checkpoint from PEGAINFER_TEST_MODEL_PATH"]
+fn the_two_rank_engine_is_prefix_consistent() {
+    const SALT: u32 = 11;
+    let long: usize = std::env::var("PEGAINFER_TP_PROMPT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024);
+    let short = long / 2;
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
+    let mut controls = Vec::new();
+    let mut echoes = Vec::new();
+    // `ids` is position-indexed, so the short prompt is a prefix of the long one.
+    for len in [short, long] {
+        let prompt = ids(len, SALT);
+        let control = harness.submit_scored(prompt.clone(), 1, Some(TOP_K), Some(TOP_K));
+        let drained = harness.steps.drain(control.id(), "prefix");
+        echoes.push(drained.prompt_echo.expect("the engine echoes the prompt"));
+        controls.push(control);
+    }
+    let (short_echo, long_echo) = (&echoes[0], &echoes[1]);
+    let mut compared = 0usize;
+    let mut worst = 0.0f32;
+    let mut worst_at = String::new();
+    let mut flipped = 0usize;
+    let mut first_flip = String::new();
+    for row in 0..short - 1 {
+        let (Some(a), Some(b)) = (
+            short_echo
+                .logprobs
+                .get(row + 1)
+                .and_then(|entry| entry.as_ref()),
+            long_echo
+                .logprobs
+                .get(row + 1)
+                .and_then(|entry| entry.as_ref()),
+        ) else {
+            continue;
+        };
+        compared += 1;
+        let (left, right) = (top_of(a), top_of(b));
+        for (token, value) in &left {
+            if let Some(other) = right.get(token) {
+                let gap = (value - other).abs();
+                if gap > worst {
+                    worst = gap;
+                    worst_at = format!("row {row} token {token}");
+                }
+            }
+        }
+        let (pa, pb) = (a.top_logprobs[0].0, b.top_logprobs[0].0);
+        if pa != pb {
+            flipped += 1;
+            if first_flip.is_empty() {
+                first_flip =
+                    format!("row {row}: {short}-token picks {pa}, {long}-token picks {pb}");
+            }
+        }
+    }
+    eprintln!(
+        "prefix: {compared} shared rows; worst shared-token gap {worst:.4} at {worst_at}; \
+         {flipped} argmax flips (first {first_flip})"
+    );
+    let refs: Vec<&_> = controls.iter().collect();
+    harness.shutdown(&refs);
+    assert!(compared > 0, "no shared rows were scored");
+    // The line is `serve_oracle`'s calibration, not a tight one: scoring the same
+    // context two ways (there a greedy walk against a single prefill, here a
+    // 512-row prefill against a 1024-row one) moves the logits by a chaotically
+    // amplifying amount — measured in-repo at 0.31..5.75 raw logits — because the
+    // prefill GEMM's tiling depends on the row count. Measured here: 1.69 on the
+    // four-layer synthetic, 4.05 on the 60-layer 31B. A grosser gap (a page,
+    // position or rope error) still fails.
+    assert!(
+        worst < PREFIX_LINE,
+        "the same prefix scored in a longer run differs by {worst} at {worst_at} (line \
+         {PREFIX_LINE}), so the engine is not prefix-consistent"
+    );
+}
+
+/// The prefix gate's line, on the `serve_oracle` scale (`DRIFT_LINE = 12.0`
+/// there) rather than the one-rank comparison's `LOGBROB_LINE`: the drift it
+/// looks for is the same chaotic shape-dependence, bounded the same way.
+const PREFIX_LINE: f32 = 12.0;
 
 /// Two ranks against the Hugging Face reference, for the size the gate above
 /// cannot afford a single-rank control on: a 31B's whole tower is 57 GiB, so its
@@ -465,11 +561,13 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     /// logits. A shared token may sit this far apart: bf16 reduction order and a
     /// different attention backend, nothing structural.
     const DRIFT_LINE: f32 = 1.0;
-    // The fixture also carries "edge" (1024 tokens), but that is past the TP
-    // prompt ceiling: a prefill that long stalls the single-threaded multi-rank
-    // driver before the peer ranks launch (docs/models/gemma4/tp.md "Known
-    // bounds"), so admission refuses it (`TP_MAX_PROMPT`). The case joins the
-    // gate once the ranks are driven concurrently.
+    // Only the nine-token case is gated. The 1024-token "edge" case runs (the
+    // concurrent driver carries it), but at window width its drift is the
+    // shape-dependent chaos `serve_oracle`'s `neutral_scale` already measures at
+    // 0.31..5.75 raw logits — worst shared-token logprob gap 8.37 here — so a
+    // strict top-k containment cannot hold and the case needs that gate's
+    // tolerance-plus-top-1-share discipline. See docs/models/gemma4/tp.md "Known
+    // bounds"; the calibration is the follow-up.
     const CASES: [&str; 1] = ["short"];
 
     let (device, peer) = devices();
@@ -488,6 +586,8 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     let mut controls = Vec::new();
     let mut compared = 0usize;
     let mut same_pick = 0usize;
+    let mut outside = 0usize;
+    let mut offenders: Vec<String> = Vec::new();
     let mut worst = 0.0f32;
     let mut worst_at = String::new();
     for case in CASES {
@@ -500,13 +600,8 @@ fn the_two_rank_engine_matches_the_hf_reference() {
             tokens.len(),
             "{case}: one reference row per token"
         );
-        eprintln!(
-            "hf: {case}: {} tokens, top_k {top_k}: submitting",
-            tokens.len()
-        );
         let control = harness.submit_scored(tokens.clone(), 1, Some(top_k), Some(top_k));
         let drained = harness.steps.drain(control.id(), case);
-        eprintln!("hf: {case}: drained");
         let echo = drained.prompt_echo.expect("the engine echoes the prompt");
         for row in 0..tokens.len() - 1 {
             // Row 0 of the echo is the head's own placeholder, so the row that
@@ -530,16 +625,29 @@ fn the_two_rank_engine_matches_the_hf_reference() {
             if pa == pb {
                 same_pick += 1;
             } else {
-                // A differing pick has to be a near-tie, the same rule the
-                // one-rank comparison holds itself to.
-                assert!(
-                    theirs.iter().any(|(token, _)| *token == pa),
-                    "{case} row {row}: the engine's pick {pa} is outside the reference's top-{top_k}"
-                );
-                assert!(
-                    ours_top.contains_key(&pb),
-                    "{case} row {row}: the reference's pick {pb} is outside the engine's top-{top_k}"
-                );
+                // A differing pick has to be a near-tie: each pick inside the
+                // other run's top-k. Every offender is collected rather than
+                // panicking on the first, so one run names them all.
+                if !theirs.iter().any(|(token, _)| *token == pa) {
+                    outside += 1;
+                    if offenders.len() < 10 {
+                        offenders.push(format!(
+                            "{case} row {row}: engine pick {pa} at {:.4}, reference top-1 {pb} at \
+                             {:.4}, reference top-{top_k} floor {:.4}",
+                            ours.top_logprobs[0].1,
+                            theirs[0].1,
+                            theirs.last().expect("non-empty top-k").1
+                        ));
+                    }
+                }
+                if !ours_top.contains_key(&pb) {
+                    outside += 1;
+                    if offenders.len() < 10 {
+                        offenders.push(format!(
+                            "{case} row {row}: reference pick {pb} outside the engine's top-{top_k}"
+                        ));
+                    }
+                }
             }
             for (token, value) in &theirs {
                 if let Some(other) = ours_top.get(token) {
@@ -554,11 +662,18 @@ fn the_two_rank_engine_matches_the_hf_reference() {
         controls.push(control);
     }
     eprintln!(
-        "hf: {same_pick}/{compared} rows keep the reference's pick; worst shared-token logprob gap \
-         {worst:.4} at {worst_at}"
+        "hf: {same_pick}/{compared} rows keep the reference's pick; {outside} out-of-top-k; worst \
+         shared-token logprob gap {worst:.4} at {worst_at}"
     );
+    for offender in &offenders {
+        eprintln!("hf: outside: {offender}");
+    }
     let controls: Vec<&_> = controls.iter().collect();
     harness.shutdown(&controls);
+    assert!(
+        outside == 0,
+        "{outside} rows have a pick outside the other's top-k; first up to 10: {offenders:#?}"
+    );
     assert!(
         worst < DRIFT_LINE,
         "the two-rank engine and the reference differ on {worst_at} by {worst} (line {DRIFT_LINE})"

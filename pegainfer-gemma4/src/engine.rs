@@ -63,7 +63,6 @@ const MIX_GATHER_ROWS_ENV: &str = "PEGAINFER_MIX_GATHER_ROWS";
 const MIX_MAX_PROMPTS_ENV: &str = "PEGAINFER_MIX_MAX_PROMPTS";
 const MAX_CONTEXT_ENV: &str = "PEGAINFER_MAX_CONTEXT";
 const DECODE_SLOTS_ENV: &str = "PEGAINFER_DECODE_SLOTS";
-const TP_MAX_PROMPT_ENV: &str = "PEGAINFER_TP_MAX_PROMPT";
 const KV_FP8_ENV: &str = "PEGAINFER_KV_FP8";
 const ADMIT_COALESCE_ENV: &str = "PEGAINFER_ADMIT_COALESCE_MS";
 const GLOBAL_ATTN_ENV: &str = "PEGAINFER_GLOBAL_ATTN";
@@ -127,30 +126,6 @@ fn parse_decode_slots(raw: &str) -> Result<usize> {
         Ok(value) if (1..=MAX_CONCURRENCY).contains(&value) => Ok(value),
         _ => anyhow::bail!(
             "{DECODE_SLOTS_ENV}={raw:?} not recognized (N, 1 <= N <= {MAX_CONCURRENCY})"
-        ),
-    }
-}
-
-/// The longest prompt tensor parallelism serves, in tokens. A prefill at least
-/// this long reaches a host-side device sync on rank 0 inside a global layer's
-/// MLP before the peer ranks have launched — a stall the single-threaded driver
-/// cannot recover from (docs/models/gemma4/tp.md "Known bounds"). Measured on the
-/// 60-layer 31B at TP2: 64 tokens completes, 128 stalls. Raising it needs the
-/// concurrent driver.
-const TP_MAX_PROMPT: usize = 64;
-const TP_MAX_PROMPT_OFF: &str = "off";
-
-/// `PEGAINFER_TP_MAX_PROMPT`: a positive token count, or `off`/`0` to lift the
-/// ceiling. Only consulted at world size > 1.
-fn parse_tp_max_prompt(raw: &str) -> Result<Option<usize>> {
-    let raw = raw.trim();
-    if raw.eq_ignore_ascii_case(TP_MAX_PROMPT_OFF) || raw == "0" {
-        return Ok(None);
-    }
-    match raw.parse::<usize>() {
-        Ok(value) if value > 0 => Ok(Some(value)),
-        _ => anyhow::bail!(
-            "{TP_MAX_PROMPT_ENV}={raw:?} not recognized (N, N >= 1, or {TP_MAX_PROMPT_OFF})"
         ),
     }
 }
@@ -420,17 +395,6 @@ fn start_with_knobs(
             "{MIX_CHUNK_TOKENS_ENV} is unsupported under tensor parallelism: a chunked walk's \
              rounds gather across prompts and are not covered by the TP gates"
         );
-        // Lifting the ceiling is lifting the guard on a hang this build cannot
-        // recover from, so it is said out loud rather than left to the notes.
-        if knobs.tp_max_prompt.is_none() {
-            log::warn!(
-                "{TP_MAX_PROMPT_ENV} lifts the tensor-parallel prompt ceiling: a prefill long \
-                 enough reaches a host-side device sync on rank 0 before the extra ranks have \
-                 launched, and the single-threaded driver then hangs instead of failing the \
-                 request (docs/models/gemma4/tp.md, \"Known bounds\"). Lift it only on a build \
-                 whose rank driver is concurrent."
-            );
-        }
         // The ranks take ordinals `0..world` of what this process can see, so a
         // world size past the visible devices can only fail later, less clearly.
         // `cuDeviceGetCount` needs the driver up and on a fresh process this is
@@ -641,13 +605,11 @@ impl Drop for AsyncPrefillLane {
 /// The fail-closed request validation every admission path shares; `Err`
 /// carries the typed refusal. Refuse every unsupported capability carried by
 /// the stepped `Request` (LoRA and P/D transfer metadata) rather than
-/// silently ignoring it, a scored prompt longer than `score_ceiling`, and under
-/// tensor parallelism a prompt past the ceiling the prefill stall bounds.
+/// silently ignoring it, and a scored prompt longer than `score_ceiling`.
 fn validate_request(
     request: &Request,
     max_context: usize,
     score_ceiling: usize,
-    tp_max_prompt: Option<usize>,
 ) -> Result<usize, RejectReason> {
     let prompt_tokens = request.prompt_tokens.len();
     if prompt_tokens == 0 {
@@ -679,17 +641,6 @@ fn validate_request(
         return Err(RejectReason::EchoPrefillTokens {
             prompt_tokens,
             limit: score_ceiling,
-        });
-    }
-    if let Some(limit) = tp_max_prompt
-        && prompt_tokens > limit
-    {
-        return Err(RejectReason::Unsupported {
-            feature: format!(
-                "prompts longer than {limit} tokens under tensor parallelism: a longer prefill \
-                 stalls the multi-rank driver (see {TP_MAX_PROMPT_ENV} and the tensor-parallel \
-                 notes)"
-            ),
         });
     }
     if request.kv_transfer_params.is_some() {
@@ -794,9 +745,6 @@ struct ServingKnobs {
     local_kv_storage: KvStorage,
     global_attn: GlobalAttn,
     prefix_cache: Option<usize>,
-    /// The resolved `TP_MAX_PROMPT_ENV` ceiling (`None` = lifted). Applied only
-    /// at world size > 1, where it is what the prefill stall bounds.
-    tp_max_prompt: Option<usize>,
 }
 
 impl ServingKnobs {
@@ -828,8 +776,6 @@ impl ServingKnobs {
             .map_or(Ok(GlobalAttn::Incumbent), |raw| parse_global_attn(&raw))?;
         let prefix_cache =
             lookup(PREFIX_CACHE_ENV)?.map_or(Ok(None), |raw| parse_prefix_cache_cap(&raw))?;
-        let tp_max_prompt = lookup(TP_MAX_PROMPT_ENV)?
-            .map_or(Ok(Some(TP_MAX_PROMPT)), |raw| parse_tp_max_prompt(&raw))?;
 
         // The stub tier links under the same name and refuses at launch, so
         // without this the answer would arrive after the weights are loaded
@@ -882,7 +828,6 @@ impl ServingKnobs {
             local_kv_storage,
             global_attn,
             prefix_cache,
-            tp_max_prompt,
         })
     }
 }
@@ -1264,79 +1209,41 @@ fn select_device(ctx: &DeviceContext) -> Result<()> {
     Ok(())
 }
 
-/// The rank-`rank` KV of every row, in row order.
-fn rank_kvs(rows: &mut [Active], rank: usize) -> Vec<&mut RankKv> {
-    rows.iter_mut()
-        .map(|entry| entry.kv.core_mut(rank))
-        .collect()
-}
-
-/// Break the tensor-parallel engine after a rank-0 step has failed: release
-/// every rank's captured graphs, then abort every communicator.
-///
-/// Rank 0 may have stopped between two collectives, so a peer's matching call
-/// will never arrive; aborting the comms unblocks any peer already waiting
-/// instead of letting it hang. The graphs go first, on their own device,
-/// exactly as `Drop` orders it — aborting a comm while a graph that references
-/// its NCCL launches is alive wedges. `broken` is set first so no later step runs
-/// a comm-less reduction, which would return partial sums.
-///
-/// With no extra ranks there is no collective to abort and no peer frontier to
-/// keep in step, so this is the ordinary single-rank prefill failure the caller
-/// answers by failing that one request: return before `broken` is set, or a
-/// request-local error (a per-request scratch allocation) would stop the engine.
-fn abort_comms(
-    broken: &Cell<bool>,
-    ctx: &DeviceContext,
-    serve: &mut GemmaServe,
-    arena: &mut StepArena,
-    more: &mut [RankState],
-) {
-    if more.is_empty() {
-        return;
-    }
-    broken.set(true);
-    if select_device(ctx).is_ok() {
-        arena.release_graphs();
-    }
-    for state in more.iter_mut() {
-        if select_device(&state.ctx).is_ok() {
-            state.arena.release_graphs();
+/// One `Vec` of rank-`r` families per rank for a batch: `payload[r][i]` is request
+/// `i`'s rank-`r` families. Transposed once with a disjoint borrow per request,
+/// which is what lets each rank's thread take its own slice.
+fn rank_payloads(active: &mut [Active]) -> Vec<Vec<&mut RankKv>> {
+    let world = active.first().map_or(1, |entry| entry.kv.world());
+    let mut per_rank: Vec<Vec<&mut RankKv>> = (0..world)
+        .map(|_| Vec::with_capacity(active.len()))
+        .collect();
+    for entry in active.iter_mut() {
+        let (core, twins) = entry.kv.split();
+        per_rank[0].push(core);
+        for (index, twin) in twins.iter_mut().enumerate() {
+            per_rank[index + 1].push(twin);
         }
     }
-    serve.detach_tp_comm();
-    for state in more {
-        state.serve.detach_tp_comm();
-    }
+    per_rank
 }
 
-/// Drive every extra rank for a decode-shaped step and leave them all in
-/// flight — the decode counterpart of `EngineState::step_extra_ranks`, and the
-/// one place the two shapes' difference is written down. A free function for
-/// the same reason `abort_comms` is: a mixed step still holds rank 0's logits
-/// out of its arena, so this may only borrow the fields it uses.
-///
-/// No drain here. A decode-shaped step's only host blocking point is rank 0's
-/// sampler readback, which the caller reaches after this returns, so every
-/// rank's collectives are in flight before anything waits; draining per rank
-/// instead would deadlock at three ranks or more, exactly as the comment in
-/// `step_extra_ranks` explains. A mixed step carries prompt rows and still
-/// takes this shape — its rows ride the decode step, not a prefill of their
-/// own.
-///
-/// A failure on an extra rank is fatal, because the ranks' frontiers must not
-/// drift apart. It reaches the driver as `Err` from `Scheduler::step`, which
-/// writes off every open account and winds the engine down.
-fn drive_extra_ranks<F>(more: &mut [RankState], ctx: &DeviceContext, mut per_rank: F) -> Result<()>
-where
-    F: FnMut(&mut RankState, usize) -> Result<()>,
-{
-    for (rank, state) in more.iter_mut().enumerate() {
-        activate_rank(&state.ctx)?;
-        per_rank(state, rank + 1)?;
+/// The prefill side of [`rank_payloads`]: the same transposition over the mixed
+/// step's `(kv, prompt)` pairs.
+fn prefill_payloads<'p, 't>(
+    prefills: &'p mut [(&mut GemmaKv, &'t [u32])],
+) -> Vec<Vec<(&'p mut RankKv, &'t [u32])>> {
+    let world = prefills.first().map_or(1, |(kv, _)| kv.world());
+    let mut per_rank: Vec<Vec<(&mut RankKv, &[u32])>> = (0..world)
+        .map(|_| Vec::with_capacity(prefills.len()))
+        .collect();
+    for (kv, tokens) in prefills.iter_mut() {
+        let (core, twins) = kv.split();
+        per_rank[0].push((core, *tokens));
+        for (index, twin) in twins.iter_mut().enumerate() {
+            per_rank[index + 1].push((twin, *tokens));
+        }
     }
-    // The caller's next device work is rank 0's.
-    activate_rank(ctx)
+    per_rank
 }
 
 /// Everything the contract-owned scheduler thread owns for the life of the
@@ -1384,9 +1291,6 @@ struct EngineState {
     /// refuses rather than run a comm-less reduction that would return partial
     /// sums. `Cell` so the abort path can set it while holding `&self.ctx`.
     tp_broken: Cell<bool>,
-    /// The longest prompt tensor parallelism serves (`None` = no ceiling). The
-    /// known long-prompt prefill stall bounds it (see `TP_MAX_PROMPT`).
-    tp_max_prompt: Option<usize>,
     /// The admission coalesce window; `None` unless
     /// `PEGAINFER_ADMIT_COALESCE_MS` opted in at startup.
     admit_coalesce: Option<std::time::Duration>,
@@ -1455,48 +1359,122 @@ impl EngineState {
         Ok(())
     }
 
-    /// Run `per_rank` on every extra rank, drain each stream, and require that
-    /// they all end on rank 0's frontier.
+    /// Drive one step's segment on every rank at once — rank 0 on this thread,
+    /// each extra rank on its own — then join, and require that they all end on
+    /// rank 0's frontier. `payload` carries one item per rank, rank 0's first.
     ///
-    /// Call this only once rank 0's own step has **succeeded** and is in flight:
-    /// a rank-0 failure means its collective sequence stopped short, and driving
-    /// the peer's whole tower would leave it waiting on a call that never comes,
-    /// so the caller aborts the comms instead (see `abort_comms`). With rank 0
-    /// launched, every rank's work is in flight before any drain, so the shared
-    /// collective sequence stays paired. A failure on an extra rank is fatal
-    /// here, because the ranks' frontiers must not drift apart. The drain is what
-    /// turns a device fault on a non-primary rank into a named error instead of
-    /// the primary's collective stalling forever.
-    fn step_extra_ranks<F>(&self, kv: &mut GemmaKv, per_rank: F) -> Result<()>
+    /// One thread per extra rank is what lets rank 0's segment contain a
+    /// **host-blocking** operation (a device sync, an allocation in a GEMM's
+    /// workspace): by the time rank 0 reaches it, every peer's collectives are
+    /// already in flight, so the drain rank 0 waits on can pair — where a single
+    /// thread that ran rank 0's whole segment first would wait on a call it had
+    /// not yet issued. A rank-0 failure aborts rank 0's communicator so the
+    /// peers' pending collectives error out instead of hanging, and the extras'
+    /// are aborted after the join. An extra rank's failure is fatal: the ranks'
+    /// frontiers must not drift apart.
+    fn drive_ranks<P, T, R, E>(&mut self, payload: Vec<P>, rank0: R, extra: E) -> Result<T>
     where
-        F: Fn(&RankState, &mut RankKv) -> Result<()>,
+        P: Send,
+        R: FnOnce(&DeviceContext, &GemmaServe, &mut StepArena, P) -> Result<T>,
+        E: Fn(&mut RankState, P) -> Result<()> + Sync,
     {
-        // Launch every extra rank before draining any of them. A rank's work is
-        // enqueued asynchronously, but its drain is not: waiting on rank 1 here
-        // would reach its collective before ranks 2..'s matching calls are in
-        // flight, and one thread cannot both wait and issue the next launch, so
-        // the step would deadlock. Once every call is in flight the drains can
-        // run in any order.
-        for (rank, state) in self.more.iter().enumerate() {
-            activate_rank(&state.ctx)?;
-            per_rank(state, kv.core_mut(rank + 1)).context("tensor-parallel prefill")?;
+        debug_assert_eq!(
+            payload.len(),
+            self.more.len() + 1,
+            "one payload item per rank"
+        );
+        let EngineState {
+            ctx,
+            serve,
+            arena,
+            more,
+            tp_broken,
+            ..
+        } = self;
+        let mut payload = payload.into_iter();
+        let core = payload.next().expect("a rank-0 payload item");
+        let twins: Vec<P> = payload.collect();
+        let extra_ranks = more.len();
+        let outcome = std::thread::scope(|scope| -> Result<T> {
+            let extra = &extra;
+            let mut handles = Vec::with_capacity(more.len());
+            for (index, (state, item)) in more.iter_mut().zip(twins).enumerate() {
+                let rank = index + 1;
+                handles.push(scope.spawn(move || -> Result<()> {
+                    activate_rank(&state.ctx)?;
+                    extra(state, item)
+                        .with_context(|| format!("tensor-parallel rank {rank} segment"))?;
+                    state
+                        .ctx
+                        .sync()
+                        .with_context(|| format!("drain rank {rank}"))
+                }));
+            }
+            activate_rank(ctx)?;
+            let ranked = rank0(ctx, serve, arena, core);
+            if ranked.is_err() && extra_ranks > 0 {
+                // Rank 0's sequence may have stopped short, so a peer's matching
+                // call will never come. Rank 0's own fields are not borrowed by
+                // the threads, so its communicator and graphs can be torn down
+                // here to unblock them; the extras' follow the join.
+                //
+                // Only with extra ranks: with none there is no collective to
+                // abort and no peer frontier to keep in step, so this stays the
+                // ordinary single-rank failure the caller answers by failing that
+                // one request. Marking the engine broken there would turn a
+                // request-local error — a per-request scratch allocation — into
+                // the end of the engine.
+                tp_broken.set(true);
+                if select_device(ctx).is_ok() {
+                    arena.release_graphs();
+                }
+                serve.detach_tp_comm();
+            }
+            let mut extras: Result<()> = Ok(());
+            for handle in handles {
+                let joined = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("a tensor-parallel rank thread panicked"))?;
+                if extras.is_ok() {
+                    extras = joined;
+                }
+            }
+            // A rank-0 failure is the one to report; otherwise an extra rank's
+            // failure is fatal.
+            match ranked {
+                Err(err) => Err(err),
+                Ok(value) => {
+                    extras?;
+                    Ok(value)
+                }
+            }
+        });
+        if outcome.is_err() {
+            self.break_extras();
         }
-        for (rank, state) in self.more.iter().enumerate() {
-            state
-                .ctx
-                .sync()
-                .with_context(|| format!("drain rank {}", rank + 1))?;
-        }
-        self.assert_ranks_in_step(kv)?;
         // The caller's next device work is rank 0's.
-        activate_rank(&self.ctx)
+        activate_rank(&self.ctx)?;
+        outcome
     }
 
-    /// One plain prefill step on every extra rank; their logits are discarded.
-    fn prefill_extra_ranks(&self, kv: &mut GemmaKv, tokens: &[u32]) -> Result<()> {
-        self.step_extra_ranks(kv, |state, rank_kv| {
-            state.serve.step(&state.ctx, rank_kv, tokens).map(|_| ())
-        })
+    /// Both halves of one request's KV, rank 0 first, as `drive_ranks`'s payload.
+    fn rank_payload(kv: &mut GemmaKv) -> Vec<&mut RankKv> {
+        let (core, twins) = kv.split();
+        let mut payload = Vec::with_capacity(twins.len() + 1);
+        payload.push(core);
+        payload.extend(twins.iter_mut());
+        payload
+    }
+
+    /// Abort every extra rank's communicator and release its graphs, after a
+    /// failed step has already stopped the engine.
+    fn break_extras(&mut self) {
+        for state in &mut self.more {
+            if select_device(&state.ctx).is_ok() {
+                state.arena.release_graphs();
+            }
+            state.serve.detach_tp_comm();
+        }
     }
 
     /// Reserve on every extra rank's pools, so their fronts stay in step with
@@ -1689,18 +1667,14 @@ impl EngineState {
             ledger.retire(request.id);
             return PreparedNewcomer::Done;
         }
-        let context_len = match validate_request(
-            &request.request,
-            self.max_context,
-            self.score_ceiling,
-            self.tp_max_prompt,
-        ) {
-            Ok(len) => len,
-            Err(reason) => {
-                ledger.reject(request.id, reason);
-                return PreparedNewcomer::Done;
-            }
-        };
+        let context_len =
+            match validate_request(&request.request, self.max_context, self.score_ceiling) {
+                Ok(len) => len,
+                Err(reason) => {
+                    ledger.reject(request.id, reason);
+                    return PreparedNewcomer::Done;
+                }
+            };
         let (mut kv, resumed) = self.resolve_newcomer_kv(&request.request);
         let new_tokens = request.request.prompt_tokens.len() - kv.local.seq_len();
         if options
@@ -1767,11 +1741,7 @@ impl EngineState {
             local_kv_storage,
             global_attn,
             prefix_cache: cache_cap,
-            tp_max_prompt,
         } = knobs;
-        // The ceiling only bounds a tensor-parallel prefill; at world size 1
-        // there is no peer to stall waiting for.
-        let tp_max_prompt = (world > 1).then_some(tp_max_prompt).flatten();
         if global_attn.tilelang() {
             ensure_tilelang_device(device)?;
         }
@@ -2062,7 +2032,6 @@ impl EngineState {
             score_ceiling,
             slots,
             tp_broken: Cell::new(false),
-            tp_max_prompt,
             admit_coalesce,
         })
     }
@@ -2176,15 +2145,7 @@ impl EngineState {
         if !active.is_empty() {
             self.drain_pipeline(active, ledger)?;
         }
-        // Under TP the ceiling bounds a whole step, so a prompt rides beside the
-        // live decode rows only while the sum fits; a longer one prefills alone,
-        // and the decode rows advance in the round after it.
-        let first_rows = prompt_tokens.saturating_sub(kv.local.seq_len());
-        let mixed_fits = match self.tp_max_prompt {
-            Some(limit) => first_rows + active.len() <= limit,
-            None => true,
-        };
-        if !active.is_empty() && !scored && mixed_fits {
+        if !active.is_empty() && !scored {
             self.ready_decode_rows(active, ledger);
             if !active.is_empty() {
                 // Gather more admissible prompts into the same step. A
@@ -2201,14 +2162,8 @@ impl EngineState {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
                 };
-                // A mixed step's gathered rows are a prefill, so under TP the
-                // ceiling bounds their sum too — and the live decode rows ride in
-                // the same step, so the gather leaves room for them.
-                let gather_budget = self.tp_max_prompt.map_or(self.mix_gather, |limit| {
-                    self.mix_gather.min(limit.saturating_sub(active.len()))
-                });
                 while newcomers.len() < self.mix_max_prompts
-                    && (self.mix_chunk.is_some() || rows_budget < gather_budget)
+                    && (self.mix_chunk.is_some() || rows_budget < self.mix_gather)
                     && newcomers.len() + active.len() < self.slots
                     && *attempts < self.slots
                 {
@@ -2229,7 +2184,7 @@ impl EngineState {
                         max_new_tokens: self
                             .mix_chunk
                             .is_none()
-                            .then(|| gather_budget.saturating_sub(rows_budget)),
+                            .then(|| self.mix_gather.saturating_sub(rows_budget)),
                     };
                     match self.prepare_newcomer(candidate, options, ledger) {
                         PreparedNewcomer::Ready(newcomer, new_tokens) => {
@@ -2251,6 +2206,20 @@ impl EngineState {
         let stepped = if let Some(top_k) = request.request.prompt_logprobs {
             let prompt = &request.request.prompt_tokens;
             let mut scores: Vec<Option<TokenLogprob>> = vec![None];
+            // Rank 0's tower and the peers' run at once, so the per-row readback
+            // below — which blocks on rank 0's own collective — starts only once
+            // every rank's tower is in flight.
+            let mut tower = self.drive_ranks(
+                Self::rank_payload(&mut kv),
+                |ctx, serve, _arena, core| serve.launch_prompt_tower(ctx, core, prompt),
+                |state, rank_kv| {
+                    state
+                        .serve
+                        .step_scoring(&state.ctx, rank_kv, prompt, None)
+                        .map(|_| ())
+                },
+            )?;
+            self.assert_ranks_in_step(&kv)?;
             let (ctx, suppress_ids) = (&self.ctx, &self.suppress_ids);
             let mut score = |logits: &mut HiddenStates, start: usize| -> Result<()> {
                 // The same logits a sampled token is scored on: softcapped,
@@ -2269,97 +2238,28 @@ impl EngineState {
                 scores.extend(scored.into_iter().map(Some));
                 Ok(())
             };
-            activate_rank(&self.ctx)?;
-            // Rank 0's tower is launched first, but its per-row readback blocks
-            // on its own collective, so it runs only after every rank has
-            // launched its tower — the peer's matching call must already be in
-            // flight or the one driving thread deadlocks.
-            //
-            // A rank-0 failure lands in `stepped` rather than returning from
-            // here, so the `tp_broken` gate below is what prices it: a broken
-            // pair stops the engine, while a single rank — where `abort_comms`
-            // has nothing to abort and leaves `tp_broken` clear — keeps the
-            // request-scoped failure this path has always had.
-            'scored: {
-                let mut tower = match self.serve.launch_prompt_tower(ctx, &mut kv, prompt) {
-                    Ok(tower) => tower,
-                    Err(err) => {
-                        abort_comms(
-                            &self.tp_broken,
-                            &self.ctx,
-                            &mut self.serve,
-                            &mut self.arena,
-                            &mut self.more,
-                        );
-                        break 'scored Err(err.context("scored prompt tower"));
-                    }
-                };
-                // The other ranks run the same prefill to write their KV
-                // shards; scoring is rank 0's alone. A failure on them is fatal
-                // at any world size: the ranks' frontiers must not drift apart.
-                if let Err(err) = self.step_extra_ranks(&mut kv, |state, rank_kv| {
-                    state
-                        .serve
-                        .step_scoring(&state.ctx, rank_kv, prompt, None)
-                        .map(|_| ())
-                }) {
-                    abort_comms(
-                        &self.tp_broken,
-                        &self.ctx,
-                        &mut self.serve,
-                        &mut self.arena,
-                        &mut self.more,
-                    );
-                    break 'scored Err(err);
-                }
-                // Every rank's tower has now completed and its collectives are
-                // paired, so a failure in rank 0's readback costs this request
-                // alone at any world size: the next step's collective sequence
-                // is intact, and the request's pages return with `kv` on every
-                // rank.
-                if let Err(err) = self
-                    .serve
-                    .score_prompt_tower(ctx, &mut tower, &mut score)
-                    .context("prompt logprobs")
-                {
-                    break 'scored Err(err);
-                }
-                echo = Some(PromptEcho {
-                    ids: prompt.clone(),
-                    logprobs: scores,
-                });
-                Ok(tower.into_logits())
-            }
+            self.serve
+                .score_prompt_tower(ctx, &mut tower, &mut score)
+                .context("prompt logprobs")?;
+            echo = Some(PromptEcho {
+                ids: prompt.clone(),
+                logprobs: scores,
+            });
+            Ok(tower.into_logits())
         } else if let Some(chunk) = self.mix_chunk {
             // Under the chunk knob a solo prompt walks its own segments too:
             // residency stays window plus segment whatever the prompt length.
             self.walk_plain_prompt(&mut kv, &request.request.prompt_tokens, chunk)
         } else {
             let resume = kv.local.seq_len();
-            activate_rank(&self.ctx)?;
-            let result =
-                self.serve
-                    .step(&self.ctx, &mut kv, &request.request.prompt_tokens[resume..]);
-            match result {
-                Ok(logits) => {
-                    // Rank 0's tower is in flight, so the peer's collectives
-                    // have their match. A rank-0 failure instead means its
-                    // sequence stopped short, and driving the peer's whole
-                    // tower would leave it waiting on a call that never comes.
-                    self.prefill_extra_ranks(&mut kv, &request.request.prompt_tokens[resume..])?;
-                    Ok(logits)
-                }
-                Err(err) => {
-                    abort_comms(
-                        &self.tp_broken,
-                        &self.ctx,
-                        &mut self.serve,
-                        &mut self.arena,
-                        &mut self.more,
-                    );
-                    Err(err.context("solo prefill tower"))
-                }
-            }
+            let tokens = &request.request.prompt_tokens[resume..];
+            let logits = self.drive_ranks(
+                Self::rank_payload(&mut kv),
+                |ctx, serve, _arena, core| serve.step(ctx, core, tokens),
+                |state, rank_kv| state.serve.step(&state.ctx, rank_kv, tokens).map(|_| ()),
+            )?;
+            self.assert_ranks_in_step(&kv)?;
+            Ok(logits)
         };
         let mut logits = match stepped {
             Ok(logits) => logits,
@@ -2562,26 +2462,13 @@ impl EngineState {
             tokens.len(),
         )?;
         self.admit_extra_ranks(kv, tokens.len())?;
-        activate_rank(&self.ctx)?;
-        // Rank 0's tower is in flight, so the peer's collectives have their
-        // match; a rank-0 failure instead breaks the sequence, so abort rather
-        // than drive a peer that would wait forever on a missing call.
-        match self.serve.step(&self.ctx, kv, tokens) {
-            Ok(logits) => {
-                self.prefill_extra_ranks(kv, tokens)?;
-                Ok(logits)
-            }
-            Err(err) => {
-                abort_comms(
-                    &self.tp_broken,
-                    &self.ctx,
-                    &mut self.serve,
-                    &mut self.arena,
-                    &mut self.more,
-                );
-                Err(err.context("chunked prefill tower"))
-            }
-        }
+        let logits = self.drive_ranks(
+            Self::rank_payload(kv),
+            |ctx, serve, _arena, core| serve.step(ctx, core, tokens),
+            |state, rank_kv| state.serve.step(&state.ctx, rank_kv, tokens).map(|_| ()),
+        )?;
+        self.assert_ranks_in_step(kv)?;
+        Ok(logits)
     }
 
     fn finish_plain_walker(
@@ -2599,7 +2486,8 @@ impl EngineState {
             Ok(logits) => logits,
             Err(err) => {
                 // A walk tail after a broken pair would score its first token
-                // from partial sums; stop the engine instead (see `abort_comms`).
+                // from partial sums; stop the engine instead (see
+                // `drive_ranks`' rank-0 teardown).
                 if self.tp_broken.get() {
                     return Err(err.context("tensor-parallel ranks diverged; engine stopped"));
                 }
@@ -2906,41 +2794,35 @@ impl EngineState {
         let resident = resident && self.more.is_empty();
         let tokens = (!resident).then(|| active.iter().map(|entry| entry.next).collect::<Vec<_>>());
         {
-            activate_rank(&self.ctx)?;
-            let mut kvs = rank_kvs(active, 0);
-            // Rank 0's verdict is checked before the peers are driven: a failure
-            // aborts the comms and stops the engine (see `abort_comms`).
-            let rank0 = if let Some(tokens) = tokens.as_deref() {
-                self.serve
-                    .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)
-                    .map(|_| ())
-            } else {
-                self.serve
-                    .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)
-                    .map(|_| ())
-            };
-            if let Err(err) = rank0 {
-                // Rank 0's sequence stopped short; abort before any peer waits
-                // on a collective that will never be issued.
-                abort_comms(
-                    &self.tp_broken,
-                    &self.ctx,
-                    &mut self.serve,
-                    &mut self.arena,
-                    &mut self.more,
-                );
-                return Err(err.context("batched decode launch"));
-            }
-            // The other ranks carry the same tokens and page ids; only rank 0
-            // samples, so their logits are discarded.
+            let payload = rank_payloads(active);
             if let Some(tokens) = tokens.as_deref() {
-                drive_extra_ranks(&mut self.more, &self.ctx, |state, rank| {
-                    let mut kvs = rank_kvs(active, rank);
-                    state
-                        .serve
-                        .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, tokens)
-                        .map(|_| ())
-                })?;
+                // Every rank carries the same tokens and page ids; only rank 0
+                // samples, so the extras' logits are discarded.
+                self.drive_ranks(
+                    payload,
+                    |ctx, serve, arena, mut kvs| {
+                        serve
+                            .decode_batch_step(ctx, arena, &mut kvs, tokens)
+                            .map(|_| ())
+                    },
+                    |state, mut kvs| {
+                        state
+                            .serve
+                            .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, tokens)
+                            .map(|_| ())
+                    },
+                )?;
+            } else {
+                // World size 1: the resident path, with no extra rank to drive.
+                self.drive_ranks(
+                    payload,
+                    |ctx, serve, arena, mut kvs| {
+                        serve
+                            .decode_batch_step_resident(ctx, arena, &mut kvs)
+                            .map(|_| ())
+                    },
+                    |_state, _kvs| Ok(()),
+                )?;
             }
         }
         let graph_slot = crate::serve::decode_bucket_slot(rows);
@@ -3022,58 +2904,39 @@ impl EngineState {
         ledger: &mut RequestLedger,
     ) -> Result<SampledRows> {
         let decode_tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
-        let stepped = {
-            activate_rank(&self.ctx)?;
-            let mut kvs = rank_kvs(active, 0);
-            let mut rank0_prefills: Vec<(&mut RankKv, &[u32])> = prefills
-                .iter_mut()
-                .map(|(kv, tokens)| (&mut ***kv, *tokens))
-                .collect();
-            self.serve.mixed_prefill_decode_step(
-                &self.ctx,
-                &mut self.arena,
-                &mut rank0_prefills,
-                &mut kvs,
-                &decode_tokens,
-            )
-        };
-        // Rank 0's mixed step is in flight, so the peers' collectives have their
-        // match. Check its verdict before driving them: a rank-0 failure means
-        // its sequence stopped short, and a peer's whole mixed step would wait on
-        // a call that never comes.
-        let logits = match stepped {
-            Ok(logits) => logits,
-            Err(err) => {
-                abort_comms(
-                    &self.tp_broken,
-                    &self.ctx,
-                    &mut self.serve,
-                    &mut self.arena,
-                    &mut self.more,
-                );
-                fail_active_batch(active, "mixed step", &err, ledger);
-                return Err(err.context("gemma4 mixed step"));
-            }
-        };
-        // The other ranks run the same mixed step on their own families and
-        // arena; their logits are discarded.
-        drive_extra_ranks(&mut self.more, &self.ctx, |state, rank| {
-            let mut extra_prefills: Vec<(&mut RankKv, &[u32])> = prefills
-                .iter_mut()
-                .map(|(kv, tokens)| (kv.core_mut(rank), *tokens))
-                .collect();
-            let mut kvs = rank_kvs(active, rank);
-            state
-                .serve
-                .mixed_prefill_decode_step(
-                    &state.ctx,
-                    &mut state.arena,
-                    &mut extra_prefills,
-                    &mut kvs,
-                    &decode_tokens,
-                )
-                .map(|_| ())
-        })?;
+        // One payload per rank: that rank's slice of the decode batch and of the
+        // gathered prompts. `mixed_prefill_decode_step` runs them as one step, so
+        // every rank is in flight at once (see `drive_ranks`).
+        let payload: Vec<_> = rank_payloads(active)
+            .into_iter()
+            .zip(prefill_payloads(prefills))
+            .collect();
+        let stepped = self.drive_ranks(
+            payload,
+            |ctx, serve, arena, (mut kvs, mut prompts)| {
+                serve
+                    .mixed_prefill_decode_step(ctx, arena, &mut prompts, &mut kvs, &decode_tokens)
+                    .map(|_| ())
+            },
+            |state, (mut kvs, mut prompts)| {
+                state
+                    .serve
+                    .mixed_prefill_decode_step(
+                        &state.ctx,
+                        &mut state.arena,
+                        &mut prompts,
+                        &mut kvs,
+                        &decode_tokens,
+                    )
+                    .map(|_| ())
+            },
+        );
+        if let Err(err) = stepped {
+            fail_active_batch(active, "mixed step", &err, ledger);
+            return Err(err.context("gemma4 mixed step"));
+        }
+        // The mixed step's logits live in rank 0's arena for this step.
+        let (logits, _) = self.arena.logits_and_ids();
         mixed_head_flow(
             &self.ctx,
             &self.suppress_ids,
@@ -3151,39 +3014,26 @@ impl EngineState {
         ledger: &mut RequestLedger,
     ) -> Result<()> {
         let tokens: Vec<u32> = active.iter().map(|entry| entry.next).collect();
-        activate_rank(&self.ctx)?;
-        // Rank 0's verdict is checked before the peers are driven: a failure
-        // aborts the comms and stops the engine (see `abort_comms`).
-        let rank0 = {
-            let mut kvs = rank_kvs(active, 0);
-            self.serve
-                .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, &tokens)
-                .map(|_| ())
-        };
-        if let Err(err) = rank0 {
-            // Rank 0's sequence stopped short; abort so no peer waits on a
-            // collective that will never be issued.
-            abort_comms(
-                &self.tp_broken,
-                &self.ctx,
-                &mut self.serve,
-                &mut self.arena,
-                &mut self.more,
-            );
+        // Every rank carries the same tokens and page ids; only rank 0 samples, so
+        // the extras' logits are discarded. A failure on any rank is fatal.
+        if let Err(err) = self.drive_ranks(
+            rank_payloads(active),
+            |ctx, serve, arena, mut kvs| {
+                serve
+                    .decode_batch_step(ctx, arena, &mut kvs, &tokens)
+                    .map(|_| ())
+            },
+            |state, mut kvs| {
+                state
+                    .serve
+                    .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, &tokens)
+                    .map(|_| ())
+            },
+        ) {
             let _ = self.fence();
             fail_active_batch(active, "batched decode", &err, ledger);
             return Err(err.context("batched decode"));
         }
-        // Rank 0's tower is in flight; now every other rank's. They carry the
-        // same tokens and page ids, and only rank 0 samples, so their logits
-        // are discarded.
-        drive_extra_ranks(&mut self.more, &self.ctx, |state, rank| {
-            let mut kvs = rank_kvs(active, rank);
-            state
-                .serve
-                .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, &tokens)
-                .map(|_| ())
-        })?;
         let (logits, _) = self.arena.logits_and_ids();
         let sampled = {
             let rows: Vec<SampleRow<'_>> = active

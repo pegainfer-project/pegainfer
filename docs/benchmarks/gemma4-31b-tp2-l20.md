@@ -1,6 +1,6 @@
 # Gemma 4 31B bf16 tensor-parallel-2 on two L20s
 
-TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as a two-rank eager engine — 29.91 GiB of weights per rank, a `PEGAINFER_MAX_CONTEXT=8192` envelope at 8 decode slots, cold load 30 s, first token 57 ms, 49.4 ms per decode step, and 143 tok/s aggregate at 8 concurrent. **Prompts here are short: the single-threaded rank driver caps a TP prompt at `PEGAINFER_TP_MAX_PROMPT` (default 64), so the envelope is the context, not the prompt** (`models/gemma4/tp.md`). The checkpoint does not fit one card (57 GiB), so there is no in-box single-rank baseline for it; numerical parity rests on the 31B-geometry synthetic gate (`models/gemma4/tp.md`).
+TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as a two-rank eager engine — 29.91 GiB of weights per rank, a `PEGAINFER_MAX_CONTEXT=8192` envelope at 8 decode slots, cold load 30 s, first token 57 ms, 49.4 ms per decode step, and 143 tok/s aggregate at 8 concurrent. The checkpoint does not fit one card (57 GiB), so there is no in-box single-rank baseline for it; numerical parity rests on the 31B-geometry synthetic gate (`models/gemma4/tp.md`).
 
 ## Rig
 

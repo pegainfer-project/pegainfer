@@ -232,48 +232,16 @@ fn only_a_scored_prompt_is_bound_to_the_whole_prompt_ceiling() {
     let raised = 4 * super::MAX_CONTEXT;
     let prompt_len = super::MAX_CONTEXT + 1;
     assert!(
-        super::validate_request(
-            &ceiling_probe(prompt_len, None),
-            raised,
-            super::MAX_CONTEXT,
-            None
-        )
-        .is_ok()
+        super::validate_request(&ceiling_probe(prompt_len, None), raised, super::MAX_CONTEXT)
+            .is_ok()
     );
     assert!(matches!(
         super::validate_request(
             &ceiling_probe(prompt_len, Some(0)),
             raised,
-            super::MAX_CONTEXT,
-            None
+            super::MAX_CONTEXT
         ),
         Err(RejectReason::EchoPrefillTokens { .. })
-    ));
-}
-
-#[test]
-fn the_tp_prompt_ceiling_refuses_one_token_past_it() {
-    let raised = 4 * super::MAX_CONTEXT;
-    let prompt_len = super::MAX_CONTEXT + 1;
-    // The ceiling is the boundary: a prompt equal to it passes, one token past
-    // it is refused.
-    assert!(
-        super::validate_request(
-            &ceiling_probe(prompt_len, None),
-            raised,
-            super::MAX_CONTEXT,
-            Some(prompt_len)
-        )
-        .is_ok()
-    );
-    assert!(matches!(
-        super::validate_request(
-            &ceiling_probe(prompt_len, None),
-            raised,
-            super::MAX_CONTEXT,
-            Some(prompt_len - 1)
-        ),
-        Err(RejectReason::Unsupported { .. })
     ));
 }
 
