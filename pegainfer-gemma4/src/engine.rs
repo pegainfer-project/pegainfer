@@ -1364,14 +1364,14 @@ impl EngineState {
     /// rank 0's frontier. `payload` carries one item per rank, rank 0's first.
     ///
     /// One thread per extra rank is what lets rank 0's segment contain a
-    /// **host-blocking** operation (a device sync, an allocation in a GEMM's
-    /// workspace): by the time rank 0 reaches it, every peer's collectives are
-    /// already in flight, so the drain rank 0 waits on can pair — where a single
-    /// thread that ran rank 0's whole segment first would wait on a call it had
-    /// not yet issued. A rank-0 failure aborts rank 0's communicator so the
-    /// peers' pending collectives error out instead of hanging, and the extras'
-    /// are aborted after the join. An extra rank's failure is fatal: the ranks'
-    /// frontiers must not drift apart.
+    /// **host-blocking** operation (a device sync — a lazy cuBLAS/cuBLASLt
+    /// library load in a GEMM, say — or a readback): by the time rank 0 reaches
+    /// it, every peer's collectives are already in flight, so the drain rank 0
+    /// waits on can pair — where a single thread that ran rank 0's whole segment
+    /// first would wait on a call it had not yet issued. A rank-0 failure aborts
+    /// rank 0's communicator so the peers' pending collectives error out instead
+    /// of hanging, and the extras' are aborted after the join. An extra rank's
+    /// failure is fatal: the ranks' frontiers must not drift apart.
     fn drive_ranks<P, T, R, E>(&mut self, payload: Vec<P>, rank0: R, extra: E) -> Result<T>
     where
         P: Send,
