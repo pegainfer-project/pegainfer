@@ -9,15 +9,20 @@
 //! the greedy pick. The engine's own docs say as much — greedy is reproducible
 //! for a fixed workload, not across two arithmetic orders — so the gate holds
 //! the top-k logprobs to a line and requires a differing pick to be a genuine
-//! near-tie (each pick inside the other run's top-k).
+//! near-tie (each pick inside the other run's top-k *and* the two picks within
+//! `NEAR_TIE_WIDTH` of each other in both readings).
 //!
 //! Two GPUs are mandatory, so these run one at a time on a box that has them.
+//! The near-tie rule's own halves are the exception: they read nothing but the
+//! two rows, so they carry unit tests that need no device and run with the
+//! library's ordinary suite.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::parallel::ParallelConfig;
@@ -55,6 +60,16 @@ use crate::testkit::u32_tensor;
 /// beside it polices.
 const TOP_K: usize = 8;
 const LOGBROB_LINE: f32 = 1.0;
+
+/// How far apart the two runs' picks may read **within the same run** and still
+/// be a tie: that run's own two entries, read in both runs. Mutual top-`TOP_K`
+/// membership alone is not a tie — `[6, 0, …]` against `[0, 6, …]` passes it
+/// while each run prefers a different token by six nats, and `LOGBROB_LINE` does
+/// not see that either, because it bounds a token *both* runs kept. The margin is
+/// a difference inside one row, so it is the same quantity on log_softmax (here)
+/// as on raw logits, which is where `serve_oracle`'s near-tie rule reads the same
+/// width.
+const NEAR_TIE_WIDTH: f32 = 1.0;
 
 /// The two devices a TP2 gate runs across, defaulting to 0 and 1.
 fn devices() -> (usize, usize) {
@@ -278,9 +293,11 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
                     worst_pick = worst_pick.max((va - vb).abs());
                 }
             } else {
-                // A different pick has to be a near-tie: each pick inside the
-                // other run's top-k. Otherwise the two runs disagree about the
-                // distribution, not about its last bits.
+                // A different pick has to be a near-tie, in both halves: each
+                // pick inside the other run's top-k *and* the two picks within
+                // `NEAR_TIE_WIDTH` of each other in each run's own reading.
+                // Otherwise the two runs disagree about the distribution, not
+                // about its last bits.
                 assert!(
                     right.contains_key(&pa),
                     "{what}: request {index} step {step}: one-rank pick is outside the two-rank top-{TOP_K}"
@@ -299,6 +316,26 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
                         worst_pick = worst_pick.max((va - vb).abs());
                     }
                 }
+                // Membership is not a tie on its own: `[6, 0, …]` against
+                // `[0, 6, …]` has each pick as the other's runner-up while both
+                // picks sit six nats from their own runner-up, and the bound
+                // folded in above cannot see that either (it measures a token
+                // both runs kept). Read the margin in each run's own list.
+                let (one_margin, two_margin) = (
+                    (left[&pa] - left[&pb]).abs(),
+                    (right[&pa] - right[&pb]).abs(),
+                );
+                assert!(
+                    one_margin <= NEAR_TIE_WIDTH && two_margin <= NEAR_TIE_WIDTH,
+                    "{what}: request {index} step {step}: the picks {pa} and {pb} sit \
+                     {one_margin} and {two_margin} apart in the one-rank and two-rank \
+                     readings, wider than the {NEAR_TIE_WIDTH} a reduction-order flip moves \
+                     them — each pick is inside the other run's top-{TOP_K}, so this margin is \
+                     the only thing left that tells a tie from a different distribution"
+                );
+                eprintln!(
+                    "{what}: near-tie flip {pa} vs {pb}, margins {one_margin} / {two_margin}"
+                );
                 // The two runs now decode from different prefixes, so every later
                 // step of this request compares different text; stop here.
                 break;
@@ -313,6 +350,72 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
         compared,
         detail,
     }
+}
+
+/// A one-step run over a hand-written top-k row: the rule reads nothing but
+/// `logprobs`, so nothing else about the row has to be real.
+fn drained_row(top: &[(u32, f32)]) -> Drained {
+    Drained {
+        tokens: 1,
+        cached: 0,
+        finish: FinishReason::Length,
+        ids: vec![top[0].0],
+        logprobs: vec![Some(TokenLogprob {
+            logprob: top[0].1,
+            rank: 1,
+            top_logprobs: top.to_vec(),
+        })],
+        prompt_echo: None,
+    }
+}
+
+/// A flip six nats wide: each pick is the other run's runner-up, so mutual
+/// top-`TOP_K` membership holds and only the margins can tell that these are two
+/// different distributions.
+#[test]
+#[should_panic(expected = "apart in the one-rank and two-rank readings")]
+fn a_flip_six_nats_wide_is_not_a_near_tie() {
+    let one = vec![drained_row(&[(100, 6.0), (200, 0.0)])];
+    let two = vec![drained_row(&[(200, 6.0), (100, 0.0)])];
+    distribution_gap(&one, &two, "six nats");
+}
+
+/// A tie in one run only: the one-rank row's top two sit half a nat apart, the
+/// two-rank row prefers `200` by six and a half. Membership holds on both sides
+/// again, so the width has to be read in both rows for this to fail.
+#[test]
+#[should_panic(expected = "apart in the one-rank and two-rank readings")]
+fn a_tie_in_only_one_of_the_two_runs_is_not_a_near_tie() {
+    let one = vec![drained_row(&[(100, 0.0), (200, -0.5)])];
+    let two = vec![drained_row(&[(200, 6.0), (100, -0.5)])];
+    distribution_gap(&one, &two, "one run");
+}
+
+/// The shape the rule is for, and the bound a flip must not escape: both picks'
+/// own gaps fold in before the walk stops, so the step that flipped is measured
+/// rather than skipped — and the steps after it, where the two runs are decoding
+/// different text, are not compared at all.
+#[test]
+fn a_flip_inside_the_width_still_measures_its_own_step() {
+    let one = vec![
+        drained_row(&[(100, 0.0), (200, -0.2)]),
+        drained_row(&[(100, 9.0), (200, 8.0)]),
+    ];
+    let two = vec![
+        drained_row(&[(200, 0.1), (100, -0.3)]),
+        drained_row(&[(100, -9.0), (200, -8.0)]),
+    ];
+    let gaps = distribution_gap(&one, &two, "unit");
+    assert_eq!(gaps.compared, 1, "the walk stops at the flip");
+    assert_eq!(
+        gaps.same_pick, 0,
+        "the step that flipped is not a shared pick"
+    );
+    assert!(
+        (gaps.worst_pick - 0.3).abs() < 1e-6,
+        "both picks' own gaps fold in (0.3 each), read {}",
+        gaps.worst_pick
+    );
 }
 
 /// Two ranks must agree with one rank on the same checkpoint. Which
