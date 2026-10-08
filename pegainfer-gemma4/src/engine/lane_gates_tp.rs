@@ -352,20 +352,25 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
     }
 }
 
-/// A one-step run over a hand-written top-k row: the rule reads nothing but
-/// `logprobs`, so nothing else about the row has to be real.
-fn drained_row(top: &[(u32, f32)]) -> Drained {
+/// A run of hand-written top-k rows, one per scored step: the rule reads nothing
+/// but `logprobs`, so nothing else about the rows has to be real.
+fn drained_run(rows: &[&[(u32, f32)]]) -> Drained {
     Drained {
-        tokens: 1,
+        tokens: rows.len(),
         cached: 0,
         finish: FinishReason::Length,
-        ids: vec![top[0].0],
-        logprobs: vec![Some(TokenLogprob {
-            logprob: top[0].1,
-            rank: 1,
-            top_logprobs: top.to_vec(),
-        })],
+        ids: rows.iter().map(|row| row[0].0).collect(),
+        logprobs: rows.iter().map(|row| Some(scored(row))).collect(),
         prompt_echo: None,
+    }
+}
+
+/// One scored row, its top entry taken as the row's own logprob.
+fn scored(row: &[(u32, f32)]) -> TokenLogprob {
+    TokenLogprob {
+        logprob: row[0].1,
+        rank: 1,
+        top_logprobs: row.to_vec(),
     }
 }
 
@@ -375,8 +380,8 @@ fn drained_row(top: &[(u32, f32)]) -> Drained {
 #[test]
 #[should_panic(expected = "apart in the one-rank and two-rank readings")]
 fn a_flip_six_nats_wide_is_not_a_near_tie() {
-    let one = vec![drained_row(&[(100, 6.0), (200, 0.0)])];
-    let two = vec![drained_row(&[(200, 6.0), (100, 0.0)])];
+    let one = vec![drained_run(&[&[(100, 6.0), (200, 0.0)]])];
+    let two = vec![drained_run(&[&[(200, 6.0), (100, 0.0)]])];
     distribution_gap(&one, &two, "six nats");
 }
 
@@ -386,27 +391,27 @@ fn a_flip_six_nats_wide_is_not_a_near_tie() {
 #[test]
 #[should_panic(expected = "apart in the one-rank and two-rank readings")]
 fn a_tie_in_only_one_of_the_two_runs_is_not_a_near_tie() {
-    let one = vec![drained_row(&[(100, 0.0), (200, -0.5)])];
-    let two = vec![drained_row(&[(200, 6.0), (100, -0.5)])];
+    let one = vec![drained_run(&[&[(100, 0.0), (200, -0.5)]])];
+    let two = vec![drained_run(&[&[(200, 6.0), (100, -0.5)]])];
     distribution_gap(&one, &two, "one run");
 }
 
 /// The shape the rule is for, and the bound a flip must not escape: both picks'
-/// own gaps fold in before the walk stops, so the step that flipped is measured
-/// rather than skipped — and the steps after it, where the two runs are decoding
-/// different text, are not compared at all.
+/// own gaps fold in before the request stops, so the step that flipped is
+/// measured rather than skipped — and the request's later steps, where the two
+/// runs are decoding different text, are not compared at all.
 #[test]
 fn a_flip_inside_the_width_still_measures_its_own_step() {
-    let one = vec![
-        drained_row(&[(100, 0.0), (200, -0.2)]),
-        drained_row(&[(100, 9.0), (200, 8.0)]),
-    ];
-    let two = vec![
-        drained_row(&[(200, 0.1), (100, -0.3)]),
-        drained_row(&[(100, -9.0), (200, -8.0)]),
-    ];
+    let one = vec![drained_run(&[
+        &[(100, 0.0), (200, -0.2)],
+        &[(100, 9.0), (200, 8.0)],
+    ])];
+    let two = vec![drained_run(&[
+        &[(200, 0.1), (100, -0.3)],
+        &[(100, -9.0), (200, -8.0)],
+    ])];
     let gaps = distribution_gap(&one, &two, "unit");
-    assert_eq!(gaps.compared, 1, "the walk stops at the flip");
+    assert_eq!(gaps.compared, 1, "the request stops at the flip");
     assert_eq!(
         gaps.same_pick, 0,
         "the step that flipped is not a shared pick"
