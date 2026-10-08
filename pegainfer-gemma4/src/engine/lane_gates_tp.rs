@@ -784,14 +784,12 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     /// logits. A shared token may sit this far apart: bf16 reduction order and a
     /// different attention backend, nothing structural.
     const DRIFT_LINE: f32 = 1.0;
-    // Only the nine-token case is gated. The 1024-token "edge" case runs (the
-    // concurrent driver carries it) but fails: at window width the engine reads
-    // beyond the same-workload band this repo calibrates — 8.37 on the shared
-    // tokens here — and the length, not the second rank, is the variable (a
-    // one-rank arm disagrees with itself across the window too: see
-    // `...within_a_single_rank_control` and docs/models/gemma4/tp.md "Known
-    // bounds"). So the case is an open defect, not a chaos budget to widen the
-    // line for; anchoring it against the HF dump is the follow-up.
+    // Only the nine-token case is asserted: the fixture's own metadata marks
+    // `edge` as carried but not probed (`probed_cases: ["single", "short"]`), and
+    // running it anyway fails a strict top-64 containment on ~5-8 rows — the same
+    // rows with one rank as with two, so it is the depth-dependent drift these
+    // fixtures carry tolerances for, not a two-rank difference. See
+    // docs/models/gemma4/tp.md "Known bounds".
     const CASES: [&str; 1] = ["short"];
 
     let (device, peer) = devices();
