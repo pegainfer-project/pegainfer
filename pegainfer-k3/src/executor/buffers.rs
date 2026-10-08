@@ -388,7 +388,7 @@ pub(super) fn copy_rows_2d<T: cudarc::driver::DeviceRepr>(
     // the pool's own stream.
     unsafe {
         cudarc::driver::sys::cuMemcpy2DAsync_v2(
-            &desc,
+            &raw const desc,
             pegainfer_kernels::tensor::active_cu_stream(ctx),
         )
     }

@@ -70,6 +70,9 @@ const WHALE_MAX_WORLD: usize = 1024;
 /// Per-rank inbox of sequencer messages, drained at launch boundaries.
 type Mailboxes = Arc<Mutex<Vec<VecDeque<WhaleToMember>>>>;
 
+/// Peer connections' writer halves, keyed by the rank range from their hello.
+type PeerLinks = Arc<Mutex<Vec<(std::ops::Range<GlobalRank>, TcpStream)>>>;
+
 fn deliver_local(mailboxes: &Mailboxes, first_local: GlobalRank, outbound: &WhaleOutbound) -> bool {
     let mut boxes = mailboxes.lock().expect("whale mailboxes poisoned");
     let Some(slot) = outbound.to.checked_sub(first_local) else {
@@ -221,8 +224,10 @@ fn get_tokens(reader: &mut impl Read) -> Result<Arc<[u32]>> {
     let mut bytes = vec![0u8; len as usize * 4];
     reader.read_exact(&mut bytes).context("whale frame read")?;
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("chunks_exact(4)")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -564,9 +569,6 @@ impl TcpWhaleHub {
         let mailboxes: Mailboxes = Arc::new(Mutex::new(vec![VecDeque::new(); local]));
         let failed: Arc<Mutex<Option<String>>> = Arc::default();
         let (inbound_tx, inbound_rx) = mpsc::channel::<WhaleToSequencer>();
-        // Peer connections register their writer half here, keyed by the rank
-        // range from their hello.
-        type PeerLinks = Arc<Mutex<Vec<(std::ops::Range<GlobalRank>, TcpStream)>>>;
         let peers: PeerLinks = Arc::default();
 
         let hub = Arc::new(Self {
@@ -673,8 +675,6 @@ impl TcpWhaleHub {
         // to the owning peer link. The recv timeout doubles as the gather
         // deadline tick.
         {
-            let mailboxes = mailboxes.clone();
-            let failed = failed.clone();
             std::thread::Builder::new()
                 .name("k3-whale-seq".into())
                 .spawn(move || {
@@ -749,7 +749,7 @@ impl TcpWhaleHub {
         addr: &str,
         first_local: GlobalRank,
         local: usize,
-        local_slabs: Vec<K3WhaleSlabWire>,
+        local_slabs: &[K3WhaleSlabWire],
     ) -> Result<(Arc<Self>, Vec<K3WhaleSlabWire>)> {
         ensure!(
             local_slabs.is_empty() || local_slabs.len() == local,
@@ -942,9 +942,9 @@ mod tests {
         .unwrap();
         let mut members: Vec<WhaleMember> = (0..4).map(WhaleMember::new).collect();
         // The local hub is synchronous: gathers already sit in the mailboxes.
-        for rank in 0..4 {
+        for (rank, member) in members.iter_mut().enumerate() {
             for message in hub.drain(rank) {
-                if let Some(reply) = members[rank].on_message(message, 7).unwrap() {
+                if let Some(reply) = member.on_message(message, 7).unwrap() {
                     hub.send(reply).unwrap();
                 }
             }
@@ -976,7 +976,7 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         drop(listener);
         let (host, _) = TcpWhaleHub::host(&addr, 4, CHUNK, 0, 2, Vec::new()).unwrap();
-        let (peer, _) = TcpWhaleHub::connect(&addr, 2, 2, Vec::new()).unwrap();
+        let (peer, _) = TcpWhaleHub::connect(&addr, 2, 2, &[]).unwrap();
         peer.send(WhaleToSequencer::Request {
             request: 5,
             poster: 2,
@@ -1028,7 +1028,7 @@ mod tests {
         drop(listener);
         let peer_addr = addr.clone();
         let peer = std::thread::spawn(move || {
-            TcpWhaleHub::connect(&peer_addr, 2, 2, vec![slab(2), slab(3)]).unwrap()
+            TcpWhaleHub::connect(&peer_addr, 2, 2, &[slab(2), slab(3)]).unwrap()
         });
         let (_host, host_table) =
             TcpWhaleHub::host(&addr, 4, CHUNK, 0, 2, vec![slab(0), slab(1)]).unwrap();
@@ -1064,8 +1064,8 @@ mod tests {
             .map(|first| {
                 let addr = addr.clone();
                 std::thread::spawn(move || {
-                    let slabs = vec![slab(first as u8), slab(first as u8 + 1)];
-                    TcpWhaleHub::connect(&addr, first, 2, slabs).unwrap()
+                    let slabs = [slab(first as u8), slab(first as u8 + 1)];
+                    TcpWhaleHub::connect(&addr, first, 2, &slabs).unwrap()
                 })
             })
             .collect();

@@ -141,6 +141,7 @@ fn check(rc: i32, what: &str) -> Result<()> {
 
 /// KimiRMSNorm with round-before-scale semantics: the normalized value lands
 /// in bf16 first and only then multiplies gamma.
+#[allow(clippy::many_single_char_names)]
 pub fn k3_rms_norm_rbs_batched_launch(
     ctx: &DeviceContext,
     b: usize,
@@ -220,7 +221,7 @@ pub fn k3_land_batched_launch(
 
 /// [`k3_land_batched_launch`] fused with the round-before-scale norm — MLA's
 /// `q_a`, the one place the engine fuses a merge and a norm.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 pub fn k3_land_rms_norm_rbs_batched_launch(
     ctx: &DeviceContext,
     b: usize,
@@ -347,6 +348,7 @@ pub fn k3_mul_sigmoid_batched_launch(
 
 /// K3's situ activation: `4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)` in f32,
 /// landing bf16 once. The two betas are compiled in.
+#[allow(clippy::many_single_char_names)]
 pub fn k3_situ_batched_launch(
     ctx: &DeviceContext,
     b: usize,
@@ -737,7 +739,7 @@ mod tests {
             assert!(check_bucket(bucket).is_ok());
         }
         assert_eq!(k3_chunk_bucket(K3_MAX_BATCH + 1).unwrap(), 256);
-        assert_eq!(k3_chunk_bucket(4096).unwrap(), K3_MAX_CHUNK);
+        assert_eq!(k3_chunk_bucket(4096).unwrap(), 4224);
         assert!(k3_chunk_bucket(K3_MAX_CHUNK + 1).is_err());
     }
 }

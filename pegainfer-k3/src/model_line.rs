@@ -58,6 +58,7 @@ const EP_SIZES: &[usize] = &[1, 4, 8, 16, 32, 64];
 
 // K3-exclusive CLI flags.
 #[derive(ClapArgs)]
+#[allow(clippy::struct_field_names)]
 struct K3Cli {
     /// K3 expert-parallel world size: one rank (and one scheduler partition)
     /// per GPU, routed experts split whole across ranks. One of 1, 4, 8, 16,
@@ -328,7 +329,7 @@ impl ModelLine for K3Line {
         let whale = whale_serving(
             &mut executors,
             ep_size,
-            ranks.clone(),
+            ranks,
             dspark_armed,
             cp.is_some(),
             chunk_tokens,
@@ -417,7 +418,7 @@ fn whale_serving(
         TcpWhaleHub::host(&addr, world, chunk_tokens, 0, ranks.len(), slabs)
             .context("host the K3 whale hub")?
     } else {
-        TcpWhaleHub::connect(&addr, ranks.start, ranks.len(), slabs)
+        TcpWhaleHub::connect(&addr, ranks.start, ranks.len(), &slabs)
             .context("join the K3 whale hub")?
     };
     let world_exchanged = Instant::now();

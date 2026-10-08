@@ -237,7 +237,7 @@ impl WhaleSequencer {
                 prompt,
             } => {
                 self.queue.push_back((request, poster, prompt));
-                self.start_next_gather()
+                Ok(self.start_next_gather())
             }
             WhaleToSequencer::Ready { seq, rank, count } => {
                 let Some(gathering) = self.gathering.as_mut() else {
@@ -256,7 +256,7 @@ impl WhaleSequencer {
                     "whale {seq}: rank {rank} replied ready twice"
                 );
                 gathering.replies[cp_rank] = Some(count);
-                self.try_commit()
+                Ok(self.try_commit())
             }
         }
     }
@@ -281,14 +281,14 @@ impl WhaleSequencer {
         let seq = gathering.descriptor.seq;
         log::warn!("K3 whale {seq}: gather timed out; cancelling");
         let mut outbound = broadcast(&gathering.descriptor.gang, &WhaleToMember::Cancel { seq });
-        outbound.extend(self.start_next_gather()?);
+        outbound.extend(self.start_next_gather());
         Ok(outbound)
     }
 
     /// Start the next gatherable queued whale, if none is gathering. A
     /// refused whale must not strand the ones queued behind it: no later
     /// message is guaranteed to ever arrive.
-    fn start_next_gather(&mut self) -> Result<Vec<WhaleOutbound>> {
+    fn start_next_gather(&mut self) -> Vec<WhaleOutbound> {
         let mut outbound = Vec::new();
         while self.gathering.is_none() {
             let Some((request, poster, prompt)) = self.queue.pop_front() else {
@@ -334,12 +334,12 @@ impl WhaleSequencer {
                 descriptor,
             });
         }
-        Ok(outbound)
+        outbound
     }
 
-    fn try_commit(&mut self) -> Result<Vec<WhaleOutbound>> {
+    fn try_commit(&mut self) -> Vec<WhaleOutbound> {
         let Some(gathering) = self.gathering.as_ref() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         let Some(highest) = gathering
             .replies
@@ -349,7 +349,7 @@ impl WhaleSequencer {
                 reply.map(|count| max.max(count))
             })
         else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         let gathering = self.gathering.take().expect("checked above");
         // Strictly after both every member's armed count and the previous
@@ -363,8 +363,8 @@ impl WhaleSequencer {
             &gathering.descriptor.gang,
             &WhaleToMember::Commit { seq, launch },
         );
-        outbound.extend(self.start_next_gather()?);
-        Ok(outbound)
+        outbound.extend(self.start_next_gather());
+        outbound
     }
 }
 

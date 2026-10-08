@@ -605,11 +605,12 @@ fn prefill_then_decode_serves_the_baseline_continuation() {
         .expect("prefill should run");
     assert_step_within_noise(&golden, golden.prompt.len() - 1, first, what);
     let feed = golden.feed();
-    for step in golden.prompt.len()..golden.argmax.len() {
+    let steps = golden.prompt.len()..golden.argmax.len();
+    for (step, &last_token) in steps.clone().zip(&feed[steps]) {
         let tokens = executor
             .decode(&[DecodeSlot {
                 slot: 0,
-                last_token: feed[step],
+                last_token,
             }])
             .expect("decode should run");
         assert_step_within_noise(&golden, step, tokens[0], what);
@@ -641,11 +642,12 @@ fn chunked_prefill_crosses_its_bucket_boundaries() {
         .expect("chunked prefill should run");
     assert_step_within_noise(&golden, boundary - 1, first, what);
     let feed = golden.feed();
-    for step in boundary..golden.argmax.len() {
+    let steps = boundary..golden.argmax.len();
+    for (step, &last_token) in steps.clone().zip(&feed[steps]) {
         let tokens = executor
             .decode(&[DecodeSlot {
                 slot: 0,
-                last_token: feed[step],
+                last_token,
             }])
             .expect("decode should run");
         assert_step_within_noise(&golden, step, tokens[0], what);
@@ -855,11 +857,11 @@ fn chunked_prefill_agrees_with_the_per_token_walk_at_depth() {
     let mut reference = build(1);
     reference.release(0);
     let mut ref_stream: Vec<u32> = Vec::new();
-    for index in 0..prompt.len() {
+    for &last_token in prompt {
         let out = reference
             .decode(&[DecodeSlot {
                 slot: 0,
-                last_token: prompt[index],
+                last_token,
             }])
             .expect("reference decode step");
         ref_stream.push(out[0]);

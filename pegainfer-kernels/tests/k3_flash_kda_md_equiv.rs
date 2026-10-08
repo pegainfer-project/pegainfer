@@ -76,7 +76,7 @@ fn fused_md_vs_two_calls_timing() {
     let Some(ctx) = common::device_or_skip() else {
         return;
     };
-    let mut seed = 0x7137_0f_u64;
+    let mut seed = 0x0071_370f_u64;
     let width = HEADS * D;
     let state = HEADS * D * D;
 
@@ -219,7 +219,7 @@ fn fused_md_matches_the_two_doctored_calls() {
     let Some(ctx) = common::device_or_skip() else {
         return;
     };
-    let mut seed = 0x0dd5_eed5_0f_u64;
+    let mut seed = 0x000d_d5ee_d50f_u64;
     let width = HEADS * D;
     let state = HEADS * D * D;
 

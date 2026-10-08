@@ -309,7 +309,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
             match lane.member.at_launch(self.executor.step_count())? {
                 // The superstep advanced the count; consult the next boundary
                 // before leaving — a second whale may sit right behind it.
-                WhaleDuty::Enter(whale) => self.enter_whale(lane, *whale, ledger)?,
+                WhaleDuty::Enter(whale) => self.enter_whale(lane, &whale, ledger)?,
                 WhaleDuty::Free => {
                     if !lane.member.is_quiet() {
                         return Ok(false);
@@ -356,7 +356,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
     fn enter_whale(
         &mut self,
         lane: &mut WhaleLane,
-        whale: CommittedWhale,
+        whale: &CommittedWhale,
         ledger: &mut RequestLedger,
     ) -> Result<()> {
         let posted = if whale.descriptor.poster == lane.rank {
@@ -379,7 +379,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
         };
         let first = self
             .executor
-            .prefill_whale(&whale, posted.as_ref().map(|posted| posted.slot))?;
+            .prefill_whale(whale, posted.as_ref().map(|posted| posted.slot))?;
         let Some(posted) = posted else {
             return Ok(());
         };
