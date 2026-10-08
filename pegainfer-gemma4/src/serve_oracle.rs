@@ -677,14 +677,16 @@ struct RowGap {
 /// difference is worth on the same rows — 0.31 to 5.75 raw logits.
 ///
 /// A pick that moves inside that drift is therefore the arithmetic, not this
-/// gate's subject, and the rule is the one the rest of the repo uses: **a
-/// flipped pick has to be a near tie** — each pick inside the other row's top-k
-/// *and* the two picks within [`NEAR_TIE_WIDTH`] of each other in both rows.
-/// Either half alone is not enough, and both are what the fixtures' `top1_share`
-/// floor is the fleet-wide form of. Equality could not hold at this depth: it
-/// fired on the `short` prompt at a position whose top two tokens sat 0.0625
-/// apart in the decode row and 0.1875 in the recomputed one, with the two rows
-/// agreeing to 0.3125 everywhere else.
+/// gate's subject, and the rule is the repo's — **a flipped pick has to be a
+/// near tie** — with the magnitude half added here: each pick inside the other
+/// row's top-k (which is what `lane_gates_tp`'s `distribution_gap` and the
+/// fixtures' `top1_share` floor hold) *and* the two picks within
+/// [`NEAR_TIE_WIDTH`] of each other in both rows. Membership alone lets a flip
+/// six nats wide pass, which is the different distribution this gate is for and
+/// which the callers' 12.0 drift line never sees. Equality could not hold at this
+/// depth: it fired on the `short` prompt at a position whose top two tokens sat
+/// 0.0625 apart in the decode row and 0.1875 in the recomputed one, with the two
+/// rows agreeing to 0.3125 everywhere else.
 fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> RowGap {
     assert!(
         ours.iter().chain(theirs.iter()).all(|v| v.is_finite()),
