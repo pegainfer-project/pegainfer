@@ -158,6 +158,7 @@ RMS_NORM_N = [HIDDEN, KV_LORA, LATENT]
 LAND_CONFIGS = [
     #  NT                N                   OFF               engine call site
     (4 * KDA_DIM, KDA_DIM, 3 * KDA_DIM),              # KDA output gate
+    (4 * KDA_DIM, 3 * KDA_DIM, 0),                    # KDA capsule packed q|k|v
     (KDA_DIM, KDA_DIM, 0),                            # chunked-prefill conv inputs
     (WSM_N, KDA_HEADS, 0),                            # KDA beta
     (WSM_N, KDA_HEAD_DIM, KDA_HEADS),                 # KDA low-rank gate input
