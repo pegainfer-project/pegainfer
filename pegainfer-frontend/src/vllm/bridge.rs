@@ -4,7 +4,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
-use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -709,9 +708,6 @@ async fn connect_link(
     engine_dead: Option<CancellationToken>,
     shutdown: &CancellationToken,
 ) -> Result<BridgeLink> {
-    wait_for_ipc_endpoint(input_address, shutdown).await?;
-    wait_for_ipc_endpoint(output_address, shutdown).await?;
-
     let engine_id = EngineId::from_engine_index(
         u16::try_from(engine_index).context("engine_index exceeds u16 EngineId")?,
     );
@@ -935,6 +931,7 @@ fn engine_output(
         mm_cache_miss_hashes: None,
         new_sampling_mask: None,
         spec_decode_metrics: None,
+        prompt_token_id_logprobs: None,
     }
 }
 
@@ -957,22 +954,6 @@ pub(crate) fn local_ipc_namespace() -> Result<PathBuf> {
 
 pub(crate) fn ipc_endpoint(namespace: &Path, name: &str) -> String {
     format!("ipc://{}", namespace.join(name).to_string_lossy())
-}
-
-async fn wait_for_ipc_endpoint(address: &str, shutdown: &CancellationToken) -> Result<()> {
-    let Some(path) = address.strip_prefix("ipc://") else {
-        return Ok(());
-    };
-    let path = Path::new(path);
-    loop {
-        if path.exists() {
-            return Ok(());
-        }
-        tokio::select! {
-            () = shutdown.cancelled() => bail!("shutdown before IPC endpoint appeared"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-    }
 }
 
 mod stepped;

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
+use std::os::fd::IntoRawFd;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -237,6 +239,11 @@ where
     let namespace = local_ipc_namespace()?;
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
+    // vllm-server adopts already-bound listeners (the supervisor's role in
+    // upstream's Python deployment); binding them here means the bridge can
+    // connect at any time, the server owns and closes the descriptors.
+    let input_listener_fd = UnixListener::bind(namespace.join("input.sock"))?.into_raw_fd();
+    let output_listener_fd = UnixListener::bind(namespace.join("output.sock"))?.into_raw_fd();
 
     // The HTTP server runs concurrently with the engine load: vllm-server
     // spends ~1s loading the tokenizer and chat templates before it waits for
@@ -376,8 +383,8 @@ where
 
     let config = Config {
         transport_mode: TransportMode::Bootstrapped {
-            input_address,
-            output_address,
+            input_listener_fd,
+            output_listener_fd,
             engine_start_index: 0,
             engine_count,
             data_parallel_size: engine_count,
@@ -414,9 +421,14 @@ where
             enable_prompt_tokens_details: true,
             enable_request_id_headers: false,
             enable_scale_out: false,
+            sse_keep_alive_interval: None,
         },
-        disable_log_stats: true,
-        grpc_port: None,
+        // Upstream ties the scheduler-stats and request-event metric recorders
+        // to this flag, and the bridge's stats are what `/metrics` exports; the
+        // periodic stats log line comes with it.
+        disable_log_stats: false,
+        grpc_listener_mode: None,
+        manages_engine: false,
         shutdown_timeout: Duration::from_secs(10),
         keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT,
         profiler: None,

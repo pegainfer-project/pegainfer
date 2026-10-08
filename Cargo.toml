@@ -182,13 +182,14 @@ url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 validator = { version = "0.20.0", features = ["derive"] }
 velo = "0.1.0"
-vllm-chat = { git = "https://github.com/vllm-project/vllm.git", rev = "15ed1262e70873a65582d82f7973784a0f11e5a2" }
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "15ed1262e70873a65582d82f7973784a0f11e5a2" }
-vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "15ed1262e70873a65582d82f7973784a0f11e5a2" }
-vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "15ed1262e70873a65582d82f7973784a0f11e5a2" }
-vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "15ed1262e70873a65582d82f7973784a0f11e5a2" }
+vllm-chat = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
+vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
+vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
 xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh3"] }
-zeromq = { version = "0.6.0", default-features = false, features = [
+# The vllm crates' rev: the bridge hands `PeerIdentity` and listeners across the crate boundary.
+zeromq = { git = "https://github.com/zeromq/zmq.rs", rev = "67dcba97559ebe8e8206dab753710d8b9cb07591", default-features = false, features = [
   "tokio-runtime",
   "all-transport",
 ] }
