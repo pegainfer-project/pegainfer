@@ -20,15 +20,19 @@
 //!   conv kernel then runs unchanged.
 //! * **MLA**: each rank publishes its segment's post-norm latent and rope
 //!   rows; a rank assembles rows `0..seg_end` straight into the dense-FMHA
-//!   context scratch (the paged gather is bypassed) and the existing
-//!   bottom-right-aligned causal FMHA serves its queries at
-//!   `t_kv = seg_start + seg_len`.
+//!   context scratch (the paged gather is bypassed). The causal triangle is
+//!   then *striped* across the gang ([`k3_cp_stripe_kept`]): a rank attends
+//!   its own segment causally and its odd-distance upstream segments
+//!   densely, while each even-distance upstream rank attends this rank's
+//!   published queries over its own keys and returns output + LSE for the
+//!   owner's log-sum-exp merge — the deep rank's `r + 1` segment-pairs
+//!   become at most `(r + 3) / 2`.
 //!
 //! The exchange transport is in-process ranks and plain peer-access
 //! device-to-device copies, with every ordering edge expressed **on-device**
 //! through CUDA events — the host never syncs a stream inside a superstep.
-//! Each of the roughly `2 × 69 + 24` windows per superstep runs the same
-//! four-beat protocol on every rank:
+//! Each of the roughly `2 × 69 + 24 × (1 + stripe slots)` windows per
+//! superstep runs the same four-beat protocol on every rank:
 //!
 //! 1. record my *publish* event (all my publish writes are enqueued), then
 //!    announce it through my `published` counter;
@@ -49,7 +53,6 @@
 //! passes the same collective window count, so the slots agree at each
 //! superstep boundary even as CP ranks rotate.
 
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::sync::Mutex;
@@ -69,17 +72,20 @@ use cudarc::driver::sys as cu_sys;
 use half::bf16;
 use pegainfer_kernels::ops::K3_KDA_HEAD_DIM;
 use pegainfer_kernels::ops::K3_KDA_HEADS;
+use pegainfer_kernels::ops::K3_MLA_HEADS;
 use pegainfer_kernels::ops::gemm_strided_batched_f32;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::active_cu_stream;
 
 use super::buffers::K3_CONV_STATE;
 use super::buffers::K3_KDA_STATE;
+use super::buffers::K3_MLA_V_ROW;
 use super::buffers::copy_rows;
 use super::whale_gang::K3WhaleGang;
 use crate::config::K3_ATTN_INNER;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_KV_LORA_RANK;
+use crate::config::K3_Q_B_OUT;
 use crate::config::K3_QK_ROPE_HEAD_DIM;
 
 /// Raw device base pointers one CP rank publishes for its peers to read.
@@ -92,6 +98,12 @@ pub(crate) struct K3CpPeerPtrs {
     pub(crate) kda_d: u64,
     pub(crate) mla_latent: u64,
     pub(crate) mla_rope: u64,
+    /// This segment's MLA queries for the stripe, `[seg_cap, 96 * 192]` bf16.
+    pub(crate) mla_q: u64,
+    /// The two stripe return slabs — attention output `[seg_cap, 96 * 128]`
+    /// bf16 and LSE `[96, seg_cap]` f32 — one pair per in-flight slot.
+    pub(crate) mla_ret_o: [u64; 2],
+    pub(crate) mla_ret_lse: [u64; 2],
     /// Raw `CUevent` handles for the owning rank's publish/consume events —
     /// peers wait on these cross-device (the safe wrapper refuses foreign
     /// contexts); the owning [`K3CpScratch`] keeps the events alive.
@@ -101,30 +113,96 @@ pub(crate) struct K3CpPeerPtrs {
 
 /// Which ranks a window couples. `Halo` moves the conv carry one hop down
 /// the chain; `Upstream` fans every upstream rank's publication down to all
-/// of its successors (KDA packages, MLA latents).
+/// of its successors (KDA packages, MLA latents); `Stripe` couples the
+/// explicit rank sets of one MLA stripe window (bitmasks over CP ranks —
+/// the queries fan out to a rank's helpers, each return slot comes back from
+/// them).
 #[derive(Clone, Copy)]
 pub(crate) enum K3CpWindowKind {
     Halo,
     Upstream,
+    Stripe {
+        /// Ranks whose publication I read this window.
+        from: u32,
+        /// Ranks that read mine.
+        by: u32,
+    },
+}
+
+/// The widest gang the stripe bitmasks seat.
+pub(crate) const K3_CP_STRIPE_MAX_RANKS: usize = 32;
+
+fn rank_mask(ranks: impl IntoIterator<Item = usize>) -> u32 {
+    ranks.into_iter().fold(0u32, |mask, rank| {
+        debug_assert!(rank < K3_CP_STRIPE_MAX_RANKS);
+        mask | (1u32 << rank)
+    })
+}
+
+fn mask_ranks(mask: u32) -> Vec<usize> {
+    (0..K3_CP_STRIPE_MAX_RANKS)
+        .filter(|&rank| mask & (1u32 << rank) != 0)
+        .collect()
 }
 
 impl K3CpWindowKind {
     /// Ranks whose publications `me` reads this window. CP ranks — the fleet
     /// gang maps them through its member table.
-    pub(crate) fn reads_from(self, me: usize) -> Range<usize> {
+    pub(crate) fn reads_from(self, me: usize) -> Vec<usize> {
         match self {
-            Self::Halo => me.saturating_sub(1)..me,
-            Self::Upstream => 0..me,
+            Self::Halo => (me.saturating_sub(1)..me).collect(),
+            Self::Upstream => (0..me).collect(),
+            Self::Stripe { from, .. } => mask_ranks(from),
         }
     }
 
     /// Ranks that read `me`'s publications this window.
-    pub(crate) fn read_by(self, me: usize, cp_size: usize) -> Range<usize> {
+    pub(crate) fn read_by(self, me: usize, cp_size: usize) -> Vec<usize> {
         match self {
-            Self::Halo => (me + 1).min(cp_size)..(me + 2).min(cp_size),
-            Self::Upstream => me + 1..cp_size,
+            Self::Halo => ((me + 1).min(cp_size)..(me + 2).min(cp_size)).collect(),
+            Self::Upstream => (me + 1..cp_size).collect(),
+            Self::Stripe { by, .. } => mask_ranks(by),
         }
     }
+}
+
+/// The MLA stripe schedule: the causal triangle's off-diagonal segment pairs
+/// `(q, k)`, `k < q`, each attended once — by the owner `q` (its queries over
+/// its assembled context) when `q - k` is odd, by the key holder `k` (the
+/// owner's published queries over its own expanded keys) when even. With
+/// equal segments rank `r` carries `(r + 1) / 2` kept pairs plus
+/// `(cp_size - 1 - r) / 2` helped ones on top of its own half-triangle —
+/// loads of `cp_size / 2 ± 1/2` all the way down instead of `r + 1/2`, so
+/// the deepest rank's attention halves (8 ranks: 7.5 → 4.5 segment-pairs,
+/// ideal 4). The keys a helper needs are the ones it already expanded for
+/// its own diagonal, so only queries and results move.
+///
+/// Every rank derives the identical schedule from `cp_size` alone; the
+/// windows it induces are collective and fixed per layer.
+pub(crate) fn k3_cp_stripe_kept(cp_size: usize, owner: usize) -> Vec<usize> {
+    debug_assert!(owner < cp_size);
+    (0..owner).filter(|k| (owner - k) % 2 == 1).collect()
+}
+
+/// Owners whose queries `helper` attends over its own keys, ascending.
+pub(crate) fn k3_cp_stripe_helped(cp_size: usize, helper: usize) -> Vec<usize> {
+    debug_assert!(helper < cp_size);
+    (helper + 1..cp_size)
+        .filter(|q| (q - helper) % 2 == 0)
+        .collect()
+}
+
+/// Return slots per MLA layer: the most pairs any one helper carries, which
+/// is rank 0's count. Every rank runs exactly this many return windows.
+pub(crate) fn k3_cp_stripe_slots(cp_size: usize) -> usize {
+    if cp_size == 0 { 0 } else { (cp_size - 1) / 2 }
+}
+
+/// Helpers that hand `owner` a result in return slot `slot`.
+pub(crate) fn k3_cp_stripe_returns(cp_size: usize, owner: usize, slot: usize) -> Vec<usize> {
+    (0..owner)
+        .filter(|&h| k3_cp_stripe_helped(cp_size, h).get(slot) == Some(&owner))
+        .collect()
 }
 
 /// The coordination substrate one CP scratch runs its exchange windows over:
@@ -568,6 +646,13 @@ pub(crate) struct K3CpScratch {
     pub(crate) mla_latent_pub: CudaSlice<bf16>,
     /// This segment's shared rope halves, `[seg_cap, 64]` bf16.
     pub(crate) mla_rope_pub: CudaSlice<bf16>,
+    /// This segment's MLA queries for the stripe, `[seg_cap, 96 * 192]` bf16.
+    pub(crate) mla_q_pub: CudaSlice<bf16>,
+    /// Stripe return slabs, one pair per in-flight slot: the helped owner's
+    /// attention output `[seg_cap, 96 * 128]` bf16 and LSE `[96, seg_cap]`
+    /// f32 over this rank's keys.
+    pub(crate) mla_ret_o: [CudaSlice<bf16>; 2],
+    pub(crate) mla_ret_lse: [CudaSlice<f32>; 2],
     // Local working buffers.
     /// Received upstream normed tail, `[4, hidden]` (row 3 is bucket padding).
     pub(crate) halo_normed: CudaSlice<bf16>,
@@ -602,7 +687,7 @@ pub(crate) struct K3CpScratch {
     gang_ranks: Vec<usize>,
 }
 
-/// The five buffers a CP rank publishes to its peers: pool allocations
+/// The buffers a CP rank publishes to its peers: pool allocations
 /// in-process, fabric-slab carvings on the fleet.
 struct K3CpPublish {
     normed_tail: CudaSlice<bf16>,
@@ -610,6 +695,9 @@ struct K3CpPublish {
     kda_d: CudaSlice<f32>,
     mla_latent: CudaSlice<bf16>,
     mla_rope: CudaSlice<bf16>,
+    mla_q: CudaSlice<bf16>,
+    mla_ret_o: [CudaSlice<bf16>; 2],
+    mla_ret_lse: [CudaSlice<f32>; 2],
 }
 
 impl K3CpScratch {
@@ -626,6 +714,19 @@ impl K3CpScratch {
                 .alloc_zeros(seg_cap * K3_KV_LORA_RANK)
                 .context("alloc K3 CP latent publish buffer")?,
             mla_rope: stream.alloc_zeros(seg_cap * K3_QK_ROPE_HEAD_DIM)?,
+            mla_q: stream
+                .alloc_zeros(seg_cap * K3_Q_B_OUT)
+                .context("alloc K3 CP stripe query publish buffer")?,
+            mla_ret_o: [
+                stream
+                    .alloc_zeros(seg_cap * K3_MLA_V_ROW)
+                    .context("alloc K3 CP stripe return slab")?,
+                stream.alloc_zeros(seg_cap * K3_MLA_V_ROW)?,
+            ],
+            mla_ret_lse: [
+                stream.alloc_zeros(K3_MLA_HEADS * seg_cap)?,
+                stream.alloc_zeros(K3_MLA_HEADS * seg_cap)?,
+            ],
         };
         let events = Some((
             new_event(ctx).context("create K3 CP publish event")?,
@@ -669,6 +770,15 @@ impl K3CpScratch {
             kda_d: carve_f32(mine.kda_d, K3_KDA_STATE),
             mla_latent: carve_bf16(mine.mla_latent, seg_cap * K3_KV_LORA_RANK),
             mla_rope: carve_bf16(mine.mla_rope, seg_cap * K3_QK_ROPE_HEAD_DIM),
+            mla_q: carve_bf16(mine.mla_q, seg_cap * K3_Q_B_OUT),
+            mla_ret_o: [
+                carve_bf16(mine.mla_ret_o[0], seg_cap * K3_MLA_V_ROW),
+                carve_bf16(mine.mla_ret_o[1], seg_cap * K3_MLA_V_ROW),
+            ],
+            mla_ret_lse: [
+                carve_f32(mine.mla_ret_lse[0], K3_MLA_HEADS * seg_cap),
+                carve_f32(mine.mla_ret_lse[1], K3_MLA_HEADS * seg_cap),
+            ],
         };
         Self::new_inner(
             ctx,
@@ -706,6 +816,9 @@ impl K3CpScratch {
             kda_d: publish.kda_d,
             mla_latent_pub: publish.mla_latent,
             mla_rope_pub: publish.mla_rope,
+            mla_q_pub: publish.mla_q,
+            mla_ret_o: publish.mla_ret_o,
+            mla_ret_lse: publish.mla_ret_lse,
             halo_normed: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_HIDDEN)?,
             halo_partial: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_ATTN_INNER)?,
             halo_xs: stream.alloc_zeros((K3_CONV_STATE + 1) * K3_ATTN_INNER)?,
@@ -769,6 +882,11 @@ impl K3CpScratch {
             "K3 CP rank {cp_rank} of {}",
             self.cp_size
         );
+        ensure!(
+            self.cp_size <= K3_CP_STRIPE_MAX_RANKS,
+            "K3 CP gang of {} ranks exceeds the {K3_CP_STRIPE_MAX_RANKS}-rank stripe masks",
+            self.cp_size
+        );
         self.cp_rank = cp_rank;
         ensure!(
             segments.len() == self.cp_size,
@@ -797,6 +915,9 @@ impl K3CpScratch {
             kda_d: ptr(&self.kda_d),
             mla_latent: ptr_bf(&self.mla_latent_pub),
             mla_rope: ptr_bf(&self.mla_rope_pub),
+            mla_q: ptr_bf(&self.mla_q_pub),
+            mla_ret_o: [ptr_bf(&self.mla_ret_o[0]), ptr_bf(&self.mla_ret_o[1])],
+            mla_ret_lse: [ptr(&self.mla_ret_lse[0]), ptr(&self.mla_ret_lse[1])],
             publish_event: self
                 .publish_event
                 .as_ref()
@@ -835,6 +956,10 @@ impl K3CpScratch {
         );
         ensure!(cp_rank < width, "K3 whale CP rank {cp_rank} of {width}");
         ensure!(
+            width <= K3_CP_STRIPE_MAX_RANKS,
+            "K3 whale gang of {width} ranks exceeds the {K3_CP_STRIPE_MAX_RANKS}-rank stripe masks"
+        );
+        ensure!(
             gang_ranks[cp_rank] == gang.rank(),
             "K3 whale gang seats rank {} at CP position {cp_rank}, but this executor is rank {}",
             gang_ranks[cp_rank],
@@ -868,6 +993,45 @@ impl K3CpScratch {
         self.whale_window = 0;
         self.gang_ranks = gang_ranks.to_vec();
         Ok(())
+    }
+
+    /// Upstream segments this rank attends itself (ascending).
+    pub(crate) fn stripe_kept(&self) -> Vec<usize> {
+        k3_cp_stripe_kept(self.cp_size, self.cp_rank)
+    }
+
+    /// Owners whose queries this rank attends over its own keys, by slot.
+    pub(crate) fn stripe_helped(&self) -> Vec<usize> {
+        k3_cp_stripe_helped(self.cp_size, self.cp_rank)
+    }
+
+    /// Return windows every rank runs per MLA layer.
+    pub(crate) fn stripe_slots(&self) -> usize {
+        k3_cp_stripe_slots(self.cp_size)
+    }
+
+    /// Helpers handing this rank a result in `slot`.
+    pub(crate) fn stripe_returns(&self, slot: usize) -> Vec<usize> {
+        k3_cp_stripe_returns(self.cp_size, self.cp_rank, slot)
+    }
+
+    /// The query window: my queries fan out to my helpers, and I read the
+    /// queries of every owner I help.
+    pub(crate) fn stripe_query_kind(&self) -> K3CpWindowKind {
+        let helpers = (0..self.cp_rank).filter(|h| (self.cp_rank - h) % 2 == 0);
+        K3CpWindowKind::Stripe {
+            from: rank_mask(self.stripe_helped()),
+            by: rank_mask(helpers),
+        }
+    }
+
+    /// Return window `slot`: I read the results my slot-`slot` helpers
+    /// publish, and the owner I serve in that slot reads mine.
+    pub(crate) fn stripe_return_kind(&self, slot: usize) -> K3CpWindowKind {
+        K3CpWindowKind::Stripe {
+            from: rank_mask(self.stripe_returns(slot)),
+            by: rank_mask(self.stripe_helped().get(slot).copied()),
+        }
     }
 
     /// Snapshot what one exchange window needs — plain copied data, so the
@@ -1069,6 +1233,63 @@ mod tests {
             first > last + 1000,
             "leveling too timid at 256k: first {first}, last {last}"
         );
+    }
+
+    /// Every off-diagonal pair is attended exactly once, by its owner or its
+    /// key holder, and the window sets are mirror images.
+    #[test]
+    fn stripes_cover_the_triangle_once_and_mirror() {
+        for cp_size in 2..=16usize {
+            for q in 0..cp_size {
+                for k in 0..q {
+                    let kept = k3_cp_stripe_kept(cp_size, q).contains(&k);
+                    let helped = k3_cp_stripe_helped(cp_size, k).contains(&q);
+                    assert!(
+                        kept ^ helped,
+                        "pair ({q}, {k}) @ {cp_size}: kept {kept}, helped {helped}"
+                    );
+                }
+            }
+            let slots = k3_cp_stripe_slots(cp_size);
+            for h in 0..cp_size {
+                assert!(k3_cp_stripe_helped(cp_size, h).len() <= slots);
+            }
+            for slot in 0..slots {
+                for q in 0..cp_size {
+                    for h in k3_cp_stripe_returns(cp_size, q, slot) {
+                        assert_eq!(k3_cp_stripe_helped(cp_size, h).get(slot), Some(&q));
+                    }
+                }
+            }
+        }
+    }
+
+    /// With equal segments the deepest rank's attention halves and no rank
+    /// exceeds the ideal by more than half a segment-pair.
+    #[test]
+    fn stripes_level_the_causal_triangle() {
+        for cp_size in [4usize, 8, 16] {
+            let load = |r: usize| -> f64 {
+                0.5 + k3_cp_stripe_kept(cp_size, r).len() as f64
+                    + k3_cp_stripe_helped(cp_size, r).len() as f64
+            };
+            let ideal = cp_size as f64 / 2.0;
+            let worst = (0..cp_size).map(load).fold(0.0, f64::max);
+            assert!(
+                worst <= ideal + 0.5,
+                "{cp_size}: worst {worst} vs ideal {ideal}"
+            );
+            // The deepest rank: r + 1/2 unstriped, at most (r + 3) / 2 striped.
+            let deep = load(cp_size - 1);
+            assert!(
+                deep <= (cp_size as f64 + 2.0) / 2.0,
+                "{cp_size}: deep {deep}"
+            );
+            assert!(
+                deep < cp_size as f64 - 0.5,
+                "{cp_size}: deep {deep} not relieved"
+            );
+        }
     }
 
     #[test]

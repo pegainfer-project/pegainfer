@@ -45,6 +45,7 @@ use anyhow::ensure;
 use cudarc::driver::sys as cu_sys;
 use half::bf16;
 use pegainfer_kernels::ops::K3_MEGA_FABRIC_HANDLE_BYTES;
+use pegainfer_kernels::ops::K3_MLA_HEADS;
 use pegainfer_kernels::ops::k3_chunk_bucket;
 use pegainfer_kernels::ops::k3_mega_fabric_slab_alloc;
 use pegainfer_kernels::ops::k3_mega_fabric_slab_import;
@@ -55,12 +56,14 @@ use pegainfer_kernels::tensor::active_cu_stream;
 
 use super::buffers::K3_CONV_STATE;
 use super::buffers::K3_KDA_STATE;
+use super::buffers::K3_MLA_V_ROW;
 use super::cp::K3CpPeerPtrs;
 use super::cp::K3CpScratch;
 use super::cp::K3CpSyncHandle;
 use super::cp::K3CpWindowKind;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_KV_LORA_RANK;
+use crate::config::K3_Q_B_OUT;
 use crate::config::K3_QK_ROPE_HEAD_DIM;
 
 /// Doorbell values per whale: window `w` of whale `seq` rings
@@ -85,6 +88,9 @@ pub(crate) struct K3WhaleSlabLayout {
     kda_d: usize,
     mla_latent: usize,
     mla_rope: usize,
+    mla_q: usize,
+    mla_ret_o: [usize; 2],
+    mla_ret_lse: [usize; 2],
     pub(crate) num_bytes: usize,
 }
 
@@ -111,6 +117,15 @@ impl K3WhaleSlabLayout {
         let kda_d = region(K3_KDA_STATE * size_of::<f32>());
         let mla_latent = region(seg_cap * K3_KV_LORA_RANK * size_of::<bf16>());
         let mla_rope = region(seg_cap * K3_QK_ROPE_HEAD_DIM * size_of::<bf16>());
+        let mla_q = region(seg_cap * K3_Q_B_OUT * size_of::<bf16>());
+        let mla_ret_o = [
+            region(seg_cap * K3_MLA_V_ROW * size_of::<bf16>()),
+            region(seg_cap * K3_MLA_V_ROW * size_of::<bf16>()),
+        ];
+        let mla_ret_lse = [
+            region(K3_MLA_HEADS * seg_cap * size_of::<f32>()),
+            region(K3_MLA_HEADS * seg_cap * size_of::<f32>()),
+        ];
         Self {
             publish_inbox,
             consume_inbox,
@@ -119,6 +134,9 @@ impl K3WhaleSlabLayout {
             kda_d,
             mla_latent,
             mla_rope,
+            mla_q,
+            mla_ret_o,
+            mla_ret_lse,
             num_bytes: aligned(offset),
         }
     }
@@ -266,6 +284,15 @@ impl K3WhaleGang {
             kda_d: base + self.layout.kda_d as u64,
             mla_latent: base + self.layout.mla_latent as u64,
             mla_rope: base + self.layout.mla_rope as u64,
+            mla_q: base + self.layout.mla_q as u64,
+            mla_ret_o: [
+                base + self.layout.mla_ret_o[0] as u64,
+                base + self.layout.mla_ret_o[1] as u64,
+            ],
+            mla_ret_lse: [
+                base + self.layout.mla_ret_lse[0] as u64,
+                base + self.layout.mla_ret_lse[1] as u64,
+            ],
             publish_event: 0,
             consume_event: 0,
         })
@@ -304,6 +331,7 @@ impl K3WhaleGang {
         // launches.
         let publish_flags: Vec<u64> = kind
             .read_by(cp_rank, cp_size)
+            .into_iter()
             .map(|reader| {
                 self.layout
                     .publish_flag(self.bases[gang[reader]], self.rank)
@@ -322,6 +350,7 @@ impl K3WhaleGang {
         consume()?;
         let consume_flags: Vec<u64> = kind
             .reads_from(cp_rank)
+            .into_iter()
             .map(|source| {
                 self.layout
                     .consume_flag(self.bases[gang[source]], self.rank)
@@ -474,6 +503,23 @@ mod tests {
             (
                 layout.mla_rope,
                 seg_cap * K3_QK_ROPE_HEAD_DIM * size_of::<bf16>(),
+            ),
+            (layout.mla_q, seg_cap * K3_Q_B_OUT * size_of::<bf16>()),
+            (
+                layout.mla_ret_o[0],
+                seg_cap * K3_MLA_V_ROW * size_of::<bf16>(),
+            ),
+            (
+                layout.mla_ret_o[1],
+                seg_cap * K3_MLA_V_ROW * size_of::<bf16>(),
+            ),
+            (
+                layout.mla_ret_lse[0],
+                K3_MLA_HEADS * seg_cap * size_of::<f32>(),
+            ),
+            (
+                layout.mla_ret_lse[1],
+                K3_MLA_HEADS * seg_cap * size_of::<f32>(),
             ),
         ];
         for (offset, _) in regions {
