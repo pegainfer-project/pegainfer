@@ -183,7 +183,7 @@ async fn load_lora_adapter(
         return bad_request("lora_path must not be empty");
     }
     if request.is_3d_lora_weight {
-        return bad_request("is_3d_lora_weight=true is not supported by Qwen3 LoRA PR1");
+        return bad_request("is_3d_lora_weight=true is not supported");
     }
 
     let lora_name = request.lora_name.clone();
@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_lora_adapter_route_rejects_pr1_unsupported_fields() {
+    async fn load_lora_adapter_route_rejects_3d_weight() {
         let state = route_state(gone_engine_client());
         let response = load_lora_adapter(
             axum::extract::State(state),
