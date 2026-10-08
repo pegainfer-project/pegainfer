@@ -267,6 +267,13 @@ jobs:
             extra_packages: ""
             needs_triton: true
             triton_python: python
+          # The kernels' K3 tests compile only with the `k3` feature.
+          - model_name: Kimi-K3
+            package: pegainfer-k3
+            feature: pegainfer-kernels/k3
+            extra_packages: "-p pegainfer-kernels"
+            needs_triton: false
+            triton_python: ""
 
     steps:
       - name: Checkout
