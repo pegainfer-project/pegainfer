@@ -14,8 +14,10 @@
 //! Two GPUs are mandatory, so these run one at a time on a box that has them.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::parallel::ParallelConfig;
 
@@ -23,6 +25,7 @@ use super::lane_tests::Drained;
 use super::lane_tests::Harness;
 use super::lane_tests::ids;
 use super::lane_tests::launch_with;
+use super::lane_tests::wait_until;
 use crate::testkit::f32_tensor;
 use crate::testkit::golden_bytes;
 use crate::testkit::i32_tensor;
@@ -456,24 +459,59 @@ fn the_two_rank_engine_scores_prompt_logprobs() {
 ///
 /// `PEGAINFER_TP_PROMPT_TOKENS` sets the long length (default 1024, the window
 /// width); the short run is its first half.
-#[test]
-#[ignore = "needs two GPUs and --test-threads=1; checkpoint from PEGAINFER_TEST_MODEL_PATH"]
-fn the_two_rank_engine_is_prefix_consistent() {
+/// What one prefix comparison read: how many rows lined up, how many of those
+/// shared a token at all (the gap is only read where they do), the worst
+/// shared-token gap and where it was, and how the argmaxes moved.
+struct PrefixComparison {
+    compared: usize,
+    overlapped: usize,
+    worst: f32,
+    worst_at: String,
+    flipped: usize,
+    first_flip: String,
+}
+
+impl PrefixComparison {
+    fn report(&self, what: &str, long: usize) {
+        eprintln!(
+            "{what}: {} vs {} tokens: {} rows, {} with a shared token; worst shared-token gap \
+             {:.4} at {}; {} argmax flips (first {})",
+            long / 2,
+            long,
+            self.compared,
+            self.overlapped,
+            self.worst,
+            self.worst_at,
+            self.flipped,
+            self.first_flip
+        );
+    }
+
+    /// The two properties every arm needs before its gap means anything: rows
+    /// were compared, and at least one of them shared a token with the other
+    /// run — without that the gap is a zero nobody measured.
+    fn assert_reads_something(&self, what: &str, long: usize) {
+        assert!(
+            self.compared > 0,
+            "{what}: no shared rows were scored at {} vs {long} tokens",
+            long / 2
+        );
+        assert!(
+            self.overlapped > 0,
+            "{what}: no row's top-{TOP_K} was shared between the {}- and {long}-token runs, so \
+             the gap measured nothing",
+            long / 2
+        );
+    }
+}
+
+/// Score `long` and its first half on one engine, and hold the rows they share
+/// against each other. Split out of the gate below so the two-rank arm can be
+/// held against a single-rank control on the same prompt.
+fn prefix_comparison(options: &EngineLoadOptions, long: usize) -> PrefixComparison {
     const SALT: u32 = 11;
-    let long: usize = std::env::var("PEGAINFER_TP_PROMPT_TOKENS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1024);
     let short = long / 2;
-    // `short == 0` would make `0..short - 1` wrap in release and spin instead of
-    // reaching the `compared > 0` assert below.
-    assert!(
-        long >= 4,
-        "the prefix gate needs a prompt of at least 4 tokens"
-    );
-    let (device, peer) = devices();
-    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
-    let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
+    let mut harness = launch_with(options, &as_refs(&envelope_overrides()));
     let mut controls = Vec::new();
     let mut echoes = Vec::new();
     // `ids` is position-indexed, so the short prompt is a prefix of the long one.
@@ -485,12 +523,14 @@ fn the_two_rank_engine_is_prefix_consistent() {
         controls.push(control);
     }
     let (short_echo, long_echo) = (&echoes[0], &echoes[1]);
-    let mut compared = 0usize;
-    let mut overlapped = 0usize;
-    let mut worst = 0.0f32;
-    let mut worst_at = String::new();
-    let mut flipped = 0usize;
-    let mut first_flip = String::new();
+    let mut comparison = PrefixComparison {
+        compared: 0,
+        overlapped: 0,
+        worst: 0.0,
+        worst_at: String::new(),
+        flipped: 0,
+        first_flip: String::new(),
+    };
     for row in 0..short - 1 {
         let (Some(a), Some(b)) = (
             short_echo
@@ -504,7 +544,7 @@ fn the_two_rank_engine_is_prefix_consistent() {
         ) else {
             continue;
         };
-        compared += 1;
+        comparison.compared += 1;
         assert_finite(a, &format!("{short}-token run row {row} (engine)"));
         assert_finite(b, &format!("{long}-token run row {row} (engine)"));
         let (left, right) = (top_of(a), top_of(b));
@@ -513,50 +553,102 @@ fn the_two_rank_engine_is_prefix_consistent() {
             if let Some(other) = right.get(token) {
                 shared += 1;
                 let gap = (value - other).abs();
-                if gap > worst {
-                    worst = gap;
-                    worst_at = format!("row {row} token {token}");
+                if gap > comparison.worst {
+                    comparison.worst = gap;
+                    comparison.worst_at = format!("row {row} token {token}");
                 }
             }
         }
         if shared > 0 {
-            overlapped += 1;
+            comparison.overlapped += 1;
         }
         let (pa, pb) = (a.top_logprobs[0].0, b.top_logprobs[0].0);
         if pa != pb {
-            flipped += 1;
-            if first_flip.is_empty() {
-                first_flip =
+            comparison.flipped += 1;
+            if comparison.first_flip.is_empty() {
+                comparison.first_flip =
                     format!("row {row}: {short}-token picks {pa}, {long}-token picks {pb}");
             }
         }
     }
-    eprintln!(
-        "prefix: {compared} rows, {overlapped} with a shared token; worst shared-token gap \
-         {worst:.4} at {worst_at}; {flipped} argmax flips (first {first_flip})"
-    );
     let refs: Vec<&_> = controls.iter().collect();
     harness.shutdown(&refs);
-    assert!(compared > 0, "no shared rows were scored");
-    // The gap is only computed where the two runs' top-k overlap, so a row that
-    // shares nothing contributes no evidence at all: without this, an engine that
-    // replaced every row's distribution would leave `worst` at 0 and pass.
+    comparison
+}
+
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1; checkpoint from PEGAINFER_TEST_MODEL_PATH"]
+fn the_two_rank_engine_is_prefix_consistent() {
+    let long: usize = std::env::var("PEGAINFER_TP_PROMPT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024);
+    // `long / 2 == 0` would make `0..short - 1` wrap in release and spin instead
+    // of reaching the assert below.
     assert!(
-        overlapped > 0,
-        "no row's top-{TOP_K} was shared between the {short}- and {long}-token runs, so the gap \
-         above measured nothing"
+        long >= 4,
+        "the prefix gate needs a prompt of at least 4 tokens"
     );
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let two = prefix_comparison(&tp2_options(device, peer), long);
+    two.report("prefix tp2", long);
+    two.assert_reads_something("prefix tp2", long);
     // The line is `serve_oracle`'s calibration, not a tight one: scoring the same
     // context two ways (there a greedy walk against a single prefill, here a
     // 512-row prefill against a 1024-row one) moves the logits by a chaotically
     // amplifying amount — measured in-repo at 0.31..5.75 raw logits — because the
     // prefill GEMM's tiling depends on the row count. Measured here: 1.69 on the
     // four-layer synthetic, 4.05 on the 60-layer 31B. A grosser gap (a page,
-    // position or rope error) still fails.
+    // position or rope error) still fails. A checkpoint that fits one card gets
+    // the tighter, measured form of this line and the absolute check below
+    // together — see `...within_a_single_rank_control`.
     assert!(
-        worst < PREFIX_LINE,
-        "the same prefix scored in a longer run differs by {worst} at {worst_at} (line \
-         {PREFIX_LINE}), so the engine is not prefix-consistent"
+        two.worst < PREFIX_LINE,
+        "the same prefix scored in a longer run differs by {} at {} (line {PREFIX_LINE}), so the \
+         engine is not prefix-consistent",
+        two.worst,
+        two.worst_at
+    );
+}
+
+/// The prefix gate's two-rank line, with a control arm. `serve_oracle`'s 12.0
+/// bounds raw logits there, held beside an argmax check on every row; here it
+/// bounds logprob gaps with the flips only counted, so the line needs a
+/// measurement of its own rather than a borrowed one — the same discipline
+/// #1132's cache gate applies to its cold leg.
+///
+/// The control is the *same comparison at world size 1*, so the checkpoint has
+/// to fit one card (the 12B; a gate cannot load a 31B twice). It reads what the
+/// shape difference is worth with no tensor parallelism in the picture, and the
+/// two-rank arm may not multiply it.
+#[test]
+#[ignore = "needs two GPUs, a one-card checkpoint, and --test-threads=1"]
+fn the_two_rank_engine_is_prefix_consistent_within_a_single_rank_control() {
+    let long: usize = std::env::var("PEGAINFER_TP_PROMPT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024);
+    assert!(
+        long >= 4,
+        "the prefix gate needs a prompt of at least 4 tokens"
+    );
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let control = prefix_comparison(&single_options(device), long);
+    control.report("prefix control (one rank)", long);
+    control.assert_reads_something("prefix control", long);
+    let two = prefix_comparison(&tp2_options(device, peer), long);
+    two.report("prefix tp2", long);
+    two.assert_reads_something("prefix tp2", long);
+    let ceiling = (PREFIX_CONTROL_RATIO * control.worst).max(PREFIX_CONTROL_FLOOR);
+    assert!(
+        two.worst <= ceiling,
+        "at two ranks the same prefix differs by {} at {}, against a one-rank control's {} \
+         (ceiling {ceiling} = {PREFIX_CONTROL_RATIO}x control, floor {PREFIX_CONTROL_FLOOR})",
+        two.worst,
+        two.worst_at,
+        control.worst
     );
 }
 
@@ -564,6 +656,110 @@ fn the_two_rank_engine_is_prefix_consistent() {
 /// there) rather than the one-rank comparison's `LOGBROB_LINE`: the drift it
 /// looks for is the same chaotic shape-dependence, bounded the same way.
 const PREFIX_LINE: f32 = 12.0;
+
+/// The one-card form of the same line: what the two-rank arm may read against
+/// the single-rank control's own reading. `serve_oracle` derives its lines the
+/// same way when it can afford the control arm — a ratio with a floor, so a
+/// control that happened to read exactly zero cannot tighten the bound to
+/// nothing. Both are set from this gate's own readings.
+const PREFIX_CONTROL_RATIO: f32 = 2.0;
+const PREFIX_CONTROL_FLOOR: f32 = 0.10;
+
+/// The abort machinery's own contract, with no engine in the picture: a
+/// reduction still works through the wrapper, an aborted communicator refuses
+/// the next one instead of running comm-less, and aborting twice does not reach
+/// cudarc's drop path twice — a second `ncclCommAbort` makes cudarc's `Comm`
+/// `Drop` panic, which is why the wrapper takes the communicator out rather
+/// than leaving the abort to the drop. No checkpoint, so this is the cheap half
+/// of the pair; the engine-level half is
+/// `a_failed_rank_zero_segment_stops_the_engine_at_two_ranks`.
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1"]
+fn an_aborted_communicator_refuses_the_next_reduction() {
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let contexts: Vec<crate::tensor::DeviceContext> = [device, peer]
+        .into_iter()
+        .map(|ordinal| {
+            crate::tensor::DeviceContext::new_with_device(ordinal).expect("a device context")
+        })
+        .collect();
+    let comms = cudarc::nccl::safe::Comm::from_devices(
+        contexts
+            .iter()
+            .map(|ctx| ctx.stream.clone())
+            .collect::<Vec<_>>(),
+    )
+    .expect("a two-rank communicator");
+    let ranks: Vec<crate::layer::TpComm> =
+        comms.into_iter().map(crate::layer::TpComm::new).collect();
+    let mut buffers: Vec<_> = contexts
+        .iter()
+        .map(|ctx| ctx.stream.alloc_zeros::<f32>(8).expect("a buffer"))
+        .collect();
+    // The pair reduces together once, before any abort, each rank's enqueue on
+    // its own device — the shape the engine runs and the one the wrapper must
+    // not have broken.
+    for (index, (rank, buffer)) in ranks.iter().zip(buffers.iter_mut()).enumerate() {
+        super::select_device(&contexts[index]).expect("the rank's device is current");
+        rank.all_reduce_in_place(buffer, &cudarc::nccl::safe::ReduceOp::Sum)
+            .expect("a reduction over a live communicator");
+    }
+    for ctx in &contexts {
+        ctx.stream
+            .synchronize()
+            .expect("the pair's reduction completes");
+    }
+    ranks[1].abort();
+    ranks[1].abort();
+    assert!(
+        ranks[1]
+            .all_reduce_in_place(&mut buffers[1], &cudarc::nccl::safe::ReduceOp::Sum)
+            .is_err(),
+        "a reduction after the abort must refuse instead of reducing comm-less"
+    );
+}
+
+/// A rank-0 step failure at two ranks must stop the engine promptly, not wedge
+/// it — the pairing the single-rank gate cannot see. The engine aborts every
+/// rank's communicator before joining the ranks' threads
+/// (`EngineState::drive_ranks`), and this is the end-to-end half of that: the
+/// step fails, the scheduler exits within the deadline, and the request is
+/// failed rather than left pending.
+///
+/// The fault needs no injection hook — `u32::MAX` is outside every vocabulary
+/// this line ships, and `prepare_single`'s `validate_tokens` refuses it before
+/// the tower allocates anything — but it is deliberately *symmetric*: every rank
+/// runs the same segment and so refuses the same prompt, which means a peer that
+/// never launches its collective is not what this run creates. The abort handle
+/// itself is held to its own contract, without an engine, by
+/// `an_aborted_communicator_refuses_the_next_reduction`; an asymmetric injection
+/// would need a hook in the engine, which the single-rank half
+/// (`lane_gates_logprobs::a_failed_prefill_costs_that_request_not_the_engine`)
+/// also went out of its way not to add.
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1; checkpoint from PEGAINFER_TEST_MODEL_PATH"]
+fn a_failed_rank_zero_segment_stops_the_engine_at_two_ranks() {
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
+    let bad = harness.submit(vec![9, u32::MAX, 11], 4);
+    // Bounded on purpose: the property is that the engine *stops*, and a peer
+    // left spinning on a collective would keep this waiting instead — which is
+    // the wedge this gate exists to name.
+    let stopped = wait_until(Duration::from_secs(60), || harness.scheduler_finished());
+    let terminal = harness.steps.try_terminal(bad.id());
+    assert!(
+        stopped,
+        "a rank-0 failure at TP2 left the engine running (request terminal {terminal:?}); the \
+         peer's communicator should have been aborted before the join"
+    );
+    assert!(
+        matches!(terminal, Some(Terminal::Failed { .. })),
+        "the failing request should be failed, not {terminal:?}"
+    );
+    harness.shutdown(&[]);
+}
 
 /// Two ranks against the Hugging Face reference, for the size the gate above
 /// cannot afford a single-rank control on: a 31B's whole tower is 57 GiB, so its

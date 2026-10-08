@@ -85,6 +85,15 @@ impl Harness {
             .metrics()
     }
 
+    /// Whether the scheduler thread has exited — the engine's own signal that it
+    /// stopped, which a gate can wait on with a deadline instead of racing the
+    /// frontend's error propagation.
+    pub(super) fn scheduler_finished(&self) -> bool {
+        self.scheduler
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.join.is_finished())
+    }
+
     pub(super) fn shutdown(&mut self, aborts: &[&RequestControl]) {
         for control in aborts {
             control.abort();

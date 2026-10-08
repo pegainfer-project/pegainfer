@@ -113,9 +113,12 @@ GATES_KERNELS_HD256_FP8_POOL=(
   "gpu the_generated_windowed_prefill_refuses_e4m3"
 )
 GATES_TENSOR_PARALLEL=(
+  "tp2 engine::lane_gates_tp::an_aborted_communicator_refuses_the_next_reduction"
   "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_matches_one_rank"
+  "tp2,ckpt engine::lane_gates_tp::a_failed_rank_zero_segment_stops_the_engine_at_two_ranks"
   "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_scores_prompt_logprobs"
   "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_is_prefix_consistent"
+  "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_is_prefix_consistent_within_a_single_rank_control"
   "tp2,ckpt,hf31 engine::lane_gates_tp::the_two_rank_engine_matches_the_hf_reference"
 )
 MANIFEST_LIB=(

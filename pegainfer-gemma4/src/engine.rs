@@ -42,6 +42,7 @@ use crate::kv::LOCAL_PAGE_SIZE;
 use crate::kv::RankKv;
 use crate::kv::admit_tokens;
 use crate::layer::LayerGeometry;
+use crate::layer::TpComm;
 use crate::prefix_cache::PrefixCache;
 use crate::serve::GemmaServe;
 use crate::serve::GlobalAttn;
@@ -1291,6 +1292,10 @@ struct EngineState {
     /// refuses rather than run a comm-less reduction that would return partial
     /// sums. `Cell` so the abort path can set it while holding `&self.ctx`.
     tp_broken: Cell<bool>,
+    /// A handle on each extra rank's communicator, in `more`'s order, so the
+    /// failing thread can abort a peer's communicator while that peer is inside
+    /// the collective the abort is meant to break.
+    extra_comms: Vec<TpComm>,
     /// The admission coalesce window; `None` unless
     /// `PEGAINFER_ADMIT_COALESCE_MS` opted in at startup.
     admit_coalesce: Option<std::time::Duration>,
@@ -1369,9 +1374,10 @@ impl EngineState {
     /// it, every peer's collectives are already in flight, so the drain rank 0
     /// waits on can pair — where a single thread that ran rank 0's whole segment
     /// first would wait on a call it had not yet issued. A rank-0 failure aborts
-    /// rank 0's communicator so the peers' pending collectives error out instead
-    /// of hanging, and the extras' are aborted after the join. An extra rank's
-    /// failure is fatal: the ranks' frontiers must not drift apart.
+    /// every rank's communicator *before* the join, so a peer already inside the
+    /// matching collective is unblocked by its own abort rather than left to
+    /// notice rank 0's. An extra rank's failure is fatal: the ranks' frontiers
+    /// must not drift apart.
     fn drive_ranks<P, T, R, E>(&mut self, payload: Vec<P>, rank0: R, extra: E) -> Result<T>
     where
         P: Send,
@@ -1394,6 +1400,7 @@ impl EngineState {
             arena,
             more,
             tp_broken,
+            extra_comms,
             ..
         } = self;
         let mut payload = payload.into_iter();
@@ -1406,6 +1413,12 @@ impl EngineState {
             for (index, (state, item)) in more.iter_mut().zip(twins).enumerate() {
                 let rank = index + 1;
                 handles.push(scope.spawn(move || -> Result<()> {
+                    // This step's thread creates its own cuBLAS handles in
+                    // `activate_rank`, and the guard is what destroys them when
+                    // the thread ends: the one the scheduler holds covers only
+                    // the scheduler's thread, so without it every step would
+                    // leave a handle pair's device memory behind.
+                    let _handles = bind_engine_thread(&state.ctx)?;
                     activate_rank(&state.ctx)?;
                     extra(state, item)
                         .with_context(|| format!("tensor-parallel rank {rank} segment"))?;
@@ -1419,9 +1432,13 @@ impl EngineState {
             let ranked = rank0(ctx, serve, arena, core);
             if ranked.is_err() && extra_ranks > 0 {
                 // Rank 0's sequence may have stopped short, so a peer's matching
-                // call will never come. Rank 0's own fields are not borrowed by
-                // the threads, so its communicator and graphs can be torn down
-                // here to unblock them; the extras' follow the join.
+                // call will never come — and a peer inside that collective is
+                // unblocked by aborting *its* communicator, not rank 0's. Every
+                // communicator is aborted here, before the join that would
+                // otherwise be waiting on the peer whose abort is still to come.
+                // Rank 0's own fields are not borrowed by the threads, and the
+                // peers' communicators are reached through the engine's own
+                // handles rather than their serves.
                 //
                 // Only with extra ranks: with none there is no collective to
                 // abort and no peer frontier to keep in step, so this stays the
@@ -1443,7 +1460,10 @@ impl EngineState {
                         ctx.device_ordinal
                     );
                 }
-                serve.detach_tp_comm();
+                serve.abort_tp_comm();
+                for comm in extra_comms.iter() {
+                    comm.abort();
+                }
             }
             let mut extras: Result<()> = Ok(());
             for handle in handles {
@@ -1483,7 +1503,12 @@ impl EngineState {
 
     /// Abort every extra rank's communicator and release its graphs, after a
     /// failed step has already stopped the engine.
+    /// Abort every communicator and release every extra rank's graphs, after a
+    /// failed step has already stopped the engine. Aborting is idempotent, so
+    /// this covers whichever rank failed: the pair is broken either way and no
+    /// later step may run a comm-less reduction.
     fn break_extras(&mut self) {
+        self.serve.abort_tp_comm();
         for (index, state) in self.more.iter_mut().enumerate() {
             if select_device(&state.ctx).is_ok() {
                 state.arena.release_graphs();
@@ -1495,7 +1520,7 @@ impl EngineState {
                     state.ctx.device_ordinal
                 );
             }
-            state.serve.detach_tp_comm();
+            state.serve.abort_tp_comm();
         }
     }
 
@@ -1534,11 +1559,12 @@ impl EngineState {
     }
 }
 
-/// The scheduler thread is not the thread that loaded the engine: the
-/// primary context must be made current there and the thread-local cuBLAS
-/// handles created, or the first eager GEMM fails with an invalid handle.
-/// The returned guard tears the handles down when the scheduler drops on
-/// that thread.
+/// A thread that is not the one that loaded the engine — the scheduler's, or a
+/// step's extra-rank thread — must make the primary context current there and
+/// create the thread-local cuBLAS handles, or the first eager GEMM fails with an
+/// invalid handle. The returned guard tears the handles down when that thread
+/// ends: the scheduler holds its guard for its lifetime, and each step's
+/// extra-rank thread holds one for the step's.
 fn bind_engine_thread(ctx: &DeviceContext) -> Result<CublasThreadGuard> {
     let err = unsafe { pegainfer_core::ffi::cuda_set_device(ctx.device_ordinal as i32) };
     anyhow::ensure!(
@@ -1964,7 +1990,11 @@ impl EngineState {
             activate_rank(&ctx)?;
         }
         // One communicator per rank, built on the stream the decode graph would
-        // run on, so an all-reduce lands inside that graph.
+        // run on, so an all-reduce lands inside that graph. The engine keeps a
+        // handle on each extra rank's communicator — `extra_comms[i]` is rank
+        // `i + 1`'s — so a failure can abort a peer that its own thread cannot
+        // be asked to abort (it is inside the collective being aborted).
+        let mut extra_comms: Vec<TpComm> = Vec::with_capacity(world.saturating_sub(1));
         if world > 1 {
             let mut streams = Vec::with_capacity(world);
             streams.push(ctx.stream.clone());
@@ -1974,11 +2004,11 @@ impl EngineState {
             let mut comms = cudarc::nccl::safe::Comm::from_devices(streams)
                 .map_err(|e| anyhow::anyhow!("failed to initialize NCCL comms: {e:?}"))?
                 .into_iter();
-            serve.attach_tp_comm(comms.next().expect("one comm per rank"));
+            serve.attach_tp_comm(TpComm::new(comms.next().expect("one comm per rank")));
             for state in &mut more {
-                state
-                    .serve
-                    .attach_tp_comm(comms.next().expect("one comm per rank"));
+                let comm = TpComm::new(comms.next().expect("one comm per rank"));
+                state.serve.attach_tp_comm(comm.clone());
+                extra_comms.push(comm);
             }
         }
         // With graphs on, every rank captures its decode graphs, phase by phase:
@@ -2054,6 +2084,7 @@ impl EngineState {
             score_ceiling,
             slots,
             tp_broken: Cell::new(false),
+            extra_comms,
             admit_coalesce,
         })
     }
@@ -2225,63 +2256,84 @@ impl EngineState {
         }
 
         let mut echo = None;
-        let stepped = if let Some(top_k) = request.request.prompt_logprobs {
-            let prompt = &request.request.prompt_tokens;
-            let mut scores: Vec<Option<TokenLogprob>> = vec![None];
-            // Rank 0's tower and the peers' run at once, so the per-row readback
-            // below — which blocks on rank 0's own collective — starts only once
-            // every rank's tower is in flight.
-            let mut tower = self.drive_ranks(
-                Self::rank_payload(&mut kv),
-                |ctx, serve, _arena, core| serve.launch_prompt_tower(ctx, core, prompt),
-                |state, rank_kv| {
-                    state
-                        .serve
-                        .step_scoring(&state.ctx, rank_kv, prompt, None)
-                        .map(|_| ())
-                },
-            )?;
-            self.assert_ranks_in_step(&kv)?;
-            let (ctx, suppress_ids) = (&self.ctx, &self.suppress_ids);
-            let mut score = |logits: &mut HiddenStates, start: usize| -> Result<()> {
-                // The same logits a sampled token is scored on: softcapped,
-                // then suppressed.
-                ops::suppress_logits_bf16_in_place(ctx, logits, suppress_ids)
-                    .context("suppression")?;
-                let requests: Vec<LogprobRequest> = (0..logits.seq_len)
-                    .map(|row| LogprobRequest {
-                        row,
-                        picked: prompt[start + row + 1],
-                        top_k,
-                    })
-                    .collect();
-                let scored = pegainfer_sample::token_logprobs_batch(ctx, logits, &requests)
-                    .context("prompt logprobs")?;
-                scores.extend(scored.into_iter().map(Some));
-                Ok(())
-            };
-            self.serve
-                .score_prompt_tower(ctx, &mut tower, &mut score)
-                .context("prompt logprobs")?;
-            echo = Some(PromptEcho {
-                ids: prompt.clone(),
-                logprobs: scores,
-            });
-            Ok(tower.into_logits())
-        } else if let Some(chunk) = self.mix_chunk {
-            // Under the chunk knob a solo prompt walks its own segments too:
-            // residency stays window plus segment whatever the prompt length.
-            self.walk_plain_prompt(&mut kv, &request.request.prompt_tokens, chunk)
-        } else {
-            let resume = kv.local.seq_len();
-            let tokens = &request.request.prompt_tokens[resume..];
-            let logits = self.drive_ranks(
-                Self::rank_payload(&mut kv),
-                |ctx, serve, _arena, core| serve.step(ctx, core, tokens),
-                |state, rank_kv| state.serve.step(&state.ctx, rank_kv, tokens).map(|_| ()),
-            )?;
-            self.assert_ranks_in_step(&kv)?;
-            Ok(logits)
+        // Every failure below lands in `stepped` rather than returning from here,
+        // so the `tp_broken` gate that prices it is what sets its scope: a broken
+        // pair stops the engine, while a single rank — whose `drive_ranks` had no
+        // peer to abort and left `tp_broken` clear — keeps the request-scoped
+        // failure this path has always had.
+        let stepped = 'arm: {
+            if let Some(top_k) = request.request.prompt_logprobs {
+                let prompt = &request.request.prompt_tokens;
+                let mut scores: Vec<Option<TokenLogprob>> = vec![None];
+                // Rank 0's tower and the peers' run at once, so the per-row
+                // readback below — which blocks on rank 0's own collective —
+                // starts only once every rank's tower is in flight.
+                let mut tower = match self.drive_ranks(
+                    Self::rank_payload(&mut kv),
+                    |ctx, serve, _arena, core| serve.launch_prompt_tower(ctx, core, prompt),
+                    |state, rank_kv| {
+                        state
+                            .serve
+                            .step_scoring(&state.ctx, rank_kv, prompt, None)
+                            .map(|_| ())
+                    },
+                ) {
+                    Ok(tower) => tower,
+                    Err(err) => break 'arm Err(err),
+                };
+                if let Err(err) = self.assert_ranks_in_step(&kv) {
+                    break 'arm Err(err);
+                }
+                let (ctx, suppress_ids) = (&self.ctx, &self.suppress_ids);
+                let mut score = |logits: &mut HiddenStates, start: usize| -> Result<()> {
+                    // The same logits a sampled token is scored on: softcapped,
+                    // then suppressed.
+                    ops::suppress_logits_bf16_in_place(ctx, logits, suppress_ids)
+                        .context("suppression")?;
+                    let requests: Vec<LogprobRequest> = (0..logits.seq_len)
+                        .map(|row| LogprobRequest {
+                            row,
+                            picked: prompt[start + row + 1],
+                            top_k,
+                        })
+                        .collect();
+                    let scored = pegainfer_sample::token_logprobs_batch(ctx, logits, &requests)
+                        .context("prompt logprobs")?;
+                    scores.extend(scored.into_iter().map(Some));
+                    Ok(())
+                };
+                if let Err(err) = self
+                    .serve
+                    .score_prompt_tower(ctx, &mut tower, &mut score)
+                    .context("prompt logprobs")
+                {
+                    break 'arm Err(err);
+                }
+                echo = Some(PromptEcho {
+                    ids: prompt.clone(),
+                    logprobs: scores,
+                });
+                Ok(tower.into_logits())
+            } else if let Some(chunk) = self.mix_chunk {
+                // Under the chunk knob a solo prompt walks its own segments too:
+                // residency stays window plus segment whatever the prompt length.
+                self.walk_plain_prompt(&mut kv, &request.request.prompt_tokens, chunk)
+            } else {
+                let resume = kv.local.seq_len();
+                let tokens = &request.request.prompt_tokens[resume..];
+                let logits = match self.drive_ranks(
+                    Self::rank_payload(&mut kv),
+                    |ctx, serve, _arena, core| serve.step(ctx, core, tokens),
+                    |state, rank_kv| state.serve.step(&state.ctx, rank_kv, tokens).map(|_| ()),
+                ) {
+                    Ok(logits) => logits,
+                    Err(err) => break 'arm Err(err),
+                };
+                if let Err(err) = self.assert_ranks_in_step(&kv) {
+                    break 'arm Err(err);
+                }
+                Ok(logits)
+            }
         };
         let mut logits = match stepped {
             Ok(logits) => logits,

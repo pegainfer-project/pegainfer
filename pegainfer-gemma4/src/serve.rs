@@ -1182,13 +1182,15 @@ impl GemmaServe {
         self.tp_comm = Some(comm);
     }
 
-    /// Take the communicator out, dropping — and so aborting — it. A cudarc
-    /// NCCL comm aborts on drop, which unblocks a peer already waiting on a
-    /// call this rank will never issue. Call it once the pair's collective
-    /// sequence is broken beyond repair; a comm-less step would otherwise
-    /// reduce to a no-op, so the engine must stop afterwards.
-    pub(crate) fn detach_tp_comm(&mut self) -> Option<TpComm> {
-        self.tp_comm.take()
+    /// Fail this rank's communicator. Reachable without borrowing the serve —
+    /// the engine holds its own handle — which is what lets the scheduler abort
+    /// a peer's communicator while that peer is inside a collective. A
+    /// comm-less step would otherwise reduce to a no-op, so the engine must
+    /// stop afterwards.
+    pub(crate) fn abort_tp_comm(&self) {
+        if let Some(comm) = self.tp_comm.as_ref() {
+            comm.abort();
+        }
     }
 
     /// The global family's prefill, through whichever kernel this engine was

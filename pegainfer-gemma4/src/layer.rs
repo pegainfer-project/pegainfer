@@ -30,7 +30,73 @@ use crate::weights::LinearScratch;
 
 /// The NCCL communicator of this rank's tensor-parallel group, or `None` at
 /// world size 1, where every collective is a no-op.
-pub(crate) type TpComm = cudarc::nccl::safe::Comm;
+///
+/// Shareable so that the engine can abort a rank's communicator from its own
+/// thread — a peer stuck inside a collective is unblocked by aborting *its*
+/// communicator, which is local to it, rather than by the near end aborting and
+/// hoping the far end notices. `ncclCommAbort` is documented as callable at any
+/// time from any thread to fail the communicator's pending and future
+/// operations, which is what makes the sharing sound; aborting drops the inner
+/// `Comm`, whose own `Drop` is what calls it, so nothing aborts twice.
+#[derive(Clone)]
+pub(crate) struct TpComm(std::sync::Arc<TpCommSlot>);
+
+struct TpCommSlot {
+    /// `None` once aborted, which is also what makes the abort idempotent and
+    /// what makes every reduction after it refuse rather than run comm-less.
+    comm: std::sync::Mutex<Option<cudarc::nccl::safe::Comm>>,
+}
+
+// SAFETY: the mutex is the only way either thread reaches the communicator, and
+// it is held for one enqueue — not across the collective — so the outer `abort`
+// can take and drop the `Comm` while a reduction it started is still running.
+// That concurrent abort is exactly what NCCL's contract allows, and the rank
+// that *uses* the communicator is still exactly one thread at a time.
+unsafe impl Send for TpCommSlot {}
+unsafe impl Sync for TpCommSlot {}
+
+impl TpComm {
+    pub(crate) fn new(comm: cudarc::nccl::safe::Comm) -> Self {
+        Self(std::sync::Arc::new(TpCommSlot {
+            comm: std::sync::Mutex::new(Some(comm)),
+        }))
+    }
+
+    /// Sum this rank's buffer across the group. The lock covers the enqueue
+    /// only, so a concurrent `abort` cannot be held off by a running kernel.
+    pub(crate) fn all_reduce_in_place<T>(
+        &self,
+        buff: &mut impl cudarc::driver::DevicePtrMut<T>,
+        op: &cudarc::nccl::safe::ReduceOp,
+    ) -> Result<()>
+    where
+        T: cudarc::nccl::safe::NcclType,
+    {
+        let guard = self
+            .0
+            .comm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let comm = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the communicator was aborted"))?;
+        comm.all_reduce_in_place(buff, op)
+            .map_err(|e| anyhow::anyhow!("gemma4 tensor-parallel all-reduce failed: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Fail every pending and future operation on this rank. Idempotent, and
+    /// callable from any thread.
+    pub(crate) fn abort(&self) {
+        let taken = self
+            .0
+            .comm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(taken);
+    }
+}
 
 /// The geometry a layer runs at, read off the validated config — the local
 /// and global kinds differ only in head width and KV head count.
@@ -290,8 +356,7 @@ fn all_reduce_rows(
     comm.all_reduce_in_place(
         &mut buf.data.slice_mut(..elems),
         &cudarc::nccl::safe::ReduceOp::Sum,
-    )
-    .map_err(|e| anyhow::anyhow!("gemma4 tensor-parallel all-reduce failed: {e:?}"))?;
+    )?;
     Ok(())
 }
 
