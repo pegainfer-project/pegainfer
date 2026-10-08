@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use pegainfer_core::tensor::DeviceContext;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
@@ -678,11 +679,9 @@ const PREFIX_CONTROL_FLOOR: f32 = 0.10;
 fn an_aborted_communicator_refuses_the_next_reduction() {
     let (device, peer) = devices();
     assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
-    let contexts: Vec<crate::tensor::DeviceContext> = [device, peer]
+    let contexts: Vec<DeviceContext> = [device, peer]
         .into_iter()
-        .map(|ordinal| {
-            crate::tensor::DeviceContext::new_with_device(ordinal).expect("a device context")
-        })
+        .map(|ordinal| DeviceContext::new_with_device(ordinal).expect("a device context"))
         .collect();
     let comms = cudarc::nccl::safe::Comm::from_devices(
         contexts
