@@ -226,10 +226,12 @@ fn probe_attention(text_config: &serde_json::Value) -> Result<()> {
     }
 
     // The GDN gated-norm activation. This is a *live* field on this checkpoint:
-    // upstream passes it straight to the gated RMSNorm. The in-tree gated norm
-    // hardcodes silu, so serving `sigmoid` needs the kernel change tracked in the
-    // bring-up issue — until that lands, `launch` refuses rather than computing
-    // 36 layers with the wrong activation.
+    // upstream passes it straight to the gated RMSNorm. #1129 made the shared
+    // kernel selectable (`rms_norm_gated_sigmoid_cuda` beside Qwen3.5's SiLU),
+    // so both activations are compilable; what this line lacks until its text
+    // graph lands is the call site. The pin stays fail-closed: the frozen
+    // checkpoint is sigmoid, and no silu-gated `qwen4_exp` variant has golden
+    // fixtures on this line.
     let gate = text_config
         .get("output_gate_type")
         .and_then(serde_json::Value::as_str);
@@ -237,19 +239,43 @@ fn probe_attention(text_config: &serde_json::Value) -> Result<()> {
         bail!("qwen4_exp: output_gate_type must be sigmoid, got {gate:?}");
     }
 
-    // The indexer is a second, differently-shaped attention; its geometry is a
-    // width, but a compress ratio of zero would make the block budget meaningless.
-    for field in ["indexer_n_heads", "indexer_kv_heads", "indexer_head_dim"] {
+    // The indexer is a second, differently-shaped attention. The reference's
+    // own `validate_architecture` (configuration_qwen4_exp.py:213-231) requires
+    // all five QSA fields positive, `indexer_kv_heads == 1`, and the budget to
+    // be a whole multiple of the compress ratio; a config the reference itself
+    // refuses cannot be served by any port of it.
+    for field in [
+        "indexer_n_heads",
+        "indexer_kv_heads",
+        "indexer_head_dim",
+        "indexer_budget",
+        "indexer_compress_ratio",
+    ] {
         let v = text_config.get(field).and_then(serde_json::Value::as_u64);
         if v.is_none_or(|v| v == 0) {
             bail!("qwen4_exp: {field} must be a positive integer, got {v:?}");
         }
     }
-    for field in ["indexer_budget", "indexer_compress_ratio"] {
-        let v = text_config.get(field).and_then(serde_json::Value::as_u64);
-        if v.is_none_or(|v| v == 0) {
-            bail!("qwen4_exp: {field} must be a positive integer, got {v:?}");
-        }
+    let kv_heads = text_config
+        .get("indexer_kv_heads")
+        .and_then(serde_json::Value::as_u64);
+    if kv_heads != Some(1) {
+        bail!(
+            "qwen4_exp: indexer_kv_heads must be 1 (the reference QSA requires it), got {kv_heads:?}"
+        );
+    }
+    let budget = text_config
+        .get("indexer_budget")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ratio = text_config
+        .get("indexer_compress_ratio")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if !budget.is_multiple_of(ratio) {
+        bail!(
+            "qwen4_exp: indexer_budget {budget} must be divisible by indexer_compress_ratio {ratio}"
+        );
     }
     Ok(())
 }
@@ -280,13 +306,25 @@ fn probe_moe(text_config: &serde_json::Value) -> Result<()> {
 }
 
 /// The residual stream is `hc_count` copies of hidden, so the branch count is a
-/// width — but it must be present and positive, and the low-rank mix must be.
+/// width — but the reference's own `validate_architecture` refuses `hc_count <= 1`
+/// (configuration_qwen4_exp.py:196): with a single branch there is nothing to
+/// mix and the mixer tensors degenerate. A config the reference refuses cannot
+/// be served by any port of it.
 fn probe_hyper_connections(text_config: &serde_json::Value) -> Result<()> {
-    for field in ["hc_count", "hc_lowrank"] {
-        let v = text_config.get(field).and_then(serde_json::Value::as_u64);
-        if v.is_none_or(|v| v == 0) {
-            bail!("qwen4_exp: {field} must be a positive integer, got {v:?}");
-        }
+    let hc_count = text_config
+        .get("hc_count")
+        .and_then(serde_json::Value::as_u64);
+    match hc_count {
+        Some(count) if count > 1 => {}
+        other => bail!(
+            "qwen4_exp: hc_count must be an integer > 1 (a single-branch residual stream has nothing to mix), got {other:?}"
+        ),
+    }
+    let lowrank = text_config
+        .get("hc_lowrank")
+        .and_then(serde_json::Value::as_u64);
+    if lowrank.is_none_or(|v| v == 0) {
+        bail!("qwen4_exp: hc_lowrank must be a positive integer, got {lowrank:?}");
     }
     Ok(())
 }
@@ -307,11 +345,38 @@ fn probe_ple(text_config: &serde_json::Value) -> Result<()> {
     if ids.is_empty() {
         bail!("qwen4_exp: ple_layer_ids is empty");
     }
+    // This crate derives one n-gram table, and the reference primes head `i` of
+    // PLE layer `L` at the global index `L * ngram_heads + i`
+    // (modeling_qwen4_exp.py:1037-1039): a second PLE layer's table is a
+    // different prime run, not a copy of the first. Until per-layer tables are
+    // modelled, refuse rather than derive the layer-0 geometry for all of them.
+    // (The reference also dedups and sorts the list, so even `[2, 2]` is one
+    // layer upstream — refusing it is the fail-closed reading.)
+    if ids.len() != 1 {
+        bail!(
+            "qwen4_exp: exactly one ple_layer_ids entry is modelled (each PLE layer needs its own n-gram table, its prime run offset by the layer index), got {ids:?}"
+        );
+    }
+    let layer_types = text_config
+        .get("layer_types")
+        .and_then(serde_json::Value::as_array);
     for entry in ids {
         let id = entry.as_u64().unwrap_or(0);
         if id < 1 || id > layers {
             bail!(
                 "qwen4_exp: ple_layer_ids entry {id} is outside 1..={layers} (the field is 1-indexed)"
+            );
+        }
+        // The reference supports PLE only on linear_attention layers
+        // (configuration_qwen4_exp.py:248-254). `layer_types` is guaranteed
+        // present and `num_hidden_layers`-long by `probe_layer_types`, which
+        // runs first, so the subscript is in bounds for a range-valid id.
+        let kind = layer_types
+            .and_then(|types| types.get(id as usize - 1))
+            .and_then(serde_json::Value::as_str);
+        if kind != Some("linear_attention") {
+            bail!(
+                "qwen4_exp: ple_layer_ids entry {id} sits on a {kind:?} layer, but PLE is only supported on linear_attention layers"
             );
         }
     }
@@ -375,6 +440,15 @@ fn probe_rope(text_config: &serde_json::Value) -> Result<()> {
             "qwen4_exp: rope_parameters.rope_type must be default, got {rope_type:?} — a YaRN variant is not served by this line"
         );
     }
+    // The reference reads the rope base from this same nested object with a
+    // direct index (modeling_qwen4_exp.py:108: `config.rope_parameters["rope_theta"]`),
+    // so a theta it would KeyError on is refused here, and `RopeParameters`
+    // carries it — no consumer may re-read `config.json` for it, the same
+    // second-source rule `num_experts_per_tok` follows.
+    let theta = rope.get("rope_theta").and_then(serde_json::Value::as_f64);
+    if theta.is_none_or(|t| !t.is_finite() || t <= 0.0) {
+        bail!("qwen4_exp: rope_parameters.rope_theta must be a positive number, got {theta:?}");
+    }
     // Every rope value the reference uses comes from this nested object
     // (`modeling_qwen4_exp.py` reads `config.rope_parameters["rope_theta"]` and
     // `[..., "partial_rotary_factor"]`), and `Config` models it from here, so
@@ -422,6 +496,19 @@ fn probe_rope(text_config: &serde_json::Value) -> Result<()> {
     if rotary == 0 || (head_dim as f64 * partial).fract() != 0.0 {
         bail!(
             "qwen4_exp: partial_rotary_factor {partial} x head_dim {head_dim} is not a whole number of rotary dimensions"
+        );
+    }
+    // The reference requires the rotary width to fit the QSA index head
+    // (configuration_qwen4_exp.py:227); the frozen config's 64 rotary dims fit
+    // its 128-wide index head. `indexer_head_dim` is positive by
+    // `probe_attention`, which runs first.
+    let indexer_head_dim = text_config
+        .get("indexer_head_dim")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if rotary > indexer_head_dim {
+        bail!(
+            "qwen4_exp: rotary_dim {rotary} exceeds indexer_head_dim {indexer_head_dim} — the rotary width must fit the QSA index head"
         );
     }
     Ok(())
@@ -472,8 +559,10 @@ mod tests {
     /// line accepting any other family's identity would be a routing regression
     /// in that family rather than in this one. This is the half of "the existing
     /// lines' routing is unchanged" that this crate can prove on its own; the
-    /// other half — that no existing line claims `qwen4_exp` — is pinned by the
-    /// `feature_gate_hint` tests in `pegainfer-server`.
+    /// other half — that no existing line claims `qwen4_exp` — rests on each
+    /// line's own hard identity gate plus the registry's `Conflict` error, and
+    /// the `feature_gate_hint` tests in `pegainfer-server` pin that the hint
+    /// table does not cross-map the two Qwen families.
     #[test]
     fn no_other_lines_identity_is_accepted() {
         for model_type in [
@@ -704,5 +793,65 @@ mod tests {
     fn a_zero_vocabulary_bails() {
         let err = err(|c| text(c, "vocab_size", serde_json::json!(0)));
         assert!(err.contains("vocab_size"), "{err}");
+    }
+
+    #[test]
+    fn a_single_branch_residual_stream_bails() {
+        // The reference refuses hc_count <= 1 (configuration_qwen4_exp.py:196);
+        // a port that accepted it would serve a mixer with nothing to mix.
+        let err = err(|c| text(c, "hc_count", serde_json::json!(1)));
+        assert!(err.contains("hc_count"), "{err}");
+    }
+
+    #[test]
+    fn an_indexer_kv_heads_above_one_bails() {
+        let err = err(|c| text(c, "indexer_kv_heads", serde_json::json!(2)));
+        assert!(err.contains("indexer_kv_heads"), "{err}");
+    }
+
+    #[test]
+    fn an_indexer_budget_not_divisible_by_the_compress_ratio_bails() {
+        let err = err(|c| text(c, "indexer_budget", serde_json::json!(2049)));
+        assert!(err.contains("indexer_budget"), "{err}");
+    }
+
+    #[test]
+    fn a_rotary_width_past_the_indexer_head_bails() {
+        // The frozen 64 rotary dims (0.25 x 256) fit the 128-wide index head;
+        // a 32-wide one does not (configuration_qwen4_exp.py:227).
+        let err = err(|c| text(c, "indexer_head_dim", serde_json::json!(32)));
+        assert!(err.contains("indexer_head_dim"), "{err}");
+    }
+
+    #[test]
+    fn a_multi_layer_ple_bails() {
+        // The reference offsets each PLE layer's prime run by its layer index
+        // (modeling_qwen4_exp.py:1037-1039); this crate derives one table, so a
+        // second layer's geometry would be wrong rather than merely unmodelled.
+        let err = err(|c| text(c, "ple_layer_ids", serde_json::json!([2, 6])));
+        assert!(err.contains("ple_layer_ids"), "{err}");
+    }
+
+    #[test]
+    fn ple_on_a_full_attention_layer_bails() {
+        // Under interval 4, 1-indexed layer 4 is full attention; the reference
+        // supports PLE only on linear_attention layers
+        // (configuration_qwen4_exp.py:248-254).
+        let err = err(|c| text(c, "ple_layer_ids", serde_json::json!([4])));
+        assert!(err.contains("linear_attention"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_rope_theta_bails() {
+        // The reference indexes rope_parameters["rope_theta"] directly
+        // (modeling_qwen4_exp.py:108); a config without it is unservable there,
+        // so it is refused here rather than parsed into a half-modelled rope.
+        let err = err(|c| {
+            c["text_config"]["rope_parameters"]
+                .as_object_mut()
+                .unwrap()
+                .remove("rope_theta");
+        });
+        assert!(err.contains("rope_theta"), "{err}");
     }
 }
