@@ -662,7 +662,13 @@ const PREFIX_LINE: f32 = 12.0;
 /// the single-rank control's own reading. `serve_oracle` derives its lines the
 /// same way when it can afford the control arm — a ratio with a floor, so a
 /// control that happened to read exactly zero cannot tighten the bound to
-/// nothing. Both are set from this gate's own readings.
+/// nothing.
+///
+/// Measured on the 12B at the window width (512 vs 1024 tokens): the control
+/// reads **6.30** nat and the two-rank arm **9.23**, a ratio of **1.46** — the
+/// two-rank drift at that depth is the same phenomenon, not a multiple of it.
+/// The ratio is 2.0 rather than 1.5 so a re-run's scatter does not flake the
+/// gate; the absolute `PREFIX_LINE` cannot see either reading.
 const PREFIX_CONTROL_RATIO: f32 = 2.0;
 const PREFIX_CONTROL_FLOOR: f32 = 0.10;
 
@@ -779,12 +785,13 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     /// different attention backend, nothing structural.
     const DRIFT_LINE: f32 = 1.0;
     // Only the nine-token case is gated. The 1024-token "edge" case runs (the
-    // concurrent driver carries it), but at window width its drift is the
-    // shape-dependent chaos `serve_oracle`'s `neutral_scale` already measures at
-    // 0.31..5.75 raw logits — worst shared-token logprob gap 8.37 here — so a
-    // strict top-k containment cannot hold and the case needs that gate's
-    // tolerance-plus-top-1-share discipline. See docs/models/gemma4/tp.md "Known
-    // bounds"; the calibration is the follow-up.
+    // concurrent driver carries it) but fails: at window width the engine reads
+    // beyond the same-workload band this repo calibrates — 8.37 on the shared
+    // tokens here — and the length, not the second rank, is the variable (a
+    // one-rank arm disagrees with itself across the window too: see
+    // `...within_a_single_rank_control` and docs/models/gemma4/tp.md "Known
+    // bounds"). So the case is an open defect, not a chaos budget to widen the
+    // line for; anchoring it against the HF dump is the follow-up.
     const CASES: [&str; 1] = ["short"];
 
     let (device, peer) = devices();
