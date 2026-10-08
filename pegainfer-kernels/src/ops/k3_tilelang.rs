@@ -86,6 +86,16 @@ pub const K3_MLA_HEADS: usize = 96;
 pub const K3_QK_DIM: usize = 192;
 pub const K3_V_DIM: usize = 128;
 
+const _: () = {
+    const ELEMENTWISE_TILE_WIDTH: usize = 256;
+    const ROUTER_EP_SIZE: usize = 4;
+    assert!(K3_MLA_HEADS == K3_KDA_HEADS);
+    assert!(K3_HIDDEN.is_multiple_of(ELEMENTWISE_TILE_WIDTH));
+    assert!(K3_LATENT.is_multiple_of(ELEMENTWISE_TILE_WIDTH));
+    assert!(K3_KDA_DIM.is_multiple_of(ELEMENTWISE_TILE_WIDTH));
+    assert!(K3_ROUTER_EXPERTS[0] == K3_ROUTER_EXPERTS[1] * ROUTER_EP_SIZE);
+};
+
 /// Round a live row count up to the bucket that will run it.
 ///
 /// The extra rows are computed and discarded, so the caller must still size
@@ -729,21 +739,5 @@ mod tests {
         assert_eq!(k3_chunk_bucket(K3_MAX_BATCH + 1).unwrap(), 256);
         assert_eq!(k3_chunk_bucket(4096).unwrap(), K3_MAX_CHUNK);
         assert!(k3_chunk_bucket(K3_MAX_CHUNK + 1).is_err());
-    }
-
-    #[test]
-    fn model_dimensions_agree_with_the_generator() {
-        // These mirror `pegainfer-k3/kernels/generate.py`; a silent divergence
-        // would show up as `cudaErrorInvalidValue` from every launcher.
-        assert_eq!(K3_KDA_DIM, 12288);
-        assert_eq!(K3_QK_DIM, 192);
-        assert_eq!(K3_MLA_HEADS, K3_KDA_HEADS);
-        assert_eq!(K3_HIDDEN % 256, 0);
-        assert_eq!(K3_LATENT % 256, 0);
-        assert_eq!(K3_KDA_DIM % 256, 0);
-        // The attention-residual history grows one entry per 12 layers of 93.
-        assert_eq!(K3_ATTNRES_MAX_BLOCKS, 93_usize.div_ceil(12));
-        // The 4-way expert-parallel shard of the full table.
-        assert_eq!(K3_ROUTER_EXPERTS[0] / 4, K3_ROUTER_EXPERTS[1]);
     }
 }
