@@ -35,6 +35,7 @@ pub(crate) fn request(
 ) -> Request {
     Request {
         prompt_tokens,
+        history_tokens: None,
         stop_policy: StopPolicy::new(
             if params.ignore_eos {
                 EosPolicy::Ignore

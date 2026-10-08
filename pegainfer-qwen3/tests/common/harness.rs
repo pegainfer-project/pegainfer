@@ -50,6 +50,7 @@ pub(crate) fn request(
     Request {
         prompt_tokens,
         params,
+        history_tokens: None,
         stop_policy,
         max_tokens,
         lora_adapter: None,

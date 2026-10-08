@@ -58,6 +58,7 @@ use crate::engine::SchedulerHandle;
 use crate::engine::StepOutputs;
 use crate::engine::StopCause;
 use crate::engine::Terminal;
+use crate::vllm::history::GENERATION_PROMPT_TOKENS;
 use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
 use crate::vllm::wire::convert_stop_policy;
@@ -386,11 +387,19 @@ impl SteppedEngineBridge {
                 );
             }
         };
-        let kv_transfer_params = sampling_params
-            .extra_args
-            .as_ref()
-            .and_then(|args| args.get("kv_transfer_params"))
-            .cloned();
+        let extra_arg = |key: &str| {
+            sampling_params
+                .extra_args
+                .as_ref()
+                .and_then(|args| args.get(key))
+        };
+        let kv_transfer_params = extra_arg("kv_transfer_params").cloned();
+        // The chat layer measured the generation prompt's token count at the
+        // tail of a prompt only it saw as text; a count the prompt cannot hold
+        // is no boundary.
+        let history_tokens = extra_arg(GENERATION_PROMPT_TOKENS)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|tail| prompt_tokens.len().checked_sub(tail as usize));
         // Older stepped model producers still suppress their terminal token
         // and report only `FinishReason::Stop`. Keep the legacy sentinel for
         // that producer shape; typed stop causes carry the real token and do
@@ -417,6 +426,7 @@ impl SteppedEngineBridge {
             // producers that have not migrated to StopPolicy. Qwen3 uses the
             // independent policy below for stop classification.
             params: convert_sampling(&sampling_params),
+            history_tokens,
             stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
             lora_adapter,
@@ -671,6 +681,7 @@ mod tests {
         Request {
             prompt_tokens: vec![1, 2],
             params: crate::sampler::SamplingParams::default(),
+            history_tokens: None,
             stop_policy: StopPolicy::default(),
             max_tokens: 1,
             lora_adapter: None,

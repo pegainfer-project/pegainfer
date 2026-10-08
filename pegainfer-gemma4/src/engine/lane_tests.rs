@@ -66,6 +66,7 @@ impl Harness {
                     ignore_eos: true,
                     ..pegainfer_frontend::sampler::SamplingParams::default()
                 },
+                history_tokens: None,
                 stop_policy: pegainfer_frontend::engine::StopPolicy::default(),
                 max_tokens,
                 lora_adapter: None,

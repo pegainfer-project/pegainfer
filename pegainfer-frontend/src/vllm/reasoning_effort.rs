@@ -52,19 +52,19 @@ use vllm_chat::ChatMessage;
 use vllm_chat::ChatOptions;
 use vllm_chat::ChatRequest;
 use vllm_chat::ChatRole;
+use vllm_chat::DynChatRenderer;
 use vllm_chat::EffortValue;
-use vllm_chat::LoadModelBackendsOptions;
+use vllm_chat::LoadedModelBackends;
 use vllm_chat::ResolvedToolContext;
 use vllm_chat::SamplingParams;
-use vllm_chat::load_model_backends;
 use vllm_text::TextDecodeOptions;
 
 /// Only the chat route reads `reasoning_effort`.
-const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+pub(super) const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
 /// Matches [`crate::vllm::lora`]'s route limit: the body is buffered to be
 /// rewritten, and an oversized request must not be silently truncated.
-const BODY_LIMIT: usize = 128 * 1024 * 1024;
+pub(super) const BODY_LIMIT: usize = 128 * 1024 * 1024;
 
 /// Semantic candidate rewrites between the OpenAI vocabulary and a template's
 /// own words. Which of them are active is decided per deployment by
@@ -94,24 +94,20 @@ pub(crate) type EffortAliases = Arc<[(&'static str, &'static str)]>;
 /// Qwen3.8-class save records the `output_gate_type` marker in its
 /// `config.json`; for anything else — other lines, or a path with no local
 /// config at all (e.g. a HuggingFace id) — the probe is skipped entirely and
-/// the mapping stays off.
-pub(crate) async fn probe_effort_aliases(model_path: &str) -> EffortAliases {
+/// the mapping stays off. So is it without loaded backends: without a
+/// readable template verdict there is no justification to rewrite anything.
+pub(crate) fn probe_effort_aliases(
+    model_path: &str,
+    backends: Option<&LoadedModelBackends>,
+) -> EffortAliases {
     if !probe_warranted(model_path) {
         return Vec::new().into();
     }
-    let aliases: Vec<_> = match probe_template(model_path).await {
-        Ok(aliases) => aliases,
-        Err(error) => {
-            // Fail safe: without a readable template verdict there is no
-            // justification to rewrite anything. The server loads its own
-            // backends afterwards and reports its own error if the model is
-            // genuinely broken.
-            warn!(
-                "reasoning_effort mapping disabled: template probe failed for {model_path}: {error}"
-            );
-            Vec::new()
-        }
+    let Some(backends) = backends else {
+        warn!("reasoning_effort mapping disabled: no loaded template to probe for {model_path}");
+        return Vec::new().into();
     };
+    let aliases = probe_template(&backends.chat_backend.chat_renderer());
     if !aliases.is_empty() {
         info!("reasoning_effort mapping for {model_path}: {aliases:?}");
     }
@@ -150,30 +146,21 @@ fn probe_warranted(model_path: &str) -> bool {
     text.get("output_gate_type").is_some()
 }
 
-/// Render one minimal request per candidate value through the same vendored
-/// stack the server uses, and keep the aliases whose source the template
-/// rejects while its target is accepted.
-async fn probe_template(model_path: &str) -> vllm_chat::Result<Vec<(&'static str, &'static str)>> {
-    let backends = load_model_backends(
-        model_path,
-        LoadModelBackendsOptions {
-            language_model_only: true,
-            ..Default::default()
-        },
-    )
-    .await?;
-    let renderer = backends.chat_backend.chat_renderer();
+/// Render one minimal request per candidate value through the renderer the
+/// server uses, and keep the aliases whose source the template rejects while
+/// its target is accepted.
+fn probe_template(renderer: &DynChatRenderer) -> Vec<(&'static str, &'static str)> {
     let values = probe_values();
     let mut accepted: Vec<(&str, bool)> = Vec::with_capacity(values.len());
     for value in values {
         accepted.push((value, renderer.render(&probe_request(value)).is_ok()));
     }
     let accepts = |value: &str| accepted.iter().any(|&(probed, ok)| probed == value && ok);
-    Ok(CANDIDATE_ALIASES
+    CANDIDATE_ALIASES
         .iter()
         .filter(|(from, to)| !accepts(from) && accepts(to))
         .copied()
-        .collect())
+        .collect()
 }
 
 /// The smallest request that carries one `reasoning_effort` value: a single
@@ -243,7 +230,7 @@ async fn normalize_request(
 /// which is not exported), keeping both the status category and the cause.
 /// 413 belongs to the length-limit rejection alone; any other read failure
 /// keeps the 400 this route reported before the layer existed.
-fn body_read_error(error: AxumError) -> Response {
+pub(super) fn body_read_error(error: AxumError) -> Response {
     let message = format!("failed to read the chat request body: {error}");
     let status = if error.into_inner().is::<LengthLimitError>() {
         StatusCode::PAYLOAD_TOO_LARGE
@@ -299,6 +286,9 @@ pub(crate) fn rewrite_reasoning_effort(
 
 #[cfg(test)]
 mod tests {
+    use vllm_chat::LoadModelBackendsOptions;
+    use vllm_chat::load_model_backends;
+
     use super::*;
 
     const ALL_ALIASES: &[(&str, &str)] = CANDIDATE_ALIASES;
@@ -420,12 +410,24 @@ mod tests {
         dir.path().to_str().expect("utf-8 temp path")
     }
 
+    async fn renderer_of(dir: &tempfile::TempDir) -> DynChatRenderer {
+        load_model_backends(
+            path_of(dir),
+            LoadModelBackendsOptions {
+                language_model_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the tiny fixture loads")
+        .chat_backend
+        .chat_renderer()
+    }
+
     #[tokio::test]
     async fn the_probe_arms_every_alias_for_the_stock_guarded_template() {
         let dir = probe_dir(GUARDED_TEMPLATE, true);
-        let aliases = probe_template(path_of(&dir))
-            .await
-            .expect("the probe renders the tiny fixture");
+        let aliases = probe_template(&renderer_of(&dir).await);
         assert_eq!(
             aliases.as_slice(),
             [("high", "xhigh"), ("max", "xhigh"), ("minimal", "low")]
@@ -437,9 +439,7 @@ mod tests {
         // Same marked config, custom template that accepts high/max: only
         // minimal (rejected, with low accepted) may be rewritten.
         let dir = probe_dir(ACCEPTING_TEMPLATE, true);
-        let aliases = probe_template(path_of(&dir))
-            .await
-            .expect("the probe renders the tiny fixture");
+        let aliases = probe_template(&renderer_of(&dir).await);
         assert_eq!(aliases.as_slice(), [("minimal", "low")]);
     }
 
@@ -447,13 +447,13 @@ mod tests {
     async fn the_probe_is_skipped_without_the_marker_or_a_local_config() {
         let unmarked = probe_dir(GUARDED_TEMPLATE, false);
         assert!(
-            probe_effort_aliases(path_of(&unmarked)).await.is_empty(),
+            probe_effort_aliases(path_of(&unmarked), None).is_empty(),
             "an unmarked save keeps the caller's values verbatim"
         );
 
         let missing = "/nonexistent/hf-model-id";
         assert!(
-            probe_effort_aliases(missing).await.is_empty(),
+            probe_effort_aliases(missing, None).is_empty(),
             "a path with no local config (an HF id) is not an error"
         );
     }

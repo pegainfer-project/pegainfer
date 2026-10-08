@@ -216,6 +216,7 @@ fn ceiling_probe(prompt_len: usize, prompt_logprobs: Option<usize>) -> Request {
     Request {
         prompt_tokens: ids(prompt_len, 9),
         params: pegainfer_frontend::sampler::SamplingParams::default(),
+        history_tokens: None,
         stop_policy: pegainfer_frontend::engine::StopPolicy::default(),
         max_tokens: 4,
         lora_adapter: None,

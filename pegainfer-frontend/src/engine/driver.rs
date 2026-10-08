@@ -165,6 +165,7 @@ mod tests {
         Request {
             prompt_tokens: vec![1, 2],
             params: crate::sampler::SamplingParams::default(),
+            history_tokens: None,
             stop_policy: StopPolicy::default(),
             max_tokens,
             lora_adapter: None,

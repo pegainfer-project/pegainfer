@@ -73,6 +73,8 @@ pegainfer-frontend
     ├── bridge/stepped.rs  # SteppedEngineBridge: StepOutputs -> EngineCore messages
     ├── wire.rs        #   EngineCoreSamplingParams <-> SamplingParams translation
     ├── lora.rs        #   /v1/{load,unload}_lora_adapter over LoraClient
+    ├── reasoning_effort.rs  # chat-route reasoning_effort -> the template's vocabulary
+    ├── history.rs     #   chat-route history boundary -> vllm_xargs.generation_prompt_tokens -> Request::history_tokens
     └── request_contract.rs  # GLM5.2 prefill-only route guard
 ```
 

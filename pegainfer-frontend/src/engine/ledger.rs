@@ -404,6 +404,7 @@ mod tests {
         Request {
             prompt_tokens: prompt,
             params: crate::sampler::SamplingParams::default(),
+            history_tokens: None,
             stop_policy: StopPolicy::default(),
             max_tokens: 8,
             lora_adapter: None,

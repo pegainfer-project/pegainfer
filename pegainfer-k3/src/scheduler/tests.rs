@@ -176,6 +176,7 @@ fn request(prompt_len: usize, max_tokens: usize) -> Request {
     Request {
         prompt_tokens: vec![7; prompt_len],
         params: SamplingParams::default(),
+        history_tokens: None,
         stop_policy: StopPolicy::default(),
         max_tokens,
         lora_adapter: None,

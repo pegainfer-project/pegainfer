@@ -719,6 +719,7 @@ mod tests {
         Request {
             prompt_tokens,
             params: SamplingParams::default(),
+            history_tokens: None,
             stop_policy: StopPolicy::default(),
             max_tokens,
             lora_adapter: None,

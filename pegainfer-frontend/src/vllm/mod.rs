@@ -14,7 +14,9 @@ use log::warn;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use vllm_chat::LoadModelBackendsOptions;
 use vllm_chat::ToolStrictLevel;
+use vllm_chat::load_model_backends;
 use vllm_engine_core_client::TransportMode;
 use vllm_server::ApiServerOptions;
 use vllm_server::ChatTemplateContentFormatOption;
@@ -31,6 +33,7 @@ use vllm_text::backend::hf::HfOverrides;
 use crate::engine::LaunchedEngine;
 
 mod bridge;
+mod history;
 mod lora;
 mod reasoning_effort;
 mod request_contract;
@@ -377,9 +380,26 @@ where
         }
     });
 
-    // The effort mapping is derived once at startup from the served checkpoint's
-    // loaded template; checkpoints without the save-time marker skip the probe.
-    let effort_aliases = reasoning_effort::probe_effort_aliases(&model_id).await;
+    // The two request-shaping layers read the served checkpoint's template and
+    // tokenizer, loaded once here; the server loads its own afterwards and
+    // reports its own error if the model is genuinely broken.
+    let backends = match load_model_backends(
+        &model_id,
+        LoadModelBackendsOptions {
+            language_model_only: true,
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(backends) => Some(backends),
+        Err(error) => {
+            warn!("chat request shaping disabled: backends for {model_id} did not load: {error}");
+            None
+        }
+    };
+    let effort_aliases = reasoning_effort::probe_effort_aliases(&model_id, backends.as_ref());
+    let boundary = backends.map(|b| Arc::new(history::Boundary::new(&b)));
 
     let config = Config {
         transport_mode: TransportMode::Bootstrapped {
@@ -436,7 +456,12 @@ where
     };
 
     let result = vllm_server::serve_with_router_extension(config, server_shutdown, move |router| {
-        reasoning_effort::normalize_chat_requests(extend_router(router), effort_aliases)
+        // Effort normalization is outermost so the boundary measures the
+        // template under the value the route will render with.
+        reasoning_effort::normalize_chat_requests(
+            history::mark_history(extend_router(router), boundary),
+            effort_aliases,
+        )
     })
     .await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),
