@@ -691,7 +691,8 @@ const MIX_MAX_PROMPTS: usize = 4;
 
 /// The unchunked follower-gather budget, not a step row ceiling: the
 /// leader's unseen suffix counts against it but the leader itself is never
-/// bounded (a long leader still rides the live decode batch, alone), and
+/// bounded (a long leader still rides the live decode batch, alone — except
+/// under TP, where `TP_MIX_PROMPT_ROWS` bounds it too), and
 /// the chunked walk ignores it — the chunk knob prices rows per step
 /// instead. The trade it bounds: gathering amortizes only the step floor
 /// while every live stream's inter-token gap pays the whole gathered step,
@@ -700,6 +701,16 @@ const MIX_MAX_PROMPTS: usize = 4;
 /// the gather there. Calibration measurements live in the benchmark
 /// records, not here.
 const MIX_GATHER_ROWS: usize = 512;
+
+/// The prompt rows a tensor-parallel mixed step may absorb — the
+/// `PEGAINFER_TP_MAX_PROMPT` default that went with the stall it guarded. The
+/// mixed step is the one TP path no gate covers (`serve::oracle::
+/// mixed_step_matches_serial` is single-rank), and the deleted ceiling was also
+/// what kept a gathered prompt's rows small here, so the bound stays for this
+/// step alone until a gate covers it: a prompt that does not fit beside the
+/// live batch is prefilled on its own instead, exactly as an over-ceiling
+/// prompt was before. At one rank the step is unbounded, as it always was.
+const TP_MIX_PROMPT_ROWS: usize = 64;
 
 fn parse_mix_max_prompts(raw: &str, slots: usize) -> Result<usize> {
     let prompts: usize = raw
@@ -1373,11 +1384,15 @@ impl EngineState {
     /// library load in a GEMM, say — or a readback): by the time rank 0 reaches
     /// it, every peer's collectives are already in flight, so the drain rank 0
     /// waits on can pair — where a single thread that ran rank 0's whole segment
-    /// first would wait on a call it had not yet issued. A rank-0 failure aborts
-    /// every rank's communicator *before* the join, so a peer already inside the
-    /// matching collective is unblocked by its own abort rather than left to
-    /// notice rank 0's. An extra rank's failure is fatal: the ranks' frontiers
-    /// must not drift apart.
+    /// first would wait on a call it had not yet issued.
+    ///
+    /// A failure aborts every rank's communicator *before* the join, whichever
+    /// rank failed: a peer already inside the matching collective is unblocked
+    /// by its own abort rather than left to notice someone else's. Rank 0's
+    /// failure is handled here; an extra rank's is handled by that rank's own
+    /// thread, because rank 0 is the one that would otherwise be waiting and it
+    /// cannot reach this branch while it waits. Either failure is fatal — the
+    /// ranks' frontiers must not drift apart.
     fn drive_ranks<P, T, R, E>(&mut self, payload: Vec<P>, rank0: R, extra: E) -> Result<T>
     where
         P: Send,
@@ -1403,6 +1418,15 @@ impl EngineState {
             extra_comms,
             ..
         } = self;
+        // Every communicator as its own handle, rank 0's first: whichever thread
+        // fails first aborts all of them, because a rank that stops issuing
+        // collectives strands whoever waits on the matching call — and rank 0
+        // cannot reach its own branch below while it waits inside one. Aborting
+        // takes the communicator out of its slot, so two threads reaching for the
+        // same one are harmless.
+        let mut all_comms: Vec<TpComm> = Vec::with_capacity(more.len() + 1);
+        all_comms.extend(serve.tp_comm());
+        all_comms.extend(extra_comms.iter().cloned());
         let mut payload = payload.into_iter();
         let core = payload.next().expect("a rank-0 payload item");
         let twins: Vec<P> = payload.collect();
@@ -1412,20 +1436,46 @@ impl EngineState {
             let mut handles = Vec::with_capacity(more.len());
             for (index, (state, item)) in more.iter_mut().zip(twins).enumerate() {
                 let rank = index + 1;
+                let comms = all_comms.clone();
                 handles.push(scope.spawn(move || -> Result<()> {
                     // This step's thread creates its own cuBLAS handles in
                     // `activate_rank`, and the guard is what destroys them when
                     // the thread ends: the one the scheduler holds covers only
                     // the scheduler's thread, so without it every step would
                     // leave a handle pair's device memory behind.
-                    let _handles = bind_engine_thread(&state.ctx)?;
-                    activate_rank(&state.ctx)?;
-                    extra(state, item)
-                        .with_context(|| format!("tensor-parallel rank {rank} segment"))?;
-                    state
-                        .ctx
-                        .sync()
-                        .with_context(|| format!("drain rank {rank}"))
+                    let outcome = (|| -> Result<()> {
+                        let _handles = bind_engine_thread(&state.ctx)?;
+                        activate_rank(&state.ctx)?;
+                        extra(state, item)
+                            .with_context(|| format!("tensor-parallel rank {rank} segment"))?;
+                        state
+                            .ctx
+                            .sync()
+                            .with_context(|| format!("drain rank {rank}"))
+                    })();
+                    if let Err(err) = outcome {
+                        // Rank 0 keeps launching, so its first host wait now sits
+                        // behind a collective this rank will never issue: nothing
+                        // else can release it, and its own abort branch is
+                        // unreachable until then. Every communicator is aborted
+                        // here, from this thread, for the same reason the rank-0
+                        // branch does it before the join — a peer inside that
+                        // collective is unblocked by aborting *its* communicator.
+                        if select_device(&state.ctx).is_ok() {
+                            state.arena.release_graphs();
+                        } else {
+                            log::error!(
+                                "rank {rank}'s device {} will not come current, so its graphs \
+                                 stay alive across the communicator abort; that abort may wedge",
+                                state.ctx.device_ordinal
+                            );
+                        }
+                        for comm in &comms {
+                            comm.abort();
+                        }
+                        return Err(err);
+                    }
+                    Ok(())
                 }));
             }
             activate_rank(ctx)?;
@@ -1439,6 +1489,15 @@ impl EngineState {
                 // Rank 0's own fields are not borrowed by the threads, and the
                 // peers' communicators are reached through the engine's own
                 // handles rather than their serves.
+                //
+                // The peers' graphs are still alive at this point, because their
+                // arenas live on their threads until the join: this inverts the
+                // release-then-abort order `EngineState::drop` documents, and it
+                // has to. A peer stopped inside a collective cannot be asked to
+                // release its own graphs first, and the abort is the only thing
+                // that gets it out of one — see the known bound in
+                // `docs/models/gemma4/tp.md`, which names this window rather than
+                // claiming the order holds.
                 //
                 // Only with extra ranks: with none there is no collective to
                 // abort and no peer frontier to keep in step, so this stays the
@@ -1501,13 +1560,21 @@ impl EngineState {
         payload
     }
 
-    /// Abort every extra rank's communicator and release its graphs, after a
-    /// failed step has already stopped the engine.
     /// Abort every communicator and release every extra rank's graphs, after a
-    /// failed step has already stopped the engine. Aborting is idempotent, so
-    /// this covers whichever rank failed: the pair is broken either way and no
-    /// later step may run a comm-less reduction.
+    /// failed step. Aborting is idempotent, so this covers whichever rank
+    /// failed: the pair is broken either way, no later step may run a comm-less
+    /// reduction, and every later step refuses. A failed extra rank is fatal
+    /// here for the same reason a failed rank 0 is: the ranks' frontiers must
+    /// not drift apart.
+    ///
+    /// At world size 1 there is no peer to abort, no comm to break and no
+    /// frontier to keep in step, so this leaves the engine alone — the same
+    /// failure stays what it has always been, that one request's.
     fn break_extras(&mut self) {
+        if self.more.is_empty() {
+            return;
+        }
+        self.tp_broken.set(true);
         self.serve.abort_tp_comm();
         for (index, state) in self.more.iter_mut().enumerate() {
             if select_device(&state.ctx).is_ok() {
@@ -1556,6 +1623,13 @@ impl EngineState {
             }
         }
         Ok(())
+    }
+
+    /// The prompt rows a mixed step may absorb under TP, `None` at one rank —
+    /// where the step is unbounded and byte-identical to what it always was. See
+    /// `TP_MIX_PROMPT_ROWS` for why the bound survived the ceiling.
+    fn tp_mixed_prompt_rows(&self) -> Option<usize> {
+        (!self.more.is_empty()).then_some(TP_MIX_PROMPT_ROWS)
     }
 }
 
@@ -2198,7 +2272,13 @@ impl EngineState {
         if !active.is_empty() {
             self.drain_pipeline(active, ledger)?;
         }
-        if !active.is_empty() && !scored {
+        // A prompt whose rows do not fit beside the live batch — which under TP
+        // is `TP_MIX_PROMPT_ROWS` and at one rank nothing — is prefilled on its
+        // own below instead of riding the step.
+        let mixed_fits = self.tp_mixed_prompt_rows().is_none_or(|limit| {
+            prompt_tokens.saturating_sub(kv.local.seq_len()) + active.len() <= limit
+        });
+        if !active.is_empty() && !scored && mixed_fits {
             self.ready_decode_rows(active, ledger);
             if !active.is_empty() {
                 // Gather more admissible prompts into the same step. A
@@ -2210,13 +2290,21 @@ impl EngineState {
                 // queue of dead submissions cannot stall the decode round.
                 // The row pricing runs after the prefix-cache resolve: a
                 // warm candidate costs the step only its unseen suffix.
+                // The gathered rows are a prefill, so under TP `TP_MIX_PROMPT_ROWS`
+                // bounds their sum too, and the live decode rows ride in the same
+                // step — so the gather leaves room for them.
+                let gather_budget = self
+                    .tp_mixed_prompt_rows()
+                    .map_or(self.mix_gather, |limit| {
+                        self.mix_gather.min(limit.saturating_sub(active.len()))
+                    });
                 let mut newcomers: Vec<Newcomer> = vec![(request, kv, resumed)];
                 let mut rows_budget = {
                     let (_, kv, _) = &newcomers[0];
                     prompt_tokens - kv.local.seq_len()
                 };
                 while newcomers.len() < self.mix_max_prompts
-                    && (self.mix_chunk.is_some() || rows_budget < self.mix_gather)
+                    && (self.mix_chunk.is_some() || rows_budget < gather_budget)
                     && newcomers.len() + active.len() < self.slots
                     && *attempts < self.slots
                 {
@@ -2237,7 +2325,7 @@ impl EngineState {
                         max_new_tokens: self
                             .mix_chunk
                             .is_none()
-                            .then(|| self.mix_gather.saturating_sub(rows_budget)),
+                            .then(|| gather_budget.saturating_sub(rows_budget)),
                     };
                     match self.prepare_newcomer(candidate, options, ledger) {
                         PreparedNewcomer::Ready(newcomer, new_tokens) => {

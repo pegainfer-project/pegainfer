@@ -679,7 +679,9 @@ const PREFIX_CONTROL_FLOOR: f32 = 0.10;
 /// `Drop` panic, which is why the wrapper takes the communicator out rather
 /// than leaving the abort to the drop. No checkpoint, so this is the cheap half
 /// of the pair; the engine-level half is
-/// `a_failed_rank_zero_segment_stops_the_engine_at_two_ranks`.
+/// `a_failed_rank_zero_segment_stops_the_engine_at_two_ranks`, and the release
+/// the engine depends on is its own gate beside it,
+/// `an_aborted_communicator_releases_a_waiting_reduction`.
 #[test]
 #[ignore = "needs two GPUs and --test-threads=1"]
 fn an_aborted_communicator_refuses_the_next_reduction() {
@@ -723,6 +725,106 @@ fn an_aborted_communicator_refuses_the_next_reduction() {
             .is_err(),
         "a reduction after the abort must refuse instead of reducing comm-less"
     );
+}
+
+/// The half of the same contract the gate above cannot see. There the pair has
+/// already reduced and synchronized before anything is aborted, so the abort
+/// only has to refuse what comes *next*; the engine aborts a peer's communicator
+/// while that peer is still **inside** a collective (`EngineState::drive_ranks`)
+/// and needs the abort to release it, because nothing else can — the peer's own
+/// thread is the one that is blocked.
+///
+/// So this enqueues a reduction on rank 1 alone, with no matching call from rank
+/// 0, and aborts rank 1 from another thread: the shape a peer is left in when
+/// the other rank's segment stops early. Both halves are bounded, because either
+/// can be the failure — the wait ending is what the engine's `ctx.sync()`
+/// returns on, and an `ncclCommAbort` that never returns would hang the failing
+/// rank's thread before it could report anything. No checkpoint, no engine and
+/// no injection hook.
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1"]
+fn an_aborted_communicator_releases_a_waiting_reduction() {
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let contexts: Vec<DeviceContext> = [device, peer]
+        .into_iter()
+        .map(|ordinal| DeviceContext::new_with_device(ordinal).expect("a device context"))
+        .collect();
+    let comms = cudarc::nccl::safe::Comm::from_devices(
+        contexts
+            .iter()
+            .map(|ctx| ctx.stream.clone())
+            .collect::<Vec<_>>(),
+    )
+    .expect("a two-rank communicator");
+    let ranks: Vec<crate::layer::TpComm> =
+        comms.into_iter().map(crate::layer::TpComm::new).collect();
+    let mut buffers: Vec<_> = contexts
+        .iter()
+        .map(|ctx| ctx.stream.alloc_zeros::<f32>(8).expect("a buffer"))
+        .collect();
+    // The abort runs on a thread of its own, so this thread stays free to watch
+    // the peer's stream; the context is re-bound there by the same call a step's
+    // thread uses.
+    let peer_ctx = DeviceContext {
+        ctx: contexts[1].ctx.clone(),
+        stream: contexts[1].stream.clone(),
+        device_ordinal: contexts[1].device_ordinal,
+    };
+
+    super::select_device(&contexts[1]).expect("the peer's device is current");
+    ranks[1]
+        .all_reduce_in_place(&mut buffers[1], &cudarc::nccl::safe::ReduceOp::Sum)
+        .expect("the enqueue itself succeeds");
+    // The control arm: with no peer call to pair with, the reduction cannot
+    // complete, so what follows measures the abort rather than a reduction that
+    // finished by itself.
+    assert!(
+        stream_waiting(&peer_ctx),
+        "rank 1's unpaired reduction left its stream idle, so this run could not \
+         measure what an abort releases"
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (device_ctx, stream_ctx) = (contexts[1].ctx.clone(), contexts[1].stream.clone());
+    let ordinal = contexts[1].device_ordinal;
+    let aborting_rank = ranks[1].clone();
+    std::thread::spawn(move || {
+        let ctx = DeviceContext {
+            ctx: device_ctx,
+            stream: stream_ctx,
+            device_ordinal: ordinal,
+        };
+        let bound = super::bind_engine_thread(&ctx);
+        if bound.is_ok() {
+            aborting_rank.abort();
+        }
+        let _ = tx.send(bound.map(|_guard| ()));
+    });
+    let released = wait_until(Duration::from_secs(30), || !stream_waiting(&peer_ctx));
+    let aborting = rx.recv_timeout(Duration::from_secs(30));
+    assert!(
+        released,
+        "rank 1's stream was still waiting on a reduction with no peer 30 s after its \
+         communicator was aborted; the engine's failure path relies on that abort releasing a \
+         peer already inside a collective"
+    );
+    assert!(
+        matches!(aborting, Ok(Ok(()))),
+        "aborting rank 1's communicator did not return within 30 s while a collective was in \
+         flight on it ({aborting:?}); the engine calls it from the failing rank's thread, which \
+         would hang there instead of stopping the engine"
+    );
+}
+
+/// Whether `ctx`'s stream still holds a reduction queued — the state a peer waits
+/// in until its communicator is aborted. Any other answer, success or the error a
+/// torn-down collective leaves behind, means the wait is over.
+fn stream_waiting(ctx: &DeviceContext) -> bool {
+    matches!(
+        unsafe { cudarc::driver::sys::cuStreamQuery(ctx.stream.cu_stream()) },
+        cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY
+    )
 }
 
 /// A rank-0 step failure at two ranks must stop the engine promptly, not wedge
@@ -784,12 +886,15 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     /// logits. A shared token may sit this far apart: bf16 reduction order and a
     /// different attention backend, nothing structural.
     const DRIFT_LINE: f32 = 1.0;
-    // Only the nine-token case is asserted: the fixture's own metadata marks
-    // `edge` as carried but not probed (`probed_cases: ["single", "short"]`), and
-    // running it anyway fails a strict top-64 containment on ~5-8 rows — the same
-    // rows with one rank as with two, so it is the depth-dependent drift these
-    // fixtures carry tolerances for, not a two-rank difference. See
-    // docs/models/gemma4/tp.md "Known bounds".
+    // Only the nine-token case is asserted. Running the fixture's 1024-token
+    // `edge` anyway fails a strict top-64 containment on ~5-8 rows — *the same
+    // rows with one rank as with two*, which is what shows the second rank adds
+    // nothing and leaves this as the depth-dependent shape-dependence these
+    // fixtures carry per-case tolerances for. (`probed_cases` is the fixture's
+    // list of cases carrying hidden-state probes; `edge` has none because at
+    // window width they would dwarf the file, so its absence there says nothing
+    // about whether the case is asserted.) See docs/models/gemma4/tp.md
+    // "Known bounds".
     const CASES: [&str; 1] = ["short"];
 
     let (device, peer) = devices();

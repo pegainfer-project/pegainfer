@@ -114,6 +114,7 @@ GATES_KERNELS_HD256_FP8_POOL=(
 )
 GATES_TENSOR_PARALLEL=(
   "tp2 engine::lane_gates_tp::an_aborted_communicator_refuses_the_next_reduction"
+  "tp2 engine::lane_gates_tp::an_aborted_communicator_releases_a_waiting_reduction"
   "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_matches_one_rank"
   "tp2,ckpt engine::lane_gates_tp::a_failed_rank_zero_segment_stops_the_engine_at_two_ranks"
   "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_scores_prompt_logprobs"

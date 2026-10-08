@@ -1193,6 +1193,13 @@ impl GemmaServe {
         }
     }
 
+    /// This rank's communicator as a handle of its own, so a step's thread can
+    /// abort it — or a peer's — without borrowing either serve. `TpComm` is a
+    /// handle over a shared slot, so the clone reaches the same communicator.
+    pub(crate) fn tp_comm(&self) -> Option<TpComm> {
+        self.tp_comm.clone()
+    }
+
     /// The global family's prefill, through whichever kernel this engine was
     /// started with. Both are the same fn type, so a drift between them stops
     /// compiling rather than computing something else.
