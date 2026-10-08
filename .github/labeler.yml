@@ -21,6 +21,8 @@ qwen4:
           - 'pegainfer-qwen38-flash-next/**'
           - 'pegainfer-kernels/**/*qwen4*'
           - 'pegainfer-kernels/**/*qwen4*/**'
+          - 'pegainfer-kernels/**/*qwen38*'
+          - 'pegainfer-kernels/**/*qwen38*/**'
           - 'docs/models/qwen38-flash-next/**'
 
 gemma4:

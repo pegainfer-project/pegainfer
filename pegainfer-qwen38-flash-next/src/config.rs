@@ -50,6 +50,11 @@ const UPSTREAM_DEFAULT_SEED: i64 = 1234;
 #[derive(Debug, Deserialize)]
 pub(crate) struct RopeParameters {
     pub(crate) partial_rotary_factor: f64,
+    /// The rope base. The reference reads it from this same nested object with a
+    /// direct index (modeling_qwen4_exp.py:108), so it is required here and
+    /// carried, keeping a future rope consumer off a second read of
+    /// `config.json` — the same rule `num_experts_per_tok` follows.
+    pub(crate) rope_theta: f64,
 }
 
 /// Everything the engine reads lives in `text_config`; the outer config carries
@@ -236,6 +241,11 @@ impl Config {
 /// cross-check this against the stored vectors; deriving it here is what lets the
 /// manifest reject a table whose partition disagrees with its own config before
 /// any bytes are uploaded.
+///
+/// One table, for the one PLE layer the probe enforces: the reference primes
+/// head `i` of PLE layer `L` at the global index `L * ngram_heads + i`
+/// (modeling_qwen4_exp.py:1037-1039), so a second PLE layer's table is a
+/// different prime run this struct does not model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NgramTable {
     /// `(ngram_size - 1) * heads_per_ngram` — one head per (order, head) pair.
@@ -445,6 +455,13 @@ mod tests {
         assert_eq!(text.moe_intermediate_size, 640);
         assert_eq!(text.shared_expert_intermediate_size, 640);
         assert_eq!(text.hc_lowrank, 320);
+        // The rope base the reference indexes out of rope_parameters
+        // (modeling_qwen4_exp.py:108). Pinned bit-exactly: the JSON literal
+        // must parse to this precise f64, not merely something close.
+        assert_eq!(
+            text.rope_parameters.rope_theta.to_bits(),
+            10_000_000.0f64.to_bits()
+        );
     }
 
     /// `ple_layer_ids: [2]` must land the PLE tensors on `layers.1`, not

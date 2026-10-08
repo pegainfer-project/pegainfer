@@ -47,7 +47,7 @@ Every probe and config test runs against it.
 ## What landed
 
 `pegainfer-qwen38-flash-next`, feature `qwen38-flash-next`, **with no CUDA dependency
-at all** — so its 44 tests need no device, no weights and no Triton-equipped build.
+at all** — so its 51 tests need no device, no weights and no Triton-equipped build.
 Preserving that is the point of the crate's shape: when slice B adds the device side,
 `config` and `probe` must move behind `#[cfg(any(feature, test))]` the way
 `pegainfer-gemma4/src/lib.rs` does.
@@ -65,7 +65,14 @@ Preserving that is the point of the crate's shape: when slice B adds the device 
   The same list carries `mrope_interleaved` and `mrope_section`, which are accepted
   rather than refused: a text-only sequence is their degenerate case in the reference
   itself, which expands one position per token across all three axes before
-  interleaving. The decision is tracked in #1105.
+  interleaving. The decision is tracked in #1105. Beyond the pins, the probe mirrors
+  the rules the reference's own `validate_architecture` enforces — `hc_count > 1`,
+  QSA's `indexer_kv_heads == 1` with the budget a whole multiple of the compress
+  ratio, the rotary width fitting the index head, `rope_theta` present, and PLE
+  confined to a **single** `linear_attention` layer — since a config the reference
+  refuses cannot be served by any port. Multi-layer PLE is refused for now: the
+  reference offsets each layer's prime run by its layer index (`global_head_idx =
+  L * ngram_heads + i`), and this crate derives one table.
 - **Config** (`src/config.rs`) — validated geometry plus the derivations the rest of the
   line needs. Two fields the reference reads are **absent from `config.json`** and
   come from upstream defaults: `norm_topk_prob` (`true`, and it decides whether the
@@ -106,11 +113,11 @@ search against the reference's `_find_nth_prime_after`.
 
 - **`output_gate_type` has three unrelated consumers.** On Qwen3.8-27B it is inert and
   must *not* be implemented (`docs/models/qwen35/support-qwen38.md`). Here it is live and
-  selects the GDN gated-norm activation, so the shared `csrc/shared/norm.cu` gated norm —
-  which is written for Qwen3.5's SiLU — has to become selectable before this line can
-  serve; that change is a separate PR (#1129) and this line's call site lands with the
-  text graph. It is *also* the marker the frontend's `reasoning_effort` layer arms on.
-  Read the field's consumer, never its name.
+  selects the GDN gated-norm activation; the shared `csrc/shared/norm.cu` gated norm
+  **became selectable in #1129** (a sigmoid entry point beside Qwen3.5's SiLU, merged
+  before this line's detection PR), so what remains is this line's call site, which
+  lands with the text graph. It is *also* the marker the frontend's `reasoning_effort`
+  layer arms on. Read the field's consumer, never its name.
 - **Two RMSNorm conventions in one layer.** `(1+w)` for `q_norm`/`k_norm`, the indexer
   layernorms, `hc_norm` and the PLE norms; plain `w` only for the GDN gated norm. The
   four 10240-wide ones are additionally **grouped by 2560** — likely a reshape of the
