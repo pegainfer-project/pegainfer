@@ -371,7 +371,7 @@ fn start_with_knobs(
         );
     }
     let base_seed = options.seed;
-    let graph_enabled = options.enable_cuda_graph;
+    let mut graph_enabled = options.enable_cuda_graph;
 
     let config = crate::config::Gemma4Config::from_file(&dir)?;
     let knobs = ServingKnobs::resolve(lookup, &config)?;
@@ -401,16 +401,22 @@ fn start_with_knobs(
         // cannot release its own — so with decode graphs on there is no order that
         // releases one rank and destroys another's graphs: the abort waits for the
         // release, the release runs after the join, and the join waits for the
-        // rank that abort was to release. Refused rather than left to hang there;
-        // the repo's own measurement is that graphs are a wash under TP (146.0 vs
-        // 143.7 tok/s at 8-way on two L20s), so nothing priced above zero is given
-        // up.
-        anyhow::ensure!(
-            !graph_enabled,
-            "CUDA graphs are unsupported under tensor parallelism: a captured collective cannot be \
-             released while the rank that holds it is stopped inside one, and NCCL's abort waits \
-             for exactly that release. Pass --cuda-graph=false."
-        );
+        // rank that abort was to release. Graphs are turned off here rather than
+        // refused: the flag is on by default, so a refusal would mean no TP2 launch
+        // starts until it is flipped, and the repo's own measurement is that graphs
+        // are a wash under TP (146.0 vs 143.7 tok/s at 8-way on two L20s) — nothing
+        // priced above zero is given up, and the alternative to serving eager is
+        // not serving at all.
+        if graph_enabled {
+            log::info!(
+                "tensor parallel: {world} ranks, serving eager — decode graphs are off under TP. A \
+                 captured collective cannot be released while the rank that holds it is stopped \
+                 inside one, and NCCL's abort waits for exactly that release, so a failed rank's \
+                 peer would be unresolvable (docs/models/gemma4/tp.md, \"Decode graphs are off \
+                 under TP\")."
+            );
+            graph_enabled = false;
+        }
         // The ranks take ordinals `0..world` of what this process can see, so a
         // world size past the visible devices can only fail later, less clearly.
         // `cuDeviceGetCount` needs the driver up and on a fresh process this is
@@ -1330,10 +1336,10 @@ struct EngineState {
 /// Captured collective graphs bake in NCCL kernel launches, and NCCL's
 /// communicator abort waits for a graph that references them to be destroyed —
 /// so every rank releases its graphs here, on its own device, before the fields
-/// (and with them the communicators) drop. A tensor-parallel launch refuses
-/// graphs outright (`attach`, `ensure!(!graph_enabled, …)`), so under TP there
-/// is nothing captured to wait for; this order is what keeps the single-rank
-/// path right and what a lifted refusal would need again.
+/// (and with them the communicators) drop. A tensor-parallel launch turns graphs
+/// off (`start_with_knobs`), so under TP there is nothing captured to wait for;
+/// this order is what keeps the single-rank path right, and what a lifted
+/// disable would need again.
 impl Drop for EngineState {
     fn drop(&mut self) {
         let _ = select_device(&self.ctx);
@@ -2097,6 +2103,10 @@ impl EngineState {
         // of one rank finishing its whole sweep. `Capture` only records, and a
         // recorded collective replays when its peer replays. Each rank sweeps
         // its own arena and its own single-rank dummy.
+        //
+        // Unreachable while `start_with_knobs` turns graphs off for every
+        // `world > 1` launch: the sweep is kept for whoever lifts that, and its
+        // having no runtime is a known bound (`docs/models/gemma4/tp.md`).
         if graph_enabled && world > 1 {
             let mut dummies: Vec<GemmaKv> = Vec::with_capacity(world);
             let mut primary = serve.alloc_kv();

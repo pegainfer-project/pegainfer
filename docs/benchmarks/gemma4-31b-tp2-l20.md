@@ -9,7 +9,7 @@ TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as 
 | checkpoint | `gemma-4-31b-it`, bf16, text tower only (356 vision/audio tensors skipped) |
 | hardware | two NVIDIA L20 (sm_89, 44.99 GiB usable each), PCIe, one p8s node |
 | build | `--features gemma4`, `PEGAINFER_CUDA_SM=89`, CUDA 12.9 |
-| runtime | `--tp-size=2 --cuda-graph=false`, `NCCL_PROTO=LL128`, pod NCCL 2.18.3 |
+| runtime | `--tp-size=2`, `NCCL_PROTO=LL128`, pod NCCL 2.18.3 (decode graphs are off under TP — see `models/gemma4/tp.md`) |
 | envelope | `PEGAINFER_MAX_CONTEXT=8192`, `PEGAINFER_DECODE_SLOTS=8` |
 | checkpoint source | node-local disk (a PVC read is ~3.5 min per rank) |
 
@@ -49,7 +49,7 @@ A decode step costs ~49 ms for one row and ~56 ms for eight (3.57 s / 64 steps),
 
 ## Eager vs captured decode
 
-Captured measured worth ~nothing here and is now **refused** under TP (`--cuda-graph=true` would leave the failure path unresolvable — see `models/gemma4/tp.md`, "Decode graphs are refused under TP"), so these two rows are the record of why it was dropped rather than two options. Both were measured back to back on the pair:
+Captured measured worth ~nothing here and is now **turned off** under TP (the flag is on by default, so a two-rank launch disables it — `models/gemma4/tp.md`, "Decode graphs are off under TP"), so these two rows are the record of why it was dropped rather than two options. Both were measured back to back on the pair:
 
 | mode | TTFT | step | c8 aggregate |
 | --- | ---: | ---: | ---: |

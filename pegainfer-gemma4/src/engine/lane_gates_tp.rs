@@ -99,16 +99,16 @@ fn single_options(device: usize) -> EngineLoadOptions {
     }
 }
 
-/// Two ranks, two devices. Eager, because a tensor-parallel launch refuses
-/// graphs: NCCL's abort waits for a captured graph that references the
-/// communicator to be destroyed, and a rank stopped inside a collective cannot
-/// release its own — so a captured collective would make the failure path
-/// unresolvable. The engine refuses them at launch
-/// (`engine.rs`, "CUDA graphs are unsupported under tensor parallelism"), which
-/// is what this arm has to match.
+/// Two ranks, two devices, with CUDA graphs left **at their default** (`true`).
+/// A tensor-parallel launch turns them off and says so: NCCL's abort waits for a
+/// captured graph that references the communicator to be destroyed, and a rank
+/// stopped inside a collective cannot release its own, so a captured collective
+/// would make the failure path unresolvable. The engine serves eager rather than
+/// refusing, and this arm is what holds that — with the flag at its default every
+/// gate here would fail at launch if the refusal came back.
 fn tp2_options(a: usize, b: usize) -> EngineLoadOptions {
     EngineLoadOptions {
-        enable_cuda_graph: false,
+        enable_cuda_graph: true,
         device_ordinals: vec![a, b],
         parallel_config: Some(ParallelConfig::new(2, 1)),
         ..EngineLoadOptions::default()
@@ -630,9 +630,8 @@ impl PrefixComparison {
     }
 
     /// The properties every arm needs before its gap means anything: rows were
-    /// compared, at least one of them shared a token with the other run, and the
-    /// rows that shared *nothing* are not the bulk of them — without that the gap
-    /// is a zero nobody measured.
+    /// compared, and at least one of them shared a token with the other run —
+    /// without that the gap is a zero nobody measured.
     fn assert_reads_something(&self, what: &str, long: usize) {
         assert!(
             self.compared > 0,
@@ -645,11 +644,18 @@ impl PrefixComparison {
              the gap measured nothing",
             long / 2
         );
-        // A widespread error makes most rows share nothing, and those rows are
-        // invisible to `worst`: this is the bound that sees them. Read against
-        // the reading, which is 0 of 511 rows at 1024 tokens — a quarter is far
-        // above any run this gate has taken and far below a fault that moves
-        // every page.
+    }
+
+    /// The rows that shared *no* token are invisible to `worst`, so a widespread
+    /// error — a page, position or rope fault — can otherwise read zero. This is
+    /// the absolute form of the bound that sees them, for an arm with no control
+    /// arm above it: the 31B gate (its checkpoint does not fit one card) and the
+    /// control arm itself. Read against the reading, which is 0 of 511 rows at
+    /// 1024 tokens — a quarter is far above any run this gate has taken and far
+    /// below a fault that moves every page, but it is not a detector for one
+    /// confined to part of the prompt; the control-relative form is
+    /// (`assert_disjoint_within`).
+    fn assert_disjoint_absolute(&self, what: &str, long: usize) {
         assert!(
             self.disjoint * 4 <= self.compared,
             "{what}: {} of {} rows share no token between the {}- and {long}-token runs, more \
@@ -658,6 +664,30 @@ impl PrefixComparison {
             self.disjoint,
             self.compared,
             long / 2
+        );
+    }
+
+    /// The same bound held against the one-rank control's own count, in the shape
+    /// the gap uses — a ratio with a floor, so a control that read zero cannot
+    /// tighten the bound to nothing. A false positive needs the two-rank arm to
+    /// move more rows than the control did *plus* the floor, and the floor is a
+    /// sixty-fourth of the compared rows rather than a flat quarter: the quarter
+    /// admitted 127 of 511 rows, wide enough to hide a fault confined to part of
+    /// the prompt — and rows like those are what this exists to see.
+    fn assert_disjoint_within(&self, control: &Self, what: &str, long: usize) {
+        let floor = self.compared / PREFIX_CONTROL_DISJOINT_FLOOR_DIVISOR;
+        let ceiling =
+            ((PREFIX_CONTROL_DISJOINT_RATIO * control.disjoint as f32).ceil() as usize).max(floor);
+        assert!(
+            self.disjoint <= ceiling,
+            "{what}: {} of {} rows share no token between the {}- and {long}-token runs, against \
+             a one-rank control's {} (ceiling {ceiling} = {PREFIX_CONTROL_DISJOINT_RATIO}x control, \
+             floor {floor} = compared / {PREFIX_CONTROL_DISJOINT_FLOOR_DIVISOR}) — rows like these \
+             never reach `worst`, so a fault confined to part of the prompt hides in them",
+            self.disjoint,
+            self.compared,
+            long / 2,
+            control.disjoint
         );
     }
 }
@@ -754,6 +784,7 @@ fn the_two_rank_engine_is_prefix_consistent() {
     let two = prefix_comparison(&tp2_options(device, peer), long);
     two.report("prefix tp2", long);
     two.assert_reads_something("prefix tp2", long);
+    two.assert_disjoint_absolute("prefix tp2", long);
     // The line is `serve_oracle`'s calibration, not a tight one: scoring the same
     // context two ways (there a greedy walk against a single prefill, here a
     // 512-row prefill against a 1024-row one) moves the logits by a chaotically
@@ -798,9 +829,11 @@ fn the_two_rank_engine_is_prefix_consistent_within_a_single_rank_control() {
     let control = prefix_comparison(&single_options(device), long);
     control.report("prefix control (one rank)", long);
     control.assert_reads_something("prefix control", long);
+    control.assert_disjoint_absolute("prefix control", long);
     let two = prefix_comparison(&tp2_options(device, peer), long);
     two.report("prefix tp2", long);
     two.assert_reads_something("prefix tp2", long);
+    two.assert_disjoint_within(&control, "prefix tp2", long);
     let ceiling = (PREFIX_CONTROL_RATIO * control.worst).max(PREFIX_CONTROL_FLOOR);
     assert!(
         two.worst <= ceiling,
@@ -830,6 +863,16 @@ const PREFIX_LINE: f32 = 12.0;
 /// gate; the absolute `PREFIX_LINE` cannot see either reading.
 const PREFIX_CONTROL_RATIO: f32 = 2.0;
 const PREFIX_CONTROL_FLOOR: f32 = 0.10;
+
+/// The same control-relative shape for the rows that shared *no* token, which
+/// `worst` cannot see. Measured on the 12B at the window width (512 vs 1024
+/// tokens): the control and the two-rank arm each read **0** of 511 rows, so the
+/// ceiling there is the floor. The ratio is the gap's; the floor is a
+/// sixty-fourth of the compared rows rather than a flat quarter, which admitted
+/// 127 of 511 — a fault confined to part of the prompt is rows like these, and a
+/// quarter is too wide to see one.
+const PREFIX_CONTROL_DISJOINT_RATIO: f32 = 2.0;
+const PREFIX_CONTROL_DISJOINT_FLOOR_DIVISOR: usize = 64;
 
 /// The abort machinery's own contract, with no engine in the picture: a
 /// reduction still works through the wrapper, an aborted communicator refuses
