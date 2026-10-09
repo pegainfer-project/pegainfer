@@ -2,13 +2,20 @@
 
 **TL;DR:** Qwen3-4B gains DFlash speculative decoding behind `--dflash-draft-model-path`. Speculative decode is modelled as an **optimistic transaction**: the DFlash drafter proposes K tokens, one target "verify" forward over the K+1 span confirms them, and we commit the longest argmax-matching prefix + 1 bonus token (rolling back the rest of the speculative KV). Greedy decode is **lossless up to bf16 numerical tie-flips** — the same non-determinism that already affects plain greedy decode at genuine bifurcation points; lm-eval gsm8k strict-match is identical with spec on vs off. Measured single-stream decode A/B: **1.82× on RTX 5070 Ti** (93.4 → 170.0 tok/s), **1.56× on RTX 5090** (168.9 → 263.2 tok/s). The drafter's out-of-pool footprint (weights + per-request KV/scratch) is reserved during memory profiling so the KV pool shrinks to fit instead of OOMing under load, and requests landing in the draft's final in-fill block are rejected cleanly at admission rather than crashing mid-prefill. **Concurrent throughput is now competitive after batching the draft forward.** The draft used to run a per-request **serial** `for` loop — launch-bound (a skip-attention A/B showed attention compute <2%, so 24.8 ms/step at batch 16 was almost all kernel-launch overhead), which inverted the single-stream win (c16 −59%). Batching the dense ops into one N×block pass drops draft@batch16 to **5.6 ms** and lifts 5090 greedy throughput to **c8 1346 / c16 1868 tok/s — both now beating vLLM's 1240 / 1846**. The single-stream gap is now closed by a **piecewise CUDA Graph** over the verify forward: 5090 greedy **c1 237 → 274 tok/s (+16%), matching vLLM dflash (278)**; c8 1346 → 1525 and c16 ≈ flat (no regression, both still ≥ vLLM's 1240 / 1846). Under greedy dflash the spec path ran with no CUDA Graph at all (the base-decode graph never fires), so nsys saw 1296 ms of GPU-idle launch gap — **~84% from dense-op kernel launches** (GEMM alone 48%), only 8% from attention. Capturing the *whole* forward fails: FlashInfer's paged-prefill attention freezes its KV-iteration count at capture time, so a captured attention under-reads the growing verify KV and corrupts tokens past ~60. The fix is **piecewise** — capture the dense ops (embedding, RMSNorm, every GEMM, SwiGLU, residual adds) into per-segment graphs and replay them, keeping **attention eager**. Accept is *not* the gap (9.1% vs vLLM's 8.85%, same drafter). Draft-side piecewise graph is the tracked next step. See Performance § for the A/B tables.
 
-Last touched: 2026-06
+Last touched: 2026-10
 
 ## The abstraction: speculative decode = optimistic transaction
 
 Every speculative method is the same transaction; only *propose* differs.
 
-1. **Propose** — a method-specific drafter emits K candidate tokens. (DFlash is the only proposer today; an n-gram / EAGLE proposer would slot in here.)
+The DFlash lane uses independent argmax for plain DFlash, the Markov head for
+DSpark, and learned top-16 pair scoring for DFlash2. Supported native Speculators
+DFlash2 checkpoints use their own embedding and LM head, plus block-local convolutions
+and an anchor-based attention window. These change proposal generation; target
+verification and acceptance follow the same transaction below. The performance
+measurements in this document are from the original DFlash checkpoints.
+
+1. **Propose** — a method-specific drafter emits K candidate tokens.
 2. **Verify** — the target model runs ONE prefill-style forward over the K+1 span `[current_token, draft_1, …, draft_K]` and reports its argmax at every position (echo=true).
 3. **Accept** — `accept_greedy` keeps the longest prefix where each draft matches the target argmax, then appends the target's own token at the first mismatch (the "bonus"). A verify step therefore always commits `1..=K+1` tokens — at least one token of progress even when every draft is rejected.
 4. **Commit / roll back** — accepted tokens' KV is committed (`apply_speculative`); the unused tail of the speculative reservation is LIFO-dropped (`revert_schedule`).
@@ -111,10 +118,14 @@ Harness note: pegainfer's `/v1/completions` rejects a per-request `seed` field (
 
 ## GPU memory budget & context limit
 
-DFlash's draft model and its per-request KV/scratch live **outside** the paged KV pool (`KvCacheManager`), so they must be reserved *before* the pool is sized or they silently steal from it and OOM under concurrency / long contexts. `DFlashMemoryReservation::from_config` (cheap — reads the draft `config.json`) splits the footprint by how it scales and the budget charges each in the matching place:
+DFlash's draft model and its per-request KV/scratch live **outside** the paged KV pool (`KvCacheManager`), so they must be reserved *before* the pool is sized or they silently steal from it and OOM under concurrency / long contexts. `DFlashMemoryReservation::from_path` reads the draft `config.json`, then `from_config` splits the footprint by how it scales and the budget charges each in the matching place:
 
 - **Per-token, pool-scaling** (draft KV + the prompt-tracking context scratch + the in-fill tail scratch + pending context, **65 536 B/token**) → folded into `effective_bytes_per_block`, so the *target* block count shrinks while the pool itself stays allocated at the target-only `bytes_per_block`. This is a safe upper bound: the scheduler reserves pool blocks for each request's whole lifetime (`prompt + max_tokens`), and the draft attends at most that many tokens, so billing the draft per pool-token over-covers. The draft KV and tail scratch are sized one in-fill block past that lifetime, so the fixed term also reserves `max_decode_batch × block_size` of that per-request headroom.
 - **Fixed, pool-independent** (draft weights ~1.1 GiB + the block-sized per-request scratch across the decode batch — logits-dominated, ~6.5 MiB × 256) → added to the KV `margin`.
+
+The figures above describe the original b16 checkpoint. Native DFlash2 also
+reserves its embedding, LM head, convolutions, selector weights and scratch in
+the fixed term.
 
 Measured on the RTX 5070 Ti (16 GB, util 90%), the pool correctly makes room for the draft:
 

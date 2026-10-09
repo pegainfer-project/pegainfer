@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use super::selector::SelectorHead;
 use crate::config::DFlashConfig;
 use crate::dspark::MarkovHead;
 use crate::sizing;
@@ -112,13 +113,42 @@ impl DFlashMemoryReservation {
             sizing::sum(&[draft_kv, tail_scratch])?,
         ])?;
 
+        let native = if let Some(conv) = &config.conv {
+            let dynamic_width = sizing::product(&[2, conv.taps, hidden / conv.group_size])?;
+            let conv_weights = sizing::product(&[
+                config.num_hidden_layers,
+                2,
+                BF16,
+                hidden,
+                sizing::sum(&[2 * conv.taps, dynamic_width])?,
+            ])?;
+            let embeddings = sizing::product(&[2, config.vocab_size, hidden, BF16])?;
+            let conv_scratch = sizing::product(&[
+                max_decode_batch_size,
+                config.block_size,
+                BF16,
+                sizing::sum(&[hidden, dynamic_width])?,
+            ])?;
+            sizing::sum(&[conv_weights, embeddings, conv_scratch])?
+        } else {
+            0
+        };
+
         // DSpark Markov head: weights (2 × vocab × rank) + sample scratch (the
         // per-step bias is the dominant term). Zero for plain DFlash drafters.
         let markov = MarkovHead::reservation_bytes(config, max_decode_batch_size)?;
+        let selector = SelectorHead::reservation_bytes(config, max_decode_batch_size)?;
 
         Ok(Self {
             kv_bytes_per_token,
-            fixed_bytes: sizing::sum(&[weights, scratch_total, block_headroom, markov])?,
+            fixed_bytes: sizing::sum(&[
+                weights,
+                scratch_total,
+                block_headroom,
+                markov,
+                native,
+                selector,
+            ])?,
             block_size: config.block_size,
             uses_markov_head: config.uses_markov_head(),
         })
