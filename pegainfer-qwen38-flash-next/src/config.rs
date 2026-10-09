@@ -355,14 +355,19 @@ fn nth_prime_after(start: usize, count: usize) -> usize {
     // test 1, and the trial division below accepts it (no prime exceeds its
     // square root, so the prefix is empty and `all` is vacuously true).
     let mut candidate = start.max(1);
-    // Re-sieved lazily as the candidate climbs; one sieve covers the whole window
-    // in practice because prime gaps near 2e7 are far below the base itself.
-    let mut small_primes = sieve(integer_sqrt(start + 1) + 1);
+    // One sieve covers the whole window in practice: prime gaps near 2e7 are far
+    // below the base itself, so `root` barely moves. Re-sieve only when the
+    // candidate's square root outgrows the sieve's *limit* — comparing against
+    // the largest prime in it instead would re-sieve on every candidate whose
+    // `root` is composite (4473 here), ~170x the work for no gain.
+    let mut sieved_up_to = integer_sqrt(start + 1) + 1;
+    let mut small_primes = sieve(sieved_up_to);
     loop {
         candidate += 1;
         let root = integer_sqrt(candidate) + 1;
-        if root > small_primes.last().copied().unwrap_or(0) {
+        if root > sieved_up_to {
             small_primes = sieve(root);
+            sieved_up_to = root;
         }
         if small_primes
             .iter()
