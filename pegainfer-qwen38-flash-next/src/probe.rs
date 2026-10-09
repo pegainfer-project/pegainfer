@@ -23,6 +23,16 @@ const CONV_KERNEL_MAX: u64 = 4;
 /// The full-attention head dimension the shared HD256 kernels are built for.
 const FULL_ATTN_HEAD_DIM: u64 = 256;
 
+/// The identity this line claims: the outer `model_type` and the inner
+/// `text_config.model_type` the probe requires together.
+///
+/// Exposed because `pegainfer-server`'s `feature_gate_hint` hand-mirrors each
+/// line's identities in a table that must compile when this crate does not; a
+/// test under this feature binds the mirror to these constants so the two cannot
+/// drift apart silently.
+pub const MODEL_TYPE: &str = "qwen4_exp";
+pub const TEXT_MODEL_TYPE: &str = "qwen4_exp_text";
+
 pub(crate) fn probe_config_json(json: &serde_json::Value) -> Result<()> {
     let text_config = probe_identity(json)?;
     probe_precision(text_config)?;
@@ -40,7 +50,7 @@ fn probe_identity(json: &serde_json::Value) -> Result<&serde_json::Value> {
         .get("model_type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    if model_type != "qwen4_exp" {
+    if model_type != MODEL_TYPE {
         bail!("not a Qwen3.8-Flash-Next config: model_type={model_type}");
     }
 
@@ -82,9 +92,9 @@ fn probe_identity(json: &serde_json::Value) -> Result<&serde_json::Value> {
         .get("model_type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    if text_type != "qwen4_exp_text" {
+    if text_type != TEXT_MODEL_TYPE {
         bail!(
-            "qwen4_exp: text_config.model_type is {text_type}, expected qwen4_exp_text — \
+            "qwen4_exp: text_config.model_type is {text_type}, expected {TEXT_MODEL_TYPE} — \
              cross-family mismatch"
         );
     }

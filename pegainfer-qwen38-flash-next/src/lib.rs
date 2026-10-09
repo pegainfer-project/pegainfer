@@ -28,3 +28,5 @@ mod probe;
 pub use config::FROZEN_CONFIG_SHA256;
 pub use config::FROZEN_REVISION;
 pub use config::PINNED_TRANSFORMERS;
+pub use probe::MODEL_TYPE;
+pub use probe::TEXT_MODEL_TYPE;

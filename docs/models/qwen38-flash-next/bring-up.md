@@ -83,7 +83,11 @@ Preserving that is the point of the crate's shape: when slice B adds the device 
   hint descriptor its own comment says cannot be derived away, so the mirror is tested
   and not just the probe: `feature_gate_hint` names `--features qwen38-flash-next` for
   both `qwen4_exp` and `qwen4_exp_text` when the feature is off, and stays silent when
-  it is on.
+  it is on. A test under the feature binds that row to this crate's `MODEL_TYPE` /
+  `TEXT_MODEL_TYPE`, so the mirror cannot drift from the probe. The hint is
+  **identity-only** — it cannot run a compiled-out probe — so it also fires for the FP8
+  sibling and the tied/YaRN variants of `qwen4_exp`, which the probe refuses once the
+  feature is on; the hint names the feature to rebuild with, not a promise of service.
 
 ## The n-gram table is derived, not read
 
