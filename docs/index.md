@@ -61,6 +61,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen35/decode-kernel-attribution.md` | nsys kernel attribution of the remaining serving gap vs vLLM 0.27 on A100: c16 kernel-busy 16.5 vs ~13.2 ms/step (GEMM family +3.5), bs1 92% busy with the deficit in FlashInfer paged decode (6x at bs1), GDN decode 2.2x per layer-step, and the once-per-step output-projection GEMM on an align-1 sm_75 kernel (1.67 ms/step, fixed by tile-aligning the selection width). |
 | `models/qwen35/unified-prefill-overlap.md` | Issue #715 implementation record: opt-in single-GPU shared-SM overlap keeps one prefill chunk in flight while active decode continues; default serial policy and unsupported-combination guards remain explicit. |
 
+## models / qwen38-flash-next
+
+| Path | TL;DR |
+| --- | --- |
+| `models/qwen38-flash-next/bring-up.md` | New line (`qwen4_exp`), not a Qwen3.5 variant; frozen at `de4b8e4d`. Landed: a fail-closed probe that pins structure rather than widths, so a smaller `qwen4_exp` checkpoint reuses it, and a config layer that validates the geometry, models the two fields upstream defaults (`norm_topk_prob`, `seed`) and derives the n-gram table from five config fields via 16 per-head primes. Measured traps: untied LM head, **no final-norm tensor** (the readout is the hyper-connection mixer), `ple_layer_ids` is 1-indexed so the n-gram block is on `layers.1`, the n-gram table is **102.4 GB at BF16** (the quoted ~51 GB is fp8), `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation (the inverse of the Qwen3.8-27B lesson), two RMSNorm conventions in one layer, and the PLE conv is dilated despite an identical tensor shape. Tracked in #1103 / #1104. |
+
 ## models / gemma4
 
 | Path | TL;DR |

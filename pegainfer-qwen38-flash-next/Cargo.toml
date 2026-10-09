@@ -1,0 +1,26 @@
+[package]
+autobenches = false
+autobins = false
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-qwen38-flash-next"
+version = "0.1.0"
+
+[features]
+default = []
+# Empty on purpose: this crate is CPU-only and compiles whole, so there is nothing
+# to gate. It exists so `pegainfer-server` can hold the line behind the same
+# per-line switch as every other model crate.
+qwen38-flash-next = []
+
+[dependencies]
+anyhow = { workspace = true }
+pegainfer-frontend = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

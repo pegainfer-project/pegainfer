@@ -15,6 +15,16 @@ qwen35:
           - 'pegainfer-kernels/tools/triton/**'
           - 'docs/models/qwen35/**'
 
+qwen4:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'pegainfer-qwen38-flash-next/**'
+          - 'pegainfer-kernels/**/*qwen4*'
+          - 'pegainfer-kernels/**/*qwen4*/**'
+          - 'pegainfer-kernels/**/*qwen38*'
+          - 'pegainfer-kernels/**/*qwen38*/**'
+          - 'docs/models/qwen38-flash-next/**'
+
 gemma4:
   - changed-files:
       - any-glob-to-any-file:
