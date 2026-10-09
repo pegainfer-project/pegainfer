@@ -635,9 +635,10 @@ fn describe_row(what: &str, row: &[f32]) {
 }
 
 /// How far a moved pick may sit from the other arm's: inside the other row's
-/// top-`NEAR_TIE_TOP_K` is reduction-order noise, outside it is a different
-/// distribution. The fleet-wide rule — `lane_gates_tp`'s `distribution_gap` and
-/// the HF fixtures apply the same shape, with the fixture's own `k`.
+/// top-`NEAR_TIE_TOP_K` **and** within [`NEAR_TIE_WIDTH`] is a tie, and both
+/// halves are needed — membership alone admits `[6, 0, …]` against `[0, 6, …]`.
+/// The fleet-wide rule: `lane_gates_tp`'s `distribution_gap` and the HF fixtures
+/// apply the same shape, with the fixture's own `k`.
 const NEAR_TIE_TOP_K: usize = 8;
 
 /// How far apart the two picks may read **within one row** and still be a tie:
@@ -645,13 +646,16 @@ const NEAR_TIE_TOP_K: usize = 8;
 /// width. Membership alone does not make a tie — `[6, 0, …]` against
 /// `[0, 6, …]` passes mutual top-`NEAR_TIE_TOP_K` while each row prefers a
 /// different token by six nats, which is exactly the different distribution this
-/// rule is for, and the callers' 12.0 drift line would not see it either.
+/// rule is for, and these callers' 12.0 whole-row line does not see it either
+/// (it bounds one entry's |Δ|, and six nats is inside it).
 ///
-/// The margin is a difference between two entries of one row, so it is the same
-/// quantity on raw logits (here) as on log_softmax: `lane_gates_tp`'s
-/// `LOGBROB_LINE` reads the same 1.0 on a shared token's gap for the same
-/// reason. The flip that motivated the rule read 0.0625 and 0.1875, and the
-/// shape the width rejects reads 6.
+/// The line rests on the flips this rule has read, not on another gate's
+/// calibration: one that is real reads 0.0625 and 0.1875, and the shape it must
+/// reject reads 6. `lane_gates_tp`'s `LOGBROB_LINE` reads the same 1.0, but on a
+/// different quantity — one token's gap *between* two runs — so its calibration
+/// does not carry over. What does is the reason the two are comparable at all:
+/// the margin is a difference inside one row, so it is the same number on raw
+/// logits here as on log_softmax there.
 const NEAR_TIE_WIDTH: f32 = 1.0;
 
 /// Whether `pick` is inside `row`'s top-`k`, without sorting the row: fewer than
@@ -747,14 +751,15 @@ fn a_tie_in_only_one_of_the_two_rows_is_not_a_near_tie() {
     compare_row(&[0.0, -0.5, -20.0], &[-0.5, 6.0, -20.0], "one row");
 }
 
-/// The shape the rule is for: a flip inside the width passes, and says so, since
-/// the callers that walk an arm greedily stop on it.
+/// The shape the rule is for: a flip inside the width passes, and says so — the
+/// two kernel gates print the number of rows that moved a pick, which is this
+/// flag.
 #[test]
 fn a_flip_inside_the_width_is_reported_as_one() {
     let row = compare_row(&[0.0, -0.0625, -20.0], &[-0.0625, 0.0, -20.0], "near tie");
     assert!(
         row.flipped,
-        "a moved pick has to be reported, or the greedy callers cannot stop on it"
+        "a moved pick has to be reported, or a gate cannot count the rows that moved one"
     );
     assert!(
         (row.worst - 0.0625).abs() < f32::EPSILON,
@@ -775,9 +780,10 @@ fn serving_recompute(ctx: &DeviceContext, serve: &GemmaServe, tokens: &[u32]) ->
 }
 
 /// Greedy continuation through the serving path: the prompt in one prefill
-/// step, then `steps` decode steps each fed the previous row's argmax. Every
-/// row is returned, so a divergence is placed at the step it appears, and so
-/// is the context it walked, which a recompute of the same tokens needs.
+/// step, then `steps` decode steps each fed the previous row's argmax. The
+/// prompt's row and every decode row are returned, so a divergence is placed at
+/// the step it appears, and so is the context it walked, which a recompute of
+/// the same tokens needs.
 fn continue_greedy(
     ctx: &DeviceContext,
     serve: &GemmaServe,
@@ -803,9 +809,52 @@ fn continue_greedy(
     (rows, walked)
 }
 
+/// The same walk with its decode steps forced: each step is fed the token at that
+/// position of `walked` — the incumbent's prompt plus its own picks — rather than
+/// this arm's, so both arms read the same text on every row and nothing a
+/// comparison does can leave one behind. That is what lets the two kernel gates
+/// compare *every* row of the walk instead of stopping where a pick moves.
+fn continue_forced(
+    ctx: &DeviceContext,
+    serve: &GemmaServe,
+    tokens: &[u32],
+    walked: &[u32],
+    steps: usize,
+) -> Vec<Vec<f32>> {
+    let mut kv = serve.alloc_kv();
+    let mut arena = serve
+        .alloc_step_arena(ctx, 1, false)
+        .expect("oracle step arena");
+    admit_tokens(&serve.local_pool, &serve.global_pool, &mut kv, tokens.len())
+        .expect("admit prompt");
+    let logits = serve.step(ctx, &mut kv, tokens).expect("prefill");
+    let host = logits.to_host(ctx).expect("prefill D2H");
+    let vocab = logits.hidden_dim;
+    let mut rows = vec![host[(logits.seq_len - 1) * vocab..].to_vec()];
+    for i in 0..steps {
+        let token = *walked
+            .get(tokens.len() + i)
+            .expect("the walk being followed carries one token per step");
+        rows.push(decode_serving(serve, ctx, &mut arena, &mut kv, token).expect("decode"));
+    }
+    rows
+}
+
+/// What row `i` of a walk holds: the prompt's own row first, then the decode
+/// steps. Only for the readings — a mismatch here is a label, not a comparison.
+fn row_label(i: usize) -> String {
+    if i == 0 {
+        "prompt row".to_string()
+    } else {
+        format!("decode step {}", i - 1)
+    }
+}
+
 /// The decode gates' raw-logit line. Correctness at this depth is carried by
-/// the argmax, which [`compare_row`] holds on every compared row of every cell;
-/// this catches a drift the argmax would not, and is set above the spread a
+/// the argmax, which [`compare_row`] holds on every row of every cell — except
+/// where a pick moves, and there it holds the moved pick to a near tie
+/// ([`NEAR_TIE_WIDTH`]) instead; this catches a drift the argmax would not, and
+/// is set above the spread a
 /// sixteen-cell sweep measured (worst 7.91) rather than at the edge of it,
 /// because the quantity is chaotic and a tighter line would only flake. What
 /// bounds the kernel's own error is the AOT gate, at 0.002 against fp32.
@@ -850,15 +899,12 @@ fn decode_sweep_cells() -> Vec<(usize, usize)> {
 }
 
 /// The replacement global-attention decode against the one it stands in for,
-/// over every fixture prompt at three lengths. Each step is compared on its
-/// own row, argmax first, since the arms pick their own next token: that
-/// equality is the correctness the gate carries, and it holds on every row the
-/// two arms still share. A row whose pick moves is a near tie by
-/// [`compare_row`]'s rule, and the cell stops there — each arm fed its own pick
-/// to the next step, so every later pair of rows would be two different
-/// contexts, which is the same reason `lane_gates_tp::distribution_gap` stops
-/// at a flip. The step count printed per cell is how many rows were compared.
-/// The raw-logit line is [`DRIFT_LINE`], and every cell prints its own gap
+/// over every fixture prompt at three lengths. The incumbent walks greedily;
+/// the replacement is then fed the incumbent's own tokens ([`continue_forced`]),
+/// so each step compares the same text on both sides and **every** row is
+/// measured — the prompt's row included. A row whose pick moves is a near tie by
+/// [`compare_row`]'s rule, and the count printed per cell is how many rows moved
+/// one. The raw-logit line is [`DRIFT_LINE`], and every cell prints its own gap
 /// beside [`neutral_scale`], so the spread is on the record.
 #[test]
 #[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
@@ -894,23 +940,26 @@ fn the_replacement_global_decode_matches_the_incumbent() {
         let scale = neutral_scale(&ctx, &serve, &incumbent, tokens.len(), &walked);
 
         serve.tilelang_global_attn = true;
-        let (replacement, _) = continue_greedy(&ctx, &serve, &tokens, STEPS);
-        let mut worst = (0.0f32, 0usize);
-        let mut compared = 0usize;
+        // The replacement walks the incumbent's own tokens, so every row — the
+        // prompt's row included — compares the *same* text, and no row is left
+        // unmeasured because a pick moved earlier in the walk.
+        let replacement = continue_forced(&ctx, &serve, &tokens, &walked, STEPS);
+        let mut worst = (0.0f32, 1usize);
+        let mut moved = 0usize;
         for (i, (a, b)) in incumbent.iter().zip(&replacement).enumerate() {
-            let row = compare_row(a, b, &format!("prompt {prompt} at {len}, decode step {i}"));
-            compared = i + 1;
+            let row = compare_row(a, b, &format!("prompt {prompt} at {len}, {}", row_label(i)));
             if row.worst > worst.0 {
                 worst = (row.worst, i);
             }
-            if row.flipped {
-                break;
-            }
+            moved += usize::from(row.flipped);
         }
         eprintln!(
             "prompt {prompt} at {len} tokens: floor 0, neutral scale {scale}, \
-             replacement |dlogit| {} at step {}, {compared} of {STEPS} rows compared",
-            worst.0, worst.1
+             replacement |dlogit| {} at {}, {} of {} rows moved a pick",
+            worst.0,
+            row_label(worst.1),
+            moved,
+            incumbent.len()
         );
         cells.push((prompt, len, scale, worst));
     }
@@ -923,12 +972,12 @@ fn the_replacement_global_decode_matches_the_incumbent() {
     let line = DRIFT_LINE;
     eprintln!(
         "global decode over {} cells: neutral scale at most {widest_scale}, line {line}, \
-         worst replacement |dlogit| {} at prompt {} length {} step {}",
+         worst replacement |dlogit| {} at prompt {} length {} {}",
         cells.len(),
         worst_cell.3.0,
         worst_cell.0,
         worst_cell.1,
-        worst_cell.3.1
+        row_label(worst_cell.3.1)
     );
     for (prompt, len, _, (gap, step)) in &cells {
         assert!(
@@ -943,11 +992,10 @@ fn the_replacement_global_decode_matches_the_incumbent() {
 /// kernels: the rows differ in where K's norm weight is applied, one bf16
 /// rounding apart per element. Every fixture prompt at three lengths. The
 /// split arms run and are kept first, so one pool swap covers the sweep. The
-/// decode rows take [`DRIFT_LINE`]; the prompt row keeps the prefill gate's
-/// 2.0, which one row of one kernel pass can hold. A row whose pick moves is a
-/// near tie by [`compare_row`]'s rule and ends the cell there — from that row
-/// on the two arms are decoding their own text — and the count printed per cell
-/// says how many rows were compared.
+/// decode rows take [`DRIFT_LINE`]; the prompt row keeps the prefill gate's 2.0,
+/// which one row of one kernel pass can hold. The folded arm is fed the split
+/// arm's own tokens ([`continue_forced`]), so every row is compared on the same
+/// text and the count printed per cell is how many rows moved a pick.
 #[test]
 #[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
 fn the_folded_pool_matches_the_split_one() {
@@ -974,7 +1022,7 @@ fn the_folded_pool_matches_the_split_one() {
             );
         }
         let scale = neutral_scale(&ctx, &serve, &split, tokens.len(), &walked);
-        split_arms.push((tokens, split, scale));
+        split_arms.push((tokens, split, walked, scale));
     }
 
     // The same budget of pages, in the other format; the serving path
@@ -1007,41 +1055,41 @@ fn the_folded_pool_matches_the_split_one() {
         serve.global_pool.layout().page_stride
     );
 
-    let widest_scale = split_arms.iter().fold(0.0f32, |m, c| m.max(c.2));
+    let widest_scale = split_arms.iter().fold(0.0f32, |m, c| m.max(c.3));
     let line = DRIFT_LINE;
     let mut worst_overall = (0.0f32, 0usize, 0usize, 0usize);
-    for ((prompt, len), (tokens, split, scale)) in cells.iter().zip(&split_arms) {
-        let (folded, _) = continue_greedy(&ctx, &serve, tokens, STEPS);
-        let mut worst = (0.0f32, 0usize);
-        let mut compared = 0usize;
+    for ((prompt, len), (tokens, split, walked, scale)) in cells.iter().zip(&split_arms) {
+        let folded = continue_forced(&ctx, &serve, tokens, walked, STEPS);
+        let mut worst = (0.0f32, 1usize);
+        let mut moved = 0usize;
         for (i, (a, b)) in split.iter().zip(&folded).enumerate() {
-            let row = compare_row(a, b, &format!("prompt {prompt} at {len}, row {i}"));
-            compared = i + 1;
+            let row = compare_row(a, b, &format!("prompt {prompt} at {len}, {}", row_label(i)));
             if i == 0 {
                 assert!(
                     row.worst <= 2.0,
-                    "prompt {prompt} at {len}: folded prefill |dlogit| {} above the \
+                    "prompt {prompt} at {len}: folded prompt row |dlogit| {} above the \
                      prefill line of 2.0",
                     row.worst
                 );
             } else if row.worst > worst.0 {
                 worst = (row.worst, i);
             }
-            if row.flipped {
-                break;
-            }
+            moved += usize::from(row.flipped);
         }
         eprintln!(
             "prompt {prompt} at {len} tokens: floor 0, neutral scale {scale}, \
-             folded decode |dlogit| {} at row {}, {compared} of {STEPS} rows compared",
-            worst.0, worst.1
+             folded decode |dlogit| {} at {}, {} of {} rows moved a pick",
+            worst.0,
+            row_label(worst.1),
+            moved,
+            split.len()
         );
         assert!(
             worst.0 <= line,
-            "prompt {prompt} at {len}: folded decode |dlogit| {} at row {} above the \
+            "prompt {prompt} at {len}: folded decode |dlogit| {} at {} above the \
              drift line of {line}",
             worst.0,
-            worst.1
+            row_label(worst.1)
         );
         if worst.0 > worst_overall.0 {
             worst_overall = (worst.0, worst.1, *prompt, *len);
@@ -1049,12 +1097,12 @@ fn the_folded_pool_matches_the_split_one() {
     }
     eprintln!(
         "folded against split over {} cells: neutral scale at most {widest_scale}, line \
-         {line}, worst decode |dlogit| {} at prompt {} length {} row {}",
+         {line}, worst decode |dlogit| {} at prompt {} length {} {}",
         cells.len(),
         worst_overall.0,
         worst_overall.2,
         worst_overall.3,
-        worst_overall.1
+        row_label(worst_overall.1)
     );
 }
 
