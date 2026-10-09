@@ -396,6 +396,21 @@ fn start_with_knobs(
             "{MIX_CHUNK_TOKENS_ENV} is unsupported under tensor parallelism: a chunked walk's \
              rounds gather across prompts and are not covered by the TP gates"
         );
+        // NCCL's abort waits for the captured graphs that reference the
+        // communicator being aborted, and a rank stopped inside a collective
+        // cannot release its own — so with decode graphs on there is no order that
+        // releases one rank and destroys another's graphs: the abort waits for the
+        // release, the release runs after the join, and the join waits for the
+        // rank that abort was to release. Refused rather than left to hang there;
+        // the repo's own measurement is that graphs are a wash under TP (146.0 vs
+        // 143.7 tok/s at 8-way on two L20s), so nothing priced above zero is given
+        // up.
+        anyhow::ensure!(
+            !graph_enabled,
+            "CUDA graphs are unsupported under tensor parallelism: a captured collective cannot be \
+             released while the rank that holds it is stopped inside one, and NCCL's abort waits \
+             for exactly that release. Pass --cuda-graph=false."
+        );
         // The ranks take ordinals `0..world` of what this process can see, so a
         // world size past the visible devices can only fail later, less clearly.
         // `cuDeviceGetCount` needs the driver up and on a fresh process this is
@@ -1313,9 +1328,12 @@ struct EngineState {
 }
 
 /// Captured collective graphs bake in NCCL kernel launches, and NCCL's
-/// communicator abort wedges while a graph that references them is still
-/// alive — so every rank releases its graphs here, on its own device, before
-/// the fields (and with them the communicators) drop.
+/// communicator abort waits for a graph that references them to be destroyed —
+/// so every rank releases its graphs here, on its own device, before the fields
+/// (and with them the communicators) drop. A tensor-parallel launch refuses
+/// graphs outright (`attach`, `ensure!(!graph_enabled, …)`), so under TP there
+/// is nothing captured to wait for; this order is what keeps the single-rank
+/// path right and what a lifted refusal would need again.
 impl Drop for EngineState {
     fn drop(&mut self) {
         let _ = select_device(&self.ctx);
@@ -1433,6 +1451,12 @@ impl EngineState {
         let extra_ranks = more.len();
         let outcome = std::thread::scope(|scope| -> Result<T> {
             let extra = &extra;
+            // Rank 0's device first, before any peer exists: a failure here would
+            // otherwise return from this closure while the peers are already
+            // running, and they would be left waiting on a collective rank 0
+            // never issued — the join would wait on them and the abort below
+            // would never be reached.
+            activate_rank(ctx)?;
             let mut handles = Vec::with_capacity(more.len());
             for (index, (state, item)) in more.iter_mut().zip(twins).enumerate() {
                 let rank = index + 1;
@@ -1461,15 +1485,11 @@ impl EngineState {
                         // here, from this thread, for the same reason the rank-0
                         // branch does it before the join — a peer inside that
                         // collective is unblocked by aborting *its* communicator.
-                        if select_device(&state.ctx).is_ok() {
-                            state.arena.release_graphs();
-                        } else {
-                            log::error!(
-                                "rank {rank}'s device {} will not come current, so its graphs \
-                                 stay alive across the communicator abort; that abort may wedge",
-                                state.ctx.device_ordinal
-                            );
-                        }
+                        // Nothing is captured to release first (a TP2 launch
+                        // refuses graphs); the call stays for the ordering a
+                        // lifted refusal would need.
+                        let _ = select_device(&state.ctx);
+                        state.arena.release_graphs();
                         for comm in &comms {
                             comm.abort();
                         }
@@ -1478,7 +1498,6 @@ impl EngineState {
                     Ok(())
                 }));
             }
-            activate_rank(ctx)?;
             let ranked = rank0(ctx, serve, arena, core);
             if ranked.is_err() && extra_ranks > 0 {
                 // Rank 0's sequence may have stopped short, so a peer's matching
@@ -1490,14 +1509,14 @@ impl EngineState {
                 // peers' communicators are reached through the engine's own
                 // handles rather than their serves.
                 //
-                // The peers' graphs are still alive at this point, because their
-                // arenas live on their threads until the join: this inverts the
-                // release-then-abort order `EngineState::drop` documents, and it
-                // has to. A peer stopped inside a collective cannot be asked to
-                // release its own graphs first, and the abort is the only thing
-                // that gets it out of one — see the known bound in
-                // `docs/models/gemma4/tp.md`, which names this window rather than
-                // claiming the order holds.
+                // This is the one order that works, and it is why a TP2 launch
+                // refuses CUDA graphs: NCCL's abort waits for a captured graph
+                // that references the communicator to be destroyed, and a peer
+                // stopped inside a collective can only release its own graphs
+                // after the join that its own abort is holding up. With graphs
+                // refused there is no captured collective in the way, and the
+                // release calls below are vacuous — they stay because they are
+                // what a lifted refusal would need again.
                 //
                 // Only with extra ranks: with none there is no collective to
                 // abort and no peer frontier to keep in step, so this stays the
@@ -1506,19 +1525,10 @@ impl EngineState {
                 // request-local error — a per-request scratch allocation — into
                 // the end of the engine.
                 tp_broken.set(true);
-                if select_device(ctx).is_ok() {
-                    arena.release_graphs();
-                } else {
-                    // A device that will not come current is the one case where
-                    // the release cannot run — and it is exactly the case a
-                    // sticky fault produces, so name the order we are about to
-                    // break: the abort below then runs against a live graph.
-                    log::error!(
-                        "rank 0's device {} will not come current, so its graphs stay alive \
-                         across the communicator abort; that abort may wedge",
-                        ctx.device_ordinal
-                    );
-                }
+                // Nothing is captured to release (a TP2 launch refuses graphs);
+                // the call stays for the ordering a lifted refusal would need.
+                let _ = select_device(ctx);
+                arena.release_graphs();
                 serve.abort_tp_comm();
                 for comm in extra_comms.iter() {
                     comm.abort();
@@ -1567,6 +1577,10 @@ impl EngineState {
     /// here for the same reason a failed rank 0 is: the ranks' frontiers must
     /// not drift apart.
     ///
+    /// The release is vacuous while a TP2 launch refuses graphs; it stays so the
+    /// order the abort needs — graphs gone before a communicator goes away — is
+    /// right if that refusal is lifted.
+    ///
     /// At world size 1 there is no peer to abort, no comm to break and no
     /// frontier to keep in step, so this leaves the engine alone — the same
     /// failure stays what it has always been, that one request's.
@@ -1576,17 +1590,9 @@ impl EngineState {
         }
         self.tp_broken.set(true);
         self.serve.abort_tp_comm();
-        for (index, state) in self.more.iter_mut().enumerate() {
-            if select_device(&state.ctx).is_ok() {
-                state.arena.release_graphs();
-            } else {
-                log::error!(
-                    "rank {}'s device {} will not come current, so its graphs stay alive across \
-                     the communicator abort; that abort may wedge",
-                    index + 1,
-                    state.ctx.device_ordinal
-                );
-            }
+        for state in &mut self.more {
+            let _ = select_device(&state.ctx);
+            state.arena.release_graphs();
             state.serve.abort_tp_comm();
         }
     }

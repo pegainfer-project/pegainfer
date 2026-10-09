@@ -49,14 +49,14 @@ A decode step costs ~49 ms for one row and ~56 ms for eight (3.57 s / 64 steps),
 
 ## Eager vs captured decode
 
-The default is captured (`--cuda-graph=true`, as at TP1); both modes measured back to back on the pair:
+Captured measured worth ~nothing here and is now **refused** under TP (`--cuda-graph=true` would leave the failure path unresolvable — see `models/gemma4/tp.md`, "Decode graphs are refused under TP"), so these two rows are the record of why it was dropped rather than two options. Both were measured back to back on the pair:
 
 | mode | TTFT | step | c8 aggregate |
 | --- | ---: | ---: | ---: |
 | eager (`--cuda-graph=false`) | 56.5 ms | 49.4 ms | 143.7 tok/s |
-| captured (default) | 57.0 ms | 51.5 ms | 146.0 tok/s |
+| captured (the old default) | 57.0 ms | 51.5 ms | 146.0 tok/s |
 
-A wash: the collective, not launch count, dominates the step, so capture buys little and costs ~4% per step at c1. Both start, serve and shut down cleanly; the numbers in the tables above are the eager run.
+A wash: the collective, not launch count, dominates the step, so capture buys little and costs ~4% per step at c1. The numbers in the tables above are the eager run, which is the only mode TP2 now starts in.
 
 ## Correctness
 

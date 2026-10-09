@@ -62,13 +62,21 @@ const TOP_K: usize = 8;
 const LOGBROB_LINE: f32 = 1.0;
 
 /// How far apart the two runs' picks may read **within the same run** and still
-/// be a tie: that run's own two entries, read in both runs. Mutual top-`TOP_K`
-/// membership alone is not a tie — `[6, 0, …]` against `[0, 6, …]` passes it
-/// while each run prefers a different token by six nats, and `LOGBROB_LINE` does
-/// not see that either, because it bounds a token *both* runs kept. The margin is
-/// a difference inside one row, so it is the same quantity on log_softmax (here)
-/// as on raw logits, which is where `serve_oracle`'s near-tie rule reads the same
-/// width.
+/// be a tie: that run's own two entries, read in both runs.
+///
+/// Top-`TOP_K` membership alone is not a tie — `[6, 0, …]` against `[0, 6, …]`
+/// passes it while each pick sits six nats from its own runner-up — but the
+/// bound folded in beside this rule, `worst_pick < LOGBROB_LINE`, *does* catch
+/// that shape: both picks' own gaps fold in, and a flip that wide has moved one
+/// of them. What the width adds is the band between the two: a margin just over
+/// the width riding a near-zero same-token mean (0.9 and 1.05 apart with 0.975
+/// gaps passes the line and fails this), a tie test that stands on its own, and
+/// a failure that names the two picks and both margins.
+///
+/// The margin is a difference inside one row, so it is the same quantity on
+/// log_softmax (here) as on raw logits, which is where `serve_oracle`'s rule
+/// reads it — and that side has only a whole-row 12.0 line, so there the width
+/// is what catches the six-nat shape as well.
 const NEAR_TIE_WIDTH: f32 = 1.0;
 
 /// The two devices a TP2 gate runs across, defaulting to 0 and 1.
@@ -91,12 +99,16 @@ fn single_options(device: usize) -> EngineLoadOptions {
     }
 }
 
-/// Two ranks, two devices. Graphs are on when `PEGAINFER_TP_GRAPH` is set, which
-/// turns the gate into a parity check: one rank eager against two ranks
-/// captured.
+/// Two ranks, two devices. Eager, because a tensor-parallel launch refuses
+/// graphs: NCCL's abort waits for a captured graph that references the
+/// communicator to be destroyed, and a rank stopped inside a collective cannot
+/// release its own — so a captured collective would make the failure path
+/// unresolvable. The engine refuses them at launch
+/// (`engine.rs`, "CUDA graphs are unsupported under tensor parallelism"), which
+/// is what this arm has to match.
 fn tp2_options(a: usize, b: usize) -> EngineLoadOptions {
     EngineLoadOptions {
-        enable_cuda_graph: std::env::var("PEGAINFER_TP_GRAPH").is_ok(),
+        enable_cuda_graph: false,
         device_ordinals: vec![a, b],
         parallel_config: Some(ParallelConfig::new(2, 1)),
         ..EngineLoadOptions::default()
@@ -318,9 +330,10 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
                 }
                 // Membership is not a tie on its own: `[6, 0, …]` against
                 // `[0, 6, …]` has each pick as the other's runner-up while both
-                // picks sit six nats from their own runner-up, and the bound
-                // folded in above cannot see that either (it measures a token
-                // both runs kept). Read the margin in each run's own list.
+                // sit six nats from their own runner-up. The bound folded in
+                // above catches that shape (a flip that wide has moved a pick),
+                // but not a margin just over the width riding a near-zero
+                // same-token mean — so read the margin in each run's own list.
                 let (one_margin, two_margin) = (
                     (left[&pa] - left[&pb]).abs(),
                     (right[&pa] - right[&pb]).abs(),
@@ -330,8 +343,10 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
                     "{what}: request {index} step {step}: the picks {pa} and {pb} sit \
                      {one_margin} and {two_margin} apart in the one-rank and two-rank \
                      readings, wider than the {NEAR_TIE_WIDTH} a reduction-order flip moves \
-                     them — each pick is inside the other run's top-{TOP_K}, so this margin is \
-                     the only thing left that tells a tie from a different distribution"
+                     them (the picked-token bound, both picks folded in, reads {worst_pick} \
+                     against {LOGBROB_LINE}) — each pick is inside the other run's \
+                     top-{TOP_K}, so this margin is what tells a tie from a different \
+                     distribution"
                 );
                 eprintln!(
                     "{what}: near-tie flip {pa} vs {pb}, margins {one_margin} / {two_margin}"
@@ -375,14 +390,26 @@ fn scored(row: &[(u32, f32)]) -> TokenLogprob {
 }
 
 /// A flip six nats wide: each pick is the other run's runner-up, so mutual
-/// top-`TOP_K` membership holds and only the margins can tell that these are two
-/// different distributions.
+/// top-`TOP_K` membership holds. The gate's own bound catches this shape as well
+/// — the folded `worst_pick` reads 6 against `LOGBROB_LINE` — so this test is
+/// the membership half's failure, and the one below is what the width adds.
 #[test]
 #[should_panic(expected = "apart in the one-rank and two-rank readings")]
 fn a_flip_six_nats_wide_is_not_a_near_tie() {
     let one = vec![drained_run(&[&[(100, 6.0), (200, 0.0)]])];
     let two = vec![drained_run(&[&[(200, 6.0), (100, 0.0)]])];
     distribution_gap(&one, &two, "six nats");
+}
+
+/// The band only the width rejects: the margins are 0.9 and 1.05 apart while both
+/// picks' own gaps fold to 0.975 — inside `LOGBROB_LINE`, so the gate's line
+/// passes this shape and the margin is the whole rule.
+#[test]
+#[should_panic(expected = "apart in the one-rank and two-rank readings")]
+fn a_flip_the_line_cannot_see_is_still_not_a_tie() {
+    let one = vec![drained_run(&[&[(100, 0.9), (200, 0.0)]])];
+    let two = vec![drained_run(&[&[(200, 0.975), (100, -0.075)]])];
+    distribution_gap(&one, &two, "the band");
 }
 
 /// A tie in one run only: the one-rank row's top two sit half a nat apart, the
@@ -574,6 +601,11 @@ fn the_two_rank_engine_scores_prompt_logprobs() {
 struct PrefixComparison {
     compared: usize,
     overlapped: usize,
+    /// Rows whose top-`TOP_K` shared no token at all. They contribute nothing to
+    /// `worst`, so they are counted rather than left to pass the gate on one
+    /// shared row elsewhere: a widespread error — a page, position or rope fault
+    /// — is mostly rows like this.
+    disjoint: usize,
     worst: f32,
     worst_at: String,
     flipped: usize,
@@ -583,12 +615,13 @@ struct PrefixComparison {
 impl PrefixComparison {
     fn report(&self, what: &str, long: usize) {
         eprintln!(
-            "{what}: {} vs {} tokens: {} rows, {} with a shared token; worst shared-token gap \
-             {:.4} at {}; {} argmax flips (first {})",
+            "{what}: {} vs {} tokens: {} rows, {} with a shared token, {} sharing none; worst \
+             shared-token gap {:.4} at {}; {} argmax flips (first {})",
             long / 2,
             long,
             self.compared,
             self.overlapped,
+            self.disjoint,
             self.worst,
             self.worst_at,
             self.flipped,
@@ -596,9 +629,10 @@ impl PrefixComparison {
         );
     }
 
-    /// The two properties every arm needs before its gap means anything: rows
-    /// were compared, and at least one of them shared a token with the other
-    /// run — without that the gap is a zero nobody measured.
+    /// The properties every arm needs before its gap means anything: rows were
+    /// compared, at least one of them shared a token with the other run, and the
+    /// rows that shared *nothing* are not the bulk of them — without that the gap
+    /// is a zero nobody measured.
     fn assert_reads_something(&self, what: &str, long: usize) {
         assert!(
             self.compared > 0,
@@ -609,6 +643,20 @@ impl PrefixComparison {
             self.overlapped > 0,
             "{what}: no row's top-{TOP_K} was shared between the {}- and {long}-token runs, so \
              the gap measured nothing",
+            long / 2
+        );
+        // A widespread error makes most rows share nothing, and those rows are
+        // invisible to `worst`: this is the bound that sees them. Read against
+        // the reading, which is 0 of 511 rows at 1024 tokens — a quarter is far
+        // above any run this gate has taken and far below a fault that moves
+        // every page.
+        assert!(
+            self.disjoint * 4 <= self.compared,
+            "{what}: {} of {} rows share no token between the {}- and {long}-token runs, more \
+             than a quarter of them — a disagreement that widespread is not the row-count \
+             dependence this line is calibrated for, and those rows never reach `worst`",
+            self.disjoint,
+            self.compared,
             long / 2
         );
     }
@@ -635,6 +683,7 @@ fn prefix_comparison(options: &EngineLoadOptions, long: usize) -> PrefixComparis
     let mut comparison = PrefixComparison {
         compared: 0,
         overlapped: 0,
+        disjoint: 0,
         worst: 0.0,
         worst_at: String::new(),
         flipped: 0,
@@ -670,6 +719,8 @@ fn prefix_comparison(options: &EngineLoadOptions, long: usize) -> PrefixComparis
         }
         if shared > 0 {
             comparison.overlapped += 1;
+        } else {
+            comparison.disjoint += 1;
         }
         let (pa, pb) = (a.top_logprobs[0].0, b.top_logprobs[0].0);
         if pa != pb {
@@ -994,15 +1045,16 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     /// logits. A shared token may sit this far apart: bf16 reduction order and a
     /// different attention backend, nothing structural.
     const DRIFT_LINE: f32 = 1.0;
-    // Only the nine-token case is asserted. Running the fixture's 1024-token
-    // `edge` anyway fails a strict top-64 containment on ~5-8 rows — *the same
-    // rows with one rank as with two*, which is what shows the second rank adds
-    // nothing and leaves this as the depth-dependent shape-dependence these
-    // fixtures carry per-case tolerances for. (`probed_cases` is the fixture's
-    // list of cases carrying hidden-state probes; `edge` has none because at
-    // window width they would dwarf the file, so its absence there says nothing
-    // about whether the case is asserted.) See docs/models/gemma4/tp.md
-    // "Known bounds".
+    // Only the nine-token case is asserted, so **long prompts at TP2 are
+    // unverified**: running the fixture's 1024-token `edge` fails a strict top-64
+    // containment on ~5-8 rows, and those rows fail at one rank as well as at
+    // two — which says nothing about the second rank either way, since a failure
+    // both arms share is explained by neither. Pinning that depth needs the
+    // fixtures' per-case tolerance discipline, not a containment test.
+    // (`probed_cases` lists the cases carrying hidden-state probes; `edge` has
+    // none because at window width they would dwarf the file, so its absence
+    // says nothing about whether the case is asserted.) See
+    // docs/models/gemma4/tp.md "Known bounds".
     const CASES: [&str; 1] = ["short"];
 
     let (device, peer) = devices();
