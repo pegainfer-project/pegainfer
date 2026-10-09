@@ -42,29 +42,31 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
     ]
 }
 
-/// When no compiled-in line claims the config but the identity belongs to a
-/// known family, tell the user which feature to rebuild with.
+/// One row of [`families`]: a line's feature, the identities its `probe` claims,
+/// and whether that line is compiled into this binary.
+struct Family {
+    feature: &'static str,
+    model_types: &'static [&'static str],
+    text_model_types: &'static [&'static str],
+    compiled: bool,
+}
+
+/// Every line the server can be built with, and the identities its `probe`
+/// claims.
 ///
-/// The identity strings here must stay in sync with each line's `probe`
-/// gate: this table exists precisely because the line (and its probe) is
-/// compiled out, so the duplication cannot be derived away.
-fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
-    struct Family {
-        feature: &'static str,
-        model_types: &'static [&'static str],
-        text_model_types: &'static [&'static str],
-        compiled: bool,
-    }
-    let model_type = config
-        .get("model_type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let text_model_type = config
-        .get("text_config")
-        .and_then(|text| text.get("model_type"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let families = [
+/// This is **a second source of truth by necessity**: the hint exists for the
+/// case where the line — and therefore its `probe` — is compiled out, so these
+/// strings cannot be read from the line crate. The `qwen38-flash-next` row is
+/// bound to that crate's own `MODEL_TYPE`/`TEXT_MODEL_TYPE` by a test under the
+/// feature (`flash_next_hint_identity_matches_the_line_crate`); the other rows
+/// rest on each line's own probe tests plus review of this table.
+///
+/// The hint is **identity-only**: it cannot run a compiled-out probe, so it also
+/// fires for a variant that probe would refuse — a different `dtype` (the FP8
+/// sibling), tied embeddings, a YaRN rope. It names the feature to rebuild with;
+/// it is not a promise that the checkpoint is servable.
+fn families() -> [Family; 8] {
+    [
         Family {
             feature: "deepseek-v2-lite",
             model_types: &["deepseek_v2"],
@@ -109,12 +111,30 @@ fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
         },
         Family {
             feature: "qwen38-flash-next",
+            // The FP8 sibling and the tied/YaRN variants share this outer
+            // identity, so a hint fires for them too; the line's probe refuses
+            // those once the feature is on.
             model_types: &["qwen4_exp"],
             text_model_types: &["qwen4_exp_text"],
             compiled: cfg!(feature = "qwen38-flash-next"),
         },
-    ];
-    families.iter().find_map(|family| {
+    ]
+}
+
+/// When no compiled-in line claims the config but the identity belongs to a
+/// known family, tell the user which feature to rebuild with. See [`families`]
+/// for the identity table and its limits.
+fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
+    let model_type = config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let text_model_type = config
+        .get("text_config")
+        .and_then(|text| text.get("model_type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    families().iter().find_map(|family| {
         (!family.compiled
             && (family.model_types.contains(&model_type)
                 || family.text_model_types.contains(&text_model_type)))
@@ -361,5 +381,23 @@ mod tests {
     fn hint_is_silent_for_an_unknown_family() {
         let config = serde_json::json!({"model_type": "frobnicate_lm"});
         assert!(feature_gate_hint(&config).is_none());
+    }
+
+    /// [`families`] is a hand-mirror of each line's identity, because the line —
+    /// and its `probe` — is compiled out exactly when the hint is needed. This
+    /// binds the qwen38 row to the line crate's own constants, so changing one
+    /// side without the other fails here instead of silently leaving the hint
+    /// pointing at an identity the probe no longer claims.
+    #[cfg(feature = "qwen38-flash-next")]
+    #[test]
+    fn flash_next_hint_identity_matches_the_line_crate() {
+        use pegainfer_qwen38_flash_next::MODEL_TYPE;
+        use pegainfer_qwen38_flash_next::TEXT_MODEL_TYPE;
+        let family = families()
+            .into_iter()
+            .find(|family| family.feature == "qwen38-flash-next")
+            .expect("the qwen38-flash-next family is always listed");
+        assert_eq!(family.model_types, [MODEL_TYPE].as_slice());
+        assert_eq!(family.text_model_types, [TEXT_MODEL_TYPE].as_slice());
     }
 }

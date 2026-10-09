@@ -27,8 +27,10 @@ impl ModelLine for Qwen38FlashNextLine {
         anyhow::bail!(
             "Qwen3.8-Flash-Next is detected and its config is validated, but the text graph is \
              not built yet (slice B). Refusing to start rather than serving a partial model. \
-             Serving also depends on the GDN gated-norm activation being sigmoid rather than \
-             silu, which this checkpoint's output_gate_type selects."
+             The GDN gated-norm activation this checkpoint selects (sigmoid, not Qwen3.5's \
+             silu) became selectable in the shared kernel in #1129; the missing piece is \
+             wiring that call site, which lands with the text graph in slice B rather than \
+             being an open kernel dependency."
         )
     }
 }
