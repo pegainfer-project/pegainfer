@@ -1,6 +1,6 @@
 # Gemma 4 31B bf16 tensor-parallel-2 on two L20s
 
-TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as a two-rank eager engine — 29.91 GiB of weights per rank, a `PEGAINFER_MAX_CONTEXT=8192` envelope at 8 decode slots, cold load 30 s, first token 57 ms, 49.4 ms per decode step, and 143 tok/s aggregate at 8 concurrent. **Prompts here are short: the single-threaded rank driver caps a TP prompt at `PEGAINFER_TP_MAX_PROMPT` (default 64), so the envelope is the context, not the prompt** (`models/gemma4/tp.md`). The checkpoint does not fit one card (57 GiB), so there is no in-box single-rank baseline for it; numerical parity rests on the 31B-geometry synthetic gate (`models/gemma4/tp.md`).
+TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as a two-rank eager engine — 29.91 GiB of weights per rank, a `PEGAINFER_MAX_CONTEXT=8192` envelope at 8 decode slots, cold load 30 s, first token 57 ms, 49.4 ms per decode step, and 143 tok/s aggregate at 8 concurrent. The checkpoint does not fit one card (57 GiB), so there is no in-box single-rank baseline for it; numerical parity rests on the 31B-geometry synthetic gate (`models/gemma4/tp.md`).
 
 ## Rig
 
@@ -9,7 +9,7 @@ TL;DR: the stock 31B bf16 checkpoint serves on two 48 GiB L20s (sm_89, PCIe) as 
 | checkpoint | `gemma-4-31b-it`, bf16, text tower only (356 vision/audio tensors skipped) |
 | hardware | two NVIDIA L20 (sm_89, 44.99 GiB usable each), PCIe, one p8s node |
 | build | `--features gemma4`, `PEGAINFER_CUDA_SM=89`, CUDA 12.9 |
-| runtime | `--tp-size=2 --cuda-graph=false`, `NCCL_PROTO=LL128`, pod NCCL 2.18.3 |
+| runtime | `--tp-size=2`, `NCCL_PROTO=LL128`, pod NCCL 2.18.3 (decode graphs are off under TP — see `models/gemma4/tp.md`) |
 | envelope | `PEGAINFER_MAX_CONTEXT=8192`, `PEGAINFER_DECODE_SLOTS=8` |
 | checkpoint source | node-local disk (a PVC read is ~3.5 min per rank) |
 
@@ -49,14 +49,14 @@ A decode step costs ~49 ms for one row and ~56 ms for eight (3.57 s / 64 steps),
 
 ## Eager vs captured decode
 
-The default is captured (`--cuda-graph=true`, as at TP1); both modes measured back to back on the pair:
+Captured measured worth ~nothing here and is now **turned off** under TP (the flag is on by default, so a two-rank launch disables it — `models/gemma4/tp.md`, "Decode graphs are off under TP"), so these two rows are the record of why it was dropped rather than two options. Both were measured back to back on the pair:
 
 | mode | TTFT | step | c8 aggregate |
 | --- | ---: | ---: | ---: |
 | eager (`--cuda-graph=false`) | 56.5 ms | 49.4 ms | 143.7 tok/s |
-| captured (default) | 57.0 ms | 51.5 ms | 146.0 tok/s |
+| captured (the old default) | 57.0 ms | 51.5 ms | 146.0 tok/s |
 
-A wash: the collective, not launch count, dominates the step, so capture buys little and costs ~4% per step at c1. Both start, serve and shut down cleanly; the numbers in the tables above are the eager run.
+A wash: the collective, not launch count, dominates the step, so capture buys little and costs ~4% per step at c1. The numbers in the tables above are the eager run, which is the only mode TP2 now starts in.
 
 ## Correctness
 

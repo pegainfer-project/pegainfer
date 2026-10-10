@@ -845,21 +845,11 @@ impl StepArena {
         (&mut self.logits, &mut self.ids)
     }
 
-    /// The largest power-of-two decode bucket the capture sweep reaches.
-    pub(crate) fn bucket_ceiling(&self) -> usize {
-        self.max_rows
-    }
-
-    /// Restore the serving floor after a capture sweep, which walks every
-    /// bucket and would otherwise leave `min_bucket` at the ceiling.
-    pub(crate) fn reset_min_bucket(&mut self) {
-        self.min_bucket = 1;
-    }
-
-    /// Release the captured graphs. Called on teardown, before the
-    /// communicators go away: a captured collective bakes in NCCL kernel
-    /// launches, and NCCL's communicator abort wedges while a graph that
-    /// references them is still alive.
+    /// Release the captured graphs. Called on teardown, before the communicator
+    /// goes away: a captured collective bakes in NCCL kernel launches, and NCCL's
+    /// communicator abort waits for a graph that references them to be destroyed.
+    /// A tensor-parallel launch turns graphs off, so there is nothing captured to
+    /// release on that path.
     pub(crate) fn release_graphs(&mut self) {
         self.graphs.clear();
     }
@@ -1041,11 +1031,12 @@ pub(crate) struct GemmaServe {
 }
 
 // SAFETY: A serve is pinned to one CUDA device and driven by one thread at a
-// time — the thread that loads it (the load-time warm and the decode-graph
-// sweep walk the ranks one after another, never in parallel) and afterwards the
-// engine's scheduler thread, which owns the whole `EngineState` and touches a
-// rank's serve only while that rank's device is current. Nothing shares a serve
-// between threads, so the raw NCCL communicator it may hold never crosses a
+// time: the thread that loads it (the load-time warm and the decode-graph sweep
+// walk the ranks one after another, never in parallel), and afterwards exactly
+// one thread per step — the scheduler's for rank 0, and one scoped thread per
+// extra rank, which hands its `&mut` back at the join before the scheduler
+// touches that rank again (`EngineState::drive_ranks`). No two threads hold a
+// serve at once, so the raw NCCL communicator it may hold never crosses a
 // thread while in use. (Same assertions `Qwen3Model` makes.)
 unsafe impl Send for GemmaServe {}
 
@@ -1181,13 +1172,22 @@ impl GemmaServe {
         self.tp_comm = Some(comm);
     }
 
-    /// Take the communicator out, dropping — and so aborting — it. A cudarc
-    /// NCCL comm aborts on drop, which unblocks a peer already waiting on a
-    /// call this rank will never issue. Call it once the pair's collective
-    /// sequence is broken beyond repair; a comm-less step would otherwise
-    /// reduce to a no-op, so the engine must stop afterwards.
-    pub(crate) fn detach_tp_comm(&mut self) -> Option<TpComm> {
-        self.tp_comm.take()
+    /// Fail this rank's communicator. Reachable without borrowing the serve —
+    /// the engine holds its own handle — which is what lets the scheduler abort
+    /// a peer's communicator while that peer is inside a collective. A
+    /// comm-less step would otherwise reduce to a no-op, so the engine must
+    /// stop afterwards.
+    pub(crate) fn abort_tp_comm(&self) {
+        if let Some(comm) = self.tp_comm.as_ref() {
+            comm.abort();
+        }
+    }
+
+    /// This rank's communicator as a handle of its own, so a step's thread can
+    /// abort it — or a peer's — without borrowing either serve. `TpComm` is a
+    /// handle over a shared slot, so the clone reaches the same communicator.
+    pub(crate) fn tp_comm(&self) -> Option<TpComm> {
+        self.tp_comm.clone()
     }
 
     /// The global family's prefill, through whichever kernel this engine was
@@ -2770,10 +2770,8 @@ impl GemmaServe {
         ctx.sync()
     }
 
-    /// One bucket of the sweep, one phase at a time. `Capture` only records, but
-    /// `Warm` and `Launch` execute, and the collectives they enqueue need every
-    /// rank's matching call — so a driver with more than one rank interleaves
-    /// the phases across ranks rather than running one rank's whole sweep.
+    /// One bucket of the sweep, one phase at a time. `Capture` only records, while
+    /// `Warm` executes an eager pass and `Launch` drives the serving path.
     pub(crate) fn precapture_bucket(
         &self,
         ctx: &DeviceContext,

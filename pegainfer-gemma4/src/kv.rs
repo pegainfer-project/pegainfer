@@ -310,6 +310,17 @@ impl GemmaKv {
             }
         }
     }
+
+    /// Both halves at once: rank 0's `core` and one `&mut` per twin, so a driver
+    /// that hands each rank to its own thread gets disjoint borrows.
+    pub(crate) fn split(&mut self) -> (&mut RankKv, &mut [RankKv]) {
+        (&mut self.core, &mut self.twins)
+    }
+
+    /// How many ranks this request's KV spans.
+    pub(crate) fn world(&self) -> usize {
+        self.twins.len() + 1
+    }
 }
 
 /// Pages a family still has to reserve to cover `kv_len` tokens, given what

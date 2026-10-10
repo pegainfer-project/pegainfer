@@ -9,13 +9,21 @@
 //! the greedy pick. The engine's own docs say as much — greedy is reproducible
 //! for a fixed workload, not across two arithmetic orders — so the gate holds
 //! the top-k logprobs to a line and requires a differing pick to be a genuine
-//! near-tie (each pick inside the other run's top-k).
+//! near-tie (each pick inside the other run's top-k *and* the two picks within
+//! `NEAR_TIE_WIDTH` of each other in both readings).
 //!
 //! Two GPUs are mandatory, so these run one at a time on a box that has them.
+//! The near-tie rule's own halves are the exception: they read nothing but the
+//! two rows, so they carry unit tests that need no device and run with the
+//! library's ordinary suite.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
+use pegainfer_core::tensor::DeviceContext;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::parallel::ParallelConfig;
 
@@ -23,6 +31,7 @@ use super::lane_tests::Drained;
 use super::lane_tests::Harness;
 use super::lane_tests::ids;
 use super::lane_tests::launch_with;
+use super::lane_tests::wait_until;
 use crate::testkit::f32_tensor;
 use crate::testkit::golden_bytes;
 use crate::testkit::i32_tensor;
@@ -52,6 +61,24 @@ use crate::testkit::u32_tensor;
 const TOP_K: usize = 8;
 const LOGBROB_LINE: f32 = 1.0;
 
+/// How far apart the two runs' picks may read **within the same run** and still
+/// be a tie: that run's own two entries, read in both runs.
+///
+/// Top-`TOP_K` membership alone is not a tie — `[6, 0, …]` against `[0, 6, …]`
+/// passes it while each pick sits six nats from its own runner-up — but the
+/// bound folded in beside this rule, `worst_pick < LOGBROB_LINE`, *does* catch
+/// that shape: both picks' own gaps fold in, and a flip that wide has moved one
+/// of them. What the width adds is the band between the two: a margin just over
+/// the width riding a near-zero same-token mean (0.9 and 1.05 apart with 0.975
+/// gaps passes the line and fails this), a tie test that stands on its own, and
+/// a failure that names the two picks and both margins.
+///
+/// The margin is a difference inside one row, so it is the same quantity on
+/// log_softmax (here) as on raw logits, which is where `serve_oracle`'s rule
+/// reads it — and that side has only a whole-row 12.0 line, so there the width
+/// is what catches the six-nat shape as well.
+const NEAR_TIE_WIDTH: f32 = 1.0;
+
 /// The two devices a TP2 gate runs across, defaulting to 0 and 1.
 fn devices() -> (usize, usize) {
     let read = |name: &str, fallback: usize| {
@@ -72,12 +99,16 @@ fn single_options(device: usize) -> EngineLoadOptions {
     }
 }
 
-/// Two ranks, two devices. Graphs are on when `PEGAINFER_TP_GRAPH` is set, which
-/// turns the gate into a parity check: one rank eager against two ranks
-/// captured.
+/// Two ranks, two devices, with CUDA graphs left **at their default** (`true`).
+/// A tensor-parallel launch turns them off and says so: NCCL's abort waits for a
+/// captured graph that references the communicator to be destroyed, and a rank
+/// stopped inside a collective cannot release its own, so a captured collective
+/// would make the failure path unresolvable. The engine serves eager rather than
+/// refusing, and this arm is what holds that — with the flag at its default every
+/// gate here would fail at launch if the refusal came back.
 fn tp2_options(a: usize, b: usize) -> EngineLoadOptions {
     EngineLoadOptions {
-        enable_cuda_graph: std::env::var("PEGAINFER_TP_GRAPH").is_ok(),
+        enable_cuda_graph: true,
         device_ordinals: vec![a, b],
         parallel_config: Some(ParallelConfig::new(2, 1)),
         ..EngineLoadOptions::default()
@@ -274,9 +305,11 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
                     worst_pick = worst_pick.max((va - vb).abs());
                 }
             } else {
-                // A different pick has to be a near-tie: each pick inside the
-                // other run's top-k. Otherwise the two runs disagree about the
-                // distribution, not about its last bits.
+                // A different pick has to be a near-tie, in both halves: each
+                // pick inside the other run's top-k *and* the two picks within
+                // `NEAR_TIE_WIDTH` of each other in each run's own reading.
+                // Otherwise the two runs disagree about the distribution, not
+                // about its last bits.
                 assert!(
                     right.contains_key(&pa),
                     "{what}: request {index} step {step}: one-rank pick is outside the two-rank top-{TOP_K}"
@@ -295,6 +328,29 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
                         worst_pick = worst_pick.max((va - vb).abs());
                     }
                 }
+                // Membership is not a tie on its own: `[6, 0, …]` against
+                // `[0, 6, …]` has each pick as the other's runner-up while both
+                // sit six nats from their own runner-up. The bound folded in
+                // above catches that shape (a flip that wide has moved a pick),
+                // but not a margin just over the width riding a near-zero
+                // same-token mean — so read the margin in each run's own list.
+                let (one_margin, two_margin) = (
+                    (left[&pa] - left[&pb]).abs(),
+                    (right[&pa] - right[&pb]).abs(),
+                );
+                assert!(
+                    one_margin <= NEAR_TIE_WIDTH && two_margin <= NEAR_TIE_WIDTH,
+                    "{what}: request {index} step {step}: the picks {pa} and {pb} sit \
+                     {one_margin} and {two_margin} apart in the one-rank and two-rank \
+                     readings, wider than the {NEAR_TIE_WIDTH} a reduction-order flip moves \
+                     them (the picked-token bound, both picks folded in, reads {worst_pick} \
+                     against {LOGBROB_LINE}) — each pick is inside the other run's \
+                     top-{TOP_K}, so this margin is what tells a tie from a different \
+                     distribution"
+                );
+                eprintln!(
+                    "{what}: near-tie flip {pa} vs {pb}, margins {one_margin} / {two_margin}"
+                );
                 // The two runs now decode from different prefixes, so every later
                 // step of this request compares different text; stop here.
                 break;
@@ -309,6 +365,89 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
         compared,
         detail,
     }
+}
+
+/// A run of hand-written top-k rows, one per scored step: the rule reads nothing
+/// but `logprobs`, so nothing else about the rows has to be real.
+fn drained_run(rows: &[&[(u32, f32)]]) -> Drained {
+    Drained {
+        tokens: rows.len(),
+        cached: 0,
+        finish: FinishReason::Length,
+        ids: rows.iter().map(|row| row[0].0).collect(),
+        logprobs: rows.iter().map(|row| Some(scored(row))).collect(),
+        prompt_echo: None,
+    }
+}
+
+/// One scored row, its top entry taken as the row's own logprob.
+fn scored(row: &[(u32, f32)]) -> TokenLogprob {
+    TokenLogprob {
+        logprob: row[0].1,
+        rank: 1,
+        top_logprobs: row.to_vec(),
+    }
+}
+
+/// A flip six nats wide: each pick is the other run's runner-up, so mutual
+/// top-`TOP_K` membership holds. The gate's own bound catches this shape as well
+/// — the folded `worst_pick` reads 6 against `LOGBROB_LINE` — so this test is
+/// the membership half's failure, and the one below is what the width adds.
+#[test]
+#[should_panic(expected = "apart in the one-rank and two-rank readings")]
+fn a_flip_six_nats_wide_is_not_a_near_tie() {
+    let one = vec![drained_run(&[&[(100, 6.0), (200, 0.0)]])];
+    let two = vec![drained_run(&[&[(200, 6.0), (100, 0.0)]])];
+    distribution_gap(&one, &two, "six nats");
+}
+
+/// The band only the width rejects: the margins are 0.9 and 1.05 apart while both
+/// picks' own gaps fold to 0.975 — inside `LOGBROB_LINE`, so the gate's line
+/// passes this shape and the margin is the whole rule.
+#[test]
+#[should_panic(expected = "apart in the one-rank and two-rank readings")]
+fn a_flip_the_line_cannot_see_is_still_not_a_tie() {
+    let one = vec![drained_run(&[&[(100, 0.9), (200, 0.0)]])];
+    let two = vec![drained_run(&[&[(200, 0.975), (100, -0.075)]])];
+    distribution_gap(&one, &two, "the band");
+}
+
+/// A tie in one run only: the one-rank row's top two sit half a nat apart, the
+/// two-rank row prefers `200` by six and a half. Membership holds on both sides
+/// again, so the width has to be read in both rows for this to fail.
+#[test]
+#[should_panic(expected = "apart in the one-rank and two-rank readings")]
+fn a_tie_in_only_one_of_the_two_runs_is_not_a_near_tie() {
+    let one = vec![drained_run(&[&[(100, 0.0), (200, -0.5)]])];
+    let two = vec![drained_run(&[&[(200, 6.0), (100, -0.5)]])];
+    distribution_gap(&one, &two, "one run");
+}
+
+/// The shape the rule is for, and the bound a flip must not escape: both picks'
+/// own gaps fold in before the request stops, so the step that flipped is
+/// measured rather than skipped — and the request's later steps, where the two
+/// runs are decoding different text, are not compared at all.
+#[test]
+fn a_flip_inside_the_width_still_measures_its_own_step() {
+    let one = vec![drained_run(&[
+        &[(100, 0.0), (200, -0.2)],
+        &[(100, 9.0), (200, 8.0)],
+    ])];
+    let two = vec![drained_run(&[
+        &[(200, 0.1), (100, -0.3)],
+        &[(100, -9.0), (200, -8.0)],
+    ])];
+    let gaps = distribution_gap(&one, &two, "unit");
+    assert_eq!(gaps.compared, 1, "the request stops at the flip");
+    assert_eq!(
+        gaps.same_pick, 0,
+        "the step that flipped is not a shared pick"
+    );
+    assert!(
+        (gaps.worst_pick - 0.3).abs() < 1e-6,
+        "both picks' own gaps fold in (0.3 each), read {}",
+        gaps.worst_pick
+    );
 }
 
 /// Two ranks must agree with one rank on the same checkpoint. Which
@@ -388,7 +527,6 @@ fn envelope_overrides() -> Vec<(&'static str, String)> {
     for (var, knob) in [
         ("PEGAINFER_TP_SLOTS", super::DECODE_SLOTS_ENV),
         ("PEGAINFER_TP_CTX", super::MAX_CONTEXT_ENV),
-        ("PEGAINFER_TP_MAX_PROMPT", super::TP_MAX_PROMPT_ENV),
     ] {
         if let Ok(value) = std::env::var(var) {
             overrides.push((knob, value));
@@ -411,13 +549,12 @@ fn as_refs<'a>(overrides: &'a [(&'static str, String)]) -> Vec<(&'static str, &'
 #[ignore = "needs two GPUs and --test-threads=1"]
 fn the_two_rank_engine_scores_prompt_logprobs() {
     const TOP_K: usize = 8;
-    // The gate's prompt is the TP ceiling itself, so the length the guard
-    // refuses past is the length this passes. `PEGAINFER_TP_PROMPT_TOKENS`
-    // overrides it to probe another point.
+    // A mid-length prompt, so the scored path runs a real prefill per rank rather
+    // than a single-token one. `PEGAINFER_TP_PROMPT_TOKENS` probes another point.
     let len: usize = std::env::var("PEGAINFER_TP_PROMPT_TOKENS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(super::TP_MAX_PROMPT);
+        .unwrap_or(64);
     let (device, peer) = devices();
     assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
     let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
@@ -440,11 +577,502 @@ fn the_two_rank_engine_scores_prompt_logprobs() {
         assert_eq!(
             echo.logprobs.len(),
             prompt.len(),
-            "one scored prompt row per prompt token"
+            "one scored row per prompt token"
         );
     }
     let refs: Vec<&_> = controls.iter().collect();
     harness.shutdown(&refs);
+}
+
+/// A causal model's row `r` depends only on tokens `..= r`, so the same prompt's
+/// early rows must score the same whether the prompt is run whole or cut short.
+/// They will not be bit-identical — the prefill GEMM's tiling, and so its
+/// accumulation order, depends on the row count — so the gate bounds the shared
+/// rows by the same chaotic-shape line `serve_oracle` calibrates (`PREFIX_LINE`),
+/// not by the one-rank comparison's tighter one. A **large** gap here is the
+/// engine's own long-context bug (a page, position or rope error), with no
+/// reference implementation involved.
+///
+/// `PEGAINFER_TP_PROMPT_TOKENS` sets the long length (default 1024, the window
+/// width); the short run is its first half.
+/// What one prefix comparison read: how many rows lined up, how many of those
+/// shared a token at all (the gap is only read where they do), the worst
+/// shared-token gap and where it was, and how the argmaxes moved.
+struct PrefixComparison {
+    compared: usize,
+    overlapped: usize,
+    /// Rows whose top-`TOP_K` shared no token at all. They contribute nothing to
+    /// `worst`, so they are counted rather than left to pass the gate on one
+    /// shared row elsewhere: a widespread error — a page, position or rope fault
+    /// — is mostly rows like this.
+    disjoint: usize,
+    worst: f32,
+    worst_at: String,
+    flipped: usize,
+    first_flip: String,
+}
+
+impl PrefixComparison {
+    fn report(&self, what: &str, long: usize) {
+        eprintln!(
+            "{what}: {} vs {} tokens: {} rows, {} with a shared token, {} sharing none; worst \
+             shared-token gap {:.4} at {}; {} argmax flips (first {})",
+            long / 2,
+            long,
+            self.compared,
+            self.overlapped,
+            self.disjoint,
+            self.worst,
+            self.worst_at,
+            self.flipped,
+            self.first_flip
+        );
+    }
+
+    /// The properties every arm needs before its gap means anything: rows were
+    /// compared, and at least one of them shared a token with the other run —
+    /// without that the gap is a zero nobody measured.
+    fn assert_reads_something(&self, what: &str, long: usize) {
+        assert!(
+            self.compared > 0,
+            "{what}: no shared rows were scored at {} vs {long} tokens",
+            long / 2
+        );
+        assert!(
+            self.overlapped > 0,
+            "{what}: no row's top-{TOP_K} was shared between the {}- and {long}-token runs, so \
+             the gap measured nothing",
+            long / 2
+        );
+    }
+
+    /// The rows that shared *no* token are invisible to `worst`, so a widespread
+    /// error — a page, position or rope fault — can otherwise read zero. This is
+    /// the absolute form of the bound that sees them, for an arm with no control
+    /// arm above it: the 31B gate (its checkpoint does not fit one card) and the
+    /// control arm itself. Read against the reading, which is 0 of 511 rows at
+    /// 1024 tokens — a quarter is far above any run this gate has taken and far
+    /// below a fault that moves every page, but it is not a detector for one
+    /// confined to part of the prompt; the control-relative form is
+    /// (`assert_disjoint_within`).
+    ///
+    /// The 31B arm keeps this form rather than the tighter floor because its own
+    /// count is **unmeasured**: the 0 of 511 above is the 12B control's reading,
+    /// and the 31B needs two cards that each hold 34 GiB — the tightest bound
+    /// waits for a reading from the checkpoint it is applied to.
+    fn assert_disjoint_absolute(&self, what: &str, long: usize) {
+        assert!(
+            self.disjoint * 4 <= self.compared,
+            "{what}: {} of {} rows share no token between the {}- and {long}-token runs, more \
+             than a quarter of them — a disagreement that widespread is not the row-count \
+             dependence this line is calibrated for, and those rows never reach `worst`",
+            self.disjoint,
+            self.compared,
+            long / 2
+        );
+    }
+
+    /// The same bound held against the one-rank control's own count, in the shape
+    /// the gap uses — a ratio with a floor, so a control that read zero cannot
+    /// tighten the bound to nothing. A false positive needs the two-rank arm to
+    /// move more rows than the control did *plus* the floor, and the floor is a
+    /// sixty-fourth of the compared rows rather than a flat quarter: the quarter
+    /// admitted 127 of 511 rows, wide enough to hide a fault confined to part of
+    /// the prompt — and rows like those are what this exists to see.
+    fn assert_disjoint_within(&self, control: &Self, what: &str, long: usize) {
+        let floor = self.compared / PREFIX_CONTROL_DISJOINT_FLOOR_DIVISOR;
+        let ceiling =
+            ((PREFIX_CONTROL_DISJOINT_RATIO * control.disjoint as f32).ceil() as usize).max(floor);
+        assert!(
+            self.disjoint <= ceiling,
+            "{what}: {} of {} rows share no token between the {}- and {long}-token runs, against \
+             a one-rank control's {} (ceiling {ceiling} = {PREFIX_CONTROL_DISJOINT_RATIO}x control, \
+             floor {floor} = compared / {PREFIX_CONTROL_DISJOINT_FLOOR_DIVISOR}) — rows like these \
+             never reach `worst`, so a fault confined to part of the prompt hides in them",
+            self.disjoint,
+            self.compared,
+            long / 2,
+            control.disjoint
+        );
+    }
+}
+
+/// Score `long` and its first half on one engine, and hold the rows they share
+/// against each other. Split out of the gate below so the two-rank arm can be
+/// held against a single-rank control on the same prompt.
+fn prefix_comparison(options: &EngineLoadOptions, long: usize) -> PrefixComparison {
+    const SALT: u32 = 11;
+    let short = long / 2;
+    let mut harness = launch_with(options, &as_refs(&envelope_overrides()));
+    let mut controls = Vec::new();
+    let mut echoes = Vec::new();
+    // `ids` is position-indexed, so the short prompt is a prefix of the long one.
+    for len in [short, long] {
+        let prompt = ids(len, SALT);
+        let control = harness.submit_scored(prompt.clone(), 1, Some(TOP_K), Some(TOP_K));
+        let drained = harness.steps.drain(control.id(), "prefix");
+        echoes.push(drained.prompt_echo.expect("the engine echoes the prompt"));
+        controls.push(control);
+    }
+    let (short_echo, long_echo) = (&echoes[0], &echoes[1]);
+    let mut comparison = PrefixComparison {
+        compared: 0,
+        overlapped: 0,
+        disjoint: 0,
+        worst: 0.0,
+        worst_at: String::new(),
+        flipped: 0,
+        first_flip: String::new(),
+    };
+    for row in 0..short - 1 {
+        let (Some(a), Some(b)) = (
+            short_echo
+                .logprobs
+                .get(row + 1)
+                .and_then(|entry| entry.as_ref()),
+            long_echo
+                .logprobs
+                .get(row + 1)
+                .and_then(|entry| entry.as_ref()),
+        ) else {
+            continue;
+        };
+        comparison.compared += 1;
+        assert_finite(a, &format!("{short}-token run row {row} (engine)"));
+        assert_finite(b, &format!("{long}-token run row {row} (engine)"));
+        let (left, right) = (top_of(a), top_of(b));
+        let mut shared = 0usize;
+        for (token, value) in &left {
+            if let Some(other) = right.get(token) {
+                shared += 1;
+                let gap = (value - other).abs();
+                if gap > comparison.worst {
+                    comparison.worst = gap;
+                    comparison.worst_at = format!("row {row} token {token}");
+                }
+            }
+        }
+        if shared > 0 {
+            comparison.overlapped += 1;
+        } else {
+            comparison.disjoint += 1;
+        }
+        let (pa, pb) = (a.top_logprobs[0].0, b.top_logprobs[0].0);
+        if pa != pb {
+            comparison.flipped += 1;
+            if comparison.first_flip.is_empty() {
+                comparison.first_flip =
+                    format!("row {row}: {short}-token picks {pa}, {long}-token picks {pb}");
+            }
+        }
+    }
+    let refs: Vec<&_> = controls.iter().collect();
+    harness.shutdown(&refs);
+    comparison
+}
+
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1; checkpoint from PEGAINFER_TEST_MODEL_PATH"]
+fn the_two_rank_engine_is_prefix_consistent() {
+    let long: usize = std::env::var("PEGAINFER_TP_PROMPT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024);
+    // `long / 2 == 0` would make `0..short - 1` wrap in release and spin instead
+    // of reaching the assert below.
+    assert!(
+        long >= 4,
+        "the prefix gate needs a prompt of at least 4 tokens"
+    );
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let two = prefix_comparison(&tp2_options(device, peer), long);
+    two.report("prefix tp2", long);
+    two.assert_reads_something("prefix tp2", long);
+    two.assert_disjoint_absolute("prefix tp2", long);
+    // The line is `serve_oracle`'s calibration, not a tight one: scoring the same
+    // context two ways (there a greedy walk against a single prefill, here a
+    // 512-row prefill against a 1024-row one) moves the logits by a chaotically
+    // amplifying amount — measured in-repo at 0.31..5.75 raw logits — because the
+    // prefill GEMM's tiling depends on the row count. Measured here: 1.69 on the
+    // four-layer synthetic, 4.05 on the 60-layer 31B. A grosser gap (a page,
+    // position or rope error) still fails. A checkpoint that fits one card gets
+    // the tighter, measured form of this line and the absolute check below
+    // together — see `...within_a_single_rank_control`.
+    assert!(
+        two.worst < PREFIX_LINE,
+        "the same prefix scored in a longer run differs by {} at {} (line {PREFIX_LINE}), so the \
+         engine is not prefix-consistent",
+        two.worst,
+        two.worst_at
+    );
+}
+
+/// The prefix gate's two-rank line, with a control arm. `serve_oracle`'s 12.0
+/// bounds raw logits there, held beside an argmax check on every row; here it
+/// bounds logprob gaps with the flips only counted, so the line needs a
+/// measurement of its own rather than a borrowed one — the same discipline
+/// #1132's cache gate applies to its cold leg.
+///
+/// The control is the *same comparison at world size 1*, so the checkpoint has
+/// to fit one card (the 12B; a gate cannot load a 31B twice). It reads what the
+/// shape difference is worth with no tensor parallelism in the picture, and the
+/// two-rank arm may not multiply it.
+#[test]
+#[ignore = "needs two GPUs, a one-card checkpoint, and --test-threads=1"]
+fn the_two_rank_engine_is_prefix_consistent_within_a_single_rank_control() {
+    let long: usize = std::env::var("PEGAINFER_TP_PROMPT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024);
+    assert!(
+        long >= 4,
+        "the prefix gate needs a prompt of at least 4 tokens"
+    );
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let control = prefix_comparison(&single_options(device), long);
+    control.report("prefix control (one rank)", long);
+    control.assert_reads_something("prefix control", long);
+    control.assert_disjoint_absolute("prefix control", long);
+    let two = prefix_comparison(&tp2_options(device, peer), long);
+    two.report("prefix tp2", long);
+    two.assert_reads_something("prefix tp2", long);
+    two.assert_disjoint_within(&control, "prefix tp2", long);
+    let ceiling = (PREFIX_CONTROL_RATIO * control.worst).max(PREFIX_CONTROL_FLOOR);
+    assert!(
+        two.worst <= ceiling,
+        "at two ranks the same prefix differs by {} at {}, against a one-rank control's {} \
+         (ceiling {ceiling} = {PREFIX_CONTROL_RATIO}x control, floor {PREFIX_CONTROL_FLOOR})",
+        two.worst,
+        two.worst_at,
+        control.worst
+    );
+}
+
+/// The prefix gate's line, on the `serve_oracle` scale (`DRIFT_LINE = 12.0`
+/// there) rather than the one-rank comparison's `LOGBROB_LINE`: the drift it
+/// looks for is the same chaotic shape-dependence, bounded the same way.
+const PREFIX_LINE: f32 = 12.0;
+
+/// The one-card form of the same line: what the two-rank arm may read against
+/// the single-rank control's own reading. `serve_oracle` derives its lines the
+/// same way when it can afford the control arm — a ratio with a floor, so a
+/// control that happened to read exactly zero cannot tighten the bound to
+/// nothing.
+///
+/// Measured on the 12B at the window width (512 vs 1024 tokens): the control
+/// reads **6.30** nat and the two-rank arm **9.23**, a ratio of **1.46** — the
+/// two-rank drift at that depth is the same phenomenon, not a multiple of it.
+/// The ratio is 2.0 rather than 1.5 so a re-run's scatter does not flake the
+/// gate; the absolute `PREFIX_LINE` cannot see either reading.
+const PREFIX_CONTROL_RATIO: f32 = 2.0;
+const PREFIX_CONTROL_FLOOR: f32 = 0.10;
+
+/// The same control-relative shape for the rows that shared *no* token, which
+/// `worst` cannot see. Measured on the 12B at the window width (512 vs 1024
+/// tokens): the control and the two-rank arm each read **0** of 511 rows, so the
+/// ceiling there is the floor. The ratio is the gap's; the floor is a
+/// sixty-fourth of the compared rows rather than a flat quarter, which admitted
+/// 127 of 511 — a fault confined to part of the prompt is rows like these, and a
+/// quarter is too wide to see one.
+const PREFIX_CONTROL_DISJOINT_RATIO: f32 = 2.0;
+const PREFIX_CONTROL_DISJOINT_FLOOR_DIVISOR: usize = 64;
+
+/// The abort machinery's own contract, with no engine in the picture: a
+/// reduction still works through the wrapper, an aborted communicator refuses
+/// the next one instead of running comm-less, and aborting twice does not reach
+/// cudarc's drop path twice — a second `ncclCommAbort` makes cudarc's `Comm`
+/// `Drop` panic, which is why the wrapper takes the communicator out rather
+/// than leaving the abort to the drop. No checkpoint, so this is the cheap half
+/// of the pair; the engine-level half is
+/// `a_failed_rank_zero_segment_stops_the_engine_at_two_ranks`, and the release
+/// the engine depends on is its own gate beside it,
+/// `an_aborted_communicator_releases_a_waiting_reduction`.
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1"]
+fn an_aborted_communicator_refuses_the_next_reduction() {
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let contexts: Vec<DeviceContext> = [device, peer]
+        .into_iter()
+        .map(|ordinal| DeviceContext::new_with_device(ordinal).expect("a device context"))
+        .collect();
+    let comms = cudarc::nccl::safe::Comm::from_devices(
+        contexts
+            .iter()
+            .map(|ctx| ctx.stream.clone())
+            .collect::<Vec<_>>(),
+    )
+    .expect("a two-rank communicator");
+    let ranks: Vec<crate::layer::TpComm> =
+        comms.into_iter().map(crate::layer::TpComm::new).collect();
+    let mut buffers: Vec<_> = contexts
+        .iter()
+        .map(|ctx| ctx.stream.alloc_zeros::<f32>(8).expect("a buffer"))
+        .collect();
+    // The pair reduces together once, before any abort, each rank's enqueue on
+    // its own device — the shape the engine runs and the one the wrapper must
+    // not have broken.
+    for (index, (rank, buffer)) in ranks.iter().zip(buffers.iter_mut()).enumerate() {
+        super::select_device(&contexts[index]).expect("the rank's device is current");
+        rank.all_reduce_in_place(buffer, &cudarc::nccl::safe::ReduceOp::Sum)
+            .expect("a reduction over a live communicator");
+    }
+    for ctx in &contexts {
+        ctx.stream
+            .synchronize()
+            .expect("the pair's reduction completes");
+    }
+    ranks[1].abort();
+    ranks[1].abort();
+    assert!(
+        ranks[1]
+            .all_reduce_in_place(&mut buffers[1], &cudarc::nccl::safe::ReduceOp::Sum)
+            .is_err(),
+        "a reduction after the abort must refuse instead of reducing comm-less"
+    );
+}
+
+/// The half of the same contract the gate above cannot see. There the pair has
+/// already reduced and synchronized before anything is aborted, so the abort
+/// only has to refuse what comes *next*; the engine aborts a peer's communicator
+/// while that peer is still **inside** a collective (`EngineState::drive_ranks`)
+/// and needs the abort to release it, because nothing else can — the peer's own
+/// thread is the one that is blocked.
+///
+/// So this enqueues a reduction on rank 1 alone, with no matching call from rank
+/// 0, and aborts rank 1 from another thread: the shape a peer is left in when
+/// the other rank's segment stops early. Both halves are bounded, because either
+/// can be the failure — the wait ending is what the engine's `ctx.sync()`
+/// returns on, and an `ncclCommAbort` that never returns would hang the failing
+/// rank's thread before it could report anything. No checkpoint, no engine and
+/// no injection hook.
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1"]
+fn an_aborted_communicator_releases_a_waiting_reduction() {
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let contexts: Vec<DeviceContext> = [device, peer]
+        .into_iter()
+        .map(|ordinal| DeviceContext::new_with_device(ordinal).expect("a device context"))
+        .collect();
+    let comms = cudarc::nccl::safe::Comm::from_devices(
+        contexts
+            .iter()
+            .map(|ctx| ctx.stream.clone())
+            .collect::<Vec<_>>(),
+    )
+    .expect("a two-rank communicator");
+    let ranks: Vec<crate::layer::TpComm> =
+        comms.into_iter().map(crate::layer::TpComm::new).collect();
+    let mut buffers: Vec<_> = contexts
+        .iter()
+        .map(|ctx| ctx.stream.alloc_zeros::<f32>(8).expect("a buffer"))
+        .collect();
+    // The abort runs on a thread of its own, so this thread stays free to watch
+    // the peer's stream; the context is re-bound there by the same call a step's
+    // thread uses.
+    let peer_ctx = DeviceContext {
+        ctx: contexts[1].ctx.clone(),
+        stream: contexts[1].stream.clone(),
+        device_ordinal: contexts[1].device_ordinal,
+    };
+
+    super::select_device(&contexts[1]).expect("the peer's device is current");
+    ranks[1]
+        .all_reduce_in_place(&mut buffers[1], &cudarc::nccl::safe::ReduceOp::Sum)
+        .expect("the enqueue itself succeeds");
+    // The control arm: with no peer call to pair with, the reduction cannot
+    // complete, so what follows measures the abort rather than a reduction that
+    // finished by itself.
+    assert!(
+        stream_waiting(&peer_ctx),
+        "rank 1's unpaired reduction left its stream idle, so this run could not \
+         measure what an abort releases"
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (device_ctx, stream_ctx) = (contexts[1].ctx.clone(), contexts[1].stream.clone());
+    let ordinal = contexts[1].device_ordinal;
+    let aborting_rank = ranks[1].clone();
+    std::thread::spawn(move || {
+        let ctx = DeviceContext {
+            ctx: device_ctx,
+            stream: stream_ctx,
+            device_ordinal: ordinal,
+        };
+        let bound = super::bind_engine_thread(&ctx);
+        if bound.is_ok() {
+            aborting_rank.abort();
+        }
+        let _ = tx.send(bound.map(|_guard| ()));
+    });
+    let released = wait_until(Duration::from_secs(30), || !stream_waiting(&peer_ctx));
+    let aborting = rx.recv_timeout(Duration::from_secs(30));
+    assert!(
+        released,
+        "rank 1's stream was still waiting on a reduction with no peer 30 s after its \
+         communicator was aborted; the engine's failure path relies on that abort releasing a \
+         peer already inside a collective"
+    );
+    assert!(
+        matches!(aborting, Ok(Ok(()))),
+        "aborting rank 1's communicator did not return within 30 s while a collective was in \
+         flight on it ({aborting:?}); the engine calls it from the failing rank's thread, which \
+         would hang there instead of stopping the engine"
+    );
+}
+
+/// Whether `ctx`'s stream still holds a reduction queued — the state a peer waits
+/// in until its communicator is aborted. Any other answer, success or the error a
+/// torn-down collective leaves behind, means the wait is over.
+fn stream_waiting(ctx: &DeviceContext) -> bool {
+    matches!(
+        unsafe { cudarc::driver::sys::cuStreamQuery(ctx.stream.cu_stream()) },
+        cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY
+    )
+}
+
+/// A rank-0 step failure at two ranks must stop the engine promptly, not wedge
+/// it — the pairing the single-rank gate cannot see. The engine aborts every
+/// rank's communicator before joining the ranks' threads
+/// (`EngineState::drive_ranks`), and this is the end-to-end half of that: the
+/// step fails, the scheduler exits within the deadline, and the request is
+/// failed rather than left pending.
+///
+/// The fault needs no injection hook — `u32::MAX` is outside every vocabulary
+/// this line ships, and `prepare_single`'s `validate_tokens` refuses it before
+/// the tower allocates anything — but it is deliberately *symmetric*: every rank
+/// runs the same segment and so refuses the same prompt, which means a peer that
+/// never launches its collective is not what this run creates. The abort handle
+/// itself is held to its own contract, without an engine, by
+/// `an_aborted_communicator_refuses_the_next_reduction`; an asymmetric injection
+/// would need a hook in the engine, which the single-rank half
+/// (`lane_gates_logprobs::a_failed_prefill_costs_that_request_not_the_engine`)
+/// also went out of its way not to add.
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1; checkpoint from PEGAINFER_TEST_MODEL_PATH"]
+fn a_failed_rank_zero_segment_stops_the_engine_at_two_ranks() {
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
+    let bad = harness.submit(vec![9, u32::MAX, 11], 4);
+    // Bounded on purpose: the property is that the engine *stops*, and a peer
+    // left spinning on a collective would keep this waiting instead — which is
+    // the wedge this gate exists to name.
+    let stopped = wait_until(Duration::from_secs(60), || harness.scheduler_finished());
+    let terminal = harness.steps.try_terminal(bad.id());
+    assert!(
+        stopped,
+        "a rank-0 failure at TP2 left the engine running (request terminal {terminal:?}); the \
+         peer's communicator should have been aborted before the join"
+    );
+    assert!(
+        matches!(terminal, Some(Terminal::Failed { .. })),
+        "the failing request should be failed, not {terminal:?}"
+    );
+    harness.shutdown(&[]);
 }
 
 /// Two ranks against the Hugging Face reference, for the size the gate above
@@ -465,11 +1093,16 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     /// logits. A shared token may sit this far apart: bf16 reduction order and a
     /// different attention backend, nothing structural.
     const DRIFT_LINE: f32 = 1.0;
-    // The fixture also carries "edge" (1024 tokens), but that is past the TP
-    // prompt ceiling: a prefill that long stalls the single-threaded multi-rank
-    // driver before the peer ranks launch (docs/models/gemma4/tp.md "Known
-    // bounds"), so admission refuses it (`TP_MAX_PROMPT`). The case joins the
-    // gate once the ranks are driven concurrently.
+    // Only the nine-token case is asserted, so **long prompts at TP2 are
+    // unverified**: running the fixture's 1024-token `edge` fails a strict top-64
+    // containment on ~5-8 rows, and those rows fail at one rank as well as at
+    // two — which says nothing about the second rank either way, since a failure
+    // both arms share is explained by neither. Pinning that depth needs the
+    // fixtures' per-case tolerance discipline, not a containment test.
+    // (`probed_cases` lists the cases carrying hidden-state probes; `edge` has
+    // none because at window width they would dwarf the file, so its absence
+    // says nothing about whether the case is asserted.) See
+    // docs/models/gemma4/tp.md "Known bounds".
     const CASES: [&str; 1] = ["short"];
 
     let (device, peer) = devices();
@@ -488,6 +1121,8 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     let mut controls = Vec::new();
     let mut compared = 0usize;
     let mut same_pick = 0usize;
+    let mut outside = 0usize;
+    let mut offenders: Vec<String> = Vec::new();
     let mut worst = 0.0f32;
     let mut worst_at = String::new();
     for case in CASES {
@@ -500,13 +1135,8 @@ fn the_two_rank_engine_matches_the_hf_reference() {
             tokens.len(),
             "{case}: one reference row per token"
         );
-        eprintln!(
-            "hf: {case}: {} tokens, top_k {top_k}: submitting",
-            tokens.len()
-        );
         let control = harness.submit_scored(tokens.clone(), 1, Some(top_k), Some(top_k));
         let drained = harness.steps.drain(control.id(), case);
-        eprintln!("hf: {case}: drained");
         let echo = drained.prompt_echo.expect("the engine echoes the prompt");
         for row in 0..tokens.len() - 1 {
             // Row 0 of the echo is the head's own placeholder, so the row that
@@ -530,16 +1160,29 @@ fn the_two_rank_engine_matches_the_hf_reference() {
             if pa == pb {
                 same_pick += 1;
             } else {
-                // A differing pick has to be a near-tie, the same rule the
-                // one-rank comparison holds itself to.
-                assert!(
-                    theirs.iter().any(|(token, _)| *token == pa),
-                    "{case} row {row}: the engine's pick {pa} is outside the reference's top-{top_k}"
-                );
-                assert!(
-                    ours_top.contains_key(&pb),
-                    "{case} row {row}: the reference's pick {pb} is outside the engine's top-{top_k}"
-                );
+                // A differing pick has to be a near-tie: each pick inside the
+                // other run's top-k. Every offender is collected rather than
+                // panicking on the first, so one run names them all.
+                if !theirs.iter().any(|(token, _)| *token == pa) {
+                    outside += 1;
+                    if offenders.len() < 10 {
+                        offenders.push(format!(
+                            "{case} row {row}: engine pick {pa} at {:.4}, reference top-1 {pb} at \
+                             {:.4}, reference top-{top_k} floor {:.4}",
+                            ours.top_logprobs[0].1,
+                            theirs[0].1,
+                            theirs.last().expect("non-empty top-k").1
+                        ));
+                    }
+                }
+                if !ours_top.contains_key(&pb) {
+                    outside += 1;
+                    if offenders.len() < 10 {
+                        offenders.push(format!(
+                            "{case} row {row}: reference pick {pb} outside the engine's top-{top_k}"
+                        ));
+                    }
+                }
             }
             for (token, value) in &theirs {
                 if let Some(other) = ours_top.get(token) {
@@ -554,11 +1197,18 @@ fn the_two_rank_engine_matches_the_hf_reference() {
         controls.push(control);
     }
     eprintln!(
-        "hf: {same_pick}/{compared} rows keep the reference's pick; worst shared-token logprob gap \
-         {worst:.4} at {worst_at}"
+        "hf: {same_pick}/{compared} rows keep the reference's pick; {outside} out-of-top-k; worst \
+         shared-token logprob gap {worst:.4} at {worst_at}"
     );
+    for offender in &offenders {
+        eprintln!("hf: outside: {offender}");
+    }
     let controls: Vec<&_> = controls.iter().collect();
     harness.shutdown(&controls);
+    assert!(
+        outside == 0,
+        "{outside} rows have a pick outside the other's top-k; first up to 10: {offenders:#?}"
+    );
     assert!(
         worst < DRIFT_LINE,
         "the two-rank engine and the reference differ on {worst_at} by {worst} (line {DRIFT_LINE})"

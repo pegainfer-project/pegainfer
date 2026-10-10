@@ -187,6 +187,19 @@ impl StepCollector {
         }
     }
 
+    /// The request's terminal if one has already arrived, without waiting. A
+    /// gate that asserts an engine *stopped* has to fail rather than block, and
+    /// [`Self::terminal`] waits on a stream that a stopped engine has closed.
+    pub(super) fn try_terminal(&mut self, id: RequestId) -> Option<Terminal> {
+        self.pump_available();
+        let queue = self.buffered.get_mut(&id)?;
+        let terminal = queue.iter().position(|update| update.terminal.is_some())?;
+        queue
+            .drain(..=terminal)
+            .next_back()
+            .and_then(|update| update.terminal)
+    }
+
     fn pump_available(&mut self) {
         while let Ok(step) = self.steps.try_recv() {
             for update in step.updates {
