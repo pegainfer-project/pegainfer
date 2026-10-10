@@ -46,7 +46,6 @@ use crate::layer::TpComm;
 use crate::prefix_cache::PrefixCache;
 use crate::serve::GemmaServe;
 use crate::serve::GlobalAttn;
-use crate::serve::PrecapturePhase;
 use crate::serve::StepArena;
 use crate::weights::Gemma4Weights;
 
@@ -1196,17 +1195,6 @@ struct RankState {
     arena: StepArena,
 }
 
-/// The graph-before-comm release [`Drop for EngineState`] gives the success
-/// path, for a `load` that fails after the capture sweep and so never builds an
-/// `EngineState`: this rank's captured graphs must go before its own
-/// communicator (a field of `serve`) drops.
-impl Drop for RankState {
-    fn drop(&mut self) {
-        let _ = select_device(&self.ctx);
-        self.arena.release_graphs();
-    }
-}
-
 /// Make `ctx`'s device current on this thread. The thread-local cuBLAS handles
 /// are keyed by device, so switching the current device is enough once every
 /// rank has been bound at the start of a step.
@@ -1335,19 +1323,14 @@ struct EngineState {
 
 /// Captured collective graphs bake in NCCL kernel launches, and NCCL's
 /// communicator abort waits for a graph that references them to be destroyed —
-/// so every rank releases its graphs here, on its own device, before the fields
-/// (and with them the communicators) drop. A tensor-parallel launch turns graphs
-/// off (`start_with_knobs`), so under TP there is nothing captured to wait for;
-/// this order is what keeps the single-rank path right, and what a lifted
-/// disable would need again.
+/// so rank 0's graphs are released here, on its own device, before the fields
+/// (and with them the communicator) drop. Only the single-rank path captures
+/// anything: a tensor-parallel launch turns graphs off (`start_with_knobs`), so
+/// there is no peer arena holding a captured collective to release.
 impl Drop for EngineState {
     fn drop(&mut self) {
         let _ = select_device(&self.ctx);
         self.arena.release_graphs();
-        for state in &mut self.more {
-            let _ = select_device(&state.ctx);
-            state.arena.release_graphs();
-        }
     }
 }
 
@@ -1491,11 +1474,7 @@ impl EngineState {
                         // here, from this thread, for the same reason the rank-0
                         // branch does it before the join — a peer inside that
                         // collective is unblocked by aborting *its* communicator.
-                        // Nothing is captured to release first (a TP2 launch
-                        // refuses graphs); the call stays for the ordering a
-                        // lifted refusal would need.
                         let _ = select_device(&state.ctx);
-                        state.arena.release_graphs();
                         for comm in &comms {
                             comm.abort();
                         }
@@ -1515,14 +1494,12 @@ impl EngineState {
                 // peers' communicators are reached through the engine's own
                 // handles rather than their serves.
                 //
-                // This is the one order that works, and it is why a TP2 launch
-                // refuses CUDA graphs: NCCL's abort waits for a captured graph
-                // that references the communicator to be destroyed, and a peer
-                // stopped inside a collective can only release its own graphs
-                // after the join that its own abort is holding up. With graphs
-                // refused there is no captured collective in the way, and the
-                // release calls below are vacuous — they stay because they are
-                // what a lifted refusal would need again.
+                // This is the order that works: the abort has to reach a peer that
+                // is inside a collective, so it runs before the join that is
+                // waiting on that peer. NCCL's abort also waits for a captured
+                // graph referencing the communicator to be destroyed — that cycle
+                // is why graphs are off under TP, and with none captured here
+                // there is nothing in the abort's way.
                 //
                 // Only with extra ranks: with none there is no collective to
                 // abort and no peer frontier to keep in step, so this stays the
@@ -1531,10 +1508,7 @@ impl EngineState {
                 // request-local error — a per-request scratch allocation — into
                 // the end of the engine.
                 tp_broken.set(true);
-                // Nothing is captured to release (a TP2 launch refuses graphs);
-                // the call stays for the ordering a lifted refusal would need.
                 let _ = select_device(ctx);
-                arena.release_graphs();
                 serve.abort_tp_comm();
                 for comm in extra_comms.iter() {
                     comm.abort();
@@ -1576,16 +1550,11 @@ impl EngineState {
         payload
     }
 
-    /// Abort every communicator and release every extra rank's graphs, after a
-    /// failed step. Aborting is idempotent, so this covers whichever rank
-    /// failed: the pair is broken either way, no later step may run a comm-less
-    /// reduction, and every later step refuses. A failed extra rank is fatal
-    /// here for the same reason a failed rank 0 is: the ranks' frontiers must
-    /// not drift apart.
-    ///
-    /// The release is vacuous while a TP2 launch refuses graphs; it stays so the
-    /// order the abort needs — graphs gone before a communicator goes away — is
-    /// right if that refusal is lifted.
+    /// Abort every communicator, after a failed step. Aborting is idempotent, so
+    /// this covers whichever rank failed: the pair is broken either way, no later
+    /// step may run a comm-less reduction, and every later step refuses. A failed
+    /// extra rank is fatal here for the same reason a failed rank 0 is: the ranks'
+    /// frontiers must not drift apart.
     ///
     /// At world size 1 there is no peer to abort, no comm to break and no
     /// frontier to keep in step, so this leaves the engine alone — the same
@@ -1597,8 +1566,6 @@ impl EngineState {
         self.tp_broken.set(true);
         self.serve.abort_tp_comm();
         for state in &mut self.more {
-            let _ = select_device(&state.ctx);
-            state.arena.release_graphs();
             state.serve.abort_tp_comm();
         }
     }
@@ -1982,8 +1949,8 @@ impl EngineState {
         let prefix_cache = cache_cap.map(|k| PrefixCache::new(k, sliding_window));
         let mut scratch = SampleScratch::new(&ctx, vocab, arena_rows)?;
         let mut arena = serve.alloc_step_arena(&ctx, arena_rows, graph_enabled)?;
-        // One rank sweeps here; more than one sweeps in the interleaved driver
-        // below, which owns the buckets for every rank.
+        // Only the single-rank path captures: a tensor-parallel launch turns
+        // graphs off, so there is no sweep for its ranks to interleave.
         if world == 1 {
             serve.precapture_decode_graphs(&ctx, &mut arena)?;
         }
@@ -2052,8 +2019,8 @@ impl EngineState {
         // here, with no comm live, pays those loads single-threaded. The row
         // counts span cublasLt's kernel-selection regions: a single row takes
         // a GEMV-like kernel, the rest tile GEMMs whose choice shifts at small
-        // row counts. It also warms the decode capture sweep that used to run
-        // below under graphs.
+        // row counts. It is the warm the single-rank path also needs before its
+        // capture sweep, done here for every rank while none of them has a comm.
         if world > 1 {
             let warm_rows = [1usize, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
                 .into_iter()
@@ -2096,60 +2063,6 @@ impl EngineState {
                 state.serve.attach_tp_comm(comm.clone());
                 extra_comms.push(comm);
             }
-        }
-        // With graphs on, every rank captures its decode graphs, phase by phase:
-        // `Warm` and `Launch` execute and enqueue the all-reduce, whose peer
-        // call must be in flight, so the phases interleave across ranks instead
-        // of one rank finishing its whole sweep. `Capture` only records, and a
-        // recorded collective replays when its peer replays. Each rank sweeps
-        // its own arena and its own single-rank dummy.
-        //
-        // Unreachable while `start_with_knobs` turns graphs off for every
-        // `world > 1` launch: the sweep is kept for whoever lifts that, and its
-        // having no runtime is a known bound (`docs/models/gemma4/tp.md`).
-        if graph_enabled && world > 1 {
-            let mut dummies: Vec<GemmaKv> = Vec::with_capacity(world);
-            let mut primary = serve.alloc_kv();
-            admit_tokens(&serve.local_pool, &serve.global_pool, &mut primary, 1)?;
-            dummies.push(primary);
-            for state in &more {
-                let mut dummy = state.serve.alloc_kv();
-                admit_tokens(
-                    &state.serve.local_pool,
-                    &state.serve.global_pool,
-                    &mut dummy,
-                    1,
-                )?;
-                dummies.push(dummy);
-            }
-            let mut bucket = 1usize;
-            while bucket <= arena.bucket_ceiling() {
-                for phase in PrecapturePhase::ALL {
-                    activate_rank(&ctx)?;
-                    serve.precapture_bucket(&ctx, &mut arena, &mut dummies[0], bucket, phase)?;
-                    for (rank, state) in more.iter_mut().enumerate() {
-                        activate_rank(&state.ctx)?;
-                        state.serve.precapture_bucket(
-                            &state.ctx,
-                            &mut state.arena,
-                            &mut dummies[rank + 1],
-                            bucket,
-                            phase,
-                        )?;
-                    }
-                }
-                bucket *= 2;
-            }
-            // Every rank's floor goes back to 1: the sweep left each arena's
-            // `min_bucket` at the ceiling, and a rank that kept it would pad a
-            // decode step to a different bucket than rank 0 — different graphs
-            // on different ranks for the same step.
-            arena.reset_min_bucket();
-            for state in &mut more {
-                state.arena.reset_min_bucket();
-            }
-            activate_rank(&ctx)?;
-            ctx.sync()?;
         }
         Ok(Self {
             ctx,

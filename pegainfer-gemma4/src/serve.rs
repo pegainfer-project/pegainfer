@@ -845,22 +845,11 @@ impl StepArena {
         (&mut self.logits, &mut self.ids)
     }
 
-    /// The largest power-of-two decode bucket the capture sweep reaches.
-    pub(crate) fn bucket_ceiling(&self) -> usize {
-        self.max_rows
-    }
-
-    /// Restore the serving floor after a capture sweep, which walks every
-    /// bucket and would otherwise leave `min_bucket` at the ceiling.
-    pub(crate) fn reset_min_bucket(&mut self) {
-        self.min_bucket = 1;
-    }
-
-    /// Release the captured graphs. Called on teardown, before the
-    /// communicators go away: a captured collective bakes in NCCL kernel
-    /// launches, and NCCL's communicator abort waits for a graph that references
-    /// them to be destroyed. A tensor-parallel launch refuses graphs, so at TP
-    /// there is nothing here to release and no such wait to lose.
+    /// Release the captured graphs. Called on teardown, before the communicator
+    /// goes away: a captured collective bakes in NCCL kernel launches, and NCCL's
+    /// communicator abort waits for a graph that references them to be destroyed.
+    /// A tensor-parallel launch turns graphs off, so there is nothing captured to
+    /// release on that path.
     pub(crate) fn release_graphs(&mut self) {
         self.graphs.clear();
     }
@@ -2781,10 +2770,8 @@ impl GemmaServe {
         ctx.sync()
     }
 
-    /// One bucket of the sweep, one phase at a time. `Capture` only records, but
-    /// `Warm` and `Launch` execute, and the collectives they enqueue need every
-    /// rank's matching call — so a driver with more than one rank interleaves
-    /// the phases across ranks rather than running one rank's whole sweep.
+    /// One bucket of the sweep, one phase at a time. `Capture` only records, while
+    /// `Warm` executes an eager pass and `Launch` drives the serving path.
     pub(crate) fn precapture_bucket(
         &self,
         ctx: &DeviceContext,
