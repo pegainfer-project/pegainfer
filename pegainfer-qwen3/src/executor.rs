@@ -93,8 +93,15 @@ pub struct PrefillStepItem {
     pub(crate) lora_adapter: Option<String>,
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
-    /// the remaining suffix.
-    pub(crate) cached_tokens: usize,
+    /// the remaining suffix. `None` means no lookup ran (prefix caching off,
+    /// or a prompt-scoring request), which the metrics path must not count.
+    pub(crate) cached_tokens: Option<usize>,
+    /// How many of those cached tokens came from the external side (CPU
+    /// offload / P2P restore) rather than from local KV. `None` when no
+    /// connector was consulted for this request at all; `Some(0)` when it was
+    /// consulted and restored nothing. The external `/metrics` family is
+    /// driven by this distinction, not by `cached_tokens`.
+    pub(crate) external_hit_tokens: Option<usize>,
     /// Scheduler-set cap on prompt tokens forwarded this step (chunked
     /// prefill). The executor clamps it to the tokens actually remaining.
     pub(crate) chunk_budget: usize,
@@ -124,7 +131,8 @@ impl PrefillStepItem {
             logprobs,
             prompt_logprobs,
             lora_adapter: None,
-            cached_tokens: 0,
+            cached_tokens: None,
+            external_hit_tokens: None,
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
@@ -700,7 +708,15 @@ pub struct PrefillRequestResult {
     pub first_token_logprob: Option<TokenLogprob>,
     pub(crate) prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
-    pub cached_tokens: usize,
+    /// `None` when no lookup ran at all, which is the fact the /metrics
+    /// counters need: a disabled cache or a prompt-scoring request counts
+    /// nothing.
+    pub cached_tokens: Option<usize>,
+    /// How many of `cached_tokens` were restored from the external side (CPU
+    /// offload / P2P) rather than found in local KV. `None` when no
+    /// connector was consulted for this request; `Some(0)` when it was
+    /// consulted and restored nothing.
+    pub external_hit_tokens: Option<usize>,
     /// Whether the prompt is fully prefilled. When false this step ran a
     /// non-final chunk and `first_token` is meaningless.
     pub completed: bool,
@@ -1800,7 +1816,19 @@ impl Qwen3Executor {
             // Prompt scoring needs logits for every prompt position; cached positions
             // are never forwarded, so prompt-logprob requests prefill from scratch.
             if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+                let matched = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+                req.cached_tokens = Some(matched);
+                // The probe is what consults the connector, reporting how many
+                // of the matched blocks already sit in local GPU KV; the rest
+                // is what it restored. With no probe there is no external leg
+                // to attribute, so this stays `None` — a probe that restored
+                // nothing is `Some(0)`, and the external family is reported
+                // only when it exists.
+                req.external_hit_tokens = self.prefetch.get(&req.request_id).map(|state| {
+                    let block_size = self.metadata.block_size;
+                    let local = (state.probe.gpu_hit_blocks() * block_size).min(matched);
+                    matched.saturating_sub(local)
+                });
             }
             self.request_kvs.insert(req.request_id, rkv);
             // match_and_add_prefix above already absorbed any CPU-prefetched

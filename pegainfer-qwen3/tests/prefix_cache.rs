@@ -110,7 +110,12 @@ fn run_one(ex: &mut Qwen3Executor, id: u64, prompt: &[u32]) -> (usize, Vec<Vec<(
             requests: &[prefill_item(id, prompt)],
         })
         .expect("prefill");
-    let cached = pr.requests[0].cached_tokens;
+    // The real executor always consults the prefix cache, so a lookup is
+    // always reported; `None` would mean the gate swallowed it. `Some(0)` is a
+    // genuine miss, which the caller asserts on.
+    let cached = pr.requests[0]
+        .cached_tokens
+        .expect("the real executor always runs a prefix-cache lookup");
     let mut positions = vec![top_logprobs(pr.requests[0].first_token_logprob.as_ref())];
     for fed in DECODE_FED {
         let dr = ex
@@ -233,8 +238,12 @@ fn prefix_cache_behavior() {
             requests: &[prefill_item(21, &d), prefill_item(22, &a)],
         })
         .expect("mixed prefill");
-    assert_eq!(pr.requests[0].cached_tokens, 0, "D is unseen — cold");
-    assert_eq!(pr.requests[1].cached_tokens, 3 * BLOCK, "A is warm");
+    assert_eq!(
+        pr.requests[0].cached_tokens,
+        Some(0),
+        "D is unseen — cold: a lookup ran and missed"
+    );
+    assert_eq!(pr.requests[1].cached_tokens, Some(3 * BLOCK), "A is warm");
     let d_mixed = vec![top_logprobs(pr.requests[0].first_token_logprob.as_ref())];
     let a_mixed = vec![top_logprobs(pr.requests[1].first_token_logprob.as_ref())];
     assert_close("A in mixed batch", &a_cold[..1], &a_mixed);
@@ -271,7 +280,7 @@ fn prefix_cache_behavior() {
             requests: &[prefill_item(41, &b)],
         })
         .expect("B prefill for unified decode");
-    assert_eq!(pr.requests[0].cached_tokens, 4 * BLOCK);
+    assert_eq!(pr.requests[0].cached_tokens, Some(4 * BLOCK));
     let ur = ex
         .execute_unified(UnifiedPlan {
             sample_seed: 0,
@@ -281,7 +290,7 @@ fn prefix_cache_behavior() {
         .expect("unified");
     assert_eq!(
         ur.prefill_requests[0].cached_tokens,
-        3 * BLOCK,
+        Some(3 * BLOCK),
         "unified prefill matches through the same path"
     );
     let a_unified = vec![top_logprobs(

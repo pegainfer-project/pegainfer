@@ -166,8 +166,9 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         })
         .expect("cold prefill");
     assert_eq!(
-        cold.requests[0].cached_tokens, 0,
-        "first sight of P is cold"
+        cold.requests[0].cached_tokens,
+        Some(0),
+        "first sight of P is cold: a lookup ran and missed"
     );
     let cold_first = first_token_top(&cold);
     ex.drop_request(RequestId::new(1)).expect("drop req1");
@@ -196,8 +197,15 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         .expect("warm prefill");
     assert_eq!(
         warm.requests[0].cached_tokens,
-        3 * BLOCK,
+        Some(3 * BLOCK),
         "CPU-restored prefix: 3 blocks matched, tail recomputed"
+    );
+    // All of the match came back from the host tier, so the external leg owns
+    // all of it — the split this PR reports separately.
+    assert_eq!(
+        warm.requests[0].external_hit_tokens,
+        Some(3 * BLOCK),
+        "restored blocks are attributed to the external side, not local KV"
     );
     let warm_first = first_token_top(&warm);
     ex.drop_request(RequestId::new(2)).expect("drop req2");
@@ -222,8 +230,9 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         })
         .expect("cold full prefill");
     assert_eq!(
-        cold.requests[0].cached_tokens, 0,
-        "first sight of full is cold"
+        cold.requests[0].cached_tokens,
+        Some(0),
+        "first sight of full is cold: a lookup ran and missed"
     );
     let cold_first = first_token_top(&cold);
     ex.drop_request(RequestId::new(1)).expect("drop req1");
@@ -240,8 +249,9 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         })
         .expect("short prefill");
     assert_eq!(
-        s.requests[0].cached_tokens, 0,
-        "short re-warms blocks 0..3 cold"
+        s.requests[0].cached_tokens,
+        Some(0),
+        "short re-warms blocks 0..3 cold: a lookup ran and missed"
     );
     ex.drop_request(RequestId::new(2)).expect("drop req2");
 
@@ -268,8 +278,15 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         .expect("warm full prefill");
     assert_eq!(
         warm.requests[0].cached_tokens,
-        6 * BLOCK,
+        Some(6 * BLOCK),
         "combined hit: 3 GPU-resident + 3 CPU-restored blocks match as one prefix"
+    );
+    // Only the second half crossed the connector: the first 3 blocks were
+    // already in HBM, so they belong to the local family.
+    assert_eq!(
+        warm.requests[0].external_hit_tokens,
+        Some(3 * BLOCK),
+        "the GPU-resident half is local, the restored half is external"
     );
     let warm_first = first_token_top(&warm);
     ex.drop_request(RequestId::new(3)).expect("drop req3");

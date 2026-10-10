@@ -443,3 +443,150 @@ fn lora_control_waits_until_scheduler_idle() {
         .expect_err("adapter load should be a stub error");
     assert!(matches!(error, LoraControlError::Failed(_)));
 }
+
+/// E2E (no GPU) for the prefix-cache `/metrics` counters: drive a real
+/// `Qwen3Scheduler` through the engine contract with a fake executor that
+/// reports a cached prefix on every request's first chunk, then scrape
+/// `SchedulerMetrics` across multiple batches and scrapes.
+///
+/// Guards against the two bugs from review:
+///  * unit mismatch — `prefix_queries`/`prefix_hits` are both TOKEN-granular
+///    (queried prompt tokens / cached tokens), matching vLLM's
+///    `PrefixCacheStats`, so `hit_rate = hits/queries` stays in [0, 1];
+///  * cumulative-counter double counting — every request is counted exactly
+///    once, on its first prefill chunk; the totals-to-deltas conversion the
+///    bridge applies (and why) lives on `PrefixCacheTracker`.
+#[test]
+fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
+    const BATCHES: u64 = 4;
+    const PER_BATCH: u64 = 3;
+    const TOTAL: u64 = BATCHES * PER_BATCH;
+    // Longer than the 1024-token chunk budget, so every request prefills in
+    // two chunks and the "once per request" rule meets a second chunk — the
+    // case that would double-count if the gate were missing.
+    const PROMPT_TOKENS: u64 = 1200; // tokens looked up per request
+    const HIT_TOKENS: u64 = 333; // simulated cached prefix length (<= prompt)
+    const EXTERNAL_HIT_TOKENS: u64 = 111; // of those, restored by the connector
+
+    // A fake KV cache that reports a 333-token hit on the first chunk of every
+    // request, 111 tokens of which the connector restored rather than found in
+    // local KV. Queries count the 1200 prompt tokens queried and hits count
+    // only the 222 tokens already cached locally — both token-granular, and
+    // the second chunk that completes the prefill contributes nothing more.
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(80, Arc::clone(&dropped))
+        .with_prefix_hit(HIT_TOKENS as usize)
+        .with_external_prefix_hit(EXTERNAL_HIT_TOKENS as usize);
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let mut controls = Vec::new();
+    let mut scrapes: Vec<(u64, u64, u64)> = Vec::new(); // (batch, queries, hits)
+
+    for batch in 0..BATCHES {
+        for _ in 0..PER_BATCH {
+            controls.push(partition.handle.submit(request(PROMPT_TOKENS as usize, 4)));
+        }
+        // Wait until this batch's prefills have been counted.
+        let target = (batch + 1) * PER_BATCH * PROMPT_TOKENS;
+        assert!(
+            wait_until(Duration::from_secs(2), || partition
+                .handle
+                .metrics()
+                .prefix_cache_queries
+                >= target),
+            "batch {batch} prefix queries never reached {target}"
+        );
+        let m = partition.handle.metrics();
+        scrapes.push((batch, m.prefix_cache_queries, m.prefix_cache_hits));
+    }
+
+    // Drain the step stream so the driver thread can exit cleanly.
+    for c in &controls {
+        let _ = steps.collect_terminal(c.id());
+    }
+
+    let a = partition.handle.metrics();
+
+    // Token-granular correctness per vLLM PrefixCacheStats: every request
+    // queries PROMPT_TOKENS and hits HIT_TOKENS, so the running totals are
+    // TOTAL * those, and hit_rate = HIT_TOKENS / PROMPT_TOKENS in [0, 1].
+    let expected_q = TOTAL * PROMPT_TOKENS;
+    // Hits are the local share only — what the connector restored is carried
+    // by the external family instead.
+    let expected_h = TOTAL * (HIT_TOKENS - EXTERNAL_HIT_TOKENS);
+    assert_eq!(a.prefix_cache_queries, expected_q);
+    assert_eq!(a.prefix_cache_hits, expected_h);
+    assert!(
+        a.prefix_cache_hits <= a.prefix_cache_queries,
+        "hits (cached tokens) must not exceed queries (queried tokens)"
+    );
+    let hit_rate = a.prefix_cache_hits as f64 / a.prefix_cache_queries as f64;
+    assert!(
+        (hit_rate - (HIT_TOKENS - EXTERNAL_HIT_TOKENS) as f64 / PROMPT_TOKENS as f64).abs() < 1e-9
+    );
+
+    // The external family: asked about whatever the local cache did not
+    // answer, and it restored EXTERNAL_HIT_TOKENS of it.
+    assert_eq!(
+        a.prefix_cache_external_queries,
+        TOTAL * (PROMPT_TOKENS - (HIT_TOKENS - EXTERNAL_HIT_TOKENS))
+    );
+    assert_eq!(a.prefix_cache_external_hits, TOTAL * EXTERNAL_HIT_TOKENS);
+
+    // Each batch contributed a stable, non-zero delta of exactly
+    // PER_BATCH * PROMPT_TOKENS (queries) and PER_BATCH * HIT_TOKENS (hits).
+    let mut prev_q = 0u64;
+    let mut prev_h = 0u64;
+    for (batch, q, h) in scrapes {
+        let dq = q - prev_q;
+        let dh = h - prev_h;
+        assert_eq!(
+            dq,
+            PER_BATCH * PROMPT_TOKENS,
+            "batch {batch} added exactly PER_BATCH*PROMPT_TOKENS queries"
+        );
+        assert_eq!(
+            dh,
+            PER_BATCH * HIT_TOKENS,
+            "batch {batch} added exactly PER_BATCH*HIT_TOKENS hits"
+        );
+        prev_q = q;
+        prev_h = h;
+    }
+}
+
+/// A disabled prefix cache performs no lookup, so it must report no queries.
+///
+/// A prompt-scoring request is the other case that performs no lookup: it
+/// forwards the prompt whole. With either of those there is nothing to count —
+/// reporting the prompt length anyway would invent lookups that never happened
+/// and drag every request's hit rate toward zero.
+#[test]
+fn prefix_cache_disabled_reports_no_lookups() {
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let executor = FakeExecutor::new(64, Arc::clone(&dropped))
+        .with_prefix_hit(37)
+        .without_prefix_cache();
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let mut controls = Vec::new();
+    for _ in 0..3 {
+        controls.push(partition.handle.submit(request(64, 4)));
+    }
+    // Drain to the terminal update so the requests are known to have been
+    // prefilled — otherwise zero counters would only prove nothing ran yet.
+    for c in &controls {
+        let _ = steps.collect_terminal(c.id());
+    }
+
+    let m = partition.handle.metrics();
+    eprintln!(
+        "[scrape] cache disabled: prefix_cache_queries={} prefix_cache_hits={}",
+        m.prefix_cache_queries, m.prefix_cache_hits
+    );
+    assert_eq!(
+        m.prefix_cache_queries, 0,
+        "a disabled prefix cache must not report queries it never performed"
+    );
+    assert_eq!(m.prefix_cache_hits, 0, "a disabled prefix cache cannot hit");
+}
