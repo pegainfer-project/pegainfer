@@ -1,4 +1,7 @@
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 
 use super::lane_tests::assert_warm_result;
@@ -53,6 +56,7 @@ fn lane_lifecycle_script(mode: &str) {
     let mut harness = launch(&[
         (super::ASYNC_PREFILL_ENV, mode),
         (super::PREFIX_CACHE_ENV, "4"),
+        (super::DECODE_SLOTS_ENV, "4"),
     ]);
     let streamer = pin_live_stream(&mut harness);
 
@@ -69,6 +73,25 @@ fn lane_lifecycle_script(mode: &str) {
         (queued_done.tokens, queued_done.finish),
         (4, FinishReason::Length)
     );
+
+    let config =
+        crate::config::Gemma4Config::from_file(&crate::testkit::model_path()).expect("config");
+    let stopped = harness.submit_with_policy(
+        ids(1500, 19),
+        1,
+        Some(0),
+        None,
+        StopPolicy::new(EosPolicy::Ignore, (0..config.vocab_size as u32).collect()),
+    );
+    let stopped = harness.steps.drain(stopped.id(), "stop after lane prefill");
+    assert_eq!((stopped.tokens, stopped.finish), (1, FinishReason::Stop));
+    assert_eq!(stopped.stop_cause, Some(StopCause::Token(stopped.ids[0])));
+    super::lane_gates_tp::assert_finite(
+        stopped.logprobs[0].as_ref().expect("the trigger is scored"),
+        "lane stop",
+    );
+    let seen = harness.steps.buffered_tokens(streamer.id());
+    harness.steps.wait_tokens(streamer.id(), seen + 2);
 
     let warm = harness.submit(warm_prompt(&long_prompt), 4);
     assert_warm_result(&mut harness, warm.id(), 1500, "warm suffix on lane");

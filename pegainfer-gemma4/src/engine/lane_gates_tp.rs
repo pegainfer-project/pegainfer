@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::parallel::ParallelConfig;
 
@@ -84,8 +85,8 @@ fn tp2_options(a: usize, b: usize) -> EngineLoadOptions {
     }
 }
 
-/// Serve the first prompt on its own, then the rest as one concurrent batch,
-/// and shut the engine down once.
+/// Serve the first prompt on its own, then the rest as one concurrent batch.
+/// Replay the first prompt without scores before shutting the engine down.
 ///
 /// A single prompt in flight is the **solo** admission path (`step` plus
 /// `prefill_extra_ranks`), which a batch never takes; draining it before the
@@ -109,6 +110,22 @@ fn serve_batch(
     }
     for control in &controls[1..] {
         drained.push(harness.steps.drain(control.id(), "greedy"));
+    }
+    if let Some(first) = prompts.first() {
+        let unscored = harness.submit(first.clone(), max_tokens);
+        let unscored = harness
+            .steps
+            .drain(unscored.id(), "greedy solo without scores");
+        assert_eq!(
+            (unscored.tokens, unscored.finish),
+            (max_tokens, FinishReason::Length)
+        );
+        assert_eq!(unscored.stop_cause, None);
+        assert_eq!(
+            unscored.ids, drained[0].ids,
+            "requesting logprobs must not change the single-row decode sequence"
+        );
+        assert!(unscored.logprobs.iter().all(Option::is_none));
     }
     let controls: Vec<&_> = controls.iter().collect();
     harness.shutdown(&controls);
@@ -234,9 +251,8 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
             b.logprobs.len()
         );
         for (step, (a, b)) in a.logprobs.iter().zip(&b.logprobs).enumerate() {
-            let (Some(a), Some(b)) = (a, b) else {
-                continue;
-            };
+            let a = a.as_ref().expect("one-rank request returned its logprob");
+            let b = b.as_ref().expect("two-rank request returned its logprob");
             compared += 1;
             assert_finite(
                 a,

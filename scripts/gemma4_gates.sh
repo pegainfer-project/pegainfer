@@ -4,10 +4,10 @@
 #
 # The checkpoint-backed gates need real weights, fixtures and a device; the
 # kernels contracts need only a device. This script owns their execution:
-# it refuses to start unless every prerequisite is present, it holds each
-# discovered gate set against the manifest here so a gate cannot quietly leave
-# the suite. It claims one physical device for the suite's lifetime and runs one
-# gate per process — repeated checkpoint loads in one test binary exhaust a
+# it refuses to start unless every prerequisite is present, it holds the model's
+# discovered gates against the manifest and checks that each declared shared
+# kernel gate exists. It claims one physical device for the suite's lifetime
+# and runs one gate per process — repeated checkpoint loads in one test binary exhaust a
 # 48 GiB card.
 #
 #   PEGAINFER_TEST_MODEL_PATH=<dense-checkpoint> \
@@ -63,12 +63,14 @@ GATES_SERVING_CONTRACT=(
   "gpu,ckpt engine::lane_gates_roster::the_coalesce_door_releases_one_admission_burst"
   "gpu,ckpt engine::lane_gates_roster::the_raised_ceiling_and_slots_hold_at_the_roster_edge"
   "gpu,ckpt engine::lane_gates_roster::the_full_roster_keeps_its_pipeline_under_a_queue"
+  "gpu,ckpt,prompts engine::lane_gates_roster::stop_policy_drains_decode_before_reusing_its_slot"
   "gpu,ckpt,prompts engine::lane_gates_roster::an_idle_refill_matches_a_fresh_engine"
   "gpu,ckpt engine::lane_gates_lifecycle::the_raise_reaches_the_frontend"
   "gpu,ckpt,fixtures engine::lane_gates_logprobs::prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode"
   "gpu,ckpt engine::lane_gates_logprobs::a_scored_prompt_beside_a_live_batch_is_prefilled_whole"
   "gpu,ckpt engine::lane_gates_logprobs::a_low_slot_chunked_pool_scores_up_to_what_it_holds"
   "gpu,ckpt engine::lane_gates_logprobs::a_failed_prefill_costs_that_request_not_the_engine"
+  "gpu,ckpt,prompts engine::lane_gates_logprobs::stop_policy_keeps_the_prefill_trigger_and_its_score"
 )
 GATES_KV_AND_LANES=(
   "gpu,ckpt,fixtures serve::oracle::incremental_serving_matches_recompute"
@@ -454,7 +456,7 @@ require_chatgolden() {
 }
 
 
-# --- membership: the crate's ignored set must be exactly the manifest ------
+# --- membership: model gates are exact; declared shared gates must exist ---
 ignored_in() {
   local crate=$1
   shift
@@ -493,8 +495,11 @@ kernels_listing=$(ignored_in "$KERNELS_CRATE" --lib)
 [ -n "$kernels_listing" ] || die "could not list the kernels library's ignored gates"
 kernels_names=()
 for entry in "${GATES_KERNELS[@]}"; do kernels_names+=("${entry##* }"); done
+# The shared crate also owns other models' gates; only these belong to this suite.
+kernels_expected=$(printf '%s\n' "${kernels_names[@]}" | sort)
+kernels_listing=$(comm -12 <(printf '%s\n' "$kernels_listing") <(printf '%s\n' "$kernels_expected"))
 check_membership "kernels library" "$kernels_listing" \
-  "$(printf '%s\n' "${kernels_names[@]}" | sort)"
+  "$kernels_expected"
 
 kernels_pool_listing=$(listed_in "$KERNELS_CRATE" --test hd256_fp8_pool)
 [ -n "$kernels_pool_listing" ] || die "could not list the kernels hd256_fp8_pool integration gates"

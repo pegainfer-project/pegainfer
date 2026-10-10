@@ -1,11 +1,73 @@
 use std::time::Duration;
 
+use pegainfer_frontend::engine::EosPolicy;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
+
 use super::lane_tests::Drained;
 use super::lane_tests::Harness;
 use super::lane_tests::ids;
 use super::lane_tests::launch;
 use super::lane_tests::pin_live_stream;
 use super::lane_tests::wait_until;
+
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, a GPU, fixtures, and --test-threads=1"]
+fn stop_policy_drains_decode_before_reusing_its_slot() {
+    let prompt = crate::testkit::generate_fixture_prompts().remove(0);
+    let mut harness = launch(&[(super::DECODE_SLOTS_ENV, "1")]);
+    assert!(wait_until(Duration::from_secs(10), || {
+        harness.metrics().kv_total_blocks > 0
+    }));
+    // Both pools retain their graph-padding page even when no request is live.
+    let idle = harness.metrics();
+    for logprobs in [Some(8), None] {
+        let reference = harness.submit_scored(prompt.clone(), 16, logprobs, None);
+        let reference = harness.steps.drain(reference.id(), "without a stop");
+        assert_eq!(
+            (reference.tokens, reference.finish),
+            (16, FinishReason::Length)
+        );
+        assert_eq!(reference.stop_cause, None);
+        let position = (1..reference.ids.len() - super::DECODE_PIPELINE_DEPTH)
+            .find(|&i| !reference.ids[..i].contains(&reference.ids[i]))
+            .expect("the prompt generates a later distinct token with pipeline headroom");
+        let trigger = reference.ids[position];
+        // The unscored leg has at least two tokens left when it stops, so
+        // it settles a staged readback with a successor already in flight.
+        let stopped = harness.submit_with_policy(
+            prompt.clone(),
+            16,
+            logprobs,
+            None,
+            StopPolicy::new(EosPolicy::Ignore, vec![trigger]),
+        );
+        let next = harness.submit(prompt.clone(), 6);
+        let stopped = harness.steps.drain(stopped.id(), "explicit decode stop");
+        assert_eq!(stopped.finish, FinishReason::Stop);
+        assert_eq!(stopped.stop_cause, Some(StopCause::Token(trigger)));
+        assert_eq!(stopped.ids, reference.ids[..=position]);
+        assert_eq!(stopped.logprobs, reference.logprobs[..=position]);
+        if logprobs.is_some() {
+            super::lane_gates_tp::assert_finite(
+                stopped.logprobs[position]
+                    .as_ref()
+                    .expect("the trigger is scored"),
+                "decode stop",
+            );
+        }
+        let next = harness.steps.drain(next.id(), "slot reused after a stop");
+        assert_eq!((next.tokens, next.finish), (6, FinishReason::Length));
+        assert_eq!(next.stop_cause, None);
+        assert!(
+            wait_until(Duration::from_secs(10), || harness.metrics() == idle),
+            "the stopped row and its staged successor release their pages: idle {idle:?}, now {:?}",
+            harness.metrics()
+        );
+    }
+    harness.shutdown(&[]);
+}
 
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]

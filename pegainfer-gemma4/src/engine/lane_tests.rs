@@ -4,12 +4,14 @@ use std::time::Instant;
 
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::LiveScheduler;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::spawn_scheduler;
 
 pub(super) use super::lane_step_collector::Drained;
@@ -56,6 +58,23 @@ impl Harness {
         logprobs: Option<usize>,
         prompt_logprobs: Option<usize>,
     ) -> RequestControl {
+        self.submit_with_policy(
+            prompt_tokens,
+            max_tokens,
+            logprobs,
+            prompt_logprobs,
+            StopPolicy::new(EosPolicy::Ignore, vec![]),
+        )
+    }
+
+    pub(super) fn submit_with_policy(
+        &self,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        logprobs: Option<usize>,
+        prompt_logprobs: Option<usize>,
+        stop_policy: StopPolicy,
+    ) -> RequestControl {
         self.scheduler
             .as_ref()
             .expect("live scheduler")
@@ -67,7 +86,7 @@ impl Harness {
                     ..pegainfer_frontend::sampler::SamplingParams::default()
                 },
                 history_tokens: None,
-                stop_policy: pegainfer_frontend::engine::StopPolicy::default(),
+                stop_policy,
                 max_tokens,
                 lora_adapter: None,
                 kv_transfer_params: None,
@@ -115,6 +134,7 @@ impl Harness {
             .expect("scheduler not shut down twice");
         drop(scheduler.handle);
         scheduler.join.join().expect("scheduler thread exits");
+        self.steps.pump_available();
     }
 }
 
