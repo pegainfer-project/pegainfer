@@ -655,6 +655,11 @@ impl PrefixComparison {
     /// below a fault that moves every page, but it is not a detector for one
     /// confined to part of the prompt; the control-relative form is
     /// (`assert_disjoint_within`).
+    ///
+    /// The 31B arm keeps this form rather than the tighter floor because its own
+    /// count is **unmeasured**: the 0 of 511 above is the 12B control's reading,
+    /// and the 31B needs two cards that each hold 34 GiB — the tightest bound
+    /// waits for a reading from the checkpoint it is applied to.
     fn assert_disjoint_absolute(&self, what: &str, long: usize) {
         assert!(
             self.disjoint * 4 <= self.compared,
