@@ -155,12 +155,6 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: cargo test --release --locked -p kvbm-logical --lib
 
-      # Foundation-only slice: no CUDA dependency at all, so its probe and config
-      # tests belong on a CPU runner rather than in the per-model CUDA matrix.
-      - name: Run pegainfer-qwen38-flash-next unit tests
-        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: cargo test --release --locked -p pegainfer-qwen38-flash-next --lib
-
   cpu-clippy:
     if: github.event_name == 'push' || github.event.pull_request.draft == false
     name: CPU Clippy
@@ -195,7 +189,6 @@ jobs:
           -p pegainfer-build
           -p pegainfer-frontend
           -p pegainfer-sim
-          -p pegainfer-qwen38-flash-next
           -p kvbm-logical
           --all-targets -- -D warnings
 
@@ -282,16 +275,6 @@ jobs:
             extra_packages: "-p pegainfer-kernels"
             needs_triton: false
             triton_python: ""
-          # Foundation only: no CUDA kernels yet, hence no Triton. This row is
-          # what compiles the line's registration — `pegainfer-server` gates its
-          # registry entry and its hint family on `qwen38-flash-next`, and no
-          # other row enables that feature.
-          - model_name: Qwen3.8-Flash-Next
-            package: pegainfer-qwen38-flash-next
-            feature: qwen38-flash-next
-            extra_packages: "-p pegainfer-server"
-            needs_triton: false
-            triton_python: ""
 
     steps:
       - name: Checkout
@@ -317,10 +300,7 @@ jobs:
           cuda: "13.0.2"
           linux-local-args: '["--toolkit"]'
           method: network
-          # `driver-dev` carries the stub `libcuda.so` that lets a CUDA-linked
-          # binary link on a runner with no driver; `release.yml` installs the
-          # same set for the same reason.
-          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev", "driver-dev"]'
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
           non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
 
       - name: Install Python
@@ -344,39 +324,3 @@ jobs:
           --all-targets -- -D warnings
         env:
           PEGAINFER_TRITON_PYTHON: ${{ matrix.triton_python }}
-
-      # Clippy only type-checks the server's tests; the registry mirror is the
-      # one part of this line that lives in `pegainfer-server`, so run those
-      # assertions both with the feature on and off. The `hint` filter selects
-      # every test in that module — they are pure and need no device.
-      #
-      # `--test detect_gate` then runs the *binary* both ways: stock build must
-      # name the feature to rebuild with, enabled build must detect the line and
-      # refuse to serve. That is the only coverage of `main`'s CLI → detect →
-      # hint → launch wiring, and neither outcome touches CUDA (detection is
-      # pure and `launch` bails before the engine is built) — but the binary is
-      # CUDA-linked, so the loader still has to resolve the driver stub below.
-      #
-      # Running these is the one thing this repo's CI does that *links* a
-      # CUDA-linked binary: the clippy pass above never links, and the server
-      # reaches `pegainfer-kernels`, whose build script asks for `-lcuda`. This
-      # runner has no driver, so point the linker at the toolkit's stub
-      # (`driver-dev`, the same pairing `release.yml` uses) and give the loader
-      # a `libcuda.so.1` to resolve the stub's SONAME against — a copied stub,
-      # so no root is needed. No test here calls into it.
-      - name: Run the registration tests and the detection gate both ways
-        if: matrix.feature == 'qwen38-flash-next'
-        run: |
-          set -euo pipefail
-          link_stub="$CUDA_PATH/targets/x86_64-linux/lib/stubs"
-          test -f "$link_stub/libcuda.so"
-          runtime_stub=$(mktemp -d)
-          cp "$link_stub/libcuda.so" "$runtime_stub/libcuda.so.1"
-          export LIBRARY_PATH="$link_stub${LIBRARY_PATH:+:$LIBRARY_PATH}"
-          export LD_LIBRARY_PATH="$runtime_stub${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo test --release --locked -p pegainfer-server \
-            --features qwen38-flash-next --bin pegainfer hint
-          cargo test --release --locked -p pegainfer-server --bin pegainfer hint
-          cargo test --release --locked -p pegainfer-server \
-            --features qwen38-flash-next --test detect_gate
-          cargo test --release --locked -p pegainfer-server --test detect_gate
