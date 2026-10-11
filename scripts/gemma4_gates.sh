@@ -73,6 +73,7 @@ GATES_SERVING_CONTRACT=(
 GATES_KV_AND_LANES=(
   "gpu,ckpt,fixtures serve::oracle::incremental_serving_matches_recompute"
   "gpu,ckpt serve::oracle::prefix_restore_matches_cold_path"
+  "gpu,ckpt,prompts serve::oracle::the_drift_floor_is_measured_over_the_decode_sweep"
 )
 # The replacement global-attention kernel only exists in a build that had
 # TileLang or a pre-generated directory, and the gate says so rather than

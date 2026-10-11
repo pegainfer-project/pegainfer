@@ -652,13 +652,11 @@ const NEAR_TIE_TOP_K: usize = 8;
 /// use it widest — [`the_replacement_global_decode_matches_the_incumbent`] and
 /// [`the_folded_pool_matches_the_split_one`] — sweep 512/1500/3000 tokens, where
 /// the width is **unverified**: both need a generated kernel and neither has run.
-/// The part that needs no kernel does not measure it either: running the incumbent
-/// walk's rows through `neutral_scale` at the sweep's first cell (the same call
-/// those gates make) trips the rule's **membership** half before the width — a
-/// flipped pick outside the other row's top-8 — on the sweep's cycled prompts and
-/// on the golden's own `edge` text alike (`max |dlogit| 3.5` on the latter). What
-/// binds at that depth is the membership, not this width, and a depth gate has to
-/// start from that rather than from a line.
+/// It is applied where those gates compare their own two arms; the floor they print
+/// beside it is [`neutral_scale`], which measures a *different* comparison — a
+/// decode row against a recompute — and applies no rule, because at that depth its
+/// flips leave the other row's top-8 (the same `edge` text: `max |dlogit| 3.5`), so
+/// the rule could not hold there and is not asked to.
 const NEAR_TIE_WIDTH: f32 = 1.0;
 
 /// Whether `pick` is inside `row`'s top-`k`, without sorting the row: fewer than
@@ -666,6 +664,17 @@ const NEAR_TIE_WIDTH: f32 = 1.0;
 fn pick_inside_top(row: &[f32], pick: usize, k: usize) -> bool {
     let value = row[pick];
     row.iter().filter(|v| v.total_cmp(&value).is_gt()).count() < k
+}
+
+/// The worst absolute logit gap between two rows, with no rule applied — what a
+/// row's logits moved by. [`compare_row`] is what a gate holds its own two arms
+/// to; this is for the magnitude reads, where a moved pick is the measurement
+/// rather than a failure.
+fn raw_gap(ours: &[f32], theirs: &[f32]) -> f32 {
+    ours.iter()
+        .zip(theirs)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 /// One row's comparison: the worst absolute logit gap, and whether the two arms
@@ -725,11 +734,7 @@ fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> RowGap {
         );
     }
     RowGap {
-        worst: ours
-            .iter()
-            .zip(theirs)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max),
+        worst: raw_gap(ours, theirs),
         flipped,
     }
 }
@@ -845,15 +850,25 @@ const DRIFT_LINE: f32 = 12.0;
 
 /// What a decode row's logits move by when nothing about the maths changes:
 /// every row of a greedy walk against a single prefill of the context that
-/// row saw, one arm two ways, reduced the way the arms are compared.
+/// row saw, one arm two ways, read as a **raw gap** ([`raw_gap`]) — a magnitude,
+/// so it applies no rule and asserts nothing. That is what lets the gates above
+/// carry the near-tie rule on their own two arms instead: the comparison here is
+/// a decode row against a recompute of the same context, and at the sweep's
+/// depths its flips are not near ties (measured: at 512 tokens of the golden's
+/// `edge` text the pick moves outside the other row's top-8 at `max |dlogit|
+/// 3.5`), so holding *this* comparison to the rule would fail the gates on the
+/// magnitude they exist to print.
 ///
 /// Printed beside each cell so the reader has the magnitude an already
-/// accepted implementation difference reaches here. It is not the line: a
-/// sweep of sixteen cells put this at 0.31 to 5.75 and the replacement at
-/// 0.56 to 7.91, with neither tracking prompt or length -- lengths a page
-/// apart differ sevenfold and the worst row lands anywhere from the prompt
-/// row to the last. A maximum over a walk of these is a draw from a heavy
-/// tail, so a line derived from it in-run would move with the draw.
+/// accepted implementation difference reaches here. It is not the line: the
+/// sweep the decode gates run reads **0.5 to 21.75** raw logits
+/// (`the_drift_floor_is_measured_over_the_decode_sweep`, two L20s) — above
+/// `DRIFT_LINE` itself at one cell — and an earlier sixteen-cell sweep read 0.31
+/// to 5.75 with the replacement at 0.56 to 7.91. Neither tracks prompt or
+/// length: lengths a page apart differ sevenfold and the worst row lands
+/// anywhere from the prompt row to the last. A maximum over a walk of these is a
+/// draw from a heavy tail, so a line derived from it in-run would move with the
+/// draw.
 fn neutral_scale(
     ctx: &DeviceContext,
     serve: &GemmaServe,
@@ -864,7 +879,7 @@ fn neutral_scale(
     let mut worst = 0.0f32;
     for (i, row) in rows.iter().enumerate() {
         let recomputed = serving_recompute(ctx, serve, &walked[..prompt_len + i]);
-        worst = worst.max(compare_row(row, &recomputed, &format!("neutral scale row {i}")).worst);
+        worst = worst.max(raw_gap(row, &recomputed));
     }
     worst
 }
@@ -2181,4 +2196,30 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
         lengths.len(),
         lengths
     );
+}
+
+/// [`neutral_scale`]'s number over the sweep the decode gates use, with no
+/// generated kernel in the picture: the incumbent walk's rows against a
+/// recompute of the context each row saw, at 512/1500/3000 tokens. It is here
+/// because the floor must **measure** rather than assert — the comparison it
+/// makes is not the one the gates judge, and at these depths its flips leave the
+/// other row's top-8, so routing it back through `compare_row` would panic the
+/// two generated-kernel gates inside their own floor print. The floors this
+/// reads are on the record in [`neutral_scale`]'s doc.
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
+fn the_drift_floor_is_measured_over_the_decode_sweep() {
+    const STEPS: usize = 16;
+    let (ctx, serve, _dir) = stack_with(4096, 300);
+    let prompts = crate::testkit::generate_fixture_prompts();
+    for (prompt, len) in decode_sweep_cells() {
+        let tokens: Vec<u32> = prompts[prompt].iter().cycle().copied().take(len).collect();
+        let (rows, walked) = continue_walk(&ctx, &serve, &tokens, STEPS, None);
+        let floor = neutral_scale(&ctx, &serve, &rows, tokens.len(), &walked);
+        assert!(
+            floor.is_finite(),
+            "prompt {prompt} at {len}: the drift floor read {floor}"
+        );
+        eprintln!("prompt {prompt} at {len}: drift floor {floor}");
+    }
 }
