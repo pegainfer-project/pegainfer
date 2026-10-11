@@ -9,7 +9,9 @@
 //!
 //! Neither path reaches CUDA. Detection is pure, and `launch` bails before the
 //! engine is built, so this runs on a driver-less runner once the loader can
-//! resolve the driver stub the way the CI step sets it up.
+//! resolve the driver stub the way the CI step sets it up. The model directory
+//! also carries the repo's minimal tokenizer, so the enabled build gets past the
+//! frontend's startup and the refusal is what reaches stderr.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,6 +25,16 @@ const FROZEN_CONFIG: &str = include_str!(concat!(
     "/../pegainfer-qwen38-flash-next/tests/frozen_config.json"
 ));
 
+/// The repo's own minimal tokenizer (`pegainfer-frontend/examples/echo-model`,
+/// the fixture `examples/echo-server.rs` serves). An enabled build reaches the
+/// serve path before `launch` bails, and the frontend refuses to start without a
+/// tokenizer — which would surface *that* error instead of the refusal. The
+/// engine failure then cancels the server so the refusal is what reaches stderr.
+const TOKENIZER: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../pegainfer-frontend/examples/echo-model/tokenizer.json"
+));
+
 fn model_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "pegainfer-detect-gate-{tag}-{}",
@@ -30,6 +42,7 @@ fn model_dir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.json"), FROZEN_CONFIG).unwrap();
+    std::fs::write(dir.join("tokenizer.json"), TOKENIZER).unwrap();
     dir
 }
 
