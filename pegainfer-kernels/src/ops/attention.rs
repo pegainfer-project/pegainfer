@@ -13,9 +13,12 @@ use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
 
-/// GQA group sizes (query heads / KV heads) instantiated by FlashInfer's
-/// `DISPATCH_GQA_GROUP_SIZE`; any other ratio throws at dispatch time.
-pub const SUPPORTED_GQA_GROUP_SIZES: &[usize] = &[1, 2, 3, 4, 8];
+/// GQA group sizes (query heads / KV heads) with a compiled FlashInfer
+/// batch-decode kernel. This matches the set the pinned FlashInfer's
+/// `DISPATCH_GQA_GROUP_SIZE` instantiates; a ratio outside it is not refused —
+/// it takes the eager fallback — so this list gates an optimization, not
+/// correctness. Keep it in step with the pinned FlashInfer.
+pub const SUPPORTED_GQA_GROUP_SIZES: &[usize] = &[1, 2, 3, 4, 6, 8];
 
 // ============================================================================
 // Paged prefill (FlashInfer BatchPrefillWithPagedKVCache)

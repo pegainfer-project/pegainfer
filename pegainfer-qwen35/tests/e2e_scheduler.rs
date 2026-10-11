@@ -901,8 +901,8 @@ fn test_e2e_qwen35_scheduler_tp2_graph() {
     let start = Instant::now();
     let tokenizer = common::load_tokenizer(&model_path);
     // P2c: decode replays pre-captured CUDA Graphs when the TP-local decode
-    // GQA group has a compiled kernel (4B/9B); uncompiled groups (27B group 6)
-    // keep the batched eager path under the same request flow.
+    // GQA group has a compiled kernel; uncompiled groups keep the batched
+    // eager path under the same request flow.
     let handle = pegainfer_qwen35::start_engine_with_capacity(
         Path::new(&model_path),
         EngineLoadOptions {

@@ -1,8 +1,8 @@
 # Qwen3.5 Tensor Parallelism Design
 
-> **TL;DR:** Qwen3.5 tensor parallelism reuses Qwen3's controller/worker TP runtime and stays degree-parametric. Phases 1, 2a, 2b, and 2c are implemented (see `tp-implementation.md` for the current runtime): eager dense TP, TP mixed-step unified execution, sharded linear-attention/GDR state, and decode CUDA Graphs under TP gated on the compiled decode GQA group (4B/9B TP2 capture; 27B group-6 stays eager). Remaining design work: group-6 batch-decode kernels so 27B TP2 can capture, and TP perf gates.
+> **TL;DR:** Qwen3.5 tensor parallelism reuses Qwen3's controller/worker TP runtime and stays degree-parametric. Phases 1, 2a, 2b, and 2c are implemented (see `tp-implementation.md` for the current runtime): eager dense TP, TP mixed-step unified execution, sharded linear-attention/GDR state, and decode CUDA Graphs under TP gated on the compiled decode GQA group (4B/9B and 27B TP2 capture). Remaining design work: TP perf gates.
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-10
 
 ## Goal
 
@@ -272,12 +272,12 @@ Validation scope:
 ## P2c: CUDA Graph under TP
 
 Landed 2026-08-20 (#1005), gated on `Config35::decode_group_is_compiled`:
-4B/9B TP2 capture and replay decode graphs; 27B TP2 (group 6) stays on the
-batched eager path byte-for-byte until group-6 batch-decode kernels are
-compiled. Execution record: `tp-implementation.md`, section "P2c — CUDA Graph
-under TP".
+4B/9B and 27B TP2 capture and replay decode graphs. The 27B line is group 6
+(`24 Q / 4 KV`); the pinned FlashInfer compiles it, so it is in
+`SUPPORTED_GQA_GROUP_SIZES` and captures like 4B/9B (#1145). Execution record:
+`tp-implementation.md`, section "P2c — CUDA Graph under TP".
 
-**Gate**: graph mode active iff `enable_cuda_graph && config.decode_group_is_compiled()`. 27B TP2 is group-6 (`SUPPORTED_GQA_GROUP_SIZES = [1,2,3,4,8]`, group ratio is TP-invariant), so 27B TP2 keeps the batched eager path byte-for-byte until group-6 batch-decode kernels are compiled; 4B/9B TP2 capture graphs. Startup logs once when graph was requested but the group gate keeps decode eager.
+**Gate**: graph mode active iff `enable_cuda_graph && config.decode_group_is_compiled()`. The group ratio is TP-invariant; `SUPPORTED_GQA_GROUP_SIZES` lists the sizes the pinned FlashInfer's `DISPATCH_GQA_GROUP_SIZE` instantiates (`[1,2,3,4,6,8]`), so 4B/9B and 27B TP2 capture graphs while a ratio outside it keeps the batched eager path byte-for-byte. Startup logs once when graph was requested but the group gate keeps decode eager.
 
 **State model**: scheduler owns slot semantics (TP1 mirror); workers execute slot copies on command, never infer slots worker-side.
 
@@ -291,7 +291,7 @@ under TP".
 
 **Memory** (27B TP2/rank): weights ~26.9 GB + KV pool ~5.9 GiB + slot state reserve ~6.1 GiB + buffers/graphs ~0.3 + scratch/NCCL ~2.5 ≈ 41.7 GiB → fits 48 GB, with little room to grow the KV pool. The weight figure is the 53.79 GB bf16 text tower split over two ranks: 64 decoder layers at 48.71 GB plus the untied `embed_tokens`/`lm_head` pair at 248,320 × 5120, 2.54 GB each. What actually lands on rank 0's device at gate startup, before decode traffic, is 28.3 GB. 9B TP2 slot state ~1.6 GiB. Loader already reserves `2 × max_batch × bytes_per_request` before sizing KV.
 
-**Validation ladder**: CPU lib suite → TP2 graph HF gate (9B: sequential + bucket-straddling + post-compaction replay vs eager stats) → e2e scheduler graph variant → serving_tp2 graph smoke → 27B TP2 regression unchanged (group-6 stays eager) → per-bucket eager-vs-graph decode benchmark recorded in `bench_snapshots/`.
+**Validation ladder**: CPU lib suite → TP2 graph HF gate (9B: sequential + bucket-straddling + post-compaction replay vs eager stats; 27B same gate green on 2×L20) → e2e scheduler graph variant → serving_tp2 graph smoke → 27B TP2 eager golden + graph e2e scheduler green (#1145) → per-bucket eager-vs-graph decode benchmark recorded in `bench_snapshots/`.
 
 ## References
 

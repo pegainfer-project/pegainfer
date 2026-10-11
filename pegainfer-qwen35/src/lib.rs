@@ -125,7 +125,7 @@ pub struct Qwen35LaunchOptions {
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
     tp_size: usize,
     /// TP decode captures CUDA Graphs when the rank-local decode GQA group has
-    /// a compiled kernel; uncompiled groups (27B) stay on the eager path.
+    /// a compiled kernel; uncompiled groups stay on the eager path.
     cuda_graph: bool,
     max_batch: usize,
     max_prefill_tokens: usize,

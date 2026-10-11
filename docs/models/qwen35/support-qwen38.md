@@ -22,7 +22,7 @@
 > calls round-trip streaming and non-streaming), and the TP2 short/long
 > logits rows are recorded below. Tracked in #1067.
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-10
 
 ## What the checkpoint actually is
 
@@ -228,7 +228,7 @@ HTTP request; the serving row covers the frontend layers.
 
 | Gate | Device / build | Result |
 | --- | --- | --- |
-| `hf_golden_gate` short, Qwen3.8-27B TP2 | 2×L20 (sm_89) | sequential eager, 108 positions: mean 0.0238 / p50 0.0199 / p99 0.0862 / max 0.1593. Batched eager, 72 positions: mean 0.0231 / p99 0.0823 / max 0.1274. No argmax violation. |
+| `hf_golden_gate` short, Qwen3.8-27B TP2 | 2×L20 (sm_89) | eager, 108 positions: mean 0.0233 / p50 0.0190 / p99 0.0944 / max 0.1628; batched eager, 72 positions: mean 0.0214 / p99 0.0751. Graph (group 6 compiled, #1145): sequential 108 pos mean 0.0225 / p99 0.0795; batched 45 pos mean 0.0216 / p99 0.0805; slot-compaction 38 pos mean 0.0216 / p99 0.0759. No argmax violation. |
 | `hf_golden_gate` long, Qwen3.8-27B TP2 | 2×L20 (sm_89) | 4097 + 8192-token prompts, 18 positions: mean 0.0226 / p50 0.0206 / p99 0.0860 / max 0.0882. |
 | `hf_golden_gate` Qwen3.5-0.8B, single GPU + TP2 (tied head) | L20 | single GPU: short and long both pass. The captured-graph path is not bit-reproducible between runs — sequential graph mean 0.0293–0.0299 / p99 0.0954–0.1097 across two runs, batched and slot-compaction inside tolerance. TP2 short: batched eager mean 0.0300 / p99 0.1127, identical in both — the sharded load path on a second geometry. |
 | `hf_golden_gate` Qwen3.5-2B, single GPU (tied head) | 1×A40 (sm_80 build) | short sequential, 108 positions: mean 0.0301 / p99 0.1172. Long, 18 positions: mean 0.0238 / p99 0.0778. |
@@ -309,8 +309,9 @@ One environment trap, not guarded in code:
    the tensor carries.
 2. **Native MTP drafting** — both generations ship the head
    (`mtp_num_hidden_layers: 1`, 15 `mtp.*` tensors) and nobody loads it.
-3. **Group-6 batch-decode kernels** so 27B can capture CUDA Graphs (tracked in
-   `docs/models/qwen35/tp-design.md`).
+3. ~~**Group-6 batch-decode kernels** so 27B can capture CUDA Graphs~~ **Done
+   (#1145)**: the pinned FlashInfer compiles group 6, so 27B TP2 captures and
+   replays CUDA Graphs like 4B/9B (see `docs/models/qwen35/tp-design.md`).
 4. **`reasoning_effort` the layer does not own is still raw** — the
    normalization layer rewrites the API field against the default template
    only; a caller addressing the template directly, through

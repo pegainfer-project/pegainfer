@@ -739,8 +739,8 @@ fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
 }
 
 /// TP2 executor with CUDA Graph requested. Returns `None` when the loaded
-/// model's TP-local decode GQA group has no compiled kernel (27B group 6) —
-/// the P2c gate keeps that path eager, so there is no graph to gate on.
+/// model's TP-local decode GQA group has no compiled kernel — the P2c gate
+/// keeps that path eager, so there is no graph to gate on.
 fn build_tp2_graph_executor(model_path: &str, label: &str) -> Option<Qwen35TpExecutor> {
     let devices = common::tp2_device_ordinals();
     let ex = Qwen35TpExecutor::from_runtime_with_capacity(

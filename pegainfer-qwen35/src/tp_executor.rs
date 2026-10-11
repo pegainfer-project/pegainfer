@@ -735,8 +735,8 @@ impl Qwen35TpExecutor {
             .ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP executor loaded no models"))?;
         // P2c gate: graph decode under TP requires a compiled batch-decode
         // kernel for the rank-local GQA group. The group ratio is TP-invariant,
-        // so every rank decides identically; an uncompiled group (e.g. 27B's
-        // group 6) keeps the batched eager path byte-for-byte.
+        // so every rank decides identically; an uncompiled group keeps the
+        // batched eager path byte-for-byte.
         let geometry = first.geometry;
         let graph_enabled = enable_cuda_graph && first.config().decode_group_is_compiled();
         if enable_cuda_graph && !graph_enabled {
