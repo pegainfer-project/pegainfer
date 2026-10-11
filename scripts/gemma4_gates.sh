@@ -121,6 +121,7 @@ GATES_TENSOR_PARALLEL=(
   "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_is_prefix_consistent"
   "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_is_prefix_consistent_within_a_single_rank_control"
   "tp2,ckpt,hf31 engine::lane_gates_tp::the_two_rank_engine_matches_the_hf_reference"
+  "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_is_no_further_from_the_reference_at_depth"
 )
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"

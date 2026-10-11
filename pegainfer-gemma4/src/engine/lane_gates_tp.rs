@@ -100,12 +100,10 @@ fn single_options(device: usize) -> EngineLoadOptions {
 }
 
 /// Two ranks, two devices, with CUDA graphs left **at their default** (`true`).
-/// A tensor-parallel launch turns them off and says so: NCCL's abort waits for a
-/// captured graph that references the communicator to be destroyed, and a rank
-/// stopped inside a collective cannot release its own, so a captured collective
-/// would make the failure path unresolvable. The engine serves eager rather than
-/// refusing, and this arm is what holds that — with the flag at its default every
-/// gate here would fail at launch if the refusal came back.
+/// A tensor-parallel launch turns them off and says so — the cycle that forces
+/// it is in `docs/models/gemma4/tp.md`, "Decode graphs are off under TP". With
+/// the flag at its default every gate here would fail at launch if the engine
+/// went back to *refusing*, so this arm is what holds it to falling back.
 fn tp2_options(a: usize, b: usize) -> EngineLoadOptions {
     EngineLoadOptions {
         enable_cuda_graph: true,
@@ -118,10 +116,11 @@ fn tp2_options(a: usize, b: usize) -> EngineLoadOptions {
 /// Serve the first prompt on its own, then the rest as one concurrent batch,
 /// and shut the engine down once.
 ///
-/// A single prompt in flight is the **solo** admission path (`step` plus
-/// `prefill_extra_ranks`), which a batch never takes; draining it before the
-/// others are submitted is what makes it a lone arrival. Both runs drive this
-/// same sequence, so the per-prompt comparison stays index-aligned.
+/// A single prompt in flight is the **solo** admission path (`step` over one
+/// request, driven across every rank by `drive_ranks`), which a batch never
+/// takes; draining it before the others are submitted is what makes it a lone
+/// arrival. Both runs drive this same sequence, so the per-prompt comparison
+/// stays index-aligned.
 fn serve_batch(
     harness: &mut Harness,
     prompts: &[Vec<u32>],
@@ -650,22 +649,20 @@ impl PrefixComparison {
     /// error — a page, position or rope fault — can otherwise read zero. This is
     /// the absolute form of the bound that sees them, for an arm with no control
     /// arm above it: the 31B gate (its checkpoint does not fit one card) and the
-    /// control arm itself. Read against the reading, which is 0 of 511 rows at
-    /// 1024 tokens — a quarter is far above any run this gate has taken and far
-    /// below a fault that moves every page, but it is not a detector for one
-    /// confined to part of the prompt; the control-relative form is
-    /// (`assert_disjoint_within`).
-    ///
-    /// The 31B arm keeps this form rather than the tighter floor because its own
-    /// count is **unmeasured**: the 0 of 511 above is the 12B control's reading,
-    /// and the 31B needs two cards that each hold 34 GiB — the tightest bound
-    /// waits for a reading from the checkpoint it is applied to.
+    /// control arm itself. The floor is the same sixty-fourth the control-relative
+    /// form uses, read against a reading of **0** rows out of 511 at 1024 tokens
+    /// on both checkpoints — the 12B control and, measured on two L20s, the
+    /// 60-layer 31B — so it sits far above any run either has taken, where a flat
+    /// quarter admitted 127 rows and so was not a detector for a fault confined to
+    /// part of the prompt.
     fn assert_disjoint_absolute(&self, what: &str, long: usize) {
+        let ceiling = self.compared / PREFIX_CONTROL_DISJOINT_FLOOR_DIVISOR;
         assert!(
-            self.disjoint * 4 <= self.compared,
-            "{what}: {} of {} rows share no token between the {}- and {long}-token runs, more \
-             than a quarter of them — a disagreement that widespread is not the row-count \
-             dependence this line is calibrated for, and those rows never reach `worst`",
+            self.disjoint <= ceiling,
+            "{what}: {} of {} rows share no token between the {}- and {long}-token runs, above \
+             the {ceiling} this line allows (compared / {PREFIX_CONTROL_DISJOINT_FLOOR_DIVISOR}) — \
+             a disagreement that widespread is not the row-count dependence this line is \
+             calibrated for, and those rows never reach `worst`",
             self.disjoint,
             self.compared,
             long / 2
@@ -725,18 +722,20 @@ fn prefix_comparison(options: &EngineLoadOptions, long: usize) -> PrefixComparis
         first_flip: String::new(),
     };
     for row in 0..short - 1 {
-        let (Some(a), Some(b)) = (
-            short_echo
-                .logprobs
-                .get(row + 1)
-                .and_then(|entry| entry.as_ref()),
-            long_echo
-                .logprobs
-                .get(row + 1)
-                .and_then(|entry| entry.as_ref()),
-        ) else {
-            continue;
-        };
+        // A row missing from either echo is a failure, not a skip: silently
+        // dropping it would let a run that scored only part of the prompt pass
+        // on the rows it happened to score, which is what the HF gate's own
+        // `was not scored` panic rules out.
+        let a = short_echo
+            .logprobs
+            .get(row + 1)
+            .and_then(|entry| entry.as_ref())
+            .unwrap_or_else(|| panic!("{short}-token run row {row} was not scored"));
+        let b = long_echo
+            .logprobs
+            .get(row + 1)
+            .and_then(|entry| entry.as_ref())
+            .unwrap_or_else(|| panic!("{long}-token run row {row} was not scored"));
         comparison.compared += 1;
         assert_finite(a, &format!("{short}-token run row {row} (engine)"));
         assert_finite(b, &format!("{long}-token run row {row} (engine)"));
@@ -1075,6 +1074,113 @@ fn a_failed_rank_zero_segment_stops_the_engine_at_two_ranks() {
     harness.shutdown(&[]);
 }
 
+/// One engine's distance from the fixture's reference over one case: how many
+/// rows moved a pick the reference's top-k does not hold, and the worst
+/// shared-token logprob gap. Split out of the gate below so a one-rank arm and a
+/// two-rank one are measured the same way and can be held against each other.
+struct HfDistance {
+    compared: usize,
+    same_pick: usize,
+    outside: usize,
+    offenders: Vec<String>,
+    worst: f32,
+    worst_at: String,
+}
+
+fn hf_distance(
+    options: &EngineLoadOptions,
+    fixture: &safetensors::SafeTensors<'_>,
+    case: &str,
+) -> HfDistance {
+    let (_, tokens) = u32_tensor(fixture, &format!("{case}_tokens"));
+    let (shape, ids) = i32_tensor(fixture, &format!("{case}_topk_ids"));
+    let (_, lps) = f32_tensor(fixture, &format!("{case}_topk_logprobs"));
+    let top_k = shape[1];
+    assert_eq!(
+        shape[0],
+        tokens.len(),
+        "{case}: one reference row per token"
+    );
+    let mut harness = launch_with(options, &as_refs(&envelope_overrides()));
+    let control = harness.submit_scored(tokens.clone(), 1, Some(top_k), Some(top_k));
+    let drained = harness.steps.drain(control.id(), case);
+    let echo = drained.prompt_echo.expect("the engine echoes the prompt");
+    let mut distance = HfDistance {
+        compared: 0,
+        same_pick: 0,
+        outside: 0,
+        offenders: Vec::new(),
+        worst: 0.0,
+        worst_at: String::new(),
+    };
+    for row in 0..tokens.len() - 1 {
+        // Row 0 of the echo is the head's own placeholder, so the row that
+        // predicts token `r + 1` sits at `r + 1`.
+        let ours = echo
+            .logprobs
+            .get(row + 1)
+            .and_then(|entry| entry.as_ref())
+            .unwrap_or_else(|| panic!("{case}: row {row} was not scored"));
+        let theirs: Vec<(u32, f32)> = (0..top_k)
+            .map(|k| (ids[row * top_k + k] as u32, lps[row * top_k + k]))
+            .collect();
+        assert!(
+            theirs.iter().all(|(_, value)| value.is_finite()),
+            "{case} row {row}: the reference fixture carries a non-finite logprob"
+        );
+        assert_finite(ours, &format!("{case} row {row} (engine)"));
+        let ours_top = top_of(ours);
+        let (pa, pb) = (ours.top_logprobs[0].0, theirs[0].0);
+        distance.compared += 1;
+        if pa == pb {
+            distance.same_pick += 1;
+        } else {
+            // A differing pick has to be a near-tie: each pick inside the
+            // other run's top-k. Every offender is collected rather than
+            // panicking on the first, so one run names them all.
+            if !theirs.iter().any(|(token, _)| *token == pa) {
+                distance.outside += 1;
+                if distance.offenders.len() < 10 {
+                    distance.offenders.push(format!(
+                        "{case} row {row}: engine pick {pa} at {:.4}, reference top-1 {pb} at \
+                         {:.4}, reference top-{top_k} floor {:.4}",
+                        ours.top_logprobs[0].1,
+                        theirs[0].1,
+                        theirs.last().expect("non-empty top-k").1
+                    ));
+                }
+            }
+            if !ours_top.contains_key(&pb) {
+                distance.outside += 1;
+                if distance.offenders.len() < 10 {
+                    distance.offenders.push(format!(
+                        "{case} row {row}: reference pick {pb} outside the engine's top-{top_k}"
+                    ));
+                }
+            }
+        }
+        for (token, value) in &theirs {
+            if let Some(other) = ours_top.get(token) {
+                let gap = (value - other).abs();
+                if gap > distance.worst {
+                    distance.worst = gap;
+                    distance.worst_at = format!("{case} row {row} token {token}");
+                }
+            }
+        }
+    }
+    harness.shutdown(&[&control]);
+    eprintln!(
+        "hf {case}: {}/{} rows keep the reference's pick; {} out-of-top-k; worst shared-token \
+         logprob gap {:.4} at {}",
+        distance.same_pick, distance.compared, distance.outside, distance.worst, distance.worst_at
+    );
+    for offender in &distance.offenders {
+        eprintln!("hf {case}: outside: {offender}");
+    }
+    distance
+}
+
 /// Two ranks against the Hugging Face reference, for the size the gate above
 /// cannot afford a single-rank control on: a 31B's whole tower is 57 GiB, so its
 /// baseline is impossible on one card and the *reference* is the baseline here.
@@ -1093,12 +1199,9 @@ fn the_two_rank_engine_matches_the_hf_reference() {
     /// logits. A shared token may sit this far apart: bf16 reduction order and a
     /// different attention backend, nothing structural.
     const DRIFT_LINE: f32 = 1.0;
-    // Only the nine-token case is asserted, so **long prompts at TP2 are
-    // unverified**: running the fixture's 1024-token `edge` fails a strict top-64
-    // containment on ~5-8 rows, and those rows fail at one rank as well as at
-    // two — which says nothing about the second rank either way, since a failure
-    // both arms share is explained by neither. Pinning that depth needs the
-    // fixtures' per-case tolerance discipline, not a containment test.
+    // The nine-token case is asserted here; the 1024-token `edge` case is the
+    // depth gate below, which holds the two-rank arm against a one-rank arm on
+    // the *same* fixture rather than against a containment both arms fail.
     // (`probed_cases` lists the cases carrying hidden-state probes; `edge` has
     // none because at window width they would dwarf the file, so its absence
     // says nothing about whether the case is asserted.) See
@@ -1117,100 +1220,83 @@ fn the_two_rank_engine_matches_the_hf_reference() {
         manifest["model_class"], manifest["revision"], manifest["dtypes"]
     );
 
-    let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
-    let mut controls = Vec::new();
-    let mut compared = 0usize;
-    let mut same_pick = 0usize;
-    let mut outside = 0usize;
-    let mut offenders: Vec<String> = Vec::new();
-    let mut worst = 0.0f32;
-    let mut worst_at = String::new();
     for case in CASES {
-        let (_, tokens) = u32_tensor(&fixture, &format!("{case}_tokens"));
-        let (shape, ids) = i32_tensor(&fixture, &format!("{case}_topk_ids"));
-        let (_, lps) = f32_tensor(&fixture, &format!("{case}_topk_logprobs"));
-        let top_k = shape[1];
-        assert_eq!(
-            shape[0],
-            tokens.len(),
-            "{case}: one reference row per token"
+        let distance = hf_distance(&tp2_options(device, peer), &fixture, case);
+        assert!(
+            distance.outside == 0,
+            "{case}: {} rows have a pick outside the other's top-k; first up to 10: {:#?}",
+            distance.outside,
+            distance.offenders
         );
-        let control = harness.submit_scored(tokens.clone(), 1, Some(top_k), Some(top_k));
-        let drained = harness.steps.drain(control.id(), case);
-        let echo = drained.prompt_echo.expect("the engine echoes the prompt");
-        for row in 0..tokens.len() - 1 {
-            // Row 0 of the echo is the head's own placeholder, so the row that
-            // predicts token `r + 1` sits at `r + 1`.
-            let ours = echo
-                .logprobs
-                .get(row + 1)
-                .and_then(|entry| entry.as_ref())
-                .unwrap_or_else(|| panic!("{case}: row {row} was not scored"));
-            let theirs: Vec<(u32, f32)> = (0..top_k)
-                .map(|k| (ids[row * top_k + k] as u32, lps[row * top_k + k]))
-                .collect();
-            assert!(
-                theirs.iter().all(|(_, value)| value.is_finite()),
-                "{case} row {row}: the reference fixture carries a non-finite logprob"
-            );
-            assert_finite(ours, &format!("{case} row {row} (engine)"));
-            let ours_top = top_of(ours);
-            let (pa, pb) = (ours.top_logprobs[0].0, theirs[0].0);
-            compared += 1;
-            if pa == pb {
-                same_pick += 1;
-            } else {
-                // A differing pick has to be a near-tie: each pick inside the
-                // other run's top-k. Every offender is collected rather than
-                // panicking on the first, so one run names them all.
-                if !theirs.iter().any(|(token, _)| *token == pa) {
-                    outside += 1;
-                    if offenders.len() < 10 {
-                        offenders.push(format!(
-                            "{case} row {row}: engine pick {pa} at {:.4}, reference top-1 {pb} at \
-                             {:.4}, reference top-{top_k} floor {:.4}",
-                            ours.top_logprobs[0].1,
-                            theirs[0].1,
-                            theirs.last().expect("non-empty top-k").1
-                        ));
-                    }
-                }
-                if !ours_top.contains_key(&pb) {
-                    outside += 1;
-                    if offenders.len() < 10 {
-                        offenders.push(format!(
-                            "{case} row {row}: reference pick {pb} outside the engine's top-{top_k}"
-                        ));
-                    }
-                }
-            }
-            for (token, value) in &theirs {
-                if let Some(other) = ours_top.get(token) {
-                    let gap = (value - other).abs();
-                    if gap > worst {
-                        worst = gap;
-                        worst_at = format!("{case} row {row} token {token}");
-                    }
-                }
-            }
-        }
-        controls.push(control);
+        assert!(
+            distance.worst < DRIFT_LINE,
+            "{case}: the two-rank engine and the reference differ on {} by {} (line {DRIFT_LINE})",
+            distance.worst_at,
+            distance.worst
+        );
     }
+}
+
+/// The fixture's longest case at one rank and at two, held against each other.
+/// The golden's `edge` (1024 tokens) fails a strict top-64 containment on a
+/// handful of rows **at one rank as well as at two**, and that bounds neither: a
+/// failure both arms share is explained by neither. What it can show is that the
+/// second rank adds nothing *beyond* the one-rank arm's own distance from the
+/// reference — so both arms are measured the same way ([`hf_distance`]) and the
+/// two-rank reading is held within a ratio of the one-rank one, with a floor so
+/// a control that read zero cannot tighten the ceiling to nothing. The ratio is
+/// generous on purpose: this is a drift read, not a threshold, and what it names
+/// is a two-rank arm that adds rows the one-rank arm did not.
+#[test]
+#[ignore = "needs two GPUs, a one-card checkpoint, a 12B fixture, and --test-threads=1"]
+fn the_two_rank_engine_is_no_further_from_the_reference_at_depth() {
+    /// How much further from the reference the two-rank arm may read than the
+    /// one-rank one, on each measure.
+    const RATIO: f32 = 1.5;
+    /// The floor, in rows: a one-rank arm that read zero out-of-top-k rows must
+    /// not pin the two-rank ceiling to zero.
+    const OUTSIDE_FLOOR: usize = 2;
+    /// The floor under the gap ratio, in raw logits: two arm's gaps are both
+    /// small numbers, and a ratio of small numbers is not a bound.
+    const WORST_FLOOR: f32 = 0.25;
+
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let dir = crate::testkit::model_path();
+    let (bytes, _manifest) = golden_bytes(&dir);
+    let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("fixture");
+    let case = "edge";
+
+    let one = hf_distance(&single_options(device), &fixture, case);
+    let two = hf_distance(&tp2_options(device, peer), &fixture, case);
     eprintln!(
-        "hf: {same_pick}/{compared} rows keep the reference's pick; {outside} out-of-top-k; worst \
-         shared-token logprob gap {worst:.4} at {worst_at}"
-    );
-    for offender in &offenders {
-        eprintln!("hf: outside: {offender}");
-    }
-    let controls: Vec<&_> = controls.iter().collect();
-    harness.shutdown(&controls);
-    assert!(
-        outside == 0,
-        "{outside} rows have a pick outside the other's top-k; first up to 10: {offenders:#?}"
+        "hf depth: {case} {} rows; one rank {} out-of-top-k / worst {:.4}; two ranks {} / {:.4}",
+        one.compared, one.outside, one.worst, two.outside, two.worst
     );
     assert!(
-        worst < DRIFT_LINE,
-        "the two-rank engine and the reference differ on {worst_at} by {worst} (line {DRIFT_LINE})"
+        one.compared > 0,
+        "{case}: the one-rank arm scored no rows, so there is no distance to hold against"
+    );
+    assert_eq!(
+        one.compared, two.compared,
+        "{case}: the two arms compared different row counts"
+    );
+    let outside_ceiling = ((RATIO * one.outside as f32).ceil() as usize).max(OUTSIDE_FLOOR);
+    assert!(
+        two.outside <= outside_ceiling,
+        "{case}: the two-rank arm put {} rows outside the reference's top-k, against the one-rank \
+         arm's {} (ceiling {outside_ceiling} = {RATIO}x, floor {OUTSIDE_FLOOR}) — rows like these \
+         are where a second-rank fault hides, and this arm adds them",
+        two.outside,
+        one.outside
+    );
+    let worst_ceiling = (RATIO * one.worst).max(WORST_FLOOR);
+    assert!(
+        two.worst <= worst_ceiling,
+        "{case}: the two-rank arm's worst shared-token gap is {} at {}, against the one-rank arm's \
+         {} (ceiling {worst_ceiling})",
+        two.worst,
+        two.worst_at,
+        one.worst
     );
 }
