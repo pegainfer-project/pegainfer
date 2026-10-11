@@ -62,9 +62,9 @@ struct Family {
 /// rest on each line's own probe tests plus review of this table.
 ///
 /// The hint is **identity-only**: it cannot run a compiled-out probe, so it also
-/// fires for a variant that probe would refuse — a different `dtype` (the FP8
-/// sibling), tied embeddings, a YaRN rope. It names the feature to rebuild with;
-/// it is not a promise that the checkpoint is servable.
+/// fires for a variant that probe would refuse — a quantized sibling (its
+/// `quantization_config`), tied embeddings, a YaRN rope. It names the feature to
+/// rebuild with; it is not a promise that the checkpoint is servable.
 fn families() -> [Family; 8] {
     [
         Family {
@@ -111,9 +111,9 @@ fn families() -> [Family; 8] {
         },
         Family {
             feature: "qwen4",
-            // The FP8 sibling and the tied/YaRN variants share this outer
-            // identity, so a hint fires for them too; the line's probe refuses
-            // those once the feature is on.
+            // The FP8 and NVFP4 siblings and the tied/YaRN variants share this
+            // outer identity, so a hint fires for them too; the line's probe
+            // refuses those once the feature is on.
             model_types: &["qwen4_exp"],
             text_model_types: &["qwen4_exp_text"],
             compiled: cfg!(feature = "qwen4"),

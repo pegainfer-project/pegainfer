@@ -29,6 +29,7 @@ const FULL_ATTN_HEAD_DIM: usize = 256;
 #[derive(Deserialize)]
 pub(crate) struct RawConfig {
     tie_word_embeddings: bool,
+    quantization_config: Option<serde_json::Value>,
     text_config: TextConfig,
 }
 
@@ -44,6 +45,7 @@ pub(crate) struct RopeParameters {
 #[derive(Debug, Deserialize)]
 pub(crate) struct TextConfig {
     pub(crate) dtype: String,
+    pub(crate) quantization_config: Option<serde_json::Value>,
     pub(crate) mamba_ssm_dtype: String,
     pub(crate) tie_word_embeddings: bool,
 
@@ -141,6 +143,12 @@ impl TryFrom<RawConfig> for Config {
 
     fn try_from(raw: RawConfig) -> Result<Self> {
         let t = raw.text_config;
+        // The quantized siblings (the official FP8, nvidia's NVFP4) keep
+        // `dtype: bfloat16` and differ from this checkpoint only by this block.
+        ensure!(
+            raw.quantization_config.is_none() && t.quantization_config.is_none(),
+            "qwen4_exp: quantized checkpoints are not served (quantization_config is present)"
+        );
         // The loader must materialize an embedding *and* an LM head; a tied
         // variant would leave one of them missing from the checkpoint.
         ensure!(
@@ -362,6 +370,12 @@ fn rotary_dim(t: &TextConfig) -> Result<usize> {
         t.head_dim
     );
     let rotary_dim = exact as usize;
+    // The reference builds its frequencies with `arange(0, rotary_dim, 2)` and
+    // rotates `cos.shape[-1]` dims, which is one more than an odd width.
+    ensure!(
+        rotary_dim.is_multiple_of(2),
+        "qwen4_exp: rotary_dim {rotary_dim} must be even (the reference rotates in pairs)"
+    );
     // The reference requires the rotary width to fit the QSA index head
     // (`configuration_qwen4_exp.py:227`).
     ensure!(
@@ -645,6 +659,25 @@ mod tests {
         Config::from_json(&cfg).unwrap();
     }
 
+    /// The real `Qwen/Qwen3.8-Flash-Next-FP8` config differs from the frozen one
+    /// only by this block (its 943-entry `modules_to_not_convert` trimmed), and
+    /// its `text_config.dtype` is still `bfloat16`.
+    #[test]
+    fn the_fp8_sibling_fails_closed() {
+        let err = err(|c| {
+            c["quantization_config"] = serde_json::json!({
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_per_tensor": false,
+                "act_per_tensor": false,
+                "weight_block_size": [128, 128],
+                "modules_to_not_convert": ["lm_head", "model.language_model.embed_tokens"],
+                "modules_to_convert": ["ple.ple_embedding.ngram_embedding"]
+            });
+        });
+        assert!(err.contains("quantization_config"), "{err}");
+    }
+
     #[test]
     fn a_non_bf16_dtype_bails() {
         let err = err(|c| text(c, "dtype", serde_json::json!("float16")));
@@ -718,6 +751,17 @@ mod tests {
             text(c, "partial_rotary_factor", serde_json::json!(0.3));
         });
         assert!(err.contains("whole number"), "{err}");
+    }
+
+    #[test]
+    fn an_odd_rotary_width_bails() {
+        // 63/256 is exact in binary, so 256 x factor is the whole number 63.
+        let err = err(|c| {
+            c["text_config"]["rope_parameters"]["partial_rotary_factor"] =
+                serde_json::json!(0.246_093_75);
+            text(c, "partial_rotary_factor", serde_json::json!(0.246_093_75));
+        });
+        assert!(err.contains("even"), "{err}");
     }
 
     #[test]

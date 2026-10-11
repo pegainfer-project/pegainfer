@@ -62,8 +62,12 @@ side behind a crate feature of its own, `config` and `probe` move behind
   pinning *structure rather than widths*. Pinned because an alternative would need a
   kernel or serving path this line does not have: the GDN head dims (they are the
   Triton AOT specialization keys), `head_dim` 256, the conv kernel ceiling,
-  `rope_type: default` (no YaRN path), `output_gate_type: sigmoid`,
-  `mamba_ssm_dtype: float32`, `dtype: bfloat16`, and untied embeddings. The GDN and
+  `rope_type: default` (no YaRN path), an even rotary width (the reference rotates in
+  pairs, so an odd one would rotate one more dim than computed), `output_gate_type:
+  sigmoid`, `mamba_ssm_dtype: float32`, `dtype: bfloat16` with no `quantization_config`,
+  and untied embeddings. The official FP8 sibling and nvidia's NVFP4 keep `dtype:
+  bfloat16` and differ from this checkpoint only by `quantization_config`, so that
+  block is what refuses them; the dtype alone would not. The GDN and
   attention limits mirror `pegainfer-qwen35/src/config/model.rs`, whose GDN wrappers own
   them; they move to the shared owner with those wrappers in slice B, and until then
   this crate stays free of CUDA. Deliberately *not* pinned: expert count, hidden size,
@@ -93,9 +97,10 @@ side behind a crate feature of its own, `config` and `probe` move behind
   both `qwen4_exp` and `qwen4_exp_text` when the feature is off, and stays silent when
   it is on. A test under the feature binds that row to this crate's `MODEL_TYPE` /
   `TEXT_MODEL_TYPE`, so the mirror cannot drift from the probe. The hint is
-  **identity-only** — it cannot run a compiled-out probe — so it also fires for the FP8
-  sibling and the tied/YaRN variants of `qwen4_exp`, which the probe refuses once the
-  feature is on; the hint names the feature to rebuild with, not a promise of service.
+  **identity-only** — it cannot run a compiled-out probe — so it also fires for the
+  quantized siblings and the tied/YaRN variants of `qwen4_exp`, which the config refuses
+  once the feature is on; the hint names the feature to rebuild with, not a promise of
+  service.
   `pegainfer-server/tests/detect_gate.rs` then drives the shipped binary against a
   model directory holding this crate's frozen `config.json`, both ways: the stock build
   must name the feature, the enabled build must detect the line and refuse to serve.
@@ -118,8 +123,9 @@ bytes at BF16    = 102,400,491,520                     = 102.4 GB
 
 **102.4 GB, not the ~51 GB vLLM and SGLang quote** — that figure is the fp8 footprint,
 and this checkpoint ships BF16. Every host-RAM budget in the issue set was 2× under
-until it said which dtype it meant. The FP8 sibling is a different revision and would
-need freezing separately.
+until it said which dtype it meant. The FP8 sibling converts this table to fp8
+(`modules_to_convert`); it is a separate checkpoint, refused here by its
+`quantization_config`, and serving it would need freezing separately.
 
 The derivation lands here rather than with its first consumer because #1106 (the n-gram
 brick) needs the geometry independently of any tensor contract, and because it is pure
