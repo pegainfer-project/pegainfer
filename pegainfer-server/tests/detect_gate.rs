@@ -12,10 +12,14 @@
 //! tokenizer, so the enabled build gets past the frontend's startup and the
 //! refusal is what reaches stderr.
 
+use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::process::Output;
+use std::process::ExitStatus;
+use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
 
 /// The real checkpoint config, committed by the line crate. The server has no
 /// fixture of its own, and the gate is meant to see the real thing.
@@ -45,25 +49,51 @@ fn model_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn run_against(model_path: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_pegainfer"))
+/// Both runs exit within a second once the binary is warm; this only has to
+/// catch a startup or cancellation path that never returns.
+const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs the binary against `model_path` and returns its exit status and stderr.
+/// Stderr goes to a file, so a full pipe cannot stall the child, and a run past
+/// `RUN_TIMEOUT` is killed and fails with what it printed so far.
+fn run_against(model_path: &Path) -> (ExitStatus, String) {
+    let log = model_path.join("stderr.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pegainfer"))
         .arg("--model-path")
         .arg(model_path)
-        .output()
-        .expect("spawn the pegainfer binary")
+        .stdout(Stdio::null())
+        .stderr(File::create(&log).expect("create the stderr log"))
+        .spawn()
+        .expect("spawn the pegainfer binary");
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the pegainfer binary") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the binary did not exit within {RUN_TIMEOUT:?}:\n{}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stderr = std::fs::read_to_string(&log).expect("read the stderr log");
+    (status, stderr)
 }
 
 #[cfg(not(feature = "qwen4"))]
 #[test]
 fn stock_build_names_the_qwen4_feature() {
     let dir = model_dir("stock");
-    let out = run_against(&dir);
+    let (status, stderr) = run_against(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        !out.status.success(),
+        !status.success(),
         "the stock build must not claim a qwen4_exp config"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("--features qwen4"),
         "the hint did not name the feature:\n{stderr}"
@@ -74,13 +104,12 @@ fn stock_build_names_the_qwen4_feature() {
 #[test]
 fn enabled_build_detects_the_line_and_refuses_to_serve() {
     let dir = model_dir("enabled");
-    let out = run_against(&dir);
+    let (status, stderr) = run_against(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        !out.status.success(),
+        !status.success(),
         "the line must refuse to serve until inference is implemented"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("Qwen4"),
         "stderr did not name the detected line:\n{stderr}"
