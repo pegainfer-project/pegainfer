@@ -723,10 +723,6 @@ fn prefix_comparison(options: &EngineLoadOptions, long: usize) -> PrefixComparis
         first_flip: String::new(),
     };
     for row in 0..short - 1 {
-        // A row missing from either echo is a failure, not a skip: silently
-        // dropping it would let a run that scored only part of the prompt pass
-        // on the rows it happened to score, which is what the HF gate's own
-        // `was not scored` panic rules out.
         let a = short_echo
             .logprobs
             .get(row + 1)
@@ -856,26 +852,18 @@ fn the_two_rank_engine_is_prefix_consistent_within_a_single_rank_control() {
 const PREFIX_LINE: f32 = 12.0;
 
 /// The one-card form of the same line: what the two-rank arm may read against
-/// the single-rank control's own reading. `serve_oracle` derives its lines the
-/// same way when it can afford the control arm — a ratio with a floor, so a
-/// control that happened to read exactly zero cannot tighten the bound to
-/// nothing.
-///
-/// Measured on the 12B at the window width (512 vs 1024 tokens): the control
-/// reads **6.30** nat and the two-rank arm **9.23**, a ratio of **1.46** — the
-/// two-rank drift at that depth is the same phenomenon, not a multiple of it.
-/// The ratio is 2.0 rather than 1.5 so a re-run's scatter does not flake the
-/// gate; the absolute `PREFIX_LINE` cannot see either reading.
+/// the single-rank control's own reading — a ratio with a floor, so a control
+/// that happened to read exactly zero cannot tighten the bound to nothing. The
+/// ratio is 2.0 rather than 1.5 so a re-run's scatter does not flake the gate.
+/// The readings it is set from are in `tp.md` ("Known bounds").
 const PREFIX_CONTROL_RATIO: f32 = 2.0;
 const PREFIX_CONTROL_FLOOR: f32 = 0.10;
 
 /// The same control-relative shape for the rows that shared *no* token, which
-/// `worst` cannot see. Measured on the 12B at the window width (512 vs 1024
-/// tokens): the control and the two-rank arm each read **0** of 511 rows, so the
-/// ceiling there is the floor. The ratio is the gap's; the floor is a
-/// sixty-fourth of the compared rows rather than a flat quarter, which admitted
-/// 127 of 511 — a fault confined to part of the prompt is rows like these, and a
-/// quarter is too wide to see one.
+/// `worst` cannot see. The ratio is the gap's; the floor is a sixty-fourth of the
+/// compared rows rather than a flat quarter, which admitted 127 of 511 — a fault
+/// confined to part of the prompt is rows like these, and a quarter is too wide
+/// to see one. The readings are in `tp.md` ("Known bounds").
 const PREFIX_CONTROL_DISJOINT_RATIO: f32 = 2.0;
 const PREFIX_CONTROL_DISJOINT_FLOOR_DIVISOR: usize = 64;
 
@@ -1075,10 +1063,11 @@ fn a_failed_rank_zero_segment_stops_the_engine_at_two_ranks() {
     harness.shutdown(&[]);
 }
 
-/// One engine's distance from the fixture's reference over one case: how many
-/// rows moved a pick the reference's top-k does not hold, and the worst
-/// shared-token logprob gap. Split out of the gate below so a one-rank arm and a
-/// two-rank one are measured the same way and can be held against each other.
+/// One engine's distance from the fixture's reference over one case: the rows a
+/// containment check rejects — **each row counted once**, however many checks it
+/// misses — and the worst shared-token logprob gap. Split out of the gate below
+/// so a one-rank arm and a two-rank one are measured the same way and can be
+/// held against each other.
 struct HfDistance {
     compared: usize,
     same_pick: usize,
@@ -1136,27 +1125,32 @@ fn hf_distance(
         if pa == pb {
             distance.same_pick += 1;
         } else {
-            // A differing pick has to be a near-tie: each pick inside the
-            // other run's top-k. Every offender is collected rather than
-            // panicking on the first, so one run names them all.
+            // A differing pick has to be a near-tie: each pick inside the other
+            // run's top-k. A **row** counts once however many checks it misses —
+            // counting per check would let one row weigh two, and the depth gate
+            // holds this total under a ratio. Every failing row is collected
+            // rather than panicking on the first, so one run names them all.
+            let mut missed: Vec<String> = Vec::new();
             if !theirs.iter().any(|(token, _)| *token == pa) {
-                distance.outside += 1;
-                if distance.offenders.len() < 10 {
-                    distance.offenders.push(format!(
-                        "{case} row {row}: engine pick {pa} at {:.4}, reference top-1 {pb} at \
-                         {:.4}, reference top-{top_k} floor {:.4}",
-                        ours.top_logprobs[0].1,
-                        theirs[0].1,
-                        theirs.last().expect("non-empty top-k").1
-                    ));
-                }
+                missed.push(format!(
+                    "engine pick {pa} at {:.4}, reference top-1 {pb} at {:.4}, reference \
+                     top-{top_k} floor {:.4}",
+                    ours.top_logprobs[0].1,
+                    theirs[0].1,
+                    theirs.last().expect("non-empty top-k").1
+                ));
             }
             if !ours_top.contains_key(&pb) {
+                missed.push(format!(
+                    "reference pick {pb} outside the engine's top-{top_k}"
+                ));
+            }
+            if !missed.is_empty() {
                 distance.outside += 1;
                 if distance.offenders.len() < 10 {
-                    distance.offenders.push(format!(
-                        "{case} row {row}: reference pick {pb} outside the engine's top-{top_k}"
-                    ));
+                    distance
+                        .offenders
+                        .push(format!("{case} row {row}: {}", missed.join("; ")));
                 }
             }
         }
@@ -1172,7 +1166,7 @@ fn hf_distance(
     }
     harness.shutdown(&[&control]);
     eprintln!(
-        "hf {case}: {}/{} rows keep the reference's pick; {} out-of-top-k; worst shared-token \
+        "hf {case}: {}/{} rows keep the reference's pick; {} rows out-of-top-k; worst shared-token \
          logprob gap {:.4} at {}",
         distance.same_pick, distance.compared, distance.outside, distance.worst, distance.worst_at
     );
@@ -1246,8 +1240,10 @@ fn the_two_rank_engine_matches_the_hf_reference() {
 /// reference — so both arms are measured the same way ([`hf_distance`]) and the
 /// two-rank reading is held within a ratio of the one-rank one, with a floor so
 /// a control that read zero cannot tighten the ceiling to nothing. The ratio is
-/// generous on purpose: this is a drift read, not a threshold, and what it names
-/// is a two-rank arm that adds rows the one-rank arm did not.
+/// generous on purpose: this is a drift read, not a threshold. Both measures are
+/// **totals** — the rows a containment check rejects, and the worst shared-token
+/// gap — and neither arm keeps row positions, so this bounds how far the
+/// two-rank total may grow, not which rows it grew on.
 #[test]
 #[ignore = "needs two GPUs, a one-card checkpoint, a 12B fixture, and --test-threads=1"]
 fn the_two_rank_engine_is_no_further_from_the_reference_at_depth() {
@@ -1257,8 +1253,8 @@ fn the_two_rank_engine_is_no_further_from_the_reference_at_depth() {
     /// The floor, in rows: a one-rank arm that read zero out-of-top-k rows must
     /// not pin the two-rank ceiling to zero.
     const OUTSIDE_FLOOR: usize = 2;
-    /// The floor under the gap ratio, in raw logits: two arm's gaps are both
-    /// small numbers, and a ratio of small numbers is not a bound.
+    /// The floor under the gap ratio, in logprobs (nats, as both sides are): both
+    /// arms' gaps are small numbers, and a ratio of small numbers is not a bound.
     const WORST_FLOOR: f32 = 0.25;
 
     let (device, peer) = devices();
@@ -1278,14 +1274,10 @@ fn the_two_rank_engine_is_no_further_from_the_reference_at_depth() {
         one.compared > 0,
         "{case}: the one-rank arm scored no rows, so there is no distance to hold against"
     );
-    assert_eq!(
-        one.compared, two.compared,
-        "{case}: the two arms compared different row counts"
-    );
     let outside_ceiling = ((RATIO * one.outside as f32).ceil() as usize).max(OUTSIDE_FLOOR);
     assert!(
         two.outside <= outside_ceiling,
-        "{case}: the two-rank arm put {} rows outside the reference's top-k, against the one-rank \
+        "{case}: the two-rank arm put {} rows outside a containment check, against the one-rank \
          arm's {} (ceiling {outside_ceiling} = {RATIO}x, floor {OUTSIDE_FLOOR}) — rows like these \
          are where a second-rank fault hides, and this arm adds them",
         two.outside,

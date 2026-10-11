@@ -1030,13 +1030,13 @@ pub(crate) struct GemmaServe {
 }
 
 // SAFETY: A serve is pinned to one CUDA device and driven by one thread at a
-// time: the thread that loads it (the load-time warm and the decode-graph sweep
-// walk the ranks one after another, never in parallel), and afterwards exactly
-// one thread per step — the scheduler's for rank 0, and one scoped thread per
-// extra rank, which hands its `&mut` back at the join before the scheduler
-// touches that rank again (`EngineState::drive_ranks`). No two threads hold a
-// serve at once, so the raw NCCL communicator it may hold never crosses a
-// thread while in use. (Same assertions `Qwen3Model` makes.)
+// time: the thread that loads it (the load-time warm walks the ranks one after
+// another, never in parallel), and afterwards exactly one thread per step — the
+// scheduler's for rank 0, and one scoped thread per extra rank, which hands its
+// `&mut` back at the join before the scheduler touches that rank again
+// (`EngineState::drive_ranks`). No two threads hold a serve at once, so the raw
+// NCCL communicator it may hold never crosses a thread while in use. (Same
+// assertions `Qwen3Model` makes.)
 unsafe impl Send for GemmaServe {}
 
 impl GemmaServe {
@@ -1165,8 +1165,8 @@ impl GemmaServe {
         })
     }
 
-    /// Attach this rank's tensor-parallel communicator. Every decode graph must
-    /// be captured after this, so the reduction lands inside the graph.
+    /// Attach this rank's tensor-parallel communicator, built on this rank's
+    /// compute stream so the reduction is issued where its operands are.
     pub(crate) fn attach_tp_comm(&mut self, comm: TpComm) {
         self.tp_comm = Some(comm);
     }
