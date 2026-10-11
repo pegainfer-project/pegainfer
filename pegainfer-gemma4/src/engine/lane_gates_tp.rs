@@ -389,9 +389,10 @@ fn scored(row: &[(u32, f32)]) -> TokenLogprob {
 }
 
 /// A flip six nats wide: each pick is the other run's runner-up, so mutual
-/// top-`TOP_K` membership holds. The gate's own bound catches this shape as well
-/// — the folded `worst_pick` reads 6 against `LOGBROB_LINE` — so this test is
-/// the membership half's failure, and the one below is what the width adds.
+/// top-`TOP_K` membership holds and the margin assert is what fires here. The
+/// gate's own line catches this shape too — both picks' gaps fold into
+/// `worst_pick`, which reads 6 against `LOGBROB_LINE` — so the shape is not what
+/// the width adds; the test below is the one only the width rejects.
 #[test]
 #[should_panic(expected = "apart in the one-rank and two-rank readings")]
 fn a_flip_six_nats_wide_is_not_a_near_tie() {
