@@ -3,9 +3,9 @@
 > **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture
 > preview, is a **new line** (`qwen4_exp`), not a Qwen3.5
 > variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction.
-> Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: a
-> fail-closed probe that pins *structure rather than widths*, and a config layer that
-> validates the geometry and derives what `config.json` leaves implicit. Nothing runs —
+> Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an
+> identity probe and one typed config validation that pins *structure rather than
+> widths* and derives what `config.json` leaves implicit. Nothing runs —
 > detection succeeds and `launch` refuses, because the text graph is slice B. Four facts
 > this line must not get wrong, all measured rather than assumed: the embedding is
 > **untied**; there is **no final-norm tensor** (the readout is the hyper-connection
@@ -47,46 +47,46 @@ Every probe and config test runs against it.
 
 ## What landed
 
-`pegainfer-qwen4`, feature `qwen4`, **with no CUDA dependency at all** — so its
-tests need no device, no weights and no Triton-equipped build.
-Preserving that is the point of the crate's shape: when slice B adds the device side,
-`config` and `probe` must move behind `#[cfg(any(feature, test))]` the way
-`pegainfer-gemma4/src/lib.rs` does.
+`pegainfer-qwen4`, enabled in the server by `--features qwen4`, **with no CUDA
+dependency at all** — so its tests need no device, no weights and no Triton-equipped
+build. Preserving that is the point of the crate's shape: when slice B adds the device
+side behind a crate feature of its own, `config` and `probe` move behind
+`#[cfg(any(<that feature>, test))]` the way `pegainfer-gemma4/src/lib.rs` does.
 
-- **Probe** (`src/probe.rs`) — fail-closed identity plus structure, following the
-  Gemma 4 pattern of pinning *structure rather than widths*. Pinned because an
-  alternative would need a kernel or serving path this line does not have: the GDN
-  head dims (they are the Triton AOT specialization keys), `head_dim` 256, the conv
-  kernel ceiling, `rope_type: default` (no YaRN path), `output_gate_type: sigmoid`,
-  `mamba_ssm_dtype: float32`, `dtype: bfloat16` (so the **FP8 sibling fails closed**
-  rather than loading as BF16), and untied embeddings. Deliberately *not* pinned:
-  expert count, hidden size, layer count, head counts, `hc_count` — so a smaller
-  `qwen4_exp` checkpoint reuses this probe, which is what the L20 small-model
-  deployment case needs. `smaller_widths_still_pass` is what keeps that promise honest.
-  The same list carries `mrope_interleaved` and `mrope_section`, which are accepted
+- **Probe** (`src/probe.rs`) — identity only: the outer `model_type`, `architectures`
+  and the inner `text_config.model_type`, the same split as Qwen3.5's probe.
+- **Config** (`src/config.rs`) — every other rule, behind one typed parse
+  (`RawConfig` → `Config`), so detection and loading cannot disagree. The line's
+  `ModelLine::probe` builds the whole `Config`, so `detect` refuses an unservable
+  `qwen4_exp` config before the frontend starts. It follows the Gemma 4 pattern of
+  pinning *structure rather than widths*. Pinned because an alternative would need a
+  kernel or serving path this line does not have: the GDN head dims (they are the
+  Triton AOT specialization keys), `head_dim` 256, the conv kernel ceiling,
+  `rope_type: default` (no YaRN path), `output_gate_type: sigmoid`,
+  `mamba_ssm_dtype: float32`, `dtype: bfloat16`, and untied embeddings. The GDN and
+  attention limits mirror `pegainfer-qwen35/src/config/model.rs`, whose GDN wrappers own
+  them; they move to the shared owner with those wrappers in slice B, and until then
+  this crate stays free of CUDA. Deliberately *not* pinned: expert count, hidden size,
+  layer count, head counts, `hc_count` — so a smaller `qwen4_exp` checkpoint passes the
+  same rules, which is what the L20 small-model deployment case needs
+  (`smaller_widths_still_pass`). `mrope_interleaved` and `mrope_section` are accepted
   rather than refused: a text-only sequence is their degenerate case in the reference
   itself, which expands one position per token across all three axes before
-  interleaving. The decision is tracked in #1105. Beyond the pins, the probe mirrors
+  interleaving. The decision is tracked in #1105. Beyond the pins, the config mirrors
   the rules the reference's own `validate_architecture` enforces — `hc_count > 1`,
   QSA's `indexer_kv_heads == 1` with the budget a whole multiple of the compress
   ratio, the rotary width fitting the index head, `rope_theta` present, and PLE
-  confined to a **single** `linear_attention` layer — since a config the reference
-  refuses cannot be served by any port. It also carries the two head-group integrality
-  rules the shared Qwen3.5 geometry owns (`AttentionHeadDivisibility`,
-  `LinearHeadDivisibility`): the attention and GatedDeltaNet dispatch work on the
-  derived group, so `num_attention_heads % num_key_value_heads` and
-  `linear_num_value_heads % linear_num_key_heads` must both be whole. Multi-layer PLE
-  is refused for now: the reference offsets each layer's prime run by its layer index
+  confined to a **single** `linear_attention` layer — plus the two head-group
+  integrality rules Qwen3.5's config enforces (`AttentionHeadDivisibility`,
+  `LinearHeadDivisibility`). Multi-layer PLE is refused for now: the reference offsets
+  each layer's prime run by its position in `ple_layer_ids`
   (`global_head_idx = L * ngram_heads + i`), and this crate derives one table.
-- **Config** (`src/config.rs`) — validated geometry plus the derivations the rest of the
-  line needs. Two fields the reference reads are **absent from `config.json`** and
-  come from upstream defaults: `norm_topk_prob` (`true`, and it decides whether the
-  router renormalizes its top-k) and `seed`. Both are modelled explicitly with their
-  defaults, because a port that reads only `config.json` silently drops the router
-  renormalization — this is #1068's mirror image. The line's `ModelLine::probe` builds
-  the whole `Config` rather than calling `probe_config_json` alone, because `detect`
-  claims a config through `probe`: the n-gram partition and head-group derivations are
-  the gate's job too, not test-only scaffolding.
+  `norm_topk_prob` is **absent from `config.json`** and comes from the upstream default
+  (`true`, and it decides whether the router renormalizes its top-k), so it is modelled
+  with that default: a port that reads only `config.json` silently drops the router
+  renormalization — this is #1068's mirror image. The other absent field, `seed`, only
+  matters if the n-gram hash multipliers are recomputed instead of read from the
+  checkpoint, so it is not modelled.
 - **Registration** — the server binary hand-mirrors every line's probe identities in a
   hint descriptor its own comment says cannot be derived away, so the mirror is tested
   and not just the probe: `feature_gate_hint` names `--features qwen4` for
@@ -123,8 +123,9 @@ need freezing separately.
 
 The derivation lands here rather than with its first consumer because #1106 (the n-gram
 brick) needs the geometry independently of any tensor contract, and because it is pure
-arithmetic over `config.json` — `nth_prime_after_matches_the_reference` pins the prime
-search against the reference's `_find_nth_prime_after`.
+arithmetic over `config.json`. The prime search is a direct port of the reference's
+`_is_prime` / `_find_nth_prime_after` (trial division by odd numbers), and
+`nth_prime_after_matches_the_reference` pins its values.
 
 ## Traps
 
@@ -152,7 +153,7 @@ search against the reference's `_find_nth_prime_after`.
 | Criterion | Blocked on |
 | --- | --- |
 | Tensor manifest enforced before the first H2D | Nothing — CPU only. The Gemma 4 classifier is the porting precedent; the deltas this checkpoint forces are an untied LM head, rank-3 shapes (the depthwise conv and the fused expert stacks, which carry **no `.weight` suffix**), the `model.visual.` / `mtp.` skip set, and 1-D lengths, which the shared loader does **not** check (#1068). |
-| GDN reuse proof, executed | 1 GPU. Answered as far as tensors go — geometry equals the Triton AOT constants, conv width equals the in-tree cap, names match down to the `model.language_model.layers.N.` prefix — but `conv1d_decode_batch_cuda` / `gated_delta_rule_decode_batch_cuda` are wrapped only inside `pegainfer-qwen35/src/recurrent.rs`, so slice B has to decide whether to lift them into shared `ops` or re-wrap them. |
+| GDN reuse proof, executed | 1 GPU. Answered as far as tensors go — geometry equals the Triton AOT constants, conv width equals the in-tree cap, names match down to the `model.language_model.layers.N.` prefix — but `conv1d_decode_batch_cuda` / `gated_delta_rule_decode_batch_cuda` are wrapped only inside `pegainfer-qwen35/src/recurrent.rs`, so slice B has to decide whether to lift them into shared `ops` or re-wrap them. The kernel limits `src/config.rs` mirrors from Qwen3.5 move with them. |
 | Bookend gate (embedding → mixer → lm_head → argmax) | 1 GPU, three shards (1 + 130 + 131, 5.29 GB, ~2.6 GB of weights on device) and a CPU f64 reference for the mixer. No layer weights needed. |
 | HF golden fixtures (logits + intermediate probes) | the fleet — 360 GB, plus ≥102.4 GB host RAM if the n-gram table is materialized |
 | Tokenizer / chat-template ID fixtures | transformers **5.16.0+** — the checkpoint's own tokenizer is `Qwen2Tokenizer`, which is older, but fixtures are compared against the reference implementation; nothing in the tree commits token-ID fixtures today |
