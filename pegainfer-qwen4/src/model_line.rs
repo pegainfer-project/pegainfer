@@ -12,13 +12,13 @@ use pegainfer_frontend::model_line::ModelLine;
 
 use crate::config::Config;
 
-pub static MODEL_LINE: Qwen38FlashNextLine = Qwen38FlashNextLine;
+pub static MODEL_LINE: Qwen4Line = Qwen4Line;
 
-pub struct Qwen38FlashNextLine;
+pub struct Qwen4Line;
 
-impl ModelLine for Qwen38FlashNextLine {
+impl ModelLine for Qwen4Line {
     fn name(&self) -> &'static str {
-        "Qwen3.8-Flash-Next"
+        "Qwen4"
     }
 
     /// Constructs the whole [`Config`], not just the structural probe. `detect`
@@ -35,7 +35,7 @@ impl ModelLine for Qwen38FlashNextLine {
 
     fn launch(&self, _ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         anyhow::bail!(
-            "Qwen3.8-Flash-Next is detected and its config is validated, but the text graph is \
+            "Qwen4 is detected and its config is validated, but the text graph is \
              not built yet (slice B). Refusing to start rather than serving a partial model. \
              The GDN gated-norm activation this checkpoint selects (sigmoid, not Qwen3.5's \
              silu) became selectable in the shared kernel in #1129; the missing piece is \
@@ -53,7 +53,7 @@ mod tests {
     fn the_registry_entry_detects_the_frozen_revision() {
         let json: serde_json::Value =
             serde_json::from_str(include_str!("../tests/frozen_config.json")).unwrap();
-        assert_eq!(MODEL_LINE.name(), "Qwen3.8-Flash-Next");
+        assert_eq!(MODEL_LINE.name(), "Qwen4");
         MODEL_LINE.probe(&json).unwrap();
     }
 
@@ -83,7 +83,7 @@ mod tests {
         }
         assert_eq!(
             assert_object_safe(&MODEL_LINE),
-            "Qwen3.8-Flash-Next",
+            "Qwen4",
             "the server's registry entry must keep coercing to `&'static dyn ModelLine`"
         );
     }

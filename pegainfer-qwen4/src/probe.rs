@@ -51,7 +51,7 @@ fn probe_identity(json: &serde_json::Value) -> Result<&serde_json::Value> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     if model_type != MODEL_TYPE {
-        bail!("not a Qwen3.8-Flash-Next config: model_type={model_type}");
+        bail!("not a qwen4_exp config: model_type={model_type}");
     }
 
     let has_arch = json
@@ -635,7 +635,7 @@ mod tests {
                 Err(error) => error.to_string(),
             };
             assert!(
-                err.contains("not a Qwen3.8-Flash-Next config"),
+                err.contains("not a qwen4_exp config"),
                 "{model_type}: {err}"
             );
         }

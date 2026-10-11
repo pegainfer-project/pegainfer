@@ -7,11 +7,10 @@
 //! config and asserts the two shipped outcomes: a stock build names the feature to
 //! rebuild with, an enabled build detects the line and then refuses to serve it.
 //!
-//! Neither path reaches CUDA. Detection is pure, and `launch` bails before the
-//! engine is built, so this runs on a driver-less runner once the loader can
-//! resolve the driver stub the way the CI step sets it up. The model directory
-//! also carries the repo's minimal tokenizer, so the enabled build gets past the
-//! frontend's startup and the refusal is what reaches stderr.
+//! Neither path reaches CUDA: detection is pure, and `launch` bails before the
+//! engine is built. The model directory also carries the repo's minimal
+//! tokenizer, so the enabled build gets past the frontend's startup and the
+//! refusal is what reaches stderr.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -22,7 +21,7 @@ use std::process::Output;
 /// fixture of its own, and the gate is meant to see the real thing.
 const FROZEN_CONFIG: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../pegainfer-qwen38-flash-next/tests/frozen_config.json"
+    "/../pegainfer-qwen4/tests/frozen_config.json"
 ));
 
 /// The repo's own minimal tokenizer (`pegainfer-frontend/examples/echo-model`,
@@ -54,9 +53,9 @@ fn run_against(model_path: &Path) -> Output {
         .expect("spawn the pegainfer binary")
 }
 
-#[cfg(not(feature = "qwen38-flash-next"))]
+#[cfg(not(feature = "qwen4"))]
 #[test]
-fn stock_build_names_the_flash_next_feature() {
+fn stock_build_names_the_qwen4_feature() {
     let dir = model_dir("stock");
     let out = run_against(&dir);
     let _ = std::fs::remove_dir_all(&dir);
@@ -66,12 +65,12 @@ fn stock_build_names_the_flash_next_feature() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--features qwen38-flash-next"),
+        stderr.contains("--features qwen4"),
         "the hint did not name the feature:\n{stderr}"
     );
 }
 
-#[cfg(feature = "qwen38-flash-next")]
+#[cfg(feature = "qwen4")]
 #[test]
 fn enabled_build_detects_the_line_and_refuses_to_serve() {
     let dir = model_dir("enabled");
@@ -83,7 +82,7 @@ fn enabled_build_detects_the_line_and_refuses_to_serve() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Qwen3.8-Flash-Next"),
+        stderr.contains("Qwen4"),
         "stderr did not name the detected line:\n{stderr}"
     );
     assert!(

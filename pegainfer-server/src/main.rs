@@ -37,8 +37,8 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
         &pegainfer_qwen3::model_line::MODEL_LINE,
         #[cfg(feature = "qwen35")]
         &pegainfer_qwen35::model_line::MODEL_LINE,
-        #[cfg(feature = "qwen38-flash-next")]
-        &pegainfer_qwen38_flash_next::model_line::MODEL_LINE,
+        #[cfg(feature = "qwen4")]
+        &pegainfer_qwen4::model_line::MODEL_LINE,
     ]
 }
 
@@ -56,9 +56,9 @@ struct Family {
 ///
 /// This is **a second source of truth by necessity**: the hint exists for the
 /// case where the line — and therefore its `probe` — is compiled out, so these
-/// strings cannot be read from the line crate. The `qwen38-flash-next` row is
+/// strings cannot be read from the line crate. The `qwen4` row is
 /// bound to that crate's own `MODEL_TYPE`/`TEXT_MODEL_TYPE` by a test under the
-/// feature (`flash_next_hint_identity_matches_the_line_crate`); the other rows
+/// feature (`qwen4_hint_identity_matches_the_line_crate`); the other rows
 /// rest on each line's own probe tests plus review of this table.
 ///
 /// The hint is **identity-only**: it cannot run a compiled-out probe, so it also
@@ -110,13 +110,13 @@ fn families() -> [Family; 8] {
             compiled: cfg!(feature = "qwen35"),
         },
         Family {
-            feature: "qwen38-flash-next",
+            feature: "qwen4",
             // The FP8 sibling and the tied/YaRN variants share this outer
             // identity, so a hint fires for them too; the line's probe refuses
             // those once the feature is on.
             model_types: &["qwen4_exp"],
             text_model_types: &["qwen4_exp_text"],
-            compiled: cfg!(feature = "qwen38-flash-next"),
+            compiled: cfg!(feature = "qwen4"),
         },
     ]
 }
@@ -319,36 +319,36 @@ mod tests {
         assert!(feature_gate_hint(&config).is_none());
     }
 
-    #[cfg(not(feature = "qwen38-flash-next"))]
+    #[cfg(not(feature = "qwen4"))]
     #[test]
-    fn hint_names_the_flash_next_feature_for_its_own_identity() {
+    fn hint_names_the_qwen4_feature_for_its_own_identity() {
         let config = serde_json::json!({
             "model_type": "qwen4_exp",
             "text_config": {"model_type": "qwen4_exp_text"}
         });
         let hint = feature_gate_hint(&config).expect("qwen4_exp identity should hint");
-        assert!(hint.contains("--features qwen38-flash-next"), "{hint}");
+        assert!(hint.contains("--features qwen4"), "{hint}");
     }
 
     /// The Qwen3.5 probe hard-requires `qwen3_5`, so without this family entry a
-    /// Flash-Next checkpoint would fall through to "unknown model" instead of
+    /// `qwen4_exp` checkpoint would fall through to "unknown model" instead of
     /// naming the feature to rebuild with — and with the entry present it must
     /// still not claim the Qwen3.5 identity.
-    #[cfg(not(feature = "qwen38-flash-next"))]
+    #[cfg(not(feature = "qwen4"))]
     #[test]
-    fn flash_next_and_qwen35_identities_do_not_cross_hint() {
+    fn qwen4_and_qwen35_identities_do_not_cross_hint() {
         let qwen35 = serde_json::json!({
             "model_type": "qwen3_5",
             "text_config": {"model_type": "qwen3_5_text"}
         });
         let hint = feature_gate_hint(&qwen35).unwrap_or_default();
-        assert!(!hint.contains("qwen38-flash-next"), "{hint}");
+        assert!(!hint.contains("--features qwen4"), "{hint}");
 
-        let flash_next = serde_json::json!({
+        let qwen4 = serde_json::json!({
             "model_type": "qwen4_exp",
             "text_config": {"model_type": "qwen4_exp_text"}
         });
-        let hint = feature_gate_hint(&flash_next).expect("should hint");
+        let hint = feature_gate_hint(&qwen4).expect("should hint");
         assert!(!hint.contains("--features qwen35"), "{hint}");
     }
 
@@ -356,20 +356,20 @@ mod tests {
     /// what a served config carries, but the family declares two identity lists
     /// and the other families test the text one separately
     /// (`hint_matches_text_config_identities` above).
-    #[cfg(not(feature = "qwen38-flash-next"))]
+    #[cfg(not(feature = "qwen4"))]
     #[test]
-    fn hint_matches_the_flash_next_text_identity() {
+    fn hint_matches_the_qwen4_text_identity() {
         let config = serde_json::json!({"text_config": {"model_type": "qwen4_exp_text"}});
         let hint = feature_gate_hint(&config).expect("qwen4_exp_text identity should hint");
-        assert!(hint.contains("--features qwen38-flash-next"), "{hint}");
+        assert!(hint.contains("--features qwen4"), "{hint}");
     }
 
     /// The other half of the same claim, taken under the feature that makes it
     /// true: once the line is compiled in, its own identity must fall through to
     /// the registry instead of being told to rebuild.
-    #[cfg(feature = "qwen38-flash-next")]
+    #[cfg(feature = "qwen4")]
     #[test]
-    fn hint_is_silent_for_a_compiled_flash_next_family() {
+    fn hint_is_silent_for_a_compiled_qwen4_family() {
         let config = serde_json::json!({
             "model_type": "qwen4_exp",
             "text_config": {"model_type": "qwen4_exp_text"}
@@ -385,18 +385,18 @@ mod tests {
 
     /// [`families`] is a hand-mirror of each line's identity, because the line —
     /// and its `probe` — is compiled out exactly when the hint is needed. This
-    /// binds the qwen38 row to the line crate's own constants, so changing one
+    /// binds the qwen4 row to the line crate's own constants, so changing one
     /// side without the other fails here instead of silently leaving the hint
     /// pointing at an identity the probe no longer claims.
-    #[cfg(feature = "qwen38-flash-next")]
+    #[cfg(feature = "qwen4")]
     #[test]
-    fn flash_next_hint_identity_matches_the_line_crate() {
-        use pegainfer_qwen38_flash_next::MODEL_TYPE;
-        use pegainfer_qwen38_flash_next::TEXT_MODEL_TYPE;
+    fn qwen4_hint_identity_matches_the_line_crate() {
+        use pegainfer_qwen4::MODEL_TYPE;
+        use pegainfer_qwen4::TEXT_MODEL_TYPE;
         let family = families()
             .into_iter()
-            .find(|family| family.feature == "qwen38-flash-next")
-            .expect("the qwen38-flash-next family is always listed");
+            .find(|family| family.feature == "qwen4")
+            .expect("the qwen4 family is always listed");
         assert_eq!(family.model_types, [MODEL_TYPE].as_slice());
         assert_eq!(family.text_model_types, [TEXT_MODEL_TYPE].as_slice());
     }

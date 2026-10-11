@@ -3892,7 +3892,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pegainfer-qwen38-flash-next"
+name = "pegainfer-qwen4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3930,7 +3930,7 @@ dependencies = [
  "pegainfer-kimi-k2",
  "pegainfer-qwen3",
  "pegainfer-qwen35",
- "pegainfer-qwen38-flash-next",
+ "pegainfer-qwen4",
  "serde_json",
  "tikv-jemallocator",
  "tokio",

@@ -1,10 +1,11 @@
-//! Qwen3.8-Flash-Next (`qwen4_exp`): line detection and validated geometry.
+//! The Qwen4 architecture preview (`qwen4_exp`): line detection and validated
+//! geometry. Its first checkpoint is Qwen3.8-Flash-Next.
 //!
 //! This crate carries **no CUDA dependency at all**, which is why its probe and
 //! config tests run with no device, no weights and no Triton-equipped build.
 //! Slice B (text-graph assembly and the decode step) adds the device side; when it
 //! does, the modules below must move behind
-//! `#[cfg(any(feature = "qwen38-flash-next", test))]` the way
+//! `#[cfg(any(feature = "qwen4", test))]` the way
 //! `pegainfer-gemma4/src/lib.rs` does, so this property survives.
 //!
 //! Frozen target: `Qwen/Qwen3.8-Flash-Next` at revision

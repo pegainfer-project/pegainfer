@@ -18,12 +18,10 @@ qwen35:
 qwen4:
   - changed-files:
       - any-glob-to-any-file:
-          - 'pegainfer-qwen38-flash-next/**'
+          - 'pegainfer-qwen4/**'
           - 'pegainfer-kernels/**/*qwen4*'
           - 'pegainfer-kernels/**/*qwen4*/**'
-          - 'pegainfer-kernels/**/*qwen38*'
-          - 'pegainfer-kernels/**/*qwen38*/**'
-          - 'docs/models/qwen38-flash-next/**'
+          - 'docs/models/qwen4/**'
 
 gemma4:
   - changed-files:

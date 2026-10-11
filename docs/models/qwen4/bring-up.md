@@ -1,6 +1,7 @@
-# Qwen3.8-Flash-Next bring-up
+# Qwen4 bring-up
 
-> **TL;DR:** `Qwen/Qwen3.8-Flash-Next` is a **new line** (`qwen4_exp`), not a Qwen3.5
+> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture
+> preview, is a **new line** (`qwen4_exp`), not a Qwen3.5
 > variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction.
 > Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: a
 > fail-closed probe that pins *structure rather than widths*, and a config layer that
@@ -39,15 +40,15 @@ given too):
 | `chat_template.jinja` | 8,952 | `c0c686f9c38d70d179fb7b5f5aa7530bc913dda3` | — |
 | `generation_config.json` | 202 | `023756cfadf88e5bf69eefeee3e172f38c448d64` | — |
 
-The committed `config.json` (`pegainfer-qwen38-flash-next/tests/frozen_config.json`)
+The committed `config.json` (`pegainfer-qwen4/tests/frozen_config.json`)
 is the real file, not a transcription, and a test re-hashes it against
 `FROZEN_CONFIG_SHA256` so the fixture cannot drift from the revision it claims to be.
 Every probe and config test runs against it.
 
 ## What landed
 
-`pegainfer-qwen38-flash-next`, feature `qwen38-flash-next`, **with no CUDA dependency
-at all** — so its 54 tests need no device, no weights and no Triton-equipped build.
+`pegainfer-qwen4`, feature `qwen4`, **with no CUDA dependency at all** — so its
+tests need no device, no weights and no Triton-equipped build.
 Preserving that is the point of the crate's shape: when slice B adds the device side,
 `config` and `probe` must move behind `#[cfg(any(feature, test))]` the way
 `pegainfer-gemma4/src/lib.rs` does.
@@ -88,7 +89,7 @@ Preserving that is the point of the crate's shape: when slice B adds the device 
   the gate's job too, not test-only scaffolding.
 - **Registration** — the server binary hand-mirrors every line's probe identities in a
   hint descriptor its own comment says cannot be derived away, so the mirror is tested
-  and not just the probe: `feature_gate_hint` names `--features qwen38-flash-next` for
+  and not just the probe: `feature_gate_hint` names `--features qwen4` for
   both `qwen4_exp` and `qwen4_exp_text` when the feature is off, and stays silent when
   it is on. A test under the feature binds that row to this crate's `MODEL_TYPE` /
   `TEXT_MODEL_TYPE`, so the mirror cannot drift from the probe. The hint is
