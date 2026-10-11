@@ -647,6 +647,18 @@ const NEAR_TIE_TOP_K: usize = 8;
 /// from are in [`compare_row`]. It transfers between the raw-logit gates here and
 /// `lane_gates_tp`'s log-softmax ones because the margin is a difference inside
 /// one row.
+///
+/// Its provenance is one flip on the nine-token `short` prompt, and the gates that
+/// use it widest — [`the_replacement_global_decode_matches_the_incumbent`] and
+/// [`the_folded_pool_matches_the_split_one`] — sweep 512/1500/3000 tokens, where
+/// the width is **unverified**: both need a generated kernel and neither has run.
+/// The part that needs no kernel does not measure it either: running the incumbent
+/// walk's rows through `neutral_scale` at the sweep's first cell (the same call
+/// those gates make) trips the rule's **membership** half before the width — a
+/// flipped pick outside the other row's top-8 — on the sweep's cycled prompts and
+/// on the golden's own `edge` text alike (`max |dlogit| 3.5` on the latter). What
+/// binds at that depth is the membership, not this width, and a depth gate has to
+/// start from that rather than from a line.
 const NEAR_TIE_WIDTH: f32 = 1.0;
 
 /// Whether `pick` is inside `row`'s top-`k`, without sorting the row: fewer than
