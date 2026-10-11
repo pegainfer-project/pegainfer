@@ -239,7 +239,8 @@ HTTP request; the serving row covers the frontend layers.
 Tolerances are the line's existing 4B calibration (`MEAN_TOL 0.06`,
 `P99_TOL 0.20`) — no new constants, and every size sits inside them. Run each
 TP2 test by exact name (see "How to run"): a `_tp2` substring filter also
-selects the graph test, whose group-6 skip is not an eager pass.
+selects the graph variant, whose skip (an uncompiled group, or a missing
+`PEGAINFER_TEST_MODEL_PATH`) reports `ok` without running — not an eager pass.
 
 ## How to run
 
@@ -260,7 +261,8 @@ python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path $D \
   --prompt-lens 4097,8192 --decode-tokens 8
 
 # 2. the gates. Run each TP2 test by exact name: a `_tp2` substring filter also
-#    selects the graph test, whose group-6 skip is not an eager pass.
+#    selects the graph variant, whose skip (uncompiled group, or no model path)
+#    reports ok without running — not an eager pass.
 PEGAINFER_TEST_MODEL_PATH=$D PEGAINFER_TEST_MODEL_REVISION=1d4bf0f2… \
   PEGAINFER_TEST_TP_DEVICES=2,6 \
   cargo test -r --locked -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate \
