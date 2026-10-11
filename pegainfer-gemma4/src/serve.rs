@@ -846,10 +846,9 @@ impl StepArena {
     }
 
     /// Release the captured graphs. Called on teardown, before the communicator
-    /// goes away: a captured collective bakes in NCCL kernel launches, and NCCL's
-    /// communicator abort waits for a graph that references them to be destroyed.
-    /// A tensor-parallel launch turns graphs off, so there is nothing captured to
-    /// release on that path.
+    /// goes away, because NCCL's abort waits for a graph that references it to be
+    /// destroyed. A tensor-parallel launch captures nothing, so there is nothing
+    /// to release on that path.
     pub(crate) fn release_graphs(&mut self) {
         self.graphs.clear();
     }

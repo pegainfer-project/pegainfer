@@ -395,17 +395,9 @@ fn start_with_knobs(
             "{MIX_CHUNK_TOKENS_ENV} is unsupported under tensor parallelism: a chunked walk's \
              rounds gather across prompts and are not covered by the TP gates"
         );
-        // NCCL's abort waits for the captured graphs that reference the
-        // communicator being aborted, and a rank stopped inside a collective
-        // cannot release its own — so with decode graphs on there is no order that
-        // releases one rank and destroys another's graphs: the abort waits for the
-        // release, the release runs after the join, and the join waits for the
-        // rank that abort was to release. Graphs are turned off here rather than
-        // refused: the flag is on by default, so a refusal would mean no TP2 launch
-        // starts until it is flipped, and the repo's own measurement is that graphs
-        // are a wash under TP (146.0 vs 143.7 tok/s at 8-way on two L20s) — nothing
-        // priced above zero is given up, and the alternative to serving eager is
-        // not serving at all.
+        // Graphs and the TP failure path have no order that works — see
+        // `docs/models/gemma4/tp.md`, "Decode graphs are off under TP", for the
+        // cycle. Turned off rather than refused so a default launch still serves.
         if graph_enabled {
             log::info!(
                 "tensor parallel: {world} ranks, serving eager — decode graphs are off under TP. A \
@@ -1321,12 +1313,12 @@ struct EngineState {
     admit_coalesce: Option<std::time::Duration>,
 }
 
-/// Captured collective graphs bake in NCCL kernel launches, and NCCL's
-/// communicator abort waits for a graph that references them to be destroyed —
-/// so rank 0's graphs are released here, on its own device, before the fields
-/// (and with them the communicator) drop. Only the single-rank path captures
-/// anything: a tensor-parallel launch turns graphs off (`start_with_knobs`), so
-/// there is no peer arena holding a captured collective to release.
+/// Rank 0's graphs are released here, on its own device, before the fields (and
+/// with them the communicator) drop: NCCL's abort waits for a graph that
+/// references the communicator to be destroyed. Only the single-rank path
+/// captures anything (`start_with_knobs` turns them off under TP, "Decode graphs
+/// are off under TP"), so there is no peer arena holding a captured collective
+/// to release.
 impl Drop for EngineState {
     fn drop(&mut self) {
         let _ = select_device(&self.ctx);
@@ -1496,10 +1488,8 @@ impl EngineState {
                 //
                 // This is the order that works: the abort has to reach a peer that
                 // is inside a collective, so it runs before the join that is
-                // waiting on that peer. NCCL's abort also waits for a captured
-                // graph referencing the communicator to be destroyed — that cycle
-                // is why graphs are off under TP, and with none captured here
-                // there is nothing in the abort's way.
+                // waiting on that peer. With nothing captured under TP ("Decode
+                // graphs are off under TP") there is no graph in the abort's way.
                 //
                 // Only with extra ranks: with none there is no collective to
                 // abort and no peer frontier to keep in step, so this stays the
