@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use pegainfer_frontend::engine::FinishReason;
@@ -6,6 +7,7 @@ use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::StepReceiver;
+use pegainfer_frontend::engine::StopCause;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 
@@ -13,6 +15,7 @@ pub(super) struct Drained {
     pub(super) tokens: usize,
     pub(super) cached: usize,
     pub(super) finish: FinishReason,
+    pub(super) stop_cause: Option<StopCause>,
     pub(super) ids: Vec<u32>,
     pub(super) logprobs: Vec<Option<TokenLogprob>>,
     pub(super) prompt_echo: Option<PromptEcho>,
@@ -21,6 +24,7 @@ pub(super) struct Drained {
 pub(super) struct StepCollector {
     steps: StepReceiver,
     buffered: HashMap<RequestId, VecDeque<RequestUpdate>>,
+    finished: HashSet<RequestId>,
 }
 
 /// A request the scheduler refused or failed before scheduling sends no
@@ -45,10 +49,20 @@ impl StepCollector {
         Self {
             steps,
             buffered: HashMap::new(),
+            finished: HashSet::new(),
         }
     }
 
     fn ingest(&mut self, update: RequestUpdate) {
+        assert!(
+            !self.finished.contains(&update.id),
+            "update after terminal for {}",
+            update.id
+        );
+        assert_eq!(update.tokens.len(), update.logprobs.len());
+        if update.terminal.is_some() {
+            self.finished.insert(update.id);
+        }
         self.buffered
             .entry(update.id)
             .or_default()
@@ -160,11 +174,18 @@ impl StepCollector {
                 prompt_echo = Some(echo);
             }
             match update.terminal {
-                Some(Terminal::Finished { reason, .. }) => {
+                Some(Terminal::Finished {
+                    reason,
+                    stop_cause,
+                    completion_tokens,
+                    ..
+                }) => {
+                    assert_eq!(completion_tokens, tokens, "{name}: completion count");
                     return Drained {
                         tokens,
                         cached,
                         finish: reason,
+                        stop_cause,
                         ids,
                         logprobs,
                         prompt_echo,
@@ -187,7 +208,7 @@ impl StepCollector {
         }
     }
 
-    fn pump_available(&mut self) {
+    pub(super) fn pump_available(&mut self) {
         while let Ok(step) = self.steps.try_recv() {
             for update in step.updates {
                 self.ingest(update);
@@ -210,21 +231,16 @@ impl StepCollector {
     }
 
     pub(super) fn terminals_after_close(&mut self, id: RequestId) -> Vec<Terminal> {
-        let mut terminals: Vec<Terminal> = self
-            .buffered
+        while let Some(step) = self.steps.blocking_recv() {
+            for update in step.updates {
+                self.ingest(update);
+            }
+        }
+        self.buffered
             .remove(&id)
             .unwrap_or_default()
             .into_iter()
             .filter_map(|update| update.terminal)
-            .collect();
-        while let Some(step) = self.steps.blocking_recv() {
-            terminals.extend(
-                step.updates
-                    .into_iter()
-                    .filter(|update| update.id == id)
-                    .filter_map(|update| update.terminal),
-            );
-        }
-        terminals
+            .collect()
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the stop contract of live Qwen3 and Qwen3.5 servers.
+"""Validate the stop contract of live Qwen3, Qwen3.5, and Gemma 4 servers.
 
 Selected servers must already be running. The default explicit stop set covers the
 vocabulary, so its first returned token must stop generation. --stop-token-id
@@ -22,6 +22,11 @@ Example (adapted Qwen3.5 only):
     python3 scripts/qwen3_stop_contract_probe.py \
       --target qwen35 --qwen35-model qwen35-adapted \
       --qwen35-eos-token-id 248046
+
+Example (Gemma 4 only; supply a prompt rendered with its chat template):
+    python3 scripts/qwen3_stop_contract_probe.py \
+      --target gemma4 --gemma4-model gemma4-stop-policy \
+      --gemma4-eos-token-id 1 --prompt "$PROMPT"
 
 --self-check tests this probe's assertions using isolated malformed HTTP
 responses. It needs no GPU and is not evidence about inference correctness.
@@ -890,13 +895,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--target",
-        choices=("qwen3", "qwen35", "both"),
+        choices=("qwen3", "qwen35", "gemma4", "both"),
         default="both",
         help="Select servers to probe; a single target must satisfy the full stop contract",
     )
     for prefix, port, model, vocab in (
         ("qwen3", 18081, "qwen3-adapted", 151936),
         ("qwen35", 18082, "qwen35-legacy", 248320),
+        ("gemma4", 18083, "gemma4-stop-policy", 262144),
     ):
         parser.add_argument(f"--{prefix}-url", default=f"http://127.0.0.1:{port}")
         parser.add_argument(f"--{prefix}-model", default=model)
@@ -937,8 +943,8 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if not args.self_check:
-        for prefix in ("qwen3", "qwen35"):
-            if args.target in (prefix, "both") and getattr(args, f"{prefix}_eos_token_id") is None:
+        for prefix in ("qwen3", "qwen35") if args.target == "both" else (args.target,):
+            if getattr(args, f"{prefix}_eos_token_id") is None:
                 parser.error(f"live validation requires --{prefix}-eos-token-id")
         if args.max_tokens <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
             parser.error("--max-tokens and --timeout must be positive and finite")
@@ -963,8 +969,7 @@ def main() -> int:
                 args,
                 getattr(args, f"{prefix}_eos_token_id"),
             )
-            for prefix in ("qwen3", "qwen35")
-            if args.target in (prefix, "both")
+            for prefix in (("qwen3", "qwen35") if args.target == "both" else (args.target,))
         }
     except InvalidResponse as error:
         print(str(error), file=sys.stderr)

@@ -63,12 +63,14 @@ GATES_SERVING_CONTRACT=(
   "gpu,ckpt engine::lane_gates_roster::the_coalesce_door_releases_one_admission_burst"
   "gpu,ckpt engine::lane_gates_roster::the_raised_ceiling_and_slots_hold_at_the_roster_edge"
   "gpu,ckpt engine::lane_gates_roster::the_full_roster_keeps_its_pipeline_under_a_queue"
+  "gpu,ckpt,prompts engine::lane_gates_roster::stop_policy_drains_decode_before_reusing_its_slot"
   "gpu,ckpt,prompts engine::lane_gates_roster::an_idle_refill_matches_a_fresh_engine"
   "gpu,ckpt engine::lane_gates_lifecycle::the_raise_reaches_the_frontend"
   "gpu,ckpt,fixtures engine::lane_gates_logprobs::prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode"
   "gpu,ckpt engine::lane_gates_logprobs::a_scored_prompt_beside_a_live_batch_is_prefilled_whole"
   "gpu,ckpt engine::lane_gates_logprobs::a_low_slot_chunked_pool_scores_up_to_what_it_holds"
   "gpu,ckpt engine::lane_gates_logprobs::a_failed_prefill_costs_that_request_not_the_engine"
+  "gpu,ckpt,prompts engine::lane_gates_logprobs::stop_policy_keeps_the_prefill_trigger_and_its_score"
 )
 GATES_KV_AND_LANES=(
   "gpu,ckpt,fixtures serve::oracle::incremental_serving_matches_recompute"
