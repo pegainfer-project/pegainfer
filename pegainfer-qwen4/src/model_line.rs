@@ -27,14 +27,7 @@ impl ModelLine for Qwen4Line {
     }
 
     fn launch(&self, _ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
-        anyhow::bail!(
-            "Qwen4 is detected and its config is validated, but the text graph is \
-             not built yet (slice B). Refusing to start rather than serving a partial model. \
-             The GDN gated-norm activation this checkpoint selects (sigmoid, not Qwen3.5's \
-             silu) became selectable in the shared kernel in #1129; the missing piece is \
-             wiring that call site, which lands with the text graph in slice B rather than \
-             being an open kernel dependency."
-        )
+        anyhow::bail!("this qwen4_exp checkpoint is detected, but inference is not implemented yet")
     }
 }
 

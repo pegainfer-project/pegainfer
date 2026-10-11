@@ -78,7 +78,7 @@ fn enabled_build_detects_the_line_and_refuses_to_serve() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !out.status.success(),
-        "the line must refuse to serve until the text graph lands"
+        "the line must refuse to serve until inference is implemented"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -86,7 +86,7 @@ fn enabled_build_detects_the_line_and_refuses_to_serve() {
         "stderr did not name the detected line:\n{stderr}"
     );
     assert!(
-        stderr.contains("text graph"),
+        stderr.contains("not implemented"),
         "stderr did not carry the refusal reason:\n{stderr}"
     );
 }
