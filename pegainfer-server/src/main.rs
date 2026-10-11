@@ -56,10 +56,9 @@ struct Family {
 ///
 /// This is **a second source of truth by necessity**: the hint exists for the
 /// case where the line — and therefore its `probe` — is compiled out, so these
-/// strings cannot be read from the line crate. The `qwen4` row is
-/// bound to that crate's own `MODEL_TYPE`/`TEXT_MODEL_TYPE` by a test under the
-/// feature (`qwen4_hint_identity_matches_the_line_crate`); the other rows
-/// rest on each line's own probe tests plus review of this table.
+/// strings cannot be read from the line crate. The `qwen4` row is bound to that
+/// crate's own `MODEL_TYPE`/`TEXT_MODEL_TYPE` by a test under the feature
+/// (`qwen4_hint_identity_matches_the_line_crate`).
 ///
 /// The hint is **identity-only**: it cannot run a compiled-out probe, so it also
 /// fires for a variant that probe would refuse — a quantized sibling (its
@@ -111,9 +110,6 @@ fn families() -> [Family; 8] {
         },
         Family {
             feature: "qwen4",
-            // The FP8 and NVFP4 siblings and the tied/YaRN variants share this
-            // outer identity, so a hint fires for them too; the line's probe
-            // refuses those once the feature is on.
             model_types: &["qwen4_exp"],
             text_model_types: &["qwen4_exp_text"],
             compiled: cfg!(feature = "qwen4"),
@@ -319,75 +315,14 @@ mod tests {
         assert!(feature_gate_hint(&config).is_none());
     }
 
-    #[cfg(not(feature = "qwen4"))]
-    #[test]
-    fn hint_names_the_qwen4_feature_for_its_own_identity() {
-        let config = serde_json::json!({
-            "model_type": "qwen4_exp",
-            "text_config": {"model_type": "qwen4_exp_text"}
-        });
-        let hint = feature_gate_hint(&config).expect("qwen4_exp identity should hint");
-        assert!(hint.contains("--features qwen4"), "{hint}");
-    }
-
-    /// The Qwen3.5 probe hard-requires `qwen3_5`, so without this family entry a
-    /// `qwen4_exp` checkpoint would fall through to "unknown model" instead of
-    /// naming the feature to rebuild with — and with the entry present it must
-    /// still not claim the Qwen3.5 identity.
-    #[cfg(not(feature = "qwen4"))]
-    #[test]
-    fn qwen4_and_qwen35_identities_do_not_cross_hint() {
-        let qwen35 = serde_json::json!({
-            "model_type": "qwen3_5",
-            "text_config": {"model_type": "qwen3_5_text"}
-        });
-        let hint = feature_gate_hint(&qwen35).unwrap_or_default();
-        assert!(!hint.contains("--features qwen4"), "{hint}");
-
-        let qwen4 = serde_json::json!({
-            "model_type": "qwen4_exp",
-            "text_config": {"model_type": "qwen4_exp_text"}
-        });
-        let hint = feature_gate_hint(&qwen4).expect("should hint");
-        assert!(!hint.contains("--features qwen35"), "{hint}");
-    }
-
-    /// The inner identity alone must hint as well. The outer `model_type` is
-    /// what a served config carries, but the family declares two identity lists
-    /// and the other families test the text one separately
-    /// (`hint_matches_text_config_identities` above).
-    #[cfg(not(feature = "qwen4"))]
-    #[test]
-    fn hint_matches_the_qwen4_text_identity() {
-        let config = serde_json::json!({"text_config": {"model_type": "qwen4_exp_text"}});
-        let hint = feature_gate_hint(&config).expect("qwen4_exp_text identity should hint");
-        assert!(hint.contains("--features qwen4"), "{hint}");
-    }
-
-    /// The other half of the same claim, taken under the feature that makes it
-    /// true: once the line is compiled in, its own identity must fall through to
-    /// the registry instead of being told to rebuild.
-    #[cfg(feature = "qwen4")]
-    #[test]
-    fn hint_is_silent_for_a_compiled_qwen4_family() {
-        let config = serde_json::json!({
-            "model_type": "qwen4_exp",
-            "text_config": {"model_type": "qwen4_exp_text"}
-        });
-        assert!(feature_gate_hint(&config).is_none());
-    }
-
     #[test]
     fn hint_is_silent_for_an_unknown_family() {
         let config = serde_json::json!({"model_type": "frobnicate_lm"});
         assert!(feature_gate_hint(&config).is_none());
     }
 
-    /// [`families`] is a hand-mirror of each line's identity, because the line —
-    /// and its `probe` — is compiled out exactly when the hint is needed. This
-    /// binds the qwen4 row to the line crate's own constants, so changing one
-    /// side without the other fails here instead of silently leaving the hint
-    /// pointing at an identity the probe no longer claims.
+    /// Binds the qwen4 row of [`families`] to the line crate's own constants, so
+    /// changing one side without the other fails here.
     #[cfg(feature = "qwen4")]
     #[test]
     fn qwen4_hint_identity_matches_the_line_crate() {

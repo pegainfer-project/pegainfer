@@ -92,10 +92,9 @@ side behind a crate feature of its own, `config` and `probe` move behind
   matters if the n-gram hash multipliers are recomputed instead of read from the
   checkpoint, so it is not modelled.
 - **Registration** — the server binary hand-mirrors every line's probe identities in a
-  hint descriptor its own comment says cannot be derived away, so the mirror is tested
-  and not just the probe: `feature_gate_hint` names `--features qwen4` for
-  both `qwen4_exp` and `qwen4_exp_text` when the feature is off, and stays silent when
-  it is on. A test under the feature binds that row to this crate's `MODEL_TYPE` /
+  hint table that cannot be derived away. With the feature off, `feature_gate_hint`
+  names `--features qwen4` for both `qwen4_exp` and `qwen4_exp_text`; with it on, the
+  hint stays silent. A test under the feature binds that row to this crate's `MODEL_TYPE` /
   `TEXT_MODEL_TYPE`, so the mirror cannot drift from the probe. The hint is
   **identity-only** — it cannot run a compiled-out probe — so it also fires for the
   quantized siblings and the tied/YaRN variants of `qwen4_exp`, which the config refuses

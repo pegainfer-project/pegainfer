@@ -8,9 +8,7 @@
 //! rebuild with, an enabled build detects the line and then refuses to serve it.
 //!
 //! Neither path reaches CUDA: detection is pure, and `launch` bails before the
-//! engine is built. The model directory also carries the repo's minimal
-//! tokenizer, so the enabled build gets past the frontend's startup and the
-//! refusal is what reaches stderr.
+//! engine is built.
 
 use std::fs::File;
 use std::path::Path;
