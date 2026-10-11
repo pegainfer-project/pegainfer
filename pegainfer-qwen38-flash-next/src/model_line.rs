@@ -10,6 +10,8 @@ use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
 
+use crate::config::Config;
+
 pub static MODEL_LINE: Qwen38FlashNextLine = Qwen38FlashNextLine;
 
 pub struct Qwen38FlashNextLine;
@@ -19,8 +21,16 @@ impl ModelLine for Qwen38FlashNextLine {
         "Qwen3.8-Flash-Next"
     }
 
+    /// Constructs the whole [`Config`], not just the structural probe. `detect`
+    /// claims a config through this method, so the geometry the line advertises —
+    /// the n-gram partition, the head groups — has to be derivable here as well,
+    /// or detection would accept a config the geometry layer cannot lay out. This
+    /// is also what keeps `probe_config_json` from being a weaker gate than the
+    /// path the line actually runs.
     fn probe(&self, config: &serde_json::Value) -> Result<(), String> {
-        crate::probe::probe_config_json(config).map_err(|error| error.to_string())
+        Config::from_json(config)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn launch(&self, _ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
@@ -45,6 +55,20 @@ mod tests {
             serde_json::from_str(include_str!("../tests/frozen_config.json")).unwrap();
         assert_eq!(MODEL_LINE.name(), "Qwen3.8-Flash-Next");
         MODEL_LINE.probe(&json).unwrap();
+    }
+
+    /// `probe_config_json` on its own accepts any positive `ple_embed_dim`; it is
+    /// the n-gram derivation that rejects one which cannot split across the heads.
+    /// `detect` claims a config through `probe`, so a config only the geometry
+    /// layer refuses must be refused here too — otherwise `detect` would claim it
+    /// and `launch` would report it as "validated".
+    #[test]
+    fn the_probe_rejects_geometry_that_does_not_derive() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/frozen_config.json")).unwrap();
+        json["text_config"]["ple_embed_dim"] = serde_json::json!(2561);
+        let err = MODEL_LINE.probe(&json).unwrap_err();
+        assert!(err.contains("ple_embed_dim"), "{err}");
     }
 
     /// `pegainfer-server`'s `model_lines()` collects `&'static dyn ModelLine`, and

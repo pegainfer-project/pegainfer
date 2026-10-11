@@ -204,6 +204,23 @@ fn probe_attention(text_config: &serde_json::Value) -> Result<()> {
             bail!("qwen4_exp: {field} must be a positive integer, got {v:?}");
         }
     }
+    // Grouped attention maps each KV head over a whole group of query heads, so
+    // the ratio has to be integral; the shared Qwen3.5 geometry enforces the same
+    // rule (`AttentionHeadDivisibility`), and the attention dispatch works on that
+    // derived group. Both counts are positive from the loop above.
+    let q_heads = text_config
+        .get("num_attention_heads")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let kv_heads = text_config
+        .get("num_key_value_heads")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if !q_heads.is_multiple_of(kv_heads) {
+        bail!(
+            "qwen4_exp: num_attention_heads {q_heads} must be a multiple of num_key_value_heads {kv_heads} (grouped attention needs a whole group)"
+        );
+    }
 
     // The GDN head dims are baked into the Triton AOT specialization keys, so a
     // different value is a new kernel, not a config change.
@@ -223,6 +240,21 @@ fn probe_attention(text_config: &serde_json::Value) -> Result<()> {
         if v.is_none_or(|v| v == 0) {
             bail!("qwen4_exp: {field} must be a positive integer, got {v:?}");
         }
+    }
+    // Gated DeltaNet maps value heads in whole groups over key heads, the same
+    // invariant the shared Qwen3.5 geometry enforces (`LinearHeadDivisibility`).
+    let key_heads = text_config
+        .get("linear_num_key_heads")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let value_heads = text_config
+        .get("linear_num_value_heads")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if !value_heads.is_multiple_of(key_heads) {
+        bail!(
+            "qwen4_exp: linear_num_value_heads {value_heads} must be a multiple of linear_num_key_heads {key_heads} (Gated DeltaNet groups value heads over key heads)"
+        );
     }
 
     let conv = text_config
@@ -658,6 +690,32 @@ mod tests {
     fn a_conv_kernel_past_the_in_tree_cap_bails() {
         let err = err(|c| text(c, "linear_conv_kernel_dim", serde_json::json!(5)));
         assert!(err.contains("linear_conv_kernel_dim"), "{err}");
+    }
+
+    #[test]
+    fn a_non_integral_gqa_group_bails() {
+        // The frozen 24 query heads over 2 KV heads is a whole group of 12; 10
+        // over 3 is not, and the shared attention dispatch has no way to lay it
+        // out. Qwen3.5 rejects the same shape (`AttentionHeadDivisibility`).
+        let err = err(|c| {
+            text(c, "num_attention_heads", serde_json::json!(10));
+            text(c, "num_key_value_heads", serde_json::json!(3));
+        });
+        assert!(err.contains("num_attention_heads"), "{err}");
+        assert!(err.contains("num_key_value_heads"), "{err}");
+    }
+
+    #[test]
+    fn a_non_integral_gdn_head_group_bails() {
+        // Gated DeltaNet maps value heads over key heads in whole groups; the
+        // frozen 48/16 is 3 apiece, 48/10 is not. Qwen3.5 rejects the same shape
+        // (`LinearHeadDivisibility`).
+        let err = err(|c| {
+            text(c, "linear_num_key_heads", serde_json::json!(10));
+            text(c, "linear_num_value_heads", serde_json::json!(48));
+        });
+        assert!(err.contains("linear_num_value_heads"), "{err}");
+        assert!(err.contains("linear_num_key_heads"), "{err}");
     }
 
     #[test]

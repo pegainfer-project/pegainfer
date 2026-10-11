@@ -47,7 +47,7 @@ Every probe and config test runs against it.
 ## What landed
 
 `pegainfer-qwen38-flash-next`, feature `qwen38-flash-next`, **with no CUDA dependency
-at all** — so its 51 tests need no device, no weights and no Triton-equipped build.
+at all** — so its 54 tests need no device, no weights and no Triton-equipped build.
 Preserving that is the point of the crate's shape: when slice B adds the device side,
 `config` and `probe` must move behind `#[cfg(any(feature, test))]` the way
 `pegainfer-gemma4/src/lib.rs` does.
@@ -70,15 +70,22 @@ Preserving that is the point of the crate's shape: when slice B adds the device 
   QSA's `indexer_kv_heads == 1` with the budget a whole multiple of the compress
   ratio, the rotary width fitting the index head, `rope_theta` present, and PLE
   confined to a **single** `linear_attention` layer — since a config the reference
-  refuses cannot be served by any port. Multi-layer PLE is refused for now: the
-  reference offsets each layer's prime run by its layer index (`global_head_idx =
-  L * ngram_heads + i`), and this crate derives one table.
+  refuses cannot be served by any port. It also carries the two head-group integrality
+  rules the shared Qwen3.5 geometry owns (`AttentionHeadDivisibility`,
+  `LinearHeadDivisibility`): the attention and GatedDeltaNet dispatch work on the
+  derived group, so `num_attention_heads % num_key_value_heads` and
+  `linear_num_value_heads % linear_num_key_heads` must both be whole. Multi-layer PLE
+  is refused for now: the reference offsets each layer's prime run by its layer index
+  (`global_head_idx = L * ngram_heads + i`), and this crate derives one table.
 - **Config** (`src/config.rs`) — validated geometry plus the derivations the rest of the
   line needs. Two fields the reference reads are **absent from `config.json`** and
   come from upstream defaults: `norm_topk_prob` (`true`, and it decides whether the
   router renormalizes its top-k) and `seed`. Both are modelled explicitly with their
   defaults, because a port that reads only `config.json` silently drops the router
-  renormalization — this is #1068's mirror image.
+  renormalization — this is #1068's mirror image. The line's `ModelLine::probe` builds
+  the whole `Config` rather than calling `probe_config_json` alone, because `detect`
+  claims a config through `probe`: the n-gram partition and head-group derivations are
+  the gate's job too, not test-only scaffolding.
 - **Registration** — the server binary hand-mirrors every line's probe identities in a
   hint descriptor its own comment says cannot be derived away, so the mirror is tested
   and not just the probe: `feature_gate_hint` names `--features qwen38-flash-next` for
@@ -88,6 +95,11 @@ Preserving that is the point of the crate's shape: when slice B adds the device 
   **identity-only** — it cannot run a compiled-out probe — so it also fires for the FP8
   sibling and the tied/YaRN variants of `qwen4_exp`, which the probe refuses once the
   feature is on; the hint names the feature to rebuild with, not a promise of service.
+  `pegainfer-server/tests/detect_gate.rs` then drives the shipped binary against a
+  model directory holding this crate's frozen `config.json`, both ways: the stock build
+  must name the feature, the enabled build must detect the line and refuse to serve.
+  That is the only coverage of `main`'s CLI → registry → hint → `launch` wiring, and
+  neither outcome reaches CUDA — `launch` bails before the engine is built.
 
 ## The n-gram table is derived, not read
 
