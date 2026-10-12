@@ -18,7 +18,22 @@ the module bit-for-bit (a mismatch aborts the dump).
 Fixture: provenance `format_version` / `config_sha256` / `ref_transformers`
 (assert on load); per case, the input `hidden` and the outputs. A reduced expert
 count and intermediate width keep the file small; the routed/shared split, top-k
-renormalization and fused expert layout are all preserved.
+renormalization and fused expert layout are all preserved. Contract details a
+replaying consumer needs:
+
+- `router_logits` are pre-softmax; `routing_weights` are the renormalized top-k
+  probs (`norm_topk_prob=True`), so they sum to 1 per token up to bf16 rounding.
+- `experts_gate_up_proj` is `[E, 2*I, H]` with gate = rows `[0, I)` and up =
+  rows `[I, 2I)` (the reference's `chunk(2, dim=-1)` halves); `experts_down_proj`
+  is `[E, H, I]` in `F.linear` layout (output dim first).
+- `shared_out` already carries the sigmoid of the shared gate (one scalar per
+  token, not per channel).
+- `expert_out` / `shared_out` are flat `[T, H]` (where the reference computes
+  them); `hidden` / `out` keep the batch dim `[1, T, H]`.
+- One case aligns every token with expert 0's router row, so a fixed set of 4
+  experts takes all tokens (one of them nearly all the routing weight) and the
+  other 12 are empty — the skewed/empty distribution the MoE spike requires;
+  an S=1 case pins the decode row count.
 
     python tools/accuracy/dump_qwen38fn_moe_golden.py --out <fixture>
 """
@@ -43,11 +58,26 @@ TOP_K = 4               # real 10
 MOE_INTERMEDIATE = 64   # real 640
 SHARED_INTERMEDIATE = 64  # real 640
 NORM_TOPK_PROB = True
+HIDDEN_ACT = "silu"
 SEED = 0x_03_38_F9_5A_11_82
 
+# Bumped when the fixture layout changes; the gate asserts it on load.
 FORMAT_VERSION = 1
 
-CASES = [8, 12]  # sequence lengths
+# (seq_len, input mode). "randn" = synthetic hidden states, near-uniform
+# routing. "skew" = every token aligned with expert 0's router row at
+# SKEW_SCALE: softmax collapses onto one dominant expert and all tokens share
+# the same top-k, so TOP_K experts take every token (measured renorm weights
+# [0.984, 0.006, 0.006, 0.005]) and the other NUM_EXPERTS - TOP_K stay empty —
+# the skewed/empty distribution the MoE spike requires. The S=1 case pins the
+# decode row count.
+CASES = [
+    (8, "randn"),   # prefill, near-uniform
+    (12, "randn"),  # prefill, near-uniform
+    (1, "randn"),   # decode shape
+    (16, "skew"),   # skewed routing + empty experts
+]
+SKEW_SCALE = 4.0
 
 
 class Config:
@@ -59,15 +89,16 @@ class Config:
     moe_intermediate_size = MOE_INTERMEDIATE
     shared_expert_intermediate_size = SHARED_INTERMEDIATE
     norm_topk_prob = NORM_TOPK_PROB
-    hidden_act = "silu"
+    hidden_act = HIDDEN_ACT
     initializer_range = 0.02
     _experts_implementation = "eager"
 
 
 def config_digest() -> bytes:
+    """sha256 over the frozen geometry so a consumer can assert this oracle's config."""
     canon = (
         f"hidden={HIDDEN};experts={NUM_EXPERTS};topk={TOP_K};moeint={MOE_INTERMEDIATE};"
-        f"sharedint={SHARED_INTERMEDIATE};norm_topk={NORM_TOPK_PROB}"
+        f"sharedint={SHARED_INTERMEDIATE};norm_topk={NORM_TOPK_PROB};act={HIDDEN_ACT}"
     )
     return hashlib.sha256(canon.encode()).digest()
 
@@ -115,9 +146,13 @@ def main() -> None:
         "shared_expert_gate": module.shared_expert_gate.weight.detach().contiguous(),
     }
 
-    for i, seq_len in enumerate(CASES):
-        gen = torch.Generator().manual_seed(SEED + i)
-        hidden = torch.randn(1, seq_len, HIDDEN, generator=gen).to(torch.bfloat16)
+    for i, (seq_len, mode) in enumerate(CASES):
+        if mode == "skew":
+            row = (SKEW_SCALE * module.gate.weight[0].float()).to(torch.bfloat16)
+            hidden = row.view(1, 1, HIDDEN).expand(1, seq_len, HIDDEN).contiguous()
+        else:
+            gen = torch.Generator().manual_seed(SEED + i)
+            hidden = torch.randn(1, seq_len, HIDDEN, generator=gen).to(torch.bfloat16)
         flat = hidden.view(-1, HIDDEN)
 
         with torch.no_grad():
@@ -131,15 +166,22 @@ def main() -> None:
 
         assert torch.equal(scores, r_scores), f"case {i} (S={seq_len}) router scores re-derivation != module"
         assert torch.equal(selected, r_selected), f"case {i} (S={seq_len}) router top-k re-derivation != module"
-        assert torch.allclose(logits.float(), r_logits.float()), f"case {i} (S={seq_len}) router logits differ"
-        assert torch.allclose(
-            final.view(-1, HIDDEN).float(), (experts_out + shared_out).float(), atol=1e-2
+        assert torch.equal(logits, r_logits), f"case {i} (S={seq_len}) router logits re-derivation != module"
+        assert torch.equal(
+            final.view(-1, HIDDEN), experts_out + shared_out
         ), f"case {i} (S={seq_len}) block != experts + shared"
         # Renormalization must hold: the top-k weights sum to 1 (bf16 rounding only).
         assert torch.allclose(scores.float().sum(-1), torch.ones(flat.shape[0]), atol=1e-2), (
             f"case {i} (S={seq_len}) top-k weights do not sum to 1"
         )
         assert bool(torch.isfinite(final.float()).all()), f"case {i} (S={seq_len}) non-finite output"
+        if mode == "skew":
+            # The case must actually construct the condition it claims to cover:
+            # all tokens share one top-k set, so NUM_EXPERTS - TOP_K experts are
+            # empty and one expert carries a dominant renormalized weight.
+            n_hit = len(torch.unique(selected))
+            assert n_hit == TOP_K, f"case {i} (S={seq_len}) skew case hit {n_hit} experts, expected {TOP_K}"
+            assert float(scores.max()) > 0.5, f"case {i} (S={seq_len}) skew case has no dominant expert"
 
         p = f"case{i}_"
         tensors[p + "seq_len"] = torch.tensor([seq_len], dtype=torch.int32)
@@ -150,7 +192,10 @@ def main() -> None:
         tensors[p + "expert_out"] = experts_out.contiguous()
         tensors[p + "shared_out"] = shared_out.contiguous()
         tensors[p + "out"] = final.contiguous()
-        print(f"case{i}: S={seq_len} experts_hit={len(torch.unique(selected))} rederivation_ok=True")
+        print(
+            f"case{i}: S={seq_len} mode={mode} experts_hit={len(torch.unique(selected))} "
+            f"max_w={float(scores.max()):.4f} rederivation_ok=True"
+        )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(args.out))
