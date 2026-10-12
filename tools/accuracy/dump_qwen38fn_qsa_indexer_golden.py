@@ -196,11 +196,12 @@ def selected_mask(selected: torch.Tensor, seq_len: int) -> torch.Tensor:
 
 
 def config_digest() -> bytes:
-    """sha256 over the frozen geometry so a consumer can assert this oracle's config."""
+    """sha256 over the frozen geometry + norm eps so a consumer can assert this oracle's config."""
     canon = (
         f"hidden={HIDDEN};qh={NUM_Q_HEADS};kvh={NUM_KV_HEADS};hd={HEAD_DIM};"
         f"inh={INDEXER_N_HEADS};inkv={INDEXER_KV_HEADS};ind={INDEXER_HEAD_DIM};"
-        f"ratio={INDEXER_RATIO};budget={REAL_BUDGET};rope_theta=1e7;prf=0.25"
+        f"ratio={INDEXER_RATIO};budget={REAL_BUDGET};rope_theta=1e7;prf=0.25;"
+        f"eps={RMS_EPS}"
     )
     return hashlib.sha256(canon.encode()).digest()
 
