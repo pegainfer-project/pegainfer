@@ -653,10 +653,8 @@ const NEAR_TIE_TOP_K: usize = 8;
 /// [`the_folded_pool_matches_the_split_one`] — sweep 512/1500/3000 tokens, where
 /// the width is **unverified**: both need a generated kernel and neither has run.
 /// It is applied where those gates compare their own two arms; the floor they print
-/// beside it is [`neutral_scale`], which measures a *different* comparison — a
-/// decode row against a recompute — and applies no rule, because at that depth its
-/// flips leave the other row's top-8 (the same `edge` text: `max |dlogit| 3.5`), so
-/// the rule could not hold there and is not asked to.
+/// beside it is [`neutral_scale`], which measures its own comparison and applies
+/// no rule to it.
 const NEAR_TIE_WIDTH: f32 = 1.0;
 
 /// Whether `pick` is inside `row`'s top-`k`, without sorting the row: fewer than
@@ -668,9 +666,13 @@ fn pick_inside_top(row: &[f32], pick: usize, k: usize) -> bool {
 
 /// The worst absolute logit gap between two rows, with no rule applied — what a
 /// row's logits moved by. [`compare_row`] is what a gate holds its own two arms
-/// to; this is for the magnitude reads, where a moved pick is the measurement
-/// rather than a failure.
+/// to; [`neutral_scale`] reads this for the magnitude.
 fn raw_gap(ours: &[f32], theirs: &[f32]) -> f32 {
+    assert!(
+        ours.iter().chain(theirs.iter()).all(|v| v.is_finite()),
+        "a raw gap needs finite logits: `f32::max` drops a NaN operand, so a NaN row would \
+         read as no drift"
+    );
     ours.iter()
         .zip(theirs)
         .map(|(x, y)| (x - y).abs())
@@ -690,18 +692,18 @@ struct RowGap {
 /// a whole-prompt prefill, an incumbent against its replacement), which this
 /// engine does not promise bit-equal: the callers bound the raw-logit drift by a
 /// calibrated ceiling, and `neutral_scale` right above measures what that
-/// difference is worth on the same rows — 0.31 to 5.75 raw logits.
+/// difference is worth on the same rows.
 ///
-/// A pick that moves inside that drift is therefore the arithmetic, not this
-/// gate's subject, and the rule is the repo's — **a flipped pick has to be a
-/// near tie** — with the magnitude half added here: each pick inside the other
-/// row's top-[`NEAR_TIE_TOP_K`] *and* the two picks within [`NEAR_TIE_WIDTH`] of
-/// each other in both rows. Membership alone lets a flip six nats wide pass,
-/// which is the different distribution this gate is for and which the callers'
-/// 12.0 drift line never sees. Equality could not hold at this depth: it fired on
-/// the `short` prompt at a position whose top two tokens sat 0.0625 apart in the
-/// decode row and 0.1875 in the recomputed one, with the two rows agreeing to
-/// 0.3125 everywhere else.
+/// A pick that moves inside that drift is the movement the ceiling already
+/// allows, and passing it does not show the flip was arithmetic, so the rule is
+/// the repo's — **a flipped pick has to be a near tie** — with the magnitude half
+/// added here: each pick inside the other row's top-[`NEAR_TIE_TOP_K`] *and* the
+/// two picks within [`NEAR_TIE_WIDTH`] of each other in both rows. Membership
+/// alone lets a flip six nats wide pass, which is the different distribution this
+/// gate is for and which the callers' 12.0 drift line never sees. Equality could
+/// not hold at this depth: it fired on the `short` prompt at a position whose top
+/// two tokens sat 0.0625 apart in the decode row and 0.1875 in the recomputed
+/// one, with the two rows agreeing to 0.3125 everywhere else.
 fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> RowGap {
     assert!(
         ours.iter().chain(theirs.iter()).all(|v| v.is_finite()),
@@ -773,6 +775,15 @@ fn a_flip_inside_the_width_is_reported_as_one() {
         "the row's own worst gap is still its gap, read {}",
         row.worst
     );
+}
+
+/// A NaN row is the one input a raw gap must not fold away: `f32::max` returns
+/// the other operand for a NaN, so without the finiteness check this reads 0.0 —
+/// a magnitude that reports no drift about a row that computed nothing.
+#[test]
+#[should_panic(expected = "a raw gap needs finite logits")]
+fn a_nan_row_does_not_read_as_no_drift() {
+    raw_gap(&[1.0], &[f32::NAN]);
 }
 
 /// The whole-prefix recompute of the serving path, reduced to its last row.
@@ -2200,12 +2211,12 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
 
 /// [`neutral_scale`]'s number over the sweep the decode gates use, with no
 /// generated kernel in the picture: the incumbent walk's rows against a
-/// recompute of the context each row saw, at 512/1500/3000 tokens. It is here
-/// because the floor must **measure** rather than assert — the comparison it
-/// makes is not the one the gates judge, and at these depths its flips leave the
-/// other row's top-8, so routing it back through `compare_row` would panic the
-/// two generated-kernel gates inside their own floor print. The floors this
-/// reads are on the record in [`neutral_scale`]'s doc.
+/// recompute of the context each row saw, at 512/1500/3000 tokens. A green run
+/// here says the floor is finite and **nothing about the width**: these nine
+/// cells never reach [`compare_row`], so neither top-8 membership nor
+/// [`NEAR_TIE_WIDTH`] is exercised, and pinning the width at these depths takes
+/// a run of each generated-kernel gate. The floors this reads are on the record
+/// in [`neutral_scale`]'s doc.
 #[test]
 #[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
 fn the_drift_floor_is_measured_over_the_decode_sweep() {
