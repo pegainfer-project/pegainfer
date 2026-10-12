@@ -12,8 +12,9 @@ the branches by **mean**, and a per-branch injection weight re-scatters the subl
 output. The top-level readout uses the same module with `use_combine=False`, so
 both variants are captured (`mixed_only`).
 
-The reference formulas are re-derived inside this script and asserted to match the
-module bit-for-bit (a mismatch aborts the dump).
+The reference formulas are re-derived inside this script — including the grouped
+`(1+w)` norm, recomputed here without delegating to the module — and asserted to
+match it bit-for-bit (a mismatch aborts the dump).
 
 Fixture: provenance `format_version` / `config_sha256` / `ref_transformers`
 (assert on load); per case, the input `hyper_input` (4 x hidden) and the outputs.
@@ -43,6 +44,7 @@ RMS_EPS = 1e-6
 
 SEED = 0x_03_38_F9_5A_11_81
 
+# Bumped when the fixture layout changes; the gate asserts it on load.
 FORMAT_VERSION = 1
 
 CASES = [6, 10]  # sequence lengths
@@ -58,7 +60,8 @@ class Config:
 
 
 def config_digest() -> bytes:
-    canon = f"hidden={HIDDEN};hc={HC_COUNT};lowrank={HC_LOWRANK}"
+    """sha256 over the frozen geometry + norm eps so a consumer can assert this oracle's config."""
+    canon = f"hidden={HIDDEN};hc={HC_COUNT};lowrank={HC_LOWRANK};eps={RMS_EPS}"
     return hashlib.sha256(canon.encode()).digest()
 
 
@@ -66,14 +69,29 @@ def bytes_tensor(data: bytes) -> torch.Tensor:
     return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
 
 
+def grouped_norm(weight: torch.Tensor, x: torch.Tensor, hc_count: int, hidden: int, eps: float) -> torch.Tensor:
+    """Independent grouped `(1+w)` RMSNorm: `hc_count` groups of `hidden`, per-group rms
+    in fp32, scaled by `(1+w)`, cast back to x's dtype. Mirrors
+    `Qwen4ExpTextRMSNorm(hc_count*hidden, group_size=hidden)` WITHOUT calling it, so a
+    grouping/eps regression in the reference turns the dump-time assertions red."""
+    xf = x.float().unflatten(-1, (hc_count, hidden))
+    out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    return (out.flatten(-2) * (1.0 + weight.float())).to(x.dtype)
+
+
 def rederive(module: Qwen4ExpTextGatedResidual, hyper: torch.Tensor):
-    """Re-derive the module's forward: grouped norm -> silu/sigmoid mix -> mean,
-    plus the block injection weights."""
-    normed = module.hc_norm(hyper)
+    """Re-derive the module's forward WITHOUT delegating the norm: independent grouped
+    `(1+w)` norm -> silu/sigmoid mix -> **mean** combine, plus the block injection weights
+    (None for the `use_combine=False` mixer). Returns (normed, mixed, inject)."""
+    normed = grouped_norm(module.hc_norm.weight, hyper, module.hc_count, module.hidden_size, module.hc_norm.eps)
     mix = F.silu(module.input_mix_weight_down(normed) / module.hc_count)
     mix = torch.sigmoid(module.input_mix_weight_up(mix)).unflatten(-1, (module.hc_count, module.hidden_size))
     mixed = (mix * normed.unflatten(-1, (module.hc_count, module.hidden_size))).mean(dim=-2)
-    inject = 2 * torch.sigmoid(module.block_inject_weight(normed) / module.hc_count)
+    inject = (
+        2 * torch.sigmoid(module.block_inject_weight(normed) / module.hc_count)
+        if module.block_inject_weight is not None
+        else None
+    )
     return normed, mixed, inject
 
 
@@ -92,6 +110,11 @@ def main() -> None:
                 p.normal_(0.0, 0.05 if p.dim() >= 2 else 0.5)
     combine = combine.to(torch.bfloat16)
     mixer = mixer.to(torch.bfloat16)
+
+    # Provenance faithfulness: config_sha256 digests RMS_EPS, so abort if either module
+    # was built with a different eps than the constant the fixture claims.
+    assert combine.hc_norm.eps == RMS_EPS, "combine norm eps drifted from the digested RMS_EPS"
+    assert mixer.hc_norm.eps == RMS_EPS, "mixer norm eps drifted from the digested RMS_EPS"
 
     tensors = {
         "format_version": torch.tensor([FORMAT_VERSION], dtype=torch.int32),
@@ -114,11 +137,16 @@ def main() -> None:
             mixed, hyper_out, inject = combine(hyper)
             mixed_only = mixer(hyper)
             normed, r_mixed, r_inject = rederive(combine, hyper)
+            _, r_mixed_only, _ = rederive(mixer, hyper)
+            mod_normed = combine.hc_norm(hyper)
 
+        assert torch.equal(mod_normed, normed), f"case {i} (S={seq_len}) grouped (1+w) norm re-derivation != module"
         assert torch.equal(mixed, r_mixed), f"case {i} (S={seq_len}) mix re-derivation != module"
         assert torch.equal(inject, r_inject), f"case {i} (S={seq_len}) injection re-derivation != module"
+        assert torch.equal(mixed_only, r_mixed_only), f"case {i} (S={seq_len}) mixer (use_combine=False) re-derivation != module"
         assert torch.equal(hyper_out, hyper), f"case {i} (S={seq_len}) module echoed a different hyper stream"
         assert bool(torch.isfinite(mixed.float()).all()), f"case {i} (S={seq_len}) non-finite mix"
+        assert bool(torch.isfinite(mixed_only.float()).all()), f"case {i} (S={seq_len}) non-finite mixer readout"
         # Injection is 2 * sigmoid, so it lives strictly inside (0, 2).
         assert bool(((inject > 0) & (inject < 2)).all()), f"case {i} (S={seq_len}) injection out of range"
 
