@@ -7,6 +7,7 @@ use safetensors::Dtype;
 
 use super::EXPECTED_DTYPE;
 use super::INTEGER_INDEX_DTYPE;
+use super::dtype_size;
 use crate::config::Config;
 use crate::config::LayerKind;
 
@@ -94,7 +95,7 @@ impl Manifest {
         let mut expected: BTreeMap<String, (ExpectedShape, Dtype)> = BTreeMap::new();
         let mut put = |name: String, shape: ExpectedShape, dtype: Dtype| {
             let previous = expected.insert(name.clone(), (shape, dtype));
-            debug_assert!(previous.is_none(), "{name} derived twice");
+            assert!(previous.is_none(), "{name} derived twice");
         };
 
         let hidden = config.hidden_size();
@@ -168,16 +169,6 @@ impl Manifest {
             .values()
             .map(|(shape, dtype)| shape.elements() as u128 * dtype_size(*dtype) as u128)
             .sum()
-    }
-}
-
-fn dtype_size(dtype: Dtype) -> usize {
-    match dtype {
-        Dtype::BF16 | Dtype::F16 => 2,
-        Dtype::F32 | Dtype::I32 => 4,
-        Dtype::F64 | Dtype::I64 => 8,
-        Dtype::U8 | Dtype::I8 | Dtype::BOOL => 1,
-        _ => 0,
     }
 }
 

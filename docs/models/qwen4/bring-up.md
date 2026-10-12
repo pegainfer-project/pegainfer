@@ -46,13 +46,15 @@ given too):
 The committed `config.json` (`pegainfer-qwen4/tests/frozen_config.json`)
 is the real file, not a transcription, and a test re-hashes it against
 `FROZEN_CONFIG_SHA256` so the fixture cannot drift from the revision it claims to be.
-Every probe, config and manifest test runs against it.
+The geometry and contract tests all parse it; only the identity tests build their own
+input.
 
 ## What landed
 
 `pegainfer-qwen4`, enabled in the server by `--features qwen4`, **with no CUDA
-dependency at all** — so its 67 CPU tests (plus three that read real shard bytes) need no
-device, no weights and no Triton-equipped build. Preserving that is the point of the
+dependency at all** — so its 67 CPU tests (plus three ignored ones that read a real
+checkpoint on demand) need no device, no weights and no Triton-equipped build.
+Preserving that is the point of the
 crate's shape: when slice B adds the device side behind a crate feature of its own,
 `config`, `probe` and `manifest` move behind
 `#[cfg(any(<that feature>, test))]` the way `pegainfer-gemma4/src/lib.rs` does.
@@ -206,8 +208,10 @@ and both layer families. Two things worth keeping:
   is a runtime cache-size derivation, so no header check can confirm it — it stays a
   read-the-reference item for #1105.
 
-The reader prints the shard list it opened, because #1104 asks that a proof record which
-shards it used: this gate has **never** seen the whole checkpoint.
+The reader prints the shard list it opened and the required/skipped split of what it
+checked (the ignored gate's own output is where the 446/111 figure above comes from),
+because #1104 asks that a proof record which shards it used: this gate has **never** seen
+the whole checkpoint.
 
 ## Traps
 

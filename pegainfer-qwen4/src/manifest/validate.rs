@@ -120,7 +120,8 @@ impl ManifestReport {
             return Ok(());
         }
         anyhow::bail!(
-            "Qwen3.8-Flash-Next checkpoint does not match the config, {} fault(s):\n{}",
+            "{} checkpoint does not match the config, {} fault(s):\n{}",
+            crate::MODEL_TYPE,
             faults.len(),
             faults.join("\n")
         )

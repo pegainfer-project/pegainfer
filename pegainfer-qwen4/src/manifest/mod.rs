@@ -33,3 +33,16 @@ pub(crate) const EXPECTED_DTYPE: Dtype = Dtype::BF16;
 
 /// The n-gram partition metadata is stored as integers, not weights.
 pub(crate) const INTEGER_INDEX_DTYPE: Dtype = Dtype::I64;
+
+/// Bytes per element, for the dtypes this contract can carry. Panics rather than
+/// defaulting: a tensor whose dtype is outside this set would otherwise be
+/// counted as zero bytes and shrink `Manifest::weight_bytes` silently.
+pub(crate) fn dtype_size(dtype: Dtype) -> usize {
+    match dtype {
+        Dtype::BF16 | Dtype::F16 => 2,
+        Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
+        Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
+        Dtype::U8 | Dtype::I8 | Dtype::BOOL => 1,
+        other => panic!("no contract tensor carries {other:?}"),
+    }
+}

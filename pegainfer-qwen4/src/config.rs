@@ -108,7 +108,10 @@ fn default_norm_topk_prob() -> bool {
 #[derive(Debug)]
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "the tensor contract is the first reader")
+    allow(
+        dead_code,
+        reason = "slice B's checkpoint loader is the first runtime reader"
+    )
 )]
 pub(crate) struct Config {
     pub(crate) text: TextConfig,
@@ -446,7 +449,10 @@ fn ple_layer(t: &TextConfig, layer_kinds: &[LayerKind]) -> Result<usize> {
 #[derive(Debug)]
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "the tensor contract is the first reader")
+    allow(
+        dead_code,
+        reason = "slice B's checkpoint loader is the first runtime reader"
+    )
 )]
 pub(crate) struct NgramTable {
     /// `(ngram_size - 1) * heads_per_ngram`, one head per (order, head) pair.
@@ -522,7 +528,10 @@ impl NgramTable {
     /// and the number the ecosystem's ~51 GB quote halves by assuming fp8.
     #[cfg_attr(
         not(test),
-        allow(dead_code, reason = "the tensor contract is the first reader")
+        allow(
+            dead_code,
+            reason = "only the contract test in manifest::validate reads it"
+        )
     )]
     pub(crate) fn bf16_bytes(&self) -> u128 {
         self.padded_vocab_size as u128 * self.head_dim as u128 * 2

@@ -213,6 +213,7 @@ mod tests {
 
     use super::*;
     use crate::manifest::INTEGER_INDEX_DTYPE;
+    use crate::manifest::dtype_size;
     use crate::manifest::schema::ExpectedShape;
 
     /// The reader is contract-agnostic, so these tests run it against a config
@@ -306,16 +307,6 @@ mod tests {
             .iter()
             .map(|(name, (shape, dtype))| (name.clone(), *dtype, dims(*shape)))
             .collect()
-    }
-
-    fn dtype_size(dtype: Dtype) -> usize {
-        match dtype {
-            Dtype::BF16 | Dtype::F16 => 2,
-            Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
-            Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
-            Dtype::U8 | Dtype::I8 | Dtype::BOOL => 1,
-            other => panic!("no fixture here needs {other:?}"),
-        }
     }
 
     /// Writes a shard holding `tensors`, zero-filled. Only the header is ever read
@@ -618,12 +609,18 @@ mod tests {
             .unwrap_or_else(|e| panic!("real shards disagree with the derived contract: {e:#}"));
         // #1104 asks that a proof record which shards it used, so a reader knows
         // whether the gate ever saw the whole checkpoint. Name them rather than
-        // just counting: "3 of 131" does not say which three.
+        // just counting: "3 of 131" does not say which three. The required/skipped
+        // split is printed too, so the "446 opened / 111 required" figure the
+        // bring-up doc quotes is this gate's own output, not a side count.
+        let report = scan.report(&manifest);
         eprintln!(
-            "opened {} of {} indexed shard(s), {} tensor(s) checked: {}",
+            "opened {} of {} indexed shard(s): {} tensor(s) checked, {} required text tensors, {} \
+             skipped optional; shards: {}",
             scan.present_shards.len(),
             scan.present_shards.len() + scan.absent_shards.len(),
             scan.tensors().len(),
+            scan.tensors().len() - report.skipped_optional.len(),
+            report.skipped_optional.len(),
             scan.present_shards.join(" "),
         );
     }
