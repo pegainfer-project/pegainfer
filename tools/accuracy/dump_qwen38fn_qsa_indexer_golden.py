@@ -1,35 +1,24 @@
 #!/usr/bin/env python3
-"""Generate the QSA indexer golden (per-block scores + selected token indices).
+"""Generate the QSA indexer golden: per-block scores + selected token indices.
 
-Qwen3.8-Flash-Next routes its 12 full-attention layers through the QSA token
-indexer (`Qwen4ExpTextQSAIndexer`, transformers 5.16.1 `models/qwen4_exp`). The
-Stage 1 kernel gate (P2 = scoring, P3 = selection) replays these fixtures: the
-same seeded indexer weights and synthetic hidden states, comparing per-block
-scores and the selected token indices against this stored oracle.
+Dumps the Qwen3.8-Flash-Next QSA token indexer reference
+(`Qwen4ExpTextQSAIndexer`, transformers 5.16.1 `models/qwen4_exp`) into a fixture
+the scoring/selection kernel gate replays: same seeded weights and synthetic
+hidden states, comparing per-block scores and selected token indices.
 
-The reference module's `forward` returns only the combined attention mask, so
-the score / selection internals are re-derived here from the frozen semantics
-(plan §2.4/§2.5) and the re-derivation is validated in-script by asserting it
-reproduces the module's own mask on every case. A mismatch aborts the dump.
+The reference `forward` returns only the attention mask, so the score/selection
+internals are re-derived here and validated by asserting the re-derivation
+reproduces the module's mask on every case (a mismatch aborts). Its mask builder
+also passes an int32 index to `scatter` (torch wants int64), so `_scatter_int64`
+casts it for the reference call only.
 
-Note: the shipped reference mask builder passes an int32 index to `scatter`,
-which torch rejects ("Expected dtype int64 for index"); `_scatter_int64` below
-casts it for the duration of the reference call so the reference's own code path
-can be used as the oracle. The re-derivation itself uses the correct dtype.
+Fixture: provenance `format_version` / `config_sha256` / `ref_transformers`
+(assert on load); per case, `scores` is NaN-padded with an explicit
+`scores_valid` mask (select by the mask, not the padding) and `selected` is
+-1-padded with `n_selected`. Boundary cases shrink `indexer_budget` to 16 (4
+blocks) to hit the truncation branch without a 2048-token input.
 
-Fixture layout: provenance is `format_version`, `config_sha256` and
-`ref_transformers` (assert them on load). Per case, `scores` is NaN-padded and
-its validity is the explicit `scores_valid` mask — consumers must select by that
-mask, never trust the padding; `selected` is -1-padded with `n_selected`.
-
-Geometry is the frozen Qwen3.8-Flash-Next one. The budget-boundary truncation
-(`topk(min(budget//ratio, n_complete))`) would need a 2048-token sequence at the
-real budget, so the boundary cases instead shrink `indexer_budget` (16 -> 4
-blocks) to exercise the same truncation branch at a small sequence, keeping the
-fixture small. Both budgets are recorded per case.
-
-    python tools/accuracy/dump_qwen38fn_qsa_indexer_golden.py \
-        --out test_data/qwen38fn-qsa-indexer-golden.safetensors
+    python tools/accuracy/dump_qwen38fn_qsa_indexer_golden.py --out <fixture>
 """
 
 from __future__ import annotations
@@ -49,7 +38,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
     apply_rotary_pos_emb,
 )
 
-# Frozen Qwen3.8-Flash-Next text geometry (plan §2 / bringup §2.1).
+# Qwen3.8-Flash-Next text geometry.
 HIDDEN = 2560
 NUM_Q_HEADS = 24
 NUM_KV_HEADS = 2
@@ -137,11 +126,11 @@ def rederive(
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     attention_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """Re-derive indexer scores + selected tokens (plan §2.4/§2.5).
+    """Re-derive indexer scores + selected tokens.
 
-    Returns (scores [S, ceil(S/4)] fp32 padded with NaN, selected [S, budget+ratio-1]
-    int32 padded with -1, n_blocks [S]). Mirrors the reference forward line by line,
-    calling the module's own submodules for the numerics.
+    Returns (scores [S, ceil(S/4)] fp32 NaN-padded, selected [S, budget+ratio-1]
+    int32 -1-padded, n_blocks [S]). Mirrors the reference forward, calling the
+    module's own submodules for the numerics.
     """
     batch_size, seq_len, _ = hidden.shape
     hidden_shape = (batch_size, seq_len, -1, module.index_head_dim)
