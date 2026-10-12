@@ -99,7 +99,7 @@ class _Upstream:
 
 
 class CachedPrefixRecorderTests(unittest.TestCase):
-    def test_formal_runner_requires_detailed_serial_prefix_workload(self) -> None:
+    def test_recorder_requires_detailed_serial_prefix_workload(self) -> None:
         command = [
             ".venv/bin/vllm-bench",
             "--dataset-name",

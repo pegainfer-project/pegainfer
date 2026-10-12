@@ -14,7 +14,6 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 INDEX_SCHEMA_VERSION = 2
-CELL_STATES = ("pending", "running", "succeeded", "failed", "invalid", "sealed")
 
 
 class ArtifactError(RuntimeError):
@@ -65,6 +64,52 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def write_compiled_bundle(root: Path, documents: dict[str, Any], campaign_id: str) -> dict[str, Any]:
+    """Publish immutable compiler outputs; the index is written last.
+
+    Check all conflicts before writing anything. Exclusive hard-link creation
+    also prevents another compiler from replacing a file after that check.
+    An interrupted write can be resumed with the identical document bytes.
+    """
+    root = root.expanduser().resolve()
+    if root.is_relative_to(_repo_root()):
+        raise ArtifactError("compiled artifact root must be outside the repository")
+    payloads = {name: _render(document) for name, document in documents.items()}
+    index = {
+        "kind": "compiled_artifact_index", "schema_version": 3, "campaign_id": campaign_id,
+        "files": {name: {"sha256": _sha256_bytes(data), "size": len(data)} for name, data in sorted(payloads.items())},
+    }
+    payloads["artifact_index.json"] = _render(index)
+    for name, data in payloads.items():
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts or not name:
+            raise ArtifactError(f"invalid compiler artifact path: {name}")
+        path = root / relative
+        if not path.resolve().is_relative_to(root):
+            raise ArtifactError(f"compiler artifact escapes root: {name}")
+        if path.exists() and (not path.is_file() or path.read_bytes() != data):
+            raise ArtifactError(f"refusing to overwrite a different compiler artifact: {name}")
+    for name, data in payloads.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temporary = Path(handle.name)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if path.read_bytes() != data:
+                    raise ArtifactError(f"compiler artifact changed while publishing: {name}")
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    return index
 
 
 class ArtifactStore:
@@ -215,9 +260,6 @@ class ArtifactStore:
         entry["sealed_at_utc"] = _now()
         _write_atomic(self.checkpoint_dir / f"{cell_id}.json", entry)
         self._save_index()
-
-    def pending_cell_ids(self, cells: list[dict[str, Any]]) -> list[str]:
-        return [cell["cell_id"] for cell in cells if self.status(cell["cell_id"]) != "sealed"]
 
     def variant_status(self, cell_id: str, variant: str) -> str:
         entry = self._index["variant_cells"].get(f"{cell_id}:{variant}")

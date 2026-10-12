@@ -1,0 +1,208 @@
+{
+  "client": {
+    "name": "vllm-bench",
+    "version": "test",
+    "binary": "bin/vllm-bench",
+    "tokenizer": "model",
+    "seed": 7,
+    "sampling": {
+      "temperature": 0,
+      "top_p": 1,
+      "ignore_eos": true
+    },
+    "generation": {
+      "dataset": "random",
+      "shuffle": false,
+      "prompt_representation": "token_ids",
+      "seed_policy": "phase_repeat"
+    },
+    "timing": {
+      "clock": "monotonic",
+      "first_token": "first_generated_content_event",
+      "last_token": "last_generated_content_event"
+    }
+  },
+  "variants": {
+    "target": {
+      "identity": {
+        "endpoint": "http://127.0.0.1:19090",
+        "model": "test-model",
+        "engine": "vllm",
+        "engine_version": "test",
+        "model_revision": "test",
+        "model_config_sha256": "62ebdba540b0e9ec54e42b297897ce69f78ddd3212fa6d63da1888db266cb012"
+      },
+      "runtime": {
+        "backend": "vllm",
+        "parallelism": "1",
+        "quantization": "none",
+        "scheduler": {
+          "policy": "vllm_v1",
+          "max_num_seqs": 4,
+          "max_num_batched_tokens": 2048,
+          "max_model_len": 8192,
+          "prefill": {
+            "mode": "chunked",
+            "max_chunk_tokens": 2048
+          }
+        },
+        "cache": {
+          "policy": "on",
+          "block_alignment": 16,
+          "endpoint_isolated": true
+        }
+      },
+      "server_flags": []
+    },
+    "zero_cost": {
+      "identity": {
+        "endpoint": "http://127.0.0.1:19190",
+        "model": "test-model",
+        "engine": "pegainfer-sim",
+        "engine_version": "test",
+        "model_revision": "test",
+        "model_config_sha256": "62ebdba540b0e9ec54e42b297897ce69f78ddd3212fa6d63da1888db266cb012"
+      },
+      "runtime": {
+        "backend": "pegainfer-sim",
+        "scheduler": {
+          "max_model_len": 8192
+        },
+        "cache": {
+          "policy": "on"
+        }
+      },
+      "server_flags": []
+    },
+    "sim": {
+      "identity": {
+        "endpoint": "http://127.0.0.1:19290",
+        "model": "test-model",
+        "engine": "pegainfer-sim",
+        "engine_version": "test",
+        "model_revision": "test",
+        "model_config_sha256": "62ebdba540b0e9ec54e42b297897ce69f78ddd3212fa6d63da1888db266cb012"
+      },
+      "runtime": {
+        "backend": "pegainfer-sim",
+        "scheduler": {
+          "max_model_len": 8192
+        },
+        "cache": {
+          "policy": "on"
+        }
+      },
+      "server_flags": []
+    }
+  },
+  "workload": {
+    "matrices": {
+      "prefill-train": {
+        "kind": "cold_prefill",
+        "split": "train",
+        "input_tokens": {
+          "values": [
+            128,
+            2048
+          ]
+        },
+        "concurrency": 1,
+        "output_tokens": 8,
+        "warmup_repeats": 1,
+        "repeats": 3,
+        "arrival": {
+          "mode": "fixed_batch"
+        },
+        "cache_lifecycle": {
+          "namespace": "prefill-train",
+          "reset_before": "repeat",
+          "bootstrap_repeats": 0
+        }
+      },
+      "decode-train": {
+        "kind": "steady_decode",
+        "split": "train",
+        "concurrency": {
+          "values": [
+            1,
+            4
+          ]
+        },
+        "context_tokens": {
+          "values": [
+            128,
+            2048
+          ]
+        },
+        "surface_requests": [],
+        "surface_kv_tokens": [],
+        "output_tokens": 128,
+        "warmup_repeats": 1,
+        "repeats": 3,
+        "arrival": {
+          "mode": "fixed_batch"
+        }
+      },
+      "decode-heldout": {
+        "kind": "steady_decode",
+        "split": "sealed_test",
+        "concurrency": {
+          "values": [
+            2
+          ]
+        },
+        "context_tokens": {
+          "values": [
+            1024
+          ]
+        },
+        "surface_requests": [],
+        "surface_kv_tokens": [],
+        "output_tokens": 128,
+        "warmup_repeats": 1,
+        "repeats": 3,
+        "arrival": {
+          "mode": "fixed_batch"
+        }
+      },
+      "cached-train": {
+        "kind": "cached_prefill",
+        "split": "train",
+        "prefix_tokens": {
+          "values": [
+            256,
+            512
+          ]
+        },
+        "new_tokens": {
+          "values": [
+            64,
+            128
+          ]
+        },
+        "concurrency": 1,
+        "output_tokens": 8,
+        "warmup_repeats": 0,
+        "repeats": 3,
+        "arrival": {
+          "mode": "fixed_batch"
+        },
+        "generation": {
+          "dataset": "prefix_repetition"
+        },
+        "shared_prefix": {
+          "identity": "test-prefix",
+          "suffix_mode": "request_index"
+        },
+        "cache_lifecycle": {
+          "namespace": "cached-train",
+          "reset_before": "repeat",
+          "bootstrap_repeats": 1
+        }
+      }
+    }
+  },
+  "output": {
+    "artifact_root": "artifacts"
+  }
+}

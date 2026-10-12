@@ -11,9 +11,12 @@ from typing import Any
 
 from artifacts import ArtifactError, ArtifactStore
 from benchmark import run_stream_cell
-from manifest import ManifestError, PAIRED_VARIANTS
+from manifest import ManifestError
 from pairing import canonical_pair_key, pairing_key_text
 from probe import ProbeError, probe_endpoint
+
+
+PAIRED_VARIANTS = ("target", "zero_cost", "replay")
 
 
 def _request_keys(result: dict[str, Any]) -> list[str]:

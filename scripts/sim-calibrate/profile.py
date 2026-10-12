@@ -16,11 +16,65 @@ from manifest import (  # noqa: E402
     canonical_client_identity,
     canonical_scheduler_identity,
     canonical_workload_identity,
+    canonical_json,
 )
 
 
 class ProfileError(ValueError):
     """Raised when calibration evidence cannot produce a safe profile."""
+
+
+def zero_cost_bundle(campaign: dict[str, Any], manifest_name: str = "manifest.json") -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a zero-delay control from compiled inputs, without fit/report data."""
+    target = campaign["variants"]["target"]
+    control = campaign["variants"]["zero_cost"]
+    scheduler = canonical_scheduler_identity(control["runtime"]["scheduler"])
+    workload = campaign["workload"]["cells"]
+    client = canonical_client_identity(campaign["client"], tokenizer_config_sha256=campaign["client"]["tokenizer_config_sha256"])
+    identity = target["identity"]
+    runtime = target["runtime"]
+    provenance = campaign["provenance"]
+    manifest = {
+        "schema_version": 2,
+        "target_engine": identity["engine"], "engine_version": identity["engine_version"],
+        "model_id": control["identity"]["model"], "model_revision": identity["model_revision"],
+        "model_config_sha256": identity["model_config_sha256"], "gpu": runtime.get("gpu", "unbound"),
+        "server_flags": target["server_flags"], "collection_command": canonical_json(provenance["compile_argv"]),
+        "source_artifacts": [f"plans/{cell['cell_id']}/request_plan.json" for cell in workload],
+        "backend": runtime.get("backend", identity["engine"]), "driver": runtime.get("driver", "not_recorded"),
+        "cuda": runtime.get("cuda", "not_recorded"), "parallelism": runtime.get("parallelism", "1"),
+        "quantization": runtime.get("quantization", "none"), "scheduler": scheduler,
+        "cache": canonical_cache_identity(control["runtime"].get("cache")), "client": client,
+        "workload": {
+            "cells": [{"id": cell["cell_id"], "family": cell["kind"], "input_tokens": cell["input_tokens"],
+                       "output_tokens": cell["output_tokens"], "concurrency": cell["concurrency"],
+                       "arrival_pattern": "fixed_batch", "attribution": "black_box_effective"} for cell in workload],
+            "warmup_repeats": max(cell["warmup_repeats"] for cell in workload),
+            "repeats": max(cell["repeats"] for cell in workload),
+        },
+        "split": campaign["splits"],
+        "provenance": {
+            "collector_revision": provenance["compiler_revision"],
+            "fitter_revision": "not_applicable_generated_zero_cost",
+            "artifact_uri": provenance["artifact_uri"], "source_digest": campaign["source_digest"],
+        },
+    }
+    # The artifact writer uses this exact encoding, including the final newline.
+    manifest_bytes = (json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode()
+    profile = {
+        "schema_version": 3,
+        "calibration": {"manifest": manifest_name, "sha256": _sha256_bytes(manifest_bytes)},
+        "scheduler": scheduler,
+        "predictor": {
+            "coverage": {
+                "decode_reqs": [0, scheduler["max_num_seqs"]],
+                "sum_decode_ctx_tokens": [0, scheduler["max_num_seqs"] * scheduler["max_model_len"]],
+                "prefill_tokens_in_step": [0, scheduler["max_num_batched_tokens"]],
+            },
+            "model": {"kind": "fixed_step", "duration_us": 0},
+        },
+    }
+    return manifest, profile
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -160,12 +214,6 @@ def _ms_to_us(value: Any, context: str) -> int:
     if milliseconds < 0:
         raise ProfileError(f"{context} must be non-negative")
     return int(round(milliseconds * 1000.0))
-
-
-def _positive_int(value: Any, context: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ProfileError(f"{context} must be a positive integer")
-    return value
 
 
 def _comparison_evidence(comparison: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]] | None:

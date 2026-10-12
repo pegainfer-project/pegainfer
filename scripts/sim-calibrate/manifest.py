@@ -1,48 +1,25 @@
 #!/usr/bin/env python3
-"""Versioned campaign manifest and workload-cell planning primitives.
-
-The manifest is the identity boundary for a calibration campaign.  Its digest
-is derived from target identity, client invocation, environment, workload
-cells, split assignments, and provenance, but not from timestamps or the
-digest field itself.  This keeps retries and dry-runs reproducible while still
-retaining collection time as metadata.
-"""
+"""Compile named campaign matrices and canonical serving/profile identities."""
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
-import os
-import platform
 import re
-import subprocess
-from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from urllib.parse import urlsplit
 
-from vllm_bench_matrix import MatrixError, axis_values, cold_prefill_matrix, decode_matrix
+from measurement_schema import MeasurementError, contract as measurement_contract, digest, integer, number, text
 
 
-SCHEMA_VERSION = 1
-PAIRED_SCHEMA_VERSION = 2
-CACHED_PAIRED_SCHEMA_VERSION = 3
-PAIRED_VARIANTS = ("target", "zero_cost", "replay")
+CAMPAIGN_SPEC_SCHEMA_VERSION = 4
+COMPILED_CAMPAIGN_SCHEMA_VERSION = 4
 SPLITS = ("train", "threshold_validation", "held_out_mixed", "sealed_test")
 WORKLOAD_KINDS = ("cold_prefill", "steady_decode", "cached_prefill", "mixed")
-MIXED_SPLITS = ("threshold_validation", "held_out_mixed", "sealed_test")
 
-_SENSITIVE_KEY = re.compile(
-    r"(?:api[_-]?key|credential|password|passwd|prompt|secret|token[_-]?ids?|authorization)",
-    re.IGNORECASE,
-)
-_SENSITIVE_VALUE = re.compile(
-    r"(?:bearer\s+\S+|sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,})",
-    re.IGNORECASE,
-)
-_PRIVATE_PATH = re.compile(
-    r"(?<![A-Za-z0-9_~.-])/(?:home|root|tmp|mnt|workspace)(?:/[^\s\"'<>`]+)+"
-)
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 
 
@@ -53,47 +30,90 @@ class ManifestError(ValueError):
 def canonical_json(value: Any) -> str:
     """Render JSON deterministically for IDs and digest comparisons."""
 
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _canonical_matrix_spec(value: Any, field: str = "workload.matrices") -> Any:
-    """Normalize range objects so equivalent JSON spellings share an identity."""
-
-    axis_fields = {
-        "input_tokens",
-        "required_input_tokens",
-        "concurrency",
-        "context_tokens",
-        "surface_requests",
-        "surface_kv_tokens",
-        "prefix_tokens",
-        "new_tokens",
-    }
-    if isinstance(value, list) and field.rsplit(".", 1)[-1] in axis_fields:
-        try:
-            allow_empty = field.endswith(".surface_requests") or field.endswith(".surface_kv_tokens")
-            return list(axis_values(value, field, allow_empty=allow_empty))
-        except MatrixError as exc:
-            raise ManifestError(str(exc)) from exc
+def _axis_values(value: Any, field: str, *, allow_empty: bool = False) -> tuple[int, ...]:
+    """Canonical positive integer axes, with inclusive ranges and no duplicates."""
     if isinstance(value, dict):
-        keys = set(value)
-        if keys == {"values"} or keys == {"start", "stop", "step"}:
-            try:
-                allow_empty = field.endswith(".surface_requests") or field.endswith(".surface_kv_tokens")
-                return list(axis_values(value, field, allow_empty=allow_empty))
-            except MatrixError as exc:
-                raise ManifestError(str(exc)) from exc
-        return {
-            key: _canonical_matrix_spec(value[key], f"{field}.{key}")
-            for key in sorted(value)
-        }
-    if isinstance(value, list):
-        return [_canonical_matrix_spec(item, f"{field}[{index}]") for index, item in enumerate(value)]
-    return value
+        if set(value) == {"values"}:
+            value = value["values"]
+        elif set(value) == {"start", "stop", "step"}:
+            start, stop, step = (value[name] for name in ("start", "stop", "step"))
+            for name, item in (("start", start), ("stop", stop), ("step", step)):
+                integer(item, f"{field}.{name}", positive=True)
+            if stop < start:
+                raise ManifestError(f"{field}.stop must be >= {field}.start")
+            value = list(range(start, stop + 1, step))
+        else:
+            raise ManifestError(f"{field} must use values or start/stop/step")
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise ManifestError(f"{field} must be a non-empty array or range object")
+    for item in value:
+        integer(item, field, positive=True)
+    if len(set(value)) != len(value):
+        raise ManifestError(f"{field} must not contain duplicates")
+    return tuple(sorted(value))
+
+
+def _matrix_cells(name: str, matrix: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand a validated named recipe; experiment policy stays on each cell."""
+    kind = matrix["kind"]
+    axes = {"input_tokens", "context_tokens", "concurrency", "prefix_tokens", "new_tokens",
+            "surface_requests", "surface_kv_tokens", "required_input_tokens"}
+    policy = {key: value for key, value in matrix.items() if key not in axes}
+    cells = []
+    if kind == "cold_prefill":
+        if matrix["concurrency"] != 1:
+            raise ManifestError(f"{name}.concurrency must be 1 for cold_prefill")
+        inputs = _axis_values(matrix.get("input_tokens"), f"{name}.input_tokens")
+        if matrix.get("required_input_tokens") is not None:
+            required = _axis_values(matrix["required_input_tokens"], f"{name}.required_input_tokens")
+            missing = sorted(set(required) - set(inputs))
+            if missing:
+                raise ManifestError(f"{name}.input_tokens is missing required values: {missing}")
+        metadata = {**matrix.get("metadata", {}), "matrix": kind, "input_axis": list(inputs)}
+        cells = [{"name": f"{name}-{tokens}", "input_tokens": tokens,
+                  "concurrency": 1, "metadata": dict(metadata)} for tokens in inputs]
+    elif kind == "steady_decode":
+        if matrix["output_tokens"] < 2:
+            raise ManifestError(f"{name}.output_tokens must be >=2")
+        requests = _axis_values(matrix.get("concurrency"), f"{name}.concurrency")
+        contexts = _axis_values(matrix.get("context_tokens"), f"{name}.context_tokens")
+        surface_requests = _axis_values(matrix.get("surface_requests"), f"{name}.surface_requests", allow_empty=True)
+        surface_kv = _axis_values(matrix.get("surface_kv_tokens"), f"{name}.surface_kv_tokens", allow_empty=True)
+        if bool(surface_requests) != bool(surface_kv):
+            raise ManifestError(f"{name} surface axes must be both empty or non-empty")
+
+        def add(count: int, context: int, family: str, total_kv: int) -> None:
+            cells.append({
+                "name": f"{name}-{family}-c{count}-ctx{context}",
+                "input_tokens": context, "concurrency": count, "sum_decode_ctx_tokens": total_kv,
+                "metadata": {**matrix.get("metadata", {}), "matrix": kind,
+                             "family": family, "sum_decode_ctx_tokens": total_kv},
+            })
+
+        for count, context in product(requests, contexts):
+            add(count, context, "additive", count * context)
+        # Unique axes produce the full grid. Keep surface and additive cells
+        # separate even when their shapes coincide: their fit intent differs.
+        for count, total_kv in product(surface_requests, surface_kv):
+            if total_kv % count:
+                raise ManifestError(f"{name}.surface_kv_tokens must be divisible by every surface request count")
+            add(count, total_kv // count, "surface", total_kv)
+    elif kind == "cached_prefill":
+        if matrix["concurrency"] != 1:
+            raise ManifestError(f"{name}.concurrency must be 1 for cached_prefill")
+        prefixes = _axis_values(matrix.get("prefix_tokens"), f"{name}.prefix_tokens")
+        tails = _axis_values(matrix.get("new_tokens"), f"{name}.new_tokens")
+        cells = [{"name": f"{name}-prefix{prefix}-new{tail}", "input_tokens": prefix + tail,
+                  "prefix_tokens": prefix, "new_tokens": tail, "concurrency": 1}
+                 for prefix, tail in product(prefixes, tails)]
+    return [{**policy, **cell, "matrix_name": name} for cell in cells]
 
 
 def canonical_scheduler_identity(scheduler: dict[str, Any]) -> dict[str, Any]:
@@ -260,43 +280,6 @@ def canonical_workload_identity(campaign: dict[str, Any]) -> tuple[dict[str, Any
     )
 
 
-def _redact_string(value: str) -> str:
-    repo_root = Path(__file__).resolve().parents[2]
-    home = Path.home()
-    redacted = value.replace(str(repo_root), "<repo>")
-    if str(home) != "/":
-        redacted = redacted.replace(str(home), "<home>")
-    return _PRIVATE_PATH.sub("<redacted>", redacted)
-
-
-def _validate_safe(value: Any, path: str = "manifest") -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if _SENSITIVE_KEY.search(str(key)):
-                raise ManifestError(f"sensitive field is not allowed at {path}.{key}")
-            _validate_safe(item, f"{path}.{key}")
-        return
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            _validate_safe(item, f"{path}[{index}]")
-        return
-    if isinstance(value, str) and _SENSITIVE_VALUE.search(value):
-        raise ManifestError(f"credential-like value is not allowed at {path}")
-
-
-def _validate_argv(argv: Iterable[str], field: str) -> list[str]:
-    rendered = []
-    for index, arg in enumerate(argv):
-        if not isinstance(arg, str) or not arg:
-            raise ManifestError(f"{field}[{index}] must be a non-empty string")
-        if re.search(r"(?:^|[-_])(prompt|token[-_]?ids?|api[-_]?key|password|secret)(?:=|$)", arg, re.I):
-            raise ManifestError(f"sensitive argument is not allowed at {field}[{index}]")
-        if _SENSITIVE_VALUE.search(arg):
-            raise ManifestError(f"credential-like argument is not allowed at {field}[{index}]")
-        rendered.append(_redact_string(arg))
-    return rendered
-
-
 def _non_empty(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ManifestError(f"{field} must be a non-empty string")
@@ -311,541 +294,6 @@ def _positive_int(value: Any, field: str, *, allow_zero: bool = False) -> int:
     return value
 
 
-def _normalise_cell(raw: dict[str, Any], index: int, defaults: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise ManifestError(f"workload.cells[{index}] must be an object")
-    cell = {**defaults, **raw}
-    kind = _non_empty(cell.get("kind"), f"workload.cells[{index}].kind")
-    if kind not in WORKLOAD_KINDS:
-        raise ManifestError(f"workload.cells[{index}].kind must be one of {WORKLOAD_KINDS}")
-    split = _non_empty(cell.get("split", "train"), f"workload.cells[{index}].split")
-    if split not in SPLITS:
-        raise ManifestError(f"workload.cells[{index}].split must be one of {SPLITS}")
-    name = _non_empty(cell.get("name", f"{kind}-{index:03d}"), f"workload.cells[{index}].name")
-    input_tokens = _positive_int(cell.get("input_tokens"), f"workload.cells[{index}].input_tokens")
-    output_tokens = _positive_int(cell.get("output_tokens"), f"workload.cells[{index}].output_tokens")
-    concurrency = _positive_int(cell.get("concurrency", 1), f"workload.cells[{index}].concurrency")
-    sum_decode_ctx_tokens = cell.get("sum_decode_ctx_tokens")
-    if sum_decode_ctx_tokens is not None:
-        sum_decode_ctx_tokens = _positive_int(
-            sum_decode_ctx_tokens,
-            f"workload.cells[{index}].sum_decode_ctx_tokens",
-        )
-    warmup = _positive_int(cell.get("warmup_repeats", 0), f"workload.cells[{index}].warmup_repeats", allow_zero=True)
-    repeats = _positive_int(cell.get("repeats", 1), f"workload.cells[{index}].repeats")
-    request_rate = cell.get("request_rate")
-    if request_rate is not None and (isinstance(request_rate, bool) or not isinstance(request_rate, (int, float)) or request_rate <= 0):
-        raise ManifestError(f"workload.cells[{index}].request_rate must be positive when present")
-    arrival = _non_empty(cell.get("arrival_pattern", "closed_loop"), f"workload.cells[{index}].arrival_pattern")
-    prefix_tokens = _positive_int(cell.get("prefix_tokens", 0), f"workload.cells[{index}].prefix_tokens", allow_zero=True)
-    if kind == "cached_prefill" and prefix_tokens == 0:
-        raise ManifestError(f"workload.cells[{index}] cached_prefill requires prefix_tokens > 0")
-    shared_prefix = cell.get("shared_prefix")
-    if kind == "cached_prefill":
-        if not isinstance(shared_prefix, dict):
-            raise ManifestError(f"workload.cells[{index}].cached_prefill requires shared_prefix")
-        identity = _non_empty(shared_prefix.get("identity"), f"workload.cells[{index}].shared_prefix.identity")
-        if prefix_tokens >= input_tokens:
-            raise ManifestError(f"workload.cells[{index}] cached_prefill requires uncached suffix tokens")
-        suffix_mode = _non_empty(
-            shared_prefix.get("suffix_mode", "request_index"),
-            f"workload.cells[{index}].shared_prefix.suffix_mode",
-        )
-        shared_prefix = {
-            "identity": identity,
-            "cached_tokens": prefix_tokens,
-            "suffix_mode": suffix_mode,
-        }
-    elif shared_prefix is not None:
-        raise ManifestError(f"workload.cells[{index}].shared_prefix is only valid for cached_prefill")
-    if kind == "mixed" and split not in MIXED_SPLITS:
-        raise ManifestError(f"mixed cell {name!r} must use one of {MIXED_SPLITS}")
-    prefill_input_tokens = cell.get("prefill_input_tokens")
-    if prefill_input_tokens is not None:
-        prefill_input_tokens = _positive_int(
-            prefill_input_tokens, f"workload.cells[{index}].prefill_input_tokens"
-        )
-    mixed_shape = cell.get("mixed_shape")
-    if kind == "mixed":
-        if not isinstance(mixed_shape, dict):
-            raise ManifestError(f"workload.cells[{index}] mixed requires mixed_shape")
-        foreground = mixed_shape.get("foreground")
-        background = mixed_shape.get("background")
-        if not isinstance(foreground, dict) or not isinstance(background, dict):
-            raise ManifestError(f"workload.cells[{index}].mixed_shape requires foreground/background")
-        for field in ("input_tokens", "output_tokens"):
-            _positive_int(foreground.get(field), f"workload.cells[{index}].mixed_shape.foreground.{field}")
-        for field in ("requests", "context_tokens", "output_tokens"):
-            _positive_int(background.get(field), f"workload.cells[{index}].mixed_shape.background.{field}")
-        if prefill_input_tokens is None:
-            prefill_input_tokens = _positive_int(
-                foreground["input_tokens"], f"workload.cells[{index}].prefill_input_tokens"
-            )
-        if sum_decode_ctx_tokens is None:
-            sum_decode_ctx_tokens = background["requests"] * background["context_tokens"]
-    elif mixed_shape is not None:
-        raise ManifestError(f"workload.cells[{index}].mixed_shape is only valid for mixed")
-    if kind == "steady_decode" and input_tokens <= 0:
-        raise ManifestError(f"workload.cells[{index}] steady_decode requires input_tokens > 0")
-    sampling = cell.get("sampling", {"temperature": 0.0, "top_p": 1.0})
-    if not isinstance(sampling, dict):
-        raise ManifestError(f"workload.cells[{index}].sampling must be an object")
-    for field in ("temperature", "top_p"):
-        if field in sampling and (
-            isinstance(sampling[field], bool) or not isinstance(sampling[field], (int, float))
-        ):
-            raise ManifestError(f"workload.cells[{index}].sampling.{field} must be numeric")
-    result = {
-        "name": name,
-        "kind": kind,
-        "split": split,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "concurrency": concurrency,
-        "arrival_pattern": arrival,
-        "request_rate": request_rate,
-        "prefix_tokens": prefix_tokens,
-        "warmup_repeats": warmup,
-        "repeats": repeats,
-        "ignore_eos": bool(cell.get("ignore_eos", True)),
-        "sampling": sampling,
-        "cache_evidence_required": kind == "cached_prefill",
-        "fit_policy": {
-            "status": "held_out" if kind == "mixed" or split == "held_out_mixed" else "measured",
-            "excluded_metrics": ["ttft_ms"] if concurrency > 1 else [],
-        },
-    }
-    if sum_decode_ctx_tokens is not None:
-        result["sum_decode_ctx_tokens"] = sum_decode_ctx_tokens
-    elif kind == "steady_decode":
-        result["sum_decode_ctx_tokens"] = input_tokens * concurrency
-    if shared_prefix is not None:
-        result["shared_prefix"] = shared_prefix
-    if prefill_input_tokens is not None:
-        result["prefill_input_tokens"] = prefill_input_tokens
-    if mixed_shape is not None:
-        result["mixed_shape"] = mixed_shape
-    if "metadata" in cell:
-        result["metadata"] = cell["metadata"]
-    return result
-
-
-def _axis_values(value: Any, field: str, *, allow_empty: bool = False) -> list[int]:
-    try:
-        return list(axis_values(value, field, allow_empty=allow_empty))
-    except MatrixError as exc:
-        raise ManifestError(str(exc)) from exc
-
-
-def _expand_cached_prefill(
-    workload: dict[str, Any],
-    start_index: int,
-    *,
-    raw: Any = None,
-    require_explicit_scalars: bool = False,
-) -> list[dict[str, Any]]:
-    raw = workload.get("cached_prefill") if raw is None else raw
-    matrices = raw if isinstance(raw, list) else [raw]
-    if not matrices or any(not isinstance(matrix, dict) for matrix in matrices):
-        raise ManifestError("workload.cached_prefill must be an object or a list of objects")
-
-    expanded: list[dict[str, Any]] = []
-    for matrix_index, matrix in enumerate(matrices):
-        defaults = matrix.get("defaults", {})
-        if not isinstance(defaults, dict):
-            raise ManifestError(f"workload.cached_prefill[{matrix_index}].defaults must be an object")
-        split = _non_empty(
-            matrix.get("split", defaults.get("split", "train")),
-            f"workload.cached_prefill[{matrix_index}].split",
-        )
-        if split not in SPLITS:
-            raise ManifestError(f"workload.cached_prefill[{matrix_index}].split must be one of {SPLITS}")
-        prefix_axis = _axis_values(
-            matrix.get("prefix_tokens"),
-            f"workload.cached_prefill[{matrix_index}].prefix_tokens",
-        )
-        new_axis = _axis_values(
-            matrix.get("new_tokens"),
-            f"workload.cached_prefill[{matrix_index}].new_tokens",
-        )
-        shared_prefix = matrix.get("shared_prefix", defaults.get("shared_prefix"))
-        if not isinstance(shared_prefix, dict):
-            raise ManifestError(f"workload.cached_prefill[{matrix_index}].shared_prefix must be an object")
-        identity = _non_empty(
-            shared_prefix.get("identity"),
-            f"workload.cached_prefill[{matrix_index}].shared_prefix.identity",
-        )
-        suffix_mode = _non_empty(
-            shared_prefix.get("suffix_mode", "request_index"),
-            f"workload.cached_prefill[{matrix_index}].shared_prefix.suffix_mode",
-        )
-        output_value = matrix.get("output_tokens", defaults.get("output_tokens"))
-        if output_value is None and not require_explicit_scalars:
-            output_value = 4
-        output_tokens = _positive_int(
-            output_value,
-            f"workload.cached_prefill[{matrix_index}].output_tokens",
-        )
-        name_prefix = _non_empty(
-            matrix.get("name_prefix", f"cached-prefill-{split}"),
-            f"workload.cached_prefill[{matrix_index}].name_prefix",
-        )
-        metadata = matrix.get("metadata", defaults.get("metadata", {}))
-        if not isinstance(metadata, dict):
-            raise ManifestError(f"workload.cached_prefill[{matrix_index}].metadata must be an object")
-
-        cell_defaults = dict(defaults)
-        repeats_value = matrix.get("repeats", defaults.get("repeats"))
-        warmup_value = matrix.get("warmup_repeats", defaults.get("warmup_repeats"))
-        if repeats_value is None and not require_explicit_scalars:
-            repeats_value = 3
-        if warmup_value is None and not require_explicit_scalars:
-            warmup_value = 1
-        cell_defaults.update(
-            {
-                "kind": "cached_prefill",
-                "split": split,
-                "output_tokens": output_tokens,
-                "concurrency": matrix.get("concurrency", defaults.get("concurrency", 1)),
-                "warmup_repeats": warmup_value,
-                "repeats": repeats_value,
-                "ignore_eos": matrix.get("ignore_eos", defaults.get("ignore_eos", True)),
-                "arrival_pattern": matrix.get("arrival_pattern", defaults.get("arrival_pattern", "closed_loop")),
-                "request_rate": matrix.get("request_rate", defaults.get("request_rate")),
-                "sampling": matrix.get("sampling", defaults.get("sampling", {"temperature": 0.0, "top_p": 1.0})),
-            }
-        )
-        for prefix_tokens, new_tokens in product(prefix_axis, new_axis):
-            cell_metadata = dict(metadata)
-            cell_metadata["cached_prefill_matrix"] = {
-                "prefix_tokens": prefix_tokens,
-                "new_tokens": new_tokens,
-                "shared_prefix_identity": identity,
-            }
-            expanded.append(
-                _normalise_cell(
-                    {
-                        "name": f"{name_prefix}-prefix{prefix_tokens}-new{new_tokens}",
-                        "input_tokens": prefix_tokens + new_tokens,
-                        "prefix_tokens": prefix_tokens,
-                        "shared_prefix": {
-                            "identity": identity,
-                            "suffix_mode": suffix_mode,
-                        },
-                        "metadata": cell_metadata,
-                    },
-                    start_index + len(expanded),
-                    cell_defaults,
-                )
-            )
-    return expanded
-
-
-def _expand_matrices(workload: dict[str, Any], start_index: int = 0) -> list[dict[str, Any]]:
-    """Expand the explicit JSON matrix section into concrete workload cells."""
-
-    matrices = workload.get("matrices")
-    if not isinstance(matrices, dict) or not matrices:
-        raise ManifestError("workload.matrices must be a non-empty object")
-    supported = {"cold_prefill", "decode", "steady_decode", "cached_prefill", "mixed"}
-    unknown = set(matrices) - supported
-    if unknown:
-        raise ManifestError(f"workload.matrices contains unsupported kinds: {sorted(unknown)}")
-
-    expanded: list[dict[str, Any]] = []
-
-    def append_generated(raw_cells: list[dict[str, Any]], field: str) -> None:
-        for raw_cell in raw_cells:
-            try:
-                expanded.append(_normalise_cell(raw_cell, start_index + len(expanded), {}))
-            except ManifestError as exc:
-                raise ManifestError(f"invalid {field} matrix cell: {exc}") from exc
-
-    if "cold_prefill" in matrices:
-        try:
-            append_generated(cold_prefill_matrix(matrices["cold_prefill"]), "cold_prefill")
-        except MatrixError as exc:
-            raise ManifestError(str(exc)) from exc
-
-    if "decode" in matrices and "steady_decode" in matrices:
-        raise ManifestError("workload.matrices cannot define both decode and steady_decode")
-    decode_key = "steady_decode" if "steady_decode" in matrices else "decode" if "decode" in matrices else None
-    if decode_key is not None:
-        try:
-            append_generated(decode_matrix(matrices[decode_key]), decode_key)
-        except MatrixError as exc:
-            raise ManifestError(str(exc)) from exc
-
-    if "cached_prefill" in matrices:
-        append_generated(
-            _expand_cached_prefill(
-                {"cached_prefill": matrices["cached_prefill"]},
-                start_index + len(expanded),
-                require_explicit_scalars=True,
-            ),
-            "cached_prefill",
-        )
-
-    if "mixed" in matrices:
-        raw_mixed = matrices["mixed"]
-        if isinstance(raw_mixed, dict):
-            defaults = raw_mixed.get("defaults", {})
-            raw_cells = raw_mixed.get("cells")
-            if not isinstance(defaults, dict):
-                raise ManifestError("workload.matrices.mixed.defaults must be an object")
-        elif isinstance(raw_mixed, list):
-            defaults = {}
-            raw_cells = raw_mixed
-        else:
-            raise ManifestError("workload.matrices.mixed must be an object or a list")
-        if not isinstance(raw_cells, list) or not raw_cells:
-            raise ManifestError("workload.matrices.mixed.cells must be a non-empty list")
-        mixed_cells: list[dict[str, Any]] = []
-        for index, raw_cell in enumerate(raw_cells):
-            if not isinstance(raw_cell, dict):
-                raise ManifestError(f"workload.matrices.mixed.cells[{index}] must be an object")
-            cell = {**defaults, **raw_cell}
-            if cell.get("kind") != "mixed":
-                raise ManifestError(f"workload.matrices.mixed.cells[{index}].kind must be mixed")
-            mixed_cells.append(cell)
-        append_generated(mixed_cells, "mixed")
-
-    if not expanded:
-        raise ManifestError("workload.matrices must define at least one matrix")
-    return expanded
-
-
-def _expand_cells(workload: dict[str, Any]) -> list[dict[str, Any]]:
-    expanded: list[dict[str, Any]] = []
-    if "matrices" in workload:
-        extra = set(workload) - {"matrices"}
-        if extra:
-            raise ManifestError(
-                f"workload.matrices cannot be combined with other workload keys: {sorted(extra)}"
-            )
-        expanded.extend(_expand_matrices(workload))
-    elif "cells" in workload:
-        cells = workload["cells"]
-        if not isinstance(cells, list) or not cells:
-            raise ManifestError("workload.cells must be a non-empty list")
-        expanded.extend(_normalise_cell(cell, index, {}) for index, cell in enumerate(cells))
-    elif "dimensions" in workload:
-        dimensions = workload.get("dimensions")
-        if not isinstance(dimensions, dict) or not dimensions:
-            raise ManifestError("workload.dimensions must be a non-empty object")
-        defaults = workload.get("defaults", {})
-        if not isinstance(defaults, dict):
-            raise ManifestError("workload.defaults must be an object")
-        names = sorted(dimensions)
-        values: list[list[Any]] = []
-        for name in names:
-            options = dimensions[name]
-            if not isinstance(options, list) or not options:
-                raise ManifestError(f"workload.dimensions.{name} must be a non-empty list")
-            values.append(options)
-        for index, combination in enumerate(product(*values)):
-            cell = dict(zip(names, combination))
-            expanded.append(_normalise_cell(cell, index, defaults))
-    elif "cached_prefill" not in workload:
-        raise ManifestError("workload requires cells, dimensions, or cached_prefill")
-    if "cached_prefill" in workload:
-        expanded.extend(_expand_cached_prefill(workload, len(expanded)))
-    if not expanded:
-        raise ManifestError("workload must expand to at least one cell")
-    return expanded
-
-
-def _environment() -> dict[str, Any]:
-    """Capture stable, non-secret environment facts for provenance."""
-
-    commit = None
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL, timeout=5
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return {
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "machine": platform.machine(),
-        "git_revision": commit,
-        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "proxy_mode": "ambient_env_present"
-        if any(os.environ.get(name) for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"))
-        else "ambient_env_absent",
-    }
-
-
-def _split_assignments(cells: list[dict[str, Any]], raw: Any) -> dict[str, list[str]]:
-    by_name = {cell["name"]: cell for cell in cells}
-    assignments: dict[str, list[str]] = {split: [] for split in SPLITS}
-    if raw is None:
-        for cell in cells:
-            assignments[cell["split"]].append(cell["name"])
-        return assignments
-    if not isinstance(raw, dict):
-        raise ManifestError("splits must be an object")
-    seen: set[str] = set()
-    for split in SPLITS:
-        names = raw.get(split, [])
-        if not isinstance(names, list):
-            raise ManifestError(f"splits.{split} must be a list")
-        for name in names:
-            if not isinstance(name, str) or name not in by_name:
-                raise ManifestError(f"splits.{split} references unknown cell {name!r}")
-            if name in seen:
-                raise ManifestError(f"cell {name!r} appears in multiple splits")
-            seen.add(name)
-            assignments[split].append(name)
-    missing = set(by_name) - seen
-    if missing:
-        raise ManifestError(f"cells missing split assignment: {sorted(missing)}")
-    for split, names in assignments.items():
-        for name in names:
-            if by_name[name]["split"] != split:
-                raise ManifestError(f"cell {name!r} split disagrees with splits.{split}")
-    return assignments
-
-
-def _paired_variants(spec: dict[str, Any], target: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
-    supplied = spec["variants"]
-    if not isinstance(supplied, dict) or set(supplied) != {"zero_cost", "replay"}:
-        raise ManifestError("variants must contain exactly zero_cost and replay; target comes from target/runtime")
-    variants: dict[str, Any] = {"target": {"identity": target, "runtime": runtime}}
-    for name in ("zero_cost", "replay"):
-        value = supplied[name]
-        if not isinstance(value, dict) or not isinstance(value.get("identity"), dict):
-            raise ManifestError(f"variants.{name}.identity must be an object")
-        identity = dict(value["identity"])
-        for field in ("endpoint", "model", "engine", "engine_version", "model_revision", "model_config_sha256"):
-            _non_empty(identity.get(field), f"variants.{name}.identity.{field}")
-        identity["endpoint"] = identity["endpoint"].rstrip("/")
-        if identity["model_config_sha256"].lower() != target["model_config_sha256"].lower():
-            raise ManifestError(f"variants.{name} model config digest differs from target")
-        variant_runtime = value.get("runtime")
-        if not isinstance(variant_runtime, dict) or not variant_runtime:
-            raise ManifestError(f"variants.{name}.runtime must be a non-empty object")
-        server_flags = _validate_argv(value.get("server_flags", []), f"variants.{name}.server_flags")
-        if not server_flags:
-            raise ManifestError(f"variants.{name}.server_flags must be complete and non-empty")
-        _non_empty(value.get("profile_sha256"), f"variants.{name}.profile_sha256")
-        if not _SHA256.fullmatch(value["profile_sha256"]):
-            raise ManifestError(f"variants.{name}.profile_sha256 must be SHA-256")
-        variants[name] = {
-            "identity": identity,
-            "runtime": variant_runtime,
-            "server_flags": server_flags,
-            "profile_sha256": value["profile_sha256"],
-        }
-    variants["target"]["server_flags"] = spec["client"]["server_flags"]
-    return variants
-
-
-def build_manifest(spec: dict[str, Any], *, created_at: str | None = None) -> dict[str, Any]:
-    """Validate a campaign spec and return its immutable manifest document."""
-
-    if not isinstance(spec, dict):
-        raise ManifestError("campaign spec must be an object")
-    _validate_safe(spec)
-    target = spec.get("target")
-    runtime = spec.get("runtime", {})
-    client = spec.get("client")
-    provenance = spec.get("provenance", {})
-    if not isinstance(target, dict):
-        raise ManifestError("target must be an object")
-    if not isinstance(runtime, dict) or not isinstance(client, dict) or not isinstance(provenance, dict):
-        raise ManifestError("runtime, client, and provenance must be objects")
-    target = dict(target)
-    for field in ("endpoint", "model", "engine", "engine_version", "model_revision", "model_config_sha256"):
-        _non_empty(target.get(field), f"target.{field}")
-    target["endpoint"] = _non_empty(target["endpoint"], "target.endpoint").rstrip("/")
-    client = dict(client)
-    for field in ("name", "version", "revision"):
-        _non_empty(client.get(field), f"client.{field}")
-    client["argv"] = _validate_argv(client.get("argv", []), "client.argv")
-    client["server_flags"] = _validate_argv(client.get("server_flags", []), "client.server_flags")
-    cells = _expand_cells(spec.get("workload", {}))
-    names = [cell["name"] for cell in cells]
-    if len(names) != len(set(names)):
-        raise ManifestError("workload cell names must be unique")
-    splits = _split_assignments(cells, spec.get("splits"))
-    paired = "variants" in spec
-    if paired:
-        if not _SHA256.fullmatch(target["model_config_sha256"]):
-            raise ManifestError("paired target.model_config_sha256 must be SHA-256")
-        scheduler = runtime.get("scheduler")
-        if not isinstance(scheduler, dict):
-            raise ManifestError("paired runtime.scheduler must be an object")
-        max_model_len = _positive_int(scheduler.get("max_model_len"), "runtime.scheduler.max_model_len")
-        if not client["argv"] or not client["server_flags"]:
-            raise ManifestError("paired campaign requires complete client.argv and server_flags")
-        if isinstance(client.get("seed"), bool) or not isinstance(client.get("seed"), int):
-            raise ManifestError("paired campaign requires an integer client.seed")
-        if any(cell["kind"] == "cached_prefill" for cell in cells):
-            cache = runtime.get("cache")
-            if not isinstance(cache, dict) or cache.get("policy") != "on":
-                raise ManifestError("cached_prefill paired campaigns require runtime.cache.policy=on")
-        cache = runtime.get("cache")
-        if isinstance(cache, dict) and "endpoint_isolated" in cache and not isinstance(cache["endpoint_isolated"], bool):
-            raise ManifestError("runtime.cache.endpoint_isolated must be boolean when present")
-        for cell in cells:
-            if cell["repeats"] < 2:
-                raise ManifestError(f"paired cell {cell['name']!r} requires at least two repeats")
-            if cell["kind"] == "cold_prefill" and cell["concurrency"] != 1:
-                raise ManifestError(f"cold prefill cell {cell['name']!r} requires concurrency=1")
-            if cell["kind"] == "cached_prefill" and cell["concurrency"] != 1:
-                raise ManifestError(f"cached prefill cell {cell['name']!r} requires concurrency=1")
-            if cell["kind"] == "steady_decode" and cell["output_tokens"] < 2:
-                raise ManifestError(f"steady decode cell {cell['name']!r} requires at least two output tokens")
-            if cell["input_tokens"] + cell["output_tokens"] > max_model_len:
-                raise ManifestError(f"cell {cell['name']!r} exceeds target scheduler.max_model_len")
-    for field in ("collector_revision", "collection_command", "artifact_uri", "source_digest"):
-        _non_empty(provenance.get(field), f"provenance.{field}")
-    environment = spec.get("environment", _environment())
-    if not isinstance(environment, dict):
-        raise ManifestError("environment must be an object")
-    environment = {key: _redact_string(value) if isinstance(value, str) else value for key, value in environment.items()}
-    workload_document: dict[str, Any] = {
-        "cells": cells,
-        "cell_count": len(cells),
-    }
-    if "matrices" in spec.get("workload", {}):
-        workload_document["matrix_spec"] = _canonical_matrix_spec(spec["workload"]["matrices"])
-    base = {
-        "schema_version": (
-            CACHED_PAIRED_SCHEMA_VERSION
-            if paired and any(cell["kind"] == "cached_prefill" for cell in cells)
-            else PAIRED_SCHEMA_VERSION
-            if paired
-            else SCHEMA_VERSION
-        ),
-        "target": target,
-        "runtime": runtime,
-        "client": client,
-        "workload": workload_document,
-        "splits": splits,
-        "provenance": provenance,
-        "environment": environment,
-    }
-    if paired:
-        base["variants"] = _paired_variants(spec, target, runtime)
-        base["pairing"] = {
-            "variant_order": list(PAIRED_VARIANTS),
-            "request_key": ["cell_id", "phase", "repeat", "index"],
-            "percentile_subtraction": "prohibited",
-        }
-    campaign_id = sha256_json(base)
-    stamped_cells = []
-    for cell in cells:
-        cell_id = sha256_json({"campaign_id": campaign_id, "cell": cell})
-        stamped_cells.append({"cell_id": cell_id, **cell})
-    base["workload"]["cells"] = stamped_cells
-    base["campaign_id"] = campaign_id
-    base["created_at_utc"] = created_at or datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    return base
-
-
 def load_spec(path: Path) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as handle:
@@ -857,22 +305,214 @@ def load_spec(path: Path) -> dict[str, Any]:
     return document
 
 
-def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    """Write a manifest, allowing only an identical existing document."""
+def _merge_configuration(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_configuration(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
 
-    rendered = json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        try:
-            existing = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ManifestError(f"failed to read existing manifest {path}: {exc}") from exc
-        if existing != rendered:
-            raise ManifestError(f"refusing to overwrite a different manifest: {path}")
-        return
-    temporary = path.with_name(f".{path.name}.tmp")
+
+def _fields(value: Any, allowed: set[str], field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ManifestError(f"{field} must be an object")
+    unknown = set(value) - allowed
+    if unknown:
+        raise ManifestError(f"{field} contains unknown fields: {sorted(unknown)}")
+    return value
+
+
+def canonical_sampling_configuration(value: Any, field: str) -> dict[str, Any]:
+    """Validate and normalize sampling on cells, plans and logical requests."""
+    sampling = _fields(value, {"temperature", "top_p", "top_k", "ignore_eos"}, field)
+    temperature = number(sampling.get("temperature"), "sampling.temperature")
+    top_p = number(sampling.get("top_p"), "sampling.top_p")
+    if not 0 < top_p <= 1:
+        raise ManifestError("sampling.top_p must be in (0,1]")
+    if "top_k" in sampling:
+        integer(sampling["top_k"], "sampling.top_k", positive=True)
+    if not isinstance(sampling.get("ignore_eos"), bool):
+        raise ManifestError("sampling.ignore_eos must be boolean")
+    return {**sampling, "temperature": temperature, "top_p": top_p}
+
+
+def canonical_execution_configuration(value: dict[str, Any], field: str) -> dict[str, Any]:
+    """Validate generation, sampling and timing shared by campaign and plan."""
+    integer(value.get("seed"), f"{field}.seed", maximum=2**32 - 1)
+    sampling = canonical_sampling_configuration(value.get("sampling"), f"{field}.sampling")
+    generation = _fields(value.get("generation"), {"dataset", "shuffle", "prompt_representation", "seed_policy"}, f"{field}.generation")
+    if generation.get("dataset") not in ("random", "prefix_repetition"):
+        raise ManifestError("generation.dataset must be random or prefix_repetition")
+    if generation.get("shuffle") is not False:
+        raise ManifestError("generation.shuffle must be false for fixed-batch calibration")
+    if generation.get("prompt_representation") not in ("token_ids", "text"):
+        raise ManifestError("generation.prompt_representation must be token_ids or text")
+    if generation.get("seed_policy") != "phase_repeat":
+        raise ManifestError("generation.seed_policy must be phase_repeat")
+    timing = _fields(value.get("timing"), {"clock", "first_token", "last_token"}, f"{field}.timing")
+    if timing != {"clock": "monotonic", "first_token": "first_generated_content_event", "last_token": "last_generated_content_event"}:
+        raise ManifestError("timing must use monotonic generated-content event timestamps")
+    normalized = copy.deepcopy(value)
+    normalized["sampling"] = sampling
+    return normalized
+
+
+def _matrix_configuration(name: str, matrix: Any, defaults: dict[str, Any]) -> dict[str, Any]:
+    """Resolve common experiment configuration before expanding workload axes."""
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise ManifestError("matrix names must be safe non-empty identifiers")
+    common_fields = {"kind", "split", "concurrency", "output_tokens", "warmup_repeats", "repeats", "seed", "sampling", "generation", "timing", "arrival", "cache_lifecycle", "metadata"}
+    kind_fields = {
+        "cold_prefill": {"input_tokens", "required_input_tokens"},
+        "steady_decode": {"context_tokens", "surface_requests", "surface_kv_tokens", "steady_state"},
+        "cached_prefill": {"prefix_tokens", "new_tokens", "shared_prefix"},
+    }
+    if not isinstance(matrix, dict) or not isinstance(matrix.get("kind"), str) or matrix["kind"] not in kind_fields:
+        raise ManifestError(f"matrix {name}.kind must be cold_prefill, steady_decode or cached_prefill")
+    _fields(matrix, common_fields | kind_fields[matrix["kind"]], f"matrix {name}")
+    if "metadata" in matrix and not isinstance(matrix["metadata"], dict):
+        raise ManifestError(f"matrix {name}.metadata must be an object")
+    if matrix.get("split") not in SPLITS:
+        raise ManifestError(f"matrix {name}.split is required and must be a known split")
+    if matrix.get("arrival") != {"mode": "fixed_batch"}:
+        raise ManifestError(f"matrix {name}.arrival must explicitly declare fixed_batch")
+    for field in ("output_tokens", "repeats"):
+        integer(matrix.get(field), f"matrix {name}.{field}", positive=True, maximum=2**32-1)
+    integer(matrix.get("warmup_repeats"), f"matrix {name}.warmup_repeats", maximum=2**32-1)
+    execution = canonical_execution_configuration(_merge_configuration(defaults, {k: matrix[k] for k in defaults if k in matrix}), f"matrix {name}")
+    lifecycle = matrix.get("cache_lifecycle")
+    if lifecycle is not None:
+        _fields(lifecycle, {"namespace", "reset_before", "bootstrap_repeats"}, "cache_lifecycle")
+        text(lifecycle.get("namespace"), "cache_lifecycle.namespace")
+        if lifecycle.get("reset_before") not in ("cell", "repeat"):
+            raise ManifestError("cache_lifecycle.reset_before must be cell or repeat")
+        integer(lifecycle.get("bootstrap_repeats"), "bootstrap_repeats", maximum=2**32-1)
+    return {**matrix, **execution}
+
+
+def _finalize_cell(cell: dict[str, Any], variants: dict[str, Any], assets: dict[str, Any]) -> dict[str, Any]:
+    """Validate shared request limits and freeze the compiled cell identity."""
+    for field in ("input_tokens", "output_tokens", "concurrency"):
+        integer(cell[field], field, positive=True, maximum=2**32-1)
+    for variant in variants.values():
+        if cell["input_tokens"] + cell["output_tokens"] > variant["runtime"]["scheduler"]["max_model_len"]:
+            raise ManifestError(f"cell {cell['name']} exceeds a variant context ceiling")
+    cell = {**cell, "fit_policy": {"train": cell["split"] == "train", "excluded_metrics": ["ttft_ms"] if cell["concurrency"] > 1 else []}}
+    cell["cell_id"] = sha256_json({"schema_version": COMPILED_CAMPAIGN_SCHEMA_VERSION, "client_assets": assets, "cell": cell})
+    return cell
+
+
+def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, Any]:
+    """Compile the new input contract; historical manifest consumers stay separate."""
     try:
-        temporary.write_text(rendered, encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        _fields(spec, {"kind", "schema_version", "client", "variants", "workload", "output"}, "campaign spec")
+        version = spec.get("schema_version", CAMPAIGN_SPEC_SCHEMA_VERSION)
+        if spec.get("kind", "campaign_spec") != "campaign_spec" or type(version) is not int or version != CAMPAIGN_SPEC_SCHEMA_VERSION:
+            raise ManifestError("unsupported campaign spec kind/schema_version")
+        output = _fields(spec.get("output"), {"artifact_root"}, "output")
+        text(output.get("artifact_root"), "output.artifact_root")
+        client = _fields(spec.get("client"), {"name", "version", "binary", "tokenizer", "seed", "sampling", "generation", "timing"}, "client")
+        for field in ("name", "version", "binary", "tokenizer"):
+            text(client.get(field), f"client.{field}")
+        defaults = canonical_execution_configuration({key: client.get(key) for key in ("seed", "sampling", "generation", "timing")}, "client")
+        client = {**client, **defaults}
+        supplied = _fields(spec.get("variants"), {"target", "zero_cost", "sim"}, "variants")
+        if set(supplied) != {"target", "zero_cost", "sim"}:
+            raise ManifestError("variants must contain target, zero_cost and sim")
+        variants: dict[str, Any] = {}
+        target_runtime = supplied["target"].get("runtime") if isinstance(supplied["target"], dict) else None
+        if not isinstance(target_runtime, dict):
+            raise ManifestError("variants.target.runtime must be an object")
+        for name in ("target", "zero_cost", "sim"):
+            raw = _fields(supplied[name], {"identity", "runtime", "server_flags", "profile_path"}, f"variants.{name}")
+            identity = copy.deepcopy(_fields(raw.get("identity"), {"endpoint", "model", "engine", "engine_version", "model_revision", "model_config_sha256"}, f"variants.{name}.identity"))
+            for field in ("endpoint", "model", "engine", "engine_version", "model_revision"):
+                text(identity.get(field), f"variants.{name}.identity.{field}")
+            endpoint = urlsplit(identity["endpoint"])
+            if endpoint.scheme not in ("http", "https") or not endpoint.netloc or endpoint.username or endpoint.password:
+                raise ManifestError(f"variants.{name}.identity.endpoint must be an HTTP URL without credentials")
+            identity["endpoint"] = identity["endpoint"].rstrip("/")
+            digest(identity.get("model_config_sha256"), f"variants.{name}.model_config_sha256")
+            raw_runtime = _fields(raw.get("runtime"), {"gpu", "backend", "driver", "cuda", "parallelism", "quantization", "scheduler", "cache"}, f"variants.{name}.runtime")
+            runtime = _merge_configuration(target_runtime, raw_runtime)
+            runtime["backend"] = raw_runtime.get("backend", identity["engine"])
+            for field in ("gpu", "backend", "driver", "cuda", "parallelism", "quantization"):
+                if field in runtime:
+                    text(runtime[field], f"variants.{name}.runtime.{field}")
+            scheduler = canonical_scheduler_identity(runtime.get("scheduler"))
+            for field in ("max_num_seqs", "max_num_batched_tokens", "max_model_len"):
+                integer(scheduler[field], f"scheduler.{field}", positive=True, maximum=2**32-1)
+            if scheduler["policy"] != "vllm_v1" or scheduler["max_num_seqs"] > scheduler["max_num_batched_tokens"]:
+                raise ManifestError("scheduler requires vllm_v1 and max_num_seqs <= max_num_batched_tokens")
+            runtime["scheduler"] = scheduler
+            cache = canonical_cache_identity(runtime.get("cache"))
+            if cache["policy"] not in ("on", "off") or (cache["enabled"] and (cache["block_size"] == 0 or cache["alignment"] == 0)):
+                raise ManifestError("cache policy must be on/off with positive enabled block size/alignment")
+            flags = raw.get("server_flags")
+            if not isinstance(flags, list) or any(not isinstance(flag, str) or not flag for flag in flags):
+                raise ManifestError(f"variants.{name}.server_flags must be an array of non-empty strings")
+            if any(flag == "--profile" or flag.startswith("--profile=") for flag in flags):
+                raise ManifestError("declare profile_path instead of duplicating --profile in server_flags")
+            if name == "target" and "profile_path" in raw:
+                raise ManifestError("target cannot declare a simulator profile_path")
+            variants[name] = {"identity": identity, "runtime": runtime, "server_flags": list(flags)}
+            if "profile_path" in raw:
+                variants[name]["profile_path"] = text(raw["profile_path"], f"variants.{name}.profile_path")
+        if variants["zero_cost"]["runtime"]["scheduler"] != variants["sim"]["runtime"]["scheduler"] or canonical_cache_identity(variants["zero_cost"]["runtime"].get("cache")) != canonical_cache_identity(variants["sim"]["runtime"].get("cache")):
+            raise ManifestError("zero_cost and sim must have identical scheduler/cache configuration")
+        if any(v["identity"]["model_config_sha256"] != variants["target"]["identity"]["model_config_sha256"] for v in variants.values()):
+            raise ManifestError("variant model config digests differ")
+        workload = _fields(spec.get("workload"), {"matrices"}, "workload")
+        matrices = workload.get("matrices")
+        if not isinstance(matrices, dict) or not matrices:
+            raise ManifestError("workload.matrices must be a non-empty named object")
+        cells = []
+        for name in sorted(matrices):
+            matrix = _matrix_configuration(name, matrices[name], defaults)
+            if matrix["kind"] != "steady_decode":
+                integer(matrix.get("concurrency"), f"matrix {name}.concurrency", positive=True)
+            if "steady_state" in matrix and not isinstance(matrix["steady_state"], dict):
+                raise ManifestError(f"matrix {name}.steady_state must be an object")
+            if matrix.get("kind") == "cached_prefill":
+                if matrix["generation"]["dataset"] != "prefix_repetition":
+                    raise ManifestError("cached_prefill requires prefix_repetition generation")
+                prefix = _fields(matrix.get("shared_prefix"), {"identity", "suffix_mode"}, "shared_prefix")
+                text(prefix.get("identity"), "shared_prefix.identity")
+                if prefix.get("suffix_mode") != "request_index":
+                    raise ManifestError("shared_prefix.suffix_mode must be request_index")
+            elif matrix["generation"]["dataset"] != "random":
+                raise ManifestError("cold/decode require random generation")
+            lifecycle = matrix.get("cache_lifecycle")
+            if lifecycle is not None and matrix["kind"] != "cached_prefill" and lifecycle["bootstrap_repeats"]:
+                raise ManifestError("bootstrap is only supported for cached_prefill")
+            if matrix.get("kind") == "cached_prefill" and (lifecycle is None or not lifecycle["bootstrap_repeats"]):
+                raise ManifestError("cached_prefill requires an explicit bootstrap lifecycle")
+            for cell in _matrix_cells(name, matrix):
+                if cell["kind"] == "cached_prefill":
+                    for variant in variants.values():
+                        cache = canonical_cache_identity(variant["runtime"].get("cache"))
+                        if not cache["enabled"] or cell["prefix_tokens"] % cache["alignment"]:
+                            raise ManifestError("cached prefix must align to every enabled variant cache")
+                if cell["kind"] == "steady_decode" and cell["split"] == "train" and any(cell["concurrency"] > v["runtime"]["scheduler"]["max_num_seqs"] for v in variants.values()):
+                    raise ManifestError("decode train concurrency exceeds scheduler capacity")
+                cells.append(_finalize_cell(cell, variants, assets))
+        # Output locations and profile bindings are storage metadata, not workload identity.
+        variant_identity = {name: {k: v for k, v in value.items() if k != "profile_path"} for name, value in variants.items()}
+        client_identity = {key: value for key, value in client.items() if key not in ("binary", "tokenizer")}
+        identity = {"kind": "campaign_spec", "schema_version": CAMPAIGN_SPEC_SCHEMA_VERSION, "client": {**client_identity, **assets}, "variants": variant_identity, "workload": {"cells": cells}}
+        campaign_id = sha256_json(identity)
+        splits = {split: [cell["cell_id"] for cell in cells if cell["split"] == split] for split in SPLITS}
+        return {
+            "kind": "compiled_campaign", "schema_version": COMPILED_CAMPAIGN_SCHEMA_VERSION,
+            "campaign_id": campaign_id, "source_digest": campaign_id,
+            "client": {**copy.deepcopy(client), **assets}, "variants": variants,
+            "workload": {"cells": cells, "cell_count": len(cells)}, "splits": splits,
+            "required_scope": {"cells": [cell["cell_id"] for cell in cells], "sha256": sha256_json(splits)},
+            "measurement_contract": measurement_contract(),
+        }
+    except (MeasurementError, ValueError, TypeError) as exc:
+        if isinstance(exc, ManifestError):
+            raise
+        raise ManifestError(str(exc)) from exc
