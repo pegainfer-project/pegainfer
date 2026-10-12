@@ -5,7 +5,10 @@
 //! - **A partial download is the normal case here.** The frozen revision is 360 GB
 //!   across 131 shards, so verification runs against whichever shards were
 //!   fetched. A scan therefore reports the shards it never opened, and `check`
-//!   refuses to call an unopened shard's tensors "missing".
+//!   refuses to call an unopened shard's tensors "missing". A shard the index names
+//!   that is on disk but is **not a regular file** is a different thing again — not
+//!   "not downloaded" but its own named fault, so a download tool that left a
+//!   directory behind cannot pass as an incomplete fetch.
 //! - **The index can disagree with the shards.** `model.safetensors.index.json`
 //!   is generated, so a re-sharded or truncated checkpoint leaves it stale. Each
 //!   opened shard's header is compared against the names the index attributes to
@@ -53,6 +56,9 @@ pub(crate) struct CheckpointScan {
     pub(crate) present_shards: Vec<String>,
     /// Shards the index names that are not on disk.
     pub(crate) absent_shards: Vec<String>,
+    /// Shards the index names that are on disk but are not regular files — a
+    /// directory, or anything else a loader cannot open as a shard.
+    pub(crate) unreadable_shards: Vec<String>,
     /// `*.safetensors` files on disk that the index does not name.
     pub(crate) stray_shards: Vec<String>,
     /// Opened shards whose header and the index disagree about their contents.
@@ -66,6 +72,7 @@ impl CheckpointScan {
         let mut scan = Self {
             present_shards: Vec::new(),
             absent_shards: Vec::new(),
+            unreadable_shards: Vec::new(),
             stray_shards: stray_shards(dir, &index)?,
             index_disagreement: Vec::new(),
             tensors: Vec::new(),
@@ -73,7 +80,14 @@ impl CheckpointScan {
         for (shard, indexed) in &index {
             let path = dir.join(shard);
             if !path.is_file() {
-                scan.absent_shards.push(shard.clone());
+                // "Not downloaded" and "present but not a shard" are different
+                // problems: the first is ordinary on a partial fetch, the second is
+                // a fault the fetch cannot excuse.
+                if path.exists() {
+                    scan.unreadable_shards.push(shard.clone());
+                } else {
+                    scan.absent_shards.push(shard.clone());
+                }
                 continue;
             }
             scan.present_shards.push(shard.clone());
@@ -125,7 +139,9 @@ impl CheckpointScan {
     /// shards it never saw.
     pub(crate) fn check(&self, manifest: &Manifest) -> Result<()> {
         let mut report = self.report(manifest);
-        if !self.absent_shards.is_empty() {
+        // A shard we could not open is one we cannot testify about, so its tensors
+        // are not "missing" either — the unreadable class below carries the news.
+        if !self.absent_shards.is_empty() || !self.unreadable_shards.is_empty() {
             report.forget_missing();
         }
         report.check_with(&[
@@ -134,6 +150,10 @@ impl CheckpointScan {
                 self.index_disagreement.clone(),
             ),
             ("shard not named by the index", self.stray_shards.clone()),
+            (
+                "shard the index names is not a regular file",
+                self.unreadable_shards.clone(),
+            ),
         ])
     }
 }
@@ -495,6 +515,28 @@ mod tests {
         assert!(err.contains(&stray), "{err}");
     }
 
+    /// An indexed path that exists but is not a regular file is not "not
+    /// downloaded": excusing it would let a download tool that left a directory (or
+    /// any other non-file) behind pass as an ordinary partial fetch.
+    #[test]
+    fn an_indexed_shard_that_is_not_a_regular_file_is_refused() {
+        let (dir, manifest, total) = faithful_checkpoint(3);
+        let shard = shard_name(1, total);
+        let path = dir.path().join(&shard);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let scan = CheckpointScan::read(dir.path()).unwrap();
+        assert_eq!(scan.absent_shards, Vec::<String>::new());
+        assert_eq!(scan.unreadable_shards, vec![shard.clone()]);
+        let err = scan.check(&manifest).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(err.contains(&shard), "{err}");
+        // A shard we cannot open is one we cannot testify about, so its tensors are
+        // named as unreadable rather than as a wall of "missing".
+        assert!(!err.contains("missing required text tensor"), "{err}");
+    }
+
     #[test]
     fn a_truncated_shard_is_refused_before_any_weight_is_read() {
         let (dir, manifest, total) = faithful_checkpoint(3);
@@ -617,7 +659,7 @@ mod tests {
             "opened {} of {} indexed shard(s): {} tensor(s) checked, {} required text tensors, {} \
              skipped optional; shards: {}",
             scan.present_shards.len(),
-            scan.present_shards.len() + scan.absent_shards.len(),
+            scan.present_shards.len() + scan.absent_shards.len() + scan.unreadable_shards.len(),
             scan.tensors().len(),
             scan.tensors().len() - report.skipped_optional.len(),
             report.skipped_optional.len(),

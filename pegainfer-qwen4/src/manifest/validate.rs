@@ -518,7 +518,7 @@ mod tests {
         let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH")
             .expect("PEGAINFER_TEST_MODEL_PATH must point at a checkpoint directory");
         let raw = std::fs::read_to_string(
-            std::path::Path::new(&dir).join("model.safetensors.index.json"),
+            std::path::Path::new(&dir).join(crate::manifest::read::INDEX_FILE),
         )
         .expect("checkpoint directory has no model.safetensors.index.json");
         let index: serde_json::Value = serde_json::from_str(&raw).unwrap();
