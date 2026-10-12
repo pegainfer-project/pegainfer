@@ -144,14 +144,13 @@ impl Config {
         self.text.hidden_size
     }
 
-    /// Width of the hyper-connection residual stream: every sublayer reads and
-    /// writes this, not `hidden_size`.
+    /// Width of the hyper-connection residual stream — what every sublayer reads and
+    /// writes, not `hidden_size`.
     pub(crate) fn hc_hidden_size(&self) -> usize {
         self.text.hc_count * self.text.hidden_size
     }
 
-    /// Gated DeltaNet conv channels: `key_dim * 2 + value_dim`, the fused Q|K|V
-    /// projection width.
+    /// Gated DeltaNet conv channels: `key_dim * 2 + value_dim` (the fused Q|K|V width).
     pub(crate) fn gdn_conv_dim(&self) -> usize {
         self.gdn_key_dim() * 2 + self.gdn_value_dim()
     }
@@ -524,8 +523,8 @@ impl NgramTable {
         })
     }
 
-    /// Stored bytes of the table at BF16. This is the host-resident tier's size,
-    /// and the number the ecosystem's ~51 GB quote halves by assuming fp8.
+    /// Stored bytes of the table at BF16 — the host-resident tier's size, and the number
+    /// the ecosystem's ~51 GB quote halves by assuming fp8.
     #[cfg_attr(
         not(test),
         allow(
@@ -921,18 +920,13 @@ mod tests {
         assert!(err.contains("ple_embed_dim"), "{err}");
     }
 
-    /// The test above checks the derivation against constants transcribed from the
-    /// checkpoint, so a bad transcription and a bad derivation would agree with
-    /// each other. This closes that loop by reading the two integer vectors the
-    /// checkpoint actually stores and comparing them element for element: they
-    /// *are* the partition, so a wrong prime base, head count or padding rule
-    /// cannot survive it.
+    /// `the_ngram_table_derivation_matches_the_checkpoint` compares the derivation with
+    /// constants transcribed from the checkpoint, so a bad transcription and a bad
+    /// derivation would agree. This reads the two integer vectors the checkpoint stores
+    /// and compares them element for element, which closes that loop.
     ///
-    /// Ignored because it reads tensor **values** rather than headers, and so
-    /// needs a real shard on disk. Point `PEGAINFER_TEST_MODEL_PATH` at a
-    /// directory holding `model.safetensors.index.json` plus whichever shard
-    /// carries the vectors — shard 37 of 131 at the frozen revision, which the
-    /// index is asked for rather than hardcoded.
+    /// Ignored: it reads tensor **values**, not headers, so it needs a real shard. Point
+    /// `PEGAINFER_TEST_MODEL_PATH` at a checkpoint directory.
     #[test]
     #[ignore = "needs a real Qwen3.8-Flash-Next shard holding the n-gram index vectors"]
     fn the_ngram_partition_equals_the_stored_integer_vectors() {

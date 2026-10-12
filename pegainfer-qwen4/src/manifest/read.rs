@@ -1,26 +1,14 @@
 //! Turning a checkpoint directory into the vocabulary [`super::validate`] classifies.
 //!
-//! Two things a whole-checkpoint loader does not have to cope with, but this does:
+//! Two things a whole-checkpoint loader does not have to cope with, but this does: a
+//! **partial download**, so the scan reports the shards it never opened and `check`
+//! refuses to call their tensors "missing" (a shard that is on disk but not a regular
+//! file is a named fault, not an absent one); and a **stale `index.json`**, so each
+//! opened shard's header is checked against the names the index attributes to it.
 //!
-//! - **A partial download is the normal case here.** The frozen revision is 360 GB
-//!   across 131 shards, so verification runs against whichever shards were
-//!   fetched. A scan therefore reports the shards it never opened, and `check`
-//!   refuses to call an unopened shard's tensors "missing". A shard the index names
-//!   that is on disk but is **not a regular file** is a different thing again — not
-//!   "not downloaded" but its own named fault, so a download tool that left a
-//!   directory behind cannot pass as an incomplete fetch.
-//! - **The index can disagree with the shards.** `model.safetensors.index.json`
-//!   is generated, so a re-sharded or truncated checkpoint leaves it stale. Each
-//!   opened shard's header is compared against the names the index attributes to
-//!   it, which turns a stale index into a named fault instead of a misleading
-//!   wall of "missing".
-//!
-//! Headers are read through mmap + `SafeTensors::deserialize`, the path every
-//! weights loader in this repo takes. That is not just consistency: `deserialize`
-//! validates that the data offsets are contiguous and end exactly at the file's
-//! end, so a truncated shard is rejected here rather than halfway through a
-//! device copy, and no page of weight data is faulted in while only headers are
-//! wanted.
+//! Headers go through mmap + `SafeTensors::deserialize`, the path every loader here
+//! takes: `deserialize` also rejects a truncated shard before any weight is read, and
+//! no weight page is faulted in while only headers are wanted.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -39,8 +27,8 @@ use super::validate::ObservedTensor;
 
 pub(crate) const INDEX_FILE: &str = "model.safetensors.index.json";
 const SHARD_SUFFIX: &str = ".safetensors";
-/// A fault names its first few entries: a stale index can be wrong about a
-/// thousand tensors at once and the first few are enough to diagnose it.
+/// A stale index can be wrong about a thousand tensors at once, so a fault names only
+/// its first few entries.
 const NAMED_ENTRIES: usize = 3;
 
 /// One tensor as its shard's header states it.
@@ -80,9 +68,8 @@ impl CheckpointScan {
         for (shard, indexed) in &index {
             let path = dir.join(shard);
             if !path.is_file() {
-                // "Not downloaded" and "present but not a shard" are different
-                // problems: the first is ordinary on a partial fetch, the second is
-                // a fault the fetch cannot excuse.
+                // "Not downloaded" and "on disk but not a shard" are different problems:
+                // the first is ordinary on a partial fetch, the second is a fault.
                 if path.exists() {
                     scan.unreadable_shards.push(shard.clone());
                 } else {
@@ -236,12 +223,10 @@ mod tests {
     use crate::manifest::dtype_size;
     use crate::manifest::schema::ExpectedShape;
 
-    /// The reader is contract-agnostic, so these tests run it against a config
-    /// shrunk to the point where a whole checkpoint fits in a temp dir. The
-    /// frozen revision's own shards run 800 MB to 3 GB and its n-gram table alone
-    /// is 102 GB, so a faithful fixture of it could not be written at all. The
-    /// real shards are covered by
-    /// `the_derived_contract_holds_against_the_real_shards` below.
+    /// The reader is contract-agnostic, so these tests shrink the config until a whole
+    /// checkpoint fits in a temp dir: the frozen revision's shards run 800 MB to 3 GB and its
+    /// n-gram table alone is 102 GB, so no faithful fixture of it could be written. The real
+    /// shards are covered by `the_derived_contract_holds_against_the_real_shards`.
     fn small_config() -> serde_json::Value {
         let mut json: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/frozen_config.json")).unwrap();
@@ -630,11 +615,9 @@ mod tests {
         assert!(PathBuf::from(INDEX_FILE).is_relative());
     }
 
-    /// Runs against a real checkpoint directory: `PEGAINFER_TEST_MODEL_PATH`
-    /// pointing at one that carries `model.safetensors.index.json` and at least
-    /// one shard. A partial directory is accepted — that is the point of the scan
-    /// — but every shard it does open has to agree with the derived contract on
-    /// names, shapes and dtypes, and with the index about its own contents.
+    /// Runs against a real checkpoint directory (`PEGAINFER_TEST_MODEL_PATH`): a partial
+    /// directory is accepted, but every shard it opens must agree with the derived
+    /// contract on names, shapes and dtypes, and with the index about its own contents.
     #[test]
     #[ignore = "needs real Qwen3.8-Flash-Next shards on disk"]
     fn the_derived_contract_holds_against_the_real_shards() {
@@ -649,11 +632,8 @@ mod tests {
         );
         scan.check(&manifest)
             .unwrap_or_else(|e| panic!("real shards disagree with the derived contract: {e:#}"));
-        // #1104 asks that a proof record which shards it used, so a reader knows
-        // whether the gate ever saw the whole checkpoint. Name them rather than
-        // just counting: "3 of 131" does not say which three. The required/skipped
-        // split is printed too, so the "446 opened / 111 required" figure the
-        // bring-up doc quotes is this gate's own output, not a side count.
+        // #1104 asks that a proof record which shards it used, so a reader knows the
+        // gate never saw the whole checkpoint. Name them rather than just counting.
         let report = scan.report(&manifest);
         eprintln!(
             "opened {} of {} indexed shard(s): {} tensor(s) checked, {} required text tensors, {} \

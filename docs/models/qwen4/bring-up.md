@@ -183,21 +183,9 @@ would agree with each other.
 
 ## Verified against real shards
 
-The manifest is not only self-consistent: it has been held against real bytes. Eight
-shards (14.4 GB of the 360 GB) were downloaded and every one sha256-checked against the
-repo's LFS oid before use — **shards 1, 5, 37, 80, 81, 82, 130, 131**, chosen for what
-they prove rather than at random:
-
-| Shard | Why |
-| --- | --- |
-| 1 | All 333 `model.visual.*` tensors, so the skip set is exercised; plus layer 0's nine GDN tensors and its MoE |
-| 5, 37 | The whole PLE block: the dilated `conv1d.weight`, `key_proj`/`value_proj`, the three `norm_*` vectors, both `I64[16]` partition vectors, and two real `[2500012, 160]` n-gram shards |
-| 80, 81, 82 | Layer 3, the first `full_attention` layer — QSA and its indexer |
-| 130, 131 | The untied bookend |
-
-Result: **446 tensors opened, 111 of them required text tensors, every shape and dtype
-equal to the config-derived contract**, across 7 distinct layers (0, 1, 3, 9, 10, 29, 30)
-and both layer families. Two things worth keeping:
+The manifest is not only self-consistent: it has been exercised against real shards of the
+frozen revision, and every opened tensor matched the derived shape and dtype. Two things
+worth keeping:
 
 - **The indexer geometry is confirmed**: `index_qk_proj.weight [640, 2560]` is
   (4 q + 1 kv) × 128 fused, with `q_layernorm`/`k_layernorm` at `[128]`. `q_proj
@@ -208,10 +196,8 @@ and both layer families. Two things worth keeping:
   is a runtime cache-size derivation, so no header check can confirm it — it stays a
   read-the-reference item for #1105.
 
-The reader prints the shard list it opened and the required/skipped split of what it
-checked (the ignored gate's own output is where the 446/111 figure above comes from),
-because #1104 asks that a proof record which shards it used: this gate has **never** seen
-the whole checkpoint.
+The ignored gate prints the shard list it opened, so a run records which shards the proof
+used: it has never seen the whole checkpoint.
 
 ## Traps
 
@@ -231,9 +217,10 @@ the whole checkpoint.
   in-tree `conv1d.cu` is non-dilated and caps its state at four taps, so it cannot serve
   this.
 - **GQA group 12 is not a compiled decode group.** `SUPPORTED_GQA_GROUP_SIZES` is
-  `[1, 2, 3, 4, 8]`, so `decode_group_is_compiled()` is false here and captured-graph
-  decode is off the table — the same corner Qwen3.5-27B is in at group 6. Slice B should
-  plan for permanent eager decode rather than discover it.
+  `[1, 2, 3, 4, 6, 8]`, so `decode_group_is_compiled()` is false here and captured-graph
+  decode is off the table. The set grows only when a group earns a compiled kernel
+  (#1145 added 6); 12 has not. Slice B should plan for permanent eager decode rather than
+  discover it.
 - **Do not use `load_shard_info_fixed`.** It is a Qwen3.5-specific shard-*filename*
   workaround living in shared `pegainfer-core`; this checkpoint uses standard
   `model-0000N-of-00131` naming and wants the plain loader.

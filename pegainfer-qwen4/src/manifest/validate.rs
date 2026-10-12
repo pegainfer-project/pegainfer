@@ -1,21 +1,17 @@
 //! The contract held up against what a checkpoint carries.
 //!
-//! Lifted nearly verbatim from `pegainfer-gemma4/src/manifest/validate.rs`; only
-//! the skip prefixes and the fault message name this line. The classifier is the
-//! part worth not rewriting: one pass over every header in every shard, all
-//! faults aggregated into a single report, and skipped-optional tensors counted
-//! rather than faulted.
+//! Lifted nearly verbatim from `pegainfer-gemma4/src/manifest/validate.rs`; only the skip
+//! prefixes and the fault message name this line. One pass over every header, all faults
+//! aggregated into one report, and skipped-optional tensors counted rather than faulted.
 
 use anyhow::Result;
 use safetensors::Dtype;
 
 use super::schema::Manifest;
 
-/// Tensors this text-only line deliberately does not load. Skipping is mandatory
-/// rather than optional here: the vision blocks are interleaved into the same
-/// shards as the text layers, so a loader that reads whole shards must classify
-/// per tensor. `no_skip_prefix_can_shadow_a_text_tensor` is what keeps this list
-/// from ever hiding a required tensor.
+/// Tensors this text-only line deliberately does not load. Skipping is mandatory: the
+/// vision blocks share shards with the text layers, so a whole-shard loader must classify
+/// per tensor.
 const SKIPPED_OPTIONAL_PREFIXES: &[&str] = &["model.visual.", "mtp."];
 
 pub(crate) struct ObservedTensor<'a> {
@@ -84,8 +80,8 @@ impl ManifestReport {
             && self.dtype_mismatch.is_empty()
     }
 
-    /// A caller that never opened every shard cannot say the checkpoint lacks the
-    /// tensors it never looked for.
+    /// A caller that never opened every shard cannot say the checkpoint lacks what it
+    /// never looked for.
     pub(crate) fn forget_missing(&mut self) {
         self.missing.clear();
     }
@@ -94,9 +90,8 @@ impl ManifestReport {
         self.check_with(&[])
     }
 
-    /// Skipped optional tensors are not faults. `extra` adds fault classes that
-    /// are not about the config contract at all — a stale index, a stray shard —
-    /// so one pass names everything wrong with the checkpoint.
+    /// Skipped optional tensors are not faults. `extra` adds fault classes that are not
+    /// about the config contract — a stale index, a stray shard — so one pass names all.
     pub(crate) fn check_with(&self, extra: &[(&str, Vec<String>)]) -> Result<()> {
         let faults: Vec<String> = [
             ("missing required text tensor", &self.missing),
@@ -502,16 +497,12 @@ mod tests {
         assert!(err.contains("I64"), "{err}");
     }
 
-    /// Requires the frozen checkpoint's `model.safetensors.index.json`: set
-    /// `PEGAINFER_TEST_MODEL_PATH` to a directory containing it. Proves the
-    /// derived contract *is* the checkpoint's text tensor set — not merely the
-    /// same size — and that every key this line does not require falls under a
-    /// declared skip prefix. This is the K3 `manifest_covers_the_checkpoint_index`
-    /// pattern.
-    ///
-    /// The index is 170 KB and lists all 1658 keys, so this is the only pass that
-    /// sees the *whole* checkpoint; `super::read`'s companion test is the one that
-    /// checks real shapes and dtypes, but only over the shards on disk.
+    /// Requires the frozen checkpoint's `index.json` (`PEGAINFER_TEST_MODEL_PATH`). Proves
+    /// the derived contract *is* the checkpoint's text tensor set — not merely the same size
+    /// — and that every key it does not require falls under a declared skip prefix. The index
+    /// lists all 1658 keys, so this is the only pass that sees the whole checkpoint;
+    /// `super::read`'s companion test checks real shapes and dtypes, but only over the shards
+    /// on disk.
     #[test]
     #[ignore = "needs the frozen checkpoint's model.safetensors.index.json"]
     fn the_derived_contract_equals_the_real_checkpoint_index() {

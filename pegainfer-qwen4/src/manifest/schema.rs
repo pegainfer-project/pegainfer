@@ -11,13 +11,12 @@ use super::dtype_size;
 use crate::config::Config;
 use crate::config::LayerKind;
 
-/// Every text tensor carries this prefix — except `lm_head.weight`, which the
-/// checkpoint stores at the top level. The prefix is what makes the skip set
-/// safe: a skipped tensor can never be a required one.
+/// Every text tensor carries this prefix, except `lm_head.weight` at the top level. The
+/// prefix is what makes the skip set safe: a skipped tensor can never be a required one.
 const TEXT_PREFIX: &str = "model.language_model.";
 
-/// The expected shape of one tensor. Rank matters, so the depthwise conv and the
-/// fused expert stacks get their own variants rather than being flattened.
+/// The expected shape of one tensor. Rank matters, so the depthwise conv and the fused
+/// expert stacks get their own variants rather than being flattened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpectedShape {
     Matrix {
@@ -32,8 +31,7 @@ pub(crate) enum ExpectedShape {
         channels: usize,
         kernel: usize,
     },
-    /// Fused expert stack, stored as `[experts, rows, cols]` and — unlike every
-    /// other tensor here — carrying **no `.weight` suffix**.
+    /// Fused expert stack, stored as `[experts, rows, cols]`, with **no `.weight` suffix**.
     ExpertStack {
         experts: usize,
         rows: usize,
@@ -101,9 +99,8 @@ impl Manifest {
         let hidden = config.hidden_size();
         let vocab = config.text.vocab_size;
 
-        // ---- bookend -------------------------------------------------------
-        // Untied: both ends are real tensors. `lm_head.weight` sits at the top
-        // level, outside the text prefix.
+        // ---- bookend ----
+        // Untied: `lm_head.weight` sits at the top level, outside the text prefix.
         put(
             "lm_head.weight".to_string(),
             ExpectedShape::Matrix {
@@ -120,8 +117,7 @@ impl Manifest {
             },
             EXPECTED_DTYPE,
         );
-        // There is no `model.language_model.norm.weight`: the readout is the
-        // hyper-connection mixer, which has no injection weight.
+        // No `model.language_model.norm.weight`: the readout is the hyper-connection mixer.
         hyper_connection(
             &mut put,
             &format!("{TEXT_PREFIX}hyper_connection_mixer"),
@@ -129,9 +125,8 @@ impl Manifest {
             false,
         );
 
-        // ---- per layer -----------------------------------------------------
-        // Exactly one PLE layer is modelled (`Config::ple_layer`, already
-        // converted from the 1-indexed `ple_layer_ids`).
+        // ---- per layer ----
+        // Exactly one PLE layer is modelled; `Config::ple_layer` is already 0-indexed.
         let ple_layer = config.ple_layer;
         for (index, kind) in config.layer_kinds.iter().enumerate() {
             let layer = format!("{TEXT_PREFIX}layers.{index}");
@@ -172,9 +167,8 @@ impl Manifest {
     }
 }
 
-/// One hyper-connection instance. `with_injection` distinguishes the two
-/// per-layer instances (which scatter a sublayer's output back into the branches)
-/// from the top-level mixer, which is the readout and carries no injection weight.
+/// One hyper-connection instance. `with_injection` marks the per-layer instances, which
+/// scatter a sublayer's output back into the branches; the top-level mixer has none.
 fn hyper_connection(
     put: &mut impl FnMut(String, ExpectedShape, Dtype),
     prefix: &str,
