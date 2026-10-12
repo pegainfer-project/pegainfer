@@ -21,6 +21,13 @@ geometry keeps the file small; every structural trap is preserved (partial RoPE,
 GQA group > 1, fused Q+gate, sparse mask). Boundary cases shrink `indexer_budget`
 to 16 (4 blocks) so block selection truncates without a 2048-token input.
 
+After writing, the fixture is reloaded and replayed: a strict state-dict load
+proves the stored weights are complete and correctly named, and every case must
+reproduce `attn_out` / `attn_weights` / `mask` bit-for-bit in this process. That
+bit-for-bit contract is same-environment only — across torch builds/devices the
+reduction order shifts `attn_out` by bf16 ULP noise (measured <= 2.5e-4), so a
+gate replays it with a tolerance, not exact equality.
+
     python tools/accuracy/dump_qwen38fn_qsa_attn_golden.py --out <fixture>
 """
 
@@ -33,7 +40,7 @@ from pathlib import Path
 
 import torch
 import transformers
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from transformers.models.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpTextAttention,
@@ -60,6 +67,7 @@ BOUNDARY_BUDGET = 16
 
 SEED = 0x_03_38_F9_5A_11_7F
 
+# Bumped when the fixture layout changes; the gate asserts it on load.
 FORMAT_VERSION = 1
 
 # (seq_len, indexer_budget, expect_sparse). Tail = seq_len % 4 tokens are always
@@ -124,16 +132,36 @@ def causal_mask(seq_len: int, dtype: torch.dtype) -> torch.Tensor:
 
 
 def config_digest() -> bytes:
+    """sha256 over the frozen geometry and budgets so a consumer can assert this
+    oracle's config. Budgets are part of the config: they set each case's
+    block_topk and therefore how much of the causal window the mask keeps."""
     canon = (
         f"hidden={HIDDEN};qh={NUM_Q_HEADS};kvh={NUM_KV_HEADS};hd={HEAD_DIM};"
         f"prf={PARTIAL_ROTARY};inh={INDEXER_N_HEADS};inkv={INDEXER_KV_HEADS};"
-        f"ind={INDEXER_HEAD_DIM};ratio={INDEXER_RATIO};rope_theta=1e7"
+        f"ind={INDEXER_HEAD_DIM};ratio={INDEXER_RATIO};"
+        f"budget={REAL_BUDGET};bbudget={BOUNDARY_BUDGET};rope_theta=1e7"
     )
     return hashlib.sha256(canon.encode()).digest()
 
 
 def bytes_tensor(data: bytes) -> torch.Tensor:
     return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
+
+
+def run_case(module, rotary, hidden, positions, seq_len, budget):
+    """Run the reference sublayer for one case; returns (attn_out, attn_weights,
+    effective additive mask). The indexer is deterministic, so calling it again
+    next to the module (which calls it internally) reproduces the mask the
+    attention actually ran under."""
+    module.indexer.token_budget = budget
+    module.indexer.block_topk = budget // module.indexer.compress_ratio
+    pos_emb = rotary(hidden, positions)
+    base_mask = causal_mask(seq_len, torch.bfloat16)
+    with torch.no_grad():
+        with _scatter_int64():
+            attn_out, attn_weights = module(hidden, pos_emb, base_mask, None)
+            selected = module.indexer(hidden, pos_emb, base_mask, None)
+    return attn_out, attn_weights, base_mask + selected
 
 
 def main() -> None:
@@ -171,32 +199,26 @@ def main() -> None:
     }
 
     for i, (seq_len, budget, expect_sparse) in enumerate(CASES):
-        module.indexer.token_budget = budget
-        module.indexer.block_topk = budget // module.indexer.compress_ratio
-
         gen = torch.Generator().manual_seed(SEED + i)
         hidden = torch.randn(1, seq_len, HIDDEN, generator=gen).to(torch.bfloat16)
         positions = torch.arange(seq_len, dtype=torch.long)[None]
-        pos_emb = rotary(hidden, positions)
-        base_mask = causal_mask(seq_len, torch.bfloat16)
-
-        with torch.no_grad():
-            with _scatter_int64():
-                attn_out, attn_weights = module(hidden, pos_emb, base_mask, None)
-                selected = module.indexer(hidden, pos_emb, base_mask, None)
+        attn_out, attn_weights, effective = run_case(module, rotary, hidden, positions, seq_len, budget)
 
         # The mask the module actually attended under: causal (+) sparse selection.
-        effective = base_mask + selected
         blocked = effective < 0
-        causal_blocked = base_mask < 0
+        causal_blocked = causal_mask(seq_len, torch.bfloat16) < 0
         # Everything the mask blocks must carry zero softmax mass, and every row
         # must still sum to 1 over the positions it kept.
         assert torch.equal(attn_weights.masked_fill(~blocked, 0), torch.zeros_like(attn_weights)), (
             f"case {i} (S={seq_len}) attention mass on blocked positions"
         )
+        # atol calibration: bf16 rows of ~1/n weights measure max |sum-1| ~2e-3;
+        # dropping or duplicating one key out of 20 moves a row by ~5e-2. 3e-2
+        # sits above the noise floor and below the smallest meaningful bug.
         assert torch.allclose(attn_weights.sum(-1).float(), torch.ones(1, NUM_Q_HEADS, seq_len), atol=3e-2), (
             f"case {i} (S={seq_len}) attention rows do not sum to 1"
         )
+        assert torch.isfinite(attn_out.float()).all(), f"case {i} (S={seq_len}) non-finite attn_out"
         # With a reduced budget the selector must drop at least one causally valid
         # key; with a full budget it keeps every visible block (dense).
         dropped = (~causal_blocked) & blocked
@@ -221,6 +243,43 @@ def main() -> None:
     save_file(tensors, str(args.out))
     size_mb = args.out.stat().st_size / (1024 * 1024)
     print(f"wrote {args.out} ({size_mb:.2f} MiB, {len(tensors)} tensors)")
+
+    # Reload-and-reproduce: the strict load proves the stored weights are a
+    # complete, correctly named parameter set, and each case must replay
+    # bit-for-bit from the file in this process (cross-environment replay is
+    # tolerance-bound; see the module docstring).
+    check = load_file(str(args.out))
+    assert check["format_version"].item() == FORMAT_VERSION, "reload format_version mismatch"
+    assert bytes(check["config_sha256"].tolist()) == config_digest(), "reload config_sha256 mismatch"
+    assert bytes(check["ref_transformers"].tolist()) == transformers.__version__.encode(), (
+        "reload ref_transformers mismatch"
+    )
+    replay = Qwen4ExpTextAttention(cfg, 0).to(torch.bfloat16)
+    replay.load_state_dict(
+        {
+            "q_proj.weight": check["q_proj"],
+            "k_proj.weight": check["k_proj"],
+            "v_proj.weight": check["v_proj"],
+            "o_proj.weight": check["o_proj"],
+            "q_norm.weight": check["q_norm"],
+            "k_norm.weight": check["k_norm"],
+            "indexer.index_qk_proj.weight": check["index_qk_proj"],
+            "indexer.q_layernorm.weight": check["q_layernorm"],
+            "indexer.k_layernorm.weight": check["k_layernorm"],
+        }
+    )
+    replay_rotary = Qwen4ExpTextRotaryEmbedding(cfg)
+    for i, (seq_len, budget, _) in enumerate(CASES):
+        p = f"case{i}_"
+        assert check[p + "seq_len"].item() == seq_len, f"case {i} reload seq_len mismatch"
+        assert check[p + "budget"].item() == budget, f"case {i} reload budget mismatch"
+        attn_out, attn_weights, effective = run_case(
+            replay, replay_rotary, check[p + "hidden"], check[p + "positions"].to(torch.long), seq_len, budget
+        )
+        assert torch.equal(attn_out, check[p + "attn_out"]), f"case {i} reload attn_out mismatch"
+        assert torch.equal(attn_weights, check[p + "attn_weights"]), f"case {i} reload attn_weights mismatch"
+        assert torch.equal(effective < 0, check[p + "mask"]), f"case {i} reload mask mismatch"
+    print(f"reload: {len(CASES)} cases reproduce bit-for-bit from the stored weights")
 
 
 if __name__ == "__main__":
