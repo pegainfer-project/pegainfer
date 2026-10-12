@@ -17,6 +17,11 @@ which torch rejects ("Expected dtype int64 for index"); `_scatter_int64` below
 casts it for the duration of the reference call so the reference's own code path
 can be used as the oracle. The re-derivation itself uses the correct dtype.
 
+Fixture layout: provenance is `format_version`, `config_sha256` and
+`ref_transformers` (assert them on load). Per case, `scores` is NaN-padded and
+its validity is the explicit `scores_valid` mask — consumers must select by that
+mask, never trust the padding; `selected` is -1-padded with `n_selected`.
+
 Geometry is the frozen Qwen3.8-Flash-Next one. The budget-boundary truncation
 (`topk(min(budget//ratio, n_complete))`) would need a 2048-token sequence at the
 real budget, so the boundary cases instead shrink `indexer_budget` (16 -> 4
@@ -31,9 +36,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 from pathlib import Path
 
 import torch
+import transformers
 from safetensors.torch import save_file
 
 from transformers.models.qwen4_exp.modeling_qwen4_exp import (
@@ -60,6 +67,9 @@ REAL_BUDGET = 2048
 BOUNDARY_BUDGET = 16
 
 SEED = 0x_03_38_F9_5A_11_7E
+
+# Bumped when the fixture layout changes; the gate asserts it on load.
+FORMAT_VERSION = 1
 
 # (seq_len, indexer_budget). Tail = seq_len % 4 tokens are always kept; the
 # boundary budget exercises topk(min(budget//ratio, n_complete)) under/at/over.
@@ -196,6 +206,20 @@ def selected_mask(selected: torch.Tensor, seq_len: int) -> torch.Tensor:
     return mask.scatter(-1, scatter, True)[..., :seq_len].unsqueeze(1)
 
 
+def config_digest() -> bytes:
+    """sha256 over the frozen geometry so a consumer can assert this oracle's config."""
+    canon = (
+        f"hidden={HIDDEN};qh={NUM_Q_HEADS};kvh={NUM_KV_HEADS};hd={HEAD_DIM};"
+        f"inh={INDEXER_N_HEADS};inkv={INDEXER_KV_HEADS};ind={INDEXER_HEAD_DIM};"
+        f"ratio={INDEXER_RATIO};budget={REAL_BUDGET};rope_theta=1e7;prf=0.25"
+    )
+    return hashlib.sha256(canon.encode()).digest()
+
+
+def bytes_tensor(data: bytes) -> torch.Tensor:
+    return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
@@ -212,6 +236,9 @@ def main() -> None:
     rotary = Qwen4ExpTextRotaryEmbedding(cfg)
 
     tensors = {
+        "format_version": torch.tensor([FORMAT_VERSION], dtype=torch.int32),
+        "config_sha256": bytes_tensor(config_digest()),
+        "ref_transformers": bytes_tensor(transformers.__version__.encode()),
         "index_qk_proj": module.index_qk_proj.weight.detach().contiguous(),
         "q_layernorm": module.q_layernorm.weight.detach().contiguous(),
         "k_layernorm": module.k_layernorm.weight.detach().contiguous(),
@@ -241,6 +268,9 @@ def main() -> None:
         tensors[p + "hidden"] = hidden.contiguous()
         tensors[p + "positions"] = positions.contiguous()
         tensors[p + "scores"] = scores.contiguous()
+        max_blocks = scores.shape[-1]
+        valid = torch.arange(max_blocks)[None, None, :] < n_blocks[:, :, None]
+        tensors[p + "scores_valid"] = valid.contiguous()
         tensors[p + "selected"] = selected.contiguous()
         tensors[p + "n_blocks"] = n_blocks.contiguous()
         tensors[p + "n_selected"] = n_sel.contiguous()
