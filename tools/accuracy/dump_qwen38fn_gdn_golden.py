@@ -12,13 +12,18 @@ sigmoid gate.
 
 The reference `forward` re-derives the sublayer inside this script (conv1d ->
 split -> gated delta rule -> sigmoid gated norm -> out_proj) and asserts the
-re-derivation matches the module bit-for-bit (a mismatch aborts the dump); the
-chunk (prefill) and recurrent rule paths are also cross-checked.
+re-derivation matches the module bit-for-bit (a mismatch aborts the dump). The
+chunk (prefill) and recurrent (decode) rules are cross-checked at dump time only:
+neither the recurrent output nor a recurrent state is stored, so this fixture
+oracles the prefill path -- a decode kernel gate needs its own dump.
 
 Fixture: provenance `format_version` / `config_sha256` / `ref_transformers`
-(assert on load); per case, the input `hidden` and the output. A reduced geometry
-keeps the file small; the traps preserved are the key/value head ratio > 1
-(repeat_interleave), the depthwise conv, and the sigmoid gated norm.
+(assert on load); per case, the prefill input `hidden` and its output `out`. A
+reduced geometry keeps the file small; the traps preserved are the key/value head
+ratio > 1 (repeat_interleave), the depthwise conv, and the sigmoid gated norm.
+The gate is this golden's reason to exist (the shared kernel hardcodes silu), so
+the dump asserts `norm.activation == "sigmoid"` and `config_sha256` records it: a
+silu regen fails at the source instead of writing a wrong fixture.
 
     python tools/accuracy/dump_qwen38fn_gdn_golden.py --out <fixture>
 """
@@ -134,6 +139,12 @@ def main() -> None:
     cfg = Config()
     torch.manual_seed(SEED)
     module = Qwen4ExpTextGatedDeltaNet(cfg, 0)
+    # This golden exists to pin the `output_gate_type: "sigmoid"` gated norm (the
+    # in-tree kernel hardcodes silu). The re-derivation below calls `module.norm`
+    # on both arms, so it is same-source for the gate and cannot catch a
+    # sigmoid->silu flip. Assert it here so a regen that loses the gate fails at
+    # the source rather than silently writing a silu fixture.
+    assert module.norm.activation == "sigmoid", module.norm.activation
     with torch.no_grad():
         for name, p in module.named_parameters():
             if p.dim() >= 2:
@@ -178,7 +189,11 @@ def main() -> None:
 
         assert torch.equal(out, rederived), f"case {i} (S={seq_len}) re-derivation != module output"
         # The recurrent (decode) and chunk (prefill) rules are two algorithms for the
-        # same recurrence; the golden must sit where they agree.
+        # same recurrence; the golden must sit where they agree. Both emit bf16 O(1)
+        # and agree to bf16 rounding (observed bit-identical on CPU); 2e-2 (~5 bf16
+        # ULP at |out|~1) leaves room for cross-backend reduction order without
+        # admitting a real divergence. The bit-for-bit guard above is primary; this
+        # is a secondary net.
         assert torch.allclose(out.float(), recurrent.float(), atol=2e-2, rtol=2e-2), (
             f"case {i} (S={seq_len}) chunk and recurrent rules disagree"
         )
