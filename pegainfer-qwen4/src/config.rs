@@ -136,6 +136,30 @@ impl Config {
         let raw = RawConfig::deserialize(json).map_err(|error| anyhow!("qwen4_exp: {error}"))?;
         Self::try_from(raw)
     }
+
+    pub(crate) fn hidden_size(&self) -> usize {
+        self.text.hidden_size
+    }
+
+    /// Width of the hyper-connection residual stream: every sublayer reads and
+    /// writes this, not `hidden_size`.
+    pub(crate) fn hc_hidden_size(&self) -> usize {
+        self.text.hc_count * self.text.hidden_size
+    }
+
+    /// Gated DeltaNet conv channels: `key_dim * 2 + value_dim`, the fused Q|K|V
+    /// projection width.
+    pub(crate) fn gdn_conv_dim(&self) -> usize {
+        self.gdn_key_dim() * 2 + self.gdn_value_dim()
+    }
+
+    pub(crate) fn gdn_key_dim(&self) -> usize {
+        self.text.linear_key_head_dim * self.text.linear_num_key_heads
+    }
+
+    pub(crate) fn gdn_value_dim(&self) -> usize {
+        self.text.linear_value_head_dim * self.text.linear_num_value_heads
+    }
 }
 
 impl TryFrom<RawConfig> for Config {
@@ -492,6 +516,16 @@ impl NgramTable {
             shards: t.split_ngram_parts,
             rows_per_shard: padded / t.split_ngram_parts,
         })
+    }
+
+    /// Stored bytes of the table at BF16. This is the host-resident tier's size,
+    /// and the number the ecosystem's ~51 GB quote halves by assuming fp8.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the tensor contract is the first reader")
+    )]
+    pub(crate) fn bf16_bytes(&self) -> u128 {
+        self.padded_vocab_size as u128 * self.head_dim as u128 * 2
     }
 }
 
@@ -876,5 +910,68 @@ mod tests {
     fn an_embed_dim_that_cannot_split_across_heads_is_refused() {
         let err = err(|c| text(c, "ple_embed_dim", serde_json::json!(2561)));
         assert!(err.contains("ple_embed_dim"), "{err}");
+    }
+
+    /// The test above checks the derivation against constants transcribed from the
+    /// checkpoint, so a bad transcription and a bad derivation would agree with
+    /// each other. This closes that loop by reading the two integer vectors the
+    /// checkpoint actually stores and comparing them element for element: they
+    /// *are* the partition, so a wrong prime base, head count or padding rule
+    /// cannot survive it.
+    ///
+    /// Ignored because it reads tensor **values** rather than headers, and so
+    /// needs a real shard on disk. Point `PEGAINFER_TEST_MODEL_PATH` at a
+    /// directory holding `model.safetensors.index.json` plus whichever shard
+    /// carries the vectors — shard 37 of 131 at the frozen revision, which the
+    /// index is asked for rather than hardcoded.
+    #[test]
+    #[ignore = "needs a real Qwen3.8-Flash-Next shard holding the n-gram index vectors"]
+    fn the_ngram_partition_equals_the_stored_integer_vectors() {
+        use memmap2::Mmap;
+        use safetensors::Dtype;
+        use safetensors::SafeTensors;
+
+        const EMBEDDING: &str = "model.language_model.layers.1.ple.ple_embedding.";
+        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH")
+            .expect("PEGAINFER_TEST_MODEL_PATH must point at a checkpoint directory");
+        let dir = std::path::Path::new(&dir);
+        let raw = std::fs::read_to_string(dir.join("model.safetensors.index.json"))
+            .expect("checkpoint directory has no model.safetensors.index.json");
+        let index: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let shard = index["weight_map"][format!("{EMBEDDING}ngram_heads_offsets").as_str()]
+            .as_str()
+            .expect("the index must attribute the n-gram offsets to a shard");
+        let file = std::fs::File::open(dir.join(shard)).unwrap();
+        // SAFETY: nothing else holds a write handle to a checkpoint shard.
+        let mmap = unsafe { Mmap::map(&file) }.unwrap();
+        let stored = SafeTensors::deserialize(mmap.as_ref()).unwrap();
+
+        let ngram = config().ngram;
+        for (suffix, derived) in [
+            ("ngram_heads_vocab_sizes", &ngram.head_vocab_sizes),
+            ("ngram_heads_offsets", &ngram.head_offsets),
+        ] {
+            let name = format!("{EMBEDDING}{suffix}");
+            let view = stored
+                .tensor(&name)
+                .unwrap_or_else(|e| panic!("{name} is not in {shard}: {e}"));
+            assert_eq!(view.dtype(), Dtype::I64, "{name}");
+            assert_eq!(view.shape(), [derived.len()], "{name}");
+            let real: Vec<usize> = view
+                .data()
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| i64::from_le_bytes(*chunk))
+                .map(|value| {
+                    usize::try_from(value)
+                        .unwrap_or_else(|_| panic!("{name} carries a negative row index {value}"))
+                })
+                .collect();
+            assert_eq!(
+                real, *derived,
+                "{name} in {shard} is not the derived partition"
+            );
+        }
     }
 }

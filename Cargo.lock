@@ -3896,10 +3896,13 @@ name = "pegainfer-qwen4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "memmap2",
  "pegainfer-frontend",
+ "safetensors",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
 ]
 
 [[package]]
