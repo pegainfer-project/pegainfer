@@ -1,20 +1,6 @@
 # Qwen4 bring-up
 
-> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture
-> preview, is a **new line** (`qwen4_exp`), not a Qwen3.5
-> variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction.
-> Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an
-> identity probe and one typed config validation that pins *structure rather than
-> widths* and derives what `config.json` leaves implicit, plus a tensor manifest that
-> derives **exactly** the checkpoint's 1294 text tensors and has been held against real
-> shard bytes — so it checks shapes and dtypes, not names alone, on a checkpoint too
-> large to hold whole. All of it is CPU-only. Nothing runs —
-> detection succeeds and `launch` refuses, because the text graph is slice B. Four facts
-> this line must not get wrong, all measured rather than assumed: the embedding is
-> **untied**; there is **no final-norm tensor** (the readout is the hyper-connection
-> mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`;
-> and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm
-> activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
+> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of it is CPU-only. Nothing runs — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
 >
 > **Last touched:** 2026-10
 
@@ -43,21 +29,11 @@ given too):
 | `chat_template.jinja` | 8,952 | `c0c686f9c38d70d179fb7b5f5aa7530bc913dda3` | — |
 | `generation_config.json` | 202 | `023756cfadf88e5bf69eefeee3e172f38c448d64` | — |
 
-The committed `config.json` (`pegainfer-qwen4/tests/frozen_config.json`)
-is the real file, not a transcription, and a test re-hashes it against
-`FROZEN_CONFIG_SHA256` so the fixture cannot drift from the revision it claims to be.
-The geometry and contract tests all parse it; only the identity tests build their own
-input.
+The committed `config.json` (`pegainfer-qwen4/tests/frozen_config.json`) is the real file, not a transcription, and a test re-hashes it against `FROZEN_CONFIG_SHA256` so the fixture cannot drift from the revision it claims to be. The geometry and contract tests all parse it; only the identity tests build their own input.
 
 ## What landed
 
-`pegainfer-qwen4`, enabled in the server by `--features qwen4`, **with no CUDA
-dependency at all** — so its 67 CPU tests (plus three ignored ones that read a real
-checkpoint on demand) need no device, no weights and no Triton-equipped build.
-Preserving that is the point of the
-crate's shape: when slice B adds the device side behind a crate feature of its own,
-`config`, `probe` and `manifest` move behind
-`#[cfg(any(<that feature>, test))]` the way `pegainfer-gemma4/src/lib.rs` does.
+`pegainfer-qwen4`, enabled in the server by `--features qwen4`, **with no CUDA dependency at all** — so its tests need no device, no weights and no Triton-equipped build. Preserving that is the point of the crate's shape: when slice B adds the device side behind a crate feature of its own, `config`, `probe` and `manifest` move behind `#[cfg(any(<that feature>, test))]` the way `pegainfer-gemma4/src/lib.rs` does.
 
 - **Probe** (`src/probe.rs`) — identity only: the outer `model_type`, `architectures`
   and the inner `text_config.model_type`, the same split as Qwen3.5's probe.
@@ -97,16 +73,7 @@ crate's shape: when slice B adds the device side behind a crate feature of its o
   renormalization — this is #1068's mirror image. The other absent field, `seed`, only
   matters if the n-gram hash multipliers are recomputed instead of read from the
   checkpoint, so it is not modelled.
-- **Manifest** (`src/manifest/`) — the tensor contract the checkpoint must satisfy,
-  ported from `pegainfer-gemma4/src/manifest/`. `schema.rs` derives the expected tensor
-  set from the validated `Config`; `validate.rs` lifts nearly verbatim (five fault
-  classes, one pass over every header, one aggregated report, skipped tensors counted
-  rather than faulted); `read.rs` is new — Gemma 4's checkpoint is small enough to hold
-  whole, while this one is 360 GB across 131 shards, so the reader says something true
-  about the shards on disk without pretending to know about the ones that are not. It
-  derives **exactly** the frozen checkpoint's text set: 1658 keys − 333 `model.visual.*`
-  − 31 `mtp.*` = **1294 tensors**, with `lm_head.weight` the only required one outside the
-  `model.language_model.` prefix.
+- **Manifest** (`src/manifest/`, test only until slice B's loader calls it) — the tensor contract, ported from `pegainfer-gemma4/src/manifest/`: `schema.rs` derives it from `Config` and `validate.rs` classifies headers against it. It derives **exactly** the frozen text set, 1658 keys − 333 `model.visual.*` − 31 `mtp.*` = **1294 tensors**, with `lm_head.weight` the only one outside `model.language_model.`. Beyond the untied head, it differs from Gemma 4's in rank-3 shapes (the depthwise conv and two fused expert stacks per layer, which carry no `.weight` suffix) and in a mandatory skip set, because all 333 vision tensors share shard 1 with 16 text tensors. `tests/frozen_tensors.json` (148 KB, written by `tools/accuracy/dump_qwen4_frozen_tensors.py`) holds every shard header of the frozen revision, and `the_contract_is_the_frozen_checkpoint` checks all 1658 tensors against the contract.
 - **Registration** — the server binary hand-mirrors every line's probe identities in a
   hint table that cannot be derived away. With the feature off, `feature_gate_hint`
   names `--features qwen4` for both `qwen4_exp` and `qwen4_exp_text`; with it on, the
@@ -122,29 +89,7 @@ crate's shape: when slice B adds the device side behind a crate feature of its o
   That is the only coverage of `main`'s CLI → registry → hint → `launch` wiring, and
   neither outcome reaches CUDA — `launch` bails before the engine is built.
 
-Three deltas from the Gemma 4 manifest port, each forced by this checkpoint:
-
-1. **The LM head is untied**, so Gemma 4's refusal of an untied head inverts — both
-   `embed_tokens.weight` and `lm_head.weight` are required. There is no
-   `model.language_model.norm.weight`: the readout is the hyper-connection mixer, and its
-   injection weight is absent at the top level.
-2. **Rank-3 shapes.** Gemma 4 never needed them (its experts are four 2-D quantized
-   tensors each); here the depthwise conv is `[channels, 1, kernel]` and the experts are
-   fused 3-D stacks with **no `.weight` suffix** — `mlp.experts.gate_up_proj
-   [512, 1280, 2560]` and `down_proj [512, 2560, 640]`, two tensors per layer rather than
-   1536.
-3. **The skip set is `model.visual.` and `mtp.`**, and skipping is mandatory rather than
-   optional: all **333** vision tensors sit in shard 1 alongside just 16 text tensors, so
-   a loader reading whole shards must classify per tensor. A test keeps any skip prefix
-   from ever shadowing a required text tensor.
-
-**1-D lengths are part of the contract** (259 vectors), which matters because the shared
-loader does **not** check them: `load_tensor_1d` trusts the tensor's own length, and
-`DeviceVec::from_safetensors` only tests that the byte length is even before reinterpreting
-the bytes as BF16 (#1068). This checkpoint has many 1-D tensors whose length *is* semantics
-— `A_log[48]`, `dt_bias[48]`, `norm.weight[128]`, `q_norm[256]`, the indexer layernorms at
-`[128]`, `layer_multipliers[3]`, and the two `[16]` n-gram partition vectors. Two of those
-GDN scalars currently get no dtype check at all and are right only by coincidence.
+**1-D lengths are part of the contract** (259 vectors), because the shared loader takes them on trust (#1068), and here many carry meaning: `A_log[48]`, `dt_bias[48]`, `norm.weight[128]`, `q_norm[256]`, the indexer layernorms at `[128]`, `layer_multipliers[3]` and the two `[16]` n-gram partition vectors. In the Qwen3.5 GDN loader this line would reuse, `A_log` goes through `tensor_f32_cow`, which accepts BF16 or F32 but never checks the length, and on a single rank `dt_bias` goes through `load_tensor_1d`, which only checks that the byte count is even before reading the bytes as BF16.
 
 ## The n-gram table is derived, not read
 
@@ -172,32 +117,7 @@ arithmetic over `config.json`. The prime search is a direct port of the referenc
 `_is_prime` / `_find_nth_prime_after` (trial division by odd numbers), and
 `nth_prime_after_matches_the_reference` pins its values.
 
-That arithmetic is confirmed **by value**, not just by shape: the checkpoint stores the
-partition itself as two `I64[16]` vectors, `ngram_heads_vocab_sizes` and
-`ngram_heads_offsets`, and both equal the derived primes and offsets element for element
-(20,000,003 through 20,000,171). `config.rs` gates that behind
-`the_ngram_partition_equals_the_stored_integer_vectors` — a different claim from
-`the_ngram_table_derivation_matches_the_checkpoint`, which compares the derivation against
-constants transcribed from the checkpoint, where a bad transcription and a bad derivation
-would agree with each other.
-
-## Verified against real shards
-
-The manifest is not only self-consistent: it has been exercised against real shards of the
-frozen revision, and every opened tensor matched the derived shape and dtype. Two things
-worth keeping:
-
-- **The indexer geometry is confirmed**: `index_qk_proj.weight [640, 2560]` is
-  (4 q + 1 kv) × 128 fused, with `q_layernorm`/`k_layernorm` at `[128]`. `q_proj
-  [12288, 2560]` is the Q+gate fusion at 24 × 256 × 2, and `o_proj [2560, 6144]` writes
-  back to `hidden_size`, **not** to the 10240-wide hyper-connection stream — that stream
-  is picked up by `attn_hyper_connection.block_inject_weight [4, 10240]`.
-- **`indexer_budget ÷ indexer_compress_ratio = 512` micro-blocks produces no tensor.** It
-  is a runtime cache-size derivation, so no header check can confirm it — it stays a
-  read-the-reference item for #1105.
-
-The ignored gate prints the shard list it opened, so a run records which shards the proof
-used: it has never seen the whole checkpoint.
+That arithmetic is confirmed **by value**: the checkpoint stores the partition as two `I64[16]` vectors, `ngram_heads_vocab_sizes` and `ngram_heads_offsets`, both equal to the derived primes and offsets (20,000,003 through 20,000,171). The header snapshot carries them, and `the_ngram_partition_equals_the_stored_integer_vectors` compares them with the derivation.
 
 ## Traps
 
@@ -216,22 +136,17 @@ used: it has never seen the whole checkpoint.
   though its weight tensor `[10240, 1, 4]` is shaped exactly like the GDN conv's. The
   in-tree `conv1d.cu` is non-dilated and caps its state at four taps, so it cannot serve
   this.
-- **GQA group 12 is not a compiled decode group.** `SUPPORTED_GQA_GROUP_SIZES` is
-  `[1, 2, 3, 4, 6, 8]`, so `decode_group_is_compiled()` is false here and captured-graph
-  decode is off the table. The set grows only when a group earns a compiled kernel
-  (#1145 added 6); 12 has not. Slice B should plan for permanent eager decode rather than
-  discover it.
+- **Attention writes back at `hidden_size`.** `o_proj [2560, 6144]` returns to the 2560-wide hidden size, and `attn_hyper_connection.block_inject_weight [4, 10240]` carries it into the 10240-wide hyper-connection stream.
+- **GQA group 12 is not a compiled decode group.** `SUPPORTED_GQA_GROUP_SIZES` is `[1, 2, 3, 4, 6, 8]`, so the FlashInfer batch decode path cannot serve this attention as it stands. QSA is sparse and needs kernels of its own, so whether its decode is captured in a graph is slice B's decision, made with those kernels.
 - **Do not use `load_shard_info_fixed`.** It is a Qwen3.5-specific shard-*filename*
   workaround living in shared `pegainfer-core`; this checkpoint uses standard
   `model-0000N-of-00131` naming and wants the plain loader.
 
 ## Still open
 
-The tensor manifest is **landed and verified against real shards** (see above); what
-remains is the GDN proof, the bookend and the fixtures.
-
 | Criterion | Blocked on |
 | --- | --- |
+| Tensor manifest enforced before the first H2D | slice B's loader, which must classify the headers it maps before any upload |
 | GDN reuse proof, executed | 1 GPU. Answered as far as tensors go — geometry equals the Triton AOT constants, conv width equals the in-tree cap, names match down to the `model.language_model.layers.N.` prefix — but `conv1d_decode_batch_cuda` / `gated_delta_rule_decode_batch_cuda` are wrapped only inside `pegainfer-qwen35/src/recurrent.rs`, so slice B has to decide whether to lift them into shared `ops` or re-wrap them. The kernel limits `src/config.rs` mirrors from Qwen3.5 move with them. |
 | Bookend gate (embedding → mixer → lm_head → argmax) | 1 GPU, three shards (1 + 130 + 131, 5.29 GB, ~2.6 GB of weights on device) and a CPU f64 reference for the mixer. No layer weights needed. |
 | HF golden fixtures (logits + intermediate probes) | the fleet — 360 GB, plus ≥102.4 GB host RAM if the n-gram table is materialized |
