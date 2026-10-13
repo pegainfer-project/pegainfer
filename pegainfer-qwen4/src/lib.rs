@@ -8,14 +8,8 @@
 //! `#[cfg(any(<that feature>, test))]` the way `pegainfer-gemma4/src/lib.rs` does.
 
 mod config;
-// The loader that reads a checkpoint against the contract arrives with slice B.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the checkpoint loader is the first runtime caller"
-    )
-)]
+// Only tests read the contract until slice B's loader checks a checkpoint with it.
+#[cfg(test)]
 mod manifest;
 pub mod model_line;
 mod probe;

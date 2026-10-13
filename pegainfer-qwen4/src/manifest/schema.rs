@@ -7,7 +7,6 @@ use safetensors::Dtype;
 
 use super::EXPECTED_DTYPE;
 use super::INTEGER_INDEX_DTYPE;
-use super::dtype_size;
 use crate::config::Config;
 use crate::config::LayerKind;
 
@@ -52,19 +51,6 @@ impl ExpectedShape {
             } => shape == [experts, rows, cols],
         }
     }
-
-    pub(crate) fn elements(self) -> usize {
-        match self {
-            Self::Matrix { rows, cols } => rows * cols,
-            Self::Vector { len } => len,
-            Self::Conv1d { channels, kernel } => channels * kernel,
-            Self::ExpertStack {
-                experts,
-                rows,
-                cols,
-            } => experts * rows * cols,
-        }
-    }
 }
 
 impl fmt::Display for ExpectedShape {
@@ -96,7 +82,7 @@ impl Manifest {
             assert!(previous.is_none(), "{name} derived twice");
         };
 
-        let hidden = config.hidden_size();
+        let hidden = config.text.hidden_size;
         let vocab = config.text.vocab_size;
 
         // ---- bookend ----
@@ -157,14 +143,12 @@ impl Manifest {
     pub(crate) fn expected_tensors(&self) -> &BTreeMap<String, (ExpectedShape, Dtype)> {
         &self.expected
     }
+}
 
-    /// Stored bytes of the required text tensors, at each tensor's own dtype.
-    pub(crate) fn weight_bytes(&self) -> u128 {
-        self.expected
-            .values()
-            .map(|(shape, dtype)| shape.elements() as u128 * dtype_size(*dtype) as u128)
-            .sum()
-    }
+/// Width of the hyper-connection residual stream, which every sublayer reads and
+/// writes.
+fn hc_hidden(config: &Config) -> usize {
+    config.text.hc_count * config.text.hidden_size
 }
 
 /// One hyper-connection instance. `with_injection` marks the per-layer instances, which
@@ -175,7 +159,7 @@ fn hyper_connection(
     config: &Config,
     with_injection: bool,
 ) {
-    let hc_hidden = config.hc_hidden_size();
+    let hc_hidden = hc_hidden(config);
     let lowrank = config.text.hc_lowrank;
     put(
         format!("{prefix}.hc_norm.weight"),
@@ -281,11 +265,14 @@ fn gated_delta_net(
     let prefix = format!("{layer}.linear_attn");
     let hidden = text.hidden_size;
     let value_heads = text.linear_num_value_heads;
-    // Fused Q|K|V: key_dim + key_dim + value_dim.
+    let key_dim = text.linear_num_key_heads * text.linear_key_head_dim;
+    let value_dim = value_heads * text.linear_value_head_dim;
+    // Fused Q|K|V, which the conv then runs over channel by channel.
+    let conv_dim = 2 * key_dim + value_dim;
     put(
         format!("{prefix}.in_proj_qkv.weight"),
         ExpectedShape::Matrix {
-            rows: config.gdn_conv_dim(),
+            rows: conv_dim,
             cols: hidden,
         },
         EXPECTED_DTYPE,
@@ -293,7 +280,7 @@ fn gated_delta_net(
     put(
         format!("{prefix}.in_proj_z.weight"),
         ExpectedShape::Matrix {
-            rows: config.gdn_value_dim(),
+            rows: value_dim,
             cols: hidden,
         },
         EXPECTED_DTYPE,
@@ -311,7 +298,7 @@ fn gated_delta_net(
     put(
         format!("{prefix}.conv1d.weight"),
         ExpectedShape::Conv1d {
-            channels: config.gdn_conv_dim(),
+            channels: conv_dim,
             kernel: text.linear_conv_kernel_dim,
         },
         EXPECTED_DTYPE,
@@ -334,7 +321,7 @@ fn gated_delta_net(
         format!("{prefix}.out_proj.weight"),
         ExpectedShape::Matrix {
             rows: hidden,
-            cols: config.gdn_value_dim(),
+            cols: value_dim,
         },
         EXPECTED_DTYPE,
     );
@@ -407,13 +394,12 @@ fn sparse_attention(
     }
 }
 
-/// The n-gram block. Mounted on exactly the layers `ple_layer_ids` names,
-/// converted from 1-indexed by [`Config::ple_tensor_layers`].
+/// The n-gram block, mounted on the one layer `Config::ple_layer` names.
 fn ple(put: &mut impl FnMut(String, ExpectedShape, Dtype), layer: &str, config: &Config) {
     let text = &config.text;
     let ngram = &config.ngram;
     let prefix = format!("{layer}.ple");
-    let hc_hidden = config.hc_hidden_size();
+    let hc_hidden = hc_hidden(config);
     // The block queries the hyper-connection stream, so its key side is hc-wide
     // while its value side is only hidden-wide.
     put(

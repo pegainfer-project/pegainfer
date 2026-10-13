@@ -73,26 +73,8 @@ impl ManifestReport {
         self.dtype_mismatch.sort();
     }
 
-    pub(crate) fn is_clean(&self) -> bool {
-        self.missing.is_empty()
-            && self.unexpected.is_empty()
-            && self.shape_mismatch.is_empty()
-            && self.dtype_mismatch.is_empty()
-    }
-
-    /// A caller that never opened every shard cannot say the checkpoint lacks what it
-    /// never looked for.
-    pub(crate) fn forget_missing(&mut self) {
-        self.missing.clear();
-    }
-
+    /// Skipped optional tensors are not faults.
     pub(crate) fn check(&self) -> Result<()> {
-        self.check_with(&[])
-    }
-
-    /// Skipped optional tensors are not faults. `extra` adds fault classes that are not
-    /// about the config contract — a stale index, a stray shard — so one pass names all.
-    pub(crate) fn check_with(&self, extra: &[(&str, Vec<String>)]) -> Result<()> {
         let faults: Vec<String> = [
             ("missing required text tensor", &self.missing),
             ("unexpected tensor", &self.unexpected),
@@ -105,11 +87,6 @@ impl ManifestReport {
                 .iter()
                 .map(move |entry| format!("  {label}: {entry}"))
         })
-        .chain(extra.iter().flat_map(|(label, entries)| {
-            entries
-                .iter()
-                .map(move |entry| format!("  {label}: {entry}"))
-        }))
         .collect();
         if faults.is_empty() {
             return Ok(());
@@ -192,35 +169,24 @@ mod tests {
 
     // ---- the derived contract itself --------------------------------------
 
-    /// Cross-checked against the frozen revision's `model.safetensors.index.json`:
-    /// 1658 keys, of which 333 are `model.visual.*` and 31 are `mtp.*`, leaving
-    /// exactly 1294 text tensors — and `lm_head.weight` is the only one of those
-    /// outside the text prefix.
+    /// Every tensor of the frozen revision, read from its shard headers: the 1294 text
+    /// tensors match the contract in name, shape and dtype, and the rest are the 333
+    /// vision and 31 MTP tensors the skip set covers.
     #[test]
-    fn the_derived_contract_is_the_frozen_checkpoint_text_set() {
-        let manifest = frozen_manifest();
-        assert_eq!(manifest.expected_tensors().len(), 1658 - 333 - 31);
-        assert_eq!(
-            manifest
-                .expected_tensors()
-                .keys()
-                .filter(|name| !name.starts_with("model.language_model."))
-                .collect::<Vec<_>>(),
-            vec!["lm_head.weight"]
-        );
-        // 128 shards x 2,500,012 rows x 160 columns x 2 bytes; the ~51 GB the
-        // ecosystem quotes for this table is the fp8 footprint, not this one.
-        assert_eq!(
-            frozen_config().ngram.bf16_bytes(),
-            128 * 2_500_012 * 160 * 2
-        );
-        // The published repo is 360.0 GB across 131 shards, of which the skipped
-        // vision and MTP tensors are a few GB; the text set must land under it.
-        let bytes = manifest.weight_bytes();
-        assert!(
-            bytes > 350_000_000_000 && bytes < 360_000_000_000,
-            "derived text-tensor bytes {bytes} are not consistent with the published 360.0 GB repo"
-        );
+    fn the_contract_is_the_frozen_checkpoint() {
+        let frozen = crate::manifest::frozen_tensors();
+        let observed: Vec<ObservedTensor<'_>> = frozen
+            .tensors
+            .iter()
+            .map(|(name, (dtype, shape))| ObservedTensor {
+                name,
+                dtype: *dtype,
+                shape,
+            })
+            .collect();
+        let report = frozen_manifest().classify(&observed);
+        report.check().unwrap();
+        assert_eq!(report.skipped_optional.len(), 333 + 31);
     }
 
     #[test]
@@ -495,57 +461,6 @@ mod tests {
         let err = error_for(&manifest, &tensors);
         assert!(err.contains(recast), "{err}");
         assert!(err.contains("I64"), "{err}");
-    }
-
-    /// Requires the frozen checkpoint's `index.json` (`PEGAINFER_TEST_MODEL_PATH`). Proves
-    /// the derived contract *is* the checkpoint's text tensor set — not merely the same size
-    /// — and that every key it does not require falls under a declared skip prefix. The index
-    /// lists all 1658 keys, so this is the only pass that sees the whole checkpoint;
-    /// `super::read`'s companion test checks real shapes and dtypes, but only over the shards
-    /// on disk.
-    #[test]
-    #[ignore = "needs the frozen checkpoint's model.safetensors.index.json"]
-    fn the_derived_contract_equals_the_real_checkpoint_index() {
-        let dir = std::env::var("PEGAINFER_TEST_MODEL_PATH")
-            .expect("PEGAINFER_TEST_MODEL_PATH must point at a checkpoint directory");
-        let raw = std::fs::read_to_string(
-            std::path::Path::new(&dir).join(crate::manifest::read::INDEX_FILE),
-        )
-        .expect("checkpoint directory has no model.safetensors.index.json");
-        let index: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let weight_map = index["weight_map"].as_object().expect("weight_map");
-
-        let manifest = frozen_manifest();
-        let derived = manifest.expected_tensors();
-        let report = manifest.classify(&observe(
-            &weight_map
-                .keys()
-                // The index carries no dtypes or shapes, so this pass can only
-                // check the *set*: the shape and dtype here are placeholders, and
-                // the assertions below are on the missing / unexpected / skipped
-                // classes alone.
-                .map(|name| (name.clone(), Dtype::BF16, vec![0]))
-                .collect::<Vec<_>>(),
-        ));
-
-        assert!(
-            report.missing.is_empty(),
-            "contract requires {} tensor(s) the checkpoint does not carry, e.g. {:?}",
-            report.missing.len(),
-            &report.missing[..report.missing.len().min(5)]
-        );
-        assert!(
-            report.unexpected.is_empty(),
-            "checkpoint carries {} tensor(s) the contract does not expect and no skip prefix \
-             covers, e.g. {:?}",
-            report.unexpected.len(),
-            &report.unexpected[..report.unexpected.len().min(5)]
-        );
-        // Set equality, both directions already established above.
-        assert_eq!(
-            report.skipped_optional.len() + derived.len(),
-            weight_map.len()
-        );
     }
 
     #[test]
