@@ -30,6 +30,9 @@ CASES = [
     (14, SHRUNK_BUDGET, None),  # 3 complete blocks + tail 2
     (16, SHRUNK_BUDGET, None),  # 4 complete blocks, all kept
     (20, SHRUNK_BUDGET, None),  # 5 complete blocks, one dropped
+    # Visible 2050 and 2051 keep all 512 blocks, 2052 starts dropping one block,
+    # and 2053 to 2055 drop one while keeping a tail of 1 to 3.
+    (2055, None, range(2049, 2055)),
 ]
 
 
