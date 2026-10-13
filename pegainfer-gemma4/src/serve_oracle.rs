@@ -666,12 +666,13 @@ fn pick_inside_top(row: &[f32], pick: usize, k: usize) -> bool {
 
 /// The worst absolute logit gap between two rows, with no rule applied — what a
 /// row's logits moved by. [`compare_row`] is what a gate holds its own two arms
-/// to; [`neutral_scale`] reads this for the magnitude.
-fn raw_gap(ours: &[f32], theirs: &[f32]) -> f32 {
+/// to; [`neutral_scale`] reads this for the magnitude. `f32::max` returns the
+/// other operand for a NaN, so a non-finite row has to be refused here or it
+/// folds to zero and reads as no drift.
+fn raw_gap(what: &str, ours: &[f32], theirs: &[f32]) -> f32 {
     assert!(
         ours.iter().chain(theirs.iter()).all(|v| v.is_finite()),
-        "a raw gap needs finite logits: `f32::max` drops a NaN operand, so a NaN row would \
-         read as no drift"
+        "{what}: non-finite logit"
     );
     ours.iter()
         .zip(theirs)
@@ -705,10 +706,7 @@ struct RowGap {
 /// two tokens sat 0.0625 apart in the decode row and 0.1875 in the recomputed
 /// one, with the two rows agreeing to 0.3125 everywhere else.
 fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> RowGap {
-    assert!(
-        ours.iter().chain(theirs.iter()).all(|v| v.is_finite()),
-        "{what}: non-finite logit"
-    );
+    let worst = raw_gap(what, ours, theirs);
     let (a, b) = (argmax(ours), argmax(theirs));
     let flipped = a != b;
     if flipped {
@@ -716,17 +714,14 @@ fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> RowGap {
         describe_row(&format!("{what} theirs"), theirs);
         assert!(
             pick_inside_top(theirs, a, NEAR_TIE_TOP_K) && pick_inside_top(ours, b, NEAR_TIE_TOP_K),
-            "{what}: a pick outside the other row's top-{NEAR_TIE_TOP_K} ({a} vs {b}), which is a \
-             different distribution rather than the reduction-order drift the callers' ceiling \
-             covers"
+            "{what}: the two picks ({a} vs {b}) are not each inside the other row's \
+             top-{NEAR_TIE_TOP_K}, which the rule requires"
         );
         let margins = ((ours[a] - ours[b]).abs(), (theirs[a] - theirs[b]).abs());
         assert!(
             margins.0 <= NEAR_TIE_WIDTH && margins.1 <= NEAR_TIE_WIDTH,
             "{what}: {a} and {b} sit {} and {} apart in the two rows' own readings, wider than \
-             the {NEAR_TIE_WIDTH} a reduction-order flip moves them — both picks are inside both \
-             rows' top-{NEAR_TIE_TOP_K}, so this margin is the only thing left that tells a tie \
-             from a different distribution",
+             the {NEAR_TIE_WIDTH} the rule allows",
             margins.0,
             margins.1
         );
@@ -735,10 +730,7 @@ fn compare_row(ours: &[f32], theirs: &[f32], what: &str) -> RowGap {
             margins.0, margins.1
         );
     }
-    RowGap {
-        worst: raw_gap(ours, theirs),
-        flipped,
-    }
+    RowGap { worst, flipped }
 }
 
 /// A flip six nats wide: each pick is the other row's runner-up, so mutual
@@ -778,12 +770,12 @@ fn a_flip_inside_the_width_is_reported_as_one() {
 }
 
 /// A NaN row is the one input a raw gap must not fold away: `f32::max` returns
-/// the other operand for a NaN, so without the finiteness check this reads 0.0 —
-/// a magnitude that reports no drift about a row that computed nothing.
+/// the other operand for a NaN, so without the check this reads 0.0 — a magnitude
+/// that reports no drift about a row that computed nothing.
 #[test]
-#[should_panic(expected = "a raw gap needs finite logits")]
+#[should_panic(expected = "non-finite logit")]
 fn a_nan_row_does_not_read_as_no_drift() {
-    raw_gap(&[1.0], &[f32::NAN]);
+    raw_gap("a row", &[1.0], &[f32::NAN]);
 }
 
 /// The whole-prefix recompute of the serving path, reduced to its last row.
@@ -890,7 +882,7 @@ fn neutral_scale(
     let mut worst = 0.0f32;
     for (i, row) in rows.iter().enumerate() {
         let recomputed = serving_recompute(ctx, serve, &walked[..prompt_len + i]);
-        worst = worst.max(raw_gap(row, &recomputed));
+        worst = worst.max(raw_gap(&row_label(i), row, &recomputed));
     }
     worst
 }
@@ -2211,12 +2203,12 @@ fn a_ragged_batch_does_not_depend_on_row_order() {
 
 /// [`neutral_scale`]'s number over the sweep the decode gates use, with no
 /// generated kernel in the picture: the incumbent walk's rows against a
-/// recompute of the context each row saw, at 512/1500/3000 tokens. A green run
-/// here says the floor is finite and **nothing about the width**: these nine
-/// cells never reach [`compare_row`], so neither top-8 membership nor
-/// [`NEAR_TIE_WIDTH`] is exercised, and pinning the width at these depths takes
-/// a run of each generated-kernel gate. The floors this reads are on the record
-/// in [`neutral_scale`]'s doc.
+/// recompute of the context each row saw, at 512/1500/3000 tokens. It prints and
+/// does not assert — a non-finite row panics in `raw_gap` first — and it says
+/// **nothing about the width**: these nine cells never reach [`compare_row`], so
+/// neither top-8 membership nor [`NEAR_TIE_WIDTH`] is exercised, and pinning the
+/// width at these depths takes a run of each generated-kernel gate. The floors
+/// this reads are on the record in [`neutral_scale`]'s doc.
 #[test]
 #[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
 fn the_drift_floor_is_measured_over_the_decode_sweep() {
@@ -2227,10 +2219,6 @@ fn the_drift_floor_is_measured_over_the_decode_sweep() {
         let tokens: Vec<u32> = prompts[prompt].iter().cycle().copied().take(len).collect();
         let (rows, walked) = continue_walk(&ctx, &serve, &tokens, STEPS, None);
         let floor = neutral_scale(&ctx, &serve, &rows, tokens.len(), &walked);
-        assert!(
-            floor.is_finite(),
-            "prompt {prompt} at {len}: the drift floor read {floor}"
-        );
         eprintln!("prompt {prompt} at {len}: drift floor {floor}");
     }
 }
