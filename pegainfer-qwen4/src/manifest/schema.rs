@@ -14,8 +14,7 @@ use crate::config::LayerKind;
 /// prefix is what makes the skip set safe: a skipped tensor can never be a required one.
 const TEXT_PREFIX: &str = "model.language_model.";
 
-/// The expected shape of one tensor. Rank matters, so the depthwise conv and the fused
-/// expert stacks get their own variants rather than being flattened.
+/// The expected shape of one tensor, rank included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpectedShape {
     Matrix {
@@ -39,32 +38,24 @@ pub(crate) enum ExpectedShape {
 }
 
 impl ExpectedShape {
-    pub(crate) fn matches(self, shape: &[usize]) -> bool {
+    /// The dimensions a shard header must state.
+    pub(crate) fn dims(self) -> Vec<usize> {
         match self {
-            Self::Matrix { rows, cols } => shape == [rows, cols],
-            Self::Vector { len } => shape == [len],
-            Self::Conv1d { channels, kernel } => shape == [channels, 1, kernel],
+            Self::Matrix { rows, cols } => vec![rows, cols],
+            Self::Vector { len } => vec![len],
+            Self::Conv1d { channels, kernel } => vec![channels, 1, kernel],
             Self::ExpertStack {
                 experts,
                 rows,
                 cols,
-            } => shape == [experts, rows, cols],
+            } => vec![experts, rows, cols],
         }
     }
 }
 
 impl fmt::Display for ExpectedShape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Matrix { rows, cols } => write!(f, "[{rows}, {cols}]"),
-            Self::Vector { len } => write!(f, "[{len}]"),
-            Self::Conv1d { channels, kernel } => write!(f, "[{channels}, 1, {kernel}]"),
-            Self::ExpertStack {
-                experts,
-                rows,
-                cols,
-            } => write!(f, "[{experts}, {rows}, {cols}]"),
-        }
+        write!(f, "{:?}", self.dims())
     }
 }
 
@@ -85,7 +76,6 @@ impl Manifest {
         let hidden = config.text.hidden_size;
         let vocab = config.text.vocab_size;
 
-        // ---- bookend ----
         // Untied: `lm_head.weight` sits at the top level, outside the text prefix.
         put(
             "lm_head.weight".to_string(),
@@ -111,9 +101,6 @@ impl Manifest {
             false,
         );
 
-        // ---- per layer ----
-        // Exactly one PLE layer is modelled; `Config::ple_layer` is already 0-indexed.
-        let ple_layer = config.ple_layer;
         for (index, kind) in config.layer_kinds.iter().enumerate() {
             let layer = format!("{TEXT_PREFIX}layers.{index}");
             hyper_connection(
@@ -133,7 +120,7 @@ impl Manifest {
                 LayerKind::LinearAttention => gated_delta_net(&mut put, &layer, config),
                 LayerKind::FullAttention => sparse_attention(&mut put, &layer, config),
             }
-            if index == ple_layer {
+            if index == config.ple_layer {
                 ple(&mut put, &layer, config);
             }
         }
@@ -145,8 +132,7 @@ impl Manifest {
     }
 }
 
-/// Width of the hyper-connection residual stream, which every sublayer reads and
-/// writes.
+/// Width of the hyper-connection residual stream.
 fn hc_hidden(config: &Config) -> usize {
     config.text.hc_count * config.text.hidden_size
 }
@@ -194,7 +180,7 @@ fn hyper_connection(
     }
 }
 
-/// Every layer is MoE; there is no dense variant to defer behind.
+/// Every layer is MoE.
 fn moe(put: &mut impl FnMut(String, ExpectedShape, Dtype), layer: &str, config: &Config) {
     let text = &config.text;
     let experts = text.num_experts;
@@ -372,8 +358,7 @@ fn sparse_attention(
             EXPECTED_DTYPE,
         );
     }
-    // The indexer is a second, differently-shaped attention with its own fused
-    // Q|K projection and its own layernorms.
+    // The indexer has its own fused Q|K projection and layernorms.
     let indexer_dim = (text.indexer_n_heads + text.indexer_kv_heads) * text.indexer_head_dim;
     put(
         format!("{prefix}.indexer.index_qk_proj.weight"),
@@ -418,8 +403,7 @@ fn ple(put: &mut impl FnMut(String, ExpectedShape, Dtype), layer: &str, config: 
         },
         EXPECTED_DTYPE,
     );
-    // Dilated by `ngram_size` at runtime, but the weight tensor is rank-3 with the
-    // same layout as the GDN conv — the dilation is not visible in the shape.
+    // Dilated by `ngram_size` at runtime, which the shape does not show.
     put(
         format!("{prefix}.conv1d.weight"),
         ExpectedShape::Conv1d {

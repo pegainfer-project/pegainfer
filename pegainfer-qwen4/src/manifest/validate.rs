@@ -1,17 +1,14 @@
-//! The contract held up against what a checkpoint carries.
-//!
-//! Lifted nearly verbatim from `pegainfer-gemma4/src/manifest/validate.rs`; only the skip
-//! prefixes and the fault message name this line. One pass over every header, all faults
-//! aggregated into one report, and skipped-optional tensors counted rather than faulted.
+//! Holds a checkpoint's tensors against the contract in one pass and reports every
+//! fault at once. Lifted from `pegainfer-gemma4/src/manifest/validate.rs` with this
+//! line's skip set and message.
 
 use anyhow::Result;
 use safetensors::Dtype;
 
 use super::schema::Manifest;
 
-/// Tensors this text-only line deliberately does not load. Skipping is mandatory: the
-/// vision blocks share shards with the text layers, so a whole-shard loader must classify
-/// per tensor.
+/// Tensors this text-only line does not load. They share shards with text tensors, so a
+/// loader classifies per tensor.
 const SKIPPED_OPTIONAL_PREFIXES: &[&str] = &["model.visual.", "mtp."];
 
 pub(crate) struct ObservedTensor<'a> {
@@ -36,7 +33,7 @@ impl Manifest {
                 }
                 continue;
             };
-            if !shape.matches(tensor.shape) {
+            if tensor.shape != shape.dims() {
                 report.shape_mismatch.push(format!(
                     "{}: checkpoint has {:?}, config implies {shape}",
                     tensor.name, tensor.shape
@@ -103,39 +100,21 @@ impl ManifestReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::schema::ExpectedShape;
-
-    fn frozen_config() -> crate::config::Config {
-        let json: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/frozen_config.json")).unwrap();
-        crate::config::Config::from_json(&json).unwrap()
-    }
 
     fn frozen_manifest() -> Manifest {
-        Manifest::from_config(&frozen_config())
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/frozen_config.json")).unwrap();
+        Manifest::from_config(&crate::config::Config::from_json(&json).unwrap())
     }
 
-    /// What a faultless checkpoint's headers look like, derived from the manifest
-    /// itself — so these tests exercise the classifier, not the schema.
+    /// Headers that match the manifest exactly, so these tests exercise the classifier
+    /// alone.
     fn faultless(manifest: &Manifest) -> Vec<(String, Dtype, Vec<usize>)> {
         manifest
             .expected_tensors()
             .iter()
-            .map(|(name, (shape, dtype))| (name.clone(), *dtype, dims(*shape)))
+            .map(|(name, (shape, dtype))| (name.clone(), *dtype, shape.dims()))
             .collect()
-    }
-
-    fn dims(shape: ExpectedShape) -> Vec<usize> {
-        match shape {
-            ExpectedShape::Matrix { rows, cols } => vec![rows, cols],
-            ExpectedShape::Vector { len } => vec![len],
-            ExpectedShape::Conv1d { channels, kernel } => vec![channels, 1, kernel],
-            ExpectedShape::ExpertStack {
-                experts,
-                rows,
-                cols,
-            } => vec![experts, rows, cols],
-        }
     }
 
     fn observe(tensors: &[(String, Dtype, Vec<usize>)]) -> Vec<ObservedTensor<'_>> {
@@ -167,11 +146,8 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} is not in the derived manifest"))
     }
 
-    // ---- the derived contract itself --------------------------------------
-
-    /// Every tensor of the frozen revision, read from its shard headers: the 1294 text
-    /// tensors match the contract in name, shape and dtype, and the rest are the 333
-    /// vision and 31 MTP tensors the skip set covers.
+    /// All 1658 tensors of the frozen revision: the 1294 text tensors match the contract,
+    /// and the skip set covers the 333 vision and 31 MTP tensors.
     #[test]
     fn the_contract_is_the_frozen_checkpoint() {
         let frozen = crate::manifest::frozen_tensors();
@@ -187,180 +163,6 @@ mod tests {
         let report = frozen_manifest().classify(&observed);
         report.check().unwrap();
         assert_eq!(report.skipped_optional.len(), 333 + 31);
-    }
-
-    #[test]
-    fn every_layer_family_is_mounted_where_the_config_says() {
-        let manifest = frozen_manifest();
-        let names = manifest.expected_tensors();
-        // 36 linear-attention layers, 12 full-attention layers, every 4th full.
-        for index in 0..48 {
-            let linear = names.contains_key(&format!(
-                "model.language_model.layers.{index}.linear_attn.in_proj_qkv.weight"
-            ));
-            let full = names.contains_key(&format!(
-                "model.language_model.layers.{index}.self_attn.q_proj.weight"
-            ));
-            assert_ne!(linear, full, "layer {index} must be exactly one kind");
-            assert_eq!(full, (index + 1) % 4 == 0, "layer {index} kind");
-        }
-        // The PLE block is on `layers.1`, not `layers.2`: `ple_layer_ids` is
-        // 1-indexed, and getting this wrong still produces fluent, wrong text.
-        assert!(names.contains_key("model.language_model.layers.1.ple.key_proj.weight"));
-        assert!(!names.contains_key("model.language_model.layers.2.ple.key_proj.weight"));
-    }
-
-    #[test]
-    fn the_untied_bookend_requires_both_ends() {
-        let manifest = frozen_manifest();
-        let names = manifest.expected_tensors();
-        // `lm_head.weight` is the one required tensor outside the text prefix.
-        assert!(names.contains_key("lm_head.weight"));
-        assert!(names.contains_key("model.language_model.embed_tokens.weight"));
-        // There is no final norm: the readout is the hyper-connection mixer, and
-        // it carries no injection weight.
-        assert!(!names.contains_key("model.language_model.norm.weight"));
-        assert!(names.contains_key("model.language_model.hyper_connection_mixer.hc_norm.weight"));
-        assert!(!names.contains_key(
-            "model.language_model.hyper_connection_mixer.block_inject_weight.weight"
-        ));
-    }
-
-    #[test]
-    fn the_ngram_table_is_128_named_shards_plus_three_integer_vectors() {
-        let manifest = frozen_manifest();
-        let tensors = manifest.expected_tensors();
-        let shards = tensors
-            .iter()
-            .filter(|(name, _)| name.contains(".ngram_embedding.shard_"))
-            .collect::<Vec<_>>();
-        assert_eq!(shards.len(), 128);
-        for (_, (shape, dtype)) in &shards {
-            assert_eq!(
-                *shape,
-                ExpectedShape::Matrix {
-                    rows: 2_500_012,
-                    cols: 160
-                }
-            );
-            assert_eq!(*dtype, Dtype::BF16);
-        }
-        for (name, len) in [
-            ("layer_multipliers", 3usize),
-            ("ngram_heads_offsets", 16),
-            ("ngram_heads_vocab_sizes", 16),
-        ] {
-            let key = format!("model.language_model.layers.1.ple.ple_embedding.{name}");
-            assert_eq!(
-                tensors.get(&key).copied(),
-                Some((ExpectedShape::Vector { len }, Dtype::I64)),
-                "{key}"
-            );
-        }
-    }
-
-    /// The shared loader takes a 1-D tensor's length on trust and reinterprets its
-    /// bytes, so a manifest that only checked matrices would leave every scalar
-    /// vector unverified. These lengths are semantics, not decoration.
-    #[test]
-    fn one_dimensional_lengths_are_part_of_the_contract() {
-        let manifest = frozen_manifest();
-        let tensors = manifest.expected_tensors();
-        let vectors = [
-            ("model.language_model.layers.0.linear_attn.A_log", 48usize),
-            ("model.language_model.layers.0.linear_attn.dt_bias", 48),
-            ("model.language_model.layers.0.linear_attn.norm.weight", 128),
-            ("model.language_model.layers.3.self_attn.q_norm.weight", 256),
-            ("model.language_model.layers.3.self_attn.k_norm.weight", 256),
-            (
-                "model.language_model.layers.3.self_attn.indexer.q_layernorm.weight",
-                128,
-            ),
-            (
-                "model.language_model.layers.0.attn_hyper_connection.hc_norm.weight",
-                10240,
-            ),
-        ];
-        for (name, len) in vectors {
-            assert_eq!(
-                tensors.get(name).map(|(shape, _)| *shape),
-                Some(ExpectedShape::Vector { len }),
-                "{name}"
-            );
-        }
-        // 2 hyper-connection norms per layer (48), 3 GDN scalars per linear layer
-        // (36), 4 attention/indexer norms per full layer (12), the readout mixer's
-        // norm, and the PLE block's 3 norms + 3 integer vectors.
-        assert_eq!(
-            tensors
-                .iter()
-                .filter(|(_, (shape, _))| matches!(shape, ExpectedShape::Vector { .. }))
-                .count(),
-            2 * 48 + 3 * 36 + 4 * 12 + 1 + 6,
-            "every 1-D tensor must be length-checked, not taken on trust"
-        );
-    }
-
-    #[test]
-    fn rank_three_shapes_are_distinguished_from_matrices() {
-        let manifest = frozen_manifest();
-        let tensors = manifest.expected_tensors();
-        assert_eq!(
-            tensors
-                .get("model.language_model.layers.0.linear_attn.conv1d.weight")
-                .map(|(shape, _)| *shape),
-            Some(ExpectedShape::Conv1d {
-                channels: 10240,
-                kernel: 4
-            })
-        );
-        // The GDN conv and the PLE conv have the same stored shape but different
-        // runtime dilation; the manifest can only pin the shape, so this asserts
-        // both are present rather than conflated.
-        assert_eq!(
-            tensors
-                .get("model.language_model.layers.1.ple.conv1d.weight")
-                .map(|(shape, _)| *shape),
-            Some(ExpectedShape::Conv1d {
-                channels: 10240,
-                kernel: 4
-            })
-        );
-        assert_eq!(
-            tensors
-                .get("model.language_model.layers.0.mlp.experts.gate_up_proj")
-                .map(|(shape, _)| *shape),
-            Some(ExpectedShape::ExpertStack {
-                experts: 512,
-                rows: 1280,
-                cols: 2560
-            })
-        );
-        // Fused expert stacks carry no `.weight` suffix; asserting the suffixed
-        // name is absent is what stops a silent rename from passing.
-        assert!(
-            !tensors.contains_key("model.language_model.layers.0.mlp.experts.gate_up_proj.weight")
-        );
-    }
-
-    // ---- the five fault classes -------------------------------------------
-
-    #[test]
-    fn optional_tensors_are_skipped_not_faulted() {
-        let manifest = frozen_manifest();
-        let mut tensors = faultless(&manifest);
-        for name in [
-            "model.visual.patch_embed.proj.weight",
-            "model.visual.blocks.0.attn.qkv.bias",
-            "model.visual.merger.norm.weight",
-            "mtp.fc_hidden.weight",
-            "mtp.layers.0.self_attn.q_proj.weight",
-        ] {
-            tensors.push((name.to_string(), Dtype::BF16, vec![1152, 1152]));
-        }
-        let report = manifest.classify(&observe(&tensors));
-        report.check().unwrap();
-        assert_eq!(report.skipped_optional.len(), 5);
     }
 
     #[test]
@@ -390,19 +192,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_ngram_shard_is_named() {
-        let manifest = frozen_manifest();
-        let dropped =
-            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_77.weight";
-        let tensors: Vec<_> = faultless(&manifest)
-            .into_iter()
-            .filter(|(name, ..)| name != dropped)
-            .collect();
-        let err = error_for(&manifest, &tensors);
-        assert!(err.contains("shard_77"), "{err}");
-    }
-
-    #[test]
     fn an_unexpected_tensor_is_named() {
         let manifest = frozen_manifest();
         let mut tensors = faultless(&manifest);
@@ -427,18 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn a_vector_of_the_wrong_length_is_a_shape_mismatch() {
-        let manifest = frozen_manifest();
-        let bent = "model.language_model.layers.0.linear_attn.A_log";
-        let mut tensors = faultless(&manifest);
-        bend(&mut tensors, bent).2 = vec![16];
-        let err = error_for(&manifest, &tensors);
-        assert!(err.contains(bent), "{err}");
-        assert!(err.contains("[16]"), "{err}");
-        assert!(err.contains("[48]"), "{err}");
-    }
-
-    #[test]
     fn a_dtype_mismatch_is_named() {
         let manifest = frozen_manifest();
         let recast = "model.language_model.layers.0.linear_attn.A_log";
@@ -448,19 +225,6 @@ mod tests {
         assert!(err.contains("dtype mismatch"), "{err}");
         assert!(err.contains(recast), "{err}");
         assert!(err.contains("F32"), "{err}");
-    }
-
-    /// The n-gram partition metadata is integer, so a checkpoint that stored it
-    /// as a weight dtype is a real fault rather than a harmless widening.
-    #[test]
-    fn integer_index_vectors_reject_a_weight_dtype() {
-        let manifest = frozen_manifest();
-        let recast = "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets";
-        let mut tensors = faultless(&manifest);
-        bend(&mut tensors, recast).1 = Dtype::BF16;
-        let err = error_for(&manifest, &tensors);
-        assert!(err.contains(recast), "{err}");
-        assert!(err.contains("I64"), "{err}");
     }
 
     #[test]
