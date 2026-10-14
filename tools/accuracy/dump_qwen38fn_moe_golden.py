@@ -47,11 +47,11 @@ Contract details a replaying consumer needs:
   dtype), `normal_(0.0, 0.05)` for every parameter with `dim() >= 2` and
   `normal_(0.0, 0.5)` otherwise, over `named_parameters()` order.
 
-After writing, the fixture is reloaded and each case replayed. From the stored
-tensors alone: the router logits, the renormalized top-k weights, the selected
-experts, the sigmoid-gated shared output and the block sum must reproduce
-bit-for-bit. With the block rebuilt from the recorded seed, the recorded
-`expert_out` must reproduce bit-for-bit too.
+After writing, the fixture is reloaded and each case replayed against a block
+rebuilt from the recorded seed: the stored weights must be that draw, and the
+router logits, the renormalized top-k weights, the selected experts, the shared
+output, the block sum and the recorded `expert_out` (the one tensor the boundary
+keeps out of the file) must all reproduce bit-for-bit.
 
     python tools/accuracy/dump_qwen38fn_moe_golden.py --out <fixture>
 """
@@ -198,38 +198,6 @@ def case_tensors(block: Qwen4ExpTextSparseMoeBlock, index: int) -> dict[str, tor
     }
 
 
-def reproduce_from_fixture(check: dict[str, torch.Tensor], config) -> None:
-    """Replay every case from the fixture alone: the stored weights and the stored
-    input rows must reproduce the router, the shared gate and the block sum
-    bit-for-bit."""
-    for index, seq_len in enumerate(CASES):
-        prefix = f"case{index}_"
-        top_k = check[prefix + "selected_experts"].shape[1]
-        hidden = check[prefix + "hidden"]
-        assert hidden.shape == (seq_len, config.hidden_size), f"case {index}: stored hidden shape"
-
-        logits = F.linear(hidden, check["gate_weight"])
-        assert torch.equal(logits, check[prefix + "router_logits"]), f"case {index}: router logits mismatch"
-        probs = torch.softmax(logits, dtype=torch.float, dim=-1)
-        top_value, indices = torch.topk(probs, top_k, dim=-1)
-        top_value = top_value / top_value.sum(dim=-1, keepdim=True)
-        assert torch.equal(top_value.to(logits.dtype), check[prefix + "routing_weights"]), (
-            f"case {index}: routing weights mismatch"
-        )
-        assert torch.equal(indices, check[prefix + "selected_experts"].long()), (
-            f"case {index}: selected experts mismatch"
-        )
-        assert torch.allclose(check[prefix + "routing_weights"].float().sum(-1), torch.ones(seq_len, dtype=torch.float32), atol=1e-2), (
-            f"case {index}: routing weights do not sum to 1"
-        )
-
-        gate_scalar = F.sigmoid(F.linear(hidden, check["shared_expert_gate_weight"]))
-        assert torch.equal(check[prefix + "expert_out"] + gate_scalar * check[prefix + "shared_out"], check[prefix + "out"]), (
-            f"case {index}: block != routed + sigmoid(shared gate) * shared"
-        )
-        print(f"case{index}: T={seq_len} fixture-only reproduce OK (logits/weights/selected/shared/out)")
-
-
 def reproduce_with_reference(check: dict[str, torch.Tensor], config) -> None:
     """Replay every case against a block rebuilt from the recorded seed: the
     stored weights must be that draw, and the recorded routed-expert activation —
@@ -314,7 +282,6 @@ def main() -> None:
     gc.collect()
     check = load_file(str(args.out))
     assert check["gate_weight"].shape == (config.num_experts, config.hidden_size), "stored gate_weight shape"
-    reproduce_from_fixture(check, config)
     reproduce_with_reference(check, config)
     print(f"reload: {len(CASES)} cases reproduce bit-for-bit")
 
