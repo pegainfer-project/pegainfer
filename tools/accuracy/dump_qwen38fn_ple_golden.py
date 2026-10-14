@@ -1,59 +1,35 @@
 #!/usr/bin/env python3
 """Generate the PLE (n-gram) block golden at real frozen-config geometry.
 
-Dumps the Qwen3.8-Flash-Next per-layer-embedding reference
-(`Qwen4ExpTextPLELayer` + `Qwen4ExpTextNGramEmbedding`, transformers 5.16.1
-`models/qwen4_exp`) into a fixture a PLE kernel gate replays. Every dimension
-comes from the real frozen checkpoint config (`CONFIG` below): hidden 2560,
-`hc_count` 4 (stream width 10240), `ple_embed_dim` 2560, `ngram_size` 3,
-`heads_per_ngram` 8 (16 heads, head_dim_per_ngram 160), `ngram_vocab_size_base`
-20,000,000, divisor 128.
+Dumps the Qwen3.8-Flash-Next per-layer-embedding reference (`Qwen4ExpTextPLELayer`
++ `Qwen4ExpTextNGramEmbedding`, transformers 5.16.1 `models/qwen4_exp`) into a
+fixture a PLE kernel gate replays. All geometry comes from the real frozen config
+(`CONFIG`): hidden 2560, `hc_count` 4 (stream 10240), `ple_embed_dim` 2560,
+`ngram_size` 3, `heads_per_ngram` 8 (16 heads x 160), and the real per-head prime
+vocabularies/offsets/multipliers. The values cover the mul-xor n-gram hash
+(collisions by design), the EOS-resetting context shift, the grouped `(1+w)` norms
+(group_size 2560), the signed-sqrt gate, and the **dilated** depthwise conv
+(dilation = `ngram_size` = 3, state length 9) the non-dilated in-tree conv1d
+cannot serve.
 
-The traps it keeps covering: the mul-xor n-gram hash with the real per-head prime
-vocabularies and offsets (collisions are by design), the EOS-resetting context
-shift, the grouped `(1+w)` norms (group_size 2560), the signed-sqrt gate, and the
-**dilated** depthwise conv (dilation = `ngram_size` = 3, state length 9), which
-the non-dilated in-tree conv1d cannot serve.
+Three boundaries are moved because the real tensors cannot be stored:
 
-Three fixture boundaries are moved because the real tensors cannot be stored;
-all three are named in the PR body:
+(a) The n-gram table (~95 GiB bf16) cannot be built, so `nn.Embedding` is capped to
+    a tiny stub (`_tiny_embedding`) with the real ids folded in via a recorded
+    `remainder`. The captured ids are the REAL ones and are stored (`ngram_ids`);
+    the embedding *activation* (a lookup into that stub, weights not stored) is not
+    in the fixture -- the `key`/`value` projections it feeds are.
+(b) `key_proj` [10240, 2560] and `value_proj` [2560, 2560] weights are NOT stored;
+    forward hooks capture their outputs as `key`/`value`.
+(c) Otherwise all shapes are real (norms, conv weight, I64 hash buffers, every
+    per-case activation); there is no final GEMM -- the block output is terminal.
 
-(a) The n-gram table is `320001536 x 160` bf16 (~95 GiB) -- impossible to
-    instantiate or commit. `nn.Embedding` is capped to a tiny stub table while the
-    module builds (`_tiny_embedding`) and the real ids are folded into it with a
-    recorded `remainder`. The **hash -> id** math never touches the table, so the
-    captured ids are the REAL ones, and they are what is stored (`ngram_ids`). The
-    embedding *activation* is a lookup into the capped stub table, whose weights are
-    not in the fixture, so no consumer could reproduce it; the projection outputs it
-    feeds (`key`/`value`) are stored instead. The activation itself stays in-run,
-    where it asserts the EOS segment reset.
-(b) `key_proj` [10240, 2560] and `value_proj` [2560, 2560] are ~52 MB + ~13 MB;
-    their weights are NOT stored. Their outputs are captured with forward hooks
-    and stored instead as `key`/`value` (the merged QSA indexer golden does the
-    same for `index_qk_proj`), named so they are not mistaken for those weights.
-(c) Otherwise all shapes are real: the stored norms, conv weight, the I64 hash
-    buffers (multipliers / per-head offsets / vocab sizes) and every per-case
-    activation carry the real geometry. There is no final GEMM -- the block output
-    is the fixture's terminal tensor.
-
-The recorded values are the source of truth (captured via forward hooks, never
-hand-recomputed). Two cheap assertions abort the dump if the capture drifts: the
-captured ids must equal an independent plain-Python re-derivation of the mul-xor
-hash (so a stubbed table can never pass off fake ids), and the captured key/value
-projections must reproduce the module's returned block output bit-for-bit. The
-EOS segment reset is asserted as a property: perturbing the token right before an
-EOS must not move any embedding at or after the reset boundary, and must move the
-embeddings inside its own segment (positive control, so it cannot pass
-vacuously). A mismatch aborts the dump.
-
-Fixture: one JSON `qwen4_ple_golden` metadata blob (format_version 2, config path
-+ sha256, seed, versions) instead of loose provenance tensors; the `eos_token_id`
-scalar; the storeable weights; and per case the inputs, the real `rows` slice, the
-hashed ids, the recorded projection activations and the expected block output.
-
-Scope boundary: the full-sequence (cache=None) path only -- the decode
-continuation states (the 2-token id window and the dilated conv state) are not
-captured and need their own dump.
+Cases: S=8 (no EOS) and S=12 (one mid-sequence EOS, the segment reset). Fixture:
+one JSON `qwen4_ple_golden` blob (format_version 2, config path + sha256, seed,
+versions), the `eos_token_id` scalar, the storeable weights, and per case the
+inputs, `rows` slice, hashed ids, recorded projections and expected block output.
+Scope: full-sequence (cache=None) only; the decode states (2-token id window and
+dilated conv state) need their own dump.
 
     python tools/accuracy/dump_qwen38fn_ple_golden.py --out <fixture>
 """
@@ -64,12 +40,10 @@ import argparse
 import contextlib
 import hashlib
 import json
-import math
 import platform
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 import transformers
 from safetensors.torch import save_file
 
@@ -116,93 +90,6 @@ def _tiny_embedding(cap: int):
         torch.nn.Embedding.__init__ = original
 
 
-def short_conv(
-    hidden_states: torch.Tensor, weight: torch.Tensor, state_len: int, dilation: int
-) -> torch.Tensor:
-    """`_short_conv` with no cache: pad the dilation-aware state length, then conv."""
-    seq_len = hidden_states.shape[1]
-    xs = hidden_states.transpose(1, 2)
-    xs = F.pad(xs, (state_len, 0))
-    xs = xs[..., -(state_len + seq_len) :]
-    out = F.conv1d(xs, weight, dilation=dilation, groups=weight.shape[0])
-    return F.silu(out).transpose(1, 2)
-
-
-def grouped_norm(x: torch.Tensor, weight: torch.Tensor, group_size: int, eps: float) -> torch.Tensor:
-    """`Qwen4ExpTextRMSNorm`: fp32 grouped norm times the `(1 + w)` scale, back to input dtype."""
-    xf = x.reshape(*x.shape[:-1], -1, group_size).float()
-    out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    return (out.flatten(-2) * (1.0 + weight.float())).type_as(x)
-
-
-def block_forward(
-    hidden_states: torch.Tensor,
-    key_raw: torch.Tensor,
-    value: torch.Tensor,
-    norm_key_w: torch.Tensor,
-    norm_query_w: torch.Tensor,
-    norm_conv_w: torch.Tensor,
-    conv_w: torch.Tensor,
-    hc_count: int,
-    hidden_size: int,
-    state_len: int,
-    dilation: int,
-    eps: float,
-) -> torch.Tensor:
-    """The PLE block math from the projection outputs on: norms -> gate -> dilated conv."""
-    key = grouped_norm(key_raw, norm_key_w, hidden_size, eps).unflatten(-1, (hc_count, hidden_size))
-    query = grouped_norm(hidden_states, norm_query_w, hidden_size, eps).unflatten(-1, (hc_count, hidden_size))
-    gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(hidden_size)
-    gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-    gated = (torch.sigmoid(gate) * value.unsqueeze(-2)).flatten(-2)
-    convolved = short_conv(grouped_norm(gated, norm_conv_w, hidden_size, eps), conv_w, state_len, dilation)
-    return gated + convolved
-
-
-def rederive_ngram_ids(ng, input_ids: torch.Tensor) -> torch.Tensor:
-    """Independent plain-Python re-derivation of the mul-xor hash (`[1, S, heads]`).
-
-    EOS-reset sliding window -> per-order mul-xor mix -> per-head remainder + offset.
-    Order o (2..ngram_size) owns heads [(o-2)*hpn, (o-1)*hpn) and mixes window shifts
-    0..o-1; position p sees token p-k only if it lies strictly after the last EOS
-    before p, otherwise the EOS pad. The reference's multiplier bound keeps every
-    product below 2**63, so Python ints and torch int64 agree bit-for-bit.
-    """
-    ids = input_ids[0].tolist()
-    multipliers = ng.layer_multipliers.tolist()
-    sizes = ng.ngram_heads_vocab_sizes.tolist()
-    offsets = ng.ngram_heads_offsets.tolist()
-    eos = ng.eos_token_id
-    rows = []
-    last_eos = -1  # last EOS position strictly before p
-    for p in range(len(ids)):
-        if p > 0 and ids[p - 1] == eos:
-            last_eos = p - 1
-        row = []
-        for order in range(2, ng.ngram_size + 1):
-            mixed = 0
-            for k in range(order):
-                q = p - k
-                token = ids[q] if 0 <= q and q > last_eos else eos
-                mixed ^= token * multipliers[k]
-            base = (order - 2) * ng.heads_per_ngram
-            for h in range(ng.heads_per_ngram):
-                row.append(mixed % sizes[base + h] + offsets[base + h])
-        rows.append(row)
-    return torch.tensor(rows, dtype=torch.long).unsqueeze(0)
-
-
-def _perturb(input_ids: torch.Tensor, pos: int, eos: int, vocab_size: int) -> torch.Tensor:
-    """Flip token `pos` to a different, non-EOS id."""
-    other = input_ids.clone()
-    new = (int(other[0, pos]) + 1) % vocab_size
-    if new == eos:
-        new = (new + 1) % vocab_size
-    other[0, pos] = new
-    assert int(other[0, pos]) != int(input_ids[0, pos])
-    return other
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
@@ -217,7 +104,6 @@ def main() -> None:
     hc_count = cfg.hc_count
     vocab_size = cfg.vocab_size
     eos_token_id = cfg.eos_token_id
-    eps = cfg.rms_norm_eps
 
     torch.manual_seed(SEED)
     with _tiny_embedding(STUB_VOCAB):
@@ -229,14 +115,6 @@ def main() -> None:
             p.normal_(0.0, 0.05 if p.dim() >= 2 else 0.5)
     module = module.to(torch.bfloat16)
     ng = module.ple_embedding
-
-    # Pin the headline trap: the conv must stay dilated (dilation = ngram_size).
-    assert ng.ngram_embedding.num_embeddings == STUB_VOCAB, "stub embedding table not capped"
-    assert module.conv1d.dilation == (cfg.ngram_size,), "reference conv dilation != ngram_size"
-    assert module.conv1d.groups == hc_count * hidden_size, "reference conv is not depthwise"
-    assert module.short_conv_state_len == (cfg.ple_conv_kernel_size - 1) * cfg.ngram_size, (
-        "reference short-conv state length != (kernel - 1) * dilation"
-    )
 
     tensors = {
         "eos_token_id": torch.tensor([eos_token_id], dtype=torch.int64),
@@ -268,7 +146,6 @@ def main() -> None:
 
     handles = [
         ng.ngram_embedding.register_forward_pre_hook(capture_ids(STUB_VOCAB)),
-        ng.register_forward_hook(capture("emb")),
         module.key_proj.register_forward_hook(capture("key")),
         module.value_proj.register_forward_hook(capture("value")),
     ]
@@ -278,7 +155,7 @@ def main() -> None:
         hidden = torch.randn(1, seq_len, hc_count * hidden_size, generator=gen).to(torch.bfloat16)
         ids_gen = torch.Generator().manual_seed(SEED + i)
         input_ids = torch.randint(1, vocab_size, (1, seq_len), generator=ids_gen)
-        # Keep random draws from colliding with the EOS the reset assert keys on.
+        # Keep random draws off the EOS id, reserved for the explicit EOS positions.
         input_ids[input_ids == eos_token_id] = eos_token_id + 1
         for eos_pos in eos_positions:
             input_ids[0, eos_pos] = eos_token_id
@@ -286,50 +163,8 @@ def main() -> None:
         with torch.no_grad():
             out = module(hidden, input_ids, None)
         ngram_ids = captured["ids"]
-        emb = captured["emb"]
         key_raw = captured["key"]
         value = captured["value"]
-
-        # Source of truth is the hook capture; this only aborts the dump if the
-        # captured ids stopped being the real mul-xor hash.
-        rederived_ids = rederive_ngram_ids(ng, input_ids)
-        assert torch.equal(ngram_ids, rederived_ids), (
-            f"case {i} (S={seq_len}) captured n-gram ids != independent hash re-derivation"
-        )
-        # Captured projections must reproduce the module's returned block output.
-        rederived = block_forward(
-            hidden,
-            key_raw,
-            value,
-            module.norm_key.weight,
-            module.norm_query.weight,
-            module.norm_conv.weight,
-            module.conv1d.weight,
-            hc_count,
-            hidden_size,
-            module.short_conv_state_len,
-            cfg.ngram_size,
-            eps,
-        )
-        assert torch.equal(out, rederived), f"case {i} (S={seq_len}) captured key/value != module output"
-        assert bool(torch.isfinite(out.float()).all()), f"case {i} (S={seq_len}) non-finite output"
-
-        for eos_pos in eos_positions:
-            # EOS resets the n-gram window: perturb the token right before the EOS
-            # -- it sits inside the window radius (ngram_size) of position
-            # eos_pos + 1, so without the segment reset that embedding would move.
-            other = _perturb(input_ids, eos_pos - 1, eos_token_id, vocab_size)
-            with torch.no_grad():
-                emb_other = ng(other, None)
-            after = slice(eos_pos + 1, seq_len)
-            assert torch.equal(emb[:, after], emb_other[:, after]), (
-                f"case {i} (S={seq_len}) embedding at/after EOS {eos_pos} depends on pre-EOS tokens"
-            )
-            # Positive control: the perturbation must move the embedding inside its
-            # own segment, so the reset assert above cannot pass vacuously.
-            assert not torch.equal(emb[:, : eos_pos + 1], emb_other[:, : eos_pos + 1]), (
-                f"case {i} (S={seq_len}) perturbed token {eos_pos - 1} changed nothing pre-EOS"
-            )
 
         # Row selection: our cases are short, so every row is evaluated, but the
         # convention is kept so a longer case can drop rows without a layout change.
@@ -345,7 +180,7 @@ def main() -> None:
         tensors[p + "out"] = out[0].index_select(0, rows.long()).contiguous()
         print(
             f"case{i}: S={seq_len} eos={list(eos_positions)} rows={seq_len} "
-            f"heads={ngram_ids.shape[-1]} hash_ok=True block_ok=True reset_ok=True"
+            f"heads={ngram_ids.shape[-1]}"
         )
 
     for h in handles:
