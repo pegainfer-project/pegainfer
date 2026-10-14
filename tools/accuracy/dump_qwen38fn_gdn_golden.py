@@ -9,16 +9,25 @@ feeding the delta rule, and the expected gated-norm output.
 Boundary rule -- the real geometry makes the module ~110 MiB, over GitHub's
 100 MiB push limit, so the per-layer weights are not all stored:
 
-  stored   `conv1d.weight` [10240,1,4], `A_log` [48], `dt_bias` [48],
-           `norm.weight` [128] -- every small, component-local weight.
+  stored   `conv1d.weight` [10240,1,4] and `norm.weight` [128] -- the two
+           component-local weights a GDN kernel applies to the recorded
+           activations (depthwise conv, gated norm).
   recorded `in_proj_qkv` / `in_proj_z` / `in_proj_a` / `in_proj_b` are plain
            GEMMs (~110 MiB combined), so their *outputs* are captured with
            forward hooks instead: the pre-conv `mixed_qkv`, its post-conv
-           `query`/`key`/`value` split, `z`, `g = -A_log.exp()*softplus(a+dt_bias)`
-           and `beta = sigmoid(b)`.
+           `query`/`key`/`value` split, `z`, and the derived gate pair
+           `g = -A_log.exp()*softplus(a+dt_bias)` / `beta = sigmoid(b)`.
   dropped  `out_proj` [6144,2560] is a plain GEMM too: the golden's expected
            output is the gated-norm output *before* it (what the GDN kernel
            produces).
+
+`A_log` [48] / `dt_bias` [48] are not stored: the recorded `g` is already their
+post-derivation form, so nothing in the fixture can apply them -- re-deriving
+`g` would need the `in_proj_a` / `in_proj_b` outputs, which are not stored. The
+boundary sits after the gate derivation; a kernel gate that starts from the raw
+`a`/`b` projections needs its own dump (which must also store those two
+vectors). The layer input `hidden` is not stored for the same reason: nothing in
+the fixture can consume it, since the `in_proj_*` weights are absent.
 
 `conv1d.weight` is stored with its pre-conv input `mixed_qkv` so the depthwise
 conv stage is covered end to end (post-conv `query`/`key`/`value` is reproduced
@@ -45,7 +54,8 @@ and S=64 (one full chunk).
 The dump self-checks (captured activations reproduce the captured gated-norm
 output and the module's returned output bit-for-bit; chunk/recurrent agree in
 fp32; outputs finite) and, after writing, reloads the fixture and reproduces
-every stored tensor from the stored inputs + stored weights, printing one line
+the stored conv split (`query`/`key`/`value`) and gated-norm output (`out`)
+from the stored inputs plus `conv1d_weight` / `norm_weight`, printing one line
 per case.
 """
 
@@ -241,10 +251,11 @@ def main() -> None:
             module.norm.weight.data = torch.randn(config.linear_value_head_dim, generator=gen) * 0.2 + 1.0
         module = module.to(torch.bfloat16)
 
+        # Only the weights a GDN kernel applies to the recorded activations.
+        # `A_log`/`dt_bias` are absent: the recorded `g` is already their
+        # post-derivation form and the `a`/`b` projections are not stored.
         tensors = {
             "conv1d_weight": module.conv1d.weight.detach().contiguous(),
-            "A_log": module.A_log.detach().contiguous(),
-            "dt_bias": module.dt_bias.detach().contiguous(),
             "norm_weight": module.norm.weight.detach().contiguous(),
         }
 
@@ -284,7 +295,6 @@ def main() -> None:
             # mixed_qkv + conv1d_weight cover the depthwise conv; the pre-repeat
             # query/key cover the V/K ratio 3; norm_weight covers the sigmoid gate.
             tensors[p + "seq_len"] = torch.tensor([seq_len], dtype=torch.int32)
-            tensors[p + "hidden"] = hidden.contiguous()
             tensors[p + "mixed_qkv"] = cap["mixed_qkv"].contiguous()
             tensors[p + "query"] = cap["query"].contiguous()
             tensors[p + "key"] = cap["key"].contiguous()
@@ -336,8 +346,6 @@ def verify(path: Path, root: Path) -> None:
     for i, seq_len in enumerate(CASES):
         p = f"case{i}_"
         assert int(tensors[p + "seq_len"]) == seq_len
-        hidden = tensors[p + "hidden"]
-        batch, seq, _ = hidden.shape
         # Conv stage: reproduce post-conv query/key/value from the stored pre-conv
         # mixed_qkv + the stored depthwise conv weight, bit-for-bit.
         pre = tensors[p + "mixed_qkv"]
