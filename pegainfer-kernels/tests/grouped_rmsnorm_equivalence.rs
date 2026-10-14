@@ -66,8 +66,8 @@ const ROWS: usize = TOKENS * BRANCHES;
 /// reduction order (the same warp tree, but summed in f32 instead of f64) plus
 /// `rsqrt.approx`: that moves the product by well under one bf16 ULP, which can
 /// flip a value sitting on a rounding boundary into its neighbour. Four ULP
-/// leaves room for that and is still three orders of magnitude tighter than the
-/// smallest error this file has to catch.
+/// leaves room for that and still sits far below what the negative controls have
+/// to catch — a wrong `(1+w)` slice is a 4x-16x gain error, hundreds of ULP.
 const ULP: f32 = 1.0 / 256.0;
 const TOLERANCE: f32 = 4.0 * ULP;
 
@@ -362,39 +362,44 @@ fn one_full_width_reduction_cannot_express_the_branches() {
 }
 
 /// The grouped call against the independent oracle, at the frozen geometry and
-/// the frozen `eps`.
+/// the frozen `eps`, in both serving shapes: one token (the decode step, 4
+/// blocks) and several (prefill, 4 x tokens blocks). `seq_len` reaches the kernel
+/// only through the grid, so the two are worth a pass each.
 #[test]
 fn the_grouped_norm_matches_its_own_reference() {
     let Some(ctx) = common::device_or_skip() else {
         return;
     };
-    let x = stream_host(TOKENS);
     let weight = weight_host();
-    let reference = grouped_reference(&x, &weight, ROWS, f64::from(EPS));
-
-    let states = grouped_states(&ctx, &x, TOKENS);
     let device_weight = device_weight(&ctx, &weight);
-    let mut out = HiddenStates::zeros(&ctx, STREAM, TOKENS).expect("grouped out");
-    rms_norm_grouped_offset_batch_into(&ctx, &states, &device_weight, BRANCH, EPS, &mut out)
-        .expect("grouped norm");
-    let got = read_back(&ctx, &out);
 
-    let (excess, index, deviation, magnitude) = worst_excess(&got, &reference, TOLERANCE);
-    assert!(
-        excess <= 0.0,
-        "grouped norm vs oracle: element {index} deviates by {deviation} (oracle \
-         {magnitude}), which is {excess} past the bound of {} x bf16 ULP",
-        TOLERANCE / ULP
-    );
-    let (largest, at) = worst_deviation(&got, &reference);
-    eprintln!(
-        "grouped norm vs oracle: {} elements, largest deviation {largest} at element {at} \
-         (largest |oracle| {}), worst margin excess {excess} at element {index} against \
-         {} bf16 ULP",
-        got.len(),
-        largest_magnitude(&reference),
-        TOLERANCE / ULP
-    );
+    for tokens in [1, TOKENS] {
+        let x = stream_host(tokens);
+        let reference = grouped_reference(&x, &weight, tokens * BRANCHES, f64::from(EPS));
+        let states = grouped_states(&ctx, &x, tokens);
+        let mut out = HiddenStates::zeros(&ctx, STREAM, tokens).expect("grouped out");
+        rms_norm_grouped_offset_batch_into(&ctx, &states, &device_weight, BRANCH, EPS, &mut out)
+            .expect("grouped norm");
+        let got = read_back(&ctx, &out);
+
+        let (excess, index, deviation, magnitude) = worst_excess(&got, &reference, TOLERANCE);
+        assert!(
+            excess <= 0.0,
+            "grouped norm vs oracle ({tokens} token(s)): element {index} deviates by \
+             {deviation} (oracle {magnitude}), which is {excess} past the bound of {} x \
+             bf16 ULP",
+            TOLERANCE / ULP
+        );
+        let (largest, at) = worst_deviation(&got, &reference);
+        eprintln!(
+            "grouped norm vs oracle ({tokens} token(s)): {} elements, largest deviation \
+             {largest} at element {at} (largest |oracle| {}), worst margin excess {excess} \
+             at element {index} against {} bf16 ULP",
+            got.len(),
+            largest_magnitude(&reference),
+            TOLERANCE / ULP
+        );
+    }
 }
 
 /// Bit-for-bit equality, on the input family where the arithmetic allows it.
@@ -470,9 +475,20 @@ fn the_grouped_norm_is_bit_exact_on_a_dyadic_input() {
         &oracle,
         &closed_form,
     );
+    // Guard the construction itself, not just one adjacent pair: an input that
+    // collapsed to a single value would make the bitwise comparison below
+    // vacuous, so require both a wide spread and many distinct outputs.
+    let distinct = {
+        let mut bits: Vec<u16> = closed_form.iter().map(|value| value.to_bits()).collect();
+        bits.sort_unstable();
+        bits.dedup();
+        bits.len()
+    };
+    let spread = largest_magnitude(&oracle);
     assert!(
-        largest_magnitude(&oracle) > 1.0 && closed_form.windows(2).any(|pair| pair[0] != pair[1]),
-        "the dyadic input must produce varied, non-degenerate output"
+        spread > 4.0 && distinct >= 8,
+        "the dyadic input must produce a spread, non-degenerate output: largest magnitude \
+         {spread}, {distinct} distinct values"
     );
 
     let states = grouped_states(&ctx, &x, TOKENS);
