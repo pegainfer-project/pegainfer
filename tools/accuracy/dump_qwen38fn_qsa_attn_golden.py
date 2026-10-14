@@ -6,8 +6,8 @@ This dumps the *real-geometry* sparse attention of one full-attention layer
 the sparse-attention kernel gate replays: for a handful of query rows it stores
 the reference's own post-projection activations, the effective sparse+causal
 mask, and the reference's attention weights + gated output. Nothing here
-re-implements the reference math -- the stored values are captured from the
-reference module (forward hooks), and the reload step only replays them.
+re-implements the reference math: every stored value is captured from the
+reference module itself, through forward hooks and its own eager return.
 
 Geometry is the frozen checkpoint config (`hidden_size` 2560, 24 Q / 2 KV heads,
 `head_dim` 256, `partial_rotary_factor` 0.25 -> 64 rotary dims, GQA group 12,
@@ -20,12 +20,16 @@ Boundary rule (why the plain GEMM weights are absent)
 NOT stored. Instead their *outputs* are captured with forward hooks and stored:
 the fused Q+gate `q_proj` output, the `k_proj`/`v_proj` outputs, and the input to
 `o_proj` (the gated attention activation) -- that last one is the golden's
-expected output, since `o_proj` is a plain cuBLAS GEMM. Only the small weights
-that carry real math are stored: `q_norm`/`k_norm` (the per-head `(1+w)` RMS
-norm) and the indexer's `index_qk_proj` (3.3 MB) + `q_layernorm`/`k_layernorm`.
-Each captured activation is named for the projection that produced it
-(`queries`/`keys`/`values`), so no stored tensor shares a name with the weight
-it came from.
+expected output, since `o_proj` is a plain cuBLAS GEMM. The only weights stored
+are `q_norm`/`k_norm`, the per-head `(1+w)` RMS norm the kernel applies to the
+captured `queries`/`keys`. Each captured activation is named for the projection
+that produced it (`queries`/`keys`/`values`), so no stored tensor shares a name
+with the weight it came from.
+
+The indexer's own weights (`index_qk_proj`, `q_layernorm`, `k_layernorm`) are
+absent as well: the sparse mask they produce is stored as data, and their input
+-- the layer's hidden state -- is not part of this fixture. The indexer has its
+own oracle (`qwen38fn-qsa-indexer-golden.safetensors`).
 
 Real boundary (S=2055, budget 2048 -> 512 blocks)
 -------------------------------------------------
@@ -62,14 +66,12 @@ from pathlib import Path
 
 import torch
 import transformers
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
 from transformers.models.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpTextAttention,
     Qwen4ExpTextRotaryEmbedding,
-    apply_rotary_pos_emb,
-    repeat_kv,
 )
 
 # Repo root (tools/accuracy/<this file> -> repo root).
@@ -82,11 +84,6 @@ FORMAT_VERSION = 2
 META_KEY = "qwen4_qsa_attn_golden"
 # Any full-attention layer index; the geometry is layer-independent.
 LAYER_IDX = 3
-
-# Small weights stored once and shared by every case. The big plain GEMMs
-# (`q_proj`/`k_proj`/`v_proj`/`o_proj`) are intentionally absent -- their outputs
-# are captured per case instead.
-STORED_WEIGHTS = ("q_norm", "k_norm", "index_qk_proj", "q_layernorm", "k_layernorm")
 
 # (seq_len, evaluated query rows). `None` -> evaluate every row.
 #   S=8/10 : full rows, no truncation.
@@ -134,6 +131,8 @@ def build_module(config: Qwen4ExpConfig) -> Qwen4ExpTextAttention:
     torch.manual_seed(SEED)
     module = Qwen4ExpTextAttention(config, LAYER_IDX)
     with torch.no_grad():
+        # The indexer's norms are perturbed along with the attention's: they are
+        # not stored, but they shape the mask this fixture records as data.
         for norm in (
             module.q_norm,
             module.k_norm,
@@ -155,67 +154,6 @@ def causal_mask(seq_len: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.T
     return mask, visible
 
 
-def rotary_embeddings(rotary: Qwen4ExpTextRotaryEmbedding, dtype: torch.dtype, positions: torch.Tensor):
-    """cos/sin [1,S,rotary_dim] from stored positions (the rotary module is deterministic)."""
-    dummy = torch.zeros(1, positions.numel(), 1, dtype=dtype)
-    return rotary(dummy, positions.to(torch.long)[None])
-
-
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Qwen4ExpTextRMSNorm: (x * rsqrt(mean(x^2)+eps) * (1+w)), computed in fp32."""
-    xf = x.float()
-    out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    return (out * (1.0 + weight.float())).type_as(x)
-
-
-def replay(config: Qwen4ExpConfig, rotary, weights: dict, case: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reproduce the evaluated rows' (gated attn_out, attn_weights) from stored inputs.
-
-    Mirrors the reference forward for the evaluated rows only; used to self-check
-    that the stored outputs are fully determined by the stored inputs + weights.
-    """
-    seq_len = int(case["seq_len"].item())
-    head_dim = config.head_dim
-    eps = config.rms_norm_eps
-    groups = config.num_attention_heads // config.num_key_value_heads
-    scaling = head_dim**-0.5
-
-    q = case["queries"]                    # [R, 12288] fused Q+gate (captured)
-    k = case["keys"]                       # [S, 512]   (captured)
-    v = case["values"]                     # [S, 512]   (captured)
-    mask = case["mask"]                    # [R, S] bool effective sparse+causal
-    n_rows = int(q.shape[0])
-
-    # Fused Q+gate split: each head's 512 block is [256 q | 256 gate].
-    query_states, gate = torch.chunk(q.view(1, n_rows, -1, head_dim * 2), 2, dim=-1)
-    gate = gate.reshape(1, n_rows, -1)                  # [1, R, 6144]
-    query_states = rms_norm(query_states, weights["q_norm"], eps).transpose(1, 2)  # [1,QH,R,D]
-    key_states = rms_norm(k.view(1, seq_len, -1, head_dim), weights["k_norm"], eps).transpose(1, 2)
-    value_states = v.view(1, seq_len, -1, head_dim).transpose(1, 2)
-
-    cos, sin = rotary_embeddings(rotary, q.dtype, case["positions"])
-    # Queries sit at the evaluated rows; keys cover every position. The reference
-    # rotates both in one call with the full cos/sin, which is row-wise identical.
-    row_pos = case["rows"].to(torch.long)
-    query_states = apply_rotary_pos_emb(
-        query_states, cos=cos.index_select(1, row_pos), sin=sin.index_select(1, row_pos)
-    )
-    key_states = apply_rotary_pos_emb(key_states, cos=cos, sin=sin)
-    key_states = repeat_kv(key_states, groups)
-    value_states = repeat_kv(value_states, groups)
-
-    attn = torch.matmul(query_states, key_states.transpose(2, 3)) * scaling
-    min_dtype = torch.finfo(q.dtype).min
-    fmask = torch.where(
-        mask[None, None], torch.zeros((), dtype=q.dtype), torch.tensor(min_dtype, dtype=q.dtype)
-    )
-    attn = attn + fmask
-    attn_weights = torch.nn.functional.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
-    out = torch.matmul(attn_weights, value_states).transpose(1, 2).contiguous().reshape(1, n_rows, -1)
-    out = (out * torch.sigmoid(gate)).squeeze(0)        # [R, 6144]
-    return out, attn_weights
-
-
 def dump(args) -> None:
     config, config_sha256 = load_config()
     module = build_module(config)
@@ -231,9 +169,6 @@ def dump(args) -> None:
     tensors: dict[str, torch.Tensor] = {
         "q_norm": module.q_norm.weight.detach().contiguous(),
         "k_norm": module.k_norm.weight.detach().contiguous(),
-        "index_qk_proj": module.indexer.index_qk_proj.weight.detach().contiguous(),
-        "q_layernorm": module.indexer.q_layernorm.weight.detach().contiguous(),
-        "k_layernorm": module.indexer.k_layernorm.weight.detach().contiguous(),
     }
 
     for i, (seq_len, rows) in enumerate(CASES):
@@ -310,40 +245,11 @@ def dump(args) -> None:
     print(f"wrote {args.out} ({size_mb:.2f} MiB, {len(tensors)} tensors)")
 
 
-def verify(path: Path) -> None:
-    """Reload the fixture and reproduce every stored output bit-for-bit."""
-    config, _ = load_config()
-    rotary = Qwen4ExpTextRotaryEmbedding(config)
-    data = load_file(str(path))
-    weights = {name: data[name] for name in STORED_WEIGHTS}
-
-    for i, (seq_len, _) in enumerate(CASES):
-        p = f"case{i}_"
-        case = {k[len(p) :]: v for k, v in data.items() if k.startswith(p)}
-        out, attn = replay(config, rotary, weights, case)
-        rows = case["rows"].numel()
-        ok_out = torch.equal(out, case["attn_out"])
-        ok_attn = torch.equal(attn, case["attn_weights"])
-        print(
-            f"verify case{i}: S={seq_len} R={rows} "
-            f"attn_out={'OK' if ok_out else 'FAIL'} attn_weights={'OK' if ok_attn else 'FAIL'}"
-        )
-        assert ok_out and ok_attn, f"case {i}: stored outputs not reproducible bit-for-bit"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument(
-        "--verify-only",
-        action="store_true",
-        help="skip the dump and only re-verify an existing fixture",
-    )
     args = parser.parse_args()
-
-    if not args.verify_only:
-        dump(args)
-    verify(args.out)
+    dump(args)
 
 
 if __name__ == "__main__":
