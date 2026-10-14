@@ -22,8 +22,11 @@ all three are named in the PR body:
     instantiate or commit. `nn.Embedding` is capped to a tiny stub table while the
     module builds (`_tiny_embedding`) and the real ids are folded into it with a
     recorded `remainder`. The **hash -> id** math never touches the table, so the
-    captured ids are the REAL ones; the embedding *activation* is a stub-table
-    artifact recorded as the reference's output.
+    captured ids are the REAL ones, and they are what is stored (`ngram_ids`). The
+    embedding *activation* is a lookup into the capped stub table, whose weights are
+    not in the fixture, so no consumer could reproduce it; the projection outputs it
+    feeds (`key`/`value`) are stored instead. The activation itself stays in-run,
+    where it asserts the EOS segment reset.
 (b) `key_proj` [10240, 2560] and `value_proj` [2560, 2560] are ~52 MB + ~13 MB;
     their weights are NOT stored. Their outputs are captured with forward hooks
     and stored instead as `key`/`value` (the merged QSA indexer golden does the
@@ -46,7 +49,7 @@ vacuously). A mismatch aborts the dump.
 Fixture: one JSON `qwen4_ple_golden` metadata blob (format_version 2, config path
 + sha256, seed, versions) instead of loose provenance tensors; the `eos_token_id`
 scalar; the storeable weights; and per case the inputs, the real `rows` slice, the
-hashed ids, the recorded activations and the expected block output.
+hashed ids, the recorded projection activations and the expected block output.
 
 Scope boundary: the full-sequence (cache=None) path only -- the decode
 continuation states (the 2-token id window and the dilated conv state) are not
@@ -337,7 +340,6 @@ def main() -> None:
         tensors[p + "input_ids"] = input_ids[0].to(torch.int64).contiguous()
         tensors[p + "hidden"] = hidden[0].index_select(0, rows.long()).contiguous()
         tensors[p + "ngram_ids"] = ngram_ids[0].index_select(0, rows.long()).contiguous()
-        tensors[p + "ngram_emb"] = emb[0].index_select(0, rows.long()).contiguous()
         tensors[p + "key"] = key_raw[0].index_select(0, rows.long()).contiguous()
         tensors[p + "value"] = value[0].index_select(0, rows.long()).contiguous()
         tensors[p + "out"] = out[0].index_select(0, rows.long()).contiguous()
