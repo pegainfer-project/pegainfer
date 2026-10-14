@@ -210,7 +210,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, help="write the fixture here (then self-verify)")
     parser.add_argument("--verify", type=Path, help="verify an existing fixture and exit")
-    parser.add_argument("--root", type=Path, default=Path("."), help="repo root holding the config")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(__file__).resolve().parents[2],
+        help="repo root holding the frozen config (defaults to this script's repo)",
+    )
     args = parser.parse_args()
     if not args.out and not args.verify:
         parser.error("one of --out / --verify is required")
