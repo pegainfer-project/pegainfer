@@ -26,8 +26,8 @@ all three are named in the PR body:
     artifact recorded as the reference's output.
 (b) `key_proj` [10240, 2560] and `value_proj` [2560, 2560] are ~52 MB + ~13 MB;
     their weights are NOT stored. Their outputs are captured with forward hooks
-    and stored instead (the merged QSA indexer golden does the same for
-    `index_qk_proj`).
+    and stored instead as `key`/`value` (the merged QSA indexer golden does the
+    same for `index_qk_proj`), named so they are not mistaken for those weights.
 (c) Otherwise all shapes are real: the stored norms, conv weight, the I64 hash
     buffers (multipliers / per-head offsets / vocab sizes) and every per-case
     activation carry the real geometry. There is no final GEMM -- the block output
@@ -338,8 +338,8 @@ def main() -> None:
         tensors[p + "hidden"] = hidden[0].index_select(0, rows.long()).contiguous()
         tensors[p + "ngram_ids"] = ngram_ids[0].index_select(0, rows.long()).contiguous()
         tensors[p + "ngram_emb"] = emb[0].index_select(0, rows.long()).contiguous()
-        tensors[p + "key_proj"] = key_raw[0].index_select(0, rows.long()).contiguous()
-        tensors[p + "value_proj"] = value[0].index_select(0, rows.long()).contiguous()
+        tensors[p + "key"] = key_raw[0].index_select(0, rows.long()).contiguous()
+        tensors[p + "value"] = value[0].index_select(0, rows.long()).contiguous()
         tensors[p + "out"] = out[0].index_select(0, rows.long()).contiguous()
         print(
             f"case{i}: S={seq_len} eos={list(eos_positions)} rows={seq_len} "
@@ -407,8 +407,8 @@ def verify(path: Path, eps: float) -> None:
         p = f"case{i}_"
         rows = flat[p + "rows"].long()
         hidden = flat[p + "hidden"][None]
-        key_raw = flat[p + "key_proj"][None]
-        value = flat[p + "value_proj"][None]
+        key_raw = flat[p + "key"][None]
+        value = flat[p + "value"][None]
         hidden_size = value.shape[-1]
         hc_count = key_raw.shape[-1] // hidden_size
 
