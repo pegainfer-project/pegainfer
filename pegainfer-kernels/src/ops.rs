@@ -42,6 +42,8 @@ mod marlin_face;
 mod norm;
 #[cfg(feature = "qwen35")]
 mod qwen35;
+#[cfg(feature = "qwen4")]
+mod qwen38fn;
 mod sampling;
 
 pub use attention::PrefillPagedPlan;
@@ -234,6 +236,10 @@ pub use qwen35::paged_attention_batch_decode_hd256_into;
 pub use qwen35::paged_attention_batch_decode_via_prefill_hd256_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::qk_norm_partial_rope_batched_decode_hd256_into;
+#[cfg(feature = "qwen4")]
+pub use qwen38fn::QsaIndexerGeometry;
+#[cfg(feature = "qwen4")]
+pub use qwen38fn::qsa_indexer_block_scores_into;
 pub use sampling::BatchSamplingRow;
 pub use sampling::BatchSamplingScratch;
 pub use sampling::argmax;
