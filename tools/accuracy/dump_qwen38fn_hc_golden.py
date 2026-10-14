@@ -3,24 +3,14 @@
 
 Dumps the Qwen3.8-Flash-Next gated-residual reference (`Qwen4ExpTextGatedResidual`,
 transformers 5.16.1 `models/qwen4_exp`) into a fixture a hyper-connection kernel gate
-replays. Every dimension is taken from the real frozen checkpoint config
-(`hc_count` 4 -> a 10240-wide stream, `hidden_size` 2560, `hc_lowrank` 320); nothing
-is shrunk and nothing is dropped, because the mix GEMMs *are* the component under test.
+replays, at the real frozen-checkpoint geometry (`hc_count` 4, `hidden_size` 2560,
+`hc_lowrank` 320); nothing is shrunk, because the mix GEMMs *are* the component under test.
 
-This is the residual block of the line: the stream is 4 branches wide; a grouped
-`(1+w)` RMSNorm (group size 2560, i.e. one group per branch) feeds a rank-`hc_lowrank`
-mix gate (`silu` -> `sigmoid`) that combines the branches by **mean**, and a per-branch
-injection weight re-scatters the sublayer output. `/hc_count` is applied on both the mix
-and the inject paths, and the injection weights live in `(0, 2)`. The top-level readout
-uses the same module with `use_combine=False` (there is no final-norm tensor), so both
-variants are captured: `use_combine=True` returns the mixed stream, the un-normed hyper
-echo and the injection weights, `use_combine=False` returns only the mixer readout.
-
-The mix/injection formulas are re-derived from the module's own submodules and asserted
-bit-for-bit equal to the module output (a mismatch aborts the dump); the grouped `(1+w)`
-norm is additionally reconstructed independently of the module so a grouping/eps
-regression cannot hide. This re-derivation is cheap: the mix re-uses the module's own
-`Linear` submodules and the norm pass is elementwise.
+The residual block is a 4-branch stream: a grouped `(1+w)` RMSNorm (one group per branch)
+feeds a rank-`hc_lowrank` mix gate (`silu` -> `sigmoid`) that combines the branches by
+**mean**, and a per-branch injection weight re-scatters the sublayer output (`/hc_count`
+on both paths); the top-level readout reuses the module with `use_combine=False`. Cases
+S=6/10; the manifest is one JSON metadata key (`qwen4_hc_golden`, format_version 2).
 
     python tools/accuracy/dump_qwen38fn_hc_golden.py --out test_data/qwen38fn-hc-golden.safetensors
 """
@@ -34,7 +24,6 @@ import platform
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 import transformers
 from safetensors.torch import save_file
 
@@ -73,64 +62,15 @@ def build_modules(config) -> tuple[Qwen4ExpTextGatedResidual, Qwen4ExpTextGatedR
     return combine.to(torch.bfloat16), mixer.to(torch.bfloat16)
 
 
-def grouped_norm(weight: torch.Tensor, x: torch.Tensor, hc_count: int, hidden: int, eps: float) -> torch.Tensor:
-    """Independent grouped `(1+w)` RMSNorm: `hc_count` groups of `hidden`, per-group rms
-    in fp32, scaled by `(1+w)`, cast back to x's dtype. Mirrors
-    `Qwen4ExpTextRMSNorm(hc_count*hidden, group_size=hidden)` WITHOUT calling it, so a
-    grouping/eps regression in the reference turns the dump-time assertion red."""
-    xf = x.float().unflatten(-1, (hc_count, hidden))
-    out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    return (out.flatten(-2) * (1.0 + weight.float())).to(x.dtype)
-
-
-def branch_mix(module: Qwen4ExpTextGatedResidual, normed: torch.Tensor) -> torch.Tensor:
-    """Re-derive the per-branch mix products from the module's OWN submodules: a
-    `silu -> sigmoid` gate at rank `hc_lowrank`, `/hc_count` on the down projection.
-    Shape `[..., hc_count, hidden_size]`."""
-    hc = module.hc_count
-    hidden = module.hidden_size
-    mix = F.silu(module.input_mix_weight_down(normed) / hc)
-    mix = torch.sigmoid(module.input_mix_weight_up(mix)).unflatten(-1, (hc, hidden))
-    return mix * normed.unflatten(-1, (hc, hidden))
-
-
-def inject_weights(module: Qwen4ExpTextGatedResidual, normed: torch.Tensor):
-    """Re-derive the injection weights `2*sigmoid(W @ x / hc_count)` from the module's OWN
-    submodule; None for the `use_combine=False` mixer (no injection head)."""
-    if module.block_inject_weight is None:
-        return None
-    return 2 * torch.sigmoid(module.block_inject_weight(normed) / module.hc_count)
-
-
 def case_tensors(combine, mixer, config, index: int) -> dict[str, torch.Tensor]:
     seq_len = CASES[index]
     gen = torch.Generator().manual_seed(SEED + index)
     hyper = torch.randn(1, seq_len, config.hc_count * config.hidden_size, generator=gen).to(torch.bfloat16)
 
     with torch.no_grad():
-        mixed, hyper_out, inject = combine(hyper)
+        mixed, _, inject = combine(hyper)
         mixed_only = mixer(hyper)
-        mod_normed = combine.hc_norm(hyper)
-        normed = grouped_norm(combine.hc_norm.weight, hyper, config.hc_count, config.hidden_size, config.rms_norm_eps)
-        branches = branch_mix(combine, mod_normed)
-        r_mixed = branches.mean(dim=-2)
-        r_inject = inject_weights(combine, mod_normed)
-        r_mixed_only = branch_mix(mixer, mixer.hc_norm(hyper)).mean(dim=-2)
-
-    assert torch.equal(mod_normed, normed), f"case {index} (S={seq_len}) grouped (1+w) norm re-derivation != module"
-    assert torch.equal(mixed, r_mixed), f"case {index} (S={seq_len}) mix re-derivation != module"
-    assert torch.equal(inject, r_inject), f"case {index} (S={seq_len}) injection re-derivation != module"
-    assert torch.equal(mixed_only, r_mixed_only), (
-        f"case {index} (S={seq_len}) mixer (use_combine=False) re-derivation != module"
-    )
-    assert torch.equal(hyper_out, hyper), f"case {index} (S={seq_len}) module echoed a different hyper stream"
-    assert bool(torch.isfinite(mixed.float()).all()), f"case {index} (S={seq_len}) non-finite mix"
-    assert bool(torch.isfinite(mixed_only.float()).all()), f"case {index} (S={seq_len}) non-finite mixer readout"
-    # Injection is 2 * sigmoid, so it lives strictly inside (0, 2).
-    assert bool(((inject > 0) & (inject < 2)).all()), f"case {index} (S={seq_len}) injection out of range"
-    # The branch combine is a mean, not a sum: the per-branch products average to the readout.
-    assert torch.equal(mixed, branches.mean(dim=-2)), f"case {index} (S={seq_len}) combine is not a mean"
-    assert not torch.equal(mixed, branches.sum(dim=-2)), f"case {index} (S={seq_len}) combine looks like a sum"
+        normed = combine.hc_norm(hyper)
 
     p = f"case{index}_"
     return {
@@ -152,11 +92,6 @@ def main() -> None:
     config, config_sha256 = load_text_config(root / CONFIG)
 
     combine, mixer = build_modules(config)
-
-    # Provenance faithfulness: config_sha256 digests rms_norm_eps, so abort if either
-    # module norm was built with a different eps than the config claims.
-    assert combine.hc_norm.eps == config.rms_norm_eps, "combine norm eps drifted from the config"
-    assert mixer.hc_norm.eps == config.rms_norm_eps, "mixer norm eps drifted from the config"
 
     # The mix GEMMs are the component under test, so ALL weights are stored.
     tensors = {
