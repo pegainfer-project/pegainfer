@@ -531,7 +531,9 @@ __global__ void DualRMSNormAddKernel(const T* __restrict__ a,
 // flattens back, and *then* scales by `(1 + w)` with `w` indexed by the row's
 // global column — so group `k` reads `w[k*g .. (k+1)*g]`
 // (modeling_qwen4_exp.py:148-168; the hyper-connection `hc_norm` and the three
-// PLE norms all run a 10240-wide stream in four 2560-wide groups). Flattened,
+// PLE norms all run a 10240-wide stream in four 2560-wide groups — the tensor
+// contract pins that width as `hc_count * hidden_size`, see
+// pegainfer-qwen4/src/manifest/schema.rs:135-137 and :415-421). Flattened,
 // that is `seq_len * groups` contiguous g-wide rows with the group as the
 // fastest-varying index.
 //
@@ -544,7 +546,10 @@ __global__ void DualRMSNormAddKernel(const T* __restrict__ a,
 // shared-memory stage and `rsqrt.approx` are the vendor kernel's, so that a call
 // whose weight slices are all equal reproduces the bits of
 // `rms_norm_batched_offset_cuda` (asserted by the pooled gate in
-// tests/grouped_rmsnorm_equivalence.rs).
+// tests/grouped_rmsnorm_equivalence.rs). The copy is deliberate: the alternative
+// — the vendor template launched once per group off a strided base — needs the
+// same new FFI surface and costs one launch per group, four per hyper-connection
+// block per layer step on this line, where this is one.
 // ============================================================================
 template <uint32_t VEC_SIZE, typename T>
 __global__ void GroupedRMSNormKernel(const T* __restrict__ input,
