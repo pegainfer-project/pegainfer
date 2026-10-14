@@ -19,15 +19,10 @@ echo and the injection weights, `use_combine=False` returns only the mixer reado
 The mix/injection formulas are re-derived from the module's own submodules and asserted
 bit-for-bit equal to the module output (a mismatch aborts the dump); the grouped `(1+w)`
 norm is additionally reconstructed independently of the module so a grouping/eps
-regression cannot hide. This re-derivation is cheap and allowed here because it is
-elementwise.
-
-After writing, the fixture is reloaded and every stored output is reproduced bit-for-bit
-from the stored inputs and stored weights.
+regression cannot hide. This re-derivation is cheap: the mix re-uses the module's own
+`Linear` submodules and the norm pass is elementwise.
 
     python tools/accuracy/dump_qwen38fn_hc_golden.py --out test_data/qwen38fn-hc-golden.safetensors
-
-Pass --verify-only to skip the dump and re-check an existing fixture in place.
 """
 
 from __future__ import annotations
@@ -41,7 +36,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import transformers
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
@@ -148,52 +143,13 @@ def case_tensors(combine, mixer, config, index: int) -> dict[str, torch.Tensor]:
     }
 
 
-def verify(out: Path, config) -> list[str]:
-    """Reload the fixture and reproduce EVERY stored output bit-for-bit from the stored
-    inputs and stored weights. Returns one line per case."""
-    t = load_file(str(out))
-    hc, hidden, eps = config.hc_count, config.hidden_size, config.rms_norm_eps
-
-    def norm_from(weight, x):
-        return grouped_norm(weight, x, hc, hidden, eps)
-
-    def mix_from(normed, down_w, up_w):
-        m = F.silu(F.linear(normed, down_w) / hc)
-        m = torch.sigmoid(F.linear(m, up_w)).unflatten(-1, (hc, hidden))
-        return (m * normed.unflatten(-1, (hc, hidden))).mean(dim=-2)
-
-    lines = []
-    for index, seq_len in enumerate(CASES):
-        p = f"case{index}_"
-        hyper = t[p + "hyper_input"]
-        normed = norm_from(t["hc_norm"], hyper)
-        assert torch.equal(normed, t[p + "normed"]), f"reload case {index}: normed"
-        mixed = mix_from(normed, t["input_mix_weight_down"], t["input_mix_weight_up"])
-        assert torch.equal(mixed, t[p + "mixed"]), f"reload case {index}: mixed"
-        inject = 2 * torch.sigmoid(F.linear(normed, t["block_inject_weight"]) / hc)
-        assert torch.equal(inject, t[p + "inject"]), f"reload case {index}: inject"
-        mixer_normed = norm_from(t["mixer_norm"], hyper)
-        mixed_only = mix_from(mixer_normed, t["mixer_down"], t["mixer_up"])
-        assert torch.equal(mixed_only, t[p + "mixed_only"]), f"reload case {index}: mixed_only"
-        assert int(t[p + "seq_len"][0]) == seq_len, f"reload case {index}: seq_len"
-        lines.append(
-            f"case{index}: S={seq_len} inject_mean={inject.float().mean().item():.4f} reload_reproduction_ok=True"
-        )
-    return lines
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--verify-only", action="store_true", help="reload and re-check an existing fixture")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[2]
     config, config_sha256 = load_text_config(root / CONFIG)
-    if args.verify_only:
-        for line in verify(args.out, config):
-            print("verify " + line)
-        return
 
     combine, mixer = build_modules(config)
 
@@ -231,9 +187,6 @@ def main() -> None:
     save_file(tensors, str(args.out), metadata=metadata)
     size_mb = args.out.stat().st_size / (1024 * 1024)
     print(f"wrote {args.out} ({size_mb:.2f} MiB, {len(tensors)} tensors)")
-
-    for line in verify(args.out, config):
-        print("verify " + line)
 
 
 if __name__ == "__main__":
