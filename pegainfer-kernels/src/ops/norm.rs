@@ -603,6 +603,80 @@ pub fn rms_norm_batch_offset_into(
     Ok(())
 }
 
+/// Batched **grouped** `(1+weight)` RMSNorm over `HiddenStates`: each row's
+/// `hidden_dim` columns are `hidden_dim / group_size` adjacent groups, every
+/// group is normalized on its own (its own mean of squares, under the one shared
+/// `eps`), and the `(1 + w)` scale is indexed by the row's *global* column — so
+/// group `k` reads `weight[k * group_size .. (k + 1) * group_size]`.
+///
+/// This is Qwen3.8-Flash-Next's grouped norm (`Qwen4ExpTextRMSNorm(hidden, eps,
+/// group_size)`): the hyper-connection `hc_norm` and the three PLE norms all run
+/// a 10240-wide stream in four 2560-wide groups. It is *not* the same call as
+/// [`rms_norm_batch_offset_into`] on a `hidden_dim = group_size` reshape of the
+/// stream: that kernel hands every row `weight[0 .. group_size)`
+/// (`RMSNormKernel` has no row term on the weight address), so every group but
+/// the first would be scaled by group 0's weights. See
+/// `tests/grouped_rmsnorm_equivalence.rs`.
+pub fn rms_norm_grouped_offset_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &DeviceVec,
+    group_size: usize,
+    eps: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    const OP: &str = "rms_norm_grouped_offset_batch_into";
+    ensure!(
+        x.hidden_dim > 0 && x.seq_len > 0 && group_size > 0,
+        "{OP} dimensions must be non-zero"
+    );
+    ensure!(
+        x.hidden_dim % group_size == 0,
+        "{OP} hidden_dim {} is not a whole number of {group_size}-wide groups",
+        x.hidden_dim
+    );
+    ensure!(
+        weight.len == x.hidden_dim,
+        "{OP} weight len {} != hidden_dim {}",
+        weight.len,
+        x.hidden_dim
+    );
+    ensure!(
+        weight.data.len() >= x.hidden_dim,
+        "{OP} weight backing too small"
+    );
+    ensure!(
+        out.hidden_dim == x.hidden_dim && out.seq_len == x.seq_len,
+        "{OP} out shape mismatch"
+    );
+    x.checked_extent("rms_norm_grouped_offset_batch_into x")?;
+    out.checked_extent("rms_norm_grouped_offset_batch_into out")?;
+    let hidden_dim = super::checked_i32(
+        x.hidden_dim,
+        "rms_norm_grouped_offset_batch_into hidden_dim",
+    )?;
+    let group_size =
+        super::checked_i32(group_size, "rms_norm_grouped_offset_batch_into group_size")?;
+    let seq_len = super::checked_i32(x.seq_len, "rms_norm_grouped_offset_batch_into seq_len")?;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::rms_norm_grouped_offset_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            hidden_dim,
+            group_size,
+            seq_len,
+            eps,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// (1+weight) RMSNorm into pre-allocated output buffer (Gemma/Qwen3.5 style)
 pub fn rms_norm_offset_into(
     ctx: &DeviceContext,

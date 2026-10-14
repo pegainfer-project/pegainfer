@@ -227,6 +227,7 @@ pub use norm::rms_norm_batch_dual_into;
 pub use norm::rms_norm_batch_into;
 pub use norm::rms_norm_batch_offset_into;
 pub use norm::rms_norm_gated_batch_into;
+pub use norm::rms_norm_grouped_offset_batch_into;
 pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;

@@ -468,6 +468,20 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Batched grouped (1+weight) RMSNorm: `hidden_dim` is `hidden_dim /
+    // group_size` adjacent groups, each reduced on its own, and the weight is
+    // indexed by the row's global column (Qwen3.8-Flash-Next hc_norm / PLE).
+    pub fn rms_norm_grouped_offset_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        group_size: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // (1+weight) RMSNorm — Qwen3.5 / Gemma style
     pub fn rms_norm_offset_cuda(
         x: *const Half,
