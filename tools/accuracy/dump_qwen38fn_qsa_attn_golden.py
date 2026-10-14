@@ -23,6 +23,9 @@ the fused Q+gate `q_proj` output, the `k_proj`/`v_proj` outputs, and the input t
 expected output, since `o_proj` is a plain cuBLAS GEMM. Only the small weights
 that carry real math are stored: `q_norm`/`k_norm` (the per-head `(1+w)` RMS
 norm) and the indexer's `index_qk_proj` (3.3 MB) + `q_layernorm`/`k_layernorm`.
+Each captured activation is named for the projection that produced it
+(`queries`/`keys`/`values`), so no stored tensor shares a name with the weight
+it came from.
 
 Real boundary (S=2055, budget 2048 -> 512 blocks)
 -------------------------------------------------
@@ -177,9 +180,9 @@ def replay(config: Qwen4ExpConfig, rotary, weights: dict, case: dict) -> tuple[t
     groups = config.num_attention_heads // config.num_key_value_heads
     scaling = head_dim**-0.5
 
-    q = case["q_proj"]                     # [R, 12288] fused Q+gate (captured)
-    k = case["k_proj"]                     # [S, 512]   (captured)
-    v = case["v_proj"]                     # [S, 512]   (captured)
+    q = case["queries"]                    # [R, 12288] fused Q+gate (captured)
+    k = case["keys"]                       # [S, 512]   (captured)
+    v = case["values"]                     # [S, 512]   (captured)
     mask = case["mask"]                    # [R, S] bool effective sparse+causal
     n_rows = int(q.shape[0])
 
@@ -219,9 +222,9 @@ def dump(args) -> None:
     rotary = Qwen4ExpTextRotaryEmbedding(config)
 
     captured: dict[str, torch.Tensor] = {}
-    module.q_proj.register_forward_hook(lambda m, i, o: captured.__setitem__("q_proj", o))
-    module.k_proj.register_forward_hook(lambda m, i, o: captured.__setitem__("k_proj", o))
-    module.v_proj.register_forward_hook(lambda m, i, o: captured.__setitem__("v_proj", o))
+    module.q_proj.register_forward_hook(lambda m, i, o: captured.__setitem__("q_act", o))
+    module.k_proj.register_forward_hook(lambda m, i, o: captured.__setitem__("k_act", o))
+    module.v_proj.register_forward_hook(lambda m, i, o: captured.__setitem__("v_act", o))
     module.o_proj.register_forward_pre_hook(lambda m, i: captured.__setitem__("o_in", i[0]))
     module.indexer.register_forward_hook(lambda m, i, o: captured.__setitem__("indexer_mask", o))
 
@@ -271,7 +274,7 @@ def dump(args) -> None:
                 f"case {i}: real boundary drops unexpected: {drops}"
             )
 
-        q_rows = captured["q_proj"][0].index_select(0, row_idx).contiguous()
+        q_rows = captured["q_act"][0].index_select(0, row_idx).contiguous()
         o_rows = captured["o_in"][0].index_select(0, row_idx).contiguous()
         mask_rows = eff[0, 0].index_select(0, row_idx).contiguous()
         attn_rows = attn_weights[:, :, row_idx, :].contiguous()
@@ -280,9 +283,9 @@ def dump(args) -> None:
         tensors[p + "seq_len"] = torch.tensor([seq_len], dtype=torch.int32)
         tensors[p + "rows"] = row_idx.to(torch.int32).contiguous()
         tensors[p + "positions"] = positions.contiguous()
-        tensors[p + "q_proj"] = q_rows
-        tensors[p + "k_proj"] = captured["k_proj"][0].contiguous()
-        tensors[p + "v_proj"] = captured["v_proj"][0].contiguous()
+        tensors[p + "queries"] = q_rows
+        tensors[p + "keys"] = captured["k_act"][0].contiguous()
+        tensors[p + "values"] = captured["v_act"][0].contiguous()
         tensors[p + "mask"] = mask_rows
         tensors[p + "attn_out"] = o_rows
         tensors[p + "attn_weights"] = attn_rows
