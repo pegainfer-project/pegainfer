@@ -28,9 +28,17 @@ query/key stored pre-repeat) and the sigmoid gated norm -- the reference's
 `output_gate_type` is `"sigmoid"` while the in-tree kernel hardcodes silu.
 
 The reference `forward` (cache_params=None) always takes the chunk (prefill)
-path; cases cover S=16 (partial chunk) and S=64 (one full chunk), no row
-selection needed (widest stored tensor: S=64 `mixed_qkv` [1,64,10240], 1.25 MiB).
-Metadata is a single JSON key (`qwen4_gdn_golden`, format_version 2).
+path. Its chunk rule uses `chunk_size=64` and carries `last_recurrent_state` from
+one chunk into the next, so the cases pick what the loop sees:
+
+  S=16   pad 48 -> 64  -> one chunk from a zero state
+  S=64   pad  0 -> 64  -> one chunk from a zero state
+  S=80   pad 48 -> 128 -> two chunks, the second 16 real rows + 48 pad
+  S=128  pad  0 -> 128 -> two full chunks
+
+The last two are the ones that exercise the carried state. No row selection is
+needed (widest stored tensor: S=128 `mixed_qkv` [1,128,10240], 2.5 MiB). Metadata
+is a single JSON key (`qwen4_gdn_golden`, format_version 2).
 
     python tools/accuracy/dump_qwen38fn_gdn_golden.py --out <fixture>
 """
@@ -62,8 +70,9 @@ FORMAT_VERSION = 2
 # Single metadata key; the gate asserts the digest on load.
 META_KEY = "qwen4_gdn_golden"
 
-# Prefill chunk path: S=16 is a partial chunk, S=64 is exactly one full chunk.
-CASES = [16, 64]
+# Prefill chunk path (the reference's chunk rule: `chunk_size=64`, state carried
+# across chunks). 16 and 64 run a single chunk; 80 and 128 cross a chunk boundary.
+CASES = [16, 64, 80, 128]
 
 
 def load_config(root: Path) -> tuple[Qwen4ExpConfig, str]:
