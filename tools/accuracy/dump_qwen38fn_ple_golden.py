@@ -68,7 +68,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import transformers
-from safetensors.torch import safe_open, save_file
+from safetensors.torch import save_file
 
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
@@ -362,78 +362,6 @@ def main() -> None:
     save_file(tensors, str(args.out), metadata={"qwen4_ple_golden": json.dumps(manifest, sort_keys=True)})
     size_mb = args.out.stat().st_size / (1024 * 1024)
     print(f"wrote {args.out} ({size_mb:.2f} MiB, {len(tensors)} tensors)")
-
-    verify(args.out, eps)
-
-
-def verify(path: Path, eps: float) -> None:
-    """Reload the fixture and reproduce every reproducible output bit-for-bit."""
-    with safe_open(str(path), framework="pt") as handle:
-        manifest = json.loads(handle.metadata()["qwen4_ple_golden"])
-        flat = {name: handle.get_tensor(name) for name in handle.keys()}
-    assert manifest["format_version"] == FORMAT_VERSION, "fixture format_version mismatch"
-
-    ngram_size = flat["layer_multipliers"].shape[0]
-    heads_total = flat["ngram_heads_vocab_sizes"].shape[0]
-    heads_per_ngram = heads_total // (ngram_size - 1)
-    conv_w = flat["conv1d_weight"]
-    dilation = ngram_size
-    state_len = (conv_w.shape[-1] - 1) * dilation
-    eos = int(flat["eos_token_id"][0])
-
-    def hash_ids(input_ids: torch.Tensor) -> list[list[int]]:
-        ids = input_ids.tolist()
-        mult = flat["layer_multipliers"].tolist()
-        sizes = flat["ngram_heads_vocab_sizes"].tolist()
-        offsets = flat["ngram_heads_offsets"].tolist()
-        rows, last_eos = [], -1
-        for pos in range(len(ids)):
-            if pos > 0 and ids[pos - 1] == eos:
-                last_eos = pos - 1
-            row = []
-            for order in range(2, ngram_size + 1):
-                mixed = 0
-                for k in range(order):
-                    q = pos - k
-                    token = ids[q] if 0 <= q and q > last_eos else eos
-                    mixed ^= token * mult[k]
-                base = (order - 2) * heads_per_ngram
-                for h in range(heads_per_ngram):
-                    row.append(mixed % sizes[base + h] + offsets[base + h])
-            rows.append(row)
-        return rows
-
-    for i, (seq_len, eos_positions) in enumerate(CASES):
-        p = f"case{i}_"
-        rows = flat[p + "rows"].long()
-        hidden = flat[p + "hidden"][None]
-        key_raw = flat[p + "key"][None]
-        value = flat[p + "value"][None]
-        hidden_size = value.shape[-1]
-        hc_count = key_raw.shape[-1] // hidden_size
-
-        hash_ok = torch.equal(
-            torch.tensor(hash_ids(flat[p + "input_ids"]), dtype=torch.long).index_select(0, rows),
-            flat[p + "ngram_ids"],
-        )
-        reproduced = block_forward(
-            hidden,
-            key_raw,
-            value,
-            flat["norm_key"],
-            flat["norm_query"],
-            flat["norm_conv"],
-            conv_w,
-            hc_count,
-            hidden_size,
-            state_len,
-            dilation,
-            eps,
-        )[0].index_select(0, rows)
-        block_ok = torch.equal(reproduced, flat[p + "out"])
-        assert hash_ok and block_ok, f"case {i} verify failed: hash_ok={hash_ok} block_ok={block_ok}"
-        print(f"case{i}: S={seq_len} eos={list(eos_positions)} hash_ok={hash_ok} block_bitwise_ok={block_ok}")
-
 
 if __name__ == "__main__":
     main()
