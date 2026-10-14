@@ -34,7 +34,7 @@ vllm-text = { workspace = true }
 
 [features]
 default = []
-qwen35 = ["pegainfer-kernels/qwen35"]
+qwen35 = ["pegainfer-kernels/qwen35", "pegainfer-core/qwen35"]
 
 [lints]
 workspace = true

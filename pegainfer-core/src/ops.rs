@@ -4,6 +4,8 @@ mod attention;
 pub mod call_spec;
 #[cfg(feature = "kernel-call-trace")]
 pub mod call_trace;
+#[cfg(feature = "qwen35")]
+mod gdn;
 mod paged_plan;
 #[cfg(feature = "kernel-call-trace")]
 mod traced;
@@ -11,6 +13,16 @@ mod traced;
 pub use attention::paged_attention_batch_decode_into;
 pub use attention::paged_attention_batch_decode_split_kv_into;
 pub use attention::prefill_attention_paged_into;
+#[cfg(feature = "qwen35")]
+pub use gdn::GDN_AOT_KEY_HEAD_DIM;
+#[cfg(feature = "qwen35")]
+pub use gdn::GDN_AOT_VALUE_HEAD_DIM;
+#[cfg(feature = "qwen35")]
+pub use gdn::LINEAR_CONV_MAX_KERNEL_DIM;
+#[cfg(feature = "qwen35")]
+pub use gdn::conv1d_decode_batch_into;
+#[cfg(feature = "qwen35")]
+pub use gdn::gated_delta_rule_decode_batch_into;
 pub use paged_plan::PrefillPagedPlan;
 pub use paged_plan::SplitKvCsr;
 pub use paged_plan::build_split_kv_csr;

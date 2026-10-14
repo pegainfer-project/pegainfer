@@ -1,6 +1,6 @@
 # Qwen4 bring-up
 
-> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of it is CPU-only. Nothing runs — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
+> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. The library is CPU-only; the one device path so far is the GDN decode reuse test, which drives Qwen3.5's kernels on layer 0 of the real shards. Nothing serves — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
 >
 > **Last touched:** 2026-10
 
@@ -50,9 +50,11 @@ The committed `config.json` (`pegainfer-qwen4/tests/frozen_config.json`) is the 
   and untied embeddings. The official FP8 sibling and nvidia's NVFP4 keep `dtype:
   bfloat16` and differ from this checkpoint only by `quantization_config`, so that
   block is what refuses them; the dtype alone would not. The GDN and
-  attention limits mirror `pegainfer-qwen35/src/config/model.rs`, whose GDN wrappers own
-  them; they move to the shared owner with those wrappers in slice B, and until then
-  this crate stays free of CUDA. Deliberately *not* pinned: expert count, hidden size,
+  attention limits now come from the shared owner: this line's 36 `linear_attention`
+  layers reuse the Qwen3.5 decode kernels through `pegainfer-core::ops`, and
+  `src/config.rs` mirrors the three constants that owner exports because the config
+  layer must still test with no device.
+  Deliberately *not* pinned: expert count, hidden size,
   layer count, head counts, `hc_count` — so a smaller `qwen4_exp` checkpoint passes the
   same rules, which is what the L20 small-model deployment case needs
   (`smaller_widths_still_pass`). `mrope_interleaved` and `mrope_section` are accepted
@@ -119,6 +121,33 @@ arithmetic over `config.json`. The prime search is a direct port of the referenc
 
 That arithmetic is confirmed **by value**: the checkpoint stores the partition as two `I64[16]` vectors, `ngram_heads_vocab_sizes` and `ngram_heads_offsets`, both equal to the derived primes and offsets (20,000,003 through 20,000,171). The header snapshot carries them, and `the_ngram_partition_equals_the_stored_integer_vectors` compares them with the derivation.
 
+## GDN decode reuse
+
+The 36 `linear_attention` layers run Qwen3.5's Gated DeltaNet decode kernels instead of a
+second implementation. The geometry is identical — 16 key and 48 value heads at head dim
+128, 4-tap depthwise conv, the same names down to the `model.language_model.layers.N.`
+prefix — so the two host wrappers (`conv1d_decode_batch_into`,
+`gated_delta_rule_decode_batch_into`) **moved** out of `pegainfer-qwen35/src/recurrent.rs`
+into `pegainfer-core/src/ops/gdn.rs`, behind the `qwen35` feature that compiles
+`csrc/qwen35/{conv1d,gated_delta_rule}.cu`. Qwen3.5 consumes them from there now, with its
+call sites unchanged; the three kernel limits (`GDN_AOT_KEY_HEAD_DIM`,
+`GDN_AOT_VALUE_HEAD_DIM`, `LINEAR_CONV_MAX_KERNEL_DIM`) moved with them so there is one
+definition, and `pegainfer-qwen35/src/config/model.rs` re-exports them.
+
+The reuse is proven **on the real weights**. `pegainfer-qwen4/tests/gdn_decode_reuse.rs`
+(behind this crate's `qwen4` feature, pointed at a checkpoint with
+`PEGAINFER_TEST_MODEL_PATH`) loads layer 0's nine GDN tensors from the real shards, holds
+their headers against `tests/frozen_tensors.json`, and drives both kernels on a GPU: the
+conv against the reference formula plus an exact state handoff, the GDN step against a
+host transcription of the same recurrence, each request's own state slot, and the real
+`A_log`/`dt_bias` decaying a state by exactly the host-computed factor.
+
+What it does **not** check: there is no reference oracle for this checkpoint locally, so
+nothing is compared against HF; the activations are constructed (the projections use the
+real weights, the hidden vectors are synthetic); and the gated norm and `out_proj` that
+complete the block are not exercised — the norm's sigmoid entry point is #1129's, and the
+block composition is slice B's, as is the GDN prefill path.
+
 ## Traps
 
 - **`output_gate_type` has three unrelated consumers.** On Qwen3.8-27B it is inert and
@@ -147,7 +176,7 @@ That arithmetic is confirmed **by value**: the checkpoint stores the partition a
 | Criterion | Blocked on |
 | --- | --- |
 | Tensor manifest enforced before the first H2D | slice B's loader, which must classify the headers it maps before any upload |
-| GDN reuse proof, executed | 1 GPU. Answered as far as tensors go — geometry equals the Triton AOT constants, conv width equals the in-tree cap, names match down to the `model.language_model.layers.N.` prefix — but `conv1d_decode_batch_cuda` / `gated_delta_rule_decode_batch_cuda` are wrapped only inside `pegainfer-qwen35/src/recurrent.rs`, so slice B has to decide whether to lift them into shared `ops` or re-wrap them. The kernel limits `src/config.rs` mirrors from Qwen3.5 move with them. |
+| GDN decode reuse, executed | **Answered** (see *GDN decode reuse*): the wrappers are shared in `pegainfer-core::ops`, and a real-weight test drives both kernels on a GPU. Still open: the same test on an sm_89 platform (this box is sm_120), the block composition above them, and the GDN prefill path. |
 | Bookend gate (embedding → mixer → lm_head → argmax) | 1 GPU, three shards (1 + 130 + 131, 5.29 GB, ~2.6 GB of weights on device) and a CPU f64 reference for the mixer. No layer weights needed. |
 | HF golden fixtures (logits + intermediate probes) | the fleet — 360 GB, plus ≥102.4 GB host RAM if the n-gram table is materialized |
 | Tokenizer / chat-template ID fixtures | transformers **5.16.0+** — the checkpoint's own tokenizer is `Qwen2Tokenizer`, which is older, but fixtures are compared against the reference implementation; nothing in the tree commits token-ID fixtures today |

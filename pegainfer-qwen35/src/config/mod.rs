@@ -17,9 +17,6 @@ mod tokenizer;
 mod tp;
 
 pub(crate) use model::Config35;
-pub(crate) use model::GDN_AOT_KEY_HEAD_DIM;
-pub(crate) use model::GDN_AOT_VALUE_HEAD_DIM;
-pub(crate) use model::LINEAR_CONV_MAX_KERNEL_DIM;
 pub(crate) use model::LayerType;
 pub(crate) use tokenizer::tokenizer_effective_vocab;
 pub(crate) use tp::LocalGeometry;

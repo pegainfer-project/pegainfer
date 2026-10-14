@@ -6,9 +6,6 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
-use crate::config::GDN_AOT_KEY_HEAD_DIM;
-use crate::config::GDN_AOT_VALUE_HEAD_DIM;
-use crate::config::LINEAR_CONV_MAX_KERNEL_DIM;
 use crate::ffi;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
 
@@ -49,95 +46,6 @@ pub(crate) fn gated_delta_rule_decode_vec_into(
             num_value_heads as i32,
             key_dim as i32,
             val_dim as i32,
-            ctx.stream.cu_stream(),
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gated_delta_rule_decode_batch_into(
-    ctx: &DeviceContext,
-    qkv: &HiddenStates,
-    b_proj: &HiddenStates,
-    a_proj: &HiddenStates,
-    dt_bias: &DeviceVec,
-    a_log: &CudaSlice<f32>,
-    state_ptrs: &CudaSlice<u64>,
-    output: &mut HiddenStates,
-    batch_size: usize,
-    num_key_heads: usize,
-    num_value_heads: usize,
-    key_dim: usize,
-    val_dim: usize,
-) {
-    assert_eq!(qkv.seq_len, batch_size);
-    assert_eq!(b_proj.seq_len, batch_size);
-    assert_eq!(a_proj.seq_len, batch_size);
-    assert_eq!(output.seq_len, batch_size);
-    assert_eq!(b_proj.hidden_dim, num_value_heads);
-    assert_eq!(a_proj.hidden_dim, num_value_heads);
-    assert_eq!(output.hidden_dim, num_value_heads * val_dim);
-    assert_eq!(key_dim, GDN_AOT_KEY_HEAD_DIM);
-    assert_eq!(val_dim, GDN_AOT_VALUE_HEAD_DIM);
-    assert!(state_ptrs.len() >= batch_size);
-
-    let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
-    let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
-    let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
-    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
-    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
-    let (state_ptrs, _gsp) = state_ptrs.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::gated_delta_rule_decode_batch_cuda(
-            qkv_ptr as *const ffi::Half,
-            b_ptr as *const ffi::Half,
-            a_ptr as *const ffi::Half,
-            dt_ptr as *const ffi::Half,
-            alog_ptr as *const f32,
-            state_ptrs as *const u64,
-            o_ptr as *mut ffi::Half,
-            batch_size as i32,
-            num_key_heads as i32,
-            num_value_heads as i32,
-            key_dim as i32,
-            val_dim as i32,
-            ctx.stream.cu_stream(),
-        );
-    }
-}
-
-pub(crate) fn conv1d_decode_batch_into(
-    ctx: &DeviceContext,
-    x: &HiddenStates,
-    conv_weight: &DeviceVec,
-    conv_state_ptrs: &CudaSlice<u64>,
-    out: &mut HiddenStates,
-    kernel_size: usize,
-) {
-    let batch_size = x.seq_len;
-    let num_channels = x.hidden_dim;
-    assert_eq!(out.hidden_dim, num_channels);
-    assert_eq!(out.seq_len, batch_size);
-    assert_eq!(conv_weight.len, num_channels * kernel_size);
-    assert!(kernel_size <= LINEAR_CONV_MAX_KERNEL_DIM);
-    assert!(conv_state_ptrs.len() >= batch_size);
-
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
-    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
-    let (s_ptrs, _gs) = conv_state_ptrs.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::conv1d_decode_batch_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const ffi::Half,
-            s_ptrs as *const u64,
-            o_ptr as *mut ffi::Half,
-            num_channels as i32,
-            batch_size as i32,
-            kernel_size as i32,
             ctx.stream.cu_stream(),
         );
     }
@@ -557,9 +465,9 @@ mod tests {
     use pegainfer_core::tensor::HiddenStates;
 
     use super::conv1d_prefill_batch_into;
-    use super::gated_delta_rule_decode_batch_into;
     use super::gated_delta_rule_decode_vec_into;
     use super::gated_delta_rule_prefill_chunkwise_into;
+    use crate::ops::gated_delta_rule_decode_batch_into;
     use crate::prefill_buffers::GdrChunkwiseScratch35;
 
     fn bf16_vec(data: &[f32]) -> Vec<bf16> {

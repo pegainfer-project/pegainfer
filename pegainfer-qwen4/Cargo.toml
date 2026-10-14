@@ -8,13 +8,31 @@ version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }
+cudarc = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
+pegainfer-core = { workspace = true, features = ["qwen35"], optional = true }
 pegainfer-frontend = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# The reuse test maps the real shards read-only, the way the loaders do.
+memmap2 = { workspace = true }
 safetensors = { workspace = true }
 sha2 = { workspace = true }
 
+[features]
+default = []
+# The device side. This line's Gated DeltaNet layers call the Qwen3.5 kernels
+# (`pegainfer-kernels/qwen35`: csrc/qwen35/gated_delta_rule.cu and conv1d.cu, whose
+# 128/128 head dims and 4-tap conv match this line exactly), so the flag turns on
+# that kernel set and the GDN decode ops that wrap it. A gate-off build is
+# CUDA-free: the probe, config and tensor contract still test without a device.
+qwen4 = ["dep:cudarc", "dep:half", "dep:pegainfer-core"]
+
 [lints]
 workspace = true
+
+[[test]]
+name = "gdn_decode_reuse"
+required-features = ["qwen4"]
