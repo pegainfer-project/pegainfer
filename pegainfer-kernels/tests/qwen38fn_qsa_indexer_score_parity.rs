@@ -199,6 +199,17 @@ fn assert_provenance(bytes: &[u8]) -> serde_json::Value {
         .filter(|kind| kind.as_str() == Some("full_attention"))
         .count();
     assert_eq!(full_layers, 12, "the checkpoint's sparse-attention layers");
+    // Recorded, not asserted: the host the golden was dumped on decides the
+    // order its float32 reductions round in, which is where the parity bound's
+    // residual comes from, and any other host's order is an equally valid
+    // reference. Printed because the bound's justification leans on it and it
+    // is otherwise invisible to whoever reads this gate's output.
+    println!(
+        "golden provenance: transformers {}, torch {}, {}",
+        manifest["transformers_version"].as_str().unwrap_or("?"),
+        manifest["torch_version"].as_str().unwrap_or("?"),
+        manifest["platform"].as_str().unwrap_or("?"),
+    );
     manifest
 }
 
@@ -499,6 +510,171 @@ fn check_case(
 fn fixture_records_the_frozen_reference() {
     let bytes = std::fs::read(fixture_path()).expect("read fixture");
     assert_provenance(&bytes);
+}
+
+/// The kernel's own half of the refusal contract, likewise device-free: the
+/// entry point rejects a geometry it was not compiled for *before* it forms a
+/// launch, so this can be pinned without a device and must never be skippable.
+///
+/// It is the only place the compiled row stride is checked, and the reason
+/// `fused_width` is an argument at all: the body reads `fused_qk` with the width
+/// it was compiled for, so a caller whose rows are strided differently is read
+/// out of bounds rather than computed wrongly — the one mismatch the pointer
+/// arithmetic cannot survive. `rotary_dim` and `rope_theta` are compiled
+/// constants nothing else can be held against.
+///
+/// Every call below leaves through a guard, before the first launch, and a
+/// launch is the only thing that would touch the pointers; that is why they can
+/// dangle and why this needs no device. The two zero-extent calls come first as
+/// the positive control — the compiled geometry with an empty extent, which the
+/// guards must let through — because an entry point that refused everything
+/// would make every refusal below vacuous.
+#[test]
+fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
+    use cudarc::driver::sys::CUresult;
+    use pegainfer_kernels::ffi::Half;
+    use pegainfer_kernels::ffi::qwen38fn_qsa_indexer_block_scores_cuda as entry;
+
+    // Dangling and well-aligned, never dereferenced.
+    let half = std::ptr::NonNull::<Half>::dangling().as_ptr();
+    let int = std::ptr::NonNull::<i32>::dangling().as_ptr();
+    let float = std::ptr::NonNull::<f32>::dangling().as_ptr();
+    let pool = std::ptr::NonNull::<Half>::dangling().as_ptr();
+    let invalid = CUresult::CUDA_ERROR_INVALID_VALUE as i32;
+    let success = CUresult::CUDA_SUCCESS as i32;
+
+    // (query_rows, tokens, score_cols, fused_width, rotary_dim, rope_theta, rms_eps)
+    let call = |args: (i32, i32, i32, i32, i32, f32, f32)| {
+        let (query_rows, tokens, score_cols, fused_width, rotary_dim, rope_theta, rms_eps) = args;
+        (unsafe {
+            entry(
+                half,
+                half,
+                half,
+                int,
+                int,
+                float,
+                pool,
+                query_rows,
+                tokens,
+                score_cols,
+                fused_width,
+                rotary_dim,
+                rope_theta,
+                rms_eps,
+                std::ptr::null_mut(),
+            )
+        }) as i32
+    };
+
+    // Zero extent, so the guards are the whole of the call and no launch follows.
+    assert_eq!(
+        call((0, 8, 2, 640, 64, 1.0e7, 1.0e-6)),
+        success,
+        "the compiled geometry must pass the guards"
+    );
+    assert_eq!(
+        call((1, 0, 0, 640, 64, 1.0e7, 1.0e-6)),
+        success,
+        "an empty call must pass the guards"
+    );
+
+    for (what, result) in [
+        (
+            "a fused row stride that is not the compiled 640 wide",
+            call((0, 8, 2, 639, 64, 1.0e7, 1.0e-6)),
+        ),
+        (
+            "a fused row stride wider than the compiled one",
+            call((0, 8, 2, 641, 64, 1.0e7, 1.0e-6)),
+        ),
+        (
+            "a rotary split that is not the compiled 64 of the 128-dim head",
+            call((0, 8, 2, 640, 32, 1.0e7, 1.0e-6)),
+        ),
+        (
+            "a rotary split over the whole indexer head",
+            call((0, 8, 2, 640, 128, 1.0e7, 1.0e-6)),
+        ),
+        (
+            "a rope_theta that is not the compiled 1e7",
+            call((0, 8, 2, 640, 64, 1.0e6, 1.0e-6)),
+        ),
+        (
+            // One f32 ulp: the geometry's own bit-equality check, from the
+            // kernel's side, and what a config drifting in the last place hits.
+            "a rope_theta one ulp from the compiled 1e7",
+            call((
+                0,
+                8,
+                2,
+                640,
+                64,
+                f32::from_bits(1.0e7f32.to_bits() + 1),
+                1.0e-6,
+            )),
+        ),
+        (
+            "a negative rms_eps",
+            call((0, 8, 2, 640, 64, 1.0e7, -1.0e-6)),
+        ),
+        (
+            // `!(rms_eps >= 0)` refuses NaN, which would otherwise poison every
+            // norm silently rather than fail loudly.
+            "a NaN rms_eps",
+            call((0, 8, 2, 640, 64, 1.0e7, f32::NAN)),
+        ),
+        (
+            "a negative query-row count",
+            call((-1, 8, 2, 640, 64, 1.0e7, 1.0e-6)),
+        ),
+        (
+            "a negative token count",
+            call((0, -1, 2, 640, 64, 1.0e7, 1.0e-6)),
+        ),
+        (
+            "a negative score stride",
+            call((0, 8, -1, 640, 64, 1.0e7, 1.0e-6)),
+        ),
+        (
+            // 8 tokens is 2 complete blocks, so a 1-wide row is the
+            // out-of-bounds write the stride check exists for.
+            "a score stride under the block grid",
+            call((1, 8, 1, 640, 64, 1.0e7, 1.0e-6)),
+        ),
+    ] {
+        assert_eq!(result, invalid, "{what} must be refused");
+    }
+
+    // One position per kind of argument — an input, the score output and the
+    // pool workspace — so the chain is pinned to cover the pointers, not just
+    // the extents.
+    for (what, fused_qk, scores, pooled_keys) in [
+        ("a null fused_qk", std::ptr::null(), float, pool),
+        ("a null scores", half, std::ptr::null_mut(), pool),
+        ("a null pooled_keys", half, float, std::ptr::null_mut()),
+    ] {
+        let result = unsafe {
+            entry(
+                fused_qk,
+                half,
+                half,
+                int,
+                int,
+                scores,
+                pooled_keys,
+                0,
+                8,
+                2,
+                640,
+                64,
+                1.0e7,
+                1.0e-6,
+                std::ptr::null_mut(),
+            )
+        } as i32;
+        assert_eq!(result, invalid, "{what} must be refused");
+    }
 }
 
 #[test]
