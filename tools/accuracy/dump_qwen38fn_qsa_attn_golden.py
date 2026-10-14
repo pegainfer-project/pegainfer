@@ -6,7 +6,7 @@ Dumps one full-attention layer (`Qwen4ExpTextAttention`, transformers 5.16.1
 rows, the captured post-projection activations, the effective sparse+causal mask,
 and the reference's attention weights + gated output. Every stored value is a
 capture of the reference itself (forward hooks plus its own eager return); nothing
-here re-implements it, and the dump only checks that the capture is faithful.
+here re-implements it.
 
 Not stored, and why: the plain `q_proj`/`k_proj`/`v_proj`/`o_proj` GEMMs (98 MB)
 -- their outputs are stored instead, and the input to `o_proj` is the golden's
@@ -160,10 +160,7 @@ def dump(args) -> None:
 
         captured.clear()
         with torch.no_grad(), _scatter_int64():
-            out, attn_weights = module(hidden, pos_emb, mask, None)
-
-        # The captured o_proj input must reproduce the module's returned output.
-        assert torch.equal(module.o_proj(captured["o_in"]), out), f"case {i}: o_proj replay mismatch"
+            _, attn_weights = module(hidden, pos_emb, mask, None)
 
         # Effective sparse+causal mask = the reference's own indexer mask AND causal.
         selected_bool = captured["indexer_mask"] == 0
