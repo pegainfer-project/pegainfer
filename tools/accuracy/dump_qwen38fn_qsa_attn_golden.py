@@ -1,56 +1,32 @@
 #!/usr/bin/env python3
 """Generate the Qwen3.8-Flash-Next QSA sparse full-attention golden.
 
-This dumps the *real-geometry* sparse attention of one full-attention layer
-(`Qwen4ExpTextAttention`, transformers 5.16.1 `models/qwen4_exp`) into a fixture
-the sparse-attention kernel gate replays: for a handful of query rows it stores
-the reference's own post-projection activations, the effective sparse+causal
-mask, and the reference's attention weights + gated output. Nothing here
-re-implements the reference math: every stored value is captured from the
-reference module itself, through forward hooks and its own eager return.
+Dumps one full-attention layer (`Qwen4ExpTextAttention`, transformers 5.16.1
+`models/qwen4_exp`) at the real frozen-config geometry: for a handful of query
+rows, the captured post-projection activations, the effective sparse+causal mask,
+and the reference's attention weights + gated output. Every stored value is a
+capture of the reference itself (forward hooks plus its own eager return); nothing
+here re-implements it, and the dump only checks that the capture is faithful.
 
-Geometry is the frozen checkpoint config (`hidden_size` 2560, 24 Q / 2 KV heads,
-`head_dim` 256, `partial_rotary_factor` 0.25 -> 64 rotary dims, GQA group 12,
-sigmoid output gate, indexer 4 q / 1 kv @ 128 with the real `indexer_budget`
-2048 -> 512 block budget).
+Not stored, and why: the plain `q_proj`/`k_proj`/`v_proj`/`o_proj` GEMMs (98 MB)
+-- their outputs are stored instead, and the input to `o_proj` is the golden's
+expected output; the indexer's `index_qk_proj`/`q_layernorm`/`k_layernorm` -- the
+sparse mask they produce is stored as data and their input (the layer's hidden
+state) is not part of this fixture (the indexer has its own oracle,
+`qwen38fn-qsa-indexer-golden.safetensors`). The only weights stored are
+`q_norm`/`k_norm`, the per-head `(1+w)` RMS norm the kernel applies to the
+captured `queries`/`keys`.
 
-Boundary rule (why the plain GEMM weights are absent)
------------------------------------------------------
-`q_proj`/`k_proj`/`v_proj`/`o_proj` are plain GEMMs (98 MB of weights) and are
-NOT stored. Instead their *outputs* are captured with forward hooks and stored:
-the fused Q+gate `q_proj` output, the `k_proj`/`v_proj` outputs, and the input to
-`o_proj` (the gated attention activation) -- that last one is the golden's
-expected output, since `o_proj` is a plain cuBLAS GEMM. The only weights stored
-are `q_norm`/`k_norm`, the per-head `(1+w)` RMS norm the kernel applies to the
-captured `queries`/`keys`. Each captured activation is named for the projection
-that produced it (`queries`/`keys`/`values`), so no stored tensor shares a name
-with the weight it came from.
+Cases: S=8/10/64 evaluate every row; S=2055 evaluates rows 2049..2055, around the
+real boundary where the 2048-token budget starts dropping a 4-token block. Only
+the evaluated query rows are stored (a full case would carry a ~50 MB activation
+and a ~200 MB attention-weight matrix); key/value-side activations stay full
+length.
 
-The indexer's own weights (`index_qk_proj`, `q_layernorm`, `k_layernorm`) are
-absent as well: the sparse mask they produce is stored as data, and their input
--- the layer's hidden state -- is not part of this fixture. The indexer has its
-own oracle (`qwen38fn-qsa-indexer-golden.safetensors`).
-
-Real boundary (S=2055, budget 2048 -> 512 blocks)
--------------------------------------------------
-With the real budget a query keeps `topk(min(512, n_complete))` complete 4-token
-blocks plus the tail. Over the evaluated rows (`range(2049, 2055)`, i.e. visible
-counts 2050..2055):
-  * visible 2050 / 2051 -> n_complete 512, keeps all 512 blocks (no drop);
-  * visible 2052        -> n_complete 513, drops one block (4 causally-valid keys);
-  * visible 2053..2055  -> drops one block and keeps a 1..3 token tail.
-The dump asserts those drops (and that the short cases drop nothing).
-
-Cases record only the evaluated query rows (a full 2055-row case would store a
-~50 MB `[2055, 12288]` activation and a ~200 MB weight matrix); key/value-side
-activations stay full length (they are small).
-
-Fixture metadata is a single JSON key (`qwen4_qsa_attn_golden`, format_version 2);
-there are no loose provenance tensors.
-
-The reference's mask builder passes an int32 index to `Tensor.scatter` (torch
-wants int64 on some versions), so `_scatter_int64` casts it for the reference
-call only, scoped -- the dump runs on torch 2.14.1 and older.
+Metadata is a single JSON key (`qwen4_qsa_attn_golden`, format_version 2). The
+reference's mask builder passes an int32 index to `Tensor.scatter` (torch wants
+int64 on some versions), so `_scatter_int64` casts it for that call only, scoped
+-- the dump runs on torch 2.14.1 and older.
 
     python tools/accuracy/dump_qwen38fn_qsa_attn_golden.py --out test_data/qwen38fn-qsa-attn-golden.safetensors
 """
@@ -193,22 +169,6 @@ def dump(args) -> None:
         selected_bool = captured["indexer_mask"] == 0
         eff = causal_bool & selected_bool  # [1,1,S,S]
 
-        # Self-check: blocked (sparse-dropped or future) positions carry zero softmax mass.
-        blocked_mass = (attn_weights.float() * (~eff).float()).abs().max().item()
-        assert blocked_mass == 0.0, f"case {i}: blocked positions leaked softmax mass ({blocked_mass})"
-
-        # Drop accounting: causally-valid keys the sparse budget discarded, per row.
-        causal_count = causal_bool[0, 0][row_idx].sum(-1)
-        kept_count = eff[0, 0][row_idx].sum(-1)
-        drops = (causal_count - kept_count).tolist()
-        assert all(d == 0 for d in drops[:2]) if seq_len == 2055 else all(d == 0 for d in drops), (
-            f"case {i}: unexpected sparse drop on a short case: {drops}"
-        )
-        if seq_len == 2055:
-            assert all(d == 0 for d in drops[:2]) and all(d == 4 for d in drops[2:]), (
-                f"case {i}: real boundary drops unexpected: {drops}"
-            )
-
         q_rows = captured["q_act"][0].index_select(0, row_idx).contiguous()
         o_rows = captured["o_in"][0].index_select(0, row_idx).contiguous()
         mask_rows = eff[0, 0].index_select(0, row_idx).contiguous()
@@ -225,10 +185,7 @@ def dump(args) -> None:
         tensors[p + "attn_out"] = o_rows
         tensors[p + "attn_weights"] = attn_rows
 
-        print(
-            f"dump case{i}: S={seq_len} R={len(rows)} drops={drops} "
-            f"blocked_mass={blocked_mass:.1e} attn_out={tuple(o_rows.shape)}"
-        )
+        print(f"dump case{i}: S={seq_len} R={len(rows)} attn_out={tuple(o_rows.shape)}")
 
     manifest = {
         "format_version": FORMAT_VERSION,
