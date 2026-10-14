@@ -2,38 +2,56 @@
 """Generate the MoE block golden: the sparse mixture-of-experts sublayer output.
 
 Dumps the Qwen3.8-Flash-Next MoE reference (`Qwen4ExpTextSparseMoeBlock`,
-transformers 5.16.1 `models/qwen4_exp`) into a fixture a MoE kernel gate replays:
-same seeded weights and synthetic hidden states, comparing the router logits, the
-routing weights and the block output.
+transformers 5.16.1 `models/qwen4_exp`) at the frozen checkpoint's real geometry
+into a fixture a MoE kernel gate replays: the reference's own seeded weights and
+synthetic hidden states, compared against the router logits, the routing weights,
+the selected experts and the expert/shared/block outputs it computes.
 
 Every layer of this line is MoE, so this is on the critical path. The traps it
 pins: the router renormalizes its top-k weights (`norm_topk_prob`, a field absent
-from the checkpoint's `config.json` and therefore an upstream default), the experts
-are stored as fused 3D tensors, and the shared expert rides a learned scalar gate
-that is summed with the routed output.
+from the checkpoint's `config.json` and therefore an upstream default — a port
+that reads only `config.json` silently drops it, and the top-k weights stop
+summing to 1), the experts are stored as fused 3D tensors, and the shared expert
+rides a learned scalar (one per token, not per channel) sigmoid gate that is
+summed with the routed output.
 
-The router and block math is re-derived inside this script and asserted to match
-the module bit-for-bit (a mismatch aborts the dump).
+Boundary: at real geometry the fused 512-expert stack is 2.52e9 parameters
+(`experts.gate_up_proj` [512, 1280, 2560] + `experts.down_proj` [512, 2560, 640]),
+~5 GB in bf16, so it is NOT stored. What is stored instead is the activation the
+reference's `experts` forward returns (the routed-expert output entering the block
+sum) per case, plus the weights a gate can check directly: the router `gate_weight`
+[512, 2560] (~2.6 MB) and the shared expert's three projections plus its scalar
+gate weight (~10 MB). The unstored stack stays reproducible from the `seed`
+recorded in the metadata and the draw order this script uses (see below).
 
-Fixture: provenance `format_version` / `config_sha256` / `ref_transformers`
-(assert on load); per case, the input `hidden` and the outputs. A reduced expert
-count and intermediate width keep the file small; the routed/shared split, top-k
-renormalization and fused expert layout are all preserved. Contract details a
-replaying consumer needs:
+Contract details a replaying consumer needs:
 
+- `hidden` is the flat `[R, 2560]` batch of token rows (`R` = 8 prefill, 12
+  prefill, 1 decode). The block is row-wise — no token-to-token interaction — so a
+  case is just its token count and every row is evaluated; no case needs row
+  slicing. A short batch hits only a small slice of the 512 experts (78, 108 and 10
+  distinct experts for the three cases, printed by the dump), so unrouted experts
+  are covered by construction.
 - `router_logits` are pre-softmax; `routing_weights` are the renormalized top-k
   probs (`norm_topk_prob=True`), so they sum to 1 per token up to bf16 rounding.
-- `experts_gate_up_proj` is `[E, 2*I, H]` with gate = rows `[0, I)` and up =
-  rows `[I, 2I)` (the reference's `chunk(2, dim=-1)` halves); `experts_down_proj`
-  is `[E, H, I]` in `F.linear` layout (output dim first).
-- `shared_out` already carries the sigmoid of the shared gate (one scalar per
-  token, not per channel).
-- `expert_out` / `shared_out` are flat `[T, H]` (where the reference computes
-  them); `hidden` / `out` keep the batch dim `[1, T, H]`.
-- One case aligns every token with expert 0's router row, so a fixed set of 4
-  experts takes all tokens (one of them nearly all the routing weight) and the
-  other 12 are empty — the skewed/empty distribution the MoE spike requires;
-  an S=1 case pins the decode row count.
+- `expert_out` is the recorded return of `experts(hidden, selected, weights)`: per
+  hit expert `gate, up = F.linear(rows, gate_up_proj[e]).chunk(2, dim=-1)` (gate =
+  columns `[0, I)`, up = `[I, 2I)`), then `act_fn(gate) * up`, then
+  `F.linear(·, down_proj[e])` (`down_proj` is `[E, H, I]`, output dim first),
+  scaled by `weights[row, slot]` and accumulated with `index_add_`.
+- `shared_out` is the shared expert's output BEFORE its gate;
+  `sigmoid(F.linear(hidden, shared_expert_gate_weight))` multiplies it and
+  `out = expert_out + that product`.
+- To rebuild the unstored expert stack, construct the block with the recorded
+  `seed` and this script's draw order: bfloat16 parameters (the checkpoint's
+  dtype), `normal_(0.0, 0.05)` for every parameter with `dim() >= 2` and
+  `normal_(0.0, 0.5)` otherwise, over `named_parameters()` order.
+
+After writing, the fixture is reloaded and each case replayed. From the stored
+tensors alone: the router logits, the renormalized top-k weights, the selected
+experts, the sigmoid-gated shared output and the block sum must reproduce
+bit-for-bit. With the block rebuilt from the recorded seed, the recorded
+`expert_out` must reproduce bit-for-bit too.
 
     python tools/accuracy/dump_qwen38fn_moe_golden.py --out <fixture>
 """
@@ -41,80 +59,210 @@ replaying consumer needs:
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
+import json
+import platform
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 import transformers
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
+from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
 
-# Reduced text geometry (real values in comments).
-HIDDEN = 512            # real 2560
-NUM_EXPERTS = 16        # real 512
-TOP_K = 4               # real 10
-MOE_INTERMEDIATE = 64   # real 640
-SHARED_INTERMEDIATE = 64  # real 640
-NORM_TOPK_PROB = True
-HIDDEN_ACT = "silu"
+CONFIG = "pegainfer-qwen4/tests/frozen_config.json"
+METADATA_KEY = "qwen4_moe_golden"
 SEED = 0x_03_38_F9_5A_11_82
 
-# Bumped when the fixture layout changes; the gate asserts it on load.
-FORMAT_VERSION = 1
+# Bumped when the fixture layout changes (2: real geometry, metadata-only
+# provenance, the expert stack recorded as an activation instead of stored).
+FORMAT_VERSION = 2
 
-# (seq_len, input mode). "randn" = synthetic hidden states, near-uniform
-# routing. "skew" = every token aligned with expert 0's router row at
-# SKEW_SCALE: softmax collapses onto one dominant expert and all tokens share
-# the same top-k, so TOP_K experts take every token (measured renorm weights
-# [0.984, 0.006, 0.006, 0.005]) and the other NUM_EXPERTS - TOP_K stay empty —
-# the skewed/empty distribution the MoE spike requires. The S=1 case pins the
-# decode row count.
-CASES = [
-    (8, "randn"),   # prefill, near-uniform
-    (12, "randn"),  # prefill, near-uniform
-    (1, "randn"),   # decode shape
-    (16, "skew"),   # skewed routing + empty experts
-]
-SKEW_SCALE = 4.0
+# Token counts: two prefill batches and one decode row. The block is row-wise, so
+# these pin the token shapes rather than a sequence; 12 rows already exercise the
+# renorm (a token's top-10 out of 512 experts) and the shared gate.
+CASES = [8, 12, 1]
 
 
-class Config:
-    """Minimal config carrying exactly the attributes the MoE block reads."""
-
-    hidden_size = HIDDEN
-    num_experts = NUM_EXPERTS
-    num_experts_per_tok = TOP_K
-    moe_intermediate_size = MOE_INTERMEDIATE
-    shared_expert_intermediate_size = SHARED_INTERMEDIATE
-    norm_topk_prob = NORM_TOPK_PROB
-    hidden_act = HIDDEN_ACT
-    initializer_range = 0.02
-    _experts_implementation = "eager"
+def load_text_config(path: Path):
+    raw = path.read_bytes()
+    config = Qwen4ExpConfig(**json.loads(raw)).text_config
+    return config, hashlib.sha256(raw).hexdigest()
 
 
-def config_digest() -> bytes:
-    """sha256 over the frozen geometry so a consumer can assert this oracle's config."""
-    canon = (
-        f"hidden={HIDDEN};experts={NUM_EXPERTS};topk={TOP_K};moeint={MOE_INTERMEDIATE};"
-        f"sharedint={SHARED_INTERMEDIATE};norm_topk={NORM_TOPK_PROB};act={HIDDEN_ACT}"
-    )
-    return hashlib.sha256(canon.encode()).digest()
+def build_block(config) -> Qwen4ExpTextSparseMoeBlock:
+    """The reference block at real geometry, seeded.
+
+    The 2.5e9 parameters are drawn in bfloat16 — the checkpoint's dtype — which is
+    also what keeps the construction at ~5 GB (building in fp32 and casting would
+    peak at ~15 GB for a stack that is never stored)."""
+    torch.manual_seed(SEED)
+    block = Qwen4ExpTextSparseMoeBlock(config)
+    with torch.no_grad():
+        for _, parameter in block.named_parameters():
+            if parameter.dim() >= 2:
+                parameter.normal_(0.0, 0.05)
+            else:
+                parameter.normal_(0.0, 0.5)
+    return block
 
 
-def bytes_tensor(data: bytes) -> torch.Tensor:
-    return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
-
-
-def rederive_router(module: Qwen4ExpTextSparseMoeBlock, flat: torch.Tensor):
+def rederive_router(block: Qwen4ExpTextSparseMoeBlock, flat: torch.Tensor):
     """Re-derive the router: fp32 softmax -> top-k -> optional renormalization."""
-    logits = F.linear(flat, module.gate.weight)
+    logits = F.linear(flat, block.gate.weight)
     probs = torch.softmax(logits, dtype=torch.float, dim=-1)
-    top_value, indices = torch.topk(probs, module.gate.top_k, dim=-1)
-    if module.gate.norm_topk_prob:
+    top_value, indices = torch.topk(probs, block.gate.top_k, dim=-1)
+    if block.gate.norm_topk_prob:
         top_value = top_value / top_value.sum(dim=-1, keepdim=True)
     return logits, top_value.to(logits.dtype), indices
+
+
+def capture_hook(store: dict, name: str):
+    """Record what a submodule returns, so the golden is the reference's own
+    output and not this script's re-implementation of it."""
+
+    def hook(_module, _inputs, output):
+        store[name] = output
+
+    return hook
+
+
+def run_reference(block: Qwen4ExpTextSparseMoeBlock, hidden: torch.Tensor):
+    """One reference pass over `hidden` [1, R, H]: the router triple, the routed
+    expert activation and the shared expert output, all captured from the
+    submodules, plus the block output the reference returns ([R, H] flat)."""
+    captured: dict[str, object] = {}
+    handles = [
+        block.gate.register_forward_hook(capture_hook(captured, "router")),
+        block.experts.register_forward_hook(capture_hook(captured, "experts")),
+        block.shared_expert.register_forward_hook(capture_hook(captured, "shared")),
+    ]
+    try:
+        with torch.no_grad():
+            out = block(hidden)
+    finally:
+        for handle in handles:
+            handle.remove()
+    logits, weights, selected = captured["router"]
+    return logits, weights, selected, captured["experts"], captured["shared"], out.view(-1, out.shape[-1])
+
+
+def case_tensors(block: Qwen4ExpTextSparseMoeBlock, index: int) -> dict[str, torch.Tensor]:
+    """One case: the token rows and everything the reference computes for them.
+
+    The captured values are the source of truth; the re-derivations below are the
+    cheap consistency checks that abort the dump.
+    """
+    seq_len = CASES[index]
+    hidden_dim = block.gate.hidden_dim
+    gen = torch.Generator().manual_seed(SEED + index)
+    hidden = torch.randn(1, seq_len, hidden_dim, generator=gen, dtype=torch.bfloat16)
+    flat = hidden.view(-1, hidden_dim)
+    logits, weights, selected, expert_out, shared_out, out = run_reference(block, hidden)
+
+    r_logits, r_weights, r_selected = rederive_router(block, flat)
+    assert torch.equal(logits, r_logits), f"case {index} (T={seq_len}): router logits re-derivation != module"
+    assert torch.equal(weights, r_weights), f"case {index} (T={seq_len}): routing weights re-derivation != module"
+    assert torch.equal(selected, r_selected), f"case {index} (T={seq_len}): top-k selection re-derivation != module"
+
+    # The block is the routed output plus the shared output under its learned
+    # scalar sigmoid gate.
+    gate_scalar = F.sigmoid(block.shared_expert_gate(flat))
+    assert torch.equal(out, expert_out + gate_scalar * shared_out), (
+        f"case {index} (T={seq_len}): block != routed output + sigmoid(shared gate) * shared output"
+    )
+    # Renormalization must hold: the top-k weights sum to 1. Without it the top-10
+    # probs of a 512-way softmax sum to ~0.03, well outside bf16 rounding.
+    assert torch.allclose(weights.float().sum(-1), torch.ones(seq_len, dtype=torch.float32), atol=1e-2), (
+        f"case {index} (T={seq_len}): routing weights do not sum to 1 (renorm dropped?)"
+    )
+    assert bool(torch.isfinite(out.float()).all()), f"case {index} (T={seq_len}): non-finite block output"
+
+    experts_hit = int(torch.unique(selected).numel())
+    print(
+        f"case{index}: T={seq_len} experts_hit={experts_hit}/{block.gate.num_experts} "
+        f"max_weight={float(weights.max()):.4f} renorm_sum_ok=True rederivation_ok=True"
+    )
+    prefix = f"case{index}_"
+    return {
+        prefix + "hidden": flat.contiguous(),
+        prefix + "router_logits": logits.contiguous(),
+        prefix + "routing_weights": weights.contiguous(),
+        prefix + "selected_experts": selected.to(torch.int32).contiguous(),
+        prefix + "expert_out": expert_out.contiguous(),
+        prefix + "shared_out": shared_out.contiguous(),
+        prefix + "out": out.contiguous(),
+    }
+
+
+def reproduce_from_fixture(check: dict[str, torch.Tensor], config) -> None:
+    """Replay every case from the fixture alone: the stored weights and the stored
+    input rows must reproduce the router, the shared gate and the block sum
+    bit-for-bit."""
+    for index, seq_len in enumerate(CASES):
+        prefix = f"case{index}_"
+        top_k = check[prefix + "selected_experts"].shape[1]
+        hidden = check[prefix + "hidden"]
+        assert hidden.shape == (seq_len, config.hidden_size), f"case {index}: stored hidden shape"
+
+        logits = F.linear(hidden, check["gate_weight"])
+        assert torch.equal(logits, check[prefix + "router_logits"]), f"case {index}: router logits mismatch"
+        probs = torch.softmax(logits, dtype=torch.float, dim=-1)
+        top_value, indices = torch.topk(probs, top_k, dim=-1)
+        top_value = top_value / top_value.sum(dim=-1, keepdim=True)
+        assert torch.equal(top_value.to(logits.dtype), check[prefix + "routing_weights"]), (
+            f"case {index}: routing weights mismatch"
+        )
+        assert torch.equal(indices, check[prefix + "selected_experts"].long()), (
+            f"case {index}: selected experts mismatch"
+        )
+        assert torch.allclose(check[prefix + "routing_weights"].float().sum(-1), torch.ones(seq_len, dtype=torch.float32), atol=1e-2), (
+            f"case {index}: routing weights do not sum to 1"
+        )
+
+        gate_scalar = F.sigmoid(F.linear(hidden, check["shared_expert_gate_weight"]))
+        assert torch.equal(check[prefix + "expert_out"] + gate_scalar * check[prefix + "shared_out"], check[prefix + "out"]), (
+            f"case {index}: block != routed + sigmoid(shared gate) * shared"
+        )
+        print(f"case{index}: T={seq_len} fixture-only reproduce OK (logits/weights/selected/shared/out)")
+
+
+def reproduce_with_reference(check: dict[str, torch.Tensor], config) -> None:
+    """Replay every case against a block rebuilt from the recorded seed: the
+    stored weights must be that draw, and the recorded routed-expert activation —
+    the one tensor the boundary keeps out of the file — must reproduce too."""
+    replay = build_block(config)
+    stored_weights = {
+        "gate_weight": replay.gate.weight,
+        "shared_gate_proj": replay.shared_expert.gate_proj.weight,
+        "shared_up_proj": replay.shared_expert.up_proj.weight,
+        "shared_down_proj": replay.shared_expert.down_proj.weight,
+        "shared_expert_gate_weight": replay.shared_expert_gate.weight,
+    }
+    for name, parameter in stored_weights.items():
+        assert torch.equal(parameter.detach(), check[name]), f"stored {name} != the seeded reference draw"
+    print(f"reload: {len(stored_weights)} stored weights match the seeded reference draw")
+
+    for index, seq_len in enumerate(CASES):
+        prefix = f"case{index}_"
+        gen = torch.Generator().manual_seed(SEED + index)
+        hidden = torch.randn(1, seq_len, config.hidden_size, generator=gen, dtype=torch.bfloat16)
+        assert torch.equal(hidden.view(-1, config.hidden_size), check[prefix + "hidden"]), (
+            f"case {index}: seeded hidden rows != stored rows"
+        )
+        logits, weights, selected, expert_out, shared_out, out = run_reference(replay, hidden)
+        assert torch.equal(logits, check[prefix + "router_logits"]), f"case {index}: reload router logits mismatch"
+        assert torch.equal(weights, check[prefix + "routing_weights"]), f"case {index}: reload routing weights mismatch"
+        assert torch.equal(selected.to(torch.int32), check[prefix + "selected_experts"]), (
+            f"case {index}: reload selected experts mismatch"
+        )
+        assert torch.equal(expert_out, check[prefix + "expert_out"]), f"case {index}: reload expert_out mismatch"
+        assert torch.equal(shared_out, check[prefix + "shared_out"]), f"case {index}: reload shared_out mismatch"
+        assert torch.equal(out, check[prefix + "out"]), f"case {index}: reload out mismatch"
+        print(f"case{index}: T={seq_len} reproduce OK (recorded expert_out via the seeded reference)")
 
 
 def main() -> None:
@@ -122,85 +270,53 @@ def main() -> None:
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
-    cfg = Config()
-    torch.manual_seed(SEED)
-    module = Qwen4ExpTextSparseMoeBlock(cfg)
-    with torch.no_grad():
-        for name, p in module.named_parameters():
-            if p.dim() >= 2:
-                p.normal_(0.0, 0.05)
-            else:
-                p.normal_(0.0, 0.5)
-    module = module.to(torch.bfloat16)
+    root = Path(__file__).resolve().parents[2]
+    config, config_sha256 = load_text_config(root / CONFIG)
+    # The trap: `norm_topk_prob` is an upstream default the checkpoint's config.json
+    # does not carry, so the frozen config only supplies it through the reference's
+    # class default. If that ever stops being true, the port's config plumbing (not
+    # this golden) needs another look.
+    assert "norm_topk_prob" not in json.loads((root / CONFIG).read_bytes())["text_config"], (
+        "the frozen config now carries norm_topk_prob; re-check why the trap this golden pins changed"
+    )
+    assert config.norm_topk_prob is True, "the reference no longer renormalizes its top-k weights"
 
+    torch.set_default_dtype(torch.bfloat16)
+    block = build_block(config)
     tensors = {
-        "format_version": torch.tensor([FORMAT_VERSION], dtype=torch.int32),
-        "config_sha256": bytes_tensor(config_digest()),
-        "ref_transformers": bytes_tensor(transformers.__version__.encode()),
-        "gate": module.gate.weight.detach().contiguous(),
-        "experts_gate_up_proj": module.experts.gate_up_proj.detach().contiguous(),
-        "experts_down_proj": module.experts.down_proj.detach().contiguous(),
-        "shared_gate_proj": module.shared_expert.gate_proj.weight.detach().contiguous(),
-        "shared_up_proj": module.shared_expert.up_proj.weight.detach().contiguous(),
-        "shared_down_proj": module.shared_expert.down_proj.weight.detach().contiguous(),
-        "shared_expert_gate": module.shared_expert_gate.weight.detach().contiguous(),
+        "gate_weight": block.gate.weight.detach().contiguous(),
+        "shared_gate_proj": block.shared_expert.gate_proj.weight.detach().contiguous(),
+        "shared_up_proj": block.shared_expert.up_proj.weight.detach().contiguous(),
+        "shared_down_proj": block.shared_expert.down_proj.weight.detach().contiguous(),
+        "shared_expert_gate_weight": block.shared_expert_gate.weight.detach().contiguous(),
     }
+    for index in range(len(CASES)):
+        tensors.update(case_tensors(block, index))
 
-    for i, (seq_len, mode) in enumerate(CASES):
-        if mode == "skew":
-            row = (SKEW_SCALE * module.gate.weight[0].float()).to(torch.bfloat16)
-            hidden = row.view(1, 1, HIDDEN).expand(1, seq_len, HIDDEN).contiguous()
-        else:
-            gen = torch.Generator().manual_seed(SEED + i)
-            hidden = torch.randn(1, seq_len, HIDDEN, generator=gen).to(torch.bfloat16)
-        flat = hidden.view(-1, HIDDEN)
-
-        with torch.no_grad():
-            final = module(hidden)
-            logits, scores, selected = module.gate(flat)
-            r_logits, r_scores, r_selected = rederive_router(module, flat)
-            shared = module.shared_expert(flat)
-            shared_gate = F.sigmoid(module.shared_expert_gate(flat))
-            shared_out = shared_gate * shared
-            experts_out = module.experts(flat, selected, scores)
-
-        assert torch.equal(scores, r_scores), f"case {i} (S={seq_len}) router scores re-derivation != module"
-        assert torch.equal(selected, r_selected), f"case {i} (S={seq_len}) router top-k re-derivation != module"
-        assert torch.equal(logits, r_logits), f"case {i} (S={seq_len}) router logits re-derivation != module"
-        assert torch.equal(
-            final.view(-1, HIDDEN), experts_out + shared_out
-        ), f"case {i} (S={seq_len}) block != experts + shared"
-        # Renormalization must hold: the top-k weights sum to 1 (bf16 rounding only).
-        assert torch.allclose(scores.float().sum(-1), torch.ones(flat.shape[0]), atol=1e-2), (
-            f"case {i} (S={seq_len}) top-k weights do not sum to 1"
-        )
-        assert bool(torch.isfinite(final.float()).all()), f"case {i} (S={seq_len}) non-finite output"
-        if mode == "skew":
-            # The case must actually construct the condition it claims to cover:
-            # all tokens share one top-k set, so NUM_EXPERTS - TOP_K experts are
-            # empty and one expert carries a dominant renormalized weight.
-            n_hit = len(torch.unique(selected))
-            assert n_hit == TOP_K, f"case {i} (S={seq_len}) skew case hit {n_hit} experts, expected {TOP_K}"
-            assert float(scores.max()) > 0.5, f"case {i} (S={seq_len}) skew case has no dominant expert"
-
-        p = f"case{i}_"
-        tensors[p + "seq_len"] = torch.tensor([seq_len], dtype=torch.int32)
-        tensors[p + "hidden"] = hidden.contiguous()
-        tensors[p + "router_logits"] = logits.contiguous()
-        tensors[p + "routing_weights"] = scores.contiguous()
-        tensors[p + "selected_experts"] = selected.to(torch.int32).contiguous()
-        tensors[p + "expert_out"] = experts_out.contiguous()
-        tensors[p + "shared_out"] = shared_out.contiguous()
-        tensors[p + "out"] = final.contiguous()
-        print(
-            f"case{i}: S={seq_len} mode={mode} experts_hit={len(torch.unique(selected))} "
-            f"max_w={float(scores.max()):.4f} rederivation_ok=True"
-        )
-
+    manifest = {
+        "format_version": FORMAT_VERSION,
+        "config": CONFIG,
+        "config_sha256": config_sha256,
+        "seed": SEED,
+        "transformers_version": transformers.__version__,
+        "torch_version": torch.__version__,
+        "platform": platform.machine(),
+    }
+    # One key holding sorted JSON, since safetensors writes its metadata map in a
+    # random order and several keys would make two identical runs differ.
+    metadata = {METADATA_KEY: json.dumps(manifest, sort_keys=True)}
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, str(args.out))
+    save_file(tensors, str(args.out), metadata=metadata)
     size_mb = args.out.stat().st_size / (1024 * 1024)
     print(f"wrote {args.out} ({size_mb:.2f} MiB, {len(tensors)} tensors)")
+
+    del block, tensors
+    gc.collect()
+    check = load_file(str(args.out))
+    assert check["gate_weight"].shape == (config.num_experts, config.hidden_size), "stored gate_weight shape"
+    reproduce_from_fixture(check, config)
+    reproduce_with_reference(check, config)
+    print(f"reload: {len(CASES)} cases reproduce bit-for-bit")
 
 
 if __name__ == "__main__":
