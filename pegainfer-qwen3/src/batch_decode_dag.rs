@@ -27,6 +27,8 @@ use pegainfer_core::ops::call_spec::rms_norm_batch_call;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_spec::silu_mul_fused_batch_call;
 #[cfg(feature = "kernel-call-trace")]
+use pegainfer_core::ops::call_spec::suppress_logits_call;
+#[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_spec::{self};
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_trace;
@@ -419,17 +421,28 @@ impl<'a> BatchDecodeDag<'a> {
         x: &HiddenStates,
         out: &mut HiddenStates,
     ) -> Result<()> {
-        let weight = self.model.output_projection();
-        let logits_rows = self.model.config.logits_rows;
         #[cfg(feature = "kernel-call-trace")]
-        Self::record(gemm_rows_call::<Vocab>(
-            label,
-            weight.rows,
-            weight.cols,
-            logits_rows,
-            0,
-            x.seq_len,
-        ));
+        {
+            let config = &self.model.config;
+            let tail = config.logits_rows - config.decodable_vocab;
+            let tail_label = format!("{label}.tail_mask");
+            Self::record(gemm_rows_call::<Vocab>(
+                label,
+                config.vocab_size,
+                config.hidden_size,
+                config.logits_rows,
+                0,
+                x.seq_len,
+            ));
+            if tail > 0 {
+                Self::record(suppress_logits_call::<Vocab>(
+                    tail_label,
+                    config.logits_rows,
+                    x.seq_len,
+                    tail,
+                ));
+            }
+        }
         self.model.project_logits(&self.model.ctx, x, out)
     }
 
