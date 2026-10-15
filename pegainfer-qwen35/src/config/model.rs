@@ -168,15 +168,9 @@ impl Config35 {
                 vocab_size: self.vocab_size,
             });
         }
-        // The logits GEMM's M dimension and the output matrix's leading
-        // dimension both take this width; an unaligned value (Qwen3.5-4B's
-        // tokenizer decodes 248077) forces cublasLt onto an align-1 sm_75-era
-        // kernel that costs ~1.7 ms/decode-step on sm_80. Round the GEMM width
-        // up to the tile-aligned multiple — the checkpoint's remaining rows are
-        // real trained embeddings and stay inside the mapped weight.
-        let aligned = effective_vocab.next_multiple_of(128);
         self.decodable_vocab = effective_vocab;
-        self.selection_vocab = aligned.min(self.vocab_size);
+        self.selection_vocab =
+            pegainfer_core::decodable_vocab::aligned_logits_rows(effective_vocab, self.vocab_size);
         Ok(())
     }
 }

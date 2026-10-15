@@ -103,6 +103,16 @@ pub fn decodable_vocab_width(model_path: &str) -> Result<usize> {
     Ok(width)
 }
 
+/// Rows the output projection computes for a `decodable` prefix of a
+/// `vocab`-row checkpoint. The GEMM's M dimension and the logits buffer's
+/// leading dimension both take this width, and an unaligned one (Qwen3.5-4B
+/// decodes 248077 ids) forces cublasLt onto an align-1 kernel, so it is rounded
+/// up to a 128-token tile and capped at the checkpoint's rows. The rows past
+/// `decodable` must be masked before selection.
+pub fn aligned_logits_rows(decodable: usize, vocab: usize) -> usize {
+    decodable.next_multiple_of(128).min(vocab)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

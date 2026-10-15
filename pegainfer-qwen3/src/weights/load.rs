@@ -26,7 +26,6 @@ use super::Qwen3Model;
 use super::TransformerBlock;
 use crate::config::Config;
 use crate::config::TensorParallelConfig;
-use crate::config::logits_rows;
 use crate::projection_fusion::select_decode_projection_path;
 
 #[derive(Clone, Copy, Debug)]
@@ -82,15 +81,18 @@ impl Qwen3Model {
             effective_vocab - 1,
             config.vocab_size
         );
-        config.selection_vocab = effective_vocab;
-        config.logits_rows = logits_rows(config.selection_vocab, config.vocab_size);
-        if config.selection_vocab < config.vocab_size {
+        config.decodable_vocab = effective_vocab;
+        config.logits_rows = pegainfer_core::decodable_vocab::aligned_logits_rows(
+            effective_vocab,
+            config.vocab_size,
+        );
+        if config.decodable_vocab < config.vocab_size {
             info!(
                 "output projection: selection bounded to decodable vocab {}, projecting {} aligned rows (checkpoint pads to {})",
-                config.selection_vocab, config.logits_rows, config.vocab_size
+                config.decodable_vocab, config.logits_rows, config.vocab_size
             );
         }
-        let tail_ids = (config.selection_vocab..config.logits_rows)
+        let tail_ids = (config.decodable_vocab..config.logits_rows)
             .map(u32::try_from)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let logits_tail_suppress = (!tail_ids.is_empty())

@@ -789,7 +789,7 @@ mod tests {
             num_key_value_heads: 2,
             head_dim: 2,
             vocab_size: 16,
-            selection_vocab: 16,
+            decodable_vocab: 16,
             logits_rows: 16,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
