@@ -8,15 +8,14 @@ import hashlib
 import json
 import re
 from itertools import product
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from measurement_schema import MeasurementError, contract as measurement_contract, digest, integer, number, text
 
 
-CAMPAIGN_SPEC_SCHEMA_VERSION = 4
-COMPILED_CAMPAIGN_SCHEMA_VERSION = 4
+CAMPAIGN_SPEC_SCHEMA_VERSION = 5
+COMPILED_CAMPAIGN_SCHEMA_VERSION = 5
 SPLITS = ("train", "threshold_validation", "held_out_mixed", "sealed_test")
 WORKLOAD_KINDS = ("cold_prefill", "steady_decode", "cached_prefill", "mixed")
 
@@ -294,17 +293,6 @@ def _positive_int(value: Any, field: str, *, allow_zero: bool = False) -> int:
     return value
 
 
-def load_spec(path: Path) -> dict[str, Any]:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            document = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ManifestError(f"failed to read spec {path}: {exc}") from exc
-    if not isinstance(document, dict):
-        raise ManifestError("campaign spec must be a JSON object")
-    return document
-
-
 def _merge_configuration(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(base)
     for key, value in override.items():
@@ -351,9 +339,10 @@ def canonical_execution_configuration(value: dict[str, Any], field: str) -> dict
         raise ManifestError("generation.prompt_representation must be token_ids or text")
     if generation.get("seed_policy") != "phase_repeat":
         raise ManifestError("generation.seed_policy must be phase_repeat")
-    timing = _fields(value.get("timing"), {"clock", "first_token", "last_token"}, f"{field}.timing")
-    if timing != {"clock": "monotonic", "first_token": "first_generated_content_event", "last_token": "last_generated_content_event"}:
-        raise ManifestError("timing must use monotonic generated-content event timestamps")
+    from evidence_proxy import TIMING_CONTRACT
+    timing = value.get("timing")
+    if timing != TIMING_CONTRACT:
+        raise ManifestError("timing must use the explicit proxy token-ID/text contract")
     normalized = copy.deepcopy(value)
     normalized["sampling"] = sampling
     return normalized
@@ -413,11 +402,14 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
             raise ManifestError("unsupported campaign spec kind/schema_version")
         output = _fields(spec.get("output"), {"artifact_root"}, "output")
         text(output.get("artifact_root"), "output.artifact_root")
-        client = _fields(spec.get("client"), {"name", "version", "binary", "tokenizer", "seed", "sampling", "generation", "timing"}, "client")
+        client = _fields(spec.get("client"), {"name", "version", "binary", "tokenizer", "seed", "sampling", "generation", "timing", "retry"}, "client")
         for field in ("name", "version", "binary", "tokenizer"):
             text(client.get(field), f"client.{field}")
         defaults = canonical_execution_configuration({key: client.get(key) for key in ("seed", "sampling", "generation", "timing")}, "client")
         client = {**client, **defaults}
+        from evidence_proxy import RETRY_CONTRACT
+        if client.get("retry") != RETRY_CONTRACT:
+            raise ManifestError("client.retry must declare at-most-once proxy forwarding and unavailable client retry control")
         supplied = _fields(spec.get("variants"), {"target", "zero_cost", "sim"}, "variants")
         if set(supplied) != {"target", "zero_cost", "sim"}:
             raise ManifestError("variants must contain target, zero_cost and sim")
@@ -431,7 +423,7 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
             for field in ("endpoint", "model", "engine", "engine_version", "model_revision"):
                 text(identity.get(field), f"variants.{name}.identity.{field}")
             endpoint = urlsplit(identity["endpoint"])
-            if endpoint.scheme not in ("http", "https") or not endpoint.netloc or endpoint.username or endpoint.password:
+            if endpoint.scheme not in ("http", "https") or not endpoint.netloc or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment or endpoint.path not in ("", "/"):
                 raise ManifestError(f"variants.{name}.identity.endpoint must be an HTTP URL without credentials")
             identity["endpoint"] = identity["endpoint"].rstrip("/")
             digest(identity.get("model_config_sha256"), f"variants.{name}.model_config_sha256")

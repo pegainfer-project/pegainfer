@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Replay a selected profile and report target/zero-cost/fitted/sim evidence."""
+"""Profile validation and replay reporting rules retained until C7 migration.
+
+C2 owns request execution and evidence storage through campaign/plan_driver.
+This module performs no HTTP sampling and reads no execution artifact index.
+Its report input/metric contracts still await C3-C7 migration; it is not wired
+as a consumer of measurement v3 and does not adapt old execution artifacts.
+"""
 
 from __future__ import annotations
 
-import argparse
-import copy
 import hashlib
 import json
 import math
-import os
 import statistics
-import sys
 from pathlib import Path
 from typing import Any
 
-from benchmark import run_stream_cell
 from manifest import (
     ManifestError,
     canonical_cache_identity,
@@ -29,7 +30,6 @@ from pairing import (
     pair_metric_measurements,
     pairing_key_text,
 )
-from probe import ProbeError, probe_endpoint
 
 
 SCHEMA_VERSION = 1
@@ -113,15 +113,6 @@ def _paired_error_metrics(pairs: list[tuple[Any, float, float]]) -> dict[str, An
     }
 
 
-def _safe_result_path(root: Path, relative: str) -> Path:
-    candidate = (root / relative).resolve()
-    try:
-        candidate.relative_to(root.resolve())
-    except ValueError as exc:
-        raise ReplayError(f"artifact path escapes campaign root: {relative!r}") from exc
-    return candidate
-
-
 def _safe_profile_artifact(profile_path: Path, relative: str) -> Path:
     if Path(relative).is_absolute():
         raise ReplayError(f"publication artifact path must be relative: {relative!r}")
@@ -169,48 +160,6 @@ def _validate_publication(
         if artifact.get("profile", {}).get("sha256") != profile_digest:
             raise ReplayError(f"published profile {name} does not reference this profile")
     return publication_digest
-
-
-def _load_variant_result(
-    root: Path,
-    index: dict[str, Any],
-    cell_id: str,
-    variant: str,
-) -> dict[str, Any]:
-    entries = index.get("variant_cells")
-    if not isinstance(entries, dict):
-        raise ReplayError("artifact index variant_cells must be an object")
-    entry = entries.get(f"{cell_id}:{variant}")
-    if not isinstance(entry, dict) or entry.get("status") != "sealed":
-        raise ReplayError(f"{cell_id}:{variant} is not sealed")
-    relative = entry.get("result_path")
-    expected_digest = entry.get("result_sha256")
-    if not isinstance(relative, str) or not isinstance(expected_digest, str):
-        raise ReplayError(f"{cell_id}:{variant} has incomplete artifact identity")
-    path = _safe_result_path(root, relative)
-    try:
-        payload = path.read_bytes()
-    except OSError as exc:
-        raise ReplayError(f"failed to read {path}: {exc}") from exc
-    actual_digest = _sha256(payload)
-    if actual_digest.lower() != expected_digest.lower():
-        raise ReplayError(f"artifact digest mismatch for {cell_id}:{variant}")
-    try:
-        record = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ReplayError(f"failed to parse {path}: {exc}") from exc
-    if (
-        not isinstance(record, dict)
-        or record.get("campaign_id") != index.get("campaign_id")
-        or record.get("variant") != variant
-        or not isinstance(record.get("cell"), dict)
-        or record["cell"].get("cell_id") != cell_id
-    ):
-        raise ReplayError(f"artifact identity mismatch for {cell_id}:{variant}")
-    result = record.get("result")
-    if not isinstance(result, dict):
-        raise ReplayError(f"artifact {path} has no result object")
-    return result
 
 
 def _summary(result: dict[str, Any]) -> dict[str, Any]:
@@ -975,131 +924,3 @@ def _write_document(path: Path, document: dict[str, Any]) -> None:
         raise ReplayError(f"refusing to overwrite a different report artifact: {path}")
     if not path.exists():
         path.write_text(rendered, encoding="utf-8")
-
-
-def _sim_manifest(
-    campaign: dict[str, Any],
-    calibration: dict[str, Any],
-    endpoint: str,
-    model_id: str,
-) -> dict[str, Any]:
-    manifest = copy.deepcopy(campaign)
-    manifest["variants"] = copy.deepcopy(campaign.get("variants", {}))
-    # Profile-backed sim validates that its served model id equals the
-    # calibration target model id.  The campaign's replay variant may use a
-    # transport-only alias for legacy fixed-cost sims, so it is not the
-    # identity of a functional profile replay endpoint.
-    sim_model_id = model_id
-    manifest["variants"]["sim"] = {
-        "identity": {
-            "endpoint": endpoint,
-            "engine": "pegainfer-sim",
-            "engine_version": "local",
-            "model": sim_model_id,
-            "model_config_sha256": calibration.get("model_config_sha256"),
-            "model_revision": calibration.get("model_revision", sim_model_id),
-        }
-    }
-    return manifest
-
-
-def run_replay(
-    campaign_root: Path,
-    profile_path: Path,
-    output_path: Path,
-    *,
-    sim_endpoint: str,
-    cells: list[str] | None = None,
-    require_splits: tuple[str, ...] = (),
-    allow_independent_campaign: bool = False,
-    timeout: float = 30.0,
-) -> dict[str, Any]:
-    campaign, campaign_digest = _read_json(campaign_root / "manifest.json")
-    index, index_digest = _read_json(campaign_root / "artifact_index.json")
-    if campaign.get("campaign_id") != index.get("campaign_id"):
-        raise ReplayError("campaign and artifact index campaign_id mismatch")
-    profile, calibration, selection, profile_digests = validate_profile(
-        profile_path,
-        campaign,
-        allow_independent_campaign=allow_independent_campaign,
-    )
-    selected_names = set(cells) if cells is not None else None
-    raw_variants: dict[str, dict[str, dict[str, Any]]] = {}
-    selected_cells = [cell for cell in campaign["workload"]["cells"] if selected_names is None or cell.get("name") in selected_names]
-    if not selected_cells:
-        raise ReplayError("no workload cells selected")
-    for cell in selected_cells:
-        cell_id = cell["cell_id"]
-        raw_variants[cell_id] = {
-            variant: _load_variant_result(campaign_root, index, cell_id, variant)
-            for variant in ("target", "zero_cost")
-        }
-    model_id = calibration["model_id"]
-    sim_manifest = _sim_manifest(campaign, calibration, sim_endpoint, model_id)
-    sim_model_id = sim_manifest["variants"]["sim"]["identity"]["model"]
-    try:
-        probe_endpoint(sim_endpoint, expected_model=sim_model_id, timeout=min(timeout, 10.0), attempts=2)
-    except ProbeError as exc:
-        raise ReplayError(f"sim endpoint probe failed: {exc}") from exc
-    sim_results: dict[str, dict[str, Any] | None] = {}
-    for cell in selected_cells:
-        cell_id = cell["cell_id"]
-        status, reason, _ = _predict_cell(profile, cell)
-        if status != "in_domain":
-            sim_results[cell_id] = None
-            continue
-        sim_results[cell_id] = run_stream_cell(sim_manifest, cell, variant="sim", timeout=timeout)
-    report = build_report(
-        {**campaign, "workload": {**campaign["workload"], "cells": selected_cells}},
-        profile,
-        selection,
-        {
-            **profile_digests,
-            "campaign_manifest_sha256": campaign_digest,
-            "artifact_index_sha256": index_digest,
-        },
-        raw_variants,
-        sim_results,
-        independent_campaign=allow_independent_campaign,
-    )
-    _write_document(output_path, report)
-    if require_splits:
-        require_publication_coverage(report, required_splits=require_splits)
-    return report
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--campaign-root", type=Path, required=True)
-    parser.add_argument("--profile", type=Path, required=True)
-    parser.add_argument("--sim-endpoint", required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--cell", action="append", dest="cells")
-    parser.add_argument("--require-split", action="append", dest="required_splits", default=[])
-    parser.add_argument("--independent-campaign", action="store_true")
-    parser.add_argument("--timeout", type=float, default=30.0)
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-    try:
-        report = run_replay(
-            args.campaign_root,
-            args.profile,
-            args.output,
-            sim_endpoint=args.sim_endpoint,
-            cells=args.cells,
-            require_splits=tuple(args.required_splits),
-            allow_independent_campaign=args.independent_campaign,
-            timeout=args.timeout,
-        )
-    except (OSError, ReplayError, ProbeError) as exc:
-        print(f"replay error: {exc}", file=sys.stderr)
-        return 2
-    print(json.dumps({"campaign_id": report["campaign_id"], "status": report["status"], "coverage": report["coverage"]}, sort_keys=True))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -65,22 +65,17 @@ def _connection(endpoint: Endpoint, timeout: float) -> http.client.HTTPConnectio
     return http.client.HTTPConnection(endpoint.host, endpoint.port, timeout=timeout)
 
 
-def request(
+def _get(
     endpoint: Endpoint,
-    method: str,
     path: str,
     *,
-    body: dict[str, Any] | None = None,
     timeout: float,
 ) -> HttpResult:
-    encoded = json.dumps(body, separators=(",", ":")).encode("utf-8") if body is not None else None
     headers = {"Accept": "application/json"}
-    if encoded is not None:
-        headers.update({"Content-Type": "application/json", "Content-Length": str(len(encoded))})
     started = time.perf_counter()
     conn = _connection(endpoint, timeout)
     try:
-        conn.request(method, endpoint.path(path), body=encoded, headers=headers)
+        conn.request("GET", endpoint.path(path), headers=headers)
         response = conn.getresponse()
         payload = response.read()
         return HttpResult(
@@ -90,7 +85,7 @@ def request(
             (time.perf_counter() - started) * 1000.0,
         )
     except (OSError, socket.timeout) as exc:
-        raise ProbeError(f"{method} {path} failed: {exc}") from exc
+        raise ProbeError(f"GET {path} failed: {exc}") from exc
     finally:
         conn.close()
 
@@ -122,9 +117,7 @@ def probe_endpoint(
     last_error: ProbeError | None = None
     for attempt in range(attempts):
         try:
-            health = request(endpoint, "GET", "/health", timeout=timeout)
-            _require_success(health, "/health")
-            models = request(endpoint, "GET", "/v1/models", timeout=timeout)
+            models = _get(endpoint, "/v1/models", timeout=timeout)
             _require_success(models, "/v1/models")
             document = models.json()
             entries = document.get("data") if isinstance(document, dict) else None
@@ -152,7 +145,6 @@ def probe_endpoint(
             return {
                 "proxy_mode": "direct_http_client",
                 "endpoint": base_url.rstrip("/"),
-                "health": {"status": health.status, "elapsed_ms": health.elapsed_ms},
                 "models": {
                     "status": models.status,
                     "elapsed_ms": models.elapsed_ms,

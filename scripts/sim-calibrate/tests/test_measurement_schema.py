@@ -18,12 +18,13 @@ def row() -> dict:
         'cell_id': cell, 'pairing_key': f'{cell}:measured:0:0', 'plan_sha256': 'b' * 64,
         'phase': 'measured', 'repeat': 0, 'index': 0, 'variant': 'target', 'status': 'succeeded',
         'planned_dispatch_offset_ms': 0, 'actual_dispatch_timestamp': 1.0,
-        'first_token_timestamp': 1.01, 'last_token_timestamp': 1.03,
-        'ttft_ms': 10, 'tpot_ms': 10, 'stream_chunk_tpot_ms': 10, 'e2e_ms': 31,
+        'first_token_timestamp': 1.01, 'last_token_timestamp': 1.03, 'stream_end_timestamp': 1.031,
+        'first_text_timestamp': 1.015, 'first_text_latency_ms': 15, 'measurement_origin': 'http_sse_proxy',
+        'ttft_ms': 10, 'tpot_ms': 10, 'e2e_ms': 31,
         'prompt_tokens': 128, 'completion_tokens': 3, 'token_timing_valid': True,
         'generation_event_timestamps': [1.01, 1.02, 1.03], 'interval_token_counts': [1, 1],
-        'first_event_token_count': 1, 'event_source': 'client_sse_generated_content',
-        'request_instance_id': 'request-task-0', 'transport_request_id': None, 'error': None,
+        'first_event_token_count': 1, 'event_source': 'proxy_upstream_read',
+        'request_instance_id': 'request-task-0', 'transport_request_id': 'wire-0', 'error': None,
         **{field: 'c' * 64 for field in ('prompt_sha256', 'token_sha256', 'body_sha256', 'wire_body_sha256', 'workload_evidence_sha256')},
     }
 
@@ -36,7 +37,7 @@ def envelope() -> dict:
                              'engine': 'vllm', 'engine_version': 'test', 'model_revision': 'local',
                              'model_config_sha256': 'e' * 64},
         'provenance': {'client_name': 'vllm-bench', 'client_version': 'test',
-                       **{key: 'd' * 64 for key in ('binary_sha256', 'tokenizer_sha256', 'raw_bundle_index_sha256', 'source_command_sha256')}},
+                       **{key: 'd' * 64 for key in ('binary_sha256', 'tokenizer_sha256', 'observer_sha256', 'raw_bundle_index_sha256', 'source_command_sha256')}},
     }
 
 
@@ -47,6 +48,7 @@ class MeasurementSchemaTests(unittest.TestCase):
         other['index'] = 1
         other['pairing_key'] = f"{other['cell_id']}:measured:0:1"
         other['request_instance_id'] = 'request-task-1'
+        other['transport_request_id'] = 'wire-1'
         data['measurements'].append(other)
         validate_envelope(json.loads(json.dumps(data)))
 
@@ -91,7 +93,7 @@ class MeasurementSchemaTests(unittest.TestCase):
         data = row()
         data.update(status='failed', error='request timeout', token_timing_valid=None,
                     generation_event_timestamps=[], interval_token_counts=[])
-        for field in ('first_token_timestamp', 'last_token_timestamp', 'ttft_ms', 'tpot_ms', 'stream_chunk_tpot_ms', 'e2e_ms'):
+        for field in ('first_token_timestamp', 'last_token_timestamp', 'ttft_ms', 'tpot_ms', 'e2e_ms'):
             data[field] = None
         validate_row(data)
         data['error'] = None

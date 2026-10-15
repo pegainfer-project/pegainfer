@@ -18,8 +18,21 @@
     },
     "timing": {
       "clock": "monotonic",
-      "first_token": "first_generated_content_event",
-      "last_token": "last_generated_content_event"
+      "first_token": "first_output_token_ids_event",
+      "last_token": "last_output_token_ids_event",
+      "first_text": "first_nonempty_output_text_event",
+      "text_fallback": "disabled",
+      "return_token_ids": true,
+      "echo": false,
+      "decode_interval_tokens": "right_event_output_token_count",
+      "measurement_origin": "http_sse_proxy",
+      "request_start": "proxy_upstream_dispatch",
+      "event_observation": "proxy_upstream_read"
+    },
+    "retry": {
+      "max_upstream_attempts_per_key": 1,
+      "duplicate_policy": "fail_batch",
+      "client_retry_control": "unavailable"
     }
   },
   "variants": {

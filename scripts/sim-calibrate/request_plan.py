@@ -9,7 +9,7 @@ from typing import Any
 from manifest import canonical_execution_configuration, canonical_sampling_configuration, sha256_json
 from measurement_schema import MeasurementError, digest, integer, number, text
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 KIND = "request_plan"
 
 
@@ -84,6 +84,8 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
                        "binary_sha256": client["binary_sha256"], "tokenizer_sha256": client["tokenizer_sha256"]},
             "generation": {**copy.deepcopy(cell["generation"]), "seed": base},
             "timing": copy.deepcopy(cell["timing"]),
+            "retry": copy.deepcopy(client["retry"]),
+            "observer": copy.deepcopy(client["observer"]),
             "shape": {"input_tokens": cell["input_tokens"], "output_tokens": cell["output_tokens"]},
             "sampling": copy.deepcopy(cell["sampling"]),
             "arrival": {"mode": "fixed_batch", "clock": "monotonic"},
@@ -104,7 +106,7 @@ def validate_plan(plan: dict[str, Any]) -> None:
     try:
         if not isinstance(plan, dict) or plan.get("kind") != KIND or type(plan.get("schema_version")) is not int or plan["schema_version"] != SCHEMA_VERSION:
             raise PlanError("unsupported request plan kind/schema_version")
-        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "arrival", "batches", "logical_requests", "plan_sha256", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "steady_state"}, "plan")
+        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "retry", "observer", "arrival", "batches", "logical_requests", "plan_sha256", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "steady_state"}, "plan")
         digest(plan.get("cell_id"), "cell_id")
         digest(plan.get("plan_sha256"), "plan_sha256")
         if sha256_json({k: v for k, v in plan.items() if k != "plan_sha256"}) != plan["plan_sha256"]:
@@ -127,6 +129,19 @@ def validate_plan(plan: dict[str, Any]) -> None:
             "seed": base_seed, "sampling": plan.get("sampling"), "timing": plan.get("timing"),
             "generation": {key: value for key, value in generation.items() if key != "seed"},
         }, "plan")
+        from evidence_proxy import RETRY_CONTRACT, OBSERVER_CONFIG, OBSERVER_SOURCES
+        if plan.get("retry") != RETRY_CONTRACT or not isinstance(plan.get("observer"), dict):
+            raise PlanError("missing observer/retry contract")
+        observer = _plan_fields(plan["observer"], {"config", "dependencies", "sources", "sha256"}, "observer")
+        digest(observer.get("sha256"), "observer.sha256")
+        if observer.get("config") != OBSERVER_CONFIG or not isinstance(observer.get("dependencies"), dict) or not isinstance(observer.get("sources"), dict):
+            raise PlanError("invalid observer configuration")
+        if set(observer['sources']) != set(OBSERVER_SOURCES):
+            raise PlanError('incomplete observer sources; recompile campaign')
+        for name, checksum in observer['sources'].items():
+            digest(checksum, f'observer.sources.{name}')
+        if observer["sha256"] != sha256_json([observer["config"], observer["dependencies"], observer["sources"]]):
+            raise PlanError("observer identity digest mismatch")
         c = integer(plan.get("concurrency"), "concurrency", positive=True, maximum=2**32 - 1)
         repeats = integer(plan.get("repeats"), "repeats", positive=True, maximum=2**32 - 1)
         warmups = integer(plan.get("warmup_repeats"), "warmup_repeats", maximum=2**32 - 1)

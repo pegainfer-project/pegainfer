@@ -23,7 +23,10 @@ def make_input(root: Path) -> tuple[Path, dict]:
     (model / 'tokenizer.json').write_text('{"version":"1.0","model":{"type":"WordLevel","vocab":{"x":0},"unk_token":"x"}}\n')
     (model / 'config.json').write_text('{"model_type":"qwen3","vocab_size":1}\n')
     config_digest = hashlib.sha256((model / 'config.json').read_bytes()).hexdigest()
-    spec['client']['binary'] = sys.executable
+    binary = root / 'bench'
+    binary.write_text("#!/usr/bin/env python3\nimport sys\nprint('test' if '--version' in sys.argv else 'test help')\n")
+    binary.chmod(0o755)
+    spec['client']['binary'] = str(binary)
     spec['client']['tokenizer'] = str(model)
     for variant in spec['variants'].values():
         variant['identity']['model_config_sha256'] = config_digest

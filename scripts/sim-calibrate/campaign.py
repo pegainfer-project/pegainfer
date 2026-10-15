@@ -15,6 +15,7 @@ from artifacts import ArtifactError, write_compiled_bundle
 from manifest import ManifestError, compile_manifest, sha256_json
 from profile import ProfileError, zero_cost_bundle
 from request_plan import PlanError, build_plan
+from vllm_bench import VllmBenchError, inspect_binary
 
 TOKENIZER_FILES = (
     "tokenizer_config.json", "tokenizer.json", "tokenizer.model", "special_tokens_map.json",
@@ -72,8 +73,16 @@ def _assets(spec: dict[str, Any], base: Path) -> dict[str, Any]:
     if not any((tokenizer / name).is_file() for name in ("tokenizer.json", "tokenizer.model", "vocab.json", "vocab.txt")):
         raise ManifestError("client.tokenizer is missing vocabulary/tokenizer data")
     files = {name: _file_digest(tokenizer / name) for name in TOKENIZER_FILES if (tokenizer / name).is_file()}
+    binary = inspect_binary(paths["binary"])
+    launcher = inspect_binary(Path("/usr/bin/setpriv"))
+    if client.get('version') != binary.version:
+        raise ManifestError(f"client.version must equal actual --version: {binary.version}")
+    from evidence_proxy import observer_identity
     return {
-        "binary_sha256": _file_digest(paths["binary"]),
+        "binary_sha256": binary.sha256,
+        "binary_help_sha256": binary.help_sha256,
+        "process_launcher": {"path": launcher.path, "sha256": launcher.sha256, "version": launcher.version, "help_sha256": launcher.help_sha256},
+        "observer": observer_identity(),
         "tokenizer_sha256": sha256_json(files),
         "tokenizer_config_sha256": files["tokenizer_config.json"],
         "tokenizer_files": files,
@@ -106,7 +115,7 @@ def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[
         documents[name] = plan
         cell["plan"] = {"path": name, "plan_sha256": plan["plan_sha256"]}
     module_dir = Path(__file__).resolve().parent
-    compiler_files = {name: _file_digest(module_dir / name) for name in (
+    compiler_files = {name: assets['observer']['sources'][name] for name in (
         "campaign.py", "manifest.py", "request_plan.py", "measurement_schema.py", "profile.py", "artifacts.py",
     )}
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=module_dir, capture_output=True, text=True, timeout=5, check=False)
@@ -149,13 +158,32 @@ def main(argv: list[str] | None = None) -> int:
     compile_parser.add_argument("--spec", required=True, type=Path)
     compile_parser.add_argument("--output", type=Path, help="override output.artifact_root")
     compile_parser.add_argument("--dry-run", action="store_true", help="validate and print without writing artifacts")
+    run_parser = subcommands.add_parser("run", help="execute frozen cold/decode plans through the evidence proxy")
+    run_parser.add_argument("--artifact-root", type=Path, required=True)
+    run_parser.add_argument("--variant", choices=("target", "zero_cost", "sim"), action="append", required=True)
+    run_parser.add_argument("--cell", action="append", help="exact compiled cell name or ID; repeatable")
+    run_parser.add_argument("--timeout", type=float, default=120.0, help="whole bench batch deadline in seconds")
+    run_parser.add_argument("--server-pid", action="append", default=[], metavar="VARIANT=PID", help="bind an existing local profile server; repeat for zero_cost and sim")
     args = parser.parse_args(argv)
     try:
+        if args.command == 'run':
+            import asyncio
+            from plan_driver import run_campaign
+            pids = {}
+            for binding in args.server_pid:
+                name, value = binding.split('=', 1)
+                if name not in ('zero_cost', 'sim') or name in pids:
+                    raise ValueError('server-pid must bind each profile variant once')
+                pids[name] = int(value)
+            result = asyncio.run(run_campaign(args.artifact_root, variants=args.variant,
+                                              selectors=args.cell, timeout=args.timeout, server_pids=pids))
+            print(json.dumps(result, sort_keys=True))
+            return 0 if all(entry['status'] == 'sealed' for entry in result) else 1
         compiled = compile_campaign(args.spec, output=args.output, write=not args.dry_run, argv=[str(Path(__file__).resolve()), *(sys.argv[1:] if argv is None else argv)])
         print(json.dumps(compiled if args.dry_run else {"campaign_id": compiled["campaign_id"], "cells": compiled["workload"]["cell_count"]}, sort_keys=True))
         return 0
-    except (ManifestError, ArtifactError, PlanError, ProfileError, OSError, ValueError) as exc:
-        print(f"campaign compile error: {exc}", file=sys.stderr)
+    except (ManifestError, ArtifactError, PlanError, ProfileError, VllmBenchError, OSError, ValueError, RuntimeError) as exc:
+        print(f"campaign {args.command} error: {exc}", file=sys.stderr)
         return 2
 
 

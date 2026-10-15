@@ -1,0 +1,10 @@
+# Observer environment: compile records these installed versions and source digests.
+aiohttp==3.14.3
+aiohappyeyeballs==2.7.1
+aiosignal==1.4.0
+attrs==26.1.0
+frozenlist==1.8.0
+multidict==6.9.1
+propcache==0.5.4
+yarl==1.25.1
+idna==3.20

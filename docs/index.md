@@ -171,7 +171,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `subsystems/frontend/json-campaign-matrix.md` | Calibration matrix axes come from explicit campaign JSON; Python defaults and implicit reviewer/hardware presets are removed while concrete manifest cells remain stable for downstream simulation. |
+| `subsystems/frontend/json-campaign-matrix.md` | Named JSON campaigns compile immutable plans and run cold/decode through original vllm-bench plus an asynchronous evidence proxy; versioned token/text timing, raw evidence, recovery and C8 cached migration boundaries. |
 | `subsystems/frontend/frontend-architecture.md` | `pegainfer-frontend` owns everything north of the model schedulers. Two contract generations coexist: the step contract (qwen3 + pegainfer-sim migrated) and the legacy `EngineHandle`/`TokenEvent` path (other five lines). Next: migrate glm52, then delete the legacy contract. |
 | `subsystems/frontend/simulated-inference-engine.md` | CPU-only simulated model crate on the step contract (`SimScheduler` → `LaunchedEngine::Stepped`) for vLLM/OpenAI frontend and `vllm bench serve` validation without CUDA or weights. |
 | `subsystems/frontend/sim-step-contract.md` | Cut `pegainfer-sim` from the legacy `EngineHandle`/`TokenEvent` path onto the step contract. |

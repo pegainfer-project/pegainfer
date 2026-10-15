@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import tempfile
@@ -45,6 +46,11 @@ def _write_atomic(path: Path, document: Any) -> str:
             os.fsync(handle.fileno())
             temporary = Path(handle.name)
         os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -176,95 +182,6 @@ class ArtifactStore:
         }
         self._save_index()
 
-    def status(self, cell_id: str) -> str:
-        entry = self._index["cells"].get(cell_id)
-        return entry.get("status", "pending") if entry else "pending"
-
-    def begin_cell(self, cell: dict[str, Any]) -> None:
-        cell_id = cell.get("cell_id")
-        if not isinstance(cell_id, str) or not cell_id:
-            raise ArtifactError("cell must have a cell_id")
-        current = self._index["cells"].get(cell_id)
-        if current and current.get("status") == "sealed":
-            raise ArtifactError(f"sealed cell cannot be overwritten: {cell_id}")
-        if current and current.get("name") != cell.get("name"):
-            raise ArtifactError(f"cell identity changed for {cell_id}")
-        self._index["cells"][cell_id] = {
-            "cell_id": cell_id,
-            "name": cell.get("name"),
-            "split": cell.get("split"),
-            "status": "running",
-            "updated_at_utc": _now(),
-        }
-        _write_atomic(self.checkpoint_dir / f"{cell_id}.json", self._index["cells"][cell_id])
-        self._save_index()
-
-    def record_cell(
-        self,
-        cell: dict[str, Any],
-        result: dict[str, Any],
-        *,
-        collector_argv: list[str],
-        probe: dict[str, Any],
-    ) -> dict[str, Any]:
-        cell_id = cell.get("cell_id")
-        if not isinstance(cell_id, str) or not cell_id:
-            raise ArtifactError("cell must have a cell_id")
-        if self.status(cell_id) == "sealed":
-            raise ArtifactError(f"sealed cell cannot be overwritten: {cell_id}")
-        status = result.get("status")
-        if status not in ("succeeded", "invalid", "failed"):
-            raise ArtifactError(f"cell result has unsupported status: {status!r}")
-        record = {
-            "schema_version": SCHEMA_VERSION,
-            "campaign_id": self.campaign_id,
-            "cell": cell,
-            "probe": probe,
-            "collector_argv": collector_argv,
-            "result": result,
-            "recorded_at_utc": _now(),
-        }
-        result_path = self.cell_dir / cell_id / "result.json"
-        digest = _write_atomic(result_path, record)
-        relative = result_path.relative_to(self.root).as_posix()
-        self._index["cells"][cell_id] = {
-            "cell_id": cell_id,
-            "name": cell.get("name"),
-            "split": cell.get("split"),
-            "status": status,
-            "result_path": relative,
-            "result_sha256": digest,
-            "size": result_path.stat().st_size,
-            "updated_at_utc": _now(),
-        }
-        self._index["files"][relative] = {"sha256": digest, "size": result_path.stat().st_size}
-        _write_atomic(self.checkpoint_dir / f"{cell_id}.json", self._index["cells"][cell_id])
-        self._save_index()
-        return self._index["cells"][cell_id]
-
-    def seal_cell(self, cell_id: str) -> None:
-        entry = self._index["cells"].get(cell_id)
-        if not entry:
-            raise ArtifactError(f"cannot seal unknown cell: {cell_id}")
-        if entry.get("status") == "sealed":
-            return
-        if entry.get("status") != "succeeded":
-            raise ArtifactError(f"only succeeded cells can be sealed: {cell_id}")
-        result_path = self.root / entry["result_path"]
-        if not result_path.exists():
-            raise ArtifactError(f"sealed cell result is missing: {result_path}")
-        actual_digest = _sha256_bytes(result_path.read_bytes())
-        if actual_digest != entry.get("result_sha256"):
-            raise ArtifactError(f"cell result digest changed before sealing: {cell_id}")
-        entry["status"] = "sealed"
-        entry["sealed_at_utc"] = _now()
-        _write_atomic(self.checkpoint_dir / f"{cell_id}.json", entry)
-        self._save_index()
-
-    def variant_status(self, cell_id: str, variant: str) -> str:
-        entry = self._index["variant_cells"].get(f"{cell_id}:{variant}")
-        return entry.get("status", "pending") if entry else "pending"
-
     def begin_variant_cell(self, cell: dict[str, Any], variant: str) -> None:
         cell_id = cell.get("cell_id")
         if not isinstance(cell_id, str) or not cell_id:
@@ -360,3 +277,177 @@ class ArtifactStore:
         entry["sealed_at_utc"] = _now()
         _write_atomic(self.checkpoint_dir / f"{cell_id}.{variant}.json", entry)
         self._save_index()
+
+
+def checked_path(root: Path, relative: str) -> Path:
+    """Resolve an artifact reference without permitting escape through symlinks."""
+    path = Path(relative)
+    if path.is_absolute() or '..' in path.parts or not relative:
+        raise ArtifactError(f'unsafe artifact reference: {relative}')
+    result = (root / path).resolve()
+    if not result.is_relative_to(root.resolve()):
+        raise ArtifactError(f'artifact escapes root: {relative}')
+    return result
+
+
+def file_reference(path: Path) -> dict[str, Any]:
+    return {'sha256': _sha256_bytes(path.read_bytes()), 'size': path.stat().st_size}
+
+
+def verify_files(root: Path, files: dict[str, Any]) -> None:
+    if not isinstance(files, dict) or not files:
+        raise ArtifactError('artifact index has no files')
+    for relative, expected in files.items():
+        path = checked_path(root, relative)
+        if not path.is_file() or file_reference(path) != expected:
+            raise ArtifactError(f'artifact bytes changed or missing: {relative}')
+
+
+def load_compiled_bundle(root: Path) -> dict[str, Any]:
+    root = root.expanduser().resolve()
+    index = _read_json(root / 'artifact_index.json')
+    if index.get('kind') != 'compiled_artifact_index' or index.get('schema_version') != 3:
+        raise ArtifactError('not a current compiled bundle')
+    verify_files(root, index.get('files'))
+    campaign = _read_json(root / 'compiled_campaign.json')
+    if campaign.get('kind') != 'compiled_campaign' or campaign.get('schema_version') != 5:
+        raise ArtifactError('unsupported compiled campaign; compile a new experiment')
+    if campaign.get('campaign_id') != index.get('campaign_id'):
+        raise ArtifactError('compiler campaign/index identity mismatch')
+    from request_plan import build_plan
+    for cell in campaign['workload']['cells']:
+        plan_path = cell['plan']['path']
+        if plan_path not in index['files']:
+            raise ArtifactError('plan is not in compiler index')
+        actual = _read_json(checked_path(root, plan_path))
+        if actual != build_plan(cell, campaign['client']) or actual['plan_sha256'] != cell['plan']['plan_sha256']:
+            raise ArtifactError('plan does not match compiled cell/client')
+    return campaign
+
+
+class ExecutionStore:
+    """Current execution state never mutates the immutable compiler index.
+
+    The campaign lock spans a complete driver invocation. Attempt directories
+    are allocated exclusively, including after a killed process; old raw bytes
+    are never reused or overwritten.
+    """
+
+    def __init__(self, root: Path, campaign_id: str):
+        self.root = root.resolve()
+        if self.root.is_relative_to(_repo_root()):
+            raise ArtifactError('execution artifacts must be outside repository')
+        self.campaign_id = campaign_id
+        self.path = self.root / 'execution_index.json'
+        self.lock = None
+
+    def __enter__(self):
+        self.lock = (self.root / '.execution.lock').open('a+b')
+        try:
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.index = _read_json(self.path) if self.path.exists() else {
+                'kind': 'execution_index', 'schema_version': 1, 'campaign_id': self.campaign_id, 'cells': {}}
+            if self.index.get('kind') != 'execution_index' or self.index.get('schema_version') != 1 or self.index.get('campaign_id') != self.campaign_id:
+                raise ArtifactError('execution index identity/schema mismatch')
+            return self
+        except BaseException:
+            self.lock.close()
+            raise
+
+    def __exit__(self, *_):
+        self.lock.close()
+
+    def _save(self):
+        _write_atomic(self.path, self.index)
+
+    def sealed(self, plan: dict, variant: str, binding: dict) -> dict | None:
+        entry = self.index['cells'].get(f"{plan['cell_id']}:{variant}")
+        if not entry or entry['status'] != 'sealed':
+            return None
+        if entry.get('plan_sha256') != plan['plan_sha256'] or entry.get('binding') != binding:
+            raise ArtifactError('sealed execution binding changed')
+        root = checked_path(self.root, entry['path'])
+        raw = _read_json(root / 'raw_bundle_index.json')
+        if file_reference(root / 'raw_bundle_index.json') != entry['raw_index']:
+            raise ArtifactError('sealed raw index changed')
+        verify_files(root, raw['files'])
+        if file_reference(root / 'measurements.json') != entry['measurement']:
+            raise ArtifactError('sealed measurement changed')
+        if file_reference(root / 'workload_evidence.json') != entry['workload_evidence']:
+            raise ArtifactError('sealed workload evidence changed')
+        from measurement_schema import validate_envelope
+        envelope = _read_json(root / 'measurements.json')
+        validate_envelope(envelope)
+        if envelope['provenance']['observer_sha256'] != binding.get('observer_sha256'):
+            raise ArtifactError('sealed measurement observer binding mismatch')
+        return entry
+
+    def begin(self, plan: dict, variant: str, binding: dict) -> tuple[Path, int]:
+        key = f"{plan['cell_id']}:{variant}"
+        old = self.index['cells'].get(key, {})
+        if old.get('status') == 'sealed':
+            raise ArtifactError('sealed execution cannot be overwritten')
+        history = old.get('attempts', [])
+        for previous in history:
+            if previous['status'] == 'running':
+                previous.update(status='interrupted', error='previous driver terminated before sealing')
+        parent = self.root / 'raw' / variant / plan['cell_id']
+        parent.mkdir(parents=True, exist_ok=True)
+        attempt = max([a['attempt'] for a in history], default=0) + 1
+        while True:
+            directory = parent / f'attempt-{attempt}'
+            try:
+                directory.mkdir()
+                break
+            except FileExistsError:
+                attempt += 1
+        entry = {'attempt': attempt, 'path': directory.relative_to(self.root).as_posix(),
+                 'status': 'running', 'started_at_utc': _now()}
+        self.index['cells'][key] = {'status': 'running', 'plan_sha256': plan['plan_sha256'],
+                                    'binding': binding, 'attempts': [*history, entry]}
+        self._save()
+        return directory, attempt
+
+    def raw_index(self, directory: Path) -> str:
+        files = {}
+        for path in sorted(directory.rglob('*')):
+            if path.is_symlink():
+                raise ArtifactError('symlink in raw evidence')
+            if path.is_file() and path.name not in ('raw_bundle_index.json', 'measurements.json'):
+                files[path.relative_to(directory).as_posix()] = file_reference(path)
+        return _write_atomic(directory / 'raw_bundle_index.json', {
+            'kind': 'raw_bundle_index', 'schema_version': 1, 'files': files})
+
+    def finish(self, plan: dict, variant: str, directory: Path, *, error: str | None = None) -> dict:
+        key = f"{plan['cell_id']}:{variant}"
+        entry = self.index['cells'][key]
+        current = entry['attempts'][-1]
+        status = 'failed'
+        if error is None:
+            from measurement_schema import validate_envelope
+            envelope = _read_json(directory / 'measurements.json')
+            validate_envelope(envelope)
+            if envelope['provenance']['observer_sha256'] != entry['binding'].get('observer_sha256'):
+                raise ArtifactError('measurement observer binding mismatch')
+            raw = _read_json(directory / 'raw_bundle_index.json')
+            verify_files(directory, raw['files'])
+            if envelope['plan_sha256'] != plan['plan_sha256'] or envelope['variant'] != variant:
+                raise ArtifactError('measurement belongs to a different plan/variant')
+            if envelope['provenance']['raw_bundle_index_sha256'] != file_reference(directory / 'raw_bundle_index.json')['sha256']:
+                raise ArtifactError('measurement raw index binding mismatch')
+            workload = _read_json(directory / 'workload_evidence.json')
+            from manifest import sha256_json
+            if workload.get('sha256') != sha256_json(workload.get('requests')) or any(r.get('workload_evidence_sha256') != workload['sha256'] for r in envelope['measurements']):
+                raise ArtifactError('measurement workload evidence binding mismatch')
+            if [r['pairing_key'] for r in envelope['measurements']] != [r['pairing_key'] for r in plan['logical_requests']]:
+                raise ArtifactError('measurement key set differs from plan')
+            rows = envelope['measurements']
+            status = ('sealed' if all(r['status'] == 'succeeded' for r in rows) else
+                      'unsupported' if any(r['status'] == 'unsupported' for r in rows) else 'failed')
+            current.update(measurement=file_reference(directory / 'measurements.json'),
+                           raw_index=file_reference(directory / 'raw_bundle_index.json'),
+                           workload_evidence=file_reference(directory / 'workload_evidence.json'))
+        current.update(status=status, finished_at_utc=_now(), error=error)
+        entry.update({k: v for k, v in current.items() if k != 'attempts'})
+        self._save()
+        return entry
