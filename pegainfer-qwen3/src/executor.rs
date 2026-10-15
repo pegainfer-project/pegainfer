@@ -3212,9 +3212,10 @@ impl LocalQwen3Lane {
             model.config().max_position_embeddings,
             model.fused_decode_qkv(),
         )?;
-        let sample_scratch = pegainfer_sample::SampleScratch::new(
+        let sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
             model.device_ctx(),
             model.config().logits_rows,
+            model.config().decodable_vocab,
             max_bucket,
         )?;
         Ok(Self {
@@ -3381,9 +3382,10 @@ impl LocalQwen3Lane {
         sample_seed: u64,
     ) -> Result<Vec<u32>> {
         if params.len() > self.sample_scratch.max_rows() {
-            self.sample_scratch = pegainfer_sample::SampleScratch::new(
+            self.sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
                 self.model.device_ctx(),
                 self.model.config().logits_rows,
+                self.model.config().decodable_vocab,
                 params.len(),
             )?;
         }

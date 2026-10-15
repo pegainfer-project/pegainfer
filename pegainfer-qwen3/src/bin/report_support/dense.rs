@@ -33,7 +33,7 @@ pub(crate) const INTERMEDIATE_SIZE: usize = 9728;
 /// Rows in Qwen3-4B's checkpoint embedding table.
 pub(crate) const VOCAB_SIZE: usize = 151_936;
 /// Rows the frontend can decode and production output selection may inspect.
-const SELECTION_VOCAB_SIZE: usize = 151_669;
+const DECODABLE_VOCAB_SIZE: usize = 151_669;
 /// Aligned rows computed by Qwen3-4B's production output projection.
 pub(crate) const LOGITS_ROWS: usize = 151_680;
 const Q_DIM: usize = NUM_QO_HEADS * HEAD_DIM;
@@ -212,10 +212,10 @@ fn peaked_logits(ctx: &DeviceContext, rows: usize) -> Result<HiddenStates> {
     let mut host = patterned_bf16(LOGITS_ROWS * rows, 0.001);
     for row in 0..rows {
         for peak in 0..8 {
-            let token = (row * 48_271 + peak * 15_485_863) % SELECTION_VOCAB_SIZE;
+            let token = (row * 48_271 + peak * 15_485_863) % DECODABLE_VOCAB_SIZE;
             host[row * LOGITS_ROWS + token] = bf16::from_f32(10.0 - peak as f32);
         }
-        for token in SELECTION_VOCAB_SIZE..LOGITS_ROWS {
+        for token in DECODABLE_VOCAB_SIZE..LOGITS_ROWS {
             host[row * LOGITS_ROWS + token] = bf16::from_f32(f32::NEG_INFINITY);
         }
     }
@@ -341,7 +341,12 @@ impl DenseCase {
                 };
                 DenseBuffers::Sampling {
                     logits: peaked_logits(&ctx, rows)?,
-                    scratch: pegainfer_sample::SampleScratch::new(&ctx, LOGITS_ROWS, rows)?,
+                    scratch: pegainfer_sample::SampleScratch::with_selection_width(
+                        &ctx,
+                        LOGITS_ROWS,
+                        DECODABLE_VOCAB_SIZE,
+                        rows,
+                    )?,
                     params: vec![params; rows],
                     seed: 0x5eed,
                 }
