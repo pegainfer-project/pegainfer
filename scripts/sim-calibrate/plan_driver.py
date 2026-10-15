@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import os
 import socket
@@ -10,7 +9,6 @@ import struct
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -18,7 +16,8 @@ from artifacts import (ExecutionStore, _read_json, _write_atomic,
                        checked_path, file_reference, load_compiled_bundle)
 from evidence_proxy import EvidenceError, EvidenceProxy, observer_identity
 from manifest import canonical_scheduler_identity
-from probe import probe_endpoint
+from probe import (probe_endpoint, profile_endpoint, profile_listener_matches, requires_cache_reset,
+                   validate_profile_binding, validate_reset_receipt)
 from vllm_bench import render_command, run_command
 from vllm_bench_collect import convert_evidence
 
@@ -27,9 +26,7 @@ def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
     """Bind a local already-loaded profile to the listening process, without a generation probe."""
     if pid is None or pid <= 0:
         raise EvidenceError('profile-backed variants require --server-pid VARIANT=PID')
-    endpoint = urlsplit(variant['identity']['endpoint'])
-    if endpoint.hostname != '127.0.0.1':
-        raise EvidenceError('profile PID binding requires explicit IPv4 127.0.0.1; use that address instead of localhost')
+    endpoint = profile_endpoint(variant['identity']['endpoint'])
     process = Path('/proc') / str(pid)
     namespace = (process / 'ns/net').stat()
     own_namespace = Path('/proc/self/ns/net').stat()
@@ -52,7 +49,7 @@ def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
         actual = (process / 'cwd').resolve() / actual
     if actual.resolve() != configured:
         raise EvidenceError('live server profile path differs from campaign binding')
-    port = endpoint.port or (443 if endpoint.scheme == 'https' else 80)
+    port = endpoint.port
     sockets = {os.readlink(fd) for fd in (process / 'fd').iterdir() if fd.exists() and fd.is_socket()}
     listeners = []
     for table in ('tcp', 'tcp6'):
@@ -64,13 +61,15 @@ def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
             if table == 'tcp6':
                 raise EvidenceError('IPv6/dual-stack listener at profile endpoint port cannot be attested')
             address = socket.inet_ntop(socket.AF_INET, struct.pack('=I', int(address, 16)))
-            if address not in ('127.0.0.1', '0.0.0.0'):
+            listener = {'family': 'IPv4', 'address': address, 'port': port, 'inode': fields[9]}
+            if not profile_listener_matches(endpoint, listener):
                 continue
             if f'socket:[{fields[9]}]' not in sockets:
                 raise EvidenceError('profile endpoint has a listening socket not owned by PID')
-            listeners.append({'family': 'IPv4', 'address': address, 'port': port, 'inode': fields[9]})
-    if not listeners:
-        raise EvidenceError('PID does not own the configured listening socket')
+            listeners.append(listener)
+    binding = {'endpoint': {'address': endpoint.host, 'port': port},
+               'listeners': sorted(listeners, key=lambda row: (row['address'], row['inode']))}
+    validate_profile_binding(variant['identity']['endpoint'], binding)
     stat = (process / 'stat').read_text().rsplit(')', 1)[1].split()
     start_ticks = int(stat[19])
     started = time.time() - float(Path('/proc/uptime').read_text().split()[0]) + start_ticks / os.sysconf('SC_CLK_TCK')
@@ -88,11 +87,9 @@ def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
         raise EvidenceError('profile/model identity mismatch')
     if profile.get('scheduler') != canonical_scheduler_identity(variant['runtime']['scheduler']):
         raise EvidenceError('profile scheduler differs from configured runtime')
-    return {'profile': file_reference(configured), 'manifest': file_reference(manifest_path),
+    return {**binding, 'profile': file_reference(configured), 'manifest': file_reference(manifest_path),
             'server_pid': pid, 'process_start_ticks': start_ticks,
             'network_namespace': {'device': namespace.st_dev, 'inode': namespace.st_ino},
-            'endpoint': {'address': endpoint.hostname, 'port': port},
-            'listeners': sorted(listeners, key=lambda row: (row['address'], row['inode'])),
             'executable': file_reference((process / 'exe').resolve()), 'argv': args}
 
 
@@ -110,13 +107,9 @@ async def reset_cache(base: str, root: Path, timeout: float) -> None:
     async with aiohttp.ClientSession(trust_env=False, timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         async with session.post(base + '/reset_prefix_cache', allow_redirects=False) as response:
             body = await response.read()
-            _write_atomic(root / 'reset.json', {'status': response.status, 'body': body.decode(errors='replace')})
-            try:
-                value = json.loads(body)
-            except ValueError:
-                value = None
-            if response.status != 200 or not (value is True or isinstance(value, dict) and value.get('success') is True):
-                raise EvidenceError('target reset did not prove success; cold collection unsupported')
+            receipt = {'status': response.status, 'body': body.decode(errors='replace')}
+            _write_atomic(root / 'reset.json', receipt)
+            validate_reset_receipt({**receipt, 'body': body})
 
 
 async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
@@ -142,12 +135,8 @@ async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
                 name = f"{batch['phase']}-{batch['repeat']}"
                 batch_root = directory / 'batches' / name
                 batch_root.mkdir(parents=True)
-                lifecycle = plan.get('cache_lifecycle', {})
-                if variant_name == 'target' and variant['runtime'].get('cache', {}).get('policy') == 'on':
-                    if plan['workload_kind'] == 'cold_prefill' and not lifecycle:
-                        raise EvidenceError('cold target with cache enabled requires explicit reset lifecycle')
-                    if lifecycle and (lifecycle['reset_before'] == 'repeat' or batch is plan['batches'][0]):
-                        await reset_cache(identity['endpoint'], batch_root, min(10, timeout))
+                if requires_cache_reset(plan, variant_name, variant['runtime'], batch):
+                    await reset_cache(identity['endpoint'], batch_root, min(10, timeout))
                 prefix = f"c2-{campaign['campaign_id'][:12]}-{variant_name}-{attempt}-{uuid.uuid4().hex}-{name}-"
                 proxy.register(batch, prefix, batch_root)
                 argv = render_command(plan, batch, binary=Path(client['binary']), endpoint=proxy.url,

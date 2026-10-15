@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
 
@@ -229,3 +232,189 @@ def pair_metric_measurements(
             for key in sorted(expected)
         ]
     return {"pairing": diagnostics, "pairs": pairs}
+
+
+def index_plan_measurements(plan: dict, envelope: dict, workload: dict, variant: str) -> dict[str, dict]:
+    """Exact current-schema identities; no metric qualification or ordinal fallback."""
+    from manifest import sha256_json
+    from measurement_schema import validate_envelope
+    from request_plan import validate_plan
+
+    validate_plan(plan)
+    for row in envelope.get('measurements', []):
+        if isinstance(row, dict) and row.get('status') == 'succeeded' and any(
+                not row.get(field) for field in ('prompt_sha256', 'token_sha256', 'body_sha256',
+                                                'wire_body_sha256', 'transport_request_id', 'request_instance_id')):
+            raise PairingContractError(f'{variant}: unsupported_pairing: incomplete content/identity evidence')
+    validate_envelope(envelope)
+    if envelope['plan_sha256'] != plan['plan_sha256'] or envelope['variant'] != variant:
+        raise PairingContractError(f'{variant}: measurement plan/role mismatch')
+    expected = {row['pairing_key']: row for row in plan['logical_requests']}
+    rows = {row['pairing_key']: row for row in envelope['measurements']}
+    evidence = workload.get('requests', [])
+    if (not isinstance(evidence, list) or any(not isinstance(row, dict) for row in evidence)
+            or workload.get('sha256') != sha256_json(evidence)):
+        raise PairingContractError(f'{variant}: invalid workload evidence')
+    by_key = {row.get('pairing_key'): row for row in evidence}
+    if len(by_key) != len(evidence) or set(rows) != set(expected) or set(by_key) != set(expected):
+        raise PairingContractError(f'{variant}: duplicate/missing/extra plan or workload keys')
+    for key, row in rows.items():
+        logical = expected[key]
+        if row['status'] != 'succeeded':
+            raise PairingContractError(f'{variant}:{key}: request did not succeed')
+        if (row['cell_id'] != plan['cell_id'] or row['planned_dispatch_offset_ms'] != logical['dispatch_offset_ms']
+                or row['prompt_tokens'] != logical['input_tokens']):
+            raise PairingContractError(f'{variant}:{key}: request shape/arrival differs from plan')
+        for field, value in by_key[key].items():
+            if row.get(field) != value:
+                raise PairingContractError(f'{variant}:{key}: workload/measurement {field} mismatch')
+        required = ('transport_request_id', 'request_instance_id', 'prompt_sha256', 'token_sha256',
+                    'body_sha256', 'wire_body_sha256')
+        if any(not by_key[key].get(field) for field in required):
+            raise PairingContractError(f'{variant}:{key}: unsupported_pairing: incomplete content/identity evidence')
+        if row['workload_evidence_sha256'] != workload['sha256']:
+            raise PairingContractError(f'{variant}:{key}: workload digest mismatch')
+    return rows
+
+
+def pair_plan_measurements(plan: dict, attempts: dict[str, dict], required_roles: tuple[str, ...]) -> dict:
+    """Pair only the complete declared role/key sets; repeated content is valid."""
+    if not required_roles or len(set(required_roles)) != len(required_roles):
+        raise PairingContractError('pairing requires distinct explicit roles')
+    if set(attempts) != set(required_roles):
+        raise PairingContractError('required pairing roles are missing or unexpected')
+    indexed = {role: index_plan_measurements(plan, attempts[role]['envelope'], attempts[role]['workload'], role)
+               for role in required_roles}
+    pairs = []
+    for logical in plan['logical_requests']:
+        key = logical['pairing_key']
+        rows = {role: indexed[role][key] for role in required_roles}
+        for field in ('prompt_sha256', 'token_sha256', 'body_sha256'):
+            if len({row[field] for row in rows.values()}) != 1:
+                raise PairingContractError(f'{key}: cross-role {field} mismatch')
+        if logical['phase'] == 'measured':
+            pairs.append((logical, rows))
+    return {'pairs': pairs, 'expected_count': len(pairs), 'matched_count': len(pairs),
+            'observed_count': {role: len(rows) for role, rows in indexed.items()}}
+
+
+def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: dict, identity: dict, *, runtime: dict) -> dict:
+    """Bind wire requests, read/event evidence and frozen commands to plan keys."""
+    from artifacts import _read_json, checked_path
+    from evidence_proxy import validate_request_body
+    from probe import requires_cache_reset, validate_reset_receipt
+    from sse_evidence import SSEParser
+    from vllm_bench import render_command
+    from vllm_bench_collect import convert_evidence
+
+    directory, raw = attempt['directory'], attempt['raw_index']
+    envelope, workload = attempt['envelope'], attempt['workload']
+    rows = index_plan_measurements(plan, envelope, workload, variant)
+    logical_rows = {row['pairing_key']: row for row in plan['logical_requests']}
+
+    def required_path(name):
+        if name not in raw['files']:
+            raise PairingContractError(f'{variant}: required raw file is not indexed: {name}')
+        return checked_path(directory, name)
+
+    def read(name):
+        return _read_json(required_path(name))
+
+    if envelope['variant_identity'] != identity or read('observer.json') != client['observer']:
+        raise PairingContractError(f'{variant}: frozen variant/observer identity mismatch')
+    provenance = envelope['provenance']
+    for field, expected in (('client_name', 'vllm-bench'), ('client_version', client['version']),
+                            ('binary_sha256', client['binary_sha256']), ('tokenizer_sha256', client['tokenizer_sha256']),
+                            ('observer_sha256', client['observer']['sha256'])):
+        if provenance[field] != expected:
+            raise PairingContractError(f'{variant}: frozen {field} mismatch')
+    attempt_record = read('attempt.json')
+    if (attempt_record.get('cell_id') != plan['cell_id'] or attempt_record.get('variant') != variant
+            or attempt_record.get('errors') != []):
+        raise PairingContractError(f'{variant}: invalid attempt outcome')
+
+    expected_terminals, expected_commands = set(), set()
+    previous_end = -1
+    for batch in plan['batches']:
+        batch_path = f"batches/{batch['phase']}-{batch['repeat']}"
+        if requires_cache_reset(plan, variant, runtime, batch):
+            validate_reset_receipt(read(f'{batch_path}/reset.json'))
+        command_path = f'{batch_path}/command.json'
+        expected_commands.add(command_path)
+        command = read(command_path)
+        argv, prefix = command['argv'], command['request_id_prefix']
+        if command.get('batch') != batch or command.get('target_identity') != identity:
+            raise PairingContractError(f'{variant}:{batch_path}: command batch/identity mismatch')
+        if not isinstance(argv, list) or any(not isinstance(arg, str) for arg in argv):
+            raise PairingContractError(f'{variant}:{batch_path}: invalid command argv')
+        try:
+            endpoint = argv[argv.index('--base-url') + 1]
+        except (ValueError, IndexError) as exc:
+            raise PairingContractError(f'{variant}:{batch_path}: missing proxy endpoint') from exc
+        expected_argv = render_command(plan, batch, binary=Path(client['binary']),
+                                       endpoint=endpoint, model=identity['model'],
+                                       result_dir=directory / batch_path, request_id_prefix=prefix,
+                                       tokenizer=client['tokenizer'])
+        # Result paths are execution locations; copied evidence keeps its original argv.
+        result_index = expected_argv.index('--result-dir') + 1
+        if len(argv) != len(expected_argv):
+            raise PairingContractError(f'{variant}:{batch_path}: command length differs from frozen plan')
+        expected_argv[result_index] = argv[result_index]
+        if argv != expected_argv or not isinstance(prefix, str) or not prefix:
+            raise PairingContractError(f'{variant}:{batch_path}: command differs from frozen plan')
+        process = read(f'{batch_path}/process.json')
+        if (process.get('returncode') != 0 or process.get('timed_out') is not False
+                or process.get('result_present') is not True
+                or process.get('invocation') != [client['process_launcher']['path'], '--pdeathsig', 'KILL', '--', *argv]):
+            raise PairingContractError(f'{variant}:{batch_path}: unsuccessful or different bench invocation')
+        required_path(f'{batch_path}/bench-result.json')
+        ends = []
+        for index, key in enumerate(batch['request_keys']):
+            row = rows[key]
+            transport = f'{prefix}{index}'
+            instance = hashlib.sha256(transport.encode()).hexdigest()
+            request_path = f'{batch_path}/requests/{instance}'
+            terminal_path = f'{request_path}/terminal.json'
+            expected_terminals.add(terminal_path)
+            terminal = read(terminal_path)
+            if (terminal != row['extensions'].get('terminal') or terminal.get('pairing_key') != key
+                    or terminal.get('directory') != request_path or terminal.get('request_instance_id') != instance
+                    or terminal.get('transport_request_id') != transport or row['transport_request_id'] != transport
+                    or row['request_instance_id'] != instance or terminal.get('upstream_attempts') != 1
+                    or any(terminal.get(field) != logical_value for field, logical_value in logical_rows[key].items())):
+                raise PairingContractError(f'{variant}:{key}: terminal/request mapping differs from plan')
+            start, end = terminal['upstream_dispatch_ns'], terminal['downstream_end_ns']
+            if (type(start) is not int or type(end) is not int or start < previous_end
+                    or not start <= terminal['stream_end_ns'] <= end):
+                raise PairingContractError(f'{variant}:{key}: batches overlap or terminal times are invalid')
+            ends.append(end)
+            body = read(f'{request_path}/request.json')
+            wire = required_path(f'{request_path}/request-body.bin').read_bytes()
+            if body != json.loads(wire):
+                raise PairingContractError(f'{variant}:{key}: wire body differs from request.json')
+            validate_request_body(body, plan, identity['model'])
+            payload = required_path(f'{request_path}/response-body.bin').read_bytes()
+            reads = [json.loads(line) for line in required_path(f'{request_path}/reads.jsonl').read_text().splitlines()]
+            events = [json.loads(line) for line in required_path(f'{request_path}/events.jsonl').read_text().splitlines()]
+            parser, recovered, offset, timestamp = SSEParser(), [], 0, start
+            for chunk in reads:
+                finish, observed = chunk['byte_end'], chunk['timestamp_ns']
+                if (chunk['byte_start'] != offset or type(finish) is not int or not offset < finish <= len(payload)
+                        or type(observed) is not int or not timestamp <= observed <= terminal['stream_end_ns']):
+                    raise PairingContractError(f'{variant}:{key}: invalid raw read bounds/clock')
+                recovered.extend(parser.feed(payload[offset:finish], observed))
+                offset, timestamp = finish, observed
+            recovered.extend(parser.eof())
+            if offset != len(payload) or recovered != events:
+                raise PairingContractError(f'{variant}:{key}: SSE events differ from raw reads')
+        previous_end = max(ends)
+    if ({name for name in raw['files'] if name.endswith('/terminal.json')} != expected_terminals
+            or {name for name in raw['files'] if name.endswith('/command.json')} != expected_commands):
+        raise PairingContractError(f'{variant}: extra/missing raw request or batch identities')
+    reconstructed = convert_evidence(plan, variant, identity, directory,
+                                     raw_index_sha256=provenance['raw_bundle_index_sha256'],
+                                     client=client, batch_errors=[])
+    reconstructed_workload = reconstructed.pop('workload_evidence')
+    if reconstructed != envelope or reconstructed_workload != workload:
+        raise PairingContractError(f'{variant}: measurement/workload differs from raw conversion')
+    return rows

@@ -8,7 +8,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from campaign import compile_campaign
 from plan_driver import run_campaign
-from artifacts import ArtifactError
+from artifacts import ArtifactError, read_sealed_attempt, sealed_reference
+from pairing import validate_attempt_evidence
+from request_plan import build_plan
 from vllm_bench import inspect_binary
 from test_campaign import make_input
 from test_evidence_proxy import DiagnosticEndpoint
@@ -53,6 +55,14 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(skipped[0]['skipped'])
                 self.assertEqual(len(upstream.received),6)
                 self.assertEqual((root/'artifact_index.json').read_bytes(),before)
+                plan=build_plan(compiled['workload']['cells'][0],compiled['client'])
+                pinned=sealed_reference(result[0])
+                attempt=read_sealed_attempt(root,plan,'target',pinned)
+                indexed=validate_attempt_evidence(plan,attempt,'target',compiled['client'],compiled['variants']['target']['identity'],
+                                                   runtime=compiled['variants']['target']['runtime'])
+                self.assertEqual(len(indexed),6)
+                self.assertEqual(sum(row['phase']=='measured' for row in indexed.values()),4)
+                self.assertEqual(pinned,sealed_reference(skipped[0]))
                 raw=next((root/result[0]['path']).rglob('response-body.bin'))
                 raw.write_bytes(raw.read_bytes()+b'corrupt')
                 with self.assertRaisesRegex(ArtifactError,'changed'):

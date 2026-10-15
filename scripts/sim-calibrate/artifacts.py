@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -325,6 +326,124 @@ def load_compiled_bundle(root: Path) -> dict[str, Any]:
     return campaign
 
 
+@contextmanager
+def execution_snapshot(root: Path, campaign_id: str):
+    """Read a consistent index under the driver's existing lock, without resuming it."""
+    root = root.resolve()
+    with (root / '.execution.lock').open('a+b') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ArtifactError('execution is active; retry normalization after the driver exits') from exc
+        path = root / 'execution_index.json'
+        payload = path.read_bytes()
+        index = json.loads(payload)
+        if (not isinstance(index, dict) or index.get('kind') != 'execution_index' or index.get('schema_version') != 1
+                or index.get('campaign_id') != campaign_id or not isinstance(index.get('cells'), dict)):
+            raise ArtifactError('execution index identity/schema mismatch')
+        yield index, _sha256_bytes(payload)
+
+
+def sealed_reference(entry: dict[str, Any]) -> dict[str, Any]:
+    """Pin the selected attempt, excluding mutable execution history."""
+    if entry.get('status') != 'sealed':
+        raise ArtifactError('required execution is missing or not sealed')
+    fields = ('status', 'attempt', 'path', 'plan_sha256', 'binding',
+              'measurement', 'raw_index', 'workload_evidence')
+    if any(field not in entry for field in fields):
+        raise ArtifactError('sealed execution is missing an attempt reference')
+    return json.loads(json.dumps({field: entry[field] for field in fields}))
+
+
+def _validate_measurement_links(envelope: dict, workload: dict, plan: dict, variant: str,
+                                binding: dict, raw_index_sha256: str) -> None:
+    """The same provenance links must hold at sealing and at later reads."""
+    from manifest import sha256_json
+    from measurement_schema import validate_envelope
+
+    validate_envelope(envelope)
+    if (envelope['plan_sha256'] != plan['plan_sha256'] or envelope['variant'] != variant
+            or envelope['variant_identity'] != binding.get('variant_identity')
+            or envelope['provenance']['observer_sha256'] != binding.get('observer_sha256')
+            or envelope['provenance']['raw_bundle_index_sha256'] != raw_index_sha256):
+        raise ArtifactError('measurement plan/role/binding/raw-index mismatch')
+    if (not isinstance(workload.get('requests'), list)
+            or workload.get('sha256') != sha256_json(workload['requests'])
+            or any(row.get('workload_evidence_sha256') != workload['sha256']
+                   for row in envelope['measurements'])):
+        raise ArtifactError('measurement workload evidence binding mismatch')
+
+
+def read_sealed_attempt(root: Path, plan: dict, variant: str, reference: dict) -> dict:
+    """Verify pinned file links offline; live PID attestation belongs to the driver."""
+    if reference != sealed_reference(reference) or reference['plan_sha256'] != plan['plan_sha256']:
+        raise ArtifactError('sealed attempt plan/reference mismatch')
+    attempt = reference['attempt']
+    expected_path = f"raw/{variant}/{plan['cell_id']}/attempt-{attempt}"
+    if type(attempt) is not int or attempt < 1 or reference['path'] != expected_path:
+        raise ArtifactError('sealed attempt path/role/cell mismatch')
+    directory = checked_path(root, reference['path'])
+    actual_files = set()
+    for path in directory.rglob('*'):
+        if path.is_symlink():
+            raise ArtifactError(f'symlink in sealed raw evidence: {path.relative_to(directory)}')
+        if path.is_file():
+            actual_files.add(path.relative_to(directory).as_posix())
+    for name, field in (('raw_bundle_index.json', 'raw_index'),
+                        ('measurements.json', 'measurement'), ('workload_evidence.json', 'workload_evidence')):
+        if file_reference(checked_path(directory, name)) != reference[field]:
+            raise ArtifactError(f'sealed artifact bytes changed: {reference["path"]}/{name}')
+    raw = _read_json(directory / 'raw_bundle_index.json')
+    if raw.get('kind') != 'raw_bundle_index' or raw.get('schema_version') != 1:
+        raise ArtifactError('unsupported raw bundle index')
+    verify_files(directory, raw.get('files'))
+    derived = {'raw_bundle_index.json', 'measurements.json', 'workload_evidence.json'}
+    if actual_files - derived != set(raw['files']) - derived:
+        raise ArtifactError('sealed raw directory contains unindexed or missing files')
+    for required in ('binding.json', 'observer.json', 'attempt.json', 'probe.json'):
+        if required not in raw['files']:
+            raise ArtifactError(f'required raw file is not indexed: {required}')
+    if _read_json(directory / 'binding.json') != reference['binding']:
+        raise ArtifactError('raw binding differs from selected attempt')
+    envelope = _read_json(directory / 'measurements.json')
+    workload = _read_json(directory / 'workload_evidence.json')
+    _validate_measurement_links(envelope, workload, plan, variant, reference['binding'], reference['raw_index']['sha256'])
+    return {'directory': directory, 'raw_index': raw, 'envelope': envelope, 'workload': workload}
+
+
+def write_derived_document(path: Path, document: dict, root: Path) -> None:
+    """Publish exclusively and idempotently, without replacing source evidence."""
+    root, path = root.resolve(), path.expanduser().resolve()
+    index = _read_json(root / 'artifact_index.json')
+    protected = {checked_path(root, name) for name in index['files']}
+    protected.update(root / name for name in ('artifact_index.json', 'execution_index.json', '.execution.lock'))
+    if (path in protected or any(path.is_relative_to(root / folder) for folder in ('raw', 'plans', 'profiles'))
+            or path.is_relative_to(_repo_root())):
+        raise ArtifactError('normalized output would overwrite protected source evidence or repository files')
+    payload = _render(document)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f'.{path.name}.', delete=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.read_bytes() != payload:
+                raise ArtifactError(f'refusing to overwrite a different normalized artifact: {path}')
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 class ExecutionStore:
     """Current execution state never mutates the immutable compiler index.
 
@@ -366,20 +485,7 @@ class ExecutionStore:
             return None
         if entry.get('plan_sha256') != plan['plan_sha256'] or entry.get('binding') != binding:
             raise ArtifactError('sealed execution binding changed')
-        root = checked_path(self.root, entry['path'])
-        raw = _read_json(root / 'raw_bundle_index.json')
-        if file_reference(root / 'raw_bundle_index.json') != entry['raw_index']:
-            raise ArtifactError('sealed raw index changed')
-        verify_files(root, raw['files'])
-        if file_reference(root / 'measurements.json') != entry['measurement']:
-            raise ArtifactError('sealed measurement changed')
-        if file_reference(root / 'workload_evidence.json') != entry['workload_evidence']:
-            raise ArtifactError('sealed workload evidence changed')
-        from measurement_schema import validate_envelope
-        envelope = _read_json(root / 'measurements.json')
-        validate_envelope(envelope)
-        if envelope['provenance']['observer_sha256'] != binding.get('observer_sha256'):
-            raise ArtifactError('sealed measurement observer binding mismatch')
+        read_sealed_attempt(self.root, plan, variant, sealed_reference(entry))
         return entry
 
     def begin(self, plan: dict, variant: str, binding: dict) -> tuple[Path, int]:
@@ -424,21 +530,12 @@ class ExecutionStore:
         current = entry['attempts'][-1]
         status = 'failed'
         if error is None:
-            from measurement_schema import validate_envelope
             envelope = _read_json(directory / 'measurements.json')
-            validate_envelope(envelope)
-            if envelope['provenance']['observer_sha256'] != entry['binding'].get('observer_sha256'):
-                raise ArtifactError('measurement observer binding mismatch')
             raw = _read_json(directory / 'raw_bundle_index.json')
             verify_files(directory, raw['files'])
-            if envelope['plan_sha256'] != plan['plan_sha256'] or envelope['variant'] != variant:
-                raise ArtifactError('measurement belongs to a different plan/variant')
-            if envelope['provenance']['raw_bundle_index_sha256'] != file_reference(directory / 'raw_bundle_index.json')['sha256']:
-                raise ArtifactError('measurement raw index binding mismatch')
             workload = _read_json(directory / 'workload_evidence.json')
-            from manifest import sha256_json
-            if workload.get('sha256') != sha256_json(workload.get('requests')) or any(r.get('workload_evidence_sha256') != workload['sha256'] for r in envelope['measurements']):
-                raise ArtifactError('measurement workload evidence binding mismatch')
+            _validate_measurement_links(envelope, workload, plan, variant, entry['binding'],
+                                        file_reference(directory / 'raw_bundle_index.json')['sha256'])
             if [r['pairing_key'] for r in envelope['measurements']] != [r['pairing_key'] for r in plan['logical_requests']]:
                 raise ArtifactError('measurement key set differs from plan')
             rows = envelope['measurements']

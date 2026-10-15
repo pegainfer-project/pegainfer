@@ -40,6 +40,53 @@ class Endpoint:
         return f"{self.base_path}/{suffix.lstrip('/')}"
 
 
+def profile_endpoint(base_url: str) -> Endpoint:
+    """The static endpoint contract shared by live and saved profile bindings."""
+    try:
+        endpoint = Endpoint.parse(base_url)
+    except ProbeError as exc:
+        raise ValueError(str(exc)) from exc
+    if endpoint.host != '127.0.0.1':
+        raise ValueError('profile PID binding requires explicit IPv4 127.0.0.1; use that address instead of localhost')
+    return endpoint
+
+
+def profile_listener_matches(endpoint: Endpoint, listener: dict) -> bool:
+    return (listener.get('family') == 'IPv4' and listener.get('address') in ('127.0.0.1', '0.0.0.0')
+            and listener.get('port') == endpoint.port)
+
+
+def validate_profile_binding(base_url: str, binding: dict) -> None:
+    """Check saved address/listener consistency without consulting /proc."""
+    endpoint = profile_endpoint(base_url)
+    if binding.get('endpoint') != {'address': endpoint.host, 'port': endpoint.port}:
+        raise ValueError('saved profile endpoint differs from configured endpoint')
+    listeners = binding.get('listeners')
+    if not isinstance(listeners, list) or not listeners or any(
+            not isinstance(row, dict) or not profile_listener_matches(endpoint, row) for row in listeners):
+        raise ValueError('profile listeners do not attest the configured endpoint')
+
+
+def requires_cache_reset(plan: dict, variant: str, runtime: dict, batch: dict) -> bool:
+    """Keep acquisition and offline receipt requirements on the same lifecycle."""
+    if variant != 'target' or runtime.get('cache', {}).get('policy') != 'on':
+        return False
+    lifecycle = plan.get('cache_lifecycle', {})
+    if plan['workload_kind'] == 'cold_prefill' and not lifecycle:
+        raise ValueError('cold target with cache enabled requires explicit reset lifecycle')
+    return bool(lifecycle and (lifecycle['reset_before'] == 'repeat' or batch == plan['batches'][0]))
+
+
+def validate_reset_receipt(receipt: dict) -> None:
+    """Require the existing HTTP 200 plus explicit JSON success response."""
+    try:
+        value = json.loads(receipt['body'])
+    except (ValueError, TypeError, KeyError):
+        value = None
+    if receipt.get('status') != 200 or not (value is True or isinstance(value, dict) and value.get('success') is True):
+        raise ValueError('target reset did not prove success; cold collection unsupported')
+
+
 @dataclass(frozen=True)
 class HttpResult:
     status: int

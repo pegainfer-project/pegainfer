@@ -44,6 +44,23 @@ OBSERVER_SOURCES = (
 )
 
 
+def validate_request_body(body: dict, plan: dict, model: str) -> None:
+    """The frozen wire contract, shared by acquisition and offline pairing."""
+    shape, sampling = plan['shape'], plan['sampling']
+    prompt = body.get('prompt')
+    if not isinstance(prompt, list) or len(prompt) != shape['input_tokens'] or any(type(t) is not int or t < 0 for t in prompt):
+        raise EvidenceError('request prompt IDs differ from planned shape')
+    expected = {'model': model, 'max_tokens': shape['output_tokens'],
+                'stream': True, 'return_token_ids': True, 'echo': False, **sampling}
+    for key, value in expected.items():
+        if body.get(key) != value or (isinstance(value, bool) and type(body.get(key)) is not bool):
+            raise EvidenceError(f'request {key} differs from frozen contract')
+    if body.get('n', 1) != 1 or body.get('best_of', 1) != 1:
+        raise EvidenceError('multiple choices are unsupported')
+    if body.get('stream_options', {}).get('include_usage') is not True:
+        raise EvidenceError('request must include stream usage')
+
+
 def observer_identity() -> dict[str, Any]:
     directory = Path(__file__).resolve().parent
     requirements = directory / 'requirements-evidence-proxy.txt'
@@ -188,21 +205,6 @@ class EvidenceProxy:
         by_key = {row['pairing_key']: row for row in self.plan['logical_requests']}
         self.expected = {f'{prefix}{i}': by_key[key] for i, key in enumerate(batch['request_keys'])}
 
-    def validate_body(self, body: dict) -> None:
-        shape, sampling = self.plan['shape'], self.plan['sampling']
-        prompt = body.get('prompt')
-        if not isinstance(prompt, list) or len(prompt) != shape['input_tokens'] or any(type(t) is not int or t < 0 for t in prompt):
-            raise EvidenceError('request prompt IDs differ from planned shape')
-        expected = {'model': self.model, 'max_tokens': shape['output_tokens'],
-                    'stream': True, 'return_token_ids': True, 'echo': False, **sampling}
-        for key, value in expected.items():
-            if body.get(key) != value or (isinstance(value, bool) and type(body.get(key)) is not bool):
-                raise EvidenceError(f'request {key} differs from frozen contract')
-        if body.get('n', 1) != 1 or body.get('best_of', 1) != 1:
-            raise EvidenceError('multiple choices are unsupported')
-        if body.get('stream_options', {}).get('include_usage') is not True:
-            raise EvidenceError('request must include stream usage')
-
     async def handle(self, incoming: web.Request):
         task = asyncio.current_task()
         self.active.add(task)
@@ -239,7 +241,7 @@ class EvidenceProxy:
             if not isinstance(body, dict):
                 raise EvidenceError('request body must be an object')
             self.writer.json(directory / 'request.json', body)
-            self.validate_body(body)
+            validate_request_body(body, self.plan, self.model)
             # Only hop-by-hop/transport headers are removed. Never expose authorization in metadata.
             hop = {'host', 'connection', 'content-length', 'transfer-encoding', 'accept-encoding',
                    'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'upgrade'}
