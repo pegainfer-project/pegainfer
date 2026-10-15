@@ -287,6 +287,44 @@ where
         self.in_flight.as_ref()
     }
 
+    /// Roll back a planned step before it has been priced or completed.
+    ///
+    /// Pricing is deliberately performed after planning so the predictor sees
+    /// the exact shape. If pricing fails, no admission or in-flight plan may
+    /// leak into the next scheduler iteration.
+    pub fn discard_step(&mut self, step_id: StepId) -> Result<()> {
+        let plan = self
+            .in_flight
+            .as_ref()
+            .context("cannot discard a worker step when no step is in flight")?;
+        ensure!(
+            plan.id() == step_id,
+            "worker step id {} does not match in-flight step {}",
+            step_id.get(),
+            plan.id().get()
+        );
+        for request_id in plan.admitted() {
+            ensure!(
+                self.running.iter().any(|request| request.id == *request_id),
+                "admitted request disappeared before step rollback"
+            );
+        }
+
+        let plan = self.in_flight.take().expect("in-flight step was checked");
+        for request_id in plan.admitted().iter().rev() {
+            let index = self
+                .running
+                .iter()
+                .position(|request| request.id == *request_id)
+                .expect("admitted request was checked before step rollback");
+            let mut request = self.running.remove(index);
+            request.phase = RequestPhase::Waiting;
+            self.waiting.push_front(request);
+        }
+        self.next_step_id = step_id.0;
+        Ok(())
+    }
+
     #[must_use]
     pub fn request(&self, id: I) -> Option<RequestSnapshot> {
         self.running

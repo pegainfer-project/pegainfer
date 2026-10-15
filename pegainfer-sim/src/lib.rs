@@ -258,7 +258,15 @@ impl ProfiledRuntime {
         };
         let step_id = plan.id();
         let shape = plan.shape();
-        let estimate = self.profile.estimate_step(shape)?;
+        let estimate = match self.profile.estimate_step(shape) {
+            Ok(estimate) => estimate,
+            Err(error) => {
+                self.worker
+                    .discard_step(step_id)
+                    .context("failed to roll back an unpriced worker step")?;
+                return Err(error);
+            }
+        };
         for &request_id in plan.admitted() {
             let request = self
                 .requests
@@ -708,11 +716,11 @@ mod tests {
     use crate::profile::CalibrationReference;
     use crate::profile::ENGINE_PROFILE_SCHEMA_VERSION;
     use crate::profile::PredictorCoverage;
+    use crate::profile::PredictorModel;
     use crate::profile::PredictorProfile;
     use crate::profile::PrefillPolicy;
     use crate::profile::SchedulerPolicy;
     use crate::profile::SchedulerProfile;
-    use crate::profile::TimingGrid;
 
     fn request(prompt_tokens: Vec<u32>, max_tokens: usize, logprobs: usize) -> Request {
         Request {
@@ -779,15 +787,11 @@ mod tests {
                         sum_decode_ctx_tokens: [0, 8],
                         prefill_tokens_in_step: [0, 4],
                     },
-                    grid: TimingGrid {
-                        decode_reqs: vec![0, 2],
-                        sum_decode_ctx_tokens: vec![0, 8],
-                        prefill_tokens_in_step: vec![0, 4],
-                        step_duration_us: vec![0; 8],
-                    },
+                    model: PredictorModel::FixedStep { duration_us: 0 },
                 },
             },
             manifest: CalibrationManifest {
+                schema_version: 1,
                 target_engine: "test-engine".to_string(),
                 engine_version: "0.0.0".to_string(),
                 model_id: "test-model".to_string(),
@@ -797,6 +801,17 @@ mod tests {
                 server_flags: Vec::new(),
                 collection_command: "test".to_string(),
                 source_artifacts: Vec::new(),
+                backend: None,
+                driver: None,
+                cuda: None,
+                parallelism: None,
+                quantization: None,
+                scheduler: None,
+                cache: None,
+                client: None,
+                workload: None,
+                split: None,
+                provenance: None,
             },
             profile_path: "profile.json".into(),
             manifest_path: "calibration.manifest.json".into(),

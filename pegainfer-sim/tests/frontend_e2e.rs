@@ -214,6 +214,11 @@ fn profile_fixture(name: &str) -> Result<(TempDir, LoadedEngineProfile)> {
             "online-zero-cost.manifest.json",
             include_bytes!("fixtures/online-zero-cost.manifest.json"),
         ),
+        "functional-step-gate.json" => (
+            include_bytes!("fixtures/functional-step-gate.json"),
+            "functional-step-gate.manifest.json",
+            include_bytes!("fixtures/functional-step-gate.manifest.json"),
+        ),
         other => bail!("unknown profile fixture {other}"),
     };
     let dir = tempfile::tempdir()?;
@@ -260,7 +265,7 @@ fn replay_profiled_worker(profile: &LoadedEngineProfile) -> Result<Vec<PlanTrace
         let estimate = profile.estimate_step(shape)?;
         assert!(matches!(
             estimate.source,
-            pegainfer_sim::profile::StepTimingSource::GridInterpolation
+            pegainfer_sim::profile::StepTimingSource::FixedStep
         ));
         assert!(
             shape.decode_reqs <= profile.scheduler.max_num_seqs,
@@ -352,15 +357,8 @@ fn profiled_worker_replay_is_deterministic_and_bounded() -> Result<()> {
     assert!(
         first
             .iter()
-            .map(|step| step.duration_us)
-            .min()
-            .is_some_and(|minimum| {
-                first
-                    .iter()
-                    .map(|step| step.duration_us)
-                    .any(|duration| duration > minimum)
-            }),
-        "grid pricing must vary across the replayed step shapes"
+            .all(|step| step.duration_us == first[0].duration_us),
+        "fixed predictor must price every in-domain step consistently"
     );
 
     Ok(())
@@ -370,12 +368,8 @@ fn profiled_worker_replay_is_deterministic_and_bounded() -> Result<()> {
 fn zero_cost_profile_fixture_is_valid() -> Result<()> {
     let (_fixture_dir, profile) = profile_fixture("online-zero-cost.json")?;
     assert!(
-        profile
-            .predictor
-            .grid
-            .step_duration_us
-            .iter()
-            .all(|duration| *duration == 0),
+        profile.predictor.model
+            == pegainfer_sim::profile::PredictorModel::FixedStep { duration_us: 0 },
         "zero-cost fixture must not add synthetic engine delay"
     );
     let estimate = profile.estimate_step(StepShape {
@@ -385,6 +379,50 @@ fn zero_cost_profile_fixture_is_valid() -> Result<()> {
     })?;
     assert_eq!(estimate.duration_us, 0);
 
+    Ok(())
+}
+
+#[test]
+fn functional_profile_prices_pure_work_and_fails_closed() -> Result<()> {
+    let (_fixture_dir, profile) = profile_fixture("functional-step-gate.json")?;
+    let prefill = profile.estimate_step(StepShape {
+        decode_reqs: 0,
+        sum_decode_ctx_tokens: 0,
+        prefill_tokens_in_step: 2,
+    })?;
+    assert_eq!(prefill.duration_us, 1_000);
+    assert_eq!(
+        prefill.source,
+        pegainfer_sim::profile::StepTimingSource::PrefillPiecewise
+    );
+
+    let decode = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 2,
+        prefill_tokens_in_step: 0,
+    })?;
+    assert_eq!(decode.duration_us, 3_000);
+    assert_eq!(
+        decode.source,
+        pegainfer_sim::profile::StepTimingSource::DecodeSurface
+    );
+
+    let mixed = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 2,
+        prefill_tokens_in_step: 1,
+    });
+    assert!(
+        mixed.is_err(),
+        "mixed work must fail without a mixed predictor"
+    );
+
+    let out_of_domain = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 5,
+        prefill_tokens_in_step: 0,
+    });
+    assert!(out_of_domain.is_err(), "profile coverage must fail closed");
     Ok(())
 }
 
@@ -427,14 +465,6 @@ async fn profiled_online_worker_serves_multi_request_workload() -> Result<()> {
     };
 
     let mut requests = vec![post_request(client.clone()), post_request(client.clone())];
-    wait_for_metrics(
-        &client,
-        &server.base_url,
-        &[("vllm:num_requests_running", "0", 2.0)],
-        PROFILE_GATE_MODEL_NAME,
-    )
-    .await?;
-
     // Capacity ordering is asserted by the deterministic worker replay; the
     // HTTP gate checks stable post-drain counters instead of a transient scrape.
     requests.push(post_request(client.clone()));
