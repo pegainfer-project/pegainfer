@@ -151,6 +151,10 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: cargo test --release --locked -p pegainfer-sim --lib
 
+      - name: Run pegainfer-qwen4 tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: cargo test --release --locked -p pegainfer-qwen4 --tests
+
       - name: Run kvbm-logical unit tests
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: cargo test --release --locked -p kvbm-logical --lib
@@ -188,6 +192,7 @@ jobs:
           cargo clippy --release --locked
           -p pegainfer-build
           -p pegainfer-frontend
+          -p pegainfer-qwen4
           -p pegainfer-sim
           -p kvbm-logical
           --all-targets -- -D warnings
