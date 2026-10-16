@@ -20,8 +20,10 @@ pub(crate) use pegainfer_kernels::ops::paged_attention_batch_decode_hd256_into;
 pub(crate) use pegainfer_kernels::ops::paged_attention_batch_decode_via_prefill_hd256_into;
 pub(crate) use pegainfer_kernels::ops::qk_norm_partial_rope_batched_decode_hd256_into;
 pub(crate) use recurrent::conv1d_decode_batch_into;
-pub(crate) use recurrent::conv1d_prefill_batch_into;
+pub use recurrent::conv1d_prefill_batch_into;
 pub(crate) use recurrent::gated_delta_rule_decode_batch_into;
+pub use recurrent::gated_delta_rule_prefill_chunk_prepare_into;
+pub use recurrent::gated_delta_rule_prefill_chunkwise_from_gates_into;
 pub use recurrent::gated_delta_rule_prefill_chunkwise_into;
 
 use crate::recurrent;
