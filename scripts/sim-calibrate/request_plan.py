@@ -7,9 +7,9 @@ import re
 from typing import Any
 
 from manifest import canonical_execution_configuration, canonical_sampling_configuration, sha256_json
-from measurement_schema import MeasurementError, digest, integer, number, text
+from measurement_schema import DECODE_STATISTICS_POLICY, MeasurementError, digest, integer, number, text
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 KIND = "request_plan"
 
 
@@ -91,7 +91,7 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
             "arrival": {"mode": "fixed_batch", "clock": "monotonic"},
             "batches": batches, "logical_requests": requests,
         }
-        for field in ("cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "steady_state"):
+        for field in ("cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics"):
             if field in cell:
                 plan[field] = copy.deepcopy(cell[field])
         plan["plan_sha256"] = sha256_json(plan)
@@ -106,7 +106,7 @@ def validate_plan(plan: dict[str, Any]) -> None:
     try:
         if not isinstance(plan, dict) or plan.get("kind") != KIND or type(plan.get("schema_version")) is not int or plan["schema_version"] != SCHEMA_VERSION:
             raise PlanError("unsupported request plan kind/schema_version")
-        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "retry", "observer", "arrival", "batches", "logical_requests", "plan_sha256", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "steady_state"}, "plan")
+        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "retry", "observer", "arrival", "batches", "logical_requests", "plan_sha256", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics"}, "plan")
         digest(plan.get("cell_id"), "cell_id")
         digest(plan.get("plan_sha256"), "plan_sha256")
         if sha256_json({k: v for k, v in plan.items() if k != "plan_sha256"}) != plan["plan_sha256"]:
@@ -176,10 +176,14 @@ def validate_plan(plan: dict[str, Any]) -> None:
                 raise PlanError("prefix fields are only supported for cached_prefill")
             if workload == "cold_prefill" and c != 1:
                 raise PlanError("cold_prefill requires concurrency=1")
-            if workload == "steady_decode" and shape["output_tokens"] < 2:
-                raise PlanError("steady_decode requires output_tokens >=2")
-        if "steady_state" in plan and (workload != "steady_decode" or not isinstance(plan["steady_state"], dict)):
-            raise PlanError("steady_state must be an object on a steady_decode plan")
+        if workload == "steady_decode":
+            total = integer(plan.get("num_ctx"), "num_ctx", positive=True, maximum=2**32 - 1)
+            if total != c * shape["input_tokens"] or shape["output_tokens"] not in (8, 16):
+                raise PlanError("steady_decode requires num_ctx = concurrency * input_tokens and output_tokens 8 or 16")
+            if plan.get("decode_statistics") != DECODE_STATISTICS_POLICY:
+                raise PlanError("invalid fixed decode statistics policy")
+        elif any(field in plan for field in ("num_ctx", "decode_statistics")):
+            raise PlanError("decode fields are only supported for steady_decode")
         if plan.get("arrival") != {"mode": "fixed_batch", "clock": "monotonic"}:
             raise PlanError("invalid fixed_batch arrival contract")
         batches = plan.get("batches")

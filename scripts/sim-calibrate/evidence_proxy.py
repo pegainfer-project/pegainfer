@@ -40,7 +40,7 @@ OBSERVER_SOURCES = (
     'evidence_proxy.py', 'sse_evidence.py', 'requirements-evidence-proxy.txt',
     'vllm_bench_collect.py', 'plan_driver.py', 'vllm_bench.py',
     'measurement_schema.py', 'request_plan.py', 'manifest.py', 'artifacts.py',
-    'probe.py', 'campaign.py', 'profile.py',
+    'probe.py', 'campaign.py', 'profile.py', 'steady_state.py',
 )
 
 

@@ -18,6 +18,7 @@ from evidence_proxy import EvidenceError, EvidenceProxy, observer_identity
 from manifest import canonical_scheduler_identity
 from probe import (probe_endpoint, profile_endpoint, profile_listener_matches, requires_cache_reset,
                    validate_profile_binding, validate_reset_receipt)
+from steady_state import compute_statistics
 from vllm_bench import render_command, run_command
 from vllm_bench_collect import convert_evidence
 
@@ -170,6 +171,8 @@ async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
         _write_atomic(directory / 'workload_evidence.json', envelope.pop('workload_evidence'))
         # workload_evidence is derived from raw, indexed separately to avoid a digest cycle.
         _write_atomic(directory / 'measurements.json', envelope)
+        if plan['workload_kind'] == 'steady_decode':
+            _write_atomic(directory / 'decode_statistics.json', compute_statistics(plan, envelope))
         verify_attempt_binding(campaign, variant_name, store.root, binding)
         entry = store.finish(plan, variant_name, directory)
     except Exception as exc:

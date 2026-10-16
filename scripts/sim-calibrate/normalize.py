@@ -16,11 +16,11 @@ from measurement_schema import digest
 from pairing import pair_plan_measurements, validate_attempt_evidence
 from probe import validate_profile_binding
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SUPPORTED_KINDS = ('cold_prefill', 'steady_decode')
 NORMALIZER_SOURCES = ('normalize.py', 'pairing.py', 'artifacts.py', 'manifest.py', 'request_plan.py',
                       'measurement_schema.py', 'evidence_proxy.py', 'sse_evidence.py',
-                      'vllm_bench.py', 'vllm_bench_collect.py', 'probe.py')
+                      'vllm_bench.py', 'vllm_bench_collect.py', 'probe.py', 'steady_state.py')
 
 
 class NormalizeError(ValueError):
@@ -74,7 +74,7 @@ def _profile_sources(root: Path, campaign: dict, variant: str, reference: dict) 
         raise NormalizeError('zero_cost: profile differs from compiler-generated control')
 
 
-def _load_role(root: Path, campaign: dict, plan: dict, role: str, reference: dict) -> dict:
+def load_role(root: Path, campaign: dict, plan: dict, role: str, reference: dict) -> dict:
     _profile_sources(root, campaign, role, reference)
     attempt = read_sealed_attempt(root, plan, role, reference)
     configured = campaign['variants'][role]
@@ -92,6 +92,10 @@ def _cell_result(cell: dict, plan: dict) -> dict:
 
 def _paired_cell(cell: dict, plan: dict, attempts: dict, sources: dict) -> dict:
     paired = pair_plan_measurements(plan, attempts, tuple(sources))
+    request_tpot = {role: {request['key']: request['tpot_ms']
+                           for batch in attempt['statistics']['batches'] if batch['phase'] == 'measured'
+                           for request in batch['requests']}
+                    for role, attempt in attempts.items()} if cell['kind'] == 'steady_decode' else {}
     observations = [{
         'key': logical['pairing_key'], 'cell_id': cell['cell_id'], 'kind': cell['kind'],
         'split': cell['split'], 'repeat': logical['repeat'], 'index': logical['index'],
@@ -99,9 +103,13 @@ def _paired_cell(cell: dict, plan: dict, attempts: dict, sources: dict) -> dict:
         'concurrency': cell['concurrency'], 'sum_decode_ctx_tokens': cell.get('sum_decode_ctx_tokens'),
         'fit_policy': cell['fit_policy'], 'metadata': cell.get('metadata', {}),
         'measurements': measurements, 'sources': sources,
+        'decode_window_tpot_ms': {role: values[logical['pairing_key']] for role, values in request_tpot.items()}
+                                 if cell['kind'] == 'steady_decode' else None,
     } for logical, measurements in paired['pairs']]
     return {**_cell_result(cell, plan), 'status': 'paired', 'matched_count': paired['matched_count'],
-            'observations': observations, 'observed_count': paired['observed_count']}
+            'observations': observations, 'observed_count': paired['observed_count'],
+            'decode_statistics': {role: attempt['statistics'] for role, attempt in attempts.items()}
+            if cell['kind'] == 'steady_decode' else None}
 
 
 def normalize_campaign(root: Path, *, scope: str) -> dict[str, Any]:
@@ -120,7 +128,7 @@ def normalize_campaign(root: Path, *, scope: str) -> dict[str, Any]:
                 for role in roles:
                     reference = sealed_reference(execution['cells'].get(f"{cell['cell_id']}:{role}", {}))
                     selected.append({'cell_id': cell['cell_id'], 'variant': role, **reference})
-                    attempt = _load_role(root, campaign, plan, role, reference)
+                    attempt = load_role(root, campaign, plan, role, reference)
                     result['observed_count'][role] = len(attempt['envelope']['measurements'])
                     attempts[role], sources[role] = attempt, reference
                 result = _paired_cell(cell, plan, attempts, sources)
@@ -148,7 +156,7 @@ def _assemble_document(campaign: dict, scope: str, results: list, source: dict) 
         'status': 'invalid' if failures else 'succeeded', 'scope': scope, 'scope_sha256': sha256_json(definition),
         'required_roles': list(roles), 'required_cell_ids': [cell['cell_id'] for cell in cells],
         'campaign_required_scope': campaign['required_scope'], 'deferred_cells': deferred,
-        'fit_ready': False, 'fit_pending': ['C4 fixed_batch_decode_window', 'C5 validated paired baseline subtraction'],
+        'fit_ready': False, 'fit_pending': ['C5 validated paired baseline subtraction'],
         'cell_count': len(cells), 'paired_cell_count': sum(cell['status'] == 'paired' for cell in results),
         'expected_count': sum(cell['expected_count'] for cell in results),
         'matched_count': len(observations), 'failure_count': len(failures), 'failures': failures,
@@ -161,7 +169,7 @@ def verify_normalized_sources(document: dict, *, root: Path | None = None) -> di
     """Recheck pinned sources and return canonical results, without checking saved observations."""
     if (document.get('kind') != 'normalized_campaign' or document.get('schema_version') != SCHEMA_VERSION
             or document.get('status') != 'succeeded'):
-        raise NormalizeError('source verification requires succeeded normalized schema 2')
+        raise NormalizeError('source verification requires succeeded normalized schema 3')
     source = document['source']
     root = (root or Path(source['artifact_root'])).expanduser().resolve()
     campaign = load_compiled_bundle(root)
@@ -187,7 +195,7 @@ def verify_normalized_sources(document: dict, *, root: Path | None = None) -> di
         for role in roles:
             ref = {k: v for k, v in indexed[cell['cell_id'], role].items() if k not in ('cell_id', 'variant')}
             sources[role] = ref
-            attempts[role] = _load_role(root, campaign, plan, role, ref)
+            attempts[role] = load_role(root, campaign, plan, role, ref)
         results.append(_paired_cell(cell, plan, attempts, sources))
     return _assemble_document(campaign, document['scope'], results, source)
 

@@ -311,7 +311,7 @@ def load_compiled_bundle(root: Path) -> dict[str, Any]:
         raise ArtifactError('not a current compiled bundle')
     verify_files(root, index.get('files'))
     campaign = _read_json(root / 'compiled_campaign.json')
-    if campaign.get('kind') != 'compiled_campaign' or campaign.get('schema_version') != 5:
+    if campaign.get('kind') != 'compiled_campaign' or campaign.get('schema_version') != 6:
         raise ArtifactError('unsupported compiled campaign; compile a new experiment')
     if campaign.get('campaign_id') != index.get('campaign_id'):
         raise ArtifactError('compiler campaign/index identity mismatch')
@@ -338,7 +338,7 @@ def execution_snapshot(root: Path, campaign_id: str):
         path = root / 'execution_index.json'
         payload = path.read_bytes()
         index = json.loads(payload)
-        if (not isinstance(index, dict) or index.get('kind') != 'execution_index' or index.get('schema_version') != 1
+        if (not isinstance(index, dict) or index.get('kind') != 'execution_index' or index.get('schema_version') != 2
                 or index.get('campaign_id') != campaign_id or not isinstance(index.get('cells'), dict)):
             raise ArtifactError('execution index identity/schema mismatch')
         yield index, _sha256_bytes(payload)
@@ -352,6 +352,8 @@ def sealed_reference(entry: dict[str, Any]) -> dict[str, Any]:
               'measurement', 'raw_index', 'workload_evidence')
     if any(field not in entry for field in fields):
         raise ArtifactError('sealed execution is missing an attempt reference')
+    if 'statistics' in entry:
+        fields = (*fields, 'statistics')
     return json.loads(json.dumps({field: entry[field] for field in fields}))
 
 
@@ -393,11 +395,16 @@ def read_sealed_attempt(root: Path, plan: dict, variant: str, reference: dict) -
                         ('measurements.json', 'measurement'), ('workload_evidence.json', 'workload_evidence')):
         if file_reference(checked_path(directory, name)) != reference[field]:
             raise ArtifactError(f'sealed artifact bytes changed: {reference["path"]}/{name}')
+    if plan['workload_kind'] == 'steady_decode':
+        if file_reference(directory / 'decode_statistics.json') != reference.get('statistics'):
+            raise ArtifactError('sealed decode statistics bytes changed or missing')
     raw = _read_json(directory / 'raw_bundle_index.json')
     if raw.get('kind') != 'raw_bundle_index' or raw.get('schema_version') != 1:
         raise ArtifactError('unsupported raw bundle index')
     verify_files(directory, raw.get('files'))
     derived = {'raw_bundle_index.json', 'measurements.json', 'workload_evidence.json'}
+    if plan['workload_kind'] == 'steady_decode':
+        derived.add('decode_statistics.json')
     if actual_files - derived != set(raw['files']) - derived:
         raise ArtifactError('sealed raw directory contains unindexed or missing files')
     for required in ('binding.json', 'observer.json', 'attempt.json', 'probe.json'):
@@ -408,7 +415,14 @@ def read_sealed_attempt(root: Path, plan: dict, variant: str, reference: dict) -
     envelope = _read_json(directory / 'measurements.json')
     workload = _read_json(directory / 'workload_evidence.json')
     _validate_measurement_links(envelope, workload, plan, variant, reference['binding'], reference['raw_index']['sha256'])
-    return {'directory': directory, 'raw_index': raw, 'envelope': envelope, 'workload': workload}
+    result = {'directory': directory, 'raw_index': raw, 'envelope': envelope, 'workload': workload}
+    if plan['workload_kind'] == 'steady_decode':
+        result['statistics'] = _read_json(directory / 'decode_statistics.json')
+        from steady_state import verify_statistics
+        verify_statistics(plan, envelope, result['statistics'])
+        if not result['statistics']['qualified']:
+            raise ArtifactError('sealed decode attempt is not qualified')
+    return result
 
 
 def write_derived_document(path: Path, document: dict, root: Path) -> None:
@@ -465,8 +479,8 @@ class ExecutionStore:
         try:
             fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.index = _read_json(self.path) if self.path.exists() else {
-                'kind': 'execution_index', 'schema_version': 1, 'campaign_id': self.campaign_id, 'cells': {}}
-            if self.index.get('kind') != 'execution_index' or self.index.get('schema_version') != 1 or self.index.get('campaign_id') != self.campaign_id:
+                'kind': 'execution_index', 'schema_version': 2, 'campaign_id': self.campaign_id, 'cells': {}}
+            if self.index.get('kind') != 'execution_index' or self.index.get('schema_version') != 2 or self.index.get('campaign_id') != self.campaign_id:
                 raise ArtifactError('execution index identity/schema mismatch')
             return self
         except BaseException:
@@ -519,7 +533,7 @@ class ExecutionStore:
         for path in sorted(directory.rglob('*')):
             if path.is_symlink():
                 raise ArtifactError('symlink in raw evidence')
-            if path.is_file() and path.name not in ('raw_bundle_index.json', 'measurements.json'):
+            if path.is_file() and path.name not in ('raw_bundle_index.json', 'measurements.json', 'workload_evidence.json', 'decode_statistics.json'):
                 files[path.relative_to(directory).as_posix()] = file_reference(path)
         return _write_atomic(directory / 'raw_bundle_index.json', {
             'kind': 'raw_bundle_index', 'schema_version': 1, 'files': files})
@@ -541,6 +555,14 @@ class ExecutionStore:
             rows = envelope['measurements']
             status = ('sealed' if all(r['status'] == 'succeeded' for r in rows) else
                       'unsupported' if any(r['status'] == 'unsupported' for r in rows) else 'failed')
+            if plan['workload_kind'] == 'steady_decode':
+                from steady_state import verify_statistics
+                statistics = _read_json(directory / 'decode_statistics.json')
+                verify_statistics(plan, envelope, statistics)
+                current['statistics'] = file_reference(directory / 'decode_statistics.json')
+                if status == 'sealed' and not statistics['qualified']:
+                    status = 'failed'
+                    error = 'decode statistics qualification failed: ' + json.dumps(statistics['failures'])
             current.update(measurement=file_reference(directory / 'measurements.json'),
                            raw_index=file_reference(directory / 'raw_bundle_index.json'),
                            workload_evidence=file_reference(directory / 'workload_evidence.json'))

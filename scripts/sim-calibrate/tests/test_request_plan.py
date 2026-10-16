@@ -43,6 +43,8 @@ class RequestPlanTests(unittest.TestCase):
             cell = next(c for c in compiled['workload']['cells'] if c['kind'] == 'steady_decode' and c['concurrency'] == 4)
             original = build_plan(cell, compiled['client'])
             changes = [
+                lambda p: p.update(num_ctx=1),
+                lambda p: p['decode_statistics'].update(window='central_80_percent'),
                 lambda p: p['logical_requests'].pop(),
                 lambda p: p['logical_requests'].append(copy.deepcopy(p['logical_requests'][0])),
                 lambda p: p['batches'][0]['request_keys'].pop(),

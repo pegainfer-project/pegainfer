@@ -55,18 +55,18 @@ class DiagnosticEndpoint:
                 await asyncio.sleep(0.01 if rid and rid.endswith('1') else 0.03)
             await response.write(event({'index':0, 'text':'', 'token_ids':[]}, prompt_token_ids=body['prompt']))
             count = body['max_tokens']
-            first = min(2, count)
+            first = count if self.mode == 'burst' else min(2, count)
             choice = {'index':0, 'text':'' if self.mode != 'no_ids' else 'a', 'finish_reason':None}
             if self.mode != 'no_ids':
                 choice['token_ids'] = list(range(first))
             if first == count:
                 choice['finish_reason'] = 'length'
             await response.write(event(choice))
-            await asyncio.sleep(0.01)
-            if first < count:
-                choice = {'index':0, 'text':' ', 'finish_reason':'length'}
+            for position in range(first, count):
+                await asyncio.sleep(0.01)
+                choice = {'index':0, 'text':' ', 'finish_reason':'length' if position == count-1 else None}
                 if self.mode != 'no_ids':
-                    choice['token_ids'] = list(range(first,count))
+                    choice['token_ids'] = [position]
                 await response.write(event(choice))
             if self.mode == 'drop':
                 request.transport.close()
@@ -90,8 +90,8 @@ class DiagnosticEndpoint:
 def compiled_plan(root: Path):
     path, spec = make_input(root)
     spec['workload']['matrices'] = {'decode':{
-        'kind':'steady_decode','split':'train','concurrency':[2],'context_tokens':[8],
-        'surface_requests':[],'surface_kv_tokens':[], 'output_tokens':4,
+        'kind':'steady_decode','split':'train','concurrency':[2],'num_ctx':[16],
+        'output_tokens':8,
         'warmup_repeats':0,'repeats':1,'arrival':{'mode':'fixed_batch'}}}
     path.write_text(json.dumps(spec))
     campaign = compile_campaign(path, write=False)

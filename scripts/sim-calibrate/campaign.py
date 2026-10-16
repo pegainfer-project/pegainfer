@@ -116,7 +116,7 @@ def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[
         cell["plan"] = {"path": name, "plan_sha256": plan["plan_sha256"]}
     module_dir = Path(__file__).resolve().parent
     compiler_files = {name: assets['observer']['sources'][name] for name in (
-        "campaign.py", "manifest.py", "request_plan.py", "measurement_schema.py", "profile.py", "artifacts.py",
+        "campaign.py", "manifest.py", "request_plan.py", "measurement_schema.py", "profile.py", "artifacts.py", "steady_state.py",
     )}
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=module_dir, capture_output=True, text=True, timeout=5, check=False)
     compiled["provenance"] = {

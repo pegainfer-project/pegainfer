@@ -16,6 +16,16 @@ TIMESTAMPS = ("actual_dispatch_timestamp", "first_token_timestamp", "last_token_
 METRICS = ("ttft_ms", "tpot_ms", "first_text_latency_ms", "e2e_ms")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
+DECODE_STATISTICS_POLICY = {
+    "source": "fixed_batch_decode_window",
+    "window": "full_common_generation_events",
+    "interval": "both_endpoints_inside_inclusive",
+    "token_denominator": "right_event_output_token_count",
+    "qualification": "positive_duration_and_tokens_per_measured_request",
+    "aggregation": "request_then_batch_then_repeat_equal_mean",
+    "coordinate": "initial_sum_decode_ctx_tokens",
+}
+
 
 class MeasurementError(ValueError):
     """Evidence does not satisfy the declared client measurement contract."""

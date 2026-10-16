@@ -135,48 +135,23 @@
       "decode-train": {
         "kind": "steady_decode",
         "split": "train",
-        "concurrency": {
-          "values": [
-            1,
-            4
-          ]
-        },
-        "context_tokens": {
-          "values": [
-            128,
-            2048
-          ]
-        },
-        "surface_requests": [],
-        "surface_kv_tokens": [],
-        "output_tokens": 128,
+        "concurrency": [
+          1,
+          2,
+          4
+        ],
+        "output_tokens": 8,
         "warmup_repeats": 1,
-        "repeats": 3,
+        "repeats": 2,
         "arrival": {
           "mode": "fixed_batch"
-        }
-      },
-      "decode-heldout": {
-        "kind": "steady_decode",
-        "split": "sealed_test",
-        "concurrency": {
-          "values": [
-            2
-          ]
         },
-        "context_tokens": {
-          "values": [
-            1024
-          ]
-        },
-        "surface_requests": [],
-        "surface_kv_tokens": [],
-        "output_tokens": 128,
-        "warmup_repeats": 1,
-        "repeats": 3,
-        "arrival": {
-          "mode": "fixed_batch"
-        }
+        "num_ctx": [
+          256,
+          1024,
+          3072,
+          6144
+        ]
       },
       "cached-train": {
         "kind": "cached_prefill",
@@ -212,10 +187,66 @@
           "reset_before": "repeat",
           "bootstrap_repeats": 1
         }
+      },
+      "decode-heldout": {
+        "kind": "steady_decode",
+        "split": "sealed_test",
+        "concurrency": [
+          1,
+          2,
+          4
+        ],
+        "output_tokens": 8,
+        "warmup_repeats": 1,
+        "repeats": 2,
+        "arrival": {
+          "mode": "fixed_batch"
+        },
+        "num_ctx": [
+          1536,
+          4096
+        ]
+      },
+      "decode-heldout-b3": {
+        "kind": "steady_decode",
+        "split": "sealed_test",
+        "concurrency": [
+          3
+        ],
+        "output_tokens": 8,
+        "warmup_repeats": 1,
+        "repeats": 2,
+        "arrival": {
+          "mode": "fixed_batch"
+        },
+        "num_ctx": [
+          1536,
+          3072,
+          4608
+        ]
+      },
+      "decode-heldout-short": {
+        "kind": "steady_decode",
+        "split": "sealed_test",
+        "concurrency": [
+          1,
+          2
+        ],
+        "output_tokens": 8,
+        "warmup_repeats": 1,
+        "repeats": 2,
+        "arrival": {
+          "mode": "fixed_batch"
+        },
+        "num_ctx": [
+          512
+        ]
       }
     }
   },
   "output": {
     "artifact_root": "artifacts"
-  }
+  },
+  "kind": "campaign_spec",
+  "schema_version": 6
 }

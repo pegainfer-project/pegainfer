@@ -11,11 +11,11 @@ from itertools import product
 from typing import Any
 from urllib.parse import urlsplit
 
-from measurement_schema import MeasurementError, contract as measurement_contract, digest, integer, number, text
+from measurement_schema import DECODE_STATISTICS_POLICY, MeasurementError, contract as measurement_contract, digest, integer, number, text
 
 
-CAMPAIGN_SPEC_SCHEMA_VERSION = 5
-COMPILED_CAMPAIGN_SCHEMA_VERSION = 5
+CAMPAIGN_SPEC_SCHEMA_VERSION = 6
+COMPILED_CAMPAIGN_SCHEMA_VERSION = 6
 SPLITS = ("train", "threshold_validation", "held_out_mixed", "sealed_test")
 WORKLOAD_KINDS = ("cold_prefill", "steady_decode", "cached_prefill", "mixed")
 
@@ -36,7 +36,7 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _axis_values(value: Any, field: str, *, allow_empty: bool = False) -> tuple[int, ...]:
+def _axis_values(value: Any, field: str) -> tuple[int, ...]:
     """Canonical positive integer axes, with inclusive ranges and no duplicates."""
     if isinstance(value, dict):
         if set(value) == {"values"}:
@@ -50,7 +50,7 @@ def _axis_values(value: Any, field: str, *, allow_empty: bool = False) -> tuple[
             value = list(range(start, stop + 1, step))
         else:
             raise ManifestError(f"{field} must use values or start/stop/step")
-    if not isinstance(value, list) or (not value and not allow_empty):
+    if not isinstance(value, list) or not value:
         raise ManifestError(f"{field} must be a non-empty array or range object")
     for item in value:
         integer(item, field, positive=True)
@@ -62,8 +62,8 @@ def _axis_values(value: Any, field: str, *, allow_empty: bool = False) -> tuple[
 def _matrix_cells(name: str, matrix: dict[str, Any]) -> list[dict[str, Any]]:
     """Expand a validated named recipe; experiment policy stays on each cell."""
     kind = matrix["kind"]
-    axes = {"input_tokens", "context_tokens", "concurrency", "prefix_tokens", "new_tokens",
-            "surface_requests", "surface_kv_tokens", "required_input_tokens"}
+    axes = {"input_tokens", "num_ctx", "concurrency", "prefix_tokens", "new_tokens",
+            "required_input_tokens"}
     policy = {key: value for key, value in matrix.items() if key not in axes}
     cells = []
     if kind == "cold_prefill":
@@ -79,31 +79,19 @@ def _matrix_cells(name: str, matrix: dict[str, Any]) -> list[dict[str, Any]]:
         cells = [{"name": f"{name}-{tokens}", "input_tokens": tokens,
                   "concurrency": 1, "metadata": dict(metadata)} for tokens in inputs]
     elif kind == "steady_decode":
-        if matrix["output_tokens"] < 2:
-            raise ManifestError(f"{name}.output_tokens must be >=2")
+        if matrix["output_tokens"] not in (8, 16):
+            raise ManifestError(f"{name}.output_tokens must be 8 or 16")
         requests = _axis_values(matrix.get("concurrency"), f"{name}.concurrency")
-        contexts = _axis_values(matrix.get("context_tokens"), f"{name}.context_tokens")
-        surface_requests = _axis_values(matrix.get("surface_requests"), f"{name}.surface_requests", allow_empty=True)
-        surface_kv = _axis_values(matrix.get("surface_kv_tokens"), f"{name}.surface_kv_tokens", allow_empty=True)
-        if bool(surface_requests) != bool(surface_kv):
-            raise ManifestError(f"{name} surface axes must be both empty or non-empty")
-
-        def add(count: int, context: int, family: str, total_kv: int) -> None:
+        contexts = _axis_values(matrix.get("num_ctx"), f"{name}.num_ctx")
+        for count, total in product(requests, contexts):
+            if total % count:
+                raise ManifestError(f"{name}.num_ctx must be divisible by every concurrency value")
             cells.append({
-                "name": f"{name}-{family}-c{count}-ctx{context}",
-                "input_tokens": context, "concurrency": count, "sum_decode_ctx_tokens": total_kv,
-                "metadata": {**matrix.get("metadata", {}), "matrix": kind,
-                             "family": family, "sum_decode_ctx_tokens": total_kv},
+                "name": f"{name}-c{count}-ctx{total}", "input_tokens": total // count,
+                "concurrency": count, "num_ctx": total, "sum_decode_ctx_tokens": total,
+                "decode_statistics": dict(DECODE_STATISTICS_POLICY),
+                "metadata": {**matrix.get("metadata", {}), "matrix": kind},
             })
-
-        for count, context in product(requests, contexts):
-            add(count, context, "additive", count * context)
-        # Unique axes produce the full grid. Keep surface and additive cells
-        # separate even when their shapes coincide: their fit intent differs.
-        for count, total_kv in product(surface_requests, surface_kv):
-            if total_kv % count:
-                raise ManifestError(f"{name}.surface_kv_tokens must be divisible by every surface request count")
-            add(count, total_kv // count, "surface", total_kv)
     elif kind == "cached_prefill":
         if matrix["concurrency"] != 1:
             raise ManifestError(f"{name}.concurrency must be 1 for cached_prefill")
@@ -355,7 +343,7 @@ def _matrix_configuration(name: str, matrix: Any, defaults: dict[str, Any]) -> d
     common_fields = {"kind", "split", "concurrency", "output_tokens", "warmup_repeats", "repeats", "seed", "sampling", "generation", "timing", "arrival", "cache_lifecycle", "metadata"}
     kind_fields = {
         "cold_prefill": {"input_tokens", "required_input_tokens"},
-        "steady_decode": {"context_tokens", "surface_requests", "surface_kv_tokens", "steady_state"},
+        "steady_decode": {"num_ctx"},
         "cached_prefill": {"prefix_tokens", "new_tokens", "shared_prefix"},
     }
     if not isinstance(matrix, dict) or not isinstance(matrix.get("kind"), str) or matrix["kind"] not in kind_fields:
@@ -465,8 +453,6 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
             matrix = _matrix_configuration(name, matrices[name], defaults)
             if matrix["kind"] != "steady_decode":
                 integer(matrix.get("concurrency"), f"matrix {name}.concurrency", positive=True)
-            if "steady_state" in matrix and not isinstance(matrix["steady_state"], dict):
-                raise ManifestError(f"matrix {name}.steady_state must be an object")
             if matrix.get("kind") == "cached_prefill":
                 if matrix["generation"]["dataset"] != "prefix_repetition":
                     raise ManifestError("cached_prefill requires prefix_repetition generation")

@@ -25,15 +25,15 @@ from test_campaign import make_input
 from test_sse_evidence import event
 from vllm_bench import render_command
 from vllm_bench_collect import convert_evidence
+from steady_state import compute_statistics
 
 
 def make_bundle(base: Path, *, cached=False, reset_before=None):
     """Compile current inputs; evidence is deliberately deterministic and tiny."""
     path, spec = make_input(base)
     cached_matrix = spec['workload']['matrices']['cached-train']
-    matrix = {'kind': 'steady_decode', 'split': 'train', 'concurrency': [2], 'context_tokens': [8],
-              'surface_requests': [], 'surface_kv_tokens': [],
-              'output_tokens': 4, 'warmup_repeats': 1, 'repeats': 2, 'arrival': {'mode': 'fixed_batch'}}
+    matrix = {'kind': 'steady_decode', 'split': 'train', 'concurrency': [2], 'num_ctx': [16],
+              'output_tokens': 8, 'warmup_repeats': 1, 'repeats': 2, 'arrival': {'mode': 'fixed_batch'}}
     if reset_before:
         matrix = {'kind': 'cold_prefill', 'split': 'train', 'concurrency': 1, 'input_tokens': [8],
                   'output_tokens': 4, 'warmup_repeats': 1, 'repeats': 2, 'arrival': {'mode': 'fixed_batch'},
@@ -52,7 +52,7 @@ def make_bundle(base: Path, *, cached=False, reset_before=None):
     return root, campaign
 
 
-def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *, split='train'):
+def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *, split='train', collapsed_phases=()):
     """Build raw evidence through the real converter and ExecutionStore."""
     with ExecutionStore(root, campaign['campaign_id']) as store:
         for cell in campaign['workload']['cells']:
@@ -94,24 +94,34 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                         request = directory / request_relative
                         request.mkdir(parents=True)
                         body = {'model': identity['model'], 'prompt': [1] * plan['shape']['input_tokens'],
-                                'max_tokens': 4, 'stream': True, 'return_token_ids': True, 'echo': False,
+                                'max_tokens': plan['shape']['output_tokens'], 'stream': True, 'return_token_ids': True, 'echo': False,
                                 'stream_options': {'include_usage': True}, **plan['sampling']}
                         _write_atomic(request / 'request.json', body)
                         (request / 'request-body.bin').write_bytes(json.dumps(body).encode())
-                        payload = (event({'index': 0, 'token_ids': [1, 2], 'text': ''}) +
-                                   event({'index': 0, 'token_ids': [3, 4], 'text': 'x', 'finish_reason': 'length'}) +
-                                   event(usage={'prompt_tokens': 8, 'completion_tokens': 4, 'total_tokens': 12}) +
-                                   b'data: [DONE]\r\n\r\n')
+                        count = plan['shape']['output_tokens']
+                        chunks = [event({'index': 0, 'token_ids': [1, 2], 'text': ''})]
+                        chunks.extend(event({'index': 0, 'token_ids': [j], 'text': 'x',
+                                             'finish_reason': 'length' if j == count else None})
+                                      for j in range(3, count + 1))
+                        chunks.append(event(usage={'prompt_tokens': plan['shape']['input_tokens'],
+                                                  'completion_tokens': count,
+                                                  'total_tokens': plan['shape']['input_tokens'] + count}) + b'data: [DONE]\r\n\r\n')
+                        payload = b''.join(chunks)
                         start = 1_000_000_000 + b * 100_000_000 + i * 2_000_000
                         parser = SSEParser()
-                        events = parser.feed(payload, start + 1_000_000) + parser.eof()
+                        events, reads, offset = [], [], 0
+                        for j, chunk in enumerate(chunks):
+                            timestamp = start + 1_000_000 + (0 if batch['phase'] in collapsed_phases else j * 5_000_000)
+                            events.extend(parser.feed(chunk, timestamp))
+                            reads.append({'timestamp_ns': timestamp, 'byte_start': offset, 'byte_end': offset+len(chunk)})
+                            offset += len(chunk)
+                        events.extend(parser.eof())
                         (request / 'response-body.bin').write_bytes(payload)
                         (request / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events))
-                        (request / 'reads.jsonl').write_text(json.dumps({'timestamp_ns': start + 1_000_000,
-                                                                      'byte_start': 0, 'byte_end': len(payload)}) + '\n')
+                        (request / 'reads.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in reads))
                         terminal = {**logical[key], 'transport_request_id': transport, 'request_instance_id': instance,
                                     'directory': request_relative, 'upstream_dispatch_ns': start,
-                                    'stream_end_ns': start + 2_000_000, 'downstream_end_ns': start + 3_000_000,
+                                    'stream_end_ns': start + 50_000_000, 'downstream_end_ns': start + 51_000_000,
                                     'upstream_attempts': 1, 'http_status': 200, 'eof': True, 'done': True,
                                     'finished': True, 'error': None}
                         _write_atomic(request / 'terminal.json', terminal)
@@ -120,6 +130,8 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                                             client=client, batch_errors=[])
                 _write_atomic(directory / 'workload_evidence.json', envelope.pop('workload_evidence'))
                 _write_atomic(directory / 'measurements.json', envelope)
+                if plan['workload_kind'] == 'steady_decode':
+                    _write_atomic(directory / 'decode_statistics.json', compute_statistics(plan, envelope))
                 store.finish(plan, role, directory)
 
 
@@ -139,6 +151,9 @@ def refresh_attempt(root: Path, campaign: dict, role='target'):
                                 directory, raw_index_sha256=raw_digest, client=campaign['client'], batch_errors=[])
     _write_atomic(directory / 'workload_evidence.json', envelope.pop('workload_evidence'))
     _write_atomic(directory / 'measurements.json', envelope)
+    if cell['kind'] == 'steady_decode':
+        _write_atomic(directory / 'decode_statistics.json', compute_statistics(build_plan(cell, campaign['client']), envelope))
+        entry['statistics'] = file_reference(directory / 'decode_statistics.json')
     for name, field in [('raw_bundle_index.json', 'raw_index'), ('measurements.json', 'measurement'),
                         ('workload_evidence.json', 'workload_evidence')]:
         entry[field] = file_reference(directory / name)
@@ -159,7 +174,7 @@ class NormalizeTests(unittest.TestCase):
             for observation in document['observations']:
                 self.assertEqual(observation['split'], 'train')
                 self.assertNotIn('effective', observation)
-                self.assertEqual(observation['measurements']['zero_cost']['tpot_ms'], 0)
+                self.assertGreater(observation['decode_window_tpot_ms']['zero_cost'], 0)
             with self.assertRaises(FitError):
                 fit_normalized(document)
             verify_normalized_sources(document)
@@ -194,7 +209,7 @@ class NormalizeTests(unittest.TestCase):
             campaign = compile_campaign(path)
             root = Path(tmp) / 'artifacts'
             with ExecutionStore(root, campaign['campaign_id']):
-                _write_atomic(root / 'execution_index.json', {'kind': 'execution_index', 'schema_version': 1,
+                _write_atomic(root / 'execution_index.json', {'kind': 'execution_index', 'schema_version': 2,
                               'campaign_id': campaign['campaign_id'], 'cells': {}})
             self.assertEqual(normalize_campaign(root, scope='train')['status'], 'invalid')
 

@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from steady_state import StatisticsError, aggregate_request_samples
+
 
 SCHEMA_VERSION = 1
 FIT_SPLITS = ("train",)
@@ -87,38 +89,29 @@ def _error_metrics(actual: Sequence[float], predicted: Sequence[float]) -> dict[
     }
 
 
-def _observations(
+def _prefill_observations(
     document: dict[str, Any],
     *,
-    kind: str,
-    metric: str,
     splits: Sequence[str],
 ) -> list[dict[str, Any]]:
+    metric = "ttft_ms"
     result: list[dict[str, Any]] = []
     allowed = set(splits)
     for cell in document.get("cells", []):
         if not isinstance(cell, dict) or cell.get("status") != "measured":
             continue
-        if cell.get("kind") != kind or cell.get("split") not in allowed:
+        if cell.get("kind") != "cold_prefill" or cell.get("split") not in allowed:
             continue
         for observation in cell.get("observations", []):
             if not isinstance(observation, dict):
                 continue
-            selected_metric = metric
-            label = observation.get("attribution", {}).get(metric)
             value = observation.get("effective", {}).get(metric)
-            if metric == "tpot_ms" and (label != "black_box_effective" or value is None):
-                stream_label = observation.get("attribution", {}).get("stream_chunk_tpot_ms")
-                stream_value = observation.get("effective", {}).get("stream_chunk_tpot_ms")
-                if stream_label == "black_box_effective" and stream_value is not None:
-                    selected_metric = "stream_chunk_tpot_ms"
-                    value = stream_value
-            if observation.get("attribution", {}).get(selected_metric) != "black_box_effective":
+            if observation.get("attribution", {}).get(metric) != "black_box_effective":
                 continue
             if value is None:
                 continue
             try:
-                y = _finite(value, f"effective.{selected_metric}")
+                y = _finite(value, f"effective.{metric}")
                 x = _finite(observation.get("input_tokens"), "input_tokens")
                 output = _finite(observation.get("output_tokens"), "output_tokens")
                 requests = _finite(observation.get("concurrency"), "concurrency")
@@ -134,15 +127,9 @@ def _observations(
                     "input_tokens": x,
                     "output_tokens": output,
                     "requests": requests,
-                "kv_tokens": _finite(
-                    observation.get("sum_decode_ctx_tokens")
-                    if observation.get("sum_decode_ctx_tokens") is not None
-                    else x * requests,
-                    "sum_decode_ctx_tokens",
-                ),
                     "value": y,
-                    "metric": selected_metric,
-                    "dispersion": cell.get("summaries", {}).get(selected_metric, {}).get("effective", {}),
+                    "metric": metric,
+                    "dispersion": cell.get("summaries", {}).get(metric, {}).get("effective", {}),
                     "token_timing_valid": observation.get("token_timing_valid", {}),
                     "timing_semantics": observation.get("timing_semantics", {}),
                 }
@@ -173,18 +160,13 @@ def _source_metadata(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[
         "metric": metric,
         "source_cells": cells,
         "observation_count": sum(int(sample.get("repeat_count", 1)) for sample in samples),
+        "request_count": sum(int(sample.get("request_count", 1)) for sample in samples),
         "fit_point_count": len(samples),
         "dispersion": _median_mad(dispersions),
         "timing_semantics": timing,
         "token_timing_valid": token_flags,
         "attribution": "black_box_effective",
     }
-
-
-def _candidate_timing_semantics(samples: Sequence[dict[str, Any]]) -> str:
-    if any(sample.get("metric") == "stream_chunk_tpot_ms" for sample in samples):
-        return "black_box_effective_stream_chunk"
-    return "black_box_effective"
 
 
 def _piecewise_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[str, Any]:
@@ -203,7 +185,7 @@ def _piecewise_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[st
         "status": "fitted",
         "kind": "cold_prefill",
         "metric": metric,
-        "timing_semantics": _candidate_timing_semantics(samples),
+        "timing_semantics": "black_box_effective",
         "interpolation": "piecewise_linear_inside_measured_domain",
         "knots": knots,
         "coverage": {
@@ -243,20 +225,15 @@ def _aggregate_decode_samples(samples: Sequence[dict[str, Any]]) -> list[dict[st
         key = (sample["input_tokens"], sample["requests"], sample["kv_tokens"])
         grouped.setdefault(key, []).append(sample)
     aggregated: list[dict[str, Any]] = []
-    for key, rows in sorted(grouped.items()):
-        values = [float(row["value"]) for row in rows]
-        dispersion = _median_mad(values)
+    for _, rows in sorted(grouped.items()):
+        try:
+            summary = aggregate_request_samples(rows)
+        except StatisticsError as exc:
+            raise FitError(str(exc)) from exc
         cells = sorted({row.get("cell_id") for row in rows if row.get("cell_id")})
-        representative = dict(rows[0])
-        representative.update(
-            {
-                "value": float(dispersion["median"]),
-                "dispersion": dispersion,
-                "fit_weight": _dispersion_weight(dispersion["mad"]),
-                "repeat_count": len(rows),
-                "source_cells": cells,
-            }
-        )
+        representative = {**rows[0], **summary,
+                          "fit_weight": _dispersion_weight(summary["dispersion"]["mad"]),
+                          "source_cells": cells}
         aggregated.append(representative)
     return aggregated
 
@@ -295,7 +272,7 @@ def _additive_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[str
     source = _source_metadata(aggregated, metric=metric)
     source["fit_weighting"] = {
         "method": "inverse_mad_squared",
-        "center": "repeat_median",
+        "center": "repeat_mean",
         "epsilon_ms": WEIGHT_EPSILON_MS,
         "min": WEIGHT_MIN,
         "max": WEIGHT_MAX,
@@ -305,7 +282,7 @@ def _additive_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[str
         "status": "fitted",
         "kind": "steady_decode",
         "metric": metric,
-        "timing_semantics": _candidate_timing_semantics(samples),
+        "timing_semantics": "fixed_batch_decode_window",
         "formula": "d0 + d_requests * (requests - 1) + d_kv * kv_tokens",
         "coefficients": {"d0_ms": d0, "d_requests_ms": d_requests, "d_kv_ms_per_token": d_kv},
         "coverage": {
@@ -335,23 +312,22 @@ def evaluate_additive(candidate: dict[str, Any], requests: float, kv_tokens: flo
 def _surface_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[str, Any]:
     if not samples:
         raise FitError("no measured samples for decode surface candidate")
-    requests = sorted({sample["requests"] for sample in samples})
-    kv_tokens = sorted({sample["kv_tokens"] for sample in samples})
+    aggregated = _aggregate_decode_samples(samples)
+    requests = sorted({sample["requests"] for sample in aggregated})
+    kv_tokens = sorted({sample["kv_tokens"] for sample in aggregated})
     if len(requests) < 2 or len(kv_tokens) < 2:
         raise FitError("decode surface requires at least two request and kv points")
-    values: dict[tuple[float, float], list[float]] = {}
-    for sample in samples:
-        values.setdefault((sample["requests"], sample["kv_tokens"]), []).append(sample["value"])
+    values = {(sample["requests"], sample["kv_tokens"]): sample["value"] for sample in aggregated}
     missing = [(request, kv) for request in requests for kv in kv_tokens if (request, kv) not in values]
     if missing:
         raise FitError(f"decode surface grid is incomplete: {missing[:4]}")
-    grid = [[statistics.median(values[(request, kv)]) for kv in kv_tokens] for request in requests]
+    grid = [[values[(request, kv)] for kv in kv_tokens] for request in requests]
     return {
         "name": "decode_2d_surface",
         "status": "fitted",
         "kind": "steady_decode",
         "metric": metric,
-        "timing_semantics": _candidate_timing_semantics(samples),
+        "timing_semantics": "fixed_batch_decode_window",
         "interpolation": "bilinear_inside_measured_domain",
         "axes": {"requests": requests, "kv_tokens": kv_tokens},
         "values_ms": grid,
@@ -360,7 +336,7 @@ def _surface_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[str,
             "kv_tokens": {"min": kv_tokens[0], "max": kv_tokens[-1]},
             "ood_policy": "fail",
         },
-        "source": _source_metadata(samples, metric=metric),
+        "source": _source_metadata(aggregated, metric=metric),
     }
 
 
@@ -473,7 +449,7 @@ def _cached_surface_fit(
         "status": "fitted",
         "kind": "cached_prefill",
         "metric": metric,
-        "timing_semantics": _candidate_timing_semantics(samples),
+        "timing_semantics": "black_box_effective",
         "duration_semantics": "effective_wall_including_uncached_tail",
         "formula": "prefix_cache(prefix_tokens, new_tokens)",
         "interpolation": "bilinear_inside_measured_domain",
@@ -549,24 +525,24 @@ def _fit_or_unsupported(name: str, kind: str, metric: str, fit_fn: Any, samples:
             "status": "unsupported",
             "kind": kind,
             "metric": metric,
-            "timing_semantics": _candidate_timing_semantics(samples),
+            "timing_semantics": "fixed_batch_decode_window" if kind == "steady_decode" else "black_box_effective",
             "reason": str(exc),
             "source": _source_metadata(samples, metric=metric),
         }
 
 
 def fit_normalized(document: dict[str, Any], *, source_digest: str | None = None) -> dict[str, Any]:
+    if document.get("kind") == "train_target_statistics":
+        raise FitError("target statistics require C5 validated paired baseline subtraction before fitting")
     if document.get("schema_version") != 1:
         raise FitError("normalized document schema_version must be 1")
     if document.get("status") != "succeeded":
         raise FitError("cannot fit a normalized document with failures")
-    prefill = _observations(document, kind="cold_prefill", metric="ttft_ms", splits=FIT_SPLITS)
-    decode = _observations(document, kind="steady_decode", metric="tpot_ms", splits=FIT_SPLITS)
-    decode_metric = (
-        "stream_chunk_tpot_ms"
-        if decode and all(sample.get("metric") == "stream_chunk_tpot_ms" for sample in decode)
-        else "tpot_ms"
-    )
+    prefill = _prefill_observations(document, splits=FIT_SPLITS)
+    # C5 must validate the interval reference and paired window differences before
+    # opening the formal decode consumer. Historical whole-request TPOT is retired.
+    decode = []
+    decode_metric = "tpot_ms"
     cached, cached_rejections = _cached_observations(document, metric="ttft_ms")
     try:
         cached_candidate = _cached_surface_fit(cached, metric="ttft_ms", document=document)

@@ -37,23 +37,27 @@ class FitTests(unittest.TestCase):
 
     def test_decode_additive_uses_mad_weight_and_records_policy(self) -> None:
         samples = []
-        for value in (1.0, 1.0):
-            samples.append({"cell_id": "stable-10", "input_tokens": 10.0, "requests": 1.0, "kv_tokens": 10.0, "value": value})
-        for value in (2.0, 2.0):
-            samples.append({"cell_id": "stable-20", "input_tokens": 20.0, "requests": 1.0, "kv_tokens": 20.0, "value": value})
-        for value in (2.5, 2.5):
-            samples.append({"cell_id": "stable-batch", "input_tokens": 10.0, "requests": 2.0, "kv_tokens": 20.0, "value": value})
+        for repeat, value in enumerate((1.0, 1.0)):
+            samples.append({"repeat": repeat, "cell_id": "stable-10", "input_tokens": 10.0, "requests": 1.0, "kv_tokens": 10.0, "value": value})
+        for repeat, value in enumerate((2.0, 2.0)):
+            samples.append({"repeat": repeat, "cell_id": "stable-20", "input_tokens": 20.0, "requests": 1.0, "kv_tokens": 20.0, "value": value})
+        for repeat, value in enumerate((2.5, 2.5)):
+            samples.append({"repeat": repeat, "cell_id": "stable-batch", "input_tokens": 10.0, "requests": 2.0, "kv_tokens": 20.0, "value": value})
         samples.extend(
             [
                 {"cell_id": "noisy", "input_tokens": 15.0, "requests": 2.0, "kv_tokens": 30.0, "value": 3.5},
                 {"cell_id": "noisy", "input_tokens": 15.0, "requests": 2.0, "kv_tokens": 30.0, "value": 30.0},
             ]
         )
+        # Numeric rows are expanded into complete fixed batches; two repeats per cell.
+        for repeat, row in enumerate(samples[-2:]):
+            row['repeat'] = repeat
+        samples = [{**row, 'index': index} for row in samples for index in range(int(row['requests']))]
         candidate = _additive_fit(samples, metric="tpot_ms")
         coefficients = candidate["coefficients"]
         self.assertAlmostEqual(coefficients["d_kv_ms_per_token"], 0.1, delta=0.02)
         self.assertAlmostEqual(coefficients["d_requests_ms"], 0.5, delta=0.2)
-        self.assertEqual(candidate["source"]["fit_weighting"]["center"], "repeat_median")
+        self.assertEqual(candidate["source"]["fit_weighting"]["center"], "repeat_mean")
         self.assertEqual(candidate["source"]["fit_weighting"]["method"], "inverse_mad_squared")
         self.assertEqual(candidate["source"]["observation_count"], 8)
 
@@ -74,16 +78,18 @@ class FitTests(unittest.TestCase):
     def test_decode_surface_requires_complete_total_kv_grid(self) -> None:
         samples = [
             {"cell_id": f"decode-{count}-{kv}", "requests": count, "kv_tokens": kv,
-             "input_tokens": kv // count, "value": 2.0 + 0.5 * count + 0.01 * kv}
-            for count in (1, 2) for kv in (16, 32)
+             "repeat": repeat, "index": index, "input_tokens": kv // count, "value": 2.0 + 0.5 * count + 0.01 * kv + offset}
+            for count in (1, 2) for kv in (16, 32) for repeat, offset in enumerate((0, 0, 9)) for index in range(count)
         ]
         candidate = _surface_fit(samples, metric="tpot_ms")
         self.assertEqual(candidate["axes"], {"requests": [1, 2], "kv_tokens": [16, 32]})
-        self.assertAlmostEqual(evaluate_surface(candidate, 2, 24), 3.24)
+        self.assertEqual(candidate["source"]["observation_count"], 12)
+        self.assertEqual(candidate["source"]["request_count"], 18)
+        self.assertAlmostEqual(evaluate_surface(candidate, 2, 24), 6.24)
         with self.assertRaisesRegex(FitError, "outside measured domain"):
             evaluate_surface(candidate, 4, 24)
         with self.assertRaisesRegex(FitError, "grid is incomplete"):
-            _surface_fit(samples[:-1], metric="tpot_ms")
+            _surface_fit([row for row in samples if (row["requests"], row["kv_tokens"]) != (2, 32)], metric="tpot_ms")
 
 
 if __name__ == "__main__":

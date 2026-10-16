@@ -1,6 +1,6 @@
 # Calibration campaigns and proxy evidence
 
-> **TL;DR:** Cold/decode campaigns normalize current proxy evidence with exact plan/content/batch pairing, pinned sealed-attempt provenance and complete output verification. Saved profile bindings and required reset receipts share acquisition checks. Train requires target/zero_cost independently of sim and held-out. Normalized schema 2 is not fit-ready; common decode windows and baseline subtraction remain C4–C5, and partial-ID false success remains an accepted risk.
+> **TL;DR:** Fixed-batch decode uses initial total num_ctx, complete common-event windows and equal request/batch/repeat means. Measured window qualification gates sealing and offline reuse; independent train-target statistics pin verified attempts without requiring a reference. Normalized schema 3 remains non-fit-ready until C5 supplies validated baseline subtraction. Partial-ID false success remains accepted.
 >
 > **Last touched:** 2026-10
 
@@ -27,14 +27,14 @@ Formal timestamps use the proxy's monotonic clock:
 
 - TTFT ends at the first event containing non-empty **output token IDs**, including IDs with empty text. Prompt IDs, role, usage and finish-only events do not qualify.
 - First text latency is separate; a space/newline qualifies, and no text yields null. Entirely missing output IDs yields unsupported token timing; text never substitutes for token TTFT. Partial IDs have the explicitly accepted false-success limitation documented in finding 1.
-- Multi-token events retain their actual read timestamp and token count. An interval uses its right event's token count; the first event's tokens are excluded from the interval denominator. Request TPOT is diagnostic; the common-window fit source belongs to C4.
+- Multi-token events retain their actual read timestamp and token count. An interval uses its right event's token count; the first event's tokens are excluded from the interval denominator. Request TPOT is diagnostic; `steady_state.py` owns the common-window fit source.
 - E2E ends at upstream EOF, including usage/stream tail. HTTP, finish, DONE, EOF, parser failures and downstream failures are retained independently. Truncation, count disagreement and explicit error events cannot be sealed successfully.
 
 Raw upstream reads are recorded before parsing. UTF-8/SSE framing may cross reads; an event is timestamped by the read containing its closing boundary. Multiple events in one read can have the same timestamp. No synthetic per-token timestamps are inserted. Actual request bytes, normalized body and prompt-ID digests are retained; model routing is excluded only from the normalized workload body.
 
 A trailing CR retains its own read timestamp while awaiting an optional LF. If LF follows, the boundary uses that LF's read; otherwise the saved CR time applies, including at EOF. Waiting for the next byte no longer assigns a later read time to a complete CR-only event.
 
-The observer source map freezes 13 acquisition/compiler inputs: proxy, parser, pinned requirements, converter, driver, bench adapter, measurement schema, request plan, manifest, artifact store, readiness probe, campaign compiler and profile builder. Plans require the complete source set and valid digests. Runtime rechecks it before each attempt or sealed reuse, after collection and before sealing; measurements must bind the same observer digest as their execution entry. A mismatch requires recompilation into a new artifact root. Existing campaign/plan/measurement schema versions remain 5/2/3; the expanded identity deliberately invalidates earlier compiled bundles.
+The observer source map freezes 14 acquisition/compiler inputs: proxy, parser, pinned requirements, converter, driver, bench adapter, measurement schema, request plan, manifest, artifact store, readiness probe, campaign compiler, profile builder and shared decode statistics. Plans require the complete source set and valid digests. Runtime rechecks it before each attempt or sealed reuse, after collection and before sealing; measurements must bind the same observer digest as their execution entry. A mismatch requires recompilation into a new artifact root. C4 campaign/plan versions are 6/3; raw measurement remains 3. Compiler provenance also includes the shared decode statistics source. Source changes require new compiled bundles.
 
 The proxy uses a bounded evidence queue, limits open files and flushes/fsyncs before each batch transition and final sealing. Queue overflow, storage failure or dropped evidence fails the attempt. The original bench's unconditional optional `/metrics` reads are recorded and answered locally with 404; they are not forwarded to target or used as formal metrics. This behavior is part of observer identity.
 
@@ -77,6 +77,7 @@ Run from the repository root with the pinned observer environment. These help co
 .venv/bin/python scripts/sim-calibrate/campaign.py compile --help
 .venv/bin/python scripts/sim-calibrate/campaign.py run --help
 .venv/bin/python -B scripts/sim-calibrate/normalize.py --help
+.venv/bin/python -B scripts/sim-calibrate/target_statistics.py --help
 ```
 
 A complete input example, including timing/retry contracts and named matrices, is in `scripts/sim-calibrate/tests/fixtures/campaign-compile.json`. Its binary, tokenizer, model identity, runtime and endpoints are test inputs; supply actual values for an experiment. `compile --spec` writes an external artifact root; `run --artifact-root` accepts repeated `--cell` and `--variant` selectors. An unqualified run containing deferred cached cells is rejected rather than partially executed silently.
@@ -95,16 +96,57 @@ The normalizer validates saved acquisition identity and profile file bindings wi
 
 Acquisition and offline pairing also share the existing reset lifecycle and success predicate. Only target with cache enabled and a reset lifecycle requires indexed `reset.json`: before the first batch for `cell`, or every warmup/measured batch for `repeat`. A cold target with cache enabled requires an explicit lifecycle. HTTP 200 plus JSON `true` or `{"success": true}` proves the receipt's success; missing, false or unsuccessful receipts fail validation. Cache-off targets and simulator roles retain their existing behavior. The saved receipt has no timestamp and does not independently establish reset ordering.
 
-Output is `kind=normalized_campaign`, schema 2, with scope and selected-source digests, expected/matched/observed counts, failures, original per-role measurements/events and fit policy. `status=succeeded` means complete pairing in that scope. `fit_ready=false` explicitly defers C4 windows and C5 qualified baseline subtraction. Existing fit schema 1 rejects it; no effective deltas, stream-chunk fallback or fit-ready samples are synthesized. Output publishing is exclusive/idempotent and refuses source artifact paths.
+Output is `kind=normalized_campaign`, schema 3, with scope and selected-source digests, expected/matched/observed counts, failures, original per-role measurements/events and fit policy. `status=succeeded` means complete pairing in that scope. `fit_ready=false` defers C5 qualified baseline subtraction; C4 includes each role's recomputed windows and per-request window TPOT. Existing fit schema 1 rejects it; no effective deltas, stream-chunk fallback or fit-ready samples are synthesized. Output publishing is exclusive/idempotent and refuses source artifact paths.
 
 `normalize.verify_normalized` validates a complete succeeded document, including observations, cell/top-level counts, fit readiness and the normalizer source-map digest. It compares saved results with the canonical results returned by source verification, using the same cell/observation/document assembly as normalization. `verify_normalized_sources` remains scoped to the pinned sources. Successful output publishing calls the complete validator before writing; later consumers should use it when trusting normalized results.
 
-The observed zero-cost C=4/output-32 C2 repeats have no common decode window: 32 generation events per request were received in one upstream read, so first/last generation observations coincide. C3 preserves this evidence and can pair it. C4–C5 must reject it as a formal decode baseline until qualified evidence exists; diagnostic request TPOT=0 does not establish zero frontend cost. Partial token IDs retain the explicitly accepted completeness limitation.
+The observed zero-cost C=4/output-32 C2 repeats have no common decode window: 32 generation events per request were received in one upstream read, so first/last generation observations coincide. C3 preserves this evidence and can pair it. C4 rejects it before sealing in new campaigns; C5 must supply a qualified interval reference; diagnostic request TPOT=0 does not establish zero frontend cost. Partial token IDs retain the explicitly accepted completeness limitation.
+
+## Complete decode windows and target statistics (C4)
+
+Decode matrices now declare only `concurrency × num_ctx`, where `num_ctx` is the initial **total** context across the fixed batch. Each request receives exactly `num_ctx / concurrency` prompt tokens; non-divisible coordinates and per-request context ceiling violations fail compilation. The additive and surface candidates share these cells. Retired `context_tokens`, `surface_requests`, `surface_kv_tokens` and free-form `steady_state` fields are rejected. Campaign spec/compiled schema is 6, plan schema is 3, execution index schema is 2, normalized schema is 3, and raw measurement schema remains 3.
+
+The checked-in fixture declares 12 train coordinates, B={1,2,4} × num_ctx={256,1024,3072,6144}, plus 11 `sealed_test` coordinates. Each uses warmup=1, measured=2 and per-request output=8. Held-out coordinates are B={1,2,4} × num_ctx={1536,4096}, B=3 at num_ctx={1536,3072,4608}, and B={1,2} at num_ctx=512. This is one point set for both numerical candidates, with no duplicate collection by fit family. Output=16 is accepted only as another frozen plan; the driver does not change shape during execution.
+
+For every complete batch, start=max(first output-ID timestamps), end=min(last output-ID timestamps). `steady_state.py` retains adjacent event intervals only when **both** endpoints are inside that inclusive window. Duration sums include zero-duration intervals, and the denominator sums each retained interval's right-event output token count. Multi-token events are kept intact, without timestamp interpolation. There is no 80% clipping or central-progress cross-check.
+
+A measured batch qualifies when the common window is positive and every one of its B successful requests has at least one complete interval, positive total retained duration and positive token denominator. There is no additional interval-count, duration or jitter threshold. Request TPOT values have equal weight within a batch; measured batch means have equal weight across repeats. Raw request values, retained interval/token counts, distinct timestamps, window duration and repeat dispersion remain diagnostic. `repeat_count` counts batches, not B×repeats. Warmup retains all request/content/terminal checks but its window does not gate measured qualification or enter means/dispersion. Cold-prefill's paired TTFT median remains unchanged.
+
+The driver writes `decode_statistics.json` after measurement conversion and before `ExecutionStore.finish`. It is a separate schema-1 `decode_window_statistics` artifact, with a canonical measurement digest; the selected attempt pins its byte reference. Raw indexes exclude derived files to avoid digest cycles. The reader still rejects unindexed files/symlinks and rechecks the statistic against the pinned measurement. Failed measured qualification leaves raw evidence and reasons in a failed attempt; the next explicit run creates a new directory and reruns the full plan. Successful sealed reuse revalidates statistics. A burst-read zero-cost reference can therefore fail this gate even when its requests completed; that does not determine target output length.
+
+`target_statistics.py` reuses `normalize.load_role`, `read_sealed_attempt` and `pairing.validate_attempt_evidence`. It selects every declared train decode target, freezes selected attempts and its implementation source map, and publishes schema-1 `kind=train_target_statistics`. `read_target_statistics`/`verify_target_statistics` recompute pinned results without consulting later execution state or a live service. This distinct artifact succeeds without zero_cost, while complete train normalization still requires target/zero_cost and validation still requires all three roles. Both outputs remain `fit_ready=false`. The fitter explicitly rejects target-only and paired artifacts; formal decode consumption waits for C5's reference lineage and per-request paired subtraction. Numerical NNLS/bilinear helpers already share the hierarchical mean; the retired whole-request/stream-chunk decode fallback and pooled-row median are removed. Unreplaced cached and replay/report domain logic remains until C8/C7 respectively.
+
+### C4 validation
+
+Final-source production run: Qwen3-4B, vLLM 0.30.0, RTX 3090 GPU 2, cache off, capacity 4, context ceiling 8192, whole prefill, eager/TRITON_ATTN. All 12 train targets sealed on attempt 1: 36 batches and 84 successful requests, including 24 measured batches / 56 measured requests. All measured windows qualified under policy A, so output=8 is fixed for this stage; output=16 was not sampled. The 11 held-out cells were compiled but never collected or used for tuning.
+
+| B | Train targets | Retained intervals per measured request | Common-window range (ms) |
+| --- | --- | --- | --- |
+| 1 | 4 | 6–7 | 168.67–175.18 |
+| 2 | 4 | 5–6 | 164.01–198.08 |
+| 4 | 4 | 4–6 | 158.14–197.63 |
+
+Target statistics generated and verified without a reference; all 12 sealed resumes skipped without new attempts. Complete train normalization with no reference and validation with no held-out acquisition both returned invalid as expected. After stopping the owned target, the production reader and CLI verified statistics again; compiler, acquisition and statistics source hashes match the final files. No fitted accuracy or new proxy-overhead A/B is established by this acquisition gate. Two measured repeats describe this run, without establishing a stable tail distribution.
+
+Final evidence is `/tmp/c4-production-output8-final-20261016/`: `validation-summary.json`, `target-statistics.json`, `artifacts/`, exact CLI argv/logs and target launch/log files. `/tmp/c4-production-output8-final-20261016.log` records orchestration. An earlier successful output8 run is retained at `/tmp/c4-production-output8-20261016/`; removing the last obsolete empty-surface-axis branch changed frozen acquisition identity, so the final run used a new root and did not combine repeats or rewrite earlier evidence.
+
+All 46 Python tests passed in 28.889s, including original installed bench HTTP fault/recovery integration, window edge cases, snapshot/tamper checks and legacy cached tests. Python compilation, `cargo fmt`/format check and staged diff checks passed. Suite log: `/tmp/c4-tests-final-cleanup.log`. The local production verification helper is `/tmp/c4_run_training.py`; post-shutdown source verification is `/tmp/c4_offline_verify.py`. These `/tmp` files are local evidence, not a permanent archive.
+
+The following production commands generated and rechecked the final artifact (run from the repository root):
+
+```bash
+.venv/bin/python -B scripts/sim-calibrate/target_statistics.py --artifact-root /tmp/c4-production-output8-final-20261016/artifacts --output /tmp/c4-production-output8-final-20261016/target-statistics.json
+.venv/bin/python -B scripts/sim-calibrate/target_statistics.py --artifact-root /tmp/c4-production-output8-final-20261016/artifacts --verify /tmp/c4-production-output8-final-20261016/target-statistics.json
+```
 
 ## Migration defense handoff
 
 | Previous defense / failure mode | Current owner |
 | --- | --- |
+| Duplicate per-request/surface grids, inconsistent fit centers and row counts presented as repeats | One total-num_ctx grid in `manifest._matrix_cells`; `steady_state` request/batch/repeat means shared by both numerical candidates; explicit complete-batch validation |
+| Statistically unusable measured requests sealed and then skipped forever | Shared pre-seal qualification, failed attempt diagnostics and a fresh full-plan retry; sealed reuse recomputes the same windows |
+| New sidecars bypass raw inventory or create digest cycles | Separately pinned measurement/statistics references, complete raw inventory and canonical offline recomputation |
+| Warmup enters fitted statistics or fails because it lacks a common window | Original all-phase request/evidence checks retained; only measured batches gate window qualification and enter summaries |
 | Request count, phase/repeat and duplicate attribution | Immutable plan, proxy registration/at-most-once reservation, measurement key validation |
 | Partial streams, metadata counted as output, usage/count disagreement | Incremental SSE parser, terminal evidence, proxy converter and schema |
 | Sealed overwrite, artifact tampering, interrupted-directory reuse | Separate execution store, exclusive lock/allocation and digest verification |
@@ -113,11 +155,15 @@ The observed zero-cost C=4/output-32 C2 repeats have no common decode window: 32
 | Cross-role key agreement, successful roles and sealed entries | `pairing.index_plan_measurements`/`pair_plan_measurements` plus `artifacts.sealed_reference`; replacement verified by new pairing/normalize tests, then `paired.py` removed |
 | Old normalize raw-result hashes, duplicate keys and warmup exclusion | Current compiler/attempt reader, exact full logical-key join and measured-only output; tests in `test_pairing.py`/`test_normalize.py` |
 | Content/transport attribution, fixed batches and recursive provenance | `pairing.validate_attempt_evidence`, shared body validator, pinned attempt snapshot and indexed raw checks; production bench integration and semantic fault cases |
-| Old normalize baseline negative-delta/dispersion filtering | New output cannot enter old fitter (schema 2); qualification and negative/unstable-delta policy explicitly deferred to C5, not silently inherited as pairing policy |
+| Old normalize baseline negative-delta/dispersion filtering | New output cannot enter old fitter (schema 3); qualification and negative/unstable-delta policy explicitly deferred to C5, not silently inherited as pairing policy |
 | Old mixed-overlap/cached-hit normalize branches | Mixed is outside the current compiler contract; cached explicitly deferred. Independent `cached_prefix_collect` hit/alignment/uncached-tail validation remains until C8 |
 | Profile/selection/publication lineage, errors, queueing and coverage | Restored replay validation/prediction/report rules; C7 still owns new-evidence integration and report migration |
 
 ## Execution Log
+
+- 2026-10-19, requested test reduction: removed the empty/non-positive/missing-request window failure test, warmup-window isolation test and measured-window failure/retry test from `test_steady_state.py`, plus their unused imports. Its three remaining methods pass, and all 43 retained suite methods passed in 31.628s; log: `/tmp/c4-amend-tests-20261019.log`. Production statistics/sealing behavior and the retained C4 acquisition artifacts are unchanged. The earlier 46-method result below records the original C4 acceptance run.
+
+- C4: unified total-context plans, pre-seal window qualification, pinned independent target statistics and shared means implemented. Final output8 train acquisition passed all 12 targets; 46 regression methods passed. Detailed evidence, cleanup and C5 limits are recorded above.
 
 - C3 audit repair (1A/2A/3A): shared static profile bindings and reset requirements/receipts; added complete normalized verification using existing pairing and shared result assembly, and checked successful outputs before publishing. Expanded existing test subcases only: still 36 methods, all passed in 24.105s, including original bench HTTP integration. Previously removed old-input tests remain absent. Log: `/tmp/c3-repair-python-tests-20261016.log`. Existing audit artifacts now reject wrong binding, false reset and all five derived-output corruptions; unchanged historical train/validation outputs still pass complete verification. Diagnostic summary: `/tmp/c3-repair-diagnostics-20261016.json`. No PegaInfer target/reset support was changed.
 - Repeated the existing three-role production smoke with final repair sources: all 12 cell/role executions sealed, 72 rows (48 measured), 12 train pairs and 4 validation pairs. Train published before sim/held-out collection, missing validation failed, and later collection preserved the train snapshot. Complete train/validation verification passed again after all owned servers exited; acquisition and normalizer source hashes match the final files. Evidence: `/tmp/c3-repair-production-20261016/validation-summary.json`; log: `/tmp/c3-repair-production-20261016.log`. Used the existing vLLM target and functional simulator transport profile, without a performance A/B or fitted-accuracy claim. Python compilation, `cargo fmt`/format check and diff checks passed.
@@ -137,7 +183,7 @@ The observed zero-cost C=4/output-32 C2 repeats have no common decode window: 32
 
 ## Debrief
 
-C2 writes raw evidence and measurements; C3 now verifies complete cold/decode scopes and pins their sealed-attempt provenance. File digests alone do not establish plan/content/transport agreement: C3 checks both the indexed bytes and the cross-file identities and commands. Scope and source snapshots must be separate from the evolving execution index so later collection does not invalidate valid training inputs. Common-window extraction, baseline/fitting/profile/report migration and cached-prefix integration remain later work. Partial-ID false success remains accepted and unfixed. Old artifact compatibility is absent; unreplaced replay and cached domain rules remain, while paired assessment was removed only after its defenses acquired new owners.
+C2 writes raw evidence and measurements; C3 now verifies complete cold/decode scopes and pins their sealed-attempt provenance. File digests alone do not establish plan/content/transport agreement: C3 checks both the indexed bytes and the cross-file identities and commands. Scope and source snapshots must be separate from the evolving execution index so later collection does not invalidate valid training inputs. C4 now extracts and validates common windows, gates sealing, and exposes pinned target statistics. C5 baseline/fitting and later profile/report/cached migrations remain the next steps. Partial-ID false success remains accepted and unfixed. Old artifact compatibility is absent; unreplaced replay and cached domain rules remain, while paired assessment was removed only after its defenses acquired new owners.
 
 ## C2 audit findings (2026-10-15)
 

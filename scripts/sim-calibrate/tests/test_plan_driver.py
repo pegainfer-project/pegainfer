@@ -25,8 +25,8 @@ def real_input(root: Path, endpoint: str, repeats=2, warmups=1):
     spec['variants']['target']['identity']['endpoint']=endpoint
     spec['variants']['target']['runtime']['cache']['policy']='off'
     spec['workload']['matrices']={'decode':{
-        'kind':'steady_decode','split':'train','concurrency':[2],'context_tokens':[8],
-        'surface_requests':[],'surface_kv_tokens':[],'output_tokens':4,
+        'kind':'steady_decode','split':'train','concurrency':[2],'num_ctx':[16],
+        'output_tokens':8,
         'warmup_repeats':warmups,'repeats':repeats,'arrival':{'mode':'fixed_batch'}}}
     path.write_text(json.dumps(spec))
     return compile_campaign(path),root/'artifacts'
@@ -48,7 +48,7 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([r['phase'] for r in rows],['warmup']*2+['measured']*4)
                 for row in rows:
                     self.assertEqual(row['first_event_token_count'],2)
-                    self.assertEqual(row['interval_token_counts'],[2])
+                    self.assertEqual(row['interval_token_counts'],[1]*6)
                     self.assertGreater(row['first_text_latency_ms'],row['ttft_ms'])
                     self.assertGreater(row['e2e_ms'],(row['last_token_timestamp']-row['actual_dispatch_timestamp'])*1000+10)
                 skipped=await run_campaign(root,variants=['target'],timeout=10)
@@ -69,7 +69,7 @@ class DriverTests(unittest.IsolatedAsyncioTestCase):
                     await run_campaign(root,variants=['target'],timeout=10)
 
     async def test_missing_ids_partial_usage_mismatch_and_recovery(self):
-        for mode,expected in [('no_ids','unsupported'),('drop','failed'),('bad_usage','failed'),('no_usage','sealed')]:
+        for mode,expected in [('burst','failed'),('no_ids','unsupported'),('drop','failed'),('bad_usage','failed'),('no_usage','sealed')]:
             with self.subTest(mode=mode),tempfile.TemporaryDirectory() as tmp:
                 async with DiagnosticEndpoint(mode) as upstream:
                     _,root=real_input(Path(tmp),upstream.url,repeats=1,warmups=0)
