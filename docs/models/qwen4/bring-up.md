@@ -70,7 +70,9 @@ The committed `config.json` (`pegainfer-qwen4/tests/frozen_config.json`) is the 
   `norm_topk_prob` is **absent from `config.json`** and comes from the upstream default
   (`true`, and it decides whether the router renormalizes its top-k), so it is modelled
   with that default: a port that reads only `config.json` silently drops the router
-  renormalization — this is #1068's mirror image. The other absent field, `seed`, only
+  renormalization — this is #1068's mirror image. The MoE block golden's host replay
+  (`pegainfer-qwen4/tests/moe_block_replay.rs`, device-free) prices that drop against the
+  reference: all 210 stored routing weights move, by up to 0.24 absolute. The other absent field, `seed`, only
   matters if the n-gram hash multipliers are recomputed instead of read from the
   checkpoint, so it is not modelled.
 - **Manifest** (`src/manifest/`, test only until slice B's loader calls it) — the tensor contract, ported from `pegainfer-gemma4/src/manifest/`: `schema.rs` derives it from `Config` and `validate.rs` classifies headers against it. It derives **exactly** the frozen text set, 1658 keys − 333 `model.visual.*` − 31 `mtp.*` = **1294 tensors**, with `lm_head.weight` the only one outside `model.language_model.`. Beyond the untied head, it differs from Gemma 4's in rank-3 shapes (the depthwise conv and two fused expert stacks per layer, which carry no `.weight` suffix) and in a mandatory skip set, because all 333 vision tensors share shard 1 with 16 text tensors. `tests/frozen_tensors.json` (148 KB, written by `tools/accuracy/dump_qwen4_frozen_tensors.py`) holds every shard header of the frozen revision, and `the_contract_is_the_frozen_checkpoint` checks all 1658 tensors against the contract.
