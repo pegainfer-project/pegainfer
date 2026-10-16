@@ -9,8 +9,6 @@ use half::bf16;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
-use pegainfer_kernels::ops::Dsv2LiteAttentionConfig;
-use pegainfer_kernels::ops::Dsv2LiteRopeScalingConfig;
 use pegainfer_kernels::ops::dsv2_lite_decode_attention_into;
 use pegainfer_kernels::ops::dsv2_lite_kv_norm_into;
 
@@ -24,6 +22,7 @@ use crate::attribution::DecodeAttributionProfile;
 use crate::device::activate;
 use crate::device::activate_graph_capture;
 use crate::device::graph_capture_activation_guard;
+use crate::device_kv::attention_config;
 use crate::host_ops::DecodeCache;
 use crate::model::DenseMlpForwardScratch;
 use crate::model::MlpWeights;
@@ -44,13 +43,15 @@ struct DecodeGraphProbeState {
     logits: HiddenStates,
     sample_values: CudaSlice<bf16>,
     sample_out: CudaSlice<i32>,
+    slot_ids: CudaSlice<i32>,
+    positions: CudaSlice<i32>,
     layers: Vec<LayerGraphScratch>,
     max_seq_len: usize,
 }
 
 struct LayerGraphScratch {
-    key_cache: CudaSlice<f32>,
-    value_cache: CudaSlice<f32>,
+    key_cache: CudaSlice<bf16>,
+    value_cache: CudaSlice<bf16>,
     normed: HiddenStates,
     q: HiddenStates,
     kv_a: HiddenStates,
@@ -189,8 +190,9 @@ impl DeepSeekV2LiteEp2Generator {
         let mut reference = DecodeGraphProbeState::new(self, max_seq_len, &prefill_cache)
             .context("initialize eager graph-safe probe state")?;
         reference.set_input_token(&self.rank0.ctx, first_token)?;
+        reference.set_position(&self.rank0.ctx, position)?;
         trace_graph_probe("run graph-safe eager reference step");
-        if let Err(err) = self.decode_graph_probe_step_kernels(position, &mut reference) {
+        if let Err(err) = self.decode_graph_probe_step_kernels(&mut reference) {
             report.failure_stage = "reference_failed";
             report.failure_summary = Some(format!("{err:#}"));
             return Err(err).context("run eager graph-safe decode probe step");
@@ -210,9 +212,9 @@ impl DeepSeekV2LiteEp2Generator {
         let mut captured = DecodeGraphProbeState::new(self, max_seq_len, &prefill_cache)
             .context("initialize captured graph probe state")?;
         captured.set_input_token(&self.rank0.ctx, first_token)?;
+        captured.set_position(&self.rank0.ctx, position)?;
         trace_graph_probe("capture graph-safe decode step");
-        let (graph0, graph1) = match self.capture_decode_graph_step(position, &mut captured, report)
-        {
+        let (graph0, graph1) = match self.capture_decode_graph_step(&mut captured, report) {
             Ok(graphs) => graphs,
             Err(err) => {
                 report.failure_stage = if report.captured {
@@ -311,7 +313,6 @@ impl DeepSeekV2LiteEp2Generator {
 
     fn capture_decode_graph_step(
         &self,
-        position: usize,
         state: &mut DecodeGraphProbeState,
         report: &mut FullDecodeGraphProbeReport,
     ) -> Result<(RawCudaGraph, RawCudaGraph)> {
@@ -326,7 +327,7 @@ impl DeepSeekV2LiteEp2Generator {
             begin_capture(self.rank1.ctx.stream.cu_stream(), "rank1")?;
             rank1_capture_started = true;
 
-            self.decode_graph_probe_step_kernels(position, state)?;
+            self.decode_graph_probe_step_kernels(state)?;
 
             activate_graph_capture(&self.rank0.ctx)?;
             let captured0 = end_capture(self.rank0.ctx.stream.cu_stream(), "rank0")?;
@@ -351,11 +352,7 @@ impl DeepSeekV2LiteEp2Generator {
         capture_result
     }
 
-    fn decode_graph_probe_step_kernels(
-        &self,
-        position: usize,
-        state: &mut DecodeGraphProbeState,
-    ) -> Result<()> {
+    fn decode_graph_probe_step_kernels(&self, state: &mut DecodeGraphProbeState) -> Result<()> {
         activate(&self.rank0.ctx)?;
         ops::embedding_batch(
             &self.rank0.ctx,
@@ -367,11 +364,12 @@ impl DeepSeekV2LiteEp2Generator {
         let mut current_is_a = true;
         for layer_idx in 0..self.rank0.layers.len() {
             let layer_scratch = &mut state.layers[layer_idx];
+            let metadata = (&state.slot_ids, &state.positions);
             if current_is_a {
                 self.decode_graph_layer_into(
                     layer_idx,
                     &state.hidden_a,
-                    position,
+                    metadata,
                     layer_scratch,
                     &mut state.hidden_b,
                     state.max_seq_len,
@@ -380,7 +378,7 @@ impl DeepSeekV2LiteEp2Generator {
                 self.decode_graph_layer_into(
                     layer_idx,
                     &state.hidden_b,
-                    position,
+                    metadata,
                     layer_scratch,
                     &mut state.hidden_a,
                     state.max_seq_len,
@@ -420,7 +418,7 @@ impl DeepSeekV2LiteEp2Generator {
         &self,
         layer_idx: usize,
         input: &HiddenStates,
-        position: usize,
+        (slot_ids, positions): (&CudaSlice<i32>, &CudaSlice<i32>),
         scratch: &mut LayerGraphScratch,
         out: &mut HiddenStates,
         max_seq_len: usize,
@@ -462,11 +460,13 @@ impl DeepSeekV2LiteEp2Generator {
         )?;
         dsv2_lite_decode_attention_into(
             &self.rank0.ctx,
-            self.attention_config(max_seq_len),
+            attention_config(&self.config, max_seq_len),
             &scratch.q,
             &scratch.kv_a,
             &scratch.kv_b,
-            position,
+            slot_ids,
+            positions,
+            1,
             &mut scratch.key_cache,
             &mut scratch.value_cache,
             &mut scratch.attn,
@@ -527,31 +527,6 @@ impl DeepSeekV2LiteEp2Generator {
             }
         }
     }
-
-    fn attention_config(&self, max_seq_len: usize) -> Dsv2LiteAttentionConfig {
-        Dsv2LiteAttentionConfig {
-            num_heads: self.config.num_attention_heads,
-            qk_nope_head_dim: self.config.qk_nope_head_dim,
-            qk_rope_head_dim: self.config.qk_rope_head_dim,
-            v_head_dim: self.config.v_head_dim,
-            kv_lora_rank: self.config.kv_lora_rank,
-            max_seq_len,
-            rms_norm_eps: self.config.rms_norm_eps,
-            rope_theta: self.config.rope_theta,
-            rope_scaling: self
-                .config
-                .rope_scaling
-                .as_ref()
-                .map(|rope| Dsv2LiteRopeScalingConfig {
-                    factor: rope.factor,
-                    mscale: rope.mscale,
-                    mscale_all_dim: rope.mscale_all_dim,
-                    beta_fast: rope.beta_fast as f32,
-                    beta_slow: rope.beta_slow as f32,
-                    original_max_position_embeddings: rope.original_max_position_embeddings,
-                }),
-        }
-    }
 }
 
 fn trace_graph_probe(stage: &str) {
@@ -581,6 +556,8 @@ impl DecodeGraphProbeState {
         let logits = HiddenStates::zeros(ctx, generator.config.vocab_size, 1)?;
         let sample_values = ctx.stream.alloc_zeros::<bf16>(1)?;
         let sample_out = ctx.stream.alloc_zeros::<i32>(1)?;
+        let slot_ids = ctx.stream.alloc_zeros::<i32>(1)?;
+        let positions = ctx.stream.alloc_zeros::<i32>(1)?;
 
         if let EpBackendRuntime::Nccl(nccl) = &generator.backend {
             nccl.prepare_graph_shape(ctx, &generator.rank1.ctx, generator.config.hidden_size, 1)?;
@@ -607,9 +584,24 @@ impl DecodeGraphProbeState {
             logits,
             sample_values,
             sample_out,
+            slot_ids,
+            positions,
             layers,
             max_seq_len,
         })
+    }
+
+    fn set_position(&mut self, ctx: &DeviceContext, position: usize) -> Result<()> {
+        activate(ctx)?;
+        ensure!(
+            position < self.max_seq_len,
+            "graph probe position {position} exceeds max_seq_len {}",
+            self.max_seq_len
+        );
+        ctx.stream
+            .memcpy_htod(&[i32::try_from(position)?], &mut self.positions)
+            .context("upload graph probe decode position")?;
+        ctx.sync()
     }
 
     fn set_input_token(&mut self, ctx: &DeviceContext, token: u32) -> Result<()> {
@@ -656,22 +648,25 @@ impl LayerGraphScratch {
         activate(ctx)?;
         let key_elems = max_seq_len * cfg.num_attention_heads * cfg.query_head_dim();
         let value_elems = max_seq_len * cfg.num_attention_heads * cfg.v_head_dim;
-        let mut key_cache = ctx.stream.alloc_zeros::<f32>(key_elems)?;
-        let mut value_cache = ctx.stream.alloc_zeros::<f32>(value_elems)?;
+        let mut key_cache = ctx.stream.alloc_zeros::<bf16>(key_elems)?;
+        let mut value_cache = ctx.stream.alloc_zeros::<bf16>(value_elems)?;
         ensure!(
             cache.keys().len() <= key_elems && cache.values().len() <= value_elems,
             "probe cache layer {layer_idx} exceeds device cache capacity"
         );
+        // Host cache values are bf16-representable, so the conversion is exact.
         if !cache.keys().is_empty() {
-            let mut dst = key_cache.slice_mut(0..cache.keys().len());
+            let keys: Vec<bf16> = cache.keys().iter().copied().map(bf16::from_f32).collect();
+            let mut dst = key_cache.slice_mut(0..keys.len());
             ctx.stream
-                .memcpy_htod(cache.keys(), &mut dst)
+                .memcpy_htod(&keys, &mut dst)
                 .context("upload graph probe key cache")?;
         }
         if !cache.values().is_empty() {
-            let mut dst = value_cache.slice_mut(0..cache.values().len());
+            let values: Vec<bf16> = cache.values().iter().copied().map(bf16::from_f32).collect();
+            let mut dst = value_cache.slice_mut(0..values.len());
             ctx.stream
-                .memcpy_htod(cache.values(), &mut dst)
+                .memcpy_htod(&values, &mut dst)
                 .context("upload graph probe value cache")?;
         }
 

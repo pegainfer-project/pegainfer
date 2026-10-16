@@ -6,10 +6,12 @@ use pegainfer_core::tensor::HiddenStates;
 
 use crate::Config;
 use crate::device::activate;
+use crate::device_kv::DeviceKvSlot;
 
 #[derive(Default)]
 pub(crate) struct DecodeCache {
     pub(crate) layers: Vec<LayerCache>,
+    pub(crate) device: Option<DeviceKvSlot>,
 }
 
 #[derive(Default)]
@@ -49,10 +51,14 @@ impl DecodeCache {
             layers: (0..config.num_hidden_layers)
                 .map(|_| LayerCache::default())
                 .collect(),
+            device: None,
         }
     }
 
     pub(crate) fn position(&self, config: &Config) -> Result<usize> {
+        if let Some(slot) = &self.device {
+            return Ok(slot.len());
+        }
         ensure!(
             self.layers.len() == config.num_hidden_layers,
             "decode cache layer count mismatch: cache={}, expected={}",
@@ -75,12 +81,14 @@ impl DecodeCache {
 
     pub(crate) fn clone_for_graph_probe(&self) -> Self {
         // Keep this explicit so serving hot paths do not get blanket cache cloning.
+        debug_assert!(self.device.is_none(), "graph probe clones host caches only");
         Self {
             layers: self
                 .layers
                 .iter()
                 .map(LayerCache::clone_for_graph_probe)
                 .collect(),
+            device: None,
         }
     }
 }
@@ -522,6 +530,7 @@ mod tests {
                 keys: vec![1.0, 2.0],
                 values: vec![3.0, 4.0],
             }],
+            device: None,
         };
 
         let cloned = cache.clone_for_graph_probe();

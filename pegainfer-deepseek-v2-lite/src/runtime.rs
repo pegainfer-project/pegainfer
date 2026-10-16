@@ -19,6 +19,7 @@ pub use types::GenerationResult;
 pub use types::GenerationStats;
 
 use crate::Config;
+use crate::device_kv::DeviceKvPool;
 use crate::model::DriverRankModel;
 use crate::model::ExpertRankModel;
 
@@ -26,6 +27,7 @@ pub struct DeepSeekV2LiteEp2Generator {
     device_ordinals: Vec<usize>,
     config: Config,
     device_routed_moe: Option<Mutex<moe::DeviceRoutedMoeRuntime>>,
+    device_kv: Option<Mutex<DeviceKvPool>>,
     rank0: DriverRankModel,
     rank1: ExpertRankModel,
     backend: EpBackendRuntime,

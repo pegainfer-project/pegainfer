@@ -8,9 +8,12 @@
 namespace {
 
 constexpr int kNormThreads = 256;
+// Squares live in dynamic shared memory; stay under the 48 KiB default.
+constexpr int kMaxNormDim = 8192;
 constexpr int kAttentionThreads = 256;
 constexpr int kMaxRopeDim = 128;
 constexpr int kMaxDecodeSeqLen = 4096;
+constexpr int kMaxQueryHeadDim = 256;
 
 __device__ __forceinline__ float bf16_round(float value) {
   return __bfloat162float(__float2bfloat16(value));
@@ -108,37 +111,32 @@ __global__ void kv_norm_kernel(
     int kv_a_rows,
     int seq_len,
     float eps) {
+  extern __shared__ float squares[];
   int token = blockIdx.x;
   int tid = threadIdx.x;
   if (token >= seq_len) return;
 
-  float sum = 0.0f;
+  const __nv_bfloat16 *row = kv_a + static_cast<size_t>(token) * kv_a_rows;
   for (int dim = tid; dim < kv_lora_rank; dim += blockDim.x) {
-    float value = __bfloat162float(kv_a[token * kv_a_rows + dim]);
-    sum += value * value;
+    float value = __bfloat162float(row[dim]);
+    squares[dim] = __fmul_rn(value, value);
   }
-  sum = warp_reduce_sum(sum);
-
-  __shared__ float warp_sums[8];
-  int lane = tid % WARP_SIZE;
-  int warp = tid / WARP_SIZE;
-  if (lane == 0) warp_sums[warp] = sum;
   __syncthreads();
 
   __shared__ float inv_rms;
   if (tid == 0) {
     float total = 0.0f;
-    int warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-    for (int i = 0; i < warps; ++i) total += warp_sums[i];
-    inv_rms = rsqrtf(total / static_cast<float>(kv_lora_rank) + eps);
+    for (int dim = 0; dim < kv_lora_rank; ++dim) total = __fadd_rn(total, squares[dim]);
+    float mean = __fdiv_rn(total, static_cast<float>(kv_lora_rank));
+    inv_rms = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(mean, eps)));
   }
   __syncthreads();
 
   for (int dim = tid; dim < kv_lora_rank; dim += blockDim.x) {
-    float value = __bfloat162float(kv_a[token * kv_a_rows + dim]);
-    float normalized = bf16_round(value * inv_rms);
-    float scaled = normalized * __bfloat162float(norm_weight[dim]);
-    compressed[token * kv_lora_rank + dim] = __float2bfloat16(scaled);
+    float value = __bfloat162float(row[dim]);
+    float normalized = bf16_round(__fmul_rn(value, inv_rms));
+    float scaled = __fmul_rn(normalized, __bfloat162float(norm_weight[dim]));
+    compressed[static_cast<size_t>(token) * kv_lora_rank + dim] = __float2bfloat16(scaled);
   }
 }
 
@@ -146,10 +144,11 @@ __global__ void decode_attention_kernel(
     const __nv_bfloat16 *__restrict__ q,
     const __nv_bfloat16 *__restrict__ kv_a,
     const __nv_bfloat16 *__restrict__ kv_b,
-    float *__restrict__ key_cache,
-    float *__restrict__ value_cache,
+    __nv_bfloat16 *__restrict__ key_cache,
+    __nv_bfloat16 *__restrict__ value_cache,
+    const int *__restrict__ slot_ids,
+    const int *__restrict__ positions,
     __nv_bfloat16 *__restrict__ out,
-    int position,
     int num_heads,
     int qk_nope_head_dim,
     int qk_rope_head_dim,
@@ -157,6 +156,7 @@ __global__ void decode_attention_kernel(
     int kv_lora_rank,
     int kv_a_rows,
     int kv_b_rows,
+    int num_slots,
     int max_seq_len,
     float rope_theta,
     float rope_factor,
@@ -167,60 +167,83 @@ __global__ void decode_attention_kernel(
     int rope_original_max_position_embeddings,
     int has_rope_scaling) {
   int head = blockIdx.x;
+  int row = blockIdx.y;
   int tid = threadIdx.x;
   if (head >= num_heads) return;
 
   int q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+  int q_rows = num_heads * q_head_dim;
   int kv_b_stride = qk_nope_head_dim + v_head_dim;
+  int out_rows = num_heads * v_head_dim;
+  int slot = slot_ids[row];
+  int position = positions[row];
+  if (slot < 0 || slot >= num_slots || position < 0 || position >= max_seq_len ||
+      position >= kMaxDecodeSeqLen) {
+    // Last line of defense; the host rejects bad rows before launch.
+    for (int dim = tid; dim < v_head_dim; dim += blockDim.x) {
+      out[static_cast<size_t>(row) * out_rows + head * v_head_dim + dim] =
+          __float2bfloat16(CUDART_NAN_F);
+    }
+    return;
+  }
   int kv_len = position + 1;
   float rope_scale = rope_mscale(has_rope_scaling, rope_factor, rope_mscale_arg,
                                  rope_mscale_all_dim);
 
+  const __nv_bfloat16 *row_q = q + static_cast<size_t>(row) * q_rows;
+  const __nv_bfloat16 *row_kv_a = kv_a + static_cast<size_t>(row) * kv_a_rows;
+  const __nv_bfloat16 *row_kv_b = kv_b + static_cast<size_t>(row) * kv_b_rows;
+  size_t key_token_stride = static_cast<size_t>(num_heads) * q_head_dim;
+  size_t value_token_stride = static_cast<size_t>(num_heads) * v_head_dim;
+  __nv_bfloat16 *slot_keys =
+      key_cache + static_cast<size_t>(slot) * max_seq_len * key_token_stride;
+  __nv_bfloat16 *slot_values =
+      value_cache + static_cast<size_t>(slot) * max_seq_len * value_token_stride;
+
+  __nv_bfloat16 *new_key = slot_keys + position * key_token_stride + head * q_head_dim;
+  __nv_bfloat16 *new_value =
+      slot_values + position * value_token_stride + head * v_head_dim;
+  int kv_b_base = head * kv_b_stride;
   for (int dim = tid; dim < qk_nope_head_dim; dim += blockDim.x) {
-    int q_base = head * q_head_dim;
-    int kv_b_base = head * kv_b_stride;
-    key_cache[(position * num_heads + head) * q_head_dim + dim] =
-        __bfloat162float(kv_b[kv_b_base + dim]);
-    // q nope is read directly from q during the score loop.
-    (void)q_base;
+    new_key[dim] = row_kv_b[kv_b_base + dim];
   }
   for (int dim = tid; dim < v_head_dim; dim += blockDim.x) {
-    int kv_b_base = head * kv_b_stride + qk_nope_head_dim;
-    value_cache[(position * num_heads + head) * v_head_dim + dim] =
-        __bfloat162float(kv_b[kv_b_base + dim]);
+    new_value[dim] = row_kv_b[kv_b_base + qk_nope_head_dim + dim];
   }
   for (int pair = tid; pair < qk_rope_head_dim / 2; pair += blockDim.x) {
-    int q_base = head * q_head_dim + qk_nope_head_dim;
-    float k0 = __bfloat162float(kv_a[kv_lora_rank + 2 * pair]);
-    float k1 = __bfloat162float(kv_a[kv_lora_rank + 2 * pair + 1]);
+    float k0 = __bfloat162float(row_kv_a[kv_lora_rank + 2 * pair]);
+    float k1 = __bfloat162float(row_kv_a[kv_lora_rank + 2 * pair + 1]);
     float k_out0;
     float k_out1;
     apply_rope_pair(k0, k1, pair, position, qk_rope_head_dim, rope_theta, has_rope_scaling,
                     rope_factor, rope_scale, rope_beta_fast, rope_beta_slow,
                     rope_original_max_position_embeddings, &k_out0, &k_out1);
-    int key_base = (position * num_heads + head) * q_head_dim + qk_nope_head_dim;
-    key_cache[key_base + pair] = k_out0;
-    key_cache[key_base + pair + qk_rope_head_dim / 2] = k_out1;
+    // apply_rope_pair rounds to bf16, so these stores are exact.
+    new_key[qk_nope_head_dim + pair] = __float2bfloat16(k_out0);
+    new_key[qk_nope_head_dim + pair + qk_rope_head_dim / 2] = __float2bfloat16(k_out1);
   }
-  __syncthreads();
 
   __shared__ float scores[kMaxDecodeSeqLen];
   __shared__ float denom;
   __shared__ float max_score;
-  __shared__ float query_rope[kMaxRopeDim];
+  __shared__ float query[kMaxQueryHeadDim];
 
+  for (int dim = tid; dim < qk_nope_head_dim; dim += blockDim.x) {
+    query[dim] = __bfloat162float(row_q[head * q_head_dim + dim]);
+  }
   for (int pair = tid; pair < qk_rope_head_dim / 2; pair += blockDim.x) {
     int q_base = head * q_head_dim + qk_nope_head_dim;
-    float q0 = __bfloat162float(q[q_base + 2 * pair]);
-    float q1 = __bfloat162float(q[q_base + 2 * pair + 1]);
+    float q0 = __bfloat162float(row_q[q_base + 2 * pair]);
+    float q1 = __bfloat162float(row_q[q_base + 2 * pair + 1]);
     float q_out0;
     float q_out1;
     apply_rope_pair(q0, q1, pair, position, qk_rope_head_dim, rope_theta, has_rope_scaling,
                     rope_factor, rope_scale, rope_beta_fast, rope_beta_slow,
                     rope_original_max_position_embeddings, &q_out0, &q_out1);
-    query_rope[pair] = q_out0;
-    query_rope[pair + qk_rope_head_dim / 2] = q_out1;
+    query[qk_nope_head_dim + pair] = q_out0;
+    query[qk_nope_head_dim + pair + qk_rope_head_dim / 2] = q_out1;
   }
+  // Orders this block's K/V append before the score and value loops read it.
   __syncthreads();
 
   float local_max = -CUDART_INF_F;
@@ -231,14 +254,10 @@ __global__ void decode_attention_kernel(
   }
 
   for (int pos = tid; pos < kv_len; pos += blockDim.x) {
+    const __nv_bfloat16 *key = slot_keys + pos * key_token_stride + head * q_head_dim;
     float dot = 0.0f;
-    int q_base = head * q_head_dim;
-    int k_base = (pos * num_heads + head) * q_head_dim;
-    for (int dim = 0; dim < qk_nope_head_dim; ++dim) {
-      dot += __bfloat162float(q[q_base + dim]) * key_cache[k_base + dim];
-    }
-    for (int dim = 0; dim < qk_rope_head_dim; ++dim) {
-      dot += query_rope[dim] * key_cache[k_base + qk_nope_head_dim + dim];
+    for (int dim = 0; dim < q_head_dim; ++dim) {
+      dot = __fadd_rn(dot, __fmul_rn(query[dim], __bfloat162float(key[dim])));
     }
     float score = bf16_round(bf16_round(dot) * scale);
     scores[pos] = score;
@@ -259,21 +278,14 @@ __global__ void decode_attention_kernel(
   }
   __syncthreads();
 
-  float local_sum = 0.0f;
   for (int pos = tid; pos < kv_len; pos += blockDim.x) {
-    float value = expf(scores[pos] - max_score);
-    scores[pos] = value;
-    local_sum += value;
+    scores[pos] = expf(scores[pos] - max_score);
   }
-  local_sum = warp_reduce_sum(local_sum);
-
-  __shared__ float warp_sum[8];
-  if (lane == 0) warp_sum[warp] = local_sum;
   __syncthreads();
   if (tid == 0) {
+    // Sequential sum in position order, as the host softmax does.
     float value = 0.0f;
-    int warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-    for (int i = 0; i < warps; ++i) value += warp_sum[i];
+    for (int pos = 0; pos < kv_len; ++pos) value = __fadd_rn(value, scores[pos]);
     denom = value;
   }
   __syncthreads();
@@ -283,15 +295,12 @@ __global__ void decode_attention_kernel(
     for (int pos = 0; pos < kv_len; ++pos) {
       float prob = denom > 0.0f ? scores[pos] / denom : 0.0f;
       prob = bf16_round(prob);
-      int v_base = (pos * num_heads + head) * v_head_dim;
-      acc += prob * value_cache[v_base + dim];
+      float value = __bfloat162float(slot_values[pos * value_token_stride +
+                                                 head * v_head_dim + dim]);
+      acc = __fadd_rn(acc, __fmul_rn(prob, value));
     }
-    out[head * v_head_dim + dim] = __float2bfloat16(acc);
+    out[static_cast<size_t>(row) * out_rows + head * v_head_dim + dim] = __float2bfloat16(acc);
   }
-
-  (void)kv_a_rows;
-  (void)kv_b_rows;
-  (void)max_seq_len;
 }
 
 CUresult consume_last_cuda_error() {
@@ -315,11 +324,13 @@ CUresult dsv2_lite_kv_norm_cuda(
   if (kv_a == nullptr || norm_weight == nullptr || compressed == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  if (kv_lora_rank <= 0 || kv_a_rows < kv_lora_rank || seq_len <= 0) {
+  if (kv_lora_rank <= 0 || kv_lora_rank > kMaxNormDim || kv_a_rows < kv_lora_rank ||
+      seq_len <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   cudaGetLastError();
-  kv_norm_kernel<<<seq_len, kNormThreads, 0, stream>>>(
+  size_t shared_bytes = static_cast<size_t>(kv_lora_rank) * sizeof(float);
+  kv_norm_kernel<<<seq_len, kNormThreads, shared_bytes, stream>>>(
       kv_a, norm_weight, compressed, kv_lora_rank, kv_a_rows, seq_len, eps);
   return consume_last_cuda_error();
 }
@@ -328,10 +339,12 @@ CUresult dsv2_lite_decode_attention_cuda(
     const __nv_bfloat16 *q,
     const __nv_bfloat16 *kv_a,
     const __nv_bfloat16 *kv_b,
-    float *key_cache,
-    float *value_cache,
+    __nv_bfloat16 *key_cache,
+    __nv_bfloat16 *value_cache,
+    const int *slot_ids,
+    const int *positions,
     __nv_bfloat16 *out,
-    int position,
+    int batch,
     int num_heads,
     int qk_nope_head_dim,
     int qk_rope_head_dim,
@@ -339,6 +352,7 @@ CUresult dsv2_lite_decode_attention_cuda(
     int kv_lora_rank,
     int kv_a_rows,
     int kv_b_rows,
+    int num_slots,
     int max_seq_len,
     float rope_theta,
     float rope_factor,
@@ -350,23 +364,25 @@ CUresult dsv2_lite_decode_attention_cuda(
     int has_rope_scaling,
     cudaStream_t stream) {
   if (q == nullptr || kv_a == nullptr || kv_b == nullptr || key_cache == nullptr ||
-      value_cache == nullptr || out == nullptr) {
+      value_cache == nullptr || slot_ids == nullptr || positions == nullptr || out == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  if (position < 0 || position >= max_seq_len || num_heads <= 0 || qk_nope_head_dim <= 0 ||
-      qk_rope_head_dim <= 0 || (qk_rope_head_dim % 2) != 0 ||
-      qk_rope_head_dim > kMaxRopeDim || v_head_dim <= 0 || kv_lora_rank <= 0 ||
-      max_seq_len <= 0 || position + 1 > kMaxDecodeSeqLen ||
-      kv_a_rows < kv_lora_rank + qk_rope_head_dim ||
+  if (batch <= 0 || num_heads <= 0 || qk_nope_head_dim <= 0 || qk_rope_head_dim <= 0 ||
+      (qk_rope_head_dim % 2) != 0 || qk_rope_head_dim > kMaxRopeDim ||
+      qk_nope_head_dim + qk_rope_head_dim > kMaxQueryHeadDim || v_head_dim <= 0 ||
+      kv_lora_rank <= 0 || num_slots <= 0 || max_seq_len <= 0 ||
+      max_seq_len > kMaxDecodeSeqLen || kv_a_rows < kv_lora_rank + qk_rope_head_dim ||
       kv_b_rows < num_heads * (qk_nope_head_dim + v_head_dim)) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   cudaGetLastError();
-  decode_attention_kernel<<<num_heads, kAttentionThreads, 0, stream>>>(
-      q, kv_a, kv_b, key_cache, value_cache, out, position, num_heads, qk_nope_head_dim,
-      qk_rope_head_dim, v_head_dim, kv_lora_rank, kv_a_rows, kv_b_rows, max_seq_len,
-      rope_theta, rope_factor, rope_mscale, rope_mscale_all_dim, rope_beta_fast,
-      rope_beta_slow, rope_original_max_position_embeddings, has_rope_scaling);
+  dim3 grid(num_heads, batch);
+  decode_attention_kernel<<<grid, kAttentionThreads, 0, stream>>>(
+      q, kv_a, kv_b, key_cache, value_cache, slot_ids, positions, out, num_heads,
+      qk_nope_head_dim, qk_rope_head_dim, v_head_dim, kv_lora_rank, kv_a_rows, kv_b_rows,
+      num_slots, max_seq_len, rope_theta, rope_factor, rope_mscale, rope_mscale_all_dim,
+      rope_beta_fast, rope_beta_slow, rope_original_max_position_embeddings,
+      has_rope_scaling);
   return consume_last_cuda_error();
 }
 
