@@ -250,6 +250,14 @@ pub use qwen35::paged_attention_batch_decode_split_hd256_into;
 pub use qwen35::paged_attention_batch_decode_via_prefill_hd256_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::qk_norm_partial_rope_batched_decode_hd256_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::PleBlockGeometry;
+#[cfg(feature = "qwen4")]
+pub use qwen4::PleBlockVariant;
+#[cfg(feature = "qwen4")]
+pub use qwen4::ple_block_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::ple_block_variant_into;
 pub use sampling::BatchSamplingRow;
 pub use sampling::BatchSamplingScratch;
 pub use sampling::argmax;
