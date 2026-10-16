@@ -30,6 +30,25 @@
 //!
 //!   cargo test --release -p pegainfer-kernels --features qwen4 \
 //!     --test qwen38fn_ple_block_parity -- --nocapture
+//!
+//! **What this fixture cannot reach**, recorded rather than papered over:
+//!
+//! - The gate's `clamp_min(1e-6)` floor and its `sign(0)` branch are both inert
+//!   here: the smallest `|pre_gate|` either case produces is 0.0232, five orders
+//!   above the floor, so no gate is clamped and none is exactly zero, and a wrong
+//!   floor constant would pass. Both are transcribed from the reference's own
+//!   `abs().clamp_min(1e-6).sqrt() * sign()`, and the host oracle in
+//!   `pegainfer-qwen4` carries the same two branches with the same non-exercise.
+//! - Row counts are 8 and 12, the fixture's own. `seq_len` 0 is pinned only as a
+//!   guard (the zero-extent positive controls below, which form no launch), and
+//!   `seq_len` 1 — where every conv tap but the last reads the zero state — is
+//!   compared against nothing, because the golden records no such case and the
+//!   fixture is committed.
+//! - The ops layer's own extent guards (`hidden.len()`, `workspace.len()` and the
+//!   rest) are not exercised: they run before any pointer is formed but after a
+//!   `CudaSlice` exists, so reaching one needs a device and a deliberately short
+//!   buffer. The entry points' guards — the ones that stand between a caller and
+//!   an out-of-bounds read — are covered below.
 
 #![cfg(feature = "qwen4")]
 
@@ -410,19 +429,25 @@ fn check_case(
     let mut over_1e4 = 0usize;
     let mut worst = (0usize, 0usize, 0.0f32, 0.0f32);
     for (i, (x, want)) in got.iter().zip(&case.reference).enumerate() {
-        assert!(
-            x.to_bits() != SENTINEL.to_bits(),
-            "case {}: element {i} (row {}, channel {}) still holds the sentinel, so the \
-             conv pass did not write the whole stream",
-            case.index,
-            i / width,
-            i % width
-        );
         let g = x.to_f32();
         let w = want.to_f32();
+        // Finiteness first: the sentinel is a NaN, so a NaN the kernels
+        // *produced* would otherwise be reported as an unwritten element.
         assert!(
-            g.is_finite() && w.is_finite(),
-            "case {}: element {i}",
+            g.is_finite(),
+            "case {}: element {i} (row {}, channel {}) came back {}",
+            case.index,
+            i / width,
+            i % width,
+            if x.to_bits() == SENTINEL.to_bits() {
+                "still holding the sentinel, so the conv pass did not write the whole stream"
+            } else {
+                "non-finite"
+            }
+        );
+        assert!(
+            w.is_finite(),
+            "case {}: the golden's element {i} is not finite",
             case.index
         );
         let delta = (g - w).abs();
@@ -644,6 +669,24 @@ fn the_entry_points_refuse_a_geometry_they_were_not_compiled_for() {
             }) as i32,
         ),
         (
+            "a gate over a branch count that is not the compiled 4",
+            (unsafe {
+                gate(
+                    half,
+                    half,
+                    half,
+                    half.cast_mut(),
+                    0,
+                    2560,
+                    2,
+                    2560,
+                    sqrt_hidden,
+                    1,
+                    null_stream,
+                )
+            }) as i32,
+        ),
+        (
             "a gate whose span is neither the group nor the stream",
             (unsafe {
                 gate(
@@ -714,6 +757,40 @@ fn the_entry_points_refuse_a_geometry_they_were_not_compiled_for() {
                     2560,
                     f32::NAN,
                     1,
+                    null_stream,
+                )
+            }) as i32,
+        ),
+        (
+            "a conv over a group that is not the compiled 2560 wide",
+            (unsafe {
+                conv(
+                    half,
+                    half,
+                    half,
+                    half.cast_mut(),
+                    0,
+                    1280,
+                    4,
+                    4,
+                    3,
+                    null_stream,
+                )
+            }) as i32,
+        ),
+        (
+            "a conv over a branch count that is not the compiled 4",
+            (unsafe {
+                conv(
+                    half,
+                    half,
+                    half,
+                    half.cast_mut(),
+                    0,
+                    2560,
+                    2,
+                    4,
+                    3,
                     null_stream,
                 )
             }) as i32,
