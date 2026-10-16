@@ -33,12 +33,13 @@
 //   * The dot is per BRANCH (2560), not per stream (10240). One gate per
 //     branch, and all four branches then scale the SAME `value` row.
 //
-// Both grouped norms are the existing batched `(1 + w)` RMSNorm entry point,
+// All three grouped norms are the existing batched `(1 + w)` RMSNorm entry point,
 // `rms_norm_batched_offset_cuda`, called once per branch from the Rust ops layer:
 // it normalizes `seq_len` contiguous rows of `hidden_dim`, and this stream's
 // branches are interleaved row-major, so the ops layer splits into branch-major
 // scratch first (kernel 1) and the norms then run on contiguous rows. That split
-// is what the first kernel below is for.
+// is what the first kernel below is for, and it is why the block's three grouped
+// norms cost twelve launches rather than three.
 //
 // Target: the sm_89-first portable subset — no TMA, no cluster, no wgmma. All
 // three kernels are SIMT: two are element-wise copies/maps and the third is a
@@ -48,9 +49,11 @@
 // Negative-control surface: `gate_span` and `signed_sqrt` are arguments rather
 // than compiled constants so the parity gate can turn exactly one knob on the
 // device path — a full-stream dot, or an unsigned sqrt — and assert the output
-// leaves its bound. `dilation` is genuine geometry (`ngram_size`), and the gate
-// drives it to 1 for the same reason. Production callers pass the reference
-// values; `ops::ple_block_into` is the only caller and hard-codes them.
+// leaves its bound. `dilation` is genuine geometry (`ngram_size`), and the parity
+// gate drives it to 1 for the same reason. A serving path reaches none of them:
+// `ops::ple_block_into` is the production entry and passes the reference values,
+// and only `ops::ple_block_variant_into` — whose sole callers are the gate's
+// three controls — turns a knob.
 
 #include "../common.cuh"
 #include "../shared/ffi_guard.cuh"

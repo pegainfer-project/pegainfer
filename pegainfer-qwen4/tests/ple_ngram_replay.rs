@@ -470,9 +470,9 @@ impl Block {
 ///   order's fold against them.
 ///
 /// The (slot, order) nesting below is the only part of the production `ids` this
-/// re-derives; the padded history, the window, the fold and the per-head
-/// remainder are the production functions, so a control that stopped exercising
-/// them would fail the exact test first.
+/// re-derives; the padded history, the window, the fold, the (order, head) table
+/// index and the per-head remainder are the production functions, so a control
+/// that stopped exercising them would fail the exact test first.
 fn hashed_ids(fx: &Fixture, input_ids: &[i64], controls: Controls) -> Vec<i64> {
     let hasher = &fx.hasher;
     let history = hasher.padded_history(input_ids);
@@ -496,9 +496,8 @@ fn hashed_ids(fx: &Fixture, input_ids: &[i64], controls: Controls) -> Vec<i64> {
         for row in 0..input_ids.len() {
             let mixed = hasher.fold(&windows, row + hasher.context(), order);
             for head in 0..heads_per_ngram {
-                let table_head = (order - 2) * heads_per_ngram + head;
                 ids[row * total_heads + slot * heads_per_ngram + head] =
-                    hasher.head_id(mixed, table_head);
+                    hasher.head_id(mixed, hasher.table_head_of(order, head));
             }
         }
     }

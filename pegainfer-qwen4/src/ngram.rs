@@ -86,9 +86,11 @@ impl NgramHasher {
     ///
     /// If the vectors are not the lengths the head layout implies, if any
     /// multiplier is not positive, if any head modulus is not at least 2 (a
-    /// modulus of 1 hashes every token to one row, and 0 does not divide), or if
-    /// any offset is negative or overflows its modulus into the next head's
-    /// range.
+    /// modulus of 1 hashes every token to one row, and 0 does not divide), if any
+    /// offset is negative, or if a head's `offset + modulus` overflows i64 — the
+    /// table row count is a sum of these, so an overflowing range is a table that
+    /// cannot be sized. Contiguity of the offsets is *not* checked here: that is a
+    /// property of the table the config derives, not of the hash.
     pub fn new(
         eos_token_id: i64,
         layer_multipliers: Vec<i64>,
@@ -152,14 +154,10 @@ impl NgramHasher {
         self.eos_token_id
     }
 
-    /// `ngram_size`: the widest n-gram, and the number of context positions a
-    /// multiplier covers.
-    pub fn ngram_size(&self) -> usize {
-        self.layer_multipliers.len()
-    }
-
-    /// `ngram_size - 1`: the number of order blocks, and of warm-up rows the
-    /// history is padded with.
+    /// `ngram_size - 1`: the number of order blocks in a row of
+    /// [`ids`](Self::ids), and — the same number, which is why
+    /// [`context`](Self::context) exists rather than a second derivation — of
+    /// warm-up rows the history is padded with.
     pub fn orders(&self) -> usize {
         self.layer_multipliers.len() - 1
     }
@@ -175,24 +173,9 @@ impl NgramHasher {
     }
 
     /// Warm-up rows the history is padded with: one per context token an
-    /// n-gram's window can reach back over.
+    /// n-gram's window can reach back over. Always [`orders`](Self::orders).
     pub fn context(&self) -> usize {
         self.orders()
-    }
-
-    /// The per-position multipliers, as given.
-    pub fn layer_multipliers(&self) -> &[i64] {
-        &self.layer_multipliers
-    }
-
-    /// The per-head prime moduli, in (order, head) layout.
-    pub fn head_vocab_sizes(&self) -> &[i64] {
-        &self.head_vocab_sizes
-    }
-
-    /// The per-head table offsets, in (order, head) layout.
-    pub fn head_offsets(&self) -> &[i64] {
-        &self.head_offsets
     }
 
     /// The order an output column's block carries: slot 0 is the bigram, slot 1
@@ -201,11 +184,15 @@ impl NgramHasher {
         slot + 2
     }
 
-    /// The table head a (slot, head) pair's modulus and offset belong to. Equal
-    /// to the output column `slot * heads_per_ngram + head`, because the layout
-    /// is order-major over the same head run the per-head vectors are stored in.
-    pub fn table_head_of(&self, slot: usize, head: usize) -> usize {
-        (self.order_of_slot(slot) - 2) * self.heads_per_ngram + head
+    /// The table head an (order, head) pair's modulus and offset belong to.
+    ///
+    /// Under the reference's order-major layout this is also the *output column*
+    /// the id lands in, `slot * heads_per_ngram + head` for `slot = order - 2`.
+    /// That identity is worth stating because it is what makes a transposed
+    /// (head, order) layout silently wrong: every id still names a real table
+    /// row, so nothing goes out of range and only a value comparison catches it.
+    pub fn table_head_of(&self, order: usize, head: usize) -> usize {
+        (order - 2) * self.heads_per_ngram + head
     }
 
     /// The history a whole-sequence forward hashes: [`context`](Self::context)
@@ -291,7 +278,7 @@ impl NgramHasher {
     /// is [`shifted_context`](Self::shifted_context) at shift `k`, for `k` in
     /// 0..`ngram_size`.
     pub fn windows(&self, history: &[i64], segment_starts: &[usize]) -> Vec<Vec<i64>> {
-        (0..self.ngram_size())
+        (0..self.layer_multipliers.len())
             .map(|shift| self.shifted_context(history, shift, segment_starts))
             .collect()
     }
@@ -363,7 +350,7 @@ impl NgramHasher {
                 let mixed = self.fold(&windows, row + self.context(), order);
                 for head in 0..self.heads_per_ngram {
                     id_row[slot * self.heads_per_ngram + head] =
-                        self.head_id(mixed, self.table_head_of(slot, head));
+                        self.head_id(mixed, self.table_head_of(order, head));
                 }
             }
         }
