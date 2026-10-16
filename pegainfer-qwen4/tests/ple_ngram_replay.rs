@@ -6,17 +6,25 @@
 //! `tools/accuracy/dump_qwen38fn_ple_golden.py`, at the frozen checkpoint's real
 //! geometry. This gate replays it with integer and f32/f64 host math only — no
 //! CUDA, no weights, no Python — so the two things a PLE implementation can get
-//! wrong are pinned before the kernel that will need them exists:
+//! wrong are pinned here and on the device:
 //!
 //! 1. **The n-gram hash, exactly.** `ngram_ids` is recomputed from `input_ids`
-//!    and compared with i64 equality, zero tolerance. It is pure integer math,
-//!    so any deviation is a bug and not noise: the EOS-resetting context window,
-//!    the bigram/trigram head layout (16 heads = 2 orders x 8) and the per-head
-//!    mul-xor fold all have to be right for a single id to land.
+//!    by [`pegainfer_qwen4::ngram::NgramHasher`], the production host module the
+//!    device-side table gather addresses through, and compared with i64
+//!    equality at zero tolerance. It is pure integer math, so any deviation is a
+//!    bug and not noise: the EOS-resetting context window, the bigram/trigram
+//!    head layout (16 heads = 2 orders x 8) and the per-head mul-xor fold all
+//!    have to be right for a single id to land.
 //! 2. **The PLE block, to the bf16 noise floor.** `out` is recomputed from the
 //!    stored `hidden`/`key`/`value` (the block's inputs, recorded past the
 //!    projections that the 95 GiB n-gram table feeds) and compared against the
-//!    stored block output within [`OUT_MAX_ABS`].
+//!    stored block output within [`OUT_MAX_ABS`]. The replay below is a CPU
+//!    oracle, deliberately kept test-local: it is bit-identical to the stored
+//!    `out`, which is what makes it the cross-check for the device kernels that
+//!    compute the same block in
+//!    `pegainfer-kernels/csrc/qwen38fn/qwen38fn_ple_block.cu` (gated by
+//!    `pegainfer-kernels/tests/qwen38fn_ple_block_parity.rs`, behind that
+//!    crate's `qwen4` feature).
 //!
 //! Provenance is checked on every load, never skipped: the `qwen4_ple_golden`
 //! manifest must parse, carry `format_version` 2, and name
@@ -35,12 +43,13 @@
 //! the EOS window reset, dilation 1 instead of `ngram_size`, an unsigned sqrt on
 //! the gate, and a swapped bigram/trigram head order.
 //!
-//! Still ungated here (both land with the device-side PLE work in #1106): the
-//! n-gram table lookup/gather that turns `ngram_ids` into the 160-dim head
-//! vectors, and the GPU dilated depthwise conv. This gate pins the hash that
-//! addresses the table and the arithmetic around the conv, on the host.
+//! Still ungated here: the n-gram table lookup/gather that turns `ngram_ids`
+//! into the 160-dim head vectors, which needs the 95 GiB table's loader
+//! (#1106), and the decode-side states (the 2-token id window and the 9-slot
+//! conv state), since the recording is whole-sequence.
 
 use half::bf16;
+use pegainfer_qwen4::ngram::NgramHasher;
 use safetensors::Dtype;
 use safetensors::SafeTensors;
 use serde_json::Value;
@@ -162,12 +171,10 @@ impl Case {
 /// file bytes).
 struct Fixture {
     geo: Geometry,
-    eos: i64,
-    /// One odd multiplier per context position, XOR-folded into the hash.
-    multipliers: Vec<i64>,
-    /// Per-head prime modulus, then per-head base offset into the n-gram table.
-    head_vocab: Vec<i64>,
-    head_offsets: Vec<i64>,
+    /// The production hash, built from the fixture's own scalars and per-head
+    /// vectors. It carries the EOS id, the multipliers and both head runs, so
+    /// nothing else here needs a copy of them.
+    hasher: NgramHasher,
     norm_key: Vec<bf16>,
     norm_query: Vec<bf16>,
     norm_conv: Vec<bf16>,
@@ -261,12 +268,20 @@ impl Fixture {
         let width = geo.width();
         let conv1d = bf16_tensor(&st, "conv1d_weight", geo.conv_kernel);
         let cases = load_cases(&st, &geo);
-        Fixture {
-            geo,
-            eos: eos[0],
+        // `NgramHasher::new` validates lengths, multiplier positivity and each
+        // head's modulus/offset; the fixture's own run shape is checked above,
+        // because that is a fact about the dump rather than about the hasher.
+        let hasher = NgramHasher::new(
+            eos[0],
             multipliers,
             head_vocab,
             head_offsets,
+            geo.heads_per_ngram,
+        )
+        .expect("the fixture's n-gram vectors must build a hasher");
+        Fixture {
+            geo,
+            hasher,
             norm_key: bf16_tensor(&st, "norm_key", width),
             norm_query: bf16_tensor(&st, "norm_query", width),
             norm_conv: bf16_tensor(&st, "norm_conv", width),
@@ -403,7 +418,7 @@ fn i32_tensor(st: &SafeTensors<'_>, name: &str) -> (Vec<i32>, Vec<usize>) {
 
 /// Knobs the negative controls turn. The defaults are the reference behaviour.
 #[derive(Clone, Copy)]
-struct Hash {
+struct Controls {
     /// `_shift_right_ignore_eos`' cummax segment reset: n-grams never cross an
     /// EOS boundary. Off = one window for the whole history.
     eos_reset: bool,
@@ -411,7 +426,7 @@ struct Hash {
     bigram_first: bool,
 }
 
-impl Hash {
+impl Controls {
     fn reference() -> Self {
         Self {
             eos_reset: true,
@@ -437,95 +452,53 @@ impl Block {
     }
 }
 
-/// The reference's `_shift_right_ignore_eos` on one sequence: the token `shift`
-/// positions back, or `eos` where the segment does not reach that far.
+/// Recompute `ngram_ids` — `[seq_len, heads]` flattened, row-major — from the
+/// production hasher's own primitives, with the two controls applied.
 ///
-/// `eos_reset` reproduces the cummax over EOS positions that makes
-/// `segment_start` the position after the last EOS at or before `p`, so a window
-/// never pulls a token from across a segment boundary.
-fn shift_right_ignore_eos(history: &[i64], shift: usize, eos: i64, eos_reset: bool) -> Vec<i64> {
-    if shift == 0 {
-        return history.to_vec();
-    }
-    // `previous_eos_inclusive[p]`: the last index <= p holding EOS, or -1.
-    let mut previous_inclusive = vec![-1i64; history.len()];
-    let mut running = -1i64;
-    for (p, &token) in history.iter().enumerate() {
-        if token == eos {
-            running = p as i64;
-        }
-        previous_inclusive[p] = running;
-    }
-    (0..history.len())
-        .map(|p| {
-            let source = p as i64 - shift as i64;
-            // `previous_eos` excludes p itself: an EOS token starts the *next*
-            // segment, it does not belong to the one it closes.
-            let previous_eos = if p == 0 {
-                -1
-            } else {
-                previous_inclusive[p - 1]
-            };
-            let in_segment = if eos_reset {
-                p as i64 - (previous_eos + 1)
-            } else {
-                p as i64
-            };
-            if in_segment >= shift as i64 && source >= 0 {
-                history[source as usize]
-            } else {
-                eos
-            }
-        })
-        .collect()
-}
-
-/// Recompute `ngram_ids`: `[seq_len, heads]` flattened, row-major.
+/// At [`Controls::reference`] this is [`NgramHasher::ids`] element for element,
+/// which `the_ngram_hash_replays_exactly` asserts rather than assumes, so the
+/// helper cannot drift away from the production path and still look like a
+/// control. Each knob turns exactly one piece of the reference's semantics:
 ///
-/// Port of `Qwen4ExpTextNGramEmbedding.forward`. The history is the `ngram_size -
-/// 1` EOS-padded context tokens followed by the sequence (a full-sequence
-/// forward has no cache state); each order XOR-folds `token * multiplier` over
-/// its window, then every head reduces that fold modulo its own prime and adds
-/// its own table offset. The reference drops the warm-up rows and concatenates
-/// the per-order head blocks, bigram first.
-fn ngram_ids(fx: &Fixture, input_ids: &[i64], knobs: Hash) -> Vec<i64> {
-    let geo = &fx.geo;
-    let context = geo.ngram_size - 1;
-    let heads = geo.heads_per_ngram;
-    let total_heads = geo.heads();
-    let mut history = vec![fx.eos; context];
-    history.extend_from_slice(input_ids);
-    let shifted: Vec<Vec<i64>> = (0..geo.ngram_size)
-        .map(|shift| shift_right_ignore_eos(&history, shift, fx.eos, knobs.eos_reset))
-        .collect();
-
-    let mut ids = vec![0i64; input_ids.len() * total_heads];
-    let orders: Vec<usize> = if knobs.bigram_first {
-        (2..=geo.ngram_size).collect()
+/// - `eos_reset: false` hands `shifted_context` a segment start of 0 at every
+///   position. That is the cummax replaced by nothing: every window reads its
+///   full `shift` back, across any EOS boundary. It is data rather than a second
+///   windowing function because the segment start *is* the reset — the primitive
+///   takes it as an argument precisely so a resumed decode can carry its own.
+/// - `bigram_first: false` walks the order blocks in reverse, so each slot's
+///   column keeps its own head's modulus and offset but reduces the other
+///   order's fold against them.
+///
+/// The (slot, order) nesting below is the only part of the production `ids` this
+/// re-derives; the padded history, the window, the fold and the per-head
+/// remainder are the production functions, so a control that stopped exercising
+/// them would fail the exact test first.
+fn hashed_ids(fx: &Fixture, input_ids: &[i64], controls: Controls) -> Vec<i64> {
+    let hasher = &fx.hasher;
+    let history = hasher.padded_history(input_ids);
+    let starts = if controls.eos_reset {
+        hasher.segment_starts(&history)
     } else {
-        (2..=geo.ngram_size).rev().collect()
+        vec![0; history.len()]
     };
-    for (slot, &order) in orders.iter().enumerate() {
-        // Heads `[slot * heads, (slot + 1) * heads)` carry this order; the head's
-        // own prime and offset come from the order-independent stored buffers.
-        let base_head = (order - 2) * heads;
+    let owned = hasher.windows(&history, &starts);
+    let windows: Vec<&[i64]> = owned.iter().map(Vec::as_slice).collect();
+    let heads_per_ngram = hasher.heads_per_ngram();
+    let orders = hasher.orders();
+    let total_heads = hasher.heads();
+    let mut ids = vec![0i64; input_ids.len() * total_heads];
+    for slot in 0..orders {
+        let order = if controls.bigram_first {
+            hasher.order_of_slot(slot)
+        } else {
+            hasher.order_of_slot(orders - 1 - slot)
+        };
         for row in 0..input_ids.len() {
-            let p = row + context;
-            // Every `token * multiplier` is non-negative — the reference bounds
-            // each multiplier by `(2^63 - 1) / vocab_size` so the product cannot
-            // overflow — and an XOR of non-negative i64s keeps the sign bit clear,
-            // so the fold is never negative (measured: 0 of 40 folds). The
-            // wrapping multiply is faithful rather than load-bearing.
-            let mut mixed = shifted[0][p].wrapping_mul(fx.multipliers[0]);
-            for (position, window) in shifted.iter().enumerate().take(order).skip(1) {
-                mixed ^= window[p].wrapping_mul(fx.multipliers[position]);
-            }
-            for head in 0..heads {
-                let table_head = base_head + head;
-                // `rem_euclid`, not `%`: `torch.remainder` is a floored remainder,
-                // which only differs from Rust's truncated one on a negative fold.
-                let bucket = mixed.rem_euclid(fx.head_vocab[table_head]);
-                ids[row * total_heads + slot * heads + head] = bucket + fx.head_offsets[table_head];
+            let mixed = hasher.fold(&windows, row + hasher.context(), order);
+            for head in 0..heads_per_ngram {
+                let table_head = (order - 2) * heads_per_ngram + head;
+                ids[row * total_heads + slot * heads_per_ngram + head] =
+                    hasher.head_id(mixed, table_head);
             }
         }
     }
@@ -690,7 +663,16 @@ fn eos_positions(case: &Case, eos: i64) -> Vec<usize> {
 fn the_ngram_hash_replays_exactly() {
     let fx = Fixture::load();
     for case in &fx.cases {
-        let got = ngram_ids(&fx, &case.input_ids, Hash::reference());
+        let got = fx.hasher.ids(&case.input_ids);
+        // The controls' composition helper must be the production path at the
+        // reference settings, or a control would be measuring its own copy of
+        // the hash rather than the one this test pins.
+        assert_eq!(
+            hashed_ids(&fx, &case.input_ids, Controls::reference()),
+            got,
+            "{}: the control helper is not the production hash at the reference settings",
+            case.name
+        );
         let mismatched = got
             .iter()
             .zip(&case.ngram_ids)
@@ -700,7 +682,7 @@ fn the_ngram_hash_replays_exactly() {
             "{}: S={} eos_at={:?} heads={} ids={}/{} exact",
             case.name,
             case.seq_len(),
-            eos_positions(case, fx.eos),
+            eos_positions(case, fx.hasher.eos_token_id()),
             fx.geo.heads(),
             case.ngram_ids.len() - mismatched,
             case.ngram_ids.len()
@@ -758,14 +740,14 @@ fn the_ple_block_replays_within_the_bf16_noise_floor() {
 #[test]
 fn dropping_the_eos_window_reset_breaks_the_eos_case() {
     let fx = Fixture::load();
-    let knobs = Hash {
+    let controls = Controls {
         eos_reset: false,
-        ..Hash::reference()
+        ..Controls::reference()
     };
     let mut broke = 0;
     for case in &fx.cases {
-        let positions = eos_positions(case, fx.eos);
-        let got = ngram_ids(&fx, &case.input_ids, knobs);
+        let positions = eos_positions(case, fx.hasher.eos_token_id());
+        let got = hashed_ids(&fx, &case.input_ids, controls);
         let mismatched = got
             .iter()
             .zip(&case.ngram_ids)
@@ -807,12 +789,12 @@ fn dropping_the_eos_window_reset_breaks_the_eos_case() {
 #[test]
 fn swapping_the_bigram_and_trigram_heads_breaks_the_hash() {
     let fx = Fixture::load();
-    let knobs = Hash {
+    let controls = Controls {
         bigram_first: false,
-        ..Hash::reference()
+        ..Controls::reference()
     };
     for case in &fx.cases {
-        let got = ngram_ids(&fx, &case.input_ids, knobs);
+        let got = hashed_ids(&fx, &case.input_ids, controls);
         let mismatched = got
             .iter()
             .zip(&case.ngram_ids)
