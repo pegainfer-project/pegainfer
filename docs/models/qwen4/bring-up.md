@@ -1,6 +1,6 @@
 # Qwen4 bring-up
 
-> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of it is CPU-only. Nothing runs — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
+> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe, one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime, and a **device-free replay gate** for the PLE n-gram block golden (hash exact under i64 equality, block output bit-identical). All of it is CPU-only. Nothing runs — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
 >
 > **Last touched:** 2026-10
 
@@ -88,6 +88,25 @@ The committed `config.json` (`pegainfer-qwen4/tests/frozen_config.json`) is the 
   must name the feature, the enabled build must detect the line and refuse to serve.
   That is the only coverage of `main`'s CLI → registry → hint → `launch` wiring, and
   neither outcome reaches CUDA — `launch` bails before the engine is built.
+- **PLE n-gram golden and its host reader** (`test_data/qwen38fn-ple-golden.safetensors`
+  recorded by `tools/accuracy/dump_qwen38fn_ple_golden.py`, read by
+  `tests/ple_ngram_replay.rs`) — the per-layer-embedding block captured from the
+  reference at this config's real geometry (hidden 2560, `hc_count` 4 → a 10240-wide
+  stream, 16 heads × 160, conv kernel 4 dilated by 3), plus a **device-free** gate that
+  replays it: the mul-xor n-gram hash under i64 equality, zero tolerance (128/128 and
+  192/192 ids exact on the S=8 and S=12 cases, the latter carrying a mid-sequence EOS so
+  the window reset has a boundary on both sides), and the block itself from the recorded
+  `key`/`value` projections — bit-identical on all 81920 + 122880 stored bf16 outputs,
+  with the tolerance sized from a perturbation study of the chain's only libm-dependent
+  op rather than guessed. Four negative controls (drop the EOS window reset, dilation 1,
+  unsigned sqrt, swapped bigram/trigram head order) are each asserted to fail. Two
+  boundaries the fixture cannot carry: the n-gram table (102.4 GB at BF16) is not stored,
+  so the gate starts at the block's post-projection inputs, and the recording is
+  whole-sequence, so the decode-side states (the 2-token id window, the 9-slot dilated
+  conv state) stay ungated. The hash reads `layer_multipliers` from the fixture instead of
+  recomputing them from `seed`, which is what keeps `seed` unmodelled above. The device
+  side — the table gather and the dilated conv kernel — is #1106. The crate's tests and
+  clippy now run in CI's CPU jobs, which is what keeps the no-device property honest.
 
 **1-D lengths are part of the contract** (259 vectors), because the shared loader takes them on trust (#1068), and here many carry meaning: `A_log[48]`, `dt_bias[48]`, `norm.weight[128]`, `q_norm[256]`, the indexer layernorms at `[128]`, `layer_multipliers[3]` and the two `[16]` n-gram partition vectors. In the Qwen3.5 GDN loader this line would reuse, `A_log` goes through `tensor_f32_cow`, which accepts BF16 or F32 but never checks the length, and on a single rank `dt_bias` goes through `load_tensor_1d`, which only checks that the byte count is even before reading the bytes as BF16.
 
