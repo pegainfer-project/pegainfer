@@ -768,6 +768,17 @@ fn is_qwen35_source(csrc_dir: &Path, path: &Path) -> bool {
     }
 }
 
+/// Qwen4-line (Qwen3.8-Flash-Next) model-local CUDA: the hyper-connection
+/// gated residual's elementwise tail.
+fn is_qwen38fn_source(csrc_dir: &Path, path: &Path) -> bool {
+    match path.strip_prefix(csrc_dir) {
+        Ok(relative) => relative
+            .components()
+            .any(|part| part.as_os_str() == "qwen38fn"),
+        Err(_) => false,
+    }
+}
+
 /// GLM5.2 model-local CUDA shims over DeepGEMM/FlashMLA contracts.
 fn is_glm52_source(csrc_dir: &Path, path: &Path) -> bool {
     match path.strip_prefix(csrc_dir) {
@@ -2212,6 +2223,7 @@ fn main() {
     // --- k3: DeepGEMM-only, no DeepEP/NCCL dependency ---
     let k3_enabled = cfg!(feature = "k3");
     let qwen35_enabled = cfg!(feature = "qwen35");
+    let qwen4_enabled = cfg!(feature = "qwen4");
     if glm52_enabled {
         generate_glm52_trtllm_fmha_cubins(&crate_root(), &out_dir);
         build_glm52_cutedsl_fp8_dsl(&crate_root(), &out_dir, &cuda_include);
@@ -2279,6 +2291,9 @@ fn main() {
                 return None;
             }
             if !qwen35_enabled && is_qwen35_source(&csrc_dir, path) {
+                return None;
+            }
+            if !qwen4_enabled && is_qwen38fn_source(&csrc_dir, path) {
                 return None;
             }
             // --- k3 ---
