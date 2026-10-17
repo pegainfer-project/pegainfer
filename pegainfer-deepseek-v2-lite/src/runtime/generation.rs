@@ -1,8 +1,12 @@
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
 use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use anyhow::ensure;
 use log::debug;
 use log::info;
@@ -22,6 +26,8 @@ use super::types::GenerationResult;
 use super::types::GenerationStats;
 use crate::Config;
 use crate::attribution::DecodeAttributionProfile;
+use crate::device_kv::DEVICE_KV_SLOTS;
+use crate::device_kv::DeviceKvPool;
 use crate::ep::ExpertParallelConfig;
 use crate::host_ops::DecodeCache;
 use crate::model::DriverRankModel;
@@ -144,14 +150,54 @@ impl DeepSeekV2LiteEp2Generator {
             rank1,
             backend,
             device_routed_moe: None,
+            device_kv: None,
         };
         if generator.backend.kind() == super::backend::EpBackendKind::Nccl {
             generator.device_routed_moe = Some(std::sync::Mutex::new(
                 DeviceRoutedMoeRuntime::new(&generator)
                     .context("initialize DeepSeek-V2-Lite device-routed MoE")?,
             ));
+            if let Some(pool) = DeviceKvPool::new_within_budget(
+                &generator.rank0.ctx,
+                &generator.config,
+                DEVICE_KV_SLOTS,
+                generator.config.supported_plain_rope_context(),
+            )
+            .context("allocate DeepSeek-V2-Lite device decode KV pool")?
+            {
+                info!(
+                    "allocated device decode KV: slots={DEVICE_KV_SLOTS}, max_seq_len={}, bytes={}",
+                    pool.max_seq_len(),
+                    pool.bytes()
+                );
+                generator.device_kv = Some(Mutex::new(pool));
+            }
         }
         Ok(generator)
+    }
+
+    pub(crate) fn device_decode_enabled(&self) -> bool {
+        self.device_kv.is_some()
+    }
+
+    pub(super) fn device_kv_pool(&self) -> Result<MutexGuard<'_, DeviceKvPool>> {
+        let pool = self
+            .device_kv
+            .as_ref()
+            .context("DeepSeek-V2-Lite device decode requires the device KV pool")?;
+        Ok(pool.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    pub(crate) fn attach_device_kv(&self, cache: &mut DecodeCache) -> Result<()> {
+        if self.device_kv.is_none() {
+            return Ok(());
+        }
+        let mut pool = self.device_kv_pool()?;
+        let mut slot = pool.acquire()?;
+        pool.upload_host_cache(&self.rank0.ctx, &self.config, &mut slot, cache)?;
+        cache.layers = Vec::new();
+        cache.device = Some(slot);
+        Ok(())
     }
 
     pub fn generate_greedy(
@@ -271,6 +317,7 @@ impl DeepSeekV2LiteEp2Generator {
         for row in 0..batch_size {
             let next =
                 self.prefill_next_token(prompt_tokens, &mut caches[row], &mut stats, attribution)?;
+            self.attach_device_kv(&mut caches[row])?;
             prefill_next_token_us.push(duration_micros(generation_start.elapsed()));
             generated[row].push(next);
         }
@@ -285,11 +332,11 @@ impl DeepSeekV2LiteEp2Generator {
                         .expect("batched decode rows are seeded by prefill")
                 })
                 .collect();
-            let position = prompt_tokens.len() + token_index - 1;
+            let positions = vec![prompt_tokens.len() + token_index - 1; batch_size];
             let decode_start = Instant::now();
             let next_tokens = self.decode_next_tokens_batch(
                 &input_tokens,
-                position,
+                &positions,
                 &mut caches,
                 &mut stats,
                 attribution,
@@ -348,6 +395,7 @@ impl DeepSeekV2LiteEp2Generator {
         let prefill_start = Instant::now();
         let mut next =
             self.prefill_next_token(prompt_tokens, &mut cache, &mut stats, attribution)?;
+        self.attach_device_kv(&mut cache)?;
         attribution.set_prefill_next_token(prefill_start.elapsed());
         let mut finish_reason = FinishReason::Length;
 
@@ -420,6 +468,20 @@ impl DeepSeekV2LiteEp2Generator {
         attribution: &mut DecodeAttributionProfile,
         token_index: usize,
     ) -> Result<u32> {
+        if cache.device.is_some() {
+            let tokens = self.decode_next_tokens_batch(
+                &[token],
+                &[position],
+                std::slice::from_mut(cache),
+                stats,
+                attribution,
+                token_index,
+            )?;
+            let [token] = tokens[..] else {
+                bail!("device decode returned {} tokens for one row", tokens.len());
+            };
+            return Ok(token);
+        }
         let mut hidden = attribution.record_result(
             "decode",
             "embedding",
@@ -450,7 +512,7 @@ impl DeepSeekV2LiteEp2Generator {
     pub(crate) fn decode_next_tokens_batch(
         &mut self,
         tokens: &[u32],
-        position: usize,
+        positions: &[usize],
         caches: &mut [DecodeCache],
         stats: &mut GenerationStats,
         attribution: &mut DecodeAttributionProfile,
@@ -476,19 +538,20 @@ impl DeepSeekV2LiteEp2Generator {
         )?;
         hidden = self.forward_layers_decode_batch(
             hidden,
-            position,
+            positions,
             caches,
             stats,
             attribution,
             token_index,
         )?;
+        let on_device = caches.iter().all(|cache| cache.device.is_some());
         attribution.record_result(
             "decode",
             "sample_last_token",
             || "decode.batch_sample_tokens",
             None,
             Some(token_index),
-            || self.sample_tokens(&hidden),
+            || self.sample_tokens(&hidden, on_device),
         )
     }
 }

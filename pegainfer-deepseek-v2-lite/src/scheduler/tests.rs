@@ -686,7 +686,12 @@ fn take_decode_position_groups_preserves_original_indices() {
 
     assert!(active.is_empty());
     assert_eq!(groups.len(), 2);
-    assert_eq!(groups[0].position, 4);
+    assert!(
+        groups[0]
+            .rows
+            .iter()
+            .all(|(_, state)| state.next_decode_position() == 4)
+    );
     assert_eq!(
         groups[0]
             .rows
@@ -695,7 +700,7 @@ fn take_decode_position_groups_preserves_original_indices() {
             .collect::<Vec<_>>(),
         vec![0, 2]
     );
-    assert_eq!(groups[1].position, 5);
+    assert_eq!(groups[1].rows[0].1.next_decode_position(), 5);
     assert_eq!(
         groups[1]
             .rows

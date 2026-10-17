@@ -5,6 +5,7 @@ use half::bf16;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kernels::ops::dsv2_lite_kv_norm_into;
 
 use super::DeepSeekV2LiteEp2Generator;
 use super::backend::EpBackendKind;
@@ -27,6 +28,14 @@ use crate::model::AttentionWeights;
 use crate::model::MlpWeights;
 use crate::model::dense_mlp_forward;
 use crate::model::dense_mlp_forward_per_token;
+
+enum DecodeAttentionRows<'a> {
+    Host {
+        position: usize,
+        caches: Vec<&'a mut LayerCache>,
+    },
+    Device,
+}
 
 impl DeepSeekV2LiteEp2Generator {
     pub(super) fn embed_tokens(&self, token_ids: &[u32]) -> Result<HiddenStates> {
@@ -82,36 +91,69 @@ impl DeepSeekV2LiteEp2Generator {
     pub(super) fn forward_layers_decode_batch(
         &mut self,
         mut hidden: HiddenStates,
-        position: usize,
+        positions: &[usize],
         caches: &mut [DecodeCache],
         stats: &mut GenerationStats,
         attribution: &mut DecodeAttributionProfile,
         token_index: usize,
     ) -> Result<HiddenStates> {
         ensure!(
-            caches.len() == hidden.seq_len,
-            "batched decode cache count {} must match hidden seq_len {}",
+            caches.len() == hidden.seq_len && positions.len() == hidden.seq_len,
+            "batched decode caches {} and positions {} must match hidden seq_len {}",
             caches.len(),
+            positions.len(),
             hidden.seq_len
         );
+        let device_rows = caches.iter().filter(|cache| cache.device.is_some()).count();
+        let on_device = device_rows == caches.len();
         ensure!(
-            caches
-                .iter()
-                .all(|cache| cache.layers.len() == self.rank0.layers.len()),
-            "batched decode cache layer count mismatch"
+            on_device || device_rows == 0,
+            "batched decode mixes {device_rows} device-cache rows with {} host-cache rows",
+            caches.len() - device_rows
         );
+        if on_device {
+            let mut slots = Vec::with_capacity(caches.len());
+            for (row, (cache, &position)) in caches.iter().zip(positions).enumerate() {
+                let slot = cache.device.as_ref().expect("device rows checked above");
+                ensure!(
+                    slot.len() == position,
+                    "batched decode row {row} device cache position mismatch: cache_len={}, position={position}",
+                    slot.len()
+                );
+                slots.push(slot);
+            }
+            self.device_kv_pool()?
+                .upload_decode_rows(&self.rank0.ctx, &slots)?;
+        } else {
+            ensure!(
+                positions.iter().all(|&position| position == positions[0]),
+                "host-cache batched decode requires one shared position, got {positions:?}"
+            );
+            ensure!(
+                caches
+                    .iter()
+                    .all(|cache| cache.layers.len() == self.rank0.layers.len()),
+                "batched decode cache layer count mismatch"
+            );
+        }
         let deferred_device_routes = self.begin_device_routed_forward(hidden.seq_len)?;
         for layer_idx in 0..self.rank0.layers.len() {
-            let mut layer_caches: Vec<_> = caches
-                .iter_mut()
-                .map(|cache| &mut cache.layers[layer_idx])
-                .collect();
+            let rows = if on_device {
+                DecodeAttentionRows::Device
+            } else {
+                DecodeAttentionRows::Host {
+                    position: positions[0],
+                    caches: caches
+                        .iter_mut()
+                        .map(|cache| &mut cache.layers[layer_idx])
+                        .collect(),
+                }
+            };
             hidden = self
                 .forward_layer_decode_batch(
                     layer_idx,
                     &hidden,
-                    position,
-                    &mut layer_caches,
+                    rows,
                     stats,
                     attribution,
                     token_index,
@@ -121,6 +163,16 @@ impl DeepSeekV2LiteEp2Generator {
         if deferred_device_routes {
             let (local_routes, remote_routes) = self.finish_device_routed_forward()?;
             stats.record_routes(EpBackendKind::Nccl, local_routes, remote_routes);
+        }
+        if on_device {
+            stats.device_decode_steps += 1;
+            for cache in caches.iter_mut() {
+                cache
+                    .device
+                    .as_mut()
+                    .expect("device rows checked above")
+                    .advance();
+            }
         }
         Ok(hidden)
     }
@@ -239,38 +291,55 @@ impl DeepSeekV2LiteEp2Generator {
         &mut self,
         layer_idx: usize,
         hidden: &HiddenStates,
-        position: usize,
-        caches: &mut [&mut LayerCache],
+        rows: DecodeAttentionRows<'_>,
         stats: &mut GenerationStats,
         attribution: &mut DecodeAttributionProfile,
         token_index: usize,
     ) -> Result<HiddenStates> {
-        ensure!(
-            hidden.seq_len == caches.len(),
-            "batched layer hidden seq_len {} must match cache rows {}",
-            hidden.seq_len,
-            caches.len()
-        );
+        let on_device = matches!(rows, DecodeAttentionRows::Device);
         activate(&self.rank0.ctx)?;
 
         let layer = &self.rank0.layers[layer_idx];
-        let normed = attribution.record_result(
-            "decode",
-            "host_rms_norm",
+        let normed = self.decode_rms_norm(
+            on_device,
+            hidden,
+            &layer.input_layernorm_host,
+            &layer.input_layernorm_device,
+            attribution,
             || format!("layer.{layer_idx}.batch_input_rms_norm"),
-            Some(layer_idx),
-            Some(token_index),
-            || self.rms_norm_hidden(hidden, &layer.input_layernorm_host),
+            layer_idx,
+            token_index,
         )?;
 
-        let attn = attribution.record_result(
-            "decode",
-            "attention_host_path",
-            || format!("layer.{layer_idx}.batch_attention_host_path"),
-            Some(layer_idx),
-            Some(token_index),
-            || self.attention_forward_decode_batch(&normed, &layer.attention, position, caches),
-        )?;
+        let attn = match rows {
+            DecodeAttentionRows::Host {
+                position,
+                mut caches,
+            } => attribution.record_result(
+                "decode",
+                "attention_host_path",
+                || format!("layer.{layer_idx}.batch_attention_host_path"),
+                Some(layer_idx),
+                Some(token_index),
+                || {
+                    self.attention_forward_decode_batch(
+                        &normed,
+                        &layer.attention,
+                        position,
+                        &mut caches,
+                    )
+                },
+            )?,
+            DecodeAttentionRows::Device => attribution.record_gpu_result(
+                &self.rank0.ctx,
+                "decode",
+                "attention_device_path",
+                || format!("layer.{layer_idx}.batch_attention_device_path"),
+                Some(layer_idx),
+                Some(token_index),
+                || self.attention_forward_decode_device(layer_idx, &normed, &layer.attention),
+            )?,
+        };
         activate(&self.rank0.ctx)?;
         let attn_projected = attribution.record_gpu_result(
             &self.rank0.ctx,
@@ -291,13 +360,15 @@ impl DeepSeekV2LiteEp2Generator {
             || ops::add_batch(&self.rank0.ctx, hidden, &attn_projected),
         )?;
 
-        let ffn_norm = attribution.record_result(
-            "decode",
-            "host_rms_norm",
+        let ffn_norm = self.decode_rms_norm(
+            on_device,
+            &after_attn,
+            &layer.post_attention_layernorm_host,
+            &layer.post_attention_layernorm_device,
+            attribution,
             || format!("layer.{layer_idx}.batch_post_attention_rms_norm"),
-            Some(layer_idx),
-            Some(token_index),
-            || self.rms_norm_hidden(&after_attn, &layer.post_attention_layernorm_host),
+            layer_idx,
+            token_index,
         )?;
 
         let (ffn_out, local_routes, remote_routes) = match &layer.mlp {
@@ -480,15 +551,84 @@ impl DeepSeekV2LiteEp2Generator {
         )
     }
 
+    fn attention_forward_decode_device(
+        &self,
+        layer_idx: usize,
+        input: &HiddenStates,
+        attn: &AttentionWeights,
+    ) -> Result<HiddenStates> {
+        activate(&self.rank0.ctx)?;
+        let ctx = &self.rank0.ctx;
+        let rows = input.seq_len;
+        let q = ops::gemm_per_token(ctx, &attn.q_proj, input)?;
+        let kv_a = ops::gemm_per_token(ctx, &attn.kv_a_proj, input)?;
+        let mut compressed = HiddenStates::zeros(ctx, self.config.kv_lora_rank, rows)?;
+        dsv2_lite_kv_norm_into(
+            ctx,
+            &kv_a,
+            &attn.kv_a_norm_device.data,
+            self.config.kv_lora_rank,
+            self.config.rms_norm_eps,
+            &mut compressed,
+        )?;
+        let kv_b = ops::gemm_per_token(ctx, &attn.kv_b_proj, &compressed)?;
+        let mut out = HiddenStates::zeros(ctx, self.config.o_proj_cols(), rows)?;
+        self.device_kv_pool()?
+            .attention_into(ctx, layer_idx, &q, &kv_a, &kv_b, &mut out)?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_rms_norm<C, S>(
+        &self,
+        on_device: bool,
+        hidden: &HiddenStates,
+        host_weight: &[f32],
+        device_weight: &DeviceVec,
+        attribution: &mut DecodeAttributionProfile,
+        call_site: C,
+        layer_idx: usize,
+        token_index: usize,
+    ) -> Result<HiddenStates>
+    where
+        C: FnOnce() -> S,
+        S: Into<String>,
+    {
+        if on_device {
+            attribution.record_gpu_result(
+                &self.rank0.ctx,
+                "decode",
+                "device_rms_norm",
+                call_site,
+                Some(layer_idx),
+                Some(token_index),
+                || self.rms_norm_hidden_device(hidden, device_weight),
+            )
+        } else {
+            attribution.record_result(
+                "decode",
+                "host_rms_norm",
+                call_site,
+                Some(layer_idx),
+                Some(token_index),
+                || self.rms_norm_hidden(hidden, host_weight),
+            )
+        }
+    }
+
     pub(super) fn sample_last_token(&self, hidden: &HiddenStates) -> Result<u32> {
         self.sample_token_at(hidden, hidden.seq_len - 1)
     }
 
-    pub(super) fn sample_tokens(&self, hidden: &HiddenStates) -> Result<Vec<u32>> {
+    pub(super) fn sample_tokens(&self, hidden: &HiddenStates, on_device: bool) -> Result<Vec<u32>> {
         activate(&self.rank0.ctx)?;
         ensure!(hidden.seq_len != 0, "cannot sample an empty hidden batch");
 
-        let normed = self.rms_norm_hidden(hidden, &self.rank0.norm_host)?;
+        let normed = if on_device {
+            self.rms_norm_hidden_device(hidden, &self.rank0.norm_device)?
+        } else {
+            self.rms_norm_hidden(hidden, &self.rank0.norm_host)?
+        };
         activate(&self.rank0.ctx)?;
         let logits = ops::gemm_per_token(&self.rank0.ctx, &self.rank0.lm_head, &normed)?;
         let mut values = self.rank0.ctx.stream.alloc_zeros(hidden.seq_len)?;
@@ -534,6 +674,25 @@ impl DeepSeekV2LiteEp2Generator {
             self.config.hidden_size,
             hidden.seq_len,
         )
+    }
+
+    fn rms_norm_hidden_device(
+        &self,
+        hidden: &HiddenStates,
+        weight: &DeviceVec,
+    ) -> Result<HiddenStates> {
+        activate(&self.rank0.ctx)?;
+        let mut out =
+            HiddenStates::zeros(&self.rank0.ctx, self.config.hidden_size, hidden.seq_len)?;
+        dsv2_lite_kv_norm_into(
+            &self.rank0.ctx,
+            hidden,
+            &weight.data,
+            self.config.hidden_size,
+            self.config.rms_norm_eps,
+            &mut out,
+        )?;
+        Ok(out)
     }
 
     fn rms_norm_vec(&self, input: &DeviceVec, weight: &[f32]) -> Result<DeviceVec> {
