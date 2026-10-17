@@ -124,8 +124,9 @@ That arithmetic is confirmed **by value**: the checkpoint stores the partition a
 
 ## GDN decode reuse
 
-The 36 `linear_attention` layers run Qwen3.5's Gated DeltaNet decode kernels instead of a
-second implementation. The geometry is identical — 16 key and 48 value heads at head dim
+The 36 `linear_attention` layers will run Qwen3.5's Gated DeltaNet decode kernels
+instead of a second implementation once slice B wires the text graph. The geometry is
+identical — 16 key and 48 value heads at head dim
 128, 4-tap depthwise conv, the same names down to the `model.language_model.layers.N.`
 prefix — so the two host wrappers (`conv1d_decode_batch_into`,
 `gated_delta_rule_decode_batch_into`) **moved** out of `pegainfer-qwen35/src/recurrent.rs`
@@ -133,16 +134,18 @@ into `pegainfer-kernels/src/ops/qwen35.rs`, behind the kernels' `qwen35` feature
 compiles `csrc/qwen35/{conv1d,gated_delta_rule}.cu`. Qwen3.5 consumes them from
 `pegainfer_kernels::ops` now, with its call sites unchanged; the three kernel limits
 (`GDN_AOT_KEY_HEAD_DIM`, `GDN_AOT_VALUE_HEAD_DIM`, `LINEAR_CONV_MAX_KERNEL_DIM`) moved
-with them so there is one definition. Head counts stay runtime arguments, so 48 value
-heads needs no rebuild.
+with them so the Qwen3.5 line has one definition; this line's config keeps a CPU-only
+mirror until slice B wires the device path. Head counts stay runtime arguments, so 48
+value heads needs no rebuild.
 
 What is pinned without a GPU: the tensor contract derives every GDN shape from the frozen
 config and validates all 1658 headers, and the config pins the two head dims and the conv
-cap. What is **not** yet proven is the reuse itself on this line's activations. An earlier
-component test loaded layer 0's real tensors and drove the kernels, but it compared them
-with a transcription of the same kernels from a zero state, so it could not distinguish
-the kernels from themselves; it was removed rather than presented as a reuse proof. The
-first correct prefill and decode through this line's own graph is slice B's M0 exit
+cap to CPU-only mirrors of the kernels' constants. What is **not** yet proven is the reuse
+itself on this line's activations. An earlier component test loaded layer 0's real tensors
+and drove the kernels, but it compared them with a transcription of the same kernels from
+a zero state, so it could not distinguish the kernels from themselves; it was removed
+rather than presented as a reuse proof. The first correct prefill and decode through this
+line's own graph is slice B's M0 exit
 (#1127), and that is where the GDN block gets a reference to compare against
 (`transformers`' recurrence, not a kernel transcription).
 

@@ -19,9 +19,9 @@ use crate::probe::probe_config_json;
 
 /// The GDN and full-attention kernel limits: the first three are owned by the
 /// Gated DeltaNet decode wrappers in `pegainfer_kernels::ops` (which this line
-/// drives with the same numbers as Qwen3.5), the last by the HD256 full-attention
-/// kernels. This crate's config layer runs with no device — a probe must not need
-/// CUDA — so the values are mirrored here rather than imported.
+/// will drive with the same numbers as Qwen3.5), the last by the HD256
+/// full-attention kernels. This crate's config layer runs with no device — a probe
+/// must not need CUDA — so the values are mirrored here rather than imported.
 const GDN_AOT_KEY_HEAD_DIM: usize = 128;
 const GDN_AOT_VALUE_HEAD_DIM: usize = 128;
 const LINEAR_CONV_MAX_KERNEL_DIM: usize = 4;

@@ -405,6 +405,11 @@ pub fn gated_delta_rule_decode_batch_into(
     assert_eq!(b_proj.seq_len, batch_size);
     assert_eq!(a_proj.seq_len, batch_size);
     assert_eq!(output.seq_len, batch_size);
+    assert!(
+        num_key_heads > 0 && num_value_heads > 0 && num_value_heads.is_multiple_of(num_key_heads),
+        "value heads {num_value_heads} must be a positive whole number of \
+         key-head groups of {num_key_heads}"
+    );
     assert_eq!(
         qkv.hidden_dim,
         2 * num_key_heads * key_dim + num_value_heads * val_dim

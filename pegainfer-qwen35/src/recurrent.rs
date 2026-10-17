@@ -458,6 +458,7 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use cudarc::driver::CudaSlice;
     use cudarc::driver::DevicePtrMut;
     use half::bf16;
     use pegainfer_core::tensor::DeviceContext;
@@ -467,6 +468,7 @@ mod tests {
     use super::conv1d_prefill_batch_into;
     use super::gated_delta_rule_decode_vec_into;
     use super::gated_delta_rule_prefill_chunkwise_into;
+    use crate::ops::conv1d_decode_batch_into;
     use crate::ops::gated_delta_rule_decode_batch_into;
     use crate::prefill_buffers::GdrChunkwiseScratch35;
 
@@ -608,6 +610,139 @@ mod tests {
 
         assert!(max_out_diff < 0.02, "output diff {max_out_diff}");
         assert!(max_state_diff < 0.02, "state diff {max_state_diff}");
+        Ok(())
+    }
+
+    /// One decode step of the conv1d kernel's documented recurrence:
+    /// `silu(bf16(Σ_k w[k] * [state[0], state[1], state[2], x]))`, followed by
+    /// shifting the state to the previous inputs, oldest first.
+    fn reference_conv1d_decode_step(
+        x: &[bf16],
+        weights: &[bf16],
+        state: &mut [f32],
+        kernel_size: usize,
+    ) -> Vec<bf16> {
+        let width = kernel_size - 1;
+        let channels = x.len();
+        let mut out = vec![bf16::ZERO; channels];
+        for c in 0..channels {
+            let mut sum = 0.0f32;
+            for k in 0..kernel_size {
+                let value = if k == kernel_size - 1 {
+                    x[c].to_f32()
+                } else {
+                    state[c * width + k]
+                };
+                sum += value * weights[c * kernel_size + k].to_f32();
+            }
+            let sum_bf16 = bf16::from_f32(sum).to_f32();
+            out[c] = bf16::from_f32(sum_bf16 / (1.0 + (-sum_bf16).exp()));
+        }
+        for c in 0..channels {
+            for i in 0..width {
+                state[c * width + i] = if i + 1 < width {
+                    state[c * width + i + 1]
+                } else {
+                    x[c].to_f32()
+                };
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn conv1d_decode_batch_matches_reference_steps() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let num_channels = 10240usize;
+        let kernel_size = 4usize;
+        let state_width = kernel_size - 1;
+        let batch_size = 3usize;
+
+        let w_host = bf16_vec(
+            &(0..num_channels * kernel_size)
+                .map(|i| ((i % 37) as f32 - 18.0) * 0.015_625)
+                .collect::<Vec<_>>(),
+        );
+        let conv_weight = DeviceVec::from_host(&ctx, &w_host)?;
+
+        // Distinct initial states with identical inputs: a shared or mis-indexed
+        // state pointer would make slots 1 and 2 drift from their own reference.
+        let state_len = num_channels * state_width;
+        let initial: Vec<Vec<bf16>> = (0..batch_size)
+            .map(|slot| {
+                bf16_vec(
+                    &(0..state_len)
+                        .map(|i| ((i + slot * 7) % 23) as f32 * 0.01 - 0.11)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let mut host_states: Vec<Vec<f32>> = initial
+            .iter()
+            .map(|values| values.iter().map(|value| value.to_f32()).collect())
+            .collect();
+        let mut slots: Vec<CudaSlice<bf16>> = initial
+            .iter()
+            .map(|values| ctx.stream.clone_htod(values))
+            .collect::<std::result::Result<_, _>>()?;
+
+        let mut pointers = Vec::with_capacity(batch_size);
+        for slot in &mut slots {
+            let (pointer, _guard) = slot.device_ptr_mut(&ctx.stream);
+            pointers.push(pointer);
+        }
+        let state_ptrs = ctx.stream.clone_htod(&pointers)?;
+
+        for step in 0..kernel_size + 2 {
+            let row = bf16_vec(
+                &(0..num_channels)
+                    .map(|i| (((i * 13 + step * 29) % 101) as f32 - 50.0) * 0.007_812_5)
+                    .collect::<Vec<_>>(),
+            );
+            let x_host: Vec<bf16> = (0..batch_size).flat_map(|_| row.clone()).collect();
+            let x = HiddenStates {
+                data: ctx.stream.clone_htod(&x_host)?,
+                hidden_dim: num_channels,
+                seq_len: batch_size,
+            };
+            let mut out = HiddenStates::zeros(&ctx, num_channels, batch_size)?;
+            conv1d_decode_batch_into(&ctx, &x, &conv_weight, &state_ptrs, &mut out, kernel_size);
+            ctx.sync()?;
+
+            let got: Vec<bf16> = ctx.stream.clone_dtoh(&out.data)?;
+            for slot in 0..batch_size {
+                let expected = reference_conv1d_decode_step(
+                    &row,
+                    &w_host,
+                    &mut host_states[slot],
+                    kernel_size,
+                );
+                let got_row = &got[slot * num_channels..(slot + 1) * num_channels];
+                let max_out_diff = got_row
+                    .iter()
+                    .zip(expected.iter())
+                    .map(|(got, expected)| (got.to_f32() - expected.to_f32()).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_out_diff <= 1e-2,
+                    "conv1d decode step {step} slot {slot}: output diff {max_out_diff}"
+                );
+            }
+
+            // The state is the previous inputs oldest-first, bit for bit.
+            for (slot, values) in slots.iter().enumerate() {
+                let device: Vec<bf16> = ctx.stream.clone_dtoh(values)?;
+                ctx.sync()?;
+                let expected: Vec<bf16> = host_states[slot]
+                    .iter()
+                    .map(|value| bf16::from_f32(*value))
+                    .collect();
+                assert_eq!(
+                    device, expected,
+                    "conv1d decode step {step} slot {slot}: state"
+                );
+            }
+        }
         Ok(())
     }
 
