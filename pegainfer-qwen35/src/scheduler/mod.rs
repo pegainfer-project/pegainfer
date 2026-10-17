@@ -718,9 +718,34 @@ fn active_request_kv(request: &mut ActiveRequest35) -> Option<&mut RequestKv> {
         ActiveBackendState::Tp { .. } => None,
     }
 }
-fn clamp_prefill_chunk(cursor: usize, chunk: usize, snapshot_stride: Option<usize>) -> usize {
-    snapshot_stride.map_or(chunk, |stride| {
-        debug_assert!(stride > 0);
-        chunk.min(stride - cursor % stride)
-    })
+/// Tokens one prefill step forwards. With the cache on, an unfinished step rounds
+/// its end down to a stride boundary and the last boundary at or below
+/// `history_tokens` (else the prompt length) is a step end, so cuts depend only on
+/// budget and prompt.
+fn prefill_step_chunk(
+    cursor: usize,
+    chunk: usize,
+    prompt_len: usize,
+    history_tokens: Option<usize>,
+    snapshot_stride: Option<usize>,
+) -> usize {
+    let Some(stride) = snapshot_stride else {
+        return chunk;
+    };
+    debug_assert!(stride > 0 && chunk > 0 && cursor + chunk <= prompt_len);
+    let end = cursor + chunk;
+    let last_stop = history_tokens.map_or(prompt_len, |h| h.min(prompt_len)) / stride * stride;
+    if cursor < last_stop && last_stop < end {
+        return last_stop - cursor;
+    }
+    if end == prompt_len {
+        return chunk;
+    }
+    // A budget share that cannot reach the next boundary runs unaligned rather than stall.
+    let aligned = end / stride * stride;
+    if aligned > cursor {
+        aligned - cursor
+    } else {
+        chunk
+    }
 }
