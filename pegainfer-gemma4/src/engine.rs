@@ -2792,7 +2792,9 @@ impl EngineState {
     }
 
     fn pipeline_eligible(&self, active: &[Active], ledger: &RequestLedger) -> bool {
-        !active.is_empty()
+        // Only one rank can feed the next step from device-resident sampled IDs.
+        self.more.is_empty()
+            && !active.is_empty()
             && active.len() <= self.scratch.max_rows()
             && active.iter().all(|entry| {
                 !entry.stopping
@@ -2812,18 +2814,12 @@ impl EngineState {
 
     /// Reserve the next token without retiring or reordering a row.
     ///
-    /// `Ok(false)` is rank 0's own shortfall, which the caller answers by
-    /// falling back to [`Self::ready_decode_rows`] — that path fails the row and
-    /// drops it, so its pages come back. `Err` is only reachable with extra
-    /// ranks: a rank that cannot reserve what rank 0 just reserved has lost the
-    /// page-id race, and nothing here drops the row, so the divergence would
-    /// ride into the step and read one rank's KV at another's frontier. By
-    /// `admit_extra_ranks`' own contract nothing after that can repair it, so
-    /// the engine stops instead.
-    fn ready_rows_pinned(&self, active: &mut [Active], ledger: &RequestLedger) -> Result<bool> {
+    /// A shortfall falls back to [`Self::ready_decode_rows`] after the pipeline
+    /// drains, so no pages are released while a staged step still uses them.
+    fn ready_rows_pinned(&self, active: &mut [Active], ledger: &RequestLedger) -> bool {
         for entry in active.iter_mut() {
             if ledger.is_aborted(entry.request.id) {
-                return Ok(false);
+                return false;
             }
             if admit_tokens(
                 &self.serve.local_pool,
@@ -2833,11 +2829,10 @@ impl EngineState {
             )
             .is_err()
             {
-                return Ok(false);
+                return false;
             }
-            self.admit_extra_ranks(&mut entry.kv, 1)?;
         }
-        Ok(true)
+        true
     }
 
     fn fence(&self) -> Result<()> {
@@ -2857,43 +2852,25 @@ impl EngineState {
         resident: bool,
         slot: usize,
     ) -> Result<usize> {
+        anyhow::ensure!(self.more.is_empty(), "staged decode requires a single rank");
         let rows = active.len();
-        // The staged pipeline hands rank 1 no ids of its own (it has no
-        // sampler), so under tensor parallelism every rank takes the
-        // explicit-token path.
-        let resident = resident && self.more.is_empty();
         let tokens = (!resident).then(|| active.iter().map(|entry| entry.next).collect::<Vec<_>>());
         {
-            let payload = rank_payloads(active);
-            if let Some(tokens) = tokens.as_deref() {
-                // Every rank carries the same tokens and page ids; only rank 0
-                // samples, so the extras' logits are discarded.
-                self.drive_ranks(
-                    payload,
-                    |ctx, serve, arena, mut kvs| {
-                        serve
-                            .decode_batch_step(ctx, arena, &mut kvs, tokens)
-                            .map(|_| ())
-                    },
-                    |state, mut kvs| {
-                        state
-                            .serve
-                            .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, tokens)
-                            .map(|_| ())
-                    },
-                )?;
+            activate_rank(&self.ctx)?;
+            let mut kvs: Vec<_> = active
+                .iter_mut()
+                .map(|entry| entry.kv.core_mut(0))
+                .collect();
+            let stepped = if let Some(tokens) = tokens.as_deref() {
+                self.serve
+                    .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)
+                    .map(|_| ())
             } else {
-                // World size 1: the resident path, with no extra rank to drive.
-                self.drive_ranks(
-                    payload,
-                    |ctx, serve, arena, mut kvs| {
-                        serve
-                            .decode_batch_step_resident(ctx, arena, &mut kvs)
-                            .map(|_| ())
-                    },
-                    |_state, _kvs| Ok(()),
-                )?;
-            }
+                self.serve
+                    .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)
+                    .map(|_| ())
+            };
+            stepped.context("batched decode launch")?;
         }
         let graph_slot = crate::serve::decode_bucket_slot(rows);
         if let Some(graph) = self.sampler_graphs.get_mut(graph_slot) {
@@ -3135,7 +3112,7 @@ impl EngineState {
     /// successor in flight and drain before any row-order change.
     fn decode_round(&mut self, active: &mut Vec<Active>, ledger: &mut RequestLedger) -> Result<()> {
         if let Some(pending) = self.pipeline.take() {
-            if self.pipeline_eligible(active, ledger) && self.ready_rows_pinned(active, ledger)? {
+            if self.pipeline_eligible(active, ledger) && self.ready_rows_pinned(active, ledger) {
                 let next_slot = (pending.slot + 1) % DECODE_PIPELINE_DEPTH;
                 match self.launch_staged(active, true, next_slot) {
                     Ok(rows) => {

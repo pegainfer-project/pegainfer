@@ -519,6 +519,48 @@ fn the_two_rank_engine_matches_one_rank() {
     );
 }
 
+/// Logprobs force collection before the next decode. An unscored request must
+/// consume the same sampled tokens instead of launching from stale host IDs.
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1; checkpoint from PEGAINFER_TEST_MODEL_PATH"]
+fn the_two_rank_engine_decodes_the_same_tokens_without_logprobs() {
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
+    let prompt = ids(20, 11);
+    let scored_control = harness.submit_scored(prompt.clone(), 16, Some(0), None);
+    let scored = harness.steps.drain(scored_control.id(), "scored decode");
+    let unscored_control = harness.submit(prompt, 16);
+    let unscored = harness
+        .steps
+        .drain(unscored_control.id(), "unscored decode");
+    harness.shutdown(&[&scored_control, &unscored_control]);
+
+    for (name, run) in [("scored", &scored), ("unscored", &unscored)] {
+        assert_eq!(run.ids.len(), 16, "{name}: complete token sequence");
+        assert_eq!(run.finish, FinishReason::Length, "{name}: finish reason");
+        assert_eq!(
+            run.logprobs.len(),
+            16,
+            "{name}: one logprob entry per token"
+        );
+    }
+    for lp in &scored.logprobs {
+        assert_finite(
+            lp.as_ref().expect("every scored token has a logprob"),
+            "scored decode",
+        );
+    }
+    assert!(
+        unscored.logprobs.iter().all(Option::is_none),
+        "unscored tokens must not carry logprobs"
+    );
+    assert_eq!(
+        unscored.ids, scored.ids,
+        "TP decode must consume the latest sampled token with or without logprobs"
+    );
+}
+
 /// The serving knobs a gate may force from the environment, so the same gate
 /// runs at a reduced envelope as well as at the default point — a 31B needs a
 /// smaller one to fit a 48 GiB card at all.

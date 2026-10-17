@@ -51,7 +51,9 @@ Per step, each rank's segment calls `activate_rank` (set the device, bind its co
 
 Why the extras get threads is the invariant the single-threaded driver could not hold: **a host blocking point must come after every rank's launch.** `all_reduce_rows` enqueues and returns, but a prefill's tower reaches host-side waits of its own — `main`'s stack names one: the gate|up projection GEMM (`cublasGemmEx`, reached from `attention_epilogue_into`) with the thread spinning inside libcuda, and rank 0's per-row readback is the other — so with one thread driving every rank in turn, rank 0 could block on a collective whose peer call had not been issued yet and hang. Running each extra rank's segment on its own thread, and joining only after rank 0's has returned, makes that ordering impossible rather than something each call site has to arrange; it is also what lifted the old prompt ceiling (see "Known bounds").
 
-The staged decode pipeline (ids written by the previous step's sampler) is disabled under TP: a non-primary rank has no sampler and no ids of its own, so every rank takes the explicit-token path.
+TP collects each decode step before launching the next. Only rank 0 samples, so peers need the collected host token IDs. The single-rank staged pipeline instead launches its successor before collecting, using IDs already written on the device. Feeding that successor from `entry.next` under TP reads the previous token: switching to explicit-token input alone does not make the pipeline safe. Both pipeline eligibility and the staged launch boundary therefore require a single rank.
+
+The historical throughput measurements in this document predate this collection boundary and do not establish its performance.
 
 ## The collective
 
@@ -101,6 +103,8 @@ The 8192 x 8 row is the one that has been served: 2.50 GiB global pool, 14.18 Gi
 Nothing priced above zero is given up. Capturing against eager is a wash on two L20s at 31B (8192 x 8), back to back on a quiet box — first token 57.0 vs 56.5 ms, decode step 51.5 vs 49.4 ms (+4%), 8-way aggregate 146.0 vs 143.7 tok/s — because the collective, not the launch count, dominates the step; the served envelope above is the 143.7 one. The capture-time constraint the earlier revision documented still holds for the single-rank path (graphs are on there as before): **the kernels must be warm before the communicator exists** (see "Cold start"), or a first-shape GEMM that materializes after `Comm::from_devices` wedges in the driver's module loader. The parity reading the revision before this carried — two ranks captured against one rank eager, `48/48` picks at gap `0.0000` — is not reproducible any more: the env it was taken with turns nothing on. The two-rank capture sweep went with it, so turning graphs off is now structural rather than a flag: nothing under `world > 1` ever captures, and no teardown or failure path has a graph to release.
 
 ## Verification
+
+`engine::lane_gates_tp::the_two_rank_engine_decodes_the_same_tokens_without_logprobs` compares complete greedy token sequences with and without logprobs on the same TP2 engine. The scored request collects every step; the unscored request exercises the conditions that previously entered the stale-token pipeline. Both must emit the full token budget and finish by length.
 
 `engine::lane_gates_tp::the_two_rank_engine_matches_one_rank` starts a real engine twice — once with one rank, once with two — over the same 12B checkpoint, three prompts and one batch, and compares the requested top-8 logprobs.
 
