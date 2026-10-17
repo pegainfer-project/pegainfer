@@ -77,10 +77,17 @@ fn out_of_range_row_traps() {
         &mut pooled,
         EPS,
     );
-    if res.is_ok() {
-        assert!(
+    match res {
+        Ok(()) => assert!(
             ctx.sync().is_err(),
             "row {TOKENS} in an {TOKENS}-token buffer must fail visibly"
-        );
+        ),
+        // The trap may surface at the launch instead of the next sync. Any other
+        // error means a wrapper check ran instead of the kernel, which would
+        // make this gate green without ever exercising the trap.
+        Err(err) => assert!(
+            format!("{err:#}").contains("launch failed"),
+            "the trap must come from the launch, not a wrapper check: {err:#}"
+        ),
     }
 }
