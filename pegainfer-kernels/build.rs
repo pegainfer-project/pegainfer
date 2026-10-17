@@ -2482,6 +2482,7 @@ fn main() {
             || stem == "paged_attention_window_hd256"
             || stem == "flashinfer_norm"
             || stem == "flashinfer_sampling"
+            || stem == "dflash2_selector"
             || stem == "flashinfer_top1"
             || stem == "glm52_topk"
             || stem == "local_kv_fp8"

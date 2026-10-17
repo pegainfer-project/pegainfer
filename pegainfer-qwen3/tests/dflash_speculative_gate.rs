@@ -37,7 +37,9 @@
 //!
 //! Requires a CUDA GPU, Qwen3-4B weights, and the DFlash drafter. Set
 //! `PEGAINFER_TEST_MODEL_PATH` (target) and `PEGAINFER_DFLASH_TEST_MODEL_PATH`
-//! (drafter); skips cleanly when either is absent.
+//! (drafter); the legacy gates skip when weights are absent. The ignored native
+//! gate requires explicit target and `PEGAINFER_DFLASH2_TEST_MODEL_PATH` paths
+//! and fails if its checkpoint is missing or not a native DFlash2 drafter.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -79,7 +81,7 @@ const LOGPROBS: usize = 20;
 /// ULP at typical logit magnitudes — mirrors `hf_golden_gate`'s `MARGIN_TOL`.
 const MARGIN_TOL: f32 = 0.20;
 
-/// Both tests launch a Qwen3-4B engine, and two at once overflow a 16 GB card.
+/// These tests launch a Qwen3-4B engine, and two at once overflow a 16 GB card.
 /// Cargo runs tests in one binary concurrently, so serialize the engine-holding
 /// bodies — only one engine is ever resident on the GPU.
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -244,8 +246,15 @@ fn check_lossless(
         .take_while(|(b, s)| b.id == s.id)
         .count();
 
-    // Identical sequences (or one a prefix of the other): perfectly lossless.
+    // A matching prefix alone does not prove the full continuation was produced.
     if matched == base.len().min(spec.len()) {
+        if base.len() != spec.len() {
+            return Err(format!(
+                "prompt {i}: matching prefix but different output lengths: baseline={}, spec={}",
+                base.len(),
+                spec.len()
+            ));
+        }
         eprintln!(
             "prompt {i} ({prompt:?}): {matched}/{} tokens identical (100% lossless)",
             base.len()
@@ -624,6 +633,178 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
         "concurrent heterogeneous speculative decode is not lossless:\n{}",
         failures.join("\n")
     );
+}
+
+/// Real native checkpoint coverage: selector/conv, changing batch sizes, and
+/// attention beyond the checkpoint's sliding window. This deliberately
+/// requires model paths so an explicitly requested native run cannot skip.
+#[test]
+#[ignore = "requires PEGAINFER_TEST_MODEL_PATH and PEGAINFER_DFLASH2_TEST_MODEL_PATH on a CUDA GPU"]
+fn dflash2_native_checkpoint_is_lossless() {
+    common::harness::init_capture_logging();
+    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
+        .expect("set PEGAINFER_TEST_MODEL_PATH to the matching target checkpoint");
+    let draft_path = std::env::var("PEGAINFER_DFLASH2_TEST_MODEL_PATH")
+        .expect("set PEGAINFER_DFLASH2_TEST_MODEL_PATH to a native DFlash2 checkpoint");
+    assert!(Path::new(&model_path).join("config.json").is_file());
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(Path::new(&draft_path).join("config.json"))
+            .expect("native draft config must exist"),
+    )
+    .expect("native draft config must be valid JSON");
+    assert!(
+        config["selector_rank"]
+            .as_u64()
+            .is_some_and(|rank| rank > 0)
+            && config["conv_kernel_size"]
+                .as_u64()
+                .is_some_and(|taps| taps > 0),
+        "use a native Speculators DFlash2 checkpoint with a selector and convolution"
+    );
+    let window = config["transformer_layer_config"]["sliding_window"]
+        .as_u64()
+        .filter(|&window| window > 0)
+        .expect("native checkpoint must declare a sliding window") as usize;
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let mut cases: Vec<_> = [
+        ("The capital of France is", 64),
+        ("def fibonacci(n):", 64),
+        ("The three primary colors are", 24),
+        (
+            "Q: What is 17 multiplied by 23? A: Let's think step by step.",
+            48,
+        ),
+    ]
+    .into_iter()
+    .map(|(prompt, budget)| {
+        (
+            prompt,
+            tokenizer.encode(prompt, false).expect("encode failed"),
+            budget,
+        )
+    })
+    .collect();
+    let mut long_context = tokenizer
+        .encode(
+            include_str!("../../docs/models/qwen3/dflash-speculative-decoding.md"),
+            false,
+        )
+        .expect("encode long context");
+    long_context.truncate(window + 32);
+    assert!(
+        long_context.len() > window,
+        "long-context fixture must exceed window={window}"
+    );
+    cases.push(("native long context", long_context, 32));
+    // The regret reference re-prefills the prompt plus its matching output
+    // prefix as one prompt-scoring request, which cannot use chunked prefill.
+    let max_prefill_tokens = cases
+        .iter()
+        .map(|(_, tokens, budget)| tokens.len() + *budget)
+        .fold(DEFAULT_MAX_PREFILL_TOKENS, usize::max);
+
+    let fixed_request = |tokens: &[u32], budget, logprobs| {
+        let mut req = request(
+            tokens.to_vec(),
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            budget,
+        );
+        req.logprobs = logprobs;
+        req
+    };
+    let fixed_steps = |outcome: Outcome, budget| {
+        assert!(
+            matches!(outcome.terminal, Terminal::Finished {
+                reason: FinishReason::Length, stop_cause: None, completion_tokens, ..
+            } if completion_tokens == budget),
+            "native gate must finish the complete budget: {:?}",
+            outcome.terminal
+        );
+        assert_eq!(outcome.tokens.len(), budget);
+        to_steps(outcome)
+    };
+
+    let mut baseline_options = launch_options(None);
+    baseline_options.max_prefill_tokens = max_prefill_tokens;
+    let baselines: Vec<_> = {
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), baseline_options)
+                .expect("failed to start baseline engine"),
+        );
+        let out = cases
+            .iter()
+            .map(|(_, tokens, budget)| {
+                fixed_steps(
+                    engine
+                        .submit(fixed_request(tokens, *budget, Some(LOGPROBS)))
+                        .expect_finished(),
+                    *budget,
+                )
+            })
+            .collect();
+        drop(engine);
+        std::thread::sleep(Duration::from_secs(2));
+        out
+    };
+    let mut native_options = launch_options(Some(PathBuf::from(&draft_path)));
+    native_options.max_prefill_tokens = max_prefill_tokens;
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(Path::new(&model_path), native_options)
+            .expect("failed to start native speculative engine"),
+    );
+
+    for (name, range) in [
+        ("single", 0..1),
+        ("heterogeneous", 1..4),
+        ("long-window", 4..5),
+    ] {
+        let before = engine.metrics().spec_decode.unwrap_or_default();
+        // Submit each group up front: the middle group mixes verify budgets,
+        // then the long request reuses the single-request capture shape.
+        let streams: Vec<_> = cases[range.clone()]
+            .iter()
+            .map(|(_, tokens, budget)| engine.submit(fixed_request(tokens, *budget, None)))
+            .collect();
+        let specs: Vec<_> = streams
+            .into_iter()
+            .zip(&cases[range.clone()])
+            .map(|(stream, (_, _, budget))| fixed_steps(stream.expect_finished(), *budget))
+            .collect();
+        // Metrics are published before terminal updates; take the delta before
+        // any regret diagnostic adds a separate prompt-scoring request.
+        let after = engine
+            .metrics()
+            .spec_decode
+            .expect("native speculative metrics missing");
+        let rounds = after.num_drafts - before.num_drafts;
+        let proposed = after.num_draft_tokens - before.num_draft_tokens;
+        let accepted = after.num_accepted_tokens - before.num_accepted_tokens;
+        assert!(
+            rounds > 0 && proposed > 0 && accepted > 0,
+            "{name}: speculative path inactive"
+        );
+        assert!(accepted <= proposed, "{name}: accepted exceeds proposed");
+        eprintln!(
+            "native {name}: window={window}, rounds={rounds}, proposed={proposed}, accepted={accepted}"
+        );
+        for (i, spec) in range.zip(specs) {
+            let (prompt, tokens, budget) = &cases[i];
+            check_lossless(&engine, &tokenizer, i, prompt, tokens, &baselines[i], &spec)
+                .unwrap_or_else(|failure| panic!("native {name}: {failure}"));
+            eprintln!(
+                "native {name} request {i}: prompt_tokens={}, budget={budget}, generated={}, lossless=pass",
+                tokens.len(),
+                spec.len()
+            );
+        }
+    }
 }
 
 /// Production hedge regression: an explicit stop in the middle of a verify

@@ -1,17 +1,25 @@
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::ensure;
 use log::debug;
 use pegainfer_core::rope::RopeTableSpec;
 use pegainfer_core::rope::precompute_rope;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
+use pegainfer_core::weight_loader::StagedWeightLoader;
 use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::load_tensor_1d;
+use pegainfer_core::weight_loader::load_tensor_1d_stitch;
 use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::mmap_shards;
+use safetensors::Dtype;
+use safetensors::tensor::TensorView;
 
 use super::DFlashDraftModel;
+use super::conv::GroupedConv;
+use super::conv::LayerConvs;
+use super::selector::SelectorHead;
 use crate::config::DFlashConfig;
 use crate::dspark::MARKOV_W1_TENSOR;
 use crate::dspark::MARKOV_W2_TENSOR;
@@ -149,6 +157,64 @@ impl DFlashDraftModel {
             });
         }
 
+        let convs = if let Some(conv) = &config.conv {
+            let mut loader = StagedWeightLoader::new(ctx, &shards, &weight_map)?;
+            let width = 2 * conv.taps * (config.hidden_size / conv.group_size);
+            let mut kernels = Vec::with_capacity(config.num_hidden_layers);
+            for layer in 0..config.num_hidden_layers {
+                let mut load = |name: &str| -> Result<_> {
+                    let prefix = format!("layers.{layer}.{name}");
+                    let base_name = format!("{prefix}.base_kernel");
+                    let base = match weight_map.get(&base_name) {
+                        Some(&index) => shards[index].tensor(&base_name)?,
+                        None => shards
+                            .iter()
+                            .find_map(|shard| shard.tensor(&base_name).ok())
+                            .with_context(|| {
+                                format!("Tensor '{base_name}' not found in any shard")
+                            })?,
+                    };
+                    validate_conv_base(&base, &base_name, conv.taps, config.hidden_size)?;
+                    Ok((
+                        loader.matrix(
+                            &format!("{prefix}.kernel_projection.weight"),
+                            width,
+                            config.hidden_size,
+                        )?,
+                        load_tensor_1d_stitch(
+                            ctx,
+                            &shards,
+                            &weight_map,
+                            &base_name,
+                            &[(0, base.data().len() / std::mem::size_of::<half::bf16>())],
+                        )?,
+                    ))
+                };
+                kernels.push((load("attention_conv")?, load("mlp_conv")?));
+            }
+
+            loader.finish()?;
+
+            let mut take = |(projection, base)| GroupedConv {
+                projection: loader.take(projection),
+                base,
+                block_size: config.block_size,
+                group_size: conv.group_size,
+            };
+            let layers = kernels
+                .into_iter()
+                .map(|(attention, mlp)| LayerConvs {
+                    attention: take(attention),
+                    mlp: take(mlp),
+                })
+                .collect();
+            Some(layers)
+        } else {
+            None
+        };
+
+        // Embeddings and the LM head are shared with the target, including the
+        // byte-identical copies in the supported native Qwen3-4B checkpoint.
         let norm = load_tensor_1d(ctx, &shards, &weight_map, "norm.weight")?;
         let hidden_norm = load_tensor_1d(ctx, &shards, &weight_map, "hidden_norm.weight")?;
         let fc = load_tensor_2d(
@@ -160,9 +226,7 @@ impl DFlashDraftModel {
             hidden * config.target_layer_ids.len(),
         )?;
 
-        // DSpark Markov head (Phase 1). The confidence head and the tied
-        // embed_tokens/lm_head are intentionally skipped: the head is byte-identical
-        // to the target's, which we reuse for the verify-equivalent logits.
+        // DSpark Markov head (Phase 1). The confidence head is intentionally skipped.
         let markov = if config.uses_markov_head() {
             let w1 = load_tensor_2d(
                 ctx,
@@ -191,6 +255,35 @@ impl DFlashDraftModel {
             None
         };
 
+        let selector = if config.selector_rank > 0 {
+            let rank = config.selector_rank;
+            let mut loader = StagedWeightLoader::new(ctx, &shards, &weight_map)?;
+            let w = loader.matrix(
+                "candidate_selector.hidden_projection.weight",
+                rank,
+                config.hidden_size,
+            )?;
+            let a = loader.matrix(
+                "candidate_selector.predecessor_codebook",
+                config.vocab_size,
+                rank,
+            )?;
+            let b = loader.matrix(
+                "candidate_selector.successor_codebook",
+                config.vocab_size,
+                rank,
+            )?;
+            loader.finish()?;
+            log::info!("selector: rank={rank}, top_k=16");
+            Some(SelectorHead {
+                projection: loader.take(w),
+                predecessor: loader.take(a),
+                successor: loader.take(b),
+            })
+        } else {
+            None
+        };
+
         let (cos_cache, sin_cache) = precompute_rope(
             ctx,
             &RopeTableSpec {
@@ -205,12 +298,62 @@ impl DFlashDraftModel {
         Ok(Self {
             config,
             layers,
+            convs,
             norm,
             hidden_norm,
             fc,
             cos_cache,
             sin_cache,
             markov,
+            selector,
         })
+    }
+}
+
+fn validate_conv_base(
+    tensor: &TensorView<'_>,
+    name: &str,
+    taps: usize,
+    hidden: usize,
+) -> Result<()> {
+    ensure!(
+        tensor.dtype() == Dtype::BF16,
+        "Tensor '{name}': expected dtype BF16, got {:?}",
+        tensor.dtype()
+    );
+    ensure!(
+        tensor.shape() == [2, taps, hidden],
+        "Tensor '{name}' has shape {:?}, expected [2, {taps}, {hidden}]",
+        tensor.shape()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conv_base_requires_bf16_and_exact_native_shape() -> Result<()> {
+        let name = "layers.0.attention_conv.base_kernel";
+        for (dtype, shape, expected_error) in [
+            (Dtype::BF16, vec![2, 2, 4], None),
+            (Dtype::F16, vec![2, 2, 4], Some("expected dtype BF16")),
+            (Dtype::BF16, vec![2, 4, 2], Some("expected [2, 2, 4]")),
+            (Dtype::BF16, vec![2, 2, 3], Some("expected [2, 2, 4]")),
+        ] {
+            let bytes = vec![0; shape.iter().product::<usize>() * 2];
+            let tensor = TensorView::new(dtype, shape, &bytes)?;
+            let result = validate_conv_base(&tensor, name, 2, 4);
+            if let Some(expected) = expected_error {
+                let error = result
+                    .expect_err("invalid convolution base accepted")
+                    .to_string();
+                assert!(error.contains(name) && error.contains(expected), "{error}");
+            } else {
+                result?;
+            }
+        }
+        Ok(())
     }
 }
