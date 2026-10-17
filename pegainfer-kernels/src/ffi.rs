@@ -23,6 +23,8 @@ mod kimi;
 mod lora;
 #[cfg(feature = "qwen35")]
 mod qwen35;
+#[cfg(feature = "qwen4")]
+mod qwen38fn_moe;
 mod shared;
 #[cfg(feature = "moe")]
 pub use deepep::*;
@@ -43,4 +45,6 @@ pub use kimi::*;
 pub use lora::*;
 #[cfg(feature = "qwen35")]
 pub use qwen35::*;
+#[cfg(feature = "qwen4")]
+pub use qwen38fn_moe::*;
 pub use shared::*;
