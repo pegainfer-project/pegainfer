@@ -3758,7 +3758,10 @@ dependencies = [
  "libc",
  "log",
  "pegainfer-build",
+ "safetensors",
  "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "tvm-ffi",
 ]
 
@@ -3898,6 +3901,7 @@ name = "pegainfer-qwen4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "half",
  "pegainfer-frontend",
  "safetensors",
  "serde",

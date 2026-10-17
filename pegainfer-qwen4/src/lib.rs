@@ -12,6 +12,9 @@ mod config;
 #[cfg(test)]
 mod manifest;
 pub mod model_line;
+// The PLE block's n-gram addressing: pure integer host math, so it belongs to
+// this crate's CUDA-free half and the device gather consumes what it produces.
+pub mod ngram;
 mod probe;
 
 pub use probe::MODEL_TYPE;
