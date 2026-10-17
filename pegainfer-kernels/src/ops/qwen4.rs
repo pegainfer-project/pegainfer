@@ -103,16 +103,6 @@ impl QsaIndexerGeometry {
             self.rms_eps
         );
         ensure!(
-            self.rotary_dim > 0 && self.rotary_dim <= self.head_dim,
-            "QSA indexer rotary_dim {} must be in 1..={}",
-            self.rotary_dim,
-            self.head_dim
-        );
-        ensure!(
-            self.compress_ratio > 0,
-            "QSA indexer compress_ratio must be positive"
-        );
-        ensure!(
             self.budget.is_multiple_of(self.compress_ratio),
             "QSA indexer budget {} must divide by compress_ratio {}",
             self.budget,
@@ -136,8 +126,10 @@ impl QsaIndexerGeometry {
 /// many tokens that row can see, counted from token 0. Row `j` gets
 /// `visible_len[j] / compress_ratio` scores in row `j` of `scores`, stride
 /// `score_cols`; entries past that are left untouched, as the reference leaves
-/// them NaN. The reference computes these with the block grid starting at the
-/// first visible token, which is why the two arrays are separate: causal text
+/// them NaN — a caller that wants to tell an unwritten entry from a real one
+/// has to poison the buffer itself (the parity gate pre-fills a sentinel). The
+/// reference computes these with the block grid starting at the first visible
+/// token, which is why the two arrays are separate: causal text
 /// passes `rows[j] + 1` for `visible_len[j]`.
 ///
 /// The kernel clamps both arrays into their ranges, so a caller that breaks that
