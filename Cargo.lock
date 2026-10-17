@@ -3758,6 +3758,7 @@ dependencies = [
  "libc",
  "log",
  "pegainfer-build",
+ "safetensors",
  "serde",
  "tvm-ffi",
 ]
