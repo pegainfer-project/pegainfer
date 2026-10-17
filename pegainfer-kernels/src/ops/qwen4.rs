@@ -17,6 +17,7 @@ use half::bf16;
 use crate::ffi;
 use crate::ops::checked_i32;
 use crate::tensor::DeviceContext;
+use crate::tensor::DeviceVec;
 use crate::tensor::active_cu_stream;
 
 /// The checkpoint's QSA indexer geometry. Frozen with the line: `pegainfer-qwen4`
@@ -32,11 +33,10 @@ pub struct QsaIndexerGeometry {
     pub head_dim: usize,
     /// `indexer_compress_ratio`: tokens per micro-block.
     pub compress_ratio: usize,
-    /// Dims the partial RoPE rotates: `head_dim * partial_rotary_factor` of the
-    /// *attention* head (256 * 0.25 = 64), which is under the indexer's 128.
+    /// Dims the partial RoPE rotates — `head_dim * partial_rotary_factor` of the
+    /// *attention* head (256 * 0.25 = 64), which is under the indexer's 128 —
+    /// and the row stride of the shared attention cos/sin table.
     pub rotary_dim: usize,
-    /// `rope_theta` of the checkpoint's text config.
-    pub rope_theta: f32,
     /// `rms_norm_eps`, shared by both `(1 + w)` norms.
     pub rms_eps: f32,
 }
@@ -50,7 +50,6 @@ impl QsaIndexerGeometry {
             head_dim: 128,
             compress_ratio: 4,
             rotary_dim: 64,
-            rope_theta: 1.0e7,
             rms_eps: 1.0e-6,
         }
     }
@@ -79,13 +78,6 @@ impl QsaIndexerGeometry {
                 && self.rotary_dim == 64,
             "QSA indexer geometry {self:?} is not the geometry \
              csrc/qwen4/qwen4_qsa_indexer_score.cu was compiled for"
-        );
-        // Bit equality, not a tolerance: the entry point refuses any other
-        // theta, so a geometry carrying one must not pass as if it were compiled.
-        ensure!(
-            self.rope_theta.to_bits() == 1.0e7f32.to_bits(),
-            "QSA indexer rope_theta {} is not the compiled 1e7",
-            self.rope_theta
         );
         ensure!(
             self.rms_eps >= 0.0,
@@ -116,12 +108,19 @@ impl QsaIndexerGeometry {
 ///
 /// `pooled_keys` is the workspace: `max_blocks(tokens)` rows of `head_dim`,
 /// reused across calls of the same geometry.
+///
+/// `cos`/`sin` are the shared attention RoPE tables (`pegainfer_core::rope`,
+/// `[max_pos, rotary_dim]`, position-major): the indexer rotates with the same
+/// position embeddings the attention uses, so this stage computes no trig. The
+/// tables must cover every position this call can read, `0..tokens`.
 pub fn qsa_indexer_block_scores_into(
     ctx: &DeviceContext,
     geometry: &QsaIndexerGeometry,
     fused_qk: &CudaSlice<bf16>,
     q_norm_weight: &CudaSlice<bf16>,
     k_norm_weight: &CudaSlice<bf16>,
+    cos: &DeviceVec,
+    sin: &DeviceVec,
     rows: &CudaSlice<i32>,
     visible_len: &CudaSlice<i32>,
     tokens: usize,
@@ -151,6 +150,13 @@ pub fn qsa_indexer_block_scores_into(
         q_norm_weight.len() >= geometry.head_dim && k_norm_weight.len() >= geometry.head_dim,
         "QSA indexer norm weights must hold {} bf16",
         geometry.head_dim
+    );
+    let table_len = tokens.saturating_mul(geometry.rotary_dim);
+    ensure!(
+        cos.len >= table_len && sin.len >= table_len,
+        "QSA indexer cos/sin tables hold {}/{} bf16, need {table_len} for {tokens} positions",
+        cos.len,
+        sin.len
     );
     ensure!(
         scores.len() >= query_rows.saturating_mul(score_cols),
@@ -182,6 +188,8 @@ pub fn qsa_indexer_block_scores_into(
     let (fused_ptr, _fused_guard) = fused_qk.device_ptr(&ctx.stream);
     let (q_norm_ptr, _q_norm_guard) = q_norm_weight.device_ptr(&ctx.stream);
     let (k_norm_ptr, _k_norm_guard) = k_norm_weight.device_ptr(&ctx.stream);
+    let (cos_ptr, _cos_guard) = cos.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _sin_guard) = sin.data.device_ptr(&ctx.stream);
     let (rows_ptr, _rows_guard) = rows.device_ptr(&ctx.stream);
     let (visible_ptr, _visible_guard) = visible_len.device_ptr(&ctx.stream);
     let (scores_ptr, _scores_guard) = scores.device_ptr_mut(&ctx.stream);
@@ -191,6 +199,8 @@ pub fn qsa_indexer_block_scores_into(
             fused_ptr as *const ffi::Half,
             q_norm_ptr as *const ffi::Half,
             k_norm_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
             rows_ptr as *const i32,
             visible_ptr as *const i32,
             scores_ptr as *mut f32,
@@ -200,7 +210,6 @@ pub fn qsa_indexer_block_scores_into(
             score_cols,
             fused_width,
             rotary_dim,
-            geometry.rope_theta,
             geometry.rms_eps,
             active_cu_stream(ctx),
         )
@@ -254,13 +263,6 @@ mod tests {
                 "rotary_dim",
                 QsaIndexerGeometry {
                     rotary_dim: 32,
-                    ..compiled
-                },
-            ),
-            (
-                "rope_theta",
-                QsaIndexerGeometry {
-                    rope_theta: 1.0e6,
                     ..compiled
                 },
             ),

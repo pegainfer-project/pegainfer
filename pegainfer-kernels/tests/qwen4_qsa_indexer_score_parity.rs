@@ -28,6 +28,7 @@ use half::bf16;
 use pegainfer_kernels::ops::QsaIndexerGeometry;
 use pegainfer_kernels::ops::qsa_indexer_block_scores_into;
 use pegainfer_kernels::tensor::DeviceContext;
+use pegainfer_kernels::tensor::DeviceVec;
 use safetensors::SafeTensors;
 use sha2::Digest;
 use sha2::Sha256;
@@ -54,13 +55,13 @@ const CASES: usize = 7;
 ///
 /// The tight bound's discriminative floor is the measured mutation floor, not an
 /// assumption about the arithmetic: keeping the pooled mean in f32 instead of
-/// its bf16 round trip moves scores by 1.55e-2, keeping cos/sin in f32 by
-/// 1.15e-2, 100x `rms_eps` by 1.25e-2, dropping `rms_eps` or pooling by sum by
-/// 3.3e-3, moving the pooled key's RoPE to the block end by 2.7, and a
-/// post-sum relu by 0.83 — every one of them two to six orders past the tight
-/// bound. Architecture variance is not a reason to loosen it: the gate prints
-/// identical numbers on sm_89 and sm_120, and a host trig table in the
-/// reference's style leaves all 3,674 scores unchanged.
+/// its bf16 round trip moves scores by 1.55e-2, 100x `rms_eps` by 1.25e-2,
+/// dropping `rms_eps` or pooling by sum by 3.3e-3, moving the pooled key's RoPE
+/// to the block end by 2.7, and a post-sum relu by 0.83 — every one of them
+/// two to six orders past the tight bound. Architecture variance is not a
+/// reason to loosen it: the gate prints identical numbers on sm_89 and sm_120,
+/// and the kernel reads the same host-built table the attention uses, so there
+/// is no device trig to vary.
 const ATOL_TIGHT: f32 = 2.0e-6;
 const RTOL_TIGHT: f32 = 2.0e-6;
 const ATOL_LONG: f32 = 5.0e-3;
@@ -82,6 +83,41 @@ const SENTINEL: f32 = -12345.0;
 
 fn fixture_path() -> String {
     format!("{}/../test_data/{FIXTURE}", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn config_theta(config: &serde_json::Value) -> f32 {
+    config["text_config"]["rope_parameters"]["rope_theta"]
+        .as_f64()
+        .expect("rope_theta") as f32
+}
+
+/// The attention line's cos/sin tables, built exactly like
+/// `pegainfer_core::rope::RopeTableSpec::tables`: `[max_pos, rotary_dim]`,
+/// position-major, half-split duplicated, bf16. The gate builds them here
+/// because `pegainfer-kernels` cannot depend on `pegainfer-core` (the crate
+/// dependency runs the other way); production builds the same table with that
+/// function and passes it in, which is the point of the kernel reading it.
+fn rope_tables(rotary_dim: usize, theta: f32, max_pos: usize) -> (Vec<bf16>, Vec<bf16>) {
+    assert!(rotary_dim > 0 && rotary_dim.is_multiple_of(2) && max_pos > 0);
+    let half_dim = rotary_dim / 2;
+    let inv_freq: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / theta.powf(i as f32 * 2.0 / rotary_dim as f32))
+        .collect();
+    let mut cos = vec![bf16::ZERO; max_pos * rotary_dim];
+    let mut sin = vec![bf16::ZERO; max_pos * rotary_dim];
+    for pos in 0..max_pos {
+        let base = pos * rotary_dim;
+        for i in 0..half_dim {
+            let angle = pos as f32 * inv_freq[i];
+            let c = bf16::from_f32(angle.cos());
+            let s = bf16::from_f32(angle.sin());
+            cos[base + i] = c;
+            cos[base + i + half_dim] = c;
+            sin[base + i] = s;
+            sin[base + i + half_dim] = s;
+        }
+    }
+    (cos, sin)
 }
 
 /// Bit equality for the scalars the kernel pins and the exact derivations
@@ -107,8 +143,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// The fixture's own record of what it was dumped from, held against the
 /// reference version, the frozen config's bytes and the geometry this crate
-/// compiles for.
-fn assert_provenance(bytes: &[u8]) {
+/// compiles for. Returns the parsed config, whose `rope_theta` builds the
+/// cos/sin tables the gate feeds the kernel.
+fn assert_provenance(bytes: &[u8]) -> serde_json::Value {
     let (_, metadata) = SafeTensors::read_metadata(bytes).expect("fixture metadata");
     let recorded = metadata
         .metadata()
@@ -163,9 +200,8 @@ fn assert_provenance(bytes: &[u8]) {
         .as_f64()
         .expect("rope_theta");
     assert!(
-        same_f32(rope_theta as f32, geometry.rope_theta),
-        "rope_theta {rope_theta} is not the compiled {}",
-        geometry.rope_theta
+        rope_theta.is_finite() && rope_theta > 0.0,
+        "rope_theta {rope_theta} cannot build a table"
     );
     let rms_eps = text["rms_norm_eps"].as_f64().expect("rms_norm_eps");
     assert!(
@@ -196,6 +232,7 @@ fn assert_provenance(bytes: &[u8]) {
         manifest["torch_version"].as_str().unwrap_or("?"),
         manifest["platform"].as_str().unwrap_or("?"),
     );
+    config
 }
 
 fn i32_tensor(fixture: &SafeTensors<'_>, name: &str) -> (Vec<usize>, Vec<i32>) {
@@ -361,6 +398,8 @@ fn check_case(
     geometry: &QsaIndexerGeometry,
     q_norm: &CudaSlice<bf16>,
     k_norm: &CudaSlice<bf16>,
+    cos: &DeviceVec,
+    sin: &DeviceVec,
     case: &Case,
 ) -> CaseSummary {
     let query_rows = case.rows.len();
@@ -389,6 +428,8 @@ fn check_case(
         &fused,
         q_norm,
         k_norm,
+        cos,
+        sin,
         &rows_dev,
         &visible_dev,
         case.tokens,
@@ -500,8 +541,8 @@ fn fixture_records_the_frozen_reference() {
 /// The kernel's own half of the refusal contract, device-free: the entry point
 /// rejects a geometry it was not compiled for *before* it forms a launch. It
 /// is the only place the compiled row stride is checked — the reason
-/// `fused_width` is an argument at all — and `rotary_dim` and `rope_theta`
-/// are compiled constants nothing else can be held against.
+/// `fused_width` is an argument at all — and `rotary_dim` is the cos/sin
+/// tables' compiled row stride, which nothing else can be held against.
 ///
 /// Every call below leaves through a guard before the first launch, so the
 /// pointers can dangle. The two zero-extent calls come first as the positive
@@ -521,11 +562,13 @@ fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
     let invalid = CUresult::CUDA_ERROR_INVALID_VALUE as i32;
     let success = CUresult::CUDA_SUCCESS as i32;
 
-    // (query_rows, tokens, score_cols, fused_width, rotary_dim, rope_theta, rms_eps)
-    let call = |args: (i32, i32, i32, i32, i32, f32, f32)| {
-        let (query_rows, tokens, score_cols, fused_width, rotary_dim, rope_theta, rms_eps) = args;
+    // (query_rows, tokens, score_cols, fused_width, rotary_dim, rms_eps)
+    let call = |args: (i32, i32, i32, i32, i32, f32)| {
+        let (query_rows, tokens, score_cols, fused_width, rotary_dim, rms_eps) = args;
         (unsafe {
             entry(
+                half,
+                half,
                 half,
                 half,
                 half,
@@ -538,7 +581,6 @@ fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
                 score_cols,
                 fused_width,
                 rotary_dim,
-                rope_theta,
                 rms_eps,
                 std::ptr::null_mut(),
             )
@@ -547,12 +589,12 @@ fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
 
     // Zero extent, so the guards are the whole of the call and no launch follows.
     assert_eq!(
-        call((0, 8, 2, 640, 64, 1.0e7, 1.0e-6)),
+        call((0, 8, 2, 640, 64, 1.0e-6)),
         success,
         "the compiled geometry must pass the guards"
     );
     assert_eq!(
-        call((1, 0, 0, 640, 64, 1.0e7, 1.0e-6)),
+        call((1, 0, 0, 640, 64, 1.0e-6)),
         success,
         "an empty call must pass the guards"
     );
@@ -560,83 +602,125 @@ fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
     for (what, result) in [
         (
             "a fused row stride that is not the compiled 640 wide",
-            call((0, 8, 2, 639, 64, 1.0e7, 1.0e-6)),
+            call((0, 8, 2, 639, 64, 1.0e-6)),
         ),
         (
             "a fused row stride wider than the compiled one",
-            call((0, 8, 2, 641, 64, 1.0e7, 1.0e-6)),
+            call((0, 8, 2, 641, 64, 1.0e-6)),
         ),
         (
-            "a rotary split that is not the compiled 64 of the 128-dim head",
-            call((0, 8, 2, 640, 32, 1.0e7, 1.0e-6)),
+            "a table stride that is not the compiled 64",
+            call((0, 8, 2, 640, 32, 1.0e-6)),
         ),
         (
-            "a rotary split over the whole indexer head",
-            call((0, 8, 2, 640, 128, 1.0e7, 1.0e-6)),
+            "a table stride over the whole indexer head",
+            call((0, 8, 2, 640, 128, 1.0e-6)),
         ),
-        (
-            "a rope_theta that is not the compiled 1e7",
-            call((0, 8, 2, 640, 64, 1.0e6, 1.0e-6)),
-        ),
-        (
-            // One f32 ulp: the geometry's own bit-equality check, from the
-            // kernel's side, and what a config drifting in the last place hits.
-            "a rope_theta one ulp from the compiled 1e7",
-            call((
-                0,
-                8,
-                2,
-                640,
-                64,
-                f32::from_bits(1.0e7f32.to_bits() + 1),
-                1.0e-6,
-            )),
-        ),
-        (
-            "a negative rms_eps",
-            call((0, 8, 2, 640, 64, 1.0e7, -1.0e-6)),
-        ),
+        ("a negative rms_eps", call((0, 8, 2, 640, 64, -1.0e-6))),
         (
             // `!(rms_eps >= 0)` refuses NaN, which would otherwise poison every
             // norm silently rather than fail loudly.
             "a NaN rms_eps",
-            call((0, 8, 2, 640, 64, 1.0e7, f32::NAN)),
+            call((0, 8, 2, 640, 64, f32::NAN)),
         ),
         (
             "a negative query-row count",
-            call((-1, 8, 2, 640, 64, 1.0e7, 1.0e-6)),
+            call((-1, 8, 2, 640, 64, 1.0e-6)),
         ),
-        (
-            "a negative token count",
-            call((0, -1, 2, 640, 64, 1.0e7, 1.0e-6)),
-        ),
-        (
-            "a negative score stride",
-            call((0, 8, -1, 640, 64, 1.0e7, 1.0e-6)),
-        ),
+        ("a negative token count", call((0, -1, 2, 640, 64, 1.0e-6))),
+        ("a negative score stride", call((0, 8, -1, 640, 64, 1.0e-6))),
         (
             // 8 tokens is 2 complete blocks, so a 1-wide row is the
             // out-of-bounds write the stride check exists for.
             "a score stride under the block grid",
-            call((1, 8, 1, 640, 64, 1.0e7, 1.0e-6)),
+            call((1, 8, 1, 640, 64, 1.0e-6)),
         ),
     ] {
         assert_eq!(result, invalid, "{what} must be refused");
     }
 
-    // One position per kind of argument — an input, the score output and the
+    // One position per kind of argument — the inputs, the score output and the
     // pool workspace — so the chain is pinned to cover the pointers, not just
     // the extents.
-    for (what, fused_qk, scores, pooled_keys) in [
-        ("a null fused_qk", std::ptr::null(), float, pool),
-        ("a null scores", half, std::ptr::null_mut(), pool),
-        ("a null pooled_keys", half, float, std::ptr::null_mut()),
+    for (what, fused_qk, q_norm, k_norm, cos, sin, scores, pooled_keys) in [
+        (
+            "a null fused_qk",
+            std::ptr::null_mut(),
+            half,
+            half,
+            half,
+            half,
+            float,
+            pool,
+        ),
+        (
+            "a null q_norm_weight",
+            half,
+            std::ptr::null_mut(),
+            half,
+            half,
+            half,
+            float,
+            pool,
+        ),
+        (
+            "a null k_norm_weight",
+            half,
+            half,
+            std::ptr::null_mut(),
+            half,
+            half,
+            float,
+            pool,
+        ),
+        (
+            "a null cos table",
+            half,
+            half,
+            half,
+            std::ptr::null_mut(),
+            half,
+            float,
+            pool,
+        ),
+        (
+            "a null sin table",
+            half,
+            half,
+            half,
+            half,
+            std::ptr::null_mut(),
+            float,
+            pool,
+        ),
+        (
+            "a null scores",
+            half,
+            half,
+            half,
+            half,
+            half,
+            std::ptr::null_mut(),
+            pool,
+        ),
+        (
+            "a null pooled_keys",
+            half,
+            half,
+            half,
+            half,
+            half,
+            float,
+            std::ptr::null_mut(),
+        ),
     ] {
         let result = unsafe {
             entry(
                 fused_qk,
-                half,
-                half,
+                q_norm,
+                k_norm,
+                cos,
+                sin,
                 int,
                 int,
                 scores,
@@ -646,7 +730,6 @@ fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
                 2,
                 640,
                 64,
-                1.0e7,
                 1.0e-6,
                 std::ptr::null_mut(),
             )
@@ -661,9 +744,10 @@ fn qsa_indexer_block_scores_match_the_reference() {
         return;
     };
     let bytes = std::fs::read(fixture_path()).expect("read fixture");
-    assert_provenance(&bytes);
+    let config = assert_provenance(&bytes);
     let fixture = SafeTensors::deserialize(&bytes).expect("parse fixture");
     let geometry = QsaIndexerGeometry::qwen38_flash_next();
+    let theta = config_theta(&config);
 
     let (_, q_norm) = bf16_tensor(&fixture, "q_layernorm");
     let (_, k_norm) = bf16_tensor(&fixture, "k_layernorm");
@@ -696,7 +780,18 @@ fn qsa_indexer_block_scores_match_the_reference() {
             !(*v as u32).is_multiple_of(geometry.compress_ratio as u32)
         }));
 
-        let summary = check_case(&ctx, &geometry, &q_norm_dev, &k_norm_dev, &case);
+        let (cos_host, sin_host) = rope_tables(geometry.rotary_dim, theta, case.tokens);
+        let cos_dev = DeviceVec::from_host(&ctx, &cos_host).expect("cos upload");
+        let sin_dev = DeviceVec::from_host(&ctx, &sin_host).expect("sin upload");
+        let summary = check_case(
+            &ctx,
+            &geometry,
+            &q_norm_dev,
+            &k_norm_dev,
+            &cos_dev,
+            &sin_dev,
+            &case,
+        );
         total += summary.compared;
         worst_abs = worst_abs.max(summary.max_abs);
         worst_scaled = worst_scaled.max(summary.max_scaled);
@@ -752,7 +847,7 @@ fn a_poisoned_key_keeps_its_nan_score() {
         return;
     };
     let bytes = std::fs::read(fixture_path()).expect("read fixture");
-    assert_provenance(&bytes);
+    let config = assert_provenance(&bytes);
     let fixture = SafeTensors::deserialize(&bytes).expect("parse fixture");
     let geometry = QsaIndexerGeometry::qwen38_flash_next();
     let (_, q_norm) = bf16_tensor(&fixture, "q_layernorm");
@@ -763,6 +858,9 @@ fn a_poisoned_key_keeps_its_nan_score() {
     // Case 2: 64 tokens and 16 blocks, so every row from position 3 on sees
     // block 0, which is the block the poisoned token pools into.
     let mut case = load_case(&fixture, 2, &geometry);
+    let (cos_host, sin_host) = rope_tables(geometry.rotary_dim, config_theta(&config), case.tokens);
+    let cos_dev = DeviceVec::from_host(&ctx, &cos_host).expect("cos upload");
+    let sin_dev = DeviceVec::from_host(&ctx, &sin_host).expect("sin upload");
     case.keys[0] = bf16::from_f32(f32::NAN);
     let visible_len = visible_counts(&case);
     let query_rows = case.rows.len();
@@ -788,6 +886,8 @@ fn a_poisoned_key_keeps_its_nan_score() {
         &fused,
         &q_norm_dev,
         &k_norm_dev,
+        &cos_dev,
+        &sin_dev,
         &rows_dev,
         &visible_dev,
         case.tokens,

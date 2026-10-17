@@ -11,6 +11,7 @@ mod common;
 use half::bf16;
 use pegainfer_kernels::ops::QsaIndexerGeometry;
 use pegainfer_kernels::ops::qsa_indexer_block_scores_into;
+use pegainfer_kernels::tensor::DeviceVec;
 
 const TOKENS: usize = 8;
 
@@ -38,6 +39,12 @@ fn out_of_range_row_traps() {
         .stream
         .clone_htod(&vec![bf16::ZERO; geometry.head_dim])
         .expect("k norm");
+    // The trap fires before any table read, so the contents are irrelevant;
+    // only the tables' capacity is checked by the wrapper.
+    let cos = DeviceVec::from_host(ctx, &vec![bf16::ZERO; TOKENS * geometry.rotary_dim])
+        .expect("cos table");
+    let sin = DeviceVec::from_host(ctx, &vec![bf16::ZERO; TOKENS * geometry.rotary_dim])
+        .expect("sin table");
     // Row 8 is the first position past the 8-token key array (valid: 0..=7).
     let rows = ctx.stream.clone_htod(&[TOKENS as i32]).expect("rows H2D");
     let visible = ctx
@@ -59,6 +66,8 @@ fn out_of_range_row_traps() {
         &fused,
         &q_norm,
         &k_norm,
+        &cos,
+        &sin,
         &rows,
         &visible,
         TOKENS,

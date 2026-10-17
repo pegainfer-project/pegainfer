@@ -13,11 +13,14 @@ unsafe extern "C" {
     ///
     /// `fused_width` is the caller's row stride for `fused_qk`; the body reads
     /// with the width it was compiled for, so a mismatch is refused rather than
-    /// read out of bounds.
+    /// read out of bounds. `rotary_dim` is the cos/sin tables' row stride, for
+    /// the same reason.
     pub fn qwen4_qsa_indexer_block_scores_cuda(
         fused_qk: *const Half,
         q_norm_weight: *const Half,
         k_norm_weight: *const Half,
+        cos_table: *const Half,
+        sin_table: *const Half,
         rows: *const i32,
         visible_len: *const i32,
         scores: *mut f32,
@@ -27,7 +30,6 @@ unsafe extern "C" {
         score_cols: i32,
         fused_width: i32,
         rotary_dim: i32,
-        rope_theta: f32,
         rms_eps: f32,
         stream: CUstream,
     ) -> CUresult;
