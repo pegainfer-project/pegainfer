@@ -52,7 +52,7 @@ constexpr int kThreads = 128;
 constexpr int kWarps = kThreads / WARP_SIZE;
 
 static_assert(kRotaryDim / 2 == WARP_SIZE, "a rope pair must be one lane's dims 0 and 1");
-static_assert(kDimPerLane == kHeadDim / WARP_SIZE);
+static_assert(kHeadDim % WARP_SIZE == 0, "a head must split into whole lanes");
 
 // Sum across all 32 lanes, leaving it in every lane (common.cuh's
 // `warp_reduce_sum` leaves it in lane 0, which the norm needs broadcast).
@@ -160,27 +160,25 @@ __global__ void qwen4_qsa_block_scores_kernel(
     float* __restrict__ scores,                         // [query_rows, score_cols]
     int tokens,
     int score_cols,
-    int blocks,
     float rms_eps) {
   const int row = blockIdx.x;
   const int lane = threadIdx.x % WARP_SIZE;
   const int warp = threadIdx.x / WARP_SIZE;
 
   // `rows[row]` is the row's own position and the fused_qk row its query
-  // heads are read from; clamped, like `visible_len` below, so a broken
-  // caller gets a wrong position rather than an out-of-bounds read.
-  const int raw_pos = rows[row];
-  const int pos = raw_pos < 0 ? 0 : (raw_pos >= tokens ? tokens - 1 : raw_pos);
-  int visible = visible_len[row];
-  if (visible < 0) {
-    visible = 0;
-  } else if (visible > tokens) {
-    visible = tokens;
+  // heads are read from; `visible_len[row]` is how many tokens it sees. Both
+  // are caller-provided device values and are checked here: an out-of-range
+  // entry traps, because clamping would hand the caller a plausible score for
+  // a row it never asked about.
+  const int pos = rows[row];
+  if (pos < 0 || pos >= tokens) {
+    __trap();
   }
-  int row_blocks = visible / kRatio;
-  if (row_blocks > blocks) {
-    row_blocks = blocks;
+  const int visible = visible_len[row];
+  if (visible < 0 || visible > tokens) {
+    __trap();
   }
+  const int row_blocks = visible / kRatio;
   if (row_blocks <= 0) {
     return;
   }
@@ -249,9 +247,14 @@ __global__ void qwen4_qsa_block_scores_kernel(
     }
     if (lane == 0) {
       // relu per head, then the sum over heads, then the 1/sqrt(head_dim)
-      // scale: all three are the reference's own order.
-      const float relu_sum = fmaxf(acc[0], 0.0f) + fmaxf(acc[1], 0.0f) +
-                             fmaxf(acc[2], 0.0f) + fmaxf(acc[3], 0.0f);
+      // scale: all three are the reference's own order. Written as a
+      // comparison rather than `fmaxf`, which returns the other operand when
+      // one is NaN — a poisoned score must stay NaN like `torch.relu`, not
+      // turn into a valid-looking zero.
+      const float relu_sum = (acc[0] < 0.0f ? 0.0f : acc[0]) +
+                             (acc[1] < 0.0f ? 0.0f : acc[1]) +
+                             (acc[2] < 0.0f ? 0.0f : acc[2]) +
+                             (acc[3] < 0.0f ? 0.0f : acc[3]);
       scores[static_cast<int64_t>(row) * score_cols + block] =
           relu_sum / sqrtf(static_cast<float>(kHeadDim));
     }
@@ -327,7 +330,7 @@ CUresult qwen4_qsa_indexer_block_scores_cuda(
   }
   qwen4_qsa_block_scores_kernel<<<query_rows, kThreads, 0, stream>>>(
       fused_qk, q_norm_weight, pooled_keys, rows, visible_len, scores, tokens,
-      score_cols, blocks, rms_eps);
+      score_cols, rms_eps);
   return consume_last_cuda_error();
 }
 

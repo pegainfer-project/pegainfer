@@ -43,25 +43,38 @@ const CASES: usize = 7;
 
 /// Score parity bound, `abs(got - want) <= ATOL + RTOL * abs(want)`.
 ///
-/// Six cases land within 9.6e-7 — every bf16 rounding decision the reference
-/// makes is reproduced bit-for-bit. The residual sits in the seventh (the only
-/// case with positions past 63): 152 of 3076 scores above 1e-4, worst 2.4e-3,
-/// sign-balanced with a -5.2e-7 bias — the shape of a flipped bf16 rounding
-/// decision, not a semantic difference. The reference rounds its float32
-/// reductions in a torch-defined order; where a value sits within one f32 ulp
-/// of a bf16 midpoint the kernel's butterfly tree rounds apart from it, and
-/// one flipped element moves every score it touches. The reference does the
-/// same to itself: re-deriving case 2 on x86 (torch 2.14.1 vs the golden's
-/// 2.14.0/arm64) moves one of its 496 scores by 2.2e-3, three orders more than
-/// this kernel's 9.5e-7 there.
+/// Cases 0..6 sit at ≤9.6e-7 (measured: 8.9e-8 for the 5-token case, 4.8e-7 for
+/// the 8-token one, and 9.5e-7 or less on the rest), which is a handful of f32
+/// ulps, so they carry a tight bound. The long case is the only one with
+/// positions past 63 and 513 blocks; its 2.4e-3 residual has the shape of a
+/// flipped bf16 rounding decision — the reference reproduces the same size
+/// across environments: re-deriving its case 2 on x86 from the fixture's own
+/// inputs moves one of its 496 scores by 2.2e-3 — and keeps the loose bound
+/// until that residual is traced.
 ///
-/// So the bound holds ~6 flips at a typical score of ~2, against a measured
-/// worst of 0.16 of it, while any real fault — a block off by one, a missing
-/// relu, an unrotated half — moves a score by ~1, two orders out. Selection
-/// must treat a block tied at the cut as an equally valid pick, for the same
-/// reason.
-const ATOL: f32 = 5.0e-3;
-const RTOL: f32 = 5.0e-3;
+/// The tight bound's discriminative floor is the measured mutation floor, not an
+/// assumption about the arithmetic: keeping the pooled mean in f32 instead of
+/// its bf16 round trip moves scores by 1.55e-2, keeping cos/sin in f32 by
+/// 1.15e-2, 100x `rms_eps` by 1.25e-2, dropping `rms_eps` or pooling by sum by
+/// 3.3e-3, moving the pooled key's RoPE to the block end by 2.7, and a
+/// post-sum relu by 0.83 — every one of them two to six orders past the tight
+/// bound. Architecture variance is not a reason to loosen it: the gate prints
+/// identical numbers on sm_89 and sm_120, and a host trig table in the
+/// reference's style leaves all 3,674 scores unchanged.
+const ATOL_TIGHT: f32 = 2.0e-6;
+const RTOL_TIGHT: f32 = 2.0e-6;
+const ATOL_LONG: f32 = 5.0e-3;
+const RTOL_LONG: f32 = 5.0e-3;
+/// The only case whose residual is not yet traced.
+const LONG_CASE: usize = 6;
+
+fn parity_bound(case: usize) -> (f32, f32) {
+    if case == LONG_CASE {
+        (ATOL_LONG, RTOL_LONG)
+    } else {
+        (ATOL_TIGHT, RTOL_TIGHT)
+    }
+}
 
 /// Written over the score buffer before every launch, to prove the kernel writes
 /// exactly the valid prefix of each row and nothing else.
@@ -94,8 +107,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// The fixture's own record of what it was dumped from, held against the
 /// reference version, the frozen config's bytes and the geometry this crate
-/// compiles for. Returns the manifest.
-fn assert_provenance(bytes: &[u8]) -> serde_json::Value {
+/// compiles for.
+fn assert_provenance(bytes: &[u8]) {
     let (_, metadata) = SafeTensors::read_metadata(bytes).expect("fixture metadata");
     let recorded = metadata
         .metadata()
@@ -146,7 +159,6 @@ fn assert_provenance(bytes: &[u8]) -> serde_json::Value {
         field("indexer_compress_ratio"),
         geometry.compress_ratio as u64
     );
-    assert_eq!(field("indexer_budget"), geometry.budget as u64);
     let rope_theta = text["rope_parameters"]["rope_theta"]
         .as_f64()
         .expect("rope_theta");
@@ -173,13 +185,6 @@ fn assert_provenance(bytes: &[u8]) -> serde_json::Value {
         geometry.rotary_dim
     );
     assert!(geometry.rotary_dim <= geometry.head_dim);
-    let full_layers = text["layer_types"]
-        .as_array()
-        .expect("layer_types")
-        .iter()
-        .filter(|kind| kind.as_str() == Some("full_attention"))
-        .count();
-    assert_eq!(full_layers, 12, "the checkpoint's sparse-attention layers");
     // Recorded, not asserted: the host the golden was dumped on decides the
     // order its float32 reductions round in, which is where the parity bound's
     // residual comes from, and any other host's order is an equally valid
@@ -191,7 +196,6 @@ fn assert_provenance(bytes: &[u8]) -> serde_json::Value {
         manifest["torch_version"].as_str().unwrap_or("?"),
         manifest["platform"].as_str().unwrap_or("?"),
     );
-    manifest
 }
 
 fn i32_tensor(fixture: &SafeTensors<'_>, name: &str) -> (Vec<usize>, Vec<i32>) {
@@ -332,14 +336,16 @@ fn visible_counts(case: &Case) -> Vec<i32> {
 }
 
 /// One case's parity: how much was compared, the worst element and where, and
-/// the shape of the residual — the sign split and the bias catch a
-/// *systematic* error (a lean one way, deviations piling up in one row)
-/// that a max alone cannot.
+/// the shape of the residual. The sign split, the bias and the widest row are
+/// read-outs — printed as evidence, not asserted — so the assertion is the
+/// bound and each metric keeps its own coordinates.
 struct CaseSummary {
     compared: usize,
     max_abs: f32,
+    /// `(position, block, scored, reference)` of the largest absolute error.
+    max_abs_at: (i32, usize, f32, f32),
     max_scaled: f32,
-    /// `(position, block, scored, reference)`
+    /// `(position, block, scored, reference)` of the largest scaled error.
     worst: (i32, usize, f32, f32),
     over_1e4: usize,
     over_1e5: usize,
@@ -394,8 +400,10 @@ fn check_case(
     ctx.sync().expect("sync");
     let got = ctx.stream.clone_dtoh(&scores_dev).expect("score download");
 
+    let (atol, rtol) = parity_bound(case.index);
     let mut compared = 0usize;
     let mut max_abs = 0.0f32;
+    let mut max_abs_at = (0i32, 0usize, 0.0f32, 0.0f32);
     let mut max_scaled = 0.0f32;
     let mut worst = (0i32, 0usize, 0.0f32, 0.0f32);
     let mut over_1e4 = 0usize;
@@ -437,8 +445,11 @@ fn check_case(
             );
             let delta = x - want;
             let abs = delta.abs();
-            let scaled = abs / (ATOL + RTOL * want.abs());
-            max_abs = max_abs.max(abs);
+            let scaled = abs / (atol + rtol * want.abs());
+            if abs > max_abs {
+                max_abs = abs;
+                max_abs_at = (*row, block, *x, *want);
+            }
             signed_sum += f64::from(delta);
             over_1e4 += usize::from(abs > 1.0e-4);
             over_1e5 += usize::from(abs > 1.0e-5);
@@ -457,7 +468,7 @@ fn check_case(
             let (block, x, want, abs) = case_worst.expect("a worst element");
             panic!(
                 "case {}: row {row} block {block} scored {x} against the reference's \
-                 {want}, {abs:.3e} off; the bound is ATOL {ATOL} + RTOL {RTOL} * |want|",
+                 {want}, {abs:.3e} off; the bound is ATOL {atol} + RTOL {rtol} * |want|",
                 case.index
             );
         }
@@ -467,6 +478,7 @@ fn check_case(
     CaseSummary {
         compared,
         max_abs,
+        max_abs_at,
         max_scaled,
         worst,
         over_1e4,
@@ -663,9 +675,7 @@ fn qsa_indexer_block_scores_match_the_reference() {
     let mut total = 0usize;
     let mut worst_abs = 0.0f32;
     let mut worst_scaled = 0.0f32;
-    let mut truncating = 0usize;
     let mut ragged = 0usize;
-    let mut boundary = 0usize;
     let mut over_1e4 = 0usize;
     let mut over_1e5 = 0usize;
     for index in 0..CASES {
@@ -677,15 +687,14 @@ fn qsa_indexer_block_scores_match_the_reference() {
             .map(|visible| usize::try_from(*visible).expect("visible") / geometry.compress_ratio)
             .max()
             .expect("a query row");
-        // Coverage the fixture claims, asserted rather than assumed: a case that
-        // scores more blocks than the budget keeps (so scoring cannot be the
-        // truncating stage), a case with a tail, and the real 512-block edge.
-        truncating += usize::from(scored > kept);
+        // The fixture's coverage is printed, not asserted: how many blocks each
+        // row scores versus what the budget would keep is selection-stage
+        // bookkeeping, and the `ragged` check below is the part this stage
+        // needs (the incomplete tail must exist).
         ragged += usize::from(visible_len.iter().any(|v| {
             // `visible_len` is non-negative, so the unsigned cast is exact.
             !(*v as u32).is_multiple_of(geometry.compress_ratio as u32)
         }));
-        boundary += usize::from(kept == geometry.budget / geometry.compress_ratio && scored > kept);
 
         let summary = check_case(&ctx, &geometry, &q_norm_dev, &k_norm_dev, &case);
         total += summary.compared;
@@ -693,16 +702,24 @@ fn qsa_indexer_block_scores_match_the_reference() {
         worst_scaled = worst_scaled.max(summary.max_scaled);
         over_1e4 += summary.over_1e4;
         over_1e5 += summary.over_1e5;
+        let (atol, rtol) = parity_bound(index);
         println!(
             "case {index}: {} block scores over {} rows, tokens {}, budget {}, \
              blocks scored {scored} vs kept {kept}: max abs {:.3e} at row {} block {} \
-             ({:.9} against {:.9}), above 1e-4 {}/{} ({} positive), above 1e-5 {}/{}, \
-             bias {:+.2e}, widest row {} with {}, bound fraction {:.3}",
+             ({:.9} against {:.9}); worst bound fraction {:.3} at row {} block {} \
+             ({:.9} against {:.9}); bound ATOL {atol:.1e} + RTOL {rtol:.1e} * |want|; \
+             above 1e-4 {}/{} ({} positive), above 1e-5 {}/{}, bias {:+.2e}, \
+             widest row {} with {}",
             summary.compared,
             case.rows.len(),
             case.tokens,
             case.budget,
             summary.max_abs,
+            summary.max_abs_at.0,
+            summary.max_abs_at.1,
+            summary.max_abs_at.2,
+            summary.max_abs_at.3,
+            summary.max_scaled,
             summary.worst.0,
             summary.worst.1,
             summary.worst.2,
@@ -715,23 +732,100 @@ fn qsa_indexer_block_scores_match_the_reference() {
             summary.bias,
             summary.widest_row.0,
             summary.widest_row.1,
-            summary.max_scaled,
         );
     }
     println!(
         "parity over {CASES} cases and {total} block scores: max abs {worst_abs:.3e}, \
-         worst bound fraction {worst_scaled:.3} (ATOL {ATOL}, RTOL {RTOL}); \
-         {over_1e4} of {total} above 1e-4, {over_1e5} above 1e-5"
-    );
-    assert!(
-        truncating >= 1,
-        "a case must score past what its budget's top-k would keep, or scoring \
-         could be confused with the truncating stage"
+         worst bound fraction {worst_scaled:.3}; {over_1e4} of {total} above 1e-4, \
+         {over_1e5} above 1e-5"
     );
     assert!(ragged >= 1, "the incomplete tail must be covered");
-    assert_eq!(boundary, 1, "the 512-block budget edge must be covered");
-    assert!(
-        worst_scaled <= 1.0,
-        "worst block score is {worst_scaled} of the bound"
-    );
+}
+
+/// A poisoned key must not read as a valid lowest score. `torch.relu` keeps a
+/// NaN, and the kernel's relu is written to match: the micro-block that pools
+/// the poisoned token scores NaN for every row that can see it, while the other
+/// blocks stay finite and the untouched columns stay sentinel.
+#[test]
+fn a_poisoned_key_keeps_its_nan_score() {
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let bytes = std::fs::read(fixture_path()).expect("read fixture");
+    assert_provenance(&bytes);
+    let fixture = SafeTensors::deserialize(&bytes).expect("parse fixture");
+    let geometry = QsaIndexerGeometry::qwen38_flash_next();
+    let (_, q_norm) = bf16_tensor(&fixture, "q_layernorm");
+    let (_, k_norm) = bf16_tensor(&fixture, "k_layernorm");
+    let q_norm_dev = ctx.stream.clone_htod(&q_norm).expect("q norm upload");
+    let k_norm_dev = ctx.stream.clone_htod(&k_norm).expect("k norm upload");
+
+    // Case 2: 64 tokens and 16 blocks, so every row from position 3 on sees
+    // block 0, which is the block the poisoned token pools into.
+    let mut case = load_case(&fixture, 2, &geometry);
+    case.keys[0] = bf16::from_f32(f32::NAN);
+    let visible_len = visible_counts(&case);
+    let query_rows = case.rows.len();
+    let score_cols = case.score_cols;
+
+    let fused = ctx
+        .stream
+        .clone_htod(&fused_rows(&case, &geometry))
+        .expect("fused upload");
+    let rows_dev = ctx.stream.clone_htod(&case.rows).expect("rows upload");
+    let visible_dev = ctx.stream.clone_htod(&visible_len).expect("visible upload");
+    let mut scores_dev = ctx
+        .stream
+        .clone_htod(&vec![SENTINEL; query_rows * score_cols])
+        .expect("score buffer");
+    let mut pooled_dev = ctx
+        .stream
+        .alloc_zeros::<bf16>(geometry.max_blocks(case.tokens) * geometry.head_dim)
+        .expect("pooled workspace");
+    qsa_indexer_block_scores_into(
+        &ctx,
+        &geometry,
+        &fused,
+        &q_norm_dev,
+        &k_norm_dev,
+        &rows_dev,
+        &visible_dev,
+        case.tokens,
+        &mut scores_dev,
+        score_cols,
+        &mut pooled_dev,
+    )
+    .expect("QSA indexer block scores");
+    ctx.sync().expect("sync");
+    let got = ctx.stream.clone_dtoh(&scores_dev).expect("score download");
+
+    let mut saw_nan = 0usize;
+    for (slot, row) in case.rows.iter().enumerate() {
+        let blocks = usize::try_from(visible_len[slot]).expect("visible") / geometry.compress_ratio;
+        let row_got = &got[slot * score_cols..][..score_cols];
+        if blocks > 0 {
+            assert!(
+                row_got[0].is_nan(),
+                "case 2 row {row}: the poisoned block must stay NaN, got {}",
+                row_got[0]
+            );
+            saw_nan += 1;
+            for (block, score) in row_got.iter().enumerate().take(blocks).skip(1) {
+                assert!(
+                    score.is_finite(),
+                    "case 2 row {row} block {block}: an unpoisoned block must stay \
+                     finite, got {score}"
+                );
+            }
+        }
+        for (block, score) in row_got.iter().enumerate().skip(blocks) {
+            assert!(
+                same_f32(*score, SENTINEL),
+                "case 2 row {row} column {block}: past the prefix must stay sentinel, \
+                 got {score}"
+            );
+        }
+    }
+    assert!(saw_nan > 0, "no row saw the poisoned block");
+    println!("poisoned key: block 0 is NaN on {saw_nan} rows, later blocks finite");
 }

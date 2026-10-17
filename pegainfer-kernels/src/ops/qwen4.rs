@@ -39,10 +39,6 @@ pub struct QsaIndexerGeometry {
     pub rope_theta: f32,
     /// `rms_norm_eps`, shared by both `(1 + w)` norms.
     pub rms_eps: f32,
-    /// `indexer_budget`. Not read by this stage: the reference scores every
-    /// complete block and truncates at selection, so the budget only bounds
-    /// what comes next. Carried here so the caller passes one geometry around.
-    pub budget: usize,
 }
 
 impl QsaIndexerGeometry {
@@ -56,7 +52,6 @@ impl QsaIndexerGeometry {
             rotary_dim: 64,
             rope_theta: 1.0e7,
             rms_eps: 1.0e-6,
-            budget: 2048,
         }
     }
 
@@ -66,9 +61,7 @@ impl QsaIndexerGeometry {
         (self.heads + self.kv_heads) * self.head_dim
     }
 
-    /// Blocks `pooled_keys` must hold for `tokens` tokens: `compress_ratio`
-    /// divides 16-token KV pages, so nothing completes across a page boundary
-    /// that the page grid does not also complete.
+    /// Blocks `pooled_keys` must hold for `tokens` tokens.
     pub fn max_blocks(&self, tokens: usize) -> usize {
         tokens / self.compress_ratio
     }
@@ -99,12 +92,6 @@ impl QsaIndexerGeometry {
             "QSA indexer rms_norm_eps {} must be non-negative",
             self.rms_eps
         );
-        ensure!(
-            self.budget.is_multiple_of(self.compress_ratio),
-            "QSA indexer budget {} must divide by compress_ratio {}",
-            self.budget,
-            self.compress_ratio
-        );
         Ok(())
     }
 }
@@ -124,8 +111,8 @@ impl QsaIndexerGeometry {
 /// entries past that are left untouched, as the reference leaves them NaN — a
 /// caller that wants to tell an unwritten entry from a real one has to poison
 /// the buffer itself (the parity gate pre-fills a sentinel). Both arrays are
-/// clamped into range, so a broken caller gets a wrong score rather than a
-/// read past the key array.
+/// checked on the device: an out-of-range entry traps, so a broken caller fails
+/// visibly instead of getting a plausible score for a row it never asked about.
 ///
 /// `pooled_keys` is the workspace: `max_blocks(tokens)` rows of `head_dim`,
 /// reused across calls of the same geometry.
@@ -281,13 +268,6 @@ mod tests {
                 "rms_eps",
                 QsaIndexerGeometry {
                     rms_eps: -1.0e-6,
-                    ..compiled
-                },
-            ),
-            (
-                "budget",
-                QsaIndexerGeometry {
-                    budget: 2045,
                     ..compiled
                 },
             ),
