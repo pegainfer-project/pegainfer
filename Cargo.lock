@@ -3758,7 +3758,10 @@ dependencies = [
  "libc",
  "log",
  "pegainfer-build",
+ "safetensors",
  "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "tvm-ffi",
 ]
 
