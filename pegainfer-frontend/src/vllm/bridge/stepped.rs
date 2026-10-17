@@ -39,6 +39,7 @@ use zeromq::ZmqMessage;
 use zeromq::prelude::SocketRecv;
 
 use super::BridgeLink;
+use super::PrefixCacheTracker;
 use super::SpecDecodeTracker;
 use super::connect_link;
 use super::engine_output;
@@ -88,6 +89,7 @@ impl SteppedEngineBridge {
             .take_steps()
             .context("partition step stream already taken")?;
         let mut spec = SpecDecodeTracker::default();
+        let mut prefix = PrefixCacheTracker::default();
         let Some(BridgeLink {
             mut input,
             output_tx,
@@ -107,11 +109,13 @@ impl SteppedEngineBridge {
         else {
             return Ok(());
         };
+        // Seed the gauges before any traffic; `PrefixCacheTracker` owns the
+        // totals-to-deltas conversion they must go through.
         send_outputs(
             &output_tx,
             RequestBatchOutputs {
                 engine_index: self.engine_index,
-                scheduler_stats: Some(Box::new(self.stats(&mut spec))),
+                scheduler_stats: Some(Box::new(self.stats(&mut prefix, &mut spec))),
                 timestamp: now_secs_f64(),
                 ..Default::default()
             }
@@ -154,6 +158,7 @@ impl SteppedEngineBridge {
                         &anchor,
                         &mut streams,
                         &mut names,
+                        &mut prefix,
                         &mut spec,
                         &output_tx,
                     ) {
@@ -215,9 +220,15 @@ impl SteppedEngineBridge {
 
     /// Stats for an outgoing batch; the spec delta runs from the last batch
     /// stamped, not the last step run.
-    fn stats(&self, spec: &mut SpecDecodeTracker) -> SchedulerStats {
+    fn stats(
+        &self,
+        prefix: &mut PrefixCacheTracker,
+        spec: &mut SpecDecodeTracker,
+    ) -> SchedulerStats {
         let snapshot = self.scheduler.metrics();
         let mut stats = scheduler_stats_from(&snapshot);
+        stats.prefix_cache_stats.base = prefix.interval(&snapshot);
+        stats.connector_prefix_cache_stats = prefix.external_interval(&snapshot);
         stats.spec_decoding_stats = spec.interval(&snapshot);
         stats
     }
@@ -228,6 +239,7 @@ impl SteppedEngineBridge {
         anchor: &UnixAnchor,
         streams: &mut HashMap<RequestId, SteppedStream>,
         names: &mut HashMap<String, RequestId>,
+        prefix: &mut PrefixCacheTracker,
         spec: &mut SpecDecodeTracker,
         output_tx: &tokio::sync::mpsc::UnboundedSender<
             vllm_engine_core_client::protocol::output::EngineCoreOutputs,
@@ -261,7 +273,7 @@ impl SteppedEngineBridge {
                 engine_index: self.engine_index,
                 outputs,
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
-                scheduler_stats: Some(Box::new(self.stats(spec))),
+                scheduler_stats: Some(Box::new(self.stats(prefix, spec))),
                 timestamp: now_secs_f64(),
             }
             .into(),
@@ -755,6 +767,7 @@ mod tests {
         let bridge = bridge(handle);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut spec = SpecDecodeTracker::default();
+        let mut prefix = PrefixCacheTracker::default();
         for (running, updates) in [(1, vec![scheduled]), (0, Vec::new())] {
             backend.metrics.publish(&crate::engine::SchedulerMetrics {
                 num_running_reqs: running,
@@ -766,6 +779,7 @@ mod tests {
                     &UnixAnchor::now(),
                     &mut streams,
                     &mut HashMap::new(),
+                    &mut prefix,
                     &mut spec,
                     &tx,
                 )

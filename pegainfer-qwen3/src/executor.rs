@@ -93,8 +93,15 @@ pub struct PrefillStepItem {
     pub(crate) lora_adapter: Option<String>,
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
-    /// the remaining suffix.
-    pub(crate) cached_tokens: usize,
+    /// the remaining suffix. `None` means no lookup ran (prefix caching off,
+    /// or a prompt-scoring request), which the metrics path must not count.
+    pub(crate) cached_tokens: Option<usize>,
+    /// How many of those cached tokens came from the external side (CPU
+    /// offload / P2P restore) rather than from local KV. `None` when no
+    /// connector was consulted for this request at all; `Some(0)` when it was
+    /// consulted and restored nothing. The external `/metrics` family is
+    /// driven by this distinction, not by `cached_tokens`.
+    pub(crate) external_hit_tokens: Option<usize>,
     /// Scheduler-set cap on prompt tokens forwarded this step (chunked
     /// prefill). The executor clamps it to the tokens actually remaining.
     pub(crate) chunk_budget: usize,
@@ -124,7 +131,8 @@ impl PrefillStepItem {
             logprobs,
             prompt_logprobs,
             lora_adapter: None,
-            cached_tokens: 0,
+            cached_tokens: None,
+            external_hit_tokens: None,
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
@@ -700,7 +708,15 @@ pub struct PrefillRequestResult {
     pub first_token_logprob: Option<TokenLogprob>,
     pub(crate) prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
-    pub cached_tokens: usize,
+    /// `None` when no lookup ran at all, which is the fact the /metrics
+    /// counters need: a disabled cache or a prompt-scoring request counts
+    /// nothing.
+    pub cached_tokens: Option<usize>,
+    /// How many of `cached_tokens` were restored from the external side (CPU
+    /// offload / P2P) rather than found in local KV. `None` when no
+    /// connector was consulted for this request; `Some(0)` when it was
+    /// consulted and restored nothing.
+    pub external_hit_tokens: Option<usize>,
     /// Whether the prompt is fully prefilled. When false this step ran a
     /// non-final chunk and `first_token` is meaningless.
     pub completed: bool,
@@ -907,6 +923,13 @@ pub struct Qwen3Executor {
     /// In-flight CPU→GPU prefetches keyed by request, parked until their load
     /// settles and the blocks register into the prefix cache.
     prefetch: HashMap<RequestId, PrefetchState>,
+    /// Requests whose connector was actually queried, whether it answered with
+    /// a hit or a miss. The prefetch state above is dropped on every
+    /// non-carrying outcome (a scratch prefill, a released lease, a failed
+    /// load), so its absence cannot be read as "never asked". This marker is
+    /// what keeps a connector miss in the external counters, instead of
+    /// reporting only successful restores and inflating the external hit rate.
+    connector_consulted: HashSet<RequestId>,
     /// Offload pure-L2 mode. When set, completed blocks are not kept for
     /// cross-request HBM reuse: the prefetch probe drains the inactive pool
     /// first, so every probe sees `gpu_hit == 0` and the whole cacheable prefix
@@ -1134,6 +1157,7 @@ impl Qwen3Executor {
             offload,
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
+            connector_consulted: HashSet::new(),
             l1_retention_disabled: false,
             // Derived here, not via a post-construction setter, so every
             // launch path (plain and LoRA alike) honors the P/D contract.
@@ -1535,6 +1559,7 @@ impl Qwen3Executor {
             offload: None,
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
+            connector_consulted: HashSet::new(),
             l1_retention_disabled: false,
             flush_offload_on_finish: false,
             vllm_compat: None,
@@ -1803,13 +1828,29 @@ impl Qwen3Executor {
             // Prompt scoring needs logits for every prompt position; cached positions
             // are never forwarded, so prompt-logprob requests prefill from scratch.
             if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+                let matched = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+                req.cached_tokens = Some(matched);
+                // What the connector restored is not a local hit. The probe
+                // reports how many of the matched blocks already sat in local
+                // GPU KV; a request whose probe is already gone (a scratch
+                // prefill, a released lease) restored nothing, so its whole
+                // match is local. `None` means no connector was consulted at
+                // all, so there is no external leg to report.
+                req.external_hit_tokens =
+                    self.connector_consulted.contains(&req.request_id).then(|| {
+                        let block_size = self.metadata.block_size;
+                        let local = self.prefetch.get(&req.request_id).map_or(matched, |state| {
+                            (state.probe.gpu_hit_blocks() * block_size).min(matched)
+                        });
+                        matched.saturating_sub(local)
+                    });
             }
             self.request_kvs.insert(req.request_id, rkv);
             // match_and_add_prefix above already absorbed any CPU-prefetched
             // blocks (now held by the request's sequence), so release the
             // prefetch's separate hold.
             self.prefetch.remove(&req.request_id);
+            self.connector_consulted.remove(&req.request_id);
         }
         let rkv = self
             .request_kvs
@@ -2306,6 +2347,9 @@ impl ModelExecutor for Qwen3Executor {
                 let _ = handle.wait();
             }
         }
+        // The request is gone, so drop its consulted marker with it; otherwise
+        // the set would grow without bound.
+        self.connector_consulted.remove(&request_id);
         self.saved_cursor.remove(&request_id);
         if self.speculative.is_some() {
             self.dflash_ready_requests.remove(&request_id);
@@ -2375,6 +2419,12 @@ impl ModelExecutor for Qwen3Executor {
             .is_some_and(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD);
         let park_on_loading = self.vllm_compat.is_none() || expect_remote;
         let available_blocks = self.kv_mgr.pool().available_blocks();
+        // The first-shot query below always runs (`false` = not timed out), so
+        // the connector is consulted from here on, whatever it answers. Record
+        // that before the call: a miss, an error, or a released lease must
+        // still report an external lookup, and only the early returns above
+        // stay uncounted.
+        self.connector_consulted.insert(request_id);
         let action = remote_fetch_action(
             false,
             expect_remote,

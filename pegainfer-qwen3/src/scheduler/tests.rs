@@ -219,7 +219,9 @@ fn inflight_prefill_reservation_is_unchanged_by_its_result() {
                 first_token: 100,
                 first_token_logprob: None,
                 prompt_logprobs: None,
-                cached_tokens: 0,
+                // No lookup ran for this chunk, so neither leg is reported.
+                cached_tokens: None,
+                external_hit_tokens: None,
                 completed: prefill_pos == req.prompt_tokens.len(),
                 prefill_pos,
             }],

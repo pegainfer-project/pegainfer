@@ -124,12 +124,12 @@ fn assert_close(cold: &[(u32, f32)], warm: &[(u32, f32)]) {
     );
 }
 
-/// One executor, two scenarios, run sequentially. cargo runs `#[test]`
+/// One executor, three scenarios, run sequentially. cargo runs `#[test]`
 /// functions on parallel threads; two Qwen3-4B executors sharing device 0 and
 /// the same pegaflow instance id ("qwen3-dev0") would collide on the host
 /// tier. Production wires exactly one executor per model, so the realistic
-/// shape is one executor servicing both prefixes. The two scenarios use
-/// disjoint prompt seeds, so they share no prefix and cannot cross-contaminate.
+/// shape is one executor servicing every prefix. The scenarios use disjoint
+/// prompt seeds, so they share no prefix and cannot cross-contaminate.
 #[test]
 fn live_gpu_and_cpu_prefix_hits() {
     let Some(model_path) = model_path_or_skip() else {
@@ -150,6 +150,7 @@ fn live_gpu_and_cpu_prefix_hits() {
 
     cpu_tier_restores_evicted_prefix(&mut ex);
     gpu_and_cpu_combined_hit(&mut ex);
+    connector_miss_is_counted(&mut ex);
 }
 
 /// A prefix that is evicted from HBM and restored entirely from the CPU tier
@@ -166,8 +167,9 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         })
         .expect("cold prefill");
     assert_eq!(
-        cold.requests[0].cached_tokens, 0,
-        "first sight of P is cold"
+        cold.requests[0].cached_tokens,
+        Some(0),
+        "first sight of P is cold: a lookup ran and missed"
     );
     let cold_first = first_token_top(&cold);
     ex.drop_request(RequestId::new(1)).expect("drop req1");
@@ -196,14 +198,62 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         .expect("warm prefill");
     assert_eq!(
         warm.requests[0].cached_tokens,
-        3 * BLOCK,
+        Some(3 * BLOCK),
         "CPU-restored prefix: 3 blocks matched, tail recomputed"
+    );
+    // All of the match came back from the host tier, so the external leg owns
+    // all of it — the split this PR reports separately.
+    assert_eq!(
+        warm.requests[0].external_hit_tokens,
+        Some(3 * BLOCK),
+        "restored blocks are attributed to the external side, not local KV"
     );
     let warm_first = first_token_top(&warm);
     ex.drop_request(RequestId::new(2)).expect("drop req2");
 
     // ── The restored KV must reproduce the original GPU first-token logits. ──
     assert_close(&cold_first, &warm_first);
+}
+
+/// A connector query that finds nothing is still a query. `begin_kv_prefetch`
+/// answers `false` for a miss and leaves no prefetch state behind, so the
+/// external counters can only separate "asked and missed" from "never asked"
+/// by recording the consultation itself. Without that record every miss
+/// disappears from the counters and the external hit rate reads 100%.
+fn connector_miss_is_counted(ex: &mut Qwen3Executor) {
+    let unseen = prompt(11, 50); // disjoint seed: never saved to the host tier
+    let id = RequestId::new(3);
+
+    assert!(
+        !ex.begin_kv_prefetch(id, &unseen, None, 0),
+        "an unseen prefix must not park on a load"
+    );
+    assert!(
+        ex.wait_ready_prefetch(0).is_empty(),
+        "a miss leaves no load to settle"
+    );
+
+    let missed = ex
+        .execute_prefill(PrefillPlan {
+            sample_seed: 0,
+            requests: &[prefill_item(3, &unseen)],
+        })
+        .expect("miss prefill");
+    assert_eq!(
+        missed.requests[0].cached_tokens,
+        Some(0),
+        "unseen prefix: the lookup ran and missed"
+    );
+    // The point of this case: `Some(0)`, not `None`. `None` would mean the
+    // connector was never consulted, which is what dropped every miss from the
+    // external counters before this was recorded explicitly.
+    assert_eq!(
+        missed.requests[0].external_hit_tokens,
+        Some(0),
+        "the connector was queried and restored nothing; a miss must be \
+         counted, not dropped as 'never asked'"
+    );
+    ex.drop_request(id).expect("drop req3");
 }
 
 /// A single prefix that is part GPU-resident, part CPU-only: the prefetch must
@@ -222,8 +272,9 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         })
         .expect("cold full prefill");
     assert_eq!(
-        cold.requests[0].cached_tokens, 0,
-        "first sight of full is cold"
+        cold.requests[0].cached_tokens,
+        Some(0),
+        "first sight of full is cold: a lookup ran and missed"
     );
     let cold_first = first_token_top(&cold);
     ex.drop_request(RequestId::new(1)).expect("drop req1");
@@ -240,8 +291,9 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         })
         .expect("short prefill");
     assert_eq!(
-        s.requests[0].cached_tokens, 0,
-        "short re-warms blocks 0..3 cold"
+        s.requests[0].cached_tokens,
+        Some(0),
+        "short re-warms blocks 0..3 cold: a lookup ran and missed"
     );
     ex.drop_request(RequestId::new(2)).expect("drop req2");
 
@@ -268,8 +320,15 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         .expect("warm full prefill");
     assert_eq!(
         warm.requests[0].cached_tokens,
-        6 * BLOCK,
+        Some(6 * BLOCK),
         "combined hit: 3 GPU-resident + 3 CPU-restored blocks match as one prefix"
+    );
+    // Only the second half crossed the connector: the first 3 blocks were
+    // already in HBM, so they belong to the local family.
+    assert_eq!(
+        warm.requests[0].external_hit_tokens,
+        Some(3 * BLOCK),
+        "the GPU-resident half is local, the restored half is external"
     );
     let warm_first = first_token_top(&warm);
     ex.drop_request(RequestId::new(3)).expect("drop req3");

@@ -37,12 +37,20 @@ pub(crate) fn resolve_step(
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
+            prefix_external_queries: 0,
+            prefix_external_hits: 0,
         },
         ExecutionArtifacts::SpeculativeDecode { verify } => StepEffects {
             cached: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_speculative_outputs(executor, active, &verify.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
+            prefix_external_queries: 0,
+            prefix_external_hits: 0,
         },
         ExecutionArtifacts::Unified { pending, result } => {
             let mut effects = resolve_prefill_outputs(executor, pending, result.prefill_requests);
@@ -115,18 +123,47 @@ fn resolve_prefill_outputs(
         // release builds too.
         assert_eq!(req.request_id, result.request_id);
 
-        // Report the prefix-cache hit count on the request's first chunk only
-        // — that is where it is determined. Later chunks must not re-report.
+        // Report the prefix-cache counters on the request's first chunk only —
+        // that is where they are determined. Later chunks must not re-report.
+        //
+        // Both counter pairs are TOKEN-granular, matching vLLM's
+        // `PrefixCacheStats` (the frontend reads them as hit tokens / queried
+        // tokens). Whether a lookup ran at all is the executor's call, and it
+        // reports that here rather than the resolver re-deriving it.
         if req.prefill_pos == 0 {
+            // The usage field reports what the executor reused, so it stays
+            // unconditional and simply reads zero when nothing was looked up.
             effects.cached.push(CachedTokensEffect {
                 request_id: req.request_id,
-                cached_tokens: result.cached_tokens,
+                cached_tokens: result.cached_tokens.unwrap_or(0),
             });
+            // `Some(matched)` is a lookup that ran — `Some(0)` is a miss, which
+            // still counts its query. `None` is no lookup at all, and
+            // contributes nothing, so the rate is not diluted by phantom
+            // queries. Whatever the connector restored is excluded here and
+            // attributed to the external family below.
+            if let Some(matched) = result.cached_tokens {
+                // Whatever the connector restored is not a local hit.
+                let local = matched.saturating_sub(result.external_hit_tokens.unwrap_or(0));
+                effects.prefix_queries += req.prompt_tokens.len() as u64;
+                effects.prefix_hits += local as u64;
+            }
+            // The external family is separate, and exists only when a
+            // connector was consulted for this request: a server with no
+            // offload reports nothing here. vLLM measures the connector query
+            // as the prompt minus the local hits, so a locally cached token
+            // never inflates the external denominator.
+            if let Some(external) = result.external_hit_tokens {
+                let local = result.cached_tokens.unwrap_or(0).saturating_sub(external);
+                effects.prefix_external_queries +=
+                    req.prompt_tokens.len().saturating_sub(local) as u64;
+                effects.prefix_external_hits += external as u64;
+            }
         }
 
         if !result.completed {
             req.prefill_pos = result.prefill_pos;
-            req.cached_tokens = req.cached_tokens.max(result.cached_tokens);
+            req.cached_tokens = req.cached_tokens.max(result.cached_tokens.unwrap_or(0));
             effects.pending.push(PendingEffect::ContinuePrefill { req });
             continue;
         }

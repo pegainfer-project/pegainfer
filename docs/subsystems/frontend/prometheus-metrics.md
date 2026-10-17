@@ -1,6 +1,6 @@
 # Prometheus /metrics via the vLLM frontend
 
-**TL;DR:** `/metrics` exposes request histograms for every model and engine gauges for schedulers that publish load: Qwen3, Qwen3.5 and Gemma 4 use one logical engine, while GLM5.2 EP8/DP8 uses eight rank-local engines and GLM5.2 TP8 uses one logical engine. The bridge forwards each partition's stats under the same identity the vLLM frontend uses for least-load routing.
+**TL;DR:** `/metrics` exposes request histograms for every model and engine gauges for schedulers that publish load: Qwen3, Qwen3.5 and Gemma 4 use one logical engine, while GLM5.2 EP8/DP8 uses eight rank-local engines and GLM5.2 TP8 uses one logical engine. The bridge forwards each partition's stats under the same identity the vLLM frontend uses for least-load routing. Qwen3 reports real token-granular prefix-cache query/hit counters, split into local KV and connector-restored tokens; the other lines still publish zero.
 
 Last touched: 2026-10
 
@@ -18,12 +18,33 @@ Historical watch-path measurements found noise-level cost in both covered config
 - Qwen3 TPOT: 10.6387 ms (main) vs 10.6395 ms (metrics branch) over 828 tokens.
 - GLM5.2 EP8, three-run median at concurrency 64: 1268.58 vs 1264.82 output tok/s (-0.30%); TPOT p50 41.76 vs 41.35 ms.
 
+## Prefix-cache counters
+
+Qwen3 publishes token-granular prefix-cache counters, in four families:
+
+- `vllm:prefix_cache_queries_total` / `..._hits_total` — local KV. A request
+  adds its prompt length to `queries` once, on its first prefill chunk, and
+  `hits` counts the tokens of that prompt already cached locally.
+- `vllm:external_prefix_cache_queries_total` / `..._hits_total` — the
+  connector (CPU offload / P2P restore). The query denominator is the prompt
+  minus the local hits, so a locally cached token never inflates it, and the
+  family is absent when no connector was consulted at all.
+
+A connector miss is counted: `external_queries` advances while
+`external_hits` stays flat. Only a request whose connector was never
+consulted (`None`, not `Some(0)`) contributes nothing to the external
+family, which keeps the hit rate honest instead of reporting only successful
+restores.
+
+Qwen3.5, GLM5.2, Kimi-K2 and DeepSeek-V2-Lite have not wired these counters
+yet; they still report zero.
+
 ## What deliberately reads zero (state at capture time)
 
-- `prefix_cache_queries/hits` and the by-reason waiting split (`reason="deferred"` is driven by a skipped-request counter we don't report; all waiting shows as `reason="capacity"`).
+- The by-reason waiting split: `reason="deferred"` is driven by a skipped-request counter we don't report, so all waiting shows as `reason="capacity"`.
 - Per-GPU FLOPs/bytes estimates, KV-block residency histograms, cudagraph stats — the bridge sends `SchedulerStats::default()` for these fields.
 - Every legacy model crate whose scheduler doesn't publish a `LoadSnapshot` watch (currently deepseek and kimi) gets path 1 only; its engine gauges are absent, not lying-zero — the bridge skips the stats task for that partition when no watch exists.
 
 ## Next step
 
-Next, wire the DeepSeek-V2-Lite and Kimi-K2 schedulers using the same recipe, and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.
+Next, wire the DeepSeek-V2-Lite and Kimi-K2 schedulers using the same recipe, and extend the prefix-cache counters to the remaining lines (Qwen3.5, GLM5.2, Kimi and DeepSeek report zero today). A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.
