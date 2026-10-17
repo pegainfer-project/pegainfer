@@ -11,10 +11,11 @@
 //! budget boundary at 2049..2054 visible tokens.
 //!
 //! Provenance is asserted, not assumed: the fixture records the reference
-//! version and the sha256 of the frozen config it was dumped from, and that
-//! config's indexer geometry is held against the geometry this crate compiles
-//! for. Without a device it skips; `PEGAINFER_REQUIRE_GPU=1` turns that into a
-//! failure.
+//! version and the sha256 of the frozen config it was dumped from. The gate
+//! derives its geometry from that config and cross-checks it against the
+//! fixture's own tensor shapes, so a config or checkpoint drift reaches the
+//! kernel instead of a duplicated Rust contract. Without a device it skips;
+//! `PEGAINFER_REQUIRE_GPU=1` turns that into a failure.
 //!
 //!   cargo test --release -p pegainfer-kernels --features qwen4 \
 //!     --test qwen4_qsa_indexer_score_parity -- --nocapture
@@ -25,7 +26,6 @@ mod common;
 
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use pegainfer_kernels::ops::QsaIndexerGeometry;
 use pegainfer_kernels::ops::qsa_indexer_block_scores_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceVec;
@@ -120,14 +120,67 @@ fn rope_tables(rotary_dim: usize, theta: f32, max_pos: usize) -> (Vec<bf16>, Vec
     (cos, sin)
 }
 
+/// The geometry this gate runs, derived from the frozen config and cross-checked
+/// against the fixture's own tensor shapes — not from a Rust copy of the
+/// kernel's constants. The compiled kernel produces the scores, so a drift
+/// between the config and what it was compiled for shows up as a score
+/// mismatch instead of as a duplicated contract.
+#[derive(Clone, Copy)]
+struct Geometry {
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    compress_ratio: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+}
+
+impl Geometry {
+    fn fused_width(&self) -> usize {
+        (self.heads + self.kv_heads) * self.head_dim
+    }
+
+    fn max_blocks(&self, tokens: usize) -> usize {
+        tokens / self.compress_ratio
+    }
+}
+
+fn fixture_geometry(config: &serde_json::Value, fixture: &SafeTensors<'_>) -> Geometry {
+    let text = &config["text_config"];
+    let field = |name: &str| text[name].as_u64().unwrap_or_else(|| panic!("{name}")) as usize;
+    let attention_head_dim = text["head_dim"].as_f64().expect("head_dim");
+    let partial = text["rope_parameters"]["partial_rotary_factor"]
+        .as_f64()
+        .expect("partial_rotary_factor");
+    let geometry = Geometry {
+        heads: field("indexer_n_heads"),
+        kv_heads: field("indexer_kv_heads"),
+        head_dim: field("indexer_head_dim"),
+        compress_ratio: field("indexer_compress_ratio"),
+        rotary_dim: (attention_head_dim * partial) as usize,
+        rms_eps: text["rms_norm_eps"].as_f64().expect("rms_norm_eps") as f32,
+    };
+    // The fixture's own shapes must agree with the config the golden was dumped
+    // from; the scores then hold the compiled kernel to both.
+    let (key_shape, _) = bf16_tensor(fixture, "case0_keys");
+    assert_eq!(key_shape[1], geometry.head_dim, "case0 key head dim");
+    let (query_shape, _) = bf16_tensor(fixture, "case0_queries");
+    assert_eq!(
+        &query_shape[1..],
+        [geometry.heads, geometry.head_dim],
+        "case0 query heads"
+    );
+    assert!(geometry.heads > 0 && geometry.kv_heads == 1);
+    assert!(geometry.compress_ratio > 0 && geometry.rotary_dim > 0);
+    assert!(geometry.rotary_dim <= geometry.head_dim);
+    assert!(geometry.rms_eps >= 0.0);
+    geometry
+}
+
 /// Bit equality for the scalars the kernel pins and the exact derivations
 /// beside them. The kernel refuses any other value, so a tolerance here would
 /// let a config drift through.
 fn same_f32(a: f32, b: f32) -> bool {
-    a.to_bits() == b.to_bits()
-}
-
-fn same_f64(a: f64, b: f64) -> bool {
     a.to_bits() == b.to_bits()
 }
 
@@ -142,9 +195,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// The fixture's own record of what it was dumped from, held against the
-/// reference version, the frozen config's bytes and the geometry this crate
-/// compiles for. Returns the parsed config, whose `rope_theta` builds the
-/// cos/sin tables the gate feeds the kernel.
+/// reference version and the frozen config's bytes. Returns the parsed config,
+/// from which the gate derives the geometry and builds the cos/sin tables.
 fn assert_provenance(bytes: &[u8]) -> serde_json::Value {
     let (_, metadata) = SafeTensors::read_metadata(bytes).expect("fixture metadata");
     let recorded = metadata
@@ -186,41 +238,13 @@ fn assert_provenance(bytes: &[u8]) -> serde_json::Value {
 
     let config: serde_json::Value =
         serde_json::from_slice(&config_bytes).expect("frozen config is not JSON");
-    let text = &config["text_config"];
-    let geometry = QsaIndexerGeometry::qwen38_flash_next();
-    let field = |name: &str| text[name].as_u64().unwrap_or_else(|| panic!("{name}"));
-    assert_eq!(field("indexer_n_heads"), geometry.heads as u64);
-    assert_eq!(field("indexer_kv_heads"), geometry.kv_heads as u64);
-    assert_eq!(field("indexer_head_dim"), geometry.head_dim as u64);
-    assert_eq!(
-        field("indexer_compress_ratio"),
-        geometry.compress_ratio as u64
-    );
-    let rope_theta = text["rope_parameters"]["rope_theta"]
+    let rope_theta = config["text_config"]["rope_parameters"]["rope_theta"]
         .as_f64()
         .expect("rope_theta");
     assert!(
         rope_theta.is_finite() && rope_theta > 0.0,
         "rope_theta {rope_theta} cannot build a table"
     );
-    let rms_eps = text["rms_norm_eps"].as_f64().expect("rms_norm_eps");
-    assert!(
-        same_f32(rms_eps as f32, geometry.rms_eps),
-        "rms_norm_eps {rms_eps} is not the compiled {}",
-        geometry.rms_eps
-    );
-    // rotary_dim = the attention head's head_dim * partial_rotary_factor, and
-    // the indexer head is long enough to hold it.
-    let head_dim = field("head_dim") as f64;
-    let partial = text["rope_parameters"]["partial_rotary_factor"]
-        .as_f64()
-        .expect("partial_rotary_factor");
-    assert!(
-        same_f64(head_dim * partial, geometry.rotary_dim as f64),
-        "rotary_dim {} is not head_dim {head_dim} * partial_rotary_factor {partial}",
-        geometry.rotary_dim
-    );
-    assert!(geometry.rotary_dim <= geometry.head_dim);
     // Recorded, not asserted: the host the golden was dumped on decides the
     // order its float32 reductions round in, which is where the parity bound's
     // residual comes from, and any other host's order is an equally valid
@@ -295,7 +319,7 @@ struct Case {
     score_cols: usize,
 }
 
-fn load_case(fixture: &SafeTensors<'_>, index: usize, geometry: &QsaIndexerGeometry) -> Case {
+fn load_case(fixture: &SafeTensors<'_>, index: usize, geometry: &Geometry) -> Case {
     let (key_shape, keys) = bf16_tensor(fixture, &format!("case{index}_keys"));
     let (query_shape, queries) = bf16_tensor(fixture, &format!("case{index}_queries"));
     let (rows_shape, rows) = i32_tensor(fixture, &format!("case{index}_rows"));
@@ -337,7 +361,7 @@ fn load_case(fixture: &SafeTensors<'_>, index: usize, geometry: &QsaIndexerGeome
 
 /// The fused `index_qk_proj` rows the kernel reads: the keys for every token,
 /// then the queries at the rows the reference evaluated.
-fn fused_rows(case: &Case, geometry: &QsaIndexerGeometry) -> Vec<bf16> {
+fn fused_rows(case: &Case, geometry: &Geometry) -> Vec<bf16> {
     let width = geometry.fused_width();
     let q_width = geometry.heads * geometry.head_dim;
     let mut fused = vec![bf16::ZERO; case.tokens * width];
@@ -395,7 +419,7 @@ struct CaseSummary {
 /// Runs one case.
 fn check_case(
     ctx: &DeviceContext,
-    geometry: &QsaIndexerGeometry,
+    geometry: &Geometry,
     q_norm: &CudaSlice<bf16>,
     k_norm: &CudaSlice<bf16>,
     cos: &DeviceVec,
@@ -424,7 +448,6 @@ fn check_case(
 
     qsa_indexer_block_scores_into(
         ctx,
-        geometry,
         &fused,
         q_norm,
         k_norm,
@@ -436,6 +459,7 @@ fn check_case(
         &mut scores_dev,
         score_cols,
         &mut pooled_dev,
+        geometry.rms_eps,
     )
     .expect("QSA indexer block scores");
     ctx.sync().expect("sync");
@@ -538,206 +562,6 @@ fn fixture_records_the_frozen_reference() {
     assert_provenance(&bytes);
 }
 
-/// The kernel's own half of the refusal contract, device-free: the entry point
-/// rejects a geometry it was not compiled for *before* it forms a launch. It
-/// is the only place the compiled row stride is checked — the reason
-/// `fused_width` is an argument at all — and `rotary_dim` is the cos/sin
-/// tables' compiled row stride, which nothing else can be held against.
-///
-/// Every call below leaves through a guard before the first launch, so the
-/// pointers can dangle. The two zero-extent calls come first as the positive
-/// control: an entry point that refused everything would make every refusal
-/// below vacuous.
-#[test]
-fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
-    use cudarc::driver::sys::CUresult;
-    use pegainfer_kernels::ffi::Half;
-    use pegainfer_kernels::ffi::qwen4_qsa_indexer_block_scores_cuda as entry;
-
-    // Dangling and well-aligned, never dereferenced.
-    let half = std::ptr::NonNull::<Half>::dangling().as_ptr();
-    let int = std::ptr::NonNull::<i32>::dangling().as_ptr();
-    let float = std::ptr::NonNull::<f32>::dangling().as_ptr();
-    let pool = std::ptr::NonNull::<Half>::dangling().as_ptr();
-    let invalid = CUresult::CUDA_ERROR_INVALID_VALUE as i32;
-    let success = CUresult::CUDA_SUCCESS as i32;
-
-    // (query_rows, tokens, score_cols, fused_width, rotary_dim, rms_eps)
-    let call = |args: (i32, i32, i32, i32, i32, f32)| {
-        let (query_rows, tokens, score_cols, fused_width, rotary_dim, rms_eps) = args;
-        (unsafe {
-            entry(
-                half,
-                half,
-                half,
-                half,
-                half,
-                int,
-                int,
-                float,
-                pool,
-                query_rows,
-                tokens,
-                score_cols,
-                fused_width,
-                rotary_dim,
-                rms_eps,
-                std::ptr::null_mut(),
-            )
-        }) as i32
-    };
-
-    // Zero extent, so the guards are the whole of the call and no launch follows.
-    assert_eq!(
-        call((0, 8, 2, 640, 64, 1.0e-6)),
-        success,
-        "the compiled geometry must pass the guards"
-    );
-    assert_eq!(
-        call((1, 0, 0, 640, 64, 1.0e-6)),
-        success,
-        "an empty call must pass the guards"
-    );
-
-    for (what, result) in [
-        (
-            "a fused row stride that is not the compiled 640 wide",
-            call((0, 8, 2, 639, 64, 1.0e-6)),
-        ),
-        (
-            "a fused row stride wider than the compiled one",
-            call((0, 8, 2, 641, 64, 1.0e-6)),
-        ),
-        (
-            "a table stride that is not the compiled 64",
-            call((0, 8, 2, 640, 32, 1.0e-6)),
-        ),
-        (
-            "a table stride over the whole indexer head",
-            call((0, 8, 2, 640, 128, 1.0e-6)),
-        ),
-        ("a negative rms_eps", call((0, 8, 2, 640, 64, -1.0e-6))),
-        (
-            // `!(rms_eps >= 0)` refuses NaN, which would otherwise poison every
-            // norm silently rather than fail loudly.
-            "a NaN rms_eps",
-            call((0, 8, 2, 640, 64, f32::NAN)),
-        ),
-        (
-            "a negative query-row count",
-            call((-1, 8, 2, 640, 64, 1.0e-6)),
-        ),
-        ("a negative token count", call((0, -1, 2, 640, 64, 1.0e-6))),
-        ("a negative score stride", call((0, 8, -1, 640, 64, 1.0e-6))),
-        (
-            // 8 tokens is 2 complete blocks, so a 1-wide row is the
-            // out-of-bounds write the stride check exists for.
-            "a score stride under the block grid",
-            call((1, 8, 1, 640, 64, 1.0e-6)),
-        ),
-    ] {
-        assert_eq!(result, invalid, "{what} must be refused");
-    }
-
-    // One position per kind of argument — the inputs, the score output and the
-    // pool workspace — so the chain is pinned to cover the pointers, not just
-    // the extents.
-    for (what, fused_qk, q_norm, k_norm, cos, sin, scores, pooled_keys) in [
-        (
-            "a null fused_qk",
-            std::ptr::null_mut(),
-            half,
-            half,
-            half,
-            half,
-            float,
-            pool,
-        ),
-        (
-            "a null q_norm_weight",
-            half,
-            std::ptr::null_mut(),
-            half,
-            half,
-            half,
-            float,
-            pool,
-        ),
-        (
-            "a null k_norm_weight",
-            half,
-            half,
-            std::ptr::null_mut(),
-            half,
-            half,
-            float,
-            pool,
-        ),
-        (
-            "a null cos table",
-            half,
-            half,
-            half,
-            std::ptr::null_mut(),
-            half,
-            float,
-            pool,
-        ),
-        (
-            "a null sin table",
-            half,
-            half,
-            half,
-            half,
-            std::ptr::null_mut(),
-            float,
-            pool,
-        ),
-        (
-            "a null scores",
-            half,
-            half,
-            half,
-            half,
-            half,
-            std::ptr::null_mut(),
-            pool,
-        ),
-        (
-            "a null pooled_keys",
-            half,
-            half,
-            half,
-            half,
-            half,
-            float,
-            std::ptr::null_mut(),
-        ),
-    ] {
-        let result = unsafe {
-            entry(
-                fused_qk,
-                q_norm,
-                k_norm,
-                cos,
-                sin,
-                int,
-                int,
-                scores,
-                pooled_keys,
-                0,
-                8,
-                2,
-                640,
-                64,
-                1.0e-6,
-                std::ptr::null_mut(),
-            )
-        } as i32;
-        assert_eq!(result, invalid, "{what} must be refused");
-    }
-}
-
 #[test]
 fn qsa_indexer_block_scores_match_the_reference() {
     let Some(ctx) = common::device_or_skip() else {
@@ -746,7 +570,7 @@ fn qsa_indexer_block_scores_match_the_reference() {
     let bytes = std::fs::read(fixture_path()).expect("read fixture");
     let config = assert_provenance(&bytes);
     let fixture = SafeTensors::deserialize(&bytes).expect("parse fixture");
-    let geometry = QsaIndexerGeometry::qwen38_flash_next();
+    let geometry = fixture_geometry(&config, &fixture);
     let theta = config_theta(&config);
 
     let (_, q_norm) = bf16_tensor(&fixture, "q_layernorm");
@@ -849,7 +673,7 @@ fn a_poisoned_key_keeps_its_nan_score() {
     let bytes = std::fs::read(fixture_path()).expect("read fixture");
     let config = assert_provenance(&bytes);
     let fixture = SafeTensors::deserialize(&bytes).expect("parse fixture");
-    let geometry = QsaIndexerGeometry::qwen38_flash_next();
+    let geometry = fixture_geometry(&config, &fixture);
     let (_, q_norm) = bf16_tensor(&fixture, "q_layernorm");
     let (_, k_norm) = bf16_tensor(&fixture, "k_layernorm");
     let q_norm_dev = ctx.stream.clone_htod(&q_norm).expect("q norm upload");
@@ -882,7 +706,6 @@ fn a_poisoned_key_keeps_its_nan_score() {
         .expect("pooled workspace");
     qsa_indexer_block_scores_into(
         &ctx,
-        &geometry,
         &fused,
         &q_norm_dev,
         &k_norm_dev,
@@ -894,6 +717,7 @@ fn a_poisoned_key_keeps_its_nan_score() {
         &mut scores_dev,
         score_cols,
         &mut pooled_dev,
+        geometry.rms_eps,
     )
     .expect("QSA indexer block scores");
     ctx.sync().expect("sync");

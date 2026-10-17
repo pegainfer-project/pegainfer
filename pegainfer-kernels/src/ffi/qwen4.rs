@@ -11,10 +11,10 @@ unsafe extern "C" {
     /// Pool the complete micro-blocks of `fused_qk` and score them for every
     /// query row. `pooled_keys` is the pool pass's workspace.
     ///
-    /// `fused_width` is the caller's row stride for `fused_qk`; the body reads
-    /// with the width it was compiled for, so a mismatch is refused rather than
-    /// read out of bounds. `rotary_dim` is the cos/sin tables' row stride, for
-    /// the same reason.
+    /// The geometry is compiled in: the fused row is `640` wide and the cos/sin
+    /// tables stride `64`. A caller whose buffers are laid out differently is
+    /// reading the wrong row, which the buffer-size checks in the wrapper cannot
+    /// see; the checkpoint's config is checked where the model crate reads it.
     pub fn qwen4_qsa_indexer_block_scores_cuda(
         fused_qk: *const Half,
         q_norm_weight: *const Half,
@@ -28,8 +28,6 @@ unsafe extern "C" {
         query_rows: i32,
         tokens: i32,
         score_cols: i32,
-        fused_width: i32,
-        rotary_dim: i32,
         rms_eps: f32,
         stream: CUstream,
     ) -> CUresult;

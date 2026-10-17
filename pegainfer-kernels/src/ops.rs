@@ -231,8 +231,6 @@ pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
 #[cfg(feature = "qwen4")]
-pub use qwen4::QsaIndexerGeometry;
-#[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_block_scores_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_hd256_into;

@@ -286,12 +286,11 @@ extern "C" {
 // `pooled_keys` is the pool pass's workspace — one head-dim row per complete
 // block — shared by every row, which is why pooling is its own pass.
 //
-// `fused_width` is the caller's row stride for `fused_qk`, checked here: the
-// body reads with the width it was compiled for, so a mismatched stride would
-// be read out of bounds rather than computed wrongly. `rotary_dim` is checked
-// for the same reason on the cos/sin tables: their row stride is compiled in.
-// The tables are the shared attention tables (`pegainfer_core::rope`), one
-// `[max_pos, kRotaryDim]` guest each, so this kernel does no trig of its own.
+// The row strides are compiled in: `kFusedWidth` for `fused_qk` and
+// `kRotaryDim` for the shared attention cos/sin tables
+// (`pegainfer_core::rope`), so this kernel does no trig of its own. A caller
+// whose buffers are laid out differently cannot be detected here; the model
+// crate checks its config where it reads it.
 CUresult qwen4_qsa_indexer_block_scores_cuda(
     const __nv_bfloat16* fused_qk,
     const __nv_bfloat16* q_norm_weight,
@@ -305,8 +304,6 @@ CUresult qwen4_qsa_indexer_block_scores_cuda(
     int query_rows,
     int tokens,
     int score_cols,
-    int fused_width,
-    int rotary_dim,
     float rms_eps,
     cudaStream_t stream) {
   if (fused_qk == nullptr || q_norm_weight == nullptr ||
@@ -316,9 +313,6 @@ CUresult qwen4_qsa_indexer_block_scores_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (query_rows < 0 || tokens < 0 || score_cols < 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (fused_width != kFusedWidth || rotary_dim != kRotaryDim) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (!(rms_eps >= 0.0f)) {

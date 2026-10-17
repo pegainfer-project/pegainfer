@@ -4,8 +4,10 @@
 //! visible micro-block); selection — top-k plus the unconditional tail — is a
 //! later stage, deliberately not here. Frozen semantics live in
 //! `csrc/qwen4/qwen4_qsa_indexer_score.cu` (transformers 5.16.1 `qwen4_exp`
-//! `Qwen4ExpTextQSAIndexer.forward`); the geometry this wrapper accepts is the
-//! checkpoint's own, held against the compiled constants before a launch.
+//! `Qwen4ExpTextQSAIndexer.forward`); the kernel is compiled for one geometry
+//! and this wrapper sizes its buffers from it. The checkpoint's own indexer
+//! fields are checked where the model crate reads its config, once that caller
+//! lands — this stage takes only `rms_eps` from the caller.
 
 use anyhow::Result;
 use anyhow::ensure;
@@ -20,78 +22,19 @@ use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::active_cu_stream;
 
-/// The checkpoint's QSA indexer geometry. Frozen with the line: `pegainfer-qwen4`
-/// serves one `qwen4_exp` text geometry, and the kernel is compiled for it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct QsaIndexerGeometry {
-    /// `indexer_n_heads`: query heads the indexer scores with.
-    pub heads: usize,
-    /// `indexer_kv_heads`. The reference requires exactly one, so the four
-    /// query heads all read the same pooled key.
-    pub kv_heads: usize,
-    /// `indexer_head_dim`.
-    pub head_dim: usize,
-    /// `indexer_compress_ratio`: tokens per micro-block.
-    pub compress_ratio: usize,
-    /// Dims the partial RoPE rotates — `head_dim * partial_rotary_factor` of the
-    /// *attention* head (256 * 0.25 = 64), which is under the indexer's 128 —
-    /// and the row stride of the shared attention cos/sin table.
-    pub rotary_dim: usize,
-    /// `rms_norm_eps`, shared by both `(1 + w)` norms.
-    pub rms_eps: f32,
-}
-
-impl QsaIndexerGeometry {
-    /// The frozen Qwen3.8-Flash-Next text config's indexer.
-    pub fn qwen38_flash_next() -> Self {
-        Self {
-            heads: 4,
-            kv_heads: 1,
-            head_dim: 128,
-            compress_ratio: 4,
-            rotary_dim: 64,
-            rms_eps: 1.0e-6,
-        }
-    }
-
-    /// Columns of one fused projection row: the four query heads then the raw
-    /// key head.
-    pub fn fused_width(&self) -> usize {
-        (self.heads + self.kv_heads) * self.head_dim
-    }
-
-    /// Blocks `pooled_keys` must hold for `tokens` tokens.
-    pub fn max_blocks(&self, tokens: usize) -> usize {
-        tokens / self.compress_ratio
-    }
-
-    /// Refuse a geometry the kernel was not compiled for. Called by
-    /// [`qsa_indexer_block_scores_into`] before it forms a pointer, and public so
-    /// a caller deriving geometry from a checkpoint's config can check it
-    /// without a launch.
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.heads == 4
-                && self.kv_heads == 1
-                && self.head_dim == 128
-                && self.compress_ratio == 4
-                && self.rotary_dim == 64,
-            "QSA indexer geometry {self:?} is not the geometry \
-             csrc/qwen4/qwen4_qsa_indexer_score.cu was compiled for"
-        );
-        ensure!(
-            self.rms_eps >= 0.0,
-            "QSA indexer rms_norm_eps {} must be non-negative",
-            self.rms_eps
-        );
-        Ok(())
-    }
-}
+/// The geometry the kernel is compiled for, used to size this wrapper's buffer
+/// checks. The kernel reads with the same numbers: four query heads and one
+/// shared key head at 128 (a 640-wide fused row), four tokens per micro-block,
+/// and 64 rotated dims — also the shared attention table's row stride.
+const FUSED_WIDTH: usize = 640;
+const HEAD_DIM: usize = 128;
+const ROTARY_DIM: usize = 64;
+const COMPRESS_RATIO: usize = 4;
 
 /// Score every complete micro-block of `fused_qk` for every query row.
 ///
 /// `fused_qk` is the whole fused `index_qk_proj` output, one row per token:
-/// `fused_width()` columns, the query heads first and the raw key head last.
+/// `FUSED_WIDTH` columns, the query heads first and the raw key head last.
 /// The key array must start at token 0 — the micro-block grid starts at the
 /// first visible token and this kernel reads it as token 0 (see the kernel's
 /// grid contract).
@@ -99,23 +42,22 @@ impl QsaIndexerGeometry {
 /// `rows[j]` is each query row's position (the RoPE position and the
 /// `fused_qk` row its query heads take) and `visible_len[j]` how many tokens
 /// it can see, counted from token 0; causal text passes `rows[j] + 1`. Row `j`
-/// gets `visible_len[j] / compress_ratio` scores at stride `score_cols`;
+/// gets `visible_len[j] / COMPRESS_RATIO` scores at stride `score_cols`;
 /// entries past that are left untouched, as the reference leaves them NaN — a
 /// caller that wants to tell an unwritten entry from a real one has to poison
 /// the buffer itself (the parity gate pre-fills a sentinel). Both arrays are
 /// checked on the device: an out-of-range entry traps, so a broken caller fails
 /// visibly instead of getting a plausible score for a row it never asked about.
 ///
-/// `pooled_keys` is the workspace: `max_blocks(tokens)` rows of `head_dim`,
-/// reused across calls of the same geometry.
+/// `pooled_keys` is the workspace: `tokens / COMPRESS_RATIO` rows of
+/// `HEAD_DIM`, reused across calls.
 ///
 /// `cos`/`sin` are the shared attention RoPE tables (`pegainfer_core::rope`,
-/// `[max_pos, rotary_dim]`, position-major): the indexer rotates with the same
+/// `[max_pos, ROTARY_DIM]`, position-major): the indexer rotates with the same
 /// position embeddings the attention uses, so this stage computes no trig. The
 /// tables must cover every position this call can read, `0..tokens`.
 pub fn qsa_indexer_block_scores_into(
     ctx: &DeviceContext,
-    geometry: &QsaIndexerGeometry,
     fused_qk: &CudaSlice<bf16>,
     q_norm_weight: &CudaSlice<bf16>,
     k_norm_weight: &CudaSlice<bf16>,
@@ -127,12 +69,17 @@ pub fn qsa_indexer_block_scores_into(
     scores: &mut CudaSlice<f32>,
     score_cols: usize,
     pooled_keys: &mut CudaSlice<bf16>,
+    rms_eps: f32,
 ) -> Result<()> {
-    geometry.validate()?;
+    // NaN fails the comparison, as it does in the kernel's own guard.
     ensure!(
-        score_cols >= geometry.max_blocks(tokens),
-        "QSA indexer score_cols {score_cols} cannot hold {} blocks",
-        geometry.max_blocks(tokens)
+        rms_eps >= 0.0,
+        "QSA indexer rms_norm_eps {rms_eps} must be non-negative"
+    );
+    let blocks = tokens / COMPRESS_RATIO;
+    ensure!(
+        score_cols >= blocks,
+        "QSA indexer score_cols {score_cols} cannot hold {blocks} blocks"
     );
     let query_rows = rows.len();
     ensure!(
@@ -141,17 +88,16 @@ pub fn qsa_indexer_block_scores_into(
         visible_len.len()
     );
     ensure!(
-        fused_qk.len() >= tokens.saturating_mul(geometry.fused_width()),
+        fused_qk.len() >= tokens.saturating_mul(FUSED_WIDTH),
         "QSA indexer fused_qk holds {} bf16, needs {} for {tokens} tokens",
         fused_qk.len(),
-        tokens.saturating_mul(geometry.fused_width())
+        tokens.saturating_mul(FUSED_WIDTH)
     );
     ensure!(
-        q_norm_weight.len() >= geometry.head_dim && k_norm_weight.len() >= geometry.head_dim,
-        "QSA indexer norm weights must hold {} bf16",
-        geometry.head_dim
+        q_norm_weight.len() >= HEAD_DIM && k_norm_weight.len() >= HEAD_DIM,
+        "QSA indexer norm weights must hold {HEAD_DIM} bf16"
     );
-    let table_len = tokens.saturating_mul(geometry.rotary_dim);
+    let table_len = tokens.saturating_mul(ROTARY_DIM);
     ensure!(
         cos.len >= table_len && sin.len >= table_len,
         "QSA indexer cos/sin tables hold {}/{} bf16, need {table_len} for {tokens} positions",
@@ -165,15 +111,10 @@ pub fn qsa_indexer_block_scores_into(
         query_rows.saturating_mul(score_cols)
     );
     ensure!(
-        pooled_keys.len()
-            >= geometry
-                .max_blocks(tokens)
-                .saturating_mul(geometry.head_dim),
+        pooled_keys.len() >= blocks.saturating_mul(HEAD_DIM),
         "QSA indexer pooled_keys workspace holds {} bf16, needs {}",
         pooled_keys.len(),
-        geometry
-            .max_blocks(tokens)
-            .saturating_mul(geometry.head_dim)
+        blocks.saturating_mul(HEAD_DIM)
     );
     if query_rows == 0 || tokens == 0 {
         return Ok(());
@@ -182,8 +123,6 @@ pub fn qsa_indexer_block_scores_into(
     let query_rows = checked_i32(query_rows, "QSA indexer query rows")?;
     let tokens = checked_i32(tokens, "QSA indexer tokens")?;
     let score_cols = checked_i32(score_cols, "QSA indexer score columns")?;
-    let fused_width = checked_i32(geometry.fused_width(), "QSA indexer fused width")?;
-    let rotary_dim = checked_i32(geometry.rotary_dim, "QSA indexer rotary dim")?;
 
     let (fused_ptr, _fused_guard) = fused_qk.device_ptr(&ctx.stream);
     let (q_norm_ptr, _q_norm_guard) = q_norm_weight.device_ptr(&ctx.stream);
@@ -208,76 +147,10 @@ pub fn qsa_indexer_block_scores_into(
             query_rows,
             tokens,
             score_cols,
-            fused_width,
-            rotary_dim,
-            geometry.rms_eps,
+            rms_eps,
             active_cu_stream(ctx),
         )
     }
     .result()
     .map_err(|err| anyhow::anyhow!("QSA indexer block score launch failed: {err}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::QsaIndexerGeometry;
-
-    /// The geometry is the one hand-off this stage has with the kernel's compiled
-    /// constants, so a mismatch has to be refused before a pointer is formed.
-    #[test]
-    fn only_the_compiled_geometry_passes() {
-        let compiled = QsaIndexerGeometry::qwen38_flash_next();
-        compiled.validate().expect("the frozen geometry");
-        assert_eq!(compiled.fused_width(), 640);
-        assert_eq!(compiled.max_blocks(2055), 513);
-        for (field, mutated) in [
-            (
-                "heads",
-                QsaIndexerGeometry {
-                    heads: 8,
-                    ..compiled
-                },
-            ),
-            (
-                "kv_heads",
-                QsaIndexerGeometry {
-                    kv_heads: 2,
-                    ..compiled
-                },
-            ),
-            (
-                "head_dim",
-                QsaIndexerGeometry {
-                    head_dim: 256,
-                    ..compiled
-                },
-            ),
-            (
-                "compress_ratio",
-                QsaIndexerGeometry {
-                    compress_ratio: 2,
-                    ..compiled
-                },
-            ),
-            (
-                "rotary_dim",
-                QsaIndexerGeometry {
-                    rotary_dim: 32,
-                    ..compiled
-                },
-            ),
-            (
-                "rms_eps",
-                QsaIndexerGeometry {
-                    rms_eps: -1.0e-6,
-                    ..compiled
-                },
-            ),
-        ] {
-            assert!(
-                mutated.validate().is_err(),
-                "a geometry with another {field} must be refused"
-            );
-        }
-    }
 }
