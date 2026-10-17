@@ -59,12 +59,12 @@ pub(crate) struct RawConfig {
 }
 
 /// Head dims baked into the kernels; head counts are runtime parameters. They
-/// are owned by the shared GDN wrappers (`pegainfer_core::ops`), which the
+/// are owned by the Qwen3.5 wrappers in `pegainfer_kernels::ops`, which the
 /// Qwen3.8-Flash-Next line drives with the same numbers, so this module only
 /// re-exports them: a config that passes here is one the kernels can run.
-pub(crate) use pegainfer_core::ops::GDN_AOT_KEY_HEAD_DIM;
-pub(crate) use pegainfer_core::ops::GDN_AOT_VALUE_HEAD_DIM;
-pub(crate) use pegainfer_core::ops::LINEAR_CONV_MAX_KERNEL_DIM;
+pub(crate) use pegainfer_kernels::ops::GDN_AOT_KEY_HEAD_DIM;
+pub(crate) use pegainfer_kernels::ops::GDN_AOT_VALUE_HEAD_DIM;
+pub(crate) use pegainfer_kernels::ops::LINEAR_CONV_MAX_KERNEL_DIM;
 const FULL_ATTN_HEAD_DIM: usize = 256;
 
 /// Validated Qwen3.5 model configuration (text-only).

@@ -229,6 +229,16 @@ pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
 #[cfg(feature = "qwen35")]
+pub use qwen35::GDN_AOT_KEY_HEAD_DIM;
+#[cfg(feature = "qwen35")]
+pub use qwen35::GDN_AOT_VALUE_HEAD_DIM;
+#[cfg(feature = "qwen35")]
+pub use qwen35::LINEAR_CONV_MAX_KERNEL_DIM;
+#[cfg(feature = "qwen35")]
+pub use qwen35::conv1d_decode_batch_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::gated_delta_rule_decode_batch_into;
+#[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_hd256_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_via_prefill_hd256_into;

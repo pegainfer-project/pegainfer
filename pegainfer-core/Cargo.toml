@@ -30,10 +30,6 @@ tokio = { workspace = true }
 [features]
 default = []
 kernel-call-trace = []
-# Gated DeltaNet decode ops. Their kernels are Qwen3.5's (`csrc/qwen35/…`), which
-# both the Qwen3.5 and the Qwen3.8-Flash-Next lines build; the flag names the
-# kernel set, not the model line.
-qwen35 = ["pegainfer-kernels/qwen35"]
 
 [lints]
 workspace = true

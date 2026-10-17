@@ -2,12 +2,12 @@
 //! and the tensor contract. First checkpoint `Qwen/Qwen3.8-Flash-Next`, recorded in
 //! `docs/models/qwen4/bring-up.md`.
 //!
-//! No CUDA dependency in the default build, so the probe, config and manifest tests
-//! run with no device, no weights and no Triton build. The `qwen4` feature turns on
-//! the device side: this line's Gated DeltaNet layers reuse the Qwen3.5 decode
-//! kernels through `pegainfer-core::ops`, and `tests/gdn_decode_reuse.rs` proves that
-//! reuse against layer 0 of the real checkpoint. Further device modules move behind
-//! `#[cfg(any(feature = "qwen4", test))]` the way `pegainfer-gemma4/src/lib.rs` does.
+//! No CUDA dependency at all, so its probe, config and manifest tests run with no
+//! device, no weights and no Triton build. Slice B adds the device side behind a
+//! feature of its own, and these modules then move behind
+//! `#[cfg(any(<that feature>, test))]` the way `pegainfer-gemma4/src/lib.rs` does.
+//! The Gated DeltaNet decode wrappers this line will drive already live in
+//! `pegainfer_kernels::ops` under the kernels' `qwen35` feature.
 
 mod config;
 // Only tests read the contract until slice B's loader checks a checkpoint with it.

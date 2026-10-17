@@ -3896,10 +3896,6 @@ name = "pegainfer-qwen4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cudarc",
- "half",
- "memmap2",
- "pegainfer-core",
  "pegainfer-frontend",
  "safetensors",
  "serde",
