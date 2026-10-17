@@ -1,8 +1,8 @@
-// Qwen3.8-Flash-Next QSA token-indexer block scoring (Stage 1, plan P2).
+// Qwen3.8-Flash-Next (Qwen4 line) QSA token-indexer block scoring.
 //
 // Frozen semantics: transformers 5.16.1 `qwen4_exp`,
-// `Qwen4ExpTextQSAIndexer.forward`. For a query row whose position is `p`,
-// over a visible set that starts at token 0:
+// `Qwen4ExpTextQSAIndexer.forward`. For a query row at position `p`, over a
+// visible set that starts at token 0:
 //
 //   qk           = index_qk_proj(hidden)   // one fused Linear(2560 -> 640)
 //   q_h          = (1 + q_layernorm_w) RMSNorm128(qk_q_h), partial RoPE at p
@@ -10,36 +10,22 @@
 //                  then (1 + k_layernorm_w) RMSNorm128, RoPE at 4b
 //   score_b      = sum_{h < 4} relu(q_h . pooled_key_b) / sqrt(128)
 //
-// The four query heads share one key head (indexer_kv_heads = 1), and the relu
-// is applied per head before the sum over heads.
-//
-// Two kernels own one half each. `pool_keys` builds every complete micro-block's
-// pooled key once: the reference rebuilds them per query row, from the same raw
-// keys through the same bf16 rounding points, so one pass is the same numbers —
-// a block's contents do not depend on the row that scores it. `block_scores`
-// does each row's query prep and the score reduction, over the blocks that row
-// can see. The incomplete tail (< compress_ratio tokens) is never scored: the
-// reference keeps it unconditionally, outside the block grid, and selection is
-// a separate stage.
-//
-// `compress_ratio = 4` divides the 16-token KV page, so a micro-block never
-// crosses a page. This kernel does not need that (it reads the raw key array);
-// it is what lets the selection stage map blocks onto pages with no mapping
-// layer.
+// Two kernels own one half each: `pool_keys` builds every complete
+// micro-block's pooled key once — a block's contents do not depend on the row
+// that scores it — and `block_scores` does each row's query prep and score
+// reduction over the blocks that row can see. The incomplete tail (< ratio
+// tokens) is never scored: the reference keeps it unconditionally, outside the
+// block grid.
 //
 // GRID CONTRACT: the reference groups the visible list from its FIRST visible
-// token, not from absolute position 0. This kernel requires that first visible
-// token to be token 0 of the key array (visible = [0, visible_len[row])), which
-// is the causal-text case with no prefix eviction — so block b always covers
-// tokens [4b, 4b+4). Nothing here can detect a caller whose visible list is
-// anchored elsewhere: it would pass positions and counts that look in range and
-// get a shifted grid, and such a caller must hand this kernel a shifted key
-// array instead.
+// token. This kernel requires that token to be token 0 of the key array
+// (causal text over an un-evicted cache), so block b always covers tokens
+// [4b, 4b+4). Nothing here can detect a caller whose visible list starts
+// elsewhere; such a caller must hand this kernel a shifted key array.
 //
-// Target: the sm_89-first portable subset (decision D3-B) — no TMA, no cluster,
-// no wgmma. These kernels are SIMT shuffle reductions rather than `mma.sync`
-// bodies: one block's score is a 128-wide dot over 4 query heads, a shape
-// m16n8k16 cannot tile without padding 4 rows to 16.
+// Portable SIMT — no TMA, no cluster, no wgmma; shuffle reductions rather than
+// `mma.sync`, because one block's score is a 128-wide dot over 4 query heads,
+// a shape m16n8k16 cannot tile without padding 4 rows to 16.
 
 #include "../common.cuh"
 #include "../shared/ffi_guard.cuh"
@@ -180,16 +166,11 @@ __global__ void qwen4_qsa_block_scores_kernel(
   const int lane = threadIdx.x % WARP_SIZE;
   const int warp = threadIdx.x / WARP_SIZE;
 
-  // `rows[row]` is the row's own position, and the row of `fused_qk` its query
-  // heads are read from. Contract: 0 <= rows[row] < tokens — clamped, like
-  // `visible_len` below, so a broken caller gets a wrong position rather than an
-  // out-of-bounds read.
+  // `rows[row]` is the row's own position and the fused_qk row its query
+  // heads are read from; clamped, like `visible_len` below, so a broken
+  // caller gets a wrong position rather than an out-of-bounds read.
   const int raw_pos = rows[row];
   const int pos = raw_pos < 0 ? 0 : (raw_pos >= tokens ? tokens - 1 : raw_pos);
-  // A visible list longer than the key array, or longer than the block grid, is
-  // clamped rather than read past: the adapter's contract is that
-  // visible_len[row] <= tokens, and the clamp is what keeps a broken caller from
-  // touching memory past the pool.
   int visible = visible_len[row];
   if (visible < 0) {
     visible = 0;
@@ -285,21 +266,16 @@ extern "C" {
 
 // Pooled indexer keys for the first `tokens / kRatio` complete micro-blocks of
 // a key array that starts at token 0, then the per-row block scores. The
-// incomplete tail is not pooled and not scored.
-//
-// Per row, writes `visible_len[row] / kRatio` entries of `scores` (row stride
-// `score_cols`) and leaves the rest untouched; the caller's block grid, budget
-// and selection are the next stage's business.
+// incomplete tail is not pooled and not scored. Per row, writes
+// `visible_len[row] / kRatio` entries of `scores` (row stride `score_cols`)
+// and leaves the rest untouched.
 //
 // `pooled_keys` is the pool pass's workspace — one head-dim row per complete
-// block, `tokens / kRatio` rows. It is one entry point because the score pass
-// reads all of it and every row shares it: pooling it once per call is the
-// whole reason it is not inside the per-row kernel.
+// block — shared by every row, which is why pooling is its own pass.
 //
-// `fused_width` is the caller's own row stride for `fused_qk`, checked here:
-// this body reads with the width it was compiled for, so a caller whose rows
-// are strided differently would be read out of bounds rather than computed
-// wrongly, which is the one mismatch the pointer arithmetic cannot survive.
+// `fused_width` is the caller's row stride for `fused_qk`, checked here: the
+// body reads with the width it was compiled for, so a mismatched stride would
+// be read out of bounds rather than computed wrongly.
 CUresult qwen4_qsa_indexer_block_scores_cuda(
     const __nv_bfloat16* fused_qk,
     const __nv_bfloat16* q_norm_weight,

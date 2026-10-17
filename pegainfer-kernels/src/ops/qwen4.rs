@@ -1,14 +1,11 @@
-//! Qwen3.8-Flash-Next QSA token-indexer block scoring (Stage 1, plan P2).
+//! Qwen3.8-Flash-Next QSA token-indexer block scoring.
 //!
-//! The indexer's own half of the QSA attention: it turns the fused
-//! `index_qk_proj` output into one score per (query row, visible micro-block).
-//! Selection — top-k over blocks plus the unconditional tail — is a later
-//! stage and deliberately not here.
-//!
-//! Frozen semantics live in `csrc/qwen4/qwen4_qsa_indexer_score.cu`
-//! (transformers 5.16.1 `qwen4_exp` `Qwen4ExpTextQSAIndexer.forward`); the
-//! geometry this wrapper accepts is the checkpoint's own, and every field is
-//! held against the compiled constants before a launch.
+//! Turns the fused `index_qk_proj` output into one score per (query row,
+//! visible micro-block); selection — top-k plus the unconditional tail — is a
+//! later stage, deliberately not here. Frozen semantics live in
+//! `csrc/qwen4/qwen4_qsa_indexer_score.cu` (transformers 5.16.1 `qwen4_exp`
+//! `Qwen4ExpTextQSAIndexer.forward`); the geometry this wrapper accepts is the
+//! checkpoint's own, held against the compiled constants before a launch.
 
 use anyhow::Result;
 use anyhow::ensure;
@@ -116,24 +113,19 @@ impl QsaIndexerGeometry {
 ///
 /// `fused_qk` is the whole fused `index_qk_proj` output, one row per token:
 /// `fused_width()` columns, the query heads first and the raw key head last.
-/// The key array must be the token axis from token 0 — the micro-block grid
-/// starts at the first visible token and this kernel reads it as token 0, so
-/// a visible list that starts elsewhere would shift the grid (see the kernel's
+/// The key array must start at token 0 — the micro-block grid starts at the
+/// first visible token and this kernel reads it as token 0 (see the kernel's
 /// grid contract).
 ///
-/// `rows` holds each query row's position (the RoPE position its query heads
-/// take, and the row of `fused_qk` they are read from) and `visible_len` how
-/// many tokens that row can see, counted from token 0. Row `j` gets
-/// `visible_len[j] / compress_ratio` scores in row `j` of `scores`, stride
-/// `score_cols`; entries past that are left untouched, as the reference leaves
-/// them NaN — a caller that wants to tell an unwritten entry from a real one
-/// has to poison the buffer itself (the parity gate pre-fills a sentinel). The
-/// reference computes these with the block grid starting at the first visible
-/// token, which is why the two arrays are separate: causal text
-/// passes `rows[j] + 1` for `visible_len[j]`.
-///
-/// The kernel clamps both arrays into their ranges, so a caller that breaks that
-/// contract gets a wrong score rather than a read past the key array.
+/// `rows[j]` is each query row's position (the RoPE position and the
+/// `fused_qk` row its query heads take) and `visible_len[j]` how many tokens
+/// it can see, counted from token 0; causal text passes `rows[j] + 1`. Row `j`
+/// gets `visible_len[j] / compress_ratio` scores at stride `score_cols`;
+/// entries past that are left untouched, as the reference leaves them NaN — a
+/// caller that wants to tell an unwritten entry from a real one has to poison
+/// the buffer itself (the parity gate pre-fills a sentinel). Both arrays are
+/// clamped into range, so a broken caller gets a wrong score rather than a
+/// read past the key array.
 ///
 /// `pooled_keys` is the workspace: `max_blocks(tokens)` rows of `head_dim`,
 /// reused across calls of the same geometry.

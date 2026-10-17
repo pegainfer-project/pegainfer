@@ -4,24 +4,16 @@
 //! `test_data/qwen38fn-qsa-indexer-golden.safetensors` was dumped from
 //! transformers 5.16.1 `qwen4_exp` by
 //! `tools/accuracy/dump_qwen38fn_qsa_indexer_golden.py`. Each case carries the
-//! indexer's inputs *after* `index_qk_proj` — every token's raw key and every
-//! query row's four raw query heads — plus the reference's per-row block scores,
-//! so this gate replays those inputs through the kernel and compares scores.
-//! The fused projection itself is not covered here; the golden starts after it.
-//!
-//! The cases cover the tail (5 tokens), a block-aligned short input (8), a
-//! medium one (64), the truncation branch under a shrunk budget (14, 16, 20 —
-//! the last drops a block) and the real budget boundary at 2049..2054 visible
-//! tokens, where the block grid runs from 512 kept to 513 scored with a 1..3
-//! token tail.
+//! indexer's inputs *after* `index_qk_proj` plus the reference's per-row block
+//! scores, so this gate replays those inputs through the kernel and compares.
+//! Cases cover the tail (5), a block-aligned short input (8), a medium one
+//! (64), the truncation branch under a shrunk budget (14, 16, 20) and the real
+//! budget boundary at 2049..2054 visible tokens.
 //!
 //! Provenance is asserted, not assumed: the fixture records the reference
 //! version and the sha256 of the frozen config it was dumped from, and that
 //! config's indexer geometry is held against the geometry this crate compiles
-//! for. A fixture from another checkpoint or another semantics fails here
-//! instead of being skipped.
-//!
-//! Without a device it skips; `PEGAINFER_REQUIRE_GPU=1` turns that into a
+//! for. Without a device it skips; `PEGAINFER_REQUIRE_GPU=1` turns that into a
 //! failure.
 //!
 //!   cargo test --release -p pegainfer-kernels --features qwen4 \
@@ -51,34 +43,23 @@ const CASES: usize = 7;
 
 /// Score parity bound, `abs(got - want) <= ATOL + RTOL * abs(want)`.
 ///
-/// Six of the seven cases land within 9.6e-7 — every bf16 rounding decision the
-/// reference makes (the norm's single cast, the pooled mean's round trip, the
-/// bf16 rotation) is reproduced bit-for-bit. The residual is in the seventh, the
-/// only case with positions past 63 and 513 pooled blocks: 152 of its 3076
-/// scores sit above 1e-4, 147 of them in a single row, and the worst is 2.4e-3.
+/// Six cases land within 9.6e-7 — every bf16 rounding decision the reference
+/// makes is reproduced bit-for-bit. The residual sits in the seventh (the only
+/// case with positions past 63): 152 of 3076 scores above 1e-4, worst 2.4e-3,
+/// sign-balanced with a -5.2e-7 bias — the shape of a flipped bf16 rounding
+/// decision, not a semantic difference. The reference rounds its float32
+/// reductions in a torch-defined order; where a value sits within one f32 ulp
+/// of a bf16 midpoint the kernel's butterfly tree rounds apart from it, and
+/// one flipped element moves every score it touches. The reference does the
+/// same to itself: re-deriving case 2 on x86 (torch 2.14.1 vs the golden's
+/// 2.14.0/arm64) moves one of its 496 scores by 2.2e-3, three orders more than
+/// this kernel's 9.5e-7 there.
 ///
-/// That shape is one flipped bf16 rounding decision, not a semantic difference.
-/// The reference rounds its float32 reductions in a torch-defined order (the
-/// 128-wide sum of squares, the 4-element mean) that differs from this kernel's
-/// butterfly tree, so where a value sits within a float32 ulp of a bf16 midpoint
-/// the two round apart; one such element, worth 1 bf16 ulp (0.4%) there, moves
-/// every score the element touches, which is why one row carries most of it. The
-/// bound's own diagnostics say the same: the deviations are sign-balanced (76 of
-/// 152 positive) with a bias of -5.2e-7 over 3076 scores, none of which a
-/// systematic error produces.
-///
-/// The magnitude is the reference's own floor, not this kernel's. Re-deriving
-/// case 2 on this host with the reference's own ops, from the fixture's own
-/// inputs and weights (torch 2.14.1+cpu, against the committed golden dumped
-/// under torch 2.14.0 on arm64) moves one of its 496 scores by 2.2e-3 — the same
-/// single-flip size, and on that case this kernel is three orders closer
-/// (9.5e-7).
-///
-/// So the bound is set to hold ~6 flips at a typical score of ~2 (`ATOL + RTOL *
-/// 2`), against a measured worst of 0.16 of it, while any real fault — a block
-/// off by one, a missing relu, an unrotated half — moves a score by ~1, two
-/// orders out. Selection, which is the next stage's business, is already
-/// documented as tolerating a tie at the cut for the same reason.
+/// So the bound holds ~6 flips at a typical score of ~2, against a measured
+/// worst of 0.16 of it, while any real fault — a block off by one, a missing
+/// relu, an unrotated half — moves a score by ~1, two orders out. Selection
+/// must treat a block tied at the cut as an equally valid pick, for the same
+/// reason.
 const ATOL: f32 = 5.0e-3;
 const RTOL: f32 = 5.0e-3;
 
@@ -351,14 +332,9 @@ fn visible_counts(case: &Case) -> Vec<i32> {
 }
 
 /// One case's parity: how much was compared, the worst element and where, and
-/// the shape of the residual above two diagnostic thresholds — a handful of
-/// bf16-rounding flips is a different animal from a shifted grid, and these
-/// counts say which one this is.
-///
-/// The sign split and the bias catch a *systematic* error that a max alone
-/// cannot: a mean over the compared elements that leans one way, or deviations
-/// piling up in one row (the query side) instead of spreading over blocks (the
-/// pooled-key side), would both show here.
+/// the shape of the residual — the sign split and the bias catch a
+/// *systematic* error (a lean one way, deviations piling up in one row)
+/// that a max alone cannot.
 struct CaseSummary {
     compared: usize,
     max_abs: f32,
@@ -432,10 +408,8 @@ fn check_case(
         assert!(blocks <= block_cols, "case {}: beyond the pool", case.index);
         let row_ref = &case.reference[slot * score_cols..][..score_cols];
         let row_got = &got[slot * score_cols..][..score_cols];
-        // The reference pads its un-computed columns with NaN, and the fixture
-        // carries that padding. It is a fact about the reference, not about the
-        // kernel, so the gate reads the explicit prefix `(row + 1) /
-        // compress_ratio` instead of comparing through it.
+        // The reference pads its un-computed columns with NaN; the gate reads
+        // the explicit prefix instead of comparing through it.
         for (block, want) in row_ref.iter().enumerate().skip(blocks) {
             assert!(
                 want.is_nan(),
@@ -443,9 +417,8 @@ fn check_case(
                 case.index
             );
         }
-        // The kernel writes the prefix and leaves the rest of the caller's
-        // buffer exactly as it was — bit for bit, so the sentinel check is a bit
-        // comparison rather than a float one.
+        // The kernel writes the prefix and leaves the rest bit-for-bit as it
+        // was, so the sentinel check is a bit comparison.
         for (block, x) in row_got.iter().enumerate().skip(blocks) {
             assert!(
                 same_f32(*x, SENTINEL),
@@ -512,23 +485,16 @@ fn fixture_records_the_frozen_reference() {
     assert_provenance(&bytes);
 }
 
-/// The kernel's own half of the refusal contract, likewise device-free: the
-/// entry point rejects a geometry it was not compiled for *before* it forms a
-/// launch, so this can be pinned without a device and must never be skippable.
+/// The kernel's own half of the refusal contract, device-free: the entry point
+/// rejects a geometry it was not compiled for *before* it forms a launch. It
+/// is the only place the compiled row stride is checked — the reason
+/// `fused_width` is an argument at all — and `rotary_dim` and `rope_theta`
+/// are compiled constants nothing else can be held against.
 ///
-/// It is the only place the compiled row stride is checked, and the reason
-/// `fused_width` is an argument at all: the body reads `fused_qk` with the width
-/// it was compiled for, so a caller whose rows are strided differently is read
-/// out of bounds rather than computed wrongly — the one mismatch the pointer
-/// arithmetic cannot survive. `rotary_dim` and `rope_theta` are compiled
-/// constants nothing else can be held against.
-///
-/// Every call below leaves through a guard, before the first launch, and a
-/// launch is the only thing that would touch the pointers; that is why they can
-/// dangle and why this needs no device. The two zero-extent calls come first as
-/// the positive control — the compiled geometry with an empty extent, which the
-/// guards must let through — because an entry point that refused everything
-/// would make every refusal below vacuous.
+/// Every call below leaves through a guard before the first launch, so the
+/// pointers can dangle. The two zero-extent calls come first as the positive
+/// control: an entry point that refused everything would make every refusal
+/// below vacuous.
 #[test]
 fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
     use cudarc::driver::sys::CUresult;
