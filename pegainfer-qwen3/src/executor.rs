@@ -2070,39 +2070,94 @@ impl Qwen3Executor {
         }
     }
 
-    fn wait_for_step_ack(
-        pending: Vec<channel::Receiver<Result<WorkerStepOutcome>>>,
-        op_name: &'static str,
-    ) -> Result<()> {
-        for recv in pending {
-            match recv
-                .recv()
-                .map_err(|_| worker_lost(format!("tensor-parallel {op_name} worker dropped")))??
-            {
-                WorkerStepOutcome::Ack => {}
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "tensor-parallel {op_name} worker returned unexpected payload: {}",
-                        other.kind()
-                    ));
-                }
-            }
+    /// A lost tensor-parallel rank can leave its peers in an unpaired NCCL collective,
+    /// where joining them, freeing device memory and exit's cudart teardown all block,
+    /// so that executor aborts like the pre-capture watchdog. A single rank reports the
+    /// loss and the engine shuts down.
+    fn rank_lost(&self, rank: usize, what: &str) -> anyhow::Error {
+        if !self.workers.is_empty() {
+            log::error!(
+                "FATAL: tensor-parallel rank {rank} {what}; aborting because its peers may be stuck in NCCL"
+            );
+            std::process::abort();
         }
-        Ok(())
+        worker_lost(format!("rank {rank} {what}"))
     }
 
     fn run_step(&self, step: &StepCommand) -> Result<WorkerStepOutcome> {
-        let primary = self.primary.run_step(step.clone(), true)?;
+        let primary = self
+            .primary
+            .run_step(step.clone(), true)
+            .map_err(|_| self.rank_lost(0, "step channel closed"))?;
         let mut pending = Vec::with_capacity(self.workers.len());
-        for worker in &self.workers {
-            pending.push(worker.run_step(step.clone(), false)?);
+        for (index, worker) in self.workers.iter().enumerate() {
+            let response = worker
+                .run_step(step.clone(), false)
+                .map_err(|_| self.rank_lost(index + 1, "step channel closed"))?;
+            pending.push(response);
         }
-        let primary_result = primary
-            .recv()
-            .map_err(|_| worker_lost("primary worker dropped step response"))??;
-        Self::wait_for_step_ack(pending, step.kind())?;
-        Ok(primary_result)
+        await_step_responses(&primary, &pending, step.kind())
+            .map_err(|rank| self.rank_lost(rank, "dropped its step response"))?
     }
+}
+
+/// Rank 0's step response once every peer has acked, with all ranks watched at once: a
+/// rank that dies mid step can leave the others blocked in an unpaired collective, so
+/// its closed channel returns `Err(rank)` right away, rank 0 being the primary. An error
+/// from rank 0 returns at once, and a peer error as soon as rank 0 has responded.
+fn await_step_responses(
+    primary: &channel::Receiver<Result<WorkerStepOutcome>>,
+    peers: &[channel::Receiver<Result<WorkerStepOutcome>>],
+    op_name: &'static str,
+) -> std::result::Result<Result<WorkerStepOutcome>, usize> {
+    let mut primary_outcome = None;
+    let mut waiting: Vec<usize> = (0..peers.len()).collect();
+    let mut peer_error = None;
+    while primary_outcome.is_none() || !waiting.is_empty() {
+        let mut select = channel::Select::new();
+        let primary_op = primary_outcome.is_none().then(|| select.recv(primary));
+        let peer_ops: Vec<usize> = waiting
+            .iter()
+            .map(|&peer| select.recv(&peers[peer]))
+            .collect();
+        let op = select.select();
+        let index = op.index();
+        if primary_op == Some(index) {
+            match op.recv(primary) {
+                Ok(Ok(outcome)) => primary_outcome = Some(outcome),
+                Ok(Err(error)) => return Ok(Err(error)),
+                Err(_) => return Err(0),
+            }
+        } else {
+            let slot = peer_ops
+                .iter()
+                .position(|&op_index| op_index == index)
+                .expect("the selected operation is a registered peer");
+            let peer = waiting.remove(slot);
+            match op.recv(&peers[peer]) {
+                Ok(Ok(WorkerStepOutcome::Ack)) => {}
+                Ok(Ok(other)) => {
+                    peer_error.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "tensor-parallel {op_name} worker returned unexpected payload: {}",
+                            other.kind()
+                        )
+                    });
+                }
+                Ok(Err(error)) => {
+                    peer_error.get_or_insert(error);
+                }
+                Err(_) => return Err(peer + 1),
+            }
+        }
+        if primary_outcome.is_some()
+            && let Some(error) = peer_error.take()
+        {
+            return Ok(Err(error));
+        }
+    }
+    let outcome = primary_outcome.expect("the loop ends after rank 0 responds");
+    Ok(Ok(outcome))
 }
 
 fn profile_kv_budget_on_worker(
@@ -3052,8 +3107,45 @@ impl ModelExecutor for Qwen3Executor {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::time::Duration;
 
+    use crossbeam_channel as channel;
+
+    use super::WorkerStepOutcome;
+    use super::await_step_responses;
     use super::ensure_lora_capacity;
+
+    type StepResponse = anyhow::Result<WorkerStepOutcome>;
+
+    /// The lost rank `await_step_responses` reports, failing instead of hanging if it blocks.
+    fn lost_rank_within_deadline(
+        primary: channel::Receiver<StepResponse>,
+        peer: channel::Receiver<StepResponse>,
+    ) -> Option<usize> {
+        let (done_tx, done_rx) = channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(await_step_responses(&primary, &[peer], "decode").err());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a closed rank channel must end the wait")
+    }
+
+    #[test]
+    fn a_dead_peer_is_seen_while_rank_zero_is_blocked() {
+        let (_rank_zero_blocked, primary) = channel::bounded::<StepResponse>(1);
+        let (dead_peer, peer) = channel::bounded::<StepResponse>(1);
+        drop(dead_peer);
+        assert_eq!(lost_rank_within_deadline(primary, peer), Some(1));
+    }
+
+    #[test]
+    fn a_dead_rank_zero_is_reported_as_rank_zero() {
+        let (dead_rank_zero, primary) = channel::bounded::<StepResponse>(1);
+        let (_peer_blocked, peer) = channel::bounded::<StepResponse>(1);
+        drop(dead_rank_zero);
+        assert_eq!(lost_rank_within_deadline(primary, peer), Some(0));
+    }
 
     #[test]
     fn lora_capacity_rejects_new_adapter_at_limit() {
