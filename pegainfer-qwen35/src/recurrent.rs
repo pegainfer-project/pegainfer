@@ -144,8 +144,11 @@ pub(crate) fn conv1d_decode_batch_into(
 }
 
 /// Causal depthwise conv1d prefill over a HiddenStates batch.
+///
+/// `pub` so the crate's operator surface (`runtime_ops`) can hand it to local
+/// gates and benches; the module itself stays crate-private.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn conv1d_prefill_batch_into(
+pub fn conv1d_prefill_batch_into(
     ctx: &DeviceContext,
     x_seq: &HiddenStates,
     conv_weight: &DeviceVec,
@@ -178,32 +181,61 @@ pub(crate) fn conv1d_prefill_batch_into(
     }
 }
 
+/// Prepare stage of the chunk-wise GDR prefill: head-expand q/k to the value-head
+/// count, L2-normalize them, split v, and derive the raw gate pair `g`/`beta`
+/// from the `a`/`b` projections, `dt_bias` and `A_log`.
+///
+/// This is the Qwen3.5-specific half of the operator — the gate derivation is
+/// what a line reusing the GDN stack replaces. On return `scratch.g_cumsum`
+/// still holds the *raw* per-token gate; the chunk-local cumsum folds it in
+/// [`gated_delta_rule_prefill_chunkwise_from_gates_into`].
 #[allow(clippy::too_many_arguments)]
-fn gated_delta_rule_prefill_chunk_prepare_into(
+pub fn gated_delta_rule_prefill_chunk_prepare_into(
     ctx: &DeviceContext,
     qkv: &HiddenStates,
     b_proj: &HiddenStates,
     a_proj: &HiddenStates,
     dt_bias: &DeviceVec,
     a_log: &CudaSlice<f32>,
-    q_out: &mut HiddenStates,
-    k_out: &mut HiddenStates,
-    v_out: &mut HiddenStates,
-    g_out: &mut CudaSlice<f32>,
-    beta_out: &mut CudaSlice<f32>,
+    scratch: &mut GdrChunkwiseScratch35,
     num_key_heads: usize,
     num_value_heads: usize,
 ) -> Result<()> {
+    let seq_len = qkv.seq_len;
+    assert_eq!(b_proj.seq_len, seq_len);
+    assert_eq!(a_proj.seq_len, seq_len);
+    assert_eq!(b_proj.hidden_dim, num_value_heads);
+    assert_eq!(a_proj.hidden_dim, num_value_heads);
+    assert_eq!(dt_bias.len, num_value_heads);
+    assert_eq!(a_log.len(), num_value_heads);
+    assert_eq!(scratch.q_expanded.seq_len, seq_len);
+    assert_eq!(scratch.k_expanded.seq_len, seq_len);
+    assert_eq!(scratch.v_raw.seq_len, seq_len);
+    assert_eq!(
+        scratch.q_expanded.hidden_dim,
+        num_value_heads * GDN_AOT_KEY_HEAD_DIM
+    );
+    assert_eq!(
+        scratch.k_expanded.hidden_dim,
+        num_value_heads * GDN_AOT_KEY_HEAD_DIM
+    );
+    assert_eq!(
+        scratch.v_raw.hidden_dim,
+        num_value_heads * GDN_AOT_VALUE_HEAD_DIM
+    );
+    assert_eq!(scratch.g_cumsum.len(), seq_len * num_value_heads);
+    assert_eq!(scratch.beta.len(), seq_len * num_value_heads);
+
     let (qkv_ptr, _gqkv) = qkv.data.device_ptr(&ctx.stream);
     let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
     let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
     let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
     let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
-    let (q_out_ptr, _gqo) = q_out.data.device_ptr_mut(&ctx.stream);
-    let (k_out_ptr, _gko) = k_out.data.device_ptr_mut(&ctx.stream);
-    let (v_out_ptr, _gvo) = v_out.data.device_ptr_mut(&ctx.stream);
-    let (g_out_ptr, _ggo) = g_out.device_ptr_mut(&ctx.stream);
-    let (beta_out_ptr, _gbetao) = beta_out.device_ptr_mut(&ctx.stream);
+    let (q_out_ptr, _gqo) = scratch.q_expanded.data.device_ptr_mut(&ctx.stream);
+    let (k_out_ptr, _gko) = scratch.k_expanded.data.device_ptr_mut(&ctx.stream);
+    let (v_out_ptr, _gvo) = scratch.v_raw.data.device_ptr_mut(&ctx.stream);
+    let (g_out_ptr, _ggo) = scratch.g_cumsum.device_ptr_mut(&ctx.stream);
+    let (beta_out_ptr, _gbetao) = scratch.beta.device_ptr_mut(&ctx.stream);
 
     let result = unsafe {
         ffi::gated_delta_rule_prefill_chunk_prepare_cuda(
@@ -428,7 +460,9 @@ fn gated_delta_rule_prefill_chunk_o_stage_into(
 /// Chunk-wise GDR prefill operator contract for Qwen3.5.
 ///
 /// The chunk-wise path is an explicit multi-stage operator with pre-allocated
-/// scratch instead of one opaque kernel launch.
+/// scratch instead of one opaque kernel launch. This entry point is the prepare
+/// stage followed by the chunk stages; a caller that already holds the gate pair
+/// drives [`gated_delta_rule_prefill_chunkwise_from_gates_into`] directly.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_rule_prefill_chunkwise_into(
     ctx: &DeviceContext,
@@ -445,29 +479,8 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
     key_dim: usize,
     val_dim: usize,
 ) -> Result<()> {
-    assert_eq!(scratch.q_expanded.seq_len, qkv.seq_len);
-    assert_eq!(scratch.k_expanded.seq_len, qkv.seq_len);
-    assert_eq!(scratch.v_raw.seq_len, qkv.seq_len);
-    assert_eq!(scratch.w.seq_len, qkv.seq_len);
-    assert_eq!(scratch.u.seq_len, qkv.seq_len);
-    assert_eq!(scratch.v_new.seq_len, qkv.seq_len);
-    assert_eq!(scratch.q_expanded.hidden_dim, num_value_heads * key_dim);
-    assert_eq!(scratch.k_expanded.hidden_dim, num_value_heads * key_dim);
-    assert_eq!(scratch.v_raw.hidden_dim, num_value_heads * val_dim);
-    assert_eq!(scratch.w.hidden_dim, num_value_heads * key_dim);
-    assert_eq!(scratch.u.hidden_dim, num_value_heads * val_dim);
-    assert_eq!(scratch.v_new.hidden_dim, num_value_heads * val_dim);
-
-    let expected_gate_len = qkv.seq_len * num_value_heads;
-    let expected_chunk_a_len = qkv.seq_len * num_value_heads * GdrChunkwiseScratch35::CHUNK_SIZE;
-    let expected_chunk_ai_len = expected_chunk_a_len;
-    let expected_chunk_state_len =
-        GdrChunkwiseScratch35::num_chunks(qkv.seq_len) * num_value_heads * val_dim * key_dim;
-    assert_eq!(scratch.g_cumsum.len(), expected_gate_len);
-    assert_eq!(scratch.beta.len(), expected_gate_len);
-    assert_eq!(scratch.a_tril.len(), expected_chunk_a_len);
-    assert_eq!(scratch.a_inv.len(), expected_chunk_ai_len);
-    assert_eq!(scratch.chunk_state.len(), expected_chunk_state_len);
+    assert_eq!(output.seq_len, qkv.seq_len);
+    assert_eq!(output.hidden_dim, num_value_heads * val_dim);
 
     gated_delta_rule_prefill_chunk_prepare_into(
         ctx,
@@ -476,19 +489,70 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         a_proj,
         dt_bias,
         a_log,
-        &mut scratch.q_expanded,
-        &mut scratch.k_expanded,
-        &mut scratch.v_raw,
-        &mut scratch.g_cumsum,
-        &mut scratch.beta,
+        scratch,
         num_key_heads,
         num_value_heads,
     )
     .map_err(|e| anyhow::anyhow!("GDR prefill prepare failed: {e}"))?;
+    gated_delta_rule_prefill_chunkwise_from_gates_into(
+        ctx,
+        scratch,
+        state,
+        output,
+        num_value_heads,
+        key_dim,
+        val_dim,
+    )
+}
+
+/// The chunk stages of the chunk-wise GDR prefill, over a scratch that already
+/// carries the head-expanded q/k, the raw v and the raw gate pair: `g_cumsum`
+/// still holds the per-token `g` this function folds into its chunk-local prefix
+/// sum, and `beta` the per-token beta.
+///
+/// This is the model-agnostic half of the operator — everything downstream of
+/// the gate derivation, and the entry point a line reusing the GDN stack drives
+/// with its own `g`/`beta`. `state` is the recurrent state, read as the initial
+/// state and overwritten with the final one, so consecutive chunks carry it.
+pub fn gated_delta_rule_prefill_chunkwise_from_gates_into(
+    ctx: &DeviceContext,
+    scratch: &mut GdrChunkwiseScratch35,
+    state: &mut CudaSlice<f32>,
+    output: &mut HiddenStates,
+    num_value_heads: usize,
+    key_dim: usize,
+    val_dim: usize,
+) -> Result<()> {
+    let seq_len = scratch.q_expanded.seq_len;
+    assert_eq!(output.seq_len, seq_len);
+    assert_eq!(output.hidden_dim, num_value_heads * val_dim);
+    assert_eq!(scratch.k_expanded.seq_len, seq_len);
+    assert_eq!(scratch.v_raw.seq_len, seq_len);
+    assert_eq!(scratch.w.seq_len, seq_len);
+    assert_eq!(scratch.u.seq_len, seq_len);
+    assert_eq!(scratch.v_new.seq_len, seq_len);
+    assert_eq!(scratch.q_expanded.hidden_dim, num_value_heads * key_dim);
+    assert_eq!(scratch.k_expanded.hidden_dim, num_value_heads * key_dim);
+    assert_eq!(scratch.v_raw.hidden_dim, num_value_heads * val_dim);
+    assert_eq!(scratch.w.hidden_dim, num_value_heads * key_dim);
+    assert_eq!(scratch.u.hidden_dim, num_value_heads * val_dim);
+    assert_eq!(scratch.v_new.hidden_dim, num_value_heads * val_dim);
+
+    let expected_gate_len = seq_len * num_value_heads;
+    let expected_chunk_a_len = seq_len * num_value_heads * GdrChunkwiseScratch35::CHUNK_SIZE;
+    let expected_chunk_ai_len = expected_chunk_a_len;
+    let expected_chunk_state_len =
+        GdrChunkwiseScratch35::num_chunks(seq_len) * num_value_heads * val_dim * key_dim;
+    assert_eq!(scratch.g_cumsum.len(), expected_gate_len);
+    assert_eq!(scratch.beta.len(), expected_gate_len);
+    assert_eq!(scratch.a_tril.len(), expected_chunk_a_len);
+    assert_eq!(scratch.a_inv.len(), expected_chunk_ai_len);
+    assert_eq!(scratch.chunk_state.len(), expected_chunk_state_len);
+
     gated_delta_rule_prefill_chunk_cumsum_inplace(
         ctx,
         &mut scratch.g_cumsum,
-        qkv.seq_len,
+        seq_len,
         num_value_heads,
     )
     .map_err(|e| anyhow::anyhow!("GDR prefill cumsum failed: {e}"))?;
@@ -505,7 +569,7 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
         ctx,
         &scratch.a_tril,
         &mut scratch.a_inv,
-        qkv.seq_len,
+        seq_len,
         num_value_heads,
     )
     .map_err(|e| anyhow::anyhow!("GDR prefill solve failed: {e}"))?;
