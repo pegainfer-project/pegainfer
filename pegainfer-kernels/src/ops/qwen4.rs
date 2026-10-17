@@ -5,7 +5,7 @@
 //! Selection — top-k over blocks plus the unconditional tail — is a later
 //! stage and deliberately not here.
 //!
-//! Frozen semantics live in `csrc/qwen38fn/qwen38fn_qsa_indexer_score.cu`
+//! Frozen semantics live in `csrc/qwen4/qwen4_qsa_indexer_score.cu`
 //! (transformers 5.16.1 `qwen4_exp` `Qwen4ExpTextQSAIndexer.forward`); the
 //! geometry this wrapper accepts is the checkpoint's own, and every field is
 //! held against the compiled constants before a launch.
@@ -88,7 +88,7 @@ impl QsaIndexerGeometry {
                 && self.compress_ratio == 4
                 && self.rotary_dim == 64,
             "QSA indexer geometry {self:?} is not the geometry \
-             csrc/qwen38fn/qwen38fn_qsa_indexer_score.cu was compiled for"
+             csrc/qwen4/qwen4_qsa_indexer_score.cu was compiled for"
         );
         // Bit equality, not a tolerance: the entry point refuses any other
         // theta, so a geometry carrying one must not pass as if it were compiled.
@@ -216,7 +216,7 @@ pub fn qsa_indexer_block_scores_into(
     let (scores_ptr, _scores_guard) = scores.device_ptr_mut(&ctx.stream);
     let (pooled_ptr, _pooled_guard) = pooled_keys.device_ptr_mut(&ctx.stream);
     unsafe {
-        ffi::qwen38fn_qsa_indexer_block_scores_cuda(
+        ffi::qwen4_qsa_indexer_block_scores_cuda(
             fused_ptr as *const ffi::Half,
             q_norm_ptr as *const ffi::Half,
             k_norm_ptr as *const ffi::Half,

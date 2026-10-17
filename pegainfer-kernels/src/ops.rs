@@ -43,7 +43,7 @@ mod norm;
 #[cfg(feature = "qwen35")]
 mod qwen35;
 #[cfg(feature = "qwen4")]
-mod qwen38fn;
+mod qwen4;
 mod sampling;
 
 pub use attention::PrefillPagedPlan;
@@ -230,16 +230,16 @@ pub use norm::rms_norm_gated_batch_into;
 pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::QsaIndexerGeometry;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qsa_indexer_block_scores_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_hd256_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_via_prefill_hd256_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::qk_norm_partial_rope_batched_decode_hd256_into;
-#[cfg(feature = "qwen4")]
-pub use qwen38fn::QsaIndexerGeometry;
-#[cfg(feature = "qwen4")]
-pub use qwen38fn::qsa_indexer_block_scores_into;
 pub use sampling::BatchSamplingRow;
 pub use sampling::BatchSamplingScratch;
 pub use sampling::argmax;

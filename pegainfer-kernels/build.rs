@@ -769,13 +769,12 @@ fn is_qwen35_source(csrc_dir: &Path, path: &Path) -> bool {
 }
 
 /// Qwen4 line (Qwen3.8-Flash-Next) model-local CUDA: the QSA token indexer.
-/// Named after the checkpoint, not the crate, so a second Qwen4 geometry's
-/// kernels can take their own directory.
-fn is_qwen38fn_source(csrc_dir: &Path, path: &Path) -> bool {
+/// Named after the model line, like qwen35 and glm52.
+fn is_qwen4_source(csrc_dir: &Path, path: &Path) -> bool {
     match path.strip_prefix(csrc_dir) {
         Ok(relative) => relative
             .components()
-            .any(|part| part.as_os_str() == "qwen38fn"),
+            .any(|part| part.as_os_str() == "qwen4"),
         Err(_) => false,
     }
 }
@@ -2294,7 +2293,7 @@ fn main() {
             if !qwen35_enabled && is_qwen35_source(&csrc_dir, path) {
                 return None;
             }
-            if !qwen4_enabled && is_qwen38fn_source(&csrc_dir, path) {
+            if !qwen4_enabled && is_qwen4_source(&csrc_dir, path) {
                 return None;
             }
             // --- k3 ---

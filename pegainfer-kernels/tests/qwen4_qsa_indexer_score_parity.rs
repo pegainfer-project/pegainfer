@@ -25,7 +25,7 @@
 //! failure.
 //!
 //!   cargo test --release -p pegainfer-kernels --features qwen4 \
-//!     --test qwen38fn_qsa_indexer_score_parity -- --nocapture
+//!     --test qwen4_qsa_indexer_score_parity -- --nocapture
 
 #![cfg(feature = "qwen4")]
 
@@ -533,7 +533,7 @@ fn fixture_records_the_frozen_reference() {
 fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
     use cudarc::driver::sys::CUresult;
     use pegainfer_kernels::ffi::Half;
-    use pegainfer_kernels::ffi::qwen38fn_qsa_indexer_block_scores_cuda as entry;
+    use pegainfer_kernels::ffi::qwen4_qsa_indexer_block_scores_cuda as entry;
 
     // Dangling and well-aligned, never dereferenced.
     let half = std::ptr::NonNull::<Half>::dangling().as_ptr();

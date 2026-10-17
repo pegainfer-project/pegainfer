@@ -112,7 +112,7 @@ __device__ __forceinline__ void indexer_rope_pair(float& lo, float& hi, int pos,
 // One pooled key per complete micro-block: the float32 mean of the block's raw
 // keys, cast back to bf16 the way the reference casts it, then `(1 + w)` RMSNorm
 // and RoPE at the block's first token. One warp per block, four blocks per CTA.
-__global__ void qwen38fn_qsa_pool_keys_kernel(
+__global__ void qwen4_qsa_pool_keys_kernel(
     const __nv_bfloat16* __restrict__ fused_qk,         // [tokens, kFusedWidth]
     const __nv_bfloat16* __restrict__ k_norm_weight,    // [kHeadDim]
     __nv_bfloat16* __restrict__ pooled_keys,            // [blocks, kHeadDim]
@@ -165,7 +165,7 @@ __global__ void qwen38fn_qsa_pool_keys_kernel(
 
 // Per query row: prepare the row's four query heads, then score every block the
 // row can see. One CTA per row, the four warps split the row's blocks.
-__global__ void qwen38fn_qsa_block_scores_kernel(
+__global__ void qwen4_qsa_block_scores_kernel(
     const __nv_bfloat16* __restrict__ fused_qk,         // [tokens, kFusedWidth]
     const __nv_bfloat16* __restrict__ q_norm_weight,    // [kHeadDim]
     const __nv_bfloat16* __restrict__ pooled_keys,      // [blocks, kHeadDim]
@@ -300,7 +300,7 @@ extern "C" {
 // this body reads with the width it was compiled for, so a caller whose rows
 // are strided differently would be read out of bounds rather than computed
 // wrongly, which is the one mismatch the pointer arithmetic cannot survive.
-CUresult qwen38fn_qsa_indexer_block_scores_cuda(
+CUresult qwen4_qsa_indexer_block_scores_cuda(
     const __nv_bfloat16* fused_qk,
     const __nv_bfloat16* q_norm_weight,
     const __nv_bfloat16* k_norm_weight,
@@ -342,14 +342,14 @@ CUresult qwen38fn_qsa_indexer_block_scores_cuda(
   }
   if (blocks > 0) {
     const int grid = (blocks + kWarps - 1) / kWarps;
-    qwen38fn_qsa_pool_keys_kernel<<<grid, kThreads, 0, stream>>>(
+    qwen4_qsa_pool_keys_kernel<<<grid, kThreads, 0, stream>>>(
         fused_qk, k_norm_weight, pooled_keys, blocks, rms_eps);
     const CUresult pooled_status = consume_last_cuda_error();
     if (pooled_status != CUDA_SUCCESS) {
       return pooled_status;
     }
   }
-  qwen38fn_qsa_block_scores_kernel<<<query_rows, kThreads, 0, stream>>>(
+  qwen4_qsa_block_scores_kernel<<<query_rows, kThreads, 0, stream>>>(
       fused_qk, q_norm_weight, pooled_keys, rows, visible_len, scores, tokens,
       score_cols, blocks, rms_eps);
   return consume_last_cuda_error();

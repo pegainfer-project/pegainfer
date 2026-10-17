@@ -1,5 +1,5 @@
 // Qwen3.8-Flash-Next (Qwen4 line) QSA token-indexer kernels. Geometry is frozen
-// in `csrc/qwen38fn/qwen38fn_qsa_indexer_score.cu`, which refuses a call whose
+// in `csrc/qwen4/qwen4_qsa_indexer_score.cu`, which refuses a call whose
 // rotary geometry disagrees with what it was compiled for.
 
 use cudarc::driver::sys::CUresult;
@@ -14,7 +14,7 @@ unsafe extern "C" {
     /// `fused_width` is the caller's row stride for `fused_qk`; the body reads
     /// with the width it was compiled for, so a mismatch is refused rather than
     /// read out of bounds.
-    pub fn qwen38fn_qsa_indexer_block_scores_cuda(
+    pub fn qwen4_qsa_indexer_block_scores_cuda(
         fused_qk: *const Half,
         q_norm_weight: *const Half,
         k_norm_weight: *const Half,
