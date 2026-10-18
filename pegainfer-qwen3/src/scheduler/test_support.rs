@@ -35,6 +35,11 @@ use crate::executor::UnifiedResult;
 pub(crate) struct AsyncPrefillGate {
     /// Synchronous prefills wait while set, so a test can queue requests behind one.
     pub(crate) hold_prefill: AtomicBool,
+    /// When non-zero, `hold_prefill` holds only the synchronous prefill with
+    /// this 1-based call number.
+    pub(crate) hold_call: AtomicUsize,
+    /// Synchronous prefills entered so far.
+    pub(crate) prefill_calls: AtomicUsize,
     pub(crate) open: AtomicBool,
     pub(crate) launches: AtomicUsize,
     pub(crate) polls: AtomicUsize,
@@ -251,8 +256,13 @@ impl ModelExecutor for FakeExecutor {
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
         if let Some(gate) = &self.async_prefill {
+            let call = gate.prefill_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let held = || {
+                let only = gate.hold_call.load(Ordering::SeqCst);
+                gate.hold_prefill.load(Ordering::SeqCst) && (only == 0 || only == call)
+            };
             let start = Instant::now();
-            while gate.hold_prefill.load(Ordering::SeqCst) {
+            while held() {
                 assert!(
                     start.elapsed() < Duration::from_secs(10),
                     "fake prefill held"

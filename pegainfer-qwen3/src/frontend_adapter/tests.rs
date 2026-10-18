@@ -18,6 +18,7 @@ use pegainfer_frontend::engine::LoraClient;
 use pegainfer_frontend::engine::LoraControlError;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::StepReceiver;
@@ -109,18 +110,16 @@ impl StepCollector {
     }
 
     /// Drain the remaining stream (until the scheduler is gone) and return
-    /// every terminal seen for `id`. For asserting silence after an abort.
-    fn drain_terminals_for(&mut self, id: RequestId) -> Vec<Terminal> {
-        let mut terminals: Vec<Terminal> = self
-            .buffered
-            .remove(&id)
-            .unwrap_or_default()
-            .into_iter()
+    /// every terminal seen for `ids`. For asserting silence after an abort.
+    fn drain_terminals_for(&mut self, ids: &[RequestId]) -> Vec<Terminal> {
+        let mut terminals: Vec<Terminal> = ids
+            .iter()
+            .flat_map(|id| self.buffered.remove(id).unwrap_or_default())
             .filter_map(|update| update.terminal)
             .collect();
         while let Some(step) = self.steps.blocking_recv() {
             for update in step.updates {
-                if update.id == id
+                if ids.contains(&update.id)
                     && let Some(terminal) = update.terminal
                 {
                     terminals.push(terminal);
@@ -391,10 +390,76 @@ fn aborted_request_retires_silently_and_frees_engine_state() {
     // The abort is the frontend's own act; the scheduler answers with
     // silence, not a terminal. Drain to engine shutdown to prove it.
     drop(partition.handle);
-    let terminals = steps.drain_terminals_for(control.id());
+    let terminals = steps.drain_terminals_for(&[control.id()]);
     assert!(
         terminals.is_empty(),
         "aborted request must not receive a terminal: {terminals:?}"
+    );
+    partition.join.join().expect("scheduler thread exits");
+}
+
+/// Admission takes many prompts at once while the chunk budget runs one per
+/// step, so a mass disconnect leaves admitted prompts waiting for a chunk.
+/// Those retire before their chunk instead of after it.
+#[test]
+fn aborted_prompts_waiting_for_a_prefill_chunk_never_prefill() {
+    let gate = Arc::new(AsyncPrefillGate::default());
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let executor =
+        FakeExecutor::new(512, Arc::clone(&dropped)).with_async_prefill(Arc::clone(&gate));
+    gate.hold_call.store(1, Ordering::SeqCst);
+    gate.hold_prefill.store(true, Ordering::SeqCst);
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    // Three prompts queue while the first one's prefill holds.
+    let first = partition
+        .handle
+        .submit(request(DEFAULT_MAX_PREFILL_TOKENS, 1));
+    assert!(wait_until(Duration::from_secs(5), || {
+        gate.prefill_calls.load(Ordering::SeqCst) == 1
+    }));
+    let queued: Vec<_> = (0..3)
+        .map(|_| {
+            partition
+                .handle
+                .submit(request(DEFAULT_MAX_PREFILL_TOKENS, 4))
+        })
+        .collect();
+
+    // The next step admits all three and its budget runs only the first,
+    // which now holds; the other two are admitted and waiting for a chunk.
+    gate.hold_call.store(2, Ordering::SeqCst);
+    assert!(wait_until(Duration::from_secs(5), || {
+        gate.prefill_calls.load(Ordering::SeqCst) == 2
+    }));
+    for control in &queued {
+        control.abort();
+    }
+    gate.hold_prefill.store(false, Ordering::SeqCst);
+
+    let aborted: Vec<RequestId> = queued.iter().map(RequestControl::id).collect();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let dropped = dropped.lock().unwrap();
+            aborted.iter().all(|id| dropped.contains(&id.raw()))
+        }),
+        "every aborted request is dropped"
+    );
+    assert_eq!(
+        gate.prefill_calls.load(Ordering::SeqCst),
+        2,
+        "the prompts still waiting for a chunk must retire without prefilling"
+    );
+    let (_, terminal) = steps.collect_terminal(first.id());
+    assert!(
+        matches!(terminal, Terminal::Finished { .. }),
+        "the request ahead of them finishes normally: {terminal:?}"
+    );
+    drop(partition.handle);
+    let terminals = steps.drain_terminals_for(&aborted);
+    assert!(
+        terminals.is_empty(),
+        "aborted requests must not receive a terminal: {terminals:?}"
     );
     partition.join.join().expect("scheduler thread exits");
 }

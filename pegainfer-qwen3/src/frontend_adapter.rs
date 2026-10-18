@@ -13,8 +13,10 @@
 //!   [`Engine`] bundle from `launch`.
 //!
 //! Cancellation is reactive: the frontend flips a request's abort flag and
-//! this adapter retires it on its next touch — the scheduler mechanics never
-//! see aborts. Finishes ride the committed step unless the executor withholds
+//! this adapter retires it, at the top of the next step while it is queued or
+//! waiting for its next prefill chunk, and on its next touch once it is
+//! decoding or has a prefill in flight — the scheduler mechanics never see
+//! aborts. Finishes ride the committed step unless the executor withholds
 //! them ([`ModelExecutor::withholds_finishes`]): a P/D prefill executor takes
 //! them as [`RequestLedger::defer_finish`] tokens and delivers each request's
 //! final record once its KV saves are peer-visible.
@@ -310,6 +312,32 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         ledger.retire(request_id);
         self.tracker.finish(request_id);
         let _ = self.executor.drop_request(request_id);
+    }
+
+    /// Retire every aborted request that has no prefill in flight: queued ones
+    /// before they take admission room, and admitted ones waiting for their
+    /// next prefill chunk, including those part way through their prompt,
+    /// before that chunk runs. `loading` waits for its prefetch to settle,
+    /// `active` retires on its next decode, and an in-flight async prefill
+    /// keeps its KV until its result lands.
+    fn retire_aborted_waiting(&mut self, ledger: &mut RequestLedger) {
+        for queue in [&mut self.deferred, &mut self.post_control_deferred] {
+            let (aborted, kept): (Vec<_>, Vec<_>) = std::mem::take(queue)
+                .into_iter()
+                .partition(|req| ledger.is_aborted(req.request_id));
+            *queue = kept;
+            for req in &aborted {
+                ledger.retire(req.request_id);
+                release_rejected(&mut self.executor, &mut self.tracker, req);
+            }
+        }
+        let (aborted, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.prefilling)
+            .into_iter()
+            .partition(|req| ledger.is_aborted(req.request_id));
+        self.prefilling = kept;
+        for req in aborted {
+            self.retire_aborted(req.request_id, ledger);
+        }
     }
 
     /// Fail the batch a step execution error touched, then clear the running
@@ -612,6 +640,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             let effects = resolve_step(&self.executor, &self.active, artifacts);
             self.apply_effects(effects, ledger);
         }
+        self.retire_aborted_waiting(ledger);
 
         // 2. Reclaim settled prefetches, then offer fresh requests to
         // prefetch. Control commands gate generation, so only offer once no
