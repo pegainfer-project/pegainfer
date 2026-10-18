@@ -631,7 +631,7 @@ pub fn rms_norm_grouped_offset_batch_into(
         "{OP} dimensions must be non-zero"
     );
     ensure!(
-        x.hidden_dim % group_size == 0,
+        x.hidden_dim.is_multiple_of(group_size),
         "{OP} hidden_dim {} is not a whole number of {group_size}-wide groups",
         x.hidden_dim
     );

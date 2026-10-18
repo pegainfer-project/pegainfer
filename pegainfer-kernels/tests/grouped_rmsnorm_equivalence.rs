@@ -307,8 +307,12 @@ fn the_reshaped_batched_norm_scales_every_branch_with_branch_zero() {
         .expect("reshaped norm");
     let got = read_back(&ctx, &reshaped_out);
 
-    let first: Vec<usize> = (0..ROWS).filter(|row| row % BRANCHES == 0).collect();
-    let rest: Vec<usize> = (0..ROWS).filter(|row| row % BRANCHES != 0).collect();
+    let first: Vec<usize> = (0..ROWS)
+        .filter(|row| row.is_multiple_of(BRANCHES))
+        .collect();
+    let rest: Vec<usize> = (0..ROWS)
+        .filter(|row| !row.is_multiple_of(BRANCHES))
+        .collect();
     assert_within(
         "reshaped call, branch 0 (the slice every row is served)",
         &branch_rows(&got, &first),
@@ -448,7 +452,7 @@ fn the_grouped_norm_is_bit_exact_on_a_dyadic_input() {
             // 3 of every 8 columns carry 3 instead of 1: 960 threes, so the sum
             // of squares is 960*9 + 1600*1 = 10240 = 4 * 2560.
             let magnitude = if column % 8 < 3 { 3.0f32 } else { 1.0f32 };
-            let sign = if (column / 8) % 2 == 0 {
+            let sign = if (column / 8).is_multiple_of(2) {
                 1.0f32
             } else {
                 -1.0f32
@@ -474,7 +478,7 @@ fn the_grouped_norm_is_bit_exact_on_a_dyadic_input() {
             let column = index % BRANCH;
             let branch = (index / BRANCH) % BRANCHES;
             let magnitude = if column % 8 < 3 { 3.0f32 } else { 1.0f32 };
-            let sign = if (column / 8) % 2 == 0 {
+            let sign = if (column / 8).is_multiple_of(2) {
                 1.0f32
             } else {
                 -1.0f32
