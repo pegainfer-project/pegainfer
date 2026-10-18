@@ -27,6 +27,15 @@
 //! | `the_grouped_norm_is_bit_exact_on_a_dyadic_input` | bit-for-bit equality where the arithmetic allows it |
 //! | `the_grouped_norm_degenerates_to_the_vendor_batched_norm` | the new kernel's arithmetic is the vendor kernel's, bit for bit |
 //!
+//! The two negative controls exercise the *existing* vendor entry point, never
+//! [`rms_norm_grouped_offset_batch_into`]. They are the executable form of the
+//! design decision that justifies a copied kernel (no reshape reaches the
+//! grouped weight address), the calibration for `TOLERANCE` (the wrong calls
+//! miss by 4x-16x, hundreds of ULP, not by a rounding), and the dedup tripwire:
+//! if `RMSNormKernel` ever grows a group-aware weight address, the reshape gate
+//! fails — the signal to retire `GroupedRMSNormKernel` in favour of the vendor
+//! path rather than keep both.
+//!
 //! Manual gate: CI compiles this but never runs it. Run on a GPU box with
 //! `PEGAINFER_REQUIRE_GPU=1`, which turns a missing device into a failure rather
 //! than a skip.
@@ -280,6 +289,8 @@ const DECISIVE: f32 = 0.1;
 /// `weight[0..2560)`. This gate pins both halves of that claim: branch 0, which
 /// is the slice the reshape does serve, matches the oracle; branches 1..3 get the
 /// wrong gain (4x-16x) and miss the oracle by the largest magnitude in the run.
+/// This drives the vendor entry point only; it is a negative control for the
+/// design decision, not a test of the new kernel.
 #[test]
 fn the_reshaped_batched_norm_scales_every_branch_with_branch_zero() {
     let Some(ctx) = common::device_or_skip() else {
@@ -329,7 +340,9 @@ fn the_reshaped_batched_norm_scales_every_branch_with_branch_zero() {
 /// branches' energy — the reduction side of the same claim. What that does to the
 /// output depends on the data (here the quiet branches collapse towards zero
 /// instead of reaching the oracle's magnitude); the gate is the deviation against
-/// the run's largest magnitude, not any particular ratio.
+/// the run's largest magnitude, not any particular ratio. Like its sibling, it
+/// drives the vendor entry point only and is a negative control for the design
+/// decision, not a test of the new kernel.
 #[test]
 fn one_full_width_reduction_cannot_express_the_branches() {
     let Some(ctx) = common::device_or_skip() else {
