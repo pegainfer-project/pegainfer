@@ -84,7 +84,7 @@ const TOLERANCE: f32 = 4.0 * ULP;
 /// energies are what make the *reduction* grouping observable: one shared
 /// 10240-wide rms would be set by the loud branch alone, leaving the quiet ones
 /// normalised by two orders of magnitude too much, rather than by a rounding.
-const BRANCH_SCALE: [f32; BRANCHES] = [8.0, 1.0, 0.125, 0.015625];
+const BRANCH_SCALE: [f32; BRANCHES] = [8.0, 1.0, 0.125, 0.015_625];
 /// Per-branch weight gain (2^-2 .. 2^4), so a row served the wrong branch's
 /// `(1+w)` slice is off by at least 4x.
 const BRANCH_GAIN: [f32; BRANCHES] = [0.25, 1.0, 4.0, 16.0];
@@ -434,14 +434,14 @@ fn the_grouped_norm_matches_its_own_reference() {
 /// covered by the tolerance gate above, which runs the frozen 1e-6.
 #[test]
 fn the_grouped_norm_is_bit_exact_on_a_dyadic_input() {
-    let Some(ctx) = common::device_or_skip() else {
-        return;
-    };
     // >4 octaves of branch scale, and `(1+w)` alternating between 2^m and
     // 2^(m+1) inside each branch, so neither the branch index nor the column
     // index can be permuted unnoticed.
     const BRANCH_EXPONENT: [i32; BRANCHES] = [0, 1, -2, 3];
     const WEIGHT_EXPONENT: [i32; BRANCHES] = [0, 1, -1, 2];
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
 
     let mut x = Vec::with_capacity(ROWS * BRANCH);
     let mut weight = vec![bf16::from_f32(0.0); STREAM];
@@ -460,12 +460,12 @@ fn the_grouped_norm_is_bit_exact_on_a_dyadic_input() {
             x.push(bf16::from_f32(sign * magnitude * 2f32.powi(exponent)));
         }
     }
-    for column in 0..STREAM {
+    for (column, slot) in weight.iter_mut().enumerate() {
         let branch = column / BRANCH;
         let exponent = WEIGHT_EXPONENT[branch] + (column % 2) as i32;
         // A power of two minus one is exact in bf16, and `1 + w` is then exactly
         // `2^exponent`.
-        weight[column] = bf16::from_f32(2f32.powi(exponent) - 1.0);
+        *slot = bf16::from_f32(2f32.powi(exponent) - 1.0);
     }
 
     let oracle = grouped_reference(&x, &weight, ROWS, 0.0);
@@ -676,8 +676,10 @@ fn bf16_tensor(tensors: &safetensors::SafeTensors<'_>, name: &str) -> (Vec<bf16>
     assert_eq!(view.dtype(), safetensors::Dtype::BF16, "{name} is not bf16");
     let values = view
         .data()
-        .chunks_exact(2)
-        .map(|pair| bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]])))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| bf16::from_bits(u16::from_le_bytes(*pair)))
         .collect();
     (values, view.shape().to_vec())
 }
