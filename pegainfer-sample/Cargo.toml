@@ -1,0 +1,23 @@
+[package]
+autobenches = false
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-sample"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+cudarc = { workspace = true }
+half = { workspace = true }
+pegainfer-frontend = { workspace = true }
+pegainfer-kernels = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+harness = false
+name = "select_batch"

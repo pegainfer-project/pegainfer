@@ -353,7 +353,7 @@ class BenchHttpServingTests(unittest.TestCase):
             text_prefix="text",
         )
         line = (
-            'INFO openinfer_http_trace {"request_id":"cmpl-bench-1-generated",'
+            'INFO pegainfer_http_trace {"request_id":"cmpl-bench-1-generated",'
             '"queued_at_unix_s":100.01,"scheduled_at_unix_s":100.03,'
             '"first_token_emit_unix_s":100.20,"prefill_ms":170.0,'
             '"first_decode_ms":28.0}\\n'
@@ -376,11 +376,11 @@ class BenchHttpServingTests(unittest.TestCase):
 
     def test_server_trace_loader_ignores_lines_before_measured_offset(self) -> None:
         stale = (
-            'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-stale",'
+            'INFO pegainfer_http_trace {"request_id":"cmpl-bench-0-stale",'
             '"queued_at_unix_s":50.0}\n'
         )
         current = (
-            'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-current",'
+            'INFO pegainfer_http_trace {"request_id":"cmpl-bench-0-current",'
             '"queued_at_unix_s":100.0}\n'
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -435,11 +435,11 @@ class BenchHttpServingTests(unittest.TestCase):
 
         self.assertEqual(
             first_results[0].request_id,
-            "openinfer-bench-first-measured-0",
+            "pegainfer-bench-first-measured-0",
         )
         self.assertEqual(
             second_results[0].request_id,
-            "openinfer-bench-second-measured-0",
+            "pegainfer-bench-second-measured-0",
         )
 
     def test_server_stream_error_log_marks_request_failed(self) -> None:
@@ -471,7 +471,7 @@ class BenchHttpServingTests(unittest.TestCase):
             "ERROR vllm_engine_core_client::client::stream: stream.rs:90 "
             "request failed with an internal error during generation "
             'self.request_id="cmpl-bench-0-generated"\n'
-            'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-generated",'
+            'INFO pegainfer_http_trace {"request_id":"cmpl-bench-0-generated",'
             '"queued_at_unix_s":100.01,"terminal_unix_s":100.30,'
             '"completion_tokens":1,"finish_reason":"length"}\n'
         )
@@ -549,7 +549,7 @@ class BenchHttpServingTests(unittest.TestCase):
             text_prefix="text",
         )
         line = (
-            'INFO openinfer_http_trace {"request_id":"cmpl-bench-0-generated",'
+            'INFO pegainfer_http_trace {"request_id":"cmpl-bench-0-generated",'
             '"queued_at_unix_s":100.01,"terminal_unix_s":100.30,'
             '"completion_tokens":0}\\n'
         )
@@ -846,7 +846,7 @@ class BenchHttpServingTests(unittest.TestCase):
             required_trace_coverage=1.0,
             commit="abcdef123456",
             model_path="models/DeepSeek-V2-Lite",
-            server_command="openinfer --model-path models/DeepSeek-V2-Lite",
+            server_command="pegainfer --model-path models/DeepSeek-V2-Lite",
             num_requests=1,
             concurrency=1,
             warmup=0,

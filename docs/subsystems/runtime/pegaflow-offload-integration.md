@@ -10,7 +10,7 @@
 
 - **pegaflow `block_stride_bytes`**（PR #331 → novitalabs/pegaflow，`feat/inproc-load` 基于其上）：解耦"块间步长"与"每块拷贝大小"，让 page-first fused buffer 能注册。**已合入 master**。
 - **pegaflow 进程内 load API**（PR #333，**已合入**，squash 进 #331 的 `07cac7e`）：`LoadCompletion::{Shm,Channel}` + `batch_load_kv_blocks_multi_layer_inproc` → `oneshot::Receiver`，去掉 in-process 调用方对 shm `LoadState` 的依赖（Rust 进程内不需要），非阻塞 poll。
-- **`openinfer-kv-offload::OffloadEngine`**：拥有 `PegaEngine` + 内嵌 tokio runtime；`Registration::from_buffer` 把 fused page-first buffer 映射成 per-layer 注册（**单段 `[K|V]`**：fused layout 里 K/V 本就连续 = `layer_stride` 一段，`block_stride = page_stride`，`segments=1`——不是 K/V split，那条路需要 `kv_stride > bytes_per_block`，此处不成立）。`save`（async fire-and-forget）/`save_blocking`（eviction handoff，同步捕获）/`query`（GPU+CPU hit）/`load`（oneshot）/`flush_saves`/`evict_all`。
+- **`pegainfer-kv-offload::OffloadEngine`**：拥有 `PegaEngine` + 内嵌 tokio runtime；`Registration::from_buffer` 把 fused page-first buffer 映射成 per-layer 注册（**单段 `[K|V]`**：fused layout 里 K/V 本就连续 = `layer_stride` 一段，`block_stride = page_stride`，`segments=1`——不是 K/V split，那条路需要 `kv_stride > bytes_per_block`，此处不成立）。crate 已按 `config`/`host`/`layout`/`handle`/`engine` 分模块（#799/#802 重构）；所有操作统一为 `OffloadHandle<T>` 可轮询句柄：`submit_save`/`submit_query`/`load` 提交到 pegaflow runtime 后立即返回 handle，`save`（fire-and-forget）/`save_blocking`/`query` 是其薄包装（qwen3 调用方尚未迁移）。`query` 透传 pegaflow 0.23.5 的 `wait_for_full_prefix`（glm52 native handoff 传 `true`：D 无法重算 miss，partial 命中无用）。
 - **`KvBuffer::device_ptr`**（kv-cache）：注册用的稳定基址。
 - **kvbm↔bytes 桥**（kv-cache `RequestKv`）：`prompt_block_hashes` / `assigned_block_hashes` / `prefix_matched_blocks`，`SequenceHash::as_u128()` → 16B content key。
 - **`tests/cpu_roundtrip.rs`**：真实 `KvBuffer` 上写已知 pattern → save → query → load 到**另一组** block → 字节级比对 + 零块负向控制。**通过**。
@@ -27,7 +27,7 @@
 
 pegaflow（`third_party/pegaflow`，novita，Apache-2.0）原本是 **vLLM 的 KV connector 服务端**：KV 的编排逻辑（何时 save、query 几个 block、prefix 匹配、与 scheduler 的 admission/preemption 交互）全在 vLLM 的 Python connector 那一侧，`pegaflow-core` 只是底下干 D2H/H2D + 分层存储的**肌肉**。
 
-openinfer 不是 vLLM，那套 Python connector 一行用不上。接入要做的是**用 Rust 自建那颗 connector 大脑**——而 kvbm 的 logical/physical 分层正是它的骨架：
+pegainfer 不是 vLLM，那套 Python connector 一行用不上。接入要做的是**用 Rust 自建那颗 connector 大脑**——而 kvbm 的 logical/physical 分层正是它的骨架：
 
 ```
 per-model scheduler   ← 策略：哪些 block 该 resident（full 前缀 / MLA 全前缀 / 未来稀疏选择）
@@ -39,7 +39,7 @@ pegaflow-core         ← 机制底座：D2H/H2D、DRAM/SSD/RDMA 分层
 
 ## 2. 战略决策：pegaflow 取代 kvbm 死代码做物理 tier
 
-openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是分层卸载，但**至今零接线、是死代码**（无任何非 kvbm crate 依赖）。同时养两套分层卸载违反项目复杂度红线。本 spec 采纳：**`kvbm-logical`（逻辑层 + 前缀匹配）保留，pegaflow-core 顶替它下面缺失的物理卸载层，砍掉 `kvbm-physical`/`kvbm-engine`**。理由：pegaflow 同组维护、已上 PyPI、有 H800 benchmark、库化干净；kvbm 那两层是纯负债。已执行（2026-06）：vendored `kvbm/` 目录只留 `kvbm-logical` fork，`dynamo-tokens`/`dynamo-kv-hashing` 改为 ai-dynamo/dynamo 上游 git 依赖（pin rev），其余 8 个 vendored crate 删除。
+pegainfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是分层卸载，但**至今零接线、是死代码**（无任何非 kvbm crate 依赖）。同时养两套分层卸载违反项目复杂度红线。本 spec 采纳：**`kvbm-logical`（逻辑层 + 前缀匹配）保留，pegaflow-core 顶替它下面缺失的物理卸载层，砍掉 `kvbm-physical`/`kvbm-engine`**。理由：pegaflow 同组维护、已上 PyPI、有 H800 benchmark、库化干净；kvbm 那两层是纯负债。已执行（2026-06）：vendored `kvbm/` 目录只留 `kvbm-logical` fork，`dynamo-tokens`/`dynamo-kv-hashing` 改为 ai-dynamo/dynamo 上游 git 依赖（pin rev），其余 8 个 vendored crate 删除。
 
 ## 3. 三模型三 KV 形态 → connector 边界（实据）
 
@@ -51,7 +51,7 @@ openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是
 
 **边界结论**：connector 只收 **block-structured、content-addressable** 的 KV（MLA latent / full-attn paged）。recurrent/SSM state 不进 connector。稀疏的 active-set gather 是独立的、未来的课题。
 
-证据：Kimi `openinfer-kimi-k2/src/runner/{worker.rs:612-619, cache.rs:63-80, mla.rs:38-48}`、`scheduler.rs:16,27,146,180`、`pool.rs:123`；Qwen3.5 linear `openinfer-qwen35-4b/src/...recurrent.rs`、`batch_decode_graph.rs:82-86`。
+证据：Kimi `pegainfer-kimi-k2/src/runner/{worker.rs:612-619, cache.rs:63-80, mla.rs:38-48}`、`scheduler.rs:16,27,146,180`、`pool.rs:123`；Qwen3.5 linear `pegainfer-qwen35/src/...recurrent.rs`、`batch_decode_graph.rs:82-86`。
 
 ## 4. 路线
 
@@ -63,15 +63,15 @@ openinfer 仓里 vendored 的 `kvbm-physical` / `kvbm-engine` 设计目标就是
 
 四条承重假设由 10-agent workflow 对抗验证：
 
-1. **✅ 进程内注册裸指针，无 IPC、无第二进程**：`register_context_layer_batch(data_ptrs: &[u64])`（`pegaflow-core/src/lib.rs:242-259`）收裸设备地址，拷贝路径直接喂给 driver API `cuMemcpyDtoHAsync_v2`（`transfer/memcpy.rs:82-89`）；IPC 只在 server/Python 层，core 零 IPC 调用点。cudarc 附设备 **primary context**（与 openinfer 同一），自建 worker stream。
+1. **✅ 进程内注册裸指针，无 IPC、无第二进程**：`register_context_layer_batch(data_ptrs: &[u64])`（`pegaflow-core/src/lib.rs:242-259`）收裸设备地址，拷贝路径直接喂给 driver API `cuMemcpyDtoHAsync_v2`（`transfer/memcpy.rs:82-89`）；IPC 只在 server/Python 层，core 零 IPC 调用点。cudarc 附设备 **primary context**（与 pegainfer 同一），自建 worker stream。
 2. **✅ 依赖无致命冲突**：cudarc 单 major（0.19.3↔0.19.7 统一），cuda-12080/12090 共存（build.rs 取高版本），tokio/tonic/prost 兼容。**依赖行**（git rev pin 到上游 master `07cac7e`，含 #331+#333；`default-features=false` 砍掉 pegaflow 自带的 `cuda-12`/`rdma`，靠 workspace cudarc 提供的 `cuda-12090`+`nvrtc` 满足——pegaflow-core 无 `cfg(cuda-12)` gate）：
    ```toml
    pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "07cac7e50e8ae7be15ad1b9311401039c9ee439b", default-features = false }
    ```
    下次再改 pegaflow：临时换回 path dep 共同开发 → 提 PR → 合入后 re-pin rev。
-   **为何 `cuda-12` 而非 `cuda-13`**（本机明明是 CUDA 13.3 toolkit / 13.0 driver）：openinfer 有意锁 `cudarc/cuda-12090`（`Cargo.toml:92-93`，issue #263——配 cudarc 0.19.5+ 的 per-symbol lazy loading，压低 binding level 以**不抬高 runtime driver floor**、保宽部署兼容；故意不用 `cuda-version-from-build-system` 自动，否则 driver floor 会跟着构建机 toolkit 走）。cudarc 在 workspace 是**单实例、feature 取并集后选最高版本**：pegaflow 用 `cuda-12` 并集后仍是 12090、不抬 floor；用 `cuda-13`（→ `cudarc/cuda-13000`）会把**整个 workspace 含 openinfer 自己**顶到 13000、driver floor 抬到 CUDA 13，撞翻 #263。整体迁 cu13 是独立决策（须同时改 openinfer 的 cudarc + revisit #263），本期不做。
+   **为何 `cuda-12` 而非 `cuda-13`**（本机明明是 CUDA 13.3 toolkit / 13.0 driver）：pegainfer 有意锁 `cudarc/cuda-12090`（`Cargo.toml:92-93`，issue #263——配 cudarc 0.19.5+ 的 per-symbol lazy loading，压低 binding level 以**不抬高 runtime driver floor**、保宽部署兼容；故意不用 `cuda-version-from-build-system` 自动，否则 driver floor 会跟着构建机 toolkit 走）。cudarc 在 workspace 是**单实例、feature 取并集后选最高版本**：pegaflow 用 `cuda-12` 并集后仍是 12090、不抬 floor；用 `cuda-13`（→ `cudarc/cuda-13000`）会把**整个 workspace 含 pegainfer 自己**顶到 13000、driver floor 抬到 CUDA 13，撞翻 #263。整体迁 cu13 是独立决策（须同时改 pegainfer 的 cudarc + revisit #263），本期不做。
 3. **⚠️ Layout**：block-hash 键直接适配（`u64→Vec<u8>`）；page-first layout **不适配**（见 §5.R1）；Kimi per-layer 布局**天然适配**。
-4. **✅ 流同步**：host-side 粗同步可解——save 前 openinfer 必须 `synchronize()` compute stream（pegaflow 私有 stream 只自同步，`gpu_worker.rs:520-528`），restore 前自旋 poll `LoadState`。代价：损 compute/offload 重叠（见 §6.R3）。
+4. **✅ 流同步**：host-side 粗同步可解——save 前 pegainfer 必须 `synchronize()` compute stream（pegaflow 私有 stream 只自同步，`gpu_worker.rs:520-528`），restore 前自旋 poll `LoadState`。代价：损 compute/offload 重叠（见 §6.R3）。
 
 ## 6. connector 接口（dense-first，稀疏留门不展开）
 
@@ -110,7 +110,7 @@ trait KvResidencyPolicy {
 | R4 | 依赖误配（裸 default-features=false / 漏 cuda-12） | minor | §5.2 依赖行已定，CI 编译验证 |
 | R5 | 稀疏 active-set offload 的 token-vs-block 粒度落差 | 已知开放 | 见下，不在本期 |
 
-**稀疏（已知开放问题，不在本期）**：连 dynamo KVBM 都没解 sparse attention offloading——它的复用是 radix 前缀、offload 是 frequency/LRU、tier 是整请求异步流动，对 SWA 只在 router 透传 `kv_cache_spec_sliding_window` 做 window-aware 前缀，对 topk 零处理。没有现成抽象可继承。openinfer 侧 DeepSeek 的 indexer 已产出显式可拦截的 active-set 信号，但 token/row 粒度 ≠ block 粒度，且 compressor 已控 footprint 当前不需 offload。机制层（内容寻址 + 可插拔 policy + 语义无关 transfer）本就不堵稀疏，真正缺的 decode-loop gather 大脑到时候结合具体模型新写更准。
+**稀疏（已知开放问题，不在本期）**：连 dynamo KVBM 都没解 sparse attention offloading——它的复用是 radix 前缀、offload 是 frequency/LRU、tier 是整请求异步流动，对 SWA 只在 router 透传 `kv_cache_spec_sliding_window` 做 window-aware 前缀，对 topk 零处理。没有现成抽象可继承。pegainfer 侧 DeepSeek 的 indexer 已产出显式可拦截的 active-set 信号，但 token/row 粒度 ≠ block 粒度，且 compressor 已控 footprint 当前不需 offload。机制层（内容寻址 + 可插拔 policy + 语义无关 transfer）本就不堵稀疏，真正缺的 decode-loop gather 大脑到时候结合具体模型新写更准。
 
 ## 8. 下一步：Kimi MLA 最小 spike
 

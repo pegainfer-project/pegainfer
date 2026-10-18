@@ -1,0 +1,69 @@
+[package]
+autobenches = false
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-qwen35"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+cudarc = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+pegainfer-core = { workspace = true }
+pegainfer-frontend = { workspace = true }
+pegainfer-kv-cache = { workspace = true }
+pegainfer-kernels = { workspace = true }
+pegainfer-sample = { workspace = true }
+rand = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+vllm-text = { workspace = true }
+
+[features]
+default = []
+qwen35 = ["pegainfer-kernels/qwen35"]
+
+[lints]
+workspace = true
+
+[[test]]
+name = "hf_golden_gate"
+required-features = ["qwen35"]
+
+[[test]]
+name = "e2e_scheduler"
+required-features = ["qwen35"]
+
+[[test]]
+name = "sampling_behavior"
+required-features = ["qwen35"]
+
+[[test]]
+name = "chunked_prefill"
+required-features = ["qwen35"]
+
+[[test]]
+name = "prefix_cache"
+required-features = ["qwen35"]
+
+[[test]]
+name = "serving_tp2"
+required-features = ["qwen35"]
+
+[[bench]]
+harness = false
+name = "qwen35_ops"
+required-features = ["qwen35"]

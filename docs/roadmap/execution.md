@@ -8,9 +8,9 @@ These are the shared layers — frontend, runtime, kernels, ledger/simulator/tra
 
 ### In progress
 
-- **Model-owned kernel plans.** Qwen3 already carries a light `kernel_plan` mapping prefill/decode/unified phases → Rust wrappers, FFI symbols, and CUDA/Triton/cuBLAS backends. Extend the same shape to Qwen3.5 so each model crate is self-describing.
-- **Frontend polish.** `vllm-frontend-rs` is the default OpenAI surface, talking to openinfer via a local engine-core IPC bridge. Outstanding: logprobs / prompt-logprobs translation, usage accounting, and a deliberate decision on whether the served-model-id should decouple from the tokenizer path.
-- **KV data plane (pegaflow).** First concrete tier landed: `openinfer-kv-offload::OffloadEngine` wraps in-process `pegaflow-core` as a host-tier ("L2") KV backend (mechanism), with per-model schedulers owning the residency policy (no universal connector trait — policy/mechanism split per `direction.md`). Shipped on Qwen3-4B full-attn (#316). Next candidate: Kimi-K2 MLA (layout zero-impedance, reuses the same connector pattern). SSD/RDMA tiers and DeepSeek sparse remain unrealized scope. See `subsystems/runtime/pegaflow-offload-integration.md`.
+- **Model-owned kernel plans.** ~~Qwen3 already carries a light `kernel_plan` mapping prefill/decode/unified phases → Rust wrappers, FFI symbols, and CUDA/Triton/cuBLAS backends.~~ The `kernel_plan` descriptors (qwen3 + qwen35) never acquired a reader and were removed in the hawk dead-public sweep (#743); the self-describing-model idea continues via `kernel_manifests/` + kernel-op reports instead.
+- **Frontend polish.** `vllm-frontend-rs` is the default OpenAI surface, talking to pegainfer via a local engine-core IPC bridge. Outstanding: logprobs / prompt-logprobs translation, usage accounting, and a deliberate decision on whether the served-model-id should decouple from the tokenizer path.
+- **KV data plane (pegaflow).** First concrete tier landed: `pegainfer-kv-offload::OffloadEngine` wraps in-process `pegaflow-core` as a host-tier ("L2") KV backend (mechanism), with per-model schedulers owning the residency policy (no universal connector trait — policy/mechanism split per `direction.md`). Shipped on Qwen3-4B full-attn (#316). Next candidate: Kimi-K2 MLA (layout zero-impedance, reuses the same connector pattern). SSD/RDMA tiers and DeepSeek sparse remain unrealized scope. See `subsystems/runtime/pegaflow-offload-integration.md`.
 
 ### Next
 
@@ -24,7 +24,7 @@ These are the shared layers — frontend, runtime, kernels, ledger/simulator/tra
 
 ## Models
 
-Each model crate owns its own scheduler, kernels, accuracy story, and benchmarks. The boundary with shared infrastructure is `openinfer-core` (runtime contract) + `openinfer-kernels` (op layer).
+Each model crate owns its own scheduler, kernels, accuracy story, and benchmarks. The boundary with shared infrastructure is `pegainfer-core` (runtime contract) + `pegainfer-kernels` (op layer).
 
 ### Qwen3.5-4B
 

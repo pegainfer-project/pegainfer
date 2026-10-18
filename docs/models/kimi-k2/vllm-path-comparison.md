@@ -1,6 +1,6 @@
 # Kimi-K2 vLLM Path Comparison
 
-> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 OpenInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：OpenInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、dense layer0 gate/up fused GEMM、routed scale+residual add fused kernel、routed sum clear 与 Marlin locks clear 清理已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.26ms`，synthetic output64 steady TPOT avg `14.39ms` / p99 `14.83ms`。vLLM TP-only MoE final all-reduce cadence 已实测 BF16/F32 两版均慢于当前 RS bridge，因此保留 RS bridge。
+> **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、dense layer0 gate/up fused GEMM、routed scale+residual add fused kernel、routed sum clear 与 Marlin locks clear 清理已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.26ms`，synthetic output64 steady TPOT avg `14.39ms` / p99 `14.83ms`。vLLM TP-only MoE final all-reduce cadence 已实测 BF16/F32 两版均慢于当前 RS bridge，因此保留 RS bridge。
 >
 > **Last touched:** 2026-05
 
@@ -18,12 +18,12 @@
   - `$VLLM_DIR_ALT/vllm/model_executor/layers/fused_moe/layer.py`
   - `$VLLM_DIR_ALT/csrc/cache_kernels.cu`
   - `$VLLM_DIR_ALT/csrc/moe/*`
-- OpenInfer files:
-  - `openinfer-kimi-k2/src/direct/worker.rs`
-  - `openinfer-kimi-k2/src/batch_decode_trace.rs`
-  - `openinfer-kernels/src/ops/kimi_mla.rs`
-  - `openinfer-kernels/src/ops/kimi_router.rs`
-  - `openinfer-kernels/src/ops/kimi_experts.rs`
+- PegaInfer files:
+  - `pegainfer-kimi-k2/src/direct/worker.rs`
+  - `pegainfer-kimi-k2/src/batch_decode_trace.rs`
+  - `pegainfer-kernels/src/ops/kimi_mla.rs`
+  - `pegainfer-kernels/src/ops/kimi_router.rs`
+  - `pegainfer-kernels/src/ops/kimi_experts.rs`
 
 ## vLLM Decode Operator List
 
@@ -52,20 +52,20 @@ This is the source-level list for Kimi/DeepSeekV3 decode, not an nsys trace. PyT
 | MoE scale and TP reduce | For BF16, routed output is multiplied by `routed_scaling_factor`, added with shared output, then `maybe_all_reduce_tensor_model_parallel`. | `deepseek_v2.py:187-208` |
 | Final logits | Final RMSNorm then LM head; sampling/logprobs live in vLLM sampling path rather than model file. | `deepseek_v2.py:724-725` |
 
-## OpenInfer Current Decode Operator List
+## PegaInfer Current Decode Operator List
 
 This list follows the current worker implementation. The static trace is now source-aligned for these high-level operators after the MLA trace fix below.
 
-| Section | OpenInfer actual operator path | Source evidence |
+| Section | PegaInfer actual operator path | Source evidence |
 | --- | --- | --- |
 | Embedding | `embedding_batch_vocab_shard` then TP all-reduce through BF16-via-F32 bridge. | `batch_decode_trace.rs:49-63` |
 | Attention input | `rms_norm_batch_into(hidden, input_norm)`. | `worker.rs:1777-1783` |
 | MLA q/kv down projection | `gemm_graphsafe(fused_qkv_a_proj)` then `kimi_mla_split_qkv_a` produces `q_a`, `compressed_kv`, and `k_rope`; q branch then runs `rms_norm_batch(q_a_norm)` and `gemm_graphsafe(q_b_proj)`, kv branch runs `rms_norm_batch(kv_a_norm)`. | `worker.rs:1784-1827` |
 | MLA RoPE split | `kimi_mla_rope_split_decode(q_proj, k_rope, cos, sin, positions)` produces `q_nope`, `q_pe`, and `append_kpe`. | `worker.rs:1839-1849` |
-| MLA q absorb | `kimi_mla_absorb_q_nope(kv_b_proj, q_nope)` uses preloaded `kv_b_proj` weight; this is the OpenInfer equivalent of vLLM `q_nope @ W_UK_T`. | `worker.rs:1850-1855` |
+| MLA q absorb | `kimi_mla_absorb_q_nope(kv_b_proj, q_nope)` uses preloaded `kv_b_proj` weight; this is the PegaInfer equivalent of vLLM `q_nope @ W_UK_T`. | `worker.rs:1850-1855` |
 | MLA cache append | `kimi_mla_paged_kv_append(compressed_normed, append_kpe, page tables, positions)` writes worker-owned paged MLA KV. | `worker.rs:1856-1868` |
 | MLA attention | `kimi_flashinfer_batch_decode_mla(q_abs_nope, q_pe, ckv_cache, kpe_cache, page tables, request_indices, kv metadata)`. | `worker.rs:1880-1895` |
-| MLA v up | `kimi_mla_v_up(kv_b_proj, latent)`; this is the OpenInfer equivalent of vLLM `_v_up_proj`. | `worker.rs:1907-1912` |
+| MLA v up | `kimi_mla_v_up(kv_b_proj, latent)`; this is the PegaInfer equivalent of vLLM `_v_up_proj`. | `worker.rs:1907-1912` |
 | MLA output projection | `gemm_graphsafe(o_proj)` then TP all-reduce through BF16-via-F32 bridge, then residual add. | `worker.rs:1913-1934`, `batch_decode_trace.rs:279-291` |
 | Dense layer 0 MLP | post-attn RMSNorm, separate gate/up GEMMs, `silu_mul_batch`, down GEMM, BF16-via-F32 TP all-reduce, residual add. | `batch_decode_trace.rs:294-327` |
 | MoE shared expert | post-attn RMSNorm; load-time fused shared gate/up GEMM, `silu_mul_fused_batch_into`, shared down GEMM, BF16-via-F32 TP all-reduce. | `worker.rs:2201-2238` |
@@ -111,7 +111,7 @@ This count is source-aligned for the high-level worker operators. It still folds
 
 ## Trace Drift Fixed In This Session
 
-`openinfer-kimi-k2/src/batch_decode_trace.rs` differed from `worker.rs` in the first draft of this document:
+`pegainfer-kimi-k2/src/batch_decode_trace.rs` differed from `worker.rs` in the first draft of this document:
 
 | Trace item | Current trace | Actual worker path | Effect |
 | --- | --- | --- | --- |
@@ -129,20 +129,20 @@ Validation:
 
 ```bash
 cargo fmt --all --check
-OPENINFER_CUDA_SM=90a cargo check --release -p openinfer-kimi-k2 --features kernel-report --bins
-OPENINFER_CUDA_SM=90a cargo run --release -p openinfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- \
+PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins
+PEGAINFER_CUDA_SM=90a cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- \
   trace --source static --batch-size 4 --kv-len 1024 --out $RESULT_ROOT/kimi_decode_trace_fixed_bs4_kv1024.json
 ```
 
-H20 validation for the fused-qkv patch used the same `cargo check` and static trace command under `$OPENINFER_DIR` with `OPENINFER_TRITON_PYTHON=$OPENINFER_DIR/.venv-kimi/bin/python`; output was `calls=1886`, `gemm_graphsafe=367`, and `kimi_mla_split_qkv_a=61`.
+H20 validation for the fused-qkv patch used the same `cargo check` and static trace command under `$PEGAINFER_DIR` with `PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python`; output was `calls=1886`, `gemm_graphsafe=367`, and `kimi_mla_split_qkv_a=61`.
 
 Runtime model-report validation on H20:
 
 ```bash
-LD_LIBRARY_PATH=$RESULT_ROOT/openinfer-nccl-lib:${LD_LIBRARY_PATH:-} \
-OPENINFER_CUDA_SM=90a \
-OPENINFER_TRITON_PYTHON=$OPENINFER_DIR/.venv-kimi/bin/python \
-cargo run --release -p openinfer-kimi-k2 --features kernel-report --bin kimi_model_report -- \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python \
+cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_model_report -- \
   decode --source runtime --batch-size 4 --kv-len 28 --iters 1 --format text \
   --out $RESULT_ROOT/kimi_runtime_model_report_bs4_kv28_fixed_trace_v2.json
 ```
@@ -163,17 +163,17 @@ H20 graph serving gates after fused-qkv:
 
 ## Path Differences That Matter
 
-| Difference | vLLM | OpenInfer | Why it matters |
+| Difference | vLLM | PegaInfer | Why it matters |
 | --- | --- | --- | --- |
 | MLA first projection | One `MergedReplicatedLinear` for `[q_lora_rank, kv_lora_rank + rope_dim]`. | Now one load-time fused `DeviceMatrix` plus one graph-safe GEMM and one split kernel. | This structural delta is closed in code. The keep/revert gate is H20 correctness plus TPOT/model-report improvement. |
 | Dense gate/up | V1 can use fused `gate_up_proj`; V0 module-level path still exposes gate/up. | Dense layer still uses separate gate/up; MoE shared expert now uses load-time fused gate/up GEMM. | One dense layer only matters little; shared expert repeat cost is now closed at the high-level GEMM count. |
 | Router GEMM | V1 has small-batch `dsv3_router_gemm` / `router_gemm_bf16_fp32` path before grouped top-k. | `kimi_router_noaux_tc_launch` is a single custom router/top-k kernel path. | Need compare microbench, not assume; router was ~3.7ms/step in old strong-sync profile. |
-| MLA cache append and metadata | vLLM uses `concat_and_cache_mla`; FlashMLA prepares tile scheduler metadata and graph buffers. | OpenInfer uses `kimi_mla_paged_kv_append` and precomputed decode arena arrays. | Need compare metadata/cache append cost before changing attention kernels; trace currently hides this. |
-| MLA q absorb/v up | vLLM uses `torch.bmm` with preprocessed `W_UK_T/W_UV`. | OpenInfer custom kernels `kimi_mla_absorb_q_nope` and `kimi_mla_v_up` over `kv_b_proj`. | Semantically aligned, but microbench should decide whether custom kernels or cuBLAS batched GEMM wins for bs1..4. |
-| MoE WNA16 | Both use Marlin WNA16 route align, W13, SiLU, W2, sum. | OpenInfer has persistent workspace and explicit local EP route metadata. | Main MoE kernel choice is already aligned; next work is route histogram/tail and combine, not replacing WNA16. |
-| Routed combine | vLLM EP path maps local experts via `expert_map`; final tensor-parallel reduce happens through vLLM distributed path. | OpenInfer currently uses NCCL bridge: local sum -> repeat -> reduce-scatter -> fused scale+residual add. | This is not PPLX EP; it is graph-capturable but likely still extra data movement. |
-| TP collectives | vLLM parallel layers hide TP reductions; BF16 path does not visibly use our BF16-via-F32 bridge. | OpenInfer uses BF16-via-F32 bridge for hidden all-reduces because BF16 collective changed greedy output. | This is correctness-driven overhead; replacing it needs external vLLM greedy/top-k gate. |
-| Sampling/top1 | vLLM sampling/logprobs is integrated with its sampler path. | OpenInfer graph body ends at local top1; worker D2H reads local top1 and scheduler CPU-selects across ranks. | This graph-external boundary is real, but prior profile says it is not the largest item; fix after trace/accounting is accurate. |
+| MLA cache append and metadata | vLLM uses `concat_and_cache_mla`; FlashMLA prepares tile scheduler metadata and graph buffers. | PegaInfer uses `kimi_mla_paged_kv_append` and precomputed decode arena arrays. | Need compare metadata/cache append cost before changing attention kernels; trace currently hides this. |
+| MLA q absorb/v up | vLLM uses `torch.bmm` with preprocessed `W_UK_T/W_UV`. | PegaInfer custom kernels `kimi_mla_absorb_q_nope` and `kimi_mla_v_up` over `kv_b_proj`. | Semantically aligned, but microbench should decide whether custom kernels or cuBLAS batched GEMM wins for bs1..4. |
+| MoE WNA16 | Both use Marlin WNA16 route align, W13, SiLU, W2, sum. | PegaInfer has persistent workspace and explicit local EP route metadata. | Main MoE kernel choice is already aligned; next work is route histogram/tail and combine, not replacing WNA16. |
+| Routed combine | vLLM EP path maps local experts via `expert_map`; final tensor-parallel reduce happens through vLLM distributed path. | PegaInfer currently uses NCCL bridge: local sum -> repeat -> reduce-scatter -> fused scale+residual add. | This is not PPLX EP; it is graph-capturable but likely still extra data movement. |
+| TP collectives | vLLM parallel layers hide TP reductions; BF16 path does not visibly use our BF16-via-F32 bridge. | PegaInfer uses BF16-via-F32 bridge for hidden all-reduces because BF16 collective changed greedy output. | This is correctness-driven overhead; replacing it needs external vLLM greedy/top-k gate. |
+| Sampling/top1 | vLLM sampling/logprobs is integrated with its sampler path. | PegaInfer graph body ends at local top1; worker D2H reads local top1 and scheduler CPU-selects across ranks. | This graph-external boundary is real, but prior profile says it is not the largest item; fix after trace/accounting is accurate. |
 
 ## Routed Bridge Probe
 
@@ -181,9 +181,9 @@ Historical `kimi_graph_probe --probe routed-bridge-compare` (since retired, see 
 
 ## TP-Only MoE Cadence Probe
 
-Hypatia 对 `$LOCAL_VLLM_DIR` 的 Kimi/DeepSeekV3 TP-only path 做了源码对照：vLLM decode 是 embedding `1` 次、attention `61` 次、dense layer0 `1` 次、MoE final `60` 次 BF16 all-reduce，总计 `123` 次 BF16 all-reduce，MoE TP-only path 不使用 reduce-scatter。OpenInfer 当前是同样 `123` 次 logical hidden all-reduce，再额外加 `60` 次 routed `repeat+RS` bridge。
+Hypatia 对 `$LOCAL_VLLM_DIR` 的 Kimi/DeepSeekV3 TP-only path 做了源码对照：vLLM decode 是 embedding `1` 次、attention `61` 次、dense layer0 `1` 次、MoE final `60` 次 BF16 all-reduce，总计 `123` 次 BF16 all-reduce，MoE TP-only path 不使用 reduce-scatter。PegaInfer 当前是同样 `123` 次 logical hidden all-reduce，再额外加 `60` 次 routed `repeat+RS` bridge。
 
-把 OpenInfer decode MoE 临时改成 vLLM TP-only final all-reduce 后，H20 correctness 通过但性能回退：
+把 PegaInfer decode MoE 临时改成 vLLM TP-only final all-reduce 后，H20 correctness 通过但性能回退：
 
 | Variant | output16 steady | output64 steady | Decision |
 | --- | --- | --- | --- |
@@ -198,4 +198,4 @@ Conclusion: source-level cadence parity alone is not a keep criterion. The next 
 1. Profile any remaining p99/max tail under dense/shared gate-up fusion plus routed scaled-add fusion and Marlin locks clear removal: output64 avg/p50/p95/p99 are now around `14.4/14.5/14.9/14.8ms`, with p99 under `15ms` in the latest kept gate.
 2. Revisit full shared/EP communication overlap only with a production-shaped NCCL probe; isolated two-comm graph replay wins, but worker two-comm init/capture is not stable enough to ship.
 3. Next graph-safe local wins: keep Marlin output clears unless route metadata proves every consumed row is written, add `kimi_mla_paged_kv_append` provider coverage, and design a real AG/RS or PPLX EP combine path that removes the repeat-for-RS bridge.
-4. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/OpenInfer MoE compute path is already structurally close.
+4. Keep MoE WNA16 kernel path unchanged until the corrected report shows a measured win candidate; current vLLM/PegaInfer MoE compute path is already structurally close.

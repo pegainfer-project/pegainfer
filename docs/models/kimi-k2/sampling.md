@@ -7,8 +7,8 @@ Last touched: 2026-06
 ## Param surface (`/v1/completions`)
 
 What a client can send vs. what actually happens. "Frontend" = the vllm-server
-OpenAI layer + `openinfer-vllm-frontend` conversion
-(`openinfer-vllm-frontend/src/lib.rs` `convert_sampling`); "engine" = the kimi
+OpenAI layer + `pegainfer-vllm-frontend` conversion
+(`pegainfer-vllm-frontend/src/lib.rs` `convert_sampling`); "engine" = the kimi
 scheduler/worker.
 
 | Param | TP1/DP8 | TP8 | Where decided |
@@ -32,7 +32,7 @@ Rejection UX pitfall: an engine-side rejection surfaces as a generic HTTP 500
 vllm-server OpenAI layer swallows the text. Check the server log
 (`vllm_engine_core_client::client::stream "request failed"`) when a client
 reports a 500. Fixing the mapping is a vllm-rust-workspace change, not a
-openinfer one.
+pegainfer one.
 
 ## Design (TP1/DP8)
 

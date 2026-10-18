@@ -17,7 +17,7 @@
 #
 # Usage (env-configurable):
 #   scripts/prime_devbox.sh                                          # spot V100, compile-only (sm_90), main
-#   BRANCH=feat/x GPU=L40S_48GB SPOT=0 OPENINFER_CUDA_SM= scripts/prime_devbox.sh
+#   BRANCH=feat/x GPU=L40S_48GB SPOT=0 PEGAINFER_CUDA_SM= scripts/prime_devbox.sh
 #
 # Tear down when done (id is printed at the end):  prime pods terminate <id>
 set -euo pipefail
@@ -28,13 +28,13 @@ IMAGE="${IMAGE:-ubuntu_22_cuda_12}"      # MUST ship nvcc; setup_dev.sh never in
 DISK="${DISK:-100}"
 NAME="${NAME:-oi-dev}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_rsa}"  # the key set PRIMARY on Prime (to ssh into the box)
-REMOTE_DIR="${REMOTE_DIR:-/root/openinfer}"
-REPO_SLUG="${REPO_SLUG:-openinfer-project/openinfer}"
+REMOTE_DIR="${REMOTE_DIR:-/root/pegainfer}"
+REPO_SLUG="${REPO_SLUG:-pegainfer-project/pegainfer}"
 BRANCH="${BRANCH:-main}"
 # Compile target. V100 is sm_70, which the FlashInfer/CUDA kernels do not build
-# for, so default to sm_90 (a pure compile box). Set OPENINFER_CUDA_SM= (empty)
+# for, so default to sm_90 (a pure compile box). Set PEGAINFER_CUDA_SM= (empty)
 # to let build.rs auto-detect the live GPU's arch (use that on L40S/A100/H100).
-CUDA_SM="${OPENINFER_CUDA_SM-90}"
+CUDA_SM="${PEGAINFER_CUDA_SM-90}"
 
 log(){ printf '\033[1;36m[prime_devbox]\033[0m %s\n' "$*"; }
 die(){ printf '\033[1;31m[prime_devbox] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -89,8 +89,8 @@ ssh_box "set -e
   git -C '$REMOTE_DIR' remote set-url origin 'https://github.com/${REPO_SLUG}.git'"
 
 # 5. bootstrap + build (no token in this long-running call)
-log "Running setup_dev.sh (OPENINFER_CUDA_SM=${CUDA_SM:-auto})…"
-ssh_box "cd '$REMOTE_DIR' && OPENINFER_CUDA_SM='$CUDA_SM' bash scripts/setup_dev.sh"
+log "Running setup_dev.sh (PEGAINFER_CUDA_SM=${CUDA_SM:-auto})…"
+ssh_box "cd '$REMOTE_DIR' && PEGAINFER_CUDA_SM='$CUDA_SM' bash scripts/setup_dev.sh"
 
 log "✅ Done."
 log "   SSH in:    ssh -i $SSH_KEY -p $PORT $HOST"

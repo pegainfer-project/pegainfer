@@ -1,12 +1,12 @@
 # Qwen3-4B Model Crate
 
 **Created**: 2026-05-03
-**Last touched**: 2026-07
-**TL;DR**: `crates/openinfer-qwen3` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `openinfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. The old `ModelForward` path has been removed; decode length-limit now emits the final token before `Finished`. Long-context `bs=1` TPOT was traced to non-partition FlashInfer paged decode under-filling the GPU; Qwen3 runtime gates FlashInfer split-K decode on `padded_bs<=32` (the `seq_len>=1024` gate was dropped in #437) with a 64-token chunk floor (`Tuned` capped at 64 chunks; opt-in `--batch-invariant` pins a fixed 160-token split), cutting 4k/64 serving steady TPOT from about `11.7ms` to `6.46ms` on RTX 5090. Qwen3 now keeps a single model-crate bench entry: `qwen3_kernel_snapshot`, a JSON snapshot runner with warm/cold-L2 latency, default-on CUPTI counters, and compare. Correctness/truth is intentionally out of this snapshot for now.
+**Last touched**: 2026-09
+**TL;DR**: `crates/pegainfer-qwen3` now owns Qwen3 config, weights, execution, scheduler, tests, benches, and kernel plan. Root `pegainfer` loads Qwen3 through a generic `EngineHandle` and no longer contains `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, root Qwen3 tests, or `src/model/qwen3/*`. The old `ModelForward` path has been removed; decode length-limit now emits the final token before `Finished`. Long-context `bs=1` TPOT was traced to non-partition FlashInfer paged decode under-filling the GPU; Qwen3 runtime gates FlashInfer split-K decode on `padded_bs<=32` (the `seq_len>=1024` gate was dropped in #437) with a 64-token chunk floor (`Tuned` capped at 64 chunks; opt-in `--batch-invariant` pins a fixed 160-token split), cutting 4k/64 serving steady TPOT from about `11.7ms` to `6.46ms` on RTX 5090. Qwen3 now keeps a single model-crate bench entry: `qwen3_kernel_snapshot`, a JSON snapshot runner with warm/cold-L2 latency, default-on CUPTI counters, and compare. Correctness/truth is intentionally out of this snapshot for now.
 
 ## Determinism scope
 
-`--batch-invariant` is scoped to one process, one toolchain, and one GPU. The cuBLASLt algo is re-tuned on every boot and cached per executor thread (`thread_local`), so it does not promise stability across cuBLAS or driver versions; startup logging records the pinned `splitk` and `reduction_scheme` per `(M,K)`. The builder rejects decode-overlap, DFlash speculative decoding, LoRA, and tensor parallelism.
+`--batch-invariant` is scoped to one process, one toolchain, and one GPU. The cuBLASLt algo is re-tuned on every boot and cached per executor thread (`thread_local`), so it does not promise stability across cuBLAS or driver versions; startup logging records the pinned `splitk` and `reduction_scheme` per `(M,K)`. The opt-in cross-process algo store (`PEGAINFER_GEMM_LT_CACHE`, see [serving-perf-5090.md](serving-perf-5090.md)) does not reach this path: `--batch-invariant` selects `Pin`, which takes the heuristic top without timing and never reads or writes the store. The builder rejects decode-overlap, DFlash speculative decoding, LoRA, and tensor parallelism.
 
 It also **requires `--no-prefix-cache` and rejects `--kv-offload`**. A prefix hit advances a prompt's `chunk_start` off the request-local chunk grid, re-cutting its prefill chunks according to prior traffic. `--no-prefix-cache` closes that — except under offload, where it only disables HBM retention and deliberately leaves prefix *matching* on (host-tier reuse is the point of that mode), so that pair is rejected outright.
 
@@ -14,17 +14,17 @@ It also **requires `--no-prefix-cache` and rejects `--kv-offload`**. A prefix hi
 
 - **Read**:
   - `docs/index.md` - identified the kernels/core crate split and per-model boundary docs.
-  - `docs/models/qwen3/kernels-crate.md` - Qwen3 kernel source/build ownership and human kernel index already live in `openinfer-kernels`; model-owned DAG metadata should live with the model crate.
-  - `docs/subsystems/kernels/openinfer-kernels-boundary.md` - records the per-model engine direction and says root should be reusable frontend/control-plane infrastructure, not a universal model abstraction.
+  - `docs/models/qwen3/kernels-crate.md` - Qwen3 kernel source/build ownership and human kernel index already live in `pegainfer-kernels`; model-owned DAG metadata should live with the model crate.
+  - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - records the per-model engine direction and says root should be reusable frontend/control-plane infrastructure, not a universal model abstraction.
   - `src/main.rs`, `src/lib.rs`, `src/server_engine.rs`, `src/scheduler.rs`, `src/model_executor.rs`, `src/model/qwen3/*`, `src/bin/bench_serving.rs`, and Qwen3 tests - mapped what root currently knows about Qwen3.
 - **Relevant history**:
   - The earlier shared-runtime work (now consolidated into `docs/subsystems/runtime/runtime.md`) was a useful simplification, but the next boundary should not make `ModelForward` the long-term universal engine API.
 - **Plan**:
   1. Define the model crate/root interface before moving code.
-  2. Move the generic text-generation handle/request/event types into `openinfer-core` so root and model crates can communicate without model crates depending on root.
-  3. Create `crates/openinfer-qwen3` and move Qwen3 config, weights, forward paths, decode buffers, `Qwen3Executor`, Qwen3 scheduler internals, Qwen3 correctness tests, and Qwen3-specific benches into it.
-  4. Keep root `openinfer` as frontend plus model registry. The registry can know crate names, but `main`, `vllm_frontend`, and generic benchmark code should only see `EngineHandle`, `ModelInfo`, and tokenizer path.
-  5. Add a model-owned `kernel_plan.rs` in the Qwen3 crate as the LLM/human index from model DAG phases to reusable kernels. Do not add a hand-maintained public TOML in `openinfer-kernels`.
+  2. Move the generic text-generation handle/request/event types into `pegainfer-core` so root and model crates can communicate without model crates depending on root.
+  3. Create `crates/pegainfer-qwen3` and move Qwen3 config, weights, forward paths, decode buffers, `Qwen3Executor`, Qwen3 scheduler internals, Qwen3 correctness tests, and Qwen3-specific benches into it.
+  4. Keep root `pegainfer` as frontend plus model registry. The registry can know crate names, but `main`, `vllm_frontend`, and generic benchmark code should only see `EngineHandle`, `ModelInfo`, and tokenizer path.
+  5. Add a model-owned `kernel_plan.rs` in the Qwen3 crate as the LLM/human index from model DAG phases to reusable kernels. Do not add a hand-maintained public TOML in `pegainfer-kernels`.
   6. Verify locally with format/metadata, then on the CUDA validation host with release build, clippy, Qwen3 crate e2e, and root `bench_serving snapshot`. Keep microbench timing in Criterion benches instead of duplicating it as a test.
 - **Risks / open questions**:
   - If the scheduler stays in root, root still knows Qwen3's execution shape. To meet the stated goal, the Qwen3 scheduler should move into the Qwen3 crate and expose only a generic handle.
@@ -36,7 +36,7 @@ It also **requires `--no-prefix-cache` and rejects `--kv-offload`**. A prefix hi
 The root-visible interface should be request/response oriented, not prefill/decode oriented.
 
 ```rust
-// openinfer-core
+// pegainfer-core
 pub struct EngineLoadOptions {
     pub enable_cuda_graph: bool,
     pub device_ordinals: Vec<usize>,
@@ -71,21 +71,19 @@ pub struct EngineHandle {
 ```
 
 ```rust
-// openinfer-qwen3
-pub fn probe_model(model_path: &std::path::Path) -> anyhow::Result<Option<ModelInfo>>;
+// pegainfer-qwen3
 pub fn start_engine(
     model_path: &std::path::Path,
     options: EngineLoadOptions,
 ) -> anyhow::Result<EngineHandle>;
-pub fn kernel_plan() -> &'static KernelPlan;
 ```
 
-`Qwen3Model`, `BatchDecodeBuffers`, and `KvState` should not be root-facing APIs. The deliberate low-level escape hatch is `openinfer_qwen3::runtime`, which exposes `Qwen3Executor` plus prefill/decode/unified plan types. That is the production phase boundary used by the scheduler and by model-local benches; root should still use `start_engine`.
+`Qwen3Model`, `BatchDecodeBuffers`, and `KvState` should not be root-facing APIs. The deliberate low-level escape hatch is `pegainfer_qwen3::runtime`, which exposes `Qwen3Executor` plus prefill/decode/unified plan types. That is the production phase boundary used by the scheduler and by model-local benches; root should still use `start_engine`.
 
 ## Execution Log
 
 ### Step 1: Add generic engine API to core
-- Added `openinfer_core::engine` with:
+- Added `pegainfer_core::engine` with:
   - `EngineLoadOptions`
   - `ModelInfo`
   - `TokenLogprob`
@@ -97,7 +95,7 @@ pub fn kernel_plan() -> &'static KernelPlan;
 - Root `scheduler.rs` is reduced to compatibility re-exports for `SchedulerHandle`, `SchedulerRequest`, and `TokenEvent`.
 
 ### Step 2: Extract Qwen3 crate
-- Added `crates/openinfer-qwen3`.
+- Added `crates/pegainfer-qwen3`.
 - Moved Qwen3-owned code into the crate:
   - config/weights/forward/prefill/decode/unified forward
   - batch decode buffers
@@ -114,14 +112,14 @@ pub fn kernel_plan() -> &'static KernelPlan;
   - `src/model/qwen3/*`
   - `src/model_executor.rs`
   - Qwen3 root tests: `tests/e2e.rs`, `tests/paged_attention.rs`, `tests/bench_prefill.rs`
-- Root `main.rs` starts Qwen3 through `openinfer_qwen3::start_engine(...)`.
+- Root `main.rs` starts Qwen3 through `pegainfer_qwen3::start_engine(...)`.
 - Root `vllm_frontend.rs` accepts a generic `EngineHandle`.
 - Root `bench_serving` uses the same generic scheduler bench path for Qwen3 instead of constructing `Qwen3Model` directly.
 - Checked root with `rg` and confirmed no hits for `Qwen3Model`, `Qwen3Executor`, `ModelRuntimeConfig`, `model_executor`, `src/model/qwen3`, or stale "Qwen3 continuous" comments under root source/tests/benches/README.
 
 ### Step 4: Link and validation fixes
-- Added explicit `stdc++` link output in `openinfer-kernels` build script. Once Qwen3 became an independent crate with its own tests, the FlashInfer C++ CUDA objects needed the C++ runtime linked for test binaries as well as root binaries.
-- Fixed the Qwen3 crate prefill test to respect `OPENINFER_TEST_MODEL_PATH`.
+- Added explicit `stdc++` link output in `pegainfer-kernels` build script. Once Qwen3 became an independent crate with its own tests, the FlashInfer C++ CUDA objects needed the C++ runtime linked for test binaries as well as root binaries.
+- Fixed the Qwen3 crate prefill test to respect `PEGAINFER_TEST_MODEL_PATH`.
 - The validation build directory still has no `.git`, so `bench_serving snapshot` writes `commit: unknown`; after pulling it back with `rsync -e 'ssh -S none'`, the local snapshot commit field was set to current local `HEAD` short hash `0f54a1d`.
 
 ### Step 5: Verification
@@ -129,11 +127,11 @@ pub fn kernel_plan() -> &'static KernelPlan;
   - `cargo fmt --all --check` passes.
   - `cargo metadata --no-deps --format-version 1` passes.
 - CUDA validation host (RTX 5090):
-  - `OPENINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` passes.
-  - `OPENINFER_CUDA_SM=120 cargo build --release` passes.
-  - `OPENINFER_CUDA_SM=120 cargo test --release --workspace --no-run` passes.
-  - `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p openinfer-qwen3 --test e2e -- --nocapture` passes.
-  - `RUST_LOG=warn OPENINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path <model-path> snapshot` passes:
+  - `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` passes.
+  - `PEGAINFER_CUDA_SM=120 cargo build --release` passes.
+  - `PEGAINFER_CUDA_SM=120 cargo test --release --workspace --no-run` passes.
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p pegainfer-qwen3 --test e2e -- --nocapture` passes.
+  - `RUST_LOG=warn PEGAINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path <model-path> snapshot` passes:
     - `prefill_heavy (10000,1)`: TTFT p50 `500.90ms`, p99 `503.30ms`
     - `decode_heavy (1024,256)`: TPOT p50 `7.57ms`, p99 `7.74ms`
     - This run exposed a scheduler length-limit bug: `max_tokens=256` emitted only `255` token events because the limit path finished without emitting the final decoded token. It was fixed in Step 7.
@@ -144,22 +142,22 @@ pub fn kernel_plan() -> &'static KernelPlan;
 - Rejected a bench-only support API and also rejected using `ModelForward` as the benchmark entry.
 - Added an explicit `runtime` module that re-exports the scheduler's real `Qwen3Executor` phase API: `PrefillPlan`, `DecodePlan`, `UnifiedPlan`, request items, and result types.
 - Removed top-level public `Qwen3Model`, `ModelRuntimeConfig`, and `Qwen3State` re-exports. External low-level tools must opt into `runtime`; root continues to use `start_engine`.
-- Replaced `crates/openinfer-qwen3/benches/qwen3_prefill.rs` with `benches/qwen3_runtime.rs`. It measures executor prefill TTFT over `128`, `512`, `1024`, `2048`, `4096`, and `10000` token prompts, plus executor decode TPOT for batch sizes `1`, `2`, `4`, `8`, `16`, and `32` at a `1024` token context.
+- Replaced `crates/pegainfer-qwen3/benches/qwen3_prefill.rs` with `benches/qwen3_runtime.rs`. It measures executor prefill TTFT over `128`, `512`, `1024`, `2048`, `4096`, and `10000` token prompts, plus executor decode TPOT for batch sizes `1`, `2`, `4`, `8`, `16`, and `32` at a `1024` token context.
 - Updated `tests/paged_attention.rs` to use the same executor phase API: prefill once to create KV state, then decode through `execute_decode`.
 - Verification after the cleanup:
   - Local `cargo fmt --all --check` and `cargo metadata --no-deps --format-version 1` pass.
-  - Local `cargo check --release -p openinfer-qwen3 --benches --tests` cannot run on the Mac without CUDA/nvcc; with `OPENINFER_CUDA_SM=120` it still fails at local `nvcc`.
-  - CUDA host `OPENINFER_CUDA_SM=120 cargo check --release -p openinfer-qwen3 --benches --tests` passes.
-  - CUDA host `OPENINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` passes.
-  - CUDA host `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p openinfer-qwen3 --test paged_attention -- --nocapture` passes.
-  - CUDA host full Criterion bench passes with `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<model-path> cargo bench -p openinfer-qwen3 --bench qwen3_runtime`:
+  - Local `cargo check --release -p pegainfer-qwen3 --benches --tests` cannot run on the Mac without CUDA/nvcc; with `PEGAINFER_CUDA_SM=120` it still fails at local `nvcc`.
+  - CUDA host `PEGAINFER_CUDA_SM=120 cargo check --release -p pegainfer-qwen3 --benches --tests` passes.
+  - CUDA host `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` passes.
+  - CUDA host `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p pegainfer-qwen3 --test paged_attention -- --nocapture` passes.
+  - CUDA host full Criterion bench passes with `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo bench -p pegainfer-qwen3 --bench qwen3_runtime`:
     - Prefill TTFT: `128 -> 11.804ms`, `512 -> 23.200ms`, `1024 -> 44.114ms`, `2048 -> 87.327ms`, `4096 -> 179.60ms`, `10000 -> 505.55ms`.
     - Decode one-step batch time at 1024-token context: `bs1 -> 9.3095ms`, `bs2 -> 9.3207ms`, `bs4 -> 9.4059ms`, `bs8 -> 10.960ms`, `bs16 -> 11.718ms`, `bs32 -> 13.196ms`.
 
 ### Step 7: Retire ModelForward and Fix Length Limit
-- Deleted `openinfer_core::model::{ModelForward, GenerationState}` and removed the root `src/model.rs` re-export.
+- Deleted `pegainfer_core::model::{ModelForward, GenerationState}` and removed the root `src/model.rs` re-export.
 - Deleted the Qwen3 `forward.rs` compatibility path. Qwen3 tests that used it now build their baselines from `batch_prefill(bs=1)` plus `batch_decode(bs=1)`, so they exercise the same phase APIs as production.
-- Fixed Qwen3 decode length-limit handling by adding `DecodeEffect::EmitAndFinish`. EOS behavior is unchanged: EOS finishes without emitting the stop token. Length limit now emits the sampled final token, then sends `Finished { finish_reason: Length }`.
+- Fixed Qwen3 decode length-limit handling by adding `DecodeEffect::EmitAndFinish`. Length limit now emits the sampled final token, then sends `Finished { finish_reason: Length }`. Under the typed stop contract the triggering token — model EOS or an explicit stop ID — is retained and emitted as the final token; the vLLM primary EOS carries no wire `stop_reason`, while explicit stops and secondary EOS IDs report the matching ID.
 - Regenerated `test_data/Qwen3-4B.json` because every length-limited golden output now includes the final requested token.
 - Re-ran `bench_serving snapshot` on the CUDA validation host and pulled back `bench_snapshots/rtx-5090/qwen3-4b.json`; `decode_heavy (1024,256)` now records `generated_tokens min=max=avg=256`.
 - Performance stayed within noise on RTX 5090:
@@ -167,13 +165,13 @@ pub fn kernel_plan() -> &'static KernelPlan;
   - `decode_heavy (1024,256)`: TPOT p50 `7.56ms`, p99 `7.73ms`.
 - Final verification after this step:
   - Local `cargo fmt --all --check`, `cargo metadata --no-deps --format-version 1`, and `git diff --check` pass.
-  - CUDA host `OPENINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` passes.
-  - CUDA host `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p openinfer-qwen3 --test e2e -- --nocapture` passes.
+  - CUDA host `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` passes.
+  - CUDA host `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p pegainfer-qwen3 --test e2e -- --nocapture` passes.
 
 ### Step 8: Decode Context-Length Sweep and Compile Audit
-- Added `crates/openinfer-qwen3/src/bin/qwen3_decode_context.rs` as a production-path fixed-context decode probe. It prefills a fresh request to a selected context length, then measures or profiles real `Qwen3Executor::execute_decode`; the optional `cudaProfilerStart/Stop` range only exists for profiler capture and does not run in normal serving.
+- Added `crates/pegainfer-qwen3/src/bin/qwen3_decode_context.rs` as a production-path fixed-context decode probe. It prefills a fresh request to a selected context length, then measures or profiles real `Qwen3Executor::execute_decode`; the optional `cudaProfilerStart/Stop` range only exists for profiler capture and does not run in normal serving.
 - GPU fixed-context command:
-  - `OPENINFER_CUDA_SM=120 target/release/qwen3_decode_context --model-path <model-path> --iters 10 --contexts 128,512,1024,2048,4096,8192,10000`
+  - `PEGAINFER_CUDA_SM=120 target/release/qwen3_decode_context --model-path <model-path> --iters 10 --contexts 128,512,1024,2048,4096,8192,10000`
 - Result on RTX 5090:
 
 | Context | Decode p50 |
@@ -197,13 +195,13 @@ pub fn kernel_plan() -> &'static KernelPlan;
 - H2D traffic in the profiled decode range was only about `20-23us/step`, so metadata dirty caching is good runtime hygiene but cannot explain a multi-ms TPOT gap.
 - Compile audit on the same validation worktree:
   - GPU reports compute capability `12.0`; default toolkit is CUDA `12.9` (`nvcc V12.9.86`), driver `575.57.08`.
-  - `crates/openinfer-kernels/build.rs` emits `-O3 -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 --compiler-options -fPIC`; FlashInfer translation units add `--std=c++17` and the FlashInfer include path.
-  - `cuobjdump -lelf` confirms both `libkernels_cuda.a` and `target/release/openinfer` contain `sm_120.cubin`. `compute_120` PTX fallback is also embedded, but the matching SASS is present, so this is not PTX-JIT-only execution.
+  - `crates/pegainfer-kernels/build.rs` emits `-O3 -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 --compiler-options -fPIC`; FlashInfer translation units add `--std=c++17` and the FlashInfer include path.
+  - `cuobjdump -lelf` confirms both `libkernels_cuda.a` and `target/release/pegainfer` contain `sm_120.cubin`. `compute_120` PTX fallback is also embedded, but the matching SASS is present, so this is not PTX-JIT-only execution.
   - CUDA `13.1` is installed and can build the same code into `sm_120` cubins, but the current driver/runtime combination cannot run it (`cudaError=35` after linking `libcudart.so.13`). Until the driver is upgraded, CUDA `12.9` is the latest runnable toolkit on this box.
 - Interpretation: the compile target is correct. The `bs=1` long-context slope is the known non-partition FlashInfer paged decode issue: grid shape is effectively `(batch_size, num_kv_heads) = (1, 8)`, so only 8 CTAs scan the whole KV context. At `ctx=4096`, Qwen3-4B attention reads about `604MB` (`576MiB`) of K/V per token; the measured attention time is about `5.7ms`, or roughly `105GB/s` effective aggregate bandwidth, far below the RTX 5090 memory system because the kernel under-fills the GPU. The next real fix is partition-KV/split-K decode for `bs=1` or low-batch, not build-flag tuning.
 
 ### Step 9: Pure Paged Decode Attention Bench
-- Added `crates/openinfer-qwen3/benches/qwen3_attention.rs`.
+- Added `crates/pegainfer-qwen3/benches/qwen3_attention.rs`.
 - The bench does not load Qwen3 weights. It constructs synthetic non-zero Q and paged KV buffers using Qwen3-4B attention shape: `num_qo_heads=32`, `num_kv_heads=8`, `head_dim=128`, `page_size=16`, one layer.
 - The bench calls the FlashInfer paged decode FFI directly and uses CUDA events around the kernel launches. It measures decode attention only; it excludes QKV projection, KV append, O projection, MLP, scheduler, tokenizer, and host-side serving overhead.
 - Added `paged_attention_decode_split_kv_cuda` as a reusable kernel entry for FlashInfer partition-KV/split-K decode. Runtime dispatch still uses the existing non-partition path; this step only exposes and benchmarks the candidate operator.
@@ -215,10 +213,10 @@ pub fn kernel_plan() -> &'static KernelPlan;
   - `cargo metadata --no-deps --format-version 1` passes.
   - `git diff --check` passes.
 - GPU compile:
-  - `OPENINFER_CUDA_SM=120 cargo check --release -p openinfer-qwen3 --bench qwen3_attention` passes.
-  - `OPENINFER_CUDA_SM=120 cargo clippy --release -p openinfer-qwen3 --all-targets -- -D warnings` passes.
+  - `PEGAINFER_CUDA_SM=120 cargo check --release -p pegainfer-qwen3 --bench qwen3_attention` passes.
+  - `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-qwen3 --all-targets -- -D warnings` passes.
 - GPU run:
-  - `OPENINFER_CUDA_SM=120 cargo bench -p openinfer-qwen3 --bench qwen3_attention -- --noplot` passes.
+  - `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3 --bench qwen3_attention -- --noplot` passes.
 
 Single-layer `bs=1` context sweep on RTX 5090:
 
@@ -266,9 +264,9 @@ GPU validation:
 
 | Check | Result |
 | --- | --- |
-| `OPENINFER_CUDA_SM=120 cargo check --release -p openinfer-qwen3 --all-targets` | pass |
-| `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p openinfer-qwen3 --test e2e -- --nocapture` | pass |
-| `OPENINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` | pass |
+| `PEGAINFER_CUDA_SM=120 cargo check --release -p pegainfer-qwen3 --all-targets` | pass |
+| `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p pegainfer-qwen3 --test e2e -- --nocapture` | pass |
+| `PEGAINFER_CUDA_SM=120 cargo clippy --release --all-targets -- -D warnings` | pass |
 
 Fixed-context decode probe after runtime integration:
 
@@ -281,7 +279,7 @@ Fixed-context decode probe after runtime integration:
 Command:
 
 ```bash
-OPENINFER_CUDA_SM=120 target/release/qwen3_decode_context \
+PEGAINFER_CUDA_SM=120 target/release/qwen3_decode_context \
   --model-path <model-path> \
   --iters 10 \
   --contexts 1024,4096,10000
@@ -290,7 +288,7 @@ OPENINFER_CUDA_SM=120 target/release/qwen3_decode_context \
 Cross-threshold smoke:
 
 ```bash
-OPENINFER_CUDA_SM=120 target/release/qwen3_decode_context \
+PEGAINFER_CUDA_SM=120 target/release/qwen3_decode_context \
   --model-path <model-path> \
   --iters 600 \
   --contexts 512
@@ -301,7 +299,7 @@ Result: pass, `p50=6.7156ms`. This exercises a single request growing from non-p
 Serving request check after rebuilding `bench_serving`:
 
 ```bash
-RUST_LOG=warn OPENINFER_CUDA_SM=120 target/release/bench_serving \
+RUST_LOG=warn PEGAINFER_CUDA_SM=120 target/release/bench_serving \
   --model-path <model-path> \
   request --prompt-len 4096 --output-len 64
 ```
@@ -317,7 +315,7 @@ Result:
 Interpretation: split-K removes the long-context attention slope for the low-batch case. The remaining `~6.8-7.1ms` TPOT is now dominated by the non-attention decode body: GEMMs/GEMVs, MLP, norms, logits, sampling, and graph replay overhead. Next optimization work should not keep pushing paged attention first; it should re-profile the post-split decode step and pick the new largest kernel family.
 
 ### Step 11: Attention Theoretical Bandwidth Estimate
-- Updated `crates/openinfer-qwen3/benches/qwen3_attention.rs` to print a one-time theoretical bandwidth report before Criterion runs.
+- Updated `crates/pegainfer-qwen3/benches/qwen3_attention.rs` to print a one-time theoretical bandwidth report before Criterion runs.
 - The report queries CUDA Driver attributes:
   - `CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE`
   - `CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH`
@@ -328,7 +326,7 @@ Interpretation: split-K removes the long-context attention slope for the low-bat
 - Verification command:
 
 ```bash
-OPENINFER_CUDA_SM=120 cargo bench -p openinfer-qwen3 \
+PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3 \
   --bench qwen3_attention -- --noplot
 ```
 
@@ -352,18 +350,18 @@ Batch sweep sanity rows at `kv_len=1024`:
 Interpretation: the estimate is good enough to prove the original `bs=1` non-partition path was badly under-filling memory bandwidth. It is not good enough to make final hardware-utilization claims because single-layer KV working sets fit in the RTX 5090's `96MiB` L2; the `bs16` non-partition row exceeding `100%` of DRAM peak is the warning sign. The next measurement step should use CUPTI Profiler or NCU counters for `dram__bytes_*`, `lts__t_bytes.*`, and `*_pct_of_peak_sustained_elapsed`.
 
 ### Step 12: CUPTI Counters and Split-K Retune
-- Added `crates/openinfer-cupti`, a small CUPTI Range Profiler wrapper used by the attention bench. It profiles only the attention launch range and lets the bench clear L2 before `cuptiRangeProfilerStart`, so cache-clear traffic is excluded from the measured range.
-- Extended `crates/openinfer-qwen3/benches/qwen3_attention.rs`:
-  - `OPENINFER_QWEN3_ATTENTION_CUPTI=1` prints cold-L2 CUPTI rows for `gpu__time_duration.sum`, `dram__bytes.sum`, `dram__bytes_op_read.sum`, `dram__bytes_op_write.sum`, and `lts__t_bytes.sum`.
-  - `OPENINFER_QWEN3_ATTENTION_SPLITK_SWEEP=1` sweeps split-K chunk sizes and max chunk slots.
-  - `OPENINFER_QWEN3_ATTENTION_REPORT_ONLY=1` prints reports without running Criterion samples.
+- Added `crates/pegainfer-cupti`, a small CUPTI Range Profiler wrapper used by the attention bench. It profiles only the attention launch range and lets the bench clear L2 before `cuptiRangeProfilerStart`, so cache-clear traffic is excluded from the measured range.
+- Extended `crates/pegainfer-qwen3/benches/qwen3_attention.rs`:
+  - `PEGAINFER_QWEN3_ATTENTION_CUPTI=1` prints cold-L2 CUPTI rows for `gpu__time_duration.sum`, `dram__bytes.sum`, `dram__bytes_op_read.sum`, `dram__bytes_op_write.sum`, and `lts__t_bytes.sum`.
+  - `PEGAINFER_QWEN3_ATTENTION_SPLITK_SWEEP=1` sweeps split-K chunk sizes and max chunk slots.
+  - `PEGAINFER_QWEN3_ATTENTION_REPORT_ONLY=1` prints reports without running Criterion samples.
 - GPU CUPTI command:
 
 ```bash
-OPENINFER_CUDA_SM=120 \
-OPENINFER_QWEN3_ATTENTION_REPORT_ONLY=1 \
-OPENINFER_QWEN3_ATTENTION_CUPTI=1 \
-cargo bench -p openinfer-qwen3 --bench qwen3_attention -- --noplot
+PEGAINFER_CUDA_SM=120 \
+PEGAINFER_QWEN3_ATTENTION_REPORT_ONLY=1 \
+PEGAINFER_QWEN3_ATTENTION_CUPTI=1 \
+cargo bench -p pegainfer-qwen3 --bench qwen3_attention -- --noplot
 ```
 
 Key cold-L2 CUPTI rows at `bs=1,ctx=10000`:
@@ -379,10 +377,10 @@ Interpretation: FlashInfer is not rereading KV many times from DRAM. The non-par
 Split-K sweep command:
 
 ```bash
-OPENINFER_CUDA_SM=120 \
-OPENINFER_QWEN3_ATTENTION_REPORT_ONLY=1 \
-OPENINFER_QWEN3_ATTENTION_SPLITK_SWEEP=1 \
-cargo bench -p openinfer-qwen3 --bench qwen3_attention -- --noplot
+PEGAINFER_CUDA_SM=120 \
+PEGAINFER_QWEN3_ATTENTION_REPORT_ONLY=1 \
+PEGAINFER_QWEN3_ATTENTION_SPLITK_SWEEP=1 \
+cargo bench -p pegainfer-qwen3 --bench qwen3_attention -- --noplot
 ```
 
 Representative cold-L2 sweep rows:
@@ -403,9 +401,9 @@ Historical note (this section's retune): `BatchDecodeBuffers` used `SPLIT_KV_CHU
 Production decode probe after retune:
 
 ```bash
-OPENINFER_CUDA_SM=120 cargo build --release \
-  -p openinfer-qwen3 --bin qwen3_decode_context
-OPENINFER_CUDA_SM=120 target/release/qwen3_decode_context \
+PEGAINFER_CUDA_SM=120 cargo build --release \
+  -p pegainfer-qwen3 --bin qwen3_decode_context
+PEGAINFER_CUDA_SM=120 target/release/qwen3_decode_context \
   --model-path <model-path> \
   --iters 10 \
   --contexts 1024,4096,10000
@@ -420,7 +418,7 @@ OPENINFER_CUDA_SM=120 target/release/qwen3_decode_context \
 Serving check after syncing the root `src/` worktree on the CUDA validation host:
 
 ```bash
-RUST_LOG=warn OPENINFER_CUDA_SM=120 cargo run --release \
+RUST_LOG=warn PEGAINFER_CUDA_SM=120 cargo run --release \
   --bin bench_serving -- \
   --model-path <model-path> \
   request --prompt-len 4096 --output-len 64 --warmup 5 --iters 20
@@ -437,9 +435,9 @@ Verification:
 
 | Check | Result |
 | --- | --- |
-| `OPENINFER_CUDA_SM=120 cargo clippy --release -p openinfer-cupti -p openinfer-qwen3 --bench qwen3_attention -- -D warnings` | pass |
-| `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p openinfer-qwen3 --test e2e -- --nocapture` | pass |
-| `OPENINFER_CUDA_SM=120 OPENINFER_QWEN3_ATTENTION_REPORT_ONLY=1 cargo bench -p openinfer-qwen3 --bench qwen3_attention -- --noplot` | pass |
+| `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-cupti -p pegainfer-qwen3 --bench qwen3_attention -- -D warnings` | pass |
+| `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p pegainfer-qwen3 --test e2e -- --nocapture` | pass |
+| `PEGAINFER_CUDA_SM=120 PEGAINFER_QWEN3_ATTENTION_REPORT_ONLY=1 cargo bench -p pegainfer-qwen3 --bench qwen3_attention -- --noplot` | pass |
 | `cargo fmt --all --check` | pass |
 | `cargo metadata --no-deps --format-version 1` | pass |
 | `git diff --check` | pass |
@@ -447,15 +445,15 @@ Verification:
 Note: an initial remote e2e run failed because the remote `test_data/Qwen3-4B.json` was stale and expected the pre length-limit baseline. Syncing the tracked baseline fixed it; this was not a split-K numerical drift.
 
 ### Step 13: Kernel Snapshot MVP
-- Extracted the Qwen3 paged decode attention case construction into `crates/openinfer-qwen3/src/kernel_bench.rs`.
-- Added `crates/openinfer-qwen3/benches/qwen3_kernel_snapshot.rs` as a deterministic `harness=false` runner.
+- Extracted the Qwen3 paged decode attention case construction into `crates/pegainfer-qwen3/src/kernel_bench.rs`.
+- Added `crates/pegainfer-qwen3/benches/qwen3_kernel_snapshot.rs` as a deterministic `harness=false` runner.
 - Removed the temporary correctness envelope from the snapshot runner. We do not have a settled truth source for this layer yet, so correctness belongs in a separate design rather than a misleading "non-partition equals truth" field.
 - CUPTI is default-on in the snapshot runner. `--no-cupti` is available only for latency-only smoke runs.
 
 Snapshot command:
 
 ```bash
-OPENINFER_CUDA_SM=120 cargo bench -p openinfer-qwen3 \
+PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3 \
   --bench qwen3_kernel_snapshot -- \
   run \
   --contexts 1024 \
@@ -468,7 +466,7 @@ OPENINFER_CUDA_SM=120 cargo bench -p openinfer-qwen3 \
 Compare command:
 
 ```bash
-cargo bench -p openinfer-qwen3 \
+cargo bench -p pegainfer-qwen3 \
   --bench qwen3_kernel_snapshot -- \
   compare \
   --base $RESULT_ROOT/qwen3_kernel_snapshot_smoke.json \
@@ -502,7 +500,7 @@ kernel snapshot compare complete: warnings=0 failures=0
 CUPTI note: the standalone snapshot runner originally crashed inside `libnvperf_host.so` at `NVPW_CUDA_Profiler_DecodeCounters`. The root cause was the verbose user range name, not the attention case or Rust callback trampoline. The fix is to use compact range names such as `qk/non_partition/b1/k1024` and keep full metadata in JSON fields. The first profiled launch also needs an unprofiled warmup launch; otherwise CUDA lazy initialization pollutes the first CUPTI GPU time.
 
 ```bash
-OPENINFER_CUDA_SM=120 cargo bench -p openinfer-qwen3 \
+PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3 \
   --bench qwen3_kernel_snapshot -- \
   run \
   --contexts 1024 \
@@ -516,16 +514,16 @@ Verification:
 
 | Check | Result |
 | --- | --- |
-| `OPENINFER_CUDA_SM=120 cargo clippy --release -p openinfer-cupti -p openinfer-qwen3 --bench qwen3_kernel_snapshot -- -D warnings` | pass |
-| `OPENINFER_CUDA_SM=120 OPENINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p openinfer-qwen3 --test e2e -- --nocapture` | pass |
-| `OPENINFER_CUDA_SM=120 cargo bench -p openinfer-qwen3 --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out $RESULT_ROOT/qwen3_kernel_snapshot_cupti_smoke.json` | pass |
+| `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-cupti -p pegainfer-qwen3 --bench qwen3_kernel_snapshot -- -D warnings` | pass |
+| `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p pegainfer-qwen3 --test e2e -- --nocapture` | pass |
+| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3 --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out $RESULT_ROOT/qwen3_kernel_snapshot_cupti_smoke.json` | pass |
 
 The SM counters are intentionally minimal. `sm__throughput.avg.pct_of_peak_sustained_elapsed` shows whether SMs are busy over elapsed time; `smsp__warps_active.avg.pct_of_peak_sustained_active` shows active-warp residency while SM partitions are active. At `bs=1,ctx=10000`, non-partition measured `1.19%` SM throughput and `6.59%` DRAM peak, while split-K measured `8.74%` SM throughput and `41.06%` DRAM peak for nearly identical DRAM read bytes. That is the kernel snapshot evidence for low-batch underfill.
 
 ### Step 14: Consolidate Bench Entry Points
 - Deleted the retired Criterion benches:
-  - `crates/openinfer-qwen3/benches/qwen3_runtime.rs`
-  - `crates/openinfer-qwen3/benches/qwen3_attention.rs`
+  - `crates/pegainfer-qwen3/benches/qwen3_runtime.rs`
+  - `crates/pegainfer-qwen3/benches/qwen3_attention.rs`
 - Removed their `[[bench]]` entries and the Qwen3 crate-local `criterion` dev dependency.
 - Qwen3 now has exactly one model-crate bench entry: `qwen3_kernel_snapshot`.
 - Rationale: the human CSV report, split-K tuning sweep, and machine-readable JSON runner were duplicating case construction, metric selection, and interpretation. Kernel maintenance should have one durable artifact first; optional human views should be generated from snapshot data rather than maintained as separate benches.
@@ -537,13 +535,13 @@ Verification after consolidation:
 | `cargo fmt --all --check` | pass |
 | `cargo metadata --no-deps --format-version 1` | pass |
 | `git diff --check` | pass |
-| `OPENINFER_CUDA_SM=120 cargo check --release -p openinfer-qwen3 --bench qwen3_kernel_snapshot` on the CUDA validation host | pass |
-| `OPENINFER_CUDA_SM=120 cargo clippy --release -p openinfer-cupti -p openinfer-qwen3 --bench qwen3_kernel_snapshot -- -D warnings` on the CUDA validation host | pass |
-| `OPENINFER_CUDA_SM=120 cargo bench -p openinfer-qwen3 --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out $RESULT_ROOT/qwen3_kernel_snapshot_single_bench_smoke.json` on the CUDA validation host | pass |
-| `OPENINFER_CUDA_SM=120 cargo bench -p openinfer-qwen3 --bench qwen3_kernel_snapshot -- compare --base $RESULT_ROOT/qwen3_kernel_snapshot_single_bench_smoke.json --new $RESULT_ROOT/qwen3_kernel_snapshot_single_bench_smoke.json` on the CUDA validation host | pass |
+| `PEGAINFER_CUDA_SM=120 cargo check --release -p pegainfer-qwen3 --bench qwen3_kernel_snapshot` on the CUDA validation host | pass |
+| `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-cupti -p pegainfer-qwen3 --bench qwen3_kernel_snapshot -- -D warnings` on the CUDA validation host | pass |
+| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3 --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out $RESULT_ROOT/qwen3_kernel_snapshot_single_bench_smoke.json` on the CUDA validation host | pass |
+| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3 --bench qwen3_kernel_snapshot -- compare --base $RESULT_ROOT/qwen3_kernel_snapshot_single_bench_smoke.json --new $RESULT_ROOT/qwen3_kernel_snapshot_single_bench_smoke.json` on the CUDA validation host | pass |
 
 ## Debrief
 
-The Qwen3 split now enforces the intended dependency direction: model execution code depends on `openinfer-core` and `openinfer-kernels`; root depends on the model crate only at registry/startup glue points. Root still has a `ModelType::Qwen3` enum and default Qwen3 model path because the product needs a loader choice, but it no longer sees Qwen3 layers, KV state, TP rank workers, or prefill/decode/unified plans.
+The Qwen3 split now enforces the intended dependency direction: model execution code depends on `pegainfer-core` and `pegainfer-kernels`; root depends on the model crate only at registry/startup glue points. Root still has a `ModelType::Qwen3` enum and default Qwen3 model path because the product needs a loader choice, but it no longer sees Qwen3 layers, KV state, TP rank workers, or prefill/decode/unified plans.
 
 Next cleanup should be a generic model registry module so `main.rs` and `bench_serving.rs` stop matching model crate names directly. Performance-wise, the next target is the post-split decode body: GEMM/GEMV, MLP, norms, logits, sampling, and graph replay overhead now dominate the remaining `~6.5-7.0ms` TPOT. Kernel DevOps-wise, the next target is defining a real correctness/truth source for kernel snapshots instead of treating one implementation path as the oracle.

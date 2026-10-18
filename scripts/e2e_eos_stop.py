@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E2E check that a serving openinfer engine stops at EOS (issue #238).
+"""E2E check that a serving pegainfer engine stops at EOS (issue #238).
 
 Sends the same prompt twice through `/v1/completions` on an already-running
 server:

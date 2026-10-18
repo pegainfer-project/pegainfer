@@ -24,7 +24,7 @@ Target comparison:
 
 > CLI note: the parallel shape and EP backend are selected by the
 > `--tp-size/--dp-size/--ep-backend` flags. The old `kimi-k2-pplx-ep` cargo
-> feature and `OPENINFER_KIMI_PARALLEL` env (used in the original 2026-05-25 run)
+> feature and `PEGAINFER_KIMI_PARALLEL` env (used in the original 2026-05-25 run)
 > have been removed; the feature is now just `kimi-k2`.
 
 TP1/DP8 PPLX is intentionally not the baseline for this document. The current
@@ -34,9 +34,9 @@ repair first makes TP8/DP1 PPLX match TP8/DP1 NCCL.
 
 | Date | Path | Output | Result |
 | --- | --- | --- | --- |
-| 2026-05-25 | `cargo check --release -p openinfer-server --features kimi-k2 --bin bench_serving` (PPLX selected via `--ep-backend pplx`) | clean build on 8×H200 node | Pass |
-| 2026-05-25 | `cargo check --release -p openinfer-server --features kimi-k2 --bin bench_serving` | clean build on 8×H200 node | Pass |
-| 2026-05-25 | `cargo test --release -p openinfer-comm --test pplx_roundtrip -- --nocapture` | 8 ranks dispatch+combine roundtrip, each rank received 512 tokens | Pass |
+| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2 --bin bench_serving` (PPLX selected via `--ep-backend pplx`) | clean build on 8×H200 node | Pass |
+| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2 --bin bench_serving` | clean build on 8×H200 node | Pass |
+| 2026-05-25 | `cargo test --release -p pegainfer-comm --test pplx_roundtrip -- --nocapture` | 8 ranks dispatch+combine roundtrip, each rank received 512 tokens | Pass |
 | 2026-05-25 | TP8 PPLX bs4, output 5, iters 3 | `$RESULT_ROOT/kimi_pplx_tp8_bs4_o5_final.json`: 12/12 traces hash `7c4c5d83355198fd` | Pass |
 | 2026-05-25 | TP8 NCCL bs64 active decode | `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`, steady TPOT p50 `97.53ms` | Reference |
 | 2026-05-25 | TP8 PPLX bs64 active decode | `$RESULT_ROOT/kimi_pplx_tp8_active64_o5_after_review.json`: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`, steady TPOT p50 `110.14ms` | Matches NCCL |
@@ -51,18 +51,18 @@ per-index trace equality between PPLX and NCCL for the same active scheduling.
 Common environment:
 
 ```bash
-cd $OPENINFER_DIR
+cd $PEGAINFER_DIR
 export CUDA_HOME=/usr/local/cuda
 export NVCC=/usr/local/cuda/bin/nvcc
-export LD_LIBRARY_PATH=$RESULT_ROOT/openinfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
-export OPENINFER_CUDA_SM=90a
-export OPENINFER_TRITON_PYTHON=$OPENINFER_DIR/.triton-venv/bin/python
+export LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+export PEGAINFER_CUDA_SM=90a
+export PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python
 ```
 
 NCCL reference (TP8/DP1):
 
 ```bash
-cargo run --quiet --release -p openinfer-server --features kimi-k2 --bin bench_serving -- \
+cargo run --quiet --release -p pegainfer-server --features kimi-k2 --bin bench_serving -- \
   --model-path $MODEL_DIR \
   --tp-size 8 --dp-size 1 --ep-backend nccl \
   --cuda-graph false \
@@ -74,7 +74,7 @@ cargo run --quiet --release -p openinfer-server --features kimi-k2 --bin bench_s
 PPLX path (TP8/DP1):
 
 ```bash
-cargo run --quiet --release -p openinfer-server --features kimi-k2 --bin bench_serving -- \
+cargo run --quiet --release -p pegainfer-server --features kimi-k2 --bin bench_serving -- \
   --model-path $MODEL_DIR \
   --tp-size 8 --dp-size 1 --ep-backend pplx \
   --cuda-graph false \

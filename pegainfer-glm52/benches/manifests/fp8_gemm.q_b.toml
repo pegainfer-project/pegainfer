@@ -1,0 +1,26 @@
+unit = "fp8_gemm.q_b"
+# rows>8 wide route (#812): q_b runs this fp8 GEMM past FP8_GEMV_MAX_ROWS=8.
+phase = 1
+symbol = "glm52_fp8_groupwise_gemm_sm100_cuda"
+adapter = "fp8_gemm_groupwise"
+# SM100 CUTLASS template — instantiates only on sm_100a-family builds; other
+# targets return NOT_SUPPORTED at runtime.
+capability = { blackwell_only = true }
+scratch = "32 MiB CUTLASS grouped-scheduler/tensormap workspace carved inside the FFI (fp8.rs FP8_GEMM_WORKSPACE_BYTES); allocated as bench warmup material, never timed"
+[axes]
+# 4/8 straddle the GEMV<->GEMM crossover; 16/32/48 are the verify-span
+# buckets; 64 is the span-8 x bucket-8 upper probe. All satisfy m%4==0.
+rows = [4, 8, 16, 32, 48, 64, 96]
+[shape]
+n = 16384  # q_b [heads*q_head=64*256, q_lora=2048]
+k = 2048
+[contract]
+inputs = "act e4m3 [rows, 2048] + act_scales f32 [rows, 16] (the production wide route's per-token-group-quantized input pair, generated harness-side with refs/quant.fp8_per_token_group_quant_ref, ue8m0 off); weight e4m3 [16384, 2048] + weight_scales f32 [128, 16] (checkpoint weight_scale_inv layout); workspace 32 MiB (= fp8.rs FP8_GEMM_WORKSPACE_BYTES, amortized by warmup)"
+outputs = "out[rows, 16384] bf16"
+accumulation = "f32 (CUTLASS tcgen05 block-scaled MMA, FlashInfer gemm_groupwise_sm100; fixed hardware writeback order)"
+notes = "Same shape as the mla_front GEMV chain's q_b projection — the GEMM leg of the wide-route GEMV<->GEMM comparison. FFI requires m%4==0 and k%128==0; targets outside the sm_100a family compile back to a NOT_SUPPORTED stub."
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "Reference: both e4m3 operands dequantized to f32, single f32 matmul, bf16 store; residual = pure accumulation-order noise (bf16 store floor ~4e-3). MEASURED rel_l2 <= 9.1e-5 (all rows in {4,8,16,32,48,64}, GB300 sm_103 tray03, 2026-08-01); headroom ~220x"

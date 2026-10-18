@@ -1,6 +1,6 @@
 # GPU Profiling Guide
 
-> **TL;DR:** For benchmarking, use `bench_serving --help`. For profiling, capture a trace with `nsys`, analyze totals with `nsys stats`, and always inspect `std/p95/p99/max` tails before making optimization decisions. This document covers pitfalls and diagnostic paths, not CLI reference.
+> **TL;DR:** For benchmarking, drive the HTTP server with `scripts/bench_http_serving.py` or vllm-bench (the in-process `bench_serving` bin is retired). For profiling, wrap the *server* in `nsys`, drive load over HTTP, analyze totals with `nsys stats`, and always inspect `std/p95/p99/max` tails before making optimization decisions. This document covers pitfalls and diagnostic paths, not CLI reference.
 >
 > **Status:** Active.
 
@@ -11,13 +11,17 @@
 
 ## Capturing a Trace
 
-One command:
+Wrap the server process in nsys, then drive load over HTTP from a second shell:
 
 ```bash
-# Example: capture a trace for 1024 prompt + 256 decode, export sqlite directly
+# Shell 1: server under nsys, export sqlite directly
 nsys profile --force-overwrite=true --cuda-graph-trace=node \
   --export=sqlite -o target/profiling/trace \
-  cargo run -r --bin bench_serving -- request --prompt-len 1024 --output-len 256
+  cargo run -r -- --model-path models/Qwen3-4B --port 8000
+
+# Shell 2: drive the load, then Ctrl-C the server to finalize the trace
+python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+  --model models/Qwen3-4B --num-requests 8 --concurrency 2 --max-tokens 256
 ```
 
 Produces `target/profiling/trace.nsys-rep` + `target/profiling/trace.sqlite`. The sqlite file can be analyzed directly with `nsys stats` — no secondary conversion needed.
@@ -89,29 +93,31 @@ For keep/revert decisions, a profile that only reports p50 or avg is incomplete.
 
 ## Standard Optimization Profiles
 
-Two profiles isolate prefill and decode paths for per-model optimization.
+Two load shapes isolate prefill and decode paths for per-model optimization
+(server running; `--prompt-words` controls prompt length approximately):
 
 ```bash
 # Prefill-heavy: TTFT dominates, decode negligible
-cargo run -r --bin bench_serving -- request --prompt-len 2048 --output-len 1
+python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+  --model models/Qwen3-4B --prompt-words 2048 --max-tokens 1
 
 # Decode-heavy: TPOT dominates, prefill negligible
-cargo run -r --bin bench_serving -- request --prompt-len 1 --output-len 128
+python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+  --model models/Qwen3-4B --prompt-words 1 --max-tokens 128
 ```
 
 ## Diagnosing Decode Degradation With Sequence Length
 
-If `bench_serving curve` shows TPOT degrading significantly as context grows, use comparative traces to pinpoint the offending kernel:
+If TPOT degrades significantly as context grows (sweep `--prompt-words` while holding `--max-tokens` fixed), use comparative traces to pinpoint the offending kernel: capture two server traces as above (`-o target/profiling/ctx_short` / `ctx_long`), driving one with a short prompt and one with a long prompt while output tokens stay fixed:
 
 ```bash
-# Fix output tokens, vary only prompt length
-nsys profile --force-overwrite=true --cuda-graph-trace=node \
-  --export=sqlite -o target/profiling/ctx_short \
-  cargo run -r --bin bench_serving -- request --prompt-len 1 --output-len 128 --warmup 1 --iters 1
+# Against the ctx_short server run
+python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+  --model models/Qwen3-4B --prompt-words 1 --max-tokens 128
 
-nsys profile --force-overwrite=true --cuda-graph-trace=node \
-  --export=sqlite -o target/profiling/ctx_long \
-  cargo run -r --bin bench_serving -- request --prompt-len 2048 --output-len 128 --warmup 1 --iters 1
+# Against the ctx_long server run
+python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+  --model models/Qwen3-4B --prompt-words 2048 --max-tokens 128
 ```
 
 Compare the two `cuda_gpu_kern_sum` reports — the kernel with the largest avg time increase is the culprit.

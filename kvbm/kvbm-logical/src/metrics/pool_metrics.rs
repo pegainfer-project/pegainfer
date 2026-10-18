@@ -154,28 +154,13 @@ impl BlockPoolMetrics {
     }
 
     #[inline(always)]
-    pub fn dec_inflight_mutable_by(&self, n: i64) {
-        self.inflight_mutable.fetch_sub(n, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
     pub fn inc_inflight_immutable(&self) {
         self.inflight_immutable.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline(always)]
-    pub fn inc_inflight_immutable_by(&self, n: i64) {
-        self.inflight_immutable.fetch_add(n, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
     pub fn dec_inflight_immutable(&self) {
         self.inflight_immutable.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
-    pub fn dec_inflight_immutable_by(&self, n: i64) {
-        self.inflight_immutable.fetch_sub(n, Ordering::Relaxed);
     }
 
     #[inline(always)]
@@ -186,11 +171,6 @@ impl BlockPoolMetrics {
     #[inline(always)]
     pub fn inc_reset_pool_size(&self) {
         self.reset_pool_size.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
-    pub fn inc_reset_pool_size_by(&self, n: i64) {
-        self.reset_pool_size.fetch_add(n, Ordering::Relaxed);
     }
 
     #[inline(always)]
@@ -211,11 +191,6 @@ impl BlockPoolMetrics {
     #[inline(always)]
     pub fn inc_inactive_pool_size(&self) {
         self.inactive_pool_size.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
-    pub fn inc_inactive_pool_size_by(&self, n: i64) {
-        self.inactive_pool_size.fetch_add(n, Ordering::Relaxed);
     }
 
     #[inline(always)]

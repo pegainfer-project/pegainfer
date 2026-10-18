@@ -15,11 +15,11 @@
   - `.codex/harness/README.md` - confirms the verification ladder and safety boundaries.
   - `.codex/harness/commands.md` - provides Qwen3 e2e, server, and benchmark commands.
   - `.codex/harness/verification.md` - classifies this as serving/scheduler behavior needing a narrow repro plus HTTP/benchmark evidence.
-  - `openinfer-qwen3/src/scheduler.rs` - admission control currently defers requests under KV pressure.
-  - `openinfer-qwen3/src/scheduler/plan.rs` - execution plans currently consume pending requests before failures are handled.
-  - `openinfer-qwen3/src/scheduler/effects.rs` - successful finishes drop request state; scheduler execution errors do not.
-  - `openinfer-qwen3/src/executor.rs` - `drop_request` is the existing owner API for releasing per-request KV state.
-  - `openinfer-core/src/kv_pool.rs` and `openinfer-core/src/page_pool.rs` - KV pages are RAII-returned only when request state is dropped.
+  - `pegainfer-qwen3/src/scheduler.rs` - admission control currently defers requests under KV pressure.
+  - `pegainfer-qwen3/src/scheduler/plan.rs` - execution plans currently consume pending requests before failures are handled.
+  - `pegainfer-qwen3/src/scheduler/effects.rs` - successful finishes drop request state; scheduler execution errors do not.
+  - `pegainfer-qwen3/src/executor.rs` - `drop_request` is the existing owner API for releasing per-request KV state.
+  - `pegainfer-core/src/kv_pool.rs` and `pegainfer-core/src/page_pool.rs` - KV pages are RAII-returned only when request state is dropped.
   - GitHub issue #85 - observed server stays alive but completions hang after QPS=2 KV pressure.
 - **Relevant history**:
   - `docs/subsystems/scheduler/scheduler.md` - QPS=2 varied workload is near capacity and already had some failed requests; the fix must handle pressure explicitly rather than claim higher throughput.
@@ -45,7 +45,7 @@
   - decode errors surfacing as `TokenEvent::Error`, dropping request state, and allowing recovery;
   - client/receiver drop releasing request state.
 - Changed `DecodeEffect::EmitAndContinue` send-failure handling to call `drop_request` before retiring the active request.
-- Result: remote RTX 5090 `cargo test --release -p openinfer-qwen3 --lib scheduler -- --nocapture` passed, `4 passed`.
+- Result: remote RTX 5090 `cargo test --release -p pegainfer-qwen3 --lib scheduler -- --nocapture` passed, `4 passed`.
 
 ### Step 2: Maintainer feedback refinement
 - The maintainer clarified that the basic fix should keep requests that cannot get KV allocation in the waiting queue; preemption can be deferred.
@@ -59,21 +59,21 @@
 ### Step 3: Build and static gates
 - Remote environment:
   - GPU: NVIDIA GeForce RTX 5090, driver `580.76.05`, 32607 MiB.
-  - CUDA: `nvcc` `13.0.88`, `OPENINFER_CUDA_SM=120`.
+  - CUDA: `nvcc` `13.0.88`, `PEGAINFER_CUDA_SM=120`.
   - Rust: `rustc 1.97.0-nightly (7c3c88f42 2026-05-14)`.
   - Model: `models/Qwen3-4B`, HF revision metadata `1cfa9a7208912126459214e8b04321603b3df60c`.
 - Commands:
   - `cargo fmt --check` — passed.
-  - `cargo test --release -p openinfer-qwen3 --lib scheduler -- --nocapture` — passed, `4 passed`.
-  - `cargo clippy --release -p openinfer-qwen3 --lib -- -D warnings` — passed.
-  - `cargo build --release -p openinfer-server` — passed.
+  - `cargo test --release -p pegainfer-qwen3 --lib scheduler -- --nocapture` — passed, `4 passed`.
+  - `cargo clippy --release -p pegainfer-qwen3 --lib -- -D warnings` — passed.
+  - `cargo build --release -p pegainfer-server` — passed.
 - Local command:
   - `~/.cargo/bin/cargo fmt --check` — passed.
 
 ### Step 4: E2E and serving pressure validation
 - Installed `vllm 0.21.0` in the validation venv to run the issue's real `vllm bench serve` client.
 - Ran a host-local exact e2e check against the validation model snapshot:
-  - `OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test e2e -- --nocapture`
+  - `PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B cargo test --release -p pegainfer-qwen3 --test e2e -- --nocapture`
   - Result after local fixture regeneration for that model snapshot: passed, `1 passed`.
   - PR review later found the regenerated fixture was not portable to the standard local model snapshot, so the repository `test_data/Qwen3-4B.json` change was reverted and this e2e result is not used as a merge gate.
 - Ran a small issue-shaped benchmark first:
@@ -90,19 +90,19 @@
 ### Step 5: Compatibility fix encountered during validation
 - Remote CUDA 13.0 initially failed with the existing `cudarc` `cuda-13010` feature because the driver/runtime lacked `cuDevSmResourceSplit`.
 - Kept the workspace on `cuda-13010`; changing the shared `cudarc` feature would widen the PR's collaboration surface beyond issue #85.
-- Fixed `qwen3_decode_context` test-target compilation by linking `cudaProfilerStart/Stop` directly from `cudart`; the symbols were not exposed through `openinfer_core::ffi`.
+- Fixed `qwen3_decode_context` test-target compilation by linking `cudaProfilerStart/Stop` directly from `cudart`; the symbols were not exposed through `pegainfer_core::ffi`.
 
 ### Step 6: Final diff hygiene
 - `git diff --check` — passed.
-- Confirmed the remote openinfer server process was stopped after validation.
+- Confirmed the remote pegainfer server process was stopped after validation.
 
 ### Step 7: Maintainer-style review follow-up
 - Re-reviewed the changed scheduler and bridge paths after the main fix.
 - Found one API-contract issue: `TokenEvent::Rejected` was being translated to vLLM `EngineCoreFinishReason::Stop`, which would make an impossible KV request look like an empty successful response.
-- Changed `openinfer-server/src/vllm_frontend.rs` so `Rejected` maps to `EngineCoreFinishReason::Error` with the rejection message as `stop_reason`.
+- Changed `pegainfer-server/src/vllm_frontend.rs` so `Rejected` maps to `EngineCoreFinishReason::Error` with the rejection message as `stop_reason`.
 - Added `vllm_frontend::tests::rejected_request_is_reported_as_error`.
 - Remote RTX 5090 command:
-  - `cargo test --release -p openinfer-server rejected_request_is_reported_as_error --lib` — passed, `1 passed`.
+  - `cargo test --release -p pegainfer-server rejected_request_is_reported_as_error --lib` — passed, `1 passed`.
 
 ### Step 8: PR review comment follow-up
 - Read PR #131 review comments from `gemini-code-assist`. The comments claimed the KV budget formulas should use `prompt_len + max_tokens` and `prompt_len + generated_count`.

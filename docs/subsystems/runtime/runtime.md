@@ -1,6 +1,6 @@
 # Runtime
 
-> **TL;DR:** Runtime complexity grows fast as new model families come in. We control it by keeping a shared core (`openinfer-core`) that owns the generation contract and orchestration, and pushing model-specific execution into per-model crates behind a single trait. The trait deliberately hides prefill vs decode and homogeneous vs hybrid attention from the caller.
+> **TL;DR:** Runtime complexity grows fast as new model families come in. We control it by keeping a shared core (`pegainfer-core`) that owns the generation contract and orchestration, and pushing model-specific execution into per-model crates behind a single trait. The trait deliberately hides prefill vs decode and homogeneous vs hybrid attention from the caller.
 >
 > **Last touched:** 2026-05.
 
@@ -36,9 +36,9 @@ Design points worth keeping in mind:
 
 ## What's been done
 
-- Shared runtime/API entry extracted into `openinfer-core`: sampler, page/KV pools, weight loading, CUDA Graph state, shared op adapters, `ModelForward` / `GenerationState`.
-- Per-model crates (`openinfer-qwen3`, `openinfer-qwen35-4b`) own their config, weights, prefill/decode execution, scheduler, and tests.
-- Generation loop unified into `openinfer-core` against the trait — replaces ~120 lines of duplicated orchestration per model.
+- Shared runtime/API entry extracted into `pegainfer-core`: sampler, page/KV pools, weight loading, CUDA Graph state, shared op adapters, `ModelForward` / `GenerationState`.
+- Per-model crates (`pegainfer-qwen3`, `pegainfer-qwen35`) own their config, weights, prefill/decode execution, scheduler, and tests.
+- Generation loop unified into `pegainfer-core` against the trait — replaces ~120 lines of duplicated orchestration per model.
 - Internal modules (decode buffers, KV cache, recurrent state, FFI bindings, tokenizer streaming, weight-loader helpers) pulled back behind crate-local visibility. `unreachable_pub` is meaningful again.
 - Trace machinery removed from the active public surface.
 

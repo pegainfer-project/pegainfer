@@ -1,6 +1,6 @@
 # GLM5.2 DSA Indexer Forward (PR2 model-crate)
 
-> **TL;DR:** Wire `openinfer-glm52/src/indexer.rs` — `Glm52IndexerLayerWeights` + `glm52_indexer_forward` — composing the 6 kernel ops already on main (#489) into a DSA decode indexer that produces `topk_indices[2048]`. Aligned to vllm's `DeepseekV32Indexer` (the production reference). Three ops are missing from the repo and must be added: LayerNorm (k_norm, eps=1e-6, with bias), interleaved indexer RoPE (64-dim, q+k), and weights-fold (`weights * q_scale * softmax_scale * n_heads^-0.5`). Oracle gate extends the existing harness (#499) with a `topk_indices` set-overlap assertion. `from_host` only; `from_device` deferred to PR4.
+> **TL;DR:** Wire `pegainfer-glm52/src/indexer.rs` — `Glm52IndexerLayerWeights` + `glm52_indexer_forward` — composing the 6 kernel ops already on main (#489) into a DSA decode indexer that produces `topk_indices[2048]`. Aligned to vllm's `DeepseekV32Indexer` (the production reference). Three ops are missing from the repo and must be added: LayerNorm (k_norm, eps=1e-6, with bias), interleaved indexer RoPE (64-dim, q+k), and weights-fold (`weights * q_scale * softmax_scale * n_heads^-0.5`). Oracle gate extends the existing harness (#499) with a `topk_indices` set-overlap assertion. `from_host` only; `from_device` deferred to PR4.
 >
 > **Last touched:** 2026-07
 
@@ -58,7 +58,7 @@ The oracle harness (`tools/accuracy/glm52_oracle.py`) runs transformers 5.12.1 (
 
 ## Scope
 
-### New model-crate file: `openinfer-glm52/src/indexer.rs`
+### New model-crate file: `pegainfer-glm52/src/indexer.rs`
 
 ```
 Glm52IndexerLayerWeights {
@@ -126,23 +126,23 @@ Extends the existing harness (#499, `tools/accuracy/glm52_oracle.py` + `oracle/m
    - Rust-vs-Rust (regression pin): **sha256 of slots** (same GPU, same kernel → deterministic).
 4. **Short-context regression**: at ctx <= 2048, sparse top-k == full top-k (the PR1 path). Assert the indexer's output matches `[0, 1, ..., position, -1, ...]` exactly.
 
-**Context for the gate**: ctx=4096 (where sparse != full). Requires `OPENINFER_TEST_MODEL_PATH` pointing to the GLM-5.2-FP8 checkpoint and an H200.
+**Context for the gate**: ctx=4096 (where sparse != full). Requires `PEGAINFER_TEST_MODEL_PATH` pointing to the GLM-5.2-FP8 checkpoint and an H200.
 
 ## Build & test
 
 ```bash
 # Build (SM90a, H200)
-export OPENINFER_DEEPGEMM_ROOT=openinfer-kernels/third_party/DeepGEMM/deep_gemm
+export PEGAINFER_DEEPGEMM_ROOT=pegainfer-kernels/third_party/DeepGEMM/deep_gemm
 export CUDA_HOME=/usr/local/cuda
-export OPENINFER_NCCL_ROOT=<path>
-cargo check --release -p openinfer-glm52 --features glm52
+export PEGAINFER_NCCL_ROOT=<path>
+cargo check --release -p pegainfer-glm52 --features glm52
 
 # Smoke test (no checkpoint needed — synthetic input, verify launch + shape)
-cargo test --release -p openinfer-glm52 --features glm52 --lib indexer_smoke -- --nocapture
+cargo test --release -p pegainfer-glm52 --features glm52 --lib indexer_smoke -- --nocapture
 
 # Oracle gate (H200 + checkpoint)
-OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
-  cargo test --release -p openinfer-glm52 --features glm52 --lib indexer_oracle -- --ignored --nocapture
+PEGAINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
+  cargo test --release -p pegainfer-glm52 --features glm52 --lib indexer_oracle -- --ignored --nocapture
 ```
 
 ## Execution plan
@@ -157,7 +157,7 @@ OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
 ## Read
 
 - `docs/models/glm52/oracle-harness.md` — harness design, verification, pitfalls.
-- `openinfer-glm52/src/mla_decode.rs` — PR1 forward pattern to mirror.
+- `pegainfer-glm52/src/mla_decode.rs` — PR1 forward pattern to mirror.
 - `vllm/vllm/models/deepseek_v32/nvidia/attention.py:39-157` — `DeepseekV32Indexer` (alignment target).
 - `vllm/vllm/models/deepseek_v32/nvidia/kernels.py:87-364` — `fused_norm_rope` (k_norm + RoPE + quant + cache fused; reference for the unfused decomposition).
 - `vllm/vllm/model_executor/layers/sparse_attn_indexer.py:295-647` — `sparse_attn_indexer` (DeepGEMM logits + topk + slots).

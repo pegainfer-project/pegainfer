@@ -1,0 +1,601 @@
+//! The tensor contract a config implies.
+
+use std::collections::HashMap;
+use std::fmt;
+
+use anyhow::Result;
+use safetensors::Dtype;
+
+use super::EXPECTED_DTYPE;
+use crate::config::Gemma4Config;
+use crate::config::LayerKind;
+use crate::config::MoeConfig;
+use crate::nvfp4::GROUP as FP4_GROUP;
+use crate::nvfp4::PER_BYTE as FP4_PER_BYTE;
+
+/// Every text tensor lives here, which is what keeps the modality skip list
+/// from shadowing a required one.
+const TEXT_PREFIX: &str = "model.language_model.";
+
+pub(crate) const W4A16_GROUP: usize = 32;
+const W4A16_PER_I32: usize = 8;
+
+pub(crate) struct Matrix2d {
+    pub(crate) name: String,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    /// Where the checkpoint stores this matrix as W4A16 instead of as bf16
+    /// under `name`.
+    pub(crate) w4a16: Option<W4a16Tensors>,
+}
+
+/// compressed-tensors' pack-quantized form of one linear: eight four-bit
+/// values to an int32 along the input axis, a bf16 scale per 32 of them, and
+/// the logical `[rows, cols]`.
+pub(crate) struct W4a16Tensors {
+    pub(crate) packed: TypedTensor,
+    pub(crate) scale: TypedTensor,
+    pub(crate) shape: TypedTensor,
+}
+
+pub(crate) struct Vector1d {
+    pub(crate) name: String,
+    pub(crate) len: usize,
+}
+
+pub(crate) struct AttentionTensors {
+    pub(crate) q_proj: Matrix2d,
+    pub(crate) k_proj: Matrix2d,
+    /// Absent on global layers, which the checkpoint ships without one.
+    pub(crate) v_proj: Option<Matrix2d>,
+    pub(crate) o_proj: Matrix2d,
+    pub(crate) q_norm: Vector1d,
+    pub(crate) k_norm: Vector1d,
+}
+
+/// A tensor the checkpoint stores in something other than the model dtype.
+/// The dense schema implies bf16 everywhere; the routed experts do not, so
+/// they carry their own.
+pub(crate) struct TypedTensor {
+    pub(crate) name: String,
+    pub(crate) shape: ExpectedShape,
+    pub(crate) dtype: Dtype,
+}
+
+/// One projection of one expert, stored as NVFP4: packed values, an e4m3
+/// block scale per [`crate::nvfp4::GROUP`] of them along the reduction axis, a
+/// tensor-level scale, and the activation scale a W4A4 kernel would consume.
+pub(crate) struct QuantMatrix {
+    pub(crate) weight: TypedTensor,
+    pub(crate) weight_scale: TypedTensor,
+    pub(crate) weight_scale_2: TypedTensor,
+    pub(crate) input_scale: TypedTensor,
+}
+
+pub(crate) struct ExpertTensors {
+    pub(crate) gate: QuantMatrix,
+    pub(crate) up: QuantMatrix,
+    pub(crate) down: QuantMatrix,
+}
+
+pub(crate) struct RouterTensors {
+    pub(crate) proj: Matrix2d,
+    pub(crate) scale: Vector1d,
+    pub(crate) per_expert_scale: Vector1d,
+}
+
+/// What a routed layer carries beyond the dense schema. The dense MLP stays
+/// where it is: this size keeps it and adds these alongside.
+pub(crate) struct MoeTensors {
+    pub(crate) pre_feedforward_layernorm_2: Vector1d,
+    pub(crate) post_feedforward_layernorm_1: Vector1d,
+    pub(crate) post_feedforward_layernorm_2: Vector1d,
+    pub(crate) router: RouterTensors,
+    pub(crate) experts: Vec<ExpertTensors>,
+}
+
+pub(crate) struct MlpTensors {
+    pub(crate) gate: Matrix2d,
+    pub(crate) up: Matrix2d,
+    pub(crate) down: Matrix2d,
+}
+
+pub(crate) struct LayerTensors {
+    pub(crate) input_layernorm: Vector1d,
+    pub(crate) post_attention_layernorm: Vector1d,
+    pub(crate) pre_feedforward_layernorm: Vector1d,
+    pub(crate) post_feedforward_layernorm: Vector1d,
+    pub(crate) layer_scalar: Vector1d,
+    pub(crate) attention: AttentionTensors,
+    pub(crate) mlp: MlpTensors,
+    /// Present only on the routing size.
+    pub(crate) moe: Option<MoeTensors>,
+}
+
+pub(crate) struct Manifest {
+    pub(crate) embed_tokens: Matrix2d,
+    /// The W4A16 checkpoints also ship the tied head as a tensor of its own.
+    /// It is checked, not loaded: the config ties it, so the logits read the
+    /// embedding as the reference does.
+    pub(crate) lm_head: Option<Matrix2d>,
+    pub(crate) norm: Vector1d,
+    pub(crate) layers: Vec<LayerTensors>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExpectedShape {
+    Matrix {
+        rows: usize,
+        cols: usize,
+    },
+    Vector {
+        len: usize,
+    },
+    /// Rank zero, which the quantization scales are stored as.
+    Scalar,
+}
+
+impl ExpectedShape {
+    pub(crate) fn matches(self, shape: &[usize]) -> bool {
+        match self {
+            Self::Matrix { rows, cols } => shape == [rows, cols],
+            Self::Vector { len } => shape == [len],
+            Self::Scalar => shape.is_empty(),
+        }
+    }
+
+    fn checked_bytes(self, dtype: Dtype) -> Option<usize> {
+        let elements = match self {
+            Self::Matrix { rows, cols } => rows.checked_mul(cols)?,
+            Self::Vector { len } => len,
+            Self::Scalar => 1,
+        };
+        elements.checked_mul(dtype.bitsize() / 8)
+    }
+}
+
+impl fmt::Display for ExpectedShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Matrix { rows, cols } => write!(f, "[{rows}, {cols}]"),
+            Self::Vector { len } => write!(f, "[{len}]"),
+            Self::Scalar => write!(f, "[]"),
+        }
+    }
+}
+
+impl Matrix2d {
+    fn new(name: String, rows: usize, cols: usize) -> Self {
+        Self {
+            name,
+            rows,
+            cols,
+            w4a16: None,
+        }
+    }
+
+    /// A text-tower linear at `prefix`, stored as the config says.
+    fn linear(config: &Gemma4Config, prefix: &str, rows: usize, cols: usize) -> Result<Self> {
+        let w4a16 = if config.w4a16 {
+            anyhow::ensure!(
+                cols.is_multiple_of(W4A16_GROUP),
+                "Gemma 4: '{prefix}' reduces over {cols} values, not a whole number of \
+                 {W4A16_GROUP}-value groups"
+            );
+            Some(W4a16Tensors {
+                packed: TypedTensor {
+                    name: format!("{prefix}.weight_packed"),
+                    shape: ExpectedShape::Matrix {
+                        rows,
+                        cols: cols / W4A16_PER_I32,
+                    },
+                    dtype: Dtype::I32,
+                },
+                scale: TypedTensor {
+                    name: format!("{prefix}.weight_scale"),
+                    shape: ExpectedShape::Matrix {
+                        rows,
+                        cols: cols / W4A16_GROUP,
+                    },
+                    dtype: Dtype::BF16,
+                },
+                shape: TypedTensor {
+                    name: format!("{prefix}.weight_shape"),
+                    shape: ExpectedShape::Vector { len: 2 },
+                    dtype: Dtype::I64,
+                },
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            name: format!("{prefix}.weight"),
+            rows,
+            cols,
+            w4a16,
+        })
+    }
+
+    fn expected(&self) -> ExpectedShape {
+        ExpectedShape::Matrix {
+            rows: self.rows,
+            cols: self.cols,
+        }
+    }
+}
+
+impl Vector1d {
+    fn new(name: String, len: usize) -> Self {
+        Self { name, len }
+    }
+
+    fn expected(&self) -> ExpectedShape {
+        ExpectedShape::Vector { len: self.len }
+    }
+}
+
+impl Manifest {
+    pub(crate) fn from_config(config: &Gemma4Config) -> Result<Self> {
+        anyhow::ensure!(
+            config.tie_word_embeddings,
+            "Gemma 4: this checkpoint unties the LM head, which the loader has no tensor name for; \
+             every published size ties it to the input embedding"
+        );
+        let hidden = config.hidden_size;
+        let layers = config
+            .layer_types
+            .iter()
+            .enumerate()
+            .map(|(index, &kind)| LayerTensors::new(config, index, kind))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            embed_tokens: Matrix2d::new(
+                format!("{TEXT_PREFIX}embed_tokens.weight"),
+                config.vocab_size,
+                hidden,
+            ),
+            lm_head: config
+                .w4a16
+                .then(|| Matrix2d::new("lm_head.weight".to_string(), config.vocab_size, hidden)),
+            norm: Vector1d::new(format!("{TEXT_PREFIX}norm.weight"), hidden),
+            layers,
+        })
+    }
+
+    pub(super) fn expected_tensors(&self) -> HashMap<&str, (ExpectedShape, Dtype)> {
+        fn matrix(m: &Matrix2d) -> Vec<(&str, (ExpectedShape, Dtype))> {
+            match &m.w4a16 {
+                None => vec![(m.name.as_str(), (m.expected(), EXPECTED_DTYPE))],
+                Some(q) => [&q.packed, &q.scale, &q.shape]
+                    .into_iter()
+                    .map(|t| (t.name.as_str(), (t.shape, t.dtype)))
+                    .collect(),
+            }
+        }
+        fn vector(v: &Vector1d) -> (&str, (ExpectedShape, Dtype)) {
+            (v.name.as_str(), (v.expected(), EXPECTED_DTYPE))
+        }
+        fn typed(t: &TypedTensor) -> (&str, (ExpectedShape, Dtype)) {
+            (t.name.as_str(), (t.shape, t.dtype))
+        }
+        let mut out = HashMap::new();
+        out.extend(matrix(&self.embed_tokens));
+        out.extend(self.lm_head.iter().flat_map(matrix));
+        out.extend([vector(&self.norm)]);
+        for layer in &self.layers {
+            out.extend([
+                vector(&layer.input_layernorm),
+                vector(&layer.post_attention_layernorm),
+                vector(&layer.pre_feedforward_layernorm),
+                vector(&layer.post_feedforward_layernorm),
+                vector(&layer.layer_scalar),
+                vector(&layer.attention.q_norm),
+                vector(&layer.attention.k_norm),
+            ]);
+            for linear in [
+                Some(&layer.attention.q_proj),
+                Some(&layer.attention.k_proj),
+                layer.attention.v_proj.as_ref(),
+                Some(&layer.attention.o_proj),
+                Some(&layer.mlp.gate),
+                Some(&layer.mlp.up),
+                Some(&layer.mlp.down),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                out.extend(matrix(linear));
+            }
+            let Some(moe) = &layer.moe else {
+                continue;
+            };
+            out.extend(matrix(&moe.router.proj));
+            out.extend([
+                vector(&moe.pre_feedforward_layernorm_2),
+                vector(&moe.post_feedforward_layernorm_1),
+                vector(&moe.post_feedforward_layernorm_2),
+                vector(&moe.router.scale),
+                vector(&moe.router.per_expert_scale),
+            ]);
+            for expert in &moe.experts {
+                for projection in [&expert.gate, &expert.up, &expert.down] {
+                    out.extend(projection.tensors().map(typed));
+                }
+            }
+        }
+        out
+    }
+
+    /// Before any allocator rounding.
+    pub(crate) fn weight_bytes(&self) -> Result<usize> {
+        self.expected_tensors()
+            .values()
+            .try_fold(0usize, |total, (shape, dtype)| {
+                shape
+                    .checked_bytes(*dtype)
+                    .and_then(|bytes| total.checked_add(bytes))
+            })
+            .ok_or_else(|| anyhow::anyhow!("Gemma 4: the manifest's total size overflows usize"))
+    }
+}
+
+impl QuantMatrix {
+    /// `reduction` is the axis the block scales run along, in logical values.
+    fn new(prefix: &str, rows: usize, reduction: usize) -> Result<Self> {
+        anyhow::ensure!(
+            reduction.is_multiple_of(FP4_GROUP),
+            "Gemma 4: '{prefix}' reduces over {reduction} values, which is not a whole number of \
+             {FP4_GROUP}-value scale blocks, so the checkpoint's scale shape cannot be derived"
+        );
+        let packed = ExpectedShape::Matrix {
+            rows,
+            cols: reduction / FP4_PER_BYTE,
+        };
+        let scales = ExpectedShape::Matrix {
+            rows,
+            cols: reduction / FP4_GROUP,
+        };
+        Ok(Self {
+            weight: TypedTensor {
+                name: format!("{prefix}.weight"),
+                shape: packed,
+                dtype: Dtype::U8,
+            },
+            weight_scale: TypedTensor {
+                name: format!("{prefix}.weight_scale"),
+                shape: scales,
+                dtype: Dtype::F8_E4M3,
+            },
+            weight_scale_2: TypedTensor {
+                name: format!("{prefix}.weight_scale_2"),
+                shape: ExpectedShape::Scalar,
+                dtype: Dtype::F32,
+            },
+            input_scale: TypedTensor {
+                name: format!("{prefix}.input_scale"),
+                shape: ExpectedShape::Scalar,
+                dtype: Dtype::F32,
+            },
+        })
+    }
+
+    /// Rows, and the logical values each row holds before packing.
+    pub(crate) fn geometry(&self) -> Result<(usize, usize)> {
+        match self.weight.shape {
+            ExpectedShape::Matrix { rows, cols } => Ok((rows, cols * FP4_PER_BYTE)),
+            other => anyhow::bail!(
+                "Gemma 4: '{}' is {other}, which is not a packed matrix",
+                self.weight.name
+            ),
+        }
+    }
+
+    fn tensors(&self) -> [&TypedTensor; 4] {
+        [
+            &self.weight,
+            &self.weight_scale,
+            &self.weight_scale_2,
+            &self.input_scale,
+        ]
+    }
+}
+
+impl MoeTensors {
+    fn new(prefix: &str, hidden: usize, moe: &MoeConfig) -> Result<Self> {
+        let width = moe.intermediate_size;
+        let experts = (0..moe.num_experts)
+            .map(|expert| {
+                let at = format!("{prefix}experts.{expert}");
+                Ok(ExpertTensors {
+                    gate: QuantMatrix::new(&format!("{at}.gate_proj"), width, hidden)?,
+                    up: QuantMatrix::new(&format!("{at}.up_proj"), width, hidden)?,
+                    down: QuantMatrix::new(&format!("{at}.down_proj"), hidden, width)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            pre_feedforward_layernorm_2: Vector1d::new(
+                format!("{prefix}pre_feedforward_layernorm_2.weight"),
+                hidden,
+            ),
+            post_feedforward_layernorm_1: Vector1d::new(
+                format!("{prefix}post_feedforward_layernorm_1.weight"),
+                hidden,
+            ),
+            post_feedforward_layernorm_2: Vector1d::new(
+                format!("{prefix}post_feedforward_layernorm_2.weight"),
+                hidden,
+            ),
+            router: RouterTensors {
+                proj: Matrix2d::new(
+                    format!("{prefix}router.proj.weight"),
+                    moe.num_experts,
+                    hidden,
+                ),
+                scale: Vector1d::new(format!("{prefix}router.scale"), hidden),
+                per_expert_scale: Vector1d::new(
+                    format!("{prefix}router.per_expert_scale"),
+                    moe.num_experts,
+                ),
+            },
+            experts,
+        })
+    }
+}
+
+impl LayerTensors {
+    fn new(config: &Gemma4Config, index: usize, kind: LayerKind) -> Result<Self> {
+        let hidden = config.hidden_size;
+        let prefix = format!("{TEXT_PREFIX}layers.{index}.");
+        let (head_dim, kv_heads) = match kind {
+            LayerKind::Sliding => (config.head_dim, config.num_key_value_heads),
+            LayerKind::Global => (config.global_head_dim, config.num_global_key_value_heads),
+        };
+        // External input, and the probe pins only the head dims.
+        let projection_dim = |heads: usize, what: &str| {
+            heads.checked_mul(head_dim).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Gemma 4 layer {index}: {what} dimension {heads} x {head_dim} overflows usize"
+                )
+            })
+        };
+        let q_dim = projection_dim(config.num_attention_heads, "query")?;
+        let kv_dim = projection_dim(kv_heads, "key/value")?;
+        let linear = |at: String, rows, cols| Matrix2d::linear(config, &at, rows, cols);
+        Ok(Self {
+            input_layernorm: Vector1d::new(format!("{prefix}input_layernorm.weight"), hidden),
+            post_attention_layernorm: Vector1d::new(
+                format!("{prefix}post_attention_layernorm.weight"),
+                hidden,
+            ),
+            pre_feedforward_layernorm: Vector1d::new(
+                format!("{prefix}pre_feedforward_layernorm.weight"),
+                hidden,
+            ),
+            post_feedforward_layernorm: Vector1d::new(
+                format!("{prefix}post_feedforward_layernorm.weight"),
+                hidden,
+            ),
+            layer_scalar: Vector1d::new(format!("{prefix}layer_scalar"), 1),
+            attention: AttentionTensors {
+                q_proj: linear(format!("{prefix}self_attn.q_proj"), q_dim, hidden)?,
+                k_proj: linear(format!("{prefix}self_attn.k_proj"), kv_dim, hidden)?,
+                v_proj: match kind {
+                    LayerKind::Sliding => {
+                        Some(linear(format!("{prefix}self_attn.v_proj"), kv_dim, hidden)?)
+                    }
+                    LayerKind::Global => None,
+                },
+                o_proj: linear(format!("{prefix}self_attn.o_proj"), hidden, q_dim)?,
+                q_norm: Vector1d::new(format!("{prefix}self_attn.q_norm.weight"), head_dim),
+                k_norm: Vector1d::new(format!("{prefix}self_attn.k_norm.weight"), head_dim),
+            },
+            mlp: MlpTensors {
+                gate: linear(
+                    format!("{prefix}mlp.gate_proj"),
+                    config.intermediate_size,
+                    hidden,
+                )?,
+                up: linear(
+                    format!("{prefix}mlp.up_proj"),
+                    config.intermediate_size,
+                    hidden,
+                )?,
+                down: linear(
+                    format!("{prefix}mlp.down_proj"),
+                    hidden,
+                    config.intermediate_size,
+                )?,
+            },
+            moe: config
+                .moe
+                .map(|moe| MoeTensors::new(&prefix, hidden, &moe))
+                .transpose()?,
+        })
+    }
+}
+
+/// Two sliding layers and one global, at the published 12B dimensions.
+#[cfg(test)]
+pub(crate) fn sample_config() -> Gemma4Config {
+    Gemma4Config {
+        hidden_size: 3840,
+        intermediate_size: 15360,
+        vocab_size: 262_144,
+        num_attention_heads: 16,
+        num_key_value_heads: 8,
+        num_global_key_value_heads: 1,
+        head_dim: 256,
+        global_head_dim: 512,
+        layer_types: vec![LayerKind::Sliding, LayerKind::Sliding, LayerKind::Global],
+        tie_word_embeddings: true,
+        moe: None,
+        w4a16: false,
+        rms_norm_eps: 1e-6,
+        sliding_rope_theta: 10_000.0,
+        sliding_window: 1024,
+        max_position_embeddings: 262_144,
+        global_rope_theta: 1_000_000.0,
+        global_rotary_dim: 128,
+        final_logit_softcapping: 30.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sample_config as config;
+    use super::*;
+
+    fn rejection(config: &Gemma4Config) -> String {
+        match Manifest::from_config(config) {
+            Ok(_) => panic!("expected this config to be rejected"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The published 26B dimensions.
+    fn moe_config() -> Gemma4Config {
+        let mut config = config();
+        config.hidden_size = 2816;
+        config.intermediate_size = 2112;
+        config.moe = Some(MoeConfig {
+            num_experts: 128,
+            top_k: 8,
+            intermediate_size: 704,
+        });
+        config
+    }
+
+    #[test]
+    fn a_reduction_that_is_not_whole_scale_blocks_is_refused() {
+        let mut ragged = moe_config();
+        ragged.hidden_size = 2810;
+        let err = rejection(&ragged);
+        assert!(err.contains("scale blocks"), "{err}");
+    }
+
+    #[test]
+    fn an_untied_config_is_rejected_before_any_tensor_is_named() {
+        let mut untied = config();
+        untied.tie_word_embeddings = false;
+        let err = rejection(&untied);
+        assert!(err.contains("unties the LM head"), "{err}");
+    }
+
+    #[test]
+    fn dimensions_that_overflow_are_rejected_rather_than_wrapped() {
+        let mut wide = config();
+        wide.num_attention_heads = usize::MAX;
+        let err = rejection(&wide);
+        assert!(err.contains("overflows usize"), "{err}");
+
+        let mut deep = config();
+        deep.vocab_size = usize::MAX;
+        let err = Manifest::from_config(&deep)
+            .expect("per-tensor shapes are fine; only the total overflows")
+            .weight_bytes()
+            .expect_err("a manifest whose total overflows usize was accepted")
+            .to_string();
+        assert!(err.contains("overflows usize"), "{err}");
+    }
+}

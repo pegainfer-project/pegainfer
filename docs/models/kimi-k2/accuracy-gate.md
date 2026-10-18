@@ -1,6 +1,6 @@
 # Kimi-K2 accuracy gate (vLLM-golden)
 
-**TL;DR**: `openinfer-kimi-k2/tests/vllm_golden_gate.rs` + `test_data/kimi-k2.6-vllm-golden.safetensors` give Kimi-K2 its first accuracy gate reproducible from a fresh clone (#223). Reference is vLLM (same INT4 quantized model, marlin kernels), not HF. Two passes through the public serving path: teacher-forced argmax sweep (prefill numerics, regret rule + two-sided |Δlogprob| bound) and free-greedy decode parity (decode kernels, divergence-classified). The TP1/DP8 path emits exact per-token logprobs (#236), so the gate measures both engines' logprobs of the same token, like the Qwen gates. Needs 8 GPUs + K2.6 weights; fails loudly when prerequisites are missing.
+**TL;DR**: `pegainfer-kimi-k2/tests/vllm_golden_gate.rs` + `test_data/kimi-k2.6-vllm-golden.safetensors` give Kimi-K2 its first accuracy gate reproducible from a fresh clone (#223). Reference is vLLM (same INT4 quantized model, marlin kernels), not HF. Two passes through the public serving path: teacher-forced argmax sweep (prefill numerics, regret rule + two-sided |Δlogprob| bound) and free-greedy decode parity (decode kernels, divergence-classified). The TP1/DP8 path emits exact per-token logprobs (#236), so the gate measures both engines' logprobs of the same token, like the Qwen gates. Needs 8 GPUs + K2.6 weights; fails loudly when prerequisites are missing.
 
 Last touched: 2026-06
 
@@ -9,7 +9,7 @@ Last touched: 2026-06
 Kimi-K2.6 is INT4 (compressed-tensors, pack-quantized). The general methodology
 (`docs/subsystems/correctness/logits-golden-gate.md`) uses HF bf16 as golden —
 for Kimi that is the wrong precision regime: HF decompresses INT4 to bf16 and
-runs dense GEMMs, while both vLLM and openinfer execute the quantized model
+runs dense GEMMs, while both vLLM and pegainfer execute the quantized model
 through marlin-style INT4 kernels. vLLM is the closest equal-precision
 reference, and the same box that runs the gate can regenerate the fixture
 (vLLM 0.22.0 serves K2.6 out of the box).
@@ -27,7 +27,7 @@ asserts through the *real serving path* (DP coordinator → PPLX EP → MLA
 kernels, TP1/DP8/EP8):
 
 1. **Teacher-forced argmax sweep** (prefill numerics): for every tail position
-   `i`, prefill `prompt + vllm_tail[..i]` with `max_tokens=1`. openinfer's
+   `i`, prefill `prompt + vllm_tail[..i]` with `max_tokens=1`. pegainfer's
    pick must satisfy the flatness-scaled regret rule (see Tolerances): the
    allowed distance below vLLM's argmax *in vLLM's own logprobs* grows with
    vLLM's own uncertainty at that position. An aggregate exact-match floor
@@ -43,14 +43,14 @@ kernels, TP1/DP8/EP8):
    bit-identical).
 
 Both passes additionally bound the **two-sided |Δlogprob|** at exact-match
-positions — openinfer's own logprob of the agreed token against vLLM's
+positions — pegainfer's own logprob of the agreed token against vLLM's
 stored one (mean + p99 per pass). Flip positions are excluded from that
 population on purpose: their Δ is structurally larger (the engines disagree
 about a flat distribution, which the regret rule already governs), and
 mixing the populations parks the p99 on the boundary between them — the
 same run-to-run straddling that killed fixed regret thresholds. Flip-pick
 Δ is printed for observability. A per-position internal-consistency check
-(the pick's logprob must equal the head of openinfer's own top-K) catches
+(the pick's logprob must equal the head of pegainfer's own top-K) catches
 GPU-argmax-vs-host-log-softmax disagreement on the same logits.
 
 ## Running it
@@ -62,16 +62,16 @@ GPU-argmax-vs-host-log-softmax disagreement on the same logits.
   --out test_data/kimi-k2.6-vllm-golden.safetensors
 
 # Run the gate (8 GPUs; vLLM must be stopped first — both need the full node):
-OPENINFER_TEST_MODEL_PATH=/data/models/Kimi-K2.6 \
-cargo test -p openinfer-kimi-k2 --features kimi-k2 --release \
+PEGAINFER_TEST_MODEL_PATH=/data/models/Kimi-K2.6 \
+cargo test -p pegainfer-kimi-k2 --features kimi-k2 --release \
   --test vllm_golden_gate -- --nocapture
 ```
 
 Build env on an H200/H20 node: `PATH` must include `/root/.cargo/bin` and
-`/usr/local/cuda/bin`, plus `OPENINFER_CUDA_SM=90a` and
-`OPENINFER_TRITON_PYTHON` (see `docs/models/kimi-k2/tp1-dp8-ep8-performance.md`).
+`/usr/local/cuda/bin`, plus `PEGAINFER_CUDA_SM=90a` and
+`PEGAINFER_TRITON_PYTHON` (see `docs/models/kimi-k2/tp1-dp8-ep8-performance.md`).
 
-There is no silent skip: missing `OPENINFER_TEST_MODEL_PATH` or a missing
+There is no silent skip: missing `PEGAINFER_TEST_MODEL_PATH` or a missing
 fixture panics. (The qwen35 gate's env-gated skip silently reported
 "ok 0.00s" — this gate deliberately does not.)
 
@@ -92,12 +92,12 @@ regret ≤ REGRET_BASE + REGRET_FLATNESS_SLOPE × (−vllm_top1_logprob)
        =      0.30   +        0.35           × (−vllm_top1_logprob)
 ```
 
-where regret = how far openinfer's pick sits below vLLM's argmax in vLLM's
+where regret = how far pegainfer's pick sits below vLLM's argmax in vLLM's
 own logprobs. At a confident position (top-1 ≈ 90%) the bound is ≈ 0.34 nat
 — near-exact agreement; at a flat multi-modal position (top-1 ≈ 11%) it
 reaches ≈ 1.07, because there is no single correct token for cross-engine
 noise to deviate from. The bound depends only on the committed vLLM fixture,
-so openinfer cannot influence its own tolerance.
+so pegainfer cannot influence its own tolerance.
 
 Calibration (three 8×H200 runs, 2026-06-05/06, vLLM 0.22.0 fixture):
 ~98% of positions match exactly in every pass; every cross-engine

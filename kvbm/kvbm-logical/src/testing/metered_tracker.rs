@@ -52,11 +52,6 @@ impl MeteredFrequencyTracker {
         self.touches.load(Ordering::Relaxed)
     }
 
-    /// Total `count()` calls since construction.
-    pub fn count_calls(&self) -> u64 {
-        self.count_calls.load(Ordering::Relaxed)
-    }
-
     /// Reset both counters to zero.
     pub fn reset(&self) {
         self.touches.store(0, Ordering::Relaxed);

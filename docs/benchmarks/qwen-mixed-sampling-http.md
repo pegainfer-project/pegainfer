@@ -13,14 +13,14 @@ Qwen3.5-4B passed the same workload as supplemental evidence.
 
 | Item | Value |
 | --- | --- |
-| Issue | [#412](https://github.com/openinfer-project/openinfer/issues/412) |
+| Issue | [#412](https://github.com/pegainfer-project/pegainfer/issues/412) |
 | GPU | 1x NVIDIA GeForce RTX 5090, 32607 MiB, driver 580.105.08 |
 | Primary model | Qwen3-4B BF16 safetensors, TP1, text-only serving |
 | Supplemental model | Qwen3.5-4B BF16 safetensors, TP1, text-only serving |
-| Server | Existing OpenInfer release binary; `RUST_LOG=info`; not rebuilt during the 2026-06-21 rerun |
+| Server | Existing PegaInfer release binary; `RUST_LOG=info`; not rebuilt during the 2026-06-21 rerun |
 | Client | This branch's `scripts/bench_http_serving.py`, rebased onto `upstream/main` `b66f845` |
 
-PR [#424](https://github.com/openinfer-project/openinfer/pull/424) is the
+PR [#424](https://github.com/pegainfer-project/pegainfer/pull/424) is the
 benchmark-snapshot format precedent; its multi-turn workload is separate. The
 client uses the OpenAI-compatible `temperature`, `top_k`, and `top_p` request
 fields used by `vllm bench serve`, without adding a vLLM dependency.
@@ -28,7 +28,7 @@ fields used by `vllm bench serve`, without adding a vLLM dependency.
 ## Command
 
 ```bash
-RUST_LOG=info openinfer \
+RUST_LOG=info pegainfer \
   --model-path <Qwen3-4B> \
   --served-model-name Qwen3-4B \
   --port 18080
@@ -86,7 +86,7 @@ omitted.
 
 The raw report records per-request `sampling_label`, `temperature`, `top_k`,
 and `top_p`, plus workload and summary sampling counts. This server build did
-not emit `openinfer_http_trace` lines, so TTFT/TPOT/ITL are client-observed
+not emit `pegainfer_http_trace` lines, so TTFT/TPOT/ITL are client-observed
 metrics, not server phase attribution. Qwen3.5-4B is supplemental evidence; the
 table is not a performance comparison between model lines.
 

@@ -122,16 +122,6 @@ impl<T: BlockMetadata> LogicalBlockAssignments<T> {
         self.store.assigned_iter()
     }
 
-    /// Iterates over staged blocks in staging order.
-    pub fn staged_iter(&self) -> impl Iterator<Item = (&BlockId, &CompleteBlock<T>)> {
-        self.store.staged_iter()
-    }
-
-    /// Iterates over unassigned blocks in FIFO order.
-    pub fn unassigned_iter(&self) -> impl Iterator<Item = (&BlockId, &MutableBlock<T>)> {
-        self.store.unassigned_iter()
-    }
-
     /// Iterates over all block IDs across all three collections in lifecycle
     /// order: assigned → staged → unassigned.
     pub fn all_block_ids(&self) -> impl Iterator<Item = &BlockId> {

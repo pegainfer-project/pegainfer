@@ -28,7 +28,7 @@
 ### Step 1: Shared sampling API and kernel cleanup
 
 - Removed the legacy single-row FlashInfer wrapper surface from Rust exports.
-- Deleted the custom single-block `logits_to_probs_kernel` and `gpu_sample_flashinfer_cuda` entry point from `openinfer-kernels/csrc/shared/flashinfer_sampling.cu`.
+- Deleted the custom single-block `logits_to_probs_kernel` and `gpu_sample_flashinfer_cuda` entry point from `pegainfer-kernels/csrc/shared/flashinfer_sampling.cu`.
 - Kept the batched `gpu_sample_batch_flashinfer_cuda` path and moved top1 row-state scratch sizing to `flashinfer_top1_row_states_bytes_cuda()`.
 
 ### Step 2: Qwen decode token selection
@@ -48,17 +48,17 @@
 
 - Local static gates passed: `cargo fmt --all --check`, `git diff --check`, and the old-symbol grep for `gpu_sample_flashinfer_cuda`, `logits_to_probs_kernel`, `u64::from(...to_bits)`, and `FLASHINFER_TOPK_ROW_STATES_BYTES`.
 - Validation machine gates passed:
-  - `cargo check --release --offline -p openinfer-core -p openinfer-kernels`
-  - `cargo check --release --offline -p openinfer-qwen3`
-  - `cargo check --release --offline -p openinfer-qwen35-4b --features qwen35-4b`
-  - `cargo test --release --offline -p openinfer-kernels batch_sampling_top_p_only_small_nucleus_collapses_to_argmax -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen3 --tests --no-run`
-  - `cargo test --release --offline -p openinfer-qwen3 --test hf_golden_gate -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen3 --test sampling_behavior -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b --test sampling_behavior -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b unified_step_decode_matches_graph_decode -- --nocapture`
-  - `cargo test --release --offline -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler -- --nocapture`
+  - `cargo check --release --offline -p pegainfer-core -p pegainfer-kernels`
+  - `cargo check --release --offline -p pegainfer-qwen3`
+  - `cargo check --release --offline -p pegainfer-qwen35 --features qwen35`
+  - `cargo test --release --offline -p pegainfer-kernels batch_sampling_top_p_only_small_nucleus_collapses_to_argmax -- --nocapture`
+  - `cargo test --release --offline -p pegainfer-qwen3 --tests --no-run`
+  - `cargo test --release --offline -p pegainfer-qwen3 --test hf_golden_gate -- --nocapture`
+  - `cargo test --release --offline -p pegainfer-qwen3 --test sampling_behavior -- --nocapture`
+  - `cargo test --release --offline -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate -- --nocapture`
+  - `cargo test --release --offline -p pegainfer-qwen35 --features qwen35 --test sampling_behavior -- --nocapture`
+  - `cargo test --release --offline -p pegainfer-qwen35 --features qwen35 unified_step_decode_matches_graph_decode -- --nocapture`
+  - `cargo test --release --offline -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture`
 - Qwen3.5 scheduler e2e now alternates greedy and sampled requests in the concurrent phase, so the real decode batch covers mixed token-selection rows.
 - Qwen3.5 `sampling_behavior` now proves `temperature` / `top_k` / `top_p` still steer the scheduler path, `top_k=1` and tiny `top_p` collapse to greedy, and hot sampling still varies across runs.
 - `nsys profile --trace=cuda,nvtx --cuda-graph-trace=node --export=sqlite` on the Qwen3.5 mixed scheduler test showed:

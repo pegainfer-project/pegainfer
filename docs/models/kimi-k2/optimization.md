@@ -6,7 +6,7 @@
 
 ## Goal
 
-OpenInfer Kimi-K2 端到端延迟和吞吐在同 H20 ×8 配置上达到或超过 vLLM 0.19.0 baseline，并保留 greedy token-id parity 作为 keep/revert 硬 gate。**当前重点是 decode 性能**，prefill 与 decode 主线并行改，但不优先。
+PegaInfer Kimi-K2 端到端延迟和吞吐在同 H20 ×8 配置上达到或超过 vLLM 0.19.0 baseline，并保留 greedy token-id parity 作为 keep/revert 硬 gate。**当前重点是 decode 性能**，prefill 与 decode 主线并行改，但不优先。
 
 阶段路线（前两步已落地，TP1+DP8+EP8 是当前 active line）：
 
@@ -29,13 +29,13 @@ OpenInfer Kimi-K2 端到端延迟和吞吐在同 H20 ×8 配置上达到或超�
 
 ## E2E Dashboard（TP8+EP8 历史 bring-up 口径）
 
-> 这一节是 TP8+EP8 NCCL graph 路径的历史 dashboard，concurrency 锁在 bs4。它记录的是 bring-up 阶段的 keep/revert gate，不是当前 serving cap。**当前 active line（TP1+DP8+EP8）decode batch cap 是 64**，bucketed `[1,2,4,8,16,32,64]`（`KIMI_RUNNER_MAX_BATCH = 64`，`openinfer-kimi-k2/src/runner/scheduler.rs`），bs64 service 数据见 [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md) / [roadmap.md](roadmap.md)。
+> 这一节是 TP8+EP8 NCCL graph 路径的历史 dashboard，concurrency 锁在 bs4。它记录的是 bring-up 阶段的 keep/revert gate，不是当前 serving cap。**当前 active line（TP1+DP8+EP8）decode batch cap 是 64**，bucketed `[1,2,4,8,16,32,64]`（`KIMI_RUNNER_MAX_BATCH = 64`，`pegainfer-kimi-k2/src/runner/scheduler.rs`），bs64 service 数据见 [tp1-dp8-ep8-performance.md](tp1-dp8-ep8-performance.md) / [roadmap.md](roadmap.md)。
 
-GPU: 8× NVIDIA H20。Model: Kimi-K2.5 (Kimi-K2.6 同架构权重，K2.5 是当时 H20 验证路径)。vLLM: 0.19.0。**vLLM 是 TP1+DP8+EP8 形态**，跟当时 openinfer 的 TP8+EP8 形态不同——这不是 apples-to-apples，是两条不同 sharding 路线在同硬件下的 baseline 对照（参见 [vllm-h20-baseline.md](vllm-h20-baseline.md)）。
+GPU: 8× NVIDIA H20。Model: Kimi-K2.5 (Kimi-K2.6 同架构权重，K2.5 是当时 H20 验证路径)。vLLM: 0.19.0。**vLLM 是 TP1+DP8+EP8 形态**，跟当时 pegainfer 的 TP8+EP8 形态不同——这不是 apples-to-apples，是两条不同 sharding 路线在同硬件下的 baseline 对照（参见 [vllm-h20-baseline.md](vllm-h20-baseline.md)）。
 
-In-process bench（openinfer 自带 `bench_serving request`）：
+In-process bench（pegainfer 自带 `bench_serving request`）：
 
-| Profile | Metric | openinfer | 备注 |
+| Profile | Metric | pegainfer | 备注 |
 | --- | --- | --- | --- |
 | short-prompt streaming (~30 tok in, free out) | TTFT | `1995.5ms` | HTTP `/v1/completions` 端到端 |
 | short-prompt streaming (~30 tok in, free out) | TPOT | `14.48ms` (≈30.8 tok/s) | HTTP |
@@ -46,11 +46,11 @@ In-process bench（openinfer 自带 `bench_serving request`）：
 
 HTTP bench 同 client（`vllm bench serve`），decode-heavy profile（input=1, output=128, ignore-eos, bs=4）：
 
-| Metric | openinfer TP8+EP8 | vLLM TP1+DP8+EP8 | delta |
+| Metric | pegainfer TP8+EP8 | vLLM TP1+DP8+EP8 | delta |
 | --- | ---: | ---: | --- |
-| TPOT median | `19.13ms` | `24.97ms` | openinfer −23% |
-| TPOT p99    | `23.63ms` | `29.46ms` | openinfer −20% |
-| ITL median  | `17.42ms` | `23.02ms` | openinfer −24% |
+| TPOT median | `19.13ms` | `24.97ms` | pegainfer −23% |
+| TPOT p99    | `23.63ms` | `29.46ms` | pegainfer −20% |
+| ITL median  | `17.42ms` | `23.02ms` | pegainfer −24% |
 | TTFT median | `313.10ms` | `69.60ms` | **vLLM 4.5× 更低** |
 | TTFT p99    | `4239.97ms` | `135.40ms` | **vLLM 31× 更低** |
 | Output tok/s | `159.99` | `157.94` | 同量级 |
@@ -59,7 +59,7 @@ HTTP bench 同 client（`vllm bench serve`），decode-heavy profile（input=1, 
 
 - in-process bench 来自 `target/release/bench_serving request --cuda-graph true ...`，已过四并发 vLLM fixture greedy gate，不会被 prompt prefill 吃掉。
 - 短 prompt streaming TTFT 是 OpenAI-compatible `/v1/completions` 端到端窗口（含 first-collective stream drain、scheduler、frontend），不是纯 prefill GPU time；prefill 阶段拆分还没开始（见 Open 章节）。
-- HTTP bench 是用同一份 `vllm bench serve --backend openai --endpoint /v1/completions` 分别打 openinfer 和 vLLM server，保证 client / metric 定义一致。vLLM TP1+DP8+EP8 完整 bs 1..256 扫描见 [vllm-h20-baseline.md](vllm-h20-baseline.md)。
+- HTTP bench 是用同一份 `vllm bench serve --backend openai --endpoint /v1/completions` 分别打 pegainfer 和 vLLM server，保证 client / metric 定义一致。vLLM TP1+DP8+EP8 完整 bs 1..256 扫描见 [vllm-h20-baseline.md](vllm-h20-baseline.md)。
 - **HTTP 19.13 vs in-process 14.39 差 4.74ms / token，~33% overhead** —— frontend / streaming 不该这么多，已记录到 Open 章节作为独立查询项。
 
 ## Architecture
@@ -273,7 +273,7 @@ Marlin 数字是 synthetic all-local route 假设，不是真实 EP8 全局 rout
 
 **Bottleneck:** H20 固定 4 并发 fixture `max_tokens=16` 时 row1 偶发输出 `[1008,2742,924,6454,...]`（应为 `[1008,2742,2531,414,...]`）。Per-phase row first-diff 把切点收缩到 layer1 routed expert path，最早是 `moe_w13_out`。
 
-**Root cause:** OpenInfer Marlin WNA16 wrapper 固定 `use_atomic_add=true` 且没传 `c_tmp`。当 split-K > 1 时，kernel 用 BF16 `atomicAdd` 直接累加进 output C；BF16 atomic 在 H20 上对累加顺序敏感，rank/token 之间的非确定性 ordering 把 row state 弄花。vLLM 自己的 `fused_marlin_moe.py` 对 W13 和 W2 都传 `use_atomic_add=False, use_fp32_reduce=True`，走 global F32 `c_tmp` 累加。
+**Root cause:** PegaInfer Marlin WNA16 wrapper 固定 `use_atomic_add=true` 且没传 `c_tmp`。当 split-K > 1 时，kernel 用 BF16 `atomicAdd` 直接累加进 output C；BF16 atomic 在 H20 上对累加顺序敏感，rank/token 之间的非确定性 ordering 把 row state 弄花。vLLM 自己的 `fused_marlin_moe.py` 对 W13 和 W2 都传 `use_atomic_add=False, use_fp32_reduce=True`，走 global F32 `c_tmp` 累加。
 
 **Approach:** worker / decode arena 预分配 `c_tmp` F32 buffer，Marlin launch 切到 vLLM 的 global-reduce 路径（`use_atomic_add=false`），output / locks 在 step 边界 zero-fill。
 

@@ -1,0 +1,4 @@
+# Pre-generated TileLang artifacts (tier 2). Build output, never checked in:
+# regenerate with `generate.py --out-dir pregen --vendor-includes`.
+pregen/
+__pycache__/

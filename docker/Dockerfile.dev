@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1.7
+
+# Override this build argument to test a newer toolkit without editing the file.
+ARG CUDA_IMAGE=nvidia/cuda:13.2.0-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+
+ARG CUDA_IMAGE
+ARG DEBIAN_FRONTEND=noninteractive
+ARG DEV_USER=pegainfer
+ARG DEV_UID=1000
+ARG DEV_GID=1000
+ARG TRITON_VERSION=3.7.1
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+LABEL org.pegainfer.cuda-image="${CUDA_IMAGE}"
+
+# Keep this list in sync with scripts/setup_dev.sh. libnccl-dev/libnccl2 come
+# from the NVIDIA apt repository already configured by the CUDA base image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        git \
+        libclang-dev \
+        libibverbs-dev \
+        libnccl-dev \
+        libnccl2 \
+        libprotobuf-dev \
+        libssl-dev \
+        ninja-build \
+        pkg-config \
+        protobuf-compiler \
+        python3 \
+        python3-dev \
+        python3-venv \
+        sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Give PegaInfer one stable NCCL location on every architecture. This prevents
+# the build from finding a new header while the runtime loader finds an older
+# libnccl.so from another Python or system environment.
+RUN multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
+    && mkdir -p /opt/nccl/include /opt/nccl/lib \
+    && ln -s /usr/include/nccl.h /opt/nccl/include/nccl.h \
+    && ln -s "/usr/lib/${multiarch}/libnccl.so" /opt/nccl/lib/libnccl.so \
+    && ln -s "/usr/lib/${multiarch}/libnccl.so.2" /opt/nccl/lib/libnccl.so.2 \
+    && printf '#include <nccl.h>\nint main(void) { return NCCL_VERSION_CODE < 23004; }\n' \
+        >/tmp/check_nccl.c \
+    && cc -I/usr/local/cuda/include /tmp/check_nccl.c -o /tmp/check_nccl \
+    && /tmp/check_nccl \
+    && rm -f /tmp/check_nccl /tmp/check_nccl.c
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV PEGAINFER_NCCL_ROOT=/opt/nccl
+ENV LD_LIBRARY_PATH=/opt/nccl/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+ENV UV_LINK_MODE=copy
+
+# Match the host UID/GID so bind-mounted source and caches remain writable.
+RUN if getent passwd "${DEV_UID}" >/dev/null; then userdel -f "$(getent passwd "${DEV_UID}" | cut -d: -f1)"; fi \
+    && if getent group "${DEV_GID}" >/dev/null; then groupdel "$(getent group "${DEV_GID}" | cut -d: -f1)"; fi \
+    && groupadd --gid "${DEV_GID}" "${DEV_USER}" \
+    && useradd --uid "${DEV_UID}" --gid "${DEV_GID}" --create-home --shell /bin/bash "${DEV_USER}" \
+    && echo "${DEV_USER} ALL=(root) NOPASSWD:ALL" >"/etc/sudoers.d/${DEV_USER}" \
+    && chmod 0440 "/etc/sudoers.d/${DEV_USER}"
+
+ARG TILELANG_VERSION=0.1.12
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv venv --python python3 /opt/pegainfer-venv \
+    && uv pip install --python /opt/pegainfer-venv/bin/python \
+        "triton==${TRITON_VERSION}" \
+        "tilelang==${TILELANG_VERSION}" \
+    && /opt/pegainfer-venv/bin/python -c \
+        "import tilelang, triton; print(f'tilelang={tilelang.__version__} triton={triton.__version__}')" \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | env RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo sh -s -- \
+            -y --default-toolchain none --profile minimal \
+    && chmod -R a+rX /opt/rustup /opt/cargo \
+    && chmod a+rx /opt/cargo/bin/*
+
+ENV RUSTUP_HOME=/opt/rustup
+ENV CARGO_HOME=/opt/cargo
+ENV PEGAINFER_TRITON_PYTHON=/opt/pegainfer-venv/bin/python
+ENV PEGAINFER_TILELANG_PYTHON=/opt/pegainfer-venv/bin/python
+ENV PATH=/opt/cargo/bin:/usr/local/cuda/bin:/usr/local/bin:${PATH}
+
+WORKDIR /workspace/pegainfer
+COPY rust-toolchain.toml /tmp/pegainfer-rust-toolchain.toml
+RUN cd /tmp \
+    && rustup toolchain install \
+        "$(sed -n 's/^channel = "\(.*\)"/\1/p' /tmp/pegainfer-rust-toolchain.toml)" \
+        --component rustfmt \
+        --component clippy \
+    && rm -f /tmp/pegainfer-rust-toolchain.toml \
+    && chown -R "${DEV_UID}:${DEV_GID}" /opt/cargo
+
+USER ${DEV_USER}
+CMD ["/bin/bash"]

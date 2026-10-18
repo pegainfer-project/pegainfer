@@ -1,7 +1,0 @@
-#define GLM52_TP_RANKS 8
-#define GLM52_TP_SLICE_ROWS 512
-#define GLM52_TP_SLICE_I 256
-#define GLM52_TP_ABI_PREFIX glm52_moe_tp8
-#define GLM52_TP_BLACKWELL_GEMM_B_BLOCKS_PER_SM 0
-#define GLM52_TP_BLACKWELL_GEMM_C_BLOCKS_PER_SM 0
-#include "glm52_moe_tp_impl.cuh"

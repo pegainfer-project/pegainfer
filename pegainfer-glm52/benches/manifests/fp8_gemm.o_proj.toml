@@ -1,0 +1,22 @@
+unit = "fp8_gemm.o_proj"
+# rows>8 wide route (#812): o_proj runs this fp8 GEMM past FP8_GEMV_MAX_ROWS=8.
+phase = 1
+symbol = "glm52_fp8_groupwise_gemm_sm100_cuda"
+adapter = "fp8_gemm_groupwise"
+capability = { blackwell_only = true }
+scratch = "32 MiB CUTLASS grouped-scheduler/tensormap workspace carved inside the FFI (fp8.rs FP8_GEMM_WORKSPACE_BYTES); allocated as bench warmup material, never timed"
+[axes]
+rows = [4, 8, 16, 32, 48, 64, 96]
+[shape]
+n = 6144   # o_proj [hidden=6144, heads*q_head=64*256=16384]
+k = 16384
+[contract]
+inputs = "act e4m3 [rows, 16384] + act_scales f32 [rows, 128] (refs/quant.fp8_per_token_group_quant_ref, ue8m0 off); weight e4m3 [6144, 16384] + weight_scales f32 [48, 128]; workspace 32 MiB (= fp8.rs FP8_GEMM_WORKSPACE_BYTES)"
+outputs = "out[rows, 6144] bf16"
+accumulation = "f32 (CUTLASS tcgen05 block-scaled MMA; fixed hardware writeback order)"
+notes = "Long-k weight-bound shape — the GEMM leg for the mla_front GEMV chain's o_proj. FFI requires m%4==0 and k%128==0; targets outside the sm_100a family compile to a NOT_SUPPORTED stub."
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "Same dequant-to-f32 single-matmul reference as fp8_gemm.q_b; MEASURED rel_l2 <= 9.1e-5 across the full rows axis (GB300 sm_103 tray03, 2026-08-01)"

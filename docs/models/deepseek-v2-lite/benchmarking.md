@@ -8,7 +8,7 @@
 
 | Layer | Entry point | Proves | Does not prove |
 | --- | --- | --- | --- |
-| Correctness / integration | `openinfer-deepseek-v2-lite/tests/e2e_ep2.rs` | EP2 load, host-staged/NCCL generation, request isolation, output tokens/text/hashes, route and collective accounting | Latency, throughput, SLO, soak, production readiness |
+| Correctness / integration | `pegainfer-deepseek-v2-lite/tests/e2e_ep2.rs` | EP2 load, host-staged/NCCL generation, request isolation, output tokens/text/hashes, route and collective accounting | Latency, throughput, SLO, soak, production readiness |
 | Direct diagnostic | `dsv2_lite_ep2_decode_attribution` | Fixed-shape CPU/CUDA section timing, route/collective counters, graph-readiness diagnostics | HTTP behavior, client pressure, serving SLO |
 | HTTP serving SLO | `scripts/bench_dsv2lite_http_slo.py` over the shared HTTP harness | Streaming TTFT/TPOT/ITL, request/output throughput, failures/timeouts, server trace coverage, output hashes, repeat spread | Direct-kernel attribution, sustained soak, production readiness |
 | Soak / production readiness | Separate sustained-run gate | Memory drift, long-duration tails, recovery and deployment limits | Out of scope for issue #466 |
@@ -19,21 +19,21 @@ The following is a remote-GPU template. Replace `MODEL_PATH` and, on Blackwell, 
 
 ```bash
 # Template: requires two GPUs and DeepSeek-V2-Lite weights.
-OPENINFER_TEST_MODEL_PATH=MODEL_PATH \
-OPENINFER_DSV2_LITE_EP_BACKEND=host-staged \
-  cargo test --release -p openinfer-deepseek-v2-lite \
+PEGAINFER_TEST_MODEL_PATH=MODEL_PATH \
+PEGAINFER_DSV2_LITE_EP_BACKEND=host-staged \
+  cargo test --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
-OPENINFER_TEST_MODEL_PATH=MODEL_PATH \
-OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
-OPENINFER_NCCL_LIB_DIR=NCCL_LIB_DIR \
-  cargo test --release -p openinfer-deepseek-v2-lite \
+PEGAINFER_TEST_MODEL_PATH=MODEL_PATH \
+PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
+PEGAINFER_NCCL_LIB_DIR=NCCL_LIB_DIR \
+  cargo test --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 ```
 
 The JSON emitted by this test uses `report_intent=correctness_integration` and carries an explicit no-performance claim boundary. Use the same-host HF comparison in `hf-accuracy-gate.md` for accuracy-sensitive changes.
 
-On `sm_120`, the DSV2-Lite NCCL backend fails before communicator creation when the loaded NCCL is older than `2.26.2`. NCCL 2.26.2 contains NVIDIA's shared-memory fix for recent Blackwell GPUs ([NVIDIA/nccl#1637](https://github.com/NVIDIA/nccl/issues/1637)); older releases can exceed the device/function shared-memory limit when launching collectives. Set `OPENINFER_NCCL_LIB_DIR` or `OPENINFER_NCCL_PYTHON` to select a compatible runtime when the process environment does not already expose one. The backend also scans Python executables on `PATH` for `nvidia/nccl/lib/libnccl.so.2`, so a conda or venv Python with the `nvidia-nccl-cu12` wheel can satisfy the floor without an extra selector. This startup floor is specific to `sm_120`, not older GPU architectures.
+On `sm_120`, the DSV2-Lite NCCL backend fails before communicator creation when the loaded NCCL is older than `2.26.2`. NCCL 2.26.2 contains NVIDIA's shared-memory fix for recent Blackwell GPUs ([NVIDIA/nccl#1637](https://github.com/NVIDIA/nccl/issues/1637)); older releases can exceed the device/function shared-memory limit when launching collectives. Set `PEGAINFER_NCCL_LIB_DIR` or `PEGAINFER_NCCL_PYTHON` to select a compatible runtime when the process environment does not already expose one. The backend also scans Python executables on `PATH` for `nvidia/nccl/lib/libnccl.so.2`, so a conda or venv Python with the `nvidia-nccl-cu12` wheel can satisfy the floor without an extra selector. This startup floor is specific to `sm_120`, not older GPU architectures.
 
 ## Direct Diagnostic Benchmark
 
@@ -41,9 +41,9 @@ This is a remote-GPU template:
 
 ```bash
 # Template: direct/in-process diagnostic, no HTTP server involved.
-OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
-OPENINFER_NCCL_LIB_DIR=NCCL_LIB_DIR \
-  cargo run --release -p openinfer-deepseek-v2-lite \
+PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
+PEGAINFER_NCCL_LIB_DIR=NCCL_LIB_DIR \
+  cargo run --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite \
   --bin dsv2_lite_ep2_decode_attribution \
   -- --model-path MODEL_PATH --commit COMMIT --batch-size 8 \
@@ -75,19 +75,19 @@ Run one backend at a time. These are remote-GPU templates:
 ```bash
 # Template: host-staged server.
 RUST_LOG=info \
-OPENINFER_DSV2_LITE_EP_BACKEND=host-staged \
-  cargo run --release -p openinfer-server \
-  --features deepseek-v2-lite --bin openinfer -- \
+PEGAINFER_DSV2_LITE_EP_BACKEND=host-staged \
+  cargo run --release -p pegainfer-server \
+  --features deepseek-v2-lite --bin pegainfer -- \
   --model-path MODEL_PATH --served-model-name DeepSeek-V2-Lite \
   --port 18000 --cuda-graph=false \
   > artifacts/bench/dsv2-lite/RUN_ID/host-staged/server.log 2>&1
 
 # Template: NCCL server. Use the verified runtime selector on Blackwell.
 RUST_LOG=info \
-OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
-OPENINFER_NCCL_LIB_DIR=NCCL_LIB_DIR \
-  cargo run --release -p openinfer-server \
-  --features deepseek-v2-lite --bin openinfer -- \
+PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
+PEGAINFER_NCCL_LIB_DIR=NCCL_LIB_DIR \
+  cargo run --release -p pegainfer-server \
+  --features deepseek-v2-lite --bin pegainfer -- \
   --model-path MODEL_PATH --served-model-name DeepSeek-V2-Lite \
   --port 18000 --cuda-graph=false \
   > artifacts/bench/dsv2-lite/RUN_ID/nccl/server.log 2>&1
@@ -149,9 +149,9 @@ Regenerate the retained report when its profile, schema, or measurement contract
 
 ### Issue #466 Follow-Up NCCL Readiness Smoke
 
-The retained #466 report exposed a runtime blocker outside the report tooling: with `OPENINFER_DSV2_LITE_EP_BACKEND=nccl` and no explicit NCCL selector, the server could load the system `libnccl.so.2` `2.25.1` on 2x RTX 5090 and fail before readiness. The focused fix keeps explicit `OPENINFER_NCCL_*` selectors fail-fast, then scans executable Python binaries found on `PATH` for NCCL wheel roots before falling back to generic library names. If an auto-discovered PATH candidate loads but fails the sm_120 NCCL version floor, the loader records it and continues to the next auto candidate. On the validation host, that resolved `<conda-root>/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2` and loaded NCCL `2.26.2`.
+The retained #466 report exposed a runtime blocker outside the report tooling: with `PEGAINFER_DSV2_LITE_EP_BACKEND=nccl` and no explicit NCCL selector, the server could load the system `libnccl.so.2` `2.25.1` on 2x RTX 5090 and fail before readiness. The focused fix keeps explicit `PEGAINFER_NCCL_*` selectors fail-fast, then scans executable Python binaries found on `PATH` for NCCL wheel roots before falling back to generic library names. If an auto-discovered PATH candidate loads but fails the sm_120 NCCL version floor, the loader records it and continues to the next auto candidate. On the validation host, that resolved `<conda-root>/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2` and loaded NCCL `2.26.2`.
 
-Validation was run on `upstream/main@d083b745699f527186baed1e61225e4c86965486` plus the focused fix, with `OPENINFER_CUDA_SM=120`, 2x RTX 5090, and no `OPENINFER_NCCL_PYTHON`, `OPENINFER_NCCL_LIB_DIR`, `OPENINFER_NCCL_LIB`, `OPENINFER_NCCL_LIBRARY_PATH`, `CONDA_PREFIX`, or `VIRTUAL_ENV` for the NCCL runs:
+Validation was run on `upstream/main@d083b745699f527186baed1e61225e4c86965486` plus the focused fix, with `PEGAINFER_CUDA_SM=120`, 2x RTX 5090, and no `PEGAINFER_NCCL_PYTHON`, `PEGAINFER_NCCL_LIB_DIR`, `PEGAINFER_NCCL_LIB`, `PEGAINFER_NCCL_LIBRARY_PATH`, `CONDA_PREFIX`, or `VIRTUAL_ENV` for the NCCL runs:
 
 | Gate | Artifact basename | SHA-256 / key result | Boundary |
 | --- | --- | --- | --- |

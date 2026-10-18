@@ -1,0 +1,8 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-build"
+publish = false
+
+[dev-dependencies]
+tempfile = { workspace = true }

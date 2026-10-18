@@ -4,8 +4,8 @@
 
 [files]
 extend-exclude = [
-  "openinfer-kernels/third_party/",
-  "openinfer-kernels/csrc/kimi_k2/vllm_marlin/",
+  "pegainfer-kernels/third_party/",
+  "pegainfer-kernels/csrc/marlin/vllm_marlin/",
   "**/*.cubin",
   "Cargo.lock",
 ]

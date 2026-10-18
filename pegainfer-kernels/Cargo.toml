@@ -1,0 +1,54 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-kernels"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+cudarc = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+tvm-ffi = { version = "0.1.0-alpha.0", optional = true }
+
+[dev-dependencies]
+# RLIMIT_FSIZE, to produce a real short write in the algo-store test.
+libc = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
+pegainfer-build = { workspace = true }
+
+[features]
+default = []
+tvm-ffi-triton-cubin = ["dep:tvm-ffi", "qwen35"]
+# Qwen3.5 Triton AOT kernels (GDR chunkwise prefill) — the only feature that
+# needs Python + Triton at build time.
+deepseek-v2-lite = []
+# Gemma 4: NVFP4 dequantization, whose conversion intrinsics need CUDA >= 12.8,
+# and the TileLang-generated hd512 global-attention prefill.
+gemma4 = []
+qwen35 = []
+# Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
+glm52 = ["moe"]
+# Kimi K3: TileLang-generated kernels, FP8xFP4 masked grouped GEMM, and the
+# MegaMoE fused EP kernel (NVLink peer access, no DeepEP/NCCL substrate).
+k3 = []
+kimi-k2 = ["moe"]
+moe = []
+
+[[example]]
+name = "triton_cubin_tvm_ffi"
+required-features = ["tvm-ffi-triton-cubin"]
+
+[[example]]
+name = "hd512_prefill_bench"
+required-features = ["gemma4"]
+
+[[example]]
+name = "hd512_decode_bench"
+required-features = ["gemma4"]
+
+[lints]
+workspace = true

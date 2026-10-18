@@ -4,7 +4,7 @@
 One renderer for both dot dialects we produce, so every engineer gets the
 same image from the same input:
 
-  - openinfer detailed dot (from `openinfer --dump-graph-png`, the .dot sidecar)
+  - pegainfer detailed dot (from `pegainfer --dump-graph-png`, the .dot sidecar)
   - CUDA `cudaGraphDebugDotPrint` verbose dot (e.g. dumped from vLLM)
 
 Repeated per-layer kernel blocks are detected by label signature and folded
@@ -43,7 +43,7 @@ COLORS = {
     "flashinfer": "#f9d9b0",
     "triton": "#c8e6c9",
     "vllm": "#e1cff0",
-    "openinfer": "#e1cff0",
+    "pegainfer": "#e1cff0",
     "memop": "#e0e0e0",
     "other": "#f5f5f5",
 }
@@ -83,9 +83,9 @@ def compact_name(demangled):
     m = re.match(r"(?:void )?vllm::(?:\w+::)*(\w+)", d)
     if m:
         return f"vllm {m.group(1).removesuffix('_kernel')}", "vllm"
-    m = re.match(r"(?:void )?openinfer::(?:\w+::)*(\w+)", d)
+    m = re.match(r"(?:void )?pegainfer::(?:\w+::)*(\w+)", d)
     if m:
-        return f"openinfer {m.group(1).removesuffix('Kernel')}", "openinfer"
+        return f"pegainfer {m.group(1).removesuffix('Kernel')}", "pegainfer"
     if d.startswith("triton"):
         return d.rstrip("_0123456789") or d, "triton"
     base = re.sub(r"<.*", "", d.split("(")[0]).strip().split()[-1]
@@ -144,8 +144,8 @@ def parse_cuda_debug_dot(text):
     return nodes, edges
 
 
-def parse_openinfer_dot(text):
-    """openinfer detailed sidecar: nN [label="id=..\\ntype=..\\nname=..\\n.."]."""
+def parse_pegainfer_dot(text):
+    """pegainfer detailed sidecar: nN [label="id=..\\ntype=..\\nname=..\\n.."]."""
     # edges also carry [label="from_port=..."]; anchor on the id= body so an
     # edge's target node is never re-parsed as a node definition
     node_re = re.compile(r'^\s*(n\d+) \[label="(id=.*?)"\];?', re.S | re.M)
@@ -482,9 +482,9 @@ def main():
     if "topoId" in text:
         nodes, edges = parse_cuda_debug_dot(text)
     elif "raw_symbol=" in text:
-        nodes, edges = parse_openinfer_dot(text)
+        nodes, edges = parse_pegainfer_dot(text)
     else:
-        sys.exit("error: unrecognized dot dialect (expected cudaGraphDebugDotPrint or openinfer detailed dot)")
+        sys.exit("error: unrecognized dot dialect (expected cudaGraphDebugDotPrint or pegainfer detailed dot)")
     if not nodes:
         sys.exit("error: no graph nodes parsed")
 

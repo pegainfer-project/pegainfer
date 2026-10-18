@@ -1,5 +1,0 @@
-# dynamo-runtime calls tokio unstable runtime-metrics APIs, so it only compiles
-# with this cfg. A separate workspace does not inherit dynamo's own
-# `.cargo/config.toml`, so we set it here — same as openinfer-dynamo-backend.
-[build]
-rustflags = ["--cfg", "tokio_unstable"]

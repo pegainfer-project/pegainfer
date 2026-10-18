@@ -13,12 +13,12 @@
   - `docs/index.md` — located the existing Qwen3 graph exporter and the GLM5.2 whole-step graph and TP8 topology records.
   - `docs/models/qwen3/cuda-graph-png.md` — established the existing CLI contract: early dependency validation, one complete detailed DOT, and one folded 192-DPI Cairo PNG from the same live graph.
   - `docs/models/glm52/whole-step-decode-graph.md` — established that every GLM5.2 per-rank whole-step graph covers embed through device argmax, is pre-captured before serving, and currently contains about 2,000 nodes.
-  - `openinfer-core/src/cuda_graph.rs` and `openinfer-core/src/cuda_graph/dump.rs` — confirmed `CudaGraphState` retains the source `CUgraph`, already exposes the model-agnostic inspector/renderer, and fails if asked to dump an uncaptured graph.
-  - `openinfer-glm52/src/lib.rs` — confirmed GLM5.2 launches eight physical workers in either the default DP8/EP8 topology or the mirrored TP8 MoE topology, and identified the launch boundary where dump dependencies can fail before weight loading.
-  - `openinfer-glm52/src/model/mod.rs` — confirmed each decode bucket owns its own persistent `CudaGraphState`; EP8 has buckets 1/2/4/8, while TP8 serves only the fixed bucket-8 shape.
-  - `openinfer-glm52/src/scheduler/mod.rs` — confirmed all required bucket graphs are pre-captured across all ranks before the coordinator accepts requests, providing a safe point to export rank 0 without running an extra model step.
-  - `openinfer-glm52/src/runner.rs` — located the rank-local command boundary needed to inspect the graph on the CUDA-context-owning worker thread.
-  - `openinfer-server/src/config.rs` and `openinfer-server/src/main.rs` — located model-specific CLI applicability, validation tests, and the server-to-`Glm52LaunchOptions` handoff.
+  - `pegainfer-core/src/cuda_graph.rs` and `pegainfer-core/src/cuda_graph/dump.rs` — confirmed `CudaGraphState` retains the source `CUgraph`, already exposes the model-agnostic inspector/renderer, and fails if asked to dump an uncaptured graph.
+  - `pegainfer-glm52/src/lib.rs` — confirmed GLM5.2 launches eight physical workers in either the default DP8/EP8 topology or the mirrored TP8 MoE topology, and identified the launch boundary where dump dependencies can fail before weight loading.
+  - `pegainfer-glm52/src/model/mod.rs` — confirmed each decode bucket owns its own persistent `CudaGraphState`; EP8 has buckets 1/2/4/8, while TP8 serves only the fixed bucket-8 shape.
+  - `pegainfer-glm52/src/scheduler/mod.rs` — confirmed all required bucket graphs are pre-captured across all ranks before the coordinator accepts requests, providing a safe point to export rank 0 without running an extra model step.
+  - `pegainfer-glm52/src/runner.rs` — located the rank-local command boundary needed to inspect the graph on the CUDA-context-owning worker thread.
+  - `pegainfer-server/src/config.rs` and `pegainfer-server/src/main.rs` — located model-specific CLI applicability, validation tests, and the server-to-`Glm52LaunchOptions` handoff.
 - **Relevant history**:
   - `docs/models/qwen3/cuda-graph-png.md` records that an unfolded 507-node graph exceeded Graphviz's practical PNG height; GLM5.2's roughly 2,000-node branched graph must be judged from a real render rather than assumed readable.
   - `docs/models/glm52/whole-step-decode-graph.md` records fork/join event nodes and collective kernels inside the graph, so Qwen3's linear repeated-run folding may not recognize the 78-layer GLM5.2 body.
@@ -26,7 +26,7 @@
   1. Generalize the server help/applicability tests and thread the optional PNG path through `Glm52LaunchOptions`, validating the `.png` path, CUDA driver, Graphviz Cairo renderer, and demangler before loading the checkpoint.
   2. Add one rank-local graph-dump command and a narrow `Glm52RankModel` accessor. After the existing all-rank pre-capture completes, export rank 0 bucket 1 for EP8 or rank 0 bucket 8 for TP8; normal serving and graph capture stay unchanged when the flag is absent.
   3. Reuse the shared complete-DOT exporter. Render real EP8 and TP8 graphs on 8×H200; if the PNG is not readable, extend the shared renderer to fold repeated branched layer subgraphs while preserving every physical node and edge in the DOT sidecar.
-  4. Add CPU-side CLI/model-contract coverage, then run release formatting, checks, tests, and Clippy for `openinfer-core`, `openinfer-glm52`, and `openinfer-server` with the GLM5.2 feature.
+  4. Add CPU-side CLI/model-contract coverage, then run release formatting, checks, tests, and Clippy for `pegainfer-core`, `pegainfer-glm52`, and `pegainfer-server` with the GLM5.2 feature.
   5. On 8×H200, launch both EP8 and TP8 with the flag, verify startup reaches readiness, validate the detailed DOT with Graphviz, inspect PNG dimensions/content, and run one request on each topology. Record sanitized node/edge/kernel counts and artifacts without internal hostnames or private paths.
   6. Measure dump-disabled versus dump-enabled startup/serving behavior before the required `toxic-reviewer` pass. Address every correctness or performance objection until the change is ready for review, then complete the execution log and debrief.
 - **Risks / open questions**:
@@ -115,11 +115,11 @@
   TP8 remained 2,986 nodes/3,026 edges/21 PDL at 3,045×11,911. Both detailed
   DOT files reparsed with Graphviz, both one-token requests returned HTTP 200,
   and both graphs still contained zero DSpark copy kernels.
-- Release validation passed for `openinfer-core` (27/27, including all 12 graph
+- Release validation passed for `pegainfer-core` (27/27, including all 12 graph
   tests), GLM5.2 library tests (57/57, 14 hardware tests ignored), server
   graph-CLI tests (4/4), the GLM5.2/server feature check, formatting, diff
   whitespace, and strict
-  `openinfer-core` Clippy. Strict GLM5.2 Clippy remains blocked by seven
+  `pegainfer-core` Clippy. Strict GLM5.2 Clippy remains blocked by seven
   unrelated existing lints outside this change.
 
 ### Step 5b: TP4 live export after the TP4-serving rebase

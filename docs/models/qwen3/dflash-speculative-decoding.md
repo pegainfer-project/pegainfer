@@ -15,7 +15,7 @@ Every speculative method is the same transaction; only *propose* differs.
 
 The draft↔verify boundary is a **pure token span**. Hidden states never cross it — they stay inside the proposer (`dflash.rs` / `dflash_lane.rs`). This is what lets the shared core (`speculative.rs`: `accept_greedy`, `build_verify_results`) be method-agnostic, and it is why there is deliberately **no proposer trait yet**: a trait with one impl is premature. Add it when a second method lands.
 
-Shared core lives in `openinfer-qwen3/src/speculative.rs`; the transaction wiring is in `openinfer-qwen3/src/executor/spec.rs`; the KV transaction primitives (`schedule_speculative` / `apply_speculative` / `speculative_view` / `revert_schedule`) are in `openinfer-kv-cache/src/pool.rs` delegating to kvbm `scheduled.rs`.
+Shared core lives in `pegainfer-qwen3/src/speculative.rs`; the transaction wiring is in `pegainfer-qwen3/src/executor/spec.rs`; the KV transaction primitives (`schedule_speculative` / `apply_speculative` / `speculative_view` / `revert_schedule`) are in `pegainfer-kv-cache/src/pool.rs` delegating to kvbm `scheduled.rs`.
 
 ## Key invariant: readiness comes from prefill capture, not a handshake
 
@@ -52,7 +52,7 @@ The speedup is smaller on the 5090: its higher memory bandwidth makes the baseli
 
 ### Concurrent throughput: the draft loop is serial and launch-bound
 
-Under concurrent load the single-stream win inverts. Same greedy harness (`temperature=0`, sharegpt prompts, 128 out tokens), openinfer vs vLLM with the **same** DFlash-b16 drafter, RTX 5090:
+Under concurrent load the single-stream win inverts. Same greedy harness (`temperature=0`, sharegpt prompts, 128 out tokens), pegainfer vs vLLM with the **same** DFlash-b16 drafter, RTX 5090:
 
 | concurrency | OI plain | OI DFlash serial | OI DFlash batched | **OI DFlash +graph** | vLLM DFlash |
 | --- | --- | --- | --- | --- | --- |
@@ -60,7 +60,7 @@ Under concurrent load the single-stream win inverts. Same greedy harness (`tempe
 | c8 | 1180 | 831 | 1346 | **1525** | 1240 |
 | c16 | 2277 | 1013 | 1868 | **1834** | 1846 |
 
-(tok/s, sharegpt out128, RTX 5090, greedy. The serial draft inverted the win — vLLM degraded gracefully while openinfer nearly halved; batching the draft restored c8/c16 past vLLM. The **+graph** column adds the piecewise verify CUDA Graph (this branch): it closes c1 to vLLM and lifts c8, with c16 flat — see "Single-stream gap" below. Caveat: the serial→batched columns are a same-session A/B; the +graph column's c1 is a clean same-session A/B (251 fixed-buffer eager → 274 graph), while c8/c16 are single runs against the prior batched baseline, i.e. a no-regression check rather than a tight A/B.)
+(tok/s, sharegpt out128, RTX 5090, greedy. The serial draft inverted the win — vLLM degraded gracefully while pegainfer nearly halved; batching the draft restored c8/c16 past vLLM. The **+graph** column adds the piecewise verify CUDA Graph (this branch): it closes c1 to vLLM and lifts c8, with c16 flat — see "Single-stream gap" below. Caveat: the serial→batched columns are a same-session A/B; the +graph column's c1 is a clean same-session A/B (251 fixed-buffer eager → 274 graph), while c8/c16 are single runs against the prior batched baseline, i.e. a no-regression check rather than a tight A/B.)
 
 #### Root cause (serial draft) and the fix (batched draft, landed)
 
@@ -98,7 +98,7 @@ The EAGLE proposer trait is still deferred to when EAGLE actually lands (see "no
 
 ## Task-level accuracy parity (lm-eval gsm8k)
 
-Token-level losslessness should imply task-level parity. Confirmed on the 5090 with `lm-eval` gsm8k (5-shot, greedy, `local-completions` against the openinfer server, 50 questions):
+Token-level losslessness should imply task-level parity. Confirmed on the 5090 with `lm-eval` gsm8k (5-shot, greedy, `local-completions` against the pegainfer server, 50 questions):
 
 | | flexible-extract | strict-match |
 | --- | --- | --- |
@@ -107,7 +107,7 @@ Token-level losslessness should imply task-level parity. Confirmed on the 5090 w
 
 `strict-match` is identical; `flexible-extract` differs by one question (within the ±0.05 stderr), the same single bf16 tie-flip the losslessness gate sees. DFlash does not change task accuracy.
 
-Harness note: openinfer's `/v1/completions` rejects a per-request `seed` field (`"per-request seed is not supported by this engine"` → 400), which the OpenAI/lm-eval client sends by default. For the eval the client was patched to drop `seed`; making the frontend accept-and-ignore `seed` under greedy is a separate, unrelated improvement (not part of this change).
+Harness note: pegainfer's `/v1/completions` rejects a per-request `seed` field (`"per-request seed is not supported by this engine"` → 400), which the OpenAI/lm-eval client sends by default. For the eval the client was patched to drop `seed`; making the frontend accept-and-ignore `seed` under greedy is a separate, unrelated improvement (not part of this change).
 
 ## GPU memory budget & context limit
 

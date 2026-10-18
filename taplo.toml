@@ -4,8 +4,8 @@
 exclude = [
   "target/**",
   "**/third_party/**",
-  "openinfer-dynamo-backend/**",
-  "openinfer-dynamo-frontend/**",
+  "pegainfer-dynamo-backend/**",
+  "pegainfer-dynamo-frontend/**",
   "**/kernel_manifests/**",
 ]
 include = ["**/*.toml"]

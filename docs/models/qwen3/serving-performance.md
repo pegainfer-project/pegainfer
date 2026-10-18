@@ -1,6 +1,6 @@
 # Qwen3 Serving Performance (RTX 5090)
 
-**TL;DR:** openinfer Qwen3-4B TP1 on one RTX 5090 (32 GB): beats vLLM 0.24.0 at every QPS point from QPS 8 up — at QPS 16 it's +17% throughput (1980 vs 1688 tok/s), 19× lower TTFT (204 ms vs 3832 ms), 40% lower TPOT (47 ms vs 79 ms). Qwen3-8B runs on the same binary, same GPU. DSpark speculative decoding drops single-stream TPOT from 6.5 ms to 3.7 ms (~2× decode speedup). Measured with the earlier fixed-seed harness (see the note under Reproduce).
+**TL;DR:** pegainfer Qwen3-4B TP1 on one RTX 5090 (32 GB): beats vLLM 0.24.0 at every QPS point from QPS 8 up — at QPS 16 it's +17% throughput (1980 vs 1688 tok/s), 19× lower TTFT (204 ms vs 3832 ms), 40% lower TPOT (47 ms vs 79 ms). Qwen3-8B runs on the same binary, same GPU. DSpark speculative decoding drops single-stream TPOT from 6.5 ms to 3.7 ms (~2× decode speedup). Measured with the earlier fixed-seed harness (see the note under Reproduce).
 
 Last touched: 2026-07
 
@@ -11,14 +11,14 @@ Last touched: 2026-07
 | GPU | 1× NVIDIA GeForce RTX 5090 (32 GB), driver 590.48.01 |
 | CUDA | 13.1 build (`CUDA_HOME=/usr/local/cuda-13.1`) |
 | Model | Qwen3-4B / Qwen3-8B, BF16 safetensors, TP1 |
-| openinfer | main @ `70888b2`, release build, CUDA Graph on (default), prefix cache on |
+| pegainfer | main @ `70888b2`, release build, CUDA Graph on (default), prefix cache on |
 | vLLM | 0.24.0 (PyPI), prefix cache on (default), `--max-model-len 8192` |
 | Client | `vllm-bench` (Rust) on localhost, same host, same GPU |
 | Workload | `vllm-bench --dataset-name random`, in=1024 / out=128, Poisson arrivals, seed 42, 60 s per QPS point, `--temperature 0` (greedy) |
 
 ## Qwen3-4B Serving Load
 
-| QPS | openinfer out tok/s | vLLM out tok/s | openinfer TTFT p50 | vLLM TTFT p50 | openinfer TPOT p50 | vLLM TPOT p50 |
+| QPS | pegainfer out tok/s | vLLM out tok/s | pegainfer TTFT p50 | vLLM TTFT p50 | pegainfer TPOT p50 | vLLM TPOT p50 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | 126.3 | 126.2 | 45.2 ms | 54.9 ms | 6.53 ms | 6.71 ms |
 | 2 | 252.3 | 252.2 | 30.3 ms | 38.4 ms | 6.93 ms | 7.08 ms |
@@ -28,13 +28,13 @@ Last touched: 2026-07
 | 12 | 1507.7 | 1506.2 | 60.0 ms | 106.0 ms | 16.75 ms | 18.36 ms |
 | 16 | **1979.9** | 1687.9 | **203.8 ms** | 3832.3 ms | **46.92 ms** | 79.42 ms |
 
-Low load (QPS 1–4) is comparable. At QPS 8+ openinfer leads on both TTFT and TPOT. At QPS 16 both systems are overloaded, but openinfer edges ahead on throughput (+17%) and stays 19× lower on TTFT.
+Low load (QPS 1–4) is comparable. At QPS 8+ pegainfer leads on both TTFT and TPOT. At QPS 16 both systems are overloaded, but pegainfer edges ahead on throughput (+17%) and stays 19× lower on TTFT.
 
 ## Qwen3-8B Serving Load
 
 Same harness, Qwen3-8B BF16, single RTX 5090. The 8B model is 2× the weights of 4B; throughput scales accordingly until the GPU saturates around QPS 8. QPS 10+ severely overloaded, omitted.
 
-| QPS | openinfer out tok/s | vLLM out tok/s | openinfer TTFT p50 | vLLM TTFT p50 | openinfer TPOT p50 | vLLM TPOT p50 |
+| QPS | pegainfer out tok/s | vLLM out tok/s | pegainfer TTFT p50 | vLLM TTFT p50 | pegainfer TPOT p50 | vLLM TPOT p50 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | 125.1 | 125.0 | 82.2 ms | 97.4 ms | 11.55 ms | 11.63 ms |
 | 2 | 249.9 | 250.0 | 54.1 ms | 61.5 ms | 11.46 ms | 11.57 ms |
@@ -43,7 +43,7 @@ Same harness, Qwen3-8B BF16, single RTX 5090. The 8B model is 2× the weights of
 
 ## Footprint
 
-| Metric | openinfer | vLLM 0.24.0 |
+| Metric | pegainfer | vLLM 0.24.0 |
 | --- | ---: | ---: |
 | RSS before stress, loaded and idle | **771 MB** | 3814 MB |
 | RSS after stress | **1064 MB** | 3863 MB |
@@ -51,7 +51,7 @@ Same harness, Qwen3-8B BF16, single RTX 5090. The 8B model is 2× the weights of
 | Startup, warm compile cache | **~3.0 s** | 32.7 s |
 | GPU memory, default utilization | 28832 MiB | 30290 MiB |
 
-openinfer is a single process; vLLM RSS is summed over its process tree. The openinfer RSS peak during load is transient while reading safetensors through `mmap`; steady-state settles at 771 MB after load.
+pegainfer is a single process; vLLM RSS is summed over its process tree. The pegainfer RSS peak during load is transient while reading safetensors through `mmap`; steady-state settles at 771 MB after load.
 
 ## DSpark Speculative Decoding
 
@@ -83,7 +83,7 @@ DFlash (the non-Markov predecessor) is also supported via the same flag. Single-
 
 For multi-turn chat and agent workloads, most of the prompt often lands as a warm prefix-cache hit. Same prompt sent cold once to populate GPU KV cache, then re-sent warm (1-token output to isolate TTFT):
 
-| Input length | openinfer cold | openinfer warm p50 | openinfer warm p99 | vLLM warm p50 | vLLM warm p99 |
+| Input length | pegainfer cold | pegainfer warm p50 | pegainfer warm p99 | vLLM warm p50 | vLLM warm p99 |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 256 | 16.2 ms | 8.5 ms | 8.8 ms | 14.5 ms | 19.1 ms |
 | 512 | 24.6 ms | 8.6 ms | 8.8 ms | 16.0 ms | 16.4 ms |
@@ -93,7 +93,7 @@ For multi-turn chat and agent workloads, most of the prompt often lands as a war
 | 8192 | 460.0 ms | 21.6 ms | 22.8 ms | 58.6 ms | 59.9 ms |
 | 16384 | 1143.9 ms | **26.3 ms** | 27.9 ms | 95.6 ms | 98.2 ms |
 
-openinfer wins warm TTFT at every length; the 16k warm-cache path is 3.6× faster than vLLM p50.
+pegainfer wins warm TTFT at every length; the 16k warm-cache path is 3.6× faster than vLLM p50.
 
 ## KV Offload
 
@@ -118,14 +118,14 @@ Harness note: these tables were measured with the earlier fixed-seed harness —
 The current workload entry point is:
 
 ```bash
-# openinfer Qwen3-4B QPS sweep
+# pegainfer Qwen3-4B QPS sweep
 MODEL=/data/Qwen3-4B GPU=0 tools/bench/run_serving_bench.sh
 
 # vLLM Qwen3-4B QPS sweep (for comparison)
 ENGINE=vllm MODEL=/data/Qwen3-4B GPU=0 \
   VLLM=~/develop/xingming/.venv/bin/vllm tools/bench/run_serving_bench.sh
 
-# openinfer Qwen3-4B + DSpark concurrency sweep
+# pegainfer Qwen3-4B + DSpark concurrency sweep
 MODEL=/data/Qwen3-4B DRAFT_MODEL=/data/dspark_qwen3_4b_block7 GPU=0 \
   QPS_LIST="" CONCURRENCY_LIST="1 4 8" tools/bench/run_serving_bench.sh
 

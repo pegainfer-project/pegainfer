@@ -19,7 +19,7 @@ Out of scope:
 - production continuous batching;
 - mixed-request serving;
 - sparse dispatch;
-- openinfer-comm or multi-node EP;
+- pegainfer-comm or multi-node EP;
 - vLLM parity;
 - performance improvement from CUDA Graph evidence alone.
 
@@ -35,17 +35,17 @@ python tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py \
   --case-set-json test_data/deepseek-v2-lite-ep2-cases.json \
   --out target/accuracy/dsv2-lite-ep2/hf.json
 
-OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
-OPENINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
-OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
-  cargo test --release -p openinfer-deepseek-v2-lite \
+PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+PEGAINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
+PEGAINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
+  cargo test --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
-OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
-OPENINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
-OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
-OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl.json \
-  cargo test --release -p openinfer-deepseek-v2-lite \
+PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+PEGAINFER_DSV2_LITE_E2E_CASE_SET=test_data/deepseek-v2-lite-ep2-cases.json \
+PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
+PEGAINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl.json \
+  cargo test --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
 python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
@@ -59,15 +59,15 @@ python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
 Collect batch-1 attribution:
 
 ```bash
-cargo run --release -p openinfer-deepseek-v2-lite \
+cargo run --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite \
   --bin dsv2_lite_ep2_decode_attribution \
   -- --model-path models/DeepSeek-V2-Lite \
   --batch-size 1 \
   --out target/accuracy/dsv2-lite-ep2/host-staged-attribution.json
 
-OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
-  cargo run --release -p openinfer-deepseek-v2-lite \
+PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
+  cargo run --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite \
   --bin dsv2_lite_ep2_decode_attribution \
   -- --model-path models/DeepSeek-V2-Lite \
@@ -78,8 +78,8 @@ OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
 Run the full decode graph probe:
 
 ```bash
-OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
-  cargo run --release -p openinfer-deepseek-v2-lite \
+PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
+  cargo run --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite \
   --bin dsv2_lite_ep2_decode_attribution \
   -- --model-path models/DeepSeek-V2-Lite \
@@ -93,8 +93,8 @@ Use `--batch-size 4` or `--batch-size 8` for attribution regression only. Those 
 Optional diagnostics:
 
 - `--nccl-graph-smoke` runs a preallocated f32 NCCL all-reduce CUDA Graph smoke. It is collective-only evidence.
-- `OPENINFER_DSV2_LITE_NVTX=1` emits NVTX ranges for profiler correlation. JSON CUDA event rows remain the timing source.
-- `OPENINFER_NCCL_PYTHON` can point at a Python environment whose NCCL wheel is newer than the system `libnccl`.
+- `PEGAINFER_DSV2_LITE_NVTX=1` emits NVTX ranges for profiler correlation. JSON CUDA event rows remain the timing source.
+- `PEGAINFER_NCCL_PYTHON` can point at a Python environment whose NCCL wheel is newer than the system `libnccl`.
 
 ## JSON Checks
 

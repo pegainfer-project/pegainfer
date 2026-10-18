@@ -1,0 +1,10 @@
+[[production]]
+package = "pegainfer-server"
+bin = "pegainfer"
+reason = "shipped inference server binary"
+
+# Cover every model line (qwen3, qwen35, deepseek-v2-lite, kimi-k2, glm52)
+# so feature-gated consumers keep their APIs out of the findings.
+[[feature-profile]]
+name = "all"
+all-features = true

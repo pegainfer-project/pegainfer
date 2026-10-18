@@ -262,7 +262,7 @@ def pair_summary(
     if len(left_rows) == len(right_rows):
         pairs = list(zip(left_rows, right_rows, strict=True))
     elif broadcast_single and len(left_rows) == 1:
-        # HF case-set dumps one expected row; OpenInfer emits every same-prompt
+        # HF case-set dumps one expected row; PegaInfer emits every same-prompt
         # batch row, so only the left/HF side is allowed to broadcast.
         pairs = [(left_rows[0], right) for right in right_rows]
     else:
@@ -311,7 +311,7 @@ def classify(pairs: dict[str, dict[str, Any]]) -> str:
         return "all_token_text_exact"
     if not host_nccl_exact:
         return "nccl_transport_regression"
-    return "openinfer_baseline_accuracy_gap"
+    return "pegainfer_baseline_accuracy_gap"
 
 
 def overall_classification(case_results: list[dict[str, Any]]) -> str:
@@ -320,7 +320,7 @@ def overall_classification(case_results: list[dict[str, Any]]) -> str:
         return "all_token_text_exact"
     if "nccl_transport_regression" in labels:
         return "nccl_transport_regression"
-    return "openinfer_baseline_accuracy_gap"
+    return "pegainfer_baseline_accuracy_gap"
 
 
 def short(text: str, width: int = 72) -> str:
@@ -514,8 +514,8 @@ def compare_cases(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hf", required=True, help="HF JSON output")
-    parser.add_argument("--host-staged", required=True, help="host-staged openinfer JSON output")
-    parser.add_argument("--nccl", required=True, help="NCCL openinfer JSON output")
+    parser.add_argument("--host-staged", required=True, help="host-staged pegainfer JSON output")
+    parser.add_argument("--nccl", required=True, help="NCCL pegainfer JSON output")
     parser.add_argument("--out", help="Optional path for structured comparison JSON")
     parser.add_argument(
         "--require-all-exact",

@@ -1,0 +1,64 @@
+[package]
+autobenches = false
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-qwen3"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true, optional = true }
+crossbeam-channel = { workspace = true }
+cudarc = { workspace = true }
+fastrace = { workspace = true }
+half = { workspace = true }
+hex = { workspace = true, optional = true }
+log = { workspace = true }
+pegainfer-bench = { workspace = true, optional = true }
+pegainfer-core = { workspace = true }
+pegainfer-cupti = { workspace = true, optional = true }
+pegainfer-frontend = { workspace = true }
+pegainfer-kernels = { workspace = true }
+pegainfer-kv-cache = { workspace = true }
+pegainfer-kv-offload = { workspace = true }
+pegainfer-sample = { workspace = true }
+rand = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"] }
+toml = { workspace = true, optional = true }
+
+[features]
+kernel-call-trace = ["pegainfer-core/kernel-call-trace"]
+kernel-report = [
+  "dep:comfy-table",
+  "dep:hex",
+  "dep:pegainfer-bench",
+  "dep:pegainfer-cupti",
+  "dep:sha2",
+  "dep:toml",
+  "kernel-call-trace",
+]
+test-fixtures = []
+
+[dev-dependencies]
+pegainfer-qwen3 = { workspace = true, features = ["test-fixtures"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
+vllm-text = { workspace = true }
+
+[[bin]]
+name = "qwen3_kernel_report"
+path = "src/bin/qwen3_kernel_report.rs"
+required-features = ["kernel-report"]
+
+[[bin]]
+name = "qwen3_model_report"
+path = "src/bin/qwen3_model_report.rs"
+required-features = ["kernel-report"]
+
+[lints]
+workspace = true

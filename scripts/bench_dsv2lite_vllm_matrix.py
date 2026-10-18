@@ -4,11 +4,11 @@
 The script keeps three evidence buckets separate:
 
 * HF / host-staged / NCCL correctness gate.
-* OpenInfer direct same-prompt diagnostic batch attribution.
+* PegaInfer direct same-prompt diagnostic batch attribution.
 * HTTP concurrency pressure driven by `vllm bench serve`.
 
 It intentionally does not turn HTTP concurrency into an internal batch-size
-claim. Use the optional OpenInfer trace pass for `decode_batch_size_max`.
+claim. Use the optional PegaInfer trace pass for `decode_batch_size_max`.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ CLAIM_CORRECTNESS = "correctness"
 CLAIM_DIRECT = "direct_diagnostic_batch"
 CLAIM_HTTP = "http_pressure"
 CLAIM_FAILED = "failed_setup"
-HTTP_METADATA_PREFIX = "openinfer_contract_"
+HTTP_METADATA_PREFIX = "pegainfer_contract_"
 
 
 @dataclass(frozen=True)
@@ -58,15 +58,15 @@ class EngineSpec:
 
 ENGINES = [
     EngineSpec(
-        name="openinfer-host-staged",
-        family="openinfer",
-        claim_label="OpenInfer host-staged",
+        name="pegainfer-host-staged",
+        family="pegainfer",
+        claim_label="PegaInfer host-staged",
         ep_backend="host-staged",
     ),
     EngineSpec(
-        name="openinfer-nccl",
-        family="openinfer",
-        claim_label="OpenInfer NCCL",
+        name="pegainfer-nccl",
+        family="pegainfer",
+        claim_label="PegaInfer NCCL",
         ep_backend="nccl",
     ),
     EngineSpec(
@@ -553,23 +553,23 @@ def run_correctness_gate(args: argparse.Namespace, out_dir: Path) -> dict[str, A
             "hf",
         ),
         (
-            ["cargo", "test", "--release", "-p", "openinfer-deepseek-v2-lite",
+            ["cargo", "test", "--release", "-p", "pegainfer-deepseek-v2-lite",
              "--features", "deepseek-v2-lite", "--test", "e2e_ep2", "--", "--nocapture"],
             {
-                "OPENINFER_TEST_MODEL_PATH": model,
-                "OPENINFER_DSV2_LITE_E2E_CASE_SET": case_set,
-                "OPENINFER_DSV2_LITE_E2E_JSON_OUT": host_json_arg,
+                "PEGAINFER_TEST_MODEL_PATH": model,
+                "PEGAINFER_DSV2_LITE_E2E_CASE_SET": case_set,
+                "PEGAINFER_DSV2_LITE_E2E_JSON_OUT": host_json_arg,
             },
             "host-staged",
         ),
         (
-            ["cargo", "test", "--release", "-p", "openinfer-deepseek-v2-lite",
+            ["cargo", "test", "--release", "-p", "pegainfer-deepseek-v2-lite",
              "--features", "deepseek-v2-lite", "--test", "e2e_ep2", "--", "--nocapture"],
             {
-                "OPENINFER_TEST_MODEL_PATH": model,
-                "OPENINFER_DSV2_LITE_E2E_CASE_SET": case_set,
-                "OPENINFER_DSV2_LITE_EP_BACKEND": "nccl",
-                "OPENINFER_DSV2_LITE_E2E_JSON_OUT": nccl_json_arg,
+                "PEGAINFER_TEST_MODEL_PATH": model,
+                "PEGAINFER_DSV2_LITE_E2E_CASE_SET": case_set,
+                "PEGAINFER_DSV2_LITE_EP_BACKEND": "nccl",
+                "PEGAINFER_DSV2_LITE_E2E_JSON_OUT": nccl_json_arg,
             },
             "nccl",
         ),
@@ -623,20 +623,20 @@ def run_direct_diagnostic(args: argparse.Namespace, out_dir: Path) -> list[dict[
             artifact = direct_dir / backend / f"batch{batch_size}.json"
             artifact.parent.mkdir(parents=True, exist_ok=True)
             cmd = [
-                "cargo", "run", "--release", "-p", "openinfer-deepseek-v2-lite",
+                "cargo", "run", "--release", "-p", "pegainfer-deepseek-v2-lite",
                 "--features", "deepseek-v2-lite", "--bin", "dsv2_lite_ep2_decode_attribution",
                 "--", "--model-path", str(args.model_path), "--batch-size", str(batch_size),
                 "--out", display_path(artifact),
             ]
             env = os.environ.copy()
-            env["OPENINFER_DSV2_LITE_EP_BACKEND"] = backend
+            env["PEGAINFER_DSV2_LITE_EP_BACKEND"] = backend
             row = {
                 "claim_bucket": CLAIM_DIRECT,
                 "backend": backend,
                 "batch_size": batch_size,
                 "artifact": display_path(artifact),
                 "command": redact_command(cmd),
-                "env": ["OPENINFER_DSV2_LITE_EP_BACKEND"],
+                "env": ["PEGAINFER_DSV2_LITE_EP_BACKEND"],
             }
             try:
                 run_capture(cmd, env=env, timeout=args.command_timeout_s)
@@ -982,10 +982,10 @@ def http_json(method: str, port: int, path: str, body: dict[str, Any] | None = N
 
 
 def server_command(args: argparse.Namespace, spec: EngineSpec, port: int) -> list[str]:
-    if spec.family == "openinfer":
+    if spec.family == "pegainfer":
         return [
-            "cargo", "run", "--release", "-p", "openinfer-server",
-            "--features", "deepseek-v2-lite", "--bin", "openinfer",
+            "cargo", "run", "--release", "-p", "pegainfer-server",
+            "--features", "deepseek-v2-lite", "--bin", "pegainfer",
             "--", "--model-path", str(args.model_path), "--served-model-name", args.model_id,
             "--port", str(port), "--cuda-graph=false",
         ]
@@ -1004,17 +1004,17 @@ def engine_env(args: argparse.Namespace, spec: EngineSpec) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("RUST_LOG", "info")
     if spec.ep_backend is not None:
-        env["OPENINFER_DSV2_LITE_EP_BACKEND"] = spec.ep_backend
+        env["PEGAINFER_DSV2_LITE_EP_BACKEND"] = spec.ep_backend
     if args.cuda_visible_devices:
         env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     return env
 
 
 BENCHMARK_SERVER_ENV_KEYS = (
-    "OPENINFER_DSV2_LITE_EP_BACKEND",
-    "OPENINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH",
-    "OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH",
-    "OPENINFER_DSV2_LITE_NCCL_ROUTER",
+    "PEGAINFER_DSV2_LITE_EP_BACKEND",
+    "PEGAINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH",
+    "PEGAINFER_DSV2_LITE_NCCL_EXPERT_BATCH",
+    "PEGAINFER_DSV2_LITE_NCCL_ROUTER",
     "CUDA_VISIBLE_DEVICES",
 )
 
@@ -1407,10 +1407,10 @@ def summarize_http_rows(engine_rows: list[dict[str, Any]], noisy_threshold: floa
     return summarized
 
 
-def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[dict[str, Any]]:
+def run_pegainfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[dict[str, Any]]:
     rows = []
     for spec in ENGINES:
-        if spec.family != "openinfer":
+        if spec.family != "pegainfer":
             continue
         port = args.port + 20 + len(rows)
         log_path = out_dir / "trace_server_logs" / f"{spec.name}.log"
@@ -1427,7 +1427,7 @@ def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
             with ManagedServer(cmd, env, log_path) as server:
                 wait_for_server(server, spec, port, args.model_id, args.server_ready_timeout_s)
                 for concurrency in args.concurrency:
-                    out = out_dir / "openinfer_trace" / spec.name / f"c{concurrency}.json"
+                    out = out_dir / "pegainfer_trace" / spec.name / f"c{concurrency}.json"
                     trace_cmd = [
                         sys.executable, "scripts/bench_http_serving.py",
                         "--base-url", f"http://127.0.0.1:{port}",
@@ -1469,7 +1469,7 @@ def run_openinfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
             if not row["cells"]:
                 row.update({
                     "claim_bucket": CLAIM_FAILED,
-                    "error": "no OpenInfer trace result artifacts found",
+                    "error": "no PegaInfer trace result artifacts found",
                 })
         except Exception as exc:  # noqa: BLE001
             row.update({"passed": False, "claim_bucket": CLAIM_FAILED, "error": error_text(exc)})
@@ -1491,7 +1491,7 @@ def build_summary(args: argparse.Namespace, out_dir: Path, sections: dict[str, A
         "correctness_gate": sections.get("correctness_gate"),
         "direct_diagnostic_batch": sections.get("direct_diagnostic_batch", []),
         "http_concurrency_pressure": sections.get("http_concurrency_pressure", []),
-        "openinfer_trace_pass": sections.get("openinfer_trace_pass", []),
+        "pegainfer_trace_pass": sections.get("pegainfer_trace_pass", []),
         "claim_boundary": (
             "This matrix separates correctness, direct same-prompt diagnostic batch, "
             "HTTP concurrency pressure, and failed setup rows. It does not claim vLLM parity "
@@ -1624,7 +1624,7 @@ def collect_manifest_artifacts(summary: dict[str, Any], out_dir: Path) -> list[d
                 concurrency=cell.get("concurrency"),
                 repeat=cell.get("repeat"),
             )
-    for row in summary.get("openinfer_trace_pass", []) or []:
+    for row in summary.get("pegainfer_trace_pass", []) or []:
         if not isinstance(row, dict):
             continue
         append_manifest_artifact(
@@ -1642,7 +1642,7 @@ def collect_manifest_artifacts(summary: dict[str, Any], out_dir: Path) -> list[d
                 artifacts,
                 out_dir,
                 cell.get("artifact"),
-                kind="openinfer_trace_result",
+                kind="pegainfer_trace_result",
                 claim_bucket=cell.get("claim_bucket", row.get("claim_bucket", CLAIM_HTTP)),
                 engine=row.get("engine"),
                 concurrency=cell.get("concurrency"),
@@ -1737,7 +1737,7 @@ def collect_manifest_commands(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "command": redact_payload(row.get("command")),
                 "env": redact_payload(row.get("env", [])),
             })
-    for section in ("http_concurrency_pressure", "openinfer_trace_pass"):
+    for section in ("http_concurrency_pressure", "pegainfer_trace_pass"):
         for row in summary.get(section, []) or []:
             if not isinstance(row, dict):
                 continue
@@ -1819,7 +1819,7 @@ def collect_claim_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 "error": row.get("error"),
                 "startup_failure": row.get("startup_failure"),
             })
-    for row in summary.get("openinfer_trace_pass", []) or []:
+    for row in summary.get("pegainfer_trace_pass", []) or []:
         if not isinstance(row, dict):
             continue
         for cell in row.get("cells", []) or []:
@@ -1827,7 +1827,7 @@ def collect_claim_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             trace = cell.get("trace") if isinstance(cell.get("trace"), dict) else {}
             rows.append({
-                "section": "openinfer_trace_pass",
+                "section": "pegainfer_trace_pass",
                 "claim_bucket": row.get("claim_bucket", CLAIM_HTTP),
                 "engine": row.get("engine"),
                 "passed": row.get("passed"),
@@ -1842,7 +1842,7 @@ def collect_claim_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
             })
         if not row.get("cells"):
             rows.append({
-                "section": "openinfer_trace_pass",
+                "section": "pegainfer_trace_pass",
                 "claim_bucket": row.get("claim_bucket", CLAIM_HTTP),
                 "engine": row.get("engine"),
                 "passed": row.get("passed"),
@@ -1916,7 +1916,7 @@ def build_regression_summary(
                 "output_tok_s",
             ),
         )
-        comparison["openinfer_trace_pass"] = compare_projection_maps(
+        comparison["pegainfer_trace_pass"] = compare_projection_maps(
             trace_projection_map(summary),
             trace_projection_map(baseline),
             (
@@ -1939,8 +1939,8 @@ def build_regression_summary(
             comparison["http_concurrency_pressure"],
         ))
         reasons.extend(structural_projection_reasons(
-            "openinfer_trace_pass",
-            comparison["openinfer_trace_pass"],
+            "pegainfer_trace_pass",
+            comparison["pegainfer_trace_pass"],
         ))
         contract_reasons = comparability_reasons(summary, baseline)
         reasons.extend(contract_reasons)
@@ -1969,7 +1969,7 @@ def no_baseline_regression_sections(summary: dict[str, Any]) -> dict[str, Any]:
         "correctness": {"state": "no_baseline", "current": correctness_projection(summary)},
         "direct_diagnostic_batch": {"state": "no_baseline", "current_rows": sorted(direct_projection_map(summary))},
         "http_concurrency_pressure": {"state": "no_baseline", "current_cells": sorted(http_projection_map(summary))},
-        "openinfer_trace_pass": {"state": "no_baseline", "current_cells": sorted(trace_projection_map(summary))},
+        "pegainfer_trace_pass": {"state": "no_baseline", "current_cells": sorted(trace_projection_map(summary))},
     }
 
 
@@ -2036,7 +2036,7 @@ def http_projection_map(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def trace_projection_map(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
     cells = {}
-    for row in summary.get("openinfer_trace_pass", []) or []:
+    for row in summary.get("pegainfer_trace_pass", []) or []:
         if not isinstance(row, dict):
             continue
         if not row.get("cells"):
@@ -2228,7 +2228,7 @@ def failed_setup_map(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 "error": row.get("error"),
                 "claim_bucket": row.get("claim_bucket"),
             }
-    for section in ("http_concurrency_pressure", "openinfer_trace_pass"):
+    for section in ("http_concurrency_pressure", "pegainfer_trace_pass"):
         for row in summary.get(section, []) or []:
             if isinstance(row, dict) and (row.get("claim_bucket") == CLAIM_FAILED or row.get("passed") is False):
                 key = f"{section}:{row.get('engine')}"
@@ -2259,7 +2259,7 @@ def regression_docs_summary(regression: dict[str, Any]) -> list[str]:
         f"{len(http.get('missing', []))} missing, "
         f"{len(http.get('added', []))} added"
     )
-    trace = regression.get("openinfer_trace_pass", {})
+    trace = regression.get("pegainfer_trace_pass", {})
     lines.append(
         "trace: "
         f"{len(trace.get('changed', []))} changed, "
@@ -2289,8 +2289,8 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         sections["direct_diagnostic_batch"] = run_direct_diagnostic(args, out_dir)
     if not args.skip_http:
         sections["http_concurrency_pressure"] = run_http_matrix(args, out_dir)
-    if args.openinfer_trace_pass:
-        sections["openinfer_trace_pass"] = run_openinfer_trace_pass(args, out_dir)
+    if args.pegainfer_trace_pass:
+        sections["pegainfer_trace_pass"] = run_pegainfer_trace_pass(args, out_dir)
     summary = build_summary(args, out_dir, sections)
     write_json(out_dir / "summary.json", summary)
     emit_benchmark_artifacts(args, out_dir, summary)
@@ -2415,7 +2415,7 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
     summarized_http_rows.sort(key=engine_order_key)
     sections["http_concurrency_pressure"] = summarized_http_rows
     trace_rows: list[dict[str, Any]] = []
-    for engine_dir in sorted((out_dir / "openinfer_trace").glob("*")):
+    for engine_dir in sorted((out_dir / "pegainfer_trace").glob("*")):
         row = {
             "engine": engine_dir.name,
             "claim_bucket": CLAIM_HTTP,
@@ -2451,13 +2451,13 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
         if not row["cells"]:
             row.update({
                 "claim_bucket": CLAIM_FAILED,
-                "error": "no OpenInfer trace result artifacts found",
+                "error": "no PegaInfer trace result artifacts found",
             })
         elif missing_concurrency:
             row["missing_trace_concurrency"] = missing_concurrency
             row.update({
                 "claim_bucket": CLAIM_FAILED,
-                "error": "missing OpenInfer trace result artifacts",
+                "error": "missing PegaInfer trace result artifacts",
             })
         elif not row["passed"]:
             row.update({
@@ -2469,24 +2469,24 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
     trace_rows = merge_preserved_failed_rows(
         merge_existing_row_context(
             trace_rows,
-            existing_summary.get("openinfer_trace_pass", []),
+            existing_summary.get("pegainfer_trace_pass", []),
             ("engine",),
             ("server_command", "server_log"),
         ),
-        preserved_failed_rows(existing_summary.get("openinfer_trace_pass", [])),
+        preserved_failed_rows(existing_summary.get("pegainfer_trace_pass", [])),
         ("engine",),
     )
     if trace_rows:
-        sections["openinfer_trace_pass"] = trace_rows
-    elif existing_summary.get("openinfer_trace_pass"):
-        sections["openinfer_trace_pass"] = [
+        sections["pegainfer_trace_pass"] = trace_rows
+    elif existing_summary.get("pegainfer_trace_pass"):
+        sections["pegainfer_trace_pass"] = [
             {
                 **row,
                 "passed": False,
                 "claim_bucket": CLAIM_FAILED,
-                "error": "raw OpenInfer trace artifacts are missing",
+                "error": "raw PegaInfer trace artifacts are missing",
             }
-            for row in existing_summary["openinfer_trace_pass"]
+            for row in existing_summary["pegainfer_trace_pass"]
             if isinstance(row, dict)
         ]
     summary = build_summary(args, out_dir, sections)
@@ -2741,7 +2741,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--skip-direct", action="store_true")
     parser.add_argument("--skip-http", action="store_true")
-    parser.add_argument("--openinfer-trace-pass", action="store_true")
+    parser.add_argument("--pegainfer-trace-pass", action="store_true")
     parser.add_argument("--summarize-only", type=Path)
     parser.add_argument(
         "--baseline-summary",
@@ -2808,7 +2808,7 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
                 "backend": backend,
                 "batch_size": batch,
                 "command": redact_command([
-                    "cargo", "run", "--release", "-p", "openinfer-deepseek-v2-lite",
+                    "cargo", "run", "--release", "-p", "pegainfer-deepseek-v2-lite",
                     "--features", "deepseek-v2-lite", "--bin", "dsv2_lite_ep2_decode_attribution",
                     "--", "--model-path", str(args.model_path), "--batch-size", str(batch),
                 ]),

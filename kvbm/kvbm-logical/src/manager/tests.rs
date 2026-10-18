@@ -3895,6 +3895,47 @@ mod reset_on_release_tests {
         );
     }
 
+    /// A duplicate must mark its hidden primary, not only its own slot.
+    #[test]
+    fn duplicate_can_mark_canonical_primary_for_reset() {
+        let manager = create_test_manager(4);
+        let token = create_test_token_block_from_iota(50_041);
+        let hash = token.kvbm_sequence_hash();
+
+        let primary_mutable = manager
+            .allocate_blocks(1)
+            .expect("allocate primary")
+            .into_iter()
+            .next()
+            .unwrap();
+        let primary = manager.register_block(primary_mutable.complete(&token).unwrap());
+
+        let duplicate_mutable = manager
+            .allocate_blocks(1)
+            .expect("allocate duplicate")
+            .into_iter()
+            .next()
+            .unwrap();
+        let duplicate = manager.register_block(duplicate_mutable.complete(&token).unwrap());
+        assert_ne!(primary.block_id(), duplicate.block_id());
+
+        duplicate.set_primary_reset_on_release(true);
+
+        let store = manager.store_for_test();
+        drop(primary);
+        assert_eq!(
+            store.reset_len(),
+            2,
+            "the duplicate must keep the primary active until its own drop"
+        );
+
+        drop(duplicate);
+
+        assert_eq!(store.inactive_len(), 0);
+        assert_eq!(store.reset_len(), 4);
+        assert!(!manager.block_registry().is_registered(hash));
+    }
+
     /// Pool gauges (`inflight_immutable`, `inactive_pool_size`,
     /// `reset_pool_size`) must stay coherent across the full lifecycle
     /// when the reset-on-release flag fires. Regression-protects the

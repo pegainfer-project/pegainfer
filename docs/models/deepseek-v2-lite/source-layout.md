@@ -22,7 +22,7 @@ boundaries:
 
 ## Layout
 
-`openinfer-deepseek-v2-lite/src/runtime.rs` is now a facade that keeps the
+`pegainfer-deepseek-v2-lite/src/runtime.rs` is now a facade that keeps the
 public generator and result exports stable. Implementation moved into:
 
 | File | Responsibility |
@@ -38,7 +38,7 @@ public generator and result exports stable. Implementation moved into:
 
 ## What Stayed
 
-- Public exports from `openinfer-deepseek-v2-lite/src/lib.rs` still expose
+- Public exports from `pegainfer-deepseek-v2-lite/src/lib.rs` still expose
   `DeepSeekV2LiteEp2Generator`, `GenerationResult`,
   `BatchedGenerationResult`, `GenerationStats`, and
   `DecodeGraphReadinessReport`.
@@ -61,12 +61,12 @@ cargo fmt --all --check
 Both passed.
 
 Remote validation ran on Ubuntu 22.04 with 2x NVIDIA GeForce RTX 5090, driver
-580.105.08, CUDA 12.8, `OPENINFER_CUDA_SM=120`, and a configured
-`OPENINFER_TRITON_PYTHON` environment.
+580.105.08, CUDA 12.8, `PEGAINFER_CUDA_SM=120`, and a configured
+`PEGAINFER_TRITON_PYTHON` environment.
 
 Passed gates:
 
-- `cargo check --offline --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --lib --tests`
+- `cargo check --offline --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --lib --tests`
 - HF oracle dump with `tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py`
 - host-staged `tests/e2e_ep2.rs`
 - NCCL `tests/e2e_ep2.rs` using an explicit compatible NCCL library selector

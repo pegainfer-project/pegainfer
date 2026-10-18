@@ -3,16 +3,16 @@
 > **TL;DR:** ZeRO-Prefill gives us a boundary for a future long-prefill cluster, not a router design or an implementation commitment.
 >
 > - **Want:** a long-P engine path that maximizes batch throughput once an external router has already selected long-prefill work.
-> - **Avoid:** putting long/delta classification, batch admission policy, or router state inside openinfer.
+> - **Avoid:** putting long/delta classification, batch admission policy, or router state inside pegainfer.
 > - **Why:** long prefill can provide enough compute to hide expert-weight movement, while decode and delta-prefill have different latency and state constraints.
 >
 > **Status:** Discussion record. No implementation, measurement threshold, or connector API is committed here.
 
 ## Scope
 
-This note records what we learned from "ZeRO-Prefill: Zero Redundancy Overheads in MoE Prefill Serving" ([arXiv:2605.02960](https://arxiv.org/abs/2605.02960)) and how it should shape future PegaFlow/OpenInfer planning for large MoE serving.
+This note records what we learned from "ZeRO-Prefill: Zero Redundancy Overheads in MoE Prefill Serving" ([arXiv:2605.02960](https://arxiv.org/abs/2605.02960)) and how it should shape future PegaFlow/PegaInfer planning for large MoE serving.
 
-The assumed product shape is P/D separation with an external router. The router is responsible for deciding whether work belongs to long prefill, delta prefill, or decode. This document only describes what openinfer should care about after the router has already handed it a long-prefill batch.
+The assumed product shape is P/D separation with an external router. The router is responsible for deciding whether work belongs to long prefill, delta prefill, or decode. This document only describes what pegainfer should care about after the router has already handed it a long-prefill batch.
 
 The goal is a reusable boundary record, not an implementation plan. Exact backend design, telemetry fields, measurement thresholds, and connector protocols are outside this document.
 
@@ -49,7 +49,7 @@ ZeRO-Prefill includes a KV-cache-free mode for prefill-only workloads that direc
 
 The paper's waste sources matter most when a long-prefill batch has enough work to make compute the dominant resource. In our P/D-separated roadmap, short delta-prefill and decode should not be assumed to satisfy the same condition.
 
-For openinfer, the first long-P goal is to keep selected long-prefill work compute-bound. Once the router has already selected a long-prefill batch, the engine should avoid fragmenting it into chunks that lose MFU or make expert transfer visible again.
+For pegainfer, the first long-P goal is to keep selected long-prefill work compute-bound. Once the router has already selected a long-prefill batch, the engine should avoid fragmenting it into chunks that lose MFU or make expert transfer visible again.
 
 **Want:** execution that preserves enough per-GPU prefill work to make long-P throughput the main objective.
 
@@ -105,7 +105,7 @@ The future measurement spec should explain at least:
 
 ## Derivation: Future Reuse
 
-When PegaFlow/OpenInfer planning revisits long-prefill MoE serving, use this note as the entry point:
+When PegaFlow/PegaInfer planning revisits long-prefill MoE serving, use this note as the entry point:
 
 1. Assume the router has already selected a long-prefill batch.
 2. Evaluate whether the engine keeps that batch compute-bound.

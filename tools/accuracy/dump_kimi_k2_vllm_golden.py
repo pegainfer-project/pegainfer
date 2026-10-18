@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the vLLM golden fixture for the Kimi-K2 accuracy gate.
 
-The gate (`openinfer-kimi-k2/tests/vllm_golden_gate.rs`) compares openinfer's
+The gate (`pegainfer-kimi-k2/tests/vllm_golden_gate.rs`) compares pegainfer's
 greedy decisions against vLLM *without* running vLLM at test time and *without*
 binding to one engine's exact bit pattern. So we precompute, once, on the
 serving hardware:
@@ -17,9 +17,9 @@ equal-precision reference available. The HF route decompresses to bf16, a
 different numerical regime, and needs a fragile trust_remote_code + stubbed
 vision tower load.
 
-The Rust gate replays the same sequences through openinfer two ways:
+The Rust gate replays the same sequences through pegainfer two ways:
   * teacher-forced argmax sweep — prefill `prompt + tail[..i]`, max_tokens=1,
-    per position i: openinfer's pick must sit within a logprob tie tolerance
+    per position i: pegainfer's pick must sit within a logprob tie tolerance
     of vLLM's own argmax (in vLLM's logprobs — the "regret" check);
   * free-greedy decode parity — generate D tokens and compare against the
     tail, classifying any first divergence as benign tie vs real bug using
@@ -28,7 +28,7 @@ The Rust gate replays the same sequences through openinfer two ways:
 Output is safetensors, not JSON: machine-only numeric data, nobody reads it,
 and the binary layout is ~3.5x smaller (same convention as the Qwen goldens).
 
-Run on a host with 8 GPUs and the vLLM venv (the gate's openinfer run needs
+Run on a host with 8 GPUs and the vLLM venv (the gate's pegainfer run needs
 the same GPUs, so generation and gating are sequential on one box):
 
     .venv/bin/python tools/accuracy/dump_kimi_k2_vllm_golden.py \
@@ -94,7 +94,7 @@ PROMPTS: list[tuple[str, str]] = [
     ("list", "Top five most spoken languages in the world:\n1."),
     (
         "json",
-        '{"name": "openinfer", "language": "Rust", "purpose":',
+        '{"name": "pegainfer", "language": "Rust", "purpose":',
     ),
     (
         "translation",

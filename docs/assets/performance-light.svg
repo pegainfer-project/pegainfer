@@ -1,0 +1,525 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:ns2="http://creativecommons.org/ns#" xmlns:ns4="http://www.w3.org/1999/xlink" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" width="1080" height="840" viewBox="0 0 777.6 604.8" version="1.1" role="img" aria-labelledby="performance-title performance-description">
+ <title id="performance-title">Performance across model families</title><desc id="performance-description">Four independent benchmark snapshots: Qwen3-4B median token latency with and without DSpark; Qwen3.5-9B and 27B throughput versus concurrency; Gemma 4 26B-A4B end-to-end latency relative to vLLM with BF16 or default FP8 KV; GLM-5.2 throughput on four versus eight GB300 GPUs. PegaInfer uses BF16 KV in both Gemma comparisons, which were measured separately. Hardware, workloads and axes differ between panels. Source measurements are embedded in metadata.</desc><title>Performance across model families</title>
+ <metadata>
+  <rdf:RDF>
+   <ns2:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
+    <dc:title>Performance across model families</dc:title>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <ns2:Agent>
+      <dc:title>PegaInfer</dc:title>
+     </ns2:Agent>
+    </dc:creator>
+   </ns2:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 604.8  L 777.6 604.8  L 777.6 0  L 0 0  z " style="fill: #ffffff" />
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 118.08 280.08  L 352.08 280.08  L 352.08 195.12  L 118.08 195.12  z " style="fill: #ffffff" />
+   </g>
+   <g id="matplotlib.axis_1">
+    <g id="xtick_1">
+     <g id="line2d_1">
+      <path d="M 118.08 280.08  L 118.08 195.12  " clip-path="url(#pdc00b63b48)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_2" />
+     <g id="text_1">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="118.08" y="293.370156" transform="rotate(-0 118.08 293.370156)">0</text>
+     </g>
+    </g>
+    <g id="xtick_2">
+     <g id="line2d_3">
+      <path d="M 186.903529 280.08  L 186.903529 195.12  " clip-path="url(#pdc00b63b48)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_4" />
+     <g id="text_2">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="186.903529" y="293.370156" transform="rotate(-0 186.903529 293.370156)">2</text>
+     </g>
+    </g>
+    <g id="xtick_3">
+     <g id="line2d_5">
+      <path d="M 255.727059 280.08  L 255.727059 195.12  " clip-path="url(#pdc00b63b48)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_6" />
+     <g id="text_3">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="255.727059" y="293.370156" transform="rotate(-0 255.727059 293.370156)">4</text>
+     </g>
+    </g>
+    <g id="xtick_4">
+     <g id="line2d_7">
+      <path d="M 324.550588 280.08  L 324.550588 195.12  " clip-path="url(#pdc00b63b48)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_8" />
+     <g id="text_4">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="324.550588" y="293.370156" transform="rotate(-0 324.550588 293.370156)">6</text>
+     </g>
+    </g>
+   </g>
+   <g id="matplotlib.axis_2">
+    <g id="ytick_1">
+     <g id="line2d_9" />
+     <g id="text_5">
+      <text style="font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #172b3a" x="111.08" y="219.333699" transform="rotate(-0 111.08 219.333699)">ShareGPT</text>
+     </g>
+    </g>
+    <g id="ytick_2">
+     <g id="line2d_10" />
+     <g id="text_6">
+      <text style="font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #172b3a" x="111.08" y="262.680637" transform="rotate(-0 111.08 262.680637)">Code</text>
+     </g>
+    </g>
+   </g>
+   <g id="patch_3">
+    <path d="M 118.08 217.660408  L 318.700588 217.660408  L 318.700588 228.063673  L 118.08 228.063673  z " clip-path="url(#pdc00b63b48)" style="fill: #7e8f9f" />
+   </g>
+   <g id="patch_4">
+    <path d="M 118.08 203.789388  L 219.938824 203.789388  L 219.938824 214.192653  L 118.08 214.192653  z " clip-path="url(#pdc00b63b48)" style="fill: #127d70" />
+   </g>
+   <g id="text_7">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="328.700588" y="226.16656" transform="rotate(-0 328.700588 226.16656)">5.83</text>
+   </g>
+   <g id="text_8">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="229.938824" y="212.295539" transform="rotate(-0 229.938824 212.295539)">2.96</text>
+   </g>
+   <g id="patch_5">
+    <path d="M 118.08 261.007347  L 320.077059 261.007347  L 320.077059 271.410612  L 118.08 271.410612  z " clip-path="url(#pdc00b63b48)" style="fill: #7e8f9f" />
+   </g>
+   <g id="patch_6">
+    <path d="M 118.08 247.136327  L 223.724118 247.136327  L 223.724118 257.539592  L 118.08 257.539592  z " clip-path="url(#pdc00b63b48)" style="fill: #127d70" />
+   </g>
+   <g id="text_9">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="330.077059" y="269.513498" transform="rotate(-0 330.077059 269.513498)">5.87</text>
+   </g>
+   <g id="text_10">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="233.724118" y="255.644672" transform="rotate(-0 233.724118 255.644672)">3.07</text>
+   </g>
+  </g>
+  <g id="axes_2">
+   <g id="patch_7">
+    <path d="M 440.64 280.08  L 676.8 280.08  L 676.8 195.12  L 440.64 195.12  z " style="fill: #ffffff" />
+   </g>
+   <g id="matplotlib.axis_3">
+    <g id="xtick_5">
+     <g id="line2d_11" />
+     <g id="text_11">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="445.594406" y="293.370156" transform="rotate(-0 445.594406 293.370156)">1</text>
+     </g>
+    </g>
+    <g id="xtick_6">
+     <g id="line2d_12" />
+     <g id="text_12">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="544.682517" y="293.370156" transform="rotate(-0 544.682517 293.370156)">4</text>
+     </g>
+    </g>
+    <g id="xtick_7">
+     <g id="line2d_13" />
+     <g id="text_13">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="676.8" y="293.370156" transform="rotate(-0 676.8 293.370156)">8</text>
+     </g>
+    </g>
+   </g>
+   <g id="matplotlib.axis_4">
+    <g id="ytick_3">
+     <g id="line2d_14">
+      <path d="M 440.64 280.08  L 676.8 280.08  " clip-path="url(#p5196db59a6)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_15" />
+     <g id="text_14">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="433.64" y="283.225078" transform="rotate(-0 433.64 283.225078)">0</text>
+     </g>
+    </g>
+    <g id="ytick_4">
+     <g id="line2d_16">
+      <path d="M 440.64 251.76  L 676.8 251.76  " clip-path="url(#p5196db59a6)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_17" />
+     <g id="text_15">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="433.64" y="254.905078" transform="rotate(-0 433.64 254.905078)">200</text>
+     </g>
+    </g>
+    <g id="ytick_5">
+     <g id="line2d_18">
+      <path d="M 440.64 223.44  L 676.8 223.44  " clip-path="url(#p5196db59a6)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_19" />
+     <g id="text_16">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="433.64" y="226.585078" transform="rotate(-0 433.64 226.585078)">400</text>
+     </g>
+    </g>
+    <g id="ytick_6">
+     <g id="line2d_20">
+      <path d="M 440.64 195.12  L 676.8 195.12  " clip-path="url(#p5196db59a6)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_21" />
+     <g id="text_17">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="433.64" y="198.265078" transform="rotate(-0 433.64 198.265078)">600</text>
+     </g>
+    </g>
+   </g>
+   <g id="line2d_22">
+    <path d="M 445.594406 261.5304  L 544.682517 230.2368  L 676.8 207.0144  " style="fill: none; stroke: #127d70; stroke-width: 2; stroke-linecap: square" />
+    <defs>
+     <path id="md26deef67e" d="M 0 2.25  C 0.596707 2.25 1.169055 2.012926 1.59099 1.59099  C 2.012926 1.169055 2.25 0.596707 2.25 0  C 2.25 -0.596707 2.012926 -1.169055 1.59099 -1.59099  C 1.169055 -2.012926 0.596707 -2.25 0 -2.25  C -0.596707 -2.25 -1.169055 -2.012926 -1.59099 -1.59099  C -2.012926 -1.169055 -2.25 -0.596707 -2.25 0  C -2.25 0.596707 -2.012926 1.169055 -1.59099 1.59099  C -1.169055 2.012926 -0.596707 2.25 0 2.25  z " />
+    </defs>
+    <g>
+     <use ns4:href="#md26deef67e" x="445.594406" y="261.5304" style="fill: #127d70" />
+     <use ns4:href="#md26deef67e" x="544.682517" y="230.2368" style="fill: #127d70" />
+     <use ns4:href="#md26deef67e" x="676.8" y="207.0144" style="fill: #127d70" />
+    </g>
+   </g>
+   <g id="line2d_23">
+    <path d="M 445.594406 273.4248  L 544.682517 261.5304  L 676.8 252.0432  " style="fill: none; stroke-dasharray: 6,4; stroke-dashoffset: 0; stroke: #7e8f9f; stroke-width: 2" />
+    <defs>
+     <path id="m902880b0fc" d="M -0 3.181981  L 3.181981 0  L 0 -3.181981  L -3.181981 -0  z " />
+    </defs>
+    <g>
+     <use ns4:href="#m902880b0fc" x="445.594406" y="273.4248" style="fill: #7e8f9f" />
+     <use ns4:href="#m902880b0fc" x="544.682517" y="261.5304" style="fill: #7e8f9f" />
+     <use ns4:href="#m902880b0fc" x="676.8" y="252.0432" style="fill: #7e8f9f" />
+    </g>
+   </g>
+   <g id="text_18">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="686.8" y="210.318919" transform="rotate(-0 686.8 210.318919)">9B  516</text>
+   </g>
+   <g id="text_19">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #7e8f9f" x="686.8" y="255.347719" transform="rotate(-0 686.8 255.347719)">27B  198</text>
+   </g>
+  </g>
+  <g id="axes_3">
+   <g id="patch_8">
+    <path d="M 61.2 539.28  L 298.08 539.28  L 298.08 434.16  L 61.2 434.16  z " style="fill: #ffffff" />
+   </g>
+   <g id="matplotlib.axis_5">
+    <g id="xtick_8">
+     <g id="line2d_24" />
+     <g id="text_20">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="66.657743" y="552.570156" transform="rotate(-0 66.657743 552.570156)">10.6K</text>
+     </g>
+    </g>
+    <g id="xtick_9">
+     <g id="line2d_25" />
+     <g id="text_21">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="111.204566" y="552.570156" transform="rotate(-0 111.204566 552.570156)">40K</text>
+     </g>
+    </g>
+    <g id="xtick_10">
+     <g id="line2d_26" />
+     <g id="text_22">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="174.314079" y="552.570156" transform="rotate(-0 174.314079 552.570156)">81.7K</text>
+     </g>
+    </g>
+    <g id="xtick_11">
+     <g id="line2d_27" />
+     <g id="text_23">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="298.08" y="552.570156" transform="rotate(-0 298.08 552.570156)">163K</text>
+     </g>
+    </g>
+   </g>
+   <g id="matplotlib.axis_6">
+    <g id="ytick_7">
+     <g id="line2d_28">
+      <path d="M 61.2 529.723636  L 298.08 529.723636  " clip-path="url(#p7dfcd4f72e)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_29" />
+     <g id="text_24">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="54.2" y="532.868714" transform="rotate(-0 54.2 532.868714)">0.6</text>
+     </g>
+    </g>
+    <g id="ytick_8">
+     <g id="line2d_30">
+      <path d="M 61.2 491.498182  L 298.08 491.498182  " clip-path="url(#p7dfcd4f72e)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_31" />
+     <g id="text_25">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="54.2" y="494.64326" transform="rotate(-0 54.2 494.64326)">0.8</text>
+     </g>
+    </g>
+    <g id="ytick_9">
+     <g id="line2d_32">
+      <path d="M 61.2 453.272727  L 298.08 453.272727  " clip-path="url(#p7dfcd4f72e)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_33" />
+     <g id="text_26">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="54.2" y="456.417805" transform="rotate(-0 54.2 456.417805)">1.0</text>
+     </g>
+    </g>
+   </g>
+   <g id="line2d_34">
+    <path d="M 61.2 453.272727  L 298.08 453.272727  " clip-path="url(#p7dfcd4f72e)" style="fill: none; stroke-dasharray: 1.6,2.4; stroke-dashoffset: 0; stroke: #5c6e7c; stroke-width: 0.8" />
+   </g>
+   <g id="line2d_35">
+    <path d="M 66.657743 459.064463  L 111.204566 479.767859  L 174.314079 499.339301  L 298.08 529.404131  " style="fill: none; stroke: #127d70; stroke-width: 2; stroke-linecap: square" />
+    <g>
+     <use ns4:href="#md26deef67e" x="66.657743" y="459.064463" style="fill: #127d70" />
+     <use ns4:href="#md26deef67e" x="111.204566" y="479.767859" style="fill: #127d70" />
+     <use ns4:href="#md26deef67e" x="174.314079" y="499.339301" style="fill: #127d70" />
+     <use ns4:href="#md26deef67e" x="298.08" y="529.404131" style="fill: #127d70" />
+    </g>
+   </g>
+   <g id="line2d_36">
+    <path d="M 66.657743 446.534266  L 111.204566 452.485115  L 174.314079 456.39837  L 298.08 461.515637  " style="fill: none; stroke-dasharray: 6,4; stroke-dashoffset: 0; stroke: #7e8f9f; stroke-width: 2" />
+    <g>
+     <use ns4:href="#m902880b0fc" x="66.657743" y="446.534266" style="fill: #7e8f9f" />
+     <use ns4:href="#m902880b0fc" x="111.204566" y="452.485115" style="fill: #7e8f9f" />
+     <use ns4:href="#m902880b0fc" x="174.314079" y="456.39837" style="fill: #7e8f9f" />
+     <use ns4:href="#m902880b0fc" x="298.08" y="461.515637" style="fill: #7e8f9f" />
+    </g>
+   </g>
+   <g id="text_27">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="308.08" y="532.710843" transform="rotate(-0 308.08 532.710843)">0.60×</text>
+   </g>
+   <g id="text_28">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #7e8f9f" x="308.08" y="464.820156" transform="rotate(-0 308.08 464.820156)">0.96×</text>
+   </g>
+  </g>
+  <g id="axes_4">
+   <g id="patch_9">
+    <path d="M 446.4 539.28  L 673.2 539.28  L 673.2 434.16  L 446.4 434.16  z " style="fill: #ffffff" />
+   </g>
+   <g id="matplotlib.axis_7">
+    <g id="xtick_12">
+     <g id="line2d_37" />
+     <g id="text_29">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="449.94375" y="552.570156" transform="rotate(-0 449.94375 552.570156)">1</text>
+     </g>
+    </g>
+    <g id="xtick_13">
+     <g id="line2d_38" />
+     <g id="text_30">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="474.75" y="552.570156" transform="rotate(-0 474.75 552.570156)">8</text>
+     </g>
+    </g>
+    <g id="xtick_14">
+     <g id="line2d_39" />
+     <g id="text_31">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="559.8" y="552.570156" transform="rotate(-0 559.8 552.570156)">32</text>
+     </g>
+    </g>
+    <g id="xtick_15">
+     <g id="line2d_40" />
+     <g id="text_32">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: middle; fill: #5c6e7c" x="673.2" y="552.570156" transform="rotate(-0 673.2 552.570156)">64</text>
+     </g>
+    </g>
+   </g>
+   <g id="matplotlib.axis_8">
+    <g id="ytick_10">
+     <g id="line2d_41">
+      <path d="M 446.4 539.28  L 673.2 539.28  " clip-path="url(#p8deb630a3b)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_42" />
+     <g id="text_33">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="439.4" y="542.425078" transform="rotate(-0 439.4 542.425078)">0</text>
+     </g>
+    </g>
+    <g id="ytick_11">
+     <g id="line2d_43">
+      <path d="M 446.4 504.24  L 673.2 504.24  " clip-path="url(#p8deb630a3b)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_44" />
+     <g id="text_34">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="439.4" y="507.385078" transform="rotate(-0 439.4 507.385078)">600</text>
+     </g>
+    </g>
+    <g id="ytick_12">
+     <g id="line2d_45">
+      <path d="M 446.4 469.2  L 673.2 469.2  " clip-path="url(#p8deb630a3b)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_46" />
+     <g id="text_35">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="439.4" y="472.345078" transform="rotate(-0 439.4 472.345078)">1,200</text>
+     </g>
+    </g>
+    <g id="ytick_13">
+     <g id="line2d_47">
+      <path d="M 446.4 434.16  L 673.2 434.16  " clip-path="url(#p8deb630a3b)" style="fill: none; stroke: #e3e9ed; stroke-width: 0.65; stroke-linecap: square" />
+     </g>
+     <g id="line2d_48" />
+     <g id="text_36">
+      <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="439.4" y="437.305078" transform="rotate(-0 439.4 437.305078)">1,800</text>
+     </g>
+    </g>
+   </g>
+   <g id="line2d_49">
+    <path d="M 449.94375 535.6008  L 474.75 521.468  L 559.8 502.6048  " style="fill: none; stroke-dasharray: 6,4; stroke-dashoffset: 0; stroke: #7e8f9f; stroke-width: 2" />
+    <g>
+     <use ns4:href="#m902880b0fc" x="449.94375" y="535.6008" style="fill: #7e8f9f" />
+     <use ns4:href="#m902880b0fc" x="474.75" y="521.468" style="fill: #7e8f9f" />
+     <use ns4:href="#m902880b0fc" x="559.8" y="502.6048" style="fill: #7e8f9f" />
+    </g>
+   </g>
+   <g id="line2d_50">
+    <path d="M 449.94375 534.4912  L 474.75 513.9928  L 559.8 479.8288  L 673.2 445.7232  " style="fill: none; stroke: #127d70; stroke-width: 2; stroke-linecap: square" />
+    <g>
+     <use ns4:href="#md26deef67e" x="449.94375" y="534.4912" style="fill: #127d70" />
+     <use ns4:href="#md26deef67e" x="474.75" y="513.9928" style="fill: #127d70" />
+     <use ns4:href="#md26deef67e" x="559.8" y="479.8288" style="fill: #127d70" />
+     <use ns4:href="#md26deef67e" x="673.2" y="445.7232" style="fill: #127d70" />
+    </g>
+   </g>
+   <g id="text_37">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #7e8f9f" x="569.8" y="505.909319" transform="rotate(-0 569.8 505.909319)">628</text>
+   </g>
+   <g id="text_38">
+    <text style="font-weight: 700; font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="683.2" y="448.339613" transform="rotate(-0 683.2 448.339613)">1,602</text>
+   </g>
+  </g>
+  <g id="line2d_51">
+   <path d="M 28.8 89.28  L 748.8 89.28  " style="fill: none; stroke: #e3e9ed; stroke-width: 0.8; stroke-linecap: square" />
+  </g>
+  <g id="line2d_52">
+   <path d="M 388.8 105.84  L 388.8 584.64  " style="fill: none; stroke: #e3e9ed; stroke-width: 0.8; stroke-linecap: square" />
+  </g>
+  <g id="line2d_53">
+   <path d="M 28.8 323.28  L 748.8 323.28  " style="fill: none; stroke: #e3e9ed; stroke-width: 0.8; stroke-linecap: square" />
+  </g>
+  <g id="line2d_54">
+   <path d="M 28.8 175.68  L 43.2 175.68  " style="fill: none; stroke: #7e8f9f; stroke-width: 1.9; stroke-linecap: square" />
+  </g>
+  <g id="line2d_55">
+   <path d="M 151.2 175.68  L 165.6 175.68  " style="fill: none; stroke: #127d70; stroke-width: 1.9; stroke-linecap: square" />
+  </g>
+  <g id="line2d_56">
+   <path d="M 28.8 414.72  L 43.2 414.72  " style="fill: none; stroke: #127d70; stroke-width: 1.9; stroke-linecap: square" />
+  </g>
+  <g id="line2d_57">
+   <path d="M 129.6 414.72  L 144 414.72  " style="fill: none; stroke-dasharray: 5.7,3.8; stroke-dashoffset: 0; stroke: #7e8f9f; stroke-width: 1.9" />
+  </g>
+  <g id="line2d_58">
+   <path d="M 413.28 414.72  L 427.68 414.72  " style="fill: none; stroke-dasharray: 5.7,3.8; stroke-dashoffset: 0; stroke: #7e8f9f; stroke-width: 1.9" />
+  </g>
+  <g id="line2d_59">
+   <path d="M 534.24 414.72  L 548.64 414.72  " style="fill: none; stroke: #127d70; stroke-width: 1.9; stroke-linecap: square" />
+  </g>
+  <g id="text_39">
+   <text style="font-weight: 700; font-size: 7.92px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="28.8" y="25.089609" transform="rotate(-0 28.8 25.089609)">PEGAINFER  /  SERVING MEASUREMENTS</text>
+  </g>
+  <g id="text_40">
+   <text style="font-weight: 700; font-size: 21.6px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #172b3a" x="28.8" y="55.269844" transform="rotate(-0 28.8 55.269844)">Performance across model families</text>
+  </g>
+  <g id="text_41">
+   <text style="font-size: 10.08px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="28.8" y="75.328594" transform="rotate(-0 28.8 75.328594)">Four workloads. Independent hardware and scales. Retained benchmark snapshots.</text>
+  </g>
+  <g id="text_42">
+   <text style="font-weight: 700; font-size: 7.92px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="28.8" y="112.929609" transform="rotate(-0 28.8 112.929609)">01</text>
+  </g>
+  <g id="text_43">
+   <text style="font-weight: 700; font-size: 16.56px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #172b3a" x="49.68" y="115.165547" transform="rotate(-0 49.68 115.165547)">Qwen3 · 4B</text>
+  </g>
+  <g id="text_44">
+   <text style="font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="28.8" y="134.182174" transform="rotate(-0 28.8 134.182174)">1 × RTX 5090 · BF16 · one request in flight</text>
+  </g>
+  <g id="text_45">
+   <text style="font-weight: 700; font-size: 10.08px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #172b3a" x="28.8" y="158.848594" transform="rotate(-0 28.8 158.848594)">Time per output token · p50, ms</text>
+  </g>
+  <g id="text_46">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="360" y="158.475937" transform="rotate(-0 360 158.475937)">Lower is better</text>
+  </g>
+  <g id="text_47">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="48.24" y="177.915853" transform="rotate(-0 48.24 177.915853)">PegaInfer baseline</text>
+  </g>
+  <g id="text_48">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="170.64" y="177.915853" transform="rotate(-0 170.64 177.915853)">PegaInfer + DSpark</text>
+  </g>
+  <g id="text_49">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="28.8" y="304.635853" transform="rotate(-0 28.8 304.635853)">Greedy decoding · Code = SPEED-Bench coding</text>
+  </g>
+  <g id="text_50">
+   <text style="font-weight: 700; font-size: 7.92px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="413.28" y="112.929609" transform="rotate(-0 413.28 112.929609)">02</text>
+  </g>
+  <g id="text_51">
+   <text style="font-weight: 700; font-size: 16.56px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #172b3a" x="434.16" y="115.165547" transform="rotate(-0 434.16 115.165547)">Qwen3.5 · 9B / 27B</text>
+  </g>
+  <g id="text_52">
+   <text style="font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="413.28" y="134.182174" transform="rotate(-0 413.28 134.182174)">1 × GH200 120 GB · BF16 · hybrid attention</text>
+  </g>
+  <g id="text_53">
+   <text style="font-weight: 700; font-size: 10.08px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #172b3a" x="413.28" y="158.848594" transform="rotate(-0 413.28 158.848594)">Output tokens / second</text>
+  </g>
+  <g id="text_54">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="744.48" y="158.475853" transform="rotate(-0 744.48 158.475853)">Higher is better</text>
+  </g>
+  <g id="text_55">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="413.28" y="177.915853" transform="rotate(-0 413.28 177.915853)">PegaInfer · random 1,024 in / 128 out · greedy</text>
+  </g>
+  <g id="text_56">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="413.28" y="304.635938" transform="rotate(-0 413.28 304.635938)">Concurrent requests</text>
+  </g>
+  <g id="text_57">
+   <text style="font-weight: 700; font-size: 7.92px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="28.8" y="351.969609" transform="rotate(-0 28.8 351.969609)">03</text>
+  </g>
+  <g id="text_58">
+   <text style="font-weight: 700; font-size: 16.56px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #172b3a" x="49.68" y="354.205547" transform="rotate(-0 49.68 354.205547)">Gemma 4 · 26B-A4B</text>
+  </g>
+  <g id="text_59">
+   <text style="font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="28.8" y="373.222174" transform="rotate(-0 28.8 373.222174)">1 × 48 GB GPU (SM89) · NVFP4 experts · c = 1</text>
+  </g>
+  <g id="text_60">
+   <text style="font-weight: 700; font-size: 10.08px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #172b3a" x="28.8" y="397.888495" transform="rotate(-0 28.8 397.888495)">End-to-end latency · PegaInfer / vLLM</text>
+  </g>
+  <g id="text_61">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="360" y="397.515938" transform="rotate(-0 360 397.515938)">Lower is better</text>
+  </g>
+  <g id="text_62">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="48.24" y="416.955938" transform="rotate(-0 48.24 416.955938)">vs BF16 KV</text>
+  </g>
+  <g id="text_63">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="149.04" y="416.955938" transform="rotate(-0 149.04 416.955938)">vs default FP8 KV</text>
+  </g>
+  <g id="text_64">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="28.8" y="563.835853" transform="rotate(-0 28.8 563.835853)">Prompt tokens · 256 output tokens · 1.0 = equal latency</text>
+  </g>
+  <g id="text_65">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="28.8" y="580.395853" transform="rotate(-0 28.8 580.395853)">PegaInfer KV: BF16 in both separately measured comparisons.</text>
+  </g>
+  <g id="text_66">
+   <text style="font-weight: 700; font-size: 7.92px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #127d70" x="413.28" y="351.969609" transform="rotate(-0 413.28 351.969609)">04</text>
+  </g>
+  <g id="text_67">
+   <text style="font-weight: 700; font-size: 16.56px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #172b3a" x="434.16" y="354.205547" transform="rotate(-0 434.16 354.205547)">GLM-5.2</text>
+  </g>
+  <g id="text_68">
+   <text style="font-size: 9.36px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="413.28" y="373.222266" transform="rotate(-0 413.28 373.222266)">GB300 · FP8 · native MTP · 4 vs 8 GPUs total</text>
+  </g>
+  <g id="text_69">
+   <text style="font-weight: 700; font-size: 10.08px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #172b3a" x="413.28" y="397.888594" transform="rotate(-0 413.28 397.888594)">Output tokens / second</text>
+  </g>
+  <g id="text_70">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: end; fill: #5c6e7c" x="744.48" y="397.515853" transform="rotate(-0 744.48 397.515853)">Higher is better</text>
+  </g>
+  <g id="text_71">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="432.72" y="416.955938" transform="rotate(-0 432.72 416.955938)">EP4 · 4 GPUs</text>
+  </g>
+  <g id="text_72">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="553.68" y="416.955938" transform="rotate(-0 553.68 416.955938)">P/D · 8 GPUs</text>
+  </g>
+  <g id="text_73">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="413.28" y="563.835853" transform="rotate(-0 413.28 563.835853)">Concurrent requests · random ~1K in / 128 out · greedy</text>
+  </g>
+  <g id="text_74">
+   <text style="font-size: 8.64px; font-family: Arial, Helvetica, sans-serif; text-anchor: start; fill: #5c6e7c" x="413.28" y="580.395938" transform="rotate(-0 413.28 580.395938)">P/D = TP4 prefill + EP4 decode on separate nodes.</text>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="pdc00b63b48">
+   <rect x="118.08" y="195.12" width="234" height="84.96" />
+  </clipPath>
+  <clipPath id="p5196db59a6">
+   <rect x="440.64" y="195.12" width="236.16" height="84.96" />
+  </clipPath>
+  <clipPath id="p7dfcd4f72e">
+   <rect x="61.2" y="434.16" width="236.88" height="105.12" />
+  </clipPath>
+  <clipPath id="p8deb630a3b">
+   <rect x="446.4" y="434.16" width="226.8" height="105.12" />
+  </clipPath>
+ </defs>
+<metadata id="benchmark-data">{"snapshot_date":"2026-09-05","qwen3":{"source":"https://github.com/pegainfer-project/pegainfer/blob/main/docs/models/qwen3/serving-performance.md#dspark-speculative-decoding","hardware":"1 x RTX 5090, BF16, TP1","workload":"ShareGPT and SPEED-Bench coding, concurrency 1, greedy","metric":"TPOT p50, milliseconds","revision_note":"DSpark table does not pin a revision; 70888b2 identifies a separate vLLM comparison in the report.","labels":["ShareGPT","SPEED-Bench · code"],"baseline":[5.83,5.87],"dspark":[2.96,3.07]},"qwen35":{"source":"https://pegainfer.org/models/qwen35/#gh200-08b-2b-9b-and-27b","hardware":"1 x GH200 120 GB, BF16, TP1","revision":"ffb959c4","workload":"Random 1024 input / 128 output tokens, greedy, benchmark client default seed","metric":"Output tokens per second","concurrency":[1,4,8],"9B":[131,352,516],"27B":[47,131,198]},"gemma4":{"source":"https://github.com/pegainfer-project/pegainfer/issues/758#issuecomment-5551665113","hardware":"1 x 48 GB SM89 GPU, NVFP4 routed experts through Marlin","workload":"Random prompts, 256 output tokens, concurrency 1, greedy, prefix caching off, four interleaved rounds","vllm_revision":"0.23.1rc1.dev1271+gb6ff8a2f5","metric":"End-to-end latency ratio: PegaInfer / vLLM; calculated from reported rounded median seconds","input_tokens":[10602,40002,81653,163336],"bf16":{"pegainfer_revision":"e7a41975","pegainfer_kv":"BF16","vllm_kv":"BF16","pegainfer_seconds":[3.2,7.27,16.28,43.91],"vllm_seconds":[3.3,8.44,21.45,72.98]},"fp8":{"pegainfer_revision":"ea02a9f7","pegainfer_kv":"BF16","vllm_kv":"FP8 (checkpoint default)","pegainfer_seconds":[3.23,7.31,16.24,43.93],"vllm_seconds":[3.12,7.28,16.51,45.91]},"limits":"Independent BF16 and FP8 comparison runs; no accuracy, concurrency or multi-turn conclusion. Maximum measured prompt 163336 tokens."},"glm52":{"source":"https://pegainfer.org/models/glm52/#performance","hardware":"GB300, FP8 model weights","workload":"Random requested 1024 input tokens, range ratio 0.8, 128 output tokens, greedy, ignore EOS","profile":"Native MTP, decode slots 32, draft span 2","metric":"Output tokens per second","revision_note":"Public page does not specify a revision for these tables.","ep4":{"gpus":4,"concurrency":[1,8,32],"tokens_per_second":[63,305,628]},"pd":{"gpus":8,"topology":"TP4 prefill + EP4 decode","concurrency":[1,8,32,64],"tokens_per_second":[82,433,1018,1602]},"limits":"Different GPU budgets; not a same-resource speedup. EP4 has no reported concurrency-64 measurement."}}</metadata></svg>

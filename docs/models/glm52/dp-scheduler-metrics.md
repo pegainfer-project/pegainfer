@@ -14,7 +14,7 @@ Expose the GLM5.2 scheduler gauges already supported by the vLLM Rust frontend:
 - `num_waiting_reqs`
 - `kv_cache_usage`
 
-The representation must match the real scheduling topology. EP8/DP8 must expose eight rank-local scheduler series; TP8 has one logical rank and must expose one series. Validate the result on 8x H200, measure matched performance before review, and submit the OpenInfer change as a PR. An upstream vLLM change is allowed only when the existing frontend cannot express this topology, and must be reviewed separately before implementation.
+The representation must match the real scheduling topology. EP8/DP8 must expose eight rank-local scheduler series; TP8 has one logical rank and must expose one series. Validate the result on 8x H200, measure matched performance before review, and submit the PegaInfer change as a PR. An upstream vLLM change is allowed only when the existing frontend cannot express this topology, and must be reviewed separately before implementation.
 
 ### Sources read
 
@@ -23,11 +23,11 @@ The representation must match the real scheduling topology. EP8/DP8 must expose 
 - `docs/models/glm52/continuous-batching.md`
 - `docs/models/glm52/serving-status.md`
 - `docs/conventions/bench-regression.md`
-- `openinfer-engine/src/engine.rs`
-- `openinfer-vllm-frontend/src/{lib,bridge}.rs`
-- `openinfer-glm52/src/{lib,scheduler/mod,scheduler/admission}.rs`
+- `pegainfer-engine/src/engine.rs`
+- `pegainfer-vllm-frontend/src/{lib,bridge}.rs`
+- `pegainfer-glm52/src/{lib,scheduler/mod,scheduler/admission}.rs`
 - vLLM latest `main` at public commit `c241c7a2b015f8168d1c75e80cee15e45c18ba94` (2026-07-10), especially its Rust engine-core client, metrics recorder, Python DP coordinator, EngineCore, scheduler, and metrics logger
-- The vLLM revision pinned by this workspace, confirming the required multi-engine routing and per-engine metrics mechanisms are already available to OpenInfer
+- The vLLM revision pinned by this workspace, confirming the required multi-engine routing and per-engine metrics mechanisms are already available to PegaInfer
 
 ### Findings
 
@@ -39,7 +39,7 @@ vLLM DP8 already has the desired model:
 4. The frontend registers `engine=0..7`, records eight Prometheus series, and routes new requests using a least-load score based on waiting and running counts.
 5. Aggregated text logging sums running/waiting and averages KV usage, but Prometheus retains the eight rank-local series.
 
-No upstream vLLM change is required. OpenInfer is the mismatch:
+No upstream vLLM change is required. PegaInfer is the mismatch:
 
 - The local frontend config hard-codes `engine_count=1`.
 - The bridge hard-codes `engine_index=0` and reports `data_parallel_size=1`.
@@ -97,10 +97,10 @@ The public HTTP surface remains one endpoint. The eight EP8 identities are inter
 
 ### Release gates
 
-- `openinfer-engine`: 10 passed.
-- `openinfer-vllm-frontend`: 22 passed.
+- `pegainfer-engine`: 10 passed.
+- `pegainfer-vllm-frontend`: 22 passed.
 - CPU frontend E2E, including live per-engine series, closed-feed lifecycle, request-local validation failure, and fail-fast topology mismatch coverage: 9 passed.
-- `openinfer-glm52`: 56 passed, 14 hardware oracle tests ignored by their explicit annotations.
+- `pegainfer-glm52`: 56 passed, 14 hardware oracle tests ignored by their explicit annotations.
 - GLM5.2-enabled server release check and release build passed.
 
 ### 8x H200 endpoint gates
@@ -145,4 +145,4 @@ The throughput delta is below run-to-run noise, while token latency is unchanged
 
 The important boundary is scheduler ownership, not endpoint count. EP8 has eight independent admission queues and KV pools even though clients see one HTTP endpoint, so it needs eight `SchedulerStats` identities. TP8 has one request stream mirrored across eight workers, so it needs one identity. Reusing vLLM's EngineCore registry keeps routing, request ownership, and Prometheus labels consistent; adding metrics as a separate aggregation layer would have made those three views disagree.
 
-No upstream vLLM change was needed. Its pinned Rust frontend already provides per-engine registration, frontend-local in-flight least-load routing, scheduler-stat gauges, and explicit DP-rank routing. OpenInfer only needed to expose its real logical partitions to that contract.
+No upstream vLLM change was needed. Its pinned Rust frontend already provides per-engine registration, frontend-local in-flight least-load routing, scheduler-stat gauges, and explicit DP-rank routing. PegaInfer only needed to expose its real logical partitions to that contract.

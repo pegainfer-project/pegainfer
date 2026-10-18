@@ -2,7 +2,7 @@
 
 > **TL;DR:** Enabling Green Context SM partitioning (`--decode-overlap green-ctx --decode-sm-pct 20`) runs prefill and decode on disjoint SM partitions (decode 32 SM / prefill 138 SM on a 5090's 170 SM) so a decode no longer stalls behind a co-scheduled prefill in the unified step. On the 5090 mid-band (`vllm bench serve` random in=1024/out=128, QPS 8–12) this **halves ITL p99** (44.8→22.5 / 46.7→24.7 / 56.6→26.9 ms) and cuts TPOT mean (up to −22% @QPS12) — at the cost of a **2–4× TTFT regression** (prefill loses SMs *and* is deferred to the next scheduler iteration). Restoring decode's CUDA graph under the partition (the "two-graph" change) adds a further **~5% ITL p99 / 1–4% TPOT** with zero correctness cost. Net: this is a TTFT↔ITL/TPOT trade, not a free win — turn it on only when steady-state token smoothness matters more than first-token latency.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-07
 
 Select the prefill/decode overlap mode with one CLI flag (`--decode-overlap`, off by default):
 
@@ -12,11 +12,11 @@ Select the prefill/decode overlap mode with one CLI flag (`--decode-overlap`, of
 | `stream` | two CUDA streams sharing all SMs — concurrency, no SM partition. |
 | `green-ctx` | two streams pinned to disjoint Green Context SM partitions; `--decode-sm-pct <N>` (default 20) sets decode's share. |
 
-`green-ctx` fails loudly: if the driver/VRAM combo rejects SM-pinned streams (the Xid-31 risk below), startup aborts with a message pointing at `--decode-overlap stream` — it does **not** silently degrade to the shared path, so a benchmark always measures the mode you asked for. The public knob is the `DecodeOverlap` enum (`green_ctx.rs`), threaded through `start_engine_with_offload`. Implementation: `green_ctx.rs` (`OverlapStreams` — partition + streams), `executor.rs` `SplitConcurrent` (the split step), `scheduler.rs` (when it fires).
+`green-ctx` fails loudly: if the driver/VRAM combo rejects SM-pinned streams (or the requested split isn't viable for the SM granularity), startup aborts rather than silently degrading to the shared path, so a benchmark always measures the mode you asked for. The stream-creation failure suggests `--decode-overlap stream`; a non-viable split reports the SM counts so you can retune `--decode-sm-pct`. The public knob is the `DecodeOverlap` enum (`green_ctx.rs`), threaded through `start_engine_with_offload`. Implementation: `green_ctx.rs` (`OverlapStreams` — partition + streams), `executor.rs` `SplitConcurrent` (the split step), `scheduler.rs` (when it fires).
 
 ## When the split actually fires
 
-`SplitConcurrent` is taken **only for a Unified step** — one that contains both prefill and decode work (`scheduler.rs:492`). A lone request (prefill then pure decode) never splits; its decode runs on the full-SM path with the normal CUDA graph. So the partition only matters under mixed load — exactly the mid-band (QPS 8–12 here, ~1800 split steps over a 3×60 s sweep). Below that there is nothing to overlap; well above it the box is decode-throughput-bound and the picture changes again (not measured here).
+`SplitConcurrent` is taken **only for a Unified step** — one that contains both prefill and decode work (the `has_decode_overlap() && Unified` gate in `scheduler.rs`). A lone request (prefill then pure decode) never splits; its decode runs on the full-SM path with the normal CUDA graph. So the partition only matters under mixed load — exactly the mid-band (QPS 8–12 here, ~1800 split steps over a 3×60 s sweep). Below that there is nothing to overlap; well above it the box is decode-throughput-bound and the picture changes again (not measured here).
 
 In the split step the scheduler **syncs decode and returns immediately, deferring the prefill**: prefill kernels stay in flight on the prefill stream and are polled at the top of the next iteration (`executor.rs` `InflightPrefillState`). This is *why* TTFT regresses so hard at high QPS — prefill is both squeezed onto fewer SMs and pushed behind decode. The decode-side win and the TTFT loss have the same root cause (decode is prioritized), so they move together; tuning `decode_pct` rebalances but cannot remove the trade.
 
@@ -26,10 +26,10 @@ Before: the split path forced `enable_cuda_graph = false`, so decode ran eager w
 
 The fix rests on one CUDA rule (Programming Guide §4.6.5, mirrored in `docs/lessons/cuda-green-contexts.md`): **stream capture binds each kernel node to the execution context of the stream it is captured on.** A decode graph captured *on the green decode stream* therefore replays on the decode partition's SMs regardless of which stream launches it. So:
 
-- `CudaGraphState` (openinfer-core) now captures/replays on `active_cu_stream(ctx)` — the thread-local stream override, which is the green decode stream inside the split step and `ctx.stream` everywhere else. Rewritten on the raw driver API (`cuStreamBeginCapture_v2`/`cuStreamEndCapture`/`cuGraphInstantiateWithFlags`/`cuGraphLaunch`) because cudarc's `CudaGraph` is bound to a `CudaStream` object and the green stream is a bare `CUstream`. Behaviour with no override is identical to before, so qwen35 / kimi-k2 are unaffected.
+- `CudaGraphState` (pegainfer-core) now captures/replays on `active_cu_stream(ctx)` — the thread-local stream override, which is the green decode stream inside the split step and `ctx.stream` everywhere else. Rewritten on the raw driver API (`cuStreamBeginCapture_v2`/`cuStreamEndCapture`/`cuGraphInstantiateWithFlags`/`cuGraphLaunch`) because cudarc's `CudaGraph` is bound to a `CudaStream` object and the green stream is a bare `CUstream`. Behaviour with no override is identical to before, so qwen35 / kimi-k2 are unaffected.
 - A graph captured on `ctx.stream` (full-SM, primary ctx) and one captured on the green decode stream are different objects, so `BatchDecodeBuffers` keeps **two** caches — `graphs` and `graphs_split` — selected by `has_stream_override()`. Same decode buffers back both, so pointer stability holds for both.
 
-Why this is safe even though the per-step H2D (token_ids/positions/paged meta) lands on `ctx.stream` while the graph replays on the decode stream: that cross-stream ordering already had to be correct for the *eager* split path, which shipped and ran clean. Graph replay submits the same kernels to the same stream, so it inherits the same ordering. The H2D sits outside the captured region (it runs before `run_or_capture`), so capture never sees a copy.
+Why this is safe even though the per-step H2D (token_ids/positions/paged meta) lands on `ctx.stream` while the graph replays on the decode stream: a producer fence orders that H2D ahead of the decode stream's read (`fence_producers_before_override`, see Pitfalls). Graph replay submits the same kernels to the same stream, so it inherits the same ordering. The H2D sits outside the captured region (it runs before `run_or_capture`), so capture never sees a copy.
 
 ## A/B data (5090, Qwen3-4B, random in=1024/out=128, Poisson seed 42, 60 s/point, idle GPU 0)
 
@@ -63,11 +63,13 @@ Power climbs with QPS: at QPS 8 the board still has headroom (draw oscillates ~5
 
 ## Pitfalls
 
-- **The Xid 31/43 hit during bring-up was a cross-stream buffer use-after-free, and it is fixed — not an open driver risk.** Prefill temp buffers (`token_ids`, `PrefillBuffers`) were allocated/freed on `ctx.stream` while still in flight on the override stream. The fix: sync `ctx.stream` before installing the stream override, and defer those buffers' drop until the prefill stream syncs (`prefill::DEFERRED_DROPS`, commits `bec0082`/`b39e4fe`/`aa4beec`/`65834e8`). The separate theory that `cuGreenCtxStreamCreate` *itself* faults on driver 590 + >16 GB resident did **not** reproduce: this 5090 (driver 590.48.01, ~27 GB resident — 19.3 GB of it KV) ran green-ctx clean across both 2026-06-19 sweeps and the 2026-06-20 three-mode smoke (split path fired, 0 Xid). green-ctx still fails loud if stream creation ever errors for any reason; fall back with `--decode-overlap stream`.
+- **The Xid 31/43 hit during bring-up was a cross-stream buffer use-after-free; the supported success and checked-`Result` paths are fixed — not an open driver risk.** Prefill temporaries are allocated on `ctx.stream` but consumed by override-stream kernels; the fix is a producer fence (`green_ctx::fence_producers_before_override`, ordering each `ctx.stream` alloc/H2D ahead of its override consumer) plus RAII stream drains that hold each stream until its kernels finish before any buffer frees or KV page is released — `PrefillTempBin` (prefill) and `DecodeStreamGuard` (decode), each fail-closed (a sync failure aborts). An arbitrary panic that unwinds past a not-yet-parked prefill buffer is out of scope.
+- **The "`cuGreenCtxStreamCreate` itself faults on driver 590 + >16 GB resident" theory did not reproduce.** This 5090 (driver 590.48.01, ~27 GB resident — 19.3 GB of it KV) ran green-ctx clean across both 2026-06-19 sweeps and the 2026-06-20 three-mode smoke (split path fired, 0 Xid).
+
 - **`gemm_lt` is still disabled under the stream override** (`5af4fd5`, to avoid the cuBLASLt workspace Xid-31 path). So split-path decode keeps its CUDA graph but loses the per-shape Lt tuning — a remaining decode-side lever, not yet re-measured under the partition.
 - **A single request never exercises the split path** — smoke-test with concurrent load or you are only testing the full-SM graph.
-- **`pkill` from an ssh one-liner matches its own command line** — use `pkill -f "[t]arget/release/openinfer"`, and kill/launch in separate ssh invocations.
-- Build on the 5090 with `CUDA_HOME=/usr/local/cuda-13.1` (stale `/usr/local/cuda` → cuBLAS 12.9 N=1025 cliff; see `serving-perf-5090.md`). Verify `ldd target/release/openinfer | grep cublas` shows `.so.13`.
+- **`pkill` from an ssh one-liner matches its own command line** — use `pkill -f "[t]arget/release/pegainfer"`, and kill/launch in separate ssh invocations.
+- Build on the 5090 with `CUDA_HOME=/usr/local/cuda-13.1` (stale `/usr/local/cuda` → cuBLAS 12.9 N=1025 cliff; see `serving-perf-5090.md`). Verify `ldd target/release/pegainfer | grep cublas` shows `.so.13`.
 
 ## Next
 

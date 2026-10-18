@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible HTTP serving benchmark for openinfer.
+"""OpenAI-compatible HTTP serving benchmark for pegainfer.
 
-The harness intentionally talks to /v1/completions over HTTP instead of using
-the in-process bench_serving binary. It records streaming TTFT/ITL/TPOT,
+The harness talks to /v1/completions over HTTP so it measures the real
+serving path (frontend + bridge + engine). It records streaming TTFT/ITL/TPOT,
 request latency, QPS, error rate, timeout rate, and deterministic output hashes.
 """
 
@@ -371,7 +371,7 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
     active_set_counts = value_counts([str(value) for value in active_set_sizes])
     decode_batch_counts = value_counts([str(value) for value in decode_batch_sizes])
     return {
-        "source": "server log lines matching `openinfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
+        "source": "server log lines matching `pegainfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
         "traced_requests": len(traced),
         "attached_server_records": len(attached),
         "server_error_records": len(server_error_records),
@@ -824,7 +824,7 @@ def failed_result(
     )
 
 
-TRACE_RE = re.compile(r"openinfer_http_trace\s+(\{.*\})")
+TRACE_RE = re.compile(r"pegainfer_http_trace\s+(\{.*\})")
 STREAM_ERROR_RE = re.compile(r'request failed .*self\.request_id="([^"]+)"')
 TRACE_MATCH_SLOP_S = 5.0
 
@@ -995,7 +995,7 @@ def run_batch(
     label = "measured" if measured else "warmup"
     request_id_prefix = arg_value(args, "request_id_prefix", None)
     if request_id_prefix is None:
-        request_id_prefix = f"openinfer-bench-{uuid.uuid4().hex}"
+        request_id_prefix = f"pegainfer-bench-{uuid.uuid4().hex}"
         args.request_id_prefix = request_id_prefix
     shapes = workload_shapes(args.prompt_words, args.max_tokens)
     prompt_pool = load_prompt_pool(args)
@@ -1278,7 +1278,7 @@ def parse_args() -> argparse.Namespace:
         "--server-command", help="Server launch command used for this run."
     )
     parser.add_argument(
-        "--commit", help="OpenInfer commit for this run; defaults to git HEAD."
+        "--commit", help="PegaInfer commit for this run; defaults to git HEAD."
     )
     parser.add_argument(
         "--source-revision", help="Exact source-tree revision identifier."
@@ -1322,7 +1322,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--server-log",
         type=Path,
-        help="Optional openinfer server log containing openinfer_http_trace lines for TTFT phase attribution.",
+        help="Optional pegainfer server log containing pegainfer_http_trace lines for TTFT phase attribution.",
     )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()

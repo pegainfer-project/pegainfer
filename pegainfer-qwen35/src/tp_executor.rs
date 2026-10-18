@@ -1,0 +1,2457 @@
+//! Tensor-parallel worker runtime for Qwen3.5.
+//!
+//! One canonical eager unified command per step. Linear-attention/GDR weights
+//! and state are sharded per rank; decode rows run as one batched forward per
+//! rank plus one batched rank-0 sampling pass.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::thread::{self};
+use std::time::Instant;
+
+use anyhow::Result;
+use pegainfer_frontend::sampler::SamplingParams;
+use pegainfer_kv_cache::KvCacheManager;
+use pegainfer_kv_cache::KvView;
+use pegainfer_kv_cache::RequestKv;
+
+use crate::batch_decode::DecodeGraphUse;
+use crate::batch_decode_graph::BATCH_BUCKETS;
+use crate::batch_decode_graph::BatchDecodeGraphState;
+use crate::batch_decode_graph::bucket_for;
+use crate::config::TensorParallelConfig;
+use crate::decode_buffers::BatchDecodeBuffers35;
+use crate::executor::DecodePlan;
+use crate::executor::DecodeRequestResult;
+use crate::executor::DecodeResult;
+#[cfg(test)]
+use crate::executor::DecodeStepItem;
+use crate::executor::PrefillPlan;
+use crate::executor::PrefillRequestResult;
+use crate::executor::PrefillResult;
+use crate::executor::PrefillStepItem;
+use crate::executor::RequestId;
+use crate::logprobs::snapshot_requested_logprobs;
+use crate::prefill::PREFILL_CHUNK_LEN;
+use crate::prefill_buffers::GdrChunkwiseScratch35;
+use crate::prefix_cache::Qwen35PrefixCache;
+use crate::prefix_cache::RecurrentStateStore;
+use crate::prefix_cache::SnapshotGuard;
+use crate::recurrent_state::LinearStatePointerTables;
+use crate::recurrent_state::RecurrentState;
+use crate::weights::ModelRuntimeConfig;
+use crate::weights::Qwen35Model;
+
+mod responses;
+mod worker;
+
+use responses::*;
+use worker::*;
+
+/// The pre-capture sweep records every decode bucket per rank; the 60 s NCCL
+/// startup budget is far too small for that.
+const TP_PRECAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const TRITON_AOT_DEVICE_TABLE_LEN: usize = 16;
+
+#[derive(Debug)]
+pub(crate) enum TpBeginRequestError {
+    Recoverable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl TpBeginRequestError {
+    pub(crate) fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Recoverable(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
+/// One controller-barriered phase of the TP decode-graph pre-capture sweep.
+///
+/// Capture and launch are separate phases because a captured collective's
+/// first launch blocks on its peers: overlapping that with a peer still in
+/// capture/instantiate/upload (which contend driver locks and allocate device
+/// memory) deadlocks the driver. So every rank finishes capturing a bucket
+/// before any rank launches it.
+#[derive(Clone, Copy, Debug)]
+enum PrecapturePhase {
+    /// One eager all-reduce per bucket message size, so the size-selected NCCL
+    /// algorithm connects before any `cuStreamBeginCapture` records it.
+    Warmup,
+    /// Record + instantiate + upload one bucket; no launch, no cross-rank dependency.
+    Capture { bucket_idx: usize },
+    /// Launch one bucket (pure enqueue after `Capture`) + sync; collectives pair across ranks.
+    Launch { bucket_idx: usize },
+    /// Verify every reachable bucket captured.
+    Finalize,
+}
+
+/// Scheduler-owned slot move for TP graph decode: when the request at slot
+/// `to` retires mid-batch, the request at slot `from` (the last occupied slot)
+/// takes over slot `to` so decode rows stay dense. Workers apply the move and
+/// fail (poisoning the executor) if slot occupancy does not match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TpSlotCompaction {
+    pub(crate) moved_request_id: RequestId,
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+}
+
+#[allow(dead_code)]
+enum TpWorkerCommand {
+    RestoreRequest {
+        request_id: RequestId,
+        snapshot_slot: Option<usize>,
+        boundary: usize,
+        start: Arc<TpCommandStartGate>,
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    SaveSnapshot {
+        request_id: RequestId,
+        snapshot_slot: usize,
+        start: Arc<TpCommandStartGate>,
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    Ping {
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    RunPrefillChunks {
+        chunks: Vec<TpPrefillChunkItem>,
+        kv_views: Vec<KvView>,
+        sample_seed: u64,
+        start: Arc<TpCommandStartGate>,
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    RunDecodeStep {
+        requests: Vec<TpDecodeStepItem>,
+        kv_views: Vec<KvView>,
+        sample_seed: u64,
+        start: Arc<TpCommandStartGate>,
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    RunUnifiedStep {
+        plan: TpUnifiedPlan,
+        prefill_views: Vec<KvView>,
+        decode_views: Vec<KvView>,
+        start: Arc<TpCommandStartGate>,
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    DropRequest {
+        request_id: RequestId,
+        /// Slot move the scheduler already applied to its own bookkeeping;
+        /// `Some` only when the dropped request held a decode slot that a
+        /// still-active request now takes over. Eager workers ignore it.
+        compaction: Option<TpSlotCompaction>,
+        start: Arc<TpCommandStartGate>,
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    /// Startup-only (graph-enabled TP): one phase of the decode-graph
+    /// pre-capture sweep, barriered across ranks by the controller.
+    Precapture {
+        phase: PrecapturePhase,
+        start: Arc<TpCommandStartGate>,
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    #[cfg(test)]
+    SnapshotState {
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    #[cfg(test)]
+    RemoveRequestStateForTest {
+        request_id: RequestId,
+        resp: mpsc::Sender<bool>,
+    },
+    #[cfg(test)]
+    DisconnectForTest {
+        ready: mpsc::SyncSender<()>,
+    },
+    Shutdown,
+}
+
+/// Scheduler-owned lifecycle proof required from every TP rank during cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropExpectation {
+    MustBeAbsent,
+    MustExist,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TpCommandDecision {
+    #[default]
+    Pending,
+    Execute,
+    Cancel,
+}
+
+#[derive(Default)]
+struct TpCommandStartGate {
+    decision: Mutex<TpCommandDecision>,
+    changed: Condvar,
+}
+
+impl TpCommandStartGate {
+    fn execute(&self) -> bool {
+        self.resolve(TpCommandDecision::Execute)
+    }
+
+    fn cancel(&self) -> bool {
+        self.resolve(TpCommandDecision::Cancel)
+    }
+
+    fn wait(&self) -> TpCommandDecision {
+        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
+        while *decision == TpCommandDecision::Pending {
+            decision = self
+                .changed
+                .wait(decision)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *decision
+    }
+
+    fn resolve(&self, next: TpCommandDecision) -> bool {
+        let mut decision = self.decision.lock().unwrap_or_else(PoisonError::into_inner);
+        if *decision != TpCommandDecision::Pending {
+            return false;
+        }
+        *decision = next;
+        self.changed.notify_all();
+        true
+    }
+}
+
+#[derive(Default)]
+struct TpRuntimePoison {
+    reason: Mutex<Option<String>>,
+}
+
+impl TpRuntimePoison {
+    fn poison(&self, reason: String) -> String {
+        let mut current = self.reason.lock().unwrap_or_else(PoisonError::into_inner);
+        current.get_or_insert(reason).clone()
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        if let Some(reason) = self
+            .reason
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            anyhow::bail!("Qwen3.5 TP executor is poisoned: {reason}");
+        }
+        Ok(())
+    }
+}
+
+/// TP executor. Rank 0 is the primary worker and returns scheduler-visible
+/// artifacts; every rank runs the same ordered state-mutating commands.
+pub struct Qwen35TpExecutor {
+    kv_cache: Qwen35PrefixCache,
+    request_kvs: HashMap<RequestId, RequestKv>,
+    workers: Vec<TpWorker>,
+    poison: Arc<TpRuntimePoison>,
+    world_size: usize,
+    max_batch: usize,
+    page_size: usize,
+    capacity_pages_for_requests: usize,
+    max_position_embeddings: usize,
+    eos_token_ids: Vec<u32>,
+    /// Whether decode steps replay pre-captured CUDA Graphs that record NCCL
+    /// collectives (`enable_cuda_graph` AND a compiled TP-local decode GQA
+    /// group; see the P2c gate in `tp-design.md`).
+    graph_enabled: bool,
+    /// Slot tracker for the convenience `execute_prefill`/`execute_decode`/
+    /// `drop_request` API (model-local tests), mirroring the single-GPU
+    /// `Qwen35Executor`: prefill completion appends, decode plans must cover
+    /// every tracked request in slot order, drop swap-removes and derives the
+    /// slot compaction. Scheduler-driven flows bypass it entirely — they pass
+    /// explicit slots via `execute_decode_items` and
+    /// `drop_request_with_compaction`. Never mix the two flows on one executor.
+    active_slots: Mutex<Vec<RequestId>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TpPrefillChunkItem {
+    request_id: RequestId,
+    prompt_tokens: Vec<u32>,
+    logprobs: Option<usize>,
+    sampling_params: SamplingParams,
+    finish_prefill: bool,
+}
+
+impl TpPrefillChunkItem {
+    fn new(
+        request_id: RequestId,
+        prompt_tokens: Vec<u32>,
+        logprobs: Option<usize>,
+        finish_prefill: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            prompt_tokens,
+            logprobs,
+            sampling_params: SamplingParams::default(),
+            finish_prefill,
+        }
+    }
+
+    pub(crate) fn new_with_sampling(
+        request_id: RequestId,
+        prompt_tokens: Vec<u32>,
+        logprobs: Option<usize>,
+        sampling_params: SamplingParams,
+        finish_prefill: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            prompt_tokens,
+            logprobs,
+            sampling_params,
+            finish_prefill,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TpDecodeStepItem {
+    request_id: RequestId,
+    token_id: u32,
+    logprobs: Option<usize>,
+    sampling_params: SamplingParams,
+    /// Scheduler-assigned decode slot under CUDA Graph TP. Rows must arrive in
+    /// dense slot order (`slot_idx == row`); on the request's first decode row
+    /// the worker D2D-copies its prefill recurrent state into the slot and
+    /// drops the per-request allocation. `None` on the slot-free eager path.
+    slot_idx: Option<usize>,
+}
+
+impl TpDecodeStepItem {
+    pub(crate) fn new(
+        request_id: RequestId,
+        token_id: u32,
+        logprobs: Option<usize>,
+        sampling_params: SamplingParams,
+    ) -> Self {
+        Self {
+            request_id,
+            token_id,
+            logprobs,
+            sampling_params,
+            slot_idx: None,
+        }
+    }
+
+    pub(crate) fn new_with_slot(
+        request_id: RequestId,
+        token_id: u32,
+        logprobs: Option<usize>,
+        sampling_params: SamplingParams,
+        slot_idx: usize,
+    ) -> Self {
+        Self {
+            slot_idx: Some(slot_idx),
+            ..Self::new(request_id, token_id, logprobs, sampling_params)
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TpUnifiedPlan {
+    pub(crate) prefill: Vec<TpPrefillChunkItem>,
+    pub(crate) decode: Vec<TpDecodeStepItem>,
+    pub(crate) prefill_sample_seed: u64,
+    pub(crate) decode_sample_seed: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct TpUnifiedResult {
+    pub(crate) prefill: PrefillResult,
+    pub(crate) decode: DecodeResult,
+}
+
+impl Qwen35TpExecutor {
+    fn schedule_prefill(&mut self, chunks: &[TpPrefillChunkItem]) -> Result<Vec<KvView>> {
+        anyhow::ensure!(
+            chunks
+                .iter()
+                .all(|c| self.request_kvs.contains_key(&c.request_id)),
+            "TP prefill requires begin_request"
+        );
+        for (scheduled, chunk) in chunks.iter().enumerate() {
+            if let Err(error) = self.kv_cache.schedule_prefill(
+                self.request_kvs.get_mut(&chunk.request_id).unwrap(),
+                chunk.prompt_tokens.len(),
+            ) {
+                for prior in &chunks[..scheduled] {
+                    self.request_kvs
+                        .get_mut(&prior.request_id)
+                        .unwrap()
+                        .revert_schedule()?;
+                }
+                return Err(error);
+            }
+        }
+        Ok(chunks
+            .iter()
+            .map(|c| {
+                self.kv_cache
+                    .prefill_view(&self.request_kvs[&c.request_id], c.prompt_tokens.len())
+            })
+            .collect())
+    }
+    fn schedule_decode(&mut self, requests: &[TpDecodeStepItem]) -> Result<Vec<KvView>> {
+        anyhow::ensure!(
+            requests
+                .iter()
+                .all(|r| self.request_kvs.contains_key(&r.request_id)),
+            "TP decode requires begin_request"
+        );
+        for (scheduled, request) in requests.iter().enumerate() {
+            if let Err(error) = self
+                .kv_cache
+                .schedule_decode(self.request_kvs.get_mut(&request.request_id).unwrap())
+            {
+                for prior in &requests[..scheduled] {
+                    self.request_kvs
+                        .get_mut(&prior.request_id)
+                        .unwrap()
+                        .revert_schedule()?;
+                }
+                return Err(error);
+            }
+        }
+        Ok(requests
+            .iter()
+            .map(|r| self.kv_cache.decode_view(&self.request_kvs[&r.request_id]))
+            .collect())
+    }
+
+    fn revert_requests<'a>(&mut self, request_ids: impl IntoIterator<Item = &'a RequestId>) {
+        for request_id in request_ids {
+            if let Some(request) = self.request_kvs.get_mut(request_id) {
+                if let Err(error) = self.kv_cache.revert_schedule(request) {
+                    log::warn!(
+                        "failed to revert request {} KV schedule: {error}",
+                        request_id.get()
+                    );
+                }
+            }
+        }
+    }
+    fn apply_prefill_result(
+        &mut self,
+        chunks: &[TpPrefillChunkItem],
+        result: &PrefillResult,
+    ) -> Result<()> {
+        for chunk in chunks {
+            let first_token = if chunk.finish_prefill {
+                Some(
+                    result
+                        .requests
+                        .iter()
+                        .find(|r| r.request_id == chunk.request_id)
+                        .ok_or_else(|| anyhow::anyhow!("missing final prefill artifact"))?
+                        .first_token,
+                )
+            } else {
+                None
+            };
+            let kv = self.request_kvs.get_mut(&chunk.request_id).unwrap();
+            let boundary = self.kv_cache.apply_prefill(kv, first_token)?;
+            if let Some(reservation) = self.kv_cache.reserve_snapshot(kv, boundary)? {
+                match self.broadcast_save_snapshot(chunk.request_id, reservation.recurrent_slot()) {
+                    Ok(positions) if positions.iter().all(|&p| p == boundary) => {
+                        self.kv_cache.publish_snapshot(reservation);
+                    }
+                    result => {
+                        self.kv_cache.abort_snapshot(reservation);
+                        let positions = result?;
+                        anyhow::bail!(
+                            "TP snapshot boundary mismatch: {positions:?}, expected {boundary}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn apply_decode_result(
+        &mut self,
+        requests: &[TpDecodeStepItem],
+        result: &DecodeResult,
+    ) -> Result<()> {
+        for request in requests {
+            let token = result
+                .requests
+                .iter()
+                .find(|r| r.request_id == request.request_id)
+                .ok_or_else(|| anyhow::anyhow!("missing decode artifact"))?
+                .token;
+            self.kv_cache.apply_decode(
+                self.request_kvs.get_mut(&request.request_id).unwrap(),
+                token,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Admit one request. An error leaves no distributed request state behind
+    /// unless the executor is poisoned and can no longer serve another command.
+    pub(crate) fn begin_request(
+        &mut self,
+        request_id: RequestId,
+        prompt_tokens: &[u32],
+        max_output_tokens: usize,
+        lora_name: Option<&str>,
+        allow_match: bool,
+    ) -> Result<usize, TpBeginRequestError> {
+        self.poison
+            .ensure_healthy()
+            .map_err(TpBeginRequestError::Fatal)?;
+        if self.request_kvs.contains_key(&request_id) {
+            return Err(TpBeginRequestError::Recoverable(anyhow::anyhow!(
+                "Qwen3.5 TP request {} already exists",
+                request_id.get()
+            )));
+        }
+        let (mut kv, restore) = self
+            .kv_cache
+            .begin_request(prompt_tokens, max_output_tokens, lora_name, allow_match)
+            .map_err(TpBeginRequestError::Recoverable)?;
+        let boundary = restore.as_ref().map_or(0, SnapshotGuard::boundary);
+        let snapshot_slot = restore.as_ref().map(SnapshotGuard::recurrent_slot);
+        let positions = match self.broadcast_restore_request(request_id, snapshot_slot, boundary) {
+            Ok(positions) => positions,
+            Err(error) => {
+                let _ = self.kv_cache.release_request(&mut kv);
+                return Err(TpBeginRequestError::Fatal(error));
+            }
+        };
+        let cached_tokens = if let Some(restore) = restore {
+            match self.kv_cache.finish_restore(&kv, restore, &positions) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    let _ = self.drop_request(request_id, DropExpectation::MustExist);
+                    let _ = self.kv_cache.release_request(&mut kv);
+                    return Err(TpBeginRequestError::Fatal(
+                        self.poison_after_mutation("request restore", &error),
+                    ));
+                }
+            }
+        } else {
+            if !positions.iter().all(|&position| position == 0) {
+                let _ = self.drop_request(request_id, DropExpectation::MustExist);
+                let _ = self.kv_cache.release_request(&mut kv);
+                let error = anyhow::anyhow!(
+                    "Qwen3.5 TP cold request restored non-zero positions {positions:?}"
+                );
+                return Err(TpBeginRequestError::Fatal(
+                    self.poison_after_mutation("request restore", &error),
+                ));
+            }
+            0
+        };
+        self.request_kvs.insert(request_id, kv);
+        Ok(cached_tokens)
+    }
+
+    pub(crate) fn available_pages(&self) -> usize {
+        self.kv_cache.pool().available_blocks()
+    }
+
+    pub(crate) fn active_joint_prefix_pages(
+        &self,
+        prompt_tokens: &[u32],
+        lora_name: Option<&str>,
+    ) -> usize {
+        self.kv_cache
+            .active_joint_prefix_pages(prompt_tokens, lora_name)
+    }
+
+    pub(crate) fn prefix_cache_enabled(&self) -> bool {
+        self.kv_cache.enabled()
+    }
+
+    pub(crate) fn log_prefix_cache_stats(&self) {
+        let stats = self.kv_cache.stats();
+        log::info!(
+            "prefix cache summary: ranks={}, joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
+            self.world_size,
+            stats.joint_hits,
+            stats.joint_hit_tokens,
+            stats.kv_only_fallbacks,
+            stats.snapshot_misses,
+            stats.inserts,
+            stats.evictions,
+            self.kv_cache.snapshot_occupancy(),
+            self.kv_cache.snapshot_slots(),
+        );
+    }
+
+    fn broadcast_restore_request(
+        &self,
+        request_id: RequestId,
+        snapshot_slot: Option<usize>,
+        boundary: usize,
+    ) -> Result<Vec<usize>> {
+        let resp_rx = self.dispatch_mutating("RestoreRequest", |start, resp| {
+            TpWorkerCommand::RestoreRequest {
+                request_id,
+                snapshot_slot,
+                boundary,
+                start,
+                resp,
+            }
+        })?;
+        let responses =
+            recv_runtime_responses(&resp_rx, self.world_size, "RestoreRequest", &self.poison)?;
+        validate_dispatched_responses(
+            validate_position_responses(responses, self.world_size),
+            "RestoreRequest",
+            &self.poison,
+        )
+    }
+
+    fn broadcast_save_snapshot(
+        &self,
+        request_id: RequestId,
+        snapshot_slot: usize,
+    ) -> Result<Vec<usize>> {
+        let resp_rx = self.dispatch_mutating("SaveSnapshot", |start, resp| {
+            TpWorkerCommand::SaveSnapshot {
+                request_id,
+                snapshot_slot,
+                start,
+                resp,
+            }
+        })?;
+        let responses =
+            recv_runtime_responses(&resp_rx, self.world_size, "SaveSnapshot", &self.poison)?;
+        validate_dispatched_responses(
+            validate_position_responses(responses, self.world_size),
+            "SaveSnapshot",
+            &self.poison,
+        )
+    }
+
+    pub fn from_runtime_with_capacity(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinals: &[usize],
+        max_batch: usize,
+    ) -> Result<Self> {
+        Self::from_runtime_with_limits(
+            model_path,
+            enable_cuda_graph,
+            device_ordinals,
+            max_batch,
+            PREFILL_CHUNK_LEN,
+        )
+    }
+
+    pub(crate) fn from_runtime_with_limits(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinals: &[usize],
+        max_batch: usize,
+        max_prefill_tokens: usize,
+    ) -> Result<Self> {
+        Self::from_runtime_with_limits_and_prefix(
+            model_path,
+            enable_cuda_graph,
+            device_ordinals,
+            max_batch,
+            max_prefill_tokens,
+            0,
+        )
+    }
+
+    pub(crate) fn from_runtime_with_limits_and_prefix(
+        model_path: &str,
+        enable_cuda_graph: bool,
+        device_ordinals: &[usize],
+        max_batch: usize,
+        max_prefill_tokens: usize,
+        prefix_snapshot_bytes: usize,
+    ) -> Result<Self> {
+        validate_cuda_ordinals(device_ordinals)?;
+        anyhow::ensure!(
+            device_ordinals.len() > 1,
+            "Qwen3.5 TP executor requires at least two CUDA devices, got {}",
+            device_ordinals.len()
+        );
+        anyhow::ensure!(
+            max_prefill_tokens > 0,
+            "Qwen3.5 TP max_prefill_tokens must be positive"
+        );
+
+        let world_size = device_ordinals.len();
+        let mut models = Vec::with_capacity(world_size);
+        for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
+            models.push(Qwen35Model::from_safetensors_with_runtime_and_capacity(
+                model_path,
+                ModelRuntimeConfig {
+                    enable_cuda_graph,
+                    tensor_parallel: Some(TensorParallelConfig::try_from((rank, world_size))?),
+                    device_ordinal,
+                    prefix_snapshot_bytes,
+                },
+                max_batch,
+            )?);
+        }
+        let first = models
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 TP executor loaded no models"))?;
+        // P2c gate: graph decode under TP requires a compiled batch-decode
+        // kernel for the rank-local GQA group. The group ratio is TP-invariant,
+        // so every rank decides identically; an uncompiled group keeps the
+        // batched eager path byte-for-byte.
+        let geometry = first.geometry;
+        let graph_enabled = enable_cuda_graph && first.config().decode_group_is_compiled();
+        if enable_cuda_graph && !graph_enabled {
+            static LOG_GRAPH_GATE: std::sync::Once = std::sync::Once::new();
+            LOG_GRAPH_GATE.call_once(|| {
+                log::info!(
+                    "Qwen3.5 TP decode GQA group {} ({} q heads / {} kv heads per rank) has no compiled batch-decode kernel; CUDA Graph requested but decode stays on the batched eager path",
+                    geometry.local_num_attention_heads() / geometry.local_num_key_value_heads(),
+                    geometry.local_num_attention_heads(),
+                    geometry.local_num_key_value_heads(),
+                );
+            });
+        }
+        let page_size = first.kv_buffer().layout().page_size;
+        let mut min_capacity_pages = usize::MAX;
+        for (rank, model) in models.iter().enumerate() {
+            let rank_page_size = model.kv_buffer().layout().page_size;
+            anyhow::ensure!(
+                rank_page_size == page_size,
+                "Qwen3.5 TP rank {rank} KV page size {rank_page_size} does not match rank 0 page size {page_size}"
+            );
+            min_capacity_pages = min_capacity_pages.min(model.kv_buffer().num_blocks());
+        }
+        let snapshot_slots = first.prefix_snapshot_slots();
+        anyhow::ensure!(
+            models
+                .iter()
+                .all(|m| m.prefix_snapshot_slots() == snapshot_slots),
+            "TP snapshot slot counts differ"
+        );
+        let kv_cache = Qwen35PrefixCache::new(
+            KvCacheManager::from_buffer(first.kv_buffer().clone(), min_capacity_pages)?,
+            snapshot_slots,
+        )?;
+        let padding_block_id = kv_cache.pool().padding_block_id();
+        let capacity_pages_for_requests = min_capacity_pages.saturating_sub(1);
+        let max_position_embeddings = first.config().max_position_embeddings;
+        let eos_token_ids = first.config().eos_token_ids.clone();
+
+        let nccl_id = cudarc::nccl::safe::Id::new()
+            .map_err(|e| anyhow::anyhow!("failed to create Qwen3.5 TP NCCL id: {e:?}"))?;
+        let startup_gate = Arc::new(TpStartupGate::default());
+        let effective_max_batch = Arc::new(AtomicUsize::new(0));
+        let poison = Arc::new(TpRuntimePoison::default());
+        let mut workers = Vec::with_capacity(world_size);
+        let mut preflights = Vec::with_capacity(world_size);
+        let mut startups = Vec::with_capacity(world_size);
+        for (rank, model) in models.into_iter().enumerate() {
+            match TpWorker::spawn(
+                rank,
+                world_size,
+                model,
+                max_batch,
+                max_prefill_tokens,
+                graph_enabled,
+                padding_block_id,
+                nccl_id,
+                Arc::clone(&startup_gate),
+                Arc::clone(&effective_max_batch),
+                Arc::clone(&poison),
+            ) {
+                Ok((worker, preflight, startup)) => {
+                    workers.push(worker);
+                    preflights.push(preflight);
+                    startups.push(startup);
+                }
+                Err(err) => {
+                    startup_gate.cancel();
+                    return Err(err);
+                }
+            }
+        }
+        let mut min_rank_max_batch = max_batch;
+        for (rank, preflight) in preflights.into_iter().enumerate() {
+            match preflight.recv() {
+                Ok(Ok(rank_max_batch)) => {
+                    min_rank_max_batch = min_rank_max_batch.min(rank_max_batch);
+                }
+                Ok(Err(err)) => {
+                    startup_gate.cancel();
+                    return Err(err);
+                }
+                Err(_) => {
+                    startup_gate.cancel();
+                    return Err(anyhow::anyhow!(
+                        "Qwen3.5 TP worker {rank} exited during pre-NCCL startup"
+                    ));
+                }
+            }
+        }
+        anyhow::ensure!(
+            min_rank_max_batch > 0,
+            "Qwen3.5 TP has no memory capacity for one recurrent request state"
+        );
+        effective_max_batch.store(min_rank_max_batch, Ordering::Release);
+        if min_rank_max_batch < max_batch {
+            log::warn!(
+                "Qwen3.5 TP max_batch reduced from {max_batch} to {min_rank_max_batch} by rank-local recurrent-state memory capacity"
+            );
+        }
+        let (watchdog_done, watchdog) = match spawn_nccl_startup_watchdog() {
+            Ok(watchdog) => watchdog,
+            Err(err) => {
+                startup_gate.cancel();
+                return Err(err);
+            }
+        };
+        startup_gate.connect();
+        let startup_result = startups
+            .into_iter()
+            .enumerate()
+            .try_for_each(|(rank, startup)| {
+                startup.recv().map_err(|_| {
+                    anyhow::anyhow!("Qwen3.5 TP worker {rank} exited during startup")
+                })?
+            });
+        if let Err(err) = startup_result {
+            drop(workers);
+            disarm_nccl_startup_watchdog(watchdog_done, watchdog)?;
+            return Err(err);
+        }
+        disarm_nccl_startup_watchdog(watchdog_done, watchdog)?;
+
+        let executor = Self {
+            workers,
+            kv_cache,
+            request_kvs: HashMap::new(),
+            poison,
+            world_size,
+            max_batch: min_rank_max_batch,
+            page_size,
+            capacity_pages_for_requests,
+            max_position_embeddings,
+            eos_token_ids,
+            graph_enabled,
+            active_slots: Mutex::new(Vec::new()),
+        };
+        // Pre-capture every reachable decode graph now: after NCCL connect,
+        // exactly once, before serving. A mid-serving capture on one rank while
+        // a peer replays would desync the recorded collectives, so serve time
+        // is replay-only.
+        if graph_enabled {
+            executor.run_decode_graph_precapture_sweep()?;
+            log::info!(
+                "Qwen3.5 TP decode CUDA Graph enabled: {} bucket(s) up to batch {} captured per rank",
+                BATCH_BUCKETS
+                    .iter()
+                    .take_while(|&&b| b <= bucket_for(executor.max_batch))
+                    .count(),
+                bucket_for(executor.max_batch),
+            );
+        }
+        Ok(executor)
+    }
+
+    /// Whether decode replays pre-captured CUDA Graphs (P2c gate: requested
+    /// AND the TP-local decode GQA group has a compiled kernel).
+    pub fn graph_enabled(&self) -> bool {
+        self.graph_enabled
+    }
+
+    #[cfg(test)]
+    fn world_size(&self) -> usize {
+        self.world_size
+    }
+
+    pub(crate) fn max_batch(&self) -> usize {
+        self.max_batch
+    }
+
+    pub(crate) fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    pub(crate) fn capacity_pages_for_requests(&self) -> usize {
+        self.capacity_pages_for_requests
+    }
+
+    pub(crate) fn max_position_embeddings(&self) -> usize {
+        self.max_position_embeddings
+    }
+
+    pub(crate) fn is_stop_token(&self, token_id: u32) -> bool {
+        self.eos_token_ids.contains(&token_id)
+    }
+
+    /// Pre-capture every reachable decode bucket on every rank, phase-by-phase
+    /// and barriered by the controller so a captured collective's first launch
+    /// never overlaps a peer's capture (qwen3 sweep precedent).
+    fn run_decode_graph_precapture_sweep(&self) -> Result<()> {
+        // NCCL has no device timeout, so a desynced sweep wedges forever; this
+        // watchdog aborts on the deadline. abort() not exit() — exit's cudart
+        // atexit teardown takes the same wedged driver lock — and it disarms
+        // only on the explicit success send (drop-on-error stays armed).
+        let (sweep_done_tx, sweep_done_rx) = mpsc::sync_channel::<()>(1);
+        let deadline = Instant::now() + TP_PRECAPTURE_TIMEOUT;
+        let watchdog = thread::Builder::new()
+            .name("qwen35-tp-precapture-watchdog".into())
+            .spawn(move || {
+                if sweep_done_rx.recv_timeout(TP_PRECAPTURE_TIMEOUT).is_ok() {
+                    return;
+                }
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                eprintln!(
+                    "Qwen3.5 TP decode graph pre-capture did not complete within {}s — NCCL wedge suspected, aborting",
+                    TP_PRECAPTURE_TIMEOUT.as_secs()
+                );
+                log::error!(
+                    "Qwen3.5 TP decode graph pre-capture did not complete within {}s — NCCL wedge suspected, aborting",
+                    TP_PRECAPTURE_TIMEOUT.as_secs()
+                );
+                std::process::abort();
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn Qwen3.5 TP pre-capture watchdog: {e}"))?;
+
+        let started = Instant::now();
+        let max_bucket = bucket_for(self.max_batch);
+        let sweep = (|| {
+            self.run_precapture_phase(PrecapturePhase::Warmup)?;
+            for (bucket_idx, &bucket) in BATCH_BUCKETS.iter().enumerate() {
+                if bucket > max_bucket {
+                    break;
+                }
+                self.run_precapture_phase(PrecapturePhase::Capture { bucket_idx })?;
+                self.run_precapture_phase(PrecapturePhase::Launch { bucket_idx })?;
+            }
+            self.run_precapture_phase(PrecapturePhase::Finalize)
+        })();
+        sweep?;
+        sweep_done_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Qwen3.5 TP pre-capture watchdog exited"))?;
+        watchdog
+            .join()
+            .map_err(|_| anyhow::anyhow!("Qwen3.5 TP pre-capture watchdog panicked"))?;
+        log::info!(
+            "Qwen3.5 TP decode graph pre-capture: buckets up to {max_bucket} captured per rank in {:.2}s",
+            started.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+
+    fn run_precapture_phase(&self, phase: PrecapturePhase) -> Result<()> {
+        self.poison.ensure_healthy()?;
+        let resp_rx = self.dispatch_mutating("decode graph precapture", |start, resp| {
+            TpWorkerCommand::Precapture { phase, start, resp }
+        })?;
+        let responses = recv_runtime_responses(
+            &resp_rx,
+            self.world_size,
+            "decode graph precapture",
+            &self.poison,
+        )?;
+        validate_dispatched_responses(
+            validate_ack_responses(responses, self.world_size, "decode graph precapture"),
+            "decode graph precapture",
+            &self.poison,
+        )
+    }
+
+    #[cfg(test)]
+    fn ping_all(&self) -> Result<()> {
+        self.poison.ensure_healthy()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        for worker in &self.workers {
+            self.send_or_poison(
+                worker,
+                TpWorkerCommand::Ping {
+                    resp: resp_tx.clone(),
+                },
+            )?;
+        }
+        drop(resp_tx);
+        let responses = recv_runtime_responses(&resp_rx, self.world_size, "ping", &self.poison)?;
+        validate_dispatched_responses(
+            validate_ack_responses(responses, self.world_size, "ping"),
+            "ping",
+            &self.poison,
+        )
+    }
+
+    pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
+        self.poison.ensure_healthy()?;
+        let chunks: Vec<TpPrefillChunkItem> = plan
+            .requests
+            .iter()
+            .cloned()
+            .map(TpPrefillChunkItem::from)
+            .collect();
+        validate_prefill_layout(
+            &chunks,
+            self.max_batch,
+            self.max_position_embeddings,
+            self.request_kvs.len(),
+            |request_id| self.request_kvs.contains_key(&request_id),
+        )?;
+
+        for (index, request) in plan.requests.iter().enumerate() {
+            if let Err(error) = self.begin_request(
+                request.request_id,
+                &request.prompt_tokens,
+                self.max_position_embeddings - request.prompt_tokens.len(),
+                None,
+                false,
+            ) {
+                let error = error.into_inner();
+                // Once an earlier request commits, a later failure leaves a
+                // partially admitted plan; the executor must not keep serving.
+                if index == 0 {
+                    return Err(error);
+                }
+                return Err(self.poison_after_mutation("prefill admission", &error));
+            }
+        }
+        let result = self
+            .execute_prefill_chunks(&chunks)
+            .map_err(|error| self.poison_after_mutation("prefill", &error))?;
+        if self.graph_enabled {
+            // Convenience-API slot tracking: every prefill plan item finishes
+            // prefill (TpPrefillChunkItem::from sets finish_prefill), so each
+            // request takes the next dense decode slot.
+            let mut active = self
+                .active_slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for chunk in &chunks {
+                active.push(chunk.request_id);
+            }
+        }
+        Ok(result)
+    }
+
+    fn execute_prefill_chunks(&mut self, chunks: &[TpPrefillChunkItem]) -> Result<PrefillResult> {
+        self.execute_prefill_chunks_with_seed(chunks, 0)
+    }
+
+    pub(crate) fn execute_prefill_chunks_with_seed(
+        &mut self,
+        chunks: &[TpPrefillChunkItem],
+        sample_seed: u64,
+    ) -> Result<PrefillResult> {
+        self.poison.ensure_healthy()?;
+        anyhow::ensure!(
+            !chunks.is_empty(),
+            "Qwen3.5 TP prefill chunk command requires at least one chunk"
+        );
+        validate_prefill_chunks(chunks)?;
+        let kv_views = self.schedule_prefill(chunks)?;
+        let chunks = chunks.to_vec();
+        let result = (|| {
+            let resp_rx = self.dispatch_mutating("prefill chunks", |start, resp| {
+                TpWorkerCommand::RunPrefillChunks {
+                    chunks: chunks.clone(),
+                    kv_views: kv_views.clone(),
+                    sample_seed,
+                    start,
+                    resp,
+                }
+            })?;
+            let responses =
+                recv_runtime_responses(&resp_rx, self.world_size, "prefill chunks", &self.poison)?;
+            validate_dispatched_responses(
+                validate_prefill_responses(responses, self.world_size),
+                "prefill chunks",
+                &self.poison,
+            )
+        })();
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.revert_requests(chunks.iter().map(|chunk| &chunk.request_id));
+                return Err(error);
+            }
+        };
+        self.apply_prefill_result(&chunks, &result)
+            .map_err(|e| self.poison_after_mutation("prefill apply", &e))?;
+        Ok(result)
+    }
+
+    pub fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult> {
+        anyhow::ensure!(
+            !plan.requests.is_empty(),
+            "Qwen3.5 TP decode plan requires at least one request"
+        );
+        let requests: Vec<TpDecodeStepItem> = if self.graph_enabled {
+            let active = self
+                .active_slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            anyhow::ensure!(
+                plan.requests.len() == active.len(),
+                "Qwen3.5 TP graph decode must cover all {} active requests in slot order, got {}",
+                active.len(),
+                plan.requests.len()
+            );
+            plan.requests
+                .iter()
+                .enumerate()
+                .map(|(slot, request)| {
+                    anyhow::ensure!(
+                        active[slot] == request.request_id,
+                        "Qwen3.5 TP graph decode slot {slot} holds request {} but the plan carries {}",
+                        active[slot].get(),
+                        request.request_id.get()
+                    );
+                    Ok(TpDecodeStepItem::new_with_slot(
+                        request.request_id,
+                        request.token_id,
+                        request.logprobs,
+                        SamplingParams::default(),
+                        slot,
+                    ))
+                })
+                .collect::<Result<_>>()?
+        } else {
+            plan.requests
+                .iter()
+                .map(|request| {
+                    TpDecodeStepItem::new(
+                        request.request_id,
+                        request.token_id,
+                        request.logprobs,
+                        SamplingParams::default(),
+                    )
+                })
+                .collect()
+        };
+        self.execute_decode_items(&requests, 0)
+    }
+
+    pub(crate) fn execute_decode_items(
+        &mut self,
+        requests: &[TpDecodeStepItem],
+        sample_seed: u64,
+    ) -> Result<DecodeResult> {
+        self.poison.ensure_healthy()?;
+        anyhow::ensure!(
+            !requests.is_empty(),
+            "Qwen3.5 TP decode plan requires at least one request"
+        );
+        validate_decode_requests(requests)?;
+        let kv_views = self.schedule_decode(requests)?;
+        let requests = requests.to_vec();
+        let result = (|| {
+            let resp_rx = self.dispatch_mutating("decode step", |start, resp| {
+                TpWorkerCommand::RunDecodeStep {
+                    requests: requests.clone(),
+                    kv_views: kv_views.clone(),
+                    sample_seed,
+                    start,
+                    resp,
+                }
+            })?;
+            let responses =
+                recv_runtime_responses(&resp_rx, self.world_size, "decode step", &self.poison)?;
+            validate_dispatched_responses(
+                validate_decode_responses(responses, self.world_size),
+                "decode step",
+                &self.poison,
+            )
+        })();
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.revert_requests(requests.iter().map(|request| &request.request_id));
+                return Err(error);
+            }
+        };
+        self.apply_decode_result(&requests, &result)
+            .map_err(|e| self.poison_after_mutation("decode apply", &e))?;
+        Ok(result)
+    }
+
+    pub(crate) fn execute_unified(&mut self, plan: &TpUnifiedPlan) -> Result<TpUnifiedResult> {
+        self.poison.ensure_healthy()?;
+        validate_unified_plan(plan, self.max_batch)?;
+        let prefill_views = self.schedule_prefill(&plan.prefill)?;
+        let decode_views = match self.schedule_decode(&plan.decode) {
+            Ok(views) => views,
+            Err(error) => {
+                for chunk in &plan.prefill {
+                    let _ = self
+                        .request_kvs
+                        .get_mut(&chunk.request_id)
+                        .unwrap()
+                        .revert_schedule();
+                }
+                return Err(error);
+            }
+        };
+        let result = (|| {
+            let resp_rx = self.dispatch_mutating("unified step", |start, resp| {
+                TpWorkerCommand::RunUnifiedStep {
+                    plan: plan.clone(),
+                    prefill_views: prefill_views.clone(),
+                    decode_views: decode_views.clone(),
+                    start,
+                    resp,
+                }
+            })?;
+            let responses =
+                recv_runtime_responses(&resp_rx, self.world_size, "unified step", &self.poison)?;
+            validate_dispatched_responses(
+                validate_unified_responses(responses, self.world_size),
+                "unified step",
+                &self.poison,
+            )
+        })();
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.revert_requests(plan.prefill.iter().map(|item| &item.request_id));
+                self.revert_requests(plan.decode.iter().map(|item| &item.request_id));
+                return Err(error);
+            }
+        };
+        self.apply_prefill_result(&plan.prefill, &result.prefill)
+            .map_err(|e| self.poison_after_mutation("unified prefill apply", &e))?;
+        self.apply_decode_result(&plan.decode, &result.decode)
+            .map_err(|e| self.poison_after_mutation("unified decode apply", &e))?;
+        Ok(result)
+    }
+
+    pub(crate) fn poison_after_mutation(
+        &self,
+        operation: &'static str,
+        err: &anyhow::Error,
+    ) -> anyhow::Error {
+        let reason = self.poison.poison(format!(
+            "Qwen3.5 TP {operation} failed after mutation: {err:#}"
+        ));
+        anyhow::anyhow!(reason)
+    }
+
+    pub fn drop_request(
+        &mut self,
+        request_id: RequestId,
+        expectation: DropExpectation,
+    ) -> Result<()> {
+        let compaction = self.track_retired_slot(request_id);
+        self.drop_request_with_compaction(request_id, expectation, compaction)
+    }
+
+    /// Retire a request, attaching the slot compaction the caller (scheduler)
+    /// already applied to its own dense-slot bookkeeping. Workers apply the
+    /// move and poison on occupancy mismatch; eager workers ignore it.
+    pub(crate) fn drop_request_with_compaction(
+        &mut self,
+        request_id: RequestId,
+        expectation: DropExpectation,
+        compaction: Option<TpSlotCompaction>,
+    ) -> Result<()> {
+        self.poison.ensure_healthy()?;
+        let resp_rx =
+            self.dispatch_mutating("drop request", |start, resp| TpWorkerCommand::DropRequest {
+                request_id,
+                compaction,
+                start,
+                resp,
+            })?;
+        let responses =
+            recv_runtime_responses(&resp_rx, self.world_size, "drop request", &self.poison)?;
+        validate_dispatched_responses(
+            validate_drop_responses(responses, self.world_size, expectation),
+            "drop request",
+            &self.poison,
+        )?;
+        if let Some(mut kv) = self.request_kvs.remove(&request_id) {
+            self.kv_cache.release_request(&mut kv)?;
+        }
+        Ok(())
+    }
+
+    /// Convenience-API tracker: swap-remove the retired request and derive the
+    /// slot compaction (last occupied slot moves into the vacated one).
+    /// Returns `None` on the eager path and for untracked requests.
+    fn track_retired_slot(&self, request_id: RequestId) -> Option<TpSlotCompaction> {
+        if !self.graph_enabled {
+            return None;
+        }
+        let mut active = self
+            .active_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let idx = active.iter().position(|&id| id == request_id)?;
+        let last = active.len() - 1;
+        active.swap_remove(idx);
+        // `then`, not `then_some`: the moved request only exists when the
+        // retired request was not the tail slot.
+        (idx < active.len()).then(|| TpSlotCompaction {
+            moved_request_id: active[idx],
+            from: last,
+            to: idx,
+        })
+    }
+
+    #[cfg(test)]
+    fn snapshot_workers(&self) -> Result<Vec<WorkerStateSnapshot>> {
+        self.poison.ensure_healthy()?;
+        self.snapshot_workers_unchecked_for_test()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn snapshot_workers_unchecked_for_test(&self) -> Result<Vec<WorkerStateSnapshot>> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        for worker in &self.workers {
+            self.send_or_poison(
+                worker,
+                TpWorkerCommand::SnapshotState {
+                    resp: resp_tx.clone(),
+                },
+            )?;
+        }
+        drop(resp_tx);
+        wait_for_worker_snapshots(&resp_rx, self.world_size, &self.poison)
+    }
+
+    #[cfg(test)]
+    fn inject_prefill_dispatch_failure_for_test(
+        &self,
+        chunks: &[TpPrefillChunkItem],
+        fail_rank: usize,
+    ) -> Result<()> {
+        self.poison.ensure_healthy()?;
+        anyhow::ensure!(
+            fail_rank < self.world_size,
+            "injected TP dispatch failure rank {fail_rank} is outside world size {}",
+            self.world_size
+        );
+        validate_prefill_chunks(chunks)?;
+        let chunks = chunks.to_vec();
+        dispatch_mutating_commands(
+            self.world_size,
+            "injected prefill chunks",
+            &self.poison,
+            |start, resp| TpWorkerCommand::RunPrefillChunks {
+                chunks: chunks.clone(),
+                kv_views: Vec::new(),
+                sample_seed: 0,
+                start,
+                resp,
+            },
+            |rank, command| {
+                if rank == fail_rank {
+                    anyhow::bail!("injected dispatch failure at rank {rank}");
+                }
+                self.workers[rank].send(command)
+            },
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn remove_worker_request_state_for_test(
+        &self,
+        rank: usize,
+        request_id: RequestId,
+    ) -> Result<bool> {
+        self.poison.ensure_healthy()?;
+        let worker = self
+            .workers
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("test worker rank {rank} is out of range"))?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        worker.send(TpWorkerCommand::RemoveRequestStateForTest {
+            request_id,
+            resp: resp_tx,
+        })?;
+        resp_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| anyhow::anyhow!("test worker rank {rank} did not remove state: {err}"))
+    }
+
+    #[cfg(test)]
+    fn disconnect_worker_receiver_for_test(&self, rank: usize) -> Result<()> {
+        self.poison.ensure_healthy()?;
+        let worker = self
+            .workers
+            .get(rank)
+            .ok_or_else(|| anyhow::anyhow!("test worker rank {rank} is out of range"))?;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        worker.send(TpWorkerCommand::DisconnectForTest { ready: ready_tx })?;
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| anyhow::anyhow!("test worker rank {rank} did not disconnect: {err}"))?;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (resp_tx, _resp_rx) = mpsc::channel();
+            if worker
+                .send(TpWorkerCommand::Ping { resp: resp_tx })
+                .is_err()
+            {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "test worker rank {rank} receiver remained connected"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn dispatch_mutating(
+        &self,
+        operation: &'static str,
+        build: impl Fn(Arc<TpCommandStartGate>, mpsc::Sender<TpWorkerResponse>) -> TpWorkerCommand,
+    ) -> Result<mpsc::Receiver<TpWorkerResponse>> {
+        dispatch_mutating_commands(
+            self.world_size,
+            operation,
+            &self.poison,
+            build,
+            |rank, command| self.workers[rank].send(command),
+        )
+    }
+
+    #[cfg(test)]
+    fn send_or_poison(&self, worker: &TpWorker, command: TpWorkerCommand) -> Result<()> {
+        worker.send(command).map_err(|err| {
+            let reason = self
+                .poison
+                .poison(format!("failed to dispatch TP worker command: {err:#}"));
+            anyhow::anyhow!(reason)
+        })
+    }
+}
+
+fn dispatch_mutating_commands(
+    world_size: usize,
+    operation: &'static str,
+    poison: &TpRuntimePoison,
+    build: impl Fn(Arc<TpCommandStartGate>, mpsc::Sender<TpWorkerResponse>) -> TpWorkerCommand,
+    mut send: impl FnMut(usize, TpWorkerCommand) -> Result<()>,
+) -> Result<mpsc::Receiver<TpWorkerResponse>> {
+    let start = Arc::new(TpCommandStartGate::default());
+    let (resp_tx, resp_rx) = mpsc::channel();
+    for rank in 0..world_size {
+        let command = build(Arc::clone(&start), resp_tx.clone());
+        if let Err(err) = send(rank, command) {
+            start.cancel();
+            let reason = poison.poison(format!(
+                "failed to dispatch {operation} to TP worker rank {rank}: {err:#}"
+            ));
+            return Err(anyhow::anyhow!(reason));
+        }
+    }
+    drop(resp_tx);
+    let resolved = start.execute();
+    debug_assert!(resolved, "fresh TP command gate resolved more than once");
+    Ok(resp_rx)
+}
+
+impl Drop for Qwen35TpExecutor {
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            let _ = worker.tx.send(TpWorkerCommand::Shutdown);
+        }
+        for worker in &mut self.workers {
+            worker.join_bounded();
+        }
+    }
+}
+
+fn validate_prefill_chunks(chunks: &[TpPrefillChunkItem]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(chunks.len());
+    for chunk in chunks {
+        anyhow::ensure!(
+            !chunk.prompt_tokens.is_empty(),
+            "Qwen3.5 TP prefill chunk for request {} is empty",
+            chunk.request_id.get()
+        );
+        anyhow::ensure!(
+            seen.insert(chunk.request_id),
+            "duplicate Qwen3.5 TP request id {} in one prefill chunk command",
+            chunk.request_id.get()
+        );
+    }
+    Ok(())
+}
+
+fn validate_prefill_layout(
+    chunks: &[TpPrefillChunkItem],
+    max_batch: usize,
+    max_position_embeddings: usize,
+    resident_count: usize,
+    mut request_exists: impl FnMut(RequestId) -> bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !chunks.is_empty(),
+        "Qwen3.5 TP prefill plan requires at least one request"
+    );
+    validate_prefill_chunks(chunks)?;
+    anyhow::ensure!(
+        resident_count.saturating_add(chunks.len()) <= max_batch,
+        "Qwen3.5 TP prefill plan would exceed request capacity {max_batch}"
+    );
+    for chunk in chunks {
+        anyhow::ensure!(
+            !request_exists(chunk.request_id),
+            "Qwen3.5 TP request {} already exists",
+            chunk.request_id.get()
+        );
+        anyhow::ensure!(
+            chunk.prompt_tokens.len() < max_position_embeddings,
+            "Qwen3.5 TP prefill request {} with {} prompt tokens leaves no room in the {}-token context window",
+            chunk.request_id.get(),
+            chunk.prompt_tokens.len(),
+            max_position_embeddings
+        );
+    }
+    Ok(())
+}
+
+/// Worker request states in decode-row order: `row_of_state[i]` is the row
+/// `states[i]` occupies in this command, `None` when it is not part of it.
+fn states_in_row_order<'a>(
+    states: &'a mut [TpRequestState],
+    row_of_state: &[Option<usize>],
+) -> Vec<&'a mut TpRequestState> {
+    let mut rows: Vec<(usize, &'a mut TpRequestState)> = states
+        .iter_mut()
+        .zip(row_of_state)
+        .filter_map(|(state, row)| row.map(|row| (row, state)))
+        .collect();
+    rows.sort_unstable_by_key(|(row, _)| *row);
+    rows.into_iter().map(|(_, state)| state).collect()
+}
+
+/// Rank-0 sampling pass over one decode batch: snapshot the requested logprob
+/// rows, select one token per row, and pair each token with its logprob.
+fn sample_decode_rows(
+    ctx: &pegainfer_core::tensor::DeviceContext,
+    logits: &pegainfer_core::tensor::HiddenStates,
+    requests: &[TpDecodeStepItem],
+    sample_seed: u64,
+    scratch: &mut pegainfer_sample::SampleScratch,
+) -> Result<Vec<DecodeRequestResult>> {
+    let bs = requests.len();
+    let requested_logprobs: Vec<Option<usize>> =
+        requests.iter().map(|request| request.logprobs).collect();
+    let cpu_logits = snapshot_requested_logprobs(ctx, logits, &requested_logprobs)?;
+    let params_refs: Vec<&SamplingParams> = requests
+        .iter()
+        .map(|request| &request.sampling_params)
+        .collect();
+    let steps = vec![0u64; bs];
+    let tokens =
+        pegainfer_sample::select_batch(ctx, logits, &params_refs, &steps, sample_seed, scratch)?;
+    anyhow::ensure!(
+        tokens.len() == bs,
+        "Qwen3.5 TP decode sampling returned {} tokens for {bs} rows",
+        tokens.len()
+    );
+    Ok(requests
+        .iter()
+        .enumerate()
+        .map(|(row, request)| {
+            let logprob = cpu_logits[row].as_ref().and_then(|(logits_row, top_k)| {
+                pegainfer_sample::token_logprob_from_row(logits_row, tokens[row], *top_k)
+            });
+            DecodeRequestResult {
+                request_id: request.request_id,
+                token: tokens[row],
+                logprob,
+            }
+        })
+        .collect())
+}
+
+fn validate_decode_requests(requests: &[TpDecodeStepItem]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(requests.len());
+    for request in requests {
+        anyhow::ensure!(
+            seen.insert(request.request_id),
+            "duplicate Qwen3.5 TP request id {} in one decode command",
+            request.request_id.get()
+        );
+    }
+    Ok(())
+}
+
+fn validate_cuda_ordinals(device_ordinals: &[usize]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(device_ordinals.len());
+    for &ordinal in device_ordinals {
+        anyhow::ensure!(
+            ordinal < TRITON_AOT_DEVICE_TABLE_LEN,
+            "Qwen3.5 TP CUDA ordinal {ordinal} exceeds the Triton AOT device table bound {TRITON_AOT_DEVICE_TABLE_LEN}"
+        );
+        anyhow::ensure!(
+            seen.insert(ordinal),
+            "Qwen3.5 TP CUDA ordinals must be distinct; ordinal {ordinal} appears more than once"
+        );
+    }
+    Ok(())
+}
+
+fn validate_unified_plan(plan: &TpUnifiedPlan, max_batch: usize) -> Result<()> {
+    anyhow::ensure!(
+        !plan.prefill.is_empty(),
+        "Qwen3.5 TP unified plan requires at least one prefill chunk"
+    );
+    anyhow::ensure!(
+        !plan.decode.is_empty(),
+        "Qwen3.5 TP unified plan requires at least one decode request"
+    );
+    validate_prefill_chunks(&plan.prefill)?;
+    validate_decode_requests(&plan.decode)?;
+    anyhow::ensure!(
+        plan.prefill.len().saturating_add(plan.decode.len()) <= max_batch,
+        "Qwen3.5 TP unified plan has {} rows, exceeding scheduler capacity {max_batch}",
+        plan.prefill.len().saturating_add(plan.decode.len())
+    );
+
+    let prefill_ids: HashSet<_> = plan.prefill.iter().map(|item| item.request_id).collect();
+    for decode in &plan.decode {
+        anyhow::ensure!(
+            !prefill_ids.contains(&decode.request_id),
+            "Qwen3.5 TP unified plan request id {} appears in both prefill and decode",
+            decode.request_id.get()
+        );
+    }
+    Ok(())
+}
+
+fn validate_unified_worker_state(state: &TpWorkerState, plan: &TpUnifiedPlan) -> Result<()> {
+    validate_unified_worker_layout(plan, state.max_batch, |request_id| {
+        state
+            .request_index(request_id)
+            .map(|idx| state.requests[idx].phase)
+    })
+}
+
+fn validate_unified_worker_layout(
+    plan: &TpUnifiedPlan,
+    max_batch: usize,
+    mut phase_for: impl FnMut(RequestId) -> Option<TpRequestPhase>,
+) -> Result<()> {
+    validate_unified_plan(plan, max_batch)?;
+
+    for item in &plan.prefill {
+        let phase = phase_for(item.request_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Qwen3.5 TP unified prefill request {} has no worker state",
+                item.request_id.get()
+            )
+        })?;
+        anyhow::ensure!(
+            phase == TpRequestPhase::Prefilling,
+            "Qwen3.5 TP unified prefill request {} is already in decode state",
+            item.request_id.get()
+        );
+    }
+    for item in &plan.decode {
+        let phase = phase_for(item.request_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Qwen3.5 TP unified decode request {} has no worker state",
+                item.request_id.get()
+            )
+        })?;
+        anyhow::ensure!(
+            phase == TpRequestPhase::Decoding,
+            "Qwen3.5 TP unified request {} is not ready for decode",
+            item.request_id.get()
+        );
+    }
+    Ok(())
+}
+
+impl From<PrefillStepItem> for TpPrefillChunkItem {
+    fn from(request: PrefillStepItem) -> Self {
+        Self::new(
+            request.request_id,
+            request.prompt_tokens,
+            request.logprobs,
+            true,
+        )
+    }
+}
+
+struct CublasThreadGuard;
+
+impl Drop for CublasThreadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            crate::ffi::cublas_destroy();
+        }
+    }
+}
+
+fn bind_worker_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
+    let ctx = model.device_ctx();
+    unsafe {
+        let err = crate::ffi::cuda_set_device(ctx.device_ordinal as i32);
+        if err != 0 {
+            return Err(anyhow::anyhow!(
+                "Failed to set CUDA device {} on Qwen3.5 TP worker thread: cudaError={}",
+                ctx.device_ordinal,
+                err
+            ));
+        }
+    }
+    ctx.ctx.bind_to_thread().map_err(|e| {
+        anyhow::anyhow!("Failed to bind CUDA context to Qwen3.5 TP worker thread: {e}")
+    })?;
+    unsafe {
+        crate::ffi::cublas_init();
+    }
+    Ok(CublasThreadGuard)
+}
+
+fn validate_position_responses(
+    responses: Vec<TpWorkerResponse>,
+    world_size: usize,
+) -> Result<Vec<usize>> {
+    let mut positions = vec![None; world_size];
+    for response in responses {
+        anyhow::ensure!(
+            response.rank < world_size && positions[response.rank].is_none(),
+            "invalid or duplicate snapshot response rank"
+        );
+        let TpWorkerReply::Position(position) = response.result? else {
+            anyhow::bail!("expected snapshot position response");
+        };
+        positions[response.rank] = Some(position);
+    }
+    positions
+        .into_iter()
+        .map(|p| p.ok_or_else(|| anyhow::anyhow!("missing snapshot rank response")))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_gate_cancel_releases_waiting_workers() {
+        let gate = Arc::new(TpStartupGate::default());
+        let worker_gate = Arc::clone(&gate);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let _ = done_tx.send(worker_gate.wait());
+        });
+
+        gate.cancel();
+
+        assert!(
+            !done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("cancelled startup gate should release workers within one second")
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_poison_preserves_first_failure() {
+        let poison = TpRuntimePoison::default();
+        assert_eq!(poison.poison("rank 1 OOM".into()), "rank 1 OOM");
+        assert_eq!(poison.poison("rank 0 NCCL error".into()), "rank 1 OOM");
+        let err = poison.ensure_healthy().unwrap_err().to_string();
+        assert!(err.contains("rank 1 OOM"));
+        assert!(!err.contains("rank 0 NCCL error"));
+    }
+
+    #[test]
+    fn mutating_partial_dispatch_cancels_delivered_prefix_and_poisons() {
+        let poison = TpRuntimePoison::default();
+        let (rank0_tx, rank0_rx) = mpsc::channel();
+        let (rank1_tx, rank1_rx) = mpsc::channel::<TpWorkerCommand>();
+        let senders = [rank0_tx, rank1_tx];
+        let err = dispatch_mutating_commands(
+            2,
+            "test prefill",
+            &poison,
+            |start, resp| TpWorkerCommand::RunPrefillChunks {
+                chunks: vec![TpPrefillChunkItem::new(
+                    RequestId::new(2),
+                    vec![9707],
+                    None,
+                    true,
+                )],
+                kv_views: Vec::new(),
+                sample_seed: 0,
+                start,
+                resp,
+            },
+            |rank, command| {
+                if rank == 1 {
+                    anyhow::bail!("injected prefix-only dispatch failure");
+                }
+                senders[rank]
+                    .send(command)
+                    .map_err(|_| anyhow::anyhow!("test receiver disconnected"))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("injected prefix-only dispatch failure"));
+        let TpWorkerCommand::RunPrefillChunks { start, .. } = rank0_rx.recv().unwrap() else {
+            panic!("expected prefill command")
+        };
+        assert_eq!(start.wait(), TpCommandDecision::Cancel);
+        assert!(matches!(
+            rank1_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(poison.ensure_healthy().is_err());
+    }
+
+    #[test]
+    fn limits_constructor_rejects_zero_prefill_budget_before_loading() {
+        let err = match Qwen35TpExecutor::from_runtime_with_limits("unused", false, &[0, 1], 1, 0) {
+            Ok(_) => panic!("zero TP prefill budget should fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("max_prefill_tokens must be positive"));
+    }
+
+    #[test]
+    fn rejects_single_device_topology() {
+        let err = match Qwen35TpExecutor::from_runtime_with_capacity("unused", false, &[0], 1) {
+            Ok(_) => panic!("single-device TP topology should fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("requires at least two CUDA devices"));
+    }
+
+    #[test]
+    fn slot_map_admit_release_and_compact() {
+        let id = |value: u64| RequestId::new(value);
+        let mut owners = vec![None, None, None, None];
+
+        slot_admit(&mut owners, 0, id(1)).unwrap();
+        slot_admit(&mut owners, 1, id(2)).unwrap();
+        slot_admit(&mut owners, 2, id(3)).unwrap();
+
+        let err = slot_admit(&mut owners, 1, id(9)).unwrap_err().to_string();
+        assert!(err.contains("still owned by request 2"));
+
+        // Retire slot 1: last occupied slot (2, request 3) moves into it.
+        let needs_move = slot_compact(
+            &mut owners,
+            id(2),
+            TpSlotCompaction {
+                moved_request_id: id(3),
+                from: 2,
+                to: 1,
+            },
+        )
+        .unwrap();
+        assert!(needs_move, "materialized moved request needs the GPU move");
+        assert_eq!(owners, vec![Some(id(1)), Some(id(3)), None, None]);
+
+        // Retire the tail slot: release without compaction.
+        assert_eq!(slot_release(&mut owners, id(3)), Some(1));
+        assert_eq!(owners, vec![Some(id(1)), None, None, None]);
+
+        // Releasing a request that never materialized a slot is not an error.
+        assert_eq!(slot_release(&mut owners, id(77)), None);
+    }
+
+    #[test]
+    fn slot_map_compact_tolerates_unmaterialized_requests() {
+        let id = |value: u64| RequestId::new(value);
+        let mut owners = vec![None, None, None];
+
+        // Dropped request materialized, moved request not yet admitted to its
+        // slot (retired between promotion and its first decode row): clear
+        // only, no GPU move.
+        slot_admit(&mut owners, 0, id(1)).unwrap();
+        let needs_move = slot_compact(
+            &mut owners,
+            id(1),
+            TpSlotCompaction {
+                moved_request_id: id(2),
+                from: 2,
+                to: 0,
+            },
+        )
+        .unwrap();
+        assert!(!needs_move);
+        assert_eq!(owners, vec![None, None, None]);
+
+        // Moved request materialized, dropped request not: the move is needed
+        // and the moved request takes over the vacated slot.
+        slot_admit(&mut owners, 2, id(3)).unwrap();
+        let needs_move = slot_compact(
+            &mut owners,
+            id(4),
+            TpSlotCompaction {
+                moved_request_id: id(3),
+                from: 2,
+                to: 0,
+            },
+        )
+        .unwrap();
+        assert!(needs_move);
+        assert_eq!(owners, vec![Some(id(3)), None, None]);
+    }
+
+    #[test]
+    fn slot_map_compact_poisons_on_occupancy_mismatch() {
+        let id = |value: u64| RequestId::new(value);
+        let mut owners = vec![Some(id(1)), Some(id(2))];
+
+        let err = slot_compact(
+            &mut owners,
+            id(9),
+            TpSlotCompaction {
+                moved_request_id: id(2),
+                from: 1,
+                to: 0,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("slot 0 holds request 1"));
+
+        let err = slot_compact(
+            &mut owners,
+            id(1),
+            TpSlotCompaction {
+                moved_request_id: id(9),
+                from: 1,
+                to: 0,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("slot 1 holds request 2"));
+
+        let err = slot_admit(&mut owners, 5, id(1)).unwrap_err().to_string();
+        assert!(err.contains("exceeds worker slot map"));
+    }
+
+    #[test]
+    fn validates_prefill_chunk_shape() {
+        let empty = [TpPrefillChunkItem::new(
+            RequestId::new(1),
+            vec![],
+            None,
+            false,
+        )];
+        let err = validate_prefill_chunks(&empty).unwrap_err().to_string();
+        assert!(err.contains("is empty"));
+
+        let duplicate = [
+            TpPrefillChunkItem::new(RequestId::new(1), vec![151_646], None, false),
+            TpPrefillChunkItem::new(RequestId::new(1), vec![9707], None, true),
+        ];
+        let err = validate_prefill_chunks(&duplicate).unwrap_err().to_string();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn validates_prefill_layout_before_admission() {
+        let request = |id, tokens| {
+            TpPrefillChunkItem::new(RequestId::new(id), vec![9707; tokens], None, true)
+        };
+
+        validate_prefill_layout(&[request(1, 2)], 2, 4, 1, |_| false)
+            .expect("one new request fits the remaining slot and context");
+
+        let err = validate_prefill_layout(&[], 2, 4, 0, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least one request"));
+
+        let err = validate_prefill_layout(&[request(1, 2), request(1, 2)], 2, 4, 0, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate"));
+
+        let err = validate_prefill_layout(&[request(2, 2)], 2, 4, 1, |id| id == RequestId::new(2))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"));
+
+        let err = validate_prefill_layout(&[request(2, 2)], 1, 4, 1, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("capacity"));
+
+        let err = validate_prefill_layout(&[request(2, 4)], 2, 4, 0, |_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("leaves no room"));
+    }
+
+    #[test]
+    fn validates_decode_request_shape() {
+        validate_decode_requests(&[TpDecodeStepItem::new(
+            RequestId::new(1),
+            9707,
+            None,
+            SamplingParams::default(),
+        )])
+        .expect("single decode request is valid");
+
+        let duplicate = [
+            TpDecodeStepItem::new(RequestId::new(1), 9707, None, SamplingParams::default()),
+            TpDecodeStepItem::new(RequestId::new(1), 560, None, SamplingParams::default()),
+        ];
+        let err = validate_decode_requests(&duplicate)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn validates_unified_worker_request_phases() {
+        let prefill_id = RequestId::new(1);
+        let decode_id = RequestId::new(2);
+        let plan = TpUnifiedPlan {
+            prefill: vec![TpPrefillChunkItem::new(
+                prefill_id,
+                vec![151_646],
+                None,
+                false,
+            )],
+            decode: vec![TpDecodeStepItem::new(
+                decode_id,
+                9707,
+                None,
+                SamplingParams::default(),
+            )],
+            prefill_sample_seed: 1,
+            decode_sample_seed: 2,
+        };
+
+        validate_unified_worker_layout(&plan, 2, |id| {
+            (id == prefill_id)
+                .then_some(TpRequestPhase::Prefilling)
+                .or_else(|| (id == decode_id).then_some(TpRequestPhase::Decoding))
+        })
+        .expect("unified rows should reference restored worker state");
+
+        let err = validate_unified_worker_layout(&plan, 2, |id| {
+            (id == decode_id).then_some(TpRequestPhase::Decoding)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("prefill request 1 has no worker state"));
+    }
+
+    fn assert_workers_empty(executor: &Qwen35TpExecutor) {
+        let snapshots = executor
+            .snapshot_workers()
+            .expect("snapshot healthy TP workers");
+        assert_snapshots_empty(&snapshots, executor.world_size());
+    }
+
+    fn assert_snapshots_empty(snapshots: &[WorkerStateSnapshot], world_size: usize) {
+        assert_eq!(snapshots.len(), world_size);
+        for (rank, snapshot) in snapshots.iter().enumerate() {
+            assert_eq!(snapshot.rank, rank);
+            assert_eq!(snapshot.request_count, 0, "rank {rank} retained requests");
+            assert!(
+                snapshot.requests.is_empty(),
+                "rank {rank} retained request IDs"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_drop_expectations_detect_rank_lifecycle_divergence() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_drop_expectations_detect_rank_lifecycle_divergence",
+        ) else {
+            return;
+        };
+        let mut executor =
+            Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
+                .expect("start TP2 executor");
+
+        executor
+            .drop_request(RequestId::new(400), DropExpectation::MustBeAbsent)
+            .expect("pre-materialization drop should observe all ranks absent");
+        executor.ping_all().expect("absent drop preserves health");
+
+        let clean_id = RequestId::new(401);
+        executor
+            .execute_prefill(PrefillPlan {
+                requests: &[PrefillStepItem::new(clean_id, vec![151_646, 9707], None)],
+            })
+            .expect("materialize clean request");
+        executor
+            .drop_request(clean_id, DropExpectation::MustExist)
+            .expect("materialized drop should observe all ranks present");
+        assert_workers_empty(&executor);
+
+        let divergent_id = RequestId::new(402);
+        executor
+            .execute_prefill(PrefillPlan {
+                requests: &[PrefillStepItem::new(
+                    divergent_id,
+                    vec![151_646, 9707],
+                    None,
+                )],
+            })
+            .expect("materialize divergent request");
+        assert!(
+            executor
+                .remove_worker_request_state_for_test(1, divergent_id)
+                .expect("remove rank-1 request state")
+        );
+        let err = executor
+            .drop_request(divergent_id, DropExpectation::MustExist)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MustExist"));
+        assert!(executor.ping_all().is_err());
+        let snapshots = executor
+            .snapshot_workers_unchecked_for_test()
+            .expect("snapshot workers after mixed drop poison");
+        assert_snapshots_empty(&snapshots, executor.world_size());
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_partial_dispatch_gate_prevents_rank_local_mutation() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_partial_dispatch_gate_prevents_rank_local_mutation",
+        ) else {
+            return;
+        };
+        let executor = Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
+            .expect("start TP2 executor");
+        let chunk = TpPrefillChunkItem::new(RequestId::new(410), vec![151_646, 9707], None, true);
+
+        let err = executor
+            .inject_prefill_dispatch_failure_for_test(&[chunk], 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("injected dispatch failure at rank 1"));
+        assert!(executor.ping_all().is_err());
+        let snapshots = executor
+            .snapshot_workers_unchecked_for_test()
+            .expect("snapshot workers after cancelled prefix dispatch");
+        assert_snapshots_empty(&snapshots, executor.world_size());
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_worker_receiver_disconnect_poisons_without_snapshot_claim() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_worker_receiver_disconnect_poisons_without_snapshot_claim",
+        ) else {
+            return;
+        };
+        let mut executor =
+            Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
+                .expect("start TP2 executor");
+        executor
+            .disconnect_worker_receiver_for_test(1)
+            .expect("disconnect rank-1 worker receiver");
+
+        let error = executor
+            .begin_request(
+                RequestId::new(420),
+                &[151_646, 9707],
+                executor.max_position_embeddings - 2,
+                None,
+                false,
+            )
+            .unwrap_err();
+        let TpBeginRequestError::Fatal(error) = error else {
+            panic!("worker disconnect must be fatal")
+        };
+        let err = error.to_string();
+        assert!(
+            err.contains("failed to dispatch RestoreRequest to TP worker rank 1"),
+            "unexpected error: {err}"
+        );
+        assert!(executor.ping_all().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_invalid_prefill_plan_does_not_begin_earlier_requests() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_invalid_prefill_plan_does_not_begin_earlier_requests",
+        ) else {
+            return;
+        };
+        let mut executor =
+            Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 2)
+                .expect("start TP2 executor");
+        let request_id = RequestId::new(430);
+        let duplicate = [
+            PrefillStepItem::new(request_id, vec![151_646, 9707], None),
+            PrefillStepItem::new(request_id, vec![9707], None),
+        ];
+
+        let err = executor
+            .execute_prefill(PrefillPlan {
+                requests: &duplicate,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate"));
+        assert!(executor.request_kvs.is_empty());
+        assert_workers_empty(&executor);
+
+        executor
+            .execute_prefill(PrefillPlan {
+                requests: &[PrefillStepItem::new(request_id, vec![151_646, 9707], None)],
+            })
+            .expect("the rejected request ID remains reusable");
+        executor
+            .drop_request(request_id, DropExpectation::MustExist)
+            .expect("drop retried request");
+        assert!(executor.request_kvs.is_empty());
+        assert_workers_empty(&executor);
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_unified_step_advances_prefill_and_decode_together() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_unified_step_advances_prefill_and_decode_together",
+        ) else {
+            return;
+        };
+        let mut executor =
+            Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 2)
+                .expect("start TP2 executor");
+        let decode_id = RequestId::new(30);
+        let decode_prefill = executor
+            .execute_prefill(PrefillPlan {
+                requests: &[PrefillStepItem::new(
+                    decode_id,
+                    vec![151_646, 9707],
+                    Some(1),
+                )],
+            })
+            .expect("materialize TP2 decode request");
+        let prefill_id = RequestId::new(31);
+        executor
+            .begin_request(prefill_id, &[151_646, 9707], 8, None, false)
+            .expect("admit unified prefill");
+        let unified = executor
+            .execute_unified(&TpUnifiedPlan {
+                prefill: vec![TpPrefillChunkItem::new(
+                    prefill_id,
+                    vec![151_646, 9707],
+                    Some(1),
+                    true,
+                )],
+                decode: vec![TpDecodeStepItem::new(
+                    decode_id,
+                    decode_prefill.requests[0].first_token,
+                    Some(1),
+                    SamplingParams::default(),
+                )],
+                prefill_sample_seed: 102,
+                decode_sample_seed: 101,
+            })
+            .expect("run TP2 unified step");
+
+        assert_eq!(unified.prefill.requests.len(), 1);
+        assert_eq!(unified.prefill.requests[0].request_id, prefill_id);
+        assert!(unified.prefill.requests[0].first_token_logprob.is_some());
+        assert_eq!(unified.decode.requests.len(), 1);
+        assert_eq!(unified.decode.requests[0].request_id, decode_id);
+        assert!(unified.decode.requests[0].logprob.is_some());
+        for snapshot in executor.snapshot_workers().expect("snapshot unified state") {
+            assert_eq!(snapshot.request_count, 2);
+            assert!(
+                snapshot
+                    .requests
+                    .iter()
+                    .all(|(_, phase)| *phase == TpRequestPhase::Decoding)
+            );
+        }
+
+        for request_id in [decode_id, prefill_id] {
+            executor
+                .drop_request(request_id, DropExpectation::MustExist)
+                .expect("drop unified request");
+        }
+        assert_workers_empty(&executor);
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_drop_all_restores_complete_request_capacity() {
+        const CONFIGURED_MAX_BATCH: usize = 2;
+
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_drop_all_restores_complete_request_capacity",
+        ) else {
+            return;
+        };
+        let mut executor = Qwen35TpExecutor::from_runtime_with_capacity(
+            &model_path,
+            false,
+            &[0, 1],
+            CONFIGURED_MAX_BATCH,
+        )
+        .expect("start TP2 executor");
+        assert_eq!(executor.max_batch(), CONFIGURED_MAX_BATCH);
+        assert_workers_empty(&executor);
+
+        let first_ids: Vec<_> = (100..100 + CONFIGURED_MAX_BATCH as u64)
+            .map(RequestId::new)
+            .collect();
+        let first_requests: Vec<_> = first_ids
+            .iter()
+            .map(|&request_id| PrefillStepItem::new(request_id, vec![151_646, 9707], None))
+            .collect();
+        let first_results = executor
+            .execute_prefill(PrefillPlan {
+                requests: &first_requests,
+            })
+            .expect("fill complete TP2 request capacity");
+        assert_eq!(first_results.requests.len(), CONFIGURED_MAX_BATCH);
+        let expected_ids: HashSet<_> = first_ids.iter().copied().collect();
+        for snapshot in executor
+            .snapshot_workers()
+            .expect("snapshot full TP2 request capacity")
+        {
+            assert_eq!(snapshot.request_count, CONFIGURED_MAX_BATCH);
+            assert_eq!(
+                snapshot
+                    .requests
+                    .iter()
+                    .map(|(request_id, _)| *request_id)
+                    .collect::<HashSet<_>>(),
+                expected_ids
+            );
+            assert!(
+                snapshot
+                    .requests
+                    .iter()
+                    .all(|(_, phase)| *phase == TpRequestPhase::Decoding),
+                "rank {} retained a non-decoding request after final prefill",
+                snapshot.rank
+            );
+        }
+        for request_id in &first_ids {
+            executor
+                .drop_request(*request_id, DropExpectation::MustExist)
+                .expect("drop first-pass TP2 request");
+        }
+        assert_workers_empty(&executor);
+
+        let second_ids: Vec<_> = (200..200 + CONFIGURED_MAX_BATCH as u64)
+            .map(RequestId::new)
+            .collect();
+        let second_requests: Vec<_> = second_ids
+            .iter()
+            .map(|&request_id| PrefillStepItem::new(request_id, vec![151_646, 9707], None))
+            .collect();
+        let second_prefill = executor
+            .execute_prefill(PrefillPlan {
+                requests: &second_requests,
+            })
+            .expect("refill complete TP2 request capacity");
+        assert_eq!(second_prefill.requests.len(), CONFIGURED_MAX_BATCH);
+        let decode_requests: Vec<_> = second_prefill
+            .requests
+            .iter()
+            .map(|result| DecodeStepItem::new(result.request_id, result.first_token, None))
+            .collect();
+        let decode = executor
+            .execute_decode(DecodePlan {
+                requests: &decode_requests,
+            })
+            .expect("complete one decode step after TP2 capacity refill");
+        assert_eq!(decode.requests.len(), CONFIGURED_MAX_BATCH);
+        for request_id in &second_ids {
+            executor
+                .drop_request(*request_id, DropExpectation::MustExist)
+                .expect("drop second-pass TP2 request");
+        }
+        assert_workers_empty(&executor);
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+    fn tp2_readmission_matches_clean_first_token_artifact() {
+        const REQUESTED_LOGPROBS: usize = 5;
+
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "tp2_readmission_matches_clean_first_token_artifact",
+        ) else {
+            return;
+        };
+        let mut executor =
+            Qwen35TpExecutor::from_runtime_with_capacity(&model_path, false, &[0, 1], 1)
+                .expect("start TP2 executor");
+        let prompt = vec![151_646, 9707];
+
+        let clean_id = RequestId::new(300);
+        let clean_request =
+            PrefillStepItem::new(clean_id, prompt.clone(), Some(REQUESTED_LOGPROBS));
+        let clean = executor
+            .execute_prefill(PrefillPlan {
+                requests: &[clean_request],
+            })
+            .expect("run clean TP2 prefill");
+        assert_eq!(clean.requests.len(), 1);
+        assert!(clean.requests[0].first_token_logprob.is_some());
+        let clean_artifact = (
+            clean.requests[0].first_token,
+            clean.requests[0].first_token_logprob.clone(),
+        );
+        executor
+            .drop_request(clean_id, DropExpectation::MustExist)
+            .expect("drop clean TP2 request");
+        assert_workers_empty(&executor);
+
+        let readmitted_id = RequestId::new(301);
+        let readmitted_request =
+            PrefillStepItem::new(readmitted_id, prompt, Some(REQUESTED_LOGPROBS));
+        let readmitted = executor
+            .execute_prefill(PrefillPlan {
+                requests: &[readmitted_request],
+            })
+            .expect("run readmitted TP2 prefill");
+        assert_eq!(readmitted.requests.len(), 1);
+        let readmitted_artifact = (
+            readmitted.requests[0].first_token,
+            readmitted.requests[0].first_token_logprob.clone(),
+        );
+        assert_eq!(readmitted_artifact, clean_artifact);
+        executor
+            .drop_request(readmitted_id, DropExpectation::MustExist)
+            .expect("drop readmitted TP2 request");
+        assert_workers_empty(&executor);
+    }
+}

@@ -1,12 +1,12 @@
-[submodule "openinfer-kernels/third_party/flashinfer"]
-	path = openinfer-kernels/third_party/flashinfer
+[submodule "pegainfer-kernels/third_party/flashinfer"]
+	path = pegainfer-kernels/third_party/flashinfer
 	url = https://github.com/flashinfer-ai/flashinfer
-[submodule "openinfer-kernels/third_party/DeepEP"]
-	path = openinfer-kernels/third_party/DeepEP
+[submodule "pegainfer-kernels/third_party/DeepEP"]
+	path = pegainfer-kernels/third_party/DeepEP
 	url = https://github.com/deepseek-ai/DeepEP
-[submodule "openinfer-kernels/third_party/FlashMLA"]
-	path = openinfer-kernels/third_party/FlashMLA
+[submodule "pegainfer-kernels/third_party/FlashMLA"]
+	path = pegainfer-kernels/third_party/FlashMLA
 	url = https://github.com/deepseek-ai/FlashMLA
-[submodule "openinfer-kernels/third_party/DeepGEMM"]
-	path = openinfer-kernels/third_party/DeepGEMM
-	url = https://github.com/openinfer-project/DeepGEMM
+[submodule "pegainfer-kernels/third_party/DeepGEMM"]
+	path = pegainfer-kernels/third_party/DeepGEMM
+	url = https://github.com/pegainfer-project/DeepGEMM

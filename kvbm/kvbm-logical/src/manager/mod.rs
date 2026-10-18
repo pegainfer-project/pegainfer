@@ -50,18 +50,6 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         BlockManagerConfigBuilder::default()
     }
 
-    /// Stable, process-unique identifier for this manager's underlying
-    /// [`BlockStore`](crate::pools::BlockStore). See [`crate::ManagerId`].
-    /// Cheap (one field load via the store).
-    ///
-    /// Together with a [`BlockId`](crate::BlockId) this names a specific
-    /// physical pool slot — the disambiguating runtime address that
-    /// downstream consumers need after the policy parameter `T` has been
-    /// type-erased through [`crate::LifecyclePinRef`].
-    pub fn id(&self) -> crate::ManagerId {
-        self.store.id()
-    }
-
     /// Allocate `count` mutable blocks, drawing first from the reset pool
     /// and then evicting from the inactive pool if needed.
     ///
@@ -168,6 +156,12 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         matched
     }
 
+    /// Return the point-in-time length of the contiguous prefix held by live
+    /// block references. Inactive blocks are not promoted or kept alive.
+    pub fn active_prefix_len(&self, seq_hash: &[SequenceHash]) -> usize {
+        self.store.active_prefix_len(seq_hash)
+    }
+
     /// Scatter-gather scan: finds all blocks matching any hash, without
     /// stopping on misses.
     pub fn scan_matches(
@@ -241,11 +235,6 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     /// Tokens per block (constant after construction).
     pub fn block_size(&self) -> usize {
         self.block_size
-    }
-
-    /// Current duplication policy.
-    pub fn duplication_policy(&self) -> &BlockDuplicationPolicy {
-        &self.duplication_policy
     }
 
     /// Reference to the shared block registry.

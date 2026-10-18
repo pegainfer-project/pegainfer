@@ -19,7 +19,7 @@ Every PR3 op must satisfy, from day one:
 - **No D2H, no host branching on data.** Router top-k, expert counts, slot conversion all stay on device. (Kimi lesson: `cpu_sync=false` means auditing every adapter kernel for capacity-proportional cost — bound work by device-side counters, not host loops.)
 - **Fixed shapes at capture time.** MoE token capacity = `topk(8) × EXPERT_ALIGNMENT(64)` slots, allocated once in a decode-state arena (mirror `KimiMoeDeepEpState`, `moe_deepep.rs:66-142`). Empty tail rows are skipped via device bounds, never via smaller launches.
 - **Pool allocation only, no arena.** The forwards allocate scratch per call through cudarc's stream-ordered `cuMemAllocAsync` pool — the PP8 branch's `graph_alloc_probe` proved pool allocation inside capture replays correctly as graph memory nodes, so per-call allocs are NOT a capture blocker and the arena refactor the old plan called for is unnecessary complexity. What stays banned is host-side allocation *decisions* (sizes must not depend on data).
-- **Stream-ordered only.** Use the `_graphsafe` gemm variants from `typed_ops` for bookends (the variants exist precisely for capture; `openinfer-kimi-k2/src/runner/worker/forward.rs:109-114`).
+- **Stream-ordered only.** Use the `_graphsafe` gemm variants from `typed_ops` for bookends (the variants exist precisely for capture; `pegainfer-kimi-k2/src/runner/worker/forward.rs:109-114`).
 
 PR5 then *captures* this shape; it must not have to *change* it.
 
@@ -68,7 +68,7 @@ Why not vllm's masked `BatchedExperts` layout: our shim's dispatch contract is e
 
 ## Scope
 
-### Kernel ops (`openinfer-kernels`) — cherry-picks from `feat/glm52-pp8-decode` unless noted
+### Kernel ops (`pegainfer-kernels`) — cherry-picks from `feat/glm52-pp8-decode` unless noted
 
 | op | file | what | source |
 |---|---|---|---|
@@ -79,7 +79,7 @@ Why not vllm's masked `BatchedExperts` layout: our shim's dispatch contract is e
 
 Adaptation, not rewrite: the picks must land on main's refactored op surfaces (`fp8.rs` ProjWeight, `Glm52DeepGemmScaleLayout`, feature-gated build) — expect mechanical conflicts, not design work.
 
-### Model crate (`openinfer-glm52`)
+### Model crate (`pegainfer-glm52`)
 
 - `moe_decode.rs` — cherry-pick base from the branch: `Glm52MoeLayerWeights` (gate bf16 `[256,6144]` + bias f32 `[256]` + experts packed expert-major `[E,n,k]` fp8 + scales + shared-expert ProjWeights) + `glm52_moe_decode_forward`. **Rework needed**: the branch's final version is GEMV-only and allocates per call — PR3's version fronts the grouped chain, takes an arena, and keeps GEMV behind the same signature. `from_host` only; `from_device` against the EP8 slab is PR4 (rank-slab repack decision lives there; the branch's `pack_loaded_expert_fp8_layers` in its `package.rs` is the packer reference — keep one packer shared between test and production paths).
 - `dense.rs`, `bookend.rs` — cherry-pick (branch Slice 6); swap bookend GEMMs to the `_graphsafe` variants and device top-1 (`launch_local_top1_batch`), mirroring `kimi-k2 .../forward.rs:102-124`.
@@ -130,13 +130,13 @@ Gate env: jz38 H200 + `/data/models/GLM-5.2-FP8`, same build env as `oracle-harn
 - **Gate results**:
   - bookend: embed rows digest exact, argmax exact ×8, logits 64/64.
   - layer 0 (dense + full indexer): **64/64**.
-  - layer 6 (MoE + full indexer): **62/64 on BOTH Grouped and Gemv paths, failing the SAME two probes with the SAME values** — the deviation is upstream of the expert GEMMs. Measured cause: the divergent positions sit on 8th-vs-9th biased-score margins of 1.0–1.7e-4 (median 1.8e-3); the engine's fp8 router logits legitimately flip those near-tied picks vs the fp8sim oracle. The gate allows ≤4/64 outliers capped at 8×tol (dense: zero allowance). Analysis artifacts: `/tmp/layer6_taps.safetensors` + `/tmp/layer6_engine.f32` on jz-38 (`OPENINFER_GLM52_LAYER_DUMP`).
+  - layer 6 (MoE + full indexer): **62/64 on BOTH Grouped and Gemv paths, failing the SAME two probes with the SAME values** — the deviation is upstream of the expert GEMMs. Measured cause: the divergent positions sit on 8th-vs-9th biased-score margins of 1.0–1.7e-4 (median 1.8e-3); the engine's fp8 router logits legitimately flip those near-tied picks vs the fp8sim oracle. The gate allows ≤4/64 outliers capped at 8×tol (dense: zero allowance). Analysis artifacts: `/tmp/layer6_taps.safetensors` + `/tmp/layer6_engine.f32` on jz-38 (`PEGAINFER_GLM52_LAYER_DUMP`).
   - TRTLLM grouped `moeGemm` executed correctly on this branch path (its first run outside the PP8 branch).
 - **Environment pitfalls (jz-38)**:
-  - `OPENINFER_DEEPGEMM_ROOT` must point at **`.../DeepGEMM/deep_gemm`** (the python-package dir that contains `include/`), not the submodule root — the JIT `IncludeParser` resolves `$ROOT/include/deep_gemm/...`; the wrong root fails as an opaque `CUDA_ERROR_LAUNCH_FAILED` at the MQA metadata launch. Docs and gate comments corrected.
-  - The repo venv's `nvidia/nccl` is back to 2.29.7 (a torch reinstall downgraded it); the `moe`-feature DeepEP shim needs ≥ 2.30.4 → `OPENINFER_NCCL_ROOT=/root/develop/xingming/nccl-latest/nvidia/nccl` (nvidia-nccl-cu12 2.30.7 wheel).
+  - `PEGAINFER_DEEPGEMM_ROOT` must point at **`.../DeepGEMM/deep_gemm`** (the python-package dir that contains `include/`), not the submodule root — the JIT `IncludeParser` resolves `$ROOT/include/deep_gemm/...`; the wrong root fails as an opaque `CUDA_ERROR_LAUNCH_FAILED` at the MQA metadata launch. Docs and gate comments corrected.
+  - The repo venv's `nvidia/nccl` is back to 2.29.7 (a torch reinstall downgraded it); the `moe`-feature DeepEP shim needs ≥ 2.30.4 → `PEGAINFER_NCCL_ROOT=/root/develop/xingming/nccl-latest/nvidia/nccl` (nvidia-nccl-cu12 2.30.7 wheel).
   - transformers 5.13.0.dev0 is not on PyPI; run the harness with the repo venv python (`.venv/bin/python tools/accuracy/glm52_oracle.py ...`), not `uv run`.
-- **Pre-existing breakage fixed en passant**: `tests/checkpoint.rs` used `{event:?}` but `TokenEvent` had no `Debug` (fixed by deriving it); `openinfer-kernels/tests/glm52_indexer_smoke.rs` had a type error — `--tests` compile of both crates was red on main.
+- **Pre-existing breakage fixed en passant**: `tests/checkpoint.rs` used `{event:?}` but `TokenEvent` had no `Debug` (fixed by deriving it); `pegainfer-kernels/tests/glm52_indexer_smoke.rs` had a type error — `--tests` compile of both crates was red on main.
 - **Toxic-review round (Request Changes → fixed, all gates re-run green)**: cherry-pick had smuggled `CUBLAS_COMPUTE_32F_PEDANTIC` back into the router (the exact kimi lesson this doc forbids — fixed to `CUBLAS_COMPUTE_32F`; at bs=1 the tie-flip outlier set did not move); scatter/combine validated `expert_offsets.len() > topk` while the kernels index by expert id (fixed to `> n_experts`, a silent-OOB trap); the caller-less plain weight-only GEMV path was deleted (~150 lines, re-cherry-pick from the PP8 branch if PR5 wants it); the post-attention boundary now uses `fused_add_rms_norm_round_batch_into` (bit-identical); contradictory pad-row invariant docs unified on the row-isolation argument (zeroing not required for correctness).
 
 ## Read
@@ -145,9 +145,9 @@ Gate env: jz38 H200 + `/data/models/GLM-5.2-FP8`, same build env as `oracle-harn
 - `vllm/vllm/model_executor/models/deepseek_v2.py:216-407,1154-1325` — MLP/MoE/decoder layer (authoritative model graph).
 - `vllm/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:80-161` — routing math.
 - `vllm/vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py` — the graph-first DeepEP v2 decode contract (what PR4 must preserve; `do_cpu_sync=False`, device-side counts, pow2 token cap).
-- `openinfer-kimi-k2/src/runner/moe_deepep.rs` — the in-repo graph-quiet DeepEP decode shape (state arena, stream discipline, worst-case buffers).
-- `openinfer-kernels/csrc/deepep/deepep_shim.cu` + `src/ops/deepep.rs` — the DeepEP v2 elastic shim PR4 re-bakes for GLM.
-- `openinfer-kernels/src/ops/glm52/{deepgemm_grouped.rs,moe_quant.rs}` + `csrc/glm52/glm52_trtllm_grouped_fp8.cu` — merged metadata/quant ops and the compiled-but-unwrapped grouped GEMM.
+- `pegainfer-kimi-k2/src/runner/moe_deepep.rs` — the in-repo graph-quiet DeepEP decode shape (state arena, stream discipline, worst-case buffers).
+- `pegainfer-kernels/csrc/deepep/deepep_shim.cu` + `src/ops/deepep.rs` — the DeepEP v2 elastic shim PR4 re-bakes for GLM.
+- `pegainfer-kernels/src/ops/glm52/{deepgemm_grouped.rs,moe_quant.rs}` + `csrc/glm52/glm52_trtllm_grouped_fp8.cu` — merged metadata/quant ops and the compiled-but-unwrapped grouped GEMM.
 - `transformers/src/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py:456-621` — `GlmMoeDsaMLP/TopkRouter/Experts/MoE/DecoderLayer` (oracle source).
-- `feat/glm52-pp8-decode:` `openinfer-glm52/src/{moe_decode.rs,dense.rs,bookend.rs,decode.rs,weights/package.rs}` + `openinfer-kernels/csrc/glm52/{glm52_router.cu,glm52_moe_route.cu,glm52_moe_gemv.cu}` + `ops/glm52/{router.rs,moe_route.rs,moe_gemv.rs,trtllm_grouped.rs}` — the cherry-pick sources. That branch's full PP8 forward decoded fluent English on 8×H200, so the composed math is known-good; only its PP spine and npz-fixture gates are discarded.
+- `feat/glm52-pp8-decode:` `pegainfer-glm52/src/{moe_decode.rs,dense.rs,bookend.rs,decode.rs,weights/package.rs}` + `pegainfer-kernels/csrc/glm52/{glm52_router.cu,glm52_moe_route.cu,glm52_moe_gemv.cu}` + `ops/glm52/{router.rs,moe_route.rs,moe_gemv.rs,trtllm_grouped.rs}` — the cherry-pick sources. That branch's full PP8 forward decoded fluent English on 8×H200, so the composed math is known-good; only its PP spine and npz-fixture gates are discarded.
 - `feat/glm52-pp8-decode:docs/models/glm52/pp-decode.md` — the branch's measured perf record. Facts that carry over to this composition: use `fused_add_rms_norm_round_batch_into` across the layer loop (bit-identical, −0.35 ms there); clamp FlashMLA `num_sm_parts` to 32 for bs=1 (the 132-way default over-splits the combine; U-curve measured); cuBLAS is near-optimal for the bs=1 small-N/short-k GEMVs (gate, absorb) — don't hand-roll those.

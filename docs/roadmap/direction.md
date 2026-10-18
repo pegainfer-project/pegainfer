@@ -1,6 +1,6 @@
 # Direction
 
-> **TL;DR:** openinfer is not chasing a super abstraction that swallows every model. The next-stage shape is a set of reusable, stable infrastructure plus per-model engines with clear boundaries. Share what is stable; let go of what will truly fork. Optimize for keeping each model's context coherent for both humans and LLMs to read in one pass.
+> **TL;DR:** pegainfer is not chasing a super abstraction that swallows every model. The next-stage shape is a set of reusable, stable infrastructure plus per-model engines with clear boundaries. Share what is stable; let go of what will truly fork. Optimize for keeping each model's context coherent for both humans and LLMs to read in one pass.
 >
 > **Origin:** "One Size Can't Fit All" (2026-05-05).
 
@@ -21,8 +21,8 @@ So the working principle is **share the stable parts; allow the fork-prone parts
 ### Shared infrastructure (stable, cross-model)
 
 - **Frontend** — HTTP/OpenAI surface, tokenizer, chat template, stop sequences, streaming, logprobs, usage. Bridged via `vllm-frontend-rs` plus a local engine-core adapter. The frontend should never know what model, parallel strategy, or attention pattern is behind it.
-- **Runtime primitives** — `openinfer-core` owns the generation contract (`ModelForward`, `GenerationState`), sampler, CUDA Graph state, weight loader, page/KV pool primitives. Per-model crates depend on it, not on root.
-- **Kernel layer** — `openinfer-kernels` owns kernel sources, FFI, and wrappers. cuBLAS, FlashInfer, Triton AOT, handwritten CUDA all live here. Open to extension; we don't fork third-party kernels lightly.
+- **Runtime primitives** — `pegainfer-core` owns the generation contract (`ModelForward`, `GenerationState`), sampler, CUDA Graph state, weight loader, page/KV pool primitives. Per-model crates depend on it, not on root.
+- **Kernel layer** — `pegainfer-kernels` owns kernel sources, FFI, and wrappers. cuBLAS, FlashInfer, Triton AOT, handwritten CUDA all live here. Open to extension; we don't fork third-party kernels lightly.
 - **Data plane** — PegaFlow stays the KV data plane (RDMA transfer, SSD offload, prefix dedup), not folded into model internals.
 - **Tooling** — benchmarks, profiling, eventual tracing/simulator infrastructure.
 
@@ -62,7 +62,7 @@ The closed loop matters: offline expectation (simulator) + online measurement (t
 
 ## What this is not
 
-- Not "Rust rewrite of vLLM." vLLM optimizes within Python; SGLang aspires to Rust but hasn't started. openinfer's structural choice — per-model engines on shared infrastructure — is orthogonal to language.
+- Not "Rust rewrite of vLLM." vLLM optimizes within Python; SGLang aspires to Rust but hasn't started. pegainfer's structural choice — per-model engines on shared infrastructure — is orthogonal to language.
 - Not "general-purpose LLM serving stack." We are good at specific model families with clear ownership; that is the unit of scaling, not "support every model on every backend."
 - Not a permanent freeze on shared layers. The boundary moves when a new model genuinely demands it (e.g., MoE all-to-all may pull communication primitives into the shared layer). It does not move because abstraction feels nicer.
 

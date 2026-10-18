@@ -2,7 +2,7 @@
 """DeepSeek-V2-Lite HTTP reliability gate for /v1/completions.
 
 The gate intentionally uses the real OpenAI-compatible HTTP path and consumes
-`openinfer_http_trace` server logs. It fails when terminal traces are missing,
+`pegainfer_http_trace` server logs. It fails when terminal traces are missing,
 state does not retire back to a healthy baseline, clean follow-up requests fail,
 success hashes drift, or an expected cancel/disconnect/reject outcome is not
 visible in traces.
@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 
-TRACE_RE = re.compile(r"openinfer_http_trace\s+(\{.*\})")
+TRACE_RE = re.compile(r"pegainfer_http_trace\s+(\{.*\})")
 DSV2_LITE_ACTIVE_CAP = 8
 PROMPT_WORDS = (
     "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu "
@@ -831,7 +831,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", default="deepseek-v2-lite")
-    parser.add_argument("--server-log", type=Path, help="server log with openinfer_http_trace lines")
+    parser.add_argument("--server-log", type=Path, help="server log with pegainfer_http_trace lines")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-tokens", type=int, default=16)

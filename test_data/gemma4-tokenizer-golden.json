@@ -1,0 +1,79 @@
+{
+  "source_repo": "google/gemma-4-12B-it",
+  "revision": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+  "transformers_version": "5.11.0",
+  "file_sha256": {
+    "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+    "tokenizer_config.json": "a62f4e85a47c0c136edaaa3a4f591fd6783717299a9def47e5ad03a49f6a5eb9",
+    "chat_template.jinja": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4"
+  },
+  "chat_templates": [
+    {
+      "name": "single_user_with_generation_prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2 + 2?"
+        }
+      ],
+      "add_generation_prompt": true,
+      "rendered": "<bos><|turn>user\nWhat is 2 + 2?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+    },
+    {
+      "name": "single_user_no_generation_prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 2 + 2?"
+        }
+      ],
+      "add_generation_prompt": false,
+      "rendered": "<bos><|turn>user\nWhat is 2 + 2?<turn|>\n"
+    },
+    {
+      "name": "multi_turn",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "assistant",
+          "content": "Hi there."
+        },
+        {
+          "role": "user",
+          "content": "And now?"
+        }
+      ],
+      "add_generation_prompt": true,
+      "rendered": "<bos><|turn>user\nHello<turn|>\n<|turn>model\nHi there.<turn|>\n<|turn>user\nAnd now?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+    },
+    {
+      "name": "system_then_user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Explain gravity."
+        }
+      ],
+      "add_generation_prompt": true,
+      "rendered": "<bos><|turn>system\nYou are terse.<turn|>\n<|turn>user\nExplain gravity.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+    },
+    {
+      "name": "unicode_content",
+      "messages": [
+        {
+          "role": "user",
+          "content": "翻译：🙂 と こんにちは"
+        }
+      ],
+      "add_generation_prompt": true,
+      "rendered": "<bos><|turn>user\n翻译：🙂 と こんにちは<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+    }
+  ]
+}

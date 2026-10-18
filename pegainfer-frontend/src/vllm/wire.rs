@@ -1,0 +1,538 @@
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use vllm_engine_core_client::protocol::logprobs::Logprobs;
+use vllm_engine_core_client::protocol::logprobs::MaybeWireLogprobs;
+use vllm_engine_core_client::protocol::logprobs::PositionLogprobs;
+use vllm_engine_core_client::protocol::logprobs::TokenLogprob as WireTokenLogprob;
+use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
+use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
+
+use crate::engine::EosPolicy;
+use crate::engine::FinishReason;
+use crate::engine::PromptEcho;
+use crate::engine::StopPolicy;
+use crate::engine::TokenLogprob;
+use crate::sampler::SamplingParams;
+
+pub(crate) const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
+
+/// A sampled position: the chosen token, then its top-k without repeating it.
+/// The chat renderer takes the first `k` entries as the alternatives, so a
+/// repeat would push out a real candidate.
+pub(crate) fn to_wire_position_logprobs(
+    token_id: u32,
+    logprob: Option<TokenLogprob>,
+) -> Option<PositionLogprobs> {
+    Some(position_logprobs(token_id, logprob?, false))
+}
+
+/// The scored token, then its top-k. A prompt position keeps a repeat of the
+/// scored token (`keep_repeat`): the encoder needs every row of one payload
+/// equally wide, and prompt positions render as per-token maps, where the
+/// repeat collapses.
+fn position_logprobs(token_id: u32, lp: TokenLogprob, keep_repeat: bool) -> PositionLogprobs {
+    let mut entries = Vec::with_capacity(1 + lp.top_logprobs.len());
+    entries.push(WireTokenLogprob {
+        token_id,
+        logprob: lp.logprob,
+        rank: lp.rank,
+    });
+    for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
+        if !keep_repeat && alt_id == token_id {
+            continue;
+        }
+        entries.push(WireTokenLogprob {
+            token_id: alt_id,
+            logprob: alt_logprob,
+            rank: (index + 1) as u32,
+        });
+    }
+    PositionLogprobs { entries }
+}
+
+/// The engine includes the unscored leading token; vLLM restores it itself.
+/// Never drop a missing scored position: every following offset would shift.
+pub(crate) fn to_wire_prompt_logprobs(prompt: PromptEcho) -> Result<Option<MaybeWireLogprobs>> {
+    ensure!(
+        !prompt.ids.is_empty(),
+        "prompt logprobs contain an empty prompt"
+    );
+    ensure!(
+        prompt.ids.len() == prompt.logprobs.len(),
+        "prompt logprobs length mismatch: {} tokens, {} scores",
+        prompt.ids.len(),
+        prompt.logprobs.len()
+    );
+    ensure!(
+        prompt.logprobs[0].is_none(),
+        "the first prompt token must have no logprob"
+    );
+    if prompt.ids.len() == 1 {
+        return Ok(None);
+    }
+    let positions = prompt
+        .ids
+        .into_iter()
+        .zip(prompt.logprobs)
+        .enumerate()
+        .skip(1)
+        .map(|(index, (id, logprob))| {
+            logprob
+                .map(|lp| position_logprobs(id, lp, true))
+                .with_context(|| format!("missing prompt logprob at position {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(MaybeWireLogprobs::Direct(Logprobs { positions })))
+}
+
+pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingParams {
+    // The vLLM frontend lowers a client `ignore_eos=true` to `_eos_token_id:
+    // None`, but `_all_stop_token_ids` always carries the model EOS set (it
+    // exists for min_tokens masking, not stop detection). This conversion feeds
+    // the legacy SamplingParams contract, which has no field for explicit
+    // request stop IDs; keep its historical lowering until each producer is
+    // migrated to StopPolicy. Qwen3 receives the independent policy below.
+    let ignore_eos = params.eos_token_id.is_none() && params.stop_token_ids.is_empty();
+    if params.temperature <= 0.0 {
+        return SamplingParams {
+            temperature: 0.0,
+            top_k: -1,
+            top_p: 1.0,
+            min_p: 0.0,
+            seed: None,
+            ignore_eos,
+        };
+    }
+
+    SamplingParams {
+        temperature: params.temperature,
+        top_k: if params.top_k == 0 {
+            -1
+        } else {
+            i32::try_from(params.top_k).unwrap_or(i32::MAX)
+        },
+        top_p: params.top_p,
+        min_p: params.min_p,
+        // Per-request seeds need the scheduler to feed request-local step
+        // counts into select_batch; until that lands, seeded requests are
+        // rejected in the bridge instead of silently ignored. See the
+        // sampling-parity tracking issue.
+        seed: None,
+        ignore_eos,
+    }
+}
+
+pub(crate) fn convert_stop_policy(params: &EngineCoreSamplingParams) -> StopPolicy {
+    StopPolicy::new(
+        // vLLM lowers secondary model EOS IDs into stop_token_ids. Keep its
+        // primary EOS separate so secondary stops retain their wire reason;
+        // all_stop_token_ids is only for min_tokens masking.
+        params
+            .eos_token_id
+            .map_or(EosPolicy::Ignore, EosPolicy::Token),
+        params.stop_token_ids.clone(),
+    )
+}
+
+/// Reject request parameters the frontend cannot represent faithfully.
+///
+/// The stepped contract carries explicit request stop IDs independently in
+/// [`StopPolicy`]; this helper only validates unrelated sampling/transfer
+/// fields that would otherwise be silently ignored.
+/// Returns the offending description; `None` means the request is servable.
+///
+/// The float comparisons are exact on purpose: they detect "the client sent
+/// anything other than the wire default", not numeric closeness — a request
+/// carrying 1.0000001 wants a penalty and must be rejected, not rounded away.
+#[allow(clippy::float_cmp)]
+pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> Option<String> {
+    // Engine-core clients may bypass HTTP validation; reject before converting to usize.
+    if params.logprobs.is_some_and(|count| count < 0)
+        || params.prompt_logprobs.is_some_and(|count| count < 0)
+    {
+        return Some("negative logprob counts are not supported".into());
+    }
+    if params.min_tokens != 0 {
+        return Some(format!(
+            "min_tokens={} is not supported by current engine contracts",
+            params.min_tokens
+        ));
+    }
+    if !(0.0..1.0).contains(&params.min_p) || !params.min_p.is_finite() {
+        return Some(format!("min_p {} outside [0, 1)", params.min_p));
+    }
+    if params.temperature > 0.0 && params.seed.is_some() {
+        return Some("per-request seed is not supported yet".to_string());
+    }
+    if params.frequency_penalty != 0.0 {
+        return Some(format!(
+            "frequency_penalty {} is not supported yet",
+            params.frequency_penalty
+        ));
+    }
+    if params.presence_penalty != 0.0 {
+        return Some(format!(
+            "presence_penalty {} is not supported yet",
+            params.presence_penalty
+        ));
+    }
+    if params.repetition_penalty != 1.0 {
+        return Some(format!(
+            "repetition_penalty {} is not supported yet",
+            params.repetition_penalty
+        ));
+    }
+    // The server lowers the client's ec_transfer_params into extra_args, and
+    // this engine has no encoder cache connector to hand it to.
+    if let Some(ec) = params
+        .extra_args
+        .as_ref()
+        .and_then(|args| args.get("ec_transfer_params"))
+    {
+        let requested = match ec {
+            serde_json::Value::Null => false,
+            serde_json::Value::Object(map) => !map.is_empty(),
+            _ => true,
+        };
+        if requested {
+            return Some(
+                "ec_transfer_params is not supported yet: this engine has no encoder cache \
+                 connector"
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+pub(crate) fn requested_logprobs(params: &EngineCoreSamplingParams) -> Option<usize> {
+    params.logprobs.map(|count| count as usize)
+}
+
+pub(crate) fn requested_prompt_logprobs(params: &EngineCoreSamplingParams) -> Option<usize> {
+    params.prompt_logprobs.map(|count| count as usize)
+}
+
+pub(crate) fn lora_adapter_from_sampling_params(
+    params: &EngineCoreSamplingParams,
+) -> Result<Option<String>> {
+    let Some(extra_args) = params.extra_args.as_ref() else {
+        return Ok(None);
+    };
+    let Some(value) = extra_args.get(LORA_ADAPTER_XARG) else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        Some(name) if !name.is_empty() => Ok(Some(name.to_string())),
+        Some(_) => bail!("{LORA_ADAPTER_XARG} must not be empty"),
+        None => bail!("{LORA_ADAPTER_XARG} must be a string"),
+    }
+}
+
+pub(crate) fn convert_finish_reason(reason: FinishReason) -> EngineCoreFinishReason {
+    match reason {
+        FinishReason::Length => EngineCoreFinishReason::Length,
+        FinishReason::Stop => EngineCoreFinishReason::Stop,
+        FinishReason::Error => EngineCoreFinishReason::Error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::collections::HashMap;
+
+    use vllm_engine_core_client::protocol::logprobs::Logprobs;
+    use vllm_engine_core_client::protocol::logprobs::MaybeWireLogprobs;
+
+    use super::*;
+
+    fn to_wire_logprobs(token_id: u32, logprob: Option<TokenLogprob>) -> Option<MaybeWireLogprobs> {
+        let position = to_wire_position_logprobs(token_id, logprob)?;
+        Some(MaybeWireLogprobs::Direct(Logprobs {
+            positions: vec![position],
+        }))
+    }
+
+    #[test]
+    fn convert_sampling_honors_ignore_eos_lowering() {
+        // ignore_eos=true lowering: _eos_token_id=None while
+        // _all_stop_token_ids still carries the model EOS set.
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.all_stop_token_ids = BTreeSet::from([163_586]);
+        assert!(convert_sampling(&params).ignore_eos);
+
+        // Normal request: _eos_token_id present.
+        params.eos_token_id = Some(163_586);
+        assert!(!convert_sampling(&params).ignore_eos);
+
+        // The legacy SamplingParams contract keeps EOS active when explicit
+        // stop IDs are present; the stepped Qwen3 path carries those IDs in
+        // StopPolicy instead.
+        params.eos_token_id = None;
+        params.stop_token_ids = vec![42];
+        assert!(!convert_sampling(&params).ignore_eos);
+    }
+
+    #[test]
+    fn convert_stop_policy_keeps_primary_and_secondary_eos_distinct() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.eos_token_id = Some(99);
+        params.stop_token_ids = vec![100];
+
+        let policy = convert_stop_policy(&params);
+        // The primary protocol EOS is carried as `EosPolicy::Token`, so it is
+        // still an EOS stop even when the model predicate is unavailable.
+        assert_eq!(
+            policy.classify(99, |_| false),
+            Some(crate::engine::StopCause::Eos(99))
+        );
+        // Secondary model EOS IDs must keep their token stop reason.
+        assert_eq!(
+            policy.classify(100, |_| true),
+            Some(crate::engine::StopCause::Token(100))
+        );
+
+        params.eos_token_id = None;
+        params.stop_token_ids = vec![99];
+        params.all_stop_token_ids = BTreeSet::from([99, 100]);
+        let policy = convert_stop_policy(&params);
+        // EOS disabled: the primary ID stops only when explicitly requested.
+        assert_eq!(
+            policy.classify(99, |_| true),
+            Some(crate::engine::StopCause::Token(99))
+        );
+        assert_eq!(policy.classify(100, |_| true), None);
+    }
+
+    #[test]
+    fn convert_sampling_passes_min_p_and_never_seed() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.eos_token_id = Some(1);
+        params.temperature = 0.8;
+        params.min_p = 0.15;
+        params.seed = Some(42);
+        let converted = convert_sampling(&params);
+        assert!((converted.min_p - 0.15).abs() < f32::EPSILON);
+        // Seeds are rejected upstream until scheduler step wiring lands;
+        // convert must never smuggle one through.
+        assert_eq!(converted.seed, None);
+
+        // Greedy lowering zeroes min_p along with the rest.
+        params.temperature = 0.0;
+        assert_eq!(convert_sampling(&params).min_p.to_bits(), 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn unsupported_sampling_params_are_refused() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.repetition_penalty = 1.0;
+        assert_eq!(unsupported_request_params(&params), None);
+
+        params.min_tokens = 1;
+        assert_eq!(
+            unsupported_request_params(&params).as_deref(),
+            Some("min_tokens=1 is not supported by current engine contracts")
+        );
+        params.min_tokens = 0;
+
+        params.min_p = 0.2;
+        assert_eq!(unsupported_request_params(&params), None);
+        params.min_p = 1.5;
+        assert!(unsupported_request_params(&params).is_some());
+        params.min_p = 0.0;
+
+        params.temperature = 0.8;
+        params.seed = Some(7);
+        assert!(unsupported_request_params(&params).is_some());
+        // A greedy request's seed is a no-op, not a lie — allowed.
+        params.temperature = 0.0;
+        assert_eq!(unsupported_request_params(&params), None);
+        params.seed = None;
+
+        params.frequency_penalty = 0.5;
+        assert!(unsupported_request_params(&params).is_some());
+        params.frequency_penalty = 0.0;
+        params.presence_penalty = -0.5;
+        assert!(unsupported_request_params(&params).is_some());
+        params.presence_penalty = 0.0;
+        params.repetition_penalty = 1.2;
+        assert!(unsupported_request_params(&params).is_some());
+    }
+
+    #[test]
+    fn nonempty_ec_transfer_params_is_refused_not_dropped() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.extra_args = Some(HashMap::from([(
+            "ec_transfer_params".to_string(),
+            serde_json::json!({"requested": true}),
+        )]));
+        let refusal = unsupported_request_params(&params).expect("must refuse");
+        assert!(refusal.contains("ec_transfer_params"));
+
+        params.extra_args = Some(HashMap::from([(
+            "ec_transfer_params".to_string(),
+            serde_json::json!({}),
+        )]));
+        assert_eq!(unsupported_request_params(&params), None);
+        params.extra_args = Some(HashMap::from([(
+            "ec_transfer_params".to_string(),
+            serde_json::Value::Null,
+        )]));
+        assert_eq!(unsupported_request_params(&params), None);
+    }
+
+    #[test]
+    fn lora_adapter_from_sampling_params_reads_proxy_xarg() {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.extra_args = Some(HashMap::from([(
+            LORA_ADAPTER_XARG.to_string(),
+            serde_json::Value::String("adapter-a".to_string()),
+        )]));
+
+        assert_eq!(
+            lora_adapter_from_sampling_params(&params)
+                .expect("extract adapter")
+                .as_deref(),
+            Some("adapter-a")
+        );
+    }
+
+    fn assert_logprob_eq(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= f32::EPSILON,
+            "logprob mismatch: actual={actual}, expected={expected}"
+        );
+    }
+
+    #[test]
+    fn to_wire_logprobs_emits_sampled_then_alternatives() {
+        let lp = TokenLogprob {
+            rank: 1,
+            logprob: -0.5,
+            top_logprobs: vec![(7, -0.5), (42, -1.5)],
+        };
+        let wire = to_wire_logprobs(7, Some(lp)).expect("logprob payload");
+        let direct = match wire {
+            MaybeWireLogprobs::Direct(d) => d,
+            MaybeWireLogprobs::Wire(_) => panic!("expected Direct logprobs"),
+        };
+        assert_eq!(direct.positions.len(), 1);
+        let entries = &direct.positions[0].entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].token_id, 7);
+        assert_logprob_eq(entries[0].logprob, -0.5);
+        assert_eq!(entries[0].rank, 1);
+        assert_eq!(entries[1].token_id, 42);
+        assert_logprob_eq(entries[1].logprob, -1.5);
+        assert_eq!(entries[1].rank, 2);
+    }
+
+    #[test]
+    fn to_wire_logprobs_keeps_distinct_top_k_alternatives() {
+        let lp = TokenLogprob {
+            rank: 1,
+            logprob: -0.5,
+            top_logprobs: vec![(8, -1.0), (9, -1.5)],
+        };
+        let wire = to_wire_logprobs(7, Some(lp)).expect("logprob payload");
+        let direct = match wire {
+            MaybeWireLogprobs::Direct(d) => d,
+            MaybeWireLogprobs::Wire(_) => panic!("expected Direct logprobs"),
+        };
+        assert_eq!(direct.positions.len(), 1);
+        let entries = &direct.positions[0].entries;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].token_id, 7);
+        assert_logprob_eq(entries[0].logprob, -0.5);
+        assert_eq!(entries[0].rank, 1);
+        assert_eq!(entries[1].token_id, 8);
+        assert_logprob_eq(entries[1].logprob, -1.0);
+        assert_eq!(entries[1].rank, 1);
+        assert_eq!(entries[2].token_id, 9);
+        assert_logprob_eq(entries[2].logprob, -1.5);
+        assert_eq!(entries[2].rank, 2);
+    }
+
+    fn score() -> TokenLogprob {
+        TokenLogprob {
+            rank: 1,
+            logprob: -0.5,
+            top_logprobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prompt_payload_keeps_scored_positions_and_zero_top_k() {
+        let prompt = PromptEcho {
+            ids: vec![9, 8, 7],
+            logprobs: vec![None, Some(score()), Some(score())],
+        };
+        let Some(MaybeWireLogprobs::Direct(payload)) = to_wire_prompt_logprobs(prompt).unwrap()
+        else {
+            panic!("expected direct prompt logprobs");
+        };
+        let scored: Vec<_> = payload
+            .positions
+            .iter()
+            .map(|p| {
+                assert_eq!(p.entries.len(), 1);
+                p.entries[0].token_id
+            })
+            .collect();
+        assert_eq!(scored, vec![8, 7]);
+    }
+
+    #[test]
+    fn prompt_rows_keep_one_width_whether_or_not_the_token_is_in_the_top_k() {
+        let scored = |top: Vec<(u32, f32)>| TokenLogprob {
+            rank: 1,
+            logprob: -0.5,
+            top_logprobs: top,
+        };
+        let prompt = PromptEcho {
+            ids: vec![9, 8, 7],
+            logprobs: vec![
+                None,
+                Some(scored(vec![(8, -0.5), (3, -2.0)])),
+                Some(scored(vec![(4, -0.1), (5, -2.0)])),
+            ],
+        };
+        let Some(MaybeWireLogprobs::Direct(payload)) = to_wire_prompt_logprobs(prompt).unwrap()
+        else {
+            panic!("expected direct prompt logprobs");
+        };
+        let widths: Vec<_> = payload.positions.iter().map(|p| p.entries.len()).collect();
+        assert_eq!(widths, vec![3, 3]);
+    }
+
+    #[test]
+    fn malformed_prompt_scores_are_errors_instead_of_shorter_payloads() {
+        for prompt in [
+            PromptEcho {
+                ids: vec![],
+                logprobs: vec![],
+            },
+            PromptEcho {
+                ids: vec![9, 8],
+                logprobs: vec![None],
+            },
+            PromptEcho {
+                ids: vec![9, 8],
+                logprobs: vec![None, Some(score()), Some(score())],
+            },
+            PromptEcho {
+                ids: vec![9, 8, 7],
+                logprobs: vec![None, None, Some(score())],
+            },
+            PromptEcho {
+                ids: vec![9, 8],
+                logprobs: vec![Some(score()), Some(score())],
+            },
+        ] {
+            assert!(to_wire_prompt_logprobs(prompt).is_err());
+        }
+    }
+}

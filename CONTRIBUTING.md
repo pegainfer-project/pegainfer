@@ -1,4 +1,4 @@
-# Contributing to openinfer
+# Contributing to PegaInfer
 
 First off, thank you for considering contributing to our project! It's people like you that make this community great.
 

@@ -1,8 +1,8 @@
-# Frontend CPU Profiling Baseline (openinfer-sim)
+# Frontend CPU Profiling Baseline (pegainfer-sim)
 
 **Created**: 2026-06-05
 **Last touched**: 2026-06
-**TL;DR**: CPU-side profiling of the vLLM/OpenAI frontend path using `openinfer-sim` with fixed TTFT=5ms / TPOT=12ms. At 200 req / concurrency=16 / prompt=128 words / output=64 tokens the frontend adds ~150ms TTFT overhead above the 5ms simulated floor and shows no throughput bottleneck (QPS=18.2, 0 failures). Top hotspots: heap allocation (malloc/realloc ~10%), stream polling (~7.5%), clock_gettime (~2%), JSON serialization (~1%). No single frontend bottleneck dominates — the overhead is distributed across tokio runtime, IPC bridge, and HTTP framing.
+**TL;DR**: CPU-side profiling of the vLLM/OpenAI frontend path using `pegainfer-sim` with fixed TTFT=5ms / TPOT=12ms. At 200 req / concurrency=16 / prompt=128 words / output=64 tokens the frontend adds ~150ms TTFT overhead above the 5ms simulated floor and shows no throughput bottleneck (QPS=18.2, 0 failures). Top hotspots: heap allocation (malloc/realloc ~10%), stream polling (~7.5%), clock_gettime (~2%), JSON serialization (~1%). No single frontend bottleneck dominates — the overhead is distributed across tokio runtime, IPC bridge, and HTTP framing.
 
 ## Reproducible Benchmark
 
@@ -10,15 +10,15 @@
 
 ```bash
 # Build sim binary (requires protoc)
-cargo build --release -p openinfer-sim
+cargo build --release -p pegainfer-sim
 ```
 
 ### Create a tiny local model dir (avoids HF download)
 
 ```bash
-mkdir -p /tmp/openinfer-sim-model
+mkdir -p /tmp/pegainfer-sim-model
 
-cat > /tmp/openinfer-sim-model/tokenizer.json << 'EOF'
+cat > /tmp/pegainfer-sim-model/tokenizer.json << 'EOF'
 {
   "version": "1.0",
   "truncation": null,
@@ -34,20 +34,20 @@ cat > /tmp/openinfer-sim-model/tokenizer.json << 'EOF'
 }
 EOF
 
-cat > /tmp/openinfer-sim-model/tokenizer_config.json << 'EOF'
+cat > /tmp/pegainfer-sim-model/tokenizer_config.json << 'EOF'
 { "unk_token": "<unk>", "tokenizer_class": "PreTrainedTokenizerFast" }
 EOF
 
-cat > /tmp/openinfer-sim-model/config.json << 'EOF'
-{ "model_type": "openinfer_sim", "max_position_embeddings": 8192 }
+cat > /tmp/pegainfer-sim-model/config.json << 'EOF'
+{ "model_type": "pegainfer_sim", "max_position_embeddings": 8192 }
 EOF
 ```
 
 ### Start server
 
 ```bash
-cargo run --release -p openinfer-sim -- \
-  --model-id /tmp/openinfer-sim-model \
+cargo run --release -p pegainfer-sim -- \
+  --model-id /tmp/pegainfer-sim-model \
   --port 8732 \
   --base-ttft-ms 5 \
   --tpot-ms 12 \
@@ -60,7 +60,7 @@ cargo run --release -p openinfer-sim -- \
 ```bash
 python3 scripts/bench_http_serving.py \
   --base-url http://127.0.0.1:8732 \
-  --model /tmp/openinfer-sim-model \
+  --model /tmp/pegainfer-sim-model \
   --num-requests 200 \
   --concurrency 16 \
   --prompt-words 128 \
@@ -75,12 +75,12 @@ In a separate terminal after starting the server and confirming it responds:
 
 ```bash
 # Summary stats (IPC, cache misses, branch mispredictions)
-SIM_PID=$(pgrep -f "target/release/openinfer-sim")
+SIM_PID=$(pgrep -f "target/release/pegainfer-sim")
 perf stat -p $SIM_PID \
   -e cycles,instructions,cache-references,cache-misses,branch-misses,task-clock,context-switches,cpu-migrations \
   -- timeout 15 python3 scripts/bench_http_serving.py \
     --base-url http://127.0.0.1:8732 \
-    --model /tmp/openinfer-sim-model \
+    --model /tmp/pegainfer-sim-model \
     --num-requests 200 \
     --concurrency 16 \
     --prompt-words 128 \
@@ -91,7 +91,7 @@ perf stat -p $SIM_PID \
 perf record -g -p $SIM_PID -o /tmp/sim-perf.data -- \
   timeout 10 python3 scripts/bench_http_serving.py \
     --base-url http://127.0.0.1:8732 \
-    --model /tmp/openinfer-sim-model \
+    --model /tmp/pegainfer-sim-model \
     --num-requests 100 \
     --concurrency 16 \
     --prompt-words 128 \
@@ -176,7 +176,7 @@ Each direction below is tied to the specific measured frontend overhead from the
 
 ### 1. Reduce IPC bridge hops for single-engine deployments
 
-**Measured basis**: The data path crosses 5 mpsc channels + 1 ZMQ Unix socket between `run_simulated_request` and `completion_sse_stream` (confirmed by source trace in `openinfer-vllm-frontend/src/lib.rs` lines 303–847). The `output_loop` serializes all requests through a single `PushSocket`.
+**Measured basis**: The data path crosses 5 mpsc channels + 1 ZMQ Unix socket between `run_simulated_request` and `completion_sse_stream` (confirmed by source trace in `pegainfer-vllm-frontend/src/lib.rs` lines 303–847). The `output_loop` serializes all requests through a single `PushSocket`.
 
 **Direction**: For single-engine (non-distributed) deployments, bypass ZMQ and connect `LocalEngineBridge` directly through an in-process mpsc channel. This would remove the `encode_msgpack` → ZMQ send → ZMQ recv → `decode_msgpack` round-trip and its associated allocation (`rmp_serde::Decoder::any_inner` at 0.5%).
 

@@ -1,0 +1,22 @@
+unit = "fp8_gemm.shared_gate_up"
+# GEMM leg of the shared-expert SwiGLU gate|up projection ([2*2048, 6144] packed).
+phase = 1
+symbol = "glm52_fp8_groupwise_gemm_sm100_cuda"
+adapter = "fp8_gemm_groupwise"
+capability = { blackwell_only = true }
+scratch = "32 MiB CUTLASS grouped-scheduler/tensormap workspace carved inside the FFI (fp8.rs FP8_GEMM_WORKSPACE_BYTES); allocated as bench warmup material, never timed"
+[axes]
+rows = [4, 8, 16, 32, 48, 64, 96]
+[shape]
+n = 4096   # 2 * 2048 (gate|up packed)
+k = 6144
+[contract]
+inputs = "act e4m3 [rows, 6144] + act_scales f32 [rows, 48] (refs/quant.fp8_per_token_group_quant_ref, ue8m0 off); weight e4m3 [4096, 6144] + weight_scales f32 [32, 48]; workspace 32 MiB (= fp8.rs FP8_GEMM_WORKSPACE_BYTES)"
+outputs = "out[rows, 4096] bf16 = [gate|up] packed"
+accumulation = "f32 (CUTLASS tcgen05 block-scaled MMA; fixed hardware writeback order)"
+notes = "The gate|up half of the shared-expert SwiGLU narrow route (the GEMV route runs fused reduce+SiLU over GEMV partials; the wide route is this GEMM + a separate silu). FFI requires m%4==0 and k%128==0; targets outside the sm_100a family compile to a NOT_SUPPORTED stub."
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "Same reference recipe as fp8_gemm.q_b; MEASURED rel_l2 <= 9.1e-5 across the full rows axis (GB300 sm_103 tray03, 2026-08-01)"

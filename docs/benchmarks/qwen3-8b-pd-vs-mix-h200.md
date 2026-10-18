@@ -2,7 +2,7 @@
 
 > **TL;DR**: 同一多轮负载下三种部署 A/B（2026-07-03）：2 卡 P/D（1P+1D）与 2 卡 mixed（会话亲和 LB）总吞吐持平（47.8k vs 47.0k tok/s），P/D 的收益在 **decode 稳定性**——TPOT p99 10.08ms vs 12.77ms（-21%），且 turn2+ TTFT 不随轮数增长（~107ms 恒定 vs mixed 71→132ms 爬升）；代价是冷 turn1 TTFT 多 ~200ms（P→D 串行，M3 layer-wise push 的目标）。压测命令与坑（`max_completion_tokens`）见下。
 
-环境：单机 2×NVIDIA H200，每 GPU 配一块 400G IB NIC（P2P KV 走 RDMA READ），Qwen3-8B bf16，`--kv-offload --kv-offload-host-gib 32` + pegaflow P2P mesh。openinfer 分支 `feat/pd-pegaflow-p2p`，pegaflow 含 router `max_completion_tokens` 修复（`283c451`）。
+环境：单机 2×NVIDIA H200，每 GPU 配一块 400G IB NIC（P2P KV 走 RDMA READ），Qwen3-8B bf16，`--kv-offload --kv-offload-host-gib 32` + pegaflow P2P mesh。pegainfer 分支 `feat/pd-pegaflow-p2p`，pegaflow 含 router `max_completion_tokens` 修复（`283c451`）。
 
 ## 1. 负载与压测方法
 

@@ -40,7 +40,7 @@ Floating-point probes are asserted with tolerance (fp8 vs bf16 accumulation
 order makes bit-equality impossible); sha256 digests are provenance only —
 never assert a float digest across implementations.
 
-Usage (paste the emitted block into openinfer-glm52/tests/mla_decode_oracle.rs):
+Usage (paste the emitted block into pegainfer-glm52/tests/mla_decode_oracle.rs):
 
     uv run tools/accuracy/glm52_oracle.py \
         --model-path /data/models/GLM-5.2-FP8 --emit rust
@@ -144,6 +144,37 @@ def dequant_fp8_block(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Te
     return weight.to(torch.float32) * scale_full[:n, :k]
 
 
+def dequant_fp8_block_ue8m0(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    """Emulate the loader-time SM100 DeepGEMM weight conversion.
+
+    Each block scale is rounded up to a power of two, while each e4m3 weight
+    byte is requantized by old_scale/new_scale. Dequantizing the converted
+    byte with the new UE8M0 scale models the operands consumed by the MMA.
+    """
+    n, k = weight.shape
+    sn, sk = scale_inv.shape
+    assert sn == -(-n // FP8_GROUP) and sk == -(-k // FP8_GROUP), (
+        f"scale shape {scale_inv.shape} does not match weight {weight.shape}"
+    )
+    scale = scale_inv.to(torch.float32)
+    mantissa, exponent = torch.frexp(scale)
+    scale_ue8m0 = torch.where(
+        mantissa == 0.5,
+        scale,
+        torch.exp2(exponent.to(torch.float32)),
+    )
+    scale_full = scale.repeat_interleave(FP8_GROUP, 0).repeat_interleave(FP8_GROUP, 1)
+    scale_ue8m0_full = (
+        scale_ue8m0.repeat_interleave(FP8_GROUP, 0).repeat_interleave(FP8_GROUP, 1)
+    )
+    scale_full = scale_full[:n, :k]
+    scale_ue8m0_full = scale_ue8m0_full[:n, :k]
+    converted = (
+        weight.to(torch.float32) * (scale_full / scale_ue8m0_full)
+    ).to(torch.float8_e4m3fn)
+    return converted.to(torch.float32) * scale_ue8m0_full
+
+
 def quant_dequant_groups(x: torch.Tensor) -> torch.Tensor:
     """Per-128-group fp8 e4m3 quant->dequant along the last dim (engine's
     activation-quant contract: scale = group amax / 448, f32 scale)."""
@@ -216,7 +247,12 @@ class Bf16Linear(torch.nn.Module):
         return torch.nn.functional.linear(x, self.w)
 
 
-LINEAR_CLS = {"fp8sim": Fp8SimLinear, "gemv": GemvSimLinear, "bf16": Bf16Linear}
+LINEAR_CLS = {
+    "fp8sim": Fp8SimLinear,
+    "deepgemm": GemvSimLinear,
+    "gemv": GemvSimLinear,
+    "bf16": Bf16Linear,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -313,30 +349,21 @@ def build_attention(ckpt: Checkpoint, config, layer: int, precision: str, fault:
 
 
 class Fp8SimExperts(torch.nn.Module):
-    """Routed-experts forward with the engine's precision regime. In `fp8sim`
-    (the EP8 DeepGEMM chain) the token activation is quant-dequanted per
-    128-group before the gate|up GEMM, and the SwiGLU product before the down
-    GEMM (the engine's W2-input re-quant; the route weight commutes with the
-    per-group dynamic scale, so applying it after down as the official code
-    does is equivalent up to f32 scale rounding). In `gemv` (the EP4
-    weight-only chain) activations are never quantized: bf16 rows feed the
-    GEMM directly, the gate|up GEMM output is rounded to bf16 (the engine's
-    W13 store — nothing absorbs that rounding here, unlike fp8sim where the
-    e4m3 prod quant dominates it), and the SwiGLU product is rounded to bf16
-    (the engine's bf16 store between W13 and W2); the engine applies the
-    route weight to the f32 W2 output before its bf16 store, matching the
-    post-down application below.
+    """Routed-experts forward with the selected engine precision regime.
+
+    `deepgemm` models the SM100 path: loader-time weight conversion to UE8M0
+    block scales, UE8M0 activation quantization before W13 and W2, and bf16
+    W13/W2 stores. `fp8sim` preserves the former f32-scale FP8 GEMM model;
+    `gemv` preserves the former weight-only model.
 
     The loop itself mirrors `GlmMoeDsaExperts.forward` (transport, no new math).
     Expert weights are block-dequanted lazily per hit expert and cached WITHOUT
     eviction — a long run that touches all 256 experts holds ~39 GB of f32
     weights (fine on the H200 build node; do not run this on a small box).
 
-    One deliberate asymmetry vs the engine: the SwiGLU product is rounded to
-    bf16 before the W2-input quant-dequant (the engine's kernel quantizes its
-    f32 silu product directly from the bf16 GEMM output). Under e4m3's 3-bit
-    mantissa the pre-round is almost always absorbed; it is below the gate
-    tolerance by construction.
+    The historical `fp8sim` path rounds its SwiGLU product to bf16 before the
+    W2-input quant-dequant. The current `deepgemm` path models the fused
+    kernel's bf16 SiLU narrowing and f32 product directly.
     """
 
     def __init__(self, ckpt: Checkpoint, layer: int, num_experts: int, precision: str):
@@ -350,10 +377,11 @@ class Fp8SimExperts(torch.nn.Module):
     def _expert(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         if idx not in self._cache:
             def dq(stem: str) -> torch.Tensor:
-                return dequant_fp8_block(
-                    self.ckpt.tensor(f"{self.prefix}.{idx}.{stem}.weight"),
-                    self.ckpt.tensor(f"{self.prefix}.{idx}.{stem}.weight_scale_inv"),
-                )
+                weight = self.ckpt.tensor(f"{self.prefix}.{idx}.{stem}.weight")
+                scale = self.ckpt.tensor(f"{self.prefix}.{idx}.{stem}.weight_scale_inv")
+                if self.precision == "deepgemm":
+                    return dequant_fp8_block_ue8m0(weight, scale)
+                return dequant_fp8_block(weight, scale)
 
             gate_up = torch.cat([dq("gate_proj"), dq("up_proj")], dim=0)  # [2I, H]
             self._cache[idx] = (gate_up, dq("down_proj"))
@@ -363,6 +391,8 @@ class Fp8SimExperts(torch.nn.Module):
         final = torch.zeros_like(hidden_states)
         if self.precision == "fp8sim":
             hidden_states = quant_dequant_groups(hidden_states)
+        elif self.precision == "deepgemm":
+            hidden_states = quant_dequant_groups_ue8m0(hidden_states)
         act = hidden_states.to(torch.float32)
         expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
         expert_mask = expert_mask.permute(2, 1, 0)
@@ -370,14 +400,18 @@ class Fp8SimExperts(torch.nn.Module):
             gate_up, down = self._expert(expert_idx)
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             gate, up = torch.nn.functional.linear(act[token_idx], gate_up).chunk(2, dim=-1)
-            if self.precision == "gemv":
-                # The weight-only engine stores the W13 output as bf16 before
-                # the SiLU kernel reads it.
+            if self.precision in ("deepgemm", "gemv"):
                 gate = gate.to(torch.bfloat16).to(torch.float32)
                 up = up.to(torch.bfloat16).to(torch.float32)
-            prod = torch.nn.functional.silu(gate) * up
+            if self.precision == "deepgemm":
+                silu = torch.nn.functional.silu(gate).to(torch.bfloat16).to(torch.float32)
+                prod = silu * up
+            else:
+                prod = torch.nn.functional.silu(gate) * up
             if self.precision == "fp8sim":
                 prod = quant_dequant_groups(prod.to(torch.bfloat16)).to(torch.float32)
+            elif self.precision == "deepgemm":
+                prod = quant_dequant_groups_ue8m0(prod).to(torch.float32)
             elif self.precision == "gemv":
                 # The weight-only engine stores the SwiGLU product as bf16
                 # between W13 and W2 — no quant.
@@ -465,7 +499,7 @@ def run(attn, config, hidden: torch.Tensor, precision: str, fault: str) -> dict[
         # group with UE8M0 (power-of-two) scales; everything downstream (kv_b
         # decompress -> K/V) must see the quantized value, exactly like
         # FlashMLA reading the cache.
-        if precision in ("fp8sim", "gemv"):
+        if precision in ("fp8sim", "deepgemm", "gemv"):
             out = quant_dequant_groups_ue8m0(out)
         taps["kv_c_cached"] = out.detach().squeeze(0)
         return out
@@ -512,7 +546,7 @@ def run_layer(dl, config, hidden: torch.Tensor, precision: str, fault: str) -> d
     # skipped this; the effect sat just under the layer tolerance but is a
     # systematic engine-vs-oracle bias — model it.)
     def kv_c_cache_hook(_mod, _args, out):
-        if precision in ("fp8sim", "gemv"):
+        if precision in ("fp8sim", "deepgemm", "gemv"):
             out = quant_dequant_groups_ue8m0(out)
         return out
 
@@ -761,9 +795,11 @@ def main() -> int:
     p.add_argument("--layer", type=int, default=0)
     p.add_argument(
         "--precision",
-        choices=["fp8sim", "gemv", "bf16"],
+        choices=["fp8sim", "deepgemm", "gemv", "bf16"],
         default="fp8sim",
         help="fp8sim: engine's TRTLLM fp8-GEMM era (activation quant everywhere). "
+        "deepgemm: current SM100 path — GEMV outside routed experts, UE8M0 "
+        "DeepGEMM inside them. "
         "gemv: engine's weight-only-GEMV era — bf16 activations in every m=1 "
         "projection, fp8 kv-cache + fp8 routed-expert chain kept. "
         "bf16: untouched official path (cross-check).",

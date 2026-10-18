@@ -241,11 +241,6 @@ impl BlockSequence {
         self.sequence.total_tokens()
     }
 
-    /// Returns a reference to the underlying `TokenBlockSequence`.
-    pub fn sequence(&self) -> &TokenBlockSequence {
-        &self.sequence
-    }
-
     /// Returns all sequence hashes from completed blocks.
     pub fn all_sequence_hashes(&self) -> Vec<SequenceHash> {
         self.sequence

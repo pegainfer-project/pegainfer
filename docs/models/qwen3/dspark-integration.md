@@ -1,25 +1,33 @@
 # DSpark Integration (Qwen3-4B)
 
-**TL;DR:** DeepSeek's **DSpark** (paper + DeepSpec repo, Jun 2026) is **our DFlash drafter plus two bolt-ons**: (1) a *semi-autoregressive* **Markov head** — a rank-256 logit bias added in a short sequential loop over the block so each draft token conditions on the previously sampled one; this is the whole draft-quality win (+16–18% accepted length over DFlash in their offline table, paper Table 1), and (2) a **confidence head** (tiny linear → per-position survival probability) feeding a **hardware-aware prefix scheduler** that trims verify length under load — the production throughput/Pareto win. The released checkpoint `dspark_qwen3_4b_block7` has an **identical backbone to our `Qwen3-4B-DFlash-b16`** (same hidden 2560 / 5 layers / `target_layer_ids=[1,9,17,25,33]` / KV-injection) — it differs only by `block_size=7`, +4 tensors (`markov_w1 [V,256]`, `markov_w2 [V,256]`, `confidence_head.proj.weight [1,2816]`, `.bias [1]`), and an "anchor-is-the-first-prediction" block-layout tweak. **Our verify/accept/KV-transaction stack is reused unchanged** — DSpark only changes the *propose* step. On the 5090 greedy sweep, DSpark beats the matched block7 DFlash baseline by **+3.6% geomean output tok/s** overall, with the expected wins on text/code (+3.1% to +15.8%; random is the synthetic exception) and a better accepted-draft distribution (**2.52 vs 2.30** accepted draft tokens/round, full-7 accept **17.4% vs 13.9%**). Decisions settled: **block_size = 7**, **reuse the target head** (DSpark's `embed_tokens`/`lm_head` are byte-identical to target Qwen3-4B's — skip loading them). **Phase 1 delta over DFlash is small: config + 2 tensor loads + one sequential Markov loop in `execute_dflash_draft`; no new verify/KV/graph.**
+**TL;DR:** DeepSeek's **DSpark** (paper + DeepSpec repo, Jun 2026) is **our DFlash drafter plus two bolt-ons**: (1) a *semi-autoregressive* **Markov head** — a rank-256 logit bias added in a short sequential loop over the block so each draft token conditions on the previously sampled one; this is the whole draft-quality win (+16–18% accepted length over DFlash in their offline table, paper Table 1), and (2) a **confidence head** (tiny linear → per-position survival probability) feeding a **hardware-aware prefix scheduler** that trims verify length under load — the production throughput/Pareto win. The released checkpoint `dspark_qwen3_4b_block7` has an **identical backbone to our `Qwen3-4B-DFlash-b16`** (same hidden 2560 / 5 layers / `target_layer_ids=[1,9,17,25,33]` / KV-injection) — it differs only by `block_size=7`, +4 tensors (`markov_w1 [V,256]`, `markov_w2 [V,256]`, `confidence_head.proj.weight [1,2816]`, `.bias [1]`), and an "anchor-is-the-first-prediction" block-layout tweak. **Our verify/accept/KV-transaction stack is reused unchanged** — DSpark only changes the *propose* step (the later env-gated hedge, `PEGAINFER_SPEC_HEDGE*`, additionally expands verify with extra chain spans over scratch KV pages; off by default). On the 5090 greedy sweep, DSpark beats the matched block7 DFlash baseline by **+3.6% geomean output tok/s** overall, with the expected wins on text/code (+3.1% to +15.8%; random is the synthetic exception) and a better accepted-draft distribution (**2.52 vs 2.30** accepted draft tokens/round, full-7 accept **17.4% vs 13.9%**). Decisions settled: **block_size = 7**, **reuse the target head** (DSpark's `embed_tokens`/`lm_head` are byte-identical to target Qwen3-4B's — skip loading them). **Phase 1 delta over DFlash is small: config + 2 tensor loads + one sequential Markov loop in `execute_dflash_draft`; no new verify/KV/graph** *(true of Phase 1 as landed — the later opt-in hedge adds expanded verify spans, scratch KV pages, and per-shape Markov graphs, all behind `PEGAINFER_SPEC_HEDGE*`)*.
 
-Last touched: 2026-06
+Last touched: 2026-08
 
 ## Implementation status — Phase 1 built & lossless
 
 **Phase 1 (Markov head) is implemented and passes the losslessness gate.** Greedy DSpark output is byte-for-byte identical to plain greedy on the 5070 Ti dev box:
 
 ```
-OPENINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \
-OPENINFER_DFLASH_TEST_MODEL_PATH=/data/models/dspark_qwen3_4b_block7 \
-cargo test --release -p openinfer-qwen3 --test dflash_speculative_gate
-# → 4 passed; all prompts 100% lossless. (The "kernel-gap flip … Not a spec bug"
-#   diagnostics are the pre-existing DFlash prefill/decode numeric gap, unrelated.)
+PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \
+PEGAINFER_DFLASH_TEST_MODEL_PATH=/data/models/dspark_qwen3_4b_block7 \
+PEGAINFER_REQUIRE_HEDGE_GATE=1 \
+cargo test --release -p pegainfer-qwen3 --test dflash_speculative_gate
+# → 5 passed. The fifth, hedged_ladder_passes_the_lossless_gates, re-runs the
+#   lossless suites with PEGAINFER_SPEC_HEDGE on and asserts that hedged rounds
+#   and chain spans actually executed, with at least one chain win and one
+#   loss. It needs a DSpark checkpoint; the REQUIRE flag above turns a missing
+#   one into a failure instead of a green skip, so always set it when the run
+#   is meant to be evidence. See the test's own doc for what it does and does
+#   not prove.
+#   The "kernel-gap flip … Not a spec bug" diagnostics are the pre-existing
+#   DFlash prefill/decode numeric gap, unrelated.
 ```
 
-What was actually built (the new DSpark code lives in its own module `openinfer-qwen3/src/dspark.rs`):
+What was actually built (the new DSpark code lives in its own module `pegainfer-qwen3/src/dspark.rs`):
 
 - **`dspark.rs`** — `MarkovHead { w1, w2 }` + `MarkovScratch` + `sample_block()` (the sequential semi-autoregressive loop, batched across requests) + `reservation_bytes()`. This is the home of all DSpark-specific logic; `dflash.rs` only holds an `Option<MarkovHead>` and an `Option<MarkovScratch>` and exposes `uses_markov_head()` / `markov_draft_tokens()` / `verify_span()`.
-- **Custom CUDA kernel** `markov_step_argmax` (`openinfer-kernels/csrc/shared/argmax.cu` + FFI + `ops::markov_step_argmax_into`). **We chose to add one kernel** — the earlier "no new kernel needed" prediction below was revised: the base block logits are request-major `[N·block, V]`, so step `k` needs a *strided* argmax over row `i·block+k` plus a *per-request* bias row `i`. Composing that from existing ops would mean slicing/re-batching one column per step (messier and slower than a single strided argmax-with-bias kernel). The kernel reads `base[(i·block+k)·V+v] + bias[i·V+v]` and writes the chosen token id as `u32` so it feeds straight back as the next step's prev-token lookup. Two-stage (partial+finalize), reusing the existing batched-argmax tiling.
+- **Custom CUDA kernel** `markov_step_argmax` (`pegainfer-kernels/csrc/shared/argmax.cu` + FFI + `ops::markov_step_argmax_into`). **We chose to add one kernel** — the earlier "no new kernel needed" prediction below was revised: the base block logits are request-major `[N·block, V]`, so step `k` needs a *strided* argmax over row `i·block+k` plus a *per-request* bias row `i`. Composing that from existing ops would mean slicing/re-batching one column per step (messier and slower than a single strided argmax-with-bias kernel). The kernel reads `base[(i·block+k)·V+v] + bias[i·V+v]` and writes the chosen token id as `u32` so it feeds straight back as the next step's prev-token lookup. Two-stage (partial+finalize), reusing the existing batched-argmax tiling.
 - **Per-step math** = `embedding_batch(markov_w1, prev) → gemm(markov_w2) → markov_step_argmax`, looped `block_size` times; matches `VanillaMarkov.sample_block_tokens` exactly.
 - **Kernel polish after bring-up** — the two-stage Markov argmax uses programmatic dependent launch on SM90+ so the finalize kernel can be scheduled as soon as partial tiles publish their results; SM80 falls back to the normal stream-ordered launch. PDL is not a free launch, just a launch-gap reducer for this tiny finalize. The finalize kernel also writes the full request-major sampled block on device, so DSpark does one D2H per draft block instead of one D2H per step.
 - **Dual-schema config** — `DFlashConfig::from_file` now resolves both our nested `b16` schema (`dflash_config:{…}`, flat `rope_theta`) and DeepSpec's flat schema (`mask_token_id`/`target_layer_ids` flat, `rope_theta` under `rope_parameters`). `markov_rank == 0` ⇒ plain DFlash. The struct was flattened (no more `dflash_config` nesting).
@@ -89,7 +97,7 @@ Verifying the *whole* block wastes target batch capacity on tokens that will be 
 
 ## How DSpark maps onto our DFlash
 
-Our DFlash drafter (`openinfer-qwen3/src/dflash.rs`, lane in `executor/dflash_lane.rs`) already **is** the DSpark parallel backbone. Side-by-side of the released `dspark_qwen3_4b_block7` config vs our `Qwen3-4B-DFlash-b16`:
+Our DFlash drafter (`pegainfer-qwen3/src/dflash.rs`, lane in `executor/dflash_lane.rs`) already **is** the DSpark parallel backbone. Side-by-side of the released `dspark_qwen3_4b_block7` config vs our `Qwen3-4B-DFlash-b16`:
 
 | | DFlash-b16 (ours) | DSpark-block7 (released) |
 | --- | --- | --- |
@@ -207,8 +215,8 @@ Per-case mean accepted draft tokens:
 | rand | 1.86 / 2.59 | 2.06 / 2.40 | 2.13 / 2.10 |
 | code | 3.18 / 2.97 | 3.54 / 2.75 | 3.44 / 3.04 |
 
-- **Method:** `run_sweep.sh` (session scratch, on the 5090 at `/data/dspark-bench/`) launches each server and runs `/root/.cargo/bin/vllm-bench` across chat / poem / rand / code × c1/c4/c8, parsing tok/s + `cumulative_accept_rate` from the server log. Raw artifacts were copied to `/tmp/openinfer-bench/dspark-sweep-20260629/` locally; `accept_distribution.csv` there has the per-case histograms.
-- **MTP metric note:** the Python `vllm bench serve --help=all` on this 5090 exposes a `spec_bench` dataset, but not direct MTP/spec accept metrics. The Rust `vllm-bench` result JSON also only contains standard serving metrics. For accepted length, use OpenInfer's `accepted_draft` / `committed_tokens` log lines until we add a structured metric.
+- **Method:** `run_sweep.sh` (session scratch, on the 5090 at `/data/dspark-bench/`) launches each server and runs `/root/.cargo/bin/vllm-bench` across chat / poem / rand / code × c1/c4/c8, parsing tok/s + `cumulative_accept_rate` from the server log. Raw artifacts were copied to `/tmp/pegainfer-bench/dspark-sweep-20260629/` locally; `accept_distribution.csv` there has the per-case histograms.
+- **MTP metric note:** the Python `vllm bench serve --help=all` on this 5090 exposes a `spec_bench` dataset, but not direct MTP/spec accept metrics. The Rust `vllm-bench` result JSON also only contains standard serving metrics. For accepted length, use PegaInfer's `accepted_draft` / `committed_tokens` log lines until we add a structured metric.
 - **Invalid rows:** `low_entropy`/`high_entropy` are absent from the selected SPEED-Bench split in this harness, so their JSON files are missing and those rows are dropped.
 - **The accept trace** (`cumulative_accept_rate`) is `debug`-level only. It is useful for one-off DSpark/DFlash acceptance analysis, but production's default `info` logging must not emit one line per request per verify round; use a debug run or a structured metric for future acceptance studies.
 
@@ -221,7 +229,7 @@ We already support DFlash, so almost everything is reused. The *only* new surfac
 | **Config schema** | `config.rs` | DSpark `config.json` is **flat** (`mask_token_id` / `target_layer_ids` / `block_size` / `markov_rank` / `markov_head_type` / `enable_confidence_head` at top level), unlike our DFlash config's nested `dflash_config: {…}`. Add the flat fields (or a small adapter); `markov_rank` default 0 = legacy DFlash, so it's a superset not a fork. | trivial |
 | **Weight load** | `dflash/loading.rs` | Load 2 tensors: `markov_head.markov_w1.weight [V,256]`, `markov_head.markov_w2.weight [V,256]` (~156 MiB total). **Do not** load `embed_tokens`/`lm_head` (reuse target — proven identical). | trivial |
 | **Propose loop** | `dspark.rs` (`MarkovHead::sample_block`), called from `executor/dflash_lane.rs` (`execute_dflash_draft`) | `block_size`-step Markov loop, batched across requests: per step `embedding_batch(markov_w1, prev)→[N,256]`, `gemm(markov_w2)→[N,V]` bias, then `markov_step_argmax` over the step-`k` base-logit rows + bias → next prev. | the only real work |
-| **Custom kernel** | `openinfer-kernels/csrc/shared/argmax.cu` | `markov_step_argmax` — strided argmax over `base[(i·block+k)·V+v] + bias[i·V+v]`, writes `u32` token. + FFI decl + `ops::markov_step_argmax_into`. | small |
+| **Custom kernel** | `pegainfer-kernels/csrc/shared/argmax.cu` | `markov_step_argmax` — strided argmax over `base[(i·block+k)·V+v] + bias[i·V+v]`, writes `u32` token. + FFI decl + `ops::markov_step_argmax_into`. | small |
 | **Block layout** | `config.rs::anchor_first` + `executor/dflash_lane.rs` + `dflash.rs::verify_span()` | Anchor-first (all `block_size` drafts, span `block_size+1`) vs anchor-drop (`block[1..]`, span `block_size`), keyed on `anchor_first` (derived from `num_anchors` = DeepSpec format) — **not** on the markov head, so the `markov_rank==0` DeepSpec baseline drafts correctly and the native `b16` stays anchor-drop. | small |
 | **Memory reservation** | `dflash/reservation.rs` | Add `MarkovHead::reservation_bytes` (2 markov tensors ~156 MiB + sample scratch) to the fixed term. | trivial |
 

@@ -58,11 +58,6 @@ pub struct EventsManagerSettings {
 }
 
 impl EventsManagerSettings {
-    /// Creates a new builder for EventsManagerSettings.
-    pub fn builder() -> EventsManagerSettingsBuilder {
-        EventsManagerSettingsBuilder::default()
-    }
-
     /// Converts settings into an EventsManager.
     pub fn into_manager(self) -> EventsManager {
         let policy = self

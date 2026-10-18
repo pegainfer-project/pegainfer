@@ -30,11 +30,6 @@ pub fn create_iota_token_block(start: u32, block_size: u32) -> TokenBlock {
     create_test_token_block(&tokens, block_size)
 }
 
-/// Generate a vector of sequential tokens.
-pub fn sequential_tokens(start: u32, count: usize) -> Vec<u32> {
-    (start..start + count as u32).collect()
-}
-
 /// Generate tokens for a given block ID (for unique but deterministic test data).
 pub fn tokens_for_id(id: u64) -> Vec<u32> {
     vec![id as u32, (id + 1) as u32, (id + 2) as u32, (id + 3) as u32]

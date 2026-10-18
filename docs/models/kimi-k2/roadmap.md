@@ -52,7 +52,7 @@ So routing diversity is worth **~7–15%** of decode TPOT, non-linear in K (flat
 | CUDA graph decode | ✓ DeepEP full-bucket capture, −12% TPOT | #227/#298 |
 | Bench-regression snapshot | ✓ `bench_snapshots/h200/kimi-k2.6.json` | #232 |
 | Lint gate (kernels + comm) | ✓ scoped `-D warnings` hook | #233 |
-| LoRA | N/A — server rejects cleanly | `openinfer-server/src/main.rs` |
+| LoRA | N/A — server rejects cleanly | `pegainfer-server/src/main.rs` |
 
 ## Claim boundaries
 

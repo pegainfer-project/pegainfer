@@ -12,16 +12,16 @@ Last touched: 2026-06
   - `docs/models/deepseek-v2-lite/decode-attribution-gate.md` - acceptance uses the `Hello` / 16-token HF / host-staged / NCCL gate plus graph-readiness blockers.
   - `docs/models/deepseek-v2-lite/hf-accuracy-gate.md` - same-host HF, host-staged, and NCCL token/text exactness is the correctness standard.
   - `docs/models/deepseek-v2-lite/source-layout.md` - runtime responsibilities are split, and issue #275 was intentionally left as follow-up work.
-  - `openinfer-deepseek-v2-lite/src/runtime/moe.rs` - the pre-#275 NCCL combine path accumulated routed expert outputs in host `Vec<f32>` buffers, then copied H2D for NCCL and D2H before final H2D conversion.
-  - `openinfer-deepseek-v2-lite/src/nccl_backend.rs` - the pre-#275 NCCL combine path allocated send/recv device buffers inside each call and synchronized both streams.
-  - `openinfer-deepseek-v2-lite/src/runtime/readiness.rs` - the pre-#275 readiness report listed combine H2D, allocation, sync, and D2H blockers.
-  - `openinfer-kernels/src/ops/elementwise.rs` and `openinfer-kernels/csrc/shared/elementwise.cu` - existing device f32/bf16 conversion helpers could be reused, but there was no f32 accumulation helper for bf16 expert output.
+  - `pegainfer-deepseek-v2-lite/src/runtime/moe.rs` - the pre-#275 NCCL combine path accumulated routed expert outputs in host `Vec<f32>` buffers, then copied H2D for NCCL and D2H before final H2D conversion.
+  - `pegainfer-deepseek-v2-lite/src/nccl_backend.rs` - the pre-#275 NCCL combine path allocated send/recv device buffers inside each call and synchronized both streams.
+  - `pegainfer-deepseek-v2-lite/src/runtime/readiness.rs` - the pre-#275 readiness report listed combine H2D, allocation, sync, and D2H blockers.
+  - `pegainfer-kernels/src/ops/elementwise.rs` and `pegainfer-kernels/csrc/shared/elementwise.cu` - existing device f32/bf16 conversion helpers could be reused, but there was no f32 accumulation helper for bf16 expert output.
 - **Relevant history**:
   - `docs/models/deepseek-v2-lite/status.md` - NCCL plus CUDA Graph is the preferred direction, but the current gate must not be described as production EP.
   - `docs/models/deepseek-v2-lite/source-layout.md` - local macOS checks are not enough for this path; remote 2-GPU validation is the real acceptance path.
 - **Implemented**:
   1. Add a shared CUDA helper that accumulates a bf16 single-token expert output into a f32 device contribution buffer at a selected token row.
-  2. Re-export that helper through `openinfer-core::ops`.
+  2. Re-export that helper through `pegainfer-core::ops`.
   3. Add reusable NCCL combine scratch buffers inside `NaiveNcclEp2Backend`, clear the f32 send scratch per MoE call, accumulate local/remote expert outputs on the owning device, all-reduce device buffers, and cast rank0 f32 result to bf16 on device.
   4. Update graph-readiness blockers and attribution wording so removed combine H2D/D2H/allocation/sync blockers are no longer claimed, while the remaining host routing and dense-exchange blockers stay explicit.
   5. Run formatting and local compile gates, then use the provided remote GPU host for the DeepSeek-V2-Lite EP2 exactness and attribution gates.
@@ -37,9 +37,9 @@ Validated 2026-06-08 on the provided 2x RTX 5090 host with DeepSeek-V2-Lite snap
 Commands run:
 
 ```bash
-cargo test --offline --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 --no-run
+cargo test --offline --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 --no-run
 
-cargo clippy --offline --release -p openinfer-deepseek-v2-lite \
+cargo clippy --offline --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite --bins --tests -- \
   -D warnings \
   -A clippy::option_option \
@@ -52,14 +52,14 @@ python tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py \
   --output-len 16 \
   --out target/accuracy/dsv2-lite-ep2/hf.json
 
-OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
-OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
-  cargo test --offline --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+PEGAINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/host-staged.json \
+  cargo test --offline --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
-OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
-OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
-OPENINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl-after-decouple-cleanup.json \
-  cargo test --offline --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite \
+PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
+PEGAINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl-after-decouple-cleanup.json \
+  cargo test --offline --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
 python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
   --hf target/accuracy/dsv2-lite-ep2/hf.json \
@@ -68,8 +68,8 @@ python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
   --out target/accuracy/dsv2-lite-ep2/comparison-after-decouple-cleanup.json \
   --require-all-exact
 
-OPENINFER_DSV2_LITE_EP_BACKEND=nccl \
-  cargo run --offline --release -p openinfer-deepseek-v2-lite \
+PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
+  cargo run --offline --release -p pegainfer-deepseek-v2-lite \
     --features deepseek-v2-lite \
     --bin dsv2_lite_ep2_decode_attribution \
     -- --model-path models/DeepSeek-V2-Lite \
@@ -84,14 +84,14 @@ Results:
 - Token SHA256: `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`.
 - Text SHA256: `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347`.
 - Candidate NCCL attribution: `gpu_timing.sample_count=8384`, `failure_count=0`.
-- Initial remote cleanup gate: package `--bins --tests` clippy passed with only three explicit allows for then-existing lints (`openinfer-core::logging` `option_option`, and two `host_ops` test lints).
+- Initial remote cleanup gate: package `--bins --tests` clippy passed with only three explicit allows for then-existing lints (`pegainfer-core::logging` `option_option`, and two `host_ops` test lints).
 
 Follow-up review gate on 2026-06-09 after fixing those lints:
 
 ```bash
 cargo fmt --all --check
 
-cargo clippy --release -p openinfer-deepseek-v2-lite \
+cargo clippy --release -p pegainfer-deepseek-v2-lite \
   --features deepseek-v2-lite --bins --tests -- -D warnings
 ```
 

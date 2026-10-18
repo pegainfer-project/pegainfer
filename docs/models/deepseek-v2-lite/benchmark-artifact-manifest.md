@@ -33,8 +33,8 @@ The final unit run passed `59` tests. The new coverage includes `--summarize-onl
 
 ### PR #617 review follow-up
 
-- `scripts/bench_dsv2lite_vllm_matrix.py`: added section-scoped comparability reasons for added/missing direct diagnostic rows, HTTP pressure cells, and OpenInfer trace cells.
-- `tests/test_bench_dsv2lite_vllm_matrix.py`: added a CPU-only regression test for the maintainer-reported case where the baseline contains `nccl/batch1`, `openinfer-nccl/c1` HTTP, and `openinfer-nccl/c1` trace rows but the current summary omits them.
+- `scripts/bench_dsv2lite_vllm_matrix.py`: added section-scoped comparability reasons for added/missing direct diagnostic rows, HTTP pressure cells, and PegaInfer trace cells.
+- `tests/test_bench_dsv2lite_vllm_matrix.py`: added a CPU-only regression test for the maintainer-reported case where the baseline contains `nccl/batch1`, `pegainfer-nccl/c1` HTTP, and `pegainfer-nccl/c1` trace rows but the current summary omits them.
 - Validation: `py_compile`, unit tests, and the documented plan-only command all passed locally.
 
 ## Debrief

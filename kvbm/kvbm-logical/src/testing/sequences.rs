@@ -41,12 +41,6 @@ impl BlockSequenceBuilder {
         self
     }
 
-    /// Set salt for the underlying TokenBlockSequence.
-    pub fn with_salt(mut self, salt: dynamo_tokens::SaltHash) -> Self {
-        self.salt = Some(salt);
-        self
-    }
-
     /// Build the sequence as `(BlockId, SequenceHash)` pairs. Block ids are
     /// assigned sequentially starting at 0.
     pub fn build(self) -> Vec<(BlockId, SequenceHash)> {

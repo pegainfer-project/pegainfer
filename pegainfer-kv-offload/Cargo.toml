@@ -1,0 +1,33 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-kv-offload"
+version = "0.1.0"
+
+[dependencies]
+# Embedded in-process: pegaflow-core is the host/SSD/RDMA KV offload tier.
+# Pinned to the upstream master rev that landed PR #395 (P-side partial-tail
+# save + first-token router forwarding), including PR #381's metaserver flush
+# barrier and embeddable P2pTransferService. The supported producer versions
+# and default layouts are pinned in the P/D deployment docs; they register the
+# same block-local bytes PegaInfer restores, so no cross-layout conversion is
+# required.
+# per the workflow in docs/subsystems/runtime/pegaflow-offload-integration.md
+# §5.2. default-features=false drops its `cuda-12` (which would pull a
+# clashing cudarc/cuda-12080 selector); the workspace cudarc already provides
+# cuda-12090 + nvrtc + runtime, which covers pegaflow-core and
+# pegaflow-transfer. `rdma` enables pegaflow-transfer: cross-node block fetch
+# (RDMA READ) + MetaServer discovery — the P/D disaggregation data plane.
+cudarc = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+pegainfer-kv-cache = { workspace = true }
+pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "14112403bc1d0ed5b44717c0a93743fb0de66fee", default-features = false, features = [
+  "rdma",
+] }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+xxhash-rust = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-kv-store"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+# Not used by this crate's code: carried for its feature flags only.
+# pegaflow-core's stripped-down cudarc ships no CUDA version selector
+# (default-features=false drops its cuda-12), so without this the cudarc
+# build script refuses to compile whenever no sibling crate in the build
+# graph happens to select one.
+cudarc = { workspace = true }
+dynamo-kv-hashing = { workspace = true }
+kvbm-logical = { workspace = true }
+log = { workspace = true }
+pegainfer-frontend = { workspace = true }
+# Embedded in-process: pegaflow-core is the host/SSD/RDMA KV tier behind
+# `host::PegaflowHost` / `tier::PegaflowTier`. Same pin and feature set as
+# pegainfer-kv-offload: default-features=false drops its clashing cuda-12
+# cudarc selector; the workspace cudarc (cuda-12090 + nvrtc + runtime) covers
+# pegaflow-core and pegaflow-transfer. `rdma` enables the P2P data plane the
+# `p2p(..)` builder knob wires up.
+pegaflow-core = { git = "https://github.com/novitalabs/pegaflow.git", rev = "14112403bc1d0ed5b44717c0a93743fb0de66fee", default-features = false, features = [
+  "rdma",
+] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "rt-multi-thread", "net"] }
+# net: wraps the P2P gRPC listener into the stream `serve_with_incoming` takes.
+tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+libc = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

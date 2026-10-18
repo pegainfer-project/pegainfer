@@ -4,7 +4,7 @@
 # value and saves one JSON per run.
 #
 # Usage:
-#   MODEL=/data/Qwen3-4B PORT=8000 ENGINE=openinfer RESULT_DIR=/data/bench \
+#   MODEL=/data/Qwen3-4B PORT=8000 ENGINE=pegainfer RESULT_DIR=/data/bench \
 #   QPS_LIST="1 2 4 8 16" INPUT_LEN=1024 OUTPUT_LEN=128 SEED=42 \
 #   VLLM=.venv/bin/vllm tools/bench/qps_sweep.sh
 set -euo pipefail

@@ -1,6 +1,6 @@
 # Qwen3.5-4B serving vs vLLM on RTX 5090
 
-> **TL;DR:** #469 is satisfied as a retained benchmark record, not as a parity claim. OpenInfer Qwen3.5-4B passed correctness gates, the HTTP matrix, QPS sweep, and overload recovery with zero failed benchmark requests, but vLLM 0.25.1 is faster across the retained serving envelope. The clearest gap is requested 1024/256 c16: OpenInfer `17.36ms` TPOT / `807 tok/s`; vLLM `9.34ms` / `1425 tok/s`. OpenInfer direct diagnostic for the same shape is `9.14ms` avg / `8.75ms` p50, so the next issue should trace HTTP/frontend/scheduler overhead first.
+> **TL;DR:** #469 is satisfied as a retained benchmark record, not as a parity claim. PegaInfer Qwen3.5-4B passed correctness gates, the HTTP matrix, QPS sweep, and overload recovery with zero failed benchmark requests, but vLLM 0.25.1 is faster across the retained serving envelope. The clearest gap is requested 1024/256 c16: PegaInfer `17.36ms` TPOT / `807 tok/s`; vLLM `9.34ms` / `1425 tok/s`. PegaInfer direct diagnostic for the same shape is `9.14ms` avg / `8.75ms` p50, so the next issue should trace HTTP/frontend/scheduler overhead first.
 
 ## Setup
 
@@ -10,7 +10,7 @@
 | GPU | 1x NVIDIA GeForce RTX 5090, 32607 MiB |
 | Driver / CUDA runtime | NVIDIA driver `595.71.05`, CUDA runtime `13.2` from `nvidia-smi` |
 | CUDA toolkit | `nvcc 12.8.93`, `CUDA_HOME=/usr/local/cuda-12.8` |
-| OpenInfer source | Snapshot of upstream/main `e2de05dbc52bedbbb3c213e648148b64cd12b3b4` |
+| PegaInfer source | Snapshot of upstream/main `e2de05dbc52bedbbb3c213e648148b64cd12b3b4` |
 | Rust | `rustc 1.99.0-nightly (af3d95584 2026-07-09)`, `cargo 1.99.0-nightly (59800466c 2026-07-07)` |
 | Python / vLLM | Python 3.12.3, vLLM `0.25.1`, torch `2.11.0+cu130`, Triton `3.6.0` |
 | Model | `Qwen/Qwen3.5-4B`, revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`, config sha256 `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670` |
@@ -20,31 +20,31 @@ Remote Git fetch/clone was unreliable on the benchmark host. The artifact record
 
 ## Flags
 
-OpenInfer build and gates:
+PegaInfer build and gates:
 
 ```bash
-OPENINFER_CUDA_SM=120 \
-OPENINFER_TRITON_PYTHON=<python-with-triton> \
+PEGAINFER_CUDA_SM=120 \
+PEGAINFER_TRITON_PYTHON=<python-with-triton> \
 CUDA_HOME=/usr/local/cuda-12.8 \
-cargo build --release -p openinfer-server --features qwen35-4b
+cargo build --release -p pegainfer-server --features qwen35
 
-OPENINFER_TEST_MODEL_PATH=$MODEL \
-cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=$MODEL \
+cargo test --release -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate -- --nocapture
 
-OPENINFER_TEST_MODEL_PATH=$MODEL \
-cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=$MODEL \
+cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
 ```
 
-OpenInfer serve:
+PegaInfer serve:
 
 ```bash
-RUST_LOG=info target/release/openinfer \
+RUST_LOG=info target/release/pegainfer \
   --model-path "$MODEL" \
   --served-model-name Qwen3.5-4B \
   --port 8000
 ```
 
-Qwen3.5 rejected the Qwen3-specific `--no-prefix-cache` and `--gpu-memory-utilization` flags. This run did not enable any OpenInfer product-mode prefix cache path.
+Qwen3.5 rejected the Qwen3-specific `--no-prefix-cache` and `--gpu-memory-utilization` flags. This run did not enable any PegaInfer product-mode prefix cache path.
 
 vLLM serve:
 
@@ -70,12 +70,12 @@ Relevant vLLM warnings:
 - Client: `vllm bench serve --backend openai --endpoint /v1/completions`.
 - Sampling: greedy, `--temperature 0`.
 - Fixed-output cells: `--ignore-eos`.
-- Prefix cache: disabled for vLLM; not enabled/exposed for OpenInfer Qwen3.5.
+- Prefix cache: disabled for vLLM; not enabled/exposed for PegaInfer Qwen3.5.
 - Runs: 3 runs per cell, median reported below.
-- Order: vLLM block first, then OpenInfer block. This is not ABBA-interleaved, so heat-state bias is possible.
+- Order: vLLM block first, then PegaInfer block. This is not ABBA-interleaved, so heat-state bias is possible.
 - Output sanity: every cell records completed, failed, average input/output tokens, output hashes, and raw `output_lens`. No 0-token cell was counted as success.
 - vLLM 0.25.1 random dataset cannot represent exact `input_len=1` because it may generate empty prompts. The 1-token cells use custom JSONL prompt `"Hello"` with `--skip-chat-template` and `--custom-output-len`.
-- For random synthetic prompts, OpenInfer observed prompt token counts were lower than the requested length in several cells. The tables show observed average input tokens as `OpenInfer/vLLM`.
+- For random synthetic prompts, PegaInfer observed prompt token counts were lower than the requested length in several cells. The tables show observed average input tokens as `PegaInfer/vLLM`.
 
 ## Fixed / Concurrency
 
@@ -115,7 +115,7 @@ Workload: requested 1024/128, max concurrency 64, fixed output, Poisson/open-loo
 | 12 | 72/72 | 0/0 | 969.7/1024.0 | 24.46/11.91 | 678/999 | 82.79/74.37 |
 | 16 | 96/96 | 0/0 | 971.1/1024.0 | 28.07/13.17 | 812/1286 | 85.35/73.99 |
 
-OpenInfer kept every QPS cell alive with zero failures. Latency and throughput diverged at QPS 8 and above.
+PegaInfer kept every QPS cell alive with zero failures. Latency and throughput diverged at QPS 8 and above.
 
 ## Overload And Recovery
 
@@ -129,7 +129,7 @@ Both servers survived the overload cell. A clean follow-up `Hello`, `max_tokens=
 
 | Backend | completion tokens | output hash |
 | --- | --- | --- |
-| OpenInfer | 8 | `04048402ba653530` |
+| PegaInfer | 8 | `04048402ba653530` |
 | vLLM | 8 | `83d4b3ded677dc41` |
 
 ## Direct Diagnostic
@@ -141,7 +141,7 @@ This is not serving evidence. It only decides where to look first.
 | 1024/256 c1 | 49.03 | 6.96/6.97/7.07 | 140 | 144 |
 | 1024/256 c16 | 3827.11 | 9.14/8.75/9.10 | 41 | 108 |
 
-Direct c1 TPOT matches HTTP c1. Direct c16 steady TPOT is close to vLLM HTTP c16 and far below OpenInfer HTTP c16. Direct c16 TTFT is high because the request benchmark reports all 16 requests and the in-process scheduler admitted work in waves. Start attribution in HTTP/frontend/scheduler/event timing.
+Direct c1 TPOT matches HTTP c1. Direct c16 steady TPOT is close to vLLM HTTP c16 and far below PegaInfer HTTP c16. Direct c16 TTFT is high because the request benchmark reports all 16 requests and the in-process scheduler admitted work in waves. Start attribution in HTTP/frontend/scheduler/event timing.
 
 ## Claim Boundary
 
@@ -149,7 +149,7 @@ Direct c1 TPOT matches HTTP c1. Direct c16 steady TPOT is close to vLLM HTTP c16
 - It does not support "SOTA", "vLLM parity", or "production ready".
 - It does not include product-mode prefix cache results.
 - It does not prove mixed-load ITL behavior. That remains a separate workload.
-- It does not prove Qwen3.5 loses on every possible workload. It loses on the retained HTTP fixed-shape/QPS/overload envelope here. The closest cell is 1-token c1, where OpenInfer is within a few percent of vLLM.
+- It does not prove Qwen3.5 loses on every possible workload. It loses on the retained HTTP fixed-shape/QPS/overload envelope here. The closest cell is 1-token c1, where PegaInfer is within a few percent of vLLM.
 - It does not prove a model-kernel root cause for the high-concurrency HTTP gap.
 
 ## Follow-Up Recommendation

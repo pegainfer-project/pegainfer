@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 DP8 EP8 performance
 
-> TL;DR: This ledger tracks openinfer TP1+DP8+EP8 on 8x H20 against the vLLM TP1+DP8+EP8 bs64 target. The vLLM sustained bs64 `~106ms` TPOT is now explained by a DPLB/CUDA-graph bucket cliff: an uneven DP distribution such as `9,8,8,8,8,8,8,7` pads every rank from graph bucket 8 to 16 and doubles TPOT. O2 landed five production decode-kernel picks (cuBLASLt fixed-shape shared_gate_up / o_proj / MLA strided-batch, split-vocab argmax, fused router selector); accuracy held at the bf16 ULP floor by a base-vs-opt prefill logits A/B, and the PPLX Marlin small-N tile was identified as the messy branch's real accuracy break (`-inf` logits + SIGSEGV at small per-rank N) and rejected. bs64 TPOT is unchanged within noise (p50 `40.58 -> 40.09ms`): the per-kernel wins do not resolve above the ±1ms band at this shape. Every openinfer optimization must start from a profile, state the expected gain, show a microbench or isolated measurement, then pass correctness and service-level gates before commit.
+> TL;DR: This ledger tracks pegainfer TP1+DP8+EP8 on 8x H20 against the vLLM TP1+DP8+EP8 bs64 target. The vLLM sustained bs64 `~106ms` TPOT is now explained by a DPLB/CUDA-graph bucket cliff: an uneven DP distribution such as `9,8,8,8,8,8,8,7` pads every rank from graph bucket 8 to 16 and doubles TPOT. O2 landed five production decode-kernel picks (cuBLASLt fixed-shape shared_gate_up / o_proj / MLA strided-batch, split-vocab argmax, fused router selector); accuracy held at the bf16 ULP floor by a base-vs-opt prefill logits A/B, and the PPLX Marlin small-N tile was identified as the messy branch's real accuracy break (`-inf` logits + SIGSEGV at small per-rank N) and rejected. bs64 TPOT is unchanged within noise (p50 `40.58 -> 40.09ms`): the per-kernel wins do not resolve above the ±1ms band at this shape. Every pegainfer optimization must start from a profile, state the expected gain, show a microbench or isolated measurement, then pass correctness and service-level gates before commit.
 >
 > Last touched: 2026-06-07
 
@@ -44,42 +44,42 @@ For TP1 DP8, correctness checks must include uneven per-rank active rows and emp
 Path placeholders:
 
 ```bash
-export OPENINFER_DIR=/path/to/openinfer
+export PEGAINFER_DIR=/path/to/pegainfer
 export VLLM_DIR=/path/to/vllm_test
 export MODEL_DIR=/path/to/Kimi-K2.5
 export NCCL_LIB_DIR=/path/to/nccl-lib
 export EVAL_VENV=/path/to/eval-venv
 export RESULT_ROOT=/path/to/result-root
-export TRITON_PYTHON=$OPENINFER_DIR/.triton-venv/bin/python
+export TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python
 ```
 
 Build on an <H20_NODE>:
 
 ```bash
-cd "$OPENINFER_DIR"
+cd "$PEGAINFER_DIR"
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
 LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
-OPENINFER_CUDA_SM=90a \
-OPENINFER_TRITON_PYTHON="$TRITON_PYTHON" \
-cargo build --release -p openinfer-server \
-  --features kimi-k2 --bin openinfer --bin bench_serving
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
+cargo build --release -p pegainfer-server \
+  --features kimi-k2 --bin pegainfer --bin bench_serving
 ```
 
-(The old `kimi-k2-pplx-ep` feature and `OPENINFER_KIMI_PARALLEL` env existed only on the
+(The old `kimi-k2-pplx-ep` feature and `PEGAINFER_KIMI_PARALLEL` env existed only on the
 pre-merge branch; on main the feature is `kimi-k2` and parallel shape is selected by the
 `--tp-size/--dp-size/--ep-backend` CLI flags below. nvcc must also be on `PATH` — the
-`openinfer-comm` cc-rs build looks it up there, not via `$NVCC`.)
+`pegainfer-comm` cc-rs build looks it up there, not via `$NVCC`.)
 
 In-process bs64:
 
 ```bash
-cd "$OPENINFER_DIR"
+cd "$PEGAINFER_DIR"
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
 LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
-OPENINFER_CUDA_SM=90a \
-OPENINFER_TRITON_PYTHON="$TRITON_PYTHON" \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
 target/release/bench_serving \
   --model-path "$MODEL_DIR" \
   --cuda-graph false \
@@ -92,13 +92,13 @@ target/release/bench_serving \
 Service bs64, same client shape as vLLM:
 
 ```bash
-cd "$OPENINFER_DIR"
+cd "$PEGAINFER_DIR"
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
 LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
-OPENINFER_CUDA_SM=90a \
-OPENINFER_TRITON_PYTHON="$TRITON_PYTHON" \
-target/release/openinfer --model-path "$MODEL_DIR" --served-model-name kimi-k2.5 \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
+target/release/pegainfer --model-path "$MODEL_DIR" --served-model-name kimi-k2.5 \
   --port 8124 --cuda-graph false --tp-size 1 --dp-size 8 --ep-backend pplx
 ```
 
@@ -125,13 +125,13 @@ vllm bench serve \
   --save-result \
   --save-detailed \
   --result-dir "$RESULT_ROOT/kimi-tp1dp8-service" \
-  --result-filename openinfer_tp1dp8_bs64_${COMMIT}.json
+  --result-filename pegainfer_tp1dp8_bs64_${COMMIT}.json
 ```
 
 GSM8K accuracy smoke, concurrent OpenAI `/v1/completions` path:
 
 ```bash
-cd "$OPENINFER_DIR"
+cd "$PEGAINFER_DIR"
 source "$EVAL_VENV/bin/activate"
 lm_eval run --model local-completions \
   --model_args "model=kimi-k2.5,base_url=http://127.0.0.1:8125/v1/completions,tokenizer_backend=huggingface,tokenizer=$MODEL_DIR,tokenized_requests=False,trust_remote_code=True,max_length=4096,max_gen_toks=256,num_concurrent=16,timeout=300" \
@@ -190,13 +190,13 @@ vllm bench serve \
 nsys profile:
 
 ```bash
-cd "$OPENINFER_DIR"
+cd "$PEGAINFER_DIR"
 mkdir -p "$RESULT_ROOT/kimi-profile"
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
 LD_LIBRARY_PATH="$NCCL_LIB_DIR:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
-OPENINFER_CUDA_SM=90a \
-OPENINFER_TRITON_PYTHON="$TRITON_PYTHON" \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON="$TRITON_PYTHON" \
 nsys profile --force-overwrite=true --trace=cuda,nvtx \
   --cuda-graph-trace=node --export=sqlite \
   -o "$RESULT_ROOT/kimi-profile/tp1dp8_bs64_o128_${COMMIT}" \
@@ -235,7 +235,7 @@ Motivation and expected gain:
 
 Change:
 
-- `openinfer-kimi-k2/src/runner/engine.rs`
+- `pegainfer-kimi-k2/src/runner/engine.rs`
   - `MAX_BATCH_PER_DP: 4 -> 8`.
   - Added prompt_len1 admission batching in `DpCoordinator`.
   - For prompt_len1 requests, send `StepCommand::Decode { positions: vec![0], slots, decode_batch_size: MAX_BATCH_PER_DP }` instead of `Prefill`.
@@ -293,12 +293,12 @@ Correctness:
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
-cargo test -r -p openinfer-kimi-k2 --features pplx-ep runner::engine::tests --no-fail-fast
+cargo test -r -p pegainfer-kimi-k2 --features pplx-ep runner::engine::tests --no-fail-fast
 ```
 
 - Local result: `5 passed`.
 - H20 result at `0c23389`: `5 passed`.
-- Mixed-arrival service test, `$RESULT_ROOT/kimi-tp1dp8-service/openinfer_tp1dp8_mixed_arrival_prompt1_o64_0c23389.json`:
+- Mixed-arrival service test, `$RESULT_ROOT/kimi-tp1dp8-service/pegainfer_tp1dp8_mixed_arrival_prompt1_o64_0c23389.json`:
   `64/64` success with `--request-rate 16`, peak concurrent requests `54`, TTFT p50/p99
   `58.10/110.88ms`, TPOT p50/p99 `35.91/37.63ms`. This covers prompt_len1
   admissions landing while existing decode slots are active.
@@ -309,7 +309,7 @@ Performance:
   `64/64` success, TTFT p50/p99 `74.62/77.19ms`, first decode p50/p99
   `38.23/38.24ms`, steady TPOT p50/p95/p99 `40.10/43.32/43.72ms`.
 - Service, same `vllm bench serve` client as vLLM,
-  `$RESULT_ROOT/kimi-tp1dp8-service/openinfer_tp1dp8_bs64_o128_0c23389_after_warmup.json`:
+  `$RESULT_ROOT/kimi-tp1dp8-service/pegainfer_tp1dp8_bs64_o128_0c23389_after_warmup.json`:
   `256/256` success, output `1336.35 tok/s`, TTFT p50/p99 `105.31/127.81ms`,
   TPOT p50/p95/p99 `47.34/47.70/47.71ms`, ITL p50/p99 `47.84/50.69ms`.
 - vLLM warmup-after baseline,
@@ -365,7 +365,7 @@ Decision:
 - Keep as the current H20 bs64 performance baseline. O1 moves prompt_len=1 onto the decode
   shape and clears the vLLM bs64 TPOT/output gate; full token-parity correctness remains a
   separate reference gate before using TP1 DP8 as an accuracy baseline. Follow-up profiles should
-  focus on lowering openinfer service TPOT from `47ms` toward the H200-reported 30ms-class
+  focus on lowering pegainfer service TPOT from `47ms` toward the H200-reported 30ms-class
   expectation if that target is confirmed on comparable hardware.
 
 ### O2 - decode kernel cherry-pick: cuBLASLt fixed-shape GEMMs, argmax split, router fusion
@@ -410,7 +410,7 @@ Rejected: PPLX Marlin small-N tile (messy-branch `dd69876`) — the accuracy bre
 
 Accuracy gate: base-vs-opt prefill logits A/B. GSM8K-class evals are too coarse for
 ULP-level kernel drift, so the gate follows `subsystems/correctness/logits-golden-gate.md`
-with base-openinfer itself as the reference at the same TP1 DP8 PPLX config: a throwaway
+with base-pegainfer itself as the reference at the same TP1 DP8 PPLX config: a throwaway
 (uncommitted) hook after the prefill lm_head GEMM in `runner/worker/state.rs` dumps
 full-vocab bf16 logits at every prompt position for 12 fixed raw prompts (en/zh/code/math,
 1..90 tokens) sent through `/v1/completions` at `max_tokens=1`, identical patch on base

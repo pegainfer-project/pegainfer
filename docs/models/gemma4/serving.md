@@ -1,0 +1,225 @@
+# Gemma 4 serving
+
+**TL;DR:** Gemma 4 is a stepped engine: the frontend driver polls one scheduler, commits one `StepOutputs` batch per step, and the scheduler reports lifecycle changes through `RequestLedger`. Up to the configured decode slots (16 by default) hold requests, each prompt prefills whole at a step boundary by default, and every active request advances one token per batched step. Prompt plus output past the ceiling — 8192 by default, raised up to the checkpoint's 262144 by `PEGAINFER_MAX_CONTEXT` — is refused at admission, while a request that only has to wait for a decode slot queues instead. The two KV families are budgeted separately (7.27 GiB sliding + 2.00 GiB global at 12B, at the defaults). **The default configuration needs a 48 GiB card at 12B and a 96 GiB card at 31B**: 12B sits at 32.2 GiB before it serves anything, so a 32 GiB device cannot start it, and 31B sits at 83.1 GiB on one GH200 with the folded global pool — smaller envelopes are a matter of the slots and ceiling knobs below, and the 31B recipe has its own section. A row's output moves with the bucket widths it decodes at, but not with what its companions contain. An opt-in conversation prefix cache (`PEGAINFER_PREFIX_CACHE=K`) resumes multi-turn prompts at the cost of a pre-allocated page budget, and an opt-in overlap lane (`PEGAINFER_ASYNC_PREFILL=green:NN`) trades prefill latency for decode-tail protection under long-prompt admissions. An opt-in chunked walk (`PEGAINFER_MIX_CHUNK_TOKENS=N`) bounds how many prompt rows a mixed admission computes per scheduler step, so live streams advance per committed segment instead of waiting out whole prompts, and a raised ceiling (`PEGAINFER_MAX_CONTEXT`, with `PEGAINFER_DECODE_SLOTS` trading concurrency for context) serves long-context workloads on the same card. Dense and routed checkpoints use the same startup-precaptured decode graphs.
+
+Last touched: 2026-09
+
+## What a step is
+
+The contract-owned driver polls `Gemma4Scheduler::step`. Each turn admits whatever the pools can hold, up to the slot ceiling. With streams in flight, admissions share one mixed step with them — the prompts' rows sit in the step's row prefix, each as its own segment, while every active request advances its token in the suffix; a prompt that arrives with nothing active prefills alone as its own step. Up to four coincident prompts gather into the same step; a follower joins only while the gathered unseen rows stay under 512 (a warm resume is priced at its suffix), the leader itself is never bounded — a long prompt still shares the mixed step with the live batch, just without followers — and the chunked walk bypasses the follower budget, pricing rows per chunked step instead. Every popped candidate — gathered, rejected or cancelled — consumes the turn's shared admission budget: gathering amortizes only the step floor while every live stream's inter-token gap pays the whole gathered step, so short bursts fold their admission staircase (floor and per-row figures are 12B measurements recorded in the benchmark notes). With the opt-in overlap lane enabled (below), an admission into a live batch prefills asynchronously on its own stream instead of sharing the mixed step. Between admissions, every active request advances exactly one token in a single batched decode step that shares the weight pass. A request that arrives while all slots are taken waits at the head of the queue. It is refused only when nothing is active — when there is no other request whose pages could free up, the pools genuinely cannot hold it and saying so is the honest answer.
+
+`submit` only queues a `QueuedRequest`; admission and every verdict happen inside `step`. The scheduler writes `Scheduled`, cached-token counts, tokens and terminals to `RequestLedger`, and the driver commits those writes as one `StepOutputs` message after the step. Frontend aborts are flags: the next scheduler touch retires the ledger account silently and frees its KV, because the frontend has already discarded that request. Request validation and an individual chunk-tail failure reject or fail only that request; a decode, mixed-step, lane launch/join or other execution failure that leaves the executor unusable returns `Err`, after which the driver fails every open ledger account and exits.
+
+Rows retire independently. Requests in one batch have their own frontiers, their own page tables and, for the sliding family, their own released window front, so a short request finishing does not disturb the rows that continue.
+
+| Knob | Value | Where it binds |
+| --- | --- | --- |
+| Decode slots | 16 | requests beyond this queue |
+| Context ceiling | 8192 tokens | prompt + `max_tokens`, enforced at admission and reported to the frontend as the servable length |
+| Page size | 16 tokens | both families |
+| Sliding window | 1024 tokens | the local family releases its front past this; the global family never releases |
+
+The scheduler publishes load metrics after every step. `num_running_reqs` is active decode rows plus non-failed chunk walkers plus one when the async lane has an in-flight prefill; the lane and walkers must remain visible so frontend shutdown cannot mistake ongoing prefill for a drained engine. `num_waiting_reqs` is the pending submission queue. `kv_used_blocks` and `kv_total_blocks` sum used and total pages across both the local and global pools. Gemma 4 has no speculative decoder, so `spec_decode` is `None`.
+
+## The routed expert schedule
+
+The 26B routed path fixes whole-column K stripes in Gemma's Marlin template instantiations. One CTA reduces an output element in one order, so identical target rows produce identical bytes regardless of grid partition, scratch layout or companion rows. Kimi keeps the dynamic schedule. This policy changes neither the shared WNA16 launcher, the Gemma Rust wrapper nor the WNA16 C ABI. The lock-serialized fp32 staging path therefore never engages, but `c_tmp` remains allocated because the shared launcher refuses a null staging buffer.
+
+Alignment uses 16-row blocks below a 1024-row step (8192 routed slots) and 64-row blocks from there. Decode buckets top out at 16 rows, so decode never flips to the coarse block. The floor is measured, not chosen: a lone prompt loses first-token time on the coarse block at every length up to 4096 slots and ties at 8192, while the mixed steps a busy server prefills through — one 1024-token prompt beside the live decode rows — gain from it. Both blocks run the same two 128-thread tiles: the 704-wide gate and up projections admit only a 64-wide output tile, which has no correct 256-thread specialization, and a 256-thread tile for the 2816-wide down projection is byte-identical and no faster.
+
+The register router accepts exactly 128 experts and from 1 through 32 picks. A non-finite row fails closed: every emitted index stays valid and row-unique, while every emitted weight is NaN so downstream computation remains loud.
+
+The checkpoint-backed `the_routed_block_matches_the_reference_formulas` gate owns the scratch-capacity, companion-route and coarse-block evidence, including a narrow block replay after a coarse block on one scratch. On shared rows, it proves that the 16-row and 64-row block pick the same experts with the same weight bits and produce the same gate, weighted-down and block bits. `router_topk_matches_the_exact_128_expert_contract` owns the register-router boundary and non-finite rows. The kernels-owned `kimi_marlin_align_boundary_matches_vllm_contract` oracle owns stable counts, offsets, padding and expert-local order on both sides of the alignment dispatch boundary. `scripts/gemma4_gates.sh` owns three scopes and holds each ignored set against its manifest by exact name: the Gemma crate's library and integration gates, the kernels crate's Gemma contracts (router, suppression, the norm parities and the hd256 fp8 pool suite, all device-only under the `gemma4` feature), and the frontend crate's chat-render parity gate; the Kimi alignment oracle needs the `kimi-k2` feature and an `sm_90` device and is run by hand.
+
+## The decode pipeline
+
+Greedy decode rounds run a depth-two software pipeline on the base stream: a step's argmax writes its picks straight into the id buffer the next step's embedding reads, its readback lands in one of two pinned slots, and the emitted token stream lags compute by one step. The production invariant is that token ids, finish reasons and token counts are identical to collecting every step at the same batch composition, and that the kernels inside a step and their order do not change.
+
+A batch is eligible only when every row is greedy, scores no logprobs, sits at least two tokens from its length cap and is not already stopping. While a successor step is in flight the active row order is pinned: the successor's ids were written on the device for the current order, so no row may be retired, reordered or added until that step is collected. A stop found late marks the row stopping and it retires when the pipeline drains. The pipeline drains before a synchronous or mixed admission that will use the step arena or change the roster, a lane join, a cancelled row, or a batch that stopped being eligible. An admission that turns out not viable — a closed or invalid request, a page-shortage requeue, or a failed Scheduled send — and an async lane launch keep it; the lane join drains. A solo admission into an idle engine has nothing to drain but must drop the fingerprint the retired roster left, since it starts a new roster with new page identities. The collect-every-step path takes over after a drain.
+
+A regular decode step, every row one token further with its page, chunk and split structure untouched, also skips its metadata rebuild and every upload: a kernel captured at the decode graph's tail advances the per-row tables in place, and a fingerprint of the previous step proves the advanced device state is what a full upload would write. Mixed steps, page turns, chunk boundaries, admissions and the precapture warm pass invalidate the fingerprint and rebuild as before.
+
+The staged sampler chain — suppression, argmax and the device copy of the picks — is captured per bucket at startup and launched as one graph beside the decode replay; the pinned readback stays outside so the collector keeps the copy's own event. The staged path runs on the base stream only and refuses a stream override. If a step fails after its device work was enqueued, the engine synchronizes the stream before it drops the batch and returns its pages, and aborts if the device cannot be synchronized, the policy the prefill lane already applies.
+
+## The two pools
+
+Gemma 4 runs two attention families with different KV shapes, so the budget is two budgets. With 16-token pages, `C = ceil(8192/16) = 512` context pages and `W = ceil(1024/16) + 1 = 65` window pages:
+
+```
+local  = C + (slots - 1) * W + 1 = 512 + 15 * 65 + 1 = 1488 pages
+global = slots * C + 1           = 16 * 512 + 1      = 8193 pages
+```
+
+Those are the knob-off defaults. With `PEGAINFER_MIX_CHUNK_TOKENS=N` set no scan holds more than window plus segment, so the local line shrinks to
+
+```
+local  = slots * W + ceil(N / 16) + (MIX_MAX_PROMPTS - 1) + 1 + K * W
+global = slots * C + 1 + K * floor(C / 2)
+```
+
+— at the defaults (16 slots, `N=2048`, no cache) that is 1172 local pages instead of 1488; the global line only restates the default. With the async prefill lane enabled the local line keeps the default full-context transient — the lane prefills whole. Every page count and byte figure below is measured with the knob off unless it says otherwise.
+
+The shapes behind the page: the local family is 40 layers of 8 KV heads at head_dim 256, the global family is 8 layers of 1 KV head at head_dim 512, and a page carries K and V for every layer of its family. That makes a local page 5 MiB and a global page 256 KiB, so at 12B the knob-off pools are **7.27 GiB local and 2.00 GiB global**, on top of 22.18 GiB of resident weights.
+
+The asymmetry is the design: the local family only has to hold one full-context transient — the request currently prefilling, which has not released its front yet — on top of the window-capped steady footprint of everyone else. The global family never releases, so it stays linear in context for each request's whole lifetime, and that is what makes it the larger page count despite the smaller page.
+
+Each pool also reserves one padding page, which is the `+ 1` in both lines. With `PEGAINFER_PREFIX_CACHE=K` set, both lines grow by the cache's own budget — `+ K * W` local and `+ K * floor(C / 2)` global pages — so cached pages never eat the serving reserve.
+
+## What a client has to send
+
+**Prompts must carry `<bos>` themselves.** This checkpoint's `tokenizer.json` has a pass-through post-processor and its `tokenizer_config.json` sets no `add_bos_token`, so nothing in the serving path prepends it — and Gemma 4 without a leading `<bos>` degenerates into punctuation no matter how the step is scheduled:
+
+```
+prompt "The capital of France is"        -> '111.1......11111'
+prompt "<bos>The capital of France is"   -> ' Paris.\nthought\nThat is correct. Paris is …'
+```
+
+The chat template in `chat_template.jinja` opens with `<bos>`, so chat-formatted prompts already carry one; see `models/gemma4/tokenizer.md` for the rest of the template contract.
+
+**Prompt logprobs are served whole.** A request with `prompt_logprobs` prefills its prompt in one pass of its own, beside a live batch as well — it skips the prefix cache, the async lane, the gather and the chunked walk — because only that pass holds every prompt row's final hidden state. Every row goes through the head the sampled token sees (norm, tied lm_head, final logit softcap, suppressed ids), so a replayed continuation scores what its decode logprobs said. Its prompt is capped at 8192 tokens, or at what the sliding pool of an idle server holds when a small slot count and the chunk knob budget it below that; a longer one is refused naming the limit.
+
+Startup also logs one warning that is expected and harmless — the fast tokenizer path rejects this tokenizer's `Replace` normalizer and the server falls back to the Hugging Face tokenizers path:
+
+```
+WARN vllm_tokenizer failed to load tokenizer with fastokens; falling back to HuggingFace tokenizers
+```
+
+## Running it
+
+```bash
+cargo build --release --features gemma4 -p pegainfer-server
+target/release/pegainfer \
+  --model-path <checkpoint> \
+  --served-model-name gemma-4-12b-it \
+  --port 18099
+```
+
+```bash
+curl -s localhost:18099/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"gemma-4-12b-it","prompt":"<bos>The capital of France is",
+       "max_tokens":16,"temperature":0}'
+```
+
+## What it costs to hold a slot
+
+The pools are sized up front for every configured slot (`PEGAINFER_DECODE_SLOTS`, default 16). Measured at the defaults with the chunk knob off on a 49140 MiB card with the default per-bucket CUDA graphs, the process sits at **33034 MiB with no request in flight** and peaked at 33386 MiB under the serving checks below: 22.18 GiB of weights, 9.27 GiB of pools, and the rest CUDA context, RoPE tables, step buffers and the captured graphs. The eager baseline (`--cuda-graph=false`) measured 32926 MiB idle and peaked at 32932 MiB.
+
+That is a hardware floor, not a target. A 32 GiB device cannot start this configuration at all. Serving a single request needs about 2.6 GiB of pool rather than 9.27, so the slot count sets the floor — `PEGAINFER_DECODE_SLOTS` lowers it, and the raised-ceiling section below shows the measured cells.
+
+## The conversation prefix cache (opt-in)
+
+`PEGAINFER_PREFIX_CACHE=K` (unset by default) keeps copies of up to K completed prompt states, so the next turn of a conversation resumes where its history ends instead of prefilling all of it again. Unset, `0` or `off`, nothing is allocated and admission behaves exactly as above — the same spelling of off the chunked walk takes. Any other unparseable or non-UTF-8 value refuses startup instead of silently disabling the cache.
+
+When a request's prefill completes, the engine copies its prompt-state pages — the global family up to the prompt frontier plus the local family's resident window — into cache-owned pages. Only the prompt region is captured: generated tokens do not re-render into the next turn's prompt verbatim, so only the prompt prefix can ever be hit again. At admission the prompt resolves against the cache by longest common prefix, clamped to the sliding-window floor — a resume below the released window front cannot be rebuilt and misses by construction. A hit restores by copying the pages back and prefilling only the unseen suffix, and `Scheduled` reports the resumed count as `cached_tokens`.
+
+The cache brings its own page budget, added to the pool lines above at startup. A prompt longer than half the serving context (4096 tokens today) is not captured — that bound is what keeps the cache's pool share equal to what its entries paid for. A new turn's capture supersedes its conversation's older entry, capacity evicts LRU, and an admission that cannot reserve pages evicts cache entries before waiting.
+
+At `PEGAINFER_PREFIX_CACHE=16` the idle footprint measured **39242 MiB** against the 33034 MiB baseline — the difference is the pre-allocated cache budget.
+
+## The admission coalesce door (opt-in)
+
+`PEGAINFER_ADMIT_COALESCE_MS=N` (`1..=2000`; unset, `off` or `0` admits on sight) holds arrivals that would invade a live decode batch, then releases a window's arrivals as one back-to-back admission burst. It prices the number of admission interruptions, not their size: whole prompts beyond the 512-row gather budget still take separate weight scans unless `PEGAINFER_MIX_CHUNK_TOKENS` enables the chunked walk. An idle engine admits immediately, and a shallow roster skips the door when `(active + pending) * 2 < slots`.
+
+A deep roster releases when the window expires or the pending queue reaches `min(4, slots - active)`, with a floor of one. A full cohort releases before `N`; the timeout release lands no earlier than `N`, at the first intake turn after the window elapses — the driver drains submissions before each scheduler step, so there is no hard bound on how much later. That cohort is a capacity bound over the currently free slots, not a cross-completion batch. The door refuses to combine with `PEGAINFER_ASYNC_PREFILL`, whose single in-flight prefill could only be delayed by it. Measured under sustained load, c16 median TPOT improves about 8.5% for about +288 ms median TTFT; c8 pays about 5.7% throughput and about +19 ms TTFT. P99 ITL is flat to slightly worse everywhere, so the door remains off by default.
+
+## The async prefill lane (opt-in)
+
+When `PEGAINFER_ASYNC_PREFILL` is unset, serving uses the normal mixed-step path; when set, a live-batch admission's prefill moves onto its own stream so decode steps keep replaying while the prompt computes. Dense and routed checkpoints share this path at the default context ceiling. `green:NN` pins the lane to roughly NN% of the SMs via a Green Context — the cap is the mechanism: a `shared` lane's full-width prefill grids starve decode steps, and is kept only for comparison. An unrecognized value or an unviable SM partition refuses to start rather than silently degrading.
+
+One prefill is in flight at most; further arrivals wait while decode keeps stepping, a prompt arriving with nothing active takes the sync path, a restored prefix-cache hit prefills only its unseen suffix, and the sliding window's front release is deferred to the join so no page can be re-allocated under in-flight reads. The frontend driver spins when the whole scheduler is idle. While decode or queued work exists, the scheduler polls the lane without blocking; when the lane's in-flight prefill is the only remaining work, it deliberately drains and joins the lane, parking until that work has a result. A drain failure returns the same engine-fatal `Err` as a launch or join failure.
+
+Measured (a streaming request, then sixteen ~1900-token prompts admitted at once; two runs per arm): the stream's worst inter-token gap under the flood drops from 387-452 ms — one mixed step at that prompt length — to 75-76 ms with `green:35`, p99 385-432 → 39-40 ms, while the flood's own TTFT p50 grows 3.3-3.7 → 9.8-10.3 s and its wall about 2.4×. The quiet stream and idle footprint are unchanged, so an idle lane costs nothing. That trade is the positioning: a high-concurrency, decode-tail-sensitive profile, not a default — at light load the capped lane only costs TTFT.
+
+## The fp8 KV pool (opt-in)
+
+`PEGAINFER_KV_FP8=local` stores the sliding family's K/V as e4m3 at scale 1.0 — the scheme the reference engine defaults to for this checkpoint — halving the local pool's bytes (the global family stays bf16) and the decode step's dominant KV read; at c16 that is worth several percent of throughput, at c1 nothing. Unset serves byte-identically; `local` is the only accepted value. The output is approximate by construction: greedy generation still matches HF token for token on the fixture prompts, but the window-edge waypoint sits below the dual-backend top-1 bar and serving is no longer bit-equal across batch compositions where bf16 was. The prefix cache cannot be combined (its page copies index bf16 elements): an enabled `PEGAINFER_PREFIX_CACHE` refuses before the checkpoint loads, while a disabled one (`unset`, `0`, `off`) is fine. Operators wanting bit-exact serving leave it unset.
+
+## The chunked walk (opt-in)
+
+`PEGAINFER_MIX_CHUNK_TOKENS=N` (64 <= N, below the serving ceiling; unset, `off` or `0` keeps whole-prompt steps; anything else refuses startup) bounds how many prompt rows a mixed admission computes per scheduler step. The effective step rounds down to whole 128-row tiles — GEMM and attention consume full tiles, so an unaligned width pays the whole tile on every full segment — which keeps "at most N rows" true while a width under one tile stays exact. Gathered prompts walk shared segment steps: persistent `Walk` state advances exactly one round per `Scheduler::step`, each round fills one N-row budget across the walkers in admission order, every active stream advances one token per round, and the driver then commits that round's ledger updates. Running the whole walk in one call would withhold every live stream's tokens until the walk ended. A mid-walk segment's sampled row is discarded — no token, no logprob, no stop — until the prompt's final segment produces its first token, emitted at that round's boundary as the walker joins the decode batch. A walker whose client disconnects mid-walk is retired between rounds. The knob owns every scan: a drained roster's tails and a prompt arriving with nothing active walk their own segments too, paying one ~27 ms step floor per segment where a whole scan paid one — the price of holding window plus segment instead of the full prompt. The exceptions are the async prefill lane — a live-batch admission goes to the lane and prefills whole — and a request asking for prompt logprobs, which prefills whole and is capped by the pool (see "What a client has to send"). With the knob set, the gather's 512-row ceiling no longer applies: the per-round budget bounds each step instead.
+
+Pages reserve round by round: a walker holds its window plus the segment it is writing, never its whole prompt, and the sliding pool's budget stops scaling with the ceiling — the global family's whole account is still checked at the door, since it never releases. The trade is granularity, measured at 12B: under a flood of sixteen ~3900-token prompts, `N=2048` cut a live stream's flood-phase p99 gap from 855-975 ms to 497-526 ms; at ~1900-token prompts a round can span two prompts, and the same knob raised that p99 from 432-468 ms to 519-537 ms. Off by default; set it for long-context workloads where prompts run to several segments.
+
+## The raised ceiling (opt-in)
+
+`PEGAINFER_MAX_CONTEXT=N` (1024 <= N <= the checkpoint's `max_position_embeddings`, 262144 at 12B) raises the serving ceiling past the 8192 default. Past the default the chunked walk becomes mandatory — a whole scan would hold the full context in sliding pages, so startup refuses a raise without `PEGAINFER_MIX_CHUNK_TOKENS` — and the async prefill lane is refused alongside a raise for the same reason; at or below 8192 neither restriction applies. `PEGAINFER_DECODE_SLOTS=N` (1..16, default 16) is the other budget axis: the global family never releases, so its pool is slots times the ceiling, and a raise buys context back by giving up decode slots. The startup error names both knobs and the page arithmetic when a budget cannot be allocated.
+
+Measured at 12B on a 48 GiB card (idle resident, then behaviour): 64K x 16 slots sits at 46.0 GiB with the default short-load throughput intact (c8 ~148 tok/s); 128K x 8 at 43.5 GiB, same throughput; 262K x 4 at 42.6 GiB. At the full ceiling a 49K-token prompt streams its first token in ~13 s and a 204K-token prompt in ~125 s — prefill cost is ~0.21 ms per token plus a quadratic global-attention term that reaches parity with the linear term around 200K. Decode at depth stays healthy: the inter-token median rises from 28.9 ms over a 13K history to 34.9 ms over 200K. Chunk granularity trades a live stream's stall against nothing at this scale — segment cost dominates the step floor, so halving the segment halves the stream's flood-phase p99 (2613-2673 ms at 8192 down to 381-403 ms at 1024, two coincident ~49K prompts) while admission latency stays flat down to 1024; at 512 the step floor finally surfaces (stall 214-224 ms, admission and wall about 13% dearer). `N=1024` is the recommended long-context profile, `512` the tail-protective option — the knob itself still defaults off. Protocols: the latency table is single streamed completions at `temperature 0` with 64 output tokens under `PEGAINFER_MAX_CONTEXT=262144 PEGAINFER_MIX_CHUNK_TOKENS=2048 PEGAINFER_DECODE_SLOTS=2`; the envelope cells swap in their own ceiling and slots, read idle from `nvidia-smi` after graph capture and add eight concurrent short prompts for the throughput column; the granularity sweep holds the 262144 x 2 configuration, varies only the chunk knob as tabled, and measures a live stream with two coincident ~49K prompts, two runs per setting.
+
+## Measured behaviour
+
+Single GPU (sm_89, x86_64), CUDA 12.9, 12B checkpoint, greedy (`temperature 0`):
+
+| What | Result |
+| --- | --- |
+| Eight distinct prompts as one batch | every row carried its own request's continuation; none carried another's |
+| Eight rows asking for 4…32 tokens | each returned its own count, no row disturbed by another retiring |
+| 17 concurrent requests | all completed; the ones past the slot ceiling queued rather than failing |
+| One stream cancelled mid-generation | the other three finished normally |
+| Four concurrent requests at 1761 prompt tokens, 200 output | all completed across the 1024-token window |
+
+Throughput is eight prompts of 5 to 14 tokens at `max_tokens 24`, `temperature 0`, one run each, measured client-side as completion tokens over the wall time of the whole set: **31.8 tok/s** sending them one after another, **181.4 tok/s** sending them together. It is a fixed request set, not a sustained-load benchmark.
+
+## What concurrency does and does not change
+
+A row decoding in a batch does not produce the same logprobs as the same row decoding alone. That is worth separating from the thing it resembles — a row reading another row's pages — because only one of the two is benign. The variable that matters is the **bucket-width trajectory**: the sequence of padded bucket widths a row's decode steps actually compute at, which depends on when its companions become active and when they retire. Bucketing quantizes it — batch sizes that share a power-of-two bucket share their arithmetic — so fewer distinct trajectories exist than under exact widths. (The table below was measured at exact widths on the eager build that predates bucketing.)
+
+| Contrast | Trajectory | Row's tokens | max abs delta logprob |
+| --- | --- | --- | --- |
+| One batch repeated three times | same | identical | 0.000000 |
+| Companions replaced, same lengths, different content | same | identical | 0.000000 |
+| Companions replaced, lengths from 2 to 1601 tokens | same | identical | 0.000000 |
+| Seven short companions against seven long ones | changed | differ | 0.595163 |
+| Alone against in a batch of eight | changed | differ | 0.623022 |
+
+Hold the trajectory fixed and replace what the other rows are — their content, their prompt lengths — and the row is bit-identical, so **no companion row contaminates it**. Change when companions arrive or retire and the row moves, because the kernels pick shapes and reduction orders by batch size. (That a row reads the *right* positions and page rows in the first place is a separate question, gated by the preps' closed-form tests rather than by this comparison.)
+
+Decode steps compute at power-of-two batch buckets — a batch pads to its bucket with rows that write the pools' reserved padding pages — and dense and routed checkpoints replay per-bucket CUDA graphs captured at startup (`--cuda-graph=false` is the eager escape hatch; padding applies either way, so the two modes are the same arithmetic). Bucketing also quantizes the width trajectory: batch sizes that share a bucket share their arithmetic.
+
+The consequence for callers: **greedy output is reproducible for a given workload on an otherwise idle device, not across workloads.** Replaying the same requests the same way returns the same tokens; sending them alongside different traffic changes the widths they decode at and can flip a near-tie. Another process on the same GPU does this too, by moving when each prompt's prefill lands relative to the decodes around it.
+
+## The 31B checkpoint on one GH200
+
+`google/gemma-4-31B-it` served bf16 at tensor parallel 1 is the line's largest dense configuration: 60 layers (50 sliding at head_dim 256 over 16 KV heads, 10 global at head_dim 512 over 4 KV heads), hidden 5376, the 262144-entry vocabulary. The recipe is the 12B one with the knob that picks the generated kernels, and every number below was measured on one GH200 (97,871 MiB), driver 565.57, with the snapshot in `docs/benchmarks/gemma4-31b-gh200.md` holding the vLLM comparison, the concurrency cells and the regression thresholds.
+
+```bash
+PEGAINFER_TILELANG_PYTHON=<python-with-tilelang> \
+  cargo build --release --features gemma4 -p pegainfer-server
+PEGAINFER_GLOBAL_ATTN=tilelang640 target/release/pegainfer \
+  --model-path <gemma-4-31B-it> --served-model-name gemma-4-31b --port 18099
+```
+
+`PEGAINFER_GLOBAL_ATTN=tilelang640` is the recommended state at this size: the generated kernels on a folded 640-column global pool, which lead vLLM's FlashAttention path on every single-request cell from 10K to 163K tokens and hold 3.75 GiB less pool than the split one at the default point. Unset, the byte-identical incumbent path serves, 8 .. 35% behind vLLM at the same cells; it is the numerical reference, not the fast path. The generated states need the build above; without the TileLang Python the build carries a stub and a generated state refuses to start and says so.
+
+**The envelope, measured.** Idle is what the process holds after the boot settles with no request in flight; the request column is one prompt of the ceiling's length less 256, with 256 output tokens.
+
+| ceiling | slots | `PEGAINFER_MIX_CHUNK_TOKENS` | idle MiB | one request at the ceiling: TTFT / TPOT | peak MiB |
+| --- | ---: | ---: | ---: | --- | ---: |
+| 8192 (default) | 16 | off | 85,127 | 0.97 s / 19.6 ms | 87,431 |
+| 32768 | 8 | 2048 | 80,995 | 4.8 s / 20.1 ms | 81,571 |
+| 65536 | 4 | 2048 | 77,665 | 11.7 s / 20.7 ms | 78,273 |
+| 262144 | 1 | 2048 | 75,677 | 92.7 s / 24.2 ms | 76,285 |
+
+The weights are 57.19 GiB on the device; the global pool is slots × ceiling rows at 640 columns per head (6.25 GiB at the default point, 12.50 at each raised one), and the sliding pool is sized by the window and the chunk, which is why a raised ceiling with fewer slots holds less resident than the default point. A whole-prompt step at the default point costs 2.3 GiB of transient scratch above idle; under the chunked walk the transient is the chunk's and the peak sits 0.6 GiB above idle at every raised ceiling. The default state (`PEGAINFER_GLOBAL_ATTN` unset) at the default point idles at 88,967 MiB with a 10.00 GiB split pool.
+
+**Concurrency at the default point** (random 1024-token prompts, 256 output tokens, greedy; the full cells against vLLM are in the snapshot): every request completes with its full output at 1, 2, 4, 8 and 16 in flight and at 1, 2 and 4 requests per second; at four in flight 178 output tokens per second at 21.3 ms per token, at sixteen 496 at 29.4 ms, and a prompt is admitted in 0.58 s p50 with sixteen slots busy. The wide-batch decode step is the open item at this size: 4 .. 5% faster than vLLM's at one row, 8 .. 10% slower at eight and sixteen, with the same throughput and end-to-end latency either way.
+
+**The QAT W4A16 checkpoint.** `google/gemma-4-31B-it-qat-w4a16-ct` (compressed-tensors, int4 symmetric, group 32 over every text linear) serves from the same build: its weights stay 4-bit on the device (18.66 GiB), steps of up to 16 rows run TileLang W4A16 GEMMs, and wider steps dequantize each linear to bf16 for the dense GEMM. The GEMMs are compiled for one SM count: the build takes it from the visible device or from `PEGAINFER_GEMMA4_W4A16_SMS`, and without either it links the stub tier and the checkpoint is refused at load. The same load refuses a device with a different SM count. `PEGAINFER_ASYNC_PREFILL` refuses a W4A16 checkpoint, since those GEMMs need every CTA resident on the whole device. With `PEGAINFER_GLOBAL_ATTN=tilelang`, against vLLM serving the same checkpoint through Marlin on the same GH200: 1.07x output throughput at one request (9.71 against 10.36 ms per token), 1.05x at eight and sixteen with a quarter of the first-token latency, while vLLM holds the lower per-token time there by chunking prefill into its decode steps.
+
+**What this line does not serve at 31B, and how it says so.** The NVFP4 export (`nvidia/Gemma-4-31B-IT-NVFP4`, whose dense MLPs are NVFP4) is not served: only the bf16 and W4A16 tensor sets are in the manifest, and a checkpoint whose tensors do not match it stops at the loader's manifest check, which names every mismatching tensor (`a_disagreeing_config_names_every_faulty_tensor` in the gate suite, run against this checkpoint). Tensor parallelism is offered for the dense sizes: `--tp-size=P` runs one rank per device with the sharded text tower and a per-rank KV, and `P` must satisfy the world-size rule in [`tp.md`](tp.md). Under TP the async lane, the generated global-attention state, the prefix cache **and the chunked walk are all refused at start-up** — so the `PEGAINFER_MIX_CHUNK_TOKENS` knob documented above is a single-rank feature. A routed (MoE) checkpoint and a W4A16 one are refused by the sharding validator rather than by the knob checks. A raised ceiling without the chunk knob, the async lane beside a raise, fp8 sliding KV beside the prefix cache, and a generated state on a build without the kernels all refuse at start-up with the message the 12B sections above describe. A prompt at or past the ceiling is refused by the frontend with HTTP 400 naming the ceiling and the prompt length (measured: 9001 and 8192 tokens at the default point both refused, the next request served); `max_tokens` past what the ceiling leaves is clamped to it, as vLLM's frontend does (a 3-token prompt asking for 8192 got 8189), and the engine's own admission check, prompt plus output within the ceiling, stands behind that.
+
+**Hardware matrix.**
+
+| card | 12B bf16 | 26B-A4B NVFP4 | 31B bf16 |
+| --- | --- | --- | --- |
+| 32 GiB | no (32.2 GiB idle at the default point) | no | no |
+| 48 GiB (sm_89) | yes, the default point and the raised ceilings above | yes | no (57 GiB of weights) |
+| 96 GiB GH200 (sm_90) | yes | yes | yes, this section; the 262144 ceiling at one slot |
+
+## Limits today
+
+- **An admission rides the live decode batch instead of freezing it.** With streams in flight, newcomers' prompts share one eager step with the decode batch: the prompt rows sit in the row prefix as segments, every active stream advances its token in the suffix, and one sampler call covers every newcomer's first token and every active row. Measured with a streaming request underneath a flood of one-token requests: its inter-token gap stays at about 30 ms — one mixed step — whether 16, 48 or 96 requests are queued, where the frozen-prefill scheduling this replaced measured about 500 ms at the same depths. A burst of sixteen coincident ~120-token prompts folds its admission staircase — TTFT p50 and p99 both drop 20-30% — while the stream's worst gap stays bounded by the gathered step's own cost (~130 ms at the 512-row ceiling); a 16 × ~1900-token flood is untouched, since a long prompt keeps its own step. Admission work per turn stays bounded by the slot ceiling, gathered or not.
+- **Whole-prompt prefill by default.** A prompt runs whole in one step unless the opt-in chunked walk above bounds the step's prompt rows; with the knob set a walker reserves pages round by round instead of holding its whole prompt.
+- **No cross-request prefix sharing.** Two live requests with a common prefix pay for it twice; the opt-in conversation cache above serves consecutive turns of one conversation, not concurrent requests.
+- **TP for the dense sizes, one rank per device.** The budget above is per rank: at 31B the default point does not quite fit a 48 GiB card even at TP2 — 29.91 GiB of weights plus 14.38 GiB of pools is 44.29 GiB, and the ~0.90 GiB of context, arena and workspace on top puts it just over the 44.99 GiB an L20 leaves usable — so TP2 serving needs a reduced envelope, and the measured point is an 8192-token ceiling at 8 decode slots (57 ms first token, 49.4 ms per step, 143 tok/s at 8 concurrent, on two L20s). See [`tp.md`](tp.md) and `docs/benchmarks/gemma4-31b-tp2-l20.md`.
+- **Token capacity is not reported as `EngineInfo::kv_capacity`**: the engine leaves the token-fit hint empty because the two independent page families cannot be represented by one token count. Runtime load metrics still report the sum of used and total local/global pages.

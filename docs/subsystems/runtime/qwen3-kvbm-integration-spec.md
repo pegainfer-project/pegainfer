@@ -124,9 +124,9 @@ pub struct KvBuffer {
 
 ## 详细改动清单
 
-### 1. openinfer-core: 改造 KvPool → KvBuffer
+### 1. pegainfer-core: 改造 KvPool → KvBuffer
 
-**文件**: `openinfer-core/src/kv_pool.rs` → 重命名为 `kv_buffer.rs`
+**文件**: `pegainfer-core/src/kv_pool.rs` → 重命名为 `kv_buffer.rs`
 
 - 删除 `PagePool` 依赖，删除 `KvState`
 - `KvPool::new()` → `KvBuffer::new()`: 分配 `num_blocks × page_stride` 的 GPU buffer
@@ -134,11 +134,11 @@ pub struct KvBuffer {
 - 新增 `KvBuffer::padding_block_id()` → 返回 block 0（约定 block 0 是 padding）
 - `KvDesc` 不变：仍然接收 `&[i32]` page indices + seq_len
 
-**文件**: `openinfer-core/Cargo.toml`
+**文件**: `pegainfer-core/Cargo.toml`
 
 - 添加 `kvbm-logical = { workspace = true }`
 
-### 2. openinfer-qwen3/src/executor.rs: SequenceStore 替换 RequestStateStore
+### 2. pegainfer-qwen3/src/executor.rs: SequenceStore 替换 RequestStateStore
 
 **删除**:
 - `RequestStateStore`
@@ -185,7 +185,7 @@ fn build_kv_desc<'a>(
 - `alloc_kv()` → 在 `SchedulableSequence::new()` 时创建
 - `drop_request()` → `seq.release()` + remove from SequenceStore
 
-### 3. openinfer-qwen3/src/scheduler.rs: Admission 改用 BlockManager
+### 3. pegainfer-qwen3/src/scheduler.rs: Admission 改用 BlockManager
 
 **删除**:
 - `pages_needed()`, `max_request_tokens()`, `max_active_tokens()`, `current_active_tokens()`, `active_future_pages()`
@@ -307,12 +307,12 @@ let padding_immutable = block_manager.register_block(
 
 ## 接入顺序
 
-1. **openinfer-core**: 改造 `kv_pool.rs` → `kv_buffer.rs`（保留 `KvLayout`、`KvDesc`，删 `PagePool` 依赖）。保留旧 `kv_pool.rs` 不删，Qwen3.5 等其他模型仍用旧路径。
-2. **openinfer-qwen3/executor.rs**: `RequestStateStore` → `SequenceStore`，引入 `BlockManager`。
-3. **openinfer-qwen3/scheduler.rs**: Admission 改为 block 计数。
-4. **openinfer-qwen3/{prefill,batch_decode,unified_forward}.rs**: Forward path 适配 `SchedulableSequence` + `KvDesc` from block IDs。
-5. **openinfer-qwen3/batch_decode_buffers.rs**: `sync_paged_meta` 接口改造。
-6. **E2E 测试验证**: `cargo test --release -p openinfer-qwen3 --test e2e`
+1. **pegainfer-core**: 改造 `kv_pool.rs` → `kv_buffer.rs`（保留 `KvLayout`、`KvDesc`，删 `PagePool` 依赖）。保留旧 `kv_pool.rs` 不删，Qwen3.5 等其他模型仍用旧路径。
+2. **pegainfer-qwen3/executor.rs**: `RequestStateStore` → `SequenceStore`，引入 `BlockManager`。
+3. **pegainfer-qwen3/scheduler.rs**: Admission 改为 block 计数。
+4. **pegainfer-qwen3/{prefill,batch_decode,unified_forward}.rs**: Forward path 适配 `SchedulableSequence` + `KvDesc` from block IDs。
+5. **pegainfer-qwen3/batch_decode_buffers.rs**: `sync_paged_meta` 接口改造。
+6. **E2E 测试验证**: `cargo test --release -p pegainfer-qwen3 --test e2e`
 7. **TPOT 回归测试**: bench 跑一遍确认无退化。
 
 每一步编译通过 + 已有 UT 通过后再进入下一步。
@@ -322,7 +322,7 @@ let padding_immutable = block_manager.register_block(
 ## 验收标准
 
 - [ ] `cargo check --workspace` 通过
-- [ ] `cargo test --release -p openinfer-qwen3 --test e2e` 全绿
+- [ ] `cargo test --release -p pegainfer-qwen3 --test e2e` 全绿
 - [ ] `cargo test --release -p kvbm-logical --lib` 全绿（port 没被改坏）
 - [ ] 其他模型 crate 不受影响（仍然用 `KvPool`）
 - [ ] 单请求 TPOT bench ±3% 以内

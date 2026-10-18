@@ -1,5 +1,5 @@
 """
-GSM8K evaluation for thinking models (Qwen3.5) via openinfer /v1/completions API.
+GSM8K evaluation for thinking models (Qwen3.5) via pegainfer /v1/completions API.
 
 lm-eval's local-completions backend applies stop sequences during generation,
 which causes "Question:" inside <think> blocks to prematurely truncate output.

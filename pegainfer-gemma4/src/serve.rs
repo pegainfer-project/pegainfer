@@ -1,0 +1,3141 @@
+//! KV-backed serving forward over two KV families: prefill, decode, and the
+//! mixed step that carries both.
+//!
+//! The layer forwards take the step's plans and prep metadata and the
+//! pools this module owns, never a request's state. Both coordinate systems
+//! (absolute positions for RoPE, cache-relative slots for the paged
+//! scatter) coincide below the
+//! sliding window; past it the local family releases its front, and
+//! `origin_pages` is what converts between the two.
+//!
+//! Batched decode reads the global family through a split-KV decode entry
+//! and the local family through the windowed prefill entry at seq_len 1, or,
+//! with the generated kernels on a bf16 pool, through their windowed
+//! split-KV decode. Attention reads are read-only (the prep kernels own the
+//! pool writes) with sm_scale 1.0 — Gemma 4 runs unscaled attention.
+
+use anyhow::Context as AnyhowContext;
+use anyhow::Result;
+use cudarc::driver::CudaSlice;
+use half::bf16;
+use pegainfer_core::cuda_graph::CudaGraphState;
+use pegainfer_core::kv_pool::KvFormat;
+use pegainfer_core::kv_pool::KvPool;
+use pegainfer_core::kv_pool::KvStorage;
+use pegainfer_core::ops;
+use pegainfer_core::ops::PrefillPagedPlan;
+use pegainfer_core::rope::RopeTableSpec;
+use pegainfer_core::tensor::Columns;
+use pegainfer_core::tensor::DeviceContext;
+use pegainfer_core::tensor::DeviceVec;
+use pegainfer_core::tensor::HiddenStates;
+
+use crate::config::LayerKind;
+use crate::forward::embed_scale_bf16;
+use crate::forward::logits_tail;
+use crate::forward::logits_tail_into;
+use crate::forward::validate_tokens;
+use crate::kv::GLOBAL_PAGE_SIZE;
+use crate::kv::GemmaKv;
+use crate::kv::LOCAL_PAGE_SIZE;
+use crate::kv::RankKv;
+use crate::kv::SlidingLocalKv;
+use crate::kv::admit_tokens;
+use crate::layer::EpilogueScratch;
+use crate::layer::LayerGeometry;
+use crate::layer::TpComm;
+use crate::layer::attention_epilogue_into;
+use crate::layer::build_proportional_rope_tables;
+use crate::weights::Gemma4Layer;
+use crate::weights::Gemma4Weights;
+use crate::weights::Linear;
+use crate::weights::LinearScratch;
+
+/// How a step feeds the preps. The tower above them is the same either way;
+/// only the metadata a prep reads changes.
+#[derive(Clone, Copy)]
+enum PrepRef<'a> {
+    Single {
+        start_pos: usize,
+        /// Absolute page the local resident row starts at. The preps shift
+        /// only the row index by it; RoPE stays on absolute positions.
+        local_page_origin: usize,
+        global_plan: &'a PrefillPagedPlan,
+    },
+    /// One row per request. Each row's local page window rides the local
+    /// plan; the global family's window and positions live in the step's
+    /// uploaded tables. What neither carries is the sliding family's
+    /// released front, one page index per row.
+    Batched {
+        local_origins: &'a CudaSlice<i32>,
+        global_tables: &'a GlobalTables,
+    },
+    /// A mixed step's rows: the admitted prompts occupy the row prefix as
+    /// segments and the live decode batch the suffix. One per-token prep
+    /// launch per family covers every row through the step's [`MixRows`]
+    /// tables; for attention, the local plan the caller passes is the
+    /// ragged one covering every row, and the global family reads its
+    /// prefix through `global_prefill_plan` and its suffix through the
+    /// step tables.
+    Mixed {
+        prefill_len: usize,
+        mix_positions: &'a CudaSlice<i32>,
+        mix_local_pages: &'a CudaSlice<i32>,
+        mix_local_origins: &'a CudaSlice<i32>,
+        mix_global_pages: &'a CudaSlice<i32>,
+        mix_global_origins: &'a CudaSlice<i32>,
+        mix_indptr: &'a CudaSlice<i32>,
+        global_tables: &'a GlobalTables,
+        global_prefill_plan: &'a PrefillPagedPlan,
+    },
+}
+
+/// One prompt segment's slice of a mixed step's stacked rows. Positions,
+/// pages and origins ride the per-row [`MixRows`] arrays; the segment
+/// keeps only what the head gather needs — where its rows sit and how
+/// many there are.
+struct MixSeg {
+    row_offset: usize,
+    rows: usize,
+}
+
+/// Host metadata shared by pure-decode and mixed-step decode rows.
+struct DecodeRow {
+    position: usize,
+    local_last: usize,
+    local_start: usize,
+    local_origin: usize,
+    global_last: usize,
+}
+
+/// Per-row prep metadata for the unified per-token prep launches: each
+/// row's absolute position and, per family, the single page holding it
+/// with that page's index as the row's window origin — so the kernels'
+/// `pos / page_size - origin` lands on slot 0 of a one-page window. One
+/// launch per family then covers prefill and decode rows uniformly,
+/// whatever the step's segment split.
+struct MixRows {
+    local_ps: usize,
+    global_ps: usize,
+    positions: Vec<i32>,
+    local_pages: Vec<i32>,
+    local_origins: Vec<i32>,
+    global_pages: Vec<i32>,
+    global_origins: Vec<i32>,
+}
+
+impl MixRows {
+    fn new(local_ps: usize, global_ps: usize) -> Self {
+        Self {
+            local_ps,
+            global_ps,
+            positions: Vec::new(),
+            local_pages: Vec::new(),
+            local_origins: Vec::new(),
+            global_pages: Vec::new(),
+            global_origins: Vec::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        pos: usize,
+        local_window: &[i32],
+        local_origin_pages: usize,
+        global_table: &[i32],
+    ) -> Result<()> {
+        let local_slot = pos / self.local_ps - local_origin_pages;
+        let global_slot = pos / self.global_ps;
+        self.positions
+            .push(i32::try_from(pos).context("mix position fits i32")?);
+        self.local_pages.push(
+            *local_window
+                .get(local_slot)
+                .with_context(|| format!("row pos {pos} outside its local window"))?,
+        );
+        self.local_origins
+            .push(i32::try_from(pos / self.local_ps).context("mix local origin fits i32")?);
+        self.global_pages.push(
+            *global_table
+                .get(global_slot)
+                .with_context(|| format!("row pos {pos} outside its global table"))?,
+        );
+        self.global_origins
+            .push(i32::try_from(global_slot).context("mix global origin fits i32")?);
+        Ok(())
+    }
+
+    fn reset(&mut self, rows: usize) {
+        for values in [
+            &mut self.positions,
+            &mut self.local_pages,
+            &mut self.local_origins,
+            &mut self.global_pages,
+            &mut self.global_origins,
+        ] {
+            values.clear();
+            values.reserve(rows);
+        }
+    }
+}
+
+struct HostPlanningScratch {
+    local_rows: Vec<Vec<i32>>,
+    local_last: Vec<usize>,
+    local_start: Vec<usize>,
+    seq_lens: Vec<usize>,
+    global_rows: Vec<Vec<i32>>,
+    global_last: Vec<usize>,
+    global_start: Vec<usize>,
+    local_origins: Vec<i32>,
+    global_pages_cat: Vec<i32>,
+    global_indptr: Vec<i32>,
+    positions: Vec<i32>,
+    pseudo_pages: Vec<i32>,
+    pseudo_indptr: Vec<i32>,
+    pseudo_last: Vec<i32>,
+    pseudo_kv_lens: Vec<usize>,
+    local_kv_lens: Vec<usize>,
+    ones: Vec<usize>,
+    prefill_global_rows: Vec<Vec<i32>>,
+    prefill_global_last: Vec<usize>,
+    prefill_global_start: Vec<usize>,
+    segs: Vec<MixSeg>,
+    mix_rows: MixRows,
+    ids: Vec<u32>,
+}
+
+impl HostPlanningScratch {
+    fn new(local_ps: usize, global_ps: usize) -> Self {
+        Self {
+            local_rows: Vec::new(),
+            local_last: Vec::new(),
+            local_start: Vec::new(),
+            seq_lens: Vec::new(),
+            global_rows: Vec::new(),
+            global_last: Vec::new(),
+            global_start: Vec::new(),
+            local_origins: Vec::new(),
+            global_pages_cat: Vec::new(),
+            global_indptr: Vec::new(),
+            positions: Vec::new(),
+            pseudo_pages: Vec::new(),
+            pseudo_indptr: Vec::new(),
+            pseudo_last: Vec::new(),
+            pseudo_kv_lens: Vec::new(),
+            local_kv_lens: Vec::new(),
+            ones: Vec::new(),
+            prefill_global_rows: Vec::new(),
+            prefill_global_last: Vec::new(),
+            prefill_global_start: Vec::new(),
+            segs: Vec::new(),
+            mix_rows: MixRows::new(local_ps, global_ps),
+            ids: Vec::new(),
+        }
+    }
+
+    fn reset_decode(&mut self, rows: usize) {
+        reuse_rows(&mut self.local_rows, rows);
+        reuse_rows(&mut self.global_rows, rows);
+        self.local_last.clear();
+        self.local_start.clear();
+        self.global_last.clear();
+        self.global_start.clear();
+        self.local_origins.clear();
+        self.global_pages_cat.clear();
+        self.positions.clear();
+        self.pseudo_pages.clear();
+        self.pseudo_last.clear();
+        self.pseudo_kv_lens.clear();
+        self.local_kv_lens.clear();
+        self.ids.clear();
+        self.ones.clear();
+        self.ones.resize(rows, 1);
+        reset_indptr(&mut self.global_indptr);
+        reset_indptr(&mut self.pseudo_indptr);
+    }
+
+    fn reset_mixed(&mut self, prompts: usize, batch: usize, rows: usize) {
+        reuse_rows(&mut self.local_rows, prompts + batch);
+        reuse_rows(&mut self.global_rows, batch);
+        reuse_rows(&mut self.prefill_global_rows, prompts);
+        self.local_last.clear();
+        self.local_start.clear();
+        self.seq_lens.clear();
+        self.global_last.clear();
+        self.prefill_global_last.clear();
+        self.prefill_global_start.clear();
+        self.pseudo_pages.clear();
+        self.pseudo_last.clear();
+        self.pseudo_kv_lens.clear();
+        self.segs.clear();
+        self.ids.clear();
+        reset_indptr(&mut self.pseudo_indptr);
+        self.mix_rows.reset(rows);
+    }
+}
+
+fn reuse_rows(rows: &mut Vec<Vec<i32>>, needed: usize) {
+    let retained = needed.max(rows.len());
+    rows.resize_with(retained, Vec::new);
+    for row in rows.iter_mut().take(needed) {
+        row.clear();
+    }
+}
+
+fn reset_indptr(indptr: &mut Vec<i32>) {
+    indptr.clear();
+    indptr.push(0);
+}
+
+struct GemmaStepPlan {
+    start_pos: usize,
+    local_page_origin: usize,
+    local_plan: PrefillPagedPlan,
+    global_plan: PrefillPagedPlan,
+}
+
+fn upload_prefix<T: cudarc::driver::DeviceRepr>(
+    ctx: &DeviceContext,
+    slot: &mut CudaSlice<T>,
+    values: &[T],
+) -> Result<()> {
+    anyhow::ensure!(
+        values.len() <= slot.len(),
+        "step metadata of {} entries overruns its {} entry slot",
+        values.len(),
+        slot.len()
+    );
+    let mut view = slot.slice_mut(..values.len());
+    ctx.stream
+        .memcpy_htod(values, &mut view)
+        .map_err(|err| anyhow::anyhow!("step metadata H2D failed: {err}"))
+}
+
+/// Enqueue device-to-device copies of whole pool pages (`src[i] -> dst[i]`)
+/// on `ctx.stream`. A page is one contiguous `page_stride`-element span;
+/// source and destination live in the same buffer, which is why this
+/// reaches for the raw driver copy instead of cudarc's safe API.
+fn copy_pool_pages(
+    ctx: &DeviceContext,
+    buffer: &CudaSlice<bf16>,
+    layout: &pegainfer_core::kv_pool::KvLayout,
+    src: &[i32],
+    dst: &[i32],
+) -> Result<()> {
+    use cudarc::driver::DevicePtr;
+    // Page copies index bf16 elements, so only a bf16 pool may reach them.
+    anyhow::ensure!(
+        layout.storage == KvStorage::Bf16,
+        "pool page copies index bf16 elements; the fp8 pool must not reach them"
+    );
+    anyhow::ensure!(
+        src.len() == dst.len(),
+        "page copy list mismatch: {} src vs {} dst",
+        src.len(),
+        dst.len()
+    );
+    let page_bytes = layout.page_stride * std::mem::size_of::<bf16>();
+    let (base, _guard) = buffer.device_ptr(&ctx.stream);
+    for (&s, &d) in src.iter().zip(dst) {
+        let src_ptr = base + s as u64 * page_bytes as u64;
+        let dst_ptr = base + d as u64 * page_bytes as u64;
+        let rc = unsafe {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                dst_ptr,
+                src_ptr,
+                page_bytes,
+                ctx.stream.cu_stream(),
+            )
+        };
+        anyhow::ensure!(
+            rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "page D2D copy failed: {rc:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The attention path's working set. Both families run the same tower over
+/// the same rows, so one set serves both: each buffer is allocated at the
+/// wider family's width and reshaped per layer.
+struct AttnScratch {
+    normed_x: HiddenStates,
+    proj: Projections,
+    q_prep: HiddenStates,
+    attn: HiddenStates,
+}
+
+impl AttnScratch {
+    fn new(
+        ctx: &DeviceContext,
+        local: &LayerGeometry,
+        global: &LayerGeometry,
+        max_rows: usize,
+        fused: bool,
+    ) -> Result<Self> {
+        let q_dim = |geom: &LayerGeometry| geom.num_q_heads * geom.head_dim;
+        let q_max = q_dim(local).max(q_dim(global));
+        Ok(Self {
+            normed_x: HiddenStates::zeros(ctx, local.hidden_size, max_rows)?,
+            proj: Projections::new(ctx, local, global, max_rows, fused)?,
+            q_prep: HiddenStates::zeros(ctx, q_max, max_rows)?,
+            attn: HiddenStates::zeros(ctx, q_max, max_rows)?,
+        })
+    }
+
+    fn set(&mut self, geom: &LayerGeometry, seq_len: usize) {
+        let q_dim = geom.num_q_heads * geom.head_dim;
+        for (buf, hidden_dim) in [
+            (&mut self.normed_x, geom.hidden_size),
+            (&mut self.q_prep, q_dim),
+            (&mut self.attn, q_dim),
+        ] {
+            buf.hidden_dim = hidden_dim;
+            buf.seq_len = seq_len;
+        }
+        self.proj.set_rows(seq_len);
+    }
+}
+
+/// Where the attention projections land: three buffers of their own, or one
+/// row per token holding Q, K and V side by side so a single GEMM fills it.
+/// The fused GEMM is a different cuBLAS shape and need not round as the
+/// three do, so the byte-identical serving state keeps its own.
+enum Projections {
+    Separate {
+        q: HiddenStates,
+        k: HiddenStates,
+        v: HiddenStates,
+    },
+    Fused(HiddenStates),
+}
+
+/// The bands the projections landed in; `v` only where the family projects
+/// one.
+struct Projected<'a> {
+    q: Columns<'a>,
+    k: Columns<'a>,
+    v: Option<Columns<'a>>,
+}
+
+impl Projections {
+    fn new(
+        ctx: &DeviceContext,
+        local: &LayerGeometry,
+        global: &LayerGeometry,
+        max_rows: usize,
+        fused: bool,
+    ) -> Result<Self> {
+        let q_dim = |geom: &LayerGeometry| geom.num_q_heads * geom.head_dim;
+        let kv_dim = |geom: &LayerGeometry| geom.num_kv_heads * geom.head_dim;
+        if !fused {
+            let kv_max = kv_dim(local).max(kv_dim(global));
+            return Ok(Self::Separate {
+                q: HiddenStates::zeros(ctx, q_dim(local).max(q_dim(global)), max_rows)?,
+                k: HiddenStates::zeros(ctx, kv_max, max_rows)?,
+                v: HiddenStates::zeros(ctx, kv_max, max_rows)?,
+            });
+        }
+        // The sliding family projects V; the global family forks it from K,
+        // so its row is a projection narrower.
+        let widest = (q_dim(local) + 2 * kv_dim(local)).max(q_dim(global) + kv_dim(global));
+        Ok(Self::Fused(HiddenStates::zeros(ctx, widest, max_rows)?))
+    }
+
+    fn set_rows(&mut self, seq_len: usize) {
+        match self {
+            Self::Separate { q, k, v } => {
+                for buf in [q, k, v] {
+                    buf.seq_len = seq_len;
+                }
+            }
+            Self::Fused(all) => all.seq_len = seq_len,
+        }
+    }
+
+    fn project(
+        &mut self,
+        ctx: &DeviceContext,
+        qkv: &Linear,
+        x: &HiddenStates,
+        q_dim: usize,
+        kv_dim: usize,
+        linear: &LinearScratch,
+    ) -> Result<Projected<'_>> {
+        let has_v = match qkv.rows().checked_sub(q_dim) {
+            Some(rest) if rest == kv_dim => false,
+            Some(rest) if rest == 2 * kv_dim => true,
+            _ => anyhow::bail!(
+                "Q|K|V holds {} rows, neither {q_dim} + {kv_dim} nor {q_dim} + 2 x {kv_dim}",
+                qkv.rows()
+            ),
+        };
+        match self {
+            Self::Separate { q, k, v } => {
+                let qkv = qkv.bf16()?;
+                q.hidden_dim = q_dim;
+                k.hidden_dim = kv_dim;
+                v.hidden_dim = kv_dim;
+                ops::gemm_rows_into_checked(ctx, qkv, 0, q_dim, x, q)?;
+                ops::gemm_rows_into_checked(ctx, qkv, q_dim, kv_dim, x, k)?;
+                if has_v {
+                    ops::gemm_rows_into_checked(ctx, qkv, q_dim + kv_dim, kv_dim, x, v)?;
+                }
+                Ok(Projected {
+                    q: (&*q).into(),
+                    k: (&*k).into(),
+                    v: if has_v { Some((&*v).into()) } else { None },
+                })
+            }
+            Self::Fused(all) => {
+                all.hidden_dim = qkv.rows();
+                qkv.project_into(ctx, x, linear, all)?;
+                Ok(Projected {
+                    q: all.columns(0, q_dim),
+                    k: all.columns(q_dim, kv_dim),
+                    v: if has_v {
+                        Some(all.columns(q_dim + kv_dim, kv_dim))
+                    } else {
+                        None
+                    },
+                })
+            }
+        }
+    }
+}
+
+/// Order `ctx.stream` producers (plan uploads, token-id H2D, buffer
+/// allocations) before the override stream consumes them. No-op without an
+/// override.
+fn fence_producers_before_override(ctx: &DeviceContext) -> Result<()> {
+    use cudarc::driver::sys;
+    if !pegainfer_core::tensor::has_stream_override() {
+        return Ok(());
+    }
+    let override_stream = pegainfer_core::tensor::active_cu_stream(ctx);
+    let producer = ctx.stream.cu_stream();
+    unsafe {
+        let mut event: sys::CUevent = std::ptr::null_mut();
+        let create = sys::cuEventCreate(
+            &raw mut event,
+            sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+        );
+        anyhow::ensure!(
+            create == sys::CUresult::CUDA_SUCCESS,
+            "cuEventCreate (producer fence) failed: {create:?}"
+        );
+        let record = sys::cuEventRecord(event, producer);
+        let wait = if record == sys::CUresult::CUDA_SUCCESS {
+            sys::cuStreamWaitEvent(override_stream, event, 0)
+        } else {
+            record
+        };
+        let destroy = sys::cuEventDestroy_v2(event);
+        anyhow::ensure!(
+            record == sys::CUresult::CUDA_SUCCESS,
+            "cuEventRecord (producer fence) failed: {record:?}"
+        );
+        anyhow::ensure!(
+            wait == sys::CUresult::CUDA_SUCCESS,
+            "cuStreamWaitEvent (producer fence) failed: {wait:?}"
+        );
+        anyhow::ensure!(
+            destroy == sys::CUresult::CUDA_SUCCESS,
+            "cuEventDestroy (producer fence) failed: {destroy:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The tower's whole working set for one step: attention buffers, epilogue
+/// buffers, and the hidden pair the layers alternate between so no layer
+/// writes the buffer it is reading.
+struct TowerScratch {
+    attn: AttnScratch,
+    epilogue: EpilogueScratch,
+    hidden: [HiddenStates; 2],
+}
+
+impl TowerScratch {
+    /// The W4A16 GEMMs read and write whole row buckets, so with W4A16
+    /// weights the buffers hold at least sixteen rows while carrying
+    /// `max_rows`.
+    fn new(
+        ctx: &DeviceContext,
+        local: &LayerGeometry,
+        global: &LayerGeometry,
+        max_rows: usize,
+        fused: bool,
+        linear: &LinearScratch,
+    ) -> Result<Self> {
+        let capacity = if linear.is_w4a16() {
+            max_rows.max(16)
+        } else {
+            max_rows
+        };
+        let mut tower = Self {
+            attn: AttnScratch::new(ctx, local, global, capacity, fused)?,
+            epilogue: EpilogueScratch::new(ctx, local, capacity, fused, linear.clone())?,
+            hidden: [
+                HiddenStates::zeros(ctx, local.hidden_size, capacity)?,
+                HiddenStates::zeros(ctx, local.hidden_size, capacity)?,
+            ],
+        };
+        tower.open(max_rows)?;
+        Ok(tower)
+    }
+
+    fn open(&mut self, seq_len: usize) -> Result<()> {
+        self.epilogue.set_rows(seq_len)?;
+        for buf in &mut self.hidden {
+            buf.seq_len = seq_len;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn decode_bucket_slot(rows: usize) -> usize {
+    rows.next_power_of_two().trailing_zeros() as usize
+}
+
+fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &mut HiddenStates) {
+    let (first, second) = hidden.split_at_mut(1);
+    if src == 0 {
+        (&first[0], &mut second[0])
+    } else {
+        (&second[0], &mut first[0])
+    }
+}
+
+/// Takes a scoring prefill's head logits for a run of prompt rows and the
+/// first row's index.
+pub(crate) type PromptScorer<'a> = &'a mut dyn FnMut(&mut HiddenStates, usize) -> Result<()>;
+
+/// Prompt rows a scoring prefill pushes through the head at once: the
+/// logits of 256 rows over the 262144-token vocabulary are 128 MiB.
+const PROMPT_SCORE_ROWS: usize = 256;
+
+const GLOBAL_SPLIT_CHUNK_TOKENS: usize = 256;
+/// The sliding family's decode chunk: a resident window of a thousand keys
+/// wants many small CTAs rather than the global family's long streams.
+const LOCAL_SPLIT_CHUNK_TOKENS: usize = 64;
+
+struct SteadyDecode {
+    padded: usize,
+    rows: Vec<SteadyRow>,
+}
+
+struct SteadyRow {
+    kv: u64,
+    kv_len: usize,
+    local_origin: usize,
+    local_pages: usize,
+    global_pages: usize,
+    global_chunks: usize,
+}
+
+impl SteadyDecode {
+    fn advances_to(&self, next: &Self) -> bool {
+        self.padded == next.padded
+            && self.rows.len() == next.rows.len()
+            && self.rows.iter().zip(&next.rows).all(|(current, next)| {
+                next.kv == current.kv
+                    && next.kv_len == current.kv_len + 1
+                    && next.local_origin == current.local_origin
+                    && next.local_pages == current.local_pages
+                    && next.global_pages == current.global_pages
+                    && next.global_chunks == current.global_chunks
+            })
+    }
+}
+
+/// The global family's decode tables, uploaded per step: the per-request
+/// half feeds the prep, the factor-repeated half feeds the split-KV
+/// attention read over the pseudo-requests (see [`global_split_factor`]).
+struct GlobalTables {
+    pages: CudaSlice<i32>,
+    indptr: CudaSlice<i32>,
+    /// Per-row window-start pages for the prep. Pure decode rows read their
+    /// whole row from page 0, so this stays zero-filled; a per-token prep
+    /// may compress a row's window to the single page holding its position.
+    origins: CudaSlice<i32>,
+    positions: CudaSlice<i32>,
+    pseudo_pages: CudaSlice<i32>,
+    pseudo_indptr: CudaSlice<i32>,
+    pseudo_last: CudaSlice<i32>,
+}
+
+/// The split-KV plan, refilled per step at graph-stable padded shapes; the
+/// chunk size is written to its device slot once at alloc.
+struct SplitKvState {
+    request_indices_d: CudaSlice<i32>,
+    kv_tile_indices_d: CudaSlice<i32>,
+    chunk_size_d: CudaSlice<i32>,
+    o_indptr_d: CudaSlice<i32>,
+    valid_mask_d: CudaSlice<u8>,
+    tmp_v: CudaSlice<bf16>,
+    tmp_s: CudaSlice<f32>,
+    /// Chunk-count bound per pseudo-request; a step's padded slot count is
+    /// the split factor times its bucket times this.
+    cap: usize,
+    /// The chunk the tile indices count in, the same number the device slot
+    /// holds.
+    chunk_tokens: usize,
+}
+
+struct SplitKvSpec {
+    label: &'static str,
+    slots: usize,
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+    cap: usize,
+    chunk_size_d: CudaSlice<i32>,
+    chunk_tokens: usize,
+}
+
+struct SplitKvLaunch<'a> {
+    metadata: pegainfer_kernels::ops::Hd512DecodeMetadata<'a>,
+    o_indptr_d: &'a CudaSlice<i32>,
+    valid_mask_d: &'a CudaSlice<u8>,
+    tmp_v: &'a mut CudaSlice<bf16>,
+    tmp_s: &'a mut CudaSlice<f32>,
+    cap: usize,
+}
+
+impl SplitKvState {
+    fn new(ctx: &DeviceContext, spec: SplitKvSpec) -> Result<Self> {
+        let label = spec.label;
+        let alloc = |what: &'static str| {
+            move |err| anyhow::anyhow!("{label} split {what} alloc failed: {err}")
+        };
+        Ok(Self {
+            request_indices_d: ctx
+                .stream
+                .alloc_zeros(spec.slots)
+                .map_err(alloc("request indices"))?,
+            kv_tile_indices_d: ctx
+                .stream
+                .alloc_zeros(spec.slots)
+                .map_err(alloc("tile indices"))?,
+            chunk_size_d: spec.chunk_size_d,
+            o_indptr_d: ctx
+                .stream
+                .alloc_zeros(spec.rows + 1)
+                .map_err(alloc("o_indptr"))?,
+            valid_mask_d: ctx
+                .stream
+                .alloc_zeros(spec.slots)
+                .map_err(alloc("valid mask"))?,
+            tmp_v: ctx
+                .stream
+                .alloc_zeros(spec.slots * spec.heads * spec.head_dim)
+                .map_err(alloc("tmp_v"))?,
+            tmp_s: ctx
+                .stream
+                .alloc_zeros(spec.slots * spec.heads)
+                .map_err(alloc("tmp_s"))?,
+            cap: spec.cap,
+            chunk_tokens: spec.chunk_tokens,
+        })
+    }
+
+    fn upload_csr(&mut self, ctx: &DeviceContext, csr: &ops::SplitKvCsr) -> Result<()> {
+        upload_prefix(ctx, &mut self.request_indices_d, &csr.request_indices)?;
+        upload_prefix(ctx, &mut self.kv_tile_indices_d, &csr.kv_tile_indices)?;
+        upload_prefix(ctx, &mut self.o_indptr_d, &csr.o_indptr)?;
+        upload_prefix(ctx, &mut self.valid_mask_d, &csr.block_valid_mask)
+    }
+
+    fn metadata<'a>(
+        &'a mut self,
+        page_indices: &'a CudaSlice<i32>,
+        page_indptr: &'a CudaSlice<i32>,
+        last_page_len: &'a CudaSlice<i32>,
+    ) -> SplitKvLaunch<'a> {
+        SplitKvLaunch {
+            metadata: pegainfer_kernels::ops::Hd512DecodeMetadata::new(
+                page_indices,
+                page_indptr,
+                last_page_len,
+                &self.request_indices_d,
+                &self.kv_tile_indices_d,
+                &self.chunk_size_d,
+                self.chunk_tokens,
+            ),
+            o_indptr_d: &self.o_indptr_d,
+            valid_mask_d: &self.valid_mask_d,
+            tmp_v: &mut self.tmp_v,
+            tmp_s: &mut self.tmp_s,
+            cap: self.cap,
+        }
+    }
+}
+
+/// The host buffers a split-KV pseudo expansion fills, borrowed apart so one
+/// builder serves every step shape.
+struct PseudoTables<'a> {
+    pages: &'a mut Vec<i32>,
+    indptr: &'a mut Vec<i32>,
+    last_lens: &'a mut Vec<i32>,
+    kv_lens: &'a mut Vec<usize>,
+}
+
+pub(crate) struct StepArena {
+    tower: TowerScratch,
+    host: HostPlanningScratch,
+    local_plan: PrefillPagedPlan,
+    global_tables: GlobalTables,
+    global_split: SplitKvState,
+    /// The sliding family's split plan over its resident window, for the
+    /// generated windowed decode read; the windowed prefill read has no use
+    /// for it.
+    local_split: SplitKvState,
+    steady: Option<SteadyDecode>,
+    local_origins: CudaSlice<i32>,
+    ids: CudaSlice<u32>,
+    /// Mixed-step per-row prep metadata at step-stable pointers, covering
+    /// prefill and decode rows uniformly: absolute position and, per
+    /// family, the single page holding it with that page's index as the
+    /// row's window origin. `mix_indptr` is the identity ramp written once
+    /// at alloc — with one page per row the ramp serves both families. One
+    /// per-token prep launch per family then replaces the per-segment
+    /// walks, whatever the step's segment split.
+    mix_positions: CudaSlice<i32>,
+    mix_local_pages: CudaSlice<i32>,
+    mix_local_origins: CudaSlice<i32>,
+    mix_global_pages: CudaSlice<i32>,
+    mix_global_origins: CudaSlice<i32>,
+    mix_indptr: CudaSlice<i32>,
+    head_normed: HiddenStates,
+    logits: HiddenStates,
+    /// One graph per power-of-two bucket, at index `log2(bucket)`, captured
+    /// by the startup sweep. The captured kernels read and write only
+    /// step-stable pointers; per-step change rides the plan and metadata
+    /// contents uploaded before launch.
+    graphs: Vec<CudaGraphState>,
+    graph_enabled: bool,
+    /// Floor for the padded bucket. Only the pre-capture sweep raises it, to
+    /// drive every bucket from a single dummy request.
+    min_bucket: usize,
+    max_rows: usize,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+}
+
+impl StepArena {
+    /// Settle the step's preconditions — the allocation stream and a row
+    /// count the buffers can hold — since neither can be safely deferred
+    /// until the epilogue, by which point the step has already written KV.
+    fn open(&mut self, ctx: &DeviceContext, rows: usize) -> Result<()> {
+        anyhow::ensure!(
+            std::sync::Arc::ptr_eq(&ctx.stream, &self.stream),
+            "a step arena must be used on the stream it was allocated on"
+        );
+        anyhow::ensure!(
+            rows <= self.max_rows,
+            "step of {rows} rows exceeds the arena's {} row ceiling",
+            self.max_rows
+        );
+        self.tower.open(rows)
+    }
+
+    /// Logits and the id buffer consumed by the next decode embedding.
+    pub(crate) fn logits_and_ids(&mut self) -> (&mut HiddenStates, &mut CudaSlice<u32>) {
+        (&mut self.logits, &mut self.ids)
+    }
+
+    /// Release the captured graphs. Called on teardown, before the communicator
+    /// goes away, because NCCL's abort waits for a graph that references it to be
+    /// destroyed. A tensor-parallel launch captures nothing, so there is nothing
+    /// to release on that path.
+    pub(crate) fn release_graphs(&mut self) {
+        self.graphs.clear();
+    }
+}
+
+/// The allocators wrap the driver error in a message rather than keeping the
+/// code, so this reads the driver's own string. Deliberately narrow: anything
+/// it does not recognise stays an error, so a new failure mode surfaces as
+/// one rather than as a card that is merely too small.
+#[cfg(test)]
+fn is_out_of_memory(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("CUDA_ERROR_OUT_OF_MEMORY") || text.contains("out of memory")
+}
+
+impl GemmaServe {
+    /// The generated windowed entries read two-byte rows, and
+    /// `PEGAINFER_KV_FP8` stores this pool's K and V as e4m3, which they
+    /// would read as bf16 at half the stride and hand back numbers that look
+    /// like logits. The knob is the global family's, whose pool is always
+    /// bf16, so an fp8 sliding pool keeps the incumbent read rather than
+    /// costing the global family its kernels.
+    fn tilelang_local_attn(&self) -> bool {
+        self.tilelang_global_attn && self.local_pool.layout().storage == KvStorage::Bf16
+    }
+
+    /// Whether the step projects through the stacked weights. A W4A16
+    /// linear only projects whole.
+    fn fuses_projections(&self) -> bool {
+        self.tilelang_global_attn || self.linear.is_w4a16()
+    }
+
+    /// Whether a whole-prompt pass over `rows` can take its scratch here: the
+    /// allocation itself, released again, rather than a second copy of the
+    /// arithmetic that would drift from `TowerScratch::new`. Only
+    /// [`is_out_of_memory`] answers `false`; every other failure is handed
+    /// back.
+    #[cfg(test)]
+    pub(crate) fn single_pass_scratch_fits(
+        &self,
+        ctx: &DeviceContext,
+        rows: usize,
+    ) -> Result<bool> {
+        match TowerScratch::new(
+            ctx,
+            &self.local_geom,
+            &self.global_geom,
+            rows,
+            self.fuses_projections(),
+            &self.linear,
+        ) {
+            Ok(_) => Ok(true),
+            Err(e) if is_out_of_memory(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The global family's decode read, chosen once by the same flag as its
+    /// prefill: the incumbent through core's door, or this line's own kernel
+    /// straight from the crate that generates it. Same arguments, same
+    /// meaning, one fn type -- which is what lets the call sites not know.
+    fn global_decode_kernel(&self) -> pegainfer_kernels::ops::GlobalDecodeAttend {
+        if self.tilelang_global_attn {
+            pegainfer_kernels::ops::gemma4_hd512_decode_split_kv_into
+        } else {
+            pegainfer_kernels::ops::paged_attention_batch_decode_split_kv_hd512_into
+        }
+    }
+}
+
+/// Which kernels serve the attention reads, and with it how the global
+/// pool's rows are laid out. The incumbent and the generated global kernel
+/// both read the split K|V rows; the folded rows -- K only where the
+/// rotation touches it, V in full, K's norm weight folded into the query --
+/// are the generated kernel's alone, so asking for them is asking for it.
+/// Either generated state also reads the sliding family's pure-decode rows
+/// through the generated windowed split-KV kernel. The format is the pool's
+/// for its whole life, which is why this is one value rather than flags that
+/// could disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GlobalAttn {
+    Incumbent,
+    TileLang,
+    TileLangFolded,
+}
+
+impl GlobalAttn {
+    pub(crate) fn tilelang(self) -> bool {
+        !matches!(self, Self::Incumbent)
+    }
+
+    /// The global pool's row format, with the family's rotated column count.
+    pub(crate) fn format(self, rotary: usize) -> KvFormat {
+        match self {
+            Self::TileLangFolded => KvFormat::Folded { rotary },
+            Self::Incumbent | Self::TileLang => KvFormat::Split,
+        }
+    }
+}
+
+/// How many pseudo-requests the global decode read presents each request
+/// as. FlashInfer's decode dispatcher compiles GQA groups {1,2,3,4,8}: a
+/// dispatchable group passes through whole, and a non-dispatchable group
+/// over one KV head halves into pseudo-requests — an exact memory identity
+/// only because MQA gives every query head the same KV head (12B's global
+/// family is 16 over 1 at TP1). Anything else fails loud.
+///
+/// This reads the *resolved per-rank* geometry, not the config: query heads
+/// shard with the world size while KV heads follow their own range, so the
+/// same group is 16 at TP1, 8 at TP2, 4 at TP4 — and lands back inside the
+/// compiled decode set above TP1, where the split factor returns 1.
+pub(crate) fn global_split_factor(geom: &LayerGeometry) -> Result<usize> {
+    const DISPATCHABLE: [usize; 5] = [1, 2, 3, 4, 8];
+    let q = geom.num_q_heads;
+    let kv = geom.num_kv_heads;
+    anyhow::ensure!(
+        kv > 0 && q.is_multiple_of(kv),
+        "global family of {q} query heads over {kv} KV heads is not a whole GQA group"
+    );
+    let group = q / kv;
+    if DISPATCHABLE.contains(&group) {
+        return Ok(1);
+    }
+    if kv == 1 && group.is_multiple_of(2) && DISPATCHABLE.contains(&(group / 2)) {
+        return Ok(2);
+    }
+    anyhow::bail!(
+        "the global decode read has no dispatch for {q} query heads over {kv} KV heads \
+         (GQA group {group}): supported are groups 1,2,3,4,8 whole, or twice one of \
+         those over a single KV head"
+    )
+}
+
+/// One phase of the decode-graph pre-capture sweep. `Warm` and `Launch`
+/// execute, and so enqueue collectives that need every rank's matching call;
+/// `Capture` only records.
+#[derive(Clone, Copy)]
+pub(crate) enum PrecapturePhase {
+    Warm,
+    Capture,
+    Launch,
+}
+
+impl PrecapturePhase {
+    /// The sweep's phases in order.
+    pub(crate) const ALL: [Self; 3] = [Self::Warm, Self::Capture, Self::Launch];
+}
+
+/// Everything a serving step needs that outlives requests.
+pub(crate) struct GemmaServe {
+    /// The weights these pools, rope tables and layer numbering were built
+    /// for. Holding them is what makes a step's model identity structural:
+    /// KV pages written under one checkpoint are meaningless under another.
+    weights: Gemma4Weights,
+    pub(crate) local_pool: KvPool,
+    pub(crate) global_pool: KvPool,
+    local_geom: LayerGeometry,
+    global_geom: LayerGeometry,
+    sliding_window: usize,
+    global_split_factor: usize,
+    final_logit_softcapping: f32,
+    sliding_cos: DeviceVec,
+    sliding_sin: DeviceVec,
+    global_cos: DeviceVec,
+    global_sin: DeviceVec,
+    cos_max_pos: usize,
+    /// [`GlobalAttn`] reduced to what the step needs. Each kernel and the one
+    /// it stands in for are adapters at one seam -- same arguments, same
+    /// meaning -- so the choice is a flag here rather than a shape the call
+    /// sites have to know about.
+    tilelang_global_attn: bool,
+    /// Model layer index -> index within its family's pool layer axis.
+    family_index: Vec<usize>,
+    linear: LinearScratch,
+    /// This rank's tensor-parallel communicator, `None` at world size 1 where
+    /// every reduction is a no-op. Attached after construction, once every
+    /// rank's compute stream exists.
+    tp_comm: Option<TpComm>,
+}
+
+// SAFETY: A serve is pinned to one CUDA device and driven by one thread at a
+// time: the thread that loads it (the load-time warm walks the ranks one after
+// another, never in parallel), and afterwards exactly one thread per step — the
+// scheduler's for rank 0, and one scoped thread per extra rank, which hands its
+// `&mut` back at the join before the scheduler touches that rank again
+// (`EngineState::drive_ranks`). No two threads hold a serve at once, so the raw
+// NCCL communicator it may hold never crosses a thread while in use. (Same
+// assertions `Qwen3Model` makes.)
+unsafe impl Send for GemmaServe {}
+
+impl GemmaServe {
+    fn decode_row(
+        &self,
+        kv: &RankKv,
+        local_pages: &mut Vec<i32>,
+        global_pages: &mut Vec<i32>,
+    ) -> Result<DecodeRow> {
+        let position = kv.local.seq_len();
+        let kv_len = position + 1;
+        self.check_step_bounds(kv, kv_len)?;
+        let span = kv.local.resident_span(position, kv_len)?;
+        kv.local.extend_page_row(local_pages);
+        let global = kv.global.desc_for_len(kv_len)?;
+        kv.global.extend_page_indices_i32(global_pages);
+        Ok(DecodeRow {
+            position,
+            local_last: span.last_page_len,
+            local_start: span.start,
+            local_origin: kv.local.origin_pages(),
+            global_last: global.last_page_len(),
+        })
+    }
+
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        weights: Gemma4Weights,
+        max_context: usize,
+        local_kv_storage: KvStorage,
+        local_pages: usize,
+        global_pages: usize,
+        global_attn: GlobalAttn,
+    ) -> Result<Self> {
+        // One source of truth for geometry, rope tables and layer numbering.
+        let config = &weights.config;
+        // The weights carry the shard they were cut as, so the geometry and the
+        // pools sized below cannot belong to a different rank than they hold.
+        let tp = weights.tp;
+        let device_ordinal = ctx.device_ordinal;
+        // One tensor answers for the set: the loader materializes every
+        // weight through a single context.
+        let weights_ordinal = weights.embed_tokens.data.ordinal();
+        anyhow::ensure!(
+            weights_ordinal == device_ordinal,
+            "weights live on device {weights_ordinal} but this context \
+             allocates on device {device_ordinal}"
+        );
+        let local_geom = LayerGeometry::local_of(config, tp)?;
+        let global_geom = LayerGeometry::global_of(config, tp)?;
+        let global_split_factor = global_split_factor(&global_geom)?;
+        let (mut locals, mut globals) = (0usize, 0usize);
+        let family_index = config
+            .layer_types
+            .iter()
+            .map(|kind| match kind {
+                LayerKind::Sliding => {
+                    locals += 1;
+                    locals - 1
+                }
+                LayerKind::Global => {
+                    globals += 1;
+                    globals - 1
+                }
+            })
+            .collect();
+        // Both pools are laid out at the *per-rank* head counts: the geometry
+        // above is what this rank's kernels read, so a pool sized to the full
+        // config would disagree with them.
+        let local_pool = KvPool::with_storage(
+            ctx,
+            locals,
+            local_geom.num_kv_heads,
+            local_geom.head_dim,
+            LOCAL_PAGE_SIZE,
+            local_pages,
+            local_kv_storage,
+        )?;
+        let global_pool = KvPool::with_storage_and_format(
+            ctx,
+            globals,
+            global_geom.num_kv_heads,
+            global_geom.head_dim,
+            GLOBAL_PAGE_SIZE,
+            global_pages,
+            KvStorage::Bf16,
+            global_attn.format(config.global_rotary_dim),
+        )?;
+        let (sliding_cos, sliding_sin) = pegainfer_core::rope::precompute_rope(
+            ctx,
+            &RopeTableSpec {
+                rotary_dim: local_geom.head_dim,
+                frequency_dim: local_geom.head_dim,
+                max_seq_len: max_context,
+                theta: config.sliding_rope_theta,
+            },
+        )?;
+        let (global_cos, global_sin) = build_proportional_rope_tables(
+            ctx,
+            config.global_rope_theta,
+            global_geom.head_dim,
+            config.global_rotary_dim,
+            max_context,
+        )?;
+        let (sliding_window, final_logit_softcapping) =
+            (config.sliding_window, config.final_logit_softcapping);
+        let linear = LinearScratch::new(ctx, weights.w4a16_values())?;
+        Ok(Self {
+            weights,
+            local_pool,
+            global_pool,
+            local_geom,
+            global_geom,
+            sliding_window,
+            global_split_factor,
+            final_logit_softcapping,
+            sliding_cos,
+            sliding_sin,
+            global_cos,
+            global_sin,
+            cos_max_pos: max_context,
+            family_index,
+            tilelang_global_attn: global_attn.tilelang(),
+            linear,
+            tp_comm: None,
+        })
+    }
+
+    /// Attach this rank's tensor-parallel communicator, built on this rank's
+    /// compute stream so the reduction is issued where its operands are.
+    pub(crate) fn attach_tp_comm(&mut self, comm: TpComm) {
+        self.tp_comm = Some(comm);
+    }
+
+    /// Fail this rank's communicator. Reachable without borrowing the serve —
+    /// the engine holds its own handle — which is what lets the scheduler abort
+    /// a peer's communicator while that peer is inside a collective. A
+    /// comm-less step would otherwise reduce to a no-op, so the engine must
+    /// stop afterwards.
+    pub(crate) fn abort_tp_comm(&self) {
+        if let Some(comm) = self.tp_comm.as_ref() {
+            comm.abort();
+        }
+    }
+
+    /// This rank's communicator as a handle of its own, so a step's thread can
+    /// abort it — or a peer's — without borrowing either serve. `TpComm` is a
+    /// handle over a shared slot, so the clone reaches the same communicator.
+    pub(crate) fn tp_comm(&self) -> Option<TpComm> {
+        self.tp_comm.clone()
+    }
+
+    /// The global family's prefill, through whichever kernel this engine was
+    /// started with. Both are the same fn type, so a drift between them stops
+    /// compiling rather than computing something else.
+    fn global_prefill(
+        &self,
+        ctx: &DeviceContext,
+        q: &HiddenStates,
+        layer: usize,
+        plan: &PrefillPagedPlan,
+        out: &mut HiddenStates,
+        num_q_heads: usize,
+    ) -> Result<()> {
+        let attend = if self.tilelang_global_attn {
+            pegainfer_kernels::ops::gemma4_hd512_prefill_varlen_into
+        } else {
+            pegainfer_kernels::ops::batch_prefill_paged_hd512_into
+        };
+        attend(
+            ctx,
+            q,
+            self.global_pool.buffer(),
+            &self.global_pool.layout().kernel_layout(),
+            layer,
+            plan,
+            out,
+            num_q_heads,
+            1.0,
+        )
+    }
+
+    /// One arena per engine thread, sized for the decode step; a prompt
+    /// builds a [`TowerScratch`] for its own width instead. A request's
+    /// tiles are `ceil(rows * group / cta_tile_q)` with a positive
+    /// `cta_tile_q`, so `rows * group` bounds each plan.
+    pub(crate) fn alloc_step_arena(
+        &self,
+        ctx: &DeviceContext,
+        max_rows: usize,
+        graph_enabled: bool,
+    ) -> Result<StepArena> {
+        anyhow::ensure!(
+            max_rows.is_power_of_two(),
+            "the arena's {max_rows} rows must be a power of two: steps pad to buckets"
+        );
+        let group = |geom: &LayerGeometry| geom.num_q_heads / geom.num_kv_heads;
+        let alloc = |err: &'static str| {
+            move |e: cudarc::driver::DriverError| anyhow::anyhow!("{err} alloc failed: {e}")
+        };
+        let factor = self.global_split_factor;
+        let global_split_cap = self.cos_max_pos.div_ceil(GLOBAL_SPLIT_CHUNK_TOKENS);
+        let global_split_slots = factor * max_rows * global_split_cap;
+        let global_split_heads = self.global_geom.num_q_heads / factor;
+        let mut global_chunk = ctx
+            .stream
+            .alloc_zeros(1)
+            .map_err(alloc("global chunk size"))?;
+        ctx.stream
+            .memcpy_htod(&[GLOBAL_SPLIT_CHUNK_TOKENS as i32], &mut global_chunk)
+            .map_err(|e| anyhow::anyhow!("global chunk-size upload failed: {e}"))?;
+        // A resident window holds at most the window plus a page, since
+        // pages release whole.
+        let local_split_cap = (self.sliding_window + self.local_pool.layout().page_size)
+            .div_ceil(LOCAL_SPLIT_CHUNK_TOKENS);
+        let mut local_chunk = ctx
+            .stream
+            .alloc_zeros(1)
+            .map_err(alloc("local chunk size"))?;
+        ctx.stream
+            .memcpy_htod(&[LOCAL_SPLIT_CHUNK_TOKENS as i32], &mut local_chunk)
+            .map_err(|e| anyhow::anyhow!("local chunk-size upload failed: {e}"))?;
+        // A mixed step's rows are bounded by the serving ceiling's prompt
+        // rows plus a full decode bucket; the indptr ramp is written once.
+        let mix_rows_cap = self.cos_max_pos + max_rows;
+        let mut mix_indptr = ctx
+            .stream
+            .alloc_zeros(mix_rows_cap + 1)
+            .map_err(alloc("mix indptr"))?;
+        let ramp: Vec<i32> =
+            (0..=i32::try_from(mix_rows_cap).context("mix rows cap fits i32")?).collect();
+        ctx.stream
+            .memcpy_htod(&ramp, &mut mix_indptr)
+            .map_err(|e| anyhow::anyhow!("mix indptr ramp upload failed: {e}"))?;
+        Ok(StepArena {
+            tower: TowerScratch::new(
+                ctx,
+                &self.local_geom,
+                &self.global_geom,
+                max_rows,
+                self.fuses_projections(),
+                &self.linear,
+            )?,
+            host: HostPlanningScratch::new(
+                self.local_pool.layout().page_size,
+                self.global_pool.layout().page_size,
+            ),
+            local_plan: PrefillPagedPlan::new_preallocated(
+                ctx,
+                max_rows,
+                self.local_pool.capacity_pages(),
+                max_rows,
+                max_rows * group(&self.local_geom),
+            )?,
+            global_tables: GlobalTables {
+                pages: ctx
+                    .stream
+                    .alloc_zeros(self.global_pool.capacity_pages())
+                    .map_err(alloc("global pages"))?,
+                indptr: ctx
+                    .stream
+                    .alloc_zeros(max_rows + 1)
+                    .map_err(alloc("global indptr"))?,
+                origins: ctx
+                    .stream
+                    .alloc_zeros(max_rows)
+                    .map_err(alloc("global origins"))?,
+                positions: ctx
+                    .stream
+                    .alloc_zeros(max_rows)
+                    .map_err(alloc("global positions"))?,
+                pseudo_pages: ctx
+                    .stream
+                    .alloc_zeros(factor * self.global_pool.capacity_pages())
+                    .map_err(alloc("global pseudo pages"))?,
+                pseudo_indptr: ctx
+                    .stream
+                    .alloc_zeros(factor * max_rows + 1)
+                    .map_err(alloc("global pseudo indptr"))?,
+                pseudo_last: ctx
+                    .stream
+                    .alloc_zeros(factor * max_rows)
+                    .map_err(alloc("global pseudo last-page lens"))?,
+            },
+            global_split: SplitKvState::new(
+                ctx,
+                SplitKvSpec {
+                    label: "global",
+                    slots: global_split_slots,
+                    rows: factor * max_rows,
+                    heads: global_split_heads,
+                    head_dim: self.global_geom.head_dim,
+                    cap: global_split_cap,
+                    chunk_size_d: global_chunk,
+                    chunk_tokens: GLOBAL_SPLIT_CHUNK_TOKENS,
+                },
+            )?,
+            local_split: SplitKvState::new(
+                ctx,
+                SplitKvSpec {
+                    label: "local",
+                    slots: max_rows * local_split_cap,
+                    rows: max_rows,
+                    heads: self.local_geom.num_q_heads,
+                    head_dim: self.local_geom.head_dim,
+                    cap: local_split_cap,
+                    chunk_size_d: local_chunk,
+                    chunk_tokens: LOCAL_SPLIT_CHUNK_TOKENS,
+                },
+            )?,
+            steady: None,
+            local_origins: ctx.stream.alloc_zeros(max_rows).map_err(alloc("origins"))?,
+            ids: ctx.stream.alloc_zeros(max_rows).map_err(alloc("ids"))?,
+            mix_positions: ctx
+                .stream
+                .alloc_zeros(mix_rows_cap)
+                .map_err(alloc("mix positions"))?,
+            mix_local_pages: ctx
+                .stream
+                .alloc_zeros(mix_rows_cap)
+                .map_err(alloc("mix local pages"))?,
+            mix_local_origins: ctx
+                .stream
+                .alloc_zeros(mix_rows_cap)
+                .map_err(alloc("mix local origins"))?,
+            mix_global_pages: ctx
+                .stream
+                .alloc_zeros(mix_rows_cap)
+                .map_err(alloc("mix global pages"))?,
+            mix_global_origins: ctx
+                .stream
+                .alloc_zeros(mix_rows_cap)
+                .map_err(alloc("mix global origins"))?,
+            mix_indptr,
+            head_normed: HiddenStates::zeros(ctx, self.local_geom.hidden_size, max_rows)?,
+            logits: HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, max_rows)?,
+            graphs: (0..=decode_bucket_slot(max_rows))
+                .map(|_| CudaGraphState::new())
+                .collect(),
+            graph_enabled,
+            min_bucket: 1,
+            max_rows,
+            stream: ctx.stream.clone(),
+        })
+    }
+
+    pub(crate) fn alloc_kv(&self) -> GemmaKv {
+        GemmaKv::new(
+            SlidingLocalKv::new(self.local_pool.clone()),
+            self.global_pool.alloc(),
+        )
+    }
+
+    /// This rank's families alone, for the rank-`r` step of a multi-rank KV.
+    pub(crate) fn alloc_rank_kv(&self) -> RankKv {
+        RankKv::new(
+            SlidingLocalKv::new(self.local_pool.clone()),
+            self.global_pool.alloc(),
+        )
+    }
+
+    /// Copy a request's post-prefill KV into cache-owned pages — the
+    /// capture half of the conversation-tail prefix cache. Returns `None`
+    /// when either pool cannot spare the pages: capture is strictly
+    /// best-effort and never competes with an admission. Stream order makes
+    /// the copies safe — the prompt's KV writes were enqueued on
+    /// `ctx.stream` before this call, and the copies enqueue after them on
+    /// the same stream.
+    ///
+    /// Rank 0's families only: `PEGAINFER_PREFIX_CACHE` is refused under tensor
+    /// parallelism, so this never runs beside `twins`, and a multi-rank capture
+    /// would have to take every rank's shard to be resumable.
+    pub(crate) fn capture_checkpoint(
+        &self,
+        ctx: &DeviceContext,
+        kv: &RankKv,
+        token_ids: &[u32],
+    ) -> Option<crate::prefix_cache::CachedKv> {
+        // Slack guard: cache pages must never push either pool to the edge,
+        // or the saved prefill time resurfaces as refused admissions.
+        const POOL_SLACK_PAGES: usize = 128;
+        let global_src = kv.global.page_indices_i32();
+        if global_src.len() > crate::prefix_cache::entry_global_pages(self.cos_max_pos) {
+            return None;
+        }
+        let (local_avail, global_avail) = (
+            self.local_pool.available_pages(),
+            self.global_pool.available_pages(),
+        );
+        if local_avail < kv.local.held_pages() + POOL_SLACK_PAGES
+            || global_avail < global_src.len() + POOL_SLACK_PAGES
+        {
+            return None;
+        }
+        let global_pages = self.global_pool.try_reserve(global_src.len())?;
+        let mut local_pages = Vec::with_capacity(kv.local.held_pages());
+        for _ in 0..kv.local.held_pages() {
+            local_pages.push(self.local_pool.try_reserve(1)?);
+        }
+        let mut global_dst = Vec::with_capacity(global_src.len());
+        global_pages.extend_page_indices_i32(&mut global_dst);
+        let local_src = kv.local.page_row();
+        let mut local_dst = Vec::with_capacity(local_pages.len());
+        for reservation in &local_pages {
+            reservation.extend_page_indices_i32(&mut local_dst);
+        }
+        let copy = copy_pool_pages(
+            ctx,
+            self.global_pool.buffer(),
+            self.global_pool.layout(),
+            &global_src,
+            &global_dst,
+        )
+        .and_then(|()| {
+            copy_pool_pages(
+                ctx,
+                self.local_pool.buffer(),
+                self.local_pool.layout(),
+                &local_src,
+                &local_dst,
+            )
+        });
+        if let Err(err) = copy {
+            log::warn!("prefix-cache capture failed: {err:#}");
+            return None;
+        }
+        Some(crate::prefix_cache::CachedKv::new(
+            token_ids.to_vec(),
+            global_pages,
+            local_pages,
+            kv.local.origin_pages(),
+        ))
+    }
+
+    /// Rebuild a request KV from a cached conversation tail — the restore
+    /// half. The result is shaped exactly like a request that prefilled
+    /// `[0, t)` itself and already released its out-of-window pages, so
+    /// every downstream path (suffix prefill from `seq_len`, decode,
+    /// release) proceeds unchanged. Any failure aborts the whole restore —
+    /// both families or neither — and the caller falls back to a full
+    /// prefill.
+    pub(crate) fn restore_from_checkpoint(
+        &self,
+        ctx: &DeviceContext,
+        entry: &crate::prefix_cache::CachedKv,
+        t: usize,
+    ) -> Result<GemmaKv> {
+        anyhow::ensure!(
+            t > 0 && t <= entry.token_ids.len(),
+            "restore point {t} outside entry of {} tokens",
+            entry.token_ids.len()
+        );
+        let page = self.local_pool.layout().page_size;
+        // Resolve guaranteed the origin at `t` does not precede the captured
+        // window's.
+        let origin_t = crate::kv::origin_pages_at(t, self.sliding_window, page);
+        anyhow::ensure!(
+            origin_t >= entry.local_origin,
+            "restore point {t} precedes the captured window (origin {origin_t} vs {})",
+            entry.local_origin
+        );
+        let t_pages = t.div_ceil(page);
+        let local_take = t_pages - origin_t;
+        let local_skip = origin_t - entry.local_origin;
+        anyhow::ensure!(
+            local_skip + local_take <= entry.local_pages.len(),
+            "restore window slice [{local_skip}, {}) outside {} cached pages",
+            local_skip + local_take,
+            entry.local_pages.len()
+        );
+
+        let mut global = self.global_pool.alloc();
+        global.ensure_capacity(t)?;
+        let global_dst = global.page_indices_i32();
+        let mut global_src = Vec::new();
+        entry.global_pages.extend_page_indices_i32(&mut global_src);
+        global_src.truncate(global_dst.len());
+        anyhow::ensure!(
+            global_dst.len() == global_src.len(),
+            "restore page count mismatch: {} cached vs {} allocated",
+            global_src.len(),
+            global_dst.len()
+        );
+        let mut resident = Vec::with_capacity(local_take);
+        for _ in 0..local_take {
+            resident.push(
+                self.local_pool
+                    .try_reserve(1)
+                    .context("restore: local pool out of pages")?,
+            );
+        }
+        let mut local_src = Vec::with_capacity(local_take);
+        for reservation in entry.local_pages.iter().skip(local_skip).take(local_take) {
+            reservation.extend_page_indices_i32(&mut local_src);
+        }
+        let mut local_dst = Vec::with_capacity(local_take);
+        for reservation in &resident {
+            reservation.extend_page_indices_i32(&mut local_dst);
+        }
+        copy_pool_pages(
+            ctx,
+            self.global_pool.buffer(),
+            self.global_pool.layout(),
+            &global_src,
+            &global_dst,
+        )?;
+        copy_pool_pages(
+            ctx,
+            self.local_pool.buffer(),
+            self.local_pool.layout(),
+            &local_src,
+            &local_dst,
+        )?;
+        global.advance(t);
+        Ok(GemmaKv::new(
+            SlidingLocalKv::restore(self.local_pool.clone(), resident, origin_t, t),
+            global,
+        ))
+    }
+
+    fn advance_local(&self, kv: &mut RankKv, tokens: usize) -> Result<()> {
+        kv.local.advance_and_release(tokens, self.sliding_window)
+    }
+
+    fn check_step_bounds(&self, kv: &RankKv, kv_len: usize) -> Result<()> {
+        anyhow::ensure!(
+            kv.local.seq_len() == kv.global.seq_len(),
+            "the two families' frontiers diverged: local {} global {}",
+            kv.local.seq_len(),
+            kv.global.seq_len()
+        );
+        anyhow::ensure!(
+            kv.local.belongs_to(&self.local_pool) && kv.global.belongs_to(&self.global_pool),
+            "a KV state came from another pool; its page ids do not address \
+             this one's buffer"
+        );
+        anyhow::ensure!(
+            kv_len <= self.cos_max_pos,
+            "kv_len {kv_len} exceeds rope tables' {} rows",
+            self.cos_max_pos
+        );
+        Ok(())
+    }
+
+    fn plan_step(
+        &self,
+        ctx: &DeviceContext,
+        kv: &RankKv,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<GemmaStepPlan> {
+        let kv_len = start_pos + seq_len;
+        let global_desc = kv.global.desc_for_len(kv_len)?;
+        // The local plan lives in cache-relative coordinates: the resident row
+        // starts `origin_pages` pages into the sequence, and window_left masks
+        // whatever sub-window prefix the first page still carries, so a
+        // resident start that is not window-aligned loses nothing.
+        let span = kv.local.resident_span(start_pos, kv_len)?;
+        let local_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+            ctx,
+            &[kv.local.page_row()],
+            &[span.last_page_len],
+            &[span.start],
+            &[seq_len],
+            self.local_geom.num_q_heads,
+            self.local_geom.num_kv_heads,
+            self.local_geom.head_dim,
+            0,
+        )?;
+        let global_plan = PrefillPagedPlan::new(
+            ctx,
+            &global_desc,
+            start_pos,
+            seq_len,
+            self.global_geom.num_q_heads,
+            self.global_geom.num_kv_heads,
+            self.global_geom.head_dim,
+        )?;
+        Ok(GemmaStepPlan {
+            start_pos,
+            local_page_origin: kv.local.origin_pages(),
+            local_plan,
+            global_plan,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn local_layer_serve(
+        &self,
+        ctx: &DeviceContext,
+        tower: &mut TowerScratch,
+        layer: &Gemma4Layer,
+        family_layer: usize,
+        seq_len: usize,
+        prep: PrepRef<'_>,
+        local_plan: &PrefillPagedPlan,
+        local_split: Option<&mut SplitKvState>,
+        src: usize,
+    ) -> Result<()> {
+        let geom = &self.local_geom;
+        let q_dim = geom.num_q_heads * geom.head_dim;
+        let kv_dim = geom.num_kv_heads * geom.head_dim;
+        let TowerScratch {
+            attn: scratch,
+            epilogue,
+            hidden,
+        } = tower;
+        scratch.set(geom, seq_len);
+        let (x, out) = hidden_pair(hidden, src);
+
+        ops::rms_norm_batch_into(
+            ctx,
+            x,
+            &layer.input_layernorm,
+            geom.rms_norm_eps,
+            &mut scratch.normed_x,
+        );
+        let projected = scratch.proj.project(
+            ctx,
+            &layer.attention.qkv,
+            &scratch.normed_x,
+            q_dim,
+            kv_dim,
+            &epilogue.linear,
+        )?;
+        let v = projected
+            .v
+            .context("the sliding family projects V; this layer's rows hold none")?;
+
+        let mut attended = false;
+        match prep {
+            PrepRef::Single {
+                start_pos,
+                local_page_origin,
+                ..
+            } => {
+                pegainfer_kernels::ops::qkv_norm_rope_paged_prefill_hd256_plain_into(
+                    ctx,
+                    projected.q,
+                    projected.k,
+                    v,
+                    &mut scratch.q_prep,
+                    0,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.sliding_cos,
+                    &self.sliding_sin,
+                    family_layer,
+                    local_plan.page_indices_d(),
+                    0,
+                    local_page_origin,
+                    start_pos,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+            }
+            PrepRef::Batched {
+                local_origins,
+                global_tables,
+            } => {
+                pegainfer_kernels::ops::qkv_norm_rope_paged_decode_hd256_plain_into(
+                    ctx,
+                    projected.q,
+                    projected.k,
+                    v,
+                    &mut scratch.q_prep,
+                    0,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.sliding_cos,
+                    &self.sliding_sin,
+                    family_layer,
+                    local_plan.page_indices_d(),
+                    local_plan.page_indptr_d(),
+                    local_origins,
+                    &global_tables.positions,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+                // The generated kernels read the window as a split plan over
+                // the resident pages, masking the keys a page-aligned window
+                // still holds past it; the plan is the step's own.
+                if self.tilelang_local_attn() {
+                    if let Some(split) = local_split {
+                        let launch = split.metadata(
+                            local_plan.page_indices_d(),
+                            local_plan.page_indptr_d(),
+                            local_plan.last_page_len_d(),
+                        );
+                        pegainfer_kernels::ops::gemma4_hd256_decode_window_into(
+                            ctx,
+                            &scratch.q_prep,
+                            0,
+                            self.local_pool.buffer(),
+                            &self.local_pool.layout().kernel_layout(),
+                            family_layer,
+                            &launch.metadata,
+                            launch.o_indptr_d,
+                            launch.valid_mask_d,
+                            launch.tmp_v,
+                            launch.tmp_s,
+                            seq_len * launch.cap,
+                            &mut scratch.attn,
+                            geom.num_q_heads,
+                            1.0,
+                            self.sliding_window - 1,
+                        )?;
+                        attended = true;
+                    }
+                }
+            }
+            PrepRef::Mixed {
+                mix_positions,
+                mix_local_pages,
+                mix_local_origins,
+                mix_indptr,
+                ..
+            } => {
+                // One per-token launch covers every row — each row writes
+                // its position's slot in its own one-page window.
+                pegainfer_kernels::ops::qkv_norm_rope_paged_decode_hd256_plain_into(
+                    ctx,
+                    projected.q,
+                    projected.k,
+                    v,
+                    &mut scratch.q_prep,
+                    0,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.sliding_cos,
+                    &self.sliding_sin,
+                    family_layer,
+                    mix_local_pages,
+                    mix_indptr,
+                    mix_local_origins,
+                    mix_positions,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rms_norm_eps,
+                )?;
+            }
+        }
+
+        if !attended {
+            // The prompt rows' windowed read: the incumbent through core's
+            // door, or the generated kernel over the same plan and pool,
+            // chosen by the same flag as the global family's.
+            let window_left = self.sliding_window - 1;
+            if self.tilelang_local_attn() {
+                pegainfer_kernels::ops::gemma4_hd256_prefill_window_into(
+                    ctx,
+                    &scratch.q_prep,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    family_layer,
+                    local_plan,
+                    &mut scratch.attn,
+                    geom.num_q_heads,
+                    1.0,
+                    window_left,
+                )?;
+            } else {
+                pegainfer_kernels::ops::batch_prefill_paged_window_hd256_into(
+                    ctx,
+                    &scratch.q_prep,
+                    self.local_pool.buffer(),
+                    &self.local_pool.layout().kernel_layout(),
+                    family_layer,
+                    local_plan,
+                    &mut scratch.attn,
+                    geom.num_q_heads,
+                    1.0,
+                    i32::try_from(window_left).expect("window fits i32"),
+                )?;
+            }
+        }
+        attention_epilogue_into(
+            ctx,
+            layer,
+            geom,
+            self.tp_comm.as_ref(),
+            x,
+            &scratch.attn,
+            epilogue,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn global_layer_serve(
+        &self,
+        ctx: &DeviceContext,
+        tower: &mut TowerScratch,
+        layer: &Gemma4Layer,
+        family_layer: usize,
+        seq_len: usize,
+        prep: PrepRef<'_>,
+        split: Option<&mut SplitKvState>,
+        src: usize,
+    ) -> Result<()> {
+        let geom = &self.global_geom;
+        let q_dim = geom.num_q_heads * geom.head_dim;
+        let kv_dim = geom.num_kv_heads * geom.head_dim;
+        let TowerScratch {
+            attn: scratch,
+            epilogue,
+            hidden,
+        } = tower;
+        scratch.set(geom, seq_len);
+        let (x, out) = hidden_pair(hidden, src);
+
+        ops::rms_norm_batch_into(
+            ctx,
+            x,
+            &layer.input_layernorm,
+            geom.rms_norm_eps,
+            &mut scratch.normed_x,
+        );
+        let projected = scratch.proj.project(
+            ctx,
+            &layer.attention.qkv,
+            &scratch.normed_x,
+            q_dim,
+            kv_dim,
+            &epilogue.linear,
+        )?;
+        anyhow::ensure!(
+            projected.v.is_none(),
+            "global layer must not carry a v_proj; V is the k_proj fork"
+        );
+
+        // The prep writes both K and the weightless-normed V fork from the
+        // one raw K read — no D2D fork copy on the serving path.
+        match prep {
+            PrepRef::Single {
+                start_pos,
+                global_plan,
+                ..
+            } => {
+                pegainfer_kernels::ops::qk_norm_partial_rope_paged_prefill_hd512_into(
+                    ctx,
+                    projected.q,
+                    projected.k,
+                    &mut scratch.q_prep,
+                    0,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.global_cos,
+                    &self.global_sin,
+                    family_layer,
+                    global_plan.page_indices_d(),
+                    0,
+                    start_pos,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.rms_norm_eps,
+                )?;
+                self.global_prefill(
+                    ctx,
+                    &scratch.q_prep,
+                    family_layer,
+                    global_plan,
+                    &mut scratch.attn,
+                    geom.num_q_heads,
+                )?;
+            }
+            PrepRef::Batched { global_tables, .. } => {
+                let split = split.context("batched global decode needs the split-KV state")?;
+                pegainfer_kernels::ops::qk_norm_partial_rope_paged_decode_hd512_into(
+                    ctx,
+                    projected.q,
+                    projected.k,
+                    &mut scratch.q_prep,
+                    0,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.global_cos,
+                    &self.global_sin,
+                    family_layer,
+                    &global_tables.pages,
+                    &global_tables.indptr,
+                    &global_tables.origins,
+                    &global_tables.positions,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.rms_norm_eps,
+                )?;
+                // A pure reshape: `[rows, q·512]` and `[factor·rows,
+                // (q/factor)·512]` are the same memory.
+                let factor = self.global_split_factor;
+                scratch.q_prep.hidden_dim = q_dim / factor;
+                scratch.q_prep.seq_len = factor * seq_len;
+                scratch.attn.hidden_dim = q_dim / factor;
+                scratch.attn.seq_len = factor * seq_len;
+                let attend = self.global_decode_kernel();
+                let launch = split.metadata(
+                    &global_tables.pseudo_pages,
+                    &global_tables.pseudo_indptr,
+                    &global_tables.pseudo_last,
+                );
+                attend(
+                    ctx,
+                    &scratch.q_prep,
+                    0,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    family_layer,
+                    &launch.metadata,
+                    launch.o_indptr_d,
+                    launch.valid_mask_d,
+                    launch.tmp_v,
+                    launch.tmp_s,
+                    factor * seq_len * launch.cap,
+                    &mut scratch.attn,
+                    geom.num_q_heads / factor,
+                    1.0,
+                )?;
+                scratch.q_prep.hidden_dim = q_dim;
+                scratch.q_prep.seq_len = seq_len;
+                scratch.attn.hidden_dim = q_dim;
+                scratch.attn.seq_len = seq_len;
+            }
+            PrepRef::Mixed {
+                prefill_len,
+                mix_positions,
+                mix_global_pages,
+                mix_global_origins,
+                mix_indptr,
+                global_tables,
+                global_prefill_plan,
+                ..
+            } => {
+                let split = split.context("mixed global decode needs the split-KV state")?;
+                // One per-token launch covers every row — each row writes
+                // its position's slot in its own one-page window.
+                pegainfer_kernels::ops::qk_norm_partial_rope_paged_decode_hd512_into(
+                    ctx,
+                    projected.q,
+                    projected.k,
+                    &mut scratch.q_prep,
+                    0,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    &layer.attention.q_norm,
+                    &layer.attention.k_norm,
+                    &self.global_cos,
+                    &self.global_sin,
+                    family_layer,
+                    mix_global_pages,
+                    mix_indptr,
+                    mix_global_origins,
+                    mix_positions,
+                    self.cos_max_pos,
+                    geom.num_q_heads,
+                    geom.num_kv_heads,
+                    geom.rms_norm_eps,
+                )?;
+                // The prompt rows read through the ragged prefill plan —
+                // one entry per segment — and the suffix through the native
+                // split entry at the pseudo-row offset, the same kernel and
+                // chunk plan as a pure decode step.
+                scratch.q_prep.seq_len = prefill_len;
+                scratch.attn.seq_len = prefill_len;
+                self.global_prefill(
+                    ctx,
+                    &scratch.q_prep,
+                    family_layer,
+                    global_prefill_plan,
+                    &mut scratch.attn,
+                    geom.num_q_heads,
+                )?;
+                let batch = seq_len - prefill_len;
+                let factor = self.global_split_factor;
+                scratch.q_prep.hidden_dim = q_dim / factor;
+                scratch.q_prep.seq_len = factor * seq_len;
+                scratch.attn.hidden_dim = q_dim / factor;
+                scratch.attn.seq_len = factor * seq_len;
+                let attend = self.global_decode_kernel();
+                let launch = split.metadata(
+                    &global_tables.pseudo_pages,
+                    &global_tables.pseudo_indptr,
+                    &global_tables.pseudo_last,
+                );
+                attend(
+                    ctx,
+                    &scratch.q_prep,
+                    factor * prefill_len,
+                    self.global_pool.buffer(),
+                    &self.global_pool.layout().kernel_layout(),
+                    family_layer,
+                    &launch.metadata,
+                    launch.o_indptr_d,
+                    launch.valid_mask_d,
+                    launch.tmp_v,
+                    launch.tmp_s,
+                    factor * batch * launch.cap,
+                    &mut scratch.attn,
+                    geom.num_q_heads / factor,
+                    1.0,
+                )?;
+                scratch.q_prep.hidden_dim = q_dim;
+                scratch.q_prep.seq_len = seq_len;
+                scratch.attn.hidden_dim = q_dim;
+                scratch.attn.seq_len = seq_len;
+            }
+        }
+        attention_epilogue_into(
+            ctx,
+            layer,
+            geom,
+            self.tp_comm.as_ref(),
+            x,
+            &scratch.attn,
+            epilogue,
+            out,
+        )
+    }
+
+    /// Expand each global row into `global_split_factor` pseudo requests, build
+    /// the CSR the split kernel walks over their kv lengths, and upload both.
+    /// Pure decode and the mixed step differ only in which rows they hand in.
+    fn upload_split_kv_tables(
+        &self,
+        ctx: &DeviceContext,
+        rows: &[Vec<i32>],
+        lasts: &[usize],
+        pseudo: PseudoTables<'_>,
+        global_tables: &mut GlobalTables,
+        global_split: &mut SplitKvState,
+    ) -> Result<()> {
+        let PseudoTables {
+            pages,
+            indptr,
+            last_lens,
+            kv_lens,
+        } = pseudo;
+        let global_page = self.global_pool.layout().page_size;
+        let factor = self.global_split_factor;
+        for (row, &row_last) in rows.iter().zip(lasts) {
+            let row_len = i32::try_from(row.len()).context("global pages fit i32")?;
+            let last = i32::try_from(row_last).context("global last-page len fits i32")?;
+            let kv_len = (row.len() - 1) * global_page + row_last;
+            for _ in 0..factor {
+                pages.extend_from_slice(row);
+                indptr.push(indptr.last().unwrap() + row_len);
+                last_lens.push(last);
+                kv_lens.push(kv_len);
+            }
+        }
+        let csr = ops::build_split_kv_csr(
+            GLOBAL_SPLIT_CHUNK_TOKENS,
+            global_split.cap,
+            kv_lens,
+            factor * rows.len(),
+        )?;
+        upload_prefix(ctx, &mut global_tables.pseudo_pages, pages)?;
+        upload_prefix(ctx, &mut global_tables.pseudo_indptr, indptr)?;
+        upload_prefix(ctx, &mut global_tables.pseudo_last, last_lens)?;
+        global_split.upload_csr(ctx, &csr)
+    }
+
+    fn decode_fingerprint(kvs: &[&mut RankKv], padded: usize) -> Option<SteadyDecode> {
+        let rows = kvs
+            .iter()
+            .map(|kv| {
+                let position = kv.local.seq_len();
+                let kv_len = position.checked_add(1)?;
+                let span = kv.local.resident_span(position, kv_len).ok()?;
+                kv.global.desc_for_len(kv_len).ok()?;
+                Some(SteadyRow {
+                    kv: kv.id(),
+                    kv_len,
+                    local_origin: kv.local.origin_pages(),
+                    local_pages: span.pages,
+                    global_pages: kv.global.held_pages(),
+                    global_chunks: kv_len.div_ceil(GLOBAL_SPLIT_CHUNK_TOKENS),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(SteadyDecode { padded, rows })
+    }
+
+    fn plan_decode_batch(
+        &self,
+        ctx: &DeviceContext,
+        arena: &mut StepArena,
+        kvs: &[&mut RankKv],
+        padded: usize,
+    ) -> Result<()> {
+        let batch = kvs.len();
+        let fresh = Self::decode_fingerprint(kvs, padded);
+        let regular = arena
+            .steady
+            .as_ref()
+            .zip(fresh.as_ref())
+            .is_some_and(|(current, next)| current.advances_to(next));
+        if regular {
+            for kv in kvs {
+                self.check_step_bounds(kv, kv.local.seq_len() + 1)?;
+            }
+            arena.steady = fresh;
+            return Ok(());
+        }
+        arena.steady = fresh;
+        let StepArena {
+            host,
+            local_plan,
+            global_tables,
+            global_split,
+            local_split,
+            local_origins: origins_slot,
+            ..
+        } = arena;
+        host.reset_decode(padded);
+        let HostPlanningScratch {
+            local_rows,
+            local_last,
+            local_start,
+            global_rows,
+            global_last,
+            global_start,
+            local_origins,
+            global_pages_cat,
+            global_indptr,
+            positions,
+            pseudo_pages,
+            pseudo_indptr,
+            pseudo_last,
+            pseudo_kv_lens,
+            local_kv_lens,
+            ones,
+            ..
+        } = host;
+
+        for (r, kv) in kvs.iter().enumerate() {
+            let row = self.decode_row(kv, &mut local_rows[r], &mut global_rows[r])?;
+            local_origins.push(i32::try_from(row.local_origin).context("origin fits i32")?);
+            local_last.push(row.local_last);
+            local_start.push(row.local_start);
+            global_last.push(row.global_last);
+            global_start.push(row.position);
+        }
+
+        // Pad rows write each pool's reserved padding page — never a real
+        // request's KV — at position 0 with a one-token window.
+        for r in batch..padded {
+            local_origins.push(0);
+            local_rows[r].push(self.local_pool.padding_page_id());
+            local_last.push(1);
+            local_start.push(0);
+            global_rows[r].push(self.global_pool.padding_page_id());
+            global_last.push(1);
+            global_start.push(0);
+        }
+        local_plan.update_batch_with_cta_tile_q(
+            ctx,
+            &local_rows[..padded],
+            local_last,
+            local_start,
+            ones,
+            self.local_geom.num_q_heads,
+            self.local_geom.num_kv_heads,
+            self.local_geom.head_dim,
+            0,
+        )?;
+        // The local rows' resident lengths, chunked for the windowed decode
+        // read; a pad row is its one padding page.
+        let local_page = self.local_pool.layout().page_size;
+        for r in 0..padded {
+            local_kv_lens.push((local_rows[r].len() - 1) * local_page + local_last[r]);
+        }
+        let local_csr = ops::build_split_kv_csr(
+            LOCAL_SPLIT_CHUNK_TOKENS,
+            local_split.cap,
+            local_kv_lens,
+            padded,
+        )?;
+        local_split.upload_csr(ctx, &local_csr)?;
+        for r in 0..padded {
+            let row = &global_rows[r];
+            let row_len = i32::try_from(row.len()).context("global pages fit i32")?;
+            positions.push(i32::try_from(global_start[r]).context("position fits i32")?);
+            global_indptr.push(global_indptr.last().unwrap() + row_len);
+            global_pages_cat.extend_from_slice(row);
+        }
+        upload_prefix(ctx, &mut global_tables.pages, global_pages_cat)?;
+        upload_prefix(ctx, &mut global_tables.indptr, global_indptr)?;
+        upload_prefix(ctx, &mut global_tables.positions, positions)?;
+        self.upload_split_kv_tables(
+            ctx,
+            &global_rows[..padded],
+            &global_last[..padded],
+            PseudoTables {
+                pages: pseudo_pages,
+                indptr: pseudo_indptr,
+                last_lens: pseudo_last,
+                kv_lens: pseudo_kv_lens,
+            },
+            global_tables,
+            global_split,
+        )?;
+        upload_prefix(ctx, origins_slot, local_origins)
+    }
+
+    /// The stream that built the pools is the one that ordered every page
+    /// write already in them, so a step on any other stream has no ordering
+    /// against the KV it is about to read.
+    fn check_stream(&self, ctx: &DeviceContext) -> Result<()> {
+        anyhow::ensure!(
+            std::sync::Arc::ptr_eq(&ctx.stream, self.local_pool.buffer().stream()),
+            "a step must use the DeviceContext stream that constructed this GemmaServe"
+        );
+        Ok(())
+    }
+
+    /// Returns the hidden slot holding the tower's output.
+    #[allow(clippy::too_many_arguments)]
+    fn run_tower(
+        &self,
+        ctx: &DeviceContext,
+        tower: &mut TowerScratch,
+        ids: &CudaSlice<u32>,
+        seq_len: usize,
+        local_plan: &PrefillPagedPlan,
+        prep: PrepRef<'_>,
+        mut global_split: Option<&mut SplitKvState>,
+        mut local_split: Option<&mut SplitKvState>,
+    ) -> Result<usize> {
+        let weights = &self.weights;
+        ops::embedding_batch(ctx, &weights.embed_tokens, ids, &mut tower.hidden[0])?;
+        ops::scale_bf16_in_place(
+            ctx,
+            &mut tower.hidden[0],
+            embed_scale_bf16(self.local_geom.hidden_size),
+        )?;
+        let mut src = 0usize;
+        for (index, kind) in weights.config.layer_types.iter().enumerate() {
+            let layer = &weights.layers[index];
+            let family_layer = self.family_index[index];
+            match kind {
+                LayerKind::Sliding => {
+                    self.local_layer_serve(
+                        ctx,
+                        tower,
+                        layer,
+                        family_layer,
+                        seq_len,
+                        prep,
+                        local_plan,
+                        local_split.as_deref_mut(),
+                        src,
+                    )?;
+                }
+                LayerKind::Global => {
+                    self.global_layer_serve(
+                        ctx,
+                        tower,
+                        layer,
+                        family_layer,
+                        seq_len,
+                        prep,
+                        global_split.as_deref_mut(),
+                        src,
+                    )?;
+                }
+            }
+            src ^= 1;
+        }
+        Ok(src)
+    }
+
+    /// One batched decode step: each request advances a single token and the
+    /// batch shares every layer's weight pass. Row `r` of the returned logits
+    /// is request `r`'s next-token distribution; they live in the arena and
+    /// are valid until its next step.
+    pub(crate) fn decode_batch_step<'a>(
+        &self,
+        ctx: &DeviceContext,
+        arena: &'a mut StepArena,
+        kvs: &mut [&mut RankKv],
+        tokens: &[u32],
+    ) -> Result<&'a mut HiddenStates> {
+        self.decode_batch_step_inner(ctx, arena, kvs, Some(tokens))
+    }
+
+    /// Decode using token ids written into the arena by the prior staged
+    /// sampler. The caller keeps the row order and bucket unchanged.
+    pub(crate) fn decode_batch_step_resident<'a>(
+        &self,
+        ctx: &DeviceContext,
+        arena: &'a mut StepArena,
+        kvs: &mut [&mut RankKv],
+    ) -> Result<&'a mut HiddenStates> {
+        self.decode_batch_step_inner(ctx, arena, kvs, None)
+    }
+
+    fn decode_batch_step_inner<'a>(
+        &self,
+        ctx: &DeviceContext,
+        arena: &'a mut StepArena,
+        kvs: &mut [&mut RankKv],
+        tokens: Option<&[u32]>,
+    ) -> Result<&'a mut HiddenStates> {
+        let batch = kvs.len();
+        let padded = self.prepare_decode_step(ctx, arena, kvs, tokens)?;
+        let StepArena {
+            tower,
+            local_plan,
+            global_tables,
+            global_split,
+            local_split,
+            local_origins,
+            ids,
+            head_normed,
+            logits,
+            graphs,
+            graph_enabled,
+            ..
+        } = arena;
+        if *graph_enabled {
+            let graph = &mut graphs[decode_bucket_slot(padded)];
+            anyhow::ensure!(
+                graph.is_captured(),
+                "no captured graph for bucket {padded}; the pre-capture sweep must cover \
+                 every bucket before serving"
+            );
+            graph.launch_captured(ctx)?;
+        } else {
+            self.decode_gpu_body(
+                ctx,
+                tower,
+                ids,
+                padded,
+                local_plan,
+                global_tables,
+                global_split,
+                local_split,
+                local_origins,
+                head_normed,
+                logits,
+            )?;
+        }
+        logits.seq_len = batch;
+        // Append-then-attend, per request: the batch shared a step, but each
+        // request owns its own frontier and its own released front.
+        for kv in kvs.iter_mut() {
+            self.advance_local(kv, 1)?;
+            kv.global.advance(1);
+        }
+        Ok(logits)
+    }
+
+    /// The decode step's GPU body — embedding through the LM head. A pure
+    /// kernel sequence over step-stable pointers: no allocation, no
+    /// synchronization, no pool bookkeeping, which is what makes it
+    /// capturable.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_gpu_body(
+        &self,
+        ctx: &DeviceContext,
+        tower: &mut TowerScratch,
+        ids: &CudaSlice<u32>,
+        rows: usize,
+        local_plan: &mut PrefillPagedPlan,
+        global_tables: &mut GlobalTables,
+        global_split: &mut SplitKvState,
+        local_split: &mut SplitKvState,
+        local_origins: &CudaSlice<i32>,
+        head_normed: &mut HiddenStates,
+        logits: &mut HiddenStates,
+    ) -> Result<()> {
+        let src = self.run_tower(
+            ctx,
+            tower,
+            ids,
+            rows,
+            local_plan,
+            PrepRef::Batched {
+                local_origins,
+                global_tables,
+            },
+            Some(global_split),
+            Some(local_split),
+        )?;
+        logits_tail_into(
+            ctx,
+            &self.weights,
+            &tower.hidden[src],
+            self.local_geom.rms_norm_eps,
+            self.final_logit_softcapping,
+            head_normed,
+            logits,
+        )?;
+        let (local_last, kv_chunk) = local_plan.decode_metadata_d_mut();
+        ops::advance_decode_metadata(
+            ctx,
+            &mut global_tables.positions,
+            local_last,
+            &mut global_tables.pseudo_last,
+            kv_chunk,
+            rows,
+            self.global_split_factor,
+        )
+    }
+
+    /// One mixed step: one or more admitted prefill entries — whole prompts,
+    /// or mid-walk segments under the chunk knob — ride the same weight scan
+    /// as the live decode batch (the row suffix), entry rows concatenated
+    /// first. Always eager — entry lengths vary per admission, so this shape
+    /// never rides a graph; the pure-decode steps around it keep their
+    /// bucketed replays. The returned logits hold `batch + entries` rows: one
+    /// distribution per prefill entry — a mid-walk segment's row is sampled
+    /// and discarded, and only the final segment supplies the request's
+    /// first pick — then the decode batch in order.
+    pub(crate) fn mixed_prefill_decode_step<'a>(
+        &self,
+        ctx: &DeviceContext,
+        arena: &'a mut StepArena,
+        prefills: &mut [(&mut RankKv, &[u32])],
+        decode_kvs: &mut [&mut RankKv],
+        decode_tokens: &[u32],
+    ) -> Result<&'a mut HiddenStates> {
+        let prompts = prefills.len();
+        let prefill_len: usize = prefills.iter().map(|(_, p)| p.len()).sum();
+        let batch = decode_kvs.len();
+        anyhow::ensure!(
+            prompts > 0 && prefill_len > 0 && batch > 0,
+            "mixed step needs prompt rows ({prompts} prompts, {prefill_len} tokens) \
+             and a live decode batch ({batch})"
+        );
+        anyhow::ensure!(
+            decode_tokens.len() == batch,
+            "mixed step has {batch} decode requests but {} tokens",
+            decode_tokens.len()
+        );
+        anyhow::ensure!(
+            batch + prompts <= arena.max_rows,
+            "mixed step logits rows {} exceed the arena's {} row ceiling",
+            batch + prompts,
+            arena.max_rows
+        );
+        self.check_stream(ctx)?;
+        arena.steady = None;
+        for (_, prompt) in prefills.iter() {
+            validate_tokens(&self.weights, self.local_geom.hidden_size, prompt)?;
+        }
+        validate_tokens(&self.weights, self.local_geom.hidden_size, decode_tokens)?;
+        let rows = prefill_len + batch;
+        let StepArena {
+            host,
+            global_tables,
+            global_split,
+            mix_positions,
+            mix_local_pages,
+            mix_local_origins,
+            mix_global_pages,
+            mix_global_origins,
+            mix_indptr,
+            head_normed,
+            logits,
+            ..
+        } = arena;
+        host.reset_mixed(prompts, batch, rows);
+        let HostPlanningScratch {
+            local_rows,
+            local_last,
+            local_start,
+            seq_lens,
+            global_rows,
+            global_last,
+            pseudo_pages,
+            pseudo_indptr,
+            pseudo_last,
+            pseudo_kv_lens,
+            prefill_global_rows,
+            prefill_global_last,
+            prefill_global_start,
+            segs,
+            mix_rows,
+            ids: ids_host,
+            ..
+        } = host;
+
+        // Prompt entries first, then the decode rows — the ragged shape the
+        // plans, the row buffers and the segment table share. All entries
+        // derive from pre-advance state, the same way both pure steps plan.
+        let mut row_cursor = 0usize;
+        for (r, (kv, prompt)) in prefills.iter().enumerate() {
+            let start = kv.local.seq_len();
+            let kv_len = start + prompt.len();
+            self.check_step_bounds(kv, kv_len)?;
+            let span = kv.local.resident_span(start, kv_len)?;
+            let row = &mut local_rows[r];
+            kv.local.extend_page_row(row);
+            let global_last = kv.global.desc_for_len(kv_len)?.last_page_len();
+            let global_row = &mut prefill_global_rows[r];
+            kv.global.extend_page_indices_i32(global_row);
+            for i in 0..prompt.len() {
+                mix_rows.push(start + i, row, kv.local.origin_pages(), global_row)?;
+            }
+            segs.push(MixSeg {
+                row_offset: row_cursor,
+                rows: prompt.len(),
+            });
+            row_cursor += prompt.len();
+            prefill_global_last.push(global_last);
+            prefill_global_start.push(start);
+            local_last.push(span.last_page_len);
+            local_start.push(span.start);
+            seq_lens.push(prompt.len());
+        }
+        for (r, kv) in decode_kvs.iter().enumerate() {
+            let local_row = &mut local_rows[prompts + r];
+            let global_row = &mut global_rows[r];
+            let row = self.decode_row(kv, local_row, global_row)?;
+            mix_rows.push(row.position, local_row, row.local_origin, global_row)?;
+            local_last.push(row.local_last);
+            local_start.push(row.local_start);
+            seq_lens.push(1);
+            global_last.push(row.global_last);
+        }
+        // One ragged local plan covers every row's windowed attention read.
+        let local_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+            ctx,
+            &local_rows[..prompts + batch],
+            local_last,
+            local_start,
+            seq_lens,
+            self.local_geom.num_q_heads,
+            self.local_geom.num_kv_heads,
+            self.local_geom.head_dim,
+            0,
+        )?;
+        let global_prefill_plan = PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+            ctx,
+            &prefill_global_rows[..prompts],
+            prefill_global_last,
+            prefill_global_start,
+            &seq_lens[..prompts],
+            self.global_geom.num_q_heads,
+            self.global_geom.num_kv_heads,
+            self.global_geom.head_dim,
+            0,
+        )?;
+        upload_prefix(ctx, mix_positions, &mix_rows.positions)?;
+        upload_prefix(ctx, mix_local_pages, &mix_rows.local_pages)?;
+        upload_prefix(ctx, mix_local_origins, &mix_rows.local_origins)?;
+        upload_prefix(ctx, mix_global_pages, &mix_rows.global_pages)?;
+        upload_prefix(ctx, mix_global_origins, &mix_rows.global_origins)?;
+        // The split-KV attention read covers the decode rows only.
+        self.upload_split_kv_tables(
+            ctx,
+            &global_rows[..batch],
+            &global_last[..batch],
+            PseudoTables {
+                pages: pseudo_pages,
+                indptr: pseudo_indptr,
+                last_lens: pseudo_last,
+                kv_lens: pseudo_kv_lens,
+            },
+            global_tables,
+            global_split,
+        )?;
+
+        for (_, prompt) in prefills.iter() {
+            ids_host.extend_from_slice(prompt);
+        }
+        ids_host.extend_from_slice(decode_tokens);
+        let ids = ctx
+            .stream
+            .clone_htod(ids_host)
+            .map_err(|e| anyhow::anyhow!("mixed step ids H2D failed: {e}"))?;
+        let mut tower = TowerScratch::new(
+            ctx,
+            &self.local_geom,
+            &self.global_geom,
+            rows,
+            self.fuses_projections(),
+            &self.linear,
+        )?;
+        tower.open(rows)?;
+        let src = self.run_tower(
+            ctx,
+            &mut tower,
+            &ids,
+            rows,
+            &local_plan,
+            PrepRef::Mixed {
+                prefill_len,
+                mix_positions: &*mix_positions,
+                mix_local_pages: &*mix_local_pages,
+                mix_local_origins: &*mix_local_origins,
+                mix_global_pages: &*mix_global_pages,
+                mix_global_origins: &*mix_global_origins,
+                mix_indptr: &*mix_indptr,
+                global_tables: &*global_tables,
+                global_prefill_plan: &global_prefill_plan,
+            },
+            Some(global_split),
+            // A mixed step's decode rows share the windowed prefill read
+            // with its prompt rows; only pure decode steps split.
+            None,
+        )?;
+        // Compact the sampled rows into the free ping-pong slot — each
+        // segment's last row, then the decode suffix as one range — and run
+        // the batch + prompts rows through the LM head.
+        let (x, staging) = hidden_pair(&mut tower.hidden, src);
+        staging.seq_len = batch + prompts;
+        for (j, seg) in segs.iter().enumerate() {
+            ops::copy_hidden_token_range_into(
+                ctx,
+                x,
+                seg.row_offset + seg.rows - 1,
+                staging,
+                j,
+                1,
+            )?;
+        }
+        ops::copy_hidden_token_range_into(ctx, x, prefill_len, staging, prompts, batch)?;
+        logits_tail_into(
+            ctx,
+            &self.weights,
+            staging,
+            self.local_geom.rms_norm_eps,
+            self.final_logit_softcapping,
+            head_normed,
+            logits,
+        )?;
+        logits.seq_len = batch + prompts;
+        // Append-then-attend, per request, the same way both pure steps
+        // settle their frontiers.
+        for (kv, prompt) in prefills.iter_mut() {
+            self.advance_local(kv, prompt.len())?;
+            kv.global.advance(prompt.len());
+        }
+        for kv in decode_kvs.iter_mut() {
+            self.advance_local(kv, 1)?;
+            kv.global.advance(1);
+        }
+        Ok(logits)
+    }
+
+    /// Host-side preparation a decode step and its capture share: checks,
+    /// the bucket, the arena open, the plan refill and the metadata uploads.
+    fn prepare_decode_step(
+        &self,
+        ctx: &DeviceContext,
+        arena: &mut StepArena,
+        kvs: &[&mut RankKv],
+        tokens: Option<&[u32]>,
+    ) -> Result<usize> {
+        let batch = kvs.len();
+        anyhow::ensure!(batch > 0, "a decode batch needs at least one request");
+        anyhow::ensure!(
+            batch <= arena.max_rows,
+            "decode batch of {batch} exceeds the arena's {} row ceiling",
+            arena.max_rows
+        );
+        self.check_stream(ctx)?;
+        if let Some(tokens) = tokens {
+            anyhow::ensure!(
+                tokens.len() == batch,
+                "decode batch has {batch} requests but {} tokens",
+                tokens.len()
+            );
+            validate_tokens(&self.weights, self.local_geom.hidden_size, tokens)?;
+        }
+
+        // A step computes at its power-of-two bucket whether or not graphs
+        // are on: padding is part of the numeric contract, which is what
+        // keeps a captured replay and the eager escape hatch the same
+        // arithmetic at every batch size.
+        let padded = batch.next_power_of_two().max(arena.min_bucket);
+        arena.open(ctx, padded)?;
+        self.plan_decode_batch(ctx, arena, kvs, padded)?;
+        if let Some(tokens) = tokens {
+            arena.host.ids.clear();
+            arena.host.ids.extend_from_slice(tokens);
+            arena.host.ids.resize(padded, 0);
+            upload_prefix(ctx, &mut arena.ids, &arena.host.ids)?;
+        }
+        Ok(padded)
+    }
+
+    /// Capture every power-of-two decode graph before serving, then
+    /// synchronize, so capture cost and any capture error land here rather
+    /// than on the first requests. Each bucket warms one eager pass first —
+    /// forcing lazy CUDA and cuBLAS initialization outside capture — records
+    /// the body without executing it, then drives the same step through the
+    /// serving path, which replays the fresh graph and advances the dummy.
+    pub(crate) fn precapture_decode_graphs(
+        &self,
+        ctx: &DeviceContext,
+        arena: &mut StepArena,
+    ) -> Result<()> {
+        if !arena.graph_enabled {
+            return Ok(());
+        }
+        let mut kv = self.alloc_kv();
+        admit_tokens(&self.local_pool, &self.global_pool, &mut kv, 1)?;
+        self.step(ctx, &mut kv, &[0])?;
+        let mut bucket = 1usize;
+        while bucket <= arena.max_rows {
+            for phase in PrecapturePhase::ALL {
+                self.precapture_bucket(ctx, arena, &mut kv, bucket, phase)?;
+            }
+            bucket *= 2;
+        }
+        arena.min_bucket = 1;
+        ctx.sync()
+    }
+
+    /// One bucket of the sweep, one phase at a time. `Capture` only records, while
+    /// `Warm` executes an eager pass and `Launch` drives the serving path.
+    pub(crate) fn precapture_bucket(
+        &self,
+        ctx: &DeviceContext,
+        arena: &mut StepArena,
+        kv: &mut RankKv,
+        bucket: usize,
+        phase: PrecapturePhase,
+    ) -> Result<()> {
+        match phase {
+            PrecapturePhase::Warm => {
+                arena.min_bucket = bucket;
+                arena.steady = None;
+                admit_tokens(&self.local_pool, &self.global_pool, kv, 1)?;
+                let kvs: [&mut RankKv; 1] = [&mut *kv];
+                let padded = self.prepare_decode_step(ctx, arena, &kvs, Some(&[0]))?;
+                let StepArena {
+                    tower,
+                    local_plan,
+                    global_tables,
+                    global_split,
+                    local_split,
+                    local_origins,
+                    ids,
+                    head_normed,
+                    logits,
+                    ..
+                } = arena;
+                self.decode_gpu_body(
+                    ctx,
+                    tower,
+                    ids,
+                    padded,
+                    local_plan,
+                    global_tables,
+                    global_split,
+                    local_split,
+                    local_origins,
+                    head_normed,
+                    logits,
+                )
+            }
+            PrecapturePhase::Capture => {
+                let StepArena {
+                    tower,
+                    local_plan,
+                    global_tables,
+                    global_split,
+                    local_split,
+                    local_origins,
+                    ids,
+                    head_normed,
+                    logits,
+                    graphs,
+                    ..
+                } = arena;
+                graphs[decode_bucket_slot(bucket)].capture_only(ctx, || {
+                    self.decode_gpu_body(
+                        ctx,
+                        tower,
+                        ids,
+                        bucket,
+                        local_plan,
+                        global_tables,
+                        global_split,
+                        local_split,
+                        local_origins,
+                        head_normed,
+                        logits,
+                    )
+                })
+            }
+            PrecapturePhase::Launch => {
+                let mut kvs: [&mut RankKv; 1] = [&mut *kv];
+                self.decode_batch_step(ctx, arena, &mut kvs, &[0])?;
+                Ok(())
+            }
+        }
+    }
+
+    /// The host-side prologue every single-request prompt pass shares. All of it
+    /// runs on `ctx.stream`, so the overlap-safe form can fence once after it
+    /// and leave everything downstream in flight.
+    fn prepare_single(
+        &self,
+        ctx: &DeviceContext,
+        kv: &RankKv,
+        tokens: &[u32],
+        what: &str,
+    ) -> Result<SinglePass> {
+        let seq_len = tokens.len();
+        anyhow::ensure!(seq_len > 0, "{what} needs at least one token");
+        self.check_stream(ctx)?;
+        validate_tokens(&self.weights, self.local_geom.hidden_size, tokens)?;
+        let start_pos = kv.local.seq_len();
+        self.check_step_bounds(kv, start_pos + seq_len)?;
+        let plan = self.plan_step(ctx, kv, start_pos, seq_len)?;
+        let tower = TowerScratch::new(
+            ctx,
+            &self.local_geom,
+            &self.global_geom,
+            seq_len,
+            self.fuses_projections(),
+            &self.linear,
+        )?;
+        let ids = ctx
+            .stream
+            .clone_htod(tokens)
+            .map_err(|e| anyhow::anyhow!("token ids H2D failed: {e}"))?;
+        let last = HiddenStates::zeros(ctx, self.local_geom.hidden_size, 1)?;
+        Ok(SinglePass {
+            plan,
+            tower,
+            ids,
+            last,
+        })
+    }
+
+    /// The kernel half of a single-request pass, launched after the overlap-safe
+    /// form has fenced. Returns the tower slot holding every row's final
+    /// hidden state.
+    fn run_single_tower(
+        &self,
+        ctx: &DeviceContext,
+        pass: &mut SinglePass,
+        seq_len: usize,
+    ) -> Result<usize> {
+        let src = self.run_tower(
+            ctx,
+            &mut pass.tower,
+            &pass.ids,
+            seq_len,
+            &pass.plan.local_plan,
+            PrepRef::Single {
+                start_pos: pass.plan.start_pos,
+                local_page_origin: pass.plan.local_page_origin,
+                global_plan: &pass.plan.global_plan,
+            },
+            None,
+            None,
+        )?;
+        ops::copy_hidden_token_range_into(
+            ctx,
+            &pass.tower.hidden[src],
+            seq_len - 1,
+            &mut pass.last,
+            0,
+            1,
+        )?;
+        Ok(src)
+    }
+
+    pub(crate) fn step(
+        &self,
+        ctx: &DeviceContext,
+        kv: &mut RankKv,
+        tokens: &[u32],
+    ) -> Result<HiddenStates> {
+        self.step_scoring(ctx, kv, tokens, None)
+    }
+
+    /// [`GemmaServe::step`] that also hands `score` the head's logits for
+    /// every row but the last, `PROMPT_SCORE_ROWS` rows at a time with the
+    /// first row's index: row `r` predicts token `r + 1`. The readback and the
+    /// tower are split so a driver sharing one thread across ranks can launch
+    /// every rank's tower before rank 0's readback waits on its collective.
+    pub(crate) fn step_scoring(
+        &self,
+        ctx: &DeviceContext,
+        kv: &mut RankKv,
+        tokens: &[u32],
+        score: Option<PromptScorer<'_>>,
+    ) -> Result<HiddenStates> {
+        let mut tower = self.launch_prompt_tower(ctx, kv, tokens)?;
+        if let Some(score) = score {
+            self.score_prompt_tower(ctx, &mut tower, score)?;
+        }
+        Ok(tower.into_logits())
+    }
+
+    /// Run the prompt's tower and head, and hold the rows a later
+    /// [`GemmaServe::score_prompt_tower`] reads. Nothing is read back to the
+    /// host here, so the launch never waits on the rank's collective.
+    pub(crate) fn launch_prompt_tower(
+        &self,
+        ctx: &DeviceContext,
+        kv: &mut RankKv,
+        tokens: &[u32],
+    ) -> Result<PromptTower> {
+        let seq_len = tokens.len();
+        let mut pass = self.prepare_single(ctx, kv, tokens, "step")?;
+        log::debug!(
+            "step: start_pos {} seq_len {seq_len} pages local {} global {}",
+            kv.local.seq_len(),
+            kv.local.held_pages(),
+            kv.global.held_pages()
+        );
+        let src = self.run_single_tower(ctx, &mut pass, seq_len)?;
+        let logits = logits_tail(
+            ctx,
+            &self.weights,
+            &pass.last,
+            self.local_geom.rms_norm_eps,
+            self.final_logit_softcapping,
+        )?;
+        // Append-then-attend: the old window and the new tokens were both
+        // resident through the layers above, so only now is the front safe to
+        // release. The local move is settled first because it is the only
+        // fallible one — the global advance cannot fail, so nothing here can
+        // leave one family ahead of the other.
+        self.advance_local(kv, seq_len)?;
+        kv.global.advance(seq_len);
+        Ok(PromptTower {
+            pass,
+            src,
+            seq_len,
+            logits,
+        })
+    }
+
+    /// The per-row readback a scored prompt owes rank 0. It blocks on this
+    /// rank's collectives, so call it only once every rank's tower is launched.
+    pub(crate) fn score_prompt_tower(
+        &self,
+        ctx: &DeviceContext,
+        tower: &mut PromptTower,
+        score: PromptScorer<'_>,
+    ) -> Result<()> {
+        let seq_len = tower.seq_len;
+        if seq_len <= 1 {
+            return Ok(());
+        }
+        let rows = PROMPT_SCORE_ROWS.min(seq_len - 1);
+        let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
+        let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
+        let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, rows)?;
+        for start in (0..seq_len - 1).step_by(rows) {
+            let n = rows.min(seq_len - 1 - start);
+            hidden.seq_len = n;
+            ops::copy_hidden_token_range_into(
+                ctx,
+                &tower.pass.tower.hidden[tower.src],
+                start,
+                &mut hidden,
+                0,
+                n,
+            )?;
+            logits_tail_into(
+                ctx,
+                &self.weights,
+                &hidden,
+                self.local_geom.rms_norm_eps,
+                self.final_logit_softcapping,
+                &mut normed,
+                &mut logits,
+            )?;
+            score(&mut logits, start)?;
+        }
+        Ok(())
+    }
+
+    /// Whole-prompt prefill left in flight on the active stream — the
+    /// overlap-safe form of [`GemmaServe::step`].
+    /// Every host-side producer (plan upload, token-id H2D, buffer
+    /// allocation) runs on `ctx.stream` before one producer fence;
+    /// everything after is kernel work over buffers the returned pass owns,
+    /// so the caller may launch it under a stream override and leave it in
+    /// flight while decode steps continue on `ctx.stream`. The
+    /// append-then-attend window release is deferred to
+    /// [`GemmaServe::release_prefill_window`] at join time — a page
+    /// released here could be re-allocated to a decoding request's frontier
+    /// and written on `ctx.stream` while the in-flight layers still read
+    /// it.
+    pub(crate) fn prefill_into_logits(
+        &self,
+        ctx: &DeviceContext,
+        kv: &mut RankKv,
+        tokens: &[u32],
+    ) -> Result<PrefillPass> {
+        let seq_len = tokens.len();
+        let mut pass = self.prepare_single(ctx, kv, tokens, "prefill")?;
+        let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, 1)?;
+        let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, 1)?;
+        fence_producers_before_override(ctx)?;
+        self.run_single_tower(ctx, &mut pass, seq_len)?;
+        logits_tail_into(
+            ctx,
+            &self.weights,
+            &pass.last,
+            self.local_geom.rms_norm_eps,
+            self.final_logit_softcapping,
+            &mut normed,
+            &mut logits,
+        )?;
+        kv.local.advance(seq_len);
+        kv.global.advance(seq_len);
+        Ok(PrefillPass {
+            logits,
+            _pass: pass,
+            _normed: normed,
+        })
+    }
+
+    /// The deferred append-then-attend release for an overlapped prefill:
+    /// call once its completion event has fired, before the request joins
+    /// the decode batch.
+    pub(crate) fn release_prefill_window(&self, kv: &mut RankKv) -> Result<()> {
+        self.advance_local(kv, 0)
+    }
+}
+
+/// A launched prompt tower and the head rows a later scored pass reads. Kept
+/// alive across the peer ranks' tower launches so rank 0's own readback — the
+/// only part that waits on its collective — runs after every rank is in flight.
+pub(crate) struct PromptTower {
+    pass: SinglePass,
+    src: usize,
+    seq_len: usize,
+    logits: HiddenStates,
+}
+
+impl PromptTower {
+    pub(crate) fn into_logits(self) -> HiddenStates {
+        self.logits
+    }
+}
+
+/// What one single-request prompt pass allocates before any layer runs and
+/// keeps alive until its kernels retire.
+struct SinglePass {
+    plan: GemmaStepPlan,
+    tower: TowerScratch,
+    ids: CudaSlice<u32>,
+    last: HiddenStates,
+}
+
+/// Everything an overlapped prefill keeps alive while its kernels are in
+/// flight on the lane stream: dropping any of it before the completion
+/// event fires would free device memory the pass still reads.
+pub(crate) struct PrefillPass {
+    pub(crate) logits: HiddenStates,
+    _pass: SinglePass,
+    _normed: HiddenStates,
+}
+
+#[cfg(test)]
+mod oom_probe {
+    #[test]
+    fn only_a_device_out_of_memory_reads_as_one() {
+        let oom = anyhow::anyhow!(
+            "Alloc failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+        );
+        assert!(super::is_out_of_memory(&oom));
+        for other in [
+            "Alloc failed: DriverError(CUDA_ERROR_INVALID_VALUE, \"invalid argument\")",
+            "Alloc failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")",
+            "cuBLAS handle is invalid",
+        ] {
+            assert!(
+                !super::is_out_of_memory(&anyhow::anyhow!("{other}")),
+                "{other} must stay an error rather than read as a card too small"
+            );
+        }
+    }
+}
+
+#[path = "serve_oracle.rs"]
+#[cfg(test)]
+pub(crate) mod oracle;

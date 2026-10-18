@@ -18,7 +18,7 @@ repos:
       - id: clippy
         args: [--release, --all-targets]
 
-  # The hook above lints `default-members` (openinfer-server) with default
+  # The hook above lints `default-members` (pegainfer-server) with default
   # features, so the feature-gated kimi-k2 crate is never compiled and never
   # linted. This local hook closes that hole — but only when kimi-k2 source
   # changes (the CUDA build is expensive), and `--no-deps` keeps it scoped to
@@ -27,24 +27,24 @@ repos:
     hooks:
       - id: clippy-kimi-k2
         name: clippy (kimi-k2, -D warnings)
-        entry: cargo clippy -p openinfer-kimi-k2 --no-deps --release --features kimi-k2,kernel-report --all-targets -- -D warnings
+        entry: cargo clippy -p pegainfer-kimi-k2 --no-deps --release --features kimi-k2,kernel-report --all-targets -- -D warnings
         language: system
         types: [rust]
-        files: ^openinfer-kimi-k2/
+        files: ^pegainfer-kimi-k2/
         pass_filenames: false
       # The kimi-k2 hook above is --no-deps, so the kimi code living in
-      # openinfer-kernels (ops/kimi_k2 + csrc) is never linted by it.
+      # pegainfer-kernels (ops/kimi_k2 + csrc) is never linted by it.
       - id: clippy-kernels-kimi
         name: clippy (kernels w/ kimi-k2, -D warnings)
-        entry: cargo clippy -p openinfer-kernels --no-deps --release --features kimi-k2 --all-targets -- -D warnings
+        entry: cargo clippy -p pegainfer-kernels --no-deps --release --features kimi-k2 --all-targets -- -D warnings
         language: system
         types: [rust]
-        files: ^openinfer-kernels/
+        files: ^pegainfer-kernels/
         pass_filenames: false
       - id: clippy-comm
-        name: clippy (openinfer-comm, -D warnings)
-        entry: cargo clippy -p openinfer-comm --no-deps --release --all-targets -- -D warnings
+        name: clippy (pegainfer-comm, -D warnings)
+        entry: cargo clippy -p pegainfer-comm --no-deps --release --all-targets -- -D warnings
         language: system
         types: [rust]
-        files: ^openinfer-comm/
+        files: ^pegainfer-comm/
         pass_filenames: false

@@ -84,7 +84,7 @@ rustup show active-toolchain >/dev/null   # triggers install of the pinned night
 # missing cccl; CUDA 12.x does not — so require it explicitly.) Only flashinfer +
 # cccl are inited; the heavy unused nested submodules (cutlass/nccl/nixl/spdlog)
 # and the DeepEP submodule are deliberately left untouched.
-FI=openinfer-kernels/third_party/flashinfer
+FI=pegainfer-kernels/third_party/flashinfer
 is_git() { git -C "$1" rev-parse --git-dir >/dev/null 2>&1; }
 
 if [ ! -e "$FI/include" ]; then
@@ -102,10 +102,10 @@ if [ ! -e "$FI/3rdparty/cccl/libcudacxx/include/cuda/cmath" ]; then
 fi
 
 # --- 6. build ------------------------------------------------------------------
-if [ -n "${OPENINFER_CUDA_SM:-}" ]; then
-  log "OPENINFER_CUDA_SM=$OPENINFER_CUDA_SM — compiling kernels for this arch instead of the live GPU."
+if [ -n "${PEGAINFER_CUDA_SM:-}" ]; then
+  log "PEGAINFER_CUDA_SM=$PEGAINFER_CUDA_SM — compiling kernels for this arch instead of the live GPU."
 else
-  log "OPENINFER_CUDA_SM unset — build.rs auto-detects the arch from nvidia-smi."
+  log "PEGAINFER_CUDA_SM unset — build.rs auto-detects the arch from nvidia-smi."
 fi
 log "Building (release, default Qwen3-4B feature)… first build compiles CUDA kernels, give it a few minutes."
 cargo build --release

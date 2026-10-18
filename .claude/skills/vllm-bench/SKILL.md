@@ -1,6 +1,6 @@
 ---
 name: vllm-bench
-description: "Use vllm-bench to benchmark OpenAI-compatible or vLLM serving endpoints, especially multi-turn chat load tests. Use when the user asks for vllm bench, vllm-bench, multi-turn benchmark, chat serving benchmark, TTFT/TPOT/throughput measurement, concurrency sweep, load test, 压测, 多轮压测, or wants help installing, running --help, choosing flags, validating a local OpenInfer/vLLM server, saving JSON results, or interpreting vllm-bench metrics."
+description: "Use vllm-bench to benchmark OpenAI-compatible or vLLM serving endpoints, especially multi-turn chat load tests. Use when the user asks for vllm bench, vllm-bench, multi-turn benchmark, chat serving benchmark, TTFT/TPOT/throughput measurement, concurrency sweep, load test, 压测, 多轮压测, or wants help installing, running --help, choosing flags, validating a local PegaInfer/vLLM server, saving JSON results, or interpreting vllm-bench metrics."
 ---
 
 # vllm-bench
@@ -175,14 +175,14 @@ Read the output as:
 Expect later turns to have larger input token counts because each request sends
 the prior user/assistant history plus the next user message.
 
-## Example: Local OpenInfer Qwen3-4B Smoke
+## Example: Local PegaInfer Qwen3-4B Smoke
 
-This was validated locally with OpenInfer Qwen3-4B and `vllm-bench` built from
-this repo. Start OpenInfer:
+This was validated locally with PegaInfer Qwen3-4B and `vllm-bench` built from
+this repo. Start PegaInfer:
 
 ```bash
-cd <openinfer-repo>
-cargo run --release -p openinfer-server -- \
+cd <pegainfer-repo>
+cargo run --release -p pegainfer-server -- \
   --model-path <model-path> \
   --served-model-name Qwen/Qwen3-4B \
   --port 18080 \
@@ -222,9 +222,9 @@ target/release/vllm-bench \
   --result-filename vllm-bench-multi-turn-smoke.json
 ```
 
-The `--extra-body '{"min_tokens":null}'` is for OpenInfer compatibility. The
+The `--extra-body '{"min_tokens":null}'` is for PegaInfer compatibility. The
 random multi-turn path auto-adds `min_tokens` unless overridden; this pins
-output length on vLLM but OpenInfer currently rejects that field. `--ignore-eos`
+output length on vLLM but PegaInfer currently rejects that field. `--ignore-eos`
 also skips `min_tokens` and worked in local smoke testing, but it asks the
 server to ignore EOS and can grow contexts more aggressively.
 

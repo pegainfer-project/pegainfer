@@ -1,0 +1,34 @@
+# Minimal single-binary Tempo: accept OTLP, store locally, serve TraceQL.
+# Not for production — local trace inspection only.
+
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  # Flush quickly so traces show up seconds after a request, not minutes —
+  # this is an interactive local backend, not a high-throughput cluster.
+  max_block_duration: 5m
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+# No retention pressure locally; blocks are tiny.
+compactor:
+  compaction:
+    block_retention: 24h

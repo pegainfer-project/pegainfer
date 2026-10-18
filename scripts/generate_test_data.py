@@ -3,7 +3,7 @@
 
 This script loads a model via HF Transformers and generates greedy (do_sample=False)
 outputs for a set of test prompts. The results are saved as a single JSON file
-that drives openinfer's e2e tests.
+that drives pegainfer's e2e tests.
 
 Usage:
     python scripts/generate_test_data.py --model models/Qwen3-4B --name Qwen3-4B

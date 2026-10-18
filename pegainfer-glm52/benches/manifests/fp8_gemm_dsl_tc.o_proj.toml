@@ -1,0 +1,22 @@
+unit = "fp8_gemm_dsl_tc.o_proj"
+# Phase 3: CuTe DSL tcgen05 hand-written fp8 groupwise GEMM (compared against fp8_gemm.o_proj).
+phase = 3
+symbol = "cutedsl_fp8_blockwise_gemm_tcgen05"
+adapter = "fp8_gemm_dsl_tc"
+capability = { python_native = true, sm_tcgen05_only = true }
+scratch = "rows<=64: adapter-cached split-K f32 partial tensor (2, rows, n) plus one _SplitKReduce launch (TILE_CFG in units/fp8_gemm_dsl_tc.py; the zeroed allocation is cached per shape, warmup material, never timed). rows=96: none — TILE_CFG_MULTI_M drops split-K for this shape, bf16 out written directly"
+[axes]
+rows = [4, 8, 16, 32, 48, 64, 96]
+[shape]
+n = 6144
+k = 16384
+[contract]
+inputs = "Fully same-source as fp8_gemm.o_proj (make_inputs delegates to fp8_gemm_groupwise): act e4m3 [rows, 16384] + act_scales f32 [rows, 128]; weight e4m3 [6144, 16384] + weight_scales f32 [48, 128] (the 32 MiB workspace is generated but unused by the DSL kernel)"
+outputs = "out[rows, 6144] bf16"
+accumulation = "f32 (tcgen05.mma e4m3; TMEM block accumulator is folded per 128-K block into the f32 register total acc by SFA x SFB — algorithmically the same software blockscale as the CUTLASS blockwise mainloop)"
+notes = "CuTe DSL 4.6.0 JIT (cute.compile cached per (rows,n,k)); tile 64x128x128 (K tile = one scale block), 160 threads (4 acc/epilogue warps + 1 TMA/MMA warp), double-buffered TMEM acc, AB smem stages auto-sized to capacity (~9). grid.x tiles rows in 64-row M tiles (single tile through rows=64); per-rows tile-N/split-K from tile_cfg (TILE_CFG at rows<=64, TILE_CFG_MULTI_M above); partial rows handled by TMA zero-fill + row-predicated stores."
+[reference]
+mode = "torch_tolerance"
+[reference.tolerance]
+rel_l2 = 0.02
+note = "Same reference as fp8_gemm.* (refs/fp8_gemm.groupwise_gemm_ref: dual dequant f32 matmul + bf16 store)"

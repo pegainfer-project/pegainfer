@@ -215,6 +215,22 @@ impl<T: BlockMetadata + Sync> ImmutableBlock<T> {
             .store_reset_on_release(self.inner.block_id, value);
     }
 
+    /// Set reset-on-release on this block's canonical primary.
+    ///
+    /// A duplicate resets itself but keeps its primary alive; marking the
+    /// primary prevents that hidden block from entering the inactive cache on
+    /// final drop.
+    pub fn set_primary_reset_on_release(&self, value: bool) {
+        let primary = self
+            .inner
+            ._primary_keepalive
+            .as_ref()
+            .unwrap_or(&self.inner);
+        primary
+            .store
+            .store_reset_on_release(primary.block_id, value);
+    }
+
     /// Type-erased lifecycle pin for cross-policy use.
     ///
     /// Returns an [`LifecyclePinRef`] that:

@@ -1,9 +1,9 @@
 # Kernel Op Reports
 
 **Created**: 2026-05-04
-**Last touched**: 2026-06
+**Last touched**: 2026-08
 **Status**: active; prefill/report commit ready, decode tuning deferred
-**TL;DR**: `qwen3_kernel_snapshot` is no longer a Cargo bench. Qwen3 has feature-gated `qwen3_kernel_report` per-op kernel tooling and `qwen3_model_report` model-level decode operator reporting. Decode now routes through an eager `BatchDecodeDag`, so the executable forward sequence is also the `KernelCall` contract source for runtime tracing; `qwen3_model_report` disables CUDA Graph, traces that DAG, then joins traced TensorSpecs against measured microbench results to emit by-op, by-call-site, coverage, schedule-preview, latency-stat, and Graphviz DOT reports. Prefill remains covered by `qwen3_kernel_report` stage reports; measured FA2 `CTA_TILE_Q=64` is the Qwen3 production prefill default on the RTX 5090 grid. The model-agnostic timing loop, latency stats, and by-op/by-call-site rollup now live in the `openinfer-bench` crate, shared by the Kimi-K2 model report; the qwen3 attention-specific regression framework (manifest/snapshot/provenance/CUPTI/cold-L2) deliberately stays in `qwen3_kernel_report`. `qwen3_model_report` traces + measures projection GEMMs under the production `numeric_policy()`: Pin and PerToken are faithful (Pin's serving counter-observed via `pin_served`, PerToken's via `per_token_served`), while under the default Tuned policy the GEMM rows are classified `unfaithful_gemmex` and excluded from the totals without being measured (the untuned context would run GemmEx, not production's per-process-tuned algo); the JSON config records the numeric policy and a partial-total flag.
+**TL;DR**: The harness source moved out of the library in #944 — it now lives in `pegainfer-qwen3/src/bin/report_support/` and is compiled only by the two `kernel-report` binaries, so paths in the Execution Log below are historical. `qwen3_kernel_snapshot` is no longer a Cargo bench. Qwen3 has feature-gated `qwen3_kernel_report` per-op kernel tooling and `qwen3_model_report` model-level decode operator reporting. Decode now routes through an eager `BatchDecodeDag`, so the executable forward sequence is also the `KernelCall` contract source for runtime tracing; `qwen3_model_report` disables CUDA Graph, traces that DAG, then joins traced TensorSpecs against measured microbench results to emit by-op, by-call-site, coverage, schedule-preview, latency-stat, and Graphviz DOT reports. Prefill remains covered by `qwen3_kernel_report` stage reports; measured FA2 `CTA_TILE_Q=64` is the Qwen3 production prefill default on the RTX 5090 grid. The model-agnostic timing loop, latency stats, and by-op/by-call-site rollup now live in the `pegainfer-bench` crate, shared by the Kimi-K2 model report; the qwen3 attention-specific regression framework (manifest/snapshot/provenance/CUPTI/cold-L2) deliberately stays in `qwen3_kernel_report`. `qwen3_model_report` traces + measures projection GEMMs under the production `numeric_policy()`: Pin and PerToken are faithful (Pin's serving counter-observed via `pin_served`, PerToken's via `per_token_served`), while under the default Tuned policy the GEMM rows are classified `unfaithful_gemmex` and excluded from the totals without being measured (the untuned context would run GemmEx, not production's per-process-tuned algo); the JSON config records the numeric policy and a partial-total flag.
 
 ## Preparation
 
@@ -11,15 +11,15 @@
   - `docs/index.md` - located the active benchmarking, CUPTI, kernel-boundary, and Qwen3 model-crate docs.
   - `docs/models/qwen3/model-crate.md` - confirmed `qwen3_kernel_snapshot` was the current Qwen3 kernel snapshot runner and already captured warm/cold-L2 latency plus default CUPTI counters.
   - `docs/conventions/bench-regression.md` - clarified that the existing serving benchmark remains the model-level regression artifact; this task should not mix per-op reports with E2E snapshots.
-  - `docs/subsystems/kernels/openinfer-kernels-boundary.md` - confirmed kernels should become first-class measurable assets and model DAG manifests should live with model crates.
-  - `docs/models/qwen3/kernels-crate.md` - confirmed kernel source/build ownership now lives in `openinfer-kernels`, while model-owned DAG metadata belongs in the Qwen3 crate.
+  - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - confirmed kernels should become first-class measurable assets and model DAG manifests should live with model crates.
+  - `docs/models/qwen3/kernels-crate.md` - confirmed kernel source/build ownership now lives in `pegainfer-kernels`, while model-owned DAG metadata belongs in the Qwen3 crate.
   - `docs/playbooks/profiling-guide.md` - confirmed the diagnostic split between kernel composition/proportions and benchmark-grade latency.
 - **Relevant history**:
   - `docs/models/qwen3/model-crate.md` showed the current single-op snapshot already found the low-batch long-context decode-attention bottleneck.
 - **Plan**:
   1. Add direct Qwen3 crate dev-dependencies for generic infrastructure (`clap` derive for CLI and `toml` for manifest parsing) instead of extending the hand-written parser.
   2. Add a model-local TOML manifest for Qwen3-4B kernel reports, initially covering only op names, phases, shape sweeps, and variants.
-  3. Replace `crates/openinfer-qwen3/benches/qwen3_kernel_snapshot.rs` with a manifest-driven `qwen3_kernel_report` bin; do not keep a bench wrapper.
+  3. Replace `crates/pegainfer-qwen3/benches/qwen3_kernel_snapshot.rs` with a manifest-driven `qwen3_kernel_report` bin; do not keep a bench wrapper.
   4. Add a composition command that reads per-op case results and emits a decode phase report by joining the manifest's op repeat rules with measured per-op reports.
   5. Run formatting and the strongest local compile checks available; GPU execution may still require the CUDA validation host because this machine lacks local CUDA tooling.
 - **Risks / open questions**:
@@ -29,13 +29,13 @@
 ## Execution Log
 
 ### Step 1: Move from bench target to bin
-- Removed the `qwen3_kernel_snapshot` bench target from `crates/openinfer-qwen3/Cargo.toml`.
-- Moved the report runner to `crates/openinfer-qwen3/src/bin/qwen3_kernel_report.rs`.
-- Added a `kernel-report` feature for generic tool dependencies (`clap`, `toml`, `sha2`, `hex`) and `openinfer-cupti`; the bin requires that feature so normal Qwen3 library/server builds do not pull CUPTI into the default dependency graph.
+- Removed the `qwen3_kernel_snapshot` bench target from `crates/pegainfer-qwen3/Cargo.toml`.
+- Moved the report runner to `crates/pegainfer-qwen3/src/bin/qwen3_kernel_report.rs`.
+- Added a `kernel-report` feature for generic tool dependencies (`clap`, `toml`, `sha2`, `hex`) and `pegainfer-cupti`; the bin requires that feature so normal Qwen3 library/server builds do not pull CUPTI into the default dependency graph.
 - Removed the temporary `cargo bench` compatibility argument handling after the tool became a normal binary.
 
 ### Step 2: Add model-local manifest
-- Added `crates/openinfer-qwen3/kernel_manifests/qwen3.toml`.
+- Added `crates/pegainfer-qwen3/kernel_manifests/qwen3.toml`.
 - The first manifest now stays deliberately thin: `model`, `[[ops]]`, `phase`, per-op shape sweep fields, and variant labels. Provider-owned facts such as dtype, head counts, head dimension, page size, thresholds, and composition policy stay in Rust.
 
 ### Step 3: Refactor report schema and commands
@@ -46,21 +46,21 @@
 ### Step 4: Local validation
 - `cargo fmt --all --check` passed.
 - `cargo metadata --no-deps --format-version 1` passed.
-- Local `cargo check --release -p openinfer-qwen3 --bench qwen3_kernel_snapshot` previously failed before Rust type checking because this local host lacks a usable `nvcc`; GPU validation moved to the CUDA validation host.
+- Local `cargo check --release -p pegainfer-qwen3 --bench qwen3_kernel_snapshot` previously failed before Rust type checking because this local host lacks a usable `nvcc`; GPU validation moved to the CUDA validation host.
 
 ### Step 5: GPU minimal validation
 - Rebuilt the disposable validation worktree at `<validation-worktree>` from local `HEAD` commit `612850f`, then rsynced the current working tree changes over it.
-- Copied initialized FlashInfer headers from `<validation-checkout>/third_party/flashinfer` into the clean worktree's `crates/openinfer-kernels/third_party/flashinfer` directory.
-- `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
-- `OPENINFER_CUDA_SM=120 cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --no-cupti --iters 1 --contexts 1024 --batch-sizes 1 --variants non_partition --out $RESULT_ROOT/qwen3_kernel_op_report_min.json` passed.
-- `OPENINFER_CUDA_SM=120 cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compare --base $RESULT_ROOT/qwen3_kernel_op_report_min.json --new $RESULT_ROOT/qwen3_kernel_op_report_min.json` passed with `warnings=0 failures=0`.
-- `OPENINFER_CUDA_SM=120 cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compose --input $RESULT_ROOT/qwen3_kernel_op_report_min.json --batch-size 1 --context 1024 --out $RESULT_ROOT/qwen3_kernel_composition_min.json` passed.
+- Copied initialized FlashInfer headers from `<validation-checkout>/third_party/flashinfer` into the clean worktree's `crates/pegainfer-kernels/third_party/flashinfer` directory.
+- `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
+- `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --no-cupti --iters 1 --contexts 1024 --batch-sizes 1 --variants non_partition --out $RESULT_ROOT/qwen3_kernel_op_report_min.json` passed.
+- `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compare --base $RESULT_ROOT/qwen3_kernel_op_report_min.json --new $RESULT_ROOT/qwen3_kernel_op_report_min.json` passed with `warnings=0 failures=0`.
+- `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compose --input $RESULT_ROOT/qwen3_kernel_op_report_min.json --batch-size 1 --context 1024 --out $RESULT_ROOT/qwen3_kernel_composition_min.json` passed.
 - CUPTI minimal validation passed with `non_partition,split_kv_256x64` at `bs=1,ctx=1024`; the report contained 2 cases, 1 selection, CUPTI metrics for both cases, and selected `split_kv_256x64`.
-- Default package build without the report feature also passed: `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3`.
+- Default package build without the report feature also passed: `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3`.
 
 ### Step 6: Full GPU manifest run
 - Ran the full manifest command on the validation worktree:
-  - `OPENINFER_CUDA_SM=120 time cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --out $RESULT_ROOT/qwen3_kernel_report_full.json`
+  - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --out $RESULT_ROOT/qwen3_kernel_report_full.json`
 - Result:
   - `126` cases: `6` batch sizes x `7` context lengths x `3` variants.
   - `42` selections.
@@ -69,7 +69,7 @@
   - Runtime: `2:42.83 elapsed`.
   - Manifest hash: `62aada084b61795862c5d4dd23fa89d1`.
 - Self-compare passed:
-  - `OPENINFER_CUDA_SM=120 cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compare --base $RESULT_ROOT/qwen3_kernel_report_full.json --new $RESULT_ROOT/qwen3_kernel_report_full.json`
+  - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compare --base $RESULT_ROOT/qwen3_kernel_report_full.json --new $RESULT_ROOT/qwen3_kernel_report_full.json`
   - Output: `kernel report compare complete: warnings=0 failures=0`.
 - Representative selections:
   - `bs=1,ctx=1024`: `split_kv_256x64`.
@@ -82,7 +82,7 @@
   - `non_partition`: `15`.
   - `split_kv_512x64`: `7`.
 - Composed the full report for `bs=1,ctx=4096`:
-  - `OPENINFER_CUDA_SM=120 cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compose --input $RESULT_ROOT/qwen3_kernel_report_full.json --batch-size 1 --context 4096 --out $RESULT_ROOT/qwen3_kernel_composition_full_bs1_ctx4096.json`
+  - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compose --input $RESULT_ROOT/qwen3_kernel_report_full.json --batch-size 1 --context 4096 --out $RESULT_ROOT/qwen3_kernel_composition_full_bs1_ctx4096.json`
   - Output total: cold-L2 `958.473us`, `split_kv_256x64` repeated across 36 layers.
   - Coverage note still applies: only `paged_decode_attention` is included; linear, MLP, norm, embedding, and sampling are not covered yet.
 - Preserved the generated JSONs under:
@@ -119,8 +119,8 @@
   - removed `default_attention_kernel_specs`;
   - removed the old multi-launch `measure_decode_only` helper and `INNER_LAUNCHES`.
 - GPU validation in `<validation-worktree>`:
-  - `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
-  - `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3` passed.
+  - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
+  - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3` passed.
   - Decode report, `bs=1,ctx=1024`, no CUPTI, `iters=3`: `2` cases, `0` errors, selected `split_kv_256x64`; measured `non_partition=45.739us`, `split_kv_256x64=20.480us`.
   - Prefill report, `bs=1,seq=128`, no CUPTI, `iters=3`: `1` case, `0` errors, `24.917us`.
   - Prefill report, `bs=1,seq=1024`, no CUPTI, `iters=3`: `1` case, `0` errors, `142.325us`.
@@ -133,8 +133,8 @@
 - Removed the compare-time DRAM read-amplification gate. `compare` now gates only `latency_us`; metric interpretation is intentionally outside the runner.
 - Bumped op report schema to `4` and composition report schema to `3`.
 - GPU validation:
-  - `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
-  - `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3` passed.
+  - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
+  - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3` passed.
   - Decode raw-CUPTI validation: `2` cases, `0` errors, schema `4`; `case.cupti` keys were exactly the configured CUPTI metric names.
   - Prefill raw-CUPTI validation: `1` case, `0` errors, schema `4`; `case.cupti` keys were exactly the configured CUPTI metric names.
   - Decode and prefill self-compare passed with `warnings=0 failures=0`.
@@ -143,18 +143,18 @@
 ### Step 11: Full raw-CUPTI cold-L2 manifest run
 - Preserved full-run JSONs under `<kernel-report-dir>`.
 - Decode full command:
-  - `OPENINFER_CUDA_SM=120 time cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --out <kernel-report-dir>`
+  - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --out <kernel-report-dir>`
   - Result: schema `4`, `126` cases, `42` selections, `0` errors, `126` CUPTI cases, `128` measured iterations, elapsed `2:11.77`.
   - Selection counts: `split_kv_256x64=22`, `non_partition=13`, `split_kv_512x64=7`.
   - `case.cupti` contains exactly the configured CUPTI metric names. Cases and selections do not contain `diagnosis`.
 - Prefill full command:
-  - `OPENINFER_CUDA_SM=120 time cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --op paged_prefill_attention --out <kernel-report-dir>`
+  - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --op paged_prefill_attention --out <kernel-report-dir>`
   - Result: schema `4`, `7` cases, `7` selections, `0` errors, `7` CUPTI cases, `128` measured iterations, elapsed `0:07.43`.
   - Latency by `seq_len`: `128=24.687us`, `512=53.467us`, `1024=143.462us`, `2048=318.688us`, `4096=911.097us`, `8192=3015.025us`, `10000=4316.861us`.
   - `case.cupti` contains exactly the configured CUPTI metric names. Cases and selections do not contain `diagnosis`.
 - Both decode and prefill full JSONs passed self-compare with `warnings=0 failures=0`.
 - Decode composition command:
-  - `OPENINFER_CUDA_SM=120 cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compose --input <kernel-report-dir> --batch-size 1 --context 4096 --out <kernel-report-dir>`
+  - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- compose --input <kernel-report-dir> --batch-size 1 --context 4096 --out <kernel-report-dir>`
   - Result: schema `3`, no `diagnosis`, total decode-attention-only contribution `958.527us`.
 
 ### Step 12: Split prefill stages
@@ -166,8 +166,8 @@
 - Added the three stage ops to `kernel_manifests/qwen3.toml`; each currently covers `batch_size=[1]` and the same `seq_len` grid as the full prefill report.
 - Preserved stage JSONs under `<kernel-report-dir>`.
 - GPU validation:
-  - `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
-  - `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3` passed.
+  - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
+  - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3` passed.
   - Full stage reports passed self-compare with `warnings=0 failures=0`.
 - Stage latency by `seq_len`:
   - `128`: full `24.632us`, QK+RoPE `8.181us`, KV scatter `5.418us`, attention core `13.148us`.
@@ -202,7 +202,7 @@
   - Local `cargo fmt --all --check` passed.
   - Local `cargo metadata --no-deps --format-version 1` passed.
   - Local `git diff --check` passed.
-  - CUDA host `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3` passed.
+  - CUDA host `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3` passed.
 
 ### Step 14: Add direct tensor-path CUPTI metrics
 - Investigated the RTX 5090 metric catalog with `/usr/local/cuda/bin/ncu --query-metrics-mode all --query-metrics --devices 0`. Non-interactive shells did not have `ncu` in `PATH`, but the binary exists under `/usr/local/cuda/bin/ncu`.
@@ -242,10 +242,10 @@
 
 ### Step 16: Inspect local FlashInfer prefill implementation
 - Initialized the local FlashInfer submodule:
-  - `git submodule update --init crates/openinfer-kernels/third_party/flashinfer`
+  - `git submodule update --init crates/pegainfer-kernels/third_party/flashinfer`
   - Checked out `779c24d1c9e6fcc51aa2359884696fbf4ac69b3b`.
-- Confirmed the current OpenInfer wrapper calls FlashInfer's FA2 paged prefill path:
-  - `crates/openinfer-kernels/csrc/paged_attention.cu` computes `cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim)` and dispatches `BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q, 128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, ...>`.
+- Confirmed the current PegaInfer wrapper calls FlashInfer's FA2 paged prefill path:
+  - `crates/pegainfer-kernels/csrc/paged_attention.cu` computes `cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim)` and dispatches `BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q, 128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, ...>`.
   - For Qwen3 `seq_len=10000`, `packed_qo_len = seq_len * (num_qo_heads / num_kv_heads) = 40000`, and FlashInfer's `FA2DetermineCtaTileQ` selects `CTA_TILE_Q=128`.
   - Rust prefill planning also calls `batch_prefill_cta_tile_q`, so any `CTA_TILE_Q` override must be plumbed into both the plan metadata and the kernel launch.
 - Matched the NCU kernel traits to FlashInfer source:
@@ -253,7 +253,7 @@
   - `NUM_MMA_KV` is not a free runtime flag in the current wrapper. FlashInfer derives it from register and shared-memory limits with `DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), ...)`.
 - Checked backend alternatives in the same local source:
   - FlashInfer's Python `backend="cutlass"` path explicitly rejects SM12x/RTX 5090 and says to use `backend='fa2'`.
-  - `trtllm_fmha_v2_prefill` has SM120 support and supports `Q_PAGED_KV_HND`/`Q_PAGED_KV_NHD`, BF16, GQA, causal masks, and head dim 128, but it is exposed through FlashInfer's JIT/TVM FFI path (`fmha_v2_jit_binding.cu` + generated sources), not through the header-only FA2 path currently compiled by `openinfer-kernels`.
+  - `trtllm_fmha_v2_prefill` has SM120 support and supports `Q_PAGED_KV_HND`/`Q_PAGED_KV_NHD`, BF16, GQA, causal masks, and head dim 128, but it is exposed through FlashInfer's JIT/TVM FFI path (`fmha_v2_jit_binding.cu` + generated sources), not through the header-only FA2 path currently compiled by `pegainfer-kernels`.
 - Tuning conclusion:
   - First experiment: add report-only `prefill_attention_core` variants for `fa2_cta128`, `fa2_cta64`, and `fa2_cta16`, keeping plan metadata and launch dispatch consistent, then run the 10k CUPTI/NCU comparison.
   - Second experiment, only after the tile-Q sweep: consider a more invasive FMHAv2/SM120 integration or a FlashInfer Python-side benchmark to determine whether that backend beats FA2 for Qwen3's `Q_PAGED_KV` BF16 shape before wiring it into Rust/CUDA.
@@ -266,7 +266,7 @@
   - `block_tables` shaped `[batch_size, max_num_pages_per_seq]` for paged KV.
   - `Q` shaped `[total_tokens, num_qo_heads, head_dim]`.
   - Paged KV shaped `[pages, 2, num_kv_heads, page_size, head_dim]` for HND or `[pages, 2, page_size, num_kv_heads, head_dim]` for NHD.
-- The wrapper currently transposes `Q_PAGED_KV_NHD` to HND with `.transpose(-3, -2).contiguous()`. OpenInfer's KV pool is page-first NHD with separate K/V offsets across layers, so the zero-copy route would need either an HND view/storage path or a lower-level wrapper that bypasses the Python NHD transpose.
+- The wrapper currently transposes `Q_PAGED_KV_NHD` to HND with `.transpose(-3, -2).contiguous()`. PegaInfer's KV pool is page-first NHD with separate K/V offsets across layers, so the zero-copy route would need either an HND view/storage path or a lower-level wrapper that bypasses the Python NHD transpose.
 - Under the hood, FlashInfer generates FMHA v2 sources through `gen_fmha_v2_module(...)`, compiles generated kernels plus `fmha_v2_run.cu`, and exports `run` through TVM FFI (`fmha_v2_jit_binding.cu`). Direct Rust/CUDA integration is therefore not a drop-in header include like the current FA2 path.
 - Practical use options:
   - Lowest risk: benchmark it through FlashInfer's Python API on RTX 5090 with Qwen3-equivalent tensors to decide whether it beats FA2 at `seq_len=10000`.
@@ -297,14 +297,14 @@
   - Current contiguous single FA2 `bs=1,seq=10000`: `3953.402us`.
   - Current paged FA2 `bs=2,seq=10000`: `7483.966us` total, `3741.983us` per request.
   - Local-source FMHA v2 HND is `1.587x` slower than current paged FA2 at `bs=1`; its `bs=2` total is `1.540x` slower than current paged FA2 `bs=2`.
-  - NHD and HND are effectively the same latency in this direct function test (`1.003x` ratio), but the Python NHD path includes a contiguous transpose before the kernel and is therefore not a zero-copy integration path for OpenInfer.
+  - NHD and HND are effectively the same latency in this direct function test (`1.003x` ratio), but the Python NHD path includes a contiguous transpose before the kernel and is therefore not a zero-copy integration path for PegaInfer.
 - Also tested the official package public wrapper:
   - Report: `<kernel-report-dir>`
   - `backend="fa2"`, `kv_layout="NHD"`, `bs=1`: median `4095.216us`, close to our current FA2 path.
   - `backend="trtllm-gen"` initially hit a Python wrapper bug when passing `max_token_per_sequence` / `max_sequence_kv`: `UnboundLocalError: qo_indptr_host`.
   - Retrying without those max arguments reached the underlying TRT-LLM runner and failed for all tested `trtllm-gen` cases with `Unsupported architecture` on RTX 5090:
     `<kernel-report-dir>`.
-- Conclusion: there is no measured reason to wire `trtllm_fmha_v2_prefill` into OpenInfer for the Qwen3 10k BF16 prefill attention core on RTX 5090. The current FA2 path is materially faster, and the official package's public `trtllm-gen` wrapper is not usable on this GPU through the tested release package.
+- Conclusion: there is no measured reason to wire `trtllm_fmha_v2_prefill` into PegaInfer for the Qwen3 10k BF16 prefill attention core on RTX 5090. The current FA2 path is materially faster, and the official package's public `trtllm-gen` wrapper is not usable on this GPU through the tested release package.
 
 ### Step 19: Tune FA2 prefill CTA tile Q
 - Added report-only FA2 prefill variants for `CTA_TILE_Q`:
@@ -313,7 +313,7 @@
 - Implementation details:
   - Added `batch_prefill_paged_cuda_with_cta_tile_q` and matching plan helpers so launch dispatch and `request_indices` / `qo_tile_indices` metadata use the same tile size.
   - Kept the original C ABI functions as auto-heuristic wrappers.
-  - Exposed `PrefillPagedPlan::new_with_cta_tile_q` / `new_batch_with_cta_tile_q` through `openinfer-core`.
+  - Exposed `PrefillPagedPlan::new_with_cta_tile_q` / `new_batch_with_cta_tile_q` through `pegainfer-core`.
   - Switched Qwen3 production prefill planning to model-local `PREFILL_ATTENTION_CTA_TILE_Q = 64`; the global FlashInfer heuristic is unchanged.
 - Preserved tile-sweep JSONs under:
   - `<kernel-report-dir>`
@@ -348,9 +348,9 @@
   - Attention core: default `7542.625us` total vs `cta_q64=7403.535us`, about `1.9%` faster.
   - Full paged prefill op: default `8241.567us` total vs `cta_q64=8113.489us`, about `1.6%` faster.
 - GPU validation:
-  - `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
-  - `OPENINFER_CUDA_SM=120 cargo build --release -p openinfer-qwen3` passed.
-  - `OPENINFER_CUDA_SM=120 cargo test --release -p openinfer-qwen3` was not used as the acceptance gate for this kernel-level change; Qwen3 correctness now relies on the tolerance-based HF golden gate rather than the old exact batch-vs-sequential token check.
+  - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report` passed.
+  - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3` passed.
+  - `PEGAINFER_CUDA_SM=120 cargo test --release -p pegainfer-qwen3` was not used as the acceptance gate for this kernel-level change; Qwen3 correctness now relies on the tolerance-based HF golden gate rather than the old exact batch-vs-sequential token check.
 
 ### Step 20: Commit validation
 - Fixed clippy cleanup found during commit prep:
@@ -358,33 +358,33 @@
   - `qwen3_kernel_report` no longer uses `Option::map(...).unwrap_or_else(...)` or a redundant selector-key clone.
 - Local checks passed:
   - `cargo fmt --all --check`
-  - `cargo metadata --no-deps --format-version 1 >$RESULT_ROOT/openinfer_metadata.json`
+  - `cargo metadata --no-deps --format-version 1 >$RESULT_ROOT/pegainfer_metadata.json`
   - `git diff --check`
 - GPU release clippy passed on the synced validation worktree:
-  - `OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p openinfer-kernels --all-targets -- -D warnings`
-  - `OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p openinfer-core --all-targets -- -D warnings`
-  - `OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p openinfer-qwen3 --features kernel-report --all-targets -- -D warnings`
-  - `OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p openinfer --bin openinfer -- -D warnings`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer-kernels --all-targets -- -D warnings`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer-core --all-targets -- -D warnings`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer-qwen3 --features kernel-report --all-targets -- -D warnings`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer --bin pegainfer -- -D warnings`
 
 ### Step 21: Add runtime-traced Qwen3 model operator report
-- Added non-enum tensor metadata vocabulary under `openinfer-kernels/src/tensor.rs`:
+- Added non-enum tensor metadata vocabulary under `pegainfer-kernels/src/tensor.rs`:
   - marker traits for dtype, layout, and axis tags;
   - erased `TensorSpec`, `TensorArg`, `AttrSpec`, and `KernelCall` for schedules, reports, and future instrumentation.
-- Added `openinfer-core::ops::call_spec` builders so op TensorSpec construction lives next to op wrappers, not in the model-report CLI.
-- Added `openinfer-core::ops::call_trace` and traced op wrappers behind the `kernel-call-trace` feature. Normal Qwen3 builds re-export the direct kernel ops and compile out trace labels/recording. The `openinfer-qwen3` `kernel-report` feature enables `kernel-call-trace`.
+- Added `pegainfer-core::ops::call_spec` builders so op TensorSpec construction lives next to op wrappers, not in the model-report CLI.
+- Added `pegainfer-core::ops::call_trace` and traced op wrappers behind the `kernel-call-trace` feature. Normal Qwen3 builds re-export the direct kernel ops and compile out trace labels/recording. The `pegainfer-qwen3` `kernel-report` feature enables `kernel-call-trace`.
 - Wired Qwen3 batch decode labels into the actual `batch_decode` path through feature-gated macros, so label formatting and trace collection disappear when the feature is off. The trace path forces CUDA Graph off before recording.
 - Added `qwen3_model_report`, a feature-gated per-model CLI:
-  - `cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text`
+  - `cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text`
   - The CLI loads `models/Qwen3-4B` by default, creates KV state for the requested decode context, runs one real `batch_decode` trace, microbenches the traced KernelCalls, and emits JSON under `target/model_reports/qwen3-4b/`.
   - Missing bench providers fail loudly with the missing `op`, `label`, and TensorSpec; no estimated or nearest-neighbor rows are used.
 - Validation:
   - `cargo fmt --all --check` passed.
   - `git diff --check` passed.
-  - `cargo check --release -p openinfer-qwen3 --lib` passed, confirming trace wrappers are not required for the normal library path.
-  - `cargo check --release -p openinfer-qwen3 --features kernel-report --bin qwen3_model_report` passed.
-  - `cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed and wrote `target/model_reports/qwen3-4b/decode-bs16-kv2048.json`.
+  - `cargo check --release -p pegainfer-qwen3 --lib` passed, confirming trace wrappers are not required for the normal library path.
+  - `cargo check --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_model_report` passed.
+  - `cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed and wrote `target/model_reports/qwen3-4b/decode-bs16-kv2048.json`.
   - JSON audit confirmed `model/phase/config/schedule/by_op/by_call_site/coverage` are present, `schedule_source` is `runtime trace: Qwen3Model::batch_decode with CUDA Graph disabled`, and paged KV is represented as `bf16[page, layer, kv, pos_in_page, kv_head, head_dim] layout=paged_kv_page_first`.
-  - `cargo test --release -p openinfer-qwen3 --lib` passed: `7 passed`.
+  - `cargo test --release -p pegainfer-qwen3 --lib` passed: `7 passed`.
 
 ### Step 22: Add latency stats, readable tables, and DOT output
 - `qwen3_model_report` now records latency samples per unique traced `KernelCall` instead of a single mean. JSON schema `2` includes `mean_us`, sample `stddev_us`, `min_us`, `p50_us`, `p95_us`, `p99_us`, and `max_us`.
@@ -394,21 +394,21 @@
   - `target/model_reports/qwen3-4b/decode-bs16-kv2048.json`
   - `target/model_reports/qwen3-4b/decode-bs16-kv2048.dot`
 - Validation:
-  - `cargo check --release -p openinfer-qwen3 --features kernel-report --bin qwen3_model_report` passed.
-  - `cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed and wrote JSON plus DOT.
+  - `cargo check --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_model_report` passed.
+  - `cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed and wrote JSON plus DOT.
   - `dot -Tsvg target/model_reports/qwen3-4b/decode-bs16-kv2048.dot -o $RESULT_ROOT/qwen3-model-report.svg` passed.
   - JSON audit confirmed schema `2`, default `iters=32`, and `stddev_us` / `p99_us` fields in by-op rows.
-  - `cargo fmt --all --check`, `git diff --check`, and `cargo check --release -p openinfer-qwen3 --lib` passed.
+  - `cargo fmt --all --check`, `git diff --check`, and `cargo check --release -p pegainfer-qwen3 --lib` passed.
 
 ### Step 23: Make decode tracing come from an eager DAG builder
-- Added `openinfer-qwen3/src/batch_decode_dag.rs`.
+- Added `pegainfer-qwen3/src/batch_decode_dag.rs`.
 - `BatchDecodeDag` is eager: each method records the op's `KernelCall` contract when `kernel-call-trace` is active and immediately launches the production kernel. The batch decode forward path now calls DAG methods instead of wrapping free-form op calls with ad hoc trace labels.
 - Normal builds still compile out label construction through `dag_label!`; the `kernel-report` feature enables labels and `KernelCall` recording.
 - `all_reduce_hidden` now has an untraced internal path so the DAG builder owns decode all-reduce trace records without double-counting.
 - Validation:
-  - `cargo check --release -p openinfer-qwen3 --lib` passed.
-  - `cargo check --release -p openinfer-qwen3 --features kernel-report --bin qwen3_model_report` passed.
-  - `cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed; by-op counts remained `gemm=109`, `gemm_rows=108`, `paged_decode_attention=36`, `all_reduce_hidden=72`.
+  - `cargo check --release -p pegainfer-qwen3 --lib` passed.
+  - `cargo check --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_model_report` passed.
+  - `cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed; by-op counts remained `gemm=109`, `gemm_rows=108`, `paged_decode_attention=36`, `all_reduce_hidden=72`.
 
 ### Step 24: Check eager-DAG decode runtime impact
 - Ran current worktree decode-heavy request benchmark:
@@ -418,7 +418,7 @@
   - `target/release/qwen3_decode_context --model-path models/Qwen3-4B --contexts 1024 --iters 20`
   - Result: `p50=11.3781ms`, `avg=11.6660ms`.
 - Built a detached baseline worktree at `HEAD=3ffe745` and ran the same fixed-context decode probe on the same GPU/model:
-  - `OPENINFER_TRITON_PYTHON=$LOCAL_OPENINFER_DIR/.venv/bin/python cargo run --release -p openinfer-qwen3 --bin qwen3_decode_context --manifest-path $RESULT_ROOT/openinfer-bench-baseline/Cargo.toml -- --model-path $LOCAL_OPENINFER_DIR/models/Qwen3-4B --contexts 1024 --iters 20`
+  - `PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python cargo run --release -p pegainfer-qwen3 --bin qwen3_decode_context --manifest-path $RESULT_ROOT/pegainfer-bench-baseline/Cargo.toml -- --model-path $LOCAL_PEGAINFER_DIR/models/Qwen3-4B --contexts 1024 --iters 20`
   - Result: `p50=11.3610ms`, `avg=11.6449ms`.
 - Interpretation: eager DAG is not measurable as a decode overhead in this probe. Current worktree vs same-machine `HEAD` baseline is `+0.0171ms` p50 (`+0.15%`), well under the benchmark-regression `2%` TPOT threshold.
 - The standard `bench_serving snapshot --warmup 5 --iters 20` could not complete because `prefill-heavy (10000,1)` hit CUDA OOM on this run. The existing tracked `bench_snapshots/rtx-5090/qwen3-4b.json` was restored from backup after the failed snapshot attempt.
@@ -426,25 +426,25 @@
 
 ### Step 25: PR readiness cleanup
 - Cleaned release clippy findings surfaced by the model-report work:
-  - `openinfer-kernels::tensor::KernelCall` builder methods are now `#[must_use]`, and attrs are explicitly string-valued at the erased report boundary.
-  - `openinfer-kernels/build.rs` and `openinfer-core/src/cpu_topology.rs` no longer trip release clippy on `map(...).unwrap_or_else(...)`, raw pointer borrows, or redundant closures.
+  - `pegainfer-kernels::tensor::KernelCall` builder methods are now `#[must_use]`, and attrs are explicitly string-valued at the erased report boundary.
+  - `pegainfer-kernels/build.rs` and `pegainfer-core/src/cpu_topology.rs` no longer trip release clippy on `map(...).unwrap_or_else(...)`, raw pointer borrows, or redundant closures.
   - Qwen3 e2e/regen tests and `qwen3_model_report` text/DOT rendering now pass the all-targets clippy style gates.
 - Local checks passed:
   - `cargo fmt --all --check`
   - `git diff --check`
-  - `cargo clippy --release -p openinfer-qwen3 --features kernel-report --all-targets -- -D warnings`
-  - `cargo test --release -p openinfer-qwen3 --lib`
-  - `cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text`
+  - `cargo clippy --release -p pegainfer-qwen3 --features kernel-report --all-targets -- -D warnings`
+  - `cargo test --release -p pegainfer-qwen3 --lib`
+  - `cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text`
 - Qwen3-4B e2e was run with an absolute model path:
-  - `OPENINFER_TEST_MODEL_PATH=$LOCAL_OPENINFER_DIR/models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test e2e -- --nocapture`
+  - `PEGAINFER_TEST_MODEL_PATH=$LOCAL_PEGAINFER_DIR/models/Qwen3-4B cargo test --release -p pegainfer-qwen3 --test e2e -- --nocapture`
   - Current worktree produced greedy-output mismatches on repeated runs.
   - A detached baseline worktree at `HEAD=3ffe745` reproduced the same Kanye prompt mismatch, so this e2e failure is not introduced by the eager-DAG/model-report changes.
 
 ### Step 26: Full-forward manifest coverage + roofline rank pass (#456)
-- Extended the manifest beyond the attention family to the full Qwen3-4B forward: `decode_projection_gemm` / `prefill_projection_gemm` (variants are the production `(out_dim, in_dim)` set that `decode_projection_pin_shapes` warms; gate/up share a shape; lm_head is decode-only because prefill gathers last-token columns before the logits GEMM), `{decode,prefill}_rms_norm`, `{decode,prefill}_fused_add_rms_norm`, `decode_qk_norm_rope`, `{decode,prefill}_silu_mul`, `{decode,prefill}_embedding`, and `decode_sampling` (`argmax` / `sampling` through `openinfer_sample::select_batch`; its measured span includes the D2H token readback + sync — that is the production step tail, not harness overhead). One weight-free `DenseCase` harness drives all of them through the same `openinfer_kernels::ops` entry points the decode DAG launches. `decode_*` ops sweep `batch_size`, `prefill_*` sweep `seq_len` at batch 1.
+- Extended the manifest beyond the attention family to the full Qwen3-4B forward: `decode_projection_gemm` / `prefill_projection_gemm` (variants are the production `(out_dim, in_dim)` set that `decode_projection_pin_shapes` warms; gate/up share a shape; lm_head is decode-only because prefill gathers last-token columns before the logits GEMM), `{decode,prefill}_rms_norm`, `{decode,prefill}_fused_add_rms_norm`, `decode_qk_norm_rope`, `{decode,prefill}_silu_mul`, `{decode,prefill}_embedding`, and `decode_sampling` (`argmax` / `sampling` through `pegainfer_sample::select_batch`; its measured span includes the D2H token readback + sync — that is the production step tail, not harness overhead). One weight-free `DenseCase` harness drives all of them through the same `pegainfer_kernels::ops` entry points the decode DAG launches. `decode_*` ops sweep `batch_size`, `prefill_*` sweep `seq_len` at batch 1.
 - Added the `rank` subcommand — the "separate report layer" the Step 10 lesson called for, now in-repo instead of a notebook. It consumes op-report snapshot JSONs and ranks selection winners by analytic speed-of-light: the op's minimum DRAM traffic and FLOPs (from its semantics and shape) against `hardware.peak_gb_s` and an explicit `--peak-bf16-tflops` (CLI-provided on purpose: no queryable CUDA attribute exists and a baked-in per-arch table would rot). `sol%` is a true headroom bound regardless of how the kernel is written; raw CUPTI metrics, when present in the snapshot, add achieved-DRAM and tensor-pipe columns for diagnosis. Dense projection/sampling variants are distinct kernels, not competing implementations, so their variant is folded into `selector_key` and `build_selections` never collapses them.
 - Reproducible commands (H100 80GB / sm_90 validation; CUPTI unavailable there — `RmProfilingAdminOnly: 1` on the host, so `--no-cupti` and the analytic bound carried the run):
-  - `cargo run --release -p openinfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --op decode_projection_gemm --no-cupti --out reports/decode_projection_gemm.json` (per op)
+  - `cargo run --release -p pegainfer-qwen3 --features kernel-report --bin qwen3_kernel_report -- run --op decode_projection_gemm --no-cupti --out reports/decode_projection_gemm.json` (per op)
   - `... -- rank --input reports/<op>.json ... --peak-bf16-tflops 989 --out reports/rank_decode.json`
 - H100 findings (cold L2, full manifest, 128 iters): sanity anchors land where they should — decode lm_head 84–87% of DRAM SoL, split-KV decode attention 79–84% at large KV, big prefill GEMMs 78–85% of tensor peak, `fused_add_rms_norm` 86% at 10k tokens. Ranked offenders at production shapes: FlashInfer `sampling` has a ~95µs flat cost rising to 722µs at bs=256 — ~8-12% of a decode step (measured on peaked synthetic logits, top-1 mass ~0.5; a flat vocabulary overstated it 35-55% because the rejection sampler's round count tracks distribution flatness) — and `argmax`, insensitive to the distribution, reaches 103µs / 22% SoL at bs=256; `prefill_embedding` sits flat at ~27% of DRAM SoL (113µs vs 31µs bound at 10k); decode q_proj GEMMs pin at 17.9–21.5µs / 32.0–35.6% SoL and o_proj at 20.2–25.1µs / 28.9–32.3% across every batch size (gate_up 43.7–51.7%, down 39.3–46.8%) — the small-N cuBLAS territory the tracking issue flagged. Codex review caught that an untuned context falls back to GemmEx at N ≤ `GEMM_LT_MAX_N`, so `DenseCase` now runs `gemm_lt_tune` for the projection shape (L2-cold weight rotation, budget-capped) before measuring; measured tuned-vs-GemmEx on H100: q_proj −7.8…−10.6% and lm_head −2.7…−3.4% at N ≤ 16, N > 32 unchanged (GemmEx either way). An early rotation capped at 8 copies left small weights L2-resident during tuning and picked a +5% slower kv_proj algo at bs 4–8; sizing the rotation off the L2 sweep (`cache_clear_bytes`) removed that anomaly — the tuner must be DRAM-cold like the executor's 36-layer rotation; prefill attention core at 10k is 33% of tensor peak on H100 (the Step 15 occupancy analysis, worse than the 42% seen on RTX 5090). Sub-20µs elementwise cases rank at the bottom on launch floor, not kernel quality — read `sol%` together with `latency_us`.
 - CI gate decision (issue ask 4): keep roofline ranking out of CI. `sol%` is hardware-, driver-, and clock-dependent, the GPU runners differ per contributor, and the bench-regression convention already covers E2E gates. The intended workflow is manual: regenerate snapshots on the target GPU, `rank`, and `compare` against a stored snapshot for latency regressions.
@@ -478,4 +478,4 @@
   - ~~Add the next provider for decode linear/MLP floor so composition reports explain more than decode attention.~~ Done in Step 26 (#456): the manifest now covers GEMMs, norms, embedding, and sampling for both phases.
   - Extend prefill tile-Q measurements to more batch sizes and model families before making a global kernel default.
   - Extend `compose` beyond `decode_attention_only` now that per-op reports exist for the full forward.
-  - **Done (2026-05):** the model-agnostic layer was extracted into the `openinfer-bench` crate — first the timing loop / latency stats / `KernelCall` accessors, then the by-op/by-call-site rollup (`RollupRow`, `CallSiteRow`, the accumulator, and row projection). Both qwen3 and Kimi-K2 model reports reuse it; row field order is preserved so the report JSON is unchanged. The *regression* framework (TOML manifest, `KernelSnapshot`, git/hardware/build provenance, `RegressionThresholds`, compare/compose, CUPTI, cold-L2) was evaluated and deliberately **kept** in `qwen3_kernel_report`: its schema is attention-domain-specific (`CaseShape` carries head/page dims, `CaseParams` carries chunk/`cta_tile_q`) with no second consumer, so sharing it would be premature abstraction. When a second model needs kernel-level regression gating, lift the generic primitives then — not before.
+  - **Done (2026-05):** the model-agnostic layer was extracted into the `pegainfer-bench` crate — first the timing loop / latency stats / `KernelCall` accessors, then the by-op/by-call-site rollup (`RollupRow`, `CallSiteRow`, the accumulator, and row projection). Both qwen3 and Kimi-K2 model reports reuse it; row field order is preserved so the report JSON is unchanged. The *regression* framework (TOML manifest, `KernelSnapshot`, git/hardware/build provenance, `RegressionThresholds`, compare/compose, CUPTI, cold-L2) was evaluated and deliberately **kept** in `qwen3_kernel_report`: its schema is attention-domain-specific (`CaseShape` carries head/page dims, `CaseParams` carries chunk/`cta_tile_q`) with no second consumer, so sharing it would be premature abstraction. When a second model needs kernel-level regression gating, lift the generic primitives then — not before.

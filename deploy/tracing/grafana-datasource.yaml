@@ -1,0 +1,15 @@
+# Auto-provision Tempo as Grafana's trace datasource so the UI works on first
+# boot with no manual setup.
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: true
+    jsonData:
+      # Show the TraceQL search tab by default.
+      search:
+        hide: false

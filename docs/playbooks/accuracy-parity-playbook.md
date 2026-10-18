@@ -6,7 +6,7 @@
 
 ## What Counts As "Correct"
 
-- 真值是外部实现，不是 openinfer 自己生成的 JSON。
+- 真值是外部实现，不是 pegainfer 自己生成的 JSON。
 - 对生成步，真值必须是 HF 的真实 incremental `past_key_values` 路径。
 - 不要把“重建完整前缀后的 full-prefill”当生成步真值。它在后段层上可能连 HF 自己都不等于 HF incremental。
 
@@ -90,7 +90,7 @@
 ```
 
 历史 case-level 覆盖率排查命令如下。`test_data/Qwen3.5-4B.json`
-已经退役，新排查应优先走 `openinfer-qwen35-4b/tests/hf_golden_gate.rs`
+已经退役，新排查应优先走 `pegainfer-qwen35/tests/hf_golden_gate.rs`
 或重建同等的 HF `past_key_values` token-id/logits dump：
 
 ```bash

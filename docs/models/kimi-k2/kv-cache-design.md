@@ -20,7 +20,7 @@ after burning up to 2047 tokens of compute. Nothing validated
 
 ### 2. Kimi KV is already paged — the kernels need nothing
 
-`KimiMlaPagedKvLayout` (`openinfer-kernels/src/ops/kimi_k2/mla.rs`), page
+`KimiMlaPagedKvLayout` (`pegainfer-kernels/src/ops/kimi_k2/mla.rs`), page
 table buffers (`page_indices_d/page_indptr_d/last_page_len_d`), a paged append
 kernel (`kimi_mla_paged_kv_append`) and a paged MLA decode kernel
 (`kimi_flashinfer_batch_decode_mla`) were all in production. The "fixed arena"
@@ -39,12 +39,12 @@ threads explicit `positions_d`, so the fix shape is cleaner than qwen3's was.
 
 ## Design (as landed)
 
-### Logical/physical split: `BlockPool` in `openinfer-kv-cache`
+### Logical/physical split: `BlockPool` in `pegainfer-kv-cache`
 
 The qwen3 `KvCacheManager` was split so MLA models reuse the logical layer
 without inheriting the full-attention physical layout:
 
-- **`BlockPool`** (`openinfer-kv-cache/src/pool.rs`): kvbm `BlockManager` +
+- **`BlockPool`** (`pegainfer-kv-cache/src/pool.rs`): kvbm `BlockManager` +
   the reserved padding block + `RequestKv` (the `SchedulableSequence` wrapper:
   `schedule_prefill/apply_prefill/schedule_decode/apply_decode`, RAII release).
   Owns **no GPU memory** — it hands out block IDs.
@@ -84,7 +84,7 @@ it within 16 decode steps). Handing that raw list to the worker trips the
 exact-match check above. Every page row given to a forward pass must come
 from `RequestKv::step_page_indices(new_tokens)`, which trims to
 `ceil((kv_position + new_tokens)/16)`; a regression test in
-`openinfer-kv-cache/src/pool.rs` sweeps prompt lengths × decode steps and
+`pegainfer-kv-cache/src/pool.rs` sweeps prompt lengths × decode steps and
 self-retires if kvbm stops over-allocating.
 
 Why it surfaced as a *hang*, not an error: on DP the owning rank's

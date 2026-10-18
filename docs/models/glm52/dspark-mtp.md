@@ -62,7 +62,7 @@ Per spec round, per rank (all ranks in lock-step on the global step; draft is be
 
 1. **Verify** (global step, bucket 8): feed span, read 8 argmax rows + capture buffer.
 2. **Accept** (host, coordinator): longest matching prefix + bonus/correction — port
-   `openinfer-qwen3/src/speculative.rs` verbatim (`accept_greedy`, `build_verify_results`).
+   `pegainfer-qwen3/src/speculative.rs` verbatim (`accept_greedy`, `build_verify_results`).
 3. **Draft** (rank-local command, no collectives): append accepted rows' captured hidden to the
    request's pending context → fc projection → 5-layer backbone over `[anchor, mask×7]` →
    Markov sample loop (port `dspark.rs::sample_block` + the `markov_step_argmax` kernel at

@@ -15,7 +15,7 @@ All models use two profiles that isolate the prefill and decode paths:
 
 No mixed-workload profiles. Mixed performance can be inferred from the two pure paths, and mixed data is hard to attribute.
 
-openinfer: `bench_serving request --prompt-len <in> --output-len <out>` (see [profiling-guide](profiling-guide.md)). vLLM: `vllm bench serve` (see [bench-vs-vllm](bench-vs-vllm.md)).
+pegainfer: `scripts/bench_http_serving.py --prompt-words <in> --max-tokens <out>` against a running server (see [profiling-guide](profiling-guide.md)). vLLM: `vllm bench serve` (see [bench-vs-vllm](bench-vs-vllm.md)).
 
 ## Per-Model Doc Structure
 
@@ -23,14 +23,14 @@ One doc per model under `projects/`, containing three sections:
 
 ### 1. E2E Dashboard
 
-Current openinfer vs vLLM end-to-end numbers. **Update the openinfer column after each optimization** to always reflect the latest state. The vLLM column only needs to be measured once at baseline — re-measure when upgrading vLLM.
+Current pegainfer vs vLLM end-to-end numbers. **Update the pegainfer column after each optimization** to always reflect the latest state. The vLLM column only needs to be measured once at baseline — re-measure when upgrading vLLM.
 
 ```markdown
 ## E2E Dashboard
 
 GPU: ..., Model: ..., vLLM version: ..., single concurrency.
 
-| Profile | Metric | openinfer | vLLM | delta |
+| Profile | Metric | pegainfer | vLLM | delta |
 |---------|--------|-----------|------|-------|
 | prefill-heavy (2048,1) | TTFT median | ... | ... | ... |
 | prefill-heavy (2048,1) | TTFT p99 | ... | ... | ... |
@@ -40,7 +40,7 @@ GPU: ..., Model: ..., vLLM version: ..., single concurrency.
 
 ### 2. Model Architecture & Operator Coverage
 
-Expand the model's computation graph first, then annotate openinfer's support status.
+Expand the model's computation graph first, then annotate pegainfer's support status.
 
 **Architecture summary:** layer count, layer type distribution, key shapes.
 

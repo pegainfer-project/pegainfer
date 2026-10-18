@@ -1,34 +1,30 @@
 [workspace]
-default-members = ["openinfer-server"]
+default-members = ["pegainfer-server"]
 members = [
-  "openinfer-engine",
-  "openinfer-vllm-frontend",
-  "openinfer-sim",
-  "openinfer-vllm-support",
-  "openinfer-server",
-  "openinfer-core",
-  "openinfer-cupti",
-  "openinfer-kernels",
-  "openinfer-bench",
-  "openinfer-build",
-  "openinfer-deepseek-v2-lite",
-  "openinfer-glm52",
-  "openinfer-kimi-k2",
-  "openinfer-qwen3",
-  "openinfer-qwen35-4b",
-  "openinfer-sample",
-  "openinfer-kv-cache",
-  "openinfer-kv-offload",
+  "pegainfer-frontend",
+  "pegainfer-sim",
+  "pegainfer-server",
+  "pegainfer-core",
+  "pegainfer-cupti",
+  "pegainfer-kernels",
+  "pegainfer-bench",
+  "pegainfer-build",
+  "pegainfer-deepseek-v2-lite",
+  "pegainfer-gemma4",
+  "pegainfer-glm52",
+  "pegainfer-k3",
+  "pegainfer-kimi-k2",
+  "pegainfer-qwen3",
+  "pegainfer-qwen35",
+  "pegainfer-qwen4",
+  "pegainfer-sample",
+  "pegainfer-kv-cache",
+  "pegainfer-kv-offload",
+  "pegainfer-kv-store",
   # ---- dynamo kvbm (forked from upstream, Apache-2.0) ----
   "kvbm/kvbm-logical",
 ]
 resolver = "3"
-
-# openinfer-dynamo-backend / -frontend are their OWN workspaces (they depend on
-# dynamo-runtime / dynamo-llm). Excluding them keeps that heavy dep tree out of
-# this workspace's `--workspace` build + test graph, so the default openinfer
-# build stays pure Rust + CUDA with no NATS/etcd/tonic. Build from their own dirs.
-exclude = ["openinfer-dynamo-backend", "openinfer-dynamo-frontend"]
 
 # Inherited by dynamo-ported crates that use `edition.workspace = true` etc.
 [workspace.package]
@@ -69,8 +65,9 @@ colored = "3"
 comfy-table = "7.2"
 criterion = { version = "0.8", features = ["html_reports"] }
 crossbeam-channel = "0.5"
+rayon = "1"
 # Floor 0.19.3 (caret), the lowest that satisfies dynamo's `=0.19.3` pin in the
-# openinfer-dynamo-backend sub-workspace. The MAIN openinfer workspace stays
+# pegainfer-dynamo-backend sub-workspace. The MAIN pegainfer workspace stays
 # locked at 0.19.7 (caret-satisfied, no re-resolve), so the standalone engine
 # keeps the 0.19.5+ per-symbol lazy nvrtc loading that holds the cuda-12090
 # binding off a runtime driver floor (issue #263). Only the dynamo-backend
@@ -97,9 +94,15 @@ derive_builder = "0.20"
 either = { version = "1.13", features = ["serde"] }
 etcd-client = { version = "0.17.0", features = ["tls"] }
 fastrace = { version = "0.7.17", features = ["enable"] }
+# 0.17 tracks opentelemetry 0.31 (matches the otlp/sdk stack below); 0.18+ jumps
+# to otel 0.32 and would pull a second, incompatible opentelemetry into the tree.
+fastrace-opentelemetry = "0.17"
 futures = "0.3"
 half = { version = "2.7", features = ["num-traits"] }
 hex = "0.4"
+# The version axum 0.8 already carries; sharing one copy keeps the
+# `LengthLimitError` downcast type-identical to what `axum::body::to_bytes` raises.
+http-body-util = "0.1.3"
 humantime = "2.2.0"
 indexmap = "2"
 is-terminal = "0.4"
@@ -114,24 +117,25 @@ memmap2 = "0.9"
 mio = "=1.1.1"
 mockall = "0.13.1"
 nvtx = "1.3.0"
-once_cell = "1.21.3"
 oneshot = "0.1.11"
-openinfer-bench = { path = "openinfer-bench" }
-openinfer-build = { path = "openinfer-build" }
-openinfer-core = { path = "openinfer-core" }
-openinfer-cupti = { path = "openinfer-cupti" }
-openinfer-deepseek-v2-lite = { path = "openinfer-deepseek-v2-lite" }
-openinfer-engine = { path = "openinfer-engine" }
-openinfer-glm52 = { path = "openinfer-glm52" }
-openinfer-kernels = { path = "openinfer-kernels" }
-openinfer-kimi-k2 = { path = "openinfer-kimi-k2" }
-openinfer-kv-cache = { path = "openinfer-kv-cache" }
-openinfer-kv-offload = { path = "openinfer-kv-offload" }
-openinfer-qwen3 = { path = "openinfer-qwen3" }
-openinfer-qwen35-4b = { path = "openinfer-qwen35-4b" }
-openinfer-sample = { path = "openinfer-sample" }
-openinfer-vllm-frontend = { path = "openinfer-vllm-frontend" }
-openinfer-vllm-support = { path = "openinfer-vllm-support" }
+pegainfer-bench = { path = "pegainfer-bench" }
+pegainfer-build = { path = "pegainfer-build" }
+pegainfer-core = { path = "pegainfer-core" }
+pegainfer-cupti = { path = "pegainfer-cupti" }
+pegainfer-deepseek-v2-lite = { path = "pegainfer-deepseek-v2-lite" }
+pegainfer-frontend = { path = "pegainfer-frontend" }
+pegainfer-gemma4 = { path = "pegainfer-gemma4" }
+pegainfer-glm52 = { path = "pegainfer-glm52" }
+pegainfer-k3 = { path = "pegainfer-k3" }
+pegainfer-kernels = { path = "pegainfer-kernels" }
+pegainfer-kimi-k2 = { path = "pegainfer-kimi-k2" }
+pegainfer-kv-cache = { path = "pegainfer-kv-cache" }
+pegainfer-kv-offload = { path = "pegainfer-kv-offload" }
+pegainfer-kv-store = { path = "pegainfer-kv-store" }
+pegainfer-qwen3 = { path = "pegainfer-qwen3" }
+pegainfer-qwen35 = { path = "pegainfer-qwen35" }
+pegainfer-qwen4 = { path = "pegainfer-qwen4" }
+pegainfer-sample = { path = "pegainfer-sample" }
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", features = [
@@ -180,12 +184,14 @@ url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 validator = { version = "0.20.0", features = ["derive"] }
 velo = "0.1.0"
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e2d157f9b93451fa048f9c8530c8a67b" }
-vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e2d157f9b93451fa048f9c8530c8a67b" }
-vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e2d157f9b93451fa048f9c8530c8a67b" }
-vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "8e61b646e2d157f9b93451fa048f9c8530c8a67b" }
+vllm-chat = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
+vllm-server = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
+vllm-text = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "f4dde3132c94cccce485a1a59acac1d06739a59d" }
 xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh3"] }
-zeromq = { version = "0.6.0", default-features = false, features = [
+# The vllm crates' rev: the bridge hands `PeerIdentity` and listeners across the crate boundary.
+zeromq = { git = "https://github.com/zeromq/zmq.rs", rev = "67dcba97559ebe8e8206dab753710d8b9cb07591", default-features = false, features = [
   "tokio-runtime",
   "all-transport",
 ] }

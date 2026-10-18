@@ -31,7 +31,7 @@ local_experts = 384 / ep_world         (按 ep_world 切)
 
 ```rust
 /// 纯并行拓扑，跟模型无关。可复用于 Qwen 等其他模型线。
-/// 放 openinfer-core。
+/// 放 pegainfer-core。
 pub struct ParallelConfig {
     pub tp_world: usize,
     pub dp_world: usize,
@@ -39,7 +39,7 @@ pub struct ParallelConfig {
 }
 
 /// 一个 rank 在 TP×DP×EP 网格中的坐标。
-/// 放 openinfer-core。
+/// 放 pegainfer-core。
 pub struct RankCoord {
     pub global_rank: usize,
     pub tp_rank: usize,        // global_rank % tp_world
@@ -48,7 +48,7 @@ pub struct RankCoord {
 }
 
 /// Kimi-K2 专属：从拓扑派生的模型维度。
-/// 现有 KimiK2ParallelShape 的延续，留在 openinfer-kimi-k2。
+/// 现有 KimiK2ParallelShape 的延续，留在 pegainfer-kimi-k2。
 pub struct KimiK2ModelConfig {
     pub topo: ParallelConfig,
     pub heads_per_tp: usize,   // = 64 / tp_world

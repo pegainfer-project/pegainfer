@@ -14,10 +14,10 @@
   - `docs/index.md` — located the Qwen3 model, decode-attention, and kernel-report records.
   - `docs/models/qwen3/model-crate.md` — established that Qwen3 owns its decode graph and kernel plan rather than exposing model details through the server.
   - `docs/subsystems/kernels/kernel-op-reports.md` — established the existing distinction between semantic `KernelCall` reports and physical kernel execution.
-  - `openinfer-core/src/cuda_graph.rs` — confirmed `CudaGraphState` retains the source `CUgraph` after capture and is the correct graph-inspection boundary.
-  - `openinfer-qwen3/src/batch_decode.rs` and `batch_decode_buffers.rs` — confirmed graph identity is `(bucket, attention_path, stream cache)`; batch 1 deterministically selects SplitKv.
-  - `openinfer-qwen3/src/unified_forward.rs`, `weights.rs`, and `executor.rs` — confirmed single-GPU memory profiling captures a temporary graph, while TP startup pre-captures live graphs; the export must explicitly target the live batch-1 graph instead of relying on capture order.
-  - `openinfer-server/src/config.rs` and `main.rs` — located CLI validation and the server-to-`Qwen3LaunchOptions` handoff.
+  - `pegainfer-core/src/cuda_graph.rs` — confirmed `CudaGraphState` retains the source `CUgraph` after capture and is the correct graph-inspection boundary.
+  - `pegainfer-qwen3/src/batch_decode.rs` and `batch_decode_buffers.rs` — confirmed graph identity is `(bucket, attention_path, stream cache)`; batch 1 deterministically selects SplitKv.
+  - `pegainfer-qwen3/src/unified_forward.rs`, `weights.rs`, and `executor.rs` — confirmed single-GPU memory profiling captures a temporary graph, while TP startup pre-captures live graphs; the export must explicitly target the live batch-1 graph instead of relying on capture order.
+  - `pegainfer-server/src/config.rs` and `main.rs` — located CLI validation and the server-to-`Qwen3LaunchOptions` handoff.
   - CUDA 13.3 headers and the main workspace's locked cudarc 0.19.7 bindings — confirmed availability of `cuGraphGetNodes`, `cuGraphGetEdges`, `cuGraphNodeGetType`, `cuGraphKernelNodeGetParams`, and `cuFuncGetName`.
 - **Relevant history**:
   - `docs/models/qwen3/decode-attention.md` records that batch 1 uses the SplitKv path; choosing batch 1 is therefore a semantic choice, not merely a smaller launch shape.
@@ -44,18 +44,18 @@
 
 ### Step 2: CLI, live-graph plumbing, and CUDA graph inspection
 
-- Added `--dump-graph-png PATH` to `openinfer-server`; model applicability and CUDA-Graph/LoRA exclusions fail before engine loading.
+- Added `--dump-graph-png PATH` to `pegainfer-server`; model applicability and CUDA-Graph/LoRA exclusions fail before engine loading.
 - Added `Qwen3LaunchOptions::dump_graph_png` and routed it through the Qwen3 scheduler to a rank-0 worker command.
 - Single GPU pre-captures only the requested live batch-1 graph; TP reuses the completed startup sweep and reads rank 0's existing batch-1 graph.
-- Added direct `CUgraph` inspection in `openinfer-core` via `cuGraphGetNodes`, `cuGraphGetEdges`, `cuGraphNodeGetType`, `cuGraphKernelNodeGetParams_v2`, and `cuFuncGetName`.
+- Added direct `CUgraph` inspection in `pegainfer-core` via `cuGraphGetNodes`, `cuGraphGetEdges`, `cuGraphNodeGetType`, `cuGraphKernelNodeGetParams_v2`, and `cuFuncGetName`.
 - Detailed `.dot` retains full demangled/raw names and launch shapes; the PNG uses compact labels from the same node IDs and is rendered by external Graphviz.
-- Commands: `cargo fmt --all`; `git diff --check`; `cargo check --release -p openinfer-core -p openinfer-qwen3 -p openinfer-server`.
+- Commands: `cargo fmt --all`; `git diff --check`; `cargo check --release -p pegainfer-core -p pegainfer-qwen3 -p pegainfer-server`.
 - Result: release check passed on sm_120; no new dependency and no Python path.
 
 ### Step 3: Real Qwen3-4B export and repeated-layer folding
 
-- Built `openinfer-server` in release mode and launched:
-  `LD_LIBRARY_PATH=/data/opt/nccl-2.30.4/lib target/release/openinfer --model-path /data/models/Qwen3-4B --dump-graph-png qwen3_4b_decode.png --port 18080`.
+- Built `pegainfer-server` in release mode and launched:
+  `LD_LIBRARY_PATH=/data/opt/nccl-2.30.4/lib target/release/pegainfer --model-path /data/models/Qwen3-4B --dump-graph-png qwen3_4b_decode.png --port 18080`.
 - The live batch-1 SplitKv graph contained 507 kernel nodes and 506 edges. The server reached scheduler and HTTP readiness after the export.
 - The first unfolded PNG was `470x32767`: Graphviz hit its practical raster-height ceiling, making the image unusable even though the DOT was correct.
 - The physical graph is a linear chain with a 14-kernel block repeated 36 times between a two-node prologue and the final LM-head GEMV. Added topology/signature-based repeated-run detection to fold only the PNG view; the detailed DOT remains all 507 nodes and 506 edges.
@@ -67,10 +67,10 @@
 - User review found the default Graphviz raster text blurry. Rendering now requires the Cairo PNG backend and uses 192 DPI.
 - Final artifacts from the real model are `qwen3_4b_decode.dot` (319 KiB, 507 full raw/demangled symbols) and `qwen3_4b_decode.png` (336 KiB, `1386x3050`). Graphviz successfully reparsed the detailed DOT.
 - Validation passed:
-  - `cargo test --release -p openinfer-core cuda_graph::dump::tests` — 4 passed.
-  - `cargo test --release -p openinfer-server config::tests::qwen3_` — 4 passed.
-  - `cargo test --release -p openinfer-qwen3 --lib` — 67 passed.
-  - `cargo clippy --release -p openinfer-core -p openinfer-qwen3 -p openinfer-server -- -D warnings`.
+  - `cargo test --release -p pegainfer-core cuda_graph::dump::tests` — 4 passed.
+  - `cargo test --release -p pegainfer-server config::tests::qwen3_` — 4 passed.
+  - `cargo test --release -p pegainfer-qwen3 --lib` — 67 passed.
+  - `cargo clippy --release -p pegainfer-core -p pegainfer-qwen3 -p pegainfer-server -- -D warnings`.
   - `cargo fmt --all --check`; `git diff --check`; `dot -Tdot qwen3_4b_decode.dot -o /dev/null`.
 - Error/resolution: the first strict Clippy run rejected implicit Rust borrows passed to CUDA FFI and a local constant placed after statements. Switched the CUDA output parameters to explicit raw pointers and moved the constant before statements; the rerun passed.
 
@@ -85,11 +85,11 @@
 - The required `toxic-reviewer` pass traced CLI → Qwen launch → scheduler → rank worker → captured graph → CUDA Driver API and requested changes before submission.
 - `cuFuncGetName` requires CUDA Driver API 12.3. At the user's direction, raised the documented repository floor from R535/CUDA 12.2 to R545/CUDA 12.3 and added a pre-load `cuDriverGetVersion` diagnostic so older drivers return a clear error instead of panicking in cudarc's lazy symbol loader.
 - Renamed `shared_mem_bytes`/`smem` to `dynamic_shared_mem_bytes`/`dynamic_smem`; `CUDA_KERNEL_NODE_PARAMS.sharedMemBytes` does not include statically allocated shared memory.
-- Removed Qwen3 presentation metadata from `openinfer-core`: the Qwen3 executor now supplies the graph title to the reusable renderer.
+- Removed Qwen3 presentation metadata from `pegainfer-core`: the Qwen3 executor now supplies the graph title to the reusable renderer.
 - Extended the existing TP2 CUDA Graph integration test to request an export when Graphviz Cairo and `c++filt` are available, then assert that the PNG and detailed DOT contain the expected data. External renderer absence is the only reason to disable export coverage; every validation/export error otherwise fails the test. The test compiled and skipped its GPU body on the single-GPU development host.
 - Added the missing CLI test for rejecting graph export with LoRA.
 - Rebuilt and reran the real single-GPU Qwen3-4B export into `/tmp`; the server reached HTTP readiness and the detailed DOT retained 507 nodes/506 edges with the corrected dynamic-shared-memory field.
-- `cargo test --release --workspace --lib` first exposed the documented missing `OPENINFER_NCCL_ROOT`; after rerunning with `/data/opt/nccl-2.30.4`, the all-model build completed and tests advanced through 493 `kvbm-logical` cases before the unrelated `openinfer-comm-cuda-lib::test_gdr::gdr_copy_flag_GPU` failed because this host cannot create a GDRCopy handle. All Qwen3/core/server tests in this change's scope passed.
+- `cargo test --release --workspace --lib` first exposed the documented missing `PEGAINFER_NCCL_ROOT`; after rerunning with `/data/opt/nccl-2.30.4`, the all-model build completed and tests advanced through 493 `kvbm-logical` cases before the unrelated `pegainfer-comm-cuda-lib::test_gdr::gdr_copy_flag_GPU` failed because this host cannot create a GDRCopy handle. All Qwen3/core/server tests in this change's scope passed.
 
 ## Debrief
 

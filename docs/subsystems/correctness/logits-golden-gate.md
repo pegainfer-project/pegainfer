@@ -1,6 +1,6 @@
 # Numerical correctness: the logits golden gate
 
-**TL;DR**: How to guard that a model's logits stay correct across prompts, hardware, and batch size — *without* binding to one GPU's exact bits. The pattern: store a reference (HuggingFace bf16) of top-K logprobs for fixed teacher-forced sequences, replay them through openinfer, and assert (a) a structural *regret* check on the argmax and (b) the **mean** and **p99** of the per-token logprob delta stay at the bf16 noise floor. NOT exact text, NOT a hash, NOT bit-identical-across-batch, NOT the absolute max. Qwen3-4B is the reference implementation (`openinfer-qwen3/tests/hf_golden_gate.rs`, see `models/qwen3/accuracy-gate.md`); Qwen3.5-4B applies the same method with an HF `past_key_values` oracle and graph-only replay (`openinfer-qwen35-4b/tests/hf_golden_gate.rs`, see `models/qwen35/accuracy.md`).
+**TL;DR**: How to guard that a model's logits stay correct across prompts, hardware, and batch size — *without* binding to one GPU's exact bits. The pattern: store a reference (HuggingFace bf16) of top-K logprobs for fixed teacher-forced sequences, replay them through pegainfer, and assert (a) a structural *regret* check on the argmax and (b) the **mean** and **p99** of the per-token logprob delta stay at the bf16 noise floor. NOT exact text, NOT a hash, NOT bit-identical-across-batch, NOT the absolute max. Qwen3-4B is the reference implementation (`pegainfer-qwen3/tests/hf_golden_gate.rs`, see `models/qwen3/accuracy-gate.md`); Qwen3.5-4B applies the same method with an HF `past_key_values` oracle and graph-only replay (`pegainfer-qwen35/tests/hf_golden_gate.rs`, see `models/qwen35/accuracy.md`).
 
 Last touched: 2026-05
 
@@ -10,7 +10,7 @@ Last touched: 2026-05
 
 Note what this does *not* say: it does not say "bit-identical". Two facts make bit-identity a false invariant, and conflating either with a real bug is the trap every naive correctness test falls into:
 
-1. **Cross-hardware.** openinfer's logits come out of bf16 GEMM. Different GPUs (and different kernel/cuBLAS builds) use different tile shapes and accumulation orders, so the low mantissa bits differ by 1–2 ULP. bf16 has a 7-bit mantissa, so 1 ULP at logit magnitude ~16 is ≈0.125 nat — enough to flip an argmax on a near-tie.
+1. **Cross-hardware.** pegainfer's logits come out of bf16 GEMM. Different GPUs (and different kernel/cuBLAS builds) use different tile shapes and accumulation orders, so the low mantissa bits differ by 1–2 ULP. bf16 has a 7-bit mantissa, so 1 ULP at logit magnitude ~16 is ≈0.125 nat — enough to flip an argmax on a near-tie.
 2. **Cross-batch.** The batched decode path is *not* batch-invariant: batch composition changes the order in which partial results are reduced, which drifts logits ~1 ULP the same way. So "batched == sequential, bit-for-bit" is false by construction — an `executor_equivalence`-style test that asserts it is asserting a falsehood and will flake on benign noise. (We have *measured* this batch-dependent drift; we have not isolated which kernel produces it, so the doc attributes it to reduction order, not to a named library.)
 
 The correct invariant is therefore *bounded* drift, not *zero* drift. Everything below is about bounding it strictly enough to catch real bugs while absorbing the irreducible bf16 tail.
@@ -21,13 +21,13 @@ Both are **hardware-bound**: green on the machine that produced them, red everyw
 
 ## The four design choices
 
-**1. A reference of equal precision, stored once.** Use HuggingFace as the numerical golden truth, dumped in **bf16** — the same precision regime as openinfer, so the comparison is apples-to-apples — on GPU with `device_map=auto` so the one script scales to large models. Store top-K logprobs per evaluated position as safetensors (machine-only numeric data, nobody reads it). fp32 is reserved for one-time tie *adjudication*, not for the gate.
+**1. A reference of equal precision, stored once.** Use HuggingFace as the numerical golden truth, dumped in **bf16** — the same precision regime as pegainfer, so the comparison is apples-to-apples — on GPU with `device_map=auto` so the one script scales to large models. Store top-K logprobs per evaluated position as safetensors (machine-only numeric data, nobody reads it). fp32 is reserved for one-time tie *adjudication*, not for the gate.
 
 **2. Teacher-forcing, not free greedy.** Feed both engines the *identical* fixed token sequence (the reference's own prompt + decode tail) and score per position. Free-running greedy lets one argmax flip cascade, making every later position incomparable. Teacher-forcing isolates each position so a disagreement is a real per-position disagreement.
 
-**3. A structural regret check on the argmax — magnitude-independent.** openinfer's chosen token must be one the reference also ranks near its own best. *Regret* = how far below the reference's argmax (in the reference's own logprobs) openinfer's pick sits; it must stay ≤ a tie tolerance (Qwen3-4B: 0.20 nat). Where the reference has a clear winner, the only token within tolerance is its argmax, so this enforces exact agreement there; at a genuine bf16 tie the runner-up is within a ULP or two, so a tie-flip is not a failure. A pick the reference scores clearly worse — or one absent from its top-K entirely (confidently wrong on a token the reference does not even rank) — is a real wrong-token bug. This regret form is deliberate: a plain margin-gated equality check leaves a hole in the sub-tolerance tie band where a garbage argmax escapes every check.
+**3. A structural regret check on the argmax — magnitude-independent.** pegainfer's chosen token must be one the reference also ranks near its own best. *Regret* = how far below the reference's argmax (in the reference's own logprobs) pegainfer's pick sits; it must stay ≤ a tie tolerance (Qwen3-4B: 0.20 nat). Where the reference has a clear winner, the only token within tolerance is its argmax, so this enforces exact agreement there; at a genuine bf16 tie the runner-up is within a ULP or two, so a tie-flip is not a failure. A pick the reference scores clearly worse — or one absent from its top-K entirely (confidently wrong on a token the reference does not even rank) — is a real wrong-token bug. This regret form is deliberate: a plain margin-gated equality check leaves a hole in the sub-tolerance tie band where a garbage argmax escapes every check.
 
-**4. Mean + p99 of the logprob delta — NOT the absolute max.** On the head tokens, bound `|openinfer − reference|` two ways:
+**4. Mean + p99 of the logprob delta — NOT the absolute max.** On the head tokens, bound `|pegainfer − reference|` two ways:
 - **mean** — trips on *systematic* drift. A uniform logit shift of `d` nat moves every delta by ~`d`, so the mean catches a small global regression that a single-token check would miss. Averaged over thousands of deltas it is hardware-stable yet sensitive.
 - **p99** — bounds the tail without chasing the single worst token.
 
@@ -58,7 +58,7 @@ mean and p99 are flat across every pass; only the absolute max moves:
 | graph (9 padded) | 153 | 0.034 | 0.13 | 0.44 |
 | graph (5 padded) | 85 | 0.032 | 0.11 | 0.14 |
 
-The single worst token is the **same** one across bs=1 / eager-9 / graph-9 — a deep-tail token at logprob ≈−10, far below the argmax: the reference is fixed at −10.2508 while openinfer reads −9.876 at bs=1 and −9.813 in the 9-seq batch. The delta swings 0.37→0.44 purely from the batch-dependent reduction order, with **zero** effect on the argmax. eager-9 and graph-9 are bit-identical, which proves the CUDA-graph path matches eager at the same composition; the only mover is batch composition. This is exactly the benign reduction-order noise the tolerance is built to absorb, and exactly why the max is printed but not asserted.
+The single worst token is the **same** one across bs=1 / eager-9 / graph-9 — a deep-tail token at logprob ≈−10, far below the argmax: the reference is fixed at −10.2508 while pegainfer reads −9.876 at bs=1 and −9.813 in the 9-seq batch. The delta swings 0.37→0.44 purely from the batch-dependent reduction order, with **zero** effect on the argmax. eager-9 and graph-9 are bit-identical, which proves the CUDA-graph path matches eager at the same composition; the only mover is batch composition. This is exactly the benign reduction-order noise the tolerance is built to absorb, and exactly why the max is printed but not asserted.
 
 ## Applying it to a new model line
 

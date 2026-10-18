@@ -8,7 +8,7 @@
 > before changing kernels, then keep mixed-load and HTTP lifecycle evidence
 > separate.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-10
 
 Tracking issue: `[Model] Qwen3.5 dense roadmap v2: Stable single-GPU serving`
 (#654). It supersedes #249. Sibling maturity bar:
@@ -40,14 +40,14 @@ out:
 | Admission / long context | Done: full-lifetime KV accounting and explicit context/KV rejection | `docs/models/qwen35/kv-admission.md`, #254, #290, #654 |
 | Prefill | Done: direct paged writes, bounded scheduler chunking, and resumed `base_pos > 0` coverage | #252, #305, #313, #314, #333, #375, #654 |
 | Sampling / step tail | Done: mixed batched sampling and batched final norm/lm_head/token selection | #284, #353, #654 |
-| Serving-vs-vLLM evidence | Retained #469 RTX 5090 sweep exists. OpenInfer completed every cell with zero failures, but vLLM 0.25.1 is faster across the retained HTTP envelope. | `docs/benchmarks/qwen35-4b-serving-vllm-rtx5090-2026-07.md`, #469 |
-| Serving overhead | Open: direct c16 TPOT is close to vLLM HTTP c16, while OpenInfer HTTP c16 is slower. Start with HTTP/frontend/scheduler/event attribution. | #469, #654 |
+| Serving-vs-vLLM evidence | Retained #469 RTX 5090 sweep exists. PegaInfer completed every cell with zero failures, but vLLM 0.25.1 is faster across the retained HTTP envelope. | `docs/benchmarks/qwen35-4b-serving-vllm-rtx5090-2026-07.md`, #469 |
+| Serving overhead | Open: direct c16 TPOT is close to vLLM HTTP c16, while PegaInfer HTTP c16 is slower. Start with HTTP/frontend/scheduler/event attribution. | #469, #654 |
 | Mixed-load evidence | Open: prove injected prefill overlaps active decode and keep starvation setups as negative controls | #470 |
 | HTTP lifecycle | Open: retain cancel, disconnect, overload, rejection, recovery, health, and memory-return evidence | #471 |
 | Fault isolation | Open risk: batch-level execution errors can still fail multiple active requests | #654 |
 | Prefix reuse | Open: bounded joint KV/recurrent/conv snapshot design and implementation | #257 |
 | DFlash | In flight and opt-in: correctness-first work must stay default-off until gates pass | #434, PR #626, #654 |
-| Tensor parallel | Phase 1 complete: eager dense TP2 worker/scheduler execution; Phase 2 still needs mixed-step execution and sharded linear-attention/GDR state. | `docs/models/qwen35/tp-implementation.md`, #446 |
+| Tensor parallel | Done through P2c: eager dense TP2, mixed-step unified execution, sharded linear/GDR state (27B fits 2×48 GB), and decode CUDA Graphs for 4B/9B and 27B TP2; remaining: TP perf gates | `docs/models/qwen35/tp-implementation.md`, #446 |
 
 ## Active Contract
 
@@ -74,8 +74,8 @@ Serving:
 Performance:
 
 - The retained #469 sweep is the current HTTP boundary for 4B on 1x RTX 5090:
-  OpenInfer passed the matrix with zero failures, but did not match vLLM.
-- New claims must include GPU, driver, CUDA/toolchain, OpenInfer commit, vLLM
+  PegaInfer passed the matrix with zero failures, but did not match vLLM.
+- New claims must include GPU, driver, CUDA/toolchain, PegaInfer commit, vLLM
   version, model revision, serve flags, bench flags, workload, concurrency/QPS,
   completed/failed counts, average output tokens, and output sanity/hash.
 - The 1024/256 c16 direct diagnostic is attribution evidence only. It suggests
@@ -133,8 +133,8 @@ Performance:
 
 ### Later
 
-- TP for a concrete 9B or 27B TP=2 target, then 4B TP only if same-host TP=1 vs
-  TP=2 shows value.
+- TP remaining work: TP perf gates (the merged-stack A/B tracked in
+  #1001); see `docs/models/qwen35/tp-implementation.md` Follow-Ups.
 - LoRA with real-adapter logprob parity.
 - Exporter-specific FP8/NVFP4/MXFP4 loading and accuracy lanes.
 - MTP/DSpark under a separate speculative path.

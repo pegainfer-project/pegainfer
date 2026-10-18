@@ -67,10 +67,6 @@ impl LifecyclePinRef {
         self.0.manager_id()
     }
 
-    pub fn registration_handle(&self) -> BlockRegistrationHandle {
-        self.0.registration_handle()
-    }
-
     /// Strong-count of the underlying `Arc<dyn LifecyclePin>`. Useful for
     /// metrics and tests; do not branch on this in production code.
     pub fn use_count(&self) -> usize {

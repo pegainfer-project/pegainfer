@@ -10,7 +10,7 @@
   - `docs/models/qwen3/dflash-speculative-decoding.md` — DFlash design, losslessness gate, performance numbers
   - `docs/models/qwen3/serving-performance.md` — serving setup, DSpark concurrency numbers
   - `tools/bench/run_serving_bench.sh` — bench harness, uses `vllm-bench`
-  - `openinfer-qwen3/src/executor/dflash_lane.rs:192-204` — accept log format: `accepted_draft=N committed_tokens=N cumulative_accept_rate=X`
+  - `pegainfer-qwen3/src/executor/dflash_lane.rs:192-204` — accept log format: `accepted_draft=N committed_tokens=N cumulative_accept_rate=X`
 - **Relevant history**:
   - `docs/models/qwen3/dspark-integration.md` § "5090 bring-up" — Bug 1: `vllm-bench` defaults to non-greedy, silently disabling spec decode; fix: `--temperature 0`. Bug 2: anchor layout keyed on markov head instead of checkpoint format.
   - Qwen3-4B `max_position_embeddings` = 40960; DFlash effective context = `max_position_embeddings - block_size` (40953 for DSpark block7, 40944 for DFlash block16).
@@ -28,9 +28,9 @@
      - Tokenize, filter: keep prompts with `token_count + 256 ≤ 40900` (fits DFlash effective context + output budget).
      - Sample ≤500 prompts (stratified by token-count buckets) for reasonable runtime.
      - Save as JSONL: `{"prompt": "<text>", "token_count": N}`.
-  3. **Verify openinfer build** on 5090 (`CUDA_HOME=/usr/local/cuda-13.1 cargo build --release -p openinfer-server`).
+  3. **Verify pegainfer build** on 5090 (`CUDA_HOME=/usr/local/cuda-13.1 cargo build --release -p pegainfer-server`).
   4. **Run DFlash A/B**:
-     - Launch server: `--model-path /data/Qwen3-4B --dflash-draft-model-path /data/dflash_qwen3_4b_block7`, `RUST_LOG=openinfer_qwen3=debug`, GPU 7.
+     - Launch server: `--model-path /data/Qwen3-4B --dflash-draft-model-path /data/dflash_qwen3_4b_block7`, `RUST_LOG=pegainfer_qwen3=debug`, GPU 7.
      - Send prompts sequentially via Python script: `/v1/completions`, `temperature=0`, `max_tokens=256`, `ignore_eos=true`.
      - Capture server log.
      - Kill server.
@@ -62,7 +62,7 @@
 - Token distribution of the 200 sent: min 13,429 / p50 22,429 / max 28,650.
 
 ### Step 4: DFlash A/B
-- Server: `CUDA_VISIBLE_DEVICES=7 RUST_LOG=openinfer_qwen3=debug target/release/openinfer --model-path /data/Qwen3-4B --port 8000 --dflash-draft-model-path /data/dflash_qwen3_4b_block7`.
+- Server: `CUDA_VISIBLE_DEVICES=7 RUST_LOG=pegainfer_qwen3=debug target/release/pegainfer --model-path /data/Qwen3-4B --port 8000 --dflash-draft-model-path /data/dflash_qwen3_4b_block7`.
 - Client: `python3 send_prompts.py 8000 prompts_filtered.jsonl` — sequential, `temperature=0, max_tokens=128, ignore_eos=true`.
 - Result: 200/200 ok, 895s wall, 14,221 verify rounds.
 

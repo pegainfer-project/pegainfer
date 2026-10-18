@@ -50,16 +50,16 @@ Negative result: registering 40 extra unique ~1900-token prompts did not move wa
 
 - **RoPE scalar-path corruption (fixed on this branch).** `prefill_attention_paged_into` had a `batch_size == 1` fast path that used a scalar `start_pos` (always 0 from the qwen3 call site) instead of the plan's per-token positions array. Cold runs were unaffected (start really is 0); warm bs=1 prefills rotated the suffix K/Q from position 0 and scattered the mis-rotated K into KV pages — decode drift up to 3.3 nat in `hf_golden_gate` cached replay. The scalar branch and its dead kernel wrapper (`prefill_qk_norm_rope_only_cuda`) are deleted; all callers go through the positions array, which is bit-identical for cold runs (both C entry points launched the same kernel). Lesson: a "fast path" that duplicates position logic is a fork that only breaks when positions stop being trivial.
 - **TTFT measurement: drain the stream.** The server has no abort-on-disconnect — a client that hangs up after the first token leaves the request decoding its remaining tokens, and the *next* request's prefill contends with that zombie decode. Early-disconnect measurement inflated warm TTFT 16.3 → 25.5ms p50. Always read SSE to `[DONE]` between samples.
-- **Cache-off runs still register blocks.** Disabling matching only skips lookup; completed blocks are still registered on apply. Tests use this: phase 1 (off) builds cold baselines *and* populates the cache for phase 2 (on).
+- **Cache-off runs do not seed later warm replays.** Blocks are still registered while a request executes, but request teardown marks their canonical primaries reset-on-release. Re-enabling the cache therefore starts cold and tests must seed retained blocks explicitly before asserting a warm hit.
 
 ## Tests
 
-- `openinfer-qwen3/tests/prefix_cache.rs` — behavioral contract: exact cached-token counts (3-block hit + tail recompute, extension match, full-block cap edge), mixed cold+warm batch in one plan, unified prefill+decode path, warm-vs-cold logit bounds (regret + mean, golden-gate methodology).
-- `openinfer-qwen3/tests/hf_golden_gate.rs` — cached-replay surfaces (sequential bs=1 eager, batched eager, batched cuda-graph) vs the HF golden: warm mean 0.0316 / p99 0.1215 vs cold floor 0.0317 / 0.1196.
+- `pegainfer-qwen3/tests/prefix_cache.rs` — behavioral contract: exact cached-token counts (3-block hit + tail recompute, extension match, full-block cap edge), mixed cold+warm batch in one plan, unified prefill+decode path, warm-vs-cold logit bounds (regret + mean, golden-gate methodology).
+- `pegainfer-qwen3/tests/hf_golden_gate.rs` — cached-replay surfaces (sequential bs=1 eager, batched eager, batched cuda-graph) vs the HF golden: warm mean 0.0316 / p99 0.1215 vs cold floor 0.0317 / 0.1196.
 
 ```bash
-OPENINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test prefix_cache
-OPENINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B cargo test --release -p openinfer-qwen3 --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B cargo test --release -p pegainfer-qwen3 --test prefix_cache
+PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B cargo test --release -p pegainfer-qwen3 --test hf_golden_gate
 ```
 
 ## Next

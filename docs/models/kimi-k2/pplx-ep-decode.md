@@ -122,7 +122,7 @@ block_size=64 意味着 `thread_m_blocks=4`（large-batch config），每个 m_b
 
 ### #0 PPLX EP baseline（2026-05-23）
 
-从 TP8+EP8 NCCL 路径 fork，接入 `openinfer-comm::EpBackend`。PPLX 4-step protocol 替换 NCCL RS bridge，router scale 在 combine_recv 后单独应用（`accumulate=false` + `kimi_scaled_add_f32_bf16_to_bf16`）。
+从 TP8+EP8 NCCL 路径 fork，接入 `pegainfer-comm::EpBackend`。PPLX 4-step protocol 替换 NCCL RS bridge，router scale 在 combine_recv 后单独应用（`accumulate=false` + `kimi_scaled_add_f32_bf16_to_bf16`）。
 
 初始 bench_serving 测得 PPLX TPOT ≈ 37ms，NCCL no-graph ≈ 19ms。
 
@@ -183,11 +183,11 @@ prefix sum 是串行的，但只有 48 iterations in shared memory——不值�
 
 | File | 改动 |
 | --- | --- |
-| `openinfer-kimi-k2/src/runner/moe_pplx.rs` | PPLX_EXPERT_PADDING 64→8, block_size 硬编码 8, forward 逻辑 |
-| `openinfer-kernels/csrc/kimi_k2/kimi_experts.cu` | routing kernel 并行化 <<<1,64>>>, shared memory prefix sum |
-| `openinfer-kernels/csrc/kimi_k2/kimi_marlin_wna16.cu` | `swiglu_w13_pplx_kernel` + C wrapper |
-| `openinfer-kernels/src/ops/kimi_k2/experts.rs` | `kimi_pplx_build_marlin_routing_on_stream`, tight_max 计算, PPLX GEMM wrappers |
-| `openinfer-kernels/src/ffi.rs` | FFI declarations |
+| `pegainfer-kimi-k2/src/runner/moe_pplx.rs` | PPLX_EXPERT_PADDING 64→8, block_size 硬编码 8, forward 逻辑 |
+| `pegainfer-kernels/csrc/kimi_k2/kimi_experts.cu` | routing kernel 并行化 <<<1,64>>>, shared memory prefix sum |
+| `pegainfer-kernels/csrc/kimi_k2/kimi_marlin_wna16.cu` | `swiglu_w13_pplx_kernel` + C wrapper |
+| `pegainfer-kernels/src/ops/kimi_k2/experts.rs` | `kimi_pplx_build_marlin_routing_on_stream`, tight_max 计算, PPLX GEMM wrappers |
+| `pegainfer-kernels/src/ffi.rs` | FFI declarations |
 
 ## Open
 

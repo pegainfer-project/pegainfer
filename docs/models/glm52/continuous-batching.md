@@ -6,7 +6,7 @@
 
 ## What changed
 
-One commit on `feat/glm52-continuous-batching`: `openinfer-glm52` only, zero CUDA changes.
+One commit on `feat/glm52-continuous-batching`: `pegainfer-glm52` only, zero CUDA changes.
 
 - **Scheduler (`scheduler.rs`):** one-request-per-rank → up to `GLM52_MAX_BATCH_PER_RANK = 8` requests per rank, each owning one slot (and that slot's disjoint `max_model_len`-token cache region — hardcoded 4096 at the time, VRAM-derived at launch since #579). Admission is least-loaded rank first, lowest free slot; requests join/leave at step boundaries; beyond 64 active the queue holds. The admission and bucket decisions are pure functions over the occupancy (`admission_target` / `step_bucket`, unit-tested).
 - **Batch bucket ({1, 8}):** the coordinator agrees a global bucket per step — 1 row per rank while every rank holds ≤ 1 request, the full 8-row batch as soon as any rank holds two. The MoE collectives require every rank to enter with the same global row count (8 vs 64), so the bucket is a coordinator decision, never per-rank. Attention tier stays per-rank (attention is rank-local).

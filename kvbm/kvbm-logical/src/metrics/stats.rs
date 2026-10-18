@@ -186,20 +186,6 @@ impl StatsCollector {
             .rev()
             .collect()
     }
-
-    /// Spawn a tokio task that periodically calls `sample()`.
-    /// Returns a `JoinHandle` that can be used to abort the task.
-    pub fn spawn(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let this = Arc::clone(self);
-        let interval = this.config.sample_interval;
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                this.sample();
-            }
-        })
-    }
 }
 
 fn zero_stats(raw: &MetricsSnapshot) -> StatsSnapshot {

@@ -1,6 +1,6 @@
 # GLM5.2 Oracle Harness
 
-> **TL;DR:** Self-contained accuracy oracle for the GLM5.2 bricks: `tools/accuracy/glm52_oracle.py` (uv script, pinned `transformers==5.12.1` official `glm_moe_dsa` modeling code) emits paste-ready Rust probe constants; `openinfer-glm52/src/oracle/mla.rs` replays the identical seeded input through the engine and asserts them. First gate (MLA decode brick) is green on jz38 H200 — 64/64 probes, full-tensor diff RMS 1.8e-5 vs tol 6.9e-5 — and both negative controls (rope-swap, q_b head negate) go red. No MB-scale fixtures in git: probes are hardcoded constants, the full tap dump is an optional local safetensors.
+> **TL;DR:** Self-contained accuracy oracle for the GLM5.2 bricks: `tools/accuracy/glm52_oracle.py` (uv script, pinned `transformers==5.12.1` official `glm_moe_dsa` modeling code) emits paste-ready Rust probe constants; `pegainfer-glm52/src/oracle/mla.rs` replays the identical seeded input through the engine and asserts them. First gate (MLA decode brick) is green on jz38 H200 — 64/64 probes, full-tensor diff RMS 1.8e-5 vs tol 6.9e-5 — and both negative controls (rope-swap, q_b head negate) go red. No MB-scale fixtures in git: probes are hardcoded constants, the full tap dump is an optional local safetensors.
 >
 > **Last touched:** 2026-07
 
@@ -19,7 +19,7 @@
 | float probes (64 sampled indices + RMS) | tolerance-assert | hardcoded in the Rust gate |
 | input bf16 sha256 | exact-assert | hardcoded; fails on PRNG drift *before* any kernel runs |
 | float tensor sha256 | **never** — provenance only | comment header |
-| full tap dump | optional stats-assert (RMS + p99, max printed) | `OPENINFER_GLM52_ORACLE_DUMP=/path.safetensors`, not in git |
+| full tap dump | optional stats-assert (RMS + p99, max printed) | `PEGAINFER_GLM52_ORACLE_DUMP=/path.safetensors`, not in git |
 
 **Cross-language input without fixtures:** splitmix64 (integer-only) → 53-bit uniform → `(u-0.5)*4` → f32 → bf16. Both sides derive it from the seed; digest-checked.
 
@@ -32,12 +32,12 @@ uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 --em
 # 2) paste the emitted block over the GENERATED section in oracle/mlla.rs
 
 # 3) run the gate (H200 + checkpoint)
-OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
-  cargo test --release -p openinfer-glm52 --features glm52 --lib mla_oracle -- --ignored --nocapture
+PEGAINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
+  cargo test --release -p pegainfer-glm52 --features glm52 --lib mla_oracle -- --ignored --nocapture
 
 # debugging a divergence: dump all taps, gate then also whole-tensor-diffs `o`
 uv run tools/accuracy/glm52_oracle.py --model-path ... --emit safetensors --out /tmp/taps.safetensors
-OPENINFER_GLM52_ORACLE_DUMP=/tmp/taps.safetensors cargo test ... mla_oracle -- --ignored --nocapture
+PEGAINFER_GLM52_ORACLE_DUMP=/tmp/taps.safetensors cargo test ... mla_oracle -- --ignored --nocapture
 ```
 
 Taps captured (stderr table each run): `hidden, cos/sin, q_resid, q_full, ckv, kv_c_cached, attn_v, o, topk_indices`. PR2's indexer gate extends the same registry (`index_q`, `mqa_logits`, `topk_slots`).
@@ -53,8 +53,8 @@ Taps captured (stderr table each run): `hidden, cos/sin, q_resid, q_full, ckv, k
 - **numpy double-rounds:** `.astype(np.float32)` then bf16 = f64→f32→bf16. Rust `bf16::from_f64` rounds once and diverges on a handful of values. The gate mirrors `from_f32(x as f32)`; the input digest catches any future drift here by design.
 - **Float digests are torch/hw-version-fragile.** Only the *input* digest is asserted (integer-derived, stable); output digests are provenance comments.
 - **Absolute max diff grows with element count** (bf16 tail over 1.2M elements) — assert RMS + p99, print max. Same lesson as the qwen3 golden gate.
-- **jz38 worktree submodules:** `ecbbe74` (DG_NO_TORCH DeepGEMM) is a local patch not on `deepseek-ai/DeepGEMM` origin — `git submodule update` in a fresh worktree fails to fetch it. Push it from a checkout that has it: `git push ssh://jz-38/<worktree>/openinfer-kernels/third_party/DeepGEMM <sha>:refs/heads/dg-no-torch`, then check out. FlashMLA needed `--force` to materialize.
-- Build env on jz38: `PATH=/root/.cargo/bin:/usr/local/cuda/bin`, `CUDA_HOME=/usr/local/cuda` (12.8), `OPENINFER_NCCL_ROOT=<repo>/.venv/lib/python3.12/site-packages/nvidia/nccl` (system NCCL 2.29.7 is too old).
+- **jz38 worktree submodules:** `ecbbe74` (DG_NO_TORCH DeepGEMM) is a local patch not on `deepseek-ai/DeepGEMM` origin — `git submodule update` in a fresh worktree fails to fetch it. Push it from a checkout that has it: `git push ssh://jz-38/<worktree>/pegainfer-kernels/third_party/DeepGEMM <sha>:refs/heads/dg-no-torch`, then check out. FlashMLA needed `--force` to materialize.
+- Build env on jz38: `PATH=/root/.cargo/bin:/usr/local/cuda/bin`, `CUDA_HOME=/usr/local/cuda` (12.8), `PEGAINFER_NCCL_ROOT=<repo>/.venv/lib/python3.12/site-packages/nvidia/nccl` (system NCCL 2.29.7 is too old).
 
 ## Prototype-era fixtures
 

@@ -1,0 +1,12 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-cupti"
+version = "0.1.0"
+
+[build-dependencies]
+cc = { workspace = true }
+pegainfer-build = { workspace = true }
+
+[lints]
+workspace = true

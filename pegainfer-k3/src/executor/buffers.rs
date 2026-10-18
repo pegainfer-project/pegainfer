@@ -1,0 +1,994 @@
+//! Device buffers a decode step reads and writes: the per-slot state pools that
+//! survive a step, and the scratch arena that does not.
+//!
+//! Everything here is allocated once, at the executor's row capacity, and never
+//! reallocated — a batched kernel launched at bucket `b` addresses the leading
+//! `b` rows of a `[capacity, ...]` slab, so one arena serves every bucket and
+//! every device pointer is stable for CUDA-Graph capture.
+//!
+//! Two families of state need a successor buffer the kernel may not alias: the
+//! KDA recurrent state and the KDA convolution window. Copying the successor
+//! back would cost more than the step itself at width, so each is a **pair of
+//! slabs read and written by step parity**: even steps read slab 0 and write
+//! slab 1, odd steps the other way round. That makes the step body
+//! parity-dependent, which is why a bucket holds one graph per parity.
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
+use half::bf16;
+use pegainfer_kernels::ops::K3_ATTNRES_MAX_BLOCKS;
+use pegainfer_kernels::ops::K3_CONV_WIDTH;
+use pegainfer_kernels::ops::K3_KDA_HEAD_DIM;
+use pegainfer_kernels::ops::K3_KDA_HEADS;
+use pegainfer_kernels::ops::K3_MLA_HEADS;
+use pegainfer_kernels::ops::K3_MOE_QUANT_GROUP;
+use pegainfer_kernels::ops::K3_ROUTER_TOPK;
+use pegainfer_kernels::ops::K3_V_DIM;
+use pegainfer_kernels::ops::K3MegaSymmLayout;
+use pegainfer_kernels::ops::argmax_batch_bf16_split_partials_len;
+use pegainfer_kernels::ops::k3_mega_fabric_slab_alloc;
+use pegainfer_kernels::ops::k3_mega_fabric_supported;
+use pegainfer_kernels::ops::k3_mega_max_tokens_per_rank;
+use pegainfer_kernels::ops::k3_mega_open_peer_access;
+use pegainfer_kernels::ops::k3_mega_symm_buffer_layout;
+use pegainfer_kernels::tensor::DeviceContext;
+use pegainfer_kernels::tensor::HiddenStates;
+
+use super::ep::K3FabricSlab;
+use super::paged_kv::K3PagedKv;
+use crate::config::K3_ATTN_INNER;
+use crate::config::K3_DENSE_INTERMEDIATE;
+use crate::config::K3_EXPERT_INTERMEDIATE;
+use crate::config::K3_HEAD_DIM;
+use crate::config::K3_HIDDEN;
+use crate::config::K3_KV_A_OUT;
+use crate::config::K3_KV_B_OUT;
+use crate::config::K3_KV_LORA_RANK;
+use crate::config::K3_Q_B_OUT;
+use crate::config::K3_Q_LORA_RANK;
+use crate::config::K3_QK_ROPE_HEAD_DIM;
+use crate::config::K3_ROUTED_EXPERT_HIDDEN;
+use crate::config::K3_SHARED_INTERMEDIATE;
+use crate::config::K3_VOCAB;
+use crate::config::K3LayerKind;
+use crate::config::k3_layer_kind;
+
+/// Width of the KDA fused q|k|v|gate projection.
+pub(crate) const K3_KDA_FUSED: usize = 4 * K3_ATTN_INNER;
+/// Width of the padded KDA beta + low-rank-gate projection.
+pub(crate) const K3_KDA_WSM: usize = K3_KDA_HEADS + K3_KDA_HEAD_DIM;
+/// The same, rounded up the way the certified projection pads it.
+pub(crate) const K3_KDA_WSM_PADDED: usize = K3_KDA_WSM.next_multiple_of(64);
+/// Width of the MLA fused q_a | kv_a | k_rope | gate projection.
+pub(crate) const K3_MLA_FUSED: usize =
+    K3_Q_LORA_RANK + K3_KV_LORA_RANK + K3_QK_ROPE_HEAD_DIM + K3_ATTN_INNER;
+/// Carried convolution window slots.
+pub(crate) const K3_CONV_STATE: usize = K3_CONV_WIDTH - 1;
+/// Elements of one row's KDA recurrent state.
+pub(crate) const K3_KDA_STATE: usize = K3_KDA_HEADS * K3_KDA_HEAD_DIM * K3_KDA_HEAD_DIM;
+/// Width of the MLA attention output, `heads * v_head_dim`.
+pub(crate) const K3_MLA_V_ROW: usize = K3_MLA_HEADS * K3_V_DIM;
+
+/// One KDA layer's per-slot state: recurrent matrix plus the three convolution
+/// windows, each as a parity pair.
+pub(crate) struct K3KdaState {
+    /// `[2][rows, heads, head_dim, head_dim]` f32.
+    pub(crate) recurrent: [CudaSlice<f32>; 2],
+    /// `[2][3][rows, width - 1, inner]` bf16, one window per q/k/v stream.
+    pub(crate) conv: [[CudaSlice<bf16>; 3]; 2],
+}
+
+pub(crate) enum K3LayerState {
+    Kda(Box<K3KdaState>),
+    /// MLA state lives in the pool-wide paged latent cache ([`K3PagedKv`]),
+    /// not per layer.
+    Mla,
+}
+
+/// Everything about a slot that outlives a step.
+pub(crate) struct K3StatePool {
+    /// Sequence rows: how many independent sequences' KDA state this pool
+    /// holds. The decode pool has one per slot; the prefill pool has one.
+    pub(crate) rows: usize,
+    /// Batch rows a step against this pool runs at — the row count of the
+    /// snapshot slab and the KV block table. Equal to `rows` for decode; for
+    /// a prefill chunk it is the chunk capacity, because a chunk runs one
+    /// sequence's tokens as that many batch rows.
+    pub(crate) attn_rows: usize,
+    pub(crate) max_ctx: usize,
+    pub(crate) layers: Vec<K3LayerState>,
+    /// The paged MLA latent cache all MLA layers share.
+    pub(crate) kv: K3PagedKv,
+    /// Attention-residual snapshot history, `[attn_rows, block_count, hidden]`
+    /// bf16. The row stride is pinned at `K3_ATTNRES_MAX_BLOCKS` regardless of
+    /// the model's depth: the batched attnres kernels compile the slab's
+    /// (B, BC, H) stride in, so every pool must present the same one.
+    pub(crate) blocks: CudaSlice<bf16>,
+    pub(crate) block_count: usize,
+    /// Tokens each sequence row has already consumed. Index into its MLA
+    /// window and, plus one, its attention context length.
+    pub(crate) positions: Vec<usize>,
+}
+
+impl K3StatePool {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        rows: usize,
+        attn_rows: usize,
+        max_ctx: usize,
+        num_layers: usize,
+        kv_pages: usize,
+    ) -> Result<Self> {
+        // See the `blocks` field: the slab stride is the compile-time capacity
+        // the attnres kernels index by, never the truncation's block count.
+        let block_count = K3_ATTNRES_MAX_BLOCKS;
+        ensure!(
+            attn_rows == rows || rows == 1,
+            "K3 state pool: attn_rows may exceed rows only for a one-sequence (prefill) pool"
+        );
+        let stream = &ctx.stream;
+        let mla_layers = (0..num_layers)
+            .filter(|layer| k3_layer_kind(*layer) == K3LayerKind::Mla)
+            .count()
+            .max(1);
+        let kv = K3PagedKv::new(ctx, attn_rows, max_ctx, mla_layers, kv_pages)?;
+        let mut layers = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            layers.push(match k3_layer_kind(layer) {
+                K3LayerKind::Kda => {
+                    let recurrent_len = rows * K3_KDA_STATE;
+                    let conv_len = rows * K3_CONV_STATE * K3_ATTN_INNER;
+                    let mut recurrent = Vec::with_capacity(2);
+                    let mut conv = Vec::with_capacity(2);
+                    for _ in 0..2 {
+                        recurrent.push(
+                            stream
+                                .alloc_zeros::<f32>(recurrent_len)
+                                .context("alloc K3 KDA recurrent state")?,
+                        );
+                        conv.push([
+                            stream.alloc_zeros::<bf16>(conv_len)?,
+                            stream.alloc_zeros::<bf16>(conv_len)?,
+                            stream.alloc_zeros::<bf16>(conv_len)?,
+                        ]);
+                    }
+                    let [conv_even, conv_odd] = conv
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!("two parities were pushed"));
+                    let [recurrent_even, recurrent_odd] = recurrent
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!("two parities were pushed"));
+                    K3LayerState::Kda(Box::new(K3KdaState {
+                        recurrent: [recurrent_even, recurrent_odd],
+                        conv: [conv_even, conv_odd],
+                    }))
+                }
+                K3LayerKind::Mla => K3LayerState::Mla,
+            });
+        }
+        Ok(Self {
+            rows,
+            attn_rows,
+            max_ctx,
+            layers,
+            kv,
+            blocks: stream
+                .alloc_zeros::<bf16>(attn_rows * block_count * K3_HIDDEN)
+                .context("alloc K3 attention-residual snapshots")?,
+            block_count,
+            positions: vec![0; rows],
+        })
+    }
+
+    /// Zero one row's state everywhere and rewind its position. Both parities
+    /// are cleared: which one a step reads depends on the executor's step
+    /// counter, not on the row.
+    pub(crate) fn reset_row(&mut self, ctx: &DeviceContext, row: usize) -> Result<()> {
+        anyhow::ensure!(row < self.rows, "K3 state pool has no row {row}");
+        for layer in &mut self.layers {
+            match layer {
+                K3LayerState::Kda(kda) => {
+                    for parity in 0..2 {
+                        zero_rows(ctx, &mut kda.recurrent[parity], row, 1, K3_KDA_STATE)?;
+                        for stream in &mut kda.conv[parity] {
+                            zero_rows(ctx, stream, row, 1, K3_CONV_STATE * K3_ATTN_INNER)?;
+                        }
+                    }
+                }
+                // The paged latent cache is released below; freed pages are
+                // zeroed when next claimed, not here.
+                K3LayerState::Mla => {}
+            }
+        }
+        // A one-sequence pool's snapshot slab spans every chunk row, and they
+        // all belong to this sequence.
+        let (first, count) = if self.attn_rows == self.rows {
+            (row, 1)
+        } else {
+            (0, self.attn_rows)
+        };
+        zero_rows(
+            ctx,
+            &mut self.blocks,
+            first,
+            count,
+            self.block_count * K3_HIDDEN,
+        )?;
+        self.kv.release_row(row);
+        self.positions[row] = 0;
+        Ok(())
+    }
+
+    /// Copy one row of `source` into `row` of this pool, taking the KDA state
+    /// out of `source_parity` and landing it in `target_parity`. This is how a
+    /// finished prefill hands its sequence over to the decode pool.
+    pub(crate) fn adopt_row(
+        &mut self,
+        ctx: &DeviceContext,
+        source: &K3StatePool,
+        source_row: usize,
+        source_parity: usize,
+        row: usize,
+        target_parity: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            row < self.rows && source_row < source.rows,
+            "K3 state pool row out of range"
+        );
+        anyhow::ensure!(
+            source.layers.len() == self.layers.len()
+                && source.max_ctx == self.max_ctx
+                && source.block_count == self.block_count,
+            "K3 state pools disagree on geometry"
+        );
+        for (target, origin) in self.layers.iter_mut().zip(&source.layers) {
+            match (target, origin) {
+                (K3LayerState::Kda(target), K3LayerState::Kda(origin)) => {
+                    copy_rows(
+                        ctx,
+                        &origin.recurrent[source_parity],
+                        source_row,
+                        &mut target.recurrent[target_parity],
+                        row,
+                        1,
+                        K3_KDA_STATE,
+                    )?;
+                    for (target, origin) in target.conv[target_parity]
+                        .iter_mut()
+                        .zip(&origin.conv[source_parity])
+                    {
+                        copy_rows(
+                            ctx,
+                            origin,
+                            source_row,
+                            target,
+                            row,
+                            1,
+                            K3_CONV_STATE * K3_ATTN_INNER,
+                        )?;
+                    }
+                }
+                // The paged latent cache is adopted once for the whole pool,
+                // below the layer walk.
+                (K3LayerState::Mla, K3LayerState::Mla) => {}
+                _ => anyhow::bail!("K3 state pools disagree on layer kinds"),
+            }
+        }
+        copy_rows(
+            ctx,
+            &source.blocks,
+            source_row,
+            &mut self.blocks,
+            row,
+            1,
+            self.block_count * K3_HIDDEN,
+        )?;
+        self.kv.adopt_row(
+            ctx,
+            &source.kv,
+            source_row,
+            row,
+            source.positions[source_row],
+        )?;
+        self.positions[row] = source.positions[source_row];
+        Ok(())
+    }
+
+    /// Move `source_row`'s snapshot row into snapshot row 0.
+    ///
+    /// A prefill chunk leaves the final token's attention-residual snapshots
+    /// in the chunk's last live row; [`Self::adopt_row`] hands row 0 over, so
+    /// the prefill pool collapses the last row down first.
+    pub(crate) fn collapse_snapshots(
+        &mut self,
+        ctx: &DeviceContext,
+        source_row: usize,
+    ) -> Result<()> {
+        if source_row == 0 {
+            return Ok(());
+        }
+        ensure!(
+            source_row < self.attn_rows,
+            "K3 snapshot collapse from row {source_row} exceeds the {} snapshot rows",
+            self.attn_rows
+        );
+        let width = self.block_count * K3_HIDDEN;
+        let bytes = width * size_of::<bf16>();
+        let (base, _guard) = self.blocks.device_ptr_mut(&ctx.stream);
+        // SAFETY: distinct rows of one slab (source_row != 0), stream-ordered.
+        unsafe {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                base,
+                base + (source_row * bytes) as u64,
+                bytes,
+                pegainfer_kernels::tensor::active_cu_stream(ctx),
+            )
+        }
+        .result()
+        .map_err(|error| anyhow::anyhow!("K3 snapshot collapse failed: {error}"))
+    }
+}
+
+/// Strided row copy between two device buffers: `rows` rows of `width`
+/// elements, read from `src` starting at element `src_start` with a pitch of
+/// `src_pitch` elements per row, written likewise into `dst`. This is what
+/// builds a prefill chunk's convolution windows: the source rows are dense,
+/// the destination rows are one slot of a `[rows, K3_CONV_STATE, inner]`
+/// window, so the pitches differ.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn copy_rows_2d<T: cudarc::driver::DeviceRepr>(
+    ctx: &DeviceContext,
+    src: &CudaSlice<T>,
+    src_start: usize,
+    src_pitch: usize,
+    dst: &mut CudaSlice<T>,
+    dst_start: usize,
+    dst_pitch: usize,
+    rows: usize,
+    width: usize,
+) -> Result<()> {
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    ensure!(
+        width <= src_pitch.max(width)
+            && src_start + (rows - 1) * src_pitch + width <= src.len()
+            && dst_start + (rows - 1) * dst_pitch + width <= dst.len(),
+        "K3 2D row copy out of range: src {} at {src_start}+{rows}x{src_pitch}, dst {} at \
+         {dst_start}+{rows}x{dst_pitch}, width {width}",
+        src.len(),
+        dst.len()
+    );
+    let element = size_of::<T>();
+    let (src_ptr, _src_guard) = src.device_ptr(&ctx.stream);
+    let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&ctx.stream);
+    let desc = cudarc::driver::sys::CUDA_MEMCPY2D {
+        srcXInBytes: 0,
+        srcY: 0,
+        srcMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+        srcHost: std::ptr::null(),
+        srcDevice: src_ptr + (src_start * element) as u64,
+        srcArray: std::ptr::null_mut(),
+        srcPitch: src_pitch * element,
+        dstXInBytes: 0,
+        dstY: 0,
+        dstMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+        dstHost: std::ptr::null_mut(),
+        dstDevice: dst_ptr + (dst_start * element) as u64,
+        dstArray: std::ptr::null_mut(),
+        dstPitch: dst_pitch * element,
+        WidthInBytes: width * element,
+        Height: rows,
+    };
+    // SAFETY: both ranges were bounds-checked above and the copy is ordered on
+    // the pool's own stream.
+    unsafe {
+        cudarc::driver::sys::cuMemcpy2DAsync_v2(
+            &raw const desc,
+            pegainfer_kernels::tensor::active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|error| anyhow::anyhow!("K3 2D row copy failed: {error}"))
+}
+
+fn zero_rows<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    ctx: &DeviceContext,
+    buffer: &mut CudaSlice<T>,
+    first_row: usize,
+    rows: usize,
+    row_width: usize,
+) -> Result<()> {
+    if rows == 0 || row_width == 0 {
+        return Ok(());
+    }
+    let start = first_row * row_width;
+    let mut window = buffer.slice_mut(start..start + rows * row_width);
+    ctx.stream
+        .memset_zeros(&mut window)
+        .context("zero a K3 state row")
+}
+
+pub(super) fn copy_rows<T: cudarc::driver::DeviceRepr>(
+    ctx: &DeviceContext,
+    source: &CudaSlice<T>,
+    source_row: usize,
+    target: &mut CudaSlice<T>,
+    target_row: usize,
+    rows: usize,
+    row_width: usize,
+) -> Result<()> {
+    if rows == 0 || row_width == 0 {
+        return Ok(());
+    }
+    let span = rows * row_width;
+    let origin = source.slice(source_row * row_width..source_row * row_width + span);
+    let mut destination = target.slice_mut(target_row * row_width..target_row * row_width + span);
+    ctx.stream
+        .memcpy_dtod(&origin, &mut destination)
+        .context("copy a K3 state row")
+}
+
+/// Routed-expert chain buffers. Sized from the rank's local expert count and
+/// the masked layout's per-expert capacity, both fixed for the executor.
+pub(crate) struct K3MoeScratch {
+    pub(crate) masked_m: CudaSlice<i32>,
+    pub(crate) slot_map: CudaSlice<i32>,
+    pub(crate) w13_activation: CudaSlice<u8>,
+    pub(crate) w13_scale: CudaSlice<f32>,
+    pub(crate) w13_scale_packed: CudaSlice<i32>,
+    pub(crate) w13_out: CudaSlice<bf16>,
+    pub(crate) w2_activation: CudaSlice<u8>,
+    pub(crate) w2_scale: CudaSlice<f32>,
+    pub(crate) w2_scale_packed: CudaSlice<i32>,
+    pub(crate) w2_out: CudaSlice<bf16>,
+}
+
+impl K3MoeScratch {
+    /// `tokens` is the row count the *chain* runs at — this rank's bucket
+    /// capacity (the chain is the single-rank numerics anchor; the mega
+    /// transport never allocates this scratch).
+    fn new(ctx: &DeviceContext, tokens: usize, groups: usize, masked_cap: usize) -> Result<Self> {
+        let stream = &ctx.stream;
+        let masked_rows = groups * masked_cap;
+        let latent = K3_ROUTED_EXPERT_HIDDEN;
+        let inter = K3_EXPERT_INTERMEDIATE;
+        let quant = K3_MOE_QUANT_GROUP;
+        Ok(Self {
+            masked_m: stream.alloc_zeros(groups)?,
+            slot_map: stream.alloc_zeros(tokens * K3_ROUTER_TOPK)?,
+            w13_activation: stream
+                .alloc_zeros(masked_rows * latent)
+                .context("alloc K3 W13 activation")?,
+            w13_scale: stream.alloc_zeros(groups * (latent / quant) * masked_cap)?,
+            w13_scale_packed: stream.alloc_zeros(groups * (latent / (4 * quant)) * masked_cap)?,
+            w13_out: stream
+                .alloc_zeros(masked_rows * 2 * inter)
+                .context("alloc K3 W13 output")?,
+            w2_activation: stream
+                .alloc_zeros(masked_rows * inter)
+                .context("alloc K3 W2 activation")?,
+            w2_scale: stream.alloc_zeros(groups * (inter / quant) * masked_cap)?,
+            w2_scale_packed: stream.alloc_zeros(groups * (inter / (4 * quant)) * masked_cap)?,
+            w2_out: stream
+                .alloc_zeros(masked_rows * latent)
+                .context("alloc K3 W2 output")?,
+        })
+    }
+}
+
+/// The fused MegaMoE kernel's whole non-weight working set: one flat slab
+/// carrying twelve differently-typed regions (the activation and its scale
+/// factors, the routing pair, and the L1/L2 ring buffers the kernel streams
+/// through), plus the offsets that address them.
+///
+/// It doubles as the kernel's "symmetric" buffer. At `ep_size == 1` that is a
+/// plain device allocation: the kernel's cross-rank barriers compile down to
+/// grid-local synchronisation, so no IPC or NVSHMEM handle is involved. Above
+/// one rank every rank holds one of these on its own device and the whole world
+/// exchanges base pointers once, at startup; the addressing is plain peer
+/// access over NVLink, so there is still no IPC or NVSHMEM handle. It is zeroed
+/// once here — the workspace counters that share the slab are self-restoring
+/// across launches but start from zero.
+pub(crate) struct K3MegaScratch {
+    pub(crate) layout: K3MegaSymmLayout,
+    /// The slab. In-process it is a stream-ordered pool allocation; in a
+    /// fleet it is a `CU_MEM_HANDLE_TYPE_FABRIC` VMM mapping wrapped into the
+    /// same type ([`CudaStream::upgrade_device_ptr`]) so everything downstream
+    /// is identical. The wrapper's drop will try a pool free on the VMM
+    /// pointer, which the context records and ignores — acceptable, because a
+    /// mega slab's lifetime is the process's (an EP group dies as a fleet).
+    pub(crate) symm: CudaSlice<u8>,
+    /// Present exactly in fleet mode: what the bootstrap publishes so peer
+    /// processes can import this slab.
+    fabric: Option<K3FabricSlab>,
+    /// Row capacity the slab and the AOT kernel were built for. This is the
+    /// protocol maximum, not the executor's live batch: it is a template
+    /// parameter of the AOT kernel and every rank must agree on it.
+    pub(crate) max_tokens: usize,
+    /// GLOBAL routed-expert count. The kernel derives a token's destination
+    /// rank from `expert_id / (num_experts / num_ranks)`, so it wants the whole
+    /// count even though this rank only holds its own block of experts.
+    pub(crate) routed_experts: usize,
+    pub(crate) num_ranks: usize,
+    pub(crate) rank_idx: usize,
+    /// One base pointer per rank, as addressed from this rank's context. Known
+    /// at construction at `ep_size == 1`; above it, filled once from the group's
+    /// rendezvous before the first step.
+    ptrs: Vec<i64>,
+    base: i64,
+    /// Launches made since the current step began, and what the step owes.
+    ///
+    /// The kernel pairs the world inside itself, so a rank that skips a layer
+    /// leaves its peers in a barrier nothing satisfies. Nothing here can
+    /// *rescue* that — the guard exists so the rank that got it wrong says so,
+    /// instead of every other rank timing out sixty seconds later with no
+    /// indication of who was missing. Armed only above one rank (single-rank
+    /// steps replay from a captured graph, where a host-side counter would not
+    /// tick).
+    launches: usize,
+    launches_per_step: usize,
+}
+
+/// Open `self_ordinal` against every other device this process can see, so a
+/// later rendezvous can hand any of them this rank's slab pointer. Devices the
+/// pair cannot reach are skipped rather than fatal — they are simply not
+/// candidates for the group, and a rank that ends up with an unreachable peer
+/// finds out at rendezvous time with its ordinal in the message.
+fn open_local_peer_access(self_ordinal: usize) -> Result<()> {
+    let devices = cudarc::driver::result::device::get_count()
+        .map_err(|error| anyhow::anyhow!("count the CUDA devices: {error}"))?;
+    for peer in 0..usize::try_from(devices.max(0))? {
+        if peer == self_ordinal {
+            continue;
+        }
+        if let Err(error) = k3_mega_open_peer_access(self_ordinal, peer) {
+            log::debug!(
+                "K3 MegaMoE device {self_ordinal} cannot reach device {peer}, so it is not a \
+                 candidate peer: {error:#}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What an executor decides about its MegaMoE slab before it exists.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct K3MegaGeometry {
+    /// Device SM count; the kernel's grid sync spans it, so it is baked into
+    /// the instantiation.
+    pub(crate) num_sms: usize,
+    /// Expert-parallel world size the kernel pairs across.
+    pub(crate) num_ranks: usize,
+    /// This rank's index in that world.
+    pub(crate) rank_idx: usize,
+    /// The group spans processes: the slab must be a fabric-exportable VMM
+    /// allocation rather than a pool one, so peer processes can import it.
+    pub(crate) fleet: bool,
+}
+
+impl K3MegaScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        routed_experts: usize,
+        num_sms: usize,
+        min_tokens: usize,
+        num_ranks: usize,
+        rank_idx: usize,
+        fleet: bool,
+    ) -> Result<Self> {
+        // In-process groups: every device that will ever address this slab has
+        // to be opened BEFORE the slab exists — the memory-pool access grant
+        // only reliably covers allocations made after it. The group's own
+        // membership is not known until the rendezvous, so open every
+        // reachable one now and let `K3EpRuntime` re-check the ranks that turn
+        // out to be in the group. Fleet slabs skip this entirely: they are VMM
+        // fabric allocations, whose access grants (every local device, at
+        // allocation and at import) travel with the mapping.
+        if num_ranks > 1 && !fleet {
+            open_local_peer_access(ctx.device_ordinal)?;
+        }
+        // The slab and the layout take the AOT kernel's protocol maximum, not
+        // a batch-derived size: the ring capacities are kernel template
+        // parameters and the launch rejects any other value. The executor's
+        // live capacity only has to fit under it.
+        let max_tokens = k3_mega_max_tokens_per_rank();
+        ensure!(
+            min_tokens <= max_tokens,
+            "K3 MegaMoE is instantiated for {max_tokens} rows per rank, but this executor asks \
+             for {min_tokens}"
+        );
+        let layout = k3_mega_symm_buffer_layout(
+            num_ranks,
+            routed_experts,
+            max_tokens,
+            K3_ROUTER_TOPK,
+            K3_ROUTED_EXPERT_HIDDEN,
+            K3_EXPERT_INTERMEDIATE,
+            num_sms,
+        )?;
+        let (symm, fabric) = if fleet {
+            ensure!(
+                k3_mega_fabric_supported(ctx.device_ordinal).unwrap_or(false),
+                "K3 fleet rank on device {} cannot allocate NVLink-fabric memory; a cross-machine \
+                 EP group needs the IMEX daemon and a fabric-capable driver",
+                ctx.device_ordinal
+            );
+            let (ptr, handle) = k3_mega_fabric_slab_alloc(ctx.device_ordinal, layout.num_bytes)
+                .context("alloc K3 MegaMoE fabric symmetric buffer")?;
+            // SAFETY: the pointer is a live, zeroed mapping of at least
+            // `num_bytes` bytes; see the field's note about its drop.
+            let symm = unsafe {
+                ctx.stream
+                    .upgrade_device_ptr::<u8>(u64::try_from(ptr)?, layout.num_bytes)
+            };
+            (
+                symm,
+                Some(K3FabricSlab {
+                    handle,
+                    num_bytes: layout.num_bytes,
+                }),
+            )
+        } else {
+            (
+                ctx.stream
+                    .alloc_zeros::<u8>(layout.num_bytes)
+                    .context("alloc K3 MegaMoE symmetric buffer")?,
+                None,
+            )
+        };
+        let base = {
+            let (ptr, _guard) = symm.device_ptr(&ctx.stream);
+            i64::try_from(ptr)?
+        };
+        let mut ptrs = vec![0i64; num_ranks];
+        ptrs[rank_idx] = base;
+        Ok(Self {
+            layout,
+            symm,
+            fabric,
+            max_tokens,
+            routed_experts,
+            num_ranks,
+            rank_idx,
+            ptrs,
+            base,
+            launches: 0,
+            launches_per_step: 0,
+        })
+    }
+
+    /// The slab's fabric identity, present exactly in fleet mode — what the
+    /// bootstrap publishes so peer processes can import this slab.
+    pub(crate) fn fabric(&self) -> Option<K3FabricSlab> {
+        self.fabric
+    }
+
+    /// Count one launch against the current step.
+    pub(crate) fn count_launch(&mut self) {
+        self.launches += 1;
+    }
+
+    /// Arm the guard for a step that owes `launches` kernel launches. Zero
+    /// disarms it.
+    pub(crate) fn begin_step(&mut self, launches: usize) {
+        self.launches = 0;
+        self.launches_per_step = launches;
+    }
+
+    /// Check the step made every launch its peers are waiting on.
+    pub(crate) fn end_step(&self) -> Result<()> {
+        ensure!(
+            self.launches_per_step == 0 || self.launches == self.launches_per_step,
+            "K3 MegaMoE rank {} made {} launches this step but its peers expect {}; the group is \
+             now out of phase",
+            self.rank_idx,
+            self.launches,
+            self.launches_per_step
+        );
+        Ok(())
+    }
+
+    /// This rank's slab base, the value it publishes to its peers.
+    pub(crate) fn base(&self) -> i64 {
+        self.base
+    }
+
+    /// The world's base-pointer table, or `None` until the rendezvous has
+    /// filled it (which cannot happen at `ep_size == 1`, where it is complete
+    /// from construction).
+    pub(crate) fn peers(&self) -> Option<&[i64]> {
+        self.ptrs.iter().all(|ptr| *ptr != 0).then_some(&self.ptrs)
+    }
+
+    /// Adopt the table the group's rendezvous produced.
+    pub(crate) fn set_peers(&mut self, ptrs: Vec<i64>) -> Result<()> {
+        ensure!(
+            ptrs.len() == self.num_ranks,
+            "K3 MegaMoE rank {} expected {} peer pointers, the rendezvous produced {}",
+            self.rank_idx,
+            self.num_ranks,
+            ptrs.len()
+        );
+        ensure!(
+            ptrs[self.rank_idx] == self.base,
+            "K3 MegaMoE rank {} published base {:#x} but its slab is at {:#x}",
+            self.rank_idx,
+            ptrs[self.rank_idx],
+            self.base
+        );
+        self.ptrs = ptrs;
+        Ok(())
+    }
+}
+
+/// Per-step working buffers. Named after the certified engine's scratch so the
+/// launch sequence reads the same way.
+pub(crate) struct K3Scratch {
+    // Step inputs, refreshed from the host before every step (or graph replay).
+    pub(crate) token_ids: CudaSlice<u32>,
+    /// Per-row MLA context length, i.e. valid cache slots including this step.
+    pub(crate) context_len: CudaSlice<i32>,
+    /// Per-row destination of this step's paged latent write
+    /// ([`K3PagedKv::write_index`]), or `-1` for a row this step does not own.
+    pub(crate) kv_row: CudaSlice<i32>,
+    // Residual stream.
+    pub(crate) hidden: CudaSlice<bf16>,
+    pub(crate) prefix: CudaSlice<bf16>,
+    pub(crate) mixed: CudaSlice<bf16>,
+    pub(crate) prefix2: CudaSlice<bf16>,
+    pub(crate) mixed2: CudaSlice<bf16>,
+    pub(crate) attn_out: CudaSlice<bf16>,
+    pub(crate) mlp_out: CudaSlice<bf16>,
+    pub(crate) normed: CudaSlice<bf16>,
+    pub(crate) scores: CudaSlice<f32>,
+    // KDA.
+    pub(crate) kda_gate_partial: CudaSlice<f32>,
+    pub(crate) kda_conv_partial: CudaSlice<f32>,
+    pub(crate) kda_wsm_partial: CudaSlice<f32>,
+    pub(crate) kda_forget_partial: CudaSlice<f32>,
+    pub(crate) beta: CudaSlice<bf16>,
+    pub(crate) forget_low: CudaSlice<bf16>,
+    pub(crate) out_gate: CudaSlice<bf16>,
+    pub(crate) conv_x: CudaSlice<bf16>,
+    /// Prefill-chunk convolution windows, `[rows, K3_CONV_STATE, inner]`: row
+    /// `t` holds the three landed inputs preceding token `t`, prebuilt from
+    /// the chunk itself (and the carried window for the first rows), so one
+    /// batched conv launch serves the whole chunk.
+    pub(crate) conv_window: CudaSlice<bf16>,
+    /// The batched conv launch's successor windows; row `tokens - 1` is the
+    /// window to carry into the next chunk.
+    pub(crate) conv_window_next: CudaSlice<bf16>,
+    pub(crate) conv_q: CudaSlice<bf16>,
+    pub(crate) conv_k: CudaSlice<bf16>,
+    pub(crate) conv_v: CudaSlice<bf16>,
+    pub(crate) gated: CudaSlice<bf16>,
+    /// Chunked prefill (FlashKDA): the landed pre-activation gate projection,
+    /// `[rows, inner]` — the same `bf16(Σ gp)` landing the fused core takes
+    /// before adding `dt_bias`, which FlashKDA applies in-kernel.
+    pub(crate) kda_g: CudaSlice<bf16>,
+    /// Chunked prefill: beta transposed to `[heads, rows]` for FlashKDA's TMA.
+    pub(crate) kda_beta_t: CudaSlice<bf16>,
+    /// Chunked prefill: FlashKDA's raw attention rows, pre o_norm and gate.
+    pub(crate) kda_attn: CudaSlice<bf16>,
+    /// Chunked prefill: FlashKDA's inter-kernel workspace.
+    pub(crate) flash_kda_ws: CudaSlice<u8>,
+    // MLA.
+    pub(crate) mla_fused_partial: CudaSlice<f32>,
+    pub(crate) q_norm: CudaSlice<bf16>,
+    pub(crate) kv_a: CudaSlice<bf16>,
+    pub(crate) kv_latent: CudaSlice<bf16>,
+    pub(crate) kv_norm: CudaSlice<bf16>,
+    pub(crate) mla_gate: CudaSlice<bf16>,
+    pub(crate) q_partial: CudaSlice<f32>,
+    pub(crate) query: CudaSlice<bf16>,
+    /// The shared per-token rope half, `[rows, 64]` — cached verbatim (NoPE).
+    pub(crate) rope: CudaSlice<bf16>,
+    pub(crate) attn: CudaSlice<bf16>,
+    /// Chunked prefill (FlashMLA): the gathered cached latent,
+    /// `[max_ctx, 512]`, wrapped for the kv_b cuBLAS expansion (`seq_len` is
+    /// set to the chunk's kv span before each GEMM).
+    pub(crate) mla_ctx_latent: HiddenStates,
+    /// Chunked prefill: the gathered shared rope halves, `[max_ctx, 64]`.
+    pub(crate) mla_ctx_rope: CudaSlice<bf16>,
+    /// Chunked prefill: the kv_b expansion, `[win, heads, 256]` per-head
+    /// `nope | value` rows — the FMHA reads V as a strided view into this.
+    /// `win = min(max_ctx, K3_MLA_CTX_WINDOW)`: deeper contexts re-expand
+    /// window by window and merge through the LSE, so only the latent/rope
+    /// gather above scales with `max_ctx`.
+    pub(crate) mla_ctx_nope_v: HiddenStates,
+    /// Chunked prefill: the assembled K rows, `[win, heads, 192]`.
+    pub(crate) mla_ctx_k: CudaSlice<bf16>,
+    /// Chunked prefill: the windowed walk's f32 output accumulator,
+    /// `[rows, heads, 128]`.
+    pub(crate) mla_o_acc: CudaSlice<f32>,
+    /// Chunked prefill: the running log-sum-exp, `[heads, rows]`.
+    pub(crate) mla_lse_acc: CudaSlice<f32>,
+    /// Chunked prefill: one window's LSE from the FMHA, `[heads, rows]`.
+    pub(crate) mla_lse_win: CudaSlice<f32>,
+    // MLP / MoE.
+    pub(crate) hidden_partial: CudaSlice<f32>,
+    pub(crate) router_partial: CudaSlice<f32>,
+    pub(crate) topk_idx: CudaSlice<i32>,
+    pub(crate) topk_weight: CudaSlice<f32>,
+    pub(crate) latent_partial: CudaSlice<f32>,
+    pub(crate) latent: CudaSlice<bf16>,
+    pub(crate) routed_latent: CudaSlice<bf16>,
+    pub(crate) routed_latent_norm: CudaSlice<bf16>,
+    pub(crate) routed: CudaSlice<bf16>,
+    pub(crate) shared: CudaSlice<bf16>,
+    pub(crate) shared_partial: CudaSlice<f32>,
+    pub(crate) shared_gate: CudaSlice<bf16>,
+    pub(crate) shared_up: CudaSlice<bf16>,
+    pub(crate) shared_act: CudaSlice<bf16>,
+    pub(crate) dense_partial: CudaSlice<f32>,
+    pub(crate) dense_gate: CudaSlice<bf16>,
+    pub(crate) dense_up: CudaSlice<bf16>,
+    pub(crate) dense_act: CudaSlice<bf16>,
+    /// Present only when the routed experts run the masked chain. The fused
+    /// kernel keeps its whole working set in the slab below, so a production
+    /// rank never allocates this.
+    pub(crate) moe: Option<K3MoeScratch>,
+    /// Present only when the routed experts run through the fused kernel.
+    pub(crate) mega: Option<K3MegaScratch>,
+    // Output.
+    pub(crate) logit_partial: CudaSlice<f32>,
+    pub(crate) logits: CudaSlice<bf16>,
+    pub(crate) argmax_partial_values: CudaSlice<f32>,
+    pub(crate) argmax_partial_indices: CudaSlice<i32>,
+    pub(crate) argmax_values: CudaSlice<bf16>,
+    pub(crate) argmax_indices: CudaSlice<i32>,
+}
+
+impl K3Scratch {
+    /// `rows` is the widest bucket any step runs (the chunk bucket when
+    /// chunked prefill outgrows the decode ladder); `sample_rows` is the
+    /// decode row capacity, which alone sizes the epilogue buffers — a
+    /// prefill chunk skips the batched epilogue and samples its boundary
+    /// token through a one-row pass, so the vocab-wide buffers never scale
+    /// with the chunk. Exactly one of the two routed-expert working sets is
+    /// allocated: the fused kernel's slab when `mega` is set, the masked
+    /// chain's otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        rows: usize,
+        sample_rows: usize,
+        max_ctx: usize,
+        routed_experts: usize,
+        groups: usize,
+        masked_cap: usize,
+        mega: Option<K3MegaGeometry>,
+    ) -> Result<Self> {
+        let stream = &ctx.stream;
+        let wide = |width: usize| stream.alloc_zeros::<bf16>(rows * width);
+        let partial = |width: usize| stream.alloc_zeros::<f32>(rows * width);
+        let argmax_partials = argmax_batch_bf16_split_partials_len(sample_rows, K3_VOCAB);
+        Ok(Self {
+            token_ids: stream.alloc_zeros(rows)?,
+            context_len: stream.alloc_zeros(rows)?,
+            kv_row: stream.clone_htod(&vec![-1i32; rows])?,
+            hidden: wide(K3_HIDDEN)?,
+            prefix: wide(K3_HIDDEN)?,
+            mixed: wide(K3_HIDDEN)?,
+            prefix2: wide(K3_HIDDEN)?,
+            mixed2: wide(K3_HIDDEN)?,
+            attn_out: wide(K3_HIDDEN)?,
+            mlp_out: wide(K3_HIDDEN)?,
+            normed: wide(K3_HIDDEN)?,
+            scores: stream.alloc_zeros(rows * (crate::config::K3_LAYERS.div_ceil(12) + 1))?,
+            kda_gate_partial: partial(K3_KDA_FUSED)?,
+            kda_conv_partial: partial(K3_ATTN_INNER)?,
+            kda_wsm_partial: partial(K3_KDA_WSM_PADDED)?,
+            kda_forget_partial: partial(K3_ATTN_INNER)?,
+            beta: wide(K3_KDA_HEADS)?,
+            forget_low: wide(K3_HEAD_DIM)?,
+            out_gate: wide(K3_ATTN_INNER)?,
+            conv_x: wide(K3_ATTN_INNER)?,
+            conv_window: wide(K3_CONV_STATE * K3_ATTN_INNER)?,
+            conv_window_next: wide(K3_CONV_STATE * K3_ATTN_INNER)?,
+            conv_q: wide(K3_ATTN_INNER)?,
+            conv_k: wide(K3_ATTN_INNER)?,
+            conv_v: wide(K3_ATTN_INNER)?,
+            gated: wide(K3_ATTN_INNER)?,
+            kda_g: wide(K3_ATTN_INNER)?,
+            kda_beta_t: wide(K3_KDA_HEADS)?,
+            kda_attn: wide(K3_ATTN_INNER)?,
+            flash_kda_ws: stream.alloc_zeros(
+                pegainfer_kernels::ops::k3_flash_kda_workspace_bytes(rows, K3_KDA_HEADS),
+            )?,
+            mla_fused_partial: partial(K3_MLA_FUSED)?,
+            q_norm: wide(K3_Q_LORA_RANK)?,
+            kv_a: wide(K3_KV_A_OUT)?,
+            kv_latent: wide(K3_KV_LORA_RANK)?,
+            kv_norm: wide(K3_KV_LORA_RANK)?,
+            mla_gate: wide(K3_ATTN_INNER)?,
+            q_partial: partial(K3_Q_B_OUT)?,
+            query: wide(K3_Q_B_OUT)?,
+            rope: wide(K3_QK_ROPE_HEAD_DIM)?,
+            attn: wide(K3_MLA_V_ROW)?,
+            mla_ctx_latent: HiddenStates {
+                data: stream.alloc_zeros(max_ctx * K3_KV_LORA_RANK)?,
+                hidden_dim: K3_KV_LORA_RANK,
+                seq_len: 0,
+            },
+            mla_ctx_rope: stream.alloc_zeros(max_ctx * K3_QK_ROPE_HEAD_DIM)?,
+            mla_ctx_nope_v: HiddenStates {
+                data: stream
+                    .alloc_zeros(max_ctx.min(crate::config::K3_MLA_CTX_WINDOW) * K3_KV_B_OUT)?,
+                hidden_dim: K3_KV_B_OUT,
+                seq_len: 0,
+            },
+            mla_ctx_k: stream
+                .alloc_zeros(max_ctx.min(crate::config::K3_MLA_CTX_WINDOW) * K3_Q_B_OUT)?,
+            mla_o_acc: stream.alloc_zeros(rows * K3_MLA_V_ROW)?,
+            mla_lse_acc: stream.alloc_zeros(K3_MLA_HEADS * rows)?,
+            mla_lse_win: stream.alloc_zeros(K3_MLA_HEADS * rows)?,
+            hidden_partial: partial(K3_HIDDEN)?,
+            router_partial: partial(routed_experts)?,
+            topk_idx: stream.alloc_zeros(rows * K3_ROUTER_TOPK)?,
+            topk_weight: stream.alloc_zeros(rows * K3_ROUTER_TOPK)?,
+            latent_partial: partial(K3_ROUTED_EXPERT_HIDDEN)?,
+            latent: wide(K3_ROUTED_EXPERT_HIDDEN)?,
+            routed_latent: wide(K3_ROUTED_EXPERT_HIDDEN)?,
+            routed_latent_norm: wide(K3_ROUTED_EXPERT_HIDDEN)?,
+            routed: wide(K3_HIDDEN)?,
+            shared: wide(K3_HIDDEN)?,
+            shared_partial: partial(2 * K3_SHARED_INTERMEDIATE)?,
+            shared_gate: wide(K3_SHARED_INTERMEDIATE)?,
+            shared_up: wide(K3_SHARED_INTERMEDIATE)?,
+            shared_act: wide(K3_SHARED_INTERMEDIATE)?,
+            dense_partial: partial(2 * K3_DENSE_INTERMEDIATE)?,
+            dense_gate: wide(K3_DENSE_INTERMEDIATE)?,
+            dense_up: wide(K3_DENSE_INTERMEDIATE)?,
+            dense_act: wide(K3_DENSE_INTERMEDIATE)?,
+            moe: match mega {
+                Some(_) => None,
+                None => Some(K3MoeScratch::new(ctx, rows, groups, masked_cap)?),
+            },
+            mega: mega
+                .map(|geometry| {
+                    K3MegaScratch::new(
+                        ctx,
+                        routed_experts,
+                        geometry.num_sms,
+                        // The mega slab is a PROTOCOL-max buffer, not a
+                        // batch-sized one: every peer allocates the same
+                        // AOT-instantiated row capacity, and this rank's live
+                        // capacity merely has to fit under it.
+                        rows,
+                        geometry.num_ranks,
+                        geometry.rank_idx,
+                        geometry.fleet,
+                    )
+                })
+                .transpose()?,
+            logit_partial: stream
+                .alloc_zeros(sample_rows * K3_VOCAB)
+                .context("alloc K3 logit partial")?,
+            logits: stream
+                .alloc_zeros(sample_rows * K3_VOCAB)
+                .context("alloc K3 logits")?,
+            argmax_partial_values: stream.alloc_zeros(argmax_partials)?,
+            argmax_partial_indices: stream.alloc_zeros(argmax_partials)?,
+            argmax_values: stream.alloc_zeros(sample_rows)?,
+            argmax_indices: stream.alloc_zeros(sample_rows)?,
+        })
+    }
+}
+
+/// Split a parity pair into the slab this step reads and the one it writes.
+/// The two are disjoint halves of the same array, so a shared borrow of one and
+/// a unique borrow of the other coexist.
+pub(crate) fn parity_pair<T>(pair: &mut [T; 2], parity: usize) -> (&T, &mut T) {
+    let (low, high) = pair.split_at_mut(1);
+    if parity == 0 {
+        (&low[0], &mut high[0])
+    } else {
+        (&high[0], &mut low[0])
+    }
+}

@@ -1,13 +1,13 @@
 # Kimi-K2 MoE EP: PPLX → DeepEP migration
 
-> **TL;DR:** Implemented and 8×H200-verified — Kimi-K2's MoE EP backend is now DeepEP (elastic API, AOT-instantiated, no torch/NVRTC/NVSHMEM); PPLX is fully deleted from the kimi path (`moe_pplx.rs` gone, kimi crate no longer depends on `openinfer-comm`). Decode = `do_expand=true` + `do_cpu_sync=false`: fixed worst-case buffers, zero host syncs/allocs per step → **CUDA graph capture enabled (#227): bs64 steady TPOT p50 26.03 ms vs 29.61 eager (−12%), replay only at full bucket occupancy**. Prefill = `do_cpu_sync=true` with host spin on pinned counters. Marlin consumes the DeepEP recv buffer **in place** (expert_alignment 8 == Marlin block size; identity routing + sentinels). Same-node A/B vs PPLX on hth200-29: **eager bs64 TPOT p50 29.61 vs 29.79 ms (parity), comm itself 7µs/layer faster**; golden gate equivalent to main (free-greedy near-tie reds on both backends, teacher-forced 0 violations both). The initial port was +14% TPOT slower until two capacity-proportional adapter kernels were fixed (see the lesson below).
+> **TL;DR:** Implemented and 8×H200-verified — Kimi-K2's MoE EP backend is now DeepEP (elastic API, AOT-instantiated, no torch/NVRTC/NVSHMEM); PPLX is fully deleted from the kimi path (`moe_pplx.rs` gone, kimi crate no longer depends on `pegainfer-comm`). Decode = `do_expand=true` + `do_cpu_sync=false`: fixed worst-case buffers, zero host syncs/allocs per step → **CUDA graph capture enabled (#227): bs64 steady TPOT p50 26.03 ms vs 29.61 eager (−12%), replay only at full bucket occupancy**. Prefill = `do_cpu_sync=true` with host spin on pinned counters. Marlin consumes the DeepEP recv buffer **in place** (expert_alignment 8 == Marlin block size; identity routing + sentinels). Same-node A/B vs PPLX on hth200-29: **eager bs64 TPOT p50 29.61 vs 29.79 ms (parity), comm itself 7µs/layer faster**; golden gate equivalent to main (free-greedy near-tie reds on both backends, teacher-forced 0 violations both). The initial port was +14% TPOT slower until two capacity-proportional adapter kernels were fixed (see the lesson below).
 >
 > **Last touched:** 2026-06
 
 ## Architecture as built
 
 ```
-openinfer-kernels/
+pegainfer-kernels/
   third_party/DeepEP            # submodule d4f41e4 (2026-05-26)
   csrc/deepep/deepep_shim.cu    # AOT template instantiation (Kimi config baked:
                                 #   384 experts / 48 local, topk 8, hidden 7168, 8 ranks)
@@ -15,20 +15,20 @@ openinfer-kernels/
   src/ffi/deepep.rs             # repr(C) DeepEpInfo + extern decls
   src/ops/deepep.rs             # DeepEp wrapper: decode_dispatch/decode_combine (no sync),
                                 #   prefill_dispatch_send/wait_counts/recv + prefill_combine
-openinfer-kimi-k2/
+pegainfer-kimi-k2/
   src/runner/moe_deepep.rs      # the MoE layer:
                                 #   forward_moe_layer_decode_deepep_normed  (host-quiet)
                                 #   forward_moe_layer_prefill_deepep       (cpu-sync)
 ```
 
-Build needs `OPENINFER_NCCL_ROOT` pointing at NCCL ≥ 2.30 (device API: `ncclDevComm`,
+Build needs `PEGAINFER_NCCL_ROOT` pointing at NCCL ≥ 2.30 (device API: `ncclDevComm`,
 windows, GIN). The binary links `libnccl.so.2` via `LD_LIBRARY_PATH` at runtime.
-Local dev: `OPENINFER_NCCL_ROOT=/data/opt/nccl-2.30.4`.
+Local dev: `PEGAINFER_NCCL_ROOT=/data/opt/nccl-2.30.4`.
 
 Backend selection: TP1/DP8 **requires** `--ep-backend=deepep` (default), TP8/DP1
 requires `nccl` — both enforced with `ensure!` in `runner/bringup.rs`. There is no
-PPLX fallback by design ("我们并不是很喜欢 pplx ep"). `openinfer-comm`/PPLX survive
-only for the deepseek crates, which use their own `openinfer_comm::EpBackend` type.
+PPLX fallback by design ("我们并不是很喜欢 pplx ep"). `pegainfer-comm`/PPLX survive
+only for the deepseek crates, which use their own `pegainfer_comm::EpBackend` type.
 
 ## The contracts the integration stands on (verified in upstream source)
 
@@ -161,7 +161,7 @@ Node env facts (also apply to other hth200 nodes until proven otherwise):
   plugin loads but deeper init fails without DOCA GPUNetIO; intranode traffic
   is NVLink windows, GIN is inter-node-only.
 - System NCCL is exactly 2.30.4 (`/usr/include` + `/usr/lib/x86_64-linux-gnu`);
-  `OPENINFER_NCCL_ROOT` wants the `include/`+`lib/` layout — a symlink tree at
+  `PEGAINFER_NCCL_ROOT` wants the `include/`+`lib/` layout — a symlink tree at
   `/data/opt/nccl-2.30.4` bridges it.
 - The bastion swallows ssh exit codes — poll remote jobs with output markers,
   never `$?`. `pkill -f <pattern>` self-matches the ssh wrapper command line —

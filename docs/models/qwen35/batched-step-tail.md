@@ -1,8 +1,8 @@
 # Qwen3.5 Batched Step Tail
 
-> **TL;DR:** Qwen3.5 issue #353 is implemented in the local branch: prefill gathers per-request last hidden rows, runs batched offset RMSNorm + one lm_head GEMM, and scheduler/executor decode sample from batched logits. Full-vocab host copies now happen only for `logprobs > 0`. HF logits + scheduler e2e pass; benchmark evidence supports a first-token/short-output TTFT claim only.
+> **TL;DR:** Implementation record for Qwen3.5 issue #353: prefill gathers per-request last hidden rows, runs batched offset RMSNorm + one lm_head GEMM, and scheduler/executor decode sample from batched logits. Full-vocab host copies happen only for `logprobs > 0`. HF logits + scheduler e2e passed; benchmark evidence supports a first-token/short-output TTFT claim only.
 >
-> **Last touched:** 2026-06
+> **Last touched:** 2026-10
 
 ## Scope
 
@@ -13,25 +13,25 @@
 
 ## Code Shape
 
-- `openinfer-qwen35-4b/src/prefill.rs` returns each request's last hidden state and batches final `rms_norm_batch_offset_into` + `gemm`.
-- `openinfer-qwen35-4b/src/unified_forward.rs` returns batched prefill logits and leaves decode logits in the graph buffer.
-- `openinfer-qwen35-4b/src/batch_decode.rs`, `src/scheduler.rs`, and `src/executor.rs` sample from batched logits.
-- `openinfer-qwen35-4b/src/logprobs.rs` is the single helper for requested-logprobs snapshots and CPU logprob formatting.
-- `openinfer-qwen35-4b/tests/e2e_scheduler.rs` checks greedy `logprobs=0/1` token parity, logprob payload shape, and mixed concurrent logprob/no-logprob requests.
+- `pegainfer-qwen35/src/prefill.rs` returns each request's last hidden state and batches final `rms_norm_batch_offset_into` + `gemm`.
+- `pegainfer-qwen35/src/unified_forward.rs` returns batched prefill logits and leaves decode logits in the graph buffer.
+- `pegainfer-qwen35/src/batch_decode.rs`, `src/scheduler.rs`, and `src/executor.rs` sample from batched logits.
+- `pegainfer-qwen35/src/logprobs.rs` is the single helper for requested-logprobs snapshots and CPU logprob formatting.
+- `pegainfer-qwen35/tests/e2e_scheduler.rs` checks greedy `logprobs=0/1` token parity, logprob payload shape, and mixed concurrent logprob/no-logprob requests.
 
 ## Verification
 
 ```bash
 cargo fmt --all --check
 git diff --check
-OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-with-triton> \
-  cargo check --release -p openinfer-qwen35-4b --features qwen35-4b --tests
-OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-with-triton> \
-  OPENINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
-  cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate -- --nocapture
-OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=<python-with-triton> \
-  OPENINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
-  cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler -- --nocapture
+PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-with-triton> \
+  cargo check --release -p pegainfer-qwen35 --features qwen35 --tests
+PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-with-triton> \
+  PEGAINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
+  cargo test --release -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate -- --nocapture
+PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-with-triton> \
+  PEGAINFER_TEST_MODEL_PATH=<Qwen3.5-4B> \
+  cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
 ```
 
 Results:
@@ -47,7 +47,7 @@ Environment: single RTX 5090 32GB, driver 580.76.05, CUDA 12.8, Rust 1.96.0, Tri
 Final short-output serving A/B:
 
 ```bash
-cargo run --release --features qwen35-4b --bin bench_serving -- \
+cargo run --release --features qwen35 --bin bench_serving -- \
   --model-path <Qwen3.5-4B> --format json --label <label> --out <label>.json \
   request --prompt-len 1 --output-len 1 --concurrency 4 --warmup 5 --iters 20 --seed 353
 ```
@@ -72,4 +72,4 @@ Long-output diagnostic:
 - Read-only DeepSeek diff review found no blocker.
 - Follow-up review cleaned duplicate logprobs helpers into `src/logprobs.rs` and kept docs public-facing with placeholders rather than machine paths.
 - Fail-fast logprobs snapshot errors are intentional; silent logprobs loss is worse than an explicit request error in this correctness-sensitive path.
-- Final review flagged a `concurrency=64` shutdown SIGSEGV in `cublas_destroy`; qwen35 now returns an `EngineHandle` that joins the scheduler thread before process teardown.
+- Final review flagged a `concurrency=64` shutdown SIGSEGV in `cublas_destroy`. The server must join the scheduler thread before process teardown; the current `Engine` carries that join handle in `LiveScheduler`.

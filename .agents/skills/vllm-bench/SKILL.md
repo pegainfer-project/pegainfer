@@ -1,6 +1,6 @@
 ---
 name: vllm-bench
-description: "Use vllm-bench to benchmark OpenAI-compatible or vLLM serving endpoints, especially multi-turn chat load tests. Use when the user asks for vllm bench, vllm-bench, multi-turn benchmark, chat serving benchmark, TTFT/TPOT/throughput measurement, concurrency sweep, load test, 压测, 多轮压测, or wants help installing, running --help, choosing flags, validating a local OpenInfer/vLLM server, saving JSON results, or interpreting vllm-bench metrics."
+description: "Use vllm-bench to benchmark OpenAI-compatible or vLLM serving endpoints, especially multi-turn chat load tests. Use when the user asks for vllm bench, vllm-bench, multi-turn benchmark, chat serving benchmark, TTFT/TPOT/throughput measurement, concurrency sweep, load test, 压测, 多轮压测, or wants help installing, running --help, choosing flags, validating a local PegaInfer/vLLM server, saving JSON results, or interpreting vllm-bench metrics."
 ---
 
 # vllm-bench
@@ -21,26 +21,30 @@ Use this workflow for multi-turn work:
 
 ## Install
 
-Install from the upstream repository:
+`vllm-bench` has moved into the main vLLM repository as a crate in the Rust
+workspace (`vllm-project/vllm` → `rust/src/bench`); the standalone
+`vllm-project/vllm-bench` repo is archived and read-only. Build the maintained
+version from the new home:
 
 ```bash
-cargo install --git https://github.com/vllm-project/vllm-bench vllm-bench
+git clone --depth 1 https://github.com/vllm-project/vllm.git
+cd vllm/rust
+cargo build --release -p vllm-bench   # -> target/release/vllm-bench
 ```
 
-The trailing `vllm-bench` package name matters: the repo also contains another
-binary, so omitting it can fail with "multiple packages with binaries found".
-Cargo installs the binary to `~/.cargo/bin/vllm-bench`.
+`--depth 1` keeps the clone small; vLLM full history is large and not needed
+for a build.
 
-Alternatives from the README:
+To install onto PATH from the clone (the build above left the shell in
+`vllm/rust`):
 
 ```bash
-curl -fsSL https://github.com/vllm-project/vllm-bench/releases/latest/download/vllm-bench-$(uname -m)-linux-musl \
-  -o vllm-bench && chmod +x vllm-bench
-
-git clone https://github.com/vllm-project/vllm-bench.git
-cd vllm-bench
-./install.sh
+cargo install --path src/bench        # from vllm/rust -> ~/.cargo/bin/vllm-bench
 ```
+
+Note: upstream `rust/src/bench/README.md` may still show the archived
+standalone-repo install commands; the migration notice on the archived repo is
+the authoritative pointer, and `--help` on a fresh build is the flag authority.
 
 After install, run:
 
@@ -175,14 +179,14 @@ Read the output as:
 Expect later turns to have larger input token counts because each request sends
 the prior user/assistant history plus the next user message.
 
-## Example: Local OpenInfer Qwen3-4B Smoke
+## Example: Local PegaInfer Qwen3-4B Smoke
 
-This was validated locally with OpenInfer Qwen3-4B and `vllm-bench` built from
-this repo. Start OpenInfer:
+This was validated locally with PegaInfer Qwen3-4B and `vllm-bench` built from
+this repo. Start PegaInfer:
 
 ```bash
-cd <openinfer-repo>
-cargo run --release -p openinfer-server -- \
+cd <pegainfer-repo>
+cargo run --release -p pegainfer-server -- \
   --model-path <model-path> \
   --served-model-name Qwen/Qwen3-4B \
   --port 18080 \
@@ -198,7 +202,7 @@ curl -s http://127.0.0.1:18080/v1/models
 Run a tiny multi-turn benchmark:
 
 ```bash
-cd <vllm-bench-repo>
+cd <vllm-repo>/rust
 target/release/vllm-bench \
   --backend openai-chat \
   --base-url http://127.0.0.1:18080 \
@@ -222,9 +226,9 @@ target/release/vllm-bench \
   --result-filename vllm-bench-multi-turn-smoke.json
 ```
 
-The `--extra-body '{"min_tokens":null}'` is for OpenInfer compatibility. The
+The `--extra-body '{"min_tokens":null}'` is for PegaInfer compatibility. The
 random multi-turn path auto-adds `min_tokens` unless overridden; this pins
-output length on vLLM but OpenInfer currently rejects that field. `--ignore-eos`
+output length on vLLM but PegaInfer currently rejects that field. `--ignore-eos`
 also skips `min_tokens` and worked in local smoke testing, but it asks the
 server to ignore EOS and can grow contexts more aggressively.
 

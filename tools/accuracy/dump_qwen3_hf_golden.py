@@ -3,19 +3,19 @@
 
 The size is read from config.json, so one script serves every size.
 
-The gate (`openinfer-qwen3/tests/hf_golden_gate.rs`) compares openinfer's
+The gate (`pegainfer-qwen3/tests/hf_golden_gate.rs`) compares pegainfer's
 logprobs against HF *without* running HF at test time and *without* binding to
 one GPU's exact bit pattern. So we precompute, once, on the GPU:
 
   * a seed-pinned set of fixed token sequences (`prompt + teacher-forced tail`),
   * HF's top-K next-token logprobs at every evaluated position.
 
-The Rust gate replays the *same fixed sequences* through openinfer (prefill +
+The Rust gate replays the *same fixed sequences* through pegainfer (prefill +
 teacher-forced decode) and asserts its logprobs land within a bf16 tolerance of
 this golden — argmax must match HF wherever HF has a clear (> a few ULP) winner,
 logprobs within the bf16 noise floor.
 
-bf16 (not fp32) on purpose: it is the same precision regime as openinfer, so the
+bf16 (not fp32) on purpose: it is the same precision regime as pegainfer, so the
 comparison is apples-to-apples, and it runs on the GPU — `device_map=auto` scales
 the same script to the large models. fp32 only mattered for the one-time tie
 *adjudication* (compare_qwen3_4b_hf_logprobs.py --dtype float32); the gate's
@@ -60,8 +60,10 @@ VOCAB_CEILING = 100_000  # clear of high-id special tokens, matches the gate
 TOP_K = 64
 
 # (hidden_size, num_hidden_layers) -> fixture size token. Keep in sync with
-# `fixture_size_name` in openinfer-qwen3/tests/hf_golden_gate.rs.
+# `fixture_size_name` in pegainfer-qwen3/tests/hf_golden_gate.rs.
 SIZE_NAMES = {
+    (1024, 28): "0.6b",
+    (2048, 28): "1.7b",
     (2560, 36): "4b",
     (4096, 36): "8b",
     (5120, 40): "14b",

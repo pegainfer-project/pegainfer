@@ -210,9 +210,9 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                 }
             ],
             "http_concurrency_pressure": [http_row],
-            "openinfer_trace_pass": [
+            "pegainfer_trace_pass": [
                 {
-                    "engine": "openinfer-host-staged",
+                    "engine": "pegainfer-host-staged",
                     "claim_bucket": bench_matrix.CLAIM_HTTP,
                     "passed": True,
                     "cells": [
@@ -317,7 +317,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             "<external>/DeepSeek-V2-Lite",
         )
 
-    def test_openinfer_server_command_keeps_default_features(self) -> None:
+    def test_pegainfer_server_command_keeps_default_features(self) -> None:
         args = SimpleNamespace(model_path=Path("models/DeepSeek-V2-Lite"), model_id="DeepSeek-V2-Lite")
         spec = bench_matrix.ENGINES[0]
 
@@ -718,19 +718,19 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         self.assertEqual(
             bench_matrix.benchmark_server_env(
                 {
-                    "OPENINFER_DSV2_LITE_EP_BACKEND": "nccl",
-                    "OPENINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH": "serial",
-                    "OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH": "grouped",
-                    "OPENINFER_DSV2_LITE_NCCL_ROUTER": "device",
+                    "PEGAINFER_DSV2_LITE_EP_BACKEND": "nccl",
+                    "PEGAINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH": "serial",
+                    "PEGAINFER_DSV2_LITE_NCCL_EXPERT_BATCH": "grouped",
+                    "PEGAINFER_DSV2_LITE_NCCL_ROUTER": "device",
                     "CUDA_VISIBLE_DEVICES": "0,1",
                     "UNRELATED": "ignored",
                 }
             ),
             {
-                "OPENINFER_DSV2_LITE_EP_BACKEND": "nccl",
-                "OPENINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH": "serial",
-                "OPENINFER_DSV2_LITE_NCCL_EXPERT_BATCH": "grouped",
-                "OPENINFER_DSV2_LITE_NCCL_ROUTER": "device",
+                "PEGAINFER_DSV2_LITE_EP_BACKEND": "nccl",
+                "PEGAINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH": "serial",
+                "PEGAINFER_DSV2_LITE_NCCL_EXPERT_BATCH": "grouped",
+                "PEGAINFER_DSV2_LITE_NCCL_ROUTER": "device",
                 "CUDA_VISIBLE_DEVICES": "0,1",
             },
         )
@@ -905,7 +905,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         rows = bench_matrix.summarize_http_rows(
             [
                 {
-                    "engine": "openinfer-host-staged",
+                    "engine": "pegainfer-host-staged",
                     "cells": [
                         {
                             "concurrency": 1,
@@ -1111,7 +1111,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
     def test_summarize_existing_rejects_http_workload_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            http = root / "http_raw" / "openinfer-host-staged" / "c8" / "r0" / "result.json"
+            http = root / "http_raw" / "pegainfer-host-staged" / "c8" / "r0" / "result.json"
             http.parent.mkdir(parents=True)
             payload = self.valid_http_payload(max_concurrency=8)
             payload[f"{bench_matrix.HTTP_METADATA_PREFIX}input_len"] = "32"
@@ -1361,7 +1361,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                 "output_tok_s": 2.5,
             })
             baseline["http_concurrency_pressure"].append({
-                "engine": "openinfer-nccl",
+                "engine": "pegainfer-nccl",
                 "claim_bucket": bench_matrix.CLAIM_HTTP,
                 "passed": True,
                 "cells": [],
@@ -1388,8 +1388,8 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                     }
                 ],
             })
-            baseline["openinfer_trace_pass"].append({
-                "engine": "openinfer-nccl",
+            baseline["pegainfer_trace_pass"].append({
+                "engine": "pegainfer-nccl",
                 "claim_bucket": bench_matrix.CLAIM_HTTP,
                 "passed": True,
                 "cells": [
@@ -1415,18 +1415,18 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             )
 
         self.assertEqual(regression["direct_diagnostic_batch"]["missing"], ["nccl/batch1"])
-        self.assertEqual(regression["http_concurrency_pressure"]["missing"], ["openinfer-nccl/c1"])
-        self.assertEqual(regression["openinfer_trace_pass"]["missing"], ["openinfer-nccl/c1"])
+        self.assertEqual(regression["http_concurrency_pressure"]["missing"], ["pegainfer-nccl/c1"])
+        self.assertEqual(regression["pegainfer_trace_pass"]["missing"], ["pegainfer-nccl/c1"])
         self.assertIn(
             "direct_diagnostic_batch_missing:nccl/batch1",
             regression["comparability"]["reasons"],
         )
         self.assertIn(
-            "http_concurrency_pressure_missing:openinfer-nccl/c1",
+            "http_concurrency_pressure_missing:pegainfer-nccl/c1",
             regression["comparability"]["reasons"],
         )
         self.assertIn(
-            "openinfer_trace_pass_missing:openinfer-nccl/c1",
+            "pegainfer_trace_pass_missing:pegainfer-nccl/c1",
             regression["comparability"]["reasons"],
         )
         self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
@@ -1812,7 +1812,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
     def test_summarize_existing_preserves_http_context_and_engine_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for engine in ("vllm-tp2", "openinfer-host-staged"):
+            for engine in ("vllm-tp2", "pegainfer-host-staged"):
                 http = root / "http_raw" / engine / "c1" / "r0" / "result.json"
                 http.parent.mkdir(parents=True)
                 http.write_text(
@@ -1847,9 +1847,9 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                                 ],
                             },
                             {
-                                "engine": "openinfer-host-staged",
-                                "label": "OpenInfer host-staged",
-                                "family": "openinfer",
+                                "engine": "pegainfer-host-staged",
+                                "label": "PegaInfer host-staged",
+                                "family": "pegainfer",
                                 "server_command": ["cargo", "run"],
                             },
                         ]
@@ -1878,8 +1878,8 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             summary = self.summarize_existing_without_metadata_probe(args)
 
         rows = summary["http_concurrency_pressure"]
-        self.assertEqual([row["engine"] for row in rows], ["openinfer-host-staged", "vllm-tp2"])
-        self.assertEqual(rows[0]["label"], "OpenInfer host-staged")
+        self.assertEqual([row["engine"] for row in rows], ["pegainfer-host-staged", "vllm-tp2"])
+        self.assertEqual(rows[0]["label"], "PegaInfer host-staged")
         self.assertEqual(rows[0]["server_command"], ["cargo", "run"])
         self.assertEqual(rows[1]["label"], "vLLM TP2")
         self.assertEqual(rows[1]["cells"][0]["command"], ["vllm", "bench"])
@@ -2099,10 +2099,10 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         self.assertIn(f"{token_key}=<redacted>", summary["http_concurrency_pressure"][0]["server_log_tail"])
         self.assertNotIn("value_from_log", summary["http_concurrency_pressure"][0]["server_log_tail"])
 
-    def test_summarize_existing_rebuilds_openinfer_trace_pass(self) -> None:
+    def test_summarize_existing_rebuilds_pegainfer_trace_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            trace = root / "openinfer_trace" / "openinfer-host-staged" / "c8.json"
+            trace = root / "pegainfer_trace" / "pegainfer-host-staged" / "c8.json"
             trace.parent.mkdir(parents=True)
             trace.write_text(
                 json.dumps(
@@ -2135,8 +2135,8 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
 
             summary = self.summarize_existing_without_metadata_probe(args)
 
-        trace_rows = summary["openinfer_trace_pass"]
-        self.assertEqual(trace_rows[0]["engine"], "openinfer-host-staged")
+        trace_rows = summary["pegainfer_trace_pass"]
+        self.assertEqual(trace_rows[0]["engine"], "pegainfer-host-staged")
         self.assertTrue(trace_rows[0]["passed"])
         self.assertEqual(trace_rows[0]["cells"][0]["trace"]["decode_batch_size_max"], 5)
         self.assertEqual(trace_rows[0]["cells"][0]["active_set_size_max"], 8)
@@ -2151,15 +2151,15 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
     def test_summarize_existing_preserves_unresolved_trace_failed_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            trace = root / "openinfer_trace" / "openinfer-host-staged" / "c1.json"
+            trace = root / "pegainfer_trace" / "pegainfer-host-staged" / "c1.json"
             trace.parent.mkdir(parents=True)
             trace.write_text(json.dumps(self.valid_trace_payload()), encoding="utf-8")
             (root / "summary.json").write_text(
                 json.dumps(
                     {
-                        "openinfer_trace_pass": [
+                        "pegainfer_trace_pass": [
                             {
-                                "engine": "openinfer-nccl",
+                                "engine": "pegainfer-nccl",
                                 "claim_bucket": "failed_setup",
                                 "passed": False,
                                 "error": "old trace setup failed",
@@ -2190,10 +2190,10 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
 
             summary = self.summarize_existing_without_metadata_probe(args)
 
-        rows_by_engine = {row["engine"]: row for row in summary["openinfer_trace_pass"]}
-        self.assertTrue(rows_by_engine["openinfer-host-staged"]["passed"])
-        self.assertFalse(rows_by_engine["openinfer-nccl"]["passed"])
-        self.assertEqual(rows_by_engine["openinfer-nccl"]["error"], "old trace setup failed")
+        rows_by_engine = {row["engine"]: row for row in summary["pegainfer_trace_pass"]}
+        self.assertTrue(rows_by_engine["pegainfer-host-staged"]["passed"])
+        self.assertFalse(rows_by_engine["pegainfer-nccl"]["passed"])
+        self.assertEqual(rows_by_engine["pegainfer-nccl"]["error"], "old trace setup failed")
 
     def test_trace_cell_errors_fail_closed(self) -> None:
         args = self.base_args(Path("."))
@@ -2249,7 +2249,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
     def test_summarize_existing_marks_empty_trace_engine_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "openinfer_trace" / "openinfer-host-staged").mkdir(parents=True)
+            (root / "pegainfer_trace" / "pegainfer-host-staged").mkdir(parents=True)
             args = SimpleNamespace(
                 summarize_only=root,
                 noisy_threshold=0.05,
@@ -2270,16 +2270,16 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
 
             summary = self.summarize_existing_without_metadata_probe(args)
 
-        row = summary["openinfer_trace_pass"][0]
-        self.assertEqual(row["engine"], "openinfer-host-staged")
+        row = summary["pegainfer_trace_pass"][0]
+        self.assertEqual(row["engine"], "pegainfer-host-staged")
         self.assertFalse(row["passed"])
         self.assertEqual(row["claim_bucket"], "failed_setup")
-        self.assertIn("no OpenInfer trace result artifacts", row["error"])
+        self.assertIn("no PegaInfer trace result artifacts", row["error"])
 
     def test_summarize_existing_marks_missing_trace_concurrency_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            trace = root / "openinfer_trace" / "openinfer-host-staged" / "c1.json"
+            trace = root / "pegainfer_trace" / "pegainfer-host-staged" / "c1.json"
             trace.parent.mkdir(parents=True)
             trace.write_text(
                 json.dumps(
@@ -2310,7 +2310,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
 
             summary = self.summarize_existing_without_metadata_probe(args)
 
-        row = summary["openinfer_trace_pass"][0]
+        row = summary["pegainfer_trace_pass"][0]
         self.assertFalse(row["passed"])
         self.assertEqual(row["claim_bucket"], "failed_setup")
         self.assertEqual(row["missing_trace_concurrency"], [4])

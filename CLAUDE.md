@@ -1,6 +1,6 @@
 This file provides guidance to Coding Agent when working with code in this repository.
 
-## What is openinfer
+## What is PegaInfer
 
 Pure Rust + CUDA LLM inference engine. No PyTorch, no frameworks. OpenAI-compatible `/v1/completions` API.
 
@@ -10,36 +10,53 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 
 | Model | Crate | Feature flag | Architecture |
 |-------|-------|-------------|-------------|
-| Qwen3-4B / 8B | `openinfer-qwen3` | `qwen3` (default) | Full attention, TP support |
-| Qwen3.5-4B | `openinfer-qwen35-4b` | `--features qwen35-4b` (needs build-time Python + Triton) | 24 linear + 8 full attention |
-| DeepSeek-V2-Lite | `openinfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
-| Kimi-K2 | `openinfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
-| GLM5.2 | `openinfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
+| Qwen3-4B / 8B | `pegainfer-qwen3` | `qwen3` (default) | Full attention, TP support |
+| Qwen3.5-4B / 9B / 27B · Qwen3.8-27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention. Qwen3.8 shares the line: same `model_type`, same text geometry — see `docs/models/qwen35/support-qwen38.md` |
+| DeepSeek-V2-Lite | `pegainfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
+| Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Sliding-window + global full attention, dense sizes at TP2 (one rank per device), batched decode, opt-in chunked prefill (single rank only) |
+| Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
+| GLM5.2 | `pegainfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
+| Kimi-K3 | `pegainfer-k3` | `--features k3` | Hybrid KDA + MLA, latent MoE + MXFP4, EP (bring-up — single-rank decode wired) |
 
 ## Build & Run
 
 **Always use `--release`** — debug builds are extremely slow for GPU/CUDA and will timeout.
+
+When developing with Docker, use `docker/Dockerfile.dev` and `docker/dev.sh` as described in `docker/README.md`.
 
 ```bash
 # Qwen3 (default feature, no Python anywhere in the build)
 cargo run --release -- --model-path models/Qwen3-4B
 
 # Feature-gated models
-cargo run --release --features qwen35-4b -- --model-path models/Qwen3.5-4B
+cargo run --release --features qwen35 -- --model-path models/Qwen3.5-4B
 cargo run --release --features kimi-k2 -- --model-path models/Kimi-K2
 cargo run --release --features deepseek-v2-lite -- --model-path models/DeepSeek-V2-Lite
 cargo run --release --features glm52 -- --model-path models/GLM5.2
 ```
 
 **Key env vars:**
-- `OPENINFER_CUDA_SM` — GPU SM target override when `nvidia-smi` unavailable (e.g. `120` or `120,80`)
-- `OPENINFER_TRITON_PYTHON` — Python with Triton for `qwen35-4b` build-time AOT kernel generation (falls back to `.venv/bin/python`, then `python3`, then `python`)
-- `OPENINFER_TILELANG_PYTHON` — Python with TileLang for the `glm52` sparse-MLA build-time AOT (sm_90a targets only)
-- `OPENINFER_NCCL_ROOT` — NCCL root (>= 2.30.4) for DeepEP shim (`moe` feature)
-- `OPENINFER_FLASHINFER_INCLUDE` — FlashInfer include dir override
-- `OPENINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
-- `OPENINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
-- `OPENINFER_NVCC_JOBS` — override parallel nvcc job count
+- `PEGAINFER_CUDA_SM` — GPU SM target override when `nvidia-smi` unavailable (e.g. `120` or `120,80`)
+- `PEGAINFER_TRITON_PYTHON` — Python with Triton for `qwen35` build-time AOT kernel generation (falls back to `.venv/bin/python`, then `python3`, then `python`)
+- `PEGAINFER_TILELANG_PYTHON` — Python with TileLang for the `glm52` sparse-MLA build-time AOT (sm_90a targets only)
+- `PEGAINFER_NCCL_ROOT` — NCCL root (>= 2.30.4) for DeepEP shim (`moe` feature)
+- `PEGAINFER_FLASHINFER_INCLUDE` — FlashInfer include dir override
+- `PEGAINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
+- `PEGAINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
+- `PEGAINFER_NVCC_JOBS` — override parallel nvcc job count
+- `PEGAINFER_GEMM_LT_CACHE` — opt-in cross-process cublasLt algo store: `<file>` carries the winners `gemm_lt_tune` timed in an earlier boot instead of re-timing them (Qwen3-4B on one sm_89 card: warm ready ~1965 → ~1312 ms, paired 5/5). Append-only text, created if absent, safe to share between processes and machines and safe to delete; each record carries GPU, CUDA runtime/driver/cublasLt version, shape and workspace cap, so anything that does not match is a miss and re-tunes (a driver update that keeps the same CUDA level is not distinguished — delete the file to force a re-tune). Unset = tune on every boot; Qwen3's `--batch-invariant` pins the heuristic instead and never reads it
+- `PEGAINFER_GLOBAL_ATTN` — gemma4 global-attention kernel and pool format: unset/`off` = the incumbent kernel on the split K|V pool (byte-identical serving); `tilelang` = the generated kernel on the same pool; `tilelang640` = the generated kernel on a folded pool whose rows hold K only where the rotation touches it and fold K's norm weight into the query, 640 columns per token per head instead of 1024. Both generated states also read the sliding family's prompt rows through a generated windowed prefill and its pure-decode rows through a generated windowed split-KV kernel, project Q|K|V and gate|up with one GEMM each where the split state issues one per projection (the fused shape may round differently), need a build that carries the kernels, and report the global pool's bytes at start-up
+- `PEGAINFER_KV_FP8` — gemma4 opt-in fp8 KV: `local` stores the sliding family's K/V as e4m3 at scale 1.0 (lossy; halves the local pool; refuses an enabled prefix cache; unset = byte-identical serving)
+- `PEGAINFER_PREFIX_CACHE` — gemma4 opt-in conversation prefix cache: `K` entries of captured prompt state resume multi-turn prompts (pre-allocated page budget; unset = off, byte-identical serving)
+- `PEGAINFER_ADMIT_COALESCE_MS` — gemma4 opt-in admission coalesce door: `N` ms in `1..=2000` (`off`/`0`/unset = admit on sight), holds arrivals that would invade a live decode batch so a window's arrivals land as one admission burst; refuses the async prefill lane; merging into one mixed step needs the chunked walk or a sub-budget prompt
+- `PEGAINFER_ASYNC_PREFILL` — gemma4 opt-in overlap lane: `green:NN` prefills live-batch admissions on an SM-capped stream to protect decode tails (`shared` for comparison; unset = off; bad values refuse to start)
+- `PEGAINFER_MIX_CHUNK_TOKENS` — gemma4 opt-in chunked walk: a mixed admission computes at most `N` prompt rows per step (`64 <= N <` the serving ceiling; unset = whole-prompt steps; bad values refuse to start)
+- `PEGAINFER_MIX_GATHER_ROWS` / `PEGAINFER_MIX_MAX_PROMPTS` — gemma4 admission gather: how many prompt rows and how many prompts one mixed step may absorb (`1..=` the serving ceiling and `1..=` the decode slots; defaults gather only short bursts). Raising them lets a burst ride one step, which trades the median time to first token for the p99 tail and the wide-batch decode step; bad values refuse to start
+- `PEGAINFER_MAX_CONTEXT` — gemma4 serving ceiling raise (default 8192, up to the checkpoint's 262144; a raise past the default needs `PEGAINFER_MIX_CHUNK_TOKENS` and refuses the async lane)
+- `PEGAINFER_DECODE_SLOTS` — gemma4 decode slots (1..16, default 16): global KV budget = slots x ceiling, trade concurrency for context
+- `GLM52_DECODE_SLOTS` / `GLM52_MTP_DRAFTS` — glm52 runtime profile: decode slots per rank (default 8, ceiling 32) and MTP draft span (default 5); `slots x (1+drafts)` must fit the 96-row step (validated at launch; MTP only). Throughput ceiling profile: `32` / `2`.
+- `PEGAINFER_K3_CP` — k3 opt-in context-parallel prefill lane: CP width, must equal the process's local rank count (on a fleet each process runs its own gang; remote ranks pad). Mutually exclusive with the dspark draft lane.
+- `PEGAINFER_K3_CP_MIN` — k3 CP admission floor in prompt tokens (default 2048; measured crossover ~1k). Prompts below it, or too long for one chunk step per rank (M0), prefill locally.
 
 ## Tests
 
@@ -48,9 +65,9 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 cargo test --release --workspace --lib
 
 # Accuracy and integration tests — require GPU + model weights
-cargo test --release -p openinfer-qwen3 --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test hf_golden_gate
-OPENINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p openinfer-qwen35-4b --features qwen35-4b --test e2e_scheduler
+cargo test --release -p pegainfer-qwen3 --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate
+PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler
 
 # Single test (filter by name)
 cargo test --release --workspace --lib prefix_cache -- --nocapture
@@ -65,13 +82,13 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
                                                │
               ┌──────────┬─────────────┬───────┼───────────┬──────────┐
               │          │             │       │           │          │
-        openinfer-  openinfer-   openinfer-  openinfer-  openinfer-  ...
-        qwen3       qwen35-4b    dsv2-lite   kimi-k2     glm52
+        pegainfer-  pegainfer-   pegainfer-  pegainfer-  pegainfer-  ...
+        qwen3       qwen35       dsv2-lite   kimi-k2     glm52
       (full attn) (linear+full) (MoE+EP)   (MLA+MoE)  (MLA+MoE+FP8)
               │          │             │       │           │          │
               └──────────┴─────────────┴───────┼───────────┴──────────┘
                                                │
-                          openinfer-core runtime + openinfer-kernels
+                          pegainfer-core runtime + pegainfer-kernels
                                                │
                                ┌───────────────┼───────────────┐
                                │               │               │
@@ -82,16 +99,31 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 **Key abstractions:**
 
-- **`openinfer-engine`** — shared request/event contract (`EngineHandle`, `GenerateRequest`, `TokenEvent`) used by the server and model crates. (`openinfer-core::engine` re-exports it.)
+- **`pegainfer-frontend`** — the serving frontend: the engine request/event contract (`pegainfer_frontend::engine` — `EngineHandle`, `GenerateRequest`, `TokenEvent`) plus the protocol stacks on top of it (`vllm` module today, `dynamo` planned) and the `ModelLine` dispatch trait. Model crates implement against the contract; the server binary does pure dispatch.
 - **Per-model crates** — each model owns config, weights, prefill/decode execution, scheduler, tests, and benches.
-- **`openinfer-core::ops`** — shared GPU operator wrappers used by model crates.
-- **`openinfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `glm52`).
+- **`pegainfer-core::ops`** — shared GPU operator wrappers used by model crates.
+- **`pegainfer-kernels`** — tensor/FFI/kernel build owner for CUDA, cuBLAS, FlashInfer, and Triton AOT. Model-specific kernels live in feature-gated submodules (`kimi_k2`, `glm52`).
 - **CUDA Graph** — decode path captured inside model executors with pre-allocated buffers to preserve pointer stability.
-- **KV state** — model schedulers own request state; shared paged-KV primitives live in `openinfer-kv-cache`; host/SSD/RDMA offload bridge in `openinfer-kv-offload`.
+- **KV state** — model schedulers own request state; shared paged-KV primitives live in `pegainfer-kv-cache`; host/SSD/RDMA offload bridge in `pegainfer-kv-offload`.
 
-**Build system**: the virtual workspace root has no package build script. `openinfer-kernels/build.rs` owns CUDA/Triton compilation:
-1. Compiles `openinfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
-2. Feature-gated codegen: `qwen35-4b` runs Triton AOT via `openinfer-kernels/tools/triton/gen_triton_aot.py`; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA plus TileLang sparse-MLA codegen on sm_90a
+**Build system**: the virtual workspace root has no package build script. `pegainfer-kernels/build.rs` owns CUDA/Triton compilation:
+1. Compiles `pegainfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
+2. Feature-gated codegen: `qwen35` runs Triton AOT via `pegainfer-kernels/tools/triton/gen_triton_aot.py`; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA plus TileLang sparse-MLA codegen on sm_90a
+
+## EP Free-Running Discipline
+
+Canonical doc: `docs/models/glm52/free-running-dp.md` (K3's gang lane follows it). Invariants — violating any of these is a deadlock design:
+
+- **No rank ever stops or waits.** Every engine loop runs unconditionally at full speed; idle ranks step with padding rows. Any quiet wait (condvar, sleep-poll) inside EP coordination is a bug, and the fleet is never asleep, so never design "wake up" or "pump until X" steps.
+- **The per-step collective chain is fixed** — no conditional collectives. Skipping work happens inside kernels via zero-load padding entry, never by host negotiation.
+- **The launch count is the global clock** (pairing pins all ranks within ±1 launch). Coordination means agreeing ahead of time on *what step N contains*, never "wait until everyone is ready".
+- **Padding rows are protocol surface**: their bytes reach peers, so every dummy-row input must be constructively deterministic.
+
+---
+
+# AI-Assisted Contributions
+
+AI-assisted PRs must be accountable and verifiable. Show that the work is not duplicated, name the production invariant being changed, and provide real evidence: production E2E for features and fixes, same-context A/B for performance, and model evals for output or accuracy changes. Every changed file must serve that invariant; remove unrelated cleanup, thin wrappers, generated scaffolding, and mock or source-text tests presented as production evidence.
 
 ---
 
@@ -170,3 +202,5 @@ When a session wraps up:
 # Git Conventions
 
 Commit messages use Commitizen format: `<type>(<scope>): <subject>`. Never commit directly to `main` — create a `feat/`/`fix/`/`chore/`/… branch first.
+
+CI runs `cargo fmt --check`; run `cargo fmt` before committing.

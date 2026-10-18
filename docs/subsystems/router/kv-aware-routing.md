@@ -1,6 +1,6 @@
 # KV-aware routing (Dynamo frontend)
 
-TL;DR: When openinfer Qwen3 workers run behind a Dynamo frontend, the frontend's
+TL;DR: When pegainfer Qwen3 workers run behind a Dynamo frontend, the frontend's
 KV router routes each request to the worker that already holds the longest
 prefix of its tokens, fed by the workers' KV block events. Measured on 8×Qwen3-4B
 with a multi-turn chat workload: follow-up-turn TTFT stays flat at ~45 ms under

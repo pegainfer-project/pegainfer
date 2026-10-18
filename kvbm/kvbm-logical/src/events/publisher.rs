@@ -202,11 +202,6 @@ impl KvbmCacheEventsPublisher {
             handle.abort();
         }
     }
-
-    /// Checks if the publisher task is finished.
-    pub fn is_finished(&self) -> bool {
-        self.handle.as_ref().is_none_or(|h| h.is_finished())
-    }
 }
 
 impl Drop for KvbmCacheEventsPublisher {

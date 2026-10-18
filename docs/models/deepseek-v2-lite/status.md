@@ -1,8 +1,8 @@
 # DeepSeek-V2-Lite Status And Benchmark Ledger
 
-> **TL;DR:** DeepSeek-V2-Lite keeps correctness, direct decode diagnostics, retained HTTP SLO reports, and soak readiness as separate gates. HF/host-staged/NCCL exactness and HTTP lifecycle evidence are retained; issue #466 added fixed host-staged/NCCL SLO artifacts, and the follow-up NCCL readiness fix covers the no-selector short HTTP path without claiming production readiness.
+> **TL;DR:** DeepSeek-V2-Lite keeps correctness, direct decode diagnostics, retained HTTP SLO reports, and soak readiness as separate gates. NCCL MoE forwards with rows 1..8 now use device-routed pointer-batched experts with exact retained token/text outputs; this does not change the separate soak, parity, or production-readiness boundary.
 
-Last touched: 2026-07
+Last touched: 2026-09
 
 ## Capability Contract
 
@@ -18,13 +18,14 @@ Last touched: 2026-07
 | Device-resident NCCL combine | Available | Issue #275 keeps NCCL combine contributions/results on reusable f32 device scratch and preserves the HF / host-staged / NCCL exact gate on 2x RTX 5090. |
 | Device-resident NCCL dense exchange | Available | Issue #276 reuses backend-owned bf16 dense-exchange scratch, clears rank1 zero-send every exchange, removes dense-exchange stream sync from the backend call, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
 | NCCL route-plan replay | Available | Issue #277 builds a token-major host route plan once after top-k routing, replays that plan for NCCL expert launches and device contribution accumulation, keeps route counters visible, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. This remains the eager NCCL oracle path. |
+| Device-routed NCCL small-row MoE | Available for rows 1..8 | Decode and short prefill keep routing and routed-expert execution on GPU through fixed route slots and pointer-batched GEMMs; the eager route-plan path remains the rollback oracle. Correctness and performance evidence lives in `device-routed-moe.md`. |
 | NCCL CUDA Graph readiness | Covered-shape diagnostic | Schema-2 `cuda_graph_readiness` now includes a fail-closed `full_decode_graph_probe`. The 2026-06-20 run reports capture, instantiate, replay, and verification success with `8/8` verified replays for the retained batch-1 NCCL decode step. |
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
-| HTTP trace and measured MoE throughput optimization | HTTP and direct evidence | Issue #280 logs DeepSeek-V2-Lite `openinfer_http_trace` records and batches same-position decode subgroups. Issue #464 extends phase/decode-step attribution, groups host-staged and NCCL routes by stable `(owner_rank, global_expert)`, and moves the NCCL gate GEMM to a bitwise-matched CUDA logits kernel while keeping host top-k/softmax. Diagnostic serial/host rollback switches remain available for retained A/B and emergency rollback; they are not production tuning knobs. |
+| HTTP trace and measured MoE throughput optimization | HTTP and direct evidence | Issue #280 logs DeepSeek-V2-Lite `pegainfer_http_trace` records and batches same-position decode subgroups. Issue #464 extends phase/decode-step attribution, groups host-staged and NCCL routes by stable `(owner_rank, global_expert)`, and moves the NCCL gate GEMM to a bitwise-matched CUDA logits kernel while keeping host top-k/softmax. Diagnostic serial/host rollback switches remain available for retained A/B and emergency rollback; they are not production tuning knobs. |
 | HTTP reliability lifecycle gate | Available | Issue #453 adds `scripts/bench_dsv2lite_http_reliability.py`, which drives real streaming `/v1/completions` scenarios for client cancel/disconnect, unsupported params, active-cap overload, mixed short/long prompts with adjacent failures, and clean follow-up recovery. The 2026-07-04 2x RTX 5090 host-staged and NCCL runs both passed with terminal trace coverage, stable output hashes, active/pending/decode maxima, and healthy final scheduler baselines. |
 | Retained HTTP serving SLO report | Retained HTTP evidence | Issue #466 adds model-owned short/mixed/long profiles on the shared HTTP benchmark scripts. The current retained run covered all six host-staged/NCCL children with zero failures/timeouts and full trace coverage. The #466 follow-up fixed NCCL no-selector readiness by discovering a compatible Python-wheel NCCL runtime from `PATH`; the short NCCL c1 HTTP smoke now reaches readiness and completes without startup failure or layer-1 illegal address. This is HTTP pressure/SLO evidence only; command details and artifact hashes live in `benchmarking.md`. |
-| Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, OpenInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, OpenInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus OpenInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
+| Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, PegaInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, PegaInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus PegaInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 rows are gap-finding evidence from a documented contract. The supplemental validation run is not serving parity or a stock-install claim. |
 
 ## Correctness Contract
@@ -35,13 +36,13 @@ The retained correctness gate is deliberately narrow:
 - devices: single-node EP2 with two local GPUs;
 - committed cases: `test_data/deepseek-v2-lite-ep2-cases.json` keeps the original `Hello` / 16-token case and widens the oracle with a few additional prompts plus batch sizes `4` and `8`;
 - generation mode: greedy;
-- backends: host-staged and `OPENINFER_DSV2_LITE_EP_BACKEND=nccl`.
+- backends: host-staged and `PEGAINFER_DSV2_LITE_EP_BACKEND=nccl`.
 
 The comparison gate must be run on the same model snapshot for HF, host-staged, and NCCL outputs. Same-host comparison remains strict: HF, host-staged, and NCCL must be token-exact and text-exact for every committed case and every diagnostic batch row. Host-staged remains the baseline oracle for NCCL transport changes. The latest retained evidence is the 2026-06-28 2x RTX 5090 case-set run with `case_count=5`, top-level `classification=all_token_text_exact`, no comparison warnings, token hash `4fb4c8825fe4d2c4a1d966da25c259abdf675f4de4548daa5d41aea7dfe30225`, and text hash `0eedf11429e9ac13bb799c31665c6e9f70a1ac4493a08a3f3da9ecf39c1ec347`.
 
 The mixed-request serving E2E computes sequential greedy token-id oracles with `DeepSeekV2LiteEp2Generator::generate_greedy`, then submits concurrent requests through `start_engine`. The retained 2026-06-23 run covers same-length mixed prompts for same-position batch decode, different-length mixed prompts for single-row decode fallback, and a valid request submitted beside an invalid `logprobs` request to prove explicit rejection does not poison the valid stream. Host-staged and NCCL both passed the mixed-serving E2E.
 
-The HTTP reliability gate is intentionally separate from the mixed-serving E2E. It proves that the serving bridge and scheduler surface terminal states in a machine-readable way, then uses a clean follow-up request after every failure scenario to show state recovery. Rejected requests that fail in the HTTP/frontend guard may have no scheduler trace; rejected requests admitted to the DSV2-Lite scheduler must have `openinfer_http_trace` terminal evidence. Cancelled and disconnected streams are classified separately by the request-local `TokenSink` cancellation flag versus a closed shared channel.
+The HTTP reliability gate is intentionally separate from the mixed-serving E2E. It proves that the serving bridge and scheduler surface terminal states in a machine-readable way, then uses a clean follow-up request after every failure scenario to show state recovery. Rejected requests that fail in the HTTP/frontend guard may have no scheduler trace; rejected requests admitted to the DSV2-Lite scheduler must have `pegainfer_http_trace` terminal evidence. Cancelled and disconnected streams are classified separately by the request-local `TokenSink` cancellation flag versus a closed shared channel.
 
 The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for this narrow shape, because the same model snapshot has produced different exact greedy text on those hosts while still matching HF on each host. Do not use the static hash pair list as a substitute for the same-host HF comparison when changing accuracy-sensitive code.
 
@@ -69,17 +70,17 @@ The current-source #466 aggregate is retained under `artifacts/bench/dsv2-lite/<
 
 ### Retained vLLM TP2/EP2 Matrix
 
-The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` and tracks [#279](https://github.com/openinfer-project/openinfer/issues/279). It is the current source for OpenInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `prompt_words=64`, `max_tokens=64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract. Prompt words are a workload-generator input, not a token count.
+The retained matrix lives in `docs/benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` and tracks [#279](https://github.com/pegainfer-project/pegainfer/issues/279). It is the current source for PegaInfer host-staged/NCCL versus vLLM TP2/TP2+EP2 under the `prompt_words=64`, `max_tokens=64`, `num_prompts=32`, `max_concurrency=1/4/8`, `temperature=0`, `ignore_eos=true` HTTP pressure contract. Prompt words are a workload-generator input, not a token count.
 
 Latest 2026-06-28 result on 2x RTX 5090:
 
 | Bucket | Result | Claim boundary |
 | --- | --- | --- |
-| Correctness | HF dump, OpenInfer host-staged E2E, and OpenInfer NCCL E2E all passed; comparison classified `all_token_text_exact` with no warnings. | Correctness bucket only; no HTTP serving claim. |
-| Direct diagnostic batch | OpenInfer host-staged and NCCL batch `1/4/8` all passed with token hash `4fb4c8825fe4d2c4...`. | Direct same-prompt model-path evidence only; do not compare the backend TPOT rows as production performance. |
-| HTTP pressure | Clean OpenInfer host-staged and NCCL completed all `1/4/8` concurrency cells; host-staged c4, NCCL c4, and NCCL c8 were noisy. Clean vLLM TP2 and vLLM TP2+EP2 failed server startup on the target FlashInfer SM120 path. | `--max-concurrency` is client pressure, not true internal batch size by itself. |
+| Correctness | HF dump, PegaInfer host-staged E2E, and PegaInfer NCCL E2E all passed; comparison classified `all_token_text_exact` with no warnings. | Correctness bucket only; no HTTP serving claim. |
+| Direct diagnostic batch | PegaInfer host-staged and NCCL batch `1/4/8` all passed with token hash `4fb4c8825fe4d2c4...`. | Direct same-prompt model-path evidence only; do not compare the backend TPOT rows as production performance. |
+| HTTP pressure | Clean PegaInfer host-staged and NCCL completed all `1/4/8` concurrency cells; host-staged c4, NCCL c4, and NCCL c8 were noisy. Clean vLLM TP2 and vLLM TP2+EP2 failed server startup on the target FlashInfer SM120 path. | `--max-concurrency` is client pressure, not true internal batch size by itself. |
 | Supplemental vLLM validation | A separate FlashInfer #3633-equivalent validation run completed vLLM TP2 and TP2+EP2 for all `1/4/8` concurrency cells. | Not a clean stock vLLM package-stack claim; it only shares the HTTP client/workload contract. |
-| Trace pass | OpenInfer host-staged showed `decode_batch_size_max=1/4/5` and NCCL showed `1/2/5` for concurrency `1/4/8`. | OpenInfer-only trace evidence; no vLLM internal claim. |
+| Trace pass | PegaInfer host-staged showed `decode_batch_size_max=1/4/5` and NCCL showed `1/2/5` for concurrency `1/4/8`. | PegaInfer-only trace evidence; no vLLM internal claim. |
 
 ### HTTP Trace And MoE Optimization
 
@@ -122,9 +123,9 @@ PR #196 extends attribution for the same direct diagnostic shapes. The retained 
 
 ### HTTP Concurrency Pressure
 
-The issue #277 branch was also run through `/v1/completions` with `vllm bench serve` used only as the common HTTP client. Shape: random input length `2`, output length `16`, `24` prompts, `temperature=0`, `ignore_eos`, `--max-concurrency 1/4/8`, OpenInfer `--cuda-graph=false`.
+The issue #277 branch was also run through `/v1/completions` with `vllm bench serve` used only as the common HTTP client. Shape: random input length `2`, output length `16`, `24` prompts, `temperature=0`, `ignore_eos`, `--max-concurrency 1/4/8`, PegaInfer `--cuda-graph=false`.
 
-OpenInfer streaming currently makes the client-side TPOT fields near-zero in this shape, so this table reports output throughput and throughput-derived milliseconds per output token computed as `duration / total_output_tokens`. `--max-concurrency` should be read as concurrent request pressure, not as proof of true internal OpenInfer batch size.
+PegaInfer streaming currently makes the client-side TPOT fields near-zero in this shape, so this table reports output throughput and throughput-derived milliseconds per output token computed as `duration / total_output_tokens`. `--max-concurrency` should be read as concurrent request pressure, not as proof of true internal PegaInfer batch size.
 
 | Backend | conc | completed | output tok/s | throughput-derived ms/output token | mean TTFT ms | median TTFT ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -137,7 +138,7 @@ OpenInfer streaming currently makes the client-side TPOT fields near-zero in thi
 
 ### Issue #280 HTTP Trace, Subgroup Decode, And Long Prompts
 
-Retained 2026-06-24 evidence on 2x RTX 5090, NCCL EP2 with chunked large collectives, release `openinfer-server --features deepseek-v2-lite`, `/v1/completions`, `temperature=0`, `ignore_eos=true`, `max_tokens=16`, `num_requests=8`, `repeats=3`, with server logs consumed by `scripts/bench_http_serving.py`.
+Retained 2026-06-24 evidence on 2x RTX 5090, NCCL EP2 with chunked large collectives, release `pegainfer-server --features deepseek-v2-lite`, `/v1/completions`, `temperature=0`, `ignore_eos=true`, `max_tokens=16`, `num_requests=8`, `repeats=3`, with server logs consumed by `scripts/bench_http_serving.py`.
 
 This is HTTP serving evidence for request-level trace attribution, completed/failed/timeout accounting, output hash stability, and same-position decode subgroups. It does not prove vLLM parity, production EP readiness, or acceptable long-prompt latency.
 
@@ -196,7 +197,7 @@ This table is a no-regression and trace-coverage record. It is not a throughput 
 
 ### Issue #453 HTTP Reliability Gate
 
-The #453 runner is `scripts/bench_dsv2lite_http_reliability.py`. It uses standard-library HTTP streaming against `/v1/completions`, parses `openinfer_http_trace` from the server log, and writes one JSON artifact with per-scenario counts, output hashes, trace coverage, active/pending/decode maxima, terminal reasons, final healthy-baseline status, and clean follow-up results.
+The #453 runner is `scripts/bench_dsv2lite_http_reliability.py`. It uses standard-library HTTP streaming against `/v1/completions`, parses `pegainfer_http_trace` from the server log, and writes one JSON artifact with per-scenario counts, output hashes, trace coverage, active/pending/decode maxima, terminal reasons, final healthy-baseline status, and clean follow-up results.
 
 Scenarios covered by the runner:
 
@@ -220,14 +221,14 @@ Validation completed for the runner schema, runner false-positive guards, schedu
 python3 scripts/bench_dsv2lite_http_reliability.py --dry-run --out <artifact>.json
 python3 -m py_compile scripts/bench_dsv2lite_http_reliability.py tests/test_bench_dsv2lite_http_reliability.py
 python3 -m unittest tests.test_bench_dsv2lite_http_reliability
-cargo test --release -p openinfer-engine --lib token_sink -- --nocapture
-cargo test --release -p openinfer-vllm-frontend --lib abort -- --nocapture
-cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --lib scheduler -- --nocapture
-OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite OPENINFER_DSV2_LITE_EP_BACKEND=host-staged cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
-OPENINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite OPENINFER_DSV2_LITE_EP_BACKEND=nccl cargo test --release -p openinfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+cargo test --release -p pegainfer-engine --lib token_sink -- --nocapture
+cargo test --release -p pegainfer-vllm-frontend --lib abort -- --nocapture
+cargo test --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --lib scheduler -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite PEGAINFER_DSV2_LITE_EP_BACKEND=host-staged cargo test --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite PEGAINFER_DSV2_LITE_EP_BACKEND=nccl cargo test --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 ```
 
-The local dry-run passed all four scenarios and emits deterministic JSON. `tests/test_bench_dsv2lite_http_reliability.py` passed and verifies that the runner fails when a client-observed disconnect lacks a matching scheduler terminal reason or when trace fields are missing. `cargo test --release -p openinfer-engine --lib token_sink -- --nocapture` passed and verifies explicit cancel versus closed receiver behavior. `cargo test --release -p openinfer-vllm-frontend --lib abort -- --nocapture` passed and verifies that frontend aborts drop late tokens and classify disconnect before the first client-visible token separately from cancel after token output. The DSV2-Lite scheduler lifecycle subset passed `23 passed; 0 failed`; host-staged and NCCL `e2e_ep2` each passed `1 passed; 0 failed`. The SM120 NCCL validation used an NCCL 2.30.7 runtime library.
+The local dry-run passed all four scenarios and emits deterministic JSON. `tests/test_bench_dsv2lite_http_reliability.py` passed and verifies that the runner fails when a client-observed disconnect lacks a matching scheduler terminal reason or when trace fields are missing. `cargo test --release -p pegainfer-engine --lib token_sink -- --nocapture` passed and verifies explicit cancel versus closed receiver behavior. `cargo test --release -p pegainfer-vllm-frontend --lib abort -- --nocapture` passed and verifies that frontend aborts drop late tokens and classify disconnect before the first client-visible token separately from cancel after token output. The DSV2-Lite scheduler lifecycle subset passed `23 passed; 0 failed`; host-staged and NCCL `e2e_ep2` each passed `1 passed; 0 failed`. The SM120 NCCL validation used an NCCL 2.30.7 runtime library.
 
 Retained 2026-07-04 live HTTP reliability artifacts from real `/v1/completions` traffic:
 
@@ -270,14 +271,14 @@ Use these labels consistently:
 | `direct single-row` | In-process batch `1` decode. | HTTP serving throughput. |
 | `direct same-prompt diagnostic batch` | Fixed same-prompt direct batch sizes `1/4/8`. | Production continuous batching or mixed-request scheduling. |
 | `first mixed-request serving gate` | Greedy-only EP2 scheduler path with explicit admission/rejection/deferral, per-request host-side decode `DecodeCache`, active cap `8`, and exact sequential-oracle E2E. | vLLM parity, sparse dispatch, production EP readiness, HTTP throughput scaling, non-greedy sampling, or logprobs support. |
-| `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `openinfer_http_trace` rows; HTTP sweeps show non-1 `active_set_size`, `decode_batch_size_max`, phase timing, and batched-vs-singleton decode-step counts. | Fair vLLM parity, long-prompt latency readiness, backend/kernel attribution, or a before/after percentage unless a paired baseline run is recorded. |
+| `HTTP trace/subgroup evidence` | `/v1/completions` requests have per-request `pegainfer_http_trace` rows; HTTP sweeps show non-1 `active_set_size`, `decode_batch_size_max`, phase timing, and batched-vs-singleton decode-step counts. | Fair vLLM parity, long-prompt latency readiness, backend/kernel attribution, or a before/after percentage unless a paired baseline run is recorded. |
 | `route-grouped MoE slice` | Separate paired host-staged and NCCL direct/HTTP A/B for the retained #464 shapes, with exact token/text hashes and contribution accumulation in original route order. | Fewer per-row GEMM launches, broad workload scaling, soak/SLO readiness, production EP readiness, or vLLM parity. |
 | `NCCL device logits router slice` | The gate GEMM runs on CUDA with bitwise host-logit coverage; existing host top-k/softmax builds the route plan. | Fully device-resident routing, no routing D2H, general numerical equivalence, or non-NCCL improvement. |
 | `HTTP reliability lifecycle gate` | `/v1/completions` cancel/disconnect/reject/overload/mixed-failure scenarios have terminal reason counts, trace coverage, active/pending/decode maxima, output hashes, and clean follow-up recovery evidence. | Production EP readiness, soak stability, SLO latency, vLLM parity, throughput improvement, sparse dispatch, or multi-node EP support. |
 | `retained HTTP serving SLO` | Named short/mixed/long `/v1/completions` contracts report latency percentiles, throughput, outcomes, full trace coverage, hashes, and repeat spread for one backend/hardware/toolchain. | Direct attribution, sustained soak, production readiness, vLLM parity, or performance outside a matched contract. |
 | `covered NCCL decode graph probe` | Probe-only batch-1 `Hello` decode step captured, instantiated, replayed, and token-verified under CUDA Graph. | Default serving graph coverage, multi-step graph replay, batch `4/8` graph coverage, or performance improvement. |
-| `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True OpenInfer batch size unless the engine path proves it. |
-| `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 from the retained matrix or the separate FlashInfer-fixed validation. | Stock vLLM install support, OpenInfer serving parity, or production readiness. |
+| `HTTP concurrency pressure` | `vllm bench serve --max-concurrency N` against an HTTP endpoint. | True PegaInfer batch size unless the engine path proves it. |
+| `vLLM comparison from documented environment` | vLLM TP2 / TP2+EP2 from the retained matrix or the separate FlashInfer-fixed validation. | Stock vLLM install support, PegaInfer serving parity, or production readiness. |
 
 Do not claim:
 
@@ -309,8 +310,8 @@ The next implementation should be chosen from measured evidence:
    - treat any future `failure_stage` as fail-closed evidence.
 
 3. Keep a fair serving benchmark contract around future performance work.
-   - OpenInfer host-staged.
-   - OpenInfer NCCL.
+   - PegaInfer host-staged.
+   - PegaInfer NCCL.
    - vLLM TP2.
    - vLLM TP2+EP2 when supported.
    - default vLLM configuration plus a controlled configuration with cache/flag choices recorded.

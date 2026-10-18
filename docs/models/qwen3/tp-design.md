@@ -13,11 +13,11 @@ Add tensor parallelism for `Qwen3-4B` with a narrow and explicit first target:
 - keep the milestone focused on model-parallel correctness
 - establish the right abstractions for later large-model and MoE work
 
-This milestone is about making openinfer capable of serving a single model replica across two GPUs. It is not about multi-replica throughput scaling.
+This milestone is about making pegainfer capable of serving a single model replica across two GPUs. It is not about multi-replica throughput scaling.
 
 ## Why This Matters
 
-Large-model serving and MoE serving both require model-parallel building blocks. For openinfer, tensor parallelism is the first such building block.
+Large-model serving and MoE serving both require model-parallel building blocks. For pegainfer, tensor parallelism is the first such building block.
 
 The immediate value is:
 
@@ -34,7 +34,7 @@ This first pass is intentionally narrow:
 - focus: correctness and architecture
 - deployment target: a single machine
 
-The first milestone does not need to solve every parallelism problem. It needs to prove that openinfer can run one dense model replica across two GPUs without breaking correctness or making the architecture harder to evolve.
+The first milestone does not need to solve every parallelism problem. It needs to prove that pegainfer can run one dense model replica across two GPUs without breaking correctness or making the architecture harder to evolve.
 
 ## Design Constraints
 
@@ -690,7 +690,7 @@ This abstraction is the right carrier for model-internal parallelism such as TP 
 
 It is not the right abstraction for service-layer data parallelism across multiple model replicas.
 
-If openinfer later needs multiple model replicas, that should live above the executor layer. A `ModelExecutor` still represents one logical model replica, even if that replica internally spans multiple GPUs.
+If pegainfer later needs multiple model replicas, that should live above the executor layer. A `ModelExecutor` still represents one logical model replica, even if that replica internally spans multiple GPUs.
 
 ## What Success Looks Like
 
@@ -763,4 +763,4 @@ The following questions are intentionally deferred until after the first TP mile
 
 This milestone should stay disciplined.
 
-The job is not to build a full distributed inference platform in one step. The job is to make openinfer capable of correct `TP=2` execution for `Qwen3-4B`, while establishing the architectural boundary that future large dense and MoE work can build on.
+The job is not to build a full distributed inference platform in one step. The job is to make pegainfer capable of correct `TP=2` execution for `Qwen3-4B`, while establishing the architectural boundary that future large dense and MoE work can build on.

@@ -79,7 +79,7 @@ For profiling a server that's already running, use the launch/start/stop workflo
 ```bash
 # Terminal 1: launch the server under nsys control, but don't start collecting yet
 nsys launch --trace=cuda,nvtx --cuda-graph-trace=node \
-  --session-new=my_session -- cargo run -r --bin openinfer-server -- ...
+  --session-new=my_session -- cargo run -r --bin pegainfer-server -- ...
 
 # Terminal 2: start/stop collection on demand
 nsys start --session=my_session

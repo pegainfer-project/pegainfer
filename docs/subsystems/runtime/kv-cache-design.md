@@ -169,7 +169,7 @@ impl BlockManager {
 
 **为什么 allocate 用 RequestId 而非返回 handle？**
 
-handle 模式（Dynamo 的 `MutableBlock`/`CompleteBlock`）适合跨进程、多 worker 场景。openinfer 是单进程、单 scheduler 线程模型——block ownership 在 `BlockManager` 内部用 `HashMap<RequestId, Vec<BlockId>>` 跟踪即可。返回 handle 会引入 Arc/refcount 开销但没有实际收益。
+handle 模式（Dynamo 的 `MutableBlock`/`CompleteBlock`）适合跨进程、多 worker 场景。pegainfer 是单进程、单 scheduler 线程模型——block ownership 在 `BlockManager` 内部用 `HashMap<RequestId, Vec<BlockId>>` 跟踪即可。返回 handle 会引入 Arc/refcount 开销但没有实际收益。
 
 ### RequestBlocks — per-request 视图
 
@@ -284,12 +284,12 @@ pub enum KernelKvMetadata {
 ### 组装：谁持有什么
 
 ```
-openinfer-core:
+pegainfer-core:
   BlockId, BlockState, BlockManager, BlockManagerStats
   RequestBlocks
   PhysicalBackend trait, KernelKvMetadata
 
-openinfer-core (或 openinfer-kernels):
+pegainfer-core (或 pegainfer-kernels):
   FullAttentionBackend
   MlaBackend
 
@@ -416,11 +416,11 @@ bs=64, avg 16K tokens/req → 1,000 blocks/req → 64,000 blocks → 75% utiliza
 
 ## 已落地代码
 
-### `openinfer-block-manager` crate
+### `pegainfer-block-manager` crate
 
 独立 crate，零 GPU 依赖，纯逻辑。从 Dynamo `kvbm-logical`（Apache-2.0）的 `BlockStore` 精简而来。
 
-**文件**: `openinfer-block-manager/src/lib.rs`
+**文件**: `pegainfer-block-manager/src/lib.rs`
 
 **核心类型**:
 - `BlockId(u32)` — block identity
@@ -462,11 +462,11 @@ impl BlockManager {
 
 ### Step 1: ✓ BlockManager logical layer
 
-已完成。`openinfer-block-manager` crate 独立，零 GPU 依赖。
+已完成。`pegainfer-block-manager` crate 独立，零 GPU 依赖。
 
 ### Step 2: MlaBackend (PhysicalBackend)
 
-在 `openinfer-core` 中实现 `MlaBackend`：双 buffer (ckv + kpe)，block_size=16，共享 BlockId 映射。对齐 K2 现有 FlashInfer MLA kernel 的 metadata 接口。
+在 `pegainfer-core` 中实现 `MlaBackend`：双 buffer (ckv + kpe)，block_size=16，共享 BlockId 映射。对齐 K2 现有 FlashInfer MLA kernel 的 metadata 接口。
 
 ### Step 3: K2 迁移
 

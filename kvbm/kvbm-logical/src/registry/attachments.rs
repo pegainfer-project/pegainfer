@@ -137,25 +137,6 @@ impl<'a, T: Any + Send + Sync> TypedAttachments<'a, T> {
         f(&mut multiple_refs)
     }
 
-    /// Execute a closure with immutable access to both unique and multiple attachments of type T.
-    pub fn with_all<R>(&self, f: impl FnOnce(Option<&T>, &[&T]) -> R) -> R {
-        let type_id = TypeId::of::<T>();
-        let attachments = self.handle.inner.attachments.lock();
-
-        let unique = attachments
-            .unique_attachments
-            .get(&type_id)
-            .and_then(|v| v.downcast_ref::<T>());
-
-        let multiple_refs: Vec<&T> = attachments
-            .multiple_attachments
-            .get(&type_id)
-            .map(|vec| vec.iter().filter_map(|v| v.downcast_ref::<T>()).collect())
-            .unwrap_or_default();
-
-        f(unique, &multiple_refs)
-    }
-
     /// Execute a closure with mutable access to both unique and multiple attachments of type T.
     pub fn with_all_mut<R>(&self, f: impl FnOnce(Option<&mut T>, &mut [&mut T]) -> R) -> R {
         let type_id = TypeId::of::<T>();

@@ -1,0 +1,17 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-kv-cache"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+cudarc = { workspace = true }
+dynamo-kv-hashing = { workspace = true }
+half = { workspace = true }
+kvbm-logical = { workspace = true }
+pegainfer-kernels = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
