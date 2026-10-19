@@ -616,14 +616,10 @@ mod tests {
     /// One decode step of the conv1d kernel's documented recurrence:
     /// `silu(bf16(Σ_k w[k] * [state[0], state[1], state[2], x]))`, followed by
     /// shifting the state to the previous inputs, oldest first.
-    fn reference_conv1d_decode_step(
-        x: &[bf16],
-        weights: &[bf16],
-        state: &mut [f32],
-        kernel_size: usize,
-    ) -> Vec<bf16> {
-        let width = kernel_size - 1;
+    fn reference_conv1d_decode_step(x: &[bf16], weights: &[bf16], state: &mut [f32]) -> Vec<bf16> {
         let channels = x.len();
+        let kernel_size = weights.len() / channels;
+        let width = kernel_size - 1;
         let mut out = vec![bf16::ZERO; channels];
         for c in 0..channels {
             let mut sum = 0.0f32;
@@ -648,6 +644,20 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Steps between two finite bf16 values on the bf16 grid, with +0 and -0 as
+    /// one point.
+    fn bf16_ulp_distance(a: bf16, b: bf16) -> u32 {
+        let ordered = |value: bf16| {
+            let bits = i32::from(value.to_bits());
+            if bits & 0x8000 != 0 {
+                -(bits & 0x7fff)
+            } else {
+                bits
+            }
+        };
+        ordered(a).abs_diff(ordered(b))
     }
 
     #[test]
@@ -711,21 +721,24 @@ mod tests {
 
             let got: Vec<bf16> = ctx.stream.clone_dtoh(&out.data)?;
             for slot in 0..batch_size {
-                let expected = reference_conv1d_decode_step(
-                    &row,
-                    &w_host,
-                    &mut host_states[slot],
-                    kernel_size,
-                );
+                let expected = reference_conv1d_decode_step(&row, &w_host, &mut host_states[slot]);
                 let got_row = &got[slot * num_channels..(slot + 1) * num_channels];
-                let max_out_diff = got_row
-                    .iter()
-                    .zip(expected.iter())
-                    .map(|(got, expected)| (got.to_f32() - expected.to_f32()).abs())
-                    .fold(0.0f32, f32::max);
                 assert!(
-                    max_out_diff <= 1e-2,
-                    "conv1d decode step {step} slot {slot}: output diff {max_out_diff}"
+                    got_row
+                        .iter()
+                        .chain(&expected)
+                        .all(|value| value.to_f32().is_finite()),
+                    "conv1d decode step {step} slot {slot}: non-finite output"
+                );
+                let max_ulps = got_row
+                    .iter()
+                    .zip(&expected)
+                    .map(|(got, expected)| bf16_ulp_distance(*got, *expected))
+                    .max()
+                    .unwrap_or_default();
+                assert!(
+                    max_ulps <= 1,
+                    "conv1d decode step {step} slot {slot}: output off by {max_ulps} bf16 ulps"
                 );
             }
 
