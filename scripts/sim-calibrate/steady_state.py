@@ -98,13 +98,15 @@ def aggregate_request_samples(samples: list[dict]) -> dict:
         if type(row.get('repeat')) is not int or type(row.get('index')) is not int:
             raise StatisticsError('decode samples require explicit repeat/index')
         batches.setdefault((row['cell_id'], row['repeat']), []).append(row)
-    means = []
-    for rows in batches.values():
+    means, repeats = [], []
+    for (cell_id, repeat), rows in batches.items():
         size = rows[0]['requests']
         if (size != int(size) or len(rows) != size or {r['index'] for r in rows} != set(range(int(size)))
                 or any(r['requests'] != size for r in rows)):
             raise StatisticsError('incomplete or duplicate decode batch samples')
-        means.append(statistics.mean(row['value'] for row in rows))
+        mean = statistics.mean(row['value'] for row in rows)
+        means.append(mean)
+        repeats.append({'cell_id': cell_id, 'repeat': repeat, 'request_count': len(rows), 'mean': mean})
     dispersion = summary(means)
     return {'value': dispersion['mean'], 'repeat_count': len(means),
-            'request_count': len(samples), 'dispersion': dispersion}
+            'request_count': len(samples), 'dispersion': dispersion, 'batches': repeats}

@@ -14,6 +14,7 @@ import aiohttp
 
 from artifacts import (ExecutionStore, _read_json, _write_atomic,
                        checked_path, file_reference, load_compiled_bundle)
+from baseline import resolve_reference, select_reference
 from evidence_proxy import EvidenceError, EvidenceProxy, observer_identity
 from manifest import canonical_scheduler_identity
 from probe import (probe_endpoint, profile_endpoint, profile_listener_matches, requires_cache_reset,
@@ -94,12 +95,15 @@ def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
             'executable': file_reference((process / 'exe').resolve()), 'argv': args}
 
 
-def verify_attempt_binding(campaign: dict, variant_name: str, root: Path, binding: dict) -> None:
+def verify_attempt_binding(campaign: dict, variant_name: str, root: Path, binding: dict, cell_id: str) -> None:
     if observer_identity() != campaign['client']['observer']:
         raise EvidenceError('frozen observer changed; recompile campaign into a new artifact root')
     if variant_name != 'target':
-        expected = {k: v for k, v in binding.items() if k not in ('variant_identity', 'observer_sha256')}
-        if profile_binding(root, campaign['variants'][variant_name], binding['server_pid']) != expected:
+        variant = campaign['variants'][variant_name]
+        if variant_name == 'zero_cost':
+            variant = {**variant, **resolve_reference(root, campaign, binding['reference'], cell_id)}
+        expected = {k: v for k, v in binding.items() if k not in ('variant_identity', 'observer_sha256', 'reference')}
+        if profile_binding(root, variant, binding['server_pid']) != expected:
             raise EvidenceError('profile server binding changed')
 
 
@@ -115,7 +119,7 @@ async def reset_cache(base: str, root: Path, timeout: float) -> None:
 
 async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
                       store: ExecutionStore, *, timeout: float, binding: dict) -> dict:
-    verify_attempt_binding(campaign, variant_name, store.root, binding)
+    verify_attempt_binding(campaign, variant_name, store.root, binding, plan['cell_id'])
     previous = store.sealed(plan, variant_name, binding)
     if previous:
         return {**previous, 'skipped': True}
@@ -159,7 +163,7 @@ async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
     if proxy:
         errors.extend(proxy.errors)
     try:
-        verify_attempt_binding(campaign, variant_name, store.root, binding)
+        verify_attempt_binding(campaign, variant_name, store.root, binding, plan['cell_id'])
     except Exception as exc:
         errors.append(f'attempt binding lost: {exc}')
     _write_atomic(directory / 'attempt.json', {'attempt': attempt, 'errors': errors,
@@ -173,7 +177,7 @@ async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
         _write_atomic(directory / 'measurements.json', envelope)
         if plan['workload_kind'] == 'steady_decode':
             _write_atomic(directory / 'decode_statistics.json', compute_statistics(plan, envelope))
-        verify_attempt_binding(campaign, variant_name, store.root, binding)
+        verify_attempt_binding(campaign, variant_name, store.root, binding, plan['cell_id'])
         entry = store.finish(plan, variant_name, directory)
     except Exception as exc:
         _write_atomic(directory / 'conversion_failure.json', {'error': f'{type(exc).__name__}: {exc}'})
@@ -218,12 +222,14 @@ async def run_campaign(root: Path, *, variants: list[str], selectors: list[str] 
     with ExecutionStore(root, campaign['campaign_id']) as store:
         for variant_name in variants:
             variant = campaign['variants'][variant_name]
-            binding = {'variant_identity': variant['identity'], 'observer_sha256': client['observer']['sha256']}
-            if variant_name != 'target':
-                binding.update(profile_binding(root, variant, (server_pids or {}).get(variant_name)))
-                if variant_name == 'zero_cost' and binding['profile']['sha256'] != variant['profile_binding']['sha256']:
-                    raise EvidenceError('zero-cost profile differs from compiled generated control')
             for cell in cells:
+                binding = {'variant_identity': variant['identity'], 'observer_sha256': client['observer']['sha256']}
+                configured = variant
+                if variant_name == 'zero_cost':
+                    binding['reference'] = select_reference(root, campaign, cell['cell_id'])
+                    configured = {**variant, **resolve_reference(root, campaign, binding['reference'], cell['cell_id'])}
+                if variant_name != 'target':
+                    binding.update(profile_binding(root, configured, (server_pids or {}).get(variant_name)))
                 plan = _read_json(checked_path(root, cell['plan']['path']))
                 result = await run_attempt(campaign, cell, plan, variant_name, store,
                                            timeout=timeout, binding=binding)

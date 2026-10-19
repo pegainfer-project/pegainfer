@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from manifest import SPLITS, sha256_json
+
 
 PAIRING_KEY_SCHEMA = ("cell_id", "phase", "repeat", "index")
 PairingKey = tuple[str, str, int, int]
@@ -16,6 +18,35 @@ PairingKey = tuple[str, str, int, int]
 
 class PairingContractError(ValueError):
     """Raised when a campaign cannot establish a canonical request identity."""
+
+
+def campaign_scope(campaign: dict, scope: str) -> tuple[list, list, tuple, dict]:
+    if scope not in ('train', 'validation'):
+        raise PairingContractError('scope must be explicitly train or validation')
+    cells, deferred = [], []
+    all_cells = campaign['workload']['cells']
+    if (len({cell['cell_id'] for cell in all_cells}) != len(all_cells)
+            or campaign['workload']['cell_count'] != len(all_cells)):
+        raise PairingContractError('duplicate compiled cell identity or inconsistent cell count')
+    splits = {split: [cell['cell_id'] for cell in all_cells if cell['split'] == split] for split in SPLITS}
+    if (splits != campaign['splits'] or campaign['required_scope'] != {
+            'cells': [cell['cell_id'] for cell in all_cells], 'sha256': sha256_json(splits)}):
+        raise PairingContractError('compiled required scope/splits mismatch')
+    for cell in all_cells:
+        if cell['split'] not in SPLITS or cell['kind'] not in ('cold_prefill', 'steady_decode', 'cached_prefill'):
+            raise PairingContractError('unknown compiled kind/split')
+        if (cell['split'] == 'train') != (scope == 'train'):
+            continue
+        if cell['kind'] == 'cached_prefill':
+            deferred.append({'cell_id': cell['cell_id'], 'kind': cell['kind'], 'split': cell['split'],
+                             'reason': 'cached-prefill acquisition/validation deferred to C8'})
+        else:
+            cells.append(cell)
+    roles = ('target', 'zero_cost') if scope == 'train' else ('target', 'zero_cost', 'sim')
+    definition = {'scope': scope, 'required_roles': list(roles),
+                  'plans': [{'cell_id': cell['cell_id'], 'plan_sha256': cell['plan']['plan_sha256']}
+                            for cell in cells]}
+    return cells, deferred, roles, definition
 
 
 def canonical_pair_key(measurement: dict[str, Any], cell_id: str, *, measured_only: bool = False) -> PairingKey:
@@ -418,3 +449,39 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
     if reconstructed != envelope or reconstructed_workload != workload:
         raise PairingContractError(f'{variant}: measurement/workload differs from raw conversion')
     return rows
+
+
+def _profile_sources(root: Path, campaign: dict, variant: str, reference: dict) -> None:
+    """Verify saved profile file bindings without consulting a current process."""
+    if variant == 'target':
+        return
+    from artifacts import _read_json, checked_path, file_reference
+    from probe import validate_profile_binding
+    configured, binding = campaign['variants'][variant], reference['binding']
+    if variant == 'zero_cost':
+        from baseline import resolve_reference
+        configured = {**configured, **resolve_reference(root, campaign, binding['reference'], binding['reference']['cell_id'])}
+
+    validate_profile_binding(configured['identity']['endpoint'], binding)
+    profile_path = checked_path(root, configured['profile_path'])
+    if file_reference(profile_path) != binding.get('profile'):
+        raise PairingContractError(f'{variant}: saved profile bytes changed')
+    profile = _read_json(profile_path)
+    manifest_path = checked_path(profile_path.parent, profile['calibration']['manifest'])
+    if (file_reference(manifest_path) != binding.get('manifest')
+            or file_reference(manifest_path)['sha256'] != profile['calibration']['sha256']):
+        raise PairingContractError(f'{variant}: saved calibration manifest bytes changed')
+
+
+
+def load_role(root: Path, campaign: dict, plan: dict, role: str, reference: dict) -> dict:
+    from artifacts import _read_json, read_sealed_attempt
+    if role == 'zero_cost' and reference['binding'].get('reference', {}).get('cell_id') != plan['cell_id']:
+        raise PairingContractError('reference binding belongs to another cell')
+    _profile_sources(root, campaign, role, reference)
+    attempt = read_sealed_attempt(root, plan, role, reference)
+    configured = campaign['variants'][role]
+    validate_attempt_evidence(plan, attempt, role, campaign['client'], configured['identity'], runtime=configured['runtime'])
+    if _read_json(attempt['directory'] / 'attempt.json')['attempt'] != reference['attempt']:
+        raise PairingContractError(f'{role}: raw attempt number differs from selected attempt')
+    return attempt

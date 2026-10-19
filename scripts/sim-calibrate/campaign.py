@@ -13,7 +13,7 @@ from typing import Any
 
 from artifacts import ArtifactError, write_compiled_bundle
 from manifest import ManifestError, compile_manifest, sha256_json
-from profile import ProfileError, zero_cost_bundle
+from profile import ProfileError
 from request_plan import PlanError, build_plan
 from vllm_bench import VllmBenchError, inspect_binary
 
@@ -127,24 +127,12 @@ def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[
         "artifact_uri": root.as_uri(),
     }
     variants = compiled["variants"]
-    zero_path = _profile_destination(root, variants["zero_cost"].get("profile_path"), "profiles/zero_cost/profile.json")
-    manifest_path = str(Path(zero_path).with_name("manifest.json"))
-    if zero_path == manifest_path:
-        raise ManifestError("zero_cost profile cannot use the reserved manifest.json filename")
-    if any(name in documents or name in ("compiled_campaign.json", "artifact_index.json") for name in (zero_path, manifest_path)):
-        raise ManifestError("zero_cost profile output collides with a compiled artifact")
-    manifest, zero = zero_cost_bundle(compiled, Path(manifest_path).name)
-    documents[manifest_path] = manifest
-    documents[zero_path] = zero
-    for name in ("zero_cost", "sim"):
-        relative = zero_path if name == "zero_cost" else _profile_destination(root, variants[name].get("profile_path"), "profiles/sim/profile.json")
-        if name == "sim" and (relative in documents or relative in ("compiled_campaign.json", "artifact_index.json")):
-            raise ManifestError("sim profile output collides with a compiled artifact")
-        variants[name]["profile_path"] = relative
-        variants[name]["profile_binding"] = {"source": "generated_zero_cost" if name == "zero_cost" else "pending_fit"}
-        if name == "zero_cost":
-            payload = (json.dumps(zero, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode()
-            variants[name]["profile_binding"].update({"sha256": hashlib.sha256(payload).hexdigest(), "manifest_sha256": zero["calibration"]["sha256"]})
+    variants["zero_cost"]["reference_preparation"] = "references/preparation.json"
+    relative = _profile_destination(root, variants["sim"].get("profile_path"), "profiles/sim/profile.json")
+    if relative in documents or relative in ("compiled_campaign.json", "artifact_index.json"):
+        raise ManifestError("sim profile output collides with a compiled artifact")
+    variants["sim"]["profile_path"] = relative
+    variants["sim"]["profile_binding"] = {"source": "pending_fit"}
     documents["compiled_campaign.json"] = compiled
     if write:
         write_compiled_bundle(root, documents, compiled["campaign_id"])
@@ -158,6 +146,8 @@ def main(argv: list[str] | None = None) -> int:
     compile_parser.add_argument("--spec", required=True, type=Path)
     compile_parser.add_argument("--output", type=Path, help="override output.artifact_root")
     compile_parser.add_argument("--dry-run", action="store_true", help="validate and print without writing artifacts")
+    prepare_parser = subcommands.add_parser("prepare-reference", help="freeze references from complete train-target evidence")
+    prepare_parser.add_argument("--artifact-root", type=Path, required=True)
     run_parser = subcommands.add_parser("run", help="execute frozen cold/decode plans through the evidence proxy")
     run_parser.add_argument("--artifact-root", type=Path, required=True)
     run_parser.add_argument("--variant", choices=("target", "zero_cost", "sim"), action="append", required=True)
@@ -166,6 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--server-pid", action="append", default=[], metavar="VARIANT=PID", help="bind an existing local profile server; repeat for zero_cost and sim")
     args = parser.parse_args(argv)
     try:
+        if args.command == 'prepare-reference':
+            from baseline import prepare_references
+            prepared = prepare_references(args.artifact_root)
+            print(json.dumps({'preparation_id': prepared['preparation_id'], 'cells': len(prepared['cells'])}, sort_keys=True))
+            return 0
         if args.command == 'run':
             import asyncio
             from plan_driver import run_campaign

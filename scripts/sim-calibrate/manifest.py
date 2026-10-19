@@ -11,11 +11,11 @@ from itertools import product
 from typing import Any
 from urllib.parse import urlsplit
 
-from measurement_schema import DECODE_STATISTICS_POLICY, MeasurementError, contract as measurement_contract, digest, integer, number, text
+from measurement_schema import DECODE_STATISTICS_POLICY, REFERENCE_POLICIES, reference_policy, MeasurementError, contract as measurement_contract, digest, integer, number, text
 
 
-CAMPAIGN_SPEC_SCHEMA_VERSION = 6
-COMPILED_CAMPAIGN_SCHEMA_VERSION = 6
+CAMPAIGN_SPEC_SCHEMA_VERSION = 7
+COMPILED_CAMPAIGN_SCHEMA_VERSION = 7
 SPLITS = ("train", "threshold_validation", "held_out_mixed", "sealed_test")
 WORKLOAD_KINDS = ("cold_prefill", "steady_decode", "cached_prefill", "mixed")
 
@@ -376,6 +376,8 @@ def _finalize_cell(cell: dict[str, Any], variants: dict[str, Any], assets: dict[
     for variant in variants.values():
         if cell["input_tokens"] + cell["output_tokens"] > variant["runtime"]["scheduler"]["max_model_len"]:
             raise ManifestError(f"cell {cell['name']} exceeds a variant context ceiling")
+    if cell["kind"] in REFERENCE_POLICIES:
+        cell = {**cell, "reference_policy": reference_policy(cell["kind"], cell["split"])}
     cell = {**cell, "fit_policy": {"train": cell["split"] == "train", "excluded_metrics": ["ttft_ms"] if cell["concurrency"] > 1 else []}}
     cell["cell_id"] = sha256_json({"schema_version": COMPILED_CAMPAIGN_SCHEMA_VERSION, "client_assets": assets, "cell": cell})
     return cell
@@ -435,6 +437,8 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
                 raise ManifestError(f"variants.{name}.server_flags must be an array of non-empty strings")
             if any(flag == "--profile" or flag.startswith("--profile=") for flag in flags):
                 raise ManifestError("declare profile_path instead of duplicating --profile in server_flags")
+            if name == "zero_cost" and "profile_path" in raw:
+                raise ManifestError("zero_cost profile is prepared after target collection, not supplied at compile time")
             if name == "target" and "profile_path" in raw:
                 raise ManifestError("target cannot declare a simulator profile_path")
             variants[name] = {"identity": identity, "runtime": runtime, "server_flags": list(flags)}

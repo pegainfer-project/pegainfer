@@ -12,16 +12,18 @@ from artifacts import (ArtifactError, _read_json, checked_path, execution_snapsh
                        load_compiled_bundle, sealed_reference, write_derived_document)
 from manifest import sha256_json
 from measurement_schema import DECODE_STATISTICS_POLICY, digest
-from normalize import NORMALIZER_SOURCES, _scope, load_role
+from pairing import campaign_scope, load_role
 
 KIND = 'train_target_statistics'
 SCHEMA_VERSION = 1
-SOURCES = (*NORMALIZER_SOURCES, 'target_statistics.py')
+SOURCES = ('target_statistics.py', 'pairing.py', 'artifacts.py', 'manifest.py', 'request_plan.py',
+           'measurement_schema.py', 'evidence_proxy.py', 'sse_evidence.py',
+           'vllm_bench.py', 'vllm_bench_collect.py', 'probe.py', 'steady_state.py')
 
 
 def _cells(campaign: dict) -> list[dict]:
     # Reuse the compiler scope checks; this stage has its own target-only role contract.
-    cells, _, _, _ = _scope(campaign, 'train')
+    cells, _, _, _ = campaign_scope(campaign, 'train')
     return [cell for cell in cells if cell['kind'] == 'steady_decode']
 
 

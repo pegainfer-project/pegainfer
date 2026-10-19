@@ -24,12 +24,13 @@ class ProfileError(ValueError):
     """Raised when calibration evidence cannot produce a safe profile."""
 
 
-def zero_cost_bundle(campaign: dict[str, Any], manifest_name: str = "manifest.json") -> tuple[dict[str, Any], dict[str, Any]]:
-    """Build a zero-delay control from compiled inputs, without fit/report data."""
+def reference_bundle(campaign: dict[str, Any], cell: dict, *, interval_us: int,
+                     source_digest: str, source_artifacts: list[str], manifest_name: str = "manifest.json") -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a known functional reference, independent of fit/report artifacts."""
     target = campaign["variants"]["target"]
     control = campaign["variants"]["zero_cost"]
     scheduler = canonical_scheduler_identity(control["runtime"]["scheduler"])
-    workload = campaign["workload"]["cells"]
+    workload = [cell]
     client = canonical_client_identity(campaign["client"], tokenizer_config_sha256=campaign["client"]["tokenizer_config_sha256"])
     identity = target["identity"]
     runtime = target["runtime"]
@@ -40,7 +41,7 @@ def zero_cost_bundle(campaign: dict[str, Any], manifest_name: str = "manifest.js
         "model_id": control["identity"]["model"], "model_revision": identity["model_revision"],
         "model_config_sha256": identity["model_config_sha256"], "gpu": runtime.get("gpu", "unbound"),
         "server_flags": target["server_flags"], "collection_command": canonical_json(provenance["compile_argv"]),
-        "source_artifacts": [f"plans/{cell['cell_id']}/request_plan.json" for cell in workload],
+        "source_artifacts": source_artifacts,
         "backend": runtime.get("backend", identity["engine"]), "driver": runtime.get("driver", "not_recorded"),
         "cuda": runtime.get("cuda", "not_recorded"), "parallelism": runtime.get("parallelism", "1"),
         "quantization": runtime.get("quantization", "none"), "scheduler": scheduler,
@@ -52,11 +53,11 @@ def zero_cost_bundle(campaign: dict[str, Any], manifest_name: str = "manifest.js
             "warmup_repeats": max(cell["warmup_repeats"] for cell in workload),
             "repeats": max(cell["repeats"] for cell in workload),
         },
-        "split": campaign["splits"],
+        "split": {name: [cell["cell_id"]] if name == cell["split"] else [] for name in campaign["splits"]},
         "provenance": {
             "collector_revision": provenance["compiler_revision"],
-            "fitter_revision": "not_applicable_generated_zero_cost",
-            "artifact_uri": provenance["artifact_uri"], "source_digest": campaign["source_digest"],
+            "fitter_revision": "not_applicable_known_reference",
+            "artifact_uri": provenance["artifact_uri"], "source_digest": source_digest,
         },
     }
     # The artifact writer uses this exact encoding, including the final newline.
@@ -71,7 +72,14 @@ def zero_cost_bundle(campaign: dict[str, Any], manifest_name: str = "manifest.js
                 "sum_decode_ctx_tokens": [0, scheduler["max_num_seqs"] * scheduler["max_model_len"]],
                 "prefill_tokens_in_step": [0, scheduler["max_num_batched_tokens"]],
             },
-            "model": {"kind": "fixed_step", "duration_us": 0},
+            "model": {
+                "kind": "functional",
+                "prefill": {"input_tokens": [0, scheduler["max_num_batched_tokens"]], "duration_us": [0, 0]},
+                "decode": {"decode_reqs": [0, scheduler["max_num_seqs"]],
+                           "sum_decode_ctx_tokens": [0, scheduler["max_num_seqs"] * scheduler["max_model_len"]],
+                           "duration_us": [interval_us] * 4},
+                "mixed": {"kind": "composition_additive", "intercept_us": 0},
+            },
         },
     }
     return manifest, profile

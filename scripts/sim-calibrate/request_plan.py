@@ -7,9 +7,9 @@ import re
 from typing import Any
 
 from manifest import canonical_execution_configuration, canonical_sampling_configuration, sha256_json
-from measurement_schema import DECODE_STATISTICS_POLICY, MeasurementError, digest, integer, number, text
+from measurement_schema import DECODE_STATISTICS_POLICY, REFERENCE_POLICIES, reference_policy, MeasurementError, digest, integer, number, text
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 KIND = "request_plan"
 
 
@@ -78,7 +78,7 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
                 append(phase, repeat)
         plan = {
             "kind": KIND, "schema_version": SCHEMA_VERSION, "cell_id": cell["cell_id"],
-            "matrix_name": cell["matrix_name"], "workload_kind": cell["kind"],
+            "matrix_name": cell["matrix_name"], "split": cell["split"], "workload_kind": cell["kind"],
             "concurrency": concurrency, "warmup_repeats": warmups, "repeats": repeats,
             "client": {"driver": "vllm-bench", "version": client["version"],
                        "binary_sha256": client["binary_sha256"], "tokenizer_sha256": client["tokenizer_sha256"]},
@@ -91,7 +91,7 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
             "arrival": {"mode": "fixed_batch", "clock": "monotonic"},
             "batches": batches, "logical_requests": requests,
         }
-        for field in ("cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics"):
+        for field in ("cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics", "reference_policy"):
             if field in cell:
                 plan[field] = copy.deepcopy(cell[field])
         plan["plan_sha256"] = sha256_json(plan)
@@ -106,7 +106,7 @@ def validate_plan(plan: dict[str, Any]) -> None:
     try:
         if not isinstance(plan, dict) or plan.get("kind") != KIND or type(plan.get("schema_version")) is not int or plan["schema_version"] != SCHEMA_VERSION:
             raise PlanError("unsupported request plan kind/schema_version")
-        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "retry", "observer", "arrival", "batches", "logical_requests", "plan_sha256", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics"}, "plan")
+        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "split", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "retry", "observer", "arrival", "batches", "logical_requests", "plan_sha256", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics", "reference_policy"}, "plan")
         digest(plan.get("cell_id"), "cell_id")
         digest(plan.get("plan_sha256"), "plan_sha256")
         if sha256_json({k: v for k, v in plan.items() if k != "plan_sha256"}) != plan["plan_sha256"]:
@@ -114,6 +114,9 @@ def validate_plan(plan: dict[str, Any]) -> None:
         matrix_name = text(plan.get("matrix_name"), "matrix_name")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", matrix_name):
             raise PlanError("matrix_name must be a safe identifier")
+        from manifest import SPLITS
+        if plan.get("split") not in SPLITS:
+            raise PlanError("unknown plan split")
         workload = plan.get("workload_kind")
         if workload not in ("cold_prefill", "steady_decode", "cached_prefill"):
             raise PlanError("unsupported workload_kind")
@@ -184,6 +187,8 @@ def validate_plan(plan: dict[str, Any]) -> None:
                 raise PlanError("invalid fixed decode statistics policy")
         elif any(field in plan for field in ("num_ctx", "decode_statistics")):
             raise PlanError("decode fields are only supported for steady_decode")
+        if workload in REFERENCE_POLICIES and plan.get("reference_policy") != reference_policy(workload, plan["split"]):
+            raise PlanError("reference policy differs from the frozen workload contract")
         if plan.get("arrival") != {"mode": "fixed_batch", "clock": "monotonic"}:
             raise PlanError("invalid fixed_batch arrival contract")
         batches = plan.get("batches")

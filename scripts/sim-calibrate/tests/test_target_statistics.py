@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from artifacts import ArtifactError, _read_json, _write_atomic, file_reference
+from artifacts import ArtifactError, ExecutionStore, _read_json, _write_atomic, file_reference
 from fit import FitError, fit_normalized
 from normalize import normalize_campaign
 from target_statistics import (collect_target_statistics, read_target_statistics,
@@ -41,7 +41,8 @@ class TargetStatisticsTests(unittest.TestCase):
     def test_missing_or_unqualified_target_and_mutations_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, campaign = make_bundle(Path(tmp))
-            collect_fixture(root, campaign, roles=('zero_cost',))
+            with ExecutionStore(root, campaign['campaign_id']) as store:
+                store._save()
             self.assertEqual(collect_target_statistics(root)['status'], 'invalid')
             collect_fixture(root, campaign, roles=('target',), collapsed_phases=('measured',))
             self.assertEqual(collect_target_statistics(root)['status'], 'invalid')

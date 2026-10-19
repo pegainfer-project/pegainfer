@@ -27,6 +27,20 @@ DECODE_STATISTICS_POLICY = {
 }
 
 
+REFERENCE_POLICIES = {
+    "cold_prefill": {"kind": "cold_zero", "interval_source": "none", "encoding": "integer_us_round_nearest"},
+    "steady_decode": {"kind": "target_decode_mean", "interval_source": "qualified_train_target_cell_mean",
+                      "encoding": "integer_us_round_nearest"},
+}
+
+
+def reference_policy(kind: str, split: str) -> dict:
+    """Validation keeps the existing zero-control diagnostic, never a train interval."""
+    if split != 'train':
+        return {"kind": "validation_zero", "interval_source": "none", "encoding": "integer_us_round_nearest"}
+    return dict(REFERENCE_POLICIES[kind])
+
+
 class MeasurementError(ValueError):
     """Evidence does not satisfy the declared client measurement contract."""
 

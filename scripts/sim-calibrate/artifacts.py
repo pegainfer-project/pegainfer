@@ -311,7 +311,7 @@ def load_compiled_bundle(root: Path) -> dict[str, Any]:
         raise ArtifactError('not a current compiled bundle')
     verify_files(root, index.get('files'))
     campaign = _read_json(root / 'compiled_campaign.json')
-    if campaign.get('kind') != 'compiled_campaign' or campaign.get('schema_version') != 6:
+    if campaign.get('kind') != 'compiled_campaign' or campaign.get('schema_version') != 7:
         raise ArtifactError('unsupported compiled campaign; compile a new experiment')
     if campaign.get('campaign_id') != index.get('campaign_id'):
         raise ArtifactError('compiler campaign/index identity mismatch')

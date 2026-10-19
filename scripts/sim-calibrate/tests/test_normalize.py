@@ -26,6 +26,9 @@ from test_sse_evidence import event
 from vllm_bench import render_command
 from vllm_bench_collect import convert_evidence
 from steady_state import compute_statistics
+from baseline import prepare_references, resolve_reference, select_reference
+from profile import reference_bundle
+from manifest import sha256_json
 
 
 def make_bundle(base: Path, *, cached=False, reset_before=None):
@@ -44,30 +47,42 @@ def make_bundle(base: Path, *, cached=False, reset_before=None):
     path.write_text(json.dumps(spec))
     campaign = compile_campaign(path)
     root = base / 'artifacts'
-    zero = root / campaign['variants']['zero_cost']['profile_path']
     sim = root / campaign['variants']['sim']['profile_path']
-    sim.parent.mkdir(parents=True)
-    sim.write_bytes(zero.read_bytes())
-    (sim.parent / 'manifest.json').write_bytes((zero.parent / 'manifest.json').read_bytes())
+    manifest, profile = reference_bundle(campaign, campaign['workload']['cells'][0], interval_us=0,
+                                         source_digest=sha256_json('fixture'), source_artifacts=[])
+    _write_atomic(sim.parent / 'manifest.json', manifest)
+    _write_atomic(sim, profile)
     return root, campaign
 
 
-def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *, split='train', collapsed_phases=()):
+def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *, split='train', collapsed_phases=(), event_interval_ms=5):
     """Build raw evidence through the real converter and ExecutionStore."""
-    with ExecutionStore(root, campaign['campaign_id']) as store:
-        for cell in campaign['workload']['cells']:
-            if cell['split'] != split or cell['kind'] == 'cached_prefill':
-                continue
-            plan = build_plan(cell, campaign['client'])
-            for role in roles:
+    if 'zero_cost' in roles:
+        if 'target' in roles:
+            collect_fixture(root, campaign, ('target',), split=split, collapsed_phases=collapsed_phases,
+                            event_interval_ms=event_interval_ms)
+            roles = tuple(role for role in roles if role != 'target')
+        prepare_references(root)
+    for role in roles:
+        with ExecutionStore(root, campaign['campaign_id']) as store:
+            for cell in campaign['workload']['cells']:
+                if cell['split'] != split or cell['kind'] == 'cached_prefill':
+                    continue
+                plan = build_plan(cell, campaign['client'])
                 identity, client = campaign['variants'][role]['identity'], campaign['client']
                 binding = {'variant_identity': identity, 'observer_sha256': client['observer']['sha256']}
                 if role != 'target':
-                    profile = root / campaign['variants'][role]['profile_path']
+                    configured = campaign['variants'][role]
+                    if role == 'zero_cost':
+                        binding['reference'] = select_reference(root, campaign, cell['cell_id'])
+                        configured = resolve_reference(root, campaign, binding['reference'], cell['cell_id'])
+                    profile = root / configured['profile_path']
                     endpoint = urlsplit(identity['endpoint'])
                     binding.update(profile=file_reference(profile), manifest=file_reference(profile.parent / 'manifest.json'),
                                    endpoint={'address': endpoint.hostname, 'port': endpoint.port},
                                    listeners=[{'family': 'IPv4', 'address': '0.0.0.0', 'port': endpoint.port}])
+                if store.sealed(plan, role, binding):
+                    continue
                 directory, number = store.begin(plan, role, binding)
                 for name, value in [('binding', binding), ('observer', client['observer']), ('probe', {'model': identity['model']}),
                                     ('attempt', {'attempt': number, 'errors': [], 'cell_id': cell['cell_id'], 'variant': role})]:
@@ -99,7 +114,8 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                         _write_atomic(request / 'request.json', body)
                         (request / 'request-body.bin').write_bytes(json.dumps(body).encode())
                         count = plan['shape']['output_tokens']
-                        chunks = [event({'index': 0, 'token_ids': [1, 2], 'text': ''})]
+                        chunks = [event({'index': 0, 'token_ids': list(range(1, min(count, 2) + 1)), 'text': '',
+                                         'finish_reason': 'length' if count <= 2 else None})]
                         chunks.extend(event({'index': 0, 'token_ids': [j], 'text': 'x',
                                              'finish_reason': 'length' if j == count else None})
                                       for j in range(3, count + 1))
@@ -107,11 +123,11 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                                                   'completion_tokens': count,
                                                   'total_tokens': plan['shape']['input_tokens'] + count}) + b'data: [DONE]\r\n\r\n')
                         payload = b''.join(chunks)
-                        start = 1_000_000_000 + b * 100_000_000 + i * 2_000_000
+                        start = 1_000_000_000 + b * 1_000_000_000 + i * 2_000_000
                         parser = SSEParser()
                         events, reads, offset = [], [], 0
                         for j, chunk in enumerate(chunks):
-                            timestamp = start + 1_000_000 + (0 if batch['phase'] in collapsed_phases else j * 5_000_000)
+                            timestamp = start + 1_000_000 + (0 if batch['phase'] in collapsed_phases else j * event_interval_ms * 1_000_000)
                             events.extend(parser.feed(chunk, timestamp))
                             reads.append({'timestamp_ns': timestamp, 'byte_start': offset, 'byte_end': offset+len(chunk)})
                             offset += len(chunk)
@@ -121,7 +137,8 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                         (request / 'reads.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in reads))
                         terminal = {**logical[key], 'transport_request_id': transport, 'request_instance_id': instance,
                                     'directory': request_relative, 'upstream_dispatch_ns': start,
-                                    'stream_end_ns': start + 50_000_000, 'downstream_end_ns': start + 51_000_000,
+                                    'stream_end_ns': start + (len(chunks) * event_interval_ms + 10) * 1_000_000,
+                                    'downstream_end_ns': start + (len(chunks) * event_interval_ms + 11) * 1_000_000,
                                     'upstream_attempts': 1, 'http_status': 200, 'eof': True, 'done': True,
                                     'finished': True, 'error': None}
                         _write_atomic(request / 'terminal.json', terminal)
@@ -170,13 +187,15 @@ class NormalizeTests(unittest.TestCase):
             self.assertEqual(document['matched_count'], 4)
             self.assertEqual(len(document['deferred_cells']), 4)
             self.assertEqual(document['required_roles'], ['target', 'zero_cost'])
-            self.assertFalse(document['fit_ready'])
+            self.assertTrue(document['fit_ready'])
             for observation in document['observations']:
                 self.assertEqual(observation['split'], 'train')
-                self.assertNotIn('effective', observation)
+                self.assertAlmostEqual(observation['baseline_residual']['tpot_ms'], 0)
+                self.assertAlmostEqual(observation['effective']['tpot_ms'], 5)
+                self.assertEqual(observation['reference_interval_ms'], 5)
                 self.assertGreater(observation['decode_window_tpot_ms']['zero_cost'], 0)
-            with self.assertRaises(FitError):
-                fit_normalized(document)
+            fitted = fit_normalized(document)
+            self.assertEqual(next(c for c in fitted['candidates'] if c['name']=='decode_additive')['status'], 'fitted')
             verify_normalized_sources(document)
         for reset_before in ('cell', 'repeat'):
             with self.subTest(reset_before=reset_before), tempfile.TemporaryDirectory() as tmp:
@@ -192,6 +211,7 @@ class NormalizeTests(unittest.TestCase):
     def test_validation_requires_complete_roles_and_empty_scope_is_invalid(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, campaign = make_bundle(Path(tmp))
+            collect_fixture(root, campaign, roles=('target',))
             collect_fixture(root, campaign, split='sealed_test')
             self.assertEqual(normalize_campaign(root, scope='validation')['status'], 'invalid')
             collect_fixture(root, campaign, roles=('sim',), split='sealed_test')
@@ -238,7 +258,7 @@ class NormalizeTests(unittest.TestCase):
                     elif mode == 'normalizer_digest':
                         changed['source']['normalizer_sha256'] = '0' * 64
                     else:
-                        changed['fit_ready'] = True
+                        changed['fit_ready'] = False
                     with self.assertRaises(NormalizeError):
                         verify_normalized(changed)
                     with self.assertRaises(NormalizeError):

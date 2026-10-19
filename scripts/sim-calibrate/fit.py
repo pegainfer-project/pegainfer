@@ -16,7 +16,7 @@ from typing import Any, Iterable, Sequence
 from steady_state import StatisticsError, aggregate_request_samples
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 FIT_SPLITS = ("train",)
 VALIDATION_SPLITS = ("threshold_validation",)
 HELD_OUT_SPLITS = ("held_out_mixed", "sealed_test")
@@ -89,51 +89,26 @@ def _error_metrics(actual: Sequence[float], predicted: Sequence[float]) -> dict[
     }
 
 
-def _prefill_observations(
-    document: dict[str, Any],
-    *,
-    splits: Sequence[str],
-) -> list[dict[str, Any]]:
-    metric = "ttft_ms"
-    result: list[dict[str, Any]] = []
-    allowed = set(splits)
-    for cell in document.get("cells", []):
-        if not isinstance(cell, dict) or cell.get("status") != "measured":
+def _training_observations(document: dict[str, Any], *, kind: str, metric: str) -> list[dict[str, Any]]:
+    """Only fully verified current training cells reach numerical algorithms."""
+    result = []
+    for cell in document['cells']:
+        if cell['kind'] != kind or cell['split'] != 'train' or cell['status'] != 'measured':
             continue
-        if cell.get("kind") != "cold_prefill" or cell.get("split") not in allowed:
-            continue
-        for observation in cell.get("observations", []):
-            if not isinstance(observation, dict):
+        for row in cell['observations']:
+            if metric in row['fit_policy']['excluded_metrics']:
                 continue
-            value = observation.get("effective", {}).get(metric)
-            if observation.get("attribution", {}).get(metric) != "black_box_effective":
-                continue
-            if value is None:
-                continue
-            try:
-                y = _finite(value, f"effective.{metric}")
-                x = _finite(observation.get("input_tokens"), "input_tokens")
-                output = _finite(observation.get("output_tokens"), "output_tokens")
-                requests = _finite(observation.get("concurrency"), "concurrency")
-            except FitError:
-                continue
-            result.append(
-                {
-                    "cell_id": observation.get("cell_id"),
-                    "split": observation.get("split"),
-                    "repeat": observation.get("repeat"),
-                    "index": observation.get("index"),
-                    "request_id": observation.get("request_id"),
-                    "input_tokens": x,
-                    "output_tokens": output,
-                    "requests": requests,
-                    "value": y,
-                    "metric": metric,
-                    "dispersion": cell.get("summaries", {}).get(metric, {}).get("effective", {}),
-                    "token_timing_valid": observation.get("token_timing_valid", {}),
-                    "timing_semantics": observation.get("timing_semantics", {}),
-                }
-            )
+            expected = 'fixed_batch_decode_window' if kind == 'steady_decode' else 'paired_request_ttft'
+            if row['metric_source'] != expected:
+                raise FitError('incorrect training metric source')
+            result.append({
+                'cell_id': row['cell_id'], 'split': row['split'], 'repeat': row['repeat'], 'index': row['index'],
+                'input_tokens': row['input_tokens'], 'requests': row['concurrency'],
+                'kv_tokens': row['sum_decode_ctx_tokens'],
+                'value': _finite(row['effective'][metric], 'paired effective', nonnegative=False),
+                'metric': metric, 'dispersion': cell['training']['dispersion'],
+                'timing_semantics': {metric: expected}, 'token_timing_valid': {},
+            })
     return result
 
 
@@ -532,69 +507,46 @@ def _fit_or_unsupported(name: str, kind: str, metric: str, fit_fn: Any, samples:
 
 
 def fit_normalized(document: dict[str, Any], *, source_digest: str | None = None) -> dict[str, Any]:
-    if document.get("kind") == "train_target_statistics":
-        raise FitError("target statistics require C5 validated paired baseline subtraction before fitting")
-    if document.get("schema_version") != 1:
-        raise FitError("normalized document schema_version must be 1")
-    if document.get("status") != "succeeded":
-        raise FitError("cannot fit a normalized document with failures")
-    prefill = _prefill_observations(document, splits=FIT_SPLITS)
-    # C5 must validate the interval reference and paired window differences before
-    # opening the formal decode consumer. Historical whole-request TPOT is retired.
-    decode = []
-    decode_metric = "tpot_ms"
-    cached, cached_rejections = _cached_observations(document, metric="ttft_ms")
+    from normalize import SCHEMA_VERSION as NORMALIZED_SCHEMA, verify_normalized
+    if (document.get('kind') != 'normalized_campaign' or document.get('schema_version') != NORMALIZED_SCHEMA
+            or document.get('scope') != 'train' or document.get('status') != 'succeeded'
+            or document.get('fit_ready') is not True):
+        raise FitError('fitting requires a complete qualified current train artifact')
     try:
-        cached_candidate = _cached_surface_fit(cached, metric="ttft_ms", document=document)
-    except FitError as exc:
-        normalized_source = document.get("source", {})
-        cached_candidate = {
-            "name": "cached_prefill_surface",
-            "status": "unsupported",
-            "kind": "cached_prefill",
-            "metric": "ttft_ms",
-            "timing_semantics": "black_box_effective",
-            "duration_semantics": "effective_wall_including_uncached_tail_required",
-            "reason": str(exc),
-            "rejected_evidence": cached_rejections,
-            "source": {
-                "cache_policy": normalized_source.get("cache_policy") if isinstance(normalized_source, dict) else None,
-                "block_alignment": (
-                    normalized_source.get("cache_policy", {}).get("block_alignment")
-                    if isinstance(normalized_source, dict) and isinstance(normalized_source.get("cache_policy"), dict)
-                    else None
-                ),
-                "target_identity": normalized_source.get("target_identity") if isinstance(normalized_source, dict) else None,
-                "source_digests": normalized_source.get("source_digests") if isinstance(normalized_source, dict) else None,
-                "source_cells": sorted({sample.get("cell_id") for sample in cached if sample.get("cell_id")}),
-            },
-        }
+        verify_normalized(document)
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        raise FitError(f'training evidence verification failed: {exc}') from exc
+    prefill = _training_observations(document, kind='cold_prefill', metric='ttft_ms')
+    decode = _training_observations(document, kind='steady_decode', metric='tpot_ms')
     candidates = [
-        _fit_or_unsupported("cold_prefill_piecewise_linear", "cold_prefill", "ttft_ms", _piecewise_fit, prefill),
-        _fit_or_unsupported("decode_additive", "steady_decode", decode_metric, _additive_fit, decode),
-        _fit_or_unsupported("decode_2d_surface", "steady_decode", decode_metric, _surface_fit, decode),
-        cached_candidate,
+        _fit_or_unsupported('cold_prefill_piecewise_linear', 'cold_prefill', 'ttft_ms', _piecewise_fit, prefill),
+        _fit_or_unsupported('decode_additive', 'steady_decode', 'tpot_ms', _additive_fit, decode),
+        _fit_or_unsupported('decode_2d_surface', 'steady_decode', 'tpot_ms', _surface_fit, decode),
+        {'name': 'cached_prefill_surface', 'kind': 'cached_prefill', 'metric': 'ttft_ms',
+         'status': 'unsupported', 'reason': 'cached training integration deferred to C8'},
     ]
-    normalized_source = document.get("source", {})
-    if not isinstance(normalized_source, dict):
-        normalized_source = {}
-    for candidate in candidates:
-        source = candidate.setdefault("source", {})
-        source["artifact_digests"] = normalized_source.get("source_digests")
-        source["target_identity"] = normalized_source.get("target_identity")
-        source["cache_policy"] = normalized_source.get("cache_policy")
+    failures = [c['name'] for c in candidates if c['status'] != 'fitted'
+                and ((c['kind'] == 'steady_decode' and decode) or (c['kind'] == 'cold_prefill' and prefill))]
+    normalized_source = document['source']
+    fitter_sources = {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+                     for name in ('fit.py', 'steady_state.py')}
+    if source_digest is None:
+        source_digest = hashlib.sha256((json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + '\n').encode()).hexdigest()
     return {
         "schema_version": SCHEMA_VERSION,
         "campaign_id": document.get("campaign_id"),
-        "status": "succeeded",
+        "status": "invalid" if failures else "succeeded",
+        "failures": failures,
         "source": {
             "normalized_sha256": source_digest,
             "normalized_campaign_id": document.get("campaign_id"),
+            "normalized_schema_version": document['schema_version'],
+            "training": normalized_source,
+            "fitter_sources": fitter_sources,
             "fit_splits": list(FIT_SPLITS),
             "validation_splits": list(VALIDATION_SPLITS),
             "held_out_splits": list(HELD_OUT_SPLITS),
             "held_out_fit_policy": "excluded",
-            "artifact_digests": normalized_source.get("source_digests"),
         },
         "candidates": candidates,
         "validation": {"status": "pending", "split": list(VALIDATION_SPLITS)},
@@ -637,7 +589,7 @@ def main() -> int:
         print(f"fit error: {exc}", file=sys.stderr)
         return 2
     print(json.dumps({key: fitted[key] for key in ("campaign_id", "status")}, sort_keys=True))
-    return 0
+    return 0 if fitted['status'] == 'succeeded' else 1
 
 
 if __name__ == "__main__":

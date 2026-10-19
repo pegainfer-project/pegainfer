@@ -248,5 +248,5 @@
     "artifact_root": "artifacts"
   },
   "kind": "campaign_spec",
-  "schema_version": 6
+  "schema_version": 7
 }
