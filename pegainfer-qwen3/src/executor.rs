@@ -3214,6 +3214,9 @@ struct LocalQwen3Lane {
     kv_buffer: KvBuffer,
     layout: KvLayout,
     sample_scratch: pegainfer_sample::SampleScratch,
+    /// The attention plan every unified step of an uncompiled GQA group refills
+    /// in place; `None` for a compiled group (see `unified_attention_plan`).
+    unified_plan: Option<ops::PrefillPagedPlan>,
     /// Request-local decode steps handed to `select_batch`, reused across
     /// steps to keep the sampling hot path allocation-free. All zeros until
     /// the scheduler wires generated counts through (sampling-parity 1b).
@@ -3310,12 +3313,15 @@ impl LocalQwen3Lane {
             model.config().decodable_vocab,
             max_bucket,
         )?;
+        let unified_plan =
+            model.unified_attention_plan(max_prefill_tokens, max_bucket, buf_layout.page_size)?;
         Ok(Self {
             model,
             kv_buffer,
             layout,
             bufs,
             sample_scratch,
+            unified_plan,
             steps_buf: Vec::new(),
             max_prefill_tokens,
             inflight_prefill: None,
@@ -3925,6 +3931,7 @@ impl LocalQwen3Lane {
             decode_views,
             decode_lora_adapters,
             &mut self.bufs,
+            self.unified_plan.as_mut(),
             self.kv_buffer.buffer(),
             &self.layout,
         )

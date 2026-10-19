@@ -4,6 +4,7 @@
 //! kernel, use BatchPrefill for every row; Pin/PerToken route decode rows through the decode
 //! attention ops, keeping a unified decode row on the same kernel path as a pure decode step.
 
+use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
@@ -126,6 +127,15 @@ impl Qwen3Model {
         )];
         let prefill_adapters: Vec<Option<&str>> = vec![None; num_prefill_reqs];
 
+        // The lane allocates this plan after the KV pool and keeps it, so the
+        // sampled peak has to hold it at the same capacity.
+        let mut unified_plan = self.unified_attention_plan(
+            max_prefill_tokens,
+            num_prefill_reqs + profile_decode_rows,
+            page_size,
+        )?;
+        mark_peak()?;
+
         let logits = self.unified_step_with_peak(
             &prefill_tokens_list,
             &prefill_single_views,
@@ -134,6 +144,7 @@ impl Qwen3Model {
             &decode_views,
             &decode_adapters,
             decode_bufs,
+            unified_plan.as_mut(),
             kv_buffer.buffer(),
             &layout,
             mark_peak,
@@ -157,10 +168,48 @@ impl Qwen3Model {
         Ok(())
     }
 
+    /// The attention plan an uncompiled GQA group refills on every unified step
+    /// instead of allocating a fresh one. It is sized for the widest step
+    /// admission allows: `max_rows` rows (prefilling and decoding requests),
+    /// `max_prefill_tokens` prompt tokens plus one token per row, and a full
+    /// context of pages per row, since shared prefixes repeat pages across rows.
+    /// A compiled group decodes through its own kernel and gets none.
+    pub(crate) fn unified_attention_plan(
+        &self,
+        max_prefill_tokens: usize,
+        max_rows: usize,
+        page_size: usize,
+    ) -> Result<Option<PrefillPagedPlan>> {
+        if self.config.decode_group_is_compiled() {
+            return Ok(None);
+        }
+        let group = self.local_num_attention_heads() / self.local_num_key_value_heads();
+        let max_tokens = max_prefill_tokens
+            .checked_add(max_rows)
+            .context("unified attention plan token capacity overflows")?;
+        let max_pages = self
+            .config
+            .max_position_embeddings
+            .div_ceil(page_size)
+            .checked_mul(max_rows)
+            .context("unified attention plan page capacity overflows")?;
+        // A row splits into ceil(tokens * group / cta_tile_q) tiles, so rounding adds
+        // at most one tile per row to the total.
+        let max_tiles = max_tokens
+            .checked_mul(group)
+            .map(|rows| rows.div_ceil(PREFILL_ATTENTION_CTA_TILE_Q as usize))
+            .and_then(|tiles| tiles.checked_add(max_rows))
+            .context("unified attention plan tile capacity overflows")?;
+        PrefillPagedPlan::new_preallocated(&self.ctx, max_tokens, max_pages, max_rows, max_tiles)
+            .map(Some)
+    }
+
     /// Unified step: prefill + decode in one forward pass.
     ///
     /// Returns batched last-token logits `[logits_rows, n_prefill + n_decode]`:
     /// prefill request columns first (in request order), then decode columns.
+    /// `unified_plan` is the lane's [`Self::unified_attention_plan`]; when present
+    /// the step refills it in place of building a plan.
     pub(crate) fn unified_step(
         &self,
         prefill_prompts: &[&[u32]],
@@ -170,6 +219,7 @@ impl Qwen3Model {
         decode_views: &[KvView],
         decode_lora_adapters: &[Option<&str>],
         decode_bufs: &mut BatchDecodeBuffers,
+        unified_plan: Option<&mut PrefillPagedPlan>,
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
     ) -> Result<HiddenStates> {
@@ -182,6 +232,7 @@ impl Qwen3Model {
             decode_views,
             decode_lora_adapters,
             decode_bufs,
+            unified_plan,
             kv_buffer,
             layout,
             &mut mark_peak,
@@ -197,6 +248,7 @@ impl Qwen3Model {
         decode_views: &[KvView],
         decode_lora_adapters: &[Option<&str>],
         decode_bufs: &mut BatchDecodeBuffers,
+        unified_plan: Option<&mut PrefillPagedPlan>,
         kv_buffer: &CudaSlice<bf16>,
         layout: &KvLayout,
         mark_peak: &mut dyn FnMut() -> Result<()>,
@@ -263,6 +315,7 @@ impl Qwen3Model {
             NumericPolicy::Pin | NumericPolicy::PerToken
         ) && num_decode_reqs > 0
             && self.config.decode_group_is_compiled();
+        let fresh_plan;
         let plan = if split_decode_attention {
             let positions: Vec<i32> = decode_positions.iter().map(|&pos| pos as i32).collect();
             self.ctx
@@ -271,7 +324,7 @@ impl Qwen3Model {
             let decode_refs: Vec<&KvView> = decode_views.iter().collect();
             decode_bufs.sync_paged_meta(&self.ctx, &decode_refs, num_decode_reqs)?;
 
-            if num_prefill_reqs > 0 {
+            fresh_plan = if num_prefill_reqs > 0 {
                 let page_indices: Vec<Vec<i32>> = prefill_views
                     .iter()
                     .map(|v| v.page_indices().to_vec())
@@ -293,7 +346,8 @@ impl Qwen3Model {
                 )?)
             } else {
                 None
-            }
+            };
+            fresh_plan.as_ref()
         } else {
             // One attention plan over prefill requests + decode rows (qo_len=1,
             // start at the decode position so the row attends its full history).
@@ -311,17 +365,33 @@ impl Qwen3Model {
             start_positions.extend_from_slice(&decode_positions);
             let mut seq_lens = prefill_seq_lens.clone();
             seq_lens.extend(std::iter::repeat_n(1, num_decode_reqs));
-            Some(PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
-                &self.ctx,
-                &page_indices,
-                &last_page_lens,
-                &start_positions,
-                &seq_lens,
-                self.local_num_attention_heads(),
-                self.local_num_key_value_heads(),
-                self.config.head_dim,
-                PREFILL_ATTENTION_CTA_TILE_Q,
-            )?)
+            if let Some(plan) = unified_plan {
+                plan.update_batch_with_cta_tile_q(
+                    &self.ctx,
+                    &page_indices,
+                    &last_page_lens,
+                    &start_positions,
+                    &seq_lens,
+                    self.local_num_attention_heads(),
+                    self.local_num_key_value_heads(),
+                    self.config.head_dim,
+                    PREFILL_ATTENTION_CTA_TILE_Q,
+                )?;
+                Some(&*plan)
+            } else {
+                fresh_plan = Some(PrefillPagedPlan::from_raw_batch_with_cta_tile_q(
+                    &self.ctx,
+                    &page_indices,
+                    &last_page_lens,
+                    &start_positions,
+                    &seq_lens,
+                    self.local_num_attention_heads(),
+                    self.local_num_key_value_heads(),
+                    self.config.head_dim,
+                    PREFILL_ATTENTION_CTA_TILE_Q,
+                )?);
+                fresh_plan.as_ref()
+            }
         };
         mark_peak()?;
 
@@ -329,7 +399,7 @@ impl Qwen3Model {
         let hidden = self.unified_layers_with_peak(
             hidden,
             total_tokens,
-            plan.as_ref(),
+            plan,
             decode_bufs,
             split_decode_attention,
             total_prefill,
