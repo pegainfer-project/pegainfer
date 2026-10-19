@@ -27,6 +27,8 @@ use pegainfer_core::ops::call_spec::rms_norm_batch_call;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_spec::silu_mul_fused_batch_call;
 #[cfg(feature = "kernel-call-trace")]
+use pegainfer_core::ops::call_spec::suppress_logits_call;
+#[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_spec::{self};
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_core::ops::call_trace;
@@ -35,10 +37,10 @@ use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_kernels::tensor::AxisTag;
 use pegainfer_kernels::tensor::Hidden;
-use pegainfer_kernels::tensor::InDim;
 use pegainfer_kernels::tensor::Intermediate;
 use pegainfer_kernels::tensor::OutTotal;
 use pegainfer_kernels::tensor::QDim;
+#[cfg(feature = "kernel-call-trace")]
 use pegainfer_kernels::tensor::Vocab;
 
 use crate::batch_decode_buffers::BatchDecodeBuffers;
@@ -416,11 +418,32 @@ impl<'a> BatchDecodeDag<'a> {
     pub(crate) fn lm_head(
         &self,
         label: DagLabel,
-        weight: &DeviceMatrix,
         x: &HiddenStates,
         out: &mut HiddenStates,
-    ) {
-        self.gemm::<Vocab, InDim>(label, weight, x, out);
+    ) -> Result<()> {
+        #[cfg(feature = "kernel-call-trace")]
+        {
+            let config = &self.model.config;
+            let tail = config.logits_rows - config.decodable_vocab;
+            let tail_label = format!("{label}.tail_mask");
+            Self::record(gemm_rows_call::<Vocab>(
+                label,
+                config.vocab_size,
+                config.hidden_size,
+                config.logits_rows,
+                0,
+                x.seq_len,
+            ));
+            if tail > 0 {
+                Self::record(suppress_logits_call::<Vocab>(
+                    tail_label,
+                    config.logits_rows,
+                    x.seq_len,
+                    tail,
+                ));
+            }
+        }
+        self.model.project_logits(&self.model.ctx, x, out)
     }
 
     #[cfg(feature = "kernel-call-trace")]

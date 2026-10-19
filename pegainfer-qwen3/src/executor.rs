@@ -560,7 +560,7 @@ fn tune_decode_gemm_algos(
 
     let ctx = model.device_ctx();
     let hidden = model.config().hidden_size;
-    let vocab = model.config().vocab_size;
+    let logits_rows = model.config().logits_rows;
     let q_dim = model.local_q_dim();
     let kv_dim = model.local_kv_dim();
     let intermediate = model.local_intermediate_size();
@@ -573,7 +573,7 @@ fn tune_decode_gemm_algos(
             q_dim,
             kv_dim,
             intermediate,
-            vocab,
+            logits_rows,
         )?;
         let max_context = model.config().max_position_embeddings;
         log::info!(
@@ -623,7 +623,7 @@ fn tune_decode_gemm_algos(
         ops::gemm_lt_tune(ctx, &o_samples, hidden, n)?;
         ops::gemm_lt_tune(ctx, &gate_up_samples, intermediate, n)?;
         ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
-        ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
+        ops::gemm_lt_tune(ctx, &lm_head_samples, logits_rows, n)?;
     }
     Ok(())
 }
@@ -643,7 +643,7 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
     // Unified-N peak: one prefill chunk (≤ max_prefill_tokens) + (max_bucket−1) concurrent decoders;
     // rests on max_decode_batch_size == BATCH_BUCKETS.last().
     let ceiling = max_prefill_tokens + (*BATCH_BUCKETS.last().unwrap()).saturating_sub(1);
-    // lm_head (vocab×hidden) runs on the sampled-position count, not the token count: decode-only
+    // lm_head (logits_rows×hidden) runs on the sampled-position count, not the token count: decode-only
     // pads to a bucket (≤ max_decode_batch_size) and unified gathers ≤ that many requests, while
     // all-position scoring runs up to max_prefill_tokens — true max N = max(max_prefill, max_decode_batch).
     let lm_head_max_n = max_prefill_tokens.max(*BATCH_BUCKETS.last().unwrap());
@@ -652,7 +652,7 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
         q_dim,
         kv_dim,
         intermediate,
-        model.config().vocab_size,
+        model.config().logits_rows,
     );
     // Per-shape N upper bound, in the same lm_head-last order as `shapes`: the unified-N peak for
     // every projection, the sampled-position count for lm_head.
@@ -1266,8 +1266,11 @@ impl Qwen3Executor {
             let max_verify_batch = *BATCH_BUCKETS.last().unwrap();
             let (dflash_kv_bytes_per_token, hedge_scratch_pages) = match dflash_draft_path {
                 Some(path) => {
-                    let reservation =
-                        crate::dflash::DFlashMemoryReservation::from_path(path, max_verify_batch)?;
+                    let reservation = crate::dflash::DFlashMemoryReservation::from_path(
+                        path,
+                        model.config().logits_rows,
+                        max_verify_batch,
+                    )?;
                     memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
                         memory_options.kv_cache_memory_margin_bytes,
                         reservation.fixed_bytes,
@@ -2067,39 +2070,94 @@ impl Qwen3Executor {
         }
     }
 
-    fn wait_for_step_ack(
-        pending: Vec<channel::Receiver<Result<WorkerStepOutcome>>>,
-        op_name: &'static str,
-    ) -> Result<()> {
-        for recv in pending {
-            match recv
-                .recv()
-                .map_err(|_| anyhow::anyhow!("tensor-parallel {op_name} worker dropped"))??
-            {
-                WorkerStepOutcome::Ack => {}
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "tensor-parallel {op_name} worker returned unexpected payload: {}",
-                        other.kind()
-                    ));
-                }
-            }
+    /// A lost tensor-parallel rank can leave its peers in an unpaired NCCL collective,
+    /// where joining them, freeing device memory and exit's cudart teardown all block,
+    /// so that executor aborts like the pre-capture watchdog. A single rank reports the
+    /// loss and the engine shuts down.
+    fn rank_lost(&self, rank: usize, what: &str) -> anyhow::Error {
+        if !self.workers.is_empty() {
+            log::error!(
+                "FATAL: tensor-parallel rank {rank} {what}; aborting because its peers may be stuck in NCCL"
+            );
+            std::process::abort();
         }
-        Ok(())
+        worker_lost(format!("rank {rank} {what}"))
     }
 
     fn run_step(&self, step: &StepCommand) -> Result<WorkerStepOutcome> {
-        let primary = self.primary.run_step(step.clone(), true)?;
+        let primary = self
+            .primary
+            .run_step(step.clone(), true)
+            .map_err(|_| self.rank_lost(0, "step channel closed"))?;
         let mut pending = Vec::with_capacity(self.workers.len());
-        for worker in &self.workers {
-            pending.push(worker.run_step(step.clone(), false)?);
+        for (index, worker) in self.workers.iter().enumerate() {
+            let response = worker
+                .run_step(step.clone(), false)
+                .map_err(|_| self.rank_lost(index + 1, "step channel closed"))?;
+            pending.push(response);
         }
-        let primary_result = primary
-            .recv()
-            .map_err(|_| anyhow::anyhow!("primary worker dropped step response"))??;
-        Self::wait_for_step_ack(pending, step.kind())?;
-        Ok(primary_result)
+        await_step_responses(&primary, &pending, step.kind())
+            .map_err(|rank| self.rank_lost(rank, "dropped its step response"))?
     }
+}
+
+/// Rank 0's step response once every peer has acked, with all ranks watched at once: a
+/// rank that dies mid step can leave the others blocked in an unpaired collective, so
+/// its closed channel returns `Err(rank)` right away, rank 0 being the primary. An error
+/// from rank 0 returns at once, and a peer error as soon as rank 0 has responded.
+fn await_step_responses(
+    primary: &channel::Receiver<Result<WorkerStepOutcome>>,
+    peers: &[channel::Receiver<Result<WorkerStepOutcome>>],
+    op_name: &'static str,
+) -> std::result::Result<Result<WorkerStepOutcome>, usize> {
+    let mut primary_outcome = None;
+    let mut waiting: Vec<usize> = (0..peers.len()).collect();
+    let mut peer_error = None;
+    while primary_outcome.is_none() || !waiting.is_empty() {
+        let mut select = channel::Select::new();
+        let primary_op = primary_outcome.is_none().then(|| select.recv(primary));
+        let peer_ops: Vec<usize> = waiting
+            .iter()
+            .map(|&peer| select.recv(&peers[peer]))
+            .collect();
+        let op = select.select();
+        let index = op.index();
+        if primary_op == Some(index) {
+            match op.recv(primary) {
+                Ok(Ok(outcome)) => primary_outcome = Some(outcome),
+                Ok(Err(error)) => return Ok(Err(error)),
+                Err(_) => return Err(0),
+            }
+        } else {
+            let slot = peer_ops
+                .iter()
+                .position(|&op_index| op_index == index)
+                .expect("the selected operation is a registered peer");
+            let peer = waiting.remove(slot);
+            match op.recv(&peers[peer]) {
+                Ok(Ok(WorkerStepOutcome::Ack)) => {}
+                Ok(Ok(other)) => {
+                    peer_error.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "tensor-parallel {op_name} worker returned unexpected payload: {}",
+                            other.kind()
+                        )
+                    });
+                }
+                Ok(Err(error)) => {
+                    peer_error.get_or_insert(error);
+                }
+                Err(_) => return Err(peer + 1),
+            }
+        }
+        if primary_outcome.is_some()
+            && let Some(error) = peer_error.take()
+        {
+            return Ok(Err(error));
+        }
+    }
+    let outcome = primary_outcome.expect("the loop ends after rank 0 responds");
+    Ok(Ok(outcome))
 }
 
 fn profile_kv_budget_on_worker(
@@ -2790,7 +2848,7 @@ impl ModelExecutor for Qwen3Executor {
                     }
                     let rx = self.primary.resolve_prefill()?;
                     rx.recv().map_err(|_| {
-                        anyhow::anyhow!("worker dropped resolve_prefill on decode-error path")
+                        worker_lost("worker dropped resolve_prefill on decode-error path")
                     })??;
                     return Err(e);
                 }
@@ -3049,8 +3107,45 @@ impl ModelExecutor for Qwen3Executor {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::time::Duration;
 
+    use crossbeam_channel as channel;
+
+    use super::WorkerStepOutcome;
+    use super::await_step_responses;
     use super::ensure_lora_capacity;
+
+    type StepResponse = anyhow::Result<WorkerStepOutcome>;
+
+    /// The lost rank `await_step_responses` reports, failing instead of hanging if it blocks.
+    fn lost_rank_within_deadline(
+        primary: channel::Receiver<StepResponse>,
+        peer: channel::Receiver<StepResponse>,
+    ) -> Option<usize> {
+        let (done_tx, done_rx) = channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(await_step_responses(&primary, &[peer], "decode").err());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a closed rank channel must end the wait")
+    }
+
+    #[test]
+    fn a_dead_peer_is_seen_while_rank_zero_is_blocked() {
+        let (_rank_zero_blocked, primary) = channel::bounded::<StepResponse>(1);
+        let (dead_peer, peer) = channel::bounded::<StepResponse>(1);
+        drop(dead_peer);
+        assert_eq!(lost_rank_within_deadline(primary, peer), Some(1));
+    }
+
+    #[test]
+    fn a_dead_rank_zero_is_reported_as_rank_zero() {
+        let (dead_rank_zero, primary) = channel::bounded::<StepResponse>(1);
+        let (_peer_blocked, peer) = channel::bounded::<StepResponse>(1);
+        drop(dead_rank_zero);
+        assert_eq!(lost_rank_within_deadline(primary, peer), Some(0));
+    }
 
     #[test]
     fn lora_capacity_rejects_new_adapter_at_limit() {
@@ -3119,6 +3214,9 @@ struct LocalQwen3Lane {
     kv_buffer: KvBuffer,
     layout: KvLayout,
     sample_scratch: pegainfer_sample::SampleScratch,
+    /// The attention plan every unified step of an uncompiled GQA group refills
+    /// in place; `None` for a compiled group (see `unified_attention_plan`).
+    unified_plan: Option<ops::PrefillPagedPlan>,
     /// Request-local decode steps handed to `select_batch`, reused across
     /// steps to keep the sampling hot path allocation-free. All zeros until
     /// the scheduler wires generated counts through (sampling-parity 1b).
@@ -3201,7 +3299,7 @@ impl LocalQwen3Lane {
             model.local_q_dim(),
             model.local_kv_dim(),
             model.local_intermediate_size(),
-            model.config().vocab_size,
+            model.config().logits_rows,
             max_bucket,
             buf_layout.page_size,
             padding_block_id,
@@ -3209,17 +3307,21 @@ impl LocalQwen3Lane {
             model.config().max_position_embeddings,
             model.fused_decode_qkv(),
         )?;
-        let sample_scratch = pegainfer_sample::SampleScratch::new(
+        let sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
             model.device_ctx(),
-            model.config().vocab_size,
+            model.config().logits_rows,
+            model.config().decodable_vocab,
             max_bucket,
         )?;
+        let unified_plan =
+            model.unified_attention_plan(max_prefill_tokens, max_bucket, buf_layout.page_size)?;
         Ok(Self {
             model,
             kv_buffer,
             layout,
             bufs,
             sample_scratch,
+            unified_plan,
             steps_buf: Vec::new(),
             max_prefill_tokens,
             inflight_prefill: None,
@@ -3378,9 +3480,10 @@ impl LocalQwen3Lane {
         sample_seed: u64,
     ) -> Result<Vec<u32>> {
         if params.len() > self.sample_scratch.max_rows() {
-            self.sample_scratch = pegainfer_sample::SampleScratch::new(
+            self.sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
                 self.model.device_ctx(),
-                self.model.config().vocab_size,
+                self.model.config().logits_rows,
+                self.model.config().decodable_vocab,
                 params.len(),
             )?;
         }
@@ -3828,6 +3931,7 @@ impl LocalQwen3Lane {
             decode_views,
             decode_lora_adapters,
             &mut self.bufs,
+            self.unified_plan.as_mut(),
             self.kv_buffer.buffer(),
             &self.layout,
         )
@@ -4015,6 +4119,29 @@ impl WorkerStepOutcome {
     }
 }
 
+/// A rank's worker thread is gone (it panicked or exited), so the executor can
+/// never run another step. The scheduler reports it as fatal.
+#[derive(Debug)]
+pub(crate) struct WorkerLost(String);
+
+impl WorkerLost {
+    pub(crate) fn caused(error: &anyhow::Error) -> bool {
+        error.chain().any(<dyn std::error::Error>::is::<Self>)
+    }
+}
+
+impl std::fmt::Display for WorkerLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkerLost {}
+
+pub(crate) fn worker_lost(what: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(WorkerLost(what.into()))
+}
+
 struct RankWorker {
     tx: channel::Sender<WorkerCommand>,
     handle: Option<thread::JoinHandle<()>>,
@@ -4116,7 +4243,7 @@ impl RankWorker {
                 collect_result,
                 resp: resp_tx,
             })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
+            .map_err(|_| worker_lost("tensor-parallel worker step channel closed"))?;
         Ok(resp_rx)
     }
 
@@ -4151,7 +4278,7 @@ impl RankWorker {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::ResolvePrefill { resp: resp_tx })
-            .map_err(|_| anyhow::anyhow!("worker channel closed on resolve_prefill"))?;
+            .map_err(|_| worker_lost("worker channel closed on resolve_prefill"))?;
         Ok(resp_rx)
     }
 

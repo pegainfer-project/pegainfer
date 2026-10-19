@@ -35,8 +35,13 @@ pub(crate) struct DFlashMemoryReservation {
 }
 
 impl DFlashMemoryReservation {
-    pub(crate) fn from_path(draft_path: &str, max_decode_batch_size: usize) -> Result<Self> {
-        let config = DFlashConfig::from_file(draft_path)?;
+    pub(crate) fn from_path(
+        draft_path: &str,
+        logits_rows: usize,
+        max_decode_batch_size: usize,
+    ) -> Result<Self> {
+        let mut config = DFlashConfig::from_file(draft_path)?;
+        config.logits_rows = logits_rows;
         Self::from_config(&config, max_decode_batch_size)
     }
 
@@ -70,7 +75,7 @@ impl DFlashMemoryReservation {
         let dense_scratch_per_block_row = sizing::product(&[
             BF16,
             sizing::sum(&[
-                config.vocab_size,
+                config.logits_rows,
                 sizing::product(&[5, hidden])?,
                 sizing::product(&[2, q_dim])?,
                 sizing::product(&[3, inter])?,

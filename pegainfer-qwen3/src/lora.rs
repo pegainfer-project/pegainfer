@@ -789,10 +789,11 @@ mod tests {
             num_key_value_heads: 2,
             head_dim: 2,
             vocab_size: 16,
+            decodable_vocab: 16,
+            logits_rows: 16,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
             max_position_embeddings: 40960,
-            eos_token_id: 151_645,
             tie_word_embeddings: false,
             stop_token_ids: vec![151_645],
         }

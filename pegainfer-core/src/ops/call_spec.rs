@@ -119,6 +119,18 @@ pub fn gemm_rows_call<Out: AxisTag>(
         .attr("rows", rows.to_string())
 }
 
+/// In-place mask of the last `ids` rows of each logits column to -inf.
+pub fn suppress_logits_call<A: AxisTag>(
+    label: impl Into<String>,
+    rows: usize,
+    batch: usize,
+    ids: usize,
+) -> KernelCall {
+    KernelCall::new("suppress_logits_bf16", label)
+        .output("logits", hidden_batch::<A>(rows, batch))
+        .attr("ids", ids.to_string())
+}
+
 pub fn gemm_call<Out: AxisTag, In: AxisTag>(
     label: impl Into<String>,
     out_dim: usize,

@@ -21,8 +21,8 @@ use pegainfer_frontend::parallel::ParallelConfig;
 use pegainfer_kv_cache::BlockPool;
 use tokio::sync::mpsc;
 
+use crate::config::KIMI_K2_VOCAB;
 use crate::config::KimiK2ParallelShape;
-use crate::config::load_stop_token_ids;
 use crate::runner::affinity::pin_scheduler_thread;
 use crate::runner::config::KimiK2RunnerConfig;
 use crate::runner::executor::ForwardExecutor;
@@ -150,7 +150,8 @@ fn start_engine_tp8_dp1(
         KimiK2ParallelShape::tp8_ep8(),
         KIMI_TP8_KV_POOL_PAGES,
     )?;
-    let stop_token_ids = load_stop_token_ids(model_path)?;
+    let stop_token_ids = pegainfer_core::eos::eos_token_ids(model_path, KIMI_K2_VOCAB)?;
+    info!("stop tokens: {stop_token_ids:?}");
     let executor = build_tp8_dp1_executor(&config)?;
     let pool = BlockPool::new(KIMI_KV_PAGE_SIZE, config.kv_pool_pages)?;
 
@@ -198,7 +199,8 @@ fn start_engine_tp1_dp8(
         KimiK2ParallelShape::tp1_dp8(),
         KIMI_DP_KV_POOL_PAGES_PER_RANK,
     )?;
-    let stop_token_ids = load_stop_token_ids(model_path)?;
+    let stop_token_ids = pegainfer_core::eos::eos_token_ids(model_path, KIMI_K2_VOCAB)?;
+    info!("stop tokens: {stop_token_ids:?}");
     let executors = build_tp1_dp8_executors(&config)?;
     let pools = (0..dp_world)
         .map(|_| BlockPool::new(KIMI_KV_PAGE_SIZE, config.kv_pool_pages))

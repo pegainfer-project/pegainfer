@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -16,6 +17,8 @@ use pegainfer_frontend::engine::LoadLoraAdapterRequest;
 use pegainfer_frontend::engine::LoraClient;
 use pegainfer_frontend::engine::LoraControlError;
 use pegainfer_frontend::engine::RejectReason;
+use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::StepReceiver;
@@ -24,6 +27,7 @@ use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 
 use super::start_with_executor;
 use crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS;
+use crate::scheduler::test_support::AsyncPrefillGate;
 use crate::scheduler::test_support::FakeExecutor;
 use crate::scheduler::test_support::request;
 use crate::scheduler::test_support::request_with_lora;
@@ -106,18 +110,16 @@ impl StepCollector {
     }
 
     /// Drain the remaining stream (until the scheduler is gone) and return
-    /// every terminal seen for `id`. For asserting silence after an abort.
-    fn drain_terminals_for(&mut self, id: RequestId) -> Vec<Terminal> {
-        let mut terminals: Vec<Terminal> = self
-            .buffered
-            .remove(&id)
-            .unwrap_or_default()
-            .into_iter()
+    /// every terminal seen for `ids`. For asserting silence after an abort.
+    fn drain_terminals_for(&mut self, ids: &[RequestId]) -> Vec<Terminal> {
+        let mut terminals: Vec<Terminal> = ids
+            .iter()
+            .flat_map(|id| self.buffered.remove(id).unwrap_or_default())
             .filter_map(|update| update.terminal)
             .collect();
         while let Some(step) = self.steps.blocking_recv() {
             for update in step.updates {
-                if update.id == id
+                if ids.contains(&update.id)
                     && let Some(terminal) = update.terminal
                 {
                     terminals.push(terminal);
@@ -272,6 +274,26 @@ fn decode_error_fails_the_request_and_scheduler_recovers() {
 }
 
 #[test]
+fn lost_worker_ends_the_scheduler() {
+    let executor = FakeExecutor::new(4, Arc::new(Mutex::new(Vec::new()))).with_worker_lost();
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    let doomed = partition.handle.submit(request(16, 2));
+    let (_, terminal) = steps.collect_terminal(doomed.id());
+    match terminal {
+        Terminal::Failed { message, .. } => assert!(
+            message.contains("engine fatal") && message.contains("fake rank worker exited"),
+            "a lost worker should fail requests as fatal, got {message}"
+        ),
+        other => panic!("a lost worker should surface as Terminal::Failed, got {other:?}"),
+    }
+    assert!(
+        wait_until(Duration::from_secs(1), || partition.join.is_finished()),
+        "the scheduler must stop once a rank worker is gone"
+    );
+}
+
+#[test]
 fn same_step_finishes_all_reach_their_terminals() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let executor = FakeExecutor::new(8, Arc::clone(&dropped));
@@ -368,10 +390,76 @@ fn aborted_request_retires_silently_and_frees_engine_state() {
     // The abort is the frontend's own act; the scheduler answers with
     // silence, not a terminal. Drain to engine shutdown to prove it.
     drop(partition.handle);
-    let terminals = steps.drain_terminals_for(control.id());
+    let terminals = steps.drain_terminals_for(&[control.id()]);
     assert!(
         terminals.is_empty(),
         "aborted request must not receive a terminal: {terminals:?}"
+    );
+    partition.join.join().expect("scheduler thread exits");
+}
+
+/// Admission takes many prompts at once while the chunk budget runs one per
+/// step, so a mass disconnect leaves admitted prompts waiting for a chunk.
+/// Those retire before their chunk instead of after it.
+#[test]
+fn aborted_prompts_waiting_for_a_prefill_chunk_never_prefill() {
+    let gate = Arc::new(AsyncPrefillGate::default());
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let executor =
+        FakeExecutor::new(512, Arc::clone(&dropped)).with_async_prefill(Arc::clone(&gate));
+    gate.hold_call.store(1, Ordering::SeqCst);
+    gate.hold_prefill.store(true, Ordering::SeqCst);
+    let (partition, _lora, mut steps) = launch(executor, false);
+
+    // Three prompts queue while the first one's prefill holds.
+    let first = partition
+        .handle
+        .submit(request(DEFAULT_MAX_PREFILL_TOKENS, 1));
+    assert!(wait_until(Duration::from_secs(5), || {
+        gate.prefill_calls.load(Ordering::SeqCst) == 1
+    }));
+    let queued: Vec<_> = (0..3)
+        .map(|_| {
+            partition
+                .handle
+                .submit(request(DEFAULT_MAX_PREFILL_TOKENS, 4))
+        })
+        .collect();
+
+    // The next step admits all three and its budget runs only the first,
+    // which now holds; the other two are admitted and waiting for a chunk.
+    gate.hold_call.store(2, Ordering::SeqCst);
+    assert!(wait_until(Duration::from_secs(5), || {
+        gate.prefill_calls.load(Ordering::SeqCst) == 2
+    }));
+    for control in &queued {
+        control.abort();
+    }
+    gate.hold_prefill.store(false, Ordering::SeqCst);
+
+    let aborted: Vec<RequestId> = queued.iter().map(RequestControl::id).collect();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let dropped = dropped.lock().unwrap();
+            aborted.iter().all(|id| dropped.contains(&id.raw()))
+        }),
+        "every aborted request is dropped"
+    );
+    assert_eq!(
+        gate.prefill_calls.load(Ordering::SeqCst),
+        2,
+        "the prompts still waiting for a chunk must retire without prefilling"
+    );
+    let (_, terminal) = steps.collect_terminal(first.id());
+    assert!(
+        matches!(terminal, Terminal::Finished { .. }),
+        "the request ahead of them finishes normally: {terminal:?}"
+    );
+    drop(partition.handle);
+    let terminals = steps.drain_terminals_for(&aborted);
+    assert!(
+        terminals.is_empty(),
+        "aborted requests must not receive a terminal: {terminals:?}"
     );
     partition.join.join().expect("scheduler thread exits");
 }
@@ -442,4 +530,90 @@ fn lora_control_waits_until_scheduler_idle() {
         .expect("join load thread")
         .expect_err("adapter load should be a stub error");
     assert!(matches!(error, LoraControlError::Failed(_)));
+}
+
+/// `first` prefills alone, then decodes beside `launched`, whose prefill stays
+/// parked on the overlap stream while `arrivals` are admitted. Every request
+/// must finish once that prefill lands.
+fn assert_arrivals_during_inflight_prefill_finish(
+    executor: FakeExecutor,
+    first: Request,
+    launched: Request,
+    arrivals: Vec<Request>,
+) {
+    let gate = Arc::new(AsyncPrefillGate::default());
+    gate.hold_prefill.store(true, Ordering::SeqCst);
+    let executor = executor.with_async_prefill(Arc::clone(&gate));
+    // A 16-token step budget keeps `launched` out of `first`'s prefill step.
+    let mut engine = start_with_executor(executor, 42, 16, false);
+    let mut scheduler = engine.schedulers.remove(0);
+    let mut steps = StepCollector::new(
+        scheduler
+            .handle
+            .take_steps()
+            .expect("a fresh scheduler yields its step stream once"),
+    );
+
+    let mut controls = vec![
+        scheduler.handle.submit(first),
+        scheduler.handle.submit(launched),
+    ];
+    gate.hold_prefill.store(false, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(5), || gate
+            .launches
+            .load(Ordering::SeqCst)
+            == 1),
+        "the second request's prefill never ran beside a decode"
+    );
+    controls.extend(arrivals.into_iter().map(|req| scheduler.handle.submit(req)));
+    // Only steps with a prefill in flight poll; the third one starts after a
+    // step that drained the arrivals has finished admitting them.
+    let polls = gate.polls.load(Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(5), || gate.polls.load(Ordering::SeqCst)
+            >= polls + 3),
+        "the scheduler stopped stepping while the prefill was in flight"
+    );
+    gate.open.store(true, Ordering::SeqCst);
+
+    for (index, control) in controls.iter().enumerate() {
+        let (_, terminal) = steps.collect_terminal(control.id());
+        assert!(
+            matches!(
+                terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Length,
+                    ..
+                }
+            ),
+            "request {index} did not finish: {terminal:?}"
+        );
+    }
+}
+
+#[test]
+fn arrivals_during_inflight_prefill_leave_its_decode_slot() {
+    // Two slots: the in-flight request owns one, so the second arrival waits.
+    let executor =
+        FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_max_decode_batch_size(2);
+    assert_arrivals_during_inflight_prefill_finish(
+        executor,
+        request(16, 2),
+        request(16, 4),
+        vec![request(16, 4), request(16, 4)],
+    );
+}
+
+#[test]
+fn arrivals_during_inflight_prefill_leave_its_kv_tail() {
+    // Five blocks: the in-flight request holds one and is owed two more, so an
+    // arrival needing three waits for it to finish.
+    let executor = FakeExecutor::new(5, Arc::new(Mutex::new(Vec::new())));
+    assert_arrivals_during_inflight_prefill_finish(
+        executor,
+        request(16, 2),
+        request(16, 32),
+        vec![request(16, 32)],
+    );
 }

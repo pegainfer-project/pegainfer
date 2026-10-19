@@ -2,6 +2,7 @@
 //! reads, and the Gated DeltaNet decode step over
 //! `csrc/qwen35/{gated_delta_rule,conv1d}.cu`.
 
+use anyhow::Context as _;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -13,6 +14,7 @@ use super::attention::PagedGeometry;
 use super::attention::checked_paged_geometry;
 use crate::ffi;
 use crate::paged_kv::PagedKvLayout;
+use crate::tensor::Columns;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
@@ -250,6 +252,139 @@ pub fn paged_attention_batch_decode_hd256_into(
     Ok(())
 }
 
+/// Split-KV variant of [`paged_attention_batch_decode_hd256_into`]: the KV range
+/// is divided across `split_kv` CTAs per (kv head, request) and the partial
+/// softmax states are merged by a second kernel. The caller owns the scratch
+/// buffers and must size them for `[split_kv, batch_size, num_qo_heads, 256]`
+/// (f32) and `[split_kv, batch_size, num_qo_heads]` (f32, twice).
+///
+/// It wins where the FlashInfer path starves the device: the split grid turns a
+/// single-request decode from 4 CTAs into `4 * split_kv`. The kernel is shaped
+/// for Qwen3.5-4B's GQA group (16 query heads over 4 kv heads at head_dim 256)
+/// and refuses other geometries rather than serving a wrong answer.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_batch_decode_split_hd256_into(
+    ctx: &DeviceContext,
+    q: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    page_indices_d: &CudaSlice<i32>,
+    page_indptr_d: &CudaSlice<i32>,
+    last_page_len_d: &CudaSlice<i32>,
+    positions_d: &CudaSlice<i32>,
+    request_indices_d: &CudaSlice<i32>,
+    kv_chunk_size_d: &CudaSlice<i32>,
+    partial_o: &mut CudaSlice<f32>,
+    partial_m: &mut CudaSlice<f32>,
+    partial_l: &mut CudaSlice<f32>,
+    output: &mut HiddenStates,
+    num_qo_heads: usize,
+    batch_size: usize,
+    split_kv: usize,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    let page_size = layout.page_size;
+
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "batch hd256 split decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
+
+    let partial_elems = split_kv
+        .checked_mul(batch_size)
+        .and_then(|n| n.checked_mul(num_qo_heads))
+        .context("split decode partial buffer shape overflow")?;
+    anyhow::ensure!(
+        split_kv >= 1
+            && partial_o.len() >= partial_elems * head_dim
+            && partial_m.len() >= partial_elems
+            && partial_l.len() >= partial_elems,
+        "split decode scratch too small: splits={split_kv}, bs={batch_size}, heads={num_qo_heads}, \
+         dim={head_dim}, o={}, m={}, l={}",
+        partial_o.len(),
+        partial_m.len(),
+        partial_l.len()
+    );
+
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = page_indptr_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (po_ptr, _gpo) = partial_o.device_ptr_mut(&ctx.stream);
+    let (pm_ptr, _gpm) = partial_m.device_ptr_mut(&ctx.stream);
+    let (pl_ptr, _gpl) = partial_l.device_ptr_mut(&ctx.stream);
+
+    let stream = crate::tensor::active_cu_stream(ctx);
+
+    // The current token's K/V has to be in the pool before the read, exactly as
+    // the non-split path orders it.
+    scatter_decode_kv_into_paged(
+        ctx,
+        k,
+        v,
+        kv_buffer,
+        layout,
+        layer,
+        page_indices_d,
+        page_indptr_d,
+        last_page_len_d,
+        positions_d,
+        request_indices_d,
+        batch_size,
+        "batch hd256 split decode",
+    )?;
+
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let result = unsafe {
+        ffi::paged_attention_decode_split_hd256_cuda(
+            q_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            kcs_ptr as *const i32,
+            po_ptr as *mut f32,
+            pm_ptr as *mut f32,
+            pl_ptr as *mut f32,
+            num_qo_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            page_size as i32,
+            batch_size as i32,
+            split_kv as i32,
+            stride_page,
+            sm_scale,
+            stream,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "paged_attention_decode_split_hd256_cuda failed with error {result}{}",
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     ctx: &DeviceContext,
@@ -385,12 +520,15 @@ pub const LINEAR_CONV_MAX_KERNEL_DIM: usize = 4;
 /// Head dims must be the baked-in ones ([`GDN_AOT_KEY_HEAD_DIM`],
 /// [`GDN_AOT_VALUE_HEAD_DIM`]); head counts are free, so a different value-head
 /// count needs no rebuild.
+///
+/// `b_proj` and `a_proj` may each be one band of a fused beta/alpha projection;
+/// their slot stride is then the tensor they are a band of.
 #[allow(clippy::too_many_arguments)]
-pub fn gated_delta_rule_decode_batch_into(
+pub fn gated_delta_rule_decode_batch_into<'a>(
     ctx: &DeviceContext,
     qkv: &HiddenStates,
-    b_proj: &HiddenStates,
-    a_proj: &HiddenStates,
+    b_proj: impl Into<Columns<'a>>,
+    a_proj: impl Into<Columns<'a>>,
     dt_bias: &DeviceVec,
     a_log: &CudaSlice<f32>,
     state_ptrs: &CudaSlice<u64>,
@@ -401,9 +539,13 @@ pub fn gated_delta_rule_decode_batch_into(
     key_dim: usize,
     val_dim: usize,
 ) {
+    let b_proj = b_proj.into();
+    let a_proj = a_proj.into();
+    b_proj.assert_in_row("gated_delta_rule_decode b_proj");
+    a_proj.assert_in_row("gated_delta_rule_decode a_proj");
     assert_eq!(qkv.seq_len, batch_size);
-    assert_eq!(b_proj.seq_len, batch_size);
-    assert_eq!(a_proj.seq_len, batch_size);
+    assert_eq!(b_proj.states.seq_len, batch_size);
+    assert_eq!(a_proj.states.seq_len, batch_size);
     assert_eq!(output.seq_len, batch_size);
     assert!(
         num_key_heads > 0 && num_value_heads > 0 && num_value_heads.is_multiple_of(num_key_heads),
@@ -414,8 +556,8 @@ pub fn gated_delta_rule_decode_batch_into(
         qkv.hidden_dim,
         2 * num_key_heads * key_dim + num_value_heads * val_dim
     );
-    assert_eq!(b_proj.hidden_dim, num_value_heads);
-    assert_eq!(a_proj.hidden_dim, num_value_heads);
+    assert_eq!(b_proj.width, num_value_heads);
+    assert_eq!(a_proj.width, num_value_heads);
     assert_eq!(output.hidden_dim, num_value_heads * val_dim);
     assert_eq!(dt_bias.len, num_value_heads);
     assert_eq!(a_log.len(), num_value_heads);
@@ -423,9 +565,11 @@ pub fn gated_delta_rule_decode_batch_into(
     assert_eq!(val_dim, GDN_AOT_VALUE_HEAD_DIM);
     assert!(state_ptrs.len() >= batch_size);
 
+    let (b_base, _gb) = b_proj.states.data.device_ptr(&ctx.stream);
+    let b_ptr = b_base + (b_proj.col * std::mem::size_of::<bf16>()) as u64;
+    let (a_base, _ga) = a_proj.states.data.device_ptr(&ctx.stream);
+    let a_ptr = a_base + (a_proj.col * std::mem::size_of::<bf16>()) as u64;
     let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
-    let (b_ptr, _gb) = b_proj.data.device_ptr(&ctx.stream);
-    let (a_ptr, _ga) = a_proj.data.device_ptr(&ctx.stream);
     let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
     let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
     let (state_ptrs, _gsp) = state_ptrs.device_ptr(&ctx.stream);
@@ -445,6 +589,8 @@ pub fn gated_delta_rule_decode_batch_into(
             num_value_heads as i32,
             key_dim as i32,
             val_dim as i32,
+            b_proj.states.hidden_dim as i32,
+            a_proj.states.hidden_dim as i32,
             ctx.stream.cu_stream(),
         );
     }
@@ -460,23 +606,30 @@ pub fn gated_delta_rule_decode_batch_into(
 /// `x`, so `kernel_size` must not exceed [`LINEAR_CONV_MAX_KERNEL_DIM`]. `out` is
 /// `silu(bf16(conv))`, rounded exactly like the reference (`conv1d` then `silu` in
 /// bf16), not a fused `silu(sum)`.
-pub fn conv1d_decode_batch_into(
+///
+/// Slots of the conv input stride by the tensor's own row width, so `x` may be
+/// the qkv band of a fused qkv+z projection. The conv output is this operator's
+/// own buffer and keeps the band's width as its slot stride.
+pub fn conv1d_decode_batch_into<'a>(
     ctx: &DeviceContext,
-    x: &HiddenStates,
+    x: impl Into<Columns<'a>>,
     conv_weight: &DeviceVec,
     conv_state_ptrs: &CudaSlice<u64>,
     out: &mut HiddenStates,
     kernel_size: usize,
 ) {
-    let batch_size = x.seq_len;
-    let num_channels = x.hidden_dim;
+    let x = x.into();
+    x.assert_in_row("conv1d_decode x");
+    let batch_size = x.states.seq_len;
+    let num_channels = x.width;
     assert_eq!(out.hidden_dim, num_channels);
     assert_eq!(out.seq_len, batch_size);
     assert_eq!(conv_weight.len, num_channels * kernel_size);
     assert!(kernel_size <= LINEAR_CONV_MAX_KERNEL_DIM);
     assert!(conv_state_ptrs.len() >= batch_size);
 
-    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.states.data.device_ptr(&ctx.stream);
+    let x_ptr = x_ptr + (x.col * std::mem::size_of::<bf16>()) as u64;
     let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
     let (s_ptrs, _gs) = conv_state_ptrs.device_ptr(&ctx.stream);
     let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
@@ -488,6 +641,7 @@ pub fn conv1d_decode_batch_into(
             s_ptrs as *const u64,
             o_ptr as *mut ffi::Half,
             num_channels as i32,
+            x.states.hidden_dim as i32,
             batch_size as i32,
             kernel_size as i32,
             ctx.stream.cu_stream(),

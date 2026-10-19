@@ -6,6 +6,8 @@ name: Needs rebase
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "47 */6 * * *"
   workflow_call:
     inputs:
       pr:
@@ -55,11 +57,17 @@ jobs:
               return pulls;
             }
 
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            // Mergeability can lag a push to main without reading UNKNOWN, so label from a second read.
+            await openPulls();
+            await sleep(60_000);
+
             let unknown = null;
             for (let attempt = 0; attempt < 10; attempt++) {
               if (unknown) {
                 core.info(`Mergeability not computed yet for ${[...unknown].join(', ')}, retrying in 30 s`);
-                await new Promise((resolve) => setTimeout(resolve, 30_000));
+                await sleep(30_000);
               }
               const pulls = (await openPulls()).filter(
                 (pr) => (only === null || pr.number === only) && (unknown === null || unknown.has(pr.number)),

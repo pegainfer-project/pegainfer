@@ -46,7 +46,6 @@ pub(crate) struct TextConfig {
     rope_parameters: RopeParameters,
     max_position_embeddings: Option<usize>,
     tie_word_embeddings: Option<bool>,
-    eos_token_id: u32,
 }
 
 /// Raw Qwen3.5 config as deserialized from `config.json`. Held only long enough
@@ -81,7 +80,8 @@ pub(crate) struct Config35 {
     pub(crate) num_hidden_layers: usize,
     pub(crate) vocab_size: usize,
     pub(crate) rms_norm_eps: f32,
-    pub(crate) eos_token_id: u32,
+    /// The checkpoint's EOS set, resolved in [`Config35::from_file`].
+    pub(crate) eos_token_ids: Vec<u32>,
 
     // Full attention params
     pub(crate) num_attention_heads: usize,
@@ -121,7 +121,8 @@ impl Config35 {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
         let raw: RawConfig = serde_json::from_str(&content)?;
-        let config = Self::try_from(raw)?;
+        let mut config = Self::try_from(raw)?;
+        config.eos_token_ids = pegainfer_core::eos::eos_token_ids(model_path, config.vocab_size)?;
         Ok(config)
     }
 
@@ -171,15 +172,9 @@ impl Config35 {
                 vocab_size: self.vocab_size,
             });
         }
-        // The logits GEMM's M dimension and the output matrix's leading
-        // dimension both take this width; an unaligned value (Qwen3.5-4B's
-        // tokenizer decodes 248077) forces cublasLt onto an align-1 sm_75-era
-        // kernel that costs ~1.7 ms/decode-step on sm_80. Round the GEMM width
-        // up to the tile-aligned multiple — the checkpoint's remaining rows are
-        // real trained embeddings and stay inside the mapped weight.
-        let aligned = effective_vocab.next_multiple_of(128);
         self.decodable_vocab = effective_vocab;
-        self.selection_vocab = aligned.min(self.vocab_size);
+        self.selection_vocab =
+            pegainfer_core::decodable_vocab::aligned_logits_rows(effective_vocab, self.vocab_size);
         Ok(())
     }
 }
@@ -280,7 +275,7 @@ impl TryFrom<RawConfig> for Config35 {
             num_hidden_layers: t.num_hidden_layers,
             vocab_size: t.vocab_size,
             rms_norm_eps: t.rms_norm_eps as f32,
-            eos_token_id: t.eos_token_id,
+            eos_token_ids: Vec::new(),
             num_attention_heads: t.num_attention_heads,
             num_key_value_heads: t.num_key_value_heads,
             head_dim: t.head_dim,

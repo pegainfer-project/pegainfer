@@ -367,28 +367,40 @@ pub(crate) fn admitted_future_blocks<E: ModelExecutor>(
     executor: &E,
     active: &[ActiveRequestState],
     prefilling: &[PendingRequest],
+    inflight: &[PendingRequest],
 ) -> usize {
     let block_size = executor.block_size();
     active_future_blocks(active, block_size)
-        + prefilling_future_blocks(prefilling, block_size, |id| executor.prefetched_blocks(id))
+        + prefilling_future_blocks(prefilling, inflight, block_size, |id| {
+            executor.prefetched_blocks(id)
+        })
 }
 
+/// An in-flight prefill already holds its launched chunk, so its debt starts at
+/// `prefill_pos + step_chunk`; a queued one starts at `prefill_pos`.
 fn prefilling_future_blocks(
     prefilling: &[PendingRequest],
+    inflight: &[PendingRequest],
     block_size: usize,
     // Blocks a request already holds via a settled prefetch (zero once its
     // first chunk absorbs them). They are out of the free pool, so counting
     // them as future need would double-charge the budget.
     prefetch_credit: impl Fn(RequestId) -> usize,
 ) -> usize {
-    prefilling
+    let owed = |req: &PendingRequest, allocated_tokens: usize| {
+        pending_lifetime_blocks(req, block_size)
+            .saturating_sub(blocks_needed(allocated_tokens, block_size))
+            .saturating_sub(prefetch_credit(req.request_id))
+    };
+    let queued: usize = prefilling
         .iter()
-        .map(|req| {
-            pending_lifetime_blocks(req, block_size)
-                .saturating_sub(blocks_needed(req.prefill_pos, block_size))
-                .saturating_sub(prefetch_credit(req.request_id))
-        })
-        .sum()
+        .map(|req| owed(req, req.prefill_pos))
+        .sum();
+    let launched: usize = inflight
+        .iter()
+        .map(|req| owed(req, req.prefill_pos + req.step_chunk))
+        .sum();
+    queued + launched
 }
 
 /// Default for `max_prefill_tokens`: prompt tokens forwarded in a single step
@@ -415,6 +427,9 @@ pub(crate) fn admit_deferred_requests(
     // chunks and will take a decode slot when they promote, so admission
     // must reserve both or completing chunks can overshoot capacity.
     prefilling: &[PendingRequest],
+    // Decode-overlap prefills still running on the GPU: out of `prefilling`
+    // until their result is applied, but owed the same KV tail and slot.
+    inflight: &[PendingRequest],
     block_size: usize,
     available_blocks: usize,
     max_request_blocks: usize,
@@ -431,12 +446,14 @@ pub(crate) fn admit_deferred_requests(
         .saturating_sub(active_future_blocks(active, block_size))
         .saturating_sub(prefilling_future_blocks(
             prefilling,
+            inflight,
             block_size,
             &prefetch_credit,
         ));
     let mut decode_slots = max_decode_batch_size
         .saturating_sub(active.len())
-        .saturating_sub(prefilling.len());
+        .saturating_sub(prefilling.len())
+        .saturating_sub(inflight.len());
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();

@@ -478,14 +478,19 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Per-head RMSNorm with F32 weight + SiLU gate
+    // Per-head RMSNorm with F32 weight + SiLU gate. `num_heads` counts every
+    // head of every slot; `heads_per_slot` splits that back into (slot, head)
+    // so `x` and `gate` can each carry their own tensor's slot stride.
     pub fn rms_norm_gated_cuda(
         x: *const Half,
         weight: *const f32,
         gate: *const Half,
         out: *mut Half,
         num_heads: i32,
+        heads_per_slot: i32,
         head_dim: i32,
+        x_stride: i32,
+        gate_stride: i32,
         eps: f32,
         stream: CUstream,
     );
@@ -498,7 +503,10 @@ unsafe extern "C" {
         gate: *const Half,
         out: *mut Half,
         num_heads: i32,
+        heads_per_slot: i32,
         head_dim: i32,
+        x_stride: i32,
+        gate_stride: i32,
         eps: f32,
         stream: CUstream,
     );

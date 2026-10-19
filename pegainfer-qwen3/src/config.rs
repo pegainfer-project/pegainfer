@@ -33,11 +33,16 @@ pub(crate) struct Config {
     pub(crate) num_key_value_heads: usize,
     pub(crate) head_dim: usize,
     pub(crate) vocab_size: usize,
+    /// Token-selection width: `vocab_size` bounded to the frontend-decodable vocab.
+    #[serde(skip)]
+    pub(crate) decodable_vocab: usize,
+    /// Aligned output-projection rows; any rows past `decodable_vocab` are suppressed.
+    #[serde(skip)]
+    pub(crate) logits_rows: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
     #[serde(default = "default_max_position_embeddings")]
     pub(crate) max_position_embeddings: usize,
-    pub(crate) eos_token_id: u32,
     pub(crate) tie_word_embeddings: bool,
     #[serde(skip)]
     pub(crate) stop_token_ids: Vec<u32>,
@@ -60,6 +65,8 @@ pub(crate) struct DFlashConfig {
     num_target_layers: usize,
     pub(crate) head_dim: usize,
     pub(crate) vocab_size: usize,
+    /// Target output-projection rows, including its suppressed alignment tail.
+    pub(crate) logits_rows: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
     pub(crate) max_position_embeddings: usize,
@@ -167,32 +174,13 @@ fn default_max_position_embeddings() -> usize {
     40960
 }
 
-#[derive(Debug, Deserialize)]
-struct GenerationConfig {
-    eos_token_id: EosTokenIds,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum EosTokenIds {
-    Single(u32),
-    Multiple(Vec<u32>),
-}
-
-impl EosTokenIds {
-    fn into_vec(self) -> Vec<u32> {
-        match self {
-            Self::Single(token_id) => vec![token_id],
-            Self::Multiple(token_ids) => token_ids,
-        }
-    }
-}
-
 impl Config {
     pub(crate) fn from_file(model_path: &str) -> Result<Self> {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        config.decodable_vocab = config.vocab_size;
+        config.logits_rows = config.vocab_size;
         anyhow::ensure!(
             config.num_key_value_heads > 0
                 && config
@@ -210,7 +198,7 @@ impl Config {
                 config.num_key_value_heads,
             );
         }
-        config.stop_token_ids = Self::load_stop_token_ids(model_path, config.eos_token_id)?;
+        config.stop_token_ids = pegainfer_core::eos::eos_token_ids(model_path, config.vocab_size)?;
         Ok(config)
     }
 
@@ -247,22 +235,6 @@ impl Config {
     pub(crate) fn local_kv_dim(&self, tp: TensorParallelConfig) -> usize {
         self.local_num_key_value_heads(tp) * self.head_dim
     }
-
-    fn load_stop_token_ids(model_path: &str, fallback_eos_token_id: u32) -> Result<Vec<u32>> {
-        let generation_config_path = format!("{}/generation_config.json", model_path);
-        match fs::read_to_string(&generation_config_path) {
-            Ok(content) => {
-                let generation_config: GenerationConfig = serde_json::from_str(&content)?;
-                let mut stop_token_ids = generation_config.eos_token_id.into_vec();
-                stop_token_ids.dedup();
-                Ok(stop_token_ids)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Ok(vec![fallback_eos_token_id])
-            }
-            Err(err) => Err(err.into()),
-        }
-    }
 }
 
 impl DFlashConfig {
@@ -297,6 +269,7 @@ impl DFlashConfig {
             num_target_layers: raw.num_target_layers,
             head_dim: raw.head_dim,
             vocab_size: raw.vocab_size,
+            logits_rows: raw.vocab_size,
             rms_norm_eps: raw.rms_norm_eps,
             rope_theta,
             max_position_embeddings: raw.max_position_embeddings,

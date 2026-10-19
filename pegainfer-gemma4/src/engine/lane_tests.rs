@@ -156,7 +156,7 @@ pub(super) fn load_state(overrides: &[(&str, &str)]) -> anyhow::Result<super::En
     let dir = crate::testkit::model_path();
     let config = crate::config::Gemma4Config::from_file(&dir)?;
     let knobs = super::ServingKnobs::resolve(&knob_table(overrides), &config)?;
-    let policy = super::generation_policy(&dir)?;
+    let policy = super::generation_policy(&dir, config.vocab_size)?;
     super::EngineState::load(&dir, &config, knobs, &[0], policy, 0x5EED, true)
 }
 

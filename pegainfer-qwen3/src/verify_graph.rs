@@ -50,7 +50,7 @@ pub(crate) struct VerifyGraphBuffers {
     captured_hidden: HiddenStates,
     /// RMS-norm output feeding the lm_head GEMM `[hidden_dim, max_total_rows]`.
     all_logits_normed: HiddenStates,
-    /// All-position logits `[vocab, max_total_rows]` (the verify forward's output).
+    /// All-position logits `[logits_rows, max_total_rows]` (the verify forward's output).
     all_logits: HiddenStates,
     /// Device-resident concatenated verify tokens `[max_total_rows]`.
     token_ids_d: CudaSlice<u32>,
@@ -89,7 +89,7 @@ impl VerifyGraphBuffers {
         let q_dim = model.local_q_dim();
         let kv_dim = model.local_kv_dim();
         let inter_dim = model.local_intermediate_size();
-        let vocab = model.config().vocab_size;
+        let logits_rows = model.config().logits_rows;
         let max_total_rows = max_batch * span;
 
         // Each request's `span` query tokens fan out to `span * group_size`
@@ -114,7 +114,7 @@ impl VerifyGraphBuffers {
                 max_total_rows,
             )?,
             all_logits_normed: HiddenStates::zeros(ctx, hidden_dim, max_total_rows)?,
-            all_logits: HiddenStates::zeros(ctx, vocab, max_total_rows)?,
+            all_logits: HiddenStates::zeros(ctx, logits_rows, max_total_rows)?,
             token_ids_d: ctx.stream.alloc_zeros(max_total_rows)?,
             plan: PrefillPagedPlan::new_preallocated(
                 ctx,
@@ -154,7 +154,7 @@ impl VerifyGraphBuffers {
         self.all_logits.seq_len = total_rows;
     }
 
-    /// All-position logits `[vocab, total_rows]` from the last forward.
+    /// All-position logits `[logits_rows, total_rows]` from the last forward.
     pub(crate) fn all_logits(&self) -> &HiddenStates {
         &self.all_logits
     }
@@ -428,12 +428,7 @@ impl Qwen3Model {
             self.config().rms_norm_eps,
             &mut bufs.all_logits_normed,
         );
-        ops::gemm_into(
-            ctx,
-            self.output_projection(),
-            &bufs.all_logits_normed,
-            &mut bufs.all_logits,
-        );
+        self.project_logits(ctx, &bufs.all_logits_normed, &mut bufs.all_logits)?;
         Ok(())
     }
 

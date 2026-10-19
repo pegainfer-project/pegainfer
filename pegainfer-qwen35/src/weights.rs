@@ -172,7 +172,7 @@ impl Qwen35Model {
             geometry.rank(),
             geometry.world_size(),
         );
-        let effective_vocab = super::config::tokenizer_effective_vocab(model_path)?;
+        let effective_vocab = pegainfer_core::decodable_vocab::decodable_vocab_width(model_path)?;
         config
             .bound_selection_vocab(effective_vocab)
             .map_err(anyhow::Error::from)?;
@@ -501,10 +501,8 @@ impl Qwen35Model {
         let full_kv_samples =
             sample_mats(full_attn().flat_map(|attn| [&attn.k_proj, &attn.v_proj]));
         let full_o_samples = sample_mats(full_attn().map(|attn| &attn.o_proj));
-        let linear_qkv_samples = sample_mats(linear_attn().map(|attn| &attn.in_proj_qkv));
-        let linear_z_samples = sample_mats(linear_attn().map(|attn| &attn.in_proj_z));
-        let linear_ba_samples =
-            sample_mats(linear_attn().flat_map(|attn| [&attn.in_proj_b, &attn.in_proj_a]));
+        let linear_qkvz_samples = sample_mats(linear_attn().map(|attn| &attn.in_proj_qkvz));
+        let linear_ba_samples = sample_mats(linear_attn().map(|attn| &attn.in_proj_ba));
         let linear_out_samples = sample_mats(linear_attn().map(|attn| &attn.out_proj));
         let gate_up_samples = sample_mats(self.layers.iter().map(|layer| &layer.mlp.gate_up_proj));
         let down_samples = sample_mats(self.layers.iter().map(|layer| &layer.mlp.down_proj));
@@ -522,9 +520,8 @@ impl Qwen35Model {
             tune_if_nonempty(ctx, &full_q_samples, full_q, n)?;
             tune_if_nonempty(ctx, &full_kv_samples, full_kv, n)?;
             tune_if_nonempty(ctx, &full_o_samples, hidden, n)?;
-            tune_if_nonempty(ctx, &linear_qkv_samples, linear_qkv, n)?;
-            tune_if_nonempty(ctx, &linear_z_samples, linear_z, n)?;
-            tune_if_nonempty(ctx, &linear_ba_samples, linear_ba, n)?;
+            tune_if_nonempty(ctx, &linear_qkvz_samples, linear_qkv + linear_z, n)?;
+            tune_if_nonempty(ctx, &linear_ba_samples, 2 * linear_ba, n)?;
             tune_if_nonempty(ctx, &linear_out_samples, hidden, n)?;
             crate::ops::gemm_lt_tune(ctx, &gate_up_samples, 2 * intermediate, n)?;
             crate::ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
@@ -580,7 +577,7 @@ impl Qwen35Model {
     }
 
     pub(crate) fn is_stop_token(&self, token_id: u32) -> bool {
-        token_id == self.config.eos_token_id
+        self.config.eos_token_ids.contains(&token_id)
     }
 }
 

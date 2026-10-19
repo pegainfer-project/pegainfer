@@ -27,9 +27,10 @@ impl DFlashDraftModel {
         model_path: &str,
         target: &Qwen3Model,
     ) -> Result<Self> {
-        let config = DFlashConfig::from_file(model_path)
+        let mut config = DFlashConfig::from_file(model_path)
             .with_context(|| format!("load DFlash config from {model_path}"))?;
         config.validate_for_target(target.config())?;
+        config.logits_rows = target.config().logits_rows;
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
         debug!(
