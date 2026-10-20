@@ -4,12 +4,15 @@ use std::time::Instant;
 
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::LiveScheduler;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
+use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::spawn_scheduler;
 
 pub(super) use super::lane_step_collector::Drained;
@@ -32,15 +35,19 @@ impl Harness {
         }
     }
 
-    pub(super) fn from_state(state: super::EngineState) -> Self {
-        let servable_len = Some(u32::try_from(state.max_context).expect("servable ceiling"));
-        let mut scheduler = spawn_scheduler("gemma4-test", super::Gemma4Scheduler::new(state));
+    pub(super) fn from_scheduler(scheduler: impl Scheduler + 'static, max_context: usize) -> Self {
+        let mut scheduler = spawn_scheduler("gemma4-test", scheduler);
         let steps = scheduler.handle.take_steps().expect("fresh step stream");
         Self {
             scheduler: Some(scheduler),
             steps: StepCollector::new(steps),
-            servable_len,
+            servable_len: Some(u32::try_from(max_context).expect("servable ceiling")),
         }
+    }
+
+    pub(super) fn from_state(state: super::EngineState) -> Self {
+        let max_context = state.max_context;
+        Self::from_scheduler(super::Gemma4Scheduler::new(state), max_context)
     }
 
     pub(super) fn submit(&self, prompt_tokens: Vec<u32>, max_tokens: usize) -> RequestControl {
@@ -56,18 +63,32 @@ impl Harness {
         logprobs: Option<usize>,
         prompt_logprobs: Option<usize>,
     ) -> RequestControl {
+        self.submit_with_policy(
+            prompt_tokens,
+            max_tokens,
+            logprobs,
+            prompt_logprobs,
+            StopPolicy::new(EosPolicy::Ignore, vec![]),
+        )
+    }
+
+    pub(super) fn submit_with_policy(
+        &self,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        logprobs: Option<usize>,
+        prompt_logprobs: Option<usize>,
+        stop_policy: StopPolicy,
+    ) -> RequestControl {
         self.scheduler
             .as_ref()
             .expect("live scheduler")
             .handle
             .submit(Request {
                 prompt_tokens,
-                params: pegainfer_frontend::sampler::SamplingParams {
-                    ignore_eos: true,
-                    ..pegainfer_frontend::sampler::SamplingParams::default()
-                },
+                params: pegainfer_frontend::sampler::SamplingParams::default(),
                 history_tokens: None,
-                stop_policy: pegainfer_frontend::engine::StopPolicy::default(),
+                stop_policy,
                 max_tokens,
                 lora_adapter: None,
                 kv_transfer_params: None,
@@ -124,6 +145,7 @@ impl Harness {
             .expect("scheduler not shut down twice");
         drop(scheduler.handle);
         scheduler.join.join().expect("scheduler thread exits");
+        self.steps.pump_available();
     }
 }
 

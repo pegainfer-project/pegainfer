@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 
 use super::lane_gates_tp::assert_finite;
@@ -28,6 +31,47 @@ const LOGPROB_FLOOR: f32 = 0.10;
 /// line. At this prompt's first scored position the window fixture's sdpa and
 /// eager rows differ by 0.315 nat on the same token; the cold leg measured 0.278.
 const COLD_LOGPROB_LINE: f32 = 0.5;
+
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, a GPU, fixtures, and --test-threads=1"]
+fn stop_policy_keeps_the_prefill_trigger_and_its_score() {
+    let config =
+        crate::config::Gemma4Config::from_file(&crate::testkit::model_path()).expect("config");
+    let policy = StopPolicy::new(EosPolicy::Ignore, (0..config.vocab_size as u32).collect());
+    let prompt = crate::testkit::generate_fixture_prompts().remove(0);
+    let mut harness = launch(&[
+        (super::MIX_CHUNK_TOKENS_ENV, "64"),
+        (super::DECODE_SLOTS_ENV, "2"),
+    ]);
+    let mut streamer = None;
+    for (label, prompt) in [
+        ("solo", prompt.iter().copied().take(40).collect()),
+        (
+            "chunked mixed",
+            prompt.iter().cycle().copied().take(192).collect(),
+        ),
+    ] {
+        let request = harness.submit_with_policy(prompt, 1, Some(TOP_K), None, policy.clone());
+        let done = harness.steps.drain(request.id(), label);
+        assert_eq!((done.tokens, done.finish), (1, FinishReason::Stop));
+        assert_eq!(done.stop_cause, Some(StopCause::Token(done.ids[0])));
+        let score = done.logprobs[0].as_ref().expect("the trigger is scored");
+        assert_finite(score, label);
+        let top = score
+            .top_logprobs
+            .iter()
+            .find(|(id, _)| *id == done.ids[0])
+            .expect("the greedy trigger is in its own top-k");
+        assert_eq!(score.logprob.to_bits(), top.1.to_bits(), "{label}");
+        if streamer.is_none() {
+            streamer = Some(pin_live_stream(&mut harness));
+        }
+    }
+    let streamer = streamer.expect("mixed admission has a live decoder");
+    let seen = harness.steps.buffered_tokens(streamer.id());
+    harness.steps.wait_tokens(streamer.id(), seen + 2);
+    harness.shutdown(&[&streamer]);
+}
 
 fn assert_echo_covers(echo: &PromptEcho, prompt: &[u32], top_k: usize) {
     assert_eq!(echo.ids, prompt, "the echo names the prompt");
