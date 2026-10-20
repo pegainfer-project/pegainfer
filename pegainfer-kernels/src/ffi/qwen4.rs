@@ -1,6 +1,5 @@
-// Qwen3.8-Flash-Next (Qwen4 line) QSA token-indexer kernels. Geometry is frozen
-// in `csrc/qwen4/qwen4_qsa_indexer_score.cu`, which refuses a call whose
-// rotary geometry disagrees with what it was compiled for.
+// Qwen3.8-Flash-Next (Qwen4 line) QSA token-indexer kernels. Geometry is compiled
+// into `csrc/qwen4/qwen4_qsa_indexer_score.cu`; the entry point takes none.
 
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;

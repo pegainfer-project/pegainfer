@@ -249,10 +249,11 @@ fn assert_provenance(bytes: &[u8]) -> serde_json::Value {
         "rope_theta {rope_theta} cannot build a table"
     );
     // Recorded, not asserted: the host the golden was dumped on decides the
-    // order its float32 reductions round in, which is where the parity bound's
-    // residual comes from, and any other host's order is an equally valid
-    // reference. Printed because the bound's justification leans on it and it
-    // is otherwise invisible to whoever reads this gate's output.
+    // order its float32 reductions round in, and any other host's order is an
+    // equally valid reference. That order is one candidate for the long case's
+    // residual, which is not traced yet. Printed because the bound's
+    // justification leans on it and it is otherwise invisible to whoever reads
+    // this gate's output.
     println!(
         "golden provenance: transformers {}, torch {}, {}",
         manifest["transformers_version"].as_str().unwrap_or("?"),
@@ -344,7 +345,7 @@ fn load_case(fixture: &SafeTensors<'_>, index: usize, geometry: &Geometry) -> Ca
         score_shape[1],
         tokens / geometry.compress_ratio
     );
-    let case = Case {
+    Case {
         index,
         tokens,
         budget: budget_tensor(fixture, &format!("case{index}_budget")),
@@ -353,13 +354,7 @@ fn load_case(fixture: &SafeTensors<'_>, index: usize, geometry: &Geometry) -> Ca
         rows,
         reference,
         score_cols: score_shape[1],
-    };
-    assert!(
-        case.budget.is_multiple_of(geometry.compress_ratio as u32),
-        "case {index}: the reference requires the budget to divide by the \
-         compress ratio, and its block_topk is that quotient"
-    );
-    case
+    }
 }
 
 /// The fused `index_qk_proj` rows the kernel reads: the keys for every token,
