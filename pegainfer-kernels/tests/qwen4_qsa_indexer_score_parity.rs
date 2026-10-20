@@ -91,12 +91,15 @@ fn config_theta(config: &serde_json::Value) -> f32 {
         .expect("rope_theta") as f32
 }
 
-/// The attention line's cos/sin tables, built exactly like
-/// `pegainfer_core::rope::RopeTableSpec::tables`: `[max_pos, rotary_dim]`,
-/// position-major, half-split duplicated, bf16. The gate builds them here
-/// because `pegainfer-kernels` cannot depend on `pegainfer-core` (the crate
-/// dependency runs the other way); production builds the same table with that
-/// function and passes it in, which is the point of the kernel reading it.
+/// The attention line's cos/sin tables, built like
+/// `pegainfer_core::rope::RopeTableSpec::tables` with `frequency_dim` equal to
+/// `rotary_dim`: `[max_pos, rotary_dim]`, position-major, half-split
+/// duplicated, bf16. Equal dims are what the reference's partial RoPE uses
+/// (its `inv_freq` spans the 64 rotated dims); a spec with the head dim as
+/// `frequency_dim` builds a different table. The gate builds them here because
+/// `pegainfer-kernels` cannot depend on `pegainfer-core` (the crate dependency
+/// runs the other way); production builds the same table with that function
+/// and passes it in, which is the point of the kernel reading it.
 fn rope_tables(rotary_dim: usize, theta: f32, max_pos: usize) -> (Vec<bf16>, Vec<bf16>) {
     assert!(rotary_dim > 0 && rotary_dim.is_multiple_of(2) && max_pos > 0);
     let half_dim = rotary_dim / 2;

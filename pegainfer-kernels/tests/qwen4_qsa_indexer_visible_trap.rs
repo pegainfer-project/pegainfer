@@ -21,9 +21,9 @@ const ROTARY_DIM: usize = 64;
 const EPS: f32 = 1e-6;
 const SCORE_COLS: usize = TOKENS / 4;
 
-/// A `visible_len` entry outside `[0, tokens]` must fail visibly rather than
-/// being clamped into a plausible score. The kernel traps; the async error
-/// surfaces at the launch or the next sync.
+/// A `visible_len` entry outside `[0, rows[j] + 1]` must fail visibly rather
+/// than scoring blocks past the row. The kernel traps; the async error surfaces
+/// at the launch or the next sync.
 #[test]
 fn out_of_range_visible_traps() {
     let Some(ctx) = common::device_or_skip() else {
@@ -47,11 +47,12 @@ fn out_of_range_visible_traps() {
     // only the tables' capacity is checked by the wrapper.
     let cos = DeviceVec::from_host(ctx, &vec![bf16::ZERO; TOKENS * ROTARY_DIM]).expect("cos table");
     let sin = DeviceVec::from_host(ctx, &vec![bf16::ZERO; TOKENS * ROTARY_DIM]).expect("sin table");
-    let rows = ctx.stream.clone_htod(&[0i32]).expect("rows H2D");
-    // One token past the key array: the valid range is 0..=8.
+    // Row 3 sees at most 4 tokens. Eight stays inside the key array, so only
+    // the cap at the row's own token can reject it.
+    let rows = ctx.stream.clone_htod(&[3i32]).expect("rows H2D");
     let visible = ctx
         .stream
-        .clone_htod(&[(TOKENS + 1) as i32])
+        .clone_htod(&[TOKENS as i32])
         .expect("visible H2D");
     let mut scores = ctx
         .stream
@@ -80,8 +81,7 @@ fn out_of_range_visible_traps() {
     match res {
         Ok(()) => assert!(
             ctx.sync().is_err(),
-            "visible {} in an {TOKENS}-token buffer must fail visibly",
-            TOKENS + 1
+            "visible {TOKENS} for row 3 must fail visibly"
         ),
         // The trap may surface at the launch instead of the next sync. Any other
         // error means a wrapper check ran instead of the kernel, which would

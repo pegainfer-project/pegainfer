@@ -41,21 +41,25 @@ const COMPRESS_RATIO: usize = 4;
 ///
 /// `rows[j]` is each query row's position (the RoPE position and the
 /// `fused_qk` row its query heads take) and `visible_len[j]` how many tokens
-/// it can see, counted from token 0; causal text passes `rows[j] + 1`. Row `j`
-/// gets `visible_len[j] / COMPRESS_RATIO` scores at stride `score_cols`;
+/// it can see, counted from token 0 and at most `rows[j] + 1`, which is what
+/// causal text passes. Row `j` gets `visible_len[j] / COMPRESS_RATIO` scores at
+/// stride `score_cols`;
 /// entries past that are left untouched, as the reference leaves them NaN — a
 /// caller that wants to tell an unwritten entry from a real one has to poison
 /// the buffer itself (the parity gate pre-fills a sentinel). Both arrays are
-/// checked on the device: an out-of-range entry traps, so a broken caller fails
-/// visibly instead of getting a plausible score for a row it never asked about.
+/// checked on the device: a row outside the key array, or a visible length past
+/// the row's own token, traps, so a broken caller fails visibly instead of
+/// getting a plausible score for blocks it should not see.
 ///
 /// `pooled_keys` is the workspace: `tokens / COMPRESS_RATIO` rows of
 /// `HEAD_DIM`, reused across calls.
 ///
 /// `cos`/`sin` are the shared attention RoPE tables (`pegainfer_core::rope`,
 /// `[max_pos, ROTARY_DIM]`, position-major): the indexer rotates with the same
-/// position embeddings the attention uses, so this stage computes no trig. The
-/// tables must cover every position this call can read, `0..tokens`.
+/// position embeddings the attention uses, so this stage computes no trig. They
+/// must be built with `rotary_dim` and `frequency_dim` both `ROTARY_DIM`, the
+/// frequencies the reference's partial RoPE uses, and cover every position this
+/// call can read, `0..tokens`.
 pub fn qsa_indexer_block_scores_into(
     ctx: &DeviceContext,
     fused_qk: &CudaSlice<bf16>,

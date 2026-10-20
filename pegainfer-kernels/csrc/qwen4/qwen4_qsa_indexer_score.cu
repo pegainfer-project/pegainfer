@@ -175,16 +175,17 @@ __global__ void qwen4_qsa_block_scores_kernel(
   const int warp = threadIdx.x / WARP_SIZE;
 
   // `rows[row]` is the row's own position and the fused_qk row its query
-  // heads are read from; `visible_len[row]` is how many tokens it sees. Both
-  // are caller-provided device values and are checked here: an out-of-range
-  // entry traps, because clamping would hand the caller a plausible score for
-  // a row it never asked about.
+  // heads are read from; `visible_len[row]` is how many tokens it sees, which
+  // causal text caps at the row's own token. Both are caller-provided device
+  // values and are checked here: an out-of-range entry traps, because clamping
+  // it, or scoring blocks past the row, would hand the caller a plausible score
+  // it never asked for. With `pos < tokens`, `pos + 1` also bounds the array.
   const int pos = rows[row];
   if (pos < 0 || pos >= tokens) {
     __trap();
   }
   const int visible = visible_len[row];
-  if (visible < 0 || visible > tokens) {
+  if (visible < 0 || visible > pos + 1) {
     __trap();
   }
   const int row_blocks = visible / kRatio;
