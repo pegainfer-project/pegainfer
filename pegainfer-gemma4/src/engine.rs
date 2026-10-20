@@ -374,7 +374,7 @@ fn start_with_knobs(
 
     let config = crate::config::Gemma4Config::from_file(&dir)?;
     let knobs = ServingKnobs::resolve(lookup, &config)?;
-    let policy = generation_policy(&dir)?;
+    let policy = generation_policy(&dir, config.vocab_size)?;
     if world > 1 {
         anyhow::ensure!(
             knobs.lane_mode.is_none(),
@@ -473,17 +473,12 @@ struct GenerationPolicy {
     suppress: Vec<u32>,
 }
 
-fn generation_policy(dir: &str) -> Result<GenerationPolicy> {
+fn generation_policy(dir: &str, vocab: usize) -> Result<GenerationPolicy> {
+    let eos = pegainfer_core::eos::eos_token_ids(dir, vocab)?;
     let path = format!("{dir}/generation_config.json");
     let json: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?,
     )?;
-    let eos = token_ids(
-        json.get("eos_token_id")
-            .with_context(|| format!("{path} missing eos_token_id"))?,
-    )
-    .with_context(|| format!("{path} eos_token_id"))?;
-    anyhow::ensure!(!eos.is_empty(), "{path} declares an empty eos_token_id");
     let mut suppress = match json.get("suppress_tokens") {
         Some(value) => token_ids(value).with_context(|| format!("{path} suppress_tokens"))?,
         None => Vec::new(),
@@ -501,21 +496,15 @@ impl GenerationPolicy {
         !ignore_eos && self.eos.contains(&id)
     }
 
-    /// Both sets index the vocabulary, so both are checked against it once
-    /// the head is loaded: an out-of-range suppressed id would fail the first
-    /// request, and an out-of-range stop id would never match at all and turn
-    /// every request into a length stop.
+    /// The suppressed ids index the vocabulary, so they are checked against
+    /// it once the head is loaded: an out-of-range one would fail the first
+    /// request. The EOS set was checked when it was resolved.
     fn check_against_vocab(&self, vocab: usize) -> Result<()> {
-        for (kind, ids) in [
-            ("eos_token_id", &self.eos),
-            ("effective suppression set", &self.suppress),
-        ] {
-            for &id in ids {
-                anyhow::ensure!(
-                    (id as usize) < vocab,
-                    "{kind} lists {id}, outside the {vocab} the checkpoint's head spans"
-                );
-            }
+        for &id in &self.suppress {
+            anyhow::ensure!(
+                (id as usize) < vocab,
+                "effective suppression set lists {id}, outside the {vocab} the checkpoint's head spans"
+            );
         }
         Ok(())
     }

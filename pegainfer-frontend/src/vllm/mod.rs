@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::os::fd::IntoRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -15,7 +16,6 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use vllm_chat::LoadModelBackendsOptions;
-use vllm_chat::ToolStrictLevel;
 use vllm_chat::load_model_backends;
 use vllm_engine_core_client::TransportMode;
 use vllm_server::ApiServerOptions;
@@ -423,7 +423,7 @@ where
         listener_mode: HttpListenerMode::BindTcp { host, port },
         tool_call_parser,
         reasoning_parser: ParserSelection::default(),
-        tool_strict_level: ToolStrictLevel::default(),
+        tool_strict_level: None,
         renderer: RendererSelection::default(),
         chat_template: None,
         default_chat_template_kwargs: None,
@@ -441,6 +441,7 @@ where
             enable_prompt_tokens_details: true,
             enable_request_id_headers: false,
             enable_scale_out: false,
+            enable_per_request_metrics: false,
             sse_keep_alive_interval: None,
         },
         // Upstream ties the scheduler-stats and request-event metric recorders
@@ -450,6 +451,7 @@ where
         grpc_listener_mode: None,
         manages_engine: false,
         shutdown_timeout: Duration::from_secs(10),
+        stream_interval: NonZeroU32::MIN,
         keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT,
         profiler: None,
         tls: None,

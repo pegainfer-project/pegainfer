@@ -27,7 +27,9 @@ pub struct Config {
     // Part of the HF config.json schema; nothing reads it yet.
     #[allow(dead_code)]
     bos_token_id: u32,
-    pub(crate) eos_token_id: u32,
+    /// The checkpoint's EOS set, resolved in [`Config::from_model_dir`].
+    #[serde(skip)]
+    pub(crate) eos_token_ids: Vec<u32>,
     pub(crate) vocab_size: usize,
     pub(crate) hidden_size: usize,
     pub(crate) intermediate_size: usize,
@@ -63,8 +65,9 @@ impl Config {
     pub(crate) fn from_model_dir(model_path: impl AsRef<Path>) -> Result<Self> {
         let config_path = model_path.as_ref().join("config.json");
         let content = fs::read_to_string(&config_path)?;
-        let config: Self = serde_json::from_str(&content)?;
+        let mut config: Self = serde_json::from_str(&content)?;
         config.validate_lite()?;
+        config.eos_token_ids = pegainfer_core::eos::eos_token_ids(&model_path, config.vocab_size)?;
         Ok(config)
     }
 
@@ -236,7 +239,7 @@ pub(crate) fn test_lite_config() -> Config {
     Config {
         model_type: "deepseek_v2".to_string(),
         bos_token_id: 100_000,
-        eos_token_id: 100_001,
+        eos_token_ids: vec![100_001],
         vocab_size: 102_400,
         hidden_size: 2048,
         intermediate_size: 10944,

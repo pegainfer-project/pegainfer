@@ -9,6 +9,40 @@ use pegainfer_kv_cache::KvView;
 use super::config::Config35;
 use super::config::LocalGeometry;
 
+/// Decode buckets at or below this size read full attention through the split-KV
+/// kernel instead of the FlashInfer batch-decode kernel.
+///
+/// FlashInfer launches one CTA per (request, kv head) and never grows that grid
+/// with KV length, so a small decode leaves the device idle — four CTAs for a
+/// single request, 64 for sixteen. Splitting the KV range instead wins at every
+/// bucket this threshold admits, measured on one tree with two runs a side:
+/// bs1 9.41/9.36 → 8.57/8.57 ms, c8 11.25/11.27 → 10.65/10.67, c16 13.06/13.08
+/// → 12.80/12.82 mean TPOT, qps16 unchanged. The wider buckets keep FlashInfer:
+/// on an sm_90 card at 1024 in and 256 out, routing them through the split form
+/// measured 10.23/10.25 against 9.65/9.67 ms mean TPOT at c32 and 16.56/16.58
+/// against 14.98/15.14 at c64. See `docs/models/qwen35/decode-kernel-attribution.md`.
+pub(crate) const SPLIT_DECODE_MAX_BATCH: usize = 16;
+
+/// Query heads per kv head the split-KV kernel is built for, one warp each. A
+/// checkpoint with another GQA group (the 27B sizes run 6) keeps the FlashInfer
+/// path at every bucket, since the kernel refuses that geometry.
+pub(crate) const SPLIT_DECODE_GQA_GROUP: usize = 4;
+
+/// KV splits per (kv head, request) CTA group, for a decode bucket.
+///
+/// Fixed per bucket rather than derived from KV length because the grid shape
+/// has to be constant across a captured CUDA Graph bucket; an over-split request
+/// simply leaves later CTAs empty. The counts are where each bucket's curve
+/// flattens on the standalone harness: 32 splits is best at batch 1
+/// (27.98 µs against 34.98 at 16), and 16 is best at batch 8 (57.26 against
+/// 60.58 at 32) and batch 16 (96.26 against 98.47).
+pub(crate) fn split_decode_splits(batch: usize) -> usize {
+    if batch <= 2 { 32 } else { 16 }
+}
+
+/// Upper bound on [`split_decode_splits`], for sizing the partial buffers.
+pub(crate) const SPLIT_DECODE_MAX_SPLITS: usize = 32;
+
 /// Pre-allocated GPU buffers for Qwen3.5 batch decode (N requests, 1 token each).
 pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) max_batch_size: usize,
@@ -30,11 +64,17 @@ pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) v_attn: HiddenStates,
     pub(crate) attn_out_full: HiddenStates,
 
-    // Linear attention [dim, batch]
-    pub(crate) qkv: HiddenStates,
-    pub(crate) z: HiddenStates,
-    pub(crate) b_proj: HiddenStates,
-    pub(crate) a_proj: HiddenStates,
+    // Split-KV decode scratch [splits, batch, qo_heads, head_dim] and the two
+    // per-(split, request, head) softmax accumulators beside it. Sized for the
+    // buckets the split kernel serves, not for the whole decode capacity.
+    pub(crate) split_partial_o: CudaSlice<f32>,
+    pub(crate) split_partial_m: CudaSlice<f32>,
+    pub(crate) split_partial_l: CudaSlice<f32>,
+
+    // Linear attention [dim, batch]. The two projections are the fused ones:
+    // `qkvz` holds the qkv band below the z band, `ba` holds beta below alpha.
+    pub(crate) qkvz: HiddenStates,
+    pub(crate) ba: HiddenStates,
     pub(crate) qkv_conv: HiddenStates,
     pub(crate) gdr_out: HiddenStates,
     pub(crate) normed_gated: HiddenStates,
@@ -82,7 +122,6 @@ impl BatchDecodeBuffers35 {
         let qkv_dim = geometry.local_linear_qkv_dim();
         let z_dim = geometry.local_linear_z_dim();
         let b_dim = geometry.local_linear_num_value_heads();
-        let a_dim = b_dim;
         let intermediate = geometry.local_intermediate_size();
 
         Ok(Self {
@@ -102,10 +141,25 @@ impl BatchDecodeBuffers35 {
             v_attn: HiddenStates::zeros(ctx, kv_dim, bs)?,
             attn_out_full: HiddenStates::zeros(ctx, q_dim, bs)?,
 
-            qkv: HiddenStates::zeros(ctx, qkv_dim, bs)?,
-            z: HiddenStates::zeros(ctx, z_dim, bs)?,
-            b_proj: HiddenStates::zeros(ctx, b_dim, bs)?,
-            a_proj: HiddenStates::zeros(ctx, a_dim, bs)?,
+            split_partial_o: ctx.stream.alloc_zeros(
+                SPLIT_DECODE_MAX_SPLITS
+                    * bs.min(SPLIT_DECODE_MAX_BATCH)
+                    * geometry.local_num_attention_heads()
+                    * 256,
+            )?,
+            split_partial_m: ctx.stream.alloc_zeros(
+                SPLIT_DECODE_MAX_SPLITS
+                    * bs.min(SPLIT_DECODE_MAX_BATCH)
+                    * geometry.local_num_attention_heads(),
+            )?,
+            split_partial_l: ctx.stream.alloc_zeros(
+                SPLIT_DECODE_MAX_SPLITS
+                    * bs.min(SPLIT_DECODE_MAX_BATCH)
+                    * geometry.local_num_attention_heads(),
+            )?,
+
+            qkvz: HiddenStates::zeros(ctx, qkv_dim + z_dim, bs)?,
+            ba: HiddenStates::zeros(ctx, 2 * b_dim, bs)?,
             qkv_conv: HiddenStates::zeros(ctx, qkv_dim, bs)?,
             gdr_out: HiddenStates::zeros(ctx, z_dim, bs)?,
             normed_gated: HiddenStates::zeros(ctx, z_dim, bs)?,
@@ -148,10 +202,8 @@ impl BatchDecodeBuffers35 {
         self.v_attn.seq_len = bs;
         self.attn_out_full.seq_len = bs;
 
-        self.qkv.seq_len = bs;
-        self.z.seq_len = bs;
-        self.b_proj.seq_len = bs;
-        self.a_proj.seq_len = bs;
+        self.qkvz.seq_len = bs;
+        self.ba.seq_len = bs;
         self.qkv_conv.seq_len = bs;
         self.gdr_out.seq_len = bs;
         self.normed_gated.seq_len = bs;

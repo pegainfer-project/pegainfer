@@ -295,7 +295,7 @@ fn lone_kv_transfer_defers_until_terminal_output() {
     );
     assert!(d.drain());
     let output = d.next_output().expect("terminal output");
-    assert_eq!(output.outputs[0].kv_transfer_params, Some(params));
+    assert_eq!(output.outputs[0].kv_transfer_params, Some(Box::new(params)));
 }
 
 /// First-token metadata (queued/scheduled events + prefill stats) rides the

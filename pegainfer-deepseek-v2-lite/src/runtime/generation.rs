@@ -353,7 +353,7 @@ impl DeepSeekV2LiteEp2Generator {
 
         for step in 0..max_new_tokens {
             if let Some(reason) =
-                append_generated_token(&mut generated, next, self.config.eos_token_id, ignore_eos)
+                append_generated_token(&mut generated, next, &self.config.eos_token_ids, ignore_eos)
             {
                 finish_reason = reason;
                 break;

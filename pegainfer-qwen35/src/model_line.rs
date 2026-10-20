@@ -152,7 +152,7 @@ impl ModelLine for Qwen35Line {
         Ok(ServePlan {
             // Both generations' templates request the Qwen Coder tool syntax,
             // but upstream `Auto` matches the model *path* by substring: a
-            // `Qwen3.8-27B` directory resolves to the JSON `qwen3_xml` parser
+            // `Qwen3.8-27B` directory resolves to the JSON `qwen3_json` parser
             // (`docs/models/qwen35/support-qwen38.md`). The line knows better
             // than the directory name.
             auto_tool_call_parser: Some(ParserSelection::Explicit("qwen3_coder".to_string())),

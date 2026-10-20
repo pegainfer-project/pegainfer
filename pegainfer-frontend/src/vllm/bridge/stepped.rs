@@ -263,6 +263,7 @@ impl SteppedEngineBridge {
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
                 scheduler_stats: Some(Box::new(self.stats(spec))),
                 timestamp: now_secs_f64(),
+                weight_version: None,
             }
             .into(),
         )
@@ -636,7 +637,7 @@ fn reduce_update(
         state.take_prefill_stats(),
     );
     output.new_prompt_logprobs_tensors = prompt_logprobs;
-    output.kv_transfer_params = state.kv_transfer_params.take();
+    output.kv_transfer_params = state.kv_transfer_params.take().map(Box::new);
     (Some(output), terminated)
 }
 

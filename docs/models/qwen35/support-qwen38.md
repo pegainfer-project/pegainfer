@@ -178,7 +178,7 @@ Guangzhou
 
 Under `Auto` the upstream matcher resolves the parser by case-insensitive
 substring match against the model *path* (`qwen3.5` → `qwen3_coder`, bare
-`qwen3` → `qwen3_xml`), so a `Qwen3.8-27B` directory picks `qwen3_xml` and
+`qwen3` → `qwen3_json`), so a `Qwen3.8-27B` directory picks `qwen3_json` and
 that block lands in `content` unparsed (observed). The Qwen3.5 line
 therefore resolves `auto` itself: `ServePlan::auto_tool_call_parser` maps
 it to `qwen3_coder` regardless of the directory name, and an explicit
@@ -233,7 +233,7 @@ HTTP request; the serving row covers the frontend layers.
 | `hf_golden_gate` Qwen3.5-0.8B, single GPU + TP2 (tied head) | L20 | single GPU: short and long both pass. The captured-graph path is not bit-reproducible between runs — sequential graph mean 0.0293–0.0299 / p99 0.0954–0.1097 across two runs, batched and slot-compaction inside tolerance. TP2 short: batched eager mean 0.0300 / p99 0.1127, identical in both — the sharded load path on a second geometry. |
 | `hf_golden_gate` Qwen3.5-2B, single GPU (tied head) | 1×A40 (sm_80 build) | short sequential, 108 positions: mean 0.0301 / p99 0.1172. Long, 18 positions: mean 0.0238 / p99 0.0778. |
 | `hf_golden_gate` Qwen3.5-4B, single GPU (untied head) | 1×A40 (sm_80 build) | short sequential, 108 positions: mean 0.0238 / p99 0.0813. Long, 18 positions: mean 0.0223 / p99 0.0705. |
-| serving, real Qwen3.8-27B TP2 | 2×L20 (sm_89) | the startup probe arms `[("high","xhigh"),("max","xhigh"),("minimal","low")]` from the checkpoint's own template ~2 s into boot; a `reasoning_effort:"high"` chat request returns 200 with reasoning; tool calls round-trip under `qwen3_coder` (non-streaming `tool_calls` + SSE deltas) and come back raw under `qwen3_xml`; with no flag at all the line default logs `using tool parser parser_name="qwen3_coder"` and parses the same request. |
+| serving, real Qwen3.8-27B TP2 | 2×L20 (sm_89) | the startup probe arms `[("high","xhigh"),("max","xhigh"),("minimal","low")]` from the checkpoint's own template ~2 s into boot; a `reasoning_effort:"high"` chat request returns 200 with reasoning; tool calls round-trip under `qwen3_coder` (non-streaming `tool_calls` + SSE deltas) and come back raw under the JSON parser (then named `qwen3_xml`; upstream renamed it `qwen3_json` and made `qwen3_xml` an alias of `qwen3_coder`); with no flag at all the line default logs `using tool parser parser_name="qwen3_coder"` and parses the same request. |
 | CPU suites | — | `pegainfer-frontend`, `pegainfer-core` and `pegainfer-qwen35 --features qwen35` libs (the last on the GPU box, its recurrent tests included), plus the sim `frontend_e2e` — which carries the guarded-template `reasoning_effort` case and still fails a kwargs-only effort, the deliberate boundary — and `tool_call_roundtrip`. clippy `-D warnings` and `cargo fmt --all --check` clean. |
 
 Tolerances are the line's existing 4B calibration (`MEAN_TOL 0.06`,

@@ -267,7 +267,7 @@ pub struct Qwen35TpExecutor {
     page_size: usize,
     capacity_pages_for_requests: usize,
     max_position_embeddings: usize,
-    eos_token_id: u32,
+    eos_token_ids: Vec<u32>,
     /// Whether decode steps replay pre-captured CUDA Graphs that record NCCL
     /// collectives (`enable_cuda_graph` AND a compiled TP-local decode GQA
     /// group; see the P2c gate in `tp-design.md`).
@@ -755,7 +755,7 @@ impl Qwen35TpExecutor {
         let padding_block_id = kv_cache.pool().padding_block_id();
         let capacity_pages_for_requests = min_capacity_pages.saturating_sub(1);
         let max_position_embeddings = first.config().max_position_embeddings;
-        let eos_token_id = first.config().eos_token_id;
+        let eos_token_ids = first.config().eos_token_ids.clone();
 
         let nccl_id = cudarc::nccl::safe::Id::new()
             .map_err(|e| anyhow::anyhow!("failed to create Qwen3.5 TP NCCL id: {e:?}"))?;
@@ -851,7 +851,7 @@ impl Qwen35TpExecutor {
             page_size,
             capacity_pages_for_requests,
             max_position_embeddings,
-            eos_token_id,
+            eos_token_ids,
             graph_enabled,
             active_slots: Mutex::new(Vec::new()),
         };
@@ -901,7 +901,7 @@ impl Qwen35TpExecutor {
     }
 
     pub(crate) fn is_stop_token(&self, token_id: u32) -> bool {
-        token_id == self.eos_token_id
+        self.eos_token_ids.contains(&token_id)
     }
 
     /// Pre-capture every reachable decode bucket on every rank, phase-by-phase

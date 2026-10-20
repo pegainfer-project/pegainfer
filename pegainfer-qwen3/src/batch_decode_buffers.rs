@@ -68,7 +68,7 @@ pub(crate) fn decode_projection_pin_shapes(
     q_dim: usize,
     kv_dim: usize,
     intermediate: usize,
-    vocab: usize,
+    logits_rows: usize,
 ) -> [(usize, usize); 6] {
     [
         (q_dim, hidden),
@@ -76,7 +76,7 @@ pub(crate) fn decode_projection_pin_shapes(
         (hidden, q_dim),
         (intermediate, hidden),
         (hidden, intermediate),
-        (vocab, hidden),
+        (logits_rows, hidden),
     ]
 }
 
@@ -87,9 +87,9 @@ pub(crate) fn warmup_decode_projection_pins(
     q_dim: usize,
     kv_dim: usize,
     intermediate: usize,
-    vocab: usize,
+    logits_rows: usize,
 ) -> Result<()> {
-    for (m, k) in decode_projection_pin_shapes(hidden, q_dim, kv_dim, intermediate, vocab) {
+    for (m, k) in decode_projection_pin_shapes(hidden, q_dim, kv_dim, intermediate, logits_rows) {
         let config = gemm_lt_pin_warmup(m, k)?;
         info!(
             "Qwen3 GEMM pin: m={m}, k={k}, splitk={}, reduction_scheme={}",
@@ -219,7 +219,7 @@ impl BatchDecodeBuffers {
         q_dim: usize,
         kv_dim: usize,
         intermediate_size: usize,
-        vocab_size: usize,
+        logits_rows: usize,
         max_batch_size: usize,
         page_size: usize,
         padding_page_id: i32,
@@ -270,7 +270,7 @@ impl BatchDecodeBuffers {
             mlp_act: HiddenStates::zeros(ctx, intermediate_size, bs)?,
             mlp_out: HiddenStates::zeros(ctx, hidden_dim, bs)?,
             hidden: HiddenStates::zeros(ctx, hidden_dim, bs)?,
-            logits: HiddenStates::zeros(ctx, vocab_size, bs)?,
+            logits: HiddenStates::zeros(ctx, logits_rows, bs)?,
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
             lora_token_slots_d: ctx.stream.alloc_zeros(bs)?,

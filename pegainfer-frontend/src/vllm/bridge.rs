@@ -583,7 +583,7 @@ fn reduce_request(
         state.first_token_events.take(),
         state.first_token_prefill_stats.take(),
     );
-    output.kv_transfer_params = state.kv_transfer_params.take();
+    output.kv_transfer_params = state.kv_transfer_params.take().map(Box::new);
     (Some(output), terminated)
 }
 
@@ -935,13 +935,14 @@ fn engine_output(
         kv_transfer_params: None,
         ec_transfer_params: None,
         trace_headers: None,
-        prefill_stats,
+        prefill_stats: prefill_stats.map(Box::new),
         routed_experts: None,
         num_nans_in_logits: 0,
         mm_cache_miss_hashes: None,
         new_sampling_mask: None,
         spec_decode_metrics: None,
         prompt_token_id_logprobs: None,
+        error: None,
     }
 }
 

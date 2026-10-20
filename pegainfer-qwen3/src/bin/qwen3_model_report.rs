@@ -511,6 +511,7 @@ fn measure_call(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
         "fused_add_rms_norm_batch" => measure_fused_add_rms_norm(call, iters),
         "silu_mul_fused_batch" => measure_silu_mul_fused(call, iters),
         "split_qkv" => measure_split_qkv(call, iters),
+        "suppress_logits_bf16" => measure_suppress_logits(call, iters),
         other => bail!("no benchmark provider for op `{other}`"),
     }
 }
@@ -527,6 +528,24 @@ fn measure_embedding(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let mut out = HiddenStates::zeros(&ctx, hidden, batch)?;
     measure_loop(&ctx, iters, || {
         ops::embedding_batch(&ctx, &embed, &token_ids, &mut out)?;
+        Ok(())
+    })
+}
+
+fn measure_suppress_logits(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let logits = output(call, "logits")?;
+    let rows = axis(logits, "vocab")?;
+    let batch = axis(logits, "batch")?;
+    let ids = attr_usize(call, "ids")?;
+    anyhow::ensure!(ids <= rows, "suppress_logits ids {ids} exceed rows {rows}");
+    let tail = (rows - ids..rows)
+        .map(u32::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let ctx = DeviceContext::new()?;
+    let mut logits = HiddenStates::zeros(&ctx, rows, batch)?;
+    let tail = ops::SuppressIds::upload(&ctx, &tail, rows)?;
+    measure_loop(&ctx, iters, || {
+        ops::suppress_logits_bf16_in_place(&ctx, &mut logits, &tail)?;
         Ok(())
     })
 }

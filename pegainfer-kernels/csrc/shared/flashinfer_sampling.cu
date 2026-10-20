@@ -107,7 +107,7 @@ extern "C" int gpu_sample_batch_flashinfer_cuda(
       // each element from its own index.
       err = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
           probs_scratch, probs_scratch, const_cast<int*>(top_k_arr), n_rows,
-          /*top_k_val=*/0, vocab_size, row_states, stream);
+          /*top_k_val=*/0, vocab_size, row_states, /*deterministic=*/false, stream);
       if (err != cudaSuccess) {
         return static_cast<int>(err);
       }

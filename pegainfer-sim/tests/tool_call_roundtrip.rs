@@ -273,9 +273,9 @@ impl ToolCallSimServer {
 
 /// Model dir at a path containing `qwen3`. `ParserSelection::Auto` resolves the
 /// parser from the *model path string* (`config.model`) by case-insensitive
-/// substring match against a registry (`qwen3` -> `qwen3_xml`) — a random temp
+/// substring match against a registry (`qwen3` -> `qwen3_json`) — a random temp
 /// dir has no model-family name and would fail with `ParserUnavailableForModel`.
-/// The `qwen3-` prefix makes `Auto` select the qwen3 XML parser exactly as it
+/// The `qwen3-` prefix makes `Auto` select the qwen3 JSON parser exactly as it
 /// would for `models/Qwen3-4B` in production.
 fn qwen_model_dir() -> Result<TempDir> {
     let dir = tempfile::Builder::new()

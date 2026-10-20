@@ -773,6 +773,23 @@ impl<'a> From<&'a HiddenStates> for Columns<'a> {
     }
 }
 
+impl Columns<'_> {
+    /// Panics unless the band lies within the row. `columns` and the public
+    /// fields accept any band, and a launch that reads `width` columns at the
+    /// row stride from `col` would otherwise run past the last row's end.
+    pub fn assert_in_row(&self, what: &str) {
+        assert!(
+            self.col
+                .checked_add(self.width)
+                .is_some_and(|end| end <= self.states.hidden_dim),
+            "{what} columns [{}..+{}) exceed the row's {}",
+            self.col,
+            self.width,
+            self.states.hidden_dim
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

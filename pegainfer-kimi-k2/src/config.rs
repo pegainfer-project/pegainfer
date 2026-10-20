@@ -4,9 +4,6 @@
 // helpers are intentionally kept compiling in feature-off builds.
 #![cfg_attr(not(feature = "kimi-k2"), allow(dead_code))]
 
-use std::fs;
-use std::path::Path;
-
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -252,58 +249,6 @@ pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Stop-token IDs for EOS detection. `generation_config.json` is authoritative
-/// (it may list several); `config.json`'s `eos_token_id` is the fallback. A
-/// chat model without either cannot signal end-of-turn, so this fails instead
-/// of letting every request silently run to `max_tokens`.
-pub(crate) fn load_stop_token_ids(model_path: &Path) -> Result<Vec<u32>> {
-    let stop_token_ids = read_stop_token_ids(model_path)?;
-    log::info!("stop tokens: {stop_token_ids:?}");
-    Ok(stop_token_ids)
-}
-
-fn read_stop_token_ids(model_path: &Path) -> Result<Vec<u32>> {
-    let generation_config_path = model_path.join("generation_config.json");
-    match fs::read_to_string(&generation_config_path) {
-        Ok(content) => {
-            let json: Value = serde_json::from_str(&content)
-                .with_context(|| format!("parse {}", generation_config_path.display()))?;
-            eos_token_ids(&json).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} has no usable eos_token_id",
-                    generation_config_path.display()
-                )
-            })
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let config_path = model_path.join("config.json");
-            let content = fs::read_to_string(&config_path)
-                .with_context(|| format!("read {}", config_path.display()))?;
-            let json: Value = serde_json::from_str(&content)
-                .with_context(|| format!("parse {}", config_path.display()))?;
-            // kimi_k25 wraps the text model config in text_config.
-            eos_token_ids(&json)
-                .or_else(|| json.get("text_config").and_then(eos_token_ids))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("{} has no usable eos_token_id", config_path.display())
-                })
-        }
-        Err(err) => Err(err).with_context(|| format!("read {}", generation_config_path.display())),
-    }
-}
-
-fn eos_token_ids(json: &Value) -> Option<Vec<u32>> {
-    let to_u32 = |value: &Value| value.as_u64().and_then(|id| u32::try_from(id).ok());
-    match json.get("eos_token_id")? {
-        Value::Array(ids) => {
-            let mut ids = ids.iter().map(to_u32).collect::<Option<Vec<_>>>()?;
-            ids.dedup();
-            (!ids.is_empty()).then_some(ids)
-        }
-        id => to_u32(id).map(|id| vec![id]),
-    }
-}
-
 fn string_field(json: &Value, key: &str) -> Result<String> {
     json.get(key)
         .and_then(Value::as_str)
@@ -409,32 +354,5 @@ impl KimiK2ParallelShape {
     #[must_use]
     pub(crate) fn parallel_config(&self) -> pegainfer_frontend::parallel::ParallelConfig {
         pegainfer_frontend::parallel::ParallelConfig::new(self.tp_world, self.dp_world)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::eos_token_ids;
-
-    #[test]
-    fn eos_token_ids_accepts_single_and_array() {
-        assert_eq!(
-            eos_token_ids(&json!({"eos_token_id": 163_586})),
-            Some(vec![163_586])
-        );
-        assert_eq!(
-            eos_token_ids(&json!({"eos_token_id": [163_585, 163_586, 163_586]})),
-            Some(vec![163_585, 163_586])
-        );
-    }
-
-    #[test]
-    fn eos_token_ids_rejects_missing_or_malformed() {
-        assert_eq!(eos_token_ids(&json!({})), None);
-        assert_eq!(eos_token_ids(&json!({"eos_token_id": []})), None);
-        assert_eq!(eos_token_ids(&json!({"eos_token_id": "eos"})), None);
-        assert_eq!(eos_token_ids(&json!({"eos_token_id": [163_585, -1]})), None);
     }
 }

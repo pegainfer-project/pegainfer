@@ -5,7 +5,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
 use pegainfer_frontend::engine::Request;
@@ -25,22 +29,42 @@ use crate::executor::RequestId;
 use crate::executor::UnifiedPlan;
 use crate::executor::UnifiedResult;
 
+/// Decode-overlap prefills park until a test opens the gate; the counters let
+/// the test wait for a launch or for scheduler steps.
+#[derive(Default)]
+pub(crate) struct AsyncPrefillGate {
+    /// Synchronous prefills wait while set, so a test can queue requests behind one.
+    pub(crate) hold_prefill: AtomicBool,
+    /// When non-zero, `hold_prefill` holds only the synchronous prefill with
+    /// this 1-based call number.
+    pub(crate) hold_call: AtomicUsize,
+    /// Synchronous prefills entered so far.
+    pub(crate) prefill_calls: AtomicUsize,
+    pub(crate) open: AtomicBool,
+    pub(crate) launches: AtomicUsize,
+    pub(crate) polls: AtomicUsize,
+}
+
 pub(crate) struct FakeExecutor {
     pub(crate) block_size: usize,
     max_request_blocks: usize,
     max_context_tokens: usize,
+    max_decode_batch_size: usize,
     available_blocks: usize,
     held_tokens: HashMap<RequestId, usize>,
     // Prompt progress of requests mid-chunked-prefill (mirrors the real
     // executor's kv_position so multi-chunk scheduling is exercised).
     prefill_positions: HashMap<RequestId, usize>,
     fail_decode_once: bool,
+    worker_lost: bool,
     decode_delay: Duration,
     loaded_lora_adapters: HashSet<String>,
     pub(crate) dropped: Arc<Mutex<Vec<u64>>>,
     pub(crate) prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
     emit_logprobs: bool,
+    async_prefill: Option<Arc<AsyncPrefillGate>>,
+    parked_prefill: Option<PrefillResult>,
 }
 
 impl FakeExecutor {
@@ -49,17 +73,31 @@ impl FakeExecutor {
             block_size: 16,
             max_request_blocks,
             max_context_tokens: usize::MAX,
+            max_decode_batch_size: 64,
             available_blocks: max_request_blocks,
             held_tokens: HashMap::new(),
             prefill_positions: HashMap::new(),
             fail_decode_once: false,
+            worker_lost: false,
             decode_delay: Duration::ZERO,
             loaded_lora_adapters: HashSet::new(),
             dropped,
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
             emit_logprobs: false,
+            async_prefill: None,
+            parked_prefill: None,
         }
+    }
+
+    pub(crate) fn with_max_decode_batch_size(mut self, slots: usize) -> Self {
+        self.max_decode_batch_size = slots;
+        self
+    }
+
+    pub(crate) fn with_async_prefill(mut self, gate: Arc<AsyncPrefillGate>) -> Self {
+        self.async_prefill = Some(gate);
+        self
     }
 
     pub(crate) fn with_stop_token(mut self, token: u32) -> Self {
@@ -74,6 +112,12 @@ impl FakeExecutor {
 
     pub(crate) fn with_decode_failure(mut self) -> Self {
         self.fail_decode_once = true;
+        self
+    }
+
+    /// Decode fails the way the real executor does once a rank worker is gone.
+    pub(crate) fn with_worker_lost(mut self) -> Self {
+        self.worker_lost = true;
         self
     }
 
@@ -122,6 +166,16 @@ impl FakeExecutor {
         }
     }
 
+    /// The real executor panics past its largest decode graph bucket.
+    fn check_decode_batch(&self, rows: usize) -> Result<()> {
+        anyhow::ensure!(
+            rows <= self.max_decode_batch_size,
+            "fake decode batch {rows} exceeds {} slots",
+            self.max_decode_batch_size
+        );
+        Ok(())
+    }
+
     pub(crate) fn ensure_request_tokens(
         &mut self,
         request_id: RequestId,
@@ -154,7 +208,7 @@ impl ModelExecutor for FakeExecutor {
     }
 
     fn max_decode_batch_size(&self) -> usize {
-        64
+        self.max_decode_batch_size
     }
 
     fn available_blocks(&self) -> usize {
@@ -201,6 +255,21 @@ impl ModelExecutor for FakeExecutor {
     }
 
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
+        if let Some(gate) = &self.async_prefill {
+            let call = gate.prefill_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let held = || {
+                let only = gate.hold_call.load(Ordering::SeqCst);
+                gate.hold_prefill.load(Ordering::SeqCst) && (only == 0 || only == call)
+            };
+            let start = Instant::now();
+            while held() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "fake prefill held"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         for req in plan.requests {
             self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
         }
@@ -222,6 +291,10 @@ impl ModelExecutor for FakeExecutor {
             self.fail_decode_once = false;
             anyhow::bail!("fake decode KV capacity exhausted");
         }
+        if self.worker_lost {
+            return Err(crate::executor::worker_lost("fake rank worker exited"));
+        }
+        self.check_decode_batch(plan.requests.len())?;
 
         for req in plan.requests {
             let current_tokens = self
@@ -253,6 +326,7 @@ impl ModelExecutor for FakeExecutor {
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
+        self.check_decode_batch(plan.decode_requests.len())?;
         for req in plan.prefill_requests {
             self.ensure_request_tokens(req.request_id, req.prompt_tokens.len())?;
         }
@@ -265,12 +339,21 @@ impl ModelExecutor for FakeExecutor {
             self.ensure_request_tokens(req.request_id, current_tokens + 1)?;
         }
 
+        let mut prefill_requests: Vec<_> = plan
+            .prefill_requests
+            .iter()
+            .map(|req| self.fake_prefill_result(req))
+            .collect();
+        if let Some(gate) = &self.async_prefill {
+            self.parked_prefill = Some(PrefillResult {
+                requests: std::mem::take(&mut prefill_requests),
+                dflash_context_captured_requests: Vec::new(),
+            });
+            gate.launches.fetch_add(1, Ordering::SeqCst);
+        }
+
         Ok(UnifiedResult {
-            prefill_requests: plan
-                .prefill_requests
-                .iter()
-                .map(|req| self.fake_prefill_result(req))
-                .collect(),
+            prefill_requests,
             decode_requests: plan
                 .decode_requests
                 .iter()
@@ -281,6 +364,20 @@ impl ModelExecutor for FakeExecutor {
                 })
                 .collect(),
         })
+    }
+
+    fn has_decode_overlap(&self) -> bool {
+        self.async_prefill.is_some()
+    }
+
+    fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
+        let gate = self.async_prefill.as_ref()?;
+        gate.polls.fetch_add(1, Ordering::SeqCst);
+        if gate.open.load(Ordering::SeqCst) {
+            self.parked_prefill.take()
+        } else {
+            None
+        }
     }
 }
 

@@ -30,7 +30,12 @@ use super::common::patterned_bf16;
 /// same convention as the attention constants in `common`.
 pub(crate) const HIDDEN_SIZE: usize = 2560;
 pub(crate) const INTERMEDIATE_SIZE: usize = 9728;
+/// Rows in Qwen3-4B's checkpoint embedding table.
 pub(crate) const VOCAB_SIZE: usize = 151_936;
+/// Rows the frontend can decode and production output selection may inspect.
+const DECODABLE_VOCAB_SIZE: usize = 151_669;
+/// Aligned rows computed by Qwen3-4B's production output projection.
+pub(crate) const LOGITS_ROWS: usize = 151_680;
 const Q_DIM: usize = NUM_QO_HEADS * HEAD_DIM;
 const KV_DIM: usize = NUM_KV_HEADS * HEAD_DIM;
 /// Position span for the decode qk-norm-rope bench: mid-context decode is the
@@ -91,7 +96,7 @@ impl GemmProjection {
             Self::OProj => (HIDDEN_SIZE, Q_DIM),
             Self::GateUpHalf => (INTERMEDIATE_SIZE, HIDDEN_SIZE),
             Self::DownProj => (HIDDEN_SIZE, INTERMEDIATE_SIZE),
-            Self::LmHead => (VOCAB_SIZE, HIDDEN_SIZE),
+            Self::LmHead => (LOGITS_ROWS, HIDDEN_SIZE),
         }
     }
 }
@@ -202,18 +207,21 @@ fn ones_vec(ctx: &DeviceContext, len: usize) -> Result<DeviceVec> {
 /// FlashInfer rejection sampler's round count depends on that peakedness — a
 /// flat synthetic vocabulary would overstate its cost. Each row gets a few
 /// dominant logits (top-1 mass ~0.5 after softmax) over a low-noise floor, at
-/// row-varying positions.
+/// row-varying positions; the aligned non-decodable tail is negative infinity.
 fn peaked_logits(ctx: &DeviceContext, rows: usize) -> Result<HiddenStates> {
-    let mut host = patterned_bf16(VOCAB_SIZE * rows, 0.001);
+    let mut host = patterned_bf16(LOGITS_ROWS * rows, 0.001);
     for row in 0..rows {
         for peak in 0..8 {
-            let token = (row * 48_271 + peak * 15_485_863) % VOCAB_SIZE;
-            host[row * VOCAB_SIZE + token] = bf16::from_f32(10.0 - peak as f32);
+            let token = (row * 48_271 + peak * 15_485_863) % DECODABLE_VOCAB_SIZE;
+            host[row * LOGITS_ROWS + token] = bf16::from_f32(10.0 - peak as f32);
+        }
+        for token in DECODABLE_VOCAB_SIZE..LOGITS_ROWS {
+            host[row * LOGITS_ROWS + token] = bf16::from_f32(f32::NEG_INFINITY);
         }
     }
     Ok(HiddenStates {
         data: ctx.stream.clone_htod(&host)?,
-        hidden_dim: VOCAB_SIZE,
+        hidden_dim: LOGITS_ROWS,
         seq_len: rows,
     })
 }
@@ -333,7 +341,12 @@ impl DenseCase {
                 };
                 DenseBuffers::Sampling {
                     logits: peaked_logits(&ctx, rows)?,
-                    scratch: pegainfer_sample::SampleScratch::new(&ctx, VOCAB_SIZE, rows)?,
+                    scratch: pegainfer_sample::SampleScratch::with_selection_width(
+                        &ctx,
+                        LOGITS_ROWS,
+                        DECODABLE_VOCAB_SIZE,
+                        rows,
+                    )?,
                     params: vec![params; rows],
                     seed: 0x5eed,
                 }

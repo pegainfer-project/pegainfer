@@ -71,9 +71,8 @@ struct ActiveRequestState {
     trace: RequestTrace,
 }
 
-#[derive(Clone, Copy)]
 struct FinishPolicy {
-    eos_token_id: u32,
+    eos_token_ids: Vec<u32>,
     ignore_eos: bool,
 }
 
@@ -264,7 +263,7 @@ impl MixedRequestScheduler {
             generated: 0,
             last_token: next,
             finish_policy: FinishPolicy {
-                eos_token_id: self.generator.config().eos_token_id,
+                eos_token_ids: self.generator.config().eos_token_ids.clone(),
                 ignore_eos: pending.params.ignore_eos,
             },
             cache,
@@ -552,7 +551,7 @@ impl ActiveRequestState {
         pending_queue_size_at_terminal: usize,
     ) -> bool {
         self.last_token = token;
-        if !self.finish_policy.ignore_eos && token == self.finish_policy.eos_token_id {
+        if !self.finish_policy.ignore_eos && self.finish_policy.eos_token_ids.contains(&token) {
             self.log_http_trace(
                 FinishReason::Stop,
                 None,

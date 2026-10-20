@@ -76,6 +76,7 @@ use weights::Glm52RankLoadBundle;
 use weights::Glm52WeightManifest;
 
 use crate::config::GLM52_MAX_CONTEXT;
+use crate::config::GLM52_VOCAB;
 use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::glm52_arena_bytes;
 use crate::model::glm52_pool_blocks;
@@ -977,7 +978,7 @@ fn start_engine(
         )),
     );
 
-    let eos_token_ids = read_eos_token_ids(model_path)?;
+    let eos_token_ids = pegainfer_core::eos::eos_token_ids(model_path, GLM52_VOCAB)?;
     // Exactly-known VRAM that lands AFTER the workers' free-VRAM measurement
     // (post-FinishKv): the DeepEP/DeepGEMM buffers created in SetupComm, and
     // — when DSpark is on — the draft weights reserve plus its cap-scaled
@@ -1629,33 +1630,6 @@ fn store_runtime_handle() -> tokio::runtime::Handle {
         })
         .handle()
         .clone()
-}
-
-/// EOS ids from the checkpoint's generation_config.json (`eos_token_id` is a
-/// number or an array of numbers).
-fn read_eos_token_ids(model_path: &Path) -> Result<Vec<u32>> {
-    let path = model_path.join("generation_config.json");
-    let content = std::fs::read_to_string(&path)
-        .map_err(|err| anyhow::anyhow!("read {}: {err}", path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|err| anyhow::anyhow!("parse {}: {err}", path.display()))?;
-    let field = json
-        .get("eos_token_id")
-        .ok_or_else(|| anyhow::anyhow!("{} missing eos_token_id", path.display()))?;
-    let as_u32 = |value: &serde_json::Value| -> Result<u32> {
-        value
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or_else(|| anyhow::anyhow!("eos_token_id entry {value} is not a u32"))
-    };
-    let ids = match field {
-        serde_json::Value::Array(entries) => {
-            entries.iter().map(as_u32).collect::<Result<Vec<_>>>()?
-        }
-        other => vec![as_u32(other)?],
-    };
-    ensure!(!ids.is_empty(), "eos_token_id list is empty");
-    Ok(ids)
 }
 
 fn validate_startup(

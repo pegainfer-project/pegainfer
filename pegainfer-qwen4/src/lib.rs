@@ -6,6 +6,8 @@
 //! device, no weights and no Triton build. Slice B adds the device side behind a
 //! feature of its own, and these modules then move behind
 //! `#[cfg(any(<that feature>, test))]` the way `pegainfer-gemma4/src/lib.rs` does.
+//! The Gated DeltaNet decode wrappers this line will drive already live in
+//! `pegainfer_kernels::ops` under the kernels' `qwen35` feature.
 
 mod config;
 // Only tests read the contract until slice B's loader checks a checkpoint with it.
