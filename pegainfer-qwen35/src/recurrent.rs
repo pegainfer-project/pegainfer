@@ -5,6 +5,8 @@ use cudarc::driver::DevicePtrMut;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kernels::ops::GDN_AOT_KEY_HEAD_DIM;
+use pegainfer_kernels::ops::GDN_AOT_VALUE_HEAD_DIM;
 
 use crate::ffi;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
