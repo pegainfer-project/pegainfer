@@ -100,6 +100,7 @@ impl Qwen3Executor {
             kv_views,
             sample_seed: plan.sample_seed,
             verify_round,
+            gated: plan.gated,
         };
         let outcome = match self.run_step(&step) {
             Ok(outcome) => outcome,
@@ -194,7 +195,12 @@ impl Qwen3Executor {
         if let Some(counters) = self.spec_decode_counters.as_mut() {
             for (req, req_result) in plan.requests.iter().zip(&result.requests) {
                 let num_draft_tokens = req.as_slice().len().saturating_sub(1);
-                counters.observe_draft(num_draft_tokens, req_result.matched_draft_tokens);
+                // A load-gated round verifies a one-token span and proposes no
+                // draft; booking it as one would inflate the published draft
+                // count and dilute the acceptance rate.
+                if num_draft_tokens > 0 {
+                    counters.observe_draft(num_draft_tokens, req_result.matched_draft_tokens);
+                }
             }
         }
 

@@ -56,11 +56,22 @@ pub(crate) struct VerifyGraphBuffers {
     token_ids_d: CudaSlice<u32>,
     /// Paged-attention plan, refilled in place each step.
     plan: PrefillPagedPlan,
-    /// Piecewise CUDA Graphs: `graphs[bucket_idx][segment]`. Each bucket's verify
-    /// forward is split into `num_layers + 1` dense segments (attention runs eager
-    /// between them); a segment is captured once at its exact-bucket batch and
-    /// replayed thereafter. Empty (`CudaGraphState::new()`) until first captured.
-    graphs: Vec<Vec<CudaGraphState>>,
+    /// Piecewise CUDA Graphs: `graphs[variant][bucket_idx][segment]`. Each
+    /// bucket's verify forward is split into `num_layers + 1` dense segments
+    /// (attention runs eager between them); a segment is captured once at its
+    /// exact-bucket batch and replayed thereafter. Empty (`CudaGraphState::new()`)
+    /// until first captured.
+    ///
+    /// The first axis is the **span variant** (see [`Self::spans`]): a captured
+    /// segment bakes its row count, so the one-token gated round and the
+    /// full-span round need separate graph sets over the same buffers.
+    graphs: Vec<Vec<Vec<CudaGraphState>>>,
+    /// Rows per request each span variant covers. Variant 0 is the configured
+    /// verify span (the checkpoint's, shortened by a
+    /// `PEGAINFER_SPEC_MAX_DRAFTS` trim); the gated round's one-token span
+    /// follows. A step whose rows match no variant exactly (a truncated span)
+    /// runs eager.
+    spans: Vec<usize>,
     /// `NumericPolicy` when these graphs were built; asserted unchanged at capture/replay. They bake
     /// the policy-selected GEMM algo and are keyed `(bucket, segment)` without policy — the same
     /// policy-key-trap the decode graphs guard.
@@ -91,6 +102,14 @@ impl VerifyGraphBuffers {
         let inter_dim = model.local_intermediate_size();
         let logits_rows = model.config().logits_rows;
         let max_total_rows = max_batch * span;
+        // Span variants: the checkpoint's verify span, plus the gated round's
+        // one-token span. Both draw from the same buffers — the one-token rows
+        // fit inside the widest variant — but each needs its own captured
+        // graphs, because a captured segment bakes its row count.
+        let mut spans = vec![span];
+        if span > 1 {
+            spans.push(1);
+        }
 
         // Each request's `span` query tokens fan out to `span * group_size`
         // packed-QO rows; with a CTA tile of at least 1, that bounds tiles per
@@ -124,14 +143,23 @@ impl VerifyGraphBuffers {
                 max_tiles,
             )?,
             // num_layers + 1 dense segments per bucket (attention is eager between).
-            graphs: BATCH_BUCKETS
+            // One graph set per span variant: a captured segment bakes its row
+            // count, so the gated round's one-token rows and the full-span rows
+            // cannot share a graph.
+            graphs: spans
                 .iter()
                 .map(|_| {
-                    (0..=model.config().num_hidden_layers)
-                        .map(|_| CudaGraphState::new())
+                    BATCH_BUCKETS
+                        .iter()
+                        .map(|_| {
+                            (0..=model.config().num_hidden_layers)
+                                .map(|_| CudaGraphState::new())
+                                .collect()
+                        })
                         .collect()
                 })
                 .collect(),
+            spans,
             policy_at_construction: numeric_policy(),
             max_batch,
             span,
@@ -170,6 +198,18 @@ impl VerifyGraphBuffers {
     pub(crate) fn captured_hidden(&self) -> &HiddenStates {
         &self.captured_hidden
     }
+}
+
+/// The span variant whose rows a step matches exactly, or `None` when it
+/// matches none (a truncated span, or rows that no variant covers).
+///
+/// The match is exact on purpose: a captured segment bakes its row count, so
+/// a step may only replay the variant recorded at the same shape. Returning
+/// `None` sends the step eager, which is always correct.
+fn span_variant(spans: &[usize], total_tokens: usize, batch_size: usize) -> Option<usize> {
+    spans
+        .iter()
+        .position(|&span| total_tokens == batch_size * span)
 }
 
 impl Qwen3Model {
@@ -279,55 +319,50 @@ impl Qwen3Model {
         // `total_tokens` varies at a fixed `batch_size`. Replaying a segment that
         // was captured at one row count at a *different* count processes the wrong
         // number of rows and leaves the tail rows stale — silently corrupting the
-        // verify logits of the trailing requests. So only the full, maximal
-        // `batch_size * span` shape (every request contributing a full span) uses
-        // the graph; any truncated step runs eager. This makes
-        // capture-shape == replay-shape an invariant by construction.
-        let full_shape = total_tokens == batch_size * bufs.span;
-        match BATCH_BUCKETS.iter().position(|&b| b == batch_size) {
-            Some(bidx) if full_shape => {
-                if bufs.graphs[bidx].is_empty() || !bufs.graphs[bidx][0].is_captured() {
-                    log::info!(
-                        "verify graph capturing: bucket {batch_size} span {span}",
-                        span = bufs.span
-                    );
-                }
-                assert_eq!(
-                    numeric_policy(),
-                    bufs.policy_at_construction,
-                    "NumericPolicy changed after the verify graphs were captured; they are keyed (bucket, segment) without policy, so build a fresh executor per policy (policy-key-trap)"
-                );
-                // Take the bucket's segment graphs out so the capture closures can
-                // borrow `bufs` mutably; restore them after (even on error).
-                let mut segs = std::mem::take(&mut bufs.graphs[bidx]);
-                let result = (|| -> Result<()> {
-                    segs[0].run_or_capture(ctx, || self.verify_seg_embed_pre(bufs))?;
-                    self.verify_attn(0, kv_buffer, layout, bufs)?;
-                    for (i, segment) in segs.iter_mut().enumerate().take(num_layers).skip(1) {
-                        segment.run_or_capture(ctx, || {
-                            self.verify_seg_post_pre(i, capture_layer_ids, bufs)
-                        })?;
-                        self.verify_attn(i, kv_buffer, layout, bufs)?;
-                    }
-                    segs[num_layers].run_or_capture(ctx, || {
-                        self.verify_seg_post_logits(capture_layer_ids, bufs)
-                    })?;
-                    Ok(())
-                })();
-                bufs.graphs[bidx] = segs;
-                result?;
+        // verify logits of the trailing requests. So only a step whose rows match
+        // a span variant exactly (every request contributing a full span of that
+        // variant) uses that variant's graph; any other shape runs eager. This
+        // makes capture-shape == replay-shape an invariant by construction.
+        let variant = span_variant(&bufs.spans, total_tokens, batch_size);
+        let bucket = BATCH_BUCKETS.iter().position(|&b| b == batch_size);
+        if let (Some(bidx), Some(vidx)) = (bucket, variant) {
+            let span = bufs.spans[vidx];
+            if bufs.graphs[vidx][bidx].is_empty() || !bufs.graphs[vidx][bidx][0].is_captured() {
+                log::info!("verify graph capturing: bucket {batch_size} span {span}");
             }
-            // Off-bucket batch, or a truncated (non-full-span) step: run the same
-            // segments eager (no capture).
-            _ => {
-                self.verify_seg_embed_pre(bufs)?;
+            assert_eq!(
+                numeric_policy(),
+                bufs.policy_at_construction,
+                "NumericPolicy changed after the verify graphs were captured; they are keyed (bucket, segment) without policy, so build a fresh executor per policy (policy-key-trap)"
+            );
+            // Take the bucket's segment graphs out so the capture closures can
+            // borrow `bufs` mutably; restore them after (even on error).
+            let mut segs = std::mem::take(&mut bufs.graphs[vidx][bidx]);
+            let result = (|| -> Result<()> {
+                segs[0].run_or_capture(ctx, || self.verify_seg_embed_pre(bufs))?;
                 self.verify_attn(0, kv_buffer, layout, bufs)?;
-                for i in 1..num_layers {
-                    self.verify_seg_post_pre(i, capture_layer_ids, bufs)?;
+                for (i, segment) in segs.iter_mut().enumerate().take(num_layers).skip(1) {
+                    segment.run_or_capture(ctx, || {
+                        self.verify_seg_post_pre(i, capture_layer_ids, bufs)
+                    })?;
                     self.verify_attn(i, kv_buffer, layout, bufs)?;
                 }
-                self.verify_seg_post_logits(capture_layer_ids, bufs)?;
+                segs[num_layers]
+                    .run_or_capture(ctx, || self.verify_seg_post_logits(capture_layer_ids, bufs))?;
+                Ok(())
+            })();
+            bufs.graphs[vidx][bidx] = segs;
+            result?;
+        } else {
+            // Off-bucket batch, or a truncated (non-full-span) step: run the same
+            // segments eager (no capture).
+            self.verify_seg_embed_pre(bufs)?;
+            self.verify_attn(0, kv_buffer, layout, bufs)?;
+            for i in 1..num_layers {
+                self.verify_seg_post_pre(i, capture_layer_ids, bufs)?;
+                self.verify_attn(i, kv_buffer, layout, bufs)?;
             }
+            self.verify_seg_post_logits(capture_layer_ids, bufs)?;
         }
 
         Ok(())
@@ -451,5 +486,23 @@ impl Qwen3Model {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::span_variant;
+
+    #[test]
+    fn span_variant_matches_only_an_exact_full_span() {
+        let spans = [8, 1];
+        // Full-span and gated shapes at bucket 8 each hit their own variant.
+        assert_eq!(span_variant(&spans, 64, 8), Some(0));
+        assert_eq!(span_variant(&spans, 8, 8), Some(1));
+        // Every truncated shape must run eager: replaying a graph at a
+        // different row count would leave the tail rows stale.
+        assert_eq!(span_variant(&spans, 63, 8), None);
+        assert_eq!(span_variant(&spans, 9, 8), None);
+        assert_eq!(span_variant(&spans, 16, 8), None);
     }
 }

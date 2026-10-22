@@ -496,6 +496,7 @@ fn execute_step_on_lane(
             kv_views,
             sample_seed,
             verify_round,
+            gated,
         } => {
             // One target forward over each request's K+1 draft span with a
             // speculative KV view. The fixed-buffer verify path computes all-
@@ -503,8 +504,13 @@ fn execute_step_on_lane(
             // token at each span position) and captures the target hidden states
             // (at the DFlash layers) to seed the next draft — all into reused,
             // pointer-stable scratch (`VerifyGraphBuffers`).
-            let result =
-                lane.execute_dflash_verify(requests, kv_views, *sample_seed, *verify_round)?;
+            let result = lane.execute_dflash_verify(
+                requests,
+                kv_views,
+                *sample_seed,
+                *verify_round,
+                *gated,
+            )?;
             Ok(WorkerStepOutcome::SpeculativeVerify(result))
         }
         StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
@@ -3194,9 +3200,11 @@ impl Drop for Qwen3Executor {
 #[derive(Clone, Debug)]
 struct DFlashMeta {
     block_size: usize,
-    /// Max drafts proposed per verify step (`K`). The span leads with the anchor
-    /// (`[anchor, draft_1, …]`), so this is `verify_span - 1` under either block
-    /// layout — anchor-first vs anchor-drop is already folded into `verify_span()`.
+    /// Max drafts proposed per verify step (`K`), after any
+    /// `PEGAINFER_SPEC_MAX_DRAFTS` trim. The span leads with the anchor
+    /// (`[anchor, draft_1, …]`), so the span is `K + 1` under either block
+    /// layout — anchor-first vs anchor-drop is already folded into the
+    /// drafter's draft count.
     num_spec_tokens: usize,
     /// Draft's max cacheable position; with the `block_size` in-fill headroom
     /// this caps the DFlash-effective context to `max_position_embeddings - block_size`.
@@ -3417,7 +3425,7 @@ impl LocalQwen3Lane {
         model.tune_gemm_algos(&self.model)?;
         let meta = DFlashMeta {
             block_size: model.block_size(),
-            num_spec_tokens: model.verify_span().saturating_sub(1),
+            num_spec_tokens: model.effective_drafts(),
             max_position_embeddings: model.max_position_embeddings(),
             target_layer_ids: model.target_layer_ids().to_vec(),
         };
@@ -3738,6 +3746,9 @@ impl LocalQwen3Lane {
             &final_results,
             Some(bufs.captured_hidden()),
             verify_round,
+            // A hedged round always verifies at least one draft; a gated round
+            // cannot be hedged (its spans are one token).
+            false,
         )?;
         if trace {
             for idx in 0..requests.len() {
@@ -3776,7 +3787,7 @@ impl LocalQwen3Lane {
         }))
     }
 
-    /// DFlash verify forward over each request's `block_size`-token span, using
+    /// DFlash verify forward over each request's verify span, using
     /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation),
     /// lazily built on first use. Numerically equivalent to the
     /// `batch_prefill(all_position_logits=true)` verify path it replaces.
@@ -3786,18 +3797,20 @@ impl LocalQwen3Lane {
         kv_views: &[KvView],
         sample_seed: u64,
         verify_round: u64,
+        gated: bool,
     ) -> Result<VerifyResult> {
         let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
             anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
         })?;
         // Verify span = anchor + drafts: `block_size` for DFlash, `block_size + 1`
-        // for DSpark (anchor-first). The graph buffers + replay shape key off this.
+        // for DSpark (anchor-first), shortened by a `PEGAINFER_SPEC_MAX_DRAFTS`
+        // trim. The graph buffers + replay shape key off this.
         let verify_span = self
             .dflash
             .as_ref()
             .expect("DFlash present when capture layers exist")
             .model
-            .verify_span();
+            .effective_verify_span();
 
         if self.verify_bufs.is_none() {
             let max_batch = *BATCH_BUCKETS.last().unwrap();
@@ -3888,6 +3901,7 @@ impl LocalQwen3Lane {
                 &request_results,
                 Some(bufs.captured_hidden()),
                 verify_round,
+                gated,
             )?;
             Ok(VerifyResult {
                 requests: request_results,
@@ -3998,6 +4012,8 @@ enum StepCommand {
         kv_views: Vec<KvView>,
         sample_seed: u64,
         verify_round: u64,
+        /// The load gate turned drafting off for this step (see `VerifyPlan`).
+        gated: bool,
     },
     /// Speculative draft: roll the DFlash draft model forward one block per
     /// request. Uses the draft's own KV — no target KV views.

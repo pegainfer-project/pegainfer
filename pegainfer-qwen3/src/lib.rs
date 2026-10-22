@@ -17,6 +17,7 @@ mod prefill;
 mod projection_fusion;
 mod scheduler;
 mod sizing;
+mod spec_env;
 mod speculative;
 mod split_kv;
 mod unified_forward;
@@ -259,6 +260,9 @@ pub struct Qwen3LaunchOptions {
     reason = "launch is a one-shot ownership boundary used by external worker threads"
 )]
 pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<Engine> {
+    // Spec-knob validation lives in the shared start paths
+    // (`start_engine_with_offload_inner` / `start_engine_with_lora_control`),
+    // which this function delegates to.
     let device_ordinals = if options.tp_size == 1 {
         vec![options.device_ordinal]
     } else {
@@ -414,6 +418,10 @@ fn start_engine_with_offload_inner(
     dflash_draft_model_path: Option<&Path>,
     dump_graph_png: Option<&Path>,
 ) -> Result<Engine> {
+    // Refuse to start on a malformed spec knob instead of silently running with
+    // the lever off (unset and an explicit `0` still mean off). This is the
+    // non-LoRA start path.
+    crate::spec_env::validate(|name| std::env::var(name).ok())?;
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
@@ -465,6 +473,10 @@ pub fn start_engine_with_lora_control(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
 ) -> Result<Engine> {
+    // Refuse to start on a malformed spec knob instead of silently running with
+    // the lever off (unset and an explicit `0` still mean off). This is the
+    // LoRA start path.
+    crate::spec_env::validate(|name| std::env::var(name).ok())?;
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,

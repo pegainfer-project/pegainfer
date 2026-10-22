@@ -67,6 +67,11 @@ pub(crate) struct VerifyPlan<'a> {
     /// Engine step seed for the verify rows' sampler pass (same contract as
     /// decode: fresh per step; seeded rows re-mix their own request seed).
     pub sample_seed: u64,
+    /// The load gate turned drafting off for this step: every span is the
+    /// request's confirmed token alone. Carried separately from the span
+    /// length because a near-budget request's span is also one token — only
+    /// this flag says *why* the round has no drafts.
+    pub gated: bool,
 }
 
 #[derive(Clone, Debug)]

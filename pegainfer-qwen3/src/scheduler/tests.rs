@@ -782,3 +782,48 @@ fn speculative_resolves_each_request_independently() {
             if *request_id == RequestId::new(2)
     ));
 }
+
+// ── Load gate: a gated batch must keep its draft context ──────────────────
+//
+// The regression this pins: a gated batch must NOT be routed to a plain
+// decode. A plain decode advances the sequence outside the speculative path,
+// so the executor drops the captured draft context — and only a fresh prefill
+// can rebuild it. A gate that fell back to plain decode would therefore be a
+// one-way latch that kills speculation for those requests until they are
+// re-prefilled, which is the opposite of "recover when the load drops".
+
+#[test]
+fn a_gated_batch_runs_a_verify_round_not_a_plain_decode() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_speculative();
+    let active: Vec<ActiveRequestState> = (1..=8).map(|id| active_state(id, 0, 32)).collect();
+
+    assert!(
+        matches!(
+            runtime_plan_at(&exec, &active, Vec::new(), 9),
+            Some(plan::ExecutionPlan::SpeculativeDecode)
+        ),
+        "under the threshold the batch drafts and verifies"
+    );
+    assert!(
+        matches!(
+            runtime_plan_at(&exec, &active, Vec::new(), 8),
+            Some(plan::ExecutionPlan::GatedSpeculativeDecode)
+        ),
+        "at the threshold the batch verifies a one-token span"
+    );
+}
+
+#[test]
+fn a_gated_batch_with_pending_work_prefills_first() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_speculative();
+    let active: Vec<ActiveRequestState> = (1..=8).map(|id| active_state(id, 0, 32)).collect();
+    let pending = PendingRequest::from_request(RequestId::new(9), request(16, 1));
+
+    assert!(
+        matches!(
+            runtime_plan_at(&exec, &active, vec![pending], 4),
+            Some(plan::ExecutionPlan::Prefill { .. })
+        ),
+        "a gated batch still prefills its arrivals, so they capture their draft context"
+    );
+}

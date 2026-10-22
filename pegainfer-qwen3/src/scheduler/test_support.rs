@@ -45,6 +45,7 @@ pub(crate) struct AsyncPrefillGate {
     pub(crate) polls: AtomicUsize,
 }
 
+#[allow(clippy::struct_excessive_bools)] // test double: independent knobs, not a state machine
 pub(crate) struct FakeExecutor {
     pub(crate) block_size: usize,
     max_request_blocks: usize,
@@ -63,6 +64,11 @@ pub(crate) struct FakeExecutor {
     pub(crate) prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
     emit_logprobs: bool,
+    /// Whether a draft model is loaded (the fake reports every request as
+    /// draft-ready unless it is listed in `not_ready`).
+    speculative: bool,
+    /// Requests the fake reports as NOT having captured draft context.
+    not_ready: HashSet<RequestId>,
     async_prefill: Option<Arc<AsyncPrefillGate>>,
     parked_prefill: Option<PrefillResult>,
 }
@@ -85,6 +91,8 @@ impl FakeExecutor {
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
             emit_logprobs: false,
+            speculative: false,
+            not_ready: HashSet::new(),
             async_prefill: None,
             parked_prefill: None,
         }
@@ -128,6 +136,19 @@ impl FakeExecutor {
 
     pub(crate) fn with_lora_adapters(mut self, names: &[&str]) -> Self {
         self.loaded_lora_adapters = names.iter().map(|name| (*name).to_string()).collect();
+        self
+    }
+
+    /// Pretend a draft model is loaded: every request reports captured draft
+    /// context unless it is named in [`Self::with_request_not_ready`].
+    pub(crate) fn with_speculative(mut self) -> Self {
+        self.speculative = true;
+        self
+    }
+
+    /// Report one request as NOT draft-ready (no captured draft context).
+    pub(crate) fn with_request_not_ready(mut self, request_id: RequestId) -> Self {
+        self.not_ready.insert(request_id);
         self
     }
 
@@ -217,6 +238,14 @@ impl ModelExecutor for FakeExecutor {
 
     fn is_stop_token(&self, token_id: u32) -> bool {
         self.stop_token == Some(token_id)
+    }
+
+    fn speculative_enabled(&self) -> bool {
+        self.speculative
+    }
+
+    fn speculative_request_ready(&self, request_id: RequestId) -> bool {
+        self.speculative && !self.not_ready.contains(&request_id)
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
