@@ -24,6 +24,18 @@ pub(crate) use reservation::DFlashMemoryReservation;
 use selector::SelectorHead;
 use selector::SelectorScratch;
 
+/// `PEGAINFER_SPEC_MAX_DRAFTS=<k>` — cap on the draft candidates proposed per
+/// round (0/unset = the checkpoint's natural block). Read once.
+fn max_drafts() -> usize {
+    static MAX_DRAFTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_DRAFTS.get_or_init(|| {
+        std::env::var("PEGAINFER_SPEC_MAX_DRAFTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
 pub(crate) struct DFlashDraftModel {
     config: DFlashConfig,
     layers: Vec<TransformerBlock>,
@@ -373,17 +385,43 @@ impl DFlashDraftModel {
         self.config.anchor_first()
     }
 
-    /// Length of each request's verify span = anchor (1) + proposed drafts.
-    /// Anchor-drop checkpoints discard block position 0, proposing
-    /// `block_size - 1` drafts (span `block_size`); anchor-first checkpoints
-    /// propose all `block_size` drafts (span `block_size + 1`). The verify
-    /// CUDA-graph buffers are sized to this.
-    pub(crate) fn verify_span(&self) -> usize {
+    /// How many draft candidates the block layout yields before any trim:
+    /// anchor-drop checkpoints discard block position 0 (the anchor slot; only
+    /// the mask positions draft), so they propose `block_size - 1`; anchor-first
+    /// checkpoints have position 0 already predict the first draft, so they
+    /// propose all `block_size` — a one-token-longer verify span. This is a
+    /// checkpoint property, not a markov one: a `markov_rank == 0` DeepSpec
+    /// checkpoint is still anchor-first.
+    pub(crate) fn natural_drafts(&self) -> usize {
         if self.anchor_first() {
-            self.block_size() + 1
-        } else {
             self.block_size()
+        } else {
+            self.block_size() - 1
         }
+    }
+
+    /// `PEGAINFER_SPEC_MAX_DRAFTS=<k>` trims how many draft candidates are
+    /// proposed per round: the drafter still rolls its whole block out (its
+    /// cache still writes the `block_size`-slot in-fill tail every round, so
+    /// the headroom is unchanged), but only the first `k` candidates are
+    /// verified, so the target forward carries `1 + k` rows per request
+    /// instead of the full span. `0`/unset = off.
+    ///
+    /// The trim trades rows for rounds: the accepted tail beyond `k` is cut,
+    /// so a round commits fewer tokens. Whether that pays depends on how
+    /// row-bound the target forward is on the GPU in use — measure it.
+    pub(crate) fn effective_drafts(&self) -> usize {
+        let natural = self.natural_drafts();
+        let cap = max_drafts();
+        if cap > 0 { natural.min(cap) } else { natural }
+    }
+
+    /// Verify span under the current trim = anchor (1) + effective drafts.
+    /// The verify CUDA-graph buffers are sized to this, and the span is
+    /// uniform across the batch, so a full-span step still satisfies the
+    /// capture-shape ≡ replay-shape invariant.
+    pub(crate) fn effective_verify_span(&self) -> usize {
+        self.effective_drafts() + 1
     }
 
     pub(crate) fn tune_gemm_algos(&self, target: &Qwen3Model) -> Result<()> {

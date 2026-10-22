@@ -475,6 +475,11 @@ impl LocalQwen3Lane {
             // Anchor-first checkpoints use every sample. Prepend the actual
             // dangling token once for all three paths before target verification.
             let drafts_start = usize::from(!selector && !model.anchor_first());
+            // `PEGAINFER_SPEC_MAX_DRAFTS` trims the proposal: only the first
+            // `effective_drafts` candidates are verified, so the target forward
+            // carries fewer rows. The block is still rolled out in full — the
+            // drafter's cache still writes its `block_size`-slot in-fill tail.
+            let keep = model.effective_drafts();
             let mut outputs = Vec::with_capacity(requests.len());
             for (i, req) in requests.iter().enumerate() {
                 let block = &sampled[i * sampled_stride..(i + 1) * sampled_stride];
@@ -485,9 +490,15 @@ impl LocalQwen3Lane {
                     i,
                     block_size
                 );
-                let mut token_ids = Vec::with_capacity(drafts.len() + 1);
+                anyhow::ensure!(
+                    keep <= drafts.len(),
+                    "draft trim {} exceeds the block's {} draft tokens",
+                    keep,
+                    drafts.len()
+                );
+                let mut token_ids = Vec::with_capacity(keep + 1);
                 token_ids.push(req.current_token);
-                token_ids.extend(drafts.iter().copied());
+                token_ids.extend(drafts[..keep].iter().copied());
                 outputs.push(DraftRequestResult {
                     request_id: req.request_id,
                     token_ids,

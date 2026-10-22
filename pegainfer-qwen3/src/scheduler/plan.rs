@@ -26,6 +26,12 @@ pub(crate) enum ExecutionPlan {
     Decode,
     /// Draft + verify the whole active batch (all requests are draft-ready).
     SpeculativeDecode,
+    /// Verify the whole active batch over a one-token span — the load gate
+    /// turned speculation off for this step. No draft is proposed, so the
+    /// target commits one token per request, but the DFlash capture and the
+    /// draft-ready state survive: the next round under the threshold
+    /// speculates again.
+    GatedSpeculativeDecode,
     Unified {
         pending: Vec<PendingRequest>,
     },
@@ -126,6 +132,19 @@ pub(crate) fn execute_plan(
             verify.requests.sort_by_key(|result| result.request_id);
             Ok(ExecutionArtifacts::SpeculativeDecode { verify })
         }
+        ExecutionPlan::GatedSpeculativeDecode => {
+            // No draft this step: the verify span is the request's confirmed
+            // last token, so the target commits exactly one token per request
+            // and the DFlash context advances by the same single row. The
+            // capture is NOT dropped, which is what makes the gate reversible.
+            let verify_requests = build_gated_verify_items(active);
+            let mut verify = executor.execute_speculative_verify(VerifyPlan {
+                requests: &verify_requests,
+                sample_seed: rand::RngExt::random(rng),
+            })?;
+            verify.requests.sort_by_key(|result| result.request_id);
+            Ok(ExecutionArtifacts::SpeculativeDecode { verify })
+        }
         ExecutionPlan::Unified { pending } => {
             let pending_indices: Vec<usize> = (0..pending.len()).collect();
             let active_indices: Vec<usize> = (0..active.len()).collect();
@@ -143,23 +162,87 @@ pub(crate) fn execute_plan(
     }
 }
 
+/// `PEGAINFER_SPEC_MAX_BATCH=<n>` turns on the load-aware speculation gate: once
+/// the active batch reaches `<n>` requests, the engine stops proposing drafts
+/// for that step. `0`/unset = off. Read once.
+///
+/// The gate exists because the verify pass costs `batch * span` rows while plain
+/// decode costs `batch`, so at high concurrency the target forward's fixed cost
+/// (36 layers of weight reads) dominates and speculation can lose to plain
+/// decode outright. The threshold is a *measured* crossover for the model and
+/// GPU in use, not a universal constant.
+pub(crate) fn spec_max_batch() -> usize {
+    static MAX_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_BATCH.get_or_init(|| {
+        std::env::var("PEGAINFER_SPEC_MAX_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// What the engine does with the active batch this step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpeculationDecision {
+    /// Every request is draft-ready and the batch is under the load gate:
+    /// draft + verify.
+    Speculate,
+    /// Every request is draft-ready but the batch reached the load gate:
+    /// verify a one-token span, keeping the DFlash capture alive.
+    Gated,
+    /// Some request is not draft-ready (or no drafter is loaded): plain
+    /// decode, which invalidates the captured draft context.
+    NotReady,
+}
+
 /// All-or-nothing: speculate the whole active batch only when every request is
 /// draft-ready (no LoRA, no logprobs). A single non-ready request falls the
 /// batch back to plain decode rather than running a mixed step. Sampling
 /// params are NOT a gate: sampled-verify (#512) runs the regular sampler over
 /// the verify rows, so the full surface — temperature/top_k/top_p/min_p/seed —
 /// rides the speculative path.
-pub(crate) fn should_speculative_decode(
+///
+/// The load gate is separate from readiness, and the two have different
+/// fallbacks: a request that is not draft-ready has no capture to preserve, so
+/// the batch decodes plainly; a *gated* batch is fully draft-ready and must
+/// keep its capture, or the gate would be a one-way latch that kills
+/// speculation engine-wide (a plain decode drops the captured context, and
+/// only a fresh prefill can rebuild it).
+///
+/// `max_batch` is passed in rather than read here so the gate is testable
+/// without mutating process-wide env state; the scheduler reads it once via
+/// [`spec_max_batch`].
+pub(crate) fn speculation_decision_at(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
-) -> bool {
-    executor.speculative_enabled()
-        && !active.is_empty()
-        && active.iter().all(|req| {
-            executor.speculative_request_ready(req.request_id)
-                && req.lora_adapter.is_none()
-                && req.logprobs.is_none()
-        })
+    max_batch: usize,
+) -> SpeculationDecision {
+    if !executor.speculative_enabled() || active.is_empty() {
+        return SpeculationDecision::NotReady;
+    }
+    let all_ready = active.iter().all(|req| {
+        executor.speculative_request_ready(req.request_id)
+            && req.lora_adapter.is_none()
+            && req.logprobs.is_none()
+    });
+    if !all_ready {
+        return SpeculationDecision::NotReady;
+    }
+    if spec_gate_trips(active, max_batch) {
+        SpeculationDecision::Gated
+    } else {
+        SpeculationDecision::Speculate
+    }
+}
+
+/// The load gate's decision with the threshold passed in, so the gate is
+/// testable without mutating process-wide env state.
+///
+/// The gate only ever *removes* speculation for a step; it never changes a
+/// request's draft-ready state, so a batch that trips the gate speculates again
+/// as soon as it shrinks below the threshold.
+fn spec_gate_trips(active: &[ActiveRequestState], max_batch: usize) -> bool {
+    max_batch > 0 && active.len() >= max_batch
 }
 
 fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStepItem> {
@@ -207,6 +290,24 @@ fn build_speculative_verify_items(
         ));
     }
     requests
+}
+
+/// One-token verify spans for a gated round: each request's confirmed last
+/// token and nothing else. The target commits exactly one token per request,
+/// and the DFlash context advances by exactly one captured row — the same
+/// bookkeeping a full speculative round does, minus the draft.
+fn build_gated_verify_items(active: &[ActiveRequestState]) -> Vec<VerifyStepItem> {
+    active
+        .iter()
+        .map(|req| {
+            VerifyStepItem::new(
+                req.request_id,
+                vec![req.last_token],
+                req.params,
+                req.stop_policy.clone(),
+            )
+        })
+        .collect()
 }
 
 fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<PrefillStepItem> {
@@ -257,11 +358,15 @@ fn sort_decode_results(results: &mut [crate::executor::DecodeRequestResult]) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     use pegainfer_frontend::engine::StopPolicy;
     use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
     use crate::executor::RequestId;
+    use crate::scheduler::test_support::FakeExecutor;
 
     fn pending() -> PendingRequest {
         PendingRequest {
@@ -304,6 +409,89 @@ mod tests {
         assert_eq!(items[0].hedge_budget, 1);
         assert_eq!(items[1].hedge_budget, 32);
         assert_eq!(items[2].hedge_budget, 0);
+    }
+
+    // ── Load-aware speculation gate (PEGAINFER_SPEC_MAX_BATCH) ─────────────
+    //
+    // The gate turns speculation off for a step when the batch is too large to
+    // speculate in profit. It must stay *reversible*: a gated batch keeps its
+    // DFlash capture, so speculation resumes when the batch shrinks.
+
+    fn speculative_batch(count: usize) -> Vec<ActiveRequestState> {
+        (0..count)
+            .map(|i| ActiveRequestState {
+                request_id: RequestId::new(i as u64 + 1),
+                lora_adapter: None,
+                last_token: 42,
+                generated_count: 0,
+                max_tokens: 32,
+                prompt_len: 10,
+                params: SamplingParams::default(),
+                stop_policy: StopPolicy::default(),
+                logprobs: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn load_gate_gates_the_batch_at_the_threshold() {
+        let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_speculative();
+        let batch = speculative_batch(8);
+        // Gate off (0) → always speculate.
+        assert_eq!(
+            speculation_decision_at(&exec, &batch, 0),
+            SpeculationDecision::Speculate
+        );
+        // Under the threshold → speculate.
+        assert_eq!(
+            speculation_decision_at(&exec, &batch, 9),
+            SpeculationDecision::Speculate
+        );
+        // At the threshold → gated (the threshold is inclusive).
+        assert_eq!(
+            speculation_decision_at(&exec, &batch, 8),
+            SpeculationDecision::Gated
+        );
+        // Over the threshold → gated.
+        assert_eq!(
+            speculation_decision_at(&exec, &batch, 4),
+            SpeculationDecision::Gated
+        );
+    }
+
+    #[test]
+    fn a_request_without_draft_context_is_never_gated() {
+        // A request that never captured its context cannot run a verify round,
+        // so the batch decodes plainly; the gate must not paper over that.
+        let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new())))
+            .with_speculative()
+            .with_request_not_ready(RequestId::new(3));
+        let batch = speculative_batch(8);
+        assert_eq!(
+            speculation_decision_at(&exec, &batch, 4),
+            SpeculationDecision::NotReady
+        );
+    }
+
+    #[test]
+    fn no_drafter_means_neither_speculation_nor_a_gate() {
+        let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new())));
+        let batch = speculative_batch(8);
+        assert_eq!(
+            speculation_decision_at(&exec, &batch, 4),
+            SpeculationDecision::NotReady
+        );
+    }
+
+    #[test]
+    fn gated_verify_spans_carry_only_the_confirmed_token() {
+        let batch = speculative_batch(2);
+        let items = build_gated_verify_items(&batch);
+        assert_eq!(items.len(), 2);
+        // One token per request: the target commits one token per step and the
+        // DFlash context advances by exactly one captured row.
+        assert_eq!(items[0].as_slice(), &[42]);
+        assert_eq!(items[1].as_slice(), &[42]);
     }
 
     #[test]

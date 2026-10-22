@@ -98,6 +98,32 @@ Result (5090, greedy, same-session A/B): fixed-buffer eager **250.9 → +graph 2
 
 The EAGLE proposer trait is still deferred to when EAGLE actually lands (see "no proposer trait yet" above); both the batched draft and the future CUDA-Graph draft are DFlash-internal changes behind the unchanged `DraftPlan→DraftResult` seam, so neither is thrown away by EAGLE.
 
+## Load-aware speculation gate (`PEGAINFER_SPEC_MAX_BATCH`)
+
+`PEGAINFER_SPEC_MAX_BATCH=<n>` turns speculation off for a step once the active batch reaches `n` requests. `0`/unset = off, so serving behaviour is unchanged until a threshold is measured and set — and the threshold is a **measured crossover for the model and GPU in use**, not a constant.
+
+**Why a gate at all.** The verify pass costs `batch × span` target rows while a plain decode costs `batch`. At high concurrency the target forward's fixed cost (36 layers of weight reads) dominates, and speculation can lose to plain decode outright — the same shape as vLLM's `--speculative-disable-by-batch-size`.
+
+**A gated step is NOT a plain decode, and that is the whole difficulty.** A plain decode advances the sequence outside the speculative path, so the executor drops the captured draft context — and only a fresh prefill can rebuild it. A gate that fell back to plain decode would be a **one-way latch**: the first trip would kill speculation for every affected request until they were re-prefilled, i.e. the opposite of "recover when the load drops" (#718 §4).
+
+So a gated step is a **one-token verify round**: no draft is proposed, the target verifies the span `[current_token]` alone, one token is committed per request, and the DFlash context advances by exactly the one captured row — the same bookkeeping a full round does. The capture and the draft-ready state survive, so the batch speculates again as soon as it shrinks below the threshold. The scheduler distinguishes the two fallbacks explicitly: `SpeculationDecision::NotReady` (a request has no captured context — plain decode, the pre-existing behaviour) vs `SpeculationDecision::Gated` (everything is draft-ready — a one-token verify round that keeps the capture).
+
+**The verify CUDA graph needed a span dimension for this.** A captured dense segment bakes its row count, so the one-token rows cannot share a graph with the full-span rows. `VerifyGraphBuffers` now holds one graph set per span variant, and a step replays a variant only when its row count matches that variant exactly — capture-shape ≡ replay-shape, unchanged.
+
+**Measured on one L20 (Qwen3-4B, DFlash block7):** the gate is worth **+46.6 %** output tok/s at c64 (2115 → 3099) and leaves every below-threshold cell untouched (±1.2 %, inside the harness's 0.3–2.2 % paired noise floor). It lands ~5 % short of the plain decode, because the gated step runs the prefill-style *verify* path while the plain step runs the tuned *decode* path. A run at c64 with the gate at 32 logged **8142 gated rounds and 29 speculating rounds** — the gate trips under load and speculation resumes when the batch shrinks, with the DFlash capture intact. Full protocol, noise floor, per-drafter crossovers and the recommended thresholds: [benchmarks/qwen3-4b-spec-decode-l20.md](../../benchmarks/qwen3-4b-spec-decode-l20.md).
+
+## Static draft trim (`PEGAINFER_SPEC_MAX_DRAFTS`)
+
+`PEGAINFER_SPEC_MAX_DRAFTS=<k>` caps how many draft candidates are **proposed** per round: the drafter still rolls its whole block out (its cache still writes the `block_size`-slot in-fill tail every round, so the headroom is unchanged), but only the first `k` candidates enter the verify span, so the target forward carries `1 + k` rows per request instead of the full span. `0`/unset = off (the checkpoint's natural block).
+
+The verify buffers are sized to the trimmed span, and the span stays uniform across the batch, so a full-span step still satisfies the capture-shape ≡ replay-shape invariant — the same invariant the one-token gated round relies on.
+
+**The trade:** fewer rows per verify forward, but a shorter accepted run per round, so more rounds for the same output. Which side wins depends on how row-bound the target forward is on the GPU in use — a property of the *hardware*, not of the checkpoint, and the 5090 and the L20 answer it differently. Measure it per platform; the L20 numbers are in the benchmark doc.
+
+**Measured on one L20 (Qwen3-4B, DFlash block7):** the trim's sign **flips with concurrency** — it loses 4–16 % at c8/c16 (there the step is launch-bound, the rows are nearly free, and the shorter accepted run only costs rounds) and wins **+9.1 %** at c32, where K=4 moves the drafter from 7 % *below* plain decode to 2 % above it. At c64 the span ordering is monotone: K=7 2113 < K=4 2405 < K=2 2572 < the load gate's span-1 3083. So the **optimal span shrinks as the batch grows** — the row cost of the target forward scales with `batch × span` while the accept-rate cost does not. A static K is therefore a load-adaptive lever in disguise: it needs a concurrency range, never a constant, and the same rule as the gate's applies — arm it at or above the crossover, never below.
+
+The trim is lossless: with `PEGAINFER_SPEC_MAX_DRAFTS=4` or `=2`, `dflash_speculative_greedy_matches_plain_greedy` and `dflash_concurrent_heterogeneous_is_lossless` both pass.
+
 ## Task-level accuracy parity (lm-eval gsm8k)
 
 Token-level losslessness should imply task-level parity. Confirmed on the 5090 with `lm-eval` gsm8k (5-shot, greedy, `local-completions` against the pegainfer server, 50 questions):
