@@ -348,18 +348,40 @@ fn select_plan(
 /// gate holds the golden to; `torch.topk` leaves a block tied at the cut open,
 /// so the fixture's own pick can differ there and still be valid.
 ///
-/// `variant` is [`QSA_SELECT_PRODUCTION`] in production. The other
-/// `QSA_SELECT_*` values are the parity gate's negative controls — they run the
-/// same launch and mutate one step of the selection so the gate proves its
-/// assertions bite — and are refused outside `0..=5`. A non-finite score inside
-/// a row's block prefix or an out-of-range `rows` entry traps on the device: the
+/// This is [`qsa_indexer_select_variant_into`] with [`QSA_SELECT_PRODUCTION`];
+/// the production path has no mutation knob. A non-finite score inside a row's
+/// block prefix or an out-of-range `rows` entry traps on the device: the
 /// caller's input is broken, and a silently shorter visible set would hand the
 /// attention softmax an undefined row. The kernel repeats the budget and score
 /// row width checks the host entry already made, so a caller reaching it by
 /// another path still fails visibly. The wrapper refuses an empty launch, a
-/// malformed budget, a short buffer and an unknown variant before any pointer
-/// is formed.
+/// malformed budget and a short buffer before any pointer is formed.
 pub fn qsa_indexer_select_into(
+    ctx: &DeviceContext,
+    scores: &CudaSlice<f32>,
+    rows: &CudaSlice<i32>,
+    budget: i32,
+    tokens: usize,
+    mask: &mut CudaSlice<u8>,
+) -> Result<()> {
+    qsa_indexer_select_variant_into(
+        ctx,
+        scores,
+        rows,
+        budget,
+        tokens,
+        mask,
+        QSA_SELECT_PRODUCTION,
+    )
+}
+
+/// [`qsa_indexer_select_into`] with the parity gate's mutation knob.
+///
+/// `variant` is [`QSA_SELECT_PRODUCTION`] in production. The other
+/// `QSA_SELECT_*` values are the gate's negative controls — they run the same
+/// launch and mutate one step of the selection so the gate proves its assertions
+/// bite — and are refused outside `0..=5`.
+pub fn qsa_indexer_select_variant_into(
     ctx: &DeviceContext,
     scores: &CudaSlice<f32>,
     rows: &CudaSlice<i32>,

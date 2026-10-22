@@ -10,7 +10,10 @@
 //! ignored (the parity gate feeds it back verbatim).
 //!
 //! Manual gate: no CI job enables `qwen4`, so CI neither builds nor runs it. Run
-//! it with `--features qwen4` and `PEGAINFER_REQUIRE_GPU=1`.
+//! it with `--features qwen4` and `PEGAINFER_REQUIRE_GPU=1`, last, on a
+//! disposable device: a deliberate trap can leave a shared GPU needing a reset
+//! (observed on an RTX 5060 / CUDA 12.9.1, where `cuInit` then failed for every
+//! later process until the device was reset).
 
 #![cfg(feature = "qwen4")]
 
@@ -36,7 +39,7 @@ fn a_non_finite_score_traps() {
         .expect("scores H2D");
     let rows = ctx.stream.clone_htod(&[ROW]).expect("rows H2D");
     let mut mask = ctx.stream.alloc_zeros::<u8>(TOKENS).expect("mask");
-    let launch = qsa_indexer_select_into(&ctx, &scores, &rows, BUDGET, TOKENS, &mut mask, 0);
+    let launch = qsa_indexer_select_into(&ctx, &scores, &rows, BUDGET, TOKENS, &mut mask);
     let error = match launch {
         Ok(()) => ctx.sync().err().unwrap_or_else(|| {
             panic!("a NaN block score must fail visibly instead of selecting around it")

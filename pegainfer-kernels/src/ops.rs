@@ -255,6 +255,8 @@ pub use qwen4::qsa_indexer_block_scores_into;
 pub use qwen4::rms_norm_grouped_offset_batch_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_select_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qsa_indexer_select_variant_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::GDN_AOT_KEY_HEAD_DIM;
 #[cfg(feature = "qwen35")]

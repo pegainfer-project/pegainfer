@@ -70,6 +70,7 @@ use pegainfer_kernels::ops::QSA_SELECT_KEEP_FEWER;
 use pegainfer_kernels::ops::QSA_SELECT_KEEP_MORE;
 use pegainfer_kernels::ops::QSA_SELECT_PRODUCTION;
 use pegainfer_kernels::ops::qsa_indexer_select_into;
+use pegainfer_kernels::ops::qsa_indexer_select_variant_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use safetensors::SafeTensors;
 use sha2::Digest;
@@ -441,16 +442,20 @@ fn run_case(ctx: &DeviceContext, case: &Case, variant: i32) -> Vec<u8> {
         .stream
         .clone_htod(&vec![SENTINEL; case.rows.len() * case.tokens])
         .expect("mask buffer");
-    qsa_indexer_select_into(
-        ctx,
-        &scores,
-        &rows,
-        case.budget,
-        case.tokens,
-        &mut mask,
-        variant,
-    )
-    .unwrap_or_else(|e| panic!("case {}: variant {variant} launch: {e:#}", case.index));
+    let launch = if variant == QSA_SELECT_PRODUCTION {
+        qsa_indexer_select_into(ctx, &scores, &rows, case.budget, case.tokens, &mut mask)
+    } else {
+        qsa_indexer_select_variant_into(
+            ctx,
+            &scores,
+            &rows,
+            case.budget,
+            case.tokens,
+            &mut mask,
+            variant,
+        )
+    };
+    launch.unwrap_or_else(|e| panic!("case {}: variant {variant} launch: {e:#}", case.index));
     ctx.sync().expect("sync");
     let host = ctx.stream.clone_dtoh(&mask).expect("mask download");
     assert!(

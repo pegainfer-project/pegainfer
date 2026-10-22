@@ -8,7 +8,10 @@
 //! for, and the mask would look plausible.
 //!
 //! Manual gate: no CI job enables `qwen4`, so CI neither builds nor runs it. Run
-//! it with `--features qwen4` and `PEGAINFER_REQUIRE_GPU=1`.
+//! it with `--features qwen4` and `PEGAINFER_REQUIRE_GPU=1`, last, on a
+//! disposable device: a deliberate trap can leave a shared GPU needing a reset
+//! (observed on an RTX 5060 / CUDA 12.9.1, where `cuInit` then failed for every
+//! later process until the device was reset).
 
 #![cfg(feature = "qwen4")]
 
@@ -30,7 +33,7 @@ fn an_out_of_range_row_traps() {
     let scores = ctx.stream.clone_htod(&[1.0f32, 0.5]).expect("scores H2D");
     let rows = ctx.stream.clone_htod(&[TOKENS as i32]).expect("rows H2D");
     let mut mask = ctx.stream.alloc_zeros::<u8>(TOKENS).expect("mask");
-    let launch = qsa_indexer_select_into(&ctx, &scores, &rows, BUDGET, TOKENS, &mut mask, 0);
+    let launch = qsa_indexer_select_into(&ctx, &scores, &rows, BUDGET, TOKENS, &mut mask);
     let error = match launch {
         Ok(()) => ctx
             .sync()
