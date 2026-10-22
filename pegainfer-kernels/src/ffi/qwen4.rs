@@ -30,4 +30,17 @@ unsafe extern "C" {
         rms_eps: f32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Batched grouped `(1+weight)` RMSNorm; see
+    /// `ops::rms_norm_grouped_offset_batch_into` for the contract.
+    pub fn rms_norm_grouped_offset_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        group_size: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
 }

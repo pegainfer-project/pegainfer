@@ -1,13 +1,16 @@
-//! Qwen3.8-Flash-Next QSA token-indexer block scoring.
+//! Qwen3.8-Flash-Next (Qwen4 line) kernels.
 //!
-//! Turns the fused `index_qk_proj` output into one score per (query row,
-//! visible micro-block); selection — top-k plus the unconditional tail — is a
-//! later stage, deliberately not here. Frozen semantics live in
-//! `csrc/qwen4/qwen4_qsa_indexer_score.cu` (transformers 5.16.1 `qwen4_exp`
-//! `Qwen4ExpTextQSAIndexer.forward`); the kernel is compiled for one geometry
-//! and this wrapper sizes its buffers from it. The checkpoint's own indexer
-//! fields are checked where the model crate reads its config, once that caller
-//! lands — this stage takes only `rms_eps` from the caller.
+//! QSA token-indexer block scoring turns the fused `index_qk_proj` output into
+//! one score per (query row, visible micro-block); selection — top-k plus the
+//! unconditional tail — is a later stage, deliberately not here. Frozen
+//! semantics live in `csrc/qwen4/qwen4_qsa_indexer_score.cu` (transformers
+//! 5.16.1 `qwen4_exp` `Qwen4ExpTextQSAIndexer.forward`); the kernel is compiled
+//! for one geometry and this wrapper sizes its buffers from it. The checkpoint's
+//! own indexer fields are checked where the model crate reads its config, once
+//! that caller lands — this stage takes only `rms_eps` from the caller.
+//!
+//! The grouped `(1+weight)` RMSNorm serves the hyper-connection and PLE streams
+//! (`csrc/qwen4/qwen4_grouped_rmsnorm.cu`); its contract is on the wrapper.
 
 use anyhow::Result;
 use anyhow::ensure;
@@ -20,6 +23,7 @@ use crate::ffi;
 use crate::ops::checked_i32;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
+use crate::tensor::HiddenStates;
 use crate::tensor::active_cu_stream;
 
 /// The geometry the kernel is compiled for, used to size this wrapper's buffer
@@ -157,4 +161,73 @@ pub fn qsa_indexer_block_scores_into(
     }
     .result()
     .map_err(|err| anyhow::anyhow!("QSA indexer block score launch failed: {err}"))
+}
+
+/// Batched grouped `(1+weight)` RMSNorm over `HiddenStates`: `hidden_dim` is
+/// `hidden_dim / group_size` adjacent groups, each reduced on its own under one
+/// shared `eps`. The `(1 + w)` scale is indexed by the row's *global* column, so
+/// group `k` reads `weight[k * group_size .. (k + 1) * group_size]`.
+///
+/// Qwen3.8-Flash-Next's `Qwen4ExpTextRMSNorm(hidden, eps, group_size)` uses this
+/// for the hyper-connection `hc_norm` and the PLE norms, both a 10240-wide
+/// stream in four 2560-wide groups. A call whose weight slices are all equal
+/// reproduces [`crate::ops::rms_norm_batch_offset_into`]'s bits; see
+/// `tests/grouped_rmsnorm_equivalence.rs`.
+pub fn rms_norm_grouped_offset_batch_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    weight: &DeviceVec,
+    group_size: usize,
+    eps: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    const OP: &str = "rms_norm_grouped_offset_batch_into";
+    ensure!(
+        x.hidden_dim > 0 && x.seq_len > 0 && group_size > 0,
+        "{OP} dimensions must be non-zero"
+    );
+    ensure!(
+        x.hidden_dim.is_multiple_of(group_size),
+        "{OP} hidden_dim {} is not a whole number of {group_size}-wide groups",
+        x.hidden_dim
+    );
+    ensure!(
+        weight.len == x.hidden_dim,
+        "{OP} weight len {} != hidden_dim {}",
+        weight.len,
+        x.hidden_dim
+    );
+    ensure!(
+        weight.data.len() >= x.hidden_dim,
+        "{OP} weight backing too small"
+    );
+    ensure!(
+        out.hidden_dim == x.hidden_dim && out.seq_len == x.seq_len,
+        "{OP} out shape mismatch"
+    );
+    x.checked_extent("rms_norm_grouped_offset_batch_into x")?;
+    out.checked_extent("rms_norm_grouped_offset_batch_into out")?;
+    let hidden_dim = checked_i32(
+        x.hidden_dim,
+        "rms_norm_grouped_offset_batch_into hidden_dim",
+    )?;
+    let group_size = checked_i32(group_size, "rms_norm_grouped_offset_batch_into group_size")?;
+    let seq_len = checked_i32(x.seq_len, "rms_norm_grouped_offset_batch_into seq_len")?;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::rms_norm_grouped_offset_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            hidden_dim,
+            group_size,
+            seq_len,
+            eps,
+            active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
 }

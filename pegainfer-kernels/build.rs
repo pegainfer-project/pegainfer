@@ -2734,7 +2734,7 @@ fn main() {
     }
     if !qwen4_enabled {
         println!(
-            "cargo:warning=Qwen4 QSA indexer kernels disabled; enable the pegainfer-kernels `qwen4` feature to build them"
+            "cargo:warning=Qwen4 kernels disabled; enable the pegainfer-kernels `qwen4` feature to build them"
         );
     }
 
