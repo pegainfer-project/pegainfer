@@ -231,6 +231,10 @@ pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
 #[cfg(feature = "qwen4")]
+pub use qwen4::QsaAttnGeometry;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qsa_attn_forward_into;
+#[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_block_scores_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::GDN_AOT_KEY_HEAD_DIM;
