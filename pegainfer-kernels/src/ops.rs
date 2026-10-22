@@ -230,6 +230,14 @@ pub use norm::rms_norm_gated_batch_into;
 pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
+// "hc" is the Qwen4 hyper-connection block (`Qwen4ExpTextGatedResidual`); the
+// three ops are its elementwise tail — see `ops/qwen4.rs`.
+#[cfg(feature = "qwen4")]
+pub use qwen4::hc_mul_branch_combine_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::hc_sigmoid_affine_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::hc_silu_scaled_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_block_scores_into;
 #[cfg(feature = "qwen35")]
