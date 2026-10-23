@@ -1,9 +1,16 @@
-//! Shared launch for the QSA indexer trap binaries. Each binary fires one trap,
-//! because `__trap()` leaves the context in a sticky error state and anything
-//! sharing the process afterwards would fail for the wrong reason.
+//! Shared launches for the QSA indexer and selector trap binaries. Each binary
+//! fires one trap, because `__trap()` leaves the context in a sticky error state
+//! and anything sharing the process afterwards would fail for the wrong reason.
+//!
+//! Run them last or on a disposable device: a deliberate `__trap()` can leave a
+//! shared GPU needing a reset (observed on an RTX 5060 / CUDA 12.9.1, where
+//! `cuInit` then failed for every later process until the device was reset).
+
+#![allow(dead_code)] // Each binary includes both launchers and calls one.
 
 use half::bf16;
 use pegainfer_kernels::ops::qsa_indexer_block_scores_into;
+use pegainfer_kernels::ops::qsa_indexer_select_into;
 use pegainfer_kernels::tensor::DeviceVec;
 
 const TOKENS: usize = 8;
@@ -64,5 +71,39 @@ pub(crate) fn assert_traps(row: i32, visible: i32) {
     assert!(
         message.contains("CUDA_ERROR_LAUNCH_FAILED"),
         "row {row} seeing {visible} tokens must end in the kernel's trap, got: {message}"
+    );
+}
+
+/// The selector trap cases all run an eight-token mask with two score columns
+/// and the eight-token budget; only the poisoned field differs.
+const SELECT_TOKENS: usize = 8;
+const SELECT_BUDGET: i32 = 8;
+
+/// Select once with one poisoned input and require the kernel's trap. Same
+/// contract as [`assert_traps`]: a trap ends the launch with
+/// `CUDA_ERROR_LAUNCH_FAILED`, reported at the launch or at the next sync, and
+/// any other outcome fails, including a wrapper check, an invalid argument and
+/// an illegal address.
+pub(crate) fn assert_select_traps(label: &str, scores: &[f32], rows: &[i32]) {
+    let Some(ctx) = crate::common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let scores = ctx.stream.clone_htod(scores).expect("scores H2D");
+    let rows = ctx.stream.clone_htod(rows).expect("rows H2D");
+    let mut mask = ctx.stream.alloc_zeros::<u8>(SELECT_TOKENS).expect("mask");
+    let launch =
+        qsa_indexer_select_into(ctx, &scores, &rows, SELECT_BUDGET, SELECT_TOKENS, &mut mask);
+    let error = match launch {
+        Ok(()) => ctx
+            .sync()
+            .err()
+            .unwrap_or_else(|| panic!("{label} must fail visibly")),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("CUDA_ERROR_LAUNCH_FAILED"),
+        "{label} must end in the kernel's trap, got: {message}"
     );
 }
