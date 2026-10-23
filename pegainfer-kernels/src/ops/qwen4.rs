@@ -1,13 +1,15 @@
 //! Qwen3.8-Flash-Next (Qwen4 line) kernels.
 //!
-//! QSA token-indexer block scoring turns the fused `index_qk_proj` output into
-//! one score per (query row, visible micro-block); selection — top-k plus the
-//! unconditional tail — is a later stage, deliberately not here. Frozen
-//! semantics live in `csrc/qwen4/qwen4_qsa_indexer_score.cu` (transformers
-//! 5.16.1 `qwen4_exp` `Qwen4ExpTextQSAIndexer.forward`); the kernel is compiled
-//! for one geometry and this wrapper sizes its buffers from it. The checkpoint's
-//! own indexer fields are checked where the model crate reads its config, once
-//! that caller lands — this stage takes only `rms_eps` from the caller.
+//! [`qsa_indexer_block_scores_into`] turns the fused `index_qk_proj` output
+//! into one score per (query row, visible micro-block);
+//! [`qsa_indexer_select_into`] turns those scores into the row's token-level
+//! visibility mask (top-k plus the unconditional tail). Frozen semantics live
+//! in `csrc/qwen4/qwen4_qsa_indexer_score.cu` and
+//! `csrc/qwen4/qwen4_qsa_indexer_select.cu` (transformers 5.16.1 `qwen4_exp`
+//! `Qwen4ExpTextQSAIndexer.forward`); the kernels are compiled for one geometry
+//! and these wrappers size their buffers from it. The checkpoint's own indexer
+//! fields are checked where the model crate reads its config, once that caller
+//! lands — the score stage takes only `rms_eps` from the caller.
 //!
 //! The grouped `(1+weight)` RMSNorm serves the hyper-connection and PLE streams
 //! (`csrc/qwen4/qwen4_grouped_rmsnorm.cu`); its contract is on the wrapper.
@@ -264,7 +266,8 @@ struct SelectPlan {
 
 /// The launcher's pre-launch contract. Split from the launch so the guards can
 /// be held without a device (see the unit tests below): every check here is
-/// host arithmetic over buffer lengths and scalars.
+/// host arithmetic over buffer lengths and scalars. The public entries return
+/// early for an empty launch, so these extents are always non-empty here.
 ///
 /// `score_capacity` is the flat length of the score buffer and `score_cols` its
 /// row stride, which is only unambiguous when the length divides evenly by the
@@ -307,8 +310,8 @@ fn select_plan(
     let score_cols = score_capacity / query_rows;
     ensure!(
         score_cols >= tokens / COMPRESS_RATIO,
-        "QSA indexer score row holds {score_cols} blocks, one row can see \
-         {} of {tokens} tokens",
+        "QSA indexer score row holds {score_cols} blocks, but a mask over \
+         {tokens} tokens needs {}",
         tokens / COMPRESS_RATIO
     );
     ensure!(
@@ -354,8 +357,10 @@ fn select_plan(
 /// caller's input is broken, and a silently shorter visible set would hand the
 /// attention softmax an undefined row. The kernel repeats the budget and score
 /// row width checks the host entry already made, so a caller reaching it by
-/// another path still fails visibly. The wrapper refuses an empty launch, a
-/// malformed budget and a short buffer before any pointer is formed.
+/// another path still fails visibly. An empty launch (`rows.len() == 0` or
+/// `tokens == 0`) is a no-op, as it is in the score stage above; the C entry
+/// still refuses one reached directly. A malformed budget and a short buffer
+/// are refused before any pointer is formed.
 pub fn qsa_indexer_select_into(
     ctx: &DeviceContext,
     scores: &CudaSlice<f32>,
@@ -381,6 +386,9 @@ pub fn qsa_indexer_select_into(
 /// `QSA_SELECT_*` values are the gate's negative controls — they run the same
 /// launch and mutate one step of the selection so the gate proves its assertions
 /// bite — and are refused outside `0..=5`.
+///
+/// An empty launch is a no-op, matching the score stage; the C entry still
+/// refuses one reached directly.
 pub fn qsa_indexer_select_variant_into(
     ctx: &DeviceContext,
     scores: &CudaSlice<f32>,
@@ -390,6 +398,9 @@ pub fn qsa_indexer_select_variant_into(
     mask: &mut CudaSlice<u8>,
     variant: i32,
 ) -> Result<()> {
+    if rows.is_empty() || tokens == 0 {
+        return Ok(());
+    }
     let plan = select_plan(
         rows.len(),
         tokens,
@@ -468,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_extents_are_refused() {
+    fn select_plan_refuses_empty_extents() {
         let (_, tokens, scores, mask) = VALID;
         assert!(plan(0, tokens, 0, mask, 8, 0).is_err(), "no rows");
         assert!(plan(2, 0, scores, 0, 8, 0).is_err(), "no tokens");

@@ -45,9 +45,10 @@
 // `keep` masked argmax passes over the row's blocks — O(keep * blocks) — with an
 // exclusion bitmap in dynamic shared memory, one bit per block. The bitmap is
 // sized from the widest row this launch can see (`tokens / ratio` blocks); the
-// host refuses a launch whose bitmap passes the 48 KiB default dynamic-smem
-// ceiling (393216 blocks, 1.57M tokens), which is far past the checkpoint's
-// 262144 positions, so no caller this line serves is refused by it.
+// host refuses a launch whose bitmap plus the block's static shared state
+// passes the 48 KiB default per-block ceiling (392960 blocks, 1.57M tokens),
+// which is far past the checkpoint's 262144 positions, so no caller this line
+// serves is refused by it.
 //
 // VARIANT: the last argument selects gate-only mutations of the same launch
 // (production always passes 0). The kernel refuses an unknown value. These
@@ -77,8 +78,13 @@ constexpr int kRatio = 4;  // indexer_compress_ratio
 constexpr int kMaxKeptBlocks = 512;
 constexpr int kThreads = 128;
 constexpr int kWarps = kThreads / WARP_SIZE;
-// The default dynamic-shared-memory ceiling on every supported arch; the
-// exclusion bitmap must fit under it without an opt-in.
+// One score and one index per warp, allocated statically beside the dynamic
+// bitmap and therefore counted against the same per-block ceiling.
+constexpr int kStaticSharedBytes =
+    kWarps * (static_cast<int>(sizeof(float)) + static_cast<int>(sizeof(int)));
+// The default per-block shared-memory ceiling on every supported arch; the
+// exclusion bitmap plus the block's static state must fit under it without an
+// opt-in.
 constexpr int kMaxSharedBytes = 48 * 1024;
 
 enum SelectVariant : int {
@@ -312,18 +318,11 @@ CUresult qwen4_qsa_indexer_select_cuda(
   if (tokens / kRatio > score_cols) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  // 64-bit cell count: the mask and score row offsets are formed in 64 bits, so
-  // the product must fit before any pointer arithmetic. The grid takes
-  // `query_rows` directly and an `int` always fits the launch dimension.
-  if (static_cast<int64_t>(query_rows) >
-      INT64_MAX / static_cast<int64_t>(tokens)) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
   const int max_blocks = tokens / kRatio;
   const int words = (max_blocks + 31) >> 5;
   const int64_t shared_bytes =
       static_cast<int64_t>(words) * static_cast<int64_t>(sizeof(unsigned int));
-  if (shared_bytes > kMaxSharedBytes) {
+  if (shared_bytes + kStaticSharedBytes > kMaxSharedBytes) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   qwen4_qsa_select_kernel<<<query_rows, kThreads,
