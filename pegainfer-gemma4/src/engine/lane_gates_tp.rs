@@ -18,11 +18,20 @@
 //! library's ordinary suite.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::QueuedRequest;
+use pegainfer_frontend::engine::RequestLedger;
+use pegainfer_frontend::engine::Scheduler;
+use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::parallel::ParallelConfig;
@@ -30,6 +39,7 @@ use pegainfer_frontend::parallel::ParallelConfig;
 use super::lane_tests::Drained;
 use super::lane_tests::Harness;
 use super::lane_tests::ids;
+use super::lane_tests::knob_table;
 use super::lane_tests::launch_with;
 use super::lane_tests::wait_until;
 use crate::testkit::f32_tensor;
@@ -113,6 +123,53 @@ fn tp2_options(a: usize, b: usize) -> EngineLoadOptions {
     }
 }
 
+// Hold a declared cohort until every member reaches the real scheduler. CPU
+// scheduling must not turn the two repeat runs into different mixed batches.
+struct CohortScheduler {
+    inner: super::Gemma4Scheduler,
+    cohorts: mpsc::Receiver<usize>,
+    missing: usize,
+}
+
+impl Scheduler for CohortScheduler {
+    fn submit(&mut self, request: QueuedRequest) {
+        if let Ok(size) = self.cohorts.try_recv() {
+            self.missing = size;
+        }
+        self.missing = self.missing.saturating_sub(1);
+        self.inner.submit(request);
+    }
+
+    fn step(&mut self, ledger: &mut RequestLedger) -> anyhow::Result<()> {
+        if self.missing == 0 {
+            self.inner.step(ledger)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn metrics(&self) -> SchedulerMetrics {
+        self.inner.metrics()
+    }
+}
+
+fn launch_cohorts(
+    options: &EngineLoadOptions,
+    overrides: &[(&str, &str)],
+) -> (Harness, mpsc::Sender<usize>) {
+    let dir = crate::testkit::model_path();
+    let state = super::load_with_knobs(Path::new(&dir), options, &knob_table(overrides))
+        .expect("engine start");
+    let max_context = state.max_context;
+    let (send, cohorts) = mpsc::channel();
+    let scheduler = CohortScheduler {
+        inner: super::Gemma4Scheduler::new(state),
+        cohorts,
+        missing: 0,
+    };
+    (Harness::from_scheduler(scheduler, max_context), send)
+}
+
 /// Serve the first prompt on its own, then the rest as one concurrent batch,
 /// and shut the engine down once.
 ///
@@ -123,6 +180,7 @@ fn tp2_options(a: usize, b: usize) -> EngineLoadOptions {
 /// stays index-aligned.
 fn serve_batch(
     harness: &mut Harness,
+    cohorts: &mpsc::Sender<usize>,
     prompts: &[Vec<u32>],
     max_tokens: usize,
     logprobs: usize,
@@ -134,6 +192,7 @@ fn serve_batch(
         drained.push(harness.steps.drain(control.id(), "greedy solo"));
         controls.push(control);
     }
+    cohorts.send(prompts.len() - 1).expect("live scheduler");
     for prompt in &prompts[1..] {
         controls.push(harness.submit_scored(prompt.clone(), max_tokens, Some(logprobs), None));
     }
@@ -142,6 +201,19 @@ fn serve_batch(
     }
     let controls: Vec<&_> = controls.iter().collect();
     harness.shutdown(&controls);
+    for (index, output) in drained.iter().enumerate() {
+        assert_eq!(
+            (output.tokens, output.finish),
+            (max_tokens, FinishReason::Length)
+        );
+        assert_eq!(output.stop_cause, None);
+        for (step, score) in output.logprobs.iter().enumerate() {
+            assert_finite(
+                score.as_ref().expect("every token is scored"),
+                &format!("request {index} step {step}"),
+            );
+        }
+    }
     drained
 }
 
@@ -264,18 +336,9 @@ fn distribution_gap(one: &[Drained], two: &[Drained], what: &str) -> Gaps {
             b.logprobs.len()
         );
         for (step, (a, b)) in a.logprobs.iter().zip(&b.logprobs).enumerate() {
-            let (Some(a), Some(b)) = (a, b) else {
-                continue;
-            };
+            let a = a.as_ref().expect("one-rank request returned its logprob");
+            let b = b.as_ref().expect("two-rank request returned its logprob");
             compared += 1;
-            assert_finite(
-                a,
-                &format!("{what}: request {index} step {step} (one rank)"),
-            );
-            assert_finite(
-                b,
-                &format!("{what}: request {index} step {step} (two rank)"),
-            );
             let (left, right) = (top_of(a), top_of(b));
             worst_top = worst_top.max((a.top_logprobs[0].1 - b.top_logprobs[0].1).abs());
             for (token, value) in &left {
@@ -373,6 +436,7 @@ fn drained_run(rows: &[&[(u32, f32)]]) -> Drained {
         tokens: rows.len(),
         cached: 0,
         finish: FinishReason::Length,
+        stop_cause: None,
         ids: rows.iter().map(|row| row[0].0).collect(),
         logprobs: rows.iter().map(|row| Some(scored(row))).collect(),
         prompt_echo: None,
@@ -471,19 +535,19 @@ fn the_two_rank_engine_matches_one_rank() {
 
     // One rank first, and torn down before the two-rank engine takes the same
     // devices.
-    let mut one = launch_with(&single_options(device), &overrides);
-    let single = serve_batch(&mut one, &prompts, 16, TOP_K);
+    let (mut one, cohorts) = launch_cohorts(&single_options(device), &overrides);
+    let single = serve_batch(&mut one, &cohorts, &prompts, 16, TOP_K);
     drop(one);
     // The control: the same one-rank run again, and it must come out
     // **bit-identical**. A metric that only holds a tolerance can pass while a
     // token trades places with another, so compare the runs themselves.
-    let mut one_again = launch_with(&single_options(device), &overrides);
-    let repeat = serve_batch(&mut one_again, &prompts, 16, TOP_K);
+    let (mut one_again, cohorts) = launch_cohorts(&single_options(device), &overrides);
+    let repeat = serve_batch(&mut one_again, &cohorts, &prompts, 16, TOP_K);
     drop(one_again);
     assert_identical(&single, &repeat, "tp1-repeat");
 
-    let mut two = launch_with(&tp2_options(device, peer), &overrides);
-    let tp2 = serve_batch(&mut two, &prompts, 16, TOP_K);
+    let (mut two, cohorts) = launch_cohorts(&tp2_options(device, peer), &overrides);
+    let tp2 = serve_batch(&mut two, &cohorts, &prompts, 16, TOP_K);
     drop(two);
 
     // `single == repeat` bit for bit, so comparing tp2 against the repeat run
@@ -517,6 +581,61 @@ fn the_two_rank_engine_matches_one_rank() {
         gaps.worst_pick,
         gaps.worst_top
     );
+}
+
+#[test]
+#[ignore = "needs two GPUs and --test-threads=1; checkpoint from PEGAINFER_TEST_MODEL_PATH"]
+fn stop_policy_keeps_the_two_rank_decode_trigger_and_its_score() {
+    let (device, peer) = devices();
+    assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
+    let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
+    let prompt = ids(20, 11);
+    let reference = harness.submit_scored(prompt.clone(), 16, Some(0), None);
+    let reference = harness.steps.drain(reference.id(), "without a stop");
+    let position = (1..reference.ids.len())
+        .find(|&i| !reference.ids[..i].contains(&reference.ids[i]))
+        .expect("the prompt generates a distinct token during decode");
+    let trigger = reference.ids[position];
+    let stopped: Vec<_> = [Some(0), None]
+        .into_iter()
+        .map(|logprobs| {
+            let request = harness.submit_with_policy(
+                prompt.clone(),
+                position + 1,
+                logprobs,
+                None,
+                StopPolicy::new(EosPolicy::Ignore, vec![trigger]),
+            );
+            (
+                logprobs,
+                harness.steps.drain(request.id(), "explicit decode stop"),
+            )
+        })
+        .collect();
+    harness.shutdown(&[]);
+
+    assert_eq!(
+        (reference.tokens, reference.finish),
+        (16, FinishReason::Length)
+    );
+    assert_eq!(reference.stop_cause, None);
+    for score in &reference.logprobs {
+        assert_finite(score.as_ref().expect("every token is scored"), "reference");
+    }
+    for (logprobs, stopped) in &stopped {
+        assert_eq!(
+            (stopped.tokens, stopped.finish),
+            (position + 1, FinishReason::Stop),
+            "stop takes precedence over the coincident length cap"
+        );
+        assert_eq!(stopped.stop_cause, Some(StopCause::Token(trigger)));
+        assert_eq!(stopped.ids, reference.ids[..=position]);
+        if logprobs.is_some() {
+            assert_eq!(stopped.logprobs, reference.logprobs[..=position]);
+        } else {
+            assert!(stopped.logprobs.iter().all(Option::is_none));
+        }
+    }
 }
 
 /// The serving knobs a gate may force from the environment, so the same gate

@@ -12,6 +12,8 @@ The contract-owned driver polls `Gemma4Scheduler::step`. Each turn admits whatev
 
 Rows retire independently. Requests in one batch have their own frontiers, their own page tables and, for the sliding family, their own released window front, so a short request finishing does not disturb the rows that continue.
 
+Prefill and decode apply each request's stop policy. Ignoring EOS still honors explicit stop token IDs; when a token also reaches `max_tokens`, stop takes precedence over length. The ledger retains the actual trigger token and its requested logprob, counts it as a completion token, and records whether it matched EOS or an explicit stop ID. Pipelined decode discards later in-flight picks for a stopped row and releases its KV after the pipeline drains.
+
 | Knob | Value | Where it binds |
 | --- | --- | --- |
 | Decode slots | 16 | requests beyond this queue |
