@@ -43,7 +43,9 @@
 // One CTA per query row. Portability is the point (no TMA, no cluster, no
 // wgmma): the selection is a comparison-only SIMT reduction. The search is
 // `keep` masked argmax passes over the row's blocks — O(keep * blocks) — with an
-// exclusion bitmap in dynamic shared memory, one bit per block. The bitmap is
+// exclusion bitmap in dynamic shared memory, one bit per block. A row that keeps
+// every block (under the budget) skips the search and sets the whole visible
+// prefix. The bitmap is
 // sized from the widest row this launch can see (`tokens / ratio` blocks); the
 // host refuses a launch whose bitmap plus the block's static shared state
 // passes the 48 KiB default per-block ceiling (392960 blocks, 1.57M tokens),
@@ -147,66 +149,71 @@ __global__ void qwen4_qsa_select_kernel(
 
   const int keep_cap = budget / kRatio;
   const int keep = keep_cap < blocks ? keep_cap : blocks;
-
-  // The bitmap covers every block any row of this launch can see.
-  const int max_blocks = tokens / kRatio;
-  const int words = (max_blocks + 31) >> 5;
-  for (int word = tid; word < words; word += blockDim.x) {
-    picked[word] = 0u;
-  }
-  __syncthreads();
+  // Under the budget every complete block is kept, so the mask is the whole
+  // visible prefix and the search (with its bitmap) is skipped.
+  const bool all_kept = keep == blocks;
 
   __shared__ float warp_score[kWarps];
   __shared__ int warp_index[kWarps];
-  for (int pick = 0; pick < keep; ++pick) {
-    // Each thread's best among the candidates it owns; the scan is in ascending
-    // block order, and the explicit tie rule keeps the result independent of
-    // which thread found a tied score first.
-    float best_score = 0.0f;
-    int best_index = -1;
-    for (int block = tid; block < blocks; block += blockDim.x) {
-      if (block_picked(picked, block)) {
-        continue;
-      }
-      const float score = row_scores[block];
-      if (outranks(score, block, best_score, best_index)) {
-        best_score = score;
-        best_index = block;
-      }
-    }
-#pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-      const float other_score = __shfl_down_sync(0xffffffffu, best_score, offset);
-      const int other_index = __shfl_down_sync(0xffffffffu, best_index, offset);
-      if (outranks(other_score, other_index, best_score, best_index)) {
-        best_score = other_score;
-        best_index = other_index;
-      }
-    }
-    const int lane = tid & (WARP_SIZE - 1);
-    if (lane == 0) {
-      warp_score[tid / WARP_SIZE] = best_score;
-      warp_index[tid / WARP_SIZE] = best_index;
+  if (!all_kept) {
+    // The bitmap covers every block any row of this launch can see.
+    const int max_blocks = tokens / kRatio;
+    const int words = (max_blocks + 31) >> 5;
+    for (int word = tid; word < words; word += blockDim.x) {
+      picked[word] = 0u;
     }
     __syncthreads();
-    if (tid == 0) {
-      float pick_score = warp_score[0];
-      int pick_index = warp_index[0];
-#pragma unroll
-      for (int warp = 1; warp < kWarps; ++warp) {
-        if (outranks(warp_score[warp], warp_index[warp], pick_score, pick_index)) {
-          pick_score = warp_score[warp];
-          pick_index = warp_index[warp];
+
+    for (int pick = 0; pick < keep; ++pick) {
+      // Each thread's best among the candidates it owns; the scan is in
+      // ascending block order, and the explicit tie rule keeps the result
+      // independent of which thread found a tied score first.
+      float best_score = 0.0f;
+      int best_index = -1;
+      for (int block = tid; block < blocks; block += blockDim.x) {
+        if (block_picked(picked, block)) {
+          continue;
+        }
+        const float score = row_scores[block];
+        if (outranks(score, block, best_score, best_index)) {
+          best_score = score;
+          best_index = block;
         }
       }
-      // `keep <= blocks` and every pass marks one block, so at least one
-      // unpicked candidate remains; an empty pick means the launch is broken.
-      if (pick_index < 0) {
-        __trap();
+#pragma unroll
+      for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        const float other_score = __shfl_down_sync(0xffffffffu, best_score, offset);
+        const int other_index = __shfl_down_sync(0xffffffffu, best_index, offset);
+        if (outranks(other_score, other_index, best_score, best_index)) {
+          best_score = other_score;
+          best_index = other_index;
+        }
       }
-      mark_picked(picked, pick_index);
+      const int lane = tid & (WARP_SIZE - 1);
+      if (lane == 0) {
+        warp_score[tid / WARP_SIZE] = best_score;
+        warp_index[tid / WARP_SIZE] = best_index;
+      }
+      __syncthreads();
+      if (tid == 0) {
+        float pick_score = warp_score[0];
+        int pick_index = warp_index[0];
+#pragma unroll
+        for (int warp = 1; warp < kWarps; ++warp) {
+          if (outranks(warp_score[warp], warp_index[warp], pick_score, pick_index)) {
+            pick_score = warp_score[warp];
+            pick_index = warp_index[warp];
+          }
+        }
+        // `keep <= blocks` and every pass marks one block, so at least one
+        // unpicked candidate remains; an empty pick means the launch is broken.
+        if (pick_index < 0) {
+          __trap();
+        }
+        mark_picked(picked, pick_index);
+      }
+      __syncthreads();
     }
-    __syncthreads();
   }
 
   unsigned char* row_mask = mask + static_cast<int64_t>(row) * tokens;
@@ -215,7 +222,7 @@ __global__ void qwen4_qsa_select_kernel(
   }
   __syncthreads();
   for (int block = tid; block < blocks; block += blockDim.x) {
-    if (!block_picked(picked, block)) {
+    if (!all_kept && !block_picked(picked, block)) {
       continue;
     }
     const int base = block * kRatio;
