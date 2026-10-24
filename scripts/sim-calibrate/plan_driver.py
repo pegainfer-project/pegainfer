@@ -17,6 +17,7 @@ from artifacts import (ExecutionStore, _read_json, _write_atomic,
 from baseline import resolve_reference, select_reference
 from evidence_proxy import EvidenceError, EvidenceProxy, observer_identity
 from manifest import canonical_scheduler_identity
+from profile import verify_fitted_bundle
 from probe import (probe_endpoint, profile_endpoint, profile_listener_matches, requires_cache_reset,
                    validate_profile_binding, validate_reset_receipt)
 from steady_state import compute_statistics
@@ -102,7 +103,9 @@ def verify_attempt_binding(campaign: dict, variant_name: str, root: Path, bindin
         variant = campaign['variants'][variant_name]
         if variant_name == 'zero_cost':
             variant = {**variant, **resolve_reference(root, campaign, binding['reference'], cell_id)}
-        expected = {k: v for k, v in binding.items() if k not in ('variant_identity', 'observer_sha256', 'reference')}
+        if variant_name == 'sim' and verify_fitted_bundle(root, campaign) != binding.get('selection'):
+            raise EvidenceError('fitted profile selection changed')
+        expected = {k: v for k, v in binding.items() if k not in ('variant_identity', 'observer_sha256', 'reference', 'selection')}
         if profile_binding(root, variant, binding['server_pid']) != expected:
             raise EvidenceError('profile server binding changed')
 
@@ -228,6 +231,8 @@ async def run_campaign(root: Path, *, variants: list[str], selectors: list[str] 
                 if variant_name == 'zero_cost':
                     binding['reference'] = select_reference(root, campaign, cell['cell_id'])
                     configured = {**variant, **resolve_reference(root, campaign, binding['reference'], cell['cell_id'])}
+                if variant_name == 'sim':
+                    binding['selection'] = verify_fitted_bundle(root, campaign)
                 if variant_name != 'target':
                     binding.update(profile_binding(root, configured, (server_pids or {}).get(variant_name)))
                 plan = _read_json(checked_path(root, cell['plan']['path']))

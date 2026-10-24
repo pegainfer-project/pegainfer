@@ -27,11 +27,11 @@ from vllm_bench import render_command
 from vllm_bench_collect import convert_evidence
 from steady_state import compute_statistics
 from baseline import prepare_references, resolve_reference, select_reference
-from profile import reference_bundle
+from profile import materialize_profile, verify_fitted_bundle
 from manifest import sha256_json
 
 
-def make_bundle(base: Path, *, cached=False, reset_before=None):
+def make_bundle(base: Path, *, cached=False, reset_before=None, full_train=False):
     """Compile current inputs; evidence is deliberately deterministic and tiny."""
     path, spec = make_input(base)
     cached_matrix = spec['workload']['matrices']['cached-train']
@@ -42,16 +42,20 @@ def make_bundle(base: Path, *, cached=False, reset_before=None):
                   'output_tokens': 4, 'warmup_repeats': 1, 'repeats': 2, 'arrival': {'mode': 'fixed_batch'},
                   'cache_lifecycle': {'namespace': 'cold', 'reset_before': reset_before, 'bootstrap_repeats': 0}}
     spec['workload']['matrices'] = {'decode': matrix, 'heldout': {**matrix, 'split': 'sealed_test'}}
+    if full_train:
+        for variant in spec['variants'].values():
+            variant['runtime']['cache'] = {'policy': 'off'}
+        spec['workload']['matrices'] = {
+            'cold': {**matrix, 'kind': 'cold_prefill', 'concurrency': 1, 'input_tokens': [8, 64]},
+            'decode': {**matrix, 'concurrency': [1, 2], 'num_ctx': [16, 64]},
+            'heldout': {**matrix, 'num_ctx': [32], 'split': 'sealed_test'},
+        }
+        spec['workload']['matrices']['cold'].pop('num_ctx')
     if cached:
         spec['workload']['matrices']['cached'] = cached_matrix
     path.write_text(json.dumps(spec))
     campaign = compile_campaign(path)
     root = base / 'artifacts'
-    sim = root / campaign['variants']['sim']['profile_path']
-    manifest, profile = reference_bundle(campaign, campaign['workload']['cells'][0], interval_us=0,
-                                         source_digest=sha256_json('fixture'), source_artifacts=[])
-    _write_atomic(sim.parent / 'manifest.json', manifest)
-    _write_atomic(sim, profile)
     return root, campaign
 
 
@@ -63,6 +67,14 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                             event_interval_ms=event_interval_ms)
             roles = tuple(role for role in roles if role != 'target')
         prepare_references(root)
+    if 'sim' in roles:
+        normalized_path, fit_path = root.parent / 'profile-train.json', root.parent / 'profile-fit.json'
+        if not fit_path.exists():
+            normalized = normalize_campaign(root, scope='train')
+            write_document(normalized_path, normalized)
+            from fit import write_document as write_fit
+            write_fit(fit_path, fit_normalized(normalized, source_digest=file_reference(normalized_path)['sha256']))
+        materialize_profile(root, normalized_artifact=normalized_path, fit_artifact=fit_path)
     for role in roles:
         with ExecutionStore(root, campaign['campaign_id']) as store:
             for cell in campaign['workload']['cells']:
@@ -78,7 +90,10 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                         configured = resolve_reference(root, campaign, binding['reference'], cell['cell_id'])
                     profile = root / configured['profile_path']
                     endpoint = urlsplit(identity['endpoint'])
-                    binding.update(profile=file_reference(profile), manifest=file_reference(profile.parent / 'manifest.json'),
+                    manifest_path = profile.parent / _read_json(profile)['calibration']['manifest']
+                    if role == 'sim':
+                        binding['selection'] = verify_fitted_bundle(root, campaign)
+                    binding.update(profile=file_reference(profile), manifest=file_reference(manifest_path),
                                    endpoint={'address': endpoint.hostname, 'port': endpoint.port},
                                    listeners=[{'family': 'IPv4', 'address': '0.0.0.0', 'port': endpoint.port}])
                 if store.sealed(plan, role, binding):
@@ -210,8 +225,8 @@ class NormalizeTests(unittest.TestCase):
 
     def test_validation_requires_complete_roles_and_empty_scope_is_invalid(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root, campaign = make_bundle(Path(tmp))
-            collect_fixture(root, campaign, roles=('target',))
+            root, campaign = make_bundle(Path(tmp), full_train=True)
+            collect_fixture(root, campaign)
             collect_fixture(root, campaign, split='sealed_test')
             self.assertEqual(normalize_campaign(root, scope='validation')['status'], 'invalid')
             collect_fixture(root, campaign, roles=('sim',), split='sealed_test')
@@ -235,7 +250,7 @@ class NormalizeTests(unittest.TestCase):
 
     def test_snapshot_survives_later_collection_and_offline_source_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root, campaign = make_bundle(Path(tmp))
+            root, campaign = make_bundle(Path(tmp), full_train=True)
             collect_fixture(root, campaign)
             document = normalize_campaign(root, scope='train')
             output = Path(tmp) / 'normalized.json'

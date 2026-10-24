@@ -461,6 +461,10 @@ def _profile_sources(root: Path, campaign: dict, variant: str, reference: dict) 
     if variant == 'zero_cost':
         from baseline import resolve_reference
         configured = {**configured, **resolve_reference(root, campaign, binding['reference'], binding['reference']['cell_id'])}
+    if variant == 'sim':
+        from profile import verify_fitted_bundle
+        if verify_fitted_bundle(root, campaign) != binding.get('selection'):
+            raise PairingContractError('saved fitted selection differs from verified training')
 
     validate_profile_binding(configured['identity']['endpoint'], binding)
     profile_path = checked_path(root, configured['profile_path'])

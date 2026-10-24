@@ -553,6 +553,14 @@ def fit_normalized(document: dict[str, Any], *, source_digest: str | None = None
     }
 
 
+def verify_fit(document: dict, normalized: dict, *, normalized_digest: str) -> None:
+    """Recompute candidates from pinned qualified training; hashes alone are not proof."""
+    from manifest import canonical_json
+    expected = fit_normalized(normalized, source_digest=normalized_digest)
+    if expected['status'] != 'succeeded' or canonical_json(document) != canonical_json(expected):
+        raise FitError('fit differs from verified train evidence or fitter implementation')
+
+
 def write_document(path: Path, document: dict[str, Any]) -> None:
     rendered = json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
     path = path.expanduser().resolve()

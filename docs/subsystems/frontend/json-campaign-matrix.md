@@ -1,6 +1,6 @@
 # Calibration campaigns and proxy evidence
 
-> **TL;DR:** Train target evidence now prepares immutable per-cell references; paired window/TTFT differences qualify complete training before numerical fitting. Decode keeps initial total num_ctx, full common windows and signed request values. Fitted-profile lifecycle and held-out reporting remain C6/C7; cached migration remains C8.
+> **TL;DR:** Qualified paired training now produces an immutable, loadable surface profile without a validation report. The driver and offline reader bind its selection back to verified training and reference evidence. Decode keeps initial total num_ctx, full common windows and signed request values. Final held-out reporting remains C7; cached migration remains C8.
 >
 > **Last touched:** 2026-10
 
@@ -183,6 +183,45 @@ After every owned server stopped, production readers reverified preparation, tar
 
 All 48 Python tests passed (64.384s; `/tmp/c5-tests-complete.log`), including five new reference/signed-value/full-training tests and the retained real-bench HTTP checks. All 15 `pegainfer-sim` release library tests passed (`/tmp/c5-sim-release-tests.log`); Python compilation, cargo formatting and diff checks passed. The three steady-state test methods removed at the user’s request were not restored. C4’s amended retained suite was 43 tests; its earlier 46-test run above is historical.
 
+## Fitted profile lifecycle (C6)
+
+`profile.py` consumes the current compiler bundle plus explicit normalized and fit artifact paths. It has no report input, implicit artifact glob, characterization mode or validation-error selection. Complete qualified train evidence remains mandatory. `fit.verify_fit` runs the existing numerical fitter against the pinned normalized input, including its production source verification, and compares the whole saved fit. Rehashing an edited candidate or normalized value cannot establish eligibility. Normalizer sources must match the frozen acquisition source map; fit/materializer implementation digests are retained separately.
+
+C6 fixes selection to `cold_prefill_piecewise_linear` and `decode_2d_surface`; additive remains a numerical diagnostic and is never a runtime fallback. The full surface is converted from milliseconds to integer microseconds in request-major order. Axes must be strictly increasing, integer, dimensionally complete and representable by the Rust contract. No reference interval or baseline is added a second time. Mixed work uses the existing actual-step prefill + decode composition with zero intercept, without requiring mixed validation. Positive work outside a component's curve still fails, including gaps inside the outer rectangular coverage; no extrapolation or invented zero knots are introduced.
+
+The shared calibration-manifest builder serves both C5 known references and C6 fitted profiles. Target engine/hardware/model provenance stays distinct from the sim's served model name and scheduler/cache identity. Rust profile schema 3 and manifest schema 2 are unchanged.
+
+The compiler-selected sim directory contains the configured profile filename, `calibration.manifest.json` and `selection.json`. The selection pins normalized/fit paths and byte references, candidate/source metadata, implementation digests and profile/manifest byte references. `status=selected` means the fixed train candidates were materialized; `validation_status=pending` carries no accuracy or publication claim. Cached remains explicitly unsupported until C8.
+
+`artifacts.write_fitted_bundle` holds the existing execution lock, fsyncs all files in a private sibling directory, and publishes the directory with one rename. It accepts an existing identical complete bundle, refuses a different or partial bundle, and does not weaken the generic writer's `profiles/` protection. It cannot replace compiler, plan, raw or reference evidence. The compiler index remains unchanged.
+
+Before sim acquisition, on sealed reuse, after collection and before sealing, the driver verifies the complete fitted bundle against its pinned training and then applies the existing live profile/PID/listener checks. The attempt saves the selection byte reference. `pairing.load_role` performs the same fitted verification offline; it does not need the old server process. Standalone Rust/reference profile loading remains available, but a calibration campaign's sim role now requires this complete fitted selection. Old transport-only campaign sim fixtures are replaced by qualified-training fixtures rather than accepted through a compatibility branch.
+
+C6's independent smoke uses six train cells (cold inputs 64/2048, decode B=1/4 × total context=256/2048) and one non-training probe (B=2, total context=1024, output=8), all warmup=1/measured=2. Training runs target/reference; the probe runs target/fitted sim only. This does not relax C7's three-role formal validation contract or claim final report success. The original 11 sealed-test cells remain uncollected. The probe's positive prefill work is 512..1024 tokens and decode context is bounded by 512..1036, inside both fitted components. Training boundary cells are anchors, not a promise that generated continuation stays in-domain.
+
+### C6 production validation (2026-10-24)
+
+Fresh final-source evidence is `/tmp/c6-production-20261024-final/`, with `validation-summary.json`, `artifacts/`, exact commands/logs and the before-probe training snapshot. Qwen3-4B ran on RTX 3090 GPU2, vLLM 0.30.0, Torch 2.13.0+cu130/CUDA 13.0, half/eager/TRITON_ATTN, prefix cache off and whole prefill. The 18 frozen acquisition sources match the final files.
+
+All 14 cell/role acquisitions sealed on attempt 1: 84 requests (28 warmup, 56 measured), 24 measured train pairs and four measured probe pairs. All 20 measured decode batches qualified; the minimum common window was 140.704ms and every measured request retained at least four intervals. Profile materialization and identical regeneration succeeded before any probe evidence or report existed. The original driver rejected a live reference profile at the sim endpoint before creating a probe attempt; the correct fitted profile served all probe requests, and sealed resume dispatched none.
+
+The fitted profile preserves the complete 2×2 decode surface at B=1/4, total context=256/2048. Request-major durations are `[24665,24500,28192,28969]` microseconds. Cold inputs 64/2048 price at `[55295,290435]` microseconds. These are training-derived model values, not an accuracy result. The same generated bundle loaded through the production Rust loader/worker test and priced the actual mixed shape `(1,512,512)` at `108391 + 24641 = 133032` microseconds; all three tested unmodeled shapes were rejected.
+
+After all owned servers stopped, the production readers reverified target statistics, references, normalized training, exact fit, fitted selection and every target/sim attempt. Counts and exact content pairing passed; the pre-probe training/profile snapshot and original C5 execution index were unchanged. GPU2 returned to 1MiB used. The offline helper's first run incorrectly passed a process-list JSON array to the object-only artifact reader; using the standard JSON reader for that helper metadata fixed the check. `offline-verify.log` retains that failure and `offline-verify-final.log` records the successful stop-state verification. No acquisition, raw evidence or production source was changed to repair the helper.
+
+All 53 Python regression methods passed, including five new profile-contract tests (`/tmp/c6-python-tests.log`). Rust release lib 15, CLI 2 and frontend 24 passed, including the new mixed/OOD worker test; release build, clippy with warnings denied, formatting, Python syntax and diff checks passed. The wider Rust invocation also ran three untouched tool-call tests: one passed and two failed with HTTP 500 because the temporary model has no tool parser (`/tmp/c6-sim-tests.log`). The tool-call test/runtime sources have no C6 changes; that broader suite is not reported as green. HTTP tests require sandbox-external loopback access and were run serially with proxy environment variables removed.
+
+Those counts describe the initial C6 validation. At the user's review request, the no-report/idempotence, publication-failure, encoding-boundary and Rust mixed/OOD tests were subsequently removed. C6 retains two new Python tests covering corrupted training/fit rejection and offline sim evidence binding; both passed after the reduction, and the Rust frontend release test target compiled. Formatting and diff checks also passed. The recorded smoke and initial validation results remain historical evidence; the removed tests are no longer part of the checked-in suite.
+
+The executed materialization and post-stop verification entry points were:
+
+```bash
+/home/mgj/openinfer/.venv/bin/python -B /home/mgj/openinfer/scripts/sim-calibrate/profile.py --artifact-root /tmp/c6-production-20261024-final/artifacts --normalized /tmp/c6-production-20261024-final/normalized.json --fit-artifact /tmp/c6-production-20261024-final/fit.json
+/home/mgj/openinfer/.venv/bin/python -B /tmp/c6_offline_verify.py /tmp/c6-production-20261024-final
+```
+
+Local orchestration is `/tmp/c6_production.py`; its log retains the initial helper-only failure after successful acquisition. The standalone final verifier above passed. C7 still owns complete held-out reporting and accuracy/queueing acceptance; C6 did not collect the original 11 sealed-test cells or select a model using their results.
+
 ## Migration defense handoff
 
 | Previous defense / failure mode | Current owner |
@@ -202,6 +241,8 @@ All 48 Python tests passed (64.384s; `/tmp/c5-tests-complete.log`), including fi
 | Old normalize baseline negative-delta/dispersion filtering | New output cannot enter old fitter (schema 3); qualification and negative/unstable-delta policy explicitly deferred to C5, not silently inherited as pairing policy |
 | Old mixed-overlap/cached-hit normalize branches | Mixed is outside the current compiler contract; cached explicitly deferred. Independent `cached_prefix_collect` hit/alignment/uncached-tail validation remains until C8 |
 | Profile/selection/publication lineage, errors, queueing and coverage | Restored replay validation/prediction/report rules; C7 still owns new-evidence integration and report migration |
+| Old profile report prerequisite and report-derived candidate scoring | Replaced by verified complete train + exact fit recomputation and fixed surface selection; held-out/report bytes are not materialization inputs |
+| Old profile digest/model-domain checks and separate file writes | Shared calibration identity, strict runtime axes/units, atomic immutable fitted bundle, and shared live/offline selection-to-training verification; scheduler and runtime OOD rejection retained |
 
 ## Execution Log
 

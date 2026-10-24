@@ -10,12 +10,12 @@ import math
 from pathlib import Path
 from typing import Any
 
-from manifest import (  # noqa: E402
-    ManifestError,
+from artifacts import (_read_json, _render, file_reference, fitted_bundle_paths,
+                       load_compiled_bundle, write_fitted_bundle)
+from manifest import (
     canonical_cache_identity,
     canonical_client_identity,
     canonical_scheduler_identity,
-    canonical_workload_identity,
     canonical_json,
 )
 
@@ -24,47 +24,49 @@ class ProfileError(ValueError):
     """Raised when calibration evidence cannot produce a safe profile."""
 
 
-def reference_bundle(campaign: dict[str, Any], cell: dict, *, interval_us: int,
-                     source_digest: str, source_artifacts: list[str], manifest_name: str = "manifest.json") -> tuple[dict[str, Any], dict[str, Any]]:
-    """Build a known functional reference, independent of fit/report artifacts."""
+def _calibration_manifest(campaign: dict, variant: str, cells: list[dict], source_digest: str,
+                          source_artifacts: list[str], fitter_revision: str) -> dict:
     target = campaign["variants"]["target"]
-    control = campaign["variants"]["zero_cost"]
-    scheduler = canonical_scheduler_identity(control["runtime"]["scheduler"])
-    workload = [cell]
-    client = canonical_client_identity(campaign["client"], tokenizer_config_sha256=campaign["client"]["tokenizer_config_sha256"])
-    identity = target["identity"]
-    runtime = target["runtime"]
-    provenance = campaign["provenance"]
-    manifest = {
+    serving = campaign["variants"][variant]
+    identity, runtime, provenance = target["identity"], target["runtime"], campaign["provenance"]
+    return {
         "schema_version": 2,
         "target_engine": identity["engine"], "engine_version": identity["engine_version"],
-        "model_id": control["identity"]["model"], "model_revision": identity["model_revision"],
+        "model_id": serving["identity"]["model"], "model_revision": identity["model_revision"],
         "model_config_sha256": identity["model_config_sha256"], "gpu": runtime.get("gpu", "unbound"),
         "server_flags": target["server_flags"], "collection_command": canonical_json(provenance["compile_argv"]),
         "source_artifacts": source_artifacts,
         "backend": runtime.get("backend", identity["engine"]), "driver": runtime.get("driver", "not_recorded"),
         "cuda": runtime.get("cuda", "not_recorded"), "parallelism": runtime.get("parallelism", "1"),
-        "quantization": runtime.get("quantization", "none"), "scheduler": scheduler,
-        "cache": canonical_cache_identity(control["runtime"].get("cache")), "client": client,
+        "quantization": runtime.get("quantization", "none"),
+        "scheduler": canonical_scheduler_identity(serving["runtime"]["scheduler"]),
+        "cache": canonical_cache_identity(serving["runtime"].get("cache")),
+        "client": canonical_client_identity(campaign["client"], tokenizer_config_sha256=campaign["client"]["tokenizer_config_sha256"]),
         "workload": {
             "cells": [{"id": cell["cell_id"], "family": cell["kind"], "input_tokens": cell["input_tokens"],
                        "output_tokens": cell["output_tokens"], "concurrency": cell["concurrency"],
-                       "arrival_pattern": "fixed_batch", "attribution": "black_box_effective"} for cell in workload],
-            "warmup_repeats": max(cell["warmup_repeats"] for cell in workload),
-            "repeats": max(cell["repeats"] for cell in workload),
+                       "arrival_pattern": "fixed_batch", "attribution": "black_box_effective"} for cell in cells],
+            "warmup_repeats": max(cell["warmup_repeats"] for cell in cells),
+            "repeats": max(cell["repeats"] for cell in cells),
         },
-        "split": {name: [cell["cell_id"]] if name == cell["split"] else [] for name in campaign["splits"]},
+        "split": {name: [cell["cell_id"] for cell in cells if name == cell["split"]] for name in campaign["splits"]},
         "provenance": {
-            "collector_revision": provenance["compiler_revision"],
-            "fitter_revision": "not_applicable_known_reference",
+            "collector_revision": provenance["compiler_revision"], "fitter_revision": fitter_revision,
             "artifact_uri": provenance["artifact_uri"], "source_digest": source_digest,
         },
     }
-    # The artifact writer uses this exact encoding, including the final newline.
-    manifest_bytes = (json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode()
+
+
+def reference_bundle(campaign: dict[str, Any], cell: dict, *, interval_us: int,
+                     source_digest: str, source_artifacts: list[str], manifest_name: str = "manifest.json") -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a known functional reference, independent of fit/report artifacts."""
+    manifest = _calibration_manifest(campaign, "zero_cost", [cell], source_digest, source_artifacts,
+                                     "not_applicable_known_reference")
+    scheduler = manifest["scheduler"]
+    manifest_bytes = _render(manifest)
     profile = {
         "schema_version": 3,
-        "calibration": {"manifest": manifest_name, "sha256": _sha256_bytes(manifest_bytes)},
+        "calibration": {"manifest": manifest_name, "sha256": hashlib.sha256(manifest_bytes).hexdigest()},
         "scheduler": scheduler,
         "predictor": {
             "coverage": {
@@ -85,126 +87,6 @@ def reference_bundle(campaign: dict[str, Any], cell: dict, *, interval_us: int,
     return manifest, profile
 
 
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _mixed_model(mixed_validation: dict[str, Any]) -> dict[str, Any] | None:
-    """Materialize only the step-observable mixed composition base."""
-
-    if not isinstance(mixed_validation, dict):
-        return None
-    if mixed_validation.get("status") != "measured":
-        return None
-    mixed_errors = mixed_validation.get("errors") or {}
-    if not isinstance(mixed_errors.get("absolute_ms"), dict) or mixed_errors.get("count", 0) <= 0:
-        return None
-    if mixed_validation.get("ood") or mixed_validation.get("uncertain"):
-        return None
-    return {
-        "kind": "composition_additive",
-        "intercept_us": 0,
-    }
-
-
-def _sha256_file(path: Path) -> str:
-    try:
-        return _sha256_bytes(path.read_bytes())
-    except OSError as exc:
-        raise ProfileError(f"failed to read {path}: {exc}") from exc
-
-
-def _load_json(path: Path) -> dict[str, Any]:
-    value, _ = _load_json_with_digest(path)
-    return value
-
-
-def _load_json_with_digest(path: Path) -> tuple[dict[str, Any], str]:
-    try:
-        payload = path.read_bytes()
-        value = json.loads(payload.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ProfileError(f"failed to read JSON {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ProfileError(f"{path} must contain a JSON object")
-    return value, _sha256_bytes(payload)
-
-
-def _select_artifact(
-    campaign_root: Path,
-    directory: str,
-    pattern: str,
-    explicit: Path | None,
-    label: str,
-) -> Path:
-    root = campaign_root.resolve()
-    if explicit is not None:
-        candidate = explicit if explicit.is_absolute() else root / explicit
-        candidate = candidate.resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError as exc:
-            raise ProfileError(f"{label} path escapes campaign root: {candidate}") from exc
-        if not candidate.is_file():
-            raise ProfileError(f"{label} artifact does not exist: {candidate}")
-        return candidate
-    candidates = sorted((root / directory).glob(pattern))
-    if not candidates:
-        raise ProfileError(f"campaign must contain {directory}/{pattern}")
-    if len(candidates) != 1:
-        names = ", ".join(path.name for path in candidates)
-        raise ProfileError(f"ambiguous {label} artifacts; specify one explicitly: {names}")
-    return candidates[0].resolve()
-
-
-def _validate_artifact_lineage(
-    campaign_root: Path,
-    campaign: dict[str, Any],
-    normalized_path: Path,
-    fit_path: Path,
-    report_path: Path,
-) -> dict[str, str]:
-    manifest_path = campaign_root / "manifest.json"
-    manifest, manifest_digest = _load_json_with_digest(manifest_path)
-    normalized, normalized_digest = _load_json_with_digest(normalized_path)
-    fit, fit_digest = _load_json_with_digest(fit_path)
-    report, report_digest = _load_json_with_digest(report_path)
-    campaign_id = campaign.get("campaign_id")
-    if manifest.get("campaign_id") != campaign_id:
-        raise ProfileError("campaign manifest identity changed while materializing profile")
-    for label, artifact in (("normalized", normalized), ("fit", fit), ("report", report)):
-        if artifact.get("campaign_id") != campaign_id:
-            raise ProfileError(f"{label} campaign_id does not match manifest")
-        if artifact.get("status") != "succeeded":
-            raise ProfileError(f"{label} artifact is not succeeded")
-    normalized_source = normalized.get("source")
-    source_digests = normalized_source.get("source_digests") if isinstance(normalized_source, dict) else None
-    if not isinstance(source_digests, dict) or source_digests.get("manifest_sha256") != manifest_digest:
-        raise ProfileError("normalized artifact is not bound to the campaign manifest")
-    fit_source = fit.get("source")
-    if not isinstance(fit_source, dict) or fit_source.get("normalized_sha256") != normalized_digest:
-        raise ProfileError("fit artifact normalized digest does not match bytes")
-    report_provenance = report.get("provenance")
-    if not isinstance(report_provenance, dict):
-        raise ProfileError("report artifact provenance is missing")
-    if report_provenance.get("normalized_sha256") != normalized_digest:
-        raise ProfileError("report normalized digest does not match bytes")
-    if report_provenance.get("fit_sha256") != fit_digest:
-        raise ProfileError("report fit digest does not match bytes")
-    if report_provenance.get("manifest_sha256") != manifest_digest:
-        raise ProfileError("report manifest digest does not match bytes")
-    normalized_index_digest = source_digests.get("artifact_index_sha256")
-    report_index_digest = report_provenance.get("artifact_index_sha256")
-    if normalized_index_digest != report_index_digest:
-        raise ProfileError("report artifact index digest does not match normalized lineage")
-    return {
-        "manifest_sha256": manifest_digest,
-        "normalized_sha256": normalized_digest,
-        "fit_sha256": fit_digest,
-        "report_sha256": report_digest,
-    }
-
-
 def _required(mapping: dict[str, Any], key: str, context: str) -> Any:
     if key not in mapping:
         raise ProfileError(f"{context} is missing {key}")
@@ -221,120 +103,13 @@ def _ms_to_us(value: Any, context: str) -> int:
     milliseconds = _finite_number(value, context)
     if milliseconds < 0:
         raise ProfileError(f"{context} must be non-negative")
-    return int(round(milliseconds * 1000.0))
-
-
-def _comparison_evidence(comparison: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
-    # Sealed and held-out evidence is reserved for validation/signoff, never selection.
-    for split in ("threshold_validation", "train"):
-        record = comparison.get("by_split", {}).get(split)
-        if not isinstance(record, dict):
-            continue
-        if record.get("status") != "measured" or int(record.get("sample_count", 0)) <= 0:
-            continue
-        if record.get("ood"):
-            continue
-        errors = record.get("errors")
-        if not isinstance(errors, dict):
-            continue
-        relative = errors.get("relative")
-        if not isinstance(relative, dict) or relative.get("p95") is None:
-            continue
-        by_cell = record.get("by_cell")
-        if isinstance(by_cell, dict):
-            # Reports may retain extra train observations outside a candidate's
-            # fitted domain for OOD characterization.  The candidate's source
-            # cells are the contract for profile selection: every fitted point
-            # must be measured, while unrelated report cells must not veto it.
-            provenance = comparison.get("candidate_provenance")
-            candidate_provenance = (
-                provenance.get(comparison.get("name"))
-                if isinstance(provenance, dict)
-                else None
-            )
-            source_cells = (
-                candidate_provenance.get("source_cells")
-                if isinstance(candidate_provenance, dict)
-                else None
-            )
-            if isinstance(source_cells, list) and source_cells:
-                selected_cells = [by_cell.get(str(cell_id)) for cell_id in source_cells]
-                if any(not isinstance(item, dict) for item in selected_cells):
-                    continue
-            else:
-                selected_cells = list(by_cell.values())
-            measured_cells = [
-                item
-                for item in selected_cells
-                if isinstance(item, dict) and item.get("status") == "measured"
-            ]
-            if not measured_cells or len(measured_cells) != len(selected_cells):
-                # Aggregate errors cannot hide an unsupported fitted point.
-                continue
-            cell_p95 = [
-                item.get("errors", {}).get("relative", {}).get("p95")
-                for item in measured_cells
-            ]
-            if any(value is None for value in cell_p95):
-                continue
-            fidelity = {
-                "cell_count": len(measured_cells),
-                "worst_cell_relative_p95": max(float(value) for value in cell_p95),
-                "selection_metric": "worst_cell_relative_p95",
-            }
-        else:
-            # Keep old reports readable, but new reports always carry by_cell.
-            fidelity = {
-                "cell_count": int(record.get("sample_count", 0)),
-                "worst_cell_relative_p95": float(relative["p95"]),
-                "selection_metric": "aggregate_relative_p95_legacy",
-            }
-        return split, record, fidelity
-    return None
-
-
-def _select_comparison(
-    report: dict[str, Any],
-    names: tuple[str, ...],
-    *,
-    allow_characterization: bool,
-) -> tuple[dict[str, Any], str, bool, dict[str, Any]]:
-    candidates = [
-        item
-        for item in report.get("comparisons", [])
-        if isinstance(item, dict) and item.get("name") in names and item.get("status") == "fitted"
-    ]
-    scored: list[tuple[tuple[float, float, float, int], dict[str, Any], str, bool, dict[str, Any]]] = []
-    complexity = {name: index for index, name in enumerate(names)}
-    for candidate in candidates:
-        evidence = _comparison_evidence(candidate)
-        if evidence is None:
-            continue
-        split, record, fidelity = evidence
-        if split == "train" and not allow_characterization:
-            continue
-        relative = record["errors"]["relative"]
-        scored.append(
-            (
-                (
-                    float(fidelity["worst_cell_relative_p95"]),
-                    float(relative["p95"]),
-                    float(relative.get("p50") if relative.get("p50") is not None else float("inf")),
-                    complexity.get(candidate["name"], len(names)),
-                ),
-                candidate,
-                split,
-                split == "train",
-                fidelity,
-            )
-        )
-    if not scored:
-        mode = "characterization" if allow_characterization else "held-out"
-        raise ProfileError(
-            f"no usable {mode} evidence for candidates {', '.join(names)}"
-        )
-    _, candidate, split, characterization, fidelity = min(scored, key=lambda item: item[0])
-    return candidate, split, characterization, fidelity
+    scaled = milliseconds * 1000.0
+    if not math.isfinite(scaled):
+        raise ProfileError(f"{context} exceeds u64 microseconds")
+    encoded = round(scaled)
+    if encoded > 2**64 - 1:
+        raise ProfileError(f"{context} exceeds u64 microseconds")
+    return encoded
 
 
 def _fit_candidate(fit: dict[str, Any], name: str) -> dict[str, Any]:
@@ -360,352 +135,129 @@ def _prefill_model(candidate: dict[str, Any]) -> dict[str, Any]:
             raise ProfileError(f"cold prefill knot {index}.x must be a non-negative integer")
         inputs.append(int(x))
         durations.append(_ms_to_us(_required(knot, "y", f"cold prefill knot {index}"), f"knot {index}.y"))
+    _axis(inputs, "prefill.input_tokens", 2**32 - 1)
     return {"input_tokens": inputs, "duration_us": durations}
 
 
+def _axis(values: list, label: str, maximum: int) -> list[int]:
+    if (not isinstance(values, list) or len(values) < 2
+            or any(isinstance(x, bool) or not isinstance(x, (int, float)) or x < 0 or x > maximum
+                   or not math.isfinite(x) or int(x) != x for x in values)
+            or any(a >= b for a, b in zip(values, values[1:]))):
+        raise ProfileError(f"{label} must be a strictly increasing integer axis with at least two points")
+    return [int(x) for x in values]
+
+
 def _decode_model(candidate: dict[str, Any]) -> dict[str, Any]:
-    kind = candidate.get("name")
-    coverage = _required(candidate, "coverage", f"decode candidate {kind}")
-    requests = coverage.get("requests")
-    kv_tokens = coverage.get("kv_tokens")
-    if not isinstance(requests, dict) or not isinstance(kv_tokens, dict):
-        raise ProfileError(f"decode candidate {kind} has incomplete coverage")
-    request_min = int(_finite_number(requests["min"], "decode requests.min"))
-    request_max = int(_finite_number(requests["max"], "decode requests.max"))
-    kv_min = int(_finite_number(kv_tokens["min"], "decode kv_tokens.min"))
-    kv_max = int(_finite_number(kv_tokens["max"], "decode kv_tokens.max"))
-    if kind == "decode_2d_surface":
-        axes = _required(candidate, "axes", "decode surface")
-        values = _required(candidate, "values_ms", "decode surface")
-        request_axis = [int(_finite_number(value, "decode requests axis")) for value in axes["requests"]]
-        kv_axis = [int(_finite_number(value, "decode kv axis")) for value in axes["kv_tokens"]]
-        duration_us = [
-            [_ms_to_us(value, "decode surface duration") for value in row]
-            for row in values
-        ]
-    elif kind == "decode_additive":
-        coefficients = _required(candidate, "coefficients", "decode additive")
-        d0 = _finite_number(coefficients["d0_ms"], "decode d0_ms")
-        d_kv = _finite_number(coefficients["d_kv_ms_per_token"], "decode d_kv_ms_per_token")
-        d_requests = _finite_number(coefficients["d_requests_ms"], "decode d_requests_ms")
-        request_axis = [request_min, request_max]
-        kv_axis = [kv_min, kv_max]
-        duration_us = [
-            [
-                _ms_to_us(
-                    d0 + d_requests * (request_count - 1) + d_kv * kv_count,
-                    "decode additive duration",
-                )
-                for kv_count in kv_axis
-            ]
-            for request_count in request_axis
-        ]
-    else:
-        raise ProfileError(f"unsupported decode candidate {kind}")
-    if len(request_axis) < 2 or len(kv_axis) < 2:
-        raise ProfileError(f"decode candidate {kind} needs at least two points per axis")
-    if len(duration_us) != len(request_axis) or any(len(row) != len(kv_axis) for row in duration_us):
-        raise ProfileError(f"decode candidate {kind} has inconsistent surface dimensions")
-    return {
-        "decode_reqs": request_axis,
-        "sum_decode_ctx_tokens": kv_axis,
-        "duration_us": [value for row in duration_us for value in row],
-    }
+    if candidate.get("name") != "decode_2d_surface":
+        raise ProfileError("C6 requires decode_2d_surface; no candidate fallback")
+    axes = candidate["axes"]
+    requests = _axis(axes["requests"], "decode.requests", 2**32 - 1)
+    contexts = _axis(axes["kv_tokens"], "decode.kv_tokens", 2**64 - 1)
+    values = candidate["values_ms"]
+    if len(values) != len(requests) or any(len(row) != len(contexts) for row in values):
+        raise ProfileError("decode surface dimensions do not match axes")
+    return {"decode_reqs": requests, "sum_decode_ctx_tokens": contexts,
+            "duration_us": [_ms_to_us(value, "decode surface duration") for row in values for value in row]}
 
 
-def _rust_manifest(
-    campaign: dict[str, Any],
-    source_artifacts: list[str],
-    source_digest: str,
-    tokenizer_config_sha256: str,
-    calibration_driver: str,
-) -> dict[str, Any]:
-    target = _required(campaign, "target", "campaign")
-    runtime = _required(campaign, "runtime", "campaign")
-    scheduler = _required(runtime, "scheduler", "campaign.runtime")
-    client = _required(campaign, "client", "campaign")
-    provenance = _required(campaign, "provenance", "campaign")
-    environment = campaign.get("environment") or {}
-    cache_runtime = runtime.get("cache") or {}
-    try:
-        scheduler_identity = canonical_scheduler_identity(scheduler)
-        cache_identity = canonical_cache_identity(cache_runtime)
-        client_identity = canonical_client_identity(
-            client,
-            tokenizer_config_sha256=tokenizer_config_sha256,
-        )
-        workload_identity, split_identity = canonical_workload_identity(campaign)
-    except ManifestError as exc:
-        raise ProfileError(str(exc)) from exc
-    return {
-        "schema_version": 2,
-        "target_engine": _required(target, "engine", "campaign.target"),
-        "engine_version": _required(target, "engine_version", "campaign.target"),
-        "model_id": _required(target, "model", "campaign.target"),
-        "model_revision": _required(target, "model_revision", "campaign.target"),
-        "model_config_sha256": _required(target, "model_config_sha256", "campaign.target"),
-        "gpu": environment.get("cuda_visible_devices") or "unbound",
-        "server_flags": _required(client, "server_flags", "campaign.client"),
-        "collection_command": _required(provenance, "collection_command", "campaign.provenance"),
-        "source_artifacts": source_artifacts,
-        "backend": runtime.get("backend") or "unknown",
-        "driver": environment.get("driver") or "unknown",
-        "cuda": environment.get("cuda") or "unknown",
-        "parallelism": runtime.get("parallelism") or "unknown",
-        "quantization": runtime.get("quantization") or "none",
-        "scheduler": scheduler_identity,
-        "cache": cache_identity,
-        "client": client_identity,
-        "workload": workload_identity,
-        "split": split_identity,
-        "provenance": {
-            "collector_revision": _required(provenance, "collector_revision", "campaign.provenance"),
-            "fitter_revision": "sim-calibrate-fit-schema-1",
-            "artifact_uri": _required(provenance, "artifact_uri", "campaign.provenance"),
-            "source_digest": source_digest,
-        },
-    }
-
-
-def materialize_profile(
-    campaign_root: Path,
-    output_root: Path,
-    *,
-    tokenizer_config: Path,
-    allow_characterization: bool = False,
-    normalized_artifact: Path | None = None,
-    fit_artifact: Path | None = None,
-    report_artifact: Path | None = None,
-) -> dict[str, Any]:
-    campaign_root = campaign_root.expanduser().resolve()
-    campaign = _load_json(campaign_root / "manifest.json")
-    normalized_path = _select_artifact(
-        campaign_root,
-        ".",
-        "normalized.json",
-        normalized_artifact,
-        "normalized",
-    )
-    fit_path = _select_artifact(campaign_root, "fit", "candidates-*.json", fit_artifact, "fit")
-    report_path = _select_artifact(campaign_root, "report", "comparison-*.json", report_artifact, "report")
-    lineage = _validate_artifact_lineage(campaign_root, campaign, normalized_path, fit_path, report_path)
-    normalized = _load_json(normalized_path)
-    fit = _load_json(fit_path)
-    report = _load_json(report_path)
-    tokenizer_digest = _sha256_file(tokenizer_config)
-    prefill_comparison, prefill_split, prefill_characterization, prefill_fidelity = _select_comparison(
-        report,
-        ("cold_prefill_piecewise_linear",),
-        allow_characterization=allow_characterization,
-    )
-    decode_comparison, decode_split, decode_characterization, decode_fidelity = _select_comparison(
-        report,
-        ("decode_2d_surface", "decode_additive"),
-        allow_characterization=allow_characterization,
-    )
-    prefill_candidate = _fit_candidate(fit, prefill_comparison["name"])
-    decode_candidate = _fit_candidate(fit, decode_comparison["name"])
-    prefill = _prefill_model(prefill_candidate)
-    decode = _decode_model(decode_candidate)
-    mixed_comparison = next(
-        (
-            comparison
-            for comparison in report.get("comparisons", [])
-            if comparison.get("name") == "composition_additive"
-            and comparison.get("status") == "fitted"
-        ),
-        None,
-    )
-    mixed_validation = (
-        mixed_comparison.get("by_split", {}).get("threshold_validation", {})
-        if isinstance(mixed_comparison, dict)
-        else {}
-    )
-    mixed_errors = mixed_validation.get("errors", {}) if isinstance(mixed_validation, dict) else {}
-    mixed_is_validated = (
-        isinstance(mixed_validation, dict)
-        and mixed_validation.get("status") == "measured"
-        and isinstance(mixed_errors.get("absolute_ms"), dict)
-        and mixed_errors.get("count", 0) > 0
-        and not mixed_validation.get("ood")
-        and not mixed_validation.get("uncertain")
-    )
-    mixed = _mixed_model(mixed_validation) if mixed_is_validated else None
-    max_prefill = max(prefill["input_tokens"])
-    max_decode_reqs = max(decode["decode_reqs"])
-    max_decode_ctx = max(decode["sum_decode_ctx_tokens"])
-    source_paths = [
-        str((campaign_root / "manifest.json").resolve()),
-        str(normalized_path.resolve()),
-        str(fit_path.resolve()),
-        str(report_path.resolve()),
-    ]
-    source_digest = _sha256_bytes(
-        "\n".join(_sha256_file(Path(path)) for path in source_paths).encode("utf-8")
-    )
-    normalized_source = normalized.get("source") if isinstance(normalized.get("source"), dict) else {}
-    campaign_provenance = campaign.get("provenance") if isinstance(campaign.get("provenance"), dict) else {}
-    collection_command = str(campaign_provenance.get("collection_command", ""))
-    calibration_driver = str(
-        normalized_source.get("collector")
-        or campaign_provenance.get("collector")
-        or ("vllm-bench" if "vllm-bench" in collection_command else "unknown")
-    )
-    rust_manifest = _rust_manifest(
-        campaign,
-        source_paths,
-        source_digest,
-        tokenizer_digest,
-        calibration_driver,
-    )
-    manifest_bytes = json.dumps(
-        rust_manifest, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    manifest_sha256 = _sha256_bytes(manifest_bytes)
+def _fitted_documents(root: Path, campaign: dict, normalized_path: Path, fit_path: Path) -> dict:
+    """Reconstruct the entire bundle from verified, pinned training bytes."""
+    from fit import verify_fit
+    normalized, fitted = _read_json(normalized_path), _read_json(fit_path)
+    if (normalized.get("campaign_id") != campaign["campaign_id"]
+            or Path(normalized["source"]["artifact_root"]).resolve() != root):
+        raise ProfileError("profile training belongs to another campaign/root")
+    from normalize import NORMALIZER_SOURCES
+    frozen_sources = campaign["client"]["observer"]["sources"]
+    if normalized["source"]["normalizer_sources"] != {name: frozen_sources[name] for name in NORMALIZER_SOURCES}:
+        raise ProfileError("training normalizer differs from frozen acquisition sources")
+    verify_fit(fitted, normalized, normalized_digest=file_reference(normalized_path)["sha256"])
+    prefill_candidate = _fit_candidate(fitted, "cold_prefill_piecewise_linear")
+    decode_candidate = _fit_candidate(fitted, "decode_2d_surface")
+    prefill, decode = _prefill_model(prefill_candidate), _decode_model(decode_candidate)
+    sources = {"normalized": {"path": str(normalized_path), **file_reference(normalized_path)},
+               "fit": {"path": str(fit_path), **file_reference(fit_path)}}
+    generator_sources = {"profile.py": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                         **fitted["source"]["fitter_sources"]}
+    source_digest = hashlib.sha256(_render({"training": sources, "generator_sources": generator_sources})).hexdigest()
+    manifest = _calibration_manifest(campaign, "sim", campaign["workload"]["cells"], source_digest,
+                                     [value["path"] for value in sources.values()],
+                                     "sim-calibrate-fit-schema-2:" + generator_sources["fit.py"])
+    scheduler = manifest["scheduler"]
+    max_requests, max_context, max_prefill = decode["decode_reqs"][-1], decode["sum_decode_ctx_tokens"][-1], prefill["input_tokens"][-1]
+    if (max_requests > scheduler["max_num_seqs"] or max_prefill > scheduler["max_num_batched_tokens"]
+            or max_context > scheduler["max_num_seqs"] * scheduler["max_model_len"]):
+        raise ProfileError("fitted domain exceeds scheduler capacity")
+    paths = fitted_bundle_paths(root, campaign)
     profile = {
         "schema_version": 3,
-        "calibration": {
-            "manifest": "calibration.manifest.json",
-            "sha256": manifest_sha256,
-        },
-        "scheduler": rust_manifest["scheduler"],
+        "calibration": {"manifest": "calibration.manifest.json",
+                        "sha256": hashlib.sha256(_render(manifest)).hexdigest()},
+        "scheduler": scheduler,
         "predictor": {
-            "coverage": {
-                "decode_reqs": [0, max_decode_reqs],
-                "sum_decode_ctx_tokens": [0, max_decode_ctx],
-                "prefill_tokens_in_step": [0, max_prefill],
-            },
-            "model": {
-                "kind": "functional",
-                "prefill": prefill,
-                "decode": decode,
-                "mixed": mixed,
-            },
+            # Zero denotes an absent component. Positive work still has to be
+            # covered by its actual curve; no zero knots or extrapolation.
+            "coverage": {"decode_reqs": [0, max_requests], "sum_decode_ctx_tokens": [0, max_context],
+                         "prefill_tokens_in_step": [0, max_prefill]},
+            "model": {"kind": "functional", "prefill": prefill, "decode": decode,
+                      "mixed": {"kind": "composition_additive", "intercept_us": 0}},
         },
     }
-    residual_candidate = next(
-        (
-            item
-            for item in report.get("residual_candidates", [])
-            if isinstance(item, dict)
-            and item.get("name") == "sparse_residual_correction"
-            and item.get("status") == "candidate"
-        ),
-        None,
-    )
-    residual_count = (
-        len(residual_candidate.get("residuals_ms", {}))
-        if isinstance(residual_candidate, dict)
-        and isinstance(residual_candidate.get("residuals_ms"), dict)
-        else 0
-    )
+    documents = {paths["profile"].name: profile, paths["manifest"].name: manifest}
     selection = {
-        "status": (
-            "characterization"
-            if prefill_characterization or decode_characterization
-            else "selected"
-        ),
-        "campaign_id": campaign["campaign_id"],
-        "target": campaign["target"],
-        "fit_artifact": str(fit_path.resolve()),
-        "report_artifact": str(report_path.resolve()),
-        "artifact_digests": lineage,
-        "calibration_driver": calibration_driver,
-        "fidelity_report": {
-            "sha256": lineage["report_sha256"],
-            "per_cell": any(
-                isinstance(item, dict)
-                and any(
-                    isinstance(split.get("by_cell"), dict)
-                    for split in item.get("by_split", {}).values()
-                    if isinstance(split, dict)
-                )
-                for item in report.get("comparisons", [])
-            ),
-        },
-        "prefill": {
-            "candidate": prefill_comparison["name"],
-            "evidence_split": prefill_split,
-            "source": prefill_candidate.get("source"),
-            "fidelity": prefill_fidelity,
-        },
-        "decode": {
-            "candidate": decode_comparison["name"],
-            "evidence_split": decode_split,
-            "source": decode_candidate.get("source"),
-            "fidelity": decode_fidelity,
-        },
-        "cached_prefill": {
-            "status": "fit_report_only",
-            "runtime_predictor": "excluded",
-            "candidate": "cached_prefill_surface",
-            "report_status": next(
-                (
-                    comparison.get("status")
-                    for comparison in report.get("comparisons", [])
-                    if comparison.get("name") == "cached_prefill_surface"
-                ),
-                "unsupported",
-            ),
-        },
-        "mixed": (
-            {
-                "status": "selected",
-                "candidate": "composition_additive",
-                "evidence_split": "threshold_validation",
-                "intercept_us": 0,
-                "residual_correction": {
-                    "status": "offline_only" if residual_candidate is not None else "unsupported",
-                    "candidate": "sparse_residual_correction" if residual_candidate is not None else None,
-                    "fit_split": residual_candidate.get("fit_split") if isinstance(residual_candidate, dict) else None,
-                    "count": residual_count,
-                },
-            }
-            if mixed_is_validated and mixed is not None
-            else {"status": "unsupported", "reason": "no in-domain mixed evidence"}
-        ),
+        "kind": "fitted_profile_selection", "schema_version": 1, "status": "selected",
+        "campaign_id": campaign["campaign_id"], "target": campaign["variants"]["target"]["identity"],
+        "training": sources, "generator_sources": generator_sources,
+        "validation_status": "pending", "selection_policy": "fixed_train_surface",
+        "prefill": {"candidate": prefill_candidate["name"], "evidence_split": "train", "source": prefill_candidate["source"]},
+        "decode": {"candidate": decode_candidate["name"], "evidence_split": "train", "source": decode_candidate["source"]},
+        "mixed": {"candidate": "composition_additive", "intercept_us": 0, "validation_status": "pending"},
+        "cached_prefill": {"status": "unsupported", "reason": "cached integration deferred to C8"},
+        "files": {name: {"sha256": hashlib.sha256(_render(value)).hexdigest(), "size": len(_render(value))}
+                  for name, value in documents.items()},
     }
-    output_root.mkdir(parents=True, exist_ok=True)
-    (output_root / "calibration.manifest.json").write_bytes(manifest_bytes)
-    (output_root / "profile.json").write_text(
-        json.dumps(profile, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (output_root / "selection.json").write_text(
-        json.dumps(selection, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return selection
+    return {**documents, paths["selection"].name: selection}
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--campaign-root", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--tokenizer-config", type=Path, required=True)
-    parser.add_argument("--normalized", type=Path)
-    parser.add_argument("--fit-artifact", type=Path)
-    parser.add_argument("--report-artifact", type=Path)
-    parser.add_argument("--allow-characterization", action="store_true")
-    return parser.parse_args()
+def verify_fitted_bundle(root: Path, campaign: dict) -> dict:
+    """Offline proof of the selected model, not merely self-reported digests."""
+    paths = fitted_bundle_paths(root, campaign)
+    selection = _read_json(paths["selection"])
+    if selection.get("kind") != "fitted_profile_selection" or selection.get("schema_version") != 1:
+        raise ProfileError("sim requires a current complete fitted profile bundle")
+    expected = _fitted_documents(root, campaign, Path(selection["training"]["normalized"]["path"]),
+                                 Path(selection["training"]["fit"]["path"]))
+    for path in paths.values():
+        if not path.is_file() or path.is_symlink() or path.read_bytes() != _render(expected[path.name]):
+            raise ProfileError(f"fitted bundle differs from verified training: {path.name}")
+    return file_reference(paths["selection"])
+
+
+def materialize_profile(root: Path, *, normalized_artifact: Path, fit_artifact: Path) -> dict:
+    from evidence_proxy import observer_identity
+    root = root.expanduser().resolve()
+    campaign = load_compiled_bundle(root)
+    if campaign["client"]["observer"] != observer_identity():
+        raise ProfileError("frozen materializer changed; compile and collect into a new root")
+    documents = _fitted_documents(root, campaign, normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
+    write_fitted_bundle(root, campaign, documents)
+    verify_fitted_bundle(root, campaign)
+    return documents["selection.json"]
 
 
 def main() -> int:
-    args = parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifact-root", type=Path, required=True)
+    parser.add_argument("--normalized", type=Path, required=True)
+    parser.add_argument("--fit-artifact", type=Path, required=True)
+    args = parser.parse_args()
     try:
-        selection = materialize_profile(
-            args.campaign_root,
-            args.output_root,
-            tokenizer_config=args.tokenizer_config,
-            allow_characterization=args.allow_characterization,
-            normalized_artifact=args.normalized,
-            fit_artifact=args.fit_artifact,
-            report_artifact=args.report_artifact,
-        )
-    except ProfileError as exc:
+        selection = materialize_profile(args.artifact_root, normalized_artifact=args.normalized, fit_artifact=args.fit_artifact)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         print(f"profile error: {exc}")
         return 2
-    print(json.dumps(selection, ensure_ascii=True, sort_keys=True))
+    print(json.dumps({key: selection[key] for key in ("campaign_id", "status", "validation_status")}, sort_keys=True))
     return 0
 
 

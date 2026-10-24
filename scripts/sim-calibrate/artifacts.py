@@ -7,6 +7,7 @@ import hashlib
 import fcntl
 import json
 import os
+import shutil
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -456,6 +457,68 @@ def write_derived_document(path: Path, document: dict, root: Path) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def fitted_bundle_paths(root: Path, campaign: dict) -> dict[str, Path]:
+    """Only the compiler-selected, otherwise unused output directory is writable."""
+    root = root.resolve()
+    configured = Path(campaign['variants']['sim']['profile_path'])
+    profile = checked_path(root, str(configured))
+    directory = profile.parent
+    if (root.is_relative_to(_repo_root()) or directory == root
+            or any(directory.is_relative_to(root / name) for name in ('raw', 'plans', 'references'))
+            or any((root / part).is_symlink() for part in [configured, *configured.parents] if str(part) != '.')
+            or profile.name in ('calibration.manifest.json', 'selection.json')):
+        raise ArtifactError('unsafe fitted profile output directory')
+    index = _read_json(root / 'artifact_index.json')
+    protected = [checked_path(root, name) for name in index['files']]
+    protected += [root / name for name in ('artifact_index.json', 'execution_index.json', '.execution.lock')]
+    if any(path.is_relative_to(directory) for path in protected):
+        raise ArtifactError('fitted bundle would replace protected campaign evidence')
+    return {'profile': profile, 'manifest': directory / 'calibration.manifest.json',
+            'selection': directory / 'selection.json'}
+
+
+def write_fitted_bundle(root: Path, campaign: dict, documents: dict) -> None:
+    """Publish all files by one directory rename; never overwrite an existing bundle."""
+    paths = fitted_bundle_paths(root, campaign)
+    directory = paths['profile'].parent
+    if set(documents) != {path.name for path in paths.values()}:
+        raise ArtifactError('incomplete fitted bundle')
+    payloads = {name: _render(value) for name, value in documents.items()}
+    with (root / '.execution.lock').open('a+b') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ArtifactError('execution active; cannot publish fitted profile') from exc
+        if directory.exists():
+            if (not directory.is_dir() or {p.name for p in directory.iterdir()} != set(payloads)
+                    or any((directory / name).is_symlink() or not (directory / name).is_file()
+                           or (directory / name).read_bytes() != payload for name, payload in payloads.items())):
+                raise ArtifactError('refusing to overwrite a different or partial fitted bundle')
+            return
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=f'.{directory.name}.', dir=directory.parent))
+        try:
+            for name, payload in payloads.items():
+                with (temporary / name).open('xb') as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.rename(temporary, directory)
+            descriptor = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
 
 
 class ExecutionStore:
