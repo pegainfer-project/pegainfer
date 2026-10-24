@@ -99,7 +99,7 @@ pub(crate) struct DFlashConfig {
 pub(crate) struct DSpineConfig {
     pub(crate) code_size: usize,
     pub(crate) rank: usize,
-    // Read by the bridge forward and the weight loader in the next slice.
+    // Read by the bridge forward/refinement and the weight loader in the next slice.
     #[allow(dead_code)]
     pub(crate) eps: f32,
     /// Draft layer indices carrying a code bridge, 0-based and ascending.
@@ -107,6 +107,7 @@ pub(crate) struct DSpineConfig {
     #[allow(dead_code)]
     pub(crate) feature_layers: Vec<usize>,
     /// Width of the top-K serial last-write refinement.
+    #[allow(dead_code)]
     pub(crate) head_topk: usize,
 }
 
@@ -133,6 +134,12 @@ struct DFlashInnerConfig {
     selected_prefix_terminal: Option<bool>,
     #[serde(default)]
     selected_prefix_last_write_refine: Option<RawDSpineLastWriteRefine>,
+    /// DSpark reliability probes; DSpine has no equivalent.
+    #[serde(default)]
+    selected_prefix_feature_reliability: Option<Value>,
+    /// DSpark next-token row layout; DSpine refines anchor-row blocks only.
+    #[serde(default)]
+    selected_prefix_feature_next_token_rows: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +158,15 @@ struct RawDSpineCodeBridge {
 #[derive(Clone, Debug, Deserialize)]
 struct RawDSpineLastWriteRefine {
     kind: String,
+    head_topk: usize,
+}
+
+/// Top-level refinement declaration some DSpine checkpoints carry instead of
+/// (or alongside) `dflash_config.selected_prefix_last_write_refine`.
+#[derive(Clone, Debug, Deserialize)]
+struct RawDSpineSecondPass {
+    mode: Option<String>,
+    first_exact: Option<usize>,
     head_topk: usize,
 }
 
@@ -203,12 +219,9 @@ struct RawDFlashConfig {
     block_size: Option<usize>,
     #[serde(default)]
     dflash_config: Option<DFlashInnerConfig>,
-    /// DSpine checkpoints nest this under `dflash_config`; accept the flat form too.
+    /// The reference reads this from the top level, unlike the bridge itself.
     #[serde(default)]
-    draft_block_causal: Option<bool>,
-    /// Parsed only to reject the unsupported flat DSpine schema loudly.
-    #[serde(default)]
-    selected_prefix_code_bridge: Option<RawDSpineCodeBridge>,
+    code_bridge_second_pass: Option<RawDSpineSecondPass>,
     #[serde(default)]
     mask_token_id: Option<u32>,
     #[serde(default)]
@@ -329,13 +342,17 @@ impl Config {
 
 impl DSpineConfig {
     /// `Ok(None)` for a plain DFlash/DSpark checkpoint; `Ok(Some(_))` when the
-    /// checkpoint carries a code bridge. Every DSpine-only field is validated
-    /// rather than ignored; serving a bridge checkpoint as plain DFlash would
-    /// draft with near-zero acceptance.
+    /// checkpoint carries a code bridge. Every DSpine-only serving field is
+    /// validated rather than ignored; serving a bridge checkpoint as plain
+    /// DFlash would draft with near-zero acceptance.
+    ///
+    /// Training-only fields (`bridge.kappa`, `selected_prefix_decode_mode`,
+    /// `selected_prefix_feature_gt_training`, the teacher fields, and the
+    /// refinement's `version`/`weight`) are neither validated nor used here.
     fn from_inner(
         inner: &DFlashInnerConfig,
         num_hidden_layers: usize,
-        draft_block_causal: Option<bool>,
+        second_pass: Option<&RawDSpineSecondPass>,
     ) -> Result<Option<Self>> {
         let Some(bridge) = inner.selected_prefix_code_bridge.as_ref() else {
             let stray = inner.selected_prefix_feature_layers.is_some()
@@ -351,8 +368,17 @@ impl DSpineConfig {
         };
 
         ensure!(
-            draft_block_causal == Some(true),
+            inner.draft_block_causal == Some(true),
             "DSpine requires draft_block_causal = true (causal draft attention)"
+        );
+        ensure!(
+            inner.selected_prefix_feature_reliability.is_none(),
+            "DSpine has no reliability probes"
+        );
+        ensure!(
+            inner.selected_prefix_feature_next_token_rows != Some(true),
+            "DSpine's serial refinement is defined for anchor-row blocks; \
+             next-token rows are a DSpark layout"
         );
         ensure!(
             inner.selected_prefix_terminal == Some(false),
@@ -392,26 +418,48 @@ impl DSpineConfig {
         );
         let feature_layers = layers.iter().map(|layer| layer - 1).collect();
 
-        let refine = inner
-            .selected_prefix_last_write_refine
-            .as_ref()
-            .context("DSpine config missing selected_prefix_last_write_refine")?;
+        let mut head_topk = None;
+        if let Some(refine) = inner.selected_prefix_last_write_refine.as_ref() {
+            ensure!(
+                refine.kind == "exact_sender",
+                "DSpine requires selected_prefix_last_write_refine.kind = \"exact_sender\", got {:?}",
+                refine.kind
+            );
+            head_topk = Some(refine.head_topk);
+        }
+        if let Some(second) = second_pass {
+            ensure!(
+                second.mode.as_deref() == Some("serial_table"),
+                "DSpine serves only code_bridge_second_pass.mode = \"serial_table\", got {:?}",
+                second.mode
+            );
+            ensure!(
+                second.first_exact == Some(num_hidden_layers - 1),
+                "DSpine serial_table redoes the last write only: \
+                 code_bridge_second_pass.first_exact must be {}, got {:?}",
+                num_hidden_layers - 1,
+                second.first_exact
+            );
+            match head_topk {
+                Some(width) => ensure!(
+                    width == second.head_topk,
+                    "DSpine refinement widths disagree: \
+                     selected_prefix_last_write_refine.head_topk = {width}, \
+                     code_bridge_second_pass.head_topk = {}",
+                    second.head_topk
+                ),
+                None => head_topk = Some(second.head_topk),
+            }
+        }
+        let head_topk = head_topk.context(
+            "DSpine config names no refinement width: add \
+             selected_prefix_last_write_refine or code_bridge_second_pass",
+        )?;
         ensure!(
-            refine.kind == "exact_sender",
-            "DSpine requires selected_prefix_last_write_refine.kind = \"exact_sender\", got {:?}",
-            refine.kind
-        );
-        ensure!(
-            refine.head_topk.is_power_of_two() && (2..=64).contains(&refine.head_topk),
-            "DSpine head_topk must be a power of two in [2, 64], got {}",
-            refine.head_topk
+            head_topk.is_power_of_two() && (2..=64).contains(&head_topk),
+            "DSpine head_topk must be a power of two in [2, 64], got {head_topk}"
         );
 
-        ensure!(
-            bridge.code_size > 0 && bridge.code_size.is_multiple_of(128),
-            "DSpine code_size must be a non-zero multiple of 128, got {}",
-            bridge.code_size
-        );
         ensure!(
             bridge.rank > 0 && bridge.rank.is_multiple_of(128),
             "DSpine bridge rank must be a non-zero multiple of 128, got {}",
@@ -428,7 +476,7 @@ impl DSpineConfig {
             rank: bridge.rank,
             eps: bridge.eps,
             feature_layers,
-            head_topk: refine.head_topk,
+            head_topk,
         }))
     }
 }
@@ -499,12 +547,6 @@ impl DFlashConfig {
             .or(geometry.rope_parameters.map(|r| r.rope_theta))
             .context("drafter config missing rope_theta / rope_parameters.rope_theta")?;
 
-        ensure!(
-            raw.selected_prefix_code_bridge.is_none(),
-            "DSpine bridge config must be nested under dflash_config; \
-             a flat selected_prefix_code_bridge is not supported"
-        );
-
         // mask_token_id + target_layer_ids: nested dflash_config (b16) or flat (DeepSpec).
         let dflash_config = raw.dflash_config;
         let (mask_token_id, target_layer_ids) = if let Some(inner) = &dflash_config {
@@ -533,24 +575,12 @@ impl DFlashConfig {
 
         let sliding_window = conv.as_ref().and(geometry.sliding_window);
 
-        let draft_block_causal = match (
-            dflash_config
-                .as_ref()
-                .and_then(|inner| inner.draft_block_causal),
-            raw.draft_block_causal,
-        ) {
-            (Some(nested), Some(flat)) => {
-                ensure!(
-                    nested == flat,
-                    "draft_block_causal disagrees between dflash_config ({nested}) and the top level ({flat})"
-                );
-                Some(nested)
-            }
-            (nested, flat) => nested.or(flat),
-        };
-
         let dspine = if let Some(inner) = &dflash_config {
-            DSpineConfig::from_inner(inner, geometry.num_hidden_layers, draft_block_causal)?
+            DSpineConfig::from_inner(
+                inner,
+                geometry.num_hidden_layers,
+                raw.code_bridge_second_pass.as_ref(),
+            )?
         } else {
             None
         };
@@ -563,6 +593,10 @@ impl DFlashConfig {
                 raw.markov_rank == 0,
                 "DSpine drafts carry no markov head; config declares markov_rank = {}",
                 raw.markov_rank
+            );
+            ensure!(
+                conv.is_none() && selector_rank == 0,
+                "DSpine drafts carry neither DFlash2 convolutions nor a selector"
             );
         }
         Ok(Self {
@@ -1073,10 +1107,6 @@ pub(crate) mod tests {
                 ),
             ),
             (
-                "code size not kernel-tile aligned",
-                DSPINE_8B_CONFIG.replace("\"code_size\": 1024", "\"code_size\": 1000"),
-            ),
-            (
                 "bridge rank not kernel-tile aligned",
                 DSPINE_8B_CONFIG.replace("\"rank\": 512", "\"rank\": 500"),
             ),
@@ -1100,17 +1130,52 @@ pub(crate) mod tests {
                 ),
             ),
             (
-                "conflicting causal flags",
+                "reliability probes",
                 DSPINE_8B_CONFIG.replace(
-                    "\"dflash_config\": {",
-                    "\"draft_block_causal\": false,\n      \"dflash_config\": {",
+                    "\"selected_prefix_terminal\": false,",
+                    "\"selected_prefix_feature_reliability\": {\"kind\": \"probe\"},\n        \"selected_prefix_terminal\": false,",
                 ),
             ),
             (
-                "flat bridge schema",
-                PLAIN_DFLASH_CONFIG.replace(
+                "next-token rows",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_terminal\": false,",
+                    "\"selected_prefix_feature_next_token_rows\": true,\n        \"selected_prefix_terminal\": false,",
+                ),
+            ),
+            (
+                "convolution next to a bridge",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_terminal\": false,",
+                    "\"conv_kernel_size\": 2,\n        \"conv_group_size\": 2,\n        \"selected_prefix_terminal\": false,",
+                ),
+            ),
+            (
+                "selector next to a bridge",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_terminal\": false,",
+                    "\"selector_rank\": 2,\n        \"selected_prefix_terminal\": false,",
+                ),
+            ),
+            (
+                "second pass disagrees on the refinement width",
+                DSPINE_8B_CONFIG.replace(
                     "\"block_size\": 16,",
-                    "\"block_size\": 16,\n      \"selected_prefix_code_bridge\": {\"code_size\": 1024, \"rank\": 512, \"eps\": 1e-06},",
+                    "\"block_size\": 16,\n      \"code_bridge_second_pass\": {\"mode\": \"serial_table\", \"first_exact\": 4, \"head_topk\": 32},",
+                ),
+            ),
+            (
+                "second pass that is not serial_table",
+                DSPINE_8B_CONFIG.replace(
+                    "\"block_size\": 16,",
+                    "\"block_size\": 16,\n      \"code_bridge_second_pass\": {\"mode\": \"parallel_table\", \"first_exact\": 4, \"head_topk\": 16},",
+                ),
+            ),
+            (
+                "second pass redoing a non-last write",
+                DSPINE_8B_CONFIG.replace(
+                    "\"block_size\": 16,",
+                    "\"block_size\": 16,\n      \"code_bridge_second_pass\": {\"mode\": \"serial_table\", \"first_exact\": 3, \"head_topk\": 16},",
                 ),
             ),
         ];
@@ -1121,6 +1186,24 @@ pub(crate) mod tests {
                 "{name} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn accepts_the_top_level_second_pass_as_the_refinement_width() {
+        let mut json: Value = serde_json::from_str(DSPINE_8B_CONFIG).expect("fixture json");
+        json["dflash_config"]
+            .as_object_mut()
+            .expect("nested dflash_config")
+            .remove("selected_prefix_last_write_refine");
+        json["code_bridge_second_pass"] = serde_json::json!({
+            "mode": "serial_table",
+            "first_exact": 4,
+            "head_topk": 16,
+        });
+
+        let config = DFlashConfig::from_json(&json.to_string()).expect("second-pass config");
+        let dspine = config.dspine.as_ref().expect("parsed bridge");
+        assert_eq!(dspine.head_topk, 16);
     }
 
     #[test]

@@ -38,6 +38,11 @@ impl DFlashDraftModel {
         let mut config = DFlashConfig::from_file(model_path)
             .with_context(|| format!("load DFlash config from {model_path}"))?;
         config.validate_for_target(target.config())?;
+        anyhow::ensure!(
+            !config.uses_dspine(),
+            "DSpine code-bridge loading is not implemented yet; \
+             serving this checkpoint as plain DFlash would draft with near-zero acceptance"
+        );
         config.logits_rows = target.config().logits_rows;
 
         let (shard_paths, weight_map) = load_shard_info(model_path)?;
