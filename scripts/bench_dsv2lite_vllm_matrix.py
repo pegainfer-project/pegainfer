@@ -45,6 +45,20 @@ CLAIM_DIRECT = "direct_diagnostic_batch"
 CLAIM_HTTP = "http_pressure"
 CLAIM_FAILED = "failed_setup"
 HTTP_METADATA_PREFIX = "pegainfer_contract_"
+# CLI destination -> (retained contract key, fresh-run default).
+WORKLOAD_OPTIONS = {
+    "model_id": ("model_id", DEFAULT_MODEL_ID),
+    "input_len": ("input_len", 64),
+    "output_len": ("output_len", 64),
+    "num_prompts": ("num_prompts", 32),
+    "num_warmups": ("num_warmups", 4),
+    "concurrency": ("max_concurrency", DEFAULT_CONCURRENCY),
+    "request_rate": ("request_rate", "inf"),
+    "temperature": ("temperature", 0.0),
+    "ignore_eos": ("ignore_eos", True),
+    "repeats": ("repeats", 3),
+    "noisy_threshold": ("noisy_threshold", 0.05),
+}
 
 
 @dataclass(frozen=True)
@@ -2297,11 +2311,33 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
+def retained_workload_args(args: argparse.Namespace, summary: dict[str, Any]) -> argparse.Namespace:
+    metadata_payload = summary.get("metadata")
+    contract = metadata_payload.get("benchmark_contract") if isinstance(metadata_payload, dict) else None
+    if not isinstance(contract, dict):
+        return args
+    restored = argparse.Namespace(**vars(args))
+    explicit_fields = getattr(args, "explicit_workload_fields", set())
+    for name, (key, _default) in WORKLOAD_OPTIONS.items():
+        if key not in contract:
+            continue
+        recorded = contract[key]
+        if name in explicit_fields and getattr(args, name) != recorded:
+            flag = "--" + name.replace("_", "-")
+            raise SystemExit(
+                f"{flag} {getattr(args, name)!r} conflicts with retained benchmark_contract.{key} "
+                f"{recorded!r}; summarize-only cannot change a recorded workload"
+            )
+        setattr(restored, name, recorded)
+    return restored
+
+
 def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
     out_dir = repo_path(args.summarize_only)
     sections: dict[str, Any] = {}
     existing_summary_path = out_dir / "summary.json"
     existing_summary = load_json(existing_summary_path) if existing_summary_path.exists() else {}
+    args = retained_workload_args(args, existing_summary)
     correctness = out_dir / "correctness" / "comparison.json"
     if correctness.exists():
         comparison = load_json(correctness)
@@ -2701,7 +2737,7 @@ def parse_args() -> argparse.Namespace:
     script_argv, vllm_serve_extra_args = split_vllm_serve_extra_args(sys.argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--model-id", default=argparse.SUPPRESS)
     parser.add_argument("--out-dir", type=Path, default=Path("target/benchmarks/deepseek-v2-lite-vllm-tp2-ep2"))
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -2724,17 +2760,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--cuda-visible-devices")
-    parser.add_argument("--input-len", type=int, default=64)
-    parser.add_argument("--output-len", type=int, default=64)
-    parser.add_argument("--num-prompts", type=int, default=32)
-    parser.add_argument("--num-warmups", type=int, default=4)
-    parser.add_argument("--concurrency", type=parse_int_list, default=DEFAULT_CONCURRENCY)
+    parser.add_argument("--input-len", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--output-len", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--num-prompts", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--num-warmups", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--concurrency", type=parse_int_list, default=argparse.SUPPRESS)
     parser.add_argument("--direct-batches", type=parse_int_list, default=DEFAULT_DIRECT_BATCHES)
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--request-rate", default="inf")
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--noisy-threshold", type=float, default=0.05)
+    parser.add_argument("--repeats", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--request-rate", default=argparse.SUPPRESS)
+    parser.add_argument("--temperature", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS)
+    parser.add_argument("--noisy-threshold", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--server-ready-timeout-s", type=float, default=900)
     parser.add_argument("--command-timeout-s", type=float, default=1800)
     parser.add_argument("--keep-going", action="store_true")
@@ -2753,6 +2789,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args(script_argv)
+    args.explicit_workload_fields = set(vars(args)) & WORKLOAD_OPTIONS.keys()
+    for name, (_key, default) in WORKLOAD_OPTIONS.items():
+        if not hasattr(args, name):
+            setattr(args, name, default)
     args.vllm_serve_extra_args = normalize_vllm_serve_extra_args(vllm_serve_extra_args)
     if args.repeats <= 0:
         raise SystemExit("--repeats must be positive")
