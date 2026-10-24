@@ -53,6 +53,10 @@ pub struct SimulatedEngineConfig {
     /// A pretend drafter: `(K, accepted per verify step)`; `None` is no drafter.
     spec_decode: Option<(usize, usize)>,
     profile: Option<ProfileConfig>,
+    /// A pretend prefix lookup: `(local hit tokens, externally restored hit
+    /// tokens)` reported on each request's first chunk; `None` models an engine
+    /// that never consults a prefix cache (disabled, or prompt scoring).
+    prefix_cache: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +92,7 @@ impl SimulatedEngineConfig {
             scripted_completion: Vec::new(),
             spec_decode: None,
             profile: None,
+            prefix_cache: None,
         })
     }
 
@@ -105,6 +110,15 @@ impl SimulatedEngineConfig {
         );
         SpecDecodeCounters::new(num_spec_tokens).expect("K within MAX_SPEC_TOKENS");
         self.spec_decode = Some((num_spec_tokens, num_accepted));
+        self
+    }
+
+    /// Report a prefix-cache lookup on every ordinary request's first chunk:
+    /// `hit_tokens` served from local KV and `external_hit_tokens` restored
+    /// from the connector (CPU offload / P2P) instead. Hit 0 models a miss.
+    #[must_use]
+    pub fn with_prefix_cache(mut self, hit_tokens: usize, external_hit_tokens: usize) -> Self {
+        self.prefix_cache = Some((hit_tokens, external_hit_tokens));
         self
     }
 
@@ -149,6 +163,7 @@ impl Default for SimulatedEngineConfig {
             scripted_completion: Vec::new(),
             spec_decode: None,
             profile: None,
+            prefix_cache: None,
         }
     }
 }
@@ -181,12 +196,60 @@ pub fn start_engine_with_partitions(config: &SimulatedEngineConfig, partitions: 
     }
 }
 
+/// Cumulative prefix-cache lookups, in tokens.
+///
+/// The scheduler holds running totals; the bridge converts them to per-send
+/// deltas before they reach Prometheus (see `PrefixCacheTracker`).
+///
+/// Both counters are token-granular, and the external family exists only for a
+/// request whose connector was consulted — mirroring vLLM, which registers
+/// `connector_prefix_cache_queries` as the prompt minus the local hits, so a
+/// locally cached token never inflates the external denominator.
+#[derive(Default, Clone, Copy)]
+struct PrefixCacheTally {
+    /// Prompt tokens looked up in the prefix cache.
+    queries: u64,
+    /// Looked-up tokens found in local KV.
+    hits: u64,
+    /// `queries - hits`: the part of the prompt a connector could serve.
+    external_queries: u64,
+    /// Of that remainder, how many the connector actually restored.
+    external_hits: u64,
+}
+
+impl PrefixCacheTally {
+    /// Tally one admitted request's prefix lookup.
+    ///
+    /// `knob` is the simulated lookup: `(local hits, externally restored hits)`.
+    /// `None` means no prefix cache is configured, so nothing ran and nothing
+    /// is counted — the counters must not invent lookups that never happened.
+    ///
+    /// Prompt scoring is skipped too: it forwards the prompt whole, matching
+    /// the qwen3 executor's gate.
+    fn note(&mut self, knob: Option<(usize, usize)>, request: &Request) {
+        let Some((local_hits, external_hits)) = knob else {
+            return;
+        };
+        if request.prompt_logprobs.is_some() {
+            return;
+        }
+        let prompt = request.prompt_tokens.len();
+        let local = local_hits.min(prompt);
+        let external = external_hits.min(prompt - local);
+        self.queries += prompt as u64;
+        self.hits += local as u64;
+        self.external_queries += (prompt - local) as u64;
+        self.external_hits += external as u64;
+    }
+}
+
 struct SimScheduler {
     config: SimulatedEngineConfig,
     queued: Vec<QueuedRequest>,
     running: Vec<RunningRequest>,
     spec_decode: Option<SpecDecodeCounters>,
     profiled: Option<ProfiledRuntime>,
+    prefix_cache: PrefixCacheTally,
 }
 
 struct RunningRequest {
@@ -237,8 +300,9 @@ impl ProfiledRuntime {
         queued: &mut Vec<QueuedRequest>,
         ledger: &mut RequestLedger,
         spec_decode: &mut Option<SpecDecodeCounters>,
+        prefix: &mut PrefixCacheTally,
     ) -> Result<()> {
-        self.drain_submissions(config, queued, ledger)?;
+        self.drain_submissions(config, queued, ledger, prefix)?;
         self.cancel_aborted(ledger)?;
 
         if let Some(in_flight) = self.in_flight {
@@ -295,6 +359,7 @@ impl ProfiledRuntime {
         config: &SimulatedEngineConfig,
         queued: &mut Vec<QueuedRequest>,
         ledger: &mut RequestLedger,
+        prefix: &mut PrefixCacheTally,
     ) -> Result<()> {
         for QueuedRequest { id, request } in std::mem::take(queued) {
             if ledger.is_aborted(id) {
@@ -310,6 +375,9 @@ impl ProfiledRuntime {
                 ledger.reject(id, reject_reason(rejection, &request));
                 continue;
             }
+            // Admitted: the same shared tally the legacy lane uses, so the
+            // profiled lane does not report zeros for lookups it performed.
+            prefix.note(config.prefix_cache, &request);
             let (mut completion_tokens, finish_reason) =
                 planned_completion(config, &request.prompt_tokens, request.max_tokens);
             completion_tokens.reverse();
@@ -517,6 +585,7 @@ impl SimScheduler {
             running: Vec::new(),
             spec_decode,
             profiled,
+            prefix_cache: PrefixCacheTally::default(),
         }
     }
 
@@ -548,6 +617,7 @@ impl Scheduler for SimScheduler {
                 &mut self.queued,
                 ledger,
                 &mut self.spec_decode,
+                &mut self.prefix_cache,
             );
             self.profiled = Some(profiled);
             return result;
@@ -557,12 +627,24 @@ impl Scheduler for SimScheduler {
 
     fn metrics(&self) -> SchedulerMetrics {
         if let Some(profiled) = &self.profiled {
-            return profiled.metrics(self.spec_decode.as_ref());
+            // The profiled lane drives its own run state, but the prefix-cache
+            // counters are tallied on admission whichever lane admits the
+            // request, so both lanes report them the same way.
+            let mut metrics = profiled.metrics(self.spec_decode.as_ref());
+            metrics.prefix_cache_queries = self.prefix_cache.queries;
+            metrics.prefix_cache_hits = self.prefix_cache.hits;
+            metrics.prefix_cache_external_queries = self.prefix_cache.external_queries;
+            metrics.prefix_cache_external_hits = self.prefix_cache.external_hits;
+            return metrics;
         }
         SchedulerMetrics {
             num_running_reqs: self.running.len() as u64,
             num_waiting_reqs: self.queued.len() as u64,
             spec_decode: self.spec_decode,
+            prefix_cache_queries: self.prefix_cache.queries,
+            prefix_cache_hits: self.prefix_cache.hits,
+            prefix_cache_external_queries: self.prefix_cache.external_queries,
+            prefix_cache_external_hits: self.prefix_cache.external_hits,
             ..SchedulerMetrics::default()
         }
     }
@@ -575,6 +657,9 @@ impl SimScheduler {
                 ledger.retire(id);
                 continue;
             }
+            // The pretend lookup happens exactly where a real engine would do
+            // it: once, on admission.
+            self.prefix_cache.note(self.config.prefix_cache, &request);
             let prompt_len = request.prompt_tokens.len();
             let (pending, finish_reason) =
                 planned_completion(&self.config, &request.prompt_tokens, request.max_tokens);
@@ -636,7 +721,6 @@ impl SimScheduler {
         Ok(())
     }
 }
-
 /// Remaining tokens (reversed) plus the terminal reason. Empty pending means
 /// finish immediately after admit.
 fn planned_completion(

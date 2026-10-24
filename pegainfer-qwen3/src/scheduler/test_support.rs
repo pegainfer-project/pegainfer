@@ -18,6 +18,7 @@ use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use super::blocks_needed;
+use crate::executor::ConnectorLookupCounters;
 use crate::executor::DecodePlan;
 use crate::executor::DecodeRequestResult;
 use crate::executor::ModelExecutor;
@@ -65,6 +66,18 @@ pub(crate) struct FakeExecutor {
     emit_logprobs: bool,
     async_prefill: Option<Arc<AsyncPrefillGate>>,
     parked_prefill: Option<PrefillResult>,
+    // `cached_tokens` the first prefill chunk of every request reports (a
+    // simulated prefix-cache lookup). Drives the prefix-cache query/hit
+    // counters without a real GPU KV cache. `None` models a real executor with
+    // prefix caching switched off, which never calls `match_and_add_prefix`
+    // and must therefore report no queries.
+    prefix_hit_tokens: Option<usize>,
+    // Tokens of the simulated hit attributed to the external side (CPU offload
+    // / P2P) rather than found in local KV. `None` models an engine that
+    // consulted no connector for this request, so the external family stays
+    // unreported; `Some(0)` is a probe that restored nothing.
+    prefix_external_hit_tokens: Option<usize>,
+    connector_lookups: ConnectorLookupCounters,
 }
 
 impl FakeExecutor {
@@ -87,6 +100,9 @@ impl FakeExecutor {
             emit_logprobs: false,
             async_prefill: None,
             parked_prefill: None,
+            prefix_hit_tokens: Some(0),
+            prefix_external_hit_tokens: None,
+            connector_lookups: ConnectorLookupCounters::default(),
         }
     }
 
@@ -97,6 +113,27 @@ impl FakeExecutor {
 
     pub(crate) fn with_async_prefill(mut self, gate: Arc<AsyncPrefillGate>) -> Self {
         self.async_prefill = Some(gate);
+        self
+    }
+
+    /// Simulate a prefix-cache hit on every request's first prefill chunk by
+    /// reporting `tokens` cached tokens.
+    pub(crate) fn with_prefix_hit(mut self, tokens: usize) -> Self {
+        self.prefix_hit_tokens = Some(tokens);
+        self
+    }
+
+    /// Model an executor that never consults a prefix cache (caching switched
+    /// off): no `match_and_add_prefix` happens, so no query may be counted.
+    pub(crate) fn without_prefix_cache(mut self) -> Self {
+        self.prefix_hit_tokens = None;
+        self
+    }
+
+    /// Simulate a connector that was consulted for every request and restored
+    /// `tokens` externally. Without this the external family reports nothing.
+    pub(crate) fn with_external_prefix_hit(mut self, tokens: usize) -> Self {
+        self.prefix_external_hit_tokens = Some(tokens);
         self
     }
 
@@ -148,6 +185,20 @@ impl FakeExecutor {
         } else {
             self.prefill_positions.insert(req.request_id, prefill_pos);
         }
+        // The external family is only reported for a request whose connector
+        // was consulted; later chunks contribute nothing.
+        let external_hit_tokens = if start == 0 && self.prefix_hit_tokens.is_some() {
+            self.prefix_external_hit_tokens
+        } else {
+            None
+        };
+        // Mirror the real executor's settle point: the connector is asked
+        // about whatever was not already local, once per request.
+        if let Some((hit, external)) = self.prefix_hit_tokens.zip(external_hit_tokens) {
+            self.connector_lookups.queries +=
+                (req.prompt_tokens.len() - hit.saturating_sub(external)) as u64;
+            self.connector_lookups.hits += external as u64;
+        }
         PrefillRequestResult {
             request_id: req.request_id,
             first_token: 100 + req.request_id.raw() as u32,
@@ -160,7 +211,16 @@ impl FakeExecutor {
                 }
             }),
             prompt_logprobs: None,
-            cached_tokens: 0,
+            // A simulated lookup is reported only on the request's first chunk
+            // (start == 0); later chunks carry no cached prefix. `None` models
+            // a cache that never ran a lookup (switched off, or prompt
+            // scoring).
+            cached_tokens: if start == 0 {
+                self.prefix_hit_tokens
+            } else {
+                None
+            },
+            external_hit_tokens,
             completed,
             prefill_pos,
         }
@@ -217,6 +277,10 @@ impl ModelExecutor for FakeExecutor {
 
     fn is_stop_token(&self, token_id: u32) -> bool {
         self.stop_token == Some(token_id)
+    }
+
+    fn connector_lookup_counters(&self) -> ConnectorLookupCounters {
+        self.connector_lookups
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {

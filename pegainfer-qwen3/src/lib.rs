@@ -202,6 +202,7 @@ pub mod runtime {
     pub use crate::batch_decode_buffers::SPLIT_KV_CHUNK_TOKENS;
     pub use crate::batch_decode_buffers::SPLIT_KV_TUNED_MAX_CHUNKS;
     pub use crate::batch_decode_buffers::split_chunk_size_for;
+    pub use crate::executor::ConnectorLookupCounters;
     pub use crate::executor::DecodePlan;
     pub use crate::executor::DecodeRequestResult;
     pub use crate::executor::DecodeResult;

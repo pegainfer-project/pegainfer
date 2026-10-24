@@ -64,9 +64,6 @@ pub(crate) struct PendingRequest {
     /// Prompt tokens to forward in the upcoming step. Set by
     /// `take_prefill_chunks` when the request is packed into a step.
     pub(crate) step_chunk: usize,
-    /// Prefix-cache hits reported by the first chunk, carried across later
-    /// chunks so the final result still reports them truthfully.
-    pub(crate) cached_tokens: usize,
 }
 
 impl PendingRequest {
@@ -83,7 +80,6 @@ impl PendingRequest {
             prefetch_offered: false,
             prefill_pos: 0,
             step_chunk: 0,
-            cached_tokens: 0,
         }
     }
 
