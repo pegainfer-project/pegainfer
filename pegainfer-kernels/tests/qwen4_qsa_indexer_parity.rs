@@ -821,27 +821,15 @@ mod select {
     //! the first visible token, the scoring pass's grid contract), so a
     //! prefix-evicted visible list is out of contract and has no case here.
     //!
-    //! Negative controls run the same launch with the kernel's gate-only `variant`
-    //! and are held to computed floors, never a vacuous non-empty check: dropping
-    //! the tail must differ exactly on the fixture's tail bits, keeping one block
-    //! fewer exactly on one block per row, keeping one block more exactly on the
-    //! truncating rows (`blocks > budget / 4`), ignoring causality exactly on the
-    //! columns past each row's own token, and inverting the order must reproduce a
-    //! host-computed bottom-k mask and differ from production on exactly two blocks
-    //! per truncating row.
+    //! The fixture covers both selection paths: rows that keep every block take
+    //! the all-kept fast path, and the truncating rows run the masked argmax
+    //! loop.
 
     use std::cmp::Ordering;
 
     use cudarc::driver::sys::CUresult;
     use pegainfer_kernels::ffi::qwen4_qsa_indexer_select_cuda;
-    use pegainfer_kernels::ops::QSA_SELECT_DROP_TAIL;
-    use pegainfer_kernels::ops::QSA_SELECT_IGNORE_CAUSALITY;
-    use pegainfer_kernels::ops::QSA_SELECT_INVERT_ORDER;
-    use pegainfer_kernels::ops::QSA_SELECT_KEEP_FEWER;
-    use pegainfer_kernels::ops::QSA_SELECT_KEEP_MORE;
-    use pegainfer_kernels::ops::QSA_SELECT_PRODUCTION;
     use pegainfer_kernels::ops::qsa_indexer_select_into;
-    use pegainfer_kernels::ops::qsa_indexer_select_variant_into;
     use pegainfer_kernels::tensor::DeviceContext;
 
     use super::*;
@@ -1011,15 +999,12 @@ mod select {
     }
 
     /// The canonical order over a score row: descending score, ascending block
-    /// index. `invert` flips only the score direction (the gate's negative control);
-    /// the tie rule stays "lower index first" either way, like the kernel's.
-    fn canonical_order(scores: &[f32], invert: bool) -> Vec<usize> {
+    /// index, the kernel's tie rule.
+    fn canonical_order(scores: &[f32]) -> Vec<usize> {
         let mut order: Vec<usize> = (0..scores.len()).collect();
         order.sort_by(|&a, &b| {
             let by_score = if scores[a] == scores[b] {
                 Ordering::Equal
-            } else if invert {
-                scores[a].partial_cmp(&scores[b]).expect("finite scores")
             } else {
                 scores[b].partial_cmp(&scores[a]).expect("finite scores")
             };
@@ -1107,42 +1092,30 @@ mod select {
         selected
     }
 
-    /// Runs one case's mask through one variant and returns the downloaded cells.
-    fn run_case(ctx: &DeviceContext, case: &Case, variant: i32) -> Vec<u8> {
+    /// Runs one case's mask through the production launch and returns the
+    /// downloaded cells.
+    fn run_case(ctx: &DeviceContext, case: &Case) -> Vec<u8> {
         let scores = ctx.stream.clone_htod(&case.scores).expect("score upload");
         let rows = ctx.stream.clone_htod(&case.rows).expect("rows upload");
         let mut mask = ctx
             .stream
             .clone_htod(&vec![SENTINEL; case.rows.len() * case.tokens])
             .expect("mask buffer");
-        let launch = if variant == QSA_SELECT_PRODUCTION {
-            qsa_indexer_select_into(
-                ctx,
-                &scores,
-                case.score_cols,
-                &rows,
-                case.budget,
-                case.tokens,
-                &mut mask,
-            )
-        } else {
-            qsa_indexer_select_variant_into(
-                ctx,
-                &scores,
-                case.score_cols,
-                &rows,
-                case.budget,
-                case.tokens,
-                &mut mask,
-                variant,
-            )
-        };
-        launch.unwrap_or_else(|e| panic!("case {}: variant {variant} launch: {e:#}", case.index));
+        qsa_indexer_select_into(
+            ctx,
+            &scores,
+            case.score_cols,
+            &rows,
+            case.budget,
+            case.tokens,
+            &mut mask,
+        )
+        .unwrap_or_else(|e| panic!("case {}: launch: {e:#}", case.index));
         ctx.sync().expect("sync");
         let host = ctx.stream.clone_dtoh(&mask).expect("mask download");
         assert!(
             host.iter().all(|cell| *cell <= 1),
-            "case {}: variant {variant} left a cell unwritten or wrote past 1",
+            "case {}: left a cell unwritten or wrote past 1",
             case.index
         );
         host
@@ -1155,21 +1128,8 @@ mod select {
         bitwise: usize,
         tie: usize,
         truncating: usize,
-        /// Rows that keep at least one block, i.e. rows with a score prefix.
-        keeping_rows: usize,
-        tail_bits: usize,
-        /// The fixture's own tail width summed over the rows, for the control.
-        tail_expected: usize,
-        keep_fewer_diff: usize,
-        keep_more_diff: usize,
-        causality_diff: usize,
-        /// The fixture's own "columns past the row's token" summed over the rows.
-        causality_expected: usize,
-        invert_diff: usize,
-        /// Truncating rows whose mask the inverted order changes.
-        invert_rows: usize,
-        /// Blocks production drops that the inverted order keeps.
-        invert_dropped_kept: usize,
+        /// Rows that keep every block and take the all-kept fast path.
+        all_kept: usize,
     }
 
     fn check_case(ctx: &DeviceContext, case: &Case, scenario: &Scenario) -> CaseReport {
@@ -1177,12 +1137,7 @@ mod select {
         let rows = case.rows.len();
         let tokens = case.tokens;
 
-        let production = run_case(ctx, case, QSA_SELECT_PRODUCTION);
-        let drop_tail = run_case(ctx, case, QSA_SELECT_DROP_TAIL);
-        let keep_fewer = run_case(ctx, case, QSA_SELECT_KEEP_FEWER);
-        let keep_more = run_case(ctx, case, QSA_SELECT_KEEP_MORE);
-        let ignore_causality = run_case(ctx, case, QSA_SELECT_IGNORE_CAUSALITY);
-        let invert = run_case(ctx, case, QSA_SELECT_INVERT_ORDER);
+        let production = run_case(ctx, case);
 
         let mut report = CaseReport {
             rows,
@@ -1195,8 +1150,7 @@ mod select {
             let tail = case.tail(slot);
             let keep = case.keep(slot, budget_blocks);
             let scores = &case.row_scores(slot)[..blocks];
-            let canonical = canonical_order(scores, false);
-            let inverted = canonical_order(scores, true);
+            let canonical = canonical_order(scores);
             let label = format!("case {} row {row}", case.index);
 
             // The kernel and the host's canonical order must agree on every row.
@@ -1269,121 +1223,8 @@ mod select {
             }
             if blocks > keep {
                 report.truncating += 1;
-            }
-            report.keeping_rows += usize::from(keep > 0);
-            report.tail_expected += tail;
-
-            // Control 1: dropping the tail differs exactly on the tail tokens.
-            let want = host_mask(tokens, blocks, &canonical[..keep], 0);
-            let got = &drop_tail[slot * tokens..][..tokens];
-            assert_same_row(&format!("{label} (drop tail)"), got, &want);
-            let diff = differing(got, ours);
-            let want: Vec<usize> = (blocks * RATIO..blocks * RATIO + tail).collect();
-            assert_eq!(
-                diff, want,
-                "{label}: the tail tokens are the only difference"
-            );
-            report.tail_bits += diff.len();
-
-            // Control 2: one block fewer differs exactly on the last kept block.
-            let fewer = keep.saturating_sub(1);
-            let want = host_mask(tokens, blocks, &canonical[..fewer], tail);
-            let got = &keep_fewer[slot * tokens..][..tokens];
-            assert_same_row(&format!("{label} (keep fewer)"), got, &want);
-            let diff = differing(got, ours);
-            report.keep_fewer_diff += diff.len();
-            if keep == 0 {
-                assert!(diff.is_empty(), "{label}: nothing to drop");
             } else {
-                let dropped = canonical[keep - 1] * RATIO;
-                assert_eq!(
-                    diff,
-                    (dropped..dropped + RATIO).collect::<Vec<_>>(),
-                    "{label}: the block the budget had to drop is the only difference"
-                );
-            }
-
-            // Control 3: one block more differs exactly on the truncating rows,
-            // where an extra block exists; a row under the budget cannot change.
-            let more = (keep + 1).min(blocks);
-            let want = host_mask(tokens, blocks, &canonical[..more], tail);
-            let got = &keep_more[slot * tokens..][..tokens];
-            assert_same_row(&format!("{label} (keep more)"), got, &want);
-            let diff = differing(got, ours);
-            report.keep_more_diff += diff.len();
-            if blocks > keep {
-                let added = canonical[keep] * RATIO;
-                assert_eq!(
-                    diff,
-                    (added..added + RATIO).collect::<Vec<_>>(),
-                    "{label}: the first block past the budget is the only difference"
-                );
-            } else {
-                assert!(
-                    diff.is_empty(),
-                    "{label}: keeping more than the budget is capped at {blocks} blocks"
-                );
-            }
-
-            // Control 4: ignoring causality differs exactly on the columns past the
-            // row's own token, and nowhere else.
-            let mut want = host_mask(tokens, blocks, &canonical[..keep], tail);
-            want[pos + 1..].fill(1);
-            let got = &ignore_causality[slot * tokens..][..tokens];
-            assert_same_row(&format!("{label} (ignore causality)"), got, &want);
-            let diff = differing(got, ours);
-            let want: Vec<usize> = (pos + 1..tokens).collect();
-            assert_eq!(
-                diff, want,
-                "{label}: only tokens past the row's own position may differ"
-            );
-            report.causality_diff += diff.len();
-            report.causality_expected += tokens - 1 - pos;
-
-            // Control 5: the inverted order reproduces a host-computed bottom-k
-            // mask and differs from production on exactly the blocks the two orders
-            // disagree on — every block production had to drop comes back, and the
-            // top block goes.
-            let got = &invert[slot * tokens..][..tokens];
-            assert_same_row(
-                &format!("{label} (invert)"),
-                got,
-                &host_mask(tokens, blocks, &inverted[..keep], tail),
-            );
-            let diff = differing(got, ours);
-            report.invert_diff += diff.len();
-            let mut traded: Vec<usize> = canonical[..keep]
-                .iter()
-                .filter(|block| !inverted[..keep].contains(*block))
-                .copied()
-                .collect();
-            traded.extend(
-                inverted[..keep]
-                    .iter()
-                    .filter(|block| !canonical[..keep].contains(*block))
-                    .copied(),
-            );
-            let mut want = Vec::new();
-            for block in &traded {
-                want.extend(block * RATIO..block * RATIO + RATIO);
-            }
-            want.sort_unstable();
-            assert_eq!(
-                diff, want,
-                "{label}: the inverted order must trade exactly the blocks the two orders \
-                 disagree on"
-            );
-            if blocks > keep {
-                report.invert_rows += usize::from(!diff.is_empty());
-                report.invert_dropped_kept += canonical[keep..]
-                    .iter()
-                    .filter(|block| inverted[..keep].contains(*block))
-                    .count();
-            } else {
-                assert!(
-                    diff.is_empty(),
-                    "{label}: every block is kept, so order cannot matter"
-                );
+                report.all_kept += 1;
             }
         }
         report
@@ -1406,53 +1247,27 @@ mod select {
             let report = check_case(&ctx, &case, &scenario);
             budgets.push(case.budget);
             println!(
-                "case {index}: {} rows, {} bitwise, {} tie, {} truncating (blocks > budget/4); \
-                 tokens {}, budget {} ({} blocks); controls differ: drop-tail {} bits, \
-                 keep-fewer {} bits, keep-more {} bits, ignore-causality {} bits, \
-                 invert {} bits",
+                "case {index}: {} rows, {} bitwise, {} tie, {} truncating, {} all-kept; \
+                 tokens {}, budget {} ({} blocks)",
                 report.rows,
                 report.bitwise,
                 report.tie,
                 report.truncating,
+                report.all_kept,
                 case.tokens,
                 case.budget,
                 scenario.blocks_of(case.budget),
-                report.tail_bits,
-                report.keep_fewer_diff,
-                report.keep_more_diff,
-                report.causality_diff,
-                report.invert_diff,
             );
             total.rows += report.rows;
             total.bitwise += report.bitwise;
             total.tie += report.tie;
             total.truncating += report.truncating;
-            total.tail_bits += report.tail_bits;
-            total.tail_expected += report.tail_expected;
-            total.keeping_rows += report.keeping_rows;
-            total.causality_expected += report.causality_expected;
-            total.keep_fewer_diff += report.keep_fewer_diff;
-            total.keep_more_diff += report.keep_more_diff;
-            total.causality_diff += report.causality_diff;
-            total.invert_diff += report.invert_diff;
-            total.invert_rows += report.invert_rows;
-            total.invert_dropped_kept += report.invert_dropped_kept;
+            total.all_kept += report.all_kept;
         }
         println!(
             "selection parity over {CASES} cases: {} rows, {} bitwise, {} up to ties, \
-             {} truncating; controls differ from production: drop-tail {} bits, \
-             keep-fewer {} bits, keep-more {} bits, ignore-causality {} bits, invert {} \
-             bits ({} blocks production dropped that the inverted order keeps)",
-            total.rows,
-            total.bitwise,
-            total.tie,
-            total.truncating,
-            total.tail_bits,
-            total.keep_fewer_diff,
-            total.keep_more_diff,
-            total.causality_diff,
-            total.invert_diff,
-            total.invert_dropped_kept,
+             {} truncating, {} all-kept",
+            total.rows, total.bitwise, total.tie, total.truncating, total.all_kept,
         );
 
         assert_eq!(
@@ -1473,54 +1288,13 @@ mod select {
             "the config's own budget {} is not exercised",
             scenario.default_budget
         );
-        // Computed floors: each control must bite exactly as widely as the fixture
-        // allows, and the two truncation-dependent controls need truncating rows to
-        // mean anything.
-        assert!(
-            total.tail_expected > 0,
-            "the fixture must give some row a tail to drop"
-        );
-        assert_eq!(
-            total.tail_bits, total.tail_expected,
-            "drop-tail must clear exactly the fixture's tail bits"
-        );
-        assert!(
-            total.keeping_rows > 0,
-            "the fixture must give some row a block to keep"
-        );
-        assert_eq!(
-            total.keep_fewer_diff,
-            RATIO * total.keeping_rows,
-            "keep-fewer must remove exactly one block per row that keeps one"
-        );
-        assert_eq!(
-            total.keep_more_diff,
-            RATIO * total.truncating,
-            "keep-more must add exactly one block on every truncating row"
-        );
-        assert!(
-            total.causality_expected > 0,
-            "the fixture must give some row a token past its own"
-        );
-        assert_eq!(
-            total.causality_diff, total.causality_expected,
-            "ignore-causality must set exactly the columns past each row's token"
-        );
         assert!(
             total.truncating > 0,
-            "the fixture must express a dropped block"
-        );
-        assert_eq!(
-            total.invert_rows, total.truncating,
-            "inverting must change every truncating row and no other"
-        );
-        assert_eq!(
-            total.invert_dropped_kept, total.truncating,
-            "inverting must keep every block production dropped"
+            "the fixture must exercise the truncating path"
         );
         assert!(
-            total.invert_diff >= RATIO * total.truncating,
-            "inverting must differ on at least one block per truncating row"
+            total.all_kept > 0,
+            "the fixture must exercise the all-kept fast path"
         );
     }
 
@@ -1537,7 +1311,6 @@ mod select {
             tokens: i32,
             score_cols: i32,
             budget: i32,
-            variant: i32,
         ) -> CUresult {
             unsafe {
                 qwen4_qsa_indexer_select_cuda(
@@ -1548,7 +1321,6 @@ mod select {
                     tokens,
                     score_cols,
                     budget,
-                    variant,
                     std::ptr::null_mut(),
                 )
             }
@@ -1556,7 +1328,7 @@ mod select {
         let scores = std::ptr::NonNull::<f32>::dangling().as_ptr();
         let rows = std::ptr::NonNull::<i32>::dangling().as_ptr();
         let mask = std::ptr::NonNull::<u8>::dangling().as_ptr();
-        let valid = |budget, variant| launch(scores, rows, mask, 1, 8, 2, budget, variant);
+        let valid = |budget| launch(scores, rows, mask, 1, 8, 2, budget);
 
         let refuse = |label: &str, result: CUresult| {
             assert_eq!(
@@ -1567,46 +1339,40 @@ mod select {
         };
         refuse(
             "null scores",
-            launch(std::ptr::null(), rows, mask, 1, 8, 2, 8, 0),
+            launch(std::ptr::null(), rows, mask, 1, 8, 2, 8),
         );
         refuse(
             "null rows",
-            launch(scores, std::ptr::null(), mask, 1, 8, 2, 8, 0),
+            launch(scores, std::ptr::null(), mask, 1, 8, 2, 8),
         );
         refuse(
             "null mask",
-            launch(scores, rows, std::ptr::null_mut(), 1, 8, 2, 8, 0),
+            launch(scores, rows, std::ptr::null_mut(), 1, 8, 2, 8),
         );
         for query_rows in [-1, 0] {
             refuse(
                 "query rows",
-                launch(scores, rows, mask, query_rows, 8, 2, 8, 0),
+                launch(scores, rows, mask, query_rows, 8, 2, 8),
             );
         }
         for tokens in [-1, 0] {
-            refuse("tokens", launch(scores, rows, mask, 1, tokens, 2, 8, 0));
+            refuse("tokens", launch(scores, rows, mask, 1, tokens, 2, 8));
         }
         refuse(
             "negative score columns",
-            launch(scores, rows, mask, 1, 8, -1, 8, 0),
+            launch(scores, rows, mask, 1, 8, -1, 8),
         );
         for budget in [-4, 0, 2, 7, 2052] {
-            refuse("budget", valid(budget, 0));
-        }
-        for variant in [-1, 6] {
-            refuse("variant", valid(8, variant));
+            refuse("budget", valid(budget));
         }
         // A row sees up to tokens / 4 blocks, so one score column cannot serve an
         // eight-token row.
-        refuse(
-            "narrow score row",
-            launch(scores, rows, mask, 1, 8, 1, 8, 0),
-        );
+        refuse("narrow score row", launch(scores, rows, mask, 1, 8, 1, 8));
         // The exclusion bitmap is one bit per block: 1.6M tokens is past the 48 KiB
         // dynamic-shared-memory ceiling a launch may use without an opt-in.
         refuse(
             "oversized exclusion bitmap",
-            launch(scores, rows, mask, 1, 1_600_000, 400_000, 8, 0),
+            launch(scores, rows, mask, 1, 1_600_000, 400_000, 8),
         );
         // A launch that passes every guard would dereference these placeholder
         // pointers, so only refusals belong in this test.

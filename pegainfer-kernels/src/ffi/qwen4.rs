@@ -50,10 +50,9 @@ unsafe extern "C" {
     ///
     /// `rows[j]` is the row's position, `scores` its `score_cols`-wide f32
     /// block-score row and `mask` its `tokens`-wide byte row. `budget` is the
-    /// token budget and `variant` is `0` in production; the other values are
-    /// the parity gate's controls. The compiled geometry is four tokens per
-    /// block and one byte per mask cell; a caller whose buffers are laid out
-    /// differently cannot be detected here.
+    /// token budget. The compiled geometry is four tokens per block and one
+    /// byte per mask cell; a caller whose buffers are laid out differently
+    /// cannot be detected here.
     pub fn qwen4_qsa_indexer_select_cuda(
         scores: *const f32,
         rows: *const i32,
@@ -62,7 +61,6 @@ unsafe extern "C" {
         tokens: i32,
         score_cols: i32,
         budget: i32,
-        variant: i32,
         stream: CUstream,
     ) -> CUresult;
 }

@@ -50,17 +50,6 @@
 // which is far past the checkpoint's 262144 positions, so no caller this line
 // serves is refused by it.
 //
-// VARIANT: the last argument selects gate-only mutations of the same launch
-// (production always passes 0). The kernel refuses an unknown value. These
-// exist so the parity gate can prove its assertions bite on the real kernel
-// path without weakening the production branch:
-//   0 production                 as described above
-//   1 drop the tail              the tail bits are left 0
-//   2 keep fewer                 `keep - 1` blocks instead of `keep`
-//   3 keep more                  `keep + 1` blocks, capped at `blocks`
-//   4 ignore causality           every column past the row's own token is set
-//   5 invert the order           the LOWEST scores are kept, ties still to the
-//                                lower index
 
 #include "../common.cuh"
 #include "../shared/ffi_guard.cuh"
@@ -87,22 +76,11 @@ constexpr int kStaticSharedBytes =
 // opt-in.
 constexpr int kMaxSharedBytes = 48 * 1024;
 
-enum SelectVariant : int {
-  kProduction = 0,
-  kDropTail = 1,
-  kKeepFewer = 2,
-  kKeepMore = 3,
-  kIgnoreCausality = 4,
-  kInvertOrder = 5,
-};
-
-// The canonical order: descending score, ascending block index; `invert` flips
-// only the score direction (the gate's negative control), never the tie rule,
-// so a tied pair still resolves to the lower index either way. An absent
+// The canonical order: descending score, ascending block index. An absent
 // candidate (`index < 0`) never outranks a present one, which is what lets the
 // pass start from "nothing found yet".
 __device__ __forceinline__ bool outranks(float score, int index, float best_score,
-                                         int best_index, bool invert) {
+                                         int best_index) {
   if (index < 0) {
     return false;
   }
@@ -110,7 +88,7 @@ __device__ __forceinline__ bool outranks(float score, int index, float best_scor
     return true;
   }
   if (score != best_score) {
-    return invert ? (score < best_score) : (score > best_score);
+    return score > best_score;
   }
   return index < best_index;
 }
@@ -133,8 +111,7 @@ __global__ void qwen4_qsa_select_kernel(
     unsigned char* __restrict__ mask,   // [query_rows, tokens]
     int tokens,
     int score_cols,
-    int budget,
-    int variant) {
+    int budget) {
   extern __shared__ unsigned int picked[];
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
@@ -157,9 +134,6 @@ __global__ void qwen4_qsa_select_kernel(
   if (budget <= 0 || budget % kRatio != 0 || budget / kRatio > kMaxKeptBlocks) {
     __trap();
   }
-  if (variant < kProduction || variant > kInvertOrder) {
-    __trap();
-  }
 
   const float* row_scores = scores + static_cast<int64_t>(row) * score_cols;
   // Fail closed on a poisoned score before any comparison can skip it. NaN
@@ -172,13 +146,7 @@ __global__ void qwen4_qsa_select_kernel(
   }
 
   const int keep_cap = budget / kRatio;
-  int keep = keep_cap < blocks ? keep_cap : blocks;
-  if (variant == kKeepFewer && keep > 0) {
-    --keep;
-  } else if (variant == kKeepMore && keep < blocks) {
-    ++keep;
-  }
-  const bool invert = variant == kInvertOrder;
+  const int keep = keep_cap < blocks ? keep_cap : blocks;
 
   // The bitmap covers every block any row of this launch can see.
   const int max_blocks = tokens / kRatio;
@@ -201,7 +169,7 @@ __global__ void qwen4_qsa_select_kernel(
         continue;
       }
       const float score = row_scores[block];
-      if (outranks(score, block, best_score, best_index, invert)) {
+      if (outranks(score, block, best_score, best_index)) {
         best_score = score;
         best_index = block;
       }
@@ -210,7 +178,7 @@ __global__ void qwen4_qsa_select_kernel(
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
       const float other_score = __shfl_down_sync(0xffffffffu, best_score, offset);
       const int other_index = __shfl_down_sync(0xffffffffu, best_index, offset);
-      if (outranks(other_score, other_index, best_score, best_index, invert)) {
+      if (outranks(other_score, other_index, best_score, best_index)) {
         best_score = other_score;
         best_index = other_index;
       }
@@ -226,8 +194,7 @@ __global__ void qwen4_qsa_select_kernel(
       int pick_index = warp_index[0];
 #pragma unroll
       for (int warp = 1; warp < kWarps; ++warp) {
-        if (outranks(warp_score[warp], warp_index[warp], pick_score, pick_index,
-                     invert)) {
+        if (outranks(warp_score[warp], warp_index[warp], pick_score, pick_index)) {
           pick_score = warp_score[warp];
           pick_index = warp_index[warp];
         }
@@ -257,16 +224,8 @@ __global__ void qwen4_qsa_select_kernel(
       row_mask[base + i] = 1;
     }
   }
-  if (variant != kDropTail) {
-    for (int i = tid; i < tail; i += blockDim.x) {
-      row_mask[blocks * kRatio + i] = 1;
-    }
-  }
-  if (variant == kIgnoreCausality) {
-    // Gate-only: pretend the row's own token is not the end of the visible set.
-    for (int token = visible + tid; token < tokens; token += blockDim.x) {
-      row_mask[token] = 1;
-    }
+  for (int i = tid; i < tail; i += blockDim.x) {
+    row_mask[blocks * kRatio + i] = 1;
   }
 }
 
@@ -284,8 +243,7 @@ extern "C" {
 // `rows` carries the query rows' positions in the token order (also the row
 // order of `scores` and `mask`); it is not assumed to be every position.
 // `budget` is the token budget, a positive multiple of kRatio whose block count
-// is at most kMaxKeptBlocks. `variant` is 0 in production; the other values are
-// the gate's controls (see above).
+// is at most kMaxKeptBlocks.
 //
 // The compiled geometry is kRatio = 4 and one byte per mask cell; a caller
 // whose buffers are laid out differently cannot be detected here. An empty
@@ -300,7 +258,6 @@ CUresult qwen4_qsa_indexer_select_cuda(
     int tokens,
     int score_cols,
     int budget,
-    int variant,
     cudaStream_t stream) {
   if (scores == nullptr || rows == nullptr || mask == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
@@ -309,9 +266,6 @@ CUresult qwen4_qsa_indexer_select_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (budget <= 0 || budget % kRatio != 0 || budget / kRatio > kMaxKeptBlocks) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (variant < kProduction || variant > kInvertOrder) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   // Every row reads at most `tokens / kRatio` blocks from its score row.
@@ -327,7 +281,7 @@ CUresult qwen4_qsa_indexer_select_cuda(
   }
   qwen4_qsa_select_kernel<<<query_rows, kThreads,
                             static_cast<size_t>(shared_bytes), stream>>>(
-      scores, rows, mask, tokens, score_cols, budget, variant);
+      scores, rows, mask, tokens, score_cols, budget);
   return consume_last_cuda_error();
 }
 
