@@ -133,6 +133,7 @@ fn assert_score_traps(row: i32, visible: i32) {
 /// The selector trap cases all run an eight-token mask with two score columns
 /// and the eight-token budget; only the poisoned field differs.
 const SELECT_TOKENS: usize = 8;
+const SELECT_SCORE_COLS: usize = SELECT_TOKENS / 4;
 const SELECT_BUDGET: i32 = 8;
 
 /// Select once with one poisoned input and require the kernel's trap. Same
@@ -148,8 +149,15 @@ fn assert_select_traps(label: &str, scores: &[f32], rows: &[i32]) {
     let scores = ctx.stream.clone_htod(scores).expect("scores H2D");
     let rows = ctx.stream.clone_htod(rows).expect("rows H2D");
     let mut mask = ctx.stream.alloc_zeros::<u8>(SELECT_TOKENS).expect("mask");
-    let launch =
-        qsa_indexer_select_into(ctx, &scores, &rows, SELECT_BUDGET, SELECT_TOKENS, &mut mask);
+    let launch = qsa_indexer_select_into(
+        ctx,
+        &scores,
+        SELECT_SCORE_COLS,
+        &rows,
+        SELECT_BUDGET,
+        SELECT_TOKENS,
+        &mut mask,
+    );
     let error = match launch {
         Ok(()) => ctx
             .sync()

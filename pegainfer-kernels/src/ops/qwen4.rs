@@ -269,13 +269,15 @@ struct SelectPlan {
 /// host arithmetic over buffer lengths and scalars. The public entries return
 /// early for an empty launch, so these extents are always non-empty here.
 ///
-/// `score_capacity` is the flat length of the score buffer and `score_cols` its
-/// row stride, which is only unambiguous when the length divides evenly by the
-/// row count. The stride must hold `tokens / COMPRESS_RATIO` blocks — one row's
-/// ceiling — while the kernel reads only each row's own `(rows[j] + 1) / 4`.
+/// `score_cols` is the score buffer's row stride and `score_capacity` its flat
+/// length, which may exceed the rows' extent — the score stage can hand over a
+/// buffer with spare capacity. The stride must hold `tokens / COMPRESS_RATIO`
+/// blocks — one row's ceiling — while the kernel reads only each row's own
+/// `(rows[j] + 1) / 4`.
 fn select_plan(
     query_rows: usize,
     tokens: usize,
+    score_cols: usize,
     score_capacity: usize,
     mask_capacity: usize,
     budget: i32,
@@ -303,11 +305,14 @@ fn select_plan(
     let cells = query_rows
         .checked_mul(tokens)
         .ok_or_else(|| anyhow::anyhow!("QSA indexer mask {query_rows} x {tokens} overflows"))?;
+    let score_cells = query_rows.checked_mul(score_cols).ok_or_else(|| {
+        anyhow::anyhow!("QSA indexer score {query_rows} x {score_cols} overflows")
+    })?;
     ensure!(
-        score_capacity.is_multiple_of(query_rows),
-        "QSA indexer score buffer {score_capacity} f32 does not divide into {query_rows} rows"
+        score_capacity >= score_cells,
+        "QSA indexer score buffer {score_capacity} f32 cannot hold {query_rows} rows \
+         of {score_cols}"
     );
-    let score_cols = score_capacity / query_rows;
     ensure!(
         score_cols >= tokens / COMPRESS_RATIO,
         "QSA indexer score row holds {score_cols} blocks, but a mask over \
@@ -330,10 +335,10 @@ fn select_plan(
 /// visibility mask: the tokens of the `min(budget / COMPRESS_RATIO, blocks)`
 /// highest block scores plus the row's incomplete tail.
 ///
-/// `scores` is `[rows.len(), score_cols]` f32 with row stride
-/// `scores.len() / rows.len()`; only `(rows[j] + 1) / 4` entries of row `j` are
-/// read, so the NaN padding the scoring stage leaves past that prefix is never
-/// touched. `rows[j]` is row `j`'s position, also its row order in `scores` and
+/// `scores` is `[rows.len(), score_cols]` f32 with row stride `score_cols`; the
+/// buffer may hold spare capacity (`scores.len() >= rows.len() * score_cols`).
+/// Only `(rows[j] + 1) / 4` entries of row `j` are read, so the NaN padding the
+/// scoring stage leaves past that prefix is never touched. `rows[j]` is row `j`'s position, also its row order in `scores` and
 /// `mask`. `budget` is the token budget, a positive multiple of four keeping at
 /// most 512 blocks; `tokens` is the mask's column count and the row's causal
 /// ceiling (`pos < tokens`).
@@ -364,6 +369,7 @@ fn select_plan(
 pub fn qsa_indexer_select_into(
     ctx: &DeviceContext,
     scores: &CudaSlice<f32>,
+    score_cols: usize,
     rows: &CudaSlice<i32>,
     budget: i32,
     tokens: usize,
@@ -372,6 +378,7 @@ pub fn qsa_indexer_select_into(
     qsa_indexer_select_variant_into(
         ctx,
         scores,
+        score_cols,
         rows,
         budget,
         tokens,
@@ -392,6 +399,7 @@ pub fn qsa_indexer_select_into(
 pub fn qsa_indexer_select_variant_into(
     ctx: &DeviceContext,
     scores: &CudaSlice<f32>,
+    score_cols: usize,
     rows: &CudaSlice<i32>,
     budget: i32,
     tokens: usize,
@@ -404,6 +412,7 @@ pub fn qsa_indexer_select_variant_into(
     let plan = select_plan(
         rows.len(),
         tokens,
+        score_cols,
         scores.len(),
         mask.len(),
         budget,
@@ -433,26 +442,38 @@ pub fn qsa_indexer_select_variant_into(
 mod tests {
     use super::*;
 
-    /// Rows, tokens, score capacity and mask capacity of one valid launch:
-    /// two query rows, eight tokens, two blocks per score row.
-    const VALID: (usize, usize, usize, usize) = (2, 8, 4, 16);
+    /// Rows, tokens, score columns, score capacity and mask capacity of one
+    /// valid launch: two query rows, eight tokens, two blocks per score row.
+    const VALID: (usize, usize, usize, usize, usize) = (2, 8, 2, 4, 16);
 
     fn plan(
         query_rows: usize,
         tokens: usize,
+        score_cols: usize,
         scores: usize,
         mask: usize,
         budget: i32,
         variant: i32,
     ) -> Result<SelectPlan> {
-        select_plan(query_rows, tokens, scores, mask, budget, variant)
+        select_plan(
+            query_rows, tokens, score_cols, scores, mask, budget, variant,
+        )
     }
 
     #[test]
     fn a_complete_launch_passes() {
-        let (rows, tokens, scores, mask) = VALID;
+        let (rows, tokens, score_cols, scores, mask) = VALID;
         assert_eq!(
-            plan(rows, tokens, scores, mask, 8, QSA_SELECT_PRODUCTION).expect("valid"),
+            plan(
+                rows,
+                tokens,
+                score_cols,
+                scores,
+                mask,
+                8,
+                QSA_SELECT_PRODUCTION
+            )
+            .expect("valid"),
             SelectPlan {
                 query_rows: 2,
                 tokens: 8,
@@ -460,60 +481,92 @@ mod tests {
             }
         );
         // The budget ceiling itself, and the gate's last control, both pass.
-        assert!(plan(rows, tokens, scores, mask, 2048, QSA_SELECT_INVERT_ORDER).is_ok());
+        assert!(
+            plan(
+                rows,
+                tokens,
+                score_cols,
+                scores,
+                mask,
+                2048,
+                QSA_SELECT_INVERT_ORDER
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn malformed_budgets_are_refused() {
-        let (rows, tokens, scores, mask) = VALID;
+        let (rows, tokens, score_cols, scores, mask) = VALID;
         for budget in [0, -4, 2, 7, 2052, i32::MIN, i32::MAX] {
             assert!(
-                plan(rows, tokens, scores, mask, budget, QSA_SELECT_PRODUCTION).is_err(),
+                plan(
+                    rows,
+                    tokens,
+                    score_cols,
+                    scores,
+                    mask,
+                    budget,
+                    QSA_SELECT_PRODUCTION
+                )
+                .is_err(),
                 "budget {budget} must be refused"
             );
         }
         // 2048 tokens is the checkpoint's budget and the block ceiling; one
         // more multiple of four is past it.
-        assert!(plan(rows, tokens, scores, mask, 2048, 0).is_ok());
-        assert!(plan(rows, tokens, scores, mask, 2052, 0).is_err());
+        assert!(plan(rows, tokens, score_cols, scores, mask, 2048, 0).is_ok());
+        assert!(plan(rows, tokens, score_cols, scores, mask, 2052, 0).is_err());
     }
 
     #[test]
     fn select_plan_refuses_empty_extents() {
-        let (_, tokens, scores, mask) = VALID;
-        assert!(plan(0, tokens, 0, mask, 8, 0).is_err(), "no rows");
-        assert!(plan(2, 0, scores, 0, 8, 0).is_err(), "no tokens");
+        let (_, tokens, score_cols, scores, mask) = VALID;
+        assert!(
+            plan(0, tokens, score_cols, 0, mask, 8, 0).is_err(),
+            "no rows"
+        );
+        assert!(
+            plan(2, 0, score_cols, scores, 0, 8, 0).is_err(),
+            "no tokens"
+        );
     }
 
     #[test]
     fn short_buffers_are_refused() {
-        let (rows, tokens, scores, mask) = VALID;
-        // 3 f32 does not divide into 2 rows: the stride would be ambiguous.
-        assert!(plan(rows, tokens, 3, mask, 8, 0).is_err());
-        // One column per row cannot hold the two blocks an 8-token row sees.
-        assert!(plan(rows, tokens, 2, mask, 8, 0).is_err());
+        let (rows, tokens, score_cols, scores, mask) = VALID;
+        // Three f32 cannot hold two rows of two columns.
+        assert!(plan(rows, tokens, score_cols, 3, mask, 8, 0).is_err());
+        // One column cannot hold the two blocks an 8-token row sees.
+        assert!(plan(rows, tokens, 1, 2, mask, 8, 0).is_err());
         // One byte short of the [2, 8] mask.
-        assert!(plan(rows, tokens, scores, mask - 1, 8, 0).is_err());
+        assert!(plan(rows, tokens, score_cols, scores, mask - 1, 8, 0).is_err());
         // A score row wider than the block grid is fine: only the prefix is read.
-        assert!(plan(rows, tokens, 2 * 16, mask, 8, 0).is_ok());
+        assert!(plan(rows, tokens, 16, 2 * 16, mask, 8, 0).is_ok());
+        // Spare capacity does not change the row stride.
+        let spare = plan(rows, tokens, score_cols, 2 * scores, mask, 8, 0).expect("spare");
+        assert_eq!(spare.score_cols, 2);
     }
 
     #[test]
     fn unknown_variants_are_refused() {
-        let (rows, tokens, scores, mask) = VALID;
+        let (rows, tokens, score_cols, scores, mask) = VALID;
         for variant in [-1, 6, i32::MIN, i32::MAX] {
             assert!(
-                plan(rows, tokens, scores, mask, 8, variant).is_err(),
+                plan(rows, tokens, score_cols, scores, mask, 8, variant).is_err(),
                 "variant {variant} must be refused"
             );
         }
         for variant in 0..=5 {
-            assert!(plan(rows, tokens, scores, mask, 8, variant).is_ok());
+            assert!(plan(rows, tokens, score_cols, scores, mask, 8, variant).is_ok());
         }
     }
 
     #[test]
     fn an_overflowing_mask_product_is_refused() {
-        assert!(plan(usize::MAX, 8, 8, usize::MAX, 8, 0).is_err());
+        assert!(plan(usize::MAX, 8, 2, 8, usize::MAX, 8, 0).is_err());
+        // A stride product that does not fit is refused before the capacity
+        // comparison can read it as a plausible row count.
+        assert!(plan(2, 8, usize::MAX, usize::MAX, 16, 8, 0).is_err());
     }
 }

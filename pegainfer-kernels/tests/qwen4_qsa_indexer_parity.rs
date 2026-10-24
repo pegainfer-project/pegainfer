@@ -1116,11 +1116,20 @@ mod select {
             .clone_htod(&vec![SENTINEL; case.rows.len() * case.tokens])
             .expect("mask buffer");
         let launch = if variant == QSA_SELECT_PRODUCTION {
-            qsa_indexer_select_into(ctx, &scores, &rows, case.budget, case.tokens, &mut mask)
+            qsa_indexer_select_into(
+                ctx,
+                &scores,
+                case.score_cols,
+                &rows,
+                case.budget,
+                case.tokens,
+                &mut mask,
+            )
         } else {
             qsa_indexer_select_variant_into(
                 ctx,
                 &scores,
+                case.score_cols,
                 &rows,
                 case.budget,
                 case.tokens,
