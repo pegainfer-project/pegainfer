@@ -3194,9 +3194,11 @@ impl Drop for Qwen3Executor {
 #[derive(Clone, Debug)]
 struct DFlashMeta {
     block_size: usize,
-    /// Max drafts proposed per verify step (`K`). The span leads with the anchor
-    /// (`[anchor, draft_1, …]`), so this is `verify_span - 1` under either block
-    /// layout — anchor-first vs anchor-drop is already folded into `verify_span()`.
+    /// Max drafts proposed per verify step (`K`), after any
+    /// `PEGAINFER_SPEC_MAX_DRAFTS` trim. The span leads with the anchor
+    /// (`[anchor, draft_1, …]`), so the span is `K + 1` under either block
+    /// layout — anchor-first vs anchor-drop is already folded into the
+    /// drafter's draft count.
     num_spec_tokens: usize,
     /// Draft's max cacheable position; with the `block_size` in-fill headroom
     /// this caps the DFlash-effective context to `max_position_embeddings - block_size`.
@@ -3417,7 +3419,7 @@ impl LocalQwen3Lane {
         model.tune_gemm_algos(&self.model)?;
         let meta = DFlashMeta {
             block_size: model.block_size(),
-            num_spec_tokens: model.verify_span().saturating_sub(1),
+            num_spec_tokens: model.effective_drafts(),
             max_position_embeddings: model.max_position_embeddings(),
             target_layer_ids: model.target_layer_ids().to_vec(),
         };
@@ -3776,7 +3778,7 @@ impl LocalQwen3Lane {
         }))
     }
 
-    /// DFlash verify forward over each request's `block_size`-token span, using
+    /// DFlash verify forward over each request's verify span, using
     /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation),
     /// lazily built on first use. Numerically equivalent to the
     /// `batch_prefill(all_position_logits=true)` verify path it replaces.
@@ -3791,13 +3793,14 @@ impl LocalQwen3Lane {
             anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
         })?;
         // Verify span = anchor + drafts: `block_size` for DFlash, `block_size + 1`
-        // for DSpark (anchor-first). The graph buffers + replay shape key off this.
+        // for DSpark (anchor-first), shortened by a `PEGAINFER_SPEC_MAX_DRAFTS`
+        // trim. The graph buffers + replay shape key off this.
         let verify_span = self
             .dflash
             .as_ref()
             .expect("DFlash present when capture layers exist")
             .model
-            .verify_span();
+            .effective_verify_span();
 
         if self.verify_bufs.is_none() {
             let max_batch = *BATCH_BUCKETS.last().unwrap();
