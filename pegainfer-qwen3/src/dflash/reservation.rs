@@ -16,7 +16,8 @@ use crate::sizing;
 ///   is a tracked follow-up that would shrink this term to the draft KV alone).
 /// - `fixed_bytes` does not scale with the pool (billed via the memory margin):
 ///   the draft weights plus the lane-level batched scratch sized for the whole
-///   decode batch.
+///   decode batch, and (for DSpine) the bridge weights, vocabulary-sized
+///   TG/TSV tables, and bridge/serial scratch.
 // TODO: the draft scratch is now a single lane-level `DFlashBatchScratch`
 // allocated once (dense buffers sized `max_batch * block_size`, plus one shared
 // varlen tail), not a per-request buffer. The per-token `tail_scratch` term and
@@ -142,6 +143,7 @@ impl DFlashMemoryReservation {
         // per-step bias is the dominant term). Zero for plain DFlash drafters.
         let markov = MarkovHead::reservation_bytes(config, max_decode_batch_size)?;
         let selector = SelectorHead::reservation_bytes(config, max_decode_batch_size)?;
+        let dspine = dspine_bytes(config, max_decode_batch_size)?;
 
         Ok(Self {
             kv_bytes_per_token,
@@ -152,9 +154,90 @@ impl DFlashMemoryReservation {
                 markov,
                 native,
                 selector,
+                dspine,
             ])?,
             block_size: config.block_size,
             uses_markov_head: config.uses_markov_head(),
         })
+    }
+}
+
+/// Fixed DSpine footprint: bridge weights, vocabulary-sized TG/TSV tables, and
+/// the lane-level bridge/top-K/serial scratch. `0` for non-DSpine drafters.
+///
+/// The scratch term bills a standalone layout (normalized read, delta, and the
+/// last-write stash) even though the forward may alias `normed`/`o_buf`; like
+/// the DFlash terms above it is a conservative upper bound.
+fn dspine_bytes(config: &DFlashConfig, max_decode_batch_size: usize) -> Result<usize> {
+    const BF16: usize = 2;
+    const F32: usize = 4;
+    if !config.uses_dspine() {
+        return Ok(0);
+    }
+    let dspine = config
+        .dspine
+        .as_ref()
+        .expect("uses_dspine implies a parsed bridge");
+    let hidden = config.hidden_size;
+    let vocab = config.vocab_size;
+    let layers = config.num_hidden_layers;
+    let code = dspine.code_size;
+    let rank = dspine.rank;
+    let topk = dspine.head_topk;
+
+    let weights = sizing::sum(&[
+        sizing::product(&[vocab, code, BF16])?,  // codebook
+        sizing::product(&[code, hidden, BF16])?, // read_weight
+        sizing::product(&[layers.saturating_sub(1), code, hidden, BF16])?, // early reads
+        sizing::product(&[layers, hidden, rank, BF16])?, // feature writes
+        sizing::product(&[3, rank, code, BF16])?, // packed gate/predecessor/prev
+        sizing::product(&[rank, BF16])?,         // gate bias
+        sizing::product(&[vocab, rank, BF16])?,  // TG
+        sizing::product(&[vocab, 2, rank, BF16])?, // TSV
+    ])?;
+
+    let bridge_state = sizing::product(&[
+        BF16,
+        sizing::sum(&[
+            hidden,                       // normalized read
+            hidden,                       // delta
+            hidden,                       // last-write raw stash
+            code,                         // codes
+            sizing::product(&[4, rank])?, // packed (3R) + message (R)
+        ])?,
+    ])?;
+    // candidates + idx + top-K values/ids, then sampled/row/picked/top-k ids.
+    let serial_state = sizing::sum(&[sizing::product(&[16, topk])?, 16])?;
+    let rows = sizing::product(&[max_decode_batch_size, config.block_size])?;
+    let scratch = sizing::product(&[rows, sizing::sum(&[bridge_state, F32, serial_state])?])?;
+
+    sizing::sum(&[weights, scratch])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::tests::dspine_8b_config;
+    use crate::config::tests::plain_dflash_config;
+
+    const MAX_BATCH: usize = 256;
+    /// codebook + read/early-read/write + packed/bias + TG/TSV (843,973,632 B)
+    /// plus the bridge/serial scratch at 256 × 16 rows (126,959,616 B).
+    const DSPINE_FIXED_BYTES: usize = 970_933_248;
+
+    #[test]
+    fn dspine_bridge_is_billed_in_fixed_bytes() {
+        let plain = DFlashMemoryReservation::from_config(&plain_dflash_config(), MAX_BATCH)
+            .expect("plain DFlash reservation");
+        let dspine = DFlashMemoryReservation::from_config(&dspine_8b_config(), MAX_BATCH)
+            .expect("DSpine reservation");
+
+        assert_eq!(dspine.kv_bytes_per_token, plain.kv_bytes_per_token);
+        assert_eq!(dspine.fixed_bytes - plain.fixed_bytes, DSPINE_FIXED_BYTES);
+        assert_eq!(
+            dspine_bytes(&plain_dflash_config(), MAX_BATCH).unwrap(),
+            0,
+            "plain DFlash must not bill DSpine memory"
+        );
     }
 }
