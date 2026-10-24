@@ -44,9 +44,11 @@
 > the v1 full-prompt salt had killed all cross-turn reuse) and the prefill
 > pool retains released prefixes: multi-turn per-turn TTFT is flat instead
 > of linear in history (c1 p50 ~270 ms at every turn; c8 late-turn p50
-> 1,186 → 454 ms), with byte-identical greedy outputs.
+> 1,186 → 454 ms), with byte-identical greedy outputs. The router smoke
+> requires generated text, a successful terminal reason, and `[DONE]` before
+> reporting success.
 >
-> **Last touched:** 2026-08
+> **Last touched:** 2026-10
 
 ## Preparation
 
@@ -726,6 +728,24 @@ verification rejects any draft it misleads. Verified on the same stack:
 The bare-metal P deployment also surfaced #810 (two NCCL copies corrupt
 the TP4 comm when the shared lib dir lacks the unversioned symlink) —
 fixed operationally, hardening tracked there.
+
+### Router smoke completion guard (2026-10)
+
+**Preparation:** Read the handoff failure semantics above and the stack's
+`smoke` entrypoint; reproduce partial text followed by EOF or an error terminal
+through the smoke CLI, then require complete successful protocol termination.
+
+**Execution:** `scripts/glm52_pd_smoke.py`, also used by the stack's `smoke`
+command, now requires text, `finish_reason=stop|length`, and `[DONE]`. A text
+chunk alone cannot establish that decode completed: a failed handoff or decode
+may still leave partial output. Error terminals fail immediately. The command
+keeps draining successful streams through `[DONE]`, including usage events.
+
+**Debrief:** `python3 -m unittest discover -s tests -p test_glm52_pd_smoke.py -v`
+exercises the actual CLI against loopback HTTP fixtures: seven tests pass;
+the unfixed script reported success in five failing cases. These CPU tests
+establish the smoke command's outcome handling. GPU generation, KV transfer,
+and the hardware measurements above were not rerun for this change.
 
 ## Debrief
 
