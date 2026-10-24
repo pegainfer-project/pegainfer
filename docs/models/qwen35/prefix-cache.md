@@ -1,6 +1,6 @@
 # Qwen3.5-4B prefix cache
 
-> **TL;DR:** Qwen3.5-4B uses a GPU-only, content-hashed joint prefix cache: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. KV stays in kvbm's reclaimable inactive pool, while `SnapshotCache` owns snapshot lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests pass, and a 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
+> **TL;DR:** Qwen3.5-4B uses a GPU-only, content-hashed joint prefix cache: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. Snapshots are taken only at budget-sized prefill step ends rounded down to 256 tokens plus one stop at the last boundary of `history_tokens` (or the prompt), so the cache no longer splits cold prefill every 256 tokens. KV stays in kvbm's reclaimable inactive pool, while `SnapshotCache` owns snapshot lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests pass, and a 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
 >
 > **Last touched:** 2026-10
 
@@ -30,7 +30,7 @@ The first version is deliberately narrow:
 
 - GPU-only recurrent snapshot allocator with a fixed load-time byte budget.
 - One complete snapshot contains all linear layers' f32 GDR state, bf16 conv state, and the token position.
-- Snapshots are eligible every 256 prompt tokens. Non-aligned request ends apply normally but do not create snapshots.
+- Snapshots lie on a 256-token grid but are taken only at prefill step ends (see Snapshot interval). Non-aligned request ends apply normally but do not create snapshots.
 - A reusable boundary must have both registered full-attention KV and a GPU-resident recurrent snapshot for the same token prefix.
 - `Qwen35PrefixCache` is the only interface used by the scheduler for joint prefix creation and restore.
 - Restored state is copied into the request's own `RecurrentState`; active requests never modify or directly share a cache slot.
@@ -85,17 +85,25 @@ KV without a matching snapshot is not a Qwen3.5 prefix hit. A snapshot without m
 
 ## Snapshot interval
 
-A snapshot boundary is the token position after a scheduled prefill window has completed all model layers. The current interval is:
+A snapshot boundary is the token position after a scheduled prefill window has completed all model layers. Boundaries lie on a fixed grid:
 
 ```text
 SNAPSHOT_STRIDE_TOKENS = 256
 ```
 
-The stride is a multiple of the 16-token KV block size, so every snapshot key references the lineage hash of a complete registered KV block. The scheduler clamps each request's next window to the next snapshot boundary. With a 900-token prompt, the resulting positions are `256 -> 512 -> 768 -> 900`; only the first three are snapshot candidates.
+The stride is a multiple of the 16-token KV block size, so every snapshot key references the lineage hash of a complete registered KV block. With the cache on, the scheduler (`prefill_step_chunk`) cuts prefill only where the budget and the prompt put a step end (#1077):
+
+- every step uses its full budget, and an unfinished step's end rounds down to a 256-token boundary;
+- one extra stop lands on the last boundary at or below the request's `history_tokens` (the prompt length when it has none), so the next chat turn resumes near where this one ended and never inside the generation prompt;
+- a budget share that cannot reach the next boundary runs unaligned, without a snapshot, rather than stall.
+
+At the default 1,024-token budget a 4,160-token prompt runs `1024 -> 2048 -> 3072 -> 4096 -> 4160`, the same five forwards as with the cache off; a 4,000-token prompt adds its stop: `1024 -> 2048 -> 3072 -> 3840 -> 4000`. Cuts never depend on cache size or slot pressure, so a hit at a step end replays the cold run's cuts exactly and allocation changes only the hit rate. The cost is coverage: a shared prefix that ends between two step ends reuses up to one step less than a snapshot every 256 tokens would. vLLM's `mamba_cache_mode="align"` makes the same trade, and vLLM has removed its every-block `"all"` mode.
+
+Moving a cut moves numerics. Measured on main for #1077 (Qwen3.5-4B, sm_89, 32 greedy tokens), cold runs of one prompt that differ only in cuts (cache on vs off, budgets 512/1024/8192) keep identical tokens but differ by mean 0.11-0.25 and p99 0.6-2.4 in top logprobs, while runs with the same cuts match exactly. In an early experiment (not every shape or path), splitting only the projection GEMMs into 256-token calls removed the difference, pointing to the GEMM shape. Same-cut restores, including a cross-prompt hit whose cuts match, are therefore checked for exact equality. A hit that moves a cut must keep greedy tokens, and no top logprob may move further (p99) than between cold runs that differ only in cuts in the same test; means are not bounded because they count how many logprobs shift by one bf16 step and vary about 2x between cut changes (Qwen3.5-2B on an RTX 3060: cut-change means 0.023-0.043, moved-cut hit 0.048, all p99 at or below 0.25).
 
 The GDR implementation internally tiles work in 64-token chunks, but this is not a snapshot correctness constraint. It handles a partial final tile and applies recurrent state for arbitrary positive sequence lengths. The invariant is “after a successful whole-model window,” not `position % 64 == 0`.
 
-The 256-token interval limits how many large snapshots one prompt creates. Prefixes shorter than 256 tokens intentionally remain cold. Any later interval must still align to complete KV blocks.
+Prefixes shorter than 256 tokens intentionally remain cold. Any later interval must still align to complete KV blocks.
 
 ## Snapshot contents and capacity
 
@@ -177,7 +185,7 @@ struct PrefixBoundaryKey {
 
 A snapshot is created after a whole-model window, not inside per-layer GDR scratch:
 
-1. Clamp the scheduled window to the next 256-token boundary or prompt end.
+1. Cut the scheduled window at a step end (see Snapshot interval) or the prompt end.
 2. Reserve KV blocks with `RequestKv::schedule_prefill`.
 3. Run the full model, updating full-attention KV and request-local recurrent/conv state.
 4. On failure, revert the KV schedule and publish nothing.
@@ -257,6 +265,7 @@ This keeps admission, attachment, and eviction deterministic across ranks while 
 - A prefix hit always leaves at least one prompt token uncached so final prefill can emit the first generated token.
 - Echo requests are rejected before prefix matching.
 - Allocation pressure changes hit rate only, not request output.
+- Prefill cuts depend only on the step budget, the prompt and `history_tokens`, never on cache size or slot pressure.
 - Failed forward or snapshot insertion never publishes a cache key.
 - A KV-only or snapshot-only boundary is never reported as cached tokens.
 - A snapshot may outlive its KV blocks; lookup treats missing KV as a cache miss.
@@ -276,6 +285,7 @@ The implementation acceptance surface should include:
 
 - cache-management tests for snapshot keys, shorter-boundary fallback, duplicate insertion, pinning, and unpinned eviction;
 - scheduler tests for prompts below 256, exactly on boundaries, across multiple boundaries, and with non-aligned tails;
+- step-end cuts: cold output identical across cache sizes, exact same-cut restores (also across prompts), a moved-cut hit within a measured cut-change floor, and the `history_tokens` stop;
 - availability tests for KV-only, snapshot-only, and shorter valid fallback;
 - adapter salt isolation;
 - mixed cold and warm requests in the same prefill/unified step;
@@ -296,13 +306,26 @@ One TP1 first-request run on GPU 1 (RTX 4090) used a fresh engine, a 4,160-token
 | 0 MiB | 354.22 ms |
 | 128 MiB | 438.05 ms |
 
-This one-shot comparison is not a distribution, but the measured `+83.83 ms` (`+23.7%`) is material: enabling the cache trades cold TTFT for lower TTFT when later requests reuse a prefix.
+This one-shot comparison is not a distribution, but the measured `+83.83 ms` (`+23.7%`) is material: enabling the cache traded cold TTFT for lower TTFT when later requests reuse a prefix.
+
+That cost came from the every-256 split, which #1077 replaced with step-end cuts: with the cache on this prompt now runs `1024 -> 2048 -> 3072 -> 4096 -> 4160`, the cache-off cuts, and `cold_output_ignores_cache_budget` checks that its cold output matches the cache-off run exactly.
+
+Same-context A/B for #1077 (2026-10-17): Qwen3.5-2B on one RTX 3060 12 GB (Qwen3.5-4B does not fit its startup reserve), a fresh server per arm with `--max-batch 2`, 10 distinct cold 4,160-token prompts after 2 warmups, then 5 resends of the last one. TTFT is p50 in ms.
+
+| Build | Cache | Cold TTFT | Warm TTFT (hit tokens) | Prefill steps | Snapshots per prompt |
+| --- | --- | ---: | ---: | ---: | ---: |
+| before | off | 732.69 | 763.04 (none) | 5 | 0 |
+| before | 128 MiB | 871.18 | 21.76 (4,096) | 17 | 16 |
+| after | off | 701.59 | 748.57 (none) | 5 | 0 |
+| after | 128 MiB | 716.92 | 24.07 (4,096) | 5 | 4 |
+
+The cache-off arms run identical code, so their 31 ms gap is run-to-run noise. Within each build, enabling the cache cost +18.9% cold TTFT before and +2.2% after, at the same warm hit. Request-time GPU memory above the ready state rose from 37 to 160 MiB with the cache on, in line with cache off (134-195 MiB), because prefill passes are 1,024 tokens again; it stays inside the reserved prefill scratch. A 4B A/B on a 24 GB card is still to be recorded.
 
 ### Warm reuse (2026-08-06)
 
 - **Environment:** local Qwen3.5-4B, RTX 4090s only (GPU 1 for TP1; GPUs 1/2 for TP2). TP1 used CUDA Graphs; TP2 used `--cuda-graph=false`.
 
-Qwen3.5 reuses the largest 256-token boundary strictly below the prompt length. This table compares cache-off cold TTFT with cache-on warm TTFT p50 for single-token generation.
+A repeated prompt reuses its latest snapshot strictly below the prompt length; for these lengths that is the largest 256-token boundary below it. This table compares cache-off cold TTFT with cache-on warm TTFT p50 for single-token generation.
 
 | Prompt tokens | Cached tokens | TP1 | TP1 reduction | TP2 | TP2 reduction |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -328,10 +351,12 @@ This table summarizes behavior under concurrency, mixed load, and decode batchin
 | TP1 mixed load | Baseline ITL p50/p99 `12.03/12.25 ms`; mixed ITL `12.03/36.12 ms`. After initial insertion, 4,096-token injections hit 3,840 tokens with `41.42--51.00 ms` prefill and no warnings. |
 | Decode TP1 vs TP2 | At context 4,096/batch 1, TP1/TP2 TPOT is `13.08/12.47 ms`; at batch 4 it is `13.74/48.76 ms`. TP2 batch decode needs a separate runtime optimization pass; this run disables CUDA Graphs. |
 
+These warm runs predate the step-end cuts (#1077). The cached lengths in the first table still hold, because each of those prompts stops on the largest boundary below it, but a resent prompt without `history_tokens` that ends exactly on a step end, like the 4,096-token injections, now resumes from the previous step end (3,072 instead of 3,840).
+
 **Conclusion**
 
 - **Core performance gains**
-  - Prefix caching is an explicit cold/warm trade: the one-shot 4,160-token cold request above was 23.7% slower with the cache enabled.
+  - Before #1077, prefix caching traded cold TTFT for warm TTFT (the one-shot 4,160-token cold request above was 23.7% slower with the cache enabled); step-end cuts give that prompt the cache-off forwards back.
   - Warm TTFT improves with prefix length: at 4,160 prompt tokens it falls by 94.3% on TP1 and 95.1% on TP2.
   - For 128-token outputs, the same long prompt reduces E2E latency by 15.4% on TP1 and 21.1% on TP2; steady decode TPOT is effectively unchanged.
   - The benefit remains under TP1 concurrency and mixed load; warm injections hit 3,840 tokens with 41--51 ms prefill and no warnings.
@@ -345,6 +370,8 @@ This table summarizes behavior under concurrency, mixed load, and decode batchin
 - pinned-CPU snapshot offload and two-tier LRU;
 - request-end snapshots for non-aligned prompt lengths;
 - workload-adaptive or per-model snapshot stride;
+- a snapshot slot reserved for a shared system prompt (its own policy and issue if a workload needs it);
+- snapshots at the 256-token boundaries inside a step, which need shape-stable projection GEMMs (fixed 256-token calls matched the every-256 reference in #1077's experiment);
 - snapshot compression or reduced-precision state;
 - cross-worker/P-D transfer of hybrid state;
 - sharing snapshot infrastructure across other hybrid model lines.

@@ -537,14 +537,106 @@ fn immediate_prefill_drop_failure_publishes_only_terminal_error() {
     }
 }
 
+/// Step ends of a lone prompt whose every step gets the whole budget.
+fn prefill_step_ends(
+    prompt_len: usize,
+    budget: usize,
+    history_tokens: Option<usize>,
+    stride: Option<usize>,
+) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut cursor = 0;
+    while cursor < prompt_len {
+        let chunk = budget.min(prompt_len - cursor);
+        cursor += prefill_step_chunk(cursor, chunk, prompt_len, history_tokens, stride);
+        ends.push(cursor);
+    }
+    ends
+}
+
 #[test]
-fn prefix_cache_chunking_stops_at_snapshot_boundaries() {
+fn prefix_cache_steps_end_at_budget_boundaries() {
     let stride = Some(crate::prefix_cache::SNAPSHOT_STRIDE_TOKENS);
-    assert_eq!(clamp_prefill_chunk(0, 900, stride), 256);
-    assert_eq!(clamp_prefill_chunk(256, 644, stride), 256);
-    assert_eq!(clamp_prefill_chunk(512, 388, stride), 256);
-    assert_eq!(clamp_prefill_chunk(768, 132, stride), 132);
-    assert_eq!(clamp_prefill_chunk(0, 900, None), 900);
+    // The last boundary is already a step end: the cache-off forwards.
+    let cache_off = prefill_step_ends(4160, 1024, None, None);
+    assert_eq!(cache_off, [1024, 2048, 3072, 4096, 4160]);
+    assert_eq!(prefill_step_ends(4160, 1024, None, stride), cache_off);
+    // One extra stop at the prompt's last boundary.
+    assert_eq!(
+        prefill_step_ends(4000, 1024, None, stride),
+        [1024, 2048, 3072, 3840, 4000]
+    );
+    assert_eq!(
+        prefill_step_ends(4000, 1024, None, None),
+        [1024, 2048, 3072, 4000]
+    );
+    assert_eq!(prefill_step_ends(576, 1024, None, stride), [512, 576]);
+    // `history_tokens` keeps the stop out of the generation prompt; oversized hints clamp.
+    assert_eq!(
+        prefill_step_ends(4100, 1024, Some(4094), stride),
+        [1024, 2048, 3072, 3840, 4100]
+    );
+    assert_eq!(
+        prefill_step_ends(4100, 1024, None, stride),
+        [1024, 2048, 3072, 4096, 4100]
+    );
+    assert_eq!(
+        prefill_step_ends(576, 1024, Some(10_000), stride),
+        [512, 576]
+    );
+    // Unfinished steps round down; boundary-length and short prompts run whole.
+    assert_eq!(
+        prefill_step_ends(2112, 1000, None, stride),
+        [768, 1536, 2048, 2112]
+    );
+    assert_eq!(prefill_step_ends(512, 1024, None, stride), [512]);
+    assert_eq!(prefill_step_ends(100, 1024, None, stride), [100]);
+    // A budget below the stride still progresses, landing on boundaries where it can.
+    assert_eq!(
+        prefill_step_ends(512, 128, None, stride),
+        [128, 256, 384, 512]
+    );
+}
+
+#[test]
+fn take_prefill_chunks_cuts_each_request_on_its_own_prompt() {
+    let stride = Some(crate::prefix_cache::SNAPSHOT_STRIDE_TOKENS);
+    let at = |id: u64, prompt_len: usize, history_tokens: Option<usize>, cursor: usize| {
+        let mut request = test_request("prefilling", vec![1; prompt_len], 2);
+        request.history_tokens = history_tokens;
+        PrefillingRequest35 {
+            req: QueuedRequest {
+                id: FrontendRequestId::new(id),
+                request,
+            },
+            backend_state: PrefillBackendState::Tp {
+                request_id: RequestId::new(id),
+            },
+            cursor,
+            step_chunk: 0,
+        }
+    };
+    let step_chunks = |mut prefilling: Vec<PrefillingRequest35>| {
+        take_prefill_chunks(&mut prefilling, 1024, stride)
+            .iter()
+            .map(|p| p.step_chunk)
+            .collect::<Vec<_>>()
+    };
+    // The request's own hint places its stop; the step holds the whole budget.
+    assert_eq!(
+        step_chunks(vec![at(0, 4100, Some(4094), 3072), at(1, 4160, None, 0)]),
+        [768]
+    );
+    // A finished chat turn leaves a 764-token share that rounds down to 512.
+    assert_eq!(
+        step_chunks(vec![at(0, 4100, Some(4094), 3840), at(1, 4160, None, 0)]),
+        [260, 512]
+    );
+    // A 124-token share cannot reach the next boundary and runs unaligned.
+    assert_eq!(
+        step_chunks(vec![at(0, 900, None, 0), at(1, 4160, None, 256)]),
+        [768, 124]
+    );
 }
 
 #[test]
