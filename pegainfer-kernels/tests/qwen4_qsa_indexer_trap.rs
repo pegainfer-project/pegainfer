@@ -43,11 +43,15 @@ fn every_trap_runs_in_its_own_process() {
             .env("PEGAINFER_REQUIRE_GPU", "1")
             .output()
             .unwrap_or_else(|err| panic!("spawn {case}: {err}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // A filter that matches nothing exits 0 with `0 passed`, so the exit
+        // status alone would turn every case green without reaching a trap.
         assert!(
-            output.status.success(),
-            "{case} must end in the kernel's trap, but its child process failed: {}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            output.status.success() && stdout.contains("1 passed"),
+            "{case} must run exactly one passing child test and end in the kernel's trap, \
+             but its child process failed: {}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
         );
         println!("{case}: trapped in its own process");
     }
