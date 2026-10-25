@@ -1,6 +1,6 @@
 # Calibration campaigns and proxy evidence
 
-> **TL;DR:** Qualified paired training now produces an immutable, loadable surface profile without a validation report. The driver and offline reader bind its selection back to verified training and reference evidence. Decode keeps initial total num_ctx, full common windows and signed request values. Final held-out reporting remains C7; cached migration remains C8.
+> **TL;DR:** Complete cold/decode campaigns connect qualified training, immutable profiles and source-verified held-out raw TTFT reports. A five-knot prefill recollection now has 462 requests and six fresh held-out cells: cold relative TTFT error p50 is 7.22%, while queueing p95 remains 199.14%. Mixed stays additive; evidence completeness does not approve accuracy. Cached migration remains C8.
 >
 > **Last touched:** 2026-10
 
@@ -9,7 +9,7 @@
 - Read `docs/index.md`, `docs/conventions/migration-defense.md`, the campaign compiler, request-plan/schema/storage modules, and every replaced execution module.
 - The previous collector inferred identity from result positions and used bench timing arrays. Those arrays cannot establish output token arrival, complete stream duration, or request attribution.
 - The approved C2 scope is cold-prefill/decode collection. Cached-prefix's existing independent tools, tests and required storage APIs remain until C8 replaces them.
-- C3 replaces the retained `paired.py` assessment with plan/measurement-v3 pairing in `pairing.py` and removes the replaced module. Replay's report, error-statistics and profile-validation rules, and the metric helpers it still imports, remain until their C7 migration. Removing an execution caller alone does not establish replacement of its domain rules.
+- C3 replaces the retained `paired.py` assessment with plan/measurement-v3 pairing in `pairing.py` and removes the replaced module. C7 transfers replay's report, error-statistics and profile-validation defenses to the current source validators and final completeness gate, then removes the replaced metric helpers. Removing an execution caller alone does not establish replacement of its domain rules.
 - C5 replaces the old manifest/result fit consumer with fully verified train normalization. It retains all signed paired values and gates the complete cell representative; it does not restore the former MAD-based attribution filter or old-format paired/replay tests.
 - C2 implementation audit requested by the user: review current working-tree acquisition, parser/converter, recovery/store and profile binding against the approved contract; reproduce suspected failures with local controlled endpoints and disposable artifacts under `/tmp`. Record confirmed findings and limits before making production fixes. Retain the user's test-file deletions.
 
@@ -34,7 +34,7 @@ Raw upstream reads are recorded before parsing. UTF-8/SSE framing may cross read
 
 A trailing CR retains its own read timestamp while awaiting an optional LF. If LF follows, the boundary uses that LF's read; otherwise the saved CR time applies, including at EOF. Waiting for the next byte no longer assigns a later read time to a complete CR-only event.
 
-The observer source map freezes 18 acquisition/compiler/reference inputs: the C4 set plus baseline preparation, shared pairing, normalization and target statistics. Plans require the complete source set and valid digests. Runtime rechecks it before each attempt or sealed reuse, after collection and before sealing; measurements bind the same observer digest as their execution entry. A mismatch requires recompilation and new acquisition in a new artifact root. Historical evidence is never relabelled after source changes.
+The observer source map freezes 22 execution inputs, including the fitter and C7 replay/report/acceptance implementations. Plans require the complete source set and valid digests. Runtime rechecks it before each attempt or sealed reuse, after collection and before sealing; measurements bind the same observer digest as their execution entry. Reports also enforce the frozen report and validation-normalizer sources. A mismatch requires recompilation and new acquisition in a new artifact root. Historical evidence is never relabelled after source changes.
 
 The proxy uses a bounded evidence queue, limits open files and flushes/fsyncs before each batch transition and final sealing. Queue overflow, storage failure or dropped evidence fails the attempt. The original bench's unconditional optional `/metrics` reads are recorded and answered locally with 404; they are not forwarded to target or used as formal metrics. This behavior is part of observer identity.
 
@@ -44,7 +44,7 @@ The proxy uses a bounded evidence queue, limits open files and flushes/fsyncs be
 
 `campaign.py run` calls `plan_driver.run_campaign`, which opens `artifacts.ExecutionStore`. The store writes `execution_index.json` atomically when an attempt begins and updates it when the attempt finishes; it is not a bench/proxy output or a compilation artifact.
 
-Timeout/cancellation kills and reaps the owned bench process group; parent-death signaling also terminates bench if the driver is killed directly, and the interrupted attempt is recovered in a new directory; stdout/stderr are written during execution and retained on failure. The driver owns the bench and proxy lifecycle. Already-running target/simulator servers remain caller-owned.
+Timeout/cancellation kills and reaps the owned bench process group; parent-death signaling also terminates bench if the driver is killed directly, and the interrupted attempt is recovered in a new directory; stdout/stderr are written during execution and retained on failure. The driver owns the bench and proxy lifecycle. `campaign.py run` keeps existing servers caller-owned; the full-stage `execute` entry owns the profile servers it launches, while the existing target remains caller-owned.
 
 For profile-backed zero_cost/sim, supply `--server-pid VARIANT=PID`. C2 verifies the local process's profile argument, profile/calibration digests, model, scheduler and start time. Driver and server must share a network namespace. The configured endpoint must explicitly use IPv4 `127.0.0.1`; every matching listener at that address or `0.0.0.0` must belong to the PID. Same-port IPv6 listeners are conservatively rejected because IPv6/dual-stack attestation is outside this scope. Bindings record namespace and listener address/port/inode, and are rechecked before each attempt or sealed reuse, after collection and before sealing. `localhost` is rejected with a request to use the explicit IPv4 address; target endpoints retain their existing rules. The zero_cost attempt pins its cell and immutable preparation-list digest. The live profile must match that cell’s prepared profile/manifest bytes and runtime; the driver resolves and verifies the selection before each binding check. This binding requires Linux `/proc`; remote/cross-namespace profile attestation is not implemented. A pending fitted sim profile does not prevent compilation or target/zero-cost collection.
 
@@ -63,9 +63,9 @@ Cold targets with caching enabled require an explicit reset lifecycle; a false/u
 | Per-request raw data | Actual body in `request.json` and binary files; `reads.jsonl` records byte ranges/read times, `events.jsonl` records classified SSE events, `terminal.json` records HTTP/finish/DONE/EOF/errors and upstream attempts. Raw times are monotonic nanoseconds; measurement timestamps use seconds and durations use milliseconds. |
 | `bench-result.json` / runtime profiles | Original bench JSON remains unchanged and diagnostic only. Rust profile schema 3 and calibration manifest schema 2 remain unchanged. No normalized/fitted/acceptance JSON was generated by C2. |
 
-New execution rejects old campaign/plan/measurement versions instead of adapting them. Restored replay/report rules retain their domain contracts until C3-C7 migration; they are not connected to measurement v3 and do not provide a new-to-old wrapper.
+New execution and reporting reject old artifact versions instead of adapting them. Replay/report now consume measurement-v3 evidence through the existing exact-pairing and normalization validators, with no new-to-old wrapper.
 
-`stream_chunk_tpot_ms` was a mean interval between content-bearing SSE events, without proving one event equals one output token. It is removed from the new measurement contract because a multi-token event needs token-count weighting. Request diagnostic `tpot_ms` uses `(last_output_event_time - first_output_event_time) / sum(right_event_output_token_counts)`; the first event's tokens are excluded. This diagnostic does not replace C4's common-window fit source. Restored reporting modules may still mention the old field pending their later migration; the new converter does not emit it.
+`stream_chunk_tpot_ms` was a mean interval between content-bearing SSE events, without proving one event equals one output token. It is removed from the new measurement and reporting contracts because a multi-token event needs token-count weighting. Request diagnostic `tpot_ms` uses `(last_output_event_time - first_output_event_time) / sum(right_event_output_token_counts)`; the first event's tokens are excluded. This diagnostic does not replace C4's common-window fit source.
 
 The retained production smoke outputs are under `/tmp/c2-production-20261015-final-process/`: `validation-summary.json` summarizes validation, `artifacts/` contains compiled inputs, plans, profiles, execution index and raw bundles; `ab/` and `ab.json` contain direct/proxy comparisons; `*.server.log`, `*.server.json` and `outcome.json` retain server/execution context. The sim profile is a functional transport smoke input, not a fitted result. Test methods use `TemporaryDirectory`, so their temporary bundles are cleaned up; suite logs are retained separately. These `/tmp` paths are local temporary evidence, not a durable repository archive.
 
@@ -222,14 +222,71 @@ The executed materialization and post-stop verification entry points were:
 
 Local orchestration is `/tmp/c6_production.py`; its log retains the initial helper-only failure after successful acquisition. The standalone final verifier above passed. C7 still owns complete held-out reporting and accuracy/queueing acceptance; C6 did not collect the original 11 sealed-test cells or select a model using their results.
 
+## Held-out reporting and full-stage execution (C7)
+
+`campaign.py execute` uses an existing target and a named local sim binary/model metadata path. It collects the complete training target scope, prepares references from training only, launches one reference profile server per pending cell and collects references through the existing driver. It then saves successful normalized training and fit, materializes the fitted profile, records an immutable training/profile snapshot, and collects held-out target/zero_cost/sim before writing the final report. Every stage stops on failure; a later explicit invocation may resume after verifying sealed sources offline, without requiring historical server PIDs. Profile-server commands, logs and exits are retained under `servers/`. No independent acquisition client or parser is added.
+
+Training decode keeps A qualification at sealing and reading. All non-train windows are recomputed by the same algorithm and retained as diagnostics; a zero reference can have no positive window and null TPOT while still providing complete TTFT evidence. Such observations cannot become fit inputs. Request success, terminal/token/content/arrival evidence, exact three-role pairing and source/profile binding remain mandatory. This distinction uses the frozen plan split and new observer identity; it does not relabel old evidence or change the statistics formula/schema.
+
+`report.py` and `replay.replay_campaign` consume the current validation scope, which includes every declared non-train cold/decode cell and preserves its original split. Report schema 2 is `held_out_replay_report`. Each matched request supplies raw target and sim TTFT; absolute error is their absolute difference, and relative error divides by positive target raw TTFT. Per-cell and aggregate actual/predicted/absolute/relative statistics contain p50/p95/p99. Reference timing stays diagnostic; there is no second baseline subtraction, offline fitted prediction, held-out model selection or mixed residual correction.
+
+`acceptance.py` gates evidence completeness: exact required cells, a nonempty C>1 held-out scope, all three roles, complete percentiles, consistent expected/matched/cell/aggregate counts, and verified loaded profile/selection. Missing, unsupported and domain-failed execution cannot succeed. Required cached cells in either train or validation remain explicitly deferred and prevent whole-report success until C8; train cells never enter the held-out samples or counts. `succeeded` means complete evidence; `accuracy_acceptance=not_assessed` declares that no business error threshold has been applied. Missing replay yields `replay_required` or `partial` and does not block fitting or profile generation.
+
+The report embeds a pinned normalized snapshot with plan, generator/tokenizer/bench/observer identities and every selected role's raw/workload/profile references. Verification replays existing source validators and recomputes statistics; changing saved values or rehashing edited evidence does not authorize success. Complete reports remain verifiable after servers stop or later acquisition changes the mutable execution index. Output writing protects raw, plans, references, fitted bundle and external training artifacts. The original publication coverage entry points retain their defense and require current complete verified reports; C7 adds no precision threshold or publication workflow.
+
+The former metric-pairing helpers and `metrics.py`, whose sole production consumer was replay, are removed after this handoff. Rust predictor, worker and scheduler are unchanged. Final-source C7 validation uses the independent root `/home/mgj/artifacts/c7-production-20261026-verified/`. The earlier `c7-production-20261026-final/` root is retained as development evidence after the training-cached gate was completed. Neither root claims the original 11 sealed-test cells or the C8/C9 cached smoke are complete.
+
+### C7 production validation (2026-10-26)
+
+The original C7 acceptance run passed 60/60 methods in 398.991s, including 10 added methods across five test files, before the user-directed test reduction recorded below. Release sim build, Python syntax, cargo formatting and diff checks passed. Test fixtures cover source/gate behavior; the independent production campaign supplies actual execution evidence. No Rust source or tests changed.
+
+The new root uses cold inputs 64/2048 with output1, decode B=1/4 × initial total context=256/2048 with output8, and a sealed-test held-out B=2/total context=1024 with output8. Every cell/role uses warmup1/measured2. Scheduler slots4, whole prefill, token budget/context ceiling8192 and cache off match the frozen configuration. Qwen3-4B target ran on RTX 3090 GPU2 with vLLM 0.30.0, Torch 2.13.0+cu130/CUDA13.0, half/eager/TRITON_ATTN.
+
+All 15 cell/role acquisitions sealed on attempt1: 90 requests (30 warmup, 60 measured), 45 original-bench invocations, 24 measured train pairs and four three-role held-out pairs. All 16 measured training decode batches qualified; the minimum window was 133.929ms. Both held-out zero-reference windows were non-positive and retained as unqualified diagnostics with null TPOT; their complete raw TTFT evidence remained valid. No held-out measurements entered fit or reference preparation.
+
+The complete report is `artifacts/reports/validation.json`, with `status=succeeded` and `accuracy_acceptance=not_assessed`:
+
+| Held-out TTFT | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| Target raw ms | 108.902 | 146.899 | 147.290 |
+| Sim raw ms | 157.923 | 217.520 | 217.552 |
+| Per-request absolute error ms | 96.413 | 147.491 | 148.039 |
+| Per-request relative error | 114.153% | 210.762% | 212.999% |
+
+These are four matched requests from two measured repeats. The same key can fall in different early/late first-token groups across roles: target index0 measured 144/147ms while sim index0 measured about98ms; index1 target measured69/74ms while sim measured about217ms. Errors are computed before percentile aggregation, preserving key attribution rather than reordering requests by latency. The evidence does not isolate the source of the model gap, and no model or pairing policy was tuned using these results.
+
+Before collection, missing replay yielded `replay_required` without creating an execution index. A live wrong profile was rejected without changing the index. A separate diagnostic request with4096 prefill tokens received HTTP500, with the actual worker log identifying the4096 shape outside the2048 profile domain. All owned target/reference/sim processes stopped; GPU2 returned to1MiB. Full-stage offline resume sent no requests or new attempts, regenerated identical report bytes, and retained the training/profile snapshot. The stopped-state verifier rechecked the complete report, normalized training, exact fit, reference preparation, selected profile and all15 role/cell bundles.
+
+Evidence includes `validation-summary.json`, `python-tests.log`, `static-checks.log`, `rust-build.log`, `production.log`, `offline-verification.log`, saved commands/process records and indexed raw bundles. The final tests finish before any formal acquisition; the target may initialize while regression runs, with an explicit success-receipt gate. The first helper launch encountered an old GPU lock file's write permissions before collection; read-only locking resolved it. A later final-review fix extended deferred-cached gating to train, so final sources were recompiled and fully recollected in this new root.
+
+### Prefill density recollection (2026-10-26)
+
+The approved follow-up uses the existing production pipeline without changing Rust/Python implementation or the mixed formula. Cold train now measures inputs `[64,256,512,1024,2048]`, output1; decode train is recollected at B1/4 × initial total context256/2048, output8. All cells use warmup2/measured5. Seeds are 20261026 for train and 20261027 for held-out; plans and request sets were frozen before acquisition. The new root is `/home/mgj/artifacts/c7-prefill-dense-20261026/`.
+
+The resulting prefill costs are 52.239/61.555/76.089/133.952/281.212 ms. Decode remains a complete B1/4 × S256/2048 surface, with newly collected costs 24.398/23.899/27.611/28.506 ms. Mixed remains `composition_additive`, intercept0; no held-out residual, selection or parameter adjustment was applied.
+
+Six fresh held-out cells cover cold P384/768, B2 with per-request P384/768, and B3 with P384/640. Their entire decode trajectories stay inside the fitted component domains. The report keeps exact logical-key pairing and computes per-request raw TTFT errors before aggregation:
+
+| Fresh held-out group | Measured pairs | Relative error p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Cold | 10 | 7.224% | 20.913% | 22.870% |
+| Queueing | 50 | 24.280% | 199.144% | 210.613% |
+| All | 60 | 20.026% | 192.515% | 209.746% |
+
+All 15 cells/36 cell-role acquisitions sealed on attempt1: 252 original-bench invocations, 462 requests (132 warmup/330 measured), 75 train pairs and 60 held-out pairs. All 40 measured train decode windows qualified, minimum 138.392 ms. The four existing fit tests and two profile tests passed; no test methods were added. Raw recomputation agrees with every official sample and percentile.
+
+The remaining error is material. Nine of 20 queueing batches have different first upstream-dispatch identities across target/sim; ten have different first-token identities. Dispatch does not establish engine admission order. Sorting each batch is diagnostic only: queueing error still has p50/p95 of 13.560%/43.255%, and never replaces the formal 24.280%/199.144%. Short-prompt training is also variable: effective P64 spans 49.736–62.882 ms and P256 spans 40.098–61.962 ms; all repeats remain included. No unmeasured GPU-clock explanation is asserted.
+
+The report is complete with `accuracy_acceptance.status=not_assessed`. These fresh shapes/seeds differ from the original C7 four-request held-out and the earlier controlled diagnostic; their percentages are not a same-context A/B. Stopped-state resume sent no new requests or attempts, the regenerated report is byte-identical, and the training/profile snapshot is unchanged. All owned servers stopped and temporary runners were removed. The original 11 held-out cells and C8/C9 cached scope remain uncollected. Configuration, commands, source snapshot, raw streams, fitted bundle, official report and independent analysis are retained in the new root; production code and old evidence remain unchanged.
+
 ## Migration defense handoff
 
 | Previous defense / failure mode | Current owner |
 | --- | --- |
 | Duplicate per-request/surface grids, inconsistent fit centers and row counts presented as repeats | One total-num_ctx grid in `manifest._matrix_cells`; `steady_state` request/batch/repeat means shared by both numerical candidates; explicit complete-batch validation |
-| Statistically unusable measured requests sealed and then skipped forever | Shared pre-seal qualification, failed attempt diagnostics and a fresh full-plan retry; sealed reuse recomputes the same windows |
+| Statistically unusable training requests sealed and then skipped forever | Shared train pre-seal qualification, failed attempt diagnostics and a fresh full-plan retry; sealed reuse recomputes the same windows. Held-out windows remain verified diagnostics |
 | New sidecars bypass raw inventory or create digest cycles | Separately pinned measurement/statistics references, complete raw inventory and canonical offline recomputation |
-| Warmup enters fitted statistics or fails because it lacks a common window | Original all-phase request/evidence checks retained; only measured batches gate window qualification and enter summaries |
+| Warmup enters fitted statistics or fails because it lacks a common window | Original all-phase request/evidence checks retained; only train measured batches require A windows for fitting |
 | Request count, phase/repeat and duplicate attribution | Immutable plan, proxy registration/at-most-once reservation, measurement key validation |
 | Partial streams, metadata counted as output, usage/count disagreement | Incremental SSE parser, terminal evidence, proxy converter and schema |
 | Sealed overwrite, artifact tampering, interrupted-directory reuse | Separate execution store, exclusive lock/allocation and digest verification |
@@ -238,13 +295,15 @@ Local orchestration is `/tmp/c6_production.py`; its log retains the initial help
 | Cross-role key agreement, successful roles and sealed entries | `pairing.index_plan_measurements`/`pair_plan_measurements` plus `artifacts.sealed_reference`; replacement verified by new pairing/normalize tests, then `paired.py` removed |
 | Old normalize raw-result hashes, duplicate keys and warmup exclusion | Current compiler/attempt reader, exact full logical-key join and measured-only output; tests in `test_pairing.py`/`test_normalize.py` |
 | Content/transport attribution, fixed batches and recursive provenance | `pairing.validate_attempt_evidence`, shared body validator, pinned attempt snapshot and indexed raw checks; production bench integration and semantic fault cases |
-| Old normalize baseline negative-delta/dispersion filtering | New output cannot enter old fitter (schema 3); qualification and negative/unstable-delta policy explicitly deferred to C5, not silently inherited as pairing policy |
+| Old normalize baseline negative-delta/dispersion filtering | Current normalized schema 4 and fit schema 2 require qualified complete train, signed request-level values and the verified C5 metric-specific reference formula |
 | Old mixed-overlap/cached-hit normalize branches | Mixed is outside the current compiler contract; cached explicitly deferred. Independent `cached_prefix_collect` hit/alignment/uncached-tail validation remains until C8 |
-| Profile/selection/publication lineage, errors, queueing and coverage | Restored replay validation/prediction/report rules; C7 still owns new-evidence integration and report migration |
+| Profile/selection/publication lineage, errors, queueing and coverage | Existing profile/selection and exact source validators feed C7 raw TTFT reports; acceptance rebuilds required scope/counts, and publication coverage requires a verified complete report |
 | Old profile report prerequisite and report-derived candidate scoring | Replaced by verified complete train + exact fit recomputation and fixed surface selection; held-out/report bytes are not materialization inputs |
 | Old profile digest/model-domain checks and separate file writes | Shared calibration identity, strict runtime axes/units, atomic immutable fitted bundle, and shared live/offline selection-to-training verification; scheduler and runtime OOD rejection retained |
 
 ## Execution Log
+
+- 2026-10-26, C7 test review: removed six requested methods (previous list numbers 2/3/4/5/7/10) and their unused imports. Four C7-added methods remain across acceptance/replay/report. All 54 retained suite methods passed (253.242s wall); cargo formatting and diff checks passed. Production code and frozen acquisition evidence are unchanged; the 60-method result above records the original acceptance run. Log: `/home/mgj/artifacts/c7-test-reduction-20261026/python-tests.log`.
 
 - 2026-10-19, requested test reduction: removed the empty/non-positive/missing-request window failure test, warmup-window isolation test and measured-window failure/retry test from `test_steady_state.py`, plus their unused imports. Its three remaining methods pass, and all 43 retained suite methods passed in 31.628s; log: `/tmp/c4-amend-tests-20261019.log`. Production statistics/sealing behavior and the retained C4 acquisition artifacts are unchanged. The earlier 46-method result below records the original C4 acceptance run.
 
@@ -268,7 +327,7 @@ Local orchestration is `/tmp/c6_production.py`; its log retains the initial help
 
 ## Debrief
 
-C2 writes raw evidence and measurements; C3 now verifies complete cold/decode scopes and pins their sealed-attempt provenance. File digests alone do not establish plan/content/transport agreement: C3 checks both the indexed bytes and the cross-file identities and commands. Scope and source snapshots must be separate from the evolving execution index so later collection does not invalidate valid training inputs. C4 now extracts and validates common windows, gates sealing, and exposes pinned target statistics. C5 now prepares and binds references and verifies paired training before numerical fitting. The next steps are C6 fitted-profile lifecycle, C7 held-out reporting and C8 cached integration. Partial-ID false success remains accepted and unfixed. Old artifact compatibility is absent; unreplaced replay and cached domain rules remain, while paired assessment was removed only after its defenses acquired new owners.
+C2 writes raw evidence and measurements; C3 verifies complete cold/decode scopes and pins their sealed-attempt provenance. File digests alone do not establish plan/content/transport agreement: the validators check both indexed bytes and cross-file identities and commands. Scope and source snapshots remain separate from the evolving execution index. C4 validates training windows; C5 prepares references and paired training; C6 materializes immutable fitted profiles; C7 connects full-stage execution and held-out raw TTFT reporting. C7 evidence completeness passed, while measured TTFT error remains large. Cached integration remains C8; the original11-point held-out campaign still needs wider training coverage and later full collection. Partial-ID false success remains accepted and unfixed. Replaced replay/metric paths are removed after their defenses acquire current owners; cached domain rules remain until migration.
 
 ## C2 audit findings (2026-10-15)
 

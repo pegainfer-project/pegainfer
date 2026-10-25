@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import signal
 import socket
 import struct
 import time
 import uuid
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 import aiohttp
 
@@ -23,6 +25,61 @@ from probe import (probe_endpoint, profile_endpoint, profile_listener_matches, r
 from steady_state import compute_statistics
 from vllm_bench import render_command, run_command
 from vllm_bench_collect import convert_evidence
+
+
+@asynccontextmanager
+async def profile_server(root: Path, variant: dict, *, binary: Path, model_path: Path,
+                         timeout: float = 60):
+    """Own one local profile server and retain its exact launch/exit evidence."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise EvidenceError('server startup timeout must be finite and positive')
+    endpoint = profile_endpoint(variant['identity']['endpoint'])
+    binary, model_path = binary.expanduser().resolve(), model_path.expanduser().resolve()
+    if file_reference(model_path / 'config.json')['sha256'] != variant['identity']['model_config_sha256']:
+        raise EvidenceError('server model metadata differs from frozen model identity')
+    profile = checked_path(root, variant['profile_path'])
+    flags = variant['server_flags']
+    reserved = ('--profile', '--model-id', '--model-path', '--port')
+    if any(flag.split('=', 1)[0] in reserved for flag in flags):
+        raise EvidenceError('managed profile server flags override its bound endpoint/model/profile')
+    argv = [str(binary), '--model-path', str(model_path), '--model-id', variant['identity']['model'],
+            '--port', str(endpoint.port), '--profile', str(profile), *flags]
+    directory = root / 'servers' / uuid.uuid4().hex
+    directory.mkdir(parents=True)
+    _write_atomic(directory / 'command.json', {'argv': argv, 'executable': file_reference(binary),
+                                             'profile': file_reference(profile)})
+    environment = {k: v for k, v in os.environ.items() if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
+    with (directory / 'server.log').open('wb') as log:
+        child = await asyncio.create_subprocess_exec(*argv, stdout=log, stderr=asyncio.subprocess.STDOUT,
+                                                     env=environment, start_new_session=True)
+        try:
+            _write_atomic(directory / 'started.json', {'pid': child.pid})
+            deadline = time.monotonic() + timeout
+            while True:
+                if child.returncode is not None:
+                    raise EvidenceError(f'profile server exited ({child.returncode}); see {directory}')
+                try:
+                    await asyncio.to_thread(probe_endpoint, variant['identity']['endpoint'],
+                                            expected_model=variant['identity']['model'], timeout=min(1, timeout))
+                    profile_binding(root, variant, child.pid)
+                    break
+                except (OSError, ValueError, RuntimeError) as exc:
+                    if time.monotonic() >= deadline:
+                        raise EvidenceError(f'profile server not ready; see {directory}: {exc}') from exc
+                    await asyncio.sleep(0.1)
+            yield child.pid
+        finally:
+            if child.returncode is None:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(child.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    await child.wait()
+            _write_atomic(directory / 'stopped.json', {'pid': child.pid, 'returncode': child.returncode})
 
 
 def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:

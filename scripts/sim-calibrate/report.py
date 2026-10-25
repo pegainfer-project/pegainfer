@@ -1,552 +1,235 @@
 #!/usr/bin/env python3
-"""Compare fitted candidates and report held-out residual diagnostics."""
-
+"""Report paired held-out target/sim raw TTFT, with pinned source verification."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
-import statistics
+import math
 import sys
 from pathlib import Path
-from typing import Any, Callable
 
-from fit import (
-    FitError,
-    _error_metrics,
-    evaluate_additive,
-    evaluate_cached_surface,
-    evaluate_piecewise,
-    evaluate_surface,
-)
+from acceptance import assess_report
+from artifacts import (_read_json, checked_path, file_reference, fitted_bundle_paths, load_compiled_bundle,
+                       write_derived_document)
+from manifest import sha256_json
+from normalize import (NORMALIZER_SOURCES, _assemble_document, _cell_result,
+                       normalize_campaign, verify_normalized)
+from pairing import campaign_scope
+from profile import verify_fitted_bundle
 
-
-SCHEMA_VERSION = 1
-SPLITS = ("train", "threshold_validation", "held_out_mixed", "sealed_test")
-
-
-def _read_json(path: Path) -> tuple[dict[str, Any], str]:
-    payload = path.read_bytes()
-    value = json.loads(payload.decode("utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError(f"JSON artifact must be an object: {path}")
-    return value, hashlib.sha256(payload).hexdigest()
+KIND = 'held_out_replay_report'
+SCHEMA_VERSION = 2
+REPORT_SOURCES = ('report.py', 'replay.py', 'acceptance.py')
 
 
-def _percentile(values: list[float], quantile: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * quantile
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
-
-
-def _percentiles(values: list[float]) -> dict[str, float | None]:
-    return {
-        f"p{int(quantile * 100)}": _percentile(values, quantile)
-        for quantile in (0.50, 0.95, 0.99)
-    }
-
-
-def _cell_summary(
-    actual: list[float],
-    predicted: list[float],
-    *,
-    ood: list[dict[str, Any]],
-    uncertain: list[dict[str, Any]],
-    cell: dict[str, Any],
-) -> dict[str, Any]:
-    if actual:
-        status = "measured"
-    elif ood:
-        status = "out_of_domain"
-    elif uncertain:
-        status = "uncertain"
-    else:
-        status = "no_observations"
-    return {
-        "status": status,
-        "cell_id": cell.get("cell_id"),
-        "name": cell.get("name"),
-        "split": cell.get("split"),
-        "kind": cell.get("kind"),
-        "sample_count": len(actual),
-        "actual": _percentiles(actual),
-        "predicted": _percentiles(predicted),
-        "errors": _error_metrics(actual, predicted),
-        "ood": ood,
-        "uncertain": uncertain,
-        "source": cell.get("raw") or cell.get("metadata") or {},
-    }
-
-
-def _candidate(fit_document: dict[str, Any], name: str) -> dict[str, Any] | None:
-    for candidate in fit_document.get("candidates", []):
-        if isinstance(candidate, dict) and candidate.get("name") == name:
-            return candidate
-    return None
-
-
-def _observations(document: dict[str, Any], *, kinds: set[str], splits: set[str]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for cell in document.get("cells", []):
-        if not isinstance(cell, dict) or cell.get("status") != "measured":
+def _percentiles(values: list[float]) -> dict:
+    values = sorted(values)
+    result = {}
+    for name, quantile in (('p50', .50), ('p95', .95), ('p99', .99)):
+        if not values:
+            result[name] = None
             continue
-        if cell.get("kind") not in kinds or cell.get("split") not in splits:
-            continue
-        metadata = cell.get("metadata") if isinstance(cell.get("metadata"), dict) else {}
-        for observation in cell.get("observations", []):
-            if isinstance(observation, dict):
-                result.append({"cell": cell, "observation": observation, "metadata": metadata})
+        position = (len(values)-1) * quantile
+        lower = int(position)
+        upper = min(lower+1, len(values)-1)
+        result[name] = values[lower] + (values[upper]-values[lower]) * (position-lower)
     return result
 
 
-def _direct_prediction(candidate: dict[str, Any], observation: dict[str, Any]) -> float:
-    if candidate.get("status") != "fitted":
-        raise FitError(f"candidate is {candidate.get('status', 'missing')}")
-    if candidate["name"] == "cold_prefill_piecewise_linear":
-        return evaluate_piecewise(candidate, observation.get("prefill_input_tokens", observation["input_tokens"]))
-    if candidate["name"] == "decode_additive":
-        requests = observation["concurrency"]
-        kv_tokens = observation.get("sum_decode_ctx_tokens")
-        if kv_tokens is None:
-            kv_tokens = observation["input_tokens"] * requests
-        return evaluate_additive(candidate, requests, kv_tokens)
-    if candidate["name"] == "decode_2d_surface":
-        requests = observation["concurrency"]
-        kv_tokens = observation.get("sum_decode_ctx_tokens")
-        if kv_tokens is None:
-            kv_tokens = observation["input_tokens"] * requests
-        return evaluate_surface(candidate, requests, kv_tokens)
-    if candidate["name"] == "cached_prefill_surface":
-        prefix_tokens = observation.get("prefix_tokens", observation.get("cached_tokens"))
-        if prefix_tokens is None:
-            raise FitError("cached-prefill observation has no prefix_tokens")
-        new_tokens = observation["input_tokens"] - prefix_tokens
-        if new_tokens <= 0:
-            raise FitError("cached-prefill observation has no positive new_tokens")
-        return evaluate_cached_surface(candidate, prefix_tokens, new_tokens)
-    raise FitError(f"no direct evaluator for {candidate['name']}")
+def summarize_samples(samples: list[dict]) -> dict:
+    """The sole percentile owner; errors are computed before aggregation."""
+    return {'count': len(samples),
+            'actual': _percentiles([row['actual_ms'] for row in samples]),
+            'predicted': _percentiles([row['predicted_ms'] for row in samples]),
+            'errors': {'count': len(samples),
+                       'absolute_ms': _percentiles([row['absolute_error_ms'] for row in samples]),
+                       'relative': _percentiles([row['relative_error'] for row in samples])}}
 
 
-def _comparison(
-    name: str,
-    candidates: dict[str, dict[str, Any] | None],
-    entries: list[dict[str, Any]],
-    *,
-    actual_metric: str,
-    prediction: Callable[[dict[str, Any]], float],
-    candidate_names: list[str],
-) -> dict[str, Any]:
-    unavailable = [
-        name
-        for name in candidate_names
-        if candidates.get(name) is None or candidates[name].get("status") != "fitted"
-    ]
-    if unavailable:
-        reason = "; ".join(
-            f"{name}: {(candidates.get(name) or {}).get('reason', 'candidate is unavailable')}"
-            for name in unavailable
-        )
-        by_split: dict[str, dict[str, Any]] = {}
-        source_cells = sorted(
-            {
-                entry["observation"].get("cell_id")
-                for entry in entries
-                if entry["observation"].get("cell_id")
-            }
-        )
-        for split in SPLITS:
-            split_entries = [entry for entry in entries if entry["cell"].get("split") == split]
-            attribution: dict[str, int] = {}
-            by_cell: dict[str, dict[str, Any]] = {}
-            for entry in split_entries:
-                observation = entry["observation"]
-                label = observation.get("attribution", {}).get(actual_metric, "missing")
-                attribution[label] = attribution.get(label, 0) + 1
-                cell_id = observation.get("cell_id") or entry["cell"].get("name") or "<unknown>"
-                record = by_cell.setdefault(
-                    cell_id,
-                    _cell_summary([], [], ood=[], uncertain=[], cell=entry["cell"]),
-                )
-                record["status"] = "candidate_unsupported"
-                record["reason"] = reason
-                record["uncertain"].append({"cell_id": cell_id, "reason": reason})
-            by_split[split] = {
-                "status": "candidate_unsupported",
-                "reason": reason,
-                "errors": _error_metrics([], []),
-                "sample_count": 0,
-                "ood": [],
-                "uncertain": [],
-                "attribution": attribution,
-                "by_cell": by_cell,
-            }
-        return {
-            "name": name,
-            "status": "unsupported",
-            "reason": reason,
-            "candidate_names": candidate_names,
-            "fit_policy": "candidates trained only on train; validation and held_out splits are report-only",
-            "coverage": {
-                candidate_name: candidates[candidate_name].get("coverage")
-                if candidates.get(candidate_name)
-                else None
-                for candidate_name in candidate_names
-            },
-            "dispersion": {
-                candidate_name: candidates[candidate_name].get("source", {}).get("dispersion")
-                if candidates.get(candidate_name)
-                else None
-                for candidate_name in candidate_names
-            },
-            "candidate_provenance": {
-                candidate_name: candidates[candidate_name].get("source")
-                if candidates.get(candidate_name)
-                else None
-                for candidate_name in candidate_names
-            },
-            "source_cells": source_cells,
-            "errors": _error_metrics([], []),
-            "by_split": by_split,
-            "ood_count": 0,
-            "uncertain_count": sum(
-                1
-                for entry in entries
-                if entry["observation"].get("attribution", {}).get(actual_metric) != "black_box_effective"
-            ),
-            "attribution_status": "paired_request_delta",
-        }
-    by_split: dict[str, dict[str, Any]] = {}
-    source_cells: set[str] = set()
-    all_actual: list[float] = []
-    all_predicted: list[float] = []
-    total_ood = 0
-    total_uncertain = 0
-    for split in SPLITS:
-        actual: list[float] = []
-        predicted: list[float] = []
-        ood: list[dict[str, Any]] = []
-        uncertain: list[dict[str, Any]] = []
-        attribution: dict[str, int] = {}
-        per_cell: dict[str, dict[str, Any]] = {}
-        for entry in entries:
-            cell = entry["cell"]
-            observation = entry["observation"]
-            if cell.get("split") != split:
-                continue
-            cell_id = observation.get("cell_id")
-            if cell_id:
-                source_cells.add(cell_id)
-            label = observation.get("attribution", {}).get(actual_metric, "missing")
-            attribution[label] = attribution.get(label, 0) + 1
-            cell_key = cell_id or cell.get("name") or "<unknown>"
-            cell_actual = per_cell.setdefault(cell_key, {"actual": [], "predicted": [], "ood": [], "uncertain": [], "cell": cell})
-            value = observation.get("effective", {}).get(actual_metric)
-            metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
-            if (
-                entry["cell"].get("kind") == "mixed"
-                and metadata.get("requires_overlap") is True
-                and metadata.get("overlap_status") != "validated"
-            ):
-                detail = {"cell_id": cell_id, "reason": "mixed overlap evidence is not validated"}
-                uncertain.append(detail)
-                cell_actual["uncertain"].append(detail)
-                continue
-            if value is None or label != "black_box_effective":
-                detail = {"cell_id": cell_id, "reason": "missing or uncertain attribution"}
-                uncertain.append(detail)
-                cell_actual["uncertain"].append(detail)
-                continue
+def _sample(observation: dict) -> dict:
+    measurements = observation['measurements']
+    actual, predicted = (measurements[role]['ttft_ms'] for role in ('target', 'sim'))
+    if any(isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value)
+           for value in (actual, predicted)) or actual <= 0 or predicted < 0:
+        raise ValueError('raw TTFT requires positive target and finite nonnegative simulator values')
+    absolute = abs(actual-predicted)
+    relative = absolute/actual
+    if not math.isfinite(relative):
+        raise ValueError('raw TTFT relative error is non-finite')
+    return {'key': observation['key'], 'repeat': observation['repeat'], 'index': observation['index'],
+            'actual_ms': actual, 'predicted_ms': predicted,
+            'absolute_error_ms': absolute, 'relative_error': relative}
+
+
+def _build_report(root: Path, campaign: dict, normalized: dict) -> dict:
+    frozen = campaign['client']['observer']['sources']
+    reporter_sources = {name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
+                        for name in REPORT_SOURCES}
+    if reporter_sources != {name: frozen.get(name) for name in REPORT_SOURCES}:
+        raise ValueError('frozen report generator changed; compile and collect into a new root')
+    if normalized['source']['normalizer_sources'] != {name: frozen.get(name) for name in NORMALIZER_SOURCES}:
+        raise ValueError('validation normalizer differs from frozen acquisition sources')
+    cells, deferred, roles, definition = campaign_scope(campaign, 'validation')
+    # Final report success covers required evidence, including unsupported train
+    # components. These stay out of held-out samples and their request counts.
+    deferred = [*campaign_scope(campaign, 'train')[1], *deferred]
+    profile_sources, profile_failure = {}, None
+    try:
+        selection = verify_fitted_bundle(root, campaign)
+        paths = fitted_bundle_paths(root, campaign)
+        profile_sources = {name: {'path': str(path), **file_reference(path)} for name, path in paths.items()}
+        if profile_sources['selection'] != {'path': str(paths['selection']), **selection}:
+            raise ValueError('selected fitted bundle changed')
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        profile_failure = f'{type(exc).__name__}: {exc}'
+    indexed = {cell['cell_id']: cell for cell in normalized['cells']}
+    results = []
+    for cell in cells:
+        paired = indexed[cell['cell_id']]
+        samples, failures = [], []
+        if paired['status'] == 'paired':
             try:
-                estimate = prediction(observation)
-            except FitError as exc:
-                detail = {"cell_id": cell_id, "reason": str(exc)}
-                ood.append(detail)
-                cell_actual["ood"].append(detail)
-                continue
-            actual.append(float(value))
-            predicted.append(float(estimate))
-            cell_actual["actual"].append(float(value))
-            cell_actual["predicted"].append(float(estimate))
-        if actual:
-            all_actual.extend(actual)
-            all_predicted.extend(predicted)
-        total_ood += len(ood)
-        total_uncertain += len(uncertain)
-        by_split[split] = {
-            "status": "measured" if actual else "no_in_domain_observations",
-            "errors": _error_metrics(actual, predicted),
-            "sample_count": len(actual),
-            "ood": ood,
-            "uncertain": uncertain,
-            "attribution": attribution,
-            "by_cell": {
-                cell_id: _cell_summary(
-                    values["actual"],
-                    values["predicted"],
-                    ood=values["ood"],
-                    uncertain=values["uncertain"],
-                    cell=values["cell"],
-                )
-                for cell_id, values in sorted(per_cell.items())
-            },
-        }
-    return {
-        "name": name,
-        "status": "fitted" if all_actual else "unsupported",
-        "candidate_names": candidate_names,
-        "fit_policy": "candidates trained only on train; validation and held_out splits are report-only",
-        "coverage": {
-            name: candidates[name].get("coverage") if candidates.get(name) else None for name in candidate_names
-        },
-        "dispersion": {
-            name: candidates[name].get("source", {}).get("dispersion") if candidates.get(name) else None
-            for name in candidate_names
-        },
-        "candidate_provenance": {
-            name: candidates[name].get("source") if candidates.get(name) else None for name in candidate_names
-        },
-        "source_cells": sorted(source_cells),
-        "errors": _error_metrics(all_actual, all_predicted),
-        "by_split": by_split,
-        "ood_count": total_ood,
-        "uncertain_count": total_uncertain,
-        "attribution_status": "paired_request_delta",
-    }
-
-
-def _composition_prediction(
-    prefill: dict[str, Any] | None,
-    decode: dict[str, Any] | None,
-    *,
-    marginal: bool,
-) -> Callable[[dict[str, Any]], float]:
-    def predict(observation: dict[str, Any]) -> float:
-        if prefill is None or decode is None:
-            raise FitError("prefill or decode candidate is missing")
-        prefill_tokens = observation.get("prefill_input_tokens", observation["input_tokens"])
-        prefill_ms = evaluate_piecewise(prefill, prefill_tokens)
-        if marginal:
-            decode_ms = _direct_prediction(decode, observation)
+                samples = [_sample(row) for row in paired['observations']]
+            except (ValueError, KeyError, TypeError) as exc:
+                failures.append(str(exc))
         else:
-            kv_tokens = observation.get("sum_decode_ctx_tokens")
-            if kv_tokens is None:
-                if observation.get("kind") == "mixed":
-                    raise FitError("mixed observation has no role-specific sum_decode_ctx_tokens")
-                kv_tokens = observation["input_tokens"] * observation["concurrency"]
-            decode_ms = evaluate_additive(
-                decode,
-                observation["concurrency"],
-                kv_tokens,
-            )
-        return prefill_ms + decode_ms * float(observation["output_tokens"])
-
-    return predict
-
-
-def _residual_candidate(
-    composition: dict[str, Any],
-    entries: list[dict[str, Any]],
-    prediction: Callable[[dict[str, Any]], float],
-) -> dict[str, Any]:
-    groups: dict[tuple[Any, ...], list[float]] = {}
-    excluded: list[dict[str, Any]] = []
-    for entry in entries:
-        cell = entry["cell"]
-        if cell.get("split") != "threshold_validation" or cell.get("kind") != "mixed":
-            continue
-        metadata = entry["metadata"]
-        if metadata.get("scheduler_mismatch") or metadata.get("frontend_mismatch"):
-            excluded.append({"cell_id": entry["observation"].get("cell_id"), "reason": "scheduler/frontend mismatch"})
-            continue
-        observation = entry["observation"]
-        if observation.get("attribution", {}).get("e2e_ms") != "black_box_effective":
-            continue
-        try:
-            residual = float(observation["effective"]["e2e_ms"]) - prediction(observation)
-        except (FitError, TypeError, ValueError):
-            continue
-        key = (observation.get("input_tokens"), observation.get("output_tokens"), observation.get("concurrency"))
-        groups.setdefault(key, []).append(residual)
-    stable: dict[str, float] = {}
-    for key, residuals in groups.items():
-        if len(residuals) < 2:
-            continue
-        if all(value > 0.0 for value in residuals) or all(value < 0.0 for value in residuals):
-            stable[json.dumps(key, separators=(",", ":"))] = statistics.median(residuals)
-    if not stable:
-        return {
-            "name": "sparse_residual_correction",
-            "status": "unsupported",
-            "reason": "no repeated same-direction validation residual after mismatch exclusion",
-            "excluded": excluded,
-            "source_cells": composition.get("source_cells", []),
-        }
-    return {
-        "name": "sparse_residual_correction",
-        "status": "candidate",
-        "fit_split": "threshold_validation",
-        "residuals_ms": stable,
-        "excluded": excluded,
-        "source_cells": composition.get("source_cells", []),
-        "provenance": "derived only from repeated validation residuals; held_out_mixed excluded",
+            failures.append(paired.get('reason', 'complete held-out role pairing is missing'))
+        if profile_failure:
+            failures.append('fitted profile: ' + profile_failure)
+        sources = paired['observations'][0]['sources'] if paired['observations'] else {}
+        result = {'cell_id': cell['cell_id'], 'name': cell['name'], 'kind': cell['kind'], 'split': cell['split'],
+                  'concurrency': cell['concurrency'], 'plan': cell['plan'],
+                  'status': 'measured' if not failures else 'not_measured',
+                  'expected_count': paired['expected_count'], 'matched_count': len(samples),
+                  'pairing': {'complete': paired['status'] == 'paired',
+                              'target_zero_cost': paired['status'] == 'paired',
+                              'target_sim': paired['status'] == 'paired',
+                              'expected_count': paired['expected_count'], 'matched_count': paired['matched_count']},
+                  'coverage': {'status': 'in_domain' if not failures else 'unverified',
+                               'basis': 'successful_profiled_execution',
+                               'reason': '; '.join(failures) if failures else None},
+                  **{role: {'status': 'succeeded' if role in sources else 'missing',
+                            'source': sources.get(role)} for role in roles},
+                  'reference_diagnostic': {'policy': cell['reference_policy'], 'fit_eligible': False,
+                                           'binding': sources.get('zero_cost', {}).get('binding')},
+                  'samples': samples, **summarize_samples(samples), 'failures': failures}
+        results.append(result)
+    all_samples = [row for cell in results for row in cell['samples']]
+    split_names = sorted({cell['split'] for cell in results})
+    by_split = {split: summarize_samples([row for cell in results if cell['split'] == split for row in cell['samples']])
+                for split in split_names}
+    queueing = [cell for cell in results if cell['concurrency'] > 1]
+    report = {
+        'kind': KIND, 'schema_version': SCHEMA_VERSION, 'campaign_id': campaign['campaign_id'],
+        'scope': 'validation', 'scope_sha256': sha256_json(definition),
+        'required_roles': list(roles), 'required_cell_ids': [cell['cell_id'] for cell in cells],
+        'required_queueing_cell_ids': [cell['cell_id'] for cell in cells if cell['concurrency'] > 1],
+        'campaign_required_scope': campaign['required_scope'], 'deferred_cells': deferred,
+        'coverage_required_kinds': sorted({cell['kind'] for cell in cells}),
+        'metric': 'ttft_ms', 'basis': 'paired_raw_target_sim',
+        'relative_denominator': 'positive_target_raw_ttft_ms',
+        'accuracy_acceptance': {'status': 'not_assessed', 'thresholds': None},
+        'cell_count': len(results), 'measured_cell_count': sum(cell['status'] == 'measured' for cell in results),
+        'expected_count': sum(cell['expected_count'] for cell in results), 'matched_count': len(all_samples),
+        'cells': results, 'aggregates': {'by_split': by_split, 'all': summarize_samples(all_samples)},
+        'queueing_ttft': {'metric': 'ttft_ms', 'basis': 'paired_raw_target_sim', 'fit_excluded': True,
+                          'cells': queueing,
+                          'aggregates': {split: summarize_samples([row for cell in queueing if cell['split'] == split
+                                                                  for row in cell['samples']]) for split in split_names}},
+        'provenance': {'artifact_root': str(root), 'normalized_sha256': sha256_json(normalized),
+                       'source': normalized['source'], 'profile': profile_sources,
+                       'target_identity': campaign['variants']['target']['identity'], 'client': campaign['client'],
+                       'reporter_sources': reporter_sources},
+        'normalized': normalized,
     }
+    report['acceptance'] = assess_report(report)
+    report['status'] = ('succeeded' if report['acceptance']['status'] == 'passed' else
+                        'partial' if any(ref['variant'] == 'sim' for ref in normalized['source']['selected_attempts'])
+                        else 'replay_required')
+    return report
 
 
-def build_report(
-    normalized: dict[str, Any],
-    fitted: dict[str, Any],
-    *,
-    normalized_digest: str | None = None,
-    fit_digest: str | None = None,
-) -> dict[str, Any]:
-    if fitted.get("schema_version") != 1:
-        raise ValueError("fit artifact schema_version must be 1")
-    entries = _observations(
-        normalized,
-        kinds={"cold_prefill", "steady_decode", "cached_prefill", "mixed"},
-        splits=set(SPLITS),
-    )
-    candidates = {name: _candidate(fitted, name) for name in (
-        "cold_prefill_piecewise_linear", "decode_additive", "decode_2d_surface", "cached_prefill_surface"
-    )}
-    comparisons: list[dict[str, Any]] = []
-    cold_entries = [entry for entry in entries if entry["cell"].get("kind") == "cold_prefill"]
-    decode_entries = [entry for entry in entries if entry["cell"].get("kind") == "steady_decode"]
-    cached_entries = [entry for entry in entries if entry["cell"].get("kind") == "cached_prefill"]
-    mixed_entries = [entry for entry in entries if entry["cell"].get("kind") == "mixed"]
-    if candidates["cold_prefill_piecewise_linear"]:
-        comparisons.append(
-            _comparison(
-                "cold_prefill_piecewise_linear",
-                candidates,
-                cold_entries,
-                actual_metric="ttft_ms",
-                prediction=lambda observation: _direct_prediction(candidates["cold_prefill_piecewise_linear"], observation),
-                candidate_names=["cold_prefill_piecewise_linear"],
-            )
-        )
-    for name in ("decode_additive", "decode_2d_surface"):
-        if candidates[name]:
-            comparisons.append(
-                _comparison(
-                    name,
-                    candidates,
-                    decode_entries,
-                    actual_metric=candidates[name].get("metric", "tpot_ms"),
-                    prediction=lambda observation, selected=name: _direct_prediction(candidates[selected], observation),
-                    candidate_names=[name],
-            )
-        )
-    if candidates["cached_prefill_surface"]:
-        comparisons.append(
-            _comparison(
-                "cached_prefill_surface",
-                candidates,
-                cached_entries,
-                actual_metric="ttft_ms",
-                prediction=lambda observation: _direct_prediction(candidates["cached_prefill_surface"], observation),
-                candidate_names=["cached_prefill_surface"],
-            )
-        )
-    additive_prediction = _composition_prediction(
-        candidates["cold_prefill_piecewise_linear"], candidates["decode_additive"], marginal=False
-    )
-    marginal_prediction = _composition_prediction(
-        candidates["cold_prefill_piecewise_linear"], candidates["decode_2d_surface"], marginal=True
-    )
-    additive_report = _comparison(
-        "composition_additive",
-        candidates,
-        mixed_entries,
-        actual_metric="e2e_ms",
-        prediction=additive_prediction,
-        candidate_names=["cold_prefill_piecewise_linear", "decode_additive"],
-    )
-    marginal_report = _comparison(
-        "composition_marginal_decode",
-        candidates,
-        mixed_entries,
-        actual_metric="e2e_ms",
-        prediction=marginal_prediction,
-        candidate_names=["cold_prefill_piecewise_linear", "decode_2d_surface"],
-    )
-    comparisons.extend((additive_report, marginal_report))
-    residual = _residual_candidate(additive_report, mixed_entries, additive_prediction)
-    source = normalized.get("source", {}) if isinstance(normalized.get("source"), dict) else {}
-    failures = normalized.get("failures", []) if isinstance(normalized.get("failures"), list) else []
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "campaign_id": normalized.get("campaign_id"),
-        "status": "succeeded",
-        "provenance": {
-            "normalized_sha256": normalized_digest,
-            "fit_sha256": fit_digest,
-            "manifest_sha256": source.get("source_digests", {}).get("manifest_sha256"),
-            "artifact_index_sha256": source.get("source_digests", {}).get("artifact_index_sha256"),
-            "target_identity": source.get("target_identity"),
-            "cache_policy": source.get("cache_policy"),
-        },
-        "splits": {"fit": ["train"], "validation": ["threshold_validation"], "held_out": list(("held_out_mixed", "sealed_test"))},
-        "comparisons": comparisons,
-        "held_out_ttft": {
-            "status": "replay_required",
-            "metric": "ttft_ms",
-            "fit_excluded": True,
-            "basis": "functional_profile_replay",
-            "reason": "report.py fit comparisons intentionally remain TPOT; use replay.queueing_ttft for scheduler TTFT errors",
-        },
-        "residual_candidates": [residual],
-        "failures": failures,
-        "missing_invalid_ood": {
-            "normalized_failures": failures,
-            "comparison_ood": {item["name"]: item["ood_count"] for item in comparisons},
-            "no_zero_fill": True,
-        },
-    }
-
-
-def write_document(path: Path, document: dict[str, Any]) -> None:
-    rendered = json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    path = path.expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        if path.read_text(encoding="utf-8") != rendered:
-            raise ValueError(f"refusing to overwrite a different report artifact: {path}")
-        return
-    temporary = path.with_name(f".{path.name}.tmp")
+def _validation_normalization(root: Path, campaign: dict) -> dict:
     try:
-        temporary.write_text(rendered, encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        return normalize_campaign(root, scope='validation')
+    except FileNotFoundError as exc:
+        if Path(exc.filename) != root/'execution_index.json' or (root/'execution_index.json').exists():
+            raise
+        # No execution index exists yet. Reuse normalization's cell/document
+        # contracts, explicitly recording the absent source rather than a digest.
+        cells = campaign_scope(campaign, 'validation')[0]
+        results = []
+        for cell in cells:
+            result = _cell_result(cell, _read_json(checked_path(root, cell['plan']['path'])))
+            result['reason'] = 'execution has not started: execution index is absent'
+            results.append(result)
+        sources = {name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
+                   for name in NORMALIZER_SOURCES}
+        source = {'artifact_root': str(root), 'compiler_index': file_reference(root/'artifact_index.json'),
+                  'execution_index_sha256_at_read': None, 'selected_attempts': [],
+                  'selected_attempts_sha256': sha256_json([]),
+                  'normalizer_sources': sources, 'normalizer_sha256': sha256_json(sources)}
+        return _assemble_document(campaign, 'validation', results, source)
 
 
-def parse_args() -> argparse.Namespace:
+def report_campaign(root: Path) -> dict:
+    root = root.expanduser().resolve()
+    campaign = load_compiled_bundle(root)
+    normalized = _validation_normalization(root, campaign)
+    if normalized['status'] == 'succeeded':
+        verify_normalized(normalized, root=root)
+    return _build_report(root, campaign, normalized)
+
+
+def verify_report(document: dict, *, root: Path | None = None) -> None:
+    if document.get('kind') != KIND or document.get('schema_version') != SCHEMA_VERSION:
+        raise ValueError('current held-out replay report schema 2 is required')
+    root = (root or Path(document['provenance']['artifact_root'])).expanduser().resolve()
+    normalized = document['normalized']
+    if normalized.get('status') == 'succeeded':
+        verify_normalized(normalized, root=root)
+    else:
+        # Incomplete snapshots may never be promoted by editing their status.
+        if sha256_json(_validation_normalization(root, load_compiled_bundle(root))) != sha256_json(normalized):
+            raise ValueError('incomplete report no longer matches current evidence; regenerate it')
+    expected = _build_report(root, load_compiled_bundle(root), normalized)
+    if sha256_json(document) != sha256_json(expected):
+        raise ValueError('held-out report differs from verified sources, statistics or completeness')
+
+
+def write_document(path: Path, document: dict) -> None:
+    verify_report(document)
+    root = Path(document['provenance']['artifact_root'])
+    protected = [Path(ref['path']).resolve() for ref in document['provenance']['profile'].values()]
+    selection_ref = document['provenance']['profile'].get('selection')
+    if selection_ref:
+        selection = _read_json(Path(selection_ref['path']))
+        protected.extend(Path(ref['path']).resolve() for ref in selection['training'].values())
+    source = document['normalized']['source']
+    for ref in source['selected_attempts']:
+        protected.append((root/ref['path']).resolve())
+    if (path.expanduser().resolve().is_relative_to(root/'references') or
+            any(path.expanduser().resolve() == source_path or path.expanduser().resolve().is_relative_to(source_path)
+                for source_path in protected)):
+        raise ValueError('report output would overwrite source evidence')
+    write_derived_document(path, document, root)
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--normalized", type=Path, required=True)
-    parser.add_argument("--fit", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
+    parser.add_argument('--artifact-root', required=True, type=Path)
+    parser.add_argument('--output', required=True, type=Path)
+    args = parser.parse_args(argv)
     try:
-        normalized, normalized_digest = _read_json(args.normalized)
-        fitted, fit_digest = _read_json(args.fit)
-        report = build_report(normalized, fitted, normalized_digest=normalized_digest, fit_digest=fit_digest)
-        write_document(args.output, report)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        print(f"report error: {exc}", file=sys.stderr)
+        document = report_campaign(args.artifact_root)
+        write_document(args.output, document)
+    except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+        print(f'report error: {exc}', file=sys.stderr)
         return 2
-    print(json.dumps({"campaign_id": report["campaign_id"], "status": report["status"]}, sort_keys=True))
-    return 0
+    print(json.dumps({key: document[key] for key in ('campaign_id', 'status', 'cell_count', 'matched_count')}, sort_keys=True))
+    return 0 if document['status'] == 'succeeded' else 1
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

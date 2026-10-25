@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile a named JSON campaign into immutable plans and a zero-cost bundle."""
+"""Compile immutable campaigns and execute the train-to-held-out lifecycle."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from artifacts import ArtifactError, write_compiled_bundle
+from artifacts import (ArtifactError, _read_json, checked_path, execution_snapshot, file_reference,
+                       load_compiled_bundle, sealed_reference, write_compiled_bundle, write_derived_document)
 from manifest import ManifestError, compile_manifest, sha256_json
 from profile import ProfileError
 from request_plan import PlanError, build_plan
@@ -139,6 +140,118 @@ def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[
     return compiled
 
 
+async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
+                           timeout: float = 120, startup_timeout: float = 60) -> dict:
+    """Run a complete cold/decode scope against an already-running target.
+
+    Profile servers are owned here because references differ by cell. Every
+    acquisition still uses the existing driver. Recovery verifies sealed bytes
+    before skipping them, without needing their historical processes alive.
+    """
+    import math
+    from baseline import prepare_references, resolve_reference, select_reference
+    from evidence_proxy import observer_identity
+    from fit import fit_normalized, write_document as write_fit
+    from normalize import normalize_campaign, verify_normalized, write_document as write_normalized
+    from pairing import campaign_scope, load_role
+    from plan_driver import profile_server, run_campaign
+    from profile import materialize_profile, verify_fitted_bundle
+    from artifacts import fitted_bundle_paths
+    from replay import replay_campaign
+    from report import write_document as write_report
+
+    if any(not math.isfinite(value) or value <= 0 for value in (timeout, startup_timeout)):
+        raise ArtifactError('campaign timeouts must be finite and positive')
+    root = root.expanduser().resolve()
+    campaign = load_compiled_bundle(root)
+    if campaign['client']['observer'] != observer_identity():
+        raise ArtifactError('frozen execution sources changed; compile into a new root')
+    if file_reference(model_path.expanduser().resolve() / 'config.json')['sha256'] != campaign['variants']['target']['identity']['model_config_sha256']:
+        raise ArtifactError('model metadata differs from frozen campaign identity')
+    if not sim_binary.expanduser().resolve().is_file():
+        raise ArtifactError('simulator binary is missing')
+    train, train_deferred, _, _ = campaign_scope(campaign, 'train')
+    heldout, heldout_deferred, _, _ = campaign_scope(campaign, 'validation')
+    if train_deferred or heldout_deferred:
+        raise ArtifactError('full-stage cached-prefill execution is deferred to C8')
+    if not train or not heldout or not any(c['concurrency'] > 1 for c in heldout):
+        raise ArtifactError('full-stage execution requires train and required C>1 held-out cells')
+
+    def pending(cells: list[dict], role: str) -> list[dict]:
+        remaining = []
+        if not (root / 'execution_index.json').exists():
+            return cells
+        with execution_snapshot(root, campaign['campaign_id']) as (execution, _):
+            for cell in cells:
+                entry = execution['cells'].get(f"{cell['cell_id']}:{role}", {})
+                if entry.get('status') != 'sealed':
+                    remaining.append(cell)
+                    continue
+                plan = _read_json(checked_path(root, cell['plan']['path']))
+                load_role(root, campaign, plan, role, sealed_reference(entry))
+        return remaining
+
+    async def collect(cells: list[dict], role: str, pid: int | None = None) -> None:
+        if not cells:
+            return
+        results = await run_campaign(root, variants=[role], selectors=[c['cell_id'] for c in cells],
+                                     timeout=timeout, server_pids={role: pid} if pid else None)
+        if len(results) != len(cells) or any(result['status'] != 'sealed' for result in results):
+            raise ArtifactError(f'{role} acquisition failed; inspect execution_index.json before an explicit resume')
+
+    async def references(cells: list[dict]) -> None:
+        for cell in pending(cells, 'zero_cost'):
+            binding = select_reference(root, campaign, cell['cell_id'])
+            variant = {**campaign['variants']['zero_cost'], **resolve_reference(root, campaign, binding, cell['cell_id'])}
+            async with profile_server(root, variant, binary=sim_binary, model_path=model_path,
+                                      timeout=startup_timeout) as pid:
+                await collect([cell], 'zero_cost', pid)
+
+    await collect(pending(train, 'target'), 'target')
+    prepare_references(root)
+    await references(train)
+    if fitted_bundle_paths(root, campaign)['selection'].exists():
+        verify_fitted_bundle(root, campaign)
+    else:
+        normalized_path, fit_path = root / 'derived/train.normalized.json', root / 'derived/fit.json'
+        if normalized_path.exists():
+            normalized = _read_json(normalized_path)
+            verify_normalized(normalized, root=root)
+        else:
+            normalized = normalize_campaign(root, scope='train')
+        if normalized['status'] != 'succeeded':
+            raise ArtifactError('complete qualified training is required before fit')
+        write_normalized(normalized_path, normalized)
+        fitted = fit_normalized(normalized, source_digest=file_reference(normalized_path)['sha256'])
+        if fitted['status'] != 'succeeded':
+            raise ArtifactError('required training candidates could not be fitted')
+        write_fit(fit_path, fitted)
+        materialize_profile(root, normalized_artifact=normalized_path, fit_artifact=fit_path)
+    bundle_paths = fitted_bundle_paths(root, campaign)
+    selection = _read_json(bundle_paths['selection'])
+    training_paths = [*bundle_paths.values(), root/'references/preparation.json',
+                      root/'artifact_index.json', root/'compiled_campaign.json',
+                      *(Path(ref['path']) for ref in selection['training'].values())]
+    training_snapshot = {str(path): file_reference(path) for path in training_paths}
+    write_derived_document(root/'derived/training-snapshot.json', training_snapshot, root)
+    await collect(pending(heldout, 'target'), 'target')
+    await references(heldout)
+    remaining = pending(heldout, 'sim')
+    if remaining:
+        async with profile_server(root, campaign['variants']['sim'], binary=sim_binary,
+                                  model_path=model_path, timeout=startup_timeout) as pid:
+            await collect(remaining, 'sim', pid)
+    if {str(path): file_reference(path) for path in training_paths} != training_snapshot:
+        raise ArtifactError('training/profile sources changed during held-out acquisition')
+    report = replay_campaign(root)
+    report_path = root / 'reports' / ('validation.json' if report['status'] == 'succeeded'
+                                    else f"{report['status']}-{sha256_json(report)}.json")
+    write_report(report_path, report)
+    return {'campaign_id': campaign['campaign_id'], 'status': report['status'],
+            'report': {'path': str(report_path), **file_reference(report_path)},
+            'expected_count': report['expected_count'], 'matched_count': report['matched_count']}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -154,8 +267,21 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--cell", action="append", help="exact compiled cell name or ID; repeatable")
     run_parser.add_argument("--timeout", type=float, default=120.0, help="whole bench batch deadline in seconds")
     run_parser.add_argument("--server-pid", action="append", default=[], metavar="VARIANT=PID", help="bind an existing local profile server; repeat for zero_cost and sim")
+    execute_parser = subcommands.add_parser('execute', help='run all cold/decode stages against an already-running target')
+    execute_parser.add_argument('--artifact-root', type=Path, required=True)
+    execute_parser.add_argument('--sim-binary', type=Path, required=True)
+    execute_parser.add_argument('--model-path', type=Path, required=True)
+    execute_parser.add_argument('--timeout', type=float, default=120)
+    execute_parser.add_argument('--startup-timeout', type=float, default=60)
     args = parser.parse_args(argv)
     try:
+        if args.command == 'execute':
+            import asyncio
+            result = asyncio.run(execute_campaign(args.artifact_root, sim_binary=args.sim_binary,
+                                                 model_path=args.model_path, timeout=args.timeout,
+                                                 startup_timeout=args.startup_timeout))
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result['status'] == 'succeeded' else 1
         if args.command == 'prepare-reference':
             from baseline import prepare_references
             prepared = prepare_references(args.artifact_root)

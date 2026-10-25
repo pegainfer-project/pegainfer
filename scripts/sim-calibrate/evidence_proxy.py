@@ -42,6 +42,7 @@ OBSERVER_SOURCES = (
     'measurement_schema.py', 'request_plan.py', 'manifest.py', 'artifacts.py',
     'probe.py', 'campaign.py', 'profile.py', 'steady_state.py', 'baseline.py',
     'pairing.py', 'normalize.py', 'target_statistics.py',
+    'fit.py', 'replay.py', 'report.py', 'acceptance.py',
 )
 
 

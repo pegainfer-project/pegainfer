@@ -15,6 +15,15 @@ class StatisticsError(ValueError):
     """A decode statistic cannot be established from the frozen evidence."""
 
 
+def requires_qualified_window(plan: dict) -> bool:
+    """Only frozen train plans require A-qualified windows for consumption.
+
+    Held-out plans retain the same recomputable statistics as diagnostics;
+    their measured metric is complete request TTFT, including zero controls.
+    """
+    return plan['split'] == 'train'
+
+
 def summary(values: list[float]) -> dict:
     """Dispersion describes repeat values; mean is the sole representative."""
     if not values:

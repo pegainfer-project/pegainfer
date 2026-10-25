@@ -419,9 +419,9 @@ def read_sealed_attempt(root: Path, plan: dict, variant: str, reference: dict) -
     result = {'directory': directory, 'raw_index': raw, 'envelope': envelope, 'workload': workload}
     if plan['workload_kind'] == 'steady_decode':
         result['statistics'] = _read_json(directory / 'decode_statistics.json')
-        from steady_state import verify_statistics
+        from steady_state import requires_qualified_window, verify_statistics
         verify_statistics(plan, envelope, result['statistics'])
-        if not result['statistics']['qualified']:
+        if requires_qualified_window(plan) and not result['statistics']['qualified']:
             raise ArtifactError('sealed decode attempt is not qualified')
     return result
 
@@ -619,11 +619,11 @@ class ExecutionStore:
             status = ('sealed' if all(r['status'] == 'succeeded' for r in rows) else
                       'unsupported' if any(r['status'] == 'unsupported' for r in rows) else 'failed')
             if plan['workload_kind'] == 'steady_decode':
-                from steady_state import verify_statistics
+                from steady_state import requires_qualified_window, verify_statistics
                 statistics = _read_json(directory / 'decode_statistics.json')
                 verify_statistics(plan, envelope, statistics)
                 current['statistics'] = file_reference(directory / 'decode_statistics.json')
-                if status == 'sealed' and not statistics['qualified']:
+                if status == 'sealed' and requires_qualified_window(plan) and not statistics['qualified']:
                     status = 'failed'
                     error = 'decode statistics qualification failed: ' + json.dumps(statistics['failures'])
             current.update(measurement=file_reference(directory / 'measurements.json'),

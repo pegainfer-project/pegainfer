@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from artifacts import ArtifactError, ExecutionStore, _read_json, _write_atomic, file_reference
 from campaign import compile_campaign
-from fit import FitError, fit_normalized
+from fit import fit_normalized
 from normalize import NormalizeError, normalize_campaign, verify_normalized, verify_normalized_sources, write_document
 from probe import requires_cache_reset
 from request_plan import build_plan
