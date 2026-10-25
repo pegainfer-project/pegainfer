@@ -1228,6 +1228,12 @@ impl Qwen3Executor {
         ensure_pertoken_single_gpu(policy, device_ordinals.len())?;
         ensure_pertoken_overlap_disabled(policy, decode_overlap)?;
 
+        // Refuse unsupported draft checkpoints before loading the target, so a
+        // DSpine config fails for its own reason instead of during KV sizing.
+        if let Some(path) = dflash_draft_path {
+            crate::config::DFlashConfig::from_file(path)?.ensure_servable()?;
+        }
+
         if policy == NumericPolicy::PerToken {
             if enable_cuda_graph {
                 let max_graph_bucket = crate::batch_decode::DecodeGraphPlan::new(policy)

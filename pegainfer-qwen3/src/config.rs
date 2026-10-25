@@ -94,22 +94,11 @@ pub(crate) struct DFlashConfig {
     pub(crate) dspine: Option<DSpineConfig>,
 }
 
-/// Resolved DSpine bridge config (`tencent/Qwen3-8B-DSpine-b16`).
+/// Marker that the checkpoint carries a validated DSpine code bridge. The
+/// bridge dimensions are resolved from the raw config and land with the
+/// loader/forward that read them.
 #[derive(Clone, Debug)]
-pub(crate) struct DSpineConfig {
-    pub(crate) code_size: usize,
-    pub(crate) rank: usize,
-    // Read by the bridge forward/refinement and the weight loader in the next slice.
-    #[allow(dead_code)]
-    pub(crate) eps: f32,
-    /// Draft layer indices carrying a code bridge, 0-based and ascending.
-    /// The last draft layer is always present (its write is refined serially).
-    #[allow(dead_code)]
-    pub(crate) feature_layers: Vec<usize>,
-    /// Width of the top-K serial last-write refinement.
-    #[allow(dead_code)]
-    pub(crate) head_topk: usize,
-}
+pub(crate) struct DSpineConfig;
 
 #[derive(Clone, Debug, Deserialize)]
 struct DFlashInnerConfig {
@@ -164,6 +153,7 @@ struct RawDSpineLastWriteRefine {
 /// Top-level refinement declaration some DSpine checkpoints carry instead of
 /// (or alongside) `dflash_config.selected_prefix_last_write_refine`.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawDSpineSecondPass {
     mode: Option<String>,
     first_exact: Option<usize>,
@@ -230,6 +220,11 @@ struct RawDFlashConfig {
     conv_kernel_size: Option<usize>,
     conv_group_size: Option<usize>,
     sliding_window_non_causal: Option<bool>,
+    /// HF text-config attention shape; DSpine requires causal full attention.
+    #[serde(default)]
+    is_causal: Option<bool>,
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
     #[serde(default)]
     sample_from_anchor: bool,
     #[serde(default)]
@@ -343,8 +338,7 @@ impl Config {
 impl DSpineConfig {
     /// `Ok(None)` for a plain DFlash/DSpark checkpoint; `Ok(Some(_))` when the
     /// checkpoint carries a code bridge. Every DSpine-only serving field is
-    /// validated rather than ignored; serving a bridge checkpoint as plain
-    /// DFlash would draft with near-zero acceptance.
+    /// validated rather than ignored.
     ///
     /// Training-only fields (`bridge.kappa`, `selected_prefix_decode_mode`,
     /// `selected_prefix_feature_gt_training`, the teacher fields, and the
@@ -416,7 +410,6 @@ impl DSpineConfig {
             layers.last() == Some(&num_hidden_layers),
             "DSpine refines the last write, so the last draft layer must be active; got {layers:?}"
         );
-        let feature_layers = layers.iter().map(|layer| layer - 1).collect();
 
         let mut head_topk = None;
         if let Some(refine) = inner.selected_prefix_last_write_refine.as_ref() {
@@ -461,6 +454,11 @@ impl DSpineConfig {
         );
 
         ensure!(
+            bridge.code_size > 0,
+            "DSpine code_size must be positive, got {}",
+            bridge.code_size
+        );
+        ensure!(
             bridge.rank > 0 && bridge.rank.is_multiple_of(128),
             "DSpine bridge rank must be a non-zero multiple of 128, got {}",
             bridge.rank
@@ -471,13 +469,7 @@ impl DSpineConfig {
             bridge.eps
         );
 
-        Ok(Some(Self {
-            code_size: bridge.code_size,
-            rank: bridge.rank,
-            eps: bridge.eps,
-            feature_layers,
-            head_topk,
-        }))
+        Ok(Some(Self))
     }
 }
 
@@ -598,6 +590,21 @@ impl DFlashConfig {
                 conv.is_none() && selector_rank == 0,
                 "DSpine drafts carry neither DFlash2 convolutions nor a selector"
             );
+            ensure!(
+                raw.is_causal != Some(false),
+                "DSpine requires causal draft attention; config sets is_causal = false"
+            );
+            if let Some(layer_types) = &raw.layer_types {
+                ensure!(
+                    layer_types.iter().all(|kind| kind == "full_attention"),
+                    "DSpine drafts use full-attention layers only, got {layer_types:?}"
+                );
+            }
+            ensure!(
+                geometry.sliding_window.is_none(),
+                "DSpine drafts use no sliding window, got {:?}",
+                geometry.sliding_window
+            );
         }
         Ok(Self {
             hidden_size: geometry.hidden_size,
@@ -636,10 +643,21 @@ impl DFlashConfig {
         self.markov_rank > 0
     }
 
-    /// DSpine code bridge is active; the draft forward injects per-layer
-    /// features and proposes with the serial last-write refinement.
+    /// The drafter config carries a DSpine code bridge. These checkpoints are
+    /// not servable yet; see [`DFlashConfig::ensure_servable`].
     pub(crate) fn uses_dspine(&self) -> bool {
         self.dspine.is_some()
+    }
+
+    /// Refuse draft checkpoints this build cannot serve yet. Callers run this
+    /// before loading the target so a DSpine checkpoint fails for its own
+    /// reason rather than during KV sizing or profile.
+    pub(crate) fn ensure_servable(&self) -> Result<()> {
+        ensure!(
+            !self.uses_dspine(),
+            "DSpine draft checkpoints are not supported yet"
+        );
+        Ok(())
     }
 
     /// Anchor-first block layout (see [`DFlashConfig::anchor_first`]). The markov
@@ -726,10 +744,6 @@ impl DFlashConfig {
                 self.hidden_size.is_multiple_of(512),
                 "DSpine bridge requires hidden_size to be a multiple of 512, got {}",
                 self.hidden_size
-            );
-            anyhow::ensure!(
-                !self.anchor_first(),
-                "DSpine drafts are anchor-drop; anchor-first checkpoints are not supported"
             );
         }
 
@@ -1032,13 +1046,6 @@ pub(crate) mod tests {
         assert_eq!(config.block_size, 16);
         assert_eq!(config.mask_token_id, 151_669);
         assert_eq!(config.target_layer_ids, vec![1, 9, 17, 25, 33]);
-
-        let dspine = config.dspine.as_ref().expect("parsed bridge");
-        assert_eq!(dspine.code_size, 1024);
-        assert_eq!(dspine.rank, 512);
-        assert_eq!(dspine.eps.to_bits(), 1e-6f32.to_bits());
-        assert_eq!(dspine.feature_layers, vec![0, 1, 2, 3, 4]);
-        assert_eq!(dspine.head_topk, 16);
     }
 
     #[test]
@@ -1178,6 +1185,27 @@ pub(crate) mod tests {
                     "\"block_size\": 16,\n      \"code_bridge_second_pass\": {\"mode\": \"serial_table\", \"first_exact\": 3, \"head_topk\": 16},",
                 ),
             ),
+            (
+                "explicitly non-causal attention",
+                DSPINE_8B_CONFIG.replace(
+                    "\"block_size\": 16,",
+                    "\"block_size\": 16,\n      \"is_causal\": false,",
+                ),
+            ),
+            (
+                "sliding layer type",
+                DSPINE_8B_CONFIG.replace(
+                    "\"layer_types\": [\"full_attention\",",
+                    "\"layer_types\": [\"sliding_attention\",",
+                ),
+            ),
+            (
+                "sliding window",
+                DSPINE_8B_CONFIG.replace(
+                    "\"block_size\": 16,",
+                    "\"block_size\": 16,\n      \"sliding_window\": 2048,",
+                ),
+            ),
         ];
 
         for (name, json) in cases {
@@ -1202,14 +1230,19 @@ pub(crate) mod tests {
         });
 
         let config = DFlashConfig::from_json(&json.to_string()).expect("second-pass config");
-        let dspine = config.dspine.as_ref().expect("parsed bridge");
-        assert_eq!(dspine.head_topk, 16);
+        assert!(config.uses_dspine());
+    }
+
+    #[test]
+    fn dspine_checkpoints_are_refused_until_the_forward_lands() {
+        assert!(dspine_8b_config().ensure_servable().is_err());
+        plain_dflash_config()
+            .ensure_servable()
+            .expect("plain DFlash stays servable");
     }
 
     #[test]
     fn rejects_dspine_targets_the_kernels_cannot_serve() {
-        let target = target_qwen3_8b();
-
         let mut wrong_head_dim = dspine_8b_config();
         wrong_head_dim.head_dim = 64;
         let mut target_64 = target_qwen3_8b();
@@ -1221,9 +1254,5 @@ pub(crate) mod tests {
         let mut target_256 = target_qwen3_8b();
         target_256.hidden_size = 256;
         assert!(wrong_hidden.validate_for_target(&target_256).is_err());
-
-        let mut anchor_first = dspine_8b_config();
-        anchor_first.anchor_first = true;
-        assert!(anchor_first.validate_for_target(&target).is_err());
     }
 }
