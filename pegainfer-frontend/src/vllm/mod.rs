@@ -121,6 +121,40 @@ pub async fn serve_with_engine_count(
     .await
 }
 
+/// Serve as [`serve_with_engine_count`] does, behind the caller's routes:
+/// `extend_router` takes the vLLM router and returns the one that listens.
+/// An engine refuses what it does not serve here, with a 400 before the
+/// request reaches it, as the prefill-only contract does.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_router_extension<F>(
+    engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
+    model_path: &Path,
+    served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
+    port: u16,
+    max_model_len: Option<u32>,
+    engine_count: usize,
+    shutdown: CancellationToken,
+    extend_router: F,
+) -> Result<()>
+where
+    F: FnOnce(Router) -> Router,
+{
+    serve_model_on_host_with_router_extension(
+        engine,
+        model_path.to_string_lossy().into_owned(),
+        served_model_name,
+        tool_call_parser,
+        "0.0.0.0".to_string(),
+        port,
+        resolve_max_model_len(model_path, max_model_len),
+        engine_count,
+        shutdown,
+        extend_router,
+    )
+    .await
+}
+
 /// Serve an endpoint that requires `max_tokens=1`.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_prefill_only_with_engine_count(
@@ -133,14 +167,13 @@ pub async fn serve_prefill_only_with_engine_count(
     engine_count: usize,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    serve_model_on_host_with_router_extension(
+    serve_with_router_extension(
         engine,
-        model_path.to_string_lossy().into_owned(),
+        model_path,
         served_model_name,
         tool_call_parser,
-        "0.0.0.0".to_string(),
         port,
-        resolve_max_model_len(model_path, max_model_len),
+        max_model_len,
         engine_count,
         shutdown,
         request_contract::prefill_only_routes,
