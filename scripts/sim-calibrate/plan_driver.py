@@ -21,6 +21,7 @@ from evidence_proxy import EvidenceError, EvidenceProxy, observer_identity
 from manifest import canonical_scheduler_identity
 from profile import verify_fitted_bundle
 from probe import (probe_endpoint, profile_endpoint, profile_listener_matches, requires_cache_reset,
+                   target_runtime_environment, validate_cache_recovery_receipt,
                    validate_profile_binding, validate_reset_receipt)
 from steady_state import compute_statistics
 from vllm_bench import render_command, run_command
@@ -82,33 +83,15 @@ async def profile_server(root: Path, variant: dict, *, binary: Path, model_path:
             _write_atomic(directory / 'stopped.json', {'pid': child.pid, 'returncode': child.returncode})
 
 
-def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
-    """Bind a local already-loaded profile to the listening process, without a generation probe."""
-    if pid is None or pid <= 0:
-        raise EvidenceError('profile-backed variants require --server-pid VARIANT=PID')
-    endpoint = profile_endpoint(variant['identity']['endpoint'])
+def process_binding(base_url: str, pid: int) -> dict:
+    """Attest a local listener and executable without sending generation requests."""
+    endpoint = profile_endpoint(base_url)
     process = Path('/proc') / str(pid)
     namespace = (process / 'ns/net').stat()
     own_namespace = Path('/proc/self/ns/net').stat()
     if (namespace.st_dev, namespace.st_ino) != (own_namespace.st_dev, own_namespace.st_ino):
         raise EvidenceError('profile PID is in a different network namespace')
     args = [x.decode() for x in (process / 'cmdline').read_bytes().split(b'\0') if x]
-    def option(name):
-        for index, arg in enumerate(args):
-            if arg == name and index + 1 < len(args):
-                return args[index+1]
-            if arg.startswith(name + '='):
-                return arg.split('=', 1)[1]
-        return None
-    configured = checked_path(root, variant['profile_path'])
-    supplied = option('--profile')
-    if not supplied:
-        raise EvidenceError('server process was not started with --profile')
-    actual = Path(supplied)
-    if not actual.is_absolute():
-        actual = (process / 'cwd').resolve() / actual
-    if actual.resolve() != configured:
-        raise EvidenceError('live server profile path differs from campaign binding')
     port = endpoint.port
     sockets = {os.readlink(fd) for fd in (process / 'fd').iterdir() if fd.exists() and fd.is_socket()}
     listeners = []
@@ -129,9 +112,38 @@ def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
             listeners.append(listener)
     binding = {'endpoint': {'address': endpoint.host, 'port': port},
                'listeners': sorted(listeners, key=lambda row: (row['address'], row['inode']))}
-    validate_profile_binding(variant['identity']['endpoint'], binding)
+    validate_profile_binding(base_url, binding)
     stat = (process / 'stat').read_text().rsplit(')', 1)[1].split()
     start_ticks = int(stat[19])
+    return {**binding, 'server_pid': pid, 'process_start_ticks': start_ticks,
+            'network_namespace': {'device': namespace.st_dev, 'inode': namespace.st_ino},
+            'executable': file_reference((process / 'exe').resolve()), 'argv': args}
+
+
+def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
+    """Bind a local already-loaded profile to the listening process, without a generation probe."""
+    if pid is None or pid <= 0:
+        raise EvidenceError('profile-backed variants require --server-pid VARIANT=PID')
+    binding = process_binding(variant['identity']['endpoint'], pid)
+    process = Path('/proc') / str(pid)
+    args = binding['argv']
+    def option(name):
+        for index, arg in enumerate(args):
+            if arg == name and index + 1 < len(args):
+                return args[index+1]
+            if arg.startswith(name + '='):
+                return arg.split('=', 1)[1]
+        return None
+    configured = checked_path(root, variant['profile_path'])
+    supplied = option('--profile')
+    if not supplied:
+        raise EvidenceError('server process was not started with --profile')
+    actual = Path(supplied)
+    if not actual.is_absolute():
+        actual = (process / 'cwd').resolve() / actual
+    if actual.resolve() != configured:
+        raise EvidenceError('live server profile path differs from campaign binding')
+    start_ticks = binding['process_start_ticks']
     started = time.time() - float(Path('/proc/uptime').read_text().split()[0]) + start_ticks / os.sysconf('SC_CLK_TCK')
     if configured.stat().st_mtime > started + 0.02:
         raise EvidenceError('profile changed after server start; restart server before sampling')
@@ -147,10 +159,7 @@ def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
         raise EvidenceError('profile/model identity mismatch')
     if profile.get('scheduler') != canonical_scheduler_identity(variant['runtime']['scheduler']):
         raise EvidenceError('profile scheduler differs from configured runtime')
-    return {**binding, 'profile': file_reference(configured), 'manifest': file_reference(manifest_path),
-            'server_pid': pid, 'process_start_ticks': start_ticks,
-            'network_namespace': {'device': namespace.st_dev, 'inode': namespace.st_ino},
-            'executable': file_reference((process / 'exe').resolve()), 'argv': args}
+    return {**binding, 'profile': file_reference(configured), 'manifest': file_reference(manifest_path)}
 
 
 def verify_attempt_binding(campaign: dict, variant_name: str, root: Path, binding: dict, cell_id: str) -> None:
@@ -167,7 +176,7 @@ def verify_attempt_binding(campaign: dict, variant_name: str, root: Path, bindin
             raise EvidenceError('profile server binding changed')
 
 
-async def reset_cache(base: str, root: Path, timeout: float) -> None:
+async def reset_cache(base: str, root: Path, timeout: float) -> dict:
     """A false or unavailable reset cannot establish a cold target."""
     async with aiohttp.ClientSession(trust_env=False, timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         async with session.post(base + '/reset_prefix_cache', allow_redirects=False) as response:
@@ -175,6 +184,81 @@ async def reset_cache(base: str, root: Path, timeout: float) -> None:
             receipt = {'status': response.status, 'body': body.decode(errors='replace')}
             _write_atomic(root / 'reset.json', receipt)
             validate_reset_receipt({**receipt, 'body': body})
+            return receipt
+
+
+class TargetProcess:
+    """Restart only a process created by this attempt, keeping its launch evidence."""
+
+    def __init__(self, variant: dict, directory: Path, launcher: dict):
+        self.variant, self.directory, self.launcher = variant, directory, launcher
+        self.child = None
+        self.log = None
+
+    async def stop(self) -> None:
+        if self.child is not None:
+            try:
+                os.killpg(self.child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            if self.child.returncode is None:
+                try:
+                    await asyncio.wait_for(self.child.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    pass
+            # The leader can exit before its frontend workers. Reap the whole
+            # owned group even when asyncio has already reaped that leader.
+            try:
+                os.killpg(self.child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await self.child.wait()
+            _write_atomic(self.directory / 'target-stopped.json',
+                          {'pid': self.child.pid, 'returncode': self.child.returncode})
+            self.child = None
+        if self.log is not None:
+            self.log.close()
+            self.log = None
+
+    async def restart(self, directory: Path) -> tuple[dict, dict]:
+        await self.stop()
+        launch, identity = self.variant['launch'], self.variant['identity']
+        endpoint = profile_endpoint(identity['endpoint'])
+        # An occupied endpoint is caller-owned; never terminate it or relabel it.
+        try:
+            connection = socket.create_connection((endpoint.host, endpoint.port), timeout=0.2)
+        except OSError:
+            pass
+        else:
+            connection.close()
+            raise EvidenceError('managed target endpoint is already occupied')
+        if file_reference(Path(launch['argv'][0])) != launch['executable']:
+            raise EvidenceError('frozen target executable changed')
+        if file_reference(Path(self.launcher['path']))['sha256'] != self.launcher['sha256']:
+            raise EvidenceError('frozen process launcher changed')
+        self.directory = directory
+        self.log = (directory / 'target-server.log').open('xb')
+        environment = {k: v for k, v in os.environ.items() if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
+        for name in target_runtime_environment(environment):
+            environment.pop(name)
+        environment.update(launch.get('environment', {}))
+        self.child = await asyncio.create_subprocess_exec(
+            self.launcher['path'], '--pdeathsig', 'KILL', '--', *launch['argv'],
+            stdout=self.log, stderr=asyncio.subprocess.STDOUT, env=environment, start_new_session=True)
+        _write_atomic(directory / 'target-started.json', {'pid': self.child.pid, 'launch': launch})
+        deadline = time.monotonic() + launch['startup_timeout']
+        while True:
+            if self.child.returncode is not None:
+                raise EvidenceError(f'managed target exited ({self.child.returncode}); see {directory}')
+            try:
+                readiness = await asyncio.to_thread(probe_endpoint, identity['endpoint'],
+                                                    expected_model=identity['model'], timeout=1)
+                process = process_binding(identity['endpoint'], self.child.pid)
+                return readiness, process
+            except (OSError, ValueError, RuntimeError) as exc:
+                if time.monotonic() >= deadline:
+                    raise EvidenceError(f'managed target not ready; see {directory}: {exc}') from exc
+                await asyncio.sleep(0.1)
 
 
 async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
@@ -189,19 +273,44 @@ async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
     errors = []
     interrupted = None
     proxy = None
+    managed = (TargetProcess(variant, directory, client['process_launcher'])
+               if variant_name == 'target' and plan['workload_kind'] == 'cached_prefill'
+               and plan['cache_lifecycle'].get('recovery') == 'restart' else None)
     try:
         _write_atomic(directory / 'observer.json', client['observer'])
         _write_atomic(directory / 'binding.json', binding)
-        probe = await asyncio.to_thread(probe_endpoint, identity['endpoint'], expected_model=identity['model'],
-                                        timeout=min(10, timeout), attempts=1)
-        _write_atomic(directory / 'probe.json', probe)
+        if managed is None:
+            probe = await asyncio.to_thread(probe_endpoint, identity['endpoint'], expected_model=identity['model'],
+                                            timeout=min(10, timeout), attempts=1)
+            _write_atomic(directory / 'probe.json', probe)
         async with EvidenceProxy(identity['endpoint'], identity['model'], plan, directory, timeout=timeout) as proxy:
             for batch in plan['batches']:
                 name = f"{batch['phase']}-{batch['repeat']}"
                 batch_root = directory / 'batches' / name
                 batch_root.mkdir(parents=True)
                 if requires_cache_reset(plan, variant_name, variant['runtime'], batch):
-                    await reset_cache(identity['endpoint'], batch_root, min(10, timeout))
+                    if plan['workload_kind'] == 'cached_prefill':
+                        receipt = {'method': plan['cache_lifecycle'].get('recovery', 'reset'),
+                                   'group': {k: batch[k] for k in ('before_phase', 'before_repeat')},
+                                   'variant_identity': identity, 'started_ns': time.monotonic_ns()}
+                        if managed is not None:
+                            readiness, process = await managed.restart(batch_root)
+                            receipt.update(launch=variant['launch'], process=process)
+                        else:
+                            receipt['reset'] = await reset_cache(identity['endpoint'], batch_root, min(10, timeout))
+                            readiness = await asyncio.to_thread(probe_endpoint, identity['endpoint'],
+                                                                expected_model=identity['model'], timeout=min(10, timeout))
+                        receipt.update(readiness=readiness, ready_ns=time.monotonic_ns())
+                        _write_atomic(batch_root / 'recovery.json', receipt)
+                        validate_cache_recovery_receipt(receipt, plan, batch, variant_identity=identity,
+                                                        launch=variant.get('launch'))
+                        if not (directory / 'probe.json').exists():
+                            _write_atomic(directory / 'probe.json', readiness)
+                    else:
+                        await reset_cache(identity['endpoint'], batch_root, min(10, timeout))
+                if plan['workload_kind'] == 'cached_prefill':
+                    from cached_prefix_workload import batch_payload
+                    (batch_root / 'custom.jsonl').write_bytes(batch_payload(plan, batch))
                 prefix = f"c2-{campaign['campaign_id'][:12]}-{variant_name}-{attempt}-{uuid.uuid4().hex}-{name}-"
                 proxy.register(batch, prefix, batch_root)
                 argv = render_command(plan, batch, binary=Path(client['binary']), endpoint=proxy.url,
@@ -220,6 +329,9 @@ async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
         errors.append(f'{type(exc).__name__}: {exc}')
         if isinstance(exc, asyncio.CancelledError):
             interrupted = exc
+    finally:
+        if managed is not None:
+            await managed.stop()
     if proxy:
         errors.extend(proxy.errors)
     try:
@@ -264,10 +376,12 @@ async def run_campaign(root: Path, *, variants: list[str], selectors: list[str] 
             if matches[0] not in chosen:
                 chosen.append(matches[0])
         cells = chosen
-    if not cells or any(c['kind'] not in ('cold_prefill','steady_decode') for c in cells):
-        raise EvidenceError('unsupported workload: C2 executes cold_prefill/steady_decode only; select cells explicitly')
+    if not cells or any(c['kind'] not in ('cold_prefill','steady_decode','cached_prefill') for c in cells):
+        raise EvidenceError('unsupported workload')
     if not variants or len(variants) != len(set(variants)) or any(v not in ('target','zero_cost','sim') for v in variants):
         raise EvidenceError('select distinct target/zero_cost/sim variants')
+    if any(c['kind'] == 'cached_prefill' for c in cells) and 'sim' in variants:
+        raise EvidenceError('cached simulator runtime is not implemented; collect target/zero_cost for offline calibration')
     client = campaign['client']
     from campaign import _assets
     import copy

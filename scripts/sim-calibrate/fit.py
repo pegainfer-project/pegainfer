@@ -16,7 +16,7 @@ from typing import Any, Iterable, Sequence
 from steady_state import StatisticsError, aggregate_request_samples
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FIT_SPLITS = ("train",)
 VALIDATION_SPLITS = ("threshold_validation",)
 HELD_OUT_SPLITS = ("held_out_mixed", "sealed_test")
@@ -315,135 +315,97 @@ def _surface_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[str,
     }
 
 
-def _cached_observations(document: dict[str, Any], *, metric: str) -> tuple[list[dict[str, Any]], list[str]]:
-    samples: list[dict[str, Any]] = []
-    rejected: list[str] = []
-    for cell in document.get("cells", []):
-        if not isinstance(cell, dict) or cell.get("status") != "measured":
+def _cached_observations(document: dict[str, Any], *, metric: str) -> list[dict[str, Any]]:
+    """Reapply the acquisition cache contract before accepting signed differences."""
+    from cached_prefill import validate_cached_measurement
+    samples = []
+    for cell in document['cells']:
+        if cell['kind'] != 'cached_prefill' or cell['split'] != 'train':
             continue
-        if cell.get("kind") != "cached_prefill" or cell.get("split") not in FIT_SPLITS:
-            continue
-        for observation in cell.get("observations", []):
-            if not isinstance(observation, dict):
-                continue
-            reason: str | None = None
-            evidence = observation.get("cache_hit_evidence", {}).get("target")
-            if not isinstance(evidence, dict):
-                reason = "missing positive cache hit evidence"
-            elif not isinstance(evidence.get("cached_tokens"), int) or evidence.get("cached_tokens", 0) <= 0:
-                reason = "cached_tokens evidence must be positive"
-            elif not any(
-                isinstance(evidence.get(field), str) and evidence.get(field)
-                for field in ("shared_prefix_id", "shared_prefix_hash", "prefix_hash")
-            ):
-                reason = "missing shared-prefix identity evidence"
-            elif not isinstance(observation.get("shared_prefix"), dict):
-                reason = "missing manifest shared-prefix identity"
-            elif evidence.get("shared_prefix_id") != observation["shared_prefix"].get("identity"):
-                reason = "shared-prefix identity evidence does not match manifest"
-            elif not (
-                evidence.get("cache_hit") is True
-                or evidence.get("prefix_cache_hit") is True
-                or evidence.get("hit") is True
-            ):
-                reason = "cache hit evidence is not positive"
-            elif evidence.get("duration_includes_uncached_tail") is not True:
-                reason = "duration lacks explicit uncached-tail accounting"
-            if reason is not None:
-                rejected.append(f"{observation.get('cell_id', '<unknown>')}: {reason}")
-                continue
-            if observation.get("attribution", {}).get(metric) != "black_box_effective":
-                rejected.append(f"{observation.get('cell_id', '<unknown>')}: attribution is uncertain")
-                continue
-            try:
-                cached_tokens = _finite(evidence["cached_tokens"], "cached_tokens")
-                input_tokens = _finite(observation.get("input_tokens"), "input_tokens")
-                value = _finite(observation.get("effective", {}).get(metric), f"effective.{metric}")
-            except FitError as exc:
-                rejected.append(f"{observation.get('cell_id', '<unknown>')}: {exc}")
-                continue
-            new_tokens = input_tokens - cached_tokens
-            if new_tokens <= 0.0:
-                rejected.append(f"{observation.get('cell_id', '<unknown>')}: uncached new_tokens must be positive")
-                continue
-            if observation.get("prefix_tokens") != int(cached_tokens):
-                rejected.append(f"{observation.get('cell_id', '<unknown>')}: metadata prefix_tokens disagrees with evidence")
-                continue
-            if evidence.get("expected_cached_tokens") != int(cached_tokens):
-                rejected.append(f"{observation.get('cell_id', '<unknown>')}: expected cached token count disagrees with evidence")
-                continue
-            samples.append(
-                {
-                    "cell_id": observation.get("cell_id"),
-                    "split": observation.get("split"),
-                    "new_tokens": new_tokens,
-                    "prefix_tokens": cached_tokens,
-                    "value": value,
-                    "dispersion": cell.get("summaries", {}).get(metric, {}).get("effective", {}),
-                    "cache_evidence": evidence,
-                    "timing_semantics": observation.get("timing_semantics", {}),
-                    "token_timing_valid": observation.get("token_timing_valid", {}),
-                }
-            )
-    return samples, rejected
+        if cell['status'] != 'measured' or cell['training']['qualified'] is not True:
+            raise FitError('cached-prefill training cell is incomplete or unqualified')
+        plan = cell['plan']
+        for row in cell['observations']:
+            if metric in row['fit_policy']['excluded_metrics']:
+                raise FitError('required cached-prefill TTFT cannot be excluded from fitting')
+            logical = row['logical_request']
+            for role in ('target', 'zero_cost'):
+                validate_cached_measurement(plan, row['measurements'][role], logical)
+            if row['metric_source'] != 'paired_request_ttft' or row['reference_interval_ms'] != 0:
+                raise FitError('cached-prefill requires paired TTFT against the full zero-cost reference')
+            if (row['prefix_tokens'], row['new_tokens']) != (plan['prefix_tokens'], plan['new_tokens']):
+                raise FitError('cached-prefill coordinates differ from the frozen plan')
+            samples.append({
+                'cell_id': row['cell_id'], 'split': row['split'], 'repeat': row['repeat'], 'index': row['index'],
+                'prefix_tokens': row['prefix_tokens'], 'new_tokens': row['new_tokens'],
+                'value': _finite(row['effective'][metric], 'paired effective', nonnegative=False),
+                'dispersion': cell['training']['dispersion'],
+                'timing_semantics': {metric: 'paired_request_ttft'}, 'token_timing_valid': {},
+            })
+    return samples
 
 
 def _cached_surface_fit(
-    samples: Sequence[dict[str, Any]],
-    *,
-    metric: str,
-    document: dict[str, Any],
+    samples: Sequence[dict[str, Any]], *, metric: str, document: dict[str, Any],
 ) -> dict[str, Any]:
-    if not samples:
-        raise FitError("no cached-prefill observation has complete positive cache evidence")
-    new_axis = sorted({sample["new_tokens"] for sample in samples})
-    prefix_axis = sorted(
-        {
-            sample.get("prefix_tokens", sample.get("cached_tokens"))
-            for sample in samples
-            if sample.get("prefix_tokens", sample.get("cached_tokens")) is not None
-        }
-    )
-    if len(new_axis) < 2 or len(prefix_axis) < 2:
-        raise FitError("cached-prefill surface requires at least two new-token and prefix-token points")
-    values: dict[tuple[float, float], list[float]] = {}
+    """Fit only the complete compiled grid, without inferring axes from survivors."""
+    required = document.get('cached_requirements')
+    if not isinstance(required, list) or not required:
+        raise FitError('cached-prefill surface requires the compiled grid declaration')
+    declared = {row['cell_id']: row for row in required}
+    if len(declared) != len(required):
+        raise FitError('duplicate cached-prefill compiled cell identity')
+    families = {}
+    for row in required:
+        if row['concurrency'] != 1 or type(row['repeats']) is not int or row['repeats'] < 1:
+            raise FitError('cached-prefill requires concurrency=1 and positive measured repeats')
+        families.setdefault(row['matrix_name'], []).append(row)
+    for name, rows in families.items():
+        axes = rows[0]['axes']
+        prefixes = set(axes['prefix_tokens'])
+        tails = set(axes['new_tokens'])
+        points = {(row['prefix_tokens'], row['new_tokens']) for row in rows}
+        if (any(row['axes'] != axes for row in rows) or len(prefixes) < 2 or len(tails) < 2
+                or len(points) != len(rows) or points != {(p, n) for p in prefixes for n in tails}):
+            raise FitError(f'cached-prefill compiled grid is incomplete for matrix {name}')
+    new_axis = sorted({row['new_tokens'] for row in required})
+    prefix_axis = sorted({row['prefix_tokens'] for row in required})
+    expected = {(row['cell_id'], repeat, 0) for row in required for repeat in range(row['repeats'])}
+    observed = set()
+    values = {}
     for sample in samples:
-        prefix_tokens = sample.get("prefix_tokens", sample.get("cached_tokens"))
-        if prefix_tokens is None:
-            raise FitError("cached-prefill sample has no prefix_tokens")
-        values.setdefault((prefix_tokens, sample["new_tokens"]), []).append(sample["value"])
+        identity = (sample['cell_id'], sample['repeat'], sample['index'])
+        if identity in observed or identity not in expected:
+            raise FitError('duplicate or unexpected cached-prefill measured sample')
+        observed.add(identity)
+        row = declared[sample['cell_id']]
+        point = (sample['prefix_tokens'], sample['new_tokens'])
+        if point != (row['prefix_tokens'], row['new_tokens']):
+            raise FitError('cached-prefill sample coordinates differ from the compiled grid')
+        values.setdefault(point, []).append(_finite(sample['value'], 'paired effective', nonnegative=False))
+    if observed != expected:
+        raise FitError('cached-prefill grid is incomplete: missing required measured samples')
     missing = [(prefix, new) for prefix in prefix_axis for new in new_axis if (prefix, new) not in values]
     if missing:
-        raise FitError(f"cached-prefill surface grid is incomplete: {missing[:4]}")
-    grid = [[statistics.median(values[(prefix, new)]) for new in new_axis] for prefix in prefix_axis]
-    grid_dispersion = [[_median_mad(values[(prefix, new)]) for new in new_axis] for prefix in prefix_axis]
-    normalized_source = document.get("source", {})
-    cache_policy = normalized_source.get("cache_policy") if isinstance(normalized_source, dict) else None
+        raise FitError(f'cached-prefill surface grid is incomplete: {missing[:4]}')
+    grid = [[_finite(statistics.median(values[(prefix, new)]), 'cached cell representative')
+             for new in new_axis] for prefix in prefix_axis]
+    dispersion = [[_median_mad(values[(prefix, new)]) for new in new_axis] for prefix in prefix_axis]
+    domain = {'prefix_tokens': {'min': prefix_axis[0], 'max': prefix_axis[-1]},
+              'new_tokens': {'min': new_axis[0], 'max': new_axis[-1]}, 'ood_policy': 'fail'}
     return {
-        "name": "cached_prefill_surface",
-        "status": "fitted",
-        "kind": "cached_prefill",
-        "metric": metric,
-        "timing_semantics": "black_box_effective",
-        "duration_semantics": "effective_wall_including_uncached_tail",
-        "formula": "prefix_cache(prefix_tokens, new_tokens)",
-        "interpolation": "bilinear_inside_measured_domain",
-        "axes": {"prefix_tokens": prefix_axis, "new_tokens": new_axis},
-        "values_ms": grid,
-        "dispersion": grid_dispersion,
-        "coverage": {
-            "new_tokens": {"min": new_axis[0], "max": new_axis[-1]},
-            "prefix_tokens": {"min": prefix_axis[0], "max": prefix_axis[-1]},
-            "ood_policy": "fail",
-        },
-        "source": {
-            **_source_metadata(samples, metric=metric),
-            "cache_policy": cache_policy,
-            "block_alignment": (cache_policy or {}).get("block_alignment") if isinstance(cache_policy, dict) else None,
-            "target_identity": normalized_source.get("target_identity") if isinstance(normalized_source, dict) else None,
-            "source_digests": normalized_source.get("source_digests") if isinstance(normalized_source, dict) else None,
-            "cache_evidence": "positive_shared_prefix_identity_and_uncached_tail",
-        },
+        'name': 'cached_prefill_surface', 'status': 'fitted', 'kind': 'cached_prefill', 'metric': metric,
+        'timing_semantics': 'black_box_effective',
+        'duration_semantics': 'paired_ttft_difference_including_uncached_tail',
+        'formula': 'prefix_cache(prefix_tokens, new_tokens)',
+        'interpolation': 'bilinear_inside_measured_domain',
+        'aggregation': 'per_request_target_minus_zero_reference_then_measured_repeat_median',
+        'axes': {'prefix_tokens': prefix_axis, 'new_tokens': new_axis},
+        'values_ms': grid, 'dispersion': dispersion, 'coverage': domain,
+        'runtime_enabled': False, 'validation_status': 'offline_fit_only',
+        'source': {**_source_metadata(samples, metric=metric), 'required_cells': required,
+                   'cache_evidence': 'exact_requested_observed_prefix_and_uncached_tail',
+                   'training': document.get('source', {})},
     }
 
 
@@ -473,7 +435,7 @@ def evaluate_surface(candidate: dict[str, Any], requests: float, kv_tokens: floa
 
 def evaluate_cached_surface(candidate: dict[str, Any], prefix_tokens: float, new_tokens: float) -> float:
     axes = candidate["axes"]
-    prefix_axis = axes.get("prefix_tokens", axes.get("cached_tokens"))
+    prefix_axis = axes["prefix_tokens"]
     new_axis = axes["new_tokens"]
     if not isinstance(prefix_axis, list):
         raise FitError("cached-prefill candidate has no prefix_tokens axis")
@@ -518,18 +480,20 @@ def fit_normalized(document: dict[str, Any], *, source_digest: str | None = None
         raise FitError(f'training evidence verification failed: {exc}') from exc
     prefill = _training_observations(document, kind='cold_prefill', metric='ttft_ms')
     decode = _training_observations(document, kind='steady_decode', metric='tpot_ms')
+    cached = _cached_observations(document, metric='ttft_ms')
     candidates = [
         _fit_or_unsupported('cold_prefill_piecewise_linear', 'cold_prefill', 'ttft_ms', _piecewise_fit, prefill),
         _fit_or_unsupported('decode_additive', 'steady_decode', 'tpot_ms', _additive_fit, decode),
         _fit_or_unsupported('decode_2d_surface', 'steady_decode', 'tpot_ms', _surface_fit, decode),
-        {'name': 'cached_prefill_surface', 'kind': 'cached_prefill', 'metric': 'ttft_ms',
-         'status': 'unsupported', 'reason': 'cached training integration deferred to C8'},
+        _fit_or_unsupported('cached_prefill_surface', 'cached_prefill', 'ttft_ms',
+                            lambda samples, metric: _cached_surface_fit(samples, metric=metric, document=document), cached),
     ]
     failures = [c['name'] for c in candidates if c['status'] != 'fitted'
-                and ((c['kind'] == 'steady_decode' and decode) or (c['kind'] == 'cold_prefill' and prefill))]
+                and ((c['kind'] == 'steady_decode' and decode) or (c['kind'] == 'cold_prefill' and prefill)
+                     or (c['kind'] == 'cached_prefill' and document['cached_requirements']))]
     normalized_source = document['source']
     fitter_sources = {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                     for name in ('fit.py', 'steady_state.py')}
+                     for name in ('fit.py', 'steady_state.py', 'cached_prefill.py')}
     if source_digest is None:
         source_digest = hashlib.sha256((json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + '\n').encode()).hexdigest()
     return {

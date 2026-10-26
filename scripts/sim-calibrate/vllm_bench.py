@@ -88,21 +88,33 @@ def render_command(plan: dict, batch: dict, *, binary: Path, endpoint: str, mode
     """Render an explicitly registered batch; no cell/repeat policy lives here."""
     from request_plan import validate_plan
     validate_plan(plan)
-    if plan['workload_kind'] not in ('cold_prefill', 'steady_decode'):
-        raise VllmBenchError('unsupported workload until its dedicated migration')
     if batch not in plan['batches']:
         raise VllmBenchError('batch is absent from immutable plan')
-    if plan['generation']['prompt_representation'] != 'token_ids':
+    cached = plan['workload_kind'] == 'cached_prefill'
+    if cached:
+        from cached_prefix_workload import batch_payload
+        dataset = result_dir / 'custom.jsonl'
+        try:
+            if dataset.read_bytes() != batch_payload(plan, batch):
+                raise VllmBenchError('custom dataset differs from frozen batch content/row order')
+        except OSError as exc:
+            raise VllmBenchError(f'cannot read frozen custom dataset {dataset}: {exc}') from exc
+    elif plan['generation']['prompt_representation'] != 'token_ids':
         raise VllmBenchError('cold/decode require token-ID prompts')
     argv = [str(binary), '--backend', 'openai', '--base-url', endpoint, '--model', model,
-            '--tokenizer', tokenizer, '--dataset-name', 'random',
-            '--num-prompts', str(plan['concurrency']), '--max-concurrency', str(plan['concurrency']),
-            '--random-input-len', str(plan['shape']['input_tokens']),
-            '--random-output-len', str(plan['shape']['output_tokens']), '--random-range-ratio', '0',
-            '--seed', str(batch['seed']), '--num-warmups', '0', '--ready-check-timeout-sec', '0',
-            '--request-rate', 'inf', '--disable-shuffle', '--prompt-token-ids', '--no-steady-state',
+            '--tokenizer', tokenizer, '--dataset-name', 'custom' if cached else 'random',
+            '--num-prompts', str(plan['concurrency']), '--max-concurrency', str(plan['concurrency'])]
+    if cached:
+        argv.extend(('--dataset-path', str(dataset), '--custom-output-len', '-1', '--no-oversample',
+                     '--skip-chat-template'))
+    else:
+        argv.extend(('--random-input-len', str(plan['shape']['input_tokens']),
+                     '--random-output-len', str(plan['shape']['output_tokens']), '--random-range-ratio', '0',
+                     '--prompt-token-ids'))
+    argv.extend(('--seed', str(batch['seed']), '--num-warmups', '0', '--ready-check-timeout-sec', '0',
+            '--request-rate', 'inf', '--disable-shuffle', '--no-steady-state',
             '--save-result', '--save-detailed', '--result-dir', str(result_dir),
-            '--result-filename', 'bench-result.json', '--request-id-prefix', request_id_prefix]
+            '--result-filename', 'bench-result.json', '--request-id-prefix', request_id_prefix))
     sampling = plan['sampling']
     if sampling['ignore_eos']:
         argv.append('--ignore-eos')

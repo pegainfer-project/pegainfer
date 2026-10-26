@@ -6,7 +6,7 @@ import math
 import re
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ENVELOPE_KIND = "measurement_envelope"
 ROW_KIND = "measurement_row"
 PHASES = ("warmup", "bootstrap", "measured")
@@ -31,6 +31,7 @@ REFERENCE_POLICIES = {
     "cold_prefill": {"kind": "cold_zero", "interval_source": "none", "encoding": "integer_us_round_nearest"},
     "steady_decode": {"kind": "target_decode_mean", "interval_source": "qualified_train_target_cell_mean",
                       "encoding": "integer_us_round_nearest"},
+    "cached_prefill": {"kind": "cached_zero", "interval_source": "none", "encoding": "integer_us_round_nearest"},
 }
 
 

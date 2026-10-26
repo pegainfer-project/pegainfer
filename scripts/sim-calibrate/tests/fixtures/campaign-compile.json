@@ -176,7 +176,8 @@
           "mode": "fixed_batch"
         },
         "generation": {
-          "dataset": "prefix_repetition"
+          "dataset": "custom",
+          "prompt_representation": "text"
         },
         "shared_prefix": {
           "identity": "test-prefix",
@@ -186,7 +187,8 @@
           "namespace": "cached-train",
           "reset_before": "repeat",
           "bootstrap_repeats": 1
-        }
+        },
+        "bootstrap_output_tokens": 1
       },
       "decode-heldout": {
         "kind": "steady_decode",
@@ -248,5 +250,5 @@
     "artifact_root": "artifacts"
   },
   "kind": "campaign_spec",
-  "schema_version": 7
+  "schema_version": 8
 }

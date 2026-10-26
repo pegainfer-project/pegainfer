@@ -39,19 +39,20 @@ class BaselineTests(unittest.TestCase):
                 ('steady_decode', [0, 0], False), ('steady_decode', [-1, -2], False),
                 ('steady_decode', [-10, 30], True), ('steady_decode', [float('inf'), 1], False),
                 ('cold_prefill', [-10, 10], True), ('cold_prefill', [-10, 8], False),
-                ('cold_prefill', [float('nan'), 2], False)):
+                ('cold_prefill', [float('nan'), 2], False),
+                ('cached_prefill', [-10, 10], True), ('cached_prefill', [-10, 8], False)):
             with self.subTest(kind=kind, effective=effective):
                 cell = {'kind': kind, 'cell_id': 'cell', 'concurrency': 1, 'repeats': 2}
                 rows = [{'key': str(i), 'repeat': i, 'index': 0,
                          'decode_window_tpot_ms': {'target': value + 1, 'zero_cost': 2},
                          'measurements': {'target': {'ttft_ms': value + 1}, 'zero_cost': {'ttft_ms': 1}}}
                         for i, value in enumerate(effective)]
-                result = derive_cell(cell, rows, {'interval_us': 1000})
+                result = derive_cell(cell, rows, {'interval_us': 0 if kind == 'cached_prefill' else 1000})
                 self.assertEqual(result['qualified'], qualified)
                 self.assertEqual(len(rows), 2)
                 json.dumps(result, allow_nan=False)
                 json.dumps([{'effective': r['effective'], 'residual': r['baseline_residual']} for r in rows], allow_nan=False)
-                if kind == 'cold_prefill' and qualified:
+                if kind in ('cold_prefill', 'cached_prefill') and qualified:
                     self.assertEqual(result['representative'], 0)
 
     def test_preparation_requires_targets_and_freezes_profiles_without_heldout(self):

@@ -52,6 +52,7 @@ def make_bundle(base: Path, *, cached=False, reset_before=None, full_train=False
         }
         spec['workload']['matrices']['cold'].pop('num_ctx')
     if cached:
+        cached_matrix.update(warmup_repeats=1, repeats=2, output_tokens=1)
         spec['workload']['matrices']['cached'] = cached_matrix
     path.write_text(json.dumps(spec))
     campaign = compile_campaign(path)
@@ -78,7 +79,7 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
     for role in roles:
         with ExecutionStore(root, campaign['campaign_id']) as store:
             for cell in campaign['workload']['cells']:
-                if cell['split'] != split or cell['kind'] == 'cached_prefill':
+                if cell['split'] != split:
                     continue
                 plan = build_plan(cell, campaign['client'])
                 identity, client = campaign['variants'][role]['identity'], campaign['client']
@@ -107,8 +108,21 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                     relative = f"batches/{batch['phase']}-{batch['repeat']}"
                     batch_root = directory / relative
                     if requires_cache_reset(plan, role, campaign['variants'][role]['runtime'], batch):
-                        _write_atomic(batch_root / 'reset.json', {'status': 200, 'body': '{"success": true}'})
+                        if cell['kind'] == 'cached_prefill':
+                            _write_atomic(batch_root / 'reset.json', {'status': 200, 'body': '{"success": true}'})
+                            _write_atomic(batch_root / 'recovery.json', {
+                                'method': 'reset', 'group': {key: batch[key] for key in ('before_phase', 'before_repeat')},
+                                'started_ns': b * 1_000_000_000 + 100_000_000,
+                                'ready_ns': b * 1_000_000_000 + 200_000_000, 'variant_identity': identity,
+                                'readiness': {'endpoint': identity['endpoint'], 'models': {'model_ids': [identity['model']]}},
+                                'reset': {'status': 200, 'body': '{"success": true}'}})
+                        else:
+                            _write_atomic(batch_root / 'reset.json', {'status': 200, 'body': '{"success": true}'})
                     prefix = f'fixture-{role}-{b}-'
+                    if cell['kind'] == 'cached_prefill':
+                        from cached_prefix_workload import batch_payload
+                        batch_root.mkdir(parents=True, exist_ok=True)
+                        (batch_root / 'custom.jsonl').write_bytes(batch_payload(plan, batch))
                     argv = render_command(plan, batch, binary=Path(client['binary']), endpoint='http://127.0.0.1:1',
                                           model=identity['model'], result_dir=batch_root, request_id_prefix=prefix,
                                           tokenizer=client['tokenizer'])
@@ -123,20 +137,25 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                         request_relative = f'{relative}/requests/{instance}'
                         request = directory / request_relative
                         request.mkdir(parents=True)
-                        body = {'model': identity['model'], 'prompt': [1] * plan['shape']['input_tokens'],
-                                'max_tokens': plan['shape']['output_tokens'], 'stream': True, 'return_token_ids': True, 'echo': False,
+                        request_shape = logical[key]
+                        body = {'model': identity['model'], 'prompt': request_shape.get('prompt', [1] * request_shape['input_tokens']),
+                                'max_tokens': request_shape['output_tokens'], 'stream': True, 'return_token_ids': True, 'echo': False,
                                 'stream_options': {'include_usage': True}, **plan['sampling']}
                         _write_atomic(request / 'request.json', body)
                         (request / 'request-body.bin').write_bytes(json.dumps(body).encode())
-                        count = plan['shape']['output_tokens']
+                        count = request_shape['output_tokens']
                         chunks = [event({'index': 0, 'token_ids': list(range(1, min(count, 2) + 1)), 'text': '',
-                                         'finish_reason': 'length' if count <= 2 else None})]
+                                         'finish_reason': 'length' if count <= 2 else None},
+                                        **({'prompt_token_ids': request_shape['token_ids']} if cell['kind'] == 'cached_prefill' else {}))]
                         chunks.extend(event({'index': 0, 'token_ids': [j], 'text': 'x',
                                              'finish_reason': 'length' if j == count else None})
                                       for j in range(3, count + 1))
-                        chunks.append(event(usage={'prompt_tokens': plan['shape']['input_tokens'],
+                        chunks.append(event(usage={'prompt_tokens': request_shape['input_tokens'],
                                                   'completion_tokens': count,
-                                                  'total_tokens': plan['shape']['input_tokens'] + count}) + b'data: [DONE]\r\n\r\n')
+                                                  'total_tokens': request_shape['input_tokens'] + count,
+                                                  **({'prompt_tokens_details': {'cached_tokens': cell['prefix_tokens']
+                                                       if role == 'target' and batch['phase'] != 'bootstrap' else 0}}
+                                                     if cell['kind'] == 'cached_prefill' else {})}) + b'data: [DONE]\r\n\r\n')
                         payload = b''.join(chunks)
                         start = 1_000_000_000 + b * 1_000_000_000 + i * 2_000_000
                         parser = SSEParser()
@@ -199,12 +218,15 @@ class NormalizeTests(unittest.TestCase):
             collect_fixture(root, campaign)
             document = normalize_campaign(root, scope='train')
             self.assertEqual(document['status'], 'succeeded', document['failures'])
-            self.assertEqual(document['matched_count'], 4)
-            self.assertEqual(len(document['deferred_cells']), 4)
+            self.assertEqual(document['matched_count'], 12)
+            self.assertEqual(len(document['deferred_cells']), 0)
             self.assertEqual(document['required_roles'], ['target', 'zero_cost'])
             self.assertTrue(document['fit_ready'])
             for observation in document['observations']:
                 self.assertEqual(observation['split'], 'train')
+                if observation['kind'] == 'cached_prefill':
+                    self.assertEqual(observation['effective']['ttft_ms'], 0)
+                    continue
                 self.assertAlmostEqual(observation['baseline_residual']['tpot_ms'], 0)
                 self.assertAlmostEqual(observation['effective']['tpot_ms'], 5)
                 self.assertEqual(observation['reference_interval_ms'], 5)
@@ -237,7 +259,7 @@ class NormalizeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path, spec = make_input(Path(tmp))
             spec['workload']['matrices'] = {}
-            # A nonempty campaign with no train cold/decode still cannot succeed vacuously.
+            # An uncollected cached-only scope cannot succeed vacuously.
             original = json.loads((Path(__file__).parent / 'fixtures/campaign-compile.json').read_text())
             spec['workload']['matrices']['cached'] = original['workload']['matrices']['cached-train']
             path.write_text(json.dumps(spec))

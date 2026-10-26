@@ -64,16 +64,39 @@ class FitTests(unittest.TestCase):
     def test_cached_prefill_bilinear_surface_uses_prefix_and_new_axes(self) -> None:
         samples = [
             {"cell_id": f"cached-{prefix}-{new}", "prefix_tokens": prefix,
-             "new_tokens": new, "value": 3.0 + 0.25 * prefix + 0.5 * new}
+             "new_tokens": new, "value": 3.0 + 0.25 * prefix + 0.5 * new,
+             "repeat": 0, "index": 0}
             for prefix in (16, 32) for new in (4, 8)
         ]
-        candidate = _cached_surface_fit(samples, metric="ttft_ms", document={})
+        document = {'cached_requirements': [
+            {key: sample[key] for key in ('cell_id', 'prefix_tokens', 'new_tokens')} |
+            {'matrix_name': 'cached', 'repeats': 1, 'concurrency': 1,
+             'axes': {'prefix_tokens': [16, 32], 'new_tokens': [4, 8]}}
+            for sample in samples]}
+        candidate = _cached_surface_fit(samples, metric="ttft_ms", document=document)
         self.assertEqual(candidate["axes"], {"prefix_tokens": [16, 32], "new_tokens": [4, 8]})
         self.assertAlmostEqual(evaluate_cached_surface(candidate, 24, 6), 12.0)
         with self.assertRaisesRegex(FitError, "outside measured domain"):
             evaluate_cached_surface(candidate, 40, 6)
         with self.assertRaisesRegex(FitError, "grid is incomplete"):
-            _cached_surface_fit(samples[:-1], metric="ttft_ms", document={})
+            _cached_surface_fit(samples[:-1], metric="ttft_ms", document=document)
+        # Losing a whole axis must not turn the remaining samples into a smaller domain.
+        with self.assertRaisesRegex(FitError, "grid is incomplete"):
+            _cached_surface_fit(samples[:2], metric="ttft_ms", document=document)
+        with self.assertRaisesRegex(FitError, "compiled grid declaration"):
+            _cached_surface_fit(samples, metric="ttft_ms", document={})
+        with self.assertRaisesRegex(FitError, "duplicate"):
+            _cached_surface_fit([*samples, samples[0]], metric="ttft_ms", document=document)
+        # A negative request is retained when its paired-repeat median is nonnegative.
+        for cell in document['cached_requirements']:
+            cell['repeats'] = 2
+        signed = [{**row, 'repeat': repeat, 'value': value}
+                  for row in samples for repeat, value in enumerate((-10, 10))]
+        candidate = _cached_surface_fit(signed, metric='ttft_ms', document=document)
+        self.assertEqual(candidate['values_ms'], [[0, 0], [0, 0]])
+        self.assertEqual(candidate['dispersion'][0][0]['min'], -10)
+        with self.assertRaisesRegex(FitError, 'non-negative'):
+            _cached_surface_fit([{**row, 'value': -1} for row in signed], metric='ttft_ms', document=document)
 
     def test_decode_surface_requires_complete_total_kv_grid(self) -> None:
         samples = [

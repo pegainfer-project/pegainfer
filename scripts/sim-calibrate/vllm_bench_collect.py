@@ -1,4 +1,4 @@
-"""Convert actual proxy evidence to measurement v3; bench JSON is diagnostic only."""
+"""Convert actual proxy evidence; bench JSON is diagnostic only."""
 from __future__ import annotations
 
 import hashlib
@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from cached_prefill import CachedPrefillError, capture_cached_evidence, server_prompt_events, validate_cached_measurement
 from manifest import sha256_json
 from measurement_schema import ROW_KIND, SCHEMA_VERSION, validate_envelope
 
@@ -62,12 +63,16 @@ def convert_evidence(plan: dict, variant: str, identity: dict, root: Path, *,
             body = json.loads((directory / 'request.json').read_text())
             prompt = body.get('prompt')
             normalized = {k: v for k, v in body.items() if k != 'model'}
-            row.update(prompt_sha256=sha256_json(prompt), token_sha256=sha256_json(prompt),
+            cached = plan['workload_kind'] == 'cached_prefill'
+            events = _jsonl(directory / 'events.jsonl')
+            prompt_events = server_prompt_events(events) if cached else []
+            actual_ids = prompt_events[-1]['token_ids'] if cached and prompt_events else prompt
+            row.update(prompt_sha256=sha256_json(prompt), token_sha256=sha256_json(actual_ids),
                        body_sha256=sha256_json(normalized),
                        wire_body_sha256=hashlib.sha256((directory/'request-body.bin').read_bytes()).hexdigest())
-            row['prompt_tokens'] = len(prompt) if isinstance(prompt, list) else None
-            row['extensions']['prompt_count_source'] = 'actual_request_token_ids'
-            events = _jsonl(directory / 'events.jsonl')
+            row['prompt_tokens'] = len(actual_ids) if isinstance(actual_ids, list) else None
+            row['extensions']['prompt_count_source'] = ('server_prompt_token_ids' if cached
+                                                         else 'actual_request_token_ids')
             generation = [e for e in events if e['output_token_ids']]
             texts = [e for e in events if e['text'] != '']
             usages = [e['usage'] for e in events if e.get('usage') is not None]
@@ -105,11 +110,11 @@ def convert_evidence(plan: dict, variant: str, identity: dict, root: Path, *,
                 elif generation and usage['completion_tokens'] != count:
                     problem = 'usage/output token-ID count mismatch'
                 details = usage.get('prompt_tokens_details', {}) if isinstance(usage, dict) else {}
-                if isinstance(details, dict) and details.get('cached_tokens', 0) != 0:
+                if not cached and isinstance(details, dict) and details.get('cached_tokens', 0) != 0:
                     problem = 'cold/decode request reports cached input tokens'
             for event in events:
                 actual_prompt = event.get('payload', {}).get('prompt_token_ids')
-                if actual_prompt is not None and actual_prompt != prompt:
+                if not cached and actual_prompt is not None and actual_prompt != prompt:
                     problem = 'server prompt token IDs disagree with request'
             if generation and ((plan['sampling']['ignore_eos'] and count != logical['output_tokens']) or count > logical['output_tokens']):
                 problem = 'actual completion length differs from fixed-length contract'
@@ -120,6 +125,13 @@ def convert_evidence(plan: dict, variant: str, identity: dict, root: Path, *,
                     row.update(status='succeeded', error=None, token_timing_valid=True)
             elif problem:
                 row.update(error=problem, token_timing_valid=False)
+            if cached:
+                row['extensions']['cached_prefill'] = capture_cached_evidence(row, events)
+                if row['status'] == 'succeeded':
+                    try:
+                        validate_cached_measurement(plan, row, logical)
+                    except CachedPrefillError as exc:
+                        row.update(status='failed', error=str(exc), token_timing_valid=False)
             if batch_errors:
                 row.update(status='failed', error='attempt invalid: ' + '; '.join(batch_errors), token_timing_valid=False)
             evidence.append({k: row.get(k) for k in ('pairing_key','transport_request_id','request_instance_id',

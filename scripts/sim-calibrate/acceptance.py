@@ -34,7 +34,7 @@ def assess_report(document: dict) -> dict:
     if document['relative_denominator'] != 'positive_target_raw_ttft_ms':
         failures.append('undefined relative-error denominator')
     if document['deferred_cells']:
-        failures.append('required unsupported cached cells remain deferred to C8')
+        failures.append('required cached-prefill runtime validation is unsupported')
     for cell in cells:
         cell_id = cell['cell_id']
         if cell['status'] != 'measured' or cell['coverage']['status'] != 'in_domain':

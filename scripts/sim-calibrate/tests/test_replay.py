@@ -26,6 +26,7 @@ class ReplayTests(unittest.TestCase):
                 self.assertEqual(document['status'], 'replay_required')
                 self.assertEqual(document['matched_count'], 0)
                 self.assertEqual(document['acceptance']['status'], 'failed')
-                self.assertEqual(bool(document['deferred_cells']), cached_train)
-                self.assertTrue(all(cell['split'] == 'train' for cell in document['deferred_cells']))
+                # Cached training is supported offline; missing acquisition
+                # still cannot satisfy the existing online replay gate.
+                self.assertEqual(document['deferred_cells'], [])
                 verify_report(document)

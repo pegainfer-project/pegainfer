@@ -13,7 +13,7 @@ from pathlib import Path
 MODULE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MODULE_ROOT))
 
-from vllm_bench import inspect_binary  # noqa: E402
+from vllm_bench import VllmBenchError, inspect_binary  # noqa: E402
 
 
 class VllmBenchTests(unittest.TestCase):

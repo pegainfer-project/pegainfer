@@ -43,14 +43,18 @@ OBSERVER_SOURCES = (
     'probe.py', 'campaign.py', 'profile.py', 'steady_state.py', 'baseline.py',
     'pairing.py', 'normalize.py', 'target_statistics.py',
     'fit.py', 'replay.py', 'report.py', 'acceptance.py',
+    'cached_prefix_workload.py', 'cached_prefill.py',
 )
 
 
-def validate_request_body(body: dict, plan: dict, model: str) -> None:
+def validate_request_body(body: dict, plan: dict, model: str, logical: dict | None = None) -> None:
     """The frozen wire contract, shared by acquisition and offline pairing."""
-    shape, sampling = plan['shape'], plan['sampling']
+    shape, sampling = logical or plan['shape'], plan['sampling']
     prompt = body.get('prompt')
-    if not isinstance(prompt, list) or len(prompt) != shape['input_tokens'] or any(type(t) is not int or t < 0 for t in prompt):
+    if plan['workload_kind'] == 'cached_prefill':
+        if logical is None or not isinstance(prompt, str) or prompt != logical.get('prompt'):
+            raise EvidenceError('request custom prompt differs from frozen logical input')
+    elif not isinstance(prompt, list) or len(prompt) != shape['input_tokens'] or any(type(t) is not int or t < 0 for t in prompt):
         raise EvidenceError('request prompt IDs differ from planned shape')
     expected = {'model': model, 'max_tokens': shape['output_tokens'],
                 'stream': True, 'return_token_ids': True, 'echo': False, **sampling}
@@ -243,7 +247,7 @@ class EvidenceProxy:
             if not isinstance(body, dict):
                 raise EvidenceError('request body must be an object')
             self.writer.json(directory / 'request.json', body)
-            validate_request_body(body, self.plan, self.model)
+            validate_request_body(body, self.plan, self.model, logical)
             # Only hop-by-hop/transport headers are removed. Never expose authorization in metadata.
             hop = {'host', 'connection', 'content-length', 'transfer-encoding', 'accept-encoding',
                    'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'upgrade'}

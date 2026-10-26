@@ -31,9 +31,9 @@ def campaign_scope(campaign: dict, scope: str) -> tuple[list, list, tuple, dict]
             raise PairingContractError('unknown compiled kind/split')
         if (cell['split'] == 'train') != (scope == 'train'):
             continue
-        if cell['kind'] == 'cached_prefill':
+        if cell['kind'] == 'cached_prefill' and scope == 'validation':
             deferred.append({'cell_id': cell['cell_id'], 'kind': cell['kind'], 'split': cell['split'],
-                             'reason': 'cached-prefill acquisition/validation deferred to C8'})
+                             'reason': 'cached-prefill runtime validation is unsupported'})
         else:
             cells.append(cell)
     roles = ('target', 'zero_cost') if scope == 'train' else ('target', 'zero_cost', 'sim')
@@ -83,6 +83,9 @@ def index_plan_measurements(plan: dict, envelope: dict, workload: dict, variant:
             raise PairingContractError(f'{variant}:{key}: unsupported_pairing: incomplete content/identity evidence')
         if row['workload_evidence_sha256'] != workload['sha256']:
             raise PairingContractError(f'{variant}:{key}: workload digest mismatch')
+        if plan['workload_kind'] == 'cached_prefill':
+            from cached_prefill import validate_cached_measurement
+            validate_cached_measurement(plan, row, logical)
     return rows
 
 
@@ -107,11 +110,12 @@ def pair_plan_measurements(plan: dict, attempts: dict[str, dict], required_roles
             'observed_count': {role: len(rows) for role, rows in indexed.items()}}
 
 
-def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: dict, identity: dict, *, runtime: dict) -> dict:
+def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: dict, identity: dict, *, runtime: dict,
+                              launch: dict | None = None) -> dict:
     """Bind wire requests, read/event evidence and frozen commands to plan keys."""
     from artifacts import _read_json, checked_path
     from evidence_proxy import validate_request_body
-    from probe import requires_cache_reset, validate_reset_receipt
+    from probe import requires_cache_reset, validate_reset_receipt, validate_cache_recovery_receipt
     from sse_evidence import SSEParser
     from vllm_bench import render_command
     from vllm_bench_collect import convert_evidence
@@ -142,12 +146,26 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
             or attempt_record.get('errors') != []):
         raise PairingContractError(f'{variant}: invalid attempt outcome')
 
-    expected_terminals, expected_commands = set(), set()
+    expected_terminals, expected_commands, expected_recoveries = set(), set(), set()
     previous_end = -1
     for batch in plan['batches']:
         batch_path = f"batches/{batch['phase']}-{batch['repeat']}"
+        ready_ns = -1
         if requires_cache_reset(plan, variant, runtime, batch):
-            validate_reset_receipt(read(f'{batch_path}/reset.json'))
+            if plan['workload_kind'] == 'cached_prefill':
+                recovery_path = f'{batch_path}/recovery.json'
+                expected_recoveries.add(recovery_path)
+                receipt = read(recovery_path)
+                ready_ns = validate_cache_recovery_receipt(receipt, plan, batch, variant_identity=identity, launch=launch)['ready_ns']
+                if receipt['method'] == 'reset':
+                    reset_path = f'{batch_path}/reset.json'
+                    expected_recoveries.add(reset_path)
+                    if read(reset_path) != receipt['reset']:
+                        raise PairingContractError(f'{variant}:{batch_path}: HTTP reset receipt differs from restoration')
+                if receipt['started_ns'] < previous_end:
+                    raise PairingContractError(f'{variant}:{batch_path}: cache restoration overlaps the preceding request')
+            else:
+                validate_reset_receipt(read(f'{batch_path}/reset.json'))
         command_path = f'{batch_path}/command.json'
         expected_commands.add(command_path)
         command = read(command_path)
@@ -169,6 +187,16 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
         if len(argv) != len(expected_argv):
             raise PairingContractError(f'{variant}:{batch_path}: command length differs from frozen plan')
         expected_argv[result_index] = argv[result_index]
+        if plan['workload_kind'] == 'cached_prefill':
+            from cached_prefix_workload import batch_payload
+            dataset_index = expected_argv.index('--dataset-path') + 1
+            # Preserve the original absolute invocation path in copied bundles,
+            # but require its exact relationship to the recorded result directory.
+            if argv[dataset_index] != str(Path(argv[result_index]) / 'custom.jsonl'):
+                raise PairingContractError(f'{variant}:{batch_path}: custom dataset path differs from the batch')
+            expected_argv[dataset_index] = argv[dataset_index]
+            if required_path(f'{batch_path}/custom.jsonl').read_bytes() != batch_payload(plan, batch):
+                raise PairingContractError(f'{variant}:{batch_path}: custom dataset differs from frozen content')
         if argv != expected_argv or not isinstance(prefix, str) or not prefix:
             raise PairingContractError(f'{variant}:{batch_path}: command differs from frozen plan')
         process = read(f'{batch_path}/process.json')
@@ -193,7 +221,7 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
                     or any(terminal.get(field) != logical_value for field, logical_value in logical_rows[key].items())):
                 raise PairingContractError(f'{variant}:{key}: terminal/request mapping differs from plan')
             start, end = terminal['upstream_dispatch_ns'], terminal['downstream_end_ns']
-            if (type(start) is not int or type(end) is not int or start < previous_end
+            if (type(start) is not int or type(end) is not int or start < max(previous_end, ready_ns)
                     or not start <= terminal['stream_end_ns'] <= end):
                 raise PairingContractError(f'{variant}:{key}: batches overlap or terminal times are invalid')
             ends.append(end)
@@ -201,7 +229,7 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
             wire = required_path(f'{request_path}/request-body.bin').read_bytes()
             if body != json.loads(wire):
                 raise PairingContractError(f'{variant}:{key}: wire body differs from request.json')
-            validate_request_body(body, plan, identity['model'])
+            validate_request_body(body, plan, identity['model'], logical_rows[key])
             payload = required_path(f'{request_path}/response-body.bin').read_bytes()
             reads = [json.loads(line) for line in required_path(f'{request_path}/reads.jsonl').read_text().splitlines()]
             events = [json.loads(line) for line in required_path(f'{request_path}/events.jsonl').read_text().splitlines()]
@@ -220,6 +248,9 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
     if ({name for name in raw['files'] if name.endswith('/terminal.json')} != expected_terminals
             or {name for name in raw['files'] if name.endswith('/command.json')} != expected_commands):
         raise PairingContractError(f'{variant}: extra/missing raw request or batch identities')
+    if plan['workload_kind'] == 'cached_prefill' and {
+            name for name in raw['files'] if name.endswith(('/recovery.json', '/reset.json'))} != expected_recoveries:
+        raise PairingContractError(f'{variant}: extra/missing cache restoration breaks the bootstrap lifecycle')
     reconstructed = convert_evidence(plan, variant, identity, directory,
                                      raw_index_sha256=provenance['raw_bundle_index_sha256'],
                                      client=client, batch_errors=[])
@@ -263,7 +294,8 @@ def load_role(root: Path, campaign: dict, plan: dict, role: str, reference: dict
     _profile_sources(root, campaign, role, reference)
     attempt = read_sealed_attempt(root, plan, role, reference)
     configured = campaign['variants'][role]
-    validate_attempt_evidence(plan, attempt, role, campaign['client'], configured['identity'], runtime=configured['runtime'])
+    validate_attempt_evidence(plan, attempt, role, campaign['client'], configured['identity'], runtime=configured['runtime'],
+                              launch=configured.get('launch'))
     if _read_json(attempt['directory'] / 'attempt.json')['attempt'] != reference['attempt']:
         raise PairingContractError(f'{role}: raw attempt number differs from selected attempt')
     return attempt

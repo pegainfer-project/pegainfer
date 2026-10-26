@@ -15,10 +15,6 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
-INDEX_SCHEMA_VERSION = 2
-
-
 class ArtifactError(RuntimeError):
     """Raised when an artifact store cannot preserve campaign lineage."""
 
@@ -84,7 +80,8 @@ def write_compiled_bundle(root: Path, documents: dict[str, Any], campaign_id: st
     root = root.expanduser().resolve()
     if root.is_relative_to(_repo_root()):
         raise ArtifactError("compiled artifact root must be outside the repository")
-    payloads = {name: _render(document) for name, document in documents.items()}
+    payloads = {name: document if isinstance(document, bytes) else _render(document)
+                for name, document in documents.items()}
     index = {
         "kind": "compiled_artifact_index", "schema_version": 3, "campaign_id": campaign_id,
         "files": {name: {"sha256": _sha256_bytes(data), "size": len(data)} for name, data in sorted(payloads.items())},
@@ -120,166 +117,6 @@ def write_compiled_bundle(root: Path, documents: dict[str, Any], campaign_id: st
     return index
 
 
-class ArtifactStore:
-    """A campaign-scoped store whose raw files live outside the repository."""
-
-    def __init__(self, root: Path, campaign_id: str) -> None:
-        root = root.expanduser().resolve()
-        repo = _repo_root()
-        try:
-            root.relative_to(repo)
-        except ValueError:
-            pass
-        else:
-            raise ArtifactError(f"raw artifact root must be outside the repository: {root}")
-        if not campaign_id or any(character not in "0123456789abcdef" for character in campaign_id.lower()):
-            raise ArtifactError("campaign_id must be a non-empty hexadecimal digest")
-        self.root = root
-        self.campaign_id = campaign_id
-        self.index_path = root / "artifact_index.json"
-        self.manifest_path = root / "manifest.json"
-        self.checkpoint_dir = root / "checkpoints"
-        self.cell_dir = root / "cells"
-        self._index = self._load_index()
-
-    def _load_index(self) -> dict[str, Any]:
-        if not self.index_path.exists():
-            return {
-                "schema_version": INDEX_SCHEMA_VERSION,
-                "campaign_id": self.campaign_id,
-                "created_at_utc": _now(),
-                "updated_at_utc": _now(),
-                "cells": {},
-                "variant_cells": {},
-                "files": {},
-            }
-        index = _read_json(self.index_path)
-        if index.get("schema_version") not in (SCHEMA_VERSION, INDEX_SCHEMA_VERSION) or index.get("campaign_id") != self.campaign_id:
-            raise ArtifactError("artifact index schema or campaign_id mismatch")
-        if not isinstance(index.get("cells"), dict) or not isinstance(index.get("files"), dict):
-            raise ArtifactError("artifact index cells/files must be objects")
-        index.setdefault("variant_cells", {})
-        return index
-
-    @property
-    def index(self) -> dict[str, Any]:
-        return json.loads(json.dumps(self._index))
-
-    def _save_index(self) -> None:
-        self._index["updated_at_utc"] = _now()
-        _write_atomic(self.index_path, self._index)
-
-    def attach_manifest(self, manifest: dict[str, Any]) -> None:
-        if manifest.get("campaign_id") != self.campaign_id:
-            raise ArtifactError("manifest campaign_id does not match artifact store")
-        if self.manifest_path.exists():
-            existing = _read_json(self.manifest_path)
-            if existing != manifest:
-                raise ArtifactError("refusing to replace a different campaign manifest")
-        else:
-            _write_atomic(self.manifest_path, manifest)
-        self._index["files"]["manifest.json"] = {
-            "sha256": _sha256_bytes(self.manifest_path.read_bytes()),
-            "size": self.manifest_path.stat().st_size,
-        }
-        self._save_index()
-
-    def begin_variant_cell(self, cell: dict[str, Any], variant: str) -> None:
-        cell_id = cell.get("cell_id")
-        if not isinstance(cell_id, str) or not cell_id:
-            raise ArtifactError("cell must have a cell_id")
-        key = f"{cell_id}:{variant}"
-        current = self._index["variant_cells"].get(key)
-        if current and current.get("status") == "sealed":
-            raise ArtifactError(f"sealed variant cell cannot be overwritten: {key}")
-        if current and current.get("name") != cell.get("name"):
-            raise ArtifactError(f"variant cell identity changed for {key}")
-        entry = {
-            "cell_id": cell_id,
-            "variant": variant,
-            "name": cell.get("name"),
-            "split": cell.get("split"),
-            "status": "running",
-            "attempts": current.get("attempts", []) if current else [],
-            "updated_at_utc": _now(),
-        }
-        self._index["variant_cells"][key] = entry
-        _write_atomic(self.checkpoint_dir / f"{cell_id}.{variant}.json", entry)
-        self._save_index()
-
-    def record_variant_cell(
-        self,
-        cell: dict[str, Any],
-        variant: str,
-        result: dict[str, Any],
-        *,
-        collector_argv: list[str],
-        probe: dict[str, Any],
-    ) -> dict[str, Any]:
-        cell_id = cell.get("cell_id")
-        if not isinstance(cell_id, str) or not cell_id:
-            raise ArtifactError("cell must have a cell_id")
-        key = f"{cell_id}:{variant}"
-        current = self._index["variant_cells"].get(key)
-        if current is None:
-            raise ArtifactError(f"variant cell was not started: {key}")
-        if current.get("status") == "sealed":
-            raise ArtifactError(f"sealed variant cell cannot be overwritten: {key}")
-        status = result.get("status")
-        if status not in ("succeeded", "invalid", "failed"):
-            raise ArtifactError(f"variant cell result has unsupported status: {status!r}")
-        attempt = len(current.get("attempts", [])) + 1
-        while (self.cell_dir / cell_id / variant / f"attempt-{attempt:04d}" / "result.json").exists():
-            attempt += 1
-        record = {
-            "schema_version": SCHEMA_VERSION,
-            "campaign_id": self.campaign_id,
-            "cell": cell,
-            "variant": variant,
-            "attempt": attempt,
-            "probe": probe,
-            "collector_argv": collector_argv,
-            "result": result,
-            "recorded_at_utc": _now(),
-        }
-        result_path = self.cell_dir / cell_id / variant / f"attempt-{attempt:04d}" / "result.json"
-        digest = _write_atomic(result_path, record)
-        relative = result_path.relative_to(self.root).as_posix()
-        attempt_entry = {
-            "attempt": attempt,
-            "status": status,
-            "result_path": relative,
-            "result_sha256": digest,
-            "size": result_path.stat().st_size,
-            "recorded_at_utc": record["recorded_at_utc"],
-        }
-        current["attempts"] = [*current.get("attempts", []), attempt_entry]
-        current.update({"status": status, "result_path": relative, "result_sha256": digest, "size": result_path.stat().st_size, "updated_at_utc": _now()})
-        self._index["files"][relative] = {"sha256": digest, "size": result_path.stat().st_size}
-        _write_atomic(self.checkpoint_dir / f"{cell_id}.{variant}.json", current)
-        self._save_index()
-        return current
-
-    def seal_variant_cell(self, cell_id: str, variant: str) -> None:
-        key = f"{cell_id}:{variant}"
-        entry = self._index["variant_cells"].get(key)
-        if not entry:
-            raise ArtifactError(f"cannot seal unknown variant cell: {key}")
-        if entry.get("status") == "sealed":
-            return
-        if entry.get("status") != "succeeded":
-            raise ArtifactError(f"only succeeded variant cells can be sealed: {key}")
-        result_path = self.root / entry["result_path"]
-        if not result_path.exists():
-            raise ArtifactError(f"sealed variant result is missing: {result_path}")
-        actual_digest = _sha256_bytes(result_path.read_bytes())
-        if actual_digest != entry.get("result_sha256"):
-            raise ArtifactError(f"variant result digest changed before sealing: {key}")
-        entry["status"] = "sealed"
-        entry["sealed_at_utc"] = _now()
-        _write_atomic(self.checkpoint_dir / f"{cell_id}.{variant}.json", entry)
-        self._save_index()
-
 
 def checked_path(root: Path, relative: str) -> Path:
     """Resolve an artifact reference without permitting escape through symlinks."""
@@ -312,18 +149,29 @@ def load_compiled_bundle(root: Path) -> dict[str, Any]:
         raise ArtifactError('not a current compiled bundle')
     verify_files(root, index.get('files'))
     campaign = _read_json(root / 'compiled_campaign.json')
-    if campaign.get('kind') != 'compiled_campaign' or campaign.get('schema_version') != 7:
+    from manifest import COMPILED_CAMPAIGN_SCHEMA_VERSION
+    if campaign.get('kind') != 'compiled_campaign' or campaign.get('schema_version') != COMPILED_CAMPAIGN_SCHEMA_VERSION:
         raise ArtifactError('unsupported compiled campaign; compile a new experiment')
     if campaign.get('campaign_id') != index.get('campaign_id'):
         raise ArtifactError('compiler campaign/index identity mismatch')
     from request_plan import build_plan
+    plans = []
     for cell in campaign['workload']['cells']:
         plan_path = cell['plan']['path']
         if plan_path not in index['files']:
             raise ArtifactError('plan is not in compiler index')
         actual = _read_json(checked_path(root, plan_path))
-        if actual != build_plan(cell, campaign['client']) or actual['plan_sha256'] != cell['plan']['plan_sha256']:
+        plans.append(actual)
+        rebuilt = build_plan(cell, campaign['client'], frozen_workload=actual) if cell['kind'] == 'cached_prefill' else build_plan(cell, campaign['client'])
+        if actual != rebuilt or actual['plan_sha256'] != cell['plan']['plan_sha256']:
             raise ArtifactError('plan does not match compiled cell/client')
+        if cell['kind'] == 'cached_prefill':
+            from cached_prefix_workload import workload_documents
+            for name, payload in workload_documents(actual).items():
+                if name not in index['files'] or checked_path(root, name).read_bytes() != payload:
+                    raise ArtifactError('cached workload differs from frozen plan')
+    from cached_prefix_workload import validate_workload_collection
+    validate_workload_collection(plans)
     return campaign
 
 

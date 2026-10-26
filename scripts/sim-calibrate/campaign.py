@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -101,6 +102,21 @@ def _profile_destination(root: Path, configured: str | None, default: str) -> st
 def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[str] | None = None, write: bool = True) -> dict[str, Any]:
     spec_path = spec_path.expanduser().resolve()
     spec = load_json_campaign(spec_path)
+    launch = spec.get('variants', {}).get('target', {}).get('launch')
+    if launch is not None:
+        if (not isinstance(launch, dict) or not isinstance(launch.get('argv'), list) or not launch['argv']
+                or any(not isinstance(arg, str) or not arg for arg in launch['argv'])):
+            raise ManifestError('target launch requires a nonempty argv')
+        executable = Path(launch['argv'][0]).expanduser()
+        if not executable.is_absolute():
+            executable = spec_path.parent / executable
+        launch['argv'][0] = str(executable.absolute())
+        launch['executable'] = file_reference(executable)
+        from probe import target_runtime_environment
+        environment = launch.get('environment', {})
+        if not isinstance(environment, dict):
+            raise ManifestError('target launch environment must be an object')
+        launch['environment'] = {**target_runtime_environment(dict(os.environ)), **environment}
     assets = _assets(spec, spec_path.parent)
     compiled = compile_manifest(spec, assets)
     root = output or Path(spec["output"]["artifact_root"]).expanduser()
@@ -114,11 +130,18 @@ def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[
         plan = build_plan(cell, compiled["client"])
         name = f"plans/{cell['cell_id']}/request_plan.json"
         documents[name] = plan
+        if cell['kind'] == 'cached_prefill':
+            from cached_prefix_workload import workload_documents
+            documents.update(workload_documents(plan))
         cell["plan"] = {"path": name, "plan_sha256": plan["plan_sha256"]}
+    from cached_prefix_workload import validate_workload_collection
+    validate_workload_collection([documents[c['plan']['path']] for c in compiled['workload']['cells']])
     module_dir = Path(__file__).resolve().parent
     compiler_files = {name: assets['observer']['sources'][name] for name in (
         "campaign.py", "manifest.py", "request_plan.py", "measurement_schema.py", "profile.py", "artifacts.py", "steady_state.py",
     )}
+    if any(c['kind'] == 'cached_prefill' for c in compiled['workload']['cells']):
+        compiler_files['cached_prefix_workload.py'] = assets['observer']['sources']['cached_prefix_workload.py']
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=module_dir, capture_output=True, text=True, timeout=5, check=False)
     compiled["provenance"] = {
         "compiler_revision": revision.stdout.strip() if revision.returncode == 0 else "unversioned",
@@ -141,7 +164,8 @@ def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[
 
 
 async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
-                           timeout: float = 120, startup_timeout: float = 60) -> dict:
+                           timeout: float = 120, startup_timeout: float = 60,
+                           through_fit: bool = False) -> dict:
     """Run a complete cold/decode scope against an already-running target.
 
     Profile servers are owned here because references differ by cell. Every
@@ -155,7 +179,7 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
     from normalize import normalize_campaign, verify_normalized, write_document as write_normalized
     from pairing import campaign_scope, load_role
     from plan_driver import profile_server, run_campaign
-    from profile import materialize_profile, verify_fitted_bundle
+    from profile import materialize_calibration, materialize_profile, verify_fitted_bundle
     from artifacts import fitted_bundle_paths
     from replay import replay_campaign
     from report import write_document as write_report
@@ -172,9 +196,11 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
         raise ArtifactError('simulator binary is missing')
     train, train_deferred, _, _ = campaign_scope(campaign, 'train')
     heldout, heldout_deferred, _, _ = campaign_scope(campaign, 'validation')
-    if train_deferred or heldout_deferred:
-        raise ArtifactError('full-stage cached-prefill execution is deferred to C8')
-    if not train or not heldout or not any(c['concurrency'] > 1 for c in heldout):
+    cached_only = bool(train) and all(c['kind'] == 'cached_prefill' for c in train)
+    through_fit = through_fit or (cached_only and not heldout and not heldout_deferred)
+    if train_deferred or (heldout_deferred and not through_fit):
+        raise ArtifactError('required cached online simulator validation is unsupported')
+    if not train or (not through_fit and (not heldout or not any(c['concurrency'] > 1 for c in heldout))):
         raise ArtifactError('full-stage execution requires train and required C>1 held-out cells')
 
     def pending(cells: list[dict], role: str) -> list[dict]:
@@ -210,6 +236,23 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
     await collect(pending(train, 'target'), 'target')
     prepare_references(root)
     await references(train)
+    if through_fit:
+        normalized_path, fit_path = root / 'derived/train.normalized.json', root / 'derived/fit.json'
+        normalized = normalize_campaign(root, scope='train')
+        if normalized['status'] != 'succeeded':
+            raise ArtifactError('complete qualified training is required before fit')
+        write_normalized(normalized_path, normalized)
+        fitted = fit_normalized(normalized, source_digest=file_reference(normalized_path)['sha256'])
+        if fitted['status'] != 'succeeded':
+            raise ArtifactError('required training candidates could not be fitted')
+        write_fit(fit_path, fitted)
+        result = {'campaign_id': campaign['campaign_id'], 'status': 'succeeded',
+                  'stage': 'offline_calibration', 'runtime_enabled': False,
+                  'normalized': {'path': str(normalized_path), **file_reference(normalized_path)},
+                  'fit': {'path': str(fit_path), **file_reference(fit_path)}}
+        if any(c['kind'] == 'cached_prefill' for c in train):
+            result['calibration'] = materialize_calibration(root, normalized_artifact=normalized_path, fit_artifact=fit_path)
+        return result
     if fitted_bundle_paths(root, campaign)['selection'].exists():
         verify_fitted_bundle(root, campaign)
     else:
@@ -273,13 +316,14 @@ def main(argv: list[str] | None = None) -> int:
     execute_parser.add_argument('--model-path', type=Path, required=True)
     execute_parser.add_argument('--timeout', type=float, default=120)
     execute_parser.add_argument('--startup-timeout', type=float, default=60)
+    execute_parser.add_argument('--through-fit', action='store_true', help='stop after verified offline training and calibration publication')
     args = parser.parse_args(argv)
     try:
         if args.command == 'execute':
             import asyncio
             result = asyncio.run(execute_campaign(args.artifact_root, sim_binary=args.sim_binary,
                                                  model_path=args.model_path, timeout=args.timeout,
-                                                 startup_timeout=args.startup_timeout))
+                                                 startup_timeout=args.startup_timeout, through_fit=args.through_fit))
             print(json.dumps(result, sort_keys=True))
             return 0 if result['status'] == 'succeeded' else 1
         if args.command == 'prepare-reference':

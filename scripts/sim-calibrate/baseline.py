@@ -18,7 +18,7 @@ SCHEMA_VERSION = 1
 PREPARATION_PATH = 'references/preparation.json'
 GENERATOR_SOURCES = ('baseline.py', 'profile.py', 'manifest.py', 'measurement_schema.py',
                      'artifacts.py', 'pairing.py', 'normalize.py', 'target_statistics.py',
-                     'request_plan.py', 'steady_state.py')
+                     'request_plan.py', 'steady_state.py', 'cached_prefill.py', 'cached_prefix_workload.py')
 
 
 def training_cells(campaign: dict) -> list[dict]:
@@ -57,7 +57,7 @@ def _validate_inputs(root: Path, campaign: dict, inputs: dict) -> dict:
             raise ArtifactError('reference interval uses a different target attempt')
         stats = {cell['cell_id']: cell['statistics'] for cell in document['cells']}
     elif document is not None:
-        raise ArtifactError('cold-only preparation does not consume decode statistics')
+        raise ArtifactError('preparation without decode does not consume decode statistics')
     return stats
 
 
@@ -168,6 +168,8 @@ def derive_cell(cell: dict, observations: list[dict], reference: dict) -> dict:
     decode = cell['kind'] == 'steady_decode'
     metric = 'tpot_ms' if decode else 'ttft_ms'
     interval_ms = reference['interval_us'] / 1000
+    if cell['kind'] == 'cached_prefill' and interval_ms != 0:
+        raise ArtifactError('cached-prefill requires a zero-prefill, zero-decode reference')
     values, residuals, errors = [], [], []
     for row in observations:
         if decode:

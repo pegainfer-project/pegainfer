@@ -16,10 +16,11 @@ from manifest import sha256_json
 from measurement_schema import digest
 from pairing import campaign_scope as _scope, pair_plan_measurements, load_role
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 NORMALIZER_SOURCES = ('normalize.py', 'pairing.py', 'artifacts.py', 'manifest.py', 'request_plan.py',
                       'measurement_schema.py', 'evidence_proxy.py', 'sse_evidence.py',
-                      'vllm_bench.py', 'vllm_bench_collect.py', 'probe.py', 'steady_state.py', 'profile.py', 'baseline.py')
+                      'vllm_bench.py', 'vllm_bench_collect.py', 'probe.py', 'steady_state.py', 'profile.py', 'baseline.py',
+                      'cached_prefill.py', 'cached_prefix_workload.py')
 
 
 class NormalizeError(ValueError):
@@ -29,7 +30,8 @@ class NormalizeError(ValueError):
 def _cell_result(cell: dict, plan: dict) -> dict:
     return {'cell_id': cell['cell_id'], 'name': cell['name'], 'kind': cell['kind'], 'split': cell['split'],
             'status': 'invalid', 'expected_count': sum(row['phase'] == 'measured' for row in plan['logical_requests']),
-            'matched_count': 0, 'observed_count': {}, 'observations': []}
+            'matched_count': 0, 'observed_count': {}, 'observations': [],
+            **({'plan': plan} if cell['kind'] == 'cached_prefill' else {})}
 
 
 def _paired_cell(root: Path, campaign: dict, cell: dict, plan: dict, attempts: dict, sources: dict, scope: str) -> dict:
@@ -44,6 +46,8 @@ def _paired_cell(root: Path, campaign: dict, cell: dict, plan: dict, attempts: d
         'input_tokens': logical['input_tokens'], 'output_tokens': logical['output_tokens'],
         'concurrency': cell['concurrency'], 'sum_decode_ctx_tokens': cell.get('sum_decode_ctx_tokens'),
         'fit_policy': cell['fit_policy'], 'metadata': cell.get('metadata', {}),
+        **({'prefix_tokens': cell['prefix_tokens'], 'new_tokens': cell['new_tokens'],
+            'logical_request': logical} if cell['kind'] == 'cached_prefill' else {}),
         'measurements': measurements, 'sources': sources,
         'decode_window_tpot_ms': {role: values[logical['pairing_key']] for role, values in request_tpot.items()}
                                  if cell['kind'] == 'steady_decode' else None,
@@ -102,13 +106,20 @@ def _assemble_document(campaign: dict, scope: str, results: list, source: dict) 
     expected_status = 'measured' if scope == 'train' else 'paired'
     failures = [{'cell_id': cell['cell_id'], 'reason': cell['reason']} for cell in results if cell['status'] != expected_status]
     if not cells:
-        failures.append({'cell_id': None, 'reason': 'required cold/decode scope is empty'})
+        failures.append({'cell_id': None, 'reason': 'required evidence scope is empty'})
+    if scope == 'validation' and deferred:
+        failures.extend({'cell_id': cell['cell_id'], 'reason': cell['reason']} for cell in deferred)
     observations = [row for cell in results for row in cell['observations']]
     return {
         'kind': 'normalized_campaign', 'schema_version': SCHEMA_VERSION, 'campaign_id': campaign['campaign_id'],
         'status': 'invalid' if failures else 'succeeded', 'scope': scope, 'scope_sha256': sha256_json(definition),
         'required_roles': list(roles), 'required_cell_ids': [cell['cell_id'] for cell in cells],
         'campaign_required_scope': campaign['required_scope'], 'deferred_cells': deferred,
+        'cached_requirements': [
+            {**{field: cell[field] for field in ('cell_id', 'matrix_name', 'prefix_tokens', 'new_tokens', 'repeats', 'concurrency')},
+             'axes': {'prefix_tokens': cell['metadata']['prefix_axis'],
+                      'new_tokens': cell['metadata']['new_token_axis']}}
+            for cell in cells if cell['kind'] == 'cached_prefill'],
         'fit_ready': scope == 'train' and not failures,
         'fit_pending': [] if scope == 'train' and not failures else ['complete qualified train scope required'],
         'cell_count': len(cells), 'paired_cell_count': sum(cell['status'] == expected_status for cell in results),
@@ -123,7 +134,7 @@ def verify_normalized_sources(document: dict, *, root: Path | None = None) -> di
     """Recheck pinned sources and return canonical results, without checking saved observations."""
     if (document.get('kind') != 'normalized_campaign' or document.get('schema_version') != SCHEMA_VERSION
             or document.get('status') != 'succeeded'):
-        raise NormalizeError('source verification requires succeeded normalized schema 4')
+        raise NormalizeError('source verification requires succeeded current normalized schema')
     source = document['source']
     root = (root or Path(source['artifact_root'])).expanduser().resolve()
     campaign = load_compiled_bundle(root)

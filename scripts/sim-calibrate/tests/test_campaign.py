@@ -20,8 +20,11 @@ def make_input(root: Path) -> tuple[Path, dict]:
     model = root / 'model'
     model.mkdir()
     (model / 'tokenizer_config.json').write_text('{"tokenizer_class":"PreTrainedTokenizerFast"}\n')
-    (model / 'tokenizer.json').write_text('{"version":"1.0","model":{"type":"WordLevel","vocab":{"x":0},"unk_token":"x"}}\n')
-    (model / 'config.json').write_text('{"model_type":"qwen3","vocab_size":1}\n')
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, **{chr(97 + i): i + 1 for i in range(26)}}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.save(str(model / 'tokenizer.json'))
+    (model / 'config.json').write_text('{"model_type":"qwen3","vocab_size":27}\n')
     config_digest = hashlib.sha256((model / 'config.json').read_bytes()).hexdigest()
     binary = root / 'bench'
     binary.write_text("#!/usr/bin/env python3\nimport sys\nprint('test' if '--version' in sys.argv else 'test help')\n")
@@ -137,7 +140,6 @@ class CampaignCompileTests(unittest.TestCase):
             second = compile_campaign(path, write=False)
             self.assertEqual(first['campaign_id'], second['campaign_id'])
             self.assertEqual(first['workload']['cells'], second['workload']['cells'])
-
 
 if __name__ == '__main__':
     unittest.main()

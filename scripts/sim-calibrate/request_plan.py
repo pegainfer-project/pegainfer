@@ -1,4 +1,4 @@
-"""Immutable fixed-batch request identities; vllm-bench owns prompt generation."""
+"""Immutable fixed batches: bench-generated IDs or frozen cached custom text."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 from manifest import canonical_execution_configuration, canonical_sampling_configuration, sha256_json
 from measurement_schema import DECODE_STATISTICS_POLICY, REFERENCE_POLICIES, reference_policy, MeasurementError, digest, integer, number, text
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 KIND = "request_plan"
 
 
@@ -30,7 +30,8 @@ def _plan_fields(value: Any, allowed: set[str], field: str) -> dict[str, Any]:
     return value
 
 
-def build_plan(cell: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
+def build_plan(cell: dict[str, Any], client: dict[str, Any], *,
+               frozen_workload: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         digest(cell.get("cell_id"), "cell_id")
         concurrency = integer(cell.get("concurrency"), "concurrency", positive=True)
@@ -62,7 +63,8 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
                 key = f"{cell['cell_id']}:{phase}:{repeat}:{index}"
                 row = {
                     "pairing_key": key, "phase": phase, "repeat": repeat, "index": index,
-                    "input_tokens": cell["input_tokens"], "output_tokens": cell["output_tokens"],
+                    "input_tokens": cell["prefix_tokens"] if phase == "bootstrap" else cell["input_tokens"],
+                    "output_tokens": cell["bootstrap_output_tokens"] if phase == "bootstrap" else cell["output_tokens"],
                     "sampling": copy.deepcopy(cell["sampling"]), "dispatch_offset_ms": 0,
                 }
                 batch["request_keys"].append(key)
@@ -94,10 +96,33 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
         for field in ("cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics", "reference_policy"):
             if field in cell:
                 plan[field] = copy.deepcopy(cell[field])
+        if cell['kind'] == 'cached_prefill':
+            plan['phase_shapes'] = {phase: {'input_tokens': cell['prefix_tokens'] if phase == 'bootstrap' else cell['input_tokens'],
+                                           'output_tokens': cell['bootstrap_output_tokens'] if phase == 'bootstrap' else cell['output_tokens']}
+                                    for phase in ('bootstrap', 'warmup', 'measured')}
+            from cached_prefix_workload import prepare_plan_workload, validate_cached_workload
+            if frozen_workload is None:
+                prepare_plan_workload(plan, client)
+            else:
+                frozen_rows = frozen_workload.get('logical_requests')
+                if not isinstance(frozen_rows, list) or any(not isinstance(row, dict) for row in frozen_rows):
+                    raise PlanError('frozen cached workload must contain logical requests')
+                indexed = {row.get('pairing_key'): row for row in frozen_rows}
+                if len(indexed) != len(frozen_rows) or set(indexed) != {row['pairing_key'] for row in requests}:
+                    raise PlanError('frozen cached workload keys differ from the compiled cell')
+                for row in requests:
+                    frozen = indexed[row['pairing_key']]
+                    for field in ('prompt', 'token_ids', 'suffix_seed'):
+                        if field in frozen:
+                            row[field] = copy.deepcopy(frozen[field])
+                plan['cached_workload'] = copy.deepcopy(frozen_workload.get('cached_workload'))
+                validate_cached_workload(plan)
+        elif frozen_workload is not None:
+            raise PlanError('frozen custom workload is only supported for cached-prefill')
         plan["plan_sha256"] = sha256_json(plan)
         validate_plan(plan)
         return plan
-    except (MeasurementError, KeyError, TypeError) as exc:
+    except (MeasurementError, KeyError, TypeError, ValueError) as exc:
         raise PlanError(str(exc)) from exc
 
 
@@ -106,7 +131,7 @@ def validate_plan(plan: dict[str, Any]) -> None:
     try:
         if not isinstance(plan, dict) or plan.get("kind") != KIND or type(plan.get("schema_version")) is not int or plan["schema_version"] != SCHEMA_VERSION:
             raise PlanError("unsupported request plan kind/schema_version")
-        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "split", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "retry", "observer", "arrival", "batches", "logical_requests", "plan_sha256", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics", "reference_policy"}, "plan")
+        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "split", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "retry", "observer", "arrival", "batches", "logical_requests", "plan_sha256", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics", "reference_policy", "phase_shapes", "cached_workload"}, "plan")
         digest(plan.get("cell_id"), "cell_id")
         digest(plan.get("plan_sha256"), "plan_sha256")
         if sha256_json({k: v for k, v in plan.items() if k != "plan_sha256"}) != plan["plan_sha256"]:
@@ -152,17 +177,19 @@ def validate_plan(plan: dict[str, Any]) -> None:
         for field in ("input_tokens", "output_tokens"):
             integer(shape.get(field), f"shape.{field}", positive=True, maximum=2**32 - 1)
         integer(shape["input_tokens"] + shape["output_tokens"], "shape.total_tokens", maximum=2**32 - 1)
-        lifecycle = _plan_fields(plan.get("cache_lifecycle", {}), {"namespace", "reset_before", "bootstrap_repeats"}, "cache_lifecycle")
+        lifecycle = _plan_fields(plan.get("cache_lifecycle", {}), {"namespace", "reset_before", "bootstrap_repeats", "recovery"}, "cache_lifecycle")
         boots = 0
         if "cache_lifecycle" in plan:
             text(lifecycle.get("namespace"), "cache_lifecycle.namespace")
             if lifecycle.get("reset_before") not in ("cell", "repeat"):
                 raise PlanError("cache_lifecycle.reset_before must be cell or repeat")
             boots = integer(lifecycle.get("bootstrap_repeats"), "cache_lifecycle.bootstrap_repeats", maximum=2**32 - 1)
+            if lifecycle.get('recovery', 'reset') not in ('reset', 'restart'):
+                raise PlanError('cache_lifecycle.recovery must be reset or restart')
         prefix_seed = None
         if workload == "cached_prefill":
-            if c != 1 or generation["dataset"] != "prefix_repetition" or not boots:
-                raise PlanError("cached_prefill requires concurrency=1, prefix_repetition and bootstrap")
+            if c != 1 or generation["dataset"] != "custom" or generation["prompt_representation"] != "text" or not boots:
+                raise PlanError("cached_prefill requires concurrency=1, custom text and bootstrap")
             prefix = integer(plan.get("prefix_tokens"), "prefix_tokens", positive=True, maximum=2**32 - 1)
             tail = integer(plan.get("new_tokens"), "new_tokens", positive=True, maximum=2**32 - 1)
             if prefix + tail != shape["input_tokens"]:
@@ -172,10 +199,20 @@ def validate_plan(plan: dict[str, Any]) -> None:
             if shared.get("suffix_mode") != "request_index":
                 raise PlanError("shared_prefix.suffix_mode must be request_index")
             prefix_seed = _seed(base_seed, shared["identity"], "prefix", 0)
+            phases = _plan_fields(plan.get('phase_shapes'), {'bootstrap', 'warmup', 'measured'}, 'phase_shapes')
+            if set(phases) != {'bootstrap', 'warmup', 'measured'}:
+                raise PlanError('cached phase_shapes must explicitly declare every phase')
+            for phase, phase_shape in phases.items():
+                _plan_fields(phase_shape, {'input_tokens', 'output_tokens'}, 'phase shape')
+                for field in ('input_tokens', 'output_tokens'):
+                    integer(phase_shape.get(field), f'phase_shapes.{phase}.{field}', positive=True, maximum=2**32-1)
+                integer(phase_shape['input_tokens'] + phase_shape['output_tokens'], 'phase_shape.total_tokens', maximum=2**32-1)
+                if phase_shape['input_tokens'] != (prefix if phase == 'bootstrap' else shape['input_tokens']) or (phase != 'bootstrap' and phase_shape != shape):
+                    raise PlanError('cached phase shape differs from prefix-only bootstrap/full formal input')
         else:
-            if generation["dataset"] != "random" or boots:
+            if generation["dataset"] != "random" or generation["prompt_representation"] != "token_ids" or boots:
                 raise PlanError("cold/decode require random generation without bootstrap")
-            if any(field in plan for field in ("shared_prefix", "prefix_tokens", "new_tokens")):
+            if any(field in plan for field in ("shared_prefix", "prefix_tokens", "new_tokens", "phase_shapes", "cached_workload")):
                 raise PlanError("prefix fields are only supported for cached_prefill")
             if workload == "cold_prefill" and c != 1:
                 raise PlanError("cold_prefill requires concurrency=1")
@@ -201,7 +238,7 @@ def validate_plan(plan: dict[str, Any]) -> None:
             raise PlanError("batch/request count does not match phase/repeat contract")
         by_key = {}
         for row in rows:
-            _plan_fields(row, {"pairing_key", "phase", "repeat", "index", "input_tokens", "output_tokens", "sampling", "dispatch_offset_ms"}, "logical request")
+            _plan_fields(row, {"pairing_key", "phase", "repeat", "index", "input_tokens", "output_tokens", "sampling", "dispatch_offset_ms"} | ({"prompt", "token_ids", "suffix_seed"} if workload == "cached_prefill" else set()), "logical request")
             text(row.get("pairing_key"), "pairing_key")
             for field in ("repeat", "index", "input_tokens", "output_tokens"):
                 integer(row.get(field), f"logical request.{field}", positive=field.endswith("tokens"), maximum=2**32 - 1)
@@ -247,11 +284,15 @@ def validate_plan(plan: dict[str, Any]) -> None:
                 row = by_key.get(key)
                 if row is None or (row.get("phase"), row.get("repeat"), row.get("index")) != (phase, repeat, index):
                     raise PlanError("missing or mismatched logical request identity")
-                if row.get("input_tokens") != shape["input_tokens"] or row.get("output_tokens") != shape["output_tokens"] or row.get("sampling") != plan["sampling"] or row.get("dispatch_offset_ms") != 0:
+                phase_shape = plan["phase_shapes"][phase] if workload == "cached_prefill" else shape
+                if row.get("input_tokens") != phase_shape["input_tokens"] or row.get("output_tokens") != phase_shape["output_tokens"] or row.get("sampling") != plan["sampling"] or row.get("dispatch_offset_ms") != 0:
                     raise PlanError("logical request differs from declared shape/sampling/arrival")
             seen.extend(keys)
         if seen != [row["pairing_key"] for row in rows]:
             raise PlanError("request order or key set differs from batches")
+        if workload == 'cached_prefill':
+            from cached_prefix_workload import validate_cached_workload
+            validate_cached_workload(plan)
     except (MeasurementError, KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, PlanError):
             raise

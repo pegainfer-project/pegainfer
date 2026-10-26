@@ -13,6 +13,15 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+TARGET_ENV_PREFIXES = ('PEGAINFER_', 'CUDA_', 'NCCL_', 'VLLM_', 'OMP_', 'MKL_')
+
+
+def target_runtime_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Select runtime configuration for an owned target, excluding credentials."""
+    return {key: value for key, value in environment.items()
+            if (key.startswith(TARGET_ENV_PREFIXES) or key == 'RUST_LOG')
+            and not key.endswith(('_KEY', '_TOKEN', '_SECRET', '_PASSWORD'))}
+
 
 class ProbeError(RuntimeError):
     """Raised when an endpoint is unavailable or fails the identity contract."""
@@ -74,6 +83,14 @@ def requires_cache_reset(plan: dict, variant: str, runtime: dict, batch: dict) -
     lifecycle = plan.get('cache_lifecycle', {})
     if plan['workload_kind'] == 'cold_prefill' and not lifecycle:
         raise ValueError('cold target with cache enabled requires explicit reset lifecycle')
+    if plan['workload_kind'] == 'cached_prefill':
+        if not lifecycle or batch['phase'] != 'bootstrap':
+            return False
+        if lifecycle['reset_before'] == 'cell':
+            return batch == plan['batches'][0]
+        group = (batch['before_phase'], batch['before_repeat'])
+        return batch == next(b for b in plan['batches'] if b['phase'] == 'bootstrap'
+                             and (b['before_phase'], b['before_repeat']) == group)
     return bool(lifecycle and (lifecycle['reset_before'] == 'repeat' or batch == plan['batches'][0]))
 
 
@@ -85,6 +102,40 @@ def validate_reset_receipt(receipt: dict) -> None:
         value = None
     if receipt.get('status') != 200 or not (value is True or isinstance(value, dict) and value.get('success') is True):
         raise ValueError('target reset did not prove success; cold collection unsupported')
+
+
+def validate_cache_recovery_receipt(receipt: dict, plan: dict, batch: dict, *,
+                                    variant_identity: dict | None = None, launch: dict | None = None) -> dict:
+    """Revalidate indexed recovery evidence before its prefix-only bootstrap."""
+    method = plan['cache_lifecycle'].get('recovery', 'reset')
+    group = {k: batch[k] for k in ('before_phase', 'before_repeat')}
+    if receipt.get('method') != method or receipt.get('group') != group:
+        raise ValueError('cache recovery method/group differs from the frozen plan')
+    start, ready = receipt.get('started_ns'), receipt.get('ready_ns')
+    if type(start) is not int or type(ready) is not int or not 0 <= start <= ready:
+        raise ValueError('cache recovery has invalid monotonic timestamps')
+    identity = variant_identity or receipt.get('variant_identity')
+    if receipt.get('variant_identity') != identity or not isinstance(identity, dict):
+        raise ValueError('cache recovery belongs to another target')
+    readiness = receipt.get('readiness', {})
+    if (readiness.get('endpoint') != identity['endpoint']
+            or identity['model'] not in readiness.get('models', {}).get('model_ids', [])):
+        raise ValueError('cache recovery lacks non-generating model readiness evidence')
+    if method == 'reset':
+        validate_reset_receipt(receipt.get('reset', {}))
+    elif method == 'restart':
+        if not launch or receipt.get('launch') != launch:
+            raise ValueError('restart differs from the frozen target launch')
+        binding = receipt.get('process', {})
+        validate_profile_binding(identity['endpoint'], binding)
+        if (type(binding.get('server_pid')) is not int or binding['server_pid'] <= 0
+                or type(binding.get('process_start_ticks')) is not int
+                or binding.get('executable') != launch['executable']
+                or binding.get('argv') != launch['argv']):
+            raise ValueError('restart process does not attest the frozen executable/argv')
+    else:
+        raise ValueError('unsupported cache recovery method')
+    return receipt
 
 
 @dataclass(frozen=True)

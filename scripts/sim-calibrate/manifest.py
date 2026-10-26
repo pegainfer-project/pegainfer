@@ -8,14 +8,15 @@ import hashlib
 import json
 import re
 from itertools import product
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from measurement_schema import DECODE_STATISTICS_POLICY, REFERENCE_POLICIES, reference_policy, MeasurementError, contract as measurement_contract, digest, integer, number, text
 
 
-CAMPAIGN_SPEC_SCHEMA_VERSION = 7
-COMPILED_CAMPAIGN_SCHEMA_VERSION = 7
+CAMPAIGN_SPEC_SCHEMA_VERSION = 8
+COMPILED_CAMPAIGN_SCHEMA_VERSION = 8
 SPLITS = ("train", "threshold_validation", "held_out_mixed", "sealed_test")
 WORKLOAD_KINDS = ("cold_prefill", "steady_decode", "cached_prefill", "mixed")
 
@@ -98,7 +99,9 @@ def _matrix_cells(name: str, matrix: dict[str, Any]) -> list[dict[str, Any]]:
         prefixes = _axis_values(matrix.get("prefix_tokens"), f"{name}.prefix_tokens")
         tails = _axis_values(matrix.get("new_tokens"), f"{name}.new_tokens")
         cells = [{"name": f"{name}-prefix{prefix}-new{tail}", "input_tokens": prefix + tail,
-                  "prefix_tokens": prefix, "new_tokens": tail, "concurrency": 1}
+                  "prefix_tokens": prefix, "new_tokens": tail, "concurrency": 1,
+                  "metadata": {**matrix.get("metadata", {}), "matrix": kind,
+                               "prefix_axis": list(prefixes), "new_token_axis": list(tails)}}
                  for prefix, tail in product(prefixes, tails)]
     return [{**policy, **cell, "matrix_name": name} for cell in cells]
 
@@ -319,8 +322,8 @@ def canonical_execution_configuration(value: dict[str, Any], field: str) -> dict
     integer(value.get("seed"), f"{field}.seed", maximum=2**32 - 1)
     sampling = canonical_sampling_configuration(value.get("sampling"), f"{field}.sampling")
     generation = _fields(value.get("generation"), {"dataset", "shuffle", "prompt_representation", "seed_policy"}, f"{field}.generation")
-    if generation.get("dataset") not in ("random", "prefix_repetition"):
-        raise ManifestError("generation.dataset must be random or prefix_repetition")
+    if generation.get("dataset") not in ("random", "custom"):
+        raise ManifestError("generation.dataset must be random or custom")
     if generation.get("shuffle") is not False:
         raise ManifestError("generation.shuffle must be false for fixed-batch calibration")
     if generation.get("prompt_representation") not in ("token_ids", "text"):
@@ -344,7 +347,7 @@ def _matrix_configuration(name: str, matrix: Any, defaults: dict[str, Any]) -> d
     kind_fields = {
         "cold_prefill": {"input_tokens", "required_input_tokens"},
         "steady_decode": {"num_ctx"},
-        "cached_prefill": {"prefix_tokens", "new_tokens", "shared_prefix"},
+        "cached_prefill": {"prefix_tokens", "new_tokens", "shared_prefix", "bootstrap_output_tokens"},
     }
     if not isinstance(matrix, dict) or not isinstance(matrix.get("kind"), str) or matrix["kind"] not in kind_fields:
         raise ManifestError(f"matrix {name}.kind must be cold_prefill, steady_decode or cached_prefill")
@@ -361,11 +364,13 @@ def _matrix_configuration(name: str, matrix: Any, defaults: dict[str, Any]) -> d
     execution = canonical_execution_configuration(_merge_configuration(defaults, {k: matrix[k] for k in defaults if k in matrix}), f"matrix {name}")
     lifecycle = matrix.get("cache_lifecycle")
     if lifecycle is not None:
-        _fields(lifecycle, {"namespace", "reset_before", "bootstrap_repeats"}, "cache_lifecycle")
+        _fields(lifecycle, {"namespace", "reset_before", "bootstrap_repeats", "recovery"}, "cache_lifecycle")
         text(lifecycle.get("namespace"), "cache_lifecycle.namespace")
         if lifecycle.get("reset_before") not in ("cell", "repeat"):
             raise ManifestError("cache_lifecycle.reset_before must be cell or repeat")
         integer(lifecycle.get("bootstrap_repeats"), "bootstrap_repeats", maximum=2**32-1)
+        if lifecycle.get("recovery", "reset") not in ("reset", "restart"):
+            raise ManifestError("cache_lifecycle.recovery must be reset or restart")
     return {**matrix, **execution}
 
 
@@ -374,7 +379,8 @@ def _finalize_cell(cell: dict[str, Any], variants: dict[str, Any], assets: dict[
     for field in ("input_tokens", "output_tokens", "concurrency"):
         integer(cell[field], field, positive=True, maximum=2**32-1)
     for variant in variants.values():
-        if cell["input_tokens"] + cell["output_tokens"] > variant["runtime"]["scheduler"]["max_model_len"]:
+        maximum = max(cell["input_tokens"] + cell["output_tokens"], cell.get("prefix_tokens", 0) + cell.get("bootstrap_output_tokens", 0))
+        if maximum > variant["runtime"]["scheduler"]["max_model_len"]:
             raise ManifestError(f"cell {cell['name']} exceeds a variant context ceiling")
     if cell["kind"] in REFERENCE_POLICIES:
         cell = {**cell, "reference_policy": reference_policy(cell["kind"], cell["split"])}
@@ -408,7 +414,7 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
         if not isinstance(target_runtime, dict):
             raise ManifestError("variants.target.runtime must be an object")
         for name in ("target", "zero_cost", "sim"):
-            raw = _fields(supplied[name], {"identity", "runtime", "server_flags", "profile_path"}, f"variants.{name}")
+            raw = _fields(supplied[name], {"identity", "runtime", "server_flags", "profile_path", "launch"}, f"variants.{name}")
             identity = copy.deepcopy(_fields(raw.get("identity"), {"endpoint", "model", "engine", "engine_version", "model_revision", "model_config_sha256"}, f"variants.{name}.identity"))
             for field in ("endpoint", "model", "engine", "engine_version", "model_revision"):
                 text(identity.get(field), f"variants.{name}.identity.{field}")
@@ -442,6 +448,23 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
             if name == "target" and "profile_path" in raw:
                 raise ManifestError("target cannot declare a simulator profile_path")
             variants[name] = {"identity": identity, "runtime": runtime, "server_flags": list(flags)}
+            if "launch" in raw:
+                if name != "target":
+                    raise ManifestError("only target may declare launch")
+                launch = _fields(raw["launch"], {"argv", "environment", "startup_timeout", "executable"}, "target.launch")
+                argv = launch.get("argv")
+                if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or not arg for arg in argv) or not Path(argv[0]).is_absolute():
+                    raise ManifestError("target.launch.argv must start with an absolute executable")
+                environment = launch.get("environment", {})
+                if not isinstance(environment, dict) or any(not isinstance(key, str) or not key or "=" in key or not isinstance(value, str) for key, value in environment.items()):
+                    raise ManifestError("target.launch.environment must contain string values")
+                timeout = number(launch.get("startup_timeout", 90), "target.launch.startup_timeout")
+                if timeout <= 0:
+                    raise ManifestError("target.launch.startup_timeout must be positive")
+                executable = _fields(launch.get('executable'), {'sha256', 'size'}, 'target.launch.executable')
+                digest(executable.get('sha256'), 'target.launch.executable.sha256')
+                integer(executable.get('size'), 'target.launch.executable.size', positive=True)
+                variants[name]["launch"] = {"argv": list(argv), "environment": dict(environment), "startup_timeout": timeout, 'executable': dict(executable)}
             if "profile_path" in raw:
                 variants[name]["profile_path"] = text(raw["profile_path"], f"variants.{name}.profile_path")
         if variants["zero_cost"]["runtime"]["scheduler"] != variants["sim"]["runtime"]["scheduler"] or canonical_cache_identity(variants["zero_cost"]["runtime"].get("cache")) != canonical_cache_identity(variants["sim"]["runtime"].get("cache")):
@@ -458,14 +481,17 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
             if matrix["kind"] != "steady_decode":
                 integer(matrix.get("concurrency"), f"matrix {name}.concurrency", positive=True)
             if matrix.get("kind") == "cached_prefill":
-                if matrix["generation"]["dataset"] != "prefix_repetition":
-                    raise ManifestError("cached_prefill requires prefix_repetition generation")
+                if matrix["generation"]["dataset"] != "custom" or matrix["generation"]["prompt_representation"] != "text":
+                    raise ManifestError("cached_prefill requires custom text generation")
+                integer(matrix.get("bootstrap_output_tokens"), "bootstrap_output_tokens", positive=True, maximum=2**32-1)
                 prefix = _fields(matrix.get("shared_prefix"), {"identity", "suffix_mode"}, "shared_prefix")
                 text(prefix.get("identity"), "shared_prefix.identity")
                 if prefix.get("suffix_mode") != "request_index":
                     raise ManifestError("shared_prefix.suffix_mode must be request_index")
             elif matrix["generation"]["dataset"] != "random":
                 raise ManifestError("cold/decode require random generation")
+            elif matrix["generation"]["prompt_representation"] != "token_ids":
+                raise ManifestError("cold/decode require token-ID prompts")
             lifecycle = matrix.get("cache_lifecycle")
             if lifecycle is not None and matrix["kind"] != "cached_prefill" and lifecycle["bootstrap_repeats"]:
                 raise ManifestError("bootstrap is only supported for cached_prefill")
@@ -473,10 +499,11 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
                 raise ManifestError("cached_prefill requires an explicit bootstrap lifecycle")
             for cell in _matrix_cells(name, matrix):
                 if cell["kind"] == "cached_prefill":
-                    for variant in variants.values():
-                        cache = canonical_cache_identity(variant["runtime"].get("cache"))
-                        if not cache["enabled"] or cell["prefix_tokens"] % cache["alignment"]:
-                            raise ManifestError("cached prefix must align to every enabled variant cache")
+                    if lifecycle.get("recovery", "reset") == "restart" and "launch" not in variants["target"]:
+                        raise ManifestError("cached restart recovery requires target.launch")
+                    cache = canonical_cache_identity(variants["target"]["runtime"].get("cache"))
+                    if not cache["enabled"] or cell["prefix_tokens"] % cache["alignment"]:
+                        raise ManifestError("cached prefix must align to the enabled target cache")
                 if cell["kind"] == "steady_decode" and cell["split"] == "train" and any(cell["concurrency"] > v["runtime"]["scheduler"]["max_num_seqs"] for v in variants.values()):
                     raise ManifestError("decode train concurrency exceeds scheduler capacity")
                 cells.append(_finalize_cell(cell, variants, assets))
