@@ -115,11 +115,7 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
         },
         top_p: params.top_p,
         min_p: params.min_p,
-        // Per-request seeds need the scheduler to feed request-local step
-        // counts into select_batch; until that lands, seeded requests are
-        // rejected in the bridge instead of silently ignored. See the
-        // sampling-parity tracking issue.
-        seed: None,
+        seed: params.seed.map(|s| s as u64),
         ignore_eos,
     }
 }
@@ -162,9 +158,6 @@ pub(crate) fn unsupported_request_params(params: &EngineCoreSamplingParams) -> O
     }
     if !(0.0..1.0).contains(&params.min_p) || !params.min_p.is_finite() {
         return Some(format!("min_p {} outside [0, 1)", params.min_p));
-    }
-    if params.temperature > 0.0 && params.seed.is_some() {
-        return Some("per-request seed is not supported yet".to_string());
     }
     if params.frequency_penalty != 0.0 {
         return Some(format!(
@@ -308,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_sampling_passes_min_p_and_never_seed() {
+    fn convert_sampling_passes_min_p_and_seed() {
         let mut params = EngineCoreSamplingParams::for_test();
         params.eos_token_id = Some(1);
         params.temperature = 0.8;
@@ -316,13 +309,16 @@ mod tests {
         params.seed = Some(42);
         let converted = convert_sampling(&params);
         assert!((converted.min_p - 0.15).abs() < f32::EPSILON);
-        // Seeds are rejected upstream until scheduler step wiring lands;
-        // convert must never smuggle one through.
-        assert_eq!(converted.seed, None);
+        assert_eq!(converted.seed, Some(42));
 
-        // Greedy lowering zeroes min_p along with the rest.
+        // Greedy lowering zeroes min_p along with the rest; a seed draws
+        // nothing there.
         params.temperature = 0.0;
-        assert_eq!(convert_sampling(&params).min_p.to_bits(), 0.0_f32.to_bits());
+        let greedy = convert_sampling(&params);
+        assert_eq!(
+            (greedy.min_p.to_bits(), greedy.seed),
+            (0.0_f32.to_bits(), None)
+        );
     }
 
     #[test]
@@ -346,10 +342,8 @@ mod tests {
 
         params.temperature = 0.8;
         params.seed = Some(7);
-        assert!(unsupported_request_params(&params).is_some());
-        // A greedy request's seed is a no-op, not a lie — allowed.
-        params.temperature = 0.0;
         assert_eq!(unsupported_request_params(&params), None);
+        params.temperature = 0.0;
         params.seed = None;
 
         params.frequency_penalty = 0.5;
