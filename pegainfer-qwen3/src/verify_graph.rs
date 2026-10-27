@@ -16,10 +16,8 @@
 //! between segments. Attention must stay eager because FlashInfer's paged-prefill
 //! kernel fixes its KV-iteration count when the graph is recorded; with the verify
 //! context growing every step, a captured attention would under-read KV and
-//! corrupt later tokens. The dense segments bake their row count, so a captured
-//! segment is only ever replayed at the exact full `batch_size * span` shape it
-//! was recorded at; a step whose span is truncated near a request's output
-//! budget falls back to eager (see [`Qwen3Model::batch_prefill_into`]).
+//! corrupt later tokens. Which steps may replay the dense segments is decided in
+//! [`Qwen3Model::batch_prefill_into`].
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -62,15 +60,12 @@ pub(crate) struct VerifyGraphBuffers {
     /// exact-bucket batch and replayed thereafter. Empty (`CudaGraphState::new()`)
     /// until first captured.
     ///
-    /// The first axis is the **span variant** (see [`Self::spans`]): a captured
-    /// segment bakes its row count, so the one-token gated round and the
-    /// full-span round need separate graph sets over the same buffers.
+    /// The first axis is the **span variant** (see [`Self::spans`]).
     graphs: Vec<Vec<Vec<CudaGraphState>>>,
     /// Rows per request each span variant covers. Variant 0 is the configured
     /// verify span (the checkpoint's, shortened by a
     /// `PEGAINFER_SPEC_MAX_DRAFTS` trim); the gated round's one-token span
-    /// follows. A step whose rows match no variant exactly (a truncated span)
-    /// runs eager.
+    /// follows.
     spans: Vec<usize>,
     /// `NumericPolicy` when these graphs were built; asserted unchanged at capture/replay. They bake
     /// the policy-selected GEMM algo and are keyed `(bucket, segment)` without policy — the same
