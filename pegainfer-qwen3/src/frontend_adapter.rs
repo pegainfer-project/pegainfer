@@ -13,8 +13,10 @@
 //!   [`Engine`] bundle from `launch`.
 //!
 //! Cancellation is reactive: the frontend flips a request's abort flag and
-//! this adapter retires it on its next touch — the scheduler mechanics never
-//! see aborts. Finishes ride the committed step unless the executor withholds
+//! this adapter retires it, at the top of the next step while it is queued or
+//! waiting for its next prefill chunk, and on its next touch once it is
+//! decoding or has a prefill in flight — the scheduler mechanics never see
+//! aborts. Finishes ride the committed step unless the executor withholds
 //! them ([`ModelExecutor::withholds_finishes`]): a P/D prefill executor takes
 //! them as [`RequestLedger::defer_finish`] tokens and delivers each request's
 //! final record once its KV saves are peer-visible.
@@ -42,6 +44,7 @@ use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopCause;
 use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::numeric_policy;
@@ -53,6 +56,7 @@ use crate::Qwen3OffloadOptions;
 use crate::executor::ModelExecutor;
 use crate::executor::Qwen3Executor;
 use crate::executor::RequestId;
+use crate::executor::WorkerLost;
 use crate::scheduler::ActiveRequestState;
 use crate::scheduler::PendingRequest;
 use crate::scheduler::RejectReason as AdmissionReject;
@@ -269,6 +273,10 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         }
     }
 
+    fn inflight_prefills(&self) -> &[PendingRequest] {
+        self.inflight_prefill_pending.as_deref().unwrap_or_default()
+    }
+
     fn idle(&self) -> bool {
         self.active.is_empty()
             && self.deferred.is_empty()
@@ -306,6 +314,32 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         let _ = self.executor.drop_request(request_id);
     }
 
+    /// Retire every aborted request that has no prefill in flight: queued ones
+    /// before they take admission room, and admitted ones waiting for their
+    /// next prefill chunk, including those part way through their prompt,
+    /// before that chunk runs. `loading` waits for its prefetch to settle,
+    /// `active` retires on its next decode, and an in-flight async prefill
+    /// keeps its KV until its result lands.
+    fn retire_aborted_waiting(&mut self, ledger: &mut RequestLedger) {
+        for queue in [&mut self.deferred, &mut self.post_control_deferred] {
+            let (aborted, kept): (Vec<_>, Vec<_>) = std::mem::take(queue)
+                .into_iter()
+                .partition(|req| ledger.is_aborted(req.request_id));
+            *queue = kept;
+            for req in &aborted {
+                ledger.retire(req.request_id);
+                release_rejected(&mut self.executor, &mut self.tracker, req);
+            }
+        }
+        let (aborted, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.prefilling)
+            .into_iter()
+            .partition(|req| ledger.is_aborted(req.request_id));
+        self.prefilling = kept;
+        for req in aborted {
+            self.retire_aborted(req.request_id, ledger);
+        }
+    }
+
     /// Fail the batch a step execution error touched, then clear the running
     /// set — the same requests the plan was about to advance.
     fn fail_touched_requests(
@@ -330,6 +364,23 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         self.active.clear();
     }
 
+    /// Absorb a step execution error by failing the batch it touched. A lost
+    /// rank worker leaves nothing to serve with, so that error is returned and
+    /// the driver winds the engine down.
+    fn absorb_step_failure(
+        &mut self,
+        targets: Vec<RequestId>,
+        error: anyhow::Error,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
+        if WorkerLost::caused(&error) {
+            return Err(error);
+        }
+        warn!("Execution step failed: {error}");
+        self.fail_touched_requests(targets, &error.to_string(), ledger);
+        Ok(())
+    }
+
     /// Translate one step's pure effects into ledger writes, executor
     /// bookkeeping, and state transitions. The old per-token send-failure
     /// signal is replaced by explicit abort probes on the ledger.
@@ -343,7 +394,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         // terminal rides the committed step, which the driver ships after
         // publishing metrics — the finishing batch's send-time stats then
         // read the drained occupancy instead of racing the publish.
-        let mut finishes: Vec<(RequestId, FinishReason)> = Vec::new();
+        let mut finishes: Vec<(RequestId, FinishReason, Option<StopCause>)> = Vec::new();
 
         for cached in effects.cached {
             if ledger.is_active(cached.request_id) {
@@ -368,31 +419,10 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             match effect {
                 DecodeEffect::Finish {
                     request_id,
-                    finish_reason,
-                } => {
-                    let Some(index) = self
-                        .active
-                        .iter()
-                        .position(|req| req.request_id == request_id)
-                    else {
-                        continue;
-                    };
-                    if ledger.is_active(request_id) {
-                        if ledger.is_aborted(request_id) {
-                            ledger.retire(request_id);
-                        } else {
-                            finishes.push((request_id, finish_reason));
-                        }
-                    }
-                    self.tracker.finish(request_id);
-                    let _ = self.executor.drop_request(request_id);
-                    to_retire.push(index);
-                }
-                DecodeEffect::EmitAndFinish {
-                    request_id,
                     token,
                     logprob,
                     finish_reason,
+                    stop_cause,
                 } => {
                     let Some(index) = self
                         .active
@@ -406,14 +436,14 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                             ledger.retire(request_id);
                         } else {
                             ledger.push_tokens(request_id, &[token], &[logprob]);
-                            finishes.push((request_id, finish_reason));
+                            finishes.push((request_id, finish_reason, stop_cause));
                         }
                     }
                     self.tracker.finish(request_id);
                     let _ = self.executor.drop_request(request_id);
                     to_retire.push(index);
                 }
-                DecodeEffect::EmitAndContinue {
+                DecodeEffect::Continue {
                     request_id,
                     token,
                     logprob,
@@ -436,7 +466,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         req.generated_count = completion_tokens;
                     }
                 }
-                DecodeEffect::EmitManyAndContinue {
+                DecodeEffect::ContinueMany {
                     request_id,
                     tokens,
                     completion_tokens,
@@ -460,10 +490,11 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         }
                     }
                 }
-                DecodeEffect::EmitManyAndFinish {
+                DecodeEffect::FinishMany {
                     request_id,
                     tokens,
                     finish_reason,
+                    stop_cause,
                 } => {
                     let Some(index) = self
                         .active
@@ -477,7 +508,7 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                             ledger.retire(request_id);
                         } else {
                             ledger.push_tokens(request_id, &tokens, &[]);
-                            finishes.push((request_id, finish_reason));
+                            finishes.push((request_id, finish_reason, stop_cause));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -507,32 +538,19 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
                         continued.push(req);
                     }
                 }
-                PendingEffect::Finish {
-                    request_id,
-                    finish_reason,
-                } => {
-                    if ledger.is_active(request_id) {
-                        if ledger.is_aborted(request_id) {
-                            ledger.retire(request_id);
-                        } else {
-                            finishes.push((request_id, finish_reason));
-                        }
-                    }
-                    self.tracker.finish(request_id);
-                    let _ = self.executor.drop_request(request_id);
-                }
                 PendingEffect::EmitAndFinish {
                     request_id,
                     token,
                     logprob,
                     finish_reason,
+                    stop_cause,
                 } => {
                     if ledger.is_active(request_id) {
                         if ledger.is_aborted(request_id) {
                             ledger.retire(request_id);
                         } else {
                             ledger.push_tokens(request_id, &[token], &[logprob]);
-                            finishes.push((request_id, finish_reason));
+                            finishes.push((request_id, finish_reason, stop_cause));
                         }
                     }
                     self.tracker.finish(request_id);
@@ -560,12 +578,14 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             if self.executor.withholds_finishes() {
                 let withheld: Vec<DeferredFinish> = finishes
                     .into_iter()
-                    .map(|(request_id, reason)| ledger.defer_finish(request_id, reason))
+                    .map(|(request_id, reason, stop_cause)| {
+                        ledger.defer_finish_with_cause(request_id, reason, stop_cause)
+                    })
                     .collect();
                 self.executor.release_finished_events(withheld);
             } else {
-                for (request_id, reason) in finishes {
-                    ledger.finish(request_id, reason);
+                for (request_id, reason, stop_cause) in finishes {
+                    ledger.finish_with_cause(request_id, reason, stop_cause);
                 }
             }
         }
@@ -620,12 +640,18 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             let effects = resolve_step(&self.executor, &self.active, artifacts);
             self.apply_effects(effects, ledger);
         }
+        self.retire_aborted_waiting(ledger);
 
         // 2. Reclaim settled prefetches, then offer fresh requests to
         // prefetch. Control commands gate generation, so only offer once no
         // control is pending (a prefetch must not race ahead of an adapter
         // load it depends on).
-        let reserve_floor = admitted_future_blocks(&self.executor, &self.active, &self.prefilling);
+        let reserve_floor = admitted_future_blocks(
+            &self.executor,
+            &self.active,
+            &self.prefilling,
+            self.inflight_prefills(),
+        );
         reclaim_ready_prefetch(
             &mut self.executor,
             &mut self.deferred,
@@ -655,8 +681,12 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         // driver.
         if self.idle() {
             if !self.loading.is_empty() {
-                let reserve_floor =
-                    admitted_future_blocks(&self.executor, &self.active, &self.prefilling);
+                let reserve_floor = admitted_future_blocks(
+                    &self.executor,
+                    &self.active,
+                    &self.prefilling,
+                    self.inflight_prefills(),
+                );
                 block_on_loading(
                     &mut self.executor,
                     &mut self.deferred,
@@ -684,6 +714,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             lora_validation.accepted,
             &self.active,
             &self.prefilling,
+            self.inflight_prefills(),
             self.executor.block_size(),
             self.executor.available_blocks(),
             self.executor.max_request_blocks(),
@@ -753,11 +784,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 &mut self.rng,
             ) {
                 Ok(v) => v,
-                Err(e) => {
-                    warn!("Execution step failed: {e}");
-                    self.fail_touched_requests(targets, &e.to_string(), ledger);
-                    return Ok(());
-                }
+                Err(e) => return self.absorb_step_failure(targets, e, ledger),
             };
             // Only decode effects come out of the unified result (its prefill
             // request list is empty until the poll resolves).
@@ -768,16 +795,12 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         }
 
         // 8. Execute, resolve, apply. A step failure kills the touched batch
-        // but not the engine.
+        // but not the engine, unless a rank worker is gone.
         let targets = failure_target_ids(&self.active, &plan);
         let artifacts =
             match execute_plan(&mut self.executor, &mut self.active, plan, &mut self.rng) {
                 Ok(v) => v,
-                Err(e) => {
-                    warn!("Execution step failed: {e}");
-                    self.fail_touched_requests(targets, &e.to_string(), ledger);
-                    return Ok(());
-                }
+                Err(e) => return self.absorb_step_failure(targets, e, ledger),
             };
         let effects = resolve_step(&self.executor, &self.active, artifacts);
         self.apply_effects(effects, ledger);
@@ -802,6 +825,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 + self.loading.len()
                 + self.post_control_deferred.len()) as u64,
             spec_decode: self.executor.spec_decode_counters(),
+            prefix_cache: None,
         }
     }
 }

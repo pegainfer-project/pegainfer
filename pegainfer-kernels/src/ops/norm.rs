@@ -6,6 +6,7 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::tensor::Columns;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
@@ -627,40 +628,80 @@ pub fn rms_norm_offset_into(
     Ok(())
 }
 
-/// Batched per-head RMSNorm with F32 weight + SiLU gate multiplication.
+/// Which activation multiplies a gated RMSNorm's output.
+///
+/// Qwen3.5's Gated DeltaNet uses [`GatedNormActivation::Silu`].
+/// Qwen3.8-Flash-Next declares `output_gate_type: "sigmoid"`, and its reference
+/// implementation passes that field straight to the gated norm, so the same
+/// kernel has to serve both. Note the *attention* output gate is a hardcoded
+/// sigmoid on both lines; this enum is only about the gated norm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedNormActivation {
+    Silu,
+    Sigmoid,
+}
+
+/// Batched per-head RMSNorm with F32 weight + a gated activation multiplies.
 /// HiddenStates are flattened as (seq_len * num_heads) contiguous head slices.
+/// The gate may be one band of a fused projection, in which case its slot stride
+/// is the tensor it is a band of rather than the band's own width.
+/// `activation` chooses the gate: Qwen3.5's Gated DeltaNet passes
+/// [`GatedNormActivation::Silu`], Qwen3.8-Flash-Next's passes `Sigmoid`.
 #[allow(clippy::too_many_arguments)]
-pub fn rms_norm_gated_batch_into(
+pub fn rms_norm_gated_batch_into<'a>(
     ctx: &DeviceContext,
     x: &HiddenStates,
     weight: &CudaSlice<f32>,
-    gate: &HiddenStates,
+    gate: impl Into<Columns<'a>>,
     out: &mut HiddenStates,
     num_heads: usize,
     head_dim: usize,
     eps: f32,
+    activation: GatedNormActivation,
 ) {
+    let gate = gate.into();
+    gate.assert_in_row("rms_norm_gated gate");
     let total_heads = x.seq_len * num_heads;
     assert_eq!(x.hidden_dim, num_heads * head_dim);
-    assert_eq!(gate.hidden_dim, x.hidden_dim);
-    assert_eq!(gate.seq_len, x.seq_len);
+    assert_eq!(gate.width, x.hidden_dim);
+    assert_eq!(gate.states.seq_len, x.seq_len);
     assert_eq!(out.hidden_dim, x.hidden_dim);
     assert_eq!(out.seq_len, x.seq_len);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (w_ptr, _gw) = weight.device_ptr(&ctx.stream);
-    let (g_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
+    let (g_ptr, _gg) = gate.states.data.device_ptr(&ctx.stream);
+    let g_ptr = g_ptr + (gate.col * std::mem::size_of::<bf16>()) as u64;
     let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let stream = crate::tensor::active_cu_stream(ctx);
     unsafe {
-        ffi::rms_norm_gated_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const f32,
-            g_ptr as *const ffi::Half,
-            o_ptr as *mut ffi::Half,
-            total_heads as i32,
-            head_dim as i32,
-            eps,
-            crate::tensor::active_cu_stream(ctx),
-        );
+        match activation {
+            GatedNormActivation::Silu => ffi::rms_norm_gated_cuda(
+                x_ptr as *const ffi::Half,
+                w_ptr as *const f32,
+                g_ptr as *const ffi::Half,
+                o_ptr as *mut ffi::Half,
+                total_heads as i32,
+                num_heads as i32,
+                head_dim as i32,
+                x.hidden_dim as i32,
+                gate.states.hidden_dim as i32,
+                eps,
+                stream,
+            ),
+            GatedNormActivation::Sigmoid => ffi::rms_norm_gated_sigmoid_cuda(
+                x_ptr as *const ffi::Half,
+                w_ptr as *const f32,
+                g_ptr as *const ffi::Half,
+                o_ptr as *mut ffi::Half,
+                total_heads as i32,
+                num_heads as i32,
+                head_dim as i32,
+                x.hidden_dim as i32,
+                gate.states.hidden_dim as i32,
+                eps,
+                stream,
+            ),
+        }
     }
 }
 
@@ -804,5 +845,152 @@ mod parity {
         dual_rms_norm_add_batch_into(&ctx, &a, &wa, &b, &wb, eps, &mut fused)
             .expect("fused combine");
         assert_bitwise(&ctx, &split, &fused, "fused MoE combine");
+    }
+
+    /// CPU reference for the per-head gated RMSNorm, in f64 then rounded to bf16.
+    /// The kernel reduces in f32 with a warp tree, so this is an oracle with a
+    /// bf16-sized tolerance, not a bit-exact model.
+    fn gated_norm_reference(
+        x: &[bf16],
+        weight: &[f32],
+        gate: &[bf16],
+        head_dim: usize,
+        eps: f32,
+        sigmoid: bool,
+    ) -> Vec<bf16> {
+        let mut out = vec![bf16::from_f32(0.0); x.len()];
+        for head in 0..(x.len() / head_dim) {
+            let base = head * head_dim;
+            let mut sumsq = 0.0f64;
+            for t in 0..head_dim {
+                let v = f64::from(x[base + t].to_f32());
+                sumsq += v * v;
+            }
+            let inv_rms = 1.0 / (sumsq / head_dim as f64 + f64::from(eps)).sqrt();
+            for t in 0..head_dim {
+                let normed = f64::from(x[base + t].to_f32()) * inv_rms * f64::from(weight[t]);
+                let g = f64::from(gate[base + t].to_f32());
+                let sigma = 1.0 / (1.0 + (-g).exp());
+                let activated = if sigmoid { sigma } else { g * sigma };
+                out[base + t] = bf16::from_f32((normed * activated) as f32);
+            }
+        }
+        out
+    }
+
+    fn assert_close(got: &[bf16], want: &[bf16], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what} length");
+        assert!(!got.is_empty(), "{what}: nothing to compare");
+        let tolerance = |magnitude: f64| 0.02 + 0.03 * magnitude;
+        let mut worst = (0usize, 0.0f64, 0.0f64);
+        let mut worst_excess = f64::NEG_INFINITY;
+        for (index, (got_value, want_value)) in got.iter().zip(want).enumerate() {
+            let (got_value, want_value) = (
+                f64::from(got_value.to_f32()),
+                f64::from(want_value.to_f32()),
+            );
+            let (abs_diff, magnitude) = ((got_value - want_value).abs(), want_value.abs());
+            // A NaN never satisfies the comparison below, so it would be skipped
+            // rather than reported and an all-NaN output would pass. Non-finite
+            // values are rejected here instead of being ranked.
+            assert!(
+                got_value.is_finite() && want_value.is_finite(),
+                "{what}: element {index} is not finite (got {got_value}, reference {want_value})"
+            );
+            // Rank by the margin against the actual bound, not by the raw
+            // deviation: the bound is affine in `magnitude`, so the two orderings
+            // differ, and ranking by deviation can let a large-magnitude element
+            // past its own bound while a small-magnitude element, ranked higher,
+            // passes. Every element is checked for that reason.
+            let excess = abs_diff - tolerance(magnitude);
+            if excess > worst_excess {
+                worst_excess = excess;
+                worst = (index, abs_diff, magnitude);
+            }
+        }
+        let (index, abs_diff, magnitude) = worst;
+        assert!(
+            worst_excess <= 0.0,
+            "{what}: element {index} differs by {abs_diff} (reference {magnitude}), over the \
+             tolerance by {worst_excess}"
+        );
+    }
+
+    /// The gated norm has two activations, because Qwen3.8-Flash-Next's
+    /// `output_gate_type` selects sigmoid where Qwen3.5 uses silu. Run at the
+    /// Flash-Next GDN geometry (48 value heads at head_dim 128), each activation
+    /// against its own CPU reference. The two distinct references are what pin the
+    /// template parameter: were both entry points instantiated with one activation,
+    /// the mismatched comparison would fail on nearly every element (silu is
+    /// `g * sigmoid(g)`, so the two differ wherever `g` is not zero).
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_gated_norm_activations_match_their_references() {
+        let ctx = DeviceContext::new_with_device(0).expect("device");
+        let (num_heads, head_dim, seq_len, eps) = (48usize, 128usize, 4usize, 1e-6f32);
+        let d = num_heads * head_dim;
+        let x = seeded(&ctx, d, seq_len, 11);
+        let gate = seeded(&ctx, d, seq_len, 12);
+        let weight_host: Vec<f32> = (0..head_dim)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.25 + 1.0)
+            .collect();
+        let weight = ctx.stream.clone_htod(&weight_host).expect("weight up");
+
+        let mut silu_out = HiddenStates::zeros(&ctx, d, seq_len).expect("silu buf");
+        rms_norm_gated_batch_into(
+            &ctx,
+            &x,
+            &weight,
+            &gate,
+            &mut silu_out,
+            num_heads,
+            head_dim,
+            eps,
+            GatedNormActivation::Silu,
+        );
+        let mut sigmoid_out = HiddenStates::zeros(&ctx, d, seq_len).expect("sigmoid buf");
+        rms_norm_gated_batch_into(
+            &ctx,
+            &x,
+            &weight,
+            &gate,
+            &mut sigmoid_out,
+            num_heads,
+            head_dim,
+            eps,
+            GatedNormActivation::Sigmoid,
+        );
+
+        let x_host = ctx.stream.clone_dtoh(&x.data).expect("x down");
+        let gate_host = ctx.stream.clone_dtoh(&gate.data).expect("gate down");
+        let silu_host = ctx.stream.clone_dtoh(&silu_out.data).expect("silu down");
+        let sigmoid_host = ctx
+            .stream
+            .clone_dtoh(&sigmoid_out.data)
+            .expect("sigmoid down");
+
+        assert_close(
+            &silu_host,
+            &gated_norm_reference(&x_host, &weight_host, &gate_host, head_dim, eps, false),
+            "silu gated norm",
+        );
+        assert_close(
+            &sigmoid_host,
+            &gated_norm_reference(&x_host, &weight_host, &gate_host, head_dim, eps, true),
+            "sigmoid gated norm",
+        );
+    }
+
+    /// `assert_close` must not treat a non-finite value as "close": a NaN never
+    /// wins the margin comparison, so without the finiteness check an all-NaN
+    /// output would leave `worst_excess` at negative infinity and pass.
+    #[test]
+    #[should_panic(expected = "not finite")]
+    fn assert_close_rejects_non_finite_values() {
+        assert_close(
+            &[bf16::from_f32(f32::NAN)],
+            &[bf16::from_f32(1.0)],
+            "nan output",
+        );
     }
 }

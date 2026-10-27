@@ -81,13 +81,18 @@ fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
         prompt.to_vec(),
         MAX_OUTPUT,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
 fn decode_item(id: u64, fed: u32) -> DecodeStepItem {
-    DecodeStepItem::new(RequestId::new(id), fed, SamplingParams::default(), LOGPROBS)
+    DecodeStepItem::new(
+        RequestId::new(id),
+        fed,
+        SamplingParams::default(),
+        Some(LOGPROBS),
+    )
 }
 
 fn top_logprobs(lp: Option<&TokenLogprob>) -> Vec<(u32, f32)> {
@@ -103,7 +108,6 @@ fn run_one(ex: &mut Qwen3Executor, id: u64, prompt: &[u32]) -> (usize, Vec<Vec<(
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(id, prompt)],
-            echo: false,
         })
         .expect("prefill");
     let cached = pr.requests[0].cached_tokens;
@@ -227,7 +231,6 @@ fn prefix_cache_behavior() {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(21, &d), prefill_item(22, &a)],
-            echo: false,
         })
         .expect("mixed prefill");
     assert_eq!(pr.requests[0].cached_tokens, 0, "D is unseen — cold");
@@ -246,7 +249,6 @@ fn prefix_cache_behavior() {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(31, &d)],
-            echo: false,
         })
         .expect("D solo prefill");
     let d_solo = vec![top_logprobs(pr.requests[0].first_token_logprob.as_ref())];
@@ -267,7 +269,6 @@ fn prefix_cache_behavior() {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(41, &b)],
-            echo: false,
         })
         .expect("B prefill for unified decode");
     assert_eq!(pr.requests[0].cached_tokens, 4 * BLOCK);

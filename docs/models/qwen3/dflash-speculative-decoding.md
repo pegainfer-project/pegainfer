@@ -2,13 +2,15 @@
 
 **TL;DR:** Qwen3-4B gains DFlash speculative decoding behind `--dflash-draft-model-path`. Speculative decode is modelled as an **optimistic transaction**: the DFlash drafter proposes K tokens, one target "verify" forward over the K+1 span confirms them, and we commit the longest argmax-matching prefix + 1 bonus token (rolling back the rest of the speculative KV). Greedy decode is **lossless up to bf16 numerical tie-flips** — the same non-determinism that already affects plain greedy decode at genuine bifurcation points; lm-eval gsm8k strict-match is identical with spec on vs off. Measured single-stream decode A/B: **1.82× on RTX 5070 Ti** (93.4 → 170.0 tok/s), **1.56× on RTX 5090** (168.9 → 263.2 tok/s). The drafter's out-of-pool footprint (weights + per-request KV/scratch) is reserved during memory profiling so the KV pool shrinks to fit instead of OOMing under load, and requests landing in the draft's final in-fill block are rejected cleanly at admission rather than crashing mid-prefill. **Concurrent throughput is now competitive after batching the draft forward.** The draft used to run a per-request **serial** `for` loop — launch-bound (a skip-attention A/B showed attention compute <2%, so 24.8 ms/step at batch 16 was almost all kernel-launch overhead), which inverted the single-stream win (c16 −59%). Batching the dense ops into one N×block pass drops draft@batch16 to **5.6 ms** and lifts 5090 greedy throughput to **c8 1346 / c16 1868 tok/s — both now beating vLLM's 1240 / 1846**. The single-stream gap is now closed by a **piecewise CUDA Graph** over the verify forward: 5090 greedy **c1 237 → 274 tok/s (+16%), matching vLLM dflash (278)**; c8 1346 → 1525 and c16 ≈ flat (no regression, both still ≥ vLLM's 1240 / 1846). Under greedy dflash the spec path ran with no CUDA Graph at all (the base-decode graph never fires), so nsys saw 1296 ms of GPU-idle launch gap — **~84% from dense-op kernel launches** (GEMM alone 48%), only 8% from attention. Capturing the *whole* forward fails: FlashInfer's paged-prefill attention freezes its KV-iteration count at capture time, so a captured attention under-reads the growing verify KV and corrupts tokens past ~60. The fix is **piecewise** — capture the dense ops (embedding, RMSNorm, every GEMM, SwiGLU, residual adds) into per-segment graphs and replay them, keeping **attention eager**. Accept is *not* the gap (9.1% vs vLLM's 8.85%, same drafter). Draft-side piecewise graph is the tracked next step. See Performance § for the A/B tables.
 
-Last touched: 2026-06
+Last touched: 2026-10
 
 ## The abstraction: speculative decode = optimistic transaction
 
 Every speculative method is the same transaction; only *propose* differs.
 
-1. **Propose** — a method-specific drafter emits K candidate tokens. (DFlash is the only proposer today; an n-gram / EAGLE proposer would slot in here.)
+The DFlash lane uses independent argmax for plain DFlash, the Markov head for DSpark, and learned top-16 pair scoring for DFlash2. Native Speculators DFlash2 adds block-local convolutions and an anchor-based attention window. The supported `mgoin/Qwen3-4B-speculator.dflash2` checkpoint shares its embedding and LM head with the matching Qwen3-4B target, so those duplicate checkpoint tensors are not loaded. These change proposal generation; target verification and acceptance follow the same transaction below. The performance measurements in this document are from the original DFlash checkpoints.
+
+1. **Propose** — a method-specific drafter emits K candidate tokens.
 2. **Verify** — the target model runs ONE prefill-style forward over the K+1 span `[current_token, draft_1, …, draft_K]` and reports its argmax at every position (echo=true).
 3. **Accept** — `accept_greedy` keeps the longest prefix where each draft matches the target argmax, then appends the target's own token at the first mismatch (the "bonus"). A verify step therefore always commits `1..=K+1` tokens — at least one token of progress even when every draft is rejected.
 4. **Commit / roll back** — accepted tokens' KV is committed (`apply_speculative`); the unused tail of the speculative reservation is LIFO-dropped (`revert_schedule`).
@@ -96,6 +98,32 @@ Result (5090, greedy, same-session A/B): fixed-buffer eager **250.9 → +graph 2
 
 The EAGLE proposer trait is still deferred to when EAGLE actually lands (see "no proposer trait yet" above); both the batched draft and the future CUDA-Graph draft are DFlash-internal changes behind the unchanged `DraftPlan→DraftResult` seam, so neither is thrown away by EAGLE.
 
+## Load-aware speculation gate (`PEGAINFER_SPEC_MAX_BATCH`)
+
+`PEGAINFER_SPEC_MAX_BATCH=<n>` turns speculation off for a step once the active batch reaches `n` requests. `0`/unset = off, so serving behaviour is unchanged until a threshold is measured and set — and the threshold is a **measured crossover for the model and GPU in use**, not a constant.
+
+**Why a gate at all.** The verify pass costs `batch × span` target rows while a plain decode costs `batch`. At high concurrency the target forward's fixed cost (36 layers of weight reads) dominates, and speculation can lose to plain decode outright — the same shape as vLLM's `--speculative-disable-by-batch-size`.
+
+**A gated step is NOT a plain decode, and that is the whole difficulty.** A plain decode advances the sequence outside the speculative path, so the executor drops the captured draft context — and only a fresh prefill can rebuild it. A gate that fell back to plain decode would be a **one-way latch**: the first trip would kill speculation for every affected request until they were re-prefilled, i.e. the opposite of "recover when the load drops" (#718 §4).
+
+So a gated step is a **one-token verify round**: no draft is proposed, the target verifies the span `[current_token]` alone, one token is committed per request, and the DFlash context advances by exactly the one captured row — the same bookkeeping a full round does. The capture and the draft-ready state survive, so the batch speculates again as soon as it shrinks below the threshold. The scheduler distinguishes the two fallbacks explicitly: `SpeculationDecision::NotReady` (a request has no captured context — plain decode, the pre-existing behaviour) vs `SpeculationDecision::Gated` (everything is draft-ready — a one-token verify round that keeps the capture).
+
+**The verify CUDA graph needed a span dimension for this.** A captured dense segment bakes its row count, so the one-token rows cannot share a graph with the full-span rows. `VerifyGraphBuffers` now holds one graph set per span variant, and a step replays a variant only when its row count matches that variant exactly — capture-shape ≡ replay-shape, unchanged.
+
+**Measured on one L20 (Qwen3-4B, DFlash block7):** the gate is worth **+46.6 %** output tok/s at c64 (2115 → 3099) and leaves every below-threshold cell untouched (±1.2 %, inside the harness's 0.3–2.2 % paired noise floor). It lands ~5 % short of the plain decode, because the gated step runs the prefill-style *verify* path while the plain step runs the tuned *decode* path. The child-process gate checks the resume per request (`gated=` in the trace). Full protocol, noise floor, per-drafter crossovers and the recommended thresholds: [benchmarks/qwen3-4b-spec-decode-l20.md](../../benchmarks/qwen3-4b-spec-decode-l20.md).
+
+## Static draft trim (`PEGAINFER_SPEC_MAX_DRAFTS`)
+
+`PEGAINFER_SPEC_MAX_DRAFTS=<k>` caps how many draft candidates are **proposed** per round: the drafter still rolls its whole block out (its cache still writes the `block_size`-slot in-fill tail every round, so the headroom is unchanged), but only the first `k` candidates enter the verify span, so the target forward carries `1 + k` rows per request instead of the full span. `0`/unset = off (the checkpoint's natural block).
+
+The verify buffers are sized to the trimmed span, and the span stays uniform across the batch, so a full-span step still satisfies the capture-shape ≡ replay-shape invariant — the same invariant the one-token gated round relies on.
+
+**The trade:** fewer rows per verify forward, but a shorter accepted run per round, so more rounds for the same output. Which side wins depends on how row-bound the target forward is on the GPU in use — a property of the *hardware*, not of the checkpoint, and the 5090 and the L20 answer it differently. Measure it per platform; the L20 numbers are in the benchmark doc.
+
+**Measured on one L20 (Qwen3-4B, DFlash block7):** the trim's sign **flips with concurrency** — it loses at c8 (−3.6 % at K=4, −15.6 % at K=2) and at c16 for K=2 (−10.6 %), while c16 K=4 changes sign across rounds (unresolved); there the step is launch-bound, the rows are nearly free, and the shorter accepted run only costs rounds. It wins **+9.1 %** at c32 over the untrimmed drafter, which brings it from 6.5 % below plain decode to **parity** (paired median +1.8 %, below the study's 2 % bar). At c64 the span ordering is monotone: K=7 2113 < K=4 2405 < K=2 2572 < the load gate's span-1 3083. So the **optimal span shrinks as the batch grows** — the row cost of the target forward scales with `batch × span` while the accept-rate cost does not. A static K is therefore a load-adaptive lever in disguise: it needs a concurrency range, never a constant, and the same rule as the gate's applies — arm it at or above the crossover, never below.
+
+The trim is lossless: with `PEGAINFER_SPEC_MAX_DRAFTS=4` or `=2`, `dflash_speculative_greedy_matches_plain_greedy` and `dflash_concurrent_heterogeneous_is_lossless` both pass.
+
 ## Task-level accuracy parity (lm-eval gsm8k)
 
 Token-level losslessness should imply task-level parity. Confirmed on the 5090 with `lm-eval` gsm8k (5-shot, greedy, `local-completions` against the pegainfer server, 50 questions):
@@ -111,10 +139,12 @@ Harness note: pegainfer's `/v1/completions` rejects a per-request `seed` field (
 
 ## GPU memory budget & context limit
 
-DFlash's draft model and its per-request KV/scratch live **outside** the paged KV pool (`KvCacheManager`), so they must be reserved *before* the pool is sized or they silently steal from it and OOM under concurrency / long contexts. `DFlashMemoryReservation::from_config` (cheap — reads the draft `config.json`) splits the footprint by how it scales and the budget charges each in the matching place:
+DFlash's draft model and its per-request KV/scratch live **outside** the paged KV pool (`KvCacheManager`), so they must be reserved *before* the pool is sized or they silently steal from it and OOM under concurrency / long contexts. `DFlashMemoryReservation::from_path` reads the draft `config.json`, then `from_config` splits the footprint by how it scales and the budget charges each in the matching place:
 
 - **Per-token, pool-scaling** (draft KV + the prompt-tracking context scratch + the in-fill tail scratch + pending context, **65 536 B/token**) → folded into `effective_bytes_per_block`, so the *target* block count shrinks while the pool itself stays allocated at the target-only `bytes_per_block`. This is a safe upper bound: the scheduler reserves pool blocks for each request's whole lifetime (`prompt + max_tokens`), and the draft attends at most that many tokens, so billing the draft per pool-token over-covers. The draft KV and tail scratch are sized one in-fill block past that lifetime, so the fixed term also reserves `max_decode_batch × block_size` of that per-request headroom.
 - **Fixed, pool-independent** (draft weights ~1.1 GiB + the block-sized per-request scratch across the decode batch — logits-dominated, ~6.5 MiB × 256) → added to the KV `margin`.
+
+The figures above describe the original b16 checkpoint. Native DFlash2 additionally reserves convolution and selector weights and scratch in the fixed term. The shared embedding and LM head are already accounted for by the target and are not reserved again.
 
 Measured on the RTX 5070 Ti (16 GB, util 90%), the pool correctly makes room for the draft:
 

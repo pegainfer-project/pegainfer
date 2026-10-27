@@ -72,7 +72,7 @@ async fn validate_prefill_only_inner(
     };
     anyhow::ensure!(
         effective_max_tokens == Some(1),
-        "GLM5.2 prefill-only mode requires max_tokens=1, got {}",
+        "prefill only routes require max_tokens=1, got {}",
         effective_max_tokens.map_or_else(|| "omitted".to_owned(), |value| value.to_string())
     );
     parts.headers.insert(

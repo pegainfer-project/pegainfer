@@ -36,10 +36,9 @@ fn prefill_first(ex: &mut Qwen3Executor, id: RequestId, prompt: &[u32]) -> u32 {
             prompt.to_vec(),
             64,
             SamplingParams::default(),
-            0,
-            false,
+            None,
+            None,
         )],
-        echo: false,
         sample_seed: 0,
     })
     .expect("prefill")
@@ -98,10 +97,15 @@ fn unified_decode_row(
                 chunk,
                 64,
                 SamplingParams::default(),
-                0,
-                false,
+                None,
+                None,
             )],
-            decode_requests: &[DecodeStepItem::new(id_a, t0, SamplingParams::default(), 64)],
+            decode_requests: &[DecodeStepItem::new(
+                id_a,
+                t0,
+                SamplingParams::default(),
+                Some(64),
+            )],
             sample_seed: 0,
         })
         .expect("unified");
@@ -118,7 +122,12 @@ fn pure_decode_row(ex: &mut Qwen3Executor, p: &[u32], id_dec: u64) -> Row {
     reset_numeric_policy_counters();
     let dr = ex
         .execute_decode(DecodePlan {
-            requests: &[DecodeStepItem::new(id, t0, SamplingParams::default(), 64)],
+            requests: &[DecodeStepItem::new(
+                id,
+                t0,
+                SamplingParams::default(),
+                Some(64),
+            )],
             sample_seed: 0,
         })
         .expect("decode");
@@ -259,7 +268,7 @@ fn prefill_each(
 fn decode_items(decoders: &[(RequestId, u32)]) -> Vec<DecodeStepItem> {
     decoders
         .iter()
-        .map(|&(id, tok)| DecodeStepItem::new(id, tok, SamplingParams::default(), 64))
+        .map(|&(id, tok)| DecodeStepItem::new(id, tok, SamplingParams::default(), Some(64)))
         .collect()
 }
 
@@ -300,8 +309,8 @@ fn unified_decode_batch(
                 mixed_prompt(PAST_SPLIT_CAP + 1),
                 64,
                 SamplingParams::default(),
-                0,
-                false,
+                None,
+                None,
             )],
             decode_requests: &decode_items,
             sample_seed: 0,

@@ -3,17 +3,14 @@ use std::time::Duration;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::RequestControl;
 
-use super::lane_test_env::scoped_engine_env;
 use super::lane_tests::Harness;
 use super::lane_tests::launch;
+use super::lane_tests::load_state;
 use super::lane_tests::pin_live_stream;
 use super::lane_tests::wait_until;
 
 fn load_chunk_state(chunk: &str) -> super::EngineState {
-    let dir = crate::testkit::model_path();
-    let policy = super::generation_policy(&dir).expect("policy");
-    let _env = scoped_engine_env(&[(super::MIX_CHUNK_TOKENS_ENV, chunk)]);
-    super::EngineState::load(&dir, 0, policy, 0x5EED, true).expect("engine state")
+    load_state(&[(super::MIX_CHUNK_TOKENS_ENV, chunk)]).expect("engine state")
 }
 
 #[test]
@@ -27,9 +24,9 @@ fn the_gathered_transient_leaves_headroom() {
     let window = crate::config::Gemma4Config::from_file(&dir)
         .expect("config")
         .sliding_window;
-    let window_pages = window.div_ceil(crate::kv::PAGE_SIZE) + 1;
+    let window_pages = window.div_ceil(crate::kv::LOCAL_PAGE_SIZE) + 1;
     let provisioned = window_pages
-        + 2048usize.div_ceil(crate::kv::PAGE_SIZE)
+        + 2048usize.div_ceil(crate::kv::LOCAL_PAGE_SIZE)
         + (super::MIX_MAX_PROMPTS - 1)
         + (super::MAX_CONCURRENCY - 1) * window_pages;
     assert_eq!(
@@ -179,4 +176,77 @@ fn the_gathered_walk_does_not_depend_on_its_batching() {
             .is_empty(),
         "aborted walker must retire without a terminal"
     );
+}
+
+/// The bounds the 31B line is served at. The companion gates leave the prompt
+/// bound compiled and chunk at sixty-four rows, where a burst takes one round
+/// and `transient_pages` — which grows with both bounds, and is what the
+/// ceiling check refuses against — is an order of magnitude smaller.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
+fn the_served_bounds_provision_a_split_walk() {
+    let dir = crate::testkit::model_path();
+    let state = load_state(&[
+        (super::MIX_CHUNK_TOKENS_ENV, "6144"),
+        (super::MIX_MAX_PROMPTS_ENV, "8"),
+        (super::MIX_GATHER_ROWS_ENV, "8192"),
+    ])
+    .expect("engine state");
+    assert_eq!(state.mix_chunk, Some(6144));
+    assert_eq!(state.mix_max_prompts, 8);
+    assert_eq!(state.mix_gather, 8192);
+    assert_eq!(state.slots, 16);
+
+    let window = crate::config::Gemma4Config::from_file(&dir)
+        .expect("config")
+        .sliding_window;
+    let window_pages = window.div_ceil(crate::kv::LOCAL_PAGE_SIZE) + 1;
+    let provisioned = window_pages
+        + 6144usize.div_ceil(crate::kv::LOCAL_PAGE_SIZE)
+        + (8 - 1)
+        + (super::MAX_CONCURRENCY - 1) * window_pages;
+    assert_eq!(
+        state.serve.local_pool.available_pages(),
+        provisioned,
+        "the served bounds must size the pool by one shared walk segment"
+    );
+
+    let mut harness = Harness::from_state(state);
+    let prompts = crate::testkit::generate_fixture_prompts();
+    let stream_prompt: Vec<u32> = prompts[0].iter().cycle().copied().take(1500).collect();
+    let burst_prompt: Vec<u32> = prompts[0].iter().cycle().copied().take(1024).collect();
+    let streams: Vec<RequestControl> = (0..4)
+        .map(|_| harness.submit(stream_prompt.clone(), 40))
+        .collect();
+    assert!(
+        wait_until(Duration::from_secs(30), || harness
+            .metrics()
+            .num_running_reqs
+            >= 4),
+        "the gather needs a live decode batch to ride"
+    );
+    let burst: Vec<RequestControl> = (0..8)
+        .map(|_| harness.submit(burst_prompt.clone(), 2))
+        .collect();
+    let burst_ids: Vec<_> = burst.iter().map(RequestControl::id).collect();
+    harness.steps.wait_scheduled_together(&burst_ids);
+    for (index, request) in burst.iter().enumerate() {
+        assert_eq!(
+            harness
+                .steps
+                .drain(request.id(), &format!("burst prompt {index}"))
+                .tokens,
+            2
+        );
+    }
+    for (index, request) in streams.iter().enumerate() {
+        assert_eq!(
+            harness
+                .steps
+                .drain(request.id(), &format!("stream {index}"))
+                .tokens,
+            40
+        );
+    }
+    harness.shutdown(&[]);
 }

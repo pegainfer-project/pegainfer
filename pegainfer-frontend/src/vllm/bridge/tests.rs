@@ -116,6 +116,7 @@ fn token_and_finish_in_one_burst_coalesce() {
         TokenEvent::Token {
             id: 11,
             logprob: Some(TokenLogprob {
+                rank: 1,
                 logprob: -0.1,
                 top_logprobs: vec![(11, -0.1), (12, -0.5)],
             }),
@@ -126,6 +127,7 @@ fn token_and_finish_in_one_burst_coalesce() {
         TokenEvent::Token {
             id: 21,
             logprob: Some(TokenLogprob {
+                rank: 1,
                 logprob: -0.2,
                 top_logprobs: vec![(21, -0.2), (22, -0.6)],
             }),
@@ -293,7 +295,7 @@ fn lone_kv_transfer_defers_until_terminal_output() {
     );
     assert!(d.drain());
     let output = d.next_output().expect("terminal output");
-    assert_eq!(output.outputs[0].kv_transfer_params, Some(params));
+    assert_eq!(output.outputs[0].kv_transfer_params, Some(Box::new(params)));
 }
 
 /// First-token metadata (queued/scheduled events + prefill stats) rides the
@@ -570,6 +572,7 @@ async fn load_snapshots_become_stats_only_batches() {
         num_running_reqs: 2,
         num_waiting_reqs: 1,
         spec_decode: None,
+        prefix_cache: None,
     });
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
@@ -673,6 +676,96 @@ async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
     assert_eq!(spec.num_draft_tokens, 4);
     assert_eq!(spec.num_accepted_tokens, 4);
     assert_eq!(spec.num_accepted_tokens_per_pos, vec![2, 2]);
+
+    shutdown.cancel();
+    task.await
+        .expect("stats task exits on shutdown")
+        .expect("stats publisher shuts down cleanly");
+}
+
+/// Prefix-cache totals become per-interval deltas that the frontend `inc_by`s
+/// into `vllm:prefix_cache_{queries,hits}_total` for the device tier and, via
+/// the connector stats, `vllm:external_prefix_cache_*` and
+/// `prompt_tokens_cached_by_source{source="host"}` for the host tier. An
+/// engine restart (totals going backwards) diffs from zero instead of going
+/// negative, and an engine without a prefix cache exports zeros as before.
+#[tokio::test]
+async fn prefix_cache_stats_are_per_interval_deltas_across_a_restart() {
+    let mut totals = PrefixCacheCounters {
+        queries: 4096,
+        hits: 0,
+        host_queries: 0,
+        host_hits: 0,
+    };
+    let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics {
+        prefix_cache: Some(totals),
+        ..SchedulerMetrics::default()
+    });
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(publish_scheduler_stats(
+        0,
+        load_rx,
+        output_tx,
+        shutdown.clone(),
+    ));
+
+    // First publish diffs against zero, so it carries the whole cumulative.
+    let first = next_scheduler_stats(&mut output_rx).await;
+    assert_eq!(first.prefix_cache_stats.base.queries, 4096);
+    assert_eq!(first.prefix_cache_stats.base.hits, 0);
+    // No host lookup yet: no external stats.
+    assert_eq!(first.connector_prefix_cache_stats, None);
+
+    // A later turn: 4352 tokens looked up, 4096 of them served from cache;
+    // the 1280 that missed device were looked up in host, which had 1024.
+    totals.queries += 4352;
+    totals.hits += 4096;
+    totals.host_queries += 1280;
+    totals.host_hits += 1024;
+    load_tx.send_replace(SchedulerMetrics {
+        prefix_cache: Some(totals),
+        ..SchedulerMetrics::default()
+    });
+    let turn = next_scheduler_stats(&mut output_rx).await;
+    let local = &turn.prefix_cache_stats;
+    assert_eq!(local.base.queries, 4352);
+    assert_eq!(local.base.hits, 3072);
+    let host = turn
+        .connector_prefix_cache_stats
+        .as_ref()
+        .expect("host hits ride the connector stats");
+    assert_eq!(host.base.queries, 1280);
+    assert_eq!(host.base.hits, 1024);
+    assert_eq!(host.hits_by_source.host, 1024);
+    // What the frontend adds to `prompt_tokens_cached_by_source`: local hits
+    // as `device`, connector hits by their source. Together, every hit once.
+    let mut by_source = host.hits_by_source.counts();
+    by_source[0] += local.base.hits;
+    assert_eq!(by_source, [3072, 1024, 0, 0, 0]);
+    assert_eq!(by_source.iter().sum::<u64>(), 4096);
+
+    // The engine restarts: totals fall below the baseline. The interval
+    // counts from zero rather than underflowing or dropping the new work.
+    load_tx.send_replace(SchedulerMetrics {
+        prefix_cache: Some(PrefixCacheCounters {
+            queries: 300,
+            hits: 200,
+            host_queries: 0,
+            host_hits: 0,
+        }),
+        ..SchedulerMetrics::default()
+    });
+    let restarted = next_scheduler_stats(&mut output_rx).await;
+    assert_eq!(restarted.prefix_cache_stats.base.queries, 300);
+    assert_eq!(restarted.prefix_cache_stats.base.hits, 200);
+    assert_eq!(restarted.connector_prefix_cache_stats, None);
+
+    // No prefix cache: the default stats, exactly what was exported before.
+    load_tx.send_replace(SchedulerMetrics::default());
+    let none = next_scheduler_stats(&mut output_rx).await;
+    assert_eq!(none.prefix_cache_stats, PrefixCacheStats::default());
+    assert_eq!(none.connector_prefix_cache_stats, None);
 
     shutdown.cancel();
     task.await

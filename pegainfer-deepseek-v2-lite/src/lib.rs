@@ -4,6 +4,8 @@ mod config;
 #[cfg(feature = "deepseek-v2-lite")]
 mod device;
 #[cfg(feature = "deepseek-v2-lite")]
+mod device_kv;
+#[cfg(feature = "deepseek-v2-lite")]
 mod engine;
 mod ep;
 #[cfg(feature = "deepseek-v2-lite")]

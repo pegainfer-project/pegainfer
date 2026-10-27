@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use log::debug;
 use log::warn;
 use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::executor::ModelExecutor;
@@ -34,8 +35,9 @@ pub(crate) struct ActiveRequestState {
     pub(crate) max_tokens: usize,
     pub(crate) prompt_len: usize,
     pub(crate) params: SamplingParams,
-    /// Number of top logprobs to return (0 = disabled).
-    pub(crate) logprobs: usize,
+    pub(crate) stop_policy: StopPolicy,
+    /// Completion top-k count; None disables scoring, Some(0) scores only the chosen token.
+    pub(crate) logprobs: Option<usize>,
 }
 
 /// A request between submission and promotion, `Clone` because the decode-overlap
@@ -47,9 +49,10 @@ pub(crate) struct PendingRequest {
     pub(crate) lora_adapter: Option<String>,
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) params: SamplingParams,
+    pub(crate) stop_policy: StopPolicy,
     pub(crate) max_tokens: usize,
-    pub(crate) logprobs: usize,
-    pub(crate) echo: bool,
+    pub(crate) logprobs: Option<usize>,
+    pub(crate) prompt_logprobs: Option<usize>,
     /// Whether this request has already been offered to async KV prefetch.
     /// Offered at most once; a no-hit offer leaves the request in the normal
     /// admission flow with this set so it isn't re-probed every tick.
@@ -73,9 +76,10 @@ impl PendingRequest {
             lora_adapter: req.lora_adapter,
             prompt_tokens: req.prompt_tokens,
             params: req.params,
+            stop_policy: req.stop_policy,
             max_tokens: req.max_tokens,
             logprobs: req.logprobs,
-            echo: req.echo,
+            prompt_logprobs: req.prompt_logprobs,
             prefetch_offered: false,
             prefill_pos: 0,
             step_chunk: 0,
@@ -90,7 +94,7 @@ impl PendingRequest {
 
 /// Pull the next prefill step set off the front of `prefilling`, capping the
 /// step's total forwarded tokens at `max_prefill_tokens`. Each taken request
-/// gets its per-step chunk recorded in `step_chunk`. Echo requests need
+/// gets its per-step chunk recorded in `step_chunk`. Prompt-logprob requests need
 /// logits for every prompt position in one forward, so they only run when
 /// their whole remainder fits the profiled prefill bound. Under request-local
 /// chunking, a request takes `min(remaining, max_prefill_tokens)` whole or skips
@@ -106,7 +110,7 @@ pub(crate) fn take_prefill_chunks(
     let mut i = 0;
     while i < prefilling.len() && budget > 0 {
         let remaining = prefilling[i].remaining_prompt_tokens();
-        let chunk = if prefilling[i].echo {
+        let chunk = if prefilling[i].prompt_logprobs.is_some() {
             if remaining > budget {
                 i += 1;
                 continue;
@@ -163,12 +167,12 @@ pub(crate) fn reclaim_ready_prefetch<E: ModelExecutor>(
 /// request that doesn't start a load (pure GPU hit, miss, or block pressure)
 /// stays in `deferred`, flagged so it isn't re-probed next tick.
 ///
-/// Echo requests are never offered: their prefill forwards the whole prompt to
+/// Prompt-logprob requests are never offered: their prefill forwards the whole prompt to
 /// recover prompt logprobs and so skips `match_and_add_prefix` (see
 /// `execute_prefill`). Prefetched blocks would never be matched/reused — they
 /// would only park restored KV that admission credits but prefill can't spend,
 /// starving the request under tight budgets. Leaving `prefetch_offered` unset
-/// for echo is harmless: the `!req.echo` guard keeps them from being probed.
+/// for prompt-logprob requests is harmless: the `req.prompt_logprobs.is_none()` guard keeps them from being probed.
 pub(crate) fn offer_prefetch<E: ModelExecutor>(
     executor: &mut E,
     deferred: &mut Vec<PendingRequest>,
@@ -179,7 +183,7 @@ pub(crate) fn offer_prefetch<E: ModelExecutor>(
 ) {
     let mut keep = Vec::with_capacity(deferred.len());
     for mut req in deferred.drain(..) {
-        if !req.prefetch_offered && !req.echo {
+        if !req.prefetch_offered && req.prompt_logprobs.is_none() {
             req.prefetch_offered = true;
             if executor.begin_kv_prefetch(
                 req.request_id,
@@ -253,7 +257,7 @@ pub(crate) fn release_rejected<E: ModelExecutor>(
 pub(crate) enum RejectReason {
     /// Worst-case length exceeds the model's position-encoding window.
     ContextLength { limit: usize },
-    /// Echo needs all-position logits in one forward, so it must fit the
+    /// Prompt scoring needs all-position logits in one forward, so it must fit the
     /// profiled prefill bound.
     EchoPrefillTokens { limit: usize },
     /// Worst-case length needs more KV blocks than this instance can ever provide.
@@ -352,8 +356,8 @@ fn active_future_blocks(active: &[ActiveRequestState], block_size: usize) -> usi
         .sum()
 }
 
-fn echo_exceeds_prefill_bound(req: &PendingRequest, max_prefill_tokens: usize) -> bool {
-    req.echo && req.prompt_tokens.len() > max_prefill_tokens
+fn prompt_logprobs_exceeds_prefill_bound(req: &PendingRequest, max_prefill_tokens: usize) -> bool {
+    req.prompt_logprobs.is_some() && req.prompt_tokens.len() > max_prefill_tokens
 }
 
 /// Free blocks already promised to admitted requests (active decode growth +
@@ -363,28 +367,40 @@ pub(crate) fn admitted_future_blocks<E: ModelExecutor>(
     executor: &E,
     active: &[ActiveRequestState],
     prefilling: &[PendingRequest],
+    inflight: &[PendingRequest],
 ) -> usize {
     let block_size = executor.block_size();
     active_future_blocks(active, block_size)
-        + prefilling_future_blocks(prefilling, block_size, |id| executor.prefetched_blocks(id))
+        + prefilling_future_blocks(prefilling, inflight, block_size, |id| {
+            executor.prefetched_blocks(id)
+        })
 }
 
+/// An in-flight prefill already holds its launched chunk, so its debt starts at
+/// `prefill_pos + step_chunk`; a queued one starts at `prefill_pos`.
 fn prefilling_future_blocks(
     prefilling: &[PendingRequest],
+    inflight: &[PendingRequest],
     block_size: usize,
     // Blocks a request already holds via a settled prefetch (zero once its
     // first chunk absorbs them). They are out of the free pool, so counting
     // them as future need would double-charge the budget.
     prefetch_credit: impl Fn(RequestId) -> usize,
 ) -> usize {
-    prefilling
+    let owed = |req: &PendingRequest, allocated_tokens: usize| {
+        pending_lifetime_blocks(req, block_size)
+            .saturating_sub(blocks_needed(allocated_tokens, block_size))
+            .saturating_sub(prefetch_credit(req.request_id))
+    };
+    let queued: usize = prefilling
         .iter()
-        .map(|req| {
-            pending_lifetime_blocks(req, block_size)
-                .saturating_sub(blocks_needed(req.prefill_pos, block_size))
-                .saturating_sub(prefetch_credit(req.request_id))
-        })
-        .sum()
+        .map(|req| owed(req, req.prefill_pos))
+        .sum();
+    let launched: usize = inflight
+        .iter()
+        .map(|req| owed(req, req.prefill_pos + req.step_chunk))
+        .sum();
+    queued + launched
 }
 
 /// Default for `max_prefill_tokens`: prompt tokens forwarded in a single step
@@ -393,7 +409,7 @@ fn prefilling_future_blocks(
 /// batch can eat the post-KV-pool VRAM headroom and OOM mid-serving under a
 /// request burst. Prompts longer than the budget are split across steps, so
 /// long prompts can't monopolize a step and starve running decodes.
-/// Echo requests need all-position logits in one forward and are rejected when
+/// Prompt-logprob requests need all-position logits in one forward and are rejected when
 /// their prompt exceeds this bound.
 ///
 /// A unified step's duration scales with its prefill tokens, and every decode
@@ -411,6 +427,9 @@ pub(crate) fn admit_deferred_requests(
     // chunks and will take a decode slot when they promote, so admission
     // must reserve both or completing chunks can overshoot capacity.
     prefilling: &[PendingRequest],
+    // Decode-overlap prefills still running on the GPU: out of `prefilling`
+    // until their result is applied, but owed the same KV tail and slot.
+    inflight: &[PendingRequest],
     block_size: usize,
     available_blocks: usize,
     max_request_blocks: usize,
@@ -427,12 +446,14 @@ pub(crate) fn admit_deferred_requests(
         .saturating_sub(active_future_blocks(active, block_size))
         .saturating_sub(prefilling_future_blocks(
             prefilling,
+            inflight,
             block_size,
             &prefetch_credit,
         ));
     let mut decode_slots = max_decode_batch_size
         .saturating_sub(active.len())
-        .saturating_sub(prefilling.len());
+        .saturating_sub(prefilling.len())
+        .saturating_sub(inflight.len());
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
@@ -449,7 +470,7 @@ pub(crate) fn admit_deferred_requests(
             continue;
         }
 
-        if echo_exceeds_prefill_bound(&req, max_prefill_tokens) {
+        if prompt_logprobs_exceeds_prefill_bound(&req, max_prefill_tokens) {
             rejected.push((
                 req,
                 RejectReason::EchoPrefillTokens {
@@ -501,14 +522,36 @@ pub(crate) fn runtime_plan(
     active: &[ActiveRequestState],
     pending: Vec<PendingRequest>,
 ) -> Option<plan::ExecutionPlan> {
-    if plan::should_speculative_decode(executor, active) {
-        if pending.is_empty() {
-            Some(plan::ExecutionPlan::SpeculativeDecode)
-        } else {
-            Some(plan::ExecutionPlan::Prefill { pending })
+    runtime_plan_at(executor, active, pending, plan::spec_max_batch())
+}
+
+/// [`runtime_plan`] with the load gate's threshold passed in, so the gate is
+/// testable without mutating process-wide env state.
+fn runtime_plan_at(
+    executor: &impl ModelExecutor,
+    active: &[ActiveRequestState],
+    pending: Vec<PendingRequest>,
+    max_batch: usize,
+) -> Option<plan::ExecutionPlan> {
+    use plan::SpeculationDecision;
+    match plan::speculation_decision_at(executor, active, max_batch) {
+        SpeculationDecision::Speculate => {
+            if pending.is_empty() {
+                Some(plan::ExecutionPlan::SpeculativeDecode)
+            } else {
+                Some(plan::ExecutionPlan::Prefill { pending })
+            }
         }
-    } else {
-        plan::build_next_plan(!active.is_empty(), pending, executor.speculative_enabled())
+        SpeculationDecision::Gated => {
+            if pending.is_empty() {
+                Some(plan::ExecutionPlan::GatedSpeculativeDecode)
+            } else {
+                Some(plan::ExecutionPlan::Prefill { pending })
+            }
+        }
+        SpeculationDecision::NotReady => {
+            plan::build_next_plan(!active.is_empty(), pending, executor.speculative_enabled())
+        }
     }
 }
 
@@ -523,7 +566,9 @@ pub(crate) fn failure_target_ids(
         plan::ExecutionPlan::Prefill { pending } => {
             targets.extend(pending.iter().map(|req| req.request_id));
         }
-        plan::ExecutionPlan::Decode | plan::ExecutionPlan::SpeculativeDecode => {
+        plan::ExecutionPlan::Decode
+        | plan::ExecutionPlan::SpeculativeDecode
+        | plan::ExecutionPlan::GatedSpeculativeDecode => {
             targets.extend(active.iter().map(|req| req.request_id));
         }
         plan::ExecutionPlan::Unified { pending } => {

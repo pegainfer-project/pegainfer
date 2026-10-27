@@ -6,12 +6,17 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_kv_cache::BlockPool;
 
 use super::test_support::FakeExecutor;
 use super::test_support::request;
 use super::*;
+use crate::executor::PrefillRequestResult;
+use crate::executor::PrefillResult;
 use crate::speculative::VerifyRequestResult;
 
 fn active_state(request_id: u64, generated_count: usize, max_tokens: usize) -> ActiveRequestState {
@@ -23,7 +28,8 @@ fn active_state(request_id: u64, generated_count: usize, max_tokens: usize) -> A
         max_tokens,
         prompt_len: 16,
         params: SamplingParams::default(),
-        logprobs: 0,
+        stop_policy: StopPolicy::default(),
+        logprobs: None,
     }
 }
 
@@ -72,8 +78,19 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
     ];
 
     // available 4 blocks - 2 reserved for active growth = budget of 2.
-    let outcome =
-        admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, 32, |_| 0);
+    let outcome = admit_deferred_requests(
+        deferred,
+        &active,
+        &[],
+        &[],
+        16,
+        4,
+        4,
+        usize::MAX,
+        64,
+        32,
+        |_| 0,
+    );
 
     let ids = |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.raw()).collect::<Vec<_>>();
     assert_eq!(
@@ -111,8 +128,19 @@ fn requests_exceeding_context_window_are_rejected() {
         mk(3, 40, 1),  // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
     ];
 
-    let outcome =
-        admit_deferred_requests(deferred, &active, &[], 16, 1000, 1000, 32, 64, 64, |_| 0);
+    let outcome = admit_deferred_requests(
+        deferred,
+        &active,
+        &[],
+        &[],
+        16,
+        1000,
+        1000,
+        32,
+        64,
+        64,
+        |_| 0,
+    );
 
     let pending_ids = outcome
         .pending
@@ -148,6 +176,7 @@ fn admission_respects_decode_batch_capacity() {
         vec![pending],
         &active,
         &[],
+        &[],
         16,
         1024,
         1024,
@@ -167,6 +196,51 @@ fn admission_respects_decode_batch_capacity() {
         "capacity-starved request should stay deferred"
     );
     assert!(outcome.rejected.is_empty());
+}
+
+#[test]
+fn inflight_prefill_reservation_is_unchanged_by_its_result() {
+    let executor = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new())));
+    // 40 prompt + 20 output tokens: 4 lifetime blocks.
+    let launched = |prefill_pos: usize, step_chunk: usize| PendingRequest {
+        prefill_pos,
+        step_chunk,
+        ..PendingRequest::from_request(RequestId::new(1), request(40, 20))
+    };
+    // A middle chunk returns to `prefilling`; the last one promotes to decode.
+    for (req, owed) in [(launched(0, 32), 2), (launched(32, 8), 1)] {
+        let floor = admitted_future_blocks(&executor, &[], &[], std::slice::from_ref(&req));
+        assert_eq!(floor, owed, "the launched chunk is already allocated");
+
+        let prefill_pos = req.prefill_pos + req.step_chunk;
+        let result = PrefillResult {
+            requests: vec![PrefillRequestResult {
+                request_id: req.request_id,
+                first_token: 100,
+                first_token_logprob: None,
+                prompt_logprobs: None,
+                cached_tokens: 0,
+                completed: prefill_pos == req.prompt_tokens.len(),
+                prefill_pos,
+            }],
+            dflash_context_captured_requests: Vec::new(),
+        };
+        let artifacts = plan::ExecutionArtifacts::Prefill {
+            pending: vec![req],
+            result,
+        };
+        let effects = resolve::resolve_step(&executor, &[], artifacts);
+        let (active, prefilling) = match effects.pending.into_iter().next() {
+            Some(effects::PendingEffect::ContinuePrefill { req }) => (Vec::new(), vec![req]),
+            Some(effects::PendingEffect::Promote { state, .. }) => (vec![state], Vec::new()),
+            _ => panic!("a launched chunk resolves to continue or promote"),
+        };
+        assert_eq!(
+            admitted_future_blocks(&executor, &active, &prefilling, &[]),
+            floor,
+            "applying the result neither frees nor double counts the reservation"
+        );
+    }
 }
 
 #[test]
@@ -257,20 +331,20 @@ fn request_local_chunks_are_independent_of_earlier_requests() {
 }
 
 #[test]
-fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
-    let mk_echo = |id: u64, prompt_len| {
+fn prompt_logprobs_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
+    let mk_prompt_logprobs = |id: u64, prompt_len| {
         let mut pending = PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1));
-        pending.echo = true;
+        pending.prompt_logprobs = Some(0);
         pending
     };
     let mk = |id: u64, prompt_len| {
         PendingRequest::from_request(RequestId::new(id), request(prompt_len, 1))
     };
 
-    // Oversized echo is rejected by admission. If a caller bypasses
+    // Oversized prompt-scoring work is rejected by admission. If a caller bypasses
     // admission, the chunk picker must still keep it out of the profiled
     // prefill shape instead of running it whole.
-    let mut prefilling = vec![mk_echo(1, 64), mk(2, 16)];
+    let mut prefilling = vec![mk_prompt_logprobs(1, 64), mk(2, 16)];
     let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].request_id, RequestId::new(2));
@@ -278,13 +352,13 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
     assert_eq!(
         prefilling[0].request_id,
         RequestId::new(1),
-        "oversized echo stays queued if admission was bypassed"
+        "oversized prompt-scoring work stays queued if admission was bypassed"
     );
 
-    // An echo that doesn't fit behind earlier work is skipped, not split;
+    // A prompt-scoring request that doesn't fit behind earlier work is skipped, not split;
     // later requests may still fill the leftover budget, and the step set
     // stays sorted by request id.
-    let mut prefilling = vec![mk(3, 24), mk_echo(4, 16), mk(5, 8)];
+    let mut prefilling = vec![mk(3, 24), mk_prompt_logprobs(4, 16), mk(5, 8)];
     let taken = take_prefill_chunks(&mut prefilling, 32, false);
     assert_eq!(
         taken
@@ -292,17 +366,17 @@ fn echo_requests_run_only_when_their_prompt_fits_the_prefill_bound() {
             .map(|r| (r.request_id.raw(), r.step_chunk))
             .collect::<Vec<_>>(),
         vec![(3, 24), (5, 8)],
-        "echo skipped, leftover budget goes to the next non-echo request"
+        "prompt scoring skipped, leftover budget goes to the next ordinary request"
     );
     assert_eq!(prefilling[0].request_id, RequestId::new(4));
 }
 
 #[test]
-fn oversized_echo_request_is_rejected_at_admission() {
+fn oversized_prompt_logprobs_request_is_rejected_at_admission() {
     let active: [ActiveRequestState; 0] = [];
-    let mk_echo = |id: u64, prompt_len| {
+    let mk_prompt_logprobs = |id: u64, prompt_len| {
         let mut req = request(prompt_len, 1);
-        req.echo = true;
+        req.prompt_logprobs = Some(0);
         PendingRequest::from_request(RequestId::new(id), req)
     };
     let mk = |id: u64, prompt_len| {
@@ -310,8 +384,9 @@ fn oversized_echo_request_is_rejected_at_admission() {
     };
 
     let outcome = admit_deferred_requests(
-        vec![mk_echo(1, 33), mk(2, 64)],
+        vec![mk_prompt_logprobs(1, 33), mk(2, 64)],
         &active,
+        &[],
         &[],
         16,
         1024,
@@ -329,7 +404,7 @@ fn oversized_echo_request_is_rejected_at_admission() {
             .map(|r| r.request_id.raw())
             .collect::<Vec<_>>(),
         vec![2],
-        "non-echo oversized prompts can still be admitted and chunked"
+        "Ordinary oversized prompts can still be admitted and chunked"
     );
     assert_eq!(outcome.rejected.len(), 1);
     assert_eq!(outcome.rejected[0].0.request_id, RequestId::new(1));
@@ -338,7 +413,7 @@ fn oversized_echo_request_is_rejected_at_admission() {
             outcome.rejected[0].1,
             RejectReason::EchoPrefillTokens { limit: 32 }
         ),
-        "oversized echo should be rejected against the profiled prefill bound"
+        "oversized prompt-scoring work should be rejected against the profiled prefill bound"
     );
 }
 
@@ -352,6 +427,7 @@ fn page_boundary_lifetime_blocks_gate_admission() {
     let under_reserved = admit_deferred_requests(
         vec![mk(1, 16, 17)],
         &active,
+        &[],
         &[],
         16,
         2,
@@ -374,6 +450,7 @@ fn page_boundary_lifetime_blocks_gate_admission() {
     let exactly_reserved = admit_deferred_requests(
         vec![mk(2, 16, 17)],
         &active,
+        &[],
         &[],
         16,
         3,
@@ -472,25 +549,28 @@ fn lifetime_blocks_never_under_reserve_kvbm_peak_draw() {
 }
 
 #[test]
-fn echo_requests_are_never_offered_to_prefetch() {
+fn prompt_logprobs_requests_are_never_offered_to_prefetch() {
     let dropped = Arc::new(Mutex::new(Vec::new()));
     let mut executor = FakeExecutor::new(64, dropped);
     let offers = Arc::clone(&executor.prefetch_offers);
 
-    let mk = |id: u64, echo: bool| {
+    let mk = |id: u64, wants_prompt_logprobs: bool| {
         let mut req = request(32, 1);
-        req.echo = echo;
+        req.prompt_logprobs = wants_prompt_logprobs.then_some(0);
         PendingRequest::from_request(RequestId::new(id), req)
     };
     let mut deferred = vec![mk(1, true), mk(2, false)];
     let mut loading = Vec::new();
     offer_prefetch(&mut executor, &mut deferred, &mut loading, 0);
 
-    // The plain request is probed; the echo request is skipped entirely, so
+    // The plain request is probed; the prompt-scoring request is skipped entirely, so
     // its prefill forwards the whole prompt without parking unspendable KV.
     assert_eq!(*offers.lock().unwrap(), vec![2]);
-    let echo = deferred.iter().find(|r| r.request_id.raw() == 1).unwrap();
-    assert!(!echo.prefetch_offered, "echo request must stay un-probed");
+    let scored = deferred.iter().find(|r| r.request_id.raw() == 1).unwrap();
+    assert!(
+        !scored.prefetch_offered,
+        "prompt-scoring request must stay un-probed"
+    );
     let plain = deferred.iter().find(|r| r.request_id.raw() == 2).unwrap();
     assert!(
         plain.prefetch_offered,
@@ -515,6 +595,14 @@ fn spec_active(
             ignore_eos,
             ..SamplingParams::default()
         },
+        stop_policy: StopPolicy::new(
+            if ignore_eos {
+                EosPolicy::Ignore
+            } else {
+                EosPolicy::ModelDefault
+            },
+            Vec::new(),
+        ),
         ..active_state(id, generated_count, max_tokens)
     }
 }
@@ -537,7 +625,7 @@ fn speculative_full_span_accept_continues() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndContinue {
+            effects::DecodeEffect::ContinueMany {
                 request_id,
                 tokens,
                 completion_tokens,
@@ -551,54 +639,54 @@ fn speculative_full_span_accept_continues() {
                 "completion = prior generated + span len"
             );
         }
-        _ => panic!("expected EmitManyAndContinue"),
+        _ => panic!("expected ContinueMany"),
     }
 }
 
 #[test]
-fn speculative_stop_token_midspan_finishes_and_suppresses_eos() {
+fn speculative_stop_token_midspan_finishes_and_retains_the_trigger() {
     let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
     let active = [spec_active(1, 5, 100, false)];
-    // EOS lands at span position 2; tokens before it are emitted, EOS is not.
+    // EOS lands at span position 2; the trigger is retained and the suffix is not.
     let results = [spec_result(1, vec![10, 11, SPEC_EOS, 13])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndFinish {
+            effects::DecodeEffect::FinishMany {
                 tokens,
                 finish_reason,
+                stop_cause,
                 ..
             },
         ] => {
-            assert_eq!(
-                tokens,
-                &vec![10, 11],
-                "EOS itself is suppressed from emission"
-            );
+            assert_eq!(tokens, &vec![10, 11, SPEC_EOS],);
             assert!(matches!(finish_reason, FinishReason::Stop));
+            assert_eq!(*stop_cause, Some(StopCause::Eos(SPEC_EOS)));
         }
-        _ => panic!("expected EmitManyAndFinish(Stop)"),
+        _ => panic!("expected FinishMany(Stop)"),
     }
 }
 
 #[test]
-fn speculative_stop_token_at_span_start_emits_nothing() {
+fn speculative_stop_token_at_span_start_retains_the_token() {
     let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
     let active = [spec_active(1, 5, 100, false)];
     let results = [spec_result(1, vec![SPEC_EOS, 11, 12])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndFinish {
+            effects::DecodeEffect::FinishMany {
                 tokens,
                 finish_reason,
+                stop_cause,
                 ..
             },
         ] => {
-            assert!(tokens.is_empty(), "stop at position 0 emits no tokens");
+            assert_eq!(tokens, &vec![SPEC_EOS]);
             assert!(matches!(finish_reason, FinishReason::Stop));
+            assert_eq!(*stop_cause, Some(StopCause::Eos(SPEC_EOS)));
         }
-        _ => panic!("expected EmitManyAndFinish(Stop)"),
+        _ => panic!("expected FinishMany(Stop)"),
     }
 }
 
@@ -611,7 +699,7 @@ fn speculative_max_tokens_truncates_midspan() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
         [
-            effects::DecodeEffect::EmitManyAndFinish {
+            effects::DecodeEffect::FinishMany {
                 tokens,
                 finish_reason,
                 ..
@@ -624,7 +712,7 @@ fn speculative_max_tokens_truncates_midspan() {
             );
             assert!(matches!(finish_reason, FinishReason::Length));
         }
-        _ => panic!("expected EmitManyAndFinish(Length)"),
+        _ => panic!("expected FinishMany(Length)"),
     }
 }
 
@@ -635,14 +723,43 @@ fn speculative_ignore_eos_does_not_stop() {
     let results = [spec_result(1, vec![SPEC_EOS, SPEC_EOS])];
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     match &effects[..] {
-        [effects::DecodeEffect::EmitManyAndContinue { tokens, .. }] => {
+        [effects::DecodeEffect::ContinueMany { tokens, .. }] => {
             assert_eq!(
                 tokens,
                 &vec![SPEC_EOS, SPEC_EOS],
                 "ignore_eos passes stop tokens through"
             );
         }
-        _ => panic!("expected EmitManyAndContinue"),
+        _ => panic!("expected ContinueMany"),
+    }
+}
+
+#[test]
+fn speculative_request_stop_truncates_the_span_when_eos_is_ignored() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_stop_token(SPEC_EOS);
+
+    let mut request = spec_active(1, 0, 100, true);
+    request.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![12]);
+
+    let active = [request];
+    let results = [spec_result(1, vec![10, 11, 12, 13])];
+
+    let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
+
+    match &effects[..] {
+        [
+            effects::DecodeEffect::FinishMany {
+                tokens,
+                finish_reason,
+                stop_cause,
+                ..
+            },
+        ] => {
+            assert_eq!(tokens, &vec![10, 11, 12]);
+            assert_eq!(*finish_reason, FinishReason::Stop);
+            assert_eq!(*stop_cause, Some(StopCause::Token(12)));
+        }
+        _ => panic!("expected request stop to finish the speculative span"),
     }
 }
 
@@ -657,11 +774,47 @@ fn speculative_resolves_each_request_independently() {
     let effects = resolve::resolve_speculative_outputs(&exec, &active, &results);
     assert!(matches!(
         &effects[0],
-        effects::DecodeEffect::EmitManyAndContinue { request_id, .. } if *request_id == RequestId::new(1)
+        effects::DecodeEffect::ContinueMany { request_id, .. } if *request_id == RequestId::new(1)
     ));
     assert!(matches!(
         &effects[1],
-        effects::DecodeEffect::EmitManyAndFinish { request_id, finish_reason: FinishReason::Stop, .. }
+        effects::DecodeEffect::FinishMany { request_id, finish_reason: FinishReason::Stop, .. }
             if *request_id == RequestId::new(2)
     ));
+}
+
+#[test]
+fn a_gated_batch_runs_a_verify_round_not_a_plain_decode() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_speculative();
+    let active: Vec<ActiveRequestState> = (1..=8).map(|id| active_state(id, 0, 32)).collect();
+
+    assert!(
+        matches!(
+            runtime_plan_at(&exec, &active, Vec::new(), 9),
+            Some(plan::ExecutionPlan::SpeculativeDecode)
+        ),
+        "under the threshold the batch drafts and verifies"
+    );
+    assert!(
+        matches!(
+            runtime_plan_at(&exec, &active, Vec::new(), 8),
+            Some(plan::ExecutionPlan::GatedSpeculativeDecode)
+        ),
+        "at the threshold the batch verifies a one-token span"
+    );
+}
+
+#[test]
+fn a_gated_batch_with_pending_work_prefills_first() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_speculative();
+    let active: Vec<ActiveRequestState> = (1..=8).map(|id| active_state(id, 0, 32)).collect();
+    let pending = PendingRequest::from_request(RequestId::new(9), request(16, 1));
+
+    assert!(
+        matches!(
+            runtime_plan_at(&exec, &active, vec![pending], 4),
+            Some(plan::ExecutionPlan::Prefill { .. })
+        ),
+        "a gated batch still prefills its arrivals, so they capture their draft context"
+    );
 }

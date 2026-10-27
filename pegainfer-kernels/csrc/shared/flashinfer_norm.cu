@@ -23,6 +23,8 @@
 
 #include <flashinfer/norm.cuh>
 
+#include "ffi_guard.cuh"
+
 using DType = __nv_bfloat16;
 
 namespace pegainfer {
@@ -580,7 +582,7 @@ CUresult rms_norm_batched_dual_cuda(const DType *x, const DType *weight_a, const
         pegainfer::norm::DualRMSNormKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
             x, weight_a, weight_b, out_a, out_b, d, eps, scale_a);
     });
-    return static_cast<CUresult>(cudaGetLastError());
+    return map_cuda_error(cudaGetLastError());
 }
 
 CUresult dual_rms_norm_add_batched_cuda(const DType *a, const DType *weight_a, const DType *b,
@@ -597,7 +599,7 @@ CUresult dual_rms_norm_add_batched_cuda(const DType *a, const DType *weight_a, c
         pegainfer::norm::DualRMSNormAddKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
             a, weight_a, b, weight_b, out, d, eps);
     });
-    return static_cast<CUresult>(cudaGetLastError());
+    return map_cuda_error(cudaGetLastError());
 }
 
 CUresult rms_norm_add_rms_norm_round_batched_cuda(const DType *x, const DType *weight_post,
@@ -625,7 +627,7 @@ CUresult rms_norm_add_rms_norm_round_batched_cuda(const DType *x, const DType *w
             err = cudaGetLastError();
         }
     });
-    return static_cast<CUresult>(err);
+    return map_cuda_error(err);
 }
 
 CUresult rms_norm_add_scale_batched_cuda(const DType *x, const DType *weight,
@@ -643,7 +645,7 @@ CUresult rms_norm_add_scale_batched_cuda(const DType *x, const DType *weight,
         pegainfer::norm::RMSNormAddScaleKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
             x, weight, residual, out, d, eps, scale);
     });
-    return static_cast<CUresult>(cudaGetLastError());
+    return map_cuda_error(cudaGetLastError());
 }
 
 // ============================================================================
@@ -698,7 +700,7 @@ CUresult fused_add_rms_norm_round_batched_cuda(DType *hidden, const DType *resid
         /*stride_residual=*/static_cast<uint32_t>(hidden_dim),
         /*stride_out=*/static_cast<uint32_t>(hidden_dim),
         eps, stream);
-    return static_cast<CUresult>(err);
+    return map_cuda_error(err);
 }
 
 // ============================================================================
@@ -822,7 +824,7 @@ CUresult layer_norm_cuda(const DType *x, const float *gamma, const float *beta,
     size_t shmem_size = std::min(block_size / 32, (n + 31) / 32) * sizeof(float);
     layer_norm_kernel<<<rows, block_size, shmem_size, stream>>>(x, gamma, beta, out, n, eps);
     cudaError_t err = cudaGetLastError();
-    return static_cast<CUresult>(err);
+    return map_cuda_error(err);
 }
 
 // ============================================================================

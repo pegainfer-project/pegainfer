@@ -37,13 +37,21 @@
 //!
 //! Requires a CUDA GPU, Qwen3-4B weights, and the DFlash drafter. Set
 //! `PEGAINFER_TEST_MODEL_PATH` (target) and `PEGAINFER_DFLASH_TEST_MODEL_PATH`
-//! (drafter); skips cleanly when either is absent.
+//! (drafter); the legacy gates skip when weights are absent. The ignored native
+//! gate requires explicit target and `PEGAINFER_DFLASH2_TEST_MODEL_PATH` paths
+//! and fails if its checkpoint is missing or not a native DFlash2 drafter.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use pegainfer_frontend::engine::EosPolicy;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
@@ -73,7 +81,7 @@ const LOGPROBS: usize = 20;
 /// ULP at typical logit magnitudes — mirrors `hf_golden_gate`'s `MARGIN_TOL`.
 const MARGIN_TOL: f32 = 0.20;
 
-/// Both tests launch a Qwen3-4B engine, and two at once overflow a 16 GB card.
+/// These tests launch a Qwen3-4B engine, and two at once overflow a 16 GB card.
 /// Cargo runs tests in one binary concurrently, so serialize the engine-holding
 /// bodies — only one engine is ever resident on the GPU.
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -168,7 +176,7 @@ fn generate(
     max_tokens: usize,
 ) -> Vec<Step> {
     let mut req = request(prompt_tokens, SamplingParams::default(), max_tokens);
-    req.logprobs = logprobs;
+    req.logprobs = (logprobs > 0).then_some(logprobs);
     to_steps(engine.submit(req).expect_finished())
 }
 
@@ -199,19 +207,19 @@ fn generate_concurrent(engine: &EngineHarness, requests: Vec<(Vec<u32>, usize)>)
         .collect()
 }
 
-/// Prefill `context` (echo) and return the next-token distribution the *prefill*
+/// Prefill `context` (prompt scoring) and return the next-token distribution the *prefill*
 /// kernel produces — the kernel the speculative verify path also uses. This is
 /// the reference the spec pick should match (vs the plain-decode baseline, whose
 /// kernel resolves bifurcation ties to the other side). Returns the first
 /// generated token's `(id, top_logprobs)`.
 fn prefill_next(engine: &EngineHarness, context: Vec<u32>, logprobs: usize) -> Step {
     let mut req = request(context, SamplingParams::default(), 1);
-    req.logprobs = logprobs;
-    req.echo = true;
+    req.logprobs = (logprobs > 0).then_some(logprobs);
+    req.prompt_logprobs = Some(logprobs);
     let mut generated = to_steps(engine.submit(req).expect_finished());
     assert!(
         !generated.is_empty(),
-        "echo prefill finished without a token"
+        "prompt-scoring prefill finished without a token"
     );
     generated.swap_remove(0)
 }
@@ -238,8 +246,15 @@ fn check_lossless(
         .take_while(|(b, s)| b.id == s.id)
         .count();
 
-    // Identical sequences (or one a prefix of the other): perfectly lossless.
+    // A matching prefix alone does not prove the full continuation was produced.
     if matched == base.len().min(spec.len()) {
+        if base.len() != spec.len() {
+            return Err(format!(
+                "prompt {i}: matching prefix but different output lengths: baseline={}, spec={}",
+                base.len(),
+                spec.len()
+            ));
+        }
         eprintln!(
             "prompt {i} ({prompt:?}): {matched}/{} tokens identical (100% lossless)",
             base.len()
@@ -620,6 +635,312 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
     );
 }
 
+/// Real native checkpoint coverage: selector/conv, changing batch sizes, and
+/// attention beyond the checkpoint's sliding window. This deliberately
+/// requires model paths so an explicitly requested native run cannot skip.
+#[test]
+#[ignore = "requires PEGAINFER_TEST_MODEL_PATH and PEGAINFER_DFLASH2_TEST_MODEL_PATH on a CUDA GPU"]
+fn dflash2_native_checkpoint_is_lossless() {
+    common::harness::init_capture_logging();
+    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
+        .expect("set PEGAINFER_TEST_MODEL_PATH to the matching target checkpoint");
+    let draft_path = std::env::var("PEGAINFER_DFLASH2_TEST_MODEL_PATH")
+        .expect("set PEGAINFER_DFLASH2_TEST_MODEL_PATH to a native DFlash2 checkpoint");
+    assert!(Path::new(&model_path).join("config.json").is_file());
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(Path::new(&draft_path).join("config.json"))
+            .expect("native draft config must exist"),
+    )
+    .expect("native draft config must be valid JSON");
+    assert!(
+        config["selector_rank"]
+            .as_u64()
+            .is_some_and(|rank| rank > 0)
+            && config["conv_kernel_size"]
+                .as_u64()
+                .is_some_and(|taps| taps > 0),
+        "use a native Speculators DFlash2 checkpoint with a selector and convolution"
+    );
+    let window = config["transformer_layer_config"]["sliding_window"]
+        .as_u64()
+        .filter(|&window| window > 0)
+        .expect("native checkpoint must declare a sliding window") as usize;
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let mut cases: Vec<_> = [
+        ("The capital of France is", 64),
+        ("def fibonacci(n):", 64),
+        ("The three primary colors are", 24),
+        (
+            "Q: What is 17 multiplied by 23? A: Let's think step by step.",
+            48,
+        ),
+    ]
+    .into_iter()
+    .map(|(prompt, budget)| {
+        (
+            prompt,
+            tokenizer.encode(prompt, false).expect("encode failed"),
+            budget,
+        )
+    })
+    .collect();
+    let mut long_context = tokenizer
+        .encode(
+            include_str!("../../docs/models/qwen3/dflash-speculative-decoding.md"),
+            false,
+        )
+        .expect("encode long context");
+    long_context.truncate(window + 32);
+    assert!(
+        long_context.len() > window,
+        "long-context fixture must exceed window={window}"
+    );
+    cases.push(("native long context", long_context, 32));
+    // The regret reference re-prefills the prompt plus its matching output
+    // prefix as one prompt-scoring request, which cannot use chunked prefill.
+    let max_prefill_tokens = cases
+        .iter()
+        .map(|(_, tokens, budget)| tokens.len() + *budget)
+        .fold(DEFAULT_MAX_PREFILL_TOKENS, usize::max);
+
+    let fixed_request = |tokens: &[u32], budget, logprobs| {
+        let mut req = request(
+            tokens.to_vec(),
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            budget,
+        );
+        req.logprobs = logprobs;
+        req
+    };
+    let fixed_steps = |outcome: Outcome, budget| {
+        assert!(
+            matches!(outcome.terminal, Terminal::Finished {
+                reason: FinishReason::Length, stop_cause: None, completion_tokens, ..
+            } if completion_tokens == budget),
+            "native gate must finish the complete budget: {:?}",
+            outcome.terminal
+        );
+        assert_eq!(outcome.tokens.len(), budget);
+        to_steps(outcome)
+    };
+
+    let mut baseline_options = launch_options(None);
+    baseline_options.max_prefill_tokens = max_prefill_tokens;
+    let baselines: Vec<_> = {
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), baseline_options)
+                .expect("failed to start baseline engine"),
+        );
+        let out = cases
+            .iter()
+            .map(|(_, tokens, budget)| {
+                fixed_steps(
+                    engine
+                        .submit(fixed_request(tokens, *budget, Some(LOGPROBS)))
+                        .expect_finished(),
+                    *budget,
+                )
+            })
+            .collect();
+        drop(engine);
+        std::thread::sleep(Duration::from_secs(2));
+        out
+    };
+    let mut native_options = launch_options(Some(PathBuf::from(&draft_path)));
+    native_options.max_prefill_tokens = max_prefill_tokens;
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(Path::new(&model_path), native_options)
+            .expect("failed to start native speculative engine"),
+    );
+
+    for (name, range) in [
+        ("single", 0..1),
+        ("heterogeneous", 1..4),
+        ("long-window", 4..5),
+    ] {
+        let before = engine.metrics().spec_decode.unwrap_or_default();
+        // Submit each group up front: the middle group mixes verify budgets,
+        // then the long request reuses the single-request capture shape.
+        let streams: Vec<_> = cases[range.clone()]
+            .iter()
+            .map(|(_, tokens, budget)| engine.submit(fixed_request(tokens, *budget, None)))
+            .collect();
+        let specs: Vec<_> = streams
+            .into_iter()
+            .zip(&cases[range.clone()])
+            .map(|(stream, (_, _, budget))| fixed_steps(stream.expect_finished(), *budget))
+            .collect();
+        // Metrics are published before terminal updates; take the delta before
+        // any regret diagnostic adds a separate prompt-scoring request.
+        let after = engine
+            .metrics()
+            .spec_decode
+            .expect("native speculative metrics missing");
+        let rounds = after.num_drafts - before.num_drafts;
+        let proposed = after.num_draft_tokens - before.num_draft_tokens;
+        let accepted = after.num_accepted_tokens - before.num_accepted_tokens;
+        assert!(
+            rounds > 0 && proposed > 0 && accepted > 0,
+            "{name}: speculative path inactive"
+        );
+        assert!(accepted <= proposed, "{name}: accepted exceeds proposed");
+        eprintln!(
+            "native {name}: window={window}, rounds={rounds}, proposed={proposed}, accepted={accepted}"
+        );
+        for (i, spec) in range.zip(specs) {
+            let (prompt, tokens, budget) = &cases[i];
+            check_lossless(&engine, &tokenizer, i, prompt, tokens, &baselines[i], &spec)
+                .unwrap_or_else(|failure| panic!("native {name}: {failure}"));
+            eprintln!(
+                "native {name} request {i}: prompt_tokens={}, budget={budget}, generated={}, lossless=pass",
+                tokens.len(),
+                spec.len()
+            );
+        }
+    }
+}
+
+/// Production hedge regression: an explicit stop in the middle of a verify
+/// span must be applied before the hedge winner is selected and committed.
+/// The parent gate also checks the request-local worker trace, because the
+/// final stream alone cannot prove the winner was selected from a truncated
+/// span (a broken worker is only rejected at commit, after the fact).
+#[test]
+fn dflash_hedged_midspan_stop_retains_trigger() {
+    common::harness::init_capture_logging();
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    if std::env::var_os("PEGAINFER_SPEC_HEDGE").is_none() {
+        eprintln!(
+            "skipping hedged mid-span stop gate: run it through hedged_ladder_passes_the_lossless_gates"
+        );
+        return;
+    }
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let prompt = "Write a short paragraph about a blue";
+    let tokenizer = common::load_tokenizer(&model_path);
+    let prompt_tokens = tokenizer.encode(prompt, false).expect("encode failed");
+    let draft_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(Path::new(&draft_path).join("config.json"))
+            .expect("read draft config"),
+    )
+    .expect("parse draft config");
+    let block_size = draft_config["block_size"]
+        .as_u64()
+        .expect("draft block_size") as usize;
+    let min_index = (block_size / 2).max(1);
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start speculative engine"),
+    );
+    let baseline_params = SamplingParams {
+        ignore_eos: true,
+        ..SamplingParams::default()
+    };
+    let baseline = engine
+        .submit(request(
+            prompt_tokens.clone(),
+            baseline_params,
+            GENERATED_TOKENS,
+        ))
+        .expect_finished();
+    assert!(matches!(
+        baseline.terminal,
+        Terminal::Finished {
+            reason: FinishReason::Length,
+            stop_cause: None,
+            completion_tokens,
+            ..
+        } if completion_tokens == GENERATED_TOKENS && completion_tokens == baseline.tokens.len()
+    ));
+    let baseline = baseline.tokens;
+    let candidate_stops: Vec<(usize, u32)> = baseline
+        .iter()
+        .enumerate()
+        .skip(min_index)
+        .take(block_size.saturating_sub(min_index))
+        .filter(|(index, token)| !baseline[..*index].contains(token))
+        .map(|(index, token)| (index, *token))
+        .collect();
+    assert!(
+        !candidate_stops.is_empty(),
+        "baseline did not produce a unique token inside the first verify span"
+    );
+
+    let mut stopped_cases = 0usize;
+    let mut no_stop_cases = 0usize;
+    for (baseline_index, stop_id) in candidate_stops {
+        let stopped_params = SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        };
+        let mut stopped = request(prompt_tokens.clone(), stopped_params, GENERATED_TOKENS);
+        stopped.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![stop_id]);
+        let stream = engine.submit(stopped);
+        let request_id = stream.id();
+        eprintln!("hedge stop request={request_id}");
+        let outcome = stream.expect_finished();
+
+        // Do not `continue` past a candidate: a mid-span stop must still be
+        // the final token, and a run that never sampled the stop must terminate
+        // at the length limit. Filtering either shape would hide a suffix leak.
+        if let Some(position) = outcome.tokens.iter().position(|&token| token == stop_id) {
+            assert_eq!(
+                position,
+                outcome.tokens.len() - 1,
+                "stop {stop_id} was followed by {} more token(s) in candidate baseline_index={baseline_index}: {:?}",
+                outcome.tokens.len() - 1 - position,
+                outcome.tokens
+            );
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Stop,
+                    stop_cause: Some(StopCause::Token(id)),
+                    completion_tokens,
+                    ..
+                } if id == stop_id && completion_tokens == outcome.tokens.len()
+            ));
+            eprintln!(
+                "hedge stop candidate baseline_index={baseline_index} token={stop_id} retained_len={}",
+                outcome.tokens.len()
+            );
+            stopped_cases += 1;
+        } else {
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Length,
+                    stop_cause: None,
+                    completion_tokens,
+                    ..
+                } if completion_tokens == GENERATED_TOKENS && completion_tokens == outcome.tokens.len()
+            ));
+            no_stop_cases += 1;
+        }
+    }
+    assert!(
+        stopped_cases > 0,
+        "none of the candidate tokens produced a mid-span explicit stop"
+    );
+    eprintln!("hedge stop child: {stopped_cases} stopped case(s), {no_stop_cases} no-stop case(s)");
+}
+
 /// P2 regression: a request that fits the target context window but lands in the
 /// draft's `block_size` in-fill headroom (`max_pos - block_size < prompt +
 /// max_tokens <= max_pos`) must be rejected cleanly at admission. Before the
@@ -700,15 +1021,15 @@ fn dflash_request_in_draft_headroom_is_rejected_not_panicked() {
     }
 }
 
-/// Execution gate for the hedge ladder: re-runs the two losslessness tests
+/// Execution gate for the hedge ladder: re-runs the hedge child suites
 /// above in child processes, since the hedge config is read once per process
 /// and cannot be toggled in-process.
 ///
-/// Scope: this proves the copy-back and discard branches were ENTERED, not
-/// that a later round consumes the winner's state correctly — `check_lossless`
-/// returns at the first benign tie flip, so the suffix past it is never
-/// compared. A tie is also a non-win (the win test is strictly-greater), so
-/// the counters cannot separate a tie from a shorter chain.
+/// The stop child additionally checks that an untrimmed B candidate is not
+/// selected over the truncated A candidate, and that context append and KV
+/// commit use the same retained length. The losslessness children retain their
+/// numerical tie tolerance and only require that the configured hedge path
+/// actually ran.
 ///
 /// Strict token equality against an unhedged run is NOT a valid contract:
 /// hedged rounds change the verify batch shape, which legally flips bf16 ties,
@@ -750,16 +1071,17 @@ fn hedged_ladder_passes_the_lossless_gates() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let exe = std::env::current_exe().expect("test binary path");
-    // One child per lossless suite, each with a single exact filter, so the
-    // invocation shape is beyond dispute on any libtest version.
+    // One child per suite, each with a single exact filter, so the invocation
+    // shape is beyond dispute on any libtest version.
     // A hedge-free child would make its lossless pass vacuous, so each child
     // must show expanded spans in the executor's per-round trace.
     let mut total_spans = 0usize;
-    let mut total_wins = 0usize;
     let mut total_rounds = 0usize;
+    let mut total_wins = 0usize;
     for child_test in [
         "dflash_speculative_greedy_matches_plain_greedy",
         "dflash_concurrent_heterogeneous_is_lossless",
+        "dflash_hedged_midspan_stop_retains_trigger",
     ] {
         let output = Command::new(&exe)
             .args(["--exact", child_test, "--test-threads=1", "--nocapture"])
@@ -777,7 +1099,6 @@ fn hedged_ladder_passes_the_lossless_gates() {
         );
         let mut rounds = 0usize;
         let mut spans = 0usize;
-        let mut wins = 0usize;
         for line in child_stderr.lines() {
             let Some(rest) = line.split("DFlash hedge: ").nth(1) else {
                 continue;
@@ -787,23 +1108,271 @@ fn hedged_ladder_passes_the_lossless_gates() {
                 .filter(|tok| !tok.is_empty())
                 .map(|tok| tok.parse::<usize>().expect("hedge trace number"));
             spans += nums.next().expect("span count");
-            wins += nums.next().expect("win count");
+            let wins = nums.next().expect("win count");
+            if child_test != "dflash_hedged_midspan_stop_retains_trigger" {
+                total_wins += wins;
+            }
             rounds += 1;
         }
         assert!(
             rounds > 0 && spans > 0,
             "child '{child_test}' executed no hedged verify round:\n{child_stderr}"
         );
-        total_rounds += rounds;
-        total_spans += spans;
-        total_wins += wins;
+        if child_test == "dflash_hedged_midspan_stop_retains_trigger" {
+            let stop_requests: HashSet<String> = child_stderr
+                .lines()
+                .filter_map(|line| line.strip_prefix("hedge stop request="))
+                .map(str::to_owned)
+                .collect();
+            assert!(
+                !stop_requests.is_empty(),
+                "stop child emitted no request marker"
+            );
+            let mut context_by_round_request: HashMap<(u64, String), usize> = HashMap::new();
+            let mut commit_by_round_request: HashMap<(u64, String), usize> = HashMap::new();
+            for line in child_stderr.lines() {
+                let (length_field, lengths) = if line.contains("Qwen3 DFlash context ") {
+                    ("context_len=", &mut context_by_round_request)
+                } else if line.contains("Qwen3 DFlash commit ") {
+                    ("accepted_len=", &mut commit_by_round_request)
+                } else {
+                    continue;
+                };
+                let value = |name: &str| {
+                    line.split_whitespace()
+                        .find_map(|field| field.strip_prefix(name))
+                };
+                let round = value("round=")
+                    .expect("verify round")
+                    .parse::<u64>()
+                    .expect("numeric verify round");
+                let request = value("request=").expect("verify request");
+                let length = value(length_field)
+                    .expect("verify length")
+                    .parse::<usize>()
+                    .expect("numeric verify length");
+                assert!(
+                    lengths
+                        .insert((round, request.to_string()), length)
+                        .is_none(),
+                    "duplicate {length_field} for round={round} request={request}"
+                );
+            }
+            let mut worker_side_truncation = false;
+            for line in child_stderr.lines() {
+                if !line.contains("Qwen3 DFlash hedge detail ") {
+                    continue;
+                }
+                let value = |name: &str| {
+                    line.split_whitespace()
+                        .find_map(|field| field.strip_prefix(name))
+                };
+                let selected = value("selected=");
+                let round = value("round=")
+                    .expect("hedge round")
+                    .parse::<u64>()
+                    .expect("numeric hedge round");
+                let request = value("request=").expect("hedge request");
+                let raw_a = value("raw_a=").and_then(|v| v.parse().ok());
+                let raw_b_lens = value("raw_b_lens=").map(|v| {
+                    v.split(',')
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.parse::<usize>().expect("raw B length"))
+                        .collect::<Vec<_>>()
+                });
+                let selected_len = value("selected_len=")
+                    .expect("selected length")
+                    .parse::<usize>()
+                    .expect("numeric selected length");
+                if !stop_requests.contains(request) {
+                    continue;
+                }
+                let key = (round, request.to_string());
+                let context_len = context_by_round_request
+                    .get(&key)
+                    .expect("same-round DFlash context record");
+                let commit_len = commit_by_round_request
+                    .get(&key)
+                    .expect("same-round KV commit record");
+                assert_eq!(
+                    selected_len, *context_len,
+                    "hedge/context mismatch for round={round} request={request}"
+                );
+                assert_eq!(
+                    selected_len, *commit_len,
+                    "hedge/commit mismatch for round={round} request={request}"
+                );
+                let raw_b_max = raw_b_lens
+                    .as_ref()
+                    .and_then(|lengths| lengths.iter().copied().max());
+                if raw_b_max.is_some_and(|raw_b| raw_a.is_some_and(|raw_a| raw_b > raw_a))
+                    && selected == Some("A")
+                    && raw_b_max.is_some_and(|raw| selected_len < raw)
+                {
+                    worker_side_truncation = true;
+                }
+            }
+            assert!(
+                worker_side_truncation,
+                "stop hedge never truncated a candidate before winner/context commit:\n{child_stderr}"
+            );
+        }
+        if child_test != "dflash_hedged_midspan_stop_retains_trigger" {
+            total_rounds += rounds;
+            total_spans += spans;
+        }
     }
-    assert!(
-        total_wins > 0,
-        "no hedge chain ever won across {total_rounds} hedged rounds"
+    assert!(total_rounds > 0 && total_spans > 0);
+    assert!(total_wins > 0);
+    assert!(total_spans > total_wins);
+}
+
+/// Parse the executor's per-round trace into
+/// `(round, request, gated, verified drafts, accepted drafts)`. `RequestId`
+/// renders as `req-<n>`, so each field takes the first non-empty digit run
+/// after the field name.
+fn levers_trace_rows(stderr: &str) -> Vec<(u64, u64, bool, usize, usize)> {
+    let mut out = Vec::new();
+    for line in stderr.lines() {
+        if !line.contains("Qwen3 DFlash context round=") {
+            continue;
+        }
+        let field = |name: &str| -> u64 {
+            line.split(name)
+                .nth(1)
+                .and_then(|rest| {
+                    rest.split(|ch: char| !ch.is_ascii_digit())
+                        .find(|token| !token.is_empty())
+                })
+                .and_then(|token| token.parse().ok())
+                .unwrap_or_else(|| panic!("missing {name} in trace line: {line}"))
+        };
+        out.push((
+            field("round="),
+            field("request="),
+            field("gated=") == 1,
+            field("verified_draft=") as usize,
+            field("accepted_draft=") as usize,
+        ));
+    }
+    out
+}
+
+/// Losslessness and reach under the two load levers.
+///
+/// Both knobs are read once per process from the environment, so a normal test
+/// cannot vary them per case. This gate re-execs itself (the hedged gate's
+/// pattern) once per configuration and checks the child's lossless pass *and*
+/// the executor's per-round trace:
+///
+/// - `PEGAINFER_SPEC_MAX_BATCH=1` gates every round (the batch is always >= 1),
+///   so the one-token verify path is the only path exercised;
+/// - `PEGAINFER_SPEC_MAX_DRAFTS=4/2` must keep the greedy and concurrent gates
+///   green, and no round may verify more drafts than the cap;
+/// - `PEGAINFER_SPEC_MAX_BATCH=3` on the heterogeneous concurrent batch (four
+///   staggered budgets): the batch shrinks below the threshold mid-run, and a
+///   request that was gated must later accept drafts.
+#[test]
+fn dflash_spec_levers_keep_losslessness() {
+    const GREEDY: &str = "dflash_speculative_greedy_matches_plain_greedy";
+    const CONCURRENT: &str = "dflash_concurrent_heterogeneous_is_lossless";
+
+    let (Some(_), Some(_)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let exe = std::env::current_exe().expect("test binary path");
+
+    let run_child = |child_test: &str, envs: &[(&str, &str)]| -> String {
+        let mut command = Command::new(&exe);
+        command
+            .args(["--exact", child_test, "--test-threads=1", "--nocapture"])
+            .env("PEGAINFER_TEST_LOG", "1")
+            .env_remove("PEGAINFER_SPEC_MAX_BATCH")
+            .env_remove("PEGAINFER_SPEC_MAX_DRAFTS")
+            .env_remove("PEGAINFER_SPEC_HEDGE")
+            .env_remove("PEGAINFER_SPEC_HEDGE_AUTO")
+            .env_remove("PEGAINFER_SPEC_HEDGE_POSITIONS")
+            .env_remove("PEGAINFER_SPEC_HEDGE_KNEE");
+        for &(key, value) in envs {
+            command.env(key, value);
+        }
+        let output = command
+            .output()
+            .unwrap_or_else(|e| panic!("spawn child gate '{child_test}': {e}"));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "child gate '{child_test}' failed with {envs:?}:\n{}\n{stderr}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        stderr
+    };
+
+    // Every step gated: the one-token round must reproduce plain greedy.
+    let trace = run_child(GREEDY, &[("PEGAINFER_SPEC_MAX_BATCH", "1")]);
+    let trace_rows = levers_trace_rows(&trace);
+    let gated = trace_rows.iter().filter(|row| row.2).count();
+    let drafting = trace_rows.iter().filter(|row| !row.2 && row.3 > 0).count();
+    eprintln!(
+        "spec lever gate: child={GREEDY} env=MAX_BATCH=1 gated_rows={gated} \
+         speculating_rows={drafting}"
     );
     assert!(
-        total_spans > total_wins,
-        "every hedge span won ({total_wins}/{total_spans}) — the discard path never executed"
+        gated > 0
+            && drafting == 0
+            && trace_rows
+                .iter()
+                .all(|row| row.2 && row.3 == 0 && row.4 <= 1),
+        "PEGAINFER_SPEC_MAX_BATCH=1 still speculated (gated={gated}, drafting={drafting}):\n{trace}"
+    );
+
+    // Trimmed spans stay lossless, and no round verifies more than the cap.
+    for cap in ["4", "2"] {
+        let cap_len: usize = cap.parse().expect("numeric draft cap");
+        for child_test in [GREEDY, CONCURRENT] {
+            let trace = run_child(child_test, &[("PEGAINFER_SPEC_MAX_DRAFTS", cap)]);
+            let trace_rows = levers_trace_rows(&trace);
+            let drafting = trace_rows.iter().filter(|row| !row.2 && row.3 > 0).count();
+            let max_drafts = trace_rows.iter().map(|row| row.3).max().unwrap_or(0);
+            eprintln!(
+                "spec lever gate: child={child_test} env=MAX_DRAFTS={cap} gated_rows=0 \
+                 speculating_rows={drafting} max_drafts={max_drafts}"
+            );
+            assert!(
+                trace_rows.iter().all(|row| !row.2),
+                "the gate must stay off when only MAX_DRAFTS is set:\n{trace}"
+            );
+            assert!(
+                drafting > 0 && max_drafts <= cap_len,
+                "trim K={cap} on '{child_test}' verified {max_drafts} drafts \
+                 (drafting rounds={drafting}):\n{trace}"
+            );
+        }
+    }
+
+    // Resume, checked per request: aggregate counts cannot show it.
+    let trace = run_child(CONCURRENT, &[("PEGAINFER_SPEC_MAX_BATCH", "3")]);
+    let trace_rows = levers_trace_rows(&trace);
+    let gated = trace_rows.iter().filter(|row| row.2).count();
+    let drafting = trace_rows.iter().filter(|row| !row.2 && row.3 > 0).count();
+    eprintln!(
+        "spec lever gate: child={CONCURRENT} env=MAX_BATCH=3 gated_rows={gated} \
+         speculating_rows={drafting}"
+    );
+    let resumed = trace_rows.iter().enumerate().any(|(index, row)| {
+        !row.2
+            && row.3 > 0
+            && row.4 > 0
+            && trace_rows[..index]
+                .iter()
+                .any(|earlier| earlier.1 == row.1 && earlier.2)
+    });
+    assert!(
+        gated > 0 && drafting > 0 && resumed,
+        "no request was gated and then later accepted drafts \
+         (gated={gated}, drafting={drafting}):\n{trace}"
     );
 }

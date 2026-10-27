@@ -99,8 +99,8 @@ fn run_request(
         lora_adapter: None,
         kv_transfer_params: None,
         token_tx,
-        logprobs: 0,
-        echo: false,
+        logprobs: None,
+        prompt_logprobs: None,
     })?;
     let mut completion = Vec::new();
     loop {

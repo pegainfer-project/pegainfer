@@ -68,10 +68,6 @@ pub(crate) enum ConfigError {
     TpZeroWorldSize,
     #[error("tensor_parallel.rank {rank} must be < world_size {world_size}")]
     TpRankOutOfRange { rank: usize, world_size: usize },
-    #[error(
-        "Qwen3.5 tensor parallelism is eager-only; disable CUDA Graph for tp world_size={world_size}"
-    )]
-    TpRequiresEager { world_size: usize },
     #[error("{field}={value} not divisible by tp world_size={world_size}")]
     TpIndivisible {
         field: &'static str,

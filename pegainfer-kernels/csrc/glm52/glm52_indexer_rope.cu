@@ -18,6 +18,7 @@
 // left unchanged.
 
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -102,11 +103,7 @@ CUresult glm52_indexer_rope_cuda(__nv_bfloat16* q,      // [tokens, n_heads, hea
   }
   const dim3 grid(n_heads, tokens, 1);
   glm52_indexer_rope_kernel<<<grid, 128, 0, stream>>>(q, k, n_heads, cos, sin);
-  cudaError_t err = cudaGetLastError();
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue) return CUDA_ERROR_INVALID_VALUE;
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  return CUDA_ERROR_LAUNCH_FAILED;
+  return map_cuda_error(cudaGetLastError());
 }
 
 }  // extern "C"

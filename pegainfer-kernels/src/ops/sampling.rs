@@ -533,6 +533,7 @@ pub unsafe fn logprob_topk_batch_bf16_into(
     rows: usize,
     k_max: usize,
     out_picked_lp: &mut CudaSlice<f32>,
+    out_picked_rank: &mut CudaSlice<i32>,
     out_topk_vals: &mut CudaSlice<f32>,
     out_topk_ids: &mut CudaSlice<i32>,
 ) -> Result<()> {
@@ -557,9 +558,10 @@ pub unsafe fn logprob_topk_batch_bf16_into(
         top_k.len()
     );
     ensure!(
-        out_picked_lp.len() >= rows,
-        "logprob_topk picked output too small: have {}, need {rows}",
-        out_picked_lp.len()
+        out_picked_lp.len() >= rows && out_picked_rank.len() >= rows,
+        "logprob_topk picked outputs too small: have {}/{}, need {rows}",
+        out_picked_lp.len(),
+        out_picked_rank.len()
     );
     let topk_needed = rows
         .checked_mul(k_max)
@@ -579,6 +581,7 @@ pub unsafe fn logprob_topk_batch_bf16_into(
     let (picked_ptr, _gp) = picked.device_ptr(&ctx.stream);
     let (k_ptr, _gk) = top_k.device_ptr(&ctx.stream);
     let (lp_ptr, _gl) = out_picked_lp.device_ptr_mut(&ctx.stream);
+    let (rank_ptr, _grank) = out_picked_rank.device_ptr_mut(&ctx.stream);
     let (vals_ptr, _gv) = out_topk_vals.device_ptr_mut(&ctx.stream);
     let (ids_ptr, _gi) = out_topk_ids.device_ptr_mut(&ctx.stream);
 
@@ -589,6 +592,7 @@ pub unsafe fn logprob_topk_batch_bf16_into(
             picked_ptr as *const i32,
             k_ptr as *const i32,
             lp_ptr as *mut f32,
+            rank_ptr as *mut i32,
             vals_ptr as *mut f32,
             ids_ptr as *mut i32,
             rows_i32,

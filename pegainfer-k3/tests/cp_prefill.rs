@@ -29,7 +29,7 @@
 //! comparison).
 //!
 //! ```text
-//! cargo test --release -p pegainfer-k3 --test cp_prefill \
+//! cargo test --release -p pegainfer-k3 --features k3 --test cp_prefill \
 //!   cp4_prefill_matches_cp1 -- --ignored --nocapture
 //! ```
 

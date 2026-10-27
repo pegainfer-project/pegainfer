@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <exception>
 
+#include "../shared/ffi_guard.cuh"
 #include "params.h"
 #include "sm100/decode/head64/kernel.cuh"
 #include "sm100/prefill/sparse/fwd/head64/phase1.cuh"
@@ -28,16 +29,6 @@ constexpr int kMaxSmParts = 160;
 constexpr int kBlockSizeTopk = 64;
 constexpr int kFixedOverheadBlocks = 5;
 constexpr float kLog2E = 1.4426950408889634f;
-
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
 
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 

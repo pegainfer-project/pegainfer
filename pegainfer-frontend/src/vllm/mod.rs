@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
+use std::num::NonZeroU32;
+use std::os::fd::IntoRawFd;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +15,8 @@ use log::warn;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use vllm_chat::LoadModelBackendsOptions;
+use vllm_chat::load_model_backends;
 use vllm_engine_core_client::TransportMode;
 use vllm_server::ApiServerOptions;
 use vllm_server::ChatTemplateContentFormatOption;
@@ -21,13 +26,16 @@ use vllm_server::CorsConfig;
 use vllm_server::DEFAULT_KEEP_ALIVE_TIMEOUT;
 use vllm_server::GenerationConfigMode;
 use vllm_server::HttpListenerMode;
-use vllm_server::ParserSelection;
+pub use vllm_server::ParserSelection;
 use vllm_server::RendererSelection;
+use vllm_text::backend::hf::HfOverrides;
 
 use crate::engine::LaunchedEngine;
 
 mod bridge;
+mod history;
 mod lora;
+mod reasoning_effort;
 mod request_contract;
 mod wire;
 
@@ -61,10 +69,13 @@ impl ModelLenConfig {
 /// Pass `max_model_len: None` to read `max_position_embeddings` from
 /// `model_path/config.json`; pass `Some(n)` when the path has no config
 /// (e.g. a HuggingFace model id for the sim frontend).
+/// `tool_call_parser` selects the output tool-call parser (see the
+/// `--tool-call-parser` CLI flag for the `Auto` matching caveat).
 pub async fn serve(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     port: u16,
     max_model_len: Option<u32>,
     shutdown: CancellationToken,
@@ -73,6 +84,7 @@ pub async fn serve(
         engine,
         model_path,
         served_model_name,
+        tool_call_parser,
         port,
         max_model_len,
         1,
@@ -89,6 +101,7 @@ pub async fn serve_with_engine_count(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     port: u16,
     max_model_len: Option<u32>,
     engine_count: usize,
@@ -98,11 +111,46 @@ pub async fn serve_with_engine_count(
         engine,
         model_path.to_string_lossy().into_owned(),
         served_model_name,
+        tool_call_parser,
         "0.0.0.0".to_string(),
         port,
         resolve_max_model_len(model_path, max_model_len),
         engine_count,
         shutdown,
+    )
+    .await
+}
+
+/// Serve as [`serve_with_engine_count`] does, behind the caller's routes:
+/// `extend_router` takes the vLLM router and returns the one that listens.
+/// An engine refuses what it does not serve here, with a 400 before the
+/// request reaches it, as the prefill-only contract does.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_router_extension<F>(
+    engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
+    model_path: &Path,
+    served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
+    port: u16,
+    max_model_len: Option<u32>,
+    engine_count: usize,
+    shutdown: CancellationToken,
+    extend_router: F,
+) -> Result<()>
+where
+    F: FnOnce(Router) -> Router,
+{
+    serve_model_on_host_with_router_extension(
+        engine,
+        model_path.to_string_lossy().into_owned(),
+        served_model_name,
+        tool_call_parser,
+        "0.0.0.0".to_string(),
+        port,
+        resolve_max_model_len(model_path, max_model_len),
+        engine_count,
+        shutdown,
+        extend_router,
     )
     .await
 }
@@ -113,18 +161,19 @@ pub async fn serve_prefill_only_with_engine_count(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_path: &Path,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     port: u16,
     max_model_len: Option<u32>,
     engine_count: usize,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    serve_model_on_host_with_router_extension(
+    serve_with_router_extension(
         engine,
-        model_path.to_string_lossy().into_owned(),
+        model_path,
         served_model_name,
-        "0.0.0.0".to_string(),
+        tool_call_parser,
         port,
-        resolve_max_model_len(model_path, max_model_len),
+        max_model_len,
         engine_count,
         shutdown,
         request_contract::prefill_only_routes,
@@ -136,6 +185,7 @@ pub async fn serve_model_with_lora_routes(
     engine: crate::engine::Engine,
     model_id: impl Into<String>,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     lora_modules: Vec<LoraModule>,
     port: u16,
     max_model_len: u32,
@@ -158,6 +208,7 @@ pub async fn serve_model_with_lora_routes(
         std::future::ready(Ok(LaunchedEngine::Stepped(engine))),
         model_id,
         served_model_name.clone(),
+        tool_call_parser,
         "0.0.0.0".to_string(),
         port,
         max_model_len,
@@ -181,6 +232,7 @@ async fn serve_model_on_host(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_id: String,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     host: String,
     port: u16,
     max_model_len: u32,
@@ -191,6 +243,7 @@ async fn serve_model_on_host(
         engine,
         model_id,
         served_model_name,
+        tool_call_parser,
         host,
         port,
         max_model_len,
@@ -205,6 +258,7 @@ async fn serve_model_on_host_with_router_extension<F>(
     engine: impl Future<Output = Result<LaunchedEngine>> + Send + 'static,
     model_id: String,
     served_model_name: Vec<String>,
+    tool_call_parser: ParserSelection,
     host: String,
     port: u16,
     max_model_len: u32,
@@ -221,6 +275,11 @@ where
     let namespace = local_ipc_namespace()?;
     let input_address = ipc_endpoint(&namespace, "input.sock");
     let output_address = ipc_endpoint(&namespace, "output.sock");
+    // vllm-server adopts already-bound listeners (the supervisor's role in
+    // upstream's Python deployment); binding them here means the bridge can
+    // connect at any time, the server owns and closes the descriptors.
+    let input_listener_fd = UnixListener::bind(namespace.join("input.sock"))?.into_raw_fd();
+    let output_listener_fd = UnixListener::bind(namespace.join("output.sock"))?.into_raw_fd();
 
     // The HTTP server runs concurrently with the engine load: vllm-server
     // spends ~1s loading the tokenizer and chat templates before it waits for
@@ -331,7 +390,7 @@ where
             if bridge_error.is_some() {
                 server_shutdown.cancel();
                 bridge_shutdown.cancel();
-                bridges.abort_all();
+                // Let the other bridges abort their requests and flush their output.
                 while bridges.join_next().await.is_some() {}
             }
             // The bridges are gone, and with them the partition handles:
@@ -354,10 +413,31 @@ where
         }
     });
 
+    // The two request-shaping layers read the served checkpoint's template and
+    // tokenizer, loaded once here; the server loads its own afterwards and
+    // reports its own error if the model is genuinely broken.
+    let backends = match load_model_backends(
+        &model_id,
+        LoadModelBackendsOptions {
+            language_model_only: true,
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(backends) => Some(backends),
+        Err(error) => {
+            warn!("chat request shaping disabled: backends for {model_id} did not load: {error}");
+            None
+        }
+    };
+    let effort_aliases = reasoning_effort::probe_effort_aliases(&model_id, backends.as_ref());
+    let boundary = backends.map(|b| Arc::new(history::Boundary::new(&b)));
+
     let config = Config {
         transport_mode: TransportMode::Bootstrapped {
-            input_address,
-            output_address,
+            input_listener_fd,
+            output_listener_fd,
             engine_start_index: 0,
             engine_count,
             data_parallel_size: engine_count,
@@ -369,15 +449,21 @@ where
         },
         coordinator_mode: CoordinatorMode::None,
         model: model_id,
+        revision: None,
+        hf_overrides: HfOverrides::default(),
         generation_config: GenerationConfigMode::Auto,
         served_model_name,
         listener_mode: HttpListenerMode::BindTcp { host, port },
-        tool_call_parser: ParserSelection::default(),
+        tool_call_parser,
         reasoning_parser: ParserSelection::default(),
+        tool_strict_level: None,
         renderer: RendererSelection::default(),
         chat_template: None,
         default_chat_template_kwargs: None,
         limit_mm_per_prompt: HashMap::new(),
+        // Startup adapters go through the engine-side LoRA channel
+        // (`load_startup_lora_modules`), never the upstream static loader.
+        lora_modules: Vec::new(),
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         max_logprobs: None,
         language_model_only: true,
@@ -387,17 +473,32 @@ where
             enable_log_requests: true,
             enable_prompt_tokens_details: true,
             enable_request_id_headers: false,
+            enable_scale_out: false,
+            enable_per_request_metrics: false,
+            sse_keep_alive_interval: None,
         },
-        disable_log_stats: true,
-        grpc_port: None,
+        // Upstream ties the scheduler-stats and request-event metric recorders
+        // to this flag, and the bridge's stats are what `/metrics` exports; the
+        // periodic stats log line comes with it.
+        disable_log_stats: false,
+        grpc_listener_mode: None,
+        manages_engine: false,
         shutdown_timeout: Duration::from_secs(10),
+        stream_interval: NonZeroU32::MIN,
         keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT,
         profiler: None,
         tls: None,
     };
 
-    let result =
-        vllm_server::serve_with_router_extension(config, server_shutdown, extend_router).await;
+    let result = vllm_server::serve_with_router_extension(config, server_shutdown, move |router| {
+        // Effort normalization is outermost so the boundary measures the
+        // template under the value the route will render with.
+        reasoning_effort::normalize_chat_requests(
+            history::mark_history(extend_router(router), boundary),
+            effort_aliases,
+        )
+    })
+    .await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),
     // then collect the engine task. If the server failed while the engine is
     // still loading, the uncancellable blocking load must finish first.

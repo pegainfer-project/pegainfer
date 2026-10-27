@@ -9,6 +9,8 @@ use pegainfer_frontend::model_line::CliDecodeOverlap;
 use pegainfer_frontend::model_line::CliError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
+use pegainfer_frontend::model_line::ServePlan;
+use pegainfer_frontend::vllm::ParserSelection;
 
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35LaunchOptions;
@@ -21,6 +23,9 @@ pub struct Qwen35Line;
 // Qwen3.5-exclusive CLI flags.
 #[derive(ClapArgs)]
 struct Qwen35Cli {
+    /// Per-rank GPU budget in MiB for joint prefix snapshots; zero disables reuse.
+    #[arg(long, default_value_t = 0)]
+    qwen35_prefix_cache_mib: usize,
     /// Decode-batch capacity, 1..=64. Qwen3.5 internally rounds allocation to
     /// the next graph bucket but admits only this many scheduler slots; defaults
     /// to 64.
@@ -92,6 +97,7 @@ impl ModelLine for Qwen35Line {
             "device_ordinal",
             "tp_size",
             "cuda_graph",
+            "no_prefix_cache",
             "max_prefill_tokens",
             "decode_overlap",
             "decode_sm_pct",
@@ -105,6 +111,11 @@ impl ModelLine for Qwen35Line {
     ) -> Result<(), CliError> {
         let cli = cli(ctx);
         let decode_overlap = resolve_decode_overlap(ctx.shared.decode_overlap)?;
+        if cli.qwen35_prefix_cache_mib > 0 && ctx.shared.no_prefix_cache {
+            return Err(CliError::rule(
+                "--qwen35-prefix-cache-mib and --no-prefix-cache are contradictory",
+            ));
+        }
         if let Some(max_batch) = cli.max_batch {
             if !(1..=crate::MAX_DECODE_BATCH).contains(&max_batch) {
                 return Err(CliError::rule(format!(
@@ -122,13 +133,6 @@ impl ModelLine for Qwen35Line {
                 )));
             }
         }
-        if decode_overlap != Qwen35DecodeOverlap::Off
-            && matches!(cli.qwen35_scheduler_policy, CliQwen35SchedulerPolicy::Auto)
-        {
-            return Err(CliError::rule(
-                "Qwen3.5 --decode-overlap=stream requires --qwen35-scheduler-policy=off",
-            ));
-        }
         if ctx.shared.tp_size > 1 && decode_overlap != Qwen35DecodeOverlap::Off {
             return Err(CliError::rule(
                 "--decode-overlap is single-GPU only; tp_size>1 has no prefill/decode overlap",
@@ -144,11 +148,24 @@ impl ModelLine for Qwen35Line {
         Ok(())
     }
 
+    fn serve_plan(&self, _ctx: &LaunchContext<'_>) -> Result<ServePlan, CliError> {
+        Ok(ServePlan {
+            // Both generations' templates request the Qwen Coder tool syntax,
+            // but upstream `Auto` matches the model *path* by substring: a
+            // `Qwen3.8-27B` directory resolves to the JSON `qwen3_json` parser
+            // (`docs/models/qwen35/support-qwen38.md`). The line knows better
+            // than the directory name.
+            auto_tool_call_parser: Some(ParserSelection::Explicit("qwen3_coder".to_string())),
+            ..Default::default()
+        })
+    }
+
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
         let cli = cli(ctx);
         crate::launch_with_options_policy_and_overlap(
             ctx.model_path,
             Qwen35LaunchOptions {
+                prefix_cache_mib: cli.qwen35_prefix_cache_mib,
                 device_ordinal: ctx.shared.device_ordinal,
                 tp_size: ctx.shared.tp_size,
                 cuda_graph: ctx.shared.cuda_graph,
@@ -162,7 +179,7 @@ impl ModelLine for Qwen35Line {
             resolve_decode_overlap(ctx.shared.decode_overlap)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
         )
-        .map(LaunchedEngine::Handle)
+        .map(LaunchedEngine::Stepped)
     }
 }
 
@@ -186,6 +203,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_contradictory_prefix_cache_flags() {
+        let error = validate_argv(&[
+            "pegainfer",
+            "--qwen35-prefix-cache-mib",
+            "128",
+            "--no-prefix-cache",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("contradictory"), "{error}");
+    }
+
+    #[test]
     fn probe_accepts_qwen35_identity() {
         let json = serde_json::json!({
             "model_type": "qwen3_5",
@@ -199,8 +229,15 @@ mod tests {
 
     #[test]
     fn accepts_tp_size() {
-        validate_argv(&["pegainfer", "--tp-size", "2", "--cuda-graph=false"])
-            .expect("Qwen3.5 should accept --tp-size for eager TP startup");
+        validate_argv(&[
+            "pegainfer",
+            "--tp-size",
+            "2",
+            "--cuda-graph=false",
+            "--qwen35-prefix-cache-mib",
+            "128",
+        ])
+        .expect("Qwen3.5 should accept prefix caching with eager TP startup");
     }
 
     #[test]
@@ -242,8 +279,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_auto_policy_with_overlap() {
-        let error = validate_argv(&[
+    fn accepts_auto_policy_with_overlap() {
+        validate_argv(&[
             "pegainfer",
             "--decode-overlap",
             "stream",
@@ -252,8 +289,7 @@ mod tests {
             "--qwen35-scheduler-policy",
             "auto",
         ])
-        .expect_err("Qwen3.5 should reject auto policy with overlap");
-        assert!(error.to_string().contains("scheduler-policy=off"));
+        .expect("Qwen3.5 should accept the auto policy together with stream overlap");
     }
 
     #[test]
@@ -283,6 +319,35 @@ mod tests {
         assert!(
             error.to_string().contains("--max-batch must be in 1..="),
             "unexpected error: {error}"
+        );
+    }
+
+    /// The server resolves `--tool-call-parser` through this plan, so the
+    /// line's answer is the parser the served grammar gets: `auto` must become
+    /// the Coder parser both generations' templates emit, and an explicit
+    /// choice must survive untouched.
+    #[test]
+    fn auto_tool_call_parser_resolves_to_the_coder_parser() {
+        let (shared, matches, _) =
+            parse_for_line(&MODEL_LINE, &["pegainfer"]).expect("the shared flags parse");
+        let config = serde_json::json!({});
+        let ctx = LaunchContext {
+            model_path: std::path::Path::new("unused"),
+            config: &config,
+            shared: &shared,
+            matches: &matches,
+        };
+        let plan = MODEL_LINE.serve_plan(&ctx).expect("the plan builds");
+
+        assert_eq!(
+            plan.resolve_tool_call_parser(ParserSelection::Auto),
+            ParserSelection::Explicit("qwen3_coder".to_string())
+        );
+        let explicit = ParserSelection::Explicit("qwen3_xml".to_string());
+        assert_eq!(
+            plan.resolve_tool_call_parser(explicit.clone()),
+            explicit,
+            "an explicit name is the caller's to make"
         );
     }
 }

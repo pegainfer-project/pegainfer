@@ -4,6 +4,7 @@ use anyhow::Result;
 use anyhow::bail;
 use cudarc::driver::CudaSlice;
 use half::bf16;
+pub use pegainfer_kernels::paged_kv::KvFormat;
 pub use pegainfer_kernels::paged_kv::KvStorage;
 
 use crate::page_pool::OwnedPagePermit;
@@ -22,11 +23,13 @@ pub struct KvLayout {
     pub head_dim: usize,
     /// Elements in one K (or V) block: page_size × num_kv_heads × head_dim.
     pub kv_block_len: usize,
-    /// Elements between layers within a page: 2 × kv_block_len (K then V).
+    /// Elements between layers within a page: the format's values per token
+    /// over the page's tokens and heads (K then V for `KvFormat::Split`).
     pub layer_stride: usize,
     /// Elements per page (all layers): num_layers × layer_stride.
     pub page_stride: usize,
     pub storage: KvStorage,
+    pub format: KvFormat,
 }
 
 impl KvLayout {
@@ -52,16 +55,35 @@ impl KvLayout {
         page_size: usize,
         storage: KvStorage,
     ) -> anyhow::Result<Self> {
-        let strides = || -> Option<(usize, usize, usize)> {
-            let kv_block_len = page_size.checked_mul(num_kv_heads)?.checked_mul(head_dim)?;
-            let layer_stride = kv_block_len.checked_mul(2)?;
-            let page_stride = num_layers.checked_mul(layer_stride)?;
-            Some((kv_block_len, layer_stride, page_stride))
-        };
-        let (kv_block_len, layer_stride, page_stride) = strides().ok_or_else(|| {
+        Self::with_storage_and_format(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            storage,
+            KvFormat::Split,
+        )
+    }
+
+    pub fn with_storage_and_format(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        storage: KvStorage,
+        format: KvFormat,
+    ) -> anyhow::Result<Self> {
+        let (kv_block_len, layer_stride, page_stride) = pegainfer_kernels::paged_kv::derive_strides(
+            page_size,
+            num_kv_heads,
+            head_dim,
+            num_layers,
+            format,
+        )
+        .ok_or_else(|| {
             anyhow::anyhow!(
-                "kv layout strides overflow usize: {num_layers} layers x {num_kv_heads} heads x \
-                 {head_dim} dim x {page_size} page"
+                "kv layout strides overflow usize or {format:?} does not fit head_dim {head_dim}: \
+                 {num_layers} layers x {num_kv_heads} heads x {page_size} page"
             )
         })?;
         Ok(Self {
@@ -73,6 +95,7 @@ impl KvLayout {
             layer_stride,
             page_stride,
             storage,
+            format,
         })
     }
 
@@ -86,6 +109,7 @@ impl KvLayout {
             layer_stride: self.layer_stride,
             page_stride: self.page_stride,
             storage: self.storage,
+            format: self.format,
         }
     }
 }
@@ -146,8 +170,37 @@ impl KvPool {
         num_pages: usize,
         storage: KvStorage,
     ) -> Result<Self> {
-        let layout =
-            KvLayout::with_storage(num_layers, num_kv_heads, head_dim, page_size, storage)?;
+        Self::with_storage_and_format(
+            ctx,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            num_pages,
+            storage,
+            KvFormat::Split,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_storage_and_format(
+        ctx: &DeviceContext,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        num_pages: usize,
+        storage: KvStorage,
+        format: KvFormat,
+    ) -> Result<Self> {
+        let layout = KvLayout::with_storage_and_format(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            storage,
+            format,
+        )?;
         let total_elements = num_pages.checked_mul(layout.page_stride).ok_or_else(|| {
             anyhow::anyhow!(
                 "KvPool geometry overflows: {num_pages} pages x {} elements per page",

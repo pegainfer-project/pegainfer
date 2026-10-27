@@ -1,18 +1,23 @@
 # Gemma 4 tokenizer and chat template
 
-**TL;DR:** All five chat renders reproduce the Hugging Face reference when content is flattened to strings — gated by `pegainfer-frontend/tests/gemma4_tokenizer_parity.rs` (runner-owned) against the pinned 12B checkpoint, with the other two sizes covered by inspection rather than by running. The token-id probes are retired: both sides run the same `tokenizers` crate, so they gated the Python wrapper's version skew rather than behavior. One divergence is open: under the frontend's default content format the system turn gains a trailing space. Contracts the engine must honour: BOS comes only from the chat template, EOS is declared in three places with three different values, the published generation defaults are sampled rather than greedy, and text-only serving rejects modality tokens before embedding and suppresses them before sampling.
+**TL;DR:** All five chat renders reproduce the Hugging Face reference when content is flattened to strings — gated by `pegainfer-frontend/tests/gemma4_tokenizer_parity.rs` (runner-owned) against the checkpoint its reference was dumped from. The committed reference is 12B's; another size is gated by dumping its own under `PEGAINFER_GEMMA4_FIXTURE_TAG`, as 31B has been, and a size whose reference nobody dumped is covered by inspection rather than by running. The token-id probes are retired: both sides run the same `tokenizers` crate, so they gated the Python wrapper's version skew rather than behavior. One divergence is open: under the frontend's default content format the system turn gains a trailing space. Contracts the engine must honour: BOS comes only from the chat template, EOS is declared in three places with three different values, the published generation defaults are sampled rather than greedy, and text-only serving rejects modality tokens before embedding and suppresses them before sampling.
 
 Last touched: 2026-09
 
-## The gate runs on 12B; the result carries to the other sizes by inspection
+## The gate runs on the size its reference was dumped from
 
-The executable gate is bound to the pinned 12B checkpoint — the fixture records that checkpoint's
-file hashes and every test checks them first, so pointing it at another size fails on the
-`tokenizer_config.json` hash before asserting anything. That binding is deliberate: it keeps the
-guard an exact-file provenance check rather than a set of semantic exceptions.
+The executable gate is bound to whichever checkpoint its reference came from — the fixture records
+that checkpoint's file hashes and every test checks them first, so a reference and a checkpoint
+that do not match fail on the `tokenizer_config.json` hash before anything is asserted. That
+binding is deliberate: it keeps the guard an exact-file provenance check rather than a set of
+semantic exceptions. The committed reference is 12B's.
 
-What carries to 26B-A4B and 31B is the conclusion, not the run, and it carries because the files
-are the same bytes. Against the published repositories:
+Another size is gated by dumping its own reference under a tag rather than by loosening the guard:
+`test_data/gemma4-<tag>-tokenizer-golden.json` beside the committed `gemma4-tokenizer-golden.json`,
+selected with `PEGAINFER_GEMMA4_FIXTURE_TAG` (see the Reference fixture section below). 31B has
+been run that way. Only the 12B reference is committed, so for any size whose reference nobody has
+dumped, what carries is the conclusion rather than the run, and it carries because the files are
+the same bytes. Against the published repositories:
 
 | file | 12B | 26B-A4B | 31B |
 | --- | --- | --- | --- |
@@ -40,6 +45,24 @@ python tools/accuracy/dump_gemma4_tokenizer_golden.py <model-dir> <out.json> \
   --source-repo google/gemma-4-12B-it --revision <sha>
 ```
 
+The same command dumps another size's reference; the runner finds it by tag, so the name is what
+selects it. `PEGAINFER_GEMMA4_FIXTURE_TAG=12b` (the default) keeps the committed untagged name,
+and any other tag reads `test_data/gemma4-<tag>-tokenizer-golden.json`:
+
+```bash
+python tools/accuracy/dump_gemma4_tokenizer_golden.py <31b-checkpoint-dir> \
+  test_data/gemma4-31b-tokenizer-golden.json \
+  --source-repo google/gemma-4-31B-it --revision <sha>
+
+PEGAINFER_GEMMA4_FIXTURE_TAG=31b \
+  PEGAINFER_TEST_MODEL_PATH=<31b-checkpoint> \
+  scripts/gemma4_gates.sh string_form_chat_renders
+```
+
+This dumper needs no device: it renders chat templates and reads the tokenizer's files. The
+tensor references the same tag selects, and the sharded dump the larger checkpoints need, are in
+`docs/models/gemma4/hf-golden.md`.
+
 Repository and revision are required arguments rather than inferred: a checkpoint directory
 carries no reliable record of where it came from, and guessing from a renamed local directory
 would write a wrong name into the golden. Everything in the fixture is asserted by the tests
@@ -59,6 +82,10 @@ executes it, or run it directly against the pinned 12B one:
 PEGAINFER_TEST_MODEL_PATH=<pinned-12B-checkpoint-dir> \
   cargo test --release -p pegainfer-frontend --test gemma4_tokenizer_parity -- --ignored
 ```
+
+Run directly, the test reads the committed reference unless `PEGAINFER_GEMMA4_CHAT_GOLDEN` names
+another; the runner sets that variable from the tag, which is why the tagged run above goes through
+it rather than around it.
 
 ## The chat template lives in its own file
 

@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "../shared/ffi_guard.cuh"
+
 namespace MARLIN_NAMESPACE_NAME {
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS) {}
@@ -52,10 +54,6 @@ struct ThreadConfigs {
   const ThreadConfig* large_batch;
   int large_count;
 };
-
-inline CUresult last_error_to_cu(cudaError_t err) {
-  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
-}
 
 inline int get_scales_cache_size(
     ThreadConfig const& th_config,
@@ -267,14 +265,16 @@ inline CUresult launch_marlin_moe_gemm(
   }
   int dev = 0;
   cudaError_t err = cudaGetDevice(&dev);
-  if (err != cudaSuccess) return CUDA_ERROR_INVALID_VALUE;
+  if (err != cudaSuccess) return map_cuda_error(err);
   if (sm_count <= 0) {
     err = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
-    if (err != cudaSuccess || sm_count <= 0) return CUDA_ERROR_INVALID_VALUE;
+    if (err != cudaSuccess) return map_cuda_error(err);
+    if (sm_count <= 0) return CUDA_ERROR_INVALID_VALUE;
   }
   int max_shared_mem = 0;
   err = cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-  if (err != cudaSuccess || max_shared_mem <= 0) return CUDA_ERROR_INVALID_VALUE;
+  if (err != cudaSuccess) return map_cuda_error(err);
+  if (max_shared_mem <= 0) return CUDA_ERROR_INVALID_VALUE;
 
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
@@ -306,7 +306,7 @@ inline CUresult launch_marlin_moe_gemm(
 
   err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              max_shared_mem);
-  if (err != cudaSuccess) return CUDA_ERROR_INVALID_VALUE;
+  if (err != cudaSuccess) return map_cuda_error(err);
 
   const int4* A_ptr = reinterpret_cast<const int4*>(input);
   const int4* B_ptr = reinterpret_cast<const int4*>(b_qweight);
@@ -320,7 +320,7 @@ inline CUresult launch_marlin_moe_gemm(
       nullptr, nullptr, sorted_token_ids, expert_ids, num_tokens_post_padded,
       topk_weights, top_k, mul_topk_weights, size_k / group_size, size_m,
       size_n, size_k, locks, false, use_atomic_add, use_fp32_reduce);
-  return last_error_to_cu(cudaPeekAtLastError());
+  return map_cuda_error(cudaPeekAtLastError());
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME

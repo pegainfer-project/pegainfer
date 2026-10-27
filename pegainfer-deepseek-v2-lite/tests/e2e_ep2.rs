@@ -138,6 +138,11 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
         "DeepSeek-V2-Lite E2E expected ep_size=2, got {}",
         result.stats.ep_size
     );
+    validate_device_decode_steps(
+        &result.stats,
+        result.tokens.len().saturating_sub(1),
+        "single generation",
+    )?;
     ensure!(
         result.stats.device_ordinals == vec![0, 1],
         "DeepSeek-V2-Lite E2E expected devices [0, 1], got {:?}",
@@ -638,8 +643,8 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         };
         receivers.push((id, token_rx));
         requests.push(req);
@@ -725,8 +730,8 @@ fn run_mixed_serving_position_fallback(
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         };
         receivers.push((id, token_rx));
         requests.push(req);
@@ -793,8 +798,8 @@ fn run_mixed_serving_rejection_isolation(
         lora_adapter: None,
         kv_transfer_params: None,
         token_tx: invalid_tx,
-        logprobs: 1,
-        echo: false,
+        logprobs: Some(1),
+        prompt_logprobs: None,
     };
 
     let (valid_tx, mut valid_rx) = TokenSink::standalone();
@@ -809,8 +814,8 @@ fn run_mixed_serving_rejection_isolation(
         lora_adapter: None,
         kv_transfer_params: None,
         token_tx: valid_tx,
-        logprobs: 0,
-        echo: false,
+        logprobs: None,
+        prompt_logprobs: None,
     };
     submit_concurrently(handle, vec![invalid_req, valid_req])?;
 
@@ -957,6 +962,7 @@ fn validate_generation_stats(
         stats.ep_backend,
         current_backend()
     );
+    validate_device_decode_steps(stats, generated_tokens_per_row.saturating_sub(1), &case.id)?;
     let expected_prompt_tokens = prompt_tokens_per_row * case.batch_size;
     ensure!(
         stats.prompt_tokens == expected_prompt_tokens,
@@ -1060,6 +1066,7 @@ fn ep_payload(stats: &pegainfer_deepseek_v2_lite::GenerationStats) -> serde_json
         "nccl_combine_calls": stats.nccl_combine_calls,
         "nccl_dense_exchange_elements": stats.nccl_dense_exchange_elements,
         "nccl_combine_elements": stats.nccl_combine_elements,
+        "device_decode_steps": stats.device_decode_steps,
     })
 }
 
@@ -1118,6 +1125,30 @@ fn matched_expected_output_oracle(token_sha256: &str, text_sha256: &str) -> Opti
 
 fn current_backend() -> String {
     env::var("PEGAINFER_DSV2_LITE_EP_BACKEND").unwrap_or_else(|_| "host-staged".to_string())
+}
+
+fn host_decode_attention() -> bool {
+    env::var("PEGAINFER_DSV2_LITE_DECODE_ATTENTION").is_ok_and(|value| value.trim() == "host")
+}
+
+fn validate_device_decode_steps(
+    stats: &pegainfer_deepseek_v2_lite::GenerationStats,
+    expected_steps: usize,
+    label: &str,
+) -> Result<()> {
+    let steps = stats.device_decode_steps;
+    let valid = match stats.ep_backend.as_str() {
+        "host-staged" => steps == 0,
+        "nccl" if host_decode_attention() => steps == 0,
+        "nccl" => steps == expected_steps,
+        _ => false,
+    };
+    ensure!(
+        valid,
+        "{label} device decode steps: got {steps}, expected 0 for host-staged or PEGAINFER_DSV2_LITE_DECODE_ATTENTION=host, {expected_steps} for NCCL; backend={}",
+        stats.ep_backend
+    );
+    Ok(())
 }
 
 fn resolve_model_path(raw: &str) -> PathBuf {

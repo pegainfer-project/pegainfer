@@ -27,6 +27,10 @@ use pegaflow_core::StorageConfig;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
+mod runtime;
+
+use runtime::HostRuntime;
+
 /// Cross-node P2P sharing over pegaflow's MetaServer + RDMA data plane.
 ///
 /// With this set, the host (a) registers saved block hashes with the
@@ -52,13 +56,9 @@ pub struct P2pConfig {
 /// The shared host side of the store: one [`PegaEngine`], the runtime that
 /// drives it, and the P2P serving tasks. Build via [`Self::builder`].
 pub struct PegaflowHost {
+    // Request runtime shutdown before releasing the engine.
+    runtime: HostRuntime,
     engine: Arc<PegaEngine>,
-    // `Option` so `Drop` can take it: dropping a `Runtime` inside async
-    // context panics (tokio forbids blocking at runtime teardown there), and
-    // hosts get dropped wherever the last reference dies — including the
-    // bottom of an async `main` or a test's async body. `shutdown_background`
-    // never blocks; in-flight saves are best-effort cache writes anyway.
-    runtime: Option<Runtime>,
     /// `Some` when P2P is on: resolving the sender shuts the gRPC service
     /// down (dropping the last `PegaflowHost` fires it).
     #[allow(dead_code)]
@@ -95,21 +95,11 @@ impl PegaflowHost {
     }
 
     pub(crate) fn runtime(&self) -> &Runtime {
-        self.runtime
-            .as_ref()
-            .expect("host runtime outlives every non-Drop use")
+        self.runtime.get()
     }
 
     pub(crate) fn has_p2p(&self) -> bool {
         self.has_p2p
-    }
-}
-
-impl Drop for PegaflowHost {
-    fn drop(&mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
-        }
     }
 }
 
@@ -160,19 +150,7 @@ impl PegaflowHostBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Arc<PegaflowHost>, EngineError> {
-        // TODO(kv-store): converge on the process-global tokio runtime. The
-        // store already borrows the caller's Handle, and this private pool is
-        // a second set of threads doing the same kind of work. Kept private
-        // for now: engine construction needs a runtime context at build time
-        // (MetaServerClient spawns at construction), and the ownership/Drop
-        // story (shutdown_background) is simplest while we own it.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(self.runtime_threads.max(1))
-            .enable_all()
-            .build()
-            .map_err(|e| EngineError::Storage(format!("host runtime build: {e}")))?;
-
+    fn storage_config(&self) -> Result<StorageConfig, EngineError> {
         let mut storage_config = StorageConfig::default();
         if let Some(p2p) = &self.p2p {
             if p2p.rdma_nics.is_empty() {
@@ -201,11 +179,23 @@ impl PegaflowHostBuilder {
                 ..SsdCacheConfig::default()
             });
         }
+        Ok(storage_config)
+    }
+
+    pub fn build(self) -> Result<Arc<PegaflowHost>, EngineError> {
+        let storage_config = self.storage_config()?;
+        // TODO(kv-store): converge on the process-global tokio runtime. The
+        // store already borrows the caller's Handle, and this private pool is
+        // a second set of threads doing the same kind of work. Kept private
+        // for now: engine construction needs a runtime context at build time
+        // (MetaServerClient spawns at construction), and the ownership/Drop
+        // story (shutdown_background) is simplest while we own it.
+        let runtime = HostRuntime::new(self.runtime_threads)?;
 
         // pegaflow's MetaServerClient spawns its background registration loop
         // with tokio::spawn, so the engine must be built inside our runtime.
         let engine = {
-            let _guard = runtime.enter();
+            let _guard = runtime.get().enter();
             Arc::new(PegaEngine::new_with_config(
                 self.pinned_pool_bytes,
                 self.use_hugepages,
@@ -217,14 +207,14 @@ impl PegaflowHostBuilder {
         // `advertise_addr` for the RDMA handshake + block queries. Same
         // lifecycle as the engine — shut down (via the oneshot) on drop.
         let p2p_shutdown = match self.p2p {
-            Some(p2p) => Some(Self::start_p2p(&runtime, &engine, &p2p)?),
+            Some(p2p) => Some(Self::start_p2p(runtime.get(), &engine, &p2p)?),
             None => None,
         };
         let has_p2p = p2p_shutdown.is_some();
 
         Ok(Arc::new(PegaflowHost {
+            runtime,
             engine,
-            runtime: Some(runtime),
             p2p_shutdown,
             has_p2p,
         }))

@@ -309,7 +309,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
             match lane.member.at_launch(self.executor.step_count())? {
                 // The superstep advanced the count; consult the next boundary
                 // before leaving — a second whale may sit right behind it.
-                WhaleDuty::Enter(whale) => self.enter_whale(lane, *whale, ledger)?,
+                WhaleDuty::Enter(whale) => self.enter_whale(lane, &whale, ledger)?,
                 WhaleDuty::Free => {
                     if !lane.member.is_quiet() {
                         return Ok(false);
@@ -356,7 +356,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
     fn enter_whale(
         &mut self,
         lane: &mut WhaleLane,
-        whale: CommittedWhale,
+        whale: &CommittedWhale,
         ledger: &mut RequestLedger,
     ) -> Result<()> {
         let posted = if whale.descriptor.poster == lane.rank {
@@ -379,7 +379,7 @@ impl<E: StepExecutor> K3Scheduler<E> {
         };
         let first = self
             .executor
-            .prefill_whale(&whale, posted.as_ref().map(|posted| posted.slot))?;
+            .prefill_whale(whale, posted.as_ref().map(|posted| posted.slot))?;
         let Some(posted) = posted else {
             return Ok(());
         };
@@ -492,6 +492,11 @@ impl<E: StepExecutor> K3Scheduler<E> {
     /// The refusal this request earns before it ever runs, if any. Only
     /// permanent misfits are refused — a full batch is a wait, not a verdict.
     fn admission_refusal(&self, request: &Request) -> Option<RejectReason> {
+        if request.logprobs.is_some() || request.prompt_logprobs.is_some() {
+            return Some(RejectReason::Unsupported {
+                feature: "completion or prompt logprobs".into(),
+            });
+        }
         let prompt_tokens = request.prompt_tokens.len();
         let limit = self.executor.max_context_tokens();
         (prompt_tokens.saturating_add(request.max_tokens) > limit).then_some(

@@ -38,6 +38,8 @@ Verify:
 ```
 
 > build.rs auto-detects `.venv/bin/python` for Triton AOT compilation. Override with `PEGAINFER_TRITON_PYTHON` if needed.
+>
+> Multi-GPU (TP/NCCL) runtime note: cudarc dlopens `libnccl.so` (its search list has no plain `libnccl.so.2`), while the `nvidia-nccl-cu13` wheel ships only `libnccl.so.2`. Add `libnccl.so -> libnccl.so.2` inside `.venv/lib/python3.*/site-packages/nvidia/nccl/lib/` and put that dir on `LD_LIBRARY_PATH` when running TP.
 
 ## 3. Build
 

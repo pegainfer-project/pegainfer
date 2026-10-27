@@ -17,6 +17,7 @@
 // device function; validated bit-for-bit against the HF oracle (q_rot/k_rot).
 
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -256,13 +257,7 @@ __global__ void glm52_mla_ckv_split_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() {
-  cudaError_t err = cudaGetLastError();
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue) return CUDA_ERROR_INVALID_VALUE;
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
+CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
 }  // namespace
 

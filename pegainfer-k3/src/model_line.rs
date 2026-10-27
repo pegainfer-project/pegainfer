@@ -22,6 +22,7 @@ use serde_json::Value;
 use crate::config::K3_HIDDEN;
 use crate::config::K3_LAYERS;
 use crate::config::K3_SUPPORTED_ROUTED_EXPERTS;
+use crate::config::K3_VOCAB;
 use crate::executor::K3Executor;
 use crate::executor::K3ExecutorConfig;
 use crate::executor::cp::K3_WHALE_SEGMENT_FLOOR;
@@ -58,6 +59,7 @@ const EP_SIZES: &[usize] = &[1, 4, 8, 16, 32, 64];
 
 // K3-exclusive CLI flags.
 #[derive(ClapArgs)]
+#[allow(clippy::struct_field_names)]
 struct K3Cli {
     /// K3 expert-parallel world size: one rank (and one scheduler partition)
     /// per GPU, routed experts split whole across ranks. One of 1, 4, 8, 16,
@@ -147,24 +149,6 @@ fn claims_architecture(config: &Value) -> bool {
             list.iter()
                 .any(|entry| entry.as_str() == Some(ARCHITECTURE))
         })
-}
-
-/// End-of-sequence ids the scheduler stops on. The field is a scalar in this
-/// family's config; arrays appear in other exports of the same architecture,
-/// so accept both.
-fn eos_token_ids(config: &Value) -> Vec<u32> {
-    let field = config
-        .get("eos_token_id")
-        .or_else(|| text_field(config, "eos_token_id"));
-    match field {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_u64)
-            .map(|id| id as u32)
-            .collect(),
-        Some(value) => value.as_u64().map(|id| id as u32).into_iter().collect(),
-        None => Vec::new(),
-    }
 }
 
 impl ModelLine for K3Line {
@@ -258,8 +242,7 @@ impl ModelLine for K3Line {
             // the frontend registers engine identities before the weights are
             // loaded.
             scheduler_partition_count: local_ranks(&cli, ep_size)?.len(),
-            prefill_only: false,
-            lora_modules: None,
+            ..ServePlan::default()
         })
     }
 
@@ -267,7 +250,7 @@ impl ModelLine for K3Line {
         let cli = cli(ctx);
         let ep_size = ep_size(&cli)?;
         let ranks = local_ranks(&cli, ep_size)?;
-        let eos_token_ids = eos_token_ids(ctx.config);
+        let eos_token_ids = pegainfer_core::eos::eos_token_ids(ctx.model_path, K3_VOCAB)?;
         let mut config = K3ExecutorConfig::default().from_env().for_ep(ep_size);
         config.weight_staging = cli.k3_weight_staging;
         warn_if_loader_cpu_starved(ranks.len(), config.weight_staging);
@@ -329,7 +312,7 @@ impl ModelLine for K3Line {
         let whale = whale_serving(
             &mut executors,
             ep_size,
-            ranks.clone(),
+            ranks,
             dspark_armed,
             cp.is_some(),
             chunk_tokens,
@@ -418,7 +401,7 @@ fn whale_serving(
         TcpWhaleHub::host(&addr, world, chunk_tokens, 0, ranks.len(), slabs)
             .context("host the K3 whale hub")?
     } else {
-        TcpWhaleHub::connect(&addr, ranks.start, ranks.len(), slabs)
+        TcpWhaleHub::connect(&addr, ranks.start, ranks.len(), &slabs)
             .context("join the K3 whale hub")?
     };
     let world_exchanged = Instant::now();
@@ -733,16 +716,6 @@ mod tests {
             .probe(&config)
             .expect_err("the architecture claim is part of the identity");
         assert!(error.contains("architectures"), "{error}");
-    }
-
-    #[test]
-    fn eos_ids_come_from_either_spelling() {
-        assert_eq!(eos_token_ids(&reference_config(224)), vec![163_586]);
-        assert_eq!(
-            eos_token_ids(&serde_json::json!({"eos_token_id": [1, 2]})),
-            vec![1, 2]
-        );
-        assert!(eos_token_ids(&serde_json::json!({})).is_empty());
     }
 
     #[test]

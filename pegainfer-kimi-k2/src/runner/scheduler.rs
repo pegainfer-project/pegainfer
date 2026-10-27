@@ -779,8 +779,8 @@ mod tests {
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         };
         (req, token_rx)
     }
@@ -866,7 +866,7 @@ mod tests {
         let mut scheduler = test_scheduler(&calls, test_pool());
 
         let (mut echo_req, mut token_rx) = request_with_channel(vec![11, 22], 4);
-        echo_req.echo = true;
+        echo_req.prompt_logprobs = Some(1);
 
         scheduler.handle_request_batch(vec![echo_req]);
 
@@ -881,8 +881,8 @@ mod tests {
             panic!("expected Rejected event");
         };
         assert!(
-            message.contains("echo"),
-            "rejection names the unsupported field: {message}"
+            message.contains("prompt logprobs"),
+            "rejection names the unsupported feature: {message}"
         );
     }
 

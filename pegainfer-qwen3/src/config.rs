@@ -33,23 +33,24 @@ pub(crate) struct Config {
     pub(crate) num_key_value_heads: usize,
     pub(crate) head_dim: usize,
     pub(crate) vocab_size: usize,
+    /// Token-selection width: `vocab_size` bounded to the frontend-decodable vocab.
+    #[serde(skip)]
+    pub(crate) decodable_vocab: usize,
+    /// Aligned output-projection rows; any rows past `decodable_vocab` are suppressed.
+    #[serde(skip)]
+    pub(crate) logits_rows: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
     #[serde(default = "default_max_position_embeddings")]
     pub(crate) max_position_embeddings: usize,
-    pub(crate) eos_token_id: u32,
     pub(crate) tie_word_embeddings: bool,
     #[serde(skip)]
     pub(crate) stop_token_ids: Vec<u32>,
 }
 
-/// Resolved drafter config shared by DFlash and DSpark. DSpark extends the
-/// DFlash backbone with a Markov head and an optional confidence head;
-/// `markov_rank == 0` is plain DFlash. Two on-disk schemas are normalized into
-/// this in `from_file`: our `Qwen3-4B-DFlash-b16` nests
-/// `dflash_config: {mask_token_id, target_layer_ids}` and puts `rope_theta` at
-/// the top level, while DeepSpec's `dflash_/dspark_*_block7` put those fields
-/// flat and nest `rope_theta` under `rope_parameters`.
+/// Drafter config for DFlash, DSpark and DFlash2. `from_file` normalizes
+/// nested b16, flat DeepSpec and Speculators schemas. With both head ranks
+/// zero, proposals use independent per-position argmax.
 #[derive(Clone, Debug)]
 pub(crate) struct DFlashConfig {
     pub(crate) hidden_size: usize,
@@ -57,17 +58,23 @@ pub(crate) struct DFlashConfig {
     pub(crate) num_hidden_layers: usize,
     pub(crate) num_attention_heads: usize,
     pub(crate) num_key_value_heads: usize,
-    num_target_layers: usize,
+    num_target_layers: Option<usize>,
     pub(crate) head_dim: usize,
     pub(crate) vocab_size: usize,
+    /// Target output-projection rows, including its suppressed alignment tail.
+    pub(crate) logits_rows: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
     pub(crate) max_position_embeddings: usize,
     pub(crate) block_size: usize,
     pub(crate) mask_token_id: u32,
     pub(crate) target_layer_ids: Vec<usize>,
-    /// DSpark Markov head low-rank size; 0 disables the head (= plain DFlash).
+    /// DSpark Markov head low-rank size; 0 disables the Markov head.
     pub(crate) markov_rank: usize,
+    /// Path-selector rank; 0 disables this head.
+    pub(crate) selector_rank: usize,
+    pub(crate) conv: Option<DFlashConvConfig>,
+    pub(crate) sliding_window: Option<usize>,
     markov_head_type: String,
     /// Block draft layout. DeepSpec `Qwen3DSparkModel` checkpoints (both the
     /// markov and the `markov_rank == 0` ones) are *anchor-first*: block position
@@ -83,12 +90,74 @@ pub(crate) struct DFlashConfig {
     /// so the operator knows that capability is being ignored. See
     /// docs/models/qwen3/dspark-integration.md (Phase 2).
     pub(crate) enable_confidence_head: bool,
+    /// DSpine code bridge; `None` for DFlash and DSpark drafters.
+    pub(crate) dspine: Option<DSpineConfig>,
 }
+
+/// Marker that the checkpoint carries a validated DSpine code bridge. The
+/// bridge dimensions are resolved from the raw config and land with the
+/// loader/forward that read them.
+#[derive(Clone, Debug)]
+pub(crate) struct DSpineConfig;
 
 #[derive(Clone, Debug, Deserialize)]
 struct DFlashInnerConfig {
     mask_token_id: u32,
     target_layer_ids: Vec<usize>,
+    block_size: Option<usize>,
+    selector_rank: Option<usize>,
+    selector_top_k: Option<usize>,
+    conv_kernel_size: Option<usize>,
+    conv_group_size: Option<usize>,
+    #[serde(default)]
+    draft_block_causal: Option<bool>,
+    #[serde(default)]
+    selected_prefix_code_bridge: Option<RawDSpineCodeBridge>,
+    #[serde(default)]
+    selected_prefix_feature_layers: Option<Vec<usize>>,
+    #[serde(default)]
+    selected_prefix_feature_writes: Option<bool>,
+    #[serde(default)]
+    selected_prefix_feature_write_mode: Option<String>,
+    #[serde(default)]
+    selected_prefix_terminal: Option<bool>,
+    #[serde(default)]
+    selected_prefix_last_write_refine: Option<RawDSpineLastWriteRefine>,
+    /// DSpark reliability probes; DSpine has no equivalent.
+    #[serde(default)]
+    selected_prefix_feature_reliability: Option<Value>,
+    /// DSpark next-token row layout; DSpine refines anchor-row blocks only.
+    #[serde(default)]
+    selected_prefix_feature_next_token_rows: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DFlashConvConfig {
+    pub(crate) taps: usize,
+    pub(crate) group_size: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RawDSpineCodeBridge {
+    code_size: usize,
+    rank: usize,
+    eps: f32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RawDSpineLastWriteRefine {
+    kind: String,
+    head_topk: usize,
+}
+
+/// Top-level refinement declaration some DSpine checkpoints carry instead of
+/// (or alongside) `dflash_config.selected_prefix_last_write_refine`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDSpineSecondPass {
+    mode: Option<String>,
+    first_exact: Option<usize>,
+    head_topk: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,38 +165,103 @@ struct RopeParameters {
     rope_theta: f32,
 }
 
+fn default_selector_top_k() -> usize {
+    pegainfer_kernels::ops::DFLASH2_CANDIDATE_K
+}
+
 fn default_markov_head_type() -> String {
     "vanilla".to_string()
 }
 
-/// On-disk drafter config tolerant of both the nested (`b16`) and flat
-/// (DeepSpec) schemas; `from_file` resolves it into `DFlashConfig`.
+/// transformers' `Qwen3Config` defaults for deriving absent `layer_types`.
+const DEFAULT_SLIDING_WINDOW: usize = 4096;
+
+fn default_max_window_layers() -> usize {
+    28
+}
+
+/// Backbone geometry shared by flat configs and Speculators
+/// `transformer_layer_config`.
 #[derive(Deserialize)]
-struct RawDFlashConfig {
+struct DFlashGeometry {
     hidden_size: usize,
     intermediate_size: usize,
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
-    num_target_layers: usize,
     head_dim: usize,
     vocab_size: usize,
     rms_norm_eps: f32,
-    #[serde(default)]
     rope_theta: Option<f32>,
-    #[serde(default)]
     rope_parameters: Option<RopeParameters>,
     #[serde(default = "default_max_position_embeddings")]
     max_position_embeddings: usize,
-    block_size: usize,
+    /// `Some(None)` is an explicit `null`; an absent key stays `None`, which
+    /// transformers reads as its default window.
+    #[allow(
+        clippy::option_option,
+        reason = "an absent window and a null one mean different things to transformers"
+    )]
+    #[serde(default, deserialize_with = "present")]
+    sliding_window: Option<Option<usize>>,
+}
+
+#[allow(
+    clippy::option_option,
+    reason = "keeps a present null apart from an absent key"
+)]
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<usize>>, D::Error> {
+    Option::<usize>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DFlashGeometrySource {
+    Speculators {
+        transformer_layer_config: DFlashGeometry,
+    },
+    Flat(DFlashGeometry),
+}
+
+#[derive(Deserialize)]
+struct RawDFlashConfig {
+    #[serde(flatten)]
+    geometry: DFlashGeometrySource,
+    num_target_layers: Option<usize>,
+    block_size: Option<usize>,
     #[serde(default)]
     dflash_config: Option<DFlashInnerConfig>,
+    /// The reference reads this from the top level, unlike the bridge itself.
+    #[serde(default)]
+    code_bridge_second_pass: Option<RawDSpineSecondPass>,
     #[serde(default)]
     mask_token_id: Option<u32>,
     #[serde(default)]
     target_layer_ids: Option<Vec<usize>>,
+    aux_hidden_state_layer_ids: Option<Vec<usize>>,
+    conv_kernel_size: Option<usize>,
+    conv_group_size: Option<usize>,
+    sliding_window_non_causal: Option<bool>,
+    /// HF text-config attention shape; DSpine requires causal full attention.
+    #[serde(default)]
+    is_causal: Option<bool>,
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
+    /// With no `layer_types`, transformers derives sliding layers from these.
+    #[serde(default)]
+    use_sliding_window: bool,
+    #[serde(default = "default_max_window_layers")]
+    max_window_layers: usize,
+    #[serde(default)]
+    sample_from_anchor: bool,
     #[serde(default)]
     markov_rank: usize,
+    #[serde(default)]
+    selector_rank: usize,
+    #[serde(default = "default_selector_top_k")]
+    selector_top_k: usize,
     #[serde(default = "default_markov_head_type")]
     markov_head_type: String,
     #[serde(default)]
@@ -167,32 +301,13 @@ fn default_max_position_embeddings() -> usize {
     40960
 }
 
-#[derive(Debug, Deserialize)]
-struct GenerationConfig {
-    eos_token_id: EosTokenIds,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum EosTokenIds {
-    Single(u32),
-    Multiple(Vec<u32>),
-}
-
-impl EosTokenIds {
-    fn into_vec(self) -> Vec<u32> {
-        match self {
-            Self::Single(token_id) => vec![token_id],
-            Self::Multiple(token_ids) => token_ids,
-        }
-    }
-}
-
 impl Config {
     pub(crate) fn from_file(model_path: &str) -> Result<Self> {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        config.decodable_vocab = config.vocab_size;
+        config.logits_rows = config.vocab_size;
         anyhow::ensure!(
             config.num_key_value_heads > 0
                 && config
@@ -210,7 +325,7 @@ impl Config {
                 config.num_key_value_heads,
             );
         }
-        config.stop_token_ids = Self::load_stop_token_ids(model_path, config.eos_token_id)?;
+        config.stop_token_ids = pegainfer_core::eos::eos_token_ids(model_path, config.vocab_size)?;
         Ok(config)
     }
 
@@ -247,21 +362,143 @@ impl Config {
     pub(crate) fn local_kv_dim(&self, tp: TensorParallelConfig) -> usize {
         self.local_num_key_value_heads(tp) * self.head_dim
     }
+}
 
-    fn load_stop_token_ids(model_path: &str, fallback_eos_token_id: u32) -> Result<Vec<u32>> {
-        let generation_config_path = format!("{}/generation_config.json", model_path);
-        match fs::read_to_string(&generation_config_path) {
-            Ok(content) => {
-                let generation_config: GenerationConfig = serde_json::from_str(&content)?;
-                let mut stop_token_ids = generation_config.eos_token_id.into_vec();
-                stop_token_ids.dedup();
-                Ok(stop_token_ids)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Ok(vec![fallback_eos_token_id])
-            }
-            Err(err) => Err(err.into()),
+impl DSpineConfig {
+    /// `Ok(None)` for a plain DFlash/DSpark checkpoint; `Ok(Some(_))` when the
+    /// checkpoint carries a code bridge. Every DSpine-only serving field is
+    /// validated rather than ignored.
+    ///
+    /// Training-only fields (`bridge.kappa`, `selected_prefix_decode_mode`,
+    /// `selected_prefix_feature_gt_training`, the teacher fields, and the
+    /// refinement's `version`/`weight`) are neither validated nor used here.
+    fn from_inner(
+        inner: &DFlashInnerConfig,
+        num_hidden_layers: usize,
+        second_pass: Option<&RawDSpineSecondPass>,
+    ) -> Result<Option<Self>> {
+        let Some(bridge) = inner.selected_prefix_code_bridge.as_ref() else {
+            let stray = inner.selected_prefix_feature_layers.is_some()
+                || inner.selected_prefix_feature_writes.is_some()
+                || inner.selected_prefix_feature_write_mode.is_some()
+                || inner.selected_prefix_terminal.is_some()
+                || inner.selected_prefix_last_write_refine.is_some();
+            ensure!(
+                !stray,
+                "drafter config has DSpine refinement fields but no selected_prefix_code_bridge"
+            );
+            return Ok(None);
+        };
+
+        ensure!(
+            inner.draft_block_causal == Some(true),
+            "DSpine requires draft_block_causal = true (causal draft attention)"
+        );
+        ensure!(
+            inner.selected_prefix_feature_reliability.is_none(),
+            "DSpine has no reliability probes"
+        );
+        ensure!(
+            inner.selected_prefix_feature_next_token_rows != Some(true),
+            "DSpine's serial refinement is defined for anchor-row blocks; \
+             next-token rows are a DSpark layout"
+        );
+        ensure!(
+            inner.selected_prefix_terminal == Some(false),
+            "DSpine supports terminal-disabled code bridges only"
+        );
+        ensure!(
+            inner.selected_prefix_feature_writes == Some(true),
+            "DSpine requires selected_prefix_feature_writes = true"
+        );
+        ensure!(
+            inner.selected_prefix_feature_write_mode.as_deref() == Some("independent"),
+            "DSpine requires selected_prefix_feature_write_mode = \"independent\", got {:?}",
+            inner.selected_prefix_feature_write_mode
+        );
+
+        let layers = inner
+            .selected_prefix_feature_layers
+            .as_ref()
+            .context("DSpine config missing selected_prefix_feature_layers")?;
+        ensure!(
+            !layers.is_empty(),
+            "DSpine feature layers must not be empty"
+        );
+        ensure!(
+            layers.windows(2).all(|pair| pair[0] < pair[1]),
+            "DSpine feature layers must be strictly increasing, got {layers:?}"
+        );
+        ensure!(
+            layers
+                .iter()
+                .all(|&layer| (1..=num_hidden_layers).contains(&layer)),
+            "DSpine feature layers must be 1-based within 1..={num_hidden_layers}, got {layers:?}"
+        );
+        ensure!(
+            layers.last() == Some(&num_hidden_layers),
+            "DSpine refines the last write, so the last draft layer must be active; got {layers:?}"
+        );
+
+        let mut head_topk = None;
+        if let Some(refine) = inner.selected_prefix_last_write_refine.as_ref() {
+            ensure!(
+                refine.kind == "exact_sender",
+                "DSpine requires selected_prefix_last_write_refine.kind = \"exact_sender\", got {:?}",
+                refine.kind
+            );
+            head_topk = Some(refine.head_topk);
         }
+        if let Some(second) = second_pass {
+            ensure!(
+                second.mode.as_deref() == Some("serial_table"),
+                "DSpine serves only code_bridge_second_pass.mode = \"serial_table\", got {:?}",
+                second.mode
+            );
+            ensure!(
+                second.first_exact == Some(num_hidden_layers - 1),
+                "DSpine serial_table redoes the last write only: \
+                 code_bridge_second_pass.first_exact must be {}, got {:?}",
+                num_hidden_layers - 1,
+                second.first_exact
+            );
+            match head_topk {
+                Some(width) => ensure!(
+                    width == second.head_topk,
+                    "DSpine refinement widths disagree: \
+                     selected_prefix_last_write_refine.head_topk = {width}, \
+                     code_bridge_second_pass.head_topk = {}",
+                    second.head_topk
+                ),
+                None => head_topk = Some(second.head_topk),
+            }
+        }
+        let head_topk = head_topk.context(
+            "DSpine config names no refinement width: add \
+             selected_prefix_last_write_refine or code_bridge_second_pass",
+        )?;
+        ensure!(
+            head_topk.is_power_of_two() && (2..=64).contains(&head_topk),
+            "DSpine head_topk must be a power of two in [2, 64], got {head_topk}"
+        );
+
+        ensure!(
+            bridge.code_size > 0,
+            "DSpine code_size must be positive, got {}",
+            bridge.code_size
+        );
+        ensure!(
+            bridge.rank > 0 && bridge.rank.is_multiple_of(128),
+            "DSpine bridge rank must be a non-zero multiple of 128, got {}",
+            bridge.rank
+        );
+        ensure!(
+            bridge.eps.is_finite() && bridge.eps > 0.0,
+            "DSpine code bridge eps must be finite and positive, got {}",
+            bridge.eps
+        );
+
+        Ok(Some(Self))
     }
 }
 
@@ -269,41 +506,169 @@ impl DFlashConfig {
     pub(crate) fn from_file(model_path: &str) -> Result<Self> {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
-        let raw: RawDFlashConfig = serde_json::from_str(&content)?;
+        Self::from_json(&content)
+    }
+
+    fn from_json(content: &str) -> Result<Self> {
+        let raw: RawDFlashConfig = serde_json::from_str(content)?;
+        let geometry = match raw.geometry {
+            DFlashGeometrySource::Speculators {
+                transformer_layer_config,
+            } => transformer_layer_config,
+            DFlashGeometrySource::Flat(geometry) => geometry,
+        };
+        let inner = raw.dflash_config.as_ref();
+        let block_size = inner
+            .and_then(|config| config.block_size)
+            .or(raw.block_size)
+            .context("drafter config missing block_size")?;
+        let selector_rank = inner
+            .and_then(|config| config.selector_rank)
+            .unwrap_or(raw.selector_rank);
+        let selector_top_k = inner
+            .and_then(|config| config.selector_top_k)
+            .unwrap_or(raw.selector_top_k);
+        if selector_rank > 0 {
+            ensure!(
+                selector_top_k == default_selector_top_k(),
+                "DFlash2 requires top-16 candidates"
+            );
+            ensure!(
+                raw.markov_rank == 0 && raw.num_anchors.is_none() && !raw.sample_from_anchor,
+                "DFlash2 selector requires an anchor-drop DFlash backbone"
+            );
+        }
+
+        let conv = match (
+            inner
+                .and_then(|config| config.conv_kernel_size)
+                .or(raw.conv_kernel_size),
+            inner
+                .and_then(|config| config.conv_group_size)
+                .or(raw.conv_group_size),
+        ) {
+            (None, None) => None,
+            (Some(taps), Some(group_size)) => {
+                ensure!(
+                    raw.sliding_window_non_causal != Some(false) && !raw.sample_from_anchor,
+                    "DFlash2 supports noncausal anchor-drop blocks"
+                );
+                ensure!(
+                    taps > 0 && group_size > 0 && geometry.hidden_size.is_multiple_of(group_size),
+                    "DFlash2 convolution requires positive taps and groups dividing hidden_size"
+                );
+                Some(DFlashConvConfig { taps, group_size })
+            }
+            _ => bail!("DFlash2 convolution requires both kernel_size and group_size"),
+        };
 
         // rope_theta: flat (b16) or nested under rope_parameters (DeepSpec).
-        let rope_theta = raw
+        let rope_theta = geometry
             .rope_theta
-            .or(raw.rope_parameters.map(|r| r.rope_theta))
+            .or(geometry.rope_parameters.map(|r| r.rope_theta))
             .context("drafter config missing rope_theta / rope_parameters.rope_theta")?;
 
         // mask_token_id + target_layer_ids: nested dflash_config (b16) or flat (DeepSpec).
-        let (mask_token_id, target_layer_ids) = match raw.dflash_config {
-            Some(inner) => (inner.mask_token_id, inner.target_layer_ids),
-            None => (
+        let dflash_config = raw.dflash_config;
+        let (mask_token_id, target_layer_ids) = if let Some(inner) = &dflash_config {
+            (inner.mask_token_id, inner.target_layer_ids.clone())
+        } else {
+            let layers = match (raw.target_layer_ids, raw.aux_hidden_state_layer_ids) {
+                (Some(layers), _) => layers,
+                (_, Some(layers)) => layers
+                    .into_iter()
+                    .map(|layer| {
+                        // Speculators indexes HF hidden_states (0 is embedding);
+                        // our capture points are zero-based decoder outputs.
+                        layer
+                            .checked_sub(1)
+                            .context("DFlash capture must refer to a decoder output")
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                _ => bail!("drafter config missing target hidden-state layers"),
+            };
+            (
                 raw.mask_token_id
-                    .context("drafter config missing mask_token_id (no dflash_config block)")?,
-                raw.target_layer_ids
-                    .context("drafter config missing target_layer_ids (no dflash_config block)")?,
-            ),
+                    .context("drafter config missing mask_token_id")?,
+                layers,
+            )
         };
 
+        let sliding_window = conv.as_ref().and(geometry.sliding_window.flatten());
+
+        let dspine = if let Some(inner) = &dflash_config {
+            DSpineConfig::from_inner(
+                inner,
+                geometry.num_hidden_layers,
+                raw.code_bridge_second_pass.as_ref(),
+            )?
+        } else {
+            None
+        };
+        if dspine.is_some() {
+            ensure!(
+                raw.num_anchors.is_none(),
+                "DSpine drafts are anchor-drop; config declares num_anchors"
+            );
+            ensure!(
+                raw.markov_rank == 0,
+                "DSpine drafts carry no markov head; config declares markov_rank = {}",
+                raw.markov_rank
+            );
+            ensure!(
+                conv.is_none() && selector_rank == 0,
+                "DSpine drafts carry neither DFlash2 convolutions nor a selector"
+            );
+            ensure!(
+                raw.is_causal != Some(false),
+                "DSpine requires causal draft attention; config sets is_causal = false"
+            );
+            if let Some(layer_types) = &raw.layer_types {
+                ensure!(
+                    layer_types.len() == geometry.num_hidden_layers,
+                    "DSpine layer_types must name every draft layer ({}), got {}",
+                    geometry.num_hidden_layers,
+                    layer_types.len()
+                );
+                ensure!(
+                    layer_types.iter().all(|kind| kind == "full_attention"),
+                    "DSpine drafts use full-attention layers only, got {layer_types:?}"
+                );
+            } else {
+                // Mirrors how transformers' `Qwen3Config` derives absent layer types.
+                let window = geometry
+                    .sliding_window
+                    .unwrap_or(Some(DEFAULT_SLIDING_WINDOW));
+                ensure!(
+                    !(raw.use_sliding_window
+                        && window.is_some()
+                        && raw.max_window_layers < geometry.num_hidden_layers),
+                    "DSpine drafts use full-attention layers only; use_sliding_window makes \
+                     layers {}.. sliding",
+                    raw.max_window_layers
+                );
+            }
+        }
         Ok(Self {
-            hidden_size: raw.hidden_size,
-            intermediate_size: raw.intermediate_size,
-            num_hidden_layers: raw.num_hidden_layers,
-            num_attention_heads: raw.num_attention_heads,
-            num_key_value_heads: raw.num_key_value_heads,
+            hidden_size: geometry.hidden_size,
+            intermediate_size: geometry.intermediate_size,
+            num_hidden_layers: geometry.num_hidden_layers,
+            num_attention_heads: geometry.num_attention_heads,
+            num_key_value_heads: geometry.num_key_value_heads,
             num_target_layers: raw.num_target_layers,
-            head_dim: raw.head_dim,
-            vocab_size: raw.vocab_size,
-            rms_norm_eps: raw.rms_norm_eps,
+            head_dim: geometry.head_dim,
+            vocab_size: geometry.vocab_size,
+            logits_rows: geometry.vocab_size,
+            rms_norm_eps: geometry.rms_norm_eps,
             rope_theta,
-            max_position_embeddings: raw.max_position_embeddings,
-            block_size: raw.block_size,
+            max_position_embeddings: geometry.max_position_embeddings,
+            block_size,
             mask_token_id,
             target_layer_ids,
             markov_rank: raw.markov_rank,
+            selector_rank,
+            conv,
+            sliding_window,
             markov_head_type: raw.markov_head_type,
             enable_confidence_head: raw.enable_confidence_head,
             // A markov head only ever ships on a DeepSpec (anchor-first)
@@ -311,6 +676,7 @@ impl DFlashConfig {
             // markov as an independent corroborating signal so a future flat
             // schema can't accidentally route a markov checkpoint anchor-drop.
             anchor_first: raw.num_anchors.is_some() || raw.markov_rank > 0,
+            dspine,
         })
     }
 
@@ -318,6 +684,23 @@ impl DFlashConfig {
     /// semi-autoregressive sample loop instead of independent argmax.
     pub(crate) fn uses_markov_head(&self) -> bool {
         self.markov_rank > 0
+    }
+
+    /// The drafter config carries a DSpine code bridge. These checkpoints are
+    /// not servable yet; see [`DFlashConfig::ensure_servable`].
+    pub(crate) fn uses_dspine(&self) -> bool {
+        self.dspine.is_some()
+    }
+
+    /// Refuse draft checkpoints this build cannot serve yet. Callers run this
+    /// before loading the target so a DSpine checkpoint fails for its own
+    /// reason rather than during KV sizing or profile.
+    pub(crate) fn ensure_servable(&self) -> Result<()> {
+        ensure!(
+            !self.uses_dspine(),
+            "DSpine draft checkpoints are not supported yet"
+        );
+        Ok(())
     }
 
     /// Anchor-first block layout (see [`DFlashConfig::anchor_first`]). The markov
@@ -334,8 +717,9 @@ impl DFlashConfig {
             target.hidden_size
         );
         anyhow::ensure!(
-            self.num_target_layers == target.num_hidden_layers,
-            "DFlash num_target_layers {} does not match target layers {}",
+            self.num_target_layers
+                .is_none_or(|layers| layers == target.num_hidden_layers),
+            "DFlash num_target_layers {:?} does not match target layers {}",
             self.num_target_layers,
             target.num_hidden_layers
         );
@@ -524,4 +908,429 @@ pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
         "Qwen3 architectures must contain Qwen3ForCausalLM"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dflash_selector_fields_parse_from_flat_and_nested_configs() -> Result<()> {
+        let geometry = serde_json::json!({
+            "hidden_size": 4, "intermediate_size": 8, "num_hidden_layers": 2,
+            "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 4,
+            "vocab_size": 16, "rms_norm_eps": 1e-6, "rope_theta": 10000.0
+        });
+        let selector = serde_json::json!({
+            "block_size": 3, "mask_token_id": 7, "target_layer_ids": [1, 5],
+            "selector_rank": 2, "selector_top_k": 16,
+            "training_metadata": { "unused": true }
+        });
+        let mut flat = geometry.clone();
+        flat.as_object_mut()
+            .unwrap()
+            .extend(selector.as_object().unwrap().clone());
+        let mut nested = geometry;
+        nested["dflash_config"] = selector;
+        let directory = tempfile::tempdir()?;
+
+        for json in [flat, nested] {
+            fs::write(directory.path().join("config.json"), json.to_string())?;
+            let config = DFlashConfig::from_file(directory.path().to_str().unwrap())?;
+            assert_eq!(config.block_size, 3);
+            assert_eq!(config.mask_token_id, 7);
+            assert_eq!(config.target_layer_ids, vec![1, 5]);
+            assert_eq!(config.selector_rank, 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn speculators_dflash_maps_hidden_state_indices_to_decoder_layers() -> Result<()> {
+        let json = serde_json::json!({
+            "transformer_layer_config": {
+                "hidden_size": 4, "intermediate_size": 8, "num_hidden_layers": 2,
+                "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 4,
+                "vocab_size": 16, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                "sliding_window": 2048
+            },
+            "block_size": 3, "mask_token_id": 7, "selector_rank": 2,
+            "conv_kernel_size": 2, "conv_group_size": 2,
+            "aux_hidden_state_layer_ids": [1, 3], "sliding_window_non_causal": true
+        });
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("config.json"), json.to_string())?;
+        let config = DFlashConfig::from_file(directory.path().to_str().unwrap())?;
+
+        assert_eq!(config.target_layer_ids, vec![0, 2]);
+        assert_eq!(config.selector_rank, 2);
+        let conv = config.conv.expect("native convolution config");
+        assert_eq!((conv.taps, conv.group_size), (2, 2));
+        assert_eq!(config.sliding_window, Some(2048));
+        Ok(())
+    }
+
+    fn dspine_config_value() -> Value {
+        serde_json::from_str(DSPINE_8B_CONFIG).expect("fixture json")
+    }
+
+    const DSPINE_8B_CONFIG: &str = r#"{
+      "architectures": ["DFlashDraftModel"],
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "auto_map": {"AutoModel": "dflash.DFlashDraftModel"},
+      "block_size": 16,
+      "bos_token_id": 151643,
+      "dflash_config": {
+        "draft_block_causal": true,
+        "mask_token_id": 151669,
+        "selected_prefix_code_bridge": {
+          "code_size": 1024,
+          "eps": 1e-06,
+          "kappa": 10.0,
+          "rank": 512
+        },
+        "selected_prefix_decode_mode": "serial",
+        "selected_prefix_feature_gt_training": true,
+        "selected_prefix_feature_layers": [1, 2, 3, 4, 5],
+        "selected_prefix_feature_teacher_layers": [1, 2, 3],
+        "selected_prefix_feature_write_mode": "independent",
+        "selected_prefix_feature_writes": true,
+        "selected_prefix_last_write_refine": {
+          "head_topk": 16,
+          "kind": "exact_sender",
+          "version": 1,
+          "weight": 1.0
+        },
+        "selected_prefix_terminal": false,
+        "target_layer_ids": [1, 9, 17, 25, 33]
+      },
+      "draft_vocab_size": 151936,
+      "dtype": "bfloat16",
+      "eos_token_id": 151645,
+      "head_dim": 128,
+      "hidden_act": "silu",
+      "hidden_size": 4096,
+      "intermediate_size": 12288,
+      "layer_types": ["full_attention", "full_attention", "full_attention", "full_attention", "full_attention"],
+      "max_position_embeddings": 40960,
+      "model_type": "qwen3",
+      "num_attention_heads": 32,
+      "num_hidden_layers": 5,
+      "num_key_value_heads": 8,
+      "num_target_layers": 36,
+      "rms_norm_eps": 1e-06,
+      "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
+      "rope_theta": 1000000,
+      "tie_word_embeddings": false,
+      "vocab_size": 151936
+    }"#;
+
+    const PLAIN_DFLASH_CONFIG: &str = r#"{
+      "hidden_size": 4096,
+      "intermediate_size": 12288,
+      "num_hidden_layers": 5,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "num_target_layers": 36,
+      "head_dim": 128,
+      "vocab_size": 151936,
+      "rms_norm_eps": 1e-06,
+      "rope_theta": 1000000,
+      "block_size": 16,
+      "dflash_config": {"mask_token_id": 151669, "target_layer_ids": [1, 9, 17, 25, 33]}
+    }"#;
+
+    fn target_qwen3_8b() -> Config {
+        Config {
+            hidden_size: 4096,
+            intermediate_size: 12288,
+            num_hidden_layers: 36,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            vocab_size: 151_936,
+            decodable_vocab: 151_936,
+            logits_rows: 151_936,
+            rms_norm_eps: 1e-06,
+            rope_theta: 1_000_000.0,
+            max_position_embeddings: 40960,
+            tie_word_embeddings: false,
+            stop_token_ids: vec![151_645],
+        }
+    }
+
+    #[test]
+    fn parses_dspine_code_bridge_config() {
+        let config = DFlashConfig::from_json(DSPINE_8B_CONFIG).expect("DSpine config");
+        config
+            .validate_for_target(&target_qwen3_8b())
+            .expect("DSpine config should match Qwen3-8B");
+
+        assert!(config.uses_dspine());
+        assert!(!config.anchor_first());
+    }
+
+    #[test]
+    fn plain_dflash_config_is_not_dspine() {
+        let config = DFlashConfig::from_json(PLAIN_DFLASH_CONFIG).expect("plain DFlash config");
+        config
+            .validate_for_target(&target_qwen3_8b())
+            .expect("plain DFlash config should match Qwen3-8B");
+        assert!(!config.uses_dspine());
+    }
+
+    #[test]
+    fn rejects_unsupported_dspine_bridge_configs() {
+        let mut too_few_layer_types = dspine_config_value();
+        too_few_layer_types["layer_types"] = serde_json::json!([
+            "full_attention",
+            "full_attention",
+            "full_attention",
+            "full_attention"
+        ]);
+        let mut empty_layer_types = dspine_config_value();
+        empty_layer_types["layer_types"] = serde_json::json!([]);
+        // No window key, so transformers' default window reaches layer 4.
+        let mut derived_sliding_layer = dspine_config_value();
+        let fields = derived_sliding_layer.as_object_mut().expect("flat fixture");
+        fields.remove("layer_types");
+        fields.insert("use_sliding_window".into(), serde_json::json!(true));
+        fields.insert("max_window_layers".into(), serde_json::json!(4));
+
+        let cases = [
+            (
+                "terminal projection enabled",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_terminal\": false",
+                    "\"selected_prefix_terminal\": true",
+                ),
+            ),
+            (
+                "non-power-of-two refinement width",
+                DSPINE_8B_CONFIG.replace("\"head_topk\": 16", "\"head_topk\": 15"),
+            ),
+            (
+                "last draft layer inactive",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_feature_layers\": [1, 2, 3, 4, 5]",
+                    "\"selected_prefix_feature_layers\": [1, 2, 3, 4]",
+                ),
+            ),
+            (
+                "anchor-first layout",
+                DSPINE_8B_CONFIG.replace(
+                    "\"num_hidden_layers\": 5,",
+                    "\"num_hidden_layers\": 5,\n      \"num_anchors\": 1,",
+                ),
+            ),
+            (
+                "refinement fields without a bridge",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_code_bridge\": {",
+                    "\"selected_prefix_code_bridge_ignored\": {",
+                ),
+            ),
+            (
+                "non-causal draft attention",
+                DSPINE_8B_CONFIG.replace(
+                    "\"draft_block_causal\": true",
+                    "\"draft_block_causal\": false",
+                ),
+            ),
+            (
+                "feature writes disabled",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_feature_writes\": true",
+                    "\"selected_prefix_feature_writes\": false",
+                ),
+            ),
+            (
+                "non-independent write mode",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_feature_write_mode\": \"independent\"",
+                    "\"selected_prefix_feature_write_mode\": \"shared\"",
+                ),
+            ),
+            (
+                "bridge rank not kernel-tile aligned",
+                DSPINE_8B_CONFIG.replace("\"rank\": 512", "\"rank\": 500"),
+            ),
+            (
+                "non-positive bridge eps",
+                DSPINE_8B_CONFIG.replace("\"eps\": 1e-06", "\"eps\": 0.0"),
+            ),
+            (
+                "unsupported refinement kind",
+                DSPINE_8B_CONFIG.replace("\"kind\": \"exact_sender\"", "\"kind\": \"approximate\""),
+            ),
+            (
+                "refinement width above 64",
+                DSPINE_8B_CONFIG.replace("\"head_topk\": 16", "\"head_topk\": 128"),
+            ),
+            (
+                "unsorted feature layers",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_feature_layers\": [1, 2, 3, 4, 5]",
+                    "\"selected_prefix_feature_layers\": [1, 2, 3, 5, 4]",
+                ),
+            ),
+            (
+                "reliability probes",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_terminal\": false,",
+                    "\"selected_prefix_feature_reliability\": {\"kind\": \"probe\"},\n        \"selected_prefix_terminal\": false,",
+                ),
+            ),
+            (
+                "next-token rows",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_terminal\": false,",
+                    "\"selected_prefix_feature_next_token_rows\": true,\n        \"selected_prefix_terminal\": false,",
+                ),
+            ),
+            (
+                "convolution next to a bridge",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_terminal\": false,",
+                    "\"conv_kernel_size\": 2,\n        \"conv_group_size\": 2,\n        \"selected_prefix_terminal\": false,",
+                ),
+            ),
+            (
+                "selector next to a bridge",
+                DSPINE_8B_CONFIG.replace(
+                    "\"selected_prefix_terminal\": false,",
+                    "\"selector_rank\": 2,\n        \"selected_prefix_terminal\": false,",
+                ),
+            ),
+            (
+                "second pass disagrees on the refinement width",
+                DSPINE_8B_CONFIG.replace(
+                    "\"block_size\": 16,",
+                    "\"block_size\": 16,\n      \"code_bridge_second_pass\": {\"mode\": \"serial_table\", \"first_exact\": 4, \"head_topk\": 32},",
+                ),
+            ),
+            (
+                "second pass that is not serial_table",
+                DSPINE_8B_CONFIG.replace(
+                    "\"block_size\": 16,",
+                    "\"block_size\": 16,\n      \"code_bridge_second_pass\": {\"mode\": \"parallel_table\", \"first_exact\": 4, \"head_topk\": 16},",
+                ),
+            ),
+            (
+                "second pass redoing a non-last write",
+                DSPINE_8B_CONFIG.replace(
+                    "\"block_size\": 16,",
+                    "\"block_size\": 16,\n      \"code_bridge_second_pass\": {\"mode\": \"serial_table\", \"first_exact\": 3, \"head_topk\": 16},",
+                ),
+            ),
+            (
+                "explicitly non-causal attention",
+                DSPINE_8B_CONFIG.replace(
+                    "\"block_size\": 16,",
+                    "\"block_size\": 16,\n      \"is_causal\": false,",
+                ),
+            ),
+            (
+                "sliding layer type",
+                DSPINE_8B_CONFIG.replace(
+                    "\"layer_types\": [\"full_attention\",",
+                    "\"layer_types\": [\"sliding_attention\",",
+                ),
+            ),
+            ("too few layer types", too_few_layer_types.to_string()),
+            ("empty layer types", empty_layer_types.to_string()),
+            ("derived sliding layer", derived_sliding_layer.to_string()),
+        ];
+
+        for (name, json) in cases {
+            assert!(
+                DFlashConfig::from_json(&json).is_err(),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_the_top_level_second_pass_as_the_refinement_width() {
+        let mut json: Value = serde_json::from_str(DSPINE_8B_CONFIG).expect("fixture json");
+        json["dflash_config"]
+            .as_object_mut()
+            .expect("nested dflash_config")
+            .remove("selected_prefix_last_write_refine");
+        json["code_bridge_second_pass"] = serde_json::json!({
+            "mode": "serial_table",
+            "first_exact": 4,
+            "head_topk": 16,
+        });
+
+        let config = DFlashConfig::from_json(&json.to_string()).expect("second-pass config");
+        assert!(config.uses_dspine());
+    }
+
+    #[test]
+    fn windows_that_reach_no_layer_are_accepted() {
+        let without_types = |fields: Value| {
+            let mut json = dspine_config_value();
+            let object = json.as_object_mut().expect("flat fixture");
+            object.remove("layer_types");
+            object.extend(fields.as_object().expect("field map").clone());
+            json
+        };
+        let mut explicit_types = dspine_config_value();
+        explicit_types["sliding_window"] = serde_json::json!(2048);
+        let cases = [
+            ("explicit full layer types", explicit_types),
+            (
+                "window without use_sliding_window",
+                without_types(serde_json::json!({"sliding_window": 2048})),
+            ),
+            (
+                "explicit null window",
+                without_types(serde_json::json!({
+                    "sliding_window": null,
+                    "use_sliding_window": true,
+                    "max_window_layers": 0,
+                })),
+            ),
+            (
+                "window past the last layer",
+                without_types(serde_json::json!({
+                    "sliding_window": 2048,
+                    "use_sliding_window": true,
+                    "max_window_layers": 5,
+                })),
+            ),
+        ];
+
+        for (name, json) in cases {
+            let config = DFlashConfig::from_json(&json.to_string())
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert!(config.uses_dspine(), "{name}");
+        }
+    }
+
+    #[test]
+    fn dspine_checkpoints_are_refused_before_the_target_loads() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        fs::write(directory.path().join("config.json"), DSPINE_8B_CONFIG).expect("write config");
+
+        let Err(error) = crate::executor::Qwen3Executor::from_runtime_with_lora_options(
+            "/nonexistent-target",
+            false,
+            &[0],
+            crate::Qwen3LoraOptions::default(),
+            crate::Qwen3OffloadOptions::disabled(),
+            crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
+            Some(directory.path().to_str().expect("utf-8 path")),
+            crate::Qwen3MemoryOptions::default(),
+        ) else {
+            panic!("DSpine must be refused before the target loads");
+        };
+
+        assert!(
+            format!("{error:#}").contains("DSpine draft checkpoints are not supported yet"),
+            "unexpected error: {error:#}"
+        );
+    }
 }

@@ -6,6 +6,8 @@
 #include <float.h>
 #include <math.h>
 
+#include "../shared/ffi_guard.cuh"
+
 namespace {
 
 // The strided lane scan and shuffle tree preserve lower-expert tie breaking.
@@ -145,7 +147,7 @@ CUresult gemma4_moe_router_topk_cuda(const __nv_bfloat16 *logits,
   }
   gemma4_moe_router_topk_kernel<<<rows, kRouterBlock, 0, stream>>>(
       logits, per_expert_scale, experts, top_k, index_out, weight_out);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 // The routed GEMM leaves one row per (token, pick); this folds the picks back
@@ -165,7 +167,7 @@ CUresult gemma4_moe_sum_topk_cuda(const __nv_bfloat16 *routed, int rows,
   }
   gemma4_moe_sum_topk_kernel<<<(int)grid, block, 0, stream>>>(
       routed, top_k, hidden, total, out);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 } // extern "C"

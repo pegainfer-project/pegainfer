@@ -2,12 +2,46 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
-use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kv_cache::KvView;
 
 use super::config::Config35;
 use super::config::LocalGeometry;
+
+/// Decode buckets at or below this size read full attention through the split-KV
+/// kernel instead of the FlashInfer batch-decode kernel.
+///
+/// FlashInfer launches one CTA per (request, kv head) and never grows that grid
+/// with KV length, so a small decode leaves the device idle — four CTAs for a
+/// single request, 64 for sixteen. Splitting the KV range instead wins at every
+/// bucket this threshold admits, measured on one tree with two runs a side:
+/// bs1 9.41/9.36 → 8.57/8.57 ms, c8 11.25/11.27 → 10.65/10.67, c16 13.06/13.08
+/// → 12.80/12.82 mean TPOT, qps16 unchanged. The wider buckets keep FlashInfer:
+/// on an sm_90 card at 1024 in and 256 out, routing them through the split form
+/// measured 10.23/10.25 against 9.65/9.67 ms mean TPOT at c32 and 16.56/16.58
+/// against 14.98/15.14 at c64. See `docs/models/qwen35/decode-kernel-attribution.md`.
+pub(crate) const SPLIT_DECODE_MAX_BATCH: usize = 16;
+
+/// Query heads per kv head the split-KV kernel is built for, one warp each. A
+/// checkpoint with another GQA group (the 27B sizes run 6) keeps the FlashInfer
+/// path at every bucket, since the kernel refuses that geometry.
+pub(crate) const SPLIT_DECODE_GQA_GROUP: usize = 4;
+
+/// KV splits per (kv head, request) CTA group, for a decode bucket.
+///
+/// Fixed per bucket rather than derived from KV length because the grid shape
+/// has to be constant across a captured CUDA Graph bucket; an over-split request
+/// simply leaves later CTAs empty. The counts are where each bucket's curve
+/// flattens on the standalone harness: 32 splits is best at batch 1
+/// (27.98 µs against 34.98 at 16), and 16 is best at batch 8 (57.26 against
+/// 60.58 at 32) and batch 16 (96.26 against 98.47).
+pub(crate) fn split_decode_splits(batch: usize) -> usize {
+    if batch <= 2 { 32 } else { 16 }
+}
+
+/// Upper bound on [`split_decode_splits`], for sizing the partial buffers.
+pub(crate) const SPLIT_DECODE_MAX_SPLITS: usize = 32;
 
 /// Pre-allocated GPU buffers for Qwen3.5 batch decode (N requests, 1 token each).
 pub(crate) struct BatchDecodeBuffers35 {
@@ -30,11 +64,17 @@ pub(crate) struct BatchDecodeBuffers35 {
     pub(crate) v_attn: HiddenStates,
     pub(crate) attn_out_full: HiddenStates,
 
-    // Linear attention [dim, batch]
-    pub(crate) qkv: HiddenStates,
-    pub(crate) z: HiddenStates,
-    pub(crate) b_proj: HiddenStates,
-    pub(crate) a_proj: HiddenStates,
+    // Split-KV decode scratch [splits, batch, qo_heads, head_dim] and the two
+    // per-(split, request, head) softmax accumulators beside it. Sized for the
+    // buckets the split kernel serves, not for the whole decode capacity.
+    pub(crate) split_partial_o: CudaSlice<f32>,
+    pub(crate) split_partial_m: CudaSlice<f32>,
+    pub(crate) split_partial_l: CudaSlice<f32>,
+
+    // Linear attention [dim, batch]. The two projections are the fused ones:
+    // `qkvz` holds the qkv band below the z band, `ba` holds beta below alpha.
+    pub(crate) qkvz: HiddenStates,
+    pub(crate) ba: HiddenStates,
     pub(crate) qkv_conv: HiddenStates,
     pub(crate) gdr_out: HiddenStates,
     pub(crate) normed_gated: HiddenStates,
@@ -67,18 +107,21 @@ impl BatchDecodeBuffers35 {
         config: &Config35,
         geometry: LocalGeometry,
         max_batch_size: usize,
-        max_total_pages: usize,
+        page_size: usize,
         padding_page_id: i32,
     ) -> Result<Self> {
         let h = config.hidden_size;
         let bs = max_batch_size;
+        let max_view_pages = config.max_position_embeddings.div_ceil(page_size).max(1);
+        let page_index_capacity = bs
+            .checked_mul(max_view_pages)
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 decode page-index capacity overflow"))?;
         let q_proj_dim = geometry.local_full_attn_gated_q_dim();
         let q_dim = geometry.local_full_attn_q_dim();
         let kv_dim = geometry.local_full_attn_kv_dim();
-        let qkv_dim = config.linear_attn_qkv_dim();
-        let z_dim = config.linear_attn_z_dim();
-        let b_dim = config.linear_num_value_heads;
-        let a_dim = b_dim;
+        let qkv_dim = geometry.local_linear_qkv_dim();
+        let z_dim = geometry.local_linear_z_dim();
+        let b_dim = geometry.local_linear_num_value_heads();
         let intermediate = geometry.local_intermediate_size();
 
         Ok(Self {
@@ -98,25 +141,44 @@ impl BatchDecodeBuffers35 {
             v_attn: HiddenStates::zeros(ctx, kv_dim, bs)?,
             attn_out_full: HiddenStates::zeros(ctx, q_dim, bs)?,
 
-            qkv: HiddenStates::zeros(ctx, qkv_dim, bs)?,
-            z: HiddenStates::zeros(ctx, z_dim, bs)?,
-            b_proj: HiddenStates::zeros(ctx, b_dim, bs)?,
-            a_proj: HiddenStates::zeros(ctx, a_dim, bs)?,
+            split_partial_o: ctx.stream.alloc_zeros(
+                SPLIT_DECODE_MAX_SPLITS
+                    * bs.min(SPLIT_DECODE_MAX_BATCH)
+                    * geometry.local_num_attention_heads()
+                    * 256,
+            )?,
+            split_partial_m: ctx.stream.alloc_zeros(
+                SPLIT_DECODE_MAX_SPLITS
+                    * bs.min(SPLIT_DECODE_MAX_BATCH)
+                    * geometry.local_num_attention_heads(),
+            )?,
+            split_partial_l: ctx.stream.alloc_zeros(
+                SPLIT_DECODE_MAX_SPLITS
+                    * bs.min(SPLIT_DECODE_MAX_BATCH)
+                    * geometry.local_num_attention_heads(),
+            )?,
+
+            qkvz: HiddenStates::zeros(ctx, qkv_dim + z_dim, bs)?,
+            ba: HiddenStates::zeros(ctx, 2 * b_dim, bs)?,
             qkv_conv: HiddenStates::zeros(ctx, qkv_dim, bs)?,
             gdr_out: HiddenStates::zeros(ctx, z_dim, bs)?,
             normed_gated: HiddenStates::zeros(ctx, z_dim, bs)?,
 
             token_ids_d: ctx.stream.alloc_zeros(bs)?,
             positions_d: ctx.stream.alloc_zeros(bs)?,
-            // Extra capacity for padding slots (at most max_batch_size padding entries).
-            page_indices_d: ctx.stream.alloc_zeros(max_total_pages + bs)?,
+            page_indices_d: ctx.stream.alloc_zeros(page_index_capacity)?,
             page_indptr_d: ctx.stream.alloc_zeros(bs + 1)?,
             last_page_len_d: ctx.stream.alloc_zeros(bs)?,
             request_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_tile_indices_d: ctx.stream.alloc_zeros(bs)?,
             kv_chunk_size_d: ctx.stream.alloc_zeros(bs)?,
 
-            sample: pegainfer_sample::SampleScratch::new(ctx, config.selection_vocab, bs)?,
+            sample: pegainfer_sample::SampleScratch::with_selection_width(
+                ctx,
+                config.selection_vocab,
+                config.decodable_vocab,
+                bs,
+            )?,
             steps: Vec::new(),
 
             padding_page_id,
@@ -140,10 +202,8 @@ impl BatchDecodeBuffers35 {
         self.v_attn.seq_len = bs;
         self.attn_out_full.seq_len = bs;
 
-        self.qkv.seq_len = bs;
-        self.z.seq_len = bs;
-        self.b_proj.seq_len = bs;
-        self.a_proj.seq_len = bs;
+        self.qkvz.seq_len = bs;
+        self.ba.seq_len = bs;
         self.qkv_conv.seq_len = bs;
         self.gdr_out.seq_len = bs;
         self.normed_gated.seq_len = bs;
@@ -151,15 +211,15 @@ impl BatchDecodeBuffers35 {
 
     /// Sync paged attention metadata to GPU.
     ///
-    /// `padded_bs` >= `kv_states.len()`: padding slots (if any) point to the
+    /// `padded_bs` >= `views.len()`: padding slots (if any) point to the
     /// reserved padding page with seq_len=1 so FlashInfer accesses valid memory.
-    pub(crate) fn sync_paged_meta(
+    pub(crate) fn sync_paged_views(
         &mut self,
         ctx: &DeviceContext,
-        kv_states: &[&KvState],
+        views: &[KvView],
         padded_bs: usize,
     ) -> Result<()> {
-        let real_bs = kv_states.len();
+        let real_bs = views.len();
         debug_assert!(padded_bs >= real_bs);
 
         let mut all_page_indices = Vec::new();
@@ -167,12 +227,11 @@ impl BatchDecodeBuffers35 {
         let mut last_page_lens = Vec::with_capacity(padded_bs);
         let mut chunk_sizes = Vec::with_capacity(padded_bs);
 
-        for kv in kv_states {
-            let pages = kv.page_indices_i32();
-            all_page_indices.extend_from_slice(&pages);
+        for view in views {
+            all_page_indices.extend_from_slice(view.page_indices());
             indptr.push(all_page_indices.len() as i32);
-            last_page_lens.push(kv.last_page_len() as i32);
-            chunk_sizes.push(kv.seq_len() as i32);
+            last_page_lens.push(view.last_page_len() as i32);
+            chunk_sizes.push(view.seq_len() as i32);
         }
 
         // Padding slots: 1 page (the padding page), seq_len=1, last_page_len=1.
@@ -186,6 +245,12 @@ impl BatchDecodeBuffers35 {
         let request_indices: Vec<i32> = (0..padded_bs as i32).collect();
         let kv_tile_indices = vec![0i32; padded_bs];
 
+        anyhow::ensure!(
+            all_page_indices.len() <= self.page_indices_d.len(),
+            "Qwen3.5 decode page-index overflow: {} view pages exceed buffer capacity {}",
+            all_page_indices.len(),
+            self.page_indices_d.len()
+        );
         ctx.stream
             .memcpy_htod(&all_page_indices, &mut self.page_indices_d)?;
         ctx.stream.memcpy_htod(&indptr, &mut self.page_indptr_d)?;

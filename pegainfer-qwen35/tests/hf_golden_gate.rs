@@ -7,10 +7,11 @@
 //! The Qwen3.5 fixture is produced through HF's incremental `past_key_values`
 //! path so the oracle matches pegainfer's prefill + decode shape.
 //!
-//! Qwen3.5 currently has no eager batched decode path; decode goes through the
-//! CUDA-graph bucketed path. This gate therefore covers sequential bs=1,
-//! bucket-straddling batched graph passes, and slot compaction after a request
-//! is dropped mid-replay.
+//! Single-GPU decode goes through the CUDA-graph bucketed path; under TP it is
+//! one batched eager step per rank, or pre-captured graphs when the decode GQA
+//! group has a compiled kernel. This gate covers sequential bs=1,
+//! bucket-straddling batched passes, slot compaction after a request is
+//! dropped mid-replay, and the TP2 eager and graph variants.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,51 +45,6 @@ const HEAD_K: usize = 8;
 const MARGIN_TOL: f32 = 0.20;
 const MEAN_TOL: f32 = 0.06;
 const P99_TOL: f32 = 0.20;
-
-/// Size key from config CONTENT, not the directory name; keep in sync with
-/// `SIZE_NAMES` in `tools/accuracy/dump_qwen35_hf_golden.py`.
-fn fixture_size_name(model_path: &str) -> Option<&'static str> {
-    let config_path = Path::new(model_path).join("config.json");
-    let raw = std::fs::read_to_string(&config_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("parse {}: {e}", config_path.display()));
-    let t = v.get("text_config").unwrap_or(&v);
-    let hidden = t.get("hidden_size").and_then(serde_json::Value::as_u64);
-    let layers = t
-        .get("num_hidden_layers")
-        .and_then(serde_json::Value::as_u64);
-    let (Some(hidden), Some(layers)) = (hidden, layers) else {
-        panic!(
-            "{} has no hidden_size/num_hidden_layers",
-            config_path.display()
-        );
-    };
-    match (hidden, layers) {
-        (1024, 24) => Some("0.8b"),
-        (2048, 24) => Some("2b"),
-        (2560, 32) => Some("4b"),
-        (4096, 32) => Some("9b"),
-        (5120, 64) => Some("27b"),
-        _ => None,
-    }
-}
-
-/// Sizes whose fixtures are committed in `test_data/`; a missing file for
-/// these is a broken checkout, not an ungenerated fixture.
-const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.8b", "2b", "4b", "9b", "27b"];
-
-fn default_fixture_path(size: &str, long: bool) -> String {
-    let kind = if long {
-        "-hf-long-golden"
-    } else {
-        "-hf-golden"
-    };
-    format!(
-        "{}/../test_data/qwen35-{size}{kind}.safetensors",
-        env!("CARGO_MANIFEST_DIR")
-    )
-}
 
 const BUCKET_STRADDLES: [usize; 2] = [5, 3];
 const SLOT_COMPACTION_BATCH: usize = 5;
@@ -130,6 +86,52 @@ fn safetensors_metadata(bytes: &[u8]) -> HashMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// This line's fixture names. The directory is shared with the other lines'
+/// gates, whose fixtures must not be considered here.
+const FIXTURE_PREFIXES: &[&str] = &["qwen35-", "qwen38-"];
+
+/// The fixture is chosen by the checkpoint's config bytes, not a geometry
+/// table: every committed fixture records `config_sha256` in its safetensors
+/// metadata, so the gate scans this line's fixtures and keeps the one whose
+/// recorded hash matches the local `config.json`.
+fn find_default_fixture(model_path: &str, long: bool) -> String {
+    let config = Path::new(model_path).join("config.json");
+    let hash = sha256_file(&config).unwrap_or_else(|| panic!("read {}", config.display()));
+    let suffix = if long {
+        "-hf-long-golden.safetensors"
+    } else {
+        "-hf-golden.safetensors"
+    };
+    let dir = format!("{}/../test_data", env!("CARGO_MANIFEST_DIR"));
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {dir}: {e}")) {
+        let path = entry.unwrap_or_else(|e| panic!("read {dir}: {e}")).path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(name.ends_with(suffix) && FIXTURE_PREFIXES.iter().any(|p| name.starts_with(p))) {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        if safetensors_metadata(&bytes).get("config_sha256") == Some(&hash) {
+            matches.push(path);
+        }
+    }
+    match matches.len() {
+        0 => panic!(
+            "no committed qwen35 hf_golden_gate fixture records config_sha256={hash} \
+             (config: {}, kind: {}); generate one with \
+             tools/accuracy/dump_qwen35_hf_golden.py --model-path {model_path}",
+            config.display(),
+            if long { "long" } else { "short" },
+        ),
+        1 => matches[0].to_string_lossy().into_owned(),
+        _ => panic!(
+            "multiple qwen35 hf_golden_gate fixtures match {model_path}/config.json: {matches:?}"
+        ),
+    }
 }
 
 fn model_revision(model_path: &str) -> Option<String> {
@@ -176,7 +178,30 @@ fn require_metadata<'a>(metadata: &'a HashMap<String, String>, key: &str) -> &'a
         .unwrap_or_else(|| panic!("qwen35 hf_golden_gate fixture missing metadata key {key}"))
 }
 
-fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
+/// The fixture's `model_revision` is the only field that pins the *weights*;
+/// `config_sha256` pins the geometry, which two 27B checkpoints share. An
+/// unresolvable local revision therefore fails here instead of skipping: a
+/// skip reports `ok` without comparing a single logit.
+fn require_model_revision(model_path: &str, expected: &str, resolved: Option<String>) {
+    let Some(actual) = resolved else {
+        panic!(
+            "qwen35 hf_golden_gate cannot resolve the local model revision of {model_path}, \
+             but this fixture requires model_revision={expected}; set \
+             PEGAINFER_TEST_MODEL_REVISION to the revision the checkpoint was downloaded at \
+             (the config hash pins the geometry, not the weights)"
+        );
+    };
+    assert_eq!(
+        actual, expected,
+        "qwen35 hf_golden_gate model revision mismatch; set PEGAINFER_TEST_MODEL_REVISION or use the fixture's model snapshot"
+    );
+}
+
+/// Assert the fixture's recorded metadata against the local checkpoint. Every
+/// field is checked here rather than at selection time because a fixture named
+/// by `PEGAINFER_TEST_GOLDEN`/`_LONG` bypasses [`find_default_fixture`] and its
+/// `config_sha256` match entirely.
+fn check_fixture_metadata(model_path: &str, golden: &Golden) {
     let metadata = &golden.metadata;
     assert_eq!(
         require_metadata(metadata, "dtype"),
@@ -207,16 +232,7 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
         expected_revision, "unknown",
         "qwen35 hf_golden_gate fixture must record a pinned model_revision"
     );
-    let Some(actual_revision) = model_revision(model_path) else {
-        eprintln!(
-            "skipping qwen35 hf_golden_gate: fixture requires model_revision={expected_revision}, but local model revision is unknown"
-        );
-        return false;
-    };
-    assert_eq!(
-        actual_revision, expected_revision,
-        "qwen35 hf_golden_gate model revision mismatch; set PEGAINFER_TEST_MODEL_REVISION or use the fixture's model snapshot"
-    );
+    require_model_revision(model_path, expected_revision, model_revision(model_path));
 
     if let Some(expected_tokenizer_revision) = metadata.get("tokenizer_revision") {
         assert_ne!(
@@ -224,7 +240,6 @@ fn check_fixture_metadata(model_path: &str, golden: &Golden) -> bool {
             "qwen35 hf_golden_gate fixture must record a pinned tokenizer_revision"
         );
     }
-    true
 }
 
 fn as_i32(st: &SafeTensors, name: &str) -> (Vec<i32>, Vec<usize>) {
@@ -318,40 +333,11 @@ struct Golden {
 }
 
 impl Golden {
-    /// An explicitly set env override must exist; a missing default keyed
-    /// fixture is a clean skip (`None`).
-    fn load_for(model_path: &str, long: bool) -> Option<Golden> {
+    fn load_for(model_path: &str, long: bool) -> Golden {
         let env_key = if long { LONG_GOLDEN_ENV } else { GOLDEN_ENV };
-        let Some(size) = fixture_size_name(model_path) else {
-            assert!(
-                std::env::var(env_key).is_err(),
-                "{env_key} is set but the model geometry in {model_path}/config.json \
-                 has no entry in the size table"
-            );
-            eprintln!(
-                "skipping qwen35 hf_golden_gate: unrecognized model geometry in \
-                 {model_path}/config.json; extend fixture_size_name to cover it"
-            );
-            return None;
-        };
-        let path = if let Ok(path) = std::env::var(env_key) {
-            path
-        } else {
-            let path = default_fixture_path(size, long);
-            if !Path::new(&path).exists() {
-                assert!(
-                    !COMMITTED_FIXTURE_SIZES.contains(&size),
-                    "committed golden fixture missing at {path}"
-                );
-                eprintln!(
-                    "skipping qwen35 hf_golden_gate: no golden fixture for this size at \
-                     {path}; generate one with tools/accuracy/dump_qwen35_hf_golden.py"
-                );
-                return None;
-            }
-            path
-        };
-        Some(Self::load_path(path))
+        let path =
+            std::env::var(env_key).unwrap_or_else(|_| find_default_fixture(model_path, long));
+        Self::load_path(path)
     }
 
     fn load_path(path: impl AsRef<Path>) -> Golden {
@@ -418,11 +404,11 @@ fn report_fixture_shape(golden: &Golden) {
 }
 
 fn prefill_item(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
-    PrefillStepItem::new(id, prompt, LOGPROBS)
+    PrefillStepItem::new(id, prompt, Some(LOGPROBS))
 }
 
 fn decode_item(id: RequestId, fed: u32) -> DecodeStepItem {
-    DecodeStepItem::new(id, fed, LOGPROBS)
+    DecodeStepItem::new(id, fed, Some(LOGPROBS))
 }
 
 fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (Stats, Vec<f32>) {
@@ -510,7 +496,12 @@ fn run(g: &Golden, ex: &mut Qwen35Executor, seqs: &[usize], batched: bool) -> (S
     (stats, fingerprint)
 }
 
-fn run_tp(g: &Golden, ex: &Qwen35TpExecutor, seqs: &[usize], batched: bool) -> (Stats, Vec<f32>) {
+fn run_tp(
+    g: &Golden,
+    ex: &mut Qwen35TpExecutor,
+    seqs: &[usize],
+    batched: bool,
+) -> (Stats, Vec<f32>) {
     let mut stats = Stats::default();
     let mut fingerprint = Vec::new();
     let mut fold = |stats: &mut Stats, seq, pos, pega: &[(u32, f32)]| {
@@ -747,17 +738,124 @@ fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
         .expect("build Qwen3.5 TP2 logits executor")
 }
 
+/// TP2 executor with CUDA Graph requested. Returns `None` when the loaded
+/// model's TP-local decode GQA group has no compiled kernel — the P2c gate
+/// keeps that path eager, so there is no graph to gate on.
+fn build_tp2_graph_executor(model_path: &str, label: &str) -> Option<Qwen35TpExecutor> {
+    let devices = common::tp2_device_ordinals();
+    let ex = Qwen35TpExecutor::from_runtime_with_capacity(
+        model_path,
+        true,
+        &devices,
+        MAX_EXECUTOR_BATCH,
+    )
+    .expect("build Qwen3.5 TP2 graph logits executor");
+    if !ex.graph_enabled() {
+        eprintln!(
+            "qwen35 hf_golden_gate [{label}]: CUDA Graph gated off (uncompiled TP-local decode GQA group); skipping"
+        );
+        return None;
+    }
+    Some(ex)
+}
+
+/// Mid-batch drop with slot compaction under TP: prefill `seqs`, decode one
+/// step, retire `SLOT_COMPACTION_DROP_INDEX` (the last slot moves into the
+/// gap), then keep decoding the survivors in their new dense slot order.
+fn run_tp_with_slot_compaction(
+    g: &Golden,
+    ex: &mut Qwen35TpExecutor,
+    seqs: &[usize],
+) -> (Stats, Vec<f32>) {
+    assert!(
+        seqs.len() > SLOT_COMPACTION_DROP_INDEX + 1,
+        "TP slot-compaction replay needs a non-tail request to drop"
+    );
+    assert!(
+        g.decode_len >= 2,
+        "TP slot-compaction replay needs at least two decode tokens"
+    );
+
+    let mut stats = Stats::default();
+    let mut fingerprint = Vec::new();
+    let mut fold = |stats: &mut Stats, seq, pos, pega: &[(u32, f32)]| {
+        fingerprint.push(pega[0].1);
+        check_position(stats, seq, pos, pega, &g.topk(seq, pos));
+    };
+
+    let mut live: Vec<(usize, RequestId)> = seqs
+        .iter()
+        .map(|&seq| (seq, RequestId::new(30_000 + seq as u64)))
+        .collect();
+    let items: Vec<PrefillStepItem> = live
+        .iter()
+        .map(|&(seq, id)| prefill_item(id, g.prompt(seq)))
+        .collect();
+    let pr = ex
+        .execute_prefill(PrefillPlan { requests: &items })
+        .expect("TP2 prefill");
+    for (i, &(seq, _)) in live.iter().enumerate() {
+        fold(
+            &mut stats,
+            seq,
+            0,
+            &top_logprobs(pr.requests[i].first_token_logprob.as_ref()),
+        );
+    }
+
+    let step0: Vec<DecodeStepItem> = live
+        .iter()
+        .map(|&(seq, id)| decode_item(id, g.decode(seq, 0)))
+        .collect();
+    let dr = ex
+        .execute_decode(DecodePlan { requests: &step0 })
+        .expect("TP2 decode before compaction");
+    for (i, &(seq, _)) in live.iter().enumerate() {
+        fold(
+            &mut stats,
+            seq,
+            1,
+            &top_logprobs(dr.requests[i].logprob.as_ref()),
+        );
+    }
+
+    let (_, dropped_id) = live[SLOT_COMPACTION_DROP_INDEX];
+    ex.drop_request(dropped_id, DropExpectation::MustExist)
+        .expect("TP2 drop request");
+    live.swap_remove(SLOT_COMPACTION_DROP_INDEX);
+
+    for step in 1..g.decode_len {
+        let items: Vec<DecodeStepItem> = live
+            .iter()
+            .map(|&(seq, id)| decode_item(id, g.decode(seq, step)))
+            .collect();
+        let dr = ex
+            .execute_decode(DecodePlan { requests: &items })
+            .expect("TP2 decode after compaction");
+        for (i, &(seq, _)) in live.iter().enumerate() {
+            fold(
+                &mut stats,
+                seq,
+                step + 1,
+                &top_logprobs(dr.requests[i].logprob.as_ref()),
+            );
+        }
+    }
+
+    for (_, id) in live {
+        ex.drop_request(id, DropExpectation::MustExist)
+            .expect("TP2 drop request");
+    }
+    (stats, fingerprint)
+}
+
 #[test]
 fn pega_logprobs_match_hf_golden_within_qwen35_tolerance() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    let golden = Golden::load_for(&model_path, false);
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -815,12 +913,8 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_long_golden") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    let golden = Golden::load_for(&model_path, true);
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
@@ -840,26 +934,22 @@ fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2() {
     let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden_tp2") else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, false) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    let golden = Golden::load_for(&model_path, false);
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let ex = build_tp2_executor(&model_path);
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let mut ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 sequential eager", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 sequential Qwen3.5 replay must reproduce identical logprobs"
     );
 
     let batched_n = all.len().min(MAX_EXECUTOR_BATCH);
-    let (batched, _) = run_tp(&golden, &ex, &all[..batched_n], true);
+    let (batched, _) = run_tp(&golden, &mut ex, &all[..batched_n], true);
     report_and_assert("TP2 batched eager", &batched);
 }
 
@@ -870,21 +960,72 @@ fn pega_logprobs_match_hf_long_golden_within_qwen35_tolerance_tp2() {
     else {
         return;
     };
-    let Some(golden) = Golden::load_for(&model_path, true) else {
-        return;
-    };
-    if !check_fixture_metadata(&model_path, &golden) {
-        return;
-    }
+    let golden = Golden::load_for(&model_path, true);
+    check_fixture_metadata(&model_path, &golden);
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let ex = build_tp2_executor(&model_path);
-    let (stats, fp1) = run_tp(&golden, &ex, &all, false);
+    let mut ex = build_tp2_executor(&model_path);
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
     report_and_assert("TP2 long sequential eager", &stats);
-    let (_, fp2) = run_tp(&golden, &ex, &all, false);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
     assert_eq!(
         fp1, fp2,
         "TP2 long sequential Qwen3.5 replay must reproduce identical logprobs"
     );
+}
+
+/// P2c TP2 CUDA Graph gate: sequential replay, bucket-straddling batched
+/// replay, and post-compaction replay after a mid-batch drop, all compared
+/// against the same HF golden within the existing TP2 tolerances.
+#[test]
+#[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
+fn pega_logprobs_match_hf_golden_within_qwen35_tolerance_tp2_graph() {
+    let Some(model_path) = common::model_path_or_skip("pega_logprobs_match_hf_golden_tp2_graph")
+    else {
+        return;
+    };
+    let golden = Golden::load_for(&model_path, false);
+    check_fixture_metadata(&model_path, &golden);
+    report_fixture_shape(&golden);
+    let all: Vec<usize> = (0..golden.num_seqs).collect();
+
+    let Some(mut ex) = build_tp2_graph_executor(&model_path, "TP2 graph") else {
+        return;
+    };
+    let (stats, fp1) = run_tp(&golden, &mut ex, &all, false);
+    report_and_assert("TP2 sequential graph", &stats);
+    let (_, fp2) = run_tp(&golden, &mut ex, &all, false);
+    assert_eq!(
+        fp1, fp2,
+        "TP2 sequential Qwen3.5 graph replay must reproduce identical logprobs"
+    );
+
+    for n in BUCKET_STRADDLES {
+        if all.len() >= n {
+            let (batched, _) = run_tp(&golden, &mut ex, &all[..n], true);
+            report_and_assert(&format!("TP2 batched graph ({n} padded)"), &batched);
+        } else {
+            eprintln!(
+                "qwen35 hf_golden_gate: skipping TP2 batched graph ({n} padded); fixture has only {} sequence(s)",
+                all.len()
+            );
+        }
+    }
+
+    if golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2 {
+        let (compacted, fp1) =
+            run_tp_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
+        report_and_assert("TP2 slot-compaction graph", &compacted);
+        let (_, fp2) = run_tp_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
+        assert_eq!(
+            fp1, fp2,
+            "TP2 slot-compaction Qwen3.5 graph replay must reproduce identical logprobs"
+        );
+    } else {
+        eprintln!(
+            "qwen35 hf_golden_gate: skipping TP2 slot-compaction graph; fixture has {} sequence(s), decode_len {}",
+            golden.num_seqs, golden.decode_len
+        );
+    }
 }

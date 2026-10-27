@@ -44,6 +44,8 @@
 
 #include <atomic>
 
+#include "../shared/ffi_guard.cuh"
+
 #ifdef K3_FLASH_MLA_SM100F
 #include "collective/fmha_fusion.hpp"
 #include "collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
@@ -59,18 +61,8 @@
 
 // Not in an anonymous namespace: nvcc's device-stub generation trips over an
 // anonymous-namespace __global__ when an included header (cute) opens its own.
-static CUresult k3_flash_mla_map_cuda_error(cudaError_t err) {
-    if (err == cudaSuccess) return CUDA_SUCCESS;
-    if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-    if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-    return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 static CUresult k3_flash_mla_consume_last_cuda_error() {
-    return k3_flash_mla_map_cuda_error(cudaGetLastError());
+    return map_cuda_error(cudaGetLastError());
 }
 
 // The paged latent row: post-norm kv latent | shared per-token rope half.
@@ -383,9 +375,9 @@ static CUresult k3_flash_mla_prefill_run(
     using Operation = typename Cfg::Operation;
     int device = 0;
     cudaError_t err = cudaGetDevice(&device);
-    if (err != cudaSuccess) return k3_flash_mla_map_cuda_error(err);
+    if (err != cudaSuccess) return map_cuda_error(err);
     err = k3_flash_mla_prefill_ensure_smem_attr<typename Operation::Kernel>(device);
-    if (err != cudaSuccess) return k3_flash_mla_map_cuda_error(err);
+    if (err != cudaSuccess) return map_cuda_error(err);
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = device;
     hw_info.sm_count =

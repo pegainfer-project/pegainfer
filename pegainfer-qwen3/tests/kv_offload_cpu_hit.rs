@@ -73,8 +73,8 @@ fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
         prompt.to_vec(),
         MAX_OUTPUT,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
@@ -163,7 +163,6 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(1, &p)],
-            echo: false,
         })
         .expect("cold prefill");
     assert_eq!(
@@ -193,7 +192,6 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(2, &p)],
-            echo: false,
         })
         .expect("warm prefill");
     assert_eq!(
@@ -221,7 +219,6 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(1, &full)],
-            echo: false,
         })
         .expect("cold full prefill");
     assert_eq!(
@@ -240,7 +237,6 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(2, &short)],
-            echo: false,
         })
         .expect("short prefill");
     assert_eq!(
@@ -268,7 +264,6 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(3, &full)],
-            echo: false,
         })
         .expect("warm full prefill");
     assert_eq!(

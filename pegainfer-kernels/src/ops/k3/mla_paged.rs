@@ -35,6 +35,8 @@ const K3_KV_LORA: usize = 512;
 /// Cached latent row width: kv_lora_rank 512 | rope 64.
 pub const K3_KV_LATENT_ROW: usize = K3_KV_LORA + 64;
 
+const _: () = assert!(K3_KV_LATENT_ROW == K3_KV_LORA + (K3_QK_DIM - K3_V_DIM));
+
 /// Absorbed-MLA decode: `q [b, heads * 192]`, `w_kv_b [heads * 256, 512]`
 /// (checkpoint orientation — per head `[128 nope | 128 value] x 512`), the
 /// pool `slab` with this layer's slice at `layer_offset` elements and pages
@@ -106,18 +108,4 @@ pub fn k3_mla_paged_attn_launch(
     }
     .result()
     .map_err(|err| anyhow!("K3 paged MLA attention launch failed: {err}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn geometry_agrees_with_the_cache_row() {
-        // The cached row is [kv_lora 512 | rope 64]; the query per head is
-        // [nope 128 | rope 64]; the value head is 128 wide.
-        assert_eq!(K3_KV_LATENT_ROW, K3_KV_LORA + (K3_QK_DIM - 128));
-        assert_eq!(K3_V_DIM, 128);
-        assert_eq!(K3_KV_PAGE_TOKENS, 64);
-    }
 }

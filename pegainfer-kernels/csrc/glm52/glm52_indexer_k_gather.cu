@@ -16,6 +16,7 @@
 // table, mirroring the -1-padding and topk_lens semantics of the paged twin.
 
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 
@@ -131,16 +132,6 @@ __global__ void topk_to_slots_lut_kernel(
   if (tid == 0) {
     topk_lens[row] = total;
   }
-}
-
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
 }
 
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }

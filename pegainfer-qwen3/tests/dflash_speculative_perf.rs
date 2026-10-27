@@ -103,7 +103,10 @@ fn timed_generate(engine: &EngineHarness, prompt_tokens: Vec<u32>) -> (usize, Du
             .expect("engine closed the stream without a terminal");
         count += update.tokens.len();
         match update.terminal {
-            Some(Terminal::Finished { .. }) => return (count, start.elapsed()),
+            Some(Terminal::Finished { .. }) => {
+                assert_eq!(count, GENERATED_TOKENS, "fixed-length request ended early");
+                return (count, start.elapsed());
+            }
             Some(Terminal::Failed { message, .. }) => panic!("generation failed: {message}"),
             Some(Terminal::Rejected { reason, .. }) => panic!("generation rejected: {reason}"),
             None => {}

@@ -34,16 +34,6 @@ constexpr int kScanThreads = 256;
 constexpr int kMaxBlocks = 65535;
 constexpr int kVecWidth = 8;  // bf16 per float4
 
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
 int grid_blocks(long long work) {

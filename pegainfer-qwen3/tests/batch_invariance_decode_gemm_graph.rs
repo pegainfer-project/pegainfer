@@ -54,8 +54,8 @@ fn pitem(id: RequestId, prompt: Vec<u32>) -> PrefillStepItem {
         prompt,
         MAX_OUTPUT_TOKENS,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
@@ -76,7 +76,6 @@ fn a_first_and_decode(ex: &mut Qwen3Executor, n_requests: usize) -> (u32, Vec<(u
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &pitems,
-            echo: false,
         })
         .expect("prefill");
     let a_first = pr.requests[0].first_token;
@@ -84,7 +83,12 @@ fn a_first_and_decode(ex: &mut Qwen3Executor, n_requests: usize) -> (u32, Vec<(u
         .iter()
         .zip(&pr.requests)
         .map(|((id, _), req)| {
-            DecodeStepItem::new(*id, req.first_token, SamplingParams::default(), LOGPROBS)
+            DecodeStepItem::new(
+                *id,
+                req.first_token,
+                SamplingParams::default(),
+                Some(LOGPROBS),
+            )
         })
         .collect();
     let dr = ex
@@ -128,7 +132,7 @@ fn decode_batch(ex: &mut Qwen3Executor, ids: &[RequestId], tokens: &[u32]) -> Ve
     let ditems: Vec<DecodeStepItem> = ids
         .iter()
         .zip(tokens.iter().copied())
-        .map(|(id, token)| DecodeStepItem::new(*id, token, SamplingParams::default(), 0))
+        .map(|(id, token)| DecodeStepItem::new(*id, token, SamplingParams::default(), None))
         .collect();
 
     ex.execute_decode(DecodePlan {
@@ -155,7 +159,6 @@ fn per_token_counter_probe(ex: &mut Qwen3Executor, n_requests: usize) -> (u64, u
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &pitems,
-            echo: false,
         })
         .expect("prefill for graph-mode probe");
 

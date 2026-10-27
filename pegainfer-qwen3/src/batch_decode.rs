@@ -307,13 +307,8 @@ impl Qwen3Model {
             )?;
         }
 
-        // Output projection: logits [vocab_size, bs]
-        dag.lm_head(
-            dag_label!("lm_head"),
-            self.output_projection(),
-            &bufs.normed,
-            &mut bufs.logits,
-        );
+        // Output projection: logits [logits_rows, bs]
+        dag.lm_head(dag_label!("lm_head"), &bufs.normed, &mut bufs.logits)?;
 
         Ok(())
     }

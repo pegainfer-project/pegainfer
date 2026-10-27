@@ -14,6 +14,8 @@ use std::time::Instant;
 
 use super::event::FinishReason;
 use super::event::TokenLogprob;
+use super::stop::StopCause;
+use super::stop::StopPolicy;
 
 /// In-process routing id for one generate request, minted by
 /// [`super::SchedulerHandle::submit`] from a per-scheduler counter. `Copy` and
@@ -49,15 +51,23 @@ impl std::fmt::Display for RequestId {
 pub struct Request {
     pub prompt_tokens: Vec<u32>,
     pub params: crate::sampler::SamplingParams,
+    /// Count of leading prompt tokens that render the conversation's messages;
+    /// the chat template's generation prompt follows them. The next turn of
+    /// the conversation repeats exactly these tokens, so a scheduler that
+    /// snapshots its state there serves that turn from the snapshot. `None`
+    /// when the frontend did not measure it (a completion, or a chat body the
+    /// chat layer could not read).
+    pub history_tokens: Option<usize>,
+    pub stop_policy: StopPolicy,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
     /// Opaque router/P-D metadata from the request's
     /// `vllm_xargs.kv_transfer_params`.
     pub kv_transfer_params: Option<serde_json::Value>,
-    /// Number of top logprobs to return per token (0 = disabled).
-    pub logprobs: usize,
-    /// Return prompt tokens (and their logprobs) ahead of the completion.
-    pub echo: bool,
+    /// Completion top-k count: None disables scoring; Some(0) scores the chosen token.
+    pub logprobs: Option<usize>,
+    /// Prompt top-k count, independent of completion scoring; Some(0) scores each prompt token.
+    pub prompt_logprobs: Option<usize>,
     /// Trace context of the caller's request span, when tracing is on. The
     /// model scheduler opens its queue/prefill/decode spans as children of
     /// this. `None` when tracing is disabled.
@@ -75,9 +85,9 @@ pub struct QueuedRequest {
     pub request: Request,
 }
 
-/// Everything one scheduler step produced, in one message. The scheduler-side
-/// ledger sends exactly one per step that touched any request; an idle step
-/// sends nothing.
+/// Everything one scheduler step produced, in one message. Empty `updates`
+/// notify the frontend of changed metrics, for example after cancellation.
+/// A step with no request updates or metric changes sends nothing.
 #[derive(Debug, Default)]
 pub struct StepOutputs {
     pub updates: Vec<RequestUpdate>,
@@ -173,6 +183,8 @@ pub enum RejectReason {
         max_tokens: usize,
         limit: usize,
     },
+    /// Whole-prefill scheduling cannot fit the request in one scheduler step.
+    PrefillStepBudget { prompt_tokens: usize, limit: usize },
     /// Echo needs all-position logits in one forward pass, so the prompt must
     /// fit the profiled prefill bound.
     EchoPrefillTokens { prompt_tokens: usize, limit: usize },
@@ -200,6 +212,13 @@ impl fmt::Display for RejectReason {
                 "request exceeds this model's maximum context length of {limit} tokens: \
                  requested {} (prompt={prompt_tokens} + max_tokens={max_tokens})",
                 prompt_tokens.saturating_add(*max_tokens)
+            ),
+            Self::PrefillStepBudget {
+                prompt_tokens,
+                limit,
+            } => write!(
+                f,
+                "request prompt has {prompt_tokens} tokens but the whole-prefill step budget is {limit} tokens"
             ),
             Self::EchoPrefillTokens {
                 prompt_tokens,
@@ -233,6 +252,9 @@ impl fmt::Display for RejectReason {
 pub enum Terminal {
     Finished {
         reason: FinishReason,
+        /// Present for token-driven stop finishes. The triggering token remains
+        /// in `RequestUpdate.tokens`, with its matching logprob when requested.
+        stop_cause: Option<StopCause>,
         prompt_tokens: usize,
         completion_tokens: usize,
     },

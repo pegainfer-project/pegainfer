@@ -22,6 +22,9 @@
 //! state. Prefix caching ships disabled (KDA state is not recomputable
 //! from tokens; see docs/subsystems/kv-cache/design.md, bounded class).
 
+// `k3` needs the DeepGEMM submodule at build time; without it this crate is empty.
+#![cfg(feature = "k3")]
+
 mod config;
 pub mod executor;
 pub mod model_line;

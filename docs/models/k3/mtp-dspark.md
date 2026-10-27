@@ -18,7 +18,7 @@ cross-tray sync stalls inside MegaMoE** (a ~2.8 ms stall every 8th
 expert layer, mechanism unidentified) — finding and hiding that stall
 outranks row packing (see the round-anatomy section).
 
-Last touched: 2026-08
+Last touched: 2026-10
 
 ## The checkpoint
 
@@ -101,7 +101,7 @@ launch geometry ⇒ identical bits:
    with position invariants holding, bit-stable across release + re-prefill.
 
 Run: `PEGAINFER_K3_TEST_224=<ckpt> PEGAINFER_K3_TEST_DSPARK=<dspark>
-cargo test --release -p pegainfer-k3 --test spec_verify -- --ignored`.
+cargo test --release -p pegainfer-k3 --features k3 --test spec_verify -- --ignored`.
 
 ## Full-depth serve validation (2026-08-19, tray04)
 

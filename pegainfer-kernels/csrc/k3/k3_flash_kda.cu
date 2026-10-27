@@ -28,6 +28,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "../shared/ffi_guard.cuh"
+
 #ifdef K3_FLASH_KDA_SM90A
 #include "fwd_launch.cu"
 #include "k3_flash_kda_md.cuh"
@@ -35,16 +37,6 @@
 
 // Not in an anonymous namespace: nvcc's device-stub generation trips over an
 // anonymous-namespace __global__ when an included header (cute) opens its own.
-static CUresult k3_flash_kda_map_cuda_error(cudaError_t err) {
-    if (err == cudaSuccess) return CUDA_SUCCESS;
-    if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-    if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-    return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 static __global__ void k3_flash_kda_beta_transpose_kernel(
     const __nv_bfloat16* __restrict__ beta_th,
     __nv_bfloat16* __restrict__ beta_ht,
@@ -90,7 +82,7 @@ CUresult k3_flash_kda_beta_transpose(
         t_total,
         h
     );
-    return k3_flash_kda_map_cuda_error(cudaGetLastError());
+    return map_cuda_error(cudaGetLastError());
 }
 
 // One sequence of `t_total` tokens through the chunkwise KDA forward,
@@ -145,7 +137,7 @@ CUresult k3_flash_kda_fwd(
         gate_scale,
         stream
     );
-    return k3_flash_kda_map_cuda_error(cudaGetLastError());
+    return map_cuda_error(cudaGetLastError());
 #endif
 }
 
@@ -198,7 +190,7 @@ CUresult k3_flash_kda_fwd_md(
         gate_scale,
         stream
     );
-    return k3_flash_kda_map_cuda_error(cudaGetLastError());
+    return map_cuda_error(cudaGetLastError());
 #endif
 }
 

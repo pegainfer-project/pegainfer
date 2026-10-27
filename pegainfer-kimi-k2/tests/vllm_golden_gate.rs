@@ -349,8 +349,8 @@ fn submit(
             lora_adapter: None,
             kv_transfer_params: None,
             token_tx: tx,
-            logprobs,
-            echo: false,
+            logprobs: (logprobs > 0).then_some(logprobs),
+            prompt_logprobs: None,
         })
         .expect("submit to kimi engine");
     PendingRequest { label, rx }

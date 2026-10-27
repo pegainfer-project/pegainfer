@@ -201,6 +201,8 @@ impl LocalQwen3Lane {
         requests: &[VerifyStepItem],
         results: &[VerifyRequestResult],
         captured_hidden: Option<&HiddenStates>,
+        verify_round: u64,
+        gated: bool,
     ) -> Result<()> {
         let Some(captured_hidden) = captured_hidden else {
             anyhow::bail!("DFlash verify context capture requested but no hidden states returned");
@@ -242,6 +244,7 @@ impl LocalQwen3Lane {
                 token_offset,
                 result.accepted_tokens.len(),
             )?;
+            let context_len = state.pending_context_len().unwrap_or(0);
             dflash.requests.insert(req.request_id, state);
             dflash.verified_draft_tokens += req.token_ids.len().saturating_sub(1);
             dflash.accepted_draft_tokens += result.matched_draft_tokens;
@@ -250,11 +253,16 @@ impl LocalQwen3Lane {
             } else {
                 dflash.accepted_draft_tokens as f64 / dflash.verified_draft_tokens as f64
             };
+            let verified_draft = req.token_ids.len().saturating_sub(1);
             log::debug!(
-                "Qwen3 DFlash request={} accepted_draft={} committed_tokens={} cumulative_accept_rate={:.3}",
-                req.request_id.raw(),
+                "Qwen3 DFlash context round={} request={} accepted_draft={} verified_draft={} gated={} committed_tokens={} context_len={} cumulative_accept_rate={:.3}",
+                verify_round,
+                req.request_id,
                 result.matched_draft_tokens,
+                verified_draft,
+                u8::from(gated),
                 result.accepted_tokens.len(),
+                context_len,
                 rate,
             );
             token_offset += req.token_ids.len();
@@ -264,13 +272,17 @@ impl LocalQwen3Lane {
                 .iter()
                 .map(|result| result.accepted_tokens.len())
                 .sum();
-            controller.tick(dflash.round_chains, committed);
+            if gated {
+                controller.break_window();
+            } else {
+                controller.tick(dflash.round_chains, committed);
+            }
         }
         Ok(())
     }
 
-    /// Roll out one draft span per request: draft forward + greedy argmax over
-    /// the block. Returns the verify span `[current_token, draft_1, …]`.
+    /// Roll out one draft span per request using the checkpoint's proposal head.
+    /// Returns the verify span `[current_token, draft_1, …]`.
     pub(super) fn execute_dflash_draft(
         &mut self,
         requests: &[DraftStepItem],
@@ -334,9 +346,9 @@ impl LocalQwen3Lane {
                 draft_len
             };
 
-            // Propose tokens from the base logits. DFlash takes an independent
-            // greedy argmax per position; DSpark adds the Markov bias and samples
-            // the block left-to-right (anchor-first, all `block_size` positions).
+            // Plain DFlash uses independent argmax; the selector adds learned
+            // pair scores over top-16 candidates. DSpark uses its Markov head
+            // with an anchor-first layout (all `block_size` positions).
             let markov = model.uses_markov_head();
             let hedge_positions = if *hedge_cap > 0 {
                 hedge_branch_positions.as_slice()
@@ -409,7 +421,10 @@ impl LocalQwen3Lane {
             );
             let hedging = ladder_chains > 0 && !hedged.is_empty();
             *round_chains = if hedging { ladder_chains } else { 0 };
-            let sampled = if markov {
+            let selector = model.uses_selector();
+            let sampled = if selector {
+                model.selected_draft_tokens(self.model.device_ctx(), &current_tokens, scratch)?
+            } else if markov {
                 if hedging {
                     let ctx = self.model.device_ctx();
                     let chain_a = model.markov_draft_with_runners(
@@ -452,26 +467,26 @@ impl LocalQwen3Lane {
                 state_map.insert(request_id, state);
             }
 
+            // Selector already drops the anchor slot. Legacy proposals still
+            // carry full blocks, with the checkpoint-specific layout below.
+            let sampled_stride = block_size - usize::from(selector);
             anyhow::ensure!(
-                sampled.len() == requests.len() * block_size,
-                "DFlash batched draft sampled {} tokens for {} requests x block {}",
+                sampled.len() == requests.len() * sampled_stride,
+                "DFlash batched draft sampled {} tokens for {} requests x stride {}",
                 sampled.len(),
                 requests.len(),
-                block_size
+                sampled_stride
             );
 
-            // Split the batched samples per request: request `i` owns rows
-            // `[i * block_size, (i + 1) * block_size)`. Verify span = [current
-            // dangling token, draft_1, …]. Anchor-drop checkpoints discard block
-            // position 0 (the anchor slot; only the mask positions draft), giving
-            // `block_size - 1` drafts; anchor-first checkpoints have position 0
-            // already predict the first draft, giving all `block_size` drafts —
-            // a one-token-longer span. This is a checkpoint property, not a markov
-            // one: a `markov_rank == 0` DeepSpec checkpoint is still anchor-first.
-            let drafts_start = usize::from(!model.anchor_first());
+            // Each request owns sampled_stride entries. Selector output already
+            // excludes its anchor; legacy anchor-drop skips position 0 here.
+            // Anchor-first checkpoints use every sample. Prepend the actual
+            // dangling token once for all three paths before target verification.
+            let drafts_start = usize::from(!selector && !model.anchor_first());
+            let keep = model.effective_drafts();
             let mut outputs = Vec::with_capacity(requests.len());
             for (i, req) in requests.iter().enumerate() {
-                let block = &sampled[i * block_size..(i + 1) * block_size];
+                let block = &sampled[i * sampled_stride..(i + 1) * sampled_stride];
                 let drafts = &block[drafts_start..];
                 anyhow::ensure!(
                     !drafts.is_empty(),
@@ -479,9 +494,15 @@ impl LocalQwen3Lane {
                     i,
                     block_size
                 );
-                let mut token_ids = Vec::with_capacity(drafts.len() + 1);
+                anyhow::ensure!(
+                    keep <= drafts.len(),
+                    "draft trim {} exceeds the block's {} draft tokens",
+                    keep,
+                    drafts.len()
+                );
+                let mut token_ids = Vec::with_capacity(keep + 1);
                 token_ids.push(req.current_token);
-                token_ids.extend(drafts.iter().copied());
+                token_ids.extend(drafts[..keep].iter().copied());
                 outputs.push(DraftRequestResult {
                     request_id: req.request_id,
                     token_ids,

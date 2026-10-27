@@ -4,7 +4,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
-use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -18,6 +17,7 @@ use log::warn;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use vllm_engine_core_client::ENGINE_CORE_DEAD_SENTINEL;
 use vllm_engine_core_client::EngineId;
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::encode_msgpack;
@@ -35,7 +35,10 @@ use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::output::UtilityCallOutput;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
+use vllm_engine_core_client::protocol::stats::BaseCacheStats;
+use vllm_engine_core_client::protocol::stats::CachedTokensBySource;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::stats::PrefixCacheStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
@@ -53,6 +56,7 @@ use zeromq::util::PeerIdentity;
 use crate::engine::EngineHandle;
 use crate::engine::FinishReason;
 use crate::engine::GenerateRequest;
+use crate::engine::PrefixCacheCounters;
 use crate::engine::RequestAbortReason;
 use crate::engine::RequestTag;
 use crate::engine::SchedulerMetrics;
@@ -64,6 +68,7 @@ use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
 use crate::vllm::wire::lora_adapter_from_sampling_params;
 use crate::vllm::wire::requested_logprobs;
+use crate::vllm::wire::requested_prompt_logprobs;
 use crate::vllm::wire::to_wire_position_logprobs;
 
 pub(crate) struct LocalEngineBridge {
@@ -78,11 +83,11 @@ pub(crate) struct LocalEngineBridge {
 
 impl LocalEngineBridge {
     pub(crate) async fn run(self, shutdown: CancellationToken) -> Result<()> {
-        let BridgeLink {
+        let Some(BridgeLink {
             mut input,
             output_tx,
             mut child_tasks,
-        } = connect_link(
+        }) = connect_link(
             &self.input_address,
             &self.output_address,
             self.engine_index,
@@ -90,9 +95,13 @@ impl LocalEngineBridge {
             self.max_model_len,
             self.handle.kv_capacity(),
             self.metrics_watch.clone(),
+            None,
             &shutdown,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
 
         // One shared channel carries every request's token events, tagged by
         // request id; this loop is the sole consumer. Per-request state lives
@@ -338,7 +347,7 @@ impl LocalEngineBridge {
                 kv_transfer_params,
                 token_tx,
                 logprobs: requested_logprobs(&sampling_params),
-                echo: false,
+                prompt_logprobs: requested_prompt_logprobs(&sampling_params),
             })
             .context("failed to submit request to scheduler")?;
 
@@ -523,7 +532,7 @@ fn reduce_request(
                 }
             }
             TokenEvent::PromptTokens { .. } => {
-                // Prompt logprobs are intentionally deferred for this bridge.
+                // Legacy model lines reject prompt-logprob requests at admission.
             }
             TokenEvent::KvTransfer { params } => {
                 state.kv_transfer_params = Some(params);
@@ -578,7 +587,7 @@ fn reduce_request(
         state.first_token_events.take(),
         state.first_token_prefill_stats.take(),
     );
-    output.kv_transfer_params = state.kv_transfer_params.take();
+    output.kv_transfer_params = state.kv_transfer_params.take().map(Box::new);
     (Some(output), terminated)
 }
 
@@ -625,23 +634,90 @@ fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> Spe
     }
 }
 
-#[derive(Default)]
-pub(crate) struct SpecDecodeTracker {
-    last: SpecDecodeCounters,
+/// Per-interval prefix-cache deltas from two cumulative snapshots, in the wire
+/// shape the frontend increments its prefix-cache counters by. The frontend
+/// credits every local hit to `source="device"` and reads a tier split only off
+/// the connector stats, so host-tier hits travel there, the way vLLM's own
+/// offload connector reports them: local stats carry the remaining hits into
+/// `vllm:prefix_cache_*` and `source="device"`, connector stats carry the host
+/// lookups and hits into `vllm:external_prefix_cache_*` and `source="host"`.
+/// The connector side is `None` for an interval without host activity. A total
+/// below its baseline means the engine restarted, so the interval diffs from
+/// zero rather than going negative or dropping the new counts.
+fn prefix_cache_delta(
+    last: &PrefixCacheCounters,
+    cur: &PrefixCacheCounters,
+) -> (PrefixCacheStats, Option<PrefixCacheStats>) {
+    let restarted = cur.queries < last.queries
+        || cur.hits < last.hits
+        || cur.host_queries < last.host_queries
+        || cur.host_hits < last.host_hits;
+    let base = if restarted {
+        PrefixCacheCounters::default()
+    } else {
+        *last
+    };
+    let hits = cur.hits - base.hits;
+    let host_queries = cur.host_queries - base.host_queries;
+    let host_hits = cur.host_hits - base.host_hits;
+    let local = PrefixCacheStats {
+        base: BaseCacheStats {
+            queries: cur.queries - base.queries,
+            hits: hits.saturating_sub(host_hits),
+            ..BaseCacheStats::default()
+        },
+        ..PrefixCacheStats::default()
+    };
+    let connector = (host_queries > 0 || host_hits > 0).then(|| PrefixCacheStats {
+        base: BaseCacheStats {
+            queries: host_queries,
+            hits: host_hits,
+            ..BaseCacheStats::default()
+        },
+        hits_by_source: CachedTokensBySource {
+            host: host_hits,
+            ..CachedTokensBySource::default()
+        },
+        ..PrefixCacheStats::default()
+    });
+    (local, connector)
 }
 
-impl SpecDecodeTracker {
-    /// The delta to stamp on the next outgoing batch, or `None` when nothing
-    /// drafted. Advances the baseline, so a caller that declines to send after
-    /// calling this drops only a no-op interval.
-    pub(crate) fn interval(&mut self, snapshot: &SchedulerMetrics) -> Option<SpecDecodingStats> {
+/// Turns the scheduler's cumulative counters into the per-interval deltas
+/// stamped on each outgoing batch.
+#[derive(Default)]
+pub(crate) struct StatsTracker {
+    spec_decode: SpecDecodeCounters,
+    prefix_cache: PrefixCacheCounters,
+}
+
+impl StatsTracker {
+    /// Stats for the next outgoing batch. Advances the baselines, so a caller
+    /// that declines to send after calling this drops only that interval's
+    /// counter deltas.
+    pub(crate) fn stats(&mut self, snapshot: &SchedulerMetrics) -> SchedulerStats {
+        let mut stats = scheduler_stats_from(snapshot);
+        stats.spec_decoding_stats = self.spec_decode_interval(snapshot);
+        if let Some(cur) = &snapshot.prefix_cache {
+            (stats.prefix_cache_stats, stats.connector_prefix_cache_stats) =
+                prefix_cache_delta(&self.prefix_cache, cur);
+            self.prefix_cache = *cur;
+        } else {
+            // Reset so a prefix cache that shows up later diffs from zero.
+            self.prefix_cache = PrefixCacheCounters::default();
+        }
+        stats
+    }
+
+    /// The spec-decode delta, or `None` when nothing drafted.
+    fn spec_decode_interval(&mut self, snapshot: &SchedulerMetrics) -> Option<SpecDecodingStats> {
         let Some(cur) = &snapshot.spec_decode else {
             // Reset so a drafter loaded later diffs from zero.
-            self.last = SpecDecodeCounters::default();
+            self.spec_decode = SpecDecodeCounters::default();
             return None;
         };
-        let delta = spec_decode_delta(&self.last, cur);
-        self.last = *cur;
+        let delta = spec_decode_delta(&self.spec_decode, cur);
+        self.spec_decode = *cur;
         // A zero-draft interval would divide by zero in the frontend's
         // acceptance-rate log, and every counter moves only inside
         // `observe_draft`, so dropping it loses nothing.
@@ -661,11 +737,10 @@ async fn publish_scheduler_stats(
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let mut spec = SpecDecodeTracker::default();
+    let mut tracker = StatsTracker::default();
     loop {
         let snapshot = *load_rx.borrow_and_update();
-        let mut stats = scheduler_stats_from(&snapshot);
-        stats.spec_decoding_stats = spec.interval(&snapshot);
+        let stats = tracker.stats(&snapshot);
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),
@@ -703,22 +778,14 @@ async fn connect_link(
     max_model_len: u32,
     kv_capacity: Option<crate::engine::KvCapacity>,
     metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
+    engine_dead: Option<CancellationToken>,
     shutdown: &CancellationToken,
-) -> Result<BridgeLink> {
-    wait_for_ipc_endpoint(input_address, shutdown).await?;
-    wait_for_ipc_endpoint(output_address, shutdown).await?;
-
+) -> Result<Option<BridgeLink>> {
     let engine_id = EngineId::from_engine_index(
         u16::try_from(engine_index).context("engine_index exceeds u16 EngineId")?,
     );
     let mut socket_options = SocketOptions::default();
     socket_options.peer_identity(PeerIdentity::try_from(engine_id)?);
-
-    let mut input = DealerSocket::with_options(socket_options);
-    input
-        .connect(input_address)
-        .await
-        .with_context(|| format!("failed to connect local engine input {input_address}"))?;
 
     let (num_gpu_blocks, block_size, kv_cache_size_tokens, kv_cache_max_concurrency) =
         match kv_capacity {
@@ -756,6 +823,7 @@ async fn connect_link(
         max_loras: 0,
         kv_cache_size_tokens,
         kv_cache_max_concurrency,
+        effective_attention_block_size: kv_capacity.map(|c| c.block_size as u64),
         kv_events_config: None,
         weight_transfer_backend: None,
         enable_sleep_mode: false,
@@ -766,20 +834,38 @@ async fn connect_link(
          kv_cache_size_tokens={kv_cache_size_tokens:?} \
          kv_cache_max_concurrency={kv_cache_max_concurrency:?}"
     );
-    input
-        .send(ZmqMessage::from(encode_msgpack(&ready)?))
-        .await
-        .context("failed to send local engine ready response")?;
-
+    let mut input = DealerSocket::with_options(socket_options);
     let mut output = PushSocket::new();
-    output
-        .connect(output_address)
-        .await
-        .with_context(|| format!("failed to connect local engine output {output_address}"))?;
+    let handshake = async {
+        input
+            .connect(input_address)
+            .await
+            .with_context(|| format!("failed to connect local engine input {input_address}"))?;
+        input
+            .send(ZmqMessage::from(encode_msgpack(&ready)?))
+            .await
+            .context("failed to send local engine ready response")?;
+        output
+            .connect(output_address)
+            .await
+            .with_context(|| format!("failed to connect local engine output {output_address}"))
+    };
+    // zeromq retries a refused connect for 30 s, which outlives a server that
+    // failed its own startup and closed the listeners.
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(None),
+        handshake = handshake => handshake?,
+    }
 
     let (output_tx, output_rx) = mpsc::unbounded_channel();
     let mut child_tasks = tokio::task::JoinSet::new();
-    child_tasks.spawn(async move { ("output sender", output_loop(output, output_rx).await) });
+    child_tasks.spawn(async move {
+        (
+            "output sender",
+            output_loop(output, output_rx, engine_dead).await,
+        )
+    });
 
     // Legacy handle engines republish load snapshots as stats-only output
     // batches: their scheduler loops park when idle, so the watch cadence is
@@ -798,22 +884,34 @@ async fn connect_link(
         });
     }
 
-    Ok(BridgeLink {
+    Ok(Some(BridgeLink {
         input,
         output_tx,
         child_tasks,
-    })
+    }))
 }
 
 async fn output_loop(
     mut output: PushSocket,
     mut output_rx: mpsc::UnboundedReceiver<EngineCoreOutputs>,
+    engine_dead: Option<CancellationToken>,
 ) -> Result<()> {
     while let Some(outputs) = output_rx.recv().await {
         output
             .send(ZmqMessage::from(encode_msgpack(&outputs)?))
             .await
             .context("failed to send local engine output")?;
+    }
+    // Sent after the queued outputs: the client then fails every request it
+    // still tracks, including ones the bridge never read.
+    if engine_dead
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        output
+            .send(ZmqMessage::from(ENGINE_CORE_DEAD_SENTINEL.to_vec()))
+            .await
+            .context("failed to send the engine dead sentinel")?;
     }
     Ok(())
 }
@@ -907,12 +1005,14 @@ fn engine_output(
         kv_transfer_params: None,
         ec_transfer_params: None,
         trace_headers: None,
-        prefill_stats,
+        prefill_stats: prefill_stats.map(Box::new),
         routed_experts: None,
         num_nans_in_logits: 0,
         mm_cache_miss_hashes: None,
         new_sampling_mask: None,
         spec_decode_metrics: None,
+        prompt_token_id_logprobs: None,
+        error: None,
     }
 }
 
@@ -935,22 +1035,6 @@ pub(crate) fn local_ipc_namespace() -> Result<PathBuf> {
 
 pub(crate) fn ipc_endpoint(namespace: &Path, name: &str) -> String {
     format!("ipc://{}", namespace.join(name).to_string_lossy())
-}
-
-async fn wait_for_ipc_endpoint(address: &str, shutdown: &CancellationToken) -> Result<()> {
-    let Some(path) = address.strip_prefix("ipc://") else {
-        return Ok(());
-    };
-    let path = Path::new(path);
-    loop {
-        if path.exists() {
-            return Ok(());
-        }
-        tokio::select! {
-            () = shutdown.cancelled() => bail!("shutdown before IPC endpoint appeared"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-    }
 }
 
 mod stepped;

@@ -48,8 +48,7 @@ pub(crate) fn validate_tokens(
     Ok(())
 }
 
-/// Shared with the KV-backed serving path, which runs it over whichever rows
-/// it needs logits for.
+/// [`logits_tail_into`] into a freshly allocated buffer.
 pub(crate) fn logits_tail(
     ctx: &DeviceContext,
     weights: &Gemma4Weights,

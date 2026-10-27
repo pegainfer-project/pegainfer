@@ -117,14 +117,14 @@ fn unschedulable_verdict(req: &GenerateRequest) -> Option<UnschedulableVerdict> 
             "Kimi-K2 forward requires at least one prompt token".to_string(),
         ));
     }
-    // Honor-or-reject (#236): prompt echo needs per-position prompt logprobs,
-    // which the prefill path does not compute (lm_head runs on the last
-    // position only). Reject instead of silently returning a response with
-    // the echo stripped.
-    if req.echo {
+    // Honor-or-reject (#236): prompt logprobs need per-position prompt
+    // logits, which the prefill path does not compute (lm_head runs on the
+    // last position only). Reject instead of silently returning a response
+    // with the prompt logprobs stripped.
+    if req.prompt_logprobs.is_some() {
         return Some(UnschedulableVerdict::Reject(
-            "echo is not supported on the Kimi-K2 serving path: prompt \
-             logprobs are not computed; set echo=false"
+            "prompt logprobs are not supported on the Kimi-K2 serving path: \
+             all-position prompt logits are not computed"
                 .to_string(),
         ));
     }

@@ -11,10 +11,10 @@ use pegainfer_kernels::ops::dsv2_lite_kv_norm_into;
 use pegainfer_kernels::ops::dsv2_lite_router_logits_into;
 use pegainfer_kernels::ops::dsv2_lite_router_softmax_topk_into;
 
-use super::parse_rollback_value;
 use crate::config::test_lite_config;
 use crate::host_ops::gate_logits_host;
 use crate::host_ops::topk_softmax_routes;
+use crate::runtime::parse_rollback_value;
 
 #[test]
 fn rollback_policy_parser_rejects_unknown_values() {
@@ -120,7 +120,7 @@ fn device_router_logits_match_host_accumulation_bitwise() {
         .alloc_zeros::<f32>(hidden.seq_len * config.n_routed_experts)
         .expect("router logits");
 
-    dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits).expect("device logits");
+    dsv2_lite_router_logits_into(&ctx, hidden.as_ref(), &gate, &mut logits).expect("device logits");
     let got = ctx.stream.clone_dtoh(&logits).expect("logits D2H");
     ctx.sync().expect("sync logits");
 
@@ -174,7 +174,7 @@ fn router_logits_rejects_inflated_hidden_metadata() {
         .alloc_zeros::<f32>(hidden.seq_len * gate.rows)
         .expect("logits");
 
-    let err = dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits)
+    let err = dsv2_lite_router_logits_into(&ctx, hidden.as_ref(), &gate, &mut logits)
         .expect_err("inflated hidden metadata must fail before CUDA launch");
     assert_error_contains(&err, "router hidden backing buffer too small");
 }
@@ -203,7 +203,7 @@ fn router_logits_rejects_inflated_gate_metadata() {
         .alloc_zeros::<f32>(hidden.seq_len * gate.rows)
         .expect("logits");
 
-    let err = dsv2_lite_router_logits_into(&ctx, &hidden, &gate, &mut logits)
+    let err = dsv2_lite_router_logits_into(&ctx, hidden.as_ref(), &gate, &mut logits)
         .expect_err("inflated gate metadata must fail before CUDA launch");
     assert_error_contains(&err, "router gate backing buffer too small");
 }
@@ -386,12 +386,18 @@ fn decode_attention_rejects_inflated_q_metadata() {
     let mut out = hidden_fixture(&ctx, 2);
     let mut key_cache = ctx
         .stream
-        .alloc_zeros::<f32>(cfg.max_seq_len * cfg.num_heads * 4)
+        .alloc_zeros::<bf16>(cfg.max_seq_len * cfg.num_heads * 4)
         .expect("key cache");
     let mut value_cache = ctx
         .stream
-        .alloc_zeros::<f32>(cfg.max_seq_len * cfg.num_heads * cfg.v_head_dim)
+        .alloc_zeros::<bf16>(cfg.max_seq_len * cfg.num_heads * cfg.v_head_dim)
         .expect("value cache");
+    let slot_ids = ctx.stream.clone_htod(&[0i32]).expect("slot ids H2D");
+    let positions = ctx.stream.clone_htod(&[0i32]).expect("positions H2D");
+    let rope_cos_sin = ctx
+        .stream
+        .alloc_zeros::<bf16>(cfg.max_seq_len * cfg.qk_rope_head_dim)
+        .expect("rope table");
 
     let err = dsv2_lite_decode_attention_into(
         &ctx,
@@ -399,7 +405,10 @@ fn decode_attention_rejects_inflated_q_metadata() {
         &q,
         &kv_a,
         &kv_b,
-        0,
+        &slot_ids,
+        &positions,
+        1,
+        &rope_cos_sin,
         &mut key_cache,
         &mut value_cache,
         &mut out,
@@ -422,12 +431,18 @@ fn decode_attention_rejects_inflated_output_metadata() {
     };
     let mut key_cache = ctx
         .stream
-        .alloc_zeros::<f32>(cfg.max_seq_len * cfg.num_heads * 4)
+        .alloc_zeros::<bf16>(cfg.max_seq_len * cfg.num_heads * 4)
         .expect("key cache");
     let mut value_cache = ctx
         .stream
-        .alloc_zeros::<f32>(cfg.max_seq_len * cfg.num_heads * cfg.v_head_dim)
+        .alloc_zeros::<bf16>(cfg.max_seq_len * cfg.num_heads * cfg.v_head_dim)
         .expect("value cache");
+    let slot_ids = ctx.stream.clone_htod(&[0i32]).expect("slot ids H2D");
+    let positions = ctx.stream.clone_htod(&[0i32]).expect("positions H2D");
+    let rope_cos_sin = ctx
+        .stream
+        .alloc_zeros::<bf16>(cfg.max_seq_len * cfg.qk_rope_head_dim)
+        .expect("rope table");
 
     let err = dsv2_lite_decode_attention_into(
         &ctx,
@@ -435,7 +450,10 @@ fn decode_attention_rejects_inflated_output_metadata() {
         &q,
         &kv_a,
         &kv_b,
-        0,
+        &slot_ids,
+        &positions,
+        1,
+        &rope_cos_sin,
         &mut key_cache,
         &mut value_cache,
         &mut out,
@@ -637,8 +655,7 @@ fn tiny_attention_config() -> Dsv2LiteAttentionConfig {
         kv_lora_rank: 1,
         max_seq_len: 2,
         rms_norm_eps: 1.0e-6,
-        rope_theta: 10_000.0,
-        rope_scaling: None,
+        softmax_scale: 0.5,
     }
 }
 
@@ -669,4 +686,71 @@ fn assert_error_contains(err: &anyhow::Error, needle: &str) {
         message.contains(needle),
         "expected error containing {needle:?}, got {message:?}"
     );
+}
+
+#[test]
+fn device_routed_router_matches_host_at_supported_boundaries() {
+    let ctx = DeviceContext::new().expect("create CUDA context");
+    let mut config = test_lite_config();
+    config.n_routed_experts = 64;
+    config.num_experts_per_token = 6;
+    for batch in [1, 4, 8] {
+        for fixture in 0..3 {
+            let logits: Vec<_> = (0..batch)
+                .flat_map(|token| {
+                    (0..config.n_routed_experts).map(move |expert| match fixture {
+                        0 => ((expert * 37 + token * 13) % 101) as f32 / 17.0 - 3.0,
+                        1 => 0.0,
+                        _ if expert < 5 => 10.0 - expert as f32,
+                        _ if expert == 5 => 1.0,
+                        _ if expert == 6 => 1.0 + 1.0e-5,
+                        _ => -(expert as f32),
+                    })
+                })
+                .collect();
+            let expected = topk_softmax_routes(&config, &logits, batch);
+            let logits = ctx.stream.clone_htod(&logits).expect("logits H2D");
+            let mut ids = ctx
+                .stream
+                .alloc_zeros::<i32>(batch * config.num_experts_per_token)
+                .unwrap();
+            let mut weights = ctx
+                .stream
+                .alloc_zeros::<f32>(batch * config.num_experts_per_token)
+                .unwrap();
+            let mut errors = ctx.stream.alloc_zeros::<i32>(batch).unwrap();
+            let mut summary = ctx.stream.alloc_zeros::<u64>(5).unwrap();
+            pegainfer_kernels::ops::dsv2_lite_route_logits_into(
+                &ctx,
+                &logits,
+                batch,
+                1,
+                &mut Dsv2LiteRouterOutput {
+                    topk_idx: &mut ids,
+                    topk_weight: &mut weights,
+                },
+                &mut errors,
+                &mut summary,
+            )
+            .expect("device routed router");
+            let ids = ctx.stream.clone_dtoh(&ids).unwrap();
+            let weights = ctx.stream.clone_dtoh(&weights).unwrap();
+            let errors = ctx.stream.clone_dtoh(&errors).unwrap();
+            let summary = ctx.stream.clone_dtoh(&summary).unwrap();
+            ctx.sync().unwrap();
+            for (token, routes) in expected.iter().enumerate() {
+                for (route, &(expert, weight)) in routes.iter().enumerate() {
+                    let slot = token * config.num_experts_per_token + route;
+                    assert_eq!(
+                        ids[slot], expert as i32,
+                        "batch={batch}, fixture={fixture}, slot={slot}"
+                    );
+                    assert_close(weights[slot], weight, 1.0e-6);
+                }
+            }
+            assert!(errors.iter().all(|&error| error == 0));
+            assert_eq!(summary[3], 0);
+            assert_ne!(summary[4], 0);
+        }
+    }
 }

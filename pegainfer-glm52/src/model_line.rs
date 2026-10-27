@@ -222,7 +222,7 @@ impl ModelLine for Glm52Line {
         Ok(ServePlan {
             scheduler_partition_count,
             prefill_only: cli.glm52_prefill_only,
-            lora_modules: None,
+            ..ServePlan::default()
         })
     }
 

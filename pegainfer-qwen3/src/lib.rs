@@ -17,6 +17,7 @@ mod prefill;
 mod projection_fusion;
 mod scheduler;
 mod sizing;
+mod spec_env;
 mod speculative;
 mod split_kv;
 mod unified_forward;
@@ -414,6 +415,7 @@ fn start_engine_with_offload_inner(
     dflash_draft_model_path: Option<&Path>,
     dump_graph_png: Option<&Path>,
 ) -> Result<Engine> {
+    crate::spec_env::validate()?;
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
@@ -465,6 +467,7 @@ pub fn start_engine_with_lora_control(
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
 ) -> Result<Engine> {
+    crate::spec_env::validate()?;
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,

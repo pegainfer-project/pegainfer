@@ -1,4 +1,5 @@
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cublas_v2.h>
 #include <cuda.h>
@@ -42,7 +43,8 @@ __global__ void router_scores_topk_normalize_kernel(
   if (expert < n_experts) {
     float score = 1.0f / (1.0f + expf(-logits[token * n_experts + expert]));
     scores[tid] = score;
-    choice_scores[tid] = score + e_score_correction_bias[expert];
+    const float choice = score + e_score_correction_bias[expert];
+    choice_scores[tid] = isnan(choice) ? -CUDART_INF_F : choice;
   } else {
     scores[tid] = 0.0f;
     choice_scores[tid] = -CUDART_INF_F;
@@ -51,9 +53,11 @@ __global__ void router_scores_topk_normalize_kernel(
   __syncthreads();
 
   float selected_sum = 0.0f;
+  bool picked = false;
   for (int route = 0; route < topk; ++route) {
-    reduce_values[tid] = choice_scores[tid];
-    reduce_indices[tid] = expert < n_experts ? expert : n_experts;
+    // A picked expert competes as padding, so it loses even to an all -inf row.
+    reduce_values[tid] = picked ? -CUDART_INF_F : choice_scores[tid];
+    reduce_indices[tid] = expert < n_experts && !picked ? expert : n_experts;
     __syncthreads();
 
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -67,6 +71,7 @@ __global__ void router_scores_topk_normalize_kernel(
       }
       __syncthreads();
     }
+    picked = picked || reduce_indices[0] == expert;
 
     if (tid == 0) {
       const int best_idx = reduce_indices[0];
@@ -75,9 +80,6 @@ __global__ void router_scores_topk_normalize_kernel(
       topk_idx[token * topk + route] = best_idx;
       topk_weight[token * topk + route] = route_score;
       selected_sum += route_score;
-      if (best_idx < n_experts) {
-        choice_scores[best_idx] = -CUDART_INF_F;
-      }
     }
     __syncthreads();
   }
@@ -88,16 +90,6 @@ __global__ void router_scores_topk_normalize_kernel(
       topk_weight[token * topk + route] = selected_scores[route] * scale;
     }
   }
-}
-
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
 }
 
 CUresult consume_last_cuda_error() {

@@ -30,8 +30,8 @@ fn request(
             max_tokens,
             lora_adapter: None,
             token_tx,
-            logprobs: 0,
-            echo: false,
+            logprobs: None,
+            prompt_logprobs: None,
         },
         token_rx,
     )
@@ -61,7 +61,7 @@ fn active_state(
         generated,
         last_token,
         finish_policy: FinishPolicy {
-            eos_token_id: config.eos_token_id,
+            eos_token_ids: config.eos_token_ids.clone(),
             ignore_eos: false,
         },
         cache: DecodeCache::new(config),
@@ -82,7 +82,7 @@ fn admission_rejects_unsupported_shapes() {
     ));
 
     let (mut logprobs, _rx) = request("logprobs", 1, 1);
-    logprobs.logprobs = 1;
+    logprobs.logprobs = Some(1);
     assert!(matches!(
         admission_decision(&logprobs, context),
         AdmissionDecision::Reject(message) if message.contains("logprobs")
@@ -147,7 +147,7 @@ fn terminal_requests_do_not_wait_for_active_capacity() {
     let mut pending = VecDeque::new();
     pending.push_back(request("zero", 2, 0).0);
     let (mut invalid, _rx) = request("invalid", 2, 1);
-    invalid.logprobs = 1;
+    invalid.logprobs = Some(1);
     pending.push_back(invalid);
     pending.push_back(request("valid", 2, 1).0);
 
@@ -166,7 +166,7 @@ fn terminal_requests_do_not_wait_for_active_capacity() {
 fn invalid_request_does_not_block_later_admission_when_cap_has_room() {
     let mut pending = VecDeque::new();
     let (mut invalid, _rx) = request("invalid", 2, 1);
-    invalid.logprobs = 1;
+    invalid.logprobs = Some(1);
     pending.push_back(invalid);
     pending.push_back(request("valid", 2, 1).0);
 
@@ -181,10 +181,8 @@ fn invalid_request_does_not_block_later_admission_when_cap_has_room() {
 
 #[test]
 fn terminal_admission_events_keep_scheduler_contract() {
-    let (mut zero, mut zero_rx) = request("zero", 2, 0);
-    zero.echo = true;
+    let (zero, mut zero_rx) = request("zero", 2, 0);
     assert!(send_scheduled(&zero).is_ok());
-    assert!(send_prompt_echo(&zero));
     let _ = zero.token_tx.send(TokenEvent::Finished {
         finish_reason: FinishReason::Length,
         prompt_tokens: zero.prompt_tokens.len(),
@@ -194,10 +192,6 @@ fn terminal_admission_events_keep_scheduler_contract() {
     assert!(matches!(
         recv_event(&mut zero_rx),
         TokenEvent::Scheduled { .. }
-    ));
-    assert!(matches!(
-        recv_event(&mut zero_rx),
-        TokenEvent::PromptTokens { ids, .. } if ids == vec![1, 1]
     ));
     assert!(matches!(
         recv_event(&mut zero_rx),
@@ -300,7 +294,7 @@ fn eos_retirement_is_independent_per_request() {
     let mut stop_state = active_state("stop", tx_stop, 3, 1, 10, &config);
     let mut live_state = active_state("live", tx_live, 2, 1, 11, &config);
 
-    assert!(stop_state.emit_token_or_finish(config.eos_token_id, 2, 0));
+    assert!(stop_state.emit_token_or_finish(config.eos_token_ids[0], 2, 0));
     assert!(!live_state.emit_token_or_finish(12, 2, 0));
 
     match recv_event(&mut rx_stop) {
@@ -333,7 +327,7 @@ fn batch_decoded_tokens_retire_eos_independently() {
     let survivors = apply_decoded_tokens_to_rows(
         vec![0, 1],
         vec![stop_state, live_state],
-        vec![config.eos_token_id, 12],
+        vec![config.eos_token_ids[0], 12],
         &mut active_remaining,
         0,
     );
@@ -470,7 +464,11 @@ fn cross_group_terminal_accounting_uses_shared_active_remaining() {
     );
     assert_eq!(active_remaining, 1);
 
-    assert!(third.emit_token_or_finish(config.eos_token_id, active_remaining.saturating_sub(1), 0));
+    assert!(third.emit_token_or_finish(
+        config.eos_token_ids[0],
+        active_remaining.saturating_sub(1),
+        0
+    ));
     active_remaining = active_remaining.saturating_sub(1);
     assert_eq!(active_remaining, 0);
 
@@ -584,7 +582,9 @@ fn terminal_reason_labels_are_machine_readable() {
         2,
         0,
         FinishReason::Error,
-        Some("DeepSeek-V2-Lite EP=2 mixed serving gate does not return logprobs yet"),
+        Some(
+            "DeepSeek-V2-Lite EP=2 mixed serving gate does not return completion or prompt logprobs yet",
+        ),
     );
     assert_eq!(rejected["terminal_reason"], "rejected");
 
@@ -686,7 +686,12 @@ fn take_decode_position_groups_preserves_original_indices() {
 
     assert!(active.is_empty());
     assert_eq!(groups.len(), 2);
-    assert_eq!(groups[0].position, 4);
+    assert!(
+        groups[0]
+            .rows
+            .iter()
+            .all(|(_, state)| state.next_decode_position() == 4)
+    );
     assert_eq!(
         groups[0]
             .rows
@@ -695,7 +700,7 @@ fn take_decode_position_groups_preserves_original_indices() {
             .collect::<Vec<_>>(),
         vec![0, 2]
     );
-    assert_eq!(groups[1].position, 5);
+    assert_eq!(groups[1].rows[0].1.next_decode_position(), 5);
     assert_eq!(
         groups[1]
             .rows

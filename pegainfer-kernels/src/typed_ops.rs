@@ -8,6 +8,7 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
+use crate::ops::ffi_status_detail;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::GpuTensor;
@@ -495,13 +496,10 @@ fn launch_gemm(
             )
         };
         if status != 0 {
-            if status >= 100_000 {
-                anyhow::bail!(
-                    "cuBLAS GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",
-                    status - 100_000
-                );
-            }
-            anyhow::bail!("CUDA GEMM launch failed: cuda_status={status}, m={m}, n={n}, k={k}");
+            anyhow::bail!(
+                "GEMM failed: {}, m={m}, n={n}, k={k}",
+                ffi_status_detail(status)
+            );
         }
     }
     Ok(())

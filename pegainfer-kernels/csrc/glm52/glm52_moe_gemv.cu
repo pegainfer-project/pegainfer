@@ -16,6 +16,7 @@
 // fills the single grid column with 1 row/warp.
 
 #include "../common.cuh"  // warp_reduce_sum
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -40,14 +41,6 @@ constexpr int kRowsPlainShortKHopper = 4;  // k <= 2048, measured on SM90
 constexpr int kRowsPlainBlackwell    = 1;  // all K, measured on SM103
 constexpr int kRowsPlainLongK        = 1;  // k > 2048 on every architecture
 
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer)
-    return CUDA_ERROR_INVALID_VALUE;
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
 // The activation is read with 16-byte float4/uint4 loads straight from global (no shared

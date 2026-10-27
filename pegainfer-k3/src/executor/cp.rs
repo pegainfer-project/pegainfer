@@ -292,14 +292,14 @@ impl K3CpGroup {
         record_event(ctx, events[me].0).context("K3 CP publish event record failed")?;
         self.published[me].store(window, Ordering::Release);
         for rank in kind.reads_from(me) {
-            self.await_announce(&self.published[rank], window, rank, "publish")?;
+            Self::await_announce(&self.published[rank], window, rank, "publish")?;
             wait_event(ctx, events[rank].0).context("K3 CP publish event wait failed")?;
         }
         consume()?;
         record_event(ctx, events[me].1).context("K3 CP consume event record failed")?;
         self.consumed[me].store(window, Ordering::Release);
         for rank in kind.read_by(me, self.cp_size) {
-            self.await_announce(&self.consumed[rank], window, rank, "consume")?;
+            Self::await_announce(&self.consumed[rank], window, rank, "consume")?;
             wait_event(ctx, events[rank].1).context("K3 CP consume event wait failed")?;
         }
         Ok(())
@@ -308,13 +308,7 @@ impl K3CpGroup {
     /// Spin until `counter` reaches `window` — waiting on a peer *thread*'s
     /// enqueue progress, never on a device. A peer that stops announcing has
     /// died mid-protocol; time out instead of hanging the gang.
-    fn await_announce(
-        &self,
-        counter: &AtomicU64,
-        window: u64,
-        rank: usize,
-        stage: &str,
-    ) -> Result<()> {
+    fn await_announce(counter: &AtomicU64, window: u64, rank: usize, stage: &str) -> Result<()> {
         if counter.load(Ordering::Acquire) >= window {
             return Ok(());
         }
@@ -322,7 +316,7 @@ impl K3CpGroup {
         let mut lap = 0u32;
         while counter.load(Ordering::Acquire) < window {
             lap = lap.wrapping_add(1);
-            if lap % 1024 == 0 {
+            if lap.is_multiple_of(1024) {
                 ensure!(
                     Instant::now() < deadline,
                     "K3 CP rank {rank} never announced its {stage} for exchange window \
@@ -447,8 +441,8 @@ pub fn k3_whale_admits(total: usize, width: usize, chunk_tokens: usize) -> bool 
 /// owner is the last CP rank, so the final KDA state and the whole MLA
 /// context land on the rank that will decode.
 pub fn k3_whale_gang(poster: usize, width: usize, world: usize) -> Vec<usize> {
-    debug_assert!(poster < world && width <= world);
     const TRAY: usize = 4;
+    debug_assert!(poster < world && width <= world);
     let start = if width >= TRAY {
         (poster / TRAY * TRAY).min(world.saturating_sub(width))
     } else {
@@ -513,7 +507,7 @@ pub fn k3_whale_segments(total: usize, width: usize, chunk_tokens: usize) -> Vec
     let mut hi = per * (1.0 + K3_CP_QUAD_PER_LINEAR * total as f64);
     let mut lo = 0.0f64;
     for _ in 0..64 {
-        let mid = (lo + hi) / 2.0;
+        let mid = f64::midpoint(lo, hi);
         if coverage(mid) >= total {
             hi = mid;
         } else {
@@ -988,7 +982,7 @@ mod tests {
 
     #[test]
     fn width_covers_256k_at_ep16() {
-        assert_eq!(k3_whale_width(262144, 16, CHUNK), Some(16));
+        assert_eq!(k3_whale_width(262_144, 16, CHUNK), Some(16));
     }
 
     #[test]
@@ -1005,7 +999,7 @@ mod tests {
 
     #[test]
     fn width_is_the_widest_admitting_power_of_two() {
-        for total in [8192usize, 12288, 16384, 32768, 65536, 131072, 262144] {
+        for total in [8192usize, 12288, 16384, 32768, 65536, 131_072, 262_144] {
             let width = k3_whale_width(total, 16, CHUNK)
                 .unwrap_or_else(|| panic!("{total} tokens should admit some width"));
             assert!(k3_whale_admits(total, width, CHUNK), "{total} @ {width}");
@@ -1019,7 +1013,7 @@ mod tests {
 
     #[test]
     fn segments_partition_exactly_and_level_downward() {
-        for (total, width) in [(262144usize, 16usize), (65536, 8), (12288, 4), (8192, 2)] {
+        for (total, width) in [(262_144_usize, 16usize), (65536, 8), (12288, 4), (8192, 2)] {
             let segments = k3_whale_segments(total, width, CHUNK);
             assert_eq!(segments.len(), width, "{total} @ {width}");
             let mut expected_start = 0;
@@ -1044,7 +1038,7 @@ mod tests {
         // (the measured ~900ms TTFT step at 65k over 8 ranks, where pure
         // leveling pushed the head from a mean of 8,140 past 8,448). Every
         // segment must sit in the mean's bucket.
-        for (total, width) in [(65116usize, 8usize), (66000, 8), (33000, 8), (131072, 16)] {
+        for (total, width) in [(65116usize, 8usize), (66000, 8), (33000, 8), (131_072, 16)] {
             let cap = pegainfer_kernels::ops::k3_chunk_bucket(total.div_ceil(width)).unwrap();
             let segments = k3_whale_segments(total, width, CHUNK);
             assert_eq!(segments.iter().map(|&(_, len)| len).sum::<usize>(), total);
@@ -1062,7 +1056,7 @@ mod tests {
     fn segments_leveling_bites_at_depth() {
         // At 256k the last rank's MLA triangle is ~2/3 of its walk; an even
         // split would park the whole fleet on its tail.
-        let segments = k3_whale_segments(262144, 16, CHUNK);
+        let segments = k3_whale_segments(262_144, 16, CHUNK);
         let first = segments.first().unwrap().1;
         let last = segments.last().unwrap().1;
         assert!(

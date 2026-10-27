@@ -1,4 +1,5 @@
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cuda_fp8.h>
@@ -178,16 +179,6 @@ __global__ void silu_and_mul_per_token_group_quant_bf16_k128_masked_kernel(
     }
     __syncthreads();
   }
-}
-
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
 }
 
 // f32 mn-major scales [groups, scale_cols, cap] → packed UE8M0 i32

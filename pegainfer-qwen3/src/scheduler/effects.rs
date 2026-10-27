@@ -7,6 +7,7 @@
 //! resolve logic stay a pure function of executor results.
 
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
 use pegainfer_frontend::engine::TokenLogprob;
 
 use super::ActiveRequestState;
@@ -27,15 +28,12 @@ pub(crate) struct PromptEchoEffect {
 }
 
 pub(crate) enum PendingEffect {
-    Finish {
-        request_id: RequestId,
-        finish_reason: FinishReason,
-    },
     EmitAndFinish {
         request_id: RequestId,
         token: u32,
         logprob: Option<TokenLogprob>,
         finish_reason: FinishReason,
+        stop_cause: Option<StopCause>,
     },
     Promote {
         state: ActiveRequestState,
@@ -50,15 +48,12 @@ pub(crate) enum PendingEffect {
 pub(crate) enum DecodeEffect {
     Finish {
         request_id: RequestId,
-        finish_reason: FinishReason,
-    },
-    EmitAndFinish {
-        request_id: RequestId,
         token: u32,
         logprob: Option<TokenLogprob>,
         finish_reason: FinishReason,
+        stop_cause: Option<StopCause>,
     },
-    EmitAndContinue {
+    Continue {
         request_id: RequestId,
         token: u32,
         logprob: Option<TokenLogprob>,
@@ -68,17 +63,18 @@ pub(crate) enum DecodeEffect {
         completion_tokens: usize,
     },
     /// Commit several accepted speculative tokens and keep the request running.
-    EmitManyAndContinue {
+    ContinueMany {
         request_id: RequestId,
         tokens: Vec<u32>,
         completion_tokens: usize,
     },
     /// Commit several accepted speculative tokens, then finish — a stop token or
     /// the max-output budget was hit partway through the accepted span.
-    EmitManyAndFinish {
+    FinishMany {
         request_id: RequestId,
         tokens: Vec<u32>,
         finish_reason: FinishReason,
+        stop_cause: Option<StopCause>,
     },
 }
 

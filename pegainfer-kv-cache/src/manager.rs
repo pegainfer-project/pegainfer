@@ -65,6 +65,21 @@ impl KvCacheManager {
         Ok(Self { pool, buffer })
     }
 
+    /// Pair an existing physical KV buffer with a new logical block pool.
+    ///
+    /// `num_blocks` may be smaller than the physical allocation. Tensor-parallel
+    /// executors use this to choose the minimum common logical capacity across
+    /// rank-local buffers while keeping one shared page-id namespace.
+    pub fn from_buffer(buffer: KvBuffer, num_blocks: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            num_blocks <= buffer.num_blocks(),
+            "logical KV block count {num_blocks} exceeds physical buffer capacity {}",
+            buffer.num_blocks()
+        );
+        let pool = BlockPool::new(buffer.layout().page_size, num_blocks)?;
+        Ok(Self { pool, buffer })
+    }
+
     /// Like [`new`](Self::new) but the pool emits KV block events; returns the
     /// receiver to drain. See [`BlockPool::with_events`].
     pub fn new_with_events(
