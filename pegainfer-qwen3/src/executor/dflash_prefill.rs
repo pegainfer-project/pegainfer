@@ -10,8 +10,9 @@
 use super::PrefillStepItem;
 use super::RequestId;
 
-/// Whether a prefill request is eligible to capture DFlash target context.
-fn dflash_prefill_supported(req: &PrefillStepItem) -> bool {
+/// Whether a prefill produces clean target hidden states to seed a drafter
+/// (DFlash and EAGLE-3 alike).
+pub(super) fn prefill_capture_supported(req: &PrefillStepItem) -> bool {
     req.lora_adapter.is_none()
         && req.cached_tokens == 0
         && req.logprobs.is_none()
@@ -24,7 +25,7 @@ pub(super) fn dflash_prefill_can_capture(
     req: &PrefillStepItem,
     pending_state_exists: bool,
 ) -> bool {
-    dflash_prefill_supported(req) && (req.chunk_start == 0 || pending_state_exists)
+    prefill_capture_supported(req) && (req.chunk_start == 0 || pending_state_exists)
 }
 
 /// Capture hidden states during this prefill step iff any request is eligible.

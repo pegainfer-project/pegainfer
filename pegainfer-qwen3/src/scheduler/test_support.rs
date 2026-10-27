@@ -69,6 +69,7 @@ pub(crate) struct FakeExecutor {
     speculative: bool,
     /// Requests the fake reports as NOT having captured draft context.
     not_ready: HashSet<RequestId>,
+    max_draft_batch: Option<usize>,
     async_prefill: Option<Arc<AsyncPrefillGate>>,
     parked_prefill: Option<PrefillResult>,
 }
@@ -93,6 +94,7 @@ impl FakeExecutor {
             emit_logprobs: false,
             speculative: false,
             not_ready: HashSet::new(),
+            max_draft_batch: None,
             async_prefill: None,
             parked_prefill: None,
         }
@@ -149,6 +151,11 @@ impl FakeExecutor {
     /// Report one request as NOT draft-ready (no captured draft context).
     pub(crate) fn with_request_not_ready(mut self, request_id: RequestId) -> Self {
         self.not_ready.insert(request_id);
+        self
+    }
+
+    pub(crate) fn with_max_draft_batch(mut self, limit: usize) -> Self {
+        self.max_draft_batch = Some(limit);
         self
     }
 
@@ -246,6 +253,10 @@ impl ModelExecutor for FakeExecutor {
 
     fn speculative_request_ready(&self, request_id: RequestId) -> bool {
         self.speculative && !self.not_ready.contains(&request_id)
+    }
+
+    fn max_draft_batch(&self) -> Option<usize> {
+        self.max_draft_batch
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {

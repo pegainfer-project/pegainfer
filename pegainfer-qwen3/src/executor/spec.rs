@@ -180,7 +180,7 @@ impl Qwen3Executor {
             }
             if std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
                 log::debug!(
-                    "Qwen3 DFlash commit round={} request={} accepted_len={}",
+                    "Qwen3 speculative commit round={} request={} accepted_len={}",
                     verify_round,
                     req_result.request_id,
                     req_result.accepted_tokens.len(),

@@ -10,9 +10,10 @@
 //!
 //! This module owns the shared half. The draft/verify boundary is a **pure
 //! token span** — a model proposer's hidden states never cross it; they stay
-//! inside the proposer (see [`crate::dflash`]). DFlash is the only proposer
-//! today and is kept concrete; a proposer trait is deferred until a second
-//! implementation (n-gram / EAGLE) validates the shape.
+//! inside the proposer (see [`crate::dflash`] and [`crate::eagle3`]). Both
+//! proposers seed from target hidden states captured at prefill and verify,
+//! so they share the capture, the ready set and this transaction; only the
+//! worker lane that turns captures into drafts differs.
 //!
 //! Acceptance is [`accept_prefix_match`] for greedy and sampled requests alike
 //! (#512, the sampled-verify mechanism GLM5.2 landed in #589): the verify
@@ -28,6 +29,13 @@ use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::executor::RequestId;
+
+/// The drafter a speculative engine loads, by checkpoint path.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DraftModel<'a> {
+    DFlash(&'a str),
+    Eagle3(&'a str),
+}
 
 /// One request's verify span: the current dangling token followed by the draft
 /// candidates (`token_ids[0]` is the confirmed last token, `token_ids[1..]` are

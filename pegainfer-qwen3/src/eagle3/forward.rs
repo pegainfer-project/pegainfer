@@ -1,9 +1,12 @@
 use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use half::bf16;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kernels::ops::argmax_batch_bf16_split_partials_len;
+use pegainfer_kernels::ops::argmax_bf16_split_into;
 
 use super::Eagle3DraftModel;
 use crate::weights::Qwen3Model;
@@ -28,20 +31,14 @@ pub(crate) struct Eagle3RequestState {
     last_aux_hidden_states: Option<HiddenStates>,
 }
 
-impl Eagle3RequestState {
-    pub(crate) fn cached_len(&self) -> usize {
-        self.cached_len
-    }
-
-    /// The boundary target feature `[3 * hidden, 1]` (`None` until captured).
-    pub(crate) fn last_aux_hidden_states(&self) -> Option<&HiddenStates> {
-        self.last_aux_hidden_states.as_ref()
-    }
-}
-
 /// Single-token draft scratch (`seq_len == 1` everywhere). v1 runs one request,
 /// one token at a time — batching the draft chain is a follow-up
 pub(crate) struct Eagle3Scratch {
+    // Device argmax over `logits`: only the picked id crosses to the host.
+    argmax_partial_values: CudaSlice<f32>,
+    argmax_partial_indices: CudaSlice<i32>,
+    argmax_value: CudaSlice<bf16>,
+    argmax_index: CudaSlice<i32>,
     token_id_d: CudaSlice<u32>,
     embed: HiddenStates,         // [hidden, 1]
     hidden: HiddenStates,        // [hidden, 1] residual stream
@@ -69,40 +66,6 @@ impl Eagle3DraftModel {
 
     fn kv_dim(&self) -> usize {
         self.midlayer.kv_dim
-    }
-
-    /// Assert a request state was allocated for this drafter's geometry.
-    fn ensure_state_geometry(&self, state: &Eagle3RequestState) -> Result<()> {
-        let kv_dim = self.kv_dim();
-        anyhow::ensure!(
-            state.k.hidden_dim == kv_dim && state.v.hidden_dim == kv_dim,
-            "EAGLE-3 request-state K/V dim [{}, {}] does not match drafter kv_dim {}",
-            state.k.hidden_dim,
-            state.v.hidden_dim,
-            kv_dim
-        );
-        Ok(())
-    }
-
-    /// Assert a scratch buffer set was allocated for this drafter's geometry.
-    fn ensure_scratch_geometry(&self, scratch: &Eagle3Scratch) -> Result<()> {
-        let hidden = self.config.hidden_size;
-        let q_dim = self.q_dim();
-        let kv_dim = self.kv_dim();
-        let inter = self.config.intermediate_size;
-        let vocab = self.config.draft_vocab_size;
-        anyhow::ensure!(
-            scratch.q.hidden_dim == q_dim
-                && scratch.k.hidden_dim == kv_dim
-                && scratch.v.hidden_dim == kv_dim
-                && scratch.attn_input.hidden_dim == 2 * hidden
-                && scratch.hidden.hidden_dim == hidden
-                && scratch.gate.hidden_dim == inter
-                && scratch.logits.hidden_dim == vocab,
-            "EAGLE-3 scratch geometry does not match drafter \
-             (hidden {hidden}, q_dim {q_dim}, kv_dim {kv_dim}, inter {inter}, vocab {vocab})"
-        );
-        Ok(())
     }
 
     /// Allocate the single-layer K/V cache for one request. `max_cache_len` bounds
@@ -136,7 +99,12 @@ impl Eagle3DraftModel {
         let q_dim = self.q_dim();
         let kv_dim = self.kv_dim();
         let inter = self.config.intermediate_size;
+        let partials = argmax_batch_bf16_split_partials_len(1, self.config.draft_vocab_size);
         Ok(Eagle3Scratch {
+            argmax_partial_values: ctx.stream.alloc_zeros(partials)?,
+            argmax_partial_indices: ctx.stream.alloc_zeros(partials)?,
+            argmax_value: ctx.stream.alloc_zeros(1)?,
+            argmax_index: ctx.stream.alloc_zeros(1)?,
             token_id_d: ctx.stream.alloc_zeros(1)?,
             embed: HiddenStates::zeros(ctx, hidden, 1)?,
             hidden: HiddenStates::zeros(ctx, hidden, 1)?,
@@ -158,29 +126,6 @@ impl Eagle3DraftModel {
         })
     }
 
-    /// Fuse the draft's input hidden from target context features (test helper).
-    pub(crate) fn fuse_input_hidden_from_context(
-        &self,
-        ctx: &DeviceContext,
-        context_features: &HiddenStates,
-        scratch: &mut Eagle3Scratch,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            context_features.hidden_dim == self.fc_input_dim(),
-            "EAGLE-3 context feature dim {} does not match fc input {}",
-            context_features.hidden_dim,
-            self.fc_input_dim()
-        );
-        anyhow::ensure!(
-            context_features.seq_len == 1,
-            "EAGLE-3 input-hidden fuse expects one position, got {}",
-            context_features.seq_len
-        );
-        self.ensure_scratch_geometry(scratch)?;
-        ops::gemm_into(ctx, &self.fc, context_features, &mut scratch.hidden);
-        Ok(())
-    }
-
     fn fc_input_dim(&self) -> usize {
         // fc: [hidden, 3 * hidden] , 3 * hidden for fuser input
         self.fc.cols
@@ -188,14 +133,15 @@ impl Eagle3DraftModel {
 
     /// One EAGLE-3 draft step: consume `token_id` (the current token) and the
     /// residual stream in `scratch.hidden`, update `scratch.hidden` as output
-    pub(crate) fn draft_step<'s>(
+    /// and leave the draft logits in `scratch.logits`.
+    fn draft_step(
         &self,
         target: &Qwen3Model,
         state: &mut Eagle3RequestState,
-        scratch: &'s mut Eagle3Scratch,
+        scratch: &mut Eagle3Scratch,
         token_id: u32,
         position: usize,
-    ) -> Result<&'s HiddenStates> {
+    ) -> Result<()> {
         let ctx = target.device_ctx();
         let hidden = self.config.hidden_size;
         let q_dim = self.q_dim();
@@ -218,17 +164,14 @@ impl Eagle3DraftModel {
             position,
             state.cached_len
         );
-        self.ensure_state_geometry(state)?;
-        self.ensure_scratch_geometry(scratch)?;
 
-        // 1. Embed the current token (reuses the target's embed_tokens).
+        // The drafter ships no embedding; it reuses the target's.
         {
             let mut dst = scratch.token_id_d.slice_mut(..1);
             ctx.stream.memcpy_htod(&[token_id], &mut dst)?;
         }
         target.get_embeddings_batch_into(&scratch.token_id_d, &mut scratch.embed)?;
 
-        // 2. Norm the embedding and the fused hidden separately.
         ops::rms_norm_batch_into(
             ctx,
             &scratch.embed,
@@ -244,11 +187,10 @@ impl Eagle3DraftModel {
             &mut scratch.normed_hidden,
         );
 
-        // 3. attn_input = [normed_embed (rows 0..hidden) | normed_hidden (rows hidden..2h)].
+        // attn_input = [normed_embed (rows 0..hidden) | normed_hidden (rows hidden..2h)].
         ops::copy_hidden_rows_into(ctx, &scratch.normed_embed, &mut scratch.attn_input, 0)?;
         ops::copy_hidden_rows_into(ctx, &scratch.normed_hidden, &mut scratch.attn_input, hidden)?;
 
-        // 4. q/k/v projections (qkv_proj input is 2 * hidden).
         ops::gemm_rows_into(
             ctx,
             &self.midlayer.qkv_proj,
@@ -274,7 +216,7 @@ impl Eagle3DraftModel {
             &mut scratch.v,
         );
 
-        // 5. Plain RoPE (no QK-norm) on the single q/k token at `position`.
+        // Plain RoPE: the midlayer has no QK-norm.
         ops::eagle3_rope_into(
             ctx,
             &mut scratch.q,
@@ -290,13 +232,10 @@ impl Eagle3DraftModel {
             position,
         )?;
 
-        // 6. Append the rotated K/V into the cache at `position`.
         ops::copy_hidden_token_range_into(ctx, &scratch.k, 0, &mut state.k, position, 1)?;
         ops::copy_hidden_token_range_into(ctx, &scratch.v, 0, &mut state.v, position, 1)?;
         let kv_len = position + 1;
 
-        // 7. Attention: single-query decode — the one draft query attends the whole
-        // [0, kv_len) prefix of the draft's contiguous KV.
         ops::single_decode_nhd_into(
             ctx,
             &scratch.q,
@@ -309,7 +248,6 @@ impl Eagle3DraftModel {
             kv_len,
         )?;
 
-        // 8. Output projection.
         ops::gemm_into(
             ctx,
             &self.midlayer.o_proj,
@@ -317,7 +255,6 @@ impl Eagle3DraftModel {
             &mut scratch.o,
         );
 
-        // 9. Residual + post-attention norm (hidden += o in place; normed_post = norm(hidden)).
         pegainfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             ctx,
             &mut scratch.hidden,
@@ -327,7 +264,6 @@ impl Eagle3DraftModel {
             &mut scratch.normed_post,
         )?;
 
-        // 10. MLP (SwiGLU).
         ops::gemm_rows_into(
             ctx,
             &self.midlayer.gate_up_proj,
@@ -352,7 +288,6 @@ impl Eagle3DraftModel {
             &mut scratch.mlp_out,
         );
 
-        // 11. Residual + final norm.
         pegainfer_kernels::ops::fused_add_rms_norm_round_batch_into(
             ctx,
             &mut scratch.hidden,
@@ -362,7 +297,6 @@ impl Eagle3DraftModel {
             &mut scratch.normed_final,
         )?;
 
-        // 12. Draft head over the reduced vocabulary.
         ops::gemm_into(
             ctx,
             &self.lm_head,
@@ -371,25 +305,23 @@ impl Eagle3DraftModel {
         );
 
         state.cached_len = kv_len;
-        Ok(&scratch.logits)
+        Ok(())
     }
 
-    /// Teacher-forced prefill for EAGLE Draft
-    /// Returns `(logits [draft_vocab, N], last_hidden [hidden, 1])`
-    /// Buffers are allocated inline (prefill is one-shot, `N` varies). Does not use
-    /// the single-token `Eagle3Scratch`. `tokens[i]` sits at `start_position + i`.
-    ///
-    /// NOTE: the returned `(logits, last_hidden)` is not consumed yet — the current
-    /// callers only need the KV/boundary side effects. It is reserved for the
-    /// scheduler PR that drives prompt prefill (first-token logits / chain input hidden).
-    pub(crate) fn prefill_batched(
+    /// Teacher-force `N` (feature, token) pairs into the draft KV at
+    /// `[start_position, start_position + N)`; `tokens[i]` sits at
+    /// `start_position + i`. Only the K/V persist: the drafter is one layer, so
+    /// the attention and MLP outputs at these positions would feed nothing (the
+    /// next chain step runs the boundary position itself). Buffers are allocated
+    /// inline (`N` varies) and do not use the single-token `Eagle3Scratch`.
+    fn prefill_batched(
         &self,
         target: &Qwen3Model,
         state: &mut Eagle3RequestState,
         features: &HiddenStates,
         tokens: &[u32],
         start_position: usize,
-    ) -> Result<(HiddenStates, HiddenStates)> {
+    ) -> Result<()> {
         let num_tokens = tokens.len();
         anyhow::ensure!(num_tokens > 0, "EAGLE-3 prefill needs tokens");
         anyhow::ensure!(
@@ -413,30 +345,26 @@ impl Eagle3DraftModel {
             num_tokens,
             state.max_cache_len
         );
-        self.ensure_state_geometry(state)?;
 
         let ctx = target.device_ctx();
         let hidden = self.config.hidden_size;
         let q_dim = self.q_dim();
         let kv_dim = self.kv_dim();
-        let inter = self.config.intermediate_size;
         let eps = self.config.rms_norm_eps;
         let num_q = self.config.num_attention_heads;
         let num_kv = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim;
 
-        // 1. Embed all N tokens (reuses the target's embed_tokens).
         let mut token_ids_d = ctx.stream.alloc_zeros::<u32>(num_tokens)?;
         ctx.stream.memcpy_htod(tokens, &mut token_ids_d)?;
         let mut embed = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         target.get_embeddings_batch_into(&token_ids_d, &mut embed)?;
 
-        // 2. Residual stream = fc(per-position target features) — teacher forcing.
-        //    (draft_step gets this as the input hidden in `scratch.hidden` instead.)
+        // Teacher forcing: the input hidden is fc(target features) at every
+        // position, where `draft_step` carries its own residual stream instead.
         let mut residual = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::gemm_into(ctx, &self.fc, features, &mut residual);
 
-        // 3. Norm the embedding and the teacher-forced hidden separately.
         let mut normed_embed = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         let mut normed_hidden = HiddenStates::zeros(ctx, hidden, num_tokens)?;
         ops::rms_norm_batch_into(
@@ -454,12 +382,10 @@ impl Eagle3DraftModel {
             &mut normed_hidden,
         );
 
-        // 4. attn_input = [normed_embed (rows 0..h) | normed_hidden (rows h..2h)].
         let mut attn_input = HiddenStates::zeros(ctx, 2 * hidden, num_tokens)?;
         ops::copy_hidden_rows_into(ctx, &normed_embed, &mut attn_input, 0)?;
         ops::copy_hidden_rows_into(ctx, &normed_hidden, &mut attn_input, hidden)?;
 
-        // 5. q/k/v projections (qkv_proj input is 2 * hidden).
         let mut query = HiddenStates::zeros(ctx, q_dim, num_tokens)?;
         let mut key = HiddenStates::zeros(ctx, kv_dim, num_tokens)?;
         let mut value = HiddenStates::zeros(ctx, kv_dim, num_tokens)?;
@@ -488,7 +414,7 @@ impl Eagle3DraftModel {
             &mut value,
         );
 
-        // 6. Plain RoPE (no QK-norm) on all N q/k at positions [start, start+N).
+        // The kernel rotates q with k; only k is kept.
         ops::eagle3_rope_into(
             ctx,
             &mut query,
@@ -504,7 +430,6 @@ impl Eagle3DraftModel {
             start_position,
         )?;
 
-        // 7. Append all N rotated k/v into the cache at [start, start+N).
         ops::copy_hidden_token_range_into(ctx, &key, 0, &mut state.k, start_position, num_tokens)?;
         ops::copy_hidden_token_range_into(
             ctx,
@@ -514,84 +439,9 @@ impl Eagle3DraftModel {
             start_position,
             num_tokens,
         )?;
-        let kv_len = start_position + num_tokens;
 
-        // 8. One causal attention over the [0, kv_len) prefix.
-        let mut attn_out = HiddenStates::zeros(ctx, q_dim, num_tokens)?;
-        ops::single_prefill_nhd_causal_into(
-            ctx,
-            &query,
-            0,
-            num_tokens,
-            &state.k,
-            &state.v,
-            &mut attn_out,
-            num_q,
-            num_kv,
-            head_dim,
-            kv_len,
-        )?;
-
-        // 9. Output projection.
-        let mut attn_proj = HiddenStates::zeros(ctx, hidden, num_tokens)?;
-        ops::gemm_into(ctx, &self.midlayer.o_proj, &attn_out, &mut attn_proj);
-
-        // 10. residual += attn_proj; normed_post = norm(residual).
-        let mut normed_post = HiddenStates::zeros(ctx, hidden, num_tokens)?;
-        pegainfer_kernels::ops::fused_add_rms_norm_round_batch_into(
-            ctx,
-            &mut residual,
-            &attn_proj,
-            &self.midlayer.post_attention_layernorm,
-            eps,
-            &mut normed_post,
-        )?;
-
-        // 11. MLP (SwiGLU).
-        let mut gate = HiddenStates::zeros(ctx, inter, num_tokens)?;
-        let mut up = HiddenStates::zeros(ctx, inter, num_tokens)?;
-        let mut act = HiddenStates::zeros(ctx, inter, num_tokens)?;
-        ops::gemm_rows_into(
-            ctx,
-            &self.midlayer.gate_up_proj,
-            0,
-            inter,
-            &normed_post,
-            &mut gate,
-        );
-        ops::gemm_rows_into(
-            ctx,
-            &self.midlayer.gate_up_proj,
-            inter,
-            inter,
-            &normed_post,
-            &mut up,
-        );
-        ops::silu_mul_batch_into(ctx, &gate, &up, &mut act)?;
-        let mut mlp_out = HiddenStates::zeros(ctx, hidden, num_tokens)?;
-        ops::gemm_into(ctx, &self.midlayer.down_proj, &act, &mut mlp_out);
-
-        // 12. residual += mlp_out; normed_final = norm(residual).
-        let mut normed_final = HiddenStates::zeros(ctx, hidden, num_tokens)?;
-        pegainfer_kernels::ops::fused_add_rms_norm_round_batch_into(
-            ctx,
-            &mut residual,
-            &mlp_out,
-            &self.norm,
-            eps,
-            &mut normed_final,
-        )?;
-
-        // 13. Draft head over the reduced vocabulary.
-        let mut logits = HiddenStates::zeros(ctx, self.config.draft_vocab_size, num_tokens)?;
-        ops::gemm_into(ctx, &self.lm_head, &normed_final, &mut logits);
-
-        // 14. The last position's decoder output (post-mlp residual) is the chain's input hidden.
-        let mut last_hidden = HiddenStates::zeros(ctx, hidden, 1)?;
-        ops::copy_hidden_token_range_into(ctx, &residual, num_tokens - 1, &mut last_hidden, 0, 1)?;
-
-        state.cached_len = kv_len;
-        Ok((logits, last_hidden))
+        state.cached_len = start_position + num_tokens;
+        Ok(())
     }
 
     /// Build the draft KV for a freshly-prefilled prompt and record the boundary
@@ -660,9 +510,9 @@ impl Eagle3DraftModel {
     /// The drafted token feeds the next step while the drafter's own hidden state
     /// (the residual stream) is updated in place and carried into the next step.
     ///
-    /// Next Step: v1 syncs logits to host per step for the argmax; device-side sampling (like
-    /// DFlash `select_step_tokens`) is a perf follow-up.
-    pub(crate) fn draft_chain(
+    /// The argmax runs on the device, but each step still reads its id back to
+    /// map it through `d2t` on the host, so a round syncs once per draft.
+    fn draft_chain(
         &self,
         target: &Qwen3Model,
         state: &mut Eagle3RequestState,
@@ -687,24 +537,26 @@ impl Eagle3DraftModel {
             state.max_cache_len
         );
         let ctx = target.device_ctx();
-
-        // Initialize the residual stream with the fused target boundary hidden.
         ops::copy_hidden_token_range_into(ctx, fused_target_hidden, 0, &mut scratch.hidden, 0, 1)?;
 
         let mut span = Vec::with_capacity(k);
         let mut token = last_token;
         for i in 0..k {
-            // Scope the logits borrow so the next step can re-borrow `scratch`.
-            let host = {
-                let logits = self.draft_step(target, state, scratch, token, start_position + i)?;
-                logits.to_host(ctx)?
-            };
-            let draft_id = host
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .expect("non-empty draft logits");
+            self.draft_step(target, state, scratch, token, start_position + i)?;
+            argmax_bf16_split_into(
+                ctx,
+                &scratch.logits.data,
+                1,
+                self.config.draft_vocab_size,
+                &mut scratch.argmax_partial_values,
+                &mut scratch.argmax_partial_indices,
+                &mut scratch.argmax_value,
+                &mut scratch.argmax_index,
+            )?;
+            let picked = ctx.stream.clone_dtoh(&scratch.argmax_index)?;
+            ctx.sync()?;
+            let draft_id = usize::try_from(picked[0])
+                .context("EAGLE-3 draft argmax returned a negative id")?;
             let target_id = self
                 .draft_to_target_id(draft_id)
                 .context("EAGLE-3 draft id maps outside target vocab")?;
@@ -747,11 +599,6 @@ impl Eagle3DraftModel {
                 .last_aux_hidden_states
                 .as_ref()
                 .context("EAGLE-3 draft chain has no boundary feature (prompt not captured?)")?;
-            debug_assert_eq!(
-                feature.hidden_dim,
-                self.fc_input_dim(),
-                "last_aux_hidden_states must be [fc_input_dim, 1]"
-            );
             ops::gemm_into(ctx, &self.fc, feature, &mut fused_target_hidden);
         }
         let result = self.draft_chain(
@@ -812,10 +659,6 @@ impl Eagle3DraftModel {
                 .last_aux_hidden_states
                 .as_ref()
                 .context("EAGLE-3 rebuild has no boundary feature")?;
-            debug_assert_eq!(
-                boundary.hidden_dim, dim,
-                "last_aux_hidden_states must be [fc_input_dim, 1]"
-            );
             ops::copy_hidden_token_range_into(ctx, boundary, 0, &mut feat, 0, 1)?;
         }
         if n > 0 {
@@ -841,7 +684,7 @@ impl Eagle3DraftModel {
 
     /// Map a draft-vocabulary id back to the target vocabulary:
     /// `target_id = draft_id + d2t[draft_id]`.
-    pub(crate) fn draft_to_target_id(&self, draft_id: usize) -> Option<u32> {
+    fn draft_to_target_id(&self, draft_id: usize) -> Option<u32> {
         let offset = *self.d2t.get(draft_id)?;
         let target_id = draft_id as i64 + offset;
         (0..self.config.vocab_size as i64)
@@ -858,16 +701,11 @@ mod tests {
     fn chain_shrinks_at_cache_edge() {
         let (max, k) = (100usize, 3usize);
 
-        // when max_cache=100 and k=3 and current kv length is 97, when all 3 token pass verify
-        // speculative decoding actually generate 4 token, which causing cache overflow
+        // An all-accepted round commits k drafts plus the bonus token.
         let granted = chain_capacity(97, max, k);
-
-        // chain_capacity will return granted=2, which means we only draft 2 token to avoid overflow
         assert_eq!(granted, 2, "one draft given up so the commit fits");
         assert_eq!(97 + granted + 1, max, "commits exactly to the cache end");
 
-        // when max_cache=100 and k=3 and current kv length is 96, when all 3 token pass verify
-        // speculative decoding actually generate 4 token, in this case will not causing overflow
         assert_eq!(chain_capacity(96, max, k), 3);
         assert_eq!(
             chain_capacity(50, max, k),

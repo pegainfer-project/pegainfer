@@ -100,6 +100,7 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: None,
+        eagle3_draft_model_path: None,
     };
     // Dropping the harness joins the scheduler thread; on a panic the engine may
     // be wedged and the join would hang, so panics leak it — only the happy path

@@ -40,6 +40,8 @@ pub use weights::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
 pub use weights::DEFAULT_KV_PAGE_SIZE;
 pub use weights::Qwen3MemoryOptions;
 
+use crate::speculative::DraftModel;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3LoraOptions {
     max_loras: usize,
@@ -252,6 +254,10 @@ pub struct Qwen3LaunchOptions {
     /// `Some` enables DFlash speculative decoding with this drafter model.
     /// Single-GPU only and mutually exclusive with LoRA and KV offload.
     pub dflash_draft_model_path: Option<PathBuf>,
+    /// `Some` enables EAGLE-3 speculative decoding with this drafter model:
+    /// greedy requests draft while they are the only active request. Same
+    /// limits as DFlash, and mutually exclusive with it.
+    pub eagle3_draft_model_path: Option<PathBuf>,
 }
 
 /// Start the Qwen3 engine from server-facing [`Qwen3LaunchOptions`].
@@ -306,14 +312,24 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<Engine> 
         options.tp_size == 1 || matches!(options.decode_overlap, DecodeOverlap::Off),
         "decode-overlap is unsupported under tensor parallelism"
     );
+    let draft = match (
+        options.dflash_draft_model_path.as_deref(),
+        options.eagle3_draft_model_path.as_deref(),
+    ) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("DFlash and EAGLE-3 drafters cannot be loaded together")
+        }
+        (Some(path), None) => Some(DraftModel::DFlash(draft_path(path)?)),
+        (None, Some(path)) => Some(DraftModel::Eagle3(draft_path(path)?)),
+        (None, None) => None,
+    };
     anyhow::ensure!(
-        !(options.dflash_draft_model_path.is_some() && options.lora.is_some()),
-        "DFlash speculative decoding cannot be combined with LoRA serving"
+        !(draft.is_some() && options.lora.is_some()),
+        "speculative decoding cannot be combined with LoRA serving"
     );
     anyhow::ensure!(
-        options.dflash_draft_model_path.is_none()
-            || matches!(options.decode_overlap, DecodeOverlap::Off),
-        "DFlash speculative decoding cannot be combined with decode overlap \
+        draft.is_none() || matches!(options.decode_overlap, DecodeOverlap::Off),
+        "speculative decoding cannot be combined with decode overlap \
          (--decode-overlap): the speculative path never takes the unified overlap \
          route, so the overlap streams would only waste VRAM the drafter needs"
     );
@@ -344,10 +360,15 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<Engine> 
             options.memory,
             options.decode_overlap,
             options.batch_invariant,
-            options.dflash_draft_model_path.as_deref(),
+            draft,
             options.dump_graph_png.as_deref(),
         ),
     }
+}
+
+fn draft_path(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("draft model path must be valid UTF-8"))
 }
 
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Engine> {
@@ -397,7 +418,10 @@ pub fn start_engine_with_offload(
         memory_options,
         decode_overlap,
         batch_invariant,
-        dflash_draft_model_path,
+        dflash_draft_model_path
+            .map(draft_path)
+            .transpose()?
+            .map(DraftModel::DFlash),
         None,
     )
 }
@@ -412,7 +436,7 @@ fn start_engine_with_offload_inner(
     memory_options: Qwen3MemoryOptions,
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
-    dflash_draft_model_path: Option<&Path>,
+    draft: Option<DraftModel<'_>>,
     dump_graph_png: Option<&Path>,
 ) -> Result<Engine> {
     crate::spec_env::validate()?;
@@ -430,17 +454,11 @@ fn start_engine_with_offload_inner(
             decode_overlap,
             no_prefix_cache,
             offload_options.enabled,
-            dflash_draft_model_path.is_some(),
+            draft.is_some(),
             device_ordinals.len(),
         )?;
     }
     apply_batch_invariant_policy(batch_invariant);
-    let dflash_draft_model_path = dflash_draft_model_path
-        .map(|path| {
-            path.to_str()
-                .ok_or_else(|| anyhow::anyhow!("DFlash draft model path must be valid UTF-8"))
-        })
-        .transpose()?;
     frontend_adapter::start_qwen3(
         model_path,
         enable_cuda_graph,
@@ -451,7 +469,7 @@ fn start_engine_with_offload_inner(
         max_prefill_tokens,
         memory_options,
         decode_overlap,
-        dflash_draft_model_path,
+        draft,
         dump_graph_png,
     )
 }
@@ -518,7 +536,7 @@ fn ensure_batch_invariant_supported(
     decode_overlap: DecodeOverlap,
     no_prefix_cache: bool,
     offload: bool,
-    dflash: bool,
+    speculative: bool,
     world_size: usize,
 ) -> Result<()> {
     if !matches!(decode_overlap, DecodeOverlap::Off) {
@@ -538,9 +556,9 @@ fn ensure_batch_invariant_supported(
             "--batch-invariant is not supported with tensor parallelism: world_size={world_size} has unverified cross-rank reduction order"
         );
     }
-    if dflash {
+    if speculative {
         anyhow::bail!(
-            "--batch-invariant is not supported with DFlash speculative decoding: the decode-GEMM \
+            "--batch-invariant is not supported with speculative decoding: the decode-GEMM \
              pin warms and self-checks only the base projections, so the drafter's fc/MLP GEMMs \
              are not pinned and would bail at the GEMM boundary under Pin"
         );

@@ -80,6 +80,7 @@ use crate::scheduler::resolve::resolve_step;
 use crate::scheduler::runtime_plan;
 use crate::scheduler::servable_len;
 use crate::scheduler::take_prefill_chunks;
+use crate::speculative::DraftModel;
 use crate::weights::Qwen3MemoryOptions;
 
 // ── Engine assembly ─────────────────────────────────────────────────────
@@ -95,7 +96,7 @@ pub(crate) fn start_qwen3(
     max_prefill_tokens: usize,
     memory_options: Qwen3MemoryOptions,
     decode_overlap: crate::DecodeOverlap,
-    dflash_draft_model_path: Option<&str>,
+    draft: Option<DraftModel<'_>>,
     dump_graph_png: Option<&Path>,
 ) -> Result<Engine> {
     let mut executor = Qwen3Executor::from_runtime_with_decode_environment(
@@ -105,7 +106,7 @@ pub(crate) fn start_qwen3(
         Qwen3LoraOptions::default(),
         offload_options,
         max_prefill_tokens,
-        dflash_draft_model_path,
+        draft,
         memory_options,
         decode_overlap,
     )?;
@@ -126,8 +127,8 @@ pub(crate) fn start_qwen3(
     // draft is built against the target's embeddings/head) and forces the
     // prefix cache off, so it must follow set_no_prefix_cache. Its GPU footprint
     // was already reserved during profiling from the draft path passed above.
-    if let Some(draft_path) = dflash_draft_model_path {
-        executor.load_dflash_draft_model(draft_path)?;
+    if let Some(draft) = draft {
+        executor.load_draft_model(draft)?;
     }
 
     Ok(start_with_executor(

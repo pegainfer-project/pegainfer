@@ -1,5 +1,4 @@
 // EAGLE-3 drafter (e.g. `AngelSlim/Qwen3-4B_eagle3`).
-#![allow(dead_code)]
 
 use anyhow::Result;
 use pegainfer_core::tensor::DeviceMatrix;
@@ -11,20 +10,18 @@ mod forward;
 mod loading;
 mod reservation;
 
-// Consumed by the scheduler PR that drives the drafter; exported as the forward
-// path lands.
-#[allow(unused_imports)]
 pub(crate) use forward::Eagle3RequestState;
-#[allow(unused_imports)]
 pub(crate) use forward::Eagle3Scratch;
-// Wired into the KV budget by the scheduler PR; kept here as the skeleton lands.
-#[allow(unused_imports)]
 pub(crate) use reservation::Eagle3MemoryReservation;
 
 /// Number of tokens the EAGLE-3 chain drafts per speculative round (γ; the verify
 /// span is `EAGLE3_CHAIN_LENGTH + 1`: the current token plus γ drafts). v1 is a
-/// fixed top-1 **chain** — *not* a tree. γ=3 is the measured chain optimum on a Qwen3-4B GSM8K A/B (RTX 5070 Ti)
+/// fixed top-1 **chain** — *not* a tree.
 pub(crate) const EAGLE3_CHAIN_LENGTH: usize = 3;
+
+/// Requests one EAGLE-3 draft round serves. v1 drafts through a single-token
+/// scratch, so the scheduler plain-decodes any larger batch.
+pub(crate) const EAGLE3_MAX_BATCH: usize = 1;
 
 /// The three *target* layers (low/mid/high) whose **post-layer** hidden states
 /// EAGLE-3 captures and fuses via `fc`.
@@ -89,9 +86,6 @@ pub(crate) struct Eagle3DraftModel {
     /// Draft→target vocab offset map: `target_id = draft_id + d2t[draft_id]`.
     /// Length `draft_vocab_size`. Host-resident (small lookup, not a GEMM input).
     pub(crate) d2t: Vec<i64>,
-    /// Target→draft presence mask: `t2d[target_id]` is true iff that target token
-    /// exists in the draft vocab. Length `vocab_size`.
-    pub(crate) t2d: Vec<bool>,
     pub(crate) cos_cache: DeviceVec,
     pub(crate) sin_cache: DeviceVec,
 }

@@ -69,7 +69,7 @@ pub(crate) fn build_next_plan(
     // dedicated prefill step instead of degrading silently.
     let needs_prompt_logprobs = pending.iter().any(|req| req.prompt_logprobs.is_some());
     // Deliberately a loose superset of the real capture eligibility
-    // (`dflash_prefill_supported`, which also needs `cached_tokens == 0 && no
+    // (`prefill_capture_supported`, which also needs `cached_tokens == 0 && no
     // prompt logprobs`): over-routing an ineligible request to a dedicated
     // prefill only costs one fusion, but under-routing a capture-eligible one
     // into Unified would silently break its readiness. Never tighten this into
@@ -178,8 +178,8 @@ pub(crate) enum SpeculationDecision {
     Speculate,
     /// Every request is draft-ready but the batch reached the load gate.
     Gated,
-    /// Some request is not draft-ready (or no drafter is loaded): plain
-    /// decode.
+    /// Some request is not draft-ready, the batch is wider than the drafter
+    /// serves, or no drafter is loaded: plain decode.
     NotReady,
 }
 
@@ -195,6 +195,12 @@ pub(crate) fn speculation_decision_at(
     max_batch: usize,
 ) -> SpeculationDecision {
     if !executor.speculative_enabled() || active.is_empty() {
+        return SpeculationDecision::NotReady;
+    }
+    if executor
+        .max_draft_batch()
+        .is_some_and(|limit| active.len() > limit)
+    {
         return SpeculationDecision::NotReady;
     }
     let all_ready = active.iter().all(|req| {
@@ -402,6 +408,21 @@ mod tests {
         let batch = speculative_batch(8);
         assert_eq!(
             speculation_decision_at(&exec, &batch, 4),
+            SpeculationDecision::NotReady
+        );
+    }
+
+    #[test]
+    fn a_batch_wider_than_the_drafter_serves_decodes_plainly() {
+        let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new())))
+            .with_speculative()
+            .with_max_draft_batch(1);
+        assert_eq!(
+            speculation_decision_at(&exec, &speculative_batch(1), 0),
+            SpeculationDecision::Speculate
+        );
+        assert_eq!(
+            speculation_decision_at(&exec, &speculative_batch(2), 0),
             SpeculationDecision::NotReady
         );
     }

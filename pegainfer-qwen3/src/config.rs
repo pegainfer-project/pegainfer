@@ -277,8 +277,7 @@ struct RawDFlashConfig {
 ///  A single-layer (`midlayer`) head whose attention takes
 /// `2 * hidden_size` inputs (concatenated `[norm(embed), norm(fused_hidden)]`),
 /// has no QK-norm, reuses the target's `embed_tokens`, and predicts over a
-/// reduced `draft_vocab_size` remapped to the full vocab via `d2t`/`t2d`.
-#[allow(dead_code)]
+/// reduced `draft_vocab_size` remapped to the full vocab via `d2t`.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Eagle3Config {
     pub(crate) hidden_size: usize,
