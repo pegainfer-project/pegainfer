@@ -308,7 +308,7 @@ impl ModelExecutor for FakeExecutor {
                 .iter()
                 .map(|req| self.fake_prefill_result(req))
                 .collect(),
-            dflash_context_captured_requests: Vec::new(),
+            draft_context_captured_requests: Vec::new(),
         })
     }
 
@@ -376,7 +376,7 @@ impl ModelExecutor for FakeExecutor {
         if let Some(gate) = &self.async_prefill {
             self.parked_prefill = Some(PrefillResult {
                 requests: std::mem::take(&mut prefill_requests),
-                dflash_context_captured_requests: Vec::new(),
+                draft_context_captured_requests: Vec::new(),
             });
             gate.launches.fetch_add(1, Ordering::SeqCst);
         }

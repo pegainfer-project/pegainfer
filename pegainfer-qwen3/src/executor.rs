@@ -284,7 +284,7 @@ fn execute_step_on_lane(
                 requests.iter().any(|req| req.prompt_logprobs.is_some()),
                 capture_layer_ids.as_deref(),
             )?;
-            let dflash_context_captured_requests = lane.record_prefill_dflash_context(
+            let draft_context_captured_requests = lane.record_prefill_dflash_context(
                 requests,
                 capture_requested,
                 captured_hidden.as_ref(),
@@ -302,7 +302,7 @@ fn execute_step_on_lane(
                             all_position_logits: all_position_logits.as_ref(),
                         },
                     )?,
-                    dflash_context_captured_requests,
+                    draft_context_captured_requests,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -724,10 +724,10 @@ pub struct DecodeRequestResult {
 
 pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
-    /// Requests whose DFlash target context was captured this prefill step.
+    /// Requests whose drafter target context was captured this prefill step.
     /// Empty unless speculative decoding is enabled. The executor folds these
-    /// into its `dflash_ready_requests` set once the prompt is fully prefilled.
-    pub(crate) dflash_context_captured_requests: Vec<RequestId>,
+    /// into its `draft_ready_requests` set once the prompt is fully prefilled.
+    pub(crate) draft_context_captured_requests: Vec<RequestId>,
 }
 
 pub struct DecodeResult {
@@ -935,17 +935,17 @@ pub struct Qwen3Executor {
     /// In-flight async prefill state. Populated by the SplitConcurrent step,
     /// consumed by `poll_async_prefill`.
     async_prefill: Option<cudarc::driver::CudaEvent>,
-    /// DFlash draft metadata; `Some` once a draft model is loaded into the
+    /// Draft model metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
-    speculative: Option<DFlashMeta>,
-    /// Cumulative acceptance counters for the DFlash path, set and cleared
+    speculative: Option<DraftMeta>,
+    /// Cumulative acceptance counters for the speculative path, set and cleared
     /// together with `speculative` above. Written in
     /// `execute_speculative_verify_impl`, read by `publish_load`.
     spec_decode_counters: Option<SpecDecodeCounters>,
-    /// Requests whose DFlash context is captured and ready to draft. A request
+    /// Requests whose draft context is captured and ready to draft. A request
     /// enters this set when its prompt finishes prefilling with captured target
     /// context, and leaves on retire or a plain (non-speculative) decode.
-    dflash_ready_requests: HashSet<RequestId>,
+    draft_ready_requests: HashSet<RequestId>,
     /// CUDA device ordinal this executor was built on. Used by
     /// [`enable_decode_overlap`] to create overlap streams on the correct
     /// device (the model, KV cache, and compute stream all live here).
@@ -1152,7 +1152,7 @@ impl Qwen3Executor {
             async_prefill: None,
             speculative: None,
             spec_decode_counters: None,
-            dflash_ready_requests: HashSet::new(),
+            draft_ready_requests: HashSet::new(),
             device_ordinal,
             verify_round: 0,
         })
@@ -1268,7 +1268,7 @@ impl Qwen3Executor {
                     max_loras: lora_options.max_loras,
                     max_lora_rank: lora_options.max_lora_rank,
                     decode_overlap,
-                    dflash_enabled: dflash_draft_path.is_some(),
+                    draft_enabled: dflash_draft_path.is_some(),
                 },
             )?;
             // The DFlash draft model loads after profiling but lives outside the
@@ -1354,7 +1354,7 @@ impl Qwen3Executor {
                     max_loras: lora_options.max_loras,
                     max_lora_rank: lora_options.max_lora_rank,
                     decode_overlap,
-                    dflash_enabled: false,
+                    draft_enabled: false,
                 },
             )?);
         }
@@ -1554,7 +1554,7 @@ impl Qwen3Executor {
             async_prefill: None,
             speculative: None,
             spec_decode_counters: None,
-            dflash_ready_requests: HashSet::new(),
+            draft_ready_requests: HashSet::new(),
             device_ordinal: device_ordinals[0],
             verify_round: 0,
         })
@@ -2375,8 +2375,8 @@ impl ModelExecutor for Qwen3Executor {
         }
         self.saved_cursor.remove(&request_id);
         if self.speculative.is_some() {
-            self.dflash_ready_requests.remove(&request_id);
-            self.primary.drop_dflash_request(request_id)?;
+            self.draft_ready_requests.remove(&request_id);
+            self.primary.drop_draft_request(request_id)?;
         }
         Ok(())
     }
@@ -2614,18 +2614,18 @@ impl ModelExecutor for Qwen3Executor {
         if self.speculative.is_some() {
             for req_result in &result.requests {
                 let captured = result
-                    .dflash_context_captured_requests
+                    .draft_context_captured_requests
                     .contains(&req_result.request_id);
                 match dflash_prefill_action(captured, req_result.completed) {
                     DFlashPrefillAction::MarkReady => {
-                        self.dflash_ready_requests.insert(req_result.request_id);
+                        self.draft_ready_requests.insert(req_result.request_id);
                     }
                     DFlashPrefillAction::KeepPending => {
-                        self.dflash_ready_requests.remove(&req_result.request_id);
+                        self.draft_ready_requests.remove(&req_result.request_id);
                     }
                     DFlashPrefillAction::Drop => {
-                        self.dflash_ready_requests.remove(&req_result.request_id);
-                        self.primary.drop_dflash_request(req_result.request_id)?;
+                        self.draft_ready_requests.remove(&req_result.request_id);
+                        self.primary.drop_draft_request(req_result.request_id)?;
                     }
                 }
             }
@@ -2697,8 +2697,8 @@ impl ModelExecutor for Qwen3Executor {
         // any captured draft context is now stale — drop it.
         if self.speculative.is_some() {
             for req_result in &result.requests {
-                if self.dflash_ready_requests.remove(&req_result.request_id) {
-                    self.primary.drop_dflash_request(req_result.request_id)?;
+                if self.draft_ready_requests.remove(&req_result.request_id) {
+                    self.primary.drop_draft_request(req_result.request_id)?;
                 }
             }
         }
@@ -2723,7 +2723,7 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn speculative_request_ready(&self, request_id: RequestId) -> bool {
-        self.dflash_ready_requests.contains(&request_id)
+        self.draft_ready_requests.contains(&request_id)
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
@@ -2816,8 +2816,8 @@ impl ModelExecutor for Qwen3Executor {
                 // need DFlash mark-ready here.)
                 if self.speculative.is_some() {
                     for req_result in &result.decode_requests {
-                        if self.dflash_ready_requests.remove(&req_result.request_id) {
-                            self.primary.drop_dflash_request(req_result.request_id)?;
+                        if self.draft_ready_requests.remove(&req_result.request_id) {
+                            self.primary.drop_draft_request(req_result.request_id)?;
                         }
                     }
                 }
@@ -3204,7 +3204,7 @@ impl Drop for Qwen3Executor {
 /// worker: the draft block size (`K` candidates per round) and which target
 /// layers feed the draft (the worker captures these; kept for diagnostics).
 #[derive(Clone, Debug)]
-struct DFlashMeta {
+struct DraftMeta {
     block_size: usize,
     /// Max drafts proposed per verify step (`K`), after any
     /// `PEGAINFER_SPEC_MAX_DRAFTS` trim. The span leads with the anchor
@@ -3422,14 +3422,14 @@ impl LocalQwen3Lane {
     /// Load the DFlash draft model into this lane (primary rank only). The draft
     /// model is built here on the worker thread because it reads the co-located
     /// target model's embeddings and head.
-    fn load_dflash(&mut self, draft_path: &str) -> Result<DFlashMeta> {
+    fn load_dflash(&mut self, draft_path: &str) -> Result<DraftMeta> {
         let model = DFlashDraftModel::from_safetensors_for_target(
             self.model.device_ctx(),
             draft_path,
             &self.model,
         )?;
         model.tune_gemm_algos(&self.model)?;
-        let meta = DFlashMeta {
+        let meta = DraftMeta {
             block_size: model.block_size(),
             num_spec_tokens: model.effective_drafts(),
             max_position_embeddings: model.max_position_embeddings(),
@@ -3480,7 +3480,7 @@ impl LocalQwen3Lane {
         // synchronous result), so no context is captured here.
         Ok(PrefillResult {
             requests: results,
-            dflash_context_captured_requests: Vec::new(),
+            draft_context_captured_requests: Vec::new(),
         })
     }
 
@@ -4069,11 +4069,11 @@ enum WorkerCommand {
     /// thread because it reads the co-located target model).
     LoadDflash {
         draft_path: String,
-        resp: channel::Sender<Result<DFlashMeta>>,
+        resp: channel::Sender<Result<DraftMeta>>,
     },
-    /// Drop a request's DFlash draft state (request retired, or it fell back to
-    /// a plain decode that advanced the sequence outside the speculative path).
-    DropDflash {
+    /// Drop a request's draft state (request retired, or it fell back to a
+    /// plain decode that advanced the sequence outside the speculative path).
+    DropDraft {
         request_id: RequestId,
         resp: channel::Sender<Result<()>>,
     },
@@ -4218,7 +4218,7 @@ impl RankWorker {
                                     let result = lane.load_dflash(&draft_path);
                                     let _ = resp.send(result);
                                 }
-                                WorkerCommand::DropDflash { request_id, resp } => {
+                                WorkerCommand::DropDraft { request_id, resp } => {
                                     lane.drop_dflash_request(request_id);
                                     let _ = resp.send(Ok(()));
                                 }
@@ -4307,7 +4307,7 @@ impl RankWorker {
 
     /// Load the DFlash draft model into this worker's lane and return its
     /// metadata. Blocks until the worker finishes loading.
-    fn load_dflash(&self, draft_path: String) -> Result<DFlashMeta> {
+    fn load_dflash(&self, draft_path: String) -> Result<DraftMeta> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::LoadDflash {
@@ -4320,18 +4320,18 @@ impl RankWorker {
             .map_err(|_| anyhow::anyhow!("worker dropped load_dflash response"))?
     }
 
-    /// Drop a request's DFlash state. Blocks until the worker acknowledges.
-    fn drop_dflash_request(&self, request_id: RequestId) -> Result<()> {
+    /// Drop a request's draft state. Blocks until the worker acknowledges.
+    fn drop_draft_request(&self, request_id: RequestId) -> Result<()> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
-            .send(WorkerCommand::DropDflash {
+            .send(WorkerCommand::DropDraft {
                 request_id,
                 resp: resp_tx,
             })
-            .map_err(|_| anyhow::anyhow!("worker channel closed on drop_dflash"))?;
+            .map_err(|_| anyhow::anyhow!("worker channel closed on drop_draft"))?;
         resp_rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("worker dropped drop_dflash response"))?
+            .map_err(|_| anyhow::anyhow!("worker dropped drop_draft response"))?
     }
 
     fn load_lora_adapter(

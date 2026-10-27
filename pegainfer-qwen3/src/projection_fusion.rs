@@ -33,7 +33,7 @@ pub(crate) fn select_decode_projection_path(
     tensor_parallel: TensorParallelConfig,
     numeric_policy: NumericPolicy,
     decode_overlap: DecodeOverlap,
-    dflash_enabled: bool,
+    draft_enabled: bool,
     device_sm: i32,
     hidden_size: usize,
     q_dim: usize,
@@ -49,8 +49,8 @@ pub(crate) fn select_decode_projection_path(
     if !matches!(decode_overlap, DecodeOverlap::Off) {
         return (DecodeProjectionPath::Split, "decode_overlap");
     }
-    if dflash_enabled {
-        return (DecodeProjectionPath::Split, "dflash");
+    if draft_enabled {
+        return (DecodeProjectionPath::Split, "speculative");
     }
     if !QUALIFIED_QKV.contains(&(device_sm, hidden_size, q_dim, kv_dim, num_hidden_layers)) {
         return (DecodeProjectionPath::Split, "unqualified_sm_or_geometry");

@@ -223,7 +223,7 @@ fn inflight_prefill_reservation_is_unchanged_by_its_result() {
                 completed: prefill_pos == req.prompt_tokens.len(),
                 prefill_pos,
             }],
-            dflash_context_captured_requests: Vec::new(),
+            draft_context_captured_requests: Vec::new(),
         };
         let artifacts = plan::ExecutionArtifacts::Prefill {
             pending: vec![req],

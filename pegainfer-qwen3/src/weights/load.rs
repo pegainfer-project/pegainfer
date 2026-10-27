@@ -36,7 +36,7 @@ pub(crate) struct ModelRuntimeConfig {
     pub(crate) max_loras: usize,
     pub(crate) max_lora_rank: usize,
     pub(crate) decode_overlap: crate::DecodeOverlap,
-    pub(crate) dflash_enabled: bool,
+    pub(crate) draft_enabled: bool,
 }
 
 impl Default for ModelRuntimeConfig {
@@ -48,7 +48,7 @@ impl Default for ModelRuntimeConfig {
             max_loras: crate::Qwen3LoraOptions::DEFAULT_MAX_LORAS,
             max_lora_rank: crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
             decode_overlap: crate::DecodeOverlap::Off,
-            dflash_enabled: false,
+            draft_enabled: false,
         }
     }
 }
@@ -108,7 +108,7 @@ impl Qwen3Model {
             tensor_parallel,
             pegainfer_kernels::ops::numeric_policy(),
             runtime.decode_overlap,
-            runtime.dflash_enabled,
+            runtime.draft_enabled,
             device_sm,
             config.hidden_size,
             q_dim,
