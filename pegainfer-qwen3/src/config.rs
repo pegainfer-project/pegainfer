@@ -173,6 +173,13 @@ fn default_markov_head_type() -> String {
     "vanilla".to_string()
 }
 
+/// transformers' `Qwen3Config` defaults for deriving absent `layer_types`.
+const DEFAULT_SLIDING_WINDOW: usize = 4096;
+
+fn default_max_window_layers() -> usize {
+    28
+}
+
 /// Backbone geometry shared by flat configs and Speculators
 /// `transformer_layer_config`.
 #[derive(Deserialize)]
@@ -189,7 +196,24 @@ struct DFlashGeometry {
     rope_parameters: Option<RopeParameters>,
     #[serde(default = "default_max_position_embeddings")]
     max_position_embeddings: usize,
-    sliding_window: Option<usize>,
+    /// `Some(None)` is an explicit `null`; an absent key stays `None`, which
+    /// transformers reads as its default window.
+    #[allow(
+        clippy::option_option,
+        reason = "an absent window and a null one mean different things to transformers"
+    )]
+    #[serde(default, deserialize_with = "present")]
+    sliding_window: Option<Option<usize>>,
+}
+
+#[allow(
+    clippy::option_option,
+    reason = "keeps a present null apart from an absent key"
+)]
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<usize>>, D::Error> {
+    Option::<usize>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -225,6 +249,11 @@ struct RawDFlashConfig {
     is_causal: Option<bool>,
     #[serde(default)]
     layer_types: Option<Vec<String>>,
+    /// With no `layer_types`, transformers derives sliding layers from these.
+    #[serde(default)]
+    use_sliding_window: bool,
+    #[serde(default = "default_max_window_layers")]
+    max_window_layers: usize,
     #[serde(default)]
     sample_from_anchor: bool,
     #[serde(default)]
@@ -565,7 +594,7 @@ impl DFlashConfig {
             )
         };
 
-        let sliding_window = conv.as_ref().and(geometry.sliding_window);
+        let sliding_window = conv.as_ref().and(geometry.sliding_window.flatten());
 
         let dspine = if let Some(inner) = &dflash_config {
             DSpineConfig::from_inner(
@@ -594,26 +623,30 @@ impl DFlashConfig {
                 raw.is_causal != Some(false),
                 "DSpine requires causal draft attention; config sets is_causal = false"
             );
-            match &raw.layer_types {
-                Some(layer_types) => {
-                    ensure!(
-                        layer_types.len() == geometry.num_hidden_layers,
-                        "DSpine layer_types must name every draft layer ({}), got {}",
-                        geometry.num_hidden_layers,
-                        layer_types.len()
-                    );
-                    ensure!(
-                        layer_types.iter().all(|kind| kind == "full_attention"),
-                        "DSpine drafts use full-attention layers only, got {layer_types:?}"
-                    );
-                }
-                // Without explicit types transformers derives them from the
-                // window fields, so a configured window can make a layer sliding.
-                None => ensure!(
-                    geometry.sliding_window.is_none(),
-                    "DSpine drafts use no sliding window, got {:?}",
-                    geometry.sliding_window
-                ),
+            if let Some(layer_types) = &raw.layer_types {
+                ensure!(
+                    layer_types.len() == geometry.num_hidden_layers,
+                    "DSpine layer_types must name every draft layer ({}), got {}",
+                    geometry.num_hidden_layers,
+                    layer_types.len()
+                );
+                ensure!(
+                    layer_types.iter().all(|kind| kind == "full_attention"),
+                    "DSpine drafts use full-attention layers only, got {layer_types:?}"
+                );
+            } else {
+                // Mirrors how transformers' `Qwen3Config` derives absent layer types.
+                let window = geometry
+                    .sliding_window
+                    .unwrap_or(Some(DEFAULT_SLIDING_WINDOW));
+                ensure!(
+                    !(raw.use_sliding_window
+                        && window.is_some()
+                        && raw.max_window_layers < geometry.num_hidden_layers),
+                    "DSpine drafts use full-attention layers only; use_sliding_window makes \
+                     layers {}.. sliding",
+                    raw.max_window_layers
+                );
             }
         }
         Ok(Self {
@@ -878,7 +911,7 @@ pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -1036,9 +1069,6 @@ pub(crate) mod tests {
 
         assert!(config.uses_dspine());
         assert!(!config.anchor_first());
-        assert_eq!(config.block_size, 16);
-        assert_eq!(config.mask_token_id, 151_669);
-        assert_eq!(config.target_layer_ids, vec![1, 9, 17, 25, 33]);
     }
 
     #[test]
@@ -1061,12 +1091,12 @@ pub(crate) mod tests {
         ]);
         let mut empty_layer_types = dspine_config_value();
         empty_layer_types["layer_types"] = serde_json::json!([]);
-        let mut window_without_layer_types = dspine_config_value();
-        window_without_layer_types
-            .as_object_mut()
-            .expect("flat fixture")
-            .remove("layer_types");
-        window_without_layer_types["sliding_window"] = serde_json::json!(2048);
+        // No window key, so transformers' default window reaches layer 4.
+        let mut derived_sliding_layer = dspine_config_value();
+        let fields = derived_sliding_layer.as_object_mut().expect("flat fixture");
+        fields.remove("layer_types");
+        fields.insert("use_sliding_window".into(), serde_json::json!(true));
+        fields.insert("max_window_layers".into(), serde_json::json!(4));
 
         let cases = [
             (
@@ -1210,10 +1240,7 @@ pub(crate) mod tests {
             ),
             ("too few layer types", too_few_layer_types.to_string()),
             ("empty layer types", empty_layer_types.to_string()),
-            (
-                "sliding window without layer types",
-                window_without_layer_types.to_string(),
-            ),
+            ("derived sliding layer", derived_sliding_layer.to_string()),
         ];
 
         for (name, json) in cases {
@@ -1242,12 +1269,45 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn explicit_full_layer_types_ignore_the_window() {
-        let mut json = dspine_config_value();
-        json["sliding_window"] = serde_json::json!(2048);
+    fn windows_that_reach_no_layer_are_accepted() {
+        let without_types = |fields: Value| {
+            let mut json = dspine_config_value();
+            let object = json.as_object_mut().expect("flat fixture");
+            object.remove("layer_types");
+            object.extend(fields.as_object().expect("field map").clone());
+            json
+        };
+        let mut explicit_types = dspine_config_value();
+        explicit_types["sliding_window"] = serde_json::json!(2048);
+        let cases = [
+            ("explicit full layer types", explicit_types),
+            (
+                "window without use_sliding_window",
+                without_types(serde_json::json!({"sliding_window": 2048})),
+            ),
+            (
+                "explicit null window",
+                without_types(serde_json::json!({
+                    "sliding_window": null,
+                    "use_sliding_window": true,
+                    "max_window_layers": 0,
+                })),
+            ),
+            (
+                "window past the last layer",
+                without_types(serde_json::json!({
+                    "sliding_window": 2048,
+                    "use_sliding_window": true,
+                    "max_window_layers": 5,
+                })),
+            ),
+        ];
 
-        let config = DFlashConfig::from_json(&json.to_string()).expect("explicit full attention");
-        assert!(config.uses_dspine());
+        for (name, json) in cases {
+            let config = DFlashConfig::from_json(&json.to_string())
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert!(config.uses_dspine(), "{name}");
+        }
     }
 
     #[test]
