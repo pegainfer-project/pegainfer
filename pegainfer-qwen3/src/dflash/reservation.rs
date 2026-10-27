@@ -16,8 +16,7 @@ use crate::sizing;
 ///   is a tracked follow-up that would shrink this term to the draft KV alone).
 /// - `fixed_bytes` does not scale with the pool (billed via the memory margin):
 ///   the draft weights plus the lane-level batched scratch sized for the whole
-///   decode batch. A DSpine bridge's weights and tables are billed together with
-///   the allocation that defines their layout.
+///   decode batch.
 // TODO: the draft scratch is now a single lane-level `DFlashBatchScratch`
 // allocated once (dense buffers sized `max_batch * block_size`, plus one shared
 // varlen tail), not a per-request buffer. The per-token `tail_scratch` term and

@@ -594,17 +594,27 @@ impl DFlashConfig {
                 raw.is_causal != Some(false),
                 "DSpine requires causal draft attention; config sets is_causal = false"
             );
-            if let Some(layer_types) = &raw.layer_types {
-                ensure!(
-                    layer_types.iter().all(|kind| kind == "full_attention"),
-                    "DSpine drafts use full-attention layers only, got {layer_types:?}"
-                );
+            match &raw.layer_types {
+                Some(layer_types) => {
+                    ensure!(
+                        layer_types.len() == geometry.num_hidden_layers,
+                        "DSpine layer_types must name every draft layer ({}), got {}",
+                        geometry.num_hidden_layers,
+                        layer_types.len()
+                    );
+                    ensure!(
+                        layer_types.iter().all(|kind| kind == "full_attention"),
+                        "DSpine drafts use full-attention layers only, got {layer_types:?}"
+                    );
+                }
+                // Without explicit types transformers derives them from the
+                // window fields, so a configured window can make a layer sliding.
+                None => ensure!(
+                    geometry.sliding_window.is_none(),
+                    "DSpine drafts use no sliding window, got {:?}",
+                    geometry.sliding_window
+                ),
             }
-            ensure!(
-                geometry.sliding_window.is_none(),
-                "DSpine drafts use no sliding window, got {:?}",
-                geometry.sliding_window
-            );
         }
         Ok(Self {
             hidden_size: geometry.hidden_size,
@@ -733,19 +743,6 @@ impl DFlashConfig {
                 .all(|pair| pair[0] < pair[1]),
             "DFlash target_layer_ids must be strictly increasing"
         );
-
-        if self.dspine.is_some() {
-            anyhow::ensure!(
-                self.head_dim == 128,
-                "DSpine causal draft attention requires head_dim 128, got {}",
-                self.head_dim
-            );
-            anyhow::ensure!(
-                self.hidden_size.is_multiple_of(512),
-                "DSpine bridge requires hidden_size to be a multiple of 512, got {}",
-                self.hidden_size
-            );
-        }
 
         // DSpark Markov head: only the released `vanilla` low-rank head is
         // implemented; reject the gated/rnn variants loudly rather than silently
@@ -940,12 +937,8 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    pub(crate) fn dspine_8b_config() -> DFlashConfig {
-        DFlashConfig::from_json(DSPINE_8B_CONFIG).expect("DSpine 8B config")
-    }
-
-    pub(crate) fn plain_dflash_config() -> DFlashConfig {
-        DFlashConfig::from_json(PLAIN_DFLASH_CONFIG).expect("plain DFlash config")
+    fn dspine_config_value() -> Value {
+        serde_json::from_str(DSPINE_8B_CONFIG).expect("fixture json")
     }
 
     const DSPINE_8B_CONFIG: &str = r#"{
@@ -1059,6 +1052,22 @@ pub(crate) mod tests {
 
     #[test]
     fn rejects_unsupported_dspine_bridge_configs() {
+        let mut too_few_layer_types = dspine_config_value();
+        too_few_layer_types["layer_types"] = serde_json::json!([
+            "full_attention",
+            "full_attention",
+            "full_attention",
+            "full_attention"
+        ]);
+        let mut empty_layer_types = dspine_config_value();
+        empty_layer_types["layer_types"] = serde_json::json!([]);
+        let mut window_without_layer_types = dspine_config_value();
+        window_without_layer_types
+            .as_object_mut()
+            .expect("flat fixture")
+            .remove("layer_types");
+        window_without_layer_types["sliding_window"] = serde_json::json!(2048);
+
         let cases = [
             (
                 "terminal projection enabled",
@@ -1199,12 +1208,11 @@ pub(crate) mod tests {
                     "\"layer_types\": [\"sliding_attention\",",
                 ),
             ),
+            ("too few layer types", too_few_layer_types.to_string()),
+            ("empty layer types", empty_layer_types.to_string()),
             (
-                "sliding window",
-                DSPINE_8B_CONFIG.replace(
-                    "\"block_size\": 16,",
-                    "\"block_size\": 16,\n      \"sliding_window\": 2048,",
-                ),
+                "sliding window without layer types",
+                window_without_layer_types.to_string(),
             ),
         ];
 
@@ -1234,25 +1242,35 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn dspine_checkpoints_are_refused_until_the_forward_lands() {
-        assert!(dspine_8b_config().ensure_servable().is_err());
-        plain_dflash_config()
-            .ensure_servable()
-            .expect("plain DFlash stays servable");
+    fn explicit_full_layer_types_ignore_the_window() {
+        let mut json = dspine_config_value();
+        json["sliding_window"] = serde_json::json!(2048);
+
+        let config = DFlashConfig::from_json(&json.to_string()).expect("explicit full attention");
+        assert!(config.uses_dspine());
     }
 
     #[test]
-    fn rejects_dspine_targets_the_kernels_cannot_serve() {
-        let mut wrong_head_dim = dspine_8b_config();
-        wrong_head_dim.head_dim = 64;
-        let mut target_64 = target_qwen3_8b();
-        target_64.head_dim = 64;
-        assert!(wrong_head_dim.validate_for_target(&target_64).is_err());
+    fn dspine_checkpoints_are_refused_before_the_target_loads() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        fs::write(directory.path().join("config.json"), DSPINE_8B_CONFIG).expect("write config");
 
-        let mut wrong_hidden = dspine_8b_config();
-        wrong_hidden.hidden_size = 256;
-        let mut target_256 = target_qwen3_8b();
-        target_256.hidden_size = 256;
-        assert!(wrong_hidden.validate_for_target(&target_256).is_err());
+        let Err(error) = crate::executor::Qwen3Executor::from_runtime_with_lora_options(
+            "/nonexistent-target",
+            false,
+            &[0],
+            crate::Qwen3LoraOptions::default(),
+            crate::Qwen3OffloadOptions::disabled(),
+            crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
+            Some(directory.path().to_str().expect("utf-8 path")),
+            crate::Qwen3MemoryOptions::default(),
+        ) else {
+            panic!("DSpine must be refused before the target loads");
+        };
+
+        assert!(
+            format!("{error:#}").contains("DSpine draft checkpoints are not supported yet"),
+            "unexpected error: {error:#}"
+        );
     }
 }
