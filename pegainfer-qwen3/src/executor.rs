@@ -3810,7 +3810,8 @@ impl LocalQwen3Lane {
             .as_ref()
             .expect("DFlash present when capture layers exist")
             .model
-            .effective_verify_span();
+            .effective_drafts()
+            + 1;
 
         if self.verify_bufs.is_none() {
             let max_batch = *BATCH_BUCKETS.last().unwrap();

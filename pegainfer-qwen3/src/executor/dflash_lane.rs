@@ -196,9 +196,6 @@ impl LocalQwen3Lane {
     /// Seed the next draft round from a verify step: append the target hidden
     /// states for the *accepted* span positions to each request's pending
     /// context, and keep the cumulative acceptance trace at debug level.
-    /// `gated` marks a load-gated round (every span is the confirmed token
-    /// alone) and is traced explicitly: a near-budget truncated span is also
-    /// one token, so the span length cannot stand in for it.
     pub(super) fn record_verify_dflash_context(
         &mut self,
         requests: &[VerifyStepItem],
@@ -276,10 +273,6 @@ impl LocalQwen3Lane {
                 .map(|result| result.accepted_tokens.len())
                 .sum();
             if gated {
-                // A gated round verifies no drafts: it is not a hedging
-                // configuration sample. Sever the timing window instead of
-                // booking its interval to C=0 (which would also advance the
-                // controller's exploration and commit counters).
                 controller.break_window();
             } else {
                 controller.tick(dflash.round_chains, committed);
@@ -490,10 +483,6 @@ impl LocalQwen3Lane {
             // Anchor-first checkpoints use every sample. Prepend the actual
             // dangling token once for all three paths before target verification.
             let drafts_start = usize::from(!selector && !model.anchor_first());
-            // `PEGAINFER_SPEC_MAX_DRAFTS` trims the proposal: only the first
-            // `effective_drafts` candidates are verified, so the target forward
-            // carries fewer rows. The block is still rolled out in full — the
-            // drafter's cache still writes its `block_size`-slot in-fill tail.
             let keep = model.effective_drafts();
             let mut outputs = Vec::with_capacity(requests.len());
             for (i, req) in requests.iter().enumerate() {

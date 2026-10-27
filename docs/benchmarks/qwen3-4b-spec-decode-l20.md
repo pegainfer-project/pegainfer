@@ -13,7 +13,6 @@
 | Prompts | 64 ShareGPT first turns (`ShareGPT_V3_unfiltered_cleaned_split.json`, `--prompt-count 64 --prompt-seed 512`) — real text, because synthetic `--prompt-words` prompts overstate the speculative accept rate |
 | Protocol | **arms alternate** (A/B/A/B…), one server start per arm per round, one harness run per cell; every arm is `--no-prefix-cache` symmetric (loading a drafter forces the prefix cache off, so the spec-off arm must too) |
 | Metric | output tok/s = `qps × 128`. The qwen3 server emits no `pegainfer_http_trace` lines, so the harness cannot source per-request token counts; with `--ignore-eos` and a fixed `max_tokens` every successful request emits exactly 128 tokens. |
-| Raw data | `docs/benchmarks/qwen3-4b-spec-decode-l20/*.csv` — one CSV per sweep (`0a-noise`, `0b-baseline`, `0c-gate`, `0d-steady`, `0e-offbucket`, `0f-offbucket-gated`, `0g-trim`, `0h-trim-c64`), columns `arm,concurrency,round,output_tok_s,qps,wall_s,tpot_avg_ms,completed,failed,timeouts`. |
 
 L20 is **not** the 5090: absolute tok/s and crossover positions do not transfer. The 5090's `c16 plain 2277` is ~2× this box's `c16 plain 1150`.
 
@@ -82,8 +81,6 @@ The per-round trace marks a load-gated round **explicitly** (`gated=1`) and carr
 The `MAX_BATCH=3` row is the resume case: the threshold-3 batch gates first and speculates later, and the gate's per-request assertion (a gated request later speculates **and** accepts) passed. The `MAX_BATCH=1` row shows the one-token round is the only path exercised there, and the `MAX_DRAFTS` rows show the gate off (`gated=0`) with no round exceeding K.
 
 *(The measurement pod's toolkit is CUDA 12.9 while this tree references CUDA 13's `cudaErrorLossyQuery`; the local build wraps that one error-mapping case in a version guard. It is outside the speculative path and does not touch the harness.)*
-
-This is the behaviour the #718 "recover when the load drops" requirement needs, and the behaviour a plain-decode fallback would have destroyed (a plain decode drops the captured context, and only a fresh prefill can rebuild it — a one-way latch).
 
 The earlier c64 reversal count (8142 / 29) was taken from `accepted_draft`, which cannot tell a gated round from a fully-rejected speculative one, and is withdrawn. Reversibility is asserted per request by `dflash_spec_levers_keep_losslessness` through the explicit `gated=` marker; the run record above is that gate.
 

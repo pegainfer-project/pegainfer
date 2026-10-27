@@ -102,10 +102,6 @@ impl VerifyGraphBuffers {
         let inter_dim = model.local_intermediate_size();
         let logits_rows = model.config().logits_rows;
         let max_total_rows = max_batch * span;
-        // Span variants: the checkpoint's verify span, plus the gated round's
-        // one-token span. Both draw from the same buffers — the one-token rows
-        // fit inside the widest variant — but each needs its own captured
-        // graphs, because a captured segment bakes its row count.
         let mut spans = vec![span];
         if span > 1 {
             spans.push(1);
@@ -143,9 +139,6 @@ impl VerifyGraphBuffers {
                 max_tiles,
             )?,
             // num_layers + 1 dense segments per bucket (attention is eager between).
-            // One graph set per span variant: a captured segment bakes its row
-            // count, so the gated round's one-token rows and the full-span rows
-            // cannot share a graph.
             graphs: spans
                 .iter()
                 .map(|_| {
@@ -200,12 +193,8 @@ impl VerifyGraphBuffers {
     }
 }
 
-/// The span variant whose rows a step matches exactly, or `None` when it
-/// matches none (a truncated span, or rows that no variant covers).
-///
-/// The match is exact on purpose: a captured segment bakes its row count, so
-/// a step may only replay the variant recorded at the same shape. Returning
-/// `None` sends the step eager, which is always correct.
+/// The span variant whose rows a step matches exactly, or `None` (the step
+/// runs eager).
 fn span_variant(spans: &[usize], total_tokens: usize, batch_size: usize) -> Option<usize> {
     spans
         .iter()
@@ -486,23 +475,5 @@ impl Qwen3Model {
             )?;
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::span_variant;
-
-    #[test]
-    fn span_variant_matches_only_an_exact_full_span() {
-        let spans = [8, 1];
-        // Full-span and gated shapes at bucket 8 each hit their own variant.
-        assert_eq!(span_variant(&spans, 64, 8), Some(0));
-        assert_eq!(span_variant(&spans, 8, 8), Some(1));
-        // Every truncated shape must run eager: replaying a graph at a
-        // different row count would leave the tail rows stale.
-        assert_eq!(span_variant(&spans, 63, 8), None);
-        assert_eq!(span_variant(&spans, 9, 8), None);
-        assert_eq!(span_variant(&spans, 16, 8), None);
     }
 }

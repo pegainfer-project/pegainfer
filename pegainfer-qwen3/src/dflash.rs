@@ -388,7 +388,7 @@ impl DFlashDraftModel {
     /// propose all `block_size` — a one-token-longer verify span. This is a
     /// checkpoint property, not a markov one: a `markov_rank == 0` DeepSpec
     /// checkpoint is still anchor-first.
-    pub(crate) fn natural_drafts(&self) -> usize {
+    fn natural_drafts(&self) -> usize {
         if self.anchor_first() {
             self.block_size()
         } else {
@@ -402,22 +402,10 @@ impl DFlashDraftModel {
     /// the headroom is unchanged), but only the first `k` candidates are
     /// verified, so the target forward carries `1 + k` rows per request
     /// instead of the full span. `0`/unset = off.
-    ///
-    /// The trim trades rows for rounds: the accepted tail beyond `k` is cut,
-    /// so a round commits fewer tokens. Whether that pays depends on how
-    /// row-bound the target forward is on the GPU in use — measure it.
     pub(crate) fn effective_drafts(&self) -> usize {
         let natural = self.natural_drafts();
         let cap = max_drafts();
         if cap > 0 { natural.min(cap) } else { natural }
-    }
-
-    /// Verify span under the current trim = anchor (1) + effective drafts.
-    /// The verify CUDA-graph buffers are sized to this, and the span is
-    /// uniform across the batch, so a full-span step still satisfies the
-    /// capture-shape ≡ replay-shape invariant.
-    pub(crate) fn effective_verify_span(&self) -> usize {
-        self.effective_drafts() + 1
     }
 
     pub(crate) fn tune_gemm_algos(&self, target: &Qwen3Model) -> Result<()> {

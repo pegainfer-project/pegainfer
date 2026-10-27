@@ -783,15 +783,6 @@ fn speculative_resolves_each_request_independently() {
     ));
 }
 
-// ── Load gate: a gated batch must keep its draft context ──────────────────
-//
-// The regression this pins: a gated batch must NOT be routed to a plain
-// decode. A plain decode advances the sequence outside the speculative path,
-// so the executor drops the captured draft context — and only a fresh prefill
-// can rebuild it. A gate that fell back to plain decode would therefore be a
-// one-way latch that kills speculation for those requests until they are
-// re-prefilled, which is the opposite of "recover when the load drops".
-
 #[test]
 fn a_gated_batch_runs_a_verify_round_not_a_plain_decode() {
     let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_speculative();

@@ -517,10 +517,6 @@ pub(crate) fn admit_deferred_requests(
 /// active batch is draft-ready. Prefill of new arrivals still takes priority —
 /// a speculative step only runs when there is nothing to prefill, so the two
 /// never mix in one step.
-///
-/// A load-gated batch keeps its DFlash capture: it runs a one-token verify
-/// round instead of falling back to plain decode, which would drop the
-/// capture and leave the request unable to speculate again.
 pub(crate) fn runtime_plan(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],

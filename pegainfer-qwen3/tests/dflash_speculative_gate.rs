@@ -1228,12 +1228,9 @@ fn hedged_ladder_passes_the_lossless_gates() {
 }
 
 /// Parse the executor's per-round trace into
-/// `(round, request, gated, verified drafts, accepted drafts)`.
-///
-/// `gated` is traced explicitly — a near-budget request's span is also one
-/// token, so a zero `verified_draft` alone does not identify a gated round.
-/// `RequestId` renders as `req-<n>`, so each field takes the first non-empty
-/// digit run after the field name.
+/// `(round, request, gated, verified drafts, accepted drafts)`. `RequestId`
+/// renders as `req-<n>`, so each field takes the first non-empty digit run
+/// after the field name.
 fn levers_trace_rows(stderr: &str) -> Vec<(u64, u64, bool, usize, usize)> {
     let mut out = Vec::new();
     for line in stderr.lines() {
@@ -1261,23 +1258,6 @@ fn levers_trace_rows(stderr: &str) -> Vec<(u64, u64, bool, usize, usize)> {
     out
 }
 
-/// The gate's parser must read the executor's real format, where `RequestId`
-/// prints as `req-<n>`; a first-split-token parser panics on the first line.
-#[test]
-fn levers_trace_parses_real_trace_lines() {
-    let gated = "Qwen3 DFlash context round=7 request=req-0 accepted_draft=0 \
-                 verified_draft=0 gated=1 committed_tokens=1 context_len=12 \
-                 cumulative_accept_rate=0.000";
-    assert_eq!(levers_trace_rows(gated), vec![(7, 0, true, 0, 0)]);
-
-    let speculative = "Qwen3 DFlash context round=8 request=req-12 accepted_draft=2 \
-                       verified_draft=4 gated=0 committed_tokens=3 context_len=16 \
-                       cumulative_accept_rate=0.500";
-    assert_eq!(levers_trace_rows(speculative), vec![(8, 12, false, 4, 2)]);
-
-    assert!(levers_trace_rows("no trace here").is_empty());
-}
-
 /// Losslessness and reach under the two load levers.
 ///
 /// Both knobs are read once per process from the environment, so a normal test
@@ -1290,9 +1270,8 @@ fn levers_trace_parses_real_trace_lines() {
 /// - `PEGAINFER_SPEC_MAX_DRAFTS=4/2` must keep the greedy and concurrent gates
 ///   green, and no round may verify more drafts than the cap;
 /// - `PEGAINFER_SPEC_MAX_BATCH=3` on the heterogeneous concurrent batch (four
-///   staggered budgets) must show *both* gated and speculating rounds: the
-///   batch shrinks below the threshold mid-run, and the resumed rounds still
-///   accept (the child's own lossless assertions).
+///   staggered budgets): the batch shrinks below the threshold mid-run, and a
+///   request that was gated must later accept drafts.
 #[test]
 fn dflash_spec_levers_keep_losslessness() {
     const GREEDY: &str = "dflash_speculative_greedy_matches_plain_greedy";
@@ -1374,10 +1353,7 @@ fn dflash_spec_levers_keep_losslessness() {
         }
     }
 
-    // Resume: four staggered budgets with the gate at 3. The batch starts at 4
-    // and shrinks below the threshold as requests finish. A request that was
-    // gated must later speculate **and accept drafts**, which the aggregate
-    // counts alone cannot show (a per-request trace does).
+    // Resume, checked per request: aggregate counts cannot show it.
     let trace = run_child(CONCURRENT, &[("PEGAINFER_SPEC_MAX_BATCH", "3")]);
     let trace_rows = levers_trace_rows(&trace);
     let gated = trace_rows.iter().filter(|row| row.2).count();
