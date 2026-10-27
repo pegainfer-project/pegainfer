@@ -637,10 +637,12 @@ fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> Spe
 /// Per-interval prefix-cache deltas from two cumulative snapshots, in the wire
 /// shape the frontend increments its prefix-cache counters by. The frontend
 /// credits every local hit to `source="device"` and reads a tier split only off
-/// the connector stats, so host-tier hits travel there, the way vLLM's own
-/// offload connector reports them: local stats carry the remaining hits into
-/// `vllm:prefix_cache_*` and `source="device"`, connector stats carry the host
-/// lookups and hits into `vllm:external_prefix_cache_*` and `source="host"`.
+/// the connector stats, so connector-restored hits travel there, the way vLLM's
+/// own offload connector reports them: local stats carry the remaining hits
+/// into `vllm:prefix_cache_*` and `source="device"`, connector stats carry the
+/// connector lookups and hits into `vllm:external_prefix_cache_*`, with hits
+/// labeled `source="host"` when the engine knows they came from host memory
+/// and `source="external_unspecified"` when it cannot say which tier.
 /// The connector side is `None` for an interval without host activity. A total
 /// below its baseline means the engine restarted, so the interval diffs from
 /// zero rather than going negative or dropping the new counts.
@@ -651,7 +653,8 @@ fn prefix_cache_delta(
     let restarted = cur.queries < last.queries
         || cur.hits < last.hits
         || cur.host_queries < last.host_queries
-        || cur.host_hits < last.host_hits;
+        || cur.host_hits < last.host_hits
+        || cur.external_unspecified_hits < last.external_unspecified_hits;
     let base = if restarted {
         PrefixCacheCounters::default()
     } else {
@@ -660,22 +663,25 @@ fn prefix_cache_delta(
     let hits = cur.hits - base.hits;
     let host_queries = cur.host_queries - base.host_queries;
     let host_hits = cur.host_hits - base.host_hits;
+    let unspecified_hits = cur.external_unspecified_hits - base.external_unspecified_hits;
+    let external_hits = host_hits + unspecified_hits;
     let local = PrefixCacheStats {
         base: BaseCacheStats {
             queries: cur.queries - base.queries,
-            hits: hits.saturating_sub(host_hits),
+            hits: hits.saturating_sub(external_hits),
             ..BaseCacheStats::default()
         },
         ..PrefixCacheStats::default()
     };
-    let connector = (host_queries > 0 || host_hits > 0).then(|| PrefixCacheStats {
+    let connector = (host_queries > 0 || external_hits > 0).then(|| PrefixCacheStats {
         base: BaseCacheStats {
             queries: host_queries,
-            hits: host_hits,
+            hits: external_hits,
             ..BaseCacheStats::default()
         },
         hits_by_source: CachedTokensBySource {
             host: host_hits,
+            external_unspecified: unspecified_hits,
             ..CachedTokensBySource::default()
         },
         ..PrefixCacheStats::default()

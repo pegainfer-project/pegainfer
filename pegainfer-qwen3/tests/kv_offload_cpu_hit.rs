@@ -23,6 +23,7 @@ use std::path::Path;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::Qwen3LoraOptions;
 use pegainfer_qwen3::Qwen3OffloadOptions;
+use pegainfer_qwen3::runtime::ConnectorLookupCounters;
 use pegainfer_qwen3::runtime::PrefillPlan;
 use pegainfer_qwen3::runtime::PrefillStepItem;
 use pegainfer_qwen3::runtime::Qwen3Executor;
@@ -78,6 +79,12 @@ fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
     )
 }
 
+/// The connector lookups settled since `before`, as `(queries, hits)` tokens.
+fn lookups_since(ex: &Qwen3Executor, before: ConnectorLookupCounters) -> (u64, u64) {
+    let now = ex.connector_lookup_counters();
+    (now.queries - before.queries, now.hits - before.hits)
+}
+
 fn first_token_top(pr: &pegainfer_qwen3::runtime::PrefillResult) -> Vec<(u32, f32)> {
     pr.requests[0]
         .first_token_logprob
@@ -124,12 +131,12 @@ fn assert_close(cold: &[(u32, f32)], warm: &[(u32, f32)]) {
     );
 }
 
-/// One executor, two scenarios, run sequentially. cargo runs `#[test]`
+/// One executor, five scenarios, run sequentially. cargo runs `#[test]`
 /// functions on parallel threads; two Qwen3-4B executors sharing device 0 and
 /// the same pegaflow instance id ("qwen3-dev0") would collide on the host
 /// tier. Production wires exactly one executor per model, so the realistic
-/// shape is one executor servicing both prefixes. The two scenarios use
-/// disjoint prompt seeds, so they share no prefix and cannot cross-contaminate.
+/// shape is one executor servicing every prefix. The scenarios use disjoint
+/// prompt seeds, so they share no prefix and cannot cross-contaminate.
 #[test]
 fn live_gpu_and_cpu_prefix_hits() {
     let Some(model_path) = model_path_or_skip() else {
@@ -150,6 +157,9 @@ fn live_gpu_and_cpu_prefix_hits() {
 
     cpu_tier_restores_evicted_prefix(&mut ex);
     gpu_and_cpu_combined_hit(&mut ex);
+    connector_miss_is_counted(&mut ex);
+    local_growth_after_a_partial_load_stays_local(&mut ex);
+    cancelled_after_load_still_counts_its_lookup(&mut ex);
 }
 
 /// A prefix that is evicted from HBM and restored entirely from the CPU tier
@@ -166,8 +176,9 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         })
         .expect("cold prefill");
     assert_eq!(
-        cold.requests[0].cached_tokens, 0,
-        "first sight of P is cold"
+        cold.requests[0].cached_tokens,
+        Some(0),
+        "first sight of P is cold: a lookup ran and missed"
     );
     let cold_first = first_token_top(&cold);
     ex.drop_request(RequestId::new(1)).expect("drop req1");
@@ -196,14 +207,86 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
         .expect("warm prefill");
     assert_eq!(
         warm.requests[0].cached_tokens,
-        3 * BLOCK,
+        Some(3 * BLOCK),
         "CPU-restored prefix: 3 blocks matched, tail recomputed"
+    );
+    // All of the match came back from the host tier, so the external leg owns
+    // all of it — the split this PR reports separately.
+    assert_eq!(
+        warm.requests[0].external_hit_tokens,
+        Some(3 * BLOCK),
+        "restored blocks are attributed to the external side, not local KV"
     );
     let warm_first = first_token_top(&warm);
     ex.drop_request(RequestId::new(2)).expect("drop req2");
 
     // ── The restored KV must reproduce the original GPU first-token logits. ──
     assert_close(&cold_first, &warm_first);
+}
+
+/// A connector query that finds nothing is still a query. `begin_kv_prefetch`
+/// answers `false` for a miss and leaves no prefetch state behind, so the
+/// external counters can only separate "asked and missed" from "never asked"
+/// by recording the consultation itself. Without that record every miss
+/// disappears from the counters and the external hit rate reads 100%.
+///
+/// The missed request then stays deferred while another request registers
+/// the same prefix in local KV. Its external query width must still be the
+/// query that was sent (the whole prompt), not one re-derived from the
+/// larger admission-time match.
+fn connector_miss_is_counted(ex: &mut Qwen3Executor) {
+    let unseen = prompt(11, 50); // disjoint seed: never saved to the host tier
+    let id = RequestId::new(3);
+    let before = ex.connector_lookup_counters();
+
+    assert!(
+        !ex.begin_kv_prefetch(id, &unseen, None, 0),
+        "an unseen prefix must not park on a load"
+    );
+    assert!(
+        ex.wait_ready_prefetch(0).is_empty(),
+        "a miss leaves no load to settle"
+    );
+
+    // While request 3 waits, request 4 computes the same prompt and leaves
+    // its 3 full blocks in the local prefix cache. It never asked the
+    // connector.
+    let sibling = ex
+        .execute_prefill(PrefillPlan {
+            sample_seed: 0,
+            requests: &[prefill_item(4, &unseen)],
+        })
+        .expect("sibling prefill");
+    assert_eq!(sibling.requests[0].external_hit_tokens, None);
+    ex.drop_request(RequestId::new(4)).expect("drop req4");
+
+    let missed = ex
+        .execute_prefill(PrefillPlan {
+            sample_seed: 0,
+            requests: &[prefill_item(3, &unseen)],
+        })
+        .expect("miss prefill");
+    assert_eq!(
+        missed.requests[0].cached_tokens,
+        Some(3 * BLOCK),
+        "the sibling's blocks are matched locally at admission"
+    );
+    // The point of this case: `Some(0)`, not `None`. `None` would mean the
+    // connector was never consulted, which is what dropped every miss from the
+    // external counters before this was recorded explicitly.
+    assert_eq!(
+        missed.requests[0].external_hit_tokens,
+        Some(0),
+        "the connector was queried and restored nothing; a miss must be \
+         counted, not dropped as 'never asked'"
+    );
+    assert_eq!(
+        lookups_since(ex, before),
+        (unseen.len() as u64, 0),
+        "the connector was asked about the whole prompt, before the sibling \
+         made part of it local; the sibling never asked"
+    );
+    ex.drop_request(id).expect("drop req3");
 }
 
 /// A single prefix that is part GPU-resident, part CPU-only: the prefetch must
@@ -222,8 +305,9 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         })
         .expect("cold full prefill");
     assert_eq!(
-        cold.requests[0].cached_tokens, 0,
-        "first sight of full is cold"
+        cold.requests[0].cached_tokens,
+        Some(0),
+        "first sight of full is cold: a lookup ran and missed"
     );
     let cold_first = first_token_top(&cold);
     ex.drop_request(RequestId::new(1)).expect("drop req1");
@@ -240,13 +324,15 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         })
         .expect("short prefill");
     assert_eq!(
-        s.requests[0].cached_tokens, 0,
-        "short re-warms blocks 0..3 cold"
+        s.requests[0].cached_tokens,
+        Some(0),
+        "short re-warms blocks 0..3 cold: a lookup ran and missed"
     );
     ex.drop_request(RequestId::new(2)).expect("drop req2");
 
     // ── Prefetch `full`: GPU hits blocks 0..3, the host tier must supply the
     // continuation 3..6. A pure GPU hit would not start a load. ──
+    let before = ex.connector_lookup_counters();
     let hit = ex.begin_kv_prefetch(RequestId::new(3), &full, None, 0);
     assert!(
         hit,
@@ -268,11 +354,132 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         .expect("warm full prefill");
     assert_eq!(
         warm.requests[0].cached_tokens,
-        6 * BLOCK,
+        Some(6 * BLOCK),
         "combined hit: 3 GPU-resident + 3 CPU-restored blocks match as one prefix"
+    );
+    // Only the second half crossed the connector: the first 3 blocks were
+    // already in HBM, so they belong to the local family.
+    assert_eq!(
+        warm.requests[0].external_hit_tokens,
+        Some(3 * BLOCK),
+        "the GPU-resident half is local, the restored half is external"
+    );
+    assert_eq!(
+        lookups_since(ex, before),
+        ((full.len() - 3 * BLOCK) as u64, (3 * BLOCK) as u64),
+        "the connector was asked about everything past the GPU-resident half \
+         and restored the second half"
     );
     let warm_first = first_token_top(&warm);
     ex.drop_request(RequestId::new(3)).expect("drop req3");
 
     assert_close(&cold_first, &warm_first);
+}
+
+/// The connector restores only part of the prompt, and while the request is
+/// parked on that load another request computes the whole prompt locally.
+/// The admission-time match then spans the loaded blocks and the sibling's
+/// longer prefix; only the loaded blocks crossed the connector, so only they
+/// are external hits.
+fn local_growth_after_a_partial_load_stays_local(ex: &mut Qwen3Executor) {
+    let full = prompt(13, 100); // 6 full blocks (96 tok) + 4-token tail
+    let short = full[..50].to_vec(); // 3-block prefix of `full`
+
+    // ── Only `short`'s 3 blocks reach the host tier; HBM keeps none. ──
+    ex.execute_prefill(PrefillPlan {
+        sample_seed: 0,
+        requests: &[prefill_item(1, &short)],
+    })
+    .expect("cold short prefill");
+    ex.drop_request(RequestId::new(1)).expect("drop req1");
+    ex.flush_offload_saves();
+    ex.evict_cached_blocks();
+
+    // ── Request 2 asks the connector about all of `full` (nothing local) and
+    // loads the 3 blocks it has. ──
+    let id = RequestId::new(2);
+    let before = ex.connector_lookup_counters();
+    assert!(
+        ex.begin_kv_prefetch(id, &full, None, 0),
+        "the host tier holds the first 3 blocks"
+    );
+    let ready = ex.wait_ready_prefetch(0);
+    assert!(ready.contains(&id), "prefetch must settle, got {ready:?}");
+
+    // ── While request 2 is parked, request 3 computes `full` and registers
+    // blocks 3..6 locally. ──
+    ex.execute_prefill(PrefillPlan {
+        sample_seed: 0,
+        requests: &[prefill_item(3, &full)],
+    })
+    .expect("sibling full prefill");
+    ex.drop_request(RequestId::new(3)).expect("drop req3");
+
+    let admitted = ex
+        .execute_prefill(PrefillPlan {
+            sample_seed: 0,
+            requests: &[prefill_item(2, &full)],
+        })
+        .expect("admitted full prefill");
+    assert_eq!(
+        admitted.requests[0].cached_tokens,
+        Some(6 * BLOCK),
+        "3 loaded blocks + the sibling's 3 local blocks match as one prefix"
+    );
+    assert_eq!(
+        admitted.requests[0].external_hit_tokens,
+        Some(3 * BLOCK),
+        "only the loaded blocks are external; the sibling's growth is local"
+    );
+    assert_eq!(
+        lookups_since(ex, before),
+        (full.len() as u64, (3 * BLOCK) as u64),
+        "the connector was asked about the whole prompt and restored 3 blocks"
+    );
+    ex.drop_request(id).expect("drop req2");
+}
+
+/// A request whose load settled and which is then cancelled before its first
+/// prefill (the scheduler's abort and reject paths both end in
+/// `drop_request`) still asked the connector. Its lookup must reach the
+/// counters as a query with no hits, exactly once.
+fn cancelled_after_load_still_counts_its_lookup(ex: &mut Qwen3Executor) {
+    let p = prompt(17, 50); // 3 full blocks (48 tok) + 2-token tail
+
+    ex.execute_prefill(PrefillPlan {
+        sample_seed: 0,
+        requests: &[prefill_item(1, &p)],
+    })
+    .expect("cold prefill");
+    ex.drop_request(RequestId::new(1)).expect("drop req1");
+    ex.flush_offload_saves();
+    ex.evict_cached_blocks();
+
+    let id = RequestId::new(2);
+    let before = ex.connector_lookup_counters();
+    assert!(
+        ex.begin_kv_prefetch(id, &p, None, 0),
+        "P must hit the CPU tier after GPU eviction"
+    );
+    let ready = ex.wait_ready_prefetch(0);
+    assert!(ready.contains(&id), "prefetch must settle, got {ready:?}");
+    assert_eq!(
+        lookups_since(ex, before),
+        (0, 0),
+        "a lookup is settled when the request leaves, not when it is sent"
+    );
+
+    // Cancelled while parked: no prefill ever runs for it.
+    ex.drop_request(id).expect("drop req2");
+    assert_eq!(
+        lookups_since(ex, before),
+        (p.len() as u64, 0),
+        "a cancelled request still reports the query it sent, with no hits"
+    );
+    ex.drop_request(id).expect("drop req2 again");
+    assert_eq!(
+        lookups_since(ex, before),
+        (p.len() as u64, 0),
+        "a lookup is settled once"
+    );
 }

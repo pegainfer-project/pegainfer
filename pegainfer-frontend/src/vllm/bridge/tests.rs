@@ -686,16 +686,15 @@ async fn spec_stats_are_per_interval_deltas_that_skip_idle_intervals() {
 /// Prefix-cache totals become per-interval deltas that the frontend `inc_by`s
 /// into `vllm:prefix_cache_{queries,hits}_total` for the device tier and, via
 /// the connector stats, `vllm:external_prefix_cache_*` and
-/// `prompt_tokens_cached_by_source{source="host"}` for the host tier. An
+/// `prompt_tokens_cached_by_source{source="host"}` for the host tier, or
+/// `source="external_unspecified"` when the engine cannot attribute them. An
 /// engine restart (totals going backwards) diffs from zero instead of going
 /// negative, and an engine without a prefix cache exports zeros as before.
 #[tokio::test]
 async fn prefix_cache_stats_are_per_interval_deltas_across_a_restart() {
     let mut totals = PrefixCacheCounters {
         queries: 4096,
-        hits: 0,
-        host_queries: 0,
-        host_hits: 0,
+        ..PrefixCacheCounters::default()
     };
     let (load_tx, load_rx) = tokio::sync::watch::channel(SchedulerMetrics {
         prefix_cache: Some(totals),
@@ -745,14 +744,40 @@ async fn prefix_cache_stats_are_per_interval_deltas_across_a_restart() {
     assert_eq!(by_source, [3072, 1024, 0, 0, 0]);
     assert_eq!(by_source.iter().sum::<u64>(), 4096);
 
+    // Another turn whose connector restores 512 tokens from a tier it cannot
+    // name: the hits are external, labeled `external_unspecified`, and stay
+    // out of both the local hits and the `host` label.
+    totals.queries += 2048;
+    totals.hits += 1536;
+    totals.host_queries += 1024;
+    totals.external_unspecified_hits += 512;
+    load_tx.send_replace(SchedulerMetrics {
+        prefix_cache: Some(totals),
+        ..SchedulerMetrics::default()
+    });
+    let unspecified = next_scheduler_stats(&mut output_rx).await;
+    assert_eq!(unspecified.prefix_cache_stats.base.queries, 2048);
+    assert_eq!(unspecified.prefix_cache_stats.base.hits, 1024);
+    let external = unspecified
+        .connector_prefix_cache_stats
+        .as_ref()
+        .expect("unattributed hits ride the connector stats");
+    assert_eq!(external.base.queries, 1024);
+    assert_eq!(external.base.hits, 512);
+    assert_eq!(external.hits_by_source.external_unspecified, 512);
+    assert_eq!(external.hits_by_source.host, 0);
+    let mut by_source = external.hits_by_source.counts();
+    by_source[0] += unspecified.prefix_cache_stats.base.hits;
+    assert_eq!(by_source, [1024, 0, 0, 0, 512]);
+    assert_eq!(by_source.iter().sum::<u64>(), 1536);
+
     // The engine restarts: totals fall below the baseline. The interval
     // counts from zero rather than underflowing or dropping the new work.
     load_tx.send_replace(SchedulerMetrics {
         prefix_cache: Some(PrefixCacheCounters {
             queries: 300,
             hits: 200,
-            host_queries: 0,
-            host_hits: 0,
+            ..PrefixCacheCounters::default()
         }),
         ..SchedulerMetrics::default()
     });

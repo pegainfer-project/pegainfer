@@ -34,18 +34,25 @@ pub struct SchedulerMetrics {
 
 /// Cumulative prefix-cache counters in prompt tokens, monotone since the
 /// engine started (totals for the same reason as [`SpecDecodeCounters`]).
-/// `host_hits` never exceeds `hits`; every other hit is reported as a device
-/// hit.
+/// `host_hits + external_unspecified_hits` never exceeds `hits`; every other
+/// hit is reported as a device hit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrefixCacheCounters {
     /// Prompt tokens looked up in the prefix cache.
     pub queries: u64,
     /// Prompt tokens served from the prefix cache, from any tier.
     pub hits: u64,
-    /// Prompt tokens looked up in the host tier; zero without one.
+    /// Prompt tokens looked up in the connector's tiers (host memory and any
+    /// deeper tier behind it); zero without a connector. Queries carry no
+    /// source: the frontend splits only hits by tier.
     pub host_queries: u64,
-    /// Of `hits`, tokens restored from host memory.
+    /// Of `hits`, tokens the engine knows were restored from host memory.
     pub host_hits: u64,
+    /// Of `hits`, tokens restored through the connector from a tier the
+    /// engine cannot attribute. A connector that answers from host memory,
+    /// a P2P peer or SSD behind one call reports only a block count, so
+    /// labeling those hits `host` would misattribute the peer and disk ones.
+    pub external_unspecified_hits: u64,
 }
 
 /// Upper bound on a drafter's `K`, fixing the width of
