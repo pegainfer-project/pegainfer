@@ -1,6 +1,6 @@
 # DSpark Integration (Qwen3-4B)
 
-**TL;DR:** DeepSeek's **DSpark** (paper + DeepSpec repo, Jun 2026) is **our DFlash drafter plus two bolt-ons**: (1) a *semi-autoregressive* **Markov head** — a rank-256 logit bias added in a short sequential loop over the block so each draft token conditions on the previously sampled one; this is the whole draft-quality win (+16–18% accepted length over DFlash in their offline table, paper Table 1), and (2) a **confidence head** (tiny linear → per-position survival probability) feeding a **hardware-aware prefix scheduler** that trims verify length under load — the production throughput/Pareto win. The released checkpoint `dspark_qwen3_4b_block7` has an **identical backbone to our `Qwen3-4B-DFlash-b16`** (same hidden 2560 / 5 layers / `target_layer_ids=[1,9,17,25,33]` / KV-injection) — it differs only by `block_size=7`, +4 tensors (`markov_w1 [V,256]`, `markov_w2 [V,256]`, `confidence_head.proj.weight [1,2816]`, `.bias [1]`), and an "anchor-is-the-first-prediction" block-layout tweak. **Our verify/accept/KV-transaction stack is reused unchanged** — DSpark only changes the *propose* step (the later env-gated hedge, `PEGAINFER_SPEC_HEDGE*`, additionally expands verify with extra chain spans over scratch KV pages; off by default). On the 5090 greedy sweep, DSpark beats the matched block7 DFlash baseline by **+3.6% geomean output tok/s** overall, with the expected wins on text/code (+3.1% to +15.8%; random is the synthetic exception) and a better accepted-draft distribution (**2.52 vs 2.30** accepted draft tokens/round, full-7 accept **17.4% vs 13.9%**). Decisions settled: **block_size = 7**, **reuse the target head** (DSpark's `embed_tokens`/`lm_head` are byte-identical to target Qwen3-4B's — skip loading them). **Phase 1 delta over DFlash is small: config + 2 tensor loads + one sequential Markov loop in `execute_dflash_draft`; no new verify/KV/graph** *(true of Phase 1 as landed — the later opt-in hedge adds expanded verify spans, scratch KV pages, and per-shape Markov graphs, all behind `PEGAINFER_SPEC_HEDGE*`)*. **Phase 2 (confidence-head static-threshold truncation) is a negative result, not a loss**: it is lossless but not free, and the sweep that tried it had a ±4% harness noise floor, so only c1 (where truncation is clearly harmful, because a shorter span misses the verify CUDA graph) is resolvable — c8/c16 are unresolvable, and the cost model says block7 has no money in it on this 5090 roofline (row marginal ≈9% of step time vs +18% rounds); on an L20 the row marginal is far larger and a static K=4 trim of the block-7 DFlash drafter wins +9.1% at c32 / +13.8% at c64, so what transfers is the *measure-per-(model, GPU, drafter)* rule, not the verdict (see `benchmarks/qwen3-4b-spec-decode-l20.md`). Trim belongs on **DFlash-b16**, whose accept distribution is bimodal so trimming can cut a mode, not a tail.
+**TL;DR:** DeepSeek's **DSpark** (paper + DeepSpec repo, Jun 2026) is **our DFlash drafter plus two bolt-ons**: (1) a *semi-autoregressive* **Markov head** — a rank-256 logit bias added in a short sequential loop over the block so each draft token conditions on the previously sampled one; this is the whole draft-quality win (+16–18% accepted length over DFlash in their offline table, paper Table 1), and (2) a **confidence head** (tiny linear → per-position survival probability) feeding a **hardware-aware prefix scheduler** that trims verify length under load — the production throughput/Pareto win. The released checkpoint `dspark_qwen3_4b_block7` has an **identical backbone to our `Qwen3-4B-DFlash-b16`** (same hidden 2560 / 5 layers / `target_layer_ids=[1,9,17,25,33]` / KV-injection) — it differs only by `block_size=7`, +4 tensors (`markov_w1 [V,256]`, `markov_w2 [V,256]`, `confidence_head.proj.weight [1,2816]`, `.bias [1]`), and an "anchor-is-the-first-prediction" block-layout tweak. **Our verify/accept/KV-transaction stack is reused unchanged** — DSpark only changes the *propose* step (the later env-gated hedge, `PEGAINFER_SPEC_HEDGE*`, additionally expands verify with extra chain spans over scratch KV pages; off by default). On the 5090 greedy sweep, DSpark beats the matched block7 DFlash baseline by **+3.6% geomean output tok/s** overall, with the expected wins on text/code (+3.1% to +15.8%; random is the synthetic exception) and a better accepted-draft distribution (**2.52 vs 2.30** accepted draft tokens/round, full-7 accept **17.4% vs 13.9%**). Decisions settled: **block_size = 7**, **reuse the target head** (DSpark's `embed_tokens`/`lm_head` are byte-identical to target Qwen3-4B's — skip loading them). **Phase 1 delta over DFlash is small: config + 2 tensor loads + one sequential Markov loop in `execute_dflash_draft`; no new verify/KV/graph** *(true of Phase 1 as landed — the later opt-in hedge adds expanded verify spans, scratch KV pages, and per-shape Markov graphs, all behind `PEGAINFER_SPEC_HEDGE*`)*. **Phase 2 (confidence-head static-threshold truncation) is closed without a win, not merged**: it is lossless but not free, and the 5090 sweep's ±4% floor resolves the harm (c1 at every threshold; τ≥0.60 at c8/c16) but not whether mild truncation pays — see [Phase 2](#phase-2--confidence-head--static-threshold-draft-truncation--no-win-not-merged). What transfers is the *measure-per-(model, GPU, drafter)* rule, not the verdict; the untested trim target remains **DFlash-b16** (bimodal accept ⇒ trimming can cut a mode, not a tail).
 
 Last touched: 2026-10
 
@@ -26,12 +26,12 @@ cargo test --release -p pegainfer-qwen3 --test dflash_speculative_gate
 
 What was actually built (the new DSpark code lives in its own module `pegainfer-qwen3/src/dspark.rs`):
 
-- **`dspark.rs`** — `MarkovHead { w1, w2 }` + `MarkovScratch` + `sample_block()` (the sequential semi-autoregressive loop, batched across requests) + `reservation_bytes()`. This is the home of all DSpark-specific logic; `dflash.rs` only holds an `Option<MarkovHead>` and an `Option<MarkovScratch>` and exposes `uses_markov_head()` / `markov_draft_tokens()` / `natural_drafts()` / `effective_verify_span()`.
+- **`dspark.rs`** — `MarkovHead { w1, w2 }` + `MarkovScratch` + `sample_block()` (the sequential semi-autoregressive loop, batched across requests) + `reservation_bytes()`. This is the home of all DSpark-specific logic; `dflash.rs` only holds an `Option<MarkovHead>` and an `Option<MarkovScratch>` and exposes `uses_markov_head()` / `markov_draft_tokens()` / `natural_drafts()`.
 - **Custom CUDA kernel** `markov_step_argmax` (`pegainfer-kernels/csrc/shared/argmax.cu` + FFI + `ops::markov_step_argmax_into`). **We chose to add one kernel** — the earlier "no new kernel needed" prediction below was revised: the base block logits are request-major `[N·block, V]`, so step `k` needs a *strided* argmax over row `i·block+k` plus a *per-request* bias row `i`. Composing that from existing ops would mean slicing/re-batching one column per step (messier and slower than a single strided argmax-with-bias kernel). The kernel reads `base[(i·block+k)·V+v] + bias[i·V+v]` and writes the chosen token id as `u32` so it feeds straight back as the next step's prev-token lookup. Two-stage (partial+finalize), reusing the existing batched-argmax tiling.
 - **Per-step math** = `embedding_batch(markov_w1, prev) → gemm(markov_w2) → markov_step_argmax`, looped `block_size` times; matches `VanillaMarkov.sample_block_tokens` exactly.
 - **Kernel polish after bring-up** — the two-stage Markov argmax uses programmatic dependent launch on SM90+ so the finalize kernel can be scheduled as soon as partial tiles publish their results; SM80 falls back to the normal stream-ordered launch. PDL is not a free launch, just a launch-gap reducer for this tiny finalize. The finalize kernel also writes the full request-major sampled block on device, so DSpark does one D2H per draft block instead of one D2H per step.
 - **Dual-schema config** — `DFlashConfig::from_file` now resolves both our nested `b16` schema (`dflash_config:{…}`, flat `rope_theta`) and DeepSpec's flat schema (`mask_token_id`/`target_layer_ids` flat, `rope_theta` under `rope_parameters`). `markov_rank == 0` ⇒ plain DFlash. The struct was flattened (no more `dflash_config` nesting).
-- **Anchor-first span is a *checkpoint property*, not a markov one** — DeepSpec `Qwen3DSparkModel` checkpoints (both `dspark` *and* the `markov_rank==0` `dflash`) are anchor-first: position 0 is already the first real prediction, so all `block_size` positions draft (span `block_size+1`). Our native `DFlashDraftModel` (`b16`) is anchor-drop: position 0 is a throwaway slot, only `block[1..]` draft (span `block_size`). `DFlashConfig::anchor_first` is derived from `num_anchors` presence (set ⇒ DeepSpec ⇒ anchor-first); `natural_drafts()` and `drafts_start` key on it. The confidence head is parsed but **not loaded/used** in Phase 1 (logged at load). *(This was originally — incorrectly — keyed on the markov head; see [5090 bring-up](#5090-bring-up--two-bugs-found--fixed).)*
+- **Anchor-first span is a *checkpoint property*, not a markov one** — DeepSpec `Qwen3DSparkModel` checkpoints (both `dspark` *and* the `markov_rank==0` `dflash`) are anchor-first: position 0 is already the first real prediction, so all `block_size` positions draft (span `block_size+1`). Our native `DFlashDraftModel` (`b16`) is anchor-drop: position 0 is a throwaway slot, only `block[1..]` draft (span `block_size`). `DFlashConfig::anchor_first` is derived from `num_anchors` presence (set ⇒ DeepSpec ⇒ anchor-first); `natural_drafts()` and `drafts_start` key on it. *(This was originally — incorrectly — keyed on the markov head; see [5090 bring-up](#5090-bring-up--two-bugs-found--fixed).)*
 
 **Next:** see [Results — 5090](#results--5090-greedy) for the measured A/B and [5090 bring-up](#5090-bring-up--two-bugs-found--fixed) for the two bugs the bring-up surfaced. The 5070 Ti is dev/compile/correctness only; perf runs on the 5090.
 
@@ -45,7 +45,7 @@ What was actually built (the new DSpark code lives in its own module `pegainfer-
 | `markov_head.markov_w2.weight` | `[151936, 256]` | `Linear(256→V)` bias projection — **loaded** |
 | `fc.weight` | `[2560, 12800]` | KV-injection context projection (`12800 = 2560×5` target layers) |
 | `hidden_norm.weight` / `norm.weight` | `[2560]` | context RMSNorm / final RMSNorm |
-| `confidence_head.proj.weight` / `.bias` | `[1, 2816]` / `[1]` | Phase 2 only — **skipped** (Phase 2 is a negative result; the head is parsed but never loaded) |
+| `confidence_head.proj.weight` / `.bias` | `[1, 2816]` / `[1]` | Phase 2 only — **parsed but never loaded** (logged and discarded at load; see [Phase 2](#phase-2--confidence-head--static-threshold-draft-truncation--no-win-not-merged)) |
 | `embed_tokens.weight` / `lm_head.weight` | `[151936, 2560]` | byte-identical to target — **skipped**, reuse target head |
 
 Per layer: `self_attn.{q,k,v,o}_proj` (`q 4096`, `kv 1024`, head_dim 128, 32q/8kv), `self_attn.{q,k}_norm [128]`, `mlp.{gate,up,down}_proj` (inter 9728), `input_layernorm` / `post_attention_layernorm [2560]`. Config: `block_size=7`, `markov_rank=256`, `markov_head_type="vanilla"`, `enable_confidence_head=true`, `target_layer_ids=[1,9,17,25,33]`, `mask_token_id=151669`, `rope_theta=1e6` (under `rope_parameters`).
@@ -95,7 +95,7 @@ Verifying the *whole* block wastes target batch capacity on tokens that will be 
 
 **The split that matters for us:** the **draft-quality win (1) is local and self-contained**; the **systems win (2) is a scheduler/engine change**. They are independently shippable, and (1) is most of the per-request speedup at the low/medium concurrency our single-card serving lives in.
 
-**Our own attempt at (2) did not reproduce the paper's win, and the reason is instructive** — see [Phase 2](#phase-2--confidence-head--static-threshold-draft-truncation--negative-result-not-a-loss). The paper measures against MTP-1 at DeepSeek-V4 scale (a much larger target whose verify forward dominates the step); on Qwen3-4B the fixed cost of the target forward is a far larger share of the step, so trimming rows reclaims much less than the paper's setting implies. The lesson for (2)'s eventual shape: the scheduler's `Θ = τ · SPS(B)` objective needs a **measured** cost table, and the table's key is `(batch bucket, span)` — not batch size alone — because that is the dimension the CUDA graph is actually captured on.
+**Our own attempt at (2) did not reproduce the paper's win, and the reason is instructive** — see [Phase 2](#phase-2--confidence-head--static-threshold-draft-truncation--no-win-not-merged). The paper measures against MTP-1 at DeepSeek-V4 scale (a much larger target whose verify forward dominates the step); on Qwen3-4B the fixed cost of the target forward is a far larger share of the step, so trimming rows reclaims much less than the paper's setting implies.
 
 ## How DSpark maps onto our DFlash
 
@@ -144,18 +144,18 @@ for each request block (anchor = current_token):
 
 **Decided: `block_size = 7`** — the checkpoint's trained width (matches the paper). Smaller blocks than DFlash-b16 but higher per-position accept; A/B compares block7-DSpark vs block16-DFlash on accept length **and** tok/s, not accept alone.
 
-### Phase 2 — confidence head + static-threshold draft truncation — **NEGATIVE RESULT (not a loss)**
+### Phase 2 — confidence head + static-threshold draft truncation — **no win, not merged**
 
-Truncation is *lossless* but it is not *free*, and the first attempt to measure it did not actually
-measure it. In the prototype (never merged): load `confidence_head.proj.{weight,bias}`
+Truncation is *lossless* but it is not *free*, and the first attempt did not measure the question it
+meant to. In the prototype (never merged): load `confidence_head.proj.{weight,bias}`
 (Linear `2816→1`, `2816 = 2560 + 256`), compute `c_k = σ(proj([h_k ; markov_w1[prev_k]]))` per
 position, truncate the proposed block at the first `c_k < threshold` (mirrors
 `_confident_prefix_length` in `draft_ops.py`). The draft block shrinks, the verify span shrinks
 with it, and the verify still corrects — so output stays lossless. What the threshold does *not*
 do is pay for itself.
 
-**The measurement that settles it is the control row, not the threshold rows.** The
-instrumentation-only arm (threshold 0: instrument the confidence head, truncate nothing) does
+**The row that settles how much the thresholds are worth is the control, not the threshold
+rows.** The instrumentation-only arm (threshold 0: instrument the confidence head, truncate nothing) does
 strictly *more* work than the static baseline — one extra `[2816→1]` GEMM per draft block — and
 therefore cannot legitimately be faster. It measured faster anyway:
 
@@ -165,6 +165,7 @@ therefore cannot legitimately be faster. It measured faster anyway:
 | **threshold 0 (instrument only, no truncation)** | **358.1 (+0.03%)** | **1869.3 (+1.2%)** | **2829.1 (+4.4%)** |
 | τ=0.40 | 324.9 (−9.2%) | 1856.8 (+0.5%) | 2749.7 (+1.5%) |
 | τ=0.50 | 306.2 (−14.5%) | 1733.8 (−6.2%) | 2671.4 (−1.4%) |
+| τ=0.60 | 293.8 (−17.9%) | 1682.6 (−8.9%) | 2494.9 (−7.9%) |
 | τ=0.90 | 243.0 (−32.1%) | 1393.6 (−24.6%) | 2215.3 (−18.2%) |
 
 (30 prompts, text+code, greedy, 128 out, RTX 5090; #717.)
@@ -172,26 +173,33 @@ therefore cannot legitimately be faster. It measured faster anyway:
 **So the harness's run-to-run noise floor is ≈ ±4%,** and every ±1–2% result in that table is
 unresolvable. The honest reading of the whole sweep is therefore:
 
-- **c1: static-threshold truncation is clearly harmful.** −9.2% → −32.1%, monotone in τ, far
+- **c1: truncation is clearly harmful at every threshold.** −9.2% → −32.1%, monotone in τ, far
   outside the noise band. This is a real result.
-- **c8/c16: unresolvable.** τ=0.40's +1.5%/+0.5% and τ=0.50's −1.4% all sit inside the noise
-  floor. Neither "truncation wins" nor "truncation loses" is supported.
+- **c8/c16: truncation beyond the mildest setting is resolvably harmful.** At c8/c16, τ=0.60 is
+  −8.9%/−7.9% and τ=0.90 is −24.6%/−18.2%, all outside the band; at c8 even τ=0.50's −6.2% is
+  outside. The only cells inside it are τ=0.40 (+0.5%/+1.5%) and τ=0.50 at c16 (−1.4%). So what
+  this sweep cannot answer is whether *mild* truncation pays at high concurrency — not whether
+  truncation beyond it hurts.
 
-**Why c1 hurts, and why that does not generalize.** The c1 regression is *not* mainly lost
-tokens — it is a **graph miss**. Truncating the span makes `total_tokens` differ from
-`batch_size × span`, so the `full_shape` gate in `verify_graph.rs` fails and the step runs eager
-instead of replaying the captured graph. The graph is worth +9.3% on its own at c1
-(250.9 → 274.3 tok/s, same-session A/B), and τ=0.40 measured −9.2% — so the entire c1 regression
-is explained by losing the graph, with token loss contributing ≈0.7%. c1 is
-launch-bound, where a graph miss is expensive and trimming buys nothing; c16 is compute-bound,
-where trimming could pay — but c16's row marginal is too small to pay for the token loss
-(§"What truncation can and cannot buy" below).
+**Why c1 hurts, and why that does not generalize.** The τ=0.40 c1 regression is probably not
+mainly lost tokens: a **graph miss** is the plausible mechanism. Truncating each request's span
+independently makes the batch's row count differ from `batch_size × span`, so the graph lookup
+(`span_variant` after #1177) misses and the step runs eager instead of replaying the captured
+graph — a *uniform* static trim now has its own captured span variant, while a per-request
+variable one still falls back. That attribution is **inferred, not measured on this config**: the
+only graph-vs-eager A/B we have is DFlash-b16 single-stream at ~251 tok/s (250.9 → 274.3, +9.3%),
+a different checkpoint and throughput from this 358 tok/s DSpark-block7 sweep, and not every
+truncated round misses the graph. A graph on/off run at c1 on this config is the missing
+experiment. What *is* measured is the regime split: c1 is launch-bound, where a graph miss is
+expensive and trimming buys nothing; at higher concurrency the rows start to cost something, but
+at c16 the row-marginal share is still too small to pay for the token loss (§"What truncation can
+and cannot buy" below).
 
 **This is a measurement failure, not a refutation of confidence truncation.** The sweep never
-had the resolution to test "does trimming pay at high concurrency" — and the offline
+had the resolution to test "does mild trimming pay at high concurrency" — and the offline
 counterfactual said it should: at τ=0.5 truncation removes 47.8% of the verified rows while
-keeping 91.6% of the tokens. The offline account is positive; the online account was eaten by
-the graph miss. Any future attempt needs a noise floor measured *first* (as an interleaved A/B,
+keeping 91.6% of the tokens. The offline account is positive; the online account is confounded by
+the likely graph miss (above). Any future attempt needs a noise floor measured *first* (as an interleaved A/B,
 so it is comparable to how acceptance gates are actually applied) and any ≤2% acceptance gate is
 void until that number is ≤1%.
 
@@ -211,33 +219,34 @@ the step:
 
 Halving DSpark block7's span reclaims about **half** of a ~9% share — roughly 5% of step time —
 while costing the 10–15% of committed tokens that live in positions 5–7 (the confidence median
-has already decayed to 0.290 there), i.e. +18% rounds. Net negative with margin. **Confidence
+has already decayed to 0.290 there), i.e. up to +18% more rounds. Net negative with margin. **Confidence
 truncation on block7 has no money in it on this 5090 roofline.** DFlash-b16 is a different shape: 92% of its verify
 rows are given away, and its accept distribution is **bimodal** (structured spans accept up to
 15, free text 0), so trimming can cut an entire mode rather than shave a tail. That is where a
 trim line has to be tested — and it needs no confidence head at all, only a static K.
 
 **The row marginal is a property of the GPU, not of the checkpoint.** On an L20, a *static*
-K=4 trim of the block-7 **DFlash** drafter wins **+9.1% at c32** (moving it from 6.5% below plain decode
-to 2% above) and **+13.8% at c64**, because that box is far more row-bound at high concurrency —
+K=4 trim of the block-7 **DFlash** drafter beats the untrimmed drafter by **+9.1% at c32**
+(bringing it from 6.5% below plain decode to parity — paired median +1.8%, under the study's
+2% bar) and **+13.8% at c64** (where it is still ~26% below plain; the gate is that
+concurrency's lever), because that box is far more row-bound at high concurrency —
 see [benchmarks/qwen3-4b-spec-decode-l20.md](../../benchmarks/qwen3-4b-spec-decode-l20.md). So
 "block7 has no money in it" is a 5090 statement; the portable rule is the one the L20 sweep
 derives: measure the crossover per (model, GPU, drafter), and arm a trim (or the load gate)
 **at or above** it, never below.
 
-**Status: closed as a negative result, not merged.** The confidence head is parsed but not loaded
-(`dflash/loading.rs` logs and discards it — Phase 1 deliberately ignores it), so nothing in
-`main` carries a confidence-driven truncation path. (The separate, head-free static trim above
-is measured in the L20 benchmark doc.)
+**Status: closed without a win, not merged.** The c1 harm is real; whether mild truncation pays
+at c8/c16 is unresolved. Nothing in `main` carries a confidence-driven truncation path. (The
+separate, head-free static trim above is measured in the L20 benchmark doc.)
 
 ### Phase 3 — hardware-aware prefix scheduler (the systems/throughput win) — larger, design-first
 
-The full Alg. 1 scheduler needs: an `SPS(B)` profiling table at engine init, batch-global survival-prob sorting each step, and **variable verify length per request**. Our verify path is **greedy, single-path, and CUDA-graph bucketed** (`verify_graph.rs`, captured per batch×span bucket — see `dflash-speculative-decoding.md`), so per-request variable span **fights the captured-shape invariant** (`total_tokens == batch_size × span`). This is a real engine change (likely: dynamic top-K truncation to a few discrete span buckets + an eager fallback), justified only at the high concurrency where verify waste bites. **Deferred** — and the deferral is now evidence-backed rather than a guess: Phase 2's negative result showed the verify path's *fixed* cost (36 layers' weight reads) dominates the step, so per-request trimming has to beat a fixed term it cannot touch. Before building this, the prerequisites are a measured per-`(batch bucket, span)` cost table and a per-drafter spec-off baseline, so the scheduler optimizes a real cost curve rather than the paper's `SPS(B)` shape (whose key is wrong for us: the graph is captured per bucket, so the cost is a function of rows, not batch size). Note this is also where the EAGLE **proposer trait** discussion reconnects: DSpark is a second concrete proposer, so it's the forcing function for the trait that DFlash alone didn't justify.
+The full Alg. 1 scheduler needs: an `SPS(B)` profiling table at engine init, batch-global survival-prob sorting each step, and **variable verify length per request**. Our verify path is **greedy, single-path, and CUDA-graph bucketed** (`verify_graph.rs`, captured per batch×span bucket — see `dflash-speculative-decoding.md`), so per-request variable span **fights the captured-shape invariant** (`total_tokens == batch_size × span`). This is a real engine change (likely: dynamic top-K truncation to a few discrete span buckets + an eager fallback), justified only at the high concurrency where verify waste bites. **Deferred** — and the deferral is now evidence-backed rather than a guess: Phase 2's cost model showed that the verify path's *fixed* cost (36 layers' weight reads) dominates the step, so per-request trimming has to beat a fixed term it cannot touch. Before building this, the prerequisites are a measured per-`(batch bucket, span)` cost table and a per-drafter spec-off baseline, so the scheduler optimizes a real cost curve rather than the paper's `SPS(B)` shape (whose key is wrong for us: the graph is captured per bucket, so the cost is a function of rows, not batch size). Note this is also where the EAGLE **proposer trait** discussion reconnects: DSpark is a second concrete proposer, so it's the forcing function for the trait that DFlash alone didn't justify.
 
 ## Risks / open questions
 
 - **Sequential-loop latency at small batch.** The paper's +0.2–1.3% overhead is at batch 128 where target verify dominates. At our single-stream regime (where DFlash gives 1.56–1.82×) the `block_size` sequential bias+argmax launches are more exposed. The bias is a full-vocab (V=151936) materialization per step × block_size. Mitigations to evaluate: fuse gather+GEMV+add+argmax into one kernel per step; or only materialize top-k of the base logit before adding bias. **Measure draft-step time before/after**, like the DFlash batching A/B did.
-- **Greedy vs sampling.** Our engine is greedy-lossless spec; the paper evaluates at temperature 1.0 with rejection sampling. Markov bias works identically under greedy (argmax of base+bias). The confidence head's TV-distance training target assumes sampling, so as a *learned acceptance ranker* it only ranks accept-likelihood — it does not make the Phase 2 truncation pay for itself (see [Phase 2](#phase-2--confidence-head--static-threshold-draft-truncation--negative-result-not-a-loss)); STS calibration only matters for Phase 3's throughput math.
+- **Greedy vs sampling.** Our engine is greedy-lossless spec; the paper evaluates at temperature 1.0 with rejection sampling. Markov bias works identically under greedy (argmax of base+bias). The confidence head's TV-distance training target assumes sampling, so as a *learned acceptance ranker* it only ranks accept-likelihood — it does not make the Phase 2 truncation pay for itself (see [Phase 2](#phase-2--confidence-head--static-threshold-draft-truncation--no-win-not-merged)); STS calibration only matters for Phase 3's throughput math.
 - **`tie_word_embeddings` — RESOLVED, reuse target.** Byte-compared (sha256): DSpark's `embed_tokens.weight` *and* `lm_head.weight` are **both identical** to target Qwen3-4B's `model.embed_tokens.weight` (`eabe5625…`; target is tied, no separate `lm_head`). They're just the frozen target head serialized into the checkpoint. Like plain DFlash, DSpark reuses the target's head through `compute_logits_into` and skips loading its own `embed_tokens`/`lm_head` (saves ~1.5 GiB).
 - **RNN head — skip.** Marginal gain, harder to deploy (paper §4.3.2). Markov only.
 - **CUDA-graph draft.** The draft-side piecewise graph (tracked in the DFlash doc) now has to also cover the sequential Markov steps; the eager-attention boundary story is unchanged but the bias loop is new capture surface.

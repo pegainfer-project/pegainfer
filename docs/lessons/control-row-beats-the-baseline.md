@@ -1,6 +1,6 @@
 # A Control Row That Beats the Baseline Means Your Harness Is Noisy
 
-> **TL;DR:** The most valuable row in an A/B sweep is the one that should have been *impossible* to win. Two rules, both learned the hard way on the DSpark confidence-truncation sweep (#717):
+> **TL;DR:** The most valuable row in an A/B sweep is the one that should have been *impossible* to win. Two headline rules, both learned the hard way on the DSpark confidence-truncation sweep (#717):
 >
 > - **A control that does strictly more work cannot legitimately be faster.** If it is, you have just measured your harness's noise floor, and it is the ceiling on every delta you are about to quote.
 > - **Measure that floor before you design the acceptance gate, not after.** A ±4% floor makes every ≤2% criterion unsatisfiable — but you cannot know the floor's size until you measure it.
@@ -9,37 +9,29 @@ Companion to [profile-diff-before-blaming-transport.md](profile-diff-before-blam
 
 ## The incident
 
-The DSpark Phase 2 sweep tested **static-threshold confidence truncation**: cut the proposed draft block at the first position whose predicted survival probability falls below τ, so the verify span shrinks and fewer target rows are paid for. Four thresholds (τ = 0.40 / 0.50 / 0.90) plus a static baseline, at c1 / c8 / c16, greedy, 128 out tokens, 30 text+code prompts.
+The DSpark Phase 2 sweep tested **static-threshold confidence truncation**: cut the proposed draft block at the first position whose predicted survival probability falls below τ, so the verify span shrinks and fewer target rows are paid for. Four thresholds (τ = 0.40 / 0.50 / 0.60 / 0.90) plus a static baseline, at c1 / c8 / c16, greedy, 128 out tokens, 30 text+code prompts.
 
-The headline read was "truncation is harmful at c1 (−9.2%) and roughly neutral at c8/c16". That read was **built on an unexamined control**. The sweep also ran a **threshold-0 arm**: instrument the confidence head, compute every `c_k`, truncate nothing. That arm does *strictly more work* than the static baseline — one extra `[2816→1]` GEMM per draft block — so it cannot legitimately come out ahead.
+The headline read was "truncation is harmful at c1 (−9.2% for τ=0.40) and roughly neutral at c8/c16 for the mild thresholds". That read was **built on an unexamined control**. The sweep also ran a **threshold-0 arm**: instrument the confidence head, compute every `c_k`, truncate nothing. That arm does *strictly more work* than the static baseline — one extra `[2816→1]` GEMM per draft block — so it cannot legitimately come out ahead.
 
-It came out ahead anyway:
-
-| mode | c1 | c8 | c16 |
-| --- | ---: | ---: | ---: |
-| static block7 | 358.0 | 1847.7 | 2709.0 |
-| **threshold 0 (instrument only, no truncation)** | **358.1 (+0.03%)** | **1869.3 (+1.2%)** | **2829.1 (+4.4%)** |
-| τ=0.40 | 324.9 (−9.2%) | 1856.8 (+0.5%) | 2749.7 (+1.5%) |
-| τ=0.50 | 306.2 (−14.5%) | 1733.8 (−6.2%) | 2671.4 (−1.4%) |
-| τ=0.90 | 243.0 (−32.1%) | 1393.6 (−24.6%) | 2215.3 (−18.2%) |
+It came out ahead anyway: the instrumented arm beat the baseline by **4.4% at c16** (full table in [the Phase 2 section](../models/qwen3/dspark-integration.md#phase-2--confidence-head--static-threshold-draft-truncation--no-win-not-merged)).
 
 ## Failure 1 — the control was in the table and nobody read it
 
-The threshold-0 row was present, labelled, and still got read as "instrumentation is free" instead of "the instrumented arm beat the plain arm by 4.4%". A row that *cannot* win and then wins is not a data point about the feature — it is a **measurement of the floor**. It says: **on this harness, at this concurrency, a ±4% swing is just what happens between two runs.**
+The threshold-0 row was present, labelled, and still got read as "instrumentation is free" instead of "the instrumented arm beat the plain arm". A row that *cannot* win and then wins is not a data point about the feature — it is a **measurement of the floor**. It says: **on this harness, at this concurrency, a ±4% swing is just what happens between two runs.**
 
-That reframes the whole table. τ=0.40's +1.5% at c16 and τ=0.50's −1.4% are not "a small win" and "a small loss" — they are two points inside a ±4% band, i.e. **no result at all**. Only c1 survives: −9.2% → −14.5% → −32.1%, monotone in τ, an order of magnitude outside the band.
+That reframes the whole result. The mild-threshold deltas are points inside a ±4% band, i.e. **no result at all**. What survives cleanly is the harmful direction: the c1 regression is monotone in τ and far outside the band, and τ≥0.60 is outside it at c8/c16 too. What does not survive is the question the sweep was built to answer — whether *mild* truncation (τ=0.40 at c8/c16, τ=0.50 at c16) pays.
 
 ## Failure 2 — the "negative result" was a "no result"
 
-The sweep's conclusion was written up as *truncation does not pay*. The defensible conclusion is narrower and different: **truncation is clearly harmful at c1, and unresolvable at c8/c16.** Those are not the same claim. The second one is not a refutation of confidence truncation — it is the absence of the measurement capability needed to test it. Writing "negative result" for the second is how a live hypothesis gets closed by accident.
+The sweep's conclusion was written up as *truncation does not pay*. The defensible conclusion is narrower and different: **every threshold is clearly harmful at c1, and τ≥0.60 is clearly harmful at c8/c16 (at c8 so is τ=0.50), while the mildest cells (τ=0.40 at c8/c16, τ=0.50 at c16) are unresolvable.** Those are not the same claim. The second one is not a refutation of confidence truncation — it is the absence of the measurement capability needed to test it. Writing "negative result" for the second is how a live hypothesis gets closed by accident.
 
-The tell is the offline counterfactual, which said the opposite: at τ=0.5, truncation removes 47.8% of the verified rows while keeping 91.6% of the tokens. The offline account was positive; the online account was eaten by something else entirely (a CUDA-graph miss, below). A claim of the form "the feature does not work" that is contradicted by the offline model is a claim about the *harness* until proven otherwise.
+The tell is the offline counterfactual recorded in the Phase 2 section: it was positive. The online account is confounded by a likely CUDA-graph miss. A claim of the form "the feature does not work" that is contradicted by the offline model is a claim about the *harness* until proven otherwise.
 
 ## Failure 3 — the mechanism was attributed to the feature
 
-Once the c1 regression was real, it was read as "truncation loses accepted tokens". It is not. Truncating the span makes the verify row count differ from `batch_size × span`, so the captured-graph `full_shape` gate fails and the step runs **eager**. The piecewise verify graph is worth **+9.3%** on its own at c1 (250.9 → 274.3 tok/s, same-session A/B), and τ=0.40 measured **−9.2%**. The c1 regression is therefore almost entirely **losing the graph**, with token loss contributing ≈0.7%.
+Once the c1 regression was real, it was read as "truncation loses accepted tokens". That is not a measured decomposition: a **graph miss** is the plausible mechanism, and the graph-vs-eager A/B in the Phase 2 section is on a different checkpoint and throughput, so the attribution is inferred. Truncating each request's span independently makes the batch's row count differ from `batch_size × span`, so the captured-shape lookup misses and the step runs **eager**; a uniform static trim now has its own captured variant.
 
-c1 is launch-bound, where a graph miss is expensive and trimming buys nothing. c16 is compute-bound, where trimming *could* pay. The failure was treating "c1 is bad" as "trimming is bad" — a generalization across a regime boundary that the mechanism, not the data, should have told you about. Split the result by regime before generalizing.
+c1 is launch-bound, where a graph miss is expensive and trimming buys nothing. At higher concurrency the row-marginal share grows, where trimming *could* pay. The failure was treating "c1 is bad" as "trimming is bad" — a generalization across a regime boundary that the mechanism, not the data, should have told you about. Split the result by regime before generalizing.
 
 ## The rules
 
@@ -52,5 +44,5 @@ c1 is launch-bound, where a graph miss is expensive and trimming buys nothing. c
 
 ## Where this landed
 
-- `docs/models/qwen3/dspark-integration.md` — the Phase 2 section now carries the corrected reading, the control table, the noise floor, and the 5090 cost model (row marginal ~9% of step time against a +18% round-count cost, so trimming block7 cannot pay *there*; a re-measurement on an L20 found the opposite at c32/c64, which is why the cost model must be per-GPU rather than per-checkpoint — see `benchmarks/qwen3-4b-spec-decode-l20.md`).
-- The sweep's own conclusion is recorded as **"c1 harmful, c8/c16 unresolvable"** — not as a refutation of confidence truncation.
+- `docs/models/qwen3/dspark-integration.md` — the Phase 2 section carries the corrected reading, the control table, the noise floor, and the 5090 cost model. A re-measurement on an L20 (`benchmarks/qwen3-4b-spec-decode-l20.md`) is why the cost model must be per-GPU rather than per-checkpoint.
+- The sweep's own conclusion is recorded as **"every threshold harmful at c1; τ≥0.60 harmful at c8/c16; the mildest cells unresolved"** — not as a refutation of confidence truncation.
