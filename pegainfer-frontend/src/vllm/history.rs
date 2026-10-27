@@ -28,6 +28,19 @@
 //! measure cannot read (not JSON, no messages, a last message the renderer
 //! rejects) passes through untouched and the scheduler sees no boundary; the
 //! route reports its own error for it.
+//!
+//! The conversation's earlier turns ended at boundaries of their own, each
+//! the `history_tokens` of the request that carried it, and a scheduler that
+//! keeps snapshots beyond the instance that made them (a pooled tier) can
+//! serve the turn from any of them. Those are measured here too, as
+//! `vllm_xargs.history_marks`, newest first: every message followed by an
+//! assistant message ended some earlier request, and the conversation up to
+//! it, rendered without a generation prompt, tokenizes to that request's
+//! history. The newest [`MARKS`] are measured, each a rendering of the
+//! conversation up to it, so a long agent trace pays for a few renderings
+//! rather than one per turn. A template that tokenizes a boundary
+//! differently in a longer conversation yields a mark no snapshot sits at,
+//! which costs a miss and nothing else.
 
 use std::sync::Arc;
 
@@ -68,6 +81,12 @@ use super::reasoning_effort::body_read_error;
 /// this layer to the bridge.
 pub(crate) const GENERATION_PROMPT_TOKENS: &str = "generation_prompt_tokens";
 
+/// The `vllm_xargs` key carrying the earlier turns' boundaries, newest first.
+pub(crate) const HISTORY_MARKS: &str = "history_marks";
+
+/// How many earlier turns' boundaries are measured, the newest first.
+const MARKS: usize = 8;
+
 /// The route's renderer and tokenizer, held to measure one message at a time.
 pub(crate) struct Boundary {
     renderer: DynChatRenderer,
@@ -106,10 +125,34 @@ impl Boundary {
         Some(with.len() - shared)
     }
 
+    /// Where the earlier turns of one chat body ended, newest first: the
+    /// token count of the conversation up to each message an assistant
+    /// message follows, rendered without a generation prompt.
+    fn history_marks(&self, body: &Value) -> Vec<usize> {
+        let Some(messages) = messages(body) else {
+            return Vec::new();
+        };
+        let ends = (0..messages.len().saturating_sub(1))
+            .rev()
+            .filter(|&i| messages[i + 1].role() == vllm_chat::ChatRole::Assistant);
+        let options = ChatOptions {
+            generation_prompt_mode: GenerationPromptMode::NoGenerationPrompt,
+            ..chat_options(body)
+        };
+        ends.filter_map(|i| Some(self.render(&messages[..=i], options.clone())?.len()))
+            .filter(|&m| m > 0)
+            .take(MARKS)
+            .collect()
+    }
+
     fn tokens(&self, message: &ChatMessage, chat_options: ChatOptions) -> Option<Vec<u32>> {
+        self.render(std::slice::from_ref(message), chat_options)
+    }
+
+    fn render(&self, messages: &[ChatMessage], chat_options: ChatOptions) -> Option<Vec<u32>> {
         let rendered = self
             .renderer
-            .render(&probe_request(message.clone(), chat_options))
+            .render(&probe_request(messages.to_vec(), chat_options))
             .ok()?;
         match rendered.prompt {
             Prompt::TokenIds(ids) => Some(ids),
@@ -148,7 +191,19 @@ fn field<T: DeserializeOwned>(body: &Value, key: &str) -> Option<T> {
 /// only its text: the generation prompt's shape does not depend on its tool
 /// calls, and the route rejects what this layer cannot read.
 fn last_message(body: &Value) -> Option<ChatMessage> {
-    let message = body.get("messages")?.as_array()?.last()?;
+    message(body.get("messages")?.as_array()?.last()?)
+}
+
+/// Every message, as [`last_message`] reads one; `None` when any does not read.
+fn messages(body: &Value) -> Option<Vec<ChatMessage>> {
+    body.get("messages")?
+        .as_array()?
+        .iter()
+        .map(message)
+        .collect()
+}
+
+fn message(message: &Value) -> Option<ChatMessage> {
     let role = message.get("role")?.as_str()?;
     let content = match message.get("content") {
         None | Some(Value::Null) => ChatContent::Text(String::new()),
@@ -171,12 +226,12 @@ fn last_message(body: &Value) -> Option<ChatMessage> {
     })
 }
 
-/// One message under the request's template controls, every other field at
+/// Messages under the request's template controls, every other field at
 /// the value the route resolves for a plain text chat.
-fn probe_request(message: ChatMessage, chat_options: ChatOptions) -> ChatRequest {
+fn probe_request(messages: Vec<ChatMessage>, chat_options: ChatOptions) -> ChatRequest {
     ChatRequest {
         request_id: "history-boundary-probe".to_string(),
-        messages: vec![message],
+        messages,
         sampling_params: SamplingParams::default(),
         chat_options,
         tool_context: ResolvedToolContext::default(),
@@ -194,8 +249,8 @@ fn probe_request(message: ChatMessage, chat_options: ChatOptions) -> ChatRequest
 }
 
 /// Wrap a router so every chat request carries its generation prompt's token
-/// count into `vllm_xargs`; a server whose backends did not load serves the
-/// router as is.
+/// count and its earlier turns' boundaries into `vllm_xargs`; a server whose
+/// backends did not load serves the router as is.
 pub(crate) fn mark_history(router: Router, boundary: Option<Arc<Boundary>>) -> Router {
     match boundary {
         Some(boundary) => router.layer(middleware::from_fn_with_state(boundary, mark_request)),
@@ -229,18 +284,21 @@ async fn mark_request(
         .await
 }
 
-/// Write the measured count into the body's `vllm_xargs`, returning it when
-/// the body changed. A caller's own value for the key is replaced: the count
-/// is this server's measure of its own template, not a request parameter.
+/// Write the measured count and the earlier turns' boundaries into the body's
+/// `vllm_xargs`, returning the count when the body changed. A caller's own
+/// value for either key is replaced: they are this server's measure of its
+/// own template, not request parameters.
 fn mark_generation_prompt(body: &mut Bytes, boundary: &Boundary) -> Option<usize> {
     let mut value: Value = serde_json::from_slice(body).ok()?;
     let tokens = boundary.generation_prompt_tokens(&value)?;
-    value
+    let marks = boundary.history_marks(&value);
+    let xargs = value
         .as_object_mut()?
         .entry("vllm_xargs")
         .or_insert_with(|| json!({}))
-        .as_object_mut()?
-        .insert(GENERATION_PROMPT_TOKENS.to_string(), json!(tokens));
+        .as_object_mut()?;
+    xargs.insert(GENERATION_PROMPT_TOKENS.to_string(), json!(tokens));
+    xargs.insert(HISTORY_MARKS.to_string(), json!(marks));
     // Serializing a `Value` into a `Vec` cannot fail: every key is already a
     // string, and a non-finite number degrades to `null`.
     *body = Bytes::from(serde_json::to_vec(&value).expect("a serde_json::Value serializes"));
@@ -364,8 +422,22 @@ mod tests {
         assert_eq!(changed, Some(2));
         assert_eq!(
             value["vllm_xargs"],
-            json!({"kv_transfer_params": 1, GENERATION_PROMPT_TOKENS: 2})
+            json!({"kv_transfer_params": 1, GENERATION_PROMPT_TOKENS: 2, HISTORY_MARKS: []})
         );
+    }
+
+    #[test]
+    fn the_earlier_turns_end_where_an_assistant_message_follows() {
+        // Three turns: each user message followed by an assistant one ended a
+        // request, measured as the conversation up to it; the last did not.
+        let (_, value) = mark(
+            r#"{"messages":[{"role":"system","content":"s"},{"role":"user","content":"a b"},{"role":"assistant","content":"c"},{"role":"user","content":"d"},{"role":"assistant","content":"e f"},{"role":"user","content":"g"}]}"#,
+        );
+        // `<system> s <end><user> a b <end>` is 6 words (`<end>` glues to the
+        // next role), `<assistant> c <end><user> d <end>` 4 more.
+        assert_eq!(value["vllm_xargs"][HISTORY_MARKS], json!([10, 6]));
+        let (_, value) = mark(r#"{"messages":[{"role":"user","content":"a"}]}"#);
+        assert_eq!(value["vllm_xargs"][HISTORY_MARKS], json!([]));
     }
 
     #[test]

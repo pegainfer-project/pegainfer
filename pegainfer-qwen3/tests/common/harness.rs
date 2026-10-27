@@ -52,6 +52,7 @@ pub(crate) fn request(
         prompt_tokens,
         params,
         history_tokens: None,
+        history_marks: Vec::new(),
         stop_policy,
         max_tokens,
         lora_adapter: None,

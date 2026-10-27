@@ -16,6 +16,7 @@ fn test_request(label: &str, prompt_tokens: Vec<u32>, max_tokens: usize) -> Requ
             ..SamplingParams::default()
         },
         history_tokens: None,
+        history_marks: Vec::new(),
         stop_policy: StopPolicy::new(EosPolicy::Ignore, vec![]),
         max_tokens,
         lora_adapter: None,

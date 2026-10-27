@@ -58,6 +58,7 @@ use crate::engine::StepOutputs;
 use crate::engine::StopCause;
 use crate::engine::Terminal;
 use crate::vllm::history::GENERATION_PROMPT_TOKENS;
+use crate::vllm::history::HISTORY_MARKS;
 use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
 use crate::vllm::wire::convert_stop_policy;
@@ -400,6 +401,19 @@ impl SteppedEngineBridge {
         let history_tokens = extra_arg(GENERATION_PROMPT_TOKENS)
             .and_then(serde_json::Value::as_u64)
             .and_then(|tail| prompt_tokens.len().checked_sub(tail as usize));
+        // The earlier turns' ends the chat layer measured, kept where they
+        // fall inside this turn's history.
+        let history_marks: Vec<usize> = extra_arg(HISTORY_MARKS)
+            .and_then(serde_json::Value::as_array)
+            .map(|marks| {
+                marks
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|m| m as usize)
+                    .filter(|&m| m > 0 && history_tokens.is_some_and(|h| m < h))
+                    .collect()
+            })
+            .unwrap_or_default();
         // Older stepped model producers still suppress their terminal token
         // and report only `FinishReason::Stop`. Keep the legacy sentinel for
         // that producer shape; typed stop causes carry the real token and do
@@ -427,6 +441,7 @@ impl SteppedEngineBridge {
             // independent policy below for stop classification.
             params: convert_sampling(&sampling_params),
             history_tokens,
+            history_marks,
             stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
             lora_adapter,
@@ -682,6 +697,7 @@ mod tests {
             prompt_tokens: vec![1, 2],
             params: crate::sampler::SamplingParams::default(),
             history_tokens: None,
+            history_marks: Vec::new(),
             stop_policy: StopPolicy::default(),
             max_tokens: 1,
             lora_adapter: None,

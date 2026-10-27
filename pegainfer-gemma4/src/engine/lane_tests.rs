@@ -88,6 +88,7 @@ impl Harness {
                 prompt_tokens,
                 params: pegainfer_frontend::sampler::SamplingParams::default(),
                 history_tokens: None,
+                history_marks: Vec::new(),
                 stop_policy,
                 max_tokens,
                 lora_adapter: None,
