@@ -142,6 +142,7 @@ impl DFlashMemoryReservation {
         // per-step bias is the dominant term). Zero for plain DFlash drafters.
         let markov = MarkovHead::reservation_bytes(config, max_decode_batch_size)?;
         let selector = SelectorHead::reservation_bytes(config, max_decode_batch_size)?;
+        let dspine = super::dspine::reservation_bytes(config, max_decode_batch_size)?;
 
         Ok(Self {
             kv_bytes_per_token,
@@ -152,6 +153,7 @@ impl DFlashMemoryReservation {
                 markov,
                 native,
                 selector,
+                dspine,
             ])?,
             block_size: config.block_size,
             uses_markov_head: config.uses_markov_head(),

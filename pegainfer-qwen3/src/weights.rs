@@ -357,9 +357,9 @@ unsafe impl Send for Qwen3Model {}
 unsafe impl Sync for Qwen3Model {}
 
 impl Qwen3Model {
-    /// Only the GEMM tuning samples this directly; logits go through
-    /// [`Qwen3Model::project_logits`] so the tail mask cannot be skipped.
-    pub(super) fn output_projection(&self) -> &DeviceMatrix {
+    /// The target's output projection (`lm_head`, or tied embeddings). DSpine's
+    /// vocabulary tables are built from it once at draft load.
+    pub(crate) fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 

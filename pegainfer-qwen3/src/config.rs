@@ -94,11 +94,17 @@ pub(crate) struct DFlashConfig {
     pub(crate) dspine: Option<DSpineConfig>,
 }
 
-/// Marker that the checkpoint carries a validated DSpine code bridge. The
-/// bridge dimensions are resolved from the raw config and land with the
-/// loader/forward that read them.
+/// Resolved DSpine bridge config (`tencent/Qwen3-8B-DSpine-b16`).
 #[derive(Clone, Debug)]
-pub(crate) struct DSpineConfig;
+pub(crate) struct DSpineConfig {
+    pub(crate) code_size: usize,
+    pub(crate) rank: usize,
+    pub(crate) eps: f32,
+    /// Width of the top-K serial last-write refinement.
+    pub(crate) head_topk: usize,
+    /// Draft layer indices carrying a code bridge, 0-based and ascending.
+    pub(crate) feature_layers: Vec<usize>,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct DFlashInnerConfig {
@@ -438,6 +444,7 @@ impl DSpineConfig {
             layers.last() == Some(&num_hidden_layers),
             "DSpine refines the last write, so the last draft layer must be active; got {layers:?}"
         );
+        let feature_layers = layers.iter().map(|layer| layer - 1).collect();
 
         let mut head_topk = None;
         if let Some(refine) = inner.selected_prefix_last_write_refine.as_ref() {
@@ -497,7 +504,13 @@ impl DSpineConfig {
             bridge.eps
         );
 
-        Ok(Some(Self))
+        Ok(Some(Self {
+            code_size: bridge.code_size,
+            rank: bridge.rank,
+            eps: bridge.eps,
+            head_topk,
+            feature_layers,
+        }))
     }
 }
 
@@ -685,21 +698,9 @@ impl DFlashConfig {
         self.markov_rank > 0
     }
 
-    /// The drafter config carries a DSpine code bridge. These checkpoints are
-    /// not servable yet; see [`DFlashConfig::ensure_servable`].
+    /// The drafter config carries a DSpine code bridge.
     pub(crate) fn uses_dspine(&self) -> bool {
         self.dspine.is_some()
-    }
-
-    /// Refuse draft checkpoints this build cannot serve yet. Callers run this
-    /// before loading the target so a DSpine checkpoint fails for its own
-    /// reason rather than during KV sizing or profile.
-    pub(crate) fn ensure_servable(&self) -> Result<()> {
-        ensure!(
-            !self.uses_dspine(),
-            "DSpine draft checkpoints are not supported yet"
-        );
-        Ok(())
     }
 
     /// Anchor-first block layout (see [`DFlashConfig::anchor_first`]). The markov
@@ -1068,6 +1069,13 @@ mod tests {
 
         assert!(config.uses_dspine());
         assert!(!config.anchor_first());
+
+        let dspine = config.dspine.as_ref().expect("parsed bridge");
+        assert_eq!(dspine.code_size, 1024);
+        assert_eq!(dspine.rank, 512);
+        assert_eq!(dspine.eps.to_bits(), 1e-6f32.to_bits());
+        assert_eq!(dspine.head_topk, 16);
+        assert_eq!(dspine.feature_layers, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -1077,6 +1085,22 @@ mod tests {
             .validate_for_target(&target_qwen3_8b())
             .expect("plain DFlash config should match Qwen3-8B");
         assert!(!config.uses_dspine());
+    }
+
+    #[test]
+    fn dspine_reservation_covers_tables_and_scratch() {
+        let dspine = DFlashConfig::from_json(DSPINE_8B_CONFIG).expect("DSpine config");
+        let plain = DFlashConfig::from_json(PLAIN_DFLASH_CONFIG).expect("plain config");
+        let dspine = crate::dflash::DFlashMemoryReservation::from_config(&dspine, 256)
+            .expect("DSpine reservation");
+        let plain = crate::dflash::DFlashMemoryReservation::from_config(&plain, 256)
+            .expect("plain reservation");
+        let delta = dspine.fixed_bytes - plain.fixed_bytes;
+        assert_eq!(
+            delta, 2_497_840_128,
+            "DSpine reservation must bill tables, load transients and lane scratch"
+        );
+        assert_eq!(dspine.kv_bytes_per_token, plain.kv_bytes_per_token);
     }
 
     #[test]
@@ -1307,29 +1331,5 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name}: {error:#}"));
             assert!(config.uses_dspine(), "{name}");
         }
-    }
-
-    #[test]
-    fn dspine_checkpoints_are_refused_before_the_target_loads() {
-        let directory = tempfile::tempdir().expect("temp dir");
-        fs::write(directory.path().join("config.json"), DSPINE_8B_CONFIG).expect("write config");
-
-        let Err(error) = crate::executor::Qwen3Executor::from_runtime_with_lora_options(
-            "/nonexistent-target",
-            false,
-            &[0],
-            crate::Qwen3LoraOptions::default(),
-            crate::Qwen3OffloadOptions::disabled(),
-            crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
-            Some(directory.path().to_str().expect("utf-8 path")),
-            crate::Qwen3MemoryOptions::default(),
-        ) else {
-            panic!("DSpine must be refused before the target loads");
-        };
-
-        assert!(
-            format!("{error:#}").contains("DSpine draft checkpoints are not supported yet"),
-            "unexpected error: {error:#}"
-        );
     }
 }

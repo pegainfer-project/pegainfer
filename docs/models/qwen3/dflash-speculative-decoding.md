@@ -8,7 +8,7 @@ Last touched: 2026-10
 
 Every speculative method is the same transaction; only *propose* differs.
 
-The DFlash lane uses independent argmax for plain DFlash, the Markov head for DSpark, and learned top-16 pair scoring for DFlash2. Native Speculators DFlash2 adds block-local convolutions and an anchor-based attention window. The supported `mgoin/Qwen3-4B-speculator.dflash2` checkpoint shares its embedding and LM head with the matching Qwen3-4B target, so those duplicate checkpoint tensors are not loaded. These change proposal generation; target verification and acceptance follow the same transaction below. The performance measurements in this document are from the original DFlash checkpoints.
+The DFlash lane uses independent argmax for plain DFlash, the Markov head for DSpark, learned top-16 pair scoring for DFlash2, and the DSpine code bridge + serial last-write refinement for DSpine ([dspine-integration.md](dspine-integration.md)). Native Speculators DFlash2 adds block-local convolutions and an anchor-based attention window. The supported `mgoin/Qwen3-4B-speculator.dflash2` checkpoint shares its embedding and LM head with the matching Qwen3-4B target, so those duplicate checkpoint tensors are not loaded. These change proposal generation; target verification and acceptance follow the same transaction below. The performance measurements in this document are from the original DFlash checkpoints.
 
 1. **Propose** — a method-specific drafter emits K candidate tokens.
 2. **Verify** — the target model runs ONE prefill-style forward over the K+1 span `[current_token, draft_1, …, draft_K]` and reports its argmax at every position (echo=true).
