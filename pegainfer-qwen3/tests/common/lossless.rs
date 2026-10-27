@@ -129,7 +129,6 @@ pub(crate) fn check_lossless(
         let lo = matched.saturating_sub(2);
         let hi = (matched + 3).min(base.len()).min(spec.len());
         let base_ids: Vec<u32> = base[..hi].iter().map(|s| s.id).collect();
-        let spec_ids: Vec<u32> = spec[..hi].iter().map(|s| s.id).collect();
         eprintln!("  [diag] prompt {i} matched={matched}");
         eprintln!(
             "  [diag] context+gen base ids {:?} = {:?}",
@@ -150,7 +149,6 @@ pub(crate) fn check_lossless(
                 .map(|s| (s.id, tokenizer.decode(&[s.id], false).unwrap_or_default()))
                 .collect::<Vec<_>>()
         );
-        let _ = spec_ids;
     }
 
     // The verify path runs the prefill kernel, so the right reference for the

@@ -522,20 +522,6 @@ impl Eagle3DraftModel {
         start_position: usize,
         k: usize,
     ) -> Result<Vec<u32>> {
-        anyhow::ensure!(k > 0, "EAGLE-3 draft chain needs k > 0");
-        anyhow::ensure!(
-            fused_target_hidden.hidden_dim == self.config.hidden_size
-                && fused_target_hidden.seq_len == 1,
-            "EAGLE-3 fused_target_hidden must be [hidden, 1]"
-        );
-        anyhow::ensure!(
-            chain_capacity(start_position, state.max_cache_len, k) == k,
-            "EAGLE-3 chain of {} drafts at {} overflows cache {} — an all-accepted \
-             round commits one slot more than it drafts",
-            k,
-            start_position,
-            state.max_cache_len
-        );
         let ctx = target.device_ctx();
         ops::copy_hidden_token_range_into(ctx, fused_target_hidden, 0, &mut scratch.hidden, 0, 1)?;
 

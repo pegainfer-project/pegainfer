@@ -43,10 +43,11 @@ use common::lossless::to_steps;
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B_eagle3");
 const GENERATED_TOKENS: usize = 64;
-/// The abort test's victim ignores EOS and has room for far more tokens than
-/// one request decodes in `RETIRE_TIMEOUT`, so going idle within it means the
-/// abort retired the victim.
+/// The abort test's victim ignores EOS and gets a budget of thousands of tokens
+/// so that it is meant to still be decoding when the abort is sent. Going idle
+/// afterwards does not say which path retired it.
 const VICTIM_TOKENS: usize = 8192;
+/// How long the abort test waits for the engine to go idle after the abort.
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const PROMPTS: [&str; 5] = [
@@ -252,8 +253,8 @@ fn eagle3_output_budget_edges_match_plain_greedy() {
     }
 }
 
-/// A request aborted while it is drafting is retired, and the next request
-/// drafts and stays lossless.
+/// After a drafting request is aborted the engine goes idle, and the next
+/// request drafts and stays lossless.
 #[test]
 fn eagle3_abort_mid_speculation_keeps_the_engine_lossless() {
     let Some((model_path, draft_path)) = paths_or_skip() else {
@@ -282,7 +283,7 @@ fn eagle3_abort_mid_speculation_keeps_the_engine_lossless() {
     while engine.metrics().num_running_reqs > 0 {
         assert!(
             Instant::now() < deadline,
-            "the aborted request was never retired"
+            "the engine never went idle after the abort"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
