@@ -7,6 +7,7 @@ mod deepep;
 mod deepseek_v2_lite;
 mod dflash2;
 mod dflash2_conv;
+mod dspine;
 #[cfg(feature = "deepseek-v2-lite")]
 mod dsv2_routed_moe;
 #[cfg(feature = "deepseek-v2-lite")]
@@ -96,6 +97,15 @@ pub use dflash2::DFLASH2_CANDIDATE_K;
 pub use dflash2::DFlash2Scratch;
 pub use dflash2::dflash2_select_into;
 pub use dflash2_conv::dflash2_grouped_conv_into;
+pub use dspine::feature_finish_into as dspine_feature_finish_into;
+pub use dspine::feature_message_into as dspine_feature_message_into;
+pub use dspine::normalize_codes_into as dspine_normalize_codes_into;
+pub use dspine::prepare_read_into as dspine_prepare_read_into;
+pub use dspine::scale_cols_into as dspine_scale_cols_into;
+pub use dspine::scale_const_into as dspine_scale_const_into;
+pub use dspine::serial_chain_into as dspine_serial_chain_into;
+pub use dspine::serial_table_into as dspine_serial_table_into;
+pub use dspine::topk_into as dspine_topk_into;
 pub use elementwise::SuppressIds;
 pub use elementwise::accumulate_bf16_token_scaled_to_f32_into;
 pub use elementwise::add_batch;

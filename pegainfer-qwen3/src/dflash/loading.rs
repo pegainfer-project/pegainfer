@@ -284,6 +284,27 @@ impl DFlashDraftModel {
             None
         };
 
+        let dspine = if config.uses_dspine() {
+            let bridge = crate::dflash::dspine::DSpineBridge::load(
+                ctx,
+                &shards,
+                &weight_map,
+                &config,
+                target,
+                &norm,
+            )?;
+            log::info!(
+                "DSpine bridge: code_size={}, rank={}, top_k={}, layers={:?}",
+                bridge.code_size,
+                bridge.rank,
+                bridge.head_topk,
+                bridge.feature_layers
+            );
+            Some(bridge)
+        } else {
+            None
+        };
+
         let (cos_cache, sin_cache) = precompute_rope(
             ctx,
             &RopeTableSpec {
@@ -306,6 +327,7 @@ impl DFlashDraftModel {
             sin_cache,
             markov,
             selector,
+            dspine,
         })
     }
 }

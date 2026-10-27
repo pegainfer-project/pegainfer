@@ -1,11 +1,13 @@
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use pegainfer_core::ops;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kernels::ops as kernel_ops;
 
 use crate::config::DFlashConfig;
 use crate::dspark::MarkovHead;
@@ -14,12 +16,15 @@ use crate::weights::Qwen3Model;
 use crate::weights::TransformerBlock;
 
 mod conv;
+mod dspine;
 mod loading;
 mod reservation;
 mod selector;
 
 use conv::ConvScratch;
 use conv::LayerConvs;
+use dspine::DSpineBridge;
+use dspine::DSpineScratch;
 pub(crate) use reservation::DFlashMemoryReservation;
 use selector::SelectorHead;
 use selector::SelectorScratch;
@@ -46,6 +51,8 @@ pub(crate) struct DFlashDraftModel {
     /// `block_size` positions) instead of an independent per-position argmax.
     markov: Option<MarkovHead>,
     selector: Option<SelectorHead>,
+    /// DSpine code bridge; `None` for every other drafter.
+    dspine: Option<DSpineBridge>,
 }
 
 pub(crate) struct DFlashRequestState {
@@ -113,6 +120,7 @@ pub(crate) struct DFlashBatchScratch {
     markov: Option<MarkovScratch>,
     selector: Option<SelectorScratch>,
     conv: Option<ConvScratch>,
+    dspine: Option<DSpineScratch>,
 }
 
 impl DFlashRequestState {
@@ -286,6 +294,10 @@ impl DFlashBatchScratch {
                 .uses_markov_head()
                 .then(|| MarkovScratch::new(ctx, config, max_decode_batch_size))
                 .transpose()?,
+            dspine: config
+                .uses_dspine()
+                .then(|| DSpineScratch::new(ctx, config, max_decode_batch_size))
+                .transpose()?,
         })
     }
 
@@ -324,6 +336,9 @@ impl DFlashBatchScratch {
         self.act_out.seq_len = batch_block_rows;
         self.logits_normed.seq_len = batch_block_rows;
         self.logits.seq_len = batch_block_rows;
+        if let Some(dspine) = self.dspine.as_mut() {
+            dspine.activate(batch_block_rows);
+        }
     }
 
     /// Size the shared varlen tail buffers for one request's `tail_len =
@@ -633,15 +648,20 @@ impl DFlashDraftModel {
         debug_assert_eq!(scratch.k_tail.hidden_dim, kv_dim);
         debug_assert_eq!(scratch.gate_out.hidden_dim, inter_dim);
 
+        let mut input_normed = false;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // Dense: input layernorm over the whole batch.
-            ops::rms_norm_batch_into(
-                ctx,
-                &scratch.hidden,
-                &layer.input_layernorm,
-                self.config.rms_norm_eps,
-                &mut scratch.normed,
-            );
+            // Dense: input layernorm over the whole batch. A DSpine bridge
+            // already produced the next layer's input norm.
+            if !input_normed {
+                ops::rms_norm_batch_into(
+                    ctx,
+                    &scratch.hidden,
+                    &layer.input_layernorm,
+                    self.config.rms_norm_eps,
+                    &mut scratch.normed,
+                );
+            }
+            input_normed = false;
 
             if let (Some(convs), Some(conv_scratch)) = (&self.convs, scratch.conv.as_mut()) {
                 convs[layer_idx]
@@ -742,24 +762,41 @@ impl DFlashDraftModel {
                 )?;
                 // The trained mask keeps W target-context tokens before the
                 // anchor and the entire noncausal draft block for every query.
+                // DSpine drafts use causal attention inside the block.
                 let prefix = state.committed_len + context_len;
                 let kv_start = self
                     .config
                     .sliding_window
                     .map_or(0, |window| prefix.saturating_sub(window));
-                pegainfer_kernels::ops::single_prefill_nhd_noncausal_range_into(
-                    ctx,
-                    &scratch.q_batch,
-                    row_offset,
-                    block_size,
-                    &cache.k,
-                    &cache.v,
-                    &mut scratch.attn_output,
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
-                    kv_start..state.committed_len + tail_len,
-                )?;
+                if self.config.uses_dspine() {
+                    pegainfer_kernels::ops::single_prefill_nhd_causal_into(
+                        ctx,
+                        &scratch.q_batch,
+                        row_offset,
+                        block_size,
+                        &cache.k,
+                        &cache.v,
+                        &mut scratch.attn_output,
+                        self.config.num_attention_heads,
+                        self.config.num_key_value_heads,
+                        self.config.head_dim,
+                        state.committed_len + tail_len,
+                    )?;
+                } else {
+                    pegainfer_kernels::ops::single_prefill_nhd_noncausal_range_into(
+                        ctx,
+                        &scratch.q_batch,
+                        row_offset,
+                        block_size,
+                        &cache.k,
+                        &cache.v,
+                        &mut scratch.attn_output,
+                        self.config.num_attention_heads,
+                        self.config.num_key_value_heads,
+                        self.config.head_dim,
+                        kv_start..state.committed_len + tail_len,
+                    )?;
+                }
             }
 
             // Dense: o_proj + residual + post-attention norm + MLP over the batch.
@@ -829,6 +866,24 @@ impl DFlashDraftModel {
                 &mut scratch.hidden_out,
             )?;
             std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_out);
+
+            if let Some(bridge) = self.dspine.as_ref() {
+                if bridge.is_active_layer(layer_idx) {
+                    let next_norm = self
+                        .layers
+                        .get(layer_idx + 1)
+                        .map(|next| &next.input_layernorm);
+                    bridge.write_after_layer(
+                        ctx,
+                        layer_idx,
+                        scratch,
+                        next_norm,
+                        self.config.rms_norm_eps,
+                        block_size,
+                    )?;
+                    input_normed = layer_idx + 1 < self.layers.len();
+                }
+            }
         }
 
         for (i, state) in states.iter_mut().enumerate() {
@@ -937,6 +992,82 @@ impl DFlashDraftModel {
 
     pub(crate) fn uses_selector(&self) -> bool {
         self.selector.is_some()
+    }
+
+    pub(crate) fn uses_dspine(&self) -> bool {
+        self.dspine.is_some()
+    }
+
+    /// DSpine greedy proposal: top-K the last-layer logits, build the serial
+    /// lane table from the last write's stash, and walk it into
+    /// `[anchor, draft, ...]` per request.
+    pub(crate) fn dspine_draft_tokens(
+        &self,
+        ctx: &DeviceContext,
+        target: &Qwen3Model,
+        batch: usize,
+        scratch: &mut DFlashBatchScratch,
+    ) -> Result<Vec<u32>> {
+        let bridge = self
+            .dspine
+            .as_ref()
+            .context("DSpine proposal without a bridge")?;
+        let block_size = self.block_size();
+        let proposals = batch * (block_size - 1);
+        let k = bridge.head_topk;
+        let dspine = scratch
+            .dspine
+            .as_mut()
+            .context("DSpine proposal without scratch")?;
+        let rows = batch * block_size;
+        ensure!(
+            scratch.logits.seq_len == rows,
+            "DSpine logits rows {} != request rows {rows}",
+            scratch.logits.seq_len
+        );
+        ensure!(
+            dspine.candidates.len() >= proposals * k
+                && dspine.idx.len() >= proposals * k
+                && dspine.tokens.len() >= rows,
+            "DSpine proposal scratch is too small for batch {batch}"
+        );
+        kernel_ops::dspine_topk_into(
+            ctx,
+            &scratch.logits,
+            batch,
+            block_size,
+            k,
+            &mut dspine.candidates,
+        )?;
+        kernel_ops::dspine_serial_table_into(
+            ctx,
+            &dspine.packed,
+            &dspine.rms,
+            &scratch.hidden_out,
+            target.output_projection(),
+            &self.norm,
+            &bridge.tg,
+            &bridge.tsv,
+            &bridge.gate_bias,
+            &dspine.candidates,
+            &scratch.token_ids_d,
+            &mut dspine.idx,
+            batch,
+            block_size,
+            k,
+        )?;
+        kernel_ops::dspine_serial_chain_into(
+            ctx,
+            &dspine.idx,
+            &dspine.candidates,
+            &scratch.token_ids_d,
+            &mut dspine.tokens,
+            batch,
+            block_size,
+            k,
+        )?;
+        let host = ctx.stream.clone_dtoh(&dspine.tokens.slice(..rows))?;
+        Ok(host)
     }
 
     pub(crate) fn selected_draft_tokens(
