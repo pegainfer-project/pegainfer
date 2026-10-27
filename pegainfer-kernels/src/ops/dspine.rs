@@ -532,7 +532,7 @@ mod tests {
                 })
                 .sum::<f32>()
                 / dim as f32;
-            let r = mean.max(1.1754943508222875e-38).sqrt();
+            let r = mean.max(f32::MIN_POSITIVE).sqrt();
             expected_rms.push(r);
             for col in 0..dim {
                 let want = raw[row * dim + col].to_f32() / (r + 1e-6);
@@ -547,13 +547,13 @@ mod tests {
         let mut out = HiddenStates::zeros(&ctx, dim, rows).unwrap();
         feature_finish_into(&ctx, &raw_d, &delta_d, &rms, &mut out, block).expect("finish");
         let out_host = host(&ctx, &out);
-        for row in 0..rows {
+        for (row, &row_rms) in expected_rms.iter().enumerate() {
             for col in 0..dim {
                 let index = row * dim + col;
                 let want = if row % block == 0 {
                     raw[index].to_f32()
                 } else {
-                    raw[index].to_f32() + expected_rms[row] * delta[index].to_f32()
+                    raw[index].to_f32() + row_rms * delta[index].to_f32()
                 };
                 let want = bf16::from_f32(want).to_f32();
                 assert!((out_host[index] - want).abs() < 2e-3);
@@ -646,6 +646,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a GPU"]
+    #[allow(clippy::many_single_char_names)]
     fn topk_and_serial_chain_match_the_reference() {
         let ctx = DeviceContext::new().expect("GPU required");
         let batch = 2usize;
@@ -764,7 +765,7 @@ mod tests {
                         dot += m * tg[token * rank + d].to_f32();
                     }
                     let score = base[j] + rms[row] * dot;
-                    if score > best || (score == best && j < best_lane) {
+                    if score > best {
                         best = score;
                         best_lane = j;
                     }
