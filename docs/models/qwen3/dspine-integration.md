@@ -118,17 +118,31 @@ times, so the ratios are the transferable claim.
 
 | op (batch 256) | original | final | ratio |
 | --- | --- | --- | --- |
-| top-K | 23.5 ms | 4.4 ms | 5.3× (same-session A/B 4.75×) |
-| serial table | 19.6 ms | 4.8 ms | 4.1× (same-session A/B 3.7×) |
-| feature finish + next norm | 1.14 ms/layer | 0.51 ms/layer | 2.2× (fused vs the vectorized two-op path: 1.53×) |
-| prepare read | 0.42 ms/layer | 0.25 ms/layer | 1.7× |
+| top-K | 23.0 ms | 4.2 ms | 5.5× |
+| serial table | 21.0 ms | 5.6 ms | 3.8× |
+| feature finish + next norm | 1.14 ms/layer | 0.40 ms/layer | 2.9× |
+| prepare read | 0.42 ms/layer | 0.19 ms/layer | 2.2× |
 
-At batch 1 the top-K drops 2.9× (0.235 → 0.081 ms) and the score table 7.7×
-(0.507 → 0.066 ms); a full 256-batch round's DSpine kernel bill falls from about
-50 ms to about 14 ms (≈3.6×). The bracketed A/B ratios come from interleaved
-same-session runs and are the conservative numbers; single-path runs and the
-original baseline were taken in separate sessions, so GPU clock drift is folded
-into the unbracketed ratios. Changes, one variable at a time:
+At batch 1 the top-K drops 2.8× (0.235 → 0.083 ms) and the score table 7.8×
+(0.515 → 0.066 ms); a full 256-batch round's DSpine kernel bill falls from about
+53 ms to about 14 ms (≈3.8×). Original and final were measured with the same
+scattered-candidate protocol in separate sessions, so GPU clock drift is folded
+into the ratios; the earlier same-session A/B (top-K 4.75×, score table 3.7×)
+was taken with a constant-candidate bench and is the conservative comparison.
+
+The first benchmark filled the candidate list from the top-K of a constant
+logits buffer, so every row read the same sixteen LM-head/TG/TSV rows and ncu
+reported only 3.6% DRAM throughput for the score table. The benchmark now fills
+scattered candidate ids and anchors, and the "original" row above was re-measured
+under that protocol (23.0/21.0 ms).
+
+ncu evidence at batch 256 (needs `--cap-add=SYS_ADMIN`; without it the driver
+returns `ERR_NVGPUCTRPERM`): the final top-K runs 4.47 ms at **91.6% DRAM
+throughput** (memory roofline), and the final score table runs 5.33 ms at 47%
+DRAM / 83% L1-TEX throughput with 49% achieved occupancy. `nsys` is installed
+and runs, but on this driver/toolkit combination its CUDA kernel trace records
+only a single kernel instance even for a three-kernel probe, so no timeline is
+claimed; kernel attribution came from ncu. Changes, one variable at a time:
 
 - top-K: the scan now runs one 8-lane group per chunk (one aligned 16 B vector
   per lane, four chunks in flight per group) and the chunk/value selection uses
@@ -148,9 +162,10 @@ change f32 summation order; the previously measured L20 end-to-end gate was not
 re-run after this tuning (the kernel tests and lossless transaction are the
 oracles here).
 
-`nsys` is not installed in the tuning environment and `ncu` cannot open
-performance counters there (ERR_NVGPUCTRPERM), so no profiler artifacts are
-claimed; the optimization targets were selected from the per-op event timings.
+Profiler notes: `ncu` is usable with `--cap-add=SYS_ADMIN` and its reports are
+saved under `target/ncu-*.ncu-rep`; `nsys` kernel tracing is unusable on this
+driver/toolkit combination (one kernel instance recorded for a three-kernel
+probe), so the event timings and ncu single-kernel data are the evidence.
 
 ## Evidence
 

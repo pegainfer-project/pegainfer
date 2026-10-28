@@ -102,7 +102,10 @@ fn dspine_microbench() -> Result<()> {
     let mut normed = hidden(&ctx, HIDDEN, max_rows, 0.01);
     let codebook = matrix(&ctx, VOCAB, CODE, 0.01);
     let mut codes = hidden(&ctx, CODE, max_rows, 0.01);
-    let ids: CudaSlice<u32> = ctx.stream.alloc_zeros(max_rows)?;
+    let ids_host: Vec<u32> = (0..max_rows)
+        .map(|i| ((i as u64 * 7919) % VOCAB as u64) as u32)
+        .collect();
+    let ids: CudaSlice<u32> = ctx.stream.clone_htod(&ids_host)?;
     let mut packed = hidden(&ctx, 3 * RANK, max_rows, 0.01);
     let bias = vector(&ctx, RANK, 0.01);
     let mut message = hidden(&ctx, RANK, max_rows, 0.01);
@@ -114,7 +117,14 @@ fn dspine_microbench() -> Result<()> {
     let norm = vector(&ctx, HIDDEN, 0.01);
     let tg = matrix(&ctx, VOCAB, RANK, 0.01);
     let tsv = matrix(&ctx, VOCAB, 2 * RANK, 0.01);
-    let mut candidates: CudaSlice<i32> = ctx.stream.alloc_zeros(max_proposals * K)?;
+    // Scattered candidate ids and anchors: constant ids would keep the
+    // lm_head/TG/TSV rows hot in cache and understate the score table's DRAM
+    // traffic relative to a real draft round.
+    let candidate_host: Vec<i32> = (0..max_proposals * K)
+        .map(|i| ((i as u64 * 2_654_435_761) % VOCAB as u64) as i32)
+        .collect();
+    let mut candidates: CudaSlice<i32> = ctx.stream.clone_htod(&candidate_host)?;
+    let mut topk_candidates: CudaSlice<i32> = ctx.stream.alloc_zeros(max_proposals * K)?;
     let mut idx: CudaSlice<i32> = ctx.stream.alloc_zeros(max_proposals * K)?;
     let mut tokens: CudaSlice<u32> = ctx.stream.alloc_zeros(max_rows)?;
     let mut logits = hidden(&ctx, VOCAB, max_rows, 0.5);
@@ -161,7 +171,7 @@ fn dspine_microbench() -> Result<()> {
             .unwrap();
         });
         bench(&ctx, "topk", 20, || {
-            dspine_topk_into(&ctx, &logits, batch, BLOCK, K, &mut candidates).unwrap();
+            dspine_topk_into(&ctx, &logits, batch, BLOCK, K, &mut topk_candidates).unwrap();
         });
         bench(&ctx, "serial_table", 10, || {
             dspine_serial_table_into(
