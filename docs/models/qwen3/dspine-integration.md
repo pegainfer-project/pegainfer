@@ -130,42 +130,41 @@ scattered-candidate protocol in separate sessions, so GPU clock drift is folded
 into the ratios; the earlier same-session A/B (top-K 4.75×, score table 3.7×)
 was taken with a constant-candidate bench and is the conservative comparison.
 
-The first benchmark filled the candidate list from the top-K of a constant
-logits buffer, so every row read the same sixteen LM-head/TG/TSV rows and ncu
-reported only 3.6% DRAM throughput for the score table. The benchmark now fills
-scattered candidate ids and anchors, and the "original" row above was re-measured
-under that protocol (23.0/21.0 ms).
-
-ncu evidence at batch 256 (needs `--cap-add=SYS_ADMIN`; without it the driver
-returns `ERR_NVGPUCTRPERM`): the final top-K runs 4.47 ms at **91.6% DRAM
-throughput** (memory roofline), and the final score table runs 5.33 ms at 47%
-DRAM / 83% L1-TEX throughput with 49% achieved occupancy. `nsys` is installed
-and runs, but on this driver/toolkit combination its CUDA kernel trace records
-only a single kernel instance even for a three-kernel probe, so no timeline is
-claimed; kernel attribution came from ncu. Changes, one variable at a time:
+Changes, one variable at a time:
 
 - top-K: the scan now runs one 8-lane group per chunk (one aligned 16 B vector
-  per lane, four chunks in flight per group) and the chunk/value selection uses
-  warp reductions instead of block barriers.
+  per lane, eight chunks in flight per group) and the chunk/value selection
+  uses warp reductions instead of block barriers.
 - serial table: one warp per receiver lane, candidate/TG rows staged in shared
   memory, warp-shuffle sums; no block barrier remains in the per-lane loop.
 - finish: 16 B vector passes; the next layer's input RMSNorm is fused into the
   write (both outputs derive from the same rounded bf16 row).
 - prepare read: 16 B vectors for the sum-of-squares and normalization passes.
 
+The first benchmark filled the candidate list from the top-K of a constant
+logits buffer, so every row read the same sixteen LM-head/TG/TSV rows; ncu
+reported only 3.6% DRAM throughput for the score table. The benchmark now fills
+scattered candidate ids and anchors, and the "original" row above was
+re-measured under that protocol (23.0/21.0 ms).
+
+ncu evidence at batch 256 (ncu needs `--cap-add=SYS_ADMIN`; without it the
+driver returns `ERR_NVGPUCTRPERM`; reports land in `target/ncu-*.ncu-rep`): the
+final top-K runs 4.47 ms at **91.6% DRAM throughput** (memory roofline), and
+the final score table runs 5.33 ms at 47% DRAM / 83% L1-TEX throughput with 49%
+achieved occupancy. `nsys` is installed and runs, but on this driver/toolkit
+combination its CUDA kernel trace records only a single kernel instance even
+for a three-kernel probe, so no timeline is claimed; kernel attribution came
+from ncu.
+
 Correctness after tuning: the six host-reference GPU tests pass (including an
 exact finish-output and fused-norm comparison against the production RMSNorm
-kernel, plus partial-chunk/unaligned top-K and odd-width scalar tails), the 126 `pegainfer-qwen3` lib tests pass, and Compute Sanitizer
+kernel, plus partial-chunk/unaligned top-K and odd-width scalar tails), the 126
+`pegainfer-qwen3` lib tests pass, and Compute Sanitizer
 memcheck/racecheck/synccheck report zero errors on the tests plus a
 production-shape memcheck run. The serial-table and fused-norm reductions only
 change f32 summation order; the previously measured L20 end-to-end gate was not
 re-run after this tuning (the kernel tests and lossless transaction are the
 oracles here).
-
-Profiler notes: `ncu` is usable with `--cap-add=SYS_ADMIN` and its reports are
-saved under `target/ncu-*.ncu-rep`; `nsys` kernel tracing is unusable on this
-driver/toolkit combination (one kernel instance recorded for a three-kernel
-probe), so the event timings and ncu single-kernel data are the evidence.
 
 ## Evidence
 
