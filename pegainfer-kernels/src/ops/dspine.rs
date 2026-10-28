@@ -673,9 +673,10 @@ mod tests {
             ids.sort_by_key(|&id| -((logits[row * vocab + id as usize].to_f32() * 1e6) as i64));
             let mut want = ids[..k].to_vec();
             want.sort_unstable();
-            let mut got = candidates_host[n * k..(n + 1) * k].to_vec();
-            got.sort_unstable();
-            assert_eq!(got, want, "row {row}");
+            // The lane index is the position in this ascending list, so the
+            // emission order (not just the set) is the table's contract.
+            let got = &candidates_host[n * k..(n + 1) * k];
+            assert_eq!(got, want.as_slice(), "row {row}");
         }
 
         let raw: Vec<bf16> = (0..rows * hidden_dim)
