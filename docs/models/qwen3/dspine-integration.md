@@ -139,9 +139,9 @@ into the unbracketed ratios. Changes, one variable at a time:
   write (both outputs derive from the same rounded bf16 row).
 - prepare read: 16 B vectors for the sum-of-squares and normalization passes.
 
-Correctness after tuning: the five host-reference GPU tests pass (including an
+Correctness after tuning: the six host-reference GPU tests pass (including an
 exact finish-output and fused-norm comparison against the production RMSNorm
-kernel), the 126 `pegainfer-qwen3` lib tests pass, and Compute Sanitizer
+kernel, plus partial-chunk/unaligned top-K and odd-width scalar tails), the 126 `pegainfer-qwen3` lib tests pass, and Compute Sanitizer
 memcheck/racecheck/synccheck report zero errors on the tests plus a
 production-shape memcheck run. The serial-table and fused-norm reductions only
 change f32 summation order; the previously measured L20 end-to-end gate was not
@@ -155,8 +155,9 @@ claimed; the optimization targets were selected from the per-op event timings.
 ## Evidence
 
 - Host-reference kernel tests (`dspine::tests`, ignored without a GPU):
-  read/finish, finish+fused-norm, codes/messages, top-K (ascending-id contract)
-  + serial table + chain, scale kernels.
+  read/finish, finish+fused-norm (even and odd widths), codes/messages, top-K
+  (ascending-id contract, partial chunk, unaligned row) + serial table + chain,
+  scale kernels.
 - `dflash_speculative_gate::dspine_checkpoint_is_lossless_and_accepts`
   (ignored; set `PEGAINFER_TEST_MODEL_PATH` and
   `PEGAINFER_DSPINE_TEST_MODEL_PATH`) replays three prompts × 32 greedy tokens
