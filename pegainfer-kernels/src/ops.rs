@@ -98,6 +98,7 @@ pub use dflash2::DFlash2Scratch;
 pub use dflash2::dflash2_select_into;
 pub use dflash2_conv::dflash2_grouped_conv_into;
 pub use dspine::feature_finish_into as dspine_feature_finish_into;
+pub use dspine::feature_finish_norm_into as dspine_feature_finish_norm_into;
 pub use dspine::feature_message_into as dspine_feature_message_into;
 pub use dspine::normalize_codes_into as dspine_normalize_codes_into;
 pub use dspine::prepare_read_into as dspine_prepare_read_into;
