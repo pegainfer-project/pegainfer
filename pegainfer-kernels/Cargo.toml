@@ -65,9 +65,5 @@ required-features = ["gemma4"]
 name = "grouped_rmsnorm_equivalence"
 required-features = ["qwen4"]
 
-[[test]]
-name = "qwen4_operator_microbench"
-required-features = ["qwen4"]
-
 [lints]
 workspace = true
