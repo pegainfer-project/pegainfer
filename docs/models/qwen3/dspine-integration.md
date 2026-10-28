@@ -105,11 +105,58 @@ message/rms, candidates/idx/tokens). At `max_batch=256`, block 16, the pinned
 term is **2,497,840,128 B**. The token-scaling draft KV term is unchanged;
 plain DFlash/DSpark reserve zero.
 
+## Kernel performance
+
+The proposal-side kernels run once per draft round; every elementwise bridge
+kernel runs once per active layer (five for the 8B checkpoint). A microbenchmark
+(`pegainfer-kernels/tests/dspine_microbench.rs`, ignored by default) drives the
+production entry points at the checkpoint geometry; CUDA events wrap one launch
+after five warmup iterations, and the tables report p50 over 30 samples (20 for
+top-K, 10 for the score table). Warm-L2, single-launch protocol on one RTX 5060
+Laptop (8 GB, sm_120), CUDA 12.9.1, release build; the L20 has different absolute
+times, so the ratios are the transferable claim.
+
+| op (batch 256) | original | final | ratio |
+| --- | --- | --- | --- |
+| top-K | 23.5 ms | 4.4 ms | 5.3× (same-session A/B 4.75×) |
+| serial table | 19.6 ms | 4.8 ms | 4.1× (same-session A/B 3.7×) |
+| feature finish + next norm | 1.14 ms/layer | 0.51 ms/layer | 2.2× (fused vs the vectorized two-op path: 1.53×) |
+| prepare read | 0.42 ms/layer | 0.25 ms/layer | 1.7× |
+
+At batch 1 the top-K drops 2.9× (0.235 → 0.081 ms) and the score table 7.7×
+(0.507 → 0.066 ms); a full 256-batch round's DSpine kernel bill falls from about
+50 ms to about 14 ms (≈3.6×). The bracketed A/B ratios come from interleaved
+same-session runs and are the conservative numbers; single-path runs and the
+original baseline were taken in separate sessions, so GPU clock drift is folded
+into the unbracketed ratios. Changes, one variable at a time:
+
+- top-K: the scan now runs one 8-lane group per chunk (one aligned 16 B vector
+  per lane, four chunks in flight per group) and the chunk/value selection uses
+  warp reductions instead of block barriers.
+- serial table: one warp per receiver lane, candidate/TG rows staged in shared
+  memory, warp-shuffle sums; no block barrier remains in the per-lane loop.
+- finish: 16 B vector passes; the next layer's input RMSNorm is fused into the
+  write (both outputs derive from the same rounded bf16 row).
+- prepare read: 16 B vectors for the sum-of-squares and normalization passes.
+
+Correctness after tuning: the five host-reference GPU tests pass (including an
+exact finish-output and fused-norm comparison against the production RMSNorm
+kernel), the 126 `pegainfer-qwen3` lib tests pass, and Compute Sanitizer
+memcheck/racecheck/synccheck report zero errors on the tests plus a
+production-shape memcheck run. The serial-table and fused-norm reductions only
+change f32 summation order; the previously measured L20 end-to-end gate was not
+re-run after this tuning (the kernel tests and lossless transaction are the
+oracles here).
+
+`nsys` is not installed in the tuning environment and `ncu` cannot open
+performance counters there (ERR_NVGPUCTRPERM), so no profiler artifacts are
+claimed; the optimization targets were selected from the per-op event timings.
+
 ## Evidence
 
 - Host-reference kernel tests (`dspine::tests`, ignored without a GPU):
-  read/finish, codes/messages, top-K (ascending-id contract) + serial table +
-  chain, scale kernels.
+  read/finish, finish+fused-norm, codes/messages, top-K (ascending-id contract)
+  + serial table + chain, scale kernels.
 - `dflash_speculative_gate::dspine_checkpoint_is_lossless_and_accepts`
   (ignored; set `PEGAINFER_TEST_MODEL_PATH` and
   `PEGAINFER_DSPINE_TEST_MODEL_PATH`) replays three prompts × 32 greedy tokens
@@ -130,9 +177,9 @@ plain DFlash/DSpark reserve zero.
   chain rejection sampling (tracked in #1169).
 - No draft-side CUDA Graph, TP>1, prefix cache, or hedge. Draft attention is
   full causal, matching the checkpoint.
-- The score table currently runs one block per proposal row with block
-  reductions; fusing it with the top-K or capturing the draft tail is a
-  performance follow-up, not a correctness one.
+- The score table still runs one block per proposal row; fusing it with the
+  top-K or capturing the draft tail is a performance follow-up, not a
+  correctness one.
 
 ## Running it
 
