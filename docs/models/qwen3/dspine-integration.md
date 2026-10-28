@@ -6,8 +6,8 @@ crate. DSpine adds two things over DFlash: a per-layer **adjacent-causal code
 bridge** and a **serial last-write refinement** over top-K candidates. V1 is
 greedy-only; non-greedy requests keep the existing sampled-verify path
 (lossless, but below SGLang's sampled serial chain). Verified on one L20 (46 GB):
-the greedy losslessness gate passes on five concurrent prompts for 64 tokens
-(with 15/15 draft blocks accepted on structured prompts), and single-stream
+the generic greedy losslessness gate (five sequential prompts × 64 tokens) is
+lossless (structured prompts accept whole 15-draft blocks), and single-stream
 decode measures **47.0 → 120.1 tok/s (2.56×)**. The bridge footprint is reserved
 before KV pool sizing; probabilistic sampling parity is the tracked follow-up.
 
@@ -92,9 +92,9 @@ Per draft round, after the pass-1 logits:
    `[anchor, p1..p15]`; the anchor slot is dropped by the existing
    `drafts_start = 1` rule.
 
-Only the serial last write is refined; earlier writes stay parallel. The
-top-K/score/chain kernels use `-1e30` (not `-inf`) for dead lanes to avoid
-`0 * -inf` NaNs.
+Only the serial last write is refined; earlier writes stay parallel. Dead
+lanes are masked with `-inf`/`INT_MAX`; no kernel multiplies a mask value, so
+there is no `0 * -inf` NaN path.
 
 ## Memory
 
@@ -107,15 +107,18 @@ plain DFlash/DSpark reserve zero.
 
 ## Evidence
 
-- Kernel CPU-reference tests (`dspine::tests`, ignored without a GPU):
-  read/finish, codes/messages, top-K + serial table + chain, scale kernels.
+- Host-reference kernel tests (`dspine::tests`, ignored without a GPU):
+  read/finish, codes/messages, top-K (ascending-id contract) + serial table +
+  chain, scale kernels.
 - `dflash_speculative_gate::dspine_checkpoint_is_lossless_and_accepts`
   (ignored; set `PEGAINFER_TEST_MODEL_PATH` and
-  `PEGAINFER_DSPINE_TEST_MODEL_PATH`) checks losslessness and
-  `accepted > 0`.
-- Measured on one L20 (46 GB), Qwen3-8B + DSpine b16:
-  - greedy gate: five concurrent prompts × 64 tokens, lossless; structured
-    prompts accepted runs up to 15/15.
+  `PEGAINFER_DSPINE_TEST_MODEL_PATH`) replays three prompts × 32 greedy tokens
+  against a plain engine and asserts losslessness, `accepted > 0`, and a live
+  speculative path.
+- Measured on one L20 (46 GB), Qwen3-8B + DSpine b16 (manual harness runs):
+  - generic greedy gate (`dflash_speculative_greedy_matches_plain_greedy`,
+    five sequential prompts × 64 tokens): lossless; structured prompts
+    accepted whole 15-draft blocks.
   - single-stream A/B (`dflash_speculative_perf`): 47.0 → 120.1 tok/s (2.56×).
   - Qwen3-4B DFlash gate still passes 100% lossless (plain DFlash path
     byte-identical: the DSpine branches are all gated on `uses_dspine()`).
