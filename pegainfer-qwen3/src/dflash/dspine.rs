@@ -227,7 +227,7 @@ impl DSpineBridge {
         let logits_rows = config.logits_rows;
         anyhow::ensure!(
             logits_rows > 0 && target.output_projection().rows >= logits_rows,
-            "target output projection holds {} rows, fewer than the {logits_rows}              aligned logits rows",
+            "target output projection holds {} rows, fewer than the {logits_rows} aligned logits rows",
             target.output_projection().rows
         );
         anyhow::ensure!(
