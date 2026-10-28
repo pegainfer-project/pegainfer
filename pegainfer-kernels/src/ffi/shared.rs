@@ -1104,6 +1104,20 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dspine_feature_finish_norm_cuda(
+        raw: *const Half,
+        delta: *const Half,
+        rms: *const f32,
+        out: *mut Half,
+        normed: *mut Half,
+        weight: *const Half,
+        rows: i32,
+        hidden: i32,
+        block: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dspine_topk_cuda(
         logits: *const Half,
         candidate_ids: *mut i32,

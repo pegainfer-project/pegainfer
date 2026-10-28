@@ -222,6 +222,76 @@ pub fn feature_finish_into(
     check(status, "dspine_feature_finish")
 }
 
+/// Fused [`feature_finish_into`] plus the next layer's input RMSNorm. Both
+/// outputs derive from the same rounded bf16 row, matching the two-op path.
+#[allow(clippy::too_many_arguments)]
+pub fn feature_finish_norm_into(
+    ctx: &DeviceContext,
+    raw: &HiddenStates,
+    delta: &HiddenStates,
+    rms: &CudaSlice<f32>,
+    out: &mut HiddenStates,
+    normed: &mut HiddenStates,
+    weight: &DeviceVec,
+    block_size: usize,
+    eps: f32,
+) -> Result<()> {
+    let rows = raw.seq_len;
+    let hidden = raw.hidden_dim;
+    ensure!(
+        rows > 0 && hidden > 0 && block_size > 0,
+        "DSpine finish_norm requires non-empty dimensions"
+    );
+    ensure!(
+        delta.seq_len == rows && delta.hidden_dim == hidden,
+        "DSpine finish_norm delta shape mismatch"
+    );
+    ensure!(
+        out.seq_len == rows && out.hidden_dim == hidden,
+        "DSpine finish_norm output shape mismatch"
+    );
+    ensure!(
+        normed.seq_len == rows && normed.hidden_dim == hidden,
+        "DSpine finish_norm normalized shape mismatch"
+    );
+    ensure!(
+        weight.len == hidden,
+        "DSpine finish_norm weight width {} != hidden {hidden}",
+        weight.len
+    );
+    ensure!(
+        rms.len() >= rows,
+        "DSpine rms buffer holds {} < {rows} rows",
+        rms.len()
+    );
+    raw.checked_extent("DSpine finish_norm raw")?;
+    delta.checked_extent("DSpine finish_norm delta")?;
+    out.checked_extent("DSpine finish_norm output")?;
+    normed.checked_extent("DSpine finish_norm normalized")?;
+    let (raw_ptr, _gr) = raw.data.device_ptr(&ctx.stream);
+    let (delta_ptr, _gd) = delta.data.device_ptr(&ctx.stream);
+    let (rms_ptr, _gm) = rms.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let (normed_ptr, _gn) = normed.data.device_ptr_mut(&ctx.stream);
+    let (weight_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let status = unsafe {
+        ffi::dspine_feature_finish_norm_cuda(
+            raw_ptr as *const ffi::Half,
+            delta_ptr as *const ffi::Half,
+            rms_ptr as *const f32,
+            out_ptr as *mut ffi::Half,
+            normed_ptr as *mut ffi::Half,
+            weight_ptr as *const ffi::Half,
+            rows as i32,
+            hidden as i32,
+            block_size as i32,
+            eps,
+            active_cu_stream(ctx),
+        )
+    };
+    check(status, "dspine_feature_finish_norm")
+}
+
 /// Top-`k` token ids for every proposal row (block rows 1..block), ascending.
 pub fn topk_into(
     ctx: &DeviceContext,
@@ -558,6 +628,66 @@ mod tests {
                 let want = bf16::from_f32(want).to_f32();
                 assert!((out_host[index] - want).abs() < 2e-3);
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn finish_norm_matches_the_two_op_path() {
+        let ctx = DeviceContext::new().expect("GPU required");
+        let rows = 4usize;
+        let dim = 8usize;
+        let block = 2usize;
+        let raw_host: Vec<bf16> = (0..rows * dim)
+            .map(|i| bf16::from_f32((i as f32 * 0.037).sin() * 1.5))
+            .collect();
+        let delta_host: Vec<bf16> = (0..rows * dim)
+            .map(|i| bf16::from_f32((i as f32 * 0.011).cos()))
+            .collect();
+        let norm_host: Vec<bf16> = (0..dim)
+            .map(|i| bf16::from_f32(0.5 + i as f32 * 0.01))
+            .collect();
+        let raw = hidden(&ctx, &raw_host, dim, rows);
+        let delta = hidden(&ctx, &delta_host, dim, rows);
+        let norm = vector(&ctx, &norm_host);
+        let mut rms = ctx.stream.alloc_zeros(rows).unwrap();
+        let mut normalized = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        prepare_read_into(&ctx, &raw, &mut normalized, &mut rms, 1e-6).expect("prepare");
+
+        // Production two-op path: finish, then the shared RMSNorm.
+        let mut plain = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        feature_finish_into(&ctx, &raw, &delta, &rms, &mut plain, block).expect("finish");
+        let mut plain_norm = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        crate::ops::rms_norm_batch_into(&ctx, &plain, &norm, 1e-6, &mut plain_norm);
+
+        let mut fused = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        let mut fused_norm = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        feature_finish_norm_into(
+            &ctx,
+            &raw,
+            &delta,
+            &rms,
+            &mut fused,
+            &mut fused_norm,
+            &norm,
+            block,
+            1e-6,
+        )
+        .expect("finish norm");
+
+        let plain_host = host(&ctx, &plain);
+        let plain_norm_host = host(&ctx, &plain_norm);
+        let fused_host = host(&ctx, &fused);
+        let fused_norm_host = host(&ctx, &fused_norm);
+        for (got, want) in fused_host.iter().zip(&plain_host) {
+            assert_eq!(got.to_bits(), want.to_bits(), "finish output changed");
+        }
+        for (index, (got, want)) in fused_norm_host.iter().zip(&plain_norm_host).enumerate() {
+            // One bf16 ulp of slack for the block reduction order.
+            assert!(
+                (got - want).abs() < 0.02,
+                "fused norm[{index}] = {got} vs {want}"
+            );
         }
     }
 

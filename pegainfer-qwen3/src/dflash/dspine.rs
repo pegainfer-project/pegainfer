@@ -371,24 +371,29 @@ impl DSpineBridge {
             &dspine.message,
             &mut scratch.o_buf,
         )?;
-        ops::dspine_feature_finish_into(
-            ctx,
-            &scratch.hidden,
-            &scratch.o_buf,
-            &dspine.rms,
-            &mut scratch.hidden_out,
-            block_size,
-        )?;
-        std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_out);
-        if let Some(norm) = next_norm {
-            ops::rms_norm_batch_into(
+        match next_norm {
+            // The write and the next layer's input norm share one row pass.
+            Some(norm) => ops::dspine_feature_finish_norm_into(
                 ctx,
                 &scratch.hidden,
-                norm,
-                rms_norm_eps,
+                &scratch.o_buf,
+                &dspine.rms,
+                &mut scratch.hidden_out,
                 &mut scratch.normed,
-            );
+                norm,
+                block_size,
+                rms_norm_eps,
+            )?,
+            None => ops::dspine_feature_finish_into(
+                ctx,
+                &scratch.hidden,
+                &scratch.o_buf,
+                &dspine.rms,
+                &mut scratch.hidden_out,
+                block_size,
+            )?,
         }
+        std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_out);
         Ok(())
     }
 }

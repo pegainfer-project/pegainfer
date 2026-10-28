@@ -16,28 +16,13 @@ __device__ __forceinline__ float bf2f(__nv_bfloat16 value) {
   return __bfloat162float(value);
 }
 
-// Block-wide max with lowest-index tie-breaking; blockDim must be a power of two.
-__device__ void block_argmax(float& value, int& index, float* red,
-                             int* red_index) {
-  const int tid = threadIdx.x;
-  red[tid] = value;
-  red_index[tid] = index;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      const float other = red[tid + stride];
-      const int other_index = red_index[tid + stride];
-      if (other > red[tid] ||
-          (other == red[tid] && other_index < red_index[tid])) {
-        red[tid] = other;
-        red_index[tid] = other_index;
-      }
-    }
-    __syncthreads();
+// Warp-wide all-reduce: every lane receives the sum.
+__device__ __forceinline__ float warp_sum_all(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_xor_sync(0xffffffffu, value, offset);
   }
-  value = red[0];
-  index = red_index[0];
-  __syncthreads();
+  return value;
 }
 
 __device__ float block_sum(float value, float* red) {
@@ -61,10 +46,25 @@ __global__ void prepare_read_kernel(const __nv_bfloat16* __restrict__ raw,
   const int row = blockIdx.x;
   const int64_t base = static_cast<int64_t>(row) * hidden;
   __shared__ float red[kThreads];
+  const bool vector = (hidden & 7) == 0;
   float partial = 0.0f;
-  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-    const float x = bf2f(raw[base + i]);
-    partial += x * x;
+  if (vector) {
+    const int vectors = hidden / 8;
+    for (int v = threadIdx.x; v < vectors; v += blockDim.x) {
+      const uint4 r = *reinterpret_cast<const uint4*>(raw + base + v * 8);
+      const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&r);
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const float lo = bf2f(__low2bfloat16(p[t]));
+        const float hi = bf2f(__high2bfloat16(p[t]));
+        partial += lo * lo + hi * hi;
+      }
+    }
+  } else {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+      const float x = bf2f(raw[base + i]);
+      partial += x * x;
+    }
   }
   const float mean = block_sum(partial, red) / static_cast<float>(hidden);
   __shared__ float row_rms;
@@ -74,9 +74,24 @@ __global__ void prepare_read_kernel(const __nv_bfloat16* __restrict__ raw,
   }
   __syncthreads();
   const float denom = row_rms + eps;
-  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-    normalized[base + i] =
-        __float2bfloat16(bf2f(raw[base + i]) / denom);
+  if (vector) {
+    const int vectors = hidden / 8;
+    for (int v = threadIdx.x; v < vectors; v += blockDim.x) {
+      const uint4 r = *reinterpret_cast<const uint4*>(raw + base + v * 8);
+      const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&r);
+      uint4 out;
+      __nv_bfloat162* q = reinterpret_cast<__nv_bfloat162*>(&out);
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        q[t] = __floats2bfloat162_rn(bf2f(__low2bfloat16(p[t])) / denom,
+                                     bf2f(__high2bfloat16(p[t])) / denom);
+      }
+      *reinterpret_cast<uint4*>(normalized + base + v * 8) = out;
+    }
+  } else {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+      normalized[base + i] = __float2bfloat16(bf2f(raw[base + i]) / denom);
+    }
   }
 }
 
@@ -134,12 +149,62 @@ __global__ void feature_message_kernel(const __nv_bfloat16* __restrict__ packed,
   }
 }
 
-// out = raw on anchors, else raw + rms * delta.
+// out = raw on anchors, else raw + rms * delta. One 16 B vector per iteration
+// when the row width allows it; the scalar tail keeps odd widths exact.
+__device__ __forceinline__ __nv_bfloat162 finish_pair(
+    const __nv_bfloat162 r, const __nv_bfloat162 d, float scale,
+    bool add_delta) {
+  const float add = add_delta ? scale : 0.0f;
+  return __floats2bfloat162_rn(
+      bf2f(__low2bfloat16(r)) + add * bf2f(__low2bfloat16(d)),
+      bf2f(__high2bfloat16(r)) + add * bf2f(__high2bfloat16(d)));
+}
+
+__device__ __forceinline__ uint4 finish_vec8(const uint4& r, const uint4& d,
+                                             float scale, bool add_delta,
+                                             float* sum8) {
+  const __nv_bfloat162* rp = reinterpret_cast<const __nv_bfloat162*>(&r);
+  const __nv_bfloat162* dp = reinterpret_cast<const __nv_bfloat162*>(&d);
+  __nv_bfloat162 o[4];
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    o[t] = finish_pair(rp[t], dp[t], scale, add_delta);
+    const float lo = bf2f(__low2bfloat16(o[t]));
+    const float hi = bf2f(__high2bfloat16(o[t]));
+    *sum8 += lo * lo + hi * hi;
+  }
+  uint4 packed;
+  __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&packed);
+#pragma unroll
+  for (int t = 0; t < 4; ++t) {
+    op[t] = o[t];
+  }
+  return packed;
+}
+
 __global__ void feature_finish_kernel(const __nv_bfloat16* __restrict__ raw,
                                       const __nv_bfloat16* __restrict__ delta,
                                       const float* __restrict__ rms,
                                       __nv_bfloat16* __restrict__ out,
                                       int64_t total, int hidden, int block) {
+  const bool vector = (hidden & 7) == 0;
+  if (vector) {
+    const int64_t vectors = total / 8;
+    const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t v = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         v < vectors; v += step) {
+      const int64_t index = v * 8;
+      const int row = static_cast<int>(index / hidden);
+      const float scale = rms[row];
+      const bool add_delta = (row % block) != 0;
+      const uint4 r = *reinterpret_cast<const uint4*>(raw + index);
+      const uint4 d = *reinterpret_cast<const uint4*>(delta + index);
+      float unused = 0.0f;
+      *reinterpret_cast<uint4*>(out + index) =
+          finish_vec8(r, d, scale, add_delta, &unused);
+    }
+    return;
+  }
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t index =
            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -153,16 +218,144 @@ __global__ void feature_finish_kernel(const __nv_bfloat16* __restrict__ raw,
   }
 }
 
-// Per-row top-K (K <= 64) over the proposal rows of a [batch*block, vocab] logits
-// buffer, skipping each block's anchor row. Ids are emitted ascending.
+// Fusion of feature_finish and the next layer's input RMSNorm. Both outputs are
+// produced from the same rounded bf16 row, matching the two-kernel path.
+__global__ void feature_finish_norm_kernel(
+    const __nv_bfloat16* __restrict__ raw,
+    const __nv_bfloat16* __restrict__ delta, const float* __restrict__ rms,
+    __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ normed,
+    const __nv_bfloat16* __restrict__ weight, int hidden, int block, float eps) {
+  const int row = blockIdx.x;
+  extern __shared__ unsigned char norm_smem[];
+  __nv_bfloat16* rowbuf = reinterpret_cast<__nv_bfloat16*>(norm_smem);
+  const int nwarps = blockDim.x / 32;
+  float* warp_sums = reinterpret_cast<float*>(rowbuf + hidden);
+  const int64_t base = static_cast<int64_t>(row) * hidden;
+  const float scale = rms[row];
+  const bool add_delta = (row % block) != 0;
+  float sum = 0.0f;
+  const bool vector = (hidden & 7) == 0;
+  if (vector) {
+    const int vectors = hidden / 8;
+    for (int v = threadIdx.x; v < vectors; v += blockDim.x) {
+      const int i = v * 8;
+      const uint4 r = *reinterpret_cast<const uint4*>(raw + base + i);
+      const uint4 d = *reinterpret_cast<const uint4*>(delta + base + i);
+      float squares = 0.0f;
+      const uint4 o = finish_vec8(r, d, scale, add_delta, &squares);
+      sum += squares;
+      *reinterpret_cast<uint4*>(rowbuf + i) = o;
+      *reinterpret_cast<uint4*>(out + base + i) = o;
+    }
+  } else {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+      float value = bf2f(raw[base + i]);
+      if (add_delta) {
+        value += scale * bf2f(delta[base + i]);
+      }
+      const __nv_bfloat16 rounded = __float2bfloat16(value);
+      rowbuf[i] = rounded;
+      out[base + i] = rounded;
+      const float as_float = bf2f(rounded);
+      sum += as_float * as_float;
+    }
+  }
+  sum = warp_sum_all(sum);
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  if (lane == 0) {
+    warp_sums[warp] = sum;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+    for (int w = 0; w < nwarps; ++w) {
+      total += warp_sums[w];
+    }
+    warp_sums[0] = rsqrtf(total / static_cast<float>(hidden) + eps);
+  }
+  __syncthreads();
+  const float rcp = warp_sums[0];
+  if (vector) {
+    const int vectors = hidden / 8;
+    for (int v = threadIdx.x; v < vectors; v += blockDim.x) {
+      const int i = v * 8;
+      const uint4 r = *reinterpret_cast<const uint4*>(rowbuf + i);
+      const uint4 w = *reinterpret_cast<const uint4*>(weight + i);
+      const __nv_bfloat162* rp = reinterpret_cast<const __nv_bfloat162*>(&r);
+      const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&w);
+      __nv_bfloat162 o[4];
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        o[t] = __floats2bfloat162_rn(
+            bf2f(__low2bfloat16(rp[t])) * rcp * bf2f(__low2bfloat16(wp[t])),
+            bf2f(__high2bfloat16(rp[t])) * rcp * bf2f(__high2bfloat16(wp[t])));
+      }
+      uint4 packed;
+      __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&packed);
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        op[t] = o[t];
+      }
+      *reinterpret_cast<uint4*>(normed + base + i) =
+          *reinterpret_cast<const uint4*>(&packed);
+    }
+  } else {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+      normed[base + i] = __float2bfloat16(bf2f(rowbuf[i]) * rcp *
+                                          bf2f(weight[i]));
+    }
+  }
+}
+
+// Walk the lane table from the anchor, emitting [anchor, 15 drafts] per request.
+__global__ void serial_chain_kernel(const int* __restrict__ idx,
+                                    const int* __restrict__ candidates,
+                                    const unsigned int* __restrict__ input_ids,
+                                    unsigned int* __restrict__ out, int block,
+                                    int k) {
+  const int b = blockIdx.x;
+  const int n0 = b * (block - 1);
+  int lane = idx[static_cast<int64_t>(n0) * k];
+  out[static_cast<int64_t>(b) * block] = input_ids[static_cast<int64_t>(b) * block];
+  for (int i = 0; i < block - 1; ++i) {
+    const int64_t row = n0 + i;
+    out[static_cast<int64_t>(b) * block + 1 + i] =
+        static_cast<unsigned int>(candidates[row * k + lane]);
+    if (i + 1 < block - 1) {
+      lane = idx[(row + 1) * k + lane];
+    }
+  }
+}
+
+// Warp-wide (max, lowest-id) argmax; lane 0 holds the result.
+__device__ __forceinline__ void warp_argmax(float& value, int& index) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const float other_value = __shfl_down_sync(0xffffffffu, value, offset);
+    const int other_index = __shfl_down_sync(0xffffffffu, index, offset);
+    if (other_value > value ||
+        (other_value == value && other_index < index)) {
+      value = other_value;
+      index = other_index;
+    }
+  }
+}
+
+// Coalesced 16 B chunk scan with warp-level chunk and value selection.
 __global__ void topk_kernel(const __nv_bfloat16* __restrict__ logits,
-                            int* __restrict__ out, int block, int vocab, int k) {
+                            int* __restrict__ out, int block, int vocab,
+                            int k) {
   const int n = blockIdx.x;
   const int b = n / (block - 1);
   const int i = n % (block - 1);
   const int64_t row = static_cast<int64_t>(b) * block + 1 + i;
   const __nv_bfloat16* src = logits + row * vocab;
   const int nch = (vocab + kTopkChunk - 1) / kTopkChunk;
+  const int tid = threadIdx.x;
+  const int nwarps = blockDim.x / 32;
+  const int warp = tid / 32;
+  const int lane = tid % 32;
 
   extern __shared__ unsigned char smem[];
   float* chunk_max = reinterpret_cast<float*>(smem);
@@ -177,16 +370,73 @@ __global__ void topk_kernel(const __nv_bfloat16* __restrict__ logits,
   float* red = reinterpret_cast<float*>(cursor);
   cursor += static_cast<size_t>(blockDim.x) * sizeof(float);
   int* red_id = reinterpret_cast<int*>(cursor);
+  cursor += static_cast<size_t>(blockDim.x) * sizeof(int);
+  int* winner = reinterpret_cast<int*>(cursor);
 
-  const int tid = threadIdx.x;
-  for (int c = tid; c < nch; c += blockDim.x) {
-    const int begin = c * kTopkChunk;
-    const int end = min(begin + kTopkChunk, vocab);
+  // Chunks are scanned by 8-lane groups: each lane loads one aligned 16 B
+  // vector so a warp reads four full 128 B runs per instruction, and each
+  // group carries eight chunks in flight before reducing.
+  constexpr int kGroupLanes = kTopkChunk / 8;
+  constexpr int kChunksPerGroup = 8;
+  constexpr int kGroupsPerWarp = 32 / kGroupLanes;
+  const int group = lane / kGroupLanes;
+  const int glane = lane % kGroupLanes;
+  const int full_chunks = vocab / kTopkChunk;
+  const bool aligned = (reinterpret_cast<uintptr_t>(src) & 15u) == 0;
+  if (aligned) {
+    const int per_warp = kGroupsPerWarp * kChunksPerGroup;
+    for (int base = warp * per_warp; base < full_chunks;
+         base += nwarps * per_warp) {
+      uint4 v[kChunksPerGroup];
+      int c[kChunksPerGroup];
+#pragma unroll
+      for (int q = 0; q < kChunksPerGroup; ++q) {
+        c[q] = base + group * kChunksPerGroup + q;
+        if (c[q] < full_chunks) {
+          v[q] = *reinterpret_cast<const uint4*>(
+              src + c[q] * kTopkChunk + glane * 8);
+        }
+      }
+#pragma unroll
+      for (int q = 0; q < kChunksPerGroup; ++q) {
+        float best = -CUDART_INF_F;
+        if (c[q] < full_chunks) {
+          const __nv_bfloat162* h =
+              reinterpret_cast<const __nv_bfloat162*>(&v[q]);
+#pragma unroll
+          for (int t = 0; t < 4; ++t) {
+            best = fmaxf(best, fmaxf(bf2f(__low2bfloat16(h[t])),
+                                     bf2f(__high2bfloat16(h[t]))));
+          }
+        }
+#pragma unroll
+        for (int offset = kGroupLanes / 2; offset > 0; offset >>= 1) {
+          best = fmaxf(
+              best, __shfl_down_sync(0xffffffffu, best, offset, kGroupLanes));
+        }
+        if (glane == 0 && c[q] < full_chunks) {
+          chunk_max[c[q]] = best;
+        }
+      }
+    }
+  } else {
+    for (int c = tid; c < full_chunks; c += blockDim.x) {
+      const int begin = c * kTopkChunk;
+      float best = -CUDART_INF_F;
+      for (int j = begin; j < begin + kTopkChunk; ++j) {
+        best = fmaxf(best, bf2f(src[j]));
+      }
+      chunk_max[c] = best;
+    }
+  }
+  for (int c = full_chunks + tid; c < nch; c += blockDim.x) {
     float best = -CUDART_INF_F;
-    for (int j = begin; j < end; ++j) {
+    for (int j = c * kTopkChunk; j < vocab; ++j) {
       best = fmaxf(best, bf2f(src[j]));
     }
     chunk_max[c] = best;
+  }
+  for (int c = tid; c < nch; c += blockDim.x) {
     chunk_used[c] = 0;
   }
   __syncthreads();
@@ -204,10 +454,24 @@ __global__ void topk_kernel(const __nv_bfloat16* __restrict__ logits,
         best_index = c;
       }
     }
-    block_argmax(best, best_index, red, red_id);
+    warp_argmax(best, best_index);
+    if (lane == 0) {
+      red[warp] = best;
+      red_id[warp] = best_index;
+    }
+    __syncthreads();
     if (tid == 0) {
-      selected[slot] = best_index;
-      chunk_used[best_index] = 1;
+      int chosen = INT_MAX;
+      float chosen_value = -CUDART_INF_F;
+      for (int w = 0; w < nwarps; ++w) {
+        if (red[w] > chosen_value ||
+            (red[w] == chosen_value && red_id[w] < chosen)) {
+          chosen_value = red[w];
+          chosen = red_id[w];
+        }
+      }
+      selected[slot] = chosen;
+      chunk_used[chosen] = 1;
     }
     __syncthreads();
   }
@@ -236,16 +500,32 @@ __global__ void topk_kernel(const __nv_bfloat16* __restrict__ logits,
         best_index = id;
       }
     }
-    block_argmax(best, best_index, red, red_id);
+    warp_argmax(best, best_index);
+    if (lane == 0) {
+      red[warp] = best;
+      red_id[warp] = best_index;
+    }
+    __syncthreads();
     if (tid == 0) {
-      for (int t = 0; t < k * kTopkChunk; ++t) {
-        if (lane_id[t] == best_index) {
-          lane_value[t] = -CUDART_INF_F;
-          lane_id[t] = INT_MAX;
-          break;
+      int chosen = INT_MAX;
+      float chosen_value = -CUDART_INF_F;
+      for (int w = 0; w < nwarps; ++w) {
+        if (red[w] > chosen_value ||
+            (red[w] == chosen_value && red_id[w] < chosen)) {
+          chosen_value = red[w];
+          chosen = red_id[w];
         }
       }
-      selected[slot] = best_index;
+      *winner = chosen;
+      selected[slot] = chosen;
+    }
+    __syncthreads();
+    const int chosen = *winner;
+    for (int t = tid; t < k * kTopkChunk; t += blockDim.x) {
+      if (lane_id[t] == chosen) {
+        lane_value[t] = -CUDART_INF_F;
+        lane_id[t] = INT_MAX;
+      }
     }
     __syncthreads();
   }
@@ -266,8 +546,8 @@ __global__ void topk_kernel(const __nv_bfloat16* __restrict__ logits,
   }
 }
 
-// idx[n, k] = best receiver lane for proposal row n when the previous row chose
-// lane k. One block per proposal row; lanes loop inside the block.
+// Warp-level reductions with the candidate and tg rows staged in shared
+// memory; the per-lane loop needs no block barrier.
 __global__ void serial_table_kernel(
     const __nv_bfloat16* __restrict__ packed, const float* __restrict__ rms,
     const __nv_bfloat16* __restrict__ raw,
@@ -276,89 +556,91 @@ __global__ void serial_table_kernel(
     const __nv_bfloat16* __restrict__ tg, const __nv_bfloat16* __restrict__ tsv,
     const __nv_bfloat16* __restrict__ gate_bias,
     const int* __restrict__ candidates, const unsigned int* __restrict__ input_ids,
-    int* __restrict__ idx, int block, int hidden, int rank, int k) {
+    int* __restrict__ idx, int block, int hidden, int rank, int k,
+    int cache_tg) {
   const int n = blockIdx.x;
   const int b = n / (block - 1);
   const int i = n % (block - 1);
   const int row = b * block + 1 + i;
   const int tid = threadIdx.x;
+  const int nwarps = blockDim.x / 32;
+  const int warp = tid / 32;
+  const int lane = tid % 32;
 
   extern __shared__ unsigned char table_smem[];
   float* base = reinterpret_cast<float*>(table_smem);
-  float* message = base + k;
-  float* red = message + rank;
+  int* cand = reinterpret_cast<int*>(base + k);
+  float* msg = reinterpret_cast<float*>(cand + k);
+  __nv_bfloat16* tg_s = reinterpret_cast<__nv_bfloat16*>(
+      msg + static_cast<size_t>(nwarps) * rank);
+
+  if (tid < k) {
+    cand[tid] = candidates[static_cast<int64_t>(n) * k + tid];
+  }
+  __syncthreads();
+  if (cache_tg != 0) {
+    for (int t = tid; t < k * rank; t += blockDim.x) {
+      const int j = t / rank;
+      const int d = t - j * rank;
+      tg_s[t] = tg[static_cast<int64_t>(cand[j]) * rank + d];
+    }
+  }
+  __syncthreads();
 
   const __nv_bfloat16* raw_row = raw + static_cast<int64_t>(row) * hidden;
-  for (int lane = 0; lane < k; ++lane) {
-    const int token = candidates[static_cast<int64_t>(n) * k + lane];
+  for (int j = warp; j < k; j += nwarps) {
     const __nv_bfloat16* head_row =
-        lm_head + static_cast<int64_t>(token) * hidden;
+        lm_head + static_cast<int64_t>(cand[j]) * hidden;
     float partial = 0.0f;
-    for (int h = tid; h < hidden; h += blockDim.x) {
-      partial += bf2f(raw_row[h]) * bf2f(norm_weight[h]) * bf2f(head_row[h]);
+    for (int h = lane; h < hidden; h += 32) {
+      partial = fmaf(bf2f(raw_row[h]) * bf2f(norm_weight[h]),
+                     bf2f(head_row[h]), partial);
     }
-    const float sum = block_sum(partial, red);
-    if (tid == 0) {
-      base[lane] = sum;
+    partial = warp_sum_all(partial);
+    if (lane == 0) {
+      base[j] = partial;
     }
-    __syncthreads();
   }
+  __syncthreads();
 
   const int64_t packed_base = static_cast<int64_t>(row) * 3 * rank;
   const float row_rms = rms[row];
   const int anchor = static_cast<int>(input_ids[b * block]);
-  for (int lane = 0; lane < k; ++lane) {
+  for (int receive = warp; receive < k; receive += nwarps) {
     const int sender =
-        (i == 0) ? anchor : candidates[static_cast<int64_t>(n - 1) * k + lane];
-    const int64_t tsv_base = static_cast<int64_t>(sender) * 2 * rank;
-    for (int d = tid; d < rank; d += blockDim.x) {
+        (i == 0) ? anchor
+                 : candidates[static_cast<int64_t>(n - 1) * k + receive];
+    const __nv_bfloat16* tsv_row =
+        tsv + static_cast<int64_t>(sender) * 2 * rank;
+    float* message = msg + static_cast<size_t>(warp) * rank;
+    for (int d = lane; d < rank; d += 32) {
       const float q = bf2f(packed[packed_base + d]);
-      const float s = bf2f(tsv[tsv_base + d]);
-      const float v = bf2f(tsv[tsv_base + rank + d]);
-      const float gate = 1.0f / (1.0f + expf(-(q + s + bf2f(gate_bias[d]))));
+      const float s = bf2f(tsv_row[d]);
+      const float v = bf2f(tsv_row[rank + d]);
+      const float gate =
+          1.0f / (1.0f + expf(-(q + s + bf2f(gate_bias[d]))));
       message[d] = gate * v;
     }
-    __syncthreads();
-
     float best = -CUDART_INF_F;
     int best_lane = 0;
     for (int j = 0; j < k; ++j) {
-      const int token = candidates[static_cast<int64_t>(n) * k + j];
-      const __nv_bfloat16* tg_row = tg + static_cast<int64_t>(token) * rank;
+      const __nv_bfloat16* tg_row =
+          cache_tg != 0
+              ? tg_s + static_cast<size_t>(j) * rank
+              : tg + static_cast<int64_t>(cand[j]) * rank;
       float dot = 0.0f;
-      for (int d = tid; d < rank; d += blockDim.x) {
-        dot += message[d] * bf2f(tg_row[d]);
+      for (int d = lane; d < rank; d += 32) {
+        dot = fmaf(message[d], bf2f(tg_row[d]), dot);
       }
-      const float score = base[j] + row_rms * block_sum(dot, red);
+      dot = warp_sum_all(dot);
+      const float score = base[j] + row_rms * dot;
       if (score > best || (score == best && j < best_lane)) {
         best = score;
         best_lane = j;
       }
-      __syncthreads();
     }
-    if (tid == 0) {
-      idx[static_cast<int64_t>(n) * k + lane] = best_lane;
-    }
-    __syncthreads();
-  }
-}
-
-// Walk the lane table from the anchor, emitting [anchor, 15 drafts] per request.
-__global__ void serial_chain_kernel(const int* __restrict__ idx,
-                                    const int* __restrict__ candidates,
-                                    const unsigned int* __restrict__ input_ids,
-                                    unsigned int* __restrict__ out, int block,
-                                    int k) {
-  const int b = blockIdx.x;
-  const int n0 = b * (block - 1);
-  int lane = idx[static_cast<int64_t>(n0) * k];
-  out[static_cast<int64_t>(b) * block] = input_ids[static_cast<int64_t>(b) * block];
-  for (int i = 0; i < block - 1; ++i) {
-    const int64_t row = n0 + i;
-    out[static_cast<int64_t>(b) * block + 1 + i] =
-        static_cast<unsigned int>(candidates[row * k + lane]);
-    if (i + 1 < block - 1) {
-      lane = idx[(row + 1) * k + lane];
+    if (lane == 0) {
+      idx[static_cast<int64_t>(n) * k + receive] = best_lane;
     }
   }
 }
@@ -442,9 +724,27 @@ extern "C" CUresult dspine_feature_finish_cuda(
   return map_cuda_error(cudaGetLastError());
 }
 
+extern "C" CUresult dspine_feature_finish_norm_cuda(
+    const __nv_bfloat16* raw, const __nv_bfloat16* delta, const float* rms,
+    __nv_bfloat16* out, __nv_bfloat16* normed, const __nv_bfloat16* weight,
+    int rows, int hidden, int block, float eps, cudaStream_t stream) {
+  if (rows <= 0 || hidden <= 0 || hidden > 24576 || block <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  const size_t smem = static_cast<size_t>(hidden) * sizeof(__nv_bfloat16) +
+                      static_cast<size_t>(kThreads / 32) * sizeof(float);
+  if (smem > 48 * 1024) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  feature_finish_norm_kernel<<<rows, kThreads, smem, stream>>>(
+      raw, delta, rms, out, normed, weight, hidden, block, eps);
+  return map_cuda_error(cudaGetLastError());
+}
+
 extern "C" CUresult dspine_topk_cuda(const __nv_bfloat16* logits,
-                                     int* candidate_ids, int batch, int block,
-                                     int vocab, int k, cudaStream_t stream) {
+                                        int* candidate_ids, int batch, int block,
+                                        int vocab, int k,
+                                        cudaStream_t stream) {
   if (batch <= 0 || block < 2 || vocab <= 0 || k < 1 || k > 64 ||
       (k & (k - 1)) != 0 || vocab < k * kTopkChunk) {
     return CUDA_ERROR_INVALID_VALUE;
@@ -457,12 +757,13 @@ extern "C" CUresult dspine_topk_cuda(const __nv_bfloat16* logits,
                       static_cast<size_t>(k) * kTopkChunk * sizeof(int) +
                       static_cast<size_t>(k) * sizeof(int) +
                       static_cast<size_t>(kThreads) * sizeof(float) +
-                      static_cast<size_t>(kThreads) * sizeof(int);
+                      static_cast<size_t>(kThreads) * sizeof(int) +
+                      sizeof(int);
   if (smem > 48 * 1024) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   topk_kernel<<<rows, kThreads, smem, stream>>>(logits, candidate_ids, block,
-                                                vocab, k);
+                                                   vocab, k);
   return map_cuda_error(cudaGetLastError());
 }
 
@@ -478,12 +779,16 @@ extern "C" CUresult dspine_serial_table_cuda(
     return CUDA_ERROR_INVALID_VALUE;
   }
   const int rows = batch * (block - 1);
-  const size_t smem = static_cast<size_t>(k) * sizeof(float) +
-                      static_cast<size_t>(rank) * sizeof(float) +
-                      static_cast<size_t>(kThreads) * sizeof(float);
+  const int nwarps = kThreads / 32;
+  const size_t fixed = static_cast<size_t>(k) * sizeof(float) +
+                       static_cast<size_t>(k) * sizeof(int);
+  const size_t msg = static_cast<size_t>(nwarps) * rank * sizeof(float);
+  const size_t tg_bytes = static_cast<size_t>(k) * rank * sizeof(__nv_bfloat16);
+  const bool cache_tg = fixed + msg + tg_bytes <= 48 * 1024;
+  const size_t smem = fixed + msg + (cache_tg ? tg_bytes : 0);
   serial_table_kernel<<<rows, kThreads, smem, stream>>>(
       packed, rms, raw, lm_head, norm_weight, tg, tsv, gate_bias, candidates,
-      input_ids, idx, block, hidden, rank, k);
+      input_ids, idx, block, hidden, rank, k, cache_tg ? 1 : 0);
   return map_cuda_error(cudaGetLastError());
 }
 
