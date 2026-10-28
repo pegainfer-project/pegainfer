@@ -60,10 +60,14 @@ use log::debug;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
+use vllm_chat::AssistantContentBlock;
+use vllm_chat::AssistantToolCall;
 use vllm_chat::ChatContent;
 use vllm_chat::ChatMessage;
 use vllm_chat::ChatOptions;
 use vllm_chat::ChatRequest;
+use vllm_chat::ChatTool;
+use vllm_chat::ChatToolChoice;
 use vllm_chat::DynChatRenderer;
 use vllm_chat::GenerationPromptMode;
 use vllm_chat::LoadedModelBackends;
@@ -128,10 +132,23 @@ impl Boundary {
     /// Where the earlier turns of one chat body ended, newest first: the
     /// token count of the conversation up to each message an assistant
     /// message follows, rendered without a generation prompt.
+    ///
+    /// The tools and the tool choice render into the conversation, so each
+    /// earlier turn is rendered under the body's own, as it was sent.
     fn history_marks(&self, body: &Value) -> Vec<usize> {
-        let Some(messages) = messages(body) else {
+        let choice = match body.get("tool_choice") {
+            None | Some(Value::Null) => Ok(None),
+            Some(choice) => tool_choice(choice).map(Some).ok_or(()),
+        };
+        let (Some(messages), Some(tools), Ok(choice)) =
+            (messages(body), tools(body.get("tools")), choice)
+        else {
             return Vec::new();
         };
+        let parallel = body
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let ends = (0..messages.len().saturating_sub(1))
             .rev()
             .filter(|&i| messages[i + 1].role() == vllm_chat::ChatRole::Assistant);
@@ -139,20 +156,40 @@ impl Boundary {
             generation_prompt_mode: GenerationPromptMode::NoGenerationPrompt,
             ..chat_options(body)
         };
-        ends.filter_map(|i| Some(self.render(&messages[..=i], options.clone())?.len()))
-            .filter(|&m| m > 0)
-            .take(MARKS)
-            .collect()
+        ends.filter_map(|i| {
+            let turn = &messages[..=i];
+            let context =
+                ResolvedToolContext::new(turn, tools.clone(), choice.clone(), parallel).ok()?;
+            Some(self.render(turn, options.clone(), context)?.len())
+        })
+        .filter(|&m| m > 0)
+        .take(MARKS)
+        .collect()
     }
 
+    /// One message alone, tool-free: what it adds next to the generation
+    /// prompt does not depend on the tools.
     fn tokens(&self, message: &ChatMessage, chat_options: ChatOptions) -> Option<Vec<u32>> {
-        self.render(std::slice::from_ref(message), chat_options)
+        self.render(
+            std::slice::from_ref(message),
+            chat_options,
+            ResolvedToolContext::default(),
+        )
     }
 
-    fn render(&self, messages: &[ChatMessage], chat_options: ChatOptions) -> Option<Vec<u32>> {
+    fn render(
+        &self,
+        messages: &[ChatMessage],
+        chat_options: ChatOptions,
+        tool_context: ResolvedToolContext,
+    ) -> Option<Vec<u32>> {
         let rendered = self
             .renderer
-            .render(&probe_request(messages.to_vec(), chat_options))
+            .render(&probe_request(
+                messages.to_vec(),
+                chat_options,
+                tool_context,
+            ))
             .ok()?;
         match rendered.prompt {
             Prompt::TokenIds(ids) => Some(ids),
@@ -187,9 +224,8 @@ fn field<T: DeserializeOwned>(body: &Value, key: &str) -> Option<T> {
     serde_json::from_value(body.get(key)?.clone()).ok()
 }
 
-/// The last message in the route's own vocabulary. An assistant message keeps
-/// only its text: the generation prompt's shape does not depend on its tool
-/// calls, and the route rejects what this layer cannot read.
+/// The last message in the route's own vocabulary; the route rejects what
+/// this layer cannot read.
 fn last_message(body: &Value) -> Option<ChatMessage> {
     message(body.get("messages")?.as_array()?.last()?)
 }
@@ -212,9 +248,12 @@ fn message(message: &Value) -> Option<ChatMessage> {
     };
     Some(match role {
         "system" => ChatMessage::system(content),
-        "developer" => ChatMessage::developer(content, None),
+        "developer" => {
+            let tools = tools(message.get("tools"))?;
+            ChatMessage::developer(content, (!tools.is_empty()).then_some(tools))
+        }
         "user" => ChatMessage::user(content),
-        "assistant" => ChatMessage::assistant_text(content.try_flatten_to_text().ok()?),
+        "assistant" => assistant(message)?,
         "tool" => ChatMessage::tool_response(
             content,
             message
@@ -226,15 +265,112 @@ fn message(message: &Value) -> Option<ChatMessage> {
     })
 }
 
-/// Messages under the request's template controls, every other field at
-/// the value the route resolves for a plain text chat.
-fn probe_request(messages: Vec<ChatMessage>, chat_options: ChatOptions) -> ChatRequest {
+/// An assistant message as the route reads one: its reasoning, its text and
+/// its tool calls, in that order, every one of which a template may render
+/// into the history.
+fn assistant(message: &Value) -> Option<ChatMessage> {
+    let reasoning = ["reasoning", "reasoning_content", "thinking"]
+        .into_iter()
+        .find_map(|key| message.get(key)?.as_str())
+        .filter(|text| !text.is_empty())
+        .map(|text| AssistantContentBlock::Reasoning {
+            text: text.to_string(),
+        });
+    let text = match message.get("content") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(text)) => vec![AssistantContentBlock::Text { text: text.clone() }],
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(|part| match part.get("type")?.as_str()? {
+                "text" => Some(AssistantContentBlock::Text {
+                    text: part.get("text")?.as_str()?.to_string(),
+                }),
+                _ => None,
+            })
+            .collect::<Option<_>>()?,
+        Some(_) => return None,
+    };
+    let calls = match message.get("tool_calls") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(calls)) => calls.iter().map(tool_call).collect::<Option<_>>()?,
+        Some(_) => return None,
+    };
+    let blocks: Vec<_> = reasoning.into_iter().chain(text).chain(calls).collect();
+    (!blocks.is_empty()).then(|| ChatMessage::assistant_blocks(blocks))
+}
+
+fn tool_call(call: &Value) -> Option<AssistantContentBlock> {
+    let function = call.get("function")?;
+    (call.get("type")?.as_str()? == "function").then(|| {
+        Some(AssistantContentBlock::ToolCall(AssistantToolCall {
+            id: call.get("id")?.as_str()?.to_string(),
+            name: function.get("name")?.as_str()?.to_string(),
+            arguments: function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}")
+                .to_string(),
+        }))
+    })?
+}
+
+/// Request-level or message-scoped function tools; `None` when any does not
+/// read.
+fn tools(tools: Option<&Value>) -> Option<Vec<ChatTool>> {
+    match tools {
+        None | Some(Value::Null) => Some(Vec::new()),
+        Some(Value::Array(tools)) => tools.iter().map(tool).collect(),
+        Some(_) => None,
+    }
+}
+
+fn tool(tool: &Value) -> Option<ChatTool> {
+    let kind = tool.get("type").map_or(Some("function"), Value::as_str)?;
+    let function = tool.get("function")?;
+    let flag = |value: &Value, key| value.get(key).and_then(Value::as_bool);
+    (kind == "function").then(|| {
+        Some(ChatTool {
+            name: function.get("name")?.as_str()?.to_string(),
+            description: function
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            parameters: function.get("parameters").cloned().unwrap_or_default(),
+            strict: flag(function, "strict"),
+            defer_loading: flag(function, "defer_loading").or(flag(tool, "defer_loading")),
+        })
+    })?
+}
+
+/// A tool choice the route accepts.
+fn tool_choice(choice: &Value) -> Option<ChatToolChoice> {
+    match choice {
+        Value::String(choice) => match choice.as_str() {
+            "auto" => Some(ChatToolChoice::Auto),
+            "none" => Some(ChatToolChoice::None),
+            "required" => Some(ChatToolChoice::Required),
+            _ => None,
+        },
+        _ if choice.get("type")?.as_str()? == "function" => Some(ChatToolChoice::Function {
+            name: choice.get("function")?.get("name")?.as_str()?.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// Messages under the request's template controls and tools, every other
+/// field at the value the route resolves for a plain text chat.
+fn probe_request(
+    messages: Vec<ChatMessage>,
+    chat_options: ChatOptions,
+    tool_context: ResolvedToolContext,
+) -> ChatRequest {
     ChatRequest {
         request_id: "history-boundary-probe".to_string(),
         messages,
         sampling_params: SamplingParams::default(),
         chat_options,
-        tool_context: ResolvedToolContext::default(),
+        tool_context,
         decode_options: TextDecodeOptions::default(),
         intermediate: false,
         prompt_truncation: None,
@@ -273,7 +409,15 @@ async fn mark_request(
         Err(error) => return body_read_error(error),
     };
 
-    if let Some(tokens) = mark_generation_prompt(&mut bytes, &boundary) {
+    // Rendering and tokenizing up to MARKS prefixes of a long conversation
+    // takes seconds at 1M tokens: off the async workers.
+    let (bytes, tokens) = tokio::task::spawn_blocking(move || {
+        let tokens = mark_generation_prompt(&mut bytes, &boundary);
+        (bytes, tokens)
+    })
+    .await
+    .expect("the history measure does not panic");
+    if let Some(tokens) = tokens {
         debug!("generation prompt is {tokens} tokens");
         parts
             .headers
@@ -325,9 +469,24 @@ mod tests {
     impl ChatRenderer for Template {
         fn render(&self, request: &ChatRequest) -> vllm_chat::Result<RenderedPrompt> {
             let mut text = String::new();
+            let tools: Vec<_> = request
+                .initial_tools()
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect();
+            if !tools.is_empty() {
+                write!(text, "<tools> {} <end>", tools.join(" ")).unwrap();
+            }
             for message in &request.messages {
                 let role = serde_json::to_value(message.role()).unwrap();
-                let content = message.text_content()?;
+                let mut content = message.text_content()?;
+                if let ChatMessage::Assistant { content: blocks } = message {
+                    for block in blocks {
+                        if let AssistantContentBlock::ToolCall(call) = block {
+                            write!(content, " call:{}", call.name).unwrap();
+                        }
+                    }
+                }
                 write!(text, "<{}> {content} <end>", role.as_str().unwrap()).unwrap();
             }
             if request.chat_options.add_generation_prompt() {
@@ -438,6 +597,18 @@ mod tests {
         assert_eq!(value["vllm_xargs"][HISTORY_MARKS], json!([10, 6]));
         let (_, value) = mark(r#"{"messages":[{"role":"user","content":"a"}]}"#);
         assert_eq!(value["vllm_xargs"][HISTORY_MARKS], json!([]));
+    }
+
+    #[test]
+    fn an_earlier_turn_renders_with_the_tools_and_its_tool_calls() {
+        // `<tools> grep <end><system> s <end><user> a <end>` is 7 words, the
+        // request that ended there measured 9 with `<assistant> <think>` and a
+        // 2-word generation prompt; the tool call and its result add
+        // `<assistant> call:grep <end><tool> out <end>`, 4 more.
+        let (_, value) = mark(
+            r#"{"tools":[{"type":"function","function":{"name":"grep"}}],"messages":[{"role":"system","content":"s"},{"role":"user","content":"a"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"grep","arguments":"{}"}}]},{"role":"tool","content":"out","tool_call_id":"c1"},{"role":"assistant","content":"done"},{"role":"user","content":"b"}]}"#,
+        );
+        assert_eq!(value["vllm_xargs"][HISTORY_MARKS], json!([11, 7]));
     }
 
     #[test]
