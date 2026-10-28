@@ -475,6 +475,7 @@ pub fn serial_chain_into(
 pub fn scale_cols_into(
     ctx: &DeviceContext,
     input: &DeviceMatrix,
+    rows: usize,
     weight: &DeviceVec,
     out: &mut CudaSlice<bf16>,
 ) -> Result<()> {
@@ -484,7 +485,12 @@ pub fn scale_cols_into(
         input.cols,
         weight.len
     );
-    let count = input.rows * input.cols;
+    ensure!(
+        rows > 0 && rows <= input.rows,
+        "DSpine scale_cols rows {rows} outside 1..={}",
+        input.rows
+    );
+    let count = rows * input.cols;
     ensure!(
         out.len() >= count,
         "DSpine scale_cols output holds {} < {count}",
@@ -498,7 +504,7 @@ pub fn scale_cols_into(
             in_ptr as *const ffi::Half,
             w_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
-            input.rows as i64,
+            rows as i64,
             input.cols as i32,
             active_cu_stream(ctx),
         )
@@ -683,9 +689,10 @@ mod tests {
             assert_eq!(got.to_bits(), want.to_bits(), "finish output changed");
         }
         for (index, (got, want)) in fused_norm_host.iter().zip(&plain_norm_host).enumerate() {
-            // One bf16 ulp of slack for the block reduction order.
+            // 2% relative (with a 1.0 floor): the block reduction order can
+            // differ from the production RMSNorm by a few bf16 steps.
             assert!(
-                (got - want).abs() < 0.02,
+                (got - want).abs() <= 0.02 * want.abs().max(1.0),
                 "fused norm[{index}] = {got} vs {want}"
             );
         }
@@ -781,8 +788,220 @@ mod tests {
         let plain_norm_host = host(&ctx, &plain_norm);
         let fused_norm_host = host(&ctx, &fused_norm);
         for (index, (got, want)) in fused_norm_host.iter().zip(&plain_norm_host).enumerate() {
+            // 2% relative (with a 1.0 floor): reduction order only.
             assert!(
-                (got - want).abs() < 0.02,
+                (got - want).abs() <= 0.02 * want.abs().max(1.0),
+                "fused norm[{index}] = {got} vs {want}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn topk_ties_pick_the_lowest_ids() {
+        let ctx = DeviceContext::new().expect("GPU required");
+        let batch = 2usize;
+        let block = 3usize;
+        let rows = batch * block;
+        let proposals = batch * (block - 1);
+        let vocab = 192usize;
+        // Fixture A ties the chunk maxima at ids 3 (chunk 0) and 70 (chunk 1);
+        // fixture B ties two values inside one chunk (ids 3 and 10).
+        for (ties, k, want) in [
+            ((3usize, 70usize), 1usize, vec![3i32]),
+            ((3, 70), 2, vec![3, 70]),
+            ((3, 10), 2, vec![3, 10]),
+        ] {
+            let mut logits = vec![bf16::from_f32(0.0); rows * vocab];
+            for row in 0..rows {
+                logits[row * vocab + ties.0] = bf16::from_f32(2.0);
+                logits[row * vocab + ties.1] = bf16::from_f32(2.0);
+            }
+            let logits_d = hidden(&ctx, &logits, vocab, rows);
+            let mut candidates = ctx.stream.alloc_zeros(proposals * k).unwrap();
+            topk_into(&ctx, &logits_d, batch, block, k, &mut candidates).expect("topk ties");
+            let host: Vec<i32> = ctx.stream.clone_dtoh(&candidates).unwrap();
+            for n in 0..proposals {
+                assert_eq!(
+                    &host[n * k..(n + 1) * k],
+                    want.as_slice(),
+                    "ties {ties:?} k={k} row {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    #[allow(clippy::many_single_char_names)]
+    fn serial_table_global_tg_fallback_matches_the_reference() {
+        let ctx = DeviceContext::new().expect("GPU required");
+        let batch = 2usize;
+        let block = 3usize;
+        let hidden_dim = 8usize;
+        // rank 1400 overflows the 48 KiB shared budget for the staged TG rows
+        // (and for the message scratch plus TG), selecting the global-TG path.
+        let rank = 1400usize;
+        let k = 2usize;
+        let vocab = 128usize;
+        let rows = batch * block;
+        let proposals = batch * (block - 1);
+
+        let packed_host: Vec<bf16> = (0..rows * 3 * rank)
+            .map(|i| bf16::from_f32((i as f32 * 0.037).sin() * 0.5))
+            .collect();
+        let raw_host: Vec<bf16> = (0..rows * hidden_dim)
+            .map(|i| bf16::from_f32((i as f32 * 0.019).cos()))
+            .collect();
+        let lm_host: Vec<bf16> = (0..vocab * hidden_dim)
+            .map(|i| bf16::from_f32((i as f32 * 0.011).sin()))
+            .collect();
+        let norm_host: Vec<bf16> = (0..hidden_dim)
+            .map(|i| bf16::from_f32(0.5 + i as f32 * 0.01))
+            .collect();
+        let tg_host: Vec<bf16> = (0..vocab * rank)
+            .map(|i| bf16::from_f32((i as f32 * 0.007).cos()))
+            .collect();
+        let tsv_host: Vec<bf16> = (0..vocab * 2 * rank)
+            .map(|i| bf16::from_f32((i as f32 * 0.005).sin()))
+            .collect();
+        let bias_host: Vec<bf16> = (0..rank)
+            .map(|i| bf16::from_f32(i as f32 * 0.0005))
+            .collect();
+        let candidate_host: Vec<i32> = (0..proposals * k)
+            .map(|i| ((i * 37 + 5) % vocab) as i32)
+            .collect();
+        let rms_host: Vec<f32> = (0..rows).map(|i| 0.5 + i as f32 * 0.1).collect();
+        let ids_host: Vec<u32> = (0..rows).map(|i| ((i * 13 + 3) % vocab) as u32).collect();
+
+        let packed = hidden(&ctx, &packed_host, 3 * rank, rows);
+        let raw = hidden(&ctx, &raw_host, hidden_dim, rows);
+        let lm = matrix(&ctx, &lm_host, vocab, hidden_dim);
+        let norm = vector(&ctx, &norm_host);
+        let tg = matrix(&ctx, &tg_host, vocab, rank);
+        let tsv = matrix(&ctx, &tsv_host, vocab, 2 * rank);
+        let bias = vector(&ctx, &bias_host);
+        let rms = ctx.stream.clone_htod(&rms_host).unwrap();
+        let candidates = ctx.stream.clone_htod(&candidate_host).unwrap();
+        let ids = ctx.stream.clone_htod(&ids_host).unwrap();
+        let mut idx = ctx.stream.alloc_zeros(proposals * k).unwrap();
+        serial_table_into(
+            &ctx,
+            &packed,
+            &rms,
+            &raw,
+            &lm,
+            &norm,
+            &tg,
+            &tsv,
+            &bias,
+            &candidates,
+            &ids,
+            &mut idx,
+            batch,
+            block,
+            k,
+        )
+        .expect("serial table");
+        let idx_host: Vec<i32> = ctx.stream.clone_dtoh(&idx).unwrap();
+
+        let mut expected = vec![0i32; proposals * k];
+        for n in 0..proposals {
+            let b = n / (block - 1);
+            let i = n % (block - 1);
+            let row = b * block + 1 + i;
+            let base: Vec<f32> = (0..k)
+                .map(|j| {
+                    let token = candidate_host[n * k + j] as usize;
+                    (0..hidden_dim)
+                        .map(|h| {
+                            raw_host[row * hidden_dim + h].to_f32()
+                                * norm_host[h].to_f32()
+                                * lm_host[token * hidden_dim + h].to_f32()
+                        })
+                        .sum()
+                })
+                .collect();
+            for receive in 0..k {
+                let sender = if i == 0 {
+                    ids_host[b * block] as usize
+                } else {
+                    candidate_host[(n - 1) * k + receive] as usize
+                };
+                let mut best = f32::NEG_INFINITY;
+                let mut best_lane = 0usize;
+                for j in 0..k {
+                    let token = candidate_host[n * k + j] as usize;
+                    let mut dot = 0.0f32;
+                    for d in 0..rank {
+                        let q = packed_host[row * 3 * rank + d].to_f32();
+                        let s = tsv_host[sender * 2 * rank + d].to_f32();
+                        let v = tsv_host[sender * 2 * rank + rank + d].to_f32();
+                        let m = sigmoid(q + s + bias_host[d].to_f32()) * v;
+                        dot += m * tg_host[token * rank + d].to_f32();
+                    }
+                    let score = base[j] + rms_host[row] * dot;
+                    if score > best {
+                        best = score;
+                        best_lane = j;
+                    }
+                }
+                expected[n * k + receive] = best_lane as i32;
+            }
+        }
+        assert_eq!(idx_host, expected);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn fused_norm_handles_an_odd_hidden_width() {
+        let ctx = DeviceContext::new().expect("GPU required");
+        let rows = 2usize;
+        let dim = 5usize;
+        let block = 2usize;
+        let raw_host: Vec<bf16> = (0..rows * dim)
+            .map(|i| bf16::from_f32((i as f32 * 0.043).sin() * 1.5))
+            .collect();
+        let delta_host: Vec<bf16> = (0..rows * dim)
+            .map(|i| bf16::from_f32((i as f32 * 0.017).cos()))
+            .collect();
+        let norm_host: Vec<bf16> = (0..dim)
+            .map(|i| bf16::from_f32(0.5 + i as f32 * 0.01))
+            .collect();
+        let raw = hidden(&ctx, &raw_host, dim, rows);
+        let delta = hidden(&ctx, &delta_host, dim, rows);
+        let norm = vector(&ctx, &norm_host);
+        let mut normalized = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        let mut rms = ctx.stream.alloc_zeros(rows).unwrap();
+        prepare_read_into(&ctx, &raw, &mut normalized, &mut rms, 1e-6).expect("prepare");
+        let mut plain = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        feature_finish_into(&ctx, &raw, &delta, &rms, &mut plain, block).expect("finish");
+        let mut plain_norm = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        crate::ops::rms_norm_batch_into(&ctx, &plain, &norm, 1e-6, &mut plain_norm);
+        let mut fused = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        let mut fused_norm = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        feature_finish_norm_into(
+            &ctx,
+            &raw,
+            &delta,
+            &rms,
+            &mut fused,
+            &mut fused_norm,
+            &norm,
+            block,
+            1e-6,
+        )
+        .expect("finish norm");
+        let plain_host = host(&ctx, &plain);
+        let fused_host = host(&ctx, &fused);
+        for (got, want) in fused_host.iter().zip(&plain_host) {
+            assert_eq!(got.to_bits(), want.to_bits(), "finish output changed");
+        }
+        let plain_norm_host = host(&ctx, &plain_norm);
+        let fused_norm_host = host(&ctx, &fused_norm);
+        for (index, (got, want)) in fused_norm_host.iter().zip(&plain_norm_host).enumerate() {
+            assert!(
+                (got - want).abs() <= 0.02 * want.abs().max(1.0),
                 "fused norm[{index}] = {got} vs {want}"
             );
         }
@@ -1075,7 +1294,7 @@ mod tests {
         let input_d = matrix(&ctx, &input, rows, cols);
         let weight_d = vector(&ctx, &weight);
         let mut out = ctx.stream.alloc_zeros(rows * cols).unwrap();
-        scale_cols_into(&ctx, &input_d, &weight_d, &mut out).expect("scale cols");
+        scale_cols_into(&ctx, &input_d, rows, &weight_d, &mut out).expect("scale cols");
         let out_host: Vec<bf16> = ctx.stream.clone_dtoh(&out).unwrap();
         for row in 0..rows {
             for col in 0..cols {

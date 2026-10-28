@@ -1310,10 +1310,11 @@ impl Qwen3Executor {
         ensure_pertoken_single_gpu(policy, device_ordinals.len())?;
         ensure_pertoken_overlap_disabled(policy, decode_overlap)?;
 
-        // Parse the drafter config before the target loads (DSpine is servable
-        // now; this only keeps a malformed draft failing fast).
+        // Parse the drafter config before the target loads: a malformed draft
+        // must fail fast instead of after profiling and the target's weights.
         if let Some(DraftModel::DFlash(path)) = draft {
-            crate::config::DFlashConfig::from_file(path)?;
+            crate::config::DFlashConfig::from_file(path)
+                .with_context(|| format!("load DFlash config from {path}"))?;
         }
 
         if policy == NumericPolicy::PerToken {

@@ -881,7 +881,7 @@ impl DFlashDraftModel {
                         self.config.rms_norm_eps,
                         block_size,
                     )?;
-                    input_normed = layer_idx + 1 < self.layers.len();
+                    input_normed = next_norm.is_some();
                 }
             }
         }
@@ -1039,6 +1039,11 @@ impl DFlashDraftModel {
             k,
             &mut dspine.candidates,
         )?;
+        // `hidden_out` carries the last active write's pre-write raw: the
+        // write swaps it into `hidden` and leaves the raw behind, and
+        // `compute_logits_into` only touches hidden/logits_normed/logits. Any
+        // code inserted between the layer loop and this call must not write
+        // `hidden_out`, or the refinement silently scores the wrong row.
         kernel_ops::dspine_serial_table_into(
             ctx,
             &dspine.packed,

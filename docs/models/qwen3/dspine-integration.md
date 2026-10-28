@@ -102,7 +102,7 @@ there is no `0 * -inf` NaN path.
 weights/tables, the load-time table-build transients (scaled LM head and
 codebook, per-layer pieces), and the lane scratch (projected/codes/packed/
 message/rms, candidates/idx/tokens). At `max_batch=256`, block 16, the pinned
-term is **2,497,840,128 B**. The token-scaling draft KV term is unchanged;
+term is **2,500,985,856 B** (including the three gate/predecessor/prev shards that coexist with the packed stack during load). The token-scaling draft KV term is unchanged;
 plain DFlash/DSpark reserve zero.
 
 ## Kernel performance
@@ -120,15 +120,17 @@ times, so the ratios are the transferable claim.
 | --- | --- | --- | --- |
 | top-K | 23.0 ms | 4.2 ms | 5.5× |
 | serial table | 21.0 ms | 5.6 ms | 3.8× |
-| feature finish + next norm | 1.14 ms/layer | 0.40 ms/layer | 2.9× |
-| prepare read | 0.42 ms/layer | 0.19 ms/layer | 2.2× |
+| feature finish + next norm | 1.14 ms/layer | 0.51 ms/layer | 2.2× |
+| prepare read | 0.42 ms/layer | 0.25 ms/layer | 1.7× |
 
 At batch 1 the top-K drops 2.8× (0.235 → 0.083 ms) and the score table 7.8×
 (0.515 → 0.066 ms); a full 256-batch round's DSpine kernel bill falls from about
-53 ms to about 14 ms (≈3.8×). Original and final were measured with the same
-scattered-candidate protocol in separate sessions, so GPU clock drift is folded
-into the ratios; the earlier same-session A/B (top-K 4.75×, score table 3.7×)
-was taken with a constant-candidate bench and is the conservative comparison.
+53 ms to about 14 ms (≈3.7×). The top-K and score-table rows were re-measured
+under the scattered-candidate protocol in separate sessions (GPU clock drift is
+folded into those ratios); finish and prepare read no candidate data, so their
+rows keep the 713274db session (0.51/0.25 ms). The earlier same-session A/B
+(top-K 4.75×, score table 3.7×) used the constant-candidate bench and is the
+conservative comparison.
 
 Changes, one variable at a time:
 
@@ -156,9 +158,10 @@ combination its CUDA kernel trace records only a single kernel instance even
 for a three-kernel probe, so no timeline is claimed; kernel attribution came
 from ncu.
 
-Correctness after tuning: the six host-reference GPU tests pass (including an
+Correctness after tuning: the nine host-reference GPU tests pass (including an
 exact finish-output and fused-norm comparison against the production RMSNorm
-kernel, plus partial-chunk/unaligned top-K and odd-width scalar tails), the 126
+kernel, partial-chunk/unaligned top-K, tie-breaks, odd hidden widths, and the
+global-TG fallback), the 127
 `pegainfer-qwen3` lib tests pass, and Compute Sanitizer
 memcheck/racecheck/synccheck report zero errors on the tests plus a
 production-shape memcheck run. The serial-table and fused-norm reductions only
@@ -169,9 +172,9 @@ oracles here).
 ## Evidence
 
 - Host-reference kernel tests (`dspine::tests`, ignored without a GPU):
-  read/finish, finish+fused-norm (even and odd widths), codes/messages, top-K
-  (ascending-id contract, partial chunk, unaligned row) + serial table + chain,
-  scale kernels.
+  read/finish, finish+fused-norm (even, odd, and odd-width hidden), codes and
+  messages, top-K (ascending-id contract, partial chunk, unaligned row, ties),
+  serial table (staged and global-TG) + chain, scale kernels.
 - `dflash_speculative_gate::dspine_checkpoint_is_lossless_and_accepts`
   (ignored; set `PEGAINFER_TEST_MODEL_PATH` and
   `PEGAINFER_DSPINE_TEST_MODEL_PATH`) replays three prompts × 32 greedy tokens
