@@ -57,7 +57,7 @@ The gate replays `test_data/qwen38fn-qsa-indexer-golden.safetensors` (PR #1150) 
 
 The production geometry is one 2560-wide group per thread block with every thread owning one aligned vector, so the block reads the whole group in one round. A dedicated single-round kernel keeps that vector in registers across the reduction and reuses it for the write-back; the generic kernel retains its second read for multi-round or partially filled blocks. The arithmetic is unchanged: the f32 product is still rounded once on the bf16 store.
 
-On the same 26-SM sm_120 card, the 512-token shape moved from 56.0 to 41.6 µs p50 (three old/new runs each: 55.9–56.1 → 41.5–41.6), and 128 tokens from 17.2 to 14.9 µs. ncu moved the 512-token kernel from 79.1 to 56.4 µs, registers per thread from 44 to 29, and achieved occupancy from 65.7% to 74.6%; DRAM throughput at the new duration is 73.9%. The oracle gate now also covers 128 tokens, and the old/new paths are backed by the same microbenchmark command as the indexer above.
+On the same 26-SM sm_120 card, the 512-token shape moved from 56.0 to 41.6 µs p50 (three old/new runs each: 55.9–56.1 → 41.5–41.6), and 128 tokens from 17.2 to 14.9 µs. ncu moved the 512-token kernel from 79.1 to 56.4 µs, registers per thread from 44 to 29, and achieved occupancy from 65.7% to 74.6%; DRAM throughput at the new duration is 73.9%. The oracle gate now also covers 128 tokens.
 
 ## The n-gram table is derived, not read
 
