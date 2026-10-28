@@ -693,6 +693,103 @@ mod tests {
 
     #[test]
     #[ignore = "requires a GPU"]
+    fn odd_width_elementwise_match_the_reference() {
+        let ctx = DeviceContext::new().expect("GPU required");
+        let rows = 3usize;
+        let dim = 6usize;
+        let block = 2usize;
+        let raw_host: Vec<bf16> = (0..rows * dim)
+            .map(|i| bf16::from_f32((i as f32 * 0.051).sin() * 1.5))
+            .collect();
+        let delta_host: Vec<bf16> = (0..rows * dim)
+            .map(|i| bf16::from_f32((i as f32 * 0.019).cos()))
+            .collect();
+        let norm_host: Vec<bf16> = (0..dim)
+            .map(|i| bf16::from_f32(0.5 + i as f32 * 0.01))
+            .collect();
+        let raw = hidden(&ctx, &raw_host, dim, rows);
+        let delta = hidden(&ctx, &delta_host, dim, rows);
+        let norm = vector(&ctx, &norm_host);
+
+        let mut normalized = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        let mut rms = ctx.stream.alloc_zeros(rows).unwrap();
+        prepare_read_into(&ctx, &raw, &mut normalized, &mut rms, 1e-6).expect("prepare");
+        let normalized_host = host(&ctx, &normalized);
+        let rms_host: Vec<f32> = ctx.stream.clone_dtoh(&rms).unwrap();
+        let mut expected_rms = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let mean = raw_host[row * dim..(row + 1) * dim]
+                .iter()
+                .map(|v| {
+                    let x = v.to_f32();
+                    x * x
+                })
+                .sum::<f32>()
+                / dim as f32;
+            let r = mean.max(f32::MIN_POSITIVE).sqrt();
+            assert!((rms_host[row] - r).abs() < 1e-4, "rms[{row}]");
+            expected_rms.push(r);
+            for col in 0..dim {
+                let want = bf16::from_f32(raw_host[row * dim + col].to_f32() / (r + 1e-6));
+                assert!(
+                    (normalized_host[row * dim + col] - want.to_f32()).abs() < 1e-3,
+                    "normalized[{row},{col}]"
+                );
+            }
+        }
+
+        let mut finish = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        feature_finish_into(&ctx, &raw, &delta, &rms, &mut finish, block).expect("finish");
+        let finish_host = host(&ctx, &finish);
+        for (row, &row_rms) in expected_rms.iter().enumerate() {
+            for col in 0..dim {
+                let index = row * dim + col;
+                let want = if row % block == 0 {
+                    raw_host[index].to_f32()
+                } else {
+                    raw_host[index].to_f32() + row_rms * delta_host[index].to_f32()
+                };
+                let want = bf16::from_f32(want).to_f32();
+                assert!(
+                    (finish_host[index] - want).abs() < 2e-3,
+                    "finish[{row},{col}]"
+                );
+            }
+        }
+
+        // The scalar fallbacks of the fused kernel must match the two-op path.
+        let mut plain_norm = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        crate::ops::rms_norm_batch_into(&ctx, &finish, &norm, 1e-6, &mut plain_norm);
+        let mut fused = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        let mut fused_norm = HiddenStates::zeros(&ctx, dim, rows).unwrap();
+        feature_finish_norm_into(
+            &ctx,
+            &raw,
+            &delta,
+            &rms,
+            &mut fused,
+            &mut fused_norm,
+            &norm,
+            block,
+            1e-6,
+        )
+        .expect("finish norm");
+        let fused_host = host(&ctx, &fused);
+        for (got, want) in fused_host.iter().zip(&finish_host) {
+            assert_eq!(got.to_bits(), want.to_bits(), "finish output changed");
+        }
+        let plain_norm_host = host(&ctx, &plain_norm);
+        let fused_norm_host = host(&ctx, &fused_norm);
+        for (index, (got, want)) in fused_norm_host.iter().zip(&plain_norm_host).enumerate() {
+            assert!(
+                (got - want).abs() < 0.02,
+                "fused norm[{index}] = {got} vs {want}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
     fn codes_and_messages_match_the_reference() {
         let ctx = DeviceContext::new().expect("GPU required");
         let rows = 4usize;
@@ -807,6 +904,35 @@ mod tests {
             // emission order (not just the set) is the table's contract.
             let got = &candidates_host[n * k..(n + 1) * k];
             assert_eq!(got, want.as_slice(), "row {row}");
+        }
+
+        // A partial final chunk and a row stride that breaks 16 B alignment
+        // exercise the scalar scan and tail paths.
+        let vocab_tail = 130usize;
+        let logits_tail: Vec<bf16> = (0..rows * vocab_tail)
+            .map(|i| {
+                bf16::from_f32((i % vocab_tail) as f32 * 0.01 + (i / vocab_tail) as f32 * 0.001)
+            })
+            .collect();
+        let logits_tail_d = hidden(&ctx, &logits_tail, vocab_tail, rows);
+        let mut candidates_tail = ctx.stream.alloc_zeros(proposals * k).unwrap();
+        topk_into(&ctx, &logits_tail_d, batch, block, k, &mut candidates_tail).expect("topk tail");
+        let tail_host: Vec<i32> = ctx.stream.clone_dtoh(&candidates_tail).unwrap();
+        for n in 0..proposals {
+            let b = n / (block - 1);
+            let i = n % (block - 1);
+            let row = b * block + 1 + i;
+            let mut ids: Vec<i32> = (0..vocab_tail as i32).collect();
+            ids.sort_by_key(|&id| {
+                -((logits_tail[row * vocab_tail + id as usize].to_f32() * 1e6) as i64)
+            });
+            let mut want = ids[..k].to_vec();
+            want.sort_unstable();
+            assert_eq!(
+                &tail_host[n * k..(n + 1) * k],
+                want.as_slice(),
+                "tail row {row}"
+            );
         }
 
         let raw: Vec<bf16> = (0..rows * hidden_dim)
