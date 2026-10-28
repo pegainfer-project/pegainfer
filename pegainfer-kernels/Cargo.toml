@@ -61,6 +61,10 @@ required-features = ["gemma4"]
 name = "hd512_decode_bench"
 required-features = ["gemma4"]
 
+[[example]]
+name = "qwen4_qsa_select_bench"
+required-features = ["qwen4"]
+
 [[test]]
 name = "grouped_rmsnorm_equivalence"
 required-features = ["qwen4"]

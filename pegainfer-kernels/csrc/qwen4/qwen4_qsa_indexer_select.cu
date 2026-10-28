@@ -41,16 +41,15 @@
 // they are not part of any row's contract.
 //
 // One CTA per query row. Portability is the point (no TMA, no cluster, no
-// wgmma): the selection is a comparison-only SIMT reduction. The search is
-// `keep` masked argmax passes over the row's blocks — O(keep * blocks) — with an
-// exclusion bitmap in dynamic shared memory, one bit per block. A row that keeps
-// every block (under the budget) skips the search and sets the whole visible
-// prefix. The bitmap is
-// sized from the widest row this launch can see (`tokens / ratio` blocks); the
-// host refuses a launch whose bitmap plus the block's static shared state
-// passes the 48 KiB default per-block ceiling (392960 blocks, 1.57M tokens),
-// which is far past the checkpoint's 262144 positions, so no caller this line
-// serves is refused by it.
+// wgmma). A row under the budget keeps every complete block: one pass writes
+// the visible prefix. Otherwise an exact 8-bit radix select over the row's
+// sortable f32 keys (four passes) finds the `keep`-th score, and the blocks
+// equal to that threshold are filled in ascending block-index order to preserve
+// the canonical tie rule. A one-bit-per-block bitmap in dynamic shared memory
+// marks those equals. The bitmap is sized from the widest row this launch can
+// see (`tokens / ratio` blocks); the host refuses a launch whose bitmap plus
+// the block's static shared state passes the 48 KiB default per-block ceiling
+// (319392 blocks, 1.28M tokens), far past the checkpoint's 262144 positions.
 //
 
 #include "../common.cuh"
@@ -67,32 +66,26 @@ constexpr int kRatio = 4;  // indexer_compress_ratio
 // The budget's block ceiling: 2048 tokens / 4. `tokens` itself is not bounded
 // by this (a row can see far more blocks than the budget keeps).
 constexpr int kMaxKeptBlocks = 512;
-constexpr int kThreads = 128;
+constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / WARP_SIZE;
-// One score and one index per warp, allocated statically beside the dynamic
-// bitmap and therefore counted against the same per-block ceiling.
+constexpr int kRadixBins = 256;
+// Per-warp radix histograms, the threshold state and the equality prefix,
+// allocated statically beside the dynamic bitmap and therefore counted against
+// the same per-block ceiling.
 constexpr int kStaticSharedBytes =
-    kWarps * (static_cast<int>(sizeof(float)) + static_cast<int>(sizeof(int)));
+    kWarps * kRadixBins * static_cast<int>(sizeof(unsigned int)) +
+    2 * static_cast<int>(sizeof(unsigned int)) +
+    (kThreads + 1) * static_cast<int>(sizeof(int));
 // The default per-block shared-memory ceiling on every supported arch; the
 // exclusion bitmap plus the block's static state must fit under it without an
 // opt-in.
 constexpr int kMaxSharedBytes = 48 * 1024;
 
-// The canonical order: descending score, ascending block index. An absent
-// candidate (`index < 0`) never outranks a present one, which is what lets the
-// pass start from "nothing found yet".
-__device__ __forceinline__ bool outranks(float score, int index, float best_score,
-                                         int best_index) {
-  if (index < 0) {
-    return false;
-  }
-  if (best_index < 0) {
-    return true;
-  }
-  if (score != best_score) {
-    return score > best_score;
-  }
-  return index < best_index;
+// f32 -> monotonic u32 for the radix select. -0.0 and +0.0 compare equal in the
+// selection order, so fold both zeros to +0.0 before taking the bits.
+__device__ __forceinline__ unsigned int sortable_key(float score) {
+  const unsigned int bits = __float_as_uint(score == 0.0f ? 0.0f : score);
+  return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
 }
 
 // One bit per block, set once a block has been picked. The bitmap is the whole
@@ -102,7 +95,8 @@ __device__ __forceinline__ bool block_picked(const unsigned int* picked, int blo
 }
 
 __device__ __forceinline__ void mark_picked(unsigned int* picked, int block) {
-  picked[block >> 5] |= 1u << (block & 31);
+  // The equality pass marks from several threads, and equal keys share a word.
+  atomicOr(&picked[block >> 5], 1u << (block & 31));
 }
 
 // Per query row: validate the row, check its scores, select the kept blocks and
@@ -149,80 +143,121 @@ __global__ void qwen4_qsa_select_kernel(
 
   const int keep_cap = budget / kRatio;
   const int keep = keep_cap < blocks ? keep_cap : blocks;
-  // Under the budget every complete block is kept, so the mask is the whole
-  // visible prefix and the search (with its bitmap) is skipped.
-  const bool all_kept = keep == blocks;
+  unsigned char* row_mask = mask + static_cast<int64_t>(row) * tokens;
 
-  __shared__ float warp_score[kWarps];
-  __shared__ int warp_index[kWarps];
-  if (!all_kept) {
-    // The bitmap covers every block any row of this launch can see.
-    const int max_blocks = tokens / kRatio;
-    const int words = (max_blocks + 31) >> 5;
-    for (int word = tid; word < words; word += blockDim.x) {
-      picked[word] = 0u;
+  // Under the budget every complete block is kept: one pass writes the whole
+  // visible prefix and the search is skipped.
+  if (keep == blocks) {
+    for (int token = tid; token < tokens; token += blockDim.x) {
+      row_mask[token] = token < visible ? 1 : 0;
     }
-    __syncthreads();
-
-    for (int pick = 0; pick < keep; ++pick) {
-      // Each thread's best among the candidates it owns; the scan is in
-      // ascending block order, and the explicit tie rule keeps the result
-      // independent of which thread found a tied score first.
-      float best_score = 0.0f;
-      int best_index = -1;
-      for (int block = tid; block < blocks; block += blockDim.x) {
-        if (block_picked(picked, block)) {
-          continue;
-        }
-        const float score = row_scores[block];
-        if (outranks(score, block, best_score, best_index)) {
-          best_score = score;
-          best_index = block;
-        }
-      }
-#pragma unroll
-      for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        const float other_score = __shfl_down_sync(0xffffffffu, best_score, offset);
-        const int other_index = __shfl_down_sync(0xffffffffu, best_index, offset);
-        if (outranks(other_score, other_index, best_score, best_index)) {
-          best_score = other_score;
-          best_index = other_index;
-        }
-      }
-      const int lane = tid & (WARP_SIZE - 1);
-      if (lane == 0) {
-        warp_score[tid / WARP_SIZE] = best_score;
-        warp_index[tid / WARP_SIZE] = best_index;
-      }
-      __syncthreads();
-      if (tid == 0) {
-        float pick_score = warp_score[0];
-        int pick_index = warp_index[0];
-#pragma unroll
-        for (int warp = 1; warp < kWarps; ++warp) {
-          if (outranks(warp_score[warp], warp_index[warp], pick_score, pick_index)) {
-            pick_score = warp_score[warp];
-            pick_index = warp_index[warp];
-          }
-        }
-        // `keep <= blocks` and every pass marks one block, so at least one
-        // unpicked candidate remains; an empty pick means the launch is broken.
-        if (pick_index < 0) {
-          __trap();
-        }
-        mark_picked(picked, pick_index);
-      }
-      __syncthreads();
-    }
+    return;
   }
 
-  unsigned char* row_mask = mask + static_cast<int64_t>(row) * tokens;
+  // Exact radix select of the keep-th key: four 8-bit passes narrow the
+  // threshold one key byte at a time.
+  __shared__ unsigned int hist[kWarps * kRadixBins];
+  __shared__ unsigned int radix_prefix;
+  __shared__ int radix_remaining;
+  const int warp = tid / WARP_SIZE;
+  if (tid == 0) {
+    radix_prefix = 0u;
+    radix_remaining = keep;
+  }
+  __syncthreads();
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    for (int i = tid; i < kWarps * kRadixBins; i += blockDim.x) {
+      hist[i] = 0u;
+    }
+    __syncthreads();
+    const unsigned int prefix = radix_prefix;
+    const unsigned int high_mask =
+        shift == 24 ? 0u : (0xFFFFFFFFu << (shift + 8));
+    for (int block = tid; block < blocks; block += blockDim.x) {
+      const unsigned int key = sortable_key(row_scores[block]);
+      if ((key & high_mask) != (prefix & high_mask)) {
+        continue;
+      }
+      atomicAdd(&hist[warp * kRadixBins + ((key >> shift) & 0xFFu)], 1u);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      int remaining = radix_remaining;
+      int chosen = -1;
+      for (int bin = kRadixBins - 1; bin >= 0; --bin) {
+        int count = 0;
+        for (int w = 0; w < kWarps; ++w) {
+          count += static_cast<int>(hist[w * kRadixBins + bin]);
+        }
+        if (count >= remaining) {
+          chosen = bin;
+          break;
+        }
+        remaining -= count;
+      }
+      if (chosen < 0) {
+        __trap();  // `keep` exceeds the row's block count
+      }
+      radix_prefix = prefix | (static_cast<unsigned int>(chosen) << shift);
+      radix_remaining = remaining;
+    }
+    __syncthreads();
+  }
+  const unsigned int threshold = radix_prefix;
+  const int need = radix_remaining;
+
+  // Zero the mask row and the bitmap that marks the threshold-equal blocks.
+  const int max_blocks = tokens / kRatio;
+  const int words = (max_blocks + 31) >> 5;
   for (int token = tid; token < tokens; token += blockDim.x) {
     row_mask[token] = 0;
   }
+  for (int word = tid; word < words; word += blockDim.x) {
+    picked[word] = 0u;
+  }
   __syncthreads();
+
+  // Equal keys are ordered by block index, matching the canonical tie rule.
+  // Contiguous ranges make a per-thread prefix the global order.
+  __shared__ int equal_offsets[kThreads + 1];
+  const int start = static_cast<int>(static_cast<int64_t>(tid) * blocks / blockDim.x);
+  const int end =
+      static_cast<int>(static_cast<int64_t>(tid + 1) * blocks / blockDim.x);
+  int equal_count = 0;
+  for (int block = start; block < end; ++block) {
+    equal_count += sortable_key(row_scores[block]) == threshold;
+  }
+  equal_offsets[tid] = equal_count;
+  __syncthreads();
+  if (tid == 0) {
+    int running = 0;
+    for (int i = 0; i < kThreads; ++i) {
+      const int count = equal_offsets[i];
+      equal_offsets[i] = running;
+      running += count;
+    }
+    equal_offsets[kThreads] = running;
+    if (running < need) {
+      __trap();  // the radix threshold must cover the kept rank
+    }
+  }
+  __syncthreads();
+  int take = need - equal_offsets[tid];
+  for (int block = start; block < end && take > 0; ++block) {
+    if (sortable_key(row_scores[block]) == threshold) {
+      mark_picked(picked, block);
+      --take;
+    }
+  }
+  __syncthreads();
+
+  // Every block above the threshold is kept, the chosen equals fill the rest,
+  // and the tail is unconditional.
   for (int block = tid; block < blocks; block += blockDim.x) {
-    if (!all_kept && !block_picked(picked, block)) {
+    const unsigned int key = sortable_key(row_scores[block]);
+    const bool kept =
+        key > threshold || (key == threshold && block_picked(picked, block));
+    if (!kept) {
       continue;
     }
     const int base = block * kRatio;
