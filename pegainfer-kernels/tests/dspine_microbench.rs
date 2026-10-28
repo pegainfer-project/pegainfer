@@ -123,7 +123,7 @@ fn dspine_microbench() -> Result<()> {
     let candidate_host: Vec<i32> = (0..max_proposals * K)
         .map(|i| ((i as u64 * 2_654_435_761) % VOCAB as u64) as i32)
         .collect();
-    let mut candidates: CudaSlice<i32> = ctx.stream.clone_htod(&candidate_host)?;
+    let candidates: CudaSlice<i32> = ctx.stream.clone_htod(&candidate_host)?;
     let mut topk_candidates: CudaSlice<i32> = ctx.stream.alloc_zeros(max_proposals * K)?;
     let mut idx: CudaSlice<i32> = ctx.stream.alloc_zeros(max_proposals * K)?;
     let mut tokens: CudaSlice<u32> = ctx.stream.alloc_zeros(max_rows)?;
