@@ -784,6 +784,9 @@ extern "C" CUresult dspine_serial_table_cuda(
                        static_cast<size_t>(k) * sizeof(int);
   const size_t msg = static_cast<size_t>(nwarps) * rank * sizeof(float);
   const size_t tg_bytes = static_cast<size_t>(k) * rank * sizeof(__nv_bfloat16);
+  if (fixed + msg > 48 * 1024) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
   const bool cache_tg = fixed + msg + tg_bytes <= 48 * 1024;
   const size_t smem = fixed + msg + (cache_tg ? tg_bytes : 0);
   serial_table_kernel<<<rows, kThreads, smem, stream>>>(
