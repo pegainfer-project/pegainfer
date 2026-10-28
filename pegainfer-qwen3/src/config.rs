@@ -1097,7 +1097,7 @@ mod tests {
             .expect("plain reservation");
         let delta = dspine.fixed_bytes - plain.fixed_bytes;
         assert_eq!(
-            delta, 2_497_840_128,
+            delta, 2_500_985_856,
             "DSpine reservation must bill tables, load transients and lane scratch"
         );
         assert_eq!(dspine.kv_bytes_per_token, plain.kv_bytes_per_token);
@@ -1331,5 +1331,37 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name}: {error:#}"));
             assert!(config.uses_dspine(), "{name}");
         }
+    }
+
+    #[test]
+    fn malformed_draft_config_fails_before_the_target_loads() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            directory.path().join("config.json"),
+            r#"{"hidden_size": "not-a-number"}"#,
+        )
+        .expect("write config");
+
+        let error = crate::executor::Qwen3Executor::from_runtime_with_lora_options(
+            "/nonexistent-target",
+            false,
+            &[0],
+            crate::Qwen3LoraOptions::default(),
+            crate::Qwen3OffloadOptions::disabled(),
+            crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
+            Some(directory.path().to_str().expect("utf-8 path")),
+            crate::Qwen3MemoryOptions::default(),
+        )
+        .err()
+        .expect("malformed draft config must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("load DFlash config from"),
+            "unexpected draft config error: {message}"
+        );
+        assert!(
+            !message.contains("nonexistent-target"),
+            "the target was opened before the draft config was parsed: {message}"
+        );
     }
 }

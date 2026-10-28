@@ -358,7 +358,10 @@ unsafe impl Sync for Qwen3Model {}
 
 impl Qwen3Model {
     /// The target's output projection (`lm_head`, or tied embeddings). DSpine's
-    /// vocabulary tables are built from it once at draft load.
+    /// vocabulary tables are built from it once at draft load; its proposals
+    /// only re-score candidates taken from [`Self::project_logits`], so the
+    /// tail mask still decides which tokens can be sampled. Direct callers
+    /// that need logits must go through `project_logits`.
     pub(crate) fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }

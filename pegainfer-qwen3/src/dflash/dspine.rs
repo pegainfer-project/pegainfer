@@ -221,7 +221,15 @@ impl DSpineBridge {
             check_version(shards, weight_map, &refine, "last_write_refine_version")?;
         }
 
-        let logits_rows = target.output_projection().rows;
+        // The reservation bills `config.logits_rows` (the target's aligned
+        // logits rows); build the tables over exactly those rows so the two
+        // cannot drift. Extra LM-head rows are never candidate ids.
+        let logits_rows = config.logits_rows;
+        anyhow::ensure!(
+            logits_rows > 0 && target.output_projection().rows >= logits_rows,
+            "target output projection holds {} rows, fewer than the {logits_rows}              aligned logits rows",
+            target.output_projection().rows
+        );
         anyhow::ensure!(
             logits_rows <= vocab,
             "target logits rows {logits_rows} exceed DSpine codebook rows {vocab}"
@@ -230,6 +238,7 @@ impl DSpineBridge {
         ops::dspine_scale_cols_into(
             ctx,
             target.output_projection(),
+            logits_rows,
             final_norm,
             &mut lm_scaled.data,
         )?;
@@ -319,7 +328,6 @@ impl DSpineBridge {
             rows > 0 && rows.is_multiple_of(block_size),
             "DSpine bridge rows {rows} are not whole blocks of {block_size}"
         );
-        dspine_activate(scratch);
         let dspine = scratch
             .dspine
             .as_mut()
@@ -395,12 +403,6 @@ impl DSpineBridge {
         }
         std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_out);
         Ok(())
-    }
-}
-
-fn dspine_activate(scratch: &mut crate::dflash::DFlashBatchScratch) {
-    if let Some(dspine) = scratch.dspine.as_mut() {
-        dspine.activate(scratch.hidden.seq_len);
     }
 }
 
@@ -481,6 +483,9 @@ pub(crate) fn reservation_bytes(
     let transients = crate::sizing::sum(&[
         crate::sizing::product(&[logits_rows, hidden, bf16])?, // lm_head scaled
         crate::sizing::product(&[vocab, code, bf16])?,         // codebook scaled
+        // Gate/predecessor/prev coexist with the packed stack until load()
+        // returns.
+        crate::sizing::product(&[3, rank, code, bf16])?,
         // Per-layer read/write pieces coexist with the stacked matrices.
         crate::sizing::product(&[layers, code, hidden, bf16])?,
         crate::sizing::product(&[layers, hidden, rank, bf16])?,

@@ -229,7 +229,11 @@ __global__ void feature_finish_norm_kernel(
   extern __shared__ unsigned char norm_smem[];
   __nv_bfloat16* rowbuf = reinterpret_cast<__nv_bfloat16*>(norm_smem);
   const int nwarps = blockDim.x / 32;
-  float* warp_sums = reinterpret_cast<float*>(rowbuf + hidden);
+  // Round the byte offset up so a float array never lands on a 2-byte
+  // boundary when the row width is odd.
+  const size_t sums_offset =
+      (static_cast<size_t>(hidden) * sizeof(__nv_bfloat16) + 3) & ~size_t(3);
+  float* warp_sums = reinterpret_cast<float*>(norm_smem + sums_offset);
   const int64_t base = static_cast<int64_t>(row) * hidden;
   const float scale = rms[row];
   const bool add_delta = (row % block) != 0;
@@ -731,7 +735,9 @@ extern "C" CUresult dspine_feature_finish_norm_cuda(
   if (rows <= 0 || hidden <= 0 || hidden > 24576 || block <= 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  const size_t smem = static_cast<size_t>(hidden) * sizeof(__nv_bfloat16) +
+  const size_t sums_offset =
+      (static_cast<size_t>(hidden) * sizeof(__nv_bfloat16) + 3) & ~size_t(3);
+  const size_t smem = sums_offset +
                       static_cast<size_t>(kThreads / 32) * sizeof(float);
   if (smem > 48 * 1024) {
     return CUDA_ERROR_INVALID_VALUE;
