@@ -127,6 +127,12 @@ fn counters(engine: &EngineHarness) -> SpecDecodeCounters {
         .expect("EAGLE-3 engine publishes speculative counters")
 }
 
+/// Counters read right after launch, when the scheduler may not have published
+/// its first snapshot yet; before any step every count is zero.
+fn launch_counters(engine: &EngineHarness) -> SpecDecodeCounters {
+    engine.metrics().spec_decode.unwrap_or_default()
+}
+
 /// Drafts proposed and accepted since `before`, with the accepted count per
 /// draft position (the accepted-length distribution).
 fn report(name: &str, before: &SpecDecodeCounters, after: &SpecDecodeCounters) -> (u64, u64) {
@@ -188,7 +194,7 @@ fn eagle3_greedy_matches_plain_greedy() {
     let base = baseline(&model_path, &cases);
 
     let engine = launch(&model_path, Some(&draft_path));
-    let before = counters(&engine);
+    let before = launch_counters(&engine);
     let specs: Vec<Vec<Step>> = encoded
         .iter()
         .map(|t| generate(&engine, t.clone(), 0, GENERATED_TOKENS))
@@ -240,7 +246,7 @@ fn eagle3_output_budget_edges_match_plain_greedy() {
     let base = baseline(&model_path, &cases);
 
     let engine = launch(&model_path, Some(&draft_path));
-    let before = counters(&engine);
+    let before = launch_counters(&engine);
     let specs: Vec<Vec<Step>> = budgets
         .iter()
         .map(|&b| generate(&engine, tokens.clone(), 0, b))
@@ -268,7 +274,7 @@ fn eagle3_abort_mid_speculation_keeps_the_engine_lossless() {
     let base = baseline(&model_path, &[(encoded[1].clone(), GENERATED_TOKENS)]);
 
     let engine = launch(&model_path, Some(&draft_path));
-    let start = counters(&engine);
+    let start = launch_counters(&engine);
     let victim_params = SamplingParams {
         ignore_eos: true,
         ..SamplingParams::default()
@@ -327,7 +333,7 @@ fn eagle3_overlapping_requests_fall_back_and_stay_lossless() {
     let base = baseline(&model_path, &cases);
 
     let engine = launch(&model_path, Some(&draft_path));
-    let start = counters(&engine);
+    let start = launch_counters(&engine);
     let mut first = engine.submit(request(
         encoded[0].clone(),
         SamplingParams::default(),
