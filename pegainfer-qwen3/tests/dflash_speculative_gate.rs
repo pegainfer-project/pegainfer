@@ -614,6 +614,105 @@ fn dflash2_native_checkpoint_is_lossless() {
     }
 }
 
+/// DSpine bridge checkpoint: greedy losslessness plus a live speculative path
+/// (rounds/proposed/accepted all move). Ignored by default; set the target and
+/// `PEGAINFER_DSPINE_TEST_MODEL_PATH` to run it on a GPU.
+#[test]
+#[ignore = "requires PEGAINFER_TEST_MODEL_PATH and PEGAINFER_DSPINE_TEST_MODEL_PATH on a CUDA GPU"]
+fn dspine_checkpoint_is_lossless_and_accepts() {
+    const BUDGET: usize = 32;
+
+    common::harness::init_capture_logging();
+    let model_path = std::env::var("PEGAINFER_TEST_MODEL_PATH")
+        .expect("set PEGAINFER_TEST_MODEL_PATH to the matching target checkpoint");
+    let draft_path = std::env::var("PEGAINFER_DSPINE_TEST_MODEL_PATH")
+        .expect("set PEGAINFER_DSPINE_TEST_MODEL_PATH to a DSpine bridge checkpoint");
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(Path::new(&draft_path).join("config.json"))
+            .expect("DSpine draft config must exist"),
+    )
+    .expect("DSpine draft config must be valid JSON");
+    assert!(
+        config["dflash_config"]["selected_prefix_code_bridge"].is_object(),
+        "use a checkpoint with dflash_config.selected_prefix_code_bridge"
+    );
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let prompts = [
+        "Q: What is 17 multiplied by 23? A: Let's think step by step.",
+        "def fibonacci(n):",
+        "The capital of France is",
+    ];
+    let encoded: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|prompt| tokenizer.encode(prompt, false).expect("encode failed"))
+        .collect();
+
+    let baseline: Vec<Vec<Step>> = {
+        let engine = EngineHarness::new(
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
+                .expect("failed to start baseline engine"),
+        );
+        let out = encoded
+            .iter()
+            .map(|tokens| generate(&engine, tokens.clone(), LOGPROBS, BUDGET))
+            .collect();
+        drop(engine);
+        std::thread::sleep(Duration::from_secs(2));
+        out
+    };
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start DSpine engine"),
+    );
+    let before = engine.metrics().spec_decode.unwrap_or_default();
+    let mut failures = Vec::new();
+    for (i, &prompt) in prompts.iter().enumerate() {
+        let spec = generate(&engine, encoded[i].clone(), 0, BUDGET);
+        if let Err(failure) = check_lossless(
+            &engine,
+            &tokenizer,
+            i,
+            prompt,
+            &encoded[i],
+            &baseline[i],
+            &spec,
+        ) {
+            failures.push(failure);
+        }
+    }
+    let after = engine
+        .metrics()
+        .spec_decode
+        .expect("DSpine speculative metrics missing");
+    let rounds = after.num_drafts - before.num_drafts;
+    let proposed = after.num_draft_tokens - before.num_draft_tokens;
+    let accepted = after.num_accepted_tokens - before.num_accepted_tokens;
+    eprintln!(
+        "dspine: rounds={rounds}, proposed={proposed}, accepted={accepted} ({:.1}%)",
+        100.0 * accepted as f64 / proposed.max(1) as f64
+    );
+    drop(engine);
+
+    assert!(
+        rounds > 0 && proposed > 0 && accepted > 0,
+        "DSpine speculative path is inactive"
+    );
+    assert!(accepted <= proposed, "accepted exceeds proposed");
+    assert!(
+        failures.is_empty(),
+        "DSpine greedy decode is not lossless:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// Production hedge regression: an explicit stop in the middle of a verify
 /// span must be applied before the hedge winner is selected and committed.
 /// The parent gate also checks the request-local worker trace, because the

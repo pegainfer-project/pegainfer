@@ -1060,4 +1060,119 @@ unsafe extern "C" {
         length: i32,
         stream: CUstream,
     ) -> i32;
+
+    pub fn dspine_prepare_read_cuda(
+        raw: *const Half,
+        normalized: *mut Half,
+        rms: *mut f32,
+        rows: i32,
+        hidden: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dspine_normalize_codes_cuda(
+        projected: *const Half,
+        codebook: *const Half,
+        input_ids: *const u32,
+        codes: *mut Half,
+        rows: i32,
+        code_size: i32,
+        block: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dspine_feature_message_cuda(
+        packed: *const Half,
+        gate_bias: *const Half,
+        message: *mut Half,
+        rows: i32,
+        rank: i32,
+        block: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dspine_feature_finish_cuda(
+        raw: *const Half,
+        delta: *const Half,
+        rms: *const f32,
+        out: *mut Half,
+        rows: i32,
+        hidden: i32,
+        block: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dspine_feature_finish_norm_cuda(
+        raw: *const Half,
+        delta: *const Half,
+        rms: *const f32,
+        out: *mut Half,
+        normed: *mut Half,
+        weight: *const Half,
+        rows: i32,
+        hidden: i32,
+        block: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dspine_topk_cuda(
+        logits: *const Half,
+        candidate_ids: *mut i32,
+        batch: i32,
+        block: i32,
+        vocab: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dspine_serial_table_cuda(
+        packed: *const Half,
+        rms: *const f32,
+        raw: *const Half,
+        lm_head: *const Half,
+        norm_weight: *const Half,
+        tg: *const Half,
+        tsv: *const Half,
+        gate_bias: *const Half,
+        candidates: *const i32,
+        input_ids: *const u32,
+        idx: *mut i32,
+        batch: i32,
+        block: i32,
+        hidden: i32,
+        rank: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dspine_serial_chain_cuda(
+        idx: *const i32,
+        candidates: *const i32,
+        input_ids: *const u32,
+        out: *mut u32,
+        batch: i32,
+        block: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dspine_scale_cols_cuda(
+        input: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        rows: i64,
+        cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dspine_scale_const_cuda(
+        input: *const Half,
+        out: *mut Half,
+        count: i64,
+        factor: f32,
+        stream: CUstream,
+    ) -> CUresult;
 }

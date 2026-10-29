@@ -456,6 +456,13 @@ impl LocalQwen3Lane {
                 } else {
                     model.markov_draft_tokens(self.model.device_ctx(), &current_tokens, scratch)?
                 }
+            } else if model.uses_dspine() {
+                model.dspine_draft_tokens(
+                    self.model.device_ctx(),
+                    &self.model,
+                    requests.len(),
+                    scratch,
+                )?
             } else {
                 let greedy = SamplingParams::default();
                 let params: Vec<&SamplingParams> = vec![&greedy; draft_len];
