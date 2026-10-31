@@ -12,11 +12,14 @@
 //! The grouped `(1+weight)` RMSNorm serves the hyper-connection and PLE streams
 //! (`csrc/qwen4/qwen4_grouped_rmsnorm.cu`); its contract is on the wrapper.
 
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
+use cudarc::driver::sys::CUdevice_attribute;
 use half::bf16;
 
 use crate::ffi;
@@ -34,6 +37,39 @@ const FUSED_WIDTH: usize = 640;
 const HEAD_DIM: usize = 128;
 const ROTARY_DIM: usize = 64;
 const COMPRESS_RATIO: usize = 4;
+/// `kWarps` in the score kernel; one CTA covers that many blocks per pass.
+const SCORE_WARPS: usize = 4;
+
+/// Target resident CTAs per SM for the score pass. One row is one CTA by
+/// default, which leaves a decode batch far below the GPU's capacity; splitting
+/// each row's independent blocks reaches this target without a cross-CTA
+/// reduction. The final count is capped by the row's block count.
+const SCORE_CTAS_PER_SM: usize = 4;
+
+/// The device query is a host call, so cache it rather than repeat it in every
+/// decode step. A heterogeneous TP process would only change the split count,
+/// never the scores each CTA writes.
+static QSA_SM_COUNT: OnceLock<usize> = OnceLock::new();
+
+fn qsa_sm_count(ctx: &DeviceContext) -> Result<usize> {
+    if let Some(sms) = QSA_SM_COUNT.get() {
+        return Ok(*sms);
+    }
+    let sms = usize::try_from(
+        ctx.ctx
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+    )?;
+    let _ = QSA_SM_COUNT.set(sms);
+    Ok(*QSA_SM_COUNT.get().expect("SM count was just stored"))
+}
+
+fn qsa_score_splits(ctx: &DeviceContext, query_rows: usize, blocks: usize) -> Result<usize> {
+    let max_splits = blocks.div_ceil(SCORE_WARPS).max(1);
+    Ok(qsa_sm_count(ctx)?
+        .saturating_mul(SCORE_CTAS_PER_SM)
+        .div_ceil(query_rows)
+        .clamp(1, max_splits))
+}
 
 /// Score every complete micro-block of `fused_qk` for every query row.
 ///
@@ -128,9 +164,11 @@ pub fn qsa_indexer_block_scores_into(
         return Ok(());
     }
     // The kernel takes extents as i32; checked before any pointer is formed.
+    let score_splits = qsa_score_splits(ctx, query_rows, blocks)?;
     let query_rows = checked_i32(query_rows, "QSA indexer query rows")?;
     let tokens = checked_i32(tokens, "QSA indexer tokens")?;
     let score_cols = checked_i32(score_cols, "QSA indexer score columns")?;
+    let score_splits = checked_i32(score_splits, "QSA indexer score splits")?;
 
     let (fused_ptr, _fused_guard) = fused_qk.device_ptr(&ctx.stream);
     let (q_norm_ptr, _q_norm_guard) = q_norm_weight.device_ptr(&ctx.stream);
@@ -155,6 +193,7 @@ pub fn qsa_indexer_block_scores_into(
             query_rows,
             tokens,
             score_cols,
+            score_splits,
             rms_eps,
             active_cu_stream(ctx),
         )

@@ -27,6 +27,7 @@ unsafe extern "C" {
         query_rows: i32,
         tokens: i32,
         score_cols: i32,
+        score_splits: i32,
         rms_eps: f32,
         stream: CUstream,
     ) -> CUresult;

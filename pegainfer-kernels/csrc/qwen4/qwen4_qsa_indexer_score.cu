@@ -38,6 +38,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+
 namespace {
 
 constexpr int kHeads = 4;      // indexer_n_heads
@@ -157,7 +159,8 @@ __global__ void qwen4_qsa_pool_keys_kernel(
 }
 
 // Per query row: prepare the row's four query heads, then score every block the
-// row can see. One CTA per row, the four warps split the row's blocks.
+// row can see. Each row may span several CTAs along grid.x so a small decode
+// batch still fills the GPU; the four warps in a CTA take disjoint blocks.
 __global__ void qwen4_qsa_block_scores_kernel(
     const __nv_bfloat16* __restrict__ fused_qk,         // [tokens, kFusedWidth]
     const __nv_bfloat16* __restrict__ q_norm_weight,    // [kHeadDim]
@@ -170,7 +173,7 @@ __global__ void qwen4_qsa_block_scores_kernel(
     int tokens,
     int score_cols,
     float rms_eps) {
-  const int row = blockIdx.x;
+  const int row = blockIdx.y;
   const int lane = threadIdx.x % WARP_SIZE;
   const int warp = threadIdx.x / WARP_SIZE;
 
@@ -189,7 +192,8 @@ __global__ void qwen4_qsa_block_scores_kernel(
     __trap();
   }
   const int row_blocks = visible / kRatio;
-  if (row_blocks <= 0) {
+  const int first_block = blockIdx.x * kWarps;
+  if (row_blocks <= first_block) {
     return;
   }
 
@@ -234,7 +238,8 @@ __global__ void qwen4_qsa_block_scores_kernel(
     }
   }
 
-  for (int block = warp; block < row_blocks; block += kWarps) {
+  for (int block = first_block + warp; block < row_blocks;
+       block += gridDim.x * kWarps) {
     float acc[kHeads];
 #pragma unroll
     for (int h = 0; h < kHeads; ++h) {
@@ -305,6 +310,7 @@ CUresult qwen4_qsa_indexer_block_scores_cuda(
     int query_rows,
     int tokens,
     int score_cols,
+    int score_splits,
     float rms_eps,
     cudaStream_t stream) {
   if (fused_qk == nullptr || q_norm_weight == nullptr ||
@@ -328,6 +334,10 @@ CUresult qwen4_qsa_indexer_block_scores_cuda(
   if (blocks > score_cols) {
     return CUDA_ERROR_INVALID_VALUE;
   }
+  const int max_score_splits = std::max(1, (blocks + kWarps - 1) / kWarps);
+  if (score_splits < 1 || score_splits > max_score_splits) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
   if (blocks > 0) {
     const int grid = (blocks + kWarps - 1) / kWarps;
     qwen4_qsa_pool_keys_kernel<<<grid, kThreads, 0, stream>>>(
@@ -338,7 +348,8 @@ CUresult qwen4_qsa_indexer_block_scores_cuda(
       return pooled_status;
     }
   }
-  qwen4_qsa_block_scores_kernel<<<query_rows, kThreads, 0, stream>>>(
+  const dim3 score_grid(score_splits, query_rows);
+  qwen4_qsa_block_scores_kernel<<<score_grid, kThreads, 0, stream>>>(
       fused_qk, q_norm_weight, pooled_keys, cos_table, sin_table, rows,
       visible_len, scores, tokens, score_cols, rms_eps);
   return consume_last_cuda_error();
