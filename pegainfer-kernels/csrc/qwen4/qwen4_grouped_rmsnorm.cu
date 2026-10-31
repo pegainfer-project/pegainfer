@@ -25,6 +25,66 @@ using DType = __nv_bfloat16;
 
 namespace {
 
+// Full-row single-round shape: every launched thread owns one vector and the
+// block covers the group exactly. Keeping that vector live across the reduction
+// removes the second global read the generic kernel needs to write the output.
+template <uint32_t VEC_SIZE, typename T>
+__global__ void GroupedRMSNormSingleRoundKernel(const T* __restrict__ input,
+                                                const T* __restrict__ weight,
+                                                T* __restrict__ out,
+                                                const uint32_t group_size,
+                                                const uint32_t groups,
+                                                float eps) {
+    const uint32_t bx = blockIdx.x;
+    const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+    constexpr uint32_t warp_size = 32;
+    const uint32_t num_warps = blockDim.y;
+    const uint32_t thread_id = tx + ty * warp_size;
+    extern __shared__ float group_smem[];
+
+    const T* row_in = input + static_cast<size_t>(bx) * group_size;
+    T* row_out = out + static_cast<size_t>(bx) * group_size;
+    const T* row_weight = weight + static_cast<size_t>(bx % groups) * group_size;
+    const uint32_t elem = thread_id * VEC_SIZE;
+
+    flashinfer::vec_t<T, VEC_SIZE> input_vec;
+    input_vec.load(row_in + elem);
+
+    float sum_sq = 0.f;
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+        sum_sq += float(input_vec[j]) * float(input_vec[j]);
+    }
+
+#pragma unroll
+    for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+        sum_sq += flashinfer::math::shfl_xor_sync(sum_sq, offset);
+    }
+
+    group_smem[ty] = sum_sq;
+    __syncthreads();
+    if (ty == 0) {
+        sum_sq = (tx < num_warps) ? group_smem[tx] : 0.f;
+#pragma unroll
+        for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+            sum_sq += flashinfer::math::shfl_xor_sync(sum_sq, offset);
+        }
+        group_smem[0] = sum_sq;
+    }
+    __syncthreads();
+
+    const float rms_rcp = flashinfer::math::rsqrt(group_smem[0] / float(group_size) + eps);
+
+    flashinfer::vec_t<T, VEC_SIZE> weight_vec;
+    flashinfer::vec_t<T, VEC_SIZE> out_vec;
+    weight_vec.load(row_weight + elem);
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+        out_vec[j] = float(input_vec[j]) * rms_rcp * (1.f + float(weight_vec[j]));
+    }
+    out_vec.store(row_out + elem);
+}
+
 template <uint32_t VEC_SIZE, typename T>
 __global__ void GroupedRMSNormKernel(const T* __restrict__ input,
                                      const T* __restrict__ weight,
@@ -131,13 +191,23 @@ CUresult rms_norm_grouped_offset_cuda(const DType *x, const DType *weight, DType
     const uint32_t vec_size = std::gcd<uint32_t>(16 / sizeof(DType), d);
     const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
     const uint32_t num_warps = flashinfer::ceil_div(block_size, 32);
+    const uint32_t num_threads = num_warps * 32;
+    // The cached path has no guards, so launch it only when every thread owns
+    // one full vector and those vectors cover the group exactly.
+    const bool single_round_full =
+        static_cast<uint64_t>(num_threads) * vec_size == d;
     // One block per (token, group), the grid the flattened view would get.
     dim3 nblks(static_cast<uint32_t>(rows));
     dim3 nthrs(32, num_warps);
     const uint32_t smem_size = num_warps * sizeof(float);
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-        GroupedRMSNormKernel<VEC_SIZE, DType>
-            <<<nblks, nthrs, smem_size, stream>>>(x, weight, out, d, groups, eps);
+        if (single_round_full) {
+            GroupedRMSNormSingleRoundKernel<VEC_SIZE, DType>
+                <<<nblks, nthrs, smem_size, stream>>>(x, weight, out, d, groups, eps);
+        } else {
+            GroupedRMSNormKernel<VEC_SIZE, DType>
+                <<<nblks, nthrs, smem_size, stream>>>(x, weight, out, d, groups, eps);
+        }
     });
     return map_cuda_error(cudaGetLastError());
 }

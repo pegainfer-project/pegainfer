@@ -237,7 +237,7 @@ fn the_grouped_norm_matches_its_own_reference() {
     let weight = weight_host();
     let device_weight = device_weight(&ctx, &weight);
 
-    for tokens in [1, TOKENS] {
+    for tokens in [1, TOKENS, 128] {
         let x = stream_host(tokens);
         let reference = grouped_reference(&x, &weight, tokens * BRANCHES, f64::from(EPS));
         let states = grouped_states(&ctx, &x, tokens);
