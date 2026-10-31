@@ -288,8 +288,11 @@ impl SingleGpuBackend {
     }
 
     pub(super) fn active_joint_prefix_pages(&self, req: &Request) -> usize {
-        self.kv_cache
-            .active_joint_prefix_pages(&req.prompt_tokens, req.lora_adapter.as_deref())
+        self.kv_cache.active_joint_prefix_pages(
+            &req.prompt_tokens,
+            req.lora_adapter.as_deref(),
+            req.history_tokens,
+        )
     }
 
     pub(super) fn capacity_pages_for_requests(&self) -> usize {
@@ -313,6 +316,7 @@ impl SingleGpuBackend {
                 &req.prompt_tokens,
                 req.max_tokens,
                 req.lora_adapter.as_deref(),
+                req.history_tokens,
                 true,
             )
             .map_err(AdmissionError::Recoverable)?;
@@ -615,6 +619,7 @@ impl TpSchedulerBackend {
                 &req.prompt_tokens,
                 req.max_tokens,
                 req.lora_adapter.as_deref(),
+                req.history_tokens,
                 true,
             )
             .map_err(AdmissionError::from)?;
@@ -622,8 +627,11 @@ impl TpSchedulerBackend {
     }
 
     pub(super) fn active_joint_prefix_pages(&self, req: &Request) -> usize {
-        self.executor
-            .active_joint_prefix_pages(&req.prompt_tokens, req.lora_adapter.as_deref())
+        self.executor.active_joint_prefix_pages(
+            &req.prompt_tokens,
+            req.lora_adapter.as_deref(),
+            req.history_tokens,
+        )
     }
 
     pub(super) fn new(

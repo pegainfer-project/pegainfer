@@ -19,6 +19,15 @@ use crate::recurrent_state::RecurrentState;
 /// Token interval at which a complete recurrent/conv snapshot may be cached.
 pub(crate) const SNAPSHOT_STRIDE_TOKENS: usize = 256;
 
+/// Last stride boundary at or below `history_tokens` (the prompt length without one).
+pub(crate) fn history_stop(
+    prompt_len: usize,
+    history_tokens: Option<usize>,
+    stride: usize,
+) -> usize {
+    history_tokens.map_or(prompt_len, |h| h.min(prompt_len)) / stride * stride
+}
+
 /// Content-addressed identity of one complete hybrid-model prefix boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PrefixBoundaryKey {
@@ -307,6 +316,7 @@ impl Qwen35PrefixCache {
         &self,
         prompt_tokens: &[u32],
         lora_name: Option<&str>,
+        history_tokens: Option<usize>,
     ) -> usize {
         if !self.enabled() {
             return 0;
@@ -316,7 +326,12 @@ impl Qwen35PrefixCache {
             .pool()
             .active_prefix_hashes(prompt_tokens.to_vec(), lora_name);
         let block_size = self.kv.pool().block_size();
-        let resident_tokens = hashes.len() * block_size;
+        // Credit only what `begin_request` can attach: nothing past the history stop.
+        let resident_tokens = (hashes.len() * block_size).min(history_stop(
+            prompt_tokens.len(),
+            history_tokens,
+            SNAPSHOT_STRIDE_TOKENS,
+        ));
         eligible_boundaries(resident_tokens, SNAPSHOT_STRIDE_TOKENS)
             .find(|&boundary| {
                 let key = PrefixBoundaryKey {
@@ -339,6 +354,7 @@ impl Qwen35PrefixCache {
         prompt_tokens: &[u32],
         max_output_tokens: usize,
         lora_name: Option<&str>,
+        history_tokens: Option<usize>,
         allow_match: bool,
     ) -> Result<(RequestKv, Option<SnapshotGuard>)> {
         let mut request =
@@ -353,7 +369,10 @@ impl Qwen35PrefixCache {
             .kv
             .pool()
             .probe_prefix(prompt_tokens.to_vec(), lora_name);
-        let resident_tokens = probe.reusable_blocks() * self.kv.pool().block_size();
+        // Resuming past the history stop would skip it, so the next turn could not reuse it.
+        let resident_tokens = (probe.reusable_blocks() * self.kv.pool().block_size()).min(
+            history_stop(prompt_tokens.len(), history_tokens, SNAPSHOT_STRIDE_TOKENS),
+        );
         let mut saw_eligible_kv = false;
         for boundary in eligible_boundaries(resident_tokens, SNAPSHOT_STRIDE_TOKENS) {
             saw_eligible_kv = true;

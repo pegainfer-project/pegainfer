@@ -515,6 +515,7 @@ impl Qwen35TpExecutor {
         prompt_tokens: &[u32],
         max_output_tokens: usize,
         lora_name: Option<&str>,
+        history_tokens: Option<usize>,
         allow_match: bool,
     ) -> Result<usize, TpBeginRequestError> {
         self.poison
@@ -528,7 +529,13 @@ impl Qwen35TpExecutor {
         }
         let (mut kv, restore) = self
             .kv_cache
-            .begin_request(prompt_tokens, max_output_tokens, lora_name, allow_match)
+            .begin_request(
+                prompt_tokens,
+                max_output_tokens,
+                lora_name,
+                history_tokens,
+                allow_match,
+            )
             .map_err(TpBeginRequestError::Recoverable)?;
         let boundary = restore.as_ref().map_or(0, SnapshotGuard::boundary);
         let snapshot_slot = restore.as_ref().map(SnapshotGuard::recurrent_slot);
@@ -575,9 +582,10 @@ impl Qwen35TpExecutor {
         &self,
         prompt_tokens: &[u32],
         lora_name: Option<&str>,
+        history_tokens: Option<usize>,
     ) -> usize {
         self.kv_cache
-            .active_joint_prefix_pages(prompt_tokens, lora_name)
+            .active_joint_prefix_pages(prompt_tokens, lora_name, history_tokens)
     }
 
     pub(crate) fn prefix_cache_enabled(&self) -> bool {
@@ -1020,6 +1028,7 @@ impl Qwen35TpExecutor {
                 request.request_id,
                 &request.prompt_tokens,
                 self.max_position_embeddings - request.prompt_tokens.len(),
+                None,
                 None,
                 false,
             ) {
@@ -2185,6 +2194,7 @@ mod tests {
                 &[151_646, 9707],
                 executor.max_position_embeddings - 2,
                 None,
+                None,
                 false,
             )
             .unwrap_err();
@@ -2261,7 +2271,7 @@ mod tests {
             .expect("materialize TP2 decode request");
         let prefill_id = RequestId::new(31);
         executor
-            .begin_request(prefill_id, &[151_646, 9707], 8, None, false)
+            .begin_request(prefill_id, &[151_646, 9707], 8, None, None, false)
             .expect("admit unified prefill");
         let unified = executor
             .execute_unified(&TpUnifiedPlan {
