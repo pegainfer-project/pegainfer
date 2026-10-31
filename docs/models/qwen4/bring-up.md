@@ -2,7 +2,7 @@
 
 > **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of the model crate is CPU-only; its first device code lives beside it in `pegainfer-kernels` behind that crate's own `qwen4` feature — the QSA token indexer's block-scoring and block-selection kernels, gated against a committed reference golden. Nothing runs — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
 >
-> **Last touched:** 2026-10
+> **Last touched:** 2026-11
 
 Tracked in #1103 (roadmap) with slices A #1104 / B #1127 / C #1128 and component bricks #1105 (QSA), #1106 (n-gram), #1107 (MoE), #1108 (hyper-connections).
 
