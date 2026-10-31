@@ -72,8 +72,11 @@ pub mod runtime {
     pub use crate::weights::Qwen35Model;
 }
 
-/// Public operator surface used by Qwen3.5-local benches.
+/// Public operator surface used by Qwen3.5-local benches and gates.
 pub mod runtime_ops {
+    pub use crate::ops::conv1d_prefill_batch_into;
+    pub use crate::ops::gated_delta_rule_prefill_chunk_prepare_into;
+    pub use crate::ops::gated_delta_rule_prefill_chunkwise_from_gates_into;
     pub use crate::ops::gated_delta_rule_prefill_chunkwise_into;
     pub use crate::ops::rms_norm_batch_offset_into;
     pub use crate::ops::rms_norm_offset_into;
