@@ -1,13 +1,15 @@
 //! Qwen3.8-Flash-Next (Qwen4 line) kernels.
 //!
-//! QSA token-indexer block scoring turns the fused `index_qk_proj` output into
-//! one score per (query row, visible micro-block); selection — top-k plus the
-//! unconditional tail — is a later stage, deliberately not here. Frozen
-//! semantics live in `csrc/qwen4/qwen4_qsa_indexer_score.cu` (transformers
-//! 5.16.1 `qwen4_exp` `Qwen4ExpTextQSAIndexer.forward`); the kernel is compiled
-//! for one geometry and this wrapper sizes its buffers from it. The checkpoint's
-//! own indexer fields are checked where the model crate reads its config, once
-//! that caller lands — this stage takes only `rms_eps` from the caller.
+//! [`qsa_indexer_block_scores_into`] turns the fused `index_qk_proj` output
+//! into one score per (query row, visible micro-block);
+//! [`qsa_indexer_select_into`] turns those scores into the row's token-level
+//! visibility mask (top-k plus the unconditional tail). Frozen semantics live
+//! in `csrc/qwen4/qwen4_qsa_indexer_score.cu` and
+//! `csrc/qwen4/qwen4_qsa_indexer_select.cu` (transformers 5.16.1 `qwen4_exp`
+//! `Qwen4ExpTextQSAIndexer.forward`); the kernels are compiled for one geometry
+//! and these wrappers size their buffers from it. The checkpoint's own indexer
+//! fields are checked where the model crate reads its config, once that caller
+//! lands — the score stage takes only `rms_eps` from the caller.
 //!
 //! The grouped `(1+weight)` RMSNorm serves the hyper-connection and PLE streams
 //! (`csrc/qwen4/qwen4_grouped_rmsnorm.cu`); its contract is on the wrapper.
@@ -230,4 +232,235 @@ pub fn rms_norm_grouped_offset_batch_into(
     };
     result.result()?;
     Ok(())
+}
+
+/// The largest number of blocks a budget may keep: the checkpoint's 2048-token
+/// budget at the compiled four tokens per block. The kernel refuses the same
+/// bound on the device; this copy shapes the host-side message and lets the
+/// wrapper refuse before a launch (the score wrapper mirrors its compiled
+/// geometry the same way).
+const MAX_KEPT_BLOCKS: usize = 512;
+
+/// The extents `qsa_indexer_select_into` validates before it forms a pointer,
+/// as the kernel's `i32` arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectPlan {
+    query_rows: i32,
+    tokens: i32,
+    score_cols: i32,
+}
+
+/// The launcher's pre-launch contract. Split from the launch so the guards can
+/// be held without a device (see the unit tests below): every check here is
+/// host arithmetic over buffer lengths and scalars. The public entry returns
+/// early for an empty launch, so these extents are always non-empty here.
+///
+/// `score_cols` is the score buffer's row stride and `score_capacity` its flat
+/// length, which may exceed the rows' extent — the score stage can hand over a
+/// buffer with spare capacity. The stride must hold `tokens / COMPRESS_RATIO`
+/// blocks — one row's ceiling — while the kernel reads only each row's own
+/// `(rows[j] + 1) / 4`.
+fn select_plan(
+    query_rows: usize,
+    tokens: usize,
+    score_cols: usize,
+    score_capacity: usize,
+    mask_capacity: usize,
+    budget: i32,
+) -> Result<SelectPlan> {
+    // Unsigned arithmetic: `i32::is_multiple_of` is not stable in the pinned
+    // toolchain, and the conversion already rejects a negative budget.
+    let budget_blocks = usize::try_from(budget)
+        .ok()
+        .filter(|blocks| blocks.is_multiple_of(COMPRESS_RATIO))
+        .map(|blocks| blocks / COMPRESS_RATIO);
+    ensure!(
+        budget_blocks.is_some_and(|blocks| blocks > 0 && blocks <= MAX_KEPT_BLOCKS),
+        "QSA indexer budget {budget} must be a positive multiple of {COMPRESS_RATIO} \
+         keeping at most {MAX_KEPT_BLOCKS} blocks"
+    );
+    ensure!(query_rows > 0, "QSA indexer select needs query rows");
+    ensure!(tokens > 0, "QSA indexer select needs tokens");
+    // The 64-bit cell counts come first: a product that does not fit would
+    // otherwise be compared as a plausible-looking row extent below.
+    let cells = query_rows
+        .checked_mul(tokens)
+        .ok_or_else(|| anyhow::anyhow!("QSA indexer mask {query_rows} x {tokens} overflows"))?;
+    let score_cells = query_rows.checked_mul(score_cols).ok_or_else(|| {
+        anyhow::anyhow!("QSA indexer score {query_rows} x {score_cols} overflows")
+    })?;
+    ensure!(
+        score_capacity >= score_cells,
+        "QSA indexer score buffer {score_capacity} f32 cannot hold {query_rows} rows \
+         of {score_cols}"
+    );
+    ensure!(
+        score_cols >= tokens / COMPRESS_RATIO,
+        "QSA indexer score row holds {score_cols} blocks, but a mask over \
+         {tokens} tokens needs {}",
+        tokens / COMPRESS_RATIO
+    );
+    ensure!(
+        mask_capacity >= cells,
+        "QSA indexer mask holds {} bytes, needs {cells} for {query_rows} x {tokens}",
+        mask_capacity
+    );
+    Ok(SelectPlan {
+        query_rows: checked_i32(query_rows, "QSA indexer query rows")?,
+        tokens: checked_i32(tokens, "QSA indexer tokens")?,
+        score_cols: checked_i32(score_cols, "QSA indexer score columns")?,
+    })
+}
+
+/// Turn one score per (query row, complete block) into the row's token-level
+/// visibility mask: the tokens of the `min(budget / COMPRESS_RATIO, blocks)`
+/// highest block scores plus the row's incomplete tail.
+///
+/// `scores` is `[rows.len(), score_cols]` f32 with row stride `score_cols`; the
+/// buffer may hold spare capacity (`scores.len() >= rows.len() * score_cols`).
+/// Only `(rows[j] + 1) / 4` entries of row `j` are read, so the NaN padding the
+/// scoring stage leaves past that prefix is never touched. `rows[j]` is row `j`'s position, also its row order in `scores` and
+/// `mask`. `budget` is the token budget, a positive multiple of four keeping at
+/// most 512 blocks; `tokens` is the mask's column count and the row's causal
+/// ceiling (`pos < tokens`).
+///
+/// The visible list starts at token 0, the scoring stage's grid contract: row
+/// `j` sees exactly `[0, rows[j]]`, and its blocks are `[0, (rows[j] + 1) / 4)`.
+/// A prefix-evicted visible list is out of contract (it needs a shifted key
+/// array on both stages), which no buffer check here can detect.
+///
+/// `mask` is one byte per (row, token), `0` or `1`, row stride `tokens`: `1`
+/// exactly for the tokens of the selected blocks, whose blocks cover tokens
+/// below the row's position, and for the tail `4 * blocks ..= pos`. Causality
+/// is therefore inherent, not an extra condition. Ties go to the lower block
+/// index (descending score, ascending index), the canonical order the parity
+/// gate holds the golden to; `torch.topk` leaves a block tied at the cut open,
+/// so the fixture's own pick can differ there and still be valid.
+///
+/// A non-finite score inside a row's block prefix or an out-of-range `rows`
+/// entry traps on the device: the caller's input is broken, and a silently
+/// shorter visible set would hand the attention softmax an undefined row. The
+/// kernel repeats the budget and score row width checks the host entry already
+/// made, so a caller reaching it by another path still fails visibly. An empty
+/// launch (`rows.len() == 0` or `tokens == 0`) is a no-op, as it is in the score
+/// stage above; the C entry still refuses one reached directly. A malformed
+/// budget and a short buffer are refused before any pointer is formed.
+pub fn qsa_indexer_select_into(
+    ctx: &DeviceContext,
+    scores: &CudaSlice<f32>,
+    score_cols: usize,
+    rows: &CudaSlice<i32>,
+    budget: i32,
+    tokens: usize,
+    mask: &mut CudaSlice<u8>,
+) -> Result<()> {
+    if rows.is_empty() || tokens == 0 {
+        return Ok(());
+    }
+    let plan = select_plan(
+        rows.len(),
+        tokens,
+        score_cols,
+        scores.len(),
+        mask.len(),
+        budget,
+    )?;
+    let (scores_ptr, _scores_guard) = scores.device_ptr(&ctx.stream);
+    let (rows_ptr, _rows_guard) = rows.device_ptr(&ctx.stream);
+    let (mask_ptr, _mask_guard) = mask.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_qsa_indexer_select_cuda(
+            scores_ptr as *const f32,
+            rows_ptr as *const i32,
+            mask_ptr as *mut u8,
+            plan.query_rows,
+            plan.tokens,
+            plan.score_cols,
+            budget,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow::anyhow!("QSA indexer select launch failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows, tokens, score columns, score capacity and mask capacity of one
+    /// valid launch: two query rows, eight tokens, two blocks per score row.
+    const VALID: (usize, usize, usize, usize, usize) = (2, 8, 2, 4, 16);
+
+    fn plan(
+        query_rows: usize,
+        tokens: usize,
+        score_cols: usize,
+        scores: usize,
+        mask: usize,
+        budget: i32,
+    ) -> Result<SelectPlan> {
+        select_plan(query_rows, tokens, score_cols, scores, mask, budget)
+    }
+
+    #[test]
+    fn a_complete_launch_passes() {
+        let (rows, tokens, score_cols, scores, mask) = VALID;
+        assert_eq!(
+            plan(rows, tokens, score_cols, scores, mask, 8).expect("valid"),
+            SelectPlan {
+                query_rows: 2,
+                tokens: 8,
+                score_cols: 2,
+            }
+        );
+        // The budget ceiling itself passes.
+        assert!(plan(rows, tokens, score_cols, scores, mask, 2048).is_ok());
+    }
+
+    #[test]
+    fn malformed_budgets_are_refused() {
+        let (rows, tokens, score_cols, scores, mask) = VALID;
+        for budget in [0, -4, 2, 7, 2052, i32::MIN, i32::MAX] {
+            assert!(
+                plan(rows, tokens, score_cols, scores, mask, budget).is_err(),
+                "budget {budget} must be refused"
+            );
+        }
+        // 2048 tokens is the checkpoint's budget and the block ceiling; one
+        // more multiple of four is past it.
+        assert!(plan(rows, tokens, score_cols, scores, mask, 2048).is_ok());
+        assert!(plan(rows, tokens, score_cols, scores, mask, 2052).is_err());
+    }
+
+    #[test]
+    fn select_plan_refuses_empty_extents() {
+        let (_, tokens, score_cols, scores, mask) = VALID;
+        assert!(plan(0, tokens, score_cols, 0, mask, 8).is_err(), "no rows");
+        assert!(plan(2, 0, score_cols, scores, 0, 8).is_err(), "no tokens");
+    }
+
+    #[test]
+    fn short_buffers_are_refused() {
+        let (rows, tokens, score_cols, scores, mask) = VALID;
+        // Three f32 cannot hold two rows of two columns.
+        assert!(plan(rows, tokens, score_cols, 3, mask, 8).is_err());
+        // One column cannot hold the two blocks an 8-token row sees.
+        assert!(plan(rows, tokens, 1, 2, mask, 8).is_err());
+        // One byte short of the [2, 8] mask.
+        assert!(plan(rows, tokens, score_cols, scores, mask - 1, 8).is_err());
+        // A score row wider than the block grid is fine: only the prefix is read.
+        assert!(plan(rows, tokens, 16, 2 * 16, mask, 8).is_ok());
+        // Spare capacity does not change the row stride.
+        let spare = plan(rows, tokens, score_cols, 2 * scores, mask, 8).expect("spare");
+        assert_eq!(spare.score_cols, 2);
+    }
+
+    #[test]
+    fn an_overflowing_mask_product_is_refused() {
+        assert!(plan(usize::MAX, 8, 2, 8, usize::MAX, 8).is_err());
+        // A stride product that does not fit is refused before the capacity
+        // comparison can read it as a plausible row count.
+        assert!(plan(2, 8, usize::MAX, usize::MAX, 16, 8).is_err());
+    }
 }
