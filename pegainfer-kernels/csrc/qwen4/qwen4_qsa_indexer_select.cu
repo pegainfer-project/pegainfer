@@ -11,45 +11,30 @@
 //   visible = the tokens of the `keep` highest block scores, ties broken by
 //             the LOWER block index, plus the tail
 //
-// The tail is visible unconditionally: it is the incomplete block the top-k
-// grid never scores, and the reference keeps it outside the block grid. Since
-// blocks only ever cover tokens below `p`, the mask is causal by construction;
-// no token past the row's own position can be set.
+// The selection order is descending score, ascending block index. `torch.topk`
+// leaves the pick at the cut open, so a block tied with the last kept one is an
+// equally valid pick; this kernel's canonical tie rule is the one the parity
+// gate holds the fixture to.
 //
 // GRID CONTRACT, inherited from the score pass: the visible list starts at
 // token 0, so a row at `p` sees exactly tokens [0, p] and block b covers
-// [4b, 4b + 4). This kernel takes no `visible_len`: the mask's row order and
-// its causal ceiling both come from `rows`, which is what the reference's
-// causal path serves. A caller whose visible list starts elsewhere (an evicted
+// [4b, 4b + 4). A caller whose visible list starts elsewhere (an evicted
 // prefix) has to hand both passes a shifted key array; nothing here can detect
-// one, and a score left over past a row's real prefix would be selected as if
-// it were valid.
+// one.
 //
-// The selection order is a total order over `(score, block index)`: descending
-// score, ascending index. `torch.topk` leaves the pick at the cut open, so a
-// block tied with the last kept one is an equally valid pick; this kernel's
-// tie rule is the canonical one the gate holds the fixture to.
+// A non-finite score inside `[0, blocks)` or an out-of-range `rows` entry is an
+// upstream contract violation and traps. The score pass leaves the columns past
+// `blocks` untouched, and this kernel never reads them.
 //
-// A non-finite score inside `[0, blocks)` is an upstream contract violation and
-// traps. Zeroing it (or skipping it, which is what a bare comparison does)
-// would be worse than a visible failure: the reference's score is a relu sum,
-// so a poison reaching a block means the indexer input is already broken, and
-// silently dropping that block hands the sparse attention a mask whose kept
-// count is short of the budget. The mask's complement drives the attention
-// softmax, and an all-masked row is undefined there. The kernel never reads the
-// NaN padding past `blocks`: the score pass leaves those columns untouched and
-// they are not part of any row's contract.
-//
-// One CTA per query row. Portability is the point (no TMA, no cluster, no
-// wgmma). A row under the budget keeps every complete block: one pass writes
-// the visible prefix. Otherwise an exact 8-bit radix select over the row's
-// sortable f32 keys (four passes) finds the `keep`-th score, and the blocks
-// equal to that threshold are filled in ascending block-index order to preserve
-// the canonical tie rule. A one-bit-per-block bitmap in dynamic shared memory
-// marks those equals. The bitmap is sized from the widest row this launch can
-// see (`tokens / ratio` blocks); the host refuses a launch whose bitmap plus
-// the block's static shared state passes the 48 KiB default per-block ceiling
-// (319392 blocks, 1.28M tokens), far past the checkpoint's 262144 positions.
+// One CTA per query row. The target is the portable subset (no TMA, no cluster,
+// no wgmma). A row under the budget keeps every complete block and writes the
+// visible prefix in one pass. Otherwise an exact 8-bit radix select over the
+// row's sortable f32 keys (four passes) finds the `keep`-th score, and the
+// blocks equal to that threshold are marked in ascending block-index order to
+// preserve the tie rule, one bit per block in dynamic shared memory sized from
+// the widest row this launch can see (`tokens / ratio` blocks). The host
+// refuses a launch whose bitmap plus the block's static shared state exceeds
+// the default per-block ceiling.
 //
 
 #include "../common.cuh"
@@ -77,8 +62,7 @@ constexpr int kStaticSharedBytes =
     2 * static_cast<int>(sizeof(unsigned int)) +
     (kThreads + 1) * static_cast<int>(sizeof(int));
 // The default per-block shared-memory ceiling on every supported arch; the
-// exclusion bitmap plus the block's static state must fit under it without an
-// opt-in.
+// bitmap plus the block's static state must fit under it without an opt-in.
 constexpr int kMaxSharedBytes = 48 * 1024;
 
 // f32 -> monotonic u32 for the radix select. -0.0 and +0.0 compare equal in the
@@ -88,15 +72,15 @@ __device__ __forceinline__ unsigned int sortable_key(float score) {
   return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
 }
 
-// One bit per block, set once a block has been picked. The bitmap is the whole
-// exclusion state; no per-pick list is kept, so memory stays one bit per block.
-__device__ __forceinline__ bool block_picked(const unsigned int* picked, int block) {
-  return ((picked[block >> 5] >> (block & 31)) & 1u) != 0u;
+// One bit per block, set once a threshold-equal block has been taken; every
+// block above the threshold is kept without a mark.
+__device__ __forceinline__ bool block_taken(const unsigned int* taken, int block) {
+  return ((taken[block >> 5] >> (block & 31)) & 1u) != 0u;
 }
 
-__device__ __forceinline__ void mark_picked(unsigned int* picked, int block) {
+__device__ __forceinline__ void mark_taken(unsigned int* taken, int block) {
   // The equality pass marks from several threads, and equal keys share a word.
-  atomicOr(&picked[block >> 5], 1u << (block & 31));
+  atomicOr(&taken[block >> 5], 1u << (block & 31));
 }
 
 // Per query row: validate the row, check its scores, select the kept blocks and
@@ -108,7 +92,7 @@ __global__ void qwen4_qsa_select_kernel(
     int tokens,
     int score_cols,
     int budget) {
-  extern __shared__ unsigned int picked[];
+  extern __shared__ unsigned int taken[];
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
 
@@ -213,7 +197,7 @@ __global__ void qwen4_qsa_select_kernel(
     row_mask[token] = 0;
   }
   for (int word = tid; word < words; word += blockDim.x) {
-    picked[word] = 0u;
+    taken[word] = 0u;
   }
   __syncthreads();
 
@@ -245,7 +229,7 @@ __global__ void qwen4_qsa_select_kernel(
   int take = need - equal_offsets[tid];
   for (int block = start; block < end && take > 0; ++block) {
     if (sortable_key(row_scores[block]) == threshold) {
-      mark_picked(picked, block);
+      mark_taken(taken, block);
       --take;
     }
   }
@@ -256,7 +240,7 @@ __global__ void qwen4_qsa_select_kernel(
   for (int block = tid; block < blocks; block += blockDim.x) {
     const unsigned int key = sortable_key(row_scores[block]);
     const bool kept =
-        key > threshold || (key == threshold && block_picked(picked, block));
+        key > threshold || (key == threshold && block_taken(taken, block));
     if (!kept) {
       continue;
     }
@@ -289,9 +273,8 @@ extern "C" {
 //
 // The compiled geometry is kRatio = 4 and one byte per mask cell; a caller
 // whose buffers are laid out differently cannot be detected here. An empty
-// launch (no rows, or no tokens) is refused rather than treated as a no-op: a
-// caller asking for nothing has a scheduling bug, and returning success would
-// hide it behind an all-zero mask.
+// launch is refused; `qsa_indexer_select_into` treats one as a no-op before it
+// reaches this entry.
 CUresult qwen4_qsa_indexer_select_cuda(
     const float* scores,
     const int* rows,
