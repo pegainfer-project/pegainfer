@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -57,13 +59,16 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         values.update(overrides)
         return SimpleNamespace(**values)
 
-    def valid_trace_payload(self, concurrency=1, *, trace_overrides=None):
+    def valid_trace_payload(
+        self, concurrency=1, *, trace_overrides=None, num_requests=32,
+        prompt_words=64, max_tokens=64, temperature=0.0, ignore_eos=True,
+    ):
         trace_overrides = trace_overrides or {}
         measured = []
-        for index in range(32):
+        for index in range(num_requests):
             trace = {
                 "prompt_tokens": 84 + index % 4,
-                "completion_tokens": 64,
+                "completion_tokens": max_tokens,
                 "active_set_size": concurrency,
                 "decode_batch_size_max": concurrency,
                 "queue_wait_ms": 12.0,
@@ -82,8 +87,8 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                 bench_http_serving.RequestResult(
                     index=index,
                     request_id=f"bench-{index}",
-                    prompt_words=64,
-                    max_tokens=64,
+                    prompt_words=prompt_words,
+                    max_tokens=max_tokens,
                     ok=True,
                     status=200,
                     error=None,
@@ -98,8 +103,8 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                     ttft_ms=100.0,
                     tpot_ms=14.0,
                     itl_ms=[14.0],
-                    output_chunks=64,
-                    output_chars=64,
+                    output_chunks=max_tokens,
+                    output_chars=max_tokens,
                     output_hash=f"hash-{index}",
                     text_prefix="x",
                     server_trace=trace,
@@ -108,13 +113,13 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         args = SimpleNamespace(
             base_url="http://127.0.0.1:8000",
             model="DeepSeek-V2-Lite",
-            num_requests=32,
+            num_requests=num_requests,
             concurrency=concurrency,
             warmup=0,
-            prompt_words=[64],
-            max_tokens=[64],
-            temperature=0.0,
-            ignore_eos=True,
+            prompt_words=[prompt_words],
+            max_tokens=[max_tokens],
+            temperature=temperature,
+            ignore_eos=ignore_eos,
             timeout=900.0,
         )
         return bench_http_serving.build_report(args, measured, wall_s=102.4)
@@ -1107,6 +1112,95 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             summary["http_concurrency_pressure"][0]["summary_by_concurrency"][0]["output_tok_s"]["median"],
             1024.0,
         )
+
+    def write_workload_cli_bundle(self, root: Path):
+        contract = {
+            "model_id": "retained-model", "input_len": 128, "output_len": 8,
+            "num_prompts": 2, "num_warmups": 1, "max_concurrency": [2],
+            "request_rate": "4", "temperature": 0.4, "ignore_eos": False,
+            "repeats": 2, "noisy_threshold": 0.2,
+        }
+        metadata = self.minimal_summary()["metadata"]
+        metadata["benchmark_contract"] = contract
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "summary.json").write_text(json.dumps({"metadata": metadata}), encoding="utf-8")
+        for repeat in range(2):
+            artifact = root / "http_raw" / "pegainfer-nccl" / "c2" / f"r{repeat}" / "result.json"
+            artifact.parent.mkdir(parents=True)
+            payload = self.valid_http_payload(
+                model_id="retained-model", num_prompts=2, max_concurrency=2,
+                request_rate="4", num_completed_requests=2, total_output_tokens=16,
+                generated_texts=["alpha", "beta"], mean_tpot_ms=10.0 + repeat,
+                pegainfer_contract_input_len="128", pegainfer_contract_output_len="8",
+                pegainfer_contract_temperature="0.4", pegainfer_contract_ignore_eos="false",
+            )
+            artifact.write_text(json.dumps(payload), encoding="utf-8")
+        trace_path = root / "pegainfer_trace" / "pegainfer-nccl" / "c2.json"
+        trace_path.parent.mkdir(parents=True)
+        trace = self.valid_trace_payload(
+            concurrency=2, num_requests=2, prompt_words=128, max_tokens=8,
+            temperature=0.4, ignore_eos=False,
+        )
+        trace["model"] = "retained-model"
+        trace_path.write_text(json.dumps(trace), encoding="utf-8")
+        return contract
+
+    def run_workload_rebuild_cli(self, root: Path, *extra: str):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--summarize-only", str(root), *extra],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PATH": os.defpath, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+
+    def test_cli_rebuild_uses_retained_http_and_trace_workload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contract = self.write_workload_cli_bundle(root)
+            for flags in ((), ("--num-prompts=2", "--concurrency", "2", "--no-ignore-eos")):
+                with self.subTest(flags=flags):
+                    completed = self.run_workload_rebuild_cli(root, *flags)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+                    http = summary["http_concurrency_pressure"][0]
+                    self.assertTrue(http["passed"], http)
+                    self.assertFalse(http["summary_by_concurrency"][0]["noisy"])
+                    self.assertTrue(summary["pegainfer_trace_pass"][0]["passed"])
+                    self.assertEqual(summary["metadata"]["benchmark_contract"], contract)
+
+    def test_cli_rebuild_rejects_explicit_workload_conflicts_without_rewriting(self) -> None:
+        cases = (
+            ("--num-prompts", "32"), ("--concurrency", "1"), ("--ignore-eos",),
+            ("--temperature=0.0",), ("--request-rate", "inf"),
+            ("--model-id", "other-model"), ("--noisy-threshold", "0.05"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workload_cli_bundle(root)
+            original = (root / "summary.json").read_bytes()
+            for flags in cases:
+                with self.subTest(flags=flags):
+                    completed = self.run_workload_rebuild_cli(root, *flags)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn("conflicts with retained benchmark_contract", completed.stderr)
+                    self.assertEqual((root / "summary.json").read_bytes(), original)
+                    self.assertFalse((root / "artifact_manifest.json").exists())
+
+    def test_cli_retained_workload_still_rejects_raw_drift_and_missing_repeats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workload_cli_bundle(root)
+            artifact = root / "http_raw" / "pegainfer-nccl" / "c2" / "r0" / "result.json"
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+            payload["pegainfer_contract_input_len"] = "64"
+            artifact.write_text(json.dumps(payload), encoding="utf-8")
+            (artifact.parent.parent / "r1" / "result.json").unlink()
+            completed = self.run_workload_rebuild_cli(root)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+            row = summary["http_concurrency_pressure"][0]
+            self.assertFalse(row["passed"])
+            self.assertEqual(row["cells"][0]["workload_mismatches"], ["input_len"])
+            self.assertEqual(row["missing_result_cells"], [{"concurrency": 2, "repeat": 1}])
 
     def test_summarize_existing_rejects_http_workload_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
