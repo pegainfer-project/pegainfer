@@ -35,6 +35,7 @@ use pegainfer_kernels::ops::KIMI_O_PROJ_CUBLASLT_INPUT;
 use pegainfer_kernels::ops::KimiMarlinRouteWorkspace;
 use pegainfer_kernels::ops::KimiMarlinWna16Workspace;
 use pegainfer_kernels::ops::KimiMlaPagedKvLayout;
+use pegainfer_kernels::ops::KimiMlaSplitKv;
 use pegainfer_kernels::ops::ffi_status_detail;
 use pegainfer_kernels::ops::flashinfer_top1_row_states_bytes;
 use pegainfer_kernels::ops::kimi_flashinfer_batch_decode_mla_rt;
@@ -92,6 +93,11 @@ use crate::weights::load_rank_sliced_weights_to_gpu;
 const KIMI_MARLIN_MAX_BLOCK_SIZE: usize = 64;
 const KIMI_DECODE_MAX_BATCH: usize = 64;
 const KIMI_DECODE_BATCH_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, KIMI_DECODE_MAX_BATCH];
+/// Split-KV decode geometry: a bucket keeps `KIMI_DECODE_KV_TILE_ROWS` CTA
+/// rows, so one request gets `rows / batch_size` tiles, and no tile reads fewer
+/// than `KIMI_DECODE_MIN_KV_TILE_TOKENS` tokens.
+const KIMI_DECODE_KV_TILE_ROWS: usize = 64;
+const KIMI_DECODE_MIN_KV_TILE_TOKENS: usize = 256;
 /// KV page granularity shared by the worker page tables and the scheduler's
 /// logical `BlockPool` (one kvbm block = one physical page).
 pub(crate) const KIMI_KV_PAGE_SIZE: usize = 16;
@@ -624,14 +630,27 @@ struct KimiWorkerDecodeArena {
     page_table_capacity: usize,
     append_capacity: usize,
     layout: KimiMlaPagedKvLayout,
+    /// Split-KV geometry of this bucket: row `row * kv_tiles + tile` reads tile
+    /// `tile` of decode row `row`, so `kv_rows == batch_size * kv_tiles`.
+    kv_tiles: usize,
+    kv_rows: usize,
     page_indices_d: CudaSlice<i32>,
     page_indptr_d: CudaSlice<i32>,
     last_page_len_d: CudaSlice<i32>,
     batch_indices_d: CudaSlice<i32>,
     positions_d: CudaSlice<i32>,
-    request_indices_d: CudaSlice<i32>,
-    kv_tile_indices_d: CudaSlice<i32>,
-    kv_chunk_size_d: CudaSlice<i32>,
+    /// FlashInfer's `request_indices`: row → decode slot.
+    row_slots_d: CudaSlice<i32>,
+    /// FlashInfer's `kv_tile_indices`: row → KV tile.
+    row_tiles_d: CudaSlice<i32>,
+    /// FlashInfer's `kv_chunk_size`: tile span, one value per step.
+    tile_tokens_d: CudaSlice<i32>,
+    /// FlashInfer's `o_indptr`: per decode row, its first row.
+    slot_indptr_d: CudaSlice<i32>,
+    /// FlashInfer's `block_valid_mask`: row carries KV this step.
+    row_valid_d: CudaSlice<u8>,
+    partial_ckv_d: CudaSlice<half::bf16>,
+    partial_lse_d: CudaSlice<f32>,
     token_ids_d: CudaSlice<u32>,
     cos_d: CudaSlice<half::bf16>,
     sin_d: CudaSlice<half::bf16>,
@@ -849,6 +868,7 @@ pub(super) fn build_placements(device_ordinals: &[usize]) -> Result<Vec<KimiK2Ra
 mod tests {
     use super::KimiKvStepPages;
     use super::cache::build_slot_page_table;
+    use super::cache::plan_decode_kv_tiles;
     use super::decode_batch_bucket;
 
     #[test]
@@ -913,5 +933,47 @@ mod tests {
         let kv_pages = KimiKvStepPages::single(vec![1], 0);
         assert!(build_slot_page_table(2, 16, &kv_pages, &[2], &[1]).is_err());
         assert!(build_slot_page_table(2, 16, &kv_pages, &[0, 1], &[1, 1]).is_err());
+    }
+
+    #[test]
+    fn decode_tile_plan_splits_the_longest_request_and_masks_the_short_one() {
+        // The longest request sets the chunk (3000 / 4 = 750); the 10-token
+        // request fills one of its four tiles.
+        let plan = plan_decode_kv_tiles(2, 4, &[1, 0], &[10, 3000]).unwrap();
+        assert_eq!(plan.tile_tokens, 750);
+        assert_eq!(plan.slot_indptr, vec![0, 1, 5]);
+        assert_eq!(plan.row_tiles, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+        assert_eq!(plan.row_slots, vec![1, 1, 1, 1, 0, 0, 0, 0]);
+        assert_eq!(plan.row_valid, vec![1, 0, 0, 0, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn decode_tile_plan_keeps_a_short_kv_on_one_tile() {
+        // 256 tokens is the floor chunk, so a 200-token request cannot fan out.
+        let plan = plan_decode_kv_tiles(1, 8, &[0], &[200]).unwrap();
+        assert_eq!(plan.tile_tokens, 256);
+        assert_eq!(plan.slot_indptr, vec![0, 1]);
+        assert_eq!(plan.row_valid, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_tile_plan_pads_idle_rows_without_kv() {
+        // One active request in a four-slot bucket: the rest of the rows launch
+        // with no KV.
+        let plan = plan_decode_kv_tiles(4, 2, &[3], &[900]).unwrap();
+        assert_eq!(plan.tile_tokens, 450);
+        assert_eq!(plan.slot_indptr, vec![0, 2, 2, 2, 2]);
+        assert_eq!(plan.row_valid, vec![1, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(plan.row_slots[0], 3);
+        assert_eq!(plan.row_slots[1], 3);
+        assert!(plan.row_slots[2..].iter().all(|slot| *slot == 0));
+    }
+
+    #[test]
+    fn decode_tile_plan_rejects_row_and_slot_mismatches() {
+        assert!(plan_decode_kv_tiles(2, 4, &[0, 1], &[1]).is_err());
+        assert!(plan_decode_kv_tiles(2, 4, &[0, 1, 2], &[1, 1, 1]).is_err());
+        assert!(plan_decode_kv_tiles(2, 4, &[2], &[1]).is_err());
+        assert!(plan_decode_kv_tiles(2, 0, &[0], &[1]).is_err());
     }
 }
