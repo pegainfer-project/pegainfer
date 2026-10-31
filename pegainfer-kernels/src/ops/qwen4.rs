@@ -14,8 +14,6 @@
 //! The grouped `(1+weight)` RMSNorm serves the hyper-connection and PLE streams
 //! (`csrc/qwen4/qwen4_grouped_rmsnorm.cu`); its contract is on the wrapper.
 
-use std::sync::OnceLock;
-
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
@@ -42,32 +40,16 @@ const COMPRESS_RATIO: usize = 4;
 /// `kWarps` in the score kernel; one CTA covers that many blocks per pass.
 const SCORE_WARPS: usize = 4;
 
-/// Target resident CTAs per SM for the score pass. One row is one CTA by
-/// default, which leaves a decode batch far below the GPU's capacity; splitting
-/// each row's independent blocks reaches this target without a cross-CTA
-/// reduction. The final count is capped by the row's block count.
+/// Target resident CTAs per SM for the score pass.
 const SCORE_CTAS_PER_SM: usize = 4;
 
-/// The device query is a host call, so cache it rather than repeat it in every
-/// decode step. A heterogeneous TP process would only change the split count,
-/// never the scores each CTA writes.
-static QSA_SM_COUNT: OnceLock<usize> = OnceLock::new();
-
-fn qsa_sm_count(ctx: &DeviceContext) -> Result<usize> {
-    if let Some(sms) = QSA_SM_COUNT.get() {
-        return Ok(*sms);
-    }
+fn qsa_score_splits(ctx: &DeviceContext, query_rows: usize, blocks: usize) -> Result<usize> {
+    let max_splits = blocks.div_ceil(SCORE_WARPS).max(1);
     let sms = usize::try_from(
         ctx.ctx
             .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
     )?;
-    let _ = QSA_SM_COUNT.set(sms);
-    Ok(*QSA_SM_COUNT.get().expect("SM count was just stored"))
-}
-
-fn qsa_score_splits(ctx: &DeviceContext, query_rows: usize, blocks: usize) -> Result<usize> {
-    let max_splits = blocks.div_ceil(SCORE_WARPS).max(1);
-    Ok(qsa_sm_count(ctx)?
+    Ok(sms
         .saturating_mul(SCORE_CTAS_PER_SM)
         .div_ceil(query_rows)
         .clamp(1, max_splits))
