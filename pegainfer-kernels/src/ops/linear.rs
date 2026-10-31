@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -748,6 +749,8 @@ pub enum NumericPolicy {
 static NUMERIC_POLICY: AtomicU8 = AtomicU8::new(NumericPolicy::Tuned as u8);
 static PIN_SERVED: AtomicU64 = AtomicU64::new(0);
 static PER_TOKEN_SERVED: AtomicU64 = AtomicU64::new(0);
+static GEMV_SERVED: AtomicU64 = AtomicU64::new(0);
+static N1_MATVEC: AtomicBool = AtomicBool::new(false);
 
 /// Set the process-global policy. Must run before executor construction / graph capture (the
 /// captured algo is the one live at capture). Tests drive baseline/pin/per-token through it.
@@ -791,6 +794,40 @@ pub fn per_token_served() -> u64 {
 pub fn reset_numeric_policy_counters() {
     PIN_SERVED.store(0, Ordering::Relaxed);
     PER_TOKEN_SERVED.store(0, Ordering::Relaxed);
+}
+
+/// Count of projections served by the batch-1 matvec instead of the tiled GEMM.
+/// Nonzero proves the decode path took the bandwidth-shaped kernel; the parity
+/// gate in `tests/gemv_bf16_parity.rs` reads it to distinguish "served" from
+/// "fell back and passed anyway".
+pub fn gemv_served() -> u64 {
+    GEMV_SERVED.load(Ordering::Relaxed)
+}
+
+/// Route batch-1 projections through the matvec. Off until a line turns it on:
+/// the kernel's row sum differs from the cublas plan in the last bf16 bit, so a
+/// line opts in only after its own logits gate passes, and every line that never
+/// calls this keeps the numerics it was validated on. Must run before executor
+/// construction / graph capture (the captured launch is the one live at capture).
+pub fn set_n1_matvec(enabled: bool) {
+    N1_MATVEC.store(enabled, Ordering::Release);
+}
+
+pub fn n1_matvec_enabled() -> bool {
+    N1_MATVEC.load(Ordering::Acquire)
+}
+
+/// Smallest output width the matvec serves. Below it the grid cannot fill the
+/// device either way, so the tiled GEMM stays.
+const GEMV_MIN_ROWS: usize = 256;
+
+/// Whether one decode token should take the matvec: the weight matrix must be
+/// read in whole 16-byte beats and both buffers 16-byte aligned.
+fn gemv_eligible(m: usize, k: usize, w: *const ffi::Half, x: *const ffi::Half) -> bool {
+    m >= GEMV_MIN_ROWS
+        && k.is_multiple_of(8)
+        && (w as usize).is_multiple_of(16)
+        && (x as usize).is_multiple_of(16)
 }
 
 /// Fixed representative N at which every (M,K) pin is resolved — one algo for ALL
@@ -899,6 +936,34 @@ fn launch_gemm(
         NumericPolicy::Pin => return launch_gemm_pin(w_ptr, x_ptr, y_ptr, m, n, k, ctx),
         NumericPolicy::PerToken => return launch_gemm_pertoken(w_ptr, x_ptr, y_ptr, m, n, k, ctx),
         NumericPolicy::Tuned => {}
+    }
+    // A single decode token reads the whole weight matrix for one dot product per
+    // row, so the tiled GEMM runs at 40..192 CTAs on a 108-SM part and lands at
+    // 63..73% of read bandwidth. The matvec keeps the same bytes in flight with
+    // every CTA saturated. Pin/PerToken returned above, so a batch-invariant
+    // line keeps its pinned algo at N=1, and a line that never called
+    // `set_n1_matvec(true)` never reaches the kernel.
+    if n1_matvec_enabled() && n == 1 && gemv_eligible(m, k, w_ptr, x_ptr) {
+        let status = unsafe {
+            ffi::gemv_bf16_cuda(
+                w_ptr,
+                x_ptr,
+                y_ptr,
+                m as i32,
+                k as i32,
+                crate::tensor::active_cu_stream(ctx),
+            )
+        };
+        if status != 0 {
+            bail!(
+                "GEMV failed: {}, m={}, k={}",
+                ffi_status_detail(status),
+                m,
+                k
+            );
+        }
+        GEMV_SERVED.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
     }
     // Split-concurrent prefill must keep even N=1 projections on its dedicated
     // handle so it cannot rebind the graph-safe decode handle.

@@ -231,6 +231,9 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     decode_overlap: Qwen35DecodeOverlap,
     prefix_cache_mib: usize,
 ) -> Result<Engine> {
+    // Qwen3.5 is the line whose logits gates ran against the batch-1 matvec;
+    // every other line keeps the cublas plan it was validated on.
+    pegainfer_kernels::ops::set_n1_matvec(true);
     anyhow::ensure!(
         (1..=MAX_DECODE_BATCH).contains(&max_batch),
         "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
