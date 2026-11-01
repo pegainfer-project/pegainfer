@@ -248,6 +248,10 @@ pub use qwen4::HC_SCATTER_SCALE_STREAM;
 #[cfg(feature = "qwen4")]
 pub use qwen4::HC_SCATTER_SINGLE_ROUNDING;
 #[cfg(feature = "qwen4")]
+pub use qwen4::HcMixScratch;
+#[cfg(feature = "qwen4")]
+pub use qwen4::hc_mix_into;
+#[cfg(feature = "qwen4")]
 pub use qwen4::hc_mul_branch_combine_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::hc_scatter_add_into;

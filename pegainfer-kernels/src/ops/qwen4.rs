@@ -30,7 +30,9 @@ use half::bf16;
 
 use crate::ffi;
 use crate::ops::checked_i32;
+use crate::ops::gemm_into_checked;
 use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
 use crate::tensor::active_cu_stream;
@@ -624,4 +626,170 @@ pub fn hc_scatter_add_variant_into(
         )
     };
     launch(result, "scatter")
+}
+
+// ── the mix path, composed ────────────────────────────────────────────────
+
+/// Scratch for one hyper-connection mix pass: one buffer per reference step,
+/// so a decode step allocates nothing.
+pub struct HcMixScratch {
+    /// The grouped norm's output, `[rows, branches * hidden]`.
+    pub normed: HiddenStates,
+    /// The rank-`lowrank` bottleneck before and after the SiLU.
+    pub down: HiddenStates,
+    pub bottleneck: HiddenStates,
+    /// The up projection and its sigmoid, `[rows, branches * hidden]`.
+    pub up: HiddenStates,
+    pub gate: HiddenStates,
+    /// The injection head's logits, `[rows, branches]`, when the module has one.
+    pub inject_logits: Option<HiddenStates>,
+}
+
+impl HcMixScratch {
+    /// Allocate the scratch for `rows` tokens of `branches` `hidden`-wide
+    /// branches and a `lowrank` bottleneck.
+    pub fn new(
+        ctx: &DeviceContext,
+        rows: usize,
+        hidden: usize,
+        branches: usize,
+        lowrank: usize,
+        with_inject: bool,
+    ) -> Result<Self> {
+        ensure!(
+            rows > 0 && hidden > 0 && branches > 0 && lowrank > 0,
+            "hyper-connection mix scratch dimensions must be non-zero"
+        );
+        let stream = hidden
+            .checked_mul(branches)
+            .ok_or_else(|| anyhow::anyhow!("hyper-connection stream width overflows usize"))?;
+        Ok(Self {
+            normed: HiddenStates::zeros(ctx, stream, rows)?,
+            down: HiddenStates::zeros(ctx, lowrank, rows)?,
+            bottleneck: HiddenStates::zeros(ctx, lowrank, rows)?,
+            up: HiddenStates::zeros(ctx, stream, rows)?,
+            gate: HiddenStates::zeros(ctx, stream, rows)?,
+            inject_logits: with_inject
+                .then(|| HiddenStates::zeros(ctx, branches, rows))
+                .transpose()?,
+        })
+    }
+}
+
+/// One `Qwen4ExpTextGatedResidual` mix pass, composed from the shared surface:
+///
+/// ```text
+/// n     = grouped (1 + w) RMSNorm(hyper)              // branches groups
+/// g     = silu(down(n) / branches)
+/// gate  = sigmoid(up(g))
+/// mixed = (gate * n).mean(branches)                   // [rows, hidden]
+/// inj   = 2 * sigmoid(inject_weight(n) / branches)    // [rows, branches]
+/// ```
+///
+/// `hyper` is the `[rows, branches * hidden]` stream; `mixed` is `[rows,
+/// hidden]`; `inject_out` is `[rows, branches]` and must be present exactly
+/// when `inject_weight` is. The reference rounds to bf16 at each of these
+/// steps, and each composed op lands its rounding where the reference does.
+/// The per-layer modules pass their injection head; the top-level readout
+/// (`use_combine=False`) passes neither.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_mix_into(
+    ctx: &DeviceContext,
+    norm: &DeviceVec,
+    down: &DeviceMatrix,
+    up: &DeviceMatrix,
+    inject_weight: Option<&DeviceMatrix>,
+    hyper: &HiddenStates,
+    branches: usize,
+    rms_eps: f32,
+    scratch: &mut HcMixScratch,
+    mixed: &mut HiddenStates,
+    inject_out: Option<&mut HiddenStates>,
+) -> Result<()> {
+    ensure!(
+        branches > 0 && hyper.hidden_dim.is_multiple_of(branches),
+        "hyper-connection mix: {} branches do not divide a {}-wide stream",
+        branches,
+        hyper.hidden_dim
+    );
+    ensure!(
+        rms_eps.is_finite() && rms_eps > 0.0,
+        "hyper-connection mix: eps {rms_eps} is not positive"
+    );
+    let hidden = hyper.hidden_dim / branches;
+    let rows = hyper.seq_len;
+    let stream = hyper.hidden_dim;
+    ensure!(
+        norm.len == stream,
+        "hyper-connection mix: norm weight is {} wide, stream is {stream}",
+        norm.len
+    );
+    for (what, buf, want) in [
+        ("normed", &scratch.normed, stream),
+        ("up", &scratch.up, stream),
+        ("gate", &scratch.gate, stream),
+        ("mixed", &*mixed, hidden),
+    ] {
+        ensure!(
+            buf.hidden_dim == want && buf.seq_len == rows,
+            "hyper-connection mix: {what} is [{}, {}], need [{rows}, {want}]",
+            buf.seq_len,
+            buf.hidden_dim
+        );
+    }
+    ensure!(
+        scratch.down.hidden_dim == scratch.bottleneck.hidden_dim
+            && scratch.down.seq_len == rows
+            && scratch.bottleneck.seq_len == rows,
+        "hyper-connection mix: bottleneck buffers disagree with {rows} rows"
+    );
+    let lowrank = scratch.down.hidden_dim;
+    let with_inject = inject_weight.is_some();
+    ensure!(
+        with_inject == inject_out.is_some() && with_inject == scratch.inject_logits.is_some(),
+        "hyper-connection mix: the injection head, its output and its logits must agree"
+    );
+    if let Some(out) = inject_out.as_ref() {
+        ensure!(
+            out.hidden_dim == branches && out.seq_len == rows,
+            "hyper-connection mix: injection output is [{}, {}], need [{rows}, {branches}]",
+            out.seq_len,
+            out.hidden_dim
+        );
+    }
+    if let Some(logits) = scratch.inject_logits.as_ref() {
+        ensure!(
+            logits.hidden_dim == branches && logits.seq_len == rows,
+            "hyper-connection mix: injection logits are [{}, {}], need [{rows}, {branches}]",
+            logits.seq_len,
+            logits.hidden_dim
+        );
+    }
+
+    let divisor = 1.0 / branches as f32;
+    rms_norm_grouped_offset_batch_into(ctx, hyper, norm, hidden, rms_eps, &mut scratch.normed)?;
+    gemm_into_checked(ctx, down, &scratch.normed, &mut scratch.down)?;
+    ensure!(
+        scratch.down.hidden_dim == lowrank,
+        "hyper-connection mix: down projection produced {} columns, scratch holds {lowrank}",
+        scratch.down.hidden_dim
+    );
+    hc_silu_scaled_into(ctx, &scratch.down, divisor, &mut scratch.bottleneck)?;
+    gemm_into_checked(ctx, up, &scratch.bottleneck, &mut scratch.up)?;
+    hc_sigmoid_affine_into(ctx, &scratch.up, 1.0, 1.0, &mut scratch.gate)?;
+    hc_mul_branch_combine_into(
+        ctx,
+        &scratch.gate,
+        &scratch.normed,
+        branches,
+        divisor,
+        mixed,
+    )?;
+    if let (Some(weight), Some(logits), Some(out)) =
+        (inject_weight, scratch.inject_logits.as_mut(), inject_out)
+    {
+        gemm_into_checked(ctx, weight, &scratch.normed, logits)?;
+        hc_sigmoid_affine_into(ctx, logits, divisor, 2.0, out)?;
+    }
+    Ok(())
 }

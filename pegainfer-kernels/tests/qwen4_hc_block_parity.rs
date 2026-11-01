@@ -67,7 +67,9 @@ use pegainfer_kernels::ops::HC_SCATTER_BROADCAST;
 use pegainfer_kernels::ops::HC_SCATTER_PRODUCTION;
 use pegainfer_kernels::ops::HC_SCATTER_SCALE_STREAM;
 use pegainfer_kernels::ops::HC_SCATTER_SINGLE_ROUNDING;
+use pegainfer_kernels::ops::HcMixScratch;
 use pegainfer_kernels::ops::gemm_into_checked;
+use pegainfer_kernels::ops::hc_mix_into;
 use pegainfer_kernels::ops::hc_mul_branch_combine_into;
 use pegainfer_kernels::ops::hc_scatter_add_into;
 use pegainfer_kernels::ops::hc_scatter_add_variant_into;
@@ -388,7 +390,7 @@ enum Act {
 
 /// One knob per way the block can be built wrong. [`Variant::REFERENCE`] is the
 /// reference; each negative control flips exactly one field and names itself.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Variant {
     label: &'static str,
     /// `(1 + w)` against plain `w` in the grouped norm.
@@ -496,6 +498,40 @@ fn replay(
     rows: usize,
     variant: Variant,
 ) -> Result<Replay> {
+    if variant == Variant::REFERENCE {
+        let mut scratch = HcMixScratch::new(
+            ctx,
+            rows,
+            HIDDEN,
+            HC_COUNT,
+            LOWRANK,
+            module.inject.is_some(),
+        )?;
+        let mut mixed = HiddenStates::zeros(ctx, HIDDEN, rows)?;
+        let mut inject = module
+            .inject
+            .is_some()
+            .then(|| HiddenStates::zeros(ctx, HC_COUNT, rows))
+            .transpose()?;
+        hc_mix_into(
+            ctx,
+            &module.norm,
+            &module.down,
+            &module.up,
+            module.inject.as_ref(),
+            hyper,
+            HC_COUNT,
+            RMS_EPS,
+            &mut scratch,
+            &mut mixed,
+            inject.as_mut(),
+        )?;
+        return Ok(Replay {
+            normed: scratch.normed,
+            mixed,
+            inject,
+        });
+    }
     let mut normed = HiddenStates::zeros(ctx, STREAM, rows)?;
     norm_stream(ctx, hyper, module, branches, variant, &mut normed)?;
 
@@ -1131,4 +1167,77 @@ fn scatter_refuses_bad_shapes_and_variants() {
         hc_scatter_add_into(&harness.ctx, &x, &wide_inject, &hyper, &mut out).is_err(),
         "a branch-count mismatch must be refused"
     );
+}
+
+/// The layer's two halves in sequence, which is the reference's own flow: the
+/// mix pass computes the injection weights, and the scatter uses *those* — not
+/// the recorded ones — to fold a sublayer output back into the stream. The
+/// mix path carries the block's parity bound, so the chain's scatter is read
+/// against the recorded layer stream with the same bound; the component test
+/// above proves the scatter itself is bitwise.
+#[test]
+fn hyper_connection_block_chain_matches_golden() {
+    let Some(harness) = harness() else {
+        return;
+    };
+    for (case, scatter) in harness.cases.iter().zip(&harness.scatter) {
+        let hyper = harness.upload_stream(case);
+        let mut scratch =
+            HcMixScratch::new(&harness.ctx, case.rows, HIDDEN, HC_COUNT, LOWRANK, true)
+                .expect("mix scratch");
+        let mut mixed = HiddenStates::zeros(&harness.ctx, HIDDEN, case.rows).expect("mixed");
+        let mut inject = HiddenStates::zeros(&harness.ctx, HC_COUNT, case.rows).expect("inject");
+        hc_mix_into(
+            &harness.ctx,
+            &harness.combine.norm,
+            &harness.combine.down,
+            &harness.combine.up,
+            harness.combine.inject.as_ref(),
+            &hyper,
+            HC_COUNT,
+            RMS_EPS,
+            &mut scratch,
+            &mut mixed,
+            Some(&mut inject),
+        )
+        .expect("mix pass");
+        harness.ctx.sync().expect("mix sync");
+
+        let mixed_got: Vec<bf16> = harness.ctx.stream.clone_dtoh(&mixed.data).expect("mixed");
+        let inject_got: Vec<bf16> = harness.ctx.stream.clone_dtoh(&inject.data).expect("inject");
+        for (label, got, want) in [
+            ("chain mixed", &mixed_got, &case.mixed),
+            ("chain inject", &inject_got, &case.inject),
+        ] {
+            let d = diff(&f32_of(got), &f32_of(want));
+            println!(
+                "case {} {label}: {} of {} outside, worst {:.3e}",
+                case.index, d.outside, d.len, d.max_abs
+            );
+            assert_eq!(
+                d.outside, 0,
+                "case {}: {label} is outside abs {ATOL} + rel {RTOL}",
+                case.index
+            );
+        }
+
+        let out = scatter_step(
+            &harness.ctx,
+            &hyper,
+            &scatter.attn_sublayer,
+            &inject_got,
+            case.rows,
+            HC_SCATTER_PRODUCTION,
+        );
+        let d = diff(&f32_of(&out), &f32_of(&scatter.attn_out));
+        println!(
+            "case {} chain scatter: {} of {} outside, worst {:.3e}",
+            case.index, d.outside, d.len, d.max_abs
+        );
+        assert_eq!(
+            d.outside, 0,
+            "case {}: the composed mix->scatter chain is outside abs {ATOL} + rel {RTOL}",
+            case.index
+        );
+    }
 }
