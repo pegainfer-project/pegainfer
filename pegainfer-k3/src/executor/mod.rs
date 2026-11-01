@@ -285,7 +285,10 @@ impl K3ExecutorConfig {
             None => {}
             Some(raw) if raw == "1" => {}
             Some(raw) if raw == "0" => self.cuda_graph = false,
-            Some(raw) => bail!("{K3_CUDA_GRAPH_ENV}={raw:?} not recognized (0 or 1)"),
+            Some(raw) => bail!(
+                "{K3_CUDA_GRAPH_ENV}={:?} not recognized (0 or 1)",
+                raw.to_string_lossy()
+            ),
         }
         if let Some(slots) = env_count(K3_MAX_BATCH_ENV, 1..=K3_MAX_BATCH)? {
             self.max_batch = slots;
