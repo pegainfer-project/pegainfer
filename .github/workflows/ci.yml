@@ -250,9 +250,10 @@ jobs:
       #
       # A push to main runs every row. A pull request runs the rows its changed
       # files reach: a model crate reaches its own row; a shared crate, the
-      # workspace manifests, the toolchain or this workflow reaches every row;
-      # any other file reaches the rows of the crates whose Rust source names
-      # it, as `include_str!` does.
+      # workspace manifests, the submodule list, the toolchain or this workflow
+      # reaches every row; any other file reaches the rows of the crates whose
+      # Rust source names it, as `include_str!` does. A rename counts at both
+      # its old and its new path.
       - name: Select rows
         id: select
         env:
@@ -301,7 +302,7 @@ jobs:
           }
           rows_for_path() {
             case "$1" in
-              Cargo.toml | Cargo.lock | rust-toolchain.toml | .github/workflows/ci.yml) echo all ;;
+              Cargo.toml | Cargo.lock | rust-toolchain.toml | .gitmodules | .github/workflows/ci.yml) echo all ;;
               pegainfer-*/* | kvbm/*) rows_for_crate "${1%%/*}" ;;
             esac
             if [[ $1 != *.rs ]]; then
@@ -311,7 +312,7 @@ jobs:
             fi
           }
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            keys=$(git diff --name-only HEAD^1 HEAD | while read -r path; do rows_for_path "$path"; done | sort -u)
+            keys=$(git diff --name-only --no-renames HEAD^1 HEAD | while read -r path; do rows_for_path "$path"; done | sort -u)
           else
             keys=all
           fi
