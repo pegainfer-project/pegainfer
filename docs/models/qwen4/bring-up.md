@@ -51,6 +51,8 @@ cargo test --release -p pegainfer-kernels --features qwen4 \
   --test qwen4_qsa_indexer_score_parity -- --nocapture
 ```
 
+A decode row's blocks are independent, so the score pass splits each row across `grid.x` CTAs to target four resident CTAs per SM, taking the device's SM count from the caller; on an L20 (sm_89), the 2055-token six-row shape moved from 42.7 to 8.3 µs p50, the 512-token, 300-row shape from 12.6 to 11.0 µs, and the 512-row prefill held within 2%.
+
 The gate replays `test_data/qwen38fn-qsa-indexer-golden.safetensors` (PR #1150) and holds the fixture's recorded `format_version`, `transformers_version` and `config_sha256` against the frozen config — and derives its geometry from that config, cross-checked against the fixture's own tensor shapes — so a golden from another checkpoint or another semantics fails as a score mismatch instead of being skipped. It reads the fixture's **validity prefix** per row rather than comparing through the NaN padding the reference leaves, and proves the kernel writes exactly that prefix by checking the untouched tail still holds a sentinel. Six of seven cases land within 9.6e-7 of the reference and are held to a 2e-6 bound; the 2055-token case, the only one with positions past 63, keeps a 5e-3 bound until its 2.4e-3 residual is traced (its shape suggests one flipped bf16 rounding decision). In-range `rows`, and `visible_len` up to the row's own token, are contract: anything else traps on the device, and a poisoned key keeps its NaN score instead of reading as a valid zero. The kernel takes no budget: the reference scores every complete block and truncates only at selection.
 
 ## The QSA indexer's selection half

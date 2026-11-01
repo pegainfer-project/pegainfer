@@ -423,6 +423,7 @@ fn check_case(
     k_norm: &CudaSlice<bf16>,
     cos: &DeviceVec,
     sin: &DeviceVec,
+    num_sms: usize,
     case: &Case,
 ) -> CaseSummary {
     let query_rows = case.rows.len();
@@ -455,6 +456,7 @@ fn check_case(
         &rows_dev,
         &visible_dev,
         case.tokens,
+        num_sms,
         &mut scores_dev,
         score_cols,
         &mut pooled_dev,
@@ -585,6 +587,7 @@ fn qsa_indexer_block_scores_match_the_reference() {
     let mut ragged = 0usize;
     let mut over_1e4 = 0usize;
     let mut over_1e5 = 0usize;
+    let num_sms = common::sm_count(&ctx);
     for index in 0..CASES {
         let case = load_case(&fixture, index, &geometry);
         let visible_len = visible_counts(&case);
@@ -613,6 +616,7 @@ fn qsa_indexer_block_scores_match_the_reference() {
             &k_norm_dev,
             &cos_dev,
             &sin_dev,
+            num_sms,
             &case,
         );
         total += summary.compared;
@@ -713,6 +717,7 @@ fn a_poisoned_key_keeps_its_nan_score() {
         &rows_dev,
         &visible_dev,
         case.tokens,
+        common::sm_count(&ctx),
         &mut scores_dev,
         score_cols,
         &mut pooled_dev,

@@ -33,6 +33,20 @@ pub(crate) fn device_or_skip() -> Option<DeviceContext> {
     }
 }
 
+/// The device's SM count, queried once by the gate that hands it to a launch.
+/// Wrappers take it as an argument so no launch queries the driver.
+#[allow(dead_code)]
+pub(crate) fn sm_count(ctx: &DeviceContext) -> usize {
+    usize::try_from(
+        ctx.ctx
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .expect("SM count"),
+    )
+    .expect("SM count fits usize")
+}
+
 /// Deterministic junk, distinct per element, so a row read from the wrong
 /// page, layer or head cannot coincide with the right one. Not every binary
 /// that includes this module fills a buffer.

@@ -36,6 +36,19 @@ const FUSED_WIDTH: usize = 640;
 const HEAD_DIM: usize = 128;
 const ROTARY_DIM: usize = 64;
 const COMPRESS_RATIO: usize = 4;
+/// `kWarps` in the score kernel; one CTA covers that many blocks per pass.
+const SCORE_WARPS: usize = 4;
+
+/// Target resident CTAs per SM for the score pass.
+const SCORE_CTAS_PER_SM: usize = 4;
+
+fn qsa_score_splits(query_rows: usize, blocks: usize, num_sms: usize) -> usize {
+    let max_splits = blocks.div_ceil(SCORE_WARPS).max(1);
+    num_sms
+        .saturating_mul(SCORE_CTAS_PER_SM)
+        .div_ceil(query_rows)
+        .clamp(1, max_splits)
+}
 
 /// Score every complete micro-block of `fused_qk` for every query row.
 ///
@@ -60,6 +73,12 @@ const COMPRESS_RATIO: usize = 4;
 /// `pooled_keys` is the workspace: `tokens / COMPRESS_RATIO` rows of
 /// `HEAD_DIM`, reused across calls.
 ///
+/// `num_sms` is the SM count of `ctx`'s device, queried once by the caller.
+/// The score pass splits each row's blocks across `grid.x` CTAs to target
+/// `SCORE_CTAS_PER_SM` resident CTAs per SM; taking the count as an argument
+/// keeps the driver query off the launch path, where it cost more than the
+/// split saves on an already-large grid.
+///
 /// `cos`/`sin` are the shared attention RoPE tables (`pegainfer_core::rope`,
 /// `[max_pos, ROTARY_DIM]`, position-major): the indexer rotates with the same
 /// position embeddings the attention uses, so this stage computes no trig. They
@@ -76,6 +95,7 @@ pub fn qsa_indexer_block_scores_into(
     rows: &CudaSlice<i32>,
     visible_len: &CudaSlice<i32>,
     tokens: usize,
+    num_sms: usize,
     scores: &mut CudaSlice<f32>,
     score_cols: usize,
     pooled_keys: &mut CudaSlice<bf16>,
@@ -86,6 +106,7 @@ pub fn qsa_indexer_block_scores_into(
         rms_eps >= 0.0,
         "QSA indexer rms_norm_eps {rms_eps} must be non-negative"
     );
+    ensure!(num_sms > 0, "QSA indexer num_sms must be positive");
     let blocks = tokens / COMPRESS_RATIO;
     ensure!(
         score_cols >= blocks,
@@ -130,9 +151,11 @@ pub fn qsa_indexer_block_scores_into(
         return Ok(());
     }
     // The kernel takes extents as i32; checked before any pointer is formed.
+    let score_splits = qsa_score_splits(query_rows, blocks, num_sms);
     let query_rows = checked_i32(query_rows, "QSA indexer query rows")?;
     let tokens = checked_i32(tokens, "QSA indexer tokens")?;
     let score_cols = checked_i32(score_cols, "QSA indexer score columns")?;
+    let score_splits = checked_i32(score_splits, "QSA indexer score splits")?;
 
     let (fused_ptr, _fused_guard) = fused_qk.device_ptr(&ctx.stream);
     let (q_norm_ptr, _q_norm_guard) = q_norm_weight.device_ptr(&ctx.stream);
@@ -157,6 +180,7 @@ pub fn qsa_indexer_block_scores_into(
             query_rows,
             tokens,
             score_cols,
+            score_splits,
             rms_eps,
             active_cu_stream(ctx),
         )
@@ -312,4 +336,21 @@ pub fn qsa_indexer_select_into(
     }
     .result()
     .map_err(|err| anyhow::anyhow!("QSA indexer select launch failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qsa_score_splits;
+
+    /// Four CTAs per SM, capped by the row's block count. These include the
+    /// mid-size bands a row-count cutoff would otherwise run unsplit.
+    #[test]
+    fn score_splits_follow_the_sm_budget() {
+        assert_eq!(qsa_score_splits(300, 128, 92), 2);
+        assert_eq!(qsa_score_splits(512, 128, 92), 1);
+        assert_eq!(qsa_score_splits(300, 128, 132), 2);
+        assert_eq!(qsa_score_splits(512, 128, 132), 2);
+        assert_eq!(qsa_score_splits(1, 128, 92), 32);
+        assert_eq!(qsa_score_splits(6, 513, 92), 62);
+    }
 }
