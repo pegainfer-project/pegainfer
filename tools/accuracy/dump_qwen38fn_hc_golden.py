@@ -10,7 +10,14 @@ The residual block is a 4-branch stream: a grouped `(1+w)` RMSNorm (one group pe
 feeds a rank-`hc_lowrank` mix gate (`silu` -> `sigmoid`) that combines the branches by
 **mean**, and a per-branch injection weight re-scatters the sublayer output (`/hc_count`
 on both paths); the top-level readout reuses the module with `use_combine=False`. Cases
-S=6/10; the manifest is one JSON metadata key (`qwen4_hc_golden`, format_version 2).
+S=6/10.
+
+v3 adds the scatter half (`hyper_input + inject * sublayer`, once after attention and once
+after the MLP). It is recorded from `Qwen4ExpTextDecoderLayer.forward` itself: the layer is
+built with `__new__` (no weight allocation), the two real gated-residual modules sit on it,
+and the attention/MLP sublayers are stubs that return fixed bf16 tensors — so the recorded
+values are the reference's own two scatter lines given those inputs, not a re-derivation.
+The manifest is one JSON metadata key (`qwen4_hc_golden`).
 
     python tools/accuracy/dump_qwen38fn_hc_golden.py --out test_data/qwen38fn-hc-golden.safetensors
 """
@@ -18,6 +25,7 @@ S=6/10; the manifest is one JSON metadata key (`qwen4_hc_golden`, format_version
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import platform
@@ -28,7 +36,10 @@ import transformers
 from safetensors.torch import save_file
 
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
-from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
+from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+    Qwen4ExpTextDecoderLayer,
+    Qwen4ExpTextGatedResidual,
+)
 
 CONFIG = "pegainfer-qwen4/tests/frozen_config.json"
 METADATA_KEY = "qwen4_hc_golden"
@@ -36,8 +47,9 @@ METADATA_KEY = "qwen4_hc_golden"
 SEED = 0x_03_38_F9_5A_11_81
 
 # Bumped when the fixture layout changes; the gate asserts it on load. v2 records the
-# manifest as JSON metadata (no loose provenance tensors) and uses real geometry.
-FORMAT_VERSION = 2
+# manifest as JSON metadata (no loose provenance tensors) and uses real geometry; v3 adds
+# the scatter half recorded through the reference decoder layer's own forward.
+FORMAT_VERSION = 3
 
 CASES = [6, 10]  # sequence lengths; the input stream is [1, S, hc_count * hidden_size]
 
@@ -83,6 +95,83 @@ def case_tensors(combine, mixer, config, index: int) -> dict[str, torch.Tensor]:
     }
 
 
+class _Stub(torch.nn.Module):
+    """A sublayer that returns a fixed tensor: the scatter's input, not a component
+    under test. The layer's own forward still runs the scatter lines."""
+
+    def __init__(self, out: torch.Tensor):
+        super().__init__()
+        self.out = out
+
+    def forward(self, *args, **kwargs):
+        return self.out
+
+
+def scatter_tensors(combine, config, index: int) -> dict[str, torch.Tensor]:
+    """Record both scatter steps of a decoder layer on a fixed sublayer output.
+
+    The layer is instantiated without ``__init__`` so no weights are allocated; the
+    two gated-residual modules are real and carry the recorded weights, and the
+    attention/MLP sublayers are stubs. The captured values are what
+    ``Qwen4ExpTextDecoderLayer.forward`` computes for the scatter lines.
+    """
+    seq_len = CASES[index]
+    hidden = config.hidden_size
+    stream = config.hc_count * hidden
+    # The scatter runs on the case's own recorded `hyper_input`, drawn exactly as
+    # `case_tensors` draws it, so the fixture stores one stream per case.
+    hyper_gen = torch.Generator().manual_seed(SEED + index)
+    hyper = torch.randn(1, seq_len, stream, generator=hyper_gen).to(torch.bfloat16)
+    gen = torch.Generator().manual_seed(SEED + 0x100 + index)
+    attn_out = torch.randn(1, seq_len, hidden, generator=gen).to(torch.bfloat16)
+    mlp_out = torch.randn(1, seq_len, hidden, generator=gen).to(torch.bfloat16)
+
+    hc_attn = combine
+    hc_mlp = copy.deepcopy(combine)
+    layer = Qwen4ExpTextDecoderLayer.__new__(Qwen4ExpTextDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.ple = None
+    layer.layer_type = "linear_attention"
+    layer.attn_hyper_connection = hc_attn
+    layer.mlp_hyper_connection = hc_mlp
+    layer.linear_attn = _Stub(attn_out)
+    layer.self_attn = _Stub(attn_out)
+    layer.mlp = _Stub(mlp_out)
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def capture_inject(name):
+        def hook(_module, _inputs, output):
+            captured[name] = output[2].detach().clone()
+
+        return hook
+
+    def capture_input(name):
+        def hook(_module, inputs):
+            captured[name] = inputs[0].detach().clone()
+
+        return hook
+
+    hc_attn.register_forward_hook(capture_inject("attn_inject"))
+    hc_mlp.register_forward_hook(capture_inject("mlp_inject"))
+    hc_mlp.register_forward_pre_hook(capture_input("attn_scattered"))
+
+    with torch.no_grad():
+        mlp_scattered = layer.forward(
+            hyper, position_embeddings=(torch.empty(0), torch.empty(0))
+        )
+
+    p = f"case{index}_"
+    return {
+        p + "scatter_attn_sublayer": attn_out.contiguous(),
+        p + "scatter_attn_inject": captured["attn_inject"].contiguous(),
+        p + "scatter_attn_out": captured["attn_scattered"].contiguous(),
+        p + "scatter_mlp_sublayer": mlp_out.contiguous(),
+        p + "scatter_mlp_inject": captured["mlp_inject"].contiguous(),
+        p + "scatter_mlp_out": mlp_scattered.detach().contiguous(),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
@@ -105,6 +194,8 @@ def main() -> None:
     }
     for index in range(len(CASES)):
         tensors.update(case_tensors(combine, mixer, config, index))
+    for index in range(len(CASES)):
+        tensors.update(scatter_tensors(combine, config, index))
 
     manifest = {
         "format_version": FORMAT_VERSION,

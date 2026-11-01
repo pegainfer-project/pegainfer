@@ -20,12 +20,17 @@
 //! * `mixed_only` — the same module re-read as the top-level readout
 //!   (`use_combine=False`), which carries no injection head.
 //!
-//! Ungated: the scatter half of the residual block, `mixed + inject * sublayer`
-//! folded back into the 4-branch stream. It needs a sublayer output, which the
-//! golden does not carry — the dump records this gate's own inputs and outputs,
-//! not a layer's. `inject` is checked here, so the scatter's only per-branch
-//! coefficient is already held; the fold itself waits on a golden that carries
-//! a sublayer.
+//! * `scatter_attn_*` / `scatter_mlp_*` — the residual block's second half,
+//!   `hyper_input + inject * sublayer` folded back into the 4-branch stream,
+//!   recorded through `Qwen4ExpTextDecoderLayer.forward` with the sublayers
+//!   stubbed (the layer's own scatter lines run; the sublayer outputs are
+//!   inputs). Both steps are stored: after attention and after the MLP.
+//!
+//! The scatter is compared bitwise, not with a tolerance: it is two bf16
+//! roundings (multiply, then add) and the kernel reproduces both. Its
+//! boundaries: the recorded sublayer outputs are fixed tensors, not a real
+//! attention/MLP pass (that belongs to the text graph), and the two steps use
+//! the same HC weights (the reference has one instance per sublayer).
 //!
 //! LAYOUT. The grouped entry point reads the row-major `[S, 10240]` stream and
 //! the whole `[10240]` weight, so the positive path needs no branch-major
@@ -58,12 +63,17 @@ use std::fmt::Write as _;
 use anyhow::Result;
 use anyhow::anyhow;
 use half::bf16;
+use pegainfer_kernels::ops::HC_SCATTER_BROADCAST;
+use pegainfer_kernels::ops::HC_SCATTER_PRODUCTION;
+use pegainfer_kernels::ops::HC_SCATTER_SCALE_STREAM;
+use pegainfer_kernels::ops::HC_SCATTER_SINGLE_ROUNDING;
 use pegainfer_kernels::ops::gemm_into_checked;
 use pegainfer_kernels::ops::hc_mul_branch_combine_into;
+use pegainfer_kernels::ops::hc_scatter_add_into;
+use pegainfer_kernels::ops::hc_scatter_add_variant_into;
 use pegainfer_kernels::ops::hc_sigmoid_affine_into;
 use pegainfer_kernels::ops::hc_silu_scaled_into;
 use pegainfer_kernels::ops::rms_norm_batch_into;
-use pegainfer_kernels::ops::rms_norm_batch_offset_into;
 use pegainfer_kernels::ops::rms_norm_grouped_offset_batch_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
@@ -78,7 +88,7 @@ const FIXTURE: &str = "qwen38fn-hc-golden.safetensors";
 const METADATA_KEY: &str = "qwen4_hc_golden";
 /// Frozen config the golden was dumped from, relative to the workspace root.
 const CONFIG: &str = "pegainfer-qwen4/tests/frozen_config.json";
-const FORMAT_VERSION: u64 = 2;
+const FORMAT_VERSION: u64 = 3;
 /// The reference implementation the golden's semantics are frozen against.
 const REF_TRANSFORMERS: &str = "5.16.1";
 
@@ -625,9 +635,41 @@ fn load_cases(fixture: &SafeTensors<'_>) -> Vec<Case> {
         .collect()
 }
 
+/// The recorded scatter half: both residual steps of one layer.
+struct ScatterCase {
+    attn_sublayer: Vec<bf16>,
+    attn_inject: Vec<bf16>,
+    attn_out: Vec<bf16>,
+    mlp_sublayer: Vec<bf16>,
+    mlp_inject: Vec<bf16>,
+    mlp_out: Vec<bf16>,
+}
+
+fn load_scatter_cases(fixture: &SafeTensors<'_>) -> Vec<ScatterCase> {
+    (0..CASES.len())
+        .map(|index| {
+            let rows = CASES[index];
+            let p = format!("case{index}_scatter_");
+            ScatterCase {
+                attn_sublayer: golden_bf16(
+                    fixture,
+                    &format!("{p}attn_sublayer"),
+                    &[1, rows, HIDDEN],
+                ),
+                attn_inject: golden_bf16(fixture, &format!("{p}attn_inject"), &[1, rows, HC_COUNT]),
+                attn_out: golden_bf16(fixture, &format!("{p}attn_out"), &[1, rows, STREAM]),
+                mlp_sublayer: golden_bf16(fixture, &format!("{p}mlp_sublayer"), &[1, rows, HIDDEN]),
+                mlp_inject: golden_bf16(fixture, &format!("{p}mlp_inject"), &[1, rows, HC_COUNT]),
+                mlp_out: golden_bf16(fixture, &format!("{p}mlp_out"), &[1, rows, STREAM]),
+            }
+        })
+        .collect()
+}
+
 struct Harness {
     ctx: DeviceContext,
     cases: Vec<Case>,
+    scatter: Vec<ScatterCase>,
     combine: GatedResidual,
     mixer: GatedResidual,
 }
@@ -653,6 +695,7 @@ fn harness() -> Option<Harness> {
     Some(Harness {
         ctx,
         cases: load_cases(&fixture),
+        scatter: load_scatter_cases(&fixture),
         combine,
         mixer,
     })
@@ -885,4 +928,207 @@ fn negative_plain_weight_norm_fails() {
         ..Variant::REFERENCE
     };
     h.assert_diverges(variant, EVERYTHING);
+}
+
+// ── the scatter half ──────────────────────────────────────────────────────
+
+/// Run one scatter step through the production entry (or a gate variant) and
+/// return the written stream.
+fn scatter_step(
+    ctx: &DeviceContext,
+    hyper: &HiddenStates,
+    sublayer: &[bf16],
+    inject: &[bf16],
+    rows: usize,
+    variant: i32,
+) -> Vec<bf16> {
+    let x = HiddenStates::from_host(ctx, sublayer, HIDDEN, rows).expect("scatter sublayer");
+    let inj = HiddenStates::from_host(ctx, inject, HC_COUNT, rows).expect("scatter inject");
+    let mut out = HiddenStates::zeros(ctx, STREAM, rows).expect("scatter output");
+    let launched = if variant == HC_SCATTER_PRODUCTION {
+        hc_scatter_add_into(ctx, &x, &inj, hyper, &mut out)
+    } else {
+        hc_scatter_add_variant_into(ctx, &x, &inj, hyper, &mut out, variant)
+    };
+    launched.expect("scatter launch");
+    ctx.sync().expect("scatter sync");
+    ctx.stream.clone_dtoh(&out.data).expect("scatter download")
+}
+
+fn count_bit_diffs(got: &[bf16], want: &[bf16]) -> usize {
+    assert_eq!(got.len(), want.len());
+    got.iter()
+        .zip(want)
+        .filter(|(got, want)| got.to_bits() != want.to_bits())
+        .count()
+}
+
+/// The scatter is comparison-free arithmetic: two bf16 roundings, both
+/// reproduced, so the recorded streams must come back bit-for-bit.
+#[test]
+fn hyper_connection_scatter_matches_golden() {
+    let Some(harness) = harness() else {
+        return;
+    };
+    for (case, scatter) in harness.cases.iter().zip(&harness.scatter) {
+        let hyper = harness.upload_stream(case);
+        let attn = scatter_step(
+            &harness.ctx,
+            &hyper,
+            &scatter.attn_sublayer,
+            &scatter.attn_inject,
+            case.rows,
+            HC_SCATTER_PRODUCTION,
+        );
+        let diffs = count_bit_diffs(&attn, &scatter.attn_out);
+        println!(
+            "case {} scatter after attention: {diffs} of {} elements differ",
+            case.index,
+            attn.len()
+        );
+        assert_eq!(
+            diffs, 0,
+            "case {}: the scatter after attention is not bitwise",
+            case.index
+        );
+
+        let base = HiddenStates::from_host(&harness.ctx, &attn, STREAM, case.rows)
+            .expect("attention-scattered stream");
+        let mlp = scatter_step(
+            &harness.ctx,
+            &base,
+            &scatter.mlp_sublayer,
+            &scatter.mlp_inject,
+            case.rows,
+            HC_SCATTER_PRODUCTION,
+        );
+        let diffs = count_bit_diffs(&mlp, &scatter.mlp_out);
+        println!(
+            "case {} scatter after MLP: {diffs} of {} elements differ",
+            case.index,
+            mlp.len()
+        );
+        assert_eq!(
+            diffs, 0,
+            "case {}: the scatter after the MLP is not bitwise",
+            case.index
+        );
+    }
+}
+
+/// Every gate variant must move the recorded stream, and so must a caller that
+/// reads the wrong step's injection weights. A control that left the stream
+/// alone would not be testing the rounding or the per-branch mapping.
+#[test]
+fn scatter_negative_controls_fail() {
+    let Some(harness) = harness() else {
+        return;
+    };
+    for (case, scatter) in harness.cases.iter().zip(&harness.scatter) {
+        let hyper = harness.upload_stream(case);
+        // Floors are fractions of the recorded stream, measured on this box:
+        // one rounding moves ~24% of elements, scaling the stream ~99.9%,
+        // broadcasting branch 0 ~70%, and the wrong step's weights ~98%. The
+        // floors sit below those with margin, so a control that stopped
+        // reaching the arithmetic cannot pass on a few stray bits.
+        for (name, variant, floor) in [
+            ("one rounding", HC_SCATTER_SINGLE_ROUNDING, 0.10),
+            ("scale the stream", HC_SCATTER_SCALE_STREAM, 0.90),
+            ("broadcast branch 0", HC_SCATTER_BROADCAST, 0.50),
+        ] {
+            let got = scatter_step(
+                &harness.ctx,
+                &hyper,
+                &scatter.attn_sublayer,
+                &scatter.attn_inject,
+                case.rows,
+                variant,
+            );
+            let diffs = count_bit_diffs(&got, &scatter.attn_out);
+            println!(
+                "case {} {name}: {diffs} of {} elements differ",
+                case.index,
+                got.len()
+            );
+            let fraction = diffs as f64 / got.len() as f64;
+            assert!(
+                fraction >= floor,
+                "case {}: the {name} control moved {diffs} of {} elements, below the {floor} floor",
+                case.index,
+                got.len()
+            );
+        }
+
+        // The MLP step reads the MLP head's weights; feeding it the attention
+        // head's is a data-level error the kernel cannot detect.
+        let base = HiddenStates::from_host(&harness.ctx, &scatter.attn_out, STREAM, case.rows)
+            .expect("attention-scattered stream");
+        let got = scatter_step(
+            &harness.ctx,
+            &base,
+            &scatter.mlp_sublayer,
+            &scatter.attn_inject,
+            case.rows,
+            HC_SCATTER_PRODUCTION,
+        );
+        let diffs = count_bit_diffs(&got, &scatter.mlp_out);
+        println!(
+            "case {} wrong-step injection: {diffs} of {} elements differ",
+            case.index,
+            got.len()
+        );
+        let fraction = diffs as f64 / got.len() as f64;
+        assert!(
+            fraction >= 0.50,
+            "case {}: the attention head's weights moved only {diffs} of {} elements of the MLP step",
+            case.index,
+            got.len()
+        );
+    }
+}
+
+/// Shape and variant refusals happen before any launch.
+#[test]
+fn scatter_refuses_bad_shapes_and_variants() {
+    let Some(harness) = harness() else {
+        return;
+    };
+    let case = &harness.cases[0];
+    let scatter = &harness.scatter[0];
+    let hyper = harness.upload_stream(case);
+    let x = HiddenStates::from_host(&harness.ctx, &scatter.attn_sublayer, HIDDEN, case.rows)
+        .expect("sublayer");
+    let inject = HiddenStates::from_host(&harness.ctx, &scatter.attn_inject, HC_COUNT, case.rows)
+        .expect("inject");
+    let mut out = HiddenStates::zeros(&harness.ctx, STREAM, case.rows).expect("output");
+
+    assert!(
+        hc_scatter_add_variant_into(&harness.ctx, &x, &inject, &hyper, &mut out, 4).is_err(),
+        "an unknown variant must be refused"
+    );
+
+    let short_rows = case.rows - 1;
+    let short = HiddenStates::from_host(
+        &harness.ctx,
+        &vec![bf16::ZERO; HIDDEN * short_rows],
+        HIDDEN,
+        short_rows,
+    )
+    .expect("short sublayer");
+    assert!(
+        hc_scatter_add_into(&harness.ctx, &short, &inject, &hyper, &mut out).is_err(),
+        "a row mismatch must be refused"
+    );
+
+    let wide_inject = HiddenStates::from_host(
+        &harness.ctx,
+        &vec![bf16::ZERO; HIDDEN * case.rows],
+        HIDDEN,
+        case.rows,
+    )
+    .expect("wide inject");
+    assert!(
+        hc_scatter_add_into(&harness.ctx, &x, &wide_inject, &hyper, &mut out).is_err(),
+        "a branch-count mismatch must be refused"
+    );
 }

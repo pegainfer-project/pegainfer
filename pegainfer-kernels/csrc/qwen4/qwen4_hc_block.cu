@@ -119,6 +119,48 @@ unsigned grid_for(long long n) {
   return static_cast<unsigned>((n + kThreads - 1) / kThreads);
 }
 
+// Scatter a sublayer output back into the four-branch stream:
+//
+//   out[s, b*H + h] = bf16(hyper[s, b*H + h] + bf16(f32(x[s, h]) * f32(inj[s, b])))
+//
+// which is the reference decoder layer's `hyper_input + (out * inj).flatten()`:
+// one bf16 multiply, then one bf16 add, each rounding where torch rounds. `out`
+// may alias `hyper`: every element reads its own `hyper` value before writing.
+//
+// VARIANTS are gate-only mutations of the same launch (production is 0): 1
+// folds the multiply and the add into one f32 expression and casts once; 2
+// scales the stream instead of the sublayer output; 3 broadcasts branch 0's
+// injection weight to every branch.
+__global__ void qwen4_hc_scatter_kernel(const __nv_bfloat16 *__restrict__ x,
+                                        const __nv_bfloat16 *__restrict__ inject,
+                                        const __nv_bfloat16 *__restrict__ hyper,
+                                        __nv_bfloat16 *__restrict__ out, int rows,
+                                        int hidden, int branches, int variant) {
+  const long long n = static_cast<long long>(rows) * branches * hidden;
+  const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= n) {
+    return;
+  }
+  const int h = static_cast<int>(idx % hidden);
+  const long long row_branch = idx / hidden;
+  const int b = static_cast<int>(row_branch % branches);
+  const long long row = row_branch / branches;
+  const int src_b = variant == 3 ? 0 : b;
+  const float prod = __bfloat162float(x[row * hidden + h]) *
+                     __bfloat162float(inject[row * branches + src_b]);
+  const float base = __bfloat162float(hyper[idx]);
+  if (variant == 1) {
+    out[idx] = __float2bfloat16_rn(base + prod);
+  } else if (variant == 2) {
+    const float scaled = __bfloat162float(__float2bfloat16_rn(prod)) *
+                         __bfloat162float(__float2bfloat16_rn(base));
+    out[idx] = __float2bfloat16_rn(scaled);
+  } else {
+    const float rounded = __bfloat162float(__float2bfloat16_rn(prod));
+    out[idx] = __float2bfloat16_rn(base + rounded);
+  }
+}
+
 // Bounds a *product* of dimensions, not each factor: no single dimension is
 // separately checked, and none needs to be. What has to survive is the count a
 // launch passes to `grid_for` and the i32 source index the combine kernel
@@ -189,6 +231,30 @@ CUresult qwen4_hc_mul_branch_combine_cuda(const __nv_bfloat16 *a, const __nv_bfl
   }
   qwen4_hc_mul_branch_combine_kernel<<<grid_for(out_elems), kThreads, 0, stream>>>(
       a, b, out, static_cast<int>(out_elems), hidden, branches, combine_scale);
+  return consume_last_cuda_error();
+}
+
+CUresult qwen4_hc_scatter_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *inject,
+                               const __nv_bfloat16 *hyper, __nv_bfloat16 *out, int rows,
+                               int hidden, int branches, int variant, cudaStream_t stream) {
+  if (x == nullptr || inject == nullptr || hyper == nullptr || out == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (rows < 0 || hidden <= 0 || branches <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (variant < 0 || variant > 3) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (rows == 0) {
+    return CUDA_SUCCESS;
+  }
+  const long long out_elems = static_cast<long long>(rows) * branches * hidden;
+  if (!dims_fit_i32(out_elems)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  qwen4_hc_scatter_kernel<<<grid_for(out_elems), kThreads, 0, stream>>>(
+      x, inject, hyper, out, rows, hidden, branches, variant);
   return consume_last_cuda_error();
 }
 

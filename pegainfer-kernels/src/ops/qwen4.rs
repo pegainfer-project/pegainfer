@@ -527,3 +527,101 @@ pub fn hc_mul_branch_combine_into(
     };
     launch(result, "mul_branch_combine")
 }
+
+/// `HC_SCATTER_*` variants are gate-only mutations of the same launch;
+/// production always passes [`HC_SCATTER_PRODUCTION`].
+pub const HC_SCATTER_PRODUCTION: i32 = 0;
+/// One rounding instead of the reference's two.
+pub const HC_SCATTER_SINGLE_ROUNDING: i32 = 1;
+/// Scale the stream instead of the sublayer output.
+pub const HC_SCATTER_SCALE_STREAM: i32 = 2;
+/// Broadcast branch 0's injection weight to every branch.
+pub const HC_SCATTER_BROADCAST: i32 = 3;
+
+/// Scatter a sublayer output back into the hyper-connection stream:
+///
+/// ```text
+/// out[s, b*H + h] = bf16(hyper[s, b*H + h] + bf16(f32(x[s, h]) * f32(inject[s, b])))
+/// ```
+///
+/// `x` is `[rows, HIDDEN]` (the sublayer's 2560-wide output), `inject`
+/// `[rows, branches]` (the gated injection weights), and `hyper`/`out`
+/// `[rows, branches * HIDDEN]`. The two bf16 roundings are the reference's two
+/// elementwise ops (`out * inject`, then `hyper_input + ...`). `out` may alias
+/// `hyper`: every element reads its own base before writing it.
+///
+/// This is [`hc_scatter_add_variant_into`] with [`HC_SCATTER_PRODUCTION`].
+pub fn hc_scatter_add_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    inject: &HiddenStates,
+    hyper: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    hc_scatter_add_variant_into(ctx, x, inject, hyper, out, HC_SCATTER_PRODUCTION)
+}
+
+/// [`hc_scatter_add_into`] with the parity gate's mutation knob.
+///
+/// `variant` is [`HC_SCATTER_PRODUCTION`] in production; the other
+/// `HC_SCATTER_*` values run the same launch with one step wrong and are
+/// refused outside `0..=3`.
+pub fn hc_scatter_add_variant_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    inject: &HiddenStates,
+    hyper: &HiddenStates,
+    out: &mut HiddenStates,
+    variant: i32,
+) -> Result<()> {
+    ensure!(
+        (0..=HC_SCATTER_BROADCAST).contains(&variant),
+        "hyper-connection scatter variant {variant} is not one of 0..=3"
+    );
+    ensure!(
+        x.seq_len == inject.seq_len && x.seq_len == hyper.seq_len && x.seq_len == out.seq_len,
+        "hyper-connection scatter rows differ: x {}, inject {}, hyper {}, out {}",
+        x.seq_len,
+        inject.seq_len,
+        hyper.seq_len,
+        out.seq_len
+    );
+    let branches = inject.hidden_dim;
+    ensure!(
+        branches > 0 && hyper.hidden_dim == x.hidden_dim * branches,
+        "hyper-connection scatter: sublayer {} x {branches} does not span the {}-wide stream",
+        x.hidden_dim,
+        hyper.hidden_dim
+    );
+    ensure!(
+        out.hidden_dim == hyper.hidden_dim,
+        "hyper-connection scatter: output is {}-wide, stream is {}-wide",
+        out.hidden_dim,
+        hyper.hidden_dim
+    );
+    x.checked_extent("hyper-connection scatter sublayer output")?;
+    inject.checked_extent("hyper-connection scatter injection weights")?;
+    hyper.checked_extent("hyper-connection scatter stream")?;
+    out.checked_extent("hyper-connection scatter output")?;
+    let rows = checked_i32(x.seq_len, "hyper-connection scatter row count")?;
+    let hidden = checked_i32(x.hidden_dim, "hyper-connection scatter branch width")?;
+    let branches = checked_i32(branches, "hyper-connection scatter branch count")?;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (inject_ptr, _gi) = inject.data.device_ptr(&ctx.stream);
+    let (hyper_ptr, _gh) = hyper.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::qwen4_hc_scatter_cuda(
+            x_ptr as *const ffi::Half,
+            inject_ptr as *const ffi::Half,
+            hyper_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            rows,
+            hidden,
+            branches,
+            variant,
+            active_cu_stream(ctx),
+        )
+    };
+    launch(result, "scatter")
+}
