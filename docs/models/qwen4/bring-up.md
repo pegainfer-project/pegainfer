@@ -1,6 +1,6 @@
 # Qwen4 bring-up
 
-> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of the model crate is CPU-only; its first device code lives beside it in `pegainfer-kernels` behind that crate's own `qwen4` feature — the QSA token indexer's block-scoring and block-selection kernels, gated against a committed reference golden. Nothing runs — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
+> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of the model crate is CPU-only; its device code lives beside it in `pegainfer-kernels` behind that crate's own `qwen4` feature — the QSA indexer's block-scoring/selection kernels and the hyper-connection block, each gated against a committed reference golden. Nothing runs — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
 >
 > **Last touched:** 2026-11
 
@@ -67,6 +67,21 @@ Two boundaries the code cannot state. A row's visible list starts at token 0 (th
 
 On the 26-SM sm_120 card, the production 2560-wide group moved from 56.0 to 41.6 µs p50 at 512 tokens (128 tokens: 17.2 to 14.9 µs).
 
+## The hyper-connection block
+
+`#1108`'s block is two halves. The **mix path** — grouped `(1 + w)` RMSNorm, rank-320 down GEMM, scaled SiLU, up GEMM, sigmoid, branch mean, and (per-layer only) the injection head — is composed by `hc_mix_into` from the shared surface, with caller-owned scratch; the norm is #1158's single-launch grouped entry point. The **scatter** — `hyper_input + (sublayer_out * inject).flatten()`, with the reference's two bf16 roundings — is `hc_scatter_add_into`.
+
+The oracle is `test_data/qwen38fn-hc-golden.safetensors` (format v3). The mix tensors (`normed`, `mixed`, `inject`, `mixed_only`) are recorded from the module; the scatter streams are recorded by running `Qwen4ExpTextDecoderLayer.forward` itself with the attention and MLP sublayers stubbed, so the reference's own two scatter lines produce them — once after attention and once after the MLP — on the case's own `hyper_input`. Everything sits at the real geometry (4 branches × 2560 = 10240, `hc_lowrank` 320).
+
+```
+cargo test --release -p pegainfer-kernels --features qwen4 \
+  --test qwen4_hc_block_parity -- --nocapture
+```
+
+Measured on an RTX 5060 (sm_120), CUDA 12.9.1: the mix composition lands `normed` bit-identical (S=6) and one bf16 ulp off (S=10), `mixed` ≤ 9.77e-3 and `inject` ≤ 7.81e-3 against `ATOL = RTOL = 4.0e-2`; the scatter is **bit-identical on every recorded element** (0 of 61440 and 0 of 102400). The chain that feeds the mix path's *computed* injection weights into the scatter — the reference layer's own flow — stays inside the same bound (worst 6.25e-2 at `|w| = 1`). Controls: plain-`w` norm, swapped activation, missing divisor, sum instead of mean, one-rounding scatter, stream-scaling scatter, branch-0 broadcast and the other step's weights each move the recorded tensors or streams.
+
+Not gated: the sublayer outputs are fixed tensors, not a real attention/MLP pass; both recorded scatter steps use the same HC weights (the reference has one instance per sublayer); the layer-level composition (PLE add + both sublayers) and HF logits land with slice B; the 4× stream's serving cost is #1128's. Derived cost, to hand over: one branch-stream row is 20 KiB, the mix scratch holds `normed` + `up` + `gate` (60 KiB) + `down`/`bottleneck` (2 × 640 B) + `mixed` (5 KiB) + injection logits (8 B) ≈ 66 KiB per token, and the scatter reads and writes 20 KiB each — one layer's block live at a time, not accumulated over 48 layers.
+
 ## The n-gram table is derived, not read
 
 `config.json` states none of the table's dimensions; they follow from five fields:
@@ -112,6 +127,7 @@ Still to verify is the reuse on this line's activations. The tensor contract der
 | Tensor manifest enforced before the first H2D | slice B's loader, which must classify the headers it maps before any upload |
 | GDN decode reuse, executed | slice B: the wrappers are shared in `pegainfer-kernels::ops` and the contract pins their geometry and tensor names, but nothing has run this line's GDN block against the reference. The model-graph fixture that does so is slice B's M0 exit (#1127); the GDN prefill path and the gated norm composition land with it. |
 | Bookend gate (embedding → mixer → lm_head → argmax) | 1 GPU, three shards (1 + 130 + 131, 5.29 GB, ~2.6 GB of weights on device) and a CPU f64 reference for the mixer. No layer weights needed. |
+| Hyper-connection layer composition (PLE add → attn → scatter → MLP → scatter) and HF logits | slice B's text graph, which owns the buffer lifetimes; the block itself (mix + scatter) is gated today |
 | HF golden fixtures (logits + intermediate probes) | the fleet — 360 GB, plus ≥102.4 GB host RAM if the n-gram table is materialized |
 | Tokenizer / chat-template ID fixtures | transformers **5.16.0+** — the checkpoint's own tokenizer is `Qwen2Tokenizer`, which is older, but fixtures are compared against the reference implementation; nothing in the tree commits token-ID fixtures today |
 
