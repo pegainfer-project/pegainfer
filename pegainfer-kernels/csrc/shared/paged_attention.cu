@@ -50,42 +50,6 @@ int paged_attention_decode_split_kv_cuda(
 }
 
 // ---------------------------------------------------------------------------
-// Paged KV append — writes one K and one V token per request to paged cache.
-//
-// Must be called AFTER RMSNorm + RoPE on K, and BEFORE the attention decode.
-// V is appended as-is (no norm/RoPE).
-// ---------------------------------------------------------------------------
-int paged_kv_append_cuda(
-    void*    kv_data,
-    int64_t  k_offset_elems,
-    int64_t  v_offset_elems,
-    int32_t* page_indices,
-    int32_t* page_indptr,
-    int32_t* last_page_len_d,
-    void*    key,                  // [batch_size * num_kv_heads * head_dim] bf16
-    void*    value,                // [batch_size * num_kv_heads * head_dim] bf16
-    int32_t  num_kv_heads,
-    int32_t  head_dim,
-    int32_t  page_size,
-    int32_t  batch_size,
-    int64_t  stride_page,
-    void*    stream)
-{
-  PEGAINFER_FFI_GUARD_BEGIN
-    auto paged_kv = make_paged_kv(
-        kv_data, k_offset_elems, v_offset_elems,
-        page_indices, page_indptr, last_page_len_d,
-        num_kv_heads, head_dim, page_size, batch_size, stride_page);
-
-    return static_cast<int>(AppendPagedKVCacheDecode(
-        paged_kv,
-        reinterpret_cast<DType*>(key),
-        reinterpret_cast<DType*>(value),
-        reinterpret_cast<cudaStream_t>(stream)));
-  PEGAINFER_FFI_GUARD_END(-1)
-}
-
-// ---------------------------------------------------------------------------
 // Scatter contiguous KV cache into paged layout (one layer at a time).
 //
 // Source layout (HND per layer): k[head, pos, dim]
@@ -146,18 +110,6 @@ int paged_kv_scatter_cuda(
 // and passed as GPU arrays. This avoids per-call GPU allocations.
 // ---------------------------------------------------------------------------
 // Return the number of Q tiles for given dimensions (needed to size plan arrays).
-int32_t batch_prefill_paged_num_tiles(
-    int32_t  seq_len,
-    int32_t  num_qo_heads,
-    int32_t  num_kv_heads,
-    int32_t  head_dim)
-{
-    uint32_t group_size = num_qo_heads / num_kv_heads;
-    int64_t packed_qo_len = static_cast<int64_t>(seq_len) * group_size;
-    uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim);
-    return static_cast<int32_t>((packed_qo_len + cta_tile_q - 1) / cta_tile_q);
-}
-
 int32_t batch_prefill_paged_num_tiles_with_cta_tile_q(
     int32_t  seq_len,
     int32_t  num_qo_heads,
@@ -179,17 +131,6 @@ int32_t batch_prefill_paged_num_tiles_with_cta_tile_q(
 // Return the CTA tile size for batch prefill planning.
 // Rust needs this to compute per-request tile counts that are consistent
 // with the kernel dispatch.
-int32_t batch_prefill_cta_tile_q(
-    int32_t  total_seq_len,
-    int32_t  num_qo_heads,
-    int32_t  num_kv_heads,
-    int32_t  head_dim)
-{
-    uint32_t group_size = num_qo_heads / num_kv_heads;
-    int64_t packed_qo_len = static_cast<int64_t>(total_seq_len) * group_size;
-    return static_cast<int32_t>(FA2DetermineCtaTileQ(packed_qo_len, head_dim));
-}
-
 int32_t batch_prefill_cta_tile_q_with_override(
     int32_t  total_seq_len,
     int32_t  num_qo_heads,
@@ -221,43 +162,6 @@ int batch_prefill_paged_cuda_with_cta_tile_q(
       total_num_rows, num_qo_heads, num_kv_heads, head_dim, page_size,
       seq_len, batch_size, padded_batch_size, stride_page, sm_scale,
       cta_tile_q_override, /*window_left=*/-1, stream);
-}
-
-int batch_prefill_paged_cuda(
-    void*    q,
-    void*    output,
-    void*    kv_data,
-    int64_t  k_offset_elems,
-    int64_t  v_offset_elems,
-    int32_t* page_indices,
-    int32_t* page_indptr,
-    int32_t* last_page_len_d,
-    int32_t* q_indptr,
-    int32_t* request_indices,
-    int32_t* qo_tile_indices,
-    int32_t* kv_tile_indices,
-    int32_t* kv_chunk_size_ptr,
-    uint32_t* total_num_rows,
-    int32_t  num_qo_heads,
-    int32_t  num_kv_heads,
-    int32_t  head_dim,
-    int32_t  page_size,
-    int32_t  seq_len,
-    int32_t  batch_size,
-    int32_t  padded_batch_size,
-    int64_t  stride_page,
-    float    sm_scale,
-    void*    stream)
-{
-  PEGAINFER_FFI_GUARD_BEGIN
-    return batch_prefill_paged_cuda_with_cta_tile_q(
-        q, output, kv_data, k_offset_elems, v_offset_elems,
-        page_indices, page_indptr, last_page_len_d, q_indptr,
-        request_indices, qo_tile_indices, kv_tile_indices,
-        kv_chunk_size_ptr, total_num_rows, num_qo_heads, num_kv_heads,
-        head_dim, page_size, seq_len, batch_size, padded_batch_size,
-        stride_page, sm_scale, /*cta_tile_q_override=*/0, stream);
-  PEGAINFER_FFI_GUARD_END(-1)
 }
 
 // ---------------------------------------------------------------------------
@@ -417,76 +321,6 @@ int single_prefill_nhd_noncausal_cuda_hd64(
             PosEncodingMode::kNone,
             /*USE_FP16_QK_REDUCTION=*/false,
             MaskMode::kNone,
-            Variant,
-            PrefillParamsT>(
-            params,
-            /*tmp=*/nullptr,
-            reinterpret_cast<cudaStream_t>(stream)));
-  PEGAINFER_FFI_GUARD_END(-1)
-}
-
-// Causal variant of single_prefill_nhd_noncausal_cuda: identical NHD token-major
-// layout (q/output [seq, q_dim], k/v [max_seq, kv_dim]) but a causal mask, so the
-// N query tokens at the tail of the cache attend only positions <= their own.
-// Used for EAGLE-3's teacher-forced prefill in one batched forward (query i at
-// absolute position kv_len - seq_len + i, FlashInfer's causal alignment).
-int single_prefill_nhd_causal_cuda(
-    void*    q,
-    void*    output,
-    void*    k_cache,
-    void*    v_cache,
-    int32_t  num_qo_heads,
-    int32_t  num_kv_heads,
-    int32_t  head_dim,
-    int32_t  seq_len,
-    int32_t  kv_len,
-    int32_t  max_seq_len,
-    float    sm_scale,
-    void*    stream)
-{
-  PEGAINFER_FFI_GUARD_BEGIN
-    if (q == nullptr || output == nullptr || k_cache == nullptr || v_cache == nullptr ||
-        num_qo_heads <= 0 || num_kv_heads <= 0 || head_dim != 128 ||
-        num_qo_heads % num_kv_heads != 0 ||
-        seq_len <= 0 || kv_len <= 0 || max_seq_len < kv_len || seq_len > kv_len) {
-        return static_cast<int>(cudaErrorInvalidValue);
-    }
-
-    uint32_t q_stride_n  = num_qo_heads * head_dim;
-    uint32_t q_stride_h  = head_dim;
-    uint32_t kv_stride_n = num_kv_heads * head_dim;
-    uint32_t kv_stride_h = head_dim;
-
-    PrefillParamsT params(
-        reinterpret_cast<DType*>(q),
-        reinterpret_cast<DType*>(k_cache),
-        reinterpret_cast<DType*>(v_cache),
-        /*maybe_custom_mask=*/nullptr,
-        reinterpret_cast<DType*>(output),
-        /*lse=*/nullptr,
-        /*maybe_alibi_slopes=*/nullptr,
-        num_qo_heads,
-        num_kv_heads,
-        static_cast<uint32_t>(seq_len),
-        static_cast<uint32_t>(kv_len),
-        q_stride_n,
-        q_stride_h,
-        kv_stride_n,
-        kv_stride_h,
-        static_cast<uint32_t>(head_dim),
-        /*window_left=*/-1,
-        /*logits_soft_cap=*/0.0f,
-        sm_scale,
-        /*rope_scale=*/1.0f,
-        /*rope_theta=*/1e6f);
-
-    return static_cast<int>(
-        SinglePrefillWithKVCacheDispatched<
-            /*HEAD_DIM_QK=*/128,
-            /*HEAD_DIM_VO=*/128,
-            PosEncodingMode::kNone,
-            /*USE_FP16_QK_REDUCTION=*/false,
-            MaskMode::kCausal,
             Variant,
             PrefillParamsT>(
             params,

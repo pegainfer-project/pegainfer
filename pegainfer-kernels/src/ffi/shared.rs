@@ -158,16 +158,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn fused_add_rms_norm_cuda(
-        hidden: *mut Half,
-        residual: *const Half,
-        weight: *const Half,
-        out: *mut Half,
-        n: i32,
-        eps: f32,
-        stream: CUstream,
-    );
-
     pub fn layer_norm_cuda(
         x: *const Half,
         gamma: *const f32,
@@ -445,15 +435,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
-    pub fn embedding_decode_cuda(
-        embed: *const Half,
-        token_id: *const u32,
-        out: *mut Half,
-        hidden_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn silu_mul_fused_cuda(
         gate_up: *const Half,
         out: *mut Half,
@@ -616,13 +597,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Return the number of Q tiles for batch prefill (needed to size plan arrays).
-    pub fn batch_prefill_paged_num_tiles(
-        seq_len: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-    ) -> i32;
-
     pub fn batch_prefill_paged_num_tiles_with_cta_tile_q(
         seq_len: i32,
         num_qo_heads: i32,
@@ -632,13 +606,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Return the CTA tile size for batch prefill planning.
-    pub fn batch_prefill_cta_tile_q(
-        total_seq_len: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-    ) -> i32;
-
     pub fn batch_prefill_cta_tile_q_with_override(
         total_seq_len: i32,
         num_qo_heads: i32,
@@ -648,33 +615,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Batch prefill with paged KV cache (FlashInfer BatchPrefill, causal, kNone).
-    pub fn batch_prefill_paged_cuda(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        q_indptr: *const i32,
-        request_indices: *const i32,
-        qo_tile_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        total_num_rows: *const u32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        seq_len: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
     pub fn batch_prefill_paged_cuda_with_cta_tile_q(
         q: *const Half,
         output: *mut Half,
@@ -735,22 +675,6 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn single_prefill_nhd_noncausal_cuda_hd64(
-        q: *const Half,
-        output: *mut Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    // Causal NHD single-sequence prefill (same layout, causal mask).
-    pub fn single_prefill_nhd_causal_cuda(
         q: *const Half,
         output: *mut Half,
         k_cache: *const Half,

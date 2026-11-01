@@ -2245,9 +2245,6 @@ fn main() {
             .join(",")
     );
 
-    let replaced_cuda_files =
-        BTreeSet::from(["activation.cu", "embedding.cu", "fused_attention.cu"]);
-
     let root = crate_root();
     if moe_enabled {
         require_moe_submodules(&root);
@@ -2301,9 +2298,7 @@ fn main() {
                 return None;
             }
             // --- end k3 ---
-            if path.extension().and_then(|e| e.to_str()) == Some("cu")
-                && !replaced_cuda_files.contains(file_name)
-            {
+            if path.extension().and_then(|e| e.to_str()) == Some("cu") {
                 Some(path.clone())
             } else {
                 None
@@ -2319,15 +2314,6 @@ fn main() {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
-
-    println!(
-        "cargo:warning=Legacy CUDA translation units retired from the runtime build: {}",
-        replaced_cuda_files
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
 
     let nvcc_jobs = nvcc_job_count();
     println!("cargo:warning=Compiling CUDA translation units with {nvcc_jobs} nvcc job(s)");
