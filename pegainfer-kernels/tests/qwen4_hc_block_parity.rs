@@ -9,10 +9,10 @@
 //! projections *are* the component under test.
 //!
 //! Each case's `hyper_input` goes through the shared GPU surface — the grouped
-//! `(1 + w)` RMSNorm as four `rms_norm_batch_offset_into` calls on the real
-//! per-branch weight slice, the three projections through the cuBLAS wrapper,
-//! and the elementwise tail through the `qwen4` kernels — and every tensor
-//! the reference recorded is compared:
+//! `(1 + w)` RMSNorm through the single-launch grouped entry point (#1158), the
+//! three projections through the cuBLAS wrapper, and the elementwise tail
+//! through the `qwen4` kernels — and every tensor the reference recorded is
+//! compared:
 //!
 //! * `normed` — the grouped norm's output, the block's only norm;
 //! * `mixed` — the rank-320 mix gate's branch mean (`use_combine=True`);
@@ -27,16 +27,12 @@
 //! coefficient is already held; the fold itself waits on a golden that carries
 //! a sublayer.
 //!
-//! LAYOUT. `rms_norm_batched_offset_cuda` pins `stride_input` to `hidden_dim`,
-//! so a branch of a row-major 10240-wide stream is not addressable as `[S,
-//! 2560]`. The gate therefore feeds the norm one branch-major `[S, 2560]`
-//! buffer per branch — four launches, each with that branch's own slice of the
-//! norm weight — and assembles the row-major stream the projections read back
-//! on device with plain `memcpy_dtod`. If/when PR #1158 lands
-//! `rms_norm_grouped_offset_cuda`, production switches to that single-launch
-//! grouped entry point and the assembly disappears with it; this gate's
-//! four-call form is bit-identical on that degenerate path, so the numbers
-//! recorded here do not move when the switch happens.
+//! LAYOUT. The grouped entry point reads the row-major `[S, 10240]` stream and
+//! the whole `[10240]` weight, so the positive path needs no branch-major
+//! scratch and no assembly. The plain-`w` negative control has no grouped
+//! spelling (the reference convention is `(1 + w)`), so it keeps the
+//! per-branch batched kernel on branch-major `[S, 2560]` buffers and copies
+//! the result back into the stream; that path exists only to be rejected.
 //!
 //! Provenance is asserted, not assumed: the fixture records the reference
 //! version and the sha256 of the frozen config it was dumped from, and that
@@ -68,6 +64,7 @@ use pegainfer_kernels::ops::hc_sigmoid_affine_into;
 use pegainfer_kernels::ops::hc_silu_scaled_into;
 use pegainfer_kernels::ops::rms_norm_batch_into;
 use pegainfer_kernels::ops::rms_norm_batch_offset_into;
+use pegainfer_kernels::ops::rms_norm_grouped_offset_batch_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::DeviceVec;
@@ -319,6 +316,9 @@ fn f32_of(values: &[bf16]) -> Vec<f32> {
 /// per branch, the two low-rank mix projections, and — only for
 /// `use_combine=True` — the per-branch injection head.
 struct GatedResidual {
+    /// The whole `[STREAM]` norm weight, for the grouped entry point.
+    norm: DeviceVec,
+    /// Per-branch slices, for the plain-`w` negative control only.
     norm_branches: [DeviceVec; HC_COUNT],
     down: DeviceMatrix,
     up: DeviceMatrix,
@@ -336,6 +336,7 @@ impl GatedResidual {
     ) -> Result<Self> {
         let weight = golden_bf16(fixture, norm, &[STREAM]);
         Ok(Self {
+            norm: DeviceVec::from_host(ctx, &weight).expect("upload norm weight"),
             norm_branches: std::array::from_fn(|branch| {
                 DeviceVec::from_host(ctx, &weight[branch * HIDDEN..(branch + 1) * HIDDEN])
                     .expect("upload norm weight branch")
@@ -401,26 +402,34 @@ impl Variant {
     };
 }
 
-/// The grouped `(1 + w)` RMSNorm: one launch per branch over that branch's
-/// `[rows, HIDDEN]` buffer, with that branch's own `HIDDEN`-wide slice of the
-/// norm weight. Same arithmetic one strided or grouped launch would do — each
-/// call is one CTA per row over one group — and the same single f32 → bf16 cast
-/// per group.
-fn grouped_norm(
+/// The grouped `(1 + w)` RMSNorm over the row-major stream: one launch of the
+/// grouped entry point (#1158), which reduces each `HIDDEN`-wide group on its
+/// own and indexes the weight by the row's global column. The plain-`w`
+/// negative control has no grouped spelling — the reference convention is
+/// `(1 + w)` — so it keeps the per-branch batched kernel on the branch-major
+/// scratch and assembles the stream back.
+fn norm_stream(
     ctx: &DeviceContext,
+    hyper: &HiddenStates,
+    module: &GatedResidual,
     branches: &[HiddenStates; HC_COUNT],
-    weight: &[DeviceVec; HC_COUNT],
     variant: Variant,
-    out: &mut [HiddenStates; HC_COUNT],
+    out: &mut HiddenStates,
 ) -> Result<()> {
-    for ((x, w), dst) in branches.iter().zip(weight).zip(out.iter_mut()) {
-        if variant.offset_norm {
-            rms_norm_batch_offset_into(ctx, x, w, RMS_EPS, dst)?;
-        } else {
-            rms_norm_batch_into(ctx, x, w, RMS_EPS, dst);
-        }
+    if variant.offset_norm {
+        return rms_norm_grouped_offset_batch_into(ctx, hyper, &module.norm, HIDDEN, RMS_EPS, out);
     }
-    Ok(())
+    let mut normed_branches: [HiddenStates; HC_COUNT] = std::array::from_fn(|_| {
+        HiddenStates::zeros(ctx, HIDDEN, hyper.seq_len).expect("normed branch buffer")
+    });
+    for ((x, w), dst) in branches
+        .iter()
+        .zip(module.norm_branches.iter())
+        .zip(normed_branches.iter_mut())
+    {
+        rms_norm_batch_into(ctx, x, w, RMS_EPS, dst);
+    }
+    assemble_stream(ctx, &normed_branches, out)
 }
 
 /// Assemble the four per-branch norm buffers into the row-major
@@ -466,27 +475,19 @@ struct Replay {
     inject: Option<HiddenStates>,
 }
 
-/// Replay one `Qwen4ExpTextGatedResidual` forward from the branch-major
-/// `hyper`, rounding to bf16 at each of the reference's submodule boundaries.
+/// Replay one `Qwen4ExpTextGatedResidual` forward from the row-major `hyper`
+/// stream (the branch-major copy is the plain-`w` control's scratch), rounding
+/// to bf16 at each of the reference's submodule boundaries.
 fn replay(
     ctx: &DeviceContext,
     module: &GatedResidual,
-    hyper: &[HiddenStates; HC_COUNT],
+    hyper: &HiddenStates,
+    branches: &[HiddenStates; HC_COUNT],
     rows: usize,
     variant: Variant,
 ) -> Result<Replay> {
-    let mut normed_branches: [HiddenStates; HC_COUNT] = std::array::from_fn(|_| {
-        HiddenStates::zeros(ctx, HIDDEN, rows).expect("normed branch buffer")
-    });
-    grouped_norm(
-        ctx,
-        hyper,
-        &module.norm_branches,
-        variant,
-        &mut normed_branches,
-    )?;
     let mut normed = HiddenStates::zeros(ctx, STREAM, rows)?;
-    assemble_stream(ctx, &normed_branches, &mut normed)?;
+    norm_stream(ctx, hyper, module, branches, variant, &mut normed)?;
 
     let mut down = HiddenStates::zeros(ctx, LOWRANK, rows)?;
     gemm_into_checked(ctx, &module.down, &normed, &mut down)?;
@@ -593,7 +594,9 @@ fn report(label: &str, got: &[f32], want: &[f32]) -> Diff {
 struct Case {
     index: usize,
     rows: usize,
-    /// `hyper_input`, split per branch for the grouped norm.
+    /// `hyper_input`, row-major, as the grouped norm reads it.
+    hyper_stream: Vec<bf16>,
+    /// The same stream split per branch: only the plain-`w` control needs it.
     hyper: [Vec<bf16>; HC_COUNT],
     normed: Vec<bf16>,
     mixed: Vec<bf16>,
@@ -611,6 +614,7 @@ fn load_cases(fixture: &SafeTensors<'_>) -> Vec<Case> {
             Case {
                 index,
                 rows,
+                hyper_stream: hyper.clone(),
                 hyper: branch_major(&hyper, rows),
                 normed: golden_bf16(fixture, &format!("{p}normed"), &[1, rows, STREAM]),
                 mixed: golden_bf16(fixture, &format!("{p}mixed"), &[1, rows, HIDDEN]),
@@ -672,6 +676,11 @@ const MIX_AND_READOUT: &[Out] = &[Out::Mixed, Out::Readout];
 const EVERYTHING: &[Out] = &[Out::Normed, Out::Mixed, Out::Inject, Out::Readout];
 
 impl Harness {
+    fn upload_stream(&self, case: &Case) -> HiddenStates {
+        HiddenStates::from_host(&self.ctx, &case.hyper_stream, STREAM, case.rows)
+            .expect("upload hyper stream")
+    }
+
     fn upload(&self, case: &Case) -> [HiddenStates; HC_COUNT] {
         std::array::from_fn(|branch| {
             HiddenStates::from_host(&self.ctx, &case.hyper[branch], HIDDEN, case.rows)
@@ -681,11 +690,13 @@ impl Harness {
 
     /// The positive gate: every recorded tensor of both modules, every case.
     fn assert_reference(&self, case: &Case) {
-        let hyper = self.upload(case);
+        let hyper = self.upload_stream(case);
+        let branches = self.upload(case);
         let combine = replay(
             &self.ctx,
             &self.combine,
             &hyper,
+            &branches,
             case.rows,
             Variant::REFERENCE,
         )
@@ -701,6 +712,7 @@ impl Harness {
             &self.ctx,
             &self.mixer,
             &hyper,
+            &branches,
             case.rows,
             Variant::REFERENCE,
         )
@@ -720,12 +732,27 @@ impl Harness {
     fn assert_diverges(&self, variant: Variant, moved: &[Out]) {
         for case in &self.cases {
             println!("case {} (S = {}):", case.index, case.rows);
-            let hyper = self.upload(case);
-            let combine = replay(&self.ctx, &self.combine, &hyper, case.rows, variant)
-                .expect("replay negative control");
+            let hyper = self.upload_stream(case);
+            let branches = self.upload(case);
+            let combine = replay(
+                &self.ctx,
+                &self.combine,
+                &hyper,
+                &branches,
+                case.rows,
+                variant,
+            )
+            .expect("replay negative control");
             let readout = moved.contains(&Out::Readout).then(|| {
-                replay(&self.ctx, &self.mixer, &hyper, case.rows, variant)
-                    .expect("replay negative readout")
+                replay(
+                    &self.ctx,
+                    &self.mixer,
+                    &hyper,
+                    &branches,
+                    case.rows,
+                    variant,
+                )
+                .expect("replay negative readout")
             });
             for out in moved {
                 match out {
