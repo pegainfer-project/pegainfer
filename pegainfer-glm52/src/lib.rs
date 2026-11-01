@@ -503,33 +503,30 @@ fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle
         );
         pegainfer_core::cuda_graph::validate_graph_dump_request(path)?;
     }
-    match moe_topo {
-        Glm52MoeTopo::Tp4 => {
-            ensure!(
-                tp_size == 4,
-                "GLM5.2 TP4 requires --tp-size=4, got {tp_size}"
-            );
-            ensure!(
-                dp_size == 1,
-                "GLM5.2 TP4 requires --dp-size=1 (or omitted), got {dp_size}"
-            );
-            ensure!(
-                prefill_only.is_some(),
-                "GLM5.2 TP4 is prefill-only: pass --glm52-prefill-only \
-                 (decode TP / LL packet path was removed)"
-            );
-        }
-        _ => {
-            ensure!(
-                tp_size == 1,
-                "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
-            );
-            let expected_dp = moe_topo.default_dp_size();
-            ensure!(
-                dp_size == expected_dp,
-                "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
-            );
-        }
+    if moe_topo == Glm52MoeTopo::Tp4 {
+        ensure!(
+            tp_size == 4,
+            "GLM5.2 TP4 requires --tp-size=4, got {tp_size}"
+        );
+        ensure!(
+            dp_size == 1,
+            "GLM5.2 TP4 requires --dp-size=1 (or omitted), got {dp_size}"
+        );
+        ensure!(
+            prefill_only.is_some(),
+            "GLM5.2 TP4 is prefill-only: pass --glm52-prefill-only \
+             (decode TP / LL packet path was removed)"
+        );
+    } else {
+        ensure!(
+            tp_size == 1,
+            "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
+        );
+        let expected_dp = moe_topo.default_dp_size();
+        ensure!(
+            dp_size == expected_dp,
+            "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
+        );
     }
     if let Some(prefill) = prefill_only {
         ensure!(
@@ -585,14 +582,14 @@ fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle
             dp_size,
             ep_size: moe_topo.expected_ep_size(),
         },
-        drafter,
+        &drafter,
         max_model_len,
         prefill_only,
         no_prefix_cache,
-        kv_offload,
+        kv_offload.as_ref(),
         moe_topo,
         weight_staging,
-        dump_graph_png,
+        dump_graph_png.as_deref(),
     )
 }
 
@@ -894,14 +891,14 @@ struct LoadedGlm52Runtime {
 fn start_engine(
     model_path: &Path,
     options: &Glm52LoadOptions,
-    drafter: Glm52Drafter,
+    drafter: &Glm52Drafter,
     requested_max_model_len: Option<usize>,
     prefill_only: Option<Glm52PrefillOnlyOptions>,
     no_prefix_cache: bool,
-    kv_offload: Option<Glm52KvOffloadOptions>,
+    kv_offload: Option<&Glm52KvOffloadOptions>,
     moe_topo: Glm52MoeTopo,
     weight_staging: bool,
-    dump_graph_png: Option<PathBuf>,
+    dump_graph_png: Option<&Path>,
 ) -> Result<EngineHandle> {
     let startup = validate_startup(model_path, options, moe_topo, drafter.is_mtp())?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_topo, weight_staging)?;
@@ -932,7 +929,7 @@ fn start_engine(
     let budget = derive_max_model_len(
         requested_max_model_len,
         min_free_vram_bytes.saturating_sub(post_weight_charge_bytes),
-        &drafter,
+        drafter,
         glm52_prefill_scratch_reservation(prefill_only)?,
         prefill_only.is_some(),
         moe_topo,
@@ -1003,7 +1000,7 @@ fn start_engine(
         &loaded.workers,
         max_model_len,
         moe_topo,
-        &drafter,
+        drafter,
         prefill_only.map(|options| options.chunk_size),
         &startup.ranks,
         startup.rendezvous.as_deref(),
@@ -1061,7 +1058,7 @@ fn start_engine(
             (rank_arenas, (0..ranks).map(|_| Vec::new()).collect())
         };
         build_kv_store(
-            kv_offload.as_ref(),
+            kv_offload,
             store_arenas,
             store_mirrors,
             drafter.is_mtp(),
@@ -1100,10 +1097,10 @@ fn start_engine(
         })
         .unzip();
     let (mut graph_dump_request, graph_dump_response) =
-        match (&dump_graph_png, startup.ranks.start == 0) {
+        match (dump_graph_png, startup.ranks.start == 0) {
             (Some(path), true) => {
                 let (response_tx, response_rx) = crossbeam_channel::bounded(1);
-                (Some((path.clone(), response_tx)), Some(response_rx))
+                (Some((path.to_path_buf(), response_tx)), Some(response_rx))
             }
             _ => (None, None),
         };
@@ -1616,10 +1613,10 @@ fn build_kv_store(
 /// loader runs under one (pegainfer-server's `spawn_blocking` keeps the
 /// context), else a small dedicated runtime living for the process.
 fn store_runtime_handle() -> tokio::runtime::Handle {
+    static FALLBACK: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return handle;
     }
-    static FALLBACK: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     FALLBACK
         .get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()

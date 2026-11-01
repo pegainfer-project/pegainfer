@@ -274,7 +274,7 @@ impl ModelLine for Glm52Line {
                     .map(crate::parse_rank_range)
                     .transpose()
                     .context("--glm52-ranks")?,
-                rendezvous: cli.glm52_rendezvous.clone(),
+                rendezvous: cli.glm52_rendezvous,
             },
         )
         .context("failed to start GLM5.2 engine")

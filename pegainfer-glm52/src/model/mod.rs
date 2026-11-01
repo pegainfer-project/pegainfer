@@ -174,7 +174,7 @@ pub(crate) const GLM52_KV_PAGE_CONTENT_BYTES: usize = 3_502_592;
 /// the offload namespace and the native P/D fingerprint both fold it.
 pub(crate) const GLM52_KV_PAGE_STRIDE: usize = 3_503_040;
 
-const _: () = assert!(GLM52_KV_PAGE_STRIDE % GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN == 0);
+const _: () = assert!(GLM52_KV_PAGE_STRIDE.is_multiple_of(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN));
 const _: () = assert!(
     GLM52_KV_PAGE_STRIDE >= GLM52_KV_PAGE_CONTENT_BYTES
         && GLM52_KV_PAGE_STRIDE - GLM52_KV_PAGE_CONTENT_BYTES
@@ -1195,7 +1195,7 @@ impl Glm52RankModel {
                 &mut self.kv_slab,
                 executor.mtp_target_boundary(),
                 &round,
-                Some(mtp::Glm52MtpProposalSeed {
+                Some(&mtp::Glm52MtpProposalSeed {
                     previous: executor.mtp_proposal_boundary(),
                     draft1: &output.mtp_draft1[start..end],
                     rows_before: start,
@@ -1672,64 +1672,6 @@ impl Glm52RankModel {
     }
 }
 
-#[cfg(test)]
-mod cache_layout_tests {
-    use super::*;
-    use crate::mla_decode::Glm52MlaBackend;
-
-    #[test]
-    fn tp4_prefill_matches_ep_decode_persistent_mla_layout() {
-        let tp4_prefill =
-            glm52_persistent_mla_bytes_per_token(true, Glm52MlaBackend::FlashInferFp8);
-        let ep_decode = glm52_persistent_mla_bytes_per_token(false, Glm52MlaBackend::FlashMlaFp8Ds);
-
-        assert_eq!(tp4_prefill, 656);
-        assert_eq!(tp4_prefill, ep_decode);
-        assert_eq!(GLM52_KV_PAGE_MLA_BYTES, 41_984);
-        assert_eq!(GLM52_KV_PAGE_IDXK_BYTES, 8_448);
-    }
-
-    #[test]
-    fn page_layout_matches_the_wire_constants() {
-        let layout = glm52_page_layout();
-        assert_eq!(GLM52_KV_PAGE_CONTENT_BYTES, 3_502_592);
-        assert_eq!(GLM52_KV_PAGE_STRIDE, 3_503_040);
-        assert_eq!(
-            GLM52_KV_PAGE_STRIDE,
-            GLM52_KV_PAGE_CONTENT_BYTES.next_multiple_of(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN)
-        );
-        assert_eq!(layout.layers.len(), GLM52_LAYERS);
-        assert_eq!(
-            layout
-                .layers
-                .iter()
-                .filter(|caches| caches.index_k_offset.is_some())
-                .count(),
-            21
-        );
-        // Slices in declaration order, each 16-byte aligned, none crossing
-        // into the next.
-        let mut expected = 0usize;
-        for caches in layout.layers.iter().chain([&layout.mtp]) {
-            assert_eq!(caches.mla_offset, expected);
-            assert_eq!(caches.mla_offset % 16, 0);
-            expected += GLM52_KV_PAGE_MLA_BYTES;
-            if let Some(index_k_offset) = caches.index_k_offset {
-                assert_eq!(index_k_offset, expected);
-                assert_eq!(index_k_offset % 16, 0);
-                expected += GLM52_KV_PAGE_IDXK_BYTES;
-            }
-        }
-        assert_eq!(expected, GLM52_KV_PAGE_CONTENT_BYTES);
-        assert_eq!(layout.layers[0].mla_offset, 0);
-        assert_eq!(layout.layers[0].index_k_offset, Some(41_984));
-        assert_eq!(
-            layout.mtp.index_k_offset,
-            Some(GLM52_KV_PAGE_CONTENT_BYTES - GLM52_KV_PAGE_IDXK_BYTES)
-        );
-    }
-}
-
 /// Single-layer slab for oracle/unit paths: one page = `[MLA slice |
 /// index-K slice]`, stride padded to the 656-byte cache token row the
 /// FlashMLA TMA requires, with the same conservative-extent tail slack as
@@ -1805,4 +1747,62 @@ fn copy_strided_block(
         stream.memcpy_dtod(&src, &mut dst)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cache_layout_tests {
+    use super::*;
+    use crate::mla_decode::Glm52MlaBackend;
+
+    #[test]
+    fn tp4_prefill_matches_ep_decode_persistent_mla_layout() {
+        let tp4_prefill =
+            glm52_persistent_mla_bytes_per_token(true, Glm52MlaBackend::FlashInferFp8);
+        let ep_decode = glm52_persistent_mla_bytes_per_token(false, Glm52MlaBackend::FlashMlaFp8Ds);
+
+        assert_eq!(tp4_prefill, 656);
+        assert_eq!(tp4_prefill, ep_decode);
+        assert_eq!(GLM52_KV_PAGE_MLA_BYTES, 41_984);
+        assert_eq!(GLM52_KV_PAGE_IDXK_BYTES, 8_448);
+    }
+
+    #[test]
+    fn page_layout_matches_the_wire_constants() {
+        let layout = glm52_page_layout();
+        assert_eq!(GLM52_KV_PAGE_CONTENT_BYTES, 3_502_592);
+        assert_eq!(GLM52_KV_PAGE_STRIDE, 3_503_040);
+        assert_eq!(
+            GLM52_KV_PAGE_STRIDE,
+            GLM52_KV_PAGE_CONTENT_BYTES.next_multiple_of(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN)
+        );
+        assert_eq!(layout.layers.len(), GLM52_LAYERS);
+        assert_eq!(
+            layout
+                .layers
+                .iter()
+                .filter(|caches| caches.index_k_offset.is_some())
+                .count(),
+            21
+        );
+        // Slices in declaration order, each 16-byte aligned, none crossing
+        // into the next.
+        let mut expected = 0usize;
+        for caches in layout.layers.iter().chain([&layout.mtp]) {
+            assert_eq!(caches.mla_offset, expected);
+            assert_eq!(caches.mla_offset % 16, 0);
+            expected += GLM52_KV_PAGE_MLA_BYTES;
+            if let Some(index_k_offset) = caches.index_k_offset {
+                assert_eq!(index_k_offset, expected);
+                assert_eq!(index_k_offset % 16, 0);
+                expected += GLM52_KV_PAGE_IDXK_BYTES;
+            }
+        }
+        assert_eq!(expected, GLM52_KV_PAGE_CONTENT_BYTES);
+        assert_eq!(layout.layers[0].mla_offset, 0);
+        assert_eq!(layout.layers[0].index_k_offset, Some(41_984));
+        assert_eq!(
+            layout.mtp.index_k_offset,
+            Some(GLM52_KV_PAGE_CONTENT_BYTES - GLM52_KV_PAGE_IDXK_BYTES)
+        );
+    }
 }
