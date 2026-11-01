@@ -4,9 +4,9 @@ use anyhow::ensure;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 
-use super::experts::KIMI_K2_HIDDEN;
 use super::mla::KIMI_K2_MLA_V_HEAD_DIM;
 use crate::ffi;
+use crate::ops::KIMI_K2_HIDDEN;
 use crate::ops::ffi_status_detail;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;

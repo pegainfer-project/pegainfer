@@ -21,7 +21,7 @@ use pegainfer_kernels::ops::KIMI_K2_MLA_Q_LOCAL_OUT_TP8;
 use pegainfer_kernels::ops::KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8;
 use pegainfer_kernels::ops::KIMI_K2_MLA_QKV_A_OUT;
 use pegainfer_kernels::ops::KIMI_K2_MLA_ROPE_DIM;
-use pegainfer_kernels::ops::KIMI_K2_ROUTER_SCALE;
+use pegainfer_kernels::ops::KIMI_K2_ROUTED_SCALING_FACTOR;
 use pegainfer_kernels::tensor::AxisSpec;
 use pegainfer_kernels::tensor::Bf16;
 use pegainfer_kernels::tensor::Contiguous1D;
@@ -497,7 +497,7 @@ fn push_moe_layer(calls: &mut Vec<KernelCall>, layer_idx: usize, batch: usize) {
             TensorSpec::new::<F32, Contiguous1D>([AxisSpec::named("elem", batch * KIMI_K2_HIDDEN)]),
         )
         .output("out", hidden(KIMI_K2_HIDDEN, batch))
-        .attr("scale", KIMI_K2_ROUTER_SCALE.to_string()),
+        .attr("scale", KIMI_K2_ROUTED_SCALING_FACTOR.to_string()),
     );
 }
 

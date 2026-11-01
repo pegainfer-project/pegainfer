@@ -6,6 +6,11 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::ops::KIMI_K2_EXPERT_INTERMEDIATE;
+use crate::ops::KIMI_K2_HIDDEN;
+use crate::ops::KIMI_K2_INT4_GROUP_SIZE;
+use crate::ops::KIMI_K2_ROUTED_EXPERTS;
+use crate::ops::KIMI_K2_TOPK;
 use crate::ops::marlin_face::MarlinAlignBuffers;
 use crate::ops::marlin_face::MarlinGemmBuffers;
 use crate::ops::marlin_face::launch_marlin_align;
@@ -18,14 +23,9 @@ use crate::tensor::GpuTensor;
 #[cfg(test)]
 use crate::tensor::TensorSpec;
 
-pub const KIMI_K2_HIDDEN: usize = 7168;
-pub const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;
 pub const KIMI_K2_SHARED_GATE_UP: usize = 2 * KIMI_K2_EXPERT_INTERMEDIATE;
-const KIMI_K2_ROUTED_EXPERTS: usize = 384;
 pub const KIMI_K2_EP_WORLD: usize = 8;
 pub const KIMI_K2_LOCAL_EXPERTS: usize = KIMI_K2_ROUTED_EXPERTS / KIMI_K2_EP_WORLD;
-pub const KIMI_K2_TOPK: usize = 8;
-pub const KIMI_K2_INT4_GROUP_SIZE: usize = 32;
 
 pub fn kimi_add_f32_bf16_to_bf16<const DIM: usize>(
     ctx: &DeviceContext,
