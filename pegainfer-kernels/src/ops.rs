@@ -37,6 +37,7 @@ mod k3;
 mod k3_tilelang;
 #[cfg(feature = "kimi-k2")]
 mod kimi_k2;
+mod kimi_k2_geometry;
 mod linear;
 mod lora;
 #[cfg(any(feature = "gemma4", feature = "kimi-k2"))]
@@ -187,6 +188,7 @@ pub use k3::*;
 pub use k3_tilelang::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
+pub use kimi_k2_geometry::*;
 pub use linear::GEMM_LT_MAX_N;
 pub use linear::NumericPolicy;
 pub use linear::PinAlgoConfig;
