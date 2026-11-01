@@ -347,21 +347,6 @@ pub fn qsa_indexer_select_into(
     .map_err(|err| anyhow::anyhow!("QSA indexer select launch failed: {err}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::qsa_score_splits;
-
-    /// Four CTAs per SM, capped by the row's block count. These include the
-    /// mid-size bands a row-count cutoff would otherwise run unsplit.
-    #[test]
-    fn score_splits_follow_the_sm_budget() {
-        assert_eq!(qsa_score_splits(300, 128, 92), 2);
-        assert_eq!(qsa_score_splits(512, 128, 92), 1);
-        assert_eq!(qsa_score_splits(300, 128, 132), 2);
-        assert_eq!(qsa_score_splits(512, 128, 132), 2);
-        assert_eq!(qsa_score_splits(1, 128, 92), 32);
-        assert_eq!(qsa_score_splits(6, 513, 92), 62);
-    }
 fn ensure_finite(value: f32, what: &str) -> Result<()> {
     ensure!(
         value.is_finite(),
@@ -792,4 +777,21 @@ pub fn hc_mix_into(
         hc_sigmoid_affine_into(ctx, logits, divisor, 2.0, out)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qsa_score_splits;
+
+    /// Four CTAs per SM, capped by the row's block count. These include the
+    /// mid-size bands a row-count cutoff would otherwise run unsplit.
+    #[test]
+    fn score_splits_follow_the_sm_budget() {
+        assert_eq!(qsa_score_splits(300, 128, 92), 2);
+        assert_eq!(qsa_score_splits(512, 128, 92), 1);
+        assert_eq!(qsa_score_splits(300, 128, 132), 2);
+        assert_eq!(qsa_score_splits(512, 128, 132), 2);
+        assert_eq!(qsa_score_splits(1, 128, 92), 32);
+        assert_eq!(qsa_score_splits(6, 513, 92), 62);
+    }
 }
