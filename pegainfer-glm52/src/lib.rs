@@ -457,12 +457,9 @@ fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle
     // occupancy and collapse speculation (#812's original failure mode).
     // Only native MTP rides verify spans; without a drafter every slot is a
     // single decode row and any slot count within the ceiling fits.
-    let slots = model::glm52_decode_slots();
-    let draft_len = if drafter.is_mtp() {
-        crate::mtp::glm52_mtp_draft_len()
-    } else {
-        0
-    };
+    let slots = model::glm52_decode_slots_from_env()?;
+    let mtp_drafts = crate::mtp::glm52_mtp_draft_len_from_env()?;
+    let draft_len = if drafter.is_mtp() { mtp_drafts } else { 0 };
     ensure!(
         slots * (1 + draft_len) <= model::GLM52_MAX_STEP_ROWS,
         "GLM5.2 GLM52_DECODE_SLOTS={slots} x (1 + GLM52_MTP_DRAFTS={draft_len}) exceeds the \
