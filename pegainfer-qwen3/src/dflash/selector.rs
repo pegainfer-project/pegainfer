@@ -65,6 +65,8 @@ impl SelectorHead {
         hidden: &HiddenStates,
         logits: &HiddenStates,
         anchors: &[u32],
+        temperatures: &[f32],
+        uniforms: &[f32],
         block_size: usize,
         scratch: &mut SelectorScratch,
     ) -> Result<Vec<u32>> {
@@ -86,6 +88,11 @@ impl SelectorHead {
         buffers.projected.seq_len = rows;
         ctx.stream
             .memcpy_htod(anchors, &mut buffers.anchors.slice_mut(..batch))?;
+        ensure!(
+            temperatures.len() == batch,
+            "DFlash2 sampling batch mismatch"
+        );
+        buffers.lattice.set_sampling(ctx, temperatures, uniforms)?;
 
         // Warm cuBLAS before capture, just as the existing DSpark proposal does.
         if warmed[batch - 1] {
@@ -148,6 +155,16 @@ impl SelectorHead {
 }
 
 impl SelectorScratch {
+    /// Device proposal state from the most recent walk, valid until the next
+    /// draft. IDs include anchors; probabilities contain draft positions only.
+    pub(super) fn proposal(&self) -> (&CudaSlice<u32>, &CudaSlice<f32>, &CudaSlice<u32>) {
+        (
+            self.buffers.lattice.candidate_ids(),
+            self.buffers.lattice.proposal_probs(),
+            self.buffers.lattice.selected_ids(),
+        )
+    }
+
     pub(super) fn new(ctx: &DeviceContext, config: &DFlashConfig, batch: usize) -> Result<Self> {
         let rows = sizing::product(&[batch, config.block_size])?;
         let elements = sizing::product(&[rows, config.selector_rank])?;

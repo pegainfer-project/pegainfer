@@ -1,4 +1,4 @@
-//! DFlash2's candidate lattice; request sampling remains in pegainfer-sample.
+//! DFlash2's candidate lattice and conditional proposal distribution.
 
 use std::sync::Arc;
 
@@ -44,6 +44,9 @@ pub struct DFlash2Scratch {
     gated_predecessors: CudaSlice<f32>,
     successors: CudaSlice<f32>,
     edge_scores: CudaSlice<f32>,
+    temperatures: CudaSlice<f32>,
+    uniforms: CudaSlice<f32>,
+    proposal_probs: CudaSlice<f32>,
     selected_ids: CudaSlice<u32>,
     error_flag: CudaSlice<u32>,
 }
@@ -68,6 +71,8 @@ impl DFlash2Scratch {
             product(&[rows, DFLASH2_CANDIDATE_K, 4])?,
             product(&[rows, DFLASH2_CANDIDATE_K, rank, 8])?,
             product(&[rows, DFLASH2_CANDIDATE_K, DFLASH2_CANDIDATE_K, 4])?,
+            product(&[batch, 4])?,
+            product(&[rows, DFLASH2_CANDIDATE_K + 1, 4])?,
             product(&[rows, 4])?,
             4,
         ];
@@ -127,6 +132,9 @@ impl DFlash2Scratch {
             gated_predecessors: ctx.stream.alloc_zeros(gathered)?,
             successors: ctx.stream.alloc_zeros(gathered)?,
             edge_scores: ctx.stream.alloc_zeros(edges)?,
+            temperatures: ctx.stream.alloc_zeros(max_batch)?,
+            uniforms: ctx.stream.alloc_zeros(rows)?,
+            proposal_probs: ctx.stream.alloc_zeros(candidates)?,
             selected_ids: ctx.stream.alloc_zeros(rows)?,
             error_flag: ctx.stream.alloc_zeros(1)?,
         })
@@ -148,6 +156,33 @@ impl DFlash2Scratch {
 
     pub fn selected_ids(&self) -> &CudaSlice<u32> {
         &self.selected_ids
+    }
+
+    /// Upload this round's sampling inputs before graph replay. A zero
+    /// temperature selects greedily; uniforms are in [0, 1), one per draft.
+    pub fn set_sampling(
+        &mut self,
+        ctx: &DeviceContext,
+        temperatures: &[f32],
+        uniforms: &[f32],
+    ) -> Result<()> {
+        let batch = temperatures.len();
+        ensure!(
+            batch <= self.max_batch && uniforms.len() == batch * (self.block_size - 1),
+            "DFlash2 sampling inputs do not match the active batch"
+        );
+        ctx.stream
+            .memcpy_htod(temperatures, &mut self.temperatures.slice_mut(..batch))?;
+        ctx.stream
+            .memcpy_htod(uniforms, &mut self.uniforms.slice_mut(..uniforms.len()))?;
+        Ok(())
+    }
+
+    /// `[request, draft_position, candidate]` q along the selected path.
+    /// Greedy rows contain a one-hot distribution. Candidate IDs use the
+    /// anchor-inclusive layout returned by `candidate_ids`.
+    pub fn proposal_probs(&self) -> &CudaSlice<f32> {
+        &self.proposal_probs
     }
 
     /// Bit mask: 1 = selected NaN/+Inf unary, 2 = selected -Inf unary,
@@ -311,6 +346,9 @@ pub fn dflash2_select_into(
         let (edges_ptr, _ge) = scratch.edge_scores.device_ptr_mut(&ctx.stream);
         let (unary_ptr, _gu) = scratch.unary_scores.device_ptr(&ctx.stream);
         let (ids_ptr, _gi) = scratch.candidate_ids.device_ptr(&ctx.stream);
+        let (temperatures_ptr, _gt) = scratch.temperatures.device_ptr(&ctx.stream);
+        let (uniforms_ptr, _gr) = scratch.uniforms.device_ptr(&ctx.stream);
+        let (probs_ptr, _gq) = scratch.proposal_probs.device_ptr_mut(&ctx.stream);
         let (selected_ptr, _gs) = scratch.selected_ids.device_ptr_mut(&ctx.stream);
         let (error_ptr, _gf) = scratch.error_flag.device_ptr_mut(&ctx.stream);
 
@@ -319,6 +357,9 @@ pub fn dflash2_select_into(
                 edges_ptr as *mut f32,
                 unary_ptr as *const f32,
                 ids_ptr as *const u32,
+                temperatures_ptr as *const f32,
+                uniforms_ptr as *const f32,
+                probs_ptr as *mut f32,
                 selected_ptr as *mut u32,
                 error_ptr as *mut u32,
                 active_batch as i32,

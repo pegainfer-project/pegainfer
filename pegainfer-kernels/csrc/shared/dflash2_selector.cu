@@ -1,5 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cub/warp/warp_reduce.cuh>
+#include <cub/warp/warp_scan.cuh>
 #include <math_constants.h>
 #include <flashinfer/sampling.cuh>
 #include <flashinfer/topk.cuh>
@@ -100,33 +102,75 @@ __global__ void add_unary(float* edges, const float* unary, int rows, unsigned* 
   }
 }
 
-// One bounded walk per request; no host-visible predecessor dependency. This
-// is greedy along the selected edges, not independent argmax or Viterbi.
-__global__ void walk(const float* edges, const unsigned* ids, unsigned* selected,
-                    int batch, int length, const unsigned* error) {
-  for (int request = blockIdx.x * blockDim.x + threadIdx.x; request < batch;
-       request += blockDim.x * gridDim.x) {
+// One logical 16-lane warp handles a request. Positions remain sequential;
+// candidates within a position share reductions and the CDF scan.
+__global__ void walk(const float* edges, const unsigned* ids,
+                    const float* temperatures, const float* uniforms,
+                    float* proposal_probs, unsigned* selected, int batch,
+                    int length, const unsigned* error) {
+  constexpr int kWalkThreads = 256;
+  constexpr int kRequestsPerBlock = kWalkThreads / kCandidates;
+  using Sum = cub::WarpReduce<float, kCandidates>;
+  using Scan = cub::WarpScan<float, kCandidates>;
+  __shared__ typename Sum::TempStorage sums[kRequestsPerBlock];
+  __shared__ typename Scan::TempStorage scans[kRequestsPerBlock];
+
+  const int group = threadIdx.x / kCandidates;
+  const int lane = threadIdx.x % kCandidates;
+  const int warp_base = threadIdx.x & kCandidates;
+  const unsigned mask = 0xffffu << warp_base;
+  for (int request = blockIdx.x * kRequestsPerBlock + group; request < batch;
+       request += gridDim.x * kRequestsPerBlock) {
     int predecessor = 0;
     for (int position = 0; position < length; ++position) {
       const int64_t row = static_cast<int64_t>(request) * length + position;
       if (*error != 0) {
-        selected[row] = 0xffffffffu;
+        if (lane == 0) selected[row] = 0xffffffffu;
         continue;
       }
 
       const float* scores = edges + (row * kCandidates + predecessor) * kCandidates;
       const int64_t source = static_cast<int64_t>(request) * (length + 1) + 1 + position;
-      const unsigned* candidates = ids + source * kCandidates;
-      int best = 0;
-      for (int candidate = 1; candidate < kCandidates; ++candidate) {
-        if (scores[candidate] > scores[best] ||
-            (scores[candidate] == scores[best] && candidates[candidate] < candidates[best])) {
-          best = candidate;
+      const unsigned candidate = ids[source * kCandidates + lane];
+      const float score = scores[lane];
+      float best_score = score;
+      unsigned best_id = candidate;
+      for (int distance = kCandidates / 2; distance > 0; distance /= 2) {
+        const float other_score = __shfl_xor_sync(mask, best_score, distance, kCandidates);
+        const unsigned other_id = __shfl_xor_sync(mask, best_id, distance, kCandidates);
+        if (other_score > best_score || (other_score == best_score && other_id < best_id)) {
+          best_score = other_score;
+          best_id = other_id;
         }
       }
-
-      selected[row] = candidates[best];
-      predecessor = best;
+      const unsigned best_mask = (__ballot_sync(mask, candidate == best_id) & mask) >> warp_base;
+      int picked = __ffs(best_mask) - 1;
+      const float temperature = temperatures[request];
+      float probability;
+      if (temperature > 0.0f) {
+        probability = expf((score - best_score) / temperature);
+        float mass = Sum(sums[group]).Sum(probability);
+        mass = __shfl_sync(mask, mass, 0, kCandidates);
+        probability /= mass;
+        float cumulative;
+        Scan(scans[group]).InclusiveSum(probability, cumulative);
+        const unsigned matches = (__ballot_sync(mask, uniforms[row] < cumulative) & mask) >> warp_base;
+        if (matches != 0) {
+          picked = __ffs(matches) - 1;
+        } else {
+          // As in the scalar walk, an FP32 CDF below one uses its last positive entry.
+          const unsigned positive = (__ballot_sync(mask, probability > 0.0f) & mask) >> warp_base;
+          picked = 31 - __clz(positive);
+        }
+      } else {
+        probability = lane == picked ? 1.0f : 0.0f;
+      }
+      proposal_probs[row * kCandidates + lane] = probability;
+      const unsigned token = __shfl_sync(mask, candidate, picked, kCandidates);
+      if (lane == 0) selected[row] = token;
+      predecessor = picked;
+      // CUB storage is reused by this logical warp at the next position.
+      __syncwarp(mask);
     }
   }
 }
@@ -164,7 +208,9 @@ extern "C" int dflash2_prepare_cuda(
 }
 
 extern "C" int dflash2_finish_cuda(float* edges, const float* unary,
-                                  const unsigned* ids, unsigned* selected,
+                                  const unsigned* ids, const float* temperatures,
+                                  const float* uniforms, float* proposal_probs,
+                                  unsigned* selected,
                                   unsigned* error, int batch, int length,
                                   cudaStream_t stream) {
   PEGAINFER_FFI_GUARD_BEGIN
@@ -172,7 +218,8 @@ extern "C" int dflash2_finish_cuda(float* edges, const float* unary,
       edges, unary, batch * length, error);
   check_cuda(cudaPeekAtLastError());
 
-  walk<<<blocks(batch), 256, 0, stream>>>(edges, ids, selected, batch, length, error);
+  walk<<<blocks(static_cast<int64_t>(batch) * kCandidates), 256, 0, stream>>>(
+      edges, ids, temperatures, uniforms, proposal_probs, selected, batch, length, error);
   check_cuda(cudaPeekAtLastError());
 
   return 0;

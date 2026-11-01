@@ -11,6 +11,9 @@ use anyhow::Result;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::sampler::SamplingParams;
+use rand::RngExt;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use super::LocalQwen3Lane;
 use super::PrefillStepItem;
@@ -31,7 +34,10 @@ pub(super) struct DFlashLaneState {
     requests: HashMap<RequestId, DFlashRequestState>,
     /// Lane-level batched draft scratch, allocated once for the whole decode
     /// batch so the dense draft ops run once instead of once per request.
-    scratch: DFlashBatchScratch,
+    pub(super) scratch: DFlashBatchScratch,
+    /// Sampled proposals from this round: request -> (scratch row, round seed).
+    pub(super) proposal_rows: HashMap<RequestId, (usize, u64)>,
+    pub(super) sampling: Option<pegainfer_kernels::ops::SparseVerifyScratch>,
     verified_draft_tokens: usize,
     accepted_draft_tokens: usize,
     /// Hedge chains proposed by the last draft round (`PEGAINFER_SPEC_HEDGE`):
@@ -64,6 +70,16 @@ impl DFlashLaneState {
         max_decode_batch_size: usize,
     ) -> Result<Self> {
         let scratch = model.new_batch_scratch(ctx, max_decode_batch_size)?;
+        let sampling = model
+            .uses_selector()
+            .then(|| {
+                pegainfer_kernels::ops::SparseVerifyScratch::new(
+                    ctx,
+                    max_decode_batch_size,
+                    model.block_size(),
+                )
+            })
+            .transpose()?;
         let geometry = spec_hedge_effective(model.block_size());
         let hedge_branch_positions = geometry.positions;
         let hedge_cap = if model.uses_markov_head() && !hedge_branch_positions.is_empty() {
@@ -90,6 +106,8 @@ impl DFlashLaneState {
             model,
             requests: HashMap::new(),
             scratch,
+            proposal_rows: HashMap::new(),
+            sampling,
             verified_draft_tokens: 0,
             accepted_draft_tokens: 0,
             hedge_blocks: HashMap::new(),
@@ -298,6 +316,7 @@ impl LocalQwen3Lane {
             anyhow::bail!("DFlash draft requested but DFlash is not loaded");
         };
         let result = (|| -> Result<Vec<DraftRequestResult>> {
+            dflash.proposal_rows.clear();
             // Pull every active request's state out of the map so the batched
             // forward can hold `&mut` to all of them at once. Re-inserted below.
             let mut taken: Vec<(RequestId, DFlashRequestState)> =
@@ -320,6 +339,7 @@ impl LocalQwen3Lane {
                 round_chains,
                 hedge_cap,
                 hedge_branch_positions,
+                proposal_rows,
                 ..
             } = &mut dflash;
             let mut state_refs: Vec<&mut DFlashRequestState> =
@@ -423,7 +443,31 @@ impl LocalQwen3Lane {
             *round_chains = if hedging { ladder_chains } else { 0 };
             let selector = model.uses_selector();
             let sampled = if selector {
-                model.selected_draft_tokens(self.model.device_ctx(), &current_tokens, scratch)?
+                let mut temperatures = Vec::with_capacity(requests.len());
+                let mut uniforms = Vec::with_capacity(requests.len() * (block_size - 1));
+                for (row, req) in requests.iter().enumerate() {
+                    let greedy = pegainfer_sample::effectively_greedy(
+                        &req.params,
+                        self.model.config().decodable_vocab,
+                    );
+                    temperatures.push(if greedy { 0.0 } else { req.params.temperature });
+                    if greedy {
+                        uniforms.resize(uniforms.len() + block_size - 1, 0.0);
+                    } else {
+                        // Separate proposal draws from acceptance and correction draws.
+                        let mut rng =
+                            StdRng::seed_from_u64(pegainfer_sample::mix_seed(req.sample_seed, 0));
+                        uniforms.extend((0..block_size - 1).map(|_| rng.random::<f32>()));
+                        proposal_rows.insert(req.request_id, (row, req.sample_seed));
+                    }
+                }
+                model.selected_draft_tokens(
+                    self.model.device_ctx(),
+                    &current_tokens,
+                    &temperatures,
+                    &uniforms,
+                    scratch,
+                )?
             } else if markov {
                 if hedging {
                     let ctx = self.model.device_ctx();
@@ -517,6 +561,7 @@ impl LocalQwen3Lane {
     pub(super) fn drop_dflash_request(&mut self, request_id: RequestId) {
         if let Some(dflash) = self.dflash.as_mut() {
             dflash.requests.remove(&request_id);
+            dflash.proposal_rows.remove(&request_id);
         }
     }
 }
@@ -714,7 +759,7 @@ mod tests {
     use super::*;
 
     fn item(id: u64, budget: usize) -> DraftStepItem {
-        DraftStepItem::new(RequestId::new(id), 7, budget)
+        DraftStepItem::new(RequestId::new(id), 7, budget, SamplingParams::default(), 0)
     }
 
     const BLOCK: usize = 7;

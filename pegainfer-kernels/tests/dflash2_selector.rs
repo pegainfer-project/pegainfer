@@ -16,7 +16,7 @@ use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::HiddenStates;
 use pegainfer_kernels::tensor::StreamOverrideGuard;
 
-const N: usize = 16;
+const N: usize = 32;
 const BLOCK: usize = 8;
 const LENGTH: usize = BLOCK - 1;
 const K: usize = 16;
@@ -224,6 +224,70 @@ fn verify(
             expected.path
         );
     }
+
+    // The same graph must consume fresh uniforms and return q conditioned on
+    // the sampled predecessor, including when greedy and sampled rows mix.
+    let temperatures: Vec<_> = (0..active)
+        .map(|request| if request % 2 == 0 { 0.8 } else { 0.0 })
+        .collect();
+    for shift in [0, 31, 0] {
+        let uniforms: Vec<_> = (0..active * LENGTH)
+            .map(|i| (((i * 13 + shift) % 97) as f32 + 0.25) / 97.0)
+            .collect();
+        scratch.set_sampling(ctx, &temperatures, &uniforms)?;
+        graph.launch()?;
+        let sampled = ctx.stream.clone_dtoh(scratch.selected_ids())?;
+        let probs = ctx.stream.clone_dtoh(scratch.proposal_probs())?;
+        for (request, &temperature) in temperatures.iter().enumerate() {
+            let mut previous = 0;
+            for position in 0..LENGTH {
+                let row = request * LENGTH + position;
+                let start = (row * K + previous) * K;
+                let scores = &expected.edges[start..start + K];
+                let ids_start = (request * BLOCK + 1 + position) * K;
+                let ids = &candidates[ids_start..ids_start + K];
+                let best = (0..K)
+                    .min_by(|&a, &b| {
+                        scores[b]
+                            .partial_cmp(&scores[a])
+                            .unwrap()
+                            .then(ids[a].cmp(&ids[b]))
+                    })
+                    .unwrap();
+                let mut proposal_probs = [0.0f64; K];
+                let picked = if temperature > 0.0 {
+                    for (prob, &score) in proposal_probs.iter_mut().zip(scores) {
+                        *prob = ((f64::from(score) - f64::from(scores[best]))
+                            / f64::from(temperature))
+                        .exp();
+                    }
+                    let mass: f64 = proposal_probs.iter().sum();
+                    for prob in &mut proposal_probs {
+                        *prob /= mass;
+                    }
+                    let mut cdf = 0.0;
+                    proposal_probs
+                        .iter()
+                        .position(|prob| {
+                            cdf += prob;
+                            f64::from(uniforms[row]) < cdf
+                        })
+                        .unwrap()
+                } else {
+                    proposal_probs[best] = 1.0;
+                    best
+                };
+                assert_eq!(sampled[row], ids[picked]);
+                for (&actual, &expected) in
+                    probs[row * K..(row + 1) * K].iter().zip(&proposal_probs)
+                {
+                    assert!((f64::from(actual) - expected).abs() < 2e-6);
+                }
+                previous = picked;
+            }
+        }
+    }
+    scratch.set_sampling(ctx, &vec![0.0; active], &vec![0.0; active * LENGTH])?;
     Ok(())
 }
 
@@ -231,7 +295,7 @@ fn verify(
 fn candidates_lattice_graph_replay_and_request_isolation() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let mut scratch = DFlash2Scratch::new(&ctx, N, BLOCK, VOCAB, RANK)?;
-    for active in [16, 1, 8, 16] {
+    for active in [32, 1, 17, 8, 32] {
         let mut input = Inputs::new();
         input.poison_inactive(active);
         verify(&ctx, &mut scratch, &input, active, true)?;

@@ -49,6 +49,7 @@ use crate::weights::Qwen3Model;
 mod auto_hedge;
 mod dflash_lane;
 mod dflash_prefill;
+mod dflash_sampling;
 mod eagle3_lane;
 mod logprobs;
 use logprobs::DecodeRows;
@@ -4066,19 +4067,22 @@ impl LocalQwen3Lane {
                 &mut bufs,
             )?;
 
-            // One committed token per span row, each row governed by ITS
-            // request's params — argmax rows batch through the fused path,
-            // sampled rows ride the regular batched sampler (sampled-verify,
-            // #512). Steps stay zeroed exactly like the plain-decode call:
-            // when sampling-parity 1b wires request-local decode steps
-            // through, verify rows must move with it (row k of a span is the
-            // request's step `completion + k`) or seeded replay breaks.
-            let params: Vec<&SamplingParams> = requests
-                .iter()
-                .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
-                .collect();
-            let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
-            let mut request_results = build_verify_results(requests, &target_tokens)?;
+            // A gated step has no proposal; never consume a prior round's q.
+            if gated && let Some(dflash) = self.dflash.as_mut() {
+                dflash.proposal_rows.clear();
+            }
+            let mut request_results =
+                if let Some(results) = self.sample_selector_verify(requests, bufs.all_logits())? {
+                    results
+                } else {
+                    let params: Vec<&SamplingParams> = requests
+                        .iter()
+                        .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
+                        .collect();
+                    let target_tokens =
+                        self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
+                    build_verify_results(requests, &target_tokens)?
+                };
             // Apply the request policy before recording target hidden states;
             // otherwise a suffix discarded by terminal handling would leak
             // into the next draft context and acceptance counters.
@@ -4109,6 +4113,9 @@ impl LocalQwen3Lane {
             })
         })();
         self.verify_bufs = Some(bufs);
+        if let Some(dflash) = self.dflash.as_mut() {
+            dflash.proposal_rows.clear();
+        }
         result
     }
 
@@ -4205,9 +4212,9 @@ enum StepCommand {
     },
     /// Speculative verify: one target forward over each request's `K + 1` draft
     /// span (with a speculative KV view), capturing target hidden states for the
-    /// next draft round. Each position selects the request's *committed* token —
-    /// argmax for greedy rows, a regular sample for non-greedy rows — and the
-    /// tokens drive [`accept_prefix_match`] (sampled-verify, #512).
+    /// next draft round. Sampled DFlash2 proposals use probability-aware
+    /// acceptance; other proposals use [`accept_prefix_match`] against the
+    /// target sampler output.
     SpeculativeVerify {
         requests: Vec<VerifyStepItem>,
         kv_views: Vec<KvView>,

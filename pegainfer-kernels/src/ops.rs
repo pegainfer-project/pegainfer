@@ -7,6 +7,10 @@ mod deepep;
 mod deepseek_v2_lite;
 mod dflash2;
 mod dflash2_conv;
+mod speculative_sampling;
+pub use speculative_sampling::SparseVerifyRequest;
+pub use speculative_sampling::SparseVerifyScratch;
+pub use speculative_sampling::sparse_speculative_sample;
 #[cfg(feature = "deepseek-v2-lite")]
 mod dsv2_routed_moe;
 #[cfg(feature = "deepseek-v2-lite")]

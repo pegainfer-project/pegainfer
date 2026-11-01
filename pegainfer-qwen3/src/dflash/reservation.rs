@@ -142,6 +142,14 @@ impl DFlashMemoryReservation {
         // per-step bias is the dominant term). Zero for plain DFlash drafters.
         let markov = MarkovHead::reservation_bytes(config, max_decode_batch_size)?;
         let selector = SelectorHead::reservation_bytes(config, max_decode_batch_size)?;
+        let sampling = if config.selector_rank > 0 {
+            pegainfer_kernels::ops::SparseVerifyScratch::reservation_bytes(
+                max_decode_batch_size,
+                config.block_size,
+            )
+        } else {
+            0
+        };
 
         Ok(Self {
             kv_bytes_per_token,
@@ -152,6 +160,7 @@ impl DFlashMemoryReservation {
                 markov,
                 native,
                 selector,
+                sampling,
             ])?,
             block_size: config.block_size,
             uses_markov_head: config.uses_markov_head(),

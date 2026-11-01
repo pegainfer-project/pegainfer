@@ -120,7 +120,8 @@ pub(crate) fn execute_plan(
             // Two executor calls per step: draft proposes K tokens per request,
             // then a single target forward verifies the K+1 span. Both index by
             // request_id; sorting keeps draft and verify results aligned.
-            let draft_requests = build_speculative_draft_items(active);
+            let sample_seed = rand::RngExt::random(rng);
+            let draft_requests = build_speculative_draft_items(active, sample_seed);
             let mut draft = executor.execute_speculative_draft(DraftPlan {
                 requests: &draft_requests,
             })?;
@@ -128,7 +129,7 @@ pub(crate) fn execute_plan(
             let verify_requests = build_speculative_verify_items(active, &draft.requests);
             let mut verify = executor.execute_speculative_verify(VerifyPlan {
                 requests: &verify_requests,
-                sample_seed: rand::RngExt::random(rng),
+                sample_seed,
                 gated: false,
             })?;
             verify.requests.sort_by_key(|result| result.request_id);
@@ -185,10 +186,9 @@ pub(crate) enum SpeculationDecision {
 
 /// All-or-nothing: speculate the whole active batch only when every request is
 /// draft-ready (no LoRA, no logprobs). A single non-ready request falls the
-/// batch back to plain decode rather than running a mixed step. Sampling
-/// params are NOT a gate: sampled-verify (#512) runs the regular sampler over
-/// the verify rows, so the full surface — temperature/top_k/top_p/min_p/seed —
-/// rides the speculative path.
+/// batch back to plain decode rather than running a mixed step. Once requests
+/// are draft-ready, sampling parameters add no gate here: token matching and
+/// DFlash2 proposal-aware verification preserve the target sampling policy.
 pub(crate) fn speculation_decision_at(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
@@ -218,10 +218,11 @@ pub(crate) fn speculation_decision_at(
     }
 }
 
-fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStepItem> {
+fn build_speculative_draft_items(active: &[ActiveRequestState], seed: u64) -> Vec<DraftStepItem> {
     active
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(row, r)| {
             // Only greedy requests may hedge; the draft lane turns the
             // remaining budget into eligibility against its effective branch
             // positions (a chain must survive the verify-side span clamp).
@@ -230,7 +231,17 @@ fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStep
             } else {
                 0
             };
-            DraftStepItem::new(r.request_id, r.last_token, budget)
+            let request_seed = r
+                .params
+                .seed
+                .unwrap_or_else(|| pegainfer_sample::mix_seed(seed, row as u64));
+            DraftStepItem::new(
+                r.request_id,
+                r.last_token,
+                budget,
+                r.params,
+                pegainfer_sample::mix_seed(request_seed, r.generated_count as u64),
+            )
         })
         .collect()
 }
@@ -378,7 +389,7 @@ mod tests {
         let fresh = active(0, 32);
         let mut sampled = active(0, 32);
         sampled.params.temperature = 0.7;
-        let items = build_speculative_draft_items(&[exhausted, fresh, sampled]);
+        let items = build_speculative_draft_items(&[exhausted, fresh, sampled], 0);
         assert_eq!(items[0].hedge_budget, 1);
         assert_eq!(items[1].hedge_budget, 32);
         assert_eq!(items[2].hedge_budget, 0);

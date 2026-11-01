@@ -157,6 +157,11 @@ impl SampleScratch {
     pub fn vocab(&self) -> usize {
         self.vocab
     }
+
+    /// Reuse the probability arena for speculative verification on this stream.
+    pub fn sampling_scratch(&mut self) -> &mut BatchSamplingScratch {
+        &mut self.sampling
+    }
 }
 
 /// Pick the next token for every row of a logits arena.
