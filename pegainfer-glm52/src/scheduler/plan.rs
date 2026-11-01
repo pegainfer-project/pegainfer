@@ -119,6 +119,7 @@ pub(super) fn plan_step_shape(wants: &[usize; GLM52_MAX_BATCH_PER_RANK]) -> Glm5
 /// content-addressed block for every later match. Without leases, the joined
 /// D2H is the last thing on the rank stream and admission truly is a quiet
 /// boundary. Costs ~0.7 ms/step, offload deployments only.
+#[allow(clippy::fn_params_excessive_bools)] // independent lease predicates, not a state machine
 pub(super) fn lease_flags(
     consume: bool,
     pending_empty: bool,
