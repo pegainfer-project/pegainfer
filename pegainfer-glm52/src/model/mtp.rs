@@ -97,56 +97,6 @@ pub(super) struct Glm52MtpProposalSeed<'a> {
     pub(super) rows_before: usize,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn proposal_scratch_backs_up_partial_committed_page() {
-        let (table, copy) = proposal_page_table(&[11, 37], 127, [100, 101]).unwrap();
-        assert_eq!(table, [11, 37, 101]);
-        assert_eq!(copy, Some(37));
-    }
-
-    #[test]
-    fn proposal_scratch_appends_after_aligned_committed_page() {
-        let (table, copy) = proposal_page_table(&[11, 37], 128, [100, 101]).unwrap();
-        assert_eq!(table, [11, 37, 100, 101]);
-        assert_eq!(copy, None);
-    }
-
-    #[test]
-    fn tp4_mtp_keeps_flashinfer_execution_separate_from_slab_wire_layout() {
-        // The TP4 proposal executes over a dense 576 B/token FlashInfer
-        // cache while the P/D wire rows commit into the slab's 656 B/token
-        // fp8_ds_mla mirror slices — two layouts, never interchangeable.
-        assert_eq!(Glm52MlaBackend::FlashInferFp8.cache_bytes_per_token(), 576);
-        assert_eq!(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, 656);
-    }
-
-    #[test]
-    fn tp4_mtp_arena_ledger_charges_the_dense_caches() {
-        let cap = 16_384;
-        let slots = crate::model::glm52_decode_slots();
-        let pool = glm52_pool_blocks(cap, slots);
-        let scratch_pages = MTP_SCRATCH_PAGES_PER_SLOT * slots;
-        // TP4 charges the dense FlashInfer execution cache (MLA + index-K
-        // co-allocation) for the whole committed+scratch range; EP charges
-        // only its scratch slab pages. Neither charges the layer-78 wire
-        // mirrors — they live inside the page content already charged by
-        // `glm52_arena_bytes`.
-        let dense = (pool + scratch_pages)
-            * (GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
-                + GLM52_KV_PAGE_IDXK_BYTES);
-        let ep_scratch = scratch_pages * GLM52_KV_PAGE_STRIDE;
-        let tp4 = crate::mtp::glm52_mtp_arena_bytes(cap, pool, crate::Glm52MoeTopo::Tp4)
-            .expect("TP4 arena bytes");
-        let ep4 = crate::mtp::glm52_mtp_arena_bytes(cap, pool, crate::Glm52MoeTopo::Ep4)
-            .expect("EP4 arena bytes");
-        assert_eq!(tp4 - ep4, dense - ep_scratch);
-    }
-}
-
 /// Private proposal scratch pages per decode slot: one page for the
 /// partial-committed-page backup, one for the draft span's overflow writes.
 pub(crate) const MTP_SCRATCH_PAGES_PER_SLOT: usize = 2;
@@ -548,7 +498,7 @@ impl Glm52NativeMtp {
         slab: &mut Glm52KvSlab,
         target_final_normed: &Rows<GLM52_HIDDEN>,
         round: &Glm52MtpRound,
-        seed: Option<Glm52MtpProposalSeed<'_>>,
+        seed: Option<&Glm52MtpProposalSeed<'_>>,
     ) -> Result<Vec<[u32; GLM52_MTP_DRAFTS]>> {
         let context_bucket = round.context_bucket;
         let appends = round.appends.as_slice();
@@ -641,7 +591,7 @@ impl Glm52NativeMtp {
                 .with_context(|| format!("GLM5.2 MTP proposal slot {slot} has no append"))?;
             last_rows.push(row);
         }
-        let context_tokens = match seed.as_ref() {
+        let context_tokens = match seed {
             Some(seed) => {
                 ensure!(
                     seed.draft1.len() == appends.len()
@@ -659,7 +609,7 @@ impl Glm52NativeMtp {
         let mut proposal_pages = Vec::with_capacity(proposal_slots.len());
         let mut partial_backups = Vec::with_capacity(proposal_slots.len());
         for (packed, (&slot, &context_row)) in proposal_slots.iter().zip(&last_rows).enumerate() {
-            let src_hidden = match seed.as_ref() {
+            let src_hidden = match seed {
                 Some(seed) => {
                     let row = seed.rows_before + packed;
                     seed.previous
@@ -844,7 +794,7 @@ impl Glm52NativeMtp {
         &mut self,
         ctx: &DeviceContext,
         aux: &DeviceContext,
-        mut ep: Option<&mut Glm52MoeEpState>,
+        ep: Option<&mut Glm52MoeEpState>,
         mut tp: Option<&mut Glm52MoeTpRank>,
         embed: &DeviceMatrix,
         lm_head: &DeviceMatrix,
@@ -988,9 +938,7 @@ impl Glm52NativeMtp {
             let mut tp_padded_mlp = false;
             match &self.layer.mlp {
                 Glm52LayerMlp::MoeEp8(moe) => {
-                    let ep = ep
-                        .as_deref_mut()
-                        .context("GLM5.2 EP MTP layer has no DeepEP runtime")?;
+                    let ep = ep.context("GLM5.2 EP MTP layer has no DeepEP runtime")?;
                     // Conservative protocol-max GEMM bound, same as the
                     // target step: MTP buckets are rank-local too.
                     glm52_moe_ep_layer(
@@ -1004,9 +952,7 @@ impl Glm52NativeMtp {
                     )?;
                 }
                 Glm52LayerMlp::MoeTp(router) => {
-                    let rank = tp
-                        .as_deref_mut()
-                        .context("GLM5.2 TP MTP layer has no TP runtime")?;
+                    let rank = tp.context("GLM5.2 TP MTP layer has no TP runtime")?;
                     let (state, _slot, bank) = rank
                         .layer_bank(GLM52_MTP_LAYER)
                         .context("GLM5.2 TP MTP layer has no layer-78 slice bank")?;
@@ -1083,5 +1029,55 @@ impl Glm52NativeMtp {
                 u32::try_from(index).context("GLM5.2 MTP argmax does not fit u32")
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposal_scratch_backs_up_partial_committed_page() {
+        let (table, copy) = proposal_page_table(&[11, 37], 127, [100, 101]).unwrap();
+        assert_eq!(table, [11, 37, 101]);
+        assert_eq!(copy, Some(37));
+    }
+
+    #[test]
+    fn proposal_scratch_appends_after_aligned_committed_page() {
+        let (table, copy) = proposal_page_table(&[11, 37], 128, [100, 101]).unwrap();
+        assert_eq!(table, [11, 37, 100, 101]);
+        assert_eq!(copy, None);
+    }
+
+    #[test]
+    fn tp4_mtp_keeps_flashinfer_execution_separate_from_slab_wire_layout() {
+        // The TP4 proposal executes over a dense 576 B/token FlashInfer
+        // cache while the P/D wire rows commit into the slab's 656 B/token
+        // fp8_ds_mla mirror slices — two layouts, never interchangeable.
+        assert_eq!(Glm52MlaBackend::FlashInferFp8.cache_bytes_per_token(), 576);
+        assert_eq!(GLM52_FLASHMLA_SPARSE_BYTES_PER_TOKEN, 656);
+    }
+
+    #[test]
+    fn tp4_mtp_arena_ledger_charges_the_dense_caches() {
+        let cap = 16_384;
+        let slots = crate::model::glm52_decode_slots();
+        let pool = glm52_pool_blocks(cap, slots);
+        let scratch_pages = MTP_SCRATCH_PAGES_PER_SLOT * slots;
+        // TP4 charges the dense FlashInfer execution cache (MLA + index-K
+        // co-allocation) for the whole committed+scratch range; EP charges
+        // only its scratch slab pages. Neither charges the layer-78 wire
+        // mirrors — they live inside the page content already charged by
+        // `glm52_arena_bytes`.
+        let dense = (pool + scratch_pages)
+            * (GLM52_FLASHMLA_SPARSE_PAGE_SIZE * GLM52_FLASHINFER_SPARSE_BYTES_PER_TOKEN
+                + GLM52_KV_PAGE_IDXK_BYTES);
+        let ep_scratch = scratch_pages * GLM52_KV_PAGE_STRIDE;
+        let tp4 = crate::mtp::glm52_mtp_arena_bytes(cap, pool, crate::Glm52MoeTopo::Tp4)
+            .expect("TP4 arena bytes");
+        let ep4 = crate::mtp::glm52_mtp_arena_bytes(cap, pool, crate::Glm52MoeTopo::Ep4)
+            .expect("EP4 arena bytes");
+        assert_eq!(tp4 - ep4, dense - ep_scratch);
     }
 }
