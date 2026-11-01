@@ -12,7 +12,7 @@ version = "0.1.0"
 # and default layouts are pinned in the P/D deployment docs; they register the
 # same block-local bytes PegaInfer restores, so no cross-layout conversion is
 # required.
-# Re-pin per the workflow in docs/subsystems/runtime/pegaflow-offload-integration.md
+# per the workflow in docs/subsystems/runtime/pegaflow-offload-integration.md
 # §5.2. default-features=false drops its `cuda-12` (which would pull a
 # clashing cudarc/cuda-12080 selector); the workspace cudarc already provides
 # cuda-12090 + nvrtc + runtime, which covers pegaflow-core and
