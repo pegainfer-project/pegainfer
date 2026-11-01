@@ -100,13 +100,32 @@ pub(crate) const GLM52_MAX_BATCH_PER_RANK: usize = 32;
 /// run 32 slots with `GLM52_MTP_DRAFTS=2` to stay inside the 96-row step.
 pub(crate) fn glm52_decode_slots() -> usize {
     static SLOTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SLOTS.get_or_init(|| {
-        std::env::var("GLM52_DECODE_SLOTS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| v.clamp(1, GLM52_MAX_BATCH_PER_RANK))
-            .unwrap_or(8)
-    })
+    *SLOTS.get_or_init(|| glm52_decode_slots_from_env().unwrap_or_else(|err| panic!("{err:#}")))
+}
+
+/// Strict read behind [`glm52_decode_slots`]; launch calls it so a bad value refuses to start.
+pub(crate) fn glm52_decode_slots_from_env() -> Result<usize> {
+    env_count("GLM52_DECODE_SLOTS", 1..=GLM52_MAX_BATCH_PER_RANK, 8)
+}
+
+/// A count knob: unset takes `default`, anything else must parse into `range`.
+pub(crate) fn env_count(
+    name: &str,
+    range: std::ops::RangeInclusive<usize>,
+    default: usize,
+) -> Result<usize> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let raw = raw.to_string_lossy();
+    match raw.trim().parse::<usize>() {
+        Ok(value) if range.contains(&value) => Ok(value),
+        _ => anyhow::bail!(
+            "{name}={raw:?} not recognized (N, {} <= N <= {})",
+            range.start(),
+            range.end()
+        ),
+    }
 }
 
 /// Cache geometry is carved in units of the 64-token FlashMLA page (== the
