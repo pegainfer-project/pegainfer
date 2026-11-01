@@ -705,14 +705,9 @@ const MIX_MAX_PROMPTS: usize = 4;
 /// records, not here.
 const MIX_GATHER_ROWS: usize = 512;
 
-/// The prompt rows a tensor-parallel mixed step may absorb — the
-/// `PEGAINFER_TP_MAX_PROMPT` default that went with the stall it guarded. The
-/// mixed step is the one TP path no gate covers (`serve::oracle::
-/// mixed_step_matches_serial` is single-rank), and the deleted ceiling was also
-/// what kept a gathered prompt's rows small here, so the bound stays for this
-/// step alone until a gate covers it: a prompt that does not fit beside the
-/// live batch is prefilled on its own instead, exactly as an over-ceiling
-/// prompt was before. At one rank the step is unbounded, as it always was.
+/// The prompt rows a tensor-parallel mixed step may absorb, kept small because no gate covers
+/// that step yet (`serve::oracle::mixed_step_matches_serial` is single-rank). A prompt that
+/// does not fit beside the live batch is prefilled on its own; one rank is unbounded.
 const TP_MIX_PROMPT_ROWS: usize = 64;
 
 fn parse_mix_max_prompts(raw: &str, slots: usize) -> Result<usize> {
@@ -1285,7 +1280,7 @@ struct EngineState {
 /// Rank 0's graphs are released here, on its own device, before the fields (and
 /// with them the communicator) drop: NCCL's abort waits for a graph that
 /// references the communicator to be destroyed. Only the single-rank path
-/// captures anything (`start_with_knobs` turns them off under TP, "Decode graphs
+/// captures anything (`load_with_knobs` turns them off under TP, "Decode graphs
 /// are off under TP"), so there is no peer arena holding a captured collective
 /// to release.
 impl Drop for EngineState {
@@ -1419,7 +1414,6 @@ impl EngineState {
                     // leave a handle pair's device memory behind.
                     let outcome = (|| -> Result<()> {
                         let _handles = bind_engine_thread(&state.ctx)?;
-                        activate_rank(&state.ctx)?;
                         extra(state, item)
                             .with_context(|| format!("tensor-parallel rank {rank} segment"))?;
                         state
@@ -1578,16 +1572,7 @@ impl EngineState {
 /// ends: the scheduler holds its guard for its lifetime, and each step's
 /// extra-rank thread holds one for the step's.
 fn bind_engine_thread(ctx: &DeviceContext) -> Result<CublasThreadGuard> {
-    let err = unsafe { pegainfer_core::ffi::cuda_set_device(ctx.device_ordinal as i32) };
-    anyhow::ensure!(
-        err == 0,
-        "cudaSetDevice({}) on the scheduler thread failed: cudaError={err}",
-        ctx.device_ordinal
-    );
-    ctx.ctx
-        .bind_to_thread()
-        .map_err(|e| anyhow::anyhow!("bind the CUDA context to the scheduler thread: {e}"))?;
-    unsafe { pegainfer_core::ffi::cublas_init() };
+    activate_rank(ctx)?;
     Ok(CublasThreadGuard)
 }
 
@@ -3175,7 +3160,6 @@ impl Scheduler for Gemma4Scheduler {
             // down on this thread. Each other rank's handles are created the
             // first time `activate_rank` reaches it.
             self.cublas = Some(bind_engine_thread(&self.state.ctx)?);
-            activate_rank(&self.state.ctx)?;
         }
         if self.walk.is_some() {
             return self.advance_walk(ledger);
