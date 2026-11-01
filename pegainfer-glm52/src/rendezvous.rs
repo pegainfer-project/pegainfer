@@ -68,8 +68,14 @@ fn generate(ep_size: usize) -> Result<[u8; 128]> {
 /// process-lifetime facility (restarted peers re-fetch after a fleet-wide
 /// failure), and process exit is the release mechanism.
 fn serve(addr: &str, ep_size: usize, id: [u8; 128]) -> Result<()> {
-    let listener = TcpListener::bind(addr)
-        .with_context(|| format!("GLM5.2 bootstrap rendezvous bind {addr}"))?;
+    // Bind every interface: /etc/hosts often maps the host's own name to 127.0.1.1,
+    // which would leave the listener on loopback while peers dial the real address.
+    let port = addr
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .with_context(|| format!("GLM5.2 bootstrap rendezvous address {addr} carries no port"))?;
+    let listener = TcpListener::bind(("0.0.0.0", port))
+        .with_context(|| format!("GLM5.2 bootstrap rendezvous bind 0.0.0.0:{port} ({addr})"))?;
     std::thread::Builder::new()
         .name("glm52-rendezvous".into())
         .spawn(move || {
