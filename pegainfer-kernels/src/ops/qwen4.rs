@@ -255,35 +255,22 @@ pub fn qsa_indexer_select_into(
     scores: &CudaSlice<f32>,
     score_cols: usize,
     rows: &CudaSlice<i32>,
-    budget: i32,
+    budget: usize,
     tokens: usize,
     mask: &mut CudaSlice<u8>,
 ) -> Result<()> {
     if rows.is_empty() || tokens == 0 {
         return Ok(());
     }
-    // Unsigned arithmetic: `i32::is_multiple_of` is not stable in the pinned
-    // toolchain, and the conversion already rejects a negative budget.
-    let budget_blocks = usize::try_from(budget)
-        .ok()
-        .filter(|blocks| blocks.is_multiple_of(COMPRESS_RATIO))
-        .map(|blocks| blocks / COMPRESS_RATIO);
     ensure!(
-        budget_blocks.is_some_and(|blocks| blocks > 0 && blocks <= MAX_KEPT_BLOCKS),
+        budget > 0
+            && budget.is_multiple_of(COMPRESS_RATIO)
+            && budget / COMPRESS_RATIO <= MAX_KEPT_BLOCKS,
         "QSA indexer budget {budget} must be a positive multiple of {COMPRESS_RATIO} \
          keeping at most {MAX_KEPT_BLOCKS} blocks"
     );
-    // The 64-bit cell counts come first: a product that does not fit would
-    // otherwise be compared as a plausible-looking row extent below.
-    let cells = rows
-        .len()
-        .checked_mul(tokens)
-        .ok_or_else(|| anyhow::anyhow!("QSA indexer mask {} x {tokens} overflows", rows.len()))?;
-    let score_cells = rows.len().checked_mul(score_cols).ok_or_else(|| {
-        anyhow::anyhow!("QSA indexer score {} x {score_cols} overflows", rows.len())
-    })?;
     ensure!(
-        scores.len() >= score_cells,
+        scores.len() >= rows.len().saturating_mul(score_cols),
         "QSA indexer score buffer {} f32 cannot hold {} rows of {score_cols}",
         scores.len(),
         rows.len()
@@ -295,15 +282,17 @@ pub fn qsa_indexer_select_into(
         tokens / COMPRESS_RATIO
     );
     ensure!(
-        mask.len() >= cells,
-        "QSA indexer mask holds {} bytes, needs {cells} for {} x {tokens}",
+        mask.len() >= rows.len().saturating_mul(tokens),
+        "QSA indexer mask holds {} bytes, needs {} for {} x {tokens}",
         mask.len(),
+        rows.len().saturating_mul(tokens),
         rows.len()
     );
     // The kernel takes extents as i32; checked before any pointer is formed.
     let query_rows = checked_i32(rows.len(), "QSA indexer query rows")?;
     let tokens = checked_i32(tokens, "QSA indexer tokens")?;
     let score_cols = checked_i32(score_cols, "QSA indexer score columns")?;
+    let budget = checked_i32(budget, "QSA indexer budget")?;
     let (scores_ptr, _scores_guard) = scores.device_ptr(&ctx.stream);
     let (rows_ptr, _rows_guard) = rows.device_ptr(&ctx.stream);
     let (mask_ptr, _mask_guard) = mask.device_ptr_mut(&ctx.stream);

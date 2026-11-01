@@ -57,7 +57,7 @@ The gate replays `test_data/qwen38fn-qsa-indexer-golden.safetensors` (PR #1150) 
 
 `csrc/qwen4/qwen4_qsa_indexer_select.cu` (`qsa_indexer_select_into`) turns the block scores into the token-level mask the sparse attention reads; the contract (tie rule, unconditional tail, trap, grid) is on the kernel header, and the wrapper doc carries the Rust-side buffer rules.
 
-The select is an exact 8-bit radix select over the row's f32 keys: one 256k-token row at budget 2048 takes 298 µs on an L20, against 85.9 ms for the masked-argmax version it replaced; the all-kept fast path takes 1.4 µs.
+The select is an exact 8-bit radix select over the row's f32 keys: one 256k-token row at budget 2048 takes 298 µs on an L20, and the all-kept fast path takes 1.4 µs.
 
 Two boundaries the code cannot state. A row's visible list starts at token 0 (the scoring pass's grid), so a prefix-evicted visible list is out of contract and needs a shifted key array on both stages. And an accuracy gate must not require mask equality with the reference at a tied cut: `torch.topk` leaves that pick open, so the reference's choice can differ from the kernel's canonical one and still be valid.
 

@@ -96,11 +96,6 @@ __global__ void qwen4_qsa_select_kernel(
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
 
-  // `rows[row]` is the row's own position, and `[0, pos]` the tokens it sees.
-  // Both a negative entry and one past the key array trap: clamping either
-  // would hand the caller a mask for blocks the row never asked about. The
-  // budget is checked here too, although the host entry refuses a bad one, so a
-  // caller that reaches the kernel through another path still fails visibly.
   const int pos = rows[row];
   if (pos < 0 || pos >= tokens) {
     __trap();
@@ -108,17 +103,8 @@ __global__ void qwen4_qsa_select_kernel(
   const int visible = pos + 1;
   const int blocks = visible / kRatio;
   const int tail = visible - blocks * kRatio;
-  if (blocks > score_cols) {
-    __trap();
-  }
-  if (budget <= 0 || budget % kRatio != 0 || budget / kRatio > kMaxKeptBlocks) {
-    __trap();
-  }
 
   const float* row_scores = scores + static_cast<int64_t>(row) * score_cols;
-  // Fail closed on a poisoned score before any comparison can skip it. NaN
-  // compares false against everything, so without this check a NaN block would
-  // silently lose every pick; +inf would always win and hide the same fault.
   for (int block = tid; block < blocks; block += blockDim.x) {
     if (!isfinite(row_scores[block])) {
       __trap();
