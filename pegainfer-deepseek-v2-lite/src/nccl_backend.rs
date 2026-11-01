@@ -1395,7 +1395,6 @@ impl RawNcclLib {
                 Ok(lib) => return Ok(lib),
                 Err(error) if !candidate.explicit => {
                     skipped.push(format!("{}: {error:#}", candidate.path));
-                    continue;
                 }
                 Err(error) => return Err(error),
             }
@@ -1684,8 +1683,7 @@ fn is_executable_python(path: &Path) -> bool {
     path.is_file()
         && path
             .metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
