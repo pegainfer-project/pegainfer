@@ -143,6 +143,9 @@ impl Qwen35Model {
         runtime: ModelRuntimeConfig,
         max_batch: usize,
     ) -> Result<Self> {
+        // Qwen3.5's logits gates ran on the batch-1 matvec; every other line
+        // keeps the cublas plan it was validated on.
+        pegainfer_kernels::ops::set_n1_matvec(true);
         anyhow::ensure!(
             (1..=super::batch_decode_graph::MAX_BATCH).contains(&max_batch),
             "decode batch capacity must be in 1..={}, got {max_batch}",

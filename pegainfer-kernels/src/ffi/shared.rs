@@ -334,9 +334,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    /// One warp per output row: `y[rows] = W[rows, cols] * x[cols]`, bf16 in and
-    /// out with fp32 accumulation. `cols` must be a multiple of 8 and both
-    /// pointers 16-byte aligned; the caller owns those checks.
+    /// `y[rows] = W[rows, cols] * x[cols]`, bf16 in and out with fp32 accumulation.
     pub fn gemv_bf16_cuda(
         w: *const Half,
         x: *const Half,
