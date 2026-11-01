@@ -20,8 +20,8 @@
 //!   so the coordination state may exist only around one whale and cost one
 //!   host round-trip; there is no standing cross-process protocol.
 //!
-//! The rendezvous is a two-phase broadcast over a host side-channel (the
-//! fleet's bootstrap TCP link, kept alive), sequenced by one rank so that
+//! The rendezvous is a two-phase broadcast over a host side-channel (a TCP
+//! hub at the `PEGAINFER_K3_WHALE` address), sequenced by one rank so that
 //! concurrent whales get one global order:
 //!
 //! 1. **Gather.** The poster sends the prompt to the sequencer, which picks
