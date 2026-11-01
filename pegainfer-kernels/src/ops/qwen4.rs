@@ -42,8 +42,15 @@ const SCORE_WARPS: usize = 4;
 
 /// Target resident CTAs per SM for the score pass.
 const SCORE_CTAS_PER_SM: usize = 4;
+/// At this many rows the unsplit grid already exceeds the SM count of the
+/// supported parts, so splitting only helps small decode batches and would
+/// charge large prefill an unnecessary device query.
+const SCORE_UNSPLIT_ROWS: usize = 256;
 
 fn qsa_score_splits(ctx: &DeviceContext, query_rows: usize, blocks: usize) -> Result<usize> {
+    if query_rows >= SCORE_UNSPLIT_ROWS {
+        return Ok(1);
+    }
     let max_splits = blocks.div_ceil(SCORE_WARPS).max(1);
     let sms = usize::try_from(
         ctx.ctx
