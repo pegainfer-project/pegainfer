@@ -14,8 +14,13 @@
 
 use std::io::Read as _;
 use std::io::Write as _;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::net::ToSocketAddrs as _;
 use std::ops::Range;
 use std::time::Duration;
 use std::time::Instant;
@@ -68,14 +73,23 @@ fn generate(ep_size: usize) -> Result<[u8; 128]> {
 /// process-lifetime facility (restarted peers re-fetch after a fleet-wide
 /// failure), and process exit is the release mechanism.
 fn serve(addr: &str, ep_size: usize, id: [u8; 128]) -> Result<()> {
-    // Bind every interface: /etc/hosts often maps the host's own name to 127.0.1.1,
-    // which would leave the listener on loopback while peers dial the real address.
-    let port = addr
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok())
-        .with_context(|| format!("GLM5.2 bootstrap rendezvous address {addr} carries no port"))?;
-    let listener = TcpListener::bind(("0.0.0.0", port))
-        .with_context(|| format!("GLM5.2 bootstrap rendezvous bind 0.0.0.0:{port} ({addr})"))?;
+    // Bind every interface of the address's family: /etc/hosts often maps the host's own name to
+    // 127.0.1.1, which would leave the listener on loopback while peers dial the real address.
+    let resolved = addr
+        .to_socket_addrs()
+        .with_context(|| format!("GLM5.2 bootstrap rendezvous address {addr}"))?
+        .next()
+        .with_context(|| {
+            format!("GLM5.2 bootstrap rendezvous address {addr} resolves to nothing")
+        })?;
+    let any: IpAddr = if resolved.is_ipv4() {
+        Ipv4Addr::UNSPECIFIED.into()
+    } else {
+        Ipv6Addr::UNSPECIFIED.into()
+    };
+    let wildcard = SocketAddr::new(any, resolved.port());
+    let listener = TcpListener::bind(wildcard)
+        .with_context(|| format!("GLM5.2 bootstrap rendezvous bind {wildcard} ({addr})"))?;
     std::thread::Builder::new()
         .name("glm52-rendezvous".into())
         .spawn(move || {
