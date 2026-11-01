@@ -215,6 +215,7 @@ pub use linear::numeric_policy;
 pub use linear::per_token_served;
 pub use linear::pin_served;
 pub use linear::reset_numeric_policy_counters;
+pub use linear::set_n1_matvec;
 pub use linear::set_numeric_policy;
 pub use lora::LoraDecodeGroupedProjection;
 pub use lora::lora_decode_fused_delta_group3_into;
