@@ -38,8 +38,8 @@ deepseek-v2-lite = []
 # and the TileLang-generated hd512 global-attention prefill.
 gemma4 = []
 qwen35 = []
-# Qwen4 line (Qwen3.8-Flash-Next): the QSA token-indexer block-scoring kernels
-# and the grouped (1+weight) RMSNorm.
+# Qwen4 line (Qwen3.8-Flash-Next): the QSA token-indexer block-scoring and
+# block-selection kernels and the grouped (1+weight) RMSNorm.
 qwen4 = []
 # Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
 glm52 = ["moe"]

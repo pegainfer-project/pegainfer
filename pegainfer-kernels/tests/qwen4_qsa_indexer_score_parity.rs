@@ -8,7 +8,8 @@
 //! scores, so this gate replays those inputs through the kernel and compares.
 //! Cases cover the tail (5), a block-aligned short input (8), a medium one
 //! (64), the truncation branch under a shrunk budget (14, 16, 20) and the real
-//! budget boundary at 2049..2054 visible tokens.
+//! budget boundary at 2049..2054 visible tokens. The `select` module replays
+//! the same fixture's recorded block scores through the selection kernel.
 //!
 //! Provenance is asserted, not assumed: the fixture records the reference
 //! version and the sha256 of the frozen config it was dumped from. The gate
@@ -750,4 +751,486 @@ fn a_poisoned_key_keeps_its_nan_score() {
     }
     assert!(saw_nan > 0, "no row saw the poisoned block");
     println!("poisoned key: block 0 is NaN on {saw_nan} rows, later blocks finite");
+}
+
+mod select {
+    //! `test_data/qwen38fn-qsa-indexer-golden.safetensors` (with the scoring gate's
+    //! fixture) stores, per case, the reference's per-row block scores and the final
+    //! `[rows, tokens]` visibility mask. This gate replays those recorded scores
+    //! through the selection kernel and compares the mask. Selection is
+    //! comparison-only — no arithmetic touches a score — so there is no tolerance
+    //! here: on a row whose cut is strict the mask must match **bitwise**, and the
+    //! only rows held to less are the ones where `torch.topk` left a block tied at
+    //! the cut (see below).
+    //!
+    //! Ties: for each row the gate computes the cut score; if no other block shares
+    //! it the row is compared bitwise, and otherwise both masks are required to be
+    //! structurally valid (a causal prefix, only complete four-token blocks plus the
+    //! exact tail, exactly `min(budget / 4, blocks) * 4 + tail` bits set), to
+    //! select only scores at least as high as every block they exclude, and to keep
+    //! the same number of tied-at-cut blocks. **Ungated boundary:** every tie here
+    //! is at zero; the fixture has no row tied at a non-zero cut, so that case is
+    //! not gated.
+
+    // Exact float comparison is the point: a tied cut is defined by score-equal
+    // blocks, so a margin here would erase the distinction the gate exists for.
+    #![allow(clippy::float_cmp)]
+
+    use std::cmp::Ordering;
+
+    use pegainfer_kernels::ops::qsa_indexer_select_into;
+    use pegainfer_kernels::tensor::DeviceContext;
+
+    use super::*;
+
+    /// The four tokens per micro-block the kernel compiles in. The config's
+    /// `indexer_compress_ratio` must equal it; a drift is caught in `load_case`
+    /// rather than silently selecting blocks of another width.
+    const RATIO: usize = 4;
+    /// Written over the mask buffer before every launch, to prove the kernel writes
+    /// every cell of every row.
+    const SENTINEL: u8 = 0xAA;
+
+    /// The reference's mask is `torch.bool`, one byte per cell.
+    fn mask_tensor(fixture: &SafeTensors<'_>, name: &str) -> (Vec<usize>, Vec<u8>) {
+        let view = fixture
+            .tensor(name)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(view.dtype(), safetensors::Dtype::BOOL, "{name} dtype");
+        (view.shape().to_vec(), view.data().to_vec())
+    }
+
+    fn budget_tensor(fixture: &SafeTensors<'_>, name: &str) -> i32 {
+        let (shape, host) = i32_tensor(fixture, name);
+        assert_eq!(shape, vec![1], "{name} shape");
+        host[0]
+    }
+
+    /// One case's recorded scores, rows, budget and the reference's mask.
+    struct Case {
+        index: usize,
+        tokens: usize,
+        budget: i32,
+        rows: Vec<i32>,
+        score_cols: usize,
+        /// `[rows, score_cols]`, the NaN padding included.
+        scores: Vec<f32>,
+        /// `[rows, tokens]`, one byte per cell.
+        golden: Vec<u8>,
+    }
+
+    fn load_case(fixture: &SafeTensors<'_>, index: usize, scenario: &Scenario) -> Case {
+        let (rows_shape, rows) = i32_tensor(fixture, &format!("case{index}_rows"));
+        let (score_shape, scores) = f32_tensor(fixture, &format!("case{index}_scores"));
+        let (mask_shape, golden) = mask_tensor(fixture, &format!("case{index}_mask"));
+        let budget = budget_tensor(fixture, &format!("case{index}_budget"));
+
+        assert_eq!(rows_shape, vec![rows.len()], "case {index} rows shape");
+        assert_eq!(score_shape.len(), 2, "case {index} score rank");
+        assert_eq!(mask_shape.len(), 2, "case {index} mask rank");
+        assert_eq!(score_shape[0], rows.len(), "case {index} score rows");
+        assert_eq!(mask_shape[0], rows.len(), "case {index} mask rows");
+        let tokens = mask_shape[1];
+        assert_eq!(golden.len(), rows.len() * tokens, "case {index} mask cells");
+        assert!(tokens >= 1, "case {index} has no tokens");
+        let score_cols = score_shape[1];
+
+        // The config's ratio and the compiled one must agree before any shape is
+        // read through them: the mask's block structure is the reference's, and the
+        // kernel selects blocks of exactly RATIO tokens.
+        assert_eq!(
+            scenario.ratio, RATIO,
+            "config indexer_compress_ratio {} is not the compiled {RATIO}",
+            scenario.ratio
+        );
+        assert!(
+            budget > 0 && (budget as usize).is_multiple_of(scenario.ratio),
+            "case {index} budget {budget} is not a positive multiple of the ratio"
+        );
+        let budget_blocks = budget as usize / scenario.ratio;
+        assert!(
+            budget_blocks <= scenario.max_budget_blocks,
+            "case {index} budget keeps {budget_blocks} blocks, past the {} the config ceiling allows",
+            scenario.max_budget_blocks
+        );
+        // One row can see at most `tokens / ratio` blocks; the score row must hold
+        // them, and every cell past the row's own prefix is the reference's NaN.
+        let block_ceiling = tokens / scenario.ratio;
+        assert!(
+            score_cols >= block_ceiling,
+            "case {index}: {score_cols} score columns cannot hold {block_ceiling} blocks"
+        );
+        for (slot, row) in rows.iter().enumerate() {
+            assert!(
+                *row >= 0 && (*row as usize) < tokens,
+                "case {index} row {row} is outside the {tokens} tokens"
+            );
+            let blocks = (*row as usize + 1) / scenario.ratio;
+            let row_scores = &scores[slot * score_cols..][..score_cols];
+            for (block, score) in row_scores.iter().take(blocks).enumerate() {
+                assert!(
+                    score.is_finite(),
+                    "case {index} row {row} block {block} is not finite: {score}"
+                );
+            }
+            for (block, score) in row_scores.iter().enumerate().skip(blocks) {
+                assert!(
+                    score.is_nan(),
+                    "case {index} row {row} column {block} is not the reference's padding"
+                );
+            }
+        }
+        Case {
+            index,
+            tokens,
+            budget,
+            rows,
+            score_cols,
+            scores,
+            golden,
+        }
+    }
+
+    /// What the frozen config says about this gate's geometry.
+    struct Scenario {
+        ratio: usize,
+        /// The config's own budget, in blocks; the fixture must exercise it.
+        default_budget: i32,
+        /// The compiled budget ceiling in blocks.
+        max_budget_blocks: usize,
+    }
+
+    impl Scenario {
+        fn from_config(config: &serde_json::Value) -> Scenario {
+            let text = &config["text_config"];
+            let ratio = text["indexer_compress_ratio"]
+                .as_u64()
+                .expect("indexer_compress_ratio") as usize;
+            let default_budget = text["indexer_budget"].as_u64().expect("indexer_budget") as i32;
+            // The selection kernel refuses a budget past 512 blocks; the config's
+            // own budget must stay inside that.
+            let max_budget_blocks = 512;
+            assert!(ratio > 0, "indexer_compress_ratio");
+            assert!(default_budget > 0, "indexer_budget");
+            assert!(default_budget as usize / ratio <= max_budget_blocks);
+            Scenario {
+                ratio,
+                default_budget,
+                max_budget_blocks,
+            }
+        }
+
+        fn blocks_of(&self, budget: i32) -> usize {
+            budget as usize / self.ratio
+        }
+    }
+
+    impl Case {
+        fn row_scores(&self, slot: usize) -> &[f32] {
+            &self.scores[slot * self.score_cols..][..self.score_cols]
+        }
+
+        fn blocks(&self, slot: usize) -> usize {
+            (self.rows[slot] as usize + 1) / RATIO
+        }
+
+        fn tail(&self, slot: usize) -> usize {
+            (self.rows[slot] as usize + 1) % RATIO
+        }
+
+        fn keep(&self, slot: usize, budget_blocks: usize) -> usize {
+            budget_blocks.min(self.blocks(slot))
+        }
+
+        fn golden_row(&self, slot: usize) -> &[u8] {
+            &self.golden[slot * self.tokens..][..self.tokens]
+        }
+    }
+
+    /// The canonical order over a score row: descending score, ascending block
+    /// index, the kernel's tie rule.
+    fn canonical_order(scores: &[f32]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..scores.len()).collect();
+        order.sort_by(|&a, &b| {
+            let by_score = if scores[a] == scores[b] {
+                Ordering::Equal
+            } else {
+                scores[b].partial_cmp(&scores[a]).expect("finite scores")
+            };
+            by_score.then(a.cmp(&b))
+        });
+        order
+    }
+
+    /// A host-built mask for one row: the tokens of `selected` blocks plus the
+    /// first `tail_bits` tokens of the row's incomplete block, which starts at
+    /// `blocks * RATIO`.
+    fn host_mask(tokens: usize, blocks: usize, selected: &[usize], tail_bits: usize) -> Vec<u8> {
+        assert!(blocks * RATIO + tail_bits <= tokens, "row mask bounds");
+        let mut mask = vec![0u8; tokens];
+        for &block in selected {
+            mask[block * RATIO..][..RATIO].fill(1);
+        }
+        mask[blocks * RATIO..][..tail_bits].fill(1);
+        mask
+    }
+
+    fn differing(a: &[u8], b: &[u8]) -> Vec<usize> {
+        assert_eq!(a.len(), b.len(), "compared rows differ in length");
+        (0..a.len()).filter(|&i| a[i] != b[i]).collect()
+    }
+
+    fn assert_same_row(label: &str, got: &[u8], want: &[u8]) {
+        if let Some(at) = differing(got, want).first() {
+            panic!(
+                "{label}: first difference at token {at}: got {}, want {}. \
+                 Full difference: {:?}",
+                got[*at],
+                want[*at],
+                differing(got, want)
+            );
+        }
+    }
+
+    /// The structure every valid row mask has, returning its selected blocks: only
+    /// `0` or `1`, complete four-token blocks below the row's own token, nothing
+    /// past it, the exact tail set, and exactly `selected * 4 + tail` bits.
+    fn structure(
+        label: &str,
+        row_mask: &[u8],
+        blocks: usize,
+        tail: usize,
+        pos: usize,
+    ) -> Vec<usize> {
+        assert!(
+            row_mask.iter().all(|cell| *cell <= 1),
+            "{label}: the mask holds a cell other than 0 or 1"
+        );
+        let mut selected = Vec::new();
+        for block in 0..blocks {
+            let bits = &row_mask[block * RATIO..][..RATIO];
+            if bits.iter().all(|cell| *cell == 1) {
+                selected.push(block);
+            } else {
+                assert!(
+                    bits.iter().all(|cell| *cell == 0),
+                    "{label}: block {block} is only partly set: {bits:?}"
+                );
+            }
+        }
+        for (i, cell) in row_mask[blocks * RATIO..=pos].iter().enumerate() {
+            assert_eq!(
+                *cell, 1,
+                "{label}: tail token {i} of {tail} must be visible"
+            );
+        }
+        for (i, cell) in row_mask[pos + 1..].iter().enumerate() {
+            assert_eq!(
+                *cell,
+                0,
+                "{label}: token {} is past the row's own position and must not be visible",
+                pos + 1 + i
+            );
+        }
+        let set: usize = row_mask.iter().map(|cell| *cell as usize).sum();
+        assert_eq!(
+            set,
+            selected.len() * RATIO + tail,
+            "{label}: {set} set bits is not the selected blocks' tokens plus the tail"
+        );
+        selected
+    }
+
+    /// Runs one case's mask through the production launch and returns the
+    /// downloaded cells.
+    fn run_case(ctx: &DeviceContext, case: &Case) -> Vec<u8> {
+        let scores = ctx.stream.clone_htod(&case.scores).expect("score upload");
+        let rows = ctx.stream.clone_htod(&case.rows).expect("rows upload");
+        let mut mask = ctx
+            .stream
+            .clone_htod(&vec![SENTINEL; case.rows.len() * case.tokens])
+            .expect("mask buffer");
+        qsa_indexer_select_into(
+            ctx,
+            &scores,
+            case.score_cols,
+            &rows,
+            case.budget as usize,
+            case.tokens,
+            &mut mask,
+        )
+        .unwrap_or_else(|e| panic!("case {}: launch: {e:#}", case.index));
+        ctx.sync().expect("sync");
+        let host = ctx.stream.clone_dtoh(&mask).expect("mask download");
+        assert!(
+            host.iter().all(|cell| *cell <= 1),
+            "case {}: left a cell unwritten or wrote past 1",
+            case.index
+        );
+        host
+    }
+
+    /// One case's measured comparison.
+    #[derive(Default)]
+    struct CaseReport {
+        rows: usize,
+        bitwise: usize,
+        tie: usize,
+        truncating: usize,
+        /// Rows that keep every block and take the all-kept fast path.
+        all_kept: usize,
+    }
+
+    fn check_case(ctx: &DeviceContext, case: &Case, scenario: &Scenario) -> CaseReport {
+        let budget_blocks = scenario.blocks_of(case.budget);
+        let rows = case.rows.len();
+        let tokens = case.tokens;
+
+        let production = run_case(ctx, case);
+
+        let mut report = CaseReport {
+            rows,
+            ..CaseReport::default()
+        };
+        for slot in 0..rows {
+            let row = case.rows[slot];
+            let pos = row as usize;
+            let blocks = case.blocks(slot);
+            let tail = case.tail(slot);
+            let keep = case.keep(slot, budget_blocks);
+            let scores = &case.row_scores(slot)[..blocks];
+            let canonical = canonical_order(scores);
+            let label = format!("case {} row {row}", case.index);
+
+            // The kernel and the host's canonical order must agree on every row.
+            // On a tie row this still pins the kernel (same total order), while the
+            // golden is held to validity instead of to its open pick.
+            let ours = &production[slot * tokens..][..tokens];
+            assert_same_row(
+                &label,
+                ours,
+                &host_mask(tokens, blocks, &canonical[..keep], tail),
+            );
+
+            let golden = case.golden_row(slot);
+            let cut = if blocks > keep {
+                let mut ranked = scores.to_vec();
+                ranked.sort_by(|a, b| b.partial_cmp(a).expect("finite scores"));
+                Some(ranked[keep - 1])
+            } else {
+                None
+            };
+            let tie = cut.is_some_and(|cut| {
+                let at_cut = scores.iter().filter(|score| **score == cut).count();
+                let kept_at_cut = keep - scores.iter().filter(|score| **score > cut).count();
+                at_cut > kept_at_cut
+            });
+            if tie {
+                report.tie += 1;
+                let cut = cut.expect("a tie needs a cut");
+                let at_cut = scores.iter().filter(|score| **score == cut).count();
+                println!(
+                    "{label}: tie at cut {cut}, {at_cut} blocks tied, {keep} kept; \
+                     compared up to the tie"
+                );
+                let ours_selected = structure(&format!("{label} (ours)"), ours, blocks, tail, pos);
+                let golden_selected =
+                    structure(&format!("{label} (golden)"), golden, blocks, tail, pos);
+                assert_eq!(ours_selected.len(), keep, "{label}: kept blocks");
+                assert_eq!(golden_selected.len(), keep, "{label}: golden kept blocks");
+                // Every kept score at least every excluded one, on both masks.
+                for (name, selected) in [("ours", &ours_selected), ("golden", &golden_selected)] {
+                    let lowest = selected
+                        .iter()
+                        .map(|&block| scores[block])
+                        .fold(f32::INFINITY, f32::min);
+                    let highest_excluded = (0..blocks)
+                        .filter(|block| !selected.contains(block))
+                        .map(|block| scores[block])
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    assert!(
+                        lowest >= highest_excluded,
+                        "{label}: {name} keeps a block scoring {lowest} below the excluded \
+                         {highest_excluded}"
+                    );
+                }
+                let ours_at_cut = ours_selected
+                    .iter()
+                    .filter(|&&block| scores[block] == cut)
+                    .count();
+                let golden_at_cut = golden_selected
+                    .iter()
+                    .filter(|&&block| scores[block] == cut)
+                    .count();
+                assert_eq!(
+                    ours_at_cut, golden_at_cut,
+                    "{label}: tied-at-cut picks ({cut}) differ between the kernel and the reference"
+                );
+            } else {
+                report.bitwise += 1;
+                assert_same_row(&label, ours, golden);
+            }
+            if blocks > keep {
+                report.truncating += 1;
+            } else {
+                report.all_kept += 1;
+            }
+        }
+        report
+    }
+
+    #[test]
+    fn qsa_indexer_select_matches_the_reference() {
+        let Some(ctx) = common::device_or_skip() else {
+            return;
+        };
+        let bytes = std::fs::read(fixture_path()).expect("read fixture");
+        let config = assert_provenance(&bytes);
+        let fixture = SafeTensors::deserialize(&bytes).expect("parse fixture");
+        let scenario = Scenario::from_config(&config);
+
+        let mut total = CaseReport::default();
+        let mut budgets = Vec::new();
+        for index in 0..CASES {
+            let case = load_case(&fixture, index, &scenario);
+            let report = check_case(&ctx, &case, &scenario);
+            budgets.push(case.budget);
+            println!(
+                "case {index}: {} rows, {} bitwise, {} tie, {} truncating, {} all-kept; \
+                 tokens {}, budget {} ({} blocks)",
+                report.rows,
+                report.bitwise,
+                report.tie,
+                report.truncating,
+                report.all_kept,
+                case.tokens,
+                case.budget,
+                scenario.blocks_of(case.budget),
+            );
+            total.rows += report.rows;
+            total.bitwise += report.bitwise;
+            total.tie += report.tie;
+            total.truncating += report.truncating;
+            total.all_kept += report.all_kept;
+        }
+        println!(
+            "selection parity over {CASES} cases: {} rows, {} bitwise, {} up to ties, \
+             {} truncating, {} all-kept",
+            total.rows, total.bitwise, total.tie, total.truncating, total.all_kept,
+        );
+
+        assert!(
+            budgets.contains(&scenario.default_budget),
+            "the config's own budget {} is not exercised",
+            scenario.default_budget
+        );
+        assert!(
+            total.truncating > 0,
+            "the fixture must exercise the truncating path"
+        );
+        assert!(
+            total.all_kept > 0,
+            "the fixture must exercise the all-kept fast path"
+        );
+    }
 }

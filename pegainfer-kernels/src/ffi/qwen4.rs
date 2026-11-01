@@ -43,4 +43,24 @@ unsafe extern "C" {
         eps: f32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Select the kept micro-blocks of every query row plus its incomplete
+    /// tail, and write the row's token visibility mask (one byte per cell,
+    /// `0` or `1`).
+    ///
+    /// `rows[j]` is the row's position, `scores` its `score_cols`-wide f32
+    /// block-score row and `mask` its `tokens`-wide byte row. `budget` is the
+    /// token budget. The compiled geometry is four tokens per block and one
+    /// byte per mask cell; a caller whose buffers are laid out differently
+    /// cannot be detected here.
+    pub fn qwen4_qsa_indexer_select_cuda(
+        scores: *const f32,
+        rows: *const i32,
+        mask: *mut u8,
+        query_rows: i32,
+        tokens: i32,
+        score_cols: i32,
+        budget: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }

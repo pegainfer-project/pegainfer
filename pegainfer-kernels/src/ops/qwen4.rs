@@ -1,13 +1,15 @@
 //! Qwen3.8-Flash-Next (Qwen4 line) kernels.
 //!
-//! QSA token-indexer block scoring turns the fused `index_qk_proj` output into
-//! one score per (query row, visible micro-block); selection — top-k plus the
-//! unconditional tail — is a later stage, deliberately not here. Frozen
-//! semantics live in `csrc/qwen4/qwen4_qsa_indexer_score.cu` (transformers
-//! 5.16.1 `qwen4_exp` `Qwen4ExpTextQSAIndexer.forward`); the kernel is compiled
-//! for one geometry and this wrapper sizes its buffers from it. The checkpoint's
-//! own indexer fields are checked where the model crate reads its config, once
-//! that caller lands — this stage takes only `rms_eps` from the caller.
+//! [`qsa_indexer_block_scores_into`] turns the fused `index_qk_proj` output
+//! into one score per (query row, visible micro-block);
+//! [`qsa_indexer_select_into`] turns those scores into the row's token-level
+//! visibility mask (top-k plus the unconditional tail). Frozen semantics live
+//! in `csrc/qwen4/qwen4_qsa_indexer_score.cu` and
+//! `csrc/qwen4/qwen4_qsa_indexer_select.cu` (transformers 5.16.1 `qwen4_exp`
+//! `Qwen4ExpTextQSAIndexer.forward`); the kernels are compiled for one geometry
+//! and these wrappers size their buffers from it. The checkpoint's own indexer
+//! fields are checked where the model crate reads its config, once that caller
+//! lands — the score stage takes only `rms_eps` from the caller.
 //!
 //! The grouped `(1+weight)` RMSNorm serves the hyper-connection and PLE streams
 //! (`csrc/qwen4/qwen4_grouped_rmsnorm.cu`); its contract is on the wrapper.
@@ -232,4 +234,82 @@ pub fn rms_norm_grouped_offset_batch_into(
     };
     result.result()?;
     Ok(())
+}
+
+/// The budget's block ceiling: the checkpoint's 2048-token budget at four
+/// tokens per block.
+const MAX_KEPT_BLOCKS: usize = 512;
+
+/// Turn one score per (query row, complete block) into the row's token-level
+/// visibility mask (semantics: `csrc/qwen4/qwen4_qsa_indexer_select.cu`).
+///
+/// `scores` is `[rows.len(), score_cols]` f32 with row stride `score_cols`; the
+/// buffer may hold spare capacity (`scores.len() >= rows.len() * score_cols`).
+/// Only `(rows[j] + 1) / 4` entries of row `j` are read. `mask` is one byte per
+/// (row, token), row stride `tokens`. `budget` is the token budget, a positive
+/// multiple of four keeping at most 512 blocks, and the score row must hold
+/// `tokens / 4` blocks.
+///
+/// An empty launch (`rows.is_empty()` or `tokens == 0`) is a no-op. A malformed
+/// budget and a short buffer are refused before any pointer is formed.
+pub fn qsa_indexer_select_into(
+    ctx: &DeviceContext,
+    scores: &CudaSlice<f32>,
+    score_cols: usize,
+    rows: &CudaSlice<i32>,
+    budget: usize,
+    tokens: usize,
+    mask: &mut CudaSlice<u8>,
+) -> Result<()> {
+    if rows.is_empty() || tokens == 0 {
+        return Ok(());
+    }
+    ensure!(
+        budget > 0
+            && budget.is_multiple_of(COMPRESS_RATIO)
+            && budget / COMPRESS_RATIO <= MAX_KEPT_BLOCKS,
+        "QSA indexer budget {budget} must be a positive multiple of {COMPRESS_RATIO} \
+         keeping at most {MAX_KEPT_BLOCKS} blocks"
+    );
+    ensure!(
+        scores.len() >= rows.len().saturating_mul(score_cols),
+        "QSA indexer score buffer {} f32 cannot hold {} rows of {score_cols}",
+        scores.len(),
+        rows.len()
+    );
+    ensure!(
+        score_cols >= tokens / COMPRESS_RATIO,
+        "QSA indexer score row holds {score_cols} blocks, but a mask over \
+         {tokens} tokens needs {}",
+        tokens / COMPRESS_RATIO
+    );
+    ensure!(
+        mask.len() >= rows.len().saturating_mul(tokens),
+        "QSA indexer mask holds {} bytes, needs {} for {} x {tokens}",
+        mask.len(),
+        rows.len().saturating_mul(tokens),
+        rows.len()
+    );
+    // The kernel takes extents as i32; checked before any pointer is formed.
+    let query_rows = checked_i32(rows.len(), "QSA indexer query rows")?;
+    let tokens = checked_i32(tokens, "QSA indexer tokens")?;
+    let score_cols = checked_i32(score_cols, "QSA indexer score columns")?;
+    let budget = checked_i32(budget, "QSA indexer budget")?;
+    let (scores_ptr, _scores_guard) = scores.device_ptr(&ctx.stream);
+    let (rows_ptr, _rows_guard) = rows.device_ptr(&ctx.stream);
+    let (mask_ptr, _mask_guard) = mask.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_qsa_indexer_select_cuda(
+            scores_ptr as *const f32,
+            rows_ptr as *const i32,
+            mask_ptr as *mut u8,
+            query_rows,
+            tokens,
+            score_cols,
+            budget,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow::anyhow!("QSA indexer select launch failed: {err}"))
 }
