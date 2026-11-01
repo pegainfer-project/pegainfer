@@ -25,41 +25,34 @@ using DType = __nv_bfloat16;
 
 namespace {
 
+// Every supported group fills one thread round of aligned vectors. Keeping that
+// vector live across the reduction avoids a second global read for write-back.
 template <uint32_t VEC_SIZE, typename T>
 __global__ void GroupedRMSNormKernel(const T* __restrict__ input,
-                                     const T* __restrict__ weight,
-                                     T* __restrict__ out,
-                                     const uint32_t group_size,
-                                     const uint32_t groups,
-                                     float eps) {
-    // Flat row index over the `seq_len * groups` contiguous `group_size`-wide
-    // rows: the group runs fastest, matching `unflatten(-1, (groups, g))`.
+                                                const T* __restrict__ weight,
+                                                T* __restrict__ out,
+                                                const uint32_t group_size,
+                                                const uint32_t groups,
+                                                float eps) {
     const uint32_t bx = blockIdx.x;
     const uint32_t tx = threadIdx.x, ty = threadIdx.y;
     constexpr uint32_t warp_size = 32;
     const uint32_t num_warps = blockDim.y;
     const uint32_t thread_id = tx + ty * warp_size;
-    const uint32_t num_threads = num_warps * warp_size;
-    const uint32_t rounds = flashinfer::ceil_div(group_size, VEC_SIZE * num_threads);
     extern __shared__ float group_smem[];
 
     const T* row_in = input + static_cast<size_t>(bx) * group_size;
     T* row_out = out + static_cast<size_t>(bx) * group_size;
-    // The one difference from `RMSNormKernel`: the weight slice follows the row.
     const T* row_weight = weight + static_cast<size_t>(bx % groups) * group_size;
+    const uint32_t elem = thread_id * VEC_SIZE;
+
+    flashinfer::vec_t<T, VEC_SIZE> input_vec;
+    input_vec.load(row_in + elem);
 
     float sum_sq = 0.f;
-
-    for (uint32_t i = 0; i < rounds; i++) {
-        flashinfer::vec_t<T, VEC_SIZE> input_vec;
-        input_vec.fill(0.f);
-        if ((i * num_threads + thread_id) * VEC_SIZE < group_size) {
-            input_vec.load(row_in + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-        }
 #pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE; j++) {
-            sum_sq += float(input_vec[j]) * float(input_vec[j]);
-        }
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+        sum_sq += float(input_vec[j]) * float(input_vec[j]);
     }
 
 #pragma unroll
@@ -79,31 +72,16 @@ __global__ void GroupedRMSNormKernel(const T* __restrict__ input,
     }
     __syncthreads();
 
-    // One eps for every group: the reference holds a single `eps` on the module
-    // and the group loop reshapes the tensor, not the norm.
     const float rms_rcp = flashinfer::math::rsqrt(group_smem[0] / float(group_size) + eps);
 
-    for (uint32_t i = 0; i < rounds; i++) {
-        flashinfer::vec_t<T, VEC_SIZE> input_vec;
-        flashinfer::vec_t<T, VEC_SIZE> weight_vec;
-        flashinfer::vec_t<T, VEC_SIZE> out_vec;
-        input_vec.fill(0.f);
-        weight_vec.fill(0.f);
-        const uint32_t elem = i * num_threads * VEC_SIZE + thread_id * VEC_SIZE;
-        if (elem < group_size) {
-            input_vec.load(row_in + elem);
-            weight_vec.load(row_weight + elem);
-        }
+    flashinfer::vec_t<T, VEC_SIZE> weight_vec;
+    flashinfer::vec_t<T, VEC_SIZE> out_vec;
+    weight_vec.load(row_weight + elem);
 #pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE; j++) {
-            // The `(1 + w)` convention, and the only rounding: like GemmaRMSNorm,
-            // the f32 product is rounded once on the store to bf16.
-            out_vec[j] = float(input_vec[j]) * rms_rcp * (1.f + float(weight_vec[j]));
-        }
-        if (elem < group_size) {
-            out_vec.store(row_out + elem);
-        }
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
+        out_vec[j] = float(input_vec[j]) * rms_rcp * (1.f + float(weight_vec[j]));
     }
+    out_vec.store(row_out + elem);
 }
 
 }  // namespace
@@ -113,7 +91,8 @@ extern "C" {
 // `x`/`out` are [seq_len, hidden_dim] row-major with `hidden_dim` split into
 // `hidden_dim / group_size` equal groups; flattened, row `r` of the
 // `seq_len * groups` g-wide rows belongs to group `r % groups` and reads that
-// group's slice of `weight`.
+// group's slice of `weight`. The group must fill one round of whole vectors;
+// other shapes are refused rather than falling back to a second pass.
 CUresult rms_norm_grouped_offset_cuda(const DType *x, const DType *weight, DType *out,
                                       int hidden_dim, int group_size, int seq_len,
                                       float eps, cudaStream_t stream) {
@@ -131,6 +110,10 @@ CUresult rms_norm_grouped_offset_cuda(const DType *x, const DType *weight, DType
     const uint32_t vec_size = std::gcd<uint32_t>(16 / sizeof(DType), d);
     const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
     const uint32_t num_warps = flashinfer::ceil_div(block_size, 32);
+    const uint32_t num_threads = num_warps * 32;
+    if (static_cast<uint64_t>(num_threads) * vec_size != d) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
     // One block per (token, group), the grid the flattened view would get.
     dim3 nblks(static_cast<uint32_t>(rows));
     dim3 nthrs(32, num_warps);

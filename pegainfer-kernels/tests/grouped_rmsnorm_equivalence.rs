@@ -295,7 +295,8 @@ fn the_grouped_norm_degenerates_to_the_vendor_batched_norm() {
 }
 
 /// Broken geometry must be an error, not a silent wrong-width launch: a group
-/// size that does not divide the row, and a weight that is not the row's width.
+/// size that does not divide the row, a valid division that cannot fill one
+/// whole thread round, and a weight that is not the row's width.
 #[test]
 fn the_grouped_norm_rejects_broken_geometry() {
     let Some(ctx) = common::device_or_skip() else {
@@ -312,6 +313,10 @@ fn the_grouped_norm_rejects_broken_geometry() {
         rms_norm_grouped_offset_batch_into(&ctx, &whole, &full_weight, STREAM - 1, EPS, &mut out)
             .is_err(),
         "a group size that does not divide the row must be rejected"
+    );
+    assert!(
+        rms_norm_grouped_offset_batch_into(&ctx, &whole, &full_weight, 128, EPS, &mut out).is_err(),
+        "a group that cannot fill one whole thread round must be rejected"
     );
     assert!(
         rms_norm_grouped_offset_batch_into(&ctx, &whole, &slice_zero, BRANCH, EPS, &mut out)

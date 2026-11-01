@@ -170,8 +170,10 @@ pub fn qsa_indexer_block_scores_into(
 ///
 /// Qwen3.8-Flash-Next's `Qwen4ExpTextRMSNorm(hidden, eps, group_size)` uses this
 /// for the hyper-connection `hc_norm` and the PLE norms, both a 10240-wide
-/// stream in four 2560-wide groups. A call whose weight slices are all equal
-/// reproduces [`crate::ops::rms_norm_batch_offset_into`]'s bits; see
+/// stream in four 2560-wide groups. `group_size` must fill one whole thread
+/// round of aligned vectors; other sizes are refused. A call whose weight
+/// slices are all equal reproduces
+/// [`crate::ops::rms_norm_batch_offset_into`]'s bits; see
 /// `tests/grouped_rmsnorm_equivalence.rs`.
 pub fn rms_norm_grouped_offset_batch_into(
     ctx: &DeviceContext,

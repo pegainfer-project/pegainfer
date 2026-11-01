@@ -53,6 +53,10 @@ cargo test --release -p pegainfer-kernels --features qwen4 \
 
 The gate replays `test_data/qwen38fn-qsa-indexer-golden.safetensors` (PR #1150) and holds the fixture's recorded `format_version`, `transformers_version` and `config_sha256` against the frozen config — and derives its geometry from that config, cross-checked against the fixture's own tensor shapes — so a golden from another checkpoint or another semantics fails as a score mismatch instead of being skipped. It reads the fixture's **validity prefix** per row rather than comparing through the NaN padding the reference leaves, and proves the kernel writes exactly that prefix by checking the untouched tail still holds a sentinel. Six of seven cases land within 9.6e-7 of the reference and are held to a 2e-6 bound; the 2055-token case, the only one with positions past 63, keeps a 5e-3 bound until its 2.4e-3 residual is traced (its shape suggests one flipped bf16 rounding decision). In-range `rows`, and `visible_len` up to the row's own token, are contract: anything else traps on the device, and a poisoned key keeps its NaN score instead of reading as a valid zero. The kernel takes no budget: the reference scores every complete block and truncates only at selection. **Next: that selection** — top-k over the block scores plus the unconditional tail, which is a unit of its own and depends on the same golden, not on this kernel.
 
+## Grouped `(1+w)` RMSNorm
+
+On the 26-SM sm_120 card, the production 2560-wide group moved from 56.0 to 41.6 µs p50 at 512 tokens (128 tokens: 17.2 to 14.9 µs).
+
 ## The n-gram table is derived, not read
 
 `config.json` states none of the table's dimensions; they follow from five fields:
