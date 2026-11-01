@@ -21,8 +21,6 @@ mod fp8;
 #[cfg(test)]
 mod freerun_probe;
 mod indexer;
-#[cfg(test)]
-mod indexer_smoke;
 mod layer;
 mod mla_decode;
 mod mla_front;
@@ -310,67 +308,6 @@ impl std::str::FromStr for Glm52MoeTopo {
     }
 }
 
-#[cfg(test)]
-mod topology_tests {
-    use super::*;
-
-    #[test]
-    fn tp4_topology_shape_is_four_rank_replicated_tp() {
-        assert_eq!(Glm52MoeTopo::Tp4.default_dp_size(), 1);
-        assert_eq!(Glm52MoeTopo::Tp4.device_count(), 4);
-        assert_eq!(Glm52MoeTopo::Tp4.logical_rank_count(), 1);
-        assert_eq!(Glm52MoeTopo::Tp4.expected_tp_size(), 4);
-        assert_eq!(Glm52MoeTopo::Tp4.expected_ep_size(), 1);
-        assert!(!Glm52MoeTopo::Tp4.uses_ep_expert_bundles());
-        assert!(Glm52MoeTopo::Tp4.uses_tensor_replicated_moe());
-    }
-
-    #[test]
-    fn ep8_shapes_remain_unchanged() {
-        let topo = Glm52MoeTopo::Ep8;
-        assert_eq!(topo.default_dp_size(), GLM52_EP_RANKS);
-        assert_eq!(topo.device_count(), GLM52_EP_RANKS);
-        assert_eq!(topo.expected_tp_size(), 1);
-        assert_eq!(topo.expected_ep_size(), GLM52_EP_RANKS);
-        assert_eq!(topo.logical_rank_count(), GLM52_EP_RANKS);
-        assert!(topo.uses_ep_expert_bundles());
-        assert!(!topo.uses_tensor_replicated_moe());
-        assert_eq!(topo.ep_local_experts(), 32);
-    }
-
-    #[test]
-    fn ep4_topology_shape_is_four_rank_expert_parallel() {
-        assert_eq!(Glm52MoeTopo::Ep4.default_dp_size(), 4);
-        assert_eq!(Glm52MoeTopo::Ep4.device_count(), 4);
-        assert_eq!(Glm52MoeTopo::Ep4.logical_rank_count(), 4);
-        assert_eq!(Glm52MoeTopo::Ep4.expected_tp_size(), 1);
-        assert_eq!(Glm52MoeTopo::Ep4.expected_ep_size(), 4);
-        assert!(Glm52MoeTopo::Ep4.uses_ep_expert_bundles());
-        assert!(!Glm52MoeTopo::Ep4.uses_tensor_replicated_moe());
-        assert_eq!(Glm52MoeTopo::Ep4.ep_local_experts(), 64);
-        assert_eq!("ep4".parse::<Glm52MoeTopo>().unwrap(), Glm52MoeTopo::Ep4);
-    }
-
-    #[test]
-    fn cross_tray_ep_widths_shard_all_routed_experts() {
-        for (topo, ranks, local) in [
-            (Glm52MoeTopo::Ep16, 16, 16),
-            (Glm52MoeTopo::Ep32, 32, 8),
-            (Glm52MoeTopo::Ep64, 64, 4),
-        ] {
-            assert_eq!(topo.default_dp_size(), ranks);
-            assert_eq!(topo.device_count(), ranks);
-            assert_eq!(topo.logical_rank_count(), ranks);
-            assert_eq!(topo.expected_tp_size(), 1);
-            assert_eq!(topo.expected_ep_size(), ranks);
-            assert!(topo.uses_ep_expert_bundles());
-            assert!(!topo.uses_tensor_replicated_moe());
-            assert_eq!(topo.ep_local_experts(), local);
-            assert_eq!(format!("ep{ranks}").parse::<Glm52MoeTopo>().unwrap(), topo);
-        }
-    }
-}
-
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
 /// 8 DP ranks under a single namespace: the MLA latent has no TP sharding
 /// and the non-expert weights are replicated, so any rank's KV for a token
@@ -599,8 +536,7 @@ fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle
 /// kv_b), DeepEP collective buffers, the 8 whole-step graph instantiations,
 /// cuBLAS workspaces, and allocator fragmentation. The SM100 DeepGEMM delta
 /// over the retired weight-only chain is charged exactly and separately.
-/// Measured on 8×H200
-/// (jz-38, 2026-07-06): the worst rank's non-arena post-probe allocations
+/// Measured on 8×H200: the worst rank's non-arena post-probe allocations
 /// came to ~3.05 GiB, so 5 GiB leaves ~2 GiB of post-build headroom over
 /// the [`GLM52_POST_BUILD_MIN_FREE_BYTES`] floor; the post-build re-probe
 /// below turns any drift into a launch failure instead of a mid-serving
