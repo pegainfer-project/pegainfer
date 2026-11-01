@@ -131,12 +131,13 @@ Extends the existing harness (#499, `tools/accuracy/glm52_oracle.py` + `oracle/m
 ## Build & test
 
 ```bash
-# Build (sm_100)
+# Build (SM90a, H200)
+export PEGAINFER_DEEPGEMM_ROOT=pegainfer-kernels/third_party/DeepGEMM/deep_gemm
 export CUDA_HOME=/usr/local/cuda
 export PEGAINFER_NCCL_ROOT=<path>
 cargo check --release -p pegainfer-glm52 --features glm52
 
-# Oracle gate (Blackwell GPU + checkpoint)
+# Oracle gate (H200 + checkpoint)
 PEGAINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
   cargo test --release -p pegainfer-glm52 --features glm52 --lib indexer_oracle -- --ignored --nocapture
 ```
