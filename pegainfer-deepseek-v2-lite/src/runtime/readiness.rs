@@ -8,7 +8,6 @@ use super::backend::EpBackendRuntime;
 use super::types::DecodeGraphBlocker;
 use super::types::DecodeGraphReadinessMetrics;
 use super::types::DecodeGraphReadinessReport;
-use super::types::FullDecodeGraphProbeReport;
 use super::types::GenerationStats;
 
 #[cfg(test)]
@@ -54,15 +53,11 @@ impl DeepSeekV2LiteEp2Generator {
             None
         };
         let blockers = decode_graph_blockers(backend);
-        let full_decode_graph_probe = if blockers.is_empty() {
-            self.full_decode_graph_probe_report(
-                run_full_decode_graph_probe,
-                full_decode_probe_prompt_tokens,
-                full_decode_probe_output_len,
-            )?
-        } else {
-            full_decode_graph_probe_report(backend, run_full_decode_graph_probe, &blockers)?
-        };
+        let full_decode_graph_probe = self.full_decode_graph_probe_report(
+            run_full_decode_graph_probe,
+            full_decode_probe_prompt_tokens,
+            full_decode_probe_output_len,
+        )?;
         let full_decode_capture_ready = full_decode_graph_probe.ready();
         let status = decode_graph_readiness_status(
             backend,
@@ -110,72 +105,6 @@ fn decode_graph_readiness_status(
         }
         EpBackendKind::Nccl => "blocked_full_decode_path",
     }
-}
-
-fn full_decode_graph_probe_report(
-    backend: EpBackendKind,
-    requested: bool,
-    blockers: &[DecodeGraphBlocker],
-) -> Result<FullDecodeGraphProbeReport> {
-    if requested && backend != EpBackendKind::Nccl {
-        bail!(
-            "DeepSeek-V2-Lite --full-decode-graph-probe requires PEGAINFER_DSV2_LITE_EP_BACKEND=nccl"
-        );
-    }
-    if !requested {
-        return Ok(FullDecodeGraphProbeReport {
-            requested: false,
-            captured: false,
-            instantiated: false,
-            replayed: false,
-            verified: false,
-            replay_count: 0,
-            verified_replay_count: 0,
-            failure_stage: "not_requested",
-            failure_summary: None,
-            blockers: Vec::new(),
-            capture_mode: "thread_local",
-        });
-    }
-    if !blockers.is_empty() {
-        let blocker_ids = blockers
-            .iter()
-            .map(|blocker| blocker.id)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Ok(FullDecodeGraphProbeReport {
-            requested: true,
-            captured: false,
-            instantiated: false,
-            replayed: false,
-            verified: false,
-            replay_count: 0,
-            verified_replay_count: 0,
-            failure_stage: "preflight_blocked",
-            failure_summary: Some(format!(
-                "full decode graph probe skipped before CUDA stream capture because the current NCCL decode path still has capture blockers: {blocker_ids}"
-            )),
-            blockers: blockers.to_vec(),
-            capture_mode: "thread_local",
-        });
-    }
-
-    Ok(FullDecodeGraphProbeReport {
-        requested: true,
-        captured: false,
-        instantiated: false,
-        replayed: false,
-        verified: false,
-        replay_count: 0,
-        verified_replay_count: 0,
-        failure_stage: "probe_not_wired",
-        failure_summary: Some(
-            "no static blockers were reported, but the full decode graph capture executor is not wired"
-                .to_string(),
-        ),
-        blockers: Vec::new(),
-        capture_mode: "thread_local",
-    })
 }
 
 fn decode_graph_blockers(backend: EpBackendKind) -> Vec<DecodeGraphBlocker> {
