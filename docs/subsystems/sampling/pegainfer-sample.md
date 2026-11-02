@@ -1,6 +1,6 @@
 # pegainfer-sample — the shared sampling layer
 
-**TL;DR:** `pegainfer-sample` is the crate qwen3, qwen35, Gemma 4, GLM5.2 and Kimi-K2 route through to turn a logits arena into next-token ids (`select_batch`) and into host logprobs (`token_logprob_from_row`). It replaces `pegainfer-core::ops::select_batch_tokens_into` (deleted) and the three copies of `compute_logprobs_from_cpu`/`host_token_logprob`. Kimi keeps its sharded-vocab greedy argmax (a DP concern the crate can't express) but routes non-greedy sampling and logprobs through here. DeepSeek-V2-Lite does **not** route through: it is greedy-only and picks with a bare GPU argmax via `core::ops::argmax`, so it needs no batched sampling policy.
+**TL;DR:** `pegainfer-sample` is the crate qwen3, qwen35 and Gemma 4 route through to turn a logits arena into next-token ids (`select_batch`) and into logprobs (`token_logprob_from_row`, or the batched `token_logprobs_batch`). It replaces `pegainfer-core::ops::select_batch_tokens_into` (deleted) and the three copies of `compute_logprobs_from_cpu`/`host_token_logprob`. Kimi keeps its sharded-vocab greedy argmax (a DP concern the crate can't express) but routes non-greedy sampling and logprobs through here. GLM5.2 keeps its own greedy path too, takes only the re-exported `gpu_sample_batch_into` for non-greedy rows, and refuses logprob requests. DeepSeek-V2-Lite does **not** route through: it is greedy-only and picks with a bare GPU argmax via `core::ops::argmax`, so it needs no batched sampling policy.
 
 Last touched: 2026-11
 
