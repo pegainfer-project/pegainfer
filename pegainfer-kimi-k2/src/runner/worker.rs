@@ -552,7 +552,7 @@ impl KimiWorkerDecodeArenas {
     }
 }
 
-fn decode_batch_bucket(decode_batch_size: usize) -> Result<(usize, usize)> {
+pub(crate) fn decode_batch_bucket(decode_batch_size: usize) -> Result<(usize, usize)> {
     ensure!(
         (1..=KIMI_DECODE_MAX_BATCH).contains(&decode_batch_size),
         "Kimi decode batch size {decode_batch_size} must be in 1..={KIMI_DECODE_MAX_BATCH}"

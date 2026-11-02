@@ -38,9 +38,12 @@ const DENSE_LAYERS: usize = KIMI_K2_LAYERS - KIMI_K2_MOE_LAYERS;
 const LOCAL_DENSE_INTERMEDIATE: usize = KIMI_K2_DENSE_INTERMEDIATE / TP_WORLD_SIZE;
 const LOCAL_SHARED_INTERMEDIATE: usize = KIMI_K2_EXPERT_INTERMEDIATE / TP_WORLD_SIZE;
 
+/// Rank 0's decode schedule for `batch_size` rows at `kv_len`. The shapes use
+/// the decode arena bucket production rounds `batch_size` up to.
 pub fn trace_decode_kernel_calls(batch_size: usize, kv_len: usize) -> Result<Vec<KernelCall>> {
     ensure!(batch_size > 0, "batch_size must be greater than zero");
     ensure!(kv_len > 0, "kv_len must be greater than zero");
+    let (_, batch_size) = crate::runner::decode_batch_bucket(batch_size)?;
 
     let mut calls = Vec::new();
     calls.push(
